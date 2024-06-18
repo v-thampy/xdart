@@ -1,17 +1,17 @@
 [tool.poetry]
 name = "xdart"
-version = "0.13.1"
+version = "0.13.3"
 description = "A pyFAI based GUI utility to rebin and visualize X-ray Diffraction data"
 authors = ["Vivek Thampy <vthampy@slac.stanford.edu>"]
 license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/rwalroth/xdart.git"
-repository = "https://github.com/rwalroth/xdart.git"
-documentation = "https://github.com/rwalroth/xdart/blob/master/xdart_manual.pdf"
+homepage = "https://github.com/v-thampy/xdart.git"
+repository = "https://github.com/v-thampy/xdart.git"
+documentation = "https://github.com/v-thampy/xdart/blob/master/xdart_manual.pdf"
 keywords = ["xrd", "diffracion", "pyFAI"]
 
 [tool.poetry.dependencies]
-python = ">=3.8,<4"
+python = ">=3.8"
 pyfai = "*"
 pygix = "*"
 pyqtgraph = "*"
@@ -41,6 +41,8 @@ panel = "*"
 xlrd = "*"
 openpyxl = "*"
 imagecodecs = "*"
+natsort = '*'
+xrayutilities = '*'
 
 [tool.poetry.dev-dependencies]
 # Add your development dependencies here

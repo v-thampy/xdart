@@ -67,7 +67,7 @@ params = [
          'values': ['tif', 'raw', 'h5', 'mar3450'], 'value': 'tif', 'visible': False},
         {'name': 'series_average', 'title': 'Average Scan', 'type': 'bool', 'value': False, 'visible': True},
         {'name': 'meta_ext', 'title': 'Meta File', 'type': 'list',
-         'values': ['None', 'txt', 'pdi', 'SPEC'], 'value': 'txt'},
+         'values': ['None', 'txt', 'pdi', 'SPEC'], 'value': 'pdi'},
         {'name': 'Filter', 'type': 'str', 'value': '', 'visible': False},
         {'name': 'write_mode', 'title': 'Write Mode  ', 'type': 'list',
          'values': ['Append', 'Overwrite'], 'value': 'Append'},
@@ -349,7 +349,9 @@ class specWrangler(wranglerWidget):
         # Calibration
         global ctr
         ctr += 1
-        # ic(ctr)
+        ic(ctr)
+        if ctr > 50:
+            exit()
 
         self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
         self.thread.poni_dict = self.poni_dict
@@ -563,7 +565,7 @@ class specWrangler(wranglerWidget):
     def get_img_fname(self):
         """Sets file name based on chosen options
         """
-        # ic()
+        ic()
         old_fname = self.img_file
         if self.inp_type != 'Image Directory':
             img_file = self.parameters.child('Signal').child('File').value()
@@ -581,7 +583,7 @@ class specWrangler(wranglerWidget):
             filters = filters if filters != '**' else '*'
 
             file_found = False
-            # ic(file_found, self.img_file)
+            ic(file_found, self.img_file)
             for idx, (subdir, dirs, files) in enumerate(os.walk(self.img_dir)):
                 for file in files:
                     fname = os.path.join(subdir, file)
@@ -600,7 +602,7 @@ class specWrangler(wranglerWidget):
                                 self.img_file = fname
                                 break
                             # self.meta_ext = self.get_meta_ext(fname)
-                # ic(self.img_file, file_found, self.include_subdir, idx)
+                ic(self.img_file, file_found, self.include_subdir, self.meta_ext)
                 if file_found or (not self.include_subdir):
                     # ic('breaking')
                     break
@@ -608,13 +610,14 @@ class specWrangler(wranglerWidget):
         # ic(self.img_file, self.scan_parameters)
         if (((self.img_file != old_fname) or (self.img_file and (len(self.scan_parameters) < 1)))
                 and self.meta_ext):
+            ic('setting pars from meta')
             self.set_pars_from_meta()
 
     def set_series_average(self):
         self.series_average = self.parameters.child('Signal').child('series_average').value()
 
     def set_meta_ext(self):
-        # ic()
+        ic()
         self.meta_ext = self.parameters.child('Signal').child('meta_ext').value()
         if self.meta_ext == 'None':
             self.meta_ext = None
@@ -622,7 +625,7 @@ class specWrangler(wranglerWidget):
 
     def exists_meta_file(self, img_file):
         """Checks for existence of meta file for image file"""
-        # ic()
+        ic(self.meta_ext)
         if self.meta_ext != 'SPEC':
             meta_files = [
                 f'{os.path.splitext(img_file)[0]}.{self.meta_ext}',
@@ -639,7 +642,7 @@ class specWrangler(wranglerWidget):
         return False
 
     def set_pars_from_meta(self):
-        # ic()
+        ic()
         self.get_scan_parameters()
         self.set_bg_matching_options()
         self.set_gi_motor_options()
@@ -722,6 +725,9 @@ class specWrangler(wranglerWidget):
         """Reads image metadata to populate matching parameters
         """
         # ic(self.scan_parameters)
+        if self.scan_parameters == []:
+            return
+
         pars = [p for p in self.scan_parameters if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
         pars.insert(0, 'None')
         if 'TEMP' in pars:
@@ -760,7 +766,8 @@ class specWrangler(wranglerWidget):
         """Reads image metadata to populate possible GI theta motor
         """
         # ic()
-        pars = [p for p in self.motors if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
+        pars, value = ['Manual'], '0.1'
+        pars += [p for p in self.motors if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
         if 'th' in pars:
             pars.insert(0, pars.pop(pars.index('th')))
             value = 'th'
@@ -770,7 +777,7 @@ class specWrangler(wranglerWidget):
         else:
             value = 'Theta'
 
-        pars = ['Manual'] + pars
+        # pars = ['Manual'] + pars
         # ic(pars)
 
         opts = {'values': pars, 'limits': pars, 'value': value}
@@ -788,7 +795,7 @@ class specWrangler(wranglerWidget):
     def get_scan_parameters(self):
         """ Reads image metadata to populate matching parameters
         """
-        # ic(self.img_file)
+        ic(self.img_file, self.meta_ext)
         if not self.img_file:
             return
 

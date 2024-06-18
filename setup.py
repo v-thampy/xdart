@@ -70,7 +70,7 @@ setup(
     #
     # This field corresponds to the "Home-Page" metadata field:
     # https://packaging.python.org/specifications/core-metadata/#home-page-optional
-    url='https://github.com/rwalroth/xdart.git',  # Optional
+    url='https://github.com/v-thampy/xdart.git',  # Optional
 
     # This should be your name or the name of the organization which owns the
     # project.
