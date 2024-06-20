@@ -299,7 +299,7 @@ def get_spec_file(img_fname):
     """Check if SPEC file exists for an image file and return path if yes"""
     fpath = Path(img_fname)
     fname = fpath.stem
-    match = re.search(f'_scan\d+_\d+.', fname)
+    match = re.search(rf'_scan\d+_\d+.', fname)
     if match is None:
         return None
     spec_fname = fname[fname.find('_') + 1:match.start()]
@@ -374,7 +374,7 @@ def get_meta_from_spec(img_file, spec_path=None, spec_file=None, img_number=None
 def get_scanNumber(img_file):
     img_fname = Path(img_file).stem
 
-    match = re.search(f'_scan\d+_\d+$', img_fname)
+    match = re.search(rf'_scan\d+_\d+$', img_fname)
     if match is None:
         return None
 
@@ -386,7 +386,7 @@ def get_specFile(img_file, spec_path=None):
     if img_fname[0:2] == 'b_':
         img_fname = img_fname[2:]
 
-    match = re.search(f'_scan\d+_\d+$', img_fname)
+    match = re.search(rf'_scan\d+_\d+$', img_fname)
     if match is None:
         return None
 
@@ -414,7 +414,7 @@ def get_specFile_scanNumber(img_file, spec_path=None):
         img_fname = img_fname[2:]
     img_ext = img_file.suffix[1:]
 
-    match = re.search(f'_scan\d+_\d+.{img_ext}', img_fname)
+    match = re.search(rf'_scan\d+_\d+.{img_ext}', img_fname)
     if match is None:
         return None, None
 
@@ -820,11 +820,12 @@ def data_to_h5(data, grp, key, encoder='yaml', compression='lzf'):
                 try:
                     if key in grp:
                         if check_encoded(grp[key], 'unknown'):
-                            grp[key][()] = np.string_(data)
+                            # grp[key][()] = np.string_(data)
+                            grp[key][()] = np.bytes_(data)
                             return
                         else:
                             del(grp[key])
-                    grp.create_dataset(key, data=np.string_(data),
+                    grp.create_dataset(key, data=np.bytes_(data),
                                     dtype=h5py.string_dtype())
                     grp[key].attrs['encoded'] = 'unknown'
                 except Exception as e:
@@ -960,7 +961,7 @@ def index_to_h5(index, key, grp, compression):
         
     if index.dtype == 'object':
         if len(index) > 0:
-            strindex = np.array([np.string_(str(x)) for x in index])
+            strindex = np.array([np.bytes_(str(x)) for x in index])
             if key in grp:
                 grp[key].resize(strindex.shape)
                 grp[key][()] = strindex[()]
@@ -1047,9 +1048,9 @@ def encoded_h5(data, grp, key, encoder):
             types.
     """
     if encoder == 'yaml':
-        string = np.string_(yaml.dump(data))
+        string = np.bytes_(yaml.dump(data))
     elif encoder == 'json':
-        string = np.string_(json.dumps(data))
+        string = np.bytes_(json.dumps(data))
     if key in grp:
         if check_encoded(grp[key], encoder):
             grp[key][()] = string

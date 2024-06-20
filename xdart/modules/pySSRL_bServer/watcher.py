@@ -1,4 +1,4 @@
-import os, imp, time
+import os, time
 from fnmatch import filter
 
 from multiprocessing import Queue, Process
