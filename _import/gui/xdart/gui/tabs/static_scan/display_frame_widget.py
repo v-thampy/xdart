@@ -1286,22 +1286,23 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
 
         colors = (1, 1, 1)
         if self.cmap == 'Default':
-            colors_tuples = [cm.get_cmap('tab10'), cm.get_cmap('Set3'), cm.get_cmap('tab20b', 5)]
+            # colors_tuples = [cm.get_cmap('tab10'), cm.get_cmap('Set3'), cm.get_cmap('tab20b', 5)]
+            colors_tuples = [plt.get_cmap('tab10'), plt.get_cmap('Set3'), plt.get_cmap('tab20b', 5)]
             for nn, color_tuples in enumerate(colors_tuples):
                 if nn == 0:
                     colors = np.asarray(color_tuples.colors)
                 else:
                     colors = np.vstack((colors, np.asarray(color_tuples.colors)[:, 0:3]))
 
-            colors_tuples = cm.get_cmap('jet')
+            colors_tuples = plt.get_cmap('jet')
             more_colors = colors_tuples(np.linspace(0, 1, len(self.arch_names)))
             colors = np.vstack((colors, more_colors[:, 0:3]))
 
         else:
             try:
-                colors_tuples = cm.get_cmap(self.cmap)
+                colors_tuples = plt.get_cmap(self.cmap)
             except ValueError:
-                colors_tuples = cm.get_cmap('jet', 256)
+                colors_tuples = plt.get_cmap('jet', 256)
             colors = colors_tuples(np.linspace(0, 1, len(self.arch_names)))[:, 0:3]
 
         # colors = np.round(colors * [255, 255, 255, 1]).astype(int)
