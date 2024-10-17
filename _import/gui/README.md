@@ -8,7 +8,7 @@ X-ray Data Analysis in Real Time
 
 2. From the terminal, create a new environment with python < 3.12:
    ```
-   conda create -n xdart python=3.11
+   conda create -n xdart python=3.12
    ```
 
 3. Activate the xdart environment:
