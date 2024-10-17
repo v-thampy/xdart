@@ -187,10 +187,11 @@ def guess_from_peak_2D(model, y, x, negative, ampscale=1.0, sigscale=1.0, amp_ar
 
 
 def lorentzian_squared(x, amplitude=1.0, center=0.0, sigma=1.0):
-    """Lorentzian squared defined by amplitude
-      amplitude*(1/(1 +((x[0] - x_center)/sigma_x)**2)**2
+    r"""
+    Lorentzian squared defined by amplitude
+       amplitude*(1/(1 +((x[0] - x_center)/sigma_x)**2)**2
 
-    The HWHM is related to the parameter :math:`\Gamma` by the relation:
+       The HWHM is related to the parameter :math:`\Gamma` by the relation:
       :math:`\kappa = \sqrt{\sqrt{2} - 1}\sigma`
 
     Parameters
@@ -213,13 +214,13 @@ def lorentzian_squared(x, amplitude=1.0, center=0.0, sigma=1.0):
     y : 1D np.array
         Returns the calculated value of the lorentzian-squared function
         for the given parameters
-
     """
     return amplitude * (1 / (1 + ((x - center) / sigma)**2) )**2
 
 
 def pvoigt(x, amplitude=1.0, center=0.0, sigma=1.0, fraction=0.5):
-    """Return a 1-dimensional pseudo-Voigt function.
+    """
+    Return a 1-dimensional pseudo-Voigt function.
 
     pvoigt(x, amplitude, center, sigma, fraction) =
        amplitude*(1-fraction)*gaussion(x, center, sigma_g) +
@@ -239,7 +240,8 @@ def pvoigt(x, amplitude=1.0, center=0.0, sigma=1.0, fraction=0.5):
 
 
 def plane(x, intercept, slope_x, slope_y):
-    """2D plane
+    """
+    2D plane
     Function:
        :math:`f(x) = p_0 + p_1x + p_2y`
 
@@ -269,7 +271,8 @@ def plane(x, intercept, slope_x, slope_y):
 
 
 def lor2_2D(x, amplitude=1.0, center_x=0.0, center_y=0.0, sigma_x=1.0, sigma_y=1.0):
-    """2D Lorentzian squared defined by amplitude
+    r"""
+    2D Lorentzian squared defined by amplitude
     amplitude*(1/(1 +((x[0] - x_center)/sigma_x)**2 + ((x[1] - y_center)/sigma_y)**2))**2
 
     The HWHM is related to the parameter :math:`\Gamma` by the relation:
@@ -309,7 +312,8 @@ def lor2_2D(x, amplitude=1.0, center_x=0.0, center_y=0.0, sigma_x=1.0, sigma_y=1
 
 
 def gauss_2D(x, amplitude=1.0, center_x=0.0, center_y=0.0, sigma_x=1.0, sigma_y=1.0):
-    """2D Gaussian defined by amplitide
+    """
+    2D Gaussian defined by amplitide
     out = amplitude * ( exp( -1.0 * (x[0] - center_x)**2 / (2 * sigma_x**2) +
                              -1.0 * (x[1] - center_y)**2 / (2 * sigma_y**2) ) )
 
@@ -349,7 +353,8 @@ def gauss_2D(x, amplitude=1.0, center_x=0.0, center_y=0.0, sigma_x=1.0, sigma_y=
 
 def pvoigt_2D(x, amplitude=1.0, center_x=0.0, center_y=0.0,
         sigma_x=1.0, sigma_y=1.0, fraction=0.5):
-    """Return a 2-dimensional pseudo-Voigt function.
+    """
+    Return a 2-dimensional pseudo-Voigt function.
 
     pvoigt(x, amplitude, center, sigma, fraction) =
        amplitude*(1-fraction)*gaussion(x, center, sigma_g) +
@@ -371,7 +376,8 @@ def pvoigt_2D(x, amplitude=1.0, center_x=0.0, center_y=0.0,
 
 def assymetric_rectangle(x, amplitude1=1.0, center1=0.0, sigma1=1.0,
                    amplitude2=1.0, center2=1.0, sigma2=1.0, form='linear'):
-    """Return a rectangle function: step up, step down.
+    """
+    Return a rectangle function: step up, step down.
 
     (see step function)
     starts at 0.0, rises to amplitude (at center1 with width sigma1)
@@ -423,7 +429,7 @@ prefix: string to prepend to paramter names, needed to add two Models that
 """
 
 class LorentzianSquaredModel(Model):
-    """Model based on Lorentzian squared defined by amplitude
+    r"""Model based on Lorentzian squared defined by amplitude
       amplitude*(1/(1 +((x[0] - x_center)/sigma_x)**2)**2
 
     The HWHM is related to the parameter :math:`\Gamma` by the relation:
@@ -456,7 +462,8 @@ class LorentzianSquaredModel(Model):
 
 
 class PlaneModel(Model):
-    """Model based on 2D plane
+    """
+    Model based on 2D plane
     Function:
        :math:`f(x) = p_0 + p_1x + p_2y`
 
@@ -490,7 +497,8 @@ class PlaneModel(Model):
 
 
 class LorentzianSquared2DModel(Model):
-    """Model based on a 2D Lorentzian squared defined by amplitude
+    r"""
+    Model based on a 2D Lorentzian squared defined by amplitude
     amplitude*(1/(1 +((x[0] - x_center)/sigma_x)**2 + ((x[1] - y_center)/sigma_y)**2))**2
 
     The HWHM is related to the parameter :math:`\Gamma` by the relation:
@@ -607,7 +615,7 @@ class Pvoigt2DModel(Model):
 
 
 class AssymetricRectangleModel(Model):
-    """A model based on a Step-up and Step-down function, with five
+    r"""A model based on a Step-up and Step-down function, with five
     Parameters: ``amplitude`` (:math:`A`), ``center1`` (:math:`\mu_1`),
     ``center2`` (:math:`\mu_2`), `sigma1`` (:math:`\sigma_1`) and
     ``sigma2`` (:math:`\sigma_2`) and four choices for functional form
