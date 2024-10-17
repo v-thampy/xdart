@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-@author: walroth
+@author: walroth, vthampy
 """
 __version__ = '0.4.2'
 # Top level script for running gui based program
@@ -77,6 +77,7 @@ class Main(QMainWindow):
         self.tabwidget.tabCloseRequested.connect(self.closeExperiment)
         self.setCentralWidget(self.tabwidget)
         self.set_tabs()
+        self.open_static_scan()
         #
         self.show()
         self.resize(1600, 920)
@@ -104,6 +105,11 @@ class Main(QMainWindow):
         for e in tabs.exp_list:
             self.ui.menuExperiments.addAction(e)
         self.ui.menuExperiments.triggered.connect(self.openExperiment)
+
+    def open_static_scan(self):
+        if 'static_scan' not in self.tabs:
+            self.tabs['static_scan'] = tabs.static_scan.staticWidget(local_path=self.tab_paths['static_scan'])
+            self.tabwidget.addTab(self.tabs['static_scan'], 'static_scan')
 
     def openExperiment(self, q):
         if q.text() == 'ttheta_scan':
