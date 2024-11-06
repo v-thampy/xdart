@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "xdart"
-version = "0.14"
+version = "0.15"
 description = "A pyFAI based GUI utility to rebin and visualize X-ray Diffraction data"
 authors = ["Vivek Thampy <vthampy@stanford.edu>"]
 license = "MIT"
@@ -43,7 +43,6 @@ openpyxl = "*"
 imagecodecs = "*"
 natsort = '*'
 xrayutilities = '*'
-natsort = '*'
 
 [tool.poetry.dev-dependencies]
 # Add your development dependencies here
