@@ -608,7 +608,8 @@ class specWrangler(wranglerWidget):
         # ic(self.img_file, self.scan_parameters)
         if (((self.img_file != old_fname) or (self.img_file and (len(self.scan_parameters) < 1)))
                 and self.meta_ext):
-            self.set_pars_from_meta()
+            if self.exists_meta_file(self.img_file):
+                self.set_pars_from_meta()
 
     def set_series_average(self):
         self.series_average = self.parameters.child('Signal').child('series_average').value()
