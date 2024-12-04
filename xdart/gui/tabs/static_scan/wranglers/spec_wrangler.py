@@ -630,11 +630,22 @@ class specWrangler(wranglerWidget):
                     # ic('breaking')
                     break
 
+        if self.exists_meta_file(self.img_file):
+            print('found meta file')
+            self.set_pars_from_meta()
+        else:
+            print('no meta file - resetting')
+            self.reset_pars()
+
         # ic(self.img_file, self.scan_parameters)
-        if (((self.img_file != old_fname) or (self.img_file and (len(self.scan_parameters) < 1)))
-                and self.meta_ext):
-            if self.exists_meta_file(self.img_file):
-                self.set_pars_from_meta()
+        # if (((self.img_file != old_fname) or (self.img_file and (len(self.scan_parameters) < 1)))
+        #         and self.meta_ext):
+        #     if self.exists_meta_file(self.img_file):
+        #         print('found meta file')
+        #         self.set_pars_from_meta()
+        #     else:
+        #         print('no meta file - resetting')
+        #         self.reset_pars()
 
     def set_series_average(self):
         self.series_average = self.parameters.child('Signal').child('series_average').value()
@@ -642,6 +653,7 @@ class specWrangler(wranglerWidget):
     def set_meta_ext(self):
         # ic()
         self.meta_ext = self.parameters.child('Signal').child('meta_ext').value()
+        print(self.meta_ext)
         if self.meta_ext == 'None':
             self.meta_ext = None
         self.get_img_fname()
@@ -670,6 +682,16 @@ class specWrangler(wranglerWidget):
         self.set_bg_matching_options()
         self.set_gi_motor_options()
         self.set_bg_norm_options()
+
+    def reset_pars(self):
+        self.scan_parameters, self.motors, self.counters = [], [], []
+        self.set_bg_matching_options()
+        # self.bg_matching_par = None
+
+        self.set_gi_motor_options()
+        self.set_bg_norm_options()
+        # self.bg_norm_channel = 'None'
+        # self.th_mtr = 'Manual'
 
     def set_mask_file(self):
         """Opens file dialogue and sets the mask file
@@ -794,9 +816,11 @@ class specWrangler(wranglerWidget):
             pars.insert(0, pars.pop(pars.index('theta')))
             value = 'theta'
         else:
-            value = 'Theta'
+            # value = 'Theta'
+            value = 'Manual'
 
-        pars = ['Manual'] + pars
+        if 'Manual' not in pars:
+            pars = ['Manual'] + pars
         # ic(pars)
 
         opts = {'values': pars, 'limits': pars, 'value': value}
@@ -816,6 +840,7 @@ class specWrangler(wranglerWidget):
         """
         # ic(self.img_file)
         if not self.img_file:
+            self.scan_parameters, self.motors, self.counters = [], [], []
             return
 
         img_meta = get_img_meta(self.img_file, self.meta_ext)
