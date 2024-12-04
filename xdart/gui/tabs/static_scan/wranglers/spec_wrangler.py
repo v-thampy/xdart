@@ -631,10 +631,10 @@ class specWrangler(wranglerWidget):
                     break
 
         if self.exists_meta_file(self.img_file):
-            print('found meta file')
+            # print('found meta file')
             self.set_pars_from_meta()
         else:
-            print('no meta file - resetting')
+            # print('no meta file - resetting')
             self.reset_pars()
 
         # ic(self.img_file, self.scan_parameters)
@@ -653,7 +653,7 @@ class specWrangler(wranglerWidget):
     def set_meta_ext(self):
         # ic()
         self.meta_ext = self.parameters.child('Signal').child('meta_ext').value()
-        print(self.meta_ext)
+        # print(self.meta_ext)
         if self.meta_ext == 'None':
             self.meta_ext = None
         self.get_img_fname()
