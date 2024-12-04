@@ -357,7 +357,7 @@ class EwaldArch():
                 i_QxyQz, qxy, qz = self.integrator.transform_image(
                     self.map_raw-self.bg_raw, process='reciprocal', npt=(npt_rad, npt_azim),
                     x_range=x_range, y_range=y_range, unit='q_A^-1',
-                    mask=self.get_mask(), all=False, **pg_args)
+                    mask=self.get_mask(global_mask), all=False, **pg_args)
 
                 self.int_2d.from_result(result, self.integrator.wavelength, unit=unit,
                                         i_QxyQz=np.flipud(i_QxyQz), qz=qz, qxy=qxy)
