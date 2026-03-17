@@ -1,0 +1,29 @@
+name: ssrl_xrd_tools
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - numpy
+  - scipy
+  - h5py
+  - matplotlib
+  - jupyterlab
+  - ipykernel
+  - ipywidgets
+  - natsort
+  - xrayutilities
+  - fabio
+  - silx
+  - pyFAI
+  - joblib
+  - lmfit
+  - panel
+  - holoviews
+  - bokeh
+  - napari
+  - pytest
+  - pip
+  - pip:
+    - pyevtk
+    - -e .
