@@ -110,8 +110,6 @@ class int_1d_data_static:
         utils.h5_to_attributes(self, grp, keys)
 
     def __setattr__(self, name, value):
-        """Ensures raw, norm, and pcount are nzarray1d objects.
-        """
         self.__dict__[name] = np.asarray(value)
 
     def __add__(self, other):
@@ -126,8 +124,6 @@ class int_2d_data_static(int_1d_data_static):
     """Container for 2-dimensional integration data returned by pyFAI.
 
     attributes:
-        norm: nzarray2d, integrated signal normalized by number of
-            pixels
         ttheta: numpy array, two-theta angle
         q: numpy array, q values
         chi: numpy array, chi values
@@ -139,14 +135,9 @@ class int_2d_data_static(int_1d_data_static):
         to_hdf5: Saves data to hdf5 file
     """
 
-    # def __init__(self, i_tthChi=np.zeros(0), i_qChi=np.zeros(0), ttheta=0, q=0, chi=0,
     def __init__(self, i_tthChi=0, i_qChi=0, ttheta=0, q=0, chi=0,
                  i_QxyQz=0, qz=0, qxy=0):
         """
-        raw: nzarray2d, raw integrated signal
-        pcount: nzarray2d, how many pixels in each bin
-        norm: nzarray2d, integrated signal normalized by number of
-            pixels
         ttheta: numpy array, two-theta angle
         q: numpy array, q values
         chi: numpy array, chi values

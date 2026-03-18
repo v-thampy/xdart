@@ -8,7 +8,6 @@ from queue import Queue
 from threading import Condition
 import traceback
 import numpy as np
-from scipy.interpolate import RectBivariateSpline
 
 # Other imports
 from xdart.utils.containers import int_1d_data_static, int_2d_data_static
