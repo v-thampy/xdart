@@ -22,7 +22,6 @@ requirements:
   run:
     - python >=3.8,<3.12
     - pyfai
-    - pygix
     - pyqtgraph
     - pyqt
     - pandas

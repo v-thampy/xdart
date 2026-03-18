@@ -14,7 +14,6 @@ import xml.etree.ElementTree
 
 import numpy as np
 import re
-from datetime import datetime
 from pathlib import Path
 from collections import OrderedDict
 
@@ -331,37 +330,22 @@ def get_spec_file(img_fname):
 
 
 def get_img_meta(img_file, meta_ext, spec_path=None, rv='all'):
-    """Get image meta data from pdi/txt files for different beamlines
+    """Get image meta data from pdi/txt files for different beamlines.
+
+    Delegates to ssrl_xrd_tools.io.metadata.read_image_metadata.
 
     Args:
         img_file (str): Image file for which meta data is required
-        meta_ext (str): Extension of Meta file
-        spec_path (str): Path of spec file if not in regular path
-        rv (str, optional): Return values (Counters, motors or all)
+        meta_ext (str): Extension of Meta file ('txt', 'pdi', or 'SPEC')
+        spec_path (str): Unused; kept for backward compatibility
+        rv (str, optional): Unused; kept for backward compatibility
 
     Returns:
         [dict]: Dictionary with all the meta data
     """
-    if meta_ext == 'SPEC':
-        Counters, Motors, Extras = get_meta_from_spec(img_file, spec_path)
-    else:
-        meta_file = f'{os.path.splitext(img_file)[0]}.{meta_ext}'
-        meta_file = meta_file if os.path.exists(meta_file) else f'{img_file}.{meta_ext}'
-
-        if not os.path.exists(meta_file):
-            return {}
-
-        if meta_ext == 'pdi':  # Pilatus Image
-            Counters, Motors, Extras = get_meta_from_pdi(meta_file)
-        else:
-            Counters, Motors, Extras = get_meta_from_txt(meta_file)
-
-    if rv == 'Counters':
-        return Counters
-    elif rv == 'Motors':
-        return Motors
-
-    return Extras | Counters | Motors
+    from ssrl_xrd_tools.io.metadata import read_image_metadata
+    fmt = 'spec' if (meta_ext or '').upper() == 'SPEC' else (meta_ext or 'txt')
+    return read_image_metadata(img_file, meta_format=fmt)
 
 
 def get_meta_from_spec(img_file, spec_path=None, spec_file=None, img_number=None):
@@ -453,79 +437,6 @@ def get_specFile_scanNumber(img_file, spec_path=None):
     return None, None
 
 
-def get_meta_from_pdi(pdi_file):
-    """Get motor and counter names and values from PDI file
-
-    Args:
-        pdi_file (str): PDI file name with path
-
-    Returns:
-        [dict]: Tuple of two dictionaries containing Counters and Motors
-    """
-    with open(pdi_file, 'r') as f:
-        data = f.read()
-    data = data.replace('\n', ';')
-
-    try:
-        counters = re.search('All Counters;(.*);;# All Motors', data).group(1)
-        cts = re.split(';|=', counters)
-        Counters = {c.split()[0]: float(cs) for c, cs in zip(cts[::2], cts[1::2])}
-
-        motors = re.search('All Motors;(.*);#', data).group(1)
-        cts = re.split(';|=', motors)
-        Motors = {c.split()[0]: float(cs) for c, cs in zip(cts[::2], cts[1::2])}
-    except AttributeError:
-        ss1 = '# Diffractometer Motor Positions for image;# '
-        ss2 = ';# Calculated Detector Calibration Parameters for image:'
-
-        try:
-            motors = re.search(f'{ss1}(.*){ss2}', data).group(1)
-            cts = re.split(';|=', motors)
-            Motors = {c.split()[0]: float(cs) for c, cs in zip(cts[::2], cts[1::2])}
-            Motors['TwoTheta'] = Motors['2Theta']
-        except AttributeError:
-            Motors = {'TwoTheta': float(0.0), 'Theta': float(0.0)}
-        Counters = {}
-
-    Extras = {}
-    if len(data[data.rindex(';') + 1:]) > 0:
-        Extras['epoch'] = data[data.rindex(';') + 1:]
-
-    return Counters, Motors, Extras
-
-
-def get_meta_from_txt(txt_file):
-    """Get motor and counter names and values from PDI file
-
-    Args:
-        txt_file (str): Txt meta file name with path
-
-    Returns:
-        [dict]: Tuple of two dictionaries containing Counters and Motors
-    """
-    with open(txt_file, 'r') as f:
-        data = f.read()
-
-    counters = re.search('# Counters\n(.*)\n', data).group(1)
-    cts = re.split(',|=', counters)
-    Counters = {c.split()[0]: float(cs) for c, cs in zip(cts[::2], cts[1::2])}
-
-    motors = re.search('# Motors\n(.*)\n', data).group(1)
-    cts = re.split(',|=', motors)
-    Motors = {c.split()[0]: float(cs) for c, cs in zip(cts[::2], cts[1::2])}
-
-    # image_meta_data['User'] = (data[data.index('User: ')+5: data.index(', time')]).strip()
-    # image_meta_data['Time'] = (data[data.index('time: ')+5: data.index('# Temp')-2]).strip()
-    Time = (data[data.index('time: ') + 5: data.index('# Temp') - 2]).strip()
-
-    # d = datetime.strptime(image_meta_data['Time'], "%a %b %d %H:%M:%S %Y")
-    Extras = {}
-    d = datetime.strptime(Time, "%a %b %d %H:%M:%S %Y")
-    Extras['epoch'] = time.mktime(d.timetuple())
-
-    return Counters, Motors, Extras
-
-
 def get_motor_val(pdi_file, motor):
     """Return position of a particular motor from PDI file
 
@@ -536,9 +447,9 @@ def get_motor_val(pdi_file, motor):
     Returns:
         float: Motor position
     """
-    _, Motors = get_meta_from_pdi(pdi_file)
-
-    return Motors[motor]
+    from ssrl_xrd_tools.io.metadata import read_pdi_metadata
+    motors = read_pdi_metadata(pdi_file)
+    return motors[motor]
 
 
 def get_img_data(
