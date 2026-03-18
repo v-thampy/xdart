@@ -13,7 +13,6 @@ keywords = ["xrd", "diffracion", "pyFAI"]
 [tool.poetry.dependencies]
 python = ">=3.8"
 pyfai = "*"
-pygix = "*"
 pyqtgraph = "0.13.3"
 pyqt5 = "*"
 pandas = "*"

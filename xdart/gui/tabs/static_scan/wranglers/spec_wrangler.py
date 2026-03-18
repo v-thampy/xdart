@@ -26,7 +26,8 @@ from xdart.modules.ewald import EwaldArch, EwaldSphere
 from .wrangler_widget import wranglerWidget, wranglerThread, wranglerProcess
 from .ui.specUI import Ui_Form
 from ....gui_utils import NamedActionParameter
-from xdart.utils import get_img_data, get_img_meta
+from xdart.utils import get_img_data
+from ssrl_xrd_tools.io.metadata import read_image_metadata
 from xdart.utils import split_file_name, get_scan_name, get_img_number, get_fname_dir, get_sname_img_number
 from xdart.utils import match_img_detector, get_series_avg, get_specFile, get_mask_array
 from xdart.utils import write_xye, write_csv
@@ -793,14 +794,10 @@ class specWrangler(wranglerWidget):
         if not self.img_file:
             return
 
-        img_meta = get_img_meta(self.img_file, self.meta_ext)
+        img_meta = read_image_metadata(self.img_file, meta_format=self.meta_ext)
         self.scan_parameters = list(img_meta.keys())
-
-        counters = get_img_meta(self.img_file, self.meta_ext, rv='Counters')
-        self.counters = list(counters.keys())
-
-        motors = get_img_meta(self.img_file, self.meta_ext, rv='Motors')
-        self.motors = list(motors.keys())
+        self.counters = self.scan_parameters
+        self.motors = self.scan_parameters
 
     def enabled(self, enable):
         """Sets tree and start button to enable.
@@ -1087,7 +1084,7 @@ class specThread(wranglerThread):
         """
         if self.single_img:
             img_data = get_img_data(self.img_file, self.detector, return_float=True)
-            meta = get_img_meta(self.img_file, self.meta_ext) if self.meta_ext else {}
+            meta = read_image_metadata(self.img_file, meta_format=self.meta_ext) if self.meta_ext else {}
             # return self.img_file, get_img_number(self.img_file), img_data
             scan_name, img_number = get_sname_img_number(self.img_file)
             return self.img_file, scan_name, img_number, img_data, meta
@@ -1127,7 +1124,7 @@ class specThread(wranglerThread):
             if data is None:
                 continue
 
-            meta = get_img_meta(fname, self.meta_ext) if self.meta_ext else {}
+            meta = read_image_metadata(fname, meta_format=self.meta_ext) if self.meta_ext else {}
             n += 1
 
             if (not self.series_average) or (snumber is None):
@@ -1162,8 +1159,7 @@ class specThread(wranglerThread):
         # return None, None, None, None, None
 
     def get_meta_data(self, img_file):
-        meta_file = f'{os.path.splitext(img_file)[0]}.{self.meta_ext}'
-        return get_img_meta(meta_file)
+        return read_image_metadata(img_file, meta_format=self.meta_ext)
 
     def subtract_bg(self, img_data, img_file, img_number, img_meta):
         bg = self.get_background(img_file, img_number, img_meta)
@@ -1249,7 +1245,7 @@ class specThread(wranglerThread):
         if self.bg_type == 'Single BG File':
             if self.bg_file:
                 bg_file = self.bg_file
-                bg_meta = get_img_meta(bg_file, self.meta_ext)
+                bg_meta = read_image_metadata(bg_file, meta_format=self.meta_ext)
         elif self.bg_type == 'Series Average':
             if self.bg_file:
                 sname, fnames, bg, bg_meta = get_series_avg(self.bg_file, self.detector, self.meta_ext)
@@ -1274,7 +1270,7 @@ class specThread(wranglerThread):
                         continue
 
                     # bg_meta = get_img_meta(meta_file)
-                    bg_meta = get_img_meta(bg_file, self.meta_ext)
+                    bg_meta = read_image_metadata(bg_file, meta_format=self.meta_ext)
                     if self.bg_match_fname:
                         if img_number == get_img_number(meta_file):
                             break
