@@ -12,7 +12,9 @@ import os
 import signal
 
 # Set PySide6 as the Qt binding for pyqtgraph before any Qt imports.
+# Also export MPLBACKEND so child processes (e.g. pyFAI-calib2) inherit it.
 os.environ['PYQTGRAPH_QT_LIB'] = 'PySide6'
+os.environ['MPLBACKEND'] = 'QtAgg'
 
 # Set matplotlib backend before any matplotlib import can occur.
 # Use QtAgg (the Qt6 backend) to match pyqtgraph's choice.
