@@ -959,7 +959,7 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             int_data: int_nd_data object, data to parse
 
         returns:
-            data: numpy array, non-zero region from nzarray based on
+            data: numpy array, region selected based on
                 choices in box
             corners: tuple, the bounds of the non-zero region of the
                 dataset

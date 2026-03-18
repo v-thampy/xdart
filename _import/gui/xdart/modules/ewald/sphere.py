@@ -3,12 +3,12 @@ import os
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from pyFAI.multi_geometry import MultiGeometry
 
 from .arch import EwaldArch
 from .arch_series import ArchSeries
 from xdart.utils.containers import int_1d_data_static, int_2d_data_static
 from xdart import utils
+from ssrl_xrd_tools.integrate.multi import stitch_1d, stitch_2d
 
 # from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
 
@@ -100,8 +100,7 @@ class EwaldSphere:
         self.scan_data = scan_data
 
         self.mg_args = mg_args
-        if len(arches) > 0:
-            self.multi_geo = MultiGeometry([a.integrator for a in arches], **mg_args)
+        self._mg_integrators = [a.integrator for a in arches] if arches else []
 
         self.bai_1d_args = bai_1d_args
         self.bai_2d_args = bai_2d_args
@@ -183,9 +182,7 @@ class EwaldSphere:
                 self._update_bai_1d(arch)
                 self._update_bai_2d(arch)
             if set_mg:
-                self.multi_geo = MultiGeometry(
-                    [a.integrator for a in self.arches], **self.mg_args
-                )
+                self._mg_integrators = [a.integrator for a in self.arches]
 
             self.overall_raw += (arch.map_raw - arch.bg_raw)
 
@@ -271,85 +268,55 @@ class EwaldSphere:
             self.save_bai_2d()
 
     def set_multi_geo(self, **args):
-        """Sets the MultiGeometry instance stored in the arch.
+        """Rebuilds the per-arch integrator list used for stitched integration.
 
-        args: see pyFAI.multiple_geometry.MultiGeometry. If no args are
-            passed, uses mg_args attribute. Otherwise, updates
-            mg_args and uses passed arguments.
+        args: passed through to mg_args for bookkeeping (unit, radial_range, etc.)
         """
         self.mg_args.update(args)
         with self.sphere_lock:
-            self.multi_geo = MultiGeometry(
-                [a.integrator for a in self.arches], **self.mg_args
-            )
+            self._mg_integrators = [a.integrator for a in self.arches]
 
     def multigeometry_integrate_1d(self, monitor=None, **kwargs):
-        """Wrapper for integrate1d method of MultiGeometry.
+        """Stitch all arch images into a single 1D pattern via ssrl_xrd_tools.
 
         args:
-            monitor: channel with normalization value
-            kwargs: see MultiGeometry.integrate1d
+            monitor: scan_data column name for per-image normalization counts
+            kwargs: forwarded to stitch_1d (npt, unit, method, radial_range, …)
 
         returns:
-            result: result from MultiGeometry.integrate1d
+            IntegrationResult1D
         """
         with self.sphere_lock:
-            lst_mask = [a.get_mask() for a in self.arches]
-            if monitor is None:
-                try:
-                    result = self.multi_geo.integrate1d(
-                        [a.map_norm for a in self.arches], lst_mask=lst_mask,
-                        **kwargs
-                    )
-                except Exception as e:
-                    print(e)
-                    print('Exception 1')
-                    result = self.multi_geo.integrate1d(
-                        [a.map_raw for a in self.arches], lst_mask=lst_mask,
-                        **kwargs
-                    )
-            else:
-                result = self.multi_geo.integrate1d(
-                    [a.map_raw for a in self.arches], lst_mask=lst_mask,
-                    normalization_factor=list(self.scan_data[monitor]),
-                    **kwargs
-                )
-
-        return result
+            images = [(a.map_raw - a.bg_raw) for a in self.arches]
+            normalization = (
+                list(self.scan_data[monitor]) if monitor is not None else None
+            )
+            return stitch_1d(
+                images,
+                self._mg_integrators,
+                mask=self.global_mask,
+                normalization=normalization,
+                **kwargs,
+            )
 
     def multigeometry_integrate_2d(self, monitor=None, **kwargs):
-        """Wrapper for integrate1d method of MultiGeometry.
+        """Stitch all arch images into a 2D cake pattern via ssrl_xrd_tools.
 
         args:
-            monitor: channel with normalization value
-            kwargs: see MultiGeometry.integrate1d
+            monitor: scan_data column name for per-image normalization counts
+            kwargs: forwarded to stitch_2d (npt_rad, npt_azim, unit, method, …)
 
         returns:
-            result: result from MultiGeometry.integrate1d
+            IntegrationResult2D
         """
         with self.sphere_lock:
-            lst_mask = [a.get_mask() for a in self.arches]
-            if monitor is None:
-                try:
-                    result = self.multi_geo.integrate2d(
-                        [a.map_raw / a.map_norm for a in self.arches], lst_mask=lst_mask,
-                        **kwargs
-                    )
-                except Exception as e:
-                    print(e)
-                    print('Exception 2')
-                    result = self.multi_geo.integrate2d(
-                        [a.map_raw for a in self.arches], lst_mask=lst_mask,
-                        **kwargs
-                    )
-            else:
-                result = self.multi_geo.integrate2d(
-                    [a.map_raw for a in self.arches], lst_mask=lst_mask,
-                    normalization_factor=list(self.scan_data[monitor]),
-                    **kwargs
-                )
-
-        return result
+            images = [(a.map_raw - a.bg_raw) / a.map_norm for a in self.arches]
+            return stitch_2d(
+                images,
+                self._mg_integrators,
+                mask=self.global_mask,
+                **kwargs,
+            )
 
     def save_to_h5(self, replace=False, *args, **kwargs):
         """Saves data to hdf5 file.
