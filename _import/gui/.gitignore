@@ -137,3 +137,4 @@ xdart/pySSRL_bServer/bServer.lnk
 .idea/dictionaries/*
 .idea/libraries/*.xml
 .idea/gradle.xml
+.DS_Store
