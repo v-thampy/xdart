@@ -16,7 +16,6 @@ from ...widgets import defaultWidget
 from xdart import utils
 from xdart.utils.containers import int_2d_data_static
 from xdart.utils import catch_h5py_file as catch
-from xdart.utils.containers import create_ai_from_dict
 
 # Qt imports
 from pyqtgraph import Qt
@@ -579,7 +578,7 @@ class H5Viewer(QWidget):
 
                     # if self.poni_file is not None:
                     if arch.poni_dict is not None:
-                        arch.integrator = create_ai_from_dict(arch.poni_dict)
+                        arch.integrator = arch.setup_integrator()
 
     def get_arches_sum(self, idxs, idxs_memory):
         # ic()

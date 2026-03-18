@@ -499,7 +499,7 @@ def make_poni(poni_file, spec_file, params, detector="Pilatus100k"):
         wavelength = wavelength,
         **params)
 
-    ai = pyFAI.azimuthalIntegrator.AzimuthalIntegrator(**poni_params)
+    ai = pyFAI.integrator.azimuthal.AzimuthalIntegrator(**poni_params)
     ai.save(poni_file)
     print(ai)
     

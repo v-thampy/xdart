@@ -7,7 +7,6 @@ from pyFAI.multi_geometry import MultiGeometry
 
 from .arch import EwaldArch
 from .arch_series import ArchSeries
-from xdart.utils.containers import int_1d_data, int_2d_data
 from xdart.utils.containers import int_1d_data_static, int_2d_data_static
 from xdart import utils
 
@@ -106,16 +105,10 @@ class EwaldSphere:
 
         self.bai_1d_args = bai_1d_args
         self.bai_2d_args = bai_2d_args
-        self.mgi_1d = int_1d_data()
-        self.mgi_2d = int_2d_data()
         self.sphere_lock = Condition(_PyRLock())
 
-        if self.static:
-            self.bai_1d = int_1d_data_static()
-            self.bai_2d = int_2d_data_static()
-        else:
-            self.bai_1d = int_1d_data()
-            self.bai_2d = int_2d_data()
+        self.bai_1d = int_1d_data_static()
+        self.bai_2d = int_2d_data_static()
 
         self.overall_raw = overall_raw
         self.global_mask = global_mask
@@ -128,17 +121,11 @@ class EwaldSphere:
         """
         with self.sphere_lock:
             self.scan_data = pd.DataFrame()
-            self.mgi_1d = int_1d_data()
-            self.mgi_2d = int_2d_data()
             self.arches = ArchSeries(self.data_file, self.file_lock,
                                      static=self.static, gi=self.gi)
             self.global_mask = None
-            if self.static:
-                self.bai_1d = int_1d_data_static()
-                self.bai_2d = int_2d_data_static()
-            else:
-                self.bai_1d = int_1d_data()
-                self.bai_2d = int_2d_data()
+            self.bai_1d = int_1d_data_static()
+            self.bai_2d = int_2d_data_static()
             self.overall_raw = 0
 
     def add_arch(self, arch=None, calculate=True, update=True, get_sd=True,
@@ -215,10 +202,7 @@ class EwaldSphere:
         else:
             self.bai_1d_args = args.copy()
         with self.sphere_lock:
-            if self.static:
-                self.bai_1d = int_1d_data_static()
-            else:
-                self.bai_1d = int_1d_data()
+            self.bai_1d = int_1d_data_static()
 
             for arch in self.arches:
                 arch.integrate_1d(global_mask=self.global_mask, **args)
@@ -238,10 +222,7 @@ class EwaldSphere:
         else:
             self.bai_2d_args = args.copy()
         with self.sphere_lock:
-            if self.static:
-                self.bai_2d = int_2d_data_static()
-            else:
-                self.bai_2d = int_2d_data()
+            self.bai_2d = int_2d_data_static()
 
             for arch in self.arches:
                 arch.integrate_2d(global_mask=self.global_mask, **args)
@@ -253,11 +234,8 @@ class EwaldSphere:
         """
         with self.sphere_lock:
             try:
-                assert list(self.bai_1d.raw.shape) == list(arch.int_1d.raw.shape)
+                assert list(self.bai_1d.norm.shape) == list(arch.int_1d.norm.shape)
             except (AssertionError, AttributeError):
-                if not self.static:
-                    self.bai_1d.raw = np.zeros(arch.int_1d.raw.shape)
-                    self.bai_1d.pcount = np.zeros(arch.int_1d.pcount.shape)
                 self.bai_1d.norm = np.zeros(arch.int_1d.norm.shape)
                 self.bai_1d.sigma = np.zeros(arch.int_1d.norm.shape)
                 self.bai_1d.sigma_raw = np.zeros(arch.int_1d.norm.shape)
@@ -274,34 +252,20 @@ class EwaldSphere:
         """
         with self.sphere_lock:
             try:
-                # assert self.bai_2d.raw.shape == arch.int_2d.raw.shape
-                if self.static:
-                    assert self.bai_2d.i_qChi.shape == arch.int_2d.i_qChi.shape
-                else:
-                    assert self.bai_2d.norm.shape == arch.int_2d.norm.shape
+                assert self.bai_2d.i_qChi.shape == arch.int_2d.i_qChi.shape
             except (AssertionError, AttributeError):
-                if self.static:
-                    self.bai_2d.i_qChi = np.zeros(arch.int_2d.i_qChi.shape)
-                    self.bai_2d.i_tthChi = np.zeros(arch.int_2d.i_tthChi.shape)
-                    self.bai_2d.i_QxyQz = np.zeros(arch.int_2d.i_QxyQz.shape)
-                else:
-                    self.bai_2d.norm = np.zeros(arch.int_2d.norm.shape)
-                    self.bai_2d.raw = np.zeros(arch.int_2d.raw.shape)
-                    self.bai_2d.pcount = np.zeros(arch.int_2d.pcount.shape)
-                    self.bai_2d.sigma = np.zeros(arch.int_2d.norm.shape)
-                    self.bai_2d.sigma_raw = np.zeros(arch.int_2d.norm.shape)
+                self.bai_2d.i_qChi = np.zeros(arch.int_2d.i_qChi.shape)
+                self.bai_2d.i_tthChi = np.zeros(arch.int_2d.i_tthChi.shape)
+                self.bai_2d.i_QxyQz = np.zeros(arch.int_2d.i_QxyQz.shape)
             try:
                 self.bai_2d.ttheta = arch.int_2d.ttheta
                 self.bai_2d.q = arch.int_2d.q
                 self.bai_2d.chi = arch.int_2d.chi
-                if not self.static:
-                    self.bai_2d += arch.int_2d
-                else:
-                    self.bai_2d.i_qChi += arch.int_2d.i_qChi
-                    self.bai_2d.i_tthChi += arch.int_2d.i_tthChi
-                    self.bai_2d.i_QxyQz += arch.int_2d.i_QxyQz
-                    self.bai_2d.qz = arch.int_2d.qz
-                    self.bai_2d.qxy = arch.int_2d.qxy
+                self.bai_2d.i_qChi += arch.int_2d.i_qChi
+                self.bai_2d.i_tthChi += arch.int_2d.i_tthChi
+                self.bai_2d.i_QxyQz += arch.int_2d.i_QxyQz
+                self.bai_2d.qz = arch.int_2d.qz
+                self.bai_2d.qxy = arch.int_2d.qxy
             except AttributeError:
                 pass
             self.save_bai_2d()
@@ -351,7 +315,6 @@ class EwaldSphere:
                     **kwargs
                 )
 
-            self.mgi_1d.from_result(result, self.multi_geo.wavelength)
         return result
 
     def multigeometry_integrate_2d(self, monitor=None, **kwargs):
@@ -386,7 +349,6 @@ class EwaldSphere:
                     **kwargs
                 )
 
-            self.mgi_2d.from_result(result, self.multi_geo.wavelength)
         return result
 
     def save_to_h5(self, replace=False, *args, **kwargs):
@@ -434,17 +396,11 @@ class EwaldSphere:
             utils.attributes_to_h5(self, grp, lst_attr,
                                    compression=compression)
 
-            keys = ('bai_1d', 'bai_2d', 'mgi_1d', 'mgi_2d')
-            if self.static:
-                keys = ('bai_1d', 'bai_2d')
-            for key in keys:
+            for key in ('bai_1d', 'bai_2d'):
                 if key not in grp:
                     grp.create_group(key)
             self.bai_1d.to_hdf5(grp['bai_1d'], compression)
             self.bai_2d.to_hdf5(grp['bai_2d'], compression)
-            if not self.static:
-                self.mgi_1d.to_hdf5(grp['mgi_1d'], compression)
-                self.mgi_2d.to_hdf5(grp['mgi_2d'], compression)
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
         """Loads data stored in hdf5 file.
@@ -499,11 +455,6 @@ class EwaldSphere:
 
                     self.bai_1d.from_hdf5(grp['bai_1d'])
                     self.bai_2d.from_hdf5(grp['bai_2d'])
-                    if not self.static:
-                        self.mgi_1d.from_hdf5(grp['mgi_1d'])
-                        self.mgi_2d.from_hdf5(grp['mgi_2d'])
-                        if set_mg:
-                            self.set_multi_geo(**self.mg_args)
 
     def set_datafile(self, fname, name=None, keep_current_data=False,
                      save_args={}, load_args={}):
