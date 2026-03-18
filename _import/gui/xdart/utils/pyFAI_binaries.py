@@ -121,6 +121,6 @@ class MaskImageWidgetXdart(MaskImageWidget):
             mask_file = os.path.basename(self.outFile)
             out_dialog = Qt.QtWidgets.QMessageBox()
             out_dialog.setText(f'{mask_file} saved in Image directory')
-            out_dialog.exec_()
+            out_dialog.exec()
         event.accept()
         return

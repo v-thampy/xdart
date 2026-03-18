@@ -20,4 +20,4 @@ if __name__ == '__main__':
     app = QtGui.QApplication(sys.argv)
     test = XDImageWidget()
     test.show()
-    app.exec_()
+    app.exec()
