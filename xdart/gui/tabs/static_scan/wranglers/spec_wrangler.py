@@ -34,8 +34,6 @@ from xdart.utils import write_xye, write_csv
 from xdart.utils.containers.poni import get_poni_dict
 # from xdart.utils import natural_sort_ints
 
-from ....widgets import commandLine
-from xdart.modules.pySSRL_bServer.bServer_funcs import specCommand
 
 from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
 
@@ -172,17 +170,6 @@ class specWrangler(wranglerWidget):
         self.ui.stopButton.clicked.connect(self.stop)
         self.ui.continueButton.clicked.connect(self.cont)
 
-        # SpecCommand Line
-        self.specCommandLine = commandLine(self)
-        self.specCommandLine.send_command = self.send_command
-        self.ui.commandLayout.addWidget(self.specCommandLine)
-        self.buttonSend = QtWidgets.QPushButton(self)
-        self.buttonSend.setText('Send')
-        self.buttonSend.clicked.connect(self.send_command)
-        self.ui.commandLayout.addWidget(self.buttonSend)
-        self.commands = ['']
-        self.current = -1
-        self.keep_trying = True
         self.showLabel.connect(self.ui.specLabel.setText)
 
         # Setup parameter tree
@@ -433,21 +420,6 @@ class specWrangler(wranglerWidget):
         self.thread.sphere = self.sphere
         self.thread.data_1d = self.data_1d
         self.thread.data_2d = self.data_2d
-
-    def send_command(self):
-        """Sends command in command line to spec, and calls
-        commandLine send_command method to add command to list of
-        commands.
-        """
-        command = self.specCommandLine.text()
-        if not (command.isspace() or command == ''):
-            try:
-                specCommand(command, queue=True)
-            except Exception as e:
-                print(e)
-                print(f"Command '{command}' not sent")
-
-        commandLine.send_command(self.specCommandLine)
 
     def start(self):
         self.command = 'start'
