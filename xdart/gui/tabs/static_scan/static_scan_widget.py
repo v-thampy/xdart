@@ -629,4 +629,4 @@ class staticWidget(QWidget):
 
         out_dialog = QMessageBox()
         out_dialog.setText(message)
-        out_dialog.exec_()
+        out_dialog.exec()

@@ -44,5 +44,5 @@ if __name__ == '__main__':
     test = Test()
     test.show()
     print("at exec")
-    app.exec_()
+    app.exec()
 

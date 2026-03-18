@@ -148,7 +148,7 @@ def main():
     # app.setStyleSheet(qdarkstyle.load_stylesheet_pyqt5())
     mw = Main(tab_paths)
     mw.show()
-    app.exec_()
+    app.exec()
 
     # try:
     #     os.killpg(os.getpid(), signal.SIGTERM)

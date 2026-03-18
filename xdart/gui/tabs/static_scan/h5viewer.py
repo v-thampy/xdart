@@ -19,7 +19,7 @@ from xdart.utils import catch_h5py_file as catch
 
 # Qt imports
 from pyqtgraph import Qt
-from pyqtgraph.Qt import QtWidgets, QtCore
+from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
 
 # from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
 
@@ -94,38 +94,38 @@ class H5Viewer(QWidget):
         self.toolbar = QtWidgets.QToolBar('Tools')
 
         # File menu setup (part of toolbar)
-        self.actionOpenFolder = QtWidgets.QAction()
+        self.actionOpenFolder = QtGui.QAction()
         self.actionOpenFolder.setText('Open Folder')
 
-        self.actionSetDefaults = QtWidgets.QAction()
+        self.actionSetDefaults = QtGui.QAction()
         self.actionSetDefaults.setText('Advanced...')
 
-        self.actionSaveDataAs = QtWidgets.QAction()
+        self.actionSaveDataAs = QtGui.QAction()
         self.actionSaveDataAs.setText('Save As')
 
-        self.actionNewFile = QtWidgets.QAction()
+        self.actionNewFile = QtGui.QAction()
         self.actionNewFile.setText('New')
 
         self.exportMenu = QtWidgets.QMenu()
         self.exportMenu.setTitle('Export')
 
-        self.actionSaveImage = QtWidgets.QAction()
+        self.actionSaveImage = QtGui.QAction()
         self.actionSaveImage.setText('Current Image')
         self.exportMenu.addAction(self.actionSaveImage)
 
-        self.actionSaveArray = QtWidgets.QAction()
+        self.actionSaveArray = QtGui.QAction()
         self.actionSaveArray.setText('Current 1D Array')
         self.exportMenu.addAction(self.actionSaveArray)
         
         self.paramMenu = QtWidgets.QMenu()
         self.paramMenu.setTitle('Config')
         
-        self.actionSaveParams = QtWidgets.QAction()
+        self.actionSaveParams = QtGui.QAction()
         self.actionSaveParams.setText('Save')
         self.actionSaveParams.triggered.connect(self.defaultWidget.save_defaults)
         self.paramMenu.addAction(self.actionSaveParams)
         
-        self.actionLoadParams = QtWidgets.QAction()
+        self.actionLoadParams = QtGui.QAction()
         self.actionLoadParams.setText('Load')
         self.actionLoadParams.triggered.connect(self.defaultWidget.load_defaults)
         self.paramMenu.addAction(self.actionLoadParams)
