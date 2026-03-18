@@ -10,8 +10,8 @@ import traceback
 import numpy as np
 
 #Qt Imports
-from PyQt5 import QtWidgets
-from PyQt5.QtCore import pyqtSignal
+from PySide6 import QtWidgets
+from PySide6.QtCore import Signal
 
 import pyqtgraph as pg
 
@@ -28,8 +28,8 @@ SUB_PEN = (0, 255, 0)
 
 
 class MaskWidget(QtWidgets.QWidget):
-    newMask = pyqtSignal(int, np.ndarray)
-    requestMask = pyqtSignal(int)
+    newMask = Signal(int, np.ndarray)
+    requestMask = Signal(int)
 
     def __init__(self, parent=None, sphere=None, arch=None):
         super().__init__(parent)

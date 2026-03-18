@@ -4,7 +4,7 @@
 import sys
 
 # Qt imports
-from PyQt5 import QtGui
+from PySide6 import QtGui
 
 if __name__ == '__main__':
     from config import xdart_dir
