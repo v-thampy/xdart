@@ -245,16 +245,18 @@ class staticWidget(QWidget):
     def disconnect_wrangler(self):
         """Disconnects all signals attached the the current wrangler
         """
+        import warnings
         for signal in (self.wrangler.sigStart,
                        self.wrangler.sigUpdateData,
                        self.wrangler.sigUpdateFile,
                        self.wrangler.finished,
                        self.h5viewer.sigNewFile):
-            while True:
-                try:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
                     signal.disconnect()
-                except (TypeError, RuntimeError, SystemError):
-                    break
+            except (TypeError, RuntimeError, SystemError):
+                pass
 
     def thread_state_changed(self):
         """Called whenever a thread is started or finished.
