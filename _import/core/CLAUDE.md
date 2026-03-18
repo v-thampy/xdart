@@ -20,7 +20,7 @@ ssrl_xrd_tools/
 │   ├── nexus.py        # ✅ NeXus/HDF5 reader + writer (Bluesky input; processed-result output)
 │   ├── tiled.py        # ✅ Bluesky/Tiled catalog reader
 │   ├── export.py       # ✅ write_xye, write_csv, write_h5
-│   └── metadata.py     # STUB: txt/pdi/log metadata readers
+│   └── metadata.py     # ✅ txt/pdi metadata readers + unified read_image_metadata
 ├── corrections/    # ✅ Detector & beam corrections
 │   ├── detector.py     # ✅ subtract_dark, apply_flatfield, apply_threshold, apply_mask, combine_masks, correct_image
 │   ├── beam.py         # ✅ polarization_correction, solid_angle_correction, absorption_correction
@@ -131,6 +131,7 @@ xdart (`../xdart/`) is a PyQt5 + pyqtgraph application for interactive XRD integ
 4. Sparse arrays (`containers/nzarrays.py`) → `core/containers.py`
 5. Image loading logic → already replaced by `io/image.py`
 6. SPEC metadata parsing → already replaced by `io/spec.py`
+10. Per-image metadata (txt/pdi sidecar files) → `io/metadata.py` ✅
 7. Integration logic (from EwaldArch) → `integrate/single.py`, `integrate/multi.py` ✅ (Phase 3)
 8. 2D fitting models (`utils/lmfit_models.py`) → already in `analysis/fitting/models.py`
 9. Processed-result HDF5 output → `io/nexus.write_nexus` ✅ (replaces xdart codec for new workflows)
@@ -153,6 +154,7 @@ After extraction, xdart imports from `ssrl_xrd_tools` and becomes a thin GUI she
 - `integrate/multi.py` — create_multigeometry_integrators, stitch_1d, stitch_2d (MultiGeometry stitching)
 - `integrate/single.py` — integrate_1d, integrate_2d, integrate_scan; explicit `polarization_factor` and `normalization_factor` params (see note below)
 - `io/export.py` — write_xye, write_csv, write_h5
+- `io/metadata.py` — read_txt_metadata, read_pdi_metadata, read_image_metadata
 - `io/image.py` — detector-agnostic image I/O via fabio + HDF5 (220 lines)
 - `io/nexus.py` — read_nexus, find_nexus_image_dataset, list_entries; write_nexus, open_nexus_writer, write_nexus_frame (NeXus/HDF5 reader + writer; write_nexus replaces the custom xdart HDF5 codec for new workflows — LZF compression, SWMR support for live beamline reduction)
 - `io/spec.py` — SPEC file parsing via silx (97 lines)
@@ -168,7 +170,6 @@ After extraction, xdart imports from `ssrl_xrd_tools` and becomes a thin GUI she
 > raw pixel array *before* integration. Do not apply both; pick whichever fits your pipeline.
 
 **Stubs** (docstrings describe intended API, implement these):
-- `io/metadata.py`
 - `analysis/fitting/peaks.py`, `analysis/fitting/background.py`
 - `analysis/phase.py`, `analysis/texture.py`, `analysis/strain.py`, `analysis/refinement.py`
 
