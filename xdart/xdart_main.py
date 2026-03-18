@@ -11,15 +11,15 @@ import gc
 import os
 import signal
 
-# Set matplotlib backend before any matplotlib import can occur.
-# Use Qt5Agg (the PyQt5-specific backend) to match pyqtgraph's choice;
-# this prevents the "already loaded with macosx backend" warning.
-import matplotlib
-matplotlib.use('Qt5Agg')
+# Set PySide6 as the Qt binding for pyqtgraph before any Qt imports.
+os.environ['PYQTGRAPH_QT_LIB'] = 'PySide6'
 
-# Suppress pyFAI INFO logs (e.g. "No sensor configuration provided") and
-# the spurious pyFAI.gui.matplotlib backend-mismatch warning (Qt5Agg vs QtAgg
-# are functionally identical on PyQt5 — pyFAI just checks the string).
+# Set matplotlib backend before any matplotlib import can occur.
+# Use QtAgg (the Qt6 backend) to match pyqtgraph's choice.
+import matplotlib
+matplotlib.use('QtAgg')
+
+# Suppress pyFAI INFO logs (e.g. "No sensor configuration provided").
 import logging
 logging.getLogger('pyFAI').setLevel(logging.WARNING)
 logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
@@ -141,7 +141,6 @@ class Main(QMainWindow):
 
 def main():
     # multiprocessing.freeze_support()
-    os.environ['PYQTGRAPH_QT_LIB'] = 'PyQt5'
     tab_paths = setup_data_folders(tabs.exp_list)
     # app = QtGui.QApplication(sys.argv)
     app = QtWidgets.QApplication(sys.argv)
