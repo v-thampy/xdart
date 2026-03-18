@@ -11,6 +11,19 @@ import gc
 import os
 import signal
 
+# Set matplotlib backend before any matplotlib import can occur.
+# Use Qt5Agg (the PyQt5-specific backend) to match pyqtgraph's choice;
+# this prevents the "already loaded with macosx backend" warning.
+import matplotlib
+matplotlib.use('Qt5Agg')
+
+# Suppress pyFAI INFO logs (e.g. "No sensor configuration provided") and
+# the spurious pyFAI.gui.matplotlib backend-mismatch warning (Qt5Agg vs QtAgg
+# are functionally identical on PyQt5 — pyFAI just checks the string).
+import logging
+logging.getLogger('pyFAI').setLevel(logging.WARNING)
+logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
+
 # Qt imports
 from pyqtgraph.Qt import QtGui, QtWidgets
 
@@ -112,13 +125,7 @@ class Main(QMainWindow):
             self.tabwidget.addTab(self.tabs['static_scan'], 'static_scan')
 
     def openExperiment(self, q):
-        if q.text() == 'ttheta_scan':
-            if 'ttheta_scan' not in self.tabs:
-                if self.width() < 1300:
-                    self.resize(1300, self.height())
-                self.tabs['ttheta_scan'] = tabs.ttheta_scan.tthetaWidget(local_path=self.tab_paths['ttheta_scan'])
-                self.tabwidget.addTab(self.tabs['ttheta_scan'], 'ttheta_scan')
-        elif q.text() == 'static_scan':
+        if q.text() == 'static_scan':
             if 'static_scan' not in self.tabs:
                 self.tabs['static_scan'] = tabs.static_scan.staticWidget(local_path=self.tab_paths['static_scan'])
                 self.tabwidget.addTab(self.tabs['static_scan'], 'static_scan')

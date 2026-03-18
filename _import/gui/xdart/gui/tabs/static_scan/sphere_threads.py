@@ -11,7 +11,6 @@ import numpy as np
 from scipy.interpolate import RectBivariateSpline
 
 # Other imports
-from xdart.utils.containers import int_1d_data, int_2d_data
 from xdart.utils.containers import int_1d_data_static, int_2d_data_static
 from xdart.modules.ewald import EwaldArch
 
@@ -89,10 +88,7 @@ class integratorThread(Qt.QtCore.QThread):
         """
         self.data_2d.clear()
         with self.sphere.sphere_lock:
-            if self.sphere.static:
-                self.sphere.bai_2d = int_2d_data_static()
-            else:
-                self.sphere.bai_2d = int_2d_data()
+            self.sphere.bai_2d = int_2d_data_static()
         for arch in self.sphere.arches:
             if self.sphere.static:
                 arch.static = True
@@ -120,10 +116,7 @@ class integratorThread(Qt.QtCore.QThread):
         """
         self.data_1d.clear()
         with self.sphere.sphere_lock:
-            if self.sphere.static:
-                self.sphere.bai_1d = int_1d_data_static()
-            else:
-                self.sphere.bai_1d = int_1d_data()
+            self.sphere.bai_1d = int_1d_data_static()
         for arch in self.sphere.arches:
             if self.sphere.static:
                 arch.static = True

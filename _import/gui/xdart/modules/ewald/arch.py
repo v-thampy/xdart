@@ -5,18 +5,24 @@ Created on Mon Aug 26 14:21:58 2019
 @author: walroth
 """
 import copy
+import types
 from threading import Condition
 
-from pyFAI.azimuthalIntegrator import AzimuthalIntegrator
-from pyFAI.containers import Integrate1dResult, Integrate2dResult
+from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 from pyFAI import units
 import numpy as np
 
 from xdart import utils
-from xdart.utils.containers import PONI, int_1d_data, int_2d_data, create_ai_from_dict
+from xdart.utils.containers import PONI
 from xdart.utils.containers import int_1d_data_static, int_2d_data_static
-
-from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
+from ssrl_xrd_tools.integrate.calibration import poni_to_integrator
+from ssrl_xrd_tools.integrate.single import integrate_1d, integrate_2d
+from ssrl_xrd_tools.integrate.gid import (
+    create_fiber_integrator,
+    integrate_gi_1d,
+    integrate_gi_2d,
+    integrate_gi_polar,
+)
 
 
 class EwaldArch():
@@ -108,23 +114,27 @@ class EwaldArch():
         self.arch_lock = Condition()
         self.map_norm = 1
 
-        if self.static:
-            self.int_1d = int_1d_data_static()
-            self.int_2d = int_2d_data_static()
-        else:
-            self.int_1d = int_1d_data()
-            self.int_2d = int_2d_data()
+        self.int_1d = int_1d_data_static()
+        self.int_2d = int_2d_data_static()
 
     def setup_integrator(self):
-        """Sets up integrator object"""
-        # if self.poni_dict is not None:
-        if self.static:
-            if self.poni_dict is not None:
-                integrator = create_ai_from_dict(self.poni_dict, self.gi)
-            else:
-                integrator = AzimuthalIntegrator()
+        """Sets up integrator object (always a plain AzimuthalIntegrator;
+        GI uses create_fiber_integrator transiently during integration)."""
+        if self.poni_dict is not None:
+            # poni_dict holds raw pyFAI AI internal attributes (_dist, _rot1, …)
+            # from legacy xdart files; set them directly on the AI instance.
+            ai = AzimuthalIntegrator()
+            for k, v in self.poni_dict.items():
+                ai.__setattr__(k, v)
+            det = getattr(ai, 'detector', None)
+            if det is not None and 'MX225' in getattr(det, 'name', ''):
+                ai._rot3 -= np.deg2rad(90)
+            return ai
         else:
-            integrator = AzimuthalIntegrator(
+            from ssrl_xrd_tools.core.containers import PONI as LibPONI
+            det_obj = getattr(self.poni, 'detector', None)
+            det_name = getattr(det_obj, 'name', None) or ''
+            lib_poni = LibPONI(
                 dist=self.poni.dist,
                 poni1=self.poni.poni1,
                 poni2=self.poni.poni2,
@@ -132,10 +142,34 @@ class EwaldArch():
                 rot2=self.poni.rot2,
                 rot3=self.poni.rot3,
                 wavelength=self.poni.wavelength,
-                detector=self.poni.detector,
-                **self.ai_args
+                detector=det_name,
             )
-        return integrator
+            return poni_to_integrator(lib_poni)
+
+    def _make_lib_poni(self):
+        """Return an ssrl_xrd_tools PONI from self.integrator geometry."""
+        from ssrl_xrd_tools.core.containers import PONI as LibPONI
+        ai = self.integrator
+        det = getattr(ai, 'detector', None)
+        det_name = getattr(det, 'name', '') or ''
+        wl = getattr(ai, 'wavelength', None)
+        return LibPONI(
+            dist=float(ai.dist),
+            poni1=float(ai.poni1),
+            poni2=float(ai.poni2),
+            rot1=float(ai.rot1),
+            rot2=float(ai.rot2),
+            rot3=float(ai.rot3),
+            wavelength=float(wl) if wl else 0.0,
+            detector=str(det_name),
+        )
+
+    def _get_incident_angle(self):
+        """Return incident angle in degrees from th_mtr or scan_info."""
+        try:
+            return float(self.th_mtr)
+        except (ValueError, TypeError):
+            return float(self.scan_info.get(self.th_mtr, 0.0))
 
     def reset(self):
         """Clears all data, resets to a default EwaldArch.
@@ -149,12 +183,8 @@ class EwaldArch():
         self.scan_info = {}
         self.integrator = self.setup_integrator()
         self.map_norm = 1
-        if self.static:
-            self.int_1d = int_1d_data_static()
-            self.int_2d = int_2d_data_static()
-        else:
-            self.int_1d = int_1d_data()
-            self.int_2d = int_2d_data()
+        self.int_1d = int_1d_data_static()
+        self.int_2d = int_2d_data_static()
             
     def get_mask(self, global_mask=None):
         if global_mask is not None:
@@ -186,9 +216,6 @@ class EwaldArch():
         returns:
             result: integrate1d result from pyFAI.
         """
-        if (not self.static) and (radial_range is None):
-            radial_range = [0, 180]
-
         with self.arch_lock:
             self.map_norm = 1
             if monitor is not None:
@@ -201,65 +228,60 @@ class EwaldArch():
                 self.mask = np.arange(self.map_raw.size)[self.map_raw.flatten() < 0]
 
             if not self.gi:
-                result = self.integrator.integrate1d(
-                    # self.map_raw/self.map_norm, numpoints, unit=unit,
-                    (self.map_raw-self.bg_raw)/self.map_norm, numpoints, unit=unit,
-                    radial_range=radial_range, mask=self.get_mask(global_mask),
-                    **kwargs
+                result = integrate_1d(
+                    (self.map_raw - self.bg_raw) / self.map_norm,
+                    self.integrator,
+                    npt=numpoints,
+                    unit=str(unit),
+                    radial_range=radial_range,
+                    mask=self.get_mask(global_mask),
+                    **kwargs,
                 )
-
-                wavelength = self.poni.wavelength
-                if self.static:
-                    wavelength = self.integrator.wavelength
-                self.int_1d.from_result(result, wavelength, unit=unit)
+                self.int_1d.from_result(result, self.integrator.wavelength, unit=str(unit))
             else:
-                pg_args = ['process', 'filename', 'correctSolidAngle', 'variance', 'error_model',
-                           'dummy', 'delta_dummy', 'polarization_factor', 'dark', 'flat',
-                           'method', 'safe', 'normalization_factor']
-                pg_args = {k: v for (k, v) in kwargs.items() if k in pg_args}
+                _gi_valid = {
+                    'correctSolidAngle', 'variance', 'error_model',
+                    'dummy', 'delta_dummy', 'polarization_factor', 'dark', 'flat',
+                    'normalization_factor',
+                }
+                gi_kwargs = {k: v for k, v in kwargs.items() if k in _gi_valid}
 
-                # incident angle in deg
-                try:
-                    self.integrator.incident_angle = float(self.th_mtr)
-                except ValueError:
-                    try:
-                        self.integrator.incident_angle = self.scan_info[self.th_mtr]
-                    except KeyError:
-                        pass
-
-                # ic(self.integrator.incident_angle)
-                # tilt angle of sample in deg (misalignment in "chi")
-                self.integrator.tilt_angle = self.tilt_angle
-
-                Intensity, qAxis = self.integrator.integrate_1d(
-                    # self.map_raw/self.map_norm, numpoints, unit='q_A^-1',
-                    (self.map_raw-self.bg_raw)/self.map_norm, numpoints, unit='q_A^-1',
-                    p0_range=radial_range, p1_range=kwargs['azimuth_range'],
-                    mask=self.get_mask(global_mask), **pg_args
+                incident_angle = self._get_incident_angle()
+                fi = create_fiber_integrator(
+                    self._make_lib_poni(),
+                    incident_angle=incident_angle,
+                    tilt_angle=self.tilt_angle,
+                    angle_unit="deg",
                 )
-                result = Integrate1dResult(qAxis, Intensity)
-                self.int_1d.from_result(result, self.integrator.wavelength, unit='q_A^-1')
 
-                # Get in-plane and out-of-plane contributions
-                pg_args.pop('safe')
-                i_qz, qz = self.integrator.profile_op_box(
-                    (self.map_raw-self.bg_raw)/self.map_norm, numpoints, unit='q_A^-1',
-                    ip_width=360.,
-                    # p0_range=radial_range, p1_range=kwargs['azimuth_range'],
-                    mask=self.get_mask(global_mask), **pg_args
+                image_data = (self.map_raw - self.bg_raw) / self.map_norm
+                mask = self.get_mask(global_mask)
+
+                # Main 1D: in-plane (Qxy) profile — integrate over OOP axis
+                r_ip = integrate_gi_1d(
+                    image_data, fi, npt=numpoints, unit='qoop_A^-1',
+                    method='no', mask=mask,
+                    radial_range=radial_range,
+                    azimuth_range=kwargs.get('azimuth_range'),
+                    **gi_kwargs,
                 )
-                self.int_1d.i_qz, self.int_1d.qz = i_qz, qz
-
-                i_qxy, qxy = self.integrator.profile_ip_box(
-                    (self.map_raw-self.bg_raw)/self.map_norm, numpoints, unit='q_A^-1',
-                    op_width=360.,
-                    # p0_range=radial_range, p1_range=kwargs['azimuth_range'],
-                    mask=self.get_mask(global_mask), **pg_args
+                # r_ip.radial is the IP (Qxy) axis in Å^-1; treat as q for display
+                result_compat = types.SimpleNamespace(
+                    radial=r_ip.radial, intensity=r_ip.intensity, unit='q_A^-1'
                 )
-                self.int_1d.i_qxy, self.int_1d.qxy = i_qxy, qxy
+                self.int_1d.from_result(result_compat, fi.wavelength, unit='q_A^-1')
+                self.int_1d.i_qxy = r_ip.intensity
+                self.int_1d.qxy = r_ip.radial
 
-        # q = result.radial
-        del result
+                # OOP (Qz) profile: sum the (Qip, Qoop) 2D map over the IP axis
+                r2d = integrate_gi_2d(
+                    image_data, fi, npt_rad=min(numpoints, 500),
+                    npt_azim=min(numpoints, 500),
+                    method='no', mask=mask,
+                )
+                # r2d.intensity.shape == (npt_rad, npt_azim) = (Qip, Qoop)
+                self.int_1d.i_qz = np.nansum(r2d.intensity, axis=0)
+                self.int_1d.qz = r2d.azimuthal
 
     def integrate_2d(self, npt_rad=1000, npt_azim=1000, monitor=None,
                      radial_range=None, azimuth_range=None,
@@ -279,88 +301,92 @@ class EwaldArch():
             monitor: str, keyword for normalization counter in scan_info
             unit: pyFAI unit for integration, units.TTH_DEG, units.Q_A,
                 '2th_deg', or 'q_A^-1'
+            x_range: tuple or list, IP range for GI reciprocal map
+            y_range: tuple or list, OOP range for GI reciprocal map
             kwargs: other keywords to be passed to integrate2d, see pyFAI docs.
 
         returns:
             result: integrate2d result from pyFAI.
         """
-        if (not self.static) and (radial_range is None):
-            radial_range = [0, 180]
-        if (not self.static) and (azimuth_range is None):
-            azimuth_range = [-180, 180]
-
         with self.arch_lock:
             if monitor is not None:
-                if self.static:
-                    self.map_norm = 1
-                else:
-                    if monitor.upper() in self.scan_info.keys():
-                        self.map_norm = self.scan_info[monitor.upper()]
-                    elif monitor.lower() in self.scan_info.keys():
-                        self.map_norm = self.scan_info[monitor.lower()]
-                    else:
-                        self.map_norm = 1
-
-                    # self.map_norm = self.scan_info[monitor]
+                self.map_norm = 1
 
             if self.mask is None:
                 self.mask = np.arange(self.map_raw.size)[self.map_raw.flatten() < 0]
-            
+
             if npt_rad is None:
                 npt_rad = self.map_raw.shape[0]
-            
+
             if npt_azim is None:
                 npt_azim = self.map_raw.shape[1]
 
             if not self.gi:
-                result = self.integrator.integrate2d(
-                    # self.map_raw/self.map_norm, npt_rad, npt_azim, unit=unit,
-                    (self.map_raw-self.bg_raw)/self.map_norm, npt_rad, npt_azim, unit=unit,
-                    mask=self.get_mask(global_mask), radial_range=radial_range,
-                    azimuth_range=azimuth_range, **kwargs
+                result = integrate_2d(
+                    (self.map_raw - self.bg_raw) / self.map_norm,
+                    self.integrator,
+                    npt_rad=npt_rad,
+                    npt_azim=npt_azim,
+                    unit=str(unit),
+                    mask=self.get_mask(global_mask),
+                    radial_range=radial_range,
+                    azimuth_range=azimuth_range,
+                    **kwargs,
                 )
-                wavelength = self.poni.wavelength
-                if self.static:
-                    wavelength = self.integrator.wavelength
-                self.int_2d.from_result(result, wavelength, unit=unit)
+                # int_2d_data_static.parse_unit expects intensity shaped (npt_azim, npt_rad);
+                # integrate_2d returns (npt_rad, npt_azim), so transpose back.
+                result_compat = types.SimpleNamespace(
+                    radial=result.radial,
+                    azimuthal=result.azimuthal,
+                    intensity=result.intensity.T,
+                    unit=result.unit,
+                )
+                self.int_2d.from_result(result_compat, self.integrator.wavelength, unit=str(unit))
             else:
-                pg_args = ['filename', 'correctSolidAngle', 'variance', 'error_model',
-                           'dummy', 'delta_dummy', 'polarization_factor', 'dark', 'flat',
-                           'method', 'safe', 'normalization_factor']
-                pg_args = {k: v for (k, v) in kwargs.items() if k in pg_args}
+                _gi_valid = {
+                    'correctSolidAngle', 'variance', 'error_model',
+                    'dummy', 'delta_dummy', 'polarization_factor', 'dark', 'flat',
+                    'normalization_factor',
+                }
+                gi_kwargs = {k: v for k, v in kwargs.items() if k in _gi_valid}
 
-                # incident angle in deg
-                try:
-                    self.integrator.incident_angle = float(self.th_mtr)
-                except ValueError:
-                    try:
-                        self.integrator.incident_angle = self.scan_info[self.th_mtr]
-                    except KeyError:
-                        pass
+                incident_angle = self._get_incident_angle()
+                fi = create_fiber_integrator(
+                    self._make_lib_poni(),
+                    incident_angle=incident_angle,
+                    tilt_angle=self.tilt_angle,
+                    angle_unit="deg",
+                )
 
-                # ic(self.integrator.incident_angle)
+                image_data = self.map_raw - self.bg_raw
+                mask = self.get_mask(global_mask)
 
-                # tilt angle of sample in deg (misalignment in "chi")
-                self.integrator.tilt_angle = self.tilt_angle
+                # Polar (Q-Chi) map
+                r_polar = integrate_gi_polar(
+                    image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
+                    method='no', mask=mask, **gi_kwargs,
+                )
+                # r_polar.intensity.shape == (npt_rad, npt_azim) = (Q, Chi)
+                # from_result expects (npt_azim, npt_rad) = (Chi, Q) → transpose
+                result_compat = types.SimpleNamespace(
+                    radial=r_polar.radial,
+                    azimuthal=r_polar.azimuthal,
+                    intensity=r_polar.intensity.T,
+                    unit='q_A^-1',
+                )
 
-                if unit == '2th_deg':
-                    radial_range = self.convert_radial_range(radial_range, self.integrator.wavelength)
-
-                # Transform to polar (Q-Chi) coordinates
-                i_qchi, Q, Chi = self.integrator.transform_image(
-                    self.map_raw-self.bg_raw, process='polar', npt=(npt_rad, npt_azim),
-                    x_range=radial_range, y_range=azimuth_range, unit='q_A^-1',
-                    mask=self.get_mask(global_mask), all=False, **pg_args)
-                result = Integrate2dResult(i_qchi, Q, Chi)
-
-                # Transform to reciprocal (Qz-Qxy) coordinates
-                i_QxyQz, qxy, qz = self.integrator.transform_image(
-                    self.map_raw-self.bg_raw, process='reciprocal', npt=(npt_rad, npt_azim),
-                    x_range=x_range, y_range=y_range, unit='q_A^-1',
-                    mask=self.get_mask(), all=False, **pg_args)
-
-                self.int_2d.from_result(result, self.integrator.wavelength, unit=unit,
-                                        i_QxyQz=np.flipud(i_QxyQz), qz=qz, qxy=qxy)
+                # Fiber (Qip, Qoop) = (Qxy, Qz) map
+                r_gi2d = integrate_gi_2d(
+                    image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
+                    method='no', mask=mask,
+                    radial_range=x_range, azimuth_range=y_range,
+                    **gi_kwargs,
+                )
+                # r_gi2d.radial = Qip (Qxy), r_gi2d.azimuthal = Qoop (Qz)
+                # r_gi2d.intensity.shape == (npt_rad, npt_azim) = (Qxy, Qz)
+                self.int_2d.from_result(result_compat, fi.wavelength, unit=unit,
+                                        i_QxyQz=np.flipud(r_gi2d.intensity),
+                                        qz=r_gi2d.azimuthal, qxy=r_gi2d.radial)
 
     def set_integrator(self, **args):
         """Sets AzimuthalIntegrator with new arguments.
@@ -394,18 +420,6 @@ class EwaldArch():
     def set_scan_info(self, new_data):
         with self.arch_lock:
             self.scan_info = new_data
-
-    @staticmethod
-    def convert_radial_range(radial_range, wavelength):
-        """Convert radial range from Q (AA-1) to 2Th (deg)"""
-        if radial_range is None:
-            return None
-
-        radial_range = np.asarray(radial_range)
-        radial_range = (4 * np.pi / (wavelength * 1e10)) *\
-            np.sin(np.radians(radial_range / 2))
-
-        return radial_range
 
     def save_to_h5(self, file, compression='lzf'):
         """Saves data to hdf5 file using h5py as backend.
@@ -466,20 +480,7 @@ class EwaldArch():
                                 utils.h5_to_dict(grp['poni'])
                             )
 
-                            if self.poni_dict is not None:
-                                self.integrator = create_ai_from_dict(self.poni_dict)
-                            else:
-                                self.integrator = AzimuthalIntegrator(
-                                    dist=self.poni.dist,
-                                    poni1=self.poni.poni1,
-                                    poni2=self.poni.poni2,
-                                    rot1=self.poni.rot1,
-                                    rot2=self.poni.rot2,
-                                    rot3=self.poni.rot3,
-                                    wavelength=self.poni.wavelength,
-                                    detector=self.poni.detector,
-                                    **self.ai_args
-                                )
+                            self.integrator = self.setup_integrator()
 
     def copy(self, include_2d=True):
         """Returns a copy of self.

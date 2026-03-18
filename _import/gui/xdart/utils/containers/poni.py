@@ -1,7 +1,7 @@
 from pyFAI.detectors import Detector
 from pyFAI import detector_factory
-from pyFAI.azimuthalIntegrator import AzimuthalIntegrator
-import pygix, pyFAI
+from pyFAI.integrator.azimuthal import AzimuthalIntegrator
+import pyFAI
 import yaml
 import numpy as np
 
@@ -150,21 +150,3 @@ def get_poni_dict(poni_file):
         return None
 
 
-def create_ai_from_dict(poni_dict, gi=False):
-    """Create Azimuthal Integrator object from Dictionary"""
-    ai = AzimuthalIntegrator()
-    for k, v in poni_dict.items():
-        ai.__setattr__(k, v)
-
-    if not gi:
-        if 'MX225' in ai.detector.name:
-            ai._rot3 -= np.deg2rad(90)
-    else:
-        calib_pars = dict(
-            dist=ai._dist, poni1=ai._poni1, poni2=ai._poni2,
-            rot1=ai._rot1, rot2=ai._rot2, rot3=ai._rot3,
-            wavelength=ai._wavelength, detector=ai.detector)
-        ai = pygix.Transform(**calib_pars)
-        ai.sample_orientation = 3  # 1 is horizontal, 2 is vertical
-
-    return ai
