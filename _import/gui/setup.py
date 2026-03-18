@@ -139,7 +139,7 @@ setup(
     #
     # For an analysis of "install_requires" vs pip's requirements files see:
     # https://packaging.python.org/discussions/install-requires-vs-requirements/
-    install_requires=['ssrl_xrd_tools', 'pyfai', 'pyqtgraph', 'pyqt5', 'pandas',
+    install_requires=['ssrl_xrd_tools', 'pyfai', 'pyqtgraph', 'PySide6', 'pandas',
             'scikit-image', 'lmfit', 'pyyaml', 'numpy', 'scipy', 'silx',
             'fabio', 'matplotlib', 'requests', 'h5py', 'hdf5plugin', 'seaborn',
             'ipympl', 'ipywidgets', 'joblib', 'icecream', 'jupyterlab',

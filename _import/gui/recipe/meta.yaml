@@ -22,8 +22,8 @@ requirements:
   run:
     - python >=3.8,<3.12
     - pyfai
-    - pyqtgraph
-    - pyqt
+    - pyqtgraph >=0.13.7
+    - pyside6 >=6.5
     - pandas
     - scikit-image
     - lmfit
