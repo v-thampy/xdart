@@ -1,12 +1,12 @@
 [build-system]
 requires = ["setuptools>=64"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssrl_xrd_tools"
 version = "0.1.0"
 description = "SSRL X-ray diffraction data processing and visualization tools"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "numpy",
     "scipy",
@@ -27,6 +27,7 @@ gui = [
     "bokeh",
     "napari",
 ]
+tiled = ["tiled[client]"]
 vtk = ["pyevtk"]
 dev = [
     "jupyterlab",
@@ -41,3 +42,10 @@ xdart = "ssrl_xrd_tools.gui.main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+markers = [
+    "slow: tests that use full-size detector images or expensive integrations",
+]
