@@ -9,6 +9,7 @@ import traceback
 import gc
 
 # This module imports
+from xdart.utils.session import load_session, save_session
 from .ui.h5viewerUI import Ui_Form
 from xdart.modules.ewald import EwaldArch
 from .sphere_threads import fileHandlerThread
@@ -193,7 +194,14 @@ class H5Viewer(QWidget):
         # ic()
         # self.update_scans()
         self.update_data()
-        
+
+        # Restore session
+        session = load_session()
+        saved_dir = session.get('data_dir', '')
+        if saved_dir and os.path.isdir(saved_dir):
+            self.dirname = saved_dir
+            self.update_scans()
+
     def update_scans(self):
         """Takes in directory path and adds files in path to listScans
         """
@@ -467,6 +475,7 @@ class H5Viewer(QWidget):
         )
         if os.path.exists(dirname):
             self.dirname = dirname
+            save_session({'data_dir': dirname})
             self.arches.clear()
             self.data_1d.clear()
             self.data_2d.clear()
