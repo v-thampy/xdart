@@ -15,7 +15,7 @@ from matplotlib import cm
 from pathlib import Path
 
 # Qt imports
-from PyQt5.QtCore import Qt as pyQt
+from PySide6.QtCore import Qt as pyQt
 import pyqtgraph as pg
 from pyqtgraph import Qt
 from pyqtgraph.Qt import QtWidgets
