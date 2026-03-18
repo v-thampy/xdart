@@ -31,6 +31,7 @@ from ssrl_xrd_tools.io.metadata import read_image_metadata
 from xdart.utils import split_file_name, get_scan_name, get_img_number, get_fname_dir, get_sname_img_number
 from xdart.utils import match_img_detector, get_series_avg, get_specFile, get_mask_array
 from xdart.utils import write_xye, write_csv
+from xdart.utils.session import load_session, save_session
 from xdart.utils.containers.poni import get_poni_dict
 # from xdart.utils import natural_sort_ints
 
@@ -331,6 +332,18 @@ class specWrangler(wranglerWidget):
 
         self.setup()
 
+        # Restore session
+        session = load_session()
+        poni = session.get('poni_file', '')
+        if poni and Path(poni).exists():
+            self.parameters.child('Calibration').child('poni_file').setValue(poni)
+            self.poni_file = poni
+            self.get_poni_dict()
+        meta_ext = session.get('meta_ext')
+        if meta_ext is not None:
+            self.parameters.child('Signal').child('meta_ext').setValue(meta_ext)
+            self.meta_ext = None if meta_ext == 'None' else meta_ext
+
     def setup(self):
         """Sets up the child thread, syncs all parameters.
         """
@@ -460,6 +473,7 @@ class specWrangler(wranglerWidget):
         if fname != '':
             self.parameters.child('Calibration').child('poni_file').setValue(fname)
             self.poni_file = fname
+            save_session({'poni_file': fname})
 
     def get_poni_dict(self):
         """Opens file dialogue and sets the calibration file
@@ -592,6 +606,7 @@ class specWrangler(wranglerWidget):
         self.meta_ext = self.parameters.child('Signal').child('meta_ext').value()
         if self.meta_ext == 'None':
             self.meta_ext = None
+        save_session({'meta_ext': self.meta_ext or 'None'})
         self.get_img_fname()
 
     def exists_meta_file(self, img_file):
