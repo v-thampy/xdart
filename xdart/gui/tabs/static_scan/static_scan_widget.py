@@ -253,7 +253,7 @@ class staticWidget(QWidget):
             while True:
                 try:
                     signal.disconnect()
-                except TypeError:
+                except (TypeError, RuntimeError, SystemError):
                     break
 
     def thread_state_changed(self):
