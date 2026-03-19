@@ -181,7 +181,7 @@ class NamedActionParameterItem(ParameterItem):
         if tree is None:
             return
         
-        tree.setFirstItemColumnSpanned(self, True)
+        self.setFirstColumnSpanned(True)
         tree.setItemWidget(self, 0, self.layoutWidget)
         
     def paramRenamed(self, param, name):

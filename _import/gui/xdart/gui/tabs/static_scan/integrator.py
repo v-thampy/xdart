@@ -37,6 +37,11 @@ Units_dict = {Units[0]: 'q_A^-1', Units[1]: '2th_deg'}
 # Units_dict_inv = {'q_A^-1': Units[0], '2th_deg': Units[1]}
 Units_dict_inv = {'q_A^-1': 0, '2th_deg': 1}
 
+GI_MODES_1D = ['q_ip', 'q_oop', 'q_total', 'exit_angle']
+GI_LABELS_1D = ["Q in-plane", "Q out-of-plane", "Q total", "Exit angle"]
+GI_MODES_2D = ['qip_qoop', 'q_chi', 'exit_angles']
+GI_LABELS_2D = ["Qip vs Qoop", "Q vs Chi", "Exit angles"]
+
 params = [
     {'name': 'Default', 'type': 'group', 'children': [
             {'name': 'Integrate 1D', 'type': 'group', 'children': [
@@ -204,8 +209,9 @@ class integratorTree(Qt.QtWidgets.QWidget):
         self.setEnabled()
         # self.set_image_units()
 
-        # Connect Axis 2D signal
-        self.ui.axis2D.currentIndexChanged.connect(self._update_axes)
+        # Connect GI mode selectors
+        self.ui.axis1D.currentIndexChanged.connect(self._update_gi_mode_1d)
+        self.ui.axis2D.currentIndexChanged.connect(self._update_gi_mode_2d)
 
     def update(self):
         """Grabs args from sphere and uses _sync_ranges and
@@ -565,7 +571,7 @@ class integratorTree(Qt.QtWidgets.QWidget):
             _range = self._get_valid_range(self.ui.radial_low_2D,
                                            self.ui.radial_high_2D)
 
-        if self.ui.axis2D.currentIndex() == 1:
+        if self.sphere.gi and self.ui.axis2D.currentIndex() == 0:  # Qip vs Qoop
             self.sphere.bai_2d_args['x_range'] = _range
         else:
             self.sphere.bai_2d_args['radial_range'] = _range
@@ -608,7 +614,7 @@ class integratorTree(Qt.QtWidgets.QWidget):
             _range = self._get_valid_range(self.ui.azim_low_2D,
                                            self.ui.azim_high_2D)
 
-        if self.ui.axis2D.currentIndex() == 1:
+        if self.sphere.gi and self.ui.axis2D.currentIndex() == 0:  # Qip vs Qoop
             self.sphere.bai_2d_args['y_range'] = _range
         else:
             self.sphere.bai_2d_args['azimuth_range'] = _range
@@ -898,18 +904,37 @@ class integratorTree(Qt.QtWidgets.QWidget):
         # postProcessId21([processFile], mask)
 
     def set_image_units(self):
-        """Disable/Enable Qz-Qxy option if we are/are not in GI mode"""
+        """Populate GI mode selectors when in GI mode, reset otherwise."""
+        self.ui.axis1D.currentIndexChanged.disconnect(self._update_gi_mode_1d)
+        self.ui.axis2D.currentIndexChanged.disconnect(self._update_gi_mode_2d)
         if not self.sphere.gi:
-            self.ui.axis2D.removeItem(1)
+            self.ui.axis1D.clear()
+            self.ui.axis1D.addItem(_translate("Form", "Radial"))
+            self.ui.axis2D.clear()
+            self.ui.axis2D.addItem(_translate("Form", "Q-Chi"))
         else:
-            if self.ui.axis2D.count() == 1:
-                self.ui.axis2D.addItem(_translate("Form", 'Qz-Qxy'))
+            self.ui.axis1D.clear()
+            for label in GI_LABELS_1D:
+                self.ui.axis1D.addItem(_translate("Form", label))
+            self.ui.axis2D.clear()
+            for label in GI_LABELS_2D:
+                self.ui.axis2D.addItem(_translate("Form", label))
+        self.ui.axis1D.currentIndexChanged.connect(self._update_gi_mode_1d)
+        self.ui.axis2D.currentIndexChanged.connect(self._update_gi_mode_2d)
+        self._update_gi_mode_1d(self.ui.axis1D.currentIndex())
+        self._update_gi_mode_2d(self.ui.axis2D.currentIndex())
 
-    def _update_axes(self, n):
-        """Updates axes to allow user to set Qz-Qxy integration ranges in GI mode"""
-        pass
-        # if n == 1:
-        #     if self.ui.unit_2D
+    def _update_gi_mode_1d(self, n):
+        """Update 1D GI integration mode from axis1D combo selection."""
+        if self.sphere.gi:
+            mode = GI_MODES_1D[n] if n < len(GI_MODES_1D) else 'q_ip'
+            self.sphere.bai_1d_args['gi_mode_1d'] = mode
+
+    def _update_gi_mode_2d(self, n):
+        """Update 2D GI integration mode from axis2D combo selection."""
+        if self.sphere.gi:
+            mode = GI_MODES_2D[n] if n < len(GI_MODES_2D) else 'qip_qoop'
+            self.sphere.bai_2d_args['gi_mode_2d'] = mode
 
 
 class advancedParameters(Qt.QtWidgets.QWidget):
