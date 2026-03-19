@@ -177,7 +177,8 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.plot = self.plot_win.addPlot(viewBox=self.plot_viewBox)
         self.curves = []
         self.legend = self.plot.addLegend()
-        self.legend.setFlag(self.legend.ItemIgnoresTransformations, False)
+        from PySide6.QtWidgets import QGraphicsItem
+        self.legend.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, False)
         # self.legend.setLabelTextSize('10pt')
 
         self.pos_label = pg.LabelItem(justify='right')

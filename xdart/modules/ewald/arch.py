@@ -22,6 +22,9 @@ from ssrl_xrd_tools.integrate.gid import (
     integrate_gi_1d,
     integrate_gi_2d,
     integrate_gi_polar,
+    integrate_gi_polar_1d,
+    integrate_gi_exitangles_1d,
+    integrate_gi_exitangles,
 )
 
 
@@ -256,8 +259,9 @@ class EwaldArch():
 
                 image_data = (self.map_raw - self.bg_raw) / self.map_norm
                 mask = self.get_mask(global_mask)
+                gi_mode_1d = kwargs.get('gi_mode_1d', 'q_ip')
 
-                # Main 1D: in-plane (Qxy) profile — integrate over OOP axis
+                # In-plane (Qxy) profile
                 r_ip = integrate_gi_1d(
                     image_data, fi, npt=numpoints, unit='qoop_A^-1',
                     method='no', mask=mask,
@@ -265,11 +269,6 @@ class EwaldArch():
                     azimuth_range=kwargs.get('azimuth_range'),
                     **gi_kwargs,
                 )
-                # r_ip.radial is the IP (Qxy) axis in Å^-1; treat as q for display
-                result_compat = types.SimpleNamespace(
-                    radial=r_ip.radial, intensity=r_ip.intensity, unit='q_A^-1'
-                )
-                self.int_1d.from_result(result_compat, fi.wavelength, unit='q_A^-1')
                 self.int_1d.i_qxy = r_ip.intensity
                 self.int_1d.qxy = r_ip.radial
 
@@ -279,9 +278,46 @@ class EwaldArch():
                     npt_azim=min(numpoints, 500),
                     method='no', mask=mask,
                 )
-                # r2d.intensity.shape == (npt_rad, npt_azim) = (Qip, Qoop)
                 self.int_1d.i_qz = np.nansum(r2d.intensity, axis=0)
                 self.int_1d.qz = r2d.azimuthal
+
+                # Q total (polar radial profile)
+                r_total = integrate_gi_polar_1d(
+                    image_data, fi, npt=numpoints,
+                    method='no', mask=mask, **gi_kwargs,
+                )
+                self.int_1d.i_qtotal = r_total.intensity
+                self.int_1d.qtotal = r_total.radial
+
+                # Exit angle profile
+                r_exit = integrate_gi_exitangles_1d(
+                    image_data, fi, npt=numpoints,
+                    method='no', mask=mask, **gi_kwargs,
+                )
+                self.int_1d.i_exit = r_exit.intensity
+                self.int_1d.exit = r_exit.radial
+
+                # Set primary result from selected mode
+                if gi_mode_1d == 'q_oop':
+                    primary = types.SimpleNamespace(
+                        radial=self.int_1d.qz, intensity=self.int_1d.i_qz, unit='q_A^-1'
+                    )
+                    self.int_1d.from_result(primary, fi.wavelength, unit='q_A^-1')
+                elif gi_mode_1d == 'q_total':
+                    primary = types.SimpleNamespace(
+                        radial=r_total.radial, intensity=r_total.intensity, unit='q_A^-1'
+                    )
+                    self.int_1d.from_result(primary, fi.wavelength, unit='q_A^-1')
+                elif gi_mode_1d == 'exit_angle':
+                    primary = types.SimpleNamespace(
+                        radial=r_exit.radial, intensity=r_exit.intensity, unit='2th_deg'
+                    )
+                    self.int_1d.from_result(primary, fi.wavelength, unit='2th_deg')
+                else:  # 'q_ip' (default)
+                    primary = types.SimpleNamespace(
+                        radial=r_ip.radial, intensity=r_ip.intensity, unit='q_A^-1'
+                    )
+                    self.int_1d.from_result(primary, fi.wavelength, unit='q_A^-1')
 
     def integrate_2d(self, npt_rad=1000, npt_azim=1000, monitor=None,
                      radial_range=None, azimuth_range=None,
@@ -360,19 +396,12 @@ class EwaldArch():
 
                 image_data = self.map_raw - self.bg_raw
                 mask = self.get_mask(global_mask)
+                gi_mode_2d = kwargs.get('gi_mode_2d', 'qip_qoop')
 
                 # Polar (Q-Chi) map
                 r_polar = integrate_gi_polar(
                     image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
                     method='no', mask=mask, **gi_kwargs,
-                )
-                # r_polar.intensity.shape == (npt_rad, npt_azim) = (Q, Chi)
-                # from_result expects (npt_azim, npt_rad) = (Chi, Q) → transpose
-                result_compat = types.SimpleNamespace(
-                    radial=r_polar.radial,
-                    azimuthal=r_polar.azimuthal,
-                    intensity=r_polar.intensity.T,
-                    unit='q_A^-1',
                 )
 
                 # Fiber (Qip, Qoop) = (Qxy, Qz) map
@@ -382,11 +411,55 @@ class EwaldArch():
                     radial_range=x_range, azimuth_range=y_range,
                     **gi_kwargs,
                 )
+
+                # Exit angles map
+                r_exit2d = integrate_gi_exitangles(
+                    image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
+                    method='no', mask=mask, **gi_kwargs,
+                )
+
+                # Store all GI 2D results on int_2d
                 # r_gi2d.radial = Qip (Qxy), r_gi2d.azimuthal = Qoop (Qz)
-                # r_gi2d.intensity.shape == (npt_rad, npt_azim) = (Qxy, Qz)
-                self.int_2d.from_result(result_compat, fi.wavelength, unit=unit,
-                                        i_QxyQz=np.flipud(r_gi2d.intensity),
-                                        qz=r_gi2d.azimuthal, qxy=r_gi2d.radial)
+                self.int_2d.i_QxyQz = np.flipud(r_gi2d.intensity)
+                self.int_2d.qz = r_gi2d.azimuthal
+                self.int_2d.qxy = r_gi2d.radial
+                self.int_2d.i_exit2d = r_exit2d.intensity
+                self.int_2d.exit2d_radial = r_exit2d.radial
+                self.int_2d.exit2d_azimuthal = r_exit2d.azimuthal
+
+                # Set primary result from selected mode
+                if gi_mode_2d == 'q_chi':
+                    # r_polar.intensity.shape == (npt_rad, npt_azim) = (Q, Chi)
+                    # from_result expects (npt_azim, npt_rad) = (Chi, Q) → transpose
+                    result_compat = types.SimpleNamespace(
+                        radial=r_polar.radial,
+                        azimuthal=r_polar.azimuthal,
+                        intensity=r_polar.intensity.T,
+                        unit='q_A^-1',
+                    )
+                    self.int_2d.from_result(result_compat, fi.wavelength, unit=unit,
+                                            i_QxyQz=self.int_2d.i_QxyQz,
+                                            qz=self.int_2d.qz, qxy=self.int_2d.qxy)
+                elif gi_mode_2d == 'exit_angles':
+                    result_compat = types.SimpleNamespace(
+                        radial=r_exit2d.radial,
+                        azimuthal=r_exit2d.azimuthal,
+                        intensity=r_exit2d.intensity.T,
+                        unit='2th_deg',
+                    )
+                    self.int_2d.from_result(result_compat, fi.wavelength, unit=unit,
+                                            i_QxyQz=self.int_2d.i_QxyQz,
+                                            qz=self.int_2d.qz, qxy=self.int_2d.qxy)
+                else:  # 'qip_qoop' (default)
+                    result_compat = types.SimpleNamespace(
+                        radial=r_polar.radial,
+                        azimuthal=r_polar.azimuthal,
+                        intensity=r_polar.intensity.T,
+                        unit='q_A^-1',
+                    )
+                    self.int_2d.from_result(result_compat, fi.wavelength, unit=unit,
+                                            i_QxyQz=self.int_2d.i_QxyQz,
+                                            qz=self.int_2d.qz, qxy=self.int_2d.qxy)
 
     def set_integrator(self, **args):
         """Sets AzimuthalIntegrator with new arguments.
