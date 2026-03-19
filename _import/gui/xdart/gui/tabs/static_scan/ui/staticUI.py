@@ -15,7 +15,7 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QFont, QFontDatabase, QGradient, QIcon,
     QImage, QKeySequence, QLinearGradient, QPainter,
     QPalette, QPixmap, QRadialGradient, QTransform)
-from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout,
+from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout,
     QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout,
     QWidget)
 
@@ -114,12 +114,6 @@ class Ui_Form(object):
         self.verticalLayout.setSpacing(0)
         self.verticalLayout.setObjectName(u"verticalLayout")
         self.verticalLayout.setContentsMargins(0, 0, 0, 0)
-        self.wranglerBox = QComboBox(self.wranglerFrame)
-        self.wranglerBox.setObjectName(u"wranglerBox")
-        self.wranglerBox.setFocusPolicy(Qt.ClickFocus)
-
-        self.verticalLayout.addWidget(self.wranglerBox)
-
         self.wranglerStack = QStackedWidget(self.wranglerFrame)
         self.wranglerStack.setObjectName(u"wranglerStack")
         sizePolicy3.setHeightForWidth(self.wranglerStack.sizePolicy().hasHeightForWidth())
@@ -137,7 +131,6 @@ class Ui_Form(object):
 
 
         self.retranslateUi(Form)
-        self.wranglerBox.currentIndexChanged.connect(self.wranglerStack.setCurrentIndex)
 
         QMetaObject.connectSlotsByName(Form)
     # setupUi

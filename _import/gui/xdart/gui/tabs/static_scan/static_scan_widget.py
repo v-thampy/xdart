@@ -191,7 +191,6 @@ class staticWidget(QWidget):
                     self.sphere, self.data_1d, self.data_2d,
                 )
             )
-            self.ui.wranglerBox.addItem(name)
         self.ui.wranglerStack.currentChanged.connect(self.set_wrangler)
         self.command_queue = Queue()
         self.set_wrangler(self.ui.wranglerStack.currentIndex())
@@ -437,7 +436,6 @@ class staticWidget(QWidget):
         self.h5viewer.set_open_enabled(True)
         self.update_all()
         if not self.wrangler.thread.isRunning():
-            self.ui.wranglerBox.setEnabled(True)
             self.wrangler.enabled(True)
 
     def new_scan(self, name, fname, gi, th_mtr, single_img, series_average):
@@ -508,7 +506,6 @@ class staticWidget(QWidget):
         # ic()
         # i_qChi = np.zeros((1000, 1000), dtype=float)
 
-        self.ui.wranglerBox.setEnabled(False)
         self.wrangler.enabled(False)
 
         self.integratorTree.get_args('bai_1d')
@@ -532,7 +529,6 @@ class staticWidget(QWidget):
         if self.sphere.name == self.wrangler.scan_name:
             self.integrator_thread_finished()
         else:
-            self.ui.wranglerBox.setEnabled(True)
             self.wrangler.enabled(True)
 
         gc.collect()
