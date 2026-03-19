@@ -426,6 +426,8 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             self.plot.setXLink(None)
             self.ui.plotUnit.setEnabled(True)
 
+        self._apply_1d_only_visibility()
+
         try:
             self.update_plot()
         except TypeError:
@@ -446,6 +448,16 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             self.update_2d_label()
 
         return True
+
+    def _apply_1d_only_visibility(self):
+        """Show or hide 2D panes based on sphere.skip_2d."""
+        skip = getattr(self.sphere, 'skip_2d', False)
+        self.ui.splitter_2.setVisible(not skip)
+        if skip:
+            self.ui.update2D.setChecked(False)
+            self.ui.update2D.setEnabled(False)
+        else:
+            self.ui.update2D.setEnabled(True)
 
     def update_views(self):
         """Updates 2D (if flag is selected) and 1D views
@@ -576,6 +588,22 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
 
         # Get 1D data for all arches
         ydata, xdata = self.get_arches_int_1d()
+
+        # Chi-slice / plotUnit==2 requires 2D data; fall back gracefully if unavailable
+        if xdata is None or ydata is None:
+            needs_2d = (self.ui.plotUnit.currentIndex() == 2 or self.ui.slice.isChecked())
+            if needs_2d and getattr(self.sphere, 'skip_2d', False):
+                try:
+                    self.window().statusBar().showMessage(
+                        "Chi slicing requires 2D integration (1D Only is enabled).", 4000)
+                except Exception:
+                    pass
+            # Fall back: disable slice, retry with plain 1D
+            self.ui.slice.setChecked(False)
+            ydata, xdata = self.get_arches_int_1d()
+            if xdata is None or ydata is None:
+                return
+
         if self.sphere.series_average:
             arch_names = [self.sphere.name]
         else:

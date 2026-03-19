@@ -85,6 +85,8 @@ class integratorThread(Qt.QtCore.QThread):
         directly, handles same functions but broken up for updates
         after each image.
         """
+        if getattr(self.sphere, 'skip_2d', False):
+            return
         self.data_2d.clear()
         with self.sphere.sphere_lock:
             self.sphere.bai_2d = int_2d_data_static()
@@ -133,6 +135,8 @@ class integratorThread(Qt.QtCore.QThread):
     def bai_2d_SI(self):
         """Integrate the current arch, 2d
         """
+        if getattr(self.sphere, 'skip_2d', False):
+            return
         idxs = self.arch_ids
         if 'Overall' in self.arch_ids:
             idxs = self.sphere.arches.index
