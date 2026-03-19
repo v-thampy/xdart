@@ -90,6 +90,7 @@ class EwaldSphere:
         self.th_mtr = th_mtr
         self.single_img = single_img
         self.series_average = series_average
+        self.skip_2d = False
 
         if arches:
             self.arches = ArchSeries(self.data_file, self.file_lock, arches,
@@ -358,16 +359,18 @@ class EwaldSphere:
                     "scan_data", "global_mask", "mg_args", "bai_1d_args",
                     "bai_2d_args", "overall_raw",
                     "static", "gi", "th_mtr", "single_img", "poni_dict",
-                    "series_average"
+                    "series_average", "skip_2d"
                 ]
             utils.attributes_to_h5(self, grp, lst_attr,
                                    compression=compression)
 
-            for key in ('bai_1d', 'bai_2d'):
-                if key not in grp:
-                    grp.create_group(key)
+            if 'bai_1d' not in grp:
+                grp.create_group('bai_1d')
             self.bai_1d.to_hdf5(grp['bai_1d'], compression)
-            self.bai_2d.to_hdf5(grp['bai_2d'], compression)
+            if not self.skip_2d:
+                if 'bai_2d' not in grp:
+                    grp.create_group('bai_2d')
+                self.bai_2d.to_hdf5(grp['bai_2d'], compression)
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
         """Loads data stored in hdf5 file.
@@ -407,7 +410,7 @@ class EwaldSphere:
                             "scan_data", "mg_args", "bai_1d_args",
                             "bai_2d_args", "overall_raw",
                             "static", "gi", "th_mtr", "single_img", "poni_dict",
-                            "series_average"
+                            "series_average", "skip_2d"
                         ]
                         utils.h5_to_attributes(self, grp, lst_attr)
                         self._set_args(self.bai_1d_args)

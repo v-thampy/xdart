@@ -1079,9 +1079,10 @@ class specThread(wranglerThread):
                 series_average=self.series_average
             )
 
-            # integrate image to 1d and 2d arrays
+            # integrate image to 1d (and optionally 2d) arrays
             arch.integrate_1d(global_mask=self.mask, **sphere.bai_1d_args)
-            arch.integrate_2d(global_mask=self.mask, **sphere.bai_2d_args)
+            if not sphere.skip_2d:
+                arch.integrate_2d(global_mask=self.mask, **sphere.bai_2d_args)
 
             # Add arch copy to sphere, save to file
             with self.file_lock:
