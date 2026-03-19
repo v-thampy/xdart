@@ -144,6 +144,7 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         # Plotting Variables
         self.normChannel = None
         self.overlay = None
+        self._last_plot_unit = -1
 
         # Image and Binned 2D Data
         self.image_data = (None, None)
@@ -570,16 +571,29 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         if ydata.ndim == 1:
             ydata = ydata[np.newaxis, :]
 
-        if ((self.plot_data[0].shape == xdata.shape) and
+        current_plot_unit = self.ui.plotUnit.currentIndex()
+        unit_changed = current_plot_unit != self._last_plot_unit
+        self._last_plot_unit = current_plot_unit
+
+        if ((not unit_changed) and
+                (self.plot_data[0].shape == xdata.shape) and
                 (self.plotMethod in ['Overlay', 'Waterfall'])):
+            # Bug 3 fix: remove stale overlay entries no longer in selection
+            keep = [i for i, name in enumerate(self.arch_names) if name in arch_names]
+            if keep:
+                self.plot_data[1] = self.plot_data[1][keep]
+                self.arch_names = [self.arch_names[i] for i in keep]
+            else:
+                self.plot_data = [xdata, ydata]
+                self.arch_names = list(arch_names)
+            # Add newly selected arches
             for (arch_name, data) in zip(arch_names, ydata):
                 if arch_name not in self.arch_names:
                     self.plot_data[1] = np.vstack((self.plot_data[1], data))
                     self.arch_names.append(arch_name)
         else:
             self.plot_data = [xdata, ydata]
-            self.arch_names.clear()
-            self.arch_names = arch_names
+            self.arch_names = list(arch_names)
 
         xdata, ydata = self.plot_data
         self.plot_data_range = [[xdata.min(), xdata.max()], [ydata.min(), ydata.max()]]
@@ -1005,6 +1019,9 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.normChannel = self.get_normChannel()
         if self.normChannel and (self.sphere.scan_data[self.normChannel].sum() == 0.):
             self.normChannel = None
+        # Clear stale plot_data so update_plot() rebuilds all overlay curves
+        self.plot_data = [np.zeros(0), np.zeros(0)]
+        self.arch_names = []
         self.update()
 
     def setBkg(self):
