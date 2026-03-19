@@ -230,6 +230,7 @@ class specWrangler(wranglerWidget):
 
         # Wire signals from parameter tree based buttons
         self.parameters.sigTreeStateChanged.connect(self.setup)
+        self.parameters.sigTreeStateChanged.connect(self._save_to_session)
 
         self.parameters.child('Calibration').child('poni_file_browse').sigActivated.connect(
             self.set_poni_file
@@ -331,18 +332,70 @@ class specWrangler(wranglerWidget):
         self.ui.stopButton.setEnabled(False)
 
         self.setup()
+        self._restore_from_session()
 
-        # Restore session
+    # --- Session persistence ---
+
+    # Flat map: (session_key, param_path_tuple, is_path, self_attr)
+    # is_path=True  → only restore if the path exists on disk
+    # self_attr     → attribute to sync on restore (None = handled by sigValueChanged)
+    _SESSION_PARAMS = [
+        ('poni_file',      ('Calibration', 'poni_file'),             True,  'poni_file'),
+        ('inp_type',       ('Signal', 'inp_type'),                   False, 'inp_type'),
+        ('img_file',       ('Signal', 'File'),                       True,  'img_file'),
+        ('img_dir',        ('Signal', 'img_dir'),                    True,  'img_dir'),
+        ('include_subdir', ('Signal', 'include_subdir'),             False, 'include_subdir'),
+        ('img_ext',        ('Signal', 'img_ext'),                    False, 'img_ext'),
+        ('series_average', ('Signal', 'series_average'),             False, 'series_average'),
+        ('meta_ext',       ('Signal', 'meta_ext'),                   False, None),
+        ('file_filter',    ('Signal', 'Filter'),                     False, 'file_filter'),
+        ('write_mode',     ('Signal', 'write_mode'),                 False, 'write_mode'),
+        ('mask_file',      ('Signal', 'mask_file'),                  True,  'mask_file'),
+        ('bg_type',        ('BG', 'bg_type'),                        False, 'bg_type'),
+        ('bg_file',        ('BG', 'File'),                           True,  'bg_file'),
+        ('bg_dir',         ('BG', 'Match', 'bg_dir'),                True,  'bg_dir'),
+        ('bg_match_fname', ('BG', 'Match', 'match_fname'),           False, 'bg_match_fname'),
+        ('bg_file_filter', ('BG', 'Match', 'Filter'),                False, 'bg_file_filter'),
+        ('bg_scale',       ('BG', 'Scale'),                          False, 'bg_scale'),
+        ('gi',             ('GI', 'Grazing'),                        False, 'gi'),
+        ('th_mtr',         ('GI', 'th_motor'),                       False, 'th_mtr'),
+        ('timeout',        ('Timeout',),                             False, 'timeout'),
+        ('h5_dir',         ('h5_dir',),                              True,  'h5_dir'),
+    ]
+
+    def _save_to_session(self, *args):
+        data = {}
+        for key, path, _, _ in self._SESSION_PARAMS:
+            try:
+                p = self.parameters
+                for segment in path:
+                    p = p.child(segment)
+                data[key] = p.value()
+            except Exception:
+                pass
+        save_session(data)
+
+    def _restore_from_session(self):
         session = load_session()
-        poni = session.get('poni_file', '')
-        if poni and Path(poni).exists():
-            self.parameters.child('Calibration').child('poni_file').setValue(poni)
-            self.poni_file = poni
+        for key, path, is_path, attr in self._SESSION_PARAMS:
+            val = session.get(key)
+            if val is None:
+                continue
+            if is_path and not Path(val).exists():
+                continue
+            try:
+                p = self.parameters
+                for segment in path:
+                    p = p.child(segment)
+                p.setValue(val)
+                if attr is not None:
+                    setattr(self, attr, val)
+            except Exception:
+                pass
+        # meta_ext needs None conversion (sigValueChanged fires set_meta_ext automatically)
+        # poni_file needs poni_dict loaded
+        if session.get('poni_file') and Path(session['poni_file']).exists():
             self.get_poni_dict()
-        meta_ext = session.get('meta_ext')
-        if meta_ext is not None:
-            self.parameters.child('Signal').child('meta_ext').setValue(meta_ext)
-            self.meta_ext = None if meta_ext == 'None' else meta_ext
 
     def setup(self):
         """Sets up the child thread, syncs all parameters.
@@ -473,7 +526,7 @@ class specWrangler(wranglerWidget):
         if fname != '':
             self.parameters.child('Calibration').child('poni_file').setValue(fname)
             self.poni_file = fname
-            save_session({'poni_file': fname})
+            self._save_to_session()
 
     def get_poni_dict(self):
         """Opens file dialogue and sets the calibration file
@@ -606,7 +659,7 @@ class specWrangler(wranglerWidget):
         self.meta_ext = self.parameters.child('Signal').child('meta_ext').value()
         if self.meta_ext == 'None':
             self.meta_ext = None
-        save_session({'meta_ext': self.meta_ext or 'None'})
+        self._save_to_session()
         self.get_img_fname()
 
     def exists_meta_file(self, img_file):
