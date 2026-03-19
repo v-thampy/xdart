@@ -44,9 +44,6 @@ GI_LABELS_2D = ["Qip vs Qoop", "Q vs Chi", "Exit angles"]
 
 params = [
     {'name': 'Default', 'type': 'group', 'children': [
-            {'name': 'General', 'type': 'group', 'children': [
-                {'name': '1D Only', 'type': 'bool', 'value': False},
-            ]},
             {'name': 'Integrate 1D', 'type': 'group', 'children': [
                 # {'name': 'numpoints', 'type': 'int', 'value': 1000, 'visible': False},
                 # {'name': 'unit', 'type': 'list', 'values': {
@@ -165,8 +162,6 @@ class integratorTree(Qt.QtWidgets.QWidget):
         )
         self.bai_1d_pars = self.parameters.child('Default', 'Integrate 1D')
         self.bai_2d_pars = self.parameters.child('Default', 'Integrate 2D')
-        self.general_pars = self.parameters.child('Default', 'General')
-        self.general_pars.sigTreeStateChanged.connect(self._on_general_change)
         self.mask_window = None
 
         # UI adjustments
@@ -907,12 +902,6 @@ class integratorTree(Qt.QtWidgets.QWidget):
 
         # mask = self.mask_window.getSelectionMask()
         # postProcessId21([processFile], mask)
-
-    def _on_general_change(self, param, changes):
-        """Handle changes in the General parameter group."""
-        for par, change, data in changes:
-            if par.name() == '1D Only' and change == 'value':
-                self.sphere.skip_2d = bool(data)
 
     def set_image_units(self):
         """Populate GI mode selectors when in GI mode, reset otherwise."""

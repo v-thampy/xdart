@@ -15,7 +15,7 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QFont, QFontDatabase, QGradient, QIcon,
     QImage, QKeySequence, QLinearGradient, QPainter,
     QPalette, QPixmap, QRadialGradient, QTransform)
-from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel,
     QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
 class Ui_Form(object):
@@ -52,6 +52,12 @@ class Ui_Form(object):
         self.horizontalLayout_2.setContentsMargins(-1, 2, -1, 2)
         self.commandLayout = QHBoxLayout()
         self.commandLayout.setObjectName(u"commandLayout")
+        self.processingLabel = QLabel(self.commandFrame)
+        self.processingLabel.setObjectName(u"processingLabel")
+        self.commandLayout.addWidget(self.processingLabel)
+        self.skip2dCheckBox = QCheckBox(self.commandFrame)
+        self.skip2dCheckBox.setObjectName(u"skip2dCheckBox")
+        self.commandLayout.addWidget(self.skip2dCheckBox)
 
         self.horizontalLayout_2.addLayout(self.commandLayout)
 
@@ -102,6 +108,8 @@ class Ui_Form(object):
     def retranslateUi(self, Form):
         Form.setWindowTitle(QCoreApplication.translate("Form", u"Form", None))
         self.specLabel.setText("")
+        self.processingLabel.setText(QCoreApplication.translate("Form", u"Processing:", None))
+        self.skip2dCheckBox.setText(QCoreApplication.translate("Form", u"1D Only", None))
         self.startButton.setText(QCoreApplication.translate("Form", u"Start", None))
         self.pauseButton.setText(QCoreApplication.translate("Form", u"Pause", None))
         self.continueButton.setText(QCoreApplication.translate("Form", u"Continue", None))
