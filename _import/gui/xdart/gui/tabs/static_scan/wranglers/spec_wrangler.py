@@ -28,11 +28,11 @@ from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
 from .wrangler_widget import wranglerWidget, wranglerThread, wranglerProcess
 from .ui.specUI import Ui_Form
 from ....gui_utils import NamedActionParameter
-from xdart.utils import get_img_data
-from ssrl_xrd_tools.io.metadata import read_image_metadata
-from xdart.utils import split_file_name, get_scan_name, get_img_number, get_fname_dir, get_sname_img_number
-from xdart.utils import match_img_detector, get_series_avg, get_specFile, get_mask_array
-from xdart.utils import write_xye, write_csv
+from ssrl_xrd_tools.io.image import read_image, get_detector_mask
+from ssrl_xrd_tools.io.export import write_xye, write_csv
+from ssrl_xrd_tools.io.metadata import read_image_metadata, _extract_scan_info
+from xdart.utils import get_fname_dir  # GUI-specific file dialog helper
+from xdart.utils import match_img_detector, get_series_avg
 from xdart.utils.session import load_session, save_session
 from xdart.utils.containers.poni import get_poni_dict
 from xdart.utils.h5pool import get_pool as _get_h5pool
@@ -49,6 +49,24 @@ QPushButton = QtWidgets.QPushButton
 def _is_eiger_master(path):
     """Return True if path looks like an Eiger HDF5 master file (*_master.h5 / *_master.hdf5)."""
     return Path(path).stem.endswith('_master')
+
+
+def _get_scan_info(fname):
+    """Return (scan_name, img_number) for a file path.
+
+    Strips trailing _<digits> suffix from the stem to get scan_name.
+    Falls back to (stem, None) when no numeric suffix is found.
+    Preserves the same behaviour as the old get_sname_img_number() so
+    that scan_name values are compatible with existing file-discovery globs.
+    """
+    stem = Path(fname).stem
+    try:
+        img_number = int(stem[stem.rindex('_') + 1:])
+        scan_name = stem[:stem.rindex('_')]
+    except ValueError:
+        scan_name = stem
+        img_number = None
+    return scan_name, img_number
 
 
 def_poni_file = '' # '/Users/vthampy/SSRL_Data/RDA/static_det_test_data/test_xfc_data/test_xfc.poni'
@@ -439,7 +457,7 @@ class specWrangler(wranglerWidget):
         self.get_img_fname()
         self.thread.img_file = self.img_file
 
-        self.scan_name = get_scan_name(self.img_file)
+        self.scan_name, _ = _get_scan_info(self.img_file)
         self.thread.scan_name = self.scan_name
 
         self.thread.single_img = self.single_img
@@ -631,7 +649,8 @@ class specWrangler(wranglerWidget):
             img_file = self.parameters.child('Signal').child('File').value()
             if os.path.exists(img_file):
                 self.img_file = img_file
-                self.img_dir, _, self.img_ext = split_file_name(self.img_file)
+                _p = Path(self.img_file)
+                self.img_dir, self.img_ext = str(_p.parent), _p.suffix.lstrip('.')
                 # self.meta_ext = self.get_meta_ext(self.img_file)
 
         else:
@@ -696,9 +715,12 @@ class specWrangler(wranglerWidget):
                 # ic('returning True \n')
                 return True
         else:
-            meta_file = get_specFile(img_file)
-            if meta_file and os.path.exists(meta_file):
-                return True
+            spec_fname, _, _ = _extract_scan_info(Path(img_file))
+            if spec_fname:
+                img_fpath = Path(img_file)
+                for parent in (img_fpath.parent, img_fpath.parents[1]):
+                    if (parent / spec_fname).is_file():
+                        return True
 
         return False
 
@@ -1013,9 +1035,14 @@ class specThread(wranglerThread):
         self.detector = None
         self.img_fnames = []
         self.processed = []
-        self.processed_frames = set()  # (master_path, frame_idx) for HDF5 Eiger files
         self.processed_scans = []
         self.sub_label = ''
+        # Eiger HDF5 lazy frame state
+        self._eiger_master_path = None
+        self._eiger_frame_idx = 0
+        self._eiger_nframes = 0
+        self._eiger_master_queue = deque()
+        self._eiger_done_masters = set()
 
     def run(self):
         """Initializes specProcess and watches for new commands from
@@ -1027,12 +1054,19 @@ class specThread(wranglerThread):
 
         self.img_fnames.clear()
         self.processed.clear()
-        self.processed_frames.clear()
         self.processed_scans.clear()
+        self._eiger_master_path = None
+        self._eiger_frame_idx = 0
+        self._eiger_nframes = 0
+        self._eiger_master_queue.clear()
+        self._eiger_done_masters.clear()
         self.detector = self.poni_dict['detector']
         self.sub_label = ''
-        # self.get_mask()
-        self.mask = get_mask_array(self.detector, self.mask_file)
+        det_mask = get_detector_mask(self.detector.name)
+        if self.mask_file and os.path.exists(self.mask_file):
+            custom_mask = np.asarray(read_image(self.mask_file), dtype=bool)
+            det_mask = det_mask | custom_mask if det_mask is not None else custom_mask
+        self.mask = np.flatnonzero(det_mask) if det_mask is not None else None
         self._cached_gi_incident_angle = None
 
         self.process_scan()
@@ -1048,6 +1082,7 @@ class specThread(wranglerThread):
         sphere = None
         files_processed = 0
         _cached_poni_dict = None
+        is_eiger = _is_eiger_master(self.img_file) if self.img_file else False
 
         # ── Phase 1 & 2: collect then process all existing images ─────────────
         pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]
@@ -1089,7 +1124,7 @@ class specThread(wranglerThread):
                 self._cached_gi_incident_angle = None
 
             if img_number in list(sphere.arches.index):
-                if self.single_img:
+                if self.single_img and not is_eiger:
                     self.sigUpdate.emit(img_number)
                     break
                 continue
@@ -1097,7 +1132,7 @@ class specThread(wranglerThread):
             bg_raw = self.get_background(img_file, img_number, img_meta)
             pending.append((img_file, img_number, img_data, img_meta, bg_raw))
 
-            if self.single_img:
+            if self.single_img and not is_eiger:
                 break
 
         # Process whatever is left
@@ -1224,79 +1259,93 @@ class specThread(wranglerThread):
         print(f'Processed {fname} {self.sub_label}')
         self.sigUpdate.emit(img_number)
 
-    def _get_next_eiger_frame(self):
-        """Return next unprocessed frame from Eiger HDF5 master file(s).
-
-        Works across all three input modes:
-          - Single Image / Image Series: use self.img_file directly as the master,
-            then also search for sibling master files with the same scan-name prefix.
-          - Image Directory: glob for *_master.h5 files under self.img_dir.
-
-        Returns the standard 5-tuple (img_file, scan_name, img_number, img_data, meta).
-        Returns (None, None, 1, None, {}) when all frames are exhausted.
-        """
-        if len(self.img_fnames) == 0:
-            if self.inp_type == 'Image Directory':
-                # Glob for all master files under the directory
-                filters = '*' + '*'.join(f for f in self.file_filter.split()) + '*'
-                filters = filters if filters != '**' else '*'
-                pattern = f'{filters}_master.h5'
-                if self.include_subdir:
-                    master_files = sorted(Path(self.img_dir).rglob(pattern))
-                else:
-                    master_files = sorted(Path(self.img_dir).glob(pattern))
-            else:
-                # Single Image or Image Series: start from the selected master file,
-                # then pick up any sibling master files with the same scan-name prefix.
-                selected = Path(self.img_file)
-                selected_stem = selected.stem  # e.g., "scan001_master"
-                scan_prefix = selected_stem[:-7] if selected_stem.endswith('_master') else selected_stem
-                # strip trailing digits so "scan001" matches "scan002_master.h5" etc.
-                base_prefix = scan_prefix.rstrip('0123456789')
-                siblings = sorted(selected.parent.glob(f'{base_prefix}*_master.h5'))
-                # Only include files at or after the selected file (natural order)
-                master_files = [f for f in siblings if str(f) >= str(selected)]
-                if not master_files:
-                    master_files = [selected]
-
-            frame_entries = []
-            for mf in master_files:
-                mf_str = str(mf)
-                try:
-                    with fabio.open(mf_str) as img:
-                        nframes = img.nframes
-                except Exception:
-                    continue
-                for i in range(nframes):
-                    if (mf_str, i) not in self.processed_frames:
-                        frame_entries.append((mf_str, i))
-
-            self.img_fnames = deque(frame_entries)
-
-        if not self.img_fnames:
-            return None, None, 1, None, {}
-
-        master_path, frame_idx = self.img_fnames.popleft()
-        self.processed_frames.add((master_path, frame_idx))
-
+    def _get_nframes(self, master_path):
+        """Return frame count for a master file via fabio, 0 on failure."""
         try:
             with fabio.open(master_path) as img:
-                if frame_idx == 0:
-                    img_data = np.asarray(img.data, dtype=float)
-                else:
-                    img_data = np.asarray(img.get_frame(frame_idx).data, dtype=float)
+                return img.nframes
+        except Exception:
+            return 0
+
+    def _eiger_refill_master_queue(self):
+        """Glob for *_master.h5 files not yet processed (Image Directory mode)."""
+        filters = '*' + '*'.join(f for f in self.file_filter.split()) + '*'
+        filters = filters if filters != '**' else '*'
+        pattern = f'{filters}_master.h5'
+        if self.include_subdir:
+            master_files = sorted(Path(self.img_dir).rglob(pattern))
+        else:
+            master_files = sorted(Path(self.img_dir).glob(pattern))
+        queued = set(self._eiger_master_queue)
+        for mf in master_files:
+            mf_str = str(mf)
+            if mf_str not in self._eiger_done_masters and mf_str not in queued:
+                self._eiger_master_queue.append(mf_str)
+
+    def _get_next_eiger_frame(self):
+        """Return the next frame from Eiger HDF5 master file(s), one at a time.
+
+        Tracks position with (_eiger_master_path, _eiger_frame_idx, _eiger_nframes)
+        so frames are never enumerated upfront.  Works for all three input modes:
+          - Single Image / Image Series: process the selected master file directly.
+          - Image Directory: process each discovered *_master.h5 in order, finishing
+            all frames of one file before moving to the next.
+
+        Returns (None, None, 1, None, {}) when all available frames are exhausted.
+        """
+        # ── Initialise on the very first call ────────────────────────────────
+        if self._eiger_master_path is None:
+            if self.inp_type == 'Image Directory':
+                self._eiger_refill_master_queue()
+                if not self._eiger_master_queue:
+                    return None, None, 1, None, {}
+                self._eiger_master_path = self._eiger_master_queue.popleft()
+            else:
+                self._eiger_master_path = self.img_file
+            self._eiger_frame_idx = 0
+            self._eiger_nframes = self._get_nframes(self._eiger_master_path)
+            if self._eiger_nframes == 0:
+                return None, None, 1, None, {}
+
+        # ── Current master exhausted?  Try to advance ────────────────────────
+        if self._eiger_frame_idx >= self._eiger_nframes:
+            # Re-check in case the file grew (live scan writing new frames)
+            self._eiger_nframes = self._get_nframes(self._eiger_master_path)
+
+        if self._eiger_frame_idx >= self._eiger_nframes:
+            if self.inp_type == 'Image Directory':
+                # Mark current as done and move to next master
+                self._eiger_done_masters.add(self._eiger_master_path)
+                if not self._eiger_master_queue:
+                    self._eiger_refill_master_queue()
+                if not self._eiger_master_queue:
+                    return None, None, 1, None, {}
+                self._eiger_master_path = self._eiger_master_queue.popleft()
+                self._eiger_frame_idx = 0
+                self._eiger_nframes = self._get_nframes(self._eiger_master_path)
+                if self._eiger_nframes == 0:
+                    return None, None, 1, None, {}
+            else:
+                # Single Image / Image Series: signal exhaustion to caller
+                return None, None, 1, None, {}
+
+        # ── Read one frame ────────────────────────────────────────────────────
+        frame_idx = self._eiger_frame_idx
+        self._eiger_frame_idx += 1
+
+        try:
+            img_data = np.asarray(read_image(self._eiger_master_path, frame=frame_idx), dtype=float)
         except Exception as e:
-            print(f'Error reading frame {frame_idx} from {master_path}: {e}')
+            print(f'Error reading frame {frame_idx} from {self._eiger_master_path}: {e}')
             img_data = None
 
-        meta = read_image_metadata(master_path, meta_format=self.meta_ext) if self.meta_ext else {}
+        meta = read_image_metadata(self._eiger_master_path, meta_format=self.meta_ext) if self.meta_ext else {}
 
-        # Derive scan_name by stripping _master suffix from the stem
-        master_stem = Path(master_path).stem  # e.g., "scan001_master"
+        master_stem = Path(self._eiger_master_path).stem  # e.g., "scan001_master"
         scan_name = master_stem[:-7] if master_stem.endswith('_master') else master_stem
-        img_number = frame_idx + 1  # 1-based frame index
+        img_number = frame_idx + 1  # 1-based
 
-        return master_path, scan_name, img_number, img_data, meta
+        return self._eiger_master_path, scan_name, img_number, img_data, meta
 
     def get_next_image(self):
         """ Gets next image in image series or in directory to process
@@ -1310,9 +1359,9 @@ class specThread(wranglerThread):
 
         if self.single_img and not is_master:
             # Original single-image path (tif, raw, edf, …)
-            img_data = get_img_data(self.img_file, self.detector, return_float=True)
+            img_data = np.asarray(read_image(self.img_file), dtype=float)
             meta = read_image_metadata(self.img_file, meta_format=self.meta_ext) if self.meta_ext else {}
-            scan_name, img_number = get_sname_img_number(self.img_file)
+            scan_name, img_number = _get_scan_info(self.img_file)
             return self.img_file, scan_name, img_number, img_data, meta
 
         if is_master or self.img_ext.lower() in ('h5', 'hdf5'):
@@ -1342,7 +1391,7 @@ class specThread(wranglerThread):
         n = 0
         while len(self.img_fnames) > 0:
             fname = self.img_fnames[0]
-            sname, snumber = get_sname_img_number(fname)
+            sname, snumber = _get_scan_info(fname)
 
             if (n > 0) and (scan_name != sname):
                 break
@@ -1350,8 +1399,8 @@ class specThread(wranglerThread):
             self.processed.append(fname)
             self.img_fnames.popleft()
 
-            data = get_img_data(fname, self.detector, return_float=True)
-            if data is None:
+            data = np.asarray(read_image(fname), dtype=float)
+            if data is None or not np.isfinite(data).any():
                 continue
 
             meta = read_image_metadata(fname, meta_format=self.meta_ext) if self.meta_ext else {}
@@ -1505,7 +1554,8 @@ class specThread(wranglerThread):
                     # bg_meta = get_img_meta(meta_file)
                     bg_meta = read_image_metadata(bg_file, meta_format=self.meta_ext)
                     if self.bg_match_fname:
-                        if img_number == get_img_number(meta_file):
+                        _, meta_img_num = _get_scan_info(meta_file)
+                        if img_number == meta_img_num:
                             break
                     else:
                         try:
@@ -1519,8 +1569,8 @@ class specThread(wranglerThread):
             if bg_file is None:
                 return 0.
 
-            bg = get_img_data(bg_file, self.detector, return_float=True)
-            if bg is None:
+            bg = np.asarray(read_image(bg_file), dtype=float)
+            if bg is None or not np.isfinite(bg).any():
                 return 0.
 
         if self.bg_scale != 1:
