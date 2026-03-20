@@ -23,6 +23,8 @@ from pyqtgraph.parametertree import ParameterTree, Parameter
 
 # This module imports
 from xdart.modules.ewald import EwaldArch, EwaldSphere
+from xdart.modules.ewald.arch import _make_integrator_from_poni_dict
+from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
 from .wrangler_widget import wranglerWidget, wranglerThread, wranglerProcess
 from .ui.specUI import Ui_Form
 from ....gui_utils import NamedActionParameter
@@ -33,6 +35,7 @@ from xdart.utils import match_img_detector, get_series_avg, get_specFile, get_ma
 from xdart.utils import write_xye, write_csv
 from xdart.utils.session import load_session, save_session
 from xdart.utils.containers.poni import get_poni_dict
+from xdart.utils.h5pool import get_pool as _get_h5pool
 # from xdart.utils import natural_sort_ints
 
 
@@ -1019,6 +1022,8 @@ class specThread(wranglerThread):
         """
         sphere = None
         files_processed = 0
+        _cached_poni_dict = None       # track poni_dict identity for cache invalidation
+        _cached_gi_incident_angle = None  # track incident angle for GI fiber integrator
 
         start = time.time()
         # start1 = time.time()
@@ -1062,6 +1067,15 @@ class specThread(wranglerThread):
             # Initialize sphere and save to disk, send update for new scan
             if (sphere is None) or (self.scan_name != sphere.name):
                 sphere = self.initialize_sphere()
+                _cached_poni_dict = None  # force integrator rebuild for new sphere
+
+            # Rebuild the cached AzimuthalIntegrator when poni_dict changes
+            # (identity check detects when setup() assigns a new dict object)
+            if self.poni_dict is not _cached_poni_dict:
+                sphere._cached_integrator = _make_integrator_from_poni_dict(self.poni_dict)
+                sphere._cached_fiber_integrator = None
+                _cached_poni_dict = self.poni_dict
+                _cached_gi_incident_angle = None
 
             if img_number in list(sphere.arches.index):
                 if self.single_img:
@@ -1070,24 +1084,59 @@ class specThread(wranglerThread):
                 continue
 
             # Get Background
+            _t0 = time.time()
             bg_raw = self.get_background(img_file, img_number, img_meta)
+            _t_bg = time.time() - _t0
 
             # ic(self.th_mtr)
 
             # Initialize arch and integrate
+            _t1 = time.time()
             arch = EwaldArch(
                 img_number, img_data, poni_dict=self.poni_dict,
                 scan_info=img_meta, static=True, gi=self.gi,
                 th_mtr=self.th_mtr, bg_raw=bg_raw,
-                series_average=self.series_average
+                series_average=self.series_average,
+                integrator=sphere._cached_integrator,  # reuse cached AI (skips CSR rebuild)
             )
+            _t_arch = time.time() - _t1
+
+            # For GI: build the FiberIntegrator once per scan (or when incident angle changes)
+            if self.gi:
+                _incident_angle = arch._get_incident_angle()
+                if (sphere._cached_fiber_integrator is None
+                        or _incident_angle != _cached_gi_incident_angle):
+                    sphere._cached_fiber_integrator = create_fiber_integrator(
+                        arch._make_lib_poni(),
+                        incident_angle=_incident_angle,
+                        tilt_angle=arch.tilt_angle,
+                        angle_unit="deg",
+                    )
+                    _cached_gi_incident_angle = _incident_angle
 
             # integrate image to 1d (and optionally 2d) arrays
-            arch.integrate_1d(global_mask=self.mask, **sphere.bai_1d_args)
+            _t2 = time.time()
+            arch.integrate_1d(
+                global_mask=self.mask,
+                fiber_integrator=sphere._cached_fiber_integrator,
+                **sphere.bai_1d_args,
+            )
+            _t_1d = time.time() - _t2
+
+            _t3 = time.time()
             if not sphere.skip_2d:
-                arch.integrate_2d(global_mask=self.mask, **sphere.bai_2d_args)
+                arch.integrate_2d(
+                    global_mask=self.mask,
+                    fiber_integrator=sphere._cached_fiber_integrator,
+                    **sphere.bai_2d_args,
+                )
+            _t_2d = time.time() - _t3
 
             # Add arch copy to sphere, save to file
+            arch.skip_map_raw = sphere.skip_2d
+            # Release any read-only pool handle before writing
+            _get_h5pool().close(sphere.data_file)
+            _t4 = time.time()
             with self.file_lock:
                 sphere.add_arch(
                     arch=arch, calculate=False, update=True,
@@ -1095,12 +1144,21 @@ class specThread(wranglerThread):
                     th_mtr=self.th_mtr, series_average=self.series_average
                 )
                 sphere.save_to_h5(data_only=True, replace=False)
-            # print(f'Saved data to h5: {time.time() - start1:0.2f}')
+            _t_h5 = time.time() - _t4
 
             # Save 1D integrated data in CSV and xye files
+            _t5 = time.time()
             self.save_1d(sphere, arch, img_number)
-            # print(f'Saved 1D data: {time.time() - start1:0.2f}')
+            _t_csv = time.time() - _t5
 
+            _t_total = _t_bg + _t_arch + _t_1d + _t_2d + _t_h5 + _t_csv
+            print(
+                f'[TIMING] image_{img_number:04d}: '
+                f'bg={_t_bg:.2f}s arch_init={_t_arch:.2f}s '
+                f'int_1d={_t_1d:.2f}s int_2d={_t_2d:.2f}s '
+                f'h5_write={_t_h5:.2f}s csv={_t_csv:.2f}s '
+                f'total={_t_total:.2f}s'
+            )
             print(f'Processed {fname} {self.sub_label}')
             if len(fname) > 40:
                 fname = f'{fname[:8]}....{fname[-30:]}'
@@ -1235,6 +1293,7 @@ class specThread(wranglerThread):
         if not os.path.exists(fname):
             write_mode = 'Overwrite'
 
+        _get_h5pool().close(sphere.data_file)
         with self.file_lock:
             if write_mode == 'Append':
                 sphere.load_from_h5(replace=False, mode='a')
