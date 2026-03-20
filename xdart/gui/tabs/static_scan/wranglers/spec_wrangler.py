@@ -1245,6 +1245,8 @@ class specThread(wranglerThread):
             else:
                 sphere.save_to_h5(replace=True)
 
+        sphere.skip_2d = self.sphere.skip_2d
+
         self.sigUpdateFile.emit(
             self.scan_name, fname,
             self.gi, self.th_mtr, self.single_img,
