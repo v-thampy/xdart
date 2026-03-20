@@ -171,7 +171,7 @@ class specWrangler(wranglerWidget):
         self.ui.stopButton.clicked.connect(self.stop)
         self.ui.continueButton.clicked.connect(self.cont)
         self.ui.skip2dCheckBox.stateChanged.connect(
-            lambda state: setattr(self.sphere, 'skip_2d', bool(state))
+            lambda _: setattr(self.sphere, 'skip_2d', self.ui.skip2dCheckBox.isChecked())
         )
 
         self.showLabel.connect(self.ui.specLabel.setText)
