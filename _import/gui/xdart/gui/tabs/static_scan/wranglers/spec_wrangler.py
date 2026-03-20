@@ -1229,6 +1229,7 @@ class specThread(wranglerThread):
                              single_img=self.single_img,
                              global_mask=self.mask,
                              **self.sphere_args)
+        sphere.skip_2d = self.sphere.skip_2d
 
         write_mode = self.write_mode
         if not os.path.exists(fname):
@@ -1237,6 +1238,7 @@ class specThread(wranglerThread):
         with self.file_lock:
             if write_mode == 'Append':
                 sphere.load_from_h5(replace=False, mode='a')
+                sphere.skip_2d = self.sphere.skip_2d  # re-apply after load may overwrite it
                 for (k, v) in self.sphere_args.items():
                     setattr(sphere, k, v)
                 existing_arches = sphere.arches.index
@@ -1244,8 +1246,6 @@ class specThread(wranglerThread):
                     sphere.save_to_h5(replace=True)
             else:
                 sphere.save_to_h5(replace=True)
-
-        sphere.skip_2d = self.sphere.skip_2d
 
         self.sigUpdateFile.emit(
             self.scan_name, fname,
