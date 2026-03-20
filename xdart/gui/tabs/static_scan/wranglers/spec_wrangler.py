@@ -12,7 +12,6 @@ import fnmatch
 import numpy as np
 from pathlib import Path
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # pyFAI imports
 import fabio
@@ -106,25 +105,6 @@ params = [
 ctr = 1
 
 
-def _integrate_frame(img_data, bg_raw, poni_dict, bai_1d_args, bai_2d_args,
-                     mask, gi, th_mtr, skip_2d, img_number, scan_info,
-                     series_average):
-    """Worker function for parallel integration. Runs in a subprocess.
-
-    Each worker process builds its own pyFAI CSR lookup table on the first
-    frame it processes; subsequent frames in the same worker reuse the cache.
-    Returns the integrated EwaldArch (picklable via __getstate__/__setstate__).
-    """
-    from xdart.modules.ewald.arch import EwaldArch
-    arch = EwaldArch(img_number, img_data, poni_dict=poni_dict,
-                     scan_info=scan_info, static=True, gi=gi,
-                     th_mtr=th_mtr, bg_raw=bg_raw,
-                     series_average=series_average)
-    arch.integrate_1d(global_mask=mask, **bai_1d_args)
-    if not skip_2d:
-        arch.integrate_2d(global_mask=mask, **bai_2d_args)
-    return arch
-
 
 class specWrangler(wranglerWidget):
     """Widget for integrating data associated with spec file. Can be
@@ -201,9 +181,9 @@ class specWrangler(wranglerWidget):
         self.ui.liveCheckBox.stateChanged.connect(
             lambda _: self._set_live_mode(self.ui.liveCheckBox.isChecked())
         )
-        self.ui.maxCoresSpinBox.valueChanged.connect(
-            lambda v: setattr(self.thread, 'max_cores', v)
-        )
+        # Cores selector hidden — parallel processing removed (CSR overhead > speedup)
+        self.ui.coresLabel.setVisible(False)
+        self.ui.maxCoresSpinBox.setVisible(False)
 
         self.showLabel.connect(self.ui.specLabel.setText)
 
@@ -1055,7 +1035,7 @@ class specThread(wranglerThread):
         """Batch-integrate all existing images, then optionally watch for new ones (live mode).
 
         Phase 1 — Collect: drain the current directory glob into a pending list.
-        Phase 2 — Process: parallel (ProcessPoolExecutor) when max_cores > 1, else sequential.
+        Phase 2 — Process: sequential with cached AzimuthalIntegrator (~0.35 s/frame).
         Phase 3 — Watch (live mode only): poll every 2 s for new files; process each immediately.
         """
         sphere = None
@@ -1156,22 +1136,17 @@ class specThread(wranglerThread):
 
         print(f'\nTotal Files Processed: {files_processed}')
 
-    # ── Batch dispatch helpers ────────────────────────────────────────────────
+    # ── Batch dispatch ────────────────────────────────────────────────────────
 
     def _dispatch_batch(self, sphere, pending):
-        """Route a batch to parallel or sequential processing based on max_cores."""
-        max_cores = getattr(self, 'max_cores', 1)
-        n_workers = min(max_cores, len(pending))
-        if n_workers > 1:
-            return self._process_batch_parallel(sphere, pending, n_workers)
-        else:
-            count = 0
-            for item in pending:
-                if self.command == 'stop':
-                    break
-                self._process_one(sphere, *item)
-                count += 1
-            return count
+        """Process a list of pending images sequentially with cached integrator."""
+        count = 0
+        for item in pending:
+            if self.command == 'stop':
+                break
+            self._process_one(sphere, *item)
+            count += 1
+        return count
 
     def _process_one(self, sphere, img_file, img_number, img_data, img_meta, bg_raw):
         """Integrate one image sequentially and save. Includes timing instrumentation."""
@@ -1241,54 +1216,6 @@ class specThread(wranglerThread):
         )
         print(f'Processed {fname} {self.sub_label}')
         self.sigUpdate.emit(img_number)
-
-    def _process_batch_parallel(self, sphere, pending, n_workers):
-        """Integrate pending images in parallel subprocesses; write H5 serially."""
-        future_to_meta = {}
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            for (img_file, img_number, img_data, img_meta, bg_raw) in pending:
-                future = executor.submit(
-                    _integrate_frame,
-                    img_data, bg_raw, self.poni_dict,
-                    sphere.bai_1d_args, sphere.bai_2d_args,
-                    self.mask, self.gi, self.th_mtr,
-                    sphere.skip_2d, img_number, img_meta,
-                    self.series_average,
-                )
-                future_to_meta[future] = (img_file, img_number)
-
-            count = 0
-            for future in as_completed(future_to_meta):
-                if self.command == 'stop':
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
-                img_file, img_number = future_to_meta[future]
-                fname = os.path.splitext(os.path.basename(img_file))[0]
-                try:
-                    arch = future.result()
-                except Exception as exc:
-                    print(f'Error integrating image_{img_number:04d}: {exc}')
-                    continue
-
-                arch.skip_map_raw = sphere.skip_2d
-                _get_h5pool().close(sphere.data_file)
-                with self.file_lock:
-                    sphere.add_arch(
-                        arch=arch, calculate=False, update=True,
-                        get_sd=True, set_mg=False, static=True, gi=self.gi,
-                        th_mtr=self.th_mtr, series_average=self.series_average
-                    )
-                    sphere.save_to_h5(data_only=True, replace=False)
-
-                self.save_1d(sphere, arch, img_number)
-                print(f'Processed (parallel) {fname} {self.sub_label}')
-                if len(fname) > 40:
-                    fname = f'{fname[:8]}....{fname[-30:]}'
-                self.showLabel.emit(f'{fname}')
-                self.sigUpdate.emit(img_number)
-                count += 1
-
-        return count
 
     def get_next_image(self):
         """ Gets next image in image series or in directory to process
