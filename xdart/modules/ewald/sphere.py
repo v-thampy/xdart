@@ -91,6 +91,8 @@ class EwaldSphere:
         self.single_img = single_img
         self.series_average = series_average
         self.skip_2d = False
+        self._cached_integrator = None
+        self._cached_fiber_integrator = None
 
         if arches:
             self.arches = ArchSeries(self.data_file, self.file_lock, arches,

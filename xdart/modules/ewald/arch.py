@@ -28,6 +28,21 @@ from ssrl_xrd_tools.integrate.gid import (
 )
 
 
+def _make_integrator_from_poni_dict(poni_dict):
+    """Create an AzimuthalIntegrator from a raw poni_dict (legacy AI attributes).
+
+    Extracted so spec_wrangler can build the integrator once per scan
+    without constructing a full EwaldArch.
+    """
+    ai = AzimuthalIntegrator()
+    for k, v in poni_dict.items():
+        ai.__setattr__(k, v)
+    det = getattr(ai, 'detector', None)
+    if det is not None and 'MX225' in getattr(det, 'name', ''):
+        ai._rot3 -= np.deg2rad(90)
+    return ai
+
+
 class EwaldArch():
     """Class for storing area detector data collected in
     X-ray diffraction experiments.
@@ -77,7 +92,7 @@ class EwaldArch():
                  scan_info={}, ai_args={}, file_lock=Condition(),
                  static=False, poni_dict=None, bg_raw=0,
                  gi=False, th_mtr='th', tilt_angle=0,
-                 series_average=False
+                 series_average=False, integrator=None
                  ):
         # pylint: disable=too-many-arguments
         """idx: int, name of the arch.
@@ -112,7 +127,7 @@ class EwaldArch():
         self.tilt_angle = tilt_angle
         self.series_average = series_average
 
-        self.integrator = self.setup_integrator()
+        self.integrator = integrator if integrator is not None else self.setup_integrator()
 
         self.arch_lock = Condition()
         self.map_norm = 1
@@ -124,15 +139,7 @@ class EwaldArch():
         """Sets up integrator object (always a plain AzimuthalIntegrator;
         GI uses create_fiber_integrator transiently during integration)."""
         if self.poni_dict is not None:
-            # poni_dict holds raw pyFAI AI internal attributes (_dist, _rot1, …)
-            # from legacy xdart files; set them directly on the AI instance.
-            ai = AzimuthalIntegrator()
-            for k, v in self.poni_dict.items():
-                ai.__setattr__(k, v)
-            det = getattr(ai, 'detector', None)
-            if det is not None and 'MX225' in getattr(det, 'name', ''):
-                ai._rot3 -= np.deg2rad(90)
-            return ai
+            return _make_integrator_from_poni_dict(self.poni_dict)
         else:
             from ssrl_xrd_tools.core.containers import PONI as LibPONI
             det_obj = getattr(self.poni, 'detector', None)
@@ -204,7 +211,8 @@ class EwaldArch():
             return mask
 
     def integrate_1d(self, numpoints=10000, radial_range=None,
-                     monitor=None, unit=units.TTH_DEG, global_mask=None, **kwargs):
+                     monitor=None, unit=units.TTH_DEG, global_mask=None,
+                     fiber_integrator=None, **kwargs):
         """Wrapper for integrate1d method of AzimuthalIntegrator from pyFAI.
         Returns result and also stores the data in the int_1d object.
 
@@ -250,7 +258,7 @@ class EwaldArch():
                 gi_kwargs = {k: v for k, v in kwargs.items() if k in _gi_valid}
 
                 incident_angle = self._get_incident_angle()
-                fi = create_fiber_integrator(
+                fi = fiber_integrator or create_fiber_integrator(
                     self._make_lib_poni(),
                     incident_angle=incident_angle,
                     tilt_angle=self.tilt_angle,
@@ -322,7 +330,8 @@ class EwaldArch():
     def integrate_2d(self, npt_rad=1000, npt_azim=1000, monitor=None,
                      radial_range=None, azimuth_range=None,
                      x_range=None, y_range=None,
-                     unit=units.TTH_DEG, global_mask=None, **kwargs):
+                     unit=units.TTH_DEG, global_mask=None,
+                     fiber_integrator=None, **kwargs):
         """Wrapper for integrate2d method of AzimuthalIntegrator from pyFAI.
         Returns result and also stores the data in the int_2d object.
 
@@ -387,7 +396,7 @@ class EwaldArch():
                 gi_kwargs = {k: v for k, v in kwargs.items() if k in _gi_valid}
 
                 incident_angle = self._get_incident_angle()
-                fi = create_fiber_integrator(
+                fi = fiber_integrator or create_fiber_integrator(
                     self._make_lib_poni(),
                     incident_angle=incident_angle,
                     tilt_angle=self.tilt_angle,
@@ -511,10 +520,16 @@ class EwaldArch():
             else:
                 grp = file.create_group(str(self.idx))
             grp.attrs['type'] = 'EwaldArch'
-            lst_attr = [
-                "map_raw", "mask", "map_norm", "scan_info", "ai_args",
-                "gi", "static", "poni_dict", "bg_raw"
-            ]
+            if getattr(self, 'skip_map_raw', False):
+                lst_attr = [
+                    "mask", "map_norm", "scan_info", "ai_args",
+                    "gi", "static", "poni_dict"
+                ]
+            else:
+                lst_attr = [
+                    "map_raw", "mask", "map_norm", "scan_info", "ai_args",
+                    "gi", "static", "poni_dict", "bg_raw"
+                ]
             utils.attributes_to_h5(self, grp, lst_attr,
                                    compression=compression)
             if 'int_1d' not in grp:
