@@ -121,7 +121,7 @@ class staticWidget(QWidget):
         self.arch_ids = []
         self.arches = OrderedDict()
         self.data_1d = OrderedDict()
-        self.data_2d = FixSizeOrderedDict(max=10)
+        self.data_2d = FixSizeOrderedDict(max=20)
 
         self.ui = Ui_Form()
         self.ui.setupUi(self)

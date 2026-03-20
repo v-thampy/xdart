@@ -66,6 +66,19 @@ pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
 
 
+def _downsample_for_display(data, widget):
+    """Reduce array resolution to match widget pixel size. Display-only."""
+    if data is None or data.ndim != 2:
+        return data
+    w = max(widget.width(), 200)
+    h = max(widget.height(), 200)
+    if data.shape[0] > w * 2 or data.shape[1] > h * 2:
+        sx = max(1, data.shape[0] // w)
+        sy = max(1, data.shape[1] // h)
+        return data[::sx, ::sy]
+    return data
+
+
 class displayFrameWidget(Qt.QtWidgets.QWidget):
     """Widget for displaying 2D image data and 1D plots from EwaldSphere
     objects.
@@ -446,11 +459,15 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             self.ui.imageWindow.setMaximumHeight(0)
             self.ui.update2D.setChecked(False)
             self.ui.update2D.setEnabled(False)
+            if self.ui.slice.isChecked():
+                self.ui.slice.setChecked(False)
+            self.ui.slice.setEnabled(False)
         else:
             self.ui.imageWindow.setMinimumHeight(200)
             self.ui.imageWindow.setMaximumHeight(16777215)
             self.ui.update2D.setEnabled(True)
             self.ui.update2D.setChecked(True)
+            self.ui.slice.setEnabled(True)
 
     def update_views(self):
         """Updates 2D (if flag is selected) and 1D views
@@ -506,8 +523,9 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
     def update_image_view(self):
         data, rect = self.image_data
 
+        display_data = _downsample_for_display(data, self.image_widget)
         # self.image_widget.setImage(data.T[:, ::-1], scale=self.scale, cmap=self.cmap)
-        self.image_widget.setImage(data, scale=self.scale, cmap=self.cmap)
+        self.image_widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
         self.image_widget.setRect(rect)
 
         self.image_widget.image_plot.setLabel("bottom", 'x (Pixels)')
@@ -541,7 +559,8 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
     def update_binned_view(self):
         data, rect = self.binned_data
 
-        self.binned_widget.setImage(data.T[:, ::-1], scale=self.scale, cmap=self.cmap)
+        display_data = _downsample_for_display(data.T[:, ::-1], self.binned_widget)
+        self.binned_widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
         self.binned_widget.setRect(rect)
 
         imageUnit = self.ui.imageUnit.currentIndex()
@@ -612,16 +631,21 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self._last_plot_unit = current_plot_unit
 
         current_method = self.ui.plotMethod.currentText()
-        if ((not unit_changed) and
-                (self.plot_data[0].shape == xdata.shape) and
-                current_method in ('Overlay', 'Waterfall')):
-            # Accumulate: append any arch not already in the overlay
-            for arch_name, row in zip(arch_names, ydata):
-                if arch_name not in self.arch_names:
-                    self.plot_data[1] = np.vstack((self.plot_data[1], row))
-                    self.arch_names.append(arch_name)
+        if current_method in ('Overlay', 'Waterfall'):
+            if unit_changed or len(self.plot_data[0]) == 0:
+                # Unit changed or first time: fresh start
+                self.plot_data = [xdata, ydata]
+                self.arch_names = list(arch_names)
+            elif self.plot_data[0].shape == xdata.shape:
+                # Same shape: accumulate any arch not already in the overlay
+                for arch_name, row in zip(arch_names, ydata):
+                    if arch_name not in self.arch_names:
+                        self.plot_data[1] = np.vstack((self.plot_data[1], row))
+                        self.arch_names.append(arch_name)
+            # else: different Q-bin count (e.g. npt_1d changed) — keep old
+            # overlay intact; new arches silently skipped until user clears
         else:
-            # Fresh start: Single/Sum/Average mode, unit changed, or different x-axis
+            # Single/Sum/Average: always replace with current selection
             self.plot_data = [xdata, ydata]
             self.arch_names = list(arch_names)
 
@@ -924,6 +948,8 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
 
         # If a particular Chi Range is chosen...
         intensity = self.get_int_2d(arch_2d['int_2d'], arch, normalize=False)
+        if intensity.ndim < 2:
+            return None, None
         q, tth, chi = arch_2d['int_2d'].q, arch_2d['int_2d'].ttheta, arch_2d['int_2d'].chi
 
         xdata_list = [q, tth, chi]
@@ -1212,6 +1238,9 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         _range = [center-width, center+width]
 
         binned_data, rect = self.binned_data
+
+        if rect is None:
+            return
 
         if self.ui.plotUnit.currentIndex() < 2:
             _range = [max(rect.top(), _range[0]), min(rect.top() + rect.height(), _range[1])]
