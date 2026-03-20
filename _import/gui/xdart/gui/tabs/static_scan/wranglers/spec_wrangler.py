@@ -12,6 +12,7 @@ import fnmatch
 import numpy as np
 from pathlib import Path
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # pyFAI imports
 import fabio
@@ -100,10 +101,30 @@ params = [
     ], 'expanded': False, 'visible': False},
     {'name': 'h5_dir', 'title': 'Save Path', 'type': 'str', 'value': get_fname_dir(), 'enabled': False},
     NamedActionParameter(name='h5_dir_browse', title='Browse...', visible=False),
-    {'name': 'Timeout', 'type': 'float', 'value': 1, 'visible': False},
 ]
 
 ctr = 1
+
+
+def _integrate_frame(img_data, bg_raw, poni_dict, bai_1d_args, bai_2d_args,
+                     mask, gi, th_mtr, skip_2d, img_number, scan_info,
+                     series_average):
+    """Worker function for parallel integration. Runs in a subprocess.
+
+    Each worker process builds its own pyFAI CSR lookup table on the first
+    frame it processes; subsequent frames in the same worker reuse the cache.
+    Returns the integrated EwaldArch (picklable via __getstate__/__setstate__).
+    """
+    from xdart.modules.ewald.arch import EwaldArch
+    arch = EwaldArch(img_number, img_data, poni_dict=poni_dict,
+                     scan_info=scan_info, static=True, gi=gi,
+                     th_mtr=th_mtr, bg_raw=bg_raw,
+                     series_average=series_average)
+    arch.integrate_1d(global_mask=mask, **bai_1d_args)
+    if not skip_2d:
+        arch.integrate_2d(global_mask=mask, **bai_2d_args)
+    return arch
+
 
 class specWrangler(wranglerWidget):
     """Widget for integrating data associated with spec file. Can be
@@ -176,6 +197,13 @@ class specWrangler(wranglerWidget):
         self.ui.skip2dCheckBox.stateChanged.connect(
             lambda _: setattr(self.sphere, 'skip_2d', self.ui.skip2dCheckBox.isChecked())
         )
+        self.live_mode = False
+        self.ui.liveCheckBox.stateChanged.connect(
+            lambda _: self._set_live_mode(self.ui.liveCheckBox.isChecked())
+        )
+        self.ui.maxCoresSpinBox.valueChanged.connect(
+            lambda v: setattr(self.thread, 'max_cores', v)
+        )
 
         self.showLabel.connect(self.ui.specLabel.setText)
 
@@ -227,9 +255,6 @@ class specWrangler(wranglerWidget):
         # Grazing Incidence
         self.gi = self.parameters.child('GI').child('Grazing').value()
         self.th_mtr = self.parameters.child('GI').child('th_motor').value()
-
-        # Timeout
-        self.timeout = self.parameters.child('Timeout').value()
 
         # HDF5 Save Path
         self.h5_dir = self.parameters.child('h5_dir').value()
@@ -317,12 +342,13 @@ class specWrangler(wranglerWidget):
             self.bg_norm_channel,
             self.gi,
             self.th_mtr,
-            self.timeout,
             self.command,
             self.sphere,
             self.data_1d,
             self.data_2d,
-            self
+            live_mode=self.live_mode,
+            max_cores=self.ui.maxCoresSpinBox.value(),
+            parent=self,
         )
 
         self.thread.showLabel.connect(self.ui.specLabel.setText)
@@ -365,7 +391,6 @@ class specWrangler(wranglerWidget):
         ('bg_scale',       ('BG', 'Scale'),                          False, 'bg_scale'),
         ('gi',             ('GI', 'Grazing'),                        False, 'gi'),
         ('th_mtr',         ('GI', 'th_motor'),                       False, 'th_mtr'),
-        ('timeout',        ('Timeout',),                             False, 'timeout'),
         ('h5_dir',         ('h5_dir',),                              True,  'h5_dir'),
     ]
 
@@ -402,6 +427,11 @@ class specWrangler(wranglerWidget):
         # poni_file needs poni_dict loaded
         if session.get('poni_file') and Path(session['poni_file']).exists():
             self.get_poni_dict()
+
+    def _set_live_mode(self, enabled):
+        """Toggle live directory-watching mode."""
+        self.live_mode = enabled
+        self.thread.live_mode = enabled
 
     def setup(self):
         """Sets up the child thread, syncs all parameters.
@@ -480,9 +510,10 @@ class specWrangler(wranglerWidget):
         self.thread.th_mtr = self.th_mtr
         # ic(self.th_mtr)
 
-        # Timeout
-        self.timeout = self.parameters.child('Timeout').value()
-        self.thread.timeout = self.timeout
+        # Live mode and parallel cores
+        self.thread.live_mode = self.live_mode
+        self.thread.max_cores = self.ui.maxCoresSpinBox.value()
+        self.sphere.max_cores = self.thread.max_cores  # used by sphere_threads
 
         self.thread.command = self.command
 
@@ -929,11 +960,12 @@ class specThread(wranglerThread):
             bg_norm_channel,
             gi,
             th_mtr,
-            timeout,
             command,
             sphere,
             data_1d,
             data_2d,
+            live_mode=False,
+            max_cores=1,
             parent=None):
 
         """command_queue: mp.Queue, queue for commands sent from parent
@@ -984,7 +1016,8 @@ class specThread(wranglerThread):
         self.bg_norm_channel = bg_norm_channel
         self.gi = gi
         self.th_mtr = th_mtr
-        self.timeout = timeout
+        self.live_mode = live_mode
+        self.max_cores = max_cores
         self.command = command
         self.sphere = sphere
         self.data_1d = data_1d
@@ -1013,69 +1046,60 @@ class specThread(wranglerThread):
         self.sub_label = ''
         # self.get_mask()
         self.mask = get_mask_array(self.detector, self.mask_file)
+        self._cached_gi_incident_angle = None
 
         self.process_scan()
         print(f'Total Time: {time.time() - t0:0.2f}')
 
     def process_scan(self):
-        """Go through series of images in a scan and process them individually
+        """Batch-integrate all existing images, then optionally watch for new ones (live mode).
+
+        Phase 1 — Collect: drain the current directory glob into a pending list.
+        Phase 2 — Process: parallel (ProcessPoolExecutor) when max_cores > 1, else sequential.
+        Phase 3 — Watch (live mode only): poll every 2 s for new files; process each immediately.
         """
         sphere = None
         files_processed = 0
-        _cached_poni_dict = None       # track poni_dict identity for cache invalidation
-        _cached_gi_incident_angle = None  # track incident angle for GI fiber integrator
+        _cached_poni_dict = None
 
-        start = time.time()
-        # start1 = time.time()
-        # print(f'Start time: {time.time() - start1:0.2f}')
+        # ── Phase 1 & 2: collect then process all existing images ─────────────
+        pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]
+
         while True:
-            # Check for commands, or wait if paused
-            command = self.command
-            # ic(command)
-            if command == 'stop':
+            if self.command == 'stop':
                 break
-            elif command == 'pause':
-                self.showLabel.emit(f'Paused')
+            if self.command == 'pause':
+                self.showLabel.emit('Paused')
                 time.sleep(0.5)
                 continue
-            else:
-                pass
 
-            # img_file, img_number, img_data = self.get_next_image()
             img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
             if img_data is None:
-                if img_file is None:
-                    self.showLabel.emit(f'Checking for next image')
-                    time.sleep(0.2)
-                else:
-                    print(f'Invalid Image File {os.path.basename(img_file)}. Skipping...')
-
-                elapsed = time.time() - start
-                if elapsed > self.timeout:
-                    self.showLabel.emit(f'Timeout occurred')
-                    break
-                else:
-                    continue
-            else:
+                break  # initial glob exhausted — move on to processing
+            if img_file is not None:
                 fname = os.path.splitext(os.path.basename(img_file))[0]
-                self.showLabel.emit(f'Processing {fname[-30:]}')
+                self.showLabel.emit(f'Collecting {fname[-30:]}')
+            else:
+                print(f'Invalid image file, skipping')
+                continue
 
-            # self.scan_name = get_scan_name(img_file)
-            img_number = 1 if (img_number is None) else img_number
+            img_number = 1 if img_number is None else img_number
             self.scan_name = scan_name
 
-            # Initialize sphere and save to disk, send update for new scan
-            if (sphere is None) or (self.scan_name != sphere.name):
+            # Flush and switch sphere when scan name changes
+            if (sphere is None) or (scan_name != sphere.name):
+                if pending:
+                    files_processed += self._dispatch_batch(sphere, pending)
+                    pending = []
                 sphere = self.initialize_sphere()
-                _cached_poni_dict = None  # force integrator rebuild for new sphere
+                _cached_poni_dict = None
 
-            # Rebuild the cached AzimuthalIntegrator when poni_dict changes
-            # (identity check detects when setup() assigns a new dict object)
+            # Rebuild cached AzimuthalIntegrator when poni_dict identity changes
             if self.poni_dict is not _cached_poni_dict:
                 sphere._cached_integrator = _make_integrator_from_poni_dict(self.poni_dict)
                 sphere._cached_fiber_integrator = None
                 _cached_poni_dict = self.poni_dict
-                _cached_gi_incident_angle = None
+                self._cached_gi_incident_angle = None
 
             if img_number in list(sphere.arches.index):
                 if self.single_img:
@@ -1083,98 +1107,188 @@ class specThread(wranglerThread):
                     break
                 continue
 
-            # Get Background
-            _t0 = time.time()
             bg_raw = self.get_background(img_file, img_number, img_meta)
-            _t_bg = time.time() - _t0
-
-            # ic(self.th_mtr)
-
-            # Initialize arch and integrate
-            _t1 = time.time()
-            arch = EwaldArch(
-                img_number, img_data, poni_dict=self.poni_dict,
-                scan_info=img_meta, static=True, gi=self.gi,
-                th_mtr=self.th_mtr, bg_raw=bg_raw,
-                series_average=self.series_average,
-                integrator=sphere._cached_integrator,  # reuse cached AI (skips CSR rebuild)
-            )
-            _t_arch = time.time() - _t1
-
-            # For GI: build the FiberIntegrator once per scan (or when incident angle changes)
-            if self.gi:
-                _incident_angle = arch._get_incident_angle()
-                if (sphere._cached_fiber_integrator is None
-                        or _incident_angle != _cached_gi_incident_angle):
-                    sphere._cached_fiber_integrator = create_fiber_integrator(
-                        arch._make_lib_poni(),
-                        incident_angle=_incident_angle,
-                        tilt_angle=arch.tilt_angle,
-                        angle_unit="deg",
-                    )
-                    _cached_gi_incident_angle = _incident_angle
-
-            # integrate image to 1d (and optionally 2d) arrays
-            _t2 = time.time()
-            arch.integrate_1d(
-                global_mask=self.mask,
-                fiber_integrator=sphere._cached_fiber_integrator,
-                **sphere.bai_1d_args,
-            )
-            _t_1d = time.time() - _t2
-
-            _t3 = time.time()
-            if not sphere.skip_2d:
-                arch.integrate_2d(
-                    global_mask=self.mask,
-                    fiber_integrator=sphere._cached_fiber_integrator,
-                    **sphere.bai_2d_args,
-                )
-            _t_2d = time.time() - _t3
-
-            # Add arch copy to sphere, save to file
-            arch.skip_map_raw = sphere.skip_2d
-            # Release any read-only pool handle before writing
-            _get_h5pool().close(sphere.data_file)
-            _t4 = time.time()
-            with self.file_lock:
-                sphere.add_arch(
-                    arch=arch, calculate=False, update=True,
-                    get_sd=True, set_mg=False, static=True, gi=self.gi,
-                    th_mtr=self.th_mtr, series_average=self.series_average
-                )
-                sphere.save_to_h5(data_only=True, replace=False)
-            _t_h5 = time.time() - _t4
-
-            # Save 1D integrated data in CSV and xye files
-            _t5 = time.time()
-            self.save_1d(sphere, arch, img_number)
-            _t_csv = time.time() - _t5
-
-            _t_total = _t_bg + _t_arch + _t_1d + _t_2d + _t_h5 + _t_csv
-            print(
-                f'[TIMING] image_{img_number:04d}: '
-                f'bg={_t_bg:.2f}s arch_init={_t_arch:.2f}s '
-                f'int_1d={_t_1d:.2f}s int_2d={_t_2d:.2f}s '
-                f'h5_write={_t_h5:.2f}s csv={_t_csv:.2f}s '
-                f'total={_t_total:.2f}s'
-            )
-            print(f'Processed {fname} {self.sub_label}')
-            if len(fname) > 40:
-                fname = f'{fname[:8]}....{fname[-30:]}'
-            self.showLabel.emit(f'{fname}')
-            self.sigUpdate.emit(img_number)
-            files_processed += 1
+            pending.append((img_file, img_number, img_data, img_meta, bg_raw))
 
             if self.single_img:
-                self.sigUpdate.emit(img_number)
                 break
 
-            time.sleep(0.02)
-            start = time.time()
+        # Process whatever is left
+        if pending and sphere is not None and self.command != 'stop':
+            files_processed += self._dispatch_batch(sphere, pending)
 
-        # If loop ends, signal terminate to parent thread.
+        # ── Phase 3: live watching ────────────────────────────────────────────
+        if self.live_mode and self.command != 'stop' and sphere is not None:
+            self.showLabel.emit('Watching for new files...')
+            while self.command != 'stop':
+                if self.command == 'pause':
+                    self.showLabel.emit('Paused')
+                    time.sleep(0.5)
+                    continue
+
+                img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
+                if img_data is None:
+                    # Nothing new yet — show watching status and sleep
+                    self.showLabel.emit('Watching for new files...')
+                    time.sleep(2.0)
+                    continue
+
+                img_number = 1 if img_number is None else img_number
+                self.scan_name = scan_name
+
+                if (sphere is None) or (scan_name != sphere.name):
+                    sphere = self.initialize_sphere()
+                    _cached_poni_dict = None
+
+                if self.poni_dict is not _cached_poni_dict:
+                    sphere._cached_integrator = _make_integrator_from_poni_dict(self.poni_dict)
+                    sphere._cached_fiber_integrator = None
+                    _cached_poni_dict = self.poni_dict
+                    self._cached_gi_incident_angle = None
+
+                if img_number in list(sphere.arches.index):
+                    continue
+
+                bg_raw = self.get_background(img_file, img_number, img_meta)
+                # Process immediately — single-threaded for low latency
+                self._process_one(sphere, img_file, img_number, img_data, img_meta, bg_raw)
+                files_processed += 1
+
         print(f'\nTotal Files Processed: {files_processed}')
+
+    # ── Batch dispatch helpers ────────────────────────────────────────────────
+
+    def _dispatch_batch(self, sphere, pending):
+        """Route a batch to parallel or sequential processing based on max_cores."""
+        max_cores = getattr(self, 'max_cores', 1)
+        n_workers = min(max_cores, len(pending))
+        if n_workers > 1:
+            return self._process_batch_parallel(sphere, pending, n_workers)
+        else:
+            count = 0
+            for item in pending:
+                if self.command == 'stop':
+                    break
+                self._process_one(sphere, *item)
+                count += 1
+            return count
+
+    def _process_one(self, sphere, img_file, img_number, img_data, img_meta, bg_raw):
+        """Integrate one image sequentially and save. Includes timing instrumentation."""
+        fname = os.path.splitext(os.path.basename(img_file))[0]
+        self.showLabel.emit(f'Processing {fname[-30:]}')
+
+        _t1 = time.time()
+        arch = EwaldArch(
+            img_number, img_data, poni_dict=self.poni_dict,
+            scan_info=img_meta, static=True, gi=self.gi,
+            th_mtr=self.th_mtr, bg_raw=bg_raw,
+            series_average=self.series_average,
+            integrator=sphere._cached_integrator,
+        )
+        _t_arch = time.time() - _t1
+
+        if self.gi:
+            _incident_angle = arch._get_incident_angle()
+            if (sphere._cached_fiber_integrator is None
+                    or _incident_angle != self._cached_gi_incident_angle):
+                sphere._cached_fiber_integrator = create_fiber_integrator(
+                    arch._make_lib_poni(),
+                    incident_angle=_incident_angle,
+                    tilt_angle=arch.tilt_angle,
+                    angle_unit="deg",
+                )
+                self._cached_gi_incident_angle = _incident_angle
+
+        _t2 = time.time()
+        arch.integrate_1d(
+            global_mask=self.mask,
+            fiber_integrator=sphere._cached_fiber_integrator,
+            **sphere.bai_1d_args,
+        )
+        _t_1d = time.time() - _t2
+
+        _t3 = time.time()
+        if not sphere.skip_2d:
+            arch.integrate_2d(
+                global_mask=self.mask,
+                fiber_integrator=sphere._cached_fiber_integrator,
+                **sphere.bai_2d_args,
+            )
+        _t_2d = time.time() - _t3
+
+        arch.skip_map_raw = sphere.skip_2d
+        _get_h5pool().close(sphere.data_file)
+        _t4 = time.time()
+        with self.file_lock:
+            sphere.add_arch(
+                arch=arch, calculate=False, update=True,
+                get_sd=True, set_mg=False, static=True, gi=self.gi,
+                th_mtr=self.th_mtr, series_average=self.series_average
+            )
+            sphere.save_to_h5(data_only=True, replace=False)
+        _t_h5 = time.time() - _t4
+
+        _t5 = time.time()
+        self.save_1d(sphere, arch, img_number)
+        _t_csv = time.time() - _t5
+
+        _t_total = _t_arch + _t_1d + _t_2d + _t_h5 + _t_csv
+        print(
+            f'[TIMING] image_{img_number:04d}: '
+            f'arch_init={_t_arch:.2f}s int_1d={_t_1d:.2f}s int_2d={_t_2d:.2f}s '
+            f'h5_write={_t_h5:.2f}s csv={_t_csv:.2f}s total={_t_total:.2f}s'
+        )
+        print(f'Processed {fname} {self.sub_label}')
+        self.sigUpdate.emit(img_number)
+
+    def _process_batch_parallel(self, sphere, pending, n_workers):
+        """Integrate pending images in parallel subprocesses; write H5 serially."""
+        future_to_meta = {}
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            for (img_file, img_number, img_data, img_meta, bg_raw) in pending:
+                future = executor.submit(
+                    _integrate_frame,
+                    img_data, bg_raw, self.poni_dict,
+                    sphere.bai_1d_args, sphere.bai_2d_args,
+                    self.mask, self.gi, self.th_mtr,
+                    sphere.skip_2d, img_number, img_meta,
+                    self.series_average,
+                )
+                future_to_meta[future] = (img_file, img_number)
+
+            count = 0
+            for future in as_completed(future_to_meta):
+                if self.command == 'stop':
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                img_file, img_number = future_to_meta[future]
+                fname = os.path.splitext(os.path.basename(img_file))[0]
+                try:
+                    arch = future.result()
+                except Exception as exc:
+                    print(f'Error integrating image_{img_number:04d}: {exc}')
+                    continue
+
+                arch.skip_map_raw = sphere.skip_2d
+                _get_h5pool().close(sphere.data_file)
+                with self.file_lock:
+                    sphere.add_arch(
+                        arch=arch, calculate=False, update=True,
+                        get_sd=True, set_mg=False, static=True, gi=self.gi,
+                        th_mtr=self.th_mtr, series_average=self.series_average
+                    )
+                    sphere.save_to_h5(data_only=True, replace=False)
+
+                self.save_1d(sphere, arch, img_number)
+                print(f'Processed (parallel) {fname} {self.sub_label}')
+                if len(fname) > 40:
+                    fname = f'{fname[:8]}....{fname[-30:]}'
+                self.showLabel.emit(f'{fname}')
+                self.sigUpdate.emit(img_number)
+                count += 1
+
+        return count
 
     def get_next_image(self):
         """ Gets next image in image series or in directory to process

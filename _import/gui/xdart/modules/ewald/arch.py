@@ -135,6 +135,20 @@ class EwaldArch():
         self.int_1d = int_1d_data_static()
         self.int_2d = int_2d_data_static()
 
+    def __getstate__(self):
+        """Exclude threading.Condition objects so EwaldArch can be pickled
+        for use with concurrent.futures.ProcessPoolExecutor."""
+        state = self.__dict__.copy()
+        state.pop('arch_lock', None)
+        state.pop('file_lock', None)
+        return state
+
+    def __setstate__(self, state):
+        """Restore threading.Condition objects after unpickling."""
+        self.__dict__.update(state)
+        self.arch_lock = Condition()
+        self.file_lock = Condition()
+
     def setup_integrator(self):
         """Sets up integrator object (always a plain AzimuthalIntegrator;
         GI uses create_fiber_integrator transiently during integration)."""
