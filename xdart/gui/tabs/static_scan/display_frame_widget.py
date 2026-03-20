@@ -610,14 +610,17 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         unit_changed = current_plot_unit != self._last_plot_unit
         self._last_plot_unit = current_plot_unit
 
-        if (not unit_changed) and (self.plot_data[0].shape == xdata.shape):
+        current_method = self.ui.plotMethod.currentText()
+        if ((not unit_changed) and
+                (self.plot_data[0].shape == xdata.shape) and
+                current_method in ('Overlay', 'Waterfall')):
             # Accumulate: append any arch not already in the overlay
             for arch_name, row in zip(arch_names, ydata):
                 if arch_name not in self.arch_names:
                     self.plot_data[1] = np.vstack((self.plot_data[1], row))
                     self.arch_names.append(arch_name)
         else:
-            # Fresh start: unit changed or different x-axis size
+            # Fresh start: Single/Sum/Average mode, unit changed, or different x-axis
             self.plot_data = [xdata, ydata]
             self.arch_names = list(arch_names)
 
