@@ -236,9 +236,11 @@ class staticWidget(QWidget):
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
         if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'skip2dCheckBox'):
-            self.wrangler.ui.skip2dCheckBox.stateChanged.connect(
-                lambda _: self.displayframe._apply_1d_only_visibility()
-            )
+            def _on_skip2d_changed(_):
+                self.displayframe._apply_1d_only_visibility()
+                if not self.wrangler.ui.skip2dCheckBox.isChecked():
+                    self.displayframe.update()
+            self.wrangler.ui.skip2dCheckBox.stateChanged.connect(_on_skip2d_changed)
         self.wrangler.setup()
         self.h5viewer.sigNewFile.connect(self.wrangler.set_fname)
         self.h5viewer.sigNewFile.connect(self.displayframe.set_axes)
