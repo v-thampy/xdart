@@ -235,6 +235,10 @@ class staticWidget(QWidget):
         self.wrangler.sigUpdateGI.connect(self.update_scattering_geometry)
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
+        if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'skip2dCheckBox'):
+            self.wrangler.ui.skip2dCheckBox.stateChanged.connect(
+                lambda _: self.displayframe._apply_1d_only_visibility()
+            )
         self.wrangler.setup()
         self.h5viewer.sigNewFile.connect(self.wrangler.set_fname)
         self.h5viewer.sigNewFile.connect(self.displayframe.set_axes)
