@@ -450,6 +450,8 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             self.ui.imageWindow.setMinimumHeight(200)
             self.ui.imageWindow.setMaximumHeight(16777215)
             self.ui.update2D.setEnabled(True)
+            self.ui.update2D.setChecked(True)
+            self.update()
 
     def update_views(self):
         """Updates 2D (if flag is selected) and 1D views
