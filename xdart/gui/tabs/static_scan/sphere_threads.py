@@ -222,9 +222,11 @@ class fileHandlerThread(Qt.QtCore.QThread):
     
     def set_datafile(self):
         with self.file_lock:
+            skip_2d = getattr(self.sphere, 'skip_2d', False)
             self.sphere.set_datafile(
                 self.fname, save_args={'compression': None}
             )
+            self.sphere.skip_2d = skip_2d  # preserve checkbox state across load
         self.sigNewFile.emit(self.fname)
         self.sigUpdate.emit()
     
