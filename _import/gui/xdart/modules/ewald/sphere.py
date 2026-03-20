@@ -181,7 +181,8 @@ class EwaldSphere:
                                               'scan_data', compression)
             if update:
                 self._update_bai_1d(arch)
-                self._update_bai_2d(arch)
+                if not self.skip_2d:
+                    self._update_bai_2d(arch)
             if set_mg:
                 self._mg_integrators = [a.integrator for a in self.arches]
 
@@ -266,7 +267,8 @@ class EwaldSphere:
                 self.bai_2d.qxy = arch.int_2d.qxy
             except AttributeError:
                 pass
-            self.save_bai_2d()
+            if not self.skip_2d:
+                self.save_bai_2d()
 
     def set_multi_geo(self, **args):
         """Rebuilds the per-arch integrator list used for stitched integration.
@@ -424,7 +426,8 @@ class EwaldSphere:
                         self.global_mask = None
 
                     self.bai_1d.from_hdf5(grp['bai_1d'])
-                    self.bai_2d.from_hdf5(grp['bai_2d'])
+                    if 'bai_2d' in grp:
+                        self.bai_2d.from_hdf5(grp['bai_2d'])
 
     def set_datafile(self, fname, name=None, keep_current_data=False,
                      save_args={}, load_args={}):
