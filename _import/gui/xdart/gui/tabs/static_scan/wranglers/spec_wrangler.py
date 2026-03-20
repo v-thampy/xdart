@@ -46,6 +46,11 @@ QDialog = QtWidgets.QDialog
 QMessageBox = QtWidgets.QMessageBox
 QPushButton = QtWidgets.QPushButton
 
+def _is_eiger_master(path):
+    """Return True if path looks like an Eiger HDF5 master file (*_master.h5 / *_master.hdf5)."""
+    return Path(path).stem.endswith('_master')
+
+
 def_poni_file = '' # '/Users/vthampy/SSRL_Data/RDA/static_det_test_data/test_xfc_data/test_xfc.poni'
 def_img_file = '' # '/Users/vthampy/SSRL_Data/RDA/static_det_test_data/test_xfc_data/images/images_0005.tif'
 
@@ -1008,6 +1013,7 @@ class specThread(wranglerThread):
         self.detector = None
         self.img_fnames = []
         self.processed = []
+        self.processed_frames = set()  # (master_path, frame_idx) for HDF5 Eiger files
         self.processed_scans = []
         self.sub_label = ''
 
@@ -1021,6 +1027,7 @@ class specThread(wranglerThread):
 
         self.img_fnames.clear()
         self.processed.clear()
+        self.processed_frames.clear()
         self.processed_scans.clear()
         self.detector = self.poni_dict['detector']
         self.sub_label = ''
@@ -1217,6 +1224,73 @@ class specThread(wranglerThread):
         print(f'Processed {fname} {self.sub_label}')
         self.sigUpdate.emit(img_number)
 
+    def _get_next_eiger_frame(self):
+        """Return next unprocessed frame from Eiger HDF5 master file(s).
+
+        Works across all three input modes:
+          - Single Image / Image Series: use self.img_file directly as the master,
+            then also search for sibling master files with the same scan-name prefix.
+          - Image Directory: glob for *_master.h5 files under self.img_dir.
+
+        Returns the standard 5-tuple (img_file, scan_name, img_number, img_data, meta).
+        Returns (None, None, 1, None, {}) when all frames are exhausted.
+        """
+        import h5py as _h5py
+
+        if len(self.img_fnames) == 0:
+            if self.inp_type == 'Image Directory':
+                # Glob for all master files under the directory
+                filters = '*' + '*'.join(f for f in self.file_filter.split()) + '*'
+                filters = filters if filters != '**' else '*'
+                pattern = f'{filters}_master.h5'
+                if self.include_subdir:
+                    master_files = sorted(Path(self.img_dir).rglob(pattern))
+                else:
+                    master_files = sorted(Path(self.img_dir).glob(pattern))
+            else:
+                # Single Image or Image Series: start from the selected master file,
+                # then pick up any sibling master files with the same scan-name prefix.
+                selected = Path(self.img_file)
+                selected_stem = selected.stem  # e.g., "scan001_master"
+                scan_prefix = selected_stem[:-7] if selected_stem.endswith('_master') else selected_stem
+                # strip trailing digits so "scan001" matches "scan002_master.h5" etc.
+                base_prefix = scan_prefix.rstrip('0123456789')
+                siblings = sorted(selected.parent.glob(f'{base_prefix}*_master.h5'))
+                # Only include files at or after the selected file (natural order)
+                master_files = [f for f in siblings if str(f) >= str(selected)]
+                if not master_files:
+                    master_files = [selected]
+
+            frame_entries = []
+            for mf in master_files:
+                mf_str = str(mf)
+                try:
+                    with _h5py.File(mf_str, 'r') as f:
+                        nframes = f['entry/data/data'].shape[0]
+                except Exception:
+                    continue
+                for i in range(nframes):
+                    if (mf_str, i) not in self.processed_frames:
+                        frame_entries.append((mf_str, i))
+
+            self.img_fnames = deque(frame_entries)
+
+        if not self.img_fnames:
+            return None, None, 1, None, {}
+
+        master_path, frame_idx = self.img_fnames.popleft()
+        self.processed_frames.add((master_path, frame_idx))
+
+        img_data = get_img_data(master_path, self.detector, return_float=True, im=frame_idx)
+        meta = read_image_metadata(master_path, meta_format=self.meta_ext) if self.meta_ext else {}
+
+        # Derive scan_name by stripping _master suffix from the stem
+        master_stem = Path(master_path).stem  # e.g., "scan001_master"
+        scan_name = master_stem[:-7] if master_stem.endswith('_master') else master_stem
+        img_number = frame_idx + 1  # 1-based frame index
+
+        return master_path, scan_name, img_number, img_data, meta
+
     def get_next_image(self):
         """ Gets next image in image series or in directory to process
 
@@ -1225,12 +1299,18 @@ class specThread(wranglerThread):
             image_number {int}: image file number (if part of series)
             image_data {np.ndarray}: image file data array
         """
-        if self.single_img:
+        is_master = _is_eiger_master(self.img_file) if self.img_file else False
+
+        if self.single_img and not is_master:
+            # Original single-image path (tif, raw, edf, …)
             img_data = get_img_data(self.img_file, self.detector, return_float=True)
             meta = read_image_metadata(self.img_file, meta_format=self.meta_ext) if self.meta_ext else {}
-            # return self.img_file, get_img_number(self.img_file), img_data
             scan_name, img_number = get_sname_img_number(self.img_file)
             return self.img_file, scan_name, img_number, img_data, meta
+
+        if is_master or self.img_ext.lower() in ('h5', 'hdf5'):
+            # Eiger HDF5 master file — handles Single Image, Image Series, Image Directory
+            return self._get_next_eiger_frame()
 
         if len(self.img_fnames) == 0:
             if self.inp_type != 'Image Directory':
