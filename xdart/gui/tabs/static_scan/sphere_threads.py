@@ -6,6 +6,7 @@
 # Standard library imports
 from queue import Queue
 from threading import Condition
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import traceback
 import numpy as np
 
@@ -23,6 +24,19 @@ from xdart import utils as ut
 import gc
 
 # from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
+
+
+def _reintegrate_arch(arch, bai_1d_args, bai_2d_args, static, gi, do_2d):
+    """Module-level worker for parallel reintegration (must be picklable)."""
+    from xdart.modules.ewald.arch import EwaldArch  # local import for subprocess safety
+    if static:
+        arch.static = True
+    if gi:
+        arch.gi = True
+    arch.integrate_1d(**bai_1d_args)
+    if do_2d:
+        arch.integrate_2d(**bai_2d_args)
+    return arch
 
 
 class integratorThread(Qt.QtCore.QThread):
@@ -81,53 +95,93 @@ class integratorThread(Qt.QtCore.QThread):
                 traceback.print_exc()
 
     def bai_2d_all(self):
-        """Integrates all arches 2d. Note, does not call sphere method
-        directly, handles same functions but broken up for updates
-        after each image.
-        """
+        """Integrates all arches 2d. Uses parallel workers when sphere.max_cores > 1."""
         if getattr(self.sphere, 'skip_2d', False):
             return
         self.data_2d.clear()
         with self.sphere.sphere_lock:
             self.sphere.bai_2d = int_2d_data_static()
-        for arch in self.sphere.arches:
-            if self.sphere.static:
-                arch.static = True
-            if self.sphere.gi:
-                arch.gi = True
-            arch.integrate_2d(**self.sphere.bai_2d_args)
-            self.sphere.arches[arch.idx] = arch
-            self.sphere._update_bai_2d(arch)
 
-            self.data_2d[int(arch.idx)] = {
-                'map_raw': arch.map_raw,
-                'bg_raw': arch.bg_raw,
-                'mask': arch.mask,
-                'int_2d': arch.int_2d
-            }
-            self.update.emit(arch.idx)
+        max_cores = getattr(self.sphere, 'max_cores', 1)
+        all_arches = list(self.sphere.arches)  # load all from H5 into memory
+
+        if max_cores > 1 and len(all_arches) > 1:
+            n_workers = min(max_cores, len(all_arches))
+            futures = {}
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                for arch in all_arches:
+                    f = executor.submit(
+                        _reintegrate_arch, arch,
+                        self.sphere.bai_1d_args, self.sphere.bai_2d_args,
+                        self.sphere.static, self.sphere.gi, do_2d=True,
+                    )
+                    futures[f] = arch.idx
+                for future in as_completed(futures):
+                    arch = future.result()
+                    self.sphere.arches[arch.idx] = arch
+                    self.sphere._update_bai_2d(arch)
+                    self.data_2d[int(arch.idx)] = {
+                        'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
+                        'mask': arch.mask, 'int_2d': arch.int_2d,
+                    }
+                    self.update.emit(arch.idx)
+        else:
+            for arch in all_arches:
+                if self.sphere.static:
+                    arch.static = True
+                if self.sphere.gi:
+                    arch.gi = True
+                arch.integrate_2d(**self.sphere.bai_2d_args)
+                self.sphere.arches[arch.idx] = arch
+                self.sphere._update_bai_2d(arch)
+                self.data_2d[int(arch.idx)] = {
+                    'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
+                    'mask': arch.mask, 'int_2d': arch.int_2d,
+                }
+                self.update.emit(arch.idx)
+
         with self.file_lock:
             with catch(self.sphere.data_file, 'a') as file:
                 ut.dict_to_h5(self.sphere.bai_2d_args, file, 'bai_2d_args')
 
     def bai_1d_all(self):
-        """Integrates all arches 1d. Note, does not call sphere method
-        directly, handles same functions but broken up for updates
-        after each image.
-        """
+        """Integrates all arches 1d. Uses parallel workers when sphere.max_cores > 1."""
         self.data_1d.clear()
         with self.sphere.sphere_lock:
             self.sphere.bai_1d = int_1d_data_static()
-        for arch in self.sphere.arches:
-            if self.sphere.static:
-                arch.static = True
-            if self.sphere.gi:
-                arch.gi = True
-            arch.integrate_1d(**self.sphere.bai_1d_args)
-            self.sphere.arches[arch.idx] = arch
-            self.sphere._update_bai_1d(arch)
-            self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
-            self.update.emit(arch.idx)
+
+        max_cores = getattr(self.sphere, 'max_cores', 1)
+        all_arches = list(self.sphere.arches)  # load all from H5 into memory
+
+        if max_cores > 1 and len(all_arches) > 1:
+            n_workers = min(max_cores, len(all_arches))
+            futures = {}
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                for arch in all_arches:
+                    f = executor.submit(
+                        _reintegrate_arch, arch,
+                        self.sphere.bai_1d_args, self.sphere.bai_2d_args,
+                        self.sphere.static, self.sphere.gi, do_2d=False,
+                    )
+                    futures[f] = arch.idx
+                for future in as_completed(futures):
+                    arch = future.result()
+                    self.sphere.arches[arch.idx] = arch
+                    self.sphere._update_bai_1d(arch)
+                    self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
+                    self.update.emit(arch.idx)
+        else:
+            for arch in all_arches:
+                if self.sphere.static:
+                    arch.static = True
+                if self.sphere.gi:
+                    arch.gi = True
+                arch.integrate_1d(**self.sphere.bai_1d_args)
+                self.sphere.arches[arch.idx] = arch
+                self.sphere._update_bai_1d(arch)
+                self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
+                self.update.emit(arch.idx)
+
         with self.file_lock:
             with catch(self.sphere.data_file, 'a') as file:
                 ut.dict_to_h5(self.sphere.bai_1d_args, file, 'bai_1d_args')

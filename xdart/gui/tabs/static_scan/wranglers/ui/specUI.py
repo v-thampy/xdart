@@ -15,8 +15,9 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QFont, QFontDatabase, QGradient, QIcon,
     QImage, QKeySequence, QLinearGradient, QPainter,
     QPalette, QPixmap, QRadialGradient, QTransform)
+import os as _os
 from PySide6.QtWidgets import (QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel,
-    QPushButton, QSizePolicy, QVBoxLayout, QWidget)
+    QPushButton, QSizePolicy, QSpinBox, QVBoxLayout, QWidget)
 
 class Ui_Form(object):
     def setupUi(self, Form):
@@ -58,6 +59,21 @@ class Ui_Form(object):
         self.skip2dCheckBox = QCheckBox(self.commandFrame)
         self.skip2dCheckBox.setObjectName(u"skip2dCheckBox")
         self.commandLayout.addWidget(self.skip2dCheckBox)
+
+        self.coresLabel = QLabel(self.commandFrame)
+        self.coresLabel.setObjectName(u"coresLabel")
+        self.commandLayout.addWidget(self.coresLabel)
+        self.maxCoresSpinBox = QSpinBox(self.commandFrame)
+        self.maxCoresSpinBox.setObjectName(u"maxCoresSpinBox")
+        _cpu = _os.cpu_count() or 4
+        self.maxCoresSpinBox.setMinimum(1)
+        self.maxCoresSpinBox.setMaximum(_cpu)
+        self.maxCoresSpinBox.setValue(min(_cpu - 1, 8) or 1)
+        self.commandLayout.addWidget(self.maxCoresSpinBox)
+
+        self.liveCheckBox = QCheckBox(self.commandFrame)
+        self.liveCheckBox.setObjectName(u"liveCheckBox")
+        self.commandLayout.addWidget(self.liveCheckBox)
 
         self.horizontalLayout_2.addLayout(self.commandLayout)
 
@@ -110,6 +126,8 @@ class Ui_Form(object):
         self.specLabel.setText("")
         self.processingLabel.setText(QCoreApplication.translate("Form", u"Processing:", None))
         self.skip2dCheckBox.setText(QCoreApplication.translate("Form", u"1D Only", None))
+        self.coresLabel.setText(QCoreApplication.translate("Form", u"Cores:", None))
+        self.liveCheckBox.setText(QCoreApplication.translate("Form", u"Live", None))
         self.startButton.setText(QCoreApplication.translate("Form", u"Start", None))
         self.pauseButton.setText(QCoreApplication.translate("Form", u"Pause", None))
         self.continueButton.setText(QCoreApplication.translate("Form", u"Continue", None))
