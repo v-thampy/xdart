@@ -145,9 +145,6 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.normChannel = None
         self.overlay = None
         self._last_plot_unit = -1
-        self._plot_mode = 'same_axis'   # 'same_axis' or 'cross_scan'
-        self.cross_scan_curves = []     # [{'x': ndarray, 'y': ndarray, 'name': str}]
-        self._slice_curve_names = []    # arch_names entries that are chi slices
 
         # Image and Binned 2D Data
         self.image_data = (None, None)
@@ -230,18 +227,6 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.ui.slice_center.valueChanged.connect(self.update_plot_range)
         self.ui.slice_width.valueChanged.connect(self.update_plot_range)
         self.ui.wf_options.clicked.connect(self.popup_wf_options)
-
-        # Add Slice / Clear Slices buttons (inserted after slice_width in its layout)
-        self.add_slice_btn = QtWidgets.QPushButton("Add Slice")
-        self.clear_slices_btn = QtWidgets.QPushButton("Clear Slices")
-        self.add_slice_btn.setMaximumWidth(75)
-        self.clear_slices_btn.setMaximumWidth(90)
-        _slice_layout = self.ui.slice_width.parentWidget().layout()
-        _slice_idx = _slice_layout.indexOf(self.ui.slice_width)
-        _slice_layout.insertWidget(_slice_idx + 1, self.add_slice_btn)
-        _slice_layout.insertWidget(_slice_idx + 2, self.clear_slices_btn)
-        self.add_slice_btn.clicked.connect(self._add_slice)
-        self.clear_slices_btn.clicked.connect(self._clear_slices)
 
         # Clear 1D Plot Buttons
         self.ui.clear_1D.clicked.connect(self.clear_1D)
@@ -452,11 +437,18 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
     def _apply_1d_only_visibility(self):
         """Show or hide 2D panes based on sphere.skip_2d."""
         skip = getattr(self.sphere, 'skip_2d', False)
-        self.ui.splitter_2.setVisible(not skip)
+        # imageWindow is child index 0 in the vertical splitter
+        # Use splitter sizes to collapse/expand rather than hide(),
+        # since QSplitter doesn't fully collapse hidden children.
+        splitter = self.ui.splitter
         if skip:
+            self.ui.imageWindow.setMinimumHeight(0)
+            self.ui.imageWindow.setMaximumHeight(0)
             self.ui.update2D.setChecked(False)
             self.ui.update2D.setEnabled(False)
         else:
+            self.ui.imageWindow.setMinimumHeight(200)
+            self.ui.imageWindow.setMaximumHeight(16777215)
             self.ui.update2D.setEnabled(True)
 
     def update_views(self):
@@ -618,51 +610,19 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         unit_changed = current_plot_unit != self._last_plot_unit
         self._last_plot_unit = current_plot_unit
 
-        # Determine plot mode based on cross_scan_curves compatibility
-        if self.cross_scan_curves:
-            all_same = all(c['x'].shape == xdata.shape for c in self.cross_scan_curves)
-            self._plot_mode = 'same_axis' if all_same else 'cross_scan'
+        if (not unit_changed) and (self.plot_data[0].shape == xdata.shape):
+            # Accumulate: append any arch not already in the overlay
+            for arch_name, row in zip(arch_names, ydata):
+                if arch_name not in self.arch_names:
+                    self.plot_data[1] = np.vstack((self.plot_data[1], row))
+                    self.arch_names.append(arch_name)
         else:
-            self._plot_mode = 'same_axis'
+            # Fresh start: unit changed or different x-axis size
+            self.plot_data = [xdata, ydata]
+            self.arch_names = list(arch_names)
 
-        if self._plot_mode == 'same_axis':
-            if ((not unit_changed) and
-                    (self.plot_data[0].shape == xdata.shape) and
-                    (self.plotMethod in ['Overlay', 'Waterfall'])):
-                # Prune stale arch curves; preserve slice curves
-                keep = [i for i, name in enumerate(self.arch_names)
-                        if name in arch_names or name in self._slice_curve_names]
-                if keep:
-                    self.plot_data[1] = self.plot_data[1][keep]
-                    self.arch_names = [self.arch_names[i] for i in keep]
-                else:
-                    self.plot_data = [xdata, ydata]
-                    self.arch_names = list(arch_names)
-                    self._slice_curve_names.clear()
-                # Add newly selected arches
-                for (arch_name, data) in zip(arch_names, ydata):
-                    if arch_name not in self.arch_names:
-                        self.plot_data[1] = np.vstack((self.plot_data[1], data))
-                        self.arch_names.append(arch_name)
-            else:
-                self.plot_data = [xdata, ydata]
-                self.arch_names = list(arch_names)
-                self._slice_curve_names.clear()
-
-            xdata, ydata = self.plot_data
-            self.plot_data_range = [[xdata.min(), xdata.max()], [ydata.min(), ydata.max()]]
-        else:
-            # Cross-scan mode: refresh own sphere's curves in cross_scan_curves
-            own_names = set(arch_names)
-            self.cross_scan_curves = [c for c in self.cross_scan_curves
-                                      if c['name'] not in own_names]
-            for name, row in zip(arch_names, ydata):
-                self.cross_scan_curves.append({'x': xdata.copy(), 'y': row.copy(), 'name': name})
-            self.arch_names = [c['name'] for c in self.cross_scan_curves]
-            all_y = np.concatenate([c['y'] for c in self.cross_scan_curves])
-            all_x = np.concatenate([c['x'] for c in self.cross_scan_curves])
-            self.plot_data_range = [[float(all_x.min()), float(all_x.max())],
-                                    [float(all_y.min()), float(all_y.max())]]
+        xdata, ydata = self.plot_data
+        self.plot_data_range = [[xdata.min(), xdata.max()], [ydata.min(), ydata.max()]]
 
         self.update_plot_view()
 
@@ -680,25 +640,11 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
 
         self.plotMethod = self.ui.plotMethod.currentText()
 
-        # Waterfall is unavailable in cross-scan mode (curves have different x-axes)
-        if self._plot_mode == 'cross_scan' and self.plotMethod == 'Waterfall':
-            self.plotMethod = 'Overlay'
-            try:
-                self.window().statusBar().showMessage(
-                    "Waterfall requires matching x-axes. Falling back to Overlay.", 4000)
-            except Exception:
-                pass
-
-        # Sum/Average unavailable in cross-scan mode
-        if self._plot_mode == 'cross_scan' and self.plotMethod in ('Sum', 'Average'):
-            self.plotMethod = 'Overlay'
-
         self.ui.yOffset.setEnabled(False)
         if (self.plotMethod in ['Overlay', 'Single']) and (len(self.arch_names) > 1):
             self.ui.yOffset.setEnabled(True)
 
-        n_curves = (len(self.cross_scan_curves) if self._plot_mode == 'cross_scan'
-                    else len(self.plot_data[1]))
+        n_curves = len(self.plot_data[1])
         # Only switch to WF plot if more than three curves. Definitely switch if more than 15!
         if (self.plotMethod == 'Waterfall' and n_curves > 3) or n_curves > 15:
             self.update_wf()
@@ -709,10 +655,6 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         """Updates data in 1D plot Frame
         """
         self.setup_1d_layout()
-
-        if self._plot_mode == 'cross_scan' and self.cross_scan_curves:
-            self._update_1d_cross_scan()
-            return
 
         xdata_, ydata_ = self.plot_data
         s_xdata, ydata = xdata_.copy(), ydata_.copy()
@@ -775,57 +717,9 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
 
         return s_xdata, s_ydata
 
-    def _update_1d_cross_scan(self):
-        """Render cross-scan curves where each curve may have its own x-axis."""
-        int_label = 'I'
-        if self.normChannel:
-            int_label = f'I / {self.normChannel}'
-        ylabel = f'{int_label} (a.u.)'
-
-        self.plot.getAxis("left").setLogMode(False)
-        self.plot.getAxis("bottom").setLogMode(False)
-
-        curves_slice = self.cross_scan_curves[self.wf_start::self.wf_step]
-        self.setup_curves()
-
-        offset = self.ui.yOffset.value()
-        y_range = self.plot_data_range[1][1] - self.plot_data_range[1][0]
-        y_offset = offset / 100 * y_range if y_range else 0.0
-
-        for nn, (curve, c) in enumerate(zip(self.curves, curves_slice)):
-            x = c['x'].copy()
-            y = c['y'].copy()
-            if self.scale == 'Log':
-                if y.min() < 1:
-                    y -= (y.min() - 1.)
-                y = np.log10(y)
-                self.plot.getAxis("left").setLogMode(True)
-                ylabel = f'Log {int_label}(a.u.)'
-            elif self.scale == 'Log-Log':
-                if y.min() < 1:
-                    y -= (y.min() - 1.)
-                y = np.log10(y)
-                x = np.log10(x)
-                self.plot.getAxis("left").setLogMode(True)
-                self.plot.getAxis("bottom").setLogMode(True)
-                ylabel = f'Log {int_label}(a.u.)'
-            elif self.scale == 'Sqrt':
-                y = np.sqrt(np.abs(y)) * np.sign(y)
-                ylabel = f'<math>&radic;</math>{int_label} (a.u.)'
-            curve.setData(x, y + y_offset * nn)
-
-        plotUnit = self.ui.plotUnit.currentIndex()
-        self.plot.setLabel("bottom", x_labels_1D[plotUnit], units=x_units_1D[plotUnit])
-        self.plot.setLabel("left", ylabel)
-
     def update_wf(self):
         """Updates data in 1D plot Frame
         """
-        if self._plot_mode == 'cross_scan':
-            # Waterfall requires a shared x-axis; fall back to overlay
-            self.update_1d_view()
-            return
-
         self.setup_wf_layout()
 
         xdata_, data_ = self.plot_data
@@ -1194,8 +1088,7 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.legend.clear()
 
         arch_ids = self.arch_names[self.wf_start::self.wf_step]
-        if (self._plot_mode == 'same_axis' and
-                self.plotMethod in ['Sum', 'Average'] and
+        if (self.plotMethod in ['Sum', 'Average'] and
                 len(self.arch_names) > 1):
             arch_ids = f'{self.plotMethod} [{self.arch_names[0]}'
             for arch_name in self.arch_names[1:]:
@@ -1214,73 +1107,11 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         if not self.ui.showLegend.isChecked():
             self.legend.clear()
 
-    def _add_slice(self):
-        """Compute I(Q) for the current chi range and append as a new overlay curve."""
-        if self._plot_mode == 'cross_scan':
-            return  # Slices share the same Q axis — only supported in same-axis mode
-        if not self.idxs_2d or self.plot_data[0].size == 0:
-            return
-
-        center = self.ui.slice_center.value()
-        width = self.ui.slice_width.value()
-        slice_name = f'\u03c7=[{center - width:.1f}\u00b0,{center + width:.1f}\u00b0]'
-
-        xdata_ref = self.plot_data[0]
-        ydata_sum = None
-        count = 0
-        for idx in self.idxs_2d:
-            arch_1d = self.data_1d[int(idx)]
-            arch_2d = self.data_2d.get(int(idx))
-            if arch_2d is None:
-                continue
-            int_2d_obj = arch_2d['int_2d']
-            intensity = self.get_int_2d(int_2d_obj, arch_1d, normalize=False)
-            chi = int_2d_obj.chi
-            _inds = (center - width <= chi) & (chi <= center + width)
-            if not _inds.any():
-                continue
-            row = np.nanmean(intensity[_inds, :], axis=0)
-            row = self.normalize(row, arch_1d.scan_info)
-            if row.shape != xdata_ref.shape:
-                continue
-            ydata_sum = row if ydata_sum is None else ydata_sum + row
-            count += 1
-
-        if ydata_sum is None or count == 0:
-            return
-        slice_row = ydata_sum / count
-
-        self.plot_data[1] = np.vstack((self.plot_data[1], slice_row))
-        self.arch_names.append(slice_name)
-        self._slice_curve_names.append(slice_name)
-
-        ydata = self.plot_data[1]
-        self.plot_data_range = [[xdata_ref.min(), xdata_ref.max()],
-                                [ydata.min(), ydata.max()]]
-        self.update_plot_view()
-
-    def _clear_slices(self):
-        """Remove all chi-slice overlay curves from the current plot."""
-        if not self._slice_curve_names:
-            return
-        keep = [i for i, name in enumerate(self.arch_names)
-                if name not in self._slice_curve_names]
-        if keep:
-            self.plot_data[1] = self.plot_data[1][keep]
-        else:
-            self.plot_data[1] = np.zeros((0, self.plot_data[0].size))
-        self.arch_names = [self.arch_names[i] for i in keep]
-        self._slice_curve_names.clear()
-        self.update_plot_view()
-
     def clear_1D(self):
         """Initialize curves for line plots
         """
         self.arch_names.clear()
         self.arch_ids.clear()
-        self._slice_curve_names.clear()
-        self.cross_scan_curves.clear()
-        self._plot_mode = 'same_axis'
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.setup_1d_layout()
         self.plot.clear()
@@ -1463,39 +1294,30 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
 
         fname = os.path.join(path, fname)
 
-        if self._plot_mode == 'cross_scan':
-            # Mode B: each curve has its own x-axis — save individually
-            for nn, c in enumerate(self.cross_scan_curves):
-                safe_name = c['name'].replace('/', '_').replace(' ', '_')
-                xye_fname = f'{fname}_{safe_name}.xye'
-                ut.write_xye(xye_fname, c['x'], c['y'])
-                csv_fname = f'{fname}_{safe_name}.csv'
-                ut.write_csv(csv_fname, c['x'], c['y'])
-        else:
-            xdata, ydata = self.plot_data
-            if self.plotMethod in ['Average', 'Sum']:
-                if self.plotMethod == 'Average':
-                    s_ydata = np.nanmean(ydata, 0)
-                else:
-                    s_ydata = np.nansum(ydata, 0)
+        xdata, ydata = self.plot_data
+        if self.plotMethod in ['Average', 'Sum']:
+            if self.plotMethod == 'Average':
+                s_ydata = np.nanmean(ydata, 0)
+            else:
+                s_ydata = np.nansum(ydata, 0)
 
-                # Write to xye
-                xye_fname = f'{fname}.xye'
-                ut.write_xye(xye_fname, xdata, s_ydata)
+            # Write to xye
+            xye_fname = f'{fname}.xye'
+            ut.write_xye(xye_fname, xdata, s_ydata)
 
-                # Write to csv
-                csv_fname = f'{fname}.csv'
-                ut.write_csv(csv_fname, xdata, s_ydata)
+            # Write to csv
+            csv_fname = f'{fname}.csv'
+            ut.write_csv(csv_fname, xdata, s_ydata)
 
-            idxs = [arch.replace(f'{self.sphere.name}_', '') for arch in self.arch_names]
-            for nn, (s_ydata, idx) in enumerate(zip(ydata, idxs)):
-                # Write to xye
-                xye_fname = f'{fname}_{str(idx).zfill(4)}.xye'
-                ut.write_xye(xye_fname, xdata, s_ydata)
+        idxs = [arch.replace(f'{self.sphere.name}_', '') for arch in self.arch_names]
+        for nn, (s_ydata, idx) in enumerate(zip(ydata, idxs)):
+            # Write to xye
+            xye_fname = f'{fname}_{str(idx).zfill(4)}.xye'
+            ut.write_xye(xye_fname, xdata, s_ydata)
 
-                # Write to csv
-                csv_fname = f'{fname}_{str(idx).zfill(4)}.csv'
-                ut.write_csv(csv_fname, xdata, s_ydata)
+            # Write to csv
+            csv_fname = f'{fname}_{str(idx).zfill(4)}.csv'
+            ut.write_csv(csv_fname, xdata, s_ydata)
 
         if not auto:
             scene = self.plot_viewBox.scene()
