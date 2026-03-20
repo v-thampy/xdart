@@ -1235,8 +1235,6 @@ class specThread(wranglerThread):
         Returns the standard 5-tuple (img_file, scan_name, img_number, img_data, meta).
         Returns (None, None, 1, None, {}) when all frames are exhausted.
         """
-        import h5py as _h5py
-
         if len(self.img_fnames) == 0:
             if self.inp_type == 'Image Directory':
                 # Glob for all master files under the directory
@@ -1265,8 +1263,8 @@ class specThread(wranglerThread):
             for mf in master_files:
                 mf_str = str(mf)
                 try:
-                    with _h5py.File(mf_str, 'r') as f:
-                        nframes = f['entry/data/data'].shape[0]
+                    with fabio.open(mf_str) as img:
+                        nframes = img.nframes
                 except Exception:
                     continue
                 for i in range(nframes):
@@ -1281,7 +1279,16 @@ class specThread(wranglerThread):
         master_path, frame_idx = self.img_fnames.popleft()
         self.processed_frames.add((master_path, frame_idx))
 
-        img_data = get_img_data(master_path, self.detector, return_float=True, im=frame_idx)
+        try:
+            with fabio.open(master_path) as img:
+                if frame_idx == 0:
+                    img_data = np.asarray(img.data, dtype=float)
+                else:
+                    img_data = np.asarray(img.get_frame(frame_idx).data, dtype=float)
+        except Exception as e:
+            print(f'Error reading frame {frame_idx} from {master_path}: {e}')
+            img_data = None
+
         meta = read_image_metadata(master_path, meta_format=self.meta_ext) if self.meta_ext else {}
 
         # Derive scan_name by stripping _master suffix from the stem

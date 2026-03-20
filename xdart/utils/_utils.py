@@ -471,29 +471,17 @@ def get_img_data(
     Returns:
         ndarray: Image data read into numpy array
     """
-    # For HDF5 files, use ssrl_xrd_tools.io.image.read_image() which handles
-    # Eiger master files and any HDF5 dataset layout generically.
-    ext = os.path.splitext(fname)[1].lower()
-    if ext in ('.h5', '.hdf5'):
+    try:
+        with fabio.open(fname) as f:
+            if im == 0:
+                img_data = f.data
+            else:
+                img_data = f.get_frame(im).data
+    except Exception:
+        # Fallback: raw binary for non-standard formats
         try:
-            from ssrl_xrd_tools.io.image import read_image as _read_image
-            img_data = np.asarray(_read_image(fname, frame=im), dtype=float)
+            img_data = np.fromfile(fname, dtype='int32').reshape(detector.shape)
         except Exception:
-            return None
-    else:
-        try:
-            img_data = fabio.open(fname).data
-        except xml.etree.ElementTree.ParseError:
-            return None
-        except OSError:
-            img_data = np.asarray(np.fromfile(fname, dtype='int32', sep=""), dtype=float)
-            try:
-                img_data = img_data.reshape(detector.shape)
-            except ValueError:
-                return None
-        except ValueError:
-            return None
-        except:
             return None
 
     try:
@@ -501,33 +489,6 @@ def get_img_data(
             return None
     except AttributeError:
         return None
-
-        # if 'tif' in fname[-5:]:
-        #     img_data = np.asarray(io.imread(fname))
-        # elif ('h5' in fname[-4:]) or ('hdf5' in fname[-6:]):
-        #     with h5py.File(fname, mode='r') as f:
-        #         try:
-        #             img_data = np.asarray(f['entry']['data']['data'][im], dtype=float)
-        #         except IndexError:
-        #             return None
-        #         img_data[514:551, :] = np.nan
-        #
-        #         # Hot pixel in SSRL Eiger 1M detector
-        #         img_data[0, 1029] = np.nan
-        # elif 'mar3450' in fname[-9:]:
-        #     img_data = fabio.open(fname).data
-        # else:
-        #     img_data = np.asarray(np.fromfile(fname, dtype='int32', sep=""), dtype=float)
-        #     if len(img_data) == np.prod(shape_100K):
-        #         img_data = img_data.reshape(shape_100K)
-        #     elif len(img_data) == np.prod(shape_300K):
-        #         img_data = img_data.reshape(shape_300K)
-        #     else:
-        #         img_data = img_data.reshape(shape_1M)
-        #         img_data[:, 487:487 + 7] = np.nan
-        #         for ii in range(1, 5):
-        #             mod_start = 195 * ii + 17 * (ii - 1)
-        #             img_data[mod_start:mod_start + 17] = np.nan
 
     if return_float:
         img_data = np.asarray(img_data, dtype=float)
