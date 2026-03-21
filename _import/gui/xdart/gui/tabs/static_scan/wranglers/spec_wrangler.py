@@ -28,7 +28,7 @@ from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
 from .wrangler_widget import wranglerWidget, wranglerThread, wranglerProcess
 from .ui.specUI import Ui_Form
 from ....gui_utils import NamedActionParameter
-from ssrl_xrd_tools.io.image import read_image, get_detector_mask
+from ssrl_xrd_tools.io.image import read_image, count_frames
 from ssrl_xrd_tools.io.export import write_xye, write_csv
 from ssrl_xrd_tools.io.metadata import read_image_metadata, _extract_scan_info
 from xdart.utils import get_fname_dir  # GUI-specific file dialog helper
@@ -1062,7 +1062,7 @@ class specThread(wranglerThread):
         self._eiger_done_masters.clear()
         self.detector = self.poni_dict['detector']
         self.sub_label = ''
-        det_mask = get_detector_mask(self.detector.name)
+        det_mask = self.detector.mask  # pyFAI .mask property (no deprecation warning)
         if self.mask_file and os.path.exists(self.mask_file):
             custom_mask = np.asarray(read_image(self.mask_file), dtype=bool)
             det_mask = det_mask | custom_mask if det_mask is not None else custom_mask
@@ -1260,12 +1260,8 @@ class specThread(wranglerThread):
         self.sigUpdate.emit(img_number)
 
     def _get_nframes(self, master_path):
-        """Return frame count for a master file via fabio, 0 on failure."""
-        try:
-            with fabio.open(master_path) as img:
-                return img.nframes
-        except Exception:
-            return 0
+        """Return frame count for a master file, 0 on failure."""
+        return count_frames(master_path)
 
     def _eiger_refill_master_queue(self):
         """Glob for *_master.h5 files not yet processed (Image Directory mode)."""
