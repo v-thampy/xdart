@@ -162,7 +162,7 @@ def arr_to_h5(data, grp: h5py.Group, key: str, compression) -> None:
     else at its natural dtype.
     """
     if key in ("map_raw", "bg_raw"):
-        arr = np.array(data, dtype="int32")
+        arr = np.nan_to_num(data, nan=0).astype("int32")
     elif key in ("i_tthChi", "i_qChi", "i_QxyQz"):
         arr = np.array(data, dtype="float32")
     else:
