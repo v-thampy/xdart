@@ -1234,7 +1234,8 @@ class specThread(wranglerThread):
             )
         _t_2d = time.time() - _t3
 
-        arch.skip_map_raw = sphere.skip_2d
+        # For Eiger: raw frames already live in the master file — don't double-store them.
+        arch.skip_map_raw = sphere.skip_2d or _is_eiger_master(img_file)
         _get_h5pool().close(sphere.data_file)
         _t4 = time.time()
         with self.file_lock:
@@ -1256,7 +1257,11 @@ class specThread(wranglerThread):
             f'arch_init={_t_arch:.2f}s int_1d={_t_1d:.2f}s int_2d={_t_2d:.2f}s '
             f'h5_write={_t_h5:.2f}s csv={_t_csv:.2f}s total={_t_total:.2f}s'
         )
-        print(f'Processed {fname} {self.sub_label}')
+        _ext = Path(img_file).suffix.lower()
+        if _ext in ('.h5', '.hdf5', '.nxs'):
+            print(f'Processed {fname} frame {img_number} {self.sub_label}')
+        else:
+            print(f'Processed {fname} {self.sub_label}')
         self.sigUpdate.emit(img_number)
 
     def _get_nframes(self, master_path):
@@ -1330,7 +1335,12 @@ class specThread(wranglerThread):
         self._eiger_frame_idx += 1
 
         try:
-            img_data = np.asarray(read_image(self._eiger_master_path, frame=frame_idx), dtype=float)
+            # Read raw integer data via fabio — avoids float64+NaN from read_image.
+            # Eiger sentinel pixels (gap/dead, 0xFFFFFFFD+) become negative int32
+            # which is fine: the detector.mask global_mask already covers them.
+            with fabio.open(self._eiger_master_path) as _img:
+                _raw = _img.data if frame_idx == 0 else _img.get_frame(frame_idx).data
+            img_data = np.asarray(_raw, dtype='int32')
         except Exception as e:
             print(f'Error reading frame {frame_idx} from {self._eiger_master_path}: {e}')
             img_data = None
