@@ -192,6 +192,7 @@ def integrate_2d(
         intensity=intensity,
         sigma=sigma,
         unit=unit_str,
+        azimuthal_unit="chi_deg",
     )
 
 

@@ -519,6 +519,7 @@ def _write_result_2d(
     if r.sigma is not None:
         _replace(grp, "sigma", r.sigma, chunks=chunks, **comp_kwargs)
     grp.attrs["unit"] = r.unit
+    grp.attrs["azimuthal_unit"] = r.azimuthal_unit
 
 
 # ---------------------------------------------------------------------------

@@ -109,12 +109,14 @@ def _to_result_2d(result: Any, unit_fallback: str) -> IntegrationResult2D:
         else None
     )
     ip_unit = getattr(result, "ip_unit", None)
+    oop_unit = getattr(result, "oop_unit", None)
     return IntegrationResult2D(
         radial=np.asarray(result.inplane, dtype=float),
         azimuthal=np.asarray(result.outofplane, dtype=float),
         intensity=intensity,
         sigma=sigma,
         unit=str(ip_unit) if ip_unit is not None else unit_fallback,
+        azimuthal_unit=str(oop_unit) if oop_unit is not None else "qoop_A^-1",
     )
 
 
