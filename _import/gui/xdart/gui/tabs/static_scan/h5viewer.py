@@ -17,7 +17,7 @@ from ...widgets import defaultWidget
 from xdart import utils
 from xdart.utils.containers import int_2d_data_static
 from xdart.utils import catch_h5py_file as catch
-from xdart.utils.h5pool import H5FilePool
+from xdart.utils.h5pool import get_pool
 
 # Qt imports
 from pyqtgraph import Qt
@@ -178,7 +178,7 @@ class H5Viewer(QWidget):
         self.file_thread.sigUpdate.connect(self.sigUpdate.emit)
         self.file_thread.start(Qt.QtCore.QThread.LowPriority)
 
-        self._h5pool = H5FilePool(max_open=5)
+        self._h5pool = get_pool()
         
     def load_starting_defaults(self):
         default_path = os.path.join(self.local_path, "last_defaults.json")
@@ -249,14 +249,16 @@ class H5Viewer(QWidget):
                 self.ui.listData.setCurrentRow(-1)
                 self.arch_ids = []
                 return
-            if self.auto_last and (self.latest_idx in _idxs) and (len(self.latest_idx) == 1):
-                items = self.ui.listData.findItems(str(self.latest_idx), QtCore.Qt.MatchExactly)
-                # ic(self.latest_idx, items)
-                if len(items):
-                    for item in items:
-                        self.h5viewer.ui.listData.setCurrentItem(item)
-                return
-        if (len(_idxs) > 1) and (len(_idxs) == (len(items))):
+            if self.auto_last and isinstance(self.latest_idx, int) and str(self.latest_idx) in _idxs:
+                matched = self.ui.listData.findItems(str(self.latest_idx), QtCore.Qt.MatchExactly)
+                for item in matched:
+                    self.ui.listData.setCurrentItem(item)
+            return
+        if (len(_idxs) > 1) and (len(_idxs) == len(items)):
+            if self.auto_last and isinstance(self.latest_idx, int):
+                matched = self.ui.listData.findItems(str(self.latest_idx), QtCore.Qt.MatchExactly)
+                for item in matched:
+                    self.ui.listData.setCurrentItem(item)
             return
 
         previous_loc = self.ui.listData.currentRow()

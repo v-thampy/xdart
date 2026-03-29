@@ -12,6 +12,7 @@ from pandas import Series
 
 # xdart imports
 from xdart.utils import catch_h5py_file as catch
+from xdart.utils.h5pool import get_pool
 
 # This module imports
 from .arch import EwaldArch
@@ -51,6 +52,7 @@ class ArchSeries():
         self._i = 0
         # invoke the lock to prevent conflicts
         with self.file_lock:
+            get_pool().close(self.data_file)
             # use catch to avoid oserrors which will resolve with time.
             with catch(self.data_file, 'a') as f:
                 if 'arches' not in f:
@@ -79,24 +81,36 @@ class ArchSeries():
         """
         return self.__getitem__(self.index[idx])
     
-    def __setitem__(self, idx, arch):
+    def __setitem__(self, idx, arch, h5file=None):
         """Sets the arch at location idx to be the new arch. If an arch
         is stored with the same idx, replaces the data with the new
         data.
+
+        args:
+            h5file: open h5py file handle to reuse, skipping the file
+                open/close cycle. Caller is responsible for the lock.
         """
-        # invoke the lock to prevent conflicts
-        with self.file_lock:
-            # use catch to avoid oserrors which will resolve with time.
-            with catch(self.data_file, 'a') as f:
-                if 'arches' not in f:
-                    f.create_group('arches')
-                if idx != arch.idx:
-                    arch.idx = idx
-                arch.save_to_h5(f['arches'])
-                if arch.idx not in self.index:
-                    self.index.append(arch.idx)
-    
-    def append(self, arch):
+        if h5file is not None:
+            if 'arches' not in h5file:
+                h5file.create_group('arches')
+            if idx != arch.idx:
+                arch.idx = idx
+            arch.save_to_h5(h5file['arches'])
+            if arch.idx not in self.index:
+                self.index.append(arch.idx)
+        else:
+            with self.file_lock:
+                get_pool().close(self.data_file)
+                with catch(self.data_file, 'a') as f:
+                    if 'arches' not in f:
+                        f.create_group('arches')
+                    if idx != arch.idx:
+                        arch.idx = idx
+                    arch.save_to_h5(f['arches'])
+                    if arch.idx not in self.index:
+                        self.index.append(arch.idx)
+
+    def append(self, arch, h5file=None):
         """Adds a new arch to the end of the index, unless idx is
         already stored in which case the arch at that idx is replaced.
         """
@@ -106,7 +120,7 @@ class ArchSeries():
             _arch = arch.iloc[0]
         else:
             _arch = arch
-        arches.__setitem__(_arch.idx, _arch)
+        arches.__setitem__(_arch.idx, _arch, h5file=h5file)
         return arches
     
     def sort_index(self, inplace=False):
