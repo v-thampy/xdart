@@ -594,7 +594,7 @@ class EwaldArch():
         if include_2d:
             arch_copy.map_raw = copy.deepcopy(self.map_raw)
             arch_copy.bg_raw = copy.deepcopy(self.bg_raw)
-            arch_copy.mask = copy.deepcopy(self.mask),
+            arch_copy.mask = copy.deepcopy(self.mask)
             arch_copy.map_norm = copy.deepcopy(self.map_norm)
             arch_copy.int_2d = copy.deepcopy(self.int_2d)
             arch_copy.gi_2d = copy.deepcopy(self.gi_2d)
