@@ -10,6 +10,7 @@ from ssrl_xrd_tools.io.image import (
     find_image_files,
     apply_rotation,
     get_detector_mask,
+    count_frames,
     SUPPORTED_EXTS,
 )
 from ssrl_xrd_tools.io.spec import (
