@@ -251,9 +251,17 @@ def _pyfai_unit_to_nexus(unit_str: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def _h5_replace(grp: h5py.Group, name: str, data: np.ndarray, **kwargs) -> None:
-    """Delete-and-recreate an HDF5 dataset."""
+    """Delete-and-recreate an HDF5 dataset.
+
+    Note: lzf compression causes bus errors on ARM64 macOS with certain
+    h5py builds.  We replace it with gzip which is universally safe.
+    """
     if name in grp:
         del grp[name]
+    # lzf crashes on ARM64 macOS — use gzip instead
+    if kwargs.get('compression') == 'lzf':
+        kwargs['compression'] = 'gzip'
+        kwargs['compression_opts'] = 1  # fastest gzip level
     grp.create_dataset(name, data=data, **kwargs)
 
 

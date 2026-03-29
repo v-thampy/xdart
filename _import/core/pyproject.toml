@@ -37,9 +37,6 @@ dev = [
     "ipywidgets",
 ]
 
-[project.scripts]
-xdart = "ssrl_xrd_tools.gui.main:main"
-
 [tool.setuptools.packages.find]
 where = ["."]
 
