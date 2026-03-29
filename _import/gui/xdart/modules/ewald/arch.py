@@ -17,7 +17,6 @@ from ssrl_xrd_tools.core.containers import (
     IntegrationResult1D,
     IntegrationResult2D,
 )
-from xdart.utils.containers.compat import read_legacy_1d, read_legacy_2d
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator
 from ssrl_xrd_tools.integrate.single import integrate_1d, integrate_2d
 from ssrl_xrd_tools.integrate.gid import (
@@ -30,20 +29,6 @@ from ssrl_xrd_tools.integrate.gid import (
     integrate_gi_exitangles,
 )
 
-
-def _make_integrator_from_poni_dict(poni_dict):
-    """Create an AzimuthalIntegrator from a raw poni_dict (legacy AI attributes).
-
-    Extracted so spec_wrangler can build the integrator once per scan
-    without constructing a full EwaldArch.
-    """
-    ai = AzimuthalIntegrator()
-    for k, v in poni_dict.items():
-        ai.__setattr__(k, v)
-    det = getattr(ai, 'detector', None)
-    if det is not None and 'MX225' in getattr(det, 'name', ''):
-        ai._rot3 -= np.deg2rad(90)
-    return ai
 
 
 class EwaldArch():
@@ -65,7 +50,6 @@ class EwaldArch():
         map_norm: float, normalization constant
         mask: numpy array of indeces to be masked in array.
         poni: poni data for integration
-        poni_dict: poni_file information saved in dictionary
         scan_info: dict, information from any relevant motors and
             sensors
         static: bool, flag to specify if detector is static
@@ -93,7 +77,7 @@ class EwaldArch():
 
     def __init__(self, idx=None, map_raw=None, poni=None, mask=None,
                  scan_info={}, ai_args={}, file_lock=Condition(),
-                 static=False, poni_dict=None, bg_raw=0,
+                 static=False, bg_raw=0,
                  gi=False, th_mtr='th', tilt_angle=0,
                  series_average=False, integrator=None
                  ):
@@ -115,7 +99,6 @@ class EwaldArch():
             self.poni = PONI(dist=0.0, poni1=0.0, poni2=0.0)
         else:
             self.poni = poni
-        self.poni_dict = poni_dict
         if mask is None and map_raw is not None:
             self.mask = np.arange(map_raw.size)[map_raw.flatten() < 0]
         else:
@@ -157,10 +140,7 @@ class EwaldArch():
     def setup_integrator(self):
         """Sets up integrator object (always a plain AzimuthalIntegrator;
         GI uses create_fiber_integrator transiently during integration)."""
-        if self.poni_dict is not None:
-            return _make_integrator_from_poni_dict(self.poni_dict)
-        else:
-            return poni_to_integrator(self.poni)
+        return poni_to_integrator(self.poni)
 
     def _poni_from_integrator(self):
         """Return an ssrl_xrd_tools PONI derived from self.integrator's current geometry."""
@@ -192,8 +172,7 @@ class EwaldArch():
         self.idx = None
         self.map_raw = None
         self.bg_raw = None
-        self.poni = PONI()
-        # self.poni_dict = None
+        self.poni = PONI(dist=0.0, poni1=0.0, poni2=0.0)
         self.mask = None
         self.scan_info = {}
         self.integrator = self.setup_integrator()
@@ -495,12 +474,12 @@ class EwaldArch():
             if getattr(self, 'skip_map_raw', False):
                 lst_attr = [
                     "mask", "map_norm", "scan_info", "ai_args",
-                    "gi", "static", "poni_dict"
+                    "gi", "static"
                 ]
             else:
                 lst_attr = [
                     "map_raw", "mask", "map_norm", "scan_info", "ai_args",
-                    "gi", "static", "poni_dict", "bg_raw"
+                    "gi", "static", "bg_raw"
                 ]
             utils.attributes_to_h5(self, grp, lst_attr,
                                    compression=compression)
@@ -543,21 +522,13 @@ class EwaldArch():
                         if grp.attrs['type'] == 'EwaldArch':
                             lst_attr = [
                                 "map_raw", "mask", "map_norm", "scan_info", "ai_args",
-                                "gi", "static", "poni_dict", "bg_raw"
+                                "gi", "static", "bg_raw"
                             ]
                             utils.h5_to_attributes(self, grp, lst_attr)
                             if 'int_1d' in grp:
-                                _g1d = grp['int_1d']
-                                if 'radial' in _g1d:
-                                    self.int_1d = IntegrationResult1D.from_hdf5(_g1d)
-                                else:
-                                    self.int_1d = read_legacy_1d(_g1d)
+                                self.int_1d = IntegrationResult1D.from_hdf5(grp['int_1d'])
                             if load_2d and 'int_2d' in grp:
-                                _g2d = grp['int_2d']
-                                if 'radial' in _g2d:
-                                    self.int_2d = IntegrationResult2D.from_hdf5(_g2d)
-                                else:
-                                    self.int_2d = read_legacy_2d(_g2d)
+                                self.int_2d = IntegrationResult2D.from_hdf5(grp['int_2d'])
                             # Load auxiliary GI results if present
                             if 'gi_1d' in grp:
                                 for key in grp['gi_1d']:
@@ -582,7 +553,7 @@ class EwaldArch():
             copy.deepcopy(self.idx), None,
             copy.deepcopy(self.poni), None,
             copy.deepcopy(self.scan_info), copy.deepcopy(self.ai_args),
-            self.file_lock, poni_dict=copy.deepcopy(self.poni_dict),
+            self.file_lock,
             static=copy.deepcopy(self.static), gi=copy.deepcopy(self.gi),
             th_mtr=copy.deepcopy(self.th_mtr),
             series_average=copy.deepcopy(self.series_average)

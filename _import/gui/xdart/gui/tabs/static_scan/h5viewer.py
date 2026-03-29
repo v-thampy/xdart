@@ -9,6 +9,7 @@ import traceback
 import gc
 
 # This module imports
+from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xdart.utils.session import load_session, save_session
 from .ui.h5viewerUI import Ui_Form
 from xdart.modules.ewald import EwaldArch
@@ -588,22 +589,21 @@ class H5Viewer(QWidget):
                     if load_2d:
                         lst_attr = [
                             "map_raw", "mask", "map_norm", "scan_info", "ai_args",
-                            "gi", "static", "poni_dict", "bg_raw"
+                            "gi", "static", "bg_raw"
                         ]
                         utils.h5_to_attributes(arch, grp, lst_attr)
-                        arch.int_1d.from_hdf5(grp['int_1d'])
-                        arch.int_2d.from_hdf5(grp['int_2d'])
+                        if 'int_1d' in grp:
+                            arch.int_1d = IntegrationResult1D.from_hdf5(grp['int_1d'])
+                        if 'int_2d' in grp:
+                            arch.int_2d = IntegrationResult2D.from_hdf5(grp['int_2d'])
                     else:
                         lst_attr = [
                             "scan_info", "ai_args",
-                            "gi", "static", "poni_dict"
+                            "gi", "static"
                         ]
                         utils.h5_to_attributes(arch, grp, lst_attr)
-                        arch.int_1d.from_hdf5(grp['int_1d'])
-
-                    # if self.poni_file is not None:
-                    if arch.poni_dict is not None:
-                        arch.integrator = arch.setup_integrator()
+                        if 'int_1d' in grp:
+                            arch.int_1d = IntegrationResult1D.from_hdf5(grp['int_1d'])
 
     def get_arches_sum(self, idxs, idxs_memory):
         # ic()

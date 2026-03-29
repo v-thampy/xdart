@@ -41,6 +41,7 @@ xlrd = "*"
 openpyxl = "*"
 imagecodecs = "*"
 natsort = '*'
+ssrl_xrd_tools = '*'
 xrayutilities = '*'
 
 [tool.poetry.dev-dependencies]

@@ -1,22 +1,21 @@
 # -*- coding: utf-8 -*-
+# Manual GUI test — not run by pytest automatically.
+# Run with: python tests/test_image_widget.py
 
 # Standard Library imports
 import sys
 
-# Qt imports
-from PySide6 import QtGui
-
 if __name__ == '__main__':
-    from config import xdart_dir
-else:
-    from .config import xdart_dir
+    # Qt imports only needed when running as a script
+    from PySide6 import QtGui
 
-if xdart_dir not in sys.path:
-    sys.path.append(xdart_dir)
+    if __name__ == '__main__':
+        from config import xdart_dir
+    if xdart_dir not in sys.path:
+        sys.path.append(xdart_dir)
 
-from xdart.gui.widgets.image_widget import XDImageWidget
+    from xdart.gui.widgets.image_widget import XDImageWidget
 
-if __name__ == '__main__':
     app = QtGui.QApplication(sys.argv)
     test = XDImageWidget()
     test.show()

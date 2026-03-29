@@ -23,8 +23,9 @@ from pyqtgraph.parametertree import ParameterTree, Parameter
 
 # This module imports
 from xdart.modules.ewald import EwaldArch, EwaldSphere
-from xdart.modules.ewald.arch import _make_integrator_from_poni_dict
 from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
+from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
+from ssrl_xrd_tools.core.containers import PONI
 from .wrangler_widget import wranglerWidget, wranglerThread, wranglerProcess
 from .ui.specUI import Ui_Form
 from ....gui_utils import NamedActionParameter
@@ -34,12 +35,9 @@ from ssrl_xrd_tools.io.metadata import read_image_metadata, _extract_scan_info
 from xdart.utils import get_fname_dir  # GUI-specific file dialog helper
 from xdart.utils import match_img_detector, get_series_avg, catch_h5py_file as _catch_h5
 from xdart.utils.session import load_session, save_session
-from xdart.utils.containers.poni import get_poni_dict
 from xdart.utils.h5pool import get_pool as _get_h5pool
 # from xdart.utils import natural_sort_ints
 
-
-from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
 
 QFileDialog = QtWidgets.QFileDialog
 QDialog = QtWidgets.QDialog
@@ -185,7 +183,7 @@ class specWrangler(wranglerWidget):
         super().__init__(fname, file_lock, parent)
 
         # Scan Parameters
-        self.poni_dict = None
+        self.poni = None
         self.scan_parameters = []
         self.counters = []
         self.motors = []
@@ -334,7 +332,7 @@ class specWrangler(wranglerWidget):
             self.h5_dir,
             self.scan_name,
             self.single_img,
-            self.poni_dict,
+            self.poni,
             self.inp_type,
             self.img_file,
             self.img_dir,
@@ -455,7 +453,7 @@ class specWrangler(wranglerWidget):
         # ic(ctr)
 
         self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
-        self.thread.poni_dict = self.poni_dict
+        self.thread.poni = self.poni
 
         # Signal
         self.file_filter = self.parameters.child('Signal').child('Filter').value()
@@ -587,16 +585,18 @@ class specWrangler(wranglerWidget):
             self._save_to_session()
 
     def get_poni_dict(self):
-        """Opens file dialogue and sets the calibration file
-        """
+        """Load the PONI calibration file and store as a PONI object."""
         if not os.path.exists(self.poni_file):
             for child in self.parameters.children():
                 child.hide()
             self.parameters.child('Calibration').show()
             return
 
-        self.poni_dict = get_poni_dict(self.poni_file)
-        if self.poni_dict is None:
+        try:
+            self.poni = PONI.from_poni_file(self.poni_file)
+        except Exception:
+            self.poni = None
+        if self.poni is None:
             print('Invalid Poni File')
             self.thread.signal_q.put(('message', 'Invalid Poni File'))
             return
@@ -686,7 +686,7 @@ class specWrangler(wranglerWidget):
                     fname = os.path.join(subdir, file)
                     if fnmatch.fnmatch(fname, f'{filters}.{self.img_ext}'):
                         # ic(fname, self.img_file, self.poni_dict)
-                        if match_img_detector(fname, self.poni_dict):
+                        if match_img_detector(fname, self.poni):
                             # ic(self.img_file, self.meta_ext)
                             if self.meta_ext:
                                 if self.exists_meta_file(fname):
@@ -964,7 +964,7 @@ class specThread(wranglerThread):
             h5_dir,
             scan_name,
             single_img,
-            poni_dict,
+            poni,
             inp_type,
             img_file,
             img_dir,
@@ -1020,7 +1020,7 @@ class specThread(wranglerThread):
         self.h5_dir = h5_dir
         self.scan_name = scan_name
         self.single_img = single_img
-        self.poni_dict = poni_dict
+        self.poni = poni
         self.inp_type = inp_type
         self.img_file = img_file
         self.img_dir = img_dir
@@ -1071,7 +1071,7 @@ class specThread(wranglerThread):
         parent or signals from the process.
         """
         t0 = time.time()
-        if (self.poni_dict == '') or (self.img_file == ''):
+        if self.poni is None or (self.img_file == ''):
             return
 
         self.img_fnames.clear()
@@ -1082,9 +1082,9 @@ class specThread(wranglerThread):
         self._eiger_nframes = 0
         self._eiger_master_queue.clear()
         self._eiger_done_masters.clear()
-        self.detector = self.poni_dict['detector']
+        self.detector = get_detector(self.poni.detector) if self.poni.detector else None
         self.sub_label = ''
-        det_mask = self.detector.mask  # pyFAI .mask property (no deprecation warning)
+        det_mask = self.detector.mask if self.detector is not None else None  # pyFAI .mask property
         if self.mask_file and os.path.exists(self.mask_file):
             custom_mask = np.asarray(read_image(self.mask_file), dtype=bool)
             det_mask = det_mask | custom_mask if det_mask is not None else custom_mask
@@ -1103,7 +1103,7 @@ class specThread(wranglerThread):
         """
         sphere = None
         files_processed = 0
-        _cached_poni_dict = None
+        _cached_poni = None
         is_eiger = _is_eiger_master(self.img_file) if self.img_file else False
 
         # ── Phase 1 & 2: collect then process all existing images ─────────────
@@ -1136,13 +1136,13 @@ class specThread(wranglerThread):
                     files_processed += self._dispatch_batch(sphere, pending)
                     pending = []
                 sphere = self.initialize_sphere()
-                _cached_poni_dict = None
+                _cached_poni = None
 
-            # Rebuild cached AzimuthalIntegrator when poni_dict identity changes
-            if self.poni_dict is not _cached_poni_dict:
-                sphere._cached_integrator = _make_integrator_from_poni_dict(self.poni_dict)
+            # Rebuild cached AzimuthalIntegrator when poni identity changes
+            if self.poni is not _cached_poni:
+                sphere._cached_integrator = poni_to_integrator(self.poni)
                 sphere._cached_fiber_integrator = None
-                _cached_poni_dict = self.poni_dict
+                _cached_poni = self.poni
                 self._cached_gi_incident_angle = None
 
             if img_number in list(sphere.arches.index):
@@ -1182,12 +1182,12 @@ class specThread(wranglerThread):
 
                 if (sphere is None) or (scan_name != sphere.name):
                     sphere = self.initialize_sphere()
-                    _cached_poni_dict = None
+                    _cached_poni = None
 
-                if self.poni_dict is not _cached_poni_dict:
-                    sphere._cached_integrator = _make_integrator_from_poni_dict(self.poni_dict)
+                if self.poni is not _cached_poni:
+                    sphere._cached_integrator = poni_to_integrator(self.poni)
                     sphere._cached_fiber_integrator = None
-                    _cached_poni_dict = self.poni_dict
+                    _cached_poni = self.poni
                     self._cached_gi_incident_angle = None
 
                 if img_number in list(sphere.arches.index):
@@ -1225,7 +1225,7 @@ class specThread(wranglerThread):
         _t1 = time.time()
         threshold_mask = None if not self.apply_threshold else self.threshold(img_data)
         arch = EwaldArch(
-            img_number, img_data, poni_dict=self.poni_dict,
+            img_number, img_data, poni=self.poni,
             scan_info=img_meta, static=True, gi=self.gi,
             th_mtr=self.th_mtr, bg_raw=bg_raw,
             series_average=self.series_average,
@@ -1239,7 +1239,7 @@ class specThread(wranglerThread):
             if (sphere._cached_fiber_integrator is None
                     or _incident_angle != self._cached_gi_incident_angle):
                 sphere._cached_fiber_integrator = create_fiber_integrator(
-                    arch._make_lib_poni(),
+                    arch._poni_from_integrator(),
                     incident_angle=_incident_angle,
                     tilt_angle=arch.tilt_angle,
                     angle_unit="deg",

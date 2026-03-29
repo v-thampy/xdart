@@ -13,12 +13,10 @@ import sys
 import xml.etree.ElementTree
 
 import numpy as np
-import re
 from pathlib import Path
 from collections import OrderedDict
 
 import scipy.ndimage
-from silx.io.specfile import SpecFile
 
 import scipy.ndimage as ndimage
 from scipy.signal import medfilt2d
@@ -28,11 +26,6 @@ import yaml
 import json
 import h5py
 import fabio
-
-# This module imports
-from .lmfit_models import PlaneModel, Gaussian2DModel, LorentzianSquared2DModel, Pvoigt2DModel, update_param_hints
-
-from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
 
 # Detector File Sizes
 detector_file_sizes = {
@@ -292,41 +285,22 @@ def get_img_number(fname):
     return img_number
 
 
-def match_img_detector(img_file, poni_dict):
-    """Check if the file is created by the detector specified"""
-    detector_name = poni_dict['detector'].name
-    if detector_name not in detector_file_sizes.keys():
-        return True
+def match_img_detector(img_file, poni):
+    """Check if the file is created by the detector specified by *poni*.
 
-    if os.stat(img_file).st_size == detector_file_sizes[detector_name]:
-        return True
-
-    return False
-
-
-def query(question):
-    """Ask a question with allowed options via input()
-    and return their answer.
+    Parameters
+    ----------
+    img_file : str | Path
+        Path to the candidate image file.
+    poni : ssrl_xrd_tools.core.containers.PONI
+        Calibration object whose ``detector`` field is the pyFAI detector name.
     """
-    sys.stdout.write(question)
-    return input()
-
-
-def get_spec_file(img_fname):
-    """Check if SPEC file exists for an image file and return path if yes"""
-    fpath = Path(img_fname)
-    fname = fpath.stem
-    match = re.search(rf'_scan\d+_\d+.', fname)
-    if match is None:
-        return None
-    spec_fname = fname[fname.find('_') + 1:match.start()]
-
-    for nn in range(3):
-        s = os.path.join(fpath.parents[nn], spec_fname)
-        if os.path.isfile(s):
-            return s
-
-    return None
+    if poni is None:
+        return True
+    detector_name = poni.detector if poni.detector else ''
+    if detector_name not in detector_file_sizes:
+        return True
+    return os.stat(img_file).st_size == detector_file_sizes[detector_name]
 
 
 def get_img_meta(img_file, meta_ext, spec_path=None, rv='all'):
@@ -346,95 +320,6 @@ def get_img_meta(img_file, meta_ext, spec_path=None, rv='all'):
     from ssrl_xrd_tools.io.metadata import read_image_metadata
     fmt = 'spec' if (meta_ext or '').upper() == 'SPEC' else (meta_ext or 'txt')
     return read_image_metadata(img_file, meta_format=fmt)
-
-
-def get_meta_from_spec(img_file, spec_path=None, spec_file=None, img_number=None):
-    if spec_file is None:
-        spec_file = get_specFile_scanNumber(img_file, spec_path)
-    if spec_file is None:
-        return {}, {}, {}
-
-    scan_number = get_scanNumber(img_file)
-
-    if img_number is None:
-        img_number = get_img_number(img_file)
-
-    ic(spec_file)
-    sf_object = SpecFile(spec_file)
-    sf = sf_object[scan_number - 1]
-    try:
-        Counters = {c: v for c, v in zip(sf.labels, sf.data_line(img_number))}
-        Motors = {m: v for m, v in zip(sf.motor_names, sf.motor_positions)}
-    except IndexError:
-        Counters, Motors = {}, {}
-    sf_object.close()
-
-    Extras = {}
-    return Counters, Motors, Extras
-
-
-def get_scanNumber(img_file):
-    img_fname = Path(img_file).stem
-
-    match = re.search(rf'_scan\d+_\d+$', img_fname)
-    if match is None:
-        return None
-
-    return int(img_fname[match.start() + 5: img_fname.rfind('_')])
-
-
-def get_specFile(img_file, spec_path=None):
-    img_fname = Path(img_file).stem
-    if img_fname[0:2] == 'b_':
-        img_fname = img_fname[2:]
-
-    match = re.search(rf'_scan\d+_\d+$', img_fname)
-    if match is None:
-        return None
-
-    spec_fname = img_fname[img_fname.find('_') + 1:match.start()]
-
-    if spec_path is not None:
-        s = os.path.join(spec_path, spec_fname)
-        if os.path.exists(s):
-            return s
-    else:
-        img_fpath = Path(img_file)
-        for nn in range(2):
-            s = os.path.join(img_fpath.parents[nn], spec_fname)
-            ic(s)
-            if os.path.isfile(s):
-                return s
-
-    return None
-
-
-def get_specFile_scanNumber(img_file, spec_path=None):
-    img_file = Path(img_file)
-    img_fname = os.path.basename(img_file)
-    if img_fname[0:2] == 'b_':
-        img_fname = img_fname[2:]
-    img_ext = img_file.suffix[1:]
-
-    match = re.search(rf'_scan\d+_\d+.{img_ext}', img_fname)
-    if match is None:
-        return None, None
-
-    spec_fname = img_fname[img_fname.find('_') + 1:match.start()]
-    scan_number = int(img_fname[match.start() + 5: img_fname.rfind('_')])
-    # print(f'{img_fname} \n{spec_fname} \n{match.group()} \n{img_ext} \n{scan_number}')
-
-    if spec_path is not None:
-        s = os.path.join(spec_path, spec_fname)
-        if os.path.exists(s):
-            return s, scan_number
-    else:
-        for nn in range(2):
-            s = os.path.join(img_file.parents[nn], spec_fname)
-            if os.path.isfile(s):
-                return s, scan_number
-
-    return None, None
 
 
 def get_motor_val(pdi_file, motor):
@@ -577,138 +462,6 @@ def smooth_img(img, kernel_size=3, window_size=3, order=0):
         img = ndimage.gaussian_filter(img, sigma=(window_size, window_size), order=order)
 
     return img
-
-
-def get_fit(im, function='gaussian'):
-    """Custom function to perform 2D fit (using lmfit) on an image
-
-    Args:
-        im (ndarray): 2D array representing the image
-        function (str, optional): Fitting function to use. Defaults to 'gaussian'.
-
-    Returns:
-        tuple: Fit result (lmfit Model object), fit parameters, and evaluated fit
-    """
-    # Flatten Arrays
-    ydata = im.flatten()
-    nrows, ncols = im.shape
-    rows, cols = np.meshgrid(np.arange(0,ncols), np.arange(0,nrows))
-    x = [rows.flatten(), cols.flatten()]
-
-    Models = {'gaussian': Gaussian2DModel(),
-              'lorentzian': LorentzianSquared2DModel(),
-              'pvoigt': Pvoigt2DModel()}
-    
-    plane_mod = PlaneModel()
-    curve_mod = Models[function]
-    #curve_mod = Gaussian2DModel()
-
-    # Using the guess function
-    pars = plane_mod.guess(ydata, x)
-    pars += curve_mod.guess(ydata, x)
-
-    Hints = {'sigma_x':   {'value':5, 'min': 1},
-             'sigma_y':   {'value':5, 'min': 1},
-             'amplitude': {'min': 0},
-             'intercept': {'value':0, 'vary':False},
-             'slope_x':   {'value':0, 'vary':False},
-             'slope_y':   {'value':0, 'vary':False},
-            }
-
-    update_param_hints(pars, **Hints)
-    
-    mod_2D = plane_mod + curve_mod
-    mod_2D.missing = 'drop'
-
-    out = mod_2D.fit(ydata, pars, x=x)
-
-    # Fit results
-    I_fit = out.eval(x=[rows.flatten(), cols.flatten()])
-    im_fit = I_fit.reshape(im.shape)
-    
-    return out, pars, im_fit
-
-
-def fit_images_2D(fname, detector, tth, function='gaussian',
-                  kernel_size=3, window_size=3, order=0,
-                  Fit_Results={}, FNames={}, Img_Fits={}, Init_Params={},
-                  verbose=False, **kwargs):
-    """Wrapper function aroung get_fit function
-
-    Args:
-        fname (str): Image file name
-        detector (detector object): pyFAI detector object
-        tth (float): Value of 2th (used as key for returned dictionary)
-        function (str, optional): Fitting function. Defaults to 'gaussian'.
-        kernel_size (int, optional): Gaussian smoothing kernel size. Defaults to 3.
-        window_size (int, optional): Gaussian smoothing window size. Defaults to 3.
-        order (int, optional): Order of Gaussian filter. Defaults to 0.
-        Fit_Results (dict, optional): Dictionary with tth as key containing fit result. Defaults to {}.
-        FNames (dict, optional): Dictionary containing file names for each tth. Defaults to {}.
-        Img_Fits (dict, optional): Dictionary containing the evaluated fits for each tth. Defaults to {}.
-        Init_Params (dict, optional): Dictionary containing initial fit parameters for each tth. Defaults to {}.
-        verbose (bool, optional): Flag to print debug messages. Defaults to False.
-
-    Returns:
-        tuple: tth value and fit result
-    """
-    if verbose:
-        print(f'Processing {fname}')
-    img = get_img_data(fname, detector, return_float=True, verbose=False, **kwargs)
-    
-    smooth_img(img, kernel_size=kernel_size, window_size=window_size, order=order)
-    fit_result, init_params, img_fit = get_fit(img, function=function)
-    
-    tth = np.round(tth, 3)
-    Fit_Results[tth] = fit_result
-    FNames[tth] = fname
-    Img_Fits[tth] = img_fit
-    Init_Params[tth] = init_params
-    
-    return (tth, fit_result)
-
-
-def div0( a, b ):
-    """ ignore / 0, div0( [-1, 0, 1], 0 ) -> [0, 0, 0] """
-    with np.errstate(divide='ignore', invalid='ignore'):
-        c = np.true_divide( a, b )
-        c[ ~ np.isfinite( c )] = 0  # -inf inf NaN
-    return c
-
-
-
-
-def query_yes_no(question, default="no"):
-    """Ask a yes/no question via raw_input() and return their answer.
-    
-    "question" is a string that is presented to the user.
-    "default" is the presumed answer if the user just hits <Enter>.
-        It must be "yes" (the default), "no" or None (meaning
-        an answer is required of the user).
-
-    The "answer" return value is one of "yes" or "no".
-    """
-    valid = {"yes":"yes",   "y":"yes",  "ye":"yes",
-             "no":"no",     "n":"no"}
-    if default == None:
-        prompt = " [y/n] "
-    elif default == "yes":
-        prompt = " [Y/n] "
-    elif default == "no":
-        prompt = " [y/N] "
-    else:
-        raise ValueError("invalid default answer: '%s'" % default)
-
-    while 1:
-        sys.stdout.write(question + prompt)
-        choice = input().lower()
-        if default is not None and choice == '':
-            return default
-        elif choice in valid.keys():
-            return valid[choice]
-        else:
-            sys.stdout.write("Please respond with 'yes' or 'no' "\
-                             "(or 'y' or 'n').\n")
 
 
 class FixSizeOrderedDict(OrderedDict):
