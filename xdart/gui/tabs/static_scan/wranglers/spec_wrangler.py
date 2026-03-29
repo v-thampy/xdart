@@ -1274,6 +1274,7 @@ class specThread(wranglerThread):
             'bg_raw': arch.bg_raw,
             'mask': arch.mask,
             'int_2d': arch.int_2d,
+            'gi_2d': arch.gi_2d,
         }
 
         # For Eiger: raw frames already live in the master file — don't double-store them.
@@ -1663,23 +1664,21 @@ class specThread(wranglerThread):
         path = os.path.join(path, sphere.name)
         Path(path).mkdir(parents=True, exist_ok=True)
 
-        q, tth, intensity = arch.int_1d.q, arch.int_1d.ttheta, arch.int_1d.norm
+        if arch.int_1d is None:
+            return
+        _r1d = arch.int_1d
+        radial = _r1d.radial
+        intensity = _r1d.intensity
 
-        # Write I(q) to xye
-        fname = os.path.join(path, f'iq_{sphere.name}_{str(idx).zfill(4)}.xye')
-        write_xye(fname, q, intensity, np.sqrt(abs(intensity)))
+        # Write using the primary radial axis (q or 2th depending on integration unit)
+        is_q = _r1d.unit in ('q_A^-1', 'q_nm^-1')
+        fname_prefix = 'iq' if is_q else 'itth'
 
-        # Write I(tth) to xye
-        fname = os.path.join(path, f'itth_{sphere.name}_{str(idx).zfill(4)}.xye')
-        write_xye(fname, tth, intensity, np.sqrt(abs(intensity)))
+        fname = os.path.join(path, f'{fname_prefix}_{sphere.name}_{str(idx).zfill(4)}.xye')
+        write_xye(fname, radial, intensity, np.sqrt(abs(intensity)))
 
-        # Write I(q) to csv
-        fname = os.path.join(path, f'iq_{sphere.name}_{str(idx).zfill(4)}.csv')
-        write_csv(fname, q, intensity)
-
-        # Write I(tth) to csv
-        fname = os.path.join(path, f'itth_{sphere.name}_{str(idx).zfill(4)}.csv')
-        write_csv(fname, tth, intensity)
+        fname = os.path.join(path, f'{fname_prefix}_{sphere.name}_{str(idx).zfill(4)}.csv')
+        write_csv(fname, radial, intensity)
 
 
 def atoi(text):

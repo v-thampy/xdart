@@ -5,7 +5,6 @@ Created on Mon Aug 26 14:21:58 2019
 @author: walroth
 """
 import copy
-import types
 from threading import Condition
 
 from pyFAI.integrator.azimuthal import AzimuthalIntegrator
@@ -13,8 +12,12 @@ from pyFAI import units
 import numpy as np
 
 from xdart import utils
-from xdart.utils.containers import PONI
-from xdart.utils.containers import int_1d_data_static, int_2d_data_static
+from ssrl_xrd_tools.core.containers import (
+    PONI,
+    IntegrationResult1D,
+    IntegrationResult2D,
+)
+from xdart.utils.containers.compat import read_legacy_1d, read_legacy_2d
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator
 from ssrl_xrd_tools.integrate.single import integrate_1d, integrate_2d
 from ssrl_xrd_tools.integrate.gid import (
@@ -109,7 +112,7 @@ class EwaldArch():
         self.map_raw = map_raw
         self.bg_raw = bg_raw
         if poni is None:
-            self.poni = PONI()
+            self.poni = PONI(dist=0.0, poni1=0.0, poni2=0.0)
         else:
             self.poni = poni
         self.poni_dict = poni_dict
@@ -132,8 +135,10 @@ class EwaldArch():
         self.arch_lock = Condition()
         self.map_norm = 1
 
-        self.int_1d = int_1d_data_static()
-        self.int_2d = int_2d_data_static()
+        self.int_1d: IntegrationResult1D | None = None
+        self.int_2d: IntegrationResult2D | None = None
+        self.gi_1d: dict[str, IntegrationResult1D] = {}
+        self.gi_2d: dict[str, IntegrationResult2D] = {}
 
     def __getstate__(self):
         """Exclude threading.Condition objects so EwaldArch can be pickled
@@ -155,29 +160,15 @@ class EwaldArch():
         if self.poni_dict is not None:
             return _make_integrator_from_poni_dict(self.poni_dict)
         else:
-            from ssrl_xrd_tools.core.containers import PONI as LibPONI
-            det_obj = getattr(self.poni, 'detector', None)
-            det_name = getattr(det_obj, 'name', None) or ''
-            lib_poni = LibPONI(
-                dist=self.poni.dist,
-                poni1=self.poni.poni1,
-                poni2=self.poni.poni2,
-                rot1=self.poni.rot1,
-                rot2=self.poni.rot2,
-                rot3=self.poni.rot3,
-                wavelength=self.poni.wavelength,
-                detector=det_name,
-            )
-            return poni_to_integrator(lib_poni)
+            return poni_to_integrator(self.poni)
 
-    def _make_lib_poni(self):
-        """Return an ssrl_xrd_tools PONI from self.integrator geometry."""
-        from ssrl_xrd_tools.core.containers import PONI as LibPONI
+    def _poni_from_integrator(self):
+        """Return an ssrl_xrd_tools PONI derived from self.integrator's current geometry."""
         ai = self.integrator
         det = getattr(ai, 'detector', None)
         det_name = getattr(det, 'name', '') or ''
         wl = getattr(ai, 'wavelength', None)
-        return LibPONI(
+        return PONI(
             dist=float(ai.dist),
             poni1=float(ai.poni1),
             poni2=float(ai.poni2),
@@ -207,8 +198,10 @@ class EwaldArch():
         self.scan_info = {}
         self.integrator = self.setup_integrator()
         self.map_norm = 1
-        self.int_1d = int_1d_data_static()
-        self.int_2d = int_2d_data_static()
+        self.int_1d = None
+        self.int_2d = None
+        self.gi_1d = {}
+        self.gi_2d = {}
             
     def get_mask(self, global_mask=None):
         if global_mask is not None:
@@ -262,7 +255,7 @@ class EwaldArch():
                     mask=self.get_mask(global_mask),
                     **kwargs,
                 )
-                self.int_1d.from_result(result, self.integrator.wavelength, unit=str(unit))
+                self.int_1d = result
             else:
                 _gi_valid = {
                     'correctSolidAngle', 'variance', 'error_model',
@@ -273,7 +266,7 @@ class EwaldArch():
 
                 incident_angle = self._get_incident_angle()
                 fi = fiber_integrator or create_fiber_integrator(
-                    self._make_lib_poni(),
+                    self._poni_from_integrator(),
                     incident_angle=incident_angle,
                     tilt_angle=self.tilt_angle,
                     angle_unit="deg",
@@ -285,14 +278,12 @@ class EwaldArch():
 
                 # In-plane (Qxy) profile
                 r_ip = integrate_gi_1d(
-                    image_data, fi, npt=numpoints, unit='qoop_A^-1',
+                    image_data, fi, npt=numpoints, unit='qip_A^-1',
                     method='no', mask=mask,
                     radial_range=radial_range,
                     azimuth_range=kwargs.get('azimuth_range'),
                     **gi_kwargs,
                 )
-                self.int_1d.i_qxy = r_ip.intensity
-                self.int_1d.qxy = r_ip.radial
 
                 # OOP (Qz) profile: sum the (Qip, Qoop) 2D map over the IP axis
                 r2d = integrate_gi_2d(
@@ -300,46 +291,41 @@ class EwaldArch():
                     npt_azim=min(numpoints, 500),
                     method='no', mask=mask,
                 )
-                self.int_1d.i_qz = np.nansum(r2d.intensity, axis=0)
-                self.int_1d.qz = r2d.azimuthal
+                r_qoop = IntegrationResult1D(
+                    radial=r2d.azimuthal,
+                    intensity=np.nansum(r2d.intensity, axis=0),
+                    unit="qoop_A^-1",
+                )
 
                 # Q total (polar radial profile)
                 r_total = integrate_gi_polar_1d(
                     image_data, fi, npt=numpoints,
                     method='no', mask=mask, **gi_kwargs,
                 )
-                self.int_1d.i_qtotal = r_total.intensity
-                self.int_1d.qtotal = r_total.radial
 
                 # Exit angle profile
                 r_exit = integrate_gi_exitangles_1d(
                     image_data, fi, npt=numpoints,
                     method='no', mask=mask, **gi_kwargs,
                 )
-                self.int_1d.i_exit = r_exit.intensity
-                self.int_1d.exit = r_exit.radial
+
+                # Store all GI 1D results
+                self.gi_1d = {
+                    'qip': r_ip,
+                    'qoop': r_qoop,
+                    'qtotal': r_total,
+                    'exit': r_exit,
+                }
 
                 # Set primary result from selected mode
                 if gi_mode_1d == 'q_oop':
-                    primary = types.SimpleNamespace(
-                        radial=self.int_1d.qz, intensity=self.int_1d.i_qz, unit='q_A^-1'
-                    )
-                    self.int_1d.from_result(primary, fi.wavelength, unit='q_A^-1')
+                    self.int_1d = r_qoop
                 elif gi_mode_1d == 'q_total':
-                    primary = types.SimpleNamespace(
-                        radial=r_total.radial, intensity=r_total.intensity, unit='q_A^-1'
-                    )
-                    self.int_1d.from_result(primary, fi.wavelength, unit='q_A^-1')
+                    self.int_1d = r_total
                 elif gi_mode_1d == 'exit_angle':
-                    primary = types.SimpleNamespace(
-                        radial=r_exit.radial, intensity=r_exit.intensity, unit='2th_deg'
-                    )
-                    self.int_1d.from_result(primary, fi.wavelength, unit='2th_deg')
+                    self.int_1d = r_exit
                 else:  # 'q_ip' (default)
-                    primary = types.SimpleNamespace(
-                        radial=r_ip.radial, intensity=r_ip.intensity, unit='q_A^-1'
-                    )
-                    self.int_1d.from_result(primary, fi.wavelength, unit='q_A^-1')
+                    self.int_1d = r_ip
 
     def integrate_2d(self, npt_rad=1000, npt_azim=1000, monitor=None,
                      radial_range=None, azimuth_range=None,
@@ -392,15 +378,7 @@ class EwaldArch():
                     azimuth_range=azimuth_range,
                     **kwargs,
                 )
-                # int_2d_data_static.parse_unit expects intensity shaped (npt_azim, npt_rad);
-                # integrate_2d returns (npt_rad, npt_azim), so transpose back.
-                result_compat = types.SimpleNamespace(
-                    radial=result.radial,
-                    azimuthal=result.azimuthal,
-                    intensity=result.intensity.T,
-                    unit=result.unit,
-                )
-                self.int_2d.from_result(result_compat, self.integrator.wavelength, unit=str(unit))
+                self.int_2d = result
             else:
                 _gi_valid = {
                     'correctSolidAngle', 'variance', 'error_model',
@@ -411,7 +389,7 @@ class EwaldArch():
 
                 incident_angle = self._get_incident_angle()
                 fi = fiber_integrator or create_fiber_integrator(
-                    self._make_lib_poni(),
+                    self._poni_from_integrator(),
                     incident_angle=incident_angle,
                     tilt_angle=self.tilt_angle,
                     angle_unit="deg",
@@ -441,48 +419,28 @@ class EwaldArch():
                     method='no', mask=mask, **gi_kwargs,
                 )
 
-                # Store all GI 2D results on int_2d
-                # r_gi2d.radial = Qip (Qxy), r_gi2d.azimuthal = Qoop (Qz)
-                self.int_2d.i_QxyQz = np.flipud(r_gi2d.intensity)
-                self.int_2d.qz = r_gi2d.azimuthal
-                self.int_2d.qxy = r_gi2d.radial
-                self.int_2d.i_exit2d = r_exit2d.intensity
-                self.int_2d.exit2d_radial = r_exit2d.radial
-                self.int_2d.exit2d_azimuthal = r_exit2d.azimuthal
+                # Store all GI 2D results in gi_2d dict
+                # r_gi2d: radial=Qip, azimuthal=Qoop  (flipud for display convention)
+                r_gi2d_flipped = IntegrationResult2D(
+                    radial=r_gi2d.radial,
+                    azimuthal=r_gi2d.azimuthal,
+                    intensity=np.flipud(r_gi2d.intensity),
+                    unit=r_gi2d.unit,
+                    azimuthal_unit=r_gi2d.azimuthal_unit,
+                )
+                self.gi_2d = {
+                    'polar': r_polar,       # (Q, Chi)
+                    'gi2d': r_gi2d_flipped,  # (Qip/Qxy, Qoop/Qz)
+                    'exit2d': r_exit2d,     # exit angles
+                }
 
                 # Set primary result from selected mode
                 if gi_mode_2d == 'q_chi':
-                    # r_polar.intensity.shape == (npt_rad, npt_azim) = (Q, Chi)
-                    # from_result expects (npt_azim, npt_rad) = (Chi, Q) → transpose
-                    result_compat = types.SimpleNamespace(
-                        radial=r_polar.radial,
-                        azimuthal=r_polar.azimuthal,
-                        intensity=r_polar.intensity.T,
-                        unit='q_A^-1',
-                    )
-                    self.int_2d.from_result(result_compat, fi.wavelength, unit=unit,
-                                            i_QxyQz=self.int_2d.i_QxyQz,
-                                            qz=self.int_2d.qz, qxy=self.int_2d.qxy)
+                    self.int_2d = r_polar
                 elif gi_mode_2d == 'exit_angles':
-                    result_compat = types.SimpleNamespace(
-                        radial=r_exit2d.radial,
-                        azimuthal=r_exit2d.azimuthal,
-                        intensity=r_exit2d.intensity.T,
-                        unit='2th_deg',
-                    )
-                    self.int_2d.from_result(result_compat, fi.wavelength, unit=unit,
-                                            i_QxyQz=self.int_2d.i_QxyQz,
-                                            qz=self.int_2d.qz, qxy=self.int_2d.qxy)
+                    self.int_2d = r_exit2d
                 else:  # 'qip_qoop' (default)
-                    result_compat = types.SimpleNamespace(
-                        radial=r_polar.radial,
-                        azimuthal=r_polar.azimuthal,
-                        intensity=r_polar.intensity.T,
-                        unit='q_A^-1',
-                    )
-                    self.int_2d.from_result(result_compat, fi.wavelength, unit=unit,
-                                            i_QxyQz=self.int_2d.i_QxyQz,
-                                            qz=self.int_2d.qz, qxy=self.int_2d.qxy)
+                    self.int_2d = r_polar
 
     def set_integrator(self, **args):
         """Sets AzimuthalIntegrator with new arguments.
@@ -546,12 +504,25 @@ class EwaldArch():
                 ]
             utils.attributes_to_h5(self, grp, lst_attr,
                                    compression=compression)
-            if 'int_1d' not in grp:
-                grp.create_group('int_1d')
-            self.int_1d.to_hdf5(grp['int_1d'], compression)
-            if 'int_2d' not in grp:
-                grp.create_group('int_2d')
-            self.int_2d.to_hdf5(grp['int_2d'], compression)
+            if self.int_1d is not None:
+                if 'int_1d' not in grp:
+                    grp.create_group('int_1d')
+                self.int_1d.to_hdf5(grp['int_1d'], compression or "lzf")
+            if self.int_2d is not None:
+                if 'int_2d' not in grp:
+                    grp.create_group('int_2d')
+                self.int_2d.to_hdf5(grp['int_2d'], compression or "lzf")
+            # Save auxiliary GI results
+            if self.gi_1d:
+                gi1d_grp = grp.require_group('gi_1d')
+                for key, res in self.gi_1d.items():
+                    sub = gi1d_grp.require_group(key)
+                    res.to_hdf5(sub, compression or "lzf")
+            if self.gi_2d:
+                gi2d_grp = grp.require_group('gi_2d')
+                for key, res in self.gi_2d.items():
+                    sub = gi2d_grp.require_group(key)
+                    res.to_hdf5(sub, compression or "lzf")
             if 'poni' not in grp:
                 grp.create_group('poni')
             utils.dict_to_h5(self.poni.to_dict(), grp, 'poni')
@@ -575,10 +546,30 @@ class EwaldArch():
                                 "gi", "static", "poni_dict", "bg_raw"
                             ]
                             utils.h5_to_attributes(self, grp, lst_attr)
-                            self.int_1d.from_hdf5(grp['int_1d'])
-                            if load_2d:
-                                self.int_2d.from_hdf5(grp['int_2d'])
-                            self.poni = PONI.from_yamdict(
+                            if 'int_1d' in grp:
+                                _g1d = grp['int_1d']
+                                if 'radial' in _g1d:
+                                    self.int_1d = IntegrationResult1D.from_hdf5(_g1d)
+                                else:
+                                    self.int_1d = read_legacy_1d(_g1d)
+                            if load_2d and 'int_2d' in grp:
+                                _g2d = grp['int_2d']
+                                if 'radial' in _g2d:
+                                    self.int_2d = IntegrationResult2D.from_hdf5(_g2d)
+                                else:
+                                    self.int_2d = read_legacy_2d(_g2d)
+                            # Load auxiliary GI results if present
+                            if 'gi_1d' in grp:
+                                for key in grp['gi_1d']:
+                                    self.gi_1d[key] = IntegrationResult1D.from_hdf5(
+                                        grp['gi_1d'][key]
+                                    )
+                            if load_2d and 'gi_2d' in grp:
+                                for key in grp['gi_2d']:
+                                    self.gi_2d[key] = IntegrationResult2D.from_hdf5(
+                                        grp['gi_2d'][key]
+                                    )
+                            self.poni = PONI.from_dict(
                                 utils.h5_to_dict(grp['poni'])
                             )
 
@@ -599,11 +590,13 @@ class EwaldArch():
         arch_copy.integrator = copy.deepcopy(self.integrator)
         arch_copy.arch_lock = Condition()
         arch_copy.int_1d = copy.deepcopy(self.int_1d)
+        arch_copy.gi_1d = copy.deepcopy(self.gi_1d)
         if include_2d:
             arch_copy.map_raw = copy.deepcopy(self.map_raw)
             arch_copy.bg_raw = copy.deepcopy(self.bg_raw)
             arch_copy.mask = copy.deepcopy(self.mask),
             arch_copy.map_norm = copy.deepcopy(self.map_norm)
             arch_copy.int_2d = copy.deepcopy(self.int_2d)
+            arch_copy.gi_2d = copy.deepcopy(self.gi_2d)
 
         return arch_copy

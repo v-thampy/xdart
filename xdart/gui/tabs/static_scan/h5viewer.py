@@ -15,7 +15,6 @@ from xdart.modules.ewald import EwaldArch
 from .sphere_threads import fileHandlerThread
 from ...widgets import defaultWidget
 from xdart import utils
-from xdart.utils.containers import int_2d_data_static
 from xdart.utils import catch_h5py_file as catch
 from xdart.utils.h5pool import get_pool
 
@@ -435,7 +434,7 @@ class H5Viewer(QWidget):
         # Remove 2d data from 'Sum' if for unselected keys
         if load_2d:
             if (len(self.arches) == 0) or (len(self.data_2d) == 0):
-                self.arches.update({'sum_int_2d': int_2d_data_static(), 'sum_map_raw': 0})
+                self.arches.update({'sum_int_2d': None, 'sum_map_raw': 0})
                 self.arches.update({'idxs': [], 'add_idxs': [], 'sub_idxs': []})
 
             if len(idxs) > 1:
@@ -541,28 +540,36 @@ class H5Viewer(QWidget):
                     self.data_1d[int(idx)] = arch.copy(include_2d=False)
                     # ic('loaded 1D data', self.data_1d.keys())
                 else:
-                    try:
-                        if len(arch.int_2d.i_qChi) == 0:
-                            pass
-                    except TypeError:
+                    if arch.int_2d is None or arch.int_2d.intensity.size == 0:
                         arch.load_from_h5(file['arches'], load_2d=True)
 
                     self.data_1d[int(idx)] = arch.copy(include_2d=False)
                     self.data_2d[int(idx)] = {'map_raw': arch.map_raw,
                                               'bg_raw': arch.bg_raw,
                                               'mask': arch.mask,
-                                              'int_2d': arch.int_2d}
+                                              'int_2d': arch.int_2d,
+                                              'gi_2d': arch.gi_2d}
 
                     # ic('loaded 1 and 2D data', self.data_1d.keys(), self.data_2d.keys())
                     # ic(idx, self.arches['add_idxs'], self.arches['sub_idxs'])
                     if idx in self.arches['add_idxs']:
-                        self.arches['sum_int_2d'] += self.data_2d[int(idx)]['int_2d']
-                        # self.arches['sum_map_raw'] += self.data_2d[int(idx)]['map_raw']
+                        _d = self.data_2d[int(idx)]['int_2d']
+                        if self.arches['sum_int_2d'] is None:
+                            self.arches['sum_int_2d'] = _d
+                        else:
+                            try:
+                                self.arches['sum_int_2d'] = self.arches['sum_int_2d'] + _d
+                            except (ValueError, AttributeError):
+                                self.arches['sum_int_2d'] = _d
                         self.arches['sum_map_raw'] += (self.data_2d[int(idx)]['map_raw'] -
                                                        self.data_2d[int(idx)]['bg_raw'])
                     elif idx in self.arches['sub_idxs']:
-                        self.arches['sum_int_2d'] -= self.data_2d[int(idx)]['int_2d']
-                        # self.arches['sum_map_raw'] -= self.data_2d[int(idx)]['map_raw']
+                        _d = self.data_2d[int(idx)]['int_2d']
+                        if self.arches['sum_int_2d'] is not None:
+                            try:
+                                self.arches['sum_int_2d'] = self.arches['sum_int_2d'] - _d
+                            except (ValueError, AttributeError):
+                                self.arches['sum_int_2d'] = _d
                         self.arches['sum_map_raw'] -= (self.data_2d[int(idx)]['map_raw'] -
                                                        self.data_2d[int(idx)]['bg_raw'])
 
@@ -621,17 +628,27 @@ class H5Viewer(QWidget):
                 idxs_memory.remove(int(x))
 
         for k in add_from_data:
-            try:
-                self.arches['sum_int_2d'] += self.data_2d[int(k)]['int_2d']
-                self.arches['sum_map_raw'] += self.data_2d[int(k)]['map_raw']
-            except ValueError:
-                self.arches['sum_int_2d'] = self.data_2d[int(k)]['int_2d']
+            _d = self.data_2d[int(k)]['int_2d']
+            if self.arches['sum_int_2d'] is None:
+                self.arches['sum_int_2d'] = _d
                 self.arches['sum_map_raw'] = self.data_2d[int(k)]['map_raw']
+            else:
+                try:
+                    self.arches['sum_int_2d'] = self.arches['sum_int_2d'] + _d
+                    self.arches['sum_map_raw'] += self.data_2d[int(k)]['map_raw']
+                except (ValueError, AttributeError):
+                    self.arches['sum_int_2d'] = _d
+                    self.arches['sum_map_raw'] = self.data_2d[int(k)]['map_raw']
 
         for k in sub_from_data:
-            try:
-                self.arches['sum_int_2d'] -= self.data_2d[int(k)]['int_2d']
-                self.arches['sum_map_raw'] -= self.data_2d[int(k)]['map_raw']
-            except ValueError:
-                self.arches['sum_int_2d'] = self.data_2d[int(k)]['int_2d']
+            _d = self.data_2d[int(k)]['int_2d']
+            if self.arches['sum_int_2d'] is None:
+                self.arches['sum_int_2d'] = _d
                 self.arches['sum_map_raw'] = self.data_2d[int(k)]['map_raw']
+            else:
+                try:
+                    self.arches['sum_int_2d'] = self.arches['sum_int_2d'] - _d
+                    self.arches['sum_map_raw'] -= self.data_2d[int(k)]['map_raw']
+                except (ValueError, AttributeError):
+                    self.arches['sum_int_2d'] = _d
+                    self.arches['sum_map_raw'] = self.data_2d[int(k)]['map_raw']
