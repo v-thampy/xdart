@@ -10,6 +10,12 @@ import sys
 import gc
 import os
 import signal
+import multiprocessing
+
+# macOS + Python 3.12+: fork() after Qt init causes bus errors.
+# Use "spawn" to safely create subprocesses.
+if sys.platform == "darwin":
+    multiprocessing.set_start_method("spawn", force=True)
 
 # Set PySide6 as the Qt binding for pyqtgraph before any Qt imports.
 # Also export MPLBACKEND so child processes (e.g. pyFAI-calib2) inherit it.

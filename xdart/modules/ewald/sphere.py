@@ -7,7 +7,6 @@ import numpy as np
 from .arch import EwaldArch
 from .arch_series import ArchSeries
 from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from xdart.utils.containers.compat import read_legacy_1d, read_legacy_2d
 from xdart import utils
 from ssrl_xrd_tools.integrate.multi import stitch_1d, stitch_2d
 
@@ -62,7 +61,7 @@ class EwaldSphere:
                  bai_1d_args={}, bai_2d_args={},
                  static=False, gi=False, th_mtr='th', series_average=False,
                  overall_raw=0, single_img=False,
-                 global_mask=None, poni_dict={}
+                 global_mask=None
                  ):
         """name: string, name of sphere object.
         arches: list of EwaldArch object, data to intialize with
@@ -115,7 +114,6 @@ class EwaldSphere:
 
         self.overall_raw = overall_raw
         self.global_mask = global_mask
-        self.poni_dict = poni_dict
 
     def reset(self):
         """Resets all held data objects to blank state, called when all
@@ -358,7 +356,7 @@ class EwaldSphere:
                 lst_attr = [
                     "scan_data", "global_mask", "mg_args", "bai_1d_args",
                     "bai_2d_args", "overall_raw",
-                    "static", "gi", "th_mtr", "single_img", "poni_dict",
+                    "static", "gi", "th_mtr", "single_img",
                     "series_average", "skip_2d"
                 ]
             utils.attributes_to_h5(self, grp, lst_attr,
@@ -410,7 +408,7 @@ class EwaldSphere:
                         lst_attr = [
                             "scan_data", "mg_args", "bai_1d_args",
                             "bai_2d_args", "overall_raw",
-                            "static", "gi", "th_mtr", "single_img", "poni_dict",
+                            "static", "gi", "th_mtr", "single_img",
                             "series_average", "skip_2d"
                         ]
                         utils.h5_to_attributes(self, grp, lst_attr)
@@ -421,17 +419,9 @@ class EwaldSphere:
                             self._set_args(self.mg_args)
 
                         if 'bai_1d' in grp:
-                            _g1d = grp['bai_1d']
-                            if 'radial' in _g1d:
-                                self.bai_1d = IntegrationResult1D.from_hdf5(_g1d)
-                            else:
-                                self.bai_1d = read_legacy_1d(_g1d)
+                            self.bai_1d = IntegrationResult1D.from_hdf5(grp['bai_1d'])
                         if 'bai_2d' in grp:
-                            _g2d = grp['bai_2d']
-                            if 'radial' in _g2d:
-                                self.bai_2d = IntegrationResult2D.from_hdf5(_g2d)
-                            else:
-                                self.bai_2d = read_legacy_2d(_g2d)
+                            self.bai_2d = IntegrationResult2D.from_hdf5(grp['bai_2d'])
 
                     if "global_mask" in grp:
                         utils.h5_to_attributes(self, grp, ["global_mask"])
@@ -554,10 +544,11 @@ def get_1D_data(h5_file, arch_ids=None, static=True):
                     if grp.attrs['type'] == 'EwaldArch':
                         lst_attr = [
                             "scan_info", "ai_args",
-                            "gi", "static", "poni_dict"
+                            "gi", "static"
                         ]
                         utils.h5_to_attributes(arch, grp, lst_attr)
-                        arch.int_1d.from_hdf5(grp['int_1d'])
+                        if 'int_1d' in grp:
+                            arch.int_1d = IntegrationResult1D.from_hdf5(grp['int_1d'])
 
                 if arch.int_1d is None:
                     continue
