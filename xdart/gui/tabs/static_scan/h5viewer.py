@@ -531,6 +531,9 @@ class H5Viewer(QWidget):
         """
         # ic()
         file = self._h5pool.get(self.sphere.data_file)
+        if file is None:
+            # File is being written to by the wrangler thread — skip this read.
+            return
         for idx in arch_ids:
             try:
                 # ic(idx)

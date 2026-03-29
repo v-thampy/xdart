@@ -9,8 +9,7 @@ import sys
 import subprocess
 
 import fabio
-from xdart.utils.pyFAI_binaries import pyFAI_drawmask_main
-from xdart.utils.pyFAI_binaries import MaskImageWidgetXdart
+from xdart.utils.pyFAI_binaries import pyFAI_drawmask_main, get_MaskImageWidgetXdart
 from pyFAI.app.drawmask import postProcessId21
 
 # Qt imports
@@ -892,7 +891,8 @@ class integratorTree(Qt.QtWidgets.QWidget):
             print('No Image Chosen')
             return
 
-        self.mask_window = MaskImageWidgetXdart()
+        MaskWidgetClass = get_MaskImageWidgetXdart()
+        self.mask_window = MaskWidgetClass()
         self.mask_window.setWindowModality(Qt.QtCore.Qt.WindowModal)
         self.mask_window.show()
 
