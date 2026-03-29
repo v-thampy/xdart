@@ -838,6 +838,7 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             xdata, ydata = self.get_xydata(self.arches['sum_int_2d'])
             return intensity, xdata, ydata
 
+
         # intensity, n_arches = 0., 0
         # for nn, idx in enumerate(idxs):
         try:
@@ -847,23 +848,13 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
 
         arch_1d = self.data_1d[int(idx)]
         arch_2d = self.data_2d[int(idx)]
-        # ic(arch_2d['int_2d'].ttheta, arch_2d['int_2d'].i_tthChi)
-        # print(arch_2d['int_2d'].ttheta, arch_2d['int_2d'].i_tthChi)
-        # arch_intensity = self.get_int_2d(arch_2d['int_2d'], arch_1d)
-        intensity = self.get_int_2d(arch_2d['int_2d'], arch_1d)
-        # if (arch_intensity.ndim > 1) and (arch_intensity.shape[0] != 0):
-        #     intensity += arch_intensity
-        #     arch_xy = arch_2d
-        #     n_arches += 1
+        _gi2d = arch_2d.get('gi_2d', {})
+        intensity = self.get_int_2d(arch_2d['int_2d'], arch_1d, gi_2d=_gi2d)
 
-        # if n_arches == 0:
         if intensity.ndim != 2:
             return None, None, None
 
-        # intensity /= n_arches
-
-        # xdata, ydata = self.get_xydata(arch_xy['int_2d'])
-        xdata, ydata = self.get_xydata(arch_2d['int_2d'])
+        xdata, ydata = self.get_xydata(arch_2d['int_2d'], gi_2d=_gi2d)
         return np.asarray(intensity, dtype=float), xdata, ydata
 
     def get_sphere_int_2d(self):
@@ -871,6 +862,9 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         """
         with self.sphere.sphere_lock:
             int_2d = self.sphere.bai_2d
+
+        if int_2d is None:
+            return np.zeros((1, 1)), np.array([]), np.array([])
 
         intensity = self.get_int_2d(int_2d, normalize=True)
 
@@ -900,16 +894,18 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
 
         return ydata, xdata
 
-    def get_int_2d(self, int_2d, arch_1d=None, normalize=True):
+    def get_int_2d(self, int_2d, arch_1d=None, normalize=True, gi_2d=None):
         """Returns the appropriate 2D data depending on the chosen axes
         I(Q, Chi) or I(Qz, Qxy)
         """
-        if self.ui.imageUnit.currentIndex() == 0:
-            intensity_2d = int_2d.i_qChi
-        elif self.ui.imageUnit.currentIndex() == 1:
-            intensity_2d = int_2d.i_tthChi
+        if int_2d is None:
+            return np.zeros((1, 1))
+        if self.ui.imageUnit.currentIndex() == 2 and gi_2d:
+            _gi = gi_2d.get('gi2d')
+            intensity_2d = _gi.intensity if _gi is not None else int_2d.intensity
         else:
-            intensity_2d = int_2d.i_QxyQz
+            # imageUnit 0 (Q-Chi) or 1 (2Th-Chi): both served from primary result
+            intensity_2d = int_2d.intensity
         intensity = np.asarray(intensity_2d.copy(), dtype=float)
 
         if normalize:
@@ -932,25 +928,38 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         if self.ui.plotUnit.currentIndex() != 2:
             if not self.ui.slice.isChecked():
                 int_1d = arch.int_1d
-                if self.ui.plotUnit.currentIndex() == 3:
-                    intensity = int_1d.i_qxy
-                elif self.ui.plotUnit.currentIndex() == 4:
-                    intensity = int_1d.i_qz
+                if int_1d is None:
+                    return None, None
+                _unit_idx = self.ui.plotUnit.currentIndex()
+                gi_1d = getattr(arch, 'gi_1d', {})
+                if _unit_idx == 3:
+                    _r = gi_1d.get('qip')
+                    intensity = _r.intensity if _r is not None else int_1d.intensity
+                elif _unit_idx == 4:
+                    _r = gi_1d.get('qoop')
+                    intensity = _r.intensity if _r is not None else int_1d.intensity
                 else:
-                    intensity = int_1d.norm
+                    intensity = int_1d.intensity
 
                 ydata = self.normalize(intensity, arch.scan_info)
-                xdata = self.get_xdata(int_1d)
+                xdata = self.get_xdata(arch)
                 return xdata, ydata
 
         if arch_2d is None:
             return None, None
 
         # If a particular Chi Range is chosen...
-        intensity = self.get_int_2d(arch_2d['int_2d'], arch, normalize=False)
+        intensity = self.get_int_2d(arch_2d['int_2d'], arch, normalize=False,
+                                    gi_2d=arch_2d.get('gi_2d', {}))
         if intensity.ndim < 2:
             return None, None
-        q, tth, chi = arch_2d['int_2d'].q, arch_2d['int_2d'].ttheta, arch_2d['int_2d'].chi
+        _i2d = arch_2d['int_2d']
+        # radial axis is q or 2th depending on integration unit
+        radial = _i2d.radial if _i2d is not None else np.array([])
+        chi = _i2d.azimuthal if _i2d is not None else np.array([])
+        # treat radial as both q and tth proxies; display label set elsewhere
+        q = radial
+        tth = radial
 
         xdata_list = [q, tth, chi]
         xdata = xdata_list[self.ui.plotUnit.currentIndex()]
@@ -982,48 +991,49 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         ydata = self.normalize(ydata, arch.scan_info)
         return xdata, ydata
 
-    def get_xydata(self, int_2d):
+    def get_xydata(self, int_2d, gi_2d=None):
         """Reads the unit box and returns appropriate xdata
 
         args:
-            box: QComboBox, list of options
-            int_data: int_nd_data object, data to parse
+            int_2d: IntegrationResult2D, primary integration result
+            gi_2d: dict of IntegrationResult2D for GI modes (optional)
 
         returns:
             xdata: numpy array, x axis data for plot.
         """
+        if int_2d is None:
+            return np.array([]), np.array([])
         imageUnit = self.ui.imageUnit.currentIndex()
-        if imageUnit == 0:  # Q-Chi
-            xdata, ydata = int_2d.q, int_2d.chi
-        elif imageUnit == 1:  # 2Th-Chi
-            xdata, ydata = int_2d.ttheta, int_2d.chi
-        else:  # Qzx-Qz
-            xdata, ydata = int_2d.qxy, int_2d.qz
+        if imageUnit == 2 and gi_2d:  # Qxy-Qz (GI)
+            _gi = gi_2d.get('gi2d')
+            if _gi is not None:
+                return _gi.radial, _gi.azimuthal
+        # Q-Chi or 2Th-Chi: use primary radial and azimuthal axes
+        return int_2d.radial, int_2d.azimuthal
 
-        return xdata, ydata
-
-    def get_xdata(self, int_data):
-        """Reads the unit box and returns appropriate xdata
+    def get_xdata(self, arch):
+        """Reads the unit box and returns appropriate xdata for 1D plot.
 
         args:
-            box: QComboBox, list of options
-            int_data: int_nd_data object, data to parse
+            arch: EwaldArch copy (data_1d entry) holding int_1d and gi_1d
 
         returns:
             xdata: numpy array, x axis data for plot.
         """
         unit = self.ui.plotUnit.currentIndex()
-        if unit == 0:
-            xdata = int_data.q
-        elif unit == 1:
-            xdata = int_data.ttheta
+        int_1d = getattr(arch, 'int_1d', None)
+        gi_1d = getattr(arch, 'gi_1d', {})
+        if unit == 3:
+            _r = gi_1d.get('qip')
+            return _r.radial if _r is not None else (int_1d.radial if int_1d else np.array([]))
+        elif unit == 4:
+            _r = gi_1d.get('qoop')
+            return _r.radial if _r is not None else (int_1d.radial if int_1d else np.array([]))
         elif unit == 2:
-            xdata = self.get_chi_1d()
-        elif unit == 3:
-            xdata = int_data.qxy
+            return self.get_chi_1d()
         else:
-            xdata = int_data.qz
-        return xdata
+            # unit 0 (Q) or unit 1 (2Th): return primary radial axis
+            return int_1d.radial if int_1d is not None else np.array([])
 
     def normalize(self, int_data, scan_info):
         """Reads the norm, raw, pcount option box and returns

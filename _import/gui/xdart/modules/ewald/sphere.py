@@ -6,7 +6,8 @@ import numpy as np
 
 from .arch import EwaldArch
 from .arch_series import ArchSeries
-from xdart.utils.containers import int_1d_data_static, int_2d_data_static
+from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xdart.utils.containers.compat import read_legacy_1d, read_legacy_2d
 from xdart import utils
 from ssrl_xrd_tools.integrate.multi import stitch_1d, stitch_2d
 
@@ -109,8 +110,8 @@ class EwaldSphere:
         self.bai_2d_args = bai_2d_args
         self.sphere_lock = Condition(_PyRLock())
 
-        self.bai_1d = int_1d_data_static()
-        self.bai_2d = int_2d_data_static()
+        self.bai_1d: IntegrationResult1D | None = None
+        self.bai_2d: IntegrationResult2D | None = None
 
         self.overall_raw = overall_raw
         self.global_mask = global_mask
@@ -126,8 +127,8 @@ class EwaldSphere:
             self.arches = ArchSeries(self.data_file, self.file_lock,
                                      static=self.static, gi=self.gi)
             self.global_mask = None
-            self.bai_1d = int_1d_data_static()
-            self.bai_2d = int_2d_data_static()
+            self.bai_1d = None
+            self.bai_2d = None
             self.overall_raw = 0
 
     def add_arch(self, arch=None, calculate=True, update=True, get_sd=True,
@@ -209,7 +210,7 @@ class EwaldSphere:
         else:
             self.bai_1d_args = args.copy()
         with self.sphere_lock:
-            self.bai_1d = int_1d_data_static()
+            self.bai_1d = None
 
             for arch in self.arches:
                 arch.integrate_1d(global_mask=self.global_mask, **args)
@@ -229,7 +230,7 @@ class EwaldSphere:
         else:
             self.bai_2d_args = args.copy()
         with self.sphere_lock:
-            self.bai_2d = int_2d_data_static()
+            self.bai_2d = None
 
             for arch in self.arches:
                 arch.integrate_2d(global_mask=self.global_mask, **args)
@@ -240,41 +241,30 @@ class EwaldSphere:
         """helper function to update overall bai variables.
         """
         with self.sphere_lock:
+            if arch.int_1d is None:
+                return
             try:
-                assert list(self.bai_1d.norm.shape) == list(arch.int_1d.norm.shape)
-            except (AssertionError, AttributeError):
-                self.bai_1d.norm = np.zeros(arch.int_1d.norm.shape)
-                self.bai_1d.sigma = np.zeros(arch.int_1d.norm.shape)
-                self.bai_1d.sigma_raw = np.zeros(arch.int_1d.norm.shape)
-            try:
-                self.bai_1d += arch.int_1d
-                self.bai_1d.ttheta = arch.int_1d.ttheta
-                self.bai_1d.q = arch.int_1d.q
-            except AttributeError:
-                pass
+                if self.bai_1d is None:
+                    self.bai_1d = arch.int_1d
+                else:
+                    self.bai_1d = self.bai_1d + arch.int_1d
+            except (ValueError, AttributeError):
+                self.bai_1d = arch.int_1d
             self.save_bai_1d(h5file=h5file)
 
     def _update_bai_2d(self, arch, h5file=None):
         """helper function to update overall bai variables.
         """
         with self.sphere_lock:
+            if arch.int_2d is None:
+                return
             try:
-                assert self.bai_2d.i_qChi.shape == arch.int_2d.i_qChi.shape
-            except (AssertionError, AttributeError):
-                self.bai_2d.i_qChi = np.zeros(arch.int_2d.i_qChi.shape)
-                self.bai_2d.i_tthChi = np.zeros(arch.int_2d.i_tthChi.shape)
-                self.bai_2d.i_QxyQz = np.zeros(arch.int_2d.i_QxyQz.shape)
-            try:
-                self.bai_2d.ttheta = arch.int_2d.ttheta
-                self.bai_2d.q = arch.int_2d.q
-                self.bai_2d.chi = arch.int_2d.chi
-                self.bai_2d.i_qChi += arch.int_2d.i_qChi
-                self.bai_2d.i_tthChi += arch.int_2d.i_tthChi
-                self.bai_2d.i_QxyQz += arch.int_2d.i_QxyQz
-                self.bai_2d.qz = arch.int_2d.qz
-                self.bai_2d.qxy = arch.int_2d.qxy
-            except AttributeError:
-                pass
+                if self.bai_2d is None:
+                    self.bai_2d = arch.int_2d
+                else:
+                    self.bai_2d = self.bai_2d + arch.int_2d
+            except (ValueError, AttributeError):
+                self.bai_2d = arch.int_2d
             if not self.skip_2d:
                 self.save_bai_2d(h5file=h5file)
 
@@ -374,13 +364,14 @@ class EwaldSphere:
             utils.attributes_to_h5(self, grp, lst_attr,
                                    compression=compression)
 
-            if 'bai_1d' not in grp:
-                grp.create_group('bai_1d')
-            self.bai_1d.to_hdf5(grp['bai_1d'], compression)
-            if not self.skip_2d:
+            if self.bai_1d is not None:
+                if 'bai_1d' not in grp:
+                    grp.create_group('bai_1d')
+                self.bai_1d.to_hdf5(grp['bai_1d'], compression or "lzf")
+            if not self.skip_2d and self.bai_2d is not None:
                 if 'bai_2d' not in grp:
                     grp.create_group('bai_2d')
-                self.bai_2d.to_hdf5(grp['bai_2d'], compression)
+                self.bai_2d.to_hdf5(grp['bai_2d'], compression or "lzf")
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
         """Loads data stored in hdf5 file.
@@ -430,9 +421,17 @@ class EwaldSphere:
                             self._set_args(self.mg_args)
 
                         if 'bai_1d' in grp:
-                            self.bai_1d.from_hdf5(grp['bai_1d'])
+                            _g1d = grp['bai_1d']
+                            if 'radial' in _g1d:
+                                self.bai_1d = IntegrationResult1D.from_hdf5(_g1d)
+                            else:
+                                self.bai_1d = read_legacy_1d(_g1d)
                         if 'bai_2d' in grp:
-                            self.bai_2d.from_hdf5(grp['bai_2d'])
+                            _g2d = grp['bai_2d']
+                            if 'radial' in _g2d:
+                                self.bai_2d = IntegrationResult2D.from_hdf5(_g2d)
+                            else:
+                                self.bai_2d = read_legacy_2d(_g2d)
 
                     if "global_mask" in grp:
                         utils.h5_to_attributes(self, grp, ["global_mask"])
@@ -480,13 +479,17 @@ class EwaldSphere:
             h5file: open h5py file handle to reuse. If provided the
                 file_lock is not acquired and no file open occurs.
         """
+        if self.bai_1d is None:
+            return
         compression = None  # static scans always skip compression
         if h5file is not None:
-            self.bai_1d.to_hdf5(h5file['bai_1d'], compression=compression)
+            h5file.require_group('bai_1d')
+            self.bai_1d.to_hdf5(h5file['bai_1d'], "lzf")
         else:
             with self.file_lock:
                 with utils.catch_h5py_file(self.data_file, 'a') as file:
-                    self.bai_1d.to_hdf5(file['bai_1d'], compression=compression)
+                    file.require_group('bai_1d')
+                    self.bai_1d.to_hdf5(file['bai_1d'], "lzf")
 
     def save_bai_2d(self, compression='lzf', h5file=None):
         """Function to save only the bai_2d object.
@@ -498,13 +501,17 @@ class EwaldSphere:
             h5file: open h5py file handle to reuse. If provided the
                 file_lock is not acquired and no file open occurs.
         """
+        if self.bai_2d is None:
+            return
         compression = None  # static scans always skip compression
         if h5file is not None:
-            self.bai_2d.to_hdf5(h5file['bai_2d'], compression=compression)
+            h5file.require_group('bai_2d')
+            self.bai_2d.to_hdf5(h5file['bai_2d'], "lzf")
         else:
             with self.file_lock:
                 with utils.catch_h5py_file(self.data_file, 'a') as file:
-                    self.bai_2d.to_hdf5(file['bai_2d'], compression=compression)
+                    file.require_group('bai_2d')
+                    self.bai_2d.to_hdf5(file['bai_2d'], "lzf")
 
     def _set_args(self, args):
         """Ensures any range args are lists.
@@ -552,11 +559,21 @@ def get_1D_data(h5_file, arch_ids=None, static=True):
                         utils.h5_to_attributes(arch, grp, lst_attr)
                         arch.int_1d.from_hdf5(grp['int_1d'])
 
+                if arch.int_1d is None:
+                    continue
+                _r1d = arch.int_1d
+                # Derive both tth and q from whichever radial axis is stored
+                if _r1d.unit in ('q_A^-1', 'q_nm^-1'):
+                    _q = list(_r1d.radial) if _r1d.unit == 'q_A^-1' else list(_r1d.radial / 10.0)
+                    _tth = []  # not stored; would need wavelength to convert
+                else:
+                    _tth = list(_r1d.radial)
+                    _q = []
                 df1 = df1.append({
                     'idx': idx,
-                    'intensity': list(arch.int_1d.norm),
-                    'tth': list(arch.int_1d.ttheta),
-                    'q': list(arch.int_1d.q)},
+                    'intensity': list(_r1d.intensity),
+                    'tth': _tth,
+                    'q': _q},
                     ignore_index=True
                 )
             except KeyError:

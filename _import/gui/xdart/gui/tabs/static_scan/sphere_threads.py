@@ -11,7 +11,6 @@ import traceback
 import numpy as np
 
 # Other imports
-from xdart.utils.containers import int_1d_data_static, int_2d_data_static
 from xdart.modules.ewald import EwaldArch
 
 # Qt imports
@@ -100,7 +99,7 @@ class integratorThread(Qt.QtCore.QThread):
             return
         self.data_2d.clear()
         with self.sphere.sphere_lock:
-            self.sphere.bai_2d = int_2d_data_static()
+            self.sphere.bai_2d = None
 
         max_cores = getattr(self.sphere, 'max_cores', 1)
         all_arches = list(self.sphere.arches)  # load all from H5 into memory
@@ -122,7 +121,7 @@ class integratorThread(Qt.QtCore.QThread):
                     self.sphere._update_bai_2d(arch)
                     self.data_2d[int(arch.idx)] = {
                         'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
-                        'mask': arch.mask, 'int_2d': arch.int_2d,
+                        'mask': arch.mask, 'int_2d': arch.int_2d, 'gi_2d': arch.gi_2d,
                     }
                     self.update.emit(arch.idx)
         else:
@@ -148,7 +147,7 @@ class integratorThread(Qt.QtCore.QThread):
         """Integrates all arches 1d. Uses parallel workers when sphere.max_cores > 1."""
         self.data_1d.clear()
         with self.sphere.sphere_lock:
-            self.sphere.bai_1d = int_1d_data_static()
+            self.sphere.bai_1d = None
 
         max_cores = getattr(self.sphere, 'max_cores', 1)
         all_arches = list(self.sphere.arches)  # load all from H5 into memory
@@ -204,7 +203,8 @@ class integratorThread(Qt.QtCore.QThread):
                 'map_raw': arch.map_raw,
                 'bg_raw': arch.bg_raw,
                 'mask': arch.mask,
-                'int_2d': arch.int_2d}
+                'int_2d': arch.int_2d,
+                'gi_2d': arch.gi_2d}
             self.update.emit(idx)
 
     def bai_1d_SI(self):
@@ -311,10 +311,7 @@ class fileHandlerThread(Qt.QtCore.QThread):
                         self.data_1d[int(idx)] = arch.copy(include_2d=False)
                         # ic('loaded 1D data', self.data_1d.keys())
                         if self.update_2d:
-                            try:
-                                if len(arch.int_2d.i_qChi) == 0:
-                                    pass
-                            except TypeError:
+                            if arch.int_2d is None or arch.int_2d.intensity.size == 0:
                                 arch.load_from_h5(file['arches'], load_2d=self.update_2d)
 
                             self.data_2d[int(idx)] = {'map_raw': arch.map_raw,
