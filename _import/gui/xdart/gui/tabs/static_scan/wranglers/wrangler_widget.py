@@ -5,7 +5,7 @@
 
 # Standard library imports
 from queue import Queue
-import multiprocessing as mp
+import threading
 import traceback
 
 # Other imports
@@ -148,88 +148,9 @@ class wranglerThread(Qt.QtCore.QThread):
         self.sphere_args = sphere_args
         self.fname = fname
         self.file_lock = file_lock
-        self.signal_q = mp.Queue()
-        self.command_q = mp.Queue()
+        self.signal_q = Queue()
+        self.command_q = Queue()
     
     def run(self):
-        """Main task. Should initialize child process here and listen
-        to input and signal queues.
-        """
-        #ic()
-        process = wranglerProcess(
-            self.command_q, 
-            self.signal_q, 
-            self.sphere_args,
-            self.fname,
-            self.file_lock,
-        )
-        process.start()
-        while True:
-            if not self.input_q.empty():
-                command = self.input_q.get()
-                if command == 'stop':
-                    self.command_q.put('stop')
-                    break
-        process.join()
-
-
-class wranglerProcess(mp.Process):
-    """Base class for wrangler processes. Subclasses should extend
-    _main, NOT run. _main is run in a try except clause which ensures
-    errors are printed.
-    
-    attributes:
-        command_q: mp.Queue, queue for commands from parent thread.
-        file_lock: mp.Condition, process safe lock for file access
-        fname: str, path to data file
-        signal_q: queue to place signals back to parent thread.
-        sphere_args: dict, used as **kwargs in sphere initialization.
-            see EwaldSphere.
-    
-    methods:
-        _main: method to be overridden in subclasses.
-        run: called by start, overriding this function should take into
-            account proper error handling.
-    """
-    def __init__(self, command_q, signal_q, sphere_args, fname, file_lock,
-                 *args, **kwargs):
-        """command_q: mp.Queue, queue for commands from parent thread.
-        signal_q: queue to place signals back to parent thread.
-        sphere_args: dict, used as **kwargs in sphere initialization.
-            see EwaldSphere.
-        fname: str, path to data file
-        file_lock: mp.Condition, process safe lock for file access
-        """
-        #ic()
-        super().__init__(*args, **kwargs)
-        self.command_q = command_q
-        self.signal_q = signal_q
-        self.sphere_args = sphere_args
-        self.fname = fname
-        self.file_lock = file_lock
-
-    def run(self):
-        """Target of process, calls _main inside a try except clause to
-        handle errors.
-        """
-        #ic()
-        try:
-            self._main()
-        except:
-            print("-"*60)
-            traceback.print_exc()
-            print("-"*60)
-
-    def _main(self):
-        """Treated like overriding run in a normal multiprocess Process.
-        """
-        #ic()
-        sphere = EwaldSphere(data_file=self.fname,
-                             # keep_in_memory=True,
-                             static=True,
-                             **self.sphere_args)
-        while True:
-            if not self.command_q.empty():
-                command = self.command_q.get()
-                if command == 'stop':
-                    break
+        """Main task. Subclasses (e.g. specThread) override this."""
+        pass

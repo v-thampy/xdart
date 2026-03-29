@@ -36,10 +36,13 @@ class ArchSeries():
         sort_index: Sort the index by arch id.
     """
     def __init__(self, data_file, file_lock, arches=[],
-                 static=False, gi=False):
+                 static=False, gi=False, h5file=None):
         """data_file: Path to hdf5 file for storing data.
         file_lock: Thread safe lock.
         arches: List of arches to initialize series with.
+        h5file: Optional open h5py.File handle. When provided, the
+            constructor uses it instead of opening the file itself
+            (avoids double-open which corrupts the caller's handle).
         """
         self.data_file = data_file
         self.file_lock = file_lock
@@ -48,15 +51,24 @@ class ArchSeries():
         self.gi = gi
         if arches:
             for a in arches:
-                self.__setitem__(a.idx, a)
+                self.__setitem__(a.idx, a, h5file=h5file)
         self._i = 0
-        # invoke the lock to prevent conflicts
-        with self.file_lock:
-            get_pool().close(self.data_file)
-            # use catch to avoid oserrors which will resolve with time.
-            with catch(self.data_file, 'a') as f:
-                if 'arches' not in f:
-                    f.create_group('arches')
+        # Ensure the 'arches' group exists in the HDF5 file.
+        if h5file is not None:
+            # Caller already has the file open — use their handle directly.
+            if 'arches' not in h5file:
+                h5file.create_group('arches')
+        else:
+            # No handle provided — open, ensure group, close.
+            pool = get_pool()
+            pool.pause(self.data_file)
+            try:
+                with self.file_lock:
+                    with catch(self.data_file, 'a') as f:
+                        if 'arches' not in f:
+                            f.create_group('arches')
+            finally:
+                pool.resume(self.data_file)
                 
     def __getitem__(self, idx):
         """Initializes a new EwaldArch object and loads data from file
@@ -99,22 +111,26 @@ class ArchSeries():
             if arch.idx not in self.index:
                 self.index.append(arch.idx)
         else:
-            with self.file_lock:
-                get_pool().close(self.data_file)
-                with catch(self.data_file, 'a') as f:
-                    if 'arches' not in f:
-                        f.create_group('arches')
-                    if idx != arch.idx:
-                        arch.idx = idx
-                    arch.save_to_h5(f['arches'])
-                    if arch.idx not in self.index:
-                        self.index.append(arch.idx)
+            pool = get_pool()
+            pool.pause(self.data_file)
+            try:
+                with self.file_lock:
+                    with catch(self.data_file, 'a') as f:
+                        if 'arches' not in f:
+                            f.create_group('arches')
+                        if idx != arch.idx:
+                            arch.idx = idx
+                        arch.save_to_h5(f['arches'])
+                        if arch.idx not in self.index:
+                            self.index.append(arch.idx)
+            finally:
+                pool.resume(self.data_file)
 
     def append(self, arch, h5file=None):
         """Adds a new arch to the end of the index, unless idx is
         already stored in which case the arch at that idx is replaced.
         """
-        arches = ArchSeries(self.data_file, self.file_lock)
+        arches = ArchSeries(self.data_file, self.file_lock, h5file=h5file)
         arches.index = self.index[:]
         if isinstance(arch, Series):
             _arch = arch.iloc[0]

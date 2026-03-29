@@ -486,22 +486,22 @@ class EwaldArch():
             if self.int_1d is not None:
                 if 'int_1d' not in grp:
                     grp.create_group('int_1d')
-                self.int_1d.to_hdf5(grp['int_1d'], compression or "lzf")
+                self.int_1d.to_hdf5(grp['int_1d'], compression)
             if self.int_2d is not None:
                 if 'int_2d' not in grp:
                     grp.create_group('int_2d')
-                self.int_2d.to_hdf5(grp['int_2d'], compression or "lzf")
+                self.int_2d.to_hdf5(grp['int_2d'], compression)
             # Save auxiliary GI results
             if self.gi_1d:
                 gi1d_grp = grp.require_group('gi_1d')
                 for key, res in self.gi_1d.items():
                     sub = gi1d_grp.require_group(key)
-                    res.to_hdf5(sub, compression or "lzf")
+                    res.to_hdf5(sub, compression)
             if self.gi_2d:
                 gi2d_grp = grp.require_group('gi_2d')
                 for key, res in self.gi_2d.items():
                     sub = gi2d_grp.require_group(key)
-                    res.to_hdf5(sub, compression or "lzf")
+                    res.to_hdf5(sub, compression)
             if 'poni' not in grp:
                 grp.create_group('poni')
             utils.dict_to_h5(self.poni.to_dict(), grp, 'poni')

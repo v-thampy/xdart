@@ -26,7 +26,7 @@ from xdart.modules.ewald import EwaldArch, EwaldSphere
 from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from ssrl_xrd_tools.core.containers import PONI
-from .wrangler_widget import wranglerWidget, wranglerThread, wranglerProcess
+from .wrangler_widget import wranglerWidget, wranglerThread
 from .ui.specUI import Ui_Form
 from ....gui_utils import NamedActionParameter
 from ssrl_xrd_tools.io.image import read_image, count_frames
@@ -1212,9 +1212,12 @@ class specThread(wranglerThread):
             count += 1
         # Flush overall_raw once per batch (excluded from per-frame save_to_h5).
         if count > 0:
-            _get_h5pool().close(sphere.data_file)
-            with self.file_lock:
-                sphere.save_to_h5(data_only=False, replace=False)
+            _get_h5pool().pause(sphere.data_file)
+            try:
+                with self.file_lock:
+                    sphere.save_to_h5(data_only=False, replace=False)
+            finally:
+                _get_h5pool().resume(sphere.data_file)
         return count
 
     def _process_one(self, sphere, img_file, img_number, img_data, img_meta, bg_raw):
@@ -1279,19 +1282,23 @@ class specThread(wranglerThread):
 
         # For Eiger: raw frames already live in the master file — don't double-store them.
         arch.skip_map_raw = sphere.skip_2d or _is_eiger_master(img_file)
-        _get_h5pool().close(sphere.data_file)
+        # Pause the read pool so h5viewer cannot reopen the file while we write.
+        _get_h5pool().pause(sphere.data_file)
         _t4 = time.time()
-        with self.file_lock:
-            _t4_locked = time.time()
-            # Open the file once and pass the handle to add_arch so all
-            # sub-writes (arch, scan_data, bai_1d, bai_2d) share it.
-            with _catch_h5(sphere.data_file, 'a') as h5f:
-                sphere.add_arch(
-                    arch=arch, calculate=False, update=True,
-                    get_sd=True, set_mg=False, static=True, gi=self.gi,
-                    th_mtr=self.th_mtr, series_average=self.series_average,
-                    h5file=h5f,
-                )
+        try:
+            with self.file_lock:
+                _t4_locked = time.time()
+                # Open the file once and pass the handle to add_arch so all
+                # sub-writes (arch, scan_data, bai_1d, bai_2d) share it.
+                with _catch_h5(sphere.data_file, 'a') as h5f:
+                    sphere.add_arch(
+                        arch=arch, calculate=False, update=True,
+                        get_sd=True, set_mg=False, static=True, gi=self.gi,
+                        th_mtr=self.th_mtr, series_average=self.series_average,
+                        h5file=h5f,
+                    )
+        finally:
+            _get_h5pool().resume(sphere.data_file)
         _t_h5_total = time.time() - _t4
         _t_h5_wait  = _t4_locked - _t4
         _t_h5_write = _t_h5_total - _t_h5_wait
@@ -1526,18 +1533,21 @@ class specThread(wranglerThread):
         if not os.path.exists(fname):
             write_mode = 'Overwrite'
 
-        _get_h5pool().close(sphere.data_file)
-        with self.file_lock:
-            if write_mode == 'Append':
-                sphere.load_from_h5(replace=False, mode='a')
-                sphere.skip_2d = self.sphere.skip_2d  # re-apply after load may overwrite it
-                for (k, v) in self.sphere_args.items():
-                    setattr(sphere, k, v)
-                existing_arches = sphere.arches.index
-                if len(existing_arches) == 0:
+        _get_h5pool().pause(sphere.data_file)
+        try:
+            with self.file_lock:
+                if write_mode == 'Append':
+                    sphere.load_from_h5(replace=False, mode='a')
+                    sphere.skip_2d = self.sphere.skip_2d  # re-apply after load may overwrite it
+                    for (k, v) in self.sphere_args.items():
+                        setattr(sphere, k, v)
+                    existing_arches = sphere.arches.index
+                    if len(existing_arches) == 0:
+                        sphere.save_to_h5(replace=True)
+                else:
                     sphere.save_to_h5(replace=True)
-            else:
-                sphere.save_to_h5(replace=True)
+        finally:
+            _get_h5pool().resume(sphere.data_file)
 
         self.sigUpdateFile.emit(
             self.scan_name, fname,

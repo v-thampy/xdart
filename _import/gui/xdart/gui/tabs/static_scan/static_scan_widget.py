@@ -5,7 +5,7 @@
 
 # Standard library imports
 from queue import Queue
-import multiprocessing as mp
+import threading
 import copy
 import os
 from collections import OrderedDict
@@ -105,7 +105,7 @@ class staticWidget(QWidget):
         super().__init__(parent)
 
         # Data object initialization
-        self.file_lock = mp.Condition()
+        self.file_lock = threading.Condition()
         # if local_path is None:
         local_path = get_fname_dir()
         self.local_path = local_path
@@ -183,7 +183,7 @@ class staticWidget(QWidget):
         self.ui.metaFrame.setLayout(self.metawidget.layout)
 
         # Wrangler frame setup
-        self.wrangler = wranglerWidget("uninitialized", mp.Condition())
+        self.wrangler = wranglerWidget("uninitialized", threading.Condition())
         for name, w in wranglers.items():
             self.ui.wranglerStack.addWidget(
                 w(
