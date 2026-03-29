@@ -131,7 +131,7 @@ class EwaldSphere:
             self.overall_raw = 0
 
     def add_arch(self, arch=None, calculate=True, update=True, get_sd=True,
-                 set_mg=True, **kwargs):
+                 set_mg=True, h5file=None, **kwargs):
         """Adds new arch to sphere.
 
         args:
@@ -147,6 +147,9 @@ class EwaldSphere:
                 Takes a long time, especially with longer lists.
                 Recommended to run set_multi_geo method after all arches
                 are loaded.
+            h5file: open h5py file handle to reuse for all sub-writes,
+                eliminating redundant file open/close cycles. Caller
+                holds the file_lock for the duration.
             kwargs: If arch is None, used to intialize the EwaldArch,
                 see EwaldArch for arguments.
 
@@ -159,7 +162,8 @@ class EwaldSphere:
                 arch.integrate_1d(global_mask=self.global_mask, **self.bai_1d_args)
                 arch.integrate_2d(global_mask=self.global_mask, **self.bai_2d_args)
             arch.file_lock = self.file_lock
-            self.arches = self.arches.append(pd.Series(arch, index=[arch.idx]))
+            self.arches = self.arches.append(pd.Series(arch, index=[arch.idx]),
+                                             h5file=h5file)
             self.arches.sort_index(inplace=True)
 
             if arch.scan_info and get_sd:
@@ -174,17 +178,19 @@ class EwaldSphere:
                         arch.scan_info, index=[arch.idx], dtype='float64'
                     )
                 self.scan_data.sort_index(inplace=True)
-                with self.file_lock:
-                    with utils.catch_h5py_file(self.data_file, 'a') as file:
-                        compression = 'lzf'
-                        if self.static:
-                            compression = None
-                        utils.dataframe_to_h5(self.scan_data, file,
-                                              'scan_data', compression)
+                compression = None if self.static else 'lzf'
+                if h5file is not None:
+                    utils.dataframe_to_h5(self.scan_data, h5file,
+                                          'scan_data', compression)
+                else:
+                    with self.file_lock:
+                        with utils.catch_h5py_file(self.data_file, 'a') as file:
+                            utils.dataframe_to_h5(self.scan_data, file,
+                                                  'scan_data', compression)
             if update:
-                self._update_bai_1d(arch)
+                self._update_bai_1d(arch, h5file=h5file)
                 if not self.skip_2d:
-                    self._update_bai_2d(arch)
+                    self._update_bai_2d(arch, h5file=h5file)
             if set_mg:
                 self._mg_integrators = [a.integrator for a in self.arches]
 
@@ -230,7 +236,7 @@ class EwaldSphere:
                 self.arches[arch.idx] = arch
                 self._update_bai_2d(arch)
 
-    def _update_bai_1d(self, arch):
+    def _update_bai_1d(self, arch, h5file=None):
         """helper function to update overall bai variables.
         """
         with self.sphere_lock:
@@ -246,9 +252,9 @@ class EwaldSphere:
                 self.bai_1d.q = arch.int_1d.q
             except AttributeError:
                 pass
-            self.save_bai_1d()
+            self.save_bai_1d(h5file=h5file)
 
-    def _update_bai_2d(self, arch):
+    def _update_bai_2d(self, arch, h5file=None):
         """helper function to update overall bai variables.
         """
         with self.sphere_lock:
@@ -270,7 +276,7 @@ class EwaldSphere:
             except AttributeError:
                 pass
             if not self.skip_2d:
-                self.save_bai_2d()
+                self.save_bai_2d(h5file=h5file)
 
     def set_multi_geo(self, **args):
         """Rebuilds the per-arch integrator list used for stitched integration.
@@ -356,7 +362,7 @@ class EwaldSphere:
 
             if data_only:
                 lst_attr = [
-                    "scan_data", "global_mask", "overall_raw",
+                    "scan_data", "global_mask",
                 ]
             else:
                 lst_attr = [
@@ -422,14 +428,16 @@ class EwaldSphere:
 
                         if not self.static:
                             self._set_args(self.mg_args)
+
+                        if 'bai_1d' in grp:
+                            self.bai_1d.from_hdf5(grp['bai_1d'])
+                        if 'bai_2d' in grp:
+                            self.bai_2d.from_hdf5(grp['bai_2d'])
+
                     if "global_mask" in grp:
                         utils.h5_to_attributes(self, grp, ["global_mask"])
                     else:
                         self.global_mask = None
-
-                    self.bai_1d.from_hdf5(grp['bai_1d'])
-                    if 'bai_2d' in grp:
-                        self.bai_2d.from_hdf5(grp['bai_2d'])
 
     def set_datafile(self, fname, name=None, keep_current_data=False,
                      save_args={}, load_args={}):
@@ -462,35 +470,41 @@ class EwaldSphere:
                     self.reset()
                     self.save_to_h5(replace=True, **save_args)
 
-    def save_bai_1d(self, compression='lzf'):
+    def save_bai_1d(self, compression='lzf', h5file=None):
         """Function to save only the bai_1d object.
 
         args:
             compression: str, what compression algorithm to pass to
                 h5py. See h5py documentation for acceptable compression
                 algorithms.
+            h5file: open h5py file handle to reuse. If provided the
+                file_lock is not acquired and no file open occurs.
         """
-        compression = None
-        if self.static:
-            compression = None
-        with self.file_lock:
-            with utils.catch_h5py_file(self.data_file, 'a') as file:
-                self.bai_1d.to_hdf5(file['bai_1d'], compression=compression)
+        compression = None  # static scans always skip compression
+        if h5file is not None:
+            self.bai_1d.to_hdf5(h5file['bai_1d'], compression=compression)
+        else:
+            with self.file_lock:
+                with utils.catch_h5py_file(self.data_file, 'a') as file:
+                    self.bai_1d.to_hdf5(file['bai_1d'], compression=compression)
 
-    def save_bai_2d(self, compression='lzf'):
+    def save_bai_2d(self, compression='lzf', h5file=None):
         """Function to save only the bai_2d object.
 
         args:
             compression: str, what compression algorithm to pass to
                 h5py. See h5py documentation for acceptable compression
                 algorithms.
+            h5file: open h5py file handle to reuse. If provided the
+                file_lock is not acquired and no file open occurs.
         """
-        compression = None
-        if self.static:
-            compression = None
-        with self.file_lock:
-            with utils.catch_h5py_file(self.data_file, 'a') as file:
-                self.bai_2d.to_hdf5(file['bai_2d'], compression=compression)
+        compression = None  # static scans always skip compression
+        if h5file is not None:
+            self.bai_2d.to_hdf5(h5file['bai_2d'], compression=compression)
+        else:
+            with self.file_lock:
+                with utils.catch_h5py_file(self.data_file, 'a') as file:
+                    self.bai_2d.to_hdf5(file['bai_2d'], compression=compression)
 
     def _set_args(self, args):
         """Ensures any range args are lists.

@@ -2,6 +2,19 @@ import h5py
 from collections import OrderedDict
 
 
+# Module-level singleton — import and use this from anywhere that needs
+# to coordinate read handles with write operations.
+_pool = None
+
+
+def get_pool():
+    """Return the process-wide H5FilePool, creating it on first call."""
+    global _pool
+    if _pool is None:
+        _pool = H5FilePool(max_open=5)
+    return _pool
+
+
 class H5FilePool:
     """Keeps HDF5 files open in read-only mode for fast repeated access.
     Supports multiple simultaneous open files for cross-scan comparison."""

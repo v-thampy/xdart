@@ -323,8 +323,18 @@ class staticWidget(QWidget):
 
         self.h5viewer.latest_idx = idx
         # ic('from wrangler', idx)
+        # Hold file_lock only for the list/sphere-index update, not for the
+        # display render (which reads only in-memory data_1d/data_2d).
+        # Holding the lock across displayframe.update() blocks the wrangler
+        # thread's h5_write for the duration of the render (2+ seconds for
+        # large Eiger images).
         with self.file_lock:
-            self.update_all(idx)
+            self.h5viewer.latest_idx = idx
+            if self.h5viewer.auto_last:
+                self.latest_arch()
+            self.h5viewer.update_data()
+        self.displayframe.update()
+        self.metawidget.update()
 
     def disable_auto_last(self, q):
         """

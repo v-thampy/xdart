@@ -32,7 +32,7 @@ from ssrl_xrd_tools.io.image import read_image, count_frames
 from ssrl_xrd_tools.io.export import write_xye, write_csv
 from ssrl_xrd_tools.io.metadata import read_image_metadata, _extract_scan_info
 from xdart.utils import get_fname_dir  # GUI-specific file dialog helper
-from xdart.utils import match_img_detector, get_series_avg
+from xdart.utils import match_img_detector, get_series_avg, catch_h5py_file as _catch_h5
 from xdart.utils.session import load_session, save_session
 from xdart.utils.containers.poni import get_poni_dict
 from xdart.utils.h5pool import get_pool as _get_h5pool
@@ -115,6 +115,11 @@ params = [
         {'name': 'Scale', 'type': 'float', 'value': 1, 'visible': False},
         {'name': 'norm_channel', 'title': 'Normalize', 'type': 'list', 'values': ['bstop'], 'value': 'bstop',
          'visible': False},
+    ], 'expanded': False, 'visible': False},
+    {'name': 'Mask', 'title': 'Mask', 'type': 'group', 'children': [
+        {'name': 'Threshold', 'type': 'bool', 'value': False},
+        {'name': 'min', 'title': 'Min', 'type': 'int', 'value': 0},
+        {'name': 'max', 'title': 'Max', 'type': 'int', 'value': 0},
     ], 'expanded': False, 'visible': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'children': [
         {'name': 'Grazing', 'type': 'bool', 'value': False},
@@ -241,6 +246,11 @@ class specWrangler(wranglerWidget):
 
         # Mask
         self.mask_file = self.parameters.child('Signal').child('mask_file').value()
+
+        # Threshold
+        self.apply_threshold = self.parameters.child('Mask').child('Threshold').value()
+        self.threshold_min = self.parameters.child('Mask').child('min').value()
+        self.threshold_max = self.parameters.child('Mask').child('max').value()
 
         # Write Mode
         self.write_mode = self.parameters.child('Signal').child('write_mode').value()
@@ -475,6 +485,14 @@ class specWrangler(wranglerWidget):
 
         self.mask_file = self.parameters.child('Signal').child('mask_file').value()
         self.thread.mask_file = self.mask_file
+
+        # Threshold
+        self.apply_threshold = self.parameters.child('Mask').child('Threshold').value()
+        self.thread.apply_threshold = self.apply_threshold
+        self.threshold_min = self.parameters.child('Mask').child('min').value()
+        self.thread.threshold_min = self.threshold_min
+        self.threshold_max = self.parameters.child('Mask').child('max').value()
+        self.thread.threshold_max = self.threshold_max
 
         # Write Mode
         self.write_mode = self.parameters.child('Signal').child('write_mode').value()
@@ -1030,6 +1048,10 @@ class specThread(wranglerThread):
         self.data_1d = data_1d
         self.data_2d = data_2d
 
+        self.apply_threshold = False
+        self.threshold_min = 0
+        self.threshold_max = 0
+
         self.user = None
         self.mask = None
         self.detector = None
@@ -1188,6 +1210,11 @@ class specThread(wranglerThread):
                 break
             self._process_one(sphere, *item)
             count += 1
+        # Flush overall_raw once per batch (excluded from per-frame save_to_h5).
+        if count > 0:
+            _get_h5pool().close(sphere.data_file)
+            with self.file_lock:
+                sphere.save_to_h5(data_only=False, replace=False)
         return count
 
     def _process_one(self, sphere, img_file, img_number, img_data, img_meta, bg_raw):
@@ -1196,12 +1223,14 @@ class specThread(wranglerThread):
         self.showLabel.emit(f'Processing {fname[-30:]}')
 
         _t1 = time.time()
+        threshold_mask = None if not self.apply_threshold else self.threshold(img_data)
         arch = EwaldArch(
             img_number, img_data, poni_dict=self.poni_dict,
             scan_info=img_meta, static=True, gi=self.gi,
             th_mtr=self.th_mtr, bg_raw=bg_raw,
             series_average=self.series_average,
             integrator=sphere._cached_integrator,
+            mask=threshold_mask,
         )
         _t_arch = time.time() - _t1
 
@@ -1234,28 +1263,48 @@ class specThread(wranglerThread):
             )
         _t_2d = time.time() - _t3
 
+        # Populate data_1d/data_2d from the in-memory arch before saving to HDF5.
+        # h5viewer.data_changed() checks data_2d.keys() to decide whether to call
+        # load_arches_data() (which also fills data_1d). By pre-populating both dicts
+        # here we avoid a redundant HDF5 round-trip and ensure Eiger frames (which
+        # skip_map_raw so map_raw/bg_raw are not in HDF5) still display correctly.
+        self.data_1d[int(img_number)] = arch.copy(include_2d=False)
+        self.data_2d[int(img_number)] = {
+            'map_raw': arch.map_raw,
+            'bg_raw': arch.bg_raw,
+            'mask': arch.mask,
+            'int_2d': arch.int_2d,
+        }
+
         # For Eiger: raw frames already live in the master file — don't double-store them.
         arch.skip_map_raw = sphere.skip_2d or _is_eiger_master(img_file)
         _get_h5pool().close(sphere.data_file)
         _t4 = time.time()
         with self.file_lock:
-            sphere.add_arch(
-                arch=arch, calculate=False, update=True,
-                get_sd=True, set_mg=False, static=True, gi=self.gi,
-                th_mtr=self.th_mtr, series_average=self.series_average
-            )
-            sphere.save_to_h5(data_only=True, replace=False)
-        _t_h5 = time.time() - _t4
+            _t4_locked = time.time()
+            # Open the file once and pass the handle to add_arch so all
+            # sub-writes (arch, scan_data, bai_1d, bai_2d) share it.
+            with _catch_h5(sphere.data_file, 'a') as h5f:
+                sphere.add_arch(
+                    arch=arch, calculate=False, update=True,
+                    get_sd=True, set_mg=False, static=True, gi=self.gi,
+                    th_mtr=self.th_mtr, series_average=self.series_average,
+                    h5file=h5f,
+                )
+        _t_h5_total = time.time() - _t4
+        _t_h5_wait  = _t4_locked - _t4
+        _t_h5_write = _t_h5_total - _t_h5_wait
 
         _t5 = time.time()
         self.save_1d(sphere, arch, img_number)
         _t_csv = time.time() - _t5
 
-        _t_total = _t_arch + _t_1d + _t_2d + _t_h5 + _t_csv
+        _t_total = _t_arch + _t_1d + _t_2d + _t_h5_total + _t_csv
         print(
             f'[TIMING] image_{img_number:04d}: '
             f'arch_init={_t_arch:.2f}s int_1d={_t_1d:.2f}s int_2d={_t_2d:.2f}s '
-            f'h5_write={_t_h5:.2f}s csv={_t_csv:.2f}s total={_t_total:.2f}s'
+            f'h5_lock_wait={_t_h5_wait:.2f}s h5_write={_t_h5_write:.2f}s '
+            f'csv={_t_csv:.2f}s total={_t_total:.2f}s'
         )
         _ext = Path(img_file).suffix.lower()
         if _ext in ('.h5', '.hdf5', '.nxs'):
@@ -1520,6 +1569,11 @@ class specThread(wranglerThread):
             return None
 
         self.mask = np.flatnonzero(self.mask)
+
+    def threshold(self, img_data):
+        """Return flat indices of pixels outside [threshold_min, threshold_max]."""
+        mask = (img_data < self.threshold_min) | (img_data > self.threshold_max)
+        return np.flatnonzero(mask)
 
     def get_background(self, img_file, img_number, img_meta):
         """Subtract background image if bg_file or bg_dir specified
