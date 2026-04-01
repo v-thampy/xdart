@@ -23,51 +23,22 @@ from pyqtgraph.parametertree.Parameter import Parameter
 # This module imports
 
 
-def return_no_zero(x, y):
-    """Returns only values greater than 0 for plotting.
-    
-    args:
-        x, y: arrays, x and y data
-    
-    returns:
-        x[y > 0], y[y > 0]
-    """
-    return x[y > 0], y[y > 0]
-
-
 def get_rect(x, y):
     """Gets a QRectF object from given x and y data.
-    
+
     args:
         x, y: arrays, x and y data
-    
+
     returns:
-        QRectF object
+        QRectF object, or a unit rect if x or y is empty
     """
+    if len(x) == 0 or len(y) == 0:
+        return Qt.QtCore.QRectF(0, 0, 1, 1)
     left = x[0]
     top = y[0]
     width = max(x) - min(x)
     height = max(y) - min(y)
     return Qt.QtCore.QRectF(left, top, width, height)
-
-
-def to_rgba(arr, cmap, alpha=1):
-    """Converts array to rgba image.
-    
-    args:
-        arr: numpy array, 2D array to convert
-        cmap: colormap to use
-        alpha: scalar or array of same shape as arr, alpha values
-    
-    returns:
-        img: numpy array, 3D rgba array
-    """
-    img = cmap(
-        (arr - arr.min()) / (arr.max() - arr.min())
-    )
-    img[:, :, 3] = alpha
-
-    return img
 
 
 class RectViewBox(pg.ViewBox):
@@ -92,7 +63,7 @@ class RectViewBox(pg.ViewBox):
         dif = dif * -1
 
         ## Ignore axes if mouse is disabled
-        mouseEnabled = np.array(self.state['mouseEnabled'], dtype=np.float)
+        mouseEnabled = np.array(self.state['mouseEnabled'], dtype=float)
         mask = mouseEnabled.copy()
         if axis is not None:
             mask[1-axis] = 0.0
@@ -157,14 +128,17 @@ class NamedActionParameterItem(ParameterItem):
     """
     def __init__(self, param, depth):
         ParameterItem.__init__(self, param, depth)
-        self.layoutWidget = QtGui.QWidget()
-        self.layout = QtGui.QHBoxLayout()
+        # self.layoutWidget = QtGui.QWidget()
+        self.layoutWidget = QtWidgets.QWidget()
+        # self.layout = QtGui.QHBoxLayout()
+        self.layout = QtWidgets.QHBoxLayout()
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layoutWidget.setLayout(self.layout)
         title = param.opts.get('title', None)
         if title is None:
             title = param.name()
-        self.button = QtGui.QPushButton(title)
+        # self.button = QtGui.QPushButton(title)
+        self.button = QtWidgets.QPushButton(title)
         #self.layout.addSpacing(100)
         self.layout.addWidget(self.button)
         self.layout.addStretch()
@@ -178,7 +152,7 @@ class NamedActionParameterItem(ParameterItem):
         if tree is None:
             return
         
-        tree.setFirstItemColumnSpanned(self, True)
+        self.setFirstColumnSpanned(True)
         tree.setItemWidget(self, 0, self.layoutWidget)
         
     def paramRenamed(self, param, name):

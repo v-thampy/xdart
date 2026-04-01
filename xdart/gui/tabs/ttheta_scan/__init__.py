@@ -1,1 +1,0 @@
-from .ttheta_widget import tthetaWidget

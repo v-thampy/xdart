@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-@author: walroth
+@author: walroth, vthampy
 """
 __version__ = '0.4.2'
 # Top level script for running gui based program
@@ -10,9 +10,31 @@ import sys
 import gc
 import os
 import signal
+import faulthandler
+faulthandler.enable()  # Print Python traceback on bus error / segfault
+
+# Set PySide6 as the Qt binding for pyqtgraph before any Qt imports.
+# Also export MPLBACKEND so child processes (e.g. pyFAI-calib2) inherit it.
+os.environ['PYQTGRAPH_QT_LIB'] = 'PySide6'
+os.environ['MPLBACKEND'] = 'QtAgg'
+
+# Set matplotlib backend before any matplotlib import can occur.
+# Use QtAgg (the Qt6 backend) to match pyqtgraph's choice.
+import matplotlib
+matplotlib.use('QtAgg')
+
+# Suppress pyFAI INFO logs (e.g. "No sensor configuration provided").
+import logging
+logging.getLogger('pyFAI').setLevel(logging.WARNING)
+logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
 
 # Qt imports
-from pyqtgraph.Qt import QtGui, QtWidgets
+from typing import TYPE_CHECKING, Any
+if TYPE_CHECKING:
+    QtGui: Any = None
+    QtWidgets: Any = None
+else:
+    from pyqtgraph.Qt import QtGui, QtWidgets
 
 # This module imports
 from xdart.gui.mainWindow import Ui_MainWindow
@@ -77,6 +99,7 @@ class Main(QMainWindow):
         self.tabwidget.tabCloseRequested.connect(self.closeExperiment)
         self.setCentralWidget(self.tabwidget)
         self.set_tabs()
+        self.open_static_scan()
         #
         self.show()
         self.resize(1600, 920)
@@ -105,14 +128,13 @@ class Main(QMainWindow):
             self.ui.menuExperiments.addAction(e)
         self.ui.menuExperiments.triggered.connect(self.openExperiment)
 
+    def open_static_scan(self):
+        if 'static_scan' not in self.tabs:
+            self.tabs['static_scan'] = tabs.static_scan.staticWidget(local_path=self.tab_paths['static_scan'])
+            self.tabwidget.addTab(self.tabs['static_scan'], 'static_scan')
+
     def openExperiment(self, q):
-        if q.text() == 'ttheta_scan':
-            if 'ttheta_scan' not in self.tabs:
-                if self.width() < 1300:
-                    self.resize(1300, self.height())
-                self.tabs['ttheta_scan'] = tabs.ttheta_scan.tthetaWidget(local_path=self.tab_paths['ttheta_scan'])
-                self.tabwidget.addTab(self.tabs['ttheta_scan'], 'ttheta_scan')
-        elif q.text() == 'static_scan':
+        if q.text() == 'static_scan':
             if 'static_scan' not in self.tabs:
                 self.tabs['static_scan'] = tabs.static_scan.staticWidget(local_path=self.tab_paths['static_scan'])
                 self.tabwidget.addTab(self.tabs['static_scan'], 'static_scan')
@@ -128,13 +150,13 @@ class Main(QMainWindow):
 
 def main():
     # multiprocessing.freeze_support()
-    os.environ['PYQTGRAPH_QT_LIB'] = 'PyQt5'
     tab_paths = setup_data_folders(tabs.exp_list)
-    app = QtGui.QApplication(sys.argv)
+    # app = QtGui.QApplication(sys.argv)
+    app = QtWidgets.QApplication(sys.argv)
     # app.setStyleSheet(qdarkstyle.load_stylesheet_pyqt5())
     mw = Main(tab_paths)
     mw.show()
-    app.exec_()
+    app.exec()
 
     # try:
     #     os.killpg(os.getpid(), signal.SIGTERM)

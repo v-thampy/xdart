@@ -1,61 +1,86 @@
 # -*- coding: utf-8 -*-
 
-# Form implementation generated from reading ui file 'c:\Users\walroth\Documents\repos\xdart\xdart\experiments\static_scan\gui\wranglers\liveSpecUI.ui'
-#
-# Created by: PyQt5 UI code generator 5.9.2
-#
-# WARNING! All changes made in this file will be lost!
+################################################################################
+## Form generated from reading UI file 'liveSpecUI.ui'
+##
+## Created by: Qt User Interface Compiler version 6.10.2
+##
+## WARNING! All changes made in this file will be lost when recompiling UI file!
+################################################################################
 
-from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import (QCoreApplication, QDate, QDateTime, QLocale,
+    QMetaObject, QObject, QPoint, QRect,
+    QSize, QTime, QUrl, Qt)
+from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
+    QFont, QFontDatabase, QGradient, QIcon,
+    QImage, QKeySequence, QLinearGradient, QPainter,
+    QPalette, QPixmap, QRadialGradient, QTransform)
+from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
+    QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
 class Ui_Form(object):
     def setupUi(self, Form):
-        Form.setObjectName("Form")
-        Form.resize(400, 300)
-        self.verticalLayout = QtWidgets.QVBoxLayout(Form)
-        self.verticalLayout.setContentsMargins(0, 0, 0, 0)
+        if not Form.objectName():
+            Form.setObjectName(u"Form")
+        Form.resize(1440, 842)
+        self.verticalLayout = QVBoxLayout(Form)
         self.verticalLayout.setSpacing(0)
-        self.verticalLayout.setObjectName("verticalLayout")
-        self.paramFrame = QtWidgets.QFrame(Form)
-        self.paramFrame.setFrameShape(QtWidgets.QFrame.StyledPanel)
-        self.paramFrame.setFrameShadow(QtWidgets.QFrame.Raised)
-        self.paramFrame.setObjectName("paramFrame")
+        self.verticalLayout.setObjectName(u"verticalLayout")
+        self.verticalLayout.setContentsMargins(0, 0, 0, 0)
+        self.paramFrame = QFrame(Form)
+        self.paramFrame.setObjectName(u"paramFrame")
+        self.paramFrame.setFrameShape(QFrame.StyledPanel)
+        self.paramFrame.setFrameShadow(QFrame.Raised)
+
         self.verticalLayout.addWidget(self.paramFrame)
-        self.specLabel = QtWidgets.QLabel(Form)
-        self.specLabel.setMaximumSize(QtCore.QSize(16777215, 40))
-        self.specLabel.setText("")
-        self.specLabel.setObjectName("specLabel")
+
+        self.specLabel = QLabel(Form)
+        self.specLabel.setObjectName(u"specLabel")
+        self.specLabel.setMaximumSize(QSize(16777215, 40))
+
         self.verticalLayout.addWidget(self.specLabel)
-        self.commandFrame = QtWidgets.QFrame(Form)
-        self.commandFrame.setMaximumSize(QtCore.QSize(16777215, 40))
-        self.commandFrame.setFrameShape(QtWidgets.QFrame.StyledPanel)
-        self.commandFrame.setFrameShadow(QtWidgets.QFrame.Raised)
-        self.commandFrame.setObjectName("commandFrame")
-        self.commandLayout = QtWidgets.QHBoxLayout(self.commandFrame)
-        self.commandLayout.setObjectName("commandLayout")
+
+        self.commandFrame = QFrame(Form)
+        self.commandFrame.setObjectName(u"commandFrame")
+        self.commandFrame.setMaximumSize(QSize(16777215, 40))
+        self.commandFrame.setFrameShape(QFrame.StyledPanel)
+        self.commandFrame.setFrameShadow(QFrame.Raised)
+        self.commandLayout = QHBoxLayout(self.commandFrame)
+        self.commandLayout.setObjectName(u"commandLayout")
+
         self.verticalLayout.addWidget(self.commandFrame)
-        self.frame = QtWidgets.QFrame(Form)
-        self.frame.setMaximumSize(QtCore.QSize(16777215, 40))
-        self.frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
-        self.frame.setFrameShadow(QtWidgets.QFrame.Raised)
-        self.frame.setObjectName("frame")
-        self.horizontalLayout = QtWidgets.QHBoxLayout(self.frame)
+
+        self.frame = QFrame(Form)
+        self.frame.setObjectName(u"frame")
+        self.frame.setMaximumSize(QSize(16777215, 40))
+        self.frame.setFrameShape(QFrame.StyledPanel)
+        self.frame.setFrameShadow(QFrame.Raised)
+        self.horizontalLayout = QHBoxLayout(self.frame)
+        self.horizontalLayout.setObjectName(u"horizontalLayout")
         self.horizontalLayout.setContentsMargins(0, 0, 0, 0)
-        self.horizontalLayout.setObjectName("horizontalLayout")
-        self.startButton = QtWidgets.QPushButton(self.frame)
-        self.startButton.setObjectName("startButton")
+        self.startButton = QPushButton(self.frame)
+        self.startButton.setObjectName(u"startButton")
+
         self.horizontalLayout.addWidget(self.startButton)
-        self.stopButton = QtWidgets.QPushButton(self.frame)
-        self.stopButton.setObjectName("stopButton")
+
+        self.stopButton = QPushButton(self.frame)
+        self.stopButton.setObjectName(u"stopButton")
+
         self.horizontalLayout.addWidget(self.stopButton)
+
+
         self.verticalLayout.addWidget(self.frame)
 
+
         self.retranslateUi(Form)
-        QtCore.QMetaObject.connectSlotsByName(Form)
+
+        QMetaObject.connectSlotsByName(Form)
+    # setupUi
 
     def retranslateUi(self, Form):
-        _translate = QtCore.QCoreApplication.translate
-        Form.setWindowTitle(_translate("Form", "Form"))
-        self.startButton.setText(_translate("Form", "Start"))
-        self.stopButton.setText(_translate("Form", "Stop"))
+        Form.setWindowTitle(QCoreApplication.translate("Form", u"Form", None))
+        self.specLabel.setText("")
+        self.startButton.setText(QCoreApplication.translate("Form", u"Start", None))
+        self.stopButton.setText(QCoreApplication.translate("Form", u"Stop", None))
+    # retranslateUi
 

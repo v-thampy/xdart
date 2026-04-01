@@ -1,3 +1,3 @@
-exp_list = ['ttheta_scan', 'static_scan']
+exp_list = ['static_scan']
 
-from . import ttheta_scan, static_scan
+from . import static_scan

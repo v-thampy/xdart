@@ -1,0 +1,1113 @@
+# -*- coding: utf-8 -*-
+"""
+specThread — worker thread for spec_wrangler.
+
+Handles all image processing, integration, background subtraction,
+and file I/O in a separate QThread.
+
+@author: thampy, walroth
+"""
+
+# Standard library imports
+import os
+import re
+import time
+import glob
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from collections import deque
+
+# pyFAI / fabio / h5py
+import fabio
+import h5py
+
+# Qt imports
+from pyqtgraph import Qt
+
+# Project imports
+from xdart.modules.ewald import EwaldArch, EwaldSphere
+from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
+from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
+from ssrl_xrd_tools.io.image import read_image, count_frames
+from ssrl_xrd_tools.io.export import write_xye
+from ssrl_xrd_tools.io.nexus import find_nexus_image_dataset
+from ssrl_xrd_tools.io.metadata import read_image_metadata
+from xdart.utils import get_series_avg, catch_h5py_file as _catch_h5
+from xdart.utils.h5pool import get_pool as _get_h5pool
+from .wrangler_widget import wranglerThread
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def _is_eiger_master(path):
+    """Return True if path looks like an Eiger HDF5 master file (*_master.h5 / *_master.hdf5)."""
+    return Path(path).stem.endswith('_master')
+
+
+def _get_scan_info(fname):
+    """Return (scan_name, img_number) for a file path.
+
+    Strips trailing _<digits> suffix from the stem to get scan_name.
+    Falls back to (stem, None) when no numeric suffix is found.
+    """
+    stem = Path(fname).stem
+    try:
+        img_number = int(stem[stem.rindex('_') + 1:])
+        scan_name = stem[:stem.rindex('_')]
+    except ValueError:
+        scan_name = stem
+        img_number = None
+    return scan_name, img_number
+
+
+# ---------------------------------------------------------------------------
+# Natural sort helpers
+# ---------------------------------------------------------------------------
+
+def atoi(text):
+    return int(text) if text.isdigit() else text
+
+
+def natural_keys_int(text):
+    """
+    alist.sort(key=natural_keys) sorts in human order
+    http://nedbatchelder.com/blog/200712/human_sorting.html
+    """
+    return [atoi(c) for c in re.split(r'(\d+)', text)]
+
+
+def atof(text):
+    try:
+        retval = float(text)
+    except ValueError:
+        retval = text
+    return retval
+
+
+def natural_keys_float(text):
+    """
+    alist.sort(key=natural_keys) sorts in human order
+    float regex comes from https://stackoverflow.com/a/12643073/190597
+    """
+    return [atof(c) for c in re.split(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)', text)]
+
+
+def natural_sort_ints(list_to_sort):
+    return sorted(list_to_sort, key=natural_keys_int)
+
+
+def natural_sort_float(list_to_sort):
+    return sorted(list_to_sort, key=natural_keys_float)
+
+
+# ---------------------------------------------------------------------------
+# specThread
+# ---------------------------------------------------------------------------
+
+class specThread(wranglerThread):
+    """Thread for controlling image processing.  Receives and manages a
+    command and signal queue to pass commands from the main thread and
+    communicate back relevant signals.
+
+    attributes:
+        command_q: mp.Queue, queue to send commands to process
+        file_lock: mp.Condition, process safe lock for file access
+        scan_name: str, name of current scan
+        fname: str, full path to data file.
+        h5_dir: str, data file directory.
+        img_file: str, path to image file
+        img_dir: str, path to image directory
+        img_ext : str, extension of image file
+        series_average : bool, flag to average over series
+        meta_ext : str, extension of metadata file
+        poni_dict: str, Poni File name
+        detector: str, Detector name
+        input_q: mp.Queue, queue for commands sent from parent
+        signal_q: mp.Queue, queue for commands sent from process
+        sphere_args: dict, used as **kwargs in sphere initialization.
+            see EwaldSphere.
+        timeout: float or int, how long to continue checking for new
+            data.
+        command: command passed to stop, pause, continue etc.
+        data_1d/2d: Dictionaries to store processed data for plotting
+
+    signals:
+        showLabel: str, sends out text to be used in specLabel
+
+    methods:
+        run: Main method, called by start
+    """
+    showLabel = Qt.QtCore.Signal(str)
+
+    def __init__(
+            self,
+            command_queue,
+            sphere_args,
+            file_lock,
+            fname,
+            h5_dir,
+            scan_name,
+            single_img,
+            poni,
+            inp_type,
+            img_file,
+            img_dir,
+            include_subdir,
+            img_ext,
+            series_average,
+            meta_ext,
+            file_filter,
+            mask_file,
+            write_mode,
+            bg_type,
+            bg_file,
+            bg_dir,
+            bg_matching_par,
+            bg_match_fname,
+            bg_file_filter,
+            bg_scale,
+            bg_norm_channel,
+            gi,
+            th_mtr,
+            sample_orientation,
+            tilt_angle,
+            gi_mode_1d,
+            gi_mode_2d,
+            command,
+            sphere,
+            data_1d,
+            data_2d,
+            live_mode=False,
+            max_cores=1,
+            parent=None):
+
+        super().__init__(command_queue, sphere_args, fname, file_lock, parent)
+
+        self.h5_dir = h5_dir
+        self.scan_name = scan_name
+        self.single_img = single_img
+        self.poni = poni
+        self.inp_type = inp_type
+        self.img_file = img_file
+        self.img_dir = img_dir
+        self.include_subdir = include_subdir
+        self.img_ext = img_ext
+        self.series_average = series_average
+        self.meta_ext = meta_ext
+        self.file_filter = file_filter
+        self.mask_file = mask_file
+        self.write_mode = write_mode
+        self.bg_type = bg_type
+        self.bg_file = bg_file
+        self.bg_dir = bg_dir
+        self.bg_matching_par = bg_matching_par
+        self.bg_match_fname = bg_match_fname
+        self.bg_file_filter = bg_file_filter
+        self.bg_scale = bg_scale
+        self.bg_norm_channel = bg_norm_channel
+        self.gi = gi
+        self.th_mtr = th_mtr
+        self.sample_orientation = sample_orientation
+        self.tilt_angle = tilt_angle
+        self.gi_mode_1d = gi_mode_1d
+        self.gi_mode_2d = gi_mode_2d
+        self.live_mode = live_mode
+        self.batch_mode = False
+        self.xye_only = False
+        self.max_cores = max_cores
+        self.command = command
+        self.sphere = sphere
+        self.data_1d = data_1d
+        self.data_2d = data_2d
+
+        self.apply_threshold = False
+        self.threshold_min = 0
+        self.threshold_max = 0
+
+        self.user = None
+        self.mask = None
+        self.detector = None
+        self.img_fnames = []
+        self.processed = []
+        self.processed_scans = []
+        self.sub_label = ''
+        # Eiger HDF5 lazy frame state
+        self._eiger_master_path = None
+        self._eiger_frame_idx = 0
+        self._eiger_nframes = 0
+        self._eiger_master_queue = deque()
+        self._eiger_done_masters = set()
+        self._eiger_h5_handle = None     # persistent h5py.File for Eiger reads
+        self._eiger_h5_dataset = None    # dataset reference inside the open file
+        self._eiger_fabio_handle = None  # persistent fabio.EigerImage fallback
+
+    # ── Main entry point ─────────────────────────────────────────────────
+
+    def run(self):
+        """Initializes specProcess and watches for new commands from
+        parent or signals from the process.
+        """
+        t0 = time.time()
+        if self.poni is None or (self.img_file == ''):
+            return
+
+        self.img_fnames.clear()
+        self.processed.clear()
+        self.processed_scans.clear()
+        self._eiger_master_path = None
+        self._eiger_frame_idx = 0
+        self._eiger_nframes = 0
+        self._eiger_master_queue.clear()
+        self._eiger_done_masters.clear()
+        self.detector = get_detector(self.poni.detector) if self.poni.detector else None
+        self.sub_label = ''
+        det_mask = self.detector.mask if self.detector is not None else None  # pyFAI .mask property
+        if self.mask_file and os.path.exists(self.mask_file):
+            try:
+                custom_mask = np.asarray(read_image(self.mask_file), dtype=bool)
+                if det_mask is not None and custom_mask.shape != det_mask.shape:
+                    print(f'WARNING: mask file shape {custom_mask.shape} does not match '
+                          f'detector mask shape {det_mask.shape} — ignoring custom mask')
+                else:
+                    det_mask = det_mask | custom_mask if det_mask is not None else custom_mask
+            except Exception as e:
+                print(f'WARNING: could not load mask file {self.mask_file}: {e}')
+        self.mask = np.flatnonzero(det_mask) if det_mask is not None else None
+        self._cached_gi_incident_angle = None
+
+        # Sync GI mode selections from spec_wrangler into sphere.bai_*_args
+        if self.gi:
+            self.sphere.bai_1d_args['gi_mode_1d'] = self.gi_mode_1d
+            self.sphere.bai_2d_args['gi_mode_2d'] = self.gi_mode_2d
+
+        try:
+            self.process_scan()
+        finally:
+            self._eiger_close_master()  # ensure Eiger handle is released
+        print(f'Total Time: {time.time() - t0:0.2f}')
+
+    def process_scan(self):
+        """Batch-integrate all existing images, then optionally watch for new ones (live mode).
+
+        Phase 1 — Collect: drain the current directory glob into a pending list.
+        Phase 2 — Process: sequential with cached AzimuthalIntegrator (~0.35 s/frame).
+        Phase 3 — Watch (live mode only): poll every 2 s for new files; process each immediately.
+        """
+        sphere = None
+        files_processed = 0
+        _cached_poni = None
+        is_eiger = _is_eiger_master(self.img_file) if self.img_file else False
+
+        # ── Phase 1 & 2: collect then process all existing images ─────────────
+        pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]
+
+        while True:
+            if self.command == 'stop':
+                break
+            if self.command == 'pause':
+                self.showLabel.emit('Paused')
+                time.sleep(0.5)
+                continue
+
+            img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
+            if img_data is None:
+                break  # initial glob exhausted — move on to processing
+            if img_file is not None:
+                fname = os.path.splitext(os.path.basename(img_file))[0]
+                self.showLabel.emit(f'Collecting {fname[-30:]}')
+            else:
+                print(f'Invalid image file, skipping')
+                continue
+
+            img_number = 1 if img_number is None else img_number
+            self.scan_name = scan_name
+
+            # Flush and switch sphere when scan name changes
+            if (sphere is None) or (scan_name != sphere.name):
+                if pending:
+                    files_processed += self._dispatch_batch(sphere, pending)
+                    pending = []
+                sphere = self.initialize_sphere()
+                _cached_poni = None
+
+            # Rebuild cached AzimuthalIntegrator when poni identity changes
+            if self.poni is not _cached_poni:
+                sphere._cached_integrator = poni_to_integrator(self.poni)
+                sphere._cached_fiber_integrator = None
+                _cached_poni = self.poni
+                self._cached_gi_incident_angle = None
+
+            if img_number in list(sphere.arches.index):
+                if self.single_img and not is_eiger:
+                    self.sigUpdate.emit(img_number)
+                    break
+                continue
+
+            bg_raw = self.get_background(img_file, img_number, img_meta)
+            pending.append((img_file, img_number, img_data, img_meta, bg_raw))
+
+            if self.single_img and not is_eiger:
+                break
+
+        # Process whatever is left
+        if pending and sphere is not None and self.command != 'stop':
+            files_processed += self._dispatch_batch(sphere, pending)
+
+        # ── Phase 3: live watching ────────────────────────────────────────────
+        if self.live_mode and self.command != 'stop' and sphere is not None:
+            self.showLabel.emit('Watching for new files...')
+            while self.command != 'stop':
+                if self.command == 'pause':
+                    self.showLabel.emit('Paused')
+                    time.sleep(0.5)
+                    continue
+
+                img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
+                if img_data is None:
+                    # Nothing new yet — show watching status and sleep
+                    self.showLabel.emit('Watching for new files...')
+                    time.sleep(2.0)
+                    continue
+
+                img_number = 1 if img_number is None else img_number
+                self.scan_name = scan_name
+
+                if (sphere is None) or (scan_name != sphere.name):
+                    sphere = self.initialize_sphere()
+                    _cached_poni = None
+
+                if self.poni is not _cached_poni:
+                    sphere._cached_integrator = poni_to_integrator(self.poni)
+                    sphere._cached_fiber_integrator = None
+                    _cached_poni = self.poni
+                    self._cached_gi_incident_angle = None
+
+                if img_number in list(sphere.arches.index):
+                    continue
+
+                bg_raw = self.get_background(img_file, img_number, img_meta)
+                # Process immediately — single-threaded for low latency
+                self._process_one(sphere, img_file, img_number, img_data, img_meta, bg_raw)
+                files_processed += 1
+
+        # In batch mode, emit a single final signal so the GUI can refresh
+        if self.batch_mode and files_processed > 0:
+            self.sigUpdate.emit(-1)
+        print(f'\nTotal Files Processed: {files_processed}')
+
+    # ── Batch dispatch ────────────────────────────────────────────────────────
+
+    def _dispatch_batch(self, sphere, pending):
+        """Process a list of pending images — parallel in batch mode, serial otherwise."""
+        if self.batch_mode and len(pending) > 1:
+            return self._dispatch_batch_parallel(sphere, pending)
+        return self._dispatch_batch_serial(sphere, pending)
+
+    def _dispatch_batch_serial(self, sphere, pending):
+        """Sequential fallback (live mode or single-image batches)."""
+        count = 0
+        for item in pending:
+            if self.command == 'stop':
+                break
+            self._process_one(sphere, *item)
+            count += 1
+        # Flush overall_raw once per batch (excluded from per-frame save_to_h5).
+        if count > 0 and not self.xye_only:
+            _get_h5pool().pause(sphere.data_file)
+            try:
+                with self.file_lock:
+                    with _catch_h5(sphere.data_file, 'a') as h5f:
+                        sphere._save_to_h5(h5f, data_only=False)
+            finally:
+                _get_h5pool().resume(sphere.data_file)
+        return count
+
+    def _dispatch_batch_parallel(self, sphere, pending):
+        """Parallel batch processing using ThreadPoolExecutor.
+
+        Phase 1 — Parallel integration:
+            Each worker creates an EwaldArch, runs integrate_1d / integrate_2d,
+            and writes xye/csv.  pyFAI's Cython integration releases the GIL,
+            so threads get true parallelism for the CPU-heavy part.
+
+        Phase 2 — Serial HDF5 write:
+            All completed arches are written to HDF5 under a single file_lock
+            acquisition.  Skipped entirely in xye_only mode.
+        """
+        n_workers = min(self.max_cores, len(pending))
+        integrator = sphere._cached_integrator
+        fiber_integrator = sphere._cached_fiber_integrator
+        skip_2d = sphere.skip_2d
+        bai_1d_args = dict(sphere.bai_1d_args)
+        bai_2d_args = dict(sphere.bai_2d_args)
+        mask = self.mask
+        gi = self.gi
+        th_mtr = self.th_mtr
+        sample_orientation = self.sample_orientation
+        tilt_angle = self.tilt_angle
+        series_average = self.series_average
+        apply_threshold = self.apply_threshold
+
+        def _integrate_one(img_file, img_number, img_data, img_meta, bg_raw):
+            """Pure integration + xye write — no shared mutable state."""
+            _t0 = time.time()
+            threshold_mask = None if not apply_threshold else self.threshold(img_data)
+            arch = EwaldArch(
+                img_number, img_data, poni=self.poni,
+                scan_info=img_meta, static=True, gi=gi,
+                th_mtr=th_mtr, bg_raw=bg_raw,
+                sample_orientation=sample_orientation,
+                tilt_angle=tilt_angle,
+                series_average=series_average,
+                integrator=integrator,
+                mask=threshold_mask,
+            )
+
+            # GI fiber integrator — reuse shared one (read-only)
+            _fi = fiber_integrator
+            if gi and _fi is None:
+                _incident_angle = arch._get_incident_angle()
+                _fi = create_fiber_integrator(
+                    arch._poni_from_integrator(),
+                    incident_angle=_incident_angle,
+                    tilt_angle=arch.tilt_angle,
+                    sample_orientation=sample_orientation,
+                    angle_unit="deg",
+                )
+
+            arch.integrate_1d(
+                global_mask=mask,
+                fiber_integrator=_fi,
+                **bai_1d_args,
+            )
+            if not skip_2d:
+                arch.integrate_2d(
+                    global_mask=mask,
+                    fiber_integrator=_fi,
+                    **bai_2d_args,
+                )
+
+            # XYE / CSV output (thread-safe: unique filenames per frame)
+            self.save_1d(sphere, arch, img_number)
+
+            _elapsed = time.time() - _t0
+            fname = os.path.splitext(os.path.basename(img_file))[0]
+            print(f'[PARALLEL] image_{img_number:04d} ({fname[-30:]}): {_elapsed:.2f}s')
+            return arch
+
+        # ── Phase 1: parallel integration ────────────────────────────────────
+        arches = []
+        self.showLabel.emit(f'Integrating {len(pending)} images ({n_workers} workers)...')
+        _t_phase1 = time.time()
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {}
+            for item in pending:
+                if self.command == 'stop':
+                    break
+                fut = pool.submit(_integrate_one, *item)
+                futures[fut] = item[1]  # img_number
+
+            for fut in as_completed(futures):
+                if self.command == 'stop':
+                    break
+                try:
+                    arch = fut.result()
+                    arches.append((futures[fut], arch))
+                except Exception as e:
+                    print(f'WARNING: integration failed for image {futures[fut]}: {e}')
+        _t_phase1 = time.time() - _t_phase1
+        print(f'[BATCH] Phase 1 (parallel integration): {len(arches)} frames in {_t_phase1:.2f}s')
+
+        if not arches:
+            return 0
+
+        # Sort arches by img_number for consistent HDF5 ordering
+        arches.sort(key=lambda x: x[0])
+
+        # ── Phase 2: serial HDF5 batch write ─────────────────────────────────
+        if not self.xye_only:
+            self.showLabel.emit(f'Writing {len(arches)} frames to HDF5...')
+            _t_phase2 = time.time()
+            # Build img_number → img_file lookup for NeXus provenance
+            _img_files = {item[1]: item[0] for item in pending}
+            _get_h5pool().pause(sphere.data_file)
+            try:
+                with self.file_lock:
+                    with _catch_h5(sphere.data_file, 'a') as h5f:
+                        for img_number, arch in arches:
+                            img_file = _img_files.get(img_number, '')
+                            if img_file:
+                                try:
+                                    arch.source_file = os.path.relpath(
+                                        img_file, os.path.dirname(sphere.data_file))
+                                except ValueError:
+                                    arch.source_file = str(img_file)
+                            else:
+                                arch.source_file = ""
+                            arch.skip_map_raw = skip_2d or _is_eiger_master(img_file)
+
+                            sphere.add_arch(
+                                arch=arch, calculate=False, update=True,
+                                get_sd=True, set_mg=False, static=True, gi=gi,
+                                th_mtr=th_mtr, series_average=series_average,
+                                h5file=h5f,
+                            )
+                    # Flush overall_raw / metadata (we already hold file_lock)
+                    with _catch_h5(sphere.data_file, 'a') as h5f2:
+                        sphere._save_to_h5(h5f2, data_only=False)
+            finally:
+                _get_h5pool().resume(sphere.data_file)
+            _t_phase2 = time.time() - _t_phase2
+            print(f'[BATCH] Phase 2 (HDF5 write): {len(arches)} frames in {_t_phase2:.2f}s')
+
+        return len(arches)
+
+    def _process_one(self, sphere, img_file, img_number, img_data, img_meta, bg_raw):
+        """Integrate one image sequentially and save. Includes timing instrumentation."""
+        fname = os.path.splitext(os.path.basename(img_file))[0]
+        self.showLabel.emit(f'Processing {fname[-30:]}')
+
+        _t1 = time.time()
+        threshold_mask = None if not self.apply_threshold else self.threshold(img_data)
+        arch = EwaldArch(
+            img_number, img_data, poni=self.poni,
+            scan_info=img_meta, static=True, gi=self.gi,
+            th_mtr=self.th_mtr, bg_raw=bg_raw,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
+            series_average=self.series_average,
+            integrator=sphere._cached_integrator,
+            mask=threshold_mask,
+        )
+        _t_arch = time.time() - _t1
+
+        if self.gi:
+            _incident_angle = arch._get_incident_angle()
+            if (sphere._cached_fiber_integrator is None
+                    or _incident_angle != self._cached_gi_incident_angle):
+                sphere._cached_fiber_integrator = create_fiber_integrator(
+                    arch._poni_from_integrator(),
+                    incident_angle=_incident_angle,
+                    tilt_angle=arch.tilt_angle,
+                    sample_orientation=self.sample_orientation,
+                    angle_unit="deg",
+                )
+                self._cached_gi_incident_angle = _incident_angle
+
+        _t2 = time.time()
+        arch.integrate_1d(
+            global_mask=self.mask,
+            fiber_integrator=sphere._cached_fiber_integrator,
+            **sphere.bai_1d_args,
+        )
+        _t_1d = time.time() - _t2
+
+        _t3 = time.time()
+        if not sphere.skip_2d:
+            arch.integrate_2d(
+                global_mask=self.mask,
+                fiber_integrator=sphere._cached_fiber_integrator,
+                **sphere.bai_2d_args,
+            )
+        _t_2d = time.time() - _t3
+
+        # ── GUI data (skip in batch mode — no one is looking) ────────────
+        _t_h5_total = _t_h5_wait = _t_h5_write = 0.0
+        if not self.batch_mode:
+            self.data_1d[int(img_number)] = arch.copy(include_2d=False)
+            self.data_2d[int(img_number)] = {
+                'map_raw': arch.map_raw,
+                'bg_raw': arch.bg_raw,
+                'mask': arch.mask,
+                'int_2d': arch.int_2d,
+                'gi_2d': arch.gi_2d,
+                'thumbnail': None,
+            }
+
+        # ── HDF5 / NeXus output (skip in xye-only mode) ─────────────────
+        if not self.xye_only:
+            # Set source file as relative path from HDF5 dir for NeXus provenance
+            if img_file:
+                try:
+                    arch.source_file = os.path.relpath(
+                        img_file, os.path.dirname(sphere.data_file))
+                except ValueError:
+                    arch.source_file = str(img_file)
+            else:
+                arch.source_file = ""
+            # For Eiger: raw frames already live in the master file — don't double-store them.
+            arch.skip_map_raw = sphere.skip_2d or _is_eiger_master(img_file)
+            # Pause the read pool so h5viewer cannot reopen the file while we write.
+            _get_h5pool().pause(sphere.data_file)
+            _t4 = time.time()
+            try:
+                with self.file_lock:
+                    _t4_locked = time.time()
+                    with _catch_h5(sphere.data_file, 'a') as h5f:
+                        sphere.add_arch(
+                            arch=arch, calculate=False, update=True,
+                            get_sd=True, set_mg=False, static=True, gi=self.gi,
+                            th_mtr=self.th_mtr, series_average=self.series_average,
+                            h5file=h5f,
+                        )
+            finally:
+                _get_h5pool().resume(sphere.data_file)
+            _t_h5_total = time.time() - _t4
+            _t_h5_wait  = _t4_locked - _t4
+            _t_h5_write = _t_h5_total - _t_h5_wait
+
+        # ── XYE / CSV output (always) ────────────────────────────────────
+        _t5 = time.time()
+        self.save_1d(sphere, arch, img_number)
+        _t_csv = time.time() - _t5
+
+        _t_total = _t_arch + _t_1d + _t_2d + _t_h5_total + _t_csv
+        print(
+            f'[TIMING] image_{img_number:04d}: '
+            f'arch_init={_t_arch:.2f}s int_1d={_t_1d:.2f}s int_2d={_t_2d:.2f}s '
+            f'h5_lock_wait={_t_h5_wait:.2f}s h5_write={_t_h5_write:.2f}s '
+            f'csv={_t_csv:.2f}s total={_t_total:.2f}s'
+        )
+        _ext = Path(img_file).suffix.lower()
+        if _ext in ('.h5', '.hdf5', '.nxs'):
+            print(f'Processed {fname} frame {img_number} {self.sub_label}')
+        else:
+            print(f'Processed {fname} {self.sub_label}')
+        # In batch mode, suppress per-frame GUI signals — emit once at end
+        if not self.batch_mode:
+            self.sigUpdate.emit(img_number)
+
+    # ── Eiger HDF5 helpers ────────────────────────────────────────────────
+
+    def _get_nframes(self, master_path):
+        """Return frame count for a master file, 0 on failure."""
+        return count_frames(master_path)
+
+    def _eiger_open_master(self, master_path):
+        """Open (or switch to) an Eiger master HDF5 file, keeping the handle.
+
+        Strategy
+        --------
+        1. **Persistent fabio handle (primary)** — ``fabio.EigerImage`` is
+           purpose-built for Eiger master files and handles all firmware
+           variants, external-link layouts (``_data_*.h5``), and frame
+           indexing natively.  The handle is kept open across frames to
+           avoid the expensive open/close cycle.
+        2. **h5py fallback** — if fabio fails (unusual file, missing
+           codec, etc.), try opening with h5py and locating a contiguous
+           3D image dataset.
+        """
+        self._eiger_close_master()
+        try:
+            # Primary: fabio (handles all Eiger layouts)
+            self._eiger_fabio_handle = fabio.open(master_path)
+            self._eiger_nframes = self._eiger_fabio_handle.nframes
+        except Exception:
+            # Fallback: h5py for non-standard layouts
+            self._eiger_fabio_handle = None
+            try:
+                self._eiger_h5_handle = h5py.File(master_path, 'r')
+                ds_path = None
+                for candidate in ('/entry/data/data',
+                                  '/entry/instrument/detector/data'):
+                    if candidate in self._eiger_h5_handle:
+                        obj = self._eiger_h5_handle[candidate]
+                        if isinstance(obj, h5py.Dataset) and obj.ndim == 3:
+                            ds_path = candidate
+                            break
+                if ds_path:
+                    self._eiger_h5_dataset = self._eiger_h5_handle[ds_path]
+                    self._eiger_nframes = self._eiger_h5_dataset.shape[0]
+                else:
+                    print(f'Could not find image dataset in {master_path}')
+                    self._eiger_close_master()
+                    self._eiger_nframes = 0
+            except Exception as e:
+                print(f'Error opening Eiger master {master_path}: {e}')
+                self._eiger_close_master()
+                self._eiger_nframes = 0
+
+    def _eiger_close_master(self):
+        """Close persistent Eiger handles (fabio and/or h5py)."""
+        self._eiger_h5_dataset = None
+        if self._eiger_fabio_handle is not None:
+            try:
+                self._eiger_fabio_handle.close()
+            except Exception:
+                pass
+            self._eiger_fabio_handle = None
+        if self._eiger_h5_handle is not None:
+            try:
+                self._eiger_h5_handle.close()
+            except Exception:
+                pass
+            self._eiger_h5_handle = None
+
+    def _eiger_refill_master_queue(self):
+        """Glob for *_master.h5 files not yet processed (Image Directory mode)."""
+        filters = '*' + '*'.join(f for f in self.file_filter.split()) + '*'
+        filters = filters if filters != '**' else '*'
+        pattern = f'{filters}_master.h5'
+        if self.include_subdir:
+            master_files = sorted(Path(self.img_dir).rglob(pattern))
+        else:
+            master_files = sorted(Path(self.img_dir).glob(pattern))
+        queued = set(self._eiger_master_queue)
+        for mf in master_files:
+            mf_str = str(mf)
+            if mf_str not in self._eiger_done_masters and mf_str not in queued:
+                self._eiger_master_queue.append(mf_str)
+
+    def _get_next_eiger_frame(self):
+        """Return the next frame from Eiger HDF5 master file(s), one at a time.
+
+        Keeps the h5py file handle open across frames to avoid the
+        expensive open/close cycle per frame.  Tracks position with
+        (_eiger_master_path, _eiger_frame_idx, _eiger_nframes).
+        """
+        # ── Initialise on the very first call ────────────────────────────────
+        if self._eiger_master_path is None:
+            if self.inp_type == 'Image Directory':
+                self._eiger_refill_master_queue()
+                if not self._eiger_master_queue:
+                    return None, None, 1, None, {}
+                self._eiger_master_path = self._eiger_master_queue.popleft()
+            else:
+                self._eiger_master_path = self.img_file
+            self._eiger_frame_idx = 0
+            self._eiger_open_master(self._eiger_master_path)
+            if self._eiger_nframes == 0:
+                self._eiger_close_master()
+                return None, None, 1, None, {}
+
+        # ── Current master exhausted?  Try to advance ────────────────────────
+        if self._eiger_frame_idx >= self._eiger_nframes:
+            # Re-check frame count (file may still be growing in live mode)
+            if self._eiger_fabio_handle is not None:
+                # Reopen fabio handle to pick up newly written data files
+                try:
+                    self._eiger_fabio_handle.close()
+                    self._eiger_fabio_handle = fabio.open(self._eiger_master_path)
+                    self._eiger_nframes = self._eiger_fabio_handle.nframes
+                except Exception:
+                    self._eiger_nframes = self._get_nframes(self._eiger_master_path)
+            elif self._eiger_h5_dataset is not None:
+                try:
+                    self._eiger_h5_dataset.id.refresh()
+                    self._eiger_nframes = self._eiger_h5_dataset.shape[0]
+                except Exception:
+                    self._eiger_nframes = self._get_nframes(self._eiger_master_path)
+            else:
+                self._eiger_nframes = self._get_nframes(self._eiger_master_path)
+
+        if self._eiger_frame_idx >= self._eiger_nframes:
+            if self.inp_type == 'Image Directory':
+                self._eiger_done_masters.add(self._eiger_master_path)
+                self._eiger_close_master()
+                if not self._eiger_master_queue:
+                    self._eiger_refill_master_queue()
+                if not self._eiger_master_queue:
+                    return None, None, 1, None, {}
+                self._eiger_master_path = self._eiger_master_queue.popleft()
+                self._eiger_frame_idx = 0
+                self._eiger_open_master(self._eiger_master_path)
+                if self._eiger_nframes == 0:
+                    self._eiger_close_master()
+                    return None, None, 1, None, {}
+            else:
+                self._eiger_close_master()
+                return None, None, 1, None, {}
+
+        # ── Read one frame ────────────────────────────────────────────────────
+        frame_idx = self._eiger_frame_idx
+        self._eiger_frame_idx += 1
+
+        try:
+            if self._eiger_fabio_handle is not None:
+                # Primary: persistent fabio handle
+                _raw = (self._eiger_fabio_handle.data if frame_idx == 0
+                        else self._eiger_fabio_handle.get_frame(frame_idx).data)
+                img_data = np.asarray(_raw, dtype='int32')
+            elif self._eiger_h5_dataset is not None:
+                # Fallback: h5py dataset
+                img_data = np.asarray(self._eiger_h5_dataset[frame_idx], dtype='int32')
+            else:
+                # Should not happen, but safety net
+                with fabio.open(self._eiger_master_path) as _img:
+                    _raw = _img.data if frame_idx == 0 else _img.get_frame(frame_idx).data
+                img_data = np.asarray(_raw, dtype='int32')
+        except Exception as e:
+            print(f'Error reading frame {frame_idx} from {self._eiger_master_path}: {e}')
+            img_data = None
+
+        meta = read_image_metadata(self._eiger_master_path, meta_format=self.meta_ext) if self.meta_ext else {}
+
+        master_stem = Path(self._eiger_master_path).stem
+        scan_name = master_stem[:-7] if master_stem.endswith('_master') else master_stem
+        img_number = frame_idx + 1  # 1-based
+
+        return self._eiger_master_path, scan_name, img_number, img_data, meta
+
+    # ── Image iteration ──────────────────────────────────────────────────
+
+    def get_next_image(self):
+        """Gets next image in image series or in directory to process."""
+        is_master = _is_eiger_master(self.img_file) if self.img_file else False
+
+        if self.single_img and not is_master:
+            img_data = np.asarray(read_image(self.img_file), dtype=float)
+            meta = read_image_metadata(self.img_file, meta_format=self.meta_ext) if self.meta_ext else {}
+            scan_name, img_number = _get_scan_info(self.img_file)
+            return self.img_file, scan_name, img_number, img_data, meta
+
+        if is_master or self.img_ext.lower() in ('h5', 'hdf5'):
+            return self._get_next_eiger_frame()
+
+        if len(self.img_fnames) == 0:
+            if self.inp_type != 'Image Directory':
+                first_img = self.img_file
+                self.img_fnames = Path(self.img_dir).glob(f'{self.scan_name}_*.{self.img_ext}')
+            else:
+                first_img = ''
+                filters = '*' + '*'.join(f for f in self.file_filter.split()) + '*'
+                filters = filters if filters != '**' else '*'
+                if self.include_subdir:
+                    self.img_fnames = Path(self.img_dir).rglob(f'{filters}.{self.img_ext}')
+                else:
+                    self.img_fnames = Path(self.img_dir).glob(f'{filters}.{self.img_ext}')
+
+            self.img_fnames = [str(f) for f in self.img_fnames if
+                               (str(f) >= first_img) and (str(f) not in self.processed)]
+
+            self.img_fnames = deque(natural_sort_ints(self.img_fnames))
+
+        img_file, scan_name, img_number, img_data, img_meta = None, None, 1, None, {}
+        n = 0
+        while len(self.img_fnames) > 0:
+            fname = self.img_fnames[0]
+            sname, snumber = _get_scan_info(fname)
+
+            if (n > 0) and (scan_name != sname):
+                break
+
+            self.processed.append(fname)
+            self.img_fnames.popleft()
+
+            data = np.asarray(read_image(fname), dtype=float)
+            if data is None or not np.isfinite(data).any():
+                continue
+
+            meta = read_image_metadata(fname, meta_format=self.meta_ext) if self.meta_ext else {}
+            n += 1
+
+            if (not self.series_average) or (snumber is None):
+                return fname, sname, snumber, data, meta
+            else:
+                if n == 1:
+                    img_data = data
+                    img_meta = meta
+                else:
+                    img_data += data
+                    for (k, v) in meta.items():
+                        try:
+                            img_meta[k] = float(img_meta[k]) + float(meta[k])
+                        except TypeError:
+                            pass
+
+                scan_name, img_file = sname, fname
+
+        if n > 1:
+            img_data /= n
+            for (k, v) in img_meta.items():
+                try:
+                    img_meta[k] /= n
+                except TypeError:
+                    pass
+
+        return img_file, scan_name, img_number, img_data, img_meta
+
+    # ── Metadata / Background ────────────────────────────────────────────
+
+    def get_meta_data(self, img_file):
+        return read_image_metadata(img_file, meta_format=self.meta_ext)
+
+    def subtract_bg(self, img_data, img_file, img_number, img_meta):
+        bg = self.get_background(img_file, img_number, img_meta)
+        try:
+            img_data -= bg
+        except ValueError:
+            pass
+
+    def initialize_sphere(self):
+        """If scan changes, initialize new EwaldSphere object.
+        If mode is overwrite, replace existing HDF5 file, else append to it.
+        """
+        fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
+        sphere = EwaldSphere(self.scan_name,
+                             data_file=fname,
+                             static=True,
+                             gi=self.gi,
+                             th_mtr=self.th_mtr,
+                             series_average=self.series_average,
+                             single_img=self.single_img,
+                             global_mask=self.mask,
+                             **self.sphere_args)
+        sphere.skip_2d = self.sphere.skip_2d
+
+        write_mode = self.write_mode
+        if not os.path.exists(fname):
+            write_mode = 'Overwrite'
+
+        _get_h5pool().pause(sphere.data_file)
+        try:
+            with self.file_lock:
+                if write_mode == 'Append':
+                    sphere.load_from_h5(replace=False, mode='a')
+                    sphere.skip_2d = self.sphere.skip_2d
+                    for (k, v) in self.sphere_args.items():
+                        setattr(sphere, k, v)
+                    existing_arches = sphere.arches.index
+                    if len(existing_arches) == 0:
+                        sphere.save_to_h5(replace=True)
+                else:
+                    sphere.save_to_h5(replace=True)
+        finally:
+            _get_h5pool().resume(sphere.data_file)
+
+        # Copy integration args (including GI modes) from the main sphere.
+        sphere.bai_1d_args = self.sphere.bai_1d_args.copy()
+        sphere.bai_2d_args = self.sphere.bai_2d_args.copy()
+
+        self.sigUpdateFile.emit(
+            self.scan_name, fname,
+            self.gi, self.th_mtr, self.single_img,
+            self.series_average
+        )
+        print(f'\n***** New Scan *****')
+
+        return sphere
+
+    def get_mask(self):
+        """Get mask array from mask file."""
+        self.mask = self.detector.calc_mask()
+        if self.mask_file and os.path.exists(self.mask_file):
+            if self.mask is not None:
+                try:
+                    self.mask += fabio.open(self.mask_file).data
+                except ValueError:
+                    print('Mask file not valid for Detector')
+                    pass
+            else:
+                self.mask = fabio.open(self.mask_file).data
+
+        if self.mask is None:
+            return None
+
+        if self.mask.shape != self.detector.shape:
+            print('Mask file not valid for Detector')
+            return None
+
+        self.mask = np.flatnonzero(self.mask)
+
+    def threshold(self, img_data):
+        """Return flat indices of pixels outside [threshold_min, threshold_max]."""
+        mask = (img_data < self.threshold_min) | (img_data > self.threshold_max)
+        return np.flatnonzero(mask)
+
+    def get_background(self, img_file, img_number, img_meta):
+        """Subtract background image if bg_file or bg_dir specified."""
+        if self.bg_type == 'None':
+            return 0
+
+        bg, bg_file, bg_meta, norm_factor = 0, None, None, 1
+        self.sub_label, norm_label, bg_scale_label = '', '', ''
+
+        if self.bg_type == 'Single BG File':
+            if self.bg_file:
+                bg_file = self.bg_file
+                bg_meta = read_image_metadata(bg_file, meta_format=self.meta_ext)
+        elif self.bg_type == 'Series Average':
+            if self.bg_file:
+                sname, fnames, bg, bg_meta = get_series_avg(self.bg_file, self.detector, self.meta_ext)
+                if sname is None:
+                    return 0
+        else:
+            if self.bg_dir and (self.bg_match_fname or self.bg_matching_par):
+                bg_file_filter = 'bg' if not self.bg_file_filter else self.bg_file_filter
+                if self.bg_match_fname:
+                    bg_file_filter = f'{self.scan_name} {bg_file_filter}'
+                filters = '*' + '*'.join(f for f in bg_file_filter.split()) + '*'
+                filters = filters if filters != '**' else '*'
+
+                meta_files = sorted(glob.glob(os.path.join(
+                    self.img_dir, f'{filters}.{self.meta_ext}')))
+
+                for meta_file in meta_files:
+                    bg_file = f'{os.path.splitext(meta_file)[0]}.{self.img_ext}'
+                    if bg_file == img_file:
+                        bg_file = None
+                        continue
+
+                    bg_meta = read_image_metadata(bg_file, meta_format=self.meta_ext)
+                    if self.bg_match_fname:
+                        _, meta_img_num = _get_scan_info(meta_file)
+                        if img_number == meta_img_num:
+                            break
+                    else:
+                        try:
+                            if bg_meta[self.bg_matching_par] == img_meta[self.bg_matching_par]:
+                                break
+                        except KeyError:
+                            bg_file = None
+                            continue
+
+        if self.bg_type != 'Series Average':
+            if bg_file is None:
+                return 0.
+
+            bg = np.asarray(read_image(bg_file), dtype=float)
+            if bg is None or not np.isfinite(bg).any():
+                return 0.
+
+        if self.bg_scale != 1:
+            bg *= self.bg_scale
+            bg_scale_label = f'{self.bg_scale:0.2f} [Scale] x '
+        if (self.bg_norm_channel != 'None') and (img_meta is not None) and (bg_meta is not None):
+            try:
+                if ((self.bg_norm_channel in img_meta.keys()) and
+                        (self.bg_norm_channel in bg_meta.keys()) and
+                        (bg_meta[self.bg_norm_channel] != 0)):
+                    norm_factor = (img_meta[self.bg_norm_channel] / bg_meta[self.bg_norm_channel])
+                    bg *= norm_factor
+                    norm_label = f'{norm_factor:0.2f} [Normalized to Channel - {self.bg_norm_channel}] x '
+            except (KeyError, TypeError):
+                pass
+
+        if self.bg_type != 'Series Average':
+            self.sub_label = f'[Subtracted {bg_scale_label}{norm_label}{os.path.basename(bg_file)}]'
+        else:
+            self.sub_label = f'[Subtracted {bg_scale_label}{norm_label}{sname}]'
+
+        return bg
+
+    @staticmethod
+    def save_1d(sphere, arch, idx):
+        """Automatically save 1D integrated data."""
+        path = os.path.dirname(sphere.data_file)
+        path = os.path.join(path, sphere.name)
+        Path(path).mkdir(parents=True, exist_ok=True)
+
+        if arch.int_1d is None:
+            return
+        _r1d = arch.int_1d
+        radial = _r1d.radial
+        intensity = _r1d.intensity
+
+        is_q = _r1d.unit in ('q_A^-1', 'q_nm^-1')
+        fname_prefix = 'iq' if is_q else 'itth'
+
+        fname = os.path.join(path, f'{fname_prefix}_{sphere.name}_{str(idx).zfill(4)}.xye')
+        write_xye(fname, radial, intensity, np.sqrt(abs(intensity)))

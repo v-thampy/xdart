@@ -14,6 +14,7 @@ import h5py
 
 # add xdart to path
 import sys
+from pathlib import Path
 if __name__ == "__main__":
     from config import xdart_dir
 else:
@@ -24,6 +25,10 @@ if xdart_dir not in sys.path:
 
 from xdart.modules.ewald import EwaldArch, EwaldSphere
 from xdart.utils.containers import PONI
+
+# Skip all tests if the test data directory does not exist on this machine.
+_TEST_DATA_DIR = Path(xdart_dir) / "tests" / "test_data" / "spec_pd100k"
+_SKIP_REASON = f"Test data not found: {_TEST_DATA_DIR}"
 
 def read_RAW(file, mask = True):
     #print("Reading RAW file here...")
@@ -102,7 +107,7 @@ def make_sphere(calib_path, poni_file, stepsize, user, image_path, spec_path,
     data_file_path = os.path.join(xdart_dir, "tests/test_data/spec_pd100k/test_save.h5")
     sphere = EwaldSphere(data_file=data_file_path)
     sphere.save_to_h5(replace=True)
-    poni = PONI.from_ponifile(os.path.join(calib_path, poni_file))
+    poni = PONI.from_poni_file(os.path.join(calib_path, poni_file))
     for k in range(1, len(tth)):
         start = time.time()
         filename = (image_path + user + spec_name + "_scan" + str(scan_number) +
@@ -130,6 +135,7 @@ def make_sphere(calib_path, poni_file, stepsize, user, image_path, spec_path,
     return sphere
 
 
+@unittest.skipUnless(_TEST_DATA_DIR.exists(), _SKIP_REASON)
 class TestEwaldSphere(unittest.TestCase):
     def setUp(self):
         self.sphere = make_sphere(
