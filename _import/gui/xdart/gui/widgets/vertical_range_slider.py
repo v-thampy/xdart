@@ -7,7 +7,7 @@ import sys
 # Qt imports
 import pyqtgraph as pg
 from pyqtgraph import QtGui
-from PyQt5 import QtWidgets
+from PySide6 import QtWidgets
 
 # This module imports
 
@@ -44,5 +44,5 @@ if __name__ == '__main__':
     test = Test()
     test.show()
     print("at exec")
-    app.exec_()
+    app.exec()
 

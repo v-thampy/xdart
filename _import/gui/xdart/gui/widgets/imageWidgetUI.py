@@ -1,45 +1,55 @@
 # -*- coding: utf-8 -*-
 
-# Form implementation generated from reading ui file 'imageWidgetUI.ui'
-#
-# Created by: PyQt5 UI code generator 5.12.3
-#
-# WARNING! All changes made in this file will be lost!
+################################################################################
+## Form generated from reading UI file 'imageWidgetUI.ui'
+##
+## Created by: Qt User Interface Compiler version 6.10.2
+##
+## WARNING! All changes made in this file will be lost when recompiling UI file!
+################################################################################
 
-
-from PyQt5 import QtCore, QtGui, QtWidgets
-
+from PySide6.QtCore import (QCoreApplication, QDate, QDateTime, QLocale,
+    QMetaObject, QObject, QPoint, QRect,
+    QSize, QTime, QUrl, Qt)
+from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
+    QFont, QFontDatabase, QGradient, QIcon,
+    QImage, QKeySequence, QLinearGradient, QPainter,
+    QPalette, QPixmap, QRadialGradient, QTransform)
+from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGridLayout,
+    QHBoxLayout, QSizePolicy, QToolButton, QWidget)
 
 class Ui_Form(object):
     def setupUi(self, Form):
-        Form.setObjectName("Form")
+        if not Form.objectName():
+            Form.setObjectName(u"Form")
         Form.resize(688, 480)
-        self.horizontalLayout = QtWidgets.QHBoxLayout(Form)
-        self.horizontalLayout.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout = QHBoxLayout(Form)
         self.horizontalLayout.setSpacing(0)
-        self.horizontalLayout.setObjectName("horizontalLayout")
-        self.imageFrame = QtWidgets.QFrame(Form)
-        self.imageFrame.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self.imageFrame.setFrameShadow(QtWidgets.QFrame.Plain)
+        self.horizontalLayout.setObjectName(u"horizontalLayout")
+        self.horizontalLayout.setContentsMargins(0, 0, 0, 0)
+        self.imageFrame = QFrame(Form)
+        self.imageFrame.setObjectName(u"imageFrame")
+        self.imageFrame.setFrameShape(QFrame.NoFrame)
+        self.imageFrame.setFrameShadow(QFrame.Plain)
         self.imageFrame.setLineWidth(0)
-        self.imageFrame.setObjectName("imageFrame")
+
         self.horizontalLayout.addWidget(self.imageFrame)
-        self.toolFrame = QtWidgets.QFrame(Form)
-        sizePolicy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
+
+        self.toolFrame = QFrame(Form)
+        self.toolFrame.setObjectName(u"toolFrame")
+        sizePolicy = QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
         sizePolicy.setHeightForWidth(self.toolFrame.sizePolicy().hasHeightForWidth())
         self.toolFrame.setSizePolicy(sizePolicy)
-        self.toolFrame.setMinimumSize(QtCore.QSize(120, 0))
-        self.toolFrame.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self.toolFrame.setFrameShadow(QtWidgets.QFrame.Plain)
+        self.toolFrame.setMinimumSize(QSize(120, 0))
+        self.toolFrame.setFrameShape(QFrame.NoFrame)
+        self.toolFrame.setFrameShadow(QFrame.Plain)
         self.toolFrame.setLineWidth(0)
-        self.toolFrame.setObjectName("toolFrame")
-        self.toolLayout = QtWidgets.QGridLayout(self.toolFrame)
+        self.toolLayout = QGridLayout(self.toolFrame)
+        self.toolLayout.setObjectName(u"toolLayout")
         self.toolLayout.setContentsMargins(1, 1, 1, 1)
-        self.toolLayout.setObjectName("toolLayout")
-        self.cmapBox = QtWidgets.QComboBox(self.toolFrame)
-        self.cmapBox.setObjectName("cmapBox")
+        self.cmapBox = QComboBox(self.toolFrame)
         self.cmapBox.addItem("")
         self.cmapBox.addItem("")
         self.cmapBox.addItem("")
@@ -52,41 +62,42 @@ class Ui_Form(object):
         self.cmapBox.addItem("")
         self.cmapBox.addItem("")
         self.cmapBox.addItem("")
+        self.cmapBox.setObjectName(u"cmapBox")
+
         self.toolLayout.addWidget(self.cmapBox, 0, 1, 1, 1)
-        self.logButton = QtWidgets.QToolButton(self.toolFrame)
-        self.logButton.setMinimumSize(QtCore.QSize(30, 0))
-        self.logButton.setMaximumSize(QtCore.QSize(30, 16777215))
+
+        self.logButton = QToolButton(self.toolFrame)
+        self.logButton.setObjectName(u"logButton")
+        self.logButton.setMinimumSize(QSize(30, 0))
+        self.logButton.setMaximumSize(QSize(30, 16777215))
         self.logButton.setCheckable(True)
-        self.logButton.setObjectName("logButton")
+
         self.toolLayout.addWidget(self.logButton, 0, 0, 1, 1)
+
+
         self.horizontalLayout.addWidget(self.toolFrame)
 
+
         self.retranslateUi(Form)
-        QtCore.QMetaObject.connectSlotsByName(Form)
+
+        QMetaObject.connectSlotsByName(Form)
+    # setupUi
 
     def retranslateUi(self, Form):
-        _translate = QtCore.QCoreApplication.translate
-        Form.setWindowTitle(_translate("Form", "Form"))
-        self.cmapBox.setItemText(0, _translate("Form", "grey"))
-        self.cmapBox.setItemText(1, _translate("Form", "viridis"))
-        self.cmapBox.setItemText(2, _translate("Form", "plasma"))
-        self.cmapBox.setItemText(3, _translate("Form", "inferno"))
-        self.cmapBox.setItemText(4, _translate("Form", "magma"))
-        self.cmapBox.setItemText(5, _translate("Form", "spectrum"))
-        self.cmapBox.setItemText(6, _translate("Form", "thermal"))
-        self.cmapBox.setItemText(7, _translate("Form", "flame"))
-        self.cmapBox.setItemText(8, _translate("Form", "yellowy"))
-        self.cmapBox.setItemText(9, _translate("Form", "bipolar"))
-        self.cmapBox.setItemText(10, _translate("Form", "cyclic"))
-        self.cmapBox.setItemText(11, _translate("Form", "greyclip"))
-        self.logButton.setText(_translate("Form", "Log"))
+        Form.setWindowTitle(QCoreApplication.translate("Form", u"Form", None))
+        self.cmapBox.setItemText(0, QCoreApplication.translate("Form", u"grey", None))
+        self.cmapBox.setItemText(1, QCoreApplication.translate("Form", u"viridis", None))
+        self.cmapBox.setItemText(2, QCoreApplication.translate("Form", u"plasma", None))
+        self.cmapBox.setItemText(3, QCoreApplication.translate("Form", u"inferno", None))
+        self.cmapBox.setItemText(4, QCoreApplication.translate("Form", u"magma", None))
+        self.cmapBox.setItemText(5, QCoreApplication.translate("Form", u"spectrum", None))
+        self.cmapBox.setItemText(6, QCoreApplication.translate("Form", u"thermal", None))
+        self.cmapBox.setItemText(7, QCoreApplication.translate("Form", u"flame", None))
+        self.cmapBox.setItemText(8, QCoreApplication.translate("Form", u"yellowy", None))
+        self.cmapBox.setItemText(9, QCoreApplication.translate("Form", u"bipolar", None))
+        self.cmapBox.setItemText(10, QCoreApplication.translate("Form", u"cyclic", None))
+        self.cmapBox.setItemText(11, QCoreApplication.translate("Form", u"greyclip", None))
 
+        self.logButton.setText(QCoreApplication.translate("Form", u"Log", None))
+    # retranslateUi
 
-if __name__ == "__main__":
-    import sys
-    app = QtWidgets.QApplication(sys.argv)
-    Form = QtWidgets.QWidget()
-    ui = Ui_Form()
-    ui.setupUi(Form)
-    Form.show()
-    sys.exit(app.exec_())

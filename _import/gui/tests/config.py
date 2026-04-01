@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 
-import os
+from pathlib import Path
 
-xdart_dir = 'C:/Users/walroth/Documents/repos/xdart/'
-
-if __name__ == '__main__':
-    xdart_dir_current = os.getcwd().split('xdart')[0] + 'xdart'
-    print(f"Ensure xdart_dir '{xdart_dir}' matches '{xdart_dir_current}'")
+# Resolve xdart_dir relative to this file so it works on any machine.
+xdart_dir = str(Path(__file__).resolve().parents[1])

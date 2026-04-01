@@ -25,7 +25,6 @@ from pyqtgraph.graphicsItems.GradientEditorItem import Gradients
 from pyqtgraph.graphicsItems.GraphicsObject import GraphicsObject
 from pyqtgraph import getConfigOption
 
-# from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
 
 QFileDialog = QtWidgets.QFileDialog
 
@@ -65,7 +64,8 @@ class XDImageWidget(Qt.QtWidgets.QWidget):
 
         self.ui.logButton.toggled.connect(self.update_image)
         self.ui.cmapBox.currentIndexChanged.connect(self.set_cmap)
-        self.set_cmap(0)
+        self.ui.cmapBox.setCurrentIndex(1)
+        self.set_cmap(1)
 
         self.show()
 
@@ -182,11 +182,10 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
 
             self.histogram.axis.setLogMode(False)
 
-        self.histogram.setCmap(cm)
-
-        self.histogram.setLevels(values=levels)
+        self.histogram.setColorMap(cm)
         low, high = np.min(self.displayed_image), np.max(self.displayed_image)
         self.histogram.lo_lim, self.histogram.hi_lim = low, high
+        self.histogram.setLevels(values=levels)
 
 
 class pgXDImageItem(pg.ImageItem):
@@ -231,13 +230,6 @@ def normalize(arr):
         return (arr - minval) / (maxval - minval)
     else:
         return np.ones_like(arr)
-
-
-def sliced(arr, ceiling):
-    out = np.copy(arr)
-    maxval = arr.max() * (ceiling/100)
-    out[out > maxval] = maxval
-    return out
 
 
 class pmeshImageWidget(Qt.QtWidgets.QWidget):
@@ -328,7 +320,7 @@ class pmeshImageWidget(Qt.QtWidgets.QWidget):
         # self.histogram.setCmap(cm)
 
         # self.histogram.setLevels(values=levels)
-        low, high = np.min(self.displayed_image), np.max(self.displayed_image)
+        # low, high = np.min(self.displayed_image), np.max(self.displayed_image)
         # self.histogram.lo_lim, self.histogram.hi_lim = low, high
 
 

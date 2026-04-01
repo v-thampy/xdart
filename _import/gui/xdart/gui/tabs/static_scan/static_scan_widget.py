@@ -5,7 +5,7 @@
 
 # Standard library imports
 from queue import Queue
-import multiprocessing as mp
+import threading
 import copy
 import os
 from collections import OrderedDict
@@ -14,7 +14,12 @@ import imageio
 import pyFAI
 
 # Qt imports
-from pyqtgraph.Qt import QtWidgets, QtCore
+from typing import TYPE_CHECKING, Any
+if TYPE_CHECKING:
+    QtWidgets: Any = None
+    QtCore: Any = None
+else:
+    from pyqtgraph.Qt import QtWidgets, QtCore
 
 # This module imports
 from xdart.modules.ewald import EwaldSphere, EwaldArch
@@ -23,10 +28,8 @@ from .h5viewer import H5Viewer
 from .display_frame_widget import displayFrameWidget
 from .integrator import integratorTree
 from .metadata import metadataWidget
-from .wranglers import specWrangler, wranglerWidget
+from .wranglers import specWrangler, nexusWrangler, wranglerWidget
 from xdart.utils._utils import FixSizeOrderedDict, get_fname_dir, get_img_data
-
-# from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
 
 QWidget = QtWidgets.QWidget
 QSizePolicy = QtWidgets.QSizePolicy
@@ -37,15 +40,16 @@ QInputDialog = QtWidgets.QInputDialog
 QCombo = QtWidgets.QComboBox
 
 wranglers = {
-    'SPEC': specWrangler
+    'SPEC': specWrangler,
+    'NeXus': nexusWrangler,
 }
 
 
 def spherelocked(func):
+    """Decorator that acquires sphere_lock before calling the wrapped method."""
     def wrapper(self, *args, **kwargs):
         if isinstance(self.sphere, EwaldSphere):
             with self.sphere.sphere_lock:
-                func(self, *args, **kwargs)
                 return func(self, *args, **kwargs)
 
     return wrapper
@@ -105,7 +109,7 @@ class staticWidget(QWidget):
         super().__init__(parent)
 
         # Data object initialization
-        self.file_lock = mp.Condition()
+        self.file_lock = threading.Condition()
         # if local_path is None:
         local_path = get_fname_dir()
         self.local_path = local_path
@@ -113,7 +117,7 @@ class staticWidget(QWidget):
         if not os.path.isdir(self.dirname):
             os.mkdir(self.dirname)
 
-        self.fname = os.path.join(self.dirname, 'default.hdf5')
+        self.fname = os.path.join(self.dirname, 'default.nxs')
         self.sphere = EwaldSphere('null_main',
                                   data_file=self.fname,
                                   static=True)
@@ -121,7 +125,7 @@ class staticWidget(QWidget):
         self.arch_ids = []
         self.arches = OrderedDict()
         self.data_1d = OrderedDict()
-        self.data_2d = FixSizeOrderedDict(max=10)
+        self.data_2d = FixSizeOrderedDict(max=20)
 
         self.ui = Ui_Form()
         self.ui.setupUi(self)
@@ -162,7 +166,6 @@ class staticWidget(QWidget):
             self.displayframe.save_image
         )
         self.h5viewer.actionSaveArray.triggered.connect(self.displayframe.save_1D)
-
         # IntegratorFrame setup
         self.integratorTree = integratorTree(
             self.sphere, self.arch, self.file_lock,
@@ -175,7 +178,8 @@ class staticWidget(QWidget):
         self.integratorTree.integrator_thread.started.connect(self.thread_state_changed)
         self.integratorTree.integrator_thread.update.connect(self.integrator_thread_update)
         self.integratorTree.integrator_thread.finished.connect(self.integrator_thread_finished)
-        self.integratorTree.ui.raw_to_tif.clicked.connect(self.raw_to_tiff)
+        # Raw -> Tif button removed (no longer needed)
+        self.integratorTree.ui.raw_to_tif.hide()
 
         # Metadata setup
         self.metawidget = metadataWidget(self.sphere, self.arch,
@@ -183,21 +187,20 @@ class staticWidget(QWidget):
         self.ui.metaFrame.setLayout(self.metawidget.layout)
 
         # Wrangler frame setup
-        self.wrangler = wranglerWidget("uninitialized", mp.Condition())
+        self.wrangler = wranglerWidget("uninitialized", threading.Condition())
         for name, w in wranglers.items():
             self.ui.wranglerStack.addWidget(
                 w(
-                    self.fname,
-                    self.file_lock,
+                    self.fname, self.file_lock,
+                    self.sphere, self.data_1d, self.data_2d,
                 )
             )
-            self.ui.wranglerBox.addItem(name)
         self.ui.wranglerStack.currentChanged.connect(self.set_wrangler)
         self.command_queue = Queue()
         self.set_wrangler(self.ui.wranglerStack.currentIndex())
 
-        self.integratorTree.get_args('bai_1d')
-        self.integratorTree.get_args('bai_2d')
+        # self.integratorTree.get_args('bai_1d')
+        # self.integratorTree.get_args('bai_2d')
 
         # Setup defaultWidget in h5viewer with parameters
         parameters = [self.integratorTree.parameters]
@@ -207,13 +210,20 @@ class staticWidget(QWidget):
         self.h5viewer.defaultWidget.set_parameters(parameters)
         # self.h5viewer.load_starting_defaults()
 
+        # ── Coalescing timer for wrangler updates ──────────────────────
+        # When the wrangler thread processes images faster than the GUI
+        # can render, multiple sigUpdateData signals pile up and each
+        # triggers a full display refresh.  Instead, we note the latest
+        # index and use a single-shot QTimer (200 ms) so only the most
+        # recent update is rendered.
+        self._pending_update_idx = None
+        self._update_timer = QtCore.QTimer(self)
+        self._update_timer.setSingleShot(True)
+        self._update_timer.setInterval(200)  # ms
+        self._update_timer.timeout.connect(self._flush_pending_update)
+
         self.show()
         self.ui.wranglerFrame.activateWindow()
-        """
-        self.timer = Qt.QtCore.QTimer()
-        self.timer.timeout.connect(self.clock)
-        self.timer.start()
-    """
 
     def set_wrangler(self, qint):
         """Sets the wrangler based on the selected item in the dropdown.
@@ -236,88 +246,110 @@ class staticWidget(QWidget):
         self.wrangler.sigUpdateGI.connect(self.update_scattering_geometry)
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
+        if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'processingModeCombo'):
+            def _on_mode_changed(mode_text):
+                # Skip when in viewer mode — set_viewer_display_mode controls panels
+                if 'Viewer' in mode_text:
+                    return
+                self.displayframe._apply_1d_only_visibility()
+                if '2D' in mode_text:
+                    self.displayframe.update()
+            self.wrangler.ui.processingModeCombo.currentTextChanged.connect(_on_mode_changed)
+        if hasattr(self.wrangler, 'sigViewerModeChanged'):
+            self.wrangler.sigViewerModeChanged.connect(self._on_viewer_mode_changed)
+            # Sync current viewer mode (may have been restored from session).
+            # Defer to after show() so the QSplitter layout is established
+            # before we collapse panels.
+            vm = getattr(self.wrangler, 'viewer_mode', None)
+            if vm is not None:
+                QtCore.QTimer.singleShot(0, lambda v=vm: self._on_viewer_mode_changed(v))
+        # Wire the wrangler's Advanced button to show the integratorTree's
+        # existing 1D/2D advanced parameter dialogs in a combined popup.
+        if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'advancedButton'):
+            self.wrangler.ui.advancedButton.clicked.connect(
+                self._show_integration_advanced)
         self.wrangler.setup()
         self.h5viewer.sigNewFile.connect(self.wrangler.set_fname)
-        self.h5viewer.sigNewFile.connect(self.displayframe.set_image_units)
+        self.h5viewer.sigNewFile.connect(self.displayframe.set_axes)
         self.h5viewer.sigNewFile.connect(self.h5viewer.data_reset)
         # self.h5viewer.sigNewFile.connect(self.disable_displayframe_update)
 
     def disconnect_wrangler(self):
         """Disconnects all signals attached the the current wrangler
         """
-        for signal in (self.wrangler.sigStart,
-                       self.wrangler.sigUpdateData,
-                       self.wrangler.sigUpdateFile,
-                       self.wrangler.finished,
-                       self.h5viewer.sigNewFile):
-            while True:
-                try:
+        import warnings
+        signals = [self.wrangler.sigStart,
+                   self.wrangler.sigUpdateData,
+                   self.wrangler.sigUpdateFile,
+                   self.wrangler.finished,
+                   self.h5viewer.sigNewFile]
+        if hasattr(self.wrangler, 'sigViewerModeChanged'):
+            signals.append(self.wrangler.sigViewerModeChanged)
+        # Disconnect Advanced button from integration popup
+        if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'advancedButton'):
+            try:
+                self.wrangler.ui.advancedButton.clicked.disconnect(
+                    self._show_integration_advanced)
+            except (TypeError, RuntimeError):
+                pass
+        for signal in signals:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
                     signal.disconnect()
-                except TypeError:
-                    break
+            except (TypeError, RuntimeError, SystemError):
+                pass
 
     def thread_state_changed(self):
         """Called whenever a thread is started or finished.
         """
-        # ic()
         return
-        wrangler_running = self.wrangler.thread.isRunning()
-        integrator_running = self.integratorTree.integrator_thread.isRunning()
-        loader_running = self.h5viewer.file_thread.running
-        same_name = self.sphere.name == self.wrangler.scan_name
-
-        # ic(loader_running, integrator_running, wrangler_running)
-        if loader_running:
-            # self.h5viewer.ui.listData.setEnabled(False)
-            # self.h5viewer.ui.listScans.setEnabled(False)
-            # self.h5viewer.set_open_enabled(False)
-            self.integratorTree.setEnabled(False)
-
-        elif integrator_running:
-            self.h5viewer.ui.listData.setEnabled(True)
-            self.integratorTree.setEnabled(False)
-            # self.h5viewer.ui.listScans.setEnabled(False)
-            # self.h5viewer.set_open_enabled(False)
-            # if same_name or wrangler_running:
-            #     self.wrangler.enabled(False)
-            # else:
-            #     self.wrangler.enabled(True)
-
-        elif wrangler_running:
-            # self.h5viewer.ui.listData.setEnabled(True)
-            # self.h5viewer.ui.listScans.setEnabled(True)
-            # self.h5viewer.set_open_enabled(True)
-            # self.h5viewer.paramMenu.setEnabled(False)
-            # self.wrangler.enabled(False)
-            if same_name:
-                self.integratorTree.setEnabled(False)
-            else:
-                self.integratorTree.setEnabled(True)
-
-        else:
-            # self.h5viewer.ui.listData.setEnabled(True)
-            # self.h5viewer.ui.listScans.setEnabled(True)
-            # self.h5viewer.set_open_enabled(True)
-            self.integratorTree.setEnabled(True)
-            # self.wrangler.enabled(True)
-            # if (len(self.data_2d) == 0) and (len(self.sphere.arches.index) > 0):
-            #     self.h5viewer.ui.listData.setCurrentRow(-1)
-            #     self.h5viewer.ui.listData.setCurrentRow(0)
 
     def update_data(self, idx):
-        """Called by signal from wrangler. If the current scan name
-        is the same as the wrangler scan name, updates the data in
-        memory.
+        """Called by signal from wrangler when a new arch is processed.
+
+        Instead of rendering immediately (which blocks the main thread
+        and causes frame-skipping when the wrangler is faster than the
+        GUI), we update the in-memory data structures and schedule a
+        coalesced display refresh via a short single-shot timer.  If
+        another sigUpdateData arrives before the timer fires, only the
+        latest index is rendered.
+
+        Special case: ``idx == -1`` is the batch-complete signal —
+        trigger a full display refresh without touching the h5 viewer.
         """
-        # ic()
-        # with self.sphere.sphere_lock:
-            # if self.sphere.name == self.wrangler.scan_name:
+        if idx == -1:
+            # Batch mode finished — just refresh the display
+            self._pending_update_idx = -1
+            self._update_timer.start()
+            return
+
         self.h5viewer.file_thread.queue.put("update_sphere")
 
-        self.h5viewer.latest_idx = idx
-        # ic('from wrangler', idx)
         with self.file_lock:
-            self.update_all(idx)
+            self.h5viewer.latest_idx = idx
+            if self.h5viewer.auto_last:
+                self.latest_arch()
+            self.h5viewer.update_data()
+
+        # Record the latest index and (re)start the coalescing timer.
+        # If the timer is already running, restart resets the countdown
+        # so only one render happens after the burst settles.
+        self._pending_update_idx = idx
+        self._update_timer.start()
+
+    def _flush_pending_update(self):
+        """Render the most recently received wrangler update.
+
+        Called by _update_timer after a short quiet period (200 ms).
+        This ensures the display always shows the latest data without
+        burning CPU on intermediate frames the user never sees.
+        """
+        if self._pending_update_idx is None:
+            return
+        self._pending_update_idx = None
+        self.displayframe.update()
+        self.metawidget.update()
 
     def disable_auto_last(self, q):
         """
@@ -341,10 +373,9 @@ class staticWidget(QWidget):
         """Connected to h5viewer, sets the data in displayframe based
         on the selected image or overall data.
         """
-        # ic()
-
-        # ic(self.sphere.name, self.arch_ids)
-        if self.sphere.name != 'null_main':
+        # In viewer mode, always update display (no sphere dependency)
+        is_viewer = getattr(self.h5viewer, 'viewer_mode', None) is not None
+        if is_viewer or self.sphere.name != 'null_main':
             self.displayframe.update()
             # # if (len(self.arches.keys()) > 0) and (len(self.sphere.arches.index) > 0):
             # if ((len(self.data_1d.keys()) > 0) and
@@ -352,15 +383,13 @@ class staticWidget(QWidget):
             #         (self.arch_ids[0] != 'No data') and
             #         (len(self.sphere.arches.index) > 0)):
 
-            # if self.arch.idx is None:
-            if len(self.arch_ids) == 0:
-                # self.integratorTree.ui.apply_mask.setEnabled(False)
-                self.integratorTree.ui.integrate1D.setEnabled(False)
-                self.integratorTree.ui.integrate2D.setEnabled(False)
-            else:
-                # self.integratorTree.ui.apply_mask.setEnabled(True)
-                self.integratorTree.ui.integrate1D.setEnabled(True)
-                self.integratorTree.ui.integrate2D.setEnabled(True)
+            if not is_viewer:
+                if len(self.arch_ids) == 0:
+                    self.integratorTree.ui.integrate1D.setEnabled(False)
+                    self.integratorTree.ui.integrate2D.setEnabled(False)
+                else:
+                    self.integratorTree.ui.integrate1D.setEnabled(True)
+                    self.integratorTree.ui.integrate2D.setEnabled(True)
 
             self.metawidget.update()
             # self.integratorTree.update()
@@ -368,7 +397,6 @@ class staticWidget(QWidget):
     def close(self):
         """Tries a graceful close.
         """
-        # ic()
         del self.sphere
         del self.displayframe.sphere
         del self.arch
@@ -376,6 +404,34 @@ class staticWidget(QWidget):
         super().close()
 
         gc.collect()
+
+    def _show_integration_advanced(self):
+        """Show a combined dialog with the integratorTree's existing
+        1D and 2D advanced parameter widgets."""
+        if not hasattr(self, '_integ_adv_combined_dlg'):
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle('Integration \u2014 Advanced Settings')
+            dlg.resize(420, 450)
+            layout = QtWidgets.QVBoxLayout(dlg)
+
+            lbl1d = QtWidgets.QLabel('<b>Integrate 1D</b>')
+            layout.addWidget(lbl1d)
+            # Re-parent the existing advancedWidget trees into our dialog
+            layout.addWidget(self.integratorTree.advancedWidget1D.tree)
+
+            line = QtWidgets.QFrame()
+            line.setFrameShape(QtWidgets.QFrame.HLine)
+            line.setFrameShadow(QtWidgets.QFrame.Sunken)
+            layout.addWidget(line)
+
+            lbl2d = QtWidgets.QLabel('<b>Integrate 2D</b>')
+            layout.addWidget(lbl2d)
+            layout.addWidget(self.integratorTree.advancedWidget2D.tree)
+
+            self._integ_adv_combined_dlg = dlg
+
+        self._integ_adv_combined_dlg.show()
+        self._integ_adv_combined_dlg.raise_()
 
     def enable_integration(self, enable=True):
         """Calls the integratorTree setEnabled function.
@@ -386,15 +442,12 @@ class staticWidget(QWidget):
         """Updates all data in displays
         TODO: Currently taking the most time for the main gui thread
         """
-        # ic()
-        # if self.displayframe.auto_last or self.h5viewer.auto_last:
-        self.h5viewer.latest_idx = idx
-        # ic(idx, self.h5viewer.auto_last, self.h5viewer.latest_idx)
-        self.h5viewer.latest_idx = idx
+        if idx is not None:
+            self.h5viewer.latest_idx = idx
+            
+        self.h5viewer.update_data()
         if self.h5viewer.auto_last:
             self.latest_arch()
-            # ic(idx)
-        self.h5viewer.update_data()
 
         # if idx is None:
         #     self.h5viewer.ui.listData.setCurrentRow(self.h5viewer.ui.listData.count() - 1)
@@ -412,33 +465,30 @@ class staticWidget(QWidget):
         gc.collect()
 
     def integrator_thread_update(self, idx):
-        # ic()
         # self.thread_state_changed()
-        # ic(self.h5viewer.auto_last, idx, self.h5viewer.latest_idx)
-        # if self.h5viewer.auto_last or self.displayframe.auto_last:
-        self.h5viewer.latest_idx = idx
-        if self.h5viewer.auto_last:
-            self.latest_arch()
-            # self.h5viewer.auto_last = True
+        if idx is not None:
+            self.h5viewer.latest_idx = idx
 
         self.h5viewer.set_open_enabled(True)
         self.h5viewer.update_data()
+        
+        if self.h5viewer.auto_last:
+            self.latest_arch()
+            
         self.displayframe.update()
 
     def integrator_thread_finished(self):
         """Function connected to threadFinished signals for
         integratorThread
         """
-        # ic()
         self.thread_state_changed()
         self.enable_integration(True)
         self.h5viewer.set_open_enabled(True)
         self.update_all()
         if not self.wrangler.thread.isRunning():
-            self.ui.wranglerBox.setEnabled(True)
             self.wrangler.enabled(True)
 
-    def new_scan(self, name, fname, gi, th_mtr, single_img):
+    def new_scan(self, name, fname, gi, th_mtr, single_img, series_average):
         """Connected to sigUpdateFile from wrangler. Called when a new
         scan is started.
 
@@ -446,13 +496,17 @@ class staticWidget(QWidget):
             name: str, scan name
             fname: str, path to data file for scan
         """
-        # ic()
         # if self.sphere.name != name or self.sphere.name == 'null_main':
         self.h5viewer.dirname = os.path.dirname(fname)
         self.h5viewer.set_file(fname)
         self.sphere.gi = gi
         self.sphere.th_mtr = th_mtr
         self.sphere.single_img = single_img
+        self.sphere.series_average = series_average
+
+        self.integratorTree.get_args('bai_1d')
+        self.integratorTree.get_args('bai_2d')
+        self.integratorTree.set_image_units()
 
         # Clear data objects
         self.data_1d.clear()
@@ -460,7 +514,7 @@ class staticWidget(QWidget):
         self.arches.clear()
         self.arch_ids.clear()
 
-        self.displayframe.set_image_units()
+        self.displayframe.set_axes()
         # self.displayframe.auto_last = True
 
         self.h5viewer.scan_name = name
@@ -477,6 +531,8 @@ class staticWidget(QWidget):
             gi: bool, flag for determining if in Grazing incidence
         """
         self.sphere.gi = gi
+        self.integratorTree.set_image_units()
+        self.displayframe.set_axes()
 
     def new_arch(self, arch_data):
         """Connected to sigUpdateFile from wrangler. Called when a new
@@ -486,7 +542,6 @@ class staticWidget(QWidget):
             name: str, scan name
             fname: str, path to data file for scan
         """
-        # ic()
         arch = EwaldArch(idx=arch_data['idx'], map_raw=arch_data['map_raw'],
                          mask=arch_data['mask'], scan_info=arch_data['scan_info'],
                          poni_file=arch_data['poni_file'], static=self.sphere.static, gi=self.sphere.gi)
@@ -499,11 +554,13 @@ class staticWidget(QWidget):
         """Sets up wrangler, ensures properly synced args, and starts
         the wrangler.thread main method.
         """
-        # ic()
         # i_qChi = np.zeros((1000, 1000), dtype=float)
 
-        self.ui.wranglerBox.setEnabled(False)
         self.wrangler.enabled(False)
+
+        self.integratorTree.get_args('bai_1d')
+        self.integratorTree.get_args('bai_2d')
+
         args = {'bai_1d_args': self.sphere.bai_1d_args,
                 'bai_2d_args': self.sphere.bai_2d_args}
         self.wrangler.sphere_args = copy.deepcopy(args)
@@ -516,13 +573,32 @@ class staticWidget(QWidget):
         """Called by the wrangler finished signal. If current scan
         matches the wrangler scan, allows for integration.
         """
-        # ic()
+        # Flush any pending coalesced update so the final frame is shown.
+        self._update_timer.stop()
+        self._flush_pending_update()
+
         self.thread_state_changed()
         self.wrangler.stop()
+        
+        # Auto-load the final file generated from the batch if applicable
+        is_batch = getattr(self.wrangler.thread, 'batch_mode', False)
+        is_xye_only = getattr(self.wrangler.thread, 'xye_only', False)
+
+        if is_batch and not is_xye_only:
+            generated_file = getattr(self.wrangler, 'fname', None)
+            if generated_file and os.path.exists(generated_file):
+                # Update directory display to point at the generated folder natively 
+                generated_dir = os.path.dirname(generated_file)
+                if self.h5viewer.dirname != generated_dir:
+                    self.h5viewer.dirname = generated_dir
+                    self.h5viewer.update_scans()
+                # Inform H5Viewer to load the file and set the flag to auto-select its last point
+                self.h5viewer._auto_select_last_on_finish = True
+                self.h5viewer.set_file(generated_file)
+
         if self.sphere.name == self.wrangler.scan_name:
             self.integrator_thread_finished()
         else:
-            self.ui.wranglerBox.setEnabled(True)
             self.wrangler.enabled(True)
 
         gc.collect()
@@ -532,17 +608,42 @@ class staticWidget(QWidget):
         """
         self.h5viewer.update_2d = state
 
+    def _on_viewer_mode_changed(self, viewer_mode_str):
+        """Enable or disable the integrator panel and update h5viewer for viewer mode.
+
+        Args:
+            viewer_mode_str: 'image', 'xye', or '' (normal mode)
+        """
+        viewer_mode = viewer_mode_str or None  # '' → None
+        is_viewer = viewer_mode is not None
+        # Keep integratorTree enabled so mask/threshold controls remain accessible
+        self.h5viewer.viewer_mode = viewer_mode
+        # Give displayframe a reference to the wrangler for mask/threshold
+        self.displayframe._wrangler = self.wrangler if is_viewer else None
+        # In viewer mode, disable New/Save (keep Open Folder and Export)
+        self.h5viewer.actionNewFile.setEnabled(not is_viewer)
+        self.h5viewer.actionSaveDataAs.setEnabled(not is_viewer)
+        # XYE viewer: allow multi-select for overlay; others: single select
+        from PySide6.QtWidgets import QAbstractItemView
+        if viewer_mode == 'xye':
+            self.h5viewer.ui.listScans.setSelectionMode(
+                QAbstractItemView.ExtendedSelection)
+        else:
+            self.h5viewer.ui.listScans.setSelectionMode(
+                QAbstractItemView.SingleSelection)
+        # Configure display panels for the viewer mode
+        self.displayframe.set_viewer_display_mode(viewer_mode)
+        # Refresh scan list to show/hide appropriate file types
+        self.h5viewer.update_scans()
+
     def latest_arch(self):
         """Advances to last arch in data list, updates displayframe, and
         set auto_last to True
         """
-        # ic()
-        # self.displayframe.auto_last = True
         self.h5viewer.auto_last = True
         if self.h5viewer.ui.listData.count() <= 1:
             return
 
-        # ic(self.h5viewer.latest_idx)
         idx = self.h5viewer.latest_idx
         if isinstance(idx, int):
             self.h5viewer.latest_idx = idx
@@ -552,11 +653,15 @@ class staticWidget(QWidget):
                 for item in items:
                     self.h5viewer.ui.listData.setCurrentItem(item)
         else:
-            self.h5viewer.latest_idx = self.h5viewer.ui.listData.count()-1
-            self.h5viewer.ui.listData.setCurrentRow(self.h5viewer.latest_idx)
-
-        # if len(self.data_2d) <= 1:
-        #     self.h5viewer.ui.listData.setCurrentRow(self.h5viewer.ui.listData.count() - 1)
+            last_row = self.h5viewer.ui.listData.count() - 1
+            if last_row >= 0:
+                item = self.h5viewer.ui.listData.item(last_row)
+                if item is not None:
+                    try:
+                        self.h5viewer.latest_idx = int(item.text())
+                    except ValueError:
+                        self.h5viewer.latest_idx = item.text()
+                self.h5viewer.ui.listData.setCurrentRow(last_row)
 
     def raw_to_tiff(self):
         self.popup_detector_options()
@@ -588,8 +693,8 @@ class staticWidget(QWidget):
         layout.addWidget(accept_button, 2, 1)
         layout.addWidget(cancel_button, 2, 2)
 
-        counters = ['Pilatus 1M', 'Pilatus 100K', 'Pilatus 300K']
-        self.detector_widget.addItems(counters)
+        detectors = ['Pilatus 1M', 'Pilatus 100k', 'Pilatus 300kw']
+        self.detector_widget.addItems(detectors)
 
         accept_button.clicked.connect(self.set_detector)
         cancel_button.clicked.connect(self.close_detector_popup)
@@ -621,4 +726,4 @@ class staticWidget(QWidget):
 
         out_dialog = QMessageBox()
         out_dialog.setText(message)
-        out_dialog.exec_()
+        out_dialog.exec()
