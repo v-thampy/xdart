@@ -114,7 +114,7 @@ Masked/bad pixels are set to `np.nan` throughout the pipeline. This is consisten
 
 ## The xdart Relationship
 
-xdart (`../xdart/`) is a PyQt5 + pyqtgraph application for interactive XRD integration. Key architecture:
+xdart (`../xdart/`) is a PySide6 + pyqtgraph application for interactive XRD integration. Key architecture:
 
 - **EwaldArch**: Single detector image + pyFAI AzimuthalIntegrator + integration results
 - **EwaldSphere**: Collection of EwaldArch objects + MultiGeometry integration
@@ -419,7 +419,7 @@ This should go into `transforms/` as `q_to_tth(q, energy)` and `tth_to_q(tth, en
 - `.xye`: 3-column whitespace-separated (x, y, error) — standard powder diffraction format
 - `.csv`: comma-separated version of same
 - `.pkl`: pickle of dict or tuple (used for caching processed data)
-- `.h5`: HDF5 with per-frame groups containing q, I, IQChi arrays
+- `.nxs`: NeXus-formatted HDF5 with per-frame groups containing q, I, IQChi arrays (all processed output now uses .nxs extension)
 - `.vtk`: VTK rectilinear grid for 3D RSM visualization (ParaView/VESTA)
 
 

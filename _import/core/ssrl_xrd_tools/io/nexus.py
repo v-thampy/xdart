@@ -178,7 +178,32 @@ def find_nexus_image_dataset(
                 if inner in f and isinstance(f[inner], h5py.Dataset) and f[inner].ndim == 3:
                     return f"/{inner}"
 
-        # 4. Fallback: largest 3D dataset anywhere under the entry
+        # 4. Eiger external-link pattern: /entry/data/data_NNNNNN
+        #    Eiger master files store external links named data_000001,
+        #    data_000002, … that point to _data_*.h5 files.  Each link
+        #    resolves to a 3D dataset.  Return the *first* link path so
+        #    the caller can enumerate siblings to build the full stack.
+        if "data" in grp and isinstance(grp["data"], h5py.Group):
+            data_grp = grp["data"]
+            ext_keys = sorted(
+                k for k in data_grp
+                if data_grp.get(k, getlink=True).__class__.__name__ == "ExternalLink"
+            )
+            if ext_keys:
+                first_key = ext_keys[0]
+                try:
+                    ds = data_grp[first_key]
+                    if isinstance(ds, h5py.Dataset) and ds.ndim == 3:
+                        logger.debug(
+                            "Found Eiger external-link dataset: /%s/data/%s",
+                            entry, first_key,
+                        )
+                        return f"/{entry}/data/{first_key}"
+                except Exception:
+                    # External target file may be missing
+                    pass
+
+        # 5. Fallback: largest 3D dataset anywhere under the entry
         best_path: str | None = None
         best_size = 0
 
@@ -349,7 +374,7 @@ def open_nexus_writer(
     --------
     ::
 
-        h5 = open_nexus_writer("scan_001.h5", metadata=meta, swmr=True)
+        h5 = open_nexus_writer("scan_001.nxs", metadata=meta, swmr=True)
         try:
             for i, (r1d, r2d) in enumerate(process_frames(...)):
                 write_nexus_frame(h5, i, result_1d=r1d, result_2d=r2d)

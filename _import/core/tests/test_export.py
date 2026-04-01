@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.io.export import write_csv, write_h5, write_xye
+from ssrl_xrd_tools.io.export import write_h5, write_xye
 
 
 def test_write_xye(tmp_path):
@@ -27,16 +27,6 @@ def test_write_xye_with_variance(tmp_path):
     arr = np.loadtxt(out)
     assert arr.shape == (3, 3)
     np.testing.assert_allclose(arr[:, 2], variance, rtol=1e-10, atol=1e-12)
-
-
-def test_write_csv(tmp_path):
-    out = tmp_path / "test.csv"
-    write_csv(out, [1, 2, 3], [4, 5, 6])
-
-    arr = np.loadtxt(out, delimiter=",")
-    assert arr.shape == (3, 3)
-    np.testing.assert_allclose(arr[:, 0], [1, 2, 3], rtol=1e-10, atol=1e-12)
-    np.testing.assert_allclose(arr[:, 1], [4, 5, 6], rtol=1e-10, atol=1e-12)
 
 
 def test_write_h5(tmp_path):

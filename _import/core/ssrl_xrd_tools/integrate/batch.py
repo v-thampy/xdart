@@ -318,7 +318,7 @@ def process_series(
     n = len(scan_paths)  # type: ignore[arg-type]
     for i, raw_path in enumerate(scan_paths, start=1):
         scan_path = _as_path(raw_path)
-        out_h5 = out_dir / f"{scan_path.stem}_processed.h5"
+        out_h5 = out_dir / f"{scan_path.stem}_processed.nxs"
         logger.info("[%d/%d] Processing %s", i, n, scan_path.name)
         try:
             out = process_scan(
@@ -466,7 +466,7 @@ class DirectoryWatcher:
         if path in self._processed:
             return
         self._processed.add(path)
-        out_h5 = self._output_dir / f"{path.stem}_processed.h5"
+        out_h5 = self._output_dir / f"{path.stem}_processed.nxs"
         logger.info("DirectoryWatcher: new file detected: %s", path)
         try:
             process_scan(path, self._ai, out_h5, **self._process_kwargs)

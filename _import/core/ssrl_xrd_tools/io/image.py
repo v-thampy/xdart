@@ -2,7 +2,7 @@
 """
 Detector-agnostic image I/O for ssrl_xrd_tools.
 
-Handles: EDF, TIFF, CBF, MarCCD, raw binary, Eiger HDF5.
+Handles: EDF, TIFF, CBF, MarCCD, raw binary, Eiger HDF5, NeXus (.nxs).
 All reads go through fabio so format detection is automatic.
 Eiger master files (``*_master.h5``) are read via fabio's EigerImage,
 which handles external data-file linking transparently.  Other HDF5
@@ -23,12 +23,44 @@ from joblib import Parallel, delayed
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTS = {".edf", ".tif", ".tiff", ".cbf", ".img", ".mar3450",
-                  ".h5", ".hdf5", ".raw"}
+                  ".h5", ".hdf5", ".nxs", ".raw"}
 
 
 def _is_eiger_master(path: Path) -> bool:
     """Return True if *path* looks like an Eiger HDF5 master file."""
     return path.stem.endswith("_master")
+
+
+def resolve_detector_shape(
+    detector: str | tuple[int, int] | None = None,
+) -> tuple[int, int] | None:
+    """
+    Resolve a detector identifier to a ``(rows, cols)`` pixel shape.
+
+    Parameters
+    ----------
+    detector : str, (rows, cols), or None
+        * **str** — pyFAI detector name (e.g. ``'pilatus100k'``,
+          ``'pilatus300k'``).  Looked up via
+          ``pyFAI.detectors.detector_factory``.
+        * **tuple** — passed through unchanged.
+        * **None** — returns *None*.
+
+    Returns
+    -------
+    (int, int) or None
+    """
+    if detector is None:
+        return None
+    if isinstance(detector, (tuple, list)):
+        return tuple(detector)  # type: ignore[return-value]
+    try:
+        import pyFAI.detectors as detectors
+        det = detectors.detector_factory(detector)
+        return det.shape  # type: ignore[return-value]
+    except Exception:
+        logger.warning("Could not resolve detector shape for: %s", detector)
+        return None
 
 
 def get_detector_mask(detector_name: str) -> np.ndarray | None:
@@ -62,8 +94,9 @@ def read_image(
     mask: np.ndarray | None = None,
     threshold: float | None = None,
     detector_shape: tuple[int, int] | None = None,
+    detector: str | tuple[int, int] | None = None,
     raw_dtype: str = "int32",
-    raw_header_skip: int = 4096,
+    raw_header_skip: int = 0,
 ) -> np.ndarray:
     """
     Read a single detector image frame.
@@ -84,10 +117,16 @@ def read_image(
         Detector dimensions for raw binary files.  Required when fabio
         cannot auto-detect the format.  Also used as the reshape target
         for the fallback binary reader.
+    detector : str or (rows, cols), optional
+        Alternative to *detector_shape*.  If a string (e.g.
+        ``'pilatus100k'``, ``'pilatus300k'``), the shape is resolved via
+        ``pyFAI.detectors.detector_factory``.  A tuple is treated the
+        same as *detector_shape*.  If both *detector* and
+        *detector_shape* are given, *detector_shape* takes precedence.
     raw_dtype : str
         NumPy dtype string for raw binary files (default ``'int32'``).
     raw_header_skip : int
-        Bytes to skip at the start of raw binary files (default ``4096``).
+        Bytes to skip at the start of raw binary files (default ``0``).
 
     Returns
     -------
@@ -97,10 +136,13 @@ def read_image(
     path = Path(path)
     ext = path.suffix.lower()
 
+    # Resolve detector shape: explicit tuple wins, then detector name lookup
+    shape = detector_shape or resolve_detector_shape(detector)
+
     if ext in {".h5", ".hdf5"} and _is_eiger_master(path):
         # Eiger master files — fabio handles external data-file linking
         arr = _read_fabio_frame(path, frame)
-    elif ext in {".h5", ".hdf5"}:
+    elif ext in {".h5", ".hdf5", ".nxs"}:
         # Other HDF5 (NeXus, etc.) — try fabio first, fall back to h5py
         try:
             arr = _read_fabio_frame(path, frame)
@@ -112,12 +154,11 @@ def read_image(
         try:
             arr = _read_fabio_frame(path, frame)
         except Exception:
-            if detector_shape is None:
+            if shape is None:
                 raise
             logger.debug("fabio could not open %s, falling back to raw binary",
                          path)
-            arr = _read_raw_binary(path, detector_shape, raw_dtype,
-                                   raw_header_skip)
+            arr = _read_raw_binary(path, shape, raw_dtype, raw_header_skip)
 
     arr = arr.astype(float, copy=False)
 
@@ -147,8 +188,8 @@ def read_image_stack(
     path = Path(path)
     ext = path.suffix.lower()
 
-    if ext in {".h5", ".hdf5"} and not _is_eiger_master(path):
-        # Non-Eiger HDF5 — try fabio first, fall back to h5py
+    if ext in {".h5", ".hdf5", ".nxs"} and not _is_eiger_master(path):
+        # Non-Eiger HDF5 / NeXus — try fabio first, fall back to h5py
         try:
             arr = _read_fabio_stack(path)
         except Exception:
@@ -180,21 +221,27 @@ def read_images_parallel(
     threshold: float | None = None,
     n_jobs: int = -1,
     detector_shape: tuple[int, int] | None = None,
+    detector: str | tuple[int, int] | None = None,
     raw_dtype: str = "int32",
-    raw_header_skip: int = 4096,
+    raw_header_skip: int = 0,
 ) -> np.ndarray:
     """
     Read a list of single-frame image files in parallel.
     Returns a 3D array of shape (n_files, ny, nx).
+
+    Parameters
+    ----------
+    detector : str or (rows, cols), optional
+        See :func:`read_image`.
     """
     if not paths:
-        return np.array([])
+        return np.empty((0, 0, 0))
 
     frames = Parallel(n_jobs=n_jobs, require="sharedmem")(
         delayed(read_image)(
             p, mask=mask, threshold=threshold, rotation=rotation,
-            detector_shape=detector_shape, raw_dtype=raw_dtype,
-            raw_header_skip=raw_header_skip,
+            detector_shape=detector_shape, detector=detector,
+            raw_dtype=raw_dtype, raw_header_skip=raw_header_skip,
         )
         for p in paths
     )
@@ -219,6 +266,72 @@ def find_image_files(
         return os_sorted(candidates)
     except Exception:
         return sorted(candidates)
+
+
+def read_nexus_frame(
+    path: Path | str,
+    frame: int = 0,
+    dataset_path: str | None = None,
+) -> np.ndarray:
+    """
+    Read a single image frame from a NeXus / HDF5 file.
+
+    This is a convenience wrapper that opens the file, locates the
+    image dataset (either via *dataset_path* or automatic discovery),
+    and returns a single frame as a 2-D float array.
+
+    Parameters
+    ----------
+    path : path-like
+        NeXus (``.nxs``) or HDF5 file.
+    frame : int
+        0-based frame index.  Ignored when the dataset is 2-D.
+    dataset_path : str, optional
+        Explicit internal HDF5 path to the image dataset
+        (e.g. ``'/entry/data/data'``).  If *None*, the dataset is
+        found automatically via :func:`_find_hdf5_image_dataset`.
+
+    Returns
+    -------
+    np.ndarray
+        Float64 2-D image array.
+    """
+    path = Path(path)
+    with h5py.File(path, "r") as f:
+        if dataset_path is not None:
+            ds = f[dataset_path]
+        else:
+            ds = _find_hdf5_image_dataset(f)
+        if ds.ndim == 2:
+            return np.asarray(ds[:], dtype=float)
+        return np.asarray(ds[frame], dtype=float)
+
+
+def nexus_info(path: Path | str) -> dict:
+    """
+    Return metadata about the image dataset in a NeXus / HDF5 file.
+
+    Parameters
+    ----------
+    path : path-like
+        NeXus or HDF5 file.
+
+    Returns
+    -------
+    dict
+        Keys: ``dataset_path`` (str), ``shape`` (tuple), ``dtype``,
+        ``nframes`` (int).
+    """
+    path = Path(path)
+    with h5py.File(path, "r") as f:
+        ds = _find_hdf5_image_dataset(f)
+        nframes = ds.shape[0] if ds.ndim >= 3 else 1
+        return {
+            "dataset_path": ds.name,
+            "shape": ds.shape,
+            "dtype": str(ds.dtype),
+            "nframes": nframes,
+        }
 
 
 def apply_rotation(arr: np.ndarray, rotation: int) -> np.ndarray:
@@ -249,8 +362,8 @@ def count_frames(path: Path | str) -> int:
     path = Path(path)
     ext = path.suffix.lower()
     try:
-        if ext in {".h5", ".hdf5"} and not _is_eiger_master(path):
-            # Non-Eiger HDF5 — try fabio, fall back to h5py
+        if ext in {".h5", ".hdf5", ".nxs"} and not _is_eiger_master(path):
+            # Non-Eiger HDF5 / NeXus — try fabio, fall back to h5py
             try:
                 with fabio.open(path) as f:
                     return f.nframes
@@ -303,7 +416,7 @@ def _read_raw_binary(
     path: Path,
     shape: tuple[int, int],
     dtype: str = "int32",
-    header_skip: int = 4096,
+    header_skip: int = 0,
 ) -> np.ndarray:
     """
     Read a raw binary detector dump (no fabio support needed).
@@ -326,11 +439,91 @@ def _read_raw_binary(
 
 
 def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
-    """Try standard NeXus paths, fall back to largest dataset."""
-    for candidate in ("/entry/data/data", "/entry/instrument/detector/data", "/data"):
-        if candidate in f and isinstance(f[candidate], h5py.Dataset):
-            return f[candidate]  # type: ignore[return-value]
-    # fallback: find the largest dataset
-    found = {}
-    f.visititems(lambda name, obj: found.update({name: obj}) if isinstance(obj, h5py.Dataset) else None)
+    """Locate the image dataset inside an HDF5/NeXus file.
+
+    Search order:
+
+    1. Well-known fixed paths (NeXus and common beamline conventions).
+    2. NXdata groups found via ``NX_class`` attributes — look for a
+       dataset whose ``signal`` attribute marks the default data, or
+       pick the first 2-D+ dataset.
+    3. NXdetector groups — ``/entry/**/NXdetector/data``.
+    4. Fallback: the largest 2-D+ dataset anywhere in the file.
+    """
+    # --- 1. Fixed candidate paths -------------------------------------------
+    _FIXED_PATHS = (
+        "/entry/data/data",
+        "/entry/instrument/detector/data",
+        "/entry/instrument/detector/data_000001",
+        "/entry/measurement/data",
+        "/entry/data",
+        "/data",
+        "/entry/instrument/pilatus/data",
+        "/entry/instrument/eiger/data",
+    )
+    for candidate in _FIXED_PATHS:
+        if candidate in f:
+            obj = f[candidate]
+            if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
+                return obj  # type: ignore[return-value]
+
+    # --- 2. NXdata groups (signal attribute) ---------------------------------
+    def _search_nxdata(grp: h5py.Group) -> h5py.Dataset | None:
+        for name, item in grp.items():
+            nx_class = item.attrs.get("NX_class", b"")
+            if isinstance(nx_class, bytes):
+                nx_class = nx_class.decode("utf-8", errors="replace")
+            if nx_class == "NXdata" and isinstance(item, h5py.Group):
+                signal_name = item.attrs.get("signal", None)
+                if signal_name is not None:
+                    if isinstance(signal_name, bytes):
+                        signal_name = signal_name.decode("utf-8", errors="replace")
+                    if signal_name in item and isinstance(item[signal_name], h5py.Dataset):
+                        ds = item[signal_name]
+                        if ds.ndim >= 2:
+                            return ds  # type: ignore[return-value]
+                # No signal attribute — pick first ≥2-D dataset
+                for sub_name, sub_item in item.items():
+                    if isinstance(sub_item, h5py.Dataset) and sub_item.ndim >= 2:
+                        return sub_item  # type: ignore[return-value]
+            # Recurse into subgroups
+            if isinstance(item, h5py.Group):
+                result = _search_nxdata(item)
+                if result is not None:
+                    return result
+        return None
+
+    nxdata_result = _search_nxdata(f)
+    if nxdata_result is not None:
+        return nxdata_result
+
+    # --- 3. NXdetector groups ------------------------------------------------
+    def _search_nxdetector(grp: h5py.Group) -> h5py.Dataset | None:
+        for name, item in grp.items():
+            nx_class = item.attrs.get("NX_class", b"")
+            if isinstance(nx_class, bytes):
+                nx_class = nx_class.decode("utf-8", errors="replace")
+            if nx_class == "NXdetector" and isinstance(item, h5py.Group):
+                if "data" in item and isinstance(item["data"], h5py.Dataset):
+                    return item["data"]  # type: ignore[return-value]
+            if isinstance(item, h5py.Group):
+                result = _search_nxdetector(item)
+                if result is not None:
+                    return result
+        return None
+
+    nxdet_result = _search_nxdetector(f)
+    if nxdet_result is not None:
+        return nxdet_result
+
+    # --- 4. Fallback: largest ≥2-D dataset -----------------------------------
+    found: dict[str, h5py.Dataset] = {}
+
+    def _visitor(name: str, obj: object) -> None:
+        if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
+            found[name] = obj  # type: ignore[assignment]
+
+    f.visititems(_visitor)
+    if not found:
+        raise ValueError(f"No 2-D+ dataset found in {f.filename}")
     return max(found.values(), key=lambda d: d.size)

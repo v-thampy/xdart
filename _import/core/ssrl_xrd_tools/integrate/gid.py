@@ -171,6 +171,10 @@ def create_fiber_integrator(
     tilt = _deg2rad_or_pass(tilt_angle, angle_unit)
     fi.reset_integrator(inc, tilt, int(sample_orientation))
 
+    # Disable pyFAI's legacy mask heuristic that auto-inverts masks
+    # with > 50% masked pixels (e.g. threshold masks).
+    fi.USE_LEGACY_MASK_NORMALIZATION = False
+
     # Persist so integration helpers can re-inject them on every call
     setattr(fi, _ATTR_INC, inc)
     setattr(fi, _ATTR_TILT, tilt)
@@ -187,6 +191,7 @@ def integrate_gi_1d(
     image: np.ndarray,
     fi: FiberIntegrator,
     npt: int = 1000,
+    npt_oop: int | None = None,
     unit: str = "qoop_A^-1",
     method: str = "no",
     mask: np.ndarray | None = None,
@@ -207,7 +212,10 @@ def integrate_gi_1d(
     fi : FiberIntegrator
         Configured fiber integrator from :func:`create_fiber_integrator`.
     npt : int, optional
-        Number of output bins.  Passed as both ``npt_ip`` and ``npt_oop``.
+        Number of output bins for the in-plane axis (``npt_ip``).
+    npt_oop : int or None, optional
+        Number of output bins for the out-of-plane axis.  If *None*,
+        defaults to ``npt`` (same resolution for both axes).
     unit : str, optional
         Out-of-plane (OOP) coordinate unit, e.g. ``"qoop_A^-1"``.
         Override in-plane unit via ``unit_ip=`` in ``**kwargs``.
@@ -232,11 +240,12 @@ def integrate_gi_1d(
     """
     inc, tilt, orient = _effective_gi_params(fi, incident_angle, tilt_angle, sample_orientation)
     unit_ip = kwargs.pop("unit_ip", _DEFAULT_UNIT_IP)
+    _npt_oop = npt_oop if npt_oop is not None else npt
 
     result = fi.integrate1d_fiber(
         image,
         npt_ip=npt,
-        npt_oop=npt,
+        npt_oop=_npt_oop,
         unit_ip=unit_ip,
         unit_oop=unit,
         sample_orientation=orient,
@@ -278,7 +287,7 @@ def integrate_gi_2d(
 ) -> IntegrationResult2D:
     """
     2-D grazing-incidence map ``(Q_ip, Q_oop)`` via
-    ``FiberIntegrator.integrate2d_fiber``.
+    ``FiberIntegrator.integrate2d_grazing_incidence``.
 
     Parameters
     ----------
@@ -306,7 +315,7 @@ def integrate_gi_2d(
     sample_orientation : int or None, optional
         Override sample orientation.
     **kwargs
-        Forwarded to ``fi.integrate2d_fiber``.
+        Forwarded to ``fi.integrate2d_grazing_incidence``.
 
     Returns
     -------
@@ -318,7 +327,7 @@ def integrate_gi_2d(
     inc, tilt, orient = _effective_gi_params(fi, incident_angle, tilt_angle, sample_orientation)
     unit_oop = kwargs.pop("unit_oop", _DEFAULT_UNIT_OOP)
 
-    result = fi.integrate2d_fiber(
+    result = fi.integrate2d_grazing_incidence(
         image,
         npt_ip=npt_rad,
         npt_oop=npt_azim,
@@ -344,6 +353,8 @@ def integrate_gi_polar(
     unit: str = "q_A^-1",
     method: str = "no",
     mask: np.ndarray | None = None,
+    radial_range: tuple[float, float] | None = None,
+    azimuth_range: tuple[float, float] | None = None,
     incident_angle: float | None = None,
     tilt_angle: float | None = None,
     sample_orientation: int | None = None,
@@ -397,6 +408,8 @@ def integrate_gi_polar(
         sample_orientation=orient,
         method=method,
         mask=mask,
+        ip_range=radial_range,
+        oop_range=azimuth_range,
         incident_angle=inc,
         tilt_angle=tilt,
         **kwargs,
@@ -412,6 +425,8 @@ def integrate_gi_exitangles(
     unit: str = "q_A^-1",
     method: str = "no",
     mask: np.ndarray | None = None,
+    radial_range: tuple[float, float] | None = None,
+    azimuth_range: tuple[float, float] | None = None,
     incident_angle: float | None = None,
     tilt_angle: float | None = None,
     sample_orientation: int | None = None,
@@ -466,6 +481,8 @@ def integrate_gi_exitangles(
         sample_orientation=orient,
         method=method,
         mask=mask,
+        ip_range=radial_range,
+        oop_range=azimuth_range,
         incident_angle=inc,
         tilt_angle=tilt,
         **kwargs,
@@ -480,6 +497,8 @@ def integrate_gi_polar_1d(
     unit: str = "q_A^-1",
     method: str = "no",
     mask: np.ndarray | None = None,
+    radial_range: tuple[float, float] | None = None,
+    azimuth_range: tuple[float, float] | None = None,
     incident_angle: float | None = None,
     tilt_angle: float | None = None,
     sample_orientation: int | None = None,
@@ -533,6 +552,8 @@ def integrate_gi_polar_1d(
         sample_orientation=orient,
         method=method,
         mask=mask,
+        ip_range=radial_range,
+        oop_range=azimuth_range,
         incident_angle=inc,
         tilt_angle=tilt,
         **kwargs,
@@ -556,6 +577,8 @@ def integrate_gi_exitangles_1d(
     npt: int = 1000,
     method: str = "no",
     mask: np.ndarray | None = None,
+    radial_range: tuple[float, float] | None = None,
+    azimuth_range: tuple[float, float] | None = None,
     incident_angle: float | None = None,
     tilt_angle: float | None = None,
     sample_orientation: int | None = None,
@@ -609,6 +632,8 @@ def integrate_gi_exitangles_1d(
         mask=mask,
         incident_angle=inc,
         tilt_angle=tilt,
+        ip_range=radial_range,
+        oop_range=azimuth_range,
         **kwargs,
     )
     sigma = result.sigma if result.sigma is not None else None

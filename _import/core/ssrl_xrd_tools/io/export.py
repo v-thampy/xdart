@@ -34,6 +34,31 @@ def _replace_dataset(group: h5py.Group, name: str, data: np.ndarray) -> None:
     group.create_dataset(name, data=data)
 
 
+def read_xye(
+    path: Path | str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """
+    Read a ``.xye`` file (tab- or space-delimited, 2 or 3 columns).
+
+    Returns
+    -------
+    xdata : ndarray
+        X-axis values.
+    ydata : ndarray
+        Intensity values.
+    sigma : ndarray or None
+        Error column, if present.
+    """
+    data = np.loadtxt(_as_path(path))
+    if data.ndim == 1:
+        # single row
+        data = data.reshape(1, -1)
+    xdata = data[:, 0]
+    ydata = data[:, 1]
+    sigma = data[:, 2] if data.shape[1] > 2 else None
+    return xdata, ydata, sigma
+
+
 def write_xye(
     path: Path | str,
     xdata: np.ndarray | list[float],
@@ -66,40 +91,6 @@ def write_xye(
         raise ValueError("xdata, ydata, and variance must have matching shapes")
 
     np.savetxt(out_path, np.column_stack((x, y, sigma)), delimiter="\t")
-
-
-def write_csv(
-    path: Path | str,
-    xdata: np.ndarray | list[float],
-    ydata: np.ndarray | list[float],
-    variance: np.ndarray | list[float] | None = None,
-) -> None:
-    """
-    Write 1D data to three-column CSV format.
-
-    Parameters
-    ----------
-    path : Path or str
-        Output file path.
-    xdata : ndarray or list of float
-        X-axis values (e.g. 2theta or q).
-    ydata : ndarray or list of float
-        Intensity values.
-    variance : ndarray or list of float, optional
-        Error or variance-like column to write as the third column. If omitted,
-        ``sqrt(abs(ydata))`` is used for compatibility with existing notebooks.
-    """
-    out_path = _as_path(path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    x = _as_1d_array(xdata)
-    y = _as_1d_array(ydata)
-    sigma = _default_sigma(y) if variance is None else _as_1d_array(variance)
-
-    if x.shape != y.shape or sigma.shape != x.shape:
-        raise ValueError("xdata, ydata, and variance must have matching shapes")
-
-    np.savetxt(out_path, np.column_stack((x, y, sigma)), delimiter=",")
 
 
 def write_h5(
@@ -160,4 +151,4 @@ def write_h5(
     logger.debug("Wrote integrated data to %s [frame=%s]", out_path, frame)
 
 
-__all__ = ["write_csv", "write_h5", "write_xye"]
+__all__ = ["write_h5", "write_xye"]

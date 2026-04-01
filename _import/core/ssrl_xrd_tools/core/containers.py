@@ -246,6 +246,22 @@ def _pyfai_unit_to_nexus(unit_str: str) -> tuple[str, str]:
     return _UNIT_TO_NEXUS.get(unit_str, ("a.u.", unit_str))
 
 
+# Reverse mapping: (nexus_units, long_name) → pyFAI unit string.
+# Used by from_hdf5 to recover the pyFAI unit when reading NeXus-written data.
+_NEXUS_TO_PYFAI: dict[tuple[str, str], str] = {
+    v: k for k, v in _UNIT_TO_NEXUS.items()
+}
+
+
+def _nexus_to_pyfai_unit(nexus_units: str, long_name: str) -> str | None:
+    """
+    Reverse-map NeXus ``(units, long_name)`` back to a pyFAI unit string.
+
+    Returns None if the combination is not recognised.
+    """
+    return _NEXUS_TO_PYFAI.get((nexus_units, long_name))
+
+
 # ---------------------------------------------------------------------------
 # HDF5 helpers (lazy import wrapper)
 # ---------------------------------------------------------------------------
@@ -686,7 +702,25 @@ class IntegrationResult1D:
         radial = np.asarray(grp["radial"])
         intensity = np.asarray(grp["intensity"])
         sigma = np.asarray(grp["sigma"]) if "sigma" in grp else None
-        unit = str(grp.attrs.get("unit", "2th_deg"))
+
+        # Recover pyFAI unit string.  Try the to_hdf5 format first
+        # (grp.attrs["unit"]), then fall back to the NeXus format
+        # written by to_nexus (radial dataset attrs "units" + "long_name").
+        unit = str(grp.attrs.get("unit", ""))
+        if not unit and "radial" in grp:
+            ds_r = grp["radial"]
+            nexus_units = str(ds_r.attrs.get("units", ""))
+            long_name = str(ds_r.attrs.get("long_name", ""))
+            if nexus_units or long_name:
+                recovered = _nexus_to_pyfai_unit(nexus_units, long_name)
+                if recovered is None:
+                    logger.debug("Could not recover pyFAI unit from NeXus attrs "
+                                 f"(units={nexus_units!r}, long_name={long_name!r}); "
+                                 "defaulting to 2th_deg")
+                unit = recovered if recovered else "2th_deg"
+        if not unit:
+            unit = "2th_deg"
+
         return cls(radial=radial, intensity=intensity, sigma=sigma, unit=unit)
 
     # ------------------------------------------------------------------
@@ -1174,8 +1208,38 @@ class IntegrationResult2D:
         azimuthal = np.asarray(grp["azimuthal"])
         intensity = np.asarray(grp["intensity"])
         sigma = np.asarray(grp["sigma"]) if "sigma" in grp else None
-        unit = str(grp.attrs.get("unit", "2th_deg"))
-        azimuthal_unit = str(grp.attrs.get("azimuthal_unit", "chi_deg"))
+
+        # Recover pyFAI unit strings — try to_hdf5 format first, then NeXus
+        unit = str(grp.attrs.get("unit", ""))
+        if not unit and "radial" in grp:
+            ds_r = grp["radial"]
+            nexus_units = str(ds_r.attrs.get("units", ""))
+            long_name = str(ds_r.attrs.get("long_name", ""))
+            if nexus_units or long_name:
+                recovered = _nexus_to_pyfai_unit(nexus_units, long_name)
+                if recovered is None:
+                    logger.debug("Could not recover pyFAI unit from NeXus attrs "
+                                 f"(units={nexus_units!r}, long_name={long_name!r}); "
+                                 "defaulting to 2th_deg")
+                unit = recovered if recovered else "2th_deg"
+        if not unit:
+            unit = "2th_deg"
+
+        azimuthal_unit = str(grp.attrs.get("azimuthal_unit", ""))
+        if not azimuthal_unit and "azimuthal" in grp:
+            ds_az = grp["azimuthal"]
+            nexus_units = str(ds_az.attrs.get("units", ""))
+            long_name = str(ds_az.attrs.get("long_name", ""))
+            if nexus_units or long_name:
+                recovered = _nexus_to_pyfai_unit(nexus_units, long_name)
+                if recovered is None:
+                    logger.debug("Could not recover pyFAI azimuthal_unit from NeXus attrs "
+                                 f"(units={nexus_units!r}, long_name={long_name!r}); "
+                                 "defaulting to chi_deg")
+                azimuthal_unit = recovered if recovered else "chi_deg"
+        if not azimuthal_unit:
+            azimuthal_unit = "chi_deg"
+
         return cls(
             radial=radial,
             azimuthal=azimuthal,

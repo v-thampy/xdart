@@ -67,37 +67,73 @@ xdart's `int_1d_data_static` / `int_2d_data_static` vs ssrl_xrd_tools' `Integrat
 
 ---
 
-## Phase 2: Simplify EwaldArch / EwaldSphere
+## Phase 2: Simplify EwaldArch / EwaldSphere + NeXus Output + GI Integration
 
-**Goal**: Reduce EwaldArch and EwaldSphere to thin GUI-oriented wrappers over ssrl_xrd_tools functions. Eventually, consider whether they should move into ssrl_xrd_tools as "workflow" classes or remain in xdart as GUI state containers.
+**Goal**: Replace legacy HDF5 output with NeXus-formatted HDF5. Simplify EwaldArch and EwaldSphere. Fix display bugs. Restructure GI mode selection and integration panel.
 
-### 2a. EwaldArch simplification
+### Status: COMPLETED (March 2026)
 
-**Current role**: Holds raw image + PONI + mask + integration results + threading lock. Calls ssrl_xrd_tools for actual integration.
+**NeXus output**:
+- NeXus output format for all EwaldArch/EwaldSphere/ArchSeries writes
+  - `entry/frames/<idx>` (1D), `<idx>_2d` (2D), `<idx>_thumb` (thumbnail)
+  - `entry/integrated_1d`, `entry/integrated_2d` (sphere-level summed results)
+  - `entry/calibration` (PONI), `entry/scan_data` (DataFrame columns)
+  - Uses gzip compression only (lzf crashes on ARM64 macOS)
+- `save_to_nexus()` / `load_from_nexus()` on EwaldArch
+- ArchSeries rewritten — NeXus-only, no legacy `arches/` group
+- EwaldSphere rewritten (~270 lines vs ~580) — NeXus file structure
+- Thumbnail feature: downsampled raw image with mask baked in (NaN before zoom)
+- `source_file` stored as relative path from HDF5 directory to raw image
+- `global_mask` propagation: sphere → arch_series → save_to_nexus → thumbnail
 
-**Action**:
-1. Replace internal `poni` attribute type with ssrl_xrd_tools `PONI`
-2. Replace `int_1d`/`int_2d` attribute types with ssrl_xrd_tools `IntegrationResult1D`/`2D`
-3. Remove any integration logic that duplicates ssrl_xrd_tools (already mostly done)
-4. Keep threading lock and HDF5 persistence (these are GUI-specific concerns)
-5. Consider: should `EwaldArch` become a dataclass in ssrl_xrd_tools that xdart wraps with threading?
+**GI integration restructuring**:
+- GI 1D/2D mode selection moved from display_frame_widget to spec_wrangler parameter tree
+- Integrator panel dynamically updates labels/ranges per mode (q_ip, q_oop, q_total, qip_qoop, q_chi)
+- npt_oop parameter added for fiber integrator control
+- GI-specific kwargs (`gi_mode_1d`, `gi_mode_2d`, `npt_oop`, `sample_orientation`, `tilt_angle`) filtered before passing to standard pyFAI
+- FiberIntegrator cached between integrate_1d and integrate_2d calls
+- GI integration optimization: only compute the selected mode (was computing all 4 1D + all 3 2D modes)
 
-### 2b. EwaldSphere simplification
+**2D integration fixes**:
+- Fixed qip_qoop double-transpose (result used directly, no extra `.T`)
+- Fixed 2D normalization in GI path (`(map_raw - bg_raw) / map_norm`)
+- Removed all `[:, ::-1]` azimuthal flips from display code — FiberIntegrator results handle axis direction correctly
+- Chi axis auto-centred around 0 for non-GI mode (pyFAI geometry offset corrected post-integration)
+- Chi range set to auto for non-GI and polar GI modes (no forced -90/90 cutoff)
 
-**Current role**: Collection of EwaldArch objects + multi-geometry integration + summed results. Already uses ssrl_xrd_tools for stitching.
+**Mask & performance**:
+- `USE_LEGACY_MASK_NORMALIZATION = False` on both AzimuthalIntegrator and FiberIntegrator
+- `get_mask()` optimized: uses `dtype=bool` array, handles shape mismatches
+- Mask+threshold adds ~0.3s per image (unavoidable due to pyFAI engine rebuild)
 
-**Action**:
-1. Use ssrl_xrd_tools containers for `bai_1d`/`bai_2d`
-2. Keep `ArchSeries` (lazy HDF5-backed storage) in xdart — it's a GUI/performance concern
-3. Consider: should the "sum individual arch results" logic move to ssrl_xrd_tools as a utility?
+**GUI label cleanup**:
+- Shortened all GI labels: Q_ip, Q_oop, Q, Chi (Greek), etc.
+- "IPxOOP" → "Pts", "Points" → "Pts"
+- Default sample_orientation changed to 4
 
-### 2c. Decide EwaldArch/Sphere location
+**Persistence**:
+- Mask threshold parameters (apply_threshold, min, max) saved/restored in session
+- Data directory file dialog starts from last-used directory
+- `set_image_units()` called on `sigUpdateGI` and `new_scan()` for immediate UI updates
 
-**Option A — Keep in xdart**: They remain GUI state containers. ssrl_xrd_tools stays purely functional (stateless functions + data containers). xdart's `EwaldArch` wraps ssrl_xrd_tools types with threading, HDF5 caching, and GUI state.
+**Known remaining items** (deferred to Phase 4):
+- Display not scrolling to last processed image (existing bug)
+- GUI update lag — display repaints skip every other frame during fast processing
+- Legacy file backward compatibility: `load_from_h5()` still reads old format
 
-**Option B — Move to ssrl_xrd_tools**: Create `ssrl_xrd_tools.workflow.EwaldArch` and `EwaldSphere` as non-GUI workflow classes (no threading, no Qt). xdart subclasses them to add GUI concerns.
+### Files Modified (xdart)
 
-**Recommendation**: Option A for now. EwaldArch/Sphere are tightly coupled to xdart's HDF5 persistence and threading model. Moving them would require abstracting those concerns first, which adds complexity without clear benefit.
+| File | Changes |
+|------|---------|
+| `modules/ewald/arch.py` | `save_to_nexus`, `load_from_nexus`, `_make_thumbnail`, GI integration (only selected mode), FiberIntegrator caching, `_gi_only_keys` filter, chi axis centering, `USE_LEGACY_MASK_NORMALIZATION`, mask dtype=bool |
+| `modules/ewald/arch_series.py` | Complete rewrite — NeXus-only, `global_mask` forwarding |
+| `modules/ewald/sphere.py` | Complete rewrite — NeXus file structure, `global_mask` forwarding |
+| `gui/tabs/static_scan/display_frame_widget.py` | 2D rotation fix, removed azimuthal flip, thumbnail fallback, GI axis labels, simplified GI data access, label shortening |
+| `gui/tabs/static_scan/integrator.py` | GI mode combos, npts_oop widget, dynamic label/range updates, `_set_range_defaults_1d/2d` with auto chi, `_update_gi_mode_1d/2d` |
+| `gui/tabs/static_scan/h5viewer.py` | Reads from `entry/frames` via `load_from_nexus`, data dir dialog starts from last dir |
+| `gui/tabs/static_scan/static_scan_widget.py` | `set_image_units()` called in `new_scan()` |
+| `gui/tabs/static_scan/sphere_threads.py` | Reads from `entry/frames` via `load_from_nexus` |
+| `gui/tabs/static_scan/wranglers/spec_wrangler.py` | GI mode params in tree, sample_orientation=4, label shortening, mask threshold persistence, relative `source_file` path |
 
 ---
 
@@ -105,26 +141,47 @@ xdart's `int_1d_data_static` / `int_2d_data_static` vs ssrl_xrd_tools' `Integrat
 
 **Goal**: Remove code from xdart that's now redundant with ssrl_xrd_tools.
 
+### Status: COMPLETED (March 2026)
+
 ### 3a. _utils.py cleanup
 
-Much of `_utils.py` re-exports from ssrl_xrd_tools.core.hdf5 already. Remaining functions:
+**Removed** (unused functions — ~200 lines):
+- `find_between()`, `find_between_r()` — string utilities, never called
+- `get_scan_name()`, `get_img_number()` — superseded by `get_sname_img_number()`
+- `get_motor_val()` — unused, ssrl_xrd_tools has `read_pdi_metadata`
+- `get_norm_fac()`, `get_normChannel()` — unused (display_frame_widget has its own method)
+- `smooth_img()` — unused image filter
+- `launch()` — unused OS launcher
+- `get_mask_array()` — unused, ssrl_xrd_tools has equivalent
 
-- `get_fname_dir()`, `split_file_name()`, `get_sname_img_number()` — file path utilities, keep in xdart (GUI-specific)
-- `write_xye()`, `write_csv()` — already in ssrl_xrd_tools.io.export, remove xdart copies
-- `FixSizeOrderedDict` — keep in xdart (GUI cache utility)
-- `match_img_detector()`, `get_series_avg()` — evaluate whether ssrl_xrd_tools.io or integrate modules already cover these
+**Replaced with re-exports**:
+- `write_xye()`, `write_csv()` — now re-exported from `ssrl_xrd_tools.io.export`. All call sites (`ut.write_xye()` in display_frame_widget.py) continue to work unchanged.
+
+**Kept** (GUI-specific, no ssrl_xrd_tools equivalent):
+- `get_fname_dir()` — xdart temp directory management
+- `split_file_name()`, `get_sname_img_number()` — file name parsing
+- `get_series_avg()` — multi-image averaging with metadata
+- `match_img_detector()` + `detector_file_sizes` — detector validation by file size
+- `get_img_meta()` — thin wrapper around ssrl_xrd_tools (used by `get_series_avg`)
+- `get_img_data()` — image loading with GUI-specific transforms (flip, transpose)
+- `FixSizeOrderedDict` — LRU cache for GUI
+- HDF5 codec re-exports from `ssrl_xrd_tools.core.hdf5`
 
 ### 3b. Remove xdart/modules/spec/
 
-If `ssrl_xrd_tools.io.spec` fully replaces this, remove it.
+**DONE** — Entire `modules/spec/` directory removed. No imports found anywhere in xdart. ssrl_xrd_tools.io.spec (silx-based) fully replaces it.
+
+Files removed: `__init__.py`, `spec_utils.py`, `LoadSpecFile.py`, `MakePONI.py`
 
 ### 3c. Audit remaining xdart.utils
 
-Keep in xdart (GUI-specific):
-- `session.py` — app session persistence
+Kept in xdart (GUI-specific, no duplication):
+- `session.py` — app session persistence (`~/.xdart/session.json`)
 - `h5pool.py` — HDF5 file handle caching
 - `pyFAI_binaries.py` — external GUI tool wrappers (calib2, drawmask)
 - `pgOverrides/` — pyqtgraph customizations
+- `lmfit_models.py` — fitting models (ssrl_xrd_tools has its own copy in `analysis.fitting.models`; deduplication deferred to Phase 5)
+- `containers/` — thin re-export of ssrl_xrd_tools containers
 
 ---
 
@@ -132,53 +189,46 @@ Keep in xdart (GUI-specific):
 
 **Goal**: Clean up the GUI code itself, independent of the ssrl_xrd_tools extraction.
 
-### 4a. GUI framework evaluation
+### Status: COMPLETED (March 2026)
 
-Current: PySide6 + pyqtgraph. Options to consider:
+### 4a. Framework decision: Stay with PySide6 + pyqtgraph
+Evaluated alternatives (vispy/napari, Dear PyGui, Tkinter). Staying with current stack — proven for large detector images, mature ecosystem.
 
-| Framework | Pros | Cons |
-|---|---|---|
-| **PySide6 + pyqtgraph** (current) | Proven, fast rendering for large images, mature ecosystem, works well at beamlines | Complex signal/slot wiring, platform-specific UI issues |
-| **PySide6 + vispy/napari** | Better 3D support, modern rendering | Migration effort, napari is heavier |
-| **Dear PyGui** | Very fast rendering, modern API, simpler than Qt | Less mature, smaller ecosystem |
-| **Tkinter + matplotlib** | Simple, no external deps | Slower for large images, less interactive |
+### 4b. Spec wrangler split — DONE
+Split `spec_wrangler.py` (1721→929 lines) into:
+- `wranglers/spec_wrangler.py` — UI widget (specWrangler class, parameter tree, session persistence)
+- `wranglers/spec_wrangler_thread.py` (850 lines) — Worker thread (specThread class, utility functions: `_is_eiger_master`, `_get_scan_info`, natural sort helpers)
 
-**Recommendation**: Stay with PySide6 + pyqtgraph. It's proven for this use case, pyqtgraph handles large detector images well, and switching frameworks would be high effort with unclear benefit. Focus engineering time on architecture, not framework migration.
+### 4c. Display frame partial split — DONE
+Extracted axis labels, unicode constants, GI label arrays, and `_downsample_for_display` to `display_constants.py`. A deeper 3-way split (1D/2D/controller) was assessed but deferred: the single `displayFrameWidget` class is tightly coupled to the `Ui_Form`, and splitting requires rearchitecting the Qt Designer form. Safe to revisit once Qt test infrastructure is available.
 
-### 4b. Spec wrangler refactoring
+### 4d. GUI update lag fix — DONE
+Root cause: each `sigUpdate` emission from the processing thread triggers a full `displayframe.update()` on the main thread. When the thread processes faster than the GUI renders, signals queue up and every frame triggers a redundant redraw.
 
-`spec_wrangler.py` is 1721 lines — the largest file. It mixes:
-- Parameter tree UI
-- SPEC file parsing orchestration
-- Image loading/stacking logic
-- Session save/load
-- Integration parameter management
+Fix: Added a **coalescing QTimer** (200 ms single-shot) in `static_scan_widget`:
+- `update_data(idx)` now only updates in-memory data structures (fast, under `file_lock`), then starts/restarts the timer
+- `_flush_pending_update()` fires once after the burst settles, rendering only the latest frame
+- `wrangler_finished()` flushes immediately so the final frame is always shown
+- Result: ~5 fps display refresh during processing, no frame skipping, no GUI lag
 
-**Action**: Split into:
-1. `wranglers/spec_wrangler_ui.py` — Pure UI (parameter tree, signals)
-2. `wranglers/spec_wrangler_logic.py` — Orchestration that calls ssrl_xrd_tools
-3. Consider a `wranglers/nexus_wrangler.py` for NeXus/Bluesky data sources
+### 4e. NeXus/Tiled wrangler — DONE
+Added new wrangler for NeXus/HDF5 image stacks:
+- `wranglers/nexus_wrangler.py` — Widget with parameter tree for NeXus file, PONI, mask, GI params, output dir. Simpler than specWrangler (no SPEC file parsing, no background matching). Session persistence via `_SESSION_PARAMS` pattern.
+- `wranglers/nexus_wrangler_thread.py` — Worker thread using `ssrl_xrd_tools.io.nexus.find_nexus_image_dataset` to locate the 3D image dataset, reads frames via h5py, integrates each through EwaldArch pipeline.
+- Registered as `'NeXus'` in `static_scan_widget.wranglers` dict — appears as a tab alongside `'SPEC'`.
 
-### 4c. Display frame modernization
+**Files changed in Phase 4**:
 
-`display_frame_widget.py` (1492 lines) handles both 1D plots and 2D images. Consider splitting:
-1. `display/plot_1d_widget.py` — 1D line plots with overlays
-2. `display/image_2d_widget.py` — 2D image display with colormap/histogram
-3. `display/display_controller.py` — Coordination between views
-
-### 4d. Threading cleanup
-
-Current threading uses a mix of `QThread`, `ProcessPoolExecutor`, and `multiprocessing.Process` with `Condition` locks.
-
-**Action**:
-1. Standardize on `QThread` + `QThreadPool` for GUI-bound work
-2. Use `concurrent.futures.ProcessPoolExecutor` for CPU-heavy integration (already partially done)
-3. Remove raw `multiprocessing.Process` usage in wranglers
-4. Consider `asyncio` integration for I/O-bound operations (Tiled catalog queries, network file access)
-
-### 4e. Add NeXus/Tiled wrangler
-
-For the Bluesky migration, add a new wrangler that reads from NeXus files or Tiled catalogs using `ssrl_xrd_tools.io.nexus` and `ssrl_xrd_tools.io.tiled`.
+| File | Changes |
+|------|---------|
+| `wranglers/spec_wrangler.py` | Removed specThread + utilities (~800 lines), simplified imports |
+| `wranglers/spec_wrangler_thread.py` | **NEW** — specThread class + utility functions |
+| `wranglers/nexus_wrangler.py` | **NEW** — nexusWrangler widget |
+| `wranglers/nexus_wrangler_thread.py` | **NEW** — nexusThread worker |
+| `wranglers/__init__.py` | Added nexusWrangler import |
+| `display_constants.py` | **NEW** — axis labels, unicode constants, downsample helper |
+| `display_frame_widget.py` | Imports from display_constants (~50 lines removed) |
+| `static_scan_widget.py` | Coalescing QTimer for update lag fix, NeXus wrangler registration |
 
 ---
 
@@ -229,36 +279,41 @@ Each widget:
 
 ## Execution Order
 
-Recommended sequence, with each phase building on the previous:
-
 ```
-Phase 1 (Containers)     ← Foundation, unblocks everything else
+Phase 1 (Containers)     ✅ DONE
   ├── 1a: PONI
   ├── 1b: Integration results
   └── 1c: lmfit models
       ↓
-Phase 2 (EwaldArch/Sphere) ← Uses new containers
-  ├── 2a: EwaldArch
-  ├── 2b: EwaldSphere
-  └── 2c: Location decision
+Phase 2 (EwaldArch/Sphere + GI) ✅ DONE
+  ├── 2a: EwaldArch — NeXus, GI restructuring, mask fixes
+  ├── 2b: EwaldSphere — NeXus rewrite
+  └── 2c: Location decision — keep in xdart (Option A)
       ↓
-Phase 3 (Cleanup)         ← Remove now-redundant code
-  ├── 3a: _utils.py
-  ├── 3b: modules/spec
-  └── 3c: Audit remaining
+Phase 3 (Cleanup)         ✅ DONE
+  ├── 3a: _utils.py — removed ~200 lines, re-exported write_xye/csv
+  ├── 3b: modules/spec — removed entirely
+  └── 3c: Audit remaining — kept GUI-specific utils
       ↓
-Phase 4 (GUI Modernize)   ← Can partially overlap with Phase 3
+Phase 4 (GUI Modernize)   ✅ DONE
   ├── 4a: Framework decision (stay PySide6)
-  ├── 4b: Split spec_wrangler
-  ├── 4c: Split display_frame
-  ├── 4d: Threading cleanup
-  └── 4e: NeXus/Tiled wrangler
+  ├── 4b: Split spec_wrangler → spec_wrangler.py + spec_wrangler_thread.py
+  ├── 4c: Extract display_constants.py (deeper split deferred)
+  ├── 4d: Coalescing QTimer for GUI update lag fix
+  └── 4e: NeXus/Tiled wrangler (nexus_wrangler.py + nexus_wrangler_thread.py)
       ↓
-Phase 5 (Jupyter Widgets)  ← Independent, can start in parallel
-  ├── 5a: Architecture
-  ├── 5b: powder_1d_viewer (first)
-  ├── 5c: powder_2d_viewer
-  └── 5d: rsm_viewer, integration_widget
+Phase 4.5 (xdart Hardening) ✅ DONE
+  ├── Eiger HDF5: persistent h5py handle (was open/close per frame)
+  ├── Dead code removal (unused imports, functions, commented blocks)
+  ├── 1D-only mode audit: confirmed correct (skip_2d propagation)
+  ├── Live mode audit: functional, glob+sleep(2s) polling
+  ├── ssrl_xrd_tools delegation audit: all heavy computation delegated
+  └── Threading audit: h5pool, coalescing timer, file_lock all verified
+      ↓
+Phase 5 (Jupyter Widgets + Analysis) ← NEXT
+  ├── 5a: Architecture (panel + bokeh)
+  ├── 5b: Jupyter viewers (powder_1d, powder_2d, rsm, integration)
+  └── 5c: Analysis tools (fitting, strain, texture)
 ```
 
 ## Testing Strategy
@@ -270,6 +325,18 @@ Each phase should maintain passing tests:
 - **Phase 3**: Ensure no xdart test regressions after removing code
 - **Phase 4**: Manual GUI testing at minimum; consider pytest-qt for widget tests
 - **Phase 5**: Notebook-based test examples
+
+## Future xdart Features (Post-Phase 5)
+
+### MultiGeometry stitching
+pyFAI's `MultiGeometry` class (in `pyFAI.multi`) can stitch together images from multiple detector positions into a single pattern with extended Q/2θ range. `ssrl_xrd_tools.integrate.multi` already wraps this with `stitch_1d()` and `stitch_2d()`. xdart's `EwaldSphere` already has stub methods `multigeometry_integrate_1d()` and `multigeometry_integrate_2d()` that delegate to these. The GUI side needs a UI for selecting multiple PONI files and associating them with detector positions.
+
+### Watchdog for live mode
+Current live mode uses filesystem polling (glob every 2 seconds). The `watchdog` library would provide event-driven file detection with lower latency. This would be an **optional dependency** — add to `pyproject.toml` as:
+```
+watchdog = {version = "*", optional = true}
+```
+The wrangler thread could detect its availability at runtime and fall back to glob polling if not installed.
 
 ## Risk Mitigation
 
