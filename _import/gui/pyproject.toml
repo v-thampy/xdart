@@ -1,55 +1,65 @@
-[tool.poetry]
-name = "xdart"
-version = "0.15"
-description = "A pyFAI based GUI utility to rebin and visualize X-ray Diffraction data"
-authors = ["Vivek Thampy <vthampy@stanford.edu>"]
-license = "MIT"
-readme = "README.md"
-homepage = "https://github.com/v-thampy/xdart.git"
-repository = "https://github.com/v-thampy/xdart.git"
-documentation = "https://github.com/v-thampy/xdart/blob/master/xdart_manual.pdf"
-keywords = ["xrd", "diffracion", "pyFAI"]
-
-[tool.poetry.dependencies]
-python = ">=3.8"
-pyfai = "*"
-pyqtgraph = ">=0.13.7"
-PySide6 = ">=6.5"
-pandas = "*"
-scikit-image = "*"
-lmfit = "*"
-pyyaml = "*"
-numpy = "*"
-scipy = "*"
-silx = "*"
-fabio = "*"
-matplotlib = "*"
-requests = "*"
-h5py = "*"
-hdf5plugin = "*"
-seaborn = "*"
-ipympl = "*"
-ipywidgets = "*"
-joblib = "*"
-icecream = "*"
-jupyterlab = "*"
-nodejs = "*"
-hvplot = "*"
-holoviews = "*"
-panel = "*"
-xlrd = "*"
-openpyxl = "*"
-imagecodecs = "*"
-natsort = '*'
-ssrl_xrd_tools = '*'
-xrayutilities = '*'
-
-[tool.poetry.dev-dependencies]
-# Add your development dependencies here
-
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
 
-[tool.poetry.scripts]
+[project]
+name = "xdart"
+version = "0.15.0"
+description = "A pyFAI-based GUI for X-ray diffraction data reduction and visualization"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Vivek Thampy", email = "vthampy@stanford.edu"},
+]
+keywords = ["xrd", "diffraction", "pyFAI", "SSRL", "synchrotron", "GUI"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+dependencies = [
+    "ssrl_xrd_tools>=0.2.0",
+    "numpy",
+    "scipy",
+    "h5py",
+    "hdf5plugin",
+    "fabio",
+    "silx",
+    "pyFAI",
+    "xrayutilities",
+    "PySide6>=6.5",
+    "pyqtgraph>=0.13.7",
+    "pandas",
+    "lmfit",
+    "pyyaml",
+    "matplotlib",
+    "joblib",
+    "natsort",
+    "imagecodecs",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "build",
+    "twine",
+]
+
+[project.scripts]
 xdart = "xdart.xdart_main:main"
+
+[project.urls]
+Homepage = "https://github.com/v-thampy/xdart"
+Repository = "https://github.com/v-thampy/xdart"
+Issues = "https://github.com/v-thampy/xdart/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
