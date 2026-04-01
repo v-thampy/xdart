@@ -4,27 +4,13 @@
 """
 
 # Standard library imports
-import time
 import os
-import subprocess
-import sys
 
 # Other imports
-import xml.etree.ElementTree
-
 import numpy as np
 from pathlib import Path
 from collections import OrderedDict
 
-import scipy.ndimage
-
-import scipy.ndimage as ndimage
-from scipy.signal import medfilt2d
-
-import pandas as pd
-import yaml
-import json
-import h5py
 import fabio
 
 # Detector File Sizes
@@ -35,47 +21,10 @@ detector_file_sizes = {
     'Pilatus 1M': 4092732,
 }
 
-
-def write_xye(fname, xdata, ydata, variance=None):
-    """Saves data to an xye file. Variance is the square root of the
-    signal.
-    
-    args:
-        fname: str, path to file
-        xdata: angle or q data
-        ydata: intensity
-    """
-    if variance is None:
-        _variance = np.sqrt(abs(ydata))
-    else:
-        _variance = variance
-    with open(fname, "w") as file:
-        for i in range(0, len(xdata)):
-            file.write(
-                str(xdata[i]) + "\t" +
-                str(ydata[i]) + "\t" +
-                str(_variance[i]) + "\n"
-            )
-
-
-def write_csv(fname, xdata, ydata, variance=None):
-    """Saves data to a csv file.
-    
-    args:
-        fname: str, path to file
-        xdata: angle or q data
-        ydata: intensity
-    """
-    if variance is None:
-        _variance = np.sqrt(abs(ydata))
-    else:
-        _variance = variance
-    with open(fname, 'w') as file:
-        for i in range(0, len(xdata)):
-            file.write(str(xdata[i]) + ', ' +
-                       str(ydata[i]) + ', ' +
-                       str(_variance[i]) + '\n')
-
+# ---------------------------------------------------------------------------
+# I/O helpers — re-exported from ssrl_xrd_tools
+# ---------------------------------------------------------------------------
+from ssrl_xrd_tools.io.export import write_xye  # noqa: E402, F401
 
 # ---------------------------------------------------------------------------
 # HDF5 codec — imported from ssrl_xrd_tools.core.hdf5
@@ -102,67 +51,21 @@ from ssrl_xrd_tools.core.hdf5 import (  # noqa: E402
 )
 
 
-def find_between( s, first, last ):
-    """find first occurence of substring in string s
-     between two substrings (first and last)
-
-    Args:
-        s (str): input string
-        first (str): first substring
-        last (str): second substring
-
-    Returns:
-        str: substring between first and last
-    """
-    try:
-        start = s.index( first ) + len( first )
-        end = s.index( last, start )
-        return s[start:end]
-    except ValueError:
-        return ""
-
-
-def find_between_r( s, first, last ):
-    """find last occurence of substring in string s
-     between two substrings (first and last)
-
-    Args:
-        s (str): input string
-        first (str): first substring
-        last (str): second substring
-
-    Returns:
-        str: substring between first and last
-    """
-    try:
-        start = s.rindex(first) + len(first)
-        end = s.rindex(last, start)
-        return s[start:end]
-    except ValueError:
-        return ""
-
-
-# def get_fname_dir(fname):
 def get_fname_dir():
     """
-    Returns directory on local drive to save temporary h5 files in
-
-    Args:
-        fname: {str} Name of scan name used to create subdirectory
+    Returns directory on local drive to save temporary h5 files in.
 
     Returns:
         path: {str} Path where h5 file is saved
     """
     home_path = str(Path.home())
-
     path = os.path.join(home_path, 'xdart_processed_data')
     Path(path).mkdir(parents=True, exist_ok=True)
-
     return path
 
 
 def split_file_name(fname):
-    """Splits filename to get directory, file root and extension
+    """Splits filename to get directory, file root and extension.
 
     Arguments:
         fname {str} -- full image file name with path
@@ -178,7 +81,7 @@ def split_file_name(fname):
 
 
 def get_sname_img_number(fname):
-    """Splits filename to get scan name and image number
+    """Splits filename to get scan name and image number.
 
     Arguments:
         fname {str} -- full image file name with path
@@ -197,7 +100,7 @@ def get_sname_img_number(fname):
 
 
 def get_series_avg(fname, detector, meta_ext):
-    """ Returns the averaged image and meta data for a series
+    """Returns the averaged image and meta data for a series.
 
     Arguments:
         fname {str} -- full image file name with path
@@ -206,7 +109,7 @@ def get_series_avg(fname, detector, meta_ext):
         series_name {str} -- series name (if series exists)
         series_file_names {str array} -- file names in series
         img_data {ndarray} -- averaged 2D intensity over a series
-        img_mete {dict} -- averaged meta data over a series
+        img_meta {dict} -- averaged meta data over a series
     """
     fpath = Path(fname)
     series_name, img_number = get_sname_img_number(fname)
@@ -239,50 +142,6 @@ def get_series_avg(fname, detector, meta_ext):
             pass
 
     return series_name, fnames, data, img_meta
-
-
-def get_scan_name(fname):
-    """Splits filename to get scan name
-
-    Arguments:
-        fname {str} -- full image file name with path
-    Returns:
-        scan_name {str}
-    """
-    directory, root, ext = split_file_name(fname)
-    try:
-        img_number = root[root.rindex('_') + 1:]
-    except ValueError:
-        img_number = ''
-
-    if img_number:
-        try:
-            _ = int(img_number)
-            return root[:root.rindex('_')]
-        except ValueError:
-            return root
-
-    return root
-
-
-def get_img_number(fname):
-    """Splits filename to get scan name and image number
-
-    Arguments:
-        fname {str} -- full image file name with path
-    Returns:
-        scan_name {str}
-        nImage {int}
-    """
-    # directory, root, ext = split_file_name(fname)
-    root = os.path.splitext(fname)[0]
-    try:
-        img_number = root[root.rindex('_') + 1:]
-        img_number = int(img_number)
-    except ValueError:
-        img_number = 1
-
-    return img_number
 
 
 def match_img_detector(img_file, poni):
@@ -322,36 +181,22 @@ def get_img_meta(img_file, meta_ext, spec_path=None, rv='all'):
     return read_image_metadata(img_file, meta_format=fmt)
 
 
-def get_motor_val(pdi_file, motor):
-    """Return position of a particular motor from PDI file
-
-    Args:
-        pdi_file (str): PDI file name with path
-        motor (str): Motor name
-
-    Returns:
-        float: Motor position
-    """
-    from ssrl_xrd_tools.io.metadata import read_pdi_metadata
-    motors = read_pdi_metadata(pdi_file)
-    return motors[motor]
-
-
 def get_img_data(
         fname, detector, orientation='horizontal',
         flip=False, fliplr=False, transpose=False,
         return_float=False, im=0):
-    """Read image file and return numpy array
+    """Read image file and return numpy array.
 
     Args:
         fname (str): File Name with path
         detector (detector object): pyFAI detector object
-        orientation (str, optional): Orientation of detector. Options: 'horizontal', 'vertical'. Defaults to 'horizontal'.
-        flip (bool, optional): Flag to flip the image up-down (required by pyFAI at times). Defaults to False.
-        fliplr (bool, optional): Flag to flip the image left-right (required by pyFAI at times). Defaults to False.
-        transpose (bool, optional): Flag to transpose the image (required by pyFAI at times). Defaults to False.
-        return_float (bool, optional): Convert array to float. Defaults to False.
-        im (integer, optional): image number if input is h5 file from Eiger. Defaults to 0
+        orientation (str, optional): Orientation of detector.
+            Options: 'horizontal', 'vertical'. Defaults to 'horizontal'.
+        flip (bool, optional): Flip up-down. Defaults to False.
+        fliplr (bool, optional): Flip left-right. Defaults to False.
+        transpose (bool, optional): Transpose image. Defaults to False.
+        return_float (bool, optional): Convert to float. Defaults to False.
+        im (integer, optional): Frame number for multi-image files. Defaults to 0.
 
     Returns:
         ndarray: Image data read into numpy array
@@ -390,80 +235,6 @@ def get_img_data(
     return img_data
 
 
-def get_mask_array(detector, mask_file=None, det_orientation=0):
-    """Get mask array from mask file
-    """
-    mask = detector.calc_mask()
-    if mask_file and os.path.exists(mask_file):
-        if mask is not None:
-            try:
-                mask += fabio.open(mask_file).data
-            except ValueError:
-                print('Mask file not valid for Detector')
-                pass
-        else:
-            mask = fabio.open(mask_file).data
-
-    if mask is None:
-        return None
-
-    if mask.shape != detector.shape:
-        print('Mask file not valid for Detector')
-        return None
-
-    mask = scipy.ndimage.rotate(mask, det_orientation)
-    return np.flatnonzero(mask)
-
-
-def get_norm_fac(normChannel, scan_data, arch_ids=None, return_sum=True):
-    """Check to see if normalization channel exists in metadata and return name"""
-    normChannel = get_normChannel(normChannel, scan_data_keys=scan_data.columns)
-    if arch_ids is None:
-        arch_ids = scan_data.index
-    norm_fac = scan_data[normChannel][arch_ids] if normChannel else 1
-    if return_sum and not isinstance(norm_fac, int):
-        norm_fac = norm_fac.mean()
-
-    return norm_fac
-
-
-def get_normChannel(normChannel, scan_data_keys):
-    """Check to see if normalization channel exists in metadata and return name"""
-    if normChannel == 'sec':
-        normChannel = {'sec', 'seconds', 'Seconds', 'Sec', 'SECONDS', 'SEC'}
-    else:
-        normChannel = {normChannel, normChannel.lower(), normChannel.upper()}
-    normChannel = normChannel.intersection(scan_data_keys)
-    return normChannel.pop() if len(normChannel) > 0 else None
-
-
-def smooth_img(img, kernel_size=3, window_size=3, order=0):
-    """Apply a Gaussian filter to smooth image
-
-    Args:
-        img (ndarray): 2D numpy array for image
-        kernel_size (int, optional): Gaussian filter kernel. Defaults to 3.
-        window_size (int, optional): Gaussian filter window (should be odd). Defaults to 3.
-        order (int, optional): Order of the filter. Defaults to 0.
-
-    Returns:
-        ndarray: Smoothed image
-    """
-    if (np.mod(kernel_size, 2) == 0) or (np.mod(window_size, 2) == 0):
-        print('Smoothing windows should be odd integers')
-        return img
-
-    if order >= window_size:
-        order = window_size - 1
-
-    if kernel_size > 1:
-        img = medfilt2d(img, 3)
-    if window_size > 1:
-        img = ndimage.gaussian_filter(img, sigma=(window_size, window_size), order=order)
-
-    return img
-
-
 class FixSizeOrderedDict(OrderedDict):
     def __init__(self, *args, max=0, **kwargs):
         self._max = max
@@ -478,28 +249,7 @@ class FixSizeOrderedDict(OrderedDict):
                     diffs = [abs(int(k_)-k) for k_ in keys]
                     out_key = keys[diffs.index(max(diffs))]
                     self.pop(out_key)
-                    # pos = False if (abs(k - keys[0]) > abs(k - keys[-1])) else True
                 except ValueError:
                     self.popitem(False)
 
         OrderedDict.__setitem__(self, key, value)
-
-
-def launch(program):
-    """launch(program)
-      Run program as if it had been double-clicked in Finder, Explorer,
-      Nautilus, etc. On OS X, the program should be a .app bundle, not a
-      UNIX executable. When used with a URL, a non-executable file, etc.,
-      the behavior is implementation-defined.
-
-      Returns something false (0 or None) on success; returns something
-      True (e.g., an error code from open or xdg-open) or throws on failure.
-      However, note that in some cases the command may succeed without
-      actually launching the targeted program."""
-    if sys.platform == 'darwin':
-        ret = subprocess.call(['open', program])
-    elif sys.platform.startswith('win'):
-        ret = os.startfile(os.path.normpath(program))
-    else:
-        ret = subprocess.call(['xdg-open', program])
-    return ret

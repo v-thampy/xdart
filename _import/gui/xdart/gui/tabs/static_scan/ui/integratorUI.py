@@ -24,15 +24,15 @@ class Ui_Form(object):
     def setupUi(self, Form):
         if not Form.objectName():
             Form.setObjectName(u"Form")
-        Form.resize(1440, 402)
-        Form.setMaximumSize(QSize(16777215, 430))
+        Form.resize(1440, 260)
+        Form.setMaximumSize(QSize(16777215, 280))
         self.verticalLayout = QVBoxLayout(Form)
         self.verticalLayout.setSpacing(0)
         self.verticalLayout.setObjectName(u"verticalLayout")
         self.verticalLayout.setContentsMargins(0, 0, 0, 0)
         self.frame1D = QFrame(Form)
         self.frame1D.setObjectName(u"frame1D")
-        self.frame1D.setMaximumSize(QSize(16777215, 190))
+        self.frame1D.setMaximumSize(QSize(16777215, 120))
         self.frame1D.setFrameShape(QFrame.StyledPanel)
         self.frame1D.setFrameShadow(QFrame.Raised)
         self.frame1D.setLineWidth(20)
@@ -186,45 +186,24 @@ class Ui_Form(object):
 
         self.frame1D_layout.addWidget(self.frame1D_range)
 
-        self.frame1D_buttons = QFrame(self.frame1D)
-        self.frame1D_buttons.setObjectName(u"frame1D_buttons")
-        self.frame1D_buttons.setMaximumSize(QSize(16777215, 71))
-        self.frame1D_buttons.setFrameShape(QFrame.NoFrame)
-        self.frame1D_buttons.setFrameShadow(QFrame.Raised)
-        self.horizontalLayout_6 = QHBoxLayout(self.frame1D_buttons)
-        self.horizontalLayout_6.setObjectName(u"horizontalLayout_6")
-        self.horizontalLayout_6.setContentsMargins(5, 5, 5, 32)
-        self.horizontalLayout_5 = QHBoxLayout()
-        self.horizontalLayout_5.setSpacing(6)
-        self.horizontalLayout_5.setObjectName(u"horizontalLayout_5")
-        self.integrate1D = QPushButton(self.frame1D_buttons)
-        self.integrate1D.setObjectName(u"integrate1D")
+        # Button frame hidden — Re-Integrate/Advanced moved elsewhere.
+        # Widgets kept as hidden stubs so existing signal connections don't break.
         sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         sizePolicy1.setHorizontalStretch(0)
         sizePolicy1.setVerticalStretch(0)
-        sizePolicy1.setHeightForWidth(self.integrate1D.sizePolicy().hasHeightForWidth())
-        self.integrate1D.setSizePolicy(sizePolicy1)
         font1 = QFont()
         font1.setFamilies([u"Arial"])
         font1.setPointSize(13)
-        self.integrate1D.setFont(font1)
-        self.integrate1D.setFocusPolicy(Qt.StrongFocus)
-
-        self.horizontalLayout_5.addWidget(self.integrate1D)
-
+        self.frame1D_buttons = QFrame(self.frame1D)
+        self.frame1D_buttons.setObjectName(u"frame1D_buttons")
+        self.frame1D_buttons.setMaximumSize(QSize(0, 0))
+        self.frame1D_buttons.setVisible(False)
+        self.integrate1D = QPushButton(self.frame1D_buttons)
+        self.integrate1D.setObjectName(u"integrate1D")
+        self.integrate1D.setVisible(False)
         self.advanced1D = QPushButton(self.frame1D_buttons)
         self.advanced1D.setObjectName(u"advanced1D")
-        sizePolicy1.setHeightForWidth(self.advanced1D.sizePolicy().hasHeightForWidth())
-        self.advanced1D.setSizePolicy(sizePolicy1)
-        self.advanced1D.setFont(font1)
-        self.advanced1D.setFocusPolicy(Qt.StrongFocus)
-        self.advanced1D.setLayoutDirection(Qt.LeftToRight)
-
-        self.horizontalLayout_5.addWidget(self.advanced1D)
-
-
-        self.horizontalLayout_6.addLayout(self.horizontalLayout_5)
-
+        self.advanced1D.setVisible(False)
 
         self.frame1D_layout.addWidget(self.frame1D_buttons)
 
@@ -236,7 +215,7 @@ class Ui_Form(object):
 
         self.frame2D = QFrame(Form)
         self.frame2D.setObjectName(u"frame2D")
-        self.frame2D.setMaximumSize(QSize(16777215, 190))
+        self.frame2D.setMaximumSize(QSize(16777215, 120))
         self.frame2D.setFrameShape(QFrame.StyledPanel)
         self.frame2D.setFrameShadow(QFrame.Raised)
         self.frame2D.setLineWidth(20)
@@ -391,39 +370,18 @@ class Ui_Form(object):
 
         self.frame2D_layout.addWidget(self.frame2D_range)
 
+        # Button frame hidden — Re-Integrate/Advanced moved elsewhere.
+        # Widgets kept as hidden stubs so existing signal connections don't break.
         self.frame2D_buttons = QFrame(self.frame2D)
         self.frame2D_buttons.setObjectName(u"frame2D_buttons")
-        self.frame2D_buttons.setMaximumSize(QSize(16777215, 71))
-        self.frame2D_buttons.setFrameShape(QFrame.NoFrame)
-        self.frame2D_buttons.setFrameShadow(QFrame.Raised)
-        self.horizontalLayout_10 = QHBoxLayout(self.frame2D_buttons)
-        self.horizontalLayout_10.setObjectName(u"horizontalLayout_10")
-        self.horizontalLayout_10.setContentsMargins(5, 5, 5, 32)
-        self.horizontalLayout_11 = QHBoxLayout()
-        self.horizontalLayout_11.setSpacing(6)
-        self.horizontalLayout_11.setObjectName(u"horizontalLayout_11")
+        self.frame2D_buttons.setMaximumSize(QSize(0, 0))
+        self.frame2D_buttons.setVisible(False)
         self.integrate2D = QPushButton(self.frame2D_buttons)
         self.integrate2D.setObjectName(u"integrate2D")
-        sizePolicy1.setHeightForWidth(self.integrate2D.sizePolicy().hasHeightForWidth())
-        self.integrate2D.setSizePolicy(sizePolicy1)
-        self.integrate2D.setFont(font1)
-        self.integrate2D.setFocusPolicy(Qt.StrongFocus)
-
-        self.horizontalLayout_11.addWidget(self.integrate2D)
-
+        self.integrate2D.setVisible(False)
         self.advanced2D = QPushButton(self.frame2D_buttons)
         self.advanced2D.setObjectName(u"advanced2D")
-        sizePolicy1.setHeightForWidth(self.advanced2D.sizePolicy().hasHeightForWidth())
-        self.advanced2D.setSizePolicy(sizePolicy1)
-        self.advanced2D.setFont(font1)
-        self.advanced2D.setFocusPolicy(Qt.StrongFocus)
-        self.advanced2D.setLayoutDirection(Qt.LeftToRight)
-
-        self.horizontalLayout_11.addWidget(self.advanced2D)
-
-
-        self.horizontalLayout_10.addLayout(self.horizontalLayout_11)
-
+        self.advanced2D.setVisible(False)
 
         self.frame2D_layout.addWidget(self.frame2D_buttons)
 

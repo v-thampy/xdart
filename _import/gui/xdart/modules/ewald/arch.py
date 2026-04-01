@@ -11,6 +11,8 @@ from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 from pyFAI import units
 import numpy as np
 
+from scipy.ndimage import zoom as ndimage_zoom
+
 from xdart import utils
 from ssrl_xrd_tools.core.containers import (
     PONI,
@@ -29,6 +31,56 @@ from ssrl_xrd_tools.integrate.gid import (
     integrate_gi_exitangles,
 )
 
+
+
+# Maximum thumbnail dimension — both axes are scaled to fit within this.
+_THUMBNAIL_MAX = 256
+
+
+def _make_thumbnail(image, mask_idx=None, global_mask=None, max_size=_THUMBNAIL_MAX):
+    """Downsample a 2D image to at most (max_size, max_size) using scipy zoom.
+
+    Masked pixels are set to NaN *before* downsampling so the mask is
+    baked into the thumbnail.  This lets the GUI display a masked preview
+    without needing the full-resolution mask array.
+
+    Parameters
+    ----------
+    image : ndarray
+        2D detector image (typically map_raw - bg_raw).
+    mask_idx : array-like or None
+        Flat indices of pixels to mask (arch-level mask).
+    global_mask : array-like or None
+        Flat indices of pixels to mask (detector-level mask).
+    max_size : int
+        Maximum dimension of the output thumbnail.
+
+    Returns float32 array, or None if input is invalid.
+    """
+    if image is None:
+        return None
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim != 2:
+        return None
+
+    # Apply masks as NaN before downsampling
+    all_mask = []
+    if mask_idx is not None and len(mask_idx) > 0:
+        all_mask.append(np.asarray(mask_idx, dtype=int))
+    if global_mask is not None and len(global_mask) > 0:
+        all_mask.append(np.asarray(global_mask, dtype=int))
+    if all_mask:
+        flat_mask = np.unique(np.concatenate(all_mask))
+        flat_mask = flat_mask[flat_mask < arr.size]  # safety bound
+        arr_flat = arr.ravel()
+        arr_flat[flat_mask] = np.nan
+        arr = arr_flat.reshape(arr.shape)
+
+    h, w = arr.shape
+    if h <= max_size and w <= max_size:
+        return arr
+    factor = min(max_size / h, max_size / w)
+    return ndimage_zoom(arr, factor, order=1).astype(np.float32)
 
 
 class EwaldArch():
@@ -79,6 +131,7 @@ class EwaldArch():
                  scan_info={}, ai_args={}, file_lock=Condition(),
                  static=False, bg_raw=0,
                  gi=False, th_mtr='th', tilt_angle=0,
+                 sample_orientation=4,
                  series_average=False, integrator=None
                  ):
         # pylint: disable=too-many-arguments
@@ -111,9 +164,13 @@ class EwaldArch():
         self.gi = gi
         self.th_mtr = th_mtr
         self.tilt_angle = tilt_angle
+        self.sample_orientation = sample_orientation
         self.series_average = series_average
 
         self.integrator = integrator if integrator is not None else self.setup_integrator()
+        # Disable pyFAI's legacy mask heuristic that auto-inverts masks
+        # with > 50% masked pixels (e.g. threshold masks).
+        self.integrator.USE_LEGACY_MASK_NORMALIZATION = False
 
         self.arch_lock = Condition()
         self.map_norm = 1
@@ -122,6 +179,8 @@ class EwaldArch():
         self.int_2d: IntegrationResult2D | None = None
         self.gi_1d: dict[str, IntegrationResult1D] = {}
         self.gi_2d: dict[str, IntegrationResult2D] = {}
+        self.source_file: str = ""
+        self.thumbnail: np.ndarray | None = None  # downsampled (map_raw - bg_raw)
 
     def __getstate__(self):
         """Exclude threading.Condition objects so EwaldArch can be pickled
@@ -164,7 +223,12 @@ class EwaldArch():
         try:
             return float(self.th_mtr)
         except (ValueError, TypeError):
-            return float(self.scan_info.get(self.th_mtr, 0.0))
+            # Case-insensitive lookup for motor position
+            th_mtr = str(self.th_mtr).lower()
+            for key, val in self.scan_info.items():
+                if key.lower() == th_mtr:
+                    return float(val)
+            return 0.0
 
     def reset(self):
         """Clears all data, resets to a default EwaldArch.
@@ -183,18 +247,18 @@ class EwaldArch():
         self.gi_2d = {}
             
     def get_mask(self, global_mask=None):
-        if global_mask is not None:
-            mask_idx = np.unique(np.append(self.mask, global_mask))
-            # mask_idx.sort()
-        else:
-            mask_idx = self.mask
-        mask = np.zeros(self.map_raw.size, dtype=int)
+        shape = self.map_raw.shape
+        size = self.map_raw.size
+        mask = np.zeros(size, dtype=bool)
         try:
-            mask[mask_idx] = 1
-            return mask.reshape(self.map_raw.shape)
+            if self.mask is not None and len(self.mask):
+                mask[self.mask] = True
+            if global_mask is not None and len(global_mask):
+                mask[global_mask] = True
+            return mask.reshape(shape)
         except IndexError:
             print('Mask File Shape Mismatch')
-            return mask
+            return mask.reshape(shape) if mask.size == size else mask
 
     def integrate_1d(self, numpoints=10000, radial_range=None,
                      monitor=None, unit=units.TTH_DEG, global_mask=None,
@@ -214,6 +278,9 @@ class EwaldArch():
             result: integrate1d result from pyFAI.
         """
         with self.arch_lock:
+            if self.map_raw is None:
+                return  # no raw data (e.g. loaded from NeXus) — cannot re-integrate
+
             self.map_norm = 1
             if monitor is not None:
                 if monitor.upper() in self.scan_info.keys():
@@ -224,7 +291,21 @@ class EwaldArch():
             if self.mask is None:
                 self.mask = np.arange(self.map_raw.size)[self.map_raw.flatten() < 0]
 
+            # Keys that only make sense for GI integration — strip before
+            # passing to the standard pyFAI integrator.
+            _gi_only_keys = {
+                'gi_mode_1d', 'gi_mode_2d', 'npt_oop',
+                'sample_orientation', 'tilt_angle',
+            }
+
             if not self.gi:
+                std_kwargs = {k: v for k, v in kwargs.items()
+                              if k not in _gi_only_keys}
+                chi_offset = std_kwargs.pop('chi_offset', 0.0)
+                if 'azimuth_range' in std_kwargs and std_kwargs['azimuth_range'] is not None:
+                    _az = std_kwargs['azimuth_range']
+                    std_kwargs['azimuth_range'] = (_az[0] - chi_offset, _az[1] - chi_offset)
+                
                 result = integrate_1d(
                     (self.map_raw - self.bg_raw) / self.map_norm,
                     self.integrator,
@@ -232,7 +313,7 @@ class EwaldArch():
                     unit=str(unit),
                     radial_range=radial_range,
                     mask=self.get_mask(global_mask),
-                    **kwargs,
+                    **std_kwargs,
                 )
                 self.int_1d = result
             else:
@@ -248,63 +329,62 @@ class EwaldArch():
                     self._poni_from_integrator(),
                     incident_angle=incident_angle,
                     tilt_angle=self.tilt_angle,
+                    sample_orientation=self.sample_orientation,
                     angle_unit="deg",
                 )
+                self._fiber_integrator = fi  # cache for integrate_2d
 
                 image_data = (self.map_raw - self.bg_raw) / self.map_norm
                 mask = self.get_mask(global_mask)
-                gi_mode_1d = kwargs.get('gi_mode_1d', 'q_ip')
+                gi_mode_1d = kwargs.get('gi_mode_1d', 'q_total')
+                npt_oop = kwargs.get('npt_oop', numpoints)
 
-                # In-plane (Qxy) profile
-                r_ip = integrate_gi_1d(
-                    image_data, fi, npt=numpoints, unit='qip_A^-1',
-                    method='no', mask=mask,
-                    radial_range=radial_range,
-                    azimuth_range=kwargs.get('azimuth_range'),
-                    **gi_kwargs,
-                )
-
-                # OOP (Qz) profile: sum the (Qip, Qoop) 2D map over the IP axis
-                r2d = integrate_gi_2d(
-                    image_data, fi, npt_rad=min(numpoints, 500),
-                    npt_azim=min(numpoints, 500),
-                    method='no', mask=mask,
-                )
-                r_qoop = IntegrationResult1D(
-                    radial=r2d.azimuthal,
-                    intensity=np.nansum(r2d.intensity, axis=0),
-                    unit="qoop_A^-1",
-                )
-
-                # Q total (polar radial profile)
-                r_total = integrate_gi_polar_1d(
-                    image_data, fi, npt=numpoints,
-                    method='no', mask=mask, **gi_kwargs,
-                )
-
-                # Exit angle profile
-                r_exit = integrate_gi_exitangles_1d(
-                    image_data, fi, npt=numpoints,
-                    method='no', mask=mask, **gi_kwargs,
-                )
-
-                # Store all GI 1D results
-                self.gi_1d = {
-                    'qip': r_ip,
-                    'qoop': r_qoop,
-                    'qtotal': r_total,
-                    'exit': r_exit,
-                }
-
-                # Set primary result from selected mode
-                if gi_mode_1d == 'q_oop':
-                    self.int_1d = r_qoop
-                elif gi_mode_1d == 'q_total':
-                    self.int_1d = r_total
+                # Only compute the selected GI 1D mode
+                if gi_mode_1d == 'q_ip':
+                    result = integrate_gi_1d(
+                        image_data, fi, npt=numpoints, npt_oop=npt_oop,
+                        unit='qip_A^-1',
+                        method='no', mask=mask,
+                        radial_range=radial_range,
+                        azimuth_range=kwargs.get('azimuth_range'),
+                        **gi_kwargs,
+                    )
+                    self.gi_1d['qip'] = result
+                elif gi_mode_1d == 'q_oop':
+                    # OOP (Qz) profile: sum the (Qip, Qoop) 2D map over IP
+                    r2d = integrate_gi_2d(
+                        image_data, fi, npt_rad=numpoints,
+                        npt_azim=npt_oop,
+                        method='no', mask=mask,
+                        radial_range=radial_range,
+                        azimuth_range=kwargs.get('azimuth_range'),
+                    )
+                    result = IntegrationResult1D(
+                        radial=r2d.azimuthal,
+                        intensity=np.nansum(r2d.intensity, axis=0),
+                        unit="qoop_A^-1",
+                    )
+                    self.gi_1d['qoop'] = result
                 elif gi_mode_1d == 'exit_angle':
-                    self.int_1d = r_exit
-                else:  # 'q_ip' (default)
-                    self.int_1d = r_ip
+                    result = integrate_gi_exitangles_1d(
+                        image_data, fi, npt=numpoints,
+                        method='no', mask=mask, 
+                        radial_range=radial_range,
+                        azimuth_range=kwargs.get('azimuth_range'),
+                        **gi_kwargs,
+                    )
+                    self.gi_1d['exit'] = result
+                else:  # 'q_total' (default — polar integration)
+                    result = integrate_gi_polar_1d(
+                        image_data, fi, npt=numpoints,
+                        method='no', mask=mask,
+                        radial_range=radial_range,
+                        azimuth_range=kwargs.get('azimuth_range'),
+                        **gi_kwargs,
+                    )
+                    self.gi_1d['qtotal'] = result
+
+                self.int_1d = result
 
     def integrate_2d(self, npt_rad=1000, npt_azim=1000, monitor=None,
                      radial_range=None, azimuth_range=None,
@@ -333,6 +413,9 @@ class EwaldArch():
             result: integrate2d result from pyFAI.
         """
         with self.arch_lock:
+            if self.map_raw is None:
+                return  # no raw data (e.g. loaded from NeXus) — cannot re-integrate
+
             if monitor is not None:
                 self.map_norm = 1
 
@@ -345,7 +428,18 @@ class EwaldArch():
             if npt_azim is None:
                 npt_azim = self.map_raw.shape[1]
 
+            _gi_only_keys = {
+                'gi_mode_1d', 'gi_mode_2d', 'npt_oop',
+                'sample_orientation', 'tilt_angle',
+            }
+
             if not self.gi:
+                std_kwargs = {k: v for k, v in kwargs.items()
+                              if k not in _gi_only_keys}
+                chi_offset = std_kwargs.pop('chi_offset', 0.0)
+                if azimuth_range is not None:
+                    azimuth_range = (azimuth_range[0] - chi_offset, azimuth_range[1] - chi_offset)
+                
                 result = integrate_2d(
                     (self.map_raw - self.bg_raw) / self.map_norm,
                     self.integrator,
@@ -355,8 +449,12 @@ class EwaldArch():
                     mask=self.get_mask(global_mask),
                     radial_range=radial_range,
                     azimuth_range=azimuth_range,
-                    **kwargs,
+                    **std_kwargs,
                 )
+                
+                # Apply explicit chi_offset rather than guessing midpoint
+                if len(result.azimuthal) > 0:
+                    result.azimuthal = result.azimuthal + chi_offset
                 self.int_2d = result
             else:
                 _gi_valid = {
@@ -366,60 +464,55 @@ class EwaldArch():
                 }
                 gi_kwargs = {k: v for k, v in kwargs.items() if k in _gi_valid}
 
-                incident_angle = self._get_incident_angle()
-                fi = fiber_integrator or create_fiber_integrator(
-                    self._poni_from_integrator(),
-                    incident_angle=incident_angle,
-                    tilt_angle=self.tilt_angle,
-                    angle_unit="deg",
-                )
+                # Re-use FiberIntegrator cached by integrate_1d when available
+                fi = fiber_integrator or getattr(self, '_fiber_integrator', None)
+                if fi is None:
+                    incident_angle = self._get_incident_angle()
+                    fi = create_fiber_integrator(
+                        self._poni_from_integrator(),
+                        incident_angle=incident_angle,
+                        tilt_angle=self.tilt_angle,
+                        sample_orientation=self.sample_orientation,
+                        angle_unit="deg",
+                    )
 
-                image_data = self.map_raw - self.bg_raw
+                image_data = (self.map_raw - self.bg_raw) / self.map_norm
                 mask = self.get_mask(global_mask)
                 gi_mode_2d = kwargs.get('gi_mode_2d', 'qip_qoop')
 
-                # Polar (Q-Chi) map
-                r_polar = integrate_gi_polar(
-                    image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
-                    method='no', mask=mask, **gi_kwargs,
-                )
-
-                # Fiber (Qip, Qoop) = (Qxy, Qz) map
-                r_gi2d = integrate_gi_2d(
-                    image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
-                    method='no', mask=mask,
-                    radial_range=x_range, azimuth_range=y_range,
-                    **gi_kwargs,
-                )
-
-                # Exit angles map
-                r_exit2d = integrate_gi_exitangles(
-                    image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
-                    method='no', mask=mask, **gi_kwargs,
-                )
-
-                # Store all GI 2D results in gi_2d dict
-                # r_gi2d: radial=Qip, azimuthal=Qoop  (flipud for display convention)
-                r_gi2d_flipped = IntegrationResult2D(
-                    radial=r_gi2d.radial,
-                    azimuthal=r_gi2d.azimuthal,
-                    intensity=np.flipud(r_gi2d.intensity),
-                    unit=r_gi2d.unit,
-                    azimuthal_unit=r_gi2d.azimuthal_unit,
-                )
-                self.gi_2d = {
-                    'polar': r_polar,       # (Q, Chi)
-                    'gi2d': r_gi2d_flipped,  # (Qip/Qxy, Qoop/Qz)
-                    'exit2d': r_exit2d,     # exit angles
-                }
-
-                # Set primary result from selected mode
+                # Only compute the selected GI 2D mode
                 if gi_mode_2d == 'q_chi':
-                    self.int_2d = r_polar
+                    result = integrate_gi_polar(
+                        image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
+                        method='no', mask=mask,
+                        radial_range=radial_range,
+                        azimuth_range=azimuth_range,
+                        **gi_kwargs,
+                    )
+                    self.gi_2d['polar'] = result
                 elif gi_mode_2d == 'exit_angles':
-                    self.int_2d = r_exit2d
+                    result = integrate_gi_exitangles(
+                        image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
+                        method='no', mask=mask,
+                        radial_range=radial_range,
+                        azimuth_range=azimuth_range,
+                        **gi_kwargs,
+                    )
+                    self.gi_2d['exit2d'] = result
                 else:  # 'qip_qoop' (default)
-                    self.int_2d = r_polar
+                    r_gi2d = integrate_gi_2d(
+                        image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
+                        method='no', mask=mask,
+                        radial_range=x_range, azimuth_range=y_range,
+                        **gi_kwargs,
+                    )
+                    # integrate_gi_2d returns (npt_ip, npt_oop) via
+                    # _to_result_2d transpose.  Use directly — the display
+                    # code skips the azimuthal flip for qip_qoop mode.
+                    result = r_gi2d
+                    self.gi_2d['gi2d'] = result
+
+                self.int_2d = result
 
     def set_integrator(self, **args):
         """Sets AzimuthalIntegrator with new arguments.
@@ -454,8 +547,9 @@ class EwaldArch():
         with self.arch_lock:
             self.scan_info = new_data
 
-    def save_to_h5(self, file, compression='lzf'):
+    def save_to_h5(self, file, compression=None):
         """Saves data to hdf5 file using h5py as backend.
+        DEPRECATED — use save_to_nexus for new code.
 
         args:
             file: h5py group or file object.
@@ -508,6 +602,7 @@ class EwaldArch():
 
     def load_from_h5(self, file, load_2d=True):
         """Loads data from hdf5 file and sets attributes.
+        DEPRECATED — use load_from_nexus for new code.
 
         args:
             file: h5py file or group object
@@ -546,6 +641,129 @@ class EwaldArch():
 
                             self.integrator = self.setup_integrator()
 
+    # ------------------------------------------------------------------
+    # NeXus save/load — Phase 2 replacement for save_to_h5/load_from_h5
+    # ------------------------------------------------------------------
+
+    def save_to_nexus(self, parent_grp, global_mask=None):
+        """Save integration results to a NeXus-formatted HDF5 group.
+
+        Writes into ``parent_grp/<idx>`` (1D) and ``parent_grp/<idx>_2d``
+        (2D, optional).  Stores a downsampled thumbnail of the raw image
+        in ``parent_grp/<idx>_thumb`` for fast GUI preview.  The thumbnail
+        has both arch-level and global masks baked in as NaN pixels.
+
+        Does NOT store full-resolution raw images (map_raw, bg_raw, mask).
+        Uses gzip compression only — never lzf (crashes on ARM64 macOS).
+
+        args:
+            parent_grp: h5py.Group — typically ``entry/frames/``.
+            global_mask: array-like or None — flat indices of detector-level
+                masked pixels (from EwaldSphere.global_mask).
+        """
+        key = f"{self.idx:04d}"
+
+        # ── 1D result ──
+        if self.int_1d is not None:
+            if key in parent_grp:
+                del parent_grp[key]
+            grp_1d = parent_grp.create_group(key)
+            self.int_1d.to_nexus(grp_1d)
+            grp_1d.attrs["source_file"] = self.source_file or ""
+            grp_1d.attrs["frame_index"] = int(self.idx)
+
+        # ── Thumbnail (downsampled raw image with mask baked in) ──
+        thumb = self.thumbnail
+        if thumb is None and self.map_raw is not None:
+            try:
+                corrected = np.asarray(self.map_raw, dtype=np.float32) - np.asarray(self.bg_raw, dtype=np.float32)
+                thumb = _make_thumbnail(corrected, mask_idx=self.mask,
+                                        global_mask=global_mask)
+            except Exception:
+                thumb = None
+        if thumb is not None:
+            key_thumb = f"{self.idx:04d}_thumb"
+            if key_thumb in parent_grp:
+                del parent_grp[key_thumb]
+            parent_grp.create_dataset(
+                key_thumb, data=thumb,
+                compression="gzip", compression_opts=1,
+            )
+
+        # ── 2D result ──
+        if self.int_2d is not None:
+            key_2d = f"{self.idx:04d}_2d"
+            if key_2d in parent_grp:
+                del parent_grp[key_2d]
+            grp_2d = parent_grp.create_group(key_2d)
+            self.int_2d.to_nexus(grp_2d)
+            grp_2d.attrs["source_file"] = self.source_file or ""
+            grp_2d.attrs["frame_index"] = int(self.idx)
+
+        # ── GI 1D results ──
+        if self.gi_1d:
+            for gi_key, res in self.gi_1d.items():
+                gi_name = f"{self.idx:04d}_gi1d_{gi_key}"
+                if gi_name in parent_grp:
+                    del parent_grp[gi_name]
+                gi_grp = parent_grp.create_group(gi_name)
+                res.to_nexus(gi_grp)
+                gi_grp.attrs["source_file"] = self.source_file or ""
+                gi_grp.attrs["frame_index"] = int(self.idx)
+
+        # ── GI 2D results ──
+        if self.gi_2d:
+            for gi_key, res in self.gi_2d.items():
+                gi_name = f"{self.idx:04d}_gi2d_{gi_key}"
+                if gi_name in parent_grp:
+                    del parent_grp[gi_name]
+                gi_grp = parent_grp.create_group(gi_name)
+                res.to_nexus(gi_grp)
+                gi_grp.attrs["source_file"] = self.source_file or ""
+                gi_grp.attrs["frame_index"] = int(self.idx)
+
+    def load_from_nexus(self, parent_grp, load_2d=True):
+        """Load integration results from a NeXus-formatted HDF5 group.
+
+        Reads from ``parent_grp/<idx>`` (1D), ``parent_grp/<idx>_2d``
+        (2D, optional), and ``parent_grp/<idx>_thumb`` (thumbnail).
+
+        args:
+            parent_grp: h5py.Group — typically ``entry/frames/``.
+            load_2d: bool — if False, skip 2D data and thumbnail.
+        """
+        key = f"{self.idx:04d}"
+        key_2d = f"{self.idx:04d}_2d"
+        key_thumb = f"{self.idx:04d}_thumb"
+
+        if key in parent_grp:
+            grp_1d = parent_grp[key]
+            self.int_1d = IntegrationResult1D.from_hdf5(grp_1d)
+            self.source_file = str(grp_1d.attrs.get("source_file", ""))
+
+        # Always load thumbnail (small, useful for preview even in 1D mode)
+        if key_thumb in parent_grp:
+            self.thumbnail = np.asarray(parent_grp[key_thumb])
+
+        if load_2d and key_2d in parent_grp:
+            grp_2d = parent_grp[key_2d]
+            self.int_2d = IntegrationResult2D.from_hdf5(grp_2d)
+
+        # GI 1D results
+        gi1d_prefix = f"{self.idx:04d}_gi1d_"
+        for name in parent_grp:
+            if name.startswith(gi1d_prefix):
+                gi_key = name[len(gi1d_prefix):]
+                self.gi_1d[gi_key] = IntegrationResult1D.from_hdf5(parent_grp[name])
+
+        # GI 2D results
+        if load_2d:
+            gi2d_prefix = f"{self.idx:04d}_gi2d_"
+            for name in parent_grp:
+                if name.startswith(gi2d_prefix):
+                    gi_key = name[len(gi2d_prefix):]
+                    self.gi_2d[gi_key] = IntegrationResult2D.from_hdf5(parent_grp[name])
+
     def copy(self, include_2d=True):
         """Returns a copy of self.
         """
@@ -556,12 +774,16 @@ class EwaldArch():
             self.file_lock,
             static=copy.deepcopy(self.static), gi=copy.deepcopy(self.gi),
             th_mtr=copy.deepcopy(self.th_mtr),
+            sample_orientation=self.sample_orientation,
             series_average=copy.deepcopy(self.series_average)
         )
         arch_copy.integrator = copy.deepcopy(self.integrator)
         arch_copy.arch_lock = Condition()
         arch_copy.int_1d = copy.deepcopy(self.int_1d)
         arch_copy.gi_1d = copy.deepcopy(self.gi_1d)
+        arch_copy.source_file = self.source_file
+        # Always copy thumbnail — it's small and needed for image preview
+        arch_copy.thumbnail = copy.deepcopy(self.thumbnail)
         if include_2d:
             arch_copy.map_raw = copy.deepcopy(self.map_raw)
             arch_copy.bg_raw = copy.deepcopy(self.bg_raw)

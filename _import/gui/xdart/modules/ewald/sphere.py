@@ -5,55 +5,30 @@ import pandas as pd
 import numpy as np
 
 from .arch import EwaldArch
-from .arch_series import ArchSeries
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from .arch_series import ArchSeries, _ensure_frames_group
+from ssrl_xrd_tools.core.containers import PONI, IntegrationResult1D, IntegrationResult2D
 from xdart import utils
 from ssrl_xrd_tools.integrate.multi import stitch_1d, stitch_2d
 
-# from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
-
 
 class EwaldSphere:
-    """Class for storing multiple arch objects, and stores a MultiGeometry
-    integrator from pyFAI.
+    """Class for storing multiple arch objects in NeXus-formatted HDF5 files.
 
-    Attributes:
-        arches: ArchSeries, list of arches indexed by their idx value
-        bai_1d: int_1d_data object, stores result of 1d integration
-        bai_1d_args: dict, arguments for invidivual arch integrate1d
-            method
-        bai_2d: int_2d_data object, stores result of 2d integration
-        bai_2d_args: dict, arguments for invidivual arch integrate2d
-            method
-        data_file: str, file to save data to
-        file_lock: lock for ensuring one writer to hdf5 file
-        mg_args: arguments for MultiGeometry constructor
-        mgi_1d: int_1d_data object, stores result from multigeometry
-            integrate1d method
-        mgi_2d: int_2d_data object, stores result from multigeometry
-            integrate2d method
-        multi_geo: MultiGeometry instance
-        name: str, name of the sphere
-        scan_data: DataFrame, stores all scan metadata
-        sphere_lock: lock for modifying data in sphere
+    Output file structure::
 
-    Methods:
-        add_arch: adds new arch and optionally updates other data
-        by_arch_integrate_1d: Runs 1 dimensional integration of each
-            arch individually and sums the result, stored in bai_1d
-        by_arch_integrate_2d: Runs 2 dimensional integration of each
-            arch individually and sums the result, stored in bai_2d
-        load_from_h5: loads data from hdf5 file
-        set_multi_geo: sets the MultiGeometry instance
-        multigeometry_integrate_1d: wrapper for MultiGeometry
-            integrate1d method, result stored in mgi_1d
-        multigeometry_integrate_2d: wrapper for MultiGeometry
-            integrate2d method, result stored in mgi_2d
-        save_bai_1d: Saves only bai_1d to the data_file
-        save_bai_2d: Saves only bai_2d to the data_file
-        save_to_h5: saves data to hdf5 file
-        set_multi_geo: instatiates the multigeometry object, or
-            overrides it if it already exists.
+        scan.hdf5
+        ├── entry/                     (NXentry)
+        │   ├── calibration/           (PONI geometry)
+        │   ├── scan_data/             (motor positions per frame)
+        │   ├── frames/                (per-frame NXdata groups)
+        │   │   ├── 0001/              (1D result)
+        │   │   ├── 0001_2d/           (2D result)
+        │   │   ├── 0001_gi1d_*/       (GI 1D results)
+        │   │   └── ...
+        │   ├── integrated_1d/         (summed 1D, NXdata)
+        │   └── integrated_2d/         (summed 2D, NXdata)
+        ├── scan_data (legacy DataFrame)
+        └── @type = "EwaldSphere"
     """
 
     def __init__(self, name='scan0', arches=[], data_file=None,
@@ -63,17 +38,6 @@ class EwaldSphere:
                  overall_raw=0, single_img=False,
                  global_mask=None
                  ):
-        """name: string, name of sphere object.
-        arches: list of EwaldArch object, data to intialize with
-        data_file: str, path to hdf5 file where data is stored
-        scan_data: DataFrame, scan metadata
-        mg_args: dict, arguments for Multigeometry. Must include at
-            least 'wavelength' attribute in Angstroems
-        bai_1d_args: dict, arguments for the integrate1d method of pyFAI
-            AzimuthalIntegrator
-        bai_2d_args: dict, arguments for the integrate2d method of pyFAI
-            AzimuthalIntegrator
-        """
         super().__init__()
         self.file_lock = Condition()
         if name is None:
@@ -81,7 +45,7 @@ class EwaldSphere:
         else:
             self.name = name
         if data_file is None:
-            self.data_file = name + ".hdf5"
+            self.data_file = name + ".nxs"
         else:
             self.data_file = data_file
 
@@ -116,10 +80,7 @@ class EwaldSphere:
         self.global_mask = global_mask
 
     def reset(self):
-        """Resets all held data objects to blank state, called when all
-        new data is going to be loaded or when a sphere needs to be
-        purged of old data.
-        """
+        """Resets all held data objects to blank state."""
         with self.sphere_lock:
             self.scan_data = pd.DataFrame()
             self.arches = ArchSeries(self.data_file, self.file_lock,
@@ -131,29 +92,7 @@ class EwaldSphere:
 
     def add_arch(self, arch=None, calculate=True, update=True, get_sd=True,
                  set_mg=True, h5file=None, **kwargs):
-        """Adds new arch to sphere.
-
-        args:
-            arch: EwaldArch instance, arch to be added. Recommended to
-                always pass a copy of an arch with the arch.copy method
-                or intialize with kwargs
-            calculate: whether to run the arch's calculate methods after
-                adding
-            update: bool, if True updates the bai_1d and bai_2d
-                attributes
-            get_sd: bool, if True tries to get scan data from arch
-            set_mg: bool, if True sets the MultiGeometry attribute.
-                Takes a long time, especially with longer lists.
-                Recommended to run set_multi_geo method after all arches
-                are loaded.
-            h5file: open h5py file handle to reuse for all sub-writes,
-                eliminating redundant file open/close cycles. Caller
-                holds the file_lock for the duration.
-            kwargs: If arch is None, used to intialize the EwaldArch,
-                see EwaldArch for arguments.
-
-        returns None
-        """
+        """Adds new arch to sphere."""
         with self.sphere_lock:
             if arch is None:
                 arch = EwaldArch(**kwargs)
@@ -162,7 +101,8 @@ class EwaldSphere:
                 arch.integrate_2d(global_mask=self.global_mask, **self.bai_2d_args)
             arch.file_lock = self.file_lock
             self.arches = self.arches.append(pd.Series(arch, index=[arch.idx]),
-                                             h5file=h5file)
+                                             h5file=h5file,
+                                             global_mask=self.global_mask)
             self.arches.sort_index(inplace=True)
 
             if arch.scan_info and get_sd:
@@ -177,15 +117,12 @@ class EwaldSphere:
                         arch.scan_info, index=[arch.idx], dtype='float64'
                     )
                 self.scan_data.sort_index(inplace=True)
-                compression = None if self.static else 'lzf'
                 if h5file is not None:
-                    utils.dataframe_to_h5(self.scan_data, h5file,
-                                          'scan_data', compression)
+                    self._write_scan_data_nexus(h5file)
                 else:
                     with self.file_lock:
                         with utils.catch_h5py_file(self.data_file, 'a') as file:
-                            utils.dataframe_to_h5(self.scan_data, file,
-                                                  'scan_data', compression)
+                            self._write_scan_data_nexus(file)
             if update:
                 self._update_bai_1d(arch, h5file=h5file)
                 if not self.skip_2d:
@@ -195,49 +132,47 @@ class EwaldSphere:
 
             self.overall_raw += (arch.map_raw - arch.bg_raw)
 
-    def by_arch_integrate_1d(self, **args):
-        """Integrates all arches individually, then sums the results for
-        the overall integration result.
+    def _write_scan_data_nexus(self, h5file):
+        """Write scan_data DataFrame into entry/scan_data."""
+        entry = h5file.require_group("entry")
+        sd_grp = entry.require_group("scan_data")
+        sd_grp.attrs.setdefault("NX_class", "NXcollection")
+        for col in self.scan_data.columns:
+            ds_name = str(col)
+            if ds_name in sd_grp:
+                del sd_grp[ds_name]
+            sd_grp.create_dataset(ds_name, data=self.scan_data[col].values)
 
-        args: see EwaldArch.integrate_1d. If any args are passed, the
-            bai_1d_args dictionary is also updated with the new args.
-            If no args are passed, uses bai_1d_args attribute.
-        """
+    def by_arch_integrate_1d(self, **args):
+        """Integrates all arches individually, then sums the results."""
         if not args:
             args = self.bai_1d_args
         else:
             self.bai_1d_args = args.copy()
         with self.sphere_lock:
             self.bai_1d = None
-
             for arch in self.arches:
                 arch.integrate_1d(global_mask=self.global_mask, **args)
-                self.arches[arch.idx] = arch
+                self.arches.__setitem__(arch.idx, arch,
+                                        global_mask=self.global_mask)
                 self._update_bai_1d(arch)
 
     def by_arch_integrate_2d(self, **args):
-        """Integrates all arches individually, then sums the results for
-        the overall integration result.
-
-        args: see EwaldArch.integrate_2d. If any args are passed, the
-            bai_2d_args dictionary is also updated with the new args.
-            If no args are passed, uses bai_2d_args attribute.
-        """
+        """Integrates all arches individually, then sums the results."""
         if not args:
             args = self.bai_2d_args
         else:
             self.bai_2d_args = args.copy()
         with self.sphere_lock:
             self.bai_2d = None
-
             for arch in self.arches:
                 arch.integrate_2d(global_mask=self.global_mask, **args)
-                self.arches[arch.idx] = arch
+                self.arches.__setitem__(arch.idx, arch,
+                                        global_mask=self.global_mask)
                 self._update_bai_2d(arch)
 
     def _update_bai_1d(self, arch, h5file=None):
-        """helper function to update overall bai variables.
-        """
+        """Update running sum of 1D integration results."""
         with self.sphere_lock:
             if arch.int_1d is None:
                 return
@@ -251,8 +186,7 @@ class EwaldSphere:
             self.save_bai_1d(h5file=h5file)
 
     def _update_bai_2d(self, arch, h5file=None):
-        """helper function to update overall bai variables.
-        """
+        """Update running sum of 2D integration results."""
         with self.sphere_lock:
             if arch.int_2d is None:
                 return
@@ -267,91 +201,55 @@ class EwaldSphere:
                 self.save_bai_2d(h5file=h5file)
 
     def set_multi_geo(self, **args):
-        """Rebuilds the per-arch integrator list used for stitched integration.
-
-        args: passed through to mg_args for bookkeeping (unit, radial_range, etc.)
-        """
+        """Rebuilds the per-arch integrator list for stitched integration."""
         self.mg_args.update(args)
         with self.sphere_lock:
             self._mg_integrators = [a.integrator for a in self.arches]
 
     def multigeometry_integrate_1d(self, monitor=None, **kwargs):
-        """Stitch all arch images into a single 1D pattern via ssrl_xrd_tools.
-
-        args:
-            monitor: scan_data column name for per-image normalization counts
-            kwargs: forwarded to stitch_1d (npt, unit, method, radial_range, …)
-
-        returns:
-            IntegrationResult1D
-        """
+        """Stitch all arch images into a single 1D pattern."""
         with self.sphere_lock:
             images = [(a.map_raw - a.bg_raw) for a in self.arches]
             normalization = (
                 list(self.scan_data[monitor]) if monitor is not None else None
             )
             return stitch_1d(
-                images,
-                self._mg_integrators,
-                mask=self.global_mask,
-                normalization=normalization,
+                images, self._mg_integrators,
+                mask=self.global_mask, normalization=normalization,
                 **kwargs,
             )
 
     def multigeometry_integrate_2d(self, monitor=None, **kwargs):
-        """Stitch all arch images into a 2D cake pattern via ssrl_xrd_tools.
-
-        args:
-            monitor: scan_data column name for per-image normalization counts
-            kwargs: forwarded to stitch_2d (npt_rad, npt_azim, unit, method, …)
-
-        returns:
-            IntegrationResult2D
-        """
+        """Stitch all arch images into a 2D cake pattern."""
         with self.sphere_lock:
             images = [(a.map_raw - a.bg_raw) / a.map_norm for a in self.arches]
             return stitch_2d(
-                images,
-                self._mg_integrators,
-                mask=self.global_mask,
-                **kwargs,
+                images, self._mg_integrators,
+                mask=self.global_mask, **kwargs,
             )
 
-    def save_to_h5(self, replace=False, *args, **kwargs):
-        """Saves data to hdf5 file.
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
 
-        args:
-            replace: bool, if True file is truncated prior to writing
-                data.
-            arches: list, list of arch ids to save. Deprecated.
-            data_onle: bool, if true only saves the scan_data attribute
-                and does not save mg_args, bai_1d_args, or bai_2d_args.
-            compression: str, what compression algorithm to pass to
-                h5py. See h5py documentation for acceptable compression
-                algorithms.
-        """
-        if replace:
-            mode = 'w'
-        else:
-            mode = 'a'
+    def save_to_h5(self, replace=False, *args, **kwargs):
+        """Saves data to NeXus-formatted hdf5 file."""
+        mode = 'w' if replace else 'a'
         with self.file_lock:
             with utils.catch_h5py_file(self.data_file, mode) as file:
                 self._save_to_h5(file, *args, **kwargs)
 
     def _save_to_h5(self, grp, arches=None, data_only=False,
-                    compression='lzf'):
-        """Actual function for saving data, run with the file open and
-            holding the file_lock.
-        """
-        if self.static:
-            compression = None
+                    compression=None):
+        """Write sphere state to HDF5 in NeXus format."""
         with self.sphere_lock:
             grp.attrs['type'] = 'EwaldSphere'
 
+            entry = grp.require_group("entry")
+            entry.attrs.setdefault("NX_class", "NXentry")
+
             if data_only:
-                lst_attr = [
-                    "scan_data", "global_mask",
-                ]
+                lst_attr = ["scan_data", "global_mask"]
             else:
                 lst_attr = [
                     "scan_data", "global_mask", "mg_args", "bai_1d_args",
@@ -362,24 +260,44 @@ class EwaldSphere:
             utils.attributes_to_h5(self, grp, lst_attr,
                                    compression=compression)
 
+            if not data_only and hasattr(self, 'arches') and self.arches.index:
+                self._write_nexus_calibration(entry)
+
+            if not data_only and not self.scan_data.empty:
+                self._write_scan_data_nexus(grp)
+
             if self.bai_1d is not None:
-                if 'bai_1d' not in grp:
-                    grp.create_group('bai_1d')
-                self.bai_1d.to_hdf5(grp['bai_1d'], compression or "lzf")
+                if "integrated_1d" in entry:
+                    del entry["integrated_1d"]
+                self.bai_1d.to_nexus(entry.create_group("integrated_1d"))
+
             if not self.skip_2d and self.bai_2d is not None:
-                if 'bai_2d' not in grp:
-                    grp.create_group('bai_2d')
-                self.bai_2d.to_hdf5(grp['bai_2d'], compression or "lzf")
+                if "integrated_2d" in entry:
+                    del entry["integrated_2d"]
+                self.bai_2d.to_nexus(entry.create_group("integrated_2d"))
+
+    def _write_nexus_calibration(self, entry_grp):
+        """Write PONI calibration data into entry/calibration."""
+        cal = entry_grp.require_group("calibration")
+        cal.attrs.setdefault("NX_class", "NXinstrument")
+        try:
+            first_arch = self.arches.iloc(0)
+            poni = first_arch.poni
+        except (IndexError, KeyError):
+            return
+        if poni is None:
+            return
+        poni_dict = poni.to_dict()
+        for key in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3", "wavelength"):
+            if key in cal:
+                del cal[key]
+            cal.create_dataset(key, data=float(poni_dict.get(key, 0.0)))
+        if "detector" in cal:
+            del cal["detector"]
+        cal.create_dataset("detector", data=str(poni_dict.get("detector", "")))
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
-        """Loads data stored in hdf5 file.
-
-        args:
-            data_only: bool, if True only loads the scan_data attribute
-                and does not load mg_args, bai_1d_args, or bai_2d_args.
-            set_mg: bool, if True instantiates the Multigeometry
-                object.
-        """
+        """Loads data from NeXus-formatted hdf5 file."""
         with self.file_lock:
             if replace:
                 self.reset()
@@ -387,63 +305,54 @@ class EwaldSphere:
                 self._load_from_h5(file, *args, **kwargs)
 
     def _load_from_h5(self, grp, data_only=False, set_mg=True):
-        """Actual function for loading data, run with the file open and
-            holding the file_lock.
-        """
+        """Load from NeXus-formatted HDF5."""
         with self.sphere_lock:
-            if 'type' in grp.attrs:
-                if grp.attrs['type'] == 'EwaldSphere':
-                    for arch in grp['arches']:
-                        if int(arch) not in self.arches.index:
-                            self.arches.index.append(int(arch))
+            if 'type' not in grp.attrs or grp.attrs['type'] != 'EwaldSphere':
+                return
 
-                    self.arches.sort_index(inplace=True)
+            # Build arch index from entry/frames/
+            if "entry" in grp and "frames" in grp["entry"]:
+                frames = grp["entry/frames"]
+                for name in frames:
+                    if name.isdigit():
+                        idx = int(name)
+                        if idx not in self.arches.index:
+                            self.arches.index.append(idx)
 
-                    if data_only:
-                        lst_attr = [
-                            "scan_data", "overall_raw",
-                        ]
-                        utils.h5_to_attributes(self, grp, lst_attr)
-                    else:
-                        lst_attr = [
-                            "scan_data", "mg_args", "bai_1d_args",
-                            "bai_2d_args", "overall_raw",
-                            "static", "gi", "th_mtr", "single_img",
-                            "series_average", "skip_2d"
-                        ]
-                        utils.h5_to_attributes(self, grp, lst_attr)
-                        self._set_args(self.bai_1d_args)
-                        self._set_args(self.bai_2d_args)
+            self.arches.sort_index(inplace=True)
 
-                        if not self.static:
-                            self._set_args(self.mg_args)
+            if data_only:
+                lst_attr = ["scan_data", "overall_raw"]
+            else:
+                lst_attr = [
+                    "scan_data", "mg_args", "bai_1d_args",
+                    "bai_2d_args", "overall_raw",
+                    "static", "gi", "th_mtr", "single_img",
+                    "series_average", "skip_2d"
+                ]
+            utils.h5_to_attributes(self, grp, lst_attr)
 
-                        if 'bai_1d' in grp:
-                            self.bai_1d = IntegrationResult1D.from_hdf5(grp['bai_1d'])
-                        if 'bai_2d' in grp:
-                            self.bai_2d = IntegrationResult2D.from_hdf5(grp['bai_2d'])
+            if not data_only:
+                self._set_args(self.bai_1d_args)
+                self._set_args(self.bai_2d_args)
+                if not self.static:
+                    self._set_args(self.mg_args)
 
-                    if "global_mask" in grp:
-                        utils.h5_to_attributes(self, grp, ["global_mask"])
-                    else:
-                        self.global_mask = None
+                if "entry" in grp and "integrated_1d" in grp["entry"]:
+                    self.bai_1d = IntegrationResult1D.from_hdf5(
+                        grp["entry/integrated_1d"])
+                if "entry" in grp and "integrated_2d" in grp["entry"]:
+                    self.bai_2d = IntegrationResult2D.from_hdf5(
+                        grp["entry/integrated_2d"])
+
+            if "global_mask" in grp:
+                utils.h5_to_attributes(self, grp, ["global_mask"])
+            else:
+                self.global_mask = None
 
     def set_datafile(self, fname, name=None, keep_current_data=False,
                      save_args={}, load_args={}):
-        """Sets the data_file. If file exists and has data, loads in the
-        data. Otherwise, creates new file and resets self.
-
-        args:
-            fname: str, new data file
-            name: str or None, new name. If None, name is obtained from
-                fname.
-            keep_current_data: bool, if True overwrites any existing
-                data in the file. Otherwise, current data is either
-                overwritten by data in file or deleted if no data
-                exists, except any args dicts which are untouched.
-            save_args: dict, arguments to be passed to save_to_h5
-            load_args: dict, arguments to be passed to load_from_h5
-        """
+        """Sets the data_file."""
         with self.sphere_lock:
             self.data_file = fname
             if name is None:
@@ -459,53 +368,42 @@ class EwaldSphere:
                     self.reset()
                     self.save_to_h5(replace=True, **save_args)
 
-    def save_bai_1d(self, compression='lzf', h5file=None):
-        """Function to save only the bai_1d object.
-
-        args:
-            compression: str, what compression algorithm to pass to
-                h5py. See h5py documentation for acceptable compression
-                algorithms.
-            h5file: open h5py file handle to reuse. If provided the
-                file_lock is not acquired and no file open occurs.
-        """
+    def save_bai_1d(self, h5file=None):
+        """Save the summed 1D integration result to entry/integrated_1d."""
         if self.bai_1d is None:
             return
-        compression = None  # static scans always skip compression
         if h5file is not None:
-            h5file.require_group('bai_1d')
-            self.bai_1d.to_hdf5(h5file['bai_1d'], "lzf")
+            entry = h5file.require_group("entry")
+            if "integrated_1d" in entry:
+                del entry["integrated_1d"]
+            self.bai_1d.to_nexus(entry.create_group("integrated_1d"))
         else:
             with self.file_lock:
                 with utils.catch_h5py_file(self.data_file, 'a') as file:
-                    file.require_group('bai_1d')
-                    self.bai_1d.to_hdf5(file['bai_1d'], "lzf")
+                    entry = file.require_group("entry")
+                    if "integrated_1d" in entry:
+                        del entry["integrated_1d"]
+                    self.bai_1d.to_nexus(entry.create_group("integrated_1d"))
 
-    def save_bai_2d(self, compression='lzf', h5file=None):
-        """Function to save only the bai_2d object.
-
-        args:
-            compression: str, what compression algorithm to pass to
-                h5py. See h5py documentation for acceptable compression
-                algorithms.
-            h5file: open h5py file handle to reuse. If provided the
-                file_lock is not acquired and no file open occurs.
-        """
+    def save_bai_2d(self, h5file=None):
+        """Save the summed 2D integration result to entry/integrated_2d."""
         if self.bai_2d is None:
             return
-        compression = None  # static scans always skip compression
         if h5file is not None:
-            h5file.require_group('bai_2d')
-            self.bai_2d.to_hdf5(h5file['bai_2d'], "lzf")
+            entry = h5file.require_group("entry")
+            if "integrated_2d" in entry:
+                del entry["integrated_2d"]
+            self.bai_2d.to_nexus(entry.create_group("integrated_2d"))
         else:
             with self.file_lock:
                 with utils.catch_h5py_file(self.data_file, 'a') as file:
-                    file.require_group('bai_2d')
-                    self.bai_2d.to_hdf5(file['bai_2d'], "lzf")
+                    entry = file.require_group("entry")
+                    if "integrated_2d" in entry:
+                        del entry["integrated_2d"]
+                    self.bai_2d.to_nexus(entry.create_group("integrated_2d"))
 
     def _set_args(self, args):
-        """Ensures any range args are lists.
-        """
+        """Ensures any range args are lists."""
         for arg in args:
             if 'range' in arg:
                 if args[arg] is not None:
@@ -513,69 +411,53 @@ class EwaldSphere:
 
 
 def get_1D_data(h5_file, arch_ids=None, static=True):
-    """Loads 1D data from hdf5 file
-
-    args:
-        h5_file: hdf5 file with processed data
-        arch_ids: arches whose 1D data is loaded
-        static: scan type flag
-
-    returns:
-        df: Pandas dataframe with integrated 1D data
-    """
+    """Loads 1D data from NeXus hdf5 file into a Pandas DataFrame."""
     h5_file = Path(h5_file)
     scan_name = h5_file.stem
     sphere = EwaldSphere(scan_name, data_file=str(h5_file), static=static)
     sphere.load_from_h5(replace=False, mode='r')
 
-    df1 = pd.DataFrame(columns=('idx', 'intensity', 'tth', 'q'))
+    rows = []
     with utils.catch_h5py_file(sphere.data_file, 'r') as file:
         if arch_ids is None:
             arch_ids = sphere.arches.index
 
+        frames_grp = file["entry/frames"] if "entry" in file and "frames" in file["entry"] else None
+
         for idx in arch_ids:
             try:
                 arch = EwaldArch(idx=idx, static=sphere.static, gi=sphere.gi)
-                if str(idx) not in file['arches']:
-                    print("No data can be found")
+                if frames_grp is not None:
+                    arch.load_from_nexus(frames_grp, load_2d=False)
+                else:
                     continue
-                grp = file['arches'][str(idx)]
-                if 'type' in grp.attrs:
-                    if grp.attrs['type'] == 'EwaldArch':
-                        lst_attr = [
-                            "scan_info", "ai_args",
-                            "gi", "static"
-                        ]
-                        utils.h5_to_attributes(arch, grp, lst_attr)
-                        if 'int_1d' in grp:
-                            arch.int_1d = IntegrationResult1D.from_hdf5(grp['int_1d'])
 
                 if arch.int_1d is None:
                     continue
                 _r1d = arch.int_1d
-                # Derive both tth and q from whichever radial axis is stored
                 if _r1d.unit in ('q_A^-1', 'q_nm^-1'):
                     _q = list(_r1d.radial) if _r1d.unit == 'q_A^-1' else list(_r1d.radial / 10.0)
-                    _tth = []  # not stored; would need wavelength to convert
+                    _tth = []
                 else:
                     _tth = list(_r1d.radial)
                     _q = []
-                df1 = df1.append({
+                rows.append({
                     'idx': idx,
                     'intensity': list(_r1d.intensity),
                     'tth': _tth,
-                    'q': _q},
-                    ignore_index=True
-                )
+                    'q': _q,
+                })
             except KeyError:
                 pass
 
-    df1.set_index(df1['idx'], inplace=True)
+    df1 = pd.DataFrame(rows)
+    if df1.empty:
+        return df1
+    df1.set_index('idx', inplace=True)
     df2 = sphere.scan_data
-    df2.rename_axis('idx')
 
     try:
         df = pd.concat([df1, df2.loc[df1.index]], axis=1, join='outer')
     except KeyError:
         df = df1
-    return df.set_index(df['idx'])
+    return df

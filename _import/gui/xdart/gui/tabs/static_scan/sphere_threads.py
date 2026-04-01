@@ -22,7 +22,6 @@ from xdart import utils as ut
 
 import gc
 
-# from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
 
 
 def _reintegrate_arch(arch, bai_1d_args, bai_2d_args, static, gi, do_2d):
@@ -136,6 +135,7 @@ class integratorThread(Qt.QtCore.QThread):
                 self.data_2d[int(arch.idx)] = {
                     'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
                     'mask': arch.mask, 'int_2d': arch.int_2d,
+                    'gi_2d': arch.gi_2d,
                 }
                 self.update.emit(arch.idx)
 
@@ -295,45 +295,43 @@ class fileHandlerThread(Qt.QtCore.QThread):
     def load_arch(self):
         with self.file_lock:
             with catch(self.sphere.data_file, 'r') as file:
-                self.arch.load_from_h5(file['arches'])
+                self.arch.load_from_nexus(file["entry/frames"])
         self.sigUpdate.emit()
 
     def load_arches(self):
-        # ic()
         with self.file_lock:
             with catch(self.sphere.data_file, 'r') as file:
-                # ic(self.arch_ids)
+                if "entry" not in file or "frames" not in file["entry"]:
+                    return
+                frames_grp = file["entry/frames"]
+
                 for idx in self.arch_ids:
                     try:
-                        # ic(idx)
                         arch = EwaldArch(idx=idx, static=True, gi=self.sphere.gi)
-                        arch.load_from_h5(file['arches'], load_2d=self.update_2d)
-                        self.data_1d[int(idx)] = arch.copy(include_2d=False)
-                        # ic('loaded 1D data', self.data_1d.keys())
-                        if self.update_2d:
-                            if arch.int_2d is None or arch.int_2d.intensity.size == 0:
-                                arch.load_from_h5(file['arches'], load_2d=self.update_2d)
+                        arch.load_from_nexus(frames_grp, load_2d=self.update_2d)
 
-                            self.data_2d[int(idx)] = {'map_raw': arch.map_raw,
-                                                      'bg_raw': arch.bg_raw,
-                                                      'mask': arch.mask,
-                                                      'int_2d': arch.int_2d}
+                        self.data_1d[int(idx)] = arch.copy(include_2d=False)
+                        if self.update_2d:
+                            self.data_2d[int(idx)] = {
+                                'map_raw': arch.map_raw,
+                                'bg_raw': arch.bg_raw,
+                                'mask': arch.mask,
+                                'int_2d': arch.int_2d,
+                                'gi_2d': arch.gi_2d,
+                            }
 
                             if idx in self.arches['add_idxs']:
                                 self.arches['sum_int_2d'] += self.data_2d[int(idx)]['int_2d']
-                                # self.arches['sum_map_raw'] += self.data_2d[int(idx)]['map_raw']
                                 self.arches['sum_map_raw'] += (self.data_2d[int(idx)]['map_raw'] -
                                                                self.data_2d[int(idx)]['bg_raw'])
                             elif idx in self.arches['sub_idxs']:
                                 self.arches['sum_int_2d'] -= self.data_2d[int(idx)]['int_2d']
-                                # self.arches['sum_map_raw'] -= self.data_2d[int(idx)]['map_raw']
                                 self.arches['sum_map_raw'] -= (self.data_2d[int(idx)]['map_raw'] -
                                                                self.data_2d[int(idx)]['bg_raw'])
 
                     except KeyError:
                         pass
 
-            # ic(self.data_1d.keys(), self.data_2d.keys(), self.arches.keys())
             self.sigUpdate.emit()
 
         gc.collect()

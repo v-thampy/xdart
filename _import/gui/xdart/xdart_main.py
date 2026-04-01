@@ -29,7 +29,12 @@ logging.getLogger('pyFAI').setLevel(logging.WARNING)
 logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
 
 # Qt imports
-from pyqtgraph.Qt import QtGui, QtWidgets
+from typing import TYPE_CHECKING, Any
+if TYPE_CHECKING:
+    QtGui: Any = None
+    QtWidgets: Any = None
+else:
+    from pyqtgraph.Qt import QtGui, QtWidgets
 
 # This module imports
 from xdart.gui.mainWindow import Ui_MainWindow
