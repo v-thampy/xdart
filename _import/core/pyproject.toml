@@ -1,12 +1,30 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssrl_xrd_tools"
-version = "0.1.0"
+version = "0.2.0"
 description = "SSRL X-ray diffraction data processing and visualization tools"
-requires-python = ">=3.12"
+readme = "README.md"
+license = {text = "BSD-3-Clause"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Vivek Thampy", email = "vthampy@stanford.edu"},
+]
+keywords = ["xrd", "diffraction", "pyFAI", "SSRL", "synchrotron"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
 dependencies = [
     "numpy",
     "scipy",
@@ -35,7 +53,14 @@ dev = [
     "pytest",
     "ipykernel",
     "ipywidgets",
+    "build",
+    "twine",
 ]
+
+[project.urls]
+Homepage = "https://github.com/v-thampy/ssrl_xrd_tools"
+Repository = "https://github.com/v-thampy/ssrl_xrd_tools"
+Issues = "https://github.com/v-thampy/ssrl_xrd_tools/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
