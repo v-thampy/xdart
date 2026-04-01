@@ -13,3 +13,6 @@ build/
 .env
 .venv
 *.log
+.claude/
+claude_prompts*.md
+test.hdf5
