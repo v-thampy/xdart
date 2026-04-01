@@ -25,7 +25,6 @@ from pyqtgraph.graphicsItems.GradientEditorItem import Gradients
 from pyqtgraph.graphicsItems.GraphicsObject import GraphicsObject
 from pyqtgraph import getConfigOption
 
-# from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
 
 QFileDialog = QtWidgets.QFileDialog
 
@@ -231,13 +230,6 @@ def normalize(arr):
         return (arr - minval) / (maxval - minval)
     else:
         return np.ones_like(arr)
-
-
-def sliced(arr, ceiling):
-    out = np.copy(arr)
-    maxval = arr.max() * (ceiling/100)
-    out[out > maxval] = maxval
-    return out
 
 
 class pmeshImageWidget(Qt.QtWidgets.QWidget):

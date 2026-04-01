@@ -23,51 +23,22 @@ from pyqtgraph.parametertree.Parameter import Parameter
 # This module imports
 
 
-def return_no_zero(x, y):
-    """Returns only values greater than 0 for plotting.
-    
-    args:
-        x, y: arrays, x and y data
-    
-    returns:
-        x[y > 0], y[y > 0]
-    """
-    return x[y > 0], y[y > 0]
-
-
 def get_rect(x, y):
     """Gets a QRectF object from given x and y data.
-    
+
     args:
         x, y: arrays, x and y data
-    
+
     returns:
-        QRectF object
+        QRectF object, or a unit rect if x or y is empty
     """
+    if len(x) == 0 or len(y) == 0:
+        return Qt.QtCore.QRectF(0, 0, 1, 1)
     left = x[0]
     top = y[0]
     width = max(x) - min(x)
     height = max(y) - min(y)
     return Qt.QtCore.QRectF(left, top, width, height)
-
-
-def to_rgba(arr, cmap, alpha=1):
-    """Converts array to rgba image.
-    
-    args:
-        arr: numpy array, 2D array to convert
-        cmap: colormap to use
-        alpha: scalar or array of same shape as arr, alpha values
-    
-    returns:
-        img: numpy array, 3D rgba array
-    """
-    img = cmap(
-        (arr - arr.min()) / (arr.max() - arr.min())
-    )
-    img[:, :, 3] = alpha
-
-    return img
 
 
 class RectViewBox(pg.ViewBox):

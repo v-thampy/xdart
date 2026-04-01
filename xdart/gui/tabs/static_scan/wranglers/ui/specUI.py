@@ -16,7 +16,7 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QImage, QKeySequence, QLinearGradient, QPainter,
     QPalette, QPixmap, QRadialGradient, QTransform)
 import os as _os
-from PySide6.QtWidgets import (QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel,
     QPushButton, QSizePolicy, QSpinBox, QVBoxLayout, QWidget)
 
 class Ui_Form(object):
@@ -53,12 +53,34 @@ class Ui_Form(object):
         self.horizontalLayout_2.setContentsMargins(-1, 2, -1, 2)
         self.commandLayout = QHBoxLayout()
         self.commandLayout.setObjectName(u"commandLayout")
-        self.processingLabel = QLabel(self.commandFrame)
-        self.processingLabel.setObjectName(u"processingLabel")
-        self.commandLayout.addWidget(self.processingLabel)
-        self.skip2dCheckBox = QCheckBox(self.commandFrame)
-        self.skip2dCheckBox.setObjectName(u"skip2dCheckBox")
-        self.commandLayout.addWidget(self.skip2dCheckBox)
+        self.advancedButton = QPushButton(self.commandFrame)
+        self.advancedButton.setObjectName(u"advancedButton")
+        self.advancedButton.setMaximumSize(QSize(80, 16777215))
+        self.commandLayout.addWidget(self.advancedButton)
+        self.modeLabel = QLabel(self.commandFrame)
+        self.modeLabel.setObjectName(u"modeLabel")
+        self.modeLabel.setVisible(False)  # hidden — no longer needed
+        self.processingModeCombo = QComboBox(self.commandFrame)
+        self.processingModeCombo.setObjectName(u"processingModeCombo")
+        self.processingModeCombo.addItems([
+            "Int 1D",
+            "Int 2D",
+            "Int 1D (XYE)",
+            "Image Viewer",
+            "XYE Viewer",
+        ])
+        self.commandLayout.addWidget(self.processingModeCombo)
+
+        self.liveCheckBox = QCheckBox(self.commandFrame)
+        self.liveCheckBox.setObjectName(u"liveCheckBox")
+        self.liveCheckBox.setText(u"Live")
+        self.commandLayout.addWidget(self.liveCheckBox)
+
+        self.batchCheckBox = QCheckBox(self.commandFrame)
+        self.batchCheckBox.setObjectName(u"batchCheckBox")
+        self.batchCheckBox.setText(u"Batch")
+        self.batchCheckBox.setChecked(True)
+        self.commandLayout.addWidget(self.batchCheckBox)
 
         self.coresLabel = QLabel(self.commandFrame)
         self.coresLabel.setObjectName(u"coresLabel")
@@ -70,10 +92,6 @@ class Ui_Form(object):
         self.maxCoresSpinBox.setMaximum(_cpu)
         self.maxCoresSpinBox.setValue(min(_cpu - 1, 8) or 1)
         self.commandLayout.addWidget(self.maxCoresSpinBox)
-
-        self.liveCheckBox = QCheckBox(self.commandFrame)
-        self.liveCheckBox.setObjectName(u"liveCheckBox")
-        self.commandLayout.addWidget(self.liveCheckBox)
 
         self.horizontalLayout_2.addLayout(self.commandLayout)
 
@@ -124,10 +142,9 @@ class Ui_Form(object):
     def retranslateUi(self, Form):
         Form.setWindowTitle(QCoreApplication.translate("Form", u"Form", None))
         self.specLabel.setText("")
-        self.processingLabel.setText(QCoreApplication.translate("Form", u"Processing:", None))
-        self.skip2dCheckBox.setText(QCoreApplication.translate("Form", u"1D Only", None))
+        self.advancedButton.setText(QCoreApplication.translate("Form", u"Advanced...", None))
+        self.modeLabel.setText(QCoreApplication.translate("Form", u"Mode:", None))
         self.coresLabel.setText(QCoreApplication.translate("Form", u"Cores:", None))
-        self.liveCheckBox.setText(QCoreApplication.translate("Form", u"Live", None))
         self.startButton.setText(QCoreApplication.translate("Form", u"Start", None))
         self.pauseButton.setText(QCoreApplication.translate("Form", u"Pause", None))
         self.continueButton.setText(QCoreApplication.translate("Form", u"Continue", None))

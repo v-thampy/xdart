@@ -95,7 +95,7 @@ class Ui_Form(object):
         sizePolicy2.setVerticalStretch(0)
         sizePolicy2.setHeightForWidth(self.integratorFrame.sizePolicy().hasHeightForWidth())
         self.integratorFrame.setSizePolicy(sizePolicy2)
-        self.integratorFrame.setMaximumSize(QSize(16777215, 400))
+        self.integratorFrame.setMaximumSize(QSize(16777215, 300))
         self.integratorFrame.setFrameShape(QFrame.StyledPanel)
         self.integratorFrame.setFrameShadow(QFrame.Raised)
         self.integratorFrame.setLineWidth(3)

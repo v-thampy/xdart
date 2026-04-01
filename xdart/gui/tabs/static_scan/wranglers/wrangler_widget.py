@@ -61,7 +61,6 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         """fname: str, file path
         file_lock: mp.Condition, process safe lock
         """
-        #ic()
         super().__init__(parent)
         self.file_lock = file_lock
         self.fname = fname
@@ -83,14 +82,12 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         """Use this function to control what is enabled and disabled
         during integration.
         """
-        #ic()
         pass
 
     def setup(self):
         """Sets the thread child object. Called by tthetaWidget prior
         to starting thread.
         """
-        #ic()
         self.thread = wranglerThread(self.command_queue, self.sphere_args, self.fname, self.file_lock, self)
 
     def set_fname(self, fname):
@@ -98,7 +95,6 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         args:
             fname: str, path for new file.
         """
-        #ic()
         with self.file_lock:
             if not self.thread.isRunning():
                 self.fname = fname
@@ -142,7 +138,6 @@ class wranglerThread(Qt.QtCore.QThread):
         fname: str, path to data file.
         file_lock: mp.Condition, process safe lock for file access
         """
-        #ic()
         super().__init__(parent)
         self.input_q = command_queue # thread queue
         self.sphere_args = sphere_args
