@@ -78,8 +78,7 @@ def get_peak_model(model: str, prefix: str = "") -> LmfitModel:
     if cls is None:
         raise ValueError(
             f"Unknown peak model {model!r}. "
-            f"Choose from: {', '.join(sorted(set(_PEAK_MODEL_MAP.values().__class__.__name__ for _ in [0])))}"
-            f" ({', '.join(sorted(_PEAK_MODEL_MAP))})"
+            f"Choose from: {', '.join(sorted(_PEAK_MODEL_MAP))}"
         )
     return cls(prefix=prefix)
 
@@ -103,18 +102,15 @@ def _get_background_model(
         return LinearModel(prefix=prefix)
     if bg == "constant":
         return ConstantModel(prefix=prefix)
-    # Chebyshev / polynomial of degree N
+    # Chebyshev / polynomial of degree N — extract trailing digits
+    import re
     if bg.startswith("chebyshev") or bg.startswith("cheb"):
-        try:
-            degree = int(bg.replace("chebyshev", "").replace("cheb", ""))
-        except ValueError:
-            degree = 3
+        m = re.search(r'\d+', bg)
+        degree = int(m.group()) if m else 3
         return PolynomialModel(degree, prefix=prefix)
     if bg.startswith("poly"):
-        try:
-            degree = int(bg.replace("polynomial", "").replace("poly", ""))
-        except ValueError:
-            degree = 2
+        m = re.search(r'\d+', bg)
+        degree = int(m.group()) if m else 2
         return PolynomialModel(degree, prefix=prefix)
     raise ValueError(f"Unknown background model: {background!r}")
 

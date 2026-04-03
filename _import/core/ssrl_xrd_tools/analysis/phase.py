@@ -84,11 +84,20 @@ class PhaseModel:
             hkl = hkls[0]["hkl"] if isinstance(hkls[0], dict) else hkls[0]
             self.peaks.append(PeakData(q=q, intensity=intensity, hkl=hkl, d_spacing=d_hkl))
 
-    def update_lattice(self, a: float=None, b: float=None, c: float=None, 
+    def update_lattice(self, a: float=None, b: float=None, c: float=None,
                        alpha: float=None, beta: float=None, gamma: float=None) -> None:
-        """Update lattice parameters and recalculate peaks dynamically."""
+        """Update lattice parameters and recalculate peaks dynamically.
+
+        Raises
+        ------
+        ValueError
+            If no crystal structure has been set on this PhaseModel.
+        """
         if not self.structure:
-            return
+            raise ValueError(
+                f"Cannot update lattice for phase {self.name!r}: "
+                "no crystal structure loaded. Use from_cif() or set structure first."
+            )
             
         current_lattice = self.structure.lattice
         _a = a if a is not None else current_lattice.a

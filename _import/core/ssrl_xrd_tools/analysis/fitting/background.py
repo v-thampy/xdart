@@ -75,16 +75,26 @@ def chebyshev_background(
     mask = np.isfinite(y) & np.isfinite(x)
     xm, ym = x[mask], y[mask]
 
+    if len(xm) < degree + 1:
+        # Not enough valid points for the requested polynomial degree
+        return np.full_like(y, np.nan)
+
     # Iterative sigma-clipping: remove points above the fit (peaks)
     keep = np.ones(len(xm), dtype=bool)
     for _ in range(n_iter):
+        if np.sum(keep) < degree + 1:
+            break  # Too few points to fit; stop clipping
         coeffs = np.polynomial.chebyshev.chebfit(xm[keep], ym[keep], degree)
         bg_fit = np.polynomial.chebyshev.chebval(xm, coeffs)
         residual = ym - bg_fit
         std = np.std(residual[keep])
+        if std < 1e-15:
+            break  # Converged; all residuals essentially zero
         keep = residual < sigma_clip * std
 
     # Final fit with surviving points
+    if np.sum(keep) < degree + 1:
+        keep = np.ones(len(xm), dtype=bool)  # Fall back to unclipped fit
     coeffs = np.polynomial.chebyshev.chebfit(xm[keep], ym[keep], degree)
 
     # Evaluate at all original x points

@@ -119,6 +119,13 @@ def extract_chi_sectors(
     q_axis = np.asarray(result2d.radial, dtype=float)
     intensity = np.asarray(result2d.intensity, dtype=float)  # (nq, nchi)
 
+    if intensity.shape != (len(q_axis), len(chi_axis)):
+        raise ValueError(
+            f"Intensity shape {intensity.shape} does not match "
+            f"(len(radial), len(azimuthal)) = ({len(q_axis)}, {len(chi_axis)}). "
+            f"Check that result2d axes match the intensity array."
+        )
+
     if chi_range is None:
         chi_range = (float(chi_axis.min()), float(chi_axis.max()))
 

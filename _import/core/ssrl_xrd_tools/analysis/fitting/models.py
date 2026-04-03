@@ -143,10 +143,14 @@ def asymmetric_rectangle(
         )
     elif form in ("atan", "arctan"):
         out = (amplitude1 * np.arctan(arg1) + amplitude2 * np.arctan(arg2)) / np.pi
-    else:
+    elif form == "linear":
         arg1 = np.clip(arg1, 0.0, 1.0)
         arg2 = np.clip(arg2, -1.0, 0.0)
         out = amplitude1 * arg1 + amplitude2 * arg2
+    else:
+        raise ValueError(
+            f"Unknown form {form!r}. Choose from: 'linear', 'erf', 'atan', 'logistic'"
+        )
     return out
 
 
@@ -183,8 +187,10 @@ def pvoigt_2D(
     x, y, amplitude=1.0, centerx=0.0, centery=0.0, sigmax=1.0, sigmay=1.0, fraction=0.5
 ):
     """2D pseudo-Voigt: (1-fraction)*Gaussian2D + fraction*LorentzianSquared2D, same FWHM."""
-    sigmax_g = sigmax / 1.17741
-    sigmay_g = sigmay / 1.17741
+    # Convert Lorentzian HWHM to Gaussian sigma for equal FWHM: sqrt(2*ln2) ≈ 1.17741
+    _FWHM_FACTOR = np.sqrt(2 * np.log(2))
+    sigmax_g = sigmax / _FWHM_FACTOR
+    sigmay_g = sigmay / _FWHM_FACTOR
     return (1 - fraction) * gauss_2D(
         x, y, amplitude, centerx, centery, sigmax_g, sigmay_g
     ) + fraction * lor2_2D(x, y, amplitude, centerx, centery, sigmax, sigmay)
