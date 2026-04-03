@@ -200,10 +200,12 @@ def integrate_gi_1d(
     incident_angle: float | None = None,
     tilt_angle: float | None = None,
     sample_orientation: int | None = None,
+    vertical_integration: bool = True,
     **kwargs: Any,
 ) -> IntegrationResult1D:
     """
-    1-D grazing-incidence integration via ``FiberIntegrator.integrate1d_fiber``.
+    1-D grazing-incidence integration via
+    ``FiberIntegrator.integrate1d_grazing_incidence``.
 
     Parameters
     ----------
@@ -231,8 +233,12 @@ def integrate_gi_1d(
         Override geometry for this call (degrees).  Cached for future calls.
     sample_orientation : int or None, optional
         Override sample orientation for this call.
+    vertical_integration : bool, optional
+        If *True* (default), integrate over IP and return a 1-D OOP profile
+        (Q_oop).  If *False*, integrate over OOP and return a 1-D IP profile
+        (Q_ip).
     **kwargs
-        Forwarded to ``fi.integrate1d_fiber``.
+        Forwarded to ``fi.integrate1d_grazing_incidence``.
 
     Returns
     -------
@@ -242,7 +248,7 @@ def integrate_gi_1d(
     unit_ip = kwargs.pop("unit_ip", _DEFAULT_UNIT_IP)
     _npt_oop = npt_oop if npt_oop is not None else npt
 
-    result = fi.integrate1d_fiber(
+    result = fi.integrate1d_grazing_incidence(
         image,
         npt_ip=npt,
         npt_oop=_npt_oop,
@@ -255,10 +261,10 @@ def integrate_gi_1d(
         oop_range=azimuth_range,
         incident_angle=inc,
         tilt_angle=tilt,
+        vertical_integration=vertical_integration,
         **kwargs,
     )
     sigma = result.sigma if result.sigma is not None else None
-    # Use .integrated (not .radial) for fiber/GI results to avoid pyFAI warning
     radial = getattr(result, "integrated", None)
     if radial is None:
         radial = result.radial

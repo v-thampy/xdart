@@ -61,7 +61,7 @@ def check_encoded(grp, name: str) -> bool:
     return grp.attrs.get("encoded", "not_found") == name
 
 
-def soft_list_eval(data, scope: dict = {}) -> list:
+def soft_list_eval(data, scope: dict | None = None) -> list:
     """Return a list by applying ``eval`` to each element where possible.
 
     Falls back to ``bytes.decode()`` then the raw value on failure.
@@ -73,6 +73,8 @@ def soft_list_eval(data, scope: dict = {}) -> list:
     scope:
         Optional namespace passed to ``eval``.
     """
+    if scope is None:
+        scope = {}
     out = []
     for x in data:
         try:

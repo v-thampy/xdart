@@ -24,7 +24,7 @@ import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import h5py
 import numpy as np
@@ -156,6 +156,7 @@ def process_scan(
     detector: str = "",
     rotation: int = 0,
     reprocess: bool = False,
+    progress_cb: Callable[[int, int], None] | None = None,
     **kwargs: Any,
 ) -> Path:
     """
@@ -270,6 +271,9 @@ def process_scan(
             chi=r2d.azimuthal,
         )
         n_done += 1
+        
+        if progress_cb is not None:
+            progress_cb(n_done + n_skipped, n_total)
 
     logger.info(
         "%s: %d processed, %d skipped (already done), %d frames total",
@@ -371,6 +375,10 @@ class DirectoryWatcher:
         patterns: Sequence[str] = ("*_master.h5", "*.edf", "*.raw"),
         recursive: bool = True,
         poll_interval: float = 10.0,
+        on_file_found: Callable[[Path], None] | None = None,
+        on_file_processed: Callable[[Path], None] | None = None,
+        on_error: Callable[[Path, Exception], None] | None = None,
+        on_frame_processed: Callable[[Path, int, int], None] | None = None,
         **process_kwargs: Any,
     ) -> None:
         self._watch_dir = _as_path(watch_dir)
@@ -379,6 +387,10 @@ class DirectoryWatcher:
         self._patterns = list(patterns)
         self._recursive = recursive
         self._poll_interval = float(poll_interval)
+        self._on_file_found = on_file_found
+        self._on_file_processed = on_file_processed
+        self._on_error = on_error
+        self._on_frame_processed = on_frame_processed
         self._process_kwargs = process_kwargs
 
         self._processed: set[Path] = set()
@@ -465,15 +477,34 @@ class DirectoryWatcher:
         """Process a single newly detected file, skipping known files."""
         if path in self._processed:
             return
+            
+        if self._on_file_found is not None:
+            self._on_file_found(path)
+            
         self._processed.add(path)
         out_h5 = self._output_dir / f"{path.stem}_processed.nxs"
         logger.info("DirectoryWatcher: new file detected: %s", path)
+        
+        def _prog_cb(num_done: int, num_total: int) -> None:
+            if self._on_frame_processed is not None:
+                self._on_frame_processed(path, num_done, num_total)
+
         try:
-            process_scan(path, self._ai, out_h5, **self._process_kwargs)
+            process_scan(
+                path, 
+                self._ai, 
+                out_h5, 
+                progress_cb=_prog_cb,
+                **self._process_kwargs
+            )
+            if self._on_file_processed is not None:
+                self._on_file_processed(path)
         except Exception as exc:
             logger.error(
                 "DirectoryWatcher: error processing %s: %s", path, exc
             )
+            if self._on_error is not None:
+                self._on_error(path, exc)
 
     # ------------------------------------------------------------------
     # Internal: polling backend

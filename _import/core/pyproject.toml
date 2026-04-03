@@ -36,23 +36,21 @@ dependencies = [
     "joblib",
     "natsort",
     "lmfit",
-]
-
-[project.optional-dependencies]
-gui = [
+    "ipykernel",
+    "ipywidgets",
+    "jupyterlab",
+    "matplotlib",
     "panel",
     "holoviews",
     "bokeh",
-    "napari",
 ]
+
+[project.optional-dependencies]
+napari = ["napari"]
 tiled = ["tiled[client]"]
 vtk = ["pyevtk"]
 dev = [
-    "jupyterlab",
-    "matplotlib",
     "pytest",
-    "ipykernel",
-    "ipywidgets",
     "build",
     "twine",
 ]

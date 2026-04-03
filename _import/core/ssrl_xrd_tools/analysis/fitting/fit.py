@@ -1,43 +1,370 @@
-"""1D/2D peak fitting using lmfit and ssrl_xrd_tools.analysis.fitting.models."""
+"""
+1D and 2D peak fitting using lmfit.
+
+Two fitting modes are provided for 1D data:
+
+**Structure-agnostic** (this module)
+    Fit individual peaks without crystal-structure knowledge.  Peak positions
+    are either specified manually or found via :func:`extract_peaks`.
+
+**Structure-informed** (``phase_fitting.py``)
+    Fit a multi-phase pattern using CIF-derived peak positions / intensities
+    from ``PhaseModel`` objects.  See :class:`PhaseFitter`.
+
+Both modes share the same lmfit model zoo and background tools.
+"""
 from __future__ import annotations
 
-from typing import Any
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import numpy as np
+from lmfit import Model as LmfitModel
 from lmfit.models import (
     GaussianModel,
     LorentzianModel,
+    PseudoVoigtModel,
     VoigtModel,
     LinearModel,
     ConstantModel,
+    PolynomialModel,
 )
 
 from ssrl_xrd_tools.analysis.fitting.models import (
     lorentzian_squared,
-    pvoigt,
+    LorentzianSquaredModel,
     Gaussian2DModel,
     LorentzianSquared2DModel,
-    Pvoigt2DModel,
+    PseudoVoigt2DModel,
 )
 
+logger = logging.getLogger(__name__)
 
-def _get_peak_model(model: str, prefix: str):
-    """Return lmfit peak model for 1D fit. model: gaussian, lorentzian, voigt, pseudovoigt, lorentzian_squared."""
-    from lmfit import Model as LmfitModel
 
-    model_lower = model.lower().replace(" ", "")
-    if model_lower == "gaussian":
-        return GaussianModel(prefix=prefix)
-    if model_lower in ("lorentzian", "lorentz"):
-        return LorentzianModel(prefix=prefix)
-    if model_lower == "voigt":
-        return VoigtModel(prefix=prefix)
-    if model_lower in ("pseudovoigt", "pvoigt"):
-        return LmfitModel(pvoigt, prefix=prefix)
-    if model_lower in ("lorentzian_squared", "lor2"):
-        return LmfitModel(lorentzian_squared, prefix=prefix)
-    return GaussianModel(prefix=prefix)
+# ---------------------------------------------------------------------------
+# Peak-model registry
+# ---------------------------------------------------------------------------
 
+_PEAK_MODEL_MAP: dict[str, type] = {
+    "gaussian": GaussianModel,
+    "lorentzian": LorentzianModel,
+    "lorentz": LorentzianModel,
+    "voigt": VoigtModel,
+    "pseudovoigt": PseudoVoigtModel,
+    "pvoigt": PseudoVoigtModel,
+    "lorentzian_squared": LorentzianSquaredModel,
+    "lor2": LorentzianSquaredModel,
+}
+
+
+def get_peak_model(model: str, prefix: str = "") -> LmfitModel:
+    """
+    Return an lmfit peak Model by name.
+
+    Parameters
+    ----------
+    model : str
+        One of: 'gaussian', 'lorentzian', 'voigt', 'pseudovoigt', 'lorentzian_squared' (or 'lor2').
+    prefix : str
+        Prefix for parameter names (needed when combining multiple peaks).
+
+    Returns
+    -------
+    lmfit.Model
+    """
+    key = model.lower().replace(" ", "").replace("-", "")
+    cls = _PEAK_MODEL_MAP.get(key)
+    if cls is None:
+        raise ValueError(
+            f"Unknown peak model {model!r}. "
+            f"Choose from: {', '.join(sorted(set(_PEAK_MODEL_MAP.values().__class__.__name__ for _ in [0])))}"
+            f" ({', '.join(sorted(_PEAK_MODEL_MAP))})"
+        )
+    return cls(prefix=prefix)
+
+
+def _get_background_model(
+    background: str,
+    prefix: str = "bg_",
+) -> LmfitModel | None:
+    """Return an lmfit background model.
+
+    Parameters
+    ----------
+    background : str
+        'linear', 'constant', 'chebyshev2', 'chebyshev3', 'chebyshev4',
+        'polynomial2' .. 'polynomial7', or 'none'.
+    """
+    bg = background.lower().strip()
+    if bg == "none":
+        return None
+    if bg == "linear":
+        return LinearModel(prefix=prefix)
+    if bg == "constant":
+        return ConstantModel(prefix=prefix)
+    # Chebyshev / polynomial of degree N
+    if bg.startswith("chebyshev") or bg.startswith("cheb"):
+        try:
+            degree = int(bg.replace("chebyshev", "").replace("cheb", ""))
+        except ValueError:
+            degree = 3
+        return PolynomialModel(degree, prefix=prefix)
+    if bg.startswith("poly"):
+        try:
+            degree = int(bg.replace("polynomial", "").replace("poly", ""))
+        except ValueError:
+            degree = 2
+        return PolynomialModel(degree, prefix=prefix)
+    raise ValueError(f"Unknown background model: {background!r}")
+
+
+# ---------------------------------------------------------------------------
+# Result container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PeakFitResult1D:
+    """Result of a multi-peak 1D fit.
+
+    Attributes
+    ----------
+    fit_result : lmfit.model.ModelResult
+        The raw lmfit result (access ``params``, ``best_fit``, ``residual``, etc.).
+    peak_centers : list of float
+        Fitted centre positions for each peak.
+    peak_centers_err : list of float
+        Uncertainties on peak centres.
+    peak_sigmas : list of float
+        Fitted sigma (width) for each peak.
+    peak_amplitudes : list of float
+        Fitted amplitudes for each peak.
+    n_peaks : int
+        Number of peaks in the model.
+    model_name : str
+        Name of the peak profile used.
+    background_name : str
+        Name of the background model used.
+    """
+    fit_result: Any = field(repr=False)
+    peak_centers: list[float] = field(default_factory=list)
+    peak_centers_err: list[float] = field(default_factory=list)
+    peak_sigmas: list[float] = field(default_factory=list)
+    peak_amplitudes: list[float] = field(default_factory=list)
+    n_peaks: int = 0
+    model_name: str = ""
+    background_name: str = ""
+
+    @property
+    def success(self) -> bool:
+        return self.fit_result.success
+
+    @property
+    def best_fit(self) -> np.ndarray:
+        return self.fit_result.best_fit
+
+    @property
+    def params(self):
+        return self.fit_result.params
+
+
+# ---------------------------------------------------------------------------
+# Main 1D fitting function
+# ---------------------------------------------------------------------------
+
+def fit_peaks(
+    x: np.ndarray,
+    y: np.ndarray,
+    positions: list[float] | np.ndarray | None = None,
+    model: str = "pseudovoigt",
+    n_peaks: int | None = None,
+    background: str = "linear",
+    sigma_init: float | list[float] | None = None,
+    sigma_bounds: tuple[float, float] | None = None,
+    amplitude_init: float | list[float] | None = None,
+    amplitude_bounds: tuple[float, float] | None = None,
+    center_bounds_delta: float | None = None,
+    fraction_init: float = 0.5,
+    **fit_kwargs: Any,
+) -> PeakFitResult1D:
+    """
+    Fit one or more peaks in a 1D pattern.
+
+    This is the main structure-agnostic fitting function.  Peak positions
+    can be specified explicitly (from manual inspection or a peak-finder)
+    or auto-estimated.
+
+    Parameters
+    ----------
+    x, y : ndarray
+        1D data (e.g. q vs intensity).
+    positions : list of float or None
+        Initial peak centre positions.  If provided, ``n_peaks`` is inferred.
+        If *None*, peaks are auto-estimated from the data.
+    model : str
+        Peak profile: 'gaussian', 'lorentzian', 'voigt', 'pseudovoigt',
+        'lorentzian_squared'.
+    n_peaks : int or None
+        Number of peaks (required if *positions* is None).  Ignored if
+        *positions* is given.
+    background : str
+        Background model: 'linear', 'constant', 'chebyshev2'..'chebyshev4',
+        'polynomial2'..'polynomial7', or 'none'.
+    sigma_init : float or list of float or None
+        Initial sigma for each peak.  Scalar → same for all peaks.
+        None → auto-estimate from data range.
+    sigma_bounds : (min, max) or None
+        Bounds on sigma.  None → (0, data_range / 2).
+    amplitude_init : float or list of float or None
+        Initial amplitude.  None → auto-estimate from max intensity.
+    amplitude_bounds : (min, max) or None
+        Bounds on amplitude.  None → (0, inf).
+    center_bounds_delta : float or None
+        Each peak centre is bounded to ± this delta around its initial
+        position.  None → no bounds on centres beyond the data range.
+    fraction_init : float
+        Initial pseudo-Voigt mixing fraction (only for 'pseudovoigt').
+    **fit_kwargs
+        Passed to ``lmfit.Model.fit()`` (e.g. ``method='leastsq'``).
+
+    Returns
+    -------
+    PeakFitResult1D
+    """
+    # Clean NaN / inf
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = np.asarray(x, dtype=float)[valid]
+    y = np.asarray(y, dtype=float)[valid]
+
+    if len(x) < 5:
+        raise ValueError(f"Too few valid data points ({len(x)}) to fit.")
+
+    # Determine number of peaks
+    if positions is not None:
+        positions = list(np.asarray(positions, dtype=float).ravel())
+        n_peaks = len(positions)
+    elif n_peaks is None:
+        n_peaks = 1
+        positions = [x[np.argmax(y)]]
+    else:
+        # Auto-space peaks across the data range
+        positions = list(np.linspace(x.min(), x.max(), n_peaks + 2)[1:-1])
+
+    # Defaults
+    data_range = x.max() - x.min()
+    if sigma_init is None:
+        sigma_init = data_range / (4 * max(n_peaks, 1))
+    if isinstance(sigma_init, (int, float)):
+        sigma_init = [float(sigma_init)] * n_peaks
+
+    if sigma_bounds is None:
+        sigma_bounds = (1e-6, data_range / 2)
+
+    if amplitude_init is None:
+        amplitude_init = float(np.nanmax(y) - np.nanmin(y))
+    if isinstance(amplitude_init, (int, float)):
+        amplitude_init = [float(amplitude_init)] * n_peaks
+
+    if amplitude_bounds is None:
+        amplitude_bounds = (0, None)
+
+    # Build composite model
+    bg_model = _get_background_model(background, prefix="bg_")
+    composite = bg_model
+
+    for i in range(n_peaks):
+        prefix = f"p{i}_"
+        peak_mod = get_peak_model(model, prefix=prefix)
+        composite = peak_mod if composite is None else composite + peak_mod
+
+    if composite is None:
+        raise ValueError("No model to fit (n_peaks=0 and background='none').")
+
+    # Build parameters
+    pars = composite.make_params()
+
+    # Background init
+    if bg_model is not None:
+        if "bg_slope" in pars:
+            pars["bg_slope"].set(value=0)
+            pars["bg_intercept"].set(value=float(np.nanmin(y)))
+        if "bg_c" in pars:
+            pars["bg_c"].set(value=float(np.nanmin(y)))
+        # Polynomial: c0, c1, c2, ...
+        for key in pars:
+            if key.startswith("bg_c") and key[4:].isdigit():
+                pars[key].set(value=0)
+        if "bg_c0" in pars:
+            pars["bg_c0"].set(value=float(np.nanmin(y)))
+
+    # Peak parameters
+    for i in range(n_peaks):
+        prefix = f"p{i}_"
+
+        # Centre
+        cen = positions[i]
+        if center_bounds_delta is not None:
+            pars[f"{prefix}center"].set(
+                value=cen,
+                min=cen - center_bounds_delta,
+                max=cen + center_bounds_delta,
+            )
+        else:
+            pars[f"{prefix}center"].set(
+                value=cen, min=x.min(), max=x.max(),
+            )
+
+        # Sigma
+        pars[f"{prefix}sigma"].set(
+            value=sigma_init[i],
+            min=sigma_bounds[0],
+            max=sigma_bounds[1],
+        )
+
+        # Amplitude
+        amp_min = amplitude_bounds[0] if amplitude_bounds[0] is not None else None
+        amp_max = amplitude_bounds[1] if amplitude_bounds[1] is not None else None
+        pars[f"{prefix}amplitude"].set(
+            value=amplitude_init[i], min=amp_min, max=amp_max,
+        )
+
+        # Gamma (Voigt)
+        gamma_key = f"{prefix}gamma"
+        if gamma_key in pars:
+            pars[gamma_key].set(value=sigma_init[i], min=0)
+
+        # Fraction (PseudoVoigt)
+        frac_key = f"{prefix}fraction"
+        if frac_key in pars:
+            pars[frac_key].set(value=fraction_init, min=0, max=1)
+
+    # Fit
+    result = composite.fit(y, pars, x=x, **fit_kwargs)
+
+    # Extract results
+    centers, centers_err, sigmas, amplitudes = [], [], [], []
+    for i in range(n_peaks):
+        prefix = f"p{i}_"
+        centers.append(result.params[f"{prefix}center"].value)
+        centers_err.append(result.params[f"{prefix}center"].stderr or 0.0)
+        sigmas.append(result.params[f"{prefix}sigma"].value)
+        amplitudes.append(result.params[f"{prefix}amplitude"].value)
+
+    return PeakFitResult1D(
+        fit_result=result,
+        peak_centers=centers,
+        peak_centers_err=centers_err,
+        peak_sigmas=sigmas,
+        peak_amplitudes=amplitudes,
+        n_peaks=n_peaks,
+        model_name=model,
+        background_name=background,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legacy wrapper (backwards compatible)
+# ---------------------------------------------------------------------------
 
 def fit_line_cut(
     axis_vals: np.ndarray,
@@ -49,6 +376,10 @@ def fit_line_cut(
     """
     Fit a 1D line cut with lmfit (peak model + optional background).
 
+    This is a simplified wrapper around :func:`fit_peaks` for backwards
+    compatibility.  For new code, prefer :func:`fit_peaks` which provides
+    more control over initial positions and constraints.
+
     Parameters
     ----------
     axis_vals : np.ndarray
@@ -56,7 +387,8 @@ def fit_line_cut(
     intensity : np.ndarray
         1D intensity.
     model : str, optional
-        Peak model: 'gaussian', 'lorentzian', 'voigt', 'pseudovoigt', 'lorentzian_squared'.
+        Peak model: 'gaussian', 'lorentzian', 'voigt', 'pseudovoigt',
+        'lorentzian_squared'.
     n_peaks : int, optional
         Number of peaks.
     background : str, optional
@@ -65,52 +397,18 @@ def fit_line_cut(
     Returns
     -------
     lmfit.model.ModelResult
-        Fit result.
+        Fit result (the raw lmfit object for backwards compatibility).
     """
-    nan_mask = np.isfinite(intensity) & np.isfinite(axis_vals)
-    x = np.asarray(axis_vals)[nan_mask]
-    y = np.asarray(intensity)[nan_mask]
+    result = fit_peaks(
+        axis_vals, intensity,
+        model=model, n_peaks=n_peaks, background=background,
+    )
+    return result.fit_result
 
-    if background == "linear":
-        mod = LinearModel(prefix="b_")
-    elif background == "constant":
-        mod = ConstantModel(prefix="b_")
-    else:
-        mod = None
 
-    for i in range(n_peaks):
-        peak = _get_peak_model(model, prefix=f"p{i}_")
-        mod = peak if mod is None else mod + peak
-
-    if mod is None:
-        raise ValueError(
-            "Both n_peaks=0 and background='none' were specified, leaving no model to fit."
-        )
-
-    pars = mod.make_params()
-    if "b_slope" in pars:
-        pars["b_slope"].set(0)
-        pars["b_intercept"].set(np.nanmin(y))
-    if "b_c" in pars:
-        pars["b_c"].set(np.nanmin(y))
-
-    sig0 = (np.max(x) - np.min(x)) / (4 * max(n_peaks, 1))
-    for i in range(n_peaks):
-        center_key = f"p{i}_center"
-        if center_key in pars:
-            pars[center_key].set(np.median(x))
-        for skey in ("sigma", "sigma_x"):
-            if f"p{i}_{skey}" in pars:
-                pars[f"p{i}_{skey}"].set(sig0)
-        if f"p{i}_amplitude" in pars:
-            pars[f"p{i}_amplitude"].set(np.nanmax(y) - np.nanmin(y))
-        if f"p{i}_gamma" in pars:
-            pars[f"p{i}_gamma"].set(sig0)
-        if f"p{i}_fraction" in pars:
-            pars[f"p{i}_fraction"].set(0.5, min=0, max=1)
-
-    return mod.fit(y, pars, x=x)
-
+# ---------------------------------------------------------------------------
+# 2D fitting (unchanged)
+# ---------------------------------------------------------------------------
 
 def fit_2d_slice(
     slice_2d: np.ndarray,
@@ -119,7 +417,7 @@ def fit_2d_slice(
     model: str = "gaussian2d",
 ) -> tuple[Any, np.ndarray]:
     """
-    Fit a 2D slice with lmfit (Gaussian2d, Lorentzian2d, or PseudoVoigt2d).
+    Fit a 2D slice with lmfit (Gaussian2D, Lorentzian2D, or PseudoVoigt2D).
 
     Parameters
     ----------
@@ -142,7 +440,7 @@ def fit_2d_slice(
     _CUSTOM_MAP = {
         "lorentzian2d": LorentzianSquared2DModel,
         "lor2_2d": LorentzianSquared2DModel,
-        "pvoigt2d": Pvoigt2DModel,
+        "pvoigt2d": PseudoVoigt2DModel,
     }
     _ALL_KEYS = {"gaussian2d"} | set(_CUSTOM_MAP)
     model_key = model.lower().replace(" ", "")

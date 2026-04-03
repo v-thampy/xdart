@@ -1,4 +1,18 @@
-"""1D/2D peak models and helpers for lmfit."""
+"""
+Custom 1D/2D peak models for lmfit.
+
+Models provided here extend lmfit's built-in set.  For standard profiles
+use lmfit directly::
+
+    from lmfit.models import GaussianModel, LorentzianModel, VoigtModel, PseudoVoigtModel
+
+Custom 1D models
+    LorentzianSquaredModel  — Lorentzian², heavier tails than Voigt
+    AsymmetricRectangleModel — step-up / step-down (erf, atan, logistic)
+
+Custom 2D models
+    Gaussian2DModel, LorentzianSquared2DModel, PseudoVoigt2DModel, PlaneModel
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -9,6 +23,10 @@ from lmfit.models import fwhm_expr, update_param_vals, gaussian, lorentzian
 from scipy.special import erf
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def index_of(arr, val):
     """Return index of array nearest to a value."""
     if val < np.min(arr):
@@ -17,16 +35,12 @@ def index_of(arr, val):
 
 
 def _fwhm_expr_2D(model, parameter="sigma"):
-    """Return constraint expression for fwhm."""
+    """Return constraint expression for FWHM of a 2D model."""
     return "%.7f*%s%s" % (model.fwhm_factor, model.prefix, parameter)
 
 
 def guess_from_peak(model, y, x, negative, ampscale=1.0, sigscale=1.0, amp_area=True):
-    """Estimate starting parameters for 1D peak fits.
-
-    The parameters are: Amplitude (can be area or peak, see amp_area),
-    Center, Sigma.
-    """
+    """Estimate starting parameters (amplitude, center, sigma) for 1D peak fits."""
     if x is None:
         return model.make_params(amplitude=1.0, center=0.0, sigma=1.0)
     maxy, miny = max(y), min(y)
@@ -57,21 +71,6 @@ def guess_from_peak(model, y, x, negative, ampscale=1.0, sigscale=1.0, amp_area=
     return pars
 
 
-def guess_from_peak_2D(model, data, x, y, **kwargs):
-    """Estimate starting parameters for 2D peak fits. Delegates to _guess_2d_params."""
-    return _guess_2d_params(model, data, x, y, **kwargs)
-
-
-def update_param_hints(pars, **kwargs):
-    """Update parameter hints with keyword arguments."""
-    for pname, hints in kwargs.items():
-        if pname in pars:
-            for hint, val in hints.items():
-                if val is not None:
-                    setattr(pars[pname], hint, val)
-    return pars
-
-
 def _guess_2d_params(model, data, x, y, **kwargs):
     """Delegate 2D parameter guessing to lmfit.models.Gaussian2dModel."""
     from lmfit.models import Gaussian2dModel
@@ -96,28 +95,22 @@ prefix: string to prepend to parameter names, needed to add two Models that
     have parameter names in common. None by default.
 """
 
-# --- 1D functions ---
+
+# ---------------------------------------------------------------------------
+# 1D functions (only those NOT in lmfit)
+# ---------------------------------------------------------------------------
 
 def lorentzian_squared(x, amplitude=1.0, center=0.0, sigma=1.0):
     r"""
-    Lorentzian squared: amplitude*(1/(1 +((x - center)/sigma)**2))**2
-    HWHM = sqrt(sqrt(2)-1)*sigma
+    Lorentzian squared: amplitude * (1/(1 + ((x - center)/sigma)²))²
+
+    Heavier tails than a standard Lorentzian.
+    HWHM = sqrt(sqrt(2) - 1) * sigma.
     """
     return amplitude * (1 / (1 + ((x - center) / sigma) ** 2)) ** 2
 
 
-def pvoigt(x, amplitude=1.0, center=0.0, sigma=1.0, fraction=0.5):
-    """
-    1D pseudo-Voigt: (1-fraction)*gaussian + fraction*lorentzian, same FWHM.
-    sigma_g = sigma (Gaussian and Lorentzian share FWHM 2*sigma).
-    """
-    sigma_g = sigma
-    return (1 - fraction) * gaussian(x, amplitude, center, sigma_g) + fraction * lorentzian(
-        x, amplitude, center, sigma
-    )
-
-
-def assymetric_rectangle(
+def asymmetric_rectangle(
     x,
     amplitude1=1.0,
     center1=0.0,
@@ -128,7 +121,11 @@ def assymetric_rectangle(
     form="linear",
 ):
     """
-    Step-up and step-down function. form: 'linear', 'erf', 'atan'/'arctan', 'logistic'.
+    Step-up and step-down function.
+
+    Parameters
+    ----------
+    form : {'linear', 'erf', 'atan', 'arctan', 'logistic'}
     """
     if abs(sigma1) < 1.0e-13:
         sigma1 = 1.0e-13
@@ -153,7 +150,13 @@ def assymetric_rectangle(
     return out
 
 
-# --- 2D functions ---
+# Preserve the old misspelled name for backwards compatibility
+assymetric_rectangle = asymmetric_rectangle
+
+
+# ---------------------------------------------------------------------------
+# 2D functions
+# ---------------------------------------------------------------------------
 
 def plane(x, y, intercept=0.0, slope_x=0.0, slope_y=0.0):
     """2D plane: intercept + slope_x*x + slope_y*y."""
@@ -187,10 +190,12 @@ def pvoigt_2D(
     ) + fraction * lor2_2D(x, y, amplitude, centerx, centery, sigmax, sigmay)
 
 
-# --- 1D model classes ---
+# ---------------------------------------------------------------------------
+# 1D model classes (only those NOT in lmfit)
+# ---------------------------------------------------------------------------
 
 class LorentzianSquaredModel(Model):
-    r"""Lorentzian squared 1D. HWHM = sqrt(sqrt(2)-1)*sigma."""
+    r"""Lorentzian squared 1D model. HWHM = sqrt(sqrt(2)-1)*sigma."""
     __doc__ = (lorentzian_squared.__doc__ or "") + COMMON_DOC
     fwhm_factor = 2.0 * np.sqrt(np.sqrt(2) - 1)
 
@@ -204,30 +209,12 @@ class LorentzianSquaredModel(Model):
         return update_param_vals(pars, self.prefix, **kwargs)
 
 
-class PseudoVoigtModel(Model):
-    """1D pseudo-Voigt (Gaussian + Lorentzian mix, same FWHM)."""
-    __doc__ = (pvoigt.__doc__ or "") + COMMON_DOC
-    fwhm_factor = 2.0
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(pvoigt, *args, **kwargs)
-        self.set_param_hint("sigma", min=0)
-        self.set_param_hint("fraction", min=0, max=1, value=0.5)
-        self.set_param_hint("fwhm", expr=fwhm_expr(self))
-
-    def guess(self, data, x=None, negative=False, **kwargs):
-        pars = guess_from_peak(self, data, x, negative, ampscale=0.5, amp_area=False)
-        if f"{self.prefix}fraction" in pars:
-            pars[f"{self.prefix}fraction"].set(value=0.5, min=0, max=1)
-        return update_param_vals(pars, self.prefix, **kwargs)
-
-
-class AssymetricRectangleModel(Model):
+class AsymmetricRectangleModel(Model):
     r"""Step-up and step-down with center1, center2, sigma1, sigma2, form."""
 
     def __init__(self, independent_vars=("x",), prefix="", missing=None, name=None, **kwargs):
         kwargs.update({"prefix": prefix, "missing": missing, "independent_vars": list(independent_vars)})
-        super().__init__(assymetric_rectangle, **kwargs)
+        super().__init__(asymmetric_rectangle, **kwargs)
         self.set_param_hint("center1")
         self.set_param_hint("center2")
         self.set_param_hint(
@@ -258,7 +245,13 @@ class AssymetricRectangleModel(Model):
         return update_param_vals(pars, self.prefix, **kwargs)
 
 
-# --- 2D model classes ---
+# Backwards-compatible alias for the old misspelled name
+AssymetricRectangleModel = AsymmetricRectangleModel
+
+
+# ---------------------------------------------------------------------------
+# 2D model classes
+# ---------------------------------------------------------------------------
 
 class Gaussian2DModel(Model):
     """2D Gaussian (amplitude, centerx, centery, sigmax, sigmay)."""
@@ -294,7 +287,7 @@ class LorentzianSquared2DModel(Model):
         return _guess_2d_params(self, data, x, y, **kwargs)
 
 
-class Pvoigt2DModel(Model):
+class PseudoVoigt2DModel(Model):
     """2D pseudo-Voigt. Parameters: amplitude, centerx, centery, sigmax, sigmay, fraction."""
     __doc__ = (pvoigt_2D.__doc__ or "") + COMMON_DOC
     fwhm_factor = 2.0
@@ -313,6 +306,10 @@ class Pvoigt2DModel(Model):
         if f"{self.prefix}fraction" in pars:
             pars[f"{self.prefix}fraction"].set(value=0.5, min=0, max=1)
         return pars
+
+
+# Backwards-compatible alias
+Pvoigt2DModel = PseudoVoigt2DModel
 
 
 class PlaneModel(Model):

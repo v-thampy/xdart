@@ -54,74 +54,7 @@ class ScanInfo:
     h5_path: Path | None = None
 
 
-@dataclass(slots=True)
-class ExperimentConfig:
-    """Session-level configuration for an RSM experiment."""
-
-    base_path: Path
-    pickle_dir: Path
-    header: dict[str, Any]
-
-    img_rel_path: str = "images"
-    diff_motors: tuple[str, ...] = ("th", "chi", "phi", "tth")
-    diff_config: DiffractometerConfig = field(default_factory=DiffractometerConfig)
-    bins: tuple[int, int, int] = (80, 80, 100)
-    rotation: int = 0
-    h5_glob: str = "{sample}_scan*{scan_num}_master.h5"
-    detector: str = "Pilatus300k"
-
-    def __post_init__(self) -> None:
-        self.pickle_dir.mkdir(parents=True, exist_ok=True)
-
-    def find_h5(self, spec_dir: Path, sample: str, scan_num: int) -> Path | None:
-        pattern = self.h5_glob.format(sample=sample, scan_num=scan_num)
-        try:
-            return next(spec_dir.glob(pattern))
-        except StopIteration:
-            return None
-
-    def build_scans(self, scan_dict: dict[str, dict[str, Any]]) -> dict[str, ScanInfo]:
-        scans: dict[str, ScanInfo] = {}
-        for sample, sdict in scan_dict.items():
-            spec_dir = self.base_path / sdict["spec_rel_path"]
-            spec_path = spec_dir / sample
-
-            for scan_num in sdict["scan_nums"]:
-                h5_file = self.find_h5(spec_dir, sample, scan_num)
-                img_dir = spec_dir if h5_file else self.base_path / self.img_rel_path
-                scans[f"{sample}_{scan_num}"] = ScanInfo(
-                    spec_path=spec_path,
-                    h5_path=h5_file,
-                    img_dir=img_dir,
-                )
-        return scans
-
-    def process(
-        self,
-        scan_name: str,
-        scan_info: ScanInfo,
-        bins: tuple[int, int, int] | None = None,
-        rotation: int | None = None,
-        reprocess: bool = False,
-        roi: tuple[int, int, int, int] | None = None,
-        parallel: bool = True,
-        strict: bool = False,
-    ) -> RSMVolume | None:
-        return process_scan(
-            scan_name=scan_name,
-            scan_info=scan_info,
-            bins=self.bins if bins is None else bins,
-            header=self.header,
-            diff_motors=self.diff_motors,
-            diff_config=self.diff_config,
-            pickle_dir=self.pickle_dir,
-            rotation=self.rotation if rotation is None else rotation,
-            reprocess=reprocess,
-            roi=roi,
-            parallel=parallel,
-            strict=strict,
-            detector=self.detector,
-        )
+from ssrl_xrd_tools.core.config import ExperimentConfig
 
 
 def load_images(

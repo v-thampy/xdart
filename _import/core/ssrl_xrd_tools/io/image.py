@@ -87,6 +87,56 @@ def get_detector_mask(detector_name: str) -> np.ndarray | None:
         return None
 
 
+def load_mask(
+    mask: np.ndarray | Path | str,
+    threshold: float | None = None,
+    data: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Load or build a boolean bad-pixel mask from various inputs.
+
+    Parameters
+    ----------
+    mask : ndarray, path-like
+        * **ndarray** — used directly.  Boolean arrays are returned as-is.
+          Integer/float arrays are converted: non-zero values → ``True`` (bad).
+        * **str / Path** — path to a mask file (e.g. ``.edf``, ``.tif``).
+          The file is read via :func:`read_image` and non-zero pixels are
+          treated as bad.
+    threshold : float, optional
+        If given **and** *data* is provided, pixels in *data* exceeding
+        this value are OR-ed into the mask.
+    data : ndarray, optional
+        Image data used for the *threshold* mask.  Ignored if *threshold*
+        is None.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask, ``True`` = bad pixel.
+    """
+    if isinstance(mask, (str, Path)):
+        arr = read_image(Path(mask))
+        bool_mask = np.asarray(arr, dtype=float) != 0.0
+        # read_image returns NaN for bad pixels in some formats;
+        # treat NaN as bad too
+        bool_mask |= np.isnan(arr)
+    elif isinstance(mask, np.ndarray):
+        if mask.dtype == bool:
+            bool_mask = mask.copy()
+        else:
+            bool_mask = np.asarray(mask, dtype=float) != 0.0
+    else:
+        raise TypeError(
+            f"mask must be an ndarray or a file path, got {type(mask).__name__}"
+        )
+
+    if threshold is not None and data is not None:
+        bool_mask = bool_mask | (data > threshold) | np.isnan(data)
+
+    return bool_mask
+
+
 def read_image(
     path: Path | str,
     frame: int = 0,

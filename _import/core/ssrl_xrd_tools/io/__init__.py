@@ -4,6 +4,7 @@ from ssrl_xrd_tools.io.metadata import (
     read_txt_metadata,
 )
 from ssrl_xrd_tools.io.image import (
+    load_mask,
     read_image,
     read_image_stack,
     read_images_parallel,
