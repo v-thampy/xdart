@@ -46,11 +46,16 @@ wranglers = {
 
 
 def spherelocked(func):
-    """Decorator that acquires sphere_lock before calling the wrapped method."""
+    """Decorator that acquires sphere_lock before calling the wrapped method.
+
+    If self.sphere is not an EwaldSphere (e.g. during initialisation),
+    the function is called without the lock rather than silently returning None.
+    """
     def wrapper(self, *args, **kwargs):
         if isinstance(self.sphere, EwaldSphere):
             with self.sphere.sphere_lock:
                 return func(self, *args, **kwargs)
+        return func(self, *args, **kwargs)
 
     return wrapper
 

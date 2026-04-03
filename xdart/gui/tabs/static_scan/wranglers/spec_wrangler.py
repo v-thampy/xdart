@@ -4,10 +4,13 @@
 """
 
 # Standard library imports
+import logging
 import os
 import fnmatch
 import numpy as np
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Qt imports
 from pyqtgraph.Qt import QtCore, QtWidgets
@@ -61,27 +64,6 @@ params = [
         {'name': 'mask_file', 'title': 'Mask File', 'type': 'str', 'value': ''},
         NamedActionParameter(name='mask_file_browse', title='Browse...'),
     ], 'expanded': True, 'visible': False},
-    {'name': 'BG', 'title': 'Background', 'type': 'group', 'children': [
-        {'name': 'bg_type', 'title': '', 'type': 'list',
-         'values': ['None', 'Single BG File', 'Series Average', 'BG Directory'], 'value': 'None'},
-        {'name': 'File', 'title': 'BG File', 'type': 'str', 'value': '', 'visible': False},
-        NamedActionParameter(name='bg_file_browse', title='Browse...', visible=False),
-        {'name': 'Match', 'title': 'Match Parameter', 'type': 'group', 'children': [
-            {'name': 'Parameter', 'type': 'list', 'values': ['None'], 'value': 'None'},
-            {'name': 'match_fname', 'title': 'Match File Root', 'type': 'bool', 'value': False},
-            {'name': 'bg_dir', 'title': 'Directory', 'type': 'str', 'value': ''},
-            NamedActionParameter(name='bg_dir_browse', title='Browse...'),
-            {'name': 'Filter', 'type': 'str', 'value': ''},
-        ], 'expanded': True, 'visible': False},
-        {'name': 'Scale', 'type': 'float', 'value': 1, 'visible': False},
-        {'name': 'norm_channel', 'title': 'Normalize', 'type': 'list', 'values': ['bstop'], 'value': 'bstop',
-         'visible': False},
-    ], 'expanded': False, 'visible': False},
-    {'name': 'Mask', 'title': 'Mask', 'type': 'group', 'children': [
-        {'name': 'Threshold', 'type': 'bool', 'value': False},
-        {'name': 'min', 'title': 'Min', 'type': 'int', 'value': 0},
-        {'name': 'max', 'title': 'Max', 'type': 'int', 'value': 0},
-    ], 'expanded': False, 'visible': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'children': [
         {'name': 'Grazing', 'type': 'bool', 'value': False},
         {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'list', 'values': ['th'],
@@ -100,6 +82,27 @@ params = [
         {'name': 'gi_mode_2d', 'title': '2D Mode', 'type': 'list',
          'values': {u'Q\u1D62\u209A\u2013Q\u2092\u2092\u209A': 'qip_qoop', u'Q-\u03C7': 'q_chi'},
          'value': 'qip_qoop', 'visible': False},
+    ], 'expanded': False, 'visible': False},
+    {'name': 'Mask', 'title': 'Intensity Threshold', 'type': 'group', 'children': [
+        {'name': 'Threshold', 'type': 'bool', 'value': False},
+        {'name': 'min', 'title': 'Min', 'type': 'int', 'value': 0},
+        {'name': 'max', 'title': 'Max', 'type': 'int', 'value': 0},
+    ], 'expanded': False, 'visible': False},
+    {'name': 'BG', 'title': 'Background', 'type': 'group', 'children': [
+        {'name': 'bg_type', 'title': '', 'type': 'list',
+         'values': ['None', 'Single BG File', 'Series Average', 'BG Directory'], 'value': 'None'},
+        {'name': 'File', 'title': 'BG File', 'type': 'str', 'value': '', 'visible': False},
+        NamedActionParameter(name='bg_file_browse', title='Browse...', visible=False),
+        {'name': 'Match', 'title': 'Match Parameter', 'type': 'group', 'children': [
+            {'name': 'Parameter', 'type': 'list', 'values': ['None'], 'value': 'None'},
+            {'name': 'match_fname', 'title': 'Match File Root', 'type': 'bool', 'value': False},
+            {'name': 'bg_dir', 'title': 'Directory', 'type': 'str', 'value': ''},
+            NamedActionParameter(name='bg_dir_browse', title='Browse...'),
+            {'name': 'Filter', 'type': 'str', 'value': ''},
+        ], 'expanded': True, 'visible': False},
+        {'name': 'Scale', 'type': 'float', 'value': 1, 'visible': False},
+        {'name': 'norm_channel', 'title': 'Normalize', 'type': 'list', 'values': ['bstop'], 'value': 'bstop',
+         'visible': False},
     ], 'expanded': False, 'visible': False},
     {'name': 'h5_dir', 'title': 'Save Path', 'type': 'str', 'value': get_fname_dir(), 'enabled': False},
     NamedActionParameter(name='h5_dir_browse', title='Browse...', visible=False),
@@ -189,6 +192,7 @@ class specWrangler(wranglerWidget):
 
         # Setup parameter tree
         self.tree = ParameterTree()
+        self.tree.setMinimumWidth(150)
         self.stylize_ParameterTree()
         self.parameters = Parameter.create(
             name='spec_wrangler', type='group', children=params
@@ -480,9 +484,22 @@ class specWrangler(wranglerWidget):
         else:
             self.ui.liveCheckBox.setEnabled(True)
             self.ui.batchCheckBox.setEnabled(True)
-            
-            # Sync cores enabled state with batch checkbox
+
+            # Mutual exclusion: when one is checked, uncheck the other
+            is_live = self.ui.liveCheckBox.isChecked()
             is_batch = self.ui.batchCheckBox.isChecked()
+            if is_live and is_batch:
+                # Live was just checked — uncheck batch (or vice versa).
+                # Determine which was the trigger by checking the sender.
+                # If unclear, prefer live (last action wins).
+                self.ui.batchCheckBox.setChecked(False)
+                is_batch = False
+            if is_live:
+                self.ui.batchCheckBox.setEnabled(False)
+            if is_batch:
+                self.ui.liveCheckBox.setEnabled(False)
+
+            # Sync cores enabled state with batch checkbox
             self.ui.coresLabel.setEnabled(is_batch)
             self.ui.maxCoresSpinBox.setEnabled(is_batch)
 
@@ -516,8 +533,14 @@ class specWrangler(wranglerWidget):
         self._set_integration_controls_enabled(not is_viewer)
         # Hide start/pause/stop/continue in viewer mode
         self.ui.frame.setVisible(not is_viewer)
-        # Notify parent (static_scan_widget) so it can gray out integrator panel
-        self.sigViewerModeChanged.emit(self.viewer_mode or '')
+        # Notify parent only when viewer mode actually changed (avoids
+        # unnecessary layout resets when just toggling Live/Batch).
+        new_vm = self.viewer_mode or ''
+        if not hasattr(self, '_prev_viewer_mode'):
+            self._prev_viewer_mode = ''
+        if new_vm != self._prev_viewer_mode:
+            self._prev_viewer_mode = new_vm
+            self.sigViewerModeChanged.emit(new_vm)
 
     def _set_integration_controls_enabled(self, enabled):
         """Enable or disable parameter tree groups related to integration."""
@@ -710,7 +733,7 @@ class specWrangler(wranglerWidget):
         except Exception:
             self.poni = None
         if self.poni is None:
-            print('Invalid Poni File')
+            logger.warning('Invalid Poni File: %s', self.poni_file)
             self.thread.signal_q.put(('message', 'Invalid Poni File'))
             return
 

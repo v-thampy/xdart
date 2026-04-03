@@ -147,13 +147,18 @@ Configure in the **Background** section of the parameter tree:
 
 Background frames are integrated using the same parameters as sample frames for consistency.
 
-### Masking and Bad Pixels
+### Calibration and Masking
 
-Use the masking tools in the detector image panel:
+The integrator panel includes **Calibrate** and **Make Mask** buttons at the bottom:
 
-- **Interactive masking**: Draw polygons or rectangles on the 2D detector image to exclude regions
-- **Preset masks**: Load a Silicon mask or bad pixel map from file
-- **Automated detection**: Use threshold-based detection to mask hot pixels or detector edges
+- **Calibrate** launches the pyFAI-calib2 module for interactive detector calibration. Use a calibration standard (e.g., LaB6, CeO2) image to refine detector geometry and generate a PONI file.
+- **Make Mask** launches the pyFAI mask drawing tool, where you can interactively draw regions on a detector image to create or edit a bad-pixel mask file.
+
+Additional masking options are available in the parameter tree:
+
+- **Preset masks**: Load a mask file from disk
+- **Threshold masking**: Automatically mask pixels above or below intensity thresholds
+- **Detector masks**: Apply detector-specific dead-pixel maps
 
 Masks are saved with your results in the NeXus file for reproducibility.
 
@@ -179,13 +184,13 @@ xdart uses pyFAI PONI (PyFAI Object Containing Necessary Information) files for 
 - Wavelength
 - Detector rotation (if any)
 
-You can generate a PONI file using:
+You can generate a PONI file using the **Calibrate** button in xdart's integrator panel (which launches pyFAI-calib2), or from the command line:
 
 ```bash
 pyFAI-calib2
 ```
 
-or integrate it directly into xdart's workflow. Refer to the pyFAI documentation for detailed calibration procedures.
+Refer to the pyFAI documentation for detailed calibration procedures.
 
 ## Dependencies
 

@@ -4,9 +4,12 @@
 """
 
 # Standard library imports
+import logging
 import os
 import sys
 import subprocess
+
+logger = logging.getLogger(__name__)
 
 import fabio
 from xdart.utils.pyFAI_binaries import pyFAI_drawmask_main, get_MaskImageWidgetXdart
@@ -28,12 +31,10 @@ else:
 from pyqtgraph.parametertree import Parameter
 
 # This module imports
-if sys.platform == 'win32':
-    from .ui.integratorUI_windows import Ui_Form
-else:
-    from .ui.integratorUI_mac import Ui_Form
+from .ui.integratorUI import Ui_Form
 
 from .sphere_threads import integratorThread
+from xdart.utils.session import save_session, load_session
 
 _translate = QtCore.QCoreApplication.translate
 QFileDialog = QtWidgets.QFileDialog
@@ -212,6 +213,156 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.axis1D.currentIndexChanged.connect(self._update_gi_mode_1d)
         self.ui.axis2D.currentIndexChanged.connect(self._update_gi_mode_2d)
 
+        # Restore saved integrator settings from last session
+        self._restore_from_session()
+
+        # Auto-save integrator settings on any UI change
+        self.ui.npts_1D.textChanged.connect(self._save_to_session)
+        self.ui.npts_radial_2D.textChanged.connect(self._save_to_session)
+        self.ui.npts_azim_2D.textChanged.connect(self._save_to_session)
+        self.ui.unit_1D.currentIndexChanged.connect(self._save_to_session)
+        self.ui.unit_2D.currentIndexChanged.connect(self._save_to_session)
+        self.ui.axis1D.currentIndexChanged.connect(self._save_to_session)
+        self.ui.axis2D.currentIndexChanged.connect(self._save_to_session)
+        self.ui.radial_autoRange_1D.stateChanged.connect(self._save_to_session)
+        self.ui.azim_autoRange_1D.stateChanged.connect(self._save_to_session)
+        self.ui.radial_autoRange_2D.stateChanged.connect(self._save_to_session)
+        self.ui.azim_autoRange_2D.stateChanged.connect(self._save_to_session)
+        self.ui.radial_low_1D.textChanged.connect(self._save_to_session)
+        self.ui.radial_high_1D.textChanged.connect(self._save_to_session)
+        self.ui.azim_low_1D.textChanged.connect(self._save_to_session)
+        self.ui.azim_high_1D.textChanged.connect(self._save_to_session)
+        self.ui.radial_low_2D.textChanged.connect(self._save_to_session)
+        self.ui.radial_high_2D.textChanged.connect(self._save_to_session)
+        self.ui.azim_low_2D.textChanged.connect(self._save_to_session)
+        self.ui.azim_high_2D.textChanged.connect(self._save_to_session)
+        self.parameters.sigTreeStateChanged.connect(self._save_to_session)
+
+    # --- Session persistence ---
+
+    def _save_to_session(self, *args):
+        """Save current integrator UI state to ~/.xdart/session.json."""
+        data = {
+            'integ_npts_1D': self.ui.npts_1D.text(),
+            'integ_npts_radial_2D': self.ui.npts_radial_2D.text(),
+            'integ_npts_azim_2D': self.ui.npts_azim_2D.text(),
+            'integ_unit_1D': self.ui.unit_1D.currentIndex(),
+            'integ_unit_2D': self.ui.unit_2D.currentIndex(),
+            'integ_axis1D': self.ui.axis1D.currentIndex(),
+            'integ_axis2D': self.ui.axis2D.currentIndex(),
+            'integ_radial_autoRange_1D': self.ui.radial_autoRange_1D.isChecked(),
+            'integ_azim_autoRange_1D': self.ui.azim_autoRange_1D.isChecked(),
+            'integ_radial_autoRange_2D': self.ui.radial_autoRange_2D.isChecked(),
+            'integ_azim_autoRange_2D': self.ui.azim_autoRange_2D.isChecked(),
+            'integ_radial_low_1D': self.ui.radial_low_1D.text(),
+            'integ_radial_high_1D': self.ui.radial_high_1D.text(),
+            'integ_azim_low_1D': self.ui.azim_low_1D.text(),
+            'integ_azim_high_1D': self.ui.azim_high_1D.text(),
+            'integ_radial_low_2D': self.ui.radial_low_2D.text(),
+            'integ_radial_high_2D': self.ui.radial_high_2D.text(),
+            'integ_azim_low_2D': self.ui.azim_low_2D.text(),
+            'integ_azim_high_2D': self.ui.azim_high_2D.text(),
+        }
+        # Save advanced parameter tree values
+        for dim_label, tree in [('1d', self.bai_1d_pars), ('2d', self.bai_2d_pars)]:
+            for child in tree.children():
+                data[f'integ_{dim_label}_{child.name()}'] = child.value()
+        save_session(data)
+
+    def _restore_from_session(self):
+        """Restore integrator UI state from ~/.xdart/session.json."""
+        session = load_session()
+        if not any(k.startswith('integ_') for k in session):
+            return
+
+        # Block signals during restoration to avoid feedback loops
+        self._disconnect_inp_signals()
+        try:
+            self.ui.axis1D.currentIndexChanged.disconnect(self._update_gi_mode_1d)
+        except TypeError:
+            pass
+        try:
+            self.ui.axis2D.currentIndexChanged.disconnect(self._update_gi_mode_2d)
+        except TypeError:
+            pass
+
+        # Restore npts
+        for key, widget in [
+            ('integ_npts_1D', self.ui.npts_1D),
+            ('integ_npts_radial_2D', self.ui.npts_radial_2D),
+            ('integ_npts_azim_2D', self.ui.npts_azim_2D),
+        ]:
+            val = session.get(key)
+            if val is not None:
+                widget.setText(str(val))
+
+        # Restore unit combos
+        for key, widget in [
+            ('integ_unit_1D', self.ui.unit_1D),
+            ('integ_unit_2D', self.ui.unit_2D),
+        ]:
+            val = session.get(key)
+            if val is not None and 0 <= val < widget.count():
+                widget.setCurrentIndex(val)
+
+        # Restore axis combos (only if combo has enough items — depends on GI mode)
+        for key, widget in [
+            ('integ_axis1D', self.ui.axis1D),
+            ('integ_axis2D', self.ui.axis2D),
+        ]:
+            val = session.get(key)
+            if val is not None and 0 <= val < widget.count():
+                widget.setCurrentIndex(val)
+
+        # Restore auto-range checkboxes
+        for key, widget in [
+            ('integ_radial_autoRange_1D', self.ui.radial_autoRange_1D),
+            ('integ_azim_autoRange_1D', self.ui.azim_autoRange_1D),
+            ('integ_radial_autoRange_2D', self.ui.radial_autoRange_2D),
+            ('integ_azim_autoRange_2D', self.ui.azim_autoRange_2D),
+        ]:
+            val = session.get(key)
+            if val is not None:
+                widget.setChecked(val)
+
+        # Restore range text fields
+        for key, widget in [
+            ('integ_radial_low_1D', self.ui.radial_low_1D),
+            ('integ_radial_high_1D', self.ui.radial_high_1D),
+            ('integ_azim_low_1D', self.ui.azim_low_1D),
+            ('integ_azim_high_1D', self.ui.azim_high_1D),
+            ('integ_radial_low_2D', self.ui.radial_low_2D),
+            ('integ_radial_high_2D', self.ui.radial_high_2D),
+            ('integ_azim_low_2D', self.ui.azim_low_2D),
+            ('integ_azim_high_2D', self.ui.azim_high_2D),
+        ]:
+            val = session.get(key)
+            if val is not None:
+                widget.setText(str(val))
+
+        # Restore advanced parameter tree values
+        for dim_label, tree in [('1d', self.bai_1d_pars), ('2d', self.bai_2d_pars)]:
+            with tree.treeChangeBlocker():
+                for child in tree.children():
+                    val = session.get(f'integ_{dim_label}_{child.name()}')
+                    if val is not None:
+                        try:
+                            child.setValue(val)
+                        except Exception:
+                            pass
+
+        # Update enabled/disabled state based on restored auto-range
+        self.radial_autoRange_1D = self.ui.radial_autoRange_1D.isChecked()
+        self.azim_autoRange_1D = self.ui.azim_autoRange_1D.isChecked()
+        self.radial_autoRange_2D = self.ui.radial_autoRange_2D.isChecked()
+        self.azim_autoRange_2D = self.ui.azim_autoRange_2D.isChecked()
+        self.setEnabled()
+
+        # Reconnect signals
+        self.ui.axis1D.currentIndexChanged.connect(self._update_gi_mode_1d)
+        self.ui.axis2D.currentIndexChanged.connect(self._update_gi_mode_2d)
+        self._connect_inp_signals()
+
     def update(self):
         """Grabs args from sphere and uses _sync_ranges and
         _update_params private methods to update.
@@ -253,86 +404,19 @@ class integratorTree(QtWidgets.QWidget):
         # self.ui.integrate1D.setEnabled(False)
         # self.ui.integrate2D.setEnabled(False)
 
-    def update_radial_autoRange_1D(self):
-        """Disable/Enable radial 1D widget if auto range is un/selected
-        """
-        self.radial_autoRange_1D = self.ui.radial_autoRange_1D.isChecked()
-        # self.setEnabled()
-
-        self.bai_1d_pars.child('radial_range', 'Auto').setValue(
-            self.radial_autoRange_1D)
-        if self.radial_autoRange_1D:
-            self.sphere.bai_1d_args['radial_range'] = None
-            self.ui.radial_low_1D.setEnabled(False)
-            self.ui.radial_high_1D.setEnabled(False)
-        else:
-            self.ui.radial_low_1D.setEnabled(True)
-            self.ui.radial_high_1D.setEnabled(True)
-
-
-    def update_azim_autoRange_1D(self):
-        """Disable/Enable azim 1D widget if auto range is un/selected
-        """
-        self.azim_autoRange_1D = self.ui.azim_autoRange_1D.isChecked()
-
-        self.bai_1d_pars.child('azimuth_range', 'Auto').setValue(
-            self.azim_autoRange_1D)
-
-        if self.azim_autoRange_1D:
-            self.sphere.bai_1d_args['azimuth_range'] = None
-            self.ui.azim_low_1D.setEnabled(False)
-            self.ui.azim_high_1D.setEnabled(False)
-        else:
-            self.ui.azim_low_1D.setEnabled(True)
-            self.ui.azim_high_1D.setEnabled(True)
-
-
-    def update_radial_autoRange_2D(self):
-        """Disable/Enable radial 2D widget if auto range is un/selected
-        """
-        self.radial_autoRange_2D = self.ui.radial_autoRange_2D.isChecked()
-
-        self.bai_2d_pars.child('radial_range', 'Auto').setValue(
-            self.radial_autoRange_2D)
-
-        if self.radial_autoRange_2D:
-            self.sphere.bai_2d_args['radial_range'] = None
-            self.ui.radial_low_2D.setEnabled(False)
-            self.ui.radial_high_2D.setEnabled(False)
-        else:
-            self.ui.radial_low_2D.setEnabled(True)
-            self.ui.radial_high_2D.setEnabled(True)
-
-
-    def update_azim_autoRange_2D(self):
-        """Disable/Enable radial 2D widget if auto range is un/selected
-        """
-        self.azim_autoRange_2D = self.ui.azim_autoRange_2D.isChecked()
-
-        self.bai_2d_pars.child('azimuth_range', 'Auto').setValue(
-            self.azim_autoRange_2D)
-
-        if self.azim_autoRange_2D:
-            self.sphere.bai_2d_args['azimuth_range'] = None
-            self.ui.azim_low_2D.setEnabled(False)
-            self.ui.azim_high_2D.setEnabled(False)
-        else:
-            self.ui.azim_low_2D.setEnabled(True)
-            self.ui.azim_high_2D.setEnabled(True)
-
-
     def _validate_ranges(self):
         self.ui.npts_1D.setValidator(QtGui.QIntValidator(0, 50000))
         self.ui.npts_radial_2D.setValidator(QtGui.QIntValidator(0, 50000))
         self.ui.npts_azim_2D.setValidator(QtGui.QIntValidator(0, 50000))
 
-        minmax = (0, 50)
+        # Allow negative radial values for GI modes (e.g. Q_ip can be negative)
+        minmax = (-50, 50)
         if self.ui.unit_1D.currentIndex() == 1:
             minmax = (-180, 180)
         self.ui.radial_low_1D.setValidator(QtGui.QDoubleValidator(minmax[0], minmax[1], 2))
         self.ui.radial_high_1D.setValidator(QtGui.QDoubleValidator(minmax[0], minmax[1], 2))
 
-        minmax = (0, 50)
+        minmax = (-50, 50)
         if self.ui.unit_2D.currentIndex() == 1:
             minmax = (-180, 180)
         self.ui.radial_low_2D.setValidator(QtGui.QDoubleValidator(minmax[0], minmax[1], 2))
@@ -794,14 +878,10 @@ class integratorTree(QtWidgets.QWidget):
         with self.integrator_thread.lock:
             if len(self.sphere.arches.index) > 0:
                 self.integrator_thread.method = 'bai_1d_all'
-            # # if self.ui.all1D.isChecked() or type(self.arch.idx) != int:
-            # if self.ui.all1D.isChecked() or ('Overall' in self.arch_ids):
-            #     self.integrator_thread.method = 'bai_1d_all'
-            # else:
-            #     self.integrator_thread.method = 'bai_1d_SI'
         self.data_1d.clear()
         self.setEnabled(False)
-        self.integrator_thread.start()
+        if not self.integrator_thread.isRunning():
+            self.integrator_thread.start()
 
     def bai_2d(self, q):
         """Uses the integrator_thread attribute to call bai_2d
@@ -809,14 +889,10 @@ class integratorTree(QtWidgets.QWidget):
         with self.integrator_thread.lock:
             if len(self.sphere.arches.index) > 0:
                 self.integrator_thread.method = 'bai_2d_all'
-            # if self.ui.all2D.isChecked() or type(self.arch.idx) != int:
-            # if self.ui.all2D.isChecked() or ('Overall' in self.arch_ids):
-            #     self.integrator_thread.method = 'bai_2d_all'
-            # else:
-            #     self.integrator_thread.method = 'bai_2d_SI'
         self.data_2d.clear()
         self.setEnabled(False)
-        self.integrator_thread.start()
+        if not self.integrator_thread.isRunning():
+            self.integrator_thread.start()
 
     @staticmethod
     def run_pyfai_calib():
@@ -840,7 +916,7 @@ class integratorTree(QtWidgets.QWidget):
             options=QFileDialog.DontUseNativeDialog
         )
         if not os.path.exists(processFile):
-            print('No Image Chosen')
+            logger.info('No image chosen for mask creation')
             return
 
         MaskWidgetClass = get_MaskImageWidgetXdart()
@@ -1035,7 +1111,7 @@ class integratorTree(QtWidgets.QWidget):
             self.ui.gi_radial_label_1D.setText(f"IP ({AA_inv})")
             self.ui.gi_radial_label_1D.show()
             self.ui.label_azim_1D.setText(f"OOP ({AA_inv})")
-            self._set_range_defaults_1d(-5, 5, 0, 5)
+            self._set_range_defaults_1d(-10, 10, 0, 5)
         elif mode == 'exit_angle':
             self.ui.unit_1D.hide()
             self.ui.gi_radial_label_1D.setText(f"IP ({AA_inv})")
@@ -1068,7 +1144,7 @@ class integratorTree(QtWidgets.QWidget):
             self.ui.gi_radial_label_2D.setText(f"IP ({AA_inv})")
             self.ui.gi_radial_label_2D.show()
             self.ui.label_azim_2D.setText(f"OOP ({AA_inv})")
-            self._set_range_defaults_2d(-5, 5, 0, 5)
+            self._set_range_defaults_2d(-10, 10, 0, 5)
         elif mode == 'q_chi':
             self.ui.unit_2D.show()
             self.ui.unit_2D.setEnabled(True)
@@ -1152,6 +1228,7 @@ class advancedParameters(QtWidgets.QWidget):
         self.name = name
         self.parameter = parameter
         self.tree = pg.parametertree.ParameterTree()
+        self.tree.setMinimumWidth(150)
         self.tree.addParameters(parameter)
         self.parameter.sigTreeStateChanged.connect(self.process_change)
         self.layout = QtWidgets.QVBoxLayout(self)

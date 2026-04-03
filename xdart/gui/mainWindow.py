@@ -45,15 +45,12 @@ class Ui_MainWindow(object):
         self.menubar.setDefaultUp(True)
         self.menuFile = QMenu(self.menubar)
         self.menuFile.setObjectName(u"menuFile")
-        self.menuExperiments = QMenu(self.menubar)
-        self.menuExperiments.setObjectName(u"menuExperiments")
         MainWindow.setMenuBar(self.menubar)
         self.statusbar = QStatusBar(MainWindow)
         self.statusbar.setObjectName(u"statusbar")
         MainWindow.setStatusBar(self.statusbar)
 
         self.menubar.addAction(self.menuFile.menuAction())
-        self.menubar.addAction(self.menuExperiments.menuAction())
         self.menuFile.addAction(self.actionOpen)
         self.menuFile.addAction(self.actionExit)
 
@@ -63,10 +60,9 @@ class Ui_MainWindow(object):
     # setupUi
 
     def retranslateUi(self, MainWindow):
-        MainWindow.setWindowTitle(QCoreApplication.translate("MainWindow", u"MainWindow", None))
+        MainWindow.setWindowTitle(QCoreApplication.translate("MainWindow", u"xdart", None))
         self.actionOpen.setText(QCoreApplication.translate("MainWindow", u"Open", None))
         self.actionExit.setText(QCoreApplication.translate("MainWindow", u"Exit", None))
         self.menuFile.setTitle(QCoreApplication.translate("MainWindow", u"File", None))
-        self.menuExperiments.setTitle(QCoreApplication.translate("MainWindow", u"Experiments", None))
     # retranslateUi
 

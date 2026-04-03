@@ -64,8 +64,8 @@ class Ui_Form(object):
         sizePolicy.setVerticalStretch(0)
         sizePolicy.setHeightForWidth(self.label1D.sizePolicy().hasHeightForWidth())
         self.label1D.setSizePolicy(sizePolicy)
-        self.label1D.setMinimumSize(QSize(70, 0))
-        self.label1D.setMaximumSize(QSize(70, 16777215))
+        self.label1D.setMinimumSize(QSize(50, 0))
+        self.label1D.setMaximumSize(QSize(50, 16777215))
         font = QFont()
         font.setPointSize(11)
         font.setBold(True)
@@ -169,8 +169,8 @@ class Ui_Form(object):
 
         self.label_azim_1D = QLabel(self.frame1D_range)
         self.label_azim_1D.setObjectName(u"label_azim_1D")
-        self.label_azim_1D.setMinimumSize(QSize(55, 0))
-        self.label_azim_1D.setMaximumSize(QSize(100, 50))
+        self.label_azim_1D.setMinimumSize(QSize(40, 0))
+        self.label_azim_1D.setMaximumSize(QSize(40, 50))
         self.label_azim_1D.setAlignment(Qt.AlignCenter)
 
         self.gridLayout_1D.addWidget(self.label_azim_1D, 1, 0, 1, 1)
@@ -243,8 +243,8 @@ class Ui_Form(object):
         self.label2D.setObjectName(u"label2D")
         sizePolicy.setHeightForWidth(self.label2D.sizePolicy().hasHeightForWidth())
         self.label2D.setSizePolicy(sizePolicy)
-        self.label2D.setMinimumSize(QSize(70, 0))
-        self.label2D.setMaximumSize(QSize(70, 16777215))
+        self.label2D.setMinimumSize(QSize(50, 0))
+        self.label2D.setMaximumSize(QSize(50, 16777215))
         self.label2D.setFont(font)
         self.label2D.setAutoFillBackground(False)
         self.label2D.setStyleSheet(u"background-color: rgba(195, 195, 195, 200);")
@@ -353,8 +353,8 @@ class Ui_Form(object):
 
         self.label_azim_2D = QLabel(self.frame2D_range)
         self.label_azim_2D.setObjectName(u"label_azim_2D")
-        self.label_azim_2D.setMinimumSize(QSize(55, 0))
-        self.label_azim_2D.setMaximumSize(QSize(100, 50))
+        self.label_azim_2D.setMinimumSize(QSize(40, 0))
+        self.label_azim_2D.setMaximumSize(QSize(40, 50))
         self.label_azim_2D.setAlignment(Qt.AlignCenter)
 
         self.gridLayout_2D.addWidget(self.label_azim_2D, 1, 0, 1, 1)

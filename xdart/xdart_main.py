@@ -10,6 +10,7 @@ import sys
 import gc
 import os
 import signal
+import logging
 import faulthandler
 faulthandler.enable()  # Print Python traceback on bus error / segfault
 
@@ -24,9 +25,10 @@ import matplotlib
 matplotlib.use('QtAgg')
 
 # Suppress pyFAI INFO logs (e.g. "No sensor configuration provided").
-import logging
 logging.getLogger('pyFAI').setLevel(logging.WARNING)
 logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
+
+logger = logging.getLogger(__name__)
 
 # Qt imports
 from typing import TYPE_CHECKING, Any
@@ -39,14 +41,6 @@ else:
 # This module imports
 from xdart.gui.mainWindow import Ui_MainWindow
 from xdart.gui import tabs
-
-# Other imports
-# import multiprocessing
-# multiprocessing.freeze_support()
-# try:
-#     multiprocessing.set_start_method('spawn')
-# except RuntimeError:
-#     pass
 
 
 def setup_data_folders(exp_list):
@@ -81,33 +75,30 @@ QMainWindow = QtWidgets.QMainWindow
 class Main(QMainWindow):
     def __init__(self, tab_paths):
         """
-
         Parameters
         ----------
         tab_paths : dict
         """
         super().__init__()
         self.tab_paths = tab_paths
-        self.tabs = {}
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        self.setWindowTitle('xdart')
         self.ui.actionOpen.triggered.connect(self.openFile)
         self.ui.actionExit.triggered.connect(self.exit)
         self.fname = None
-        self.tabwidget = QtWidgets.QTabWidget()
-        self.tabwidget.setTabsClosable(True)
-        self.tabwidget.tabCloseRequested.connect(self.closeExperiment)
-        self.setCentralWidget(self.tabwidget)
-        self.set_tabs()
-        self.open_static_scan()
-        #
+
+        # Embed the main widget directly (no tab container)
+        self.main_widget = tabs.static_scan.staticWidget(
+            local_path=self.tab_paths['static_scan'])
+        self.setCentralWidget(self.main_widget)
+
         self.show()
         self.resize(1600, 920)
 
     def exit(self):
         try:
-            for i in range(self.tabwidget.count()):
-                self.closeExperiment(i)
+            self.main_widget.close()
         finally:
             self.close()
             gc.collect()
@@ -115,53 +106,21 @@ class Main(QMainWindow):
                 os.killpg(os.getpid(), signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            sys.exit(1)
+            sys.exit(0)
 
     def openFile(self):
         try:
-            self.tabwidget.currentWidget().open_file()
-        except Exception as e:
-            print(e)
-
-    def set_tabs(self):
-        for e in tabs.exp_list:
-            self.ui.menuExperiments.addAction(e)
-        self.ui.menuExperiments.triggered.connect(self.openExperiment)
-
-    def open_static_scan(self):
-        if 'static_scan' not in self.tabs:
-            self.tabs['static_scan'] = tabs.static_scan.staticWidget(local_path=self.tab_paths['static_scan'])
-            self.tabwidget.addTab(self.tabs['static_scan'], 'static_scan')
-
-    def openExperiment(self, q):
-        if q.text() == 'static_scan':
-            if 'static_scan' not in self.tabs:
-                self.tabs['static_scan'] = tabs.static_scan.staticWidget(local_path=self.tab_paths['static_scan'])
-                self.tabwidget.addTab(self.tabs['static_scan'], 'static_scan')
-
-    def closeExperiment(self, q):
-        _to_close = self.tabwidget.widget(q)
-        name = self.tabwidget.tabText(q)
-        _to_close.close()
-        self.tabwidget.removeTab(q)
-        del self.tabs[name]
-        gc.collect()
+            self.main_widget.open_file()
+        except Exception:
+            logger.exception("Error opening file")
 
 
 def main():
-    # multiprocessing.freeze_support()
     tab_paths = setup_data_folders(tabs.exp_list)
-    # app = QtGui.QApplication(sys.argv)
     app = QtWidgets.QApplication(sys.argv)
-    # app.setStyleSheet(qdarkstyle.load_stylesheet_pyqt5())
     mw = Main(tab_paths)
     mw.show()
     app.exec()
-
-    # try:
-    #     os.killpg(os.getpid(), signal.SIGTERM)
-    # except AttributeError or ProcessLookupError:
-    #     pass
 
 
 if __name__ == '__main__':

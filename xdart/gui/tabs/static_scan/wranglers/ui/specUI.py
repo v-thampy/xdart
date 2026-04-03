@@ -90,7 +90,7 @@ class Ui_Form(object):
         _cpu = _os.cpu_count() or 4
         self.maxCoresSpinBox.setMinimum(1)
         self.maxCoresSpinBox.setMaximum(_cpu)
-        self.maxCoresSpinBox.setValue(min(_cpu - 1, 8) or 1)
+        self.maxCoresSpinBox.setValue(min(_cpu - 1, 4) or 1)
         self.commandLayout.addWidget(self.maxCoresSpinBox)
 
         self.horizontalLayout_2.addLayout(self.commandLayout)

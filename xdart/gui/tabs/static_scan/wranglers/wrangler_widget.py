@@ -88,7 +88,19 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         """Sets the thread child object. Called by tthetaWidget prior
         to starting thread.
         """
+        # Disconnect old thread signals to avoid duplicate emissions
+        try:
+            self.thread.finished.disconnect(self.finished.emit)
+            self.thread.started.disconnect(self.started.emit)
+            self.thread.sigUpdate.disconnect(self.sigUpdateData.emit)
+            self.thread.sigUpdateGI.disconnect(self.sigUpdateGI.emit)
+        except (TypeError, RuntimeError):
+            pass  # Signals were never connected or already disconnected
         self.thread = wranglerThread(self.command_queue, self.sphere_args, self.fname, self.file_lock, self)
+        self.thread.finished.connect(self.finished.emit)
+        self.thread.started.connect(self.started.emit)
+        self.thread.sigUpdate.connect(self.sigUpdateData.emit)
+        self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
 
     def set_fname(self, fname):
         """Changes fname attribute of self and thread.

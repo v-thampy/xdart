@@ -4,10 +4,13 @@
 """
 
 # Standard library imports
+import logging
 import os
 import re
 import time
 import copy
+
+logger = logging.getLogger(__name__)
 
 # Other imports
 import matplotlib.pyplot as plt
@@ -145,6 +148,7 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.overlay = None
         self._last_plot_unit = -1
         self._plot_axis_info = []  # populated by set_axes()
+        self._was_skip_2d = False  # track 1D-only state for transitions
 
         # Image and Binned 2D Data
         self.image_data = (None, None)
@@ -156,7 +160,7 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.image_layout = Qt.QtWidgets.QHBoxLayout(self.ui.imageFrame)
         self.image_layout.setContentsMargins(0, 0, 0, 0)
         self.image_layout.setSpacing(0)
-        self.image_widget = pgImageWidget(lockAspect=1, raw=True)
+        self.image_widget = pgImageWidget(lockAspect=True, raw=True)
         self.image_layout.addWidget(self.image_widget)
 
         # Regrouped Image pane setup
@@ -272,14 +276,13 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         if len(self.arch_ids) == 0 or self.arch_ids[0] == 'No data':
             return
 
-        # with self.sphere.sphere_lock:
-        # if 'Overall' in self.arch_ids:
-        if len(self.arch_ids) == len(self.sphere.arches.index) > 1:
-            self.overall = True
-            self.idxs = sorted(np.asarray(self.sphere.arches.index, dtype=int))
-        else:
-            self.overall = False
-            self.idxs = sorted(self.arch_ids)
+        with self.sphere.sphere_lock:
+            if len(self.arch_ids) == len(self.sphere.arches.index) > 1:
+                self.overall = True
+                self.idxs = sorted(np.asarray(self.sphere.arches.index, dtype=int))
+            else:
+                self.overall = False
+                self.idxs = sorted(self.arch_ids)
 
         try:
             self.idxs = list(np.asarray(self.idxs, dtype=int))
@@ -557,14 +560,14 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         if self.viewer_mode == 'image':
             try:
                 self._update_image_viewer()
-            except (TypeError, Exception) as e:
-                print(f'WARNING: image viewer update failed: {e}')
+            except Exception:
+                logger.debug('Image viewer update failed', exc_info=True)
             return True
         if self.viewer_mode == 'xye':
             try:
                 self._update_xye_viewer()
-            except (TypeError, Exception) as e:
-                print(f'WARNING: xye viewer update failed: {e}')
+            except Exception:
+                logger.debug('XYE viewer update failed', exc_info=True)
             return True
 
         # ── Normal mode ──────────────────────────────────────────────
@@ -647,6 +650,7 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
                         continue
                 i += 1
             self.ui.plotUnit.blockSignals(False)
+            self._was_skip_2d = True
         else:
             # Restore 2D panels and image toolbar
             self.ui.twoDWindow.setMinimumHeight(0)
@@ -660,8 +664,11 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             self.ui.imageUnit.setEnabled(True)
             # Hide the raw image preview button in 2D modes
             self._showImageBtn.setVisible(False)
-            # Rebuild plotUnit with all entries (including 2D-derived)
-            self.set_axes()
+            # Only rebuild plotUnit when transitioning from 1D-only mode,
+            # otherwise preserve the user's current plotUnit selection.
+            if self._was_skip_2d:
+                self.set_axes()
+                self._was_skip_2d = False
 
     def _show_image_preview(self):
         """Open a popup dialog showing the raw image thumbnail for the
@@ -683,7 +690,7 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             dlg.resize(600, 600)
             layout = QtWidgets.QVBoxLayout(dlg)
             layout.setContentsMargins(2, 2, 2, 2)
-            pw = pgImageWidget(lockAspect=1, raw=True)
+            pw = pgImageWidget(lockAspect=True, raw=True)
             layout.addWidget(pw)
             self._image_preview_dialog = dlg
             self._image_preview_widget = pw
@@ -835,7 +842,7 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
                     if mask.shape == data.shape:
                         data[mask] = np.nan
                 except Exception:
-                    pass  # silently skip if mask can't be loaded
+                    logger.debug("Failed to load or apply mask file %s", mask_file, exc_info=True)
 
         data = data.T[:, ::-1]
         rect = get_rect(np.arange(data.shape[0]), np.arange(data.shape[1]))
@@ -860,10 +867,21 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             # Hide binned frame — only raw image relevant
             self.ui.binnedFrame.setMaximumWidth(0)
             self.ui.binnedFrame.setMinimumWidth(0)
-            # Disable 2D controls not relevant in viewer
+
+            # Disable all controls not relevant in image viewer mode
+            self.ui.normChannel.setEnabled(False)
+            self.ui.setBkg.setEnabled(False)
             self.ui.update2D.setChecked(False)
             self.ui.update2D.setEnabled(False)
+            self.ui.shareAxis.setEnabled(False)
+            self.ui.imageUnit.setEnabled(False)
             self.ui.slice.setEnabled(False)
+            self._showImageBtn.setVisible(False)
+
+            # Keep these active: scale (Linear/Log), cmap, save_2D
+            self.ui.scale.setEnabled(True)
+            self.ui.cmap.setEnabled(True)
+            self.ui.save_2D.setEnabled(True)
         elif mode == 'xye':
             # Collapse 2D image panel, show 1D plot panel
             self.ui.imageWindow.setMinimumHeight(0)
@@ -894,10 +912,17 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             # Restore binned frame
             self.ui.binnedFrame.setMinimumWidth(0)
             self.ui.binnedFrame.setMaximumWidth(16777215)
+            # Re-enable all controls
+            self.ui.normChannel.setEnabled(True)
+            self.ui.setBkg.setEnabled(True)
             self.ui.update2D.setEnabled(True)
             self.ui.update2D.setChecked(True)
-            self.ui.plotUnit.setEnabled(True)
             self.ui.shareAxis.setEnabled(True)
+            self.ui.imageUnit.setEnabled(True)
+            self.ui.scale.setEnabled(True)
+            self.ui.cmap.setEnabled(True)
+            self.ui.save_2D.setEnabled(True)
+            self.ui.plotUnit.setEnabled(True)
             self.ui.plotMethod.setEnabled(True)
             # Slice enable/disable depends on which axis is selected
             self._on_plotUnit_changed()
@@ -914,6 +939,11 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.cmap = self.ui.cmap.currentText()
         self.plotMethod = self.ui.plotMethod.currentText()
         self.scale = self.ui.scale.currentText()
+
+        if self.viewer_mode == 'image':
+            # Image viewer: only update the raw image panel
+            self.update_image_view()
+            return
 
         if self.ui.update2D.isChecked():
             self.update_image_view()
@@ -997,7 +1027,8 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             return
 
         # Subtract background
-        intensity -= self.bkg_2d
+        if self.bkg_2d is not None:
+            intensity -= self.bkg_2d
 
         rect = get_rect(xdata, ydata)
         self.binned_data = (intensity, rect)
@@ -1076,7 +1107,7 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
                     self.window().statusBar().showMessage(
                         "Chi slicing requires 2D integration (1D Only is enabled).", 4000)
                 except Exception:
-                    pass
+                    logger.debug("Failed to show status bar message about chi slicing", exc_info=True)
             # Fall back: disable slice, retry with plain 1D
             self.ui.slice.setChecked(False)
             ydata, xdata = self.get_arches_int_1d()
@@ -1097,7 +1128,8 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             arch_names = [n + suffix for n in arch_names]
 
         # Subtract background
-        ydata -= self.bkg_1d
+        if self.bkg_1d is not None:
+            ydata -= self.bkg_1d
         if ydata.ndim == 1:
             ydata = ydata[np.newaxis, :]
 
@@ -1214,6 +1246,8 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.plot.getAxis("bottom").setLogMode(False)
         ylabel = f'{int_label} (a.u.)'
         if self.scale == 'Log':
+            if ydata.size == 0:
+                return
             if ydata.min() < 1:
                 ydata -= (ydata.min() - 1.)
             ydata = np.log10(ydata)
@@ -1296,7 +1330,7 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
 
                 s_ydata = s_ydata[self.wf_start::self.wf_step]
             except KeyError:
-                print('Counter not present in metadata')
+                logger.debug('Counter not present in metadata')
 
         # rect = get_rect(s_xdata, np.arange(data.shape[0]))
         rect = get_rect(s_xdata, s_ydata)
@@ -1601,11 +1635,11 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         try:
             import h5py
             with h5py.File(self.sphere.data_file, 'r') as f:
-                wl = float(f['entry/calibration/wavelength'][()])
+                wl = float(f['entry/calibration/wavelength'][()]) # type: ignore
                 if wl > 0:
                     return wl
         except Exception:
-            pass
+            logger.debug("Failed to read wavelength from HDF5 calibration group in %s", self.sphere.data_file, exc_info=True)
 
         return None
 
@@ -1979,22 +2013,44 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         if fname == '':
             return
 
-        # Save as image
-        data, rect = self.binned_data
-        scene = self.binned_widget.imageViewBox.scene()
+        # Choose the right widget depending on viewer mode
+        if self.viewer_mode == 'image':
+            data, rect = self.image_data
+            scene = self.image_widget.imageViewBox.scene()
+        else:
+            data, rect = self.binned_data
+            scene = self.binned_widget.imageViewBox.scene()
+
         exporter = pyqtgraph.exporters.ImageExporter(scene)
         h = exporter.params.param('height').value()
         w = exporter.params.param('width').value()
+        if h == 0 or w == 0:
+            logger.warning("Cannot export image with zero dimensions (%dx%d)", w, h)
+            return
         h_new = 2000
         w_new = int(np.round(w/h * h_new, 0))
         exporter.params.param('height').setValue(h_new)
         exporter.params.param('width').setValue(w_new)
         exporter.export(fname)
 
-        # Save as Numpy array as well
         directory, base_name, ext = split_file_name(fname)
         save_fname = os.path.join(directory, base_name)
+
+        # Save as Numpy array
         np.save(f'{save_fname}.npy', data)
+
+        # In image viewer mode, also save a pyFAI-compatible TIFF
+        # from the raw detector-frame data (not the transposed display).
+        if self.viewer_mode == 'image' and len(self.idxs_2d) > 0:
+            try:
+                import fabio
+                raw = np.asarray(
+                    self.data_2d[self.idxs_2d[0]]['map_raw'], dtype=np.float32)
+                tif_path = os.path.join(directory, f'{base_name}_npy.tif')
+                fabio.tifimage.TifImage(data=raw).write(tif_path)
+                logger.info("Saved pyFAI-compatible TIFF: %s", tif_path)
+            except Exception:
+                logger.exception("Failed to save TIFF for pyFAI")
 
     def save_1D(self, auto=False):
         """Saves currently displayed data. Currently supports .xye

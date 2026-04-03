@@ -264,6 +264,8 @@ class fileHandlerThread(Qt.QtCore.QThread):
     def run(self):
         while True:
             method_name = self.queue.get()
+            if method_name is None:
+                break  # Sentinel: cleanly exit the thread
             try:
                 self.running = True
                 self.sigTaskStarted.emit()
