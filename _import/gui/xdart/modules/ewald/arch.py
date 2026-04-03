@@ -341,28 +341,27 @@ class EwaldArch():
 
                 # Only compute the selected GI 1D mode
                 if gi_mode_1d == 'q_ip':
+                    # IP profile: integrate over OOP, return Q_ip
                     result = integrate_gi_1d(
                         image_data, fi, npt=numpoints, npt_oop=npt_oop,
                         unit='qip_A^-1',
                         method='no', mask=mask,
                         radial_range=radial_range,
                         azimuth_range=kwargs.get('azimuth_range'),
+                        vertical_integration=False,
                         **gi_kwargs,
                     )
                     self.gi_1d['qip'] = result
                 elif gi_mode_1d == 'q_oop':
-                    # OOP (Qz) profile: sum the (Qip, Qoop) 2D map over IP
-                    r2d = integrate_gi_2d(
-                        image_data, fi, npt_rad=numpoints,
-                        npt_azim=npt_oop,
+                    # OOP profile: integrate over IP, return Q_oop
+                    result = integrate_gi_1d(
+                        image_data, fi, npt=numpoints, npt_oop=npt_oop,
+                        unit='qoop_A^-1',
                         method='no', mask=mask,
                         radial_range=radial_range,
                         azimuth_range=kwargs.get('azimuth_range'),
-                    )
-                    result = IntegrationResult1D(
-                        radial=r2d.azimuthal,
-                        intensity=np.nansum(r2d.intensity, axis=0),
-                        unit="qoop_A^-1",
+                        vertical_integration=True,
+                        **gi_kwargs,
                     )
                     self.gi_1d['qoop'] = result
                 elif gi_mode_1d == 'exit_angle':

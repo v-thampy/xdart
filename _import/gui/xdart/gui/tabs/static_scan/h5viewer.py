@@ -6,7 +6,6 @@
 import logging
 import os
 import time
-import traceback
 import gc
 
 logger = logging.getLogger(__name__)
@@ -409,7 +408,7 @@ class H5Viewer(QWidget):
         """Handle Enter/Return key on listScans to navigate into folders."""
         if obj is self.ui.listScans and event.type() == event.Type.KeyPress:
             from PySide6.QtCore import Qt
-            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 current = self.ui.listScans.currentItem()
                 if current is not None:
                     item_text = current.text()
@@ -490,8 +489,8 @@ class H5Viewer(QWidget):
             fpath = os.path.join(self.dirname, item_text)
             try:
                 xdata, ydata, sigma = read_xye(fpath)
-            except Exception as e:
-                print(f'WARNING: could not load xye file {fpath}: {e}')
+            except Exception:
+                logger.debug("Could not load xye file %s", fpath, exc_info=True)
                 continue
 
             # Guess unit from filename prefix
@@ -557,6 +556,7 @@ class H5Viewer(QWidget):
                 nframes = img.nframes
                 img.close()
             except Exception:
+                logger.debug("Failed to detect frame count from TIFF file %s", fpath, exc_info=True)
                 nframes = 1
 
         # HDF5/NeXus files always show frame numbers (even with 1 frame)
@@ -598,17 +598,17 @@ class H5Viewer(QWidget):
                 read_image(fpath, frame=frame_idx), dtype=float,
             )
         except Exception:
+            logger.debug("Failed to load frame %d from %s", frame_idx, fpath, exc_info=True)
             # For raw files, try common detector shapes
             ext = os.path.splitext(fpath)[1].lower()
             if ext == '.raw':
                 img_data = self._try_raw_detectors(fpath)
                 if img_data is None:
-                    print(f'WARNING: cannot load {os.path.basename(fpath)} — '
-                          f'raw file does not match any known detector shape. '
-                          f'Use Raw -> Tif to convert with a specific detector.')
+                    logger.warning('Cannot load %s — raw file does not match any '
+                                   'known detector shape.', os.path.basename(fpath))
                     return
             else:
-                print(f'WARNING: could not load image {fpath} frame {frame_idx}')
+                logger.warning('Could not load image %s frame %d', fpath, frame_idx)
                 return
 
         self.data_2d[int(arch_idx)] = {
@@ -635,6 +635,7 @@ class H5Viewer(QWidget):
                              os.path.basename(fpath), name, shape[0], shape[1])
                 return img_data
             except Exception:
+                logger.debug("Failed to load %s as %s detector shape %s", fpath, name, shape, exc_info=True)
                 continue
         return None
 
@@ -659,7 +660,7 @@ class H5Viewer(QWidget):
                 self.ui.listData.itemSelectionChanged.connect(self.data_changed)
                 self.new_scan = True
             except Exception:
-                traceback.print_exc()
+                logger.exception("Failed to set file: %s", fname)
                 return
 
     def data_changed(self, show_all=False):

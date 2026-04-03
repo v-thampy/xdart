@@ -45,6 +45,7 @@ dependencies = [
     "natsort",
     "imagecodecs",
     "imageio",
+    "ipykernel",
 ]
 
 [project.optional-dependencies]
