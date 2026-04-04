@@ -374,7 +374,7 @@ class integratorTree(QtWidgets.QWidget):
 
     def setEnabled(self, enable=True):
         """Overrides parent class method. Ensures appropriate child
-        widgets are enabled.
+        widgets are enabled, with autorange fields disabled when auto is on.
 
         args:
             enable: bool, If True widgets are enabled. If False
@@ -385,24 +385,16 @@ class integratorTree(QtWidgets.QWidget):
         self.advancedWidget1D.setEnabled(enable)
         self.advancedWidget2D.setEnabled(enable)
 
-        if self.radial_autoRange_1D:
-            self.ui.radial_low_1D.setEnabled(False)
-            self.ui.radial_high_1D.setEnabled(False)
-
-        if self.azim_autoRange_1D:
-            self.ui.azim_low_1D.setEnabled(False)
-            self.ui.azim_high_1D.setEnabled(False)
-
-        if self.radial_autoRange_2D:
-            self.ui.radial_low_2D.setEnabled(False)
-            self.ui.radial_high_2D.setEnabled(False)
-
-        if self.azim_autoRange_2D:
-            self.ui.azim_low_2D.setEnabled(False)
-            self.ui.azim_high_2D.setEnabled(False)
-
-        # self.ui.integrate1D.setEnabled(False)
-        # self.ui.integrate2D.setEnabled(False)
+        # Disable range fields when their autorange checkbox is checked
+        for cfg in self._RANGE_SIGNAL_CONFIGS:
+            name, low, high, auto_name, _ = cfg
+            auto_attr = name.replace('_', '_autoRange_', 1).replace('_autoRange_', '_autoRange_', 1)
+            # Map config name to instance attribute:
+            # 'radial_1D' → 'radial_autoRange_1D', 'azim_2D' → 'azim_autoRange_2D'
+            is_auto = getattr(self.ui, auto_name).isChecked()
+            if is_auto:
+                getattr(self.ui, low).setEnabled(False)
+                getattr(self.ui, high).setEnabled(False)
 
     def _validate_ranges(self):
         self.ui.npts_1D.setValidator(QtGui.QIntValidator(0, 50000))
@@ -791,10 +783,7 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.unit_2D.currentTextChanged.connect(self._get_unit_2D)
 
         # Connect range signals
-        self._connect_radial_range_1D_signals()
-        self._connect_azim_range_1D_signals()
-        self._connect_radial_range_2D_signals()
-        self._connect_azim_range_2D_signals()
+        self._connect_all_range_signals()
 
         # Connect advanced parameters signals
         self.advancedWidget1D.sigUpdateArgs.connect(self.get_args)
@@ -815,62 +804,85 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.unit_2D.currentTextChanged.disconnect(self._get_unit_2D)
 
         # Disconnect range signals
-        self._disconnect_radial_range_1D_signals()
-        self._disconnect_azim_range_1D_signals()
-        self._disconnect_radial_range_2D_signals()
-        self._disconnect_azim_range_2D_signals()
+        self._disconnect_all_range_signals()
 
         # Disconnect advanced parameters signals
         self.advancedWidget1D.sigUpdateArgs.disconnect(self.get_args)
         self.advancedWidget2D.sigUpdateArgs.disconnect(self.get_args)
 
+    # ── Data-driven range signal connect/disconnect ──────────────────
+    # Each entry maps a range name to its (low_widget, high_widget,
+    # auto_widget, getter_method) names.  _connect_range_signals and
+    # _disconnect_range_signals iterate over these instead of 8
+    # near-identical methods.
+
+    _RANGE_SIGNAL_CONFIGS = [
+        ('radial_1D', 'radial_low_1D', 'radial_high_1D',
+         'radial_autoRange_1D', '_get_radial_range_1D'),
+        ('azim_1D', 'azim_low_1D', 'azim_high_1D',
+         'azim_autoRange_1D', '_get_azim_range_1D'),
+        ('radial_2D', 'radial_low_2D', 'radial_high_2D',
+         'radial_autoRange_2D', '_get_radial_range_2D'),
+        ('azim_2D', 'azim_low_2D', 'azim_high_2D',
+         'azim_autoRange_2D', '_get_azim_range_2D'),
+    ]
+
+    def _connect_range_signals(self, name):
+        """Connect signals for a named range config (e.g. 'radial_1D')."""
+        for cfg in self._RANGE_SIGNAL_CONFIGS:
+            if cfg[0] == name:
+                _, low, high, auto, getter = cfg
+                handler = getattr(self, getter)
+                getattr(self.ui, low).textChanged.connect(handler)
+                getattr(self.ui, high).textChanged.connect(handler)
+                getattr(self.ui, auto).stateChanged.connect(handler)
+                return
+
+    def _disconnect_range_signals(self, name):
+        """Disconnect signals for a named range config (e.g. 'radial_1D')."""
+        for cfg in self._RANGE_SIGNAL_CONFIGS:
+            if cfg[0] == name:
+                _, low, high, auto, getter = cfg
+                handler = getattr(self, getter)
+                getattr(self.ui, low).textChanged.disconnect(handler)
+                getattr(self.ui, high).textChanged.disconnect(handler)
+                getattr(self.ui, auto).stateChanged.disconnect(handler)
+                return
+
+    def _connect_all_range_signals(self):
+        """Connect signals for all 4 range configs."""
+        for cfg in self._RANGE_SIGNAL_CONFIGS:
+            self._connect_range_signals(cfg[0])
+
+    def _disconnect_all_range_signals(self):
+        """Disconnect signals for all 4 range configs."""
+        for cfg in self._RANGE_SIGNAL_CONFIGS:
+            self._disconnect_range_signals(cfg[0])
+
+    # Backwards-compatible aliases for existing callers
     def _connect_radial_range_1D_signals(self):
-        """Connect signals for radial 1D range"""
-        self.ui.radial_low_1D.textChanged.connect(self._get_radial_range_1D)
-        self.ui.radial_high_1D.textChanged.connect(self._get_radial_range_1D)
-        self.ui.radial_autoRange_1D.stateChanged.connect(self._get_radial_range_1D)
+        self._connect_range_signals('radial_1D')
 
     def _disconnect_radial_range_1D_signals(self):
-        """Disconnect signals for radial 1D range"""
-        self.ui.radial_low_1D.textChanged.disconnect(self._get_radial_range_1D)
-        self.ui.radial_high_1D.textChanged.disconnect(self._get_radial_range_1D)
-        self.ui.radial_autoRange_1D.stateChanged.disconnect(self._get_radial_range_1D)
+        self._disconnect_range_signals('radial_1D')
 
     def _connect_azim_range_1D_signals(self):
-        """Connect signals for azimuth 1D range"""
-        self.ui.azim_low_1D.textChanged.connect(self._get_azim_range_1D)
-        self.ui.azim_high_1D.textChanged.connect(self._get_azim_range_1D)
-        self.ui.azim_autoRange_1D.stateChanged.connect(self._get_azim_range_1D)
+        self._connect_range_signals('azim_1D')
 
     def _disconnect_azim_range_1D_signals(self):
-        """Disconnect signals for azimuth 1D range"""
-        self.ui.azim_low_1D.textChanged.disconnect(self._get_azim_range_1D)
-        self.ui.azim_high_1D.textChanged.disconnect(self._get_azim_range_1D)
-        self.ui.azim_autoRange_1D.stateChanged.disconnect(self._get_azim_range_1D)
+        self._disconnect_range_signals('azim_1D')
 
     def _connect_radial_range_2D_signals(self):
-        """Connect signals for radial 2D range"""
-        self.ui.radial_low_2D.textChanged.connect(self._get_radial_range_2D)
-        self.ui.radial_high_2D.textChanged.connect(self._get_radial_range_2D)
-        self.ui.radial_autoRange_2D.stateChanged.connect(self._get_radial_range_2D)
+        self._connect_range_signals('radial_2D')
 
     def _disconnect_radial_range_2D_signals(self):
-        """Disconnect signals for radial 2D range"""
-        self.ui.radial_low_2D.textChanged.disconnect(self._get_radial_range_2D)
-        self.ui.radial_high_2D.textChanged.disconnect(self._get_radial_range_2D)
-        self.ui.radial_autoRange_2D.stateChanged.disconnect(self._get_radial_range_2D)
+        self._disconnect_range_signals('radial_2D')
 
     def _connect_azim_range_2D_signals(self):
-        """Connect signals for azimuth 2D range"""
-        self.ui.azim_low_2D.textChanged.connect(self._get_azim_range_2D)
-        self.ui.azim_high_2D.textChanged.connect(self._get_azim_range_2D)
-        self.ui.azim_autoRange_2D.stateChanged.connect(self._get_azim_range_2D)
+        self._connect_range_signals('azim_2D')
 
     def _disconnect_azim_range_2D_signals(self):
-        """Disconnect signals for azimuth 2D range"""
-        self.ui.azim_low_2D.textChanged.disconnect(self._get_azim_range_2D)
-        self.ui.azim_high_2D.textChanged.disconnect(self._get_azim_range_2D)
-        self.ui.azim_autoRange_2D.stateChanged.disconnect(self._get_azim_range_2D)
+        self._disconnect_range_signals('azim_2D')
 
     def bai_1d(self, q):
         """Uses the integrator_thread attribute to call bai_1d
