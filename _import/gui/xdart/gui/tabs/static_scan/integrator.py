@@ -348,8 +348,8 @@ class integratorTree(QtWidgets.QWidget):
                     if val is not None:
                         try:
                             child.setValue(val)
-                        except Exception:
-                            pass
+                        except (TypeError, ValueError, AttributeError) as e:
+                            logger.debug("Failed to restore integrator parameter value %s: %s", key, e)
 
         # Update enabled/disabled state based on restored auto-range
         self.radial_autoRange_1D = self.ui.radial_autoRange_1D.isChecked()

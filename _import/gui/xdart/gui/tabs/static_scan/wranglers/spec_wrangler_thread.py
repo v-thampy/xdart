@@ -9,6 +9,7 @@ and file I/O in a separate QThread.
 """
 
 # Standard library imports
+import logging
 import os
 import re
 import time
@@ -17,6 +18,8 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from collections import deque
+
+logger = logging.getLogger(__name__)
 
 # pyFAI / fabio / h5py
 import fabio
@@ -705,8 +708,9 @@ class specThread(wranglerThread):
             # Primary: fabio (handles all Eiger layouts)
             self._eiger_fabio_handle = fabio.open(master_path)
             self._eiger_nframes = self._eiger_fabio_handle.nframes
-        except Exception:
+        except (IOError, OSError) as e:
             # Fallback: h5py for non-standard layouts
+            logger.debug("Failed to open Eiger master with fabio %s: %s, trying h5py", master_path, e)
             self._eiger_fabio_handle = None
             try:
                 self._eiger_h5_handle = h5py.File(master_path, 'r')
@@ -736,14 +740,14 @@ class specThread(wranglerThread):
         if self._eiger_fabio_handle is not None:
             try:
                 self._eiger_fabio_handle.close()
-            except Exception:
-                pass
+            except (IOError, OSError) as e:
+                logger.debug("Failed to close fabio handle: %s", e)
             self._eiger_fabio_handle = None
         if self._eiger_h5_handle is not None:
             try:
                 self._eiger_h5_handle.close()
-            except Exception:
-                pass
+            except (IOError, OSError) as e:
+                logger.debug("Failed to close h5py handle: %s", e)
             self._eiger_h5_handle = None
 
     def _eiger_refill_master_queue(self):
@@ -792,13 +796,15 @@ class specThread(wranglerThread):
                     self._eiger_fabio_handle.close()
                     self._eiger_fabio_handle = fabio.open(self._eiger_master_path)
                     self._eiger_nframes = self._eiger_fabio_handle.nframes
-                except Exception:
+                except (IOError, OSError) as e:
+                    logger.debug("Failed to reopen fabio handle for %s: %s", self._eiger_master_path, e)
                     self._eiger_nframes = self._get_nframes(self._eiger_master_path)
             elif self._eiger_h5_dataset is not None:
                 try:
                     self._eiger_h5_dataset.id.refresh()
                     self._eiger_nframes = self._eiger_h5_dataset.shape[0]
-                except Exception:
+                except (IOError, OSError, KeyError) as e:
+                    logger.debug("Failed to refresh h5 dataset for %s: %s", self._eiger_master_path, e)
                     self._eiger_nframes = self._get_nframes(self._eiger_master_path)
             else:
                 self._eiger_nframes = self._get_nframes(self._eiger_master_path)

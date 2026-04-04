@@ -4,11 +4,14 @@
 """
 
 # Standard library imports
+import logging
 from queue import Queue
 from threading import Condition
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import traceback
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Other imports
 from xdart.modules.ewald import EwaldArch
@@ -89,7 +92,8 @@ class integratorThread(Qt.QtCore.QThread):
             method = getattr(self, self.method)
             try:
                 method()
-            except KeyError:
+            except KeyError as e:
+                logger.error("Method %s failed with KeyError: %s", self.method, e, exc_info=True)
                 traceback.print_exc()
 
     def bai_2d_all(self):
@@ -115,14 +119,19 @@ class integratorThread(Qt.QtCore.QThread):
                     )
                     futures[f] = arch.idx
                 for future in as_completed(futures):
-                    arch = future.result()
-                    self.sphere.arches[arch.idx] = arch
-                    self.sphere._update_bai_2d(arch)
-                    self.data_2d[int(arch.idx)] = {
-                        'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
-                        'mask': arch.mask, 'int_2d': arch.int_2d, 'gi_2d': arch.gi_2d,
-                    }
-                    self.update.emit(arch.idx)
+                    try:
+                        arch = future.result()
+                        self.sphere.arches[arch.idx] = arch
+                        self.sphere._update_bai_2d(arch)
+                        self.data_2d[int(arch.idx)] = {
+                            'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
+                            'mask': arch.mask, 'int_2d': arch.int_2d, 'gi_2d': arch.gi_2d,
+                        }
+                        self.update.emit(arch.idx)
+                    except Exception as e:
+                        arch_idx = futures[future]
+                        logger.error("2D integration failed for arch %s: %s", arch_idx, e, exc_info=True)
+                        self.update.emit(arch_idx)
         else:
             for arch in all_arches:
                 if self.sphere.static:
@@ -271,7 +280,8 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 self.sigTaskStarted.emit()
                 method = getattr(self, method_name)
                 method()
-            except KeyError:
+            except KeyError as e:
+                logger.error("Task %s failed with KeyError: %s", method_name, e, exc_info=True)
                 traceback.print_exc()
             self.running = False
             self.sigTaskDone.emit(method_name)
@@ -291,8 +301,8 @@ class fileHandlerThread(Qt.QtCore.QThread):
             try:
                 self.sphere.load_from_h5(replace=False, data_only=True,
                                          set_mg=False)
-            except KeyError:
-                pass
+            except KeyError as e:
+                logger.debug("Failed to load sphere data from HDF5: %s", e)
 
     def load_arch(self):
         with self.file_lock:
@@ -331,8 +341,8 @@ class fileHandlerThread(Qt.QtCore.QThread):
                                 self.arches['sum_map_raw'] -= (self.data_2d[int(idx)]['map_raw'] -
                                                                self.data_2d[int(idx)]['bg_raw'])
 
-                    except KeyError:
-                        pass
+                    except KeyError as e:
+                        logger.debug("Data missing for arch %s during aggregation: %s", idx, e)
 
             self.sigUpdate.emit()
 

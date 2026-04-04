@@ -4,6 +4,7 @@
 """
 
 # Standard library imports
+import logging
 from queue import Queue
 import threading
 import copy
@@ -12,6 +13,8 @@ from collections import OrderedDict
 import gc
 import imageio
 import pyFAI
+
+logger = logging.getLogger(__name__)
 
 # Qt imports
 from typing import TYPE_CHECKING, Any
@@ -295,15 +298,15 @@ class staticWidget(QWidget):
             try:
                 self.wrangler.ui.advancedButton.clicked.disconnect(
                     self._show_integration_advanced)
-            except (TypeError, RuntimeError):
-                pass
+            except (TypeError, RuntimeError) as e:
+                logger.debug("Failed to disconnect Advanced button signal: %s", e)
         for signal in signals:
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", RuntimeWarning)
                     signal.disconnect()
-            except (TypeError, RuntimeError, SystemError):
-                pass
+            except (TypeError, RuntimeError, SystemError) as e:
+                logger.debug("Failed to disconnect signal: %s", e)
 
     def thread_state_changed(self):
         """Called whenever a thread is started or finished.
