@@ -197,8 +197,8 @@ class MaskWidget(QtWidgets.QWidget):
             if roi[0] is q:
                 to_remove.append(i)
                 self.image.imageViewBox.removeItem(roi[0])
-        for i in to_remove:
-            del(self.ROIs[i])
+        for i in reversed(to_remove):
+            del self.ROIs[i]
         self.update_mask()
 
     def update_mask(self, q=None):

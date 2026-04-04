@@ -394,7 +394,7 @@ class PColorMeshItemLevels(PColorMeshItem):
             self.z = args[2]
 
         else:
-            ValueError('Data must been sent as (z) or (x, y, z)')
+            raise ValueError('Data must be sent as (z) or (x, y, z)')
 
     def setData(self, *args):
         """

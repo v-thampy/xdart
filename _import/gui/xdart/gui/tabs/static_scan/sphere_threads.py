@@ -173,11 +173,16 @@ class integratorThread(Qt.QtCore.QThread):
                     )
                     futures[f] = arch.idx
                 for future in as_completed(futures):
-                    arch = future.result()
-                    self.sphere.arches[arch.idx] = arch
-                    self.sphere._update_bai_1d(arch)
-                    self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
-                    self.update.emit(arch.idx)
+                    try:
+                        arch = future.result()
+                        self.sphere.arches[arch.idx] = arch
+                        self.sphere._update_bai_1d(arch)
+                        self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
+                        self.update.emit(arch.idx)
+                    except Exception as e:
+                        arch_idx = futures[future]
+                        logger.error("1D integration failed for arch %s: %s", arch_idx, e, exc_info=True)
+                        self.update.emit(arch_idx)
         else:
             for arch in all_arches:
                 if self.sphere.static:
