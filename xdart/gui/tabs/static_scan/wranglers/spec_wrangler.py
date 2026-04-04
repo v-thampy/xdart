@@ -416,8 +416,8 @@ class specWrangler(wranglerWidget):
                 for segment in path:
                     p = p.child(segment)
                 data[key] = p.value()
-            except Exception:
-                pass
+            except (AttributeError, KeyError, TypeError) as e:
+                logger.debug("Failed to save session parameter %s: %s", key, e)
         data['processing_mode'] = self.ui.processingModeCombo.currentText()
         data['live_mode'] = self.ui.liveCheckBox.isChecked()
         data['batch_mode'] = self.ui.batchCheckBox.isChecked()
@@ -438,8 +438,8 @@ class specWrangler(wranglerWidget):
                 p.setValue(val)
                 if attr is not None:
                     setattr(self, attr, val)
-            except Exception:
-                pass
+            except (AttributeError, KeyError, TypeError, ValueError) as e:
+                logger.debug("Failed to restore session parameter %s: %s", key, e)
         # Restore processing mode dropdown and checkboxes
         mode = session.get('processing_mode')
         if mode:
@@ -548,20 +548,20 @@ class specWrangler(wranglerWidget):
             try:
                 grp = self.parameters.child(group_name)
                 grp.setOpts(enabled=enabled)
-            except Exception:
-                pass
+            except (AttributeError, KeyError) as e:
+                logger.debug("Failed to set enabled state for %s: %s", group_name, e)
         # Also disable write mode and mask file in Signal group
         for child_name in ('write_mode', 'mask_file', 'mask_file_browse'):
             try:
                 self.parameters.child('Signal').child(child_name).setOpts(enabled=enabled)
-            except Exception:
-                pass
+            except (AttributeError, KeyError) as e:
+                logger.debug("Failed to set enabled state for Signal.%s: %s", child_name, e)
         # Disable save path
         try:
             self.parameters.child('h5_dir').setOpts(enabled=enabled)
             self.parameters.child('h5_dir_browse').setOpts(enabled=enabled)
-        except Exception:
-            pass
+        except (AttributeError, KeyError) as e:
+            logger.debug("Failed to set enabled state for h5_dir parameters: %s", e)
 
     def setup(self):
         """Sets up the child thread, syncs all parameters.
@@ -730,7 +730,8 @@ class specWrangler(wranglerWidget):
 
         try:
             self.poni = PONI.from_poni_file(self.poni_file)
-        except Exception:
+        except (IOError, OSError, ValueError, KeyError) as e:
+            logger.debug("Failed to load PONI file %s: %s", self.poni_file, e)
             self.poni = None
         if self.poni is None:
             logger.warning('Invalid Poni File: %s', self.poni_file)
