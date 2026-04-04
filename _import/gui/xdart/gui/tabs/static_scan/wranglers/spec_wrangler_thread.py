@@ -70,16 +70,21 @@ def _get_scan_info(fname):
 # Natural sort helpers
 # ---------------------------------------------------------------------------
 
+# Pre-compiled regex patterns (avoids recompilation on every sort key call)
+_INT_PATTERN = re.compile(r'(\d+)')
+_FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
+
+
 def atoi(text):
     return int(text) if text.isdigit() else text
 
 
 def natural_keys_int(text):
+    """Sort key for human-order sorting of strings with integers.
+
+    See: http://nedbatchelder.com/blog/200712/human_sorting.html
     """
-    alist.sort(key=natural_keys) sorts in human order
-    http://nedbatchelder.com/blog/200712/human_sorting.html
-    """
-    return [atoi(c) for c in re.split(r'(\d+)', text)]
+    return [atoi(c) for c in _INT_PATTERN.split(text)]
 
 
 def atof(text):
@@ -91,11 +96,11 @@ def atof(text):
 
 
 def natural_keys_float(text):
+    """Sort key for human-order sorting of strings with floats.
+
+    See: https://stackoverflow.com/a/12643073/190597
     """
-    alist.sort(key=natural_keys) sorts in human order
-    float regex comes from https://stackoverflow.com/a/12643073/190597
-    """
-    return [atof(c) for c in re.split(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)', text)]
+    return [atof(c) for c in _FLOAT_PATTERN.split(text)]
 
 
 def natural_sort_ints(list_to_sort):

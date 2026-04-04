@@ -527,7 +527,7 @@ class integratorTree(QtWidgets.QWidget):
                 # Catch any other range-like keys from advanced tree
                 continue
             elif child.name() == 'polarization_factor':
-                pass
+                continue  # Handled via 'Apply polarization factor' toggle below
             elif child.name() == 'Apply polarization factor':
                 if child.value():
                     args['polarization_factor'] = \

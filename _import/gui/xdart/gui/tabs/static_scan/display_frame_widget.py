@@ -385,8 +385,10 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.wf_dialog.close()
 
     def enable_2D_buttons(self):
-        """Disable buttons if update 2D is unchecked"""
-        pass
+        """Placeholder: disable 2D-related buttons when update2D is unchecked.
+
+        Currently a no-op; 2D button visibility is managed elsewhere.
+        """
 
     def set_axes(self):
         """Populate plotUnit / imageUnit combos for standard or GI mode.
@@ -2138,26 +2140,31 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         return colors
 
     def get_profile_chi(self, arch):
-        """
+        """Extract intensity profile along chi from arch.
+
         Args:
-            arch (EwaldArch Object):
+            arch: EwaldArch object with 2D integration data.
 
         Returns:
-            intensity (ndarray): Intensity integrated along Chi
-                                 over a range of Q specified by UI
+            ndarray: Intensity integrated along chi over the Q range
+                     specified by the UI slice controls.
+
+        .. note:: Not yet implemented.
         """
-        pass
+        raise NotImplementedError("get_profile_chi is not yet implemented")
 
     def get_chi_1d(self, arch):
-        """
+        """Extract 1D chi profile from arch.
+
         Args:
-            arch (EwaldArch Object):
+            arch: EwaldArch object with 2D integration data.
 
         Returns:
-            intensity (ndarray): Intensity integrated along Chi
-                                 over a range of Q specified by UI
+            ndarray: 1D intensity vs chi extracted from 2D data.
+
+        .. note:: Not yet implemented.
         """
-        pass
+        raise NotImplementedError("get_chi_1d is not yet implemented")
 
     def trackMouse(self):
         """
