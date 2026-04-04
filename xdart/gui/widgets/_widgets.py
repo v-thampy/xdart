@@ -103,7 +103,7 @@ class defaultWidget(Qt.QtWidgets.QWidget):
             valdict: dict, values to be set as defaults.
         """
         if param.isType('group'):
-            if param.hasChildren():
+            if param.hasChildren() and param.name() in valdict:
                 for child in param.children():
                     self.set_defaults(child, valdict[param.name()])
         elif param.name() in valdict:

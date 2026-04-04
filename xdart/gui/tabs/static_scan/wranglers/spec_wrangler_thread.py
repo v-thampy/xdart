@@ -277,12 +277,12 @@ class specThread(wranglerThread):
             try:
                 custom_mask = np.asarray(read_image(self.mask_file), dtype=bool)
                 if det_mask is not None and custom_mask.shape != det_mask.shape:
-                    print(f'WARNING: mask file shape {custom_mask.shape} does not match '
-                          f'detector mask shape {det_mask.shape} — ignoring custom mask')
+                    logger.warning('Mask file shape %s does not match detector mask shape %s — ignoring custom mask',
+                                  custom_mask.shape, det_mask.shape)
                 else:
                     det_mask = det_mask | custom_mask if det_mask is not None else custom_mask
             except Exception as e:
-                print(f'WARNING: could not load mask file {self.mask_file}: {e}')
+                logger.warning('Could not load mask file %s: %s', self.mask_file, e)
         self.mask = np.flatnonzero(det_mask) if det_mask is not None else None
         self._cached_gi_incident_angle = None
 
@@ -295,7 +295,7 @@ class specThread(wranglerThread):
             self.process_scan()
         finally:
             self._eiger_close_master()  # ensure Eiger handle is released
-        print(f'Total Time: {time.time() - t0:0.2f}')
+        logger.info('Total Time: %.2fs', time.time() - t0)
 
     def process_scan(self):
         """Batch-integrate all existing images, then optionally watch for new ones (live mode).
@@ -327,7 +327,7 @@ class specThread(wranglerThread):
                 fname = os.path.splitext(os.path.basename(img_file))[0]
                 self.showLabel.emit(f'Collecting {fname[-30:]}')
             else:
-                print(f'Invalid image file, skipping')
+                logger.warning('Invalid image file, skipping')
                 continue
 
             img_number = 1 if img_number is None else img_number
@@ -404,7 +404,7 @@ class specThread(wranglerThread):
         # In batch mode, emit a single final signal so the GUI can refresh
         if self.batch_mode and files_processed > 0:
             self.sigUpdate.emit(-1)
-        print(f'\nTotal Files Processed: {files_processed}')
+        logger.info('Total Files Processed: %d', files_processed)
 
     # ── Batch dispatch ────────────────────────────────────────────────────────
 
@@ -503,7 +503,7 @@ class specThread(wranglerThread):
 
             _elapsed = time.time() - _t0
             fname = os.path.splitext(os.path.basename(img_file))[0]
-            print(f'[PARALLEL] image_{img_number:04d} ({fname[-30:]}): {_elapsed:.2f}s')
+            logger.info('[PARALLEL] image_%04d (%s): %.2fs', img_number, fname[-30:], _elapsed)
             return arch
 
         # ── Phase 1: parallel integration ────────────────────────────────────
@@ -525,9 +525,9 @@ class specThread(wranglerThread):
                     arch = fut.result()
                     arches.append((futures[fut], arch))
                 except Exception as e:
-                    print(f'WARNING: integration failed for image {futures[fut]}: {e}')
+                    logger.error('Integration failed for image %s: %s', futures[fut], e)
         _t_phase1 = time.time() - _t_phase1
-        print(f'[BATCH] Phase 1 (parallel integration): {len(arches)} frames in {_t_phase1:.2f}s')
+        logger.info('[BATCH] Phase 1 (parallel integration): %d frames in %.2fs', len(arches), _t_phase1)
 
         if not arches:
             return 0
@@ -569,7 +569,7 @@ class specThread(wranglerThread):
             finally:
                 _get_h5pool().resume(sphere.data_file)
             _t_phase2 = time.time() - _t_phase2
-            print(f'[BATCH] Phase 2 (HDF5 write): {len(arches)} frames in {_t_phase2:.2f}s')
+            logger.info('[BATCH] Phase 2 (HDF5 write): %d frames in %.2fs', len(arches), _t_phase2)
 
         return len(arches)
 
@@ -673,17 +673,16 @@ class specThread(wranglerThread):
         _t_csv = time.time() - _t5
 
         _t_total = _t_arch + _t_1d + _t_2d + _t_h5_total + _t_csv
-        print(
-            f'[TIMING] image_{img_number:04d}: '
-            f'arch_init={_t_arch:.2f}s int_1d={_t_1d:.2f}s int_2d={_t_2d:.2f}s '
-            f'h5_lock_wait={_t_h5_wait:.2f}s h5_write={_t_h5_write:.2f}s '
-            f'csv={_t_csv:.2f}s total={_t_total:.2f}s'
+        logger.info(
+            '[TIMING] image_%04d: arch_init=%.2fs int_1d=%.2fs int_2d=%.2fs '
+            'h5_lock_wait=%.2fs h5_write=%.2fs csv=%.2fs total=%.2fs',
+            img_number, _t_arch, _t_1d, _t_2d, _t_h5_wait, _t_h5_write, _t_csv, _t_total
         )
         _ext = Path(img_file).suffix.lower()
         if _ext in ('.h5', '.hdf5', '.nxs'):
-            print(f'Processed {fname} frame {img_number} {self.sub_label}')
+            logger.info('Processed %s frame %s %s', fname, img_number, self.sub_label)
         else:
-            print(f'Processed {fname} {self.sub_label}')
+            logger.info('Processed %s %s', fname, self.sub_label)
         # In batch mode, suppress per-frame GUI signals — emit once at end
         if not self.batch_mode:
             self.sigUpdate.emit(img_number)
@@ -731,11 +730,11 @@ class specThread(wranglerThread):
                     self._eiger_h5_dataset = self._eiger_h5_handle[ds_path]
                     self._eiger_nframes = self._eiger_h5_dataset.shape[0]
                 else:
-                    print(f'Could not find image dataset in {master_path}')
+                    logger.warning('Could not find image dataset in %s', master_path)
                     self._eiger_close_master()
                     self._eiger_nframes = 0
             except Exception as e:
-                print(f'Error opening Eiger master {master_path}: {e}')
+                logger.error('Error opening Eiger master %s: %s', master_path, e)
                 self._eiger_close_master()
                 self._eiger_nframes = 0
 
@@ -851,7 +850,7 @@ class specThread(wranglerThread):
                     _raw = _img.data if frame_idx == 0 else _img.get_frame(frame_idx).data
                 img_data = np.asarray(_raw, dtype='int32')
         except Exception as e:
-            print(f'Error reading frame {frame_idx} from {self._eiger_master_path}: {e}')
+            logger.error('Error reading frame %d from %s: %s', frame_idx, self._eiger_master_path, e)
             img_data = None
 
         meta = read_image_metadata(self._eiger_master_path, meta_format=self.meta_ext) if self.meta_ext else {}
@@ -997,7 +996,7 @@ class specThread(wranglerThread):
             self.gi, self.th_mtr, self.single_img,
             self.series_average
         )
-        print(f'\n***** New Scan *****')
+        logger.info('***** New Scan *****')
 
         return sphere
 
@@ -1009,7 +1008,7 @@ class specThread(wranglerThread):
                 try:
                     self.mask += fabio.open(self.mask_file).data
                 except ValueError:
-                    print('Mask file not valid for Detector')
+                    logger.warning('Mask file not valid for Detector (shape mismatch)')
                     pass
             else:
                 self.mask = fabio.open(self.mask_file).data
@@ -1018,7 +1017,7 @@ class specThread(wranglerThread):
             return None
 
         if self.mask.shape != self.detector.shape:
-            print('Mask file not valid for Detector')
+            logger.warning('Mask file not valid for Detector (shape %s != %s)', self.mask.shape, self.detector.shape)
             return None
 
         self.mask = np.flatnonzero(self.mask)

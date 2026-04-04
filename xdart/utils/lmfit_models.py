@@ -401,7 +401,7 @@ def assymetric_rectangle(x, amplitude1=1.0, center1=0.0, sigma1=1.0,
     if form == 'erf':
         out = 0.5*( amplitude1*(erf(arg1) + 1) + amplitude2*(erf(arg2) + 1))
     elif form.startswith('logi'):
-        out = 0.5*( amplitude1*(1. - 1./(1. + np.exp(arg1))) + amplitude2(1. - 1./(1. + np.exp(arg2))) )
+        out = 0.5*( amplitude1*(1. - 1./(1. + np.exp(arg1))) + amplitude2*(1. - 1./(1. + np.exp(arg2))) )
     elif form in ('atan', 'arctan'):
         out = (amplitude1*np.arctan(arg1) + amplitude2*np.arctan(arg2))/np.pi
     else:

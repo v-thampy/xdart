@@ -119,7 +119,10 @@ class DFTableModel(QtCore.QAbstractTableModel):
                 except IndexError:
                     return ' '
             elif orientation == QtCore.Qt.Vertical:
-                return str(self.dataFrame.index[section])
+                try:
+                    return str(self.dataFrame.index[section])
+                except IndexError:
+                    return ' '
         return QtCore.QAbstractTableModel.headerData(self, section, orientation, role)
     
     

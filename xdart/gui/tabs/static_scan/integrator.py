@@ -388,9 +388,6 @@ class integratorTree(QtWidgets.QWidget):
         # Disable range fields when their autorange checkbox is checked
         for cfg in self._RANGE_SIGNAL_CONFIGS:
             name, low, high, auto_name, _ = cfg
-            auto_attr = name.replace('_', '_autoRange_', 1).replace('_autoRange_', '_autoRange_', 1)
-            # Map config name to instance attribute:
-            # 'radial_1D' → 'radial_autoRange_1D', 'azim_2D' → 'azim_autoRange_2D'
             is_auto = getattr(self.ui, auto_name).isChecked()
             if is_auto:
                 getattr(self.ui, low).setEnabled(False)

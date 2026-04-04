@@ -214,9 +214,10 @@ class rangeWidget(Qt.QtWidgets.QWidget):
         values
         """
         self.ui.step.blockSignals(True)
-        self.ui.step.setValue(
-            (self.ui.high.value() - self.ui.low.value()) / (points - 1)
-        )
+        if points > 1:
+            self.ui.step.setValue(
+                (self.ui.high.value() - self.ui.low.value()) / (points - 1)
+            )
         self.ui.step.blockSignals(False)
         
         self.sigPointsChanged.emit(points)
@@ -227,7 +228,7 @@ class rangeWidget(Qt.QtWidgets.QWidget):
         """
         points = round(
             ((self.ui.high.value() - self.ui.low.value()) / step) + 1
-        )
+        ) if step != 0 else self.ui.points.value()
         self.ui.points.blockSignals(True)
         self.ui.points.setValue(points)
         self.ui.points.blockSignals(False)

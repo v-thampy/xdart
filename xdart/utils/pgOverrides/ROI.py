@@ -161,7 +161,7 @@ class XDPolyLineROI(PolyLineROI):
         """
         br = self.boundingRect()
         if br.width() > 1000:
-            raise Exception()
+            raise ValueError("ROI bounding rectangle width exceeds maximum (1000)")
         if kwds.get("returnMappedCoords", False):
             sliced, coords = ROI.getArrayRegion(self, data, img, axes=axes, fromBoundingRect=True, **kwds)
 
