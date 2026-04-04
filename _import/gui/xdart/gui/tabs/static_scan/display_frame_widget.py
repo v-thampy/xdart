@@ -104,7 +104,16 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
+        self._init_data_objects(sphere, arch, arch_ids, arches, data_1d, data_2d)
+        self._init_display_panes()
+        self._init_plot_panes()
+        self._connect_signals()
+        self._init_controls()
 
+    # ── Initialization helpers ─────────────────────────────────────
+
+    def _init_data_objects(self, sphere, arch, arch_ids, arches, data_1d, data_2d):
+        """Initialize data references, plotting state, and index tracking."""
         self.ui.slice.setText(Chi)
 
         # Plotting parameters
@@ -118,12 +127,11 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.wf_start = 0
         self.wf_step = 1
 
-        # Data object initialization
+        # Data object references
         self.sphere = sphere
         self.arch = arch
         self.arch_ids = arch_ids
         self.arches = arches
-        # self.idxs = sorted(list(self.arches.keys()))
         self.arch_names = []
         self.data_1d = data_1d
         self.data_2d = data_2d
@@ -133,49 +141,51 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
 
         # Viewer mode: None (normal), 'image', or 'xye'
         self.viewer_mode = None
-        # Reference to wrangler for mask/threshold in viewer mode
         self._wrangler = None
 
-        # Get Indices of selected arches
+        # Arch index tracking
         self.idxs = []
         self.idxs_1d = []
         self.idxs_2d = []
         self.overall = False
         self.get_idxs()
 
-        # Plotting Variables
+        # Plotting variables
         self.normChannel = None
         self.overlay = None
         self._last_plot_unit = -1
         self._plot_axis_info = []  # populated by set_axes()
         self._was_skip_2d = False  # track 1D-only state for transitions
 
-        # Image and Binned 2D Data
+        # Cached display data
         self.image_data = (None, None)
         self.binned_data = (None, None)
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.plot_data_range = [[0, 0], [0, 0]]
 
-        # Image pane setup
+    def _init_display_panes(self):
+        """Set up the raw image and binned 2D image display panes."""
+        # Raw image pane
         self.image_layout = Qt.QtWidgets.QHBoxLayout(self.ui.imageFrame)
         self.image_layout.setContentsMargins(0, 0, 0, 0)
         self.image_layout.setSpacing(0)
         self.image_widget = pgImageWidget(lockAspect=True, raw=True)
         self.image_layout.addWidget(self.image_widget)
 
-        # Regrouped Image pane setup
+        # Binned (regrouped) image pane
         self.binned_layout = Qt.QtWidgets.QHBoxLayout(self.ui.binnedFrame)
         self.binned_layout.setContentsMargins(0, 0, 0, 0)
         self.binned_layout.setSpacing(0)
         self.binned_widget = pgImageWidget()
         self.binned_layout.addWidget(self.binned_widget)
 
-        # 1D/Waterfall Plot pane setup
+    def _init_plot_panes(self):
+        """Set up 1D plot, waterfall plot, and mouse tracking."""
         self.plot_layout = Qt.QtWidgets.QHBoxLayout(self.ui.plotFrame)
         self.plot_layout.setContentsMargins(0, 0, 0, 0)
         self.plot_layout.setSpacing(0)
 
-        # 1D Plot pane setup
+        # 1D plot
         self.plot_win = pg.GraphicsLayoutWidget()
         self.plot_layout.addWidget(self.plot_win)
         self.plot_viewBox = RectViewBox()
@@ -184,7 +194,6 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.legend = self.plot.addLegend()
         from PySide6.QtWidgets import QGraphicsItem
         self.legend.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, False)
-        # self.legend.setLabelTextSize('10pt')
 
         self.pos_label = pg.LabelItem(justify='right')
         self.plot_win.addItem(self.pos_label)
@@ -192,13 +201,11 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.pos_label.setFixedWidth(1)
         self.trackMouse()
 
-        # WF Plot pane setup
+        # Waterfall plot
         self.wf_widget = pgImageWidget()
-        # self.wf_widget = pmeshImageWidget()
         self.setup_wf_widget()
         self.plot_layout.addWidget(self.wf_widget)
 
-        # Waterfall Plot setup
         if self.plotMethod == 'Waterfall':
             self.plot_win.setParent(None)
             self.plot_layout.addWidget(self.wf_widget)
@@ -206,7 +213,9 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
             self.wf_widget.setParent(None)
             self.plot_layout.addWidget(self.plot_win)
 
-        # All Windows Signal connections
+    def _connect_signals(self):
+        """Wire all signal/slot connections for display controls."""
+        # Global controls
         self.ui.normChannel.activated.connect(self.normUpdate)
         self.ui.setBkg.clicked.connect(self.setBkg)
         self.ui.scale.currentIndexChanged.connect(self.update_views)
@@ -214,17 +223,15 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.ui.shareAxis.stateChanged.connect(self.update)
         self.ui.update2D.stateChanged.connect(self.enable_2D_buttons)
 
-        # 2D Window Signal connections
+        # 2D image controls
         self.ui.imageUnit.activated.connect(self.update_binned)
         self.ui.imageUnit.activated.connect(self._update_slice_range)
-        # self.ui.imageMask.stateChanged.connect(self.update_binned)
 
-        # 1D Window Signal connections
+        # 1D plot controls
         self.ui.plotMethod.currentIndexChanged.connect(self._on_plotMethod_changed)
         self.ui.yOffset.valueChanged.connect(self.update_plot_view)
         self.ui.plotUnit.activated.connect(self._on_plotUnit_changed)
         self.ui.plotUnit.activated.connect(self.update_plot)
-        # self.ui.showLegend.stateChanged.connect(self.update_plot_view)
         self.ui.showLegend.stateChanged.connect(self.update_legend)
         self.ui.slice.stateChanged.connect(self.update_plot)
         self.ui.slice.stateChanged.connect(self._update_slice_range)
@@ -232,18 +239,17 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.ui.slice_width.valueChanged.connect(self.update_plot_range)
         self.ui.wf_options.clicked.connect(self.popup_wf_options)
 
-        # Clear 1D Plot Buttons
+        # Action buttons
         self.ui.clear_1D.clicked.connect(self.clear_1D)
-
-        # Save Image/Data Buttons
         self.ui.save_2D.clicked.connect(self.save_image)
         self.ui.save_1D.clicked.connect(self.save_1D)
 
-        # Initialize image units
+    def _init_controls(self):
+        """Initialize image units, waterfall options, and preview button."""
         self.set_axes()
         self._set_slice_range(initialize=True)
 
-        # Setup Waterfall Options Popup
+        # Waterfall options popup widgets
         self.wf_dialog = QDialog()
         self.wf_yaxis_widget = QCombo()
         self.wf_start_widget = QtWidgets.QDoubleSpinBox()
@@ -251,21 +257,18 @@ class displayFrameWidget(Qt.QtWidgets.QWidget):
         self.wf_accept_button = QtWidgets.QPushButton('Okay')
         self.wf_cancel_button = QtWidgets.QPushButton('Cancel')
 
-        # Raw image preview button (added programmatically to frame_6 toolbar)
+        # Raw image preview button
         self._showImageBtn = QtWidgets.QPushButton('Show Image')
         self._showImageBtn.setMinimumSize(QtWidgets.QWidget().minimumSize())
         self._showImageBtn.setMaximumSize(Qt.QtCore.QSize(90, 16777215))
         self._showImageBtn.setToolTip('Show raw image preview for selected frame')
         self._showImageBtn.setFocusPolicy(pyQt.StrongFocus)
-        # Insert after the cmap dropdown in frame_6's layout
         self.ui.horizontalLayout_9.addSpacerItem(
             QtWidgets.QSpacerItem(10, 20, QtWidgets.QSizePolicy.Policy.Fixed,
                                   QtWidgets.QSizePolicy.Policy.Minimum))
         self.ui.horizontalLayout_9.addWidget(self._showImageBtn)
         self._showImageBtn.clicked.connect(self._show_image_preview)
-        # Hidden by default; shown only in 1D-only modes (Batch 1D / Live 1D)
         self._showImageBtn.setVisible(False)
-        # Preview dialog (created lazily)
         self._image_preview_dialog = None
         self._image_preview_widget = None
 
