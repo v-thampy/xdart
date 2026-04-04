@@ -115,10 +115,20 @@ class staticWidget(QWidget):
 
     def __init__(self, local_path=None, parent=None):
         super().__init__(parent)
+        self._init_data_objects(local_path)
+        self._init_ui()
+        self._init_child_widgets()
+        self._connect_signals()
+        self._init_wranglers()
+        self._init_defaults_and_timer()
+        self.show()
+        self.ui.wranglerFrame.activateWindow()
 
-        # Data object initialization
+    # ── Initialization helpers ─────────────────────────────────────
+
+    def _init_data_objects(self, local_path):
+        """Initialize data containers, file lock, and directory paths."""
         self.file_lock = threading.Condition()
-        # if local_path is None:
         local_path = get_fname_dir()
         self.local_path = local_path
         self.dirname = os.path.join(local_path)
@@ -135,25 +145,48 @@ class staticWidget(QWidget):
         self.data_1d = OrderedDict()
         self.data_2d = FixSizeOrderedDict(max=20)
 
+    def _init_ui(self):
+        """Set up the main UI form and detector dialog."""
         self.ui = Ui_Form()
         self.ui.setupUi(self)
-
         self.detector_dialog = QDialog()
         self.detector_widget = QCombo()
         self.detector = None
 
-        # H5Viewer setup
+    def _init_child_widgets(self):
+        """Create H5Viewer, DisplayFrame, IntegratorTree, and Metadata widgets."""
+        # H5Viewer
         self.h5viewer = H5Viewer(self.file_lock, self.local_path, self.dirname,
                                  self.sphere, self.arch, self.arch_ids, self.arches,
                                  self.data_1d, self.data_2d,
                                  self.ui.hdf5Frame)
-        # self.h5viewer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.ui.hdf5Frame.setLayout(self.h5viewer.layout)
-        # self.h5viewer.ui.listData.addItem('No data')
-        # self.h5viewer.ui.listData.setCurrentRow(0)
         self.h5viewer.update_scans()
 
-        # H5Viewer signal connections
+        # DisplayFrame
+        self.displayframe = displayFrameWidget(self.sphere, self.arch,
+                                               self.arch_ids, self.arches,
+                                               self.data_1d, self.data_2d,
+                                               parent=self.ui.middleFrame)
+        self.ui.middleFrame.setLayout(self.displayframe.ui.layout)
+
+        # IntegratorTree
+        self.integratorTree = integratorTree(
+            self.sphere, self.arch, self.file_lock,
+            self.arches, self.arch_ids, self.data_1d, self.data_2d)
+        self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
+        if len(self.sphere.arches.index) > 0:
+            self.integratorTree.update()
+        self.integratorTree.ui.raw_to_tif.hide()
+
+        # Metadata
+        self.metawidget = metadataWidget(self.sphere, self.arch,
+                                         self.arch_ids, self.arches)
+        self.ui.metaFrame.setLayout(self.metawidget.layout)
+
+    def _connect_signals(self):
+        """Wire signal/slot connections for H5Viewer, DisplayFrame, and Integrator."""
+        # H5Viewer signals
         self.h5viewer.sigUpdate.connect(self.set_data)
         self.h5viewer.file_thread.sigTaskStarted.connect(self.thread_state_changed)
         self.h5viewer.sigThreadFinished.connect(self.thread_state_changed)
@@ -161,40 +194,18 @@ class staticWidget(QWidget):
         self.h5viewer.ui.auto_last.clicked.connect(self.enable_auto_last)
         self.h5viewer.ui.auto_last.clicked.connect(self.latest_arch)
 
-        # DisplayFrame setup
-        self.displayframe = displayFrameWidget(self.sphere, self.arch,
-                                               self.arch_ids, self.arches,
-                                               self.data_1d, self.data_2d,
-                                               parent=self.ui.middleFrame)
-        self.ui.middleFrame.setLayout(self.displayframe.ui.layout)
-
-        # DisplayFrame signal connections
+        # DisplayFrame signals
         self.displayframe.ui.update2D.stateChanged.connect(self.update_h5_options)
-        self.h5viewer.actionSaveImage.triggered.connect(
-            self.displayframe.save_image
-        )
+        self.h5viewer.actionSaveImage.triggered.connect(self.displayframe.save_image)
         self.h5viewer.actionSaveArray.triggered.connect(self.displayframe.save_1D)
-        # IntegratorFrame setup
-        self.integratorTree = integratorTree(
-            self.sphere, self.arch, self.file_lock,
-            self.arches, self.arch_ids, self.data_1d, self.data_2d)
-        self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
-        if len(self.sphere.arches.index) > 0:
-            self.integratorTree.update()
 
-        # Integrator signal connections
+        # Integrator signals
         self.integratorTree.integrator_thread.started.connect(self.thread_state_changed)
         self.integratorTree.integrator_thread.update.connect(self.integrator_thread_update)
         self.integratorTree.integrator_thread.finished.connect(self.integrator_thread_finished)
-        # Raw -> Tif button removed (no longer needed)
-        self.integratorTree.ui.raw_to_tif.hide()
 
-        # Metadata setup
-        self.metawidget = metadataWidget(self.sphere, self.arch,
-                                         self.arch_ids, self.arches)
-        self.ui.metaFrame.setLayout(self.metawidget.layout)
-
-        # Wrangler frame setup
+    def _init_wranglers(self):
+        """Initialize the wrangler stack and select the default wrangler."""
         self.wrangler = wranglerWidget("uninitialized", threading.Condition())
         for name, w in wranglers.items():
             self.ui.wranglerStack.addWidget(
@@ -207,31 +218,23 @@ class staticWidget(QWidget):
         self.command_queue = Queue()
         self.set_wrangler(self.ui.wranglerStack.currentIndex())
 
-        # self.integratorTree.get_args('bai_1d')
-        # self.integratorTree.get_args('bai_2d')
-
-        # Setup defaultWidget in h5viewer with parameters
+    def _init_defaults_and_timer(self):
+        """Set up default parameters and the coalescing update timer."""
+        # Register all parameter trees with the defaultWidget
         parameters = [self.integratorTree.parameters]
         for i in range(self.ui.wranglerStack.count()):
             w = self.ui.wranglerStack.widget(i)
             parameters.append(w.parameters)
         self.h5viewer.defaultWidget.set_parameters(parameters)
-        # self.h5viewer.load_starting_defaults()
 
-        # ── Coalescing timer for wrangler updates ──────────────────────
-        # When the wrangler thread processes images faster than the GUI
-        # can render, multiple sigUpdateData signals pile up and each
-        # triggers a full display refresh.  Instead, we note the latest
-        # index and use a single-shot QTimer (200 ms) so only the most
-        # recent update is rendered.
+        # Coalescing timer for wrangler updates: when the wrangler thread
+        # processes images faster than the GUI can render, only the most
+        # recent update is rendered after a short quiet period (200 ms).
         self._pending_update_idx = None
         self._update_timer = QtCore.QTimer(self)
         self._update_timer.setSingleShot(True)
         self._update_timer.setInterval(200)  # ms
         self._update_timer.timeout.connect(self._flush_pending_update)
-
-        self.show()
-        self.ui.wranglerFrame.activateWindow()
 
     def set_wrangler(self, qint):
         """Sets the wrangler based on the selected item in the dropdown.
@@ -365,7 +368,6 @@ class staticWidget(QWidget):
         ----------
         q : Qt.QtWidgets.QListWidgetItem
         """
-        # self.displayframe.auto_last = False
         self.h5viewer.auto_last = False
 
     def enable_auto_last(self, q):
@@ -374,7 +376,6 @@ class staticWidget(QWidget):
         ----------
         q : Qt.QtWidgets.QListWidgetItem
         """
-        # self.displayframe.auto_last = True
         self.h5viewer.auto_last = True
 
     def set_data(self):
@@ -456,16 +457,6 @@ class staticWidget(QWidget):
         self.h5viewer.update_data()
         if self.h5viewer.auto_last:
             self.latest_arch()
-
-        # if idx is None:
-        #     self.h5viewer.ui.listData.setCurrentRow(self.h5viewer.ui.listData.count() - 1)
-        # else:
-        #     items = self.h5viewer.ui.listData.findItems(str(idx), QtCore.Qt.MatchExactly)
-        #     if len(items):
-        #         for item in items:
-        #             self.h5viewer.ui.listData.setCurrentItem(item)
-        #     else:
-        #         self.h5viewer.ui.listData.setCurrentRow(self.h5viewer.ui.listData.count() - 1)
 
         self.displayframe.update()
         self.metawidget.update()
@@ -573,7 +564,6 @@ class staticWidget(QWidget):
                 'bai_2d_args': self.sphere.bai_2d_args}
         self.wrangler.sphere_args = copy.deepcopy(args)
         self.wrangler.setup()
-        # self.displayframe.auto_last = True
         self.h5viewer.auto_last = True
         self.wrangler.thread.start()
 

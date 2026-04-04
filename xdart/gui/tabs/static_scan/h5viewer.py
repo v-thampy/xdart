@@ -71,11 +71,23 @@ class H5Viewer(QWidget):
                  data_1d, data_2d,
                  parent=None):
         super().__init__(parent)
+        self._init_data_objects(file_lock, local_path, dirname,
+                                sphere, arch, arch_ids, arches,
+                                data_1d, data_2d)
+        self._init_ui()
+        self._init_toolbar()
+        self._connect_signals()
+        self._init_file_thread()
+
+    # ── Initialization helpers ─────────────────────────────────────
+
+    def _init_data_objects(self, file_lock, local_path, dirname,
+                           sphere, arch, arch_ids, arches,
+                           data_1d, data_2d):
+        """Initialize data references and state flags."""
         self.local_path = local_path
         self.file_lock = file_lock
         self.dirname = dirname
-
-        # Data Objects
         self.sphere = sphere
         self.arch = arch
         self.arch_ids = arch_ids
@@ -87,84 +99,77 @@ class H5Viewer(QWidget):
         self.auto_last = True
         self.latest_idx = None
         self.new_scan_loaded = False
-        # Viewer mode: None (normal), 'image', or 'xye'
         self.viewer_mode = None
 
-        # Link UI
+    def _init_ui(self):
+        """Set up the main UI form and default widget."""
         self.ui = Ui_Form()
         self.ui.setupUi(self)
-
-        # self.layout = self.ui.layout
         self.layout = self.ui.gridLayout
         self.defaultWidget = defaultWidget()
         self.defaultWidget.sigSetUserDefaults.connect(self.set_user_defaults)
 
-        # Toolbar setup
+    def _init_toolbar(self):
+        """Create toolbar with File and Config menus."""
         self.toolbar = QtWidgets.QToolBar('Tools')
 
-        # File menu setup (part of toolbar)
+        # Actions
         self.actionOpenFolder = QtGui.QAction()
         self.actionOpenFolder.setText('Open Folder')
-
         self.actionSetDefaults = QtGui.QAction()
         self.actionSetDefaults.setText('Advanced...')
-
         self.actionSaveDataAs = QtGui.QAction()
         self.actionSaveDataAs.setText('Save As')
-
         self.actionNewFile = QtGui.QAction()
         self.actionNewFile.setText('New')
 
+        # Export sub-menu
         self.exportMenu = QtWidgets.QMenu()
         self.exportMenu.setTitle('Export')
-
         self.actionSaveImage = QtGui.QAction()
         self.actionSaveImage.setText('Current Image')
         self.exportMenu.addAction(self.actionSaveImage)
-
         self.actionSaveArray = QtGui.QAction()
         self.actionSaveArray.setText('Current 1D Array')
         self.exportMenu.addAction(self.actionSaveArray)
-        
+
+        # Config sub-menu
         self.paramMenu = QtWidgets.QMenu()
         self.paramMenu.setTitle('Config')
-        
         self.actionSaveParams = QtGui.QAction()
         self.actionSaveParams.setText('Save')
         self.actionSaveParams.triggered.connect(self.defaultWidget.save_defaults)
         self.paramMenu.addAction(self.actionSaveParams)
-        
         self.actionLoadParams = QtGui.QAction()
         self.actionLoadParams.setText('Load')
         self.actionLoadParams.triggered.connect(self.defaultWidget.load_defaults)
         self.paramMenu.addAction(self.actionLoadParams)
-        
         self.paramMenu.addAction(self.actionSetDefaults)
 
+        # File menu
         self.fileMenu = QtWidgets.QMenu()
         self.fileMenu.addAction(self.actionOpenFolder)
         self.fileMenu.addAction(self.actionNewFile)
         self.fileMenu.addAction(self.actionSaveDataAs)
         self.fileMenu.addMenu(self.exportMenu)
 
+        # Toolbar buttons
         self.fileButton = QtWidgets.QToolButton()
         self.fileButton.setText('File')
         self.fileButton.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.fileButton.setMenu(self.fileMenu)
-        
         self.paramButton = QtWidgets.QToolButton()
         self.paramButton.setText('Config')
         self.paramButton.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.paramButton.setMenu(self.paramMenu)
-        # End file menu setup
 
         self.toolbar.addWidget(self.fileButton)
         self.toolbar.addWidget(self.paramButton)
-        # End toolbar setup
-
         self.layout.addWidget(self.toolbar, 0, 0, 1, 2)
+
+    def _connect_signals(self):
+        """Wire signal/slot connections for list widgets and menu actions."""
         self.actionSetDefaults.triggered.connect(self.defaultWidget.show)
-        
         self.ui.listScans.itemDoubleClicked.connect(self.scans_clicked)
         self.ui.listScans.itemClicked.connect(self._scans_single_clicked)
         self.ui.listScans.currentItemChanged.connect(self._scans_current_changed)
@@ -175,7 +180,9 @@ class H5Viewer(QWidget):
         self.actionOpenFolder.triggered.connect(self.open_folder)
         self.actionSaveDataAs.triggered.connect(self.save_data_as)
         self.actionNewFile.triggered.connect(self.new_file)
-        
+
+    def _init_file_thread(self):
+        """Create and start the background file handler thread."""
         self.file_thread = fileHandlerThread(self.sphere, self.arch,
                                              self.file_lock,
                                              arch_ids=self.arch_ids,
@@ -186,7 +193,6 @@ class H5Viewer(QWidget):
         self.file_thread.sigNewFile.connect(self.sigNewFile.emit)
         self.file_thread.sigUpdate.connect(self.sigUpdate.emit)
         self.file_thread.start(Qt.QtCore.QThread.LowPriority)
-
         self._h5pool = get_pool()
         
     def load_starting_defaults(self):
