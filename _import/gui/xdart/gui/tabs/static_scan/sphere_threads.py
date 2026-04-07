@@ -352,39 +352,10 @@ class fileHandlerThread(Qt.QtCore.QThread):
                                     'int_2d': arch.int_2d,
                                     'gi_2d': arch.gi_2d,
                                 }
-
-                                if idx in self.arches['add_idxs']:
-                                    try:
-                                        self.arches['sum_int_2d'] += self.data_2d[int(idx)]['int_2d']
-                                    except (ValueError, AttributeError, TypeError):
-                                        self.arches['sum_int_2d'] = self.data_2d[int(idx)]['int_2d']
-                                    _raw = self.data_2d[int(idx)]['map_raw']
-                                    _bg = self.data_2d[int(idx)]['bg_raw']
-                                    if _raw is not None:
-                                        _delta = _raw if _bg is None else _raw - _bg
-                                        if self.arches['sum_map_raw'] is None or np.isscalar(self.arches['sum_map_raw']):
-                                            self.arches['sum_map_raw'] = _delta
-                                        else:
-                                            try:
-                                                self.arches['sum_map_raw'] = self.arches['sum_map_raw'] + _delta
-                                            except (ValueError, AttributeError, TypeError):
-                                                self.arches['sum_map_raw'] = _delta
-                                elif idx in self.arches['sub_idxs']:
-                                    try:
-                                        self.arches['sum_int_2d'] -= self.data_2d[int(idx)]['int_2d']
-                                    except (ValueError, AttributeError, TypeError):
-                                        self.arches['sum_int_2d'] = self.data_2d[int(idx)]['int_2d']
-                                    _raw = self.data_2d[int(idx)]['map_raw']
-                                    _bg = self.data_2d[int(idx)]['bg_raw']
-                                    if _raw is not None:
-                                        _delta = _raw if _bg is None else _raw - _bg
-                                        if self.arches['sum_map_raw'] is None or np.isscalar(self.arches['sum_map_raw']):
-                                            self.arches['sum_map_raw'] = -_delta
-                                        else:
-                                            try:
-                                                self.arches['sum_map_raw'] = self.arches['sum_map_raw'] - _delta
-                                            except (ValueError, AttributeError, TypeError):
-                                                self.arches['sum_map_raw'] = -_delta
+                                # Multi-arch combination is computed on
+                                # demand by display_data.get_arches_int_2d
+                                # / get_arches_map_raw — no shared
+                                # accumulator state to update here.
 
                     except KeyError as e:
                         logger.debug("Data missing for arch %s during aggregation: %s", idx, e)

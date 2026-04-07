@@ -98,30 +98,52 @@ class DisplayDataMixin:
     # ── 2D integration data access ────────────────────────────────
 
     def get_arches_int_2d(self, idxs=None):
-        """Return 2D arch data for multiple arches (averaged)"""
+        """Return 2D arch data for multiple arches (averaged).
+
+        Mirrors :meth:`get_arches_map_raw` / :meth:`get_arches_int_1d`:
+        accumulates per-arch normalized intensity from ``data_2d`` and
+        averages on the fly. No external state required — always reflects
+        the current selection in ``data_2d``.
+
+        Returns ``(intensity, xdata, ydata)`` or ``(None, None, None)``
+        if nothing usable is loaded.
+        """
         if idxs is None:
             idxs = self.idxs_2d
 
-        if len(idxs) > 1:
-            intensity = self.get_int_2d(self.arches['sum_int_2d'])
-            xdata, ydata = self.get_xydata(self.arches['sum_int_2d'])
-            return intensity, xdata, ydata
-
-        try:
-            idx = idxs[0]
-        except IndexError:
+        if not idxs:
             return None, None, None
 
-        arch_1d = self.data_1d[int(idx)]
-        arch_2d = self.data_2d[int(idx)]
-        _gi2d = arch_2d.get('gi_2d', {})
-        intensity = self.get_int_2d(arch_2d['int_2d'], arch_1d, gi_2d=_gi2d)
+        intensity = None
+        xdata = ydata = None
+        ctr = 0
+        for idx in idxs:
+            arch_1d = self.data_1d.get(int(idx))
+            arch_2d = self.data_2d.get(int(idx))
+            if arch_2d is None or arch_2d.get('int_2d') is None:
+                continue
+            _gi2d = arch_2d.get('gi_2d', {})
+            try:
+                _i = self.get_int_2d(arch_2d['int_2d'], arch_1d, gi_2d=_gi2d)
+            except (ValueError, AttributeError, TypeError):
+                continue
+            if _i.ndim != 2:
+                continue
+            if intensity is None:
+                intensity = np.asarray(_i, dtype=float)
+                xdata, ydata = self.get_xydata(arch_2d['int_2d'], gi_2d=_gi2d)
+            else:
+                try:
+                    intensity = intensity + _i
+                except (ValueError, AttributeError, TypeError):
+                    continue
+            ctr += 1
 
-        if intensity.ndim != 2:
+        if intensity is None or ctr == 0:
             return None, None, None
 
-        xdata, ydata = self.get_xydata(arch_2d['int_2d'], gi_2d=_gi2d)
-        return np.asarray(intensity, dtype=float), xdata, ydata
+        intensity = intensity / ctr
+        return intensity, xdata, ydata
 
     def get_sphere_int_2d(self):
         """Returns data and QRect for data in sphere
