@@ -735,16 +735,10 @@ class H5Viewer(QWidget):
         else:
             idxs_memory = [int(idx) for idx in idxs if int(idx) in self.data_1d.keys()]
 
-        if load_2d:
-            if (len(self.arches) == 0) or (len(self.data_2d) == 0):
-                self.arches.update({'sum_int_2d': None, 'sum_map_raw': 0})
-                self.arches.update({'idxs': [], 'add_idxs': [], 'sub_idxs': []})
-
-            if len(idxs) > 1:
-                self.get_arches_sum(idxs, idxs_memory)
-
-            self.arches['idxs'] = [int(idx) for idx in idxs]
-
+        # Multi-arch combination is now done on demand by
+        # get_arches_int_2d / get_arches_map_raw — no shared accumulator
+        # state to maintain here. Just figure out which arches still
+        # need to be loaded from disk.
         arch_ids = [int(idx) for idx in idxs
                     if int(idx) not in idxs_memory]
 
@@ -849,110 +843,16 @@ class H5Viewer(QWidget):
                                                   'gi_2d': arch.gi_2d,
                                                   'thumbnail': arch.thumbnail}
 
-                    if idx in self.arches['add_idxs']:
-                        _d = self.data_2d[int(idx)]['int_2d']
-                        if self.arches['sum_int_2d'] is None:
-                            self.arches['sum_int_2d'] = _d
-                        else:
-                            try:
-                                self.arches['sum_int_2d'] = self.arches['sum_int_2d'] + _d
-                            except (ValueError, AttributeError, TypeError):
-                                self.arches['sum_int_2d'] = _d
-                        _raw = self._raw_minus_bg(self.data_2d[int(idx)])
-                        self.arches['sum_map_raw'] = self._safe_accumulate(
-                            self.arches['sum_map_raw'], _raw, op='add')
-                    elif idx in self.arches['sub_idxs']:
-                        _d = self.data_2d[int(idx)]['int_2d']
-                        if self.arches['sum_int_2d'] is not None:
-                            try:
-                                self.arches['sum_int_2d'] = self.arches['sum_int_2d'] - _d
-                            except (ValueError, AttributeError, TypeError):
-                                self.arches['sum_int_2d'] = _d
-                        _raw = self._raw_minus_bg(self.data_2d[int(idx)])
-                        self.arches['sum_map_raw'] = self._safe_accumulate(
-                            self.arches['sum_map_raw'], _raw, op='sub')
-
             except KeyError:
                 pass
 
     # Removed legacy load_arch_data — all reads now go through
     # EwaldArch.load_from_nexus via load_arches_data above.
-
-    @staticmethod
-    def _raw_minus_bg(arch_2d):
-        """Return ``map_raw - bg_raw``, tolerating either being ``None``."""
-        raw = arch_2d.get('map_raw')
-        if raw is None:
-            return None
-        bg = arch_2d.get('bg_raw')
-        if bg is None:
-            return raw
-        try:
-            return raw - bg
-        except (ValueError, AttributeError, TypeError):
-            return raw
-
-    @staticmethod
-    def _safe_accumulate(accum, value, op='add'):
-        """Add or subtract ``value`` into ``accum``, tolerating ``None``.
-
-        Some arches (e.g. Eiger master frames with ``skip_map_raw``) do not
-        store a raw 2D map in the HDF5, so ``data_2d[idx]['map_raw']`` may
-        be ``None``. We treat ``None`` as "nothing to contribute" rather
-        than letting a ``TypeError`` propagate out of the overplot code.
-        """
-        if value is None:
-            return accum
-        if accum is None or np.isscalar(accum):
-            # First real contribution — seed the accumulator.
-            return value if op == 'add' else -value
-        try:
-            return accum + value if op == 'add' else accum - value
-        except (ValueError, AttributeError, TypeError):
-            return value if op == 'add' else -value
-
-    def get_arches_sum(self, idxs, idxs_memory):
-        new_idxs = set([int(idx) for idx in idxs])
-        old_idxs, data_keys = set(self.arches['idxs']), set(self.data_2d.keys())
-
-        changed_idxs = new_idxs ^ old_idxs
-        load_idxs = changed_idxs - data_keys
-
-
-        add_from_data = (new_idxs - old_idxs) & data_keys
-        add_from_h5 = new_idxs - old_idxs - data_keys
-        self.arches['add_idxs'] = [int(k) for k in add_from_h5]
-
-        sub_from_data = (old_idxs - new_idxs) & data_keys
-        sub_from_h5 = old_idxs - new_idxs - data_keys
-        self.arches['sub_idxs'] = [int(k) for k in sub_from_h5]
-
-        for x in load_idxs:
-            if int(x) in idxs_memory:
-                idxs_memory.remove(int(x))
-
-        for k in add_from_data:
-            _d = self.data_2d[int(k)]['int_2d']
-            _raw = self.data_2d[int(k)]['map_raw']
-            if self.arches['sum_int_2d'] is None:
-                self.arches['sum_int_2d'] = _d
-            else:
-                try:
-                    self.arches['sum_int_2d'] = self.arches['sum_int_2d'] + _d
-                except (ValueError, AttributeError, TypeError):
-                    self.arches['sum_int_2d'] = _d
-            self.arches['sum_map_raw'] = self._safe_accumulate(
-                self.arches['sum_map_raw'], _raw, op='add')
-
-        for k in sub_from_data:
-            _d = self.data_2d[int(k)]['int_2d']
-            _raw = self.data_2d[int(k)]['map_raw']
-            if self.arches['sum_int_2d'] is None:
-                self.arches['sum_int_2d'] = _d
-            else:
-                try:
-                    self.arches['sum_int_2d'] = self.arches['sum_int_2d'] - _d
-                except (ValueError, AttributeError, TypeError):
-                    self.arches['sum_int_2d'] = _d
-            self.arches['sum_map_raw'] = self._safe_accumulate(
-                self.arches['sum_map_raw'], _raw, op='sub')
+    #
+    # Removed get_arches_sum / _safe_accumulate / _raw_minus_bg and the
+    # add_idxs/sub_idxs/sum_int_2d/sum_map_raw machinery: combining 2D
+    # data across multiple selected arches is now done on demand by
+    # display_data.get_arches_int_2d / get_arches_map_raw, which iterate
+    # the current selection straight from data_2d. The old stateful
+    # approach was both inconsistent with the 1D path (get_arches_int_1d)
+    # and silently dead for sum_map_raw, which was never read anywhere.
