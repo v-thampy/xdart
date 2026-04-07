@@ -39,69 +39,112 @@ QItemSelectionModel = QtCore.QItemSelectionModel
 
 
 class _AccumulatingClickFilter(QtCore.QObject):
-    """Toggle items on plain left-clicks when an accumulating plot
-    mode is active.
+    """Centralized click handler for the H5Viewer ``listData`` widget.
 
-    listData stays in ``ExtendedSelection`` at all times so arrow-key
-    navigation, shift-range, and ctrl-toggle behave normally. When the
-    user is in an accumulating plot method
-    (Overlay/Waterfall/Sum/Average), a plain left-click on an item in
-    the viewport is consumed by this filter and translated into a
-    selection toggle on that single item — leaving the rest of the
-    selection untouched. Modified clicks (shift/ctrl already held) and
-    Single mode pass straight through to the default handler.
+    listData uses ``ExtendedSelection`` at all times. This filter
+    intercepts left-button presses on the viewport and dispatches them
+    according to the active plot method and held modifiers. By owning
+    the click logic explicitly we sidestep two cross-platform Qt
+    quirks at once:
+
+    1. On macOS, Qt swaps Ctrl and Meta by default — so the literal
+       Ctrl key reports as ``Qt.MetaModifier`` and is *not* recognized
+       by ``ExtendedSelection``'s built-in toggle logic. We treat
+       Ctrl, Cmd and Meta interchangeably here so toggling works on
+       every platform regardless of which physical key the user
+       presses.
+    2. PySide6's flag-enum comparisons (``mods != Qt.NoModifier``)
+       can be unreliable across versions. We coerce modifiers to
+       ``int`` and check bits explicitly.
+
+    Decision matrix (left-button press only — everything else passes
+    through):
+
+        ┌─────────────────────┬──────────────────────────┐
+        │ Modifier            │ Action                   │
+        ├─────────────────────┼──────────────────────────┤
+        │ Shift               │ pass through (Qt range)  │
+        │ Ctrl / Cmd / Meta   │ toggle clicked item      │
+        │ none — accumulating │ toggle clicked item      │
+        │ none — Single mode  │ pass through (Qt replace)│
+        └─────────────────────┴──────────────────────────┘
     """
+
+    _ACCUMULATING = ('Overlay', 'Waterfall', 'Sum', 'Average')
 
     def __init__(self, listwidget, get_mode):
         super().__init__(listwidget)
         self._lw = listwidget
         self._get_mode = get_mode
 
+    def _toggle(self, item):
+        """Toggle a single item via the selection model and notify
+        downstream listeners (data_changed via itemSelectionChanged,
+        disable_auto_last via itemClicked)."""
+        idx = self._lw.indexFromItem(item)
+        sm = self._lw.selectionModel()
+        sm.select(idx, QItemSelectionModel.Toggle)
+        sm.setCurrentIndex(idx, QItemSelectionModel.NoUpdate)
+        try:
+            self._lw.itemClicked.emit(item)
+        except Exception:
+            pass
+
     def eventFilter(self, obj, event):
-        # Only intercept the initial press. Release and double-click
-        # propagate normally so the default handler keeps its internal
-        # state consistent. Any modifier (Ctrl/Shift/Meta/Alt) — and
-        # any non-left button — falls through unconditionally so
-        # standard ExtendedSelection behaviors stay intact in every
-        # mode.
         if event.type() != QtCore.QEvent.MouseButtonPress:
             return False
         try:
             btn = event.button()
-            mods = event.modifiers()
+            mods_obj = event.modifiers()
         except AttributeError:
             return False
         if btn != QtCore.Qt.LeftButton:
             return False
-        if mods != QtCore.Qt.NoModifier:
+
+        # Coerce modifier flags to int so bitwise checks are immune
+        # to PySide6 enum/flag comparison quirks.
+        try:
+            mods = int(mods_obj)
+        except (TypeError, ValueError):
             return False
+        ctrl_bit = int(QtCore.Qt.ControlModifier)
+        shift_bit = int(QtCore.Qt.ShiftModifier)
+        meta_bit = int(QtCore.Qt.MetaModifier)
+        has_shift = bool(mods & shift_bit)
+        has_toggle_mod = bool(mods & (ctrl_bit | meta_bit))
+
+        # Shift-range select is delegated to Qt — it walks from the
+        # current/anchor item through the clicked item and replaces
+        # the selection. We don't try to reimplement that.
+        if has_shift:
+            return False
+
         try:
             mode = self._get_mode()
         except Exception:
             return False
-        if mode not in ('Overlay', 'Waterfall', 'Sum', 'Average'):
-            return False
+        accumulating = mode in self._ACCUMULATING
 
+        # Resolve the clicked item.
         try:
             pos = event.position().toPoint()
         except AttributeError:
             pos = event.pos()
         item = self._lw.itemAt(pos)
         if item is None:
-            return False
-        # Toggle the clicked item using the selection model — this is
-        # the canonical Qt path and reliably emits
-        # itemSelectionChanged so data_changed updates downstream.
-        idx = self._lw.indexFromItem(item)
-        self._lw.selectionModel().select(idx, QItemSelectionModel.Toggle)
-        self._lw.setCurrentIndex(idx)
-        # Re-emit itemClicked so downstream listeners (e.g.
-        # disable_auto_last) still react.
-        try:
-            self._lw.itemClicked.emit(item)
-        except Exception:
-            pass
-        return True
+            # Click on empty space — let Qt clear selection in Single
+            # mode, swallow it in accumulating modes so we don't lose
+            # the existing multi-selection.
+            return accumulating
+
+        if has_toggle_mod or accumulating:
+            self._toggle(item)
+            return True
+
+        # Plain click in Single mode → pass through to Qt's default
+        # ExtendedSelection handler (which replaces the selection
+        # with just the clicked item).
+        return False
 
 
 class H5Viewer(QWidget):
@@ -244,32 +287,38 @@ class H5Viewer(QWidget):
         self.ui.listScans.itemSelectionChanged.connect(self._scans_selection_changed)
         self.ui.listScans.installEventFilter(self)
         self.ui.listData.itemSelectionChanged.connect(self.data_changed)
-        # Use ExtendedSelection always so arrow keys, shift-range, and
-        # ctrl-toggle work normally. Accumulating plot methods get
-        # single-click-to-toggle behavior via _AccumulatingClickFilter
-        # installed below.
+        # listData stays in ExtendedSelection at all times so all
+        # standard selection behaviors (arrow keys, shift-range,
+        # ctrl-toggle) work consistently across modes. The click
+        # filter installed below handles plain-click toggling for
+        # accumulating plot methods (Overlay/Waterfall/Sum/Average)
+        # and works around macOS quirks where the literal Ctrl key
+        # maps to Qt.MetaModifier instead of Qt.ControlModifier.
         self.ui.listData.setSelectionMode(
             QtWidgets.QAbstractItemView.ExtendedSelection)
         self._plot_method = 'Single'
-        self._accum_click_filter = _AccumulatingClickFilter(
+        self._list_click_filter = _AccumulatingClickFilter(
             self.ui.listData, lambda: self._plot_method)
-        self.ui.listData.viewport().installEventFilter(self._accum_click_filter)
+        self.ui.listData.viewport().installEventFilter(self._list_click_filter)
+        self.ui.show_all.clicked.connect(self.show_all)
+        self.actionOpenFolder.triggered.connect(self.open_folder)
+        self.actionSaveDataAs.triggered.connect(self.save_data_as)
+        self.actionNewFile.triggered.connect(self.new_file)
 
     def set_data_selection_mode(self, plot_method):
         """Update internal plot-method state and reconcile listData
-        selection.
+        selection when switching between modes.
 
-        listData stays in ExtendedSelection mode at all times. When the
-        user enters ``Single`` mode from a multi-selection state, this
-        method collapses the selection down to the most recently
+        listData stays in ExtendedSelection at all times. When the
+        user enters ``Single`` mode from a multi-selection state,
+        this method collapses the selection down to the most recently
         focused item so the next click behaves naturally. The click
-        filter consults ``self._plot_method`` to decide whether to
-        inject Ctrl on plain clicks.
+        filter consults ``self._plot_method`` to decide how to handle
+        plain clicks.
         """
         prev_method = self._plot_method
         self._plot_method = plot_method
-        if (plot_method == 'Single'
-                and prev_method != 'Single'):
+        if plot_method == 'Single' and prev_method != 'Single':
             lw = self.ui.listData
             current = lw.currentItem()
             selected = lw.selectedItems()
@@ -283,12 +332,7 @@ class H5Viewer(QWidget):
                         lw.setCurrentItem(keep)
                 finally:
                     lw.blockSignals(False)
-                # Re-emit so arch_ids and downstream views update.
                 self.data_changed()
-        self.ui.show_all.clicked.connect(self.show_all)
-        self.actionOpenFolder.triggered.connect(self.open_folder)
-        self.actionSaveDataAs.triggered.connect(self.save_data_as)
-        self.actionNewFile.triggered.connect(self.new_file)
 
     def _init_file_thread(self):
         """Create and start the background file handler thread."""
