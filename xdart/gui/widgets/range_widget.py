@@ -146,10 +146,10 @@ class rangeWidget(Qt.QtWidgets.QWidget):
         self.ui = Ui_Form()
         self.ui.setupUi(self)
         self.ui.titleLabel.setText(title)
-        if type(unit) == list:
+        if isinstance(unit, list):
             self.ui.units.addItems(unit)
             self.ui.units.currentIndexChanged.connect(self.sigUnitChanged.emit)
-        elif type(unit) == str:
+        elif isinstance(unit, str):
             self.ui.horizontalLayout.removeWidget(self.ui.units)
             self.ui.units.hide()
             self.unit_label = Qt.QtWidgets.QLabel(self)
