@@ -129,6 +129,11 @@ class staticWidget(QWidget):
     def _init_data_objects(self, local_path):
         """Initialize data containers, file lock, and directory paths."""
         self.file_lock = threading.Condition()
+        # Reentrant lock guarding concurrent access to data_1d / data_2d from
+        # the GUI thread, integratorThread, and fileHandlerThread. Shared with
+        # all child widgets and worker threads. Always the OUTER lock when
+        # paired with sphere.sphere_lock (data_lock → sphere_lock).
+        self.data_lock = threading.RLock()
         local_path = get_fname_dir()
         self.local_path = local_path
         self.dirname = os.path.join(local_path)
@@ -159,7 +164,7 @@ class staticWidget(QWidget):
         self.h5viewer = H5Viewer(self.file_lock, self.local_path, self.dirname,
                                  self.sphere, self.arch, self.arch_ids, self.arches,
                                  self.data_1d, self.data_2d,
-                                 self.ui.hdf5Frame)
+                                 self.ui.hdf5Frame, data_lock=self.data_lock)
         self.ui.hdf5Frame.setLayout(self.h5viewer.layout)
         self.h5viewer.update_scans()
 
@@ -167,13 +172,15 @@ class staticWidget(QWidget):
         self.displayframe = displayFrameWidget(self.sphere, self.arch,
                                                self.arch_ids, self.arches,
                                                self.data_1d, self.data_2d,
-                                               parent=self.ui.middleFrame)
+                                               parent=self.ui.middleFrame,
+                                               data_lock=self.data_lock)
         self.ui.middleFrame.setLayout(self.displayframe.ui.layout)
 
         # IntegratorTree
         self.integratorTree = integratorTree(
             self.sphere, self.arch, self.file_lock,
-            self.arches, self.arch_ids, self.data_1d, self.data_2d)
+            self.arches, self.arch_ids, self.data_1d, self.data_2d,
+            data_lock=self.data_lock)
         self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
         if len(self.sphere.arches.index) > 0:
             self.integratorTree.update()

@@ -69,8 +69,10 @@ class H5Viewer(QWidget):
     def __init__(self, file_lock, local_path, dirname,
                  sphere, arch, arch_ids, arches,
                  data_1d, data_2d,
-                 parent=None):
+                 parent=None, data_lock=None):
         super().__init__(parent)
+        import threading as _threading
+        self.data_lock = data_lock if data_lock is not None else _threading.RLock()
         self._init_data_objects(file_lock, local_path, dirname,
                                 sphere, arch, arch_ids, arches,
                                 data_1d, data_2d)
@@ -188,7 +190,8 @@ class H5Viewer(QWidget):
                                              arch_ids=self.arch_ids,
                                              arches=self.arches,
                                              data_1d=self.data_1d,
-                                             data_2d=self.data_2d)
+                                             data_2d=self.data_2d,
+                                             data_lock=self.data_lock)
         self.file_thread.sigTaskDone.connect(self.thread_finished)
         self.file_thread.sigNewFile.connect(self.sigNewFile.emit)
         self.file_thread.sigUpdate.connect(self.sigUpdate.emit)
@@ -482,8 +485,9 @@ class H5Viewer(QWidget):
         if not selected:
             return
 
-        self.data_1d.clear()
-        self.data_2d.clear()
+        with self.data_lock:
+            self.data_1d.clear()
+            self.data_2d.clear()
         self.arch_ids.clear()
 
         idx = 1
@@ -510,7 +514,8 @@ class H5Viewer(QWidget):
             arch.int_1d = int_1d
             arch.scan_info = {'source_file': os.path.basename(fpath)}
 
-            self.data_1d[idx] = arch
+            with self.data_lock:
+                self.data_1d[idx] = arch
             self.arch_ids.append(str(idx))
             idx += 1
 
@@ -541,8 +546,9 @@ class H5Viewer(QWidget):
         populate listData with frame indices.  For single-frame
         files, display the image directly.
         """
-        self.data_1d.clear()
-        self.data_2d.clear()
+        with self.data_lock:
+            self.data_1d.clear()
+            self.data_2d.clear()
         self.arch_ids.clear()
         self.ui.listData.clear()
 
@@ -617,18 +623,19 @@ class H5Viewer(QWidget):
                 logger.warning('Could not load image %s frame %d', fpath, frame_idx)
                 return
 
-        self.data_2d[int(arch_idx)] = {
-            'map_raw': img_data,
-            'bg_raw': np.zeros_like(img_data),
-            'mask': None,
-            'int_2d': None,
-            'gi_2d': {},
-            'thumbnail': None,
-        }
-        # Minimal data_1d entry so display doesn't crash
-        arch = EwaldArch(idx=arch_idx, static=True, gi=False)
-        arch.scan_info = {'source_file': os.path.basename(fpath)}
-        self.data_1d[int(arch_idx)] = arch
+        with self.data_lock:
+            self.data_2d[int(arch_idx)] = {
+                'map_raw': img_data,
+                'bg_raw': np.zeros_like(img_data),
+                'mask': None,
+                'int_2d': None,
+                'gi_2d': {},
+                'thumbnail': None,
+            }
+            # Minimal data_1d entry so display doesn't crash
+            arch = EwaldArch(idx=arch_idx, static=True, gi=False)
+            arch.scan_info = {'source_file': os.path.basename(fpath)}
+            self.data_1d[int(arch_idx)] = arch
     
     def _try_raw_detectors(self, fpath):
         """Try reading a raw binary file with common detector shapes."""
@@ -758,8 +765,9 @@ class H5Viewer(QWidget):
         self._h5pool.close(self.sphere.data_file)
         self.arches.clear()
         self.arch_ids.clear()
-        self.data_1d.clear()
-        self.data_2d.clear()
+        with self.data_lock:
+            self.data_1d.clear()
+            self.data_2d.clear()
         self.new_scan = True
 
     def open_folder(self):
@@ -774,8 +782,9 @@ class H5Viewer(QWidget):
             self.dirname = dirname
             save_session({'data_dir': dirname})
             self.arches.clear()
-            self.data_1d.clear()
-            self.data_2d.clear()
+            with self.data_lock:
+                self.data_1d.clear()
+                self.data_2d.clear()
             self.new_scan = True
             self.update_scans()
     
@@ -828,16 +837,17 @@ class H5Viewer(QWidget):
                 arch = EwaldArch(idx=idx, static=True, gi=self.sphere.gi)
                 arch.load_from_nexus(frames_grp, load_2d=load_2d)
 
-                if not load_2d:
-                    self.data_1d[int(idx)] = arch.copy(include_2d=False)
-                else:
-                    self.data_1d[int(idx)] = arch.copy(include_2d=False)
-                    self.data_2d[int(idx)] = {'map_raw': arch.map_raw,
-                                              'bg_raw': arch.bg_raw,
-                                              'mask': arch.mask,
-                                              'int_2d': arch.int_2d,
-                                              'gi_2d': arch.gi_2d,
-                                              'thumbnail': arch.thumbnail}
+                with self.data_lock:
+                    if not load_2d:
+                        self.data_1d[int(idx)] = arch.copy(include_2d=False)
+                    else:
+                        self.data_1d[int(idx)] = arch.copy(include_2d=False)
+                        self.data_2d[int(idx)] = {'map_raw': arch.map_raw,
+                                                  'bg_raw': arch.bg_raw,
+                                                  'mask': arch.mask,
+                                                  'int_2d': arch.int_2d,
+                                                  'gi_2d': arch.gi_2d,
+                                                  'thumbnail': arch.thumbnail}
 
                     if idx in self.arches['add_idxs']:
                         _d = self.data_2d[int(idx)]['int_2d']
