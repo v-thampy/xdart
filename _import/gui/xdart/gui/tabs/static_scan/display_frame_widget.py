@@ -14,6 +14,7 @@ update orchestration, viewer modes, and 2D image rendering.
 import logging
 import os
 import re
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -104,10 +105,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         update_plot: Updates plot data based on selections
     """
 
-    def __init__(self, sphere, arch, arch_ids, arches, data_1d, data_2d, parent=None):
+    def __init__(self, sphere, arch, arch_ids, arches, data_1d, data_2d,
+                 parent=None, data_lock=None):
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
+        # Shared reentrant lock guarding data_1d / data_2d.  When created
+        # standalone (tests, viewer mode) fall back to a private lock.
+        self.data_lock = data_lock if data_lock is not None else threading.RLock()
         self._init_data_objects(sphere, arch, arch_ids, arches, data_1d, data_2d)
         self._init_display_panes()
         self._init_plot_panes()
@@ -279,26 +284,36 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # ── Index management ──────────────────────────────────────────
 
     def get_idxs(self):
-        """ Return selected arch indices
+        """ Return selected arch indices.
+
+        Thread-safety: snapshots of data_1d / data_2d keys are taken under
+        ``data_lock`` to avoid racing with integrator / file-handler worker
+        threads that mutate these dicts concurrently.
         """
         self.idxs, self.idxs_1d, self.idxs_2d = [], [], []
         if len(self.arch_ids) == 0 or self.arch_ids[0] == 'No data':
             return
 
-        with self.sphere.sphere_lock:
-            if len(self.arch_ids) == len(self.sphere.arches.index) > 1:
-                self.overall = True
-                self.idxs = sorted(np.asarray(self.sphere.arches.index, dtype=int))
-            else:
-                self.overall = False
-                self.idxs = sorted(self.arch_ids)
+        with self.data_lock:
+            with self.sphere.sphere_lock:
+                if len(self.arch_ids) == len(self.sphere.arches.index) > 1:
+                    self.overall = True
+                    self.idxs = sorted(np.asarray(self.sphere.arches.index, dtype=int))
+                else:
+                    self.overall = False
+                    self.idxs = sorted(self.arch_ids)
 
-        try:
-            self.idxs = list(np.asarray(self.idxs, dtype=int))
-        except ValueError:
-            return
-        self.idxs_1d = [int(idx) for idx in self.idxs if idx in self.data_1d.keys()]
-        self.idxs_2d = [int(idx) for idx in self.idxs if idx in self.data_2d.keys()]
+            try:
+                self.idxs = list(np.asarray(self.idxs, dtype=int))
+            except ValueError:
+                return
+            # Snapshot current dict keys while the lock is held, then release
+            # before doing list-comprehension work.
+            data_1d_keys = set(self.data_1d.keys())
+            data_2d_keys = set(self.data_2d.keys())
+
+        self.idxs_1d = [int(idx) for idx in self.idxs if idx in data_1d_keys]
+        self.idxs_2d = [int(idx) for idx in self.idxs if idx in data_2d_keys]
 
     def update_plot_range(self):
         if self.ui.slice.isChecked():

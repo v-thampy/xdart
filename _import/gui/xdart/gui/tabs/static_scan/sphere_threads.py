@@ -6,7 +6,7 @@
 # Standard library imports
 import logging
 from queue import Queue
-from threading import Condition
+from threading import Condition, RLock
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import traceback
 import numpy as np
@@ -70,7 +70,7 @@ class integratorThread(Qt.QtCore.QThread):
 
     def __init__(self, sphere, arch, file_lock,
                  arches, arch_ids, data_1d, data_2d,
-                 parent=None):
+                 parent=None, data_lock=None):
         super().__init__(parent)
         self.sphere = sphere
         self.arch = arch
@@ -79,6 +79,9 @@ class integratorThread(Qt.QtCore.QThread):
         self.arch_ids = arch_ids
         self.data_1d = data_1d
         self.data_2d = data_2d
+        # Shared reentrant lock guarding data_1d / data_2d access.  Falls
+        # back to a private lock when constructed without one.
+        self.data_lock = data_lock if data_lock is not None else RLock()
         self.method = None
         self.lock = Condition()
         self.mg_1d_args = {}
@@ -100,7 +103,8 @@ class integratorThread(Qt.QtCore.QThread):
         """Integrates all arches 2d. Uses parallel workers when sphere.max_cores > 1."""
         if getattr(self.sphere, 'skip_2d', False):
             return
-        self.data_2d.clear()
+        with self.data_lock:
+            self.data_2d.clear()
         with self.sphere.sphere_lock:
             self.sphere.bai_2d = None
 
@@ -123,10 +127,11 @@ class integratorThread(Qt.QtCore.QThread):
                         arch = future.result()
                         self.sphere.arches[arch.idx] = arch
                         self.sphere._update_bai_2d(arch)
-                        self.data_2d[int(arch.idx)] = {
-                            'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
-                            'mask': arch.mask, 'int_2d': arch.int_2d, 'gi_2d': arch.gi_2d,
-                        }
+                        with self.data_lock:
+                            self.data_2d[int(arch.idx)] = {
+                                'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
+                                'mask': arch.mask, 'int_2d': arch.int_2d, 'gi_2d': arch.gi_2d,
+                            }
                         self.update.emit(arch.idx)
                     except Exception as e:
                         arch_idx = futures[future]
@@ -141,11 +146,12 @@ class integratorThread(Qt.QtCore.QThread):
                 arch.integrate_2d(**self.sphere.bai_2d_args)
                 self.sphere.arches[arch.idx] = arch
                 self.sphere._update_bai_2d(arch)
-                self.data_2d[int(arch.idx)] = {
-                    'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
-                    'mask': arch.mask, 'int_2d': arch.int_2d,
-                    'gi_2d': arch.gi_2d,
-                }
+                with self.data_lock:
+                    self.data_2d[int(arch.idx)] = {
+                        'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
+                        'mask': arch.mask, 'int_2d': arch.int_2d,
+                        'gi_2d': arch.gi_2d,
+                    }
                 self.update.emit(arch.idx)
 
         with self.file_lock:
@@ -154,7 +160,8 @@ class integratorThread(Qt.QtCore.QThread):
 
     def bai_1d_all(self):
         """Integrates all arches 1d. Uses parallel workers when sphere.max_cores > 1."""
-        self.data_1d.clear()
+        with self.data_lock:
+            self.data_1d.clear()
         with self.sphere.sphere_lock:
             self.sphere.bai_1d = None
 
@@ -177,7 +184,8 @@ class integratorThread(Qt.QtCore.QThread):
                         arch = future.result()
                         self.sphere.arches[arch.idx] = arch
                         self.sphere._update_bai_1d(arch)
-                        self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
+                        with self.data_lock:
+                            self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
                         self.update.emit(arch.idx)
                     except Exception as e:
                         arch_idx = futures[future]
@@ -192,7 +200,8 @@ class integratorThread(Qt.QtCore.QThread):
                 arch.integrate_1d(**self.sphere.bai_1d_args)
                 self.sphere.arches[arch.idx] = arch
                 self.sphere._update_bai_1d(arch)
-                self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
+                with self.data_lock:
+                    self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
                 self.update.emit(arch.idx)
 
         with self.file_lock:
@@ -213,12 +222,13 @@ class integratorThread(Qt.QtCore.QThread):
             self.sphere.arches[int(idx)].integrate_2d(**self.sphere.bai_2d_args)
             # arch.integrate_2d(**self.sphere.bai_2d_args)
             arch = self.sphere.arches[int(idx)]
-            self.data_2d[int(idx)] = {
-                'map_raw': arch.map_raw,
-                'bg_raw': arch.bg_raw,
-                'mask': arch.mask,
-                'int_2d': arch.int_2d,
-                'gi_2d': arch.gi_2d}
+            with self.data_lock:
+                self.data_2d[int(idx)] = {
+                    'map_raw': arch.map_raw,
+                    'bg_raw': arch.bg_raw,
+                    'mask': arch.mask,
+                    'int_2d': arch.int_2d,
+                    'gi_2d': arch.gi_2d}
             self.update.emit(idx)
 
     def bai_1d_SI(self):
@@ -232,7 +242,8 @@ class integratorThread(Qt.QtCore.QThread):
             # self.sphere.arches[arch].integrate_1d(**self.sphere.bai_1d_args)
             self.sphere.arches[int(idx)].integrate_1d(**self.sphere.bai_1d_args)
             arch = self.sphere.arches[int(idx)]
-            self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
+            with self.data_lock:
+                self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
             self.update.emit(arch.idx)
 
     def load(self):
@@ -252,13 +263,16 @@ class fileHandlerThread(Qt.QtCore.QThread):
     
     def __init__(self, sphere, arch, file_lock,
                  parent=None, arch_ids=[], arches=None,
-                 data_1d={}, data_2d={}):
+                 data_1d={}, data_2d={}, data_lock=None):
         """
         Parameters
         ----------
         file_lock : multiprocessing.Condition
         arch : xdart.modules.ewald.EwaldArch
         sphere : xdart.modules.ewald.EwaldSphere
+        data_lock : threading.RLock, optional
+            Shared lock guarding data_1d / data_2d; a private RLock is
+            created when not provided.
         """
         super().__init__(parent)
         self.sphere = sphere
@@ -267,6 +281,7 @@ class fileHandlerThread(Qt.QtCore.QThread):
         self.arches = arches
         self.data_1d = data_1d
         self.data_2d = data_2d
+        self.data_lock = data_lock if data_lock is not None else RLock()
         self.file_lock = file_lock
         self.queue = Queue()
         self.fname = sphere.data_file
@@ -327,24 +342,25 @@ class fileHandlerThread(Qt.QtCore.QThread):
                         arch = EwaldArch(idx=idx, static=True, gi=self.sphere.gi)
                         arch.load_from_nexus(frames_grp, load_2d=self.update_2d)
 
-                        self.data_1d[int(idx)] = arch.copy(include_2d=False)
-                        if self.update_2d:
-                            self.data_2d[int(idx)] = {
-                                'map_raw': arch.map_raw,
-                                'bg_raw': arch.bg_raw,
-                                'mask': arch.mask,
-                                'int_2d': arch.int_2d,
-                                'gi_2d': arch.gi_2d,
-                            }
+                        with self.data_lock:
+                            self.data_1d[int(idx)] = arch.copy(include_2d=False)
+                            if self.update_2d:
+                                self.data_2d[int(idx)] = {
+                                    'map_raw': arch.map_raw,
+                                    'bg_raw': arch.bg_raw,
+                                    'mask': arch.mask,
+                                    'int_2d': arch.int_2d,
+                                    'gi_2d': arch.gi_2d,
+                                }
 
-                            if idx in self.arches['add_idxs']:
-                                self.arches['sum_int_2d'] += self.data_2d[int(idx)]['int_2d']
-                                self.arches['sum_map_raw'] += (self.data_2d[int(idx)]['map_raw'] -
-                                                               self.data_2d[int(idx)]['bg_raw'])
-                            elif idx in self.arches['sub_idxs']:
-                                self.arches['sum_int_2d'] -= self.data_2d[int(idx)]['int_2d']
-                                self.arches['sum_map_raw'] -= (self.data_2d[int(idx)]['map_raw'] -
-                                                               self.data_2d[int(idx)]['bg_raw'])
+                                if idx in self.arches['add_idxs']:
+                                    self.arches['sum_int_2d'] += self.data_2d[int(idx)]['int_2d']
+                                    self.arches['sum_map_raw'] += (self.data_2d[int(idx)]['map_raw'] -
+                                                                   self.data_2d[int(idx)]['bg_raw'])
+                                elif idx in self.arches['sub_idxs']:
+                                    self.arches['sum_int_2d'] -= self.data_2d[int(idx)]['int_2d']
+                                    self.arches['sum_map_raw'] -= (self.data_2d[int(idx)]['map_raw'] -
+                                                                   self.data_2d[int(idx)]['bg_raw'])
 
                     except KeyError as e:
                         logger.debug("Data missing for arch %s during aggregation: %s", idx, e)
