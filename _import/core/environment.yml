@@ -1,29 +1,39 @@
 name: ssrl_xrd_tools
 channels:
   - conda-forge
-  - defaults
 dependencies:
   - python=3.12
+  # Core scientific stack
   - numpy
   - scipy
   - h5py
   - matplotlib
+  - natsort
+  - joblib
+  # XRD / crystallography
+  - pyFAI
+  - fabio
+  - silx
+  - xrayutilities
+  - pymatgen
+  # Fitting
+  - lmfit
+  - emcee
+  # Jupyter + widgets
   - jupyterlab
   - ipykernel
   - ipywidgets
-  - natsort
-  - xrayutilities
-  - fabio
-  - silx
-  - pyFAI
-  - joblib
-  - lmfit
+  # Plotting / dashboards
   - panel
   - holoviews
   - bokeh
   - napari
+  # Dev
   - pytest
   - pip
   - pip:
+    # Pure-Python extras (not on conda-forge, or fresher on PyPI)
     - pyevtk
-    - -e .
+    - plotly
+    - anywidget
+    - jupyter_bokeh

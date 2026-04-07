@@ -43,6 +43,10 @@ dependencies = [
     "panel",
     "holoviews",
     "bokeh",
+    "jupyter_bokeh",
+    "pymatgen",
+    "plotly",
+    "anywidget",
 ]
 
 [project.optional-dependencies]

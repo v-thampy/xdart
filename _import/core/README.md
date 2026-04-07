@@ -25,45 +25,83 @@ The library handles the complete workflow from raw detector images through calib
 
 ## Installation
 
-### Standard (PyPI)
+Most users should install [**xdart**](https://github.com/v-thampy/xdart) — the desktop GUI — which pulls `ssrl_xrd_tools` in as a dependency automatically. A single installer script handles everything: it creates a dedicated conda environment, installs the heavy scientific stack from conda-forge (`pyFAI`, `h5py`, `pymatgen`, Qt, HDF5 libraries), and installs both `xdart` and `ssrl_xrd_tools` on top. This conda-for-native + pip-for-Python split avoids the binary mismatches that can occur when mixing sources for native-backed packages.
+
+### One-line install (recommended)
+
+No clone required — just run:
 
 ```bash
-pip install ssrl-xrd-tools
+curl -sSL https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.sh | bash
 ```
 
-### With Optional GUI Dependencies
-
-To use the optional visualization and GUI components:
+This creates a new conda environment called `xrd` containing Python 3.12, the full scientific stack, `xdart`, and `ssrl_xrd_tools`. After it finishes:
 
 ```bash
-pip install ssrl-xrd-tools[gui]
+conda activate xrd
+xdart          # launch the GUI
 ```
 
-This installs [panel](https://panel.holoviz.org/), [holoviews](https://holoviews.org/), and [napari](https://napari.org/) for interactive data exploration.
+> **Why `xrd`?** The script's default conda environment name is `xrd` — a short, memorable alias for "X-Ray Diffraction". This is the environment you'll activate whenever you want to use `ssrl_xrd_tools` or `xdart`. If you prefer a different name (e.g. to keep multiple versions side-by-side), pass `-n <name>`:
+>
+> ```bash
+> curl -sSL https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.sh | bash -s -- -n myenv
+> ```
 
-### With Bluesky/Tiled Support
+### If you don't have conda/mamba
 
-To access data from Bluesky-collected runs:
+Pass `--bootstrap` to have the script download and install [miniforge](https://github.com/conda-forge/miniforge) automatically into `~/miniforge3`:
 
 ```bash
-pip install ssrl-xrd-tools[tiled]
+curl -sSL https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.sh | bash -s -- --bootstrap
 ```
 
-### Development Setup
+### Installer options
 
-Clone the repository and install in editable mode with development dependencies:
+```
+-n, --name NAME       Conda environment name (default: xrd)
+-p, --python VERSION  Python version (default: 3.12)
+--bootstrap           Install miniforge to ~/miniforge3 if conda is missing
+--branch BRANCH       Git branch to install from (default: dev)
+--force               Replace an existing env of the same name
+--no-xdart            Install ssrl_xrd_tools only, skip xdart
+--dev                 Editable install (requires a local clone — see below)
+```
+
+### Updating
+
+Re-run the installer with `--force`:
 
 ```bash
-git clone https://github.com/v-thampy/ssrl_xrd_tools.git
+curl -sSL https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.sh | bash -s -- --force
+```
+
+### Development setup
+
+Developers who want an editable install with immediate reloads should clone the repos and run the installer locally with `--dev`:
+
+```bash
+git clone -b dev https://github.com/v-thampy/ssrl_xrd_tools.git
+git clone -b dev https://github.com/v-thampy/xdart.git         # optional, auto-detected if sibling
 cd ssrl_xrd_tools
-pip install -e ".[dev]"
+./scripts/install.sh --dev
 ```
 
-### Conda (Coming Soon)
+The script will auto-detect a sibling `xdart` clone and install both in editable mode.
+
+### Release branch
+
+The installer currently points at the `dev` branch (both repos) while the APIs stabilize. Once the packages are more mature, the default will switch to `main`. To pin to a specific branch or tag at any time, pass `--branch <name>`.
+
+### Conda-forge (coming eventually)
+
+A conda-forge recipe is planned once the API stabilizes, which will make installation as simple as:
 
 ```bash
-conda install -c conda-forge ssrl-xrd-tools
+mamba create -n xrd -c conda-forge ssrl-xrd-tools xdart
 ```
+
+Until then, the installer script above is the recommended path.
 
 ## Quick Start
 
