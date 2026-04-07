@@ -856,25 +856,60 @@ class H5Viewer(QWidget):
                         else:
                             try:
                                 self.arches['sum_int_2d'] = self.arches['sum_int_2d'] + _d
-                            except (ValueError, AttributeError):
+                            except (ValueError, AttributeError, TypeError):
                                 self.arches['sum_int_2d'] = _d
-                        self.arches['sum_map_raw'] += (self.data_2d[int(idx)]['map_raw'] -
-                                                       self.data_2d[int(idx)]['bg_raw'])
+                        _raw = self._raw_minus_bg(self.data_2d[int(idx)])
+                        self.arches['sum_map_raw'] = self._safe_accumulate(
+                            self.arches['sum_map_raw'], _raw, op='add')
                     elif idx in self.arches['sub_idxs']:
                         _d = self.data_2d[int(idx)]['int_2d']
                         if self.arches['sum_int_2d'] is not None:
                             try:
                                 self.arches['sum_int_2d'] = self.arches['sum_int_2d'] - _d
-                            except (ValueError, AttributeError):
+                            except (ValueError, AttributeError, TypeError):
                                 self.arches['sum_int_2d'] = _d
-                        self.arches['sum_map_raw'] -= (self.data_2d[int(idx)]['map_raw'] -
-                                                       self.data_2d[int(idx)]['bg_raw'])
+                        _raw = self._raw_minus_bg(self.data_2d[int(idx)])
+                        self.arches['sum_map_raw'] = self._safe_accumulate(
+                            self.arches['sum_map_raw'], _raw, op='sub')
 
             except KeyError:
                 pass
 
     # Removed legacy load_arch_data — all reads now go through
     # EwaldArch.load_from_nexus via load_arches_data above.
+
+    @staticmethod
+    def _raw_minus_bg(arch_2d):
+        """Return ``map_raw - bg_raw``, tolerating either being ``None``."""
+        raw = arch_2d.get('map_raw')
+        if raw is None:
+            return None
+        bg = arch_2d.get('bg_raw')
+        if bg is None:
+            return raw
+        try:
+            return raw - bg
+        except (ValueError, AttributeError, TypeError):
+            return raw
+
+    @staticmethod
+    def _safe_accumulate(accum, value, op='add'):
+        """Add or subtract ``value`` into ``accum``, tolerating ``None``.
+
+        Some arches (e.g. Eiger master frames with ``skip_map_raw``) do not
+        store a raw 2D map in the HDF5, so ``data_2d[idx]['map_raw']`` may
+        be ``None``. We treat ``None`` as "nothing to contribute" rather
+        than letting a ``TypeError`` propagate out of the overplot code.
+        """
+        if value is None:
+            return accum
+        if accum is None or np.isscalar(accum):
+            # First real contribution — seed the accumulator.
+            return value if op == 'add' else -value
+        try:
+            return accum + value if op == 'add' else accum - value
+        except (ValueError, AttributeError, TypeError):
+            return value if op == 'add' else -value
 
     def get_arches_sum(self, idxs, idxs_memory):
         new_idxs = set([int(idx) for idx in idxs])
@@ -898,26 +933,26 @@ class H5Viewer(QWidget):
 
         for k in add_from_data:
             _d = self.data_2d[int(k)]['int_2d']
+            _raw = self.data_2d[int(k)]['map_raw']
             if self.arches['sum_int_2d'] is None:
                 self.arches['sum_int_2d'] = _d
-                self.arches['sum_map_raw'] = self.data_2d[int(k)]['map_raw']
             else:
                 try:
                     self.arches['sum_int_2d'] = self.arches['sum_int_2d'] + _d
-                    self.arches['sum_map_raw'] += self.data_2d[int(k)]['map_raw']
-                except (ValueError, AttributeError):
+                except (ValueError, AttributeError, TypeError):
                     self.arches['sum_int_2d'] = _d
-                    self.arches['sum_map_raw'] = self.data_2d[int(k)]['map_raw']
+            self.arches['sum_map_raw'] = self._safe_accumulate(
+                self.arches['sum_map_raw'], _raw, op='add')
 
         for k in sub_from_data:
             _d = self.data_2d[int(k)]['int_2d']
+            _raw = self.data_2d[int(k)]['map_raw']
             if self.arches['sum_int_2d'] is None:
                 self.arches['sum_int_2d'] = _d
-                self.arches['sum_map_raw'] = self.data_2d[int(k)]['map_raw']
             else:
                 try:
                     self.arches['sum_int_2d'] = self.arches['sum_int_2d'] - _d
-                    self.arches['sum_map_raw'] -= self.data_2d[int(k)]['map_raw']
-                except (ValueError, AttributeError):
+                except (ValueError, AttributeError, TypeError):
                     self.arches['sum_int_2d'] = _d
-                    self.arches['sum_map_raw'] = self.data_2d[int(k)]['map_raw']
+            self.arches['sum_map_raw'] = self._safe_accumulate(
+                self.arches['sum_map_raw'], _raw, op='sub')
