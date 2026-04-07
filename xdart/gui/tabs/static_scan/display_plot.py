@@ -154,17 +154,35 @@ class DisplayPlotMixin:
     def _on_plotMethod_changed(self):
         """Handle plotMethod combo box changes.
 
-        Switching away from Overlay/Waterfall requires a full
-        update_plot() so that plot_data is rebuilt from the current
-        selection instead of carrying forward accumulated curves.
+        Emits ``sigPlotMethodChanged`` so external widgets (e.g. the
+        H5Viewer's data list) can adapt their selection mode.
+
+        Switching to Single mode resets accumulated plot data so the
+        plot rebuilds from the current selection. Overlay/Waterfall and
+        Sum/Average all rely on the user's full multi-selection in
+        listData and route through update_plot() so the active set is
+        re-aggregated each time.
         """
         new_method = self.ui.plotMethod.currentText()
-        if new_method not in ('Overlay', 'Waterfall'):
+        try:
+            self.sigPlotMethodChanged.emit(new_method)
+        except Exception:
+            logger.debug("sigPlotMethodChanged emit failed", exc_info=True)
+
+        if new_method == 'Single':
             # Reset accumulated data — rebuild from current selection
             self.plot_data = [np.array([]), np.array([])]
             self.arch_names = []
             self.update_plot()
+        elif new_method in ('Sum', 'Average'):
+            # No accumulation needed: aggregation happens inside
+            # update_1d_view() based on the current selection.
+            self.plot_data = [np.array([]), np.array([])]
+            self.arch_names = []
+            self.update_plot()
         else:
+            # Overlay / Waterfall: keep existing accumulated curves and
+            # just refresh the rendered view.
             self.update_plot_view()
 
     # ── 1D plot view rendering ────────────────────────────────────

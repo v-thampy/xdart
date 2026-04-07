@@ -178,6 +178,27 @@ class H5Viewer(QWidget):
         self.ui.listScans.itemSelectionChanged.connect(self._scans_selection_changed)
         self.ui.listScans.installEventFilter(self)
         self.ui.listData.itemSelectionChanged.connect(self.data_changed)
+        # Default to ExtendedSelection (Single mode); accumulating plot
+        # methods (Overlay/Waterfall/Sum/Average) switch to MultiSelection
+        # via set_data_selection_mode().
+        self.ui.listData.setSelectionMode(
+            QtWidgets.QAbstractItemView.ExtendedSelection)
+
+    def set_data_selection_mode(self, plot_method):
+        """Switch listData selection mode to match the active plot method.
+
+        Accumulating modes (Overlay, Waterfall, Sum, Average) use
+        MultiSelection so single clicks toggle items in/out of the
+        selection without requiring shift/ctrl. Single mode falls back
+        to ExtendedSelection for the standard click-to-replace behavior
+        with optional shift/ctrl multi-select.
+        """
+        if plot_method in ('Overlay', 'Waterfall', 'Sum', 'Average'):
+            mode = QtWidgets.QAbstractItemView.MultiSelection
+        else:
+            mode = QtWidgets.QAbstractItemView.ExtendedSelection
+        if self.ui.listData.selectionMode() != mode:
+            self.ui.listData.setSelectionMode(mode)
         self.ui.show_all.clicked.connect(self.show_all)
         self.actionOpenFolder.triggered.connect(self.open_folder)
         self.actionSaveDataAs.triggered.connect(self.save_data_as)

@@ -66,6 +66,12 @@ pg.setConfigOption('foreground', 'k')
 
 
 class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidget):
+    # Emitted whenever the user changes the plot method combo
+    # (Single / Overlay / Waterfall / Sum / Average). Listeners (e.g. the
+    # H5Viewer) use this to switch listData selection mode so accumulating
+    # plot methods don't require shift/ctrl multi-select.
+    sigPlotMethodChanged = Qt.QtCore.Signal(str)
+
     """Widget for displaying 2D image data and 1D plots from EwaldSphere
     objects.
 
