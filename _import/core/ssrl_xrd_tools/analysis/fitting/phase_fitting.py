@@ -109,7 +109,7 @@ def _q_from_hkl(hkl: np.ndarray, G_star: np.ndarray) -> np.ndarray:
 # Peak profile helpers
 # ---------------------------------------------------------------------------
 
-def _pseudo_voigt(x: np.ndarray, center: float, amplitude: float,
+def _pseudo_voigt(x: np.ndarray, center: float, amplitude: float, #TODO - this should probably use the lmfit Pseudovoigt
                   sigma: float, fraction: float) -> np.ndarray:
     """Evaluate a pseudo-Voigt profile (area-normalised Gaussian + Lorentzian).
 
@@ -229,7 +229,7 @@ class MultiPhaseResult:
 # Main fitter
 # ---------------------------------------------------------------------------
 
-class PhaseFitter:
+class PhaseFitter: #TODO thes SNIP background should be optional
     """
     Multi-phase 1D XRD pattern fitter.
 

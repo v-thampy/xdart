@@ -302,7 +302,7 @@ def sin2psi_regression(
 
     For a full stress calculation, Young's modulus and Poisson's ratio for
     the specific (hkl) are needed — this function returns the geometric
-    regression only.
+    regression only. #TODO add option to input this
     """
     if len(peak_fits) < 3:
         raise ValueError(

@@ -107,7 +107,7 @@ def _get_background_model(
     if bg.startswith("chebyshev") or bg.startswith("cheb"):
         m = re.search(r'\d+', bg)
         degree = int(m.group()) if m else 3
-        return PolynomialModel(degree, prefix=prefix)
+        return PolynomialModel(degree, prefix=prefix) #TODO - this should be Chebyshev  
     if bg.startswith("poly"):
         m = re.search(r'\d+', bg)
         degree = int(m.group()) if m else 2
@@ -168,7 +168,7 @@ class PeakFitResult1D:
 # Main 1D fitting function
 # ---------------------------------------------------------------------------
 
-def fit_peaks(
+def fit_peaks( #TODO - this should include ability to fix certain parameters
     x: np.ndarray,
     y: np.ndarray,
     positions: list[float] | np.ndarray | None = None,
