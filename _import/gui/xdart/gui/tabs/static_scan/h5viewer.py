@@ -38,6 +38,71 @@ QFileDialog = QtWidgets.QFileDialog
 QItemSelectionModel = QtCore.QItemSelectionModel
 
 
+class _AccumulatingClickFilter(QtCore.QObject):
+    """Toggle items on plain left-clicks when an accumulating plot
+    mode is active.
+
+    listData stays in ``ExtendedSelection`` at all times so arrow-key
+    navigation, shift-range, and ctrl-toggle behave normally. When the
+    user is in an accumulating plot method
+    (Overlay/Waterfall/Sum/Average), a plain left-click on an item in
+    the viewport is consumed by this filter and translated into a
+    selection toggle on that single item — leaving the rest of the
+    selection untouched. Modified clicks (shift/ctrl already held) and
+    Single mode pass straight through to the default handler.
+    """
+
+    def __init__(self, listwidget, get_mode):
+        super().__init__(listwidget)
+        self._lw = listwidget
+        self._get_mode = get_mode
+
+    def eventFilter(self, obj, event):
+        et = event.type()
+        if et not in (QtCore.QEvent.MouseButtonPress,
+                      QtCore.QEvent.MouseButtonRelease,
+                      QtCore.QEvent.MouseButtonDblClick):
+            return False
+        try:
+            btn = event.button()
+            mods = event.modifiers()
+        except AttributeError:
+            return False
+        if btn != QtCore.Qt.LeftButton:
+            return False
+        if mods & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
+            return False
+        try:
+            mode = self._get_mode()
+        except Exception:
+            return False
+        if mode not in ('Overlay', 'Waterfall', 'Sum', 'Average'):
+            return False
+
+        # Only act on the press; swallow the release/dblclick so the
+        # default handler can't see them and clear the selection.
+        if et != QtCore.QEvent.MouseButtonPress:
+            return True
+
+        try:
+            pos = event.position().toPoint()
+        except AttributeError:
+            pos = event.pos()
+        item = self._lw.itemAt(pos)
+        if item is None:
+            return True
+        # Toggle the clicked item; preserve the existing multi-selection.
+        item.setSelected(not item.isSelected())
+        self._lw.setCurrentItem(item, QItemSelectionModel.NoUpdate)
+        # Re-emit itemClicked so downstream listeners (e.g.
+        # disable_auto_last) still react.
+        try:
+            self._lw.itemClicked.emit(item)
+        except Exception:
+            pass
+        return True
+
+
 class H5Viewer(QWidget):
     """Widget for displaying the contents of an EwaldSphere object and
     a basic file explorer. Also holds menus for more general tasks like
@@ -178,27 +243,47 @@ class H5Viewer(QWidget):
         self.ui.listScans.itemSelectionChanged.connect(self._scans_selection_changed)
         self.ui.listScans.installEventFilter(self)
         self.ui.listData.itemSelectionChanged.connect(self.data_changed)
-        # Default to ExtendedSelection (Single mode); accumulating plot
-        # methods (Overlay/Waterfall/Sum/Average) switch to MultiSelection
-        # via set_data_selection_mode().
+        # Use ExtendedSelection always so arrow keys, shift-range, and
+        # ctrl-toggle work normally. Accumulating plot methods get
+        # single-click-to-toggle behavior via _AccumulatingClickFilter
+        # installed below.
         self.ui.listData.setSelectionMode(
             QtWidgets.QAbstractItemView.ExtendedSelection)
+        self._plot_method = 'Single'
+        self._accum_click_filter = _AccumulatingClickFilter(
+            self.ui.listData, lambda: self._plot_method)
+        self.ui.listData.viewport().installEventFilter(self._accum_click_filter)
 
     def set_data_selection_mode(self, plot_method):
-        """Switch listData selection mode to match the active plot method.
+        """Update internal plot-method state and reconcile listData
+        selection.
 
-        Accumulating modes (Overlay, Waterfall, Sum, Average) use
-        MultiSelection so single clicks toggle items in/out of the
-        selection without requiring shift/ctrl. Single mode falls back
-        to ExtendedSelection for the standard click-to-replace behavior
-        with optional shift/ctrl multi-select.
+        listData stays in ExtendedSelection mode at all times. When the
+        user enters ``Single`` mode from a multi-selection state, this
+        method collapses the selection down to the most recently
+        focused item so the next click behaves naturally. The click
+        filter consults ``self._plot_method`` to decide whether to
+        inject Ctrl on plain clicks.
         """
-        if plot_method in ('Overlay', 'Waterfall', 'Sum', 'Average'):
-            mode = QtWidgets.QAbstractItemView.MultiSelection
-        else:
-            mode = QtWidgets.QAbstractItemView.ExtendedSelection
-        if self.ui.listData.selectionMode() != mode:
-            self.ui.listData.setSelectionMode(mode)
+        prev_method = self._plot_method
+        self._plot_method = plot_method
+        if (plot_method == 'Single'
+                and prev_method != 'Single'):
+            lw = self.ui.listData
+            current = lw.currentItem()
+            selected = lw.selectedItems()
+            if len(selected) > 1:
+                lw.blockSignals(True)
+                try:
+                    lw.clearSelection()
+                    keep = current if current in selected else selected[-1]
+                    if keep is not None:
+                        keep.setSelected(True)
+                        lw.setCurrentItem(keep)
+                finally:
+                    lw.blockSignals(False)
+                # Re-emit so arch_ids and downstream views update.
+                self.data_changed()
         self.ui.show_all.clicked.connect(self.show_all)
         self.actionOpenFolder.triggered.connect(self.open_folder)
         self.actionSaveDataAs.triggered.connect(self.save_data_as)
