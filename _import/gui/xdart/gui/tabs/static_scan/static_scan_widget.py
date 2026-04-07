@@ -205,6 +205,14 @@ class staticWidget(QWidget):
         self.displayframe.ui.update2D.stateChanged.connect(self.update_h5_options)
         self.h5viewer.actionSaveImage.triggered.connect(self.displayframe.save_image)
         self.h5viewer.actionSaveArray.triggered.connect(self.displayframe.save_1D)
+        # Plot method changes drive the H5 data list selection mode so
+        # accumulating modes (Overlay/Waterfall/Sum/Average) auto-add
+        # clicked points without requiring shift/ctrl.
+        self.displayframe.sigPlotMethodChanged.connect(
+            self.h5viewer.set_data_selection_mode)
+        # Initialize once with the current plot method.
+        self.h5viewer.set_data_selection_mode(
+            self.displayframe.ui.plotMethod.currentText())
 
         # Integrator signals
         self.integratorTree.integrator_thread.started.connect(self.thread_state_changed)
