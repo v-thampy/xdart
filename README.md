@@ -5,6 +5,24 @@ X-ray Data Analysis in Real Time
 
 A single installer script handles everything: it creates a dedicated conda environment, installs the heavy scientific stack from conda-forge (`pyFAI`, `h5py`, `pymatgen`, Qt, HDF5 libraries), and installs both `xdart` and its computational core [`ssrl_xrd_tools`](https://github.com/v-thampy/ssrl_xrd_tools) on top. This conda-for-native + pip-for-Python split avoids the binary mismatches that can occur when mixing sources for native-backed packages.
 
+### Prerequisites: Git (Windows)
+
+The installer script and the development workflow both rely on `git` (and on Windows, on the bash shell that ships with it). macOS and most Linux distributions already include `git`; Windows users need to install it once.
+
+1. Download **Git for Windows** from <https://git-scm.com/download/win>. The installer is signed and bundles `git`, `git bash`, and the OpenSSL/curl tools the install script needs.
+2. Run the installer and accept the defaults. The two settings worth confirming are:
+   - *"Git from the command line and also from 3rd-party software"* — adds `git` to your `PATH`.
+   - *"Use bundled OpenSSH"* and *"Use the OpenSSL library"* — needed so `curl` and `git clone` work over HTTPS.
+3. After install, open **Git Bash** from the Start menu (not `cmd.exe` or PowerShell). All `curl … | bash` commands below should be run from this shell.
+4. Verify the install:
+
+   ```bash
+   git --version
+   curl --version
+   ```
+
+If you prefer a package manager, `winget install --id Git.Git -e` or `choco install git` work equivalently — just make sure you launch **Git Bash** afterward so the `curl … | bash` one-liners work.
+
 ### One-line install (recommended)
 
 No clone required — just run:
