@@ -58,10 +58,13 @@ class _AccumulatingClickFilter(QtCore.QObject):
         self._get_mode = get_mode
 
     def eventFilter(self, obj, event):
-        et = event.type()
-        if et not in (QtCore.QEvent.MouseButtonPress,
-                      QtCore.QEvent.MouseButtonRelease,
-                      QtCore.QEvent.MouseButtonDblClick):
+        # Only intercept the initial press. Release and double-click
+        # propagate normally so the default handler keeps its internal
+        # state consistent. Any modifier (Ctrl/Shift/Meta/Alt) — and
+        # any non-left button — falls through unconditionally so
+        # standard ExtendedSelection behaviors stay intact in every
+        # mode.
+        if event.type() != QtCore.QEvent.MouseButtonPress:
             return False
         try:
             btn = event.button()
@@ -70,7 +73,7 @@ class _AccumulatingClickFilter(QtCore.QObject):
             return False
         if btn != QtCore.Qt.LeftButton:
             return False
-        if mods & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier):
+        if mods != QtCore.Qt.NoModifier:
             return False
         try:
             mode = self._get_mode()
@@ -79,21 +82,19 @@ class _AccumulatingClickFilter(QtCore.QObject):
         if mode not in ('Overlay', 'Waterfall', 'Sum', 'Average'):
             return False
 
-        # Only act on the press; swallow the release/dblclick so the
-        # default handler can't see them and clear the selection.
-        if et != QtCore.QEvent.MouseButtonPress:
-            return True
-
         try:
             pos = event.position().toPoint()
         except AttributeError:
             pos = event.pos()
         item = self._lw.itemAt(pos)
         if item is None:
-            return True
-        # Toggle the clicked item; preserve the existing multi-selection.
-        item.setSelected(not item.isSelected())
-        self._lw.setCurrentItem(item, QItemSelectionModel.NoUpdate)
+            return False
+        # Toggle the clicked item using the selection model — this is
+        # the canonical Qt path and reliably emits
+        # itemSelectionChanged so data_changed updates downstream.
+        idx = self._lw.indexFromItem(item)
+        self._lw.selectionModel().select(idx, QItemSelectionModel.Toggle)
+        self._lw.setCurrentIndex(idx)
         # Re-emit itemClicked so downstream listeners (e.g.
         # disable_auto_last) still react.
         try:
