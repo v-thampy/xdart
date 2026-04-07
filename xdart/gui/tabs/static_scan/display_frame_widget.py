@@ -703,10 +703,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
             self.update_plot_view()
 
-        if self.overall and len(self.arch_ids) > 1:
+        # Always aggregate from per-arch data_2d. The legacy
+        # `self.overall → get_sphere_int_2d()` shortcut returned a 1×1
+        # zero array when `sphere.bai_2d` wasn't populated (common with
+        # NeXus files that store per-arch results only), which made the
+        # 2D pane go blank as soon as all arches were selected.
+        intensity, xdata, ydata = self.get_arches_int_2d()
+        if intensity is None and self.overall and len(self.arch_ids) > 1:
+            # Fall back to the precomputed sphere total if available.
             intensity, xdata, ydata = self.get_sphere_int_2d()
-        else:
-            intensity, xdata, ydata = self.get_arches_int_2d()
 
         if intensity is None:
             return
