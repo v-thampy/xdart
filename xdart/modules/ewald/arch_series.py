@@ -34,8 +34,12 @@ class ArchSeries():
         file_lock: Thread safe lock.
         index: List of all arch id numbers.
     """
-    def __init__(self, data_file, file_lock, arches=[],
+    def __init__(self, data_file, file_lock, arches=None,
                  static=False, gi=False, h5file=None):
+        # None-sentinel pattern: avoid the shared-mutable-default Python
+        # footgun (arches=[] in the signature would be shared across calls).
+        if arches is None:
+            arches = []
         self.data_file = data_file
         self.file_lock = file_lock
         self.index = []

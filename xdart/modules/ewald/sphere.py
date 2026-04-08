@@ -31,14 +31,28 @@ class EwaldSphere:
         └── @type = "EwaldSphere"
     """
 
-    def __init__(self, name='scan0', arches=[], data_file=None,
-                 scan_data=pd.DataFrame(), mg_args={'wavelength': 1e-10},
-                 bai_1d_args={}, bai_2d_args={},
+    def __init__(self, name='scan0', arches=None, data_file=None,
+                 scan_data=None, mg_args=None,
+                 bai_1d_args=None, bai_2d_args=None,
                  static=False, gi=False, th_mtr='th', series_average=False,
                  overall_raw=0, single_img=False,
                  global_mask=None
                  ):
         super().__init__()
+        # None-sentinel pattern: mutable defaults (lists, dicts, DataFrames)
+        # in function signatures are shared across all calls that omit them,
+        # so any mutation leaks between instances. Resolve them here instead.
+        if arches is None:
+            arches = []
+        if scan_data is None:
+            scan_data = pd.DataFrame()
+        if mg_args is None:
+            mg_args = {'wavelength': 1e-10}
+        if bai_1d_args is None:
+            bai_1d_args = {}
+        if bai_2d_args is None:
+            bai_2d_args = {}
+
         self.file_lock = Condition()
         if name is None:
             self.name = os.path.split(data_file)[-1].split('.')[0]
