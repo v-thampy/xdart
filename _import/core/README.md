@@ -6,7 +6,7 @@ A Python library for processing synchrotron X-ray diffraction data, providing a 
 
 `ssrl_xrd_tools` is a standalone Python library developed at SSRL (SLAC National Accelerator Laboratory) for comprehensive X-ray diffraction (XRD) data processing. It serves as the computational core for the [xdart](https://github.com/v-thampy/xdart) interactive GUI but is equally suited for scripting, Jupyter notebooks, and automated batch pipelines at beamlines or in the lab.
 
-The library handles the complete workflow from raw detector images through calibration, integration, unit conversion, and advanced analysis including peak fitting, phase identification, texture analysis, and strain calculation.
+The library handles the complete workflow from raw detector images through calibration, integration, unit conversion, and advanced analysis including peak fitting, multi-phase pattern fitting, and sin²(ψ) strain analysis.
 
 ## Features
 
@@ -16,12 +16,13 @@ The library handles the complete workflow from raw detector images through calib
 - **Reciprocal Space Mapping (RSM)** — Generate 3D reciprocal space volumes with HKL gridding
 - **NeXus/HDF5 I/O** — Standards-compliant data storage and retrieval; full NumPy/pandas object serialization
 - **SPEC File Parsing** — Extract metadata, scan commands, and counter data from SPEC files
-- **Peak Fitting & Analysis** — lmfit-based peak models with background subtraction and residual analysis
-- **Phase Identification** — Automatic phase matching against structure databases
-- **Texture Analysis** — Pole figures, orientation distribution functions (ODF)
-- **Strain Analysis** — sin²χ method for stress/strain calculation from d-spacing maps
+- **Peak Fitting** — lmfit-based single-peak and multi-peak fitting with selectable backgrounds (linear, constant, Chebyshev, polynomial, SNIP)
+- **Phase Pattern Fitting** — Multi-phase pseudo-Voigt fitting with pymatgen-derived peak positions and template intensities (`PhaseFitter`)
+- **Strain Analysis** — sin²(ψ) method for biaxial stress/strain calculation, with optional (E, ν) inputs for direct stress output
 - **Batch Processing** — Directory watching and automated pipeline execution
 - **Bluesky/Tiled Integration** — Access data from Bluesky-collected runs via Tiled
+
+> **Roadmap (not yet implemented):** texture analysis (pole figures, ODF), Rietveld/LeBail refinement, automated phase matching against structure databases, flat-field / air-scatter / polarization correction modules. The corresponding `analysis/texture.py`, `analysis/refinement.py`, and `corrections/` entries are placeholders reserved for these features.
 
 ## Installation
 
@@ -250,17 +251,18 @@ Reciprocal space mapping for crystallographic analysis:
 
 Advanced data analysis and characterization:
 
-- **Fitting** (`fitting`) — lmfit-based peak fitting, background models, residual analysis
-- **Phase Identification** (`phase`) — Phase matching, CIF database loading, structure factor calculation
-- **Texture Analysis** (`texture`) — Pole figure generation, ODF calculation, texture strength metrics
-- **Strain Analysis** (`strain`) — sin²χ method for biaxial/triaxial stress calculation; d-spacing mapping
-- **Refinement** (`refinement`) — Stubs for future integration with GSAS-II, FullProf
+- **Fitting** (`fitting`) — lmfit-based peak fitting (`fit_peaks`), multi-phase pattern fitting (`PhaseFitter`), custom models including a Chebyshev background, and the `background` submodule (SNIP etc.)
+- **Phase Models** (`phase`) — `PhaseModel` wrapping pymatgen structures, peak position / template-intensity generation from CIF, used by `PhaseFitter`
+- **Strain Analysis** (`strain`) — sin²(ψ) method: χ-sector extraction, per-sector peak fitting, linear regression; optional `(E, ν)` for stress output
+- **Texture Analysis** (`texture`) — *placeholder* — planned pole figures and ODF
+- **Refinement** (`refinement`) — *placeholder* — planned GSAS-II / FullProf / lmfit-Rietveld backends
 
-### GUI (Optional)
+### GUI
 
-Interactive visualization and data exploration (requires `gui` install):
-
-- `xdart` — Standalone desktop application (see [xdart repository](https://github.com/v-thampy/xdart))
+`ssrl_xrd_tools` is a headless library and does not ship its own GUI. The
+primary graphical front end is [**xdart**](https://github.com/v-thampy/xdart),
+a standalone PySide6 desktop app that imports `ssrl_xrd_tools` as a
+dependency.
 
 ## API Examples
 
@@ -334,15 +336,21 @@ for peak in peaks:
     print(f"Center: {peak['center']:.3f}, FWHM: {peak['fwhm']:.3f}")
 ```
 
-### Phase Matching
+### Multi-Phase Pattern Fitting
 
 ```python
-from ssrl_xrd_tools.analysis.phase import match_phases
+from ssrl_xrd_tools.analysis.phase import PhaseModel
+from ssrl_xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
 
-phases = match_phases(
-    d_spacing_list=d_vals,
-    database="ICSD"
-)
+# Build a phase from a CIF and compute its peaks
+phase = PhaseModel.from_cif("Fe.cif", name="alpha-Fe")
+phase.calculate_peaks(q_range=(1.0, 7.0))
+
+# Fit a measured 1D pattern with one or more phases
+fitter = PhaseFitter(q, intensity, background='snip')
+fitter.add_phase(phase)
+params = fitter.build_params()
+result = fitter.fit(params)
 ```
 
 ## Dependencies
@@ -360,15 +368,18 @@ phases = match_phases(
 - `natsort` — Human-friendly file sorting
 - `lmfit` — Nonlinear least-squares fitting and peak modeling
 
-### Optional
+### Optional extras
 
-- **GUI** (`[gui]`) — `panel`, `holoviews`, `bokeh`, `napari`
+- **Napari** (`[napari]`) — `napari` viewer integration for 2D/3D image browsing
 - **Tiled** (`[tiled]`) — `tiled[client]` for Bluesky data access
-- **Development** (`[dev]`) — `jupyterlab`, `matplotlib`, `pytest`, `ipykernel`, `ipywidgets`
+- **VTK** (`[vtk]`) — `pyevtk` for exporting reciprocal-space volumes to VTK
+- **Development** (`[dev]`) — `pytest`, `build`, `twine`
+
+Install with `pip install 'ssrl-xrd-tools[tiled,vtk]'` or via the installer script.
 
 ## Python Version
 
-Requires **Python >= 3.12**
+Requires **Python ≥ 3.10**.
 
 ## Contributing
 
