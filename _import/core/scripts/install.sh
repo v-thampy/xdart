@@ -36,7 +36,9 @@ SSRL_REPO="ssrl_xrd_tools"
 XDART_REPO="xdart"
 DEFAULT_BRANCH="dev"
 
-ENV_NAME="xrd"
+DEFAULT_ENV_NAME="xrd"
+ENV_NAME=""
+ENV_NAME_EXPLICIT=0
 PYTHON_VERSION="3.12"
 DEV_MODE=0
 FORCE=0
@@ -69,12 +71,13 @@ print_help() {
 # ----- arg parsing ---------------------------------------------------------
 if [[ $# -gt 0 && "$1" != -* ]]; then
     ENV_NAME="$1"
+    ENV_NAME_EXPLICIT=1
     shift
 fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -n|--name)       ENV_NAME="$2"; shift 2 ;;
+        -n|--name)       ENV_NAME="$2"; ENV_NAME_EXPLICIT=1; shift 2 ;;
         -p|--python)     PYTHON_VERSION="$2"; shift 2 ;;
         --dev)           DEV_MODE=1; shift ;;
         --with-xdart)    WITH_XDART="$2"; shift 2 ;;
@@ -91,6 +94,23 @@ if [[ ${DEV_MODE} -eq 1 && ${LOCAL_MODE} -eq 0 ]]; then
     echo "ERROR: --dev requires running from inside a local ssrl_xrd_tools clone." >&2
     echo "       Clone the repo first, then run ./scripts/install.sh --dev" >&2
     exit 1
+fi
+
+# ----- prompt for env name if not explicitly provided ----------------------
+# Works under `curl ... | bash` because we read from /dev/tty rather than
+# stdin (which is the script body). Falls back to the default silently if
+# there is no terminal attached.
+if [[ ${ENV_NAME_EXPLICIT} -eq 0 ]]; then
+    if [[ -r /dev/tty ]]; then
+        printf "Conda environment name [%s]: " "${DEFAULT_ENV_NAME}" > /dev/tty
+        if IFS= read -r _user_env_name < /dev/tty; then
+            ENV_NAME="${_user_env_name:-${DEFAULT_ENV_NAME}}"
+        else
+            ENV_NAME="${DEFAULT_ENV_NAME}"
+        fi
+    else
+        ENV_NAME="${DEFAULT_ENV_NAME}"
+    fi
 fi
 
 echo "============================================================"
@@ -208,7 +228,13 @@ echo ""
 echo "Creating env '${ENV_NAME}' from environment.yml..."
 ${CONDA_CMD} env create -f "${PATCHED_ENV}"
 
-conda activate "${ENV_NAME}"
+# NOTE: we deliberately do NOT use `conda activate` / `mamba activate` here.
+# Activation is a shell function whose state doesn't always survive a
+# `set -e` script (especially when conda and mamba disagree about envs dirs),
+# so a silent activation failure used to drop pip into the base env and
+# install xdart there instead of into ${ENV_NAME}. Using `${CONDA_CMD} run`
+# guarantees pip runs against the right interpreter regardless of which tool
+# created the env or where its envs directory lives.
 
 # ----- install xdart (+ ssrl_xrd_tools) ------------------------------------
 # xdart declares ssrl_xrd_tools as a dependency, so installing xdart is
@@ -238,11 +264,22 @@ fi
 
 echo ""
 if [[ ${NO_XDART} -eq 0 ]]; then
-    echo "Installing xdart and ssrl_xrd_tools (branch: ${BRANCH})..."
+    echo "Installing xdart and ssrl_xrd_tools into '${ENV_NAME}' (branch: ${BRANCH})..."
 else
-    echo "Installing ssrl_xrd_tools (branch: ${BRANCH})..."
+    echo "Installing ssrl_xrd_tools into '${ENV_NAME}' (branch: ${BRANCH})..."
 fi
-pip install "${PKGS[@]}"
+${CONDA_CMD} run -n "${ENV_NAME}" --no-capture-output pip install "${PKGS[@]}"
+
+# ----- verify the install actually landed in ${ENV_NAME} -------------------
+if [[ ${NO_XDART} -eq 0 ]]; then
+    if ! ${CONDA_CMD} run -n "${ENV_NAME}" python -c "import xdart" >/dev/null 2>&1; then
+        echo ""
+        echo "ERROR: xdart was not importable from env '${ENV_NAME}' after install." >&2
+        echo "       Check the pip output above for failures." >&2
+        exit 1
+    fi
+    echo "Verified: xdart is importable from '${ENV_NAME}'."
+fi
 
 # ----- done ----------------------------------------------------------------
 echo ""
@@ -250,7 +287,10 @@ echo "============================================================"
 echo "Environment '${ENV_NAME}' is ready."
 echo ""
 echo "To start using it:"
-echo "  conda activate ${ENV_NAME}"
+echo "  ${CONDA_CMD} activate ${ENV_NAME}"
+if [[ "${CONDA_CMD}" == "mamba" ]]; then
+    echo "  (use 'mamba activate', not 'conda activate' — the env was created by mamba)"
+fi
 if [[ ${NO_XDART} -eq 0 ]]; then
     echo "  xdart         # launch the xdart GUI"
 fi
