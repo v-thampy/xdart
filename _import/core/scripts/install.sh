@@ -258,13 +258,21 @@ if ! ${CONDA_CMD} env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
     exit 1
 fi
 
-# NOTE: we deliberately do NOT use `conda activate` / `mamba activate` here.
-# Activation is a shell function whose state doesn't always survive a
-# `set -e` script (especially when conda and mamba disagree about envs dirs),
-# so a silent activation failure used to drop pip into the base env and
-# install xdart there instead of into ${ENV_NAME}. Using `${CONDA_CMD} run`
-# guarantees pip runs against the right interpreter regardless of which tool
-# created the env or where its envs directory lives.
+# NOTE: we deliberately do NOT use `conda activate` / `mamba activate` here,
+# nor `${CONDA_CMD} run`. Activation is a shell function whose state doesn't
+# always survive a `set -e` script, and `mamba run` / `conda run` differ in
+# which flags they accept (e.g. --no-capture-output is conda-only). Instead
+# we resolve the env's python interpreter by path and invoke it directly --
+# this is the most portable and least surprising option regardless of
+# which tool created the env or where its envs directory lives.
+ENV_PREFIX="$(${CONDA_CMD} env list | awk -v e="${ENV_NAME}" '$1==e {print $NF; exit}')"
+if [[ -z "${ENV_PREFIX}" || ! -x "${ENV_PREFIX}/bin/python" ]]; then
+    echo "" >&2
+    echo "ERROR: could not locate python interpreter for env '${ENV_NAME}'." >&2
+    echo "       Expected at: ${ENV_PREFIX:-<unknown>}/bin/python" >&2
+    exit 1
+fi
+ENV_PYTHON="${ENV_PREFIX}/bin/python"
 
 # ----- install xdart (+ ssrl_xrd_tools) ------------------------------------
 # xdart declares ssrl_xrd_tools as a dependency, so installing xdart is
@@ -298,8 +306,11 @@ if [[ ${NO_XDART} -eq 0 ]]; then
 else
     echo "Installing ssrl_xrd_tools into '${ENV_NAME}' (branch: ${BRANCH})..."
 fi
-if ! ${CONDA_CMD} run -n "${ENV_NAME}" --no-capture-output pip install "${PKGS[@]}"; then
-    rc=$?
+set +e
+"${ENV_PYTHON}" -m pip install "${PKGS[@]}"
+rc=$?
+set -e
+if [[ ${rc} -ne 0 ]]; then
     echo "" >&2
     echo "ERROR: pip install into '${ENV_NAME}' exited with status ${rc}." >&2
     echo "       Scroll up for the specific failure (build error, network, etc.)." >&2
@@ -308,7 +319,7 @@ fi
 
 # ----- verify the install actually landed in ${ENV_NAME} -------------------
 if [[ ${NO_XDART} -eq 0 ]]; then
-    if ! ${CONDA_CMD} run -n "${ENV_NAME}" python -c "import xdart" >/dev/null 2>&1; then
+    if ! "${ENV_PYTHON}" -c "import xdart" >/dev/null 2>&1; then
         echo ""
         echo "ERROR: xdart was not importable from env '${ENV_NAME}' after install." >&2
         echo "       Check the pip output above for failures." >&2
