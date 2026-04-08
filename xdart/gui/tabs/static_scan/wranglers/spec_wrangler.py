@@ -33,12 +33,8 @@ QMessageBox = QtWidgets.QMessageBox
 QPushButton = QtWidgets.QPushButton
 
 
-def_poni_file = '' # '/Users/vthampy/SSRL_Data/RDA/static_det_test_data/test_xfc_data/test_xfc.poni'
-def_img_file = '' # '/Users/vthampy/SSRL_Data/RDA/static_det_test_data/test_xfc_data/images/images_0005.tif'
-
-if not os.path.exists(def_poni_file):
-    def_poni_file = ''
-    def_img_file = ''
+def_poni_file = ''
+def_img_file = ''
 
 params = [
     {'name': 'Calibration', 'type': 'group', 'children': [
