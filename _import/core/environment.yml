@@ -27,13 +27,12 @@ dependencies:
   - panel
   - holoviews
   - bokeh
+  - jupyter_bokeh
+  - plotly
+  - anywidget
   - napari
+  # VTK export
+  - pyevtk
   # Dev
   - pytest
   - pip
-  - pip:
-    # Pure-Python extras (not on conda-forge, or fresher on PyPI)
-    - pyevtk
-    - plotly
-    - anywidget
-    - jupyter_bokeh
