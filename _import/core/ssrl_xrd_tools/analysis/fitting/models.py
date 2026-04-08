@@ -9,6 +9,7 @@ use lmfit directly::
 Custom 1D models
     LorentzianSquaredModel  — Lorentzian², heavier tails than Voigt
     AsymmetricRectangleModel — step-up / step-down (erf, atan, logistic)
+    ChebyshevModel          — Chebyshev-polynomial background on a fixed x-range
 
 Custom 2D models
     Gaussian2DModel, LorentzianSquared2DModel, PseudoVoigt2DModel, PlaneModel
@@ -253,6 +254,130 @@ class AsymmetricRectangleModel(Model):
 
 # Backwards-compatible alias for the old misspelled name
 AssymetricRectangleModel = AsymmetricRectangleModel
+
+
+# ---------------------------------------------------------------------------
+# Chebyshev polynomial background
+# ---------------------------------------------------------------------------
+
+def _build_chebyshev_func(
+    degree: int,
+    x_min: float,
+    x_max: float,
+):
+    """Generate a bare Python function ``f(x, c0, c1, ..., cN)`` that
+    evaluates a Chebyshev polynomial after linearly mapping ``x`` from
+    ``[x_min, x_max]`` onto ``[-1, 1]``.
+
+    lmfit's :class:`~lmfit.model.Model` introspects the wrapped function's
+    signature to discover its parameter names, so we cannot use ``**kwargs``
+    — the coefficient parameters must appear as explicit positional
+    arguments. Since ``degree`` is only known at runtime, we ``exec`` the
+    function source in a fresh namespace. This is the standard trick for
+    building lmfit models with a dynamic number of parameters.
+    """
+    if not np.isfinite(x_min) or not np.isfinite(x_max) or x_max <= x_min:
+        raise ValueError(
+            f"Invalid x_range for Chebyshev background: ({x_min!r}, {x_max!r})"
+        )
+    if degree < 0:
+        raise ValueError(f"Chebyshev degree must be >= 0, got {degree}")
+
+    span = x_max - x_min
+    arg_list = ", ".join(f"c{i}" for i in range(degree + 1))
+    ns = {"np": np, "_x_min": float(x_min), "_span": float(span)}
+    src = (
+        f"def _cheb(x, {arg_list}):\n"
+        f"    t = 2.0 * (np.asarray(x, dtype=float) - _x_min) / _span - 1.0\n"
+        f"    return np.polynomial.chebyshev.chebval(t, [{arg_list}])\n"
+    )
+    exec(src, ns)
+    return ns["_cheb"]
+
+
+class ChebyshevModel(Model):
+    """lmfit Model for a Chebyshev polynomial background.
+
+    Unlike :class:`~lmfit.models.PolynomialModel`, Chebyshev polynomials
+    are orthogonal on [-1, 1], so the fit is much better-conditioned when
+    coefficients are allowed to float independently. The independent
+    variable ``x`` is linearly mapped from ``x_range`` to [-1, 1] before
+    evaluation. ``x_range`` is captured at construction time and held
+    fixed; the coefficients ``c0``..``cN`` are the only free parameters.
+
+    Parameters
+    ----------
+    degree : int
+        Polynomial degree. Creates coefficients ``c0``..``c{degree}``.
+    x_range : (float, float)
+        The ``(x_min, x_max)`` window used for the [-1, 1] mapping.
+        Required.
+    prefix : str, optional
+        lmfit prefix for parameter names (e.g. ``'bg_'``).
+
+    Examples
+    --------
+    >>> bg = ChebyshevModel(degree=3, x_range=(1.0, 5.0), prefix='bg_')
+    >>> params = bg.guess(intensity, x=q)
+    """
+
+    def __init__(
+        self,
+        degree: int,
+        x_range: tuple[float, float],
+        independent_vars=("x",),
+        prefix: str = "",
+        **kwargs,
+    ):
+        if x_range is None:
+            raise ValueError(
+                "ChebyshevModel requires x_range=(x_min, x_max) so "
+                "coefficients can be mapped to [-1, 1]."
+            )
+        x_min, x_max = float(x_range[0]), float(x_range[1])
+        func = _build_chebyshev_func(degree, x_min, x_max)
+
+        # Store for introspection / guessing
+        self.degree = int(degree)
+        self.x_min = x_min
+        self.x_max = x_max
+
+        kwargs.update({
+            "prefix": prefix,
+            "independent_vars": list(independent_vars),
+        })
+        super().__init__(func, **kwargs)
+
+    def guess(self, data, x=None, **kwargs):
+        """Starting guess: ``c0 = mean(data)``, higher coefficients = 0."""
+        pars = self.make_params()
+        if data is not None and len(np.asarray(data)):
+            c0_key = f"{self.prefix}c0"
+            if c0_key in pars:
+                pars[c0_key].set(value=float(np.nanmean(data)))
+            for i in range(1, self.degree + 1):
+                key = f"{self.prefix}c{i}"
+                if key in pars:
+                    pars[key].set(value=0.0)
+        return update_param_vals(pars, self.prefix, **kwargs)
+
+
+def make_chebyshev_model(
+    degree: int,
+    prefix: str = "",
+    x_range: tuple[float, float] | None = None,
+) -> Model:
+    """Thin wrapper that returns a :class:`ChebyshevModel` instance.
+
+    Kept for callers that prefer a factory-function style; new code should
+    instantiate :class:`ChebyshevModel` directly.
+    """
+    if x_range is None:
+        raise ValueError(
+            "make_chebyshev_model requires x_range=(x_min, x_max) so "
+            "coefficients can be mapped to [-1, 1]."
+        )
+    return ChebyshevModel(degree=degree, x_range=x_range, prefix=prefix)
 
 
 # ---------------------------------------------------------------------------

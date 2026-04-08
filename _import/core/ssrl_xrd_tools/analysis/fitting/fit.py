@@ -37,6 +37,7 @@ from ssrl_xrd_tools.analysis.fitting.models import (
     Gaussian2DModel,
     LorentzianSquared2DModel,
     PseudoVoigt2DModel,
+    ChebyshevModel,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,7 @@ def get_peak_model(model: str, prefix: str = "") -> LmfitModel:
 def _get_background_model(
     background: str,
     prefix: str = "bg_",
+    x_range: tuple[float, float] | None = None,
 ) -> LmfitModel | None:
     """Return an lmfit background model.
 
@@ -94,6 +96,12 @@ def _get_background_model(
     background : str
         'linear', 'constant', 'chebyshev2', 'chebyshev3', 'chebyshev4',
         'polynomial2' .. 'polynomial7', or 'none'.
+    prefix : str
+        lmfit parameter prefix.
+    x_range : (float, float), optional
+        The ``(x_min, x_max)`` of the fit window. Required for
+        ``'chebyshev*'`` so coefficients can be normalized to [-1, 1];
+        ignored for other background models.
     """
     bg = background.lower().strip()
     if bg == "none":
@@ -107,7 +115,12 @@ def _get_background_model(
     if bg.startswith("chebyshev") or bg.startswith("cheb"):
         m = re.search(r'\d+', bg)
         degree = int(m.group()) if m else 3
-        return PolynomialModel(degree, prefix=prefix) #TODO - this should be Chebyshev  
+        if x_range is None:
+            raise ValueError(
+                "Chebyshev backgrounds require x_range=(x_min, x_max) "
+                "so coefficients can be mapped to [-1, 1]."
+            )
+        return ChebyshevModel(degree=degree, x_range=x_range, prefix=prefix)
     if bg.startswith("poly"):
         m = re.search(r'\d+', bg)
         degree = int(m.group()) if m else 2
@@ -265,7 +278,11 @@ def fit_peaks( #TODO - this should include ability to fix certain parameters
         amplitude_bounds = (0, None)
 
     # Build composite model
-    bg_model = _get_background_model(background, prefix="bg_")
+    bg_model = _get_background_model(
+        background,
+        prefix="bg_",
+        x_range=(float(np.nanmin(x)), float(np.nanmax(x))),
+    )
     composite = bg_model
 
     for i in range(n_peaks):
