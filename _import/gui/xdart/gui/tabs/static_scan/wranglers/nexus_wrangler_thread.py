@@ -151,12 +151,6 @@ class nexusThread(wranglerThread):
             for frame_idx in range(nframes):
                 if self.command == 'stop':
                     break
-                if self.command == 'pause':
-                    self.showLabel.emit('Paused')
-                    while self.command == 'pause':
-                        time.sleep(0.3)
-                    if self.command == 'stop':
-                        break
 
                 self.showLabel.emit(f'Processing frame {frame_idx + 1}/{nframes}')
 

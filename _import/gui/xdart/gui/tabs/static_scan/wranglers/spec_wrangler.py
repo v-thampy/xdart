@@ -133,8 +133,7 @@ class specWrangler(wranglerWidget):
         ui: Ui_Form from qtdesigner
 
     methods:
-        cont, pause, stop: functions to pass continue, pause, and stop
-            commands to thread via command_queue
+        stop: function to pass stop command to thread via command_queue
         enabled: Enables or disables interactivity
         set_image_dir: sets the image directory
         set_poni_file: sets the calibration poni file
@@ -177,9 +176,7 @@ class specWrangler(wranglerWidget):
         self.ui.setupUi(self)
         self.ui.startButton.clicked.connect(self.start)
         # self.ui.startButton.clicked.connect(self.sigStart.emit)
-        self.ui.pauseButton.clicked.connect(self.pause)
         self.ui.stopButton.clicked.connect(self.stop)
-        self.ui.continueButton.clicked.connect(self.cont)
         self.ui.processingModeCombo.currentTextChanged.connect(self._on_mode_changed)
         self.ui.liveCheckBox.stateChanged.connect(self._on_mode_changed)
         self.ui.batchCheckBox.stateChanged.connect(self._on_mode_changed)
@@ -366,8 +363,6 @@ class specWrangler(wranglerWidget):
         self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
 
         # Enable/disable buttons initially
-        self.ui.pauseButton.setEnabled(False)
-        self.ui.continueButton.setEnabled(False)
         self.ui.stopButton.setEnabled(False)
 
         self.setup()
@@ -531,7 +526,7 @@ class specWrangler(wranglerWidget):
 
         # Gray out integration controls in viewer mode
         self._set_integration_controls_enabled(not is_viewer)
-        # Hide start/pause/stop/continue in viewer mode
+        # Hide start/stop in viewer mode
         self.ui.frame.setVisible(not is_viewer)
         # Notify parent only when viewer mode actually changed (avoids
         # unnecessary layout resets when just toggling Live/Batch).
@@ -681,31 +676,12 @@ class specWrangler(wranglerWidget):
     def start(self):
         self.command = 'start'
         self.thread.command = 'start'
-        self.ui.pauseButton.setEnabled(True)
-        self.ui.continueButton.setEnabled(False)
         self.ui.stopButton.setEnabled(True)
         self.sigStart.emit()
-
-    def pause(self):
-        self.command = 'pause'
-        self.thread.command = 'pause'
-        # if self.thread.isRunning():
-        self.ui.pauseButton.setEnabled(False)
-        self.ui.continueButton.setEnabled(True)
-
-    def cont(self):
-        self.command = 'continue'
-        self.thread.command = 'continue'
-        # if self.thread.isRunning():
-        self.ui.pauseButton.setEnabled(True)
-        self.ui.continueButton.setEnabled(False)
 
     def stop(self):
         self.command = 'stop'
         self.thread.command = 'stop'
-        # if self.thread.isRunning():
-        self.ui.pauseButton.setEnabled(False)
-        self.ui.continueButton.setEnabled(False)
         self.ui.stopButton.setEnabled(False)
         self.ui.specLabel.setText('')
 

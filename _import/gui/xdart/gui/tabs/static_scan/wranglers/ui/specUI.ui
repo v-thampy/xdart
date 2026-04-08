@@ -129,26 +129,6 @@
        </widget>
       </item>
       <item>
-       <widget class="QPushButton" name="pauseButton">
-        <property name="focusPolicy">
-         <enum>Qt::ClickFocus</enum>
-        </property>
-        <property name="text">
-         <string>Pause</string>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QPushButton" name="continueButton">
-        <property name="focusPolicy">
-         <enum>Qt::ClickFocus</enum>
-        </property>
-        <property name="text">
-         <string>Continue</string>
-        </property>
-       </widget>
-      </item>
-      <item>
        <widget class="QPushButton" name="stopButton">
         <property name="focusPolicy">
          <enum>Qt::ClickFocus</enum>
