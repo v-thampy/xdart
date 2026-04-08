@@ -229,14 +229,15 @@ class MultiPhaseResult:
 # Main fitter
 # ---------------------------------------------------------------------------
 
-class PhaseFitter: #TODO thes SNIP background should be optional
+class PhaseFitter:
     """
     Multi-phase 1D XRD pattern fitter.
 
     Builds a composite model of N crystallographic phases, each contributing
     pseudo-Voigt peaks at positions determined analytically from (hkl, lattice)
-    with template intensities from pymatgen.  A SNIP background is added, and
-    a global Q-shift corrects for calibration offset.
+    with template intensities from pymatgen.  An optional pre-computed
+    background is added on top of the phase peaks, and a global Q-shift
+    corrects for calibration offset.
 
     Parameters
     ----------
@@ -246,8 +247,19 @@ class PhaseFitter: #TODO thes SNIP background should be optional
         Measured intensity.
     sigma : array-like or None
         Per-point uncertainties (used as weights = 1/sigma if provided).
+    background : {'snip', None} or array-like, default 'snip'
+        Pre-computed background to subtract before fitting phase peaks.
+
+        * ``'snip'`` — compute a SNIP background from ``y`` (default,
+          preserves historical behaviour).
+        * ``None`` or ``'none'`` — zero background (useful when ``y`` has
+          already been background-subtracted, or when you want the phases
+          alone to model everything).
+        * array-like — user-supplied background of the same length as
+          ``x``.  Nothing else is computed.
     snip_width : int or None
-        SNIP clipping width.  *None* → auto (5 % of data length).
+        SNIP clipping width; only used when ``background='snip'``.
+        *None* → auto (5 % of data length).
     """
 
     def __init__(
@@ -255,6 +267,7 @@ class PhaseFitter: #TODO thes SNIP background should be optional
         x: np.ndarray | Any,
         y: np.ndarray | Any,
         sigma: np.ndarray | None = None,
+        background: str | np.ndarray | None = "snip",
         snip_width: int | None = None,
     ):
         # Accept IntegrationResult1D transparently
@@ -274,9 +287,35 @@ class PhaseFitter: #TODO thes SNIP background should be optional
         self._template_amps: list[np.ndarray] = []  # relative intensities
         self._init_lattice: list[dict] = []          # initial lattice params
 
-        # Background
-        self._snip_width = snip_width or max(int(len(self.x) * 0.05), 3)
-        self.background = snip_1d(self.y, snip_width=self._snip_width)
+        # Background: SNIP, none, or pre-computed
+        self._snip_width: int | None = None
+        self._background_kind: str   # for plot labels / introspection
+        if isinstance(background, str):
+            kind = background.lower().strip()
+            if kind == "snip":
+                self._snip_width = snip_width or max(int(len(self.x) * 0.05), 3)
+                self.background = snip_1d(self.y, snip_width=self._snip_width)
+                self._background_kind = "SNIP"
+            elif kind in ("none", ""):
+                self.background = np.zeros_like(self.y)
+                self._background_kind = "none"
+            else:
+                raise ValueError(
+                    f"Unknown background kind {background!r}. "
+                    "Use 'snip', 'none', None, or a pre-computed array."
+                )
+        elif background is None:
+            self.background = np.zeros_like(self.y)
+            self._background_kind = "none"
+        else:
+            bg_arr = np.asarray(background, dtype=float)
+            if bg_arr.shape != self.y.shape:
+                raise ValueError(
+                    f"Pre-computed background has shape {bg_arr.shape}, "
+                    f"expected {self.y.shape} to match y."
+                )
+            self.background = bg_arr
+            self._background_kind = "user"
 
     # ------------------------------------------------------------------
     # Phase management
@@ -574,9 +613,10 @@ class PhaseFitter: #TODO thes SNIP background should be optional
         ax.plot(self.x, y_total, "r-", linewidth=1.5, label="Total fit")
 
         # Background
-        if show_background:
+        if show_background and self._background_kind != "none":
+            label = f"{self._background_kind} background" if self._background_kind != "user" else "Background"
             ax.plot(self.x, self.background, "--", color="gray",
-                    linewidth=1, label="SNIP background")
+                    linewidth=1, label=label)
 
         # Per-phase components
         if show_components:
