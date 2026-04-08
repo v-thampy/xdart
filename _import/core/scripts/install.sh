@@ -226,7 +226,9 @@ sed -e "s/^name: .*/name: ${ENV_NAME}/" \
 
 echo ""
 echo "Creating env '${ENV_NAME}' from environment.yml..."
-${CONDA_CMD} env create -f "${PATCHED_ENV}"
+# --quiet suppresses mamba/conda's progress bars (the long ━━━ lines) while
+# still printing the package list and any errors.
+${CONDA_CMD} env create --quiet -f "${PATCHED_ENV}"
 
 # NOTE: we deliberately do NOT use `conda activate` / `mamba activate` here.
 # Activation is a shell function whose state doesn't always survive a
