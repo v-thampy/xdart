@@ -2,7 +2,6 @@
 """
 @author: walroth, vthampy
 """
-__version__ = '0.4.2'
 # Top level script for running gui based program
 
 # Standard library imports
