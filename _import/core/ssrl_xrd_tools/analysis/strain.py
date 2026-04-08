@@ -75,6 +75,12 @@ class Sin2PsiResult:
     d_values: np.ndarray    # fitted d-spacings
     d_errors: np.ndarray    # uncertainties on d-spacings
     peak_fits: list[PeakFitResult]  # individual sector fits
+    # Elastic constants and derived stress (populated when E, nu are
+    # supplied to sin2psi_regression; otherwise None).
+    E: float | None = None          # Young's modulus (same units as stress)
+    nu: float | None = None         # Poisson's ratio
+    stress: float | None = None     # in-plane normal stress σ_φ
+    stress_err: float | None = None # propagated 1σ uncertainty on stress
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +283,8 @@ def fit_peak_vs_psi(
 
 def sin2psi_regression(
     peak_fits: list[PeakFitResult],
+    E: float | None = None,
+    nu: float | None = None,
 ) -> Sin2PsiResult:
     """
     Perform a d vs. sin²(ψ) linear regression.
@@ -285,12 +293,19 @@ def sin2psi_regression(
     ----------
     peak_fits : list of PeakFitResult
         Output from :func:`fit_peak_vs_psi`.
+    E : float, optional
+        Young's modulus (X-ray elastic constant) for the specific (hkl).
+        Units set the units of the returned stress (e.g. GPa, MPa).
+    nu : float, optional
+        Poisson's ratio (X-ray elastic constant) for the specific (hkl).
 
     Returns
     -------
     Sin2PsiResult
         Contains the regression slope (proportional to stress), intercept
-        (d₀), R² value, and all individual data points.
+        (d₀), R² value, and all individual data points. If both ``E`` and
+        ``nu`` are provided, the result also includes the computed
+        in-plane normal stress ``σ_φ = (E / (1+ν)) · (slope / d₀)``.
 
     Notes
     -----
@@ -300,9 +315,18 @@ def sin2psi_regression(
     - ``m > 0`` → tensile in-plane stress.
     - ``m < 0`` → compressive in-plane stress.
 
-    For a full stress calculation, Young's modulus and Poisson's ratio for
-    the specific (hkl) are needed — this function returns the geometric
-    regression only. #TODO add option to input this
+    Biaxial sin²ψ stress relation (assuming σ_33 = 0 and the chosen φ
+    direction)::
+
+        ε_φψ = ((1+ν)/E) · σ_φ · sin²ψ  −  (ν/E) · (σ_11 + σ_22)
+
+    which together with ``ε_φψ ≈ (d_ψ − d₀)/d₀`` gives::
+
+        σ_φ = (E / (1+ν)) · (m / d₀)
+
+    where ``m`` is the regression slope. The returned ``stress_err`` is
+    propagated from ``slope_err`` and ``d0_err`` assuming they are
+    independent.
     """
     if len(peak_fits) < 3:
         raise ValueError(
@@ -316,6 +340,28 @@ def sin2psi_regression(
 
     reg = linregress(sin2psi, d_vals)
 
+    # Optional stress computation
+    stress: float | None = None
+    stress_err: float | None = None
+    if E is not None and nu is not None:
+        if reg.intercept == 0 or not np.isfinite(reg.intercept):
+            raise ValueError(
+                f"Cannot compute stress: intercept d0={reg.intercept} is "
+                "zero or non-finite."
+            )
+        if nu <= -1.0:
+            raise ValueError(f"Invalid Poisson's ratio nu={nu} (need ν > −1).")
+        prefactor = E / (1.0 + nu)
+        stress = prefactor * (reg.slope / reg.intercept)
+        # σ = k · m / d0  →  (δσ/σ)² = (δm/m)² + (δd0/d0)²
+        rel_slope = (reg.stderr / reg.slope) if reg.slope != 0 else 0.0
+        rel_d0 = (reg.intercept_stderr / reg.intercept)
+        stress_err = abs(stress) * float(np.hypot(rel_slope, rel_d0))
+    elif (E is None) != (nu is None):
+        raise ValueError(
+            "Provide both E and nu (or neither) to compute stress."
+        )
+
     return Sin2PsiResult(
         d0=reg.intercept,
         slope=reg.slope,
@@ -327,6 +373,10 @@ def sin2psi_regression(
         d_values=d_vals,
         d_errors=d_errs,
         peak_fits=peak_fits,
+        E=E,
+        nu=nu,
+        stress=stress,
+        stress_err=stress_err,
     )
 
 
@@ -346,6 +396,8 @@ def sin2psi_analysis(
     sigma_init: float | None = None,
     sigma_bounds: tuple[float, float] | None = None,
     center_bounds_delta: float | None = None,
+    E: float | None = None,
+    nu: float | None = None,
 ) -> Sin2PsiResult:
     """
     End-to-end sin²(ψ) strain analysis from a GI-corrected polar map.
@@ -381,7 +433,7 @@ def sin2psi_analysis(
         sigma_bounds=sigma_bounds,
         center_bounds_delta=center_bounds_delta,
     )
-    return sin2psi_regression(peak_fits)
+    return sin2psi_regression(peak_fits, E=E, nu=nu)
 
 
 __all__ = [
