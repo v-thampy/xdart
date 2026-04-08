@@ -354,4 +354,4 @@ vthampy@stanford.edu
 
 ---
 
-**xdart v0.15** | Python ≥ 3.12 | [Repository](https://github.com/v-thampy/xdart) | [Manual](https://github.com/v-thampy/xdart/blob/master/xdart_manual.pdf)
+**xdart** | Python ≥ 3.10 | [Repository](https://github.com/v-thampy/xdart) | [Manual](https://github.com/v-thampy/xdart/blob/master/xdart_manual.pdf)
