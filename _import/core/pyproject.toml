@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssrl_xrd_tools"
-version = "0.35.0"
+version = "0.35.1"
 description = "SSRL X-ray diffraction data processing and visualization tools"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
@@ -66,6 +66,7 @@ Issues = "https://github.com/v-thampy/ssrl_xrd_tools/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["ssrl_xrd_tools*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
