@@ -109,28 +109,20 @@ class nexusWrangler(wranglerWidget):
         # Buttons
         btn_layout = QtWidgets.QHBoxLayout()
         self.startButton = QtWidgets.QPushButton('Start')
-        self.pauseButton = QtWidgets.QPushButton('Pause')
         self.stopButton = QtWidgets.QPushButton('Stop')
-        self.continueButton = QtWidgets.QPushButton('Continue')
         self.skip2dCheckBox = QtWidgets.QCheckBox('Skip 2D')
 
         btn_layout.addWidget(self.startButton)
-        btn_layout.addWidget(self.pauseButton)
         btn_layout.addWidget(self.stopButton)
-        btn_layout.addWidget(self.continueButton)
         btn_layout.addWidget(self.skip2dCheckBox)
         layout.addLayout(btn_layout)
 
         self.startButton.clicked.connect(self.start)
-        self.pauseButton.clicked.connect(self.pause)
         self.stopButton.clicked.connect(self.stop)
-        self.continueButton.clicked.connect(self.cont)
         self.skip2dCheckBox.stateChanged.connect(
             lambda _: setattr(self.sphere, 'skip_2d', self.skip2dCheckBox.isChecked())
         )
 
-        self.pauseButton.setEnabled(False)
-        self.continueButton.setEnabled(False)
         self.stopButton.setEnabled(False)
 
         # Parameter tree
@@ -349,30 +341,14 @@ class nexusWrangler(wranglerWidget):
         self.command = 'start'
         self.thread.command = 'start'
         self.startButton.setEnabled(False)
-        self.pauseButton.setEnabled(True)
         self.stopButton.setEnabled(True)
-        self.continueButton.setEnabled(False)
         self._save_to_session()
         self.sigStart.emit()
-
-    def pause(self):
-        self.command = 'pause'
-        self.thread.command = 'pause'
-        self.pauseButton.setEnabled(False)
-        self.continueButton.setEnabled(True)
-
-    def cont(self):
-        self.command = 'continue'
-        self.thread.command = 'continue'
-        self.pauseButton.setEnabled(True)
-        self.continueButton.setEnabled(False)
 
     def stop(self):
         self.command = 'stop'
         self.thread.command = 'stop'
         self.startButton.setEnabled(True)
-        self.pauseButton.setEnabled(False)
-        self.continueButton.setEnabled(False)
         self.stopButton.setEnabled(False)
 
     def enabled(self, enable):

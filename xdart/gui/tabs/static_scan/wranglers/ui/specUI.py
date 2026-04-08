@@ -112,18 +112,6 @@ class Ui_Form(object):
 
         self.horizontalLayout.addWidget(self.startButton)
 
-        self.pauseButton = QPushButton(self.frame)
-        self.pauseButton.setObjectName(u"pauseButton")
-        self.pauseButton.setFocusPolicy(Qt.ClickFocus)
-
-        self.horizontalLayout.addWidget(self.pauseButton)
-
-        self.continueButton = QPushButton(self.frame)
-        self.continueButton.setObjectName(u"continueButton")
-        self.continueButton.setFocusPolicy(Qt.ClickFocus)
-
-        self.horizontalLayout.addWidget(self.continueButton)
-
         self.stopButton = QPushButton(self.frame)
         self.stopButton.setObjectName(u"stopButton")
         self.stopButton.setFocusPolicy(Qt.ClickFocus)
@@ -146,8 +134,6 @@ class Ui_Form(object):
         self.modeLabel.setText(QCoreApplication.translate("Form", u"Mode:", None))
         self.coresLabel.setText(QCoreApplication.translate("Form", u"Cores:", None))
         self.startButton.setText(QCoreApplication.translate("Form", u"Start", None))
-        self.pauseButton.setText(QCoreApplication.translate("Form", u"Pause", None))
-        self.continueButton.setText(QCoreApplication.translate("Form", u"Continue", None))
         self.stopButton.setText(QCoreApplication.translate("Form", u"Stop", None))
     # retranslateUi
 

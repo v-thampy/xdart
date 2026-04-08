@@ -139,7 +139,7 @@ class specThread(wranglerThread):
             see EwaldSphere.
         timeout: float or int, how long to continue checking for new
             data.
-        command: command passed to stop, pause, continue etc.
+        command: command passed to start, stop etc.
         data_1d/2d: Dictionaries to store processed data for plotting
 
     signals:
@@ -252,6 +252,29 @@ class specThread(wranglerThread):
         self._eiger_h5_dataset = None    # dataset reference inside the open file
         self._eiger_fabio_handle = None  # persistent fabio.EigerImage fallback
 
+    # ── Display helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _middle_truncate(text, max_len=40, ellipsis='...'):
+        """Shorten ``text`` to at most ``max_len`` chars by elliding the middle.
+
+        ``"Combi4_Angledependence_samz_4p9_03271002_0001"`` →
+        ``"Combi4_Angledep..._4p9_03271002_0001"``
+
+        Keeps the head and tail roughly balanced so the most identifying parts
+        of long filenames (prefix + frame number suffix) stay visible.
+        """
+        if text is None:
+            return ''
+        if len(text) <= max_len:
+            return text
+        keep = max_len - len(ellipsis)
+        if keep <= 0:
+            return ellipsis[:max_len]
+        head = (keep + 1) // 2  # bias the head slightly longer on odd splits
+        tail = keep - head
+        return f'{text[:head]}{ellipsis}{text[-tail:]}' if tail else f'{text[:head]}{ellipsis}'
+
     # ── Main entry point ─────────────────────────────────────────────────
 
     def run(self):
@@ -315,17 +338,13 @@ class specThread(wranglerThread):
         while True:
             if self.command == 'stop':
                 break
-            if self.command == 'pause':
-                self.showLabel.emit('Paused')
-                time.sleep(0.5)
-                continue
 
             img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
             if img_data is None:
                 break  # initial glob exhausted — move on to processing
             if img_file is not None:
                 fname = os.path.splitext(os.path.basename(img_file))[0]
-                self.showLabel.emit(f'Collecting {fname[-30:]}')
+                self.showLabel.emit(f'Collecting {self._middle_truncate(fname)}')
             else:
                 logger.warning('Invalid image file, skipping')
                 continue
@@ -368,11 +387,6 @@ class specThread(wranglerThread):
         if self.live_mode and self.command != 'stop' and sphere is not None:
             self.showLabel.emit('Watching for new files...')
             while self.command != 'stop':
-                if self.command == 'pause':
-                    self.showLabel.emit('Paused')
-                    time.sleep(0.5)
-                    continue
-
                 img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
                 if img_data is None:
                     # Nothing new yet — show watching status and sleep
@@ -576,7 +590,7 @@ class specThread(wranglerThread):
     def _process_one(self, sphere, img_file, img_number, img_data, img_meta, bg_raw):
         """Integrate one image sequentially and save. Includes timing instrumentation."""
         fname = os.path.splitext(os.path.basename(img_file))[0]
-        self.showLabel.emit(f'Processing {fname[-30:]}')
+        self.showLabel.emit(f'Processing {self._middle_truncate(fname)}')
 
         _t1 = time.time()
         threshold_mask = None if not self.apply_threshold else self.threshold(img_data)
