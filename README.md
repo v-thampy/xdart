@@ -24,6 +24,14 @@ xdart enables fast, intuitive analysis of X-ray diffraction (XRD) data from sync
 
 A single installer script handles everything: it creates a dedicated conda environment, installs the heavy scientific stack from conda-forge (`pyFAI`, `h5py`, `pymatgen`, Qt, HDF5 libraries), and installs both `xdart` and its computational core [`ssrl_xrd_tools`](https://github.com/v-thampy/ssrl_xrd_tools) on top. This conda-for-native + pip-for-Python split avoids the binary mismatches that can occur when mixing sources for native-backed packages.
 
+**TL;DR — one-line install** (requires conda or mamba; see [below](#if-you-dont-have-condamamba) if you don't have either, and the [Windows prerequisites](#prerequisites-git-windows) if you're on Windows):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.sh | bash
+```
+
+Then `conda activate xrd` (or `mamba activate xrd` if you used mamba) and run `xdart`. Read on for prerequisites, options, and the developer workflow.
+
 ### Prerequisites: Git (Windows)
 
 The installer script and the development workflow both rely on `git` (and on Windows, on the bash shell that ships with it). macOS and most Linux distributions already include `git`; Windows users need to install it once.
