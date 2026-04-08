@@ -970,6 +970,14 @@ class specThread(wranglerThread):
         If mode is overwrite, replace existing HDF5 file, else append to it.
         """
         fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
+        # Eiger master files are pre-processed with the trailing
+        # ``_master`` suffix stripped from scan_name (see
+        # _get_next_eiger_frame). Without this sync, the wrangler
+        # widget's self.fname (set from the original master filename
+        # in spec_wrangler.setup()) diverges from the actual sphere
+        # output path, and static_scan_widget.wrangler_finished
+        # cannot find the generated file to reload at end of batch.
+        self.fname = fname
         sphere = EwaldSphere(self.scan_name,
                              data_file=fname,
                              static=True,

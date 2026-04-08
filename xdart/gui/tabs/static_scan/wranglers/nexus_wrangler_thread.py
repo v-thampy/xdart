@@ -86,6 +86,14 @@ class nexusThread(wranglerThread):
         self.mask = None
         self._cached_gi_incident_angle = None
 
+        # NeXus processing is always batch-mode equivalent — surface the
+        # same flags the GUI's wrangler_finished handler checks so it
+        # auto-reloads the generated file and selects the last frame
+        # once processing is done. Without these, the display is left
+        # showing stale state from before the run.
+        self.batch_mode = True
+        self.xye_only = False
+
     # ── Main entry point ─────────────────────────────────────────────────
 
     def run(self):
