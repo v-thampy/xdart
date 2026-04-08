@@ -42,44 +42,12 @@ from xdart.gui.mainWindow import Ui_MainWindow
 from xdart.gui import tabs
 
 
-def setup_data_folders(exp_list):
-    """
-    Creates xdart/data folder and xdart/data/tabs folder for storing
-    local data. These are ignored by gitignore.
-
-    Parameters
-    ----------
-    exp_list : list, set of tabs to be
-
-    Returns
-    -------
-    tab_paths : dict, paths for tabs to store data
-    """
-    current_directory = os.path.dirname(__file__)
-    data_directory = os.path.join(current_directory, "../data")
-    if not os.path.isdir(data_directory):
-        os.mkdir(data_directory)
-    tab_paths = {}
-    for e in exp_list:
-        tab_directory = os.path.join(data_directory, e)
-        tab_paths[e] = tab_directory
-        if not os.path.isdir(tab_directory):
-            os.mkdir(tab_directory)
-    return tab_paths
-
-
 QMainWindow = QtWidgets.QMainWindow
 
 
 class Main(QMainWindow):
-    def __init__(self, tab_paths):
-        """
-        Parameters
-        ----------
-        tab_paths : dict
-        """
+    def __init__(self):
         super().__init__()
-        self.tab_paths = tab_paths
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
         self.setWindowTitle('xdart')
@@ -87,9 +55,9 @@ class Main(QMainWindow):
         self.ui.actionExit.triggered.connect(self.exit)
         self.fname = None
 
-        # Embed the main widget directly (no tab container)
-        self.main_widget = tabs.static_scan.staticWidget(
-            local_path=self.tab_paths['static_scan'])
+        # Embed the main widget directly (no tab container).
+        # The widget chooses its own scratch directory via get_fname_dir().
+        self.main_widget = tabs.static_scan.staticWidget()
         self.setCentralWidget(self.main_widget)
 
         self.show()
@@ -115,9 +83,8 @@ class Main(QMainWindow):
 
 
 def main():
-    tab_paths = setup_data_folders(tabs.exp_list)
     app = QtWidgets.QApplication(sys.argv)
-    mw = Main(tab_paths)
+    mw = Main()
     mw.show()
     app.exec()
 

@@ -113,9 +113,9 @@ class staticWidget(QWidget):
         load_sphere:
     """
 
-    def __init__(self, local_path=None, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._init_data_objects(local_path)
+        self._init_data_objects()
         self._init_ui()
         self._init_child_widgets()
         self._connect_signals()
@@ -126,7 +126,7 @@ class staticWidget(QWidget):
 
     # ── Initialization helpers ─────────────────────────────────────
 
-    def _init_data_objects(self, local_path):
+    def _init_data_objects(self):
         """Initialize data containers, file lock, and directory paths."""
         self.file_lock = threading.Condition()
         # Reentrant lock guarding concurrent access to data_1d / data_2d from
@@ -134,9 +134,9 @@ class staticWidget(QWidget):
         # all child widgets and worker threads. Always the OUTER lock when
         # paired with sphere.sphere_lock (data_lock → sphere_lock).
         self.data_lock = threading.RLock()
-        local_path = get_fname_dir()
-        self.local_path = local_path
-        self.dirname = os.path.join(local_path)
+        # Scratch directory for working .nxs files (under the user's home).
+        self.local_path = get_fname_dir()
+        self.dirname = self.local_path
         if not os.path.isdir(self.dirname):
             os.mkdir(self.dirname)
 
