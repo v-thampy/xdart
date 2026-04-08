@@ -9,7 +9,7 @@ from typing import Any, TYPE_CHECKING
 if TYPE_CHECKING:
     from ssrl_xrd_tools.rsm.pipeline import ScanInfo
 
-from ssrl_xrd_tools.rsm.geometry import DiffractometerConfig
+from ssrl_xrd_tools.core.geometry import DiffractometerConfig
 
 @dataclass
 class ExperimentConfig:
