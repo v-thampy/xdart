@@ -226,9 +226,37 @@ sed -e "s/^name: .*/name: ${ENV_NAME}/" \
 
 echo ""
 echo "Creating env '${ENV_NAME}' from environment.yml..."
-# --quiet suppresses mamba/conda's progress bars (the long ━━━ lines) while
-# still printing the package list and any errors.
-${CONDA_CMD} env create --quiet -f "${PATCHED_ENV}"
+# --yes  : auto-confirm the "Confirm changes: [Y/n]" prompt (mamba does NOT
+#          imply --yes from --quiet, and a hung prompt under set -e causes
+#          a silent abort)
+# --quiet : suppress the long ━━━ progress bars while still printing the
+#          package list and any errors
+# We wrap the call in an explicit if-check rather than relying on `set -e`
+# so a non-zero exit produces a clear, actionable error message instead of
+# the script vanishing mid-run.
+if ! ${CONDA_CMD} env create --yes --quiet -f "${PATCHED_ENV}"; then
+    rc=$?
+    echo "" >&2
+    echo "ERROR: '${CONDA_CMD} env create' exited with status ${rc}." >&2
+    echo "       The environment may be partially created. Common causes:" >&2
+    echo "         - one of the pip packages in environment.yml failed to build" >&2
+    echo "         - a package conflict (e.g. duplicate files between conda" >&2
+    echo "           packages) that mamba is treating as an error" >&2
+    echo "       Re-run with --force to wipe and retry, or scroll up for the" >&2
+    echo "       specific failure." >&2
+    exit "${rc}"
+fi
+
+# Sanity check: confirm the env is actually registered before we try to
+# install into it. If env create exited 0 but the env still isn't visible,
+# something is very wrong and we should bail loudly rather than silently
+# pip-installing into base.
+if ! ${CONDA_CMD} env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
+    echo "" >&2
+    echo "ERROR: env create reported success but '${ENV_NAME}' is not in" >&2
+    echo "       '${CONDA_CMD} env list'. Aborting before pip install." >&2
+    exit 1
+fi
 
 # NOTE: we deliberately do NOT use `conda activate` / `mamba activate` here.
 # Activation is a shell function whose state doesn't always survive a
@@ -270,7 +298,13 @@ if [[ ${NO_XDART} -eq 0 ]]; then
 else
     echo "Installing ssrl_xrd_tools into '${ENV_NAME}' (branch: ${BRANCH})..."
 fi
-${CONDA_CMD} run -n "${ENV_NAME}" --no-capture-output pip install "${PKGS[@]}"
+if ! ${CONDA_CMD} run -n "${ENV_NAME}" --no-capture-output pip install "${PKGS[@]}"; then
+    rc=$?
+    echo "" >&2
+    echo "ERROR: pip install into '${ENV_NAME}' exited with status ${rc}." >&2
+    echo "       Scroll up for the specific failure (build error, network, etc.)." >&2
+    exit "${rc}"
+fi
 
 # ----- verify the install actually landed in ${ENV_NAME} -------------------
 if [[ ${NO_XDART} -eq 0 ]]; then
