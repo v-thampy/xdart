@@ -592,15 +592,23 @@ class staticWidget(QWidget):
 
         self.thread_state_changed()
         self.wrangler.stop()
-        
+
         # Auto-load the final file generated from the batch if applicable
         is_batch = getattr(self.wrangler.thread, 'batch_mode', False)
         is_xye_only = getattr(self.wrangler.thread, 'xye_only', False)
 
         if is_batch and not is_xye_only:
-            generated_file = getattr(self.wrangler, 'fname', None)
+            # Prefer the thread's fname — it's the source of truth for
+            # where data was actually written. The widget-level
+            # wrangler.fname is set in setup() before the thread runs
+            # and may diverge (e.g. spec strips the ``_master`` suffix
+            # from eiger master filenames inside the thread, so the
+            # widget's fname ends with ``_master.nxs`` but the actual
+            # sphere output is ``<stem>.nxs``).
+            generated_file = (getattr(self.wrangler.thread, 'fname', None)
+                              or getattr(self.wrangler, 'fname', None))
             if generated_file and os.path.exists(generated_file):
-                # Update directory display to point at the generated folder natively 
+                # Update directory display to point at the generated folder natively
                 generated_dir = os.path.dirname(generated_file)
                 if self.h5viewer.dirname != generated_dir:
                     self.h5viewer.dirname = generated_dir
