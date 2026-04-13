@@ -105,8 +105,19 @@ class EwaldSphere:
             self.overall_raw = 0
 
     def add_arch(self, arch=None, calculate=True, update=True, get_sd=True,
-                 set_mg=True, h5file=None, **kwargs):
-        """Adds new arch to sphere."""
+                 set_mg=True, h5file=None, batch_save=False, **kwargs):
+        """Adds new arch to sphere.
+
+        Parameters
+        ----------
+        batch_save : bool, default False
+            If True, skip the per-frame HDF5 writes of ``scan_data``,
+            ``integrated_1d``, and ``integrated_2d`` (all of which delete
+            and re-create a grown dataset, so naive per-frame calls cost
+            O(N²) over a batch).  The in-memory accumulators are still
+            updated, so the caller MUST invoke :meth:`flush_batch_state`
+            (or equivalent explicit saves) after the loop to persist them.
+        """
         with self.sphere_lock:
             if arch is None:
                 arch = EwaldArch(**kwargs)
@@ -131,20 +142,47 @@ class EwaldSphere:
                         arch.scan_info, index=[arch.idx], dtype='float64'
                     )
                 self.scan_data.sort_index(inplace=True)
-                if h5file is not None:
-                    self._write_scan_data_nexus(h5file)
-                else:
-                    with self.file_lock:
-                        with utils.catch_h5py_file(self.data_file, 'a') as file:
-                            self._write_scan_data_nexus(file)
+                if not batch_save:
+                    if h5file is not None:
+                        self._write_scan_data_nexus(h5file)
+                    else:
+                        with self.file_lock:
+                            with utils.catch_h5py_file(self.data_file, 'a') as file:
+                                self._write_scan_data_nexus(file)
             if update:
-                self._update_bai_1d(arch, h5file=h5file)
+                self._accumulate_bai_1d(arch)
                 if not self.skip_2d:
-                    self._update_bai_2d(arch, h5file=h5file)
+                    self._accumulate_bai_2d(arch)
+                if not batch_save:
+                    self.save_bai_1d(h5file=h5file)
+                    if not self.skip_2d:
+                        self.save_bai_2d(h5file=h5file)
             if set_mg:
                 self._mg_integrators = [a.integrator for a in self.arches]
 
             self.overall_raw += (arch.map_raw - arch.bg_raw)
+
+    def flush_batch_state(self, h5file=None):
+        """Persist deferred per-batch state: scan_data + bai_1d/2d.
+
+        Companion to ``add_arch(..., batch_save=True)``.  Writes each of
+        ``entry/scan_data``, ``entry/integrated_1d``, and
+        ``entry/integrated_2d`` exactly once, so the amortised per-frame
+        write cost drops from O(N) HDF5 rewrites to O(1).
+        """
+        with self.sphere_lock:
+            if h5file is not None:
+                self._write_scan_data_nexus(h5file)
+                self.save_bai_1d(h5file=h5file)
+                if not self.skip_2d:
+                    self.save_bai_2d(h5file=h5file)
+            else:
+                with self.file_lock:
+                    with utils.catch_h5py_file(self.data_file, 'a') as file:
+                        self._write_scan_data_nexus(file)
+                        self.save_bai_1d(h5file=file)
+                        if not self.skip_2d:
+                            self.save_bai_2d(h5file=file)
 
     def _write_scan_data_nexus(self, h5file):
         """Write scan_data DataFrame into entry/scan_data."""
@@ -185,8 +223,8 @@ class EwaldSphere:
                                         global_mask=self.global_mask)
                 self._update_bai_2d(arch)
 
-    def _update_bai_1d(self, arch, h5file=None):
-        """Update running sum of 1D integration results."""
+    def _accumulate_bai_1d(self, arch):
+        """In-memory running sum of 1D integration results (no HDF5 write)."""
         with self.sphere_lock:
             if arch.int_1d is None:
                 return
@@ -197,10 +235,9 @@ class EwaldSphere:
                     self.bai_1d = self.bai_1d + arch.int_1d
             except (ValueError, AttributeError):
                 self.bai_1d = arch.int_1d
-            self.save_bai_1d(h5file=h5file)
 
-    def _update_bai_2d(self, arch, h5file=None):
-        """Update running sum of 2D integration results."""
+    def _accumulate_bai_2d(self, arch):
+        """In-memory running sum of 2D integration results (no HDF5 write)."""
         with self.sphere_lock:
             if arch.int_2d is None:
                 return
@@ -211,7 +248,18 @@ class EwaldSphere:
                     self.bai_2d = self.bai_2d + arch.int_2d
             except (ValueError, AttributeError):
                 self.bai_2d = arch.int_2d
-            if not self.skip_2d:
+
+    def _update_bai_1d(self, arch, h5file=None):
+        """Update running sum of 1D integration results and persist to HDF5."""
+        self._accumulate_bai_1d(arch)
+        with self.sphere_lock:
+            self.save_bai_1d(h5file=h5file)
+
+    def _update_bai_2d(self, arch, h5file=None):
+        """Update running sum of 2D integration results and persist to HDF5."""
+        self._accumulate_bai_2d(arch)
+        if not self.skip_2d:
+            with self.sphere_lock:
                 self.save_bai_2d(h5file=h5file)
 
     def set_multi_geo(self, **args):
