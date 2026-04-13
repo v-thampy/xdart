@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "xdart"
-version = "0.15"
+version = "0.16.1"
 description = "A pyFAI based GUI utility to rebin and visualize X-ray Diffraction data"
 authors = ["Vivek Thampy <vthampy@stanford.edu>"]
 license = "MIT"

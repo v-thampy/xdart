@@ -15,6 +15,7 @@ from collections import deque
 
 # pyFAI imports
 import fabio
+from holoviews.operation import threshold
 
 # Qt imports
 from pyqtgraph import Qt
@@ -36,15 +37,15 @@ from xdart.utils.containers.poni import get_poni_dict
 from ....widgets import commandLine
 from xdart.modules.pySSRL_bServer.bServer_funcs import specCommand
 
-from icecream import ic; ic.configureOutput(prefix='', includeContext=True)
+from icecream import ic; ic.configureOutput(prefix='', includeContext=False)
 
 QFileDialog = QtWidgets.QFileDialog
 QDialog = QtWidgets.QDialog
 QMessageBox = QtWidgets.QMessageBox
 QPushButton = QtWidgets.QPushButton
 
-def_poni_file = '' # '/Users/vthampy/SSRL_Data/RDA/static_det_test_data/test_xfc_data/test_xfc.poni'
-def_img_file = '' # '/Users/vthampy/SSRL_Data/RDA/static_det_test_data/test_xfc_data/images/images_0005.tif'
+def_poni_file = '/Users/vthampy/SSRL_Data/RDA/static_det_test_data/test_xfc_data/test_xfc.poni'
+def_img_file = '/Users/vthampy/SSRL_Data/RDA/static_det_test_data/test_xfc_data/images/images_0005.tif'
 
 if not os.path.exists(def_poni_file):
     def_poni_file = ''
@@ -89,6 +90,11 @@ params = [
         {'name': 'Scale', 'type': 'float', 'value': 1, 'visible': False},
         {'name': 'norm_channel', 'title': 'Normalize', 'type': 'list', 'values': ['bstop'], 'value': 'bstop',
          'visible': False},
+    ], 'expanded': False, 'visible': False},
+    {'name': 'Mask', 'title': 'Mask', 'type': 'group', 'children': [
+        {'name': 'Threshold', 'type': 'bool', 'value': False},
+        {'name': 'min', 'title': 'Min', 'type': 'int', 'value': 0},
+        {'name': 'max', 'title': 'Max', 'type': 'int', 'value': 0},
     ], 'expanded': False, 'visible': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'children': [
         {'name': 'Grazing', 'type': 'bool', 'value': False},
@@ -150,6 +156,7 @@ class specWrangler(wranglerWidget):
         """fname: str, file path
         file_lock: mp.Condition, process safe lock
         """
+        # ic()
         super().__init__(fname, file_lock, parent)
 
         # Scan Parameters
@@ -172,17 +179,17 @@ class specWrangler(wranglerWidget):
         self.ui.continueButton.clicked.connect(self.cont)
 
         # SpecCommand Line
-        self.specCommandLine = commandLine(self)
-        self.specCommandLine.send_command = self.send_command
-        self.ui.commandLayout.addWidget(self.specCommandLine)
-        self.buttonSend = QtWidgets.QPushButton(self)
-        self.buttonSend.setText('Send')
-        self.buttonSend.clicked.connect(self.send_command)
-        self.ui.commandLayout.addWidget(self.buttonSend)
-        self.commands = ['']
-        self.current = -1
-        self.keep_trying = True
-        self.showLabel.connect(self.ui.specLabel.setText)
+        # self.specCommandLine = commandLine(self)
+        # self.specCommandLine.send_command = self.send_command
+        # self.ui.commandLayout.addWidget(self.specCommandLine)
+        # self.buttonSend = QtWidgets.QPushButton(self)
+        # self.buttonSend.setText('Send')
+        # self.buttonSend.clicked.connect(self.send_command)
+        # # self.ui.commandLayout.addWidget(self.buttonSend)
+        # self.commands = ['']
+        # self.current = -1
+        # self.keep_trying = True
+        # self.showLabel.connect(self.ui.specLabel.setText)
 
         # Setup parameter tree
         self.tree = ParameterTree()
@@ -228,6 +235,11 @@ class specWrangler(wranglerWidget):
         self.bg_file_filter = self.parameters.child('BG').child('Match').child('Filter').value()
         self.bg_scale = self.parameters.child('BG').child('Scale').value()
         self.bg_norm_channel = self.parameters.child('BG').child('norm_channel').value()
+
+        # Threshold
+        self.apply_threshold = self.parameters.child('Mask').child('Threshold').value()
+        self.threshold_min = self.parameters.child('Mask').child('min').value()
+        self.threshold_max = self.parameters.child('Mask').child('max').value()
 
         # Grazing Incidence
         self.gi = self.parameters.child('GI').child('Grazing').value()
@@ -321,6 +333,9 @@ class specWrangler(wranglerWidget):
             self.bg_norm_channel,
             self.gi,
             self.th_mtr,
+            self.apply_threshold,
+            self.threshold_min,
+            self.threshold_max,
             self.timeout,
             self.command,
             self.sphere,
@@ -411,6 +426,16 @@ class specWrangler(wranglerWidget):
 
         self.bg_norm_channel = self.parameters.child('BG').child('norm_channel').value()
         self.thread.bg_norm_channel = self.bg_norm_channel
+
+        # Threshold
+        self.apply_threshold = self.parameters.child('Mask').child('Threshold').value()
+        self.thread.apply_threshold = self.apply_threshold
+
+        self.threshold_min = self.parameters.child('Mask').child('min').value()
+        self.thread.threshold_min = self.threshold_min
+
+        self.threshold_max = self.parameters.child('Mask').child('max').value()
+        self.thread.threshold_max = self.threshold_max
 
         # Grazing Incidence
         self.gi = self.parameters.child('GI').child('Grazing').value()
@@ -605,11 +630,22 @@ class specWrangler(wranglerWidget):
                     # ic('breaking')
                     break
 
+        if self.exists_meta_file(self.img_file):
+            # print('found meta file')
+            self.set_pars_from_meta()
+        else:
+            # print('no meta file - resetting')
+            self.reset_pars()
+
         # ic(self.img_file, self.scan_parameters)
-        if (((self.img_file != old_fname) or (self.img_file and (len(self.scan_parameters) < 1)))
-                and self.meta_ext):
-            if self.exists_meta_file(self.img_file):
-                self.set_pars_from_meta()
+        # if (((self.img_file != old_fname) or (self.img_file and (len(self.scan_parameters) < 1)))
+        #         and self.meta_ext):
+        #     if self.exists_meta_file(self.img_file):
+        #         print('found meta file')
+        #         self.set_pars_from_meta()
+        #     else:
+        #         print('no meta file - resetting')
+        #         self.reset_pars()
 
     def set_series_average(self):
         self.series_average = self.parameters.child('Signal').child('series_average').value()
@@ -617,6 +653,7 @@ class specWrangler(wranglerWidget):
     def set_meta_ext(self):
         # ic()
         self.meta_ext = self.parameters.child('Signal').child('meta_ext').value()
+        # print(self.meta_ext)
         if self.meta_ext == 'None':
             self.meta_ext = None
         self.get_img_fname()
@@ -645,6 +682,16 @@ class specWrangler(wranglerWidget):
         self.set_bg_matching_options()
         self.set_gi_motor_options()
         self.set_bg_norm_options()
+
+    def reset_pars(self):
+        self.scan_parameters, self.motors, self.counters = [], [], []
+        self.set_bg_matching_options()
+        # self.bg_matching_par = None
+
+        self.set_gi_motor_options()
+        self.set_bg_norm_options()
+        # self.bg_norm_channel = 'None'
+        # self.th_mtr = 'Manual'
 
     def set_mask_file(self):
         """Opens file dialogue and sets the mask file
@@ -769,9 +816,11 @@ class specWrangler(wranglerWidget):
             pars.insert(0, pars.pop(pars.index('theta')))
             value = 'theta'
         else:
-            value = 'Theta'
+            # value = 'Theta'
+            value = 'Manual'
 
-        pars = ['Manual'] + pars
+        if 'Manual' not in pars:
+            pars = ['Manual'] + pars
         # ic(pars)
 
         opts = {'values': pars, 'limits': pars, 'value': value}
@@ -791,6 +840,7 @@ class specWrangler(wranglerWidget):
         """
         # ic(self.img_file)
         if not self.img_file:
+            self.scan_parameters, self.motors, self.counters = [], [], []
             return
 
         img_meta = get_img_meta(self.img_file, self.meta_ext)
@@ -886,6 +936,9 @@ class specThread(wranglerThread):
             bg_norm_channel,
             gi,
             th_mtr,
+            apply_threshold,
+            threshold_min,
+            threshold_max,
             timeout,
             command,
             sphere,
@@ -941,6 +994,9 @@ class specThread(wranglerThread):
         self.bg_norm_channel = bg_norm_channel
         self.gi = gi
         self.th_mtr = th_mtr
+        self.apply_threshold = apply_threshold
+        self.threshold_min = threshold_min
+        self.threshold_max = threshold_max
         self.timeout = timeout
         self.command = command
         self.sphere = sphere
@@ -968,7 +1024,6 @@ class specThread(wranglerThread):
         self.processed_scans.clear()
         self.detector = self.poni_dict['detector']
         self.sub_label = ''
-        # self.get_mask()
         self.mask = get_mask_array(self.detector, self.mask_file)
 
         self.process_scan()
@@ -1029,17 +1084,21 @@ class specThread(wranglerThread):
                     break
                 continue
 
+            # Apply Threshold
+            threshold_mask = None if not self.apply_threshold else self.threshold(img_data)
+            #if self.apply_threshold:
+            #    threshold_mask = self.threshold(img_data)
+
             # Get Background
             bg_raw = self.get_background(img_file, img_number, img_meta)
-
-            # ic(self.th_mtr)
 
             # Initialize arch and integrate
             arch = EwaldArch(
                 img_number, img_data, poni_dict=self.poni_dict,
                 scan_info=img_meta, static=True, gi=self.gi,
                 th_mtr=self.th_mtr, bg_raw=bg_raw,
-                series_average=self.series_average
+                series_average=self.series_average,
+                mask=threshold_mask,
             )
 
             # integrate image to 1d and 2d arrays
@@ -1146,9 +1205,6 @@ class specThread(wranglerThread):
                             pass
 
                 scan_name, img_file = sname, fname
-                # ic(sname, scan_name, n)
-                # if len(self.img_fnames) == 0:
-                #     return img_file, scan_name, 1, img_data, meta
 
         if n > 1:
             img_data /= n
@@ -1159,7 +1215,6 @@ class specThread(wranglerThread):
                     pass
 
         return img_file, scan_name, img_number, img_data, img_meta
-        # return None, None, None, None, None
 
     def get_meta_data(self, img_file):
         meta_file = f'{os.path.splitext(img_file)[0]}.{self.meta_ext}'
@@ -1214,28 +1269,11 @@ class specThread(wranglerThread):
 
         return sphere
 
-    def get_mask(self):
-        """Get mask array from mask file
+    def threshold(self, img_data):
+        """Apply threshold to image data
         """
-        self.mask = self.detector.calc_mask()
-        if self.mask_file and os.path.exists(self.mask_file):
-            if self.mask is not None:
-                try:
-                    self.mask += fabio.open(self.mask_file).data
-                except ValueError:
-                    print('Mask file not valid for Detector')
-                    pass
-            else:
-                self.mask = fabio.open(self.mask_file).data
-
-        if self.mask is None:
-            return None
-
-        if self.mask.shape != self.detector.shape:
-            print('Mask file not valid for Detector')
-            return None
-
-        self.mask = np.flatnonzero(self.mask)
+        mask = (img_data < self.threshold_min) | (img_data > self.threshold_max)
+        return np.flatnonzero(mask)
 
     def get_background(self, img_file, img_number, img_meta):
         """Subtract background image if bg_file or bg_dir specified
