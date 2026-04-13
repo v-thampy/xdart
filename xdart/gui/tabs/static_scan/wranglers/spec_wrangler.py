@@ -50,7 +50,7 @@ params = [
         NamedActionParameter(name='img_dir_browse', title='Browse...', visible=False),
         {'name': 'include_subdir', 'title': 'Subdirectories', 'type': 'bool', 'value': False, 'visible': False},
         {'name': 'img_ext', 'title': 'File Type  ', 'type': 'list',
-         'values': ['tif', 'raw', 'h5', 'mar3450'], 'value': 'tif', 'visible': False},
+         'values': ['tif', 'raw', 'h5', 'nxs', 'mar3450'], 'value': 'tif', 'visible': False},
         {'name': 'series_average', 'title': 'Average Scan', 'type': 'bool', 'value': False, 'visible': True},
         {'name': 'meta_ext', 'title': 'Meta File', 'type': 'list',
          'values': ['None', 'txt', 'pdi', 'SPEC'], 'value': 'txt'},
@@ -747,7 +747,7 @@ class specWrangler(wranglerWidget):
         """Opens file dialogue and sets the spec data file
         """
         fname, _ = QFileDialog().getOpenFileName(
-            filter="Images (*.tiff *.tif *.h5 *.raw *.mar3450)"
+            filter="Images (*.tiff *.tif *.h5 *.hdf5 *.nxs *.raw *.mar3450)"
         )
         if fname != '':
             self.parameters.child('Signal').child('File').setValue(fname)
@@ -774,14 +774,16 @@ class specWrangler(wranglerWidget):
                 self.img_file = img_file
                 _p = Path(self.img_file)
                 self.img_dir, self.img_ext = str(_p.parent), _p.suffix.lstrip('.')
-                # Auto-detect metadata sidecar if not already set
-                if not self.meta_ext:
+                self._sync_meta_ext_to_img_ext()
+                # Auto-detect metadata sidecar if not already set (skipped for .nxs)
+                if not self.meta_ext and self.img_ext.lower() != 'nxs':
                     self.detect_meta_ext(self.img_file)
 
         else:
             self.img_ext = self.parameters.child('Signal').child('img_ext').value()
             self.img_dir = self.parameters.child('Signal').child('img_dir').value()
             self.include_subdir = self.parameters.child('Signal').child('include_subdir').value()
+            self._sync_meta_ext_to_img_ext()
 
             filters = '*' + '*'.join(f for f in self.file_filter.split()) + '*'
             filters = filters if filters != '**' else '*'
@@ -822,6 +824,21 @@ class specWrangler(wranglerWidget):
             self.meta_ext = None
         self._save_to_session()
         self.get_img_fname()
+
+    def _sync_meta_ext_to_img_ext(self):
+        """Force meta_ext='None' and lock it when the image type is NeXus.
+
+        NeXus/.nxs files embed their own metadata (motors, counters, energy)
+        inside the HDF5 tree, so no sidecar file is needed.  The parameter is
+        made readonly while img_ext == 'nxs' and re-enabled otherwise.
+        """
+        meta_param = self.parameters.child('Signal').child('meta_ext')
+        if (self.img_ext or '').lower() == 'nxs':
+            if meta_param.value() != 'None':
+                meta_param.setValue('None')    # fires set_meta_ext
+            meta_param.setReadonly(True)
+        else:
+            meta_param.setReadonly(False)
 
     def exists_meta_file(self, img_file):
         """Checks for existence of meta file for image file"""

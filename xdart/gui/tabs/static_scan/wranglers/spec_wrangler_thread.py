@@ -11,7 +11,9 @@ and file I/O in a separate QThread.
 # Standard library imports
 import logging
 import os
+import queue
 import re
+import threading
 import time
 import glob
 import numpy as np
@@ -50,6 +52,19 @@ def _is_eiger_master(path):
     return Path(path).stem.endswith('_master')
 
 
+def _raw_lives_in_source(path):
+    """Return True if the raw image for ``path`` is already embedded in the
+    source file (Eiger master or any HDF5/NeXus container).
+
+    When this is the case, writing ``map_raw`` into the output sphere HDF5
+    is pure duplication and can dominate the per-frame write cost.
+    """
+    if not path:
+        return False
+    ext = Path(path).suffix.lower()
+    return ext in _RAW_EMBEDDED_EXTS or _is_eiger_master(path)
+
+
 def _get_scan_info(fname):
     """Return (scan_name, img_number) for a file path.
 
@@ -73,6 +88,36 @@ def _get_scan_info(fname):
 # Pre-compiled regex patterns (avoids recompilation on every sort key call)
 _INT_PATTERN = re.compile(r'(\d+)')
 _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
+
+# Maximum number of frames to accumulate in the pending list before
+# dispatching a partial batch.  Keeps peak memory bounded when the input
+# contains thousands of frames in a single file (e.g. Bluesky .nxs with
+# a 1000-frame Eiger stack at 2167x2070 int32 ~= 18 GB if collected in
+# one go).  Larger values amortise ThreadPoolExecutor startup and the
+# end-of-batch sphere._save_to_h5 flush across more frames, so raise
+# this when RAM allows.  64 frames of a 2167x2070 int32 Eiger image
+# is ~1.2 GB of peak buffer.
+_PENDING_FLUSH_SIZE = 64
+
+# Number of frames the background prefetch worker is allowed to read
+# ahead of the main collect loop.  Kept small: too large and the prefetcher
+# contends with the h5py writer for disk I/O (source .nxs and output HDF5
+# usually share a spindle), and 18 MB/frame stacks up memory pressure that
+# slows the write phase.  The main speedup for reads comes from the bulk
+# read path below, not from growing this queue.
+_PREFETCH_QUEUE_SIZE = 4
+
+# How many frames the prefetcher reads from HDF5 in a single slice.  HDF5
+# chunks are typically sized so that one decompression produces multiple
+# frames, so reading N frames as `dset[i:i+N]` decompresses each chunk once
+# instead of N times.  Frames are then dispatched one-by-one to the
+# consumer queue, so downstream consumers are unaffected.
+_PREFETCH_READ_CHUNK = 16
+
+# File extensions whose raw image data already lives in the source file
+# — no need to duplicate `map_raw` into the output sphere HDF5.  This is
+# the single biggest write-time win for multi-frame NeXus / HDF5 inputs.
+_RAW_EMBEDDED_EXTS = frozenset({'.h5', '.hdf5', '.nxs'})
 
 
 def atoi(text):
@@ -251,6 +296,10 @@ class specThread(wranglerThread):
         self._eiger_h5_handle = None     # persistent h5py.File for Eiger reads
         self._eiger_h5_dataset = None    # dataset reference inside the open file
         self._eiger_fabio_handle = None  # persistent fabio.EigerImage fallback
+        # Background prefetch state (populated on demand)
+        self._prefetch_queue = None      # queue.Queue of frame tuples or None sentinel
+        self._prefetch_thread = None     # threading.Thread running the reader
+        self._prefetch_stop_evt = None   # threading.Event — set to cancel worker
 
     # ── Display helpers ──────────────────────────────────────────────────
 
@@ -293,6 +342,10 @@ class specThread(wranglerThread):
         self._eiger_nframes = 0
         self._eiger_master_queue.clear()
         self._eiger_done_masters.clear()
+        self._prefetch_stop_prior()     # tear down any lingering prefetcher
+        self._prefetch_queue = None
+        self._prefetch_thread = None
+        self._prefetch_stop_evt = None
         self.detector = get_detector(self.poni.detector) if self.poni.detector else None
         self.sub_label = ''
         det_mask = self.detector.mask if self.detector is not None else None  # pyFAI .mask property
@@ -317,6 +370,12 @@ class specThread(wranglerThread):
         try:
             self.process_scan()
         finally:
+            # Stop background prefetcher from the main thread BEFORE closing the
+            # master handle.  _eiger_close_master() is called from inside the
+            # prefetch worker when switching masters, so triggering a stop from
+            # there would self-join — only the main thread should tear down the
+            # prefetcher.
+            self._prefetch_stop_prior()
             self._eiger_close_master()  # ensure Eiger handle is released
         logger.info('Total Time: %.2fs', time.time() - t0)
 
@@ -334,17 +393,30 @@ class specThread(wranglerThread):
 
         # ── Phase 1 & 2: collect then process all existing images ─────────────
         pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]
+        # Per-flush read-time accumulator.  With the prefetcher this is mostly
+        # queue-wait time on the main thread, not raw h5py I/O.
+        _t_read_accum = 0.0
 
         while True:
             if self.command == 'stop':
                 break
 
+            _t_r0 = time.time()
             img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
+            _t_read_accum += time.time() - _t_r0
             if img_data is None:
                 break  # initial glob exhausted — move on to processing
             if img_file is not None:
                 fname = os.path.splitext(os.path.basename(img_file))[0]
-                self.showLabel.emit(f'Collecting {self._middle_truncate(fname)}')
+                # When the input is a multi-frame container (HDF5/NeXus/Eiger master),
+                # include the frame index so progress is visible.
+                _ext = Path(img_file).suffix.lower()
+                if _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file):
+                    self.showLabel.emit(
+                        f'Collecting {self._middle_truncate(fname)} [frame {img_number}]'
+                    )
+                else:
+                    self.showLabel.emit(f'Collecting {self._middle_truncate(fname)}')
             else:
                 logger.warning('Invalid image file, skipping')
                 continue
@@ -379,9 +451,30 @@ class specThread(wranglerThread):
             if self.single_img and not is_eiger:
                 break
 
+            # ── Bounded-memory dispatch ─────────────────────────────────────
+            # Flush when the pending list fills up so that memory stays
+            # bounded on large multi-frame inputs (e.g. 1000-frame .nxs).
+            if len(pending) >= _PENDING_FLUSH_SIZE:
+                self.showLabel.emit(
+                    f'Integrating {len(pending)} frames (partial batch)...'
+                )
+                _t_disp = time.time()
+                files_processed += self._dispatch_batch(sphere, pending)
+                logger.info(
+                    '[FLUSH] %d frames  read=%.2fs  dispatch=%.2fs',
+                    len(pending), _t_read_accum, time.time() - _t_disp,
+                )
+                pending = []
+                _t_read_accum = 0.0
+
         # Process whatever is left
         if pending and sphere is not None and self.command != 'stop':
+            _t_disp = time.time()
             files_processed += self._dispatch_batch(sphere, pending)
+            logger.info(
+                '[FLUSH-FINAL] %d frames  read=%.2fs  dispatch=%.2fs',
+                len(pending), _t_read_accum, time.time() - _t_disp,
+            )
 
         # ── Phase 3: live watching ────────────────────────────────────────────
         if self.live_mode and self.command != 'stop' and sphere is not None:
@@ -512,6 +605,16 @@ class specThread(wranglerThread):
                     **bai_2d_args,
                 )
 
+            # Precompute the raw-image thumbnail here, in parallel with
+            # other workers' integrations, rather than on the serial Phase 2
+            # writer thread.  scipy.ndimage.zoom and numpy subtract release
+            # the GIL for their C code, so this overlaps cleanly.
+            try:
+                arch.make_thumbnail(global_mask=mask)
+            except Exception as e:
+                logger.warning('Thumbnail precompute failed for image %s: %s',
+                               img_number, e)
+
             # XYE / CSV output (thread-safe: unique filenames per frame)
             self.save_1d(sphere, arch, img_number)
 
@@ -569,14 +672,20 @@ class specThread(wranglerThread):
                                     arch.source_file = str(img_file)
                             else:
                                 arch.source_file = ""
-                            arch.skip_map_raw = skip_2d or _is_eiger_master(img_file)
+                            arch.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
 
                             sphere.add_arch(
                                 arch=arch, calculate=False, update=True,
                                 get_sd=True, set_mg=False, static=True, gi=gi,
                                 th_mtr=th_mtr, series_average=series_average,
                                 h5file=h5f,
+                                # Defer scan_data + integrated_1d/2d writes until
+                                # after the loop so they're persisted once per
+                                # batch instead of once per frame.
+                                batch_save=True,
                             )
+                        # One-shot flush of deferred per-batch accumulators
+                        sphere.flush_batch_state(h5file=h5f)
                     # Flush overall_raw / metadata (we already hold file_lock)
                     with _catch_h5(sphere.data_file, 'a') as h5f2:
                         sphere._save_to_h5(h5f2, data_only=False)
@@ -661,7 +770,7 @@ class specThread(wranglerThread):
             else:
                 arch.source_file = ""
             # For Eiger: raw frames already live in the master file — don't double-store them.
-            arch.skip_map_raw = sphere.skip_2d or _is_eiger_master(img_file)
+            arch.skip_map_raw = sphere.skip_2d or _raw_lives_in_source(img_file)
             # Pause the read pool so h5viewer cannot reopen the file while we write.
             _get_h5pool().pause(sphere.data_file)
             _t4 = time.time()
@@ -708,49 +817,52 @@ class specThread(wranglerThread):
         return count_frames(master_path)
 
     def _eiger_open_master(self, master_path):
-        """Open (or switch to) an Eiger master HDF5 file, keeping the handle.
+        """Open (or switch to) an Eiger / NeXus HDF5 file, keeping the handle.
 
         Strategy
         --------
-        1. **Persistent fabio handle (primary)** — ``fabio.EigerImage`` is
-           purpose-built for Eiger master files and handles all firmware
-           variants, external-link layouts (``_data_*.h5``), and frame
-           indexing natively.  The handle is kept open across frames to
-           avoid the expensive open/close cycle.
-        2. **h5py fallback** — if fabio fails (unusual file, missing
-           codec, etc.), try opening with h5py and locating a contiguous
-           3D image dataset.
+        - ``.nxs`` files → skip fabio and go straight to h5py using
+          ``find_nexus_image_dataset`` to locate the 3D image dataset.
+          fabio's EigerImage is tuned for Eiger master layouts and does
+          not reliably find image arrays in Bluesky-style NeXus files.
+        - Otherwise (``_master.h5`` etc.):
+            1. **Persistent fabio handle (primary)** — ``fabio.EigerImage``
+               is purpose-built for Eiger master files and handles all
+               firmware variants, external-link layouts (``_data_*.h5``),
+               and frame indexing natively.
+            2. **h5py fallback** — if fabio fails, locate the 3D image
+               dataset via ``find_nexus_image_dataset``.
         """
         self._eiger_close_master()
-        try:
-            # Primary: fabio (handles all Eiger layouts)
-            self._eiger_fabio_handle = fabio.open(master_path)
-            self._eiger_nframes = self._eiger_fabio_handle.nframes
-        except (IOError, OSError) as e:
-            # Fallback: h5py for non-standard layouts
-            logger.debug("Failed to open Eiger master with fabio %s: %s, trying h5py", master_path, e)
-            self._eiger_fabio_handle = None
+
+        ext = Path(master_path).suffix.lower()
+        is_nexus = ext == '.nxs'
+
+        if not is_nexus:
             try:
-                self._eiger_h5_handle = h5py.File(master_path, 'r')
-                ds_path = None
-                for candidate in ('/entry/data/data',
-                                  '/entry/instrument/detector/data'):
-                    if candidate in self._eiger_h5_handle:
-                        obj = self._eiger_h5_handle[candidate]
-                        if isinstance(obj, h5py.Dataset) and obj.ndim == 3:
-                            ds_path = candidate
-                            break
-                if ds_path:
-                    self._eiger_h5_dataset = self._eiger_h5_handle[ds_path]
-                    self._eiger_nframes = self._eiger_h5_dataset.shape[0]
-                else:
-                    logger.warning('Could not find image dataset in %s', master_path)
-                    self._eiger_close_master()
-                    self._eiger_nframes = 0
-            except Exception as e:
-                logger.error('Error opening Eiger master %s: %s', master_path, e)
+                # Primary: fabio (handles all Eiger layouts)
+                self._eiger_fabio_handle = fabio.open(master_path)
+                self._eiger_nframes = self._eiger_fabio_handle.nframes
+                return
+            except (IOError, OSError) as e:
+                logger.debug("Failed to open %s with fabio: %s, trying h5py", master_path, e)
+                self._eiger_fabio_handle = None
+
+        # h5py path (primary for .nxs, fallback for .h5/.hdf5 master files)
+        try:
+            ds_path = find_nexus_image_dataset(master_path)
+            if ds_path is None:
+                logger.warning('Could not find 3D image dataset in %s', master_path)
                 self._eiger_close_master()
                 self._eiger_nframes = 0
+                return
+            self._eiger_h5_handle = h5py.File(master_path, 'r')
+            self._eiger_h5_dataset = self._eiger_h5_handle[ds_path]
+            self._eiger_nframes = self._eiger_h5_dataset.shape[0]
+        except Exception as e:
+            logger.error('Error opening HDF5/NeXus file %s: %s', master_path, e)
+            self._eiger_close_master()
+            self._eiger_nframes = 0
 
     def _eiger_close_master(self):
         """Close persistent Eiger handles (fabio and/or h5py)."""
@@ -784,6 +896,181 @@ class specThread(wranglerThread):
                 self._eiger_master_queue.append(mf_str)
 
     def _get_next_eiger_frame(self):
+        """Return the next frame from Eiger / NeXus HDF5 file(s).
+
+        Wraps :meth:`_get_next_eiger_frame_sync` with a background
+        prefetcher so the next frame's disk read overlaps with the
+        current frame's integration.  The synchronous reader is still
+        available for the worker itself and for paths that don't want
+        prefetching.
+
+        Uses a short polling timeout so the main thread can break out
+        of a blocked ``.get()`` if the user hits Stop and the prefetch
+        worker exited without pushing a sentinel.
+        """
+        if self._prefetch_queue is None:
+            self._start_prefetcher()
+        # Poll the queue so we can cooperate with user Stop even if the
+        # prefetcher died or hasn't pushed an end-of-stream sentinel yet.
+        while True:
+            if self.command == 'stop':
+                return (None, None, 1, None, {})
+            try:
+                return self._prefetch_queue.get(timeout=0.25)
+            except queue.Empty:
+                # If the worker is gone and queue is drained, fall through
+                # with an end-of-stream sentinel so the caller can exit.
+                if (self._prefetch_thread is None
+                        or not self._prefetch_thread.is_alive()):
+                    return (None, None, 1, None, {})
+                continue
+
+    def _start_prefetcher(self):
+        """Spin up the background prefetch thread (idempotent)."""
+        if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+            return
+        self._prefetch_queue = queue.Queue(maxsize=_PREFETCH_QUEUE_SIZE)
+        self._prefetch_stop_evt = threading.Event()
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_worker,
+            name='eiger-prefetch',
+            daemon=True,
+        )
+        self._prefetch_thread.start()
+
+    def _push_frame_to_queue(self, item):
+        """Put *item* onto the prefetch queue, cooperating with stop.
+
+        Returns True if the item was queued, False if the worker was
+        cancelled while blocking on a full queue.
+        """
+        while not self._prefetch_stop_evt.is_set() and self.command != 'stop':
+            try:
+                self._prefetch_queue.put(item, timeout=0.25)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _prefetch_worker(self):
+        """Read frames sequentially and push them onto the bounded queue.
+
+        Uses bulk HDF5 slices (`dset[i:i+N]`) where possible so each chunk
+        is decompressed once per N frames instead of N times.  Falls back
+        to single-frame reads via :meth:`_get_next_eiger_frame_sync` for
+        the initial master-file setup, fabio-backed sources, and
+        live-growing files (where bulk reads past the known end are
+        unsafe).
+
+        The worker exits when:
+          - a frame with ``img_data is None`` is produced (end of stream);
+          - the stop event is set (cooperative cancellation);
+          - ``self.command == 'stop'`` (user pressed Stop).
+        Exceptions are logged and a sentinel tuple is pushed so the
+        consumer can terminate cleanly.
+        """
+        sentinel_pushed = False
+        try:
+            while not self._prefetch_stop_evt.is_set() and self.command != 'stop':
+                # Always fetch the first frame of (the next) master through
+                # the sync reader — it handles master-queue advancement,
+                # handle opening, and frame-count refresh.
+                item = self._get_next_eiger_frame_sync()
+                if not self._push_frame_to_queue(item):
+                    return
+                if item[3] is None:
+                    # End of stream; worker is done — sentinel already queued.
+                    sentinel_pushed = True
+                    return
+
+                # Fast path: bulk-read the remainder of this master through
+                # the h5py dataset.  Skipped when fabio is primary (fabio
+                # handles its own per-frame decoding) or when we're near
+                # the tail of a live-growing file.
+                while (not self._prefetch_stop_evt.is_set()
+                       and self.command != 'stop'
+                       and self._eiger_fabio_handle is None
+                       and self._eiger_h5_dataset is not None
+                       and self._eiger_frame_idx < self._eiger_nframes):
+
+                    start = self._eiger_frame_idx
+                    end = min(start + _PREFETCH_READ_CHUNK, self._eiger_nframes)
+                    try:
+                        block = np.asarray(
+                            self._eiger_h5_dataset[start:end], dtype='int32'
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            'Bulk read failed (start=%d end=%d): %s; '
+                            'falling back to per-frame read',
+                            start, end, e,
+                        )
+                        break  # outer loop will resume with sync reader
+
+                    meta = (read_image_metadata(self._eiger_master_path,
+                                                meta_format=self.meta_ext)
+                            if self.meta_ext else {})
+                    master_stem = Path(self._eiger_master_path).stem
+                    scan_name = (master_stem[:-7]
+                                 if master_stem.endswith('_master')
+                                 else master_stem)
+
+                    # Advance the shared frame cursor *before* dispatching so
+                    # that any concurrent sync read (e.g. in fallback) does
+                    # not re-serve these frames.
+                    self._eiger_frame_idx = end
+
+                    for i in range(end - start):
+                        if (self._prefetch_stop_evt.is_set()
+                                or self.command == 'stop'):
+                            return
+                        frame_idx = start + i
+                        item = (
+                            self._eiger_master_path,
+                            scan_name,
+                            frame_idx + 1,   # 1-based img_number
+                            block[i],
+                            meta,
+                        )
+                        if not self._push_frame_to_queue(item):
+                            return
+        except Exception as e:
+            logger.exception('Eiger prefetch worker failed: %s', e)
+        finally:
+            # Guarantee the consumer unblocks no matter how we exit
+            # (stop event, command=='stop', exception, or normal return).
+            if not sentinel_pushed:
+                try:
+                    self._prefetch_queue.put(
+                        (None, None, 1, None, {}), timeout=1.0,
+                    )
+                except queue.Full:
+                    # Drain one slot so the sentinel can fit — the main
+                    # thread has already seen stop, so dropping a queued
+                    # frame is fine.
+                    try:
+                        self._prefetch_queue.get_nowait()
+                        self._prefetch_queue.put_nowait(
+                            (None, None, 1, None, {}),
+                        )
+                    except (queue.Empty, queue.Full):
+                        pass
+
+    def _prefetch_stop_prior(self):
+        """Cancel any prior prefetch thread and drain its queue."""
+        if self._prefetch_stop_evt is not None:
+            self._prefetch_stop_evt.set()
+        if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+            # Drain to unblock the worker on a full queue
+            if self._prefetch_queue is not None:
+                try:
+                    while True:
+                        self._prefetch_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self._prefetch_thread.join(timeout=2.0)
+
+    def _get_next_eiger_frame_sync(self):
         """Return the next frame from Eiger HDF5 master file(s), one at a time.
 
         Keeps the h5py file handle open across frames to avoid the
@@ -887,7 +1174,7 @@ class specThread(wranglerThread):
             scan_name, img_number = _get_scan_info(self.img_file)
             return self.img_file, scan_name, img_number, img_data, meta
 
-        if is_master or self.img_ext.lower() in ('h5', 'hdf5'):
+        if is_master or self.img_ext.lower() in ('h5', 'hdf5', 'nxs'):
             return self._get_next_eiger_frame()
 
         if len(self.img_fnames) == 0:

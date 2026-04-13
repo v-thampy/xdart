@@ -546,6 +546,33 @@ class EwaldArch():
         with self.arch_lock:
             self.scan_info = new_data
 
+    def make_thumbnail(self, global_mask=None):
+        """Compute and cache a downsampled (map_raw - bg_raw) preview.
+
+        Stores the result on ``self.thumbnail``; :meth:`save_to_nexus`
+        picks it up and skips its own (serial-path) computation.  Safe to
+        call from a worker thread — only numpy + scipy work, no HDF5 I/O.
+
+        Parameters
+        ----------
+        global_mask : array-like or None
+            Flat indices of detector-level masked pixels, typically
+            ``EwaldSphere.global_mask`` / wrangler ``self.mask``.  Masked
+            pixels become NaN in the thumbnail before downsampling.
+        """
+        if self.thumbnail is not None:
+            return
+        if self.map_raw is None:
+            return
+        try:
+            corrected = (np.asarray(self.map_raw, dtype=np.float32)
+                         - np.asarray(self.bg_raw, dtype=np.float32))
+        except Exception:
+            return
+        self.thumbnail = _make_thumbnail(
+            corrected, mask_idx=self.mask, global_mask=global_mask,
+        )
+
     def save_to_h5(self, file, compression=None):
         """Saves data to hdf5 file using h5py as backend.
         DEPRECATED — use save_to_nexus for new code.
