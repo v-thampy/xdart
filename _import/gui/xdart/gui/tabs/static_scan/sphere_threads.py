@@ -23,7 +23,6 @@ from pyqtgraph import Qt
 from xdart.utils import catch_h5py_file as catch
 from xdart import utils as ut
 
-import gc
 
 
 
@@ -361,8 +360,6 @@ class fileHandlerThread(Qt.QtCore.QThread):
                         logger.debug("Data missing for arch %s during aggregation: %s", idx, e)
 
             self.sigUpdate.emit()
-
-        gc.collect()
 
     def save_data_as(self):
         if self.new_fname is not None and self.new_fname != "":
