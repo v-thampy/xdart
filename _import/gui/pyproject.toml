@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xdart"
-version = "0.35.1"
+version = "0.35.2"
 description = "A pyFAI-based GUI for X-ray diffraction data reduction and visualization"
 readme = "README.md"
 license = {text = "MIT"}

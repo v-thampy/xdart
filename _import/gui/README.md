@@ -24,38 +24,45 @@ xdart enables fast, intuitive analysis of X-ray diffraction (XRD) data from sync
 
 A single installer script handles everything: it creates a dedicated conda environment, installs the heavy scientific stack from conda-forge (`pyFAI`, `h5py`, `pymatgen`, Qt, HDF5 libraries), and installs both `xdart` and its computational core [`ssrl_xrd_tools`](https://github.com/v-thampy/ssrl_xrd_tools) on top. This conda-for-native + pip-for-Python split avoids the binary mismatches that can occur when mixing sources for native-backed packages.
 
-**TL;DR — one-line install** (requires conda or mamba; see [below](#if-you-dont-have-condamamba) if you don't have either, and the [Windows prerequisites](#prerequisites-git-windows) if you're on Windows):
+**TL;DR — one-line install** (requires conda or mamba; see [below](#if-you-dont-have-condamamba) if you don't have either):
+
+**Linux / macOS (bash)**
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.sh | bash
 ```
 
-Then `conda activate xrd` (or `mamba activate xrd` if you used mamba) and run `xdart`. Read on for prerequisites, options, and the developer workflow.
+**Windows (PowerShell)**
 
-### Prerequisites: Git (Windows)
+```powershell
+iex "& { $(iwr -useb https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.ps1) }"
+```
 
-The installer script and the development workflow both rely on `git` (and on Windows, on the bash shell that ships with it). macOS and most Linux distributions already include `git`; Windows users need to install it once.
+Then `conda activate xrd` and run `xdart`. Read on for prerequisites, options, and the developer workflow.
 
-1. Download **Git for Windows** from <https://git-scm.com/download/win>. The installer is signed and bundles `git`, `git bash`, and the OpenSSL/curl tools the install script needs.
-2. Run the installer and accept the defaults. The two settings worth confirming are:
-   - *"Git from the command line and also from 3rd-party software"* — adds `git` to your `PATH`.
-   - *"Use bundled OpenSSH"* and *"Use the OpenSSL library"* — needed so `curl` and `git clone` work over HTTPS.
-3. After install, open **Git Bash** from the Start menu (not `cmd.exe` or PowerShell). All `curl … | bash` commands below should be run from this shell.
-4. Verify the install:
+### Windows notes
 
-   ```bash
-   git --version
-   curl --version
-   ```
+The PowerShell installer (`install.ps1`) is the native Windows path and should be preferred. It has two advantages over piping the bash installer through Git Bash:
 
-If you prefer a package manager, `winget install --id Git.Git -e` or `choco install git` work equivalently — just make sure you launch **Git Bash** afterward so the `curl … | bash` one-liners work.
+1. **It does not require Git Bash.** The script runs in a stock PowerShell or Windows Terminal session.
+2. **It finds your existing conda install.** If you already have Anaconda, Miniconda, or Miniforge installed, the script locates `conda.exe` by inspecting the standard install directories (`%USERPROFILE%\miniforge3`, `%USERPROFILE%\anaconda3`, `C:\ProgramData\Miniconda3`, etc.) — even when `conda init powershell` has not been run. That means you don't need to re-install conda just because `conda` isn't on PowerShell's `PATH`.
+
+If you prefer the bash installer, you'll still need [Git for Windows](https://git-scm.com/download/win) (which provides Git Bash) and conda must be activated inside that shell. The PowerShell path skips both requirements.
 
 ### One-line install (recommended)
 
 No clone required — just run:
 
+**Linux / macOS**
+
 ```bash
 curl -sSL https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.sh | bash
+```
+
+**Windows**
+
+```powershell
+iex "& { $(iwr -useb https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.ps1) }"
 ```
 
 This creates a new conda environment called `xrd` containing Python 3.12, the full scientific stack, `xdart`, and `ssrl_xrd_tools`. After it finishes:
