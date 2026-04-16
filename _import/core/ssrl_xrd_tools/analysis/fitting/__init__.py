@@ -29,3 +29,4 @@ from .models import (
 from .background import snip_1d, chebyshev_background, fit_background, subtract_background
 from .peaks import extract_peaks, peak_table
 from .phase_fitting import PhaseFitter, MultiPhaseResult
+from .batch import FitConfig, FitResultStore, fit_sequence

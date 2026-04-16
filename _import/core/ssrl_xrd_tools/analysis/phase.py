@@ -59,10 +59,97 @@ class PhaseModel:
     def from_cif(cls, path: Path | str, name: str | None = None) -> "PhaseModel":
         if not HAS_PYMATGEN:
             raise ImportError("pymatgen is required for CIF parsing.")
-        
+
         path = Path(path)
         name = name or path.stem
         structure = Structure.from_file(str(path))
+        return cls(name=name, structure=structure)
+
+    @classmethod
+    def from_lattice(
+        cls,
+        name: str,
+        *,
+        a: float,
+        b: float | None = None,
+        c: float | None = None,
+        alpha: float = 90.0,
+        beta: float = 90.0,
+        gamma: float = 90.0,
+        space_group: int | str = 1,
+        species: str | list[str] = "H",
+    ) -> "PhaseModel":
+        """Build a PhaseModel from explicit lattice parameters and a space group.
+
+        This is the CIF-less entry point: it constructs a pymatgen
+        :class:`Structure` with a single dummy atom at the origin and uses
+        the given space group to generate the symmetry-allowed reflections
+        via :class:`XRDCalculator`. The computed peak positions depend only
+        on the lattice and space group (atomic form factors do scale the
+        intensities, but for phase-fraction fitting what matters is the
+        relative *pattern*, which :class:`PhaseFitter` normalises and scales
+        anyway).
+
+        Parameters
+        ----------
+        name : str
+            Name used to identify the phase in fits and reports.
+        a : float
+            Lattice parameter ``a`` in Ångström.  Required.
+        b, c : float, optional
+            Lattice parameters ``b`` and ``c``.  Default to ``a`` (cubic).
+        alpha, beta, gamma : float
+            Lattice angles in degrees.  Default 90° (orthogonal).
+        space_group : int or str
+            Space group number (1–230) or Hermann–Mauguin symbol
+            (e.g. ``"Pca2_1"``, ``"P4_2/nmc"``).  Defaults to ``1`` (P1)
+            which simply enumerates all lattice-allowed reflections.
+        species : str or list of str
+            Dummy species placed at the origin.  Only affects structure
+            factors, not peak *positions*.  Default is hydrogen.
+
+        Returns
+        -------
+        PhaseModel
+
+        Examples
+        --------
+        >>> # Orthorhombic HfO2 (Pca2_1)
+        >>> ortho = PhaseModel.from_lattice(
+        ...     "Ortho", a=5.06, b=5.23, c=5.07, space_group="Pca2_1",
+        ... )
+        >>> # Tetragonal HfO2 (P4_2/nmc)
+        >>> tetra = PhaseModel.from_lattice(
+        ...     "Tetra", a=5.08, c=5.19, space_group="P4_2/nmc",
+        ... )
+        """
+        if not HAS_PYMATGEN:
+            raise ImportError("pymatgen is required for PhaseModel.from_lattice.")
+
+        from pymatgen.symmetry.groups import SpaceGroup
+
+        _b = b if b is not None else a
+        _c = c if c is not None else a
+
+        lattice = Lattice.from_parameters(a, _b, _c, alpha, beta, gamma)
+
+        # Accept int, numeric string, or H–M symbol
+        if isinstance(space_group, str) and space_group.strip().isdigit():
+            space_group = int(space_group.strip())
+        try:
+            sg = SpaceGroup(space_group) if isinstance(space_group, str) else SpaceGroup.from_int_number(int(space_group))
+        except Exception as exc:
+            raise ValueError(
+                f"Unknown space group {space_group!r}. "
+                "Pass an integer (1–230) or a Hermann–Mauguin symbol like 'Pca2_1'."
+            ) from exc
+
+        # Single dummy atom at the origin; symmetry will populate equivalents
+        species_list = [species] if isinstance(species, str) else list(species)
+        coords = [[0.0, 0.0, 0.0]] * len(species_list)
+        structure = Structure.from_spacegroup(
+            sg.symbol, lattice, species_list, coords,
+        )
         return cls(name=name, structure=structure)
         
     def calculate_peaks(self, wavelength: float = 1.5406) -> None:
@@ -82,6 +169,10 @@ class PhaseModel:
             
             # Select first HKL representation for simplicity
             hkl = hkls[0]["hkl"] if isinstance(hkls[0], dict) else hkls[0]
+            # Convert 4-index Miller-Bravais (h,k,i,l) to 3-index (h,k,l)
+            # for trigonal/hexagonal space groups where i = -(h+k)
+            if len(hkl) == 4:
+                hkl = (hkl[0], hkl[1], hkl[3])
             self.peaks.append(PeakData(q=q, intensity=intensity, hkl=hkl, d_spacing=d_hkl))
 
     def update_lattice(self, a: float=None, b: float=None, c: float=None,

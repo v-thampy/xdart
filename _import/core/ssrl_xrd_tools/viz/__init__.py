@@ -12,15 +12,25 @@ mpl
     See :func:`ssrl_xrd_tools.viz.mpl.plot_1d` and
     :func:`ssrl_xrd_tools.viz.mpl.plot_image`.
 
-Planned
--------
 plotly
-    Interactive helpers built on plotly for notebook exploration
-    (hover tooltips, zoom/pan, linked axes). Not yet implemented —
-    will be added alongside the interactive XRD viewer work.
+    Interactive helpers for notebook exploration built on
+    ``plotly.graph_objects``.  See
+    :func:`ssrl_xrd_tools.viz.plotly.plot_pattern_fit`,
+    :func:`plot_phase_fractions`, and :func:`plot_peak_fit`.
 """
 from __future__ import annotations
 
 from ssrl_xrd_tools.viz.mpl import plot_1d, plot_image
+from ssrl_xrd_tools.viz.plotly import (
+    plot_pattern_fit,
+    plot_phase_fractions,
+    plot_peak_fit,
+)
 
-__all__ = ["plot_1d", "plot_image"]
+__all__ = [
+    "plot_1d",
+    "plot_image",
+    "plot_pattern_fit",
+    "plot_phase_fractions",
+    "plot_peak_fit",
+]
