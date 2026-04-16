@@ -6,7 +6,6 @@
 import logging
 import os
 import time
-import gc
 
 logger = logging.getLogger(__name__)
 
@@ -512,8 +511,6 @@ class H5Viewer(QWidget):
                 if self.ui.listData.count() > 0:
                     self.ui.listData.setCurrentRow(self.ui.listData.count() - 1)
         self.sigThreadFinished.emit()
-
-        gc.collect()
     
     def _scans_single_clicked(self, q):
         """Handle single click in listScans — only acts in viewer mode.
@@ -897,8 +894,6 @@ class H5Viewer(QWidget):
             self.load_arches_data(arch_ids, load_2d)
 
         self.sigUpdate.emit()
-
-    gc.collect()
 
     def closeEvent(self, event):
         self._h5pool.close_all()

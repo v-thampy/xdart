@@ -463,20 +463,26 @@ class staticWidget(QWidget):
         self.integratorTree.setEnabled(enable)
 
     def update_all(self, idx=None):
-        """Updates all data in displays
-        TODO: Currently taking the most time for the main gui thread
+        """Updates all data in displays.
+
+        This is the main-thread refresh path for the static scan tab. The
+        forced ``gc.collect()`` that used to live here has been removed:
+        the GIL-interacting stop-the-world pause was contributing to the
+        UI stutter noted in the old TODO.  Cycle collection is left to
+        the default GC schedule, which is run by CPython between
+        allocation bursts.  If profiling ever shows a leak driven by
+        reference cycles here, re-add a scoped ``gc.collect()`` with a
+        comment explaining the specific object graph being collected.
         """
         if idx is not None:
             self.h5viewer.latest_idx = idx
-            
+
         self.h5viewer.update_data()
         if self.h5viewer.auto_last:
             self.latest_arch()
 
         self.displayframe.update()
         self.metawidget.update()
-
-        gc.collect()
 
     def integrator_thread_update(self, idx):
         # self.thread_state_changed()
