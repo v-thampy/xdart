@@ -14,6 +14,7 @@ util  : check_encoded, catch_h5py_file
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import time
@@ -26,6 +27,37 @@ import pandas as pd
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+# ``ast.literal_eval`` is the safe drop-in for the old ``eval`` on persisted
+# HDF5 keys/values.  It parses Python literals (numbers, strings, tuples,
+# lists, dicts, bools, None) without executing arbitrary code.  The old
+# codec used ``eval`` so external or corrupted files could execute code on
+# read — replacing with ``literal_eval`` closes that hole while preserving
+# compatibility for every legitimate persisted value we have in the wild
+# (tuple keys like ``(0, 1)``, ints, floats, repr(str)).
+
+
+def _safe_literal(value):
+    """Safely decode a persisted literal.
+
+    Accepts a bytes/str/numpy scalar produced by an earlier call to
+    ``repr()``/``str()`` and returns the original Python literal. Falls
+    back to ``bytes.decode()`` then the raw value on parse failure.
+    Never executes code.
+    """
+    if isinstance(value, bytes):
+        try:
+            value = value.decode()
+        except UnicodeDecodeError:
+            return value
+    if not isinstance(value, str):
+        # Non-string (already-typed) values pass through unchanged.
+        return value
+    try:
+        return ast.literal_eval(value)
+    except (ValueError, SyntaxError, TypeError, MemoryError):
+        return value
 
 __all__ = [
     # write
@@ -62,29 +94,26 @@ def check_encoded(grp, name: str) -> bool:
 
 
 def soft_list_eval(data, scope: dict | None = None) -> list:
-    """Return a list by applying ``eval`` to each element where possible.
+    """Return a list by safely parsing each element as a Python literal.
 
-    Falls back to ``bytes.decode()`` then the raw value on failure.
+    Uses :func:`ast.literal_eval` so corrupted or externally-sourced HDF5
+    files cannot execute code at read time.  Falls back to
+    ``bytes.decode()`` then the raw value on failure.
 
     Parameters
     ----------
     data:
         Iterable of items (typically byte-strings from an HDF5 index).
     scope:
-        Optional namespace passed to ``eval``.
+        Accepted for backwards compatibility but ignored — the safe parser
+        does not take a namespace.
     """
-    if scope is None:
-        scope = {}
-    out = []
-    for x in data:
-        try:
-            out.append(eval(x, scope))
-        except Exception:
-            try:
-                out.append(x.decode())
-            except (AttributeError, SyntaxError):
-                out.append(x)
-    return out
+    if scope is not None:
+        logger.debug(
+            "soft_list_eval received a scope argument — ignored by the safe "
+            "literal parser. Remove the argument at the call site."
+        )
+    return [_safe_literal(x) for x in data]
 
 
 @contextmanager
@@ -405,7 +434,7 @@ def h5_to_index(grp: h5py.Dataset) -> list | np.ndarray:
 
 
 def h5_to_data(grp, encoder: bool = True,
-               Loader=yaml.UnsafeLoader):
+               Loader=yaml.SafeLoader):
     """Read a value from an HDF5 dataset or group, restoring its Python type.
 
     Parameters
@@ -415,7 +444,12 @@ def h5_to_data(grp, encoder: bool = True,
     encoder:
         If ``True``, inspect the ``encoded`` attribute to select the decoder.
     Loader:
-        :mod:`yaml` Loader class used when ``encoded == 'yaml'``.
+        :mod:`yaml` Loader class used when ``encoded == 'yaml'``. Defaults
+        to :class:`yaml.SafeLoader`, which only materialises standard YAML
+        types. Callers that need to restore arbitrary Python objects from
+        trusted files may pass :class:`yaml.UnsafeLoader` explicitly, but
+        this is discouraged — use an explicit serialization format for
+        non-standard types instead.
     """
     if encoder and "encoded" in grp.attrs:
         encoded = grp.attrs["encoded"]
@@ -447,13 +481,15 @@ def h5_to_data(grp, encoder: bool = True,
         if encoded == "json":
             return json.loads(grp[...].item())
         if encoded == "unknown":
-            try:
-                return eval(grp[...].item())  # noqa: S307
-            except Exception:
-                try:
-                    return grp[...].item().decode()
-                except AttributeError:
-                    return grp[...].item()
+            raw = grp[...].item()
+            # Safe decode path: try literal_eval, then fall back to the
+            # raw decoded string. Never execute code on persisted bytes.
+            decoded = _safe_literal(raw)
+            if isinstance(decoded, str) or not isinstance(raw, (bytes, str)):
+                # literal_eval may legitimately return a str (repr of str)
+                # or may have fallen back to the raw decoded form.
+                return decoded
+            return decoded
     else:
         if isinstance(grp, h5py.Group):
             return h5_to_dict(grp, encoder=encoder, Loader=Loader)
@@ -470,16 +506,14 @@ def h5_to_data(grp, encoder: bool = True,
 def h5_to_dict(grp: h5py.Group, **kwargs) -> dict:
     """Convert an HDF5 group to a Python dictionary.
 
-    Each key in the group is run through ``eval`` to restore its original
-    type (e.g. integer keys).  Values are dispatched through
-    :func:`h5_to_data`.
+    Each key in the group is parsed with :func:`ast.literal_eval` to
+    restore its original type (e.g. integer keys, tuple keys such as
+    ``(0, 1)``).  Values are dispatched through :func:`h5_to_data`. The
+    parser is safe against arbitrary code execution.
     """
     data: dict = {}
     for key in grp.keys():
-        try:
-            e_key = eval(key, {})  # noqa: S307
-        except Exception:
-            e_key = key
+        e_key = _safe_literal(key)
         data[e_key] = h5_to_data(grp[key], **kwargs)
     return data
 
