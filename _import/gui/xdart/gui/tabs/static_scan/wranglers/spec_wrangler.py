@@ -942,7 +942,7 @@ class specWrangler(wranglerWidget):
         """
         path = QFileDialog().getExistingDirectory(
             caption='Choose Save Directory',
-            directory='',
+            dir='',
             options=QFileDialog.ShowDirsOnly
         )
         if path != '':
