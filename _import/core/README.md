@@ -32,11 +32,21 @@ Most users should install [**xdart**](https://github.com/v-thampy/xdart) — the
 
 No clone required — just run:
 
+**Linux / macOS (bash)**
+
 ```bash
 curl -sSL https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.sh | bash
 ```
 
-This creates a new conda environment called `xrd` containing Python 3.12, the full scientific stack, `xdart`, and `ssrl_xrd_tools`. After it finishes:
+**Windows (PowerShell)**
+
+```powershell
+iex "& { $(iwr -useb https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.ps1) }"
+```
+
+The PowerShell installer is the native Windows path: it doesn't require Git Bash, and it will find an existing Anaconda / Miniconda / Miniforge install even when `conda` isn't initialised for PowerShell. If no conda install exists at all, pass `-Bootstrap` to have the script install Miniforge for you.
+
+Either installer creates a new conda environment called `xrd` containing Python 3.12, the full scientific stack, `xdart`, and `ssrl_xrd_tools`. After it finishes:
 
 ```bash
 conda activate xrd
@@ -51,10 +61,14 @@ xdart          # launch the GUI
 
 ### If you don't have conda/mamba
 
-Pass `--bootstrap` to have the script download and install [miniforge](https://github.com/conda-forge/miniforge) automatically into `~/miniforge3`:
+Pass `--bootstrap` (or `-Bootstrap` on PowerShell) to have the script download and install [miniforge](https://github.com/conda-forge/miniforge) automatically into `~/miniforge3` (Linux/macOS) or `%USERPROFILE%\miniforge3` (Windows):
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.sh | bash -s -- --bootstrap
+```
+
+```powershell
+iex "& { $(iwr -useb https://raw.githubusercontent.com/v-thampy/ssrl_xrd_tools/dev/scripts/install.ps1) } -Bootstrap"
 ```
 
 ### Installer options
