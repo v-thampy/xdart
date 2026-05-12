@@ -94,7 +94,7 @@ _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
 # contains thousands of frames in a single file (e.g. Bluesky .nxs with
 # a 1000-frame Eiger stack at 2167x2070 int32 ~= 18 GB if collected in
 # one go).  Larger values amortise ThreadPoolExecutor startup and the
-# end-of-batch sphere._save_to_h5 flush across more frames, so raise
+# end-of-batch sphere._save_to_nexus flush across more frames, so raise
 # this when RAM allows.  64 frames of a 2167x2070 int32 Eiger image
 # is ~1.2 GB of peak buffer.
 _PENDING_FLUSH_SIZE = 64
@@ -529,13 +529,14 @@ class specThread(wranglerThread):
                 break
             self._process_one(sphere, *item)
             count += 1
-        # Flush overall_raw once per batch (excluded from per-frame save_to_h5).
+        # v2 writer is idempotent — slice-assigns to preallocated stacked
+        # arrays per batch, no per-frame resize-append cost.
         if count > 0 and not self.xye_only:
             _get_h5pool().pause(sphere.data_file)
             try:
                 with self.file_lock:
                     with _catch_h5(sphere.data_file, 'a') as h5f:
-                        sphere._save_to_h5(h5f, data_only=False)
+                        sphere._save_to_nexus(h5f)
             finally:
                 _get_h5pool().resume(sphere.data_file)
         return count
@@ -679,16 +680,15 @@ class specThread(wranglerThread):
                                 get_sd=True, set_mg=False, static=True, gi=gi,
                                 th_mtr=th_mtr, series_average=series_average,
                                 h5file=h5f,
-                                # Defer scan_data + integrated_1d/2d writes until
-                                # after the loop so they're persisted once per
-                                # batch instead of once per frame.
+                                # batch_save defers per-frame v1 writes; v2
+                                # writer is idempotent so this only avoids
+                                # redundant v1 work in add_arch.
                                 batch_save=True,
                             )
-                        # One-shot flush of deferred per-batch accumulators
-                        sphere.flush_batch_state(h5file=h5f)
-                    # Flush overall_raw / metadata (we already hold file_lock)
+                    # v2 writer: one stacked-array slice-assign per batch.
+                    # No flush_batch_state needed (was v1-specific).
                     with _catch_h5(sphere.data_file, 'a') as h5f2:
-                        sphere._save_to_h5(h5f2, data_only=False)
+                        sphere._save_to_nexus(h5f2)
             finally:
                 _get_h5pool().resume(sphere.data_file)
             _t_phase2 = time.time() - _t_phase2
@@ -1287,6 +1287,12 @@ class specThread(wranglerThread):
                              global_mask=self.mask,
                              **self.sphere_args)
         sphere.skip_2d = self.sphere.skip_2d
+        # v2 NeXus writer needs a DiffractometerGeometry to derive per-frame
+        # rot1/rot2/rot3 and incidence-angle arrays from scan_data.  The
+        # default is a two-circle convention using `tth` (detector arm) and
+        # whatever `th_mtr` resolves to (sample tilt).  Override later from
+        # the geometry UI panel when the user picks a non-default convention.
+        sphere.default_geometry()
 
         write_mode = self.write_mode
         if not os.path.exists(fname):
@@ -1296,15 +1302,17 @@ class specThread(wranglerThread):
         try:
             with self.file_lock:
                 if write_mode == 'Append':
+                    # load_from_h5 auto-detects v1 vs v2 and dispatches
+                    # (see EwaldSphere._is_v2_layout / _load_from_nexus_v2).
                     sphere.load_from_h5(replace=False, mode='a')
                     sphere.skip_2d = self.sphere.skip_2d
                     for (k, v) in self.sphere_args.items():
                         setattr(sphere, k, v)
                     existing_arches = sphere.arches.index
                     if len(existing_arches) == 0:
-                        sphere.save_to_h5(replace=True)
+                        sphere.save_to_nexus(replace=True)
                 else:
-                    sphere.save_to_h5(replace=True)
+                    sphere.save_to_nexus(replace=True)
         finally:
             _get_h5pool().resume(sphere.data_file)
 
