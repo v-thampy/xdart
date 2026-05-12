@@ -181,12 +181,13 @@ class nexusThread(wranglerThread):
                 self._process_one(sphere, frame_idx, img_data, frame_meta)
                 files_processed += 1
 
-        # Final HDF5 save
+        # Final HDF5 save (v2 schema; idempotent, writes everything coherent).
         if files_processed > 0 and self.command != 'stop':
             _get_h5pool().pause(sphere.data_file)
             try:
                 with self.file_lock:
-                    sphere.save_to_h5(data_only=False, replace=False)
+                    sphere.default_geometry()  # ensure geometry is populated
+                    sphere.save_to_nexus(replace=False, finalize=True)
             finally:
                 _get_h5pool().resume(sphere.data_file)
 
