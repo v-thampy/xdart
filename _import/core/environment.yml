@@ -11,7 +11,7 @@ dependencies:
   - natsort
   - joblib
   # XRD / crystallography
-  - pyFAI
+  - pyFAI>=2025.3,<2026
   - fabio
   - silx
   - xrayutilities
