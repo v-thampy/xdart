@@ -1180,7 +1180,19 @@ class specThread(wranglerThread):
         if len(self.img_fnames) == 0:
             if self.inp_type != 'Image Directory':
                 first_img = self.img_file
-                self.img_fnames = Path(self.img_dir).glob(f'{self.scan_name}_*.{self.img_ext}')
+                # Glob is loose: `{scan_name}_*.{ext}` would also match
+                # neighbours like `{scan_name}_again_0001.{ext}`. Filter to
+                # files whose tail is purely a numeric frame index, so we
+                # only pick up the *strict* siblings of self.img_file.
+                _series_re = re.compile(
+                    rf'^{re.escape(self.scan_name)}_\d+\.{re.escape(self.img_ext)}$'
+                )
+                self.img_fnames = [
+                    p for p in Path(self.img_dir).glob(
+                        f'{self.scan_name}_*.{self.img_ext}'
+                    )
+                    if _series_re.match(p.name)
+                ]
             else:
                 first_img = ''
                 filters = '*' + '*'.join(f for f in self.file_filter.split()) + '*'
