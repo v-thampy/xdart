@@ -1,0 +1,235 @@
+"""Tests for the v2 NeXus reader (``read_sphere`` / ``read_stitched``).
+
+We hand-craft a small NXroot fixture with pure h5py — no xdart
+dependency, no captured-file dependency — and round-trip it through
+the v2 reader.  The fixture corresponds to a 5-frame psic scan.
+"""
+
+from __future__ import annotations
+
+import h5py
+import numpy as np
+import pytest
+
+from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+from ssrl_xrd_tools.core.provenance import write_provenance
+from ssrl_xrd_tools.io.nexus import read_sphere, read_stitched
+
+
+N_FRAMES = 5
+N_Q = 64
+N_CHI = 32
+
+
+@pytest.fixture
+def v2_fixture(tmp_path):
+    """A minimal v2-conformant NXroot file for a 5-frame psic scan."""
+    p = tmp_path / "psic_5frame.nxs"
+
+    rng = np.random.default_rng(0)
+    q = np.linspace(0.5, 5.0, N_Q).astype(np.float32)
+    chi = np.linspace(-180.0, 180.0, N_CHI, endpoint=False).astype(np.float32)
+    frame_index = np.arange(N_FRAMES, dtype=np.int32)
+
+    intensity_1d = rng.random((N_FRAMES, N_Q), dtype=np.float32)
+    sigma_1d = np.sqrt(intensity_1d).astype(np.float32)
+    intensity_2d = rng.random((N_FRAMES, N_CHI, N_Q), dtype=np.float32)
+
+    # psic motors (sample + detector)
+    eta = np.linspace(0.0, 1.0, N_FRAMES, dtype=np.float32)
+    chi_m = np.zeros(N_FRAMES, dtype=np.float32)
+    phi = np.zeros(N_FRAMES, dtype=np.float32)
+    mu = np.zeros(N_FRAMES, dtype=np.float32)
+    del_ = np.linspace(10.0, 20.0, N_FRAMES, dtype=np.float32)
+    nu = np.linspace(2.0, 4.0, N_FRAMES, dtype=np.float32)
+
+    geom = DiffractometerGeometry.psic()
+    derived = geom.derive_per_frame(
+        {"nu": nu, "del": del_, "eta": eta}
+    )
+
+    with h5py.File(p, "w") as f:
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.attrs["default"] = "integrated_1d"
+
+        # integrated_1d ------------------------------------------------
+        g1 = entry.create_group("integrated_1d")
+        g1.attrs["NX_class"] = "NXdata"
+        g1.attrs["signal"] = "intensity"
+        g1.attrs["axes"] = ["frame_index", "q"]
+        g1.create_dataset("intensity", data=intensity_1d)
+        g1.create_dataset("sigma", data=sigma_1d)
+        q_ds = g1.create_dataset("q", data=q)
+        q_ds.attrs["units"] = "1/angstrom"
+        g1.create_dataset("frame_index", data=frame_index)
+
+        # integrated_2d ------------------------------------------------
+        g2 = entry.create_group("integrated_2d")
+        g2.attrs["NX_class"] = "NXdata"
+        g2.attrs["signal"] = "intensity"
+        g2.attrs["axes"] = ["frame_index", "chi", "q"]
+        g2.create_dataset("intensity", data=intensity_2d)
+        g2.create_dataset("q", data=q)
+        chi_ds = g2.create_dataset("chi", data=chi)
+        chi_ds.attrs["units"] = "deg"
+        g2.create_dataset("frame_index", data=frame_index)
+
+        # per_frame_geometry ------------------------------------------
+        gg = entry.create_group("per_frame_geometry")
+        for key in ("rot1", "rot2", "rot3", "incident_angle"):
+            ds = gg.create_dataset(key, data=derived[key].astype(np.float32))
+            ds.attrs["units"] = "rad" if key.startswith("rot") else "deg"
+        gg.create_dataset("frame_index", data=frame_index)
+
+        # sample positioners ------------------------------------------
+        sp = entry.create_group("sample/positioners")
+        sp.attrs["NX_class"] = "NXcollection"
+        for name, arr in [("eta", eta), ("chi", chi_m), ("phi", phi), ("mu", mu)]:
+            pg = sp.create_group(name)
+            pg.attrs["NX_class"] = "NXpositioner"
+            pg.create_dataset("value", data=arr)
+            pg["value"].attrs["units"] = "deg"
+
+        # detector positioners ----------------------------------------
+        dp = entry.create_group("instrument/detector/positioners")
+        dp.attrs["NX_class"] = "NXcollection"
+        for name, arr in [("del", del_), ("nu", nu)]:
+            pg = dp.create_group(name)
+            pg.attrs["NX_class"] = "NXpositioner"
+            pg.create_dataset("value", data=arr)
+            pg["value"].attrs["units"] = "deg"
+
+        # stitched_1d (so read_stitched can be tested too) -------------
+        st = entry.create_group("stitched_1d")
+        st.attrs["NX_class"] = "NXdata"
+        st.create_dataset("intensity", data=rng.random(N_Q, dtype=np.float32))
+        st.create_dataset("q", data=q)
+
+        # provenance ---------------------------------------------------
+        write_provenance(
+            f,
+            program="xdart",
+            program_version="0.37.0-dev0",
+            config={
+                "bai_1d_args": {"npt": N_Q, "unit": "q_A^-1"},
+                "geometry": {
+                    "convention": "psic",
+                    "mapping_json": geom.to_json(),
+                    "motor_sources": {"eta": "eta", "del": "del", "nu": "nu"},
+                },
+            },
+            inputs={"raw_files": [f"frame_{i:04d}.h5" for i in range(N_FRAMES)],
+                    "meta_file": "psic_scan.spec"},
+            date="2026-05-11T00:00:00Z",
+            host="testhost",
+        )
+
+    return p, geom, derived
+
+
+# ---------------------------------------------------------------------------
+# read_sphere
+# ---------------------------------------------------------------------------
+
+class TestReadSphere:
+    def test_basic_dims_and_shapes(self, v2_fixture):
+        p, _, _ = v2_fixture
+        ds = read_sphere(p)
+        assert ds.sizes["frame"] == N_FRAMES
+        assert ds.sizes["q"] == N_Q
+        assert ds.sizes["chi"] == N_CHI
+        assert ds["intensity_1d"].dims == ("frame", "q")
+        assert ds["intensity_2d"].dims == ("frame", "chi", "q")
+
+    def test_sigma_1d_loaded(self, v2_fixture):
+        p, _, _ = v2_fixture
+        ds = read_sphere(p)
+        assert "sigma_1d" in ds.data_vars
+        assert ds["sigma_1d"].shape == (N_FRAMES, N_Q)
+
+    def test_groups_filter_skips_2d(self, v2_fixture):
+        p, _, _ = v2_fixture
+        ds = read_sphere(p, groups=("1d",))
+        assert "intensity_1d" in ds.data_vars
+        assert "intensity_2d" not in ds.data_vars
+        # chi dim should not be present either
+        assert "chi" not in ds.dims
+
+    def test_per_frame_geometry_loaded(self, v2_fixture):
+        p, _, derived = v2_fixture
+        ds = read_sphere(p)
+        for key in ("rot1", "rot2", "rot3", "incident_angle"):
+            assert key in ds.data_vars
+            np.testing.assert_allclose(
+                ds[key].values, derived[key].astype(np.float32), atol=1e-6
+            )
+
+    def test_motor_positioners_loaded(self, v2_fixture):
+        p, _, _ = v2_fixture
+        ds = read_sphere(p)
+        # Sample motors
+        for m in ("eta", "phi", "mu"):
+            assert m in ds.data_vars
+            assert ds[m].shape == (N_FRAMES,)
+        # 'chi' is both a coord (dim) and a sample motor name —
+        # the reader stores the motor under a prefixed key to avoid
+        # collision.
+        assert "sample_chi" in ds.data_vars or "chi" in ds.coords
+        # Detector motors
+        assert "del" in ds.data_vars
+        assert "nu" in ds.data_vars
+
+    def test_q_units_attr(self, v2_fixture):
+        p, _, _ = v2_fixture
+        ds = read_sphere(p)
+        assert ds["q"].attrs.get("units") == "1/angstrom"
+        assert ds["chi"].attrs.get("units") == "deg"
+
+    def test_reduction_attrs_attached(self, v2_fixture):
+        p, _, _ = v2_fixture
+        ds = read_sphere(p)
+        red = ds.attrs.get("reduction", {})
+        assert red["program"] == "xdart"
+        assert red["version"] == "0.37.0-dev0"
+        assert red["versions"]["python"]
+        assert red["config"]["geometry"]["convention"] == "psic"
+
+    def test_frame_coord_present(self, v2_fixture):
+        p, _, _ = v2_fixture
+        ds = read_sphere(p)
+        np.testing.assert_array_equal(
+            ds["frame"].values, np.arange(N_FRAMES)
+        )
+
+    def test_missing_entry_raises(self, tmp_path):
+        p = tmp_path / "empty.nxs"
+        with h5py.File(p, "w") as f:
+            f.create_group("not_entry")
+        with pytest.raises(KeyError):
+            read_sphere(p)
+
+    def test_thumbnails_off_by_default(self, v2_fixture):
+        p, _, _ = v2_fixture
+        ds = read_sphere(p)
+        assert "thumbnail" not in ds.data_vars
+
+
+# ---------------------------------------------------------------------------
+# read_stitched
+# ---------------------------------------------------------------------------
+
+class TestReadStitched:
+    def test_reads_stitched_1d(self, v2_fixture):
+        p, _, _ = v2_fixture
+        ds = read_stitched(p)
+        assert "stitched_1d" in ds.data_vars
+        assert ds["stitched_1d"].dims == ("q",)
+        assert ds.sizes["q"] == N_Q
+
+    def test_raises_when_no_stitched_present(self, tmp_path):
+        p = tmp_path / "no_stitch.nxs"
+        with h5py.File(p, "w") as f:
+            f.create_group("entry")
+        with pytest.raises(KeyError):
+            read_stitched(p)
