@@ -1,8 +1,12 @@
-from threading import Condition, _PyRLock
+import logging
 import os
 from pathlib import Path
-import pandas as pd
+from threading import Condition, _PyRLock
+
 import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from .arch import EwaldArch
 from .arch_series import ArchSeries, _ensure_frames_group
@@ -404,8 +408,23 @@ class EwaldSphere:
                 self._load_from_h5(file, *args, **kwargs)
 
     def _load_from_h5(self, grp, data_only=False, set_mg=True):
-        """Load from NeXus-formatted HDF5."""
+        """Load from NeXus-formatted HDF5.
+
+        Auto-detects the schema version:
+
+        * v1 (xdart ≤ 0.36.x): ``grp.attrs["type"] == "EwaldSphere"`` and/or
+          digit-named per-frame groups under ``entry/frames/``.
+        * v2 (xdart 0.37+): stacked ``entry/integrated_1d (N, nq)``;
+          per-frame groups prefixed ``frame_NNNN``.
+
+        Dispatches to :meth:`_load_from_nexus_v2` for v2 files so the
+        viewer can open both schemas through a single entry point.
+        """
         with self.sphere_lock:
+            if _is_v2_layout(grp):
+                self._load_from_nexus_v2(grp, data_only=data_only,
+                                         set_mg=set_mg)
+                return
             if 'type' not in grp.attrs or grp.attrs['type'] != 'EwaldSphere':
                 return
 
@@ -507,6 +526,176 @@ class EwaldSphere:
             if 'range' in arg:
                 if args[arg] is not None:
                     args[arg] = list(args[arg])
+
+    # ------------------------------------------------------------------
+    # Geometry helpers
+    # ------------------------------------------------------------------
+
+    def default_geometry(self):
+        """Return ``self.geometry``, constructing a sensible default if unset.
+
+        The default is a two-circle convention with detector arm named
+        ``tth`` and sample tilt named ``self.incidence_motor`` (which
+        falls back to ``"th"``).  Suitable for standard transmission
+        and 2-circle GI experiments.  Override by assigning a different
+        :class:`DiffractometerGeometry` to ``self.geometry`` before
+        saving in v2 mode.
+        """
+        if self.geometry is not None:
+            return self.geometry
+        from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+        self.geometry = DiffractometerGeometry.two_circle(
+            tth="tth", th=self.incidence_motor or "th",
+        )
+        return self.geometry
+
+    # ------------------------------------------------------------------
+    # v2 NeXus loader  (xdart 0.37+ schema).  Sibling of `_load_from_h5`;
+    # called from `_load_from_h5` after schema detection so the viewer's
+    # existing entry point handles both v1 and v2 transparently.
+    # ------------------------------------------------------------------
+
+    def _load_from_nexus_v2(self, grp, *, data_only: bool = False,
+                            set_mg: bool = True) -> None:
+        """Populate sphere state from a v2 NXroot.
+
+        Reads via :func:`ssrl_xrd_tools.io.nexus.read_sphere` and
+        materialises lightweight ``EwaldArch`` objects from the stacked
+        ``intensity_1d`` / ``intensity_2d`` arrays so downstream viewer
+        code (which iterates ``self.arches``) needs no schema-specific
+        branching.
+        """
+        from ssrl_xrd_tools.io.nexus import read_sphere
+        # IntegrationResult1D/2D, EwaldArch, ArchSeries already imported at
+        # module scope; re-import here for clarity / pyright friendliness.
+
+        try:
+            ds = read_sphere(self.data_file, schema="v2")
+        except Exception as exc:
+            logger.debug("v2 load failed for %s: %s", self.data_file, exc)
+            return
+
+        # ── scan_data DataFrame from motor variables ─────────────────
+        reserved_vars = {
+            "intensity_1d", "sigma_1d", "intensity_2d",
+            "thumbnail", "rot1", "rot2", "rot3", "incident_angle",
+        }
+        motor_cols: dict[str, np.ndarray] = {
+            name: np.asarray(ds[name].values)
+            for name in ds.data_vars
+            if name not in reserved_vars and ds[name].dims == ("frame",)
+        }
+        if motor_cols:
+            self.scan_data = pd.DataFrame(motor_cols)
+
+        # ── wavelength + bai args from reduction config (if present) ─
+        reduction = ds.attrs.get("reduction", {}) or {}
+        config = reduction.get("config", {}) or {}
+        if isinstance(config.get("bai_1d_args"), dict):
+            self.bai_1d_args = dict(config["bai_1d_args"])
+        if isinstance(config.get("bai_2d_args"), dict):
+            self.bai_2d_args = dict(config["bai_2d_args"])
+        # geometry config → DiffractometerGeometry instance
+        geom_cfg = config.get("geometry")
+        if isinstance(geom_cfg, dict) and geom_cfg.get("mapping_json"):
+            try:
+                from ssrl_xrd_tools.core.geometry import (
+                    DiffractometerGeometry,
+                )
+                mj = geom_cfg["mapping_json"]
+                if isinstance(mj, dict):  # already parsed by read_provenance
+                    import json as _json
+                    mj = _json.dumps(mj)
+                self.geometry = DiffractometerGeometry.from_json(mj)
+            except Exception:
+                logger.debug("Failed to restore geometry from reduction config",
+                             exc_info=True)
+
+        # ── synthesize per-frame arches ──────────────────────────────
+        if data_only:
+            return
+
+        if "intensity_1d" not in ds.data_vars:
+            return  # nothing to materialise
+
+        q = np.asarray(ds["q"].values, dtype=float)
+        intensity_1d = np.asarray(ds["intensity_1d"].values, dtype=float)
+        sigma_1d = (
+            np.asarray(ds["sigma_1d"].values, dtype=float)
+            if "sigma_1d" in ds.data_vars else None
+        )
+        unit_1d = ds["q"].attrs.get("units", "1/angstrom") or "1/angstrom"
+        # map nexus unit string back to pyFAI-style
+        unit_1d_pyfai = (
+            "q_A^-1" if "angstrom" in unit_1d
+            else "q_nm^-1" if "nm" in unit_1d else unit_1d
+        )
+
+        has_2d = "intensity_2d" in ds.data_vars
+        if has_2d:
+            intensity_2d_stack = np.asarray(
+                ds["intensity_2d"].values, dtype=float
+            )
+            # canonical Dataset is (frame, chi, q); xdart arch convention
+            # for int_2d.intensity is (nq, nchi) — transpose per-frame.
+            intensity_2d_stack = np.transpose(intensity_2d_stack, (0, 2, 1))
+            chi = np.asarray(ds["chi"].values, dtype=float)
+            unit_chi = ds["chi"].attrs.get("units", "deg") or "deg"
+
+        frame_indices = np.asarray(ds["frame"].values).astype(int).tolist()
+        arches_list: list[EwaldArch] = []
+        for k, idx in enumerate(frame_indices):
+            arch = EwaldArch(idx=idx)
+            arch.int_1d = IntegrationResult1D(
+                radial=q,
+                intensity=intensity_1d[k],
+                sigma=sigma_1d[k] if sigma_1d is not None else None,
+                unit=unit_1d_pyfai,
+            )
+            if has_2d:
+                arch.int_2d = IntegrationResult2D(
+                    radial=q,
+                    azimuthal=chi,
+                    intensity=intensity_2d_stack[k],
+                    sigma=None,
+                    unit=unit_1d_pyfai,
+                    azimuthal_unit=unit_chi,
+                )
+            arches_list.append(arch)
+
+        self.arches = ArchSeries(
+            self.data_file, self.file_lock, arches_list,
+            static=self.static, gi=self.gi,
+        )
+
+
+def _is_v2_layout(grp) -> bool:
+    """Detect xdart v2 NeXus layout by inspecting the file-level group.
+
+    True iff a stacked ``entry/integrated_1d/intensity`` of rank 2
+    exists, OR ``entry/frames`` contains any ``frame_*`` prefixed
+    child.  Mirrors the dispatcher in
+    :func:`ssrl_xrd_tools.io.nexus.read_sphere`.
+    """
+    try:
+        if "entry" not in grp:
+            return False
+        entry = grp["entry"]
+        type_attr = entry.attrs.get("type", b"")
+        if isinstance(type_attr, bytes):
+            type_attr = type_attr.decode("utf-8", errors="replace")
+        if type_attr == "EwaldSphere":
+            return False
+        if "integrated_1d" in entry and "intensity" in entry["integrated_1d"]:
+            if entry["integrated_1d"]["intensity"].ndim == 2:
+                return True
+        if "frames" in entry:
+            for name in entry["frames"]:
+                if name.startswith("frame_"):
+                    return True
+    except Exception:
+        return False
+    return False
 
 
 def get_1D_data(h5_file, arch_ids=None, static=True):
