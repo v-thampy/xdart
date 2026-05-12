@@ -47,20 +47,22 @@ mamba activate xrd
 **3. Install xdart (recommended — brings `ssrl_xrd_tools` in automatically):**
 
 ```bash
-pip install xdart
+uv pip install xdart       # or: pip install xdart
 ```
 
 Or, library only:
 
 ```bash
-pip install ssrl_xrd_tools
+uv pip install ssrl_xrd_tools    # or: pip install ssrl_xrd_tools
 ```
+
+> **Tip — use `uv` if you have it.** [`uv`](https://docs.astral.sh/uv/) is a drop-in pip replacement from Astral that's typically **10–100× faster** on cold installs and ships an aggressive resolver and binary cache. With the scientific-stack dependency tree (pyFAI, h5py, silx, …) the difference is often the gap between a fresh-env install finishing in a few seconds versus several minutes. Install once: `pip install uv` (or `brew install uv` on macOS, `winget install astral-sh.uv` on Windows). Plain `pip` works just as well — just slower.
 
 ### Updating
 
 ```bash
 mamba activate xrd
-pip install -U xdart    # or: pip install -U ssrl_xrd_tools
+uv pip install -U xdart    # or: pip install -U xdart / ssrl_xrd_tools
 ```
 
 ### Editable / developer install
@@ -69,8 +71,8 @@ pip install -U xdart    # or: pip install -U ssrl_xrd_tools
 git clone -b dev https://github.com/v-thampy/ssrl_xrd_tools.git
 git clone -b dev https://github.com/v-thampy/xdart.git         # optional
 mamba activate xrd
-pip install -e ./ssrl_xrd_tools
-pip install -e ./xdart                                          # optional
+uv pip install -e ./ssrl_xrd_tools    # or: pip install -e ./ssrl_xrd_tools
+uv pip install -e ./xdart             # optional
 ```
 
 ### Conda-forge (in progress)
