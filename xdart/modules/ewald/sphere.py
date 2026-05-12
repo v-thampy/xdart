@@ -34,7 +34,9 @@ class EwaldSphere:
     def __init__(self, name='scan0', arches=None, data_file=None,
                  scan_data=None, mg_args=None,
                  bai_1d_args=None, bai_2d_args=None,
-                 static=False, gi=False, th_mtr='th', series_average=False,
+                 static=False, gi=False, th_mtr=None,
+                 incidence_motor=None, geometry=None,
+                 series_average=False,
                  overall_raw=0, single_img=False,
                  global_mask=None
                  ):
@@ -65,7 +67,21 @@ class EwaldSphere:
 
         self.static = static
         self.gi = gi
-        self.th_mtr = th_mtr
+        # th_mtr is the legacy name; incidence_motor is the canonical name
+        # going forward.  th_mtr kwarg defaults to None so older callers
+        # passing th_mtr='th' still work, and incidence_motor mirrors it.
+        if incidence_motor is None:
+            incidence_motor = th_mtr if th_mtr is not None else "th"
+        if th_mtr is None:
+            th_mtr = incidence_motor
+        self.th_mtr = th_mtr               # deprecated alias
+        self.incidence_motor = incidence_motor
+        # Flexible diffractometer geometry — used by the v2 NeXus writer
+        # to derive per-frame pyFAI rotations + incidence-angle arrays.
+        self.geometry = geometry            # ssrl_xrd_tools.core.geometry.DiffractometerGeometry
+        # Optional stitched-output containers (populated by run_stitch).
+        self.stitched_1d = None
+        self.stitched_2d = None
         self.single_img = single_img
         self.series_average = series_average
         self.skip_2d = False
@@ -300,6 +316,27 @@ class EwaldSphere:
         with self.file_lock:
             with utils.catch_h5py_file(self.data_file, mode) as file:
                 self._save_to_h5(file, *args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # v2 NeXus writer (xdart 0.37+).  Sibling of `_save_to_h5`, not a
+    # replacement: the v1 path stays until the wrangler is updated to
+    # drive the v2 path end-to-end.
+    # ------------------------------------------------------------------
+
+    def save_to_nexus(self, *, entry: str = "entry", finalize: bool = False,
+                      replace: bool = False) -> None:
+        """Save sphere state into a v2 NeXus file.  Idempotent across calls."""
+        mode = 'w' if replace else 'a'
+        with self.file_lock:
+            with utils.catch_h5py_file(self.data_file, mode) as file:
+                self._save_to_nexus(file, entry=entry, finalize=finalize)
+
+    def _save_to_nexus(self, h5f, *, entry: str = "entry",
+                       finalize: bool = False) -> None:
+        """Inner v2 writer; delegates to ``nexus_writer.save_sphere_to_nexus``."""
+        from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+        with self.sphere_lock:
+            save_sphere_to_nexus(self, h5f, entry=entry, finalize=finalize)
 
     def _save_to_h5(self, grp, arches=None, data_only=False,
                     compression=None):
