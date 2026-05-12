@@ -213,3 +213,82 @@ def plot_image(
             cb.set_label(cb_label, fontsize=cb_fontsize)
 
     return im, cb
+
+
+# ---------------------------------------------------------------------------
+# xarray.Dataset entry points (xdart NeXus reader output)
+# ---------------------------------------------------------------------------
+
+def plot_scan_1d(
+    ax: Axes,
+    ds,
+    *,
+    frame: int | slice | None = None,
+    label_motor: str | None = None,
+    cmap: str | None = "viridis",
+    yscale: str = "log",
+    **kwargs: Any,
+):
+    """Plot one or many 1-D patterns from a NeXus reader :class:`xr.Dataset`.
+
+    Works on the canonical Dataset shape returned by
+    :func:`ssrl_xrd_tools.io.nexus.read_sphere` (either schema).
+    """
+    if "intensity_1d" not in ds.data_vars or "q" not in ds.coords:
+        raise ValueError("Dataset missing 'intensity_1d' or 'q' coord")
+    q = ds["q"].values
+
+    if isinstance(frame, int):
+        indices = [frame]
+    elif isinstance(frame, slice):
+        indices = list(range(*frame.indices(ds.sizes["frame"])))
+    elif frame is None:
+        indices = list(range(ds.sizes["frame"]))
+    else:
+        indices = list(frame)
+
+    motor_vals = (
+        ds[label_motor].values
+        if label_motor and label_motor in ds.data_vars
+        else None
+    )
+
+    cmap_obj = plt.get_cmap(cmap) if (cmap and len(indices) > 1) else None
+    handles = []
+    for k, i in enumerate(indices):
+        I = ds["intensity_1d"].values[i]
+        sigma = ds["sigma_1d"].values[i] if "sigma_1d" in ds.data_vars else None
+        if cmap_obj is not None:
+            kwargs.setdefault("color", cmap_obj(k / max(len(indices) - 1, 1)))
+        lbl = (
+            f"{label_motor}={motor_vals[i]:.3g}"
+            if motor_vals is not None else f"frame {i}"
+        )
+        h = plot_1d(
+            ax, q, I, yerr=sigma, label=lbl,
+            attrs=dict(
+                xlabel=r"Q (Å$^{-1}$)",
+                ylabel="Intensity",
+                yscale=yscale,
+            ),
+            **kwargs,
+        )
+        handles.append(h)
+        kwargs.pop("color", None)
+    return handles
+
+
+def plot_stitched_1d(ax: Axes, ds, **kwargs):
+    """Plot a stitched 1-D pattern from :func:`read_stitched` output."""
+    if "stitched_1d" not in ds.data_vars:
+        raise ValueError("Dataset has no 'stitched_1d' — was the scan stitched?")
+    q = ds["q"].values
+    I = ds["stitched_1d"].values
+    sigma = ds.get("stitched_1d_sigma")
+    sigma = sigma.values if sigma is not None else None
+    return plot_1d(
+        ax, q, I, yerr=sigma,
+        attrs=dict(xlabel=r"Q (Å$^{-1}$)", ylabel="Intensity",
+                   yscale="log", title="Stitched"),
+        **kwargs,
+    )

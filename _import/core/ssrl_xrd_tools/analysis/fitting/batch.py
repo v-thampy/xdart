@@ -22,7 +22,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["FitConfig", "FitResultStore", "fit_sequence"]
+__all__ = ["FitConfig", "FitResultStore", "fit_sequence", "fit_nexus"]
 
 
 # ---------------------------------------------------------------------------
@@ -355,3 +355,70 @@ def fit_sequence(
             progress_callback(i, n, result)
 
     return store
+
+
+# ---------------------------------------------------------------------------
+# NeXus convenience entry point  (xdart 0.37+ schema)
+# ---------------------------------------------------------------------------
+
+def fit_nexus(
+    path: str | Path,
+    phases: list[Any],
+    config: FitConfig,
+    *,
+    entry: str = "entry",
+    sequential: bool = False,
+    progress_callback=None,
+    fit_background_template: np.ndarray
+                             | tuple[np.ndarray, np.ndarray]
+                             | None = None,
+    label_motor: str | None = None,
+) -> "FitResultStore":
+    """Fit every 1-D pattern in an xdart NeXus file (v1 or v2 schema).
+
+    Reads via :func:`ssrl_xrd_tools.io.nexus.read_sphere`, which
+    auto-detects schema version — works on both pre-0.37 and 0.37+
+    files.  Replaces per-frame ``h5py.File`` round-trips with a single
+    load.
+    """
+    from ssrl_xrd_tools.io.nexus import read_sphere
+
+    ds = read_sphere(path, entry=entry, groups=("1d",))
+
+    if "intensity_1d" not in ds.data_vars:
+        raise ValueError(
+            f"{path}:{entry} has no /integrated_1d data — nothing to fit"
+        )
+
+    q = np.asarray(ds["q"].values, dtype=float)
+    intensity = np.asarray(ds["intensity_1d"].values, dtype=float)
+    sigma_arr = (
+        np.asarray(ds["sigma_1d"].values, dtype=float)
+        if "sigma_1d" in ds.data_vars
+        else None
+    )
+
+    n = intensity.shape[0]
+    patterns: list[tuple] = []
+    for i in range(n):
+        if sigma_arr is not None:
+            patterns.append((q, intensity[i], sigma_arr[i]))
+        else:
+            patterns.append((q, intensity[i]))
+
+    if label_motor is not None and label_motor in ds.data_vars:
+        labels: list[str] | None = [str(v) for v in ds[label_motor].values]
+    elif "frame" in ds.coords:
+        labels = [str(v) for v in ds["frame"].values]
+    else:
+        labels = None
+
+    return fit_sequence(
+        patterns,
+        phases,
+        config,
+        sequential=sequential,
+        labels=labels,
+        progress_callback=progress_callback,
+        fit_background_template=fit_background_template,
+    )
