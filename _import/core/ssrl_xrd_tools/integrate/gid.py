@@ -100,7 +100,17 @@ def _unit_str(unit: Any) -> str:
 
 
 def _to_result_2d(result: Any, unit_fallback: str) -> IntegrationResult2D:
-    """Convert ``Integrate2dFiberResult`` → ``IntegrationResult2D``."""
+    """Convert pyFAI grazing-incidence 2D result → ``IntegrationResult2D``.
+
+    Handles both pyFAI versions:
+      * pyFAI 2025.x: ``integrate2d_grazing_incidence`` returns a plain
+        ``Integrate2dResult`` whose ``.radial`` axis (length ``npt_ip``)
+        is the in-plane axis and ``.azimuthal`` (length ``npt_oop``) is
+        the out-of-plane axis.
+      * pyFAI 2026.x+: returns ``Integrate2dFiberResult`` with explicit
+        ``.inplane`` / ``.outofplane`` attributes — the renamed aliases
+        for the same two axes.
+    """
     # pyFAI shape: (npt_oop, npt_ip) → transpose to (npt_ip, npt_oop)
     intensity = np.asarray(result.intensity, dtype=float).T
     sigma = (
@@ -108,11 +118,17 @@ def _to_result_2d(result: Any, unit_fallback: str) -> IntegrationResult2D:
         if result.sigma is not None
         else None
     )
+    inplane = getattr(result, "inplane", None)
+    if inplane is None:
+        inplane = result.radial
+    outofplane = getattr(result, "outofplane", None)
+    if outofplane is None:
+        outofplane = result.azimuthal
     ip_unit = getattr(result, "ip_unit", None)
     oop_unit = getattr(result, "oop_unit", None)
     return IntegrationResult2D(
-        radial=np.asarray(result.inplane, dtype=float),
-        azimuthal=np.asarray(result.outofplane, dtype=float),
+        radial=np.asarray(inplane, dtype=float),
+        azimuthal=np.asarray(outofplane, dtype=float),
         intensity=intensity,
         sigma=sigma,
         unit=str(ip_unit) if ip_unit is not None else unit_fallback,
@@ -513,8 +529,20 @@ def integrate_gi_polar_1d(
     """
     1-D polar-coordinate integration: intensity vs Q_total (chi-integrated).
 
-    Wraps ``FiberIntegrator.integrate1d_polar``, which azimuthally integrates
-    the full ``(Q, χ)`` space and returns a single radial profile in Q.
+    Fast path
+    ---------
+    When ``azimuth_range is None`` (the common "integrate over all χ" case),
+    this is numerically identical to a standard ``AzimuthalIntegrator.integrate1d``
+    on the q magnitude — every detector pixel ends up in the same q bin either
+    way, because q is invariant under sample rotation.  Since
+    ``FiberIntegrator`` IS an ``AzimuthalIntegrator``, we call its inherited
+    ``integrate1d`` directly: a single-pass 1-D rebin, much faster than the
+    2D-rebin-then-collapse path of ``integrate1d_polar``.
+
+    When ``azimuth_range`` is set (partial-χ wedge), we fall back to
+    ``FiberIntegrator.integrate1d_polar`` so the χ filter is applied
+    on the intermediate 2-D ``(q_ip, q_oop)`` grid where the polar mask
+    is well-defined.
 
     Parameters
     ----------
@@ -523,8 +551,8 @@ def integrate_gi_polar_1d(
     fi : FiberIntegrator
         Configured fiber integrator from :func:`create_fiber_integrator`.
     npt : int, optional
-        Number of output bins.  Passed as both ``npt_ip`` and ``npt_oop`` to
-        the underlying 2-D polar map before azimuthal reduction.
+        Number of output radial bins.  In the slow path, also used as both
+        ``npt_ip`` and ``npt_oop`` for the intermediate 2-D polar map.
     unit : str, optional
         Hint for the Q axis unit: ``"q_A^-1"`` (or any string containing
         ``"A^-1"``) → ``"A^-1"``; anything else → ``"nm^-1"``.
@@ -537,8 +565,8 @@ def integrate_gi_polar_1d(
     sample_orientation : int or None, optional
         Override sample orientation for this call.
     **kwargs
-        Forwarded to ``fi.integrate1d_polar``.  Useful options include
-        ``radial_integration`` (bool, default ``False``) and
+        Forwarded to the chosen integrator.  Useful options for the slow path
+        include ``radial_integration`` (bool, default ``False``) and
         ``polar_degrees`` (bool, default ``True``).
 
     Returns
@@ -549,6 +577,36 @@ def integrate_gi_polar_1d(
     inc, tilt, orient = _effective_gi_params(fi, incident_angle, tilt_angle, sample_orientation)
     radial_unit = "A^-1" if "A^-1" in unit else "nm^-1"
 
+    # --- fast path: full χ → standard 1D azimuthal integration --------------
+    if azimuth_range is None:
+        # Strip kwargs only meaningful to fiber-specific methods so they
+        # don't poison the standard integrate1d call.
+        _fiber_only = {
+            "polar_degrees", "radial_integration",
+            "ip_range", "oop_range",
+            "sample_orientation", "incident_angle", "tilt_angle",
+            "npt_ip", "npt_oop", "vertical_integration", "unit_oop",
+        }
+        std_kwargs = {k: v for k, v in kwargs.items() if k not in _fiber_only}
+        std_unit = f"q_{radial_unit}"
+        result = fi.integrate1d(
+            data=image,
+            npt=npt,
+            unit=std_unit,
+            method=method,
+            mask=mask,
+            radial_range=radial_range,
+            **std_kwargs,
+        )
+        sigma = result.sigma if result.sigma is not None else None
+        return IntegrationResult1D(
+            radial=np.asarray(result.radial, dtype=float),
+            intensity=np.asarray(result.intensity, dtype=float),
+            sigma=np.asarray(sigma, dtype=float) if sigma is not None else None,
+            unit=_unit_str(result.unit) if result.unit is not None else std_unit,
+        )
+
+    # --- slow path: restricted χ wedge → polar method -----------------------
     result = fi.integrate1d_polar(
         polar_degrees=True,
         radial_unit=radial_unit,
