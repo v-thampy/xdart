@@ -211,7 +211,15 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.gi_radial_label_2D.setMaximumSize(QtCore.QSize(90, 16777215))
         self.ui.gridLayout_2D.addWidget(self.ui.gi_radial_label_2D, 0, 0, 1, 1)
         self.ui.gi_radial_label_2D.hide()
-        
+
+        # The .ui file caps label_azim_{1D,2D} at 40 px (fine for "χ (°)").
+        # Widen so they can also display "OOP (Å⁻¹)" or "Exit (°)" without
+        # clipping in GI mode.
+        self.ui.label_azim_1D.setMinimumSize(QtCore.QSize(70, 0))
+        self.ui.label_azim_1D.setMaximumSize(QtCore.QSize(80, 50))
+        self.ui.label_azim_2D.setMinimumSize(QtCore.QSize(70, 0))
+        self.ui.label_azim_2D.setMaximumSize(QtCore.QSize(80, 50))
+
         self.setEnabled()
         # self.set_image_units()
 
@@ -590,6 +598,9 @@ class integratorTree(QtWidgets.QWidget):
 
         self.ui.azim_low_1D.setEnabled(not auto)
         self.ui.azim_high_1D.setEnabled(not auto)
+        # Toggling auto can flip the q_total path between fast (1 Pts) and
+        # slow (2 Pts); refresh the npts_oop_1D visibility.
+        self._update_npts_oop_visibility_1d()
 
     def _set_azim_range_1D(self):
         """Sets UI values from Sphere 1D azimuth range in bai_1d_args."""
@@ -607,6 +618,7 @@ class integratorTree(QtWidgets.QWidget):
         self.azim_autoRange_1D = auto
         self.ui.azim_low_1D.setEnabled(not auto)
         self.ui.azim_high_1D.setEnabled(not auto)
+        self._update_npts_oop_visibility_1d()
 
         self._connect_azim_range_1D_signals()
 
@@ -733,24 +745,29 @@ class integratorTree(QtWidgets.QWidget):
         val = self.ui.npts_1D.text()
         val = 500 if (not val) else int(val)
         self.sphere.bai_1d_args['numpoints'] = val
-
-        if self.sphere.gi:
-            val_oop = self.ui.npts_oop_1D.text()
-            val_oop = 500 if (not val_oop) else int(val_oop)
-            self.sphere.bai_1d_args['npt_oop'] = val_oop
+        # npts_oop_1D is only authoritative when visible: for GI modes that
+        # use the fiber methods (q_ip / q_oop / exit_angle), or for q_total
+        # with a restricted χ range.  When hidden, arch.py falls back to
+        # npt_oop = numpoints.
+        if self.sphere.gi and self.ui.npts_oop_1D.isVisible():
+            oop_val = self.ui.npts_oop_1D.text()
+            oop_val = val if (not oop_val) else int(oop_val)
+            self.sphere.bai_1d_args['npt_oop'] = oop_val
 
     def _set_npts_1D(self):
         self.ui.npts_1D.textChanged.disconnect(self._get_npts_1D)
         if self.sphere.gi:
-            self.ui.npts_oop_1D.textChanged.disconnect(self._get_npts_1D)
-            
+            try:
+                self.ui.npts_oop_1D.textChanged.disconnect(self._get_npts_1D)
+            except TypeError:
+                pass
         val = str(self.sphere.bai_1d_args.get('numpoints', 500))
         self.ui.npts_1D.setText(val)
         if self.sphere.gi:
-            val_oop = str(self.sphere.bai_1d_args.get('npt_oop', 500))
-            self.ui.npts_oop_1D.setText(val_oop)
+            oop_val = str(self.sphere.bai_1d_args.get('npt_oop',
+                            self.sphere.bai_1d_args.get('numpoints', 500)))
+            self.ui.npts_oop_1D.setText(oop_val)
             self.ui.npts_oop_1D.textChanged.connect(self._get_npts_1D)
-            
         self.ui.npts_1D.textChanged.connect(self._get_npts_1D)
 
     def _get_npts_radial_2D(self):
@@ -1001,12 +1018,12 @@ class integratorTree(QtWidgets.QWidget):
             self.ui.axis2D.clear()
             for label in GI_LABELS_2D:
                 self.ui.axis2D.addItem(_translate("Form", label))
-            # Show npts_oop_1D for fibre module (npt_ip x npt_oop)
-            self.ui.npts_oop_1D.show()
-            if not self.ui.npts_oop_1D.text():
-                self.ui.npts_oop_1D.setText("1000")
-            if not self.ui.npts_1D.text() or self.ui.npts_1D.text() == "3000":
-                self.ui.npts_1D.setText("1000")
+            # GI default: 2000 Pts.  The second Pts box (npts_oop_1D) shows
+            # conditionally — see _update_npts_oop_visibility_1d, which is
+            # called below via _update_gi_mode_1d.
+            if (not self.ui.npts_1D.text()
+                    or self.ui.npts_1D.text() in ("1000", "3000")):
+                self.ui.npts_1D.setText("2000")
             self.ui.label_npts_1D.setText("Pts")
             # Sync axis combos to current sphere.bai_args GI mode
             gi_mode_1d = self.sphere.bai_1d_args.get('gi_mode_1d', 'q_total')
@@ -1142,6 +1159,31 @@ class integratorTree(QtWidgets.QWidget):
                 self._set_range_defaults_1d(0, 90, -180, 180)
             else:  # Q
                 self._set_range_defaults_1d(0, 5, -180, 180)
+        self._update_npts_oop_visibility_1d()
+
+    def _update_npts_oop_visibility_1d(self):
+        """Show/hide the second 1-D Pts box (npts_oop_1D).
+
+        The q_total fast path uses pyFAI ``integrate1d`` (single npt) only
+        when the χ range is unrestricted.  For every other GI 1-D case
+        (modes q_ip / q_oop / exit_angle, or q_total with an explicit χ
+        wedge), the underlying fiber methods need both npt_ip and npt_oop.
+        Expose the second Pts field iff the slow path will be used.
+        """
+        if not self.sphere.gi:
+            self.ui.npts_oop_1D.hide()
+            return
+        mode = self.sphere.bai_1d_args.get('gi_mode_1d', 'q_total')
+        azim_auto = self.ui.azim_autoRange_1D.isChecked()
+        show_oop = (mode != 'q_total') or (not azim_auto)
+        if show_oop:
+            if not self.ui.npts_oop_1D.text():
+                self.ui.npts_oop_1D.setText(
+                    self.ui.npts_1D.text() or "2000"
+                )
+            self.ui.npts_oop_1D.show()
+        else:
+            self.ui.npts_oop_1D.hide()
 
     def _update_gi_mode_2d(self, n):
         """Update 2D integration mode from axis2D combo selection.
