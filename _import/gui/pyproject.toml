@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xdart"
-version = "0.35.2"
+version = "0.36.0"
 description = "A pyFAI-based GUI for X-ray diffraction data reduction and visualization"
 readme = "README.md"
 license = {text = "MIT"}
@@ -26,14 +26,14 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Chemistry",
 ]
 dependencies = [
-    "ssrl_xrd_tools>=0.35.1",
+    "ssrl_xrd_tools>=0.36.0",
     "numpy",
     "scipy",
     "h5py",
     "hdf5plugin",
     "fabio",
     "silx",
-    "pyFAI",
+    "pyFAI>=2025.3,<2026",
     "xrayutilities",
     "PySide6>=6.5",
     "pyqtgraph>=0.13.7",
