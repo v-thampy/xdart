@@ -112,25 +112,11 @@ _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
 _PENDING_FLUSH_SIZE = 16
 
 # How many integrated frames to accumulate between v2 _save_to_nexus
-# calls in **live** (non-batch) mode.  The v2 writer rewrites the full
-# stacked (N, nq) array on every call, so saving per-frame is O(N²) over
-# a scan.  Batching writes amortizes that cost while still letting the
-# GUI update per-frame (the sigUpdate emit + in-memory hand-off happen
-# inside _process_one regardless of the save cadence).  8 strikes a
-# decent balance: ~30 s of live-mode work between saves at 1.5 s/frame,
-# so a crash or stop loses at most a few seconds of integrated data.
-_LIVE_SAVE_INTERVAL = 8
-
-# Sentinel value substituted into the image at pixels that fall outside
-# the user's threshold band.  pyFAI's CSR integrator automatically
-# skips NaN pixels (verified empirically on pyFAI 2025/2026; NaN
-# survives arithmetic in (map_raw - bg) / norm, where a finite sentinel
-# would drift outside any practical delta_dummy band).  No dummy
-# kwargs needed.  This is what lets per-frame threshold filtering
-# coexist with a stable arch mask: out-of-band pixels are masked via
-# NaN-in-data rather than via the mask array, so the mask CRC (and
-# the CSR LUT cache) stays valid frame-to-frame.
-_THRESHOLD_NAN = np.float32(np.nan)
+# Live-save cadence and threshold-sentinel constants moved to the
+# wranglerThread base class (wrangler_widget.py) in May 2026 — refer
+# via ``self.LIVE_SAVE_INTERVAL`` / the base's module-level
+# ``_THRESHOLD_NAN`` (re-imported here for back-compat with old SPEC
+# wrangler scans that may pickle/unpickle constants by name).
 
 # Number of frames the background prefetch worker is allowed to read
 # ahead of the main collect loop.  Kept small: too large and the prefetcher
@@ -301,17 +287,16 @@ class specThread(wranglerThread):
         self.gi_mode_1d = gi_mode_1d
         self.gi_mode_2d = gi_mode_2d
         self.live_mode = live_mode
-        self.batch_mode = False
-        self.xye_only = False
+        # batch_mode / xye_only / apply_threshold / threshold_min /
+        # threshold_max / sub_label / _xye_buffer / _xye_lock /
+        # _frames_since_save / _published_arches are all initialised
+        # by the wranglerThread base class — see wrangler_widget.py.
+        # specThread only needs to set the spec-specific extras here.
         self.max_cores = max_cores
         self.command = command
         self.sphere = sphere
         self.data_1d = data_1d
         self.data_2d = data_2d
-
-        self.apply_threshold = False
-        self.threshold_min = 0
-        self.threshold_max = 0
 
         self.user = None
         self.mask = None
@@ -319,30 +304,6 @@ class specThread(wranglerThread):
         self.img_fnames = []
         self.processed = []
         self.processed_scans = []
-        self.sub_label = ''
-        # Bypass the file_thread.load_arch disk read for fresh frames:
-        # _process_one stashes the just-integrated EwaldArch here before
-        # emitting sigUpdate(img_number).  The main thread's update_data
-        # pops it and pushes directly into h5viewer.data_1d / data_2d.
-        # CPython's GIL makes dict access across threads atomic — no
-        # extra lock needed.  Bounded in practice to ~1-2 entries at a
-        # time (integration takes ~1.5s/frame; main thread consumes
-        # within ms of sigUpdate firing).
-        self._published_arches: dict = {}
-        # In live (non-batch) mode the collect loop dispatches per-frame
-        # for instant GUI feedback, but we still batch v2 file writes
-        # via this counter.  Incremented inside _dispatch_batch_serial;
-        # reset when we actually flush to disk.
-        self._frames_since_save = 0
-        # XYE write buffer.  _process_one / _integrate_one stash
-        # (img_number, arch) tuples here in lieu of writing the .xye
-        # file inline; the batch dispatcher flushes them all at end of
-        # batch via _flush_xye_buffer().  Keeping writes batched cuts
-        # filesystem syscalls per frame and groups the write phase so
-        # the integration phase isn't interleaved with small-file IO.
-        from threading import Lock
-        self._xye_buffer: list = []
-        self._xye_lock = Lock()
         # Eiger HDF5 lazy frame state
         self._eiger_master_path = None
         self._eiger_frame_idx = 0
@@ -602,7 +563,7 @@ class specThread(wranglerThread):
                 self._process_one(sphere, img_file, img_number, img_data, img_meta, bg_raw)
                 files_processed += 1
                 self._frames_since_save += 1
-                if self._frames_since_save >= _LIVE_SAVE_INTERVAL and not self.xye_only:
+                if self._frames_since_save >= self.LIVE_SAVE_INTERVAL and not self.xye_only:
                     _get_h5pool().pause(sphere.data_file)
                     try:
                         with self.file_lock:
@@ -643,85 +604,17 @@ class specThread(wranglerThread):
             return self._dispatch_batch_parallel(sphere, pending)
         return self._dispatch_batch_serial(sphere, pending, force_save=force_save)
 
-    def _resolve_arch_mask(self, sphere, img_data):
-        """Return a stable per-scan "bad pixel" mask cached on the sphere.
-
-        Computed once from ``img_data < 0`` of the first frame and
-        reused for every subsequent frame in the scan.  Keeping the
-        mask stable across frames is what lets pyFAI's CSR engine
-        cache stay valid — a single pixel changing in the mask
-        invalidates the cache and forces a ~250 ms LUT rebuild,
-        which we observed firing on roughly every 13th Eiger frame
-        before this caching was added.
-
-        Threshold-based per-frame filtering is NOT routed through
-        this mask anymore; see :meth:`_apply_threshold_inline` for
-        that path (out-of-band pixels are replaced with NaN in the
-        image data, which pyFAI's CSR integrator skips automatically).
-        """
-        cached = getattr(sphere, '_cached_data_mask', None)
-        if cached is None:
-            try:
-                cached = np.arange(img_data.size)[
-                    np.asarray(img_data).flatten() < 0
-                ]
-            except Exception:
-                cached = None
-            sphere._cached_data_mask = cached
-        return cached
-
-    def _apply_threshold_inline(self, img_data):
-        """Pre-clamp pixels outside the threshold band to NaN.
-
-        Returns a fresh float32 array with out-of-band pixels replaced
-        by NaN.  pyFAI's CSR integrator skips NaN pixels automatically
-        (no ``dummy`` / ``delta_dummy`` kwargs needed), and NaN propa-
-        gates cleanly through the ``(map_raw - bg) / map_norm`` arith-
-        metic inside ``arch.integrate_1d`` / ``integrate_2d`` — both
-        of which were critical: a finite sentinel like -1e30 gets
-        divided by monitor counts and drifts outside any reasonable
-        ``delta_dummy`` band, causing the sentinel values to bleed
-        into the integrated output (verified in a GI scan, the 1D
-        plot showed intensities at -1e27, which is what tipped us off).
-
-        Cost: one ~18 MB float32 allocation + ~10 ms of vectorised work
-        per Eiger frame.  Compare to the alternative — letting the
-        threshold mask flicker frame-to-frame and triggering a ~250 ms
-        pyFAI CSR rebuild on roughly every 13th frame — which averaged
-        ~38 ms/frame over a scan and produced visible GUI burstiness.
-        """
-        if not self.apply_threshold:
-            return img_data
-        img = np.asarray(img_data, dtype=np.float32, copy=True)
-        bad = (img < self.threshold_min) | (img > self.threshold_max)
-        img[bad] = _THRESHOLD_NAN
-        return img
-
-    def _flush_xye_buffer(self, sphere):
-        """Write all buffered XYE files in one pass.
-
-        Buffer is drained under the lock to keep new appends from
-        racing, then we write outside the lock so that further worker
-        threads can keep appending while this batch's IO is in flight.
-        Errors per-frame don't abort the batch — we log and move on.
-        """
-        with self._xye_lock:
-            if not self._xye_buffer:
-                return
-            buf = self._xye_buffer
-            self._xye_buffer = []
-        for img_number, arch in buf:
-            try:
-                self.save_1d(sphere, arch, img_number)
-            except Exception as e:
-                logger.warning('XYE write failed for frame %s: %s', img_number, e)
+    # ``_resolve_arch_mask``, ``_apply_threshold_inline``, and
+    # ``_flush_xye_buffer`` moved to wranglerThread (the base class)
+    # in May 2026 — both specThread and nexusThread inherit them now.
+    # See xdart/gui/tabs/static_scan/wranglers/wrangler_widget.py.
 
     def _dispatch_batch_serial(self, sphere, pending, *, force_save=False):
         """Sequential dispatch (live mode or single-image batches).
 
         Each frame in ``pending`` gets integrated + GUI-updated
         immediately (via ``_process_one``).  The v2 file save runs
-        *only* when at least :data:`_LIVE_SAVE_INTERVAL` frames have
+        *only* when at least :attr:`LIVE_SAVE_INTERVAL` frames have
         accumulated since the last save, or when ``force_save=True``
         (used by the final-flush path and by the live-watch tail).
         That keeps per-frame stalls off the integration loop while
@@ -739,7 +632,7 @@ class specThread(wranglerThread):
 
         should_save = (
             not self.xye_only
-            and (force_save or self._frames_since_save >= _LIVE_SAVE_INTERVAL)
+            and (force_save or self._frames_since_save >= self.LIVE_SAVE_INTERVAL)
         )
         if should_save and self._frames_since_save > 0:
             _t_save0 = time.time()
@@ -1734,21 +1627,4 @@ class specThread(wranglerThread):
 
         return bg
 
-    @staticmethod
-    def save_1d(sphere, arch, idx):
-        """Automatically save 1D integrated data."""
-        path = os.path.dirname(sphere.data_file)
-        path = os.path.join(path, sphere.name)
-        Path(path).mkdir(parents=True, exist_ok=True)
-
-        if arch.int_1d is None:
-            return
-        _r1d = arch.int_1d
-        radial = _r1d.radial
-        intensity = _r1d.intensity
-
-        is_q = _r1d.unit in ('q_A^-1', 'q_nm^-1')
-        fname_prefix = 'iq' if is_q else 'itth'
-
-        fname = os.path.join(path, f'{fname_prefix}_{sphere.name}_{str(idx).zfill(4)}.xye')
-        write_xye(fname, radial, intensity, np.sqrt(abs(intensity)))
+    # ``save_1d`` moved to wranglerThread (the base class).
