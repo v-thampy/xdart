@@ -30,6 +30,7 @@ dependencies = [
     "scipy",
     "xarray",
     "h5py",
+    "nexusformat",
     "fabio",
     "silx",
     "pyFAI>=2025.3,<2026",

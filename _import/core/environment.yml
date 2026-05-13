@@ -8,6 +8,7 @@ dependencies:
   - scipy
   - xarray
   - h5py
+  - nexusformat
   - matplotlib
   - natsort
   - joblib
