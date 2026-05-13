@@ -13,6 +13,11 @@ master files) and a PONI calibration file.
 import os
 from pathlib import Path
 
+# Used to size the Cores spinbox.  os.cpu_count() returns None on
+# exotic platforms; the fallback default mirrors what the SPEC
+# wrangler does for the same widget.
+_CPU_COUNT = os.cpu_count() or 4
+
 # Qt imports
 from pyqtgraph.Qt import QtWidgets, QtCore
 from pyqtgraph.parametertree import ParameterTree, Parameter
@@ -112,9 +117,23 @@ class nexusWrangler(wranglerWidget):
         self.stopButton = QtWidgets.QPushButton('Stop')
         self.skip2dCheckBox = QtWidgets.QCheckBox('Skip 2D')
 
+        # Cores spinbox — controls how many worker threads the
+        # nexusThread spawns for parallel batch integration.  Same
+        # convention as specWrangler.maxCoresSpinBox.  Pushed down
+        # to ``self.thread.max_cores`` before each scan starts (see
+        # :meth:`start`).  Default = min(CPU-1, 4) so we don't
+        # saturate a busy laptop by default.
+        self.coresLabel = QtWidgets.QLabel('Cores:')
+        self.maxCoresSpinBox = QtWidgets.QSpinBox()
+        self.maxCoresSpinBox.setMinimum(1)
+        self.maxCoresSpinBox.setMaximum(_CPU_COUNT)
+        self.maxCoresSpinBox.setValue(min(_CPU_COUNT - 1, 4) or 1)
+
         btn_layout.addWidget(self.startButton)
         btn_layout.addWidget(self.stopButton)
         btn_layout.addWidget(self.skip2dCheckBox)
+        btn_layout.addWidget(self.coresLabel)
+        btn_layout.addWidget(self.maxCoresSpinBox)
         layout.addLayout(btn_layout)
 
         self.startButton.clicked.connect(self.start)
@@ -218,6 +237,16 @@ class nexusWrangler(wranglerWidget):
         if poni_file and os.path.exists(poni_file):
             self.poni = PONI.from_poni_file(poni_file)
 
+        # Cores spinbox isn't in the parameter tree — restore the
+        # last selected worker count directly.  Clamp to the
+        # spinbox's [min, max] in case the user opened on a smaller
+        # machine than the one that saved the session.
+        cores = data.get('max_cores')
+        if isinstance(cores, int):
+            cores = max(self.maxCoresSpinBox.minimum(),
+                        min(cores, self.maxCoresSpinBox.maximum()))
+            self.maxCoresSpinBox.setValue(cores)
+
     def _save_to_session(self):
         """Save parameters to session.json."""
         data = load_session() or {}
@@ -229,6 +258,9 @@ class nexusWrangler(wranglerWidget):
                 data[skey] = p.value()
             except Exception:
                 pass
+        # Persist the Cores spinbox alongside the parameter-tree
+        # values — see :meth:`_restore_from_session` for the inverse.
+        data['max_cores'] = self.maxCoresSpinBox.value()
         save_session(data)
 
     # ── Browse dialogs ───────────────────────────────────────────────
@@ -340,6 +372,10 @@ class nexusWrangler(wranglerWidget):
     def start(self):
         self.command = 'start'
         self.thread.command = 'start'
+        # Push the current Cores selection into the worker thread.
+        # The thread caches it as ``self.max_cores`` and uses it when
+        # building the ThreadPoolExecutor for parallel integration.
+        self.thread.max_cores = self.maxCoresSpinBox.value()
         self.startButton.setEnabled(False)
         self.stopButton.setEnabled(True)
         self._save_to_session()

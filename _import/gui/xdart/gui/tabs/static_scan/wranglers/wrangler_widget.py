@@ -4,11 +4,15 @@
 """
 
 # Standard library imports
+import logging
+import os
 from queue import Queue
 import threading
 import traceback
 
 # Other imports
+import numpy as np
+from pathlib import Path
 
 # Qt imports
 from pyqtgraph import Qt
@@ -16,6 +20,24 @@ from pyqtgraph.parametertree import Parameter
 
 # This module imports
 from xdart.modules.ewald import EwaldSphere
+from xdart.utils.h5pool import get_pool as _get_h5pool
+from ssrl_xrd_tools.io.export import write_xye
+
+logger = logging.getLogger(__name__)
+
+
+# Sentinel used by ``_apply_threshold_inline`` to mark out-of-band
+# pixels.  pyFAI's CSR integrator auto-skips NaN at integrate time
+# without invalidating the mask CRC, so the per-frame threshold
+# filter survives without forcing a per-frame LUT rebuild.  See the
+# session_may2026_nexusformat_writer.md lesson notes for the full
+# story (lessons 2, 3 in particular).
+_THRESHOLD_NAN = np.float32(np.nan)
+
+# Default cadence: flush sphere state to disk every N frames in batch
+# / live modes.  Subclasses can override per-instance via the
+# ``LIVE_SAVE_INTERVAL`` attribute if they want a different rhythm.
+_LIVE_SAVE_INTERVAL = 8
 
 
 class wranglerWidget(Qt.QtWidgets.QWidget):
@@ -142,6 +164,12 @@ class wranglerThread(Qt.QtCore.QThread):
     sigUpdateFile = Qt.QtCore.Signal(str, str, bool, str, bool, bool)
     sigUpdateGI = Qt.QtCore.Signal(bool)
 
+    # Per-class override hook for save cadence — subclasses can set
+    # this to a different integer if they want saves more/less often
+    # than the default 8 frames.  Read inside _maybe_save() / the
+    # subclass's dispatch loop.
+    LIVE_SAVE_INTERVAL = _LIVE_SAVE_INTERVAL
+
     def __init__(self, command_queue, sphere_args, fname, file_lock,
                  parent=None):
         """command_queue: mp.Queue, queue for commands sent from parent
@@ -157,7 +185,152 @@ class wranglerThread(Qt.QtCore.QThread):
         self.file_lock = file_lock
         self.signal_q = Queue()
         self.command_q = Queue()
-    
+
+        # ── Shared batch-engine state ────────────────────────────────
+        # Subclasses can override any of these before .start() (or
+        # via their own __init__) — the defaults are the "no batch
+        # features active" zero state.
+
+        # XYE write buffer + lock.  Populated during integration in
+        # workers; drained at end of batch by _flush_xye_buffer.
+        self._xye_buffer: list = []
+        self._xye_lock = threading.Lock()
+
+        # Per-batch save cadence counter.  Wraps to zero each time
+        # _save_to_disk fires.
+        self._frames_since_save = 0
+
+        # In-memory hand-off of just-integrated arches to the main
+        # thread so it doesn't have to round-trip through disk.  The
+        # main thread's update_data consumes this dict.
+        self._published_arches: dict = {}
+
+        # Threshold filtering — subclass sets these from its UI; the
+        # base default is "no threshold" so nexus / other wranglers
+        # that don't expose a threshold UI pay nothing.
+        self.apply_threshold = False
+        self.threshold_min = 0
+        self.threshold_max = 0
+
+        # Sub-label appended to log lines (e.g. "[Subtracted bg.tif]"
+        # for SPEC bg-subtraction mode).  Empty string = no append.
+        self.sub_label = ''
+
+        # Mode flags read by the dispatch loops + the GUI's
+        # wrangler_finished handler.
+        self.batch_mode = False
+        self.xye_only = False
+        self.max_cores = 1
+
     def run(self):
         """Main task. Subclasses (e.g. specThread) override this."""
         pass
+
+    # ── Shared batch helpers ────────────────────────────────────────
+
+    def _resolve_arch_mask(self, sphere, img_data):
+        """Return a stable per-scan "bad pixel" mask cached on the sphere.
+
+        Computed once from ``img_data < 0`` of the first frame seen
+        by this sphere; reused for every subsequent frame.  Keeping
+        the mask stable across frames is what lets pyFAI's CSR
+        engine cache stay valid — a single pixel changing in the
+        mask invalidates the cache and forces a ~250 ms LUT rebuild
+        (observed on Eiger scans where saturation flicker shifts the
+        mask CRC frame-to-frame; see session_may2026 lesson 1).
+
+        Per-frame threshold filtering is NOT routed through this
+        mask — see :meth:`_apply_threshold_inline` for that path
+        (NaN-sentinel in the data, mask CRC unchanged).
+        """
+        cached = getattr(sphere, '_cached_data_mask', None)
+        if cached is None:
+            try:
+                cached = np.arange(img_data.size)[
+                    np.asarray(img_data).flatten() < 0
+                ]
+            except Exception:
+                cached = None
+            sphere._cached_data_mask = cached
+        return cached
+
+    def _apply_threshold_inline(self, img_data):
+        """Pre-clamp pixels outside the threshold band to NaN.
+
+        Returns a fresh float32 array with out-of-band pixels
+        replaced by NaN.  pyFAI's CSR integrator skips NaN pixels
+        automatically (no ``dummy``/``delta_dummy`` kwargs needed),
+        and NaN propagates cleanly through bg subtraction and monitor
+        normalization arithmetic inside ``arch.integrate_1d/2d``.
+
+        No-op when ``self.apply_threshold`` is False — subclasses
+        that don't expose a threshold UI inherit a free pass-through.
+        """
+        if not self.apply_threshold:
+            return img_data
+        img = np.asarray(img_data, dtype=np.float32, copy=True)
+        bad = (img < self.threshold_min) | (img > self.threshold_max)
+        img[bad] = _THRESHOLD_NAN
+        return img
+
+    def _flush_xye_buffer(self, sphere):
+        """Drain ``self._xye_buffer`` and write each pending XYE file.
+
+        Drains under :attr:`_xye_lock` so workers can keep appending
+        new entries while this batch's disk IO runs.  Per-file write
+        errors are logged but don't abort the batch — losing one XYE
+        file shouldn't kill an otherwise-valid scan.
+        """
+        with self._xye_lock:
+            if not self._xye_buffer:
+                return
+            buf = self._xye_buffer
+            self._xye_buffer = []
+        for img_number, arch in buf:
+            try:
+                self.save_1d(sphere, arch, img_number)
+            except Exception as e:
+                logger.warning(
+                    'XYE write failed for frame %s: %s', img_number, e,
+                )
+
+    @staticmethod
+    def save_1d(sphere, arch, idx):
+        """Write a single-frame XYE next to the sphere's .nxs file.
+
+        Static because it only depends on the sphere + arch state —
+        not on per-wrangler attributes.  Filename layout matches the
+        prior specWrangler convention so existing downstream tools
+        keep working: ``<scan_dir>/<scan_name>/iq_<scan>_NNNN.xye``
+        (or ``itth_...`` for 2θ units).
+        """
+        if arch.int_1d is None:
+            return
+        path = os.path.dirname(sphere.data_file)
+        path = os.path.join(path, sphere.name)
+        Path(path).mkdir(parents=True, exist_ok=True)
+        r1d = arch.int_1d
+        is_q = r1d.unit in ('q_A^-1', 'q_nm^-1')
+        prefix = 'iq' if is_q else 'itth'
+        fname = os.path.join(
+            path, f'{prefix}_{sphere.name}_{str(idx).zfill(4)}.xye'
+        )
+        write_xye(fname, r1d.radial, r1d.intensity,
+                  np.sqrt(np.abs(r1d.intensity)))
+
+    def _save_to_disk(self, sphere):
+        """Persist sphere state to its .nxs file (intermediate save).
+
+        Honours the h5pool pause/resume protocol so the GUI's
+        h5viewer doesn't fight the writer for the file handle, and
+        the per-wrangler ``file_lock`` so reads stay quiescent
+        during the write.  No-op in xye_only mode (no .nxs target).
+        """
+        if self.xye_only:
+            return
+        _get_h5pool().pause(sphere.data_file)
+        try:
+            with self.file_lock:
+                sphere._save_to_nexus()
+        finally:
+            _get_h5pool().resume(sphere.data_file)

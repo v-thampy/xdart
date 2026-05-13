@@ -60,12 +60,8 @@ logger = logging.getLogger(__name__)
 # multiple times for the same chunk.
 _READ_CHUNK = 16
 
-# How many frames between disk saves in the dispatch loop.  The v2
-# writer's per-flush cost is ~30 ms regardless of total scan length
-# (incremental append-only), so 8 is a comfortable cadence that
-# bounds frame-loss-on-crash to ~8 frames without dominating
-# the wall-clock.
-_LIVE_SAVE_INTERVAL = 8
+# Save cadence inherited from wranglerThread.LIVE_SAVE_INTERVAL.
+# Subclass-level override would go here as ``LIVE_SAVE_INTERVAL = N``.
 
 # Default number of parallel integration workers when the GUI
 # doesn't expose a Cores spinbox to the NeXus wrangler (it currently
@@ -285,12 +281,13 @@ class nexusThread(wranglerThread):
                 )
 
                 # ── Periodic save ───────────────────────────────────
-                # _LIVE_SAVE_INTERVAL is checked at chunk boundaries
-                # (not frame boundaries); the v2 writer's per-flush
+                # ``LIVE_SAVE_INTERVAL`` (inherited from
+                # wranglerThread) is checked at chunk boundaries —
+                # not frame boundaries; the v2 writer's per-flush
                 # cost is ~30 ms regardless, so the granularity is
                 # close enough.
-                if frames_since_save >= _LIVE_SAVE_INTERVAL:
-                    self._flush_to_disk(sphere)
+                if frames_since_save >= self.LIVE_SAVE_INTERVAL:
+                    self._save_to_disk(sphere)
                     frames_since_save = 0
 
         # Final save: write everything coherent + provenance + finalize
@@ -379,14 +376,9 @@ class nexusThread(wranglerThread):
         """
         _t0 = time.time()
         # Stable bad-pixel mask cached on the sphere across frames so
-        # pyFAI's CSR cache stays valid — same trick specThread uses.
-        if getattr(sphere, '_cached_data_mask', None) is None:
-            try:
-                sphere._cached_data_mask = np.arange(img_data.size)[
-                    np.asarray(img_data).flatten() < 0
-                ]
-            except Exception:
-                sphere._cached_data_mask = None
+        # pyFAI's CSR cache stays valid.  Helper now lives on the
+        # wranglerThread base class — same impl as specThread uses.
+        arch_mask = self._resolve_arch_mask(sphere, img_data)
 
         # Borrow a private integrator — pyFAI isn't thread-safe with
         # different inputs on a shared instance.
@@ -399,7 +391,7 @@ class nexusThread(wranglerThread):
                 tilt_angle=self.tilt_angle,
                 series_average=False,
                 integrator=ai,
-                mask=sphere._cached_data_mask,
+                mask=arch_mask,
             )
 
             # GI fiber integrator: pre-warmed on the main thread (see
@@ -467,16 +459,7 @@ class nexusThread(wranglerThread):
             batch_save=True,
         )
 
-    def _flush_to_disk(self, sphere):
-        """Save accumulated sphere state to disk (intermediate save).
-
-        Called from the chunk loop every ``_LIVE_SAVE_INTERVAL`` frames
-        so the on-disk file stays close to in-memory state even if the
-        user kills the process mid-scan.
-        """
-        _get_h5pool().pause(sphere.data_file)
-        try:
-            with self.file_lock:
-                sphere._save_to_nexus()
-        finally:
-            _get_h5pool().resume(sphere.data_file)
+    # ``_save_to_disk`` is inherited from wranglerThread.  Called
+    # from the chunk loop every LIVE_SAVE_INTERVAL frames so the
+    # on-disk file stays close to in-memory state even if the user
+    # kills the process mid-scan.
