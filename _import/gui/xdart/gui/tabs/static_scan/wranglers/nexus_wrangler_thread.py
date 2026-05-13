@@ -203,6 +203,17 @@ class nexusThread(wranglerThread):
     def _process_one(self, sphere, frame_idx, img_data, img_meta):
         """Integrate one frame and save results."""
         _t1 = time.time()
+        # Stable bad-pixel mask cached on the sphere — see specThread
+        # ._resolve_arch_mask for the full rationale.  Computed once
+        # from frame 1's negative pixels; reused for the whole scan
+        # so pyFAI's CSR cache stays valid frame-to-frame.
+        if getattr(sphere, '_cached_data_mask', None) is None:
+            try:
+                sphere._cached_data_mask = np.arange(img_data.size)[
+                    np.asarray(img_data).flatten() < 0
+                ]
+            except Exception:
+                sphere._cached_data_mask = None
         arch = EwaldArch(
             frame_idx, img_data, poni=self.poni,
             scan_info=img_meta, static=True, gi=self.gi,
@@ -211,6 +222,7 @@ class nexusThread(wranglerThread):
             tilt_angle=self.tilt_angle,
             series_average=False,
             integrator=sphere._cached_integrator,
+            mask=sphere._cached_data_mask,
         )
 
         if self.gi:
