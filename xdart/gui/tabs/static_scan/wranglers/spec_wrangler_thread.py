@@ -21,6 +21,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from collections import deque
 
+# Per-worker pyFAI integrator pool — required for correct parallel
+# batch mode.  pyFAI's AzimuthalIntegrator isn't thread-safe across
+# different inputs on a shared instance, so each worker borrows its
+# own integrator copy from a per-scan pool.  See module docstring of
+# xdart.utils.integrator_pool for the full story.
+from xdart.utils.integrator_pool import ensure_integrator_pool
+
 logger = logging.getLogger(__name__)
 
 # pyFAI / fabio / h5py
@@ -766,7 +773,16 @@ class specThread(wranglerThread):
             acquisition.  Skipped entirely in xye_only mode.
         """
         n_workers = min(self.max_cores, len(pending))
-        integrator = sphere._cached_integrator
+        # Per-scan pool of N integrator copies — required because
+        # pyFAI's AzimuthalIntegrator isn't thread-safe across workers
+        # with different inputs.  See xdart.utils.integrator_pool.
+        integrator_pool = ensure_integrator_pool(
+            sphere, '_cached_integrator', n_workers,
+        )
+        if integrator_pool is None:
+            # No cached integrator yet — fall back to serial dispatch
+            # (the source integrator gets built on the first call).
+            return self._dispatch_batch_serial(sphere, pending)
         fiber_integrator = sphere._cached_fiber_integrator
         skip_2d = sphere.skip_2d
         bai_1d_args = dict(sphere.bai_1d_args)
@@ -793,40 +809,55 @@ class specThread(wranglerThread):
             # cache survives across frames.
             img_data = self._apply_threshold_inline(img_data)
             arch_mask = self._resolve_arch_mask(sphere, img_data)
-            arch = EwaldArch(
-                img_number, img_data, poni=self.poni,
-                scan_info=img_meta, static=True, gi=gi,
-                th_mtr=th_mtr, bg_raw=bg_raw,
-                sample_orientation=sample_orientation,
-                tilt_angle=tilt_angle,
-                series_average=series_average,
-                integrator=integrator,
-                mask=arch_mask,
-            )
 
-            # GI fiber integrator — reuse shared one (read-only)
-            _fi = fiber_integrator
-            if gi and _fi is None:
-                _incident_angle = arch._get_incident_angle()
-                _fi = create_fiber_integrator(
-                    arch._poni_from_integrator(),
-                    incident_angle=_incident_angle,
-                    tilt_angle=arch.tilt_angle,
+            # Borrow a private integrator for the duration of this
+            # frame's integration.  When the worker exits the `with`
+            # block the integrator returns to the pool for the next
+            # frame to grab.  Each integrator is touched by at most
+            # one worker at a time — that's what makes parallel
+            # batch correct vs the old shared-instance code path.
+            with integrator_pool.borrow() as ai:
+                arch = EwaldArch(
+                    img_number, img_data, poni=self.poni,
+                    scan_info=img_meta, static=True, gi=gi,
+                    th_mtr=th_mtr, bg_raw=bg_raw,
                     sample_orientation=sample_orientation,
-                    angle_unit="deg",
+                    tilt_angle=tilt_angle,
+                    series_average=series_average,
+                    integrator=ai,
+                    mask=arch_mask,
                 )
 
-            arch.integrate_1d(
-                global_mask=mask,
-                fiber_integrator=_fi,
-                **bai_1d_args,
-            )
-            if not skip_2d:
-                arch.integrate_2d(
+                # GI fiber integrator — reuse shared one (read-only)
+                _fi = fiber_integrator
+                if gi and _fi is None:
+                    _incident_angle = arch._get_incident_angle()
+                    _fi = create_fiber_integrator(
+                        arch._poni_from_integrator(),
+                        incident_angle=_incident_angle,
+                        tilt_angle=arch.tilt_angle,
+                        sample_orientation=sample_orientation,
+                        angle_unit="deg",
+                    )
+
+                arch.integrate_1d(
                     global_mask=mask,
                     fiber_integrator=_fi,
-                    **bai_2d_args,
+                    **bai_1d_args,
                 )
+                if not skip_2d:
+                    arch.integrate_2d(
+                        global_mask=mask,
+                        fiber_integrator=_fi,
+                        **bai_2d_args,
+                    )
+
+            # Detach the pool integrator from this arch — once the
+            # `with` block exited, the next worker can borrow this
+            # same instance and start mutating it.  Replace with the
+            # sphere's source integrator (which the pool never hands
+            # out, so it's safe to share with non-parallel consumers).
+            arch.integrator = sphere._cached_integrator
 
             # Precompute the raw-image thumbnail here, in parallel with
             # other workers' integrations, rather than on the serial Phase 2
