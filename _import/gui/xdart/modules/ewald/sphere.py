@@ -123,27 +123,26 @@ class EwaldSphere:
             self.overall_raw = 0
 
     def has_reload_only_frames(self) -> bool:
-        """Return True iff any arch was loaded from disk without raw data.
+        """Return True iff any arch can't recover its raw image.
 
-        R3 guardrail used by the GUI reintegrate buttons.  After
-        opening an .nxs file, frames are reconstructed from the
-        stacked v2 datasets without their ``map_raw`` images — pyFAI
-        re-integration silently no-ops on those frames (``arch.py``
-        early-returns when ``map_raw is None``).  Until a lazy raw
-        loader is wired up (using ``arch.source_file`` +
-        ``source_frame_idx`` per R2), the GUI greys out reintegrate
-        and surfaces this state to the user.
+        Used by the GUI reintegrate buttons (the R3 guardrail).  After
+        L1 wired lazy raw load, an arch's ``is_reload_only`` is True
+        only when neither ``arch.map_raw`` nor a resolvable
+        ``arch.source_file`` is available — i.e. the original raw
+        frames have been moved/deleted relative to the .nxs.  If lazy
+        load is feasible (source file present), the flag is False and
+        re-integration runs through ``_lazy_load_raw`` automatically.
 
         Checks the in-memory cache only — disk-resident arches that
-        haven't been touched yet count as reload-only (they will be
-        reload-only the moment they're materialised).  False
-        whenever no arches have been added or all in-memory arches
-        are fresh from a wrangler.
+        haven't been touched yet conservatively count as reload-only
+        (we can't know without materialising them, and materialising
+        means a disk hit per frame).  Returns False when no arches
+        have been added.
         """
         in_mem = getattr(self.arches, "_in_memory", None)
         if not in_mem:
             # No arches accessed yet — if the on-disk file has any
-            # rows, materialising them would set is_reload_only=True.
+            # rows, materialising them might set is_reload_only=True.
             return bool(self.arches.index)
         return any(getattr(a, "is_reload_only", False)
                    for a in in_mem.values())
