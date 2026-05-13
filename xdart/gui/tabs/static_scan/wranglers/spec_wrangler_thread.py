@@ -287,6 +287,15 @@ class specThread(wranglerThread):
         self.processed = []
         self.processed_scans = []
         self.sub_label = ''
+        # Bypass the file_thread.load_arch disk read for fresh frames:
+        # _process_one stashes the just-integrated EwaldArch here before
+        # emitting sigUpdate(img_number).  The main thread's update_data
+        # pops it and pushes directly into h5viewer.data_1d / data_2d.
+        # CPython's GIL makes dict access across threads atomic — no
+        # extra lock needed.  Bounded in practice to ~1-2 entries at a
+        # time (integration takes ~1.5s/frame; main thread consumes
+        # within ms of sigUpdate firing).
+        self._published_arches: dict = {}
         # Eiger HDF5 lazy frame state
         self._eiger_master_path = None
         self._eiger_frame_idx = 0
@@ -378,6 +387,14 @@ class specThread(wranglerThread):
             self._prefetch_stop_prior()
             self._eiger_close_master()  # ensure Eiger handle is released
         logger.info('Total Time: %.2fs', time.time() - t0)
+        # Final echo so the user can copy the output path straight from
+        # the terminal without scrolling back to the per-scan banner.
+        # Trailing newline gives a visual gap before the next scan's
+        # 'New Scan' banner (or before the next prompt if this was the
+        # last scan in the session).
+        output_path = getattr(self, 'fname', None) or getattr(self.sphere, 'data_file', None)
+        if output_path:
+            logger.info('Output file: %s\n', output_path)
 
     def process_scan(self):
         """Batch-integrate all existing images, then optionally watch for new ones (live mode).
@@ -808,6 +825,10 @@ class specThread(wranglerThread):
             logger.info('Processed %s %s', fname, self.sub_label)
         # In batch mode, suppress per-frame GUI signals — emit once at end
         if not self.batch_mode:
+            # Publish the freshly-integrated arch so the main thread can
+            # consume it without going back to disk.  See
+            # static_scan_widget.update_data for the consumer side.
+            self._published_arches[img_number] = arch
             self.sigUpdate.emit(img_number)
 
     # ── Eiger HDF5 helpers ────────────────────────────────────────────────
@@ -1326,6 +1347,7 @@ class specThread(wranglerThread):
             self.series_average
         )
         logger.info('***** New Scan *****')
+        logger.info('Output file: %s', fname)
 
         return sphere
 

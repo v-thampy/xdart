@@ -402,8 +402,16 @@ class EwaldSphere:
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
         """Loads data from NeXus-formatted hdf5 file."""
         with self.file_lock:
+            # Preserve user-supplied global_mask across reset().  v1's
+            # _load_from_h5 restored global_mask from the file's root
+            # attrs; v2's schema doesn't persist it yet (TODO), so without
+            # this preservation the wrangler-provided mask is lost on every
+            # post-scan reload and the displayframe shows no mask overlay.
+            preserved_global_mask = getattr(self, "global_mask", None)
             if replace:
                 self.reset()
+                if preserved_global_mask is not None:
+                    self.global_mask = preserved_global_mask
             with utils.catch_h5py_file(self.data_file, mode=mode) as file:
                 self._load_from_h5(file, *args, **kwargs)
 
@@ -572,8 +580,21 @@ class EwaldSphere:
         try:
             ds = read_sphere(self.data_file, schema="v2")
         except Exception as exc:
-            logger.debug("v2 load failed for %s: %s", self.data_file, exc)
+            # Surface the failure: silent debug-logging meant users saw an
+            # empty viewer with no hint why.  exc_info=True dumps the
+            # stacktrace into the xdart log so the bug is diagnosable.
+            logger.exception(
+                "v2 NeXus load failed for %s; viewer will be empty: %s",
+                self.data_file, exc,
+            )
             return
+        logger.debug(
+            "v2 NeXus load: %s — %d frames, %d motor cols [data_only=%s]",
+            self.data_file,
+            ds.sizes.get("frame", 0),
+            sum(1 for v in ds.data_vars if ds[v].dims == ("frame",)),
+            data_only,
+        )
 
         # ── scan_data DataFrame from motor variables ─────────────────
         reserved_vars = {
@@ -611,62 +632,51 @@ class EwaldSphere:
                 logger.debug("Failed to restore geometry from reduction config",
                              exc_info=True)
 
-        # ── synthesize per-frame arches ──────────────────────────────
+        # ── populate arches.index (cheap; required for BOTH data_only paths)
+        # In v1, _load_from_h5 builds arches.index from entry/frames/
+        # regardless of data_only, because the wrangler's per-frame
+        # `update_sphere` flush calls load_from_h5(data_only=True) and
+        # the GUI needs the arch indices to update listData.  Mirror
+        # that here: populate index first, gate only the heavier
+        # work below the data_only check.
+        #
+        # Lazy-loading: ArchSeries.__getitem__ opens the file in 'r'
+        # mode on demand and loads the requested arch from the v1
+        # per-frame groups (entry/frames/0001/, 0001_2d/, ...) that
+        # the wrangler's add_arch path already wrote to disk.  This
+        # avoids the file-lock conflict that would happen if we tried
+        # to pass arches into ArchSeries() (which opens in 'a' mode).
+        try:
+            frame_indices = np.asarray(ds["frame"].values).astype(int).tolist()
+            empty_series = ArchSeries(
+                self.data_file, self.file_lock,
+                static=self.static, gi=self.gi,
+            )
+            for idx in frame_indices:
+                if idx not in empty_series.index:
+                    empty_series.index.append(idx)
+            empty_series.index.sort()
+            self.arches = empty_series
+        except Exception:
+            logger.exception(
+                "v2 NeXus load: failed to populate arches.index from %s",
+                self.data_file,
+            )
+            return
+        logger.debug(
+            "v2 NeXus load: populated arches.index (%d frames) on %r",
+            len(self.arches.index),
+            self.name,
+        )
+
+        # ── data_only short-circuit ──────────────────────────────────
+        # In data_only mode (live-mode per-frame refresh from
+        # file_thread.update_sphere) we stop here.  bai_args / geometry
+        # were already restored above; no need to redo them per frame.
         if data_only:
             return
-
         if "intensity_1d" not in ds.data_vars:
-            return  # nothing to materialise
-
-        q = np.asarray(ds["q"].values, dtype=float)
-        intensity_1d = np.asarray(ds["intensity_1d"].values, dtype=float)
-        sigma_1d = (
-            np.asarray(ds["sigma_1d"].values, dtype=float)
-            if "sigma_1d" in ds.data_vars else None
-        )
-        unit_1d = ds["q"].attrs.get("units", "1/angstrom") or "1/angstrom"
-        # map nexus unit string back to pyFAI-style
-        unit_1d_pyfai = (
-            "q_A^-1" if "angstrom" in unit_1d
-            else "q_nm^-1" if "nm" in unit_1d else unit_1d
-        )
-
-        has_2d = "intensity_2d" in ds.data_vars
-        if has_2d:
-            intensity_2d_stack = np.asarray(
-                ds["intensity_2d"].values, dtype=float
-            )
-            # canonical Dataset is (frame, chi, q); xdart arch convention
-            # for int_2d.intensity is (nq, nchi) — transpose per-frame.
-            intensity_2d_stack = np.transpose(intensity_2d_stack, (0, 2, 1))
-            chi = np.asarray(ds["chi"].values, dtype=float)
-            unit_chi = ds["chi"].attrs.get("units", "deg") or "deg"
-
-        frame_indices = np.asarray(ds["frame"].values).astype(int).tolist()
-        arches_list: list[EwaldArch] = []
-        for k, idx in enumerate(frame_indices):
-            arch = EwaldArch(idx=idx)
-            arch.int_1d = IntegrationResult1D(
-                radial=q,
-                intensity=intensity_1d[k],
-                sigma=sigma_1d[k] if sigma_1d is not None else None,
-                unit=unit_1d_pyfai,
-            )
-            if has_2d:
-                arch.int_2d = IntegrationResult2D(
-                    radial=q,
-                    azimuthal=chi,
-                    intensity=intensity_2d_stack[k],
-                    sigma=None,
-                    unit=unit_1d_pyfai,
-                    azimuthal_unit=unit_chi,
-                )
-            arches_list.append(arch)
-
-        self.arches = ArchSeries(
-            self.data_file, self.file_lock, arches_list,
-            static=self.static, gi=self.gi,
-        )
+            return
 
 
 def _is_v2_layout(grp) -> bool:
