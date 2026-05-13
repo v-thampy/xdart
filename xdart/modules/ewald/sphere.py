@@ -446,8 +446,18 @@ class EwaldSphere:
         # something for the GUI's listData to render).  ArchSeries lazy-
         # loads each arch on demand from the stacked v2 datasets via
         # _load_arch_v2; nothing to materialize up-front.
+        #
+        # An empty file (e.g. the wrangler has created the .nxs but
+        # hasn't flushed the first batch yet) returns a Dataset with
+        # no ``frame`` dim — start with an empty index in that case.
+        # Don't raise: the wrangler immediately follows with new arches.
         try:
-            frame_indices = np.asarray(ds["frame"].values).astype(int).tolist()
+            if "frame" in ds.dims:
+                frame_indices = (
+                    np.asarray(ds["frame"].values).astype(int).tolist()
+                )
+            else:
+                frame_indices = []
             empty_series = ArchSeries(
                 self.data_file, self.file_lock,
                 static=self.static, gi=self.gi,
