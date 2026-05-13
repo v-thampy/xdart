@@ -36,13 +36,6 @@ logging.basicConfig(
 logging.getLogger('pyFAI').setLevel(logging.WARNING)
 logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
 
-# Per-section save timing — emits one DEBUG line per section helper
-# (entry, reduction, integrated_1d, integrated_2d, per_frame_metadata,
-# positioners, per_frame_geometry, instrument, stitched, close+TOTAL)
-# each time the v2 writer runs.  Useful for finding which section is
-# slow on long scans; harmless overhead otherwise.
-logging.getLogger('xdart.modules.ewald.nexus_writer').setLevel(logging.DEBUG)
-
 logger = logging.getLogger(__name__)
 
 # Qt imports

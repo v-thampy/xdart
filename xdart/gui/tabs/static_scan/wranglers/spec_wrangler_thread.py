@@ -114,6 +114,17 @@ _PENDING_FLUSH_SIZE = 16
 # so a crash or stop loses at most a few seconds of integrated data.
 _LIVE_SAVE_INTERVAL = 8
 
+# Sentinel value substituted into the image at pixels that fall outside
+# the user's threshold band.  pyFAI's CSR integrator automatically
+# skips NaN pixels (verified empirically on pyFAI 2025/2026; NaN
+# survives arithmetic in (map_raw - bg) / norm, where a finite sentinel
+# would drift outside any practical delta_dummy band).  No dummy
+# kwargs needed.  This is what lets per-frame threshold filtering
+# coexist with a stable arch mask: out-of-band pixels are masked via
+# NaN-in-data rather than via the mask array, so the mask CRC (and
+# the CSR LUT cache) stays valid frame-to-frame.
+_THRESHOLD_NAN = np.float32(np.nan)
+
 # Number of frames the background prefetch worker is allowed to read
 # ahead of the main collect loop.  Kept small: too large and the prefetcher
 # contends with the h5py writer for disk I/O (source .nxs and output HDF5
@@ -625,6 +636,60 @@ class specThread(wranglerThread):
             return self._dispatch_batch_parallel(sphere, pending)
         return self._dispatch_batch_serial(sphere, pending, force_save=force_save)
 
+    def _resolve_arch_mask(self, sphere, img_data):
+        """Return a stable per-scan "bad pixel" mask cached on the sphere.
+
+        Computed once from ``img_data < 0`` of the first frame and
+        reused for every subsequent frame in the scan.  Keeping the
+        mask stable across frames is what lets pyFAI's CSR engine
+        cache stay valid — a single pixel changing in the mask
+        invalidates the cache and forces a ~250 ms LUT rebuild,
+        which we observed firing on roughly every 13th Eiger frame
+        before this caching was added.
+
+        Threshold-based per-frame filtering is NOT routed through
+        this mask anymore; see :meth:`_apply_threshold_inline` for
+        that path (out-of-band pixels are replaced with NaN in the
+        image data, which pyFAI's CSR integrator skips automatically).
+        """
+        cached = getattr(sphere, '_cached_data_mask', None)
+        if cached is None:
+            try:
+                cached = np.arange(img_data.size)[
+                    np.asarray(img_data).flatten() < 0
+                ]
+            except Exception:
+                cached = None
+            sphere._cached_data_mask = cached
+        return cached
+
+    def _apply_threshold_inline(self, img_data):
+        """Pre-clamp pixels outside the threshold band to NaN.
+
+        Returns a fresh float32 array with out-of-band pixels replaced
+        by NaN.  pyFAI's CSR integrator skips NaN pixels automatically
+        (no ``dummy`` / ``delta_dummy`` kwargs needed), and NaN propa-
+        gates cleanly through the ``(map_raw - bg) / map_norm`` arith-
+        metic inside ``arch.integrate_1d`` / ``integrate_2d`` — both
+        of which were critical: a finite sentinel like -1e30 gets
+        divided by monitor counts and drifts outside any reasonable
+        ``delta_dummy`` band, causing the sentinel values to bleed
+        into the integrated output (verified in a GI scan, the 1D
+        plot showed intensities at -1e27, which is what tipped us off).
+
+        Cost: one ~18 MB float32 allocation + ~10 ms of vectorised work
+        per Eiger frame.  Compare to the alternative — letting the
+        threshold mask flicker frame-to-frame and triggering a ~250 ms
+        pyFAI CSR rebuild on roughly every 13th frame — which averaged
+        ~38 ms/frame over a scan and produced visible GUI burstiness.
+        """
+        if not self.apply_threshold:
+            return img_data
+        img = np.asarray(img_data, dtype=np.float32, copy=True)
+        bad = (img < self.threshold_min) | (img > self.threshold_max)
+        img[bad] = _THRESHOLD_NAN
+        return img
+
     def _flush_xye_buffer(self, sphere):
         """Write all buffered XYE files in one pass.
 
@@ -712,7 +777,6 @@ class specThread(wranglerThread):
         sample_orientation = self.sample_orientation
         tilt_angle = self.tilt_angle
         series_average = self.series_average
-        apply_threshold = self.apply_threshold
 
         def _integrate_one(img_file, img_number, img_data, img_meta, bg_raw,
                            t_read=0.0):
@@ -723,7 +787,12 @@ class specThread(wranglerThread):
             its read times via the per-batch [FLUSH] line.
             """
             _t0 = time.time()
-            threshold_mask = None if not apply_threshold else self.threshold(img_data)
+            # Threshold filtering: replace out-of-band pixels with the
+            # dummy sentinel in a fresh float32 copy.  The arch mask
+            # stays stable (cached from frame 1) so pyFAI's CSR engine
+            # cache survives across frames.
+            img_data = self._apply_threshold_inline(img_data)
+            arch_mask = self._resolve_arch_mask(sphere, img_data)
             arch = EwaldArch(
                 img_number, img_data, poni=self.poni,
                 scan_info=img_meta, static=True, gi=gi,
@@ -732,7 +801,7 @@ class specThread(wranglerThread):
                 tilt_angle=tilt_angle,
                 series_average=series_average,
                 integrator=integrator,
-                mask=threshold_mask,
+                mask=arch_mask,
             )
 
             # GI fiber integrator — reuse shared one (read-only)
@@ -868,10 +937,23 @@ class specThread(wranglerThread):
         track it (the live-watch loop reads via a different path).
         """
         fname = os.path.splitext(os.path.basename(img_file))[0]
-        self.showLabel.emit(f'Processing {self._middle_truncate(fname)}')
+        # Multi-frame containers reuse a single master filename across
+        # frames; appending "[frame N]" to the status box so the user
+        # can see the frame index advancing during the scan.
+        _ext = Path(img_file).suffix.lower()
+        if _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file):
+            self.showLabel.emit(
+                f'Processing {self._middle_truncate(fname)} [frame {img_number}]'
+            )
+        else:
+            self.showLabel.emit(f'Processing {self._middle_truncate(fname)}')
 
         _t1 = time.time()
-        threshold_mask = None if not self.apply_threshold else self.threshold(img_data)
+        # Threshold via dummy sentinel + stable cached mask — see
+        # _apply_threshold_inline / _resolve_arch_mask docstrings for
+        # why this is fast even with per-frame threshold filtering on.
+        img_data = self._apply_threshold_inline(img_data)
+        arch_mask = self._resolve_arch_mask(sphere, img_data)
         arch = EwaldArch(
             img_number, img_data, poni=self.poni,
             scan_info=img_meta, static=True, gi=self.gi,
@@ -880,7 +962,7 @@ class specThread(wranglerThread):
             tilt_angle=self.tilt_angle,
             series_average=self.series_average,
             integrator=sphere._cached_integrator,
-            mask=threshold_mask,
+            mask=arch_mask,
         )
         _t_arch = time.time() - _t1
 
@@ -961,20 +1043,26 @@ class specThread(wranglerThread):
         _t_csv = time.time() - _t5
 
         _t_total = t_read + _t_arch + _t_1d + _t_2d + _t_h5_total + _t_csv
-        # 3-decimal precision so sub-10ms components (in-memory add_arch,
-        # XYE buffer append) actually show up instead of rounding to 0.00.
-        logger.info(
-            '[TIMING] image_%04d: read=%.3fs arch_init=%.3fs '
-            'int_1d=%.3fs int_2d=%.3fs add_arch=%.3fs csv=%.3fs '
-            'total=%.3fs',
-            img_number, t_read, _t_arch, _t_1d, _t_2d,
-            _t_h5_total, _t_csv, _t_total,
-        )
+        # Merged per-frame line: timing + the user-facing "processed
+        # <file>" annotation.  3-decimal precision so sub-10ms
+        # components (in-memory add_arch, XYE buffer append) don't
+        # round to 0.00.  For multi-frame containers (.h5/.hdf5/.nxs)
+        # the label is "<master> frame N" — the frame number is
+        # already explicit there, so we drop the redundant
+        # "image_NNNN" prefix that we keep for per-file inputs.
         _ext = Path(img_file).suffix.lower()
         if _ext in ('.h5', '.hdf5', '.nxs'):
-            logger.info('Processed %s frame %s %s', fname, img_number, self.sub_label)
+            _label = f'{fname} frame {img_number}'
         else:
-            logger.info('Processed %s %s', fname, self.sub_label)
+            _label = f'image_{img_number:04d} {fname}'
+        _sub = f' {self.sub_label}' if self.sub_label else ''
+        logger.info(
+            '[TIMING] %s: read=%.3fs arch_init=%.3fs '
+            'int_1d=%.3fs int_2d=%.3fs add_arch=%.3fs csv=%.3fs '
+            'total=%.3fs%s',
+            _label, t_read, _t_arch, _t_1d, _t_2d,
+            _t_h5_total, _t_csv, _t_total, _sub,
+        )
         # In batch mode, suppress per-frame GUI signals — emit once at end
         if not self.batch_mode:
             # Publish the freshly-integrated arch so the main thread can
@@ -1168,6 +1256,7 @@ class specThread(wranglerThread):
 
                     start = self._eiger_frame_idx
                     end = min(start + _PREFETCH_READ_CHUNK, self._eiger_nframes)
+                    _t_blk = time.time()
                     try:
                         block = np.asarray(
                             self._eiger_h5_dataset[start:end], dtype='int32'
@@ -1179,6 +1268,15 @@ class specThread(wranglerThread):
                             start, end, e,
                         )
                         break  # outer loop will resume with sync reader
+                    _t_blk = time.time() - _t_blk
+                    # If a bulk read takes >50ms it can fight with the
+                    # consumer for memory bandwidth — log so we can
+                    # correlate against [TIMING] spikes on the consumer.
+                    if _t_blk > 0.05:
+                        logger.info(
+                            '[PREFETCH] block frames %d-%d read in %.3fs',
+                            start, end - 1, _t_blk,
+                        )
 
                     meta = (read_image_metadata(self._eiger_master_path,
                                                 meta_format=self.meta_ext)
