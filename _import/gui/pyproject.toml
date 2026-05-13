@@ -67,3 +67,13 @@ Issues = "https://github.com/v-thampy/xdart/issues"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["xdart*"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # Upstream noise from pyFAI 2025/2026 — uses the deprecated
+    # `numpy.ndarray.strides` setter (NumPy 2.4 deprecation).  Not
+    # actionable in xdart; pyFAI will need to switch to
+    # `np.lib.stride_tricks.as_strided`.  Drop this filter once pyFAI
+    # has a release that doesn't trigger it.
+    "ignore:Setting the strides on a NumPy array has been deprecated:DeprecationWarning:pyFAI",
+]
