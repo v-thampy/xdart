@@ -17,7 +17,6 @@ import threading
 import time
 import glob
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from collections import deque
 
@@ -812,46 +811,40 @@ class specThread(wranglerThread):
             return arch
 
         # ── Phase 1: parallel integration ────────────────────────────────────
-        arches = []
+        # Shared base helper handles ThreadPoolExecutor wiring,
+        # stop-flag honoring, per-worker exception logging, and
+        # idx-sort.  Both SPEC batch and NeXus chunked dispatch now
+        # share this primitive.
         self.showLabel.emit(f'Integrating {len(pending)} images ({n_workers} workers)...')
         _t_phase1 = time.time()
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = {}
-            for item in pending:
-                if self.command == 'stop':
-                    break
-                fut = pool.submit(_integrate_one, *item)
-                futures[fut] = item[1]  # img_number
-
-            for fut in as_completed(futures):
-                if self.command == 'stop':
-                    break
-                try:
-                    arch = fut.result()
-                    arches.append((futures[fut], arch))
-                except Exception as e:
-                    logger.error('Integration failed for image %s: %s', futures[fut], e)
+        arches = self._parallel_integrate(
+            pending,
+            lambda item: _integrate_one(*item),
+            n_workers,
+            label='BATCH',
+        )
         _t_phase1 = time.time() - _t_phase1
-        logger.info('[BATCH] Phase 1 (parallel integration): %d frames in %.2fs', len(arches), _t_phase1)
+        logger.info('[BATCH] Phase 1 (parallel integration): %d frames in %.2fs',
+                    len(arches), _t_phase1)
 
         if not arches:
             return 0
-
-        # Sort arches by img_number for consistent HDF5 ordering
-        arches.sort(key=lambda x: x[0])
 
         # ── Phase 2: serial HDF5 batch write ─────────────────────────────────
         if not self.xye_only:
             self.showLabel.emit(f'Writing {len(arches)} frames to HDF5...')
             _t_phase2 = time.time()
-            # Build img_number → img_file lookup for NeXus provenance
+            # img_number → img_file lookup for NeXus provenance.  Keyed
+            # on arch.idx (== img_number) so the lookup matches the
+            # arch-only result list returned by _parallel_integrate.
             _img_files = {item[1]: item[0] for item in pending}
             _get_h5pool().pause(sphere.data_file)
             try:
                 with self.file_lock:
                     # Phase 2a: in-memory accumulation only (batch_save=True
                     # makes add_arch a pure in-memory op; no file I/O).
-                    for img_number, arch in arches:
+                    for arch in arches:
+                        img_number = arch.idx
                         img_file = _img_files.get(img_number, '')
                         if img_file:
                             try:
