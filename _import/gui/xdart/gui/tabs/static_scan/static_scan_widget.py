@@ -350,7 +350,50 @@ class staticWidget(QWidget):
             self._update_timer.start()
             return
 
-        self.h5viewer.file_thread.queue.put("update_sphere")
+        # Per-frame mid-scan refresh.  Append idx to sphere.arches.index
+        # and bypass the file_thread.load_arch disk read by pulling the
+        # freshly-integrated arch directly out of the wrangler's in-memory
+        # publication slot (see wrangler_thread._published_arches).
+        # The arch contains map_raw, mask, int_1d, int_2d, gi_2d, etc.
+        # All we need for the displayframe — no disk hit, no file-lock
+        # contention with the wrangler's per-frame write.
+        try:
+            if idx not in self.sphere.arches.index:
+                self.sphere.arches.index.append(idx)
+                self.sphere.arches.index.sort()
+        except AttributeError:
+            # arches may briefly be None or replaced during set_datafile.
+            pass
+
+        # Consume the published arch from the wrangler thread.
+        published = getattr(self.wrangler, "thread", None)
+        if published is not None:
+            arch = getattr(published, "_published_arches", {}).pop(idx, None)
+        else:
+            arch = None
+        if arch is not None:
+            try:
+                with self.h5viewer.data_lock:
+                    # 1D copy (no map_raw / 2D payload) — small object
+                    self.h5viewer.data_1d[int(idx)] = arch.copy(include_2d=False)
+                    # 2D payload as a dict matching what file_thread.load_arches
+                    # produces (see sphere_threads.load_arches).  Keys are what
+                    # displayframe.get_arches_map_raw / get_arches_int_2d
+                    # look for.
+                    if not getattr(self.sphere, "skip_2d", False):
+                        self.h5viewer.data_2d[int(idx)] = {
+                            "map_raw": getattr(arch, "map_raw", None),
+                            "bg_raw": getattr(arch, "bg_raw", 0),
+                            "mask": getattr(arch, "mask", None),
+                            "int_2d": getattr(arch, "int_2d", None),
+                            "gi_2d": getattr(arch, "gi_2d", {}),
+                            "thumbnail": getattr(arch, "thumbnail", None),
+                        }
+            except Exception:
+                # Cache miss is non-fatal — displayframe will lazy-load
+                # from disk via file_thread.load_arch as fallback.
+                logger.debug("In-memory arch hand-off failed for idx=%s",
+                             idx, exc_info=True)
 
         with self.file_lock:
             self.h5viewer.latest_idx = idx
@@ -523,6 +566,15 @@ class staticWidget(QWidget):
         self.sphere.th_mtr = th_mtr
         self.sphere.single_img = single_img
         self.sphere.series_average = series_average
+        # Propagate the wrangler-loaded mask (detector + user Mask File,
+        # combined into flat indices) into the main sphere so the
+        # displayframe can overlay it on the raw image.  Without this,
+        # self.sphere.global_mask stays None after a scan and no mask
+        # overlay is drawn (regression introduced by the v2 refactor).
+        wrangler_mask = getattr(getattr(self.wrangler, 'thread', None),
+                                'mask', None)
+        if wrangler_mask is not None:
+            self.sphere.global_mask = wrangler_mask
 
         self.integratorTree.get_args('bai_1d')
         self.integratorTree.get_args('bai_2d')

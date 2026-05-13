@@ -430,7 +430,11 @@ def _quantize_thumbnail(
     vmin, vmax = np.percentile(arr[finite], [1, 99])
     if vmax <= vmin:
         vmax = vmin + 1e-12
-    norm = np.clip((arr - vmin) / (vmax - vmin), 0, 1)
+    # Replace NaN/inf (typically from masked pixels) with 0 BEFORE the
+    # clip so they don't propagate through (arr - vmin) / range → NaN →
+    # (NaN * 255).astype(uint8) which raises "invalid value in cast".
+    arr_clean = np.where(finite, arr, vmin)
+    norm = np.clip((arr_clean - vmin) / (vmax - vmin), 0, 1)
     if dtype == "uint16":
         return (norm * 65535).astype(np.uint16), (float(vmin), float(vmax), "uint16")
     return (norm * 255).astype(np.uint8), (float(vmin), float(vmax), "uint8")

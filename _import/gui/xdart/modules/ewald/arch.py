@@ -338,6 +338,14 @@ class EwaldArch():
                 mask = self.get_mask(global_mask)
                 gi_mode_1d = kwargs.get('gi_mode_1d', 'q_total')
                 npt_oop = kwargs.get('npt_oop', numpoints)
+                # pyFAI 2025.x's fiber integrators do NOT have CSR fast
+                # paths for the qip/qoop/qtot/exit spaces — passing
+                # method='csr' triggers a "No fast path for space" warning
+                # and falls back to a much slower (and visually incorrect)
+                # code path.  Keep 'no' here.  The standard transmission
+                # integration in arch.integrate_1d (non-GI branch) still
+                # uses csr via bai_1d_args['method'].
+                gi_method = 'no'
 
                 # Only compute the selected GI 1D mode
                 if gi_mode_1d == 'q_ip':
@@ -345,7 +353,7 @@ class EwaldArch():
                     result = integrate_gi_1d(
                         image_data, fi, npt=numpoints, npt_oop=npt_oop,
                         unit='qip_A^-1',
-                        method='no', mask=mask,
+                        method=gi_method, mask=mask,
                         radial_range=radial_range,
                         azimuth_range=kwargs.get('azimuth_range'),
                         vertical_integration=False,
@@ -357,7 +365,7 @@ class EwaldArch():
                     result = integrate_gi_1d(
                         image_data, fi, npt=numpoints, npt_oop=npt_oop,
                         unit='qoop_A^-1',
-                        method='no', mask=mask,
+                        method=gi_method, mask=mask,
                         radial_range=radial_range,
                         azimuth_range=kwargs.get('azimuth_range'),
                         vertical_integration=True,
@@ -367,7 +375,7 @@ class EwaldArch():
                 elif gi_mode_1d == 'exit_angle':
                     result = integrate_gi_exitangles_1d(
                         image_data, fi, npt=numpoints,
-                        method='no', mask=mask, 
+                        method=gi_method, mask=mask,
                         radial_range=radial_range,
                         azimuth_range=kwargs.get('azimuth_range'),
                         **gi_kwargs,
@@ -376,7 +384,7 @@ class EwaldArch():
                 else:  # 'q_total' (default — polar integration)
                     result = integrate_gi_polar_1d(
                         image_data, fi, npt=numpoints,
-                        method='no', mask=mask,
+                        method=gi_method, mask=mask,
                         radial_range=radial_range,
                         azimuth_range=kwargs.get('azimuth_range'),
                         **gi_kwargs,
@@ -478,12 +486,15 @@ class EwaldArch():
                 image_data = (self.map_raw - self.bg_raw) / self.map_norm
                 mask = self.get_mask(global_mask)
                 gi_mode_2d = kwargs.get('gi_mode_2d', 'qip_qoop')
+                # See integrate_1d for why GI sticks with method='no':
+                # pyFAI 2025.x has no CSR fast-path for qip/qoop spaces.
+                gi_method = 'no'
 
                 # Only compute the selected GI 2D mode
                 if gi_mode_2d == 'q_chi':
                     result = integrate_gi_polar(
                         image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
-                        method='no', mask=mask,
+                        method=gi_method, mask=mask,
                         radial_range=radial_range,
                         azimuth_range=azimuth_range,
                         **gi_kwargs,
@@ -492,7 +503,7 @@ class EwaldArch():
                 elif gi_mode_2d == 'exit_angles':
                     result = integrate_gi_exitangles(
                         image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
-                        method='no', mask=mask,
+                        method=gi_method, mask=mask,
                         radial_range=radial_range,
                         azimuth_range=azimuth_range,
                         **gi_kwargs,
@@ -501,7 +512,7 @@ class EwaldArch():
                 else:  # 'qip_qoop' (default)
                     r_gi2d = integrate_gi_2d(
                         image_data, fi, npt_rad=npt_rad, npt_azim=npt_azim,
-                        method='no', mask=mask,
+                        method=gi_method, mask=mask,
                         radial_range=x_range, azimuth_range=y_range,
                         **gi_kwargs,
                     )
