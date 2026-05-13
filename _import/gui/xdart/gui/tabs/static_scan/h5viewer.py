@@ -957,26 +957,22 @@ class H5Viewer(QWidget):
         self.set_file(fname)
 
     def load_arches_data(self, arch_ids, load_2d):
-        """Loads per-frame data from NeXus HDF5 (``entry/frames/``).
+        """Load per-frame data from the v2 stacked arrays.
 
-        args:
-            arch_ids: list of frame indices to load
-            load_2d: bool — whether to load 2D data and thumbnails
+        Delegates to :func:`xdart.modules.ewald.arch_series._load_arch_v2`
+        so the read path matches what ``ArchSeries.__getitem__`` does
+        on-demand — no schema duplication.
         """
         file = self._h5pool.get(self.sphere.data_file)
         if file is None:
             # File is being written to by the wrangler thread — skip this read.
             return
 
-        if "entry" not in file or "frames" not in file["entry"]:
-            return
-        frames_grp = file["entry/frames"]
+        from xdart.modules.ewald.arch_series import _load_arch_v2
 
         for idx in arch_ids:
             try:
-                arch = EwaldArch(idx=idx, static=True, gi=self.sphere.gi)
-                arch.load_from_nexus(frames_grp, load_2d=load_2d)
-
+                arch = _load_arch_v2(file, idx, static=True, gi=self.sphere.gi)
                 with self.data_lock:
                     if not load_2d:
                         self.data_1d[int(idx)] = arch.copy(include_2d=False)
@@ -989,7 +985,7 @@ class H5Viewer(QWidget):
                                                   'gi_2d': arch.gi_2d,
                                                   'thumbnail': arch.thumbnail}
 
-            except KeyError:
+            except (KeyError, IndexError):
                 pass
 
     # Removed legacy load_arch_data — all reads now go through

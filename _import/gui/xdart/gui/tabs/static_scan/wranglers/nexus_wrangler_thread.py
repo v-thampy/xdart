@@ -27,7 +27,6 @@ from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detecto
 from ssrl_xrd_tools.io.nexus import find_nexus_image_dataset, read_nexus
 from ssrl_xrd_tools.io.image import read_image
 from ssrl_xrd_tools.io.export import write_xye
-from xdart.utils import catch_h5py_file as _catch_h5
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from .wrangler_widget import wranglerThread
 
@@ -259,19 +258,14 @@ class nexusThread(wranglerThread):
             arch.source_file = str(self.nexus_file)
         arch.skip_map_raw = sphere.skip_2d  # NeXus frames stay in source
 
-        # Save to HDF5
-        _get_h5pool().pause(sphere.data_file)
-        try:
-            with self.file_lock:
-                with _catch_h5(sphere.data_file, 'a') as h5f:
-                    sphere.add_arch(
-                        arch=arch, calculate=False, update=True,
-                        get_sd=True, set_mg=False, static=True, gi=self.gi,
-                        th_mtr=self.th_mtr, series_average=False,
-                        h5file=h5f,
-                    )
-        finally:
-            _get_h5pool().resume(sphere.data_file)
+        # In-memory accumulate only — batch flush at end of scan in
+        # process_nexus_file() does the single v2 write.
+        sphere.add_arch(
+            arch=arch, calculate=False, update=True,
+            get_sd=True, set_mg=False, static=True, gi=self.gi,
+            th_mtr=self.th_mtr, series_average=False,
+            batch_save=True,
+        )
 
         _t_total = time.time() - _t1
         print(f'[NEXUS] frame_{frame_idx:04d}: total={_t_total:.2f}s')
