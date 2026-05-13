@@ -153,14 +153,14 @@ def save_sphere_to_nexus(
         _write_integrated_1d(f, sphere, entry=entry)
         _write_integrated_2d(f, sphere, entry=entry)
 
-        # 3. Per-frame metadata (thumbnails + source refs)
-        _write_per_frame_metadata(h5f, sphere, entry=entry)
+        # 3. Per-frame metadata — ported to nexusformat
+        _write_per_frame_metadata(f, sphere, entry=entry)
 
-        # 4. Raw motor positioners
-        _write_positioners(h5f, sphere, entry=entry)
+        # 4. Raw motor positioners — ported to nexusformat
+        _write_positioners(f, sphere, entry=entry)
 
-        # 5. Derived per-frame geometry
-        _write_per_frame_geometry(h5f, sphere, entry=entry)
+        # 5. Derived per-frame geometry — ported to nexusformat
+        _write_per_frame_geometry(f, sphere, entry=entry)
 
         # 6. Instrument (PONI, wavelength) — write each call (cheap, scalars)
         _write_instrument(h5f, sphere, entry=entry)
@@ -327,50 +327,98 @@ def _write_integrated_2d(f, sphere, *, entry: str) -> None:
     _assign_nxgroup(f, f"{entry}/integrated_2d", nxdata)
 
 
-def _write_per_frame_metadata(h5f, sphere, *, entry: str) -> None:
-    """Per-frame thumbnails + source refs.  No integrated arrays here."""
+def _write_per_frame_metadata(f, sphere, *, entry: str) -> None:
+    """Per-frame thumbnails + source refs as :class:`NXcollection` groups.
+
+    Layout::
+
+        /entry/frames/             NXcollection
+            frame_NNNN/            NXcollection
+                thumbnail          uint8 (with @vmin, @vmax, @dtype)
+                map_raw            float32, optional
+                timestamp          str, optional
+                source_ref/        NXcollection, optional
+
+    The frame index is taken from ``arch.idx`` so re-runs that re-use
+    the same arch ids overwrite their per-frame groups in place; new
+    ids extend the collection without touching the existing entries.
+    """
     arches = list(sphere.arches)
     if not arches:
         return
 
-    g = h5f.require_group(f"{entry}/frames")
-    g.attrs["NX_class"] = "NXcollection"
+    # The top-level /entry/frames container needs to exist as an
+    # NXcollection.  Re-creating it would clobber per-frame groups
+    # written by previous batches, so we create-if-missing instead of
+    # del-and-replace.
+    frames_path = f"{entry}/frames"
+    if frames_path not in f:
+        f[frames_path] = nx.NXcollection()
+    frames = f[frames_path]
+
     for arch in arches:
         idx = getattr(arch, "idx", arches.index(arch))
-        fg = g.require_group(f"frame_{idx:04d}")
-        fg.attrs["NX_class"] = "NXcollection"
+        frame_key = f"frame_{idx:04d}"
 
-        # thumbnail: uncompressed uint8 (or uint16 if requested)
+        # Build a fresh per-frame NXcollection so an arch that's been
+        # re-integrated (different thumbnail/timestamp/...) doesn't
+        # leave stale fields behind from the previous write.
+        fg = nx.NXcollection()
+
         thumb = getattr(arch, "thumbnail", None)
         if thumb is not None:
             arr, lut = _quantize_thumbnail(thumb)
-            if "thumbnail" in fg:
-                del fg["thumbnail"]
-            ds = fg.create_dataset("thumbnail", data=arr)
-            ds.attrs["vmin"] = lut[0]
-            ds.attrs["vmax"] = lut[1]
-            ds.attrs["dtype"] = lut[2]
+            # ``dtype`` collides with NXfield's reserved kwarg (which
+            # sets the array dtype) — pass attrs as a dict so the
+            # *attribute* named "dtype" goes through.
+            fg["thumbnail"] = nx.NXfield(
+                arr,
+                attrs={"vmin": lut[0], "vmax": lut[1], "dtype": lut[2]},
+            )
 
-        # map_raw heatmap — optional small reduced 2D
-        map_raw = getattr(arch, "map_raw_thumb", None) or getattr(arch, "map_raw", None)
+        map_raw = (getattr(arch, "map_raw_thumb", None)
+                   or getattr(arch, "map_raw", None))
         if isinstance(map_raw, np.ndarray) and map_raw.ndim == 2:
-            _replace_ds(fg, "map_raw", map_raw.astype(np.float32))
+            fg["map_raw"] = nx.NXfield(map_raw.astype(np.float32))
 
-        # source_ref
         src = getattr(arch, "source_ref", None)
         if isinstance(src, dict):
-            sub = fg.require_group("source_ref")
+            sub = nx.NXcollection()
             for k, v in src.items():
-                _replace_ds(sub, k, v)
+                sub[k] = nx.NXfield(v)
+            fg["source_ref"] = sub
 
-        # timestamp
         ts = getattr(arch, "timestamp", None)
         if ts is not None:
-            _replace_ds(fg, "timestamp", str(ts))
+            fg["timestamp"] = nx.NXfield(str(ts))
+
+        # Replace any existing per-frame group (idempotent rewrite).
+        if frame_key in frames:
+            del frames[frame_key]
+        frames[frame_key] = fg
 
 
-def _write_positioners(h5f, sphere, *, entry: str) -> None:
-    """Write /entry/{sample,instrument/detector}/positioners/<motor>/."""
+def _write_positioners(f, sphere, *, entry: str) -> None:
+    """Write motor positioners under ``NXsample`` / ``NXdetector``.
+
+    Layout::
+
+        /entry/sample/                  NXsample
+            positioners/                NXcollection
+                <motor>/                NXpositioner
+                    value               float32, with @units
+        /entry/instrument/detector/     NXdetector  (parent class set by
+                                        _write_instrument later, but we
+                                        seed the detector group here)
+            positioners/                NXcollection
+                <motor>/                NXpositioner
+                    value               float32, with @units
+
+    The split between sample-axis and detector-axis motors comes from
+    :class:`DiffractometerGeometry`; if no geometry is configured this
+    is a no-op and downstream readers fall back to motor columns in
+    ``scan_data``.
+    """
     geom = getattr(sphere, "geometry", None)
     scan_data = getattr(sphere, "scan_data", None)
     if scan_data is None or len(scan_data) == 0:
@@ -383,32 +431,73 @@ def _write_positioners(h5f, sphere, *, entry: str) -> None:
         tuple(geom.detector_motors) if geom else ()
     )
 
-    def write_set(category_path: str, motors: tuple[str, ...]) -> None:
-        if not motors:
-            return
-        cat = h5f.require_group(f"{entry}/{category_path}")
-        cat.attrs["NX_class"] = (
-            "NXsample" if category_path == "sample" else "NXinstrument"
-        )
-        pos = cat.require_group("positioners")
-        pos.attrs["NX_class"] = "NXcollection"
-        for motor in motors:
-            if motor not in scan_data.columns:
-                continue
-            pg = pos.require_group(motor)
-            pg.attrs["NX_class"] = "NXpositioner"
-            _replace_ds(
-                pg, "value",
+    def _build_positioners(motors: tuple[str, ...]) -> nx.NXcollection | None:
+        """Build a positioners NXcollection from a motor name set."""
+        present = [m for m in motors if m in scan_data.columns]
+        if not present:
+            return None
+        coll = nx.NXcollection()
+        for motor in present:
+            pg = nx.NXpositioner()
+            pg["value"] = nx.NXfield(
                 np.asarray(scan_data[motor].values, dtype=np.float32),
                 attrs={"units": "deg"},
             )
+            coll[motor] = pg
+        return coll
 
-    write_set("sample", sample_motors)
-    write_set("instrument/detector", detector_motors)
+    # ── /entry/sample ─────────────────────────────────────────────
+    sample_coll = _build_positioners(sample_motors)
+    if sample_coll is not None:
+        sample_path = f"{entry}/sample"
+        if sample_path not in f:
+            f[sample_path] = nx.NXsample()
+        # ensure NX_class is right even if the group was created earlier
+        f[sample_path].attrs["NX_class"] = "NXsample"
+        # Replace positioners atomically (idempotent).
+        if "positioners" in f[sample_path]:
+            del f[sample_path]["positioners"]
+        f[sample_path]["positioners"] = sample_coll
+
+    # ── /entry/instrument/detector ────────────────────────────────
+    # _write_instrument runs after us and also writes /instrument/detector
+    # so we just make sure the path exists with the right NX_classes and
+    # attach the positioners.  Detector is NXdetector, not NXinstrument
+    # (the old code wrongly stamped this NX_class — fixed here as part
+    # of the typed-constructor port).
+    det_coll = _build_positioners(detector_motors)
+    if det_coll is not None:
+        instr_path = f"{entry}/instrument"
+        if instr_path not in f:
+            f[instr_path] = nx.NXinstrument()
+        f[instr_path].attrs["NX_class"] = "NXinstrument"
+        det_path = f"{instr_path}/detector"
+        if "detector" not in f[instr_path]:
+            f[instr_path]["detector"] = nx.NXdetector()
+        f[det_path].attrs["NX_class"] = "NXdetector"
+        if "positioners" in f[det_path]:
+            del f[det_path]["positioners"]
+        f[det_path]["positioners"] = det_coll
 
 
-def _write_per_frame_geometry(h5f, sphere, *, entry: str) -> None:
-    """Derive rot1/rot2/rot3/incident_angle from positioners + geometry."""
+def _write_per_frame_geometry(f, sphere, *, entry: str) -> None:
+    """Write derived per-frame pyFAI rotations + incidence angle.
+
+    Layout::
+
+        /entry/per_frame_geometry/      NXcollection
+            frame_index                 int32 (N,)
+            rot1                        float32 (N,), rad
+            rot2                        float32 (N,), rad
+            rot3                        float32 (N,), rad
+            incident_angle              float32 (N,), deg  (optional)
+
+    Computed from ``sphere.geometry.derive_per_frame(motors)`` —
+    motors come from ``scan_data`` columns.  Stored as an
+    NXcollection (not NXdata) because the multiple derived arrays
+    don't share a single "signal"; viewers should pick whichever
+    field they care about explicitly.
+    """
     geom = getattr(sphere, "geometry", None)
     scan_data = getattr(sphere, "scan_data", None)
     if geom is None or scan_data is None or len(scan_data) == 0:
@@ -431,15 +520,12 @@ def _write_per_frame_geometry(h5f, sphere, *, entry: str) -> None:
         # /reduction/config/geometry, so the user can re-derive later.
         return
 
-    g = h5f.require_group(f"{entry}/per_frame_geometry")
-    g.attrs["NX_class"] = "NXdata"
+    coll = nx.NXcollection()
+    coll["frame_index"] = nx.NXfield(np.arange(len(scan_data), dtype=np.int32))
     for key, arr in derived.items():
         units = "deg" if key == "incident_angle" else "rad"
-        _replace_ds(g, key, arr.astype(np.float32), attrs={"units": units})
-    _replace_ds(
-        g, "frame_index",
-        np.arange(len(scan_data), dtype=np.int32),
-    )
+        coll[key] = nx.NXfield(arr.astype(np.float32), attrs={"units": units})
+    _assign_nxgroup(f, f"{entry}/per_frame_geometry", coll)
 
 
 def _write_instrument(h5f, sphere, *, entry: str) -> None:

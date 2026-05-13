@@ -161,6 +161,30 @@ def written_nxs(tmp_path):
     return path
 
 
+@pytest.fixture
+def written_nxs_with_geometry(tmp_path):
+    """4-frame sphere WITH a DiffractometerGeometry attached.
+
+    Exercises the positioner + per-frame-geometry write paths that the
+    bare ``written_nxs`` fixture doesn't touch.
+    """
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+
+    geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
+
+    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    scan_data = pd.DataFrame({
+        "tth": np.linspace(10.0, 14.0, N_FRAMES, dtype=np.float32),
+        "th": np.linspace(0.0, 0.3, N_FRAMES, dtype=np.float32),
+    })
+    sphere = _DuckSphere(arches, scan_data=scan_data, geometry=geom)
+
+    path = tmp_path / "geometry.nxs"
+    save_sphere_to_nexus(sphere, path, mode="w", finalize=False)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Tree-shape assertions via nexusformat
 # ---------------------------------------------------------------------------
@@ -266,6 +290,53 @@ def test_reduction_provenance(written_nxs):
     assert "date" in red
     assert red["versions"].nxclass == "NXcollection"
     assert "config" in red
+
+
+def test_positioners_groups(written_nxs_with_geometry):
+    """With a geometry set, motor positioners get NXsample / NXdetector trees.
+
+    Locks down:
+    * ``/entry/sample`` is :class:`NXsample` (not :class:`NXcollection`).
+    * ``/entry/instrument/detector`` is :class:`NXdetector` (not
+      :class:`NXinstrument` — the old h5py code had this stamped
+      wrongly; the typed constructor port fixed it).
+    * Each motor is an :class:`NXpositioner` with a ``value`` field
+      whose ``@units`` attr is set.
+    """
+    root = nx.nxload(str(written_nxs_with_geometry))
+    e = root["entry"]
+
+    sample = e["sample"]
+    assert sample.nxclass == "NXsample"
+    assert sample["positioners"].nxclass == "NXcollection"
+    th = sample["positioners/th"]
+    assert th.nxclass == "NXpositioner"
+    assert th["value"].shape == (N_FRAMES,)
+    assert th["value"].attrs.get("units") == "deg"
+
+    det = e["instrument/detector"]
+    assert det.nxclass == "NXdetector"
+    assert det["positioners"].nxclass == "NXcollection"
+    tth = det["positioners/tth"]
+    assert tth.nxclass == "NXpositioner"
+    assert tth["value"].shape == (N_FRAMES,)
+
+
+def test_per_frame_geometry(written_nxs_with_geometry):
+    """``/entry/per_frame_geometry`` is an :class:`NXcollection` of
+    derived rot1/rot2/rot3 + optional incident_angle, plus
+    ``frame_index``.  Each derived array has a ``@units`` attr.
+    """
+    root = nx.nxload(str(written_nxs_with_geometry))
+    g = root["entry/per_frame_geometry"]
+    assert g.nxclass == "NXcollection"
+    assert "frame_index" in g
+    assert g["frame_index"].shape == (N_FRAMES,)
+    # At minimum rot1/rot2/rot3 (the pyFAI per-frame rotations).
+    for k in ("rot1", "rot2", "rot3"):
+        assert k in g
+        assert g[k].shape == (N_FRAMES,)
+        assert g[k].attrs.get("units") == "rad"
 
 
 def test_h5py_layout_is_idempotent(tmp_path):
