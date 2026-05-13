@@ -907,6 +907,8 @@ class integratorTree(QtWidgets.QWidget):
     def bai_1d(self, q):
         """Uses the integrator_thread attribute to call bai_1d
         """
+        if self._block_if_reload_only_frames('1D'):
+            return
         with self.integrator_thread.lock:
             if len(self.sphere.arches.index) > 0:
                 self.integrator_thread.method = 'bai_1d_all'
@@ -918,6 +920,8 @@ class integratorTree(QtWidgets.QWidget):
     def bai_2d(self, q):
         """Uses the integrator_thread attribute to call bai_2d
         """
+        if self._block_if_reload_only_frames('2D'):
+            return
         with self.integrator_thread.lock:
             if len(self.sphere.arches.index) > 0:
                 self.integrator_thread.method = 'bai_2d_all'
@@ -925,6 +929,45 @@ class integratorTree(QtWidgets.QWidget):
         self.setEnabled(False)
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()
+
+    def _block_if_reload_only_frames(self, dim_label: str) -> bool:
+        """R3 guardrail.  Abort re-integration with a status message when
+        any of the sphere's arches lacks a raw image.
+
+        ``EwaldArch.integrate_1d`` / ``integrate_2d`` silently no-op
+        when ``self.map_raw is None`` — which is the common case for
+        a sphere reloaded from a v2 .nxs (we don't persist raw frames
+        in v2 to save disk).  Without this block, the user would
+        click "Re-integrate", see the buttons grey out for a moment,
+        then nothing on disk would change and no error would surface.
+
+        Returns True iff the action was blocked.
+        """
+        try:
+            blocked = self.sphere.has_reload_only_frames()
+        except Exception:
+            blocked = False
+        if not blocked:
+            return False
+        try:
+            from pyqtgraph.Qt import QtWidgets
+            QtWidgets.QMessageBox.information(
+                self,
+                f'Cannot re-integrate {dim_label}',
+                'This sphere was reloaded from a .nxs file that does '
+                'not carry raw detector images (xdart 0.37+ v2 schema '
+                'stores integrated results only).  Re-integration is '
+                'disabled.\n\nTo re-integrate, re-run the wrangler '
+                'against the original source files.',
+            )
+        except Exception:
+            # In a headless test or no-Qt context the message box
+            # can't pop — log the block instead.
+            logger.warning(
+                'Re-integrate %s blocked: sphere has reload-only frames',
+                dim_label,
+            )
+        return True
 
     @staticmethod
     def run_pyfai_calib():

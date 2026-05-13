@@ -122,6 +122,32 @@ class EwaldSphere:
             self.bai_2d = None
             self.overall_raw = 0
 
+    def has_reload_only_frames(self) -> bool:
+        """Return True iff any arch was loaded from disk without raw data.
+
+        R3 guardrail used by the GUI reintegrate buttons.  After
+        opening an .nxs file, frames are reconstructed from the
+        stacked v2 datasets without their ``map_raw`` images — pyFAI
+        re-integration silently no-ops on those frames (``arch.py``
+        early-returns when ``map_raw is None``).  Until a lazy raw
+        loader is wired up (using ``arch.source_file`` +
+        ``source_frame_idx`` per R2), the GUI greys out reintegrate
+        and surfaces this state to the user.
+
+        Checks the in-memory cache only — disk-resident arches that
+        haven't been touched yet count as reload-only (they will be
+        reload-only the moment they're materialised).  False
+        whenever no arches have been added or all in-memory arches
+        are fresh from a wrangler.
+        """
+        in_mem = getattr(self.arches, "_in_memory", None)
+        if not in_mem:
+            # No arches accessed yet — if the on-disk file has any
+            # rows, materialising them would set is_reload_only=True.
+            return bool(self.arches.index)
+        return any(getattr(a, "is_reload_only", False)
+                   for a in in_mem.values())
+
     def add_arch(self, arch=None, calculate=True, update=True, get_sd=True,
                  set_mg=True, h5file=None, batch_save=False, **kwargs):
         """Adds a new arch to the sphere.
@@ -271,18 +297,33 @@ class EwaldSphere:
     # ------------------------------------------------------------------
 
     def save_to_nexus(self, *, entry: str = "entry", finalize: bool = False,
-                      replace: bool = False) -> None:
+                      replace: bool = False,
+                      replace_frame_indices=None) -> None:
         """Save sphere state into a v2 NeXus file.  Idempotent across calls.
+
+        Two modes — see :func:`nexus_writer.save_sphere_to_nexus` for
+        the full contract:
+
+        * ``replace_frame_indices=None`` (default): append-only.  Stacked
+          datasets grow by however many new frames have been added
+          since the last save.
+        * ``replace_frame_indices=[...]``: slice-assign recomputed
+          integrated_1d/2d rows over their existing on-disk positions.
+          Used by GUI reintegration (``sphere_threads.bai_1d_all``).
 
         The writer owns its own file handle (with NFS-retry semantics)
         so the caller only needs to hold ``self.file_lock``.
         """
         mode = 'w' if replace else 'a'
         with self.file_lock:
-            self._save_to_nexus(mode=mode, entry=entry, finalize=finalize)
+            self._save_to_nexus(
+                mode=mode, entry=entry, finalize=finalize,
+                replace_frame_indices=replace_frame_indices,
+            )
 
     def _save_to_nexus(self, *, mode: str = "a", entry: str = "entry",
-                       finalize: bool = False) -> None:
+                       finalize: bool = False,
+                       replace_frame_indices=None) -> None:
         """Inner v2 writer; delegates to ``nexus_writer.save_sphere_to_nexus``.
 
         Opens the file at ``self.data_file`` internally.  Callers must
@@ -291,8 +332,11 @@ class EwaldSphere:
         """
         from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
         with self.sphere_lock:
-            save_sphere_to_nexus(self, self.data_file, mode=mode,
-                                 entry=entry, finalize=finalize)
+            save_sphere_to_nexus(
+                self, self.data_file, mode=mode,
+                entry=entry, finalize=finalize,
+                replace_frame_indices=replace_frame_indices,
+            )
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
         """Load sphere state from a v2 NeXus file.

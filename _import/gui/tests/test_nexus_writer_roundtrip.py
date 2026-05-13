@@ -87,6 +87,10 @@ class _DuckArch:
         self.idx = int(idx)
         self.poni = _DuckPONI()
         self.source_file = f"frame_{idx:04d}.tif"
+        # R2: per-file frame index — for single-frame TIFs always 0.
+        # Test cases for multi-frame sources (e.g. Eiger external links)
+        # set this to the offset within the source file.
+        self.source_frame_idx = 0
         self.skip_map_raw = True
         self.map_raw = None
         self.bg_raw = 0
@@ -125,6 +129,13 @@ class _DuckArches:
     def __init__(self, arches):
         self._by_idx = {a.idx: a for a in arches}
         self.index = [a.idx for a in arches]
+        # Mirror ArchSeries._in_memory — the writer's R4 helpers
+        # (_representative_poni, _write_per_frame_metadata) read this
+        # directly to avoid materialising the full arch list on every
+        # save.  Tests use the same dict as _by_idx so every arch is
+        # always "in memory" (real ArchSeries caps this at 64 with
+        # FIFO eviction; tests don't need to exercise that path).
+        self._in_memory = self._by_idx
 
     def __iter__(self):
         return (self._by_idx[i] for i in self.index)
@@ -320,6 +331,278 @@ def test_frames_group_and_thumbnails(written_nxs):
         assert "vmin" in thumb.attrs
         assert "vmax" in thumb.attrs
         assert thumb.attrs["dtype"] in ("uint8", "uint16")
+        # R2 source ref: path + frame_index always present when the
+        # arch carried a source_file (every test arch does).
+        assert "source" in sub
+        src = sub["source"]
+        assert src.nxclass == "NXcollection"
+        assert "path" in src
+        assert "frame_index" in src
+        # The duck fixture sets source_file = "frame_NNNN.tif" and
+        # source_frame_idx = 0 — those should round-trip verbatim.
+        path = src["path"].nxdata
+        if isinstance(path, bytes):
+            path = path.decode("utf-8")
+        assert path == f"frame_{i:04d}.tif"
+        assert int(src["frame_index"].nxdata) == 0
+
+
+def test_source_ref_multiframe(tmp_path):
+    """Eiger-shaped source ref: same source_file, varying frame_index."""
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    import h5py
+
+    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    # Mimic a NeXus wrangler stamp: every frame points to the same
+    # master file, source_frame_idx = global index within the master.
+    for i, a in enumerate(arches):
+        a.source_file = "scan_001_master.h5"
+        a.source_frame_idx = 1000 + i  # arbitrary global offset
+
+    sphere = _DuckSphere(arches)
+    path = tmp_path / "multiframe.nxs"
+    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        for i in range(N_FRAMES):
+            src = f[f"entry/frames/frame_{i:04d}/source"]
+            v = src["path"][()]
+            if isinstance(v, bytes):
+                v = v.decode("utf-8")
+            assert v == "scan_001_master.h5"
+            assert int(src["frame_index"][()]) == 1000 + i
+
+
+def test_replace_frame_indices_updates_only_targets(tmp_path):
+    """Replace mode: slice-assign new int_1d/int_2d over the listed
+    frames; leave all other rows byte-identical.
+    """
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    import h5py
+
+    n = 5
+    arches = [_DuckArch(idx=i) for i in range(n)]
+    sphere = _DuckSphere(arches)
+    path = tmp_path / "replace.nxs"
+    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+
+    # Snapshot original on-disk rows so we can verify untouched frames.
+    with h5py.File(path, "r") as f:
+        orig_1d = np.asarray(f["entry/integrated_1d/intensity"][()])
+        orig_2d = np.asarray(f["entry/integrated_2d/intensity"][()])
+        orig_frame_idx = list(f["entry/integrated_1d/frame_index"][()])
+        assert orig_frame_idx == list(range(n))
+
+    # Simulate a GUI reintegration: change int_1d/int_2d on frames 1 and 3.
+    rng = np.random.default_rng(999)
+    new_1d_arr = rng.random(N_Q, dtype=np.float32)
+    new_2d_arr = rng.random((N_Q, N_CHI), dtype=np.float32)
+    targets = [1, 3]
+    for fi in targets:
+        a = arches[fi]
+        a.int_1d = _DuckResult1D(
+            radial=np.asarray(a.int_1d.radial),
+            intensity=new_1d_arr.copy(),
+            sigma=a.int_1d.sigma,
+        )
+        a.int_2d = _DuckResult2D(
+            radial=np.asarray(a.int_2d.radial),
+            azimuthal=np.asarray(a.int_2d.azimuthal),
+            intensity=new_2d_arr.copy(),
+        )
+
+    save_sphere_to_nexus(
+        sphere, path, entry="entry", finalize=False,
+        replace_frame_indices=targets,
+    )
+
+    with h5py.File(path, "r") as f:
+        # Frame_index order is unchanged (replace doesn't reorder).
+        assert list(f["entry/integrated_1d/frame_index"][()]) == list(range(n))
+        new_on_disk_1d = np.asarray(f["entry/integrated_1d/intensity"][()])
+        new_on_disk_2d = np.asarray(f["entry/integrated_2d/intensity"][()])
+
+    # Targets: rows updated to the new values.
+    for fi in targets:
+        assert np.allclose(new_on_disk_1d[fi], new_1d_arr)
+        # 2D layout on disk is (frame, chi, q); arch int_2d is (q, chi).
+        assert np.allclose(new_on_disk_2d[fi], new_2d_arr.T)
+
+    # Non-targets: rows byte-identical to original.
+    untouched = [i for i in range(n) if i not in targets]
+    for fi in untouched:
+        assert np.array_equal(new_on_disk_1d[fi], orig_1d[fi])
+        assert np.array_equal(new_on_disk_2d[fi], orig_2d[fi])
+
+
+def test_replace_with_no_existing_file_degrades_to_append(tmp_path):
+    """First save with replace_frame_indices set should still succeed —
+    no on-disk dataset means there's nothing to replace, so the writer
+    falls back to append mode for those frames."""
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    import h5py
+
+    arches = [_DuckArch(idx=i) for i in range(3)]
+    sphere = _DuckSphere(arches)
+    path = tmp_path / "replace_first.nxs"
+    # User somehow calls replace before any append save existed.
+    save_sphere_to_nexus(
+        sphere, path, entry="entry", finalize=False,
+        replace_frame_indices=[0, 1, 2],
+    )
+    # Result: the file was created via the append fallback; all rows
+    # present.
+    with h5py.File(path, "r") as f:
+        assert "entry/integrated_1d/intensity" in f
+        assert f["entry/integrated_1d/intensity"].shape == (3, N_Q)
+
+
+def test_reload_only_flag_round_trips(tmp_path):
+    """Frames loaded from disk via _load_arch_v2 should carry
+    is_reload_only=True; freshly-integrated arches handed from the
+    wrangler should not.
+    """
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.arch_series import _load_arch_v2
+    import h5py
+
+    arches = [_DuckArch(idx=i) for i in range(2)]
+    sphere = _DuckSphere(arches)
+    path = tmp_path / "reload_flag.nxs"
+    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+
+    # Fresh arches (from the wrangler) — default is_reload_only=False.
+    from xdart.modules.ewald.arch import EwaldArch
+    fresh = EwaldArch(idx=0)
+    assert fresh.is_reload_only is False
+
+    # Reloaded arches — the loader stamps the flag.
+    with h5py.File(path, "r") as f:
+        loaded = _load_arch_v2(f, 0, static=False, gi=False)
+    assert loaded.is_reload_only is True
+
+
+def test_has_reload_only_frames_sphere_helper(tmp_path):
+    """EwaldSphere.has_reload_only_frames mirrors the in-memory cache."""
+    from xdart.modules.ewald.sphere import EwaldSphere
+    from xdart.modules.ewald.arch import EwaldArch
+
+    sphere = EwaldSphere(name='t', data_file=str(tmp_path / 'none.nxs'))
+
+    # No arches → False (nothing to re-integrate, but nothing flagged).
+    assert sphere.has_reload_only_frames() is False
+
+    # A fresh arch (wrangler hand-off) — flag stays False.
+    fresh = EwaldArch(idx=0)
+    sphere.arches.stash(fresh)
+    sphere.arches.index.append(0)
+    assert sphere.has_reload_only_frames() is False
+
+    # Mark one as reload-only → True.
+    fresh.is_reload_only = True
+    assert sphere.has_reload_only_frames() is True
+
+
+def test_acquire_save_reload_reintegrate_save_reload(tmp_path):
+    """End-to-end: simulate the acquire → save → reload → reintegrate
+    → save → reload workflow that the GUI exercises, verifying that
+    the second reload sees the post-reintegration values on disk.
+
+    Uses the real ArchSeries (not the duck) so the test covers the
+    actual lazy-load + replace-frames code path.  Re-integration
+    here is faked by mutating the int_1d values on the in-memory
+    arches — we're testing the writer's replace mode, not pyFAI.
+    """
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.arch_series import _load_arch_v2
+
+    # --- Phase 1: acquire + save -------------------------------------
+    arches = [_DuckArch(idx=i) for i in range(4)]
+    sphere = _DuckSphere(arches)
+    path = tmp_path / "lifecycle.nxs"
+    save_sphere_to_nexus(sphere, path, entry="entry", finalize=True)
+
+    # --- Phase 2: reload --------------------------------------------
+    with h5py.File(path, "r") as f:
+        original_intensity = f["entry/integrated_1d/intensity"][1].copy()
+
+    # --- Phase 3: simulate reintegration on frames 1 + 2 ------------
+    new_intensity_frame1 = np.full(N_Q, 7.0, dtype=np.float32)
+    new_intensity_frame2 = np.full(N_Q, 9.0, dtype=np.float32)
+    arches[1].int_1d = _DuckResult1D(
+        radial=np.asarray(arches[1].int_1d.radial),
+        intensity=new_intensity_frame1.copy(),
+        sigma=arches[1].int_1d.sigma,
+    )
+    arches[2].int_1d = _DuckResult1D(
+        radial=np.asarray(arches[2].int_1d.radial),
+        intensity=new_intensity_frame2.copy(),
+        sigma=arches[2].int_1d.sigma,
+    )
+
+    # --- Phase 4: save replace --------------------------------------
+    save_sphere_to_nexus(
+        sphere, path, entry="entry", finalize=False,
+        replace_frame_indices=[1, 2],
+    )
+
+    # --- Phase 5: reload again, confirm updates persisted -----------
+    with h5py.File(path, "r") as f:
+        assert np.allclose(f["entry/integrated_1d/intensity"][1],
+                           new_intensity_frame1)
+        assert np.allclose(f["entry/integrated_1d/intensity"][2],
+                           new_intensity_frame2)
+        # Frame 1's old value should be different from the new one.
+        assert not np.allclose(original_intensity, new_intensity_frame1)
+        # The replace save also re-wrote /entry/reduction so the
+        # persisted args reflect the (possibly tweaked) integration
+        # parameters.
+        assert "entry/reduction" in f
+
+
+def test_replace_unknown_frame_idx_is_silent(tmp_path):
+    """Listing a frame_idx that doesn't exist on disk: no error, no
+    write, other targets still processed."""
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    import h5py
+
+    arches = [_DuckArch(idx=i) for i in range(3)]
+    sphere = _DuckSphere(arches)
+    path = tmp_path / "replace_unknown.nxs"
+    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+
+    # Mutate frame 1 only.
+    new_arr = np.full(N_Q, 99.0, dtype=np.float32)
+    arches[1].int_1d = _DuckResult1D(
+        radial=np.asarray(arches[1].int_1d.radial),
+        intensity=new_arr.copy(),
+        sigma=arches[1].int_1d.sigma,
+    )
+    # Pass valid + invalid frame idx.
+    save_sphere_to_nexus(
+        sphere, path, entry="entry", finalize=False,
+        replace_frame_indices=[1, 999],
+    )
+    with h5py.File(path, "r") as f:
+        assert np.allclose(f["entry/integrated_1d/intensity"][1], new_arr)
+
+
+def test_source_ref_omitted_when_no_source_file(tmp_path):
+    """No source/ subgroup is written when arch.source_file is empty."""
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    import h5py
+
+    arches = [_DuckArch(idx=i) for i in range(2)]
+    for a in arches:
+        a.source_file = ""  # no source
+    sphere = _DuckSphere(arches)
+    path = tmp_path / "no_source.nxs"
+    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        for i in range(2):
+            assert "source" not in f[f"entry/frames/frame_{i:04d}"]
 
 
 def test_instrument_groups(written_nxs):

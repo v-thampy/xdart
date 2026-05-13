@@ -112,16 +112,72 @@ def _load_arch_v2(h5file, idx: int, *, static: bool, gi: bool) -> EwaldArch:
             azimuthal_unit=chi_unit_attr or "deg",
         )
 
-    # ── per-frame thumbnail ───────────────────────────────────────
+    # ── per-frame thumbnail + source ref ──────────────────────────
     fg_key = f"entry/frames/frame_{idx:04d}"
     fg = h5file.get(fg_key)
-    if fg is not None and "thumbnail" in fg:
+    if fg is not None:
+        if "thumbnail" in fg:
+            try:
+                arch.thumbnail = np.asarray(fg["thumbnail"][()])
+            except Exception:
+                pass
+        _load_source_ref(arch, fg)
+
+    # R3 guardrail: this arch was reconstructed from disk, not handed
+    # over fresh from the wrangler.  ``map_raw`` is None and won't be
+    # populated until a lazy raw loader is wired up — so the GUI
+    # mustn't pretend re-integration is possible.
+    arch.is_reload_only = True
+    return arch
+
+
+def _load_source_ref(arch: EwaldArch, fg) -> None:
+    """Populate ``arch.source_file`` and ``arch.source_frame_idx`` from a
+    per-frame :class:`NXcollection`.
+
+    R2 schema lives under ``<frame_group>/source/{path, frame_index}``.
+    A legacy ``source_ref`` dict (never actually written by the v2
+    writer prior to R2 — the attribute-name mismatch silenced it) is
+    also supported for forward-compat with any one-off files that
+    might carry it.
+    """
+    src_grp = fg.get("source") if "source" in fg else None
+    if src_grp is not None:
         try:
-            arch.thumbnail = np.asarray(fg["thumbnail"][()])
+            path = src_grp["path"][()]
+            if isinstance(path, bytes):
+                path = path.decode("utf-8", errors="replace")
+            arch.source_file = str(path)
         except Exception:
             pass
+        try:
+            arch.source_frame_idx = int(src_grp["frame_index"][()])
+        except Exception:
+            pass
+        return
 
-    return arch
+    # Legacy support: dict-shaped source_ref subgroup.
+    legacy = fg.get("source_ref") if "source_ref" in fg else None
+    if legacy is None:
+        return
+    path = None
+    if "path" in legacy:
+        path = legacy["path"]
+    elif "file" in legacy:
+        path = legacy["file"]
+    if path is not None:
+        try:
+            v = path[()]
+            if isinstance(v, bytes):
+                v = v.decode("utf-8", errors="replace")
+            arch.source_file = str(v)
+        except Exception:
+            pass
+    if "frame_index" in legacy:
+        try:
+            arch.source_frame_idx = int(legacy["frame_index"][()])
+        except Exception:
+            pass
 
 
 class ArchSeries:

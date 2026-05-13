@@ -824,6 +824,11 @@ class specThread(wranglerThread):
                                 arch.source_file = str(img_file)
                         else:
                             arch.source_file = ""
+                        # SPEC TIFs are single-frame files, so the
+                        # per-file frame index is always 0.  (For
+                        # multi-frame sources like Eiger, the wrangler
+                        # sets this to the offset within the source.)
+                        arch.source_frame_idx = 0
                         arch.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
 
                         sphere.add_arch(
@@ -944,6 +949,8 @@ class specThread(wranglerThread):
                     arch.source_file = str(img_file)
             else:
                 arch.source_file = ""
+            # SPEC TIF: single-frame source file → idx 0.
+            arch.source_frame_idx = 0
             # For Eiger: raw frames already live in the master file — don't double-store them.
             arch.skip_map_raw = sphere.skip_2d or _raw_lives_in_source(img_file)
             _t4 = time.time()

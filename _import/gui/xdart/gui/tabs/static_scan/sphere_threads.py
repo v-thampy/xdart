@@ -21,7 +21,6 @@ from pyqtgraph import Qt
 
 # This module imports
 from xdart.utils import catch_h5py_file as catch
-from xdart import utils as ut
 
 
 
@@ -153,9 +152,19 @@ class integratorThread(Qt.QtCore.QThread):
                     }
                 self.update.emit(arch.idx)
 
-        with self.file_lock:
-            with catch(self.sphere.data_file, 'a') as file:
-                ut.dict_to_h5(self.sphere.bai_2d_args, file, 'bai_2d_args')
+        # Persist recomputed int_2d rows back to disk.  Replace-frames
+        # mode: the writer locates each frame_idx in the stacked
+        # dataset's frame_index array and slice-assigns the new
+        # intensity over the old.  The save also re-writes
+        # ``/entry/reduction`` so the persisted ``bai_2d_args``
+        # reflect this reintegration's parameters (which is the whole
+        # reason the user kicked it off).  Skipping the legacy
+        # ``ut.dict_to_h5(..., 'bai_2d_args')`` path entirely — that
+        # wrote to the file root, which is the v1 layout we dropped
+        # in 0.37.0, and it never updated the v2 stacked rows.
+        replace_idxs = list(self.sphere.arches.index)
+        if replace_idxs:
+            self.sphere.save_to_nexus(replace_frame_indices=replace_idxs)
 
     def bai_1d_all(self):
         """Integrates all arches 1d. Uses parallel workers when sphere.max_cores > 1."""
@@ -203,9 +212,11 @@ class integratorThread(Qt.QtCore.QThread):
                     self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
                 self.update.emit(arch.idx)
 
-        with self.file_lock:
-            with catch(self.sphere.data_file, 'a') as file:
-                ut.dict_to_h5(self.sphere.bai_1d_args, file, 'bai_1d_args')
+        # Persist recomputed int_1d rows back to disk via the v2
+        # replace-frames path.  See ``bai_2d_all`` for the rationale.
+        replace_idxs = list(self.sphere.arches.index)
+        if replace_idxs:
+            self.sphere.save_to_nexus(replace_frame_indices=replace_idxs)
 
     def bai_2d_SI(self):
         """Integrate the current arch, 2d

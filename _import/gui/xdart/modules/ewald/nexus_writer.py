@@ -111,8 +111,25 @@ def save_sphere_to_nexus(
     mode: str = "a",
     entry: str = "entry",
     finalize: bool = False,
+    replace_frame_indices=None,
 ) -> None:
     """Write ``sphere``'s state into the file at ``path`` as a v2 NXroot.
+
+    Two write modes:
+
+    * **Append (default, ``replace_frame_indices=None``)** —
+      acquisition flow.  Stacked integrated_1d/2d datasets are
+      append-only; per-frame metadata groups are append-only; the
+      reduction group is written once (or on finalize).
+
+    * **Replace** — ``replace_frame_indices`` is an iterable of
+      frame indices whose recomputed ``int_1d`` / ``int_2d`` should
+      be slice-assigned in place over their existing rows.  Used by
+      GUI reintegration (``sphere_threads.bai_1d_all``).  In this
+      mode the per-frame metadata + positioners + geometry are left
+      alone (they don't change on reintegration), but the reduction
+      group is re-written so the persisted ``bai_*_args`` reflect
+      the new run's parameters.
 
     Parameters
     ----------
@@ -135,6 +152,8 @@ def save_sphere_to_nexus(
         If ``True``, this is the last write of the scan — additional
         write-once items (PONI, stitched outputs) are flushed.  Safe to
         call with ``finalize=False`` repeatedly during a scan.
+    replace_frame_indices
+        See "Replace" mode above.  ``None`` (default) for append mode.
     """
     import logging
     _logger = logging.getLogger(__name__)
@@ -146,6 +165,8 @@ def save_sphere_to_nexus(
                           label, time.time() - t0)
         return time.time()
 
+    is_replace = replace_frame_indices is not None
+
     _t_total = time.time()
     _t0 = time.time()
     with _open_with_retry(path, mode) as f:
@@ -154,38 +175,38 @@ def save_sphere_to_nexus(
         _t0 = _tick("entry", _t0)
         h5f = _h5(f)
 
-        # 1. Provenance — only write on first save or on finalize.
-        # The versions/config/inputs of an in-progress scan don't
-        # change between saves; rewriting them every batch costs
-        # ~10–30 ms each (importlib.metadata.version() lookups +
-        # group-tree delete/recreate via h5py) for no benefit.
-        if finalize or "reduction" not in h5f.get(entry, {}):
+        # 1. Provenance — append mode: only on first save or finalize.
+        # Replace mode: always rewrite so the persisted ``bai_*_args``
+        # reflect whatever parameters the reintegration used (this is
+        # the whole reason the user kicked off a re-integration in the
+        # first place).
+        if is_replace or finalize or "reduction" not in h5f.get(entry, {}):
             _write_reduction(h5f, sphere, entry=entry)
         _t0 = _tick("reduction", _t0)
 
         # 2. Stacked integrated_1d and integrated_2d
-        _write_integrated_1d(f, sphere, entry=entry)
+        _write_integrated_1d(f, sphere, entry=entry,
+                             replace_frame_indices=replace_frame_indices)
         _t0 = _tick("integrated_1d", _t0)
-        _write_integrated_2d(f, sphere, entry=entry)
+        _write_integrated_2d(f, sphere, entry=entry,
+                             replace_frame_indices=replace_frame_indices)
         _t0 = _tick("integrated_2d", _t0)
 
-        # 3. Per-frame metadata
-        _write_per_frame_metadata(f, sphere, entry=entry)
-        _t0 = _tick("per_frame_metadata", _t0)
+        # 3-6: per-frame metadata, positioners, derived geometry and
+        # instrument are *write-once* values (raw motor positions
+        # don't change on reintegration; neither do PONI, thumbnail,
+        # mask).  Skip them in replace mode for a faster save.
+        if not is_replace:
+            _write_per_frame_metadata(f, sphere, entry=entry)
+            _t0 = _tick("per_frame_metadata", _t0)
+            _write_positioners(f, sphere, entry=entry)
+            _t0 = _tick("positioners", _t0)
+            _write_per_frame_geometry(f, sphere, entry=entry)
+            _t0 = _tick("per_frame_geometry", _t0)
+            _write_instrument(f, sphere, entry=entry)
+            _t0 = _tick("instrument", _t0)
 
-        # 4. Raw motor positioners
-        _write_positioners(f, sphere, entry=entry)
-        _t0 = _tick("positioners", _t0)
-
-        # 5. Derived per-frame geometry
-        _write_per_frame_geometry(f, sphere, entry=entry)
-        _t0 = _tick("per_frame_geometry", _t0)
-
-        # 6. Instrument (PONI, wavelength)
-        _write_instrument(f, sphere, entry=entry)
-        _t0 = _tick("instrument", _t0)
-
-        # 7. Stitched outputs (if present on the sphere)
+        # 7. Stitched outputs (if present on the sphere) — finalize only.
         if finalize:
             _write_stitched(f, sphere, entry=entry)
             _t0 = _tick("stitched", _t0)
@@ -390,6 +411,51 @@ def _write_static_axis(g, name: str, data: np.ndarray,
             ds.attrs[k] = v
 
 
+def _locate_rows_by_frame_idx(ds_frame_index, target_indices):
+    """Return ``(positions, ordered_target_indices)`` for slice-assignment.
+
+    Given a stacked dataset's on-disk ``frame_index`` 1-D array and a
+    list of frame indices to replace, returns the row positions where
+    each target lives, sorted ascending — h5py requires monotonically
+    increasing fancy indices for write.  Indices that don't appear on
+    disk are silently dropped (caller can detect via length mismatch
+    if it matters).
+
+    Both return arrays are aligned: ``ordered_target_indices[i]`` is
+    the frame index that lives at row ``positions[i]``.
+    """
+    on_disk = np.asarray(ds_frame_index[()])
+    # Build {frame_idx → row_position} once, then lookup in O(K).
+    lookup = {int(fi): i for i, fi in enumerate(on_disk)}
+    rows = []
+    ordered = []
+    for fi in target_indices:
+        p = lookup.get(int(fi))
+        if p is None:
+            continue
+        rows.append(p)
+        ordered.append(int(fi))
+    if not rows:
+        return np.empty((0,), dtype=np.int64), []
+    rows_arr = np.asarray(rows, dtype=np.int64)
+    order = np.argsort(rows_arr)
+    rows_sorted = rows_arr[order]
+    ordered_sorted = [ordered[i] for i in order]
+    return rows_sorted, ordered_sorted
+
+
+def _replace_rows(group, dataset_name, positions, new_rows):
+    """Slice-assign ``new_rows`` at the given monotonic ``positions``.
+
+    No-op when ``positions`` is empty.  Doesn't touch the dataset's
+    attrs (units etc. don't change on reintegration).
+    """
+    if positions.size == 0:
+        return
+    ds = group[dataset_name]
+    ds[positions, ...] = new_rows
+
+
 def _new_arches_for_write(sphere, h5f, group_path: str) -> tuple[list, int]:
     """Return ``(new_arches, existing_n)`` for an incremental save.
 
@@ -417,20 +483,54 @@ def _new_arches_for_write(sphere, h5f, group_path: str) -> tuple[list, int]:
     return new_arches, existing_n
 
 
-def _write_integrated_1d(f, sphere, *, entry: str) -> None:
+def _write_integrated_1d(f, sphere, *, entry: str,
+                         replace_frame_indices=None) -> None:
     """Write/extend ``/entry/integrated_1d`` as an NXdata group.
 
-    Incremental: only stacks and appends arches added since the last
-    save.  Per-save cost is O(K) where K = number of new frames,
-    independent of total scan length.  Without this, a 1000-frame
-    scan with ``ArchSeries._in_memory_cap=64`` would lazy-load ~936
-    arches from disk per save just to re-stack the intensity array.
+    Two modes:
+
+    * **Append (default)** — stacks and appends arches added since
+      the last save.  Per-save cost is O(K) where K = number of new
+      frames, independent of total scan length.
+    * **Replace** — ``replace_frame_indices`` is an iterable of frame
+      indices that are *already on disk* and whose ``int_1d`` arrays
+      should be slice-assigned in place.  Used by the GUI
+      reintegration path (``sphere_threads.bai_1d_all``) to persist
+      recomputed results without rewriting the whole stack.  Frames
+      in the list that don't appear on disk are silently skipped
+      (the caller can re-issue an append save afterward if needed).
     """
     if not sphere.arches.index:
         return
 
     h5f = _h5(f)
     group_path = f"{entry}/integrated_1d"
+
+    # ── Replace path ────────────────────────────────────────────────
+    if replace_frame_indices is not None:
+        if group_path not in h5f:
+            # Nothing to replace yet — degrade to a regular append so
+            # the caller's "reintegrate + save" sequence still
+            # produces a coherent file the first time.
+            replace_frame_indices = None
+        else:
+            g = h5f[group_path]
+            positions, ordered = _locate_rows_by_frame_idx(
+                g["frame_index"], replace_frame_indices,
+            )
+            if positions.size == 0:
+                return
+            target_arches = [sphere.arches[i] for i in ordered]
+            new_intensity = _stack_arches(target_arches, "int_1d.intensity")
+            if new_intensity is None:
+                return
+            _replace_rows(g, "intensity", positions, new_intensity)
+            new_sigma = _stack_arches(target_arches, "int_1d.sigma")
+            if new_sigma is not None and "sigma" in g:
+                _replace_rows(g, "sigma", positions, new_sigma)
+            return
+
+    # ── Append path (default) ───────────────────────────────────────
     new_arches, existing_n = _new_arches_for_write(sphere, h5f, group_path)
 
     if existing_n == -1:
@@ -474,18 +574,45 @@ def _write_integrated_1d(f, sphere, *, entry: str) -> None:
                          maxshape=(None, nq), chunks=chunks_1d)
 
 
-def _write_integrated_2d(f, sphere, *, entry: str) -> None:
+def _write_integrated_2d(f, sphere, *, entry: str,
+                         replace_frame_indices=None) -> None:
     """Write/extend ``/entry/integrated_2d`` as an NXdata group.
 
-    Same incremental strategy as :func:`_write_integrated_1d` — per
-    save we transpose-and-stack only the new arches' int_2d.intensity
-    and append them as new rows of the on-disk (N, nchi, nq) tensor.
+    Same two-mode shape as :func:`_write_integrated_1d`: append-by-
+    default, or slice-assign into existing rows when
+    ``replace_frame_indices`` is provided.  Per-frame int_2d is xdart-
+    shape ``(nq, nchi)`` and gets transposed to ``(nchi, nq)`` before
+    landing on disk in either path.
     """
     if not sphere.arches.index:
         return
 
     h5f = _h5(f)
     group_path = f"{entry}/integrated_2d"
+
+    # ── Replace path ────────────────────────────────────────────────
+    if replace_frame_indices is not None:
+        if group_path not in h5f:
+            replace_frame_indices = None
+        else:
+            g = h5f[group_path]
+            positions, ordered = _locate_rows_by_frame_idx(
+                g["frame_index"], replace_frame_indices,
+            )
+            if positions.size == 0:
+                return
+            target_arches = [sphere.arches[i] for i in ordered]
+            new_intensity = _stack_arches(target_arches, "int_2d.intensity")
+            if new_intensity is None:
+                return
+            new_intensity = (
+                np.transpose(new_intensity, (0, 2, 1))
+                if new_intensity.ndim == 3 else new_intensity
+            )
+            _replace_rows(g, "intensity", positions, new_intensity)
+            return
+
+    # ── Append path (default) ───────────────────────────────────────
     new_arches, existing_n = _new_arches_for_write(sphere, h5f, group_path)
 
     if existing_n == -1:
@@ -543,19 +670,23 @@ def _write_per_frame_metadata(f, sphere, *, entry: str) -> None:
         /entry/frames/             NXcollection
             frame_NNNN/            NXcollection
                 thumbnail          uint8 (with @vmin, @vmax, @dtype)
-                map_raw            float32, optional
                 timestamp          str, optional
-                source_ref/        NXcollection, optional
+                source/            NXcollection, optional
+                    path           str (relpath to the raw source file)
+                    frame_index    int  (index within the source file)
 
     Performance note: per-frame groups are *append-only* during a
     scan — once a frame's thumbnail/metadata is on disk, it doesn't
-    change.  We skip frames whose group already exists in the file,
-    so subsequent saves are O(new frames) rather than O(total frames).
-    The big win on long scans: a single-frame incremental save touches
-    one tiny NXcollection instead of N of them.
+    change.  We pull the list of already-written frame keys directly
+    from h5py and only materialise an :class:`EwaldArch` for the
+    indices that are *not* yet on disk — those hit the in-memory
+    cache (``ArchSeries._in_memory``) populated by the wrangler
+    moments earlier, so a single save costs O(new frames) and zero
+    lazy-loads.  The old code path did ``list(sphere.arches)`` which
+    materialised every arch on every save, lazy-loading old frames
+    back from disk just to check whether to skip them.
     """
-    arches = list(sphere.arches)
-    if not arches:
+    if not sphere.arches.index:
         return
 
     # The top-level /entry/frames container needs to exist as an
@@ -571,15 +702,21 @@ def _write_per_frame_metadata(f, sphere, *, entry: str) -> None:
     # in-memory tree may not have refreshed since the last save, but
     # h5py reads off the open file directly — authoritative.
     h5_frames = _h5(f)[frames_path]
+    existing_frame_keys = set(h5_frames.keys())
 
-    for arch in arches:
-        idx = getattr(arch, "idx", arches.index(arch))
+    # Filter the index *before* touching any arch object.  This is
+    # the whole point of the cursor: we never lazy-load an arch we'd
+    # immediately skip.
+    new_indices = [
+        idx for idx in sphere.arches.index
+        if f"frame_{idx:04d}" not in existing_frame_keys
+    ]
+    if not new_indices:
+        return
+
+    for idx in new_indices:
+        arch = sphere.arches[idx]
         frame_key = f"frame_{idx:04d}"
-
-        # Skip frames that are already persisted — their per-frame
-        # data is immutable post-integration.
-        if frame_key in h5_frames:
-            continue
 
         # Build a fresh per-frame NXcollection for new frames.
         fg = nx.NXcollection()
@@ -602,18 +739,42 @@ def _write_per_frame_metadata(f, sphere, *, entry: str) -> None:
         # Eiger frame into the .nxs (a ~150 ms HDF5 write each, the
         # dominant cost in [SAVE] timing).  Don't bring that back.
 
-        src = getattr(arch, "source_ref", None)
-        if isinstance(src, dict):
-            sub = nx.NXcollection()
-            for k, v in src.items():
-                sub[k] = nx.NXfield(v)
-            fg["source_ref"] = sub
+        _write_source_ref(fg, arch)
 
         ts = getattr(arch, "timestamp", None)
         if ts is not None:
             fg["timestamp"] = nx.NXfield(str(ts))
 
         frames[frame_key] = fg
+
+
+def _write_source_ref(fg, arch) -> None:
+    """Attach an ``NXcollection`` carrying the raw-source pointer.
+
+    Writes ``source/path`` and ``source/frame_index`` under the
+    per-frame group ``fg`` when the arch has a non-empty
+    ``source_file`` attribute.  ``frame_index`` defaults to the
+    arch's own ``idx`` when the arch doesn't carry an explicit
+    ``source_frame_idx`` (typical for the SPEC wrangler, where each
+    image is a single-frame file; for Eiger / multi-frame sources the
+    wrangler should set ``source_frame_idx`` to the index *within*
+    the source data file).
+
+    This replaces the older ``source_ref`` dict-based field, which
+    was never written because the writer was reading ``source_ref``
+    while the wranglers were writing ``source_file`` (naming
+    mismatch).
+    """
+    src_path = getattr(arch, "source_file", "") or ""
+    if not src_path:
+        return
+    src_frame_idx = getattr(arch, "source_frame_idx", None)
+    if src_frame_idx is None:
+        src_frame_idx = getattr(arch, "idx", 0)
+    sub = nx.NXcollection()
+    sub["path"] = nx.NXfield(str(src_path))
+    sub["frame_index"] = nx.NXfield(int(src_frame_idx))
+    fg["source"] = sub
 
 
 def _write_positioners(f, sphere, *, entry: str) -> None:
@@ -746,6 +907,56 @@ def _write_per_frame_geometry(f, sphere, *, entry: str) -> None:
     _assign_nxgroup(f, f"{entry}/per_frame_geometry", coll)
 
 
+def _representative_poni(sphere):
+    """Return any PONI that represents the scan's geometry, without iteration.
+
+    Beam-line geometry is constant across a scan (the wrangler holds
+    a single :class:`AzimuthalIntegrator` on ``sphere._cached_integrator``
+    and copies it into each arch).  The instrument-metadata writer
+    only needs *one* PONI to stamp the .nxs file.
+
+    Resolution order:
+
+    1. Any arch in ``ArchSeries._in_memory`` — the wrangler always
+       leaves at least the most recent batch's arches here, so this
+       is the zero-disk path.
+    2. The sphere's cached pyFAI integrator (if attached by the
+       wrangler), reconstituted into a PONI-shaped object — useful
+       if ``_in_memory`` was somehow drained.
+
+    Returns ``None`` only when both sources are absent (e.g. an
+    empty sphere serialised before any frame was integrated, or a
+    unit test that never set up an integrator).
+    """
+    in_mem = getattr(sphere.arches, "_in_memory", None)
+    if in_mem:
+        any_arch = next(iter(in_mem.values()))
+        poni = getattr(any_arch, "poni", None)
+        if poni is not None:
+            return poni
+    ai = getattr(sphere, "_cached_integrator", None)
+    if ai is None:
+        return None
+    # Lazy import — avoids circular dep via xdart.modules.ewald in
+    # the test fixtures, and the PONI class isn't pulled in by the
+    # ``arch.py`` import chain.
+    try:
+        from xdart.utils.containers import PONI  # type: ignore
+    except Exception:  # pragma: no cover
+        try:
+            from ssrl_xrd_tools.integrate.calibration import PONI  # type: ignore
+        except Exception:
+            return None
+    return PONI(
+        dist=float(getattr(ai, "dist", 0.0)),
+        poni1=float(getattr(ai, "poni1", 0.0)),
+        poni2=float(getattr(ai, "poni2", 0.0)),
+        rot1=float(getattr(ai, "rot1", 0.0)),
+        rot2=float(getattr(ai, "rot2", 0.0)),
+        rot3=float(getattr(ai, "rot3", 0.0)),
+    )
+
+
 def _write_instrument(f, sphere, *, entry: str) -> None:
     """Write :class:`NXinstrument` with :class:`NXsource` + :class:`NXdetector`.
 
@@ -792,17 +1003,19 @@ def _write_instrument(f, sphere, *, entry: str) -> None:
     f[det_path].attrs["NX_class"] = "NXdetector"
     det = f[det_path]
 
-    # PONI scalars (when arches exist with a poni attached)
-    arches = list(sphere.arches)
-    if arches:
-        poni = getattr(arches[0], "poni", None)
-        if poni is not None:
-            for k in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3"):
-                v = getattr(poni, k, None)
-                if v is not None:
-                    if k in det:
-                        del det[k]
-                    det[k] = nx.NXfield(float(v))
+    # PONI scalars — read from the representative source (see helper).
+    # Old code path: ``arches = list(sphere.arches); poni = arches[0].poni``,
+    # which lazy-loaded every arch on every save just to peek at frame 0's
+    # geometry.  Long scans + ``_in_memory_cap=64`` made this O(N) disk
+    # reads per save.
+    poni = _representative_poni(sphere)
+    if poni is not None:
+        for k in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3"):
+            v = getattr(poni, k, None)
+            if v is not None:
+                if k in det:
+                    del det[k]
+                det[k] = nx.NXfield(float(v))
 
     # Global mask — flat indices of masked pixels (detector mask + the
     # user-supplied Mask File, combined via the wrangler).  Stored so
