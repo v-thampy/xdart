@@ -222,6 +222,312 @@ def find_nexus_image_dataset(
         return best_path
 
 
+def _find_eiger_external_link_paths(
+    h5f: h5py.File, entry: str
+) -> list[str]:
+    """Return sorted ``/{entry}/data/data_NNNNNN`` external-link paths.
+
+    Eiger master files store the full image stack as a sequence of
+    sibling external links named ``data_000001``, ``data_000002``, ….
+    Each link resolves to a 3D ``(n_in_file, H, W)`` dataset; the full
+    scan is the concatenation along axis 0.
+
+    Returns an empty list if there are no external links under
+    ``/{entry}/data``.
+    """
+    if entry not in h5f:
+        return []
+    grp = h5f[entry]
+    if "data" not in grp or not isinstance(grp["data"], h5py.Group):
+        return []
+    data_grp = grp["data"]
+    ext_keys: list[str] = []
+    for k in data_grp:
+        try:
+            link = data_grp.get(k, getlink=True)
+        except KeyError:
+            continue
+        if link.__class__.__name__ == "ExternalLink":
+            ext_keys.append(k)
+    if not ext_keys:
+        return []
+    # Eiger names are zero-padded, so lexical sort = numeric order.
+    ext_keys.sort()
+    return [f"/{entry}/data/{k}" for k in ext_keys]
+
+
+class NexusImageStack:
+    """Read-only 3D image stack spanning one or more h5py datasets.
+
+    Wraps either:
+
+    * a single 3D dataset (e.g. ``/entry/instrument/detector/data``),
+      in which case this proxy is functionally equivalent to the
+      dataset itself; or
+    * a sorted sequence of Eiger external-link datasets
+      ``/entry/data/data_000001``, ``data_000002``, …, concatenated
+      logically along axis 0.
+
+    Provides the subset of the h5py.Dataset interface the wranglers
+    actually use: :attr:`shape`, :attr:`dtype`, :attr:`ndim`,
+    :func:`len`, ``__iter__``, and ``__getitem__`` with int or slice
+    indexing along axis 0.
+
+    Slicing is segment-aware: ``stack[a:b]`` reads each underlying
+    dataset only over its intersection with ``[a, b)``, so a chunked
+    bulk read crossing a file boundary still costs one HDF5 read per
+    touched file rather than per frame.
+
+    Must be used as a context manager so the owned ``h5py.File`` is
+    closed::
+
+        with open_nexus_image_stack(path) as stack:
+            nframes = stack.shape[0]
+            block = np.asarray(stack[0:16], dtype=np.float32)
+    """
+
+    __slots__ = ("_h5", "_paths", "_dsets", "_offsets", "shape",
+                 "dtype", "ndim")
+
+    def __init__(self, h5f: h5py.File, paths: list[str]):
+        if not paths:
+            raise ValueError("NexusImageStack requires at least one path")
+        dsets = []
+        for p in paths:
+            obj = h5f[p]
+            if not isinstance(obj, h5py.Dataset):
+                raise TypeError(f"{p} is not a Dataset (got {type(obj).__name__})")
+            if obj.ndim != 3:
+                raise ValueError(
+                    f"{p} is {obj.ndim}-D; NexusImageStack expects 3-D"
+                )
+            dsets.append(obj)
+
+        per_frame_shapes = {d.shape[1:] for d in dsets}
+        if len(per_frame_shapes) > 1:
+            raise ValueError(
+                f"Inconsistent per-frame shapes across segments: "
+                f"{per_frame_shapes}"
+            )
+        # Offsets[i] = global index where segment i starts.
+        # Offsets[-1] = total number of frames.
+        lengths = [int(d.shape[0]) for d in dsets]
+        offsets = [0]
+        for n in lengths:
+            offsets.append(offsets[-1] + n)
+
+        self._h5 = h5f
+        self._paths = list(paths)
+        self._dsets = dsets
+        self._offsets = offsets
+        self.shape = (offsets[-1],) + dsets[0].shape[1:]
+        self.dtype = dsets[0].dtype
+        self.ndim = 3
+
+    # ── Public introspection ────────────────────────────────────────────
+    @property
+    def n_segments(self) -> int:
+        """Number of underlying datasets concatenated by this stack."""
+        return len(self._dsets)
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        """Internal HDF5 paths of the underlying datasets, in stack order."""
+        return tuple(self._paths)
+
+    # ── Container protocol ──────────────────────────────────────────────
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __iter__(self):
+        for i in range(self.shape[0]):
+            yield self[i]
+
+    def __getitem__(self, key):
+        n = self.shape[0]
+        if isinstance(key, (int, np.integer)):
+            i = int(key)
+            if i < 0:
+                i += n
+            if not 0 <= i < n:
+                raise IndexError(f"frame index {key} out of range [0, {n})")
+            seg, local = self._locate(i)
+            return self._dsets[seg][local]
+        if isinstance(key, slice):
+            start, stop, step = key.indices(n)
+            if step == 1:
+                return self._read_range(start, stop)
+            # Rare path: non-unit step; fall back to per-frame reads
+            # but stay vectorised at the end.
+            if start >= stop:
+                return np.empty((0,) + self.shape[1:], dtype=self.dtype)
+            return np.stack(
+                [self[i] for i in range(start, stop, step)],
+                axis=0,
+            )
+        raise TypeError(
+            f"NexusImageStack supports int and slice indexing along axis 0, "
+            f"got {type(key).__name__}"
+        )
+
+    # ── Lifecycle / context manager ─────────────────────────────────────
+    def close(self) -> None:
+        """Close the underlying ``h5py.File`` if still open."""
+        h5 = getattr(self, "_h5", None)
+        if h5 is not None:
+            try:
+                h5.close()
+            except Exception:
+                pass
+            self._h5 = None
+
+    def __enter__(self) -> "NexusImageStack":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    # ── Internals ───────────────────────────────────────────────────────
+    def _locate(self, i: int) -> tuple[int, int]:
+        """Return ``(segment_index, local_index)`` for global frame ``i``."""
+        # Linear scan: there are typically <20 Eiger files in a scan,
+        # so a Python-level loop is faster than bisect's overhead.
+        offs = self._offsets
+        for seg in range(len(self._dsets)):
+            if i < offs[seg + 1]:
+                return seg, i - offs[seg]
+        # Unreachable if bounds-checked at the caller.
+        raise IndexError(i)
+
+    def _read_range(self, start: int, stop: int) -> np.ndarray:
+        if start >= stop:
+            return np.empty((0,) + self.shape[1:], dtype=self.dtype)
+        offs = self._offsets
+        # Locate first and last segments touched by [start, stop).
+        first_seg, _ = self._locate(start)
+        last_seg, _ = self._locate(stop - 1)
+
+        if first_seg == last_seg:
+            base = offs[first_seg]
+            return np.asarray(
+                self._dsets[first_seg][start - base:stop - base]
+            )
+        chunks = []
+        for seg in range(first_seg, last_seg + 1):
+            seg_start = max(start, offs[seg]) - offs[seg]
+            seg_stop = min(stop, offs[seg + 1]) - offs[seg]
+            chunks.append(np.asarray(self._dsets[seg][seg_start:seg_stop]))
+        return np.concatenate(chunks, axis=0)
+
+
+def open_nexus_image_stack(
+    path: Path | str,
+    entry: str = "entry",
+) -> NexusImageStack:
+    """Open a NeXus file and return a :class:`NexusImageStack` proxy.
+
+    Resolves the image dataset(s) under ``/{entry}/`` and wraps them
+    in a single logical 3D stack.  The proxy owns the underlying
+    ``h5py.File``; use it as a context manager.
+
+    Resolution order:
+
+    1. **External-link Eiger pattern**: if ``/{entry}/data/`` contains
+       one or more external-link siblings (``data_000001``, …), they
+       are concatenated along axis 0 in lexical (= numeric) order.
+       Preferred over the single-dataset paths because real Eiger
+       master files always carry external links here.
+    2. **Single dataset**: the path returned by
+       :func:`find_nexus_image_dataset`.
+
+    Parameters
+    ----------
+    path : Path or str
+        Path to the NeXus HDF5 file.
+    entry : str, optional
+        Name of the NXentry group (default ``"entry"``).
+
+    Returns
+    -------
+    NexusImageStack
+        Proxy over the resolved dataset(s).
+
+    Raises
+    ------
+    FileNotFoundError
+        If the file does not exist.
+    KeyError
+        If no 3D image dataset is found.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"NeXus file not found: {p}")
+
+    h5f = h5py.File(p, "r")
+    try:
+        ext_paths = _find_eiger_external_link_paths(h5f, entry)
+        if ext_paths:
+            return NexusImageStack(h5f, ext_paths)
+
+        single = find_nexus_image_dataset_in_open_file(h5f, entry)
+        if single is None:
+            raise KeyError(
+                f"No 3-D image dataset found in {p}:{entry}"
+            )
+        return NexusImageStack(h5f, [single])
+    except Exception:
+        h5f.close()
+        raise
+
+
+def find_nexus_image_dataset_in_open_file(
+    h5f: h5py.File, entry: str = "entry"
+) -> str | None:
+    """Variant of :func:`find_nexus_image_dataset` that reuses an open file.
+
+    Used internally by :func:`open_nexus_image_stack` to avoid opening
+    the file twice.  Same search order, minus the Eiger external-link
+    branch (which the caller handles explicitly so it can grab *all*
+    sibling links, not just the first).
+    """
+    if entry not in h5f:
+        return None
+    grp = h5f[entry]
+
+    candidate = f"{entry}/instrument/detector/data"
+    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim == 3:
+        return f"/{candidate}"
+
+    candidate = f"{entry}/data/data"
+    if candidate in h5f and isinstance(h5f[candidate], h5py.Dataset) and h5f[candidate].ndim == 3:
+        return f"/{candidate}"
+
+    if "instrument" in grp:
+        instr = grp["instrument"]
+        for subname in instr:
+            sub = instr[subname]
+            if not isinstance(sub, h5py.Group):
+                continue
+            inner = f"{entry}/instrument/{subname}/data"
+            if inner in h5f and isinstance(h5f[inner], h5py.Dataset) and h5f[inner].ndim == 3:
+                return f"/{inner}"
+
+    best_path: str | None = None
+    best_size = 0
+
+    def _visit(name: str, obj: Any) -> None:
+        nonlocal best_path, best_size
+        if not isinstance(obj, h5py.Dataset) or obj.ndim != 3:
+            return
+        size = int(np.prod(obj.shape))
+        if size > best_size:
+            best_size = size
+            best_path = f"/{entry}/{name}"
+
+    grp.visititems(_visit)
+    return best_path
+
+
 def list_entries(path: Path | str) -> list[str]:
     """
     List all NXentry group names in a NeXus file.
@@ -905,6 +1211,8 @@ def read_stitched(
 __all__ = [
     # v1 (legacy beamline files)
     "find_nexus_image_dataset",
+    "NexusImageStack",
+    "open_nexus_image_stack",
     "list_entries",
     "read_nexus",
     "open_nexus_writer",

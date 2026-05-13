@@ -7,8 +7,10 @@ import pytest
 import h5py
 
 from ssrl_xrd_tools.io.nexus import (
+    NexusImageStack,
     find_nexus_image_dataset,
     list_entries,
+    open_nexus_image_stack,
     open_nexus_writer,
     read_nexus,
     write_nexus,
@@ -208,6 +210,198 @@ class TestFindNexusImageDataset:
     def test_file_not_found(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             find_nexus_image_dataset(tmp_path / "ghost.h5")
+
+
+# ---------------------------------------------------------------------------
+# TestNexusImageStack — Eiger external-link iterator
+# ---------------------------------------------------------------------------
+
+
+def _make_eiger_master(
+    tmp_path,
+    n_files: int,
+    frames_per_file: int,
+    img_shape: tuple[int, int] = (12, 16),
+    dtype=np.uint16,
+    master_name: str = "master.h5",
+) -> tuple:
+    """Create an Eiger-style master file with external links to data files.
+
+    Each ``_data_NNNNNN.h5`` carries ``/data`` of shape
+    ``(frames_per_file, H, W)``; the master file links them as
+    ``/entry/data/data_NNNNNN``.
+
+    Returns ``(master_path, expected_full_stack)`` where the stack is
+    the deterministic per-frame content used for byte-equality checks.
+    """
+    rng = np.random.default_rng(42)
+    chunks = []
+    data_paths = []
+    for k in range(1, n_files + 1):
+        # Vary per-frame content so concatenation order matters.
+        block = (rng.integers(0, 1000, size=(frames_per_file,) + img_shape)
+                 .astype(dtype))
+        chunks.append(block)
+        data_path = tmp_path / f"scan_data_{k:06d}.h5"
+        with h5py.File(data_path, "w") as df:
+            df.create_dataset("data", data=block, chunks=(1,) + img_shape)
+        data_paths.append(data_path)
+
+    master_path = tmp_path / master_name
+    with h5py.File(master_path, "w") as mf:
+        e = mf.create_group("entry")
+        e.attrs["NX_class"] = "NXentry"
+        data_grp = e.create_group("data")
+        for k, dp in enumerate(data_paths, start=1):
+            data_grp[f"data_{k:06d}"] = h5py.ExternalLink(dp.name, "/data")
+
+    full = np.concatenate(chunks, axis=0)
+    return master_path, full
+
+
+class TestNexusImageStack:
+    """Functional tests for the external-link aware image stack proxy."""
+
+    def test_single_dataset_round_trip(self, nexus_file):
+        """A file with one detector dataset works as a 1-segment stack."""
+        with open_nexus_image_stack(nexus_file) as stack:
+            assert isinstance(stack, NexusImageStack)
+            assert stack.ndim == 3
+            assert stack.shape == (5, 20, 30)
+            assert len(stack) == 5
+            frame_0 = np.asarray(stack[0])
+            assert frame_0.shape == (20, 30)
+            full = np.asarray(stack[:])
+            assert full.shape == (5, 20, 30)
+            assert np.array_equal(full[0], frame_0)
+
+    def test_eiger_external_links_concatenated(self, tmp_path):
+        """Stack should equal the per-file concatenation along axis 0."""
+        master, expected = _make_eiger_master(
+            tmp_path, n_files=3, frames_per_file=4,
+        )
+        with open_nexus_image_stack(master) as stack:
+            assert stack.shape == expected.shape
+            assert stack.dtype == expected.dtype
+            full = np.asarray(stack[:])
+            assert np.array_equal(full, expected)
+
+    def test_slice_crosses_file_boundary(self, tmp_path):
+        """Slicing across a segment boundary stitches correctly."""
+        master, expected = _make_eiger_master(
+            tmp_path, n_files=4, frames_per_file=5,
+        )
+        # Total = 20 frames; this slice spans segments 0, 1, 2.
+        with open_nexus_image_stack(master) as stack:
+            block = np.asarray(stack[3:13])
+            assert block.shape == (10,) + expected.shape[1:]
+            assert np.array_equal(block, expected[3:13])
+
+    def test_int_index_at_each_segment(self, tmp_path):
+        """Indexing the first and last frame of each segment works."""
+        master, expected = _make_eiger_master(
+            tmp_path, n_files=3, frames_per_file=4,
+        )
+        with open_nexus_image_stack(master) as stack:
+            for i in (0, 3, 4, 7, 8, 11):
+                assert np.array_equal(np.asarray(stack[i]), expected[i])
+
+    def test_negative_index(self, tmp_path):
+        master, expected = _make_eiger_master(
+            tmp_path, n_files=2, frames_per_file=3,
+        )
+        with open_nexus_image_stack(master) as stack:
+            assert np.array_equal(np.asarray(stack[-1]), expected[-1])
+            assert np.array_equal(np.asarray(stack[-6]), expected[0])
+
+    def test_out_of_range(self, tmp_path):
+        master, _ = _make_eiger_master(
+            tmp_path, n_files=2, frames_per_file=3,
+        )
+        with open_nexus_image_stack(master) as stack:
+            with pytest.raises(IndexError):
+                stack[6]
+            with pytest.raises(IndexError):
+                stack[-7]
+
+    def test_iteration_yields_each_frame(self, tmp_path):
+        master, expected = _make_eiger_master(
+            tmp_path, n_files=2, frames_per_file=3,
+        )
+        with open_nexus_image_stack(master) as stack:
+            frames = [np.asarray(f) for f in stack]
+        assert len(frames) == expected.shape[0]
+        for i, f in enumerate(frames):
+            assert np.array_equal(f, expected[i])
+
+    def test_slice_with_step(self, tmp_path):
+        master, expected = _make_eiger_master(
+            tmp_path, n_files=3, frames_per_file=4,
+        )
+        with open_nexus_image_stack(master) as stack:
+            sub = np.asarray(stack[1:11:3])
+            assert np.array_equal(sub, expected[1:11:3])
+
+    def test_empty_slice(self, tmp_path):
+        master, _ = _make_eiger_master(
+            tmp_path, n_files=2, frames_per_file=3,
+        )
+        with open_nexus_image_stack(master) as stack:
+            out = stack[5:5]
+            assert out.shape == (0,) + stack.shape[1:]
+
+    def test_inconsistent_per_frame_shapes_raise(self, tmp_path):
+        """Mismatched (H, W) across segments must be rejected."""
+        # Two data files: one (4, 10, 10), the other (4, 12, 10).
+        a = tmp_path / "a.h5"
+        b = tmp_path / "b.h5"
+        with h5py.File(a, "w") as f:
+            f.create_dataset("data", data=np.zeros((4, 10, 10), dtype=np.uint16))
+        with h5py.File(b, "w") as f:
+            f.create_dataset("data", data=np.zeros((4, 12, 10), dtype=np.uint16))
+        master = tmp_path / "master.h5"
+        with h5py.File(master, "w") as mf:
+            e = mf.create_group("entry")
+            d = e.create_group("data")
+            d["data_000001"] = h5py.ExternalLink(a.name, "/data")
+            d["data_000002"] = h5py.ExternalLink(b.name, "/data")
+        with pytest.raises(ValueError, match="Inconsistent per-frame"):
+            open_nexus_image_stack(master)
+
+    def test_lexical_sort_is_numeric_for_eiger_names(self, tmp_path):
+        """Zero-padded Eiger names sort identically lexical vs numeric."""
+        # Build 12 files; only ordering matters here.  If we accidentally
+        # used string-sort on un-padded names "data_2" would come before
+        # "data_10".  Eiger always pads, so this should be a no-op test.
+        master, expected = _make_eiger_master(
+            tmp_path, n_files=12, frames_per_file=2,
+        )
+        with open_nexus_image_stack(master) as stack:
+            full = np.asarray(stack[:])
+            assert np.array_equal(full, expected)
+
+    def test_context_manager_closes_file(self, tmp_path):
+        master, _ = _make_eiger_master(
+            tmp_path, n_files=2, frames_per_file=3,
+        )
+        with open_nexus_image_stack(master) as stack:
+            # File handle is live inside the with-block.
+            assert stack._h5.id.valid
+            assert len(stack) == 6
+        # After exit, the file handle is gone.
+        assert stack._h5 is None
+
+    def test_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            open_nexus_image_stack(tmp_path / "ghost.h5")
+
+    def test_no_image_dataset_raises(self, tmp_path):
+        p = tmp_path / "barren.h5"
+        with h5py.File(p, "w") as f:
+            e = f.create_group("entry")
+            e.create_dataset("scalar", data=1.0)
+        with pytest.raises(KeyError, match="No 3-D image dataset"):
+            open_nexus_image_stack(p)
 
 
 # ---------------------------------------------------------------------------
