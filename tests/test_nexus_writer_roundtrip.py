@@ -107,14 +107,39 @@ class _DuckArch:
         self.thumbnail = rng.random((64, 64), dtype=np.float32)
 
 
-class _DuckArches(list):
-    """List that masquerades as ArchSeries for the writer.
+class _DuckArches:
+    """Minimal ArchSeries stand-in for the writer tests.
 
-    The writer only needs ``list(sphere.arches)``-style iteration and
-    ``arches[0].int_1d.radial`` random access; a plain list satisfies
-    both.  Real ArchSeries adds lazy-disk-load + in-memory cache —
-    irrelevant for a fully-in-memory test.
+    Provides the three interfaces the writer needs:
+
+    * ``.index`` — list of frame indices, matching
+      :class:`ArchSeries.index` (an attribute, not the inherited
+      ``list.index`` method that the previous fixture exposed).
+    * ``arches[idx]`` — fetch the arch with that *frame* index.
+    * ``list(arches)`` — iterate arches in index order.
+
+    Real ArchSeries adds lazy-disk-load + an in-memory cache; this
+    duck stores everything in a dict for in-memory speed.
     """
+
+    def __init__(self, arches):
+        self._by_idx = {a.idx: a for a in arches}
+        self.index = [a.idx for a in arches]
+
+    def __iter__(self):
+        return (self._by_idx[i] for i in self.index)
+
+    def __getitem__(self, idx):
+        return self._by_idx[idx]
+
+    def __len__(self):
+        return len(self.index)
+
+    def append(self, arch):
+        """Extend the series — used by the new write-then-extend test."""
+        self._by_idx[arch.idx] = arch
+        if arch.idx not in self.index:
+            self.index.append(arch.idx)
 
 
 class _DuckSphere:
@@ -425,3 +450,85 @@ def test_h5py_layout_is_idempotent(tmp_path):
     root = nx.nxload(str(path))
     assert root["entry/integrated_1d/intensity"].shape == (N_FRAMES, N_Q)
     assert len(list(root["entry/frames"])) == N_FRAMES
+
+
+def test_incremental_save_appends_only_new_frames(tmp_path):
+    """P1: per-save Python prep should be O(new frames), not O(all frames).
+
+    Writes K=4 frames, then *extends* the sphere with another 4 and
+    re-saves.  Verifies:
+
+    * Final on-disk shape is (8, nq) — both batches landed.
+    * The first 4 rows are bit-identical between the two checkpoints
+      (i.e. the second save didn't rewrite them — append-only).
+    * The frame_index dataset extends correctly.
+
+    Without the P1 incremental refactor the second save still wrote
+    correct *values* (full-array rewrite was idempotent), but it
+    re-stacked all N arches every time.  This test pins down the
+    append-only behaviour so future refactors don't regress.
+    """
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+
+    scan_data = pd.DataFrame({
+        "tth": np.linspace(10.0, 14.0, N_FRAMES, dtype=np.float32),
+    })
+    # Phase 1 — 4 frames + initial save.
+    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    sphere = _DuckSphere(arches, scan_data=scan_data)
+    path = tmp_path / "incremental.nxs"
+    save_sphere_to_nexus(sphere, path, mode="w")
+
+    # Snapshot row 0 of intensity from the first checkpoint — must
+    # survive the second save unchanged.
+    root_a = nx.nxload(str(path))
+    intensity_a = np.asarray(root_a["entry/integrated_1d/intensity"])
+    frame_index_a = np.asarray(root_a["entry/integrated_1d/frame_index"])
+    assert intensity_a.shape == (N_FRAMES, N_Q)
+    intensity_a_rows = intensity_a.copy()
+
+    # Phase 2 — extend the sphere by another N_FRAMES frames + re-save.
+    for i in range(N_FRAMES, 2 * N_FRAMES):
+        sphere.arches.append(_DuckArch(idx=i, seed=100))
+    save_sphere_to_nexus(sphere, path, mode="a")
+
+    # Verify the extended file.
+    root_b = nx.nxload(str(path))
+    intensity_b = np.asarray(root_b["entry/integrated_1d/intensity"])
+    frame_index_b = np.asarray(root_b["entry/integrated_1d/frame_index"])
+    assert intensity_b.shape == (2 * N_FRAMES, N_Q)
+    assert frame_index_b.shape == (2 * N_FRAMES,)
+    # The pre-existing rows are byte-identical to the first checkpoint.
+    np.testing.assert_array_equal(intensity_b[:N_FRAMES], intensity_a_rows)
+    np.testing.assert_array_equal(frame_index_b[:N_FRAMES], frame_index_a)
+    # The new rows have the new arches' frame indices.
+    assert frame_index_b[N_FRAMES:].tolist() == list(range(N_FRAMES, 2 * N_FRAMES))
+
+    # 2D side also extends correctly (parallel append).
+    intensity_2d_b = np.asarray(root_b["entry/integrated_2d/intensity"])
+    assert intensity_2d_b.shape == (2 * N_FRAMES, N_CHI, N_Q)
+
+
+def test_incremental_save_with_no_new_frames_is_noop(tmp_path):
+    """Re-saving with no new arches must not change anything on disk.
+
+    Specifically: dataset shapes stay constant, contents stay
+    byte-identical.  Guards the ``if not new_arches: return`` early
+    exit in :func:`_write_integrated_1d` / :func:`_write_integrated_2d`.
+    """
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+
+    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    sphere = _DuckSphere(
+        arches,
+        scan_data=pd.DataFrame({"tth": np.zeros(N_FRAMES, dtype=np.float32)}),
+    )
+    path = tmp_path / "noop.nxs"
+    save_sphere_to_nexus(sphere, path, mode="w")
+
+    before = np.asarray(nx.nxload(str(path))["entry/integrated_1d/intensity"])
+    save_sphere_to_nexus(sphere, path, mode="a")  # no new arches added
+    after = np.asarray(nx.nxload(str(path))["entry/integrated_1d/intensity"])
+
+    assert after.shape == before.shape == (N_FRAMES, N_Q)
+    np.testing.assert_array_equal(after, before)

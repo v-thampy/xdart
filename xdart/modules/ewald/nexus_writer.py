@@ -291,27 +291,32 @@ def _ensure_nxdata_group(h5f, path: str, *, signal: str, axes: list[str]):
     return g
 
 
-def _append_rows(g, name: str, data: np.ndarray,
-                 *, maxshape: tuple, chunks: tuple,
-                 attrs: Mapping[str, Any] | None = None) -> None:
-    """Append/replace rows in a resizable dataset.
+def _append_new_rows(g, name: str, new_rows: np.ndarray,
+                     *, maxshape: tuple, chunks: tuple,
+                     attrs: Mapping[str, Any] | None = None) -> None:
+    """Append ``new_rows`` to a resizable dataset (creating it if needed).
 
-    Designed for the "stacked-per-frame" datasets in v2: each call to
-    the writer adds K new rows.  We resize the on-disk dataset to
-    ``len(data)`` and slice-assign only the rows beyond what's
-    already there — so a save with 8 new frames at frame index 100
-    only writes 8 rows instead of all 108.
+    Unlike the previous ``_append_rows`` API which took the *full*
+    stacked array and figured out the new tail from shape comparison,
+    this one takes only the new rows.  The caller is responsible for
+    only passing the data that's not yet on disk — which means the
+    caller can skip stacking arches whose data has already been
+    written, turning the writer's in-Python prep from O(N) to O(K).
 
     If the dataset doesn't exist yet, creates it with the supplied
     ``maxshape`` / ``chunks`` parameters so future appends work.
-    If the in-memory ``data`` is *shorter* than what's on disk (the
-    user re-loaded an older sphere, say), the dataset gets resized
-    down and overwritten — that's the safer behavior than silently
-    leaving stale rows.
+
+    If the trailing dataset shape (everything except axis 0) doesn't
+    match ``new_rows.shape[1:]`` — e.g. the user changed nq between
+    saves — the dataset is rebuilt from scratch with the new rows.
+    Disk grows past in-memory shouldn't happen in normal flow (live
+    saves only ever extend), but if it does, that's also covered
+    here: a `del + recreate` is safer than leaving a tail of stale
+    rows.
     """
     if name not in g:
         ds = g.create_dataset(
-            name, data=data,
+            name, data=new_rows,
             maxshape=maxshape, chunks=chunks,
         )
         if attrs:
@@ -319,30 +324,50 @@ def _append_rows(g, name: str, data: np.ndarray,
                 ds.attrs[k] = v
         return
     ds = g[name]
-    target_n = data.shape[0]
-    current_n = ds.shape[0]
-    if target_n == current_n:
-        # Nothing new — most common path after the first save when
-        # the in-memory frame count hasn't changed.
+    # Shape compatibility check — if axis-0 trailing dimensions
+    # differ, the user changed integration parameters between saves.
+    # Rebuild from scratch.
+    if tuple(ds.shape[1:]) != tuple(new_rows.shape[1:]):
+        del g[name]
+        ds = g.create_dataset(
+            name, data=new_rows,
+            maxshape=maxshape, chunks=chunks,
+        )
         if attrs:
             for k, v in attrs.items():
                 ds.attrs[k] = v
         return
-    if target_n < current_n:
-        # In-memory shrank.  Truncate and rewrite the whole array;
-        # safer than leaving stale rows in place.
-        ds.resize(data.shape)
-        ds[...] = data
-    else:
-        # Append-only path — the hot loop.  Resize and write only
-        # the new tail.
-        new_shape = list(ds.shape)
-        new_shape[0] = target_n
-        ds.resize(tuple(new_shape))
-        ds[current_n:target_n, ...] = data[current_n:target_n, ...]
+    if new_rows.shape[0] == 0:
+        # Nothing to append — most common path on a re-save with no
+        # new frames since last save.
+        if attrs:
+            for k, v in attrs.items():
+                ds.attrs[k] = v
+        return
+    current_n = ds.shape[0]
+    new_shape = list(ds.shape)
+    new_shape[0] = current_n + new_rows.shape[0]
+    ds.resize(tuple(new_shape))
+    ds[current_n:, ...] = new_rows
     if attrs:
         for k, v in attrs.items():
             ds.attrs[k] = v
+
+
+def _existing_dataset_n(h5f, path: str) -> int:
+    """Return on-disk frame count for an integrated_* group, or 0.
+
+    Used by :func:`_write_integrated_1d` / :func:`_write_integrated_2d`
+    to decide which arches need to be stacked and appended this save.
+    Reads the dataset's first-axis size directly from h5py without
+    materialising the data — O(1).
+    """
+    if path not in h5f:
+        return 0
+    g = h5f[path]
+    if "intensity" not in g:
+        return 0
+    return int(g["intensity"].shape[0])
 
 
 def _write_static_axis(g, name: str, data: np.ndarray,
@@ -365,94 +390,149 @@ def _write_static_axis(g, name: str, data: np.ndarray,
             ds.attrs[k] = v
 
 
+def _new_arches_for_write(sphere, h5f, group_path: str) -> tuple[list, int]:
+    """Return ``(new_arches, existing_n)`` for an incremental save.
+
+    ``existing_n`` is the on-disk row count for this group's
+    ``intensity`` dataset (0 if the group / dataset doesn't exist yet).
+    ``new_arches`` is the slice of in-memory arches whose data needs
+    to be stacked and appended — i.e. arches at indices
+    ``[existing_n:total_n]`` of ``sphere.arches.index``.
+
+    For normal append workflows the new arches are always in
+    ``ArchSeries._in_memory`` (the wrangler just stashed them via
+    ``add_arch``) so this materialises without any disk reads.
+
+    If on-disk has *more* frames than in-memory — rare; sphere
+    reloaded with fewer frames after partial save — we treat the
+    group as stale and return ``existing_n=-1`` so the caller can
+    fall back to full rewrite.
+    """
+    existing_n = _existing_dataset_n(h5f, group_path)
+    total_n = len(sphere.arches.index)
+    if existing_n > total_n:
+        return [], -1
+    new_indices = list(sphere.arches.index)[existing_n:total_n]
+    new_arches = [sphere.arches[i] for i in new_indices]
+    return new_arches, existing_n
+
+
 def _write_integrated_1d(f, sphere, *, entry: str) -> None:
     """Write/extend ``/entry/integrated_1d`` as an NXdata group.
 
-    Uses resizable h5py datasets directly (not nexusformat's NXdata
-    constructor) so we can slice-assign only the NEW frames on each
-    save.  Format on disk is identical to the all-nexusformat version
-    — signal/axes/units attrs match the round-trip test.
+    Incremental: only stacks and appends arches added since the last
+    save.  Per-save cost is O(K) where K = number of new frames,
+    independent of total scan length.  Without this, a 1000-frame
+    scan with ``ArchSeries._in_memory_cap=64`` would lazy-load ~936
+    arches from disk per save just to re-stack the intensity array.
     """
-    arches = list(sphere.arches)
-    if not arches:
+    if not sphere.arches.index:
         return
-
-    intensity = _stack_arches(arches, "int_1d.intensity")
-    if intensity is None:
-        return
-    radial = np.asarray(arches[0].int_1d.radial, dtype=np.float32)
-    sigma = _stack_arches(arches, "int_1d.sigma")
-    frame_index = np.array(
-        [getattr(a, "idx", i) for i, a in enumerate(arches)], dtype=np.int32
-    )
-    N, nq = intensity.shape
-    # Chunk along the frame axis; ~32 frames per chunk is a decent
-    # trade-off between read locality (whole-pattern reads are one
-    # chunk for up to 32 frames) and write granularity (we rewrite
-    # at most one chunk's worth of frames per save).
-    chunks_1d = (min(N, 32), nq)
 
     h5f = _h5(f)
+    group_path = f"{entry}/integrated_1d"
+    new_arches, existing_n = _new_arches_for_write(sphere, h5f, group_path)
+
+    if existing_n == -1:
+        # On-disk had more frames than in-memory — stale, rebuild.
+        if group_path in h5f:
+            del h5f[group_path]
+        new_arches = [sphere.arches[i] for i in sphere.arches.index]
+
+    if not new_arches:
+        return
+
+    new_intensity = _stack_arches(new_arches, "int_1d.intensity")
+    if new_intensity is None:
+        return
+    new_sigma = _stack_arches(new_arches, "int_1d.sigma")
+    new_frame_index = np.array(
+        [getattr(a, "idx", i) for i, a in enumerate(new_arches)], dtype=np.int32
+    )
+    _, nq = new_intensity.shape
+    # Chunk along the frame axis; ~32 frames per chunk is a decent
+    # trade-off between read locality (whole-pattern reads are one
+    # chunk for up to 32 frames) and write granularity (writers
+    # touch at most one chunk's worth of frames per append).
+    chunks_1d = (min(max(len(new_arches), 1), 32), nq)
+
     g = _ensure_nxdata_group(
-        h5f, f"{entry}/integrated_1d",
+        h5f, group_path,
         signal="intensity",
         axes=["frame_index", "q"],
     )
-    _append_rows(g, "intensity", intensity,
-                 maxshape=(None, nq), chunks=chunks_1d)
-    _write_static_axis(g, "q", radial,
-                       attrs={"units": _q_units(arches[0].int_1d)})
-    _append_rows(g, "frame_index", frame_index,
-                 maxshape=(None,), chunks=(min(N, 32),))
-    if sigma is not None:
-        _append_rows(g, "sigma", sigma,
+    _append_new_rows(g, "intensity", new_intensity,
                      maxshape=(None, nq), chunks=chunks_1d)
+    _write_static_axis(g, "q",
+                       np.asarray(new_arches[0].int_1d.radial,
+                                  dtype=np.float32),
+                       attrs={"units": _q_units(new_arches[0].int_1d)})
+    _append_new_rows(g, "frame_index", new_frame_index,
+                     maxshape=(None,), chunks=(min(max(len(new_arches), 1), 32),))
+    if new_sigma is not None:
+        _append_new_rows(g, "sigma", new_sigma,
+                         maxshape=(None, nq), chunks=chunks_1d)
 
 
 def _write_integrated_2d(f, sphere, *, entry: str) -> None:
     """Write/extend ``/entry/integrated_2d`` as an NXdata group.
 
-    Per-frame intensity comes in as xdart-shape ``(nq, nchi)``; we
-    transpose to ``(nchi, nq)`` so the stacked tensor is
-    ``(N, nchi, nq)`` — that ordering matches the ``axes`` attribute
-    ``["frame_index", "chi", "q"]``.  Resizable datasets keep
-    per-save cost O(new rows).
+    Same incremental strategy as :func:`_write_integrated_1d` — per
+    save we transpose-and-stack only the new arches' int_2d.intensity
+    and append them as new rows of the on-disk (N, nchi, nq) tensor.
     """
-    arches = list(sphere.arches)
-    if not arches:
+    if not sphere.arches.index:
         return
-
-    intensity = _stack_arches(arches, "int_2d.intensity")
-    if intensity is None:
-        return
-    intensity = np.transpose(intensity, (0, 2, 1)) if intensity.ndim == 3 else intensity
-    radial = np.asarray(arches[0].int_2d.radial, dtype=np.float32)
-    azimuthal = np.asarray(arches[0].int_2d.azimuthal, dtype=np.float32)
-    frame_index = np.array(
-        [getattr(a, "idx", i) for i, a in enumerate(arches)], dtype=np.int32
-    )
-    N, nchi, nq = intensity.shape
-    # ~8 frames per chunk for 2D — at e.g. 500×500 f32 that's ~8 MB,
-    # within h5py's recommended single-chunk write size.
-    chunks_2d = (min(N, 8), nchi, nq)
 
     h5f = _h5(f)
+    group_path = f"{entry}/integrated_2d"
+    new_arches, existing_n = _new_arches_for_write(sphere, h5f, group_path)
+
+    if existing_n == -1:
+        if group_path in h5f:
+            del h5f[group_path]
+        new_arches = [sphere.arches[i] for i in sphere.arches.index]
+
+    if not new_arches:
+        return
+
+    new_intensity = _stack_arches(new_arches, "int_2d.intensity")
+    if new_intensity is None:
+        return
+    # arch.int_2d.intensity is xdart-shape (nq, nchi).  Transpose
+    # per-frame so the stacked tensor is (N, nchi, nq) — matching
+    # axes=["frame_index", "chi", "q"].
+    new_intensity = (
+        np.transpose(new_intensity, (0, 2, 1))
+        if new_intensity.ndim == 3 else new_intensity
+    )
+    new_frame_index = np.array(
+        [getattr(a, "idx", i) for i, a in enumerate(new_arches)], dtype=np.int32
+    )
+    _, nchi, nq = new_intensity.shape
+    # ~8 frames per chunk for 2D — at e.g. 500×500 f32 that's ~8 MB,
+    # within h5py's recommended single-chunk write size.
+    chunks_2d = (min(max(len(new_arches), 1), 8), nchi, nq)
+
     g = _ensure_nxdata_group(
-        h5f, f"{entry}/integrated_2d",
+        h5f, group_path,
         signal="intensity",
         axes=["frame_index", "chi", "q"],
     )
-    _append_rows(g, "intensity", intensity,
-                 maxshape=(None, nchi, nq), chunks=chunks_2d)
-    _write_static_axis(g, "q", radial,
-                       attrs={"units": _q_units(arches[0].int_2d)})
+    _append_new_rows(g, "intensity", new_intensity,
+                     maxshape=(None, nchi, nq), chunks=chunks_2d)
+    _write_static_axis(g, "q",
+                       np.asarray(new_arches[0].int_2d.radial,
+                                  dtype=np.float32),
+                       attrs={"units": _q_units(new_arches[0].int_2d)})
     _write_static_axis(
-        g, "chi", azimuthal,
-        attrs={"units": getattr(arches[0].int_2d,
+        g, "chi",
+        np.asarray(new_arches[0].int_2d.azimuthal, dtype=np.float32),
+        attrs={"units": getattr(new_arches[0].int_2d,
                                 "azimuthal_unit", "deg")},
     )
-    _append_rows(g, "frame_index", frame_index,
-                 maxshape=(None,), chunks=(min(N, 32),))
+    _append_new_rows(g, "frame_index", new_frame_index,
+                     maxshape=(None,), chunks=(min(max(len(new_arches), 1), 32),))
 
 
 def _write_per_frame_metadata(f, sphere, *, entry: str) -> None:
