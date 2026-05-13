@@ -683,60 +683,25 @@ def _read_data_group(
 
 
 # ===========================================================================
-# v2 schema reader (xdart 0.37+) + v1 backcompat
+# v2 schema reader (xdart 0.37+)
 # ---------------------------------------------------------------------------
-# See xdart/docs/nexus_stitch_refactor_plan.md §2 for the v2 layout.
-# read_sphere() auto-detects v1 vs v2 and returns a single canonical
-# xarray.Dataset shape in either case, so downstream analysis code
-# (BatchPhaseFitter, viewer, notebooks) never has to branch on schema.
+# See xdart/docs/nexus_stitch_refactor_plan.md §2 for the layout.
+# v1 (xdart ≤ 0.36.x) is intentionally not supported — re-reduce old
+# data with current xdart if you need to view it.
 #
-# Canonical Dataset shape:
-#   dims:   frame, q, chi          (chi/q only when corresponding stack loaded)
+# Dataset shape produced by ``read_sphere``:
+#   dims:   frame, q, q_2d, chi
 #   vars:   intensity_1d   (frame, q)
 #           sigma_1d       (frame, q)         optional
-#           intensity_2d   (frame, chi, q)
-#           rot1, rot2, rot3, incident_angle  (frame,)   v2 only
+#           intensity_2d   (frame, chi, q_2d)
+#           rot1, rot2, rot3, incident_angle  (frame,)
 #           <each scan motor>                 (frame,)
-#   coords: frame, q, chi
-#   attrs:  reduction (provenance dict — empty {} for v1 files)
-#           schema_version  "v1" or "v2"
+#   coords: frame, q, q_2d, chi
+#   attrs:  reduction (provenance dict)
 # ===========================================================================
 
 def _v2_decode_str(v):
     return v.decode("utf-8") if isinstance(v, bytes) else v
-
-
-def _read_v1_or_v2(entry: h5py.Group) -> str:
-    """Detect schema version from an open NXentry group.
-
-    Decision rules, in order:
-
-    1. If ``entry.attrs["type"]`` == ``"EwaldSphere"`` → v1 (xdart's v1
-       writer stamps that attribute).
-    2. If ``entry/integrated_1d/intensity.ndim`` == 2 → v2 (stacked
-       (N, nq) tensor); if 1 → v1 (single summed pattern).
-    3. If ``entry/frames`` contains a child matching the v1 naming
-       pattern ``NNNN`` (digit-only) → v1; ``frame_NNNN`` (prefixed) → v2.
-    4. Default to v2.
-    """
-    type_attr = entry.attrs.get("type", b"")
-    if isinstance(type_attr, bytes):
-        type_attr = type_attr.decode("utf-8", errors="replace")
-    if type_attr == "EwaldSphere":
-        return "v1"
-    if "integrated_1d" in entry and "intensity" in entry["integrated_1d"]:
-        ndim = entry["integrated_1d"]["intensity"].ndim
-        if ndim == 2:
-            return "v2"
-        if ndim == 1:
-            return "v1"
-    if "frames" in entry:
-        for name in entry["frames"]:
-            if name.startswith("frame_"):
-                return "v2"
-            if name.isdigit():
-                return "v1"
-    return "v2"
 
 
 def _read_positioners(grp: h5py.Group) -> dict[str, np.ndarray]:
@@ -751,156 +716,9 @@ def _read_positioners(grp: h5py.Group) -> dict[str, np.ndarray]:
     return out
 
 
-def _read_v1_scan_data(entry: h5py.Group) -> dict[str, np.ndarray]:
-    """Read v1's ``entry/scan_data/<column>`` datasets into a dict."""
-    out: dict[str, np.ndarray] = {}
-    if "scan_data" not in entry:
-        return out
-    sd = entry["scan_data"]
-    for k, v in sd.items():
-        if isinstance(v, h5py.Dataset):
-            arr = v[()]
-            out[k] = np.asarray(arr)
-    return out
-
-
-def _read_sphere_v1(path: Path, entry: str, groups: tuple[str, ...],
-                   include_thumbnails: bool):
-    """v1-schema reader.  See public ``read_sphere`` for the contract."""
-    import xarray as xr
-
-    data_vars: dict[str, tuple] = {}
-    coords: dict[str, np.ndarray] = {}
-    attrs_per_coord: dict[str, dict] = {}
-
-    with h5py.File(path, "r") as f:
-        if entry not in f:
-            raise KeyError(f"No {entry!r} group in {path}")
-        e = f[entry]
-
-        # ── enumerate per-frame groups ────────────────────────────
-        if "frames" not in e:
-            raise KeyError(f"No frames/ in {path}:{entry}; not an xdart v1 file")
-        frames_grp = e["frames"]
-
-        frame_indices: list[int] = sorted(
-            int(name) for name in frames_grp
-            if name.isdigit() and name in frames_grp
-            and isinstance(frames_grp[name], h5py.Group)
-        )
-        if not frame_indices:
-            raise KeyError(
-                f"v1 file {path} has no digit-named frame groups under frames/"
-            )
-
-        # ── 1D stack ──────────────────────────────────────────────
-        if "1d" in groups:
-            i1: list[np.ndarray] = []
-            s1: list[np.ndarray] = []
-            radial_1d: np.ndarray | None = None
-            unit_1d = ""
-            for idx in frame_indices:
-                key = f"{idx:04d}"
-                fg = frames_grp[key]
-                if "intensity" not in fg:
-                    continue
-                i1.append(np.asarray(fg["intensity"][()], dtype=np.float32))
-                if radial_1d is None and "radial" in fg:
-                    radial_1d = np.asarray(fg["radial"][()], dtype=np.float32)
-                    u = fg["radial"].attrs.get("units", b"")
-                    unit_1d = _v2_decode_str(u) if u else ""
-                if "sigma" in fg:
-                    s1.append(np.asarray(fg["sigma"][()], dtype=np.float32))
-            if i1:
-                data_vars["intensity_1d"] = (
-                    ("frame", "q"), np.stack(i1, axis=0)
-                )
-                if radial_1d is not None:
-                    coords["q"] = radial_1d
-                    if unit_1d:
-                        attrs_per_coord["q"] = {"units": unit_1d}
-                if s1 and len(s1) == len(i1):
-                    data_vars["sigma_1d"] = (
-                        ("frame", "q"), np.stack(s1, axis=0)
-                    )
-
-        # ── 2D stack ──────────────────────────────────────────────
-        if "2d" in groups:
-            i2: list[np.ndarray] = []
-            radial_2d: np.ndarray | None = None
-            azim_2d: np.ndarray | None = None
-            azim_unit = ""
-            for idx in frame_indices:
-                key2 = f"{idx:04d}_2d"
-                if key2 not in frames_grp:
-                    continue
-                fg2 = frames_grp[key2]
-                if "intensity" not in fg2:
-                    continue
-                arr = np.asarray(fg2["intensity"][()], dtype=np.float32)
-                # v1 xdart convention: shape (nq, nchi). v2 canonical: (nchi, nq).
-                if arr.ndim == 2:
-                    arr = arr.T
-                i2.append(arr)
-                if radial_2d is None and "radial" in fg2:
-                    radial_2d = np.asarray(fg2["radial"][()], dtype=np.float32)
-                if azim_2d is None and "azimuthal" in fg2:
-                    azim_2d = np.asarray(fg2["azimuthal"][()], dtype=np.float32)
-                    u = fg2["azimuthal"].attrs.get("units", b"")
-                    azim_unit = _v2_decode_str(u) if u else "deg"
-            if i2:
-                # 1D and 2D radial axes can have independent resolutions;
-                # use a separate dim name for 2D so xarray doesn't trip
-                # on size mismatch.  See _read_sphere_v2 for rationale.
-                data_vars["intensity_2d"] = (
-                    ("frame", "chi", "q_2d"), np.stack(i2, axis=0)
-                )
-                if radial_2d is not None:
-                    coords["q_2d"] = radial_2d
-                if azim_2d is not None:
-                    coords["chi"] = azim_2d
-                    attrs_per_coord["chi"] = {"units": azim_unit or "deg"}
-
-        # ── motor positioners from scan_data/ ─────────────────────
-        scan_data = _read_v1_scan_data(e)
-        N = len(frame_indices)
-        reserved = {"q", "chi", "frame"}
-        for k, arr in scan_data.items():
-            if arr.ndim != 1 or arr.shape[0] != N:
-                # Skip wrong-shape columns (e.g. scalar metadata snuck in)
-                continue
-            var_name = k if k not in reserved else f"sample_{k}"
-            if var_name not in data_vars:
-                data_vars[var_name] = (("frame",), arr)
-
-        # ── thumbnails (optional, v1 stores them as NNNN_thumb datasets) ──
-        if include_thumbnails:
-            thumbs: list[np.ndarray] = []
-            for idx in frame_indices:
-                tkey = f"{idx:04d}_thumb"
-                if tkey in frames_grp:
-                    thumbs.append(np.asarray(frames_grp[tkey][()]))
-            if thumbs and all(t.shape == thumbs[0].shape for t in thumbs):
-                data_vars["thumbnail"] = (
-                    ("frame", "thumb_y", "thumb_x"),
-                    np.stack(thumbs, axis=0),
-                )
-
-        # ── frame coordinate ─────────────────────────────────────
-        coords["frame"] = np.asarray(frame_indices, dtype=np.int32)
-
-    ds = xr.Dataset(data_vars=data_vars, coords=coords)
-    for var, attrs in attrs_per_coord.items():
-        if var in ds.coords:
-            ds[var].attrs.update(attrs)
-    ds.attrs["reduction"] = {}    # v1 files have no NXprocess block
-    ds.attrs["schema_version"] = "v1"
-    return ds
-
-
 def _read_sphere_v2(path: Path, entry: str, groups: tuple[str, ...],
                    include_thumbnails: bool):
-    """v2-schema reader. See public ``read_sphere`` for the contract."""
+    """v2-schema reader.  Body of public ``read_sphere``."""
     import xarray as xr
 
     from ssrl_xrd_tools.core.provenance import read_provenance
@@ -1006,7 +824,6 @@ def _read_sphere_v2(path: Path, entry: str, groups: tuple[str, ...],
         ds.attrs["reduction"] = read_provenance(str(path), entry=entry)
     except Exception:
         ds.attrs["reduction"] = {}
-    ds.attrs["schema_version"] = "v2"
     return ds
 
 
@@ -1016,13 +833,11 @@ def read_sphere(
     entry: str = "entry",
     groups: tuple[str, ...] = ("1d", "2d"),
     include_thumbnails: bool = False,
-    schema: str | None = None,
 ):
-    """Read an xdart NeXus file into an :class:`xarray.Dataset`.
+    """Read an xdart v2 NeXus file into an :class:`xarray.Dataset`.
 
-    Auto-detects the schema version (v1 = xdart ≤ 0.36.x; v2 = xdart
-    ≥ 0.37) and returns a canonical Dataset shape that downstream
-    analysis code doesn't have to branch on.
+    v1 (xdart ≤ 0.36.x) is intentionally not supported.  Re-reduce
+    older data with current xdart if you need to open it.
 
     Parameters
     ----------
@@ -1033,29 +848,15 @@ def read_sphere(
     groups
         Which integrated stacks to load: subset of ``("1d", "2d")``.
     include_thumbnails
-        If ``True``, load per-frame thumbnails as a
-        ``thumbnail`` data variable.
-    schema
-        Force a specific schema version (``"v1"`` or ``"v2"``).  Default
-        ``None`` auto-detects.
+        If ``True``, load per-frame thumbnails as a ``thumbnail`` data
+        variable.
 
     Returns
     -------
     xarray.Dataset
         See module-level docstring for the canonical shape.
-        ``ds.attrs["schema_version"]`` is ``"v1"`` or ``"v2"``.
     """
-    path = Path(path)
-    if schema is None:
-        with h5py.File(path, "r") as f:
-            if entry not in f:
-                raise KeyError(f"No {entry!r} group in {path}")
-            schema = _read_v1_or_v2(f[entry])
-    if schema == "v1":
-        return _read_sphere_v1(path, entry, groups, include_thumbnails)
-    if schema == "v2":
-        return _read_sphere_v2(path, entry, groups, include_thumbnails)
-    raise ValueError(f"Unknown schema {schema!r}; expected 'v1' or 'v2'")
+    return _read_sphere_v2(Path(path), entry, groups, include_thumbnails)
 
 
 def read_stitched(
