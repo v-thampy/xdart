@@ -397,6 +397,11 @@ class nexusThread(wranglerThread):
             sample_orientation=self.sample_orientation,
             angle_unit="deg",
         )
+        # Cache the angle so the parallel workers in :meth:`_integrate_one`
+        # can detect drift on ω-varying scans and fall back to a
+        # worker-local fiber integrator at the correct angle.  Same
+        # pattern as specThread.
+        sphere._cached_fiber_integrator_angle = incident_angle
 
     def _integrate_one(self, sphere, integrator_pool, frame_idx,
                        img_data, img_meta):
@@ -428,9 +433,31 @@ class nexusThread(wranglerThread):
                 mask=arch_mask,
             )
 
-            # GI fiber integrator: pre-warmed on the main thread (see
-            # _prewarm_fiber_integrator); workers only read it.
-            fi = sphere._cached_fiber_integrator
+            # GI fiber integrator: pre-warmed on the main thread for
+            # frame 0's incidence angle.  Reuse it when this frame's
+            # angle matches; otherwise build a worker-local one at
+            # the right angle.  Sin²ψ scans (fixed ω) stay on the
+            # fast cached path; ω-varying scans get correct results
+            # at the cost of one per-frame fiber-integrator build.
+            fi = None
+            if self.gi:
+                cached_fi = sphere._cached_fiber_integrator
+                cached_angle = getattr(
+                    sphere, "_cached_fiber_integrator_angle", None,
+                )
+                _arch_angle = arch._get_incident_angle()
+                _GI_ANGLE_TOL = 1e-4
+                if (cached_fi is not None and cached_angle is not None
+                        and abs(_arch_angle - cached_angle) < _GI_ANGLE_TOL):
+                    fi = cached_fi
+                else:
+                    fi = create_fiber_integrator(
+                        arch._poni_from_integrator(),
+                        incident_angle=_arch_angle,
+                        tilt_angle=arch.tilt_angle,
+                        sample_orientation=self.sample_orientation,
+                        angle_unit="deg",
+                    )
 
             arch.integrate_1d(
                 global_mask=self.mask,

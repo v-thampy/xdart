@@ -532,13 +532,29 @@ class specThread(wranglerThread):
         # ── Phase 3: live watching ────────────────────────────────────────────
         if self.live_mode and self.command != 'stop' and sphere is not None:
             self.showLabel.emit('Watching for new files...')
+            # Adaptive backoff between filesystem polls.  Starts tight
+            # so first-frame latency is small (~100 ms vs the old fixed
+            # 2 s — matters a lot for fast detectors like Eiger 4M);
+            # doubles on each consecutive miss up to ``_POLL_MAX`` so
+            # an idle wait doesn't burn CPU.  Resets on any hit so a
+            # steady-state acquisition stays at the low end of the
+            # range.  No external watcher dep — works on every FS the
+            # beamline mounts (NFS, SMB, local).
+            _poll_min = 0.1
+            _poll_max = 2.0
+            _poll_growth = 2.0
+            poll_s = _poll_min
             while self.command != 'stop':
                 img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
                 if img_data is None:
                     # Nothing new yet — show watching status and sleep
                     self.showLabel.emit('Watching for new files...')
-                    time.sleep(2.0)
+                    time.sleep(poll_s)
+                    poll_s = min(poll_s * _poll_growth, _poll_max)
                     continue
+                # Hit — reset the backoff so the next miss falls back
+                # to the snappy 100 ms baseline.
+                poll_s = _poll_min
 
                 img_number = 1 if img_number is None else img_number
                 self.scan_name = scan_name
@@ -677,6 +693,17 @@ class specThread(wranglerThread):
             # (the source integrator gets built on the first call).
             return self._dispatch_batch_serial(sphere, pending)
         fiber_integrator = sphere._cached_fiber_integrator
+        # Capture the angle the prewarmed fiber integrator was built
+        # for.  When ``gi`` is on and a per-frame arch's incidence
+        # angle drifts from this (i.e. ω varies across the scan, as
+        # opposed to a sin²ψ-style fixed-ω χ/φ scan), the worker has
+        # to fall back to a worker-local fiber integrator built at
+        # the correct angle.  Reusing the prewarm would silently
+        # integrate every frame as if it were at frame 0's incidence.
+        # 1e-4 deg is below the noise floor of beamline motor readouts
+        # and well below pyFAI's solid-angle sensitivity.
+        cached_gi_angle = self._cached_gi_incident_angle
+        _GI_ANGLE_TOL = 1e-4
         skip_2d = sphere.skip_2d
         bai_1d_args = dict(sphere.bai_1d_args)
         bai_2d_args = dict(sphere.bai_2d_args)
@@ -721,17 +748,27 @@ class specThread(wranglerThread):
                     mask=arch_mask,
                 )
 
-                # GI fiber integrator — reuse shared one (read-only)
-                _fi = fiber_integrator
-                if gi and _fi is None:
-                    _incident_angle = arch._get_incident_angle()
-                    _fi = create_fiber_integrator(
-                        arch._poni_from_integrator(),
-                        incident_angle=_incident_angle,
-                        tilt_angle=arch.tilt_angle,
-                        sample_orientation=sample_orientation,
-                        angle_unit="deg",
-                    )
+                # GI fiber integrator — reuse the prewarmed one if
+                # its incidence angle matches this frame's, otherwise
+                # build a worker-local one at the right angle.  This
+                # keeps sin²ψ scans (fixed ω) on the fast cached path
+                # while keeping ω-varying scans correct.
+                _fi = None
+                if gi:
+                    _arch_angle = arch._get_incident_angle()
+                    if (fiber_integrator is not None
+                            and cached_gi_angle is not None
+                            and abs(_arch_angle - cached_gi_angle)
+                            < _GI_ANGLE_TOL):
+                        _fi = fiber_integrator
+                    else:
+                        _fi = create_fiber_integrator(
+                            arch._poni_from_integrator(),
+                            incident_angle=_arch_angle,
+                            tilt_angle=arch.tilt_angle,
+                            sample_orientation=sample_orientation,
+                            angle_unit="deg",
+                        )
 
                 arch.integrate_1d(
                     global_mask=mask,

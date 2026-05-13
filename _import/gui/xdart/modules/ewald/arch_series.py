@@ -19,6 +19,8 @@ once per batch via :func:`xdart.modules.ewald.nexus_writer.save_sphere_to_nexus`
 stacked arrays + per-frame thumbnail group.
 """
 
+import os
+
 from pandas import Series
 import numpy as np
 
@@ -53,7 +55,8 @@ def _frame_position(h5file, idx: int) -> int | None:
     return int(where[0])
 
 
-def _load_arch_v2(h5file, idx: int, *, static: bool, gi: bool) -> EwaldArch:
+def _load_arch_v2(h5file, idx: int, *, static: bool, gi: bool,
+                  source_root: str | None = None) -> EwaldArch:
     """Build an :class:`EwaldArch` for ``idx`` from the v2 stacked arrays.
 
     Reads:
@@ -123,11 +126,18 @@ def _load_arch_v2(h5file, idx: int, *, static: bool, gi: bool) -> EwaldArch:
                 pass
         _load_source_ref(arch, fg)
 
-    # R3 guardrail: this arch was reconstructed from disk, not handed
-    # over fresh from the wrangler.  ``map_raw`` is None and won't be
-    # populated until a lazy raw loader is wired up — so the GUI
-    # mustn't pretend re-integration is possible.
-    arch.is_reload_only = True
+    # L1 lazy raw load setup + R3 guardrail.
+    # Stash the source-root for ``EwaldArch._lazy_load_raw`` to
+    # resolve relative paths against.  Then decide whether
+    # re-integration is feasible by checking that the source file
+    # exists on disk — if it does, lazy load can recover map_raw;
+    # if it doesn't, the GUI guardrail should still fire.
+    if source_root:
+        arch._source_root = source_root
+    if arch.source_file and arch._lazy_load_resolvable():
+        arch.is_reload_only = False
+    else:
+        arch.is_reload_only = True
     return arch
 
 
@@ -231,9 +241,16 @@ class ArchSeries:
             raise KeyError(f"Arch not found with {idx} index")
         if idx in self._in_memory:
             return self._in_memory[idx]
+        # Resolve the source-root (sphere data_file directory) once
+        # per load so reloaded arches can lazy-load raw frames via
+        # ``arch._source_root``-relative source_file paths.
+        source_root = (
+            os.path.dirname(self.data_file) if self.data_file else None
+        )
         with self.file_lock:
             with catch(self.data_file, 'r') as f:
-                return _load_arch_v2(f, idx, static=self.static, gi=self.gi)
+                return _load_arch_v2(f, idx, static=self.static, gi=self.gi,
+                                     source_root=source_root)
 
     def iloc(self, idx):
         """Location-based retrieval of arches (returns by position in index)."""
