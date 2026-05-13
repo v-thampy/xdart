@@ -849,11 +849,14 @@ def _read_sphere_v1(path: Path, entry: str, groups: tuple[str, ...],
                     u = fg2["azimuthal"].attrs.get("units", b"")
                     azim_unit = _v2_decode_str(u) if u else "deg"
             if i2:
+                # 1D and 2D radial axes can have independent resolutions;
+                # use a separate dim name for 2D so xarray doesn't trip
+                # on size mismatch.  See _read_sphere_v2 for rationale.
                 data_vars["intensity_2d"] = (
-                    ("frame", "chi", "q"), np.stack(i2, axis=0)
+                    ("frame", "chi", "q_2d"), np.stack(i2, axis=0)
                 )
-                if "q" not in coords and radial_2d is not None:
-                    coords["q"] = radial_2d
+                if radial_2d is not None:
+                    coords["q_2d"] = radial_2d
                 if azim_2d is not None:
                     coords["chi"] = azim_2d
                     attrs_per_coord["chi"] = {"units": azim_unit or "deg"}
@@ -931,11 +934,19 @@ def _read_sphere_v2(path: Path, entry: str, groups: tuple[str, ...],
 
         if "2d" in groups and "integrated_2d" in e:
             g2 = e["integrated_2d"]
+            # 1D and 2D radial axes are the same physical quantity (q
+            # magnitude) but sampled at independent resolutions
+            # (npt=2000 for 1D, npt_rad=500 for 2D is typical).  xarray
+            # requires distinct dim names for differently-sized axes,
+            # so 2D's radial axis lives under ``q_2d``.
             data_vars["intensity_2d"] = (
-                ("frame", "chi", "q"),
+                ("frame", "chi", "q_2d"),
                 np.asarray(g2["intensity"][()]),
             )
-            coords.setdefault("q", np.asarray(g2["q"][()]))
+            coords["q_2d"] = np.asarray(g2["q"][()])
+            u_q2 = g2["q"].attrs.get("units", None)
+            if u_q2 is not None:
+                attrs_per_coord["q_2d"] = {"units": _v2_decode_str(u_q2)}
             coords["chi"] = np.asarray(g2["chi"][()])
             u = g2["chi"].attrs.get("units", None)
             if u is not None:

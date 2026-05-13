@@ -140,7 +140,9 @@ class TestReadSphere:
         assert ds.sizes["q"] == N_Q
         assert ds.sizes["chi"] == N_CHI
         assert ds["intensity_1d"].dims == ("frame", "q")
-        assert ds["intensity_2d"].dims == ("frame", "chi", "q")
+        # 1D's radial is `q`; 2D has its own `q_2d` so 1D/2D can be
+        # at different resolutions without an xarray dim conflict.
+        assert ds["intensity_2d"].dims == ("frame", "chi", "q_2d")
 
     def test_sigma_1d_loaded(self, v2_fixture):
         p, _, _ = v2_fixture
@@ -233,3 +235,57 @@ class TestReadStitched:
             f.create_group("entry")
         with pytest.raises(KeyError):
             read_stitched(p)
+
+
+# ---------------------------------------------------------------------------
+# Regression: 1D and 2D radial axes can have independent resolutions
+# ---------------------------------------------------------------------------
+
+class TestMixedQResolution:
+    """xdart often integrates 1D at npt=2000 and 2D at npt_rad=500.
+
+    The reader must surface those as separate dims (``q`` and
+    ``q_2d``); putting both under ``q`` raises ValueError in xarray
+    because the dim's length is ambiguous.
+    """
+
+    def test_separate_q_and_q_2d_when_sizes_differ(self, tmp_path):
+        p = tmp_path / "mixed_q.nxs"
+        n_frames = 3
+        n_q_1d = 2000
+        n_q_2d = 500
+        n_chi = 16
+        rng = np.random.default_rng(2)
+
+        with h5py.File(p, "w") as f:
+            entry = f.create_group("entry")
+            entry.attrs["NX_class"] = "NXentry"
+
+            g1 = entry.create_group("integrated_1d")
+            g1.attrs["NX_class"] = "NXdata"
+            g1.create_dataset("intensity",
+                              data=rng.random((n_frames, n_q_1d), dtype=np.float32))
+            g1.create_dataset("q",
+                              data=np.linspace(0.1, 5.0, n_q_1d, dtype=np.float32))
+            g1.create_dataset("frame_index",
+                              data=np.arange(n_frames, dtype=np.int32))
+
+            g2 = entry.create_group("integrated_2d")
+            g2.attrs["NX_class"] = "NXdata"
+            g2.create_dataset("intensity",
+                              data=rng.random((n_frames, n_chi, n_q_2d),
+                                              dtype=np.float32))
+            g2.create_dataset("q",
+                              data=np.linspace(0.1, 5.0, n_q_2d, dtype=np.float32))
+            g2.create_dataset("chi",
+                              data=np.linspace(-180.0, 180.0, n_chi,
+                                               endpoint=False, dtype=np.float32))
+
+        ds = read_sphere(p)
+        # Both q axes present with their own sizes
+        assert ds.sizes["q"] == n_q_1d
+        assert ds.sizes["q_2d"] == n_q_2d
+        # 2D's radial dim is q_2d, not q
+        assert ds["intensity_2d"].dims == ("frame", "chi", "q_2d")
+        # 1D's radial dim stays q
+        assert ds["intensity_1d"].dims == ("frame", "q")

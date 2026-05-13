@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "numpy",
     "scipy",
+    "xarray",
     "h5py",
     "fabio",
     "silx",

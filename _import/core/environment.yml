@@ -6,6 +6,7 @@ dependencies:
   # Core scientific stack
   - numpy
   - scipy
+  - xarray
   - h5py
   - matplotlib
   - natsort
