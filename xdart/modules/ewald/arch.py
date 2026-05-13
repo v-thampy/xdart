@@ -5,6 +5,7 @@ Created on Mon Aug 26 14:21:58 2019
 @author: walroth
 """
 import copy
+import os
 from threading import Condition
 
 from pyFAI.integrator.azimuthal import AzimuthalIntegrator
@@ -240,6 +241,89 @@ class EwaldArch():
             detector=str(det_name),
         )
 
+    def _resolved_source_path(self) -> str:
+        """Return the absolute path to ``source_file`` for lazy raw load.
+
+        Joins ``source_file`` (relpath as stored by the wrangler)
+        against ``_source_root`` (the sphere's data_file directory,
+        set by :func:`_load_arch_v2`).  Returns an empty string when
+        either is missing, leaves it to the caller to detect.
+        """
+        if not self.source_file:
+            return ""
+        if os.path.isabs(self.source_file):
+            return self.source_file
+        if not self._source_root:
+            # Pre-R2 reloads might lack the root — assume cwd.  Real
+            # callers always go through _load_arch_v2 which sets it.
+            return self.source_file
+        return os.path.normpath(
+            os.path.join(self._source_root, self.source_file)
+        )
+
+    def _lazy_load_resolvable(self) -> bool:
+        """Return True iff a lazy raw load would find the source file.
+
+        Used by :func:`_load_arch_v2` to decide ``is_reload_only`` at
+        load time — without it the R3 guardrail would have to either
+        always pop (treating every reload as unrecoverable) or never
+        pop (silently no-op'ing when the source file is missing).
+        """
+        full = self._resolved_source_path()
+        return bool(full) and os.path.exists(full)
+
+    def _lazy_load_raw(self) -> bool:
+        """Best-effort load of ``map_raw`` from the source file on disk.
+
+        Dispatches by source-file extension:
+
+        * ``.h5`` / ``.nxs`` / ``.hdf5`` →
+          :class:`ssrl_xrd_tools.io.nexus.NexusImageStack` indexed by
+          ``source_frame_idx`` (the wrangler stamped the global stack
+          offset, so this works for both single-dataset and Eiger
+          multi-link masters).
+        * any other extension → ssrl ``read_image`` (TIF/EDF/CBF/…).
+
+        Idempotent: returns immediately if ``map_raw`` is already
+        populated.  Returns ``True`` on success, ``False`` on any
+        failure (no source ref, file missing, unrecognised format,
+        IO error).  Never raises — callers can fall through to the
+        existing "no raw, can't integrate" guard.
+
+        Note: this method does **not** acquire ``arch_lock``; callers
+        that are already inside the lock (the integrate methods) must
+        avoid re-entering.
+        """
+        if self.map_raw is not None:
+            return True
+        full = self._resolved_source_path()
+        if not full or not os.path.exists(full):
+            return False
+        ext = os.path.splitext(full)[1].lower()
+        try:
+            if ext in (".h5", ".nxs", ".hdf5"):
+                from ssrl_xrd_tools.io.nexus import open_nexus_image_stack
+                # source_frame_idx is the global flattened index per
+                # the R2 schema for NeXus sources.
+                fidx = self.source_frame_idx
+                if fidx is None:
+                    fidx = self.idx if self.idx is not None else 0
+                with open_nexus_image_stack(full) as stack:
+                    self.map_raw = np.asarray(
+                        stack[int(fidx)], dtype=np.float32,
+                    )
+            else:
+                from ssrl_xrd_tools.io.image import read_image
+                self.map_raw = np.asarray(read_image(full), dtype=np.float32)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug(
+                "_lazy_load_raw failed for %s frame %s: %s",
+                full, self.source_frame_idx, e,
+            )
+            return False
+        return self.map_raw is not None
+
     def _get_incident_angle(self):
         """Return incident angle in degrees from th_mtr or scan_info."""
         try:
@@ -301,7 +385,15 @@ class EwaldArch():
         """
         with self.arch_lock:
             if self.map_raw is None:
-                return  # no raw data (e.g. loaded from NeXus) — cannot re-integrate
+                # L1: try a lazy raw load from source_file before
+                # giving up.  Reloaded-from-v2 arches don't carry
+                # map_raw on disk (intentional schema choice) but
+                # the wrangler stamps source_file + source_frame_idx,
+                # which _lazy_load_raw can use to fetch the original
+                # frame from a TIF or a NeXus master.
+                self._lazy_load_raw()
+            if self.map_raw is None:
+                return  # no raw data and no source — cannot re-integrate
 
             self.map_norm = 1
             if monitor is not None:
@@ -443,7 +535,10 @@ class EwaldArch():
         """
         with self.arch_lock:
             if self.map_raw is None:
-                return  # no raw data (e.g. loaded from NeXus) — cannot re-integrate
+                # L1: same lazy-load attempt as integrate_1d.
+                self._lazy_load_raw()
+            if self.map_raw is None:
+                return  # no raw data and no source — cannot re-integrate
 
             if monitor is not None:
                 self.map_norm = 1

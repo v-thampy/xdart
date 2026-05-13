@@ -416,11 +416,20 @@ class staticWidget(QWidget):
                 logger.debug("In-memory arch hand-off failed for idx=%s",
                              idx, exc_info=True)
 
-        with self.file_lock:
-            self.h5viewer.latest_idx = idx
-            if self.h5viewer.auto_last:
-                self.latest_arch()
-            self.h5viewer.update_data()
+        # ``file_lock`` deliberately not held here: ``latest_arch()``
+        # and ``h5viewer.update_data()`` both only touch Qt widgets +
+        # integer attrs — no h5 file I/O.  The old code wrapped this
+        # in ``with self.file_lock`` and that lock was contended by
+        # the wrangler's per-frame save path, causing visible
+        # stutter during live mode whenever the list-widget rebuild
+        # crossed a save boundary.  Updates run on the main thread so
+        # the writes to ``latest_idx`` / ``auto_last`` are race-free
+        # against other slots fired on the same thread; the wrangler
+        # thread only signals (queued).
+        self.h5viewer.latest_idx = idx
+        if self.h5viewer.auto_last:
+            self.latest_arch()
+        self.h5viewer.update_data()
 
         # Record the latest index and (re)start the coalescing timer.
         # If the timer is already running, restart resets the countdown
