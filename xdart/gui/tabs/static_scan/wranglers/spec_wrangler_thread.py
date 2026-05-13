@@ -38,7 +38,7 @@ from ssrl_xrd_tools.io.image import read_image, count_frames
 from ssrl_xrd_tools.io.export import write_xye
 from ssrl_xrd_tools.io.nexus import find_nexus_image_dataset
 from ssrl_xrd_tools.io.metadata import read_image_metadata
-from xdart.utils import get_series_avg, catch_h5py_file as _catch_h5
+from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from .wrangler_widget import wranglerThread
 
@@ -580,13 +580,14 @@ class specThread(wranglerThread):
             self._process_one(sphere, *item)
             count += 1
         # v2 writer is idempotent — slice-assigns to preallocated stacked
-        # arrays per batch, no per-frame resize-append cost.
+        # arrays per batch, no per-frame resize-append cost.  Writer
+        # owns its file handle now, so we only hold the pause +
+        # file_lock around the call.
         if count > 0 and not self.xye_only:
             _get_h5pool().pause(sphere.data_file)
             try:
                 with self.file_lock:
-                    with _catch_h5(sphere.data_file, 'a') as h5f:
-                        sphere._save_to_nexus(h5f)
+                    sphere._save_to_nexus()
             finally:
                 _get_h5pool().resume(sphere.data_file)
         # Flush buffered XYE writes for this batch.
@@ -740,8 +741,8 @@ class specThread(wranglerThread):
                         )
                     # Phase 2b: single batch flush — one slice-assign per
                     # stacked dataset for all frames in this batch.
-                    with _catch_h5(sphere.data_file, 'a') as h5f2:
-                        sphere._save_to_nexus(h5f2)
+                    # The writer owns its file handle now.
+                    sphere._save_to_nexus()
             finally:
                 _get_h5pool().resume(sphere.data_file)
             _t_phase2 = time.time() - _t_phase2

@@ -183,14 +183,10 @@ class EwaldSphere:
 
             # Persist via the v2 writer.  Idempotent; one slice-assign per
             # stacked dataset.  Skipped in batch mode (caller flushes once
-            # at end of batch).
+            # at end of batch).  The writer opens its own file — ignore
+            # any ``h5file`` argument (kept for signature compatibility).
             if not batch_save:
-                if h5file is not None:
-                    self._save_to_nexus(h5file)
-                else:
-                    with self.file_lock:
-                        with utils.catch_h5py_file(self.data_file, 'a') as file:
-                            self._save_to_nexus(file)
+                self._save_to_nexus()
 
     def by_arch_integrate_1d(self, **args):
         """Integrate all arches individually and accumulate the 1D sum."""
@@ -276,18 +272,27 @@ class EwaldSphere:
 
     def save_to_nexus(self, *, entry: str = "entry", finalize: bool = False,
                       replace: bool = False) -> None:
-        """Save sphere state into a v2 NeXus file.  Idempotent across calls."""
+        """Save sphere state into a v2 NeXus file.  Idempotent across calls.
+
+        The writer owns its own file handle (with NFS-retry semantics)
+        so the caller only needs to hold ``self.file_lock``.
+        """
         mode = 'w' if replace else 'a'
         with self.file_lock:
-            with utils.catch_h5py_file(self.data_file, mode) as file:
-                self._save_to_nexus(file, entry=entry, finalize=finalize)
+            self._save_to_nexus(mode=mode, entry=entry, finalize=finalize)
 
-    def _save_to_nexus(self, h5f, *, entry: str = "entry",
+    def _save_to_nexus(self, *, mode: str = "a", entry: str = "entry",
                        finalize: bool = False) -> None:
-        """Inner v2 writer; delegates to ``nexus_writer.save_sphere_to_nexus``."""
+        """Inner v2 writer; delegates to ``nexus_writer.save_sphere_to_nexus``.
+
+        Opens the file at ``self.data_file`` internally.  Callers must
+        NOT hold an open h5py.File on the same path during this call —
+        HDF5 single-writer semantics will reject the second open.
+        """
         from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
         with self.sphere_lock:
-            save_sphere_to_nexus(self, h5f, entry=entry, finalize=finalize)
+            save_sphere_to_nexus(self, self.data_file, mode=mode,
+                                 entry=entry, finalize=finalize)
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
         """Load sphere state from a v2 NeXus file.
