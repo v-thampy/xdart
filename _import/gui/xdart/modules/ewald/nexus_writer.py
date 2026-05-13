@@ -28,16 +28,76 @@ Key invariants of the v2 schema:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Mapping
+import os
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Mapping, Union
 
+import h5py
+import nexusformat.nexus as nx
 import numpy as np
 
 if TYPE_CHECKING:  # pragma: no cover
-    import h5py
-
     from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
 
     from xdart.modules.ewald.sphere import EwaldSphere
+
+
+# ---------------------------------------------------------------------------
+# File-opening helper — mirrors ssrl_xrd_tools.core.hdf5.catch_h5py_file
+# semantics (NFS retry on transient OSError) but goes through
+# ``nx.nxopen`` so the returned object is an ``NXroot`` view rather
+# than a raw h5py.File.  Underlying h5py.File still reachable via
+# ``root.nxfile.file`` for sections that haven't been ported yet.
+# ---------------------------------------------------------------------------
+
+def _open_with_retry(path: Union[str, "Path"], mode: str,
+                     tries: int = 100, sleep_s: float = 0.05):
+    """Open a NeXus file via ``nx.nxopen``, retrying transient OSErrors.
+
+    Beamline NFS mounts sometimes briefly refuse to open a file while
+    another process is still releasing its lock.  Retry the same way
+    ``ssrl_xrd_tools.core.hdf5.catch_h5py_file`` does so the writer
+    behaves identically to the previous code path.
+
+    ``nx.nxopen`` accepts the same mode strings as ``h5py.File``
+    (``'r'``, ``'rw'``, ``'r+'``, ``'w'``, ``'w-'``, ``'a'``).
+    """
+    last_exc: Exception | None = None
+    for _ in range(tries):
+        try:
+            return nx.nxopen(os.fspath(path), mode)
+        except OSError as exc:
+            last_exc = exc
+            time.sleep(sleep_s)
+    # Final attempt — let it propagate naturally if it still fails
+    if last_exc is not None:
+        return nx.nxopen(os.fspath(path), mode)
+    raise RuntimeError("unreachable")
+
+
+def _h5(f) -> h5py.File:
+    """Reach the underlying ``h5py.File`` from an ``NXroot`` returned by
+    :func:`_open_with_retry`.
+
+    Used by the (still-unported) section helpers that operate directly
+    on raw h5py groups during the incremental migration.  Will go away
+    once every helper has been ported to nexusformat assignments.
+    """
+    return f.nxfile.file
+
+
+def _assign_nxgroup(f, path: str, value) -> None:
+    """Idempotent NXgroup assignment under an NXroot.
+
+    nexusformat refuses to overwrite an existing :class:`NXgroup`
+    via ``f[path] = group``; this helper deletes any existing entry
+    first so callers can keep the same ``f[path] = NXdata(...)``
+    pattern across both first-write and re-write paths.
+    """
+    if path in f:
+        del f[path]
+    f[path] = value
 
 
 # ---------------------------------------------------------------------------
@@ -46,12 +106,13 @@ if TYPE_CHECKING:  # pragma: no cover
 
 def save_sphere_to_nexus(
     sphere: "EwaldSphere",
-    h5f: "h5py.File",
+    path: Union[str, "Path"],
     *,
+    mode: str = "a",
     entry: str = "entry",
     finalize: bool = False,
 ) -> None:
-    """Write ``sphere``'s state into ``h5f`` as a v2 NXroot.
+    """Write ``sphere``'s state into the file at ``path`` as a v2 NXroot.
 
     Parameters
     ----------
@@ -60,8 +121,14 @@ def save_sphere_to_nexus(
         ``arches`` (ordered), ``scan_data`` (pandas DataFrame),
         ``bai_1d_args``, ``bai_2d_args``, optionally ``geometry``
         (:class:`DiffractometerGeometry`) and ``incidence_motor``.
-    h5f
-        Open writable :class:`h5py.File`.
+    path
+        Filesystem path to the ``.nxs`` file.  The writer opens and
+        closes its own file handle (NFS-retry semantics included), so
+        callers should NOT hold an h5py.File on the same path during
+        this call.
+    mode
+        HDF5 open mode (default ``"a"`` — open existing or create).
+        Pass ``"w"`` to truncate.
     entry
         NXentry group name (default ``"entry"``).
     finalize
@@ -69,44 +136,57 @@ def save_sphere_to_nexus(
         write-once items (PONI, stitched outputs) are flushed.  Safe to
         call with ``finalize=False`` repeatedly during a scan.
     """
-    import h5py  # noqa: F401 — imported for type narrowing on grp
+    with _open_with_retry(path, mode) as f:
+        # ``f`` is an NXroot view; ``_h5(f)`` reaches the underlying
+        # h5py.File for section helpers that haven't been ported yet.
+        # Mixing nx-assignment and h5py writes is safe (both target the
+        # same on-disk file) but nx's in-memory cache won't reflect
+        # changes made directly via h5py — so anything that needs to be
+        # *visible to subsequent nx assignments* must go through nx.
+        _ensure_nxentry(f, entry)
+        h5f = _h5(f)
 
-    _ensure_nxentry(h5f, entry)
+        # 1. Provenance (write once; idempotent re-writes are safe)
+        _write_reduction(h5f, sphere, entry=entry)
 
-    # 1. Provenance (write once; idempotent re-writes are safe)
-    _write_reduction(h5f, sphere, entry=entry)
+        # 2. Stacked integrated_1d and integrated_2d — ported to nexusformat
+        _write_integrated_1d(f, sphere, entry=entry)
+        _write_integrated_2d(f, sphere, entry=entry)
 
-    # 2. Stacked integrated_1d and integrated_2d
-    _write_integrated_1d(h5f, sphere, entry=entry)
-    _write_integrated_2d(h5f, sphere, entry=entry)
+        # 3. Per-frame metadata (thumbnails + source refs)
+        _write_per_frame_metadata(h5f, sphere, entry=entry)
 
-    # 3. Per-frame metadata (thumbnails + source refs)
-    _write_per_frame_metadata(h5f, sphere, entry=entry)
+        # 4. Raw motor positioners
+        _write_positioners(h5f, sphere, entry=entry)
 
-    # 4. Raw motor positioners
-    _write_positioners(h5f, sphere, entry=entry)
+        # 5. Derived per-frame geometry
+        _write_per_frame_geometry(h5f, sphere, entry=entry)
 
-    # 5. Derived per-frame geometry
-    _write_per_frame_geometry(h5f, sphere, entry=entry)
+        # 6. Instrument (PONI, wavelength) — write each call (cheap, scalars)
+        _write_instrument(h5f, sphere, entry=entry)
 
-    # 6. Instrument (PONI, wavelength) — write each call (cheap, scalars)
-    _write_instrument(h5f, sphere, entry=entry)
-
-    # 7. Stitched outputs (if present on the sphere)
-    if finalize:
-        _write_stitched(h5f, sphere, entry=entry)
+        # 7. Stitched outputs (if present on the sphere)
+        if finalize:
+            _write_stitched(h5f, sphere, entry=entry)
 
 
 # ---------------------------------------------------------------------------
 # Section helpers
 # ---------------------------------------------------------------------------
 
-def _ensure_nxentry(h5f, entry: str) -> None:
-    grp = h5f.require_group(entry)
-    if grp.attrs.get("NX_class", None) not in ("NXentry", b"NXentry"):
-        grp.attrs["NX_class"] = "NXentry"
-    if "default" not in grp.attrs:
-        grp.attrs["default"] = "integrated_1d"
+def _ensure_nxentry(f, entry: str) -> None:
+    """Ensure ``/<entry>`` exists as an :class:`NXentry`.
+
+    Uses nx assignment so the resulting group lives in nexusformat's
+    in-memory tree and can be navigated (e.g. ``f[entry]``) by
+    subsequent ported helpers in the same session.
+    """
+    if entry not in f:
+        f[entry] = nx.NXentry()
+    # Ensure NX_class is correctly set (idempotent on rewrites).
+    f[entry].attrs["NX_class"] = "NXentry"
+    if "default" not in f[entry].attrs:
+        f[entry].attrs["default"] = "integrated_1d"
 
 
 def _write_reduction(h5f, sphere, *, entry: str) -> None:
@@ -167,7 +247,18 @@ def _stack_arches(arches, attr: str) -> np.ndarray | None:
     return np.stack(rows, axis=0)
 
 
-def _write_integrated_1d(h5f, sphere, *, entry: str) -> None:
+def _write_integrated_1d(f, sphere, *, entry: str) -> None:
+    """Write ``/entry/integrated_1d`` as an :class:`NXdata` group.
+
+    Uses nexusformat constructors so ``signal``, ``axes``, ``units``
+    and ``NX_class`` are set by the library, not by hand — the only
+    way to instantiate :class:`NXdata` is to name a signal and its
+    axes, which makes "forgot the signal attr" a compile-time impossi-
+    bility instead of a silent on-disk bug.
+
+    Assignment to ``f[path]`` replaces the existing group atomically,
+    so the same idempotent semantics as ``_replace_ds`` apply.
+    """
     arches = list(sphere.arches)
     if not arches:
         return
@@ -181,18 +272,33 @@ def _write_integrated_1d(h5f, sphere, *, entry: str) -> None:
         [getattr(a, "idx", i) for i, a in enumerate(arches)], dtype=np.int32
     )
 
-    g = h5f.require_group(f"{entry}/integrated_1d")
-    g.attrs["NX_class"] = "NXdata"
-    g.attrs["signal"] = "intensity"
-    g.attrs["axes"] = ["frame_index", "q"]
-    _replace_ds(g, "intensity", intensity)
-    _replace_ds(g, "q", radial, attrs={"units": _q_units(arches[0].int_1d)})
+    # NXdata's signature is (signal, axes, errors, weights, *args, **kwargs)
+    # where signal/axes are NXfield instances.  The library writes the
+    # appropriate @signal and @axes attrs based on the field names.
+    # We attach sigma as a sibling field (named "sigma", not
+    # "intensity_errors" — preserve the established on-disk contract).
+    nxdata = nx.NXdata(
+        signal=nx.NXfield(intensity, name="intensity"),
+        axes=[
+            nx.NXfield(frame_index, name="frame_index"),
+            nx.NXfield(radial, name="q",
+                       units=_q_units(arches[0].int_1d)),
+        ],
+    )
     if sigma is not None:
-        _replace_ds(g, "sigma", sigma)
-    _replace_ds(g, "frame_index", frame_index)
+        nxdata["sigma"] = nx.NXfield(sigma, name="sigma")
+    _assign_nxgroup(f, f"{entry}/integrated_1d", nxdata)
 
 
-def _write_integrated_2d(h5f, sphere, *, entry: str) -> None:
+def _write_integrated_2d(f, sphere, *, entry: str) -> None:
+    """Write ``/entry/integrated_2d`` as an :class:`NXdata` group.
+
+    Per-frame intensity comes in as xdart-shape ``(nq, nchi)``; we
+    transpose to ``(nchi, nq)`` so the stacked tensor is
+    ``(N, nchi, nq)`` — that ordering matches the ``axes`` attribute
+    ``["frame_index", "chi", "q"]`` exactly, which is what NeXus-aware
+    viewers (DAWN, Mantid) expect for auto-plot.
+    """
     arches = list(sphere.arches)
     if not arches:
         return
@@ -200,8 +306,6 @@ def _write_integrated_2d(h5f, sphere, *, entry: str) -> None:
     intensity = _stack_arches(arches, "int_2d.intensity")
     if intensity is None:
         return
-    # arch.int_2d.intensity is xdart-shape (nq, nchi) — transpose
-    # per-frame to (nchi, nq) so the stacked tensor is (N, nchi, nq).
     intensity = np.transpose(intensity, (0, 2, 1)) if intensity.ndim == 3 else intensity
     radial = np.asarray(arches[0].int_2d.radial, dtype=np.float32)
     azimuthal = np.asarray(arches[0].int_2d.azimuthal, dtype=np.float32)
@@ -209,17 +313,18 @@ def _write_integrated_2d(h5f, sphere, *, entry: str) -> None:
         [getattr(a, "idx", i) for i, a in enumerate(arches)], dtype=np.int32
     )
 
-    g = h5f.require_group(f"{entry}/integrated_2d")
-    g.attrs["NX_class"] = "NXdata"
-    g.attrs["signal"] = "intensity"
-    g.attrs["axes"] = ["frame_index", "chi", "q"]
-    _replace_ds(g, "intensity", intensity)
-    _replace_ds(g, "q", radial, attrs={"units": _q_units(arches[0].int_2d)})
-    _replace_ds(
-        g, "chi", azimuthal,
-        attrs={"units": getattr(arches[0].int_2d, "azimuthal_unit", "deg")},
+    nxdata = nx.NXdata(
+        signal=nx.NXfield(intensity, name="intensity"),
+        axes=[
+            nx.NXfield(frame_index, name="frame_index"),
+            nx.NXfield(azimuthal, name="chi",
+                       units=getattr(arches[0].int_2d,
+                                     "azimuthal_unit", "deg")),
+            nx.NXfield(radial, name="q",
+                       units=_q_units(arches[0].int_2d)),
+        ],
     )
-    _replace_ds(g, "frame_index", frame_index)
+    _assign_nxgroup(f, f"{entry}/integrated_2d", nxdata)
 
 
 def _write_per_frame_metadata(h5f, sphere, *, entry: str) -> None:
