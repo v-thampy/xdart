@@ -176,8 +176,33 @@ class EwaldArch():
         self.int_2d: IntegrationResult2D | None = None
         self.gi_1d: dict[str, IntegrationResult1D] = {}
         self.gi_2d: dict[str, IntegrationResult2D] = {}
+        # Raw-source pointer (R2 schema):
+        #   source_file       relpath to the raw source file (image or .nxs master)
+        #   source_frame_idx  index of *this* frame within source_file
+        # Both written to /entry/frames/frame_NNNN/source/ by the v2
+        # writer and round-tripped by _load_arch_v2.  source_frame_idx
+        # defaults to None — the writer falls back to ``idx`` for
+        # single-frame source files (typical SPEC layout) when it's None.
         self.source_file: str = ""
+        self.source_frame_idx: int | None = None
         self.thumbnail: np.ndarray | None = None  # downsampled (map_raw - bg_raw)
+        # R3 guardrail: when an arch is reconstructed from a v2 .nxs
+        # without a raw image (the common case — v2 doesn't store
+        # map_raw to save disk), reintegration is impossible until a
+        # lazy raw loader fetches the frame back from ``source_file``.
+        # ``_load_arch_v2`` sets ``is_reload_only=False`` when the
+        # source path resolves (lazy load will succeed), else ``True``
+        # (lazy load can't recover the raw — re-integrate would
+        # silently no-op).  The GUI's "Reintegrate" buttons check
+        # ``sphere.has_reload_only_frames()`` and pop a message
+        # rather than no-op'ing inside ``EwaldArch.integrate_*``.
+        self.is_reload_only: bool = False
+        # L1 lazy raw load: the directory ``source_file`` resolves
+        # against (typically ``os.path.dirname(sphere.data_file)``,
+        # set by :func:`_load_arch_v2`).  Empty for fresh-from-wrangler
+        # arches that already carry ``map_raw`` and never need lazy
+        # load.
+        self._source_root: str = ""
 
     def __getstate__(self):
         """Exclude threading.Condition objects so EwaldArch can be pickled

@@ -451,12 +451,18 @@ class nexusThread(wranglerThread):
         arch.integrator = sphere._cached_integrator
 
         # Set source file reference for the v2 NeXus per-frame group.
+        # The source_frame_idx is the *global* frame index across all
+        # external-link data files (matches NexusImageStack's flattened
+        # view), so a lazy raw loader can do
+        # ``NexusImageStack(source_file)[source_frame_idx]`` directly
+        # without needing to know which data_NNNNNN segment to open.
         try:
             arch.source_file = os.path.relpath(
                 self.nexus_file, os.path.dirname(sphere.data_file),
             )
         except ValueError:
             arch.source_file = str(self.nexus_file)
+        arch.source_frame_idx = int(frame_idx)
         # NeXus frames already live in the source — don't double-store
         # them in the output .nxs.
         arch.skip_map_raw = True
