@@ -136,38 +136,63 @@ def save_sphere_to_nexus(
         write-once items (PONI, stitched outputs) are flushed.  Safe to
         call with ``finalize=False`` repeatedly during a scan.
     """
+    import logging
+    _logger = logging.getLogger(__name__)
+    _verbose = _logger.isEnabledFor(logging.DEBUG)
+
+    def _tick(label, t0):
+        if _verbose:
+            _logger.debug("save_sphere_to_nexus[%s]: %.3fs",
+                          label, time.time() - t0)
+        return time.time()
+
+    _t_total = time.time()
+    _t0 = time.time()
     with _open_with_retry(path, mode) as f:
-        # ``f`` is an NXroot view; ``_h5(f)`` reaches the underlying
-        # h5py.File for section helpers that haven't been ported yet.
-        # Mixing nx-assignment and h5py writes is safe (both target the
-        # same on-disk file) but nx's in-memory cache won't reflect
-        # changes made directly via h5py — so anything that needs to be
-        # *visible to subsequent nx assignments* must go through nx.
+        _t0 = _tick("open", _t0)
         _ensure_nxentry(f, entry)
+        _t0 = _tick("entry", _t0)
         h5f = _h5(f)
 
-        # 1. Provenance (write once; idempotent re-writes are safe)
-        _write_reduction(h5f, sphere, entry=entry)
+        # 1. Provenance — only write on first save or on finalize.
+        # The versions/config/inputs of an in-progress scan don't
+        # change between saves; rewriting them every batch costs
+        # ~10–30 ms each (importlib.metadata.version() lookups +
+        # group-tree delete/recreate via h5py) for no benefit.
+        if finalize or "reduction" not in h5f.get(entry, {}):
+            _write_reduction(h5f, sphere, entry=entry)
+        _t0 = _tick("reduction", _t0)
 
-        # 2. Stacked integrated_1d and integrated_2d — ported to nexusformat
+        # 2. Stacked integrated_1d and integrated_2d
         _write_integrated_1d(f, sphere, entry=entry)
+        _t0 = _tick("integrated_1d", _t0)
         _write_integrated_2d(f, sphere, entry=entry)
+        _t0 = _tick("integrated_2d", _t0)
 
-        # 3. Per-frame metadata — ported to nexusformat
+        # 3. Per-frame metadata
         _write_per_frame_metadata(f, sphere, entry=entry)
+        _t0 = _tick("per_frame_metadata", _t0)
 
-        # 4. Raw motor positioners — ported to nexusformat
+        # 4. Raw motor positioners
         _write_positioners(f, sphere, entry=entry)
+        _t0 = _tick("positioners", _t0)
 
-        # 5. Derived per-frame geometry — ported to nexusformat
+        # 5. Derived per-frame geometry
         _write_per_frame_geometry(f, sphere, entry=entry)
+        _t0 = _tick("per_frame_geometry", _t0)
 
-        # 6. Instrument (PONI, wavelength) — write each call (cheap, scalars)
-        _write_instrument(h5f, sphere, entry=entry)
+        # 6. Instrument (PONI, wavelength)
+        _write_instrument(f, sphere, entry=entry)
+        _t0 = _tick("instrument", _t0)
 
         # 7. Stitched outputs (if present on the sphere)
         if finalize:
-            _write_stitched(h5f, sphere, entry=entry)
+            _write_stitched(f, sphere, entry=entry)
+            _t0 = _tick("stitched", _t0)
+
+    if _verbose:
+        _logger.debug("save_sphere_to_nexus[close+TOTAL]: %.3fs",
+                      time.time() - _t_total)
 
 
 # ---------------------------------------------------------------------------
@@ -247,17 +272,106 @@ def _stack_arches(arches, attr: str) -> np.ndarray | None:
     return np.stack(rows, axis=0)
 
 
+def _ensure_nxdata_group(h5f, path: str, *, signal: str, axes: list[str]):
+    """Create or reuse an NXdata h5py group with correct NX_class attrs.
+
+    The integrated_1d / integrated_2d helpers need resizable h5py
+    datasets (so per-save cost is O(new rows), not O(total rows)),
+    which nexusformat doesn't expose ergonomically.  This helper
+    encapsulates the "set the four NXdata attributes" pattern that
+    keeps a hand-rolled h5py group NeXus-conformant.
+    """
+    if path in h5f:
+        g = h5f[path]
+    else:
+        g = h5f.create_group(path)
+    g.attrs["NX_class"] = "NXdata"
+    g.attrs["signal"] = signal
+    g.attrs["axes"] = axes
+    return g
+
+
+def _append_rows(g, name: str, data: np.ndarray,
+                 *, maxshape: tuple, chunks: tuple,
+                 attrs: Mapping[str, Any] | None = None) -> None:
+    """Append/replace rows in a resizable dataset.
+
+    Designed for the "stacked-per-frame" datasets in v2: each call to
+    the writer adds K new rows.  We resize the on-disk dataset to
+    ``len(data)`` and slice-assign only the rows beyond what's
+    already there — so a save with 8 new frames at frame index 100
+    only writes 8 rows instead of all 108.
+
+    If the dataset doesn't exist yet, creates it with the supplied
+    ``maxshape`` / ``chunks`` parameters so future appends work.
+    If the in-memory ``data`` is *shorter* than what's on disk (the
+    user re-loaded an older sphere, say), the dataset gets resized
+    down and overwritten — that's the safer behavior than silently
+    leaving stale rows.
+    """
+    if name not in g:
+        ds = g.create_dataset(
+            name, data=data,
+            maxshape=maxshape, chunks=chunks,
+        )
+        if attrs:
+            for k, v in attrs.items():
+                ds.attrs[k] = v
+        return
+    ds = g[name]
+    target_n = data.shape[0]
+    current_n = ds.shape[0]
+    if target_n == current_n:
+        # Nothing new — most common path after the first save when
+        # the in-memory frame count hasn't changed.
+        if attrs:
+            for k, v in attrs.items():
+                ds.attrs[k] = v
+        return
+    if target_n < current_n:
+        # In-memory shrank.  Truncate and rewrite the whole array;
+        # safer than leaving stale rows in place.
+        ds.resize(data.shape)
+        ds[...] = data
+    else:
+        # Append-only path — the hot loop.  Resize and write only
+        # the new tail.
+        new_shape = list(ds.shape)
+        new_shape[0] = target_n
+        ds.resize(tuple(new_shape))
+        ds[current_n:target_n, ...] = data[current_n:target_n, ...]
+    if attrs:
+        for k, v in attrs.items():
+            ds.attrs[k] = v
+
+
+def _write_static_axis(g, name: str, data: np.ndarray,
+                       *, attrs: Mapping[str, Any] | None = None) -> None:
+    """Write a fixed-shape axis (q, chi) that doesn't grow per frame.
+
+    Idempotent: if the dataset already exists with the same shape it
+    is left untouched; on shape change it's deleted and recreated.
+    """
+    if name in g:
+        if g[name].shape == data.shape:
+            if attrs:
+                for k, v in attrs.items():
+                    g[name].attrs[k] = v
+            return
+        del g[name]
+    ds = g.create_dataset(name, data=data)
+    if attrs:
+        for k, v in attrs.items():
+            ds.attrs[k] = v
+
+
 def _write_integrated_1d(f, sphere, *, entry: str) -> None:
-    """Write ``/entry/integrated_1d`` as an :class:`NXdata` group.
+    """Write/extend ``/entry/integrated_1d`` as an NXdata group.
 
-    Uses nexusformat constructors so ``signal``, ``axes``, ``units``
-    and ``NX_class`` are set by the library, not by hand — the only
-    way to instantiate :class:`NXdata` is to name a signal and its
-    axes, which makes "forgot the signal attr" a compile-time impossi-
-    bility instead of a silent on-disk bug.
-
-    Assignment to ``f[path]`` replaces the existing group atomically,
-    so the same idempotent semantics as ``_replace_ds`` apply.
+    Uses resizable h5py datasets directly (not nexusformat's NXdata
+    constructor) so we can slice-assign only the NEW frames on each
+    save.  Format on disk is identical to the all-nexusformat version
+    — signal/axes/units attrs match the round-trip test.
     """
     arches = list(sphere.arches)
     if not arches:
@@ -271,33 +385,38 @@ def _write_integrated_1d(f, sphere, *, entry: str) -> None:
     frame_index = np.array(
         [getattr(a, "idx", i) for i, a in enumerate(arches)], dtype=np.int32
     )
+    N, nq = intensity.shape
+    # Chunk along the frame axis; ~32 frames per chunk is a decent
+    # trade-off between read locality (whole-pattern reads are one
+    # chunk for up to 32 frames) and write granularity (we rewrite
+    # at most one chunk's worth of frames per save).
+    chunks_1d = (min(N, 32), nq)
 
-    # NXdata's signature is (signal, axes, errors, weights, *args, **kwargs)
-    # where signal/axes are NXfield instances.  The library writes the
-    # appropriate @signal and @axes attrs based on the field names.
-    # We attach sigma as a sibling field (named "sigma", not
-    # "intensity_errors" — preserve the established on-disk contract).
-    nxdata = nx.NXdata(
-        signal=nx.NXfield(intensity, name="intensity"),
-        axes=[
-            nx.NXfield(frame_index, name="frame_index"),
-            nx.NXfield(radial, name="q",
-                       units=_q_units(arches[0].int_1d)),
-        ],
+    h5f = _h5(f)
+    g = _ensure_nxdata_group(
+        h5f, f"{entry}/integrated_1d",
+        signal="intensity",
+        axes=["frame_index", "q"],
     )
+    _append_rows(g, "intensity", intensity,
+                 maxshape=(None, nq), chunks=chunks_1d)
+    _write_static_axis(g, "q", radial,
+                       attrs={"units": _q_units(arches[0].int_1d)})
+    _append_rows(g, "frame_index", frame_index,
+                 maxshape=(None,), chunks=(min(N, 32),))
     if sigma is not None:
-        nxdata["sigma"] = nx.NXfield(sigma, name="sigma")
-    _assign_nxgroup(f, f"{entry}/integrated_1d", nxdata)
+        _append_rows(g, "sigma", sigma,
+                     maxshape=(None, nq), chunks=chunks_1d)
 
 
 def _write_integrated_2d(f, sphere, *, entry: str) -> None:
-    """Write ``/entry/integrated_2d`` as an :class:`NXdata` group.
+    """Write/extend ``/entry/integrated_2d`` as an NXdata group.
 
     Per-frame intensity comes in as xdart-shape ``(nq, nchi)``; we
     transpose to ``(nchi, nq)`` so the stacked tensor is
     ``(N, nchi, nq)`` — that ordering matches the ``axes`` attribute
-    ``["frame_index", "chi", "q"]`` exactly, which is what NeXus-aware
-    viewers (DAWN, Mantid) expect for auto-plot.
+    ``["frame_index", "chi", "q"]``.  Resizable datasets keep
+    per-save cost O(new rows).
     """
     arches = list(sphere.arches)
     if not arches:
@@ -312,19 +431,28 @@ def _write_integrated_2d(f, sphere, *, entry: str) -> None:
     frame_index = np.array(
         [getattr(a, "idx", i) for i, a in enumerate(arches)], dtype=np.int32
     )
+    N, nchi, nq = intensity.shape
+    # ~8 frames per chunk for 2D — at e.g. 500×500 f32 that's ~8 MB,
+    # within h5py's recommended single-chunk write size.
+    chunks_2d = (min(N, 8), nchi, nq)
 
-    nxdata = nx.NXdata(
-        signal=nx.NXfield(intensity, name="intensity"),
-        axes=[
-            nx.NXfield(frame_index, name="frame_index"),
-            nx.NXfield(azimuthal, name="chi",
-                       units=getattr(arches[0].int_2d,
-                                     "azimuthal_unit", "deg")),
-            nx.NXfield(radial, name="q",
-                       units=_q_units(arches[0].int_2d)),
-        ],
+    h5f = _h5(f)
+    g = _ensure_nxdata_group(
+        h5f, f"{entry}/integrated_2d",
+        signal="intensity",
+        axes=["frame_index", "chi", "q"],
     )
-    _assign_nxgroup(f, f"{entry}/integrated_2d", nxdata)
+    _append_rows(g, "intensity", intensity,
+                 maxshape=(None, nchi, nq), chunks=chunks_2d)
+    _write_static_axis(g, "q", radial,
+                       attrs={"units": _q_units(arches[0].int_2d)})
+    _write_static_axis(
+        g, "chi", azimuthal,
+        attrs={"units": getattr(arches[0].int_2d,
+                                "azimuthal_unit", "deg")},
+    )
+    _append_rows(g, "frame_index", frame_index,
+                 maxshape=(None,), chunks=(min(N, 32),))
 
 
 def _write_per_frame_metadata(f, sphere, *, entry: str) -> None:
@@ -339,9 +467,12 @@ def _write_per_frame_metadata(f, sphere, *, entry: str) -> None:
                 timestamp          str, optional
                 source_ref/        NXcollection, optional
 
-    The frame index is taken from ``arch.idx`` so re-runs that re-use
-    the same arch ids overwrite their per-frame groups in place; new
-    ids extend the collection without touching the existing entries.
+    Performance note: per-frame groups are *append-only* during a
+    scan — once a frame's thumbnail/metadata is on disk, it doesn't
+    change.  We skip frames whose group already exists in the file,
+    so subsequent saves are O(new frames) rather than O(total frames).
+    The big win on long scans: a single-frame incremental save touches
+    one tiny NXcollection instead of N of them.
     """
     arches = list(sphere.arches)
     if not arches:
@@ -356,13 +487,21 @@ def _write_per_frame_metadata(f, sphere, *, entry: str) -> None:
         f[frames_path] = nx.NXcollection()
     frames = f[frames_path]
 
+    # Use the underlying h5py group for the existence check.  nx's
+    # in-memory tree may not have refreshed since the last save, but
+    # h5py reads off the open file directly — authoritative.
+    h5_frames = _h5(f)[frames_path]
+
     for arch in arches:
         idx = getattr(arch, "idx", arches.index(arch))
         frame_key = f"frame_{idx:04d}"
 
-        # Build a fresh per-frame NXcollection so an arch that's been
-        # re-integrated (different thumbnail/timestamp/...) doesn't
-        # leave stale fields behind from the previous write.
+        # Skip frames that are already persisted — their per-frame
+        # data is immutable post-integration.
+        if frame_key in h5_frames:
+            continue
+
+        # Build a fresh per-frame NXcollection for new frames.
         fg = nx.NXcollection()
 
         thumb = getattr(arch, "thumbnail", None)
@@ -376,10 +515,12 @@ def _write_per_frame_metadata(f, sphere, *, entry: str) -> None:
                 attrs={"vmin": lut[0], "vmax": lut[1], "dtype": lut[2]},
             )
 
-        map_raw = (getattr(arch, "map_raw_thumb", None)
-                   or getattr(arch, "map_raw", None))
-        if isinstance(map_raw, np.ndarray) and map_raw.ndim == 2:
-            fg["map_raw"] = nx.NXfield(map_raw.astype(np.float32))
+        # NOTE: per the v2 schema (module docstring §2), per-frame
+        # groups carry *only* metadata + thumbnail — never the full
+        # raw image.  An earlier version of this helper wrote
+        # arch.map_raw verbatim, which silently dumped 18 MB per
+        # Eiger frame into the .nxs (a ~150 ms HDF5 write each, the
+        # dominant cost in [SAVE] timing).  Don't bring that back.
 
         src = getattr(arch, "source_ref", None)
         if isinstance(src, dict):
@@ -392,9 +533,6 @@ def _write_per_frame_metadata(f, sphere, *, entry: str) -> None:
         if ts is not None:
             fg["timestamp"] = nx.NXfield(str(ts))
 
-        # Replace any existing per-frame group (idempotent rewrite).
-        if frame_key in frames:
-            del frames[frame_key]
         frames[frame_key] = fg
 
 
@@ -528,19 +666,51 @@ def _write_per_frame_geometry(f, sphere, *, entry: str) -> None:
     _assign_nxgroup(f, f"{entry}/per_frame_geometry", coll)
 
 
-def _write_instrument(h5f, sphere, *, entry: str) -> None:
-    """Write PONI / wavelength / energy + detector basics + mask."""
-    instr = h5f.require_group(f"{entry}/instrument")
-    instr.attrs["NX_class"] = "NXinstrument"
+def _write_instrument(f, sphere, *, entry: str) -> None:
+    """Write :class:`NXinstrument` with :class:`NXsource` + :class:`NXdetector`.
 
+    Coexists carefully with :func:`_write_positioners`, which may have
+    already created ``/entry/instrument`` and ``/entry/instrument/
+    detector``.  We don't replace those groups — we either create them
+    if missing, or just stamp attrs and append child fields.  Replacing
+    them would clobber the positioners we just wrote.
+
+    Layout::
+
+        /entry/instrument/              NXinstrument
+            source/                     NXsource
+                wavelength_A            float, scalar
+            detector/                   NXdetector
+                dist, poni1, poni2,     float, scalar (pyFAI geometry)
+                  rot1, rot2, rot3
+                mask                    int64 (N,)  flat pixel indices
+                  @description
+                positioners/            NXcollection (written by
+                                        _write_positioners; preserved
+                                        across rewrites)
+    """
+    # ── /entry/instrument (NXinstrument) ──────────────────────────
+    instr_path = f"{entry}/instrument"
+    if instr_path not in f:
+        f[instr_path] = nx.NXinstrument()
+    f[instr_path].attrs["NX_class"] = "NXinstrument"
+    instr = f[instr_path]
+
+    # ── source (NXsource) ─────────────────────────────────────────
     wavelength = sphere.mg_args.get("wavelength")
     if wavelength is not None:
-        src = instr.require_group("source")
-        src.attrs["NX_class"] = "NXsource"
-        _replace_ds(src, "wavelength_A", float(wavelength) * 1e10)
+        src = nx.NXsource()
+        src["wavelength_A"] = nx.NXfield(float(wavelength) * 1e10)
+        if "source" in instr:
+            del instr["source"]
+        instr["source"] = src
 
-    det = instr.require_group("detector")
-    det.attrs["NX_class"] = "NXdetector"
+    # ── detector (NXdetector) ─────────────────────────────────────
+    det_path = f"{instr_path}/detector"
+    if "detector" not in instr:
+        instr["detector"] = nx.NXdetector()
+    f[det_path].attrs["NX_class"] = "NXdetector"
+    det = f[det_path]
 
     # PONI scalars (when arches exist with a poni attached)
     arches = list(sphere.arches)
@@ -550,7 +720,9 @@ def _write_instrument(h5f, sphere, *, entry: str) -> None:
             for k in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3"):
                 v = getattr(poni, k, None)
                 if v is not None:
-                    _replace_ds(det, k, float(v))
+                    if k in det:
+                        del det[k]
+                    det[k] = nx.NXfield(float(v))
 
     # Global mask — flat indices of masked pixels (detector mask + the
     # user-supplied Mask File, combined via the wrangler).  Stored so
@@ -560,53 +732,69 @@ def _write_instrument(h5f, sphere, *, entry: str) -> None:
     if gmask is not None:
         try:
             arr = np.asarray(gmask, dtype=np.int64)
-            if arr.size > 0:
-                _replace_ds(det, "mask", arr,
-                            attrs={"description": "flat pixel indices, "
-                                   "shape (N,)"})
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            arr = None
+        if arr is not None and arr.size > 0:
+            if "mask" in det:
+                del det["mask"]
+            det["mask"] = nx.NXfield(
+                arr,
+                attrs={"description": "flat pixel indices, shape (N,)"},
+            )
 
 
-def _write_stitched(h5f, sphere, *, entry: str) -> None:
-    """Write /entry/stitched_1d and /stitched_2d if present on sphere."""
+def _write_stitched(f, sphere, *, entry: str) -> None:
+    """Write stitched 1D / 2D outputs as :class:`NXdata` groups.
+
+    Only invoked when ``finalize=True`` is passed to
+    :func:`save_sphere_to_nexus` (typically end-of-scan).  Each
+    stitched result is the combined pattern across all arches in the
+    sphere, produced via ``ssrl_xrd_tools.integrate.multi.stitch_*``.
+
+    Layout::
+
+        /entry/stitched_1d/             NXdata
+            intensity                   float32 (nq,)        @signal
+            q                           float32 (nq,)        @units
+            sigma                       float32 (nq,)        optional
+        /entry/stitched_2d/             NXdata
+            intensity                   float32 (nchi, nq)   @signal
+            q                           float32 (nq,)        @units
+            chi                         float32 (nchi,)      @units
+    """
     s1 = getattr(sphere, "stitched_1d", None)
     if s1 is not None:
-        g = h5f.require_group(f"{entry}/stitched_1d")
-        g.attrs["NX_class"] = "NXdata"
-        _replace_ds(g, "intensity", np.asarray(s1.intensity, dtype=np.float32))
-        _replace_ds(g, "q", np.asarray(s1.radial, dtype=np.float32),
-                    attrs={"units": _q_units(s1)})
+        nxdata = nx.NXdata(
+            signal=nx.NXfield(np.asarray(s1.intensity, dtype=np.float32),
+                              name="intensity"),
+            axes=[nx.NXfield(np.asarray(s1.radial, dtype=np.float32),
+                             name="q", units=_q_units(s1))],
+        )
         if getattr(s1, "sigma", None) is not None:
-            _replace_ds(g, "sigma", np.asarray(s1.sigma, dtype=np.float32))
+            nxdata["sigma"] = nx.NXfield(
+                np.asarray(s1.sigma, dtype=np.float32), name="sigma",
+            )
+        _assign_nxgroup(f, f"{entry}/stitched_1d", nxdata)
 
     s2 = getattr(sphere, "stitched_2d", None)
     if s2 is not None:
-        g = h5f.require_group(f"{entry}/stitched_2d")
-        g.attrs["NX_class"] = "NXdata"
-        _replace_ds(g, "intensity", np.asarray(s2.intensity, dtype=np.float32))
-        _replace_ds(g, "q", np.asarray(s2.radial, dtype=np.float32),
-                    attrs={"units": _q_units(s2)})
-        _replace_ds(g, "chi", np.asarray(s2.azimuthal, dtype=np.float32),
-                    attrs={"units": getattr(s2, "azimuthal_unit", "deg")})
+        nxdata = nx.NXdata(
+            signal=nx.NXfield(np.asarray(s2.intensity, dtype=np.float32),
+                              name="intensity"),
+            axes=[
+                nx.NXfield(np.asarray(s2.azimuthal, dtype=np.float32),
+                           name="chi",
+                           units=getattr(s2, "azimuthal_unit", "deg")),
+                nx.NXfield(np.asarray(s2.radial, dtype=np.float32),
+                           name="q", units=_q_units(s2)),
+            ],
+        )
+        _assign_nxgroup(f, f"{entry}/stitched_2d", nxdata)
 
 
 # ---------------------------------------------------------------------------
 # Low-level utilities
 # ---------------------------------------------------------------------------
-
-def _replace_ds(grp, name: str, data, attrs: Mapping[str, Any] | None = None) -> None:
-    """Idempotent dataset write: delete-if-exists, then create."""
-    if name in grp:
-        del grp[name]
-    if isinstance(data, np.ndarray):
-        ds = grp.create_dataset(name, data=data)
-    else:
-        ds = grp.create_dataset(name, data=data)
-    if attrs:
-        for k, v in attrs.items():
-            ds.attrs[k] = v
-
 
 def _q_units(result) -> str:
     """Pull a ``q`` unit string out of an IntegrationResult, with fallback."""

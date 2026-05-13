@@ -104,6 +104,16 @@ _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
 # spinning-disk source files (16-frame reads finish ~4× sooner).
 _PENDING_FLUSH_SIZE = 16
 
+# How many integrated frames to accumulate between v2 _save_to_nexus
+# calls in **live** (non-batch) mode.  The v2 writer rewrites the full
+# stacked (N, nq) array on every call, so saving per-frame is O(N²) over
+# a scan.  Batching writes amortizes that cost while still letting the
+# GUI update per-frame (the sigUpdate emit + in-memory hand-off happen
+# inside _process_one regardless of the save cadence).  8 strikes a
+# decent balance: ~30 s of live-mode work between saves at 1.5 s/frame,
+# so a crash or stop loses at most a few seconds of integrated data.
+_LIVE_SAVE_INTERVAL = 8
+
 # Number of frames the background prefetch worker is allowed to read
 # ahead of the main collect loop.  Kept small: too large and the prefetcher
 # contends with the h5py writer for disk I/O (source .nxs and output HDF5
@@ -301,6 +311,11 @@ class specThread(wranglerThread):
         # time (integration takes ~1.5s/frame; main thread consumes
         # within ms of sigUpdate firing).
         self._published_arches: dict = {}
+        # In live (non-batch) mode the collect loop dispatches per-frame
+        # for instant GUI feedback, but we still batch v2 file writes
+        # via this counter.  Incremented inside _dispatch_batch_serial;
+        # reset when we actually flush to disk.
+        self._frames_since_save = 0
         # XYE write buffer.  _process_one / _integrate_one stash
         # (img_number, arch) tuples here in lieu of writing the .xye
         # file inline; the batch dispatcher flushes them all at end of
@@ -434,7 +449,8 @@ class specThread(wranglerThread):
 
             _t_r0 = time.time()
             img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
-            _t_read_accum += time.time() - _t_r0
+            _t_read_this = time.time() - _t_r0
+            _t_read_accum += _t_read_this
             if img_data is None:
                 break  # initial glob exhausted — move on to processing
             if img_file is not None:
@@ -477,35 +493,62 @@ class specThread(wranglerThread):
                 continue
 
             bg_raw = self.get_background(img_file, img_number, img_meta)
-            pending.append((img_file, img_number, img_data, img_meta, bg_raw))
+            # Stash the per-frame read time on the tuple so the per-frame
+            # TIMING log can show it (otherwise it gets lumped into the
+            # batch [FLUSH] line and hides per-frame variance).
+            pending.append((img_file, img_number, img_data, img_meta,
+                            bg_raw, _t_read_this))
 
             if self.single_img and not is_eiger:
                 break
 
-            # ── Bounded-memory dispatch ─────────────────────────────────────
-            # Flush when the pending list fills up so that memory stays
-            # bounded on large multi-frame inputs (e.g. 1000-frame .nxs).
-            if len(pending) >= _PENDING_FLUSH_SIZE:
-                self.showLabel.emit(
-                    f'Integrating {len(pending)} frames (partial batch)...'
-                )
+            # ── Dispatch cadence ────────────────────────────────────────────
+            # Batch mode keeps the 16-frame pending buffer so the
+            # ThreadPoolExecutor can integrate them in parallel.
+            # Live (non-batch) mode dispatches immediately so the GUI
+            # sees per-frame updates as soon as each image lands; the
+            # disk save still gets batched separately inside
+            # _dispatch_batch_serial via _frames_since_save.
+            flush_size = _PENDING_FLUSH_SIZE if self.batch_mode else 1
+            if len(pending) >= flush_size:
+                if self.batch_mode:
+                    self.showLabel.emit(
+                        f'Integrating {len(pending)} frames (partial batch)...'
+                    )
                 _t_disp = time.time()
                 files_processed += self._dispatch_batch(sphere, pending)
-                logger.info(
-                    '[FLUSH] %d frames  read=%.2fs  dispatch=%.2fs',
-                    len(pending), _t_read_accum, time.time() - _t_disp,
-                )
+                if self.batch_mode or _t_read_accum >= 0.5:
+                    logger.info(
+                        '[FLUSH] %d frames  read=%.2fs  dispatch=%.2fs',
+                        len(pending), _t_read_accum, time.time() - _t_disp,
+                    )
                 pending = []
                 _t_read_accum = 0.0
 
-        # Process whatever is left
+        # Process whatever is left.  force_save=True so any remaining
+        # _frames_since_save tail in live mode is flushed to disk.
         if pending and sphere is not None and self.command != 'stop':
             _t_disp = time.time()
-            files_processed += self._dispatch_batch(sphere, pending)
+            files_processed += self._dispatch_batch(
+                sphere, pending, force_save=True,
+            )
             logger.info(
                 '[FLUSH-FINAL] %d frames  read=%.2fs  dispatch=%.2fs',
                 len(pending), _t_read_accum, time.time() - _t_disp,
             )
+        elif (sphere is not None and not self.xye_only
+              and self._frames_since_save > 0 and self.command != 'stop'):
+            # Pending was empty but the live-save batcher has unflushed
+            # frames (last batch hit the divisor exactly).  Force a save
+            # before leaving the collect loop.
+            _get_h5pool().pause(sphere.data_file)
+            try:
+                with self.file_lock:
+                    sphere._save_to_nexus()
+            finally:
+                _get_h5pool().resume(sphere.data_file)
+            self._flush_xye_buffer(sphere)
+            self._frames_since_save = 0
 
         # ── Phase 3: live watching ────────────────────────────────────────────
         if self.live_mode and self.command != 'stop' and sphere is not None:
@@ -535,9 +578,34 @@ class specThread(wranglerThread):
                     continue
 
                 bg_raw = self.get_background(img_file, img_number, img_meta)
-                # Process immediately — single-threaded for low latency
+                # Process immediately — single-threaded for low latency.
+                # _process_one uses add_arch(batch_save=True), so the
+                # disk save still rides on _frames_since_save below.
                 self._process_one(sphere, img_file, img_number, img_data, img_meta, bg_raw)
                 files_processed += 1
+                self._frames_since_save += 1
+                if self._frames_since_save >= _LIVE_SAVE_INTERVAL and not self.xye_only:
+                    _get_h5pool().pause(sphere.data_file)
+                    try:
+                        with self.file_lock:
+                            sphere._save_to_nexus()
+                    finally:
+                        _get_h5pool().resume(sphere.data_file)
+                    self._flush_xye_buffer(sphere)
+                    self._frames_since_save = 0
+
+        # Final flush on exit (live-watch tail or stop request) so the
+        # last few frames aren't lost.
+        if (sphere is not None and not self.xye_only
+                and self._frames_since_save > 0):
+            _get_h5pool().pause(sphere.data_file)
+            try:
+                with self.file_lock:
+                    sphere._save_to_nexus()
+            finally:
+                _get_h5pool().resume(sphere.data_file)
+            self._flush_xye_buffer(sphere)
+            self._frames_since_save = 0
 
         # In batch mode, emit a single final signal so the GUI can refresh
         if self.batch_mode and files_processed > 0:
@@ -546,11 +614,16 @@ class specThread(wranglerThread):
 
     # ── Batch dispatch ────────────────────────────────────────────────────────
 
-    def _dispatch_batch(self, sphere, pending):
-        """Process a list of pending images — parallel in batch mode, serial otherwise."""
+    def _dispatch_batch(self, sphere, pending, *, force_save=False):
+        """Process a list of pending images — parallel in batch mode, serial otherwise.
+
+        ``force_save`` only affects the serial path (live mode); the
+        parallel path always saves at end of batch by construction
+        (the whole point of batch mode is one big save per dispatch).
+        """
         if self.batch_mode and len(pending) > 1:
             return self._dispatch_batch_parallel(sphere, pending)
-        return self._dispatch_batch_serial(sphere, pending)
+        return self._dispatch_batch_serial(sphere, pending, force_save=force_save)
 
     def _flush_xye_buffer(self, sphere):
         """Write all buffered XYE files in one pass.
@@ -571,27 +644,48 @@ class specThread(wranglerThread):
             except Exception as e:
                 logger.warning('XYE write failed for frame %s: %s', img_number, e)
 
-    def _dispatch_batch_serial(self, sphere, pending):
-        """Sequential fallback (live mode or single-image batches)."""
+    def _dispatch_batch_serial(self, sphere, pending, *, force_save=False):
+        """Sequential dispatch (live mode or single-image batches).
+
+        Each frame in ``pending`` gets integrated + GUI-updated
+        immediately (via ``_process_one``).  The v2 file save runs
+        *only* when at least :data:`_LIVE_SAVE_INTERVAL` frames have
+        accumulated since the last save, or when ``force_save=True``
+        (used by the final-flush path and by the live-watch tail).
+        That keeps per-frame stalls off the integration loop while
+        bounding scan-state loss on a crash to ~8 frames.
+        """
         count = 0
         for item in pending:
             if self.command == 'stop':
                 break
+            # item is (img_file, img_number, img_data, img_meta, bg_raw, t_read)
             self._process_one(sphere, *item)
             count += 1
-        # v2 writer is idempotent — slice-assigns to preallocated stacked
-        # arrays per batch, no per-frame resize-append cost.  Writer
-        # owns its file handle now, so we only hold the pause +
-        # file_lock around the call.
-        if count > 0 and not self.xye_only:
+
+        self._frames_since_save += count
+
+        should_save = (
+            not self.xye_only
+            and (force_save or self._frames_since_save >= _LIVE_SAVE_INTERVAL)
+        )
+        if should_save and self._frames_since_save > 0:
+            _t_save0 = time.time()
             _get_h5pool().pause(sphere.data_file)
             try:
                 with self.file_lock:
                     sphere._save_to_nexus()
             finally:
                 _get_h5pool().resume(sphere.data_file)
-        # Flush buffered XYE writes for this batch.
-        self._flush_xye_buffer(sphere)
+            _t_save = time.time() - _t_save0
+            _t_xye0 = time.time()
+            self._flush_xye_buffer(sphere)
+            _t_xye = time.time() - _t_xye0
+            logger.info(
+                '[SAVE] %d frames since last save  save=%.3fs  xye=%.3fs',
+                self._frames_since_save, _t_save, _t_xye,
+            )
+            self._frames_since_save = 0
         return count
 
     def _dispatch_batch_parallel(self, sphere, pending):
@@ -620,8 +714,14 @@ class specThread(wranglerThread):
         series_average = self.series_average
         apply_threshold = self.apply_threshold
 
-        def _integrate_one(img_file, img_number, img_data, img_meta, bg_raw):
-            """Pure integration + xye write — no shared mutable state."""
+        def _integrate_one(img_file, img_number, img_data, img_meta, bg_raw,
+                           t_read=0.0):
+            """Pure integration + xye write — no shared mutable state.
+
+            ``t_read`` is accepted for tuple-shape compatibility with
+            _process_one but isn't surfaced — parallel batch mode logs
+            its read times via the per-batch [FLUSH] line.
+            """
             _t0 = time.time()
             threshold_mask = None if not apply_threshold else self.threshold(img_data)
             arch = EwaldArch(
@@ -757,8 +857,16 @@ class specThread(wranglerThread):
 
         return len(arches)
 
-    def _process_one(self, sphere, img_file, img_number, img_data, img_meta, bg_raw):
-        """Integrate one image sequentially and save. Includes timing instrumentation."""
+    def _process_one(self, sphere, img_file, img_number, img_data, img_meta,
+                     bg_raw, t_read=0.0):
+        """Integrate one image sequentially and save. Includes timing instrumentation.
+
+        ``t_read`` is the per-frame wall-clock time spent reading the
+        image off disk (or off the prefetch queue) — measured by the
+        collect loop and threaded through so the [TIMING] line shows
+        per-frame variance.  Defaults to 0 for callers that don't
+        track it (the live-watch loop reads via a different path).
+        """
         fname = os.path.splitext(os.path.basename(img_file))[0]
         self.showLabel.emit(f'Processing {self._middle_truncate(fname)}')
 
@@ -852,11 +960,15 @@ class specThread(wranglerThread):
             self._xye_buffer.append((img_number, arch))
         _t_csv = time.time() - _t5
 
-        _t_total = _t_arch + _t_1d + _t_2d + _t_h5_total + _t_csv
+        _t_total = t_read + _t_arch + _t_1d + _t_2d + _t_h5_total + _t_csv
+        # 3-decimal precision so sub-10ms components (in-memory add_arch,
+        # XYE buffer append) actually show up instead of rounding to 0.00.
         logger.info(
-            '[TIMING] image_%04d: arch_init=%.2fs int_1d=%.2fs int_2d=%.2fs '
-            'h5_lock_wait=%.2fs h5_write=%.2fs csv=%.2fs total=%.2fs',
-            img_number, _t_arch, _t_1d, _t_2d, _t_h5_wait, _t_h5_write, _t_csv, _t_total
+            '[TIMING] image_%04d: read=%.3fs arch_init=%.3fs '
+            'int_1d=%.3fs int_2d=%.3fs add_arch=%.3fs csv=%.3fs '
+            'total=%.3fs',
+            img_number, t_read, _t_arch, _t_1d, _t_2d,
+            _t_h5_total, _t_csv, _t_total,
         )
         _ext = Path(img_file).suffix.lower()
         if _ext in ('.h5', '.hdf5', '.nxs'):

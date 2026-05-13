@@ -162,6 +162,45 @@ def written_nxs(tmp_path):
 
 
 @pytest.fixture
+def written_nxs_with_stitched(tmp_path):
+    """4-frame sphere whose ``stitched_1d``/``stitched_2d`` are populated.
+
+    Exercises the ``finalize=True`` path of
+    :func:`save_sphere_to_nexus`, which writes the stitched outputs
+    only on the final save of the scan.
+    """
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+
+    nq, nchi = 64, 24
+    s1 = _DuckResult1D(
+        radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
+        intensity=np.random.default_rng(7).random(nq, dtype=np.float32),
+        sigma=np.full(nq, 0.05, dtype=np.float32),
+    )
+    s2 = _DuckResult2D(
+        radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
+        azimuthal=np.linspace(-180, 180, nchi, endpoint=False,
+                              dtype=np.float32),
+        # Stitched 2D intensity is stored in the natural (nchi, nq) shape
+        # (no transpose); this matches how stitch_2d returns its result.
+        intensity=np.random.default_rng(8).random((nchi, nq), dtype=np.float32),
+    )
+
+    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    sphere = _DuckSphere(
+        arches,
+        scan_data=pd.DataFrame({"tth": np.linspace(10, 14, N_FRAMES,
+                                                   dtype=np.float32)}),
+    )
+    sphere.stitched_1d = s1
+    sphere.stitched_2d = s2
+
+    path = tmp_path / "stitched.nxs"
+    save_sphere_to_nexus(sphere, path, mode="w", finalize=True)
+    return path, nq, nchi
+
+
+@pytest.fixture
 def written_nxs_with_geometry(tmp_path):
     """4-frame sphere WITH a DiffractometerGeometry attached.
 
@@ -337,6 +376,30 @@ def test_per_frame_geometry(written_nxs_with_geometry):
         assert k in g
         assert g[k].shape == (N_FRAMES,)
         assert g[k].attrs.get("units") == "rad"
+
+
+def test_stitched_outputs(written_nxs_with_stitched):
+    """``finalize=True`` writes ``stitched_1d`` / ``stitched_2d`` as
+    NXdata with the same signal/axes conventions as their per-frame
+    siblings (intensity signal; q on the 1D axis; chi+q on 2D).
+    """
+    path, nq, nchi = written_nxs_with_stitched
+    root = nx.nxload(str(path))
+    e = root["entry"]
+
+    s1 = e["stitched_1d"]
+    assert s1.nxclass == "NXdata"
+    assert s1["intensity"].shape == (nq,)
+    assert s1["q"].shape == (nq,)
+    assert s1["q"].attrs.get("units") in ("1/angstrom", "1/nm")
+    assert s1["sigma"].shape == (nq,)
+
+    s2 = e["stitched_2d"]
+    assert s2.nxclass == "NXdata"
+    assert s2["intensity"].shape == (nchi, nq)
+    assert s2["q"].shape == (nq,)
+    assert s2["chi"].shape == (nchi,)
+    assert s2["chi"].attrs.get("units") in ("deg", "rad")
 
 
 def test_h5py_layout_is_idempotent(tmp_path):

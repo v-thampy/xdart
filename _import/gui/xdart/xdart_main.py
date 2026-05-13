@@ -23,9 +23,25 @@ os.environ['MPLBACKEND'] = 'QtAgg'
 import matplotlib
 matplotlib.use('QtAgg')
 
+# Default root logging level — INFO is what every wrangler log line
+# currently uses, so basicConfig(INFO) is enough to surface them.
+# The DEBUG line below opts specific loggers into more verbose output;
+# the basicConfig must happen first so the handler's threshold is open.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s:%(name)s:%(message)s',
+)
+
 # Suppress pyFAI INFO logs (e.g. "No sensor configuration provided").
 logging.getLogger('pyFAI').setLevel(logging.WARNING)
 logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
+
+# Per-section save timing — emits one DEBUG line per section helper
+# (entry, reduction, integrated_1d, integrated_2d, per_frame_metadata,
+# positioners, per_frame_geometry, instrument, stitched, close+TOTAL)
+# each time the v2 writer runs.  Useful for finding which section is
+# slow on long scans; harmless overhead otherwise.
+logging.getLogger('xdart.modules.ewald.nexus_writer').setLevel(logging.DEBUG)
 
 logger = logging.getLogger(__name__)
 
