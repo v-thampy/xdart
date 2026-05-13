@@ -9,7 +9,11 @@ Performance shape (post-P3A refactor 2026-05-13):
 
 * **Bulk HDF5 reads** — frames are read in ``_READ_CHUNK``-sized
   slices (``ds[a:b]``), so HDF5 chunk decompression happens once per
-  N frames rather than N times for the same chunk.
+  N frames rather than N times for the same chunk.  Reads go through
+  :class:`ssrl_xrd_tools.io.nexus.NexusImageStack`, which exposes a
+  single (N, H, W) logical view across either a single 3D dataset or
+  an Eiger master's sibling ``data_NNNNNN`` external links — chunked
+  reads cross file boundaries seamlessly.
 * **Parallel integration** — within each chunk, integration is
   dispatched to a ``ThreadPoolExecutor`` backed by a per-scan
   :class:`IntegratorPool` (one pyFAI integrator per worker — pyFAI's
@@ -17,10 +21,21 @@ Performance shape (post-P3A refactor 2026-05-13):
   instance; see xdart.utils.integrator_pool).
 * **Periodic saves** — disk writes are batched every
   ``_LIVE_SAVE_INTERVAL`` frames so the v2 NeXus writer's per-flush
-  cost amortises across the scan.
+  cost amortises across the scan.  Skipped entirely under
+  ``xye_only`` mode (Int 1D (XYE)).
+* **Per-chunk XYE flush** — XYE files are buffered inside the worker
+  and flushed once per chunk by ``_flush_xye_buffer`` (inherited from
+  wranglerThread).  Buffering keeps the worker thread cheap and
+  groups disk traffic so it doesn't interleave with the next chunk's
+  integration.  Per-frame XYE export happens in **every** mode
+  (Int 1D + 2D, Int 1D, Int 1D (XYE)).
 * **GI mode safe** — the fiber integrator is cached on the sphere
   **before** the parallel section starts (using frame 0 to compute
   the incident angle), so workers only read it.
+* **1D-only mode** — set ``sphere.skip_2d = True`` to bypass 2D
+  integration entirely (faster on large detectors).  Set
+  ``self.xye_only = True`` (in addition) to also bypass the .nxs
+  writer and produce XYE files only.
 
 @author: thampy
 """
@@ -34,9 +49,6 @@ from pathlib import Path
 
 import numpy as np
 
-# HDF5
-import h5py
-
 # Qt imports
 from pyqtgraph import Qt
 
@@ -44,7 +56,7 @@ from pyqtgraph import Qt
 from xdart.modules.ewald import EwaldArch, EwaldSphere
 from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
-from ssrl_xrd_tools.io.nexus import find_nexus_image_dataset, read_nexus
+from ssrl_xrd_tools.io.nexus import open_nexus_image_stack, read_nexus
 from ssrl_xrd_tools.io.image import read_image
 from ssrl_xrd_tools.io.export import write_xye
 from xdart.utils.h5pool import get_pool as _get_h5pool
@@ -158,12 +170,6 @@ class nexusThread(wranglerThread):
             self.sphere.bai_1d_args['gi_mode_1d'] = self.gi_mode_1d
             self.sphere.bai_2d_args['gi_mode_2d'] = self.gi_mode_2d
 
-        # Find the image dataset in the NeXus file
-        img_ds_path = find_nexus_image_dataset(self.nexus_file, self.entry)
-        if img_ds_path is None:
-            self.showLabel.emit('No image dataset found in NeXus file')
-            return
-
         # Read scan-level metadata once (counters/angles per-frame
         # arrays).  Per-frame slicing happens later.
         try:
@@ -192,11 +198,23 @@ class nexusThread(wranglerThread):
         )
 
         files_processed = 0
-        with h5py.File(self.nexus_file, 'r') as h5f:
-            ds = h5f[img_ds_path]
+        # ``open_nexus_image_stack`` transparently handles two layouts:
+        #   • single 3D dataset (e.g. /entry/instrument/detector/data)
+        #   • Eiger master with sibling external links
+        #     /entry/data/data_NNNNNN → individual _data_*.h5 files.
+        # The proxy exposes the full scan as one (N, H, W) slice-able
+        # object, so chunked reads can cross file boundaries.
+        try:
+            ds_cm = open_nexus_image_stack(self.nexus_file, self.entry)
+        except (KeyError, FileNotFoundError) as exc:
+            self.showLabel.emit(f'No image dataset found in NeXus file: {exc}')
+            return
+        with ds_cm as ds:
             nframes = ds.shape[0]
+            n_segments = ds.n_segments
             self.showLabel.emit(
                 f'Found {nframes} frames in {Path(self.nexus_file).name}'
+                + (f' ({n_segments} data files)' if n_segments > 1 else '')
             )
 
             # ── Pre-warm GI fiber integrator BEFORE the parallel
@@ -273,26 +291,42 @@ class nexusThread(wranglerThread):
                     files_processed += 1
                     frames_since_save += 1
 
+                # ── Per-chunk XYE flush ─────────────────────────────
+                # Drain the XYE buffer once per chunk — keeps disk I/O
+                # batched and prevents the buffer from growing without
+                # bound on long scans.  Inherited ``_flush_xye_buffer``
+                # is a no-op when the buffer is empty (e.g. on Int 2D
+                # mode would be — but we always populate it).
+                _t_xye = time.time()
+                self._flush_xye_buffer(sphere)
+                _t_xye = time.time() - _t_xye
+
                 logger.info(
                     '[NEXUS-BATCH] frames %d-%d  read=%.3fs  '
-                    'integrate=%.3fs  total=%.3fs',
+                    'integrate=%.3fs  xye=%.3fs  total=%.3fs',
                     chunk_start, chunk_end - 1, _t_read, _t_phase1,
-                    _t_read + _t_phase1,
+                    _t_xye, _t_read + _t_phase1 + _t_xye,
                 )
 
-                # ── Periodic save ───────────────────────────────────
+                # ── Periodic .nxs save ──────────────────────────────
                 # ``LIVE_SAVE_INTERVAL`` (inherited from
                 # wranglerThread) is checked at chunk boundaries —
                 # not frame boundaries; the v2 writer's per-flush
                 # cost is ~30 ms regardless, so the granularity is
-                # close enough.
-                if frames_since_save >= self.LIVE_SAVE_INTERVAL:
+                # close enough.  Skipped entirely in xye_only mode
+                # (the inherited ``_save_to_disk`` is also a no-op
+                # under xye_only, but we short-circuit here too so
+                # the chunk loop reads clean).
+                if (not self.xye_only
+                        and frames_since_save >= self.LIVE_SAVE_INTERVAL):
                     self._save_to_disk(sphere)
                     frames_since_save = 0
 
         # Final save: write everything coherent + provenance + finalize
-        # (last call of the scan).
-        if files_processed > 0 and self.command != 'stop':
+        # (last call of the scan).  Skipped under xye_only — that mode
+        # exists precisely to bypass the .nxs altogether.
+        if (files_processed > 0 and self.command != 'stop'
+                and not self.xye_only):
             _get_h5pool().pause(sphere.data_file)
             try:
                 with self.file_lock:
@@ -426,6 +460,16 @@ class nexusThread(wranglerThread):
         # NeXus frames already live in the source — don't double-store
         # them in the output .nxs.
         arch.skip_map_raw = True
+
+        # Buffer the XYE write — flushed at end of each chunk by the
+        # main loop.  Mirrors the specThread pattern; keeps the worker
+        # thread cheap and groups disk traffic so it doesn't interleave
+        # with the next chunk's integration.  The flush itself respects
+        # ``xye_only`` mode (see ``_flush_xye_buffer``); the buffer is
+        # populated unconditionally because we always want per-frame
+        # XYE files in Int 1D / Int 1D + 2D / Int 1D (XYE) modes.
+        with self._xye_lock:
+            self._xye_buffer.append((frame_idx, arch))
 
         logger.debug(
             '[NEXUS] frame_%04d integrated in %.3fs',
