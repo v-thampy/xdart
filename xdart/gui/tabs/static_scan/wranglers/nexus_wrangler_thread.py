@@ -44,7 +44,6 @@ Performance shape (post-P3A refactor 2026-05-13):
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -261,21 +260,24 @@ class nexusThread(wranglerThread):
                     ))
 
                 # ── Parallel integration ────────────────────────────
-                # ThreadPoolExecutor + integrator pool: each worker
-                # borrows its own integrator copy, so the CSR LUT
-                # cache stays valid across concurrent calls.
+                # Shared base helper (_parallel_integrate) handles the
+                # ThreadPoolExecutor + error-collection + idx-sort.
+                # Each worker borrows its own integrator from the pool,
+                # so pyFAI's CSR LUT cache stays valid across
+                # concurrent calls.
                 self.showLabel.emit(
                     f'Integrating frames {chunk_start+1}-{chunk_end}'
                     f'/{nframes} ({n_workers} workers)'
                 )
                 _t_phase1 = time.time()
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    arches = list(pool.map(
-                        lambda item: self._integrate_one(
-                            sphere, integrator_pool, *item,
-                        ),
-                        items,
-                    ))
+                arches = self._parallel_integrate(
+                    items,
+                    lambda item: self._integrate_one(
+                        sphere, integrator_pool, *item,
+                    ),
+                    n_workers,
+                    label='NEXUS',
+                )
                 _t_phase1 = time.time() - _t_phase1
 
                 # ── Serial accumulation into the sphere ─────────────
@@ -367,8 +369,14 @@ class nexusThread(wranglerThread):
             for k, v in scan_meta.angles.items():
                 if frame_idx < len(v):
                     meta[k] = float(v[frame_idx])
-        except Exception:
-            pass
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
+            # AttributeError: scan_meta missing counters/angles attr.
+            # TypeError/ValueError: counter array contains non-numeric.
+            # KeyError: shouldn't happen but be defensive on dict-like.
+            # Any of these falls back to base_meta — already populated.
+            logger.debug(
+                "frame_meta lookup failed for frame %s: %s", frame_idx, e,
+            )
         return meta
 
     def _prewarm_fiber_integrator(self, sphere, first_frame, base_meta):
@@ -511,21 +519,19 @@ class nexusThread(wranglerThread):
         return arch
 
     def _publish(self, sphere, arch):
-        """Push the integrated arch into sphere + GUI display state.
+        """Push the integrated arch into sphere + the publish slot.
 
         Runs on the main thread after the parallel section so
-        ``sphere.add_arch`` and the per-frame data dict updates are
-        serialised — sphere isn't thread-safe for concurrent writes.
+        ``sphere.add_arch`` is serialised — sphere isn't thread-safe
+        for concurrent writes.
+
+        After D1 (unified handoff): we no longer write
+        ``self.data_1d``/``self.data_2d`` directly.  Instead we leave
+        the arch in ``self._published_arches[arch.idx]`` and emit
+        ``sigUpdate``; ``static_scan_widget.update_data`` pops it and
+        owns the dict updates + bounded eviction.  Same single
+        source-of-truth contract that specThread's live path uses.
         """
-        self.data_1d[arch.idx] = arch.copy(include_2d=False)
-        self.data_2d[arch.idx] = {
-            'map_raw': arch.map_raw,
-            'bg_raw': arch.bg_raw,
-            'mask': arch.mask,
-            'int_2d': arch.int_2d,
-            'gi_2d': arch.gi_2d,
-            'thumbnail': None,
-        }
         # In-memory accumulate only — the chunked flush at the end of
         # the dispatch loop (and the final ``save_to_nexus(finalize=True)``
         # at the bottom of ``run()``) handle persistence.
@@ -535,6 +541,9 @@ class nexusThread(wranglerThread):
             th_mtr=self.th_mtr, series_average=False,
             batch_save=True,
         )
+        # Publish for the GUI's update_data slot to consume.  Single
+        # write site for the dict round-trip.
+        self._published_arches[arch.idx] = arch
 
     # ``_save_to_disk`` is inherited from wranglerThread.  Called
     # from the chunk loop every LIVE_SAVE_INTERVAL frames so the

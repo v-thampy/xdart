@@ -334,3 +334,54 @@ class wranglerThread(Qt.QtCore.QThread):
                 sphere._save_to_nexus()
         finally:
             _get_h5pool().resume(sphere.data_file)
+
+    def _parallel_integrate(self, items, integrate_fn, n_workers,
+                             *, label="integration"):
+        """Run ``integrate_fn`` over ``items`` in a ThreadPoolExecutor.
+
+        D2 starter: pulls the parallel-integration boilerplate out of
+        both wranglers' inner loops so they share a single dispatch
+        primitive.  Each wrangler still owns its own per-item
+        ``integrate_fn`` (signatures differ) and its own post-publish
+        / save / xye logic; only the pool wiring is shared.
+
+        Behavior:
+          * Submits one future per item.
+          * Honours :attr:`command` == ``'stop'``: drains in-flight
+            results but stops submitting once a stop is requested.
+          * Per-item exceptions are logged at error level and the
+            corresponding arch is dropped (returns ``None`` slot
+            elided from the result list).
+          * Returns arches in idx-sorted order so on-disk frame_index
+            datasets stay monotonic.
+
+        Returns a ``list[EwaldArch]`` with ``None`` entries elided.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if not items:
+            return []
+
+        completed: list = []
+        with ThreadPoolExecutor(max_workers=max(1, int(n_workers))) as pool:
+            futures = []
+            for item in items:
+                if self.command == 'stop':
+                    break
+                futures.append(pool.submit(integrate_fn, item))
+            for fut in as_completed(futures):
+                try:
+                    arch = fut.result()
+                except Exception as e:
+                    logger.error(
+                        '[%s] worker raised: %s', label, e, exc_info=True,
+                    )
+                    continue
+                if arch is None:
+                    continue
+                completed.append(arch)
+        # Order by frame idx — the writer's stacked datasets index
+        # by frame_index, but on-disk row order should still match
+        # acquisition order so reload + slice-by-position make sense.
+        completed.sort(key=lambda a: getattr(a, 'idx', 0) or 0)
+        return completed

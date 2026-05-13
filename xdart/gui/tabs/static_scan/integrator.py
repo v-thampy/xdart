@@ -932,20 +932,25 @@ class integratorTree(QtWidgets.QWidget):
 
     def _block_if_reload_only_frames(self, dim_label: str) -> bool:
         """R3 guardrail.  Abort re-integration with a status message when
-        any of the sphere's arches lacks a raw image.
+        any of the sphere's arches lacks a raw image AND no resolvable
+        source file.
 
-        ``EwaldArch.integrate_1d`` / ``integrate_2d`` silently no-op
-        when ``self.map_raw is None`` — which is the common case for
-        a sphere reloaded from a v2 .nxs (we don't persist raw frames
-        in v2 to save disk).  Without this block, the user would
-        click "Re-integrate", see the buttons grey out for a moment,
-        then nothing on disk would change and no error would surface.
+        After L1 wired lazy raw load, ``EwaldArch.integrate_*``
+        auto-loads ``map_raw`` from ``arch.source_file`` /
+        ``arch.source_frame_idx`` when it's missing — so this guard
+        only fires when the source file has been moved/deleted
+        relative to the .nxs.  See ``EwaldSphere.has_reload_only_frames``
+        for the predicate.
 
         Returns True iff the action was blocked.
         """
         try:
             blocked = self.sphere.has_reload_only_frames()
-        except Exception:
+        except (AttributeError, RuntimeError) as e:
+            # Sphere torn down mid-call, or has_reload_only_frames
+            # itself errored.  Don't block — the integrate path's
+            # own guard will catch a genuinely empty map_raw.
+            logger.debug("reload-only check errored, not blocking: %s", e)
             blocked = False
         if not blocked:
             return False
@@ -954,18 +959,20 @@ class integratorTree(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(
                 self,
                 f'Cannot re-integrate {dim_label}',
-                'This sphere was reloaded from a .nxs file that does '
-                'not carry raw detector images (xdart 0.37+ v2 schema '
-                'stores integrated results only).  Re-integration is '
-                'disabled.\n\nTo re-integrate, re-run the wrangler '
-                'against the original source files.',
+                'This sphere was reloaded from a .nxs file and its '
+                'raw source images can no longer be found '
+                '(arch.source_file did not resolve to an existing '
+                'file).  Re-integration needs the raw frames.\n\n'
+                'Make sure the original detector files are still in '
+                'the location stored in the .nxs, or re-run the '
+                'wrangler from a machine that can see them.',
             )
-        except Exception:
+        except (ImportError, RuntimeError) as e:
             # In a headless test or no-Qt context the message box
             # can't pop — log the block instead.
             logger.warning(
-                'Re-integrate %s blocked: sphere has reload-only frames',
-                dim_label,
+                'Re-integrate %s blocked (no QMessageBox available: %s)',
+                dim_label, e,
             )
         return True
 

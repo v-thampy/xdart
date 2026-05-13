@@ -10,8 +10,11 @@ master files) and a PONI calibration file.
 """
 
 # Standard library imports
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Used to size the Cores spinbox.  os.cpu_count() returns None on
 # exotic platforms; the fallback default mirrors what the SPEC
@@ -260,8 +263,14 @@ class nexusWrangler(wranglerWidget):
                 p.setValue(val)
                 if attr:
                     setattr(self, attr, val)
-            except Exception:
-                pass
+            except (KeyError, AttributeError, ValueError, TypeError) as e:
+                # KeyError: parameter tree was renamed since the session
+                # was saved.  Other types: value-coercion mismatches.
+                # All are non-fatal — the unrestored param just keeps
+                # its default — but we want them visible at debug.
+                logger.debug(
+                    "session restore failed for %s: %s", skey, e,
+                )
 
         # Restore PONI
         poni_file = self.parameters.child('Calibration').child('poni_file').value()
@@ -297,8 +306,12 @@ class nexusWrangler(wranglerWidget):
                 for name in param_path:
                     p = p.child(name)
                 data[skey] = p.value()
-            except Exception:
-                pass
+            except (KeyError, AttributeError) as e:
+                # Missing parameter tree node — surfaces only when the
+                # widget is mid-tear-down or the tree shape changed.
+                logger.debug(
+                    "session save skipped for %s: %s", skey, e,
+                )
         # Persist the Cores spinbox alongside the parameter-tree
         # values — see :meth:`_restore_from_session` for the inverse.
         data['max_cores'] = self.maxCoresSpinBox.value()

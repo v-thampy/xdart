@@ -465,7 +465,7 @@ class specThread(wranglerThread):
                 _cached_poni = self.poni
                 self._cached_gi_incident_angle = None
 
-            if img_number in list(sphere.arches.index):
+            if img_number in sphere.arches.index:
                 if self.single_img and not is_eiger:
                     self.sigUpdate.emit(img_number)
                     break
@@ -569,7 +569,7 @@ class specThread(wranglerThread):
                     _cached_poni = self.poni
                     self._cached_gi_incident_angle = None
 
-                if img_number in list(sphere.arches.index):
+                if img_number in sphere.arches.index:
                     continue
 
                 bg_raw = self.get_background(img_file, img_number, img_meta)
