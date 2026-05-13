@@ -101,6 +101,11 @@ class nexusWrangler(wranglerWidget):
         self.tilt_angle = 0.0
         self.gi_mode_1d = 'q_total'
         self.gi_mode_2d = 'qip_qoop'
+        # Per-mode flags reflected from the processingModeCombo
+        # selection (see :meth:`_on_mode_changed`).  Threaded down to
+        # the worker in :meth:`start` so the user can change mode
+        # between runs without restarting the app.
+        self.xye_only = False
 
         # ── Build UI programmatically ────────────────────────────────
         layout = QtWidgets.QVBoxLayout(self)
@@ -115,7 +120,21 @@ class nexusWrangler(wranglerWidget):
         btn_layout = QtWidgets.QHBoxLayout()
         self.startButton = QtWidgets.QPushButton('Start')
         self.stopButton = QtWidgets.QPushButton('Stop')
-        self.skip2dCheckBox = QtWidgets.QCheckBox('Skip 2D')
+
+        # Processing-mode dropdown — same items as specWrangler so the
+        # two paths feel interchangeable.  Selecting "Int 1D" or
+        # "Int 1D (XYE)" skips 2D integration (faster batches on big
+        # detectors).  "Int 1D (XYE)" also bypasses the HDF5 write
+        # entirely — useful when the user only wants per-frame XYE
+        # files (e.g. handing off to downstream tools that don't read
+        # our .nxs schema).
+        self.modeLabel = QtWidgets.QLabel('Mode:')
+        self.processingModeCombo = QtWidgets.QComboBox()
+        self.processingModeCombo.addItems([
+            'Int 1D + 2D',
+            'Int 1D',
+            'Int 1D (XYE)',
+        ])
 
         # Cores spinbox — controls how many worker threads the
         # nexusThread spawns for parallel batch integration.  Same
@@ -131,16 +150,28 @@ class nexusWrangler(wranglerWidget):
 
         btn_layout.addWidget(self.startButton)
         btn_layout.addWidget(self.stopButton)
-        btn_layout.addWidget(self.skip2dCheckBox)
+        btn_layout.addWidget(self.modeLabel)
+        btn_layout.addWidget(self.processingModeCombo)
         btn_layout.addWidget(self.coresLabel)
         btn_layout.addWidget(self.maxCoresSpinBox)
         layout.addLayout(btn_layout)
 
         self.startButton.clicked.connect(self.start)
         self.stopButton.clicked.connect(self.stop)
-        self.skip2dCheckBox.stateChanged.connect(
-            lambda _: setattr(self.sphere, 'skip_2d', self.skip2dCheckBox.isChecked())
+        # Reflect dropdown choice into sphere.skip_2d + self.xye_only
+        # immediately on selection — the thread reads both before each
+        # frame, so the user can change mode between runs without
+        # restarting xdart.  Save the mode to session so the next
+        # launch reopens in the same configuration.
+        self.processingModeCombo.currentTextChanged.connect(self._on_mode_changed)
+        self.processingModeCombo.currentTextChanged.connect(
+            lambda _: self._save_to_session()
         )
+        # Apply the default selection once now that the signal is
+        # wired up.  Without this, the first run after launch would
+        # see ``sphere.skip_2d`` unchanged from whatever the previous
+        # consumer left it as.
+        self._on_mode_changed(self.processingModeCombo.currentText())
 
         self.stopButton.setEnabled(False)
 
@@ -247,6 +278,16 @@ class nexusWrangler(wranglerWidget):
                         min(cores, self.maxCoresSpinBox.maximum()))
             self.maxCoresSpinBox.setValue(cores)
 
+        # Restore processing mode.  ``findText`` returns -1 if the
+        # saved label no longer exists in the combo (e.g. we renamed
+        # an option), in which case we silently fall back to the
+        # default (index 0).
+        mode = data.get('processing_mode')
+        if isinstance(mode, str):
+            idx = self.processingModeCombo.findText(mode)
+            if idx >= 0:
+                self.processingModeCombo.setCurrentIndex(idx)
+
     def _save_to_session(self):
         """Save parameters to session.json."""
         data = load_session() or {}
@@ -261,7 +302,32 @@ class nexusWrangler(wranglerWidget):
         # Persist the Cores spinbox alongside the parameter-tree
         # values — see :meth:`_restore_from_session` for the inverse.
         data['max_cores'] = self.maxCoresSpinBox.value()
+        data['processing_mode'] = self.processingModeCombo.currentText()
         save_session(data)
+
+    # ── Processing-mode dropdown ─────────────────────────────────────
+
+    def _on_mode_changed(self, mode_text: str) -> None:
+        """Sync sphere/thread flags to the dropdown's current text.
+
+        Mirror of ``specWrangler._on_mode_changed``'s logic, minus the
+        viewer modes (the NeXus wrangler always runs the integration
+        pipeline — it has no separate display-only viewer panel).
+
+        * ``Int 1D + 2D`` → 1D + 2D, save .nxs, write XYE every frame
+        * ``Int 1D``       → 1D only, save .nxs, write XYE every frame
+        * ``Int 1D (XYE)`` → 1D only, **no** .nxs save, XYE only
+        """
+        # ``'1D'`` is the spec-wrangler convention: any mode whose label
+        # contains '1D' (vs '2D') skips 2D integration.  Matches even
+        # if we add new label variants later (e.g. 'Int 1D (cake-XYE)').
+        skip_2d = ('1D' in mode_text) and ('2D' not in mode_text)
+        self.sphere.skip_2d = skip_2d
+        self.xye_only = (mode_text == 'Int 1D (XYE)')
+        # Push down to the thread immediately so a mid-session mode
+        # change picks up on the next run without going through start().
+        if hasattr(self, 'thread') and self.thread is not None:
+            self.thread.xye_only = self.xye_only
 
     # ── Browse dialogs ───────────────────────────────────────────────
 
@@ -376,6 +442,10 @@ class nexusWrangler(wranglerWidget):
         # The thread caches it as ``self.max_cores`` and uses it when
         # building the ThreadPoolExecutor for parallel integration.
         self.thread.max_cores = self.maxCoresSpinBox.value()
+        # Re-sync processing-mode flags onto sphere + thread so a
+        # stale ``thread`` instance (recreated in :meth:`setup` since
+        # the last mode-change signal) sees the latest selection.
+        self._on_mode_changed(self.processingModeCombo.currentText())
         self.startButton.setEnabled(False)
         self.stopButton.setEnabled(True)
         self._save_to_session()
