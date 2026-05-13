@@ -95,9 +95,14 @@ _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
 # a 1000-frame Eiger stack at 2167x2070 int32 ~= 18 GB if collected in
 # one go).  Larger values amortise ThreadPoolExecutor startup and the
 # end-of-batch sphere._save_to_nexus flush across more frames, so raise
-# this when RAM allows.  64 frames of a 2167x2070 int32 Eiger image
-# is ~1.2 GB of peak buffer.
-_PENDING_FLUSH_SIZE = 64
+# this when RAM allows.
+#
+# 16 frames of a 2167x2070 int32 Eiger image is ~300 MB of peak buffer
+# — fits comfortably on a slow-disk laptop while still giving the user
+# visible per-batch UI refreshes every ~25 s at typical 1.5 s/frame
+# integration.  Earlier value of 64 made first-batch latency painful on
+# spinning-disk source files (16-frame reads finish ~4× sooner).
+_PENDING_FLUSH_SIZE = 16
 
 # Number of frames the background prefetch worker is allowed to read
 # ahead of the main collect loop.  Kept small: too large and the prefetcher
@@ -296,6 +301,15 @@ class specThread(wranglerThread):
         # time (integration takes ~1.5s/frame; main thread consumes
         # within ms of sigUpdate firing).
         self._published_arches: dict = {}
+        # XYE write buffer.  _process_one / _integrate_one stash
+        # (img_number, arch) tuples here in lieu of writing the .xye
+        # file inline; the batch dispatcher flushes them all at end of
+        # batch via _flush_xye_buffer().  Keeping writes batched cuts
+        # filesystem syscalls per frame and groups the write phase so
+        # the integration phase isn't interleaved with small-file IO.
+        from threading import Lock
+        self._xye_buffer: list = []
+        self._xye_lock = Lock()
         # Eiger HDF5 lazy frame state
         self._eiger_master_path = None
         self._eiger_frame_idx = 0
@@ -538,6 +552,25 @@ class specThread(wranglerThread):
             return self._dispatch_batch_parallel(sphere, pending)
         return self._dispatch_batch_serial(sphere, pending)
 
+    def _flush_xye_buffer(self, sphere):
+        """Write all buffered XYE files in one pass.
+
+        Buffer is drained under the lock to keep new appends from
+        racing, then we write outside the lock so that further worker
+        threads can keep appending while this batch's IO is in flight.
+        Errors per-frame don't abort the batch — we log and move on.
+        """
+        with self._xye_lock:
+            if not self._xye_buffer:
+                return
+            buf = self._xye_buffer
+            self._xye_buffer = []
+        for img_number, arch in buf:
+            try:
+                self.save_1d(sphere, arch, img_number)
+            except Exception as e:
+                logger.warning('XYE write failed for frame %s: %s', img_number, e)
+
     def _dispatch_batch_serial(self, sphere, pending):
         """Sequential fallback (live mode or single-image batches)."""
         count = 0
@@ -556,6 +589,8 @@ class specThread(wranglerThread):
                         sphere._save_to_nexus(h5f)
             finally:
                 _get_h5pool().resume(sphere.data_file)
+        # Flush buffered XYE writes for this batch.
+        self._flush_xye_buffer(sphere)
         return count
 
     def _dispatch_batch_parallel(self, sphere, pending):
@@ -633,8 +668,12 @@ class specThread(wranglerThread):
                 logger.warning('Thumbnail precompute failed for image %s: %s',
                                img_number, e)
 
-            # XYE / CSV output (thread-safe: unique filenames per frame)
-            self.save_1d(sphere, arch, img_number)
+            # Buffer the XYE write — flushed at end of batch by the
+            # serial dispatcher.  Keeps the worker thread cheap and
+            # groups disk traffic so it doesn't interleave with the
+            # next batch's integration.
+            with self._xye_lock:
+                self._xye_buffer.append((img_number, arch))
 
             _elapsed = time.time() - _t0
             fname = os.path.splitext(os.path.basename(img_file))[0]
@@ -679,37 +718,41 @@ class specThread(wranglerThread):
             _get_h5pool().pause(sphere.data_file)
             try:
                 with self.file_lock:
-                    with _catch_h5(sphere.data_file, 'a') as h5f:
-                        for img_number, arch in arches:
-                            img_file = _img_files.get(img_number, '')
-                            if img_file:
-                                try:
-                                    arch.source_file = os.path.relpath(
-                                        img_file, os.path.dirname(sphere.data_file))
-                                except ValueError:
-                                    arch.source_file = str(img_file)
-                            else:
-                                arch.source_file = ""
-                            arch.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
+                    # Phase 2a: in-memory accumulation only (batch_save=True
+                    # makes add_arch a pure in-memory op; no file I/O).
+                    for img_number, arch in arches:
+                        img_file = _img_files.get(img_number, '')
+                        if img_file:
+                            try:
+                                arch.source_file = os.path.relpath(
+                                    img_file, os.path.dirname(sphere.data_file))
+                            except ValueError:
+                                arch.source_file = str(img_file)
+                        else:
+                            arch.source_file = ""
+                        arch.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
 
-                            sphere.add_arch(
-                                arch=arch, calculate=False, update=True,
-                                get_sd=True, set_mg=False, static=True, gi=gi,
-                                th_mtr=th_mtr, series_average=series_average,
-                                h5file=h5f,
-                                # batch_save defers per-frame v1 writes; v2
-                                # writer is idempotent so this only avoids
-                                # redundant v1 work in add_arch.
-                                batch_save=True,
-                            )
-                    # v2 writer: one stacked-array slice-assign per batch.
-                    # No flush_batch_state needed (was v1-specific).
+                        sphere.add_arch(
+                            arch=arch, calculate=False, update=True,
+                            get_sd=True, set_mg=False, static=True, gi=gi,
+                            th_mtr=th_mtr, series_average=series_average,
+                            batch_save=True,
+                        )
+                    # Phase 2b: single batch flush — one slice-assign per
+                    # stacked dataset for all frames in this batch.
                     with _catch_h5(sphere.data_file, 'a') as h5f2:
                         sphere._save_to_nexus(h5f2)
             finally:
                 _get_h5pool().resume(sphere.data_file)
             _t_phase2 = time.time() - _t_phase2
             logger.info('[BATCH] Phase 2 (HDF5 write): %d frames in %.2fs', len(arches), _t_phase2)
+
+        # Flush buffered XYE writes for this batch.
+        _t_xye = time.time()
+        self._flush_xye_buffer(sphere)
+        _t_xye = time.time() - _t_xye
+        if _t_xye > 0.01:
+            logger.info('[BATCH] XYE flush: %d frames in %.2fs', len(arches), _t_xye)
 
         return len(arches)
 
@@ -775,7 +818,7 @@ class specThread(wranglerThread):
                 'thumbnail': None,
             }
 
-        # ── HDF5 / NeXus output (skip in xye-only mode) ─────────────────
+        # ── In-memory accumulation (no disk I/O — batch flush handles that) ──
         if not self.xye_only:
             # Set source file as relative path from HDF5 dir for NeXus provenance
             if img_file:
@@ -788,28 +831,24 @@ class specThread(wranglerThread):
                 arch.source_file = ""
             # For Eiger: raw frames already live in the master file — don't double-store them.
             arch.skip_map_raw = sphere.skip_2d or _raw_lives_in_source(img_file)
-            # Pause the read pool so h5viewer cannot reopen the file while we write.
-            _get_h5pool().pause(sphere.data_file)
             _t4 = time.time()
-            try:
-                with self.file_lock:
-                    _t4_locked = time.time()
-                    with _catch_h5(sphere.data_file, 'a') as h5f:
-                        sphere.add_arch(
-                            arch=arch, calculate=False, update=True,
-                            get_sd=True, set_mg=False, static=True, gi=self.gi,
-                            th_mtr=self.th_mtr, series_average=self.series_average,
-                            h5file=h5f,
-                        )
-            finally:
-                _get_h5pool().resume(sphere.data_file)
+            # batch_save=True → pure in-memory (stash + index + bai_*).
+            # The serial dispatcher calls sphere._save_to_nexus once at
+            # end-of-batch, so we don't pay per-frame write cost here.
+            sphere.add_arch(
+                arch=arch, calculate=False, update=True,
+                get_sd=True, set_mg=False, static=True, gi=self.gi,
+                th_mtr=self.th_mtr, series_average=self.series_average,
+                batch_save=True,
+            )
             _t_h5_total = time.time() - _t4
-            _t_h5_wait  = _t4_locked - _t4
-            _t_h5_write = _t_h5_total - _t_h5_wait
+            _t_h5_wait = 0.0
+            _t_h5_write = _t_h5_total
 
-        # ── XYE / CSV output (always) ────────────────────────────────────
+        # ── XYE buffer (flushed at end of batch by the dispatcher) ──────
         _t5 = time.time()
-        self.save_1d(sphere, arch, img_number)
+        with self._xye_lock:
+            self._xye_buffer.append((img_number, arch))
         _t_csv = time.time() - _t5
 
         _t_total = _t_arch + _t_1d + _t_2d + _t_h5_total + _t_csv
@@ -1323,8 +1362,7 @@ class specThread(wranglerThread):
         try:
             with self.file_lock:
                 if write_mode == 'Append':
-                    # load_from_h5 auto-detects v1 vs v2 and dispatches
-                    # (see EwaldSphere._is_v2_layout / _load_from_nexus_v2).
+                    # v2 NeXus loader (the only one we support now).
                     sphere.load_from_h5(replace=False, mode='a')
                     sphere.skip_2d = self.sphere.skip_2d
                     for (k, v) in self.sphere_args.items():

@@ -338,7 +338,7 @@ def _write_per_frame_geometry(h5f, sphere, *, entry: str) -> None:
 
 
 def _write_instrument(h5f, sphere, *, entry: str) -> None:
-    """Write PONI / wavelength / energy + detector basics."""
+    """Write PONI / wavelength / energy + detector basics + mask."""
     instr = h5f.require_group(f"{entry}/instrument")
     instr.attrs["NX_class"] = "NXinstrument"
 
@@ -348,19 +348,33 @@ def _write_instrument(h5f, sphere, *, entry: str) -> None:
         src.attrs["NX_class"] = "NXsource"
         _replace_ds(src, "wavelength_A", float(wavelength) * 1e10)
 
-    # Detector / calibration scalars from a representative arch
-    arches = list(sphere.arches)
-    if not arches:
-        return
-    poni = getattr(arches[0], "poni", None)
-    if poni is None:
-        return
     det = instr.require_group("detector")
     det.attrs["NX_class"] = "NXdetector"
-    for k in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3"):
-        v = getattr(poni, k, None)
-        if v is not None:
-            _replace_ds(det, k, float(v))
+
+    # PONI scalars (when arches exist with a poni attached)
+    arches = list(sphere.arches)
+    if arches:
+        poni = getattr(arches[0], "poni", None)
+        if poni is not None:
+            for k in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3"):
+                v = getattr(poni, k, None)
+                if v is not None:
+                    _replace_ds(det, k, float(v))
+
+    # Global mask — flat indices of masked pixels (detector mask + the
+    # user-supplied Mask File, combined via the wrangler).  Stored so
+    # the viewer can overlay the mask without needing the original
+    # mask file alongside the .nxs.
+    gmask = getattr(sphere, "global_mask", None)
+    if gmask is not None:
+        try:
+            arr = np.asarray(gmask, dtype=np.int64)
+            if arr.size > 0:
+                _replace_ds(det, "mask", arr,
+                            attrs={"description": "flat pixel indices, "
+                                   "shape (N,)"})
+        except Exception:
+            pass
 
 
 def _write_stitched(h5f, sphere, *, entry: str) -> None:

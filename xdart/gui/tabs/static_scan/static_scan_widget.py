@@ -16,6 +16,14 @@ import pyFAI
 
 logger = logging.getLogger(__name__)
 
+# Bound the in-memory frame cache so a 1000-frame Eiger scan doesn't
+# pile up ~30 GB of map_raw arrays in h5viewer.data_2d.  When we add a
+# new entry, evict the oldest non-current frame; user-scrolling back to
+# old frames will lazy-load them from disk again via file_thread.
+# Keep large enough that recent frames + the auto-last selection don't
+# thrash; small enough that peak memory stays sane.
+_FRAME_CACHE_MAX = 32
+
 # Qt imports
 from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
@@ -389,6 +397,19 @@ class staticWidget(QWidget):
                             "gi_2d": getattr(arch, "gi_2d", {}),
                             "thumbnail": getattr(arch, "thumbnail", None),
                         }
+                    # ── Bounded LRU-ish eviction ──────────────────────
+                    # Keep peak memory sane on long scans (1000+ frames
+                    # × 30 MB map_raw is otherwise a memory blow-up).
+                    # We evict the oldest entries; if the user scrolls
+                    # back to an evicted frame, file_thread.load_arches
+                    # will lazy-load it from disk on demand.
+                    keep = int(idx)
+                    while len(self.h5viewer.data_2d) > _FRAME_CACHE_MAX:
+                        oldest = next(iter(self.h5viewer.data_2d))
+                        if oldest == keep:
+                            break
+                        self.h5viewer.data_2d.pop(oldest, None)
+                        self.h5viewer.data_1d.pop(oldest, None)
             except Exception:
                 # Cache miss is non-fatal — displayframe will lazy-load
                 # from disk via file_thread.load_arch as fallback.

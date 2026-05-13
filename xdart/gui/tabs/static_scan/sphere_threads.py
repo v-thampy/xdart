@@ -125,7 +125,7 @@ class integratorThread(Qt.QtCore.QThread):
                     try:
                         arch = future.result()
                         self.sphere.arches[arch.idx] = arch
-                        self.sphere._update_bai_2d(arch)
+                        self.sphere._accumulate_bai_2d(arch)
                         with self.data_lock:
                             self.data_2d[int(arch.idx)] = {
                                 'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
@@ -144,7 +144,7 @@ class integratorThread(Qt.QtCore.QThread):
                     arch.gi = True
                 arch.integrate_2d(**self.sphere.bai_2d_args)
                 self.sphere.arches[arch.idx] = arch
-                self.sphere._update_bai_2d(arch)
+                self.sphere._accumulate_bai_2d(arch)
                 with self.data_lock:
                     self.data_2d[int(arch.idx)] = {
                         'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
@@ -182,7 +182,7 @@ class integratorThread(Qt.QtCore.QThread):
                     try:
                         arch = future.result()
                         self.sphere.arches[arch.idx] = arch
-                        self.sphere._update_bai_1d(arch)
+                        self.sphere._accumulate_bai_1d(arch)
                         with self.data_lock:
                             self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
                         self.update.emit(arch.idx)
@@ -198,7 +198,7 @@ class integratorThread(Qt.QtCore.QThread):
                     arch.gi = True
                 arch.integrate_1d(**self.sphere.bai_1d_args)
                 self.sphere.arches[arch.idx] = arch
-                self.sphere._update_bai_1d(arch)
+                self.sphere._accumulate_bai_1d(arch)
                 with self.data_lock:
                     self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
                 self.update.emit(arch.idx)
@@ -324,42 +324,39 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 logger.debug("Failed to load sphere data from HDF5: %s", e)
 
     def load_arch(self):
-        with self.file_lock:
-            with catch(self.sphere.data_file, 'r') as file:
-                self.arch.load_from_nexus(file["entry/frames"])
+        """Load a single arch via the v2 lazy loader (ArchSeries.__getitem__)."""
+        try:
+            self.arch = self.sphere.arches[self.arch.idx]
+        except KeyError as e:
+            logger.debug("load_arch: %s", e)
         self.sigUpdate.emit()
 
     def load_arches(self):
-        with self.file_lock:
-            with catch(self.sphere.data_file, 'r') as file:
-                if "entry" not in file or "frames" not in file["entry"]:
-                    return
-                frames_grp = file["entry/frames"]
+        """Populate data_1d/data_2d caches by lazy-loading arches via v2.
 
-                for idx in self.arch_ids:
-                    try:
-                        arch = EwaldArch(idx=idx, static=True, gi=self.sphere.gi)
-                        arch.load_from_nexus(frames_grp, load_2d=self.update_2d)
-
-                        with self.data_lock:
-                            self.data_1d[int(idx)] = arch.copy(include_2d=False)
-                            if self.update_2d:
-                                self.data_2d[int(idx)] = {
-                                    'map_raw': arch.map_raw,
-                                    'bg_raw': arch.bg_raw,
-                                    'mask': arch.mask,
-                                    'int_2d': arch.int_2d,
-                                    'gi_2d': arch.gi_2d,
-                                }
-                                # Multi-arch combination is computed on
-                                # demand by display_data.get_arches_int_2d
-                                # / get_arches_map_raw — no shared
-                                # accumulator state to update here.
-
-                    except KeyError as e:
-                        logger.debug("Data missing for arch %s during aggregation: %s", idx, e)
-
-            self.sigUpdate.emit()
+        ArchSeries.__getitem__ now reads from the stacked
+        ``entry/integrated_1d`` / ``integrated_2d`` arrays and the
+        per-frame ``frames/frame_NNNN/thumbnail`` group.  No v1 frame
+        groups touched.
+        """
+        for idx in self.arch_ids:
+            try:
+                arch = self.sphere.arches[int(idx)]
+            except (KeyError, IndexError) as e:
+                logger.debug("Data missing for arch %s: %s", idx, e)
+                continue
+            with self.data_lock:
+                self.data_1d[int(idx)] = arch.copy(include_2d=False)
+                if self.update_2d:
+                    self.data_2d[int(idx)] = {
+                        'map_raw': getattr(arch, 'map_raw', None),
+                        'bg_raw': getattr(arch, 'bg_raw', 0),
+                        'mask': getattr(arch, 'mask', None),
+                        'int_2d': getattr(arch, 'int_2d', None),
+                        'gi_2d': getattr(arch, 'gi_2d', {}),
+                        'thumbnail': getattr(arch, 'thumbnail', None),
+                    }
+        self.sigUpdate.emit()
 
     def save_data_as(self):
         if self.new_fname is not None and self.new_fname != "":

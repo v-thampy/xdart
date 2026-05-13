@@ -106,7 +106,7 @@ def make_sphere(calib_path, poni_file, stepsize, user, image_path, spec_path,
     detector = pyFAI.detectors.Detector(172e-6, 172e-6)
     data_file_path = os.path.join(xdart_dir, "tests/test_data/spec_pd100k/test_save.h5")
     sphere = EwaldSphere(data_file=data_file_path)
-    sphere.save_to_h5(replace=True)
+    sphere.save_to_nexus(replace=True)
     poni = PONI.from_poni_file(os.path.join(calib_path, poni_file))
     for k in range(1, len(tth)):
         start = time.time()
@@ -128,7 +128,7 @@ def make_sphere(calib_path, poni_file, stepsize, user, image_path, spec_path,
         times['int'].append(time.time() - start_i)
         start_a = time.time()
         sphere.add_arch(arch.copy(), calculate=False, set_mg=False)
-        sphere.save_to_h5(arches=[k], data_only=True, replace=False)
+        # add_arch itself persists via the v2 writer; no explicit save needed.
         times['add'].append(time.time() - start_a)
         
         times['overall'].append(time.time() - start)
@@ -185,8 +185,8 @@ class TestEwaldSphere(unittest.TestCase):
                                    self.sphere.bai_2d.chi).all())
     
     def test_save(self):
-        self.sphere.save_to_h5(arches=[])
-        self.sphere.save_to_h5(arches=[1], data_only=True, replace=False)
+        self.sphere.save_to_nexus(replace=True)
+        self.sphere.save_to_nexus(replace=False)
     
     def test_bai(self):
         self.sphere.by_arch_integrate_1d(numpoints=18000, monitor='i0', radial_range=[0,180], 
