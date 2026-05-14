@@ -129,23 +129,72 @@ class EwaldSphere:
         L1 wired lazy raw load, an arch's ``is_reload_only`` is True
         only when neither ``arch.map_raw`` nor a resolvable
         ``arch.source_file`` is available — i.e. the original raw
-        frames have been moved/deleted relative to the .nxs.  If lazy
-        load is feasible (source file present), the flag is False and
-        re-integration runs through ``_lazy_load_raw`` automatically.
+        frames have been moved/deleted relative to the .nxs.
 
-        Checks the in-memory cache only — disk-resident arches that
-        haven't been touched yet conservatively count as reload-only
-        (we can't know without materialising them, and materialising
-        means a disk hit per frame).  Returns False when no arches
-        have been added.
+        Path A — in-memory cache has entries: definitive answer from
+        the cache.  Re-integration buttons get the right answer
+        instantly.
+
+        Path B — empty cache (freshly opened .nxs, before any arch
+        has been materialised): probe the first frame's
+        ``/entry/frames/frame_NNNN/source/path`` directly from h5py
+        WITHOUT materialising an :class:`EwaldArch`.  This is the C2
+        fix — the pre-C2 code returned ``True`` whenever the cache
+        was empty + the index had rows, which falsely blocked
+        re-integration on a freshly opened .nxs even when every
+        source file was present and lazy load would have worked.
+        Probing one frame is a single tiny h5 read (~ms).
         """
         in_mem = getattr(self.arches, "_in_memory", None)
-        if not in_mem:
-            # No arches accessed yet — if the on-disk file has any
-            # rows, materialising them might set is_reload_only=True.
-            return bool(self.arches.index)
-        return any(getattr(a, "is_reload_only", False)
-                   for a in in_mem.values())
+        if in_mem:
+            return any(getattr(a, "is_reload_only", False)
+                       for a in in_mem.values())
+        if not self.arches.index:
+            return False
+        return self._probe_reload_only_via_h5()
+
+    def _probe_reload_only_via_h5(self) -> bool:
+        """Sample one frame's source ref from the .nxs to gauge the flag.
+
+        Reads ``/entry/frames/frame_NNNN/source/path`` for the first
+        index in ``self.arches.index`` and checks whether it resolves
+        to an existing file.  We assume the wrangler stamped sources
+        uniformly across the scan, so one probe represents the whole
+        scan — if not, the per-arch :attr:`is_reload_only` flag
+        (set by :func:`_load_arch_v2` on each lazy load) catches
+        outliers when they're actually materialised.
+
+        Returns ``True`` (conservative — block re-integration) on any
+        read error: missing group, decoding failure, h5py error.
+        ``False`` only when the source path is on disk.
+        """
+        try:
+            from xdart.utils import catch_h5py_file as _catch
+        except Exception:
+            return True
+        try:
+            first_idx = int(self.arches.index[0])
+        except (IndexError, ValueError, TypeError):
+            return True
+        try:
+            with _catch(self.data_file, 'r') as f:
+                grp_path = f"entry/frames/frame_{first_idx:04d}/source"
+                grp = f.get(grp_path)
+                if grp is None or "path" not in grp:
+                    return True  # no source ref at all → not recoverable
+                raw = grp["path"][()]
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                full = str(raw)
+                if not os.path.isabs(full):
+                    full = os.path.normpath(
+                        os.path.join(
+                            os.path.dirname(self.data_file), full,
+                        )
+                    )
+                return not os.path.exists(full)
+        except (OSError, KeyError, ValueError, TypeError, AttributeError):
+            return True
 
     def add_arch(self, arch=None, calculate=True, update=True, get_sd=True,
                  set_mg=True, h5file=None, batch_save=False, **kwargs):
@@ -410,14 +459,26 @@ class EwaldSphere:
                             set_mg: bool = True) -> None:
         """Populate sphere state from a v2 NXroot.
 
-        Reads via :func:`ssrl_xrd_tools.io.nexus.read_sphere` and
-        populates the index so :class:`ArchSeries.__getitem__` can
-        lazy-load each frame on demand from the stacked v2 datasets.
+        C5: uses :func:`read_sphere_metadata` (not the full
+        ``read_sphere``) — we only need frame_index, axes, motor
+        columns, and the reduction provenance attrs.  The heavy
+        ``intensity_1d`` / ``intensity_2d`` stacks stay on disk and
+        :class:`ArchSeries.__getitem__` lazy-loads each frame's
+        slices on demand via :func:`_load_arch_v2`.  For a 10k-frame
+        Eiger scan this is the difference between ~seconds (full
+        materialisation) and ~tens of ms (frame index + a few KB of
+        coords + motor columns).
         """
-        from ssrl_xrd_tools.io.nexus import read_sphere
+        # Prefer the metadata-only loader — it skips the heavy stacks.
+        # Fall back to the full ``read_sphere`` if the metadata loader
+        # isn't available on older ssrl_xrd_tools installs.
+        try:
+            from ssrl_xrd_tools.io.nexus import read_sphere_metadata as _read
+        except ImportError:
+            from ssrl_xrd_tools.io.nexus import read_sphere as _read
 
         try:
-            ds = read_sphere(self.data_file)
+            ds = _read(self.data_file)
         except Exception as exc:
             # Surface the failure: silent debug-logging meant users saw an
             # empty viewer with no hint why.  exc_info=True dumps the

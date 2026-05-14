@@ -854,11 +854,22 @@ class specThread(wranglerThread):
                                 arch.source_file = str(img_file)
                         else:
                             arch.source_file = ""
-                        # SPEC TIFs are single-frame files, so the
-                        # per-file frame index is always 0.  (For
-                        # multi-frame sources like Eiger, the wrangler
-                        # sets this to the offset within the source.)
-                        arch.source_frame_idx = 0
+                        # source_frame_idx is the *per-source-file*
+                        # 0-based frame offset, which lazy raw load
+                        # passes to NexusImageStack(source_file)[idx].
+                        # • Single-frame sources (TIF/EDF/CBF/…) →
+                        #   source IS the frame; idx is always 0.
+                        # • Multi-frame sources (Eiger / NeXus master)
+                        #   → use img_number-1, since
+                        #   ``_get_next_eiger_frame_sync`` emits
+                        #   ``img_number = frame_idx + 1`` (1-based).
+                        # Pre-C1 this was hardcoded to 0, so any
+                        # reload + lazy raw read on Eiger always
+                        # returned frame 0 — silently wrong.
+                        if _raw_lives_in_source(img_file):
+                            arch.source_frame_idx = int(img_number) - 1
+                        else:
+                            arch.source_frame_idx = 0
                         arch.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
 
                         sphere.add_arch(
@@ -979,8 +990,14 @@ class specThread(wranglerThread):
                     arch.source_file = str(img_file)
             else:
                 arch.source_file = ""
-            # SPEC TIF: single-frame source file → idx 0.
-            arch.source_frame_idx = 0
+            # source_frame_idx: per-source-file 0-based frame offset.
+            # See the matching block in ``_dispatch_batch_parallel``
+            # for the full rationale.  Eiger / HDF5 masters get
+            # ``img_number - 1``; everything else stays at 0.
+            if _raw_lives_in_source(img_file):
+                arch.source_frame_idx = int(img_number) - 1
+            else:
+                arch.source_frame_idx = 0
             # For Eiger: raw frames already live in the master file — don't double-store them.
             arch.skip_map_raw = sphere.skip_2d or _raw_lives_in_source(img_file)
             _t4 = time.time()
