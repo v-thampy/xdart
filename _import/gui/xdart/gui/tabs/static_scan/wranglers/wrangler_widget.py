@@ -6,6 +6,7 @@
 # Standard library imports
 import logging
 import os
+from contextlib import contextmanager
 from queue import Queue
 import threading
 import traceback
@@ -263,6 +264,59 @@ class wranglerThread(Qt.QtCore.QThread):
                 cached = None
             sphere._cached_data_mask = cached
         return cached
+
+    @staticmethod
+    @contextmanager
+    def _borrow_fiber_integrator(sphere, fiber_pool, arch,
+                                 *, angle_tol: float = 1e-4):
+        """H2 fiber-integrator borrow.
+
+        Yields a :class:`FiberIntegrator` for this arch's incidence
+        angle, with the following preference order:
+
+        1. **Borrow from pool** when the angle matches the prewarmed
+           cache (within ``angle_tol`` degrees) — workers get their
+           own deepcopy, no CSR-buffer races.  Most common path for
+           sin²ψ / fixed-ω scans.
+        2. **Build worker-local** when angle differs — slower
+           ``promote("FiberIntegrator")`` call but only on
+           ω-varying scans, and only for frames that drift.  No
+           shared state, so thread-safe by construction.
+        3. **Yield None** when GI isn't enabled at all — the arch
+           integrators ignore the ``fiber_integrator`` kwarg in
+           that case.
+
+        Yielded values that came from the pool are returned to the
+        pool on context exit (pool members are reused by subsequent
+        frames).  Worker-local fi instances become garbage at exit.
+        """
+        # Local import: ssrl_xrd_tools.integrate.gid pulls pyFAI; we
+        # don't want to drag that into every test that constructs a
+        # wranglerThread for unrelated reasons.
+        gi = bool(getattr(arch, "gi", False))
+        if not gi:
+            yield None
+            return
+        cached_angle = getattr(sphere, "_cached_fiber_integrator_angle", None)
+        try:
+            arch_angle = arch._get_incident_angle()
+        except (AttributeError, ValueError):
+            arch_angle = None
+        if (fiber_pool is not None and cached_angle is not None
+                and arch_angle is not None
+                and abs(arch_angle - cached_angle) < angle_tol):
+            with fiber_pool.borrow() as fi:
+                yield fi
+        else:
+            from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
+            fi = create_fiber_integrator(
+                arch._poni_from_integrator(),
+                incident_angle=arch_angle if arch_angle is not None else 0.0,
+                tilt_angle=arch.tilt_angle,
+                sample_orientation=arch.sample_orientation,
+                angle_unit="deg",
+            )
+            yield fi
 
     def _prewarm_arch_mask(self, sphere, img_data) -> None:
         """Populate ``sphere._cached_data_mask`` on the main thread.

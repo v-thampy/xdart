@@ -698,7 +698,19 @@ class specThread(wranglerThread):
         if (getattr(sphere, '_cached_data_mask', None) is None
                 and pending):
             self._prewarm_arch_mask(sphere, pending[0][2])
-        fiber_integrator = sphere._cached_fiber_integrator
+        # H2: per-worker fiber-integrator pool (matches IntegratorPool
+        # for the regular AzimuthalIntegrator).  None when GI is off
+        # or when the prewarm hasn't seeded _cached_fiber_integrator
+        # yet — _borrow_fiber_integrator falls back to the per-frame
+        # build in those cases.
+        fiber_pool = (
+            ensure_integrator_pool(
+                sphere, '_cached_fiber_integrator', n_workers,
+                pool_attr='_cached_fiber_integrator_pool',
+            )
+            if self.gi and sphere._cached_fiber_integrator is not None
+            else None
+        )
         # Capture the angle the prewarmed fiber integrator was built
         # for.  When ``gi`` is on and a per-frame arch's incidence
         # angle drifts from this (i.e. ω varies across the scan, as
@@ -760,39 +772,28 @@ class specThread(wranglerThread):
                     mask=arch_mask,
                 )
 
-                # GI fiber integrator — reuse the prewarmed one if
-                # its incidence angle matches this frame's, otherwise
-                # build a worker-local one at the right angle.  This
-                # keeps sin²ψ scans (fixed ω) on the fast cached path
-                # while keeping ω-varying scans correct.
-                _fi = None
-                if gi:
-                    _arch_angle = arch._get_incident_angle()
-                    if (fiber_integrator is not None
-                            and cached_gi_angle is not None
-                            and abs(_arch_angle - cached_gi_angle)
-                            < _GI_ANGLE_TOL):
-                        _fi = fiber_integrator
-                    else:
-                        _fi = create_fiber_integrator(
-                            arch._poni_from_integrator(),
-                            incident_angle=_arch_angle,
-                            tilt_angle=arch.tilt_angle,
-                            sample_orientation=sample_orientation,
-                            angle_unit="deg",
-                        )
-
-                arch.integrate_1d(
-                    global_mask=mask,
-                    fiber_integrator=_fi,
-                    **bai_1d_args,
-                )
-                if not skip_2d:
-                    arch.integrate_2d(
+                # H2: GI fiber integrator goes through the shared
+                # _borrow_fiber_integrator helper.  When the frame's
+                # incidence angle matches the prewarm cache (the
+                # sin²ψ common path) it borrows a private deepcopy
+                # from fiber_pool — same fix as IntegratorPool for
+                # the standard AzimuthalIntegrator.  Otherwise it
+                # builds a worker-local fiber integrator (ω-varying
+                # fall-back; slow but correct, single worker only).
+                with self._borrow_fiber_integrator(
+                    sphere, fiber_pool, arch,
+                ) as _fi:
+                    arch.integrate_1d(
                         global_mask=mask,
                         fiber_integrator=_fi,
-                        **bai_2d_args,
+                        **bai_1d_args,
                     )
+                    if not skip_2d:
+                        arch.integrate_2d(
+                            global_mask=mask,
+                            fiber_integrator=_fi,
+                            **bai_2d_args,
+                        )
 
             # Detach the pool integrator from this arch — once the
             # `with` block exited, the next worker can borrow this

@@ -242,6 +242,20 @@ class nexusThread(wranglerThread):
             integrator_pool = ensure_integrator_pool(
                 sphere, '_cached_integrator', n_workers,
             )
+            # H2: pyFAI FiberIntegrator inherits from
+            # AzimuthalIntegrator and shares the CSR-scratch-buffer
+            # mutation pattern.  Same fix as IntegratorPool — one
+            # deepcopy per worker, borrowed via context manager.
+            # Built only when GI is enabled and the prewarm seeded
+            # _cached_fiber_integrator; otherwise stays None and
+            # the worker uses its own per-frame fiber integrator.
+            fiber_pool = (
+                ensure_integrator_pool(
+                    sphere, '_cached_fiber_integrator', n_workers,
+                    pool_attr='_cached_fiber_integrator_pool',
+                )
+                if self.gi else None
+            )
             # If the GUI is single-core (max_cores=1) integrator_pool
             # still exists with one member; the worker borrows it like
             # everyone else.  Cleaner than branching on n_workers==1.
@@ -282,7 +296,7 @@ class nexusThread(wranglerThread):
                 arches = self._parallel_integrate(
                     items,
                     lambda item: self._integrate_one(
-                        sphere, integrator_pool, *item,
+                        sphere, integrator_pool, fiber_pool, *item,
                     ),
                     n_workers,
                     label='NEXUS',
@@ -420,8 +434,8 @@ class nexusThread(wranglerThread):
         # pattern as specThread.
         sphere._cached_fiber_integrator_angle = incident_angle
 
-    def _integrate_one(self, sphere, integrator_pool, frame_idx,
-                       img_data, img_meta):
+    def _integrate_one(self, sphere, integrator_pool, fiber_pool,
+                       frame_idx, img_data, img_meta):
         """Pure integration in a worker thread; returns the arch.
 
         Borrows an integrator from the pool, integrates 1D/2D, and
@@ -462,37 +476,27 @@ class nexusThread(wranglerThread):
             # the right angle.  Sin²ψ scans (fixed ω) stay on the
             # fast cached path; ω-varying scans get correct results
             # at the cost of one per-frame fiber-integrator build.
-            fi = None
-            if self.gi:
-                cached_fi = sphere._cached_fiber_integrator
-                cached_angle = getattr(
-                    sphere, "_cached_fiber_integrator_angle", None,
-                )
-                _arch_angle = arch._get_incident_angle()
-                _GI_ANGLE_TOL = 1e-4
-                if (cached_fi is not None and cached_angle is not None
-                        and abs(_arch_angle - cached_angle) < _GI_ANGLE_TOL):
-                    fi = cached_fi
-                else:
-                    fi = create_fiber_integrator(
-                        arch._poni_from_integrator(),
-                        incident_angle=_arch_angle,
-                        tilt_angle=arch.tilt_angle,
-                        sample_orientation=self.sample_orientation,
-                        angle_unit="deg",
-                    )
-
-            arch.integrate_1d(
-                global_mask=self.mask,
-                fiber_integrator=fi,
-                **sphere.bai_1d_args,
-            )
-            if not sphere.skip_2d:
-                arch.integrate_2d(
+            #
+            # H2: when reusing the cached integrator we BORROW a
+            # per-worker deepcopy from ``fiber_pool`` rather than
+            # share the single sphere-level instance — pyFAI's
+            # FiberIntegrator inherits the same CSR-scratch-buffer
+            # mutation pattern as AzimuthalIntegrator and is not
+            # safe across concurrent inputs.
+            with self._borrow_fiber_integrator(
+                sphere, fiber_pool, arch,
+            ) as fi:
+                arch.integrate_1d(
                     global_mask=self.mask,
                     fiber_integrator=fi,
-                    **sphere.bai_2d_args,
+                    **sphere.bai_1d_args,
                 )
+                if not sphere.skip_2d:
+                    arch.integrate_2d(
+                        global_mask=self.mask,
+                        fiber_integrator=fi,
+                        **sphere.bai_2d_args,
+                    )
 
         # Detach the pool integrator from the arch — once the `with`
         # exits, another worker can borrow this same instance.  The
