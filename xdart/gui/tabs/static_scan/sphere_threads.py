@@ -198,9 +198,23 @@ class integratorThread(Qt.QtCore.QThread):
         # off).  Replaces the legacy ``ut.dict_to_h5(...,
         # 'bai_*_args')`` write-to-root path (v1 layout, dropped
         # in 0.37.0) — that path never updated the v2 stacked rows.
+        #
+        # K2: bracket the save with the H5FilePool pause/resume
+        # protocol so any concurrent GUI h5viewer reads through the
+        # pool drop their cached handles and wait for the writer to
+        # release.  Wrangler save paths already do this; the
+        # reintegrate path was the one save site that didn't, which
+        # could race a viewer's open handle on the same .nxs file.
         replace_idxs = list(self.sphere.arches.index)
         if replace_idxs:
-            self.sphere.save_to_nexus(replace_frame_indices=replace_idxs)
+            from xdart.utils.h5pool import get_pool as _get_h5pool
+            _get_h5pool().pause(self.sphere.data_file)
+            try:
+                self.sphere.save_to_nexus(
+                    replace_frame_indices=replace_idxs,
+                )
+            finally:
+                _get_h5pool().resume(self.sphere.data_file)
 
     def bai_2d_SI(self):
         """Integrate the current arch, 2d

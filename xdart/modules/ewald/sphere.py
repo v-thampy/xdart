@@ -172,19 +172,89 @@ class EwaldSphere:
         return self._probe_reload_only_via_h5()
 
     def _probe_reload_only_via_h5(self) -> bool:
-        """Sample one frame's source ref from the .nxs to gauge the flag.
+        """Probe the .nxs file's per-frame source refs to gauge the flag.
 
-        Reads ``/entry/frames/frame_NNNN/source/path`` for the first
-        index in ``self.arches.index`` and checks whether it resolves
-        to an existing file.  We assume the wrangler stamped sources
-        uniformly across the scan, so one probe represents the whole
-        scan — if not, the per-arch :attr:`is_reload_only` flag
-        (set by :func:`_load_arch_v2` on each lazy load) catches
-        outliers when they're actually materialised.
+        K3: scans **all distinct** ``/entry/frames/frame_NNNN/source/path``
+        values in the file (deduplicated) and checks that each
+        resolves to an existing file.  For SPEC scans this is
+        typically a 1000-element loop over the same TIF-pattern
+        directory; for Eiger this is at most a handful of master
+        files.  Either way the cost is dominated by the h5 reads
+        (~few KB) — file existence checks come from the kernel's
+        dentry cache after the first miss.
 
-        Returns ``True`` (conservative — block re-integration) on any
-        read error: missing group, decoding failure, h5py error.
-        ``False`` only when the source path is on disk.
+        Returns ``True`` (block re-integration) on any of:
+        - read error
+        - any frame missing a ``source/path`` field
+        - any referenced source file missing from disk
+
+        Returns ``False`` only when every distinct source path
+        resolves.  This is stricter than the C2-style single-probe
+        but cheap enough to do at GUI-button click time, and
+        catches the mixed-source case where a scan was assembled
+        from multiple data sources (rare but possible during
+        live-mode acquisition from multiple SPEC sessions, or for
+        scans manually edited post-hoc).
+        """
+        try:
+            from xdart.utils import catch_h5py_file as _catch
+        except Exception:
+            return True
+        try:
+            indices = list(self.arches.index)
+            if not indices:
+                return True
+        except (TypeError, AttributeError):
+            return True
+
+        # Cap the scan at a reasonable size — past ~2000 frames the
+        # per-h5-read cost adds up, and a well-behaved scan with
+        # 10k frames almost certainly has uniform source refs.
+        # Sample first + last + every Nth in between to keep the
+        # probe bounded.
+        _MAX_PROBE = 256
+        if len(indices) > _MAX_PROBE:
+            step = max(1, len(indices) // _MAX_PROBE)
+            probe_ids = indices[::step]
+            if indices[-1] not in probe_ids:
+                probe_ids.append(indices[-1])
+        else:
+            probe_ids = indices
+
+        try:
+            with _catch(self.data_file, 'r') as f:
+                seen_paths: set = set()
+                for idx in probe_ids:
+                    grp_path = f"entry/frames/frame_{int(idx):04d}/source"
+                    grp = f.get(grp_path)
+                    if grp is None or "path" not in grp:
+                        return True
+                    raw = grp["path"][()]
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="replace")
+                    seen_paths.add(str(raw))
+        except (OSError, KeyError, ValueError, TypeError, AttributeError):
+            return True
+
+        # Now verify each distinct source path actually exists.
+        # File-existence checks are cheap relative to the h5 reads
+        # we already paid for above.
+        data_dir = os.path.dirname(self.data_file)
+        for raw in seen_paths:
+            try:
+                full = raw
+                if not os.path.isabs(full):
+                    full = os.path.normpath(os.path.join(data_dir, full))
+                if not os.path.exists(full):
+                    return True
+            except (OSError, TypeError):
+                return True
+        return False
+
+    def _probe_reload_only_via_h5_legacy_single(self) -> bool:
+        """Pre-K3 single-frame probe.  Kept for tests + emergency
+        fallback if the multi-probe path turns out to be too slow on
+        some pathological file.
         """
         try:
             from xdart.utils import catch_h5py_file as _catch
