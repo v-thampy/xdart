@@ -40,6 +40,7 @@ class EwaldSphere:
                  series_average=False,
                  single_img=False,
                  global_mask=None,
+                 file_lock=None,
                  **_unused,
                  ):
         super().__init__()
@@ -57,7 +58,18 @@ class EwaldSphere:
         if bai_2d_args is None:
             bai_2d_args = {}
 
-        self.file_lock = Condition()
+        # J2: file_lock unification.  Callers can pass in their own
+        # ``threading.Condition`` so the wrangler-level file_lock
+        # (used by save paths under ``self.file_lock``) is the same
+        # lock that ``ArchSeries.__getitem__`` uses for lazy loads.
+        # Pre-J2 each sphere created its own Condition() and the
+        # wrangler's GUI file_lock was a *different* lock — direct
+        # ``ArchSeries.__getitem__`` reads could happen mid-save
+        # while the wrangler thought the file was quiescent.  With a
+        # single shared lock the read just waits.  Existing callers
+        # that don't pass file_lock still work — they just get the
+        # legacy private-lock behavior.
+        self.file_lock = file_lock if file_lock is not None else Condition()
         if name is None:
             self.name = os.path.split(data_file)[-1].split('.')[0]
         else:

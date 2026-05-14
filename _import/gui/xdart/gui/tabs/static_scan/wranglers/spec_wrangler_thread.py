@@ -280,7 +280,7 @@ class specThread(wranglerThread):
         self.bg_scale = bg_scale
         self.bg_norm_channel = bg_norm_channel
         self.gi = gi
-        self.th_mtr = th_mtr
+        self.incidence_motor = th_mtr
         self.sample_orientation = sample_orientation
         self.tilt_angle = tilt_angle
         self.gi_mode_1d = gi_mode_1d
@@ -727,7 +727,7 @@ class specThread(wranglerThread):
         bai_2d_args = dict(sphere.bai_2d_args)
         mask = self.mask
         gi = self.gi
-        th_mtr = self.th_mtr
+        th_mtr = self.incidence_motor
         sample_orientation = self.sample_orientation
         tilt_angle = self.tilt_angle
         series_average = self.series_average
@@ -941,7 +941,7 @@ class specThread(wranglerThread):
         arch = EwaldArch(
             img_number, img_data, poni=self.poni,
             scan_info=img_meta, static=True, gi=self.gi,
-            th_mtr=self.th_mtr, bg_raw=bg_raw,
+            th_mtr=self.incidence_motor, bg_raw=bg_raw,
             sample_orientation=self.sample_orientation,
             tilt_angle=self.tilt_angle,
             series_average=self.series_average,
@@ -1021,7 +1021,7 @@ class specThread(wranglerThread):
             sphere.add_arch(
                 arch=arch, calculate=False, update=True,
                 get_sd=True, set_mg=False, static=True, gi=self.gi,
-                th_mtr=self.th_mtr, series_average=self.series_average,
+                th_mtr=self.incidence_motor, series_average=self.series_average,
                 batch_save=True,
             )
             _t_h5_total = time.time() - _t4
@@ -1544,10 +1544,12 @@ class specThread(wranglerThread):
                              data_file=fname,
                              static=True,
                              gi=self.gi,
-                             th_mtr=self.th_mtr,
+                             incidence_motor=self.incidence_motor,
                              series_average=self.series_average,
                              single_img=self.single_img,
                              global_mask=self.mask,
+                             # J2: share lock with wrangler save path
+                             file_lock=self.file_lock,
                              **self.sphere_args)
         sphere.skip_2d = self.sphere.skip_2d
         # v2 NeXus writer needs a DiffractometerGeometry to derive per-frame
@@ -1584,7 +1586,7 @@ class specThread(wranglerThread):
 
         self.sigUpdateFile.emit(
             self.scan_name, fname,
-            self.gi, self.th_mtr, self.single_img,
+            self.gi, self.incidence_motor, self.single_img,
             self.series_average
         )
         logger.info('***** New Scan *****')

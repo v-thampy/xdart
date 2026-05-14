@@ -99,7 +99,7 @@ class nexusWrangler(wranglerWidget):
         self.mask_file = ''
         self.h5_dir = get_fname_dir()
         self.gi = False
-        self.th_mtr = 'th'
+        self.incidence_motor = 'th'
         self.sample_orientation = 4
         self.tilt_angle = 0.0
         self.gi_mode_1d = 'q_total'
@@ -210,7 +210,7 @@ class nexusWrangler(wranglerWidget):
             self.poni,
             self.mask_file,
             self.gi,
-            self.th_mtr,
+            self.incidence_motor,
             self.sample_orientation,
             self.tilt_angle,
             self.gi_mode_1d,
@@ -405,7 +405,7 @@ class nexusWrangler(wranglerWidget):
 
         # GI parameters
         self.gi = self.parameters.child('GI').child('Grazing').value()
-        self.th_mtr = self.parameters.child('GI').child('th_motor').value()
+        self.incidence_motor = self.parameters.child('GI').child('th_motor').value()
         self.sample_orientation = self.parameters.child('GI').child('sample_orientation').value()
         self.tilt_angle = self.parameters.child('GI').child('tilt_angle').value()
         # GI modes are driven by the integrator panel (axis1D / axis2D)
@@ -422,7 +422,7 @@ class nexusWrangler(wranglerWidget):
             self.poni,
             self.mask_file,
             self.gi,
-            self.th_mtr,
+            self.incidence_motor,
             self.sample_orientation,
             self.tilt_angle,
             self.gi_mode_1d,
