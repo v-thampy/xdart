@@ -27,11 +27,56 @@ class DisplayDataMixin:
 
     - ``self.sphere``, ``self.arch``, ``self.arches``
     - ``self.arch_ids``, ``self.data_1d``, ``self.data_2d``
+    - ``self.data_lock`` (threading.RLock guarding the dicts)
     - ``self.idxs``, ``self.idxs_1d``, ``self.idxs_2d``, ``self.overall``
     - ``self.ui`` (the Ui_Form instance)
     - ``self.normChannel``, ``self.bkg_*``
     - ``self._plot_axis_info``
+
+    Locking contract (M3)
+    =====================
+
+    ``data_1d`` and ``data_2d`` are shared between the wrangler
+    thread, the integrator thread, the fileHandlerThread / the M1
+    LoadArchesWorker, and the GUI thread.  All **mutating** access
+    (assignment, ``del``, ``clear``, ``pop``) goes through
+    ``self.data_lock``.  **Read** access either takes ``data_lock``
+    explicitly (when iterating multiple keys) or uses
+    :meth:`_snapshot_data` to grab a stable view to iterate
+    lock-free.
+
+    The CPython GIL makes single ``dict[k]`` lookups atomic, so
+    direct cache-hit reads like ``self.data_1d.get(idx)`` are still
+    safe.  The unsafe pattern was *iterating* the dicts (``for k, v
+    in self.data_2d.items():`` or ``list(self.data_2d.keys())``)
+    without a lock — a concurrent writer can mutate the dict
+    mid-iteration and raise RuntimeError ("dictionary changed size
+    during iteration").  Use ``_snapshot_data`` for those paths.
     """
+
+    def _snapshot_data(self, idxs):
+        """Return a small {idx: (arch_1d, arch_2d_dict)} dict for
+        the requested ``idxs``, sampled atomically under
+        ``self.data_lock``.
+
+        M3 helper: callers that need to iterate over a set of
+        frames' data (e.g. for averaging) should take the snapshot
+        once and then process it without holding the lock.  This
+        keeps the lock window short (one dict-comprehension's worth)
+        and avoids the "dictionary changed size during iteration"
+        race that the wrangler thread can otherwise trigger.
+
+        Missing arches are silently omitted from the result — the
+        caller is expected to handle partial data anyway.
+        """
+        with self.data_lock:
+            return {
+                int(idx): (
+                    self.data_1d.get(int(idx)),
+                    self.data_2d.get(int(idx), {}),
+                )
+                for idx in idxs
+            }
 
     # ── Raw 2D data access ────────────────────────────────────────
 
@@ -41,14 +86,20 @@ class DisplayDataMixin:
         Falls back to the stored thumbnail when full-resolution raw data
         is not available (e.g. when loading from NeXus files that only
         store integration results + thumbnails).
+
+        M3: takes a single snapshot of the requested idxs under
+        ``data_lock`` and then iterates the snapshot lock-free, so
+        a concurrent writer can keep streaming new arches without
+        racing the iteration.
         """
         if idxs is None:
             idxs = self.idxs_2d
 
+        snapshot = self._snapshot_data(idxs)
+
         intensity, ctr = 0., 0
         for nn, idx in enumerate(idxs):
-            arch_1d = self.data_1d.get(int(idx))
-            arch_2d = self.data_2d.get(int(idx), {})
+            arch_1d, arch_2d = snapshot.get(int(idx), (None, {}))
             raw = arch_2d.get('map_raw')
             bg = arch_2d.get('bg_raw', 0)
             # Try thumbnail from data_2d, then fall back to data_1d
@@ -105,6 +156,10 @@ class DisplayDataMixin:
 
         Returns ``(intensity, xdata, ydata)`` or ``(None, None, None)``
         if nothing usable is loaded.
+
+        M3: uses ``_snapshot_data`` for a stable view of the
+        requested idxs; concurrent writes to ``data_1d``/``data_2d``
+        no longer race this iteration.
         """
         if idxs is None:
             idxs = self.idxs_2d
@@ -112,12 +167,13 @@ class DisplayDataMixin:
         if not idxs:
             return None, None, None
 
+        snapshot = self._snapshot_data(idxs)
+
         intensity = None
         xdata = ydata = None
         ctr = 0
         for idx in idxs:
-            arch_1d = self.data_1d.get(int(idx))
-            arch_2d = self.data_2d.get(int(idx))
+            arch_1d, arch_2d = snapshot.get(int(idx), (None, None))
             if arch_2d is None or arch_2d.get('int_2d') is None:
                 continue
             _gi2d = arch_2d.get('gi_2d', {})
