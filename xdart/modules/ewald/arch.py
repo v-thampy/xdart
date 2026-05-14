@@ -126,7 +126,7 @@ class EwaldArch():
     # pylint: disable=too-many-instance-attributes
 
     def __init__(self, idx=None, map_raw=None, poni=None, mask=None,
-                 scan_info={}, ai_args={}, file_lock=Condition(),
+                 scan_info=None, ai_args=None, file_lock=None,
                  static=False, bg_raw=0,
                  gi=False, th_mtr='th', tilt_angle=0,
                  sample_orientation=4,
@@ -138,11 +138,17 @@ class EwaldArch():
         bg_raw: numpy array, raw image data for BG
         poni: PONI object, calibration data
         mask: None or numpy array, indices of pixels to mask
-        scan_info: dict, metadata about scan
+        scan_info: dict, metadata about scan (None → fresh dict per instance)
         ai_args: dict, args to be fed to azimuthalIntegrator constructor
-        file_lock: Condition, lock for file access.
+        file_lock: Condition, lock for file access (None → fresh Condition).
         """
         super(EwaldArch, self).__init__()
+        # F4: None-sentinel pattern.  Mutable defaults in the signature
+        # (scan_info={}, ai_args={}, file_lock=Condition()) are
+        # constructed once at module-import time and shared by every
+        # caller who omits the kwarg — silently producing cross-arch
+        # state.  Materialise per-instance defaults here, matching
+        # what EwaldSphere already does.
         self.idx = idx
         self.map_raw = map_raw
         self.bg_raw = bg_raw
@@ -154,9 +160,9 @@ class EwaldArch():
             self.mask = np.arange(map_raw.size)[map_raw.flatten() < 0]
         else:
             self.mask = mask
-        self.scan_info = scan_info
-        self.ai_args = ai_args
-        self.file_lock = file_lock
+        self.scan_info = scan_info if scan_info is not None else {}
+        self.ai_args = ai_args if ai_args is not None else {}
+        self.file_lock = file_lock if file_lock is not None else Condition()
 
         self.static = static
         self.gi = gi
@@ -691,11 +697,20 @@ class EwaldArch():
         if self.thumbnail is not None:
             return
         if self.map_raw is None:
+            # F5: try L1 lazy load before giving up.  Lets thumbnail
+            # regeneration work on reloaded v2 spheres whose source
+            # files are still available.
+            self._lazy_load_raw()
+        if self.map_raw is None:
             return
         try:
             corrected = (np.asarray(self.map_raw, dtype=np.float32)
                          - np.asarray(self.bg_raw, dtype=np.float32))
-        except Exception:
+        except (TypeError, ValueError) as e:
+            import logging
+            logging.getLogger(__name__).debug(
+                "make_thumbnail: bg subtraction failed: %s", e,
+            )
             return
         self.thumbnail = _make_thumbnail(
             corrected, mask_idx=self.mask, global_mask=global_mask,

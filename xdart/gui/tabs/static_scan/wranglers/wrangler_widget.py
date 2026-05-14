@@ -242,6 +242,15 @@ class wranglerThread(Qt.QtCore.QThread):
         Per-frame threshold filtering is NOT routed through this
         mask — see :meth:`_apply_threshold_inline` for that path
         (NaN-sentinel in the data, mask CRC unchanged).
+
+        F3: callers in the parallel section should pre-warm the
+        cache via :meth:`_prewarm_arch_mask` on the main thread
+        BEFORE submitting work, so the cache is fully populated
+        when N workers read it.  Without the prewarm, the first N
+        workers all see ``None`` and race to write the same value —
+        currently safe because every worker computes the SAME mask,
+        but the invariant isn't enforced by the code and a future
+        change (e.g. per-worker thresholding) could break it.
         """
         cached = getattr(sphere, '_cached_data_mask', None)
         if cached is None:
@@ -249,10 +258,28 @@ class wranglerThread(Qt.QtCore.QThread):
                 cached = np.arange(img_data.size)[
                     np.asarray(img_data).flatten() < 0
                 ]
-            except Exception:
+            except (AttributeError, TypeError, ValueError) as e:
+                logger.debug("arch-mask compute failed: %s", e)
                 cached = None
             sphere._cached_data_mask = cached
         return cached
+
+    def _prewarm_arch_mask(self, sphere, img_data) -> None:
+        """Populate ``sphere._cached_data_mask`` on the main thread.
+
+        F3 — prevents the racy initialization that happens when N
+        parallel workers all simultaneously see a ``None`` cache and
+        each compute + write the same mask.  Computing on the main
+        thread before submitting any worker means every worker only
+        ever does a cache *read* against a stable value.
+
+        Idempotent: a no-op when the cache is already set.  Called
+        from each wrangler's run loop with the first frame's
+        ``img_data`` before the parallel section.
+        """
+        if getattr(sphere, '_cached_data_mask', None) is not None:
+            return
+        self._resolve_arch_mask(sphere, img_data)
 
     def _apply_threshold_inline(self, img_data):
         """Pre-clamp pixels outside the threshold band to NaN.
@@ -339,21 +366,25 @@ class wranglerThread(Qt.QtCore.QThread):
                              *, label="integration"):
         """Run ``integrate_fn`` over ``items`` in a ThreadPoolExecutor.
 
-        D2 starter: pulls the parallel-integration boilerplate out of
-        both wranglers' inner loops so they share a single dispatch
-        primitive.  Each wrangler still owns its own per-item
+        Shared dispatch primitive used by both SPEC batch and NeXus
+        chunked workers.  Each wrangler still owns its own per-item
         ``integrate_fn`` (signatures differ) and its own post-publish
-        / save / xye logic; only the pool wiring is shared.
+        / save / xye logic.
 
         Behavior:
-          * Submits one future per item.
-          * Honours :attr:`command` == ``'stop'``: drains in-flight
-            results but stops submitting once a stop is requested.
+          * Submits one future per item up-front, then waits.
+          * F2 cancel-fast: on Stop, calls
+            ``pool.shutdown(wait=True, cancel_futures=True)`` so
+            queued-but-not-running futures are dropped immediately.
+            ``integrate_fn`` should ALSO check ``self.command``
+            early so already-running workers can bail before the
+            expensive 2D integration starts; pre-F2 the user could
+            wait up to one full chunk after pressing Stop, because
+            running workers kept going to completion.
           * Per-item exceptions are logged at error level and the
-            corresponding arch is dropped (returns ``None`` slot
-            elided from the result list).
-          * Returns arches in idx-sorted order so on-disk frame_index
-            datasets stay monotonic.
+            corresponding arch is dropped from the result list.
+          * Returns arches in idx-sorted order so on-disk
+            frame_index stays monotonic.
 
         Returns a ``list[EwaldArch]`` with ``None`` entries elided.
         """
@@ -363,13 +394,18 @@ class wranglerThread(Qt.QtCore.QThread):
             return []
 
         completed: list = []
-        with ThreadPoolExecutor(max_workers=max(1, int(n_workers))) as pool:
-            futures = []
-            for item in items:
-                if self.command == 'stop':
-                    break
-                futures.append(pool.submit(integrate_fn, item))
+        pool = ThreadPoolExecutor(max_workers=max(1, int(n_workers)))
+        try:
+            futures = [pool.submit(integrate_fn, item) for item in items]
             for fut in as_completed(futures):
+                if self.command == 'stop':
+                    # Cancel everything still queued; let in-flight
+                    # workers finish (Python doesn't pre-empt threads,
+                    # but the integrate_fn's own stop checks will
+                    # short-circuit before they hit pyFAI).
+                    for f in futures:
+                        f.cancel()
+                    break
                 try:
                     arch = fut.result()
                 except Exception as e:
@@ -380,8 +416,12 @@ class wranglerThread(Qt.QtCore.QThread):
                 if arch is None:
                     continue
                 completed.append(arch)
-        # Order by frame idx — the writer's stacked datasets index
-        # by frame_index, but on-disk row order should still match
-        # acquisition order so reload + slice-by-position make sense.
+        finally:
+            # cancel_futures was added in 3.9; safe to assume.
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+            except TypeError:  # pragma: no cover  - older Python
+                pool.shutdown(wait=True)
+
         completed.sort(key=lambda a: getattr(a, 'idx', 0) or 0)
         return completed

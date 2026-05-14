@@ -11,7 +11,6 @@ from .arch import EwaldArch
 from .arch_series import ArchSeries
 from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xdart import utils
-from ssrl_xrd_tools.integrate.multi import stitch_1d, stitch_2d
 
 
 class EwaldSphere:
@@ -98,8 +97,12 @@ class EwaldSphere:
                                      static=self.static, gi=self.gi)
         self.scan_data = scan_data
 
+        # ``mg_args`` retained: nexus_writer reads
+        # ``mg_args["wavelength"]`` for the NXsource stamp.  The
+        # ``_mg_integrators`` list that powered the deleted
+        # ``multigeometry_integrate_*`` API is gone — stitching now
+        # goes through :mod:`xdart.modules.ewald.stitch` instead.
         self.mg_args = mg_args
-        self._mg_integrators = [a.integrator for a in arches] if arches else []
 
         self.bai_1d_args = bai_1d_args
         self.bai_2d_args = bai_2d_args
@@ -197,7 +200,7 @@ class EwaldSphere:
             return True
 
     def add_arch(self, arch=None, calculate=True, update=True, get_sd=True,
-                 set_mg=True, h5file=None, batch_save=False, **kwargs):
+                 h5file=None, batch_save=False, **kwargs):
         """Adds a new arch to the sphere.
 
         In-memory state (``arches.index``, ``scan_data``,
@@ -212,7 +215,17 @@ class EwaldSphere:
           idempotent and uses stacked slice-assigns, so per-frame calls
           are O(1) in the dataset shape rather than O(N) like the old v1
           delete-and-recreate pattern.
+
+        Pre-F6 this method also took ``set_mg=True`` which
+        rebuilt ``self._mg_integrators`` (used only by the
+        deleted ``multigeometry_integrate_*`` API).  Callers that
+        still pass ``set_mg`` are silently absorbed by ``**kwargs``;
+        new callers should drop the kwarg.
         """
+        # Eat any stale ``set_mg`` kwarg for backwards compat with
+        # one or two release-old call sites.  Other unknown kwargs
+        # land in **kwargs and are forwarded to EwaldArch below.
+        kwargs.pop("set_mg", None)
         with self.sphere_lock:
             if arch is None:
                 arch = EwaldArch(**kwargs)
@@ -246,13 +259,6 @@ class EwaldSphere:
                 if not self.skip_2d:
                     self._accumulate_bai_2d(arch)
 
-            if set_mg:
-                # ArchSeries iteration lazy-loads from disk; only do this
-                # when the file already has the frames written.  Callers
-                # that pass set_mg=True from the wrangler hot path use
-                # set_mg=False to avoid this.
-                self._mg_integrators = [a.integrator for a in self.arches]
-
             self.overall_raw += (arch.map_raw - arch.bg_raw)
 
             # Persist via the v2 writer.  Idempotent; one slice-assign per
@@ -261,30 +267,6 @@ class EwaldSphere:
             # any ``h5file`` argument (kept for signature compatibility).
             if not batch_save:
                 self._save_to_nexus()
-
-    def by_arch_integrate_1d(self, **args):
-        """Integrate all arches individually and accumulate the 1D sum."""
-        if not args:
-            args = self.bai_1d_args
-        else:
-            self.bai_1d_args = args.copy()
-        with self.sphere_lock:
-            self.bai_1d = None
-            for arch in self.arches:
-                arch.integrate_1d(global_mask=self.global_mask, **args)
-                self._accumulate_bai_1d(arch)
-
-    def by_arch_integrate_2d(self, **args):
-        """Integrate all arches individually and accumulate the 2D sum."""
-        if not args:
-            args = self.bai_2d_args
-        else:
-            self.bai_2d_args = args.copy()
-        with self.sphere_lock:
-            self.bai_2d = None
-            for arch in self.arches:
-                arch.integrate_2d(global_mask=self.global_mask, **args)
-                self._accumulate_bai_2d(arch)
 
     def _accumulate_bai_1d(self, arch):
         """In-memory running sum of 1D integration results (no HDF5 write)."""
@@ -311,34 +293,6 @@ class EwaldSphere:
                     self.bai_2d = self.bai_2d + arch.int_2d
             except (ValueError, AttributeError):
                 self.bai_2d = arch.int_2d
-
-    def set_multi_geo(self, **args):
-        """Rebuilds the per-arch integrator list for stitched integration."""
-        self.mg_args.update(args)
-        with self.sphere_lock:
-            self._mg_integrators = [a.integrator for a in self.arches]
-
-    def multigeometry_integrate_1d(self, monitor=None, **kwargs):
-        """Stitch all arch images into a single 1D pattern."""
-        with self.sphere_lock:
-            images = [(a.map_raw - a.bg_raw) for a in self.arches]
-            normalization = (
-                list(self.scan_data[monitor]) if monitor is not None else None
-            )
-            return stitch_1d(
-                images, self._mg_integrators,
-                mask=self.global_mask, normalization=normalization,
-                **kwargs,
-            )
-
-    def multigeometry_integrate_2d(self, monitor=None, **kwargs):
-        """Stitch all arch images into a 2D cake pattern."""
-        with self.sphere_lock:
-            images = [(a.map_raw - a.bg_raw) / a.map_norm for a in self.arches]
-            return stitch_2d(
-                images, self._mg_integrators,
-                mask=self.global_mask, **kwargs,
-            )
 
     # ------------------------------------------------------------------
     # v2 NeXus persistence
@@ -398,11 +352,14 @@ class EwaldSphere:
             with utils.catch_h5py_file(self.data_file, mode=mode) as file:
                 self._load_from_h5(file, *args, **kwargs)
 
-    def _load_from_h5(self, grp, data_only=False, set_mg=True):
-        """Load sphere state from a v2 NeXus file (no-op dispatcher)."""
+    def _load_from_h5(self, grp, data_only=False, **_unused):
+        """Load sphere state from a v2 NeXus file (no-op dispatcher).
+
+        ``**_unused`` absorbs any historical kwargs (notably
+        ``set_mg`` from before F6 removed the multigeometry API).
+        """
         with self.sphere_lock:
-            self._load_from_nexus_v2(grp, data_only=data_only,
-                                     set_mg=set_mg)
+            self._load_from_nexus_v2(grp, data_only=data_only)
 
     def set_datafile(self, fname, name=None, keep_current_data=False,
                      save_args={}, load_args={}):
@@ -455,8 +412,7 @@ class EwaldSphere:
     # v2 NeXus loader (xdart 0.37+ schema)
     # ------------------------------------------------------------------
 
-    def _load_from_nexus_v2(self, grp, *, data_only: bool = False,
-                            set_mg: bool = True) -> None:
+    def _load_from_nexus_v2(self, grp, *, data_only: bool = False) -> None:
         """Populate sphere state from a v2 NXroot.
 
         C5: uses :func:`read_sphere_metadata` (not the full
