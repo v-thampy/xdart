@@ -524,11 +524,35 @@ def _write_integrated_1d(f, sphere, *, entry: str,
             new_intensity = _stack_arches(target_arches, "int_1d.intensity")
             if new_intensity is None:
                 return
-            _replace_rows(g, "intensity", positions, new_intensity)
-            new_sigma = _stack_arches(target_arches, "int_1d.sigma")
-            if new_sigma is not None and "sigma" in g:
-                _replace_rows(g, "sigma", positions, new_sigma)
-            return
+            # C3 shape-change check.  When a user reintegrates with a
+            # different ``numpoints`` (or unit change that swaps the
+            # radial axis), ``new_intensity.shape[1:]`` no longer
+            # matches the on-disk row size and a slice-assign would
+            # either raise or — worse — succeed silently with a
+            # truncated row.  We also need to refresh the ``q`` axis
+            # in that case.  Drop the group and fall through to the
+            # append branch, which rewrites everything from scratch
+            # with the new shape.
+            on_disk_row = tuple(g["intensity"].shape[1:])
+            new_row = tuple(new_intensity.shape[1:])
+            if on_disk_row != new_row:
+                import logging
+                logging.getLogger(__name__).info(
+                    "[REPLACE-1D] row shape changed (on-disk=%s, new=%s); "
+                    "falling back to full rewrite",
+                    on_disk_row, new_row,
+                )
+                del h5f[group_path]
+                replace_frame_indices = None
+                # Fall through to the append branch below — it
+                # rewrites the full stacked dataset + refreshes the
+                # ``q`` axis from new_arches[0].int_1d.radial.
+            else:
+                _replace_rows(g, "intensity", positions, new_intensity)
+                new_sigma = _stack_arches(target_arches, "int_1d.sigma")
+                if new_sigma is not None and "sigma" in g:
+                    _replace_rows(g, "sigma", positions, new_sigma)
+                return
 
     # ── Append path (default) ───────────────────────────────────────
     new_arches, existing_n = _new_arches_for_write(sphere, h5f, group_path)
@@ -609,8 +633,25 @@ def _write_integrated_2d(f, sphere, *, entry: str,
                 np.transpose(new_intensity, (0, 2, 1))
                 if new_intensity.ndim == 3 else new_intensity
             )
-            _replace_rows(g, "intensity", positions, new_intensity)
-            return
+            # C3 shape-change check (see _write_integrated_1d for the
+            # full rationale).  npt_rad / npt_azim changes between
+            # integrations break slice-assign; fall back to full
+            # rewrite so both axes (q, chi) get refreshed.
+            on_disk_row = tuple(g["intensity"].shape[1:])
+            new_row = tuple(new_intensity.shape[1:])
+            if on_disk_row != new_row:
+                import logging
+                logging.getLogger(__name__).info(
+                    "[REPLACE-2D] row shape changed (on-disk=%s, new=%s); "
+                    "falling back to full rewrite",
+                    on_disk_row, new_row,
+                )
+                del h5f[group_path]
+                replace_frame_indices = None
+                # Fall through to the append branch below.
+            else:
+                _replace_rows(g, "intensity", positions, new_intensity)
+                return
 
     # ── Append path (default) ───────────────────────────────────────
     new_arches, existing_n = _new_arches_for_write(sphere, h5f, group_path)
@@ -899,11 +940,52 @@ def _write_per_frame_geometry(f, sphere, *, entry: str) -> None:
         # /reduction/config/geometry, so the user can re-derive later.
         return
 
+    # C4: frame_index here must align with the IDs used by
+    # /entry/integrated_1d/frame_index — otherwise a downstream
+    # join-by-frame_index would line up the wrong rows for
+    # 1-based SPEC scans, 0-based Eiger scans, or scans with gaps.
+    # sphere.arches.index holds the authoritative IDs; derived
+    # arrays are aligned to scan_data, so we slice them down to
+    # whatever subset is actually present in the sphere.
+    arch_ids = list(getattr(sphere.arches, "index", []) or [])
+    n_scan = len(scan_data)
+    if arch_ids and len(arch_ids) == n_scan:
+        # Common path: arches and scan_data are 1:1.  Use the actual
+        # frame IDs even if they're 1-based or have an offset.
+        frame_idx_arr = np.asarray(arch_ids, dtype=np.int32)
+        sliced = {k: v for k, v in derived.items()}
+    elif arch_ids:
+        # Partial: subset of scan_data is integrated (e.g. mid-scan
+        # save before all frames arrived).  Map each arch_id to its
+        # position in scan_data so the slice picks the right
+        # motor-derived rows.
+        # We assume arch_ids are an ordered subset of {0..n_scan-1}
+        # (the wrangler always uses the scan-frame index as arch.idx).
+        # For 1-based SPEC: subtract 1 to get the scan_data row.
+        is_one_based = (min(arch_ids) >= 1
+                        and max(arch_ids) <= n_scan
+                        and 0 not in arch_ids)
+        offset = 1 if is_one_based else 0
+        positions = [i - offset for i in arch_ids
+                     if 0 <= i - offset < n_scan]
+        if not positions:
+            return
+        pos_arr = np.asarray(positions, dtype=np.int64)
+        frame_idx_arr = np.asarray(arch_ids[:len(positions)],
+                                   dtype=np.int32)
+        sliced = {k: np.asarray(v)[pos_arr] for k, v in derived.items()}
+    else:
+        # No arches yet — preserve the historical behavior (write
+        # all scan_data rows with ascending row positions as the IDs).
+        frame_idx_arr = np.arange(n_scan, dtype=np.int32)
+        sliced = derived
+
     coll = nx.NXcollection()
-    coll["frame_index"] = nx.NXfield(np.arange(len(scan_data), dtype=np.int32))
-    for key, arr in derived.items():
+    coll["frame_index"] = nx.NXfield(frame_idx_arr)
+    for key, arr in sliced.items():
         units = "deg" if key == "incident_angle" else "rad"
-        coll[key] = nx.NXfield(arr.astype(np.float32), attrs={"units": units})
+        coll[key] = nx.NXfield(np.asarray(arr).astype(np.float32),
+                               attrs={"units": units})
     _assign_nxgroup(f, f"{entry}/per_frame_geometry", coll)
 
 

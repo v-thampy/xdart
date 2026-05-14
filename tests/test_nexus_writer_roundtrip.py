@@ -561,6 +561,60 @@ def test_acquire_save_reload_reintegrate_save_reload(tmp_path):
         assert "entry/reduction" in f
 
 
+def test_replace_with_shape_change_falls_back_to_full_rewrite(tmp_path):
+    """C3: when reintegration changes numpoints/npt_*, slice-assign
+    can't work — writer should delete the group and rewrite from
+    scratch so the q/chi axes refresh too.
+    """
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    import h5py
+
+    n = 3
+    arches = [_DuckArch(idx=i, nq=N_Q, nchi=N_CHI) for i in range(n)]
+    sphere = _DuckSphere(arches)
+    path = tmp_path / "shape_change.nxs"
+    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        assert f["entry/integrated_1d/intensity"].shape == (n, N_Q)
+        assert f["entry/integrated_2d/intensity"].shape == (n, N_CHI, N_Q)
+
+    # Simulate user changing numpoints from N_Q to N_Q * 2.
+    NQ2 = N_Q * 2
+    NCHI2 = N_CHI * 2
+    rng = np.random.default_rng(7)
+    radial_new = np.linspace(0.5, 5.0, NQ2, dtype=np.float32)
+    chi_new = np.linspace(-180.0, 180.0, NCHI2, endpoint=False,
+                          dtype=np.float32)
+    for a in arches:
+        a.int_1d = _DuckResult1D(
+            radial=radial_new,
+            intensity=rng.random(NQ2, dtype=np.float32),
+            sigma=rng.random(NQ2, dtype=np.float32) * 0.1,
+        )
+        a.int_2d = _DuckResult2D(
+            radial=radial_new,
+            azimuthal=chi_new,
+            intensity=rng.random((NQ2, NCHI2), dtype=np.float32),
+        )
+
+    # Trigger replace mode for all frames.  Shape change should be
+    # detected and the writer should rewrite the stacked datasets +
+    # refresh the q/chi axes.
+    save_sphere_to_nexus(
+        sphere, path, entry="entry", finalize=False,
+        replace_frame_indices=[0, 1, 2],
+    )
+
+    with h5py.File(path, "r") as f:
+        # 1D: new shape, new q axis.
+        assert f["entry/integrated_1d/intensity"].shape == (n, NQ2)
+        assert f["entry/integrated_1d/q"].shape == (NQ2,)
+        # 2D: new (chi, q) row shape, new chi axis.
+        assert f["entry/integrated_2d/intensity"].shape == (n, NCHI2, NQ2)
+        assert f["entry/integrated_2d/chi"].shape == (NCHI2,)
+
+
 def test_replace_unknown_frame_idx_is_silent(tmp_path):
     """Listing a frame_idx that doesn't exist on disk: no error, no
     write, other targets still processed."""
