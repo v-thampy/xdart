@@ -286,6 +286,54 @@ class DisplayPlotMixin:
 
     # ── Waterfall rendering ───────────────────────────────────────
 
+    def _wf_y_axis(self, n_rows: int):
+        """Compute the waterfall y-axis array.
+
+        G1: shared between :meth:`update_wf` and
+        :meth:`update_wf_pmesh`.  Returns the ydata array shaped to
+        ``n_rows`` (= data.shape[0] after the wf_start/wf_step slice)
+        or ``None`` when a metadata key is missing — caller handles
+        the no-axis case.
+
+        ``self.wf_yaxis`` selects the source:
+
+        * ``'Frame #'`` → ``arange`` rooted at ``wf_start + 1``.
+        * ``'Time (s)'`` / ``'Time (minutes)'`` →
+          ``scan_info['epoch']`` minus its own minimum (relative).
+        * anything else → ``scan_info[wf_yaxis]`` directly.
+
+        For everything but ``'Frame #'`` we lift the values from
+        ``self.data_1d[idx].scan_info`` for every idx in
+        ``self.idxs``, then slice with the same wf_start/wf_step the
+        data uses.
+        """
+        if self.wf_yaxis == 'Frame #':
+            return np.asarray(np.arange(n_rows) + self.wf_start + 1,
+                              dtype=float)
+        try:
+            if self.wf_yaxis == 'Time (s)':
+                s_ydata = np.asarray(
+                    [self.data_1d[idx].scan_info['epoch']
+                     for idx in self.idxs]
+                )
+                s_ydata -= s_ydata.min()
+            elif self.wf_yaxis == 'Time (minutes)':
+                s_ydata = np.asarray(
+                    [self.data_1d[idx].scan_info['epoch']
+                     for idx in self.idxs]
+                ) / 60.
+                s_ydata -= s_ydata.min()
+            else:
+                s_ydata = np.asarray(
+                    [self.data_1d[idx].scan_info[self.wf_yaxis]
+                     for idx in self.idxs]
+                )
+            return s_ydata[self.wf_start::self.wf_step]
+        except KeyError as e:
+            logger.debug('Counter %s not present in metadata: %s',
+                         self.wf_yaxis, e)
+            return None
+
     def update_wf(self):
         """Updates data in 1D plot Frame
         """
@@ -295,24 +343,9 @@ class DisplayPlotMixin:
         s_xdata, data = xdata_.copy(), data_.copy()
         data = data[self.wf_start::self.wf_step, :]
 
-        # Set YAxis Unit
-        if self.wf_yaxis == 'Frame #':
-            s_ydata = np.asarray(np.arange(data.shape[0]) + self.wf_start + 1, dtype=float)
-        else:
-            # TODO: Fix below for more WF options
-            try:
-                if self.wf_yaxis == 'Time (s)':
-                    s_ydata = np.asarray([self.data_1d[idx].scan_info['epoch'] for idx in self.idxs])
-                    s_ydata -= s_ydata.min()
-                elif self.wf_yaxis == 'Time (minutes)':
-                    s_ydata = np.asarray([self.data_1d[idx].scan_info['epoch'] for idx in self.idxs])/60.
-                    s_ydata -= s_ydata.min()
-                else:
-                    s_ydata = np.asarray([self.data_1d[idx].scan_info[self.wf_yaxis] for idx in self.idxs])
-
-                s_ydata = s_ydata[self.wf_start::self.wf_step]
-            except KeyError:
-                logger.debug('Counter not present in metadata')
+        s_ydata = self._wf_y_axis(data.shape[0])
+        if s_ydata is None:
+            return
 
         from ...gui_utils import get_rect
         rect = get_rect(s_xdata, s_ydata)
@@ -345,21 +378,9 @@ class DisplayPlotMixin:
         s_xdata -= x_step/2
         s_xdata = np.tile(s_xdata, (data.shape[0]+1, 1)).T
 
-        # Set YAxis Unit
-        if self.wf_yaxis == 'Frame #':
-            s_ydata = np.asarray(np.arange(data.shape[0]) + self.wf_start + 1, dtype=float)
-        else:
-            # TODO: Fix below for more WF options
-            if self.wf_yaxis == 'Time (s)':
-                s_ydata = np.asarray([self.data_1d[idx].scan_info['epoch'] for idx in self.idxs])
-                s_ydata -= s_ydata.min()
-            elif self.wf_yaxis == 'Time (minutes)':
-                s_ydata = np.asarray([self.data_1d[idx].scan_info['epoch'] for idx in self.idxs])/60.
-                s_ydata -= s_ydata.min()
-            else:
-                s_ydata = np.asarray([self.data_1d[idx].scan_info[self.wf_yaxis] for idx in self.idxs])
-
-            s_ydata = s_ydata[self.wf_start::self.wf_step]
+        s_ydata = self._wf_y_axis(data.shape[0])
+        if s_ydata is None:
+            return
 
         y_max, y_min = np.max(s_ydata), np.min(s_ydata)
         y_step = (y_max - y_min)/len(s_ydata)

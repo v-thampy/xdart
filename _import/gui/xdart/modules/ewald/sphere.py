@@ -38,8 +38,9 @@ class EwaldSphere:
                  static=False, gi=False, th_mtr=None,
                  incidence_motor=None, geometry=None,
                  series_average=False,
-                 overall_raw=0, single_img=False,
-                 global_mask=None
+                 single_img=False,
+                 global_mask=None,
+                 **_unused,
                  ):
         super().__init__()
         # None-sentinel pattern: mutable defaults (lists, dicts, DataFrames)
@@ -111,7 +112,10 @@ class EwaldSphere:
         self.bai_1d: IntegrationResult1D | None = None
         self.bai_2d: IntegrationResult2D | None = None
 
-        self.overall_raw = overall_raw
+        # G2: ``overall_raw`` was a sum-of-raw-frames accumulator
+        # consumed only by display_data.get_sphere_map_raw (now
+        # deleted).  Drifted from disk under R1 replace-frames and
+        # was never repopulated on v2 reload.
         self.global_mask = global_mask
 
     def reset(self):
@@ -123,7 +127,6 @@ class EwaldSphere:
             self.global_mask = None
             self.bai_1d = None
             self.bai_2d = None
-            self.overall_raw = 0
 
     def has_reload_only_frames(self) -> bool:
         """Return True iff any arch can't recover its raw image.
@@ -259,7 +262,12 @@ class EwaldSphere:
                 if not self.skip_2d:
                     self._accumulate_bai_2d(arch)
 
-            self.overall_raw += (arch.map_raw - arch.bg_raw)
+            # G2: ``self.overall_raw += (arch.map_raw - arch.bg_raw)``
+            # removed.  The accumulator's only consumer was
+            # ``display_data.get_sphere_map_raw``; the Overall view
+            # now aggregates over per-arch ``data_2d['map_raw']``,
+            # which stays correct after R1 replace-frames and v2
+            # reload.
 
             # Persist via the v2 writer.  Idempotent; one slice-assign per
             # stacked dataset.  Skipped in batch mode (caller flushes once
