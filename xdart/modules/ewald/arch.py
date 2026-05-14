@@ -128,9 +128,10 @@ class EwaldArch():
     def __init__(self, idx=None, map_raw=None, poni=None, mask=None,
                  scan_info=None, ai_args=None, file_lock=None,
                  static=False, bg_raw=0,
-                 gi=False, th_mtr='th', tilt_angle=0,
+                 gi=False, incidence_motor=None, tilt_angle=0,
                  sample_orientation=4,
-                 series_average=False, integrator=None
+                 series_average=False, integrator=None,
+                 *, th_mtr=None,  # J1: legacy alias, mapped to incidence_motor
                  ):
         # pylint: disable=too-many-arguments
         """idx: int, name of the arch.
@@ -141,6 +142,10 @@ class EwaldArch():
         scan_info: dict, metadata about scan (None → fresh dict per instance)
         ai_args: dict, args to be fed to azimuthalIntegrator constructor
         file_lock: Condition, lock for file access (None → fresh Condition).
+        incidence_motor: str, name of the GI incidence-angle motor
+        (or its scan_info key).  ``th_mtr`` is accepted as a legacy
+        alias kwarg and mapped here; ``self.th_mtr`` remains a
+        property alias for backward read access.
         """
         super(EwaldArch, self).__init__()
         # F4: None-sentinel pattern.  Mutable defaults in the signature
@@ -166,7 +171,14 @@ class EwaldArch():
 
         self.static = static
         self.gi = gi
-        self.th_mtr = th_mtr
+        # J1: canonical name is ``incidence_motor``.  Pick up the
+        # value from either kwarg with ``incidence_motor=`` winning
+        # if both happen to be passed (shouldn't be — but be
+        # deterministic).  Default 'th' preserves the historical
+        # arch behavior.
+        if incidence_motor is None:
+            incidence_motor = th_mtr if th_mtr is not None else 'th'
+        self.incidence_motor = incidence_motor
         self.tilt_angle = tilt_angle
         self.sample_orientation = sample_orientation
         self.series_average = series_average
@@ -330,15 +342,29 @@ class EwaldArch():
             return False
         return self.map_raw is not None
 
+    @property
+    def th_mtr(self):
+        """Legacy alias for :attr:`incidence_motor`.
+
+        J1: deprecated.  Kept for read access from old GUI signal
+        handlers that pass the motor name positionally.  New code
+        should use ``self.incidence_motor`` directly.
+        """
+        return self.incidence_motor
+
+    @th_mtr.setter
+    def th_mtr(self, value):
+        self.incidence_motor = value
+
     def _get_incident_angle(self):
-        """Return incident angle in degrees from th_mtr or scan_info."""
+        """Return incident angle in degrees from incidence_motor or scan_info."""
         try:
-            return float(self.th_mtr)
+            return float(self.incidence_motor)
         except (ValueError, TypeError):
             # Case-insensitive lookup for motor position
-            th_mtr = str(self.th_mtr).lower()
+            motor = str(self.incidence_motor).lower()
             for key, val in self.scan_info.items():
-                if key.lower() == th_mtr:
+                if key.lower() == motor:
                     return float(val)
             return 0.0
 
@@ -725,7 +751,7 @@ class EwaldArch():
             copy.deepcopy(self.scan_info), copy.deepcopy(self.ai_args),
             self.file_lock,
             static=copy.deepcopy(self.static), gi=copy.deepcopy(self.gi),
-            th_mtr=copy.deepcopy(self.th_mtr),
+            incidence_motor=copy.deepcopy(self.incidence_motor),
             sample_orientation=self.sample_orientation,
             series_average=copy.deepcopy(self.series_average)
         )

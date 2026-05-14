@@ -149,9 +149,13 @@ class staticWidget(QWidget):
             os.mkdir(self.dirname)
 
         self.fname = os.path.join(self.dirname, 'default.nxs')
+        # J2: share ``file_lock`` with the sphere so direct
+        # ArchSeries lazy loads use the same lock as the
+        # wrangler's save paths.
         self.sphere = EwaldSphere('null_main',
                                   data_file=self.fname,
-                                  static=True)
+                                  static=True,
+                                  file_lock=self.file_lock)
         self.arch = EwaldArch(static=True, gi=self.sphere.gi)
         self.arch_ids = []
         self.arches = OrderedDict()
@@ -581,19 +585,24 @@ class staticWidget(QWidget):
         if not self.wrangler.thread.isRunning():
             self.wrangler.enabled(True)
 
-    def new_scan(self, name, fname, gi, th_mtr, single_img, series_average):
+    def new_scan(self, name, fname, gi, incidence_motor, single_img,
+                 series_average):
         """Connected to sigUpdateFile from wrangler. Called when a new
         scan is started.
 
         args:
             name: str, scan name
             fname: str, path to data file for scan
+            incidence_motor: str, GI incidence-motor name (J1 rename;
+                previously this slot was ``th_mtr``).  Qt signals are
+                positional so the rename is purely cosmetic at this
+                boundary — the value still flows through unchanged.
         """
         # if self.sphere.name != name or self.sphere.name == 'null_main':
         self.h5viewer.dirname = os.path.dirname(fname)
         self.h5viewer.set_file(fname)
         self.sphere.gi = gi
-        self.sphere.th_mtr = th_mtr
+        self.sphere.incidence_motor = incidence_motor
         self.sphere.single_img = single_img
         self.sphere.series_average = series_average
         # Propagate the wrangler-loaded mask (detector + user Mask File,

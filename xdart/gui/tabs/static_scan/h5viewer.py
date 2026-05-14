@@ -966,6 +966,16 @@ class H5Viewer(QWidget):
         Delegates to :func:`xdart.modules.ewald.arch_series._load_arch_v2`
         so the read path matches what ``ArchSeries.__getitem__`` does
         on-demand — no schema duplication.
+
+        J3: for large selections we drain the Qt event loop with
+        ``processEvents()`` every ``_LOAD_YIELD_EVERY`` arches.  Without
+        this, selecting N frames in the GUI freezes the event loop
+        for the full O(N × per-arch-read) duration.  The yield gives
+        the UI a tick to repaint scrollbars, the selection rectangle,
+        and the status label, and lets the user click Stop / change
+        the selection mid-load.  Per-arch read stays on the GUI
+        thread — true async would need a worker QThread + reentrancy
+        guard; deferred as a bigger refactor.
         """
         file = self._h5pool.get(self.sphere.data_file)
         if file is None:
@@ -974,7 +984,14 @@ class H5Viewer(QWidget):
 
         from xdart.modules.ewald.arch_series import _load_arch_v2
 
-        for idx in arch_ids:
+        try:
+            from pyqtgraph.Qt import QtWidgets as _QW
+            _app = _QW.QApplication.instance()
+        except Exception:
+            _app = None
+        _LOAD_YIELD_EVERY = 4
+
+        for i, idx in enumerate(arch_ids):
             try:
                 arch = _load_arch_v2(file, idx, static=True, gi=self.sphere.gi)
                 with self.data_lock:
@@ -988,6 +1005,10 @@ class H5Viewer(QWidget):
                                                   'int_2d': arch.int_2d,
                                                   'gi_2d': arch.gi_2d,
                                                   'thumbnail': arch.thumbnail}
+                # Yield to the UI every few arches so scrollbars +
+                # selection rectangle stay responsive.
+                if _app is not None and (i + 1) % _LOAD_YIELD_EVERY == 0:
+                    _app.processEvents()
 
             except (KeyError, IndexError):
                 pass

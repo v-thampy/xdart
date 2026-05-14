@@ -121,7 +121,7 @@ class nexusThread(wranglerThread):
         self.poni = poni
         self.mask_file = mask_file
         self.gi = gi
-        self.th_mtr = th_mtr
+        self.incidence_motor = th_mtr
         self.sample_orientation = sample_orientation
         self.tilt_angle = tilt_angle
         self.gi_mode_1d = gi_mode_1d
@@ -192,7 +192,7 @@ class nexusThread(wranglerThread):
         # Notify the GUI that a new scan is being processed.
         self.sigUpdateFile.emit(
             scan_name, self.fname,
-            self.gi, self.th_mtr,
+            self.gi, self.incidence_motor,
             False, False,  # single_img=False, series_average=False
         )
 
@@ -414,7 +414,7 @@ class nexusThread(wranglerThread):
         scratch = EwaldArch(
             0, first_frame, poni=self.poni,
             scan_info=base_meta, static=True, gi=self.gi,
-            th_mtr=self.th_mtr,
+            th_mtr=self.incidence_motor,
             sample_orientation=self.sample_orientation,
             tilt_angle=self.tilt_angle,
             series_average=False,
@@ -462,7 +462,7 @@ class nexusThread(wranglerThread):
             arch = EwaldArch(
                 frame_idx, img_data, poni=self.poni,
                 scan_info=img_meta, static=True, gi=self.gi,
-                th_mtr=self.th_mtr,
+                th_mtr=self.incidence_motor,
                 sample_orientation=self.sample_orientation,
                 tilt_angle=self.tilt_angle,
                 series_average=False,
@@ -557,7 +557,7 @@ class nexusThread(wranglerThread):
         sphere.add_arch(
             arch=arch, calculate=False, update=True,
             get_sd=True, set_mg=False, static=True, gi=self.gi,
-            th_mtr=self.th_mtr, series_average=False,
+            th_mtr=self.incidence_motor, series_average=False,
             batch_save=True,
         )
         # Publish for the GUI's update_data slot to consume.  Single
