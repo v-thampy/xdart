@@ -796,6 +796,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.bkg_2d, _, _ = self.get_arches_int_2d(idxs)
             self.bkg_map_raw = self.get_arches_map_raw(idxs)
             if self.bkg_map_raw is None:
+                # F5: be honest about a no-op 2D background.  Pre-F5
+                # this silently set bkg=0.: 1D/2D bkg subtraction
+                # would still apply but the user saw "Clear Bkg" on
+                # the button as if 2D was wired up too.  Without
+                # raw frames (e.g. reloaded v2 file without
+                # resolvable source files), there's nothing to
+                # subtract in the 2D map view; log it.
+                logger.warning(
+                    "setBkg: no raw image data available for selected "
+                    "arches; 2D background subtraction inactive "
+                    "(1D / int_2d background still applied).  This "
+                    "usually means the .nxs was reloaded without "
+                    "access to the original source files."
+                )
                 self.bkg_map_raw = 0.
             self.ui.setBkg.setText('Clear Bkg')
         else:

@@ -691,6 +691,13 @@ class specThread(wranglerThread):
             # No cached integrator yet — fall back to serial dispatch
             # (the source integrator gets built on the first call).
             return self._dispatch_batch_serial(sphere, pending)
+        # F3: prewarm the bad-pixel mask on the main thread before
+        # any worker reads it, so cache initialization isn't racy.
+        # ``pending`` tuple shape: (img_file, img_number, img_data,
+        # img_meta, bg_raw, t_read) — index 2 is the image.
+        if (getattr(sphere, '_cached_data_mask', None) is None
+                and pending):
+            self._prewarm_arch_mask(sphere, pending[0][2])
         fiber_integrator = sphere._cached_fiber_integrator
         # Capture the angle the prewarmed fiber integrator was built
         # for.  When ``gi`` is on and a per-frame arch's incidence
@@ -720,7 +727,13 @@ class specThread(wranglerThread):
             ``t_read`` is accepted for tuple-shape compatibility with
             _process_one but isn't surfaced — parallel batch mode logs
             its read times via the per-batch [FLUSH] line.
+
+            F2 cancel-fast: returns ``None`` immediately when Stop
+            has been requested, so already-running workers exit
+            before they hit pyFAI (the expensive part).
             """
+            if self.command == 'stop':
+                return None
             _t0 = time.time()
             # Threshold filtering: replace out-of-band pixels with the
             # dummy sentinel in a fresh float32 copy.  The arch mask

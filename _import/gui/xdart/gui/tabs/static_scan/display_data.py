@@ -55,21 +55,30 @@ class DisplayDataMixin:
             thumb = arch_2d.get('thumbnail')
             if thumb is None and arch_1d is not None:
                 thumb = getattr(arch_1d, 'thumbnail', None)
-            for kk in range(3):
-                try:
-                    scan_info = arch_1d.scan_info if arch_1d is not None else {}
-                    if raw is not None:
-                        intensity += self.normalize(raw - bg, scan_info)
-                    elif thumb is not None:
-                        # Use thumbnail as fallback when raw isn't stored
-                        intensity += self.normalize(
-                            np.asarray(thumb, dtype=float), scan_info)
-                    else:
-                        break
+            # F1: was `for kk in range(3): try: ...; break; except
+            # ValueError: time.sleep(0.5)`.  The retry/sleep pattern
+            # was running on the Qt thread — visible UI freeze on
+            # any single broken arch.  The ValueError originated from
+            # shape mismatches during early-load races; we now log
+            # them at debug and move on (the GUI re-fires update
+            # signals on its own when the wrangler finishes more
+            # frames, so a missed average will be recomputed next
+            # cycle).
+            try:
+                scan_info = arch_1d.scan_info if arch_1d is not None else {}
+                if raw is not None:
+                    intensity += self.normalize(raw - bg, scan_info)
                     ctr += 1
-                    break
-                except ValueError:
-                    time.sleep(0.5)
+                elif thumb is not None:
+                    # Use thumbnail as fallback when raw isn't stored
+                    intensity += self.normalize(
+                        np.asarray(thumb, dtype=float), scan_info)
+                    ctr += 1
+            except ValueError as e:
+                logger.debug(
+                    "get_arches_map_raw skipped arch %s due to shape "
+                    "mismatch: %s", idx, e,
+                )
 
         if ctr > 0:
             intensity /= ctr

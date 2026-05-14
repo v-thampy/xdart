@@ -226,6 +226,15 @@ class nexusThread(wranglerThread):
                 first_frame = np.asarray(ds[0], dtype=np.float32)
                 self._prewarm_fiber_integrator(sphere, first_frame, base_meta)
 
+            # F3: prewarm the stable bad-pixel mask cache on the main
+            # thread before any worker runs.  Without this, the first
+            # N workers all race to compute and write
+            # sphere._cached_data_mask (same value, but the invariant
+            # isn't enforced).  Cheap: one frame read + a flatten.
+            if getattr(sphere, '_cached_data_mask', None) is None:
+                first_frame = np.asarray(ds[0], dtype=np.float32)
+                self._prewarm_arch_mask(sphere, first_frame)
+
             n_workers = min(self.max_cores, nframes)
             # Per-scan integrator pool.  Built lazily on first parallel
             # batch; reused across all subsequent chunks so the
@@ -420,7 +429,13 @@ class nexusThread(wranglerThread):
         so the next worker can borrow it safely.  All shared-sphere
         mutation (data_1d / data_2d / add_arch / sigUpdate) happens
         on the main thread in :meth:`_publish`, not here.
+
+        F2 cancel-fast: returns ``None`` immediately when Stop has
+        been requested, so the user doesn't wait for pyFAI to
+        finish the current frame after pressing Stop.
         """
+        if self.command == 'stop':
+            return None
         _t0 = time.time()
         # Stable bad-pixel mask cached on the sphere across frames so
         # pyFAI's CSR cache stays valid.  Helper now lives on the

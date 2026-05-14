@@ -846,7 +846,11 @@ class H5Viewer(QWidget):
             idxs = self.arch_ids
 
         if (len(idxs) == 0) or ('No data' in idxs):
-            time.sleep(0.1)
+            # F1: no sleep on the Qt thread.  Pre-F1 this slept 100 ms
+            # on every spurious empty-selection signal; multiplied by
+            # many selectionChanged events that fire during list
+            # rebuilds, this added visible UI stutter for no
+            # functional reason (we return immediately afterwards).
             return
 
         # ── Image viewer ─────────────────────────────────────────────

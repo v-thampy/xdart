@@ -293,6 +293,86 @@ class TestReloadOnlyFlagWiring:
 # integrate_*: lazy load happens automatically when map_raw is None
 # ---------------------------------------------------------------------------
 
+class TestPicklingPreservesLazyLoadCapability:
+    """F8 / L1 follow-up.
+
+    The sphere_threads.bai_*_all reintegrate path sends arches into
+    a ProcessPoolExecutor.  Arches reloaded from v2 .nxs lack
+    ``map_raw`` and depend on ``_source_root`` + ``source_file`` to
+    lazy-load it.  The review flagged a suspicion that ``_source_root``
+    might not survive the pickle round-trip (or might resolve
+    relative paths against the *child*'s cwd, not the parent's).
+
+    These tests confirm both attributes pickle cleanly and that the
+    child process can still resolve + load the raw frame.
+    """
+
+    def test_attrs_round_trip_through_pickle(self, tmp_path):
+        import pickle
+        from xdart.modules.ewald.arch import EwaldArch
+
+        a = EwaldArch(idx=42)
+        a.source_file = "frame_0042.tif"
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+        a.is_reload_only = False
+
+        blob = pickle.dumps(a)
+        b = pickle.loads(blob)
+
+        assert b.idx == 42
+        assert b.source_file == "frame_0042.tif"
+        assert b.source_frame_idx == 0
+        assert b._source_root == str(tmp_path)
+        assert b.is_reload_only is False
+        # _resolved_source_path should produce an absolute path
+        # rooted at _source_root — independent of child cwd.
+        full = b._resolved_source_path()
+        assert os.path.isabs(full)
+        assert full == os.path.normpath(
+            os.path.join(str(tmp_path), "frame_0042.tif")
+        )
+
+    def test_subprocess_can_lazy_load_via_pickled_arch(self, tmp_path):
+        """End-to-end: spawn a real subprocess, pickle an arch into
+        it, ask it to lazy-load, get the loaded array back.  This is
+        what sphere_threads.bai_*_all does under the hood.
+        """
+        pytest.importorskip("tifffile")
+        from xdart.modules.ewald.arch import EwaldArch
+
+        img = _write_tif(tmp_path / "frame_0007.tif",
+                         shape=(8, 10), seed=42)
+
+        a = EwaldArch(idx=7)
+        a.map_raw = None
+        a.source_file = "frame_0007.tif"
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+
+        # Use a ProcessPoolExecutor to mirror the real reintegrate
+        # path (sphere_threads._reintegrate_all uses ProcessPoolExecutor).
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_load_and_return_raw, a)
+            result_arr, result_root = future.result()
+
+        # Lazy load succeeded inside the subprocess.
+        assert result_arr is not None
+        assert result_arr.shape == img.shape
+        # The subprocess's _source_root matches the parent's — the
+        # attribute survived pickling.
+        assert result_root == str(tmp_path)
+
+
+def _load_and_return_raw(arch):
+    """Helper for ProcessPoolExecutor — must be module-level for
+    pickling to work."""
+    arch._lazy_load_raw()
+    return arch.map_raw, arch._source_root
+
+
 class TestIntegrateTriggersLazyLoad:
     """Make sure ``integrate_1d`` / ``integrate_2d`` no longer no-op
     silently when there's a recoverable source.

@@ -98,84 +98,66 @@ class integratorThread(Qt.QtCore.QThread):
                 traceback.print_exc()
 
     def bai_2d_all(self):
-        """Integrates all arches 2d. Uses parallel workers when sphere.max_cores > 1."""
+        """Integrates all arches 2d.  Thin wrapper over _reintegrate_all."""
         if getattr(self.sphere, 'skip_2d', False):
             return
+        self._reintegrate_all(do_2d=True)
+
+    def bai_1d_all(self):
+        """Integrates all arches 1d.  Thin wrapper over _reintegrate_all."""
+        self._reintegrate_all(do_2d=False)
+
+    def _reintegrate_all(self, *, do_2d: bool) -> None:
+        """Shared GUI-button reintegration body for 1D and 2D paths.
+
+        F7: lifted the mirror-twin bai_*_all methods up here.  The
+        only meaningful per-dimension differences are:
+          - which bai_*_args set the integration is parameterised on,
+          - which sphere accumulator (bai_1d vs bai_2d) gets cleared,
+          - which viewer dict (data_1d vs data_2d) gets repopulated,
+          - per-arch viewer payload shape.
+        Everything else (load all arches, ProcessPoolExecutor or
+        serial fallback, post-loop replace_frames save) was a copy
+        of the other method.
+
+        After F7 both buttons hit one code path, so a future fix
+        (e.g. for the L1 pickling concern noted in the review) lands
+        in one place.
+        """
         with self.data_lock:
-            self.data_2d.clear()
+            if do_2d:
+                self.data_2d.clear()
+            else:
+                self.data_1d.clear()
         with self.sphere.sphere_lock:
-            self.sphere.bai_2d = None
+            if do_2d:
+                self.sphere.bai_2d = None
+            else:
+                self.sphere.bai_1d = None
 
         max_cores = getattr(self.sphere, 'max_cores', 1)
         all_arches = list(self.sphere.arches)  # load all from H5 into memory
 
-        if max_cores > 1 and len(all_arches) > 1:
-            n_workers = min(max_cores, len(all_arches))
-            futures = {}
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                for arch in all_arches:
-                    f = executor.submit(
-                        _reintegrate_arch, arch,
-                        self.sphere.bai_1d_args, self.sphere.bai_2d_args,
-                        self.sphere.static, self.sphere.gi, do_2d=True,
-                    )
-                    futures[f] = arch.idx
-                for future in as_completed(futures):
-                    try:
-                        arch = future.result()
-                        self.sphere.arches[arch.idx] = arch
-                        self.sphere._accumulate_bai_2d(arch)
-                        with self.data_lock:
-                            self.data_2d[int(arch.idx)] = {
-                                'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
-                                'mask': arch.mask, 'int_2d': arch.int_2d, 'gi_2d': arch.gi_2d,
-                            }
-                        self.update.emit(arch.idx)
-                    except Exception as e:
-                        arch_idx = futures[future]
-                        logger.error("2D integration failed for arch %s: %s", arch_idx, e, exc_info=True)
-                        self.update.emit(arch_idx)
-        else:
-            for arch in all_arches:
-                if self.sphere.static:
-                    arch.static = True
-                if self.sphere.gi:
-                    arch.gi = True
-                arch.integrate_2d(**self.sphere.bai_2d_args)
-                self.sphere.arches[arch.idx] = arch
+        def _publish(arch):
+            """Reattach arch into sphere and viewer dicts."""
+            self.sphere.arches[arch.idx] = arch
+            if do_2d:
                 self.sphere._accumulate_bai_2d(arch)
                 with self.data_lock:
                     self.data_2d[int(arch.idx)] = {
-                        'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
-                        'mask': arch.mask, 'int_2d': arch.int_2d,
+                        'map_raw': arch.map_raw,
+                        'bg_raw': arch.bg_raw,
+                        'mask': arch.mask,
+                        'int_2d': arch.int_2d,
                         'gi_2d': arch.gi_2d,
                     }
-                self.update.emit(arch.idx)
+            else:
+                self.sphere._accumulate_bai_1d(arch)
+                with self.data_lock:
+                    self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
+            self.update.emit(arch.idx)
 
-        # Persist recomputed int_2d rows back to disk.  Replace-frames
-        # mode: the writer locates each frame_idx in the stacked
-        # dataset's frame_index array and slice-assigns the new
-        # intensity over the old.  The save also re-writes
-        # ``/entry/reduction`` so the persisted ``bai_2d_args``
-        # reflect this reintegration's parameters (which is the whole
-        # reason the user kicked it off).  Skipping the legacy
-        # ``ut.dict_to_h5(..., 'bai_2d_args')`` path entirely — that
-        # wrote to the file root, which is the v1 layout we dropped
-        # in 0.37.0, and it never updated the v2 stacked rows.
-        replace_idxs = list(self.sphere.arches.index)
-        if replace_idxs:
-            self.sphere.save_to_nexus(replace_frame_indices=replace_idxs)
-
-    def bai_1d_all(self):
-        """Integrates all arches 1d. Uses parallel workers when sphere.max_cores > 1."""
-        with self.data_lock:
-            self.data_1d.clear()
-        with self.sphere.sphere_lock:
-            self.sphere.bai_1d = None
-
-        max_cores = getattr(self.sphere, 'max_cores', 1)
-        all_arches = list(self.sphere.arches)  # load all from H5 into memory
-
+        label = '2D' if do_2d else '1D'
         if max_cores > 1 and len(all_arches) > 1:
             n_workers = min(max_cores, len(all_arches))
             futures = {}
@@ -184,20 +166,18 @@ class integratorThread(Qt.QtCore.QThread):
                     f = executor.submit(
                         _reintegrate_arch, arch,
                         self.sphere.bai_1d_args, self.sphere.bai_2d_args,
-                        self.sphere.static, self.sphere.gi, do_2d=False,
+                        self.sphere.static, self.sphere.gi, do_2d=do_2d,
                     )
                     futures[f] = arch.idx
                 for future in as_completed(futures):
                     try:
-                        arch = future.result()
-                        self.sphere.arches[arch.idx] = arch
-                        self.sphere._accumulate_bai_1d(arch)
-                        with self.data_lock:
-                            self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
-                        self.update.emit(arch.idx)
+                        _publish(future.result())
                     except Exception as e:
                         arch_idx = futures[future]
-                        logger.error("1D integration failed for arch %s: %s", arch_idx, e, exc_info=True)
+                        logger.error(
+                            "%s integration failed for arch %s: %s",
+                            label, arch_idx, e, exc_info=True,
+                        )
                         self.update.emit(arch_idx)
         else:
             for arch in all_arches:
@@ -205,15 +185,19 @@ class integratorThread(Qt.QtCore.QThread):
                     arch.static = True
                 if self.sphere.gi:
                     arch.gi = True
-                arch.integrate_1d(**self.sphere.bai_1d_args)
-                self.sphere.arches[arch.idx] = arch
-                self.sphere._accumulate_bai_1d(arch)
-                with self.data_lock:
-                    self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
-                self.update.emit(arch.idx)
+                if do_2d:
+                    arch.integrate_2d(**self.sphere.bai_2d_args)
+                else:
+                    arch.integrate_1d(**self.sphere.bai_1d_args)
+                _publish(arch)
 
-        # Persist recomputed int_1d rows back to disk via the v2
-        # replace-frames path.  See ``bai_2d_all`` for the rationale.
+        # Persist recomputed int_* rows back to disk via the v2
+        # replace-frames path.  The save re-writes /entry/reduction
+        # so the persisted bai_*_args reflect this reintegration's
+        # parameters (which is the whole reason the user kicked it
+        # off).  Replaces the legacy ``ut.dict_to_h5(...,
+        # 'bai_*_args')`` write-to-root path (v1 layout, dropped
+        # in 0.37.0) — that path never updated the v2 stacked rows.
         replace_idxs = list(self.sphere.arches.index)
         if replace_idxs:
             self.sphere.save_to_nexus(replace_frame_indices=replace_idxs)
