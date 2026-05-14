@@ -87,22 +87,11 @@ class DisplayDataMixin:
 
         return np.asarray(intensity, dtype=float)
 
-    def get_sphere_map_raw(self):
-        """Returns data and QRect for data in sphere
-        """
-        with self.sphere.sphere_lock:
-            map_raw = np.asarray(self.sphere.overall_raw, dtype=float)
-            if map_raw.ndim < 2:
-                self.sphere.load_from_h5(data_only=True)
-                map_raw = np.asarray(self.sphere.overall_raw, dtype=float)
-
-            norm_fac = len(self.sphere.arches.index)
-            if self.normChannel:
-                norm = self.sphere.scan_data[self.normChannel].sum()
-                if norm > 0:
-                    norm_fac = norm
-
-            return map_raw/norm_fac
+    # G2: get_sphere_map_raw was deleted.  It read sphere.overall_raw,
+    # an in-memory accumulator that doesn't survive v2 reload (the
+    # loader doesn't repopulate it) and goes stale under R1's
+    # replace-frames save.  The Overall view in update_image now
+    # aggregates via get_arches_map_raw(list(sphere.arches.index)).
 
     # ── 2D integration data access ────────────────────────────────
 
@@ -154,19 +143,13 @@ class DisplayDataMixin:
         intensity = intensity / ctr
         return intensity, xdata, ydata
 
-    def get_sphere_int_2d(self):
-        """Returns data and QRect for data in sphere
-        """
-        with self.sphere.sphere_lock:
-            int_2d = self.sphere.bai_2d
-
-        if int_2d is None:
-            return np.zeros((1, 1)), np.array([]), np.array([])
-
-        intensity = self.get_int_2d(int_2d, normalize=True)
-
-        xdata, ydata = self.get_xydata(int_2d)
-        return intensity, xdata, ydata
+    # G2: get_sphere_int_2d was deleted.  It read sphere.bai_2d, an
+    # in-memory accumulator that doesn't survive v2 reload.  The
+    # Overall view in update_binned now uses
+    # get_arches_int_2d(list(sphere.arches.index)).  The comment
+    # at the call site (display_frame_widget.update_binned) already
+    # noted this path returned 1×1 zeros for NeXus files — so it's
+    # been functionally dead since v2 landed.
 
     def get_int_2d(self, int_2d, arch_1d=None, normalize=True, gi_2d=None):
         """Returns the appropriate 2D data depending on the chosen axes.

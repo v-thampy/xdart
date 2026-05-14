@@ -651,7 +651,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """
         mask = None
         if self.overall and len(self.arch_ids) > 1:
-            data = self.get_sphere_map_raw()
+            # G2: aggregate via per-arch dict instead of the deleted
+            # sphere.overall_raw accumulator.  Stays correct after v2
+            # reload (the accumulator didn't), and after replace-frames
+            # reintegration (the accumulator drifted).
+            data = self.get_arches_map_raw(
+                list(self.sphere.arches.index),
+            )
+            if data is None:
+                return
         else:
             data = self.get_arches_map_raw()
             if data is None:
@@ -703,15 +711,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
             self.update_plot_view()
 
-        # Always aggregate from per-arch data_2d. The legacy
-        # `self.overall → get_sphere_int_2d()` shortcut returned a 1×1
-        # zero array when `sphere.bai_2d` wasn't populated (common with
-        # NeXus files that store per-arch results only), which made the
-        # 2D pane go blank as soon as all arches were selected.
+        # Always aggregate from per-arch data_2d.  Pre-G2 there was a
+        # fall-through to get_sphere_int_2d() (now deleted — it read
+        # the in-memory sphere.bai_2d accumulator that didn't survive
+        # v2 reload).  If selecting "Overall" with the current
+        # idxs_2d cache empty / partial, widen the aggregation
+        # across the full arches.index so we don't render a partial
+        # average.
         intensity, xdata, ydata = self.get_arches_int_2d()
         if intensity is None and self.overall and len(self.arch_ids) > 1:
-            # Fall back to the precomputed sphere total if available.
-            intensity, xdata, ydata = self.get_sphere_int_2d()
+            intensity, xdata, ydata = self.get_arches_int_2d(
+                list(self.sphere.arches.index),
+            )
 
         if intensity is None:
             return

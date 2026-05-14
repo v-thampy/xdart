@@ -552,149 +552,183 @@ class integratorTree(QtWidgets.QWidget):
                 else:
                     args[child.name()] = val
 
-    def _get_radial_range_1D(self):
-        """Sets Sphere 1D radial range in bai_1d_args from UI values"""
-        auto = self.ui.radial_autoRange_1D.isChecked()
-        self.radial_autoRange_1D = auto
+    # G3: the eight range-handler methods used to be hand-written
+    # copies of the same pattern (read auto checkbox → toggle line
+    # edits, push/pull the (low, high) tuple to/from bai_*_args
+    # under a per-handler key).  Lifted into two table-driven
+    # primitives below.  The Qip/Qoop key-swap in the 2D get is
+    # preserved verbatim; the 2D set reads ``radial_range`` even
+    # when GI is on (verified intentional — the UI line edits only
+    # bind to ``radial_range`` regardless of axis mode).
 
+    def _get_range_into_args(self, *, auto_cb, low_edit, high_edit,
+                              args_dict, key, auto_attr,
+                              gi_alt_key=None, after=None):
+        """Read auto-checkbox + (low, high) line edits into args_dict.
+
+        ``gi_alt_key`` (2D only): when set, and the sphere is in GI
+        mode with axis2D == Qip vs Qoop, store under that key instead
+        of ``key``.  Pre-G3 this was a hand-written `if` in every
+        2D ``_get_*`` method.
+
+        ``after``: optional callable run after the dict + UI updates
+        (e.g. ``_update_npts_oop_visibility_1d``).
+        """
+        auto = auto_cb.isChecked()
+        setattr(self, auto_attr, auto)
         _range = None
         if not auto:
-            _range = self._get_valid_range(self.ui.radial_low_1D,
-                                           self.ui.radial_high_1D)
-        self.sphere.bai_1d_args['radial_range'] = _range
+            _range = self._get_valid_range(low_edit, high_edit)
+        effective_key = key
+        if (gi_alt_key
+                and self.sphere.gi
+                and self.ui.axis2D.currentIndex() == 0):
+            effective_key = gi_alt_key
+        args_dict[effective_key] = _range
+        low_edit.setEnabled(not auto)
+        high_edit.setEnabled(not auto)
+        if after is not None:
+            after()
 
-        self.ui.radial_low_1D.setEnabled(not auto)
-        self.ui.radial_high_1D.setEnabled(not auto)
+    def _set_range_from_args(self, *, auto_cb, low_edit, high_edit,
+                              args_dict, key, auto_attr,
+                              disconnect, connect, after=None):
+        """Mirror of :meth:`_get_range_into_args`: push args_dict[key]
+        back onto the UI widgets.
+
+        ``disconnect`` / ``connect`` bracket the widget mutations so
+        the line-edit change signals don't fire back into
+        ``_get_range_into_args`` during the update.
+        """
+        disconnect()
+        _range = args_dict[key]
+        if _range is None:
+            auto_cb.setChecked(True)
+            auto = True
+        else:
+            low_edit.setText(str(_range[0]))
+            high_edit.setText(str(_range[1]))
+            auto = False
+        setattr(self, auto_attr, auto)
+        low_edit.setEnabled(not auto)
+        high_edit.setEnabled(not auto)
+        if after is not None:
+            after()
+        connect()
+
+    def _get_radial_range_1D(self):
+        """Sets Sphere 1D radial range in bai_1d_args from UI values"""
+        self._get_range_into_args(
+            auto_cb=self.ui.radial_autoRange_1D,
+            low_edit=self.ui.radial_low_1D,
+            high_edit=self.ui.radial_high_1D,
+            args_dict=self.sphere.bai_1d_args,
+            key='radial_range',
+            auto_attr='radial_autoRange_1D',
+        )
 
     def _set_radial_range_1D(self):
         """Sets UI values from Sphere 1D radial range in bai_1d_args"""
-        self._disconnect_radial_range_1D_signals()
-
-        _range = self.sphere.bai_1d_args['radial_range']
-        if _range is None:
-            self.ui.radial_autoRange_1D.setChecked(True)
-            auto = True
-        else:
-            self.ui.radial_low_1D.setText(str(_range[0]))
-            self.ui.radial_high_1D.setText(str(_range[1]))
-            auto = False
-
-        self.radial_autoRange_1D = auto
-        self.ui.radial_low_1D.setEnabled(not auto)
-        self.ui.radial_high_1D.setEnabled(not auto)
-
-        self._connect_radial_range_1D_signals()
+        self._set_range_from_args(
+            auto_cb=self.ui.radial_autoRange_1D,
+            low_edit=self.ui.radial_low_1D,
+            high_edit=self.ui.radial_high_1D,
+            args_dict=self.sphere.bai_1d_args,
+            key='radial_range',
+            auto_attr='radial_autoRange_1D',
+            disconnect=self._disconnect_radial_range_1D_signals,
+            connect=self._connect_radial_range_1D_signals,
+        )
 
     def _get_azim_range_1D(self):
         """Sets Sphere 1D azimuth range in bai_1d_args from UI values"""
-        auto = self.ui.azim_autoRange_1D.isChecked()
-        self.azim_autoRange_1D = auto
-
-        _range = None
-        if not auto:
-            _range = self._get_valid_range(self.ui.azim_low_1D,
-                                           self.ui.azim_high_1D)
-        self.sphere.bai_1d_args['azimuth_range'] = _range
-
-        self.ui.azim_low_1D.setEnabled(not auto)
-        self.ui.azim_high_1D.setEnabled(not auto)
         # Toggling auto can flip the q_total path between fast (1 Pts) and
-        # slow (2 Pts); refresh the npts_oop_1D visibility.
-        self._update_npts_oop_visibility_1d()
+        # slow (2 Pts); refresh the npts_oop_1D visibility after the
+        # dict update lands.
+        self._get_range_into_args(
+            auto_cb=self.ui.azim_autoRange_1D,
+            low_edit=self.ui.azim_low_1D,
+            high_edit=self.ui.azim_high_1D,
+            args_dict=self.sphere.bai_1d_args,
+            key='azimuth_range',
+            auto_attr='azim_autoRange_1D',
+            after=self._update_npts_oop_visibility_1d,
+        )
 
     def _set_azim_range_1D(self):
         """Sets UI values from Sphere 1D azimuth range in bai_1d_args."""
-        self._disconnect_azim_range_1D_signals()
-
-        _range = self.sphere.bai_1d_args['azimuth_range']
-        if _range is None:
-            self.ui.azim_autoRange_1D.setChecked(True)
-            auto = True
-        else:
-            self.ui.azim_low_1D.setText(str(_range[0]))
-            self.ui.azim_high_1D.setText(str(_range[1]))
-            auto = False
-
-        self.azim_autoRange_1D = auto
-        self.ui.azim_low_1D.setEnabled(not auto)
-        self.ui.azim_high_1D.setEnabled(not auto)
-        self._update_npts_oop_visibility_1d()
-
-        self._connect_azim_range_1D_signals()
+        self._set_range_from_args(
+            auto_cb=self.ui.azim_autoRange_1D,
+            low_edit=self.ui.azim_low_1D,
+            high_edit=self.ui.azim_high_1D,
+            args_dict=self.sphere.bai_1d_args,
+            key='azimuth_range',
+            auto_attr='azim_autoRange_1D',
+            disconnect=self._disconnect_azim_range_1D_signals,
+            connect=self._connect_azim_range_1D_signals,
+            after=self._update_npts_oop_visibility_1d,
+        )
 
     def _get_radial_range_2D(self):
-        """Sets Sphere 2D radial range in bai_2d_args from UI values"""
-        auto = self.ui.radial_autoRange_2D.isChecked()
-        self.radial_autoRange_2D = auto
+        """Sets Sphere 2D radial range in bai_2d_args from UI values.
 
-        _range = None
-        if not auto:
-            _range = self._get_valid_range(self.ui.radial_low_2D,
-                                           self.ui.radial_high_2D)
-
-        if self.sphere.gi and self.ui.axis2D.currentIndex() == 0:  # Qip vs Qoop
-            self.sphere.bai_2d_args['x_range'] = _range
-        else:
-            self.sphere.bai_2d_args['radial_range'] = _range
-
-        self.ui.radial_low_2D.setEnabled(not auto)
-        self.ui.radial_high_2D.setEnabled(not auto)
+        GI Qip-vs-Qoop swaps the dict key from ``radial_range`` to
+        ``x_range`` (handled by ``gi_alt_key``).
+        """
+        self._get_range_into_args(
+            auto_cb=self.ui.radial_autoRange_2D,
+            low_edit=self.ui.radial_low_2D,
+            high_edit=self.ui.radial_high_2D,
+            args_dict=self.sphere.bai_2d_args,
+            key='radial_range',
+            auto_attr='radial_autoRange_2D',
+            gi_alt_key='x_range',
+        )
 
     def _set_radial_range_2D(self):
-        """Sets UI values from Sphere 2D radial range in bai_2d_args"""
-        self._disconnect_radial_range_2D_signals()
+        """Sets UI values from Sphere 2D radial range in bai_2d_args.
 
-        _range = self.sphere.bai_2d_args['radial_range']
-        if _range is None:
-            self.ui.radial_autoRange_2D.setChecked(True)
-            auto = True
-        else:
-            self.ui.radial_low_2D.setText(str(_range[0]))
-            self.ui.radial_high_2D.setText(str(_range[1]))
-            auto = False
-
-        self.radial_autoRange_2D = auto
-        self.ui.radial_low_2D.setEnabled(not auto)
-        self.ui.radial_high_2D.setEnabled(not auto)
-
-        self._connect_radial_range_2D_signals()
+        Reads ``radial_range`` regardless of GI mode (the UI line
+        edits only bind to that key; see the _get counterpart).
+        """
+        self._set_range_from_args(
+            auto_cb=self.ui.radial_autoRange_2D,
+            low_edit=self.ui.radial_low_2D,
+            high_edit=self.ui.radial_high_2D,
+            args_dict=self.sphere.bai_2d_args,
+            key='radial_range',
+            auto_attr='radial_autoRange_2D',
+            disconnect=self._disconnect_radial_range_2D_signals,
+            connect=self._connect_radial_range_2D_signals,
+        )
 
     def _get_azim_range_2D(self):
-        """Sets Sphere 2D azimuth range in bai_2d_args from UI values"""
-        auto = self.ui.azim_autoRange_2D.isChecked()
-        self.azim_autoRange_2D = auto
+        """Sets Sphere 2D azimuth range in bai_2d_args from UI values.
 
-        _range = None
-        if not auto:
-            _range = self._get_valid_range(self.ui.azim_low_2D,
-                                           self.ui.azim_high_2D)
-
-        if self.sphere.gi and self.ui.axis2D.currentIndex() == 0:  # Qip vs Qoop
-            self.sphere.bai_2d_args['y_range'] = _range
-        else:
-            self.sphere.bai_2d_args['azimuth_range'] = _range
-
-        self.ui.azim_low_2D.setEnabled(not auto)
-        self.ui.azim_high_2D.setEnabled(not auto)
+        GI Qip-vs-Qoop swaps to ``y_range``.
+        """
+        self._get_range_into_args(
+            auto_cb=self.ui.azim_autoRange_2D,
+            low_edit=self.ui.azim_low_2D,
+            high_edit=self.ui.azim_high_2D,
+            args_dict=self.sphere.bai_2d_args,
+            key='azimuth_range',
+            auto_attr='azim_autoRange_2D',
+            gi_alt_key='y_range',
+        )
 
     def _set_azim_range_2D(self):
         """Sets UI values from Sphere 2D azimuth range in bai_2d_args."""
-        self._disconnect_azim_range_2D_signals()
-
-        _range = self.sphere.bai_2d_args['azimuth_range']
-        if _range is None:
-            self.ui.azim_autoRange_2D.setChecked(True)
-            auto = True
-        else:
-            self.ui.azim_low_2D.setText(str(_range[0]))
-            self.ui.azim_high_2D.setText(str(_range[1]))
-            auto = False
-
-        self.azim_autoRange_2D = auto
-        self.ui.azim_low_2D.setEnabled(not auto)
-        self.ui.azim_high_2D.setEnabled(not auto)
-
-        self._connect_azim_range_2D_signals()
+        self._set_range_from_args(
+            auto_cb=self.ui.azim_autoRange_2D,
+            low_edit=self.ui.azim_low_2D,
+            high_edit=self.ui.azim_high_2D,
+            args_dict=self.sphere.bai_2d_args,
+            key='azimuth_range',
+            auto_attr='azim_autoRange_2D',
+            disconnect=self._disconnect_azim_range_2D_signals,
+            connect=self._connect_azim_range_2D_signals,
+        )
 
     @staticmethod
     def _get_valid_range(low_widget, high_widget):
