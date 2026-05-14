@@ -592,21 +592,28 @@ class DisplayDataMixin:
         fname = os.path.join(path, fname)
 
         xdata, ydata = self.plot_data
-        if self.plotMethod in ['Average', 'Sum']:
+        # H4: Average / Sum produces ONE combined output.  Pre-H4 the
+        # code wrote the combined file AND then fell through to the
+        # per-frame loop below — silently producing dozens of extra
+        # per-frame .xye files alongside an "average.xye" in the
+        # same directory.  Branch cleanly: Average/Sum → combined
+        # only; everything else (Overlay, Single, Waterfall) →
+        # per-frame files.
+        if self.plotMethod in ('Average', 'Sum'):
             if self.plotMethod == 'Average':
                 s_ydata = np.nanmean(ydata, 0)
             else:
                 s_ydata = np.nansum(ydata, 0)
-
-            # Write to xye
             xye_fname = f'{fname}.xye'
             ut.write_xye(xye_fname, xdata, s_ydata)
-
-        idxs = [arch.replace(f'{self.sphere.name}_', '') for arch in self.arch_names]
-        for nn, (s_ydata, idx) in enumerate(zip(ydata, idxs)):
-            # Write to xye
-            xye_fname = f'{fname}_{str(idx).zfill(4)}.xye'
-            ut.write_xye(xye_fname, xdata, s_ydata)
+        else:
+            idxs = [
+                arch.replace(f'{self.sphere.name}_', '')
+                for arch in self.arch_names
+            ]
+            for s_ydata, idx in zip(ydata, idxs):
+                xye_fname = f'{fname}_{str(idx).zfill(4)}.xye'
+                ut.write_xye(xye_fname, xdata, s_ydata)
 
         if not auto:
             scene = self.plot_viewBox.scene()

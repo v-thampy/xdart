@@ -195,16 +195,38 @@ def save_sphere_to_nexus(
         # 3-6: per-frame metadata, positioners, derived geometry and
         # instrument are *write-once* values (raw motor positions
         # don't change on reintegration; neither do PONI, thumbnail,
-        # mask).  Skip them in replace mode for a faster save.
+        # mask).  Skip in replace mode for a faster save.
         if not is_replace:
+            # Per-frame metadata already has its own cursor (R4) —
+            # cheap on every save.
             _write_per_frame_metadata(f, sphere, entry=entry)
             _t0 = _tick("per_frame_metadata", _t0)
-            _write_positioners(f, sphere, entry=entry)
-            _t0 = _tick("positioners", _t0)
-            _write_per_frame_geometry(f, sphere, entry=entry)
-            _t0 = _tick("per_frame_geometry", _t0)
-            _write_instrument(f, sphere, entry=entry)
-            _t0 = _tick("instrument", _t0)
+
+            # H1: positioners and per_frame_geometry still rebuild
+            # full-scan arrays on every call (no cursor yet), so
+            # gate them on first-save or finalize.  Intermediate
+            # periodic saves don't need them — live viewers index
+            # by frame_index from the stacked integrated_* datasets,
+            # and the scan motor columns are still inspectable via
+            # the source NeXus / SPEC file.  This is the H1 fix
+            # from review #3 (item 5): cuts ~O(N) write cost per
+            # periodic save on long scans.
+            positioners_path = f"{entry}/sample/positioners"
+            geom_path = f"{entry}/per_frame_geometry"
+            instr_path = f"{entry}/instrument"
+            first_pos = positioners_path not in h5f
+            first_geom = geom_path not in h5f
+            first_instr = instr_path not in h5f
+
+            if finalize or first_pos:
+                _write_positioners(f, sphere, entry=entry)
+                _t0 = _tick("positioners", _t0)
+            if finalize or first_geom:
+                _write_per_frame_geometry(f, sphere, entry=entry)
+                _t0 = _tick("per_frame_geometry", _t0)
+            if finalize or first_instr:
+                _write_instrument(f, sphere, entry=entry)
+                _t0 = _tick("instrument", _t0)
 
         # 7. Stitched outputs (if present on the sphere) — finalize only.
         if finalize:

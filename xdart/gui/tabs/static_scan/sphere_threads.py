@@ -256,8 +256,8 @@ class fileHandlerThread(Qt.QtCore.QThread):
     sigTaskDone = Qt.QtCore.Signal(str)
     
     def __init__(self, sphere, arch, file_lock,
-                 parent=None, arch_ids=[], arches=None,
-                 data_1d={}, data_2d={}, data_lock=None):
+                 parent=None, arch_ids=None, arches=None,
+                 data_1d=None, data_2d=None, data_lock=None):
         """
         Parameters
         ----------
@@ -267,14 +267,18 @@ class fileHandlerThread(Qt.QtCore.QThread):
         data_lock : threading.RLock, optional
             Shared lock guarding data_1d / data_2d; a private RLock is
             created when not provided.
+
+        H3: ``arch_ids``, ``data_1d``, ``data_2d`` default to None
+        (was ``[]`` / ``{}`` — mutable defaults shared across all
+        instances that omit the kwarg).
         """
         super().__init__(parent)
         self.sphere = sphere
         self.arch = arch
-        self.arch_ids = arch_ids
+        self.arch_ids = arch_ids if arch_ids is not None else []
         self.arches = arches
-        self.data_1d = data_1d
-        self.data_2d = data_2d
+        self.data_1d = data_1d if data_1d is not None else {}
+        self.data_2d = data_2d if data_2d is not None else {}
         self.data_lock = data_lock if data_lock is not None else RLock()
         self.file_lock = file_lock
         self.queue = Queue()
