@@ -1133,6 +1133,117 @@ def _read_sphere_v2(path: Path, entry: str, groups: tuple[str, ...],
     return ds
 
 
+def read_sphere_metadata(
+    path: Path | str,
+    *,
+    entry: str = "entry",
+):
+    """Read everything *except* the heavy integrated stacks.
+
+    Returns an :class:`xarray.Dataset` shaped like :func:`read_sphere`
+    but with ``intensity_1d``, ``intensity_2d``, ``sigma_1d``, and
+    thumbnails omitted.  Still includes:
+
+    * ``frame`` coord (from ``integrated_1d/frame_index`` or
+      ``integrated_2d/frame_index``, falling back to
+      ``per_frame_geometry/frame_index``)
+    * ``q`` and ``chi`` coords (cheap, ~few KB)
+    * Per-frame motor positioners and derived geometry
+    * ``ds.attrs["reduction"]`` (provenance, bai_*_args, geometry config)
+
+    Intended for the GUI open path where a viewer needs to know what
+    frames exist + what axes they're sampled on, but doesn't yet need
+    the full (frame, chi, q) intensity tensor.  ``ArchSeries`` lazy-
+    loads each frame's slices on demand.
+
+    Reading just frame_index + coords + positioners is O(few KB) vs
+    O(N * nchi * nq * 4 B) for the full ``intensity_2d`` materialisation
+    — opening a 10k-frame Eiger scan goes from ~seconds to ~tens of ms.
+    """
+    import xarray as xr
+    from ssrl_xrd_tools.core.provenance import read_provenance
+
+    path = Path(path)
+    data_vars: dict[str, tuple] = {}
+    coords: dict[str, np.ndarray] = {}
+    attrs_per_coord: dict[str, dict] = {}
+
+    with h5py.File(path, "r") as f:
+        if entry not in f:
+            raise KeyError(f"No {entry!r} group in {path}")
+        e = f[entry]
+
+        # frame_index — try integrated_1d first, then integrated_2d,
+        # then per_frame_geometry.  Cheap; no intensity is loaded.
+        for grp_name in ("integrated_1d", "integrated_2d",
+                         "per_frame_geometry"):
+            if grp_name in e and "frame_index" in e[grp_name]:
+                coords["frame"] = np.asarray(
+                    e[grp_name]["frame_index"][()]
+                )
+                break
+
+        # q / chi axes (small).
+        if "integrated_1d" in e and "q" in e["integrated_1d"]:
+            coords["q"] = np.asarray(e["integrated_1d/q"][()])
+            u = e["integrated_1d/q"].attrs.get("units", None)
+            if u is not None:
+                attrs_per_coord["q"] = {"units": _v2_decode_str(u)}
+        if "integrated_2d" in e:
+            g2 = e["integrated_2d"]
+            if "q" in g2:
+                coords["q_2d"] = np.asarray(g2["q"][()])
+                u_q2 = g2["q"].attrs.get("units", None)
+                if u_q2 is not None:
+                    attrs_per_coord["q_2d"] = {"units": _v2_decode_str(u_q2)}
+            if "chi" in g2:
+                coords["chi"] = np.asarray(g2["chi"][()])
+                u = g2["chi"].attrs.get("units", None)
+                if u is not None:
+                    attrs_per_coord["chi"] = {"units": _v2_decode_str(u)}
+
+        # Derived per-frame geometry (rot1/2/3, incident_angle).
+        if "per_frame_geometry" in e:
+            gg = e["per_frame_geometry"]
+            for key in ("rot1", "rot2", "rot3", "incident_angle"):
+                if key in gg:
+                    data_vars[key] = (("frame",), np.asarray(gg[key][()]))
+
+        # Positioners.
+        for category, path_in in [
+            ("sample", "sample/positioners"),
+            ("detector", "instrument/detector/positioners"),
+        ]:
+            if path_in in e:
+                pos = _read_positioners(e[path_in])
+                for k, arr in pos.items():
+                    reserved = {"q", "chi", "frame"}
+                    if k in reserved or k in data_vars:
+                        var_name = f"{category}_{k}"
+                    else:
+                        var_name = k
+                    data_vars[var_name] = (("frame",), arr)
+
+        # Fallback frame coord if neither integrated_* nor
+        # per_frame_geometry carried frame_index but positioners
+        # did contribute (frame,) arrays.
+        if "frame" not in coords:
+            for _, (_, arr) in data_vars.items():
+                if isinstance(arr, np.ndarray) and arr.ndim >= 1:
+                    coords["frame"] = np.arange(arr.shape[0], dtype=np.int32)
+                    break
+
+    ds = xr.Dataset(data_vars=data_vars, coords=coords)
+    for var, attrs in attrs_per_coord.items():
+        if var in ds.coords:
+            ds[var].attrs.update(attrs)
+    try:
+        ds.attrs["reduction"] = read_provenance(str(path), entry=entry)
+    except Exception:
+        ds.attrs["reduction"] = {}
+    return ds
+
+
 def read_sphere(
     path: Path | str,
     *,
@@ -1220,5 +1331,6 @@ __all__ = [
     "write_nexus_frame",
     # v2 (xdart 0.37+)
     "read_sphere",
+    "read_sphere_metadata",
     "read_stitched",
 ]

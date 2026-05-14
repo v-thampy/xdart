@@ -13,6 +13,7 @@ from ssrl_xrd_tools.io.nexus import (
     open_nexus_image_stack,
     open_nexus_writer,
     read_nexus,
+    read_sphere_metadata,
     write_nexus,
     write_nexus_frame,
 )
@@ -407,6 +408,99 @@ class TestNexusImageStack:
 # ---------------------------------------------------------------------------
 # TestListEntries
 # ---------------------------------------------------------------------------
+
+class TestReadSphereMetadata:
+    """Locks down the C5 lean reader's contract.
+
+    The metadata loader exists so the GUI open path can spin up
+    an :class:`EwaldSphere` viewer in O(few KB) reads instead of
+    O(N * nchi * nq * 4B).  Per-frame intensity arrays stay on disk
+    and ArchSeries lazy-loads them.
+    """
+
+    @pytest.fixture
+    def synth_v2_sphere(self, tmp_path):
+        """Hand-craft a minimal v2 NXroot with frame_index, q/chi,
+        positioners, and an ``integrated_2d`` that is intentionally
+        big so 'metadata-only' has something to refuse to load."""
+        p = tmp_path / "sphere.nxs"
+        with h5py.File(p, "w") as f:
+            e = f.create_group("entry")
+            e.attrs["NX_class"] = "NXentry"
+
+            # 1D stack — 100 frames × 32 q.  Frame IDs 1-based to
+            # mimic SPEC (the C4 alignment case).
+            g1 = e.create_group("integrated_1d")
+            g1.create_dataset(
+                "intensity",
+                data=np.ones((100, 32), dtype=np.float32),
+            )
+            g1.create_dataset(
+                "frame_index",
+                data=np.arange(1, 101, dtype=np.int32),
+            )
+            q = g1.create_dataset("q",
+                                  data=np.linspace(0.5, 5.0, 32,
+                                                   dtype=np.float32))
+            q.attrs["units"] = b"1/angstrom"
+
+            # 2D stack — 100 × 16 × 32.  Bigger ndim; this is the
+            # one the metadata loader must NOT pull into memory.
+            g2 = e.create_group("integrated_2d")
+            g2.create_dataset(
+                "intensity",
+                data=np.ones((100, 16, 32), dtype=np.float32),
+            )
+            g2.create_dataset("q",
+                              data=np.linspace(0.5, 5.0, 32,
+                                               dtype=np.float32))
+            chi = g2.create_dataset(
+                "chi", data=np.linspace(-180.0, 180.0, 16,
+                                        endpoint=False,
+                                        dtype=np.float32),
+            )
+            chi.attrs["units"] = b"deg"
+
+            # Positioner.
+            samp = e.create_group("sample")
+            samp.attrs["NX_class"] = "NXsample"
+            pos = samp.create_group("positioners")
+            pos.attrs["NX_class"] = "NXcollection"
+            th = pos.create_group("th")
+            th.attrs["NX_class"] = "NXpositioner"
+            v = th.create_dataset("value",
+                                  data=np.linspace(0.0, 9.9, 100,
+                                                   dtype=np.float32))
+            v.attrs["units"] = b"deg"
+        return p
+
+    def test_returns_frame_coord_and_axes(self, synth_v2_sphere):
+        ds = read_sphere_metadata(synth_v2_sphere)
+        assert "frame" in ds.coords
+        assert "q" in ds.coords
+        assert "q_2d" in ds.coords
+        assert "chi" in ds.coords
+        # Frame IDs preserved (1-based, not arange).
+        assert list(ds["frame"].values) == list(range(1, 101))
+
+    def test_omits_intensity_arrays(self, synth_v2_sphere):
+        ds = read_sphere_metadata(synth_v2_sphere)
+        assert "intensity_1d" not in ds.data_vars
+        assert "intensity_2d" not in ds.data_vars
+        assert "sigma_1d" not in ds.data_vars
+        assert "thumbnail" not in ds.data_vars
+
+    def test_includes_positioners(self, synth_v2_sphere):
+        ds = read_sphere_metadata(synth_v2_sphere)
+        assert "th" in ds.data_vars
+        assert ds["th"].dims == ("frame",)
+        assert ds["th"].shape == (100,)
+
+    def test_units_round_trip(self, synth_v2_sphere):
+        ds = read_sphere_metadata(synth_v2_sphere)
+        assert ds["q"].attrs.get("units") == "1/angstrom"
+        assert ds["chi"].attrs.get("units") == "deg"
+
 
 class TestListEntries:
     def test_single_entry(self, nexus_file):
