@@ -981,20 +981,30 @@ def _write_per_frame_geometry(f, sphere, *, entry: str) -> None:
         # save before all frames arrived).  Map each arch_id to its
         # position in scan_data so the slice picks the right
         # motor-derived rows.
-        # We assume arch_ids are an ordered subset of {0..n_scan-1}
-        # (the wrangler always uses the scan-frame index as arch.idx).
-        # For 1-based SPEC: subtract 1 to get the scan_data row.
+        #
+        # K1 fix: pre-K1 we filtered ``positions = [i - offset for i
+        # in arch_ids if 0 <= i - offset < n_scan]`` but then derived
+        # ``frame_idx_arr = arch_ids[:len(positions)]`` — that
+        # truncates from the FRONT of arch_ids, which is only
+        # equivalent to the filtered set when the dropped entries
+        # are at the tail.  If any out-of-range arch_id appeared
+        # before a valid one, the IDs and positions would mis-pair.
+        # Build the (id, position) pairs in a single pass so both
+        # arrays stay aligned.
         is_one_based = (min(arch_ids) >= 1
                         and max(arch_ids) <= n_scan
                         and 0 not in arch_ids)
         offset = 1 if is_one_based else 0
-        positions = [i - offset for i in arch_ids
-                     if 0 <= i - offset < n_scan]
-        if not positions:
+        valid_pairs = [
+            (aid, aid - offset) for aid in arch_ids
+            if 0 <= aid - offset < n_scan
+        ]
+        if not valid_pairs:
             return
+        valid_ids = [p[0] for p in valid_pairs]
+        positions = [p[1] for p in valid_pairs]
         pos_arr = np.asarray(positions, dtype=np.int64)
-        frame_idx_arr = np.asarray(arch_ids[:len(positions)],
-                                   dtype=np.int32)
+        frame_idx_arr = np.asarray(valid_ids, dtype=np.int32)
         sliced = {k: np.asarray(v)[pos_arr] for k, v in derived.items()}
     else:
         # No arches yet — preserve the historical behavior (write
