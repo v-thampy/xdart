@@ -205,6 +205,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.plot_layout.addWidget(self.plot_win)
         self.plot_viewBox = RectViewBox()
         self.plot = self.plot_win.addPlot(viewBox=self.plot_viewBox)
+        # Seaborn-darkgrid + talk-context styling: gridlines on,
+        # tick/label fonts ~11pt.  Background colour comes from
+        # ``apply_dark_theme``'s pg.setConfigOption.
+        from xdart.gui.themes import apply_seaborn_plot_style
+        apply_seaborn_plot_style(self.plot)
         self.curves = []
         self.legend = self.plot.addLegend()
         from PySide6.QtWidgets import QGraphicsItem
@@ -651,15 +656,29 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """
         mask = None
         if self.overall and len(self.arch_ids) > 1:
-            data = self.get_sphere_map_raw()
+            # G2: aggregate via per-arch dict instead of the deleted
+            # sphere.overall_raw accumulator.  Stays correct after v2
+            # reload (the accumulator didn't), and after replace-frames
+            # reintegration (the accumulator drifted).
+            data = self.get_arches_map_raw(
+                list(self.sphere.arches.index),
+            )
+            if data is None:
+                return
         else:
             data = self.get_arches_map_raw()
             if data is None:
                 return
 
-            # Apply Mask
-            arch_2d = self.data_2d[self.idxs_2d[0]]
-            mask = arch_2d['mask']
+            # Apply Mask — O8: snapshot under data_lock so a
+            # concurrent writer (integrator publish, fileHandlerThread
+            # load) can't evict ``self.idxs_2d[0]`` between the
+            # ``in`` check and the value read.  ``.get(...)`` returns
+            # None for an evicted key; falling back to None mask is
+            # the same as having no mask, so render continues.
+            with self.data_lock:
+                arch_2d = self.data_2d.get(self.idxs_2d[0])
+            mask = arch_2d['mask'] if arch_2d is not None else None
         data = np.asarray(data, dtype=float)
 
         # Apply detector + global mask.
@@ -703,15 +722,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
             self.update_plot_view()
 
-        # Always aggregate from per-arch data_2d. The legacy
-        # `self.overall → get_sphere_int_2d()` shortcut returned a 1×1
-        # zero array when `sphere.bai_2d` wasn't populated (common with
-        # NeXus files that store per-arch results only), which made the
-        # 2D pane go blank as soon as all arches were selected.
+        # Always aggregate from per-arch data_2d.  Pre-G2 there was a
+        # fall-through to get_sphere_int_2d() (now deleted — it read
+        # the in-memory sphere.bai_2d accumulator that didn't survive
+        # v2 reload).  If selecting "Overall" with the current
+        # idxs_2d cache empty / partial, widen the aggregation
+        # across the full arches.index so we don't render a partial
+        # average.
         intensity, xdata, ydata = self.get_arches_int_2d()
         if intensity is None and self.overall and len(self.arch_ids) > 1:
-            # Fall back to the precomputed sphere total if available.
-            intensity, xdata, ydata = self.get_sphere_int_2d()
+            intensity, xdata, ydata = self.get_arches_int_2d(
+                list(self.sphere.arches.index),
+            )
 
         if intensity is None:
             return
@@ -796,6 +818,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.bkg_2d, _, _ = self.get_arches_int_2d(idxs)
             self.bkg_map_raw = self.get_arches_map_raw(idxs)
             if self.bkg_map_raw is None:
+                # F5: be honest about a no-op 2D background.  Pre-F5
+                # this silently set bkg=0.: 1D/2D bkg subtraction
+                # would still apply but the user saw "Clear Bkg" on
+                # the button as if 2D was wired up too.  Without
+                # raw frames (e.g. reloaded v2 file without
+                # resolvable source files), there's nothing to
+                # subtract in the 2D map view; log it.
+                logger.warning(
+                    "setBkg: no raw image data available for selected "
+                    "arches; 2D background subtraction inactive "
+                    "(1D / int_2d background still applied).  This "
+                    "usually means the .nxs was reloaded without "
+                    "access to the original source files."
+                )
                 self.bkg_map_raw = 0.
             self.ui.setBkg.setText('Clear Bkg')
         else:
@@ -962,7 +998,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """Render raw image data in viewer mode with optional mask/threshold."""
         if len(self.idxs_2d) == 0:
             return
-        arch_2d = self.data_2d[self.idxs_2d[0]]
+        # O8: snapshot under data_lock so a concurrent writer can't
+        # evict the key between the lookup and the read.
+        with self.data_lock:
+            arch_2d = self.data_2d.get(self.idxs_2d[0])
+        if arch_2d is None:
+            return
         data = np.asarray(arch_2d['map_raw'], dtype=float)
 
         # Apply threshold from wrangler if enabled

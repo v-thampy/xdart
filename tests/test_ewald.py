@@ -189,11 +189,25 @@ class TestEwaldSphere(unittest.TestCase):
         self.sphere.save_to_nexus(replace=False)
     
     def test_bai(self):
-        self.sphere.by_arch_integrate_1d(numpoints=18000, monitor='i0', radial_range=[0,180], 
-                        unit=units.TTH_DEG, correctSolidAngle=False, 
-                        method='csr')
+        # F6 removed sphere.by_arch_integrate_1d / by_arch_integrate_2d
+        # (unreachable from the GUI; only this test exercised it).
+        # The equivalent through the supported API is per-arch
+        # integrate_1d followed by accumulation via add_arch's
+        # internal _accumulate_bai_1d.  We rebuild that here so the
+        # assertion against true_1d_norm still validates the
+        # integration result.
+        from xdart.modules.ewald.arch import EwaldArch  # noqa: F401
+        args = dict(numpoints=18000, monitor='i0', radial_range=[0, 180],
+                    unit=units.TTH_DEG, correctSolidAngle=False,
+                    method='csr')
+        self.sphere.bai_1d_args = args.copy()
+        with self.sphere.sphere_lock:
+            self.sphere.bai_1d = None
+            for arch in self.sphere.arches:
+                arch.integrate_1d(global_mask=self.sphere.global_mask, **args)
+                self.sphere._accumulate_bai_1d(arch)
         self.assertEqual(self.sphere.bai_1d_args['method'], 'csr')
-        self.assertTrue(np.isclose(self.true_1d_norm, 
+        self.assertTrue(np.isclose(self.true_1d_norm,
                                    self.sphere.bai_1d.norm.full(),
                                    rtol=1e-3, atol=1e-4).all())
 

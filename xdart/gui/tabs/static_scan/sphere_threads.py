@@ -7,7 +7,9 @@
 import logging
 from queue import Queue
 from threading import Condition, RLock
-from concurrent.futures import ProcessPoolExecutor, as_completed
+# M2 dropped ProcessPoolExecutor; ThreadPoolExecutor + as_completed
+# are imported locally in _reintegrate_all to keep the top-of-file
+# imports tight.
 import traceback
 import numpy as np
 
@@ -21,22 +23,15 @@ from pyqtgraph import Qt
 
 # This module imports
 from xdart.utils import catch_h5py_file as catch
-from xdart import utils as ut
 
 
 
 
-def _reintegrate_arch(arch, bai_1d_args, bai_2d_args, static, gi, do_2d):
-    """Module-level worker for parallel reintegration (must be picklable)."""
-    from xdart.modules.ewald.arch import EwaldArch  # local import for subprocess safety
-    if static:
-        arch.static = True
-    if gi:
-        arch.gi = True
-    arch.integrate_1d(**bai_1d_args)
-    if do_2d:
-        arch.integrate_2d(**bai_2d_args)
-    return arch
+# M2: _reintegrate_arch (the module-level pickle-safe worker for the
+# pre-M2 ProcessPoolExecutor reintegrate path) removed.  The new
+# _reintegrate_all uses ThreadPoolExecutor + an inline closure
+# instead — no pickling, no IPC, GIL released by pyFAI's Cython
+# integration during the call.
 
 
 class integratorThread(Qt.QtCore.QThread):
@@ -99,113 +94,230 @@ class integratorThread(Qt.QtCore.QThread):
                 traceback.print_exc()
 
     def bai_2d_all(self):
-        """Integrates all arches 2d. Uses parallel workers when sphere.max_cores > 1."""
+        """Integrates all arches 2d.  Thin wrapper over _reintegrate_all."""
         if getattr(self.sphere, 'skip_2d', False):
             return
+        self._reintegrate_all(do_2d=True)
+
+    def bai_1d_all(self):
+        """Integrates all arches 1d.  Thin wrapper over _reintegrate_all."""
+        self._reintegrate_all(do_2d=False)
+
+    def _reintegrate_all(self, *, do_2d: bool) -> None:
+        """Shared GUI-button reintegration body for 1D and 2D paths.
+
+        M2 rewrite: switched from ``ProcessPoolExecutor`` over an
+        eagerly-materialised arch list to **batched lazy iteration +
+        ThreadPoolExecutor + IntegratorPool** — the same primitive
+        the wranglers use.
+
+        Why the change.  Pre-M2 the path was:
+            all_arches = list(self.sphere.arches)
+            ProcessPoolExecutor(...).submit(_reintegrate_arch, arch, ...)
+
+        For a v2 file that's:
+        * ``list(self.sphere.arches)`` triggers ``ArchSeries.__iter__``,
+          which lazy-loads every frame from disk sequentially BEFORE
+          the first worker gets a task — seconds-to-tens-of-seconds of
+          GUI-thread blocking before parallel work begins.
+        * Each arch (with L1 lazy raw load) carries a multi-MB
+          ``map_raw`` numpy array.  ProcessPoolExecutor pickles every
+          one of those into a child process — gigabytes of IPC on a
+          10k-frame Eiger scan.
+        * Peak RAM holds the full list of N arches in the parent,
+          defeating the ``_in_memory_cap=64`` eviction policy.
+
+        After M2:
+        * Iterate the index in batches of ``_RE_BATCH`` (default
+          ``32 * n_workers``); each batch is lazy-loaded just before
+          dispatch and goes out of scope after publish.
+        * ``IntegratorPool`` borrows + worker-thread integration — no
+          pickling cost, GIL released by pyFAI's Cython path.
+        * Stop is honoured between batches (and inside workers,
+          inherited from the wranglers' pattern).
+        """
         with self.data_lock:
-            self.data_2d.clear()
+            if do_2d:
+                self.data_2d.clear()
+            else:
+                self.data_1d.clear()
         with self.sphere.sphere_lock:
-            self.sphere.bai_2d = None
+            if do_2d:
+                self.sphere.bai_2d = None
+            else:
+                self.sphere.bai_1d = None
 
         max_cores = getattr(self.sphere, 'max_cores', 1)
-        all_arches = list(self.sphere.arches)  # load all from H5 into memory
+        indices = list(self.sphere.arches.index)
+        if not indices:
+            return
 
-        if max_cores > 1 and len(all_arches) > 1:
-            n_workers = min(max_cores, len(all_arches))
-            futures = {}
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                for arch in all_arches:
-                    f = executor.submit(
-                        _reintegrate_arch, arch,
-                        self.sphere.bai_1d_args, self.sphere.bai_2d_args,
-                        self.sphere.static, self.sphere.gi, do_2d=True,
-                    )
-                    futures[f] = arch.idx
-                for future in as_completed(futures):
-                    try:
-                        arch = future.result()
-                        self.sphere.arches[arch.idx] = arch
-                        self.sphere._accumulate_bai_2d(arch)
-                        with self.data_lock:
-                            self.data_2d[int(arch.idx)] = {
-                                'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
-                                'mask': arch.mask, 'int_2d': arch.int_2d, 'gi_2d': arch.gi_2d,
-                            }
-                        self.update.emit(arch.idx)
-                    except Exception as e:
-                        arch_idx = futures[future]
-                        logger.error("2D integration failed for arch %s: %s", arch_idx, e, exc_info=True)
-                        self.update.emit(arch_idx)
-        else:
-            for arch in all_arches:
-                if self.sphere.static:
-                    arch.static = True
-                if self.sphere.gi:
-                    arch.gi = True
-                arch.integrate_2d(**self.sphere.bai_2d_args)
+        def _publish(arch):
+            """Reattach arch into sphere and viewer dicts.
+
+            N3: ``sphere.arches[arch.idx] = arch`` is a sphere-state
+            mutation that other threads (the wrangler thread, the
+            GUI's ArchSeries.__getitem__) can race against.  Hold
+            ``sphere_lock`` while we do it.  The lock is short — just
+            the dict assignment + the bai accumulator — and the
+            accumulator path itself already takes sphere_lock
+            internally, so we don't deadlock by nesting (Condition
+            is reentrant).
+            """
+            with self.sphere.sphere_lock:
                 self.sphere.arches[arch.idx] = arch
+            if do_2d:
                 self.sphere._accumulate_bai_2d(arch)
                 with self.data_lock:
                     self.data_2d[int(arch.idx)] = {
-                        'map_raw': arch.map_raw, 'bg_raw': arch.bg_raw,
-                        'mask': arch.mask, 'int_2d': arch.int_2d,
+                        'map_raw': arch.map_raw,
+                        'bg_raw': arch.bg_raw,
+                        'mask': arch.mask,
+                        'int_2d': arch.int_2d,
                         'gi_2d': arch.gi_2d,
                     }
-                self.update.emit(arch.idx)
-
-        with self.file_lock:
-            with catch(self.sphere.data_file, 'a') as file:
-                ut.dict_to_h5(self.sphere.bai_2d_args, file, 'bai_2d_args')
-
-    def bai_1d_all(self):
-        """Integrates all arches 1d. Uses parallel workers when sphere.max_cores > 1."""
-        with self.data_lock:
-            self.data_1d.clear()
-        with self.sphere.sphere_lock:
-            self.sphere.bai_1d = None
-
-        max_cores = getattr(self.sphere, 'max_cores', 1)
-        all_arches = list(self.sphere.arches)  # load all from H5 into memory
-
-        if max_cores > 1 and len(all_arches) > 1:
-            n_workers = min(max_cores, len(all_arches))
-            futures = {}
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                for arch in all_arches:
-                    f = executor.submit(
-                        _reintegrate_arch, arch,
-                        self.sphere.bai_1d_args, self.sphere.bai_2d_args,
-                        self.sphere.static, self.sphere.gi, do_2d=False,
-                    )
-                    futures[f] = arch.idx
-                for future in as_completed(futures):
-                    try:
-                        arch = future.result()
-                        self.sphere.arches[arch.idx] = arch
-                        self.sphere._accumulate_bai_1d(arch)
-                        with self.data_lock:
-                            self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
-                        self.update.emit(arch.idx)
-                    except Exception as e:
-                        arch_idx = futures[future]
-                        logger.error("1D integration failed for arch %s: %s", arch_idx, e, exc_info=True)
-                        self.update.emit(arch_idx)
-        else:
-            for arch in all_arches:
-                if self.sphere.static:
-                    arch.static = True
-                if self.sphere.gi:
-                    arch.gi = True
-                arch.integrate_1d(**self.sphere.bai_1d_args)
-                self.sphere.arches[arch.idx] = arch
+                    # N9 Fix#4: a 2D reintegrate also recomputes the
+                    # 1D azimuthal cake via pyFAI's integrate2d output
+                    # → the cached data_1d entry from before the
+                    # reintegrate is now stale.  Refresh it so the 1D
+                    # viewer sees the new int_1d immediately rather
+                    # than waiting for a reselect to lazy-reload it
+                    # from disk.
+                    self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
+            else:
                 self.sphere._accumulate_bai_1d(arch)
                 with self.data_lock:
                     self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
-                self.update.emit(arch.idx)
+            self.update.emit(arch.idx)
 
-        with self.file_lock:
-            with catch(self.sphere.data_file, 'a') as file:
-                ut.dict_to_h5(self.sphere.bai_1d_args, file, 'bai_1d_args')
+        label = '2D' if do_2d else '1D'
+        n_workers = max(1, min(max_cores, len(indices)))
+
+        # IntegratorPool: one deep-copied pyFAI integrator per worker.
+        # If sphere._cached_integrator is None (sphere fresh-from-load
+        # without a wrangler having attached an integrator), the pool
+        # comes back None and we fall back to the serial path.
+        from xdart.utils.integrator_pool import ensure_integrator_pool
+        from concurrent.futures import ThreadPoolExecutor
+
+        integrator_pool = ensure_integrator_pool(
+            self.sphere, '_cached_integrator', n_workers,
+        )
+
+        # Same per-worker pattern for the GI fiber integrator (H2).
+        # Only relevant when sphere.gi is set AND a fiber integrator
+        # has been pre-built; otherwise None and the integrate calls
+        # treat the fiber arg as a no-op.
+        fiber_pool = None
+        if (self.sphere.gi
+                and getattr(self.sphere, '_cached_fiber_integrator', None)
+                is not None):
+            fiber_pool = ensure_integrator_pool(
+                self.sphere, '_cached_fiber_integrator', n_workers,
+                pool_attr='_cached_fiber_integrator_pool',
+            )
+
+        def _worker(arch):
+            """Re-integrate one arch on a thread.  Borrows a private
+            integrator from the pool to avoid pyFAI's CSR scratch
+            buffer races; same fix as IntegratorPool in the wranglers.
+            """
+            if self.sphere.static:
+                arch.static = True
+            if self.sphere.gi:
+                arch.gi = True
+            if integrator_pool is not None:
+                with integrator_pool.borrow() as ai:
+                    arch.integrator = ai
+                    if fiber_pool is not None:
+                        with fiber_pool.borrow() as fi:
+                            arch.integrate_1d(
+                                fiber_integrator=fi,
+                                **self.sphere.bai_1d_args,
+                            )
+                            if do_2d:
+                                arch.integrate_2d(
+                                    fiber_integrator=fi,
+                                    **self.sphere.bai_2d_args,
+                                )
+                    else:
+                        arch.integrate_1d(**self.sphere.bai_1d_args)
+                        if do_2d:
+                            arch.integrate_2d(**self.sphere.bai_2d_args)
+                    # Detach pool integrator before the next worker
+                    # borrows the same instance.
+                    arch.integrator = self.sphere._cached_integrator
+            else:
+                # Fallback: no integrator pool — fall back to serial
+                # (still on a thread to avoid blocking the GUI).
+                if do_2d:
+                    arch.integrate_2d(**self.sphere.bai_2d_args)
+                else:
+                    arch.integrate_1d(**self.sphere.bai_1d_args)
+            return arch
+
+        # Batched dispatch: lazy-load each batch right before
+        # submitting it, publish results, then drop the batch's
+        # arches so RAM stays bounded.
+        _RE_BATCH = max(8, 32 * n_workers)
+
+        if max_cores > 1 and len(indices) > 1 and integrator_pool is not None:
+            for i in range(0, len(indices), _RE_BATCH):
+                chunk_idxs = indices[i:i + _RE_BATCH]
+                # ArchSeries.__getitem__ does the lazy v2 load + sets
+                # source refs / _source_root for the L1 raw loader.
+                arches = [self.sphere.arches[idx] for idx in chunk_idxs]
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futures = {
+                        pool.submit(_worker, arch): arch.idx
+                        for arch in arches
+                    }
+                    from concurrent.futures import as_completed
+                    for fut in as_completed(futures):
+                        try:
+                            _publish(fut.result())
+                        except Exception as e:
+                            arch_idx = futures[fut]
+                            logger.error(
+                                "%s integration failed for arch %s: %s",
+                                label, arch_idx, e, exc_info=True,
+                            )
+                            self.update.emit(arch_idx)
+                # ``arches`` goes out of scope at the end of the
+                # iteration, so the FIFO _in_memory_cap eviction
+                # can free those frames before the next chunk loads.
+        else:
+            # Serial fallback (max_cores=1, single frame, or no
+            # integrator pool available).  Still lazy-loaded one
+            # at a time so we don't materialise the full list.
+            for idx in indices:
+                arch = self.sphere.arches[idx]
+                _publish(_worker(arch))
+
+        # Persist recomputed int_* rows back to disk via the v2
+        # replace-frames path.  The save re-writes /entry/reduction
+        # so the persisted bai_*_args reflect this reintegration's
+        # parameters (which is the whole reason the user kicked it
+        # off).  Replaces the legacy ``ut.dict_to_h5(...,
+        # 'bai_*_args')`` write-to-root path (v1 layout, dropped
+        # in 0.37.0) — that path never updated the v2 stacked rows.
+        #
+        # K2: bracket the save with the H5FilePool pause/resume
+        # protocol so any concurrent GUI h5viewer reads through the
+        # pool drop their cached handles and wait for the writer to
+        # release.  Wrangler save paths already do this; the
+        # reintegrate path was the one save site that didn't, which
+        # could race a viewer's open handle on the same .nxs file.
+        replace_idxs = list(self.sphere.arches.index)
+        if replace_idxs:
+            from xdart.utils.h5pool import get_pool as _get_h5pool
+            _get_h5pool().pause(self.sphere.data_file)
+            try:
+                self.sphere.save_to_nexus(
+                    replace_frame_indices=replace_idxs,
+                )
+            finally:
+                _get_h5pool().resume(self.sphere.data_file)
 
     def bai_2d_SI(self):
         """Integrate the current arch, 2d
@@ -261,8 +373,8 @@ class fileHandlerThread(Qt.QtCore.QThread):
     sigTaskDone = Qt.QtCore.Signal(str)
     
     def __init__(self, sphere, arch, file_lock,
-                 parent=None, arch_ids=[], arches=None,
-                 data_1d={}, data_2d={}, data_lock=None):
+                 parent=None, arch_ids=None, arches=None,
+                 data_1d=None, data_2d=None, data_lock=None):
         """
         Parameters
         ----------
@@ -272,14 +384,18 @@ class fileHandlerThread(Qt.QtCore.QThread):
         data_lock : threading.RLock, optional
             Shared lock guarding data_1d / data_2d; a private RLock is
             created when not provided.
+
+        H3: ``arch_ids``, ``data_1d``, ``data_2d`` default to None
+        (was ``[]`` / ``{}`` — mutable defaults shared across all
+        instances that omit the kwarg).
         """
         super().__init__(parent)
         self.sphere = sphere
         self.arch = arch
-        self.arch_ids = arch_ids
+        self.arch_ids = arch_ids if arch_ids is not None else []
         self.arches = arches
-        self.data_1d = data_1d
-        self.data_2d = data_2d
+        self.data_1d = data_1d if data_1d is not None else {}
+        self.data_2d = data_2d if data_2d is not None else {}
         self.data_lock = data_lock if data_lock is not None else RLock()
         self.file_lock = file_lock
         self.queue = Queue()
@@ -308,9 +424,15 @@ class fileHandlerThread(Qt.QtCore.QThread):
     def set_datafile(self):
         with self.file_lock:
             skip_2d = getattr(self.sphere, 'skip_2d', False)
-            self.sphere.set_datafile(
-                self.fname, save_args={'compression': None}
-            )
+            # O7: dropped legacy ``save_args={'compression': None}``
+            # passthrough — the v2 writer (save_to_nexus) doesn't
+            # accept a ``compression`` kwarg.  N5 made set_datafile's
+            # defaults None-sentinels, so omitting save_args is the
+            # right call.  The stale dict was stripped inside
+            # set_datafile via ``save_args.pop('compression', None)``
+            # but that workaround is unnecessary now that the caller
+            # doesn't supply the dead kwarg in the first place.
+            self.sphere.set_datafile(self.fname)
             self.sphere.skip_2d = skip_2d  # preserve checkbox state across load
         self.sigNewFile.emit(self.fname)
         self.sigUpdate.emit()

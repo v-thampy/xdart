@@ -17,7 +17,6 @@ import threading
 import time
 import glob
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from collections import deque
 
@@ -281,7 +280,7 @@ class specThread(wranglerThread):
         self.bg_scale = bg_scale
         self.bg_norm_channel = bg_norm_channel
         self.gi = gi
-        self.th_mtr = th_mtr
+        self.incidence_motor = th_mtr
         self.sample_orientation = sample_orientation
         self.tilt_angle = tilt_angle
         self.gi_mode_1d = gi_mode_1d
@@ -317,6 +316,12 @@ class specThread(wranglerThread):
         self._prefetch_queue = None      # queue.Queue of frame tuples or None sentinel
         self._prefetch_thread = None     # threading.Thread running the reader
         self._prefetch_stop_evt = None   # threading.Event — set to cancel worker
+        # O8: distinguish clean end-of-stream from worker failure.
+        # ``_prefetch_worker`` sets this to the str(exception) when
+        # it dies on an unexpected error; the consumer surfaces it
+        # via ``showLabel`` so the user sees "Eiger read failed: ..."
+        # instead of a silent end-of-scan.  None means "no error".
+        self._prefetch_error = None
 
     # ── Display helpers ──────────────────────────────────────────────────
 
@@ -363,6 +368,7 @@ class specThread(wranglerThread):
         self._prefetch_queue = None
         self._prefetch_thread = None
         self._prefetch_stop_evt = None
+        self._prefetch_error = None
         self.detector = get_detector(self.poni.detector) if self.poni.detector else None
         self.sub_label = ''
         det_mask = self.detector.mask if self.detector is not None else None  # pyFAI .mask property
@@ -465,7 +471,7 @@ class specThread(wranglerThread):
                 _cached_poni = self.poni
                 self._cached_gi_incident_angle = None
 
-            if img_number in list(sphere.arches.index):
+            if img_number in sphere.arches.index:
                 if self.single_img and not is_eiger:
                     self.sigUpdate.emit(img_number)
                     break
@@ -532,13 +538,29 @@ class specThread(wranglerThread):
         # ── Phase 3: live watching ────────────────────────────────────────────
         if self.live_mode and self.command != 'stop' and sphere is not None:
             self.showLabel.emit('Watching for new files...')
+            # Adaptive backoff between filesystem polls.  Starts tight
+            # so first-frame latency is small (~100 ms vs the old fixed
+            # 2 s — matters a lot for fast detectors like Eiger 4M);
+            # doubles on each consecutive miss up to ``_POLL_MAX`` so
+            # an idle wait doesn't burn CPU.  Resets on any hit so a
+            # steady-state acquisition stays at the low end of the
+            # range.  No external watcher dep — works on every FS the
+            # beamline mounts (NFS, SMB, local).
+            _poll_min = 0.1
+            _poll_max = 2.0
+            _poll_growth = 2.0
+            poll_s = _poll_min
             while self.command != 'stop':
                 img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
                 if img_data is None:
                     # Nothing new yet — show watching status and sleep
                     self.showLabel.emit('Watching for new files...')
-                    time.sleep(2.0)
+                    time.sleep(poll_s)
+                    poll_s = min(poll_s * _poll_growth, _poll_max)
                     continue
+                # Hit — reset the backoff so the next miss falls back
+                # to the snappy 100 ms baseline.
+                poll_s = _poll_min
 
                 img_number = 1 if img_number is None else img_number
                 self.scan_name = scan_name
@@ -553,7 +575,7 @@ class specThread(wranglerThread):
                     _cached_poni = self.poni
                     self._cached_gi_incident_angle = None
 
-                if img_number in list(sphere.arches.index):
+                if img_number in sphere.arches.index:
                     continue
 
                 bg_raw = self.get_background(img_file, img_number, img_meta)
@@ -653,6 +675,56 @@ class specThread(wranglerThread):
             self._frames_since_save = 0
         return count
 
+    def _prewarm_fiber_integrator_spec(self, sphere, pending_entry) -> None:
+        """Build ``sphere._cached_fiber_integrator`` from the first
+        pending frame.
+
+        O5: mirrors :meth:`nexusThread._prewarm_fiber_integrator` —
+        builds a throw-away arch from the first frame, computes its
+        incidence angle, and seeds the fiber integrator on the
+        sphere.  After this call ``_dispatch_batch_parallel`` can
+        build a fiber pool so every worker borrows a deep-copied
+        instance instead of constructing a fresh one per frame.
+
+        Pre-O5 the parallel batch path left ``_cached_fiber_integrator``
+        unset, ``fiber_pool`` came back None, and each worker built
+        its own fiber integrator per frame (~250 ms first-call CSR
+        LUT cost per worker per frame).  Costly for GI scans with
+        many cores.
+
+        ``pending_entry`` is one tuple from ``pending``:
+        ``(img_file, img_number, img_data, img_meta, bg_raw, t_read)``.
+        """
+        if not self.gi:
+            return
+        if sphere._cached_fiber_integrator is not None:
+            return
+        img_file, img_number, img_data, img_meta, bg_raw, _ = pending_entry
+        # Build a scratch arch identical in shape to what
+        # ``_process_one`` constructs so the angle math agrees.
+        scratch = EwaldArch(
+            img_number, img_data, poni=self.poni,
+            scan_info=img_meta, static=True, gi=True,
+            th_mtr=self.incidence_motor,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
+            series_average=self.series_average,
+            integrator=sphere._cached_integrator,
+        )
+        incident_angle = scratch._get_incident_angle()
+        sphere._cached_fiber_integrator = create_fiber_integrator(
+            scratch._poni_from_integrator(),
+            incident_angle=incident_angle,
+            tilt_angle=scratch.tilt_angle,
+            sample_orientation=self.sample_orientation,
+            angle_unit="deg",
+        )
+        # The per-frame angle-drift check in ``_integrate_one``
+        # compares against this cached value; if a later frame's
+        # incidence angle differs, that worker falls back to a
+        # locally-built fiber integrator at the right angle.
+        self._cached_gi_incident_angle = incident_angle
+
     def _dispatch_batch_parallel(self, sphere, pending):
         """Parallel batch processing using ThreadPoolExecutor.
 
@@ -676,13 +748,62 @@ class specThread(wranglerThread):
             # No cached integrator yet — fall back to serial dispatch
             # (the source integrator gets built on the first call).
             return self._dispatch_batch_serial(sphere, pending)
-        fiber_integrator = sphere._cached_fiber_integrator
+        # F3: prewarm the bad-pixel mask on the main thread before
+        # any worker reads it, so cache initialization isn't racy.
+        # ``pending`` tuple shape: (img_file, img_number, img_data,
+        # img_meta, bg_raw, t_read) — index 2 is the image.
+        if (getattr(sphere, '_cached_data_mask', None) is None
+                and pending):
+            self._prewarm_arch_mask(sphere, pending[0][2])
+        # O5: prewarm the fiber integrator from the first pending
+        # frame so the per-worker fiber_pool below is non-None.
+        # Without this every worker built its own fiber integrator
+        # per frame (slow, especially for the first frame of each
+        # worker where pyFAI's CSR LUT cost is paid).  Mirrors the
+        # ``_prewarm_fiber_integrator`` path the NeXus wrangler
+        # already runs before its parallel section.
+        if (self.gi
+                and sphere._cached_fiber_integrator is None
+                and pending):
+            try:
+                self._prewarm_fiber_integrator_spec(sphere, pending[0])
+            except Exception as e:
+                # Fall through: workers still build their own fiber
+                # integrators per frame, just without the speedup.
+                logger.debug(
+                    "SPEC GI fiber prewarm failed (%s); workers will "
+                    "build their own per-frame", e,
+                )
+        # H2: per-worker fiber-integrator pool (matches IntegratorPool
+        # for the regular AzimuthalIntegrator).  None when GI is off
+        # or when the prewarm hasn't seeded _cached_fiber_integrator
+        # yet — _borrow_fiber_integrator falls back to the per-frame
+        # build in those cases.
+        fiber_pool = (
+            ensure_integrator_pool(
+                sphere, '_cached_fiber_integrator', n_workers,
+                pool_attr='_cached_fiber_integrator_pool',
+            )
+            if self.gi and sphere._cached_fiber_integrator is not None
+            else None
+        )
+        # Capture the angle the prewarmed fiber integrator was built
+        # for.  When ``gi`` is on and a per-frame arch's incidence
+        # angle drifts from this (i.e. ω varies across the scan, as
+        # opposed to a sin²ψ-style fixed-ω χ/φ scan), the worker has
+        # to fall back to a worker-local fiber integrator built at
+        # the correct angle.  Reusing the prewarm would silently
+        # integrate every frame as if it were at frame 0's incidence.
+        # 1e-4 deg is below the noise floor of beamline motor readouts
+        # and well below pyFAI's solid-angle sensitivity.
+        cached_gi_angle = self._cached_gi_incident_angle
+        _GI_ANGLE_TOL = 1e-4
         skip_2d = sphere.skip_2d
         bai_1d_args = dict(sphere.bai_1d_args)
         bai_2d_args = dict(sphere.bai_2d_args)
         mask = self.mask
         gi = self.gi
-        th_mtr = self.th_mtr
+        th_mtr = self.incidence_motor
         sample_orientation = self.sample_orientation
         tilt_angle = self.tilt_angle
         series_average = self.series_average
@@ -694,7 +815,13 @@ class specThread(wranglerThread):
             ``t_read`` is accepted for tuple-shape compatibility with
             _process_one but isn't surfaced — parallel batch mode logs
             its read times via the per-batch [FLUSH] line.
+
+            F2 cancel-fast: returns ``None`` immediately when Stop
+            has been requested, so already-running workers exit
+            before they hit pyFAI (the expensive part).
             """
+            if self.command == 'stop':
+                return None
             _t0 = time.time()
             # Threshold filtering: replace out-of-band pixels with the
             # dummy sentinel in a fresh float32 copy.  The arch mask
@@ -721,29 +848,28 @@ class specThread(wranglerThread):
                     mask=arch_mask,
                 )
 
-                # GI fiber integrator — reuse shared one (read-only)
-                _fi = fiber_integrator
-                if gi and _fi is None:
-                    _incident_angle = arch._get_incident_angle()
-                    _fi = create_fiber_integrator(
-                        arch._poni_from_integrator(),
-                        incident_angle=_incident_angle,
-                        tilt_angle=arch.tilt_angle,
-                        sample_orientation=sample_orientation,
-                        angle_unit="deg",
-                    )
-
-                arch.integrate_1d(
-                    global_mask=mask,
-                    fiber_integrator=_fi,
-                    **bai_1d_args,
-                )
-                if not skip_2d:
-                    arch.integrate_2d(
+                # H2: GI fiber integrator goes through the shared
+                # _borrow_fiber_integrator helper.  When the frame's
+                # incidence angle matches the prewarm cache (the
+                # sin²ψ common path) it borrows a private deepcopy
+                # from fiber_pool — same fix as IntegratorPool for
+                # the standard AzimuthalIntegrator.  Otherwise it
+                # builds a worker-local fiber integrator (ω-varying
+                # fall-back; slow but correct, single worker only).
+                with self._borrow_fiber_integrator(
+                    sphere, fiber_pool, arch,
+                ) as _fi:
+                    arch.integrate_1d(
                         global_mask=mask,
                         fiber_integrator=_fi,
-                        **bai_2d_args,
+                        **bai_1d_args,
                     )
+                    if not skip_2d:
+                        arch.integrate_2d(
+                            global_mask=mask,
+                            fiber_integrator=_fi,
+                            **bai_2d_args,
+                        )
 
             # Detach the pool integrator from this arch — once the
             # `with` block exited, the next worker can borrow this
@@ -775,46 +901,40 @@ class specThread(wranglerThread):
             return arch
 
         # ── Phase 1: parallel integration ────────────────────────────────────
-        arches = []
+        # Shared base helper handles ThreadPoolExecutor wiring,
+        # stop-flag honoring, per-worker exception logging, and
+        # idx-sort.  Both SPEC batch and NeXus chunked dispatch now
+        # share this primitive.
         self.showLabel.emit(f'Integrating {len(pending)} images ({n_workers} workers)...')
         _t_phase1 = time.time()
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = {}
-            for item in pending:
-                if self.command == 'stop':
-                    break
-                fut = pool.submit(_integrate_one, *item)
-                futures[fut] = item[1]  # img_number
-
-            for fut in as_completed(futures):
-                if self.command == 'stop':
-                    break
-                try:
-                    arch = fut.result()
-                    arches.append((futures[fut], arch))
-                except Exception as e:
-                    logger.error('Integration failed for image %s: %s', futures[fut], e)
+        arches = self._parallel_integrate(
+            pending,
+            lambda item: _integrate_one(*item),
+            n_workers,
+            label='BATCH',
+        )
         _t_phase1 = time.time() - _t_phase1
-        logger.info('[BATCH] Phase 1 (parallel integration): %d frames in %.2fs', len(arches), _t_phase1)
+        logger.info('[BATCH] Phase 1 (parallel integration): %d frames in %.2fs',
+                    len(arches), _t_phase1)
 
         if not arches:
             return 0
-
-        # Sort arches by img_number for consistent HDF5 ordering
-        arches.sort(key=lambda x: x[0])
 
         # ── Phase 2: serial HDF5 batch write ─────────────────────────────────
         if not self.xye_only:
             self.showLabel.emit(f'Writing {len(arches)} frames to HDF5...')
             _t_phase2 = time.time()
-            # Build img_number → img_file lookup for NeXus provenance
+            # img_number → img_file lookup for NeXus provenance.  Keyed
+            # on arch.idx (== img_number) so the lookup matches the
+            # arch-only result list returned by _parallel_integrate.
             _img_files = {item[1]: item[0] for item in pending}
             _get_h5pool().pause(sphere.data_file)
             try:
                 with self.file_lock:
                     # Phase 2a: in-memory accumulation only (batch_save=True
                     # makes add_arch a pure in-memory op; no file I/O).
-                    for img_number, arch in arches:
+                    for arch in arches:
+                        img_number = arch.idx
                         img_file = _img_files.get(img_number, '')
                         if img_file:
                             try:
@@ -824,6 +944,22 @@ class specThread(wranglerThread):
                                 arch.source_file = str(img_file)
                         else:
                             arch.source_file = ""
+                        # source_frame_idx is the *per-source-file*
+                        # 0-based frame offset, which lazy raw load
+                        # passes to NexusImageStack(source_file)[idx].
+                        # • Single-frame sources (TIF/EDF/CBF/…) →
+                        #   source IS the frame; idx is always 0.
+                        # • Multi-frame sources (Eiger / NeXus master)
+                        #   → use img_number-1, since
+                        #   ``_get_next_eiger_frame_sync`` emits
+                        #   ``img_number = frame_idx + 1`` (1-based).
+                        # Pre-C1 this was hardcoded to 0, so any
+                        # reload + lazy raw read on Eiger always
+                        # returned frame 0 — silently wrong.
+                        if _raw_lives_in_source(img_file):
+                            arch.source_frame_idx = int(img_number) - 1
+                        else:
+                            arch.source_frame_idx = 0
                         arch.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
 
                         sphere.add_arch(
@@ -881,7 +1017,7 @@ class specThread(wranglerThread):
         arch = EwaldArch(
             img_number, img_data, poni=self.poni,
             scan_info=img_meta, static=True, gi=self.gi,
-            th_mtr=self.th_mtr, bg_raw=bg_raw,
+            th_mtr=self.incidence_motor, bg_raw=bg_raw,
             sample_orientation=self.sample_orientation,
             tilt_angle=self.tilt_angle,
             series_average=self.series_average,
@@ -944,6 +1080,14 @@ class specThread(wranglerThread):
                     arch.source_file = str(img_file)
             else:
                 arch.source_file = ""
+            # source_frame_idx: per-source-file 0-based frame offset.
+            # See the matching block in ``_dispatch_batch_parallel``
+            # for the full rationale.  Eiger / HDF5 masters get
+            # ``img_number - 1``; everything else stays at 0.
+            if _raw_lives_in_source(img_file):
+                arch.source_frame_idx = int(img_number) - 1
+            else:
+                arch.source_frame_idx = 0
             # For Eiger: raw frames already live in the master file — don't double-store them.
             arch.skip_map_raw = sphere.skip_2d or _raw_lives_in_source(img_file)
             _t4 = time.time()
@@ -953,7 +1097,7 @@ class specThread(wranglerThread):
             sphere.add_arch(
                 arch=arch, calculate=False, update=True,
                 get_sd=True, set_mg=False, static=True, gi=self.gi,
-                th_mtr=self.th_mtr, series_average=self.series_average,
+                th_mtr=self.incidence_motor, series_average=self.series_average,
                 batch_save=True,
             )
             _t_h5_total = time.time() - _t4
@@ -1101,7 +1245,7 @@ class specThread(wranglerThread):
             if self.command == 'stop':
                 return (None, None, 1, None, {})
             try:
-                return self._prefetch_queue.get(timeout=0.25)
+                item = self._prefetch_queue.get(timeout=0.25)
             except queue.Empty:
                 # If the worker is gone and queue is drained, fall through
                 # with an end-of-stream sentinel so the caller can exit.
@@ -1109,6 +1253,17 @@ class specThread(wranglerThread):
                         or not self._prefetch_thread.is_alive()):
                     return (None, None, 1, None, {})
                 continue
+            # O8: surface a worker-failure sentinel as a user-visible
+            # status before propagating end-of-stream.  A clean end
+            # has ``_prefetch_error is None``; a worker crash has the
+            # error string set in the worker's except branch.
+            if item[3] is None and self._prefetch_error:
+                self.showLabel.emit(
+                    f'Eiger read failed: {self._prefetch_error}'
+                )
+                # Clear so the next start (if any) doesn't re-emit.
+                self._prefetch_error = None
+            return item
 
     def _start_prefetcher(self):
         """Spin up the background prefetch thread (idempotent)."""
@@ -1231,6 +1386,12 @@ class specThread(wranglerThread):
                             return
         except Exception as e:
             logger.exception('Eiger prefetch worker failed: %s', e)
+            # O8: stamp the failure so the consumer of the sentinel
+            # can tell "scan ended cleanly" from "worker crashed".
+            # Surfaced via showLabel in _get_next_eiger_frame; without
+            # this the user sees a silent end-of-scan and assumes
+            # acquisition completed normally.
+            self._prefetch_error = str(e)
         finally:
             # Guarantee the consumer unblocks no matter how we exit
             # (stop event, command=='stop', exception, or normal return).
@@ -1476,10 +1637,12 @@ class specThread(wranglerThread):
                              data_file=fname,
                              static=True,
                              gi=self.gi,
-                             th_mtr=self.th_mtr,
+                             incidence_motor=self.incidence_motor,
                              series_average=self.series_average,
                              single_img=self.single_img,
                              global_mask=self.mask,
+                             # J2: share lock with wrangler save path
+                             file_lock=self.file_lock,
                              **self.sphere_args)
         sphere.skip_2d = self.sphere.skip_2d
         # v2 NeXus writer needs a DiffractometerGeometry to derive per-frame
@@ -1516,7 +1679,7 @@ class specThread(wranglerThread):
 
         self.sigUpdateFile.emit(
             self.scan_name, fname,
-            self.gi, self.th_mtr, self.single_img,
+            self.gi, self.incidence_motor, self.single_img,
             self.series_average
         )
         logger.info('***** New Scan *****')

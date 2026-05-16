@@ -5,6 +5,7 @@ Created on Mon Aug 26 14:21:58 2019
 @author: walroth
 """
 import copy
+import os
 from threading import Condition
 
 from pyFAI.integrator.azimuthal import AzimuthalIntegrator
@@ -125,11 +126,12 @@ class EwaldArch():
     # pylint: disable=too-many-instance-attributes
 
     def __init__(self, idx=None, map_raw=None, poni=None, mask=None,
-                 scan_info={}, ai_args={}, file_lock=Condition(),
+                 scan_info=None, ai_args=None, file_lock=None,
                  static=False, bg_raw=0,
-                 gi=False, th_mtr='th', tilt_angle=0,
+                 gi=False, incidence_motor=None, tilt_angle=0,
                  sample_orientation=4,
-                 series_average=False, integrator=None
+                 series_average=False, integrator=None,
+                 *, th_mtr=None,  # J1: legacy alias, mapped to incidence_motor
                  ):
         # pylint: disable=too-many-arguments
         """idx: int, name of the arch.
@@ -137,11 +139,21 @@ class EwaldArch():
         bg_raw: numpy array, raw image data for BG
         poni: PONI object, calibration data
         mask: None or numpy array, indices of pixels to mask
-        scan_info: dict, metadata about scan
+        scan_info: dict, metadata about scan (None → fresh dict per instance)
         ai_args: dict, args to be fed to azimuthalIntegrator constructor
-        file_lock: Condition, lock for file access.
+        file_lock: Condition, lock for file access (None → fresh Condition).
+        incidence_motor: str, name of the GI incidence-angle motor
+        (or its scan_info key).  ``th_mtr`` is accepted as a legacy
+        alias kwarg and mapped here; ``self.th_mtr`` remains a
+        property alias for backward read access.
         """
         super(EwaldArch, self).__init__()
+        # F4: None-sentinel pattern.  Mutable defaults in the signature
+        # (scan_info={}, ai_args={}, file_lock=Condition()) are
+        # constructed once at module-import time and shared by every
+        # caller who omits the kwarg — silently producing cross-arch
+        # state.  Materialise per-instance defaults here, matching
+        # what EwaldSphere already does.
         self.idx = idx
         self.map_raw = map_raw
         self.bg_raw = bg_raw
@@ -153,13 +165,20 @@ class EwaldArch():
             self.mask = np.arange(map_raw.size)[map_raw.flatten() < 0]
         else:
             self.mask = mask
-        self.scan_info = scan_info
-        self.ai_args = ai_args
-        self.file_lock = file_lock
+        self.scan_info = scan_info if scan_info is not None else {}
+        self.ai_args = ai_args if ai_args is not None else {}
+        self.file_lock = file_lock if file_lock is not None else Condition()
 
         self.static = static
         self.gi = gi
-        self.th_mtr = th_mtr
+        # J1: canonical name is ``incidence_motor``.  Pick up the
+        # value from either kwarg with ``incidence_motor=`` winning
+        # if both happen to be passed (shouldn't be — but be
+        # deterministic).  Default 'th' preserves the historical
+        # arch behavior.
+        if incidence_motor is None:
+            incidence_motor = th_mtr if th_mtr is not None else 'th'
+        self.incidence_motor = incidence_motor
         self.tilt_angle = tilt_angle
         self.sample_orientation = sample_orientation
         self.series_average = series_average
@@ -176,8 +195,33 @@ class EwaldArch():
         self.int_2d: IntegrationResult2D | None = None
         self.gi_1d: dict[str, IntegrationResult1D] = {}
         self.gi_2d: dict[str, IntegrationResult2D] = {}
+        # Raw-source pointer (R2 schema):
+        #   source_file       relpath to the raw source file (image or .nxs master)
+        #   source_frame_idx  index of *this* frame within source_file
+        # Both written to /entry/frames/frame_NNNN/source/ by the v2
+        # writer and round-tripped by _load_arch_v2.  source_frame_idx
+        # defaults to None — the writer falls back to ``idx`` for
+        # single-frame source files (typical SPEC layout) when it's None.
         self.source_file: str = ""
+        self.source_frame_idx: int | None = None
         self.thumbnail: np.ndarray | None = None  # downsampled (map_raw - bg_raw)
+        # R3 guardrail: when an arch is reconstructed from a v2 .nxs
+        # without a raw image (the common case — v2 doesn't store
+        # map_raw to save disk), reintegration is impossible until a
+        # lazy raw loader fetches the frame back from ``source_file``.
+        # ``_load_arch_v2`` sets ``is_reload_only=False`` when the
+        # source path resolves (lazy load will succeed), else ``True``
+        # (lazy load can't recover the raw — re-integrate would
+        # silently no-op).  The GUI's "Reintegrate" buttons check
+        # ``sphere.has_reload_only_frames()`` and pop a message
+        # rather than no-op'ing inside ``EwaldArch.integrate_*``.
+        self.is_reload_only: bool = False
+        # L1 lazy raw load: the directory ``source_file`` resolves
+        # against (typically ``os.path.dirname(sphere.data_file)``,
+        # set by :func:`_load_arch_v2`).  Empty for fresh-from-wrangler
+        # arches that already carry ``map_raw`` and never need lazy
+        # load.
+        self._source_root: str = ""
 
     def __getstate__(self):
         """Exclude threading.Condition objects so EwaldArch can be pickled
@@ -215,15 +259,124 @@ class EwaldArch():
             detector=str(det_name),
         )
 
-    def _get_incident_angle(self):
-        """Return incident angle in degrees from th_mtr or scan_info."""
+    def _resolved_source_path(self) -> str:
+        """Return the absolute path to ``source_file`` for lazy raw load.
+
+        Joins ``source_file`` (relpath as stored by the wrangler)
+        against ``_source_root`` (the sphere's data_file directory,
+        set by :func:`_load_arch_v2`).  Returns an empty string when
+        either is missing, leaves it to the caller to detect.
+        """
+        if not self.source_file:
+            return ""
+        if os.path.isabs(self.source_file):
+            return self.source_file
+        if not self._source_root:
+            # Pre-R2 reloads might lack the root — assume cwd.  Real
+            # callers always go through _load_arch_v2 which sets it.
+            return self.source_file
+        return os.path.normpath(
+            os.path.join(self._source_root, self.source_file)
+        )
+
+    def _lazy_load_resolvable(self) -> bool:
+        """Return True iff a lazy raw load would find the source file.
+
+        Used by :func:`_load_arch_v2` to decide ``is_reload_only`` at
+        load time — without it the R3 guardrail would have to either
+        always pop (treating every reload as unrecoverable) or never
+        pop (silently no-op'ing when the source file is missing).
+        """
+        full = self._resolved_source_path()
+        return bool(full) and os.path.exists(full)
+
+    def _lazy_load_raw(self) -> bool:
+        """Best-effort load of ``map_raw`` from the source file on disk.
+
+        Dispatches by source-file extension:
+
+        * ``.h5`` / ``.nxs`` / ``.hdf5`` →
+          :class:`ssrl_xrd_tools.io.nexus.NexusImageStack` indexed by
+          ``source_frame_idx`` (the wrangler stamped the global stack
+          offset, so this works for both single-dataset and Eiger
+          multi-link masters).
+        * any other extension → ssrl ``read_image`` (TIF/EDF/CBF/…).
+
+        Idempotent: returns immediately if ``map_raw`` is already
+        populated.  Returns ``True`` on success, ``False`` on any
+        failure (no source ref, file missing, unrecognised format,
+        IO error).  Never raises — callers can fall through to the
+        existing "no raw, can't integrate" guard.
+
+        Note: this method does **not** acquire ``arch_lock``; callers
+        that are already inside the lock (the integrate methods) must
+        avoid re-entering.
+        """
+        if self.map_raw is not None:
+            return True
+        full = self._resolved_source_path()
+        if not full or not os.path.exists(full):
+            return False
+        ext = os.path.splitext(full)[1].lower()
+        # source_frame_idx is the global frame offset within the
+        # source file per the R2 schema.  Resolve once so both the
+        # HDF5 and non-HDF5 branches can pass the same value.  For
+        # single-frame TIFF/EDF/CBF the value is 0 (the writer
+        # stamps it that way), so ``frame=0`` is a no-op; for
+        # multi-frame TIFF/CBF stacks the wrangler records the
+        # correct offset and we must forward it.
+        fidx = self.source_frame_idx
+        if fidx is None:
+            fidx = self.idx if self.idx is not None else 0
+        fidx = int(fidx)
         try:
-            return float(self.th_mtr)
+            if ext in (".h5", ".nxs", ".hdf5"):
+                from ssrl_xrd_tools.io.nexus import open_nexus_image_stack
+                with open_nexus_image_stack(full) as stack:
+                    self.map_raw = np.asarray(
+                        stack[fidx], dtype=np.float32,
+                    )
+            else:
+                # O2: forward source_frame_idx for multi-frame
+                # non-HDF5 sources too (e.g. multi-frame TIFF /
+                # CBF stacks).  Single-frame files use frame=0
+                # and ignore the kwarg, so this is safe.
+                from ssrl_xrd_tools.io.image import read_image
+                self.map_raw = np.asarray(
+                    read_image(full, frame=fidx), dtype=np.float32,
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug(
+                "_lazy_load_raw failed for %s frame %s: %s",
+                full, self.source_frame_idx, e,
+            )
+            return False
+        return self.map_raw is not None
+
+    @property
+    def th_mtr(self):
+        """Legacy alias for :attr:`incidence_motor`.
+
+        J1: deprecated.  Kept for read access from old GUI signal
+        handlers that pass the motor name positionally.  New code
+        should use ``self.incidence_motor`` directly.
+        """
+        return self.incidence_motor
+
+    @th_mtr.setter
+    def th_mtr(self, value):
+        self.incidence_motor = value
+
+    def _get_incident_angle(self):
+        """Return incident angle in degrees from incidence_motor or scan_info."""
+        try:
+            return float(self.incidence_motor)
         except (ValueError, TypeError):
             # Case-insensitive lookup for motor position
-            th_mtr = str(self.th_mtr).lower()
+            motor = str(self.incidence_motor).lower()
             for key, val in self.scan_info.items():
-                if key.lower() == th_mtr:
+                if key.lower() == motor:
                     return float(val)
             return 0.0
 
@@ -276,7 +429,15 @@ class EwaldArch():
         """
         with self.arch_lock:
             if self.map_raw is None:
-                return  # no raw data (e.g. loaded from NeXus) — cannot re-integrate
+                # L1: try a lazy raw load from source_file before
+                # giving up.  Reloaded-from-v2 arches don't carry
+                # map_raw on disk (intentional schema choice) but
+                # the wrangler stamps source_file + source_frame_idx,
+                # which _lazy_load_raw can use to fetch the original
+                # frame from a TIF or a NeXus master.
+                self._lazy_load_raw()
+            if self.map_raw is None:
+                return  # no raw data and no source — cannot re-integrate
 
             self.map_norm = 1
             if monitor is not None:
@@ -418,7 +579,10 @@ class EwaldArch():
         """
         with self.arch_lock:
             if self.map_raw is None:
-                return  # no raw data (e.g. loaded from NeXus) — cannot re-integrate
+                # L1: same lazy-load attempt as integrate_1d.
+                self._lazy_load_raw()
+            if self.map_raw is None:
+                return  # no raw data and no source — cannot re-integrate
 
             if monitor is not None:
                 self.map_norm = 1
@@ -571,11 +735,20 @@ class EwaldArch():
         if self.thumbnail is not None:
             return
         if self.map_raw is None:
+            # F5: try L1 lazy load before giving up.  Lets thumbnail
+            # regeneration work on reloaded v2 spheres whose source
+            # files are still available.
+            self._lazy_load_raw()
+        if self.map_raw is None:
             return
         try:
             corrected = (np.asarray(self.map_raw, dtype=np.float32)
                          - np.asarray(self.bg_raw, dtype=np.float32))
-        except Exception:
+        except (TypeError, ValueError) as e:
+            import logging
+            logging.getLogger(__name__).debug(
+                "make_thumbnail: bg subtraction failed: %s", e,
+            )
             return
         self.thumbnail = _make_thumbnail(
             corrected, mask_idx=self.mask, global_mask=global_mask,
@@ -590,7 +763,7 @@ class EwaldArch():
             copy.deepcopy(self.scan_info), copy.deepcopy(self.ai_args),
             self.file_lock,
             static=copy.deepcopy(self.static), gi=copy.deepcopy(self.gi),
-            th_mtr=copy.deepcopy(self.th_mtr),
+            incidence_motor=copy.deepcopy(self.incidence_motor),
             sample_orientation=self.sample_orientation,
             series_average=copy.deepcopy(self.series_average)
         )

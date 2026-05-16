@@ -27,11 +27,56 @@ class DisplayDataMixin:
 
     - ``self.sphere``, ``self.arch``, ``self.arches``
     - ``self.arch_ids``, ``self.data_1d``, ``self.data_2d``
+    - ``self.data_lock`` (threading.RLock guarding the dicts)
     - ``self.idxs``, ``self.idxs_1d``, ``self.idxs_2d``, ``self.overall``
     - ``self.ui`` (the Ui_Form instance)
     - ``self.normChannel``, ``self.bkg_*``
     - ``self._plot_axis_info``
+
+    Locking contract (M3)
+    =====================
+
+    ``data_1d`` and ``data_2d`` are shared between the wrangler
+    thread, the integrator thread, the fileHandlerThread / the M1
+    LoadArchesWorker, and the GUI thread.  All **mutating** access
+    (assignment, ``del``, ``clear``, ``pop``) goes through
+    ``self.data_lock``.  **Read** access either takes ``data_lock``
+    explicitly (when iterating multiple keys) or uses
+    :meth:`_snapshot_data` to grab a stable view to iterate
+    lock-free.
+
+    The CPython GIL makes single ``dict[k]`` lookups atomic, so
+    direct cache-hit reads like ``self.data_1d.get(idx)`` are still
+    safe.  The unsafe pattern was *iterating* the dicts (``for k, v
+    in self.data_2d.items():`` or ``list(self.data_2d.keys())``)
+    without a lock — a concurrent writer can mutate the dict
+    mid-iteration and raise RuntimeError ("dictionary changed size
+    during iteration").  Use ``_snapshot_data`` for those paths.
     """
+
+    def _snapshot_data(self, idxs):
+        """Return a small {idx: (arch_1d, arch_2d_dict)} dict for
+        the requested ``idxs``, sampled atomically under
+        ``self.data_lock``.
+
+        M3 helper: callers that need to iterate over a set of
+        frames' data (e.g. for averaging) should take the snapshot
+        once and then process it without holding the lock.  This
+        keeps the lock window short (one dict-comprehension's worth)
+        and avoids the "dictionary changed size during iteration"
+        race that the wrangler thread can otherwise trigger.
+
+        Missing arches are silently omitted from the result — the
+        caller is expected to handle partial data anyway.
+        """
+        with self.data_lock:
+            return {
+                int(idx): (
+                    self.data_1d.get(int(idx)),
+                    self.data_2d.get(int(idx), {}),
+                )
+                for idx in idxs
+            }
 
     # ── Raw 2D data access ────────────────────────────────────────
 
@@ -41,35 +86,50 @@ class DisplayDataMixin:
         Falls back to the stored thumbnail when full-resolution raw data
         is not available (e.g. when loading from NeXus files that only
         store integration results + thumbnails).
+
+        M3: takes a single snapshot of the requested idxs under
+        ``data_lock`` and then iterates the snapshot lock-free, so
+        a concurrent writer can keep streaming new arches without
+        racing the iteration.
         """
         if idxs is None:
             idxs = self.idxs_2d
 
+        snapshot = self._snapshot_data(idxs)
+
         intensity, ctr = 0., 0
         for nn, idx in enumerate(idxs):
-            arch_1d = self.data_1d.get(int(idx))
-            arch_2d = self.data_2d.get(int(idx), {})
+            arch_1d, arch_2d = snapshot.get(int(idx), (None, {}))
             raw = arch_2d.get('map_raw')
             bg = arch_2d.get('bg_raw', 0)
             # Try thumbnail from data_2d, then fall back to data_1d
             thumb = arch_2d.get('thumbnail')
             if thumb is None and arch_1d is not None:
                 thumb = getattr(arch_1d, 'thumbnail', None)
-            for kk in range(3):
-                try:
-                    scan_info = arch_1d.scan_info if arch_1d is not None else {}
-                    if raw is not None:
-                        intensity += self.normalize(raw - bg, scan_info)
-                    elif thumb is not None:
-                        # Use thumbnail as fallback when raw isn't stored
-                        intensity += self.normalize(
-                            np.asarray(thumb, dtype=float), scan_info)
-                    else:
-                        break
+            # F1: was `for kk in range(3): try: ...; break; except
+            # ValueError: time.sleep(0.5)`.  The retry/sleep pattern
+            # was running on the Qt thread — visible UI freeze on
+            # any single broken arch.  The ValueError originated from
+            # shape mismatches during early-load races; we now log
+            # them at debug and move on (the GUI re-fires update
+            # signals on its own when the wrangler finishes more
+            # frames, so a missed average will be recomputed next
+            # cycle).
+            try:
+                scan_info = arch_1d.scan_info if arch_1d is not None else {}
+                if raw is not None:
+                    intensity += self.normalize(raw - bg, scan_info)
                     ctr += 1
-                    break
-                except ValueError:
-                    time.sleep(0.5)
+                elif thumb is not None:
+                    # Use thumbnail as fallback when raw isn't stored
+                    intensity += self.normalize(
+                        np.asarray(thumb, dtype=float), scan_info)
+                    ctr += 1
+            except ValueError as e:
+                logger.debug(
+                    "get_arches_map_raw skipped arch %s due to shape "
+                    "mismatch: %s", idx, e,
+                )
 
         if ctr > 0:
             intensity /= ctr
@@ -78,22 +138,11 @@ class DisplayDataMixin:
 
         return np.asarray(intensity, dtype=float)
 
-    def get_sphere_map_raw(self):
-        """Returns data and QRect for data in sphere
-        """
-        with self.sphere.sphere_lock:
-            map_raw = np.asarray(self.sphere.overall_raw, dtype=float)
-            if map_raw.ndim < 2:
-                self.sphere.load_from_h5(data_only=True)
-                map_raw = np.asarray(self.sphere.overall_raw, dtype=float)
-
-            norm_fac = len(self.sphere.arches.index)
-            if self.normChannel:
-                norm = self.sphere.scan_data[self.normChannel].sum()
-                if norm > 0:
-                    norm_fac = norm
-
-            return map_raw/norm_fac
+    # G2: get_sphere_map_raw was deleted.  It read sphere.overall_raw,
+    # an in-memory accumulator that doesn't survive v2 reload (the
+    # loader doesn't repopulate it) and goes stale under R1's
+    # replace-frames save.  The Overall view in update_image now
+    # aggregates via get_arches_map_raw(list(sphere.arches.index)).
 
     # ── 2D integration data access ────────────────────────────────
 
@@ -107,6 +156,10 @@ class DisplayDataMixin:
 
         Returns ``(intensity, xdata, ydata)`` or ``(None, None, None)``
         if nothing usable is loaded.
+
+        M3: uses ``_snapshot_data`` for a stable view of the
+        requested idxs; concurrent writes to ``data_1d``/``data_2d``
+        no longer race this iteration.
         """
         if idxs is None:
             idxs = self.idxs_2d
@@ -114,12 +167,13 @@ class DisplayDataMixin:
         if not idxs:
             return None, None, None
 
+        snapshot = self._snapshot_data(idxs)
+
         intensity = None
         xdata = ydata = None
         ctr = 0
         for idx in idxs:
-            arch_1d = self.data_1d.get(int(idx))
-            arch_2d = self.data_2d.get(int(idx))
+            arch_1d, arch_2d = snapshot.get(int(idx), (None, None))
             if arch_2d is None or arch_2d.get('int_2d') is None:
                 continue
             _gi2d = arch_2d.get('gi_2d', {})
@@ -145,19 +199,13 @@ class DisplayDataMixin:
         intensity = intensity / ctr
         return intensity, xdata, ydata
 
-    def get_sphere_int_2d(self):
-        """Returns data and QRect for data in sphere
-        """
-        with self.sphere.sphere_lock:
-            int_2d = self.sphere.bai_2d
-
-        if int_2d is None:
-            return np.zeros((1, 1)), np.array([]), np.array([])
-
-        intensity = self.get_int_2d(int_2d, normalize=True)
-
-        xdata, ydata = self.get_xydata(int_2d)
-        return intensity, xdata, ydata
+    # G2: get_sphere_int_2d was deleted.  It read sphere.bai_2d, an
+    # in-memory accumulator that doesn't survive v2 reload.  The
+    # Overall view in update_binned now uses
+    # get_arches_int_2d(list(sphere.arches.index)).  The comment
+    # at the call site (display_frame_widget.update_binned) already
+    # noted this path returned 1×1 zeros for NeXus files — so it's
+    # been functionally dead since v2 landed.
 
     def get_int_2d(self, int_2d, arch_1d=None, normalize=True, gi_2d=None):
         """Returns the appropriate 2D data depending on the chosen axes.
@@ -600,21 +648,28 @@ class DisplayDataMixin:
         fname = os.path.join(path, fname)
 
         xdata, ydata = self.plot_data
-        if self.plotMethod in ['Average', 'Sum']:
+        # H4: Average / Sum produces ONE combined output.  Pre-H4 the
+        # code wrote the combined file AND then fell through to the
+        # per-frame loop below — silently producing dozens of extra
+        # per-frame .xye files alongside an "average.xye" in the
+        # same directory.  Branch cleanly: Average/Sum → combined
+        # only; everything else (Overlay, Single, Waterfall) →
+        # per-frame files.
+        if self.plotMethod in ('Average', 'Sum'):
             if self.plotMethod == 'Average':
                 s_ydata = np.nanmean(ydata, 0)
             else:
                 s_ydata = np.nansum(ydata, 0)
-
-            # Write to xye
             xye_fname = f'{fname}.xye'
             ut.write_xye(xye_fname, xdata, s_ydata)
-
-        idxs = [arch.replace(f'{self.sphere.name}_', '') for arch in self.arch_names]
-        for nn, (s_ydata, idx) in enumerate(zip(ydata, idxs)):
-            # Write to xye
-            xye_fname = f'{fname}_{str(idx).zfill(4)}.xye'
-            ut.write_xye(xye_fname, xdata, s_ydata)
+        else:
+            idxs = [
+                arch.replace(f'{self.sphere.name}_', '')
+                for arch in self.arch_names
+            ]
+            for s_ydata, idx in zip(ydata, idxs):
+                xye_fname = f'{fname}_{str(idx).zfill(4)}.xye'
+                ut.write_xye(xye_fname, xdata, s_ydata)
 
         if not auto:
             scene = self.plot_viewBox.scene()

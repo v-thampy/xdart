@@ -93,6 +93,14 @@ class Main(QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    # N8: apply dark theme before any widget construction so
+    # pyqtgraph plot backgrounds are set in time (pyqtgraph
+    # snapshots the config at widget creation).
+    try:
+        from xdart.gui.themes import apply_dark_theme
+        apply_dark_theme(app)
+    except Exception:
+        logger.exception("Failed to apply dark theme; using Qt default")
     mw = Main()
     mw.show()
     app.exec()

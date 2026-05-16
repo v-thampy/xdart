@@ -10,8 +10,11 @@ master files) and a PONI calibration file.
 """
 
 # Standard library imports
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Used to size the Cores spinbox.  os.cpu_count() returns None on
 # exotic platforms; the fallback default mirrors what the SPEC
@@ -96,7 +99,7 @@ class nexusWrangler(wranglerWidget):
         self.mask_file = ''
         self.h5_dir = get_fname_dir()
         self.gi = False
-        self.th_mtr = 'th'
+        self.incidence_motor = 'th'
         self.sample_orientation = 4
         self.tilt_angle = 0.0
         self.gi_mode_1d = 'q_total'
@@ -119,7 +122,11 @@ class nexusWrangler(wranglerWidget):
         # Buttons
         btn_layout = QtWidgets.QHBoxLayout()
         self.startButton = QtWidgets.QPushButton('Start')
+        # N8: object names enable the dark-theme QSS to colour
+        # these primary CTAs (green/red).  See xdart/gui/themes/dark.py.
+        self.startButton.setObjectName('startButton')
         self.stopButton = QtWidgets.QPushButton('Stop')
+        self.stopButton.setObjectName('stopButton')
 
         # Processing-mode dropdown — same items as specWrangler so the
         # two paths feel interchangeable.  Selecting "Int 1D" or
@@ -207,7 +214,7 @@ class nexusWrangler(wranglerWidget):
             self.poni,
             self.mask_file,
             self.gi,
-            self.th_mtr,
+            self.incidence_motor,
             self.sample_orientation,
             self.tilt_angle,
             self.gi_mode_1d,
@@ -260,8 +267,14 @@ class nexusWrangler(wranglerWidget):
                 p.setValue(val)
                 if attr:
                     setattr(self, attr, val)
-            except Exception:
-                pass
+            except (KeyError, AttributeError, ValueError, TypeError) as e:
+                # KeyError: parameter tree was renamed since the session
+                # was saved.  Other types: value-coercion mismatches.
+                # All are non-fatal — the unrestored param just keeps
+                # its default — but we want them visible at debug.
+                logger.debug(
+                    "session restore failed for %s: %s", skey, e,
+                )
 
         # Restore PONI
         poni_file = self.parameters.child('Calibration').child('poni_file').value()
@@ -297,8 +310,12 @@ class nexusWrangler(wranglerWidget):
                 for name in param_path:
                     p = p.child(name)
                 data[skey] = p.value()
-            except Exception:
-                pass
+            except (KeyError, AttributeError) as e:
+                # Missing parameter tree node — surfaces only when the
+                # widget is mid-tear-down or the tree shape changed.
+                logger.debug(
+                    "session save skipped for %s: %s", skey, e,
+                )
         # Persist the Cores spinbox alongside the parameter-tree
         # values — see :meth:`_restore_from_session` for the inverse.
         data['max_cores'] = self.maxCoresSpinBox.value()
@@ -392,7 +409,7 @@ class nexusWrangler(wranglerWidget):
 
         # GI parameters
         self.gi = self.parameters.child('GI').child('Grazing').value()
-        self.th_mtr = self.parameters.child('GI').child('th_motor').value()
+        self.incidence_motor = self.parameters.child('GI').child('th_motor').value()
         self.sample_orientation = self.parameters.child('GI').child('sample_orientation').value()
         self.tilt_angle = self.parameters.child('GI').child('tilt_angle').value()
         # GI modes are driven by the integrator panel (axis1D / axis2D)
@@ -409,7 +426,7 @@ class nexusWrangler(wranglerWidget):
             self.poni,
             self.mask_file,
             self.gi,
-            self.th_mtr,
+            self.incidence_motor,
             self.sample_orientation,
             self.tilt_angle,
             self.gi_mode_1d,
