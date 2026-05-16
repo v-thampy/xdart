@@ -44,7 +44,6 @@ Performance shape (post-P3A refactor 2026-05-13):
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -122,7 +121,7 @@ class nexusThread(wranglerThread):
         self.poni = poni
         self.mask_file = mask_file
         self.gi = gi
-        self.th_mtr = th_mtr
+        self.incidence_motor = th_mtr
         self.sample_orientation = sample_orientation
         self.tilt_angle = tilt_angle
         self.gi_mode_1d = gi_mode_1d
@@ -193,7 +192,7 @@ class nexusThread(wranglerThread):
         # Notify the GUI that a new scan is being processed.
         self.sigUpdateFile.emit(
             scan_name, self.fname,
-            self.gi, self.th_mtr,
+            self.gi, self.incidence_motor,
             False, False,  # single_img=False, series_average=False
         )
 
@@ -227,12 +226,35 @@ class nexusThread(wranglerThread):
                 first_frame = np.asarray(ds[0], dtype=np.float32)
                 self._prewarm_fiber_integrator(sphere, first_frame, base_meta)
 
+            # F3: prewarm the stable bad-pixel mask cache on the main
+            # thread before any worker runs.  Without this, the first
+            # N workers all race to compute and write
+            # sphere._cached_data_mask (same value, but the invariant
+            # isn't enforced).  Cheap: one frame read + a flatten.
+            if getattr(sphere, '_cached_data_mask', None) is None:
+                first_frame = np.asarray(ds[0], dtype=np.float32)
+                self._prewarm_arch_mask(sphere, first_frame)
+
             n_workers = min(self.max_cores, nframes)
             # Per-scan integrator pool.  Built lazily on first parallel
             # batch; reused across all subsequent chunks so the
             # ~250 ms first-call CSR LUT cost is paid once per worker.
             integrator_pool = ensure_integrator_pool(
                 sphere, '_cached_integrator', n_workers,
+            )
+            # H2: pyFAI FiberIntegrator inherits from
+            # AzimuthalIntegrator and shares the CSR-scratch-buffer
+            # mutation pattern.  Same fix as IntegratorPool — one
+            # deepcopy per worker, borrowed via context manager.
+            # Built only when GI is enabled and the prewarm seeded
+            # _cached_fiber_integrator; otherwise stays None and
+            # the worker uses its own per-frame fiber integrator.
+            fiber_pool = (
+                ensure_integrator_pool(
+                    sphere, '_cached_fiber_integrator', n_workers,
+                    pool_attr='_cached_fiber_integrator_pool',
+                )
+                if self.gi else None
             )
             # If the GUI is single-core (max_cores=1) integrator_pool
             # still exists with one member; the worker borrows it like
@@ -261,21 +283,24 @@ class nexusThread(wranglerThread):
                     ))
 
                 # ── Parallel integration ────────────────────────────
-                # ThreadPoolExecutor + integrator pool: each worker
-                # borrows its own integrator copy, so the CSR LUT
-                # cache stays valid across concurrent calls.
+                # Shared base helper (_parallel_integrate) handles the
+                # ThreadPoolExecutor + error-collection + idx-sort.
+                # Each worker borrows its own integrator from the pool,
+                # so pyFAI's CSR LUT cache stays valid across
+                # concurrent calls.
                 self.showLabel.emit(
                     f'Integrating frames {chunk_start+1}-{chunk_end}'
                     f'/{nframes} ({n_workers} workers)'
                 )
                 _t_phase1 = time.time()
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    arches = list(pool.map(
-                        lambda item: self._integrate_one(
-                            sphere, integrator_pool, *item,
-                        ),
-                        items,
-                    ))
+                arches = self._parallel_integrate(
+                    items,
+                    lambda item: self._integrate_one(
+                        sphere, integrator_pool, fiber_pool, *item,
+                    ),
+                    n_workers,
+                    label='NEXUS',
+                )
                 _t_phase1 = time.time() - _t_phase1
 
                 # ── Serial accumulation into the sphere ─────────────
@@ -322,18 +347,39 @@ class nexusThread(wranglerThread):
                     self._save_to_disk(sphere)
                     frames_since_save = 0
 
-        # Final save: write everything coherent + provenance + finalize
-        # (last call of the scan).  Skipped under xye_only — that mode
-        # exists precisely to bypass the .nxs altogether.
-        if (files_processed > 0 and self.command != 'stop'
-                and not self.xye_only):
+        # Final save: write everything coherent + provenance + finalize.
+        #
+        # N4 — Stop tail flush.  Pre-N4 this was gated on
+        # ``self.command != 'stop'``, which meant that if the user
+        # hit Stop after some frames had been processed and
+        # published but before the next periodic save kicked in,
+        # those tail frames remained in memory only and were lost.
+        # Now we always do a non-finalize save on Stop so the
+        # processed prefix lands on disk — only ``finalize=True``
+        # (provenance + write-once items) is skipped on Stop, since
+        # the scan didn't actually complete and the file should be
+        # marked as a partial result.
+        #
+        # N7 — dropped the outer ``with self.file_lock:`` because
+        # ``sphere.save_to_nexus`` already takes the lock internally
+        # (J2 made the locks the same Condition, so the nested
+        # acquire was reentrant + redundant rather than a deadlock).
+        if files_processed > 0 and not self.xye_only:
+            is_finalize = (self.command != 'stop')
             _get_h5pool().pause(sphere.data_file)
             try:
-                with self.file_lock:
-                    sphere.default_geometry()
-                    sphere.save_to_nexus(replace=False, finalize=True)
+                sphere.default_geometry()
+                sphere.save_to_nexus(
+                    replace=False, finalize=is_finalize,
+                )
             finally:
                 _get_h5pool().resume(sphere.data_file)
+            if not is_finalize:
+                logger.info(
+                    '[NEXUS] Stop tail-flushed %d frames; .nxs is '
+                    'a partial result (no finalize stamp).',
+                    files_processed,
+                )
 
         self.showLabel.emit(f'Done — {files_processed} frames processed')
         logger.info(
@@ -367,8 +413,14 @@ class nexusThread(wranglerThread):
             for k, v in scan_meta.angles.items():
                 if frame_idx < len(v):
                     meta[k] = float(v[frame_idx])
-        except Exception:
-            pass
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
+            # AttributeError: scan_meta missing counters/angles attr.
+            # TypeError/ValueError: counter array contains non-numeric.
+            # KeyError: shouldn't happen but be defensive on dict-like.
+            # Any of these falls back to base_meta — already populated.
+            logger.debug(
+                "frame_meta lookup failed for frame %s: %s", frame_idx, e,
+            )
         return meta
 
     def _prewarm_fiber_integrator(self, sphere, first_frame, base_meta):
@@ -383,7 +435,7 @@ class nexusThread(wranglerThread):
         scratch = EwaldArch(
             0, first_frame, poni=self.poni,
             scan_info=base_meta, static=True, gi=self.gi,
-            th_mtr=self.th_mtr,
+            th_mtr=self.incidence_motor,
             sample_orientation=self.sample_orientation,
             tilt_angle=self.tilt_angle,
             series_average=False,
@@ -397,9 +449,14 @@ class nexusThread(wranglerThread):
             sample_orientation=self.sample_orientation,
             angle_unit="deg",
         )
+        # Cache the angle so the parallel workers in :meth:`_integrate_one`
+        # can detect drift on ω-varying scans and fall back to a
+        # worker-local fiber integrator at the correct angle.  Same
+        # pattern as specThread.
+        sphere._cached_fiber_integrator_angle = incident_angle
 
-    def _integrate_one(self, sphere, integrator_pool, frame_idx,
-                       img_data, img_meta):
+    def _integrate_one(self, sphere, integrator_pool, fiber_pool,
+                       frame_idx, img_data, img_meta):
         """Pure integration in a worker thread; returns the arch.
 
         Borrows an integrator from the pool, integrates 1D/2D, and
@@ -407,7 +464,13 @@ class nexusThread(wranglerThread):
         so the next worker can borrow it safely.  All shared-sphere
         mutation (data_1d / data_2d / add_arch / sigUpdate) happens
         on the main thread in :meth:`_publish`, not here.
+
+        F2 cancel-fast: returns ``None`` immediately when Stop has
+        been requested, so the user doesn't wait for pyFAI to
+        finish the current frame after pressing Stop.
         """
+        if self.command == 'stop':
+            return None
         _t0 = time.time()
         # Stable bad-pixel mask cached on the sphere across frames so
         # pyFAI's CSR cache stays valid.  Helper now lives on the
@@ -420,7 +483,7 @@ class nexusThread(wranglerThread):
             arch = EwaldArch(
                 frame_idx, img_data, poni=self.poni,
                 scan_info=img_meta, static=True, gi=self.gi,
-                th_mtr=self.th_mtr,
+                th_mtr=self.incidence_motor,
                 sample_orientation=self.sample_orientation,
                 tilt_angle=self.tilt_angle,
                 series_average=False,
@@ -428,21 +491,33 @@ class nexusThread(wranglerThread):
                 mask=arch_mask,
             )
 
-            # GI fiber integrator: pre-warmed on the main thread (see
-            # _prewarm_fiber_integrator); workers only read it.
-            fi = sphere._cached_fiber_integrator
-
-            arch.integrate_1d(
-                global_mask=self.mask,
-                fiber_integrator=fi,
-                **sphere.bai_1d_args,
-            )
-            if not sphere.skip_2d:
-                arch.integrate_2d(
+            # GI fiber integrator: pre-warmed on the main thread for
+            # frame 0's incidence angle.  Reuse it when this frame's
+            # angle matches; otherwise build a worker-local one at
+            # the right angle.  Sin²ψ scans (fixed ω) stay on the
+            # fast cached path; ω-varying scans get correct results
+            # at the cost of one per-frame fiber-integrator build.
+            #
+            # H2: when reusing the cached integrator we BORROW a
+            # per-worker deepcopy from ``fiber_pool`` rather than
+            # share the single sphere-level instance — pyFAI's
+            # FiberIntegrator inherits the same CSR-scratch-buffer
+            # mutation pattern as AzimuthalIntegrator and is not
+            # safe across concurrent inputs.
+            with self._borrow_fiber_integrator(
+                sphere, fiber_pool, arch,
+            ) as fi:
+                arch.integrate_1d(
                     global_mask=self.mask,
                     fiber_integrator=fi,
-                    **sphere.bai_2d_args,
+                    **sphere.bai_1d_args,
                 )
+                if not sphere.skip_2d:
+                    arch.integrate_2d(
+                        global_mask=self.mask,
+                        fiber_integrator=fi,
+                        **sphere.bai_2d_args,
+                    )
 
         # Detach the pool integrator from the arch — once the `with`
         # exits, another worker can borrow this same instance.  The
@@ -451,12 +526,18 @@ class nexusThread(wranglerThread):
         arch.integrator = sphere._cached_integrator
 
         # Set source file reference for the v2 NeXus per-frame group.
+        # The source_frame_idx is the *global* frame index across all
+        # external-link data files (matches NexusImageStack's flattened
+        # view), so a lazy raw loader can do
+        # ``NexusImageStack(source_file)[source_frame_idx]`` directly
+        # without needing to know which data_NNNNNN segment to open.
         try:
             arch.source_file = os.path.relpath(
                 self.nexus_file, os.path.dirname(sphere.data_file),
             )
         except ValueError:
             arch.source_file = str(self.nexus_file)
+        arch.source_frame_idx = int(frame_idx)
         # NeXus frames already live in the source — don't double-store
         # them in the output .nxs.
         arch.skip_map_raw = True
@@ -478,30 +559,31 @@ class nexusThread(wranglerThread):
         return arch
 
     def _publish(self, sphere, arch):
-        """Push the integrated arch into sphere + GUI display state.
+        """Push the integrated arch into sphere + the publish slot.
 
         Runs on the main thread after the parallel section so
-        ``sphere.add_arch`` and the per-frame data dict updates are
-        serialised — sphere isn't thread-safe for concurrent writes.
+        ``sphere.add_arch`` is serialised — sphere isn't thread-safe
+        for concurrent writes.
+
+        After D1 (unified handoff): we no longer write
+        ``self.data_1d``/``self.data_2d`` directly.  Instead we leave
+        the arch in ``self._published_arches[arch.idx]`` and emit
+        ``sigUpdate``; ``static_scan_widget.update_data`` pops it and
+        owns the dict updates + bounded eviction.  Same single
+        source-of-truth contract that specThread's live path uses.
         """
-        self.data_1d[arch.idx] = arch.copy(include_2d=False)
-        self.data_2d[arch.idx] = {
-            'map_raw': arch.map_raw,
-            'bg_raw': arch.bg_raw,
-            'mask': arch.mask,
-            'int_2d': arch.int_2d,
-            'gi_2d': arch.gi_2d,
-            'thumbnail': None,
-        }
         # In-memory accumulate only — the chunked flush at the end of
         # the dispatch loop (and the final ``save_to_nexus(finalize=True)``
         # at the bottom of ``run()``) handle persistence.
         sphere.add_arch(
             arch=arch, calculate=False, update=True,
             get_sd=True, set_mg=False, static=True, gi=self.gi,
-            th_mtr=self.th_mtr, series_average=False,
+            th_mtr=self.incidence_motor, series_average=False,
             batch_save=True,
         )
+        # Publish for the GUI's update_data slot to consume.  Single
+        # write site for the dict round-trip.
+        self._published_arches[arch.idx] = arch
 
     # ``_save_to_disk`` is inherited from wranglerThread.  Called
     # from the chunk loop every LIVE_SAVE_INTERVAL frames so the

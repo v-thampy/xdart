@@ -37,6 +37,117 @@ QFileDialog = QtWidgets.QFileDialog
 QItemSelectionModel = QtCore.QItemSelectionModel
 
 
+class _LoadArchesWorker(QtCore.QObject):
+    """M1 background worker for ``load_arches_data``.
+
+    Runs ``_load_arch_v2`` for each requested frame on a dedicated
+    QThread so the GUI's event loop never blocks on HDF5 reads.
+
+    Usage::
+
+        worker = _LoadArchesWorker(data_file, file_lock, gi, arch_ids, load_2d)
+        thread = QtCore.QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.chunkLoaded.connect(viewer._absorb_chunk)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    Cancellation: the owner calls ``worker.cancel()`` (sets a
+    threading.Event); the run loop checks between every arch and
+    bails cleanly.  The currently-in-flight HDF5 read still
+    completes — there's no safe way to preempt a libhdf5 call — but
+    no further reads start.
+    """
+
+    # N1: signals carry the worker's generation number so the GUI
+    # can drop stale chunks from a cancelled worker that's still
+    # draining its run loop.
+    chunkLoaded = QtCore.Signal(int, int, object)  # (generation, idx, arch)
+    finished = QtCore.Signal(int)  # (generation,)
+    cancelled = QtCore.Signal(int)  # (generation,)
+
+    def __init__(self, data_file, file_lock, gi, arch_ids, load_2d,
+                 generation, parent=None):
+        super().__init__(parent)
+        self.data_file = data_file
+        self.file_lock = file_lock
+        self.gi = gi
+        self.arch_ids = list(arch_ids)
+        self.load_2d = load_2d
+        # N1: monotonic generation number assigned by the owning
+        # H5Viewer.  Workers whose generation no longer matches
+        # ``H5Viewer._load_generation`` have been superseded and
+        # their emitted chunks are dropped on the GUI side.
+        self.generation = int(generation)
+        # Use threading.Event so the run loop (running on the worker
+        # thread) and cancel() (called from the GUI thread) can
+        # synchronise without going through Qt's signal queue.
+        import threading
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        """Request the worker stop after its current arch read."""
+        self._cancel.set()
+
+    def run(self) -> None:
+        """Run on the worker thread.  Loads each arch and emits one
+        ``chunkLoaded`` signal per success; emits ``finished`` (or
+        ``cancelled``) when done."""
+        try:
+            from xdart.modules.ewald.arch_series import _load_arch_v2
+            pool = get_pool()
+            # Acquire a borrowed file handle from the pool.  Pre-M1
+            # the GUI did the same dance on the main thread; here we
+            # do it on the worker thread.  If the writer paused the
+            # pool mid-load, pool.get() returns None and we bail
+            # cleanly — the GUI will re-fire data_changed once the
+            # writer releases.
+            # Self-review fix #1: re-acquire the pool handle inside
+            # each loop iteration.  Pre-fix the worker grabbed
+            # ``file`` once and used it across all reads; if a
+            # concurrent save called ``pool.pause()`` the handle got
+            # closed under the worker's feet, the subsequent
+            # ``_load_arch_v2`` raised a swallowed exception, and
+            # the rest of the load silently failed.  Now every
+            # iteration goes through ``pool.get()`` so a paused pool
+            # returns None and the worker bails cleanly until the
+            # next user selection re-fires the load.
+            for idx in self.arch_ids:
+                if self._cancel.is_set():
+                    self.cancelled.emit(self.generation)
+                    return
+                file = pool.get(self.data_file)
+                if file is None:
+                    # Writer paused the pool — exit gracefully; the
+                    # writer's resume() will trigger a sigUpdate
+                    # that re-fires the GUI's data_changed slot.
+                    logger.debug(
+                        "load worker gen=%s: pool paused at idx=%s; "
+                        "stopping",
+                        self.generation, idx,
+                    )
+                    break
+                try:
+                    with self.file_lock:
+                        arch = _load_arch_v2(file, idx, static=True,
+                                             gi=self.gi)
+                except (KeyError, IndexError, OSError, ValueError) as e:
+                    logger.debug("load worker: arch %s skipped: %s",
+                                 idx, e)
+                    continue
+                # Emit on the worker thread; Qt queues the slot
+                # invocation back to the GUI thread automatically
+                # because the signal target lives on the GUI thread.
+                self.chunkLoaded.emit(self.generation, int(idx), arch)
+        except Exception:
+            logger.exception("LoadArchesWorker crashed unexpectedly")
+        finally:
+            self.finished.emit(self.generation)
+
+
 class _AccumulatingClickFilter(QtCore.QObject):
     """Centralized click handler for the H5Viewer ``listData`` widget.
 
@@ -347,6 +458,29 @@ class H5Viewer(QWidget):
         self.file_thread.sigUpdate.connect(self.sigUpdate.emit)
         self.file_thread.start(Qt.QtCore.QThread.LowPriority)
         self._h5pool = get_pool()
+        # M1: handle for the per-selection LoadArchesWorker.  None
+        # when no load is in flight.  Owns a QThread that gets
+        # created on demand and reaped between selections.
+        self._load_worker = None
+        self._load_thread = None
+        # N1: monotonic generation counter for load workers.  Every
+        # new worker gets a fresh number; _absorb_chunk drops any
+        # incoming chunk whose generation no longer matches.  This
+        # prevents stale chunks from a cancelled worker (still
+        # draining its run loop after cancel()) from polluting the
+        # new selection's data dicts.
+        self._load_generation = 0
+        # O6: coalesce ``sigUpdate`` emits while a chunk burst is
+        # streaming in from ``_LoadArchesWorker``.  Without this, a
+        # 100-arch selection fires 100 full-display repaints in
+        # rapid succession.  With it, the burst is debounced to a
+        # single emit ~100 ms after the last chunk lands — and the
+        # worker-finished slot forces a final emit so the last
+        # paint always reflects the full selection.
+        self._update_coalesce_timer = Qt.QtCore.QTimer(self)
+        self._update_coalesce_timer.setSingleShot(True)
+        self._update_coalesce_timer.setInterval(100)  # ms
+        self._update_coalesce_timer.timeout.connect(self.sigUpdate.emit)
         
     def load_starting_defaults(self):
         default_path = os.path.join(self.local_path, "last_defaults.json")
@@ -846,7 +980,11 @@ class H5Viewer(QWidget):
             idxs = self.arch_ids
 
         if (len(idxs) == 0) or ('No data' in idxs):
-            time.sleep(0.1)
+            # F1: no sleep on the Qt thread.  Pre-F1 this slept 100 ms
+            # on every spurious empty-selection signal; multiplied by
+            # many selectionChanged events that fire during list
+            # rebuilds, this added visible UI stutter for no
+            # functional reason (we return immediately afterwards).
             return
 
         # ── Image viewer ─────────────────────────────────────────────
@@ -957,36 +1095,150 @@ class H5Viewer(QWidget):
         self.set_file(fname)
 
     def load_arches_data(self, arch_ids, load_2d):
-        """Load per-frame data from the v2 stacked arrays.
+        """Dispatch a background ``_LoadArchesWorker`` for the given
+        arch_ids and return immediately.
 
-        Delegates to :func:`xdart.modules.ewald.arch_series._load_arch_v2`
-        so the read path matches what ``ArchSeries.__getitem__`` does
-        on-demand — no schema duplication.
+        M1: pre-M1 this method ran ``_load_arch_v2`` for every arch
+        on the GUI thread, with a ``QApplication.processEvents()``
+        yield every 4 reads (J3) to keep the UI from fully freezing.
+        That kept the *event loop* alive but the HDF5 reads still
+        blocked the slot — selecting 100 frames was still seconds of
+        sluggish input.  Now the reads run on a dedicated worker
+        QThread and stream results back via ``chunkLoaded`` signals.
+
+        Cancellation: starting a new load while one is in flight
+        cancels the old one — the existing worker's run loop bails
+        between reads, and the new selection's worker takes over.
+        This is what users expect when they're rapidly scrolling
+        through frames; no queued-up stale loads catching up later.
+
+        sigUpdate emits: ``_absorb_chunk`` emits ``sigUpdate`` after
+        every batch absorbed, so the display catches up
+        incrementally; the caller's own ``sigUpdate.emit()`` after
+        this method returns is still useful for "selection-only"
+        updates (cache hits) but the bulk of the visible refresh
+        comes from the worker.
         """
-        file = self._h5pool.get(self.sphere.data_file)
-        if file is None:
-            # File is being written to by the wrangler thread — skip this read.
+        if not arch_ids:
             return
-
-        from xdart.modules.ewald.arch_series import _load_arch_v2
-
-        for idx in arch_ids:
+        # Cancel any in-flight worker.  We don't wait — the worker's
+        # run loop checks the cancel flag between reads and exits
+        # cleanly on its own; the new worker can start immediately.
+        if self._load_worker is not None:
             try:
-                arch = _load_arch_v2(file, idx, static=True, gi=self.sphere.gi)
-                with self.data_lock:
-                    if not load_2d:
-                        self.data_1d[int(idx)] = arch.copy(include_2d=False)
-                    else:
-                        self.data_1d[int(idx)] = arch.copy(include_2d=False)
-                        self.data_2d[int(idx)] = {'map_raw': arch.map_raw,
-                                                  'bg_raw': arch.bg_raw,
-                                                  'mask': arch.mask,
-                                                  'int_2d': arch.int_2d,
-                                                  'gi_2d': arch.gi_2d,
-                                                  'thumbnail': arch.thumbnail}
-
-            except (KeyError, IndexError):
+                self._load_worker.cancel()
+            except (RuntimeError, AttributeError):
                 pass
+
+        # Spin up the new worker.  Lives on its own QThread; both get
+        # cleaned up after ``finished`` signals via deleteLater.
+        # N1: bump the generation counter so any in-flight chunks
+        # from the previous worker are dropped.
+        self._load_generation += 1
+        gen = self._load_generation
+        worker = _LoadArchesWorker(
+            data_file=self.sphere.data_file,
+            file_lock=self.file_lock,
+            gi=self.sphere.gi,
+            arch_ids=arch_ids,
+            load_2d=load_2d,
+            generation=gen,
+        )
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        # Capture load_2d in the slot closure since the worker only
+        # reports (gen, idx, arch) and we need to know which dict to
+        # fill.  Generation is checked inside _absorb_chunk.
+        worker.chunkLoaded.connect(
+            lambda g, idx, arch, _l2d=load_2d: self._absorb_chunk(
+                g, idx, arch, _l2d,
+            )
+        )
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        # Drop refs after the thread is done so a later cancel() call
+        # on a stale handle doesn't accidentally talk to a deleted
+        # QObject.
+        thread.finished.connect(self._clear_load_worker_refs)
+
+        self._load_worker = worker
+        self._load_thread = thread
+        thread.start()
+
+    def _absorb_chunk(self, generation, idx, arch, load_2d) -> None:
+        """Slot for ``_LoadArchesWorker.chunkLoaded``.  Runs on the
+        GUI thread; writes the loaded arch into the viewer dicts
+        under ``data_lock`` and emits ``sigUpdate`` so the display
+        repaints incrementally.
+
+        N1: drops the chunk silently when its ``generation`` no
+        longer matches ``self._load_generation`` — that means a
+        newer load has already been started (via a new selection)
+        and the chunk belongs to a cancelled worker whose run loop
+        was mid-emit when the cancel was issued.  Queued Qt
+        signals don't get clobbered by ``deleteLater``; they
+        arrive on the GUI thread after the cancel.  Without this
+        check those stale arches would land in ``data_1d`` /
+        ``data_2d`` and pollute the current selection.
+        """
+        if generation != self._load_generation:
+            logger.debug(
+                "absorb_chunk dropping stale arch %s from gen=%s "
+                "(current gen=%s)",
+                idx, generation, self._load_generation,
+            )
+            return
+        try:
+            with self.data_lock:
+                if not load_2d:
+                    self.data_1d[int(idx)] = arch.copy(include_2d=False)
+                else:
+                    self.data_1d[int(idx)] = arch.copy(include_2d=False)
+                    self.data_2d[int(idx)] = {
+                        'map_raw': arch.map_raw,
+                        'bg_raw': arch.bg_raw,
+                        'mask': arch.mask,
+                        'int_2d': arch.int_2d,
+                        'gi_2d': arch.gi_2d,
+                        'thumbnail': arch.thumbnail,
+                    }
+            # O6: coalesce display updates while a chunk burst is
+            # streaming in.  Schedule (or restart) a debounced emit
+            # rather than firing once per chunk.  ``_on_load_worker_finished``
+            # forces a final emit so the burst's last paint is
+            # guaranteed even if the timer is still pending.
+            self._update_coalesce_timer.start()
+        except (AttributeError, RuntimeError) as e:
+            logger.debug("absorb_chunk skipped arch %s: %s", idx, e)
+
+    def _clear_load_worker_refs(self) -> None:
+        """Drop ``_load_worker`` / ``_load_thread`` once the worker
+        signals finished — but ONLY if our handle still points at
+        that worker.
+
+        Self-review fix #3: queued ``thread.finished`` slot for
+        worker A can arrive AFTER ``load_arches_data`` has already
+        assigned worker B to ``self._load_worker``.  Pre-fix this
+        slot would null out worker B's handle, leaving the next
+        selection unable to ``cancel()`` it.  Identity-gate the
+        clear so only the actually-finished worker's slot wins.
+
+        The sender is the QThread of the worker that finished;
+        compare to ``self._load_thread`` to identify it.
+        """
+        sender = self.sender()
+        if sender is None or sender is self._load_thread:
+            self._load_worker = None
+            self._load_thread = None
+            # O6: force one final sigUpdate so the burst's final
+            # paint always reflects the full selection — otherwise
+            # the coalesce timer might still be pending when the
+            # last chunk arrived but the worker has now terminated.
+            if self._update_coalesce_timer.isActive():
+                self._update_coalesce_timer.stop()
+            self.sigUpdate.emit()
 
     # Removed legacy load_arch_data — all reads now go through
     # EwaldArch.load_from_nexus via load_arches_data above.

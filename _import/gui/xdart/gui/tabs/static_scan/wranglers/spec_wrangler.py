@@ -240,7 +240,7 @@ class specWrangler(wranglerWidget):
 
         # Grazing Incidence
         self.gi = self.parameters.child('GI').child('Grazing').value()
-        self.th_mtr = self.parameters.child('GI').child('th_motor').value()
+        self.incidence_motor = self.parameters.child('GI').child('th_motor').value()
         self.sample_orientation = self.parameters.child('GI').child('sample_orientation').value()
         self.tilt_angle = self.parameters.child('GI').child('tilt_angle').value()
         # gi_mode_1d / gi_mode_2d are driven by the integrator panel;
@@ -337,7 +337,7 @@ class specWrangler(wranglerWidget):
             self.bg_scale,
             self.bg_norm_channel,
             self.gi,
-            self.th_mtr,
+            self.incidence_motor,
             self.sample_orientation,
             self.tilt_angle,
             self.gi_mode_1d,
@@ -388,7 +388,9 @@ class specWrangler(wranglerWidget):
         ('bg_file_filter', ('BG', 'Match', 'Filter'),                False, 'bg_file_filter'),
         ('bg_scale',       ('BG', 'Scale'),                          False, 'bg_scale'),
         ('gi',             ('GI', 'Grazing'),                        False, 'gi'),
-        ('th_mtr',         ('GI', 'th_motor'),                       False, 'th_mtr'),
+        # J1: json session key stays 'th_mtr' for back-compat with
+        # old session.json files; attr name is now 'incidence_motor'.
+        ('th_mtr',         ('GI', 'th_motor'),                       False, 'incidence_motor'),
         ('sample_orientation', ('GI', 'sample_orientation'),         False, 'sample_orientation'),
         ('tilt_angle',     ('GI', 'tilt_angle'),                     False, 'tilt_angle'),
         ('gi_mode_1d',     ('GI', 'gi_mode_1d'),                    False, 'gi_mode_1d'),
@@ -634,8 +636,8 @@ class specWrangler(wranglerWidget):
         self.gi = self.parameters.child('GI').child('Grazing').value()
         self.thread.gi = self.gi
 
-        # self.th_mtr = self.parameters.child('GI').child('th_motor').value()
-        self.thread.th_mtr = self.th_mtr
+        # self.incidence_motor = self.parameters.child('GI').child('th_motor').value()
+        self.thread.incidence_motor = self.incidence_motor
 
         self.sample_orientation = self.parameters.child('GI').child('sample_orientation').value()
         self.thread.sample_orientation = self.sample_orientation
@@ -1003,11 +1005,11 @@ class specWrangler(wranglerWidget):
 
     def set_gi_th_motor(self):
         """Update Grazing theta motor"""
-        self.th_mtr = self.parameters.child('GI').child('th_motor').value()
+        self.incidence_motor = self.parameters.child('GI').child('th_motor').value()
         self.parameters.child('GI').child('th_val').hide()
-        if self.th_mtr == 'Manual':
+        if self.incidence_motor == 'Manual':
             self.parameters.child('GI').child('th_val').show()
-            self.th_mtr = self.parameters.child('GI').child('th_val').value()
+            self.incidence_motor = self.parameters.child('GI').child('th_val').value()
 
     def get_scan_parameters(self):
         """ Reads image metadata to populate matching parameters

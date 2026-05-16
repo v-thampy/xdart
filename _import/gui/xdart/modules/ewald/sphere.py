@@ -11,7 +11,6 @@ from .arch import EwaldArch
 from .arch_series import ArchSeries
 from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xdart import utils
-from ssrl_xrd_tools.integrate.multi import stitch_1d, stitch_2d
 
 
 class EwaldSphere:
@@ -39,8 +38,10 @@ class EwaldSphere:
                  static=False, gi=False, th_mtr=None,
                  incidence_motor=None, geometry=None,
                  series_average=False,
-                 overall_raw=0, single_img=False,
-                 global_mask=None
+                 single_img=False,
+                 global_mask=None,
+                 file_lock=None,
+                 **_unused,
                  ):
         super().__init__()
         # None-sentinel pattern: mutable defaults (lists, dicts, DataFrames)
@@ -57,7 +58,18 @@ class EwaldSphere:
         if bai_2d_args is None:
             bai_2d_args = {}
 
-        self.file_lock = Condition()
+        # J2: file_lock unification.  Callers can pass in their own
+        # ``threading.Condition`` so the wrangler-level file_lock
+        # (used by save paths under ``self.file_lock``) is the same
+        # lock that ``ArchSeries.__getitem__`` uses for lazy loads.
+        # Pre-J2 each sphere created its own Condition() and the
+        # wrangler's GUI file_lock was a *different* lock — direct
+        # ``ArchSeries.__getitem__`` reads could happen mid-save
+        # while the wrangler thought the file was quiescent.  With a
+        # single shared lock the read just waits.  Existing callers
+        # that don't pass file_lock still work — they just get the
+        # legacy private-lock behavior.
+        self.file_lock = file_lock if file_lock is not None else Condition()
         if name is None:
             self.name = os.path.split(data_file)[-1].split('.')[0]
         else:
@@ -98,8 +110,12 @@ class EwaldSphere:
                                      static=self.static, gi=self.gi)
         self.scan_data = scan_data
 
+        # ``mg_args`` retained: nexus_writer reads
+        # ``mg_args["wavelength"]`` for the NXsource stamp.  The
+        # ``_mg_integrators`` list that powered the deleted
+        # ``multigeometry_integrate_*`` API is gone — stitching now
+        # goes through :mod:`xdart.modules.ewald.stitch` instead.
         self.mg_args = mg_args
-        self._mg_integrators = [a.integrator for a in arches] if arches else []
 
         self.bai_1d_args = bai_1d_args
         self.bai_2d_args = bai_2d_args
@@ -108,7 +124,10 @@ class EwaldSphere:
         self.bai_1d: IntegrationResult1D | None = None
         self.bai_2d: IntegrationResult2D | None = None
 
-        self.overall_raw = overall_raw
+        # G2: ``overall_raw`` was a sum-of-raw-frames accumulator
+        # consumed only by display_data.get_sphere_map_raw (now
+        # deleted).  Drifted from disk under R1 replace-frames and
+        # was never repopulated on v2 reload.
         self.global_mask = global_mask
 
     def reset(self):
@@ -120,10 +139,153 @@ class EwaldSphere:
             self.global_mask = None
             self.bai_1d = None
             self.bai_2d = None
-            self.overall_raw = 0
+
+    def has_reload_only_frames(self) -> bool:
+        """Return True iff any arch can't recover its raw image.
+
+        Used by the GUI reintegrate buttons (the R3 guardrail).  After
+        L1 wired lazy raw load, an arch's ``is_reload_only`` is True
+        only when neither ``arch.map_raw`` nor a resolvable
+        ``arch.source_file`` is available — i.e. the original raw
+        frames have been moved/deleted relative to the .nxs.
+
+        Path A — in-memory cache has entries: definitive answer from
+        the cache.  Re-integration buttons get the right answer
+        instantly.
+
+        Path B — empty cache (freshly opened .nxs, before any arch
+        has been materialised): probe the first frame's
+        ``/entry/frames/frame_NNNN/source/path`` directly from h5py
+        WITHOUT materialising an :class:`EwaldArch`.  This is the C2
+        fix — the pre-C2 code returned ``True`` whenever the cache
+        was empty + the index had rows, which falsely blocked
+        re-integration on a freshly opened .nxs even when every
+        source file was present and lazy load would have worked.
+        Probing one frame is a single tiny h5 read (~ms).
+        """
+        in_mem = getattr(self.arches, "_in_memory", None)
+        if in_mem:
+            return any(getattr(a, "is_reload_only", False)
+                       for a in in_mem.values())
+        if not self.arches.index:
+            return False
+        return self._probe_reload_only_via_h5()
+
+    def _probe_reload_only_via_h5(self) -> bool:
+        """Probe the .nxs file's per-frame source refs to gauge the flag.
+
+        K3: scans **all distinct** ``/entry/frames/frame_NNNN/source/path``
+        values in the file (deduplicated) and checks that each
+        resolves to an existing file.  For SPEC scans this is
+        typically a 1000-element loop over the same TIF-pattern
+        directory; for Eiger this is at most a handful of master
+        files.  Either way the cost is dominated by the h5 reads
+        (~few KB) — file existence checks come from the kernel's
+        dentry cache after the first miss.
+
+        Returns ``True`` (block re-integration) on any of:
+        - read error
+        - any frame missing a ``source/path`` field
+        - any referenced source file missing from disk
+
+        Returns ``False`` only when every distinct source path
+        resolves.  This is stricter than the C2-style single-probe
+        but cheap enough to do at GUI-button click time, and
+        catches the mixed-source case where a scan was assembled
+        from multiple data sources (rare but possible during
+        live-mode acquisition from multiple SPEC sessions, or for
+        scans manually edited post-hoc).
+        """
+        try:
+            from xdart.utils import catch_h5py_file as _catch
+        except Exception:
+            return True
+        try:
+            indices = list(self.arches.index)
+            if not indices:
+                return True
+        except (TypeError, AttributeError):
+            return True
+
+        # Cap the scan at a reasonable size — past ~2000 frames the
+        # per-h5-read cost adds up, and a well-behaved scan with
+        # 10k frames almost certainly has uniform source refs.
+        # Sample first + last + every Nth in between to keep the
+        # probe bounded.
+        _MAX_PROBE = 256
+        if len(indices) > _MAX_PROBE:
+            step = max(1, len(indices) // _MAX_PROBE)
+            probe_ids = indices[::step]
+            if indices[-1] not in probe_ids:
+                probe_ids.append(indices[-1])
+        else:
+            probe_ids = indices
+
+        try:
+            with _catch(self.data_file, 'r') as f:
+                seen_paths: set = set()
+                for idx in probe_ids:
+                    grp_path = f"entry/frames/frame_{int(idx):04d}/source"
+                    grp = f.get(grp_path)
+                    if grp is None or "path" not in grp:
+                        return True
+                    raw = grp["path"][()]
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="replace")
+                    seen_paths.add(str(raw))
+        except (OSError, KeyError, ValueError, TypeError, AttributeError):
+            return True
+
+        # Now verify each distinct source path actually exists.
+        # File-existence checks are cheap relative to the h5 reads
+        # we already paid for above.
+        data_dir = os.path.dirname(self.data_file)
+        for raw in seen_paths:
+            try:
+                full = raw
+                if not os.path.isabs(full):
+                    full = os.path.normpath(os.path.join(data_dir, full))
+                if not os.path.exists(full):
+                    return True
+            except (OSError, TypeError):
+                return True
+        return False
+
+    def _probe_reload_only_via_h5_legacy_single(self) -> bool:
+        """Pre-K3 single-frame probe.  Kept for tests + emergency
+        fallback if the multi-probe path turns out to be too slow on
+        some pathological file.
+        """
+        try:
+            from xdart.utils import catch_h5py_file as _catch
+        except Exception:
+            return True
+        try:
+            first_idx = int(self.arches.index[0])
+        except (IndexError, ValueError, TypeError):
+            return True
+        try:
+            with _catch(self.data_file, 'r') as f:
+                grp_path = f"entry/frames/frame_{first_idx:04d}/source"
+                grp = f.get(grp_path)
+                if grp is None or "path" not in grp:
+                    return True  # no source ref at all → not recoverable
+                raw = grp["path"][()]
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                full = str(raw)
+                if not os.path.isabs(full):
+                    full = os.path.normpath(
+                        os.path.join(
+                            os.path.dirname(self.data_file), full,
+                        )
+                    )
+                return not os.path.exists(full)
+        except (OSError, KeyError, ValueError, TypeError, AttributeError):
+            return True
 
     def add_arch(self, arch=None, calculate=True, update=True, get_sd=True,
-                 set_mg=True, h5file=None, batch_save=False, **kwargs):
+                 h5file=None, batch_save=False, **kwargs):
         """Adds a new arch to the sphere.
 
         In-memory state (``arches.index``, ``scan_data``,
@@ -138,7 +300,17 @@ class EwaldSphere:
           idempotent and uses stacked slice-assigns, so per-frame calls
           are O(1) in the dataset shape rather than O(N) like the old v1
           delete-and-recreate pattern.
+
+        Pre-F6 this method also took ``set_mg=True`` which
+        rebuilt ``self._mg_integrators`` (used only by the
+        deleted ``multigeometry_integrate_*`` API).  Callers that
+        still pass ``set_mg`` are silently absorbed by ``**kwargs``;
+        new callers should drop the kwarg.
         """
+        # Eat any stale ``set_mg`` kwarg for backwards compat with
+        # one or two release-old call sites.  Other unknown kwargs
+        # land in **kwargs and are forwarded to EwaldArch below.
+        kwargs.pop("set_mg", None)
         with self.sphere_lock:
             if arch is None:
                 arch = EwaldArch(**kwargs)
@@ -172,14 +344,12 @@ class EwaldSphere:
                 if not self.skip_2d:
                     self._accumulate_bai_2d(arch)
 
-            if set_mg:
-                # ArchSeries iteration lazy-loads from disk; only do this
-                # when the file already has the frames written.  Callers
-                # that pass set_mg=True from the wrangler hot path use
-                # set_mg=False to avoid this.
-                self._mg_integrators = [a.integrator for a in self.arches]
-
-            self.overall_raw += (arch.map_raw - arch.bg_raw)
+            # G2: ``self.overall_raw += (arch.map_raw - arch.bg_raw)``
+            # removed.  The accumulator's only consumer was
+            # ``display_data.get_sphere_map_raw``; the Overall view
+            # now aggregates over per-arch ``data_2d['map_raw']``,
+            # which stays correct after R1 replace-frames and v2
+            # reload.
 
             # Persist via the v2 writer.  Idempotent; one slice-assign per
             # stacked dataset.  Skipped in batch mode (caller flushes once
@@ -187,30 +357,6 @@ class EwaldSphere:
             # any ``h5file`` argument (kept for signature compatibility).
             if not batch_save:
                 self._save_to_nexus()
-
-    def by_arch_integrate_1d(self, **args):
-        """Integrate all arches individually and accumulate the 1D sum."""
-        if not args:
-            args = self.bai_1d_args
-        else:
-            self.bai_1d_args = args.copy()
-        with self.sphere_lock:
-            self.bai_1d = None
-            for arch in self.arches:
-                arch.integrate_1d(global_mask=self.global_mask, **args)
-                self._accumulate_bai_1d(arch)
-
-    def by_arch_integrate_2d(self, **args):
-        """Integrate all arches individually and accumulate the 2D sum."""
-        if not args:
-            args = self.bai_2d_args
-        else:
-            self.bai_2d_args = args.copy()
-        with self.sphere_lock:
-            self.bai_2d = None
-            for arch in self.arches:
-                arch.integrate_2d(global_mask=self.global_mask, **args)
-                self._accumulate_bai_2d(arch)
 
     def _accumulate_bai_1d(self, arch):
         """In-memory running sum of 1D integration results (no HDF5 write)."""
@@ -238,51 +384,38 @@ class EwaldSphere:
             except (ValueError, AttributeError):
                 self.bai_2d = arch.int_2d
 
-    def set_multi_geo(self, **args):
-        """Rebuilds the per-arch integrator list for stitched integration."""
-        self.mg_args.update(args)
-        with self.sphere_lock:
-            self._mg_integrators = [a.integrator for a in self.arches]
-
-    def multigeometry_integrate_1d(self, monitor=None, **kwargs):
-        """Stitch all arch images into a single 1D pattern."""
-        with self.sphere_lock:
-            images = [(a.map_raw - a.bg_raw) for a in self.arches]
-            normalization = (
-                list(self.scan_data[monitor]) if monitor is not None else None
-            )
-            return stitch_1d(
-                images, self._mg_integrators,
-                mask=self.global_mask, normalization=normalization,
-                **kwargs,
-            )
-
-    def multigeometry_integrate_2d(self, monitor=None, **kwargs):
-        """Stitch all arch images into a 2D cake pattern."""
-        with self.sphere_lock:
-            images = [(a.map_raw - a.bg_raw) / a.map_norm for a in self.arches]
-            return stitch_2d(
-                images, self._mg_integrators,
-                mask=self.global_mask, **kwargs,
-            )
-
     # ------------------------------------------------------------------
     # v2 NeXus persistence
     # ------------------------------------------------------------------
 
     def save_to_nexus(self, *, entry: str = "entry", finalize: bool = False,
-                      replace: bool = False) -> None:
+                      replace: bool = False,
+                      replace_frame_indices=None) -> None:
         """Save sphere state into a v2 NeXus file.  Idempotent across calls.
+
+        Two modes — see :func:`nexus_writer.save_sphere_to_nexus` for
+        the full contract:
+
+        * ``replace_frame_indices=None`` (default): append-only.  Stacked
+          datasets grow by however many new frames have been added
+          since the last save.
+        * ``replace_frame_indices=[...]``: slice-assign recomputed
+          integrated_1d/2d rows over their existing on-disk positions.
+          Used by GUI reintegration (``sphere_threads.bai_1d_all``).
 
         The writer owns its own file handle (with NFS-retry semantics)
         so the caller only needs to hold ``self.file_lock``.
         """
         mode = 'w' if replace else 'a'
         with self.file_lock:
-            self._save_to_nexus(mode=mode, entry=entry, finalize=finalize)
+            self._save_to_nexus(
+                mode=mode, entry=entry, finalize=finalize,
+                replace_frame_indices=replace_frame_indices,
+            )
 
     def _save_to_nexus(self, *, mode: str = "a", entry: str = "entry",
-                       finalize: bool = False) -> None:
+                       finalize: bool = False,
+                       replace_frame_indices=None) -> None:
         """Inner v2 writer; delegates to ``nexus_writer.save_sphere_to_nexus``.
 
         Opens the file at ``self.data_file`` internally.  Callers must
@@ -291,8 +424,11 @@ class EwaldSphere:
         """
         from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
         with self.sphere_lock:
-            save_sphere_to_nexus(self, self.data_file, mode=mode,
-                                 entry=entry, finalize=finalize)
+            save_sphere_to_nexus(
+                self, self.data_file, mode=mode,
+                entry=entry, finalize=finalize,
+                replace_frame_indices=replace_frame_indices,
+            )
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
         """Load sphere state from a v2 NeXus file.
@@ -306,15 +442,25 @@ class EwaldSphere:
             with utils.catch_h5py_file(self.data_file, mode=mode) as file:
                 self._load_from_h5(file, *args, **kwargs)
 
-    def _load_from_h5(self, grp, data_only=False, set_mg=True):
-        """Load sphere state from a v2 NeXus file (no-op dispatcher)."""
+    def _load_from_h5(self, grp, data_only=False, **_unused):
+        """Load sphere state from a v2 NeXus file (no-op dispatcher).
+
+        ``**_unused`` absorbs any historical kwargs (notably
+        ``set_mg`` from before F6 removed the multigeometry API).
+        """
         with self.sphere_lock:
-            self._load_from_nexus_v2(grp, data_only=data_only,
-                                     set_mg=set_mg)
+            self._load_from_nexus_v2(grp, data_only=data_only)
 
     def set_datafile(self, fname, name=None, keep_current_data=False,
-                     save_args={}, load_args={}):
-        """Sets the data_file."""
+                     save_args=None, load_args=None):
+        """Sets the data_file.
+
+        N5: save_args / load_args switched to None-sentinels (was
+        ``{}`` mutable defaults — shared across all callers who
+        omitted the kwarg).  Same trap F4 / F5 / H3 fixed elsewhere.
+        """
+        save_args = {} if save_args is None else save_args
+        load_args = {} if load_args is None else load_args
         with self.sphere_lock:
             self.data_file = fname
             if name is None:
@@ -363,18 +509,29 @@ class EwaldSphere:
     # v2 NeXus loader (xdart 0.37+ schema)
     # ------------------------------------------------------------------
 
-    def _load_from_nexus_v2(self, grp, *, data_only: bool = False,
-                            set_mg: bool = True) -> None:
+    def _load_from_nexus_v2(self, grp, *, data_only: bool = False) -> None:
         """Populate sphere state from a v2 NXroot.
 
-        Reads via :func:`ssrl_xrd_tools.io.nexus.read_sphere` and
-        populates the index so :class:`ArchSeries.__getitem__` can
-        lazy-load each frame on demand from the stacked v2 datasets.
+        C5: uses :func:`read_sphere_metadata` (not the full
+        ``read_sphere``) — we only need frame_index, axes, motor
+        columns, and the reduction provenance attrs.  The heavy
+        ``intensity_1d`` / ``intensity_2d`` stacks stay on disk and
+        :class:`ArchSeries.__getitem__` lazy-loads each frame's
+        slices on demand via :func:`_load_arch_v2`.  For a 10k-frame
+        Eiger scan this is the difference between ~seconds (full
+        materialisation) and ~tens of ms (frame index + a few KB of
+        coords + motor columns).
         """
-        from ssrl_xrd_tools.io.nexus import read_sphere
+        # Prefer the metadata-only loader — it skips the heavy stacks.
+        # Fall back to the full ``read_sphere`` if the metadata loader
+        # isn't available on older ssrl_xrd_tools installs.
+        try:
+            from ssrl_xrd_tools.io.nexus import read_sphere_metadata as _read
+        except ImportError:
+            from ssrl_xrd_tools.io.nexus import read_sphere as _read
 
         try:
-            ds = read_sphere(self.data_file)
+            ds = _read(self.data_file)
         except Exception as exc:
             # Surface the failure: silent debug-logging meant users saw an
             # empty viewer with no hint why.  exc_info=True dumps the
@@ -403,7 +560,31 @@ class EwaldSphere:
             if name not in reserved_vars and ds[name].dims == ("frame",)
         }
         if motor_cols:
-            self.scan_data = pd.DataFrame(motor_cols)
+            # N2: index scan_data by the actual frame IDs (from the
+            # ``frame`` coord), not 0..N-1 default range index.
+            # Live acquisition writes rows by ``arch.idx`` via
+            # ``self.scan_data.loc[arch.idx] = ser`` — and the v2
+            # writer stamps ``integrated_*/frame_index`` from the
+            # same arch IDs.  If we left scan_data on the default
+            # range index, ``loc[arch.idx]`` on a reload would
+            # silently misalign for 1-based SPEC, gapped IDs, or
+            # any non-zero-based scheme.
+            frame_index = None
+            if "frame" in ds.coords:
+                try:
+                    frame_index = np.asarray(
+                        ds["frame"].values, dtype=int,
+                    )
+                except (TypeError, ValueError):
+                    frame_index = None
+            if frame_index is not None and len(frame_index) == len(
+                next(iter(motor_cols.values()))
+            ):
+                self.scan_data = pd.DataFrame(motor_cols, index=frame_index)
+            else:
+                # Fall back to default range index if ds lacks a
+                # ``frame`` coord (very old files / partial writes).
+                self.scan_data = pd.DataFrame(motor_cols)
 
         # ── wavelength + bai args from reduction config (if present) ─
         reduction = ds.attrs.get("reduction", {}) or {}

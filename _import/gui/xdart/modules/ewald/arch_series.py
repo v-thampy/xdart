@@ -19,8 +19,90 @@ once per batch via :func:`xdart.modules.ewald.nexus_writer.save_sphere_to_nexus`
 stacked arrays + per-frame thumbnail group.
 """
 
+import logging
+import os
+
 from pandas import Series
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+class _IndexedList(list):
+    """A ``list`` with O(1) ``in`` membership via a parallel set.
+
+    Drop-in replacement: every reading operation (iteration, slicing,
+    indexing, ``len``, ``sort``) is inherited from ``list`` unchanged,
+    so any code that already does ``for i in series.index``,
+    ``series.index[0]``, ``series.index[-1]``, etc. keeps working.
+    Every *mutating* operation maintains a parallel ``set`` so the
+    common hot-path check ``idx in series.arches.index`` runs in
+    O(1) instead of O(N) — important during live mode where it's
+    called for every incoming frame.
+
+    Caveat: slicing returns a plain ``list``, not an ``_IndexedList``
+    (consistent with ``list`` semantics).  Callers that want to keep
+    the indexed behavior on the copy should rewrap explicitly
+    (``_IndexedList(some_slice)``).
+    """
+
+    __slots__ = ("_set",)
+
+    def __init__(self, items=()):
+        super().__init__(items)
+        self._set: set = set(self)
+
+    def __contains__(self, x) -> bool:
+        return x in self._set
+
+    def append(self, x) -> None:
+        super().append(x)
+        self._set.add(x)
+
+    def extend(self, xs) -> None:
+        for x in xs:
+            super().append(x)
+            self._set.add(x)
+
+    def insert(self, i, x) -> None:
+        super().insert(i, x)
+        self._set.add(x)
+
+    def remove(self, x) -> None:
+        super().remove(x)
+        if super().count(x) == 0:
+            self._set.discard(x)
+
+    def pop(self, i=-1):
+        x = super().pop(i)
+        if super().count(x) == 0:
+            self._set.discard(x)
+        return x
+
+    def clear(self) -> None:
+        super().clear()
+        self._set.clear()
+
+    def __setitem__(self, k, v):
+        if isinstance(k, slice):
+            super().__setitem__(k, v)
+            self._set = set(self)
+        else:
+            old = super().__getitem__(k)
+            super().__setitem__(k, v)
+            if super().count(old) == 0:
+                self._set.discard(old)
+            self._set.add(v)
+
+    def __delitem__(self, k):
+        if isinstance(k, slice):
+            super().__delitem__(k)
+            self._set = set(self)
+        else:
+            old = super().__getitem__(k)
+            super().__delitem__(k)
+            if super().count(old) == 0:
+                self._set.discard(old)
 
 # xdart imports
 from xdart.utils import catch_h5py_file as catch
@@ -53,7 +135,8 @@ def _frame_position(h5file, idx: int) -> int | None:
     return int(where[0])
 
 
-def _load_arch_v2(h5file, idx: int, *, static: bool, gi: bool) -> EwaldArch:
+def _load_arch_v2(h5file, idx: int, *, static: bool, gi: bool,
+                  source_root: str | None = None) -> EwaldArch:
     """Build an :class:`EwaldArch` for ``idx`` from the v2 stacked arrays.
 
     Reads:
@@ -112,16 +195,95 @@ def _load_arch_v2(h5file, idx: int, *, static: bool, gi: bool) -> EwaldArch:
             azimuthal_unit=chi_unit_attr or "deg",
         )
 
-    # ── per-frame thumbnail ───────────────────────────────────────
+    # ── per-frame thumbnail + source ref ──────────────────────────
     fg_key = f"entry/frames/frame_{idx:04d}"
     fg = h5file.get(fg_key)
-    if fg is not None and "thumbnail" in fg:
-        try:
-            arch.thumbnail = np.asarray(fg["thumbnail"][()])
-        except Exception:
-            pass
+    if fg is not None:
+        if "thumbnail" in fg:
+            try:
+                arch.thumbnail = np.asarray(fg["thumbnail"][()])
+            except (KeyError, ValueError, TypeError, OSError) as e:
+                # Thumbnail read errors are non-fatal — the displayframe
+                # can fall back to map_raw if it's around, and the rest
+                # of the arch state is still valid.
+                logger.debug("thumbnail read failed for frame %d: %s",
+                             idx, e)
+        _load_source_ref(arch, fg)
 
+    # L1 lazy raw load setup + R3 guardrail.
+    # Stash the source-root for ``EwaldArch._lazy_load_raw`` to
+    # resolve relative paths against.  Then decide whether
+    # re-integration is feasible by checking that the source file
+    # exists on disk — if it does, lazy load can recover map_raw;
+    # if it doesn't, the GUI guardrail should still fire.
+    if source_root:
+        arch._source_root = source_root
+    if arch.source_file and arch._lazy_load_resolvable():
+        arch.is_reload_only = False
+    else:
+        arch.is_reload_only = True
     return arch
+
+
+def _load_source_ref(arch: EwaldArch, fg) -> None:
+    """Populate ``arch.source_file`` and ``arch.source_frame_idx`` from a
+    per-frame :class:`NXcollection`.
+
+    R2 schema lives under ``<frame_group>/source/{path, frame_index}``.
+    A legacy ``source_ref`` dict (never actually written by the v2
+    writer prior to R2 — the attribute-name mismatch silenced it) is
+    also supported for forward-compat with any one-off files that
+    might carry it.
+    """
+    # Narrow except set on every read: h5py raises KeyError on missing
+    # fields, ValueError/OSError on corrupt data, TypeError on weird
+    # dtypes.  Losing a source ref is non-fatal (the GUI guardrail
+    # falls back to reload-only mode) — but a *silent* loss is exactly
+    # the bug R2 fixed, so log at debug level so it's at least visible
+    # under XDART_LOG_LEVEL=DEBUG.
+    _SRC_READ_ERRORS = (KeyError, ValueError, TypeError, OSError)
+
+    src_grp = fg.get("source") if "source" in fg else None
+    if src_grp is not None:
+        try:
+            path = src_grp["path"][()]
+            if isinstance(path, bytes):
+                path = path.decode("utf-8", errors="replace")
+            arch.source_file = str(path)
+        except _SRC_READ_ERRORS as e:
+            logger.debug("source/path read failed for arch %s: %s",
+                         arch.idx, e)
+        try:
+            arch.source_frame_idx = int(src_grp["frame_index"][()])
+        except _SRC_READ_ERRORS as e:
+            logger.debug("source/frame_index read failed for arch %s: %s",
+                         arch.idx, e)
+        return
+
+    # Legacy support: dict-shaped source_ref subgroup.
+    legacy = fg.get("source_ref") if "source_ref" in fg else None
+    if legacy is None:
+        return
+    path = None
+    if "path" in legacy:
+        path = legacy["path"]
+    elif "file" in legacy:
+        path = legacy["file"]
+    if path is not None:
+        try:
+            v = path[()]
+            if isinstance(v, bytes):
+                v = v.decode("utf-8", errors="replace")
+            arch.source_file = str(v)
+        except _SRC_READ_ERRORS as e:
+            logger.debug("legacy source_ref path read failed for arch %s: %s",
+                         arch.idx, e)
+    if "frame_index" in legacy:
+        try:
+            arch.source_frame_idx = int(legacy["frame_index"][()])
+        except _SRC_READ_ERRORS as e:
+            logger.debug("legacy source_ref frame_index read failed for arch %s: %s",
+                         arch.idx, e)
 
 
 class ArchSeries:
@@ -136,7 +298,9 @@ class ArchSeries:
             arches = []
         self.data_file = data_file
         self.file_lock = file_lock
-        self.index: list[int] = []
+        # O(1) ``in`` membership in hot paths (live wrangler, GUI).
+        # Behaves like ``list[int]`` for everything else.
+        self.index: _IndexedList = _IndexedList()
         self.static = static
         self.gi = gi
         # Hot-cache of fully-populated EwaldArch objects.  Used by the
@@ -175,9 +339,16 @@ class ArchSeries:
             raise KeyError(f"Arch not found with {idx} index")
         if idx in self._in_memory:
             return self._in_memory[idx]
+        # Resolve the source-root (sphere data_file directory) once
+        # per load so reloaded arches can lazy-load raw frames via
+        # ``arch._source_root``-relative source_file paths.
+        source_root = (
+            os.path.dirname(self.data_file) if self.data_file else None
+        )
         with self.file_lock:
             with catch(self.data_file, 'r') as f:
-                return _load_arch_v2(f, idx, static=self.static, gi=self.gi)
+                return _load_arch_v2(f, idx, static=self.static, gi=self.gi,
+                                     source_root=source_root)
 
     def iloc(self, idx):
         """Location-based retrieval of arches (returns by position in index)."""
@@ -201,7 +372,8 @@ class ArchSeries:
         """Add a new arch (or extract from a pandas Series) to the index."""
         arches = ArchSeries(self.data_file, self.file_lock,
                             static=self.static, gi=self.gi)
-        arches.index = self.index[:]
+        # Preserve _IndexedList semantics (list[:] would degrade it).
+        arches.index = _IndexedList(self.index)
         # Preserve any in-memory cache on the new ArchSeries — losing it
         # would force the v2 writer to re-load every arch from disk.
         arches._in_memory = dict(self._in_memory)
@@ -221,7 +393,7 @@ class ArchSeries:
             return None
         arches = ArchSeries(self.data_file, self.file_lock,
                             static=self.static, gi=self.gi)
-        arches.index = sorted(self.index)
+        arches.index = _IndexedList(sorted(self.index))
         arches._in_memory = dict(self._in_memory)
         arches._in_memory_cap = self._in_memory_cap
         return arches

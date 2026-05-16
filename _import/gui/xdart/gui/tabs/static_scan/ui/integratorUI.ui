@@ -461,7 +461,7 @@
                 <enum>Qt::LeftToRight</enum>
                </property>
                <property name="text">
-                <string>Advanced...</string>
+                <string>Advanced</string>
                </property>
               </widget>
              </item>
@@ -919,7 +919,7 @@
                 <enum>Qt::LeftToRight</enum>
                </property>
                <property name="text">
-                <string>Advanced...</string>
+                <string>Advanced</string>
                </property>
               </widget>
              </item>

@@ -149,13 +149,29 @@ class staticWidget(QWidget):
             os.mkdir(self.dirname)
 
         self.fname = os.path.join(self.dirname, 'default.nxs')
+        # J2: share ``file_lock`` with the sphere so direct
+        # ArchSeries lazy loads use the same lock as the
+        # wrangler's save paths.
         self.sphere = EwaldSphere('null_main',
                                   data_file=self.fname,
-                                  static=True)
+                                  static=True,
+                                  file_lock=self.file_lock)
         self.arch = EwaldArch(static=True, gi=self.sphere.gi)
         self.arch_ids = []
         self.arches = OrderedDict()
-        self.data_1d = OrderedDict()
+        # O4: both 1D and 2D caches are bounded with the same cap.
+        # Pre-O4 ``data_1d`` was an unbounded OrderedDict while
+        # ``data_2d`` was FixSizeOrderedDict(max=20), and the manual
+        # eviction loop keyed off ``len(data_2d) > 32`` could never
+        # fire because data_2d auto-capped at 20.  Net effect: data_1d
+        # grew without bound on long live runs (a frame's int_1d copy
+        # is small but ~10k frames still added up).  Same cap on both
+        # keeps the two snapshots roughly in sync — they're separate
+        # dicts (the snapshots they hold are different sizes, so a
+        # single shared store would lose typing precision), but
+        # FixSizeOrderedDict's farthest-from-new-key eviction policy
+        # converges on roughly the same active window.
+        self.data_1d = FixSizeOrderedDict(max=_FRAME_CACHE_MAX)
         self.data_2d = FixSizeOrderedDict(max=20)
 
     def _init_ui(self):
@@ -196,7 +212,8 @@ class staticWidget(QWidget):
 
         # Metadata
         self.metawidget = metadataWidget(self.sphere, self.arch,
-                                         self.arch_ids, self.arches)
+                                         self.arch_ids, self.arches,
+                                         data_1d=self.data_1d)
         self.ui.metaFrame.setLayout(self.metawidget.layout)
 
     def _connect_signals(self):
@@ -397,30 +414,37 @@ class staticWidget(QWidget):
                             "gi_2d": getattr(arch, "gi_2d", {}),
                             "thumbnail": getattr(arch, "thumbnail", None),
                         }
-                    # ── Bounded LRU-ish eviction ──────────────────────
-                    # Keep peak memory sane on long scans (1000+ frames
-                    # × 30 MB map_raw is otherwise a memory blow-up).
-                    # We evict the oldest entries; if the user scrolls
-                    # back to an evicted frame, file_thread.load_arches
-                    # will lazy-load it from disk on demand.
-                    keep = int(idx)
-                    while len(self.h5viewer.data_2d) > _FRAME_CACHE_MAX:
-                        oldest = next(iter(self.h5viewer.data_2d))
-                        if oldest == keep:
-                            break
-                        self.h5viewer.data_2d.pop(oldest, None)
-                        self.h5viewer.data_1d.pop(oldest, None)
+                    # ── Bounded cache eviction ────────────────────────
+                    # O4: ``data_1d`` and ``data_2d`` are both bounded
+                    # FixSizeOrderedDicts now (see __init__), so their
+                    # own ``__setitem__`` already enforces the per-dict
+                    # cap.  The previous manual loop here keyed off
+                    # ``data_2d > _FRAME_CACHE_MAX=32`` was dead code:
+                    # FixSizeOrderedDict capped data_2d at 20 long
+                    # before that threshold, while data_1d (then
+                    # unbounded) silently grew without bound.  No
+                    # explicit eviction needed now; downstream cache
+                    # misses fall through to the file_thread lazy load.
             except Exception:
                 # Cache miss is non-fatal — displayframe will lazy-load
                 # from disk via file_thread.load_arch as fallback.
                 logger.debug("In-memory arch hand-off failed for idx=%s",
                              idx, exc_info=True)
 
-        with self.file_lock:
-            self.h5viewer.latest_idx = idx
-            if self.h5viewer.auto_last:
-                self.latest_arch()
-            self.h5viewer.update_data()
+        # ``file_lock`` deliberately not held here: ``latest_arch()``
+        # and ``h5viewer.update_data()`` both only touch Qt widgets +
+        # integer attrs — no h5 file I/O.  The old code wrapped this
+        # in ``with self.file_lock`` and that lock was contended by
+        # the wrangler's per-frame save path, causing visible
+        # stutter during live mode whenever the list-widget rebuild
+        # crossed a save boundary.  Updates run on the main thread so
+        # the writes to ``latest_idx`` / ``auto_last`` are race-free
+        # against other slots fired on the same thread; the wrangler
+        # thread only signals (queued).
+        self.h5viewer.latest_idx = idx
+        if self.h5viewer.auto_last:
+            self.latest_arch()
+        self.h5viewer.update_data()
 
         # Record the latest index and (re)start the coalescing timer.
         # If the timer is already running, restart resets the countdown
@@ -572,19 +596,24 @@ class staticWidget(QWidget):
         if not self.wrangler.thread.isRunning():
             self.wrangler.enabled(True)
 
-    def new_scan(self, name, fname, gi, th_mtr, single_img, series_average):
+    def new_scan(self, name, fname, gi, incidence_motor, single_img,
+                 series_average):
         """Connected to sigUpdateFile from wrangler. Called when a new
         scan is started.
 
         args:
             name: str, scan name
             fname: str, path to data file for scan
+            incidence_motor: str, GI incidence-motor name (J1 rename;
+                previously this slot was ``th_mtr``).  Qt signals are
+                positional so the rename is purely cosmetic at this
+                boundary — the value still flows through unchanged.
         """
         # if self.sphere.name != name or self.sphere.name == 'null_main':
         self.h5viewer.dirname = os.path.dirname(fname)
         self.h5viewer.set_file(fname)
         self.sphere.gi = gi
-        self.sphere.th_mtr = th_mtr
+        self.sphere.incidence_motor = incidence_motor
         self.sphere.single_img = single_img
         self.sphere.series_average = series_average
         # Propagate the wrangler-loaded mask (detector + user Mask File,
