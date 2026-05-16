@@ -111,15 +111,48 @@ def run_stitch(
     rot1_deg = np.rad2deg(derived["rot1"])
     rot2_deg = np.rad2deg(derived["rot2"])
 
-    # Image stack — bg-subtracted, optionally per-image normalized
+    # Image stack — bg-subtracted, optionally per-image normalized.
+    #
+    # P5: lazy-load ``map_raw`` for v2-reloaded arches.  On a sphere
+    # loaded from disk (vs. one freshly produced by the wrangler),
+    # ``arch.map_raw`` is None until we ask :meth:`_lazy_load_raw`
+    # to hydrate it from the source file (TIFF / NeXus master).
+    # Without this call, ``arch.map_raw - arch.bg_raw`` would
+    # TypeError on the None subtract and abort the whole stitch.
+    # Frames whose source isn't on disk get logged + skipped rather
+    # than crashing the whole run.
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
     images = []
+    skipped = []
     for i, arch in enumerate(arches):
+        if arch.map_raw is None:
+            try:
+                arch._lazy_load_raw()
+            except Exception as e:
+                _logger.warning(
+                    'stitch: lazy raw load failed for arch %s: %s',
+                    arch.idx, e,
+                )
+        if arch.map_raw is None:
+            skipped.append(arch.idx)
+            continue
         img = np.asarray(arch.map_raw - arch.bg_raw, dtype=float)
         if norm_motor is not None and norm_motor in sphere.scan_data.columns:
             denom = float(sphere.scan_data[norm_motor].iloc[i])
             if denom != 0:
                 img = img / denom
         images.append(img)
+    if skipped:
+        _logger.warning(
+            'stitch: skipped %d arches with no raw data: %s',
+            len(skipped), skipped,
+        )
+    if not images:
+        raise RuntimeError(
+            'stitch: no arches with raw data available — '
+            'all source files missing or unloadable'
+        )
     img_stack = np.stack(images, axis=0)
 
     from ssrl_xrd_tools.integrate.multi import (
