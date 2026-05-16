@@ -318,21 +318,33 @@ class EwaldArch():
         if not full or not os.path.exists(full):
             return False
         ext = os.path.splitext(full)[1].lower()
+        # source_frame_idx is the global frame offset within the
+        # source file per the R2 schema.  Resolve once so both the
+        # HDF5 and non-HDF5 branches can pass the same value.  For
+        # single-frame TIFF/EDF/CBF the value is 0 (the writer
+        # stamps it that way), so ``frame=0`` is a no-op; for
+        # multi-frame TIFF/CBF stacks the wrangler records the
+        # correct offset and we must forward it.
+        fidx = self.source_frame_idx
+        if fidx is None:
+            fidx = self.idx if self.idx is not None else 0
+        fidx = int(fidx)
         try:
             if ext in (".h5", ".nxs", ".hdf5"):
                 from ssrl_xrd_tools.io.nexus import open_nexus_image_stack
-                # source_frame_idx is the global flattened index per
-                # the R2 schema for NeXus sources.
-                fidx = self.source_frame_idx
-                if fidx is None:
-                    fidx = self.idx if self.idx is not None else 0
                 with open_nexus_image_stack(full) as stack:
                     self.map_raw = np.asarray(
-                        stack[int(fidx)], dtype=np.float32,
+                        stack[fidx], dtype=np.float32,
                     )
             else:
+                # O2: forward source_frame_idx for multi-frame
+                # non-HDF5 sources too (e.g. multi-frame TIFF /
+                # CBF stacks).  Single-frame files use frame=0
+                # and ignore the kwarg, so this is safe.
                 from ssrl_xrd_tools.io.image import read_image
-                self.map_raw = np.asarray(read_image(full), dtype=np.float32)
+                self.map_raw = np.asarray(
+                    read_image(full, frame=fidx), dtype=np.float32,
+                )
         except Exception as e:
             import logging
             logging.getLogger(__name__).debug(

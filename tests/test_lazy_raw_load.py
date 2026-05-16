@@ -151,6 +151,40 @@ class TestLazyLoadTif:
         a.source_file = ""
         assert a._lazy_load_raw() is False
 
+    def test_loads_specific_frame_from_multiframe_tif(self, tmp_path):
+        """O2 regression: for multi-frame TIFF/CBF stacks the lazy
+        loader must forward ``source_frame_idx`` to read_image, not
+        always pull frame 0.
+
+        Pre-O2 the non-HDF5 branch called ``read_image(full)`` with
+        no frame arg, so reload from a multi-frame stack returned
+        the first slice for every arch — silently wrong.
+        """
+        pytest.importorskip("tifffile")
+        from xdart.modules.ewald.arch import EwaldArch
+        import tifffile
+
+        rng = np.random.default_rng(31)
+        stack = rng.integers(0, 1000, size=(5, 6, 8)).astype(np.uint16)
+        stack_path = tmp_path / "stack.tif"
+        # tifffile writes a single multi-page TIF when given a 3D array.
+        tifffile.imwrite(str(stack_path), stack)
+
+        target_idx = 3
+        a = EwaldArch(idx=target_idx)
+        a.map_raw = None
+        a.source_file = "stack.tif"
+        a.source_frame_idx = target_idx
+        a._source_root = str(tmp_path)
+
+        assert a._lazy_load_raw() is True
+        assert a.map_raw is not None
+        # Without O2 this would be ``stack[0]``; with O2 it's the
+        # right page from the multi-page TIF.
+        np.testing.assert_allclose(
+            a.map_raw, stack[target_idx].astype(np.float32),
+        )
+
 
 # ---------------------------------------------------------------------------
 # _lazy_load_raw — NeXus source (single dataset + Eiger external links)

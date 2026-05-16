@@ -122,7 +122,11 @@ class nexusWrangler(wranglerWidget):
         # Buttons
         btn_layout = QtWidgets.QHBoxLayout()
         self.startButton = QtWidgets.QPushButton('Start')
+        # N8: object names enable the dark-theme QSS to colour
+        # these primary CTAs (green/red).  See xdart/gui/themes/dark.py.
+        self.startButton.setObjectName('startButton')
         self.stopButton = QtWidgets.QPushButton('Stop')
+        self.stopButton.setObjectName('stopButton')
 
         # Processing-mode dropdown — same items as specWrangler so the
         # two paths feel interchangeable.  Selecting "Int 1D" or

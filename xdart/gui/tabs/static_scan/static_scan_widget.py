@@ -159,7 +159,19 @@ class staticWidget(QWidget):
         self.arch = EwaldArch(static=True, gi=self.sphere.gi)
         self.arch_ids = []
         self.arches = OrderedDict()
-        self.data_1d = OrderedDict()
+        # O4: both 1D and 2D caches are bounded with the same cap.
+        # Pre-O4 ``data_1d`` was an unbounded OrderedDict while
+        # ``data_2d`` was FixSizeOrderedDict(max=20), and the manual
+        # eviction loop keyed off ``len(data_2d) > 32`` could never
+        # fire because data_2d auto-capped at 20.  Net effect: data_1d
+        # grew without bound on long live runs (a frame's int_1d copy
+        # is small but ~10k frames still added up).  Same cap on both
+        # keeps the two snapshots roughly in sync — they're separate
+        # dicts (the snapshots they hold are different sizes, so a
+        # single shared store would lose typing precision), but
+        # FixSizeOrderedDict's farthest-from-new-key eviction policy
+        # converges on roughly the same active window.
+        self.data_1d = FixSizeOrderedDict(max=_FRAME_CACHE_MAX)
         self.data_2d = FixSizeOrderedDict(max=20)
 
     def _init_ui(self):
@@ -200,7 +212,8 @@ class staticWidget(QWidget):
 
         # Metadata
         self.metawidget = metadataWidget(self.sphere, self.arch,
-                                         self.arch_ids, self.arches)
+                                         self.arch_ids, self.arches,
+                                         data_1d=self.data_1d)
         self.ui.metaFrame.setLayout(self.metawidget.layout)
 
     def _connect_signals(self):
@@ -401,19 +414,17 @@ class staticWidget(QWidget):
                             "gi_2d": getattr(arch, "gi_2d", {}),
                             "thumbnail": getattr(arch, "thumbnail", None),
                         }
-                    # ── Bounded LRU-ish eviction ──────────────────────
-                    # Keep peak memory sane on long scans (1000+ frames
-                    # × 30 MB map_raw is otherwise a memory blow-up).
-                    # We evict the oldest entries; if the user scrolls
-                    # back to an evicted frame, file_thread.load_arches
-                    # will lazy-load it from disk on demand.
-                    keep = int(idx)
-                    while len(self.h5viewer.data_2d) > _FRAME_CACHE_MAX:
-                        oldest = next(iter(self.h5viewer.data_2d))
-                        if oldest == keep:
-                            break
-                        self.h5viewer.data_2d.pop(oldest, None)
-                        self.h5viewer.data_1d.pop(oldest, None)
+                    # ── Bounded cache eviction ────────────────────────
+                    # O4: ``data_1d`` and ``data_2d`` are both bounded
+                    # FixSizeOrderedDicts now (see __init__), so their
+                    # own ``__setitem__`` already enforces the per-dict
+                    # cap.  The previous manual loop here keyed off
+                    # ``data_2d > _FRAME_CACHE_MAX=32`` was dead code:
+                    # FixSizeOrderedDict capped data_2d at 20 long
+                    # before that threshold, while data_1d (then
+                    # unbounded) silently grew without bound.  No
+                    # explicit eviction needed now; downstream cache
+                    # misses fall through to the file_thread lazy load.
             except Exception:
                 # Cache miss is non-fatal — displayframe will lazy-load
                 # from disk via file_thread.load_arch as fallback.

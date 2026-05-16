@@ -540,16 +540,38 @@ class DisplayPlotMixin:
     # ── Mouse tracking ────────────────────────────────────────────
 
     def trackMouse(self):
+        """Set up mouse tracking on the plot scene.
+
+        N6: pre-N6 this both passed ``slot=self.mouseMoved`` to the
+        SignalProxy constructor AND called
+        ``proxy.signal.connect(self.mouseMoved)`` afterwards —
+        ``mouseMoved`` ran twice per mouse event.  Also: the proxy
+        was a local variable that risked garbage-collection (Qt
+        signals don't keep proxies alive on their own).  Stash it
+        on ``self`` and use the constructor connection only.
         """
-        Sets up mouse tracking
-        Returns: x, y (z) coordinates on screen
-        """
-        from PySide6.QtCore import Qt as pyQt
-        proxy = pg.SignalProxy(signal=self.plot.scene().sigMouseMoved, rateLimit=60, slot=self.mouseMoved)
-        proxy.signal.connect(self.mouseMoved)
+        self._mouse_proxy = pg.SignalProxy(
+            signal=self.plot.scene().sigMouseMoved,
+            rateLimit=60,
+            slot=self.mouseMoved,
+        )
 
     def mouseMoved(self, pos):
+        """Slot wired to ``pg.SignalProxy(sigMouseMoved)``.
+
+        SignalProxy wraps emissions in a tuple — the slot receives
+        ``(QPointF,)`` rather than the bare event.  Unpack defensively
+        so the same slot also accepts a direct ``QPointF`` (in case
+        a future caller wires up sigMouseMoved without the proxy).
+        """
         from PySide6.QtCore import Qt as pyQt
+        # SignalProxy delivers args as a single-element tuple; the
+        # bare-signal path delivers the QPointF directly.  Handle both.
+        if isinstance(pos, tuple):
+            if not pos:
+                return
+            pos = pos[0]
+
         if len(self.curves) == 0:
             return
 

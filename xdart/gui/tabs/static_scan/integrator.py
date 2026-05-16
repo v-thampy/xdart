@@ -946,7 +946,16 @@ class integratorTree(QtWidgets.QWidget):
         with self.integrator_thread.lock:
             if len(self.sphere.arches.index) > 0:
                 self.integrator_thread.method = 'bai_1d_all'
-        self.data_1d.clear()
+        # N3: clear under data_lock to avoid racing with the
+        # integrator thread's _publish or with the GUI's
+        # _absorb_chunk arrivals (which also write through
+        # data_lock).
+        data_lock = getattr(self.integrator_thread, 'data_lock', None)
+        if data_lock is not None:
+            with data_lock:
+                self.data_1d.clear()
+        else:
+            self.data_1d.clear()
         self.setEnabled(False)
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()
@@ -959,7 +968,13 @@ class integratorTree(QtWidgets.QWidget):
         with self.integrator_thread.lock:
             if len(self.sphere.arches.index) > 0:
                 self.integrator_thread.method = 'bai_2d_all'
-        self.data_2d.clear()
+        # N3: same data_lock discipline as bai_1d above.
+        data_lock = getattr(self.integrator_thread, 'data_lock', None)
+        if data_lock is not None:
+            with data_lock:
+                self.data_2d.clear()
+        else:
+            self.data_2d.clear()
         self.setEnabled(False)
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()

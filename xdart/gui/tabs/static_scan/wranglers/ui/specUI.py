@@ -55,7 +55,7 @@ class Ui_Form(object):
         self.commandLayout.setObjectName(u"commandLayout")
         self.advancedButton = QPushButton(self.commandFrame)
         self.advancedButton.setObjectName(u"advancedButton")
-        self.advancedButton.setMaximumSize(QSize(80, 16777215))
+        self.advancedButton.setMaximumSize(QSize(100, 16777215))
         self.commandLayout.addWidget(self.advancedButton)
         self.modeLabel = QLabel(self.commandFrame)
         self.modeLabel.setObjectName(u"modeLabel")
@@ -130,7 +130,7 @@ class Ui_Form(object):
     def retranslateUi(self, Form):
         Form.setWindowTitle(QCoreApplication.translate("Form", u"Form", None))
         self.specLabel.setText("")
-        self.advancedButton.setText(QCoreApplication.translate("Form", u"Advanced...", None))
+        self.advancedButton.setText(QCoreApplication.translate("Form", u"Advanced", None))
         self.modeLabel.setText(QCoreApplication.translate("Form", u"Mode:", None))
         self.coresLabel.setText(QCoreApplication.translate("Form", u"Cores:", None))
         self.startButton.setText(QCoreApplication.translate("Form", u"Start", None))

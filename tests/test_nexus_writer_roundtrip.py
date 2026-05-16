@@ -846,6 +846,123 @@ def test_incremental_save_appends_only_new_frames(tmp_path):
     assert intensity_2d_b.shape == (2 * N_FRAMES, N_CHI, N_Q)
 
 
+def test_append_with_shape_change_full_rewrites(tmp_path):
+    """O3: a follow-up save whose new arches have a different
+    integration row shape than the on-disk dataset must NOT silently
+    drop the previously-saved rows.  Instead it falls back to a
+    full rewrite from all sphere arches with refreshed q/chi axes.
+
+    Pre-O3 ``_append_new_rows`` recreated the dataset with only
+    the new tail when shape changed — so e.g. saving 4 frames at
+    nq=32 then 4 more at nq=64 produced a 4-row file (the first
+    4 lost).  Post-O3 the file ends at 8 rows of nq=64 (all
+    arches re-stacked with the new shape).
+    """
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    import h5py
+
+    nq1 = N_Q          # 32
+    nq2 = N_Q * 2      # 64 — different!
+    nchi1 = N_CHI      # 16
+    nchi2 = N_CHI + 4  # 20 — different!
+
+    # Phase 1: 4 frames at original shape.
+    arches = [_DuckArch(idx=i, nq=nq1, nchi=nchi1) for i in range(N_FRAMES)]
+    sphere = _DuckSphere(
+        arches,
+        scan_data=pd.DataFrame({"tth": np.linspace(10, 14, N_FRAMES,
+                                                   dtype=np.float32)}),
+    )
+    path = tmp_path / "shape_drift.nxs"
+    save_sphere_to_nexus(sphere, path, mode="w")
+
+    with h5py.File(path, "r") as f:
+        assert f["entry/integrated_1d/intensity"].shape == (N_FRAMES, nq1)
+        assert f["entry/integrated_2d/intensity"].shape == (N_FRAMES,
+                                                            nchi1, nq1)
+
+    # Phase 2: replace the in-memory arches with new ones at a
+    # different shape — and *also* extend the series.  This is the
+    # bug scenario: a user reintegrating with new numpoints mid-scan,
+    # then continuing to acquire frames.
+    new_arches = [
+        _DuckArch(idx=i, nq=nq2, nchi=nchi2, seed=50)
+        for i in range(2 * N_FRAMES)
+    ]
+    # Re-seat sphere.arches to point at the reshaped arches.
+    sphere.arches = _DuckArches(new_arches)
+    save_sphere_to_nexus(sphere, path, mode="a")
+
+    # File contains 8 rows at the *new* shape; the original 4 rows
+    # at nq1 are gone (correctly — full rewrite refreshed both rows
+    # and axes).  Pre-O3 the file would have been *4* rows at nq2
+    # (the helper rebuilt from just the "new tail" of 4 arches).
+    with h5py.File(path, "r") as f:
+        assert f["entry/integrated_1d/intensity"].shape == (
+            2 * N_FRAMES, nq2,
+        ), "O3 regression: integrated_1d full rewrite must include all arches"
+        assert f["entry/integrated_2d/intensity"].shape == (
+            2 * N_FRAMES, nchi2, nq2,
+        ), "O3 regression: integrated_2d full rewrite must include all arches"
+        # frame_index also rebuilt — covers the parallel _append_new_rows
+        # call for the index array.
+        assert f["entry/integrated_1d/frame_index"].shape == (2 * N_FRAMES,)
+        assert f["entry/integrated_1d/q"].shape == (nq2,)
+
+
+def test_scan_data_index_aligns_with_gapped_frame_ids(tmp_path):
+    """O1 / N2 regression: after writer → loader round-trip, the
+    reloaded ``sphere.scan_data`` DataFrame must be indexed by the
+    actual frame IDs (``arch.idx``), not a default 0..N-1 range
+    index.
+
+    Live acquisition does ``scan_data.loc[arch.idx] = ser``.  If
+    reload built a default RangeIndex, ``loc[arch.idx]`` after
+    reload would silently misalign whenever the IDs were not
+    ``range(N)`` — e.g. 1-based SPEC, gapped Eiger external links,
+    or post-deletion holes.
+
+    Test gaps the IDs to ``[10, 12, 17, 22]`` and asserts they
+    appear as the reloaded ``scan_data`` index.
+    """
+    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.sphere import EwaldSphere
+    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+
+    gapped = [10, 12, 17, 22]
+    geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
+
+    arches = [_DuckArch(idx=i) for i in gapped]
+    scan_data = pd.DataFrame(
+        {
+            "tth": np.array([11.0, 12.5, 14.0, 15.5], dtype=np.float32),
+            "th":  np.array([0.10, 0.15, 0.20, 0.25], dtype=np.float32),
+        }
+    )
+    sphere = _DuckSphere(arches, scan_data=scan_data, geometry=geom)
+
+    path = tmp_path / "gapped.nxs"
+    save_sphere_to_nexus(sphere, path, mode="w", finalize=False)
+
+    # Round-trip through the real EwaldSphere loader.
+    reloaded = EwaldSphere(name="gapped", data_file=str(path))
+    reloaded.load_from_h5(replace=True, mode="r")
+
+    # The reloaded scan_data index *is* the gapped frame IDs.
+    assert list(reloaded.scan_data.index) == gapped
+    # And the columns survived with the right values.
+    assert "tth" in reloaded.scan_data.columns
+    assert "th" in reloaded.scan_data.columns
+    np.testing.assert_allclose(
+        reloaded.scan_data.loc[17, "tth"], 14.0, atol=1e-5,
+    )
+    # Most importantly: a ``.loc[arch.idx]`` lookup pattern that
+    # the GUI uses produces the right row, not row-position 17.
+    np.testing.assert_allclose(
+        reloaded.scan_data.loc[22, "th"], 0.25, atol=1e-5,
+    )
+
+
 def test_incremental_save_with_no_new_frames_is_noop(tmp_path):
     """Re-saving with no new arches must not change anything on disk.
 
