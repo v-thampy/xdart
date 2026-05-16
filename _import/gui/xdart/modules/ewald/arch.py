@@ -771,7 +771,19 @@ class EwaldArch():
         arch_copy.arch_lock = Condition()
         arch_copy.int_1d = copy.deepcopy(self.int_1d)
         arch_copy.gi_1d = copy.deepcopy(self.gi_1d)
+        # P4: lazy-raw-load provenance.  Pre-P4 ``source_file`` was
+        # copied but ``source_frame_idx``, ``_source_root``, and
+        # ``is_reload_only`` were not — so an ``arch.copy(include_2d=False)``
+        # stash in ``data_1d`` couldn't recover ``map_raw`` via
+        # :meth:`_lazy_load_raw` later (it'd resolve to the wrong
+        # frame or be unable to resolve a relpath at all).  Copy
+        # all four so a 1D-only copy retains the ability to lazy-
+        # load the raw frame on demand (reintegrate, thumbnail
+        # regeneration, etc.).
         arch_copy.source_file = self.source_file
+        arch_copy.source_frame_idx = self.source_frame_idx
+        arch_copy._source_root = self._source_root
+        arch_copy.is_reload_only = self.is_reload_only
         # Always copy thumbnail — it's small and needed for image preview
         arch_copy.thumbnail = copy.deepcopy(self.thumbnail)
         if include_2d:

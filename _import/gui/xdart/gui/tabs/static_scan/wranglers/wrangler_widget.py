@@ -354,19 +354,37 @@ class wranglerThread(Qt.QtCore.QThread):
         img[bad] = _THRESHOLD_NAN
         return img
 
-    def _flush_xye_buffer(self, sphere):
+    def _flush_xye_buffer(self, sphere, published_idxs=None):
         """Drain ``self._xye_buffer`` and write each pending XYE file.
 
         Drains under :attr:`_xye_lock` so workers can keep appending
         new entries while this batch's disk IO runs.  Per-file write
         errors are logged but don't abort the batch — losing one XYE
         file shouldn't kill an otherwise-valid scan.
+
+        P3: when ``published_idxs`` is provided, only buffer entries
+        whose ``img_number`` (a.k.a. ``arch.idx``) appears in the set
+        are written to disk; entries for arches that finished
+        integration but never got published to the .nxs are dropped.
+        This keeps the XYE directory and the .nxs frame set in sync
+        after a Stop mid-batch — without the filter, in-flight
+        workers that the parallel dispatcher abandoned could leave
+        orphan XYE files for frames that never landed in HDF5.
         """
         with self._xye_lock:
             if not self._xye_buffer:
                 return
             buf = self._xye_buffer
             self._xye_buffer = []
+        if published_idxs is not None:
+            published_idxs = {int(i) for i in published_idxs}
+            dropped = [t for t in buf if int(t[0]) not in published_idxs]
+            buf = [t for t in buf if int(t[0]) in published_idxs]
+            if dropped:
+                logger.info(
+                    'XYE: dropped %d unpublished entries (Stop mid-batch)',
+                    len(dropped),
+                )
         for img_number, arch in buf:
             try:
                 self.save_1d(sphere, arch, img_number)

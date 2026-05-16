@@ -217,6 +217,20 @@ class integratorThread(Qt.QtCore.QThread):
                 pool_attr='_cached_fiber_integrator_pool',
             )
 
+        # P2: re-use the wrangler base class's angle-aware borrow.
+        # The plain ``fiber_pool.borrow()`` below was unconditionally
+        # handing out the prewarmed (frame-0) FiberIntegrator to every
+        # worker.  For ω-varying GI scans (e.g. sin²ψ sweeps) the
+        # per-frame incidence angle drifts and the prewarmed instance
+        # silently integrates every frame at frame-0 geometry —
+        # silently wrong.  The helper falls back to a worker-local
+        # fiber integrator built at the right angle when the
+        # per-frame angle differs from ``_cached_fiber_integrator_angle``.
+        from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import (
+            wranglerThread,
+        )
+        _borrow_fi = wranglerThread._borrow_fiber_integrator
+
         def _worker(arch):
             """Re-integrate one arch on a thread.  Borrows a private
             integrator from the pool to avoid pyFAI's CSR scratch
@@ -229,21 +243,21 @@ class integratorThread(Qt.QtCore.QThread):
             if integrator_pool is not None:
                 with integrator_pool.borrow() as ai:
                     arch.integrator = ai
-                    if fiber_pool is not None:
-                        with fiber_pool.borrow() as fi:
-                            arch.integrate_1d(
-                                fiber_integrator=fi,
-                                **self.sphere.bai_1d_args,
-                            )
-                            if do_2d:
-                                arch.integrate_2d(
-                                    fiber_integrator=fi,
-                                    **self.sphere.bai_2d_args,
-                                )
-                    else:
-                        arch.integrate_1d(**self.sphere.bai_1d_args)
+                    # P2: angle-aware fiber borrow — pool hit when the
+                    # arch's incidence angle matches the cached
+                    # prewarm angle (most scans), worker-local build
+                    # otherwise.  No-op (yields None) when GI is off
+                    # on this arch.
+                    with _borrow_fi(self.sphere, fiber_pool, arch) as fi:
+                        arch.integrate_1d(
+                            fiber_integrator=fi,
+                            **self.sphere.bai_1d_args,
+                        )
                         if do_2d:
-                            arch.integrate_2d(**self.sphere.bai_2d_args)
+                            arch.integrate_2d(
+                                fiber_integrator=fi,
+                                **self.sphere.bai_2d_args,
+                            )
                     # Detach pool integrator before the next worker
                     # borrows the same instance.
                     arch.integrator = self.sphere._cached_integrator

@@ -977,9 +977,13 @@ class specThread(wranglerThread):
             _t_phase2 = time.time() - _t_phase2
             logger.info('[BATCH] Phase 2 (HDF5 write): %d frames in %.2fs', len(arches), _t_phase2)
 
-        # Flush buffered XYE writes for this batch.
+        # Flush buffered XYE writes for this batch.  P3: pass the
+        # set of arch.idx values that actually landed in .nxs so
+        # in-flight workers from a Stop'd batch don't leave orphan
+        # XYE files for frames that were never published.
         _t_xye = time.time()
-        self._flush_xye_buffer(sphere)
+        published_idxs = {a.idx for a in arches}
+        self._flush_xye_buffer(sphere, published_idxs=published_idxs)
         _t_xye = time.time() - _t_xye
         if _t_xye > 0.01:
             logger.info('[BATCH] XYE flush: %d frames in %.2fs', len(arches), _t_xye)

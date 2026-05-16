@@ -322,8 +322,13 @@ class nexusThread(wranglerThread):
                 # bound on long scans.  Inherited ``_flush_xye_buffer``
                 # is a no-op when the buffer is empty (e.g. on Int 2D
                 # mode would be — but we always populate it).
+                # P3: pass the set of arch.idx values that survived
+                # ``_parallel_integrate`` so a Stop-aborted batch
+                # doesn't leave orphan XYE files for frames that
+                # never landed in .nxs.
                 _t_xye = time.time()
-                self._flush_xye_buffer(sphere)
+                published_idxs = {a.idx for a in arches if a is not None}
+                self._flush_xye_buffer(sphere, published_idxs=published_idxs)
                 _t_xye = time.time() - _t_xye
 
                 logger.info(

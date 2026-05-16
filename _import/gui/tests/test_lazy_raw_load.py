@@ -151,6 +151,38 @@ class TestLazyLoadTif:
         a.source_file = ""
         assert a._lazy_load_raw() is False
 
+    def test_copy_preserves_lazy_load_provenance(self, tmp_path):
+        """P4 regression: ``EwaldArch.copy(include_2d=False)`` must
+        preserve ``source_frame_idx``, ``_source_root``, and
+        ``is_reload_only`` along with ``source_file``.
+
+        Pre-P4 the 1D-only copies stashed in ``data_1d`` lost three
+        of those fields, so any later attempt to lazy-reload the raw
+        frame (for reintegrate / thumbnail regen / etc.) either
+        resolved to frame 0 or to a path that didn't exist.  Locks
+        down the field-list so future copy() edits can't quietly
+        regress it.
+        """
+        pytest.importorskip("tifffile")
+        from xdart.modules.ewald.arch import EwaldArch
+
+        a = EwaldArch(idx=7)
+        a.source_file = "stack.tif"
+        a.source_frame_idx = 3
+        a._source_root = str(tmp_path)
+        a.is_reload_only = True
+
+        c = a.copy(include_2d=False)
+        assert c.source_file == "stack.tif"
+        assert c.source_frame_idx == 3
+        assert c._source_root == str(tmp_path)
+        assert c.is_reload_only is True
+
+        # And functional sanity: an actual lazy-load through the copy
+        # should resolve to the same path the original would.
+        _write_tif(tmp_path / "stack.tif", shape=(4, 4))
+        assert c._resolved_source_path() == a._resolved_source_path()
+
     def test_loads_specific_frame_from_multiframe_tif(self, tmp_path):
         """O2 regression: for multi-frame TIFF/CBF stacks the lazy
         loader must forward ``source_frame_idx`` to read_image, not
