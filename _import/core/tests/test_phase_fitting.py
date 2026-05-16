@@ -276,8 +276,13 @@ class TestPhaseFitter:
         np.testing.assert_allclose(result.q_shift, true_shift, atol=0.005)
 
     def test_no_phases_raises(self, q_axis, two_phase_data):
+        # When no phases / no fit-background / no amorphous component
+        # are configured, build_model raises ValueError with the
+        # "No fit content" message (broadened from the old "No phases"
+        # by commit 219a4c7 — fit-background-only baseline fits are
+        # now legal, so the error is about *any* fit content missing).
         fitter = PhaseFitter(q_axis, two_phase_data)
-        with pytest.raises(ValueError, match="No phases"):
+        with pytest.raises(ValueError, match="No fit content"):
             fitter.fit()
 
     def test_summary(self, q_axis, two_phase_data, au_phase, cu_phase):

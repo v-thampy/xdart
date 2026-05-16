@@ -31,6 +31,15 @@ def load_poni(path: Path | str) -> PONI:
     """
     Load a pyFAI ``.poni`` file into the project ``PONI`` dataclass.
 
+    Uses :class:`pyFAI.io.ponifile.PoniFile` rather than the legacy
+    ``pyFAI.load()`` entry point.  ``pyFAI.load()`` would silently
+    swallow parse failures and return a default-initialised
+    ``AzimuthalIntegrator`` (``dist=1.0``, no wavelength, generic
+    ``Detector``), which made save→load round-trip failures look
+    like value mismatches rather than parse errors.  The ``PoniFile``
+    parser raises on bad input and works identically across pyFAI
+    2025.x and 2026.x .poni format variants.
+
     Parameters
     ----------
     path : Path or str
@@ -41,16 +50,20 @@ def load_poni(path: Path | str) -> PONI:
     PONI
         Calibration geometry extracted from the file.
     """
-    ai = pyFAI.load(_as_path(path))
-    detector_name = getattr(getattr(ai, "detector", None), "name", "")
+    from pyFAI.io.ponifile import PoniFile
+
+    pf = PoniFile(str(_as_path(path)))
+    det = pf.detector
+    detector_name = getattr(det, "name", "") if det is not None else ""
+    wl = pf.wavelength
     return PONI(
-        dist=float(ai.dist),
-        poni1=float(ai.poni1),
-        poni2=float(ai.poni2),
-        rot1=float(ai.rot1),
-        rot2=float(ai.rot2),
-        rot3=float(ai.rot3),
-        wavelength=0.0 if ai.wavelength is None else float(ai.wavelength),
+        dist=float(pf.dist),
+        poni1=float(pf.poni1),
+        poni2=float(pf.poni2),
+        rot1=float(pf.rot1),
+        rot2=float(pf.rot2),
+        rot3=float(pf.rot3),
+        wavelength=0.0 if wl is None else float(wl),
         detector=str(detector_name or ""),
     )
 
@@ -58,6 +71,14 @@ def load_poni(path: Path | str) -> PONI:
 def save_poni(poni: PONI, path: Path | str) -> None:
     """
     Save a project ``PONI`` dataclass to a pyFAI ``.poni`` file.
+
+    Routes through :class:`pyFAI.io.ponifile.PoniFile` for the same
+    reason :func:`load_poni` does — the ``PoniFile.write`` path is
+    version-stable across pyFAI 2025.x / 2026.x, while
+    ``AzimuthalIntegrator.save`` switched its on-disk format between
+    minor versions.  Falls back to ``ai.save()`` if the dataclass
+    can't be expressed via the public ``PoniFile`` constructor (very
+    old pyFAI without ``read_from_dict``).
 
     Parameters
     ----------
@@ -69,7 +90,18 @@ def save_poni(poni: PONI, path: Path | str) -> None:
     out_path = _as_path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ai = poni_to_integrator(poni)
-    ai.save(str(out_path))
+    try:
+        from pyFAI.io.ponifile import PoniFile
+
+        pf = PoniFile(ai)
+        with open(out_path, "w") as f:
+            pf.write(f)
+    except Exception:
+        # Last-resort fallback — older pyFAI without PoniFile, or a
+        # quirk in PoniFile.write on this version.  Logs at debug
+        # because the legacy save path normally works too.
+        logger.debug("PoniFile.write failed; falling back to ai.save", exc_info=True)
+        ai.save(str(out_path))
 
 
 def poni_to_integrator(poni: PONI) -> AzimuthalIntegrator:
