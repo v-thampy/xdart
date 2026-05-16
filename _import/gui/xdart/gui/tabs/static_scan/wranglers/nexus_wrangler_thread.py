@@ -347,18 +347,39 @@ class nexusThread(wranglerThread):
                     self._save_to_disk(sphere)
                     frames_since_save = 0
 
-        # Final save: write everything coherent + provenance + finalize
-        # (last call of the scan).  Skipped under xye_only — that mode
-        # exists precisely to bypass the .nxs altogether.
-        if (files_processed > 0 and self.command != 'stop'
-                and not self.xye_only):
+        # Final save: write everything coherent + provenance + finalize.
+        #
+        # N4 — Stop tail flush.  Pre-N4 this was gated on
+        # ``self.command != 'stop'``, which meant that if the user
+        # hit Stop after some frames had been processed and
+        # published but before the next periodic save kicked in,
+        # those tail frames remained in memory only and were lost.
+        # Now we always do a non-finalize save on Stop so the
+        # processed prefix lands on disk — only ``finalize=True``
+        # (provenance + write-once items) is skipped on Stop, since
+        # the scan didn't actually complete and the file should be
+        # marked as a partial result.
+        #
+        # N7 — dropped the outer ``with self.file_lock:`` because
+        # ``sphere.save_to_nexus`` already takes the lock internally
+        # (J2 made the locks the same Condition, so the nested
+        # acquire was reentrant + redundant rather than a deadlock).
+        if files_processed > 0 and not self.xye_only:
+            is_finalize = (self.command != 'stop')
             _get_h5pool().pause(sphere.data_file)
             try:
-                with self.file_lock:
-                    sphere.default_geometry()
-                    sphere.save_to_nexus(replace=False, finalize=True)
+                sphere.default_geometry()
+                sphere.save_to_nexus(
+                    replace=False, finalize=is_finalize,
+                )
             finally:
                 _get_h5pool().resume(sphere.data_file)
+            if not is_finalize:
+                logger.info(
+                    '[NEXUS] Stop tail-flushed %d frames; .nxs is '
+                    'a partial result (no finalize stamp).',
+                    files_processed,
+                )
 
         self.showLabel.emit(f'Done — {files_processed} frames processed')
         logger.info(

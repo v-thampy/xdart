@@ -50,6 +50,9 @@ class XDImageWidget(Qt.QtWidgets.QWidget):
         self.ui.toolLayout.addWidget(self.histogram, 1, 0, 1, 2)
         self.imageViewBox = RectViewBox()
         self.image_plot = self.image_win.addPlot(viewBox=self.imageViewBox)
+        # Seaborn-style talk-context fonts; grid off for image plots.
+        from xdart.gui.themes import apply_seaborn_plot_style
+        apply_seaborn_plot_style(self.image_plot, grid=False)
         self.imageItem = pg.ImageItem(colormap=cm.get_cmap('viridis'))
 
         self.image_plot.addItem(self.imageItem)
@@ -117,6 +120,8 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         self.image_layout.addWidget(self.image_win)
         self.imageViewBox = RectViewBox(lockAspect=lockAspect)
         self.image_plot = self.image_win.addPlot(viewBox=self.imageViewBox)
+        from xdart.gui.themes import apply_seaborn_plot_style
+        apply_seaborn_plot_style(self.image_plot, grid=False)
         self.imageItem = pgXDImageItem(raw=self.raw)
         self.image_plot.addItem(self.imageItem)
 
@@ -250,6 +255,8 @@ class pmeshImageWidget(Qt.QtWidgets.QWidget):
         self.image_layout.addWidget(self.image_win)
         self.imageViewBox = RectViewBox(lockAspect=lockAspect)
         self.image_plot = self.image_win.addPlot(viewBox=self.imageViewBox)
+        from xdart.gui.themes import apply_seaborn_plot_style
+        apply_seaborn_plot_style(self.image_plot, grid=False)
         # self.imageItem = PColorMeshItem()
         self.imageItem = PColorMeshItemLevels()
         self.image_plot.addItem(self.imageItem)

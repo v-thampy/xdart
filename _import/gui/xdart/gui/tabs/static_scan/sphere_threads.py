@@ -153,8 +153,19 @@ class integratorThread(Qt.QtCore.QThread):
             return
 
         def _publish(arch):
-            """Reattach arch into sphere and viewer dicts."""
-            self.sphere.arches[arch.idx] = arch
+            """Reattach arch into sphere and viewer dicts.
+
+            N3: ``sphere.arches[arch.idx] = arch`` is a sphere-state
+            mutation that other threads (the wrangler thread, the
+            GUI's ArchSeries.__getitem__) can race against.  Hold
+            ``sphere_lock`` while we do it.  The lock is short — just
+            the dict assignment + the bai accumulator — and the
+            accumulator path itself already takes sphere_lock
+            internally, so we don't deadlock by nesting (Condition
+            is reentrant).
+            """
+            with self.sphere.sphere_lock:
+                self.sphere.arches[arch.idx] = arch
             if do_2d:
                 self.sphere._accumulate_bai_2d(arch)
                 with self.data_lock:
@@ -165,6 +176,14 @@ class integratorThread(Qt.QtCore.QThread):
                         'int_2d': arch.int_2d,
                         'gi_2d': arch.gi_2d,
                     }
+                    # N9 Fix#4: a 2D reintegrate also recomputes the
+                    # 1D azimuthal cake via pyFAI's integrate2d output
+                    # → the cached data_1d entry from before the
+                    # reintegrate is now stale.  Refresh it so the 1D
+                    # viewer sees the new int_1d immediately rather
+                    # than waiting for a reselect to lazy-reload it
+                    # from disk.
+                    self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
             else:
                 self.sphere._accumulate_bai_1d(arch)
                 with self.data_lock:
@@ -405,9 +424,15 @@ class fileHandlerThread(Qt.QtCore.QThread):
     def set_datafile(self):
         with self.file_lock:
             skip_2d = getattr(self.sphere, 'skip_2d', False)
-            self.sphere.set_datafile(
-                self.fname, save_args={'compression': None}
-            )
+            # O7: dropped legacy ``save_args={'compression': None}``
+            # passthrough — the v2 writer (save_to_nexus) doesn't
+            # accept a ``compression`` kwarg.  N5 made set_datafile's
+            # defaults None-sentinels, so omitting save_args is the
+            # right call.  The stale dict was stripped inside
+            # set_datafile via ``save_args.pop('compression', None)``
+            # but that workaround is unnecessary now that the caller
+            # doesn't supply the dead kwarg in the first place.
+            self.sphere.set_datafile(self.fname)
             self.sphere.skip_2d = skip_2d  # preserve checkbox state across load
         self.sigNewFile.emit(self.fname)
         self.sigUpdate.emit()

@@ -205,6 +205,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.plot_layout.addWidget(self.plot_win)
         self.plot_viewBox = RectViewBox()
         self.plot = self.plot_win.addPlot(viewBox=self.plot_viewBox)
+        # Seaborn-darkgrid + talk-context styling: gridlines on,
+        # tick/label fonts ~11pt.  Background colour comes from
+        # ``apply_dark_theme``'s pg.setConfigOption.
+        from xdart.gui.themes import apply_seaborn_plot_style
+        apply_seaborn_plot_style(self.plot)
         self.curves = []
         self.legend = self.plot.addLegend()
         from PySide6.QtWidgets import QGraphicsItem
@@ -665,9 +670,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if data is None:
                 return
 
-            # Apply Mask
-            arch_2d = self.data_2d[self.idxs_2d[0]]
-            mask = arch_2d['mask']
+            # Apply Mask — O8: snapshot under data_lock so a
+            # concurrent writer (integrator publish, fileHandlerThread
+            # load) can't evict ``self.idxs_2d[0]`` between the
+            # ``in`` check and the value read.  ``.get(...)`` returns
+            # None for an evicted key; falling back to None mask is
+            # the same as having no mask, so render continues.
+            with self.data_lock:
+                arch_2d = self.data_2d.get(self.idxs_2d[0])
+            mask = arch_2d['mask'] if arch_2d is not None else None
         data = np.asarray(data, dtype=float)
 
         # Apply detector + global mask.
@@ -987,7 +998,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """Render raw image data in viewer mode with optional mask/threshold."""
         if len(self.idxs_2d) == 0:
             return
-        arch_2d = self.data_2d[self.idxs_2d[0]]
+        # O8: snapshot under data_lock so a concurrent writer can't
+        # evict the key between the lookup and the read.
+        with self.data_lock:
+            arch_2d = self.data_2d.get(self.idxs_2d[0])
+        if arch_2d is None:
+            return
         data = np.asarray(arch_2d['map_raw'], dtype=float)
 
         # Apply threshold from wrangler if enabled

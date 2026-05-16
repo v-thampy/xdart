@@ -44,15 +44,34 @@ def get_rect(x, y):
 class RectViewBox(pg.ViewBox):
     """Special viewbox based on pyqtgraph ViewBox. Uses a box for zoom
     functions, scroll wheel to zoom.
+
+    Mouse bindings:
+      * Left-drag       — rubber-band zoom rectangle (RectMode default).
+      * Middle-click    — auto-range (zoom-out).  Bound here because the
+                          right-click default was consuming the context
+                          menu; middle-click is unmapped in pyqtgraph
+                          defaults so it's a clean home for "zoom out".
+      * Right-click     — pyqtgraph's standard context menu (View All,
+                          X/Y axis options including Log Scale and
+                          grid toggles, Mouse Mode, Plot Options,
+                          Export...).  Previously suppressed here by a
+                          custom override that intercepted right-click
+                          for auto-range; restored so the user gets
+                          the full pyqtgraph toolbox back.
     """
     def __init__(self, *args, **kwds):
         pg.ViewBox.__init__(self, *args, **kwds)
         self.setMouseMode(self.RectMode)
-        
-    ## reimplement right-click to zoom out
+
     def mouseClickEvent(self, ev):
-        if ev.button() == QtCore.Qt.RightButton:
+        # Middle-click → auto-range.  Right-click falls through to
+        # pyqtgraph's ViewBox.mouseClickEvent, which calls
+        # raiseContextMenu(ev) when the menu is enabled.
+        if ev.button() == QtCore.Qt.MiddleButton:
+            ev.accept()
             self.autoRange()
+            return
+        pg.ViewBox.mouseClickEvent(self, ev)
             
     def mouseDragEvent(self, ev, axis=None):
         ev.accept()  ## we accept all buttons

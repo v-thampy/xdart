@@ -28,6 +28,7 @@ Key invariants of the v2 schema:
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from pathlib import Path
@@ -41,6 +42,9 @@ if TYPE_CHECKING:  # pragma: no cover
     from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
 
     from xdart.modules.ewald.sphere import EwaldSphere
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -349,13 +353,15 @@ def _append_new_rows(g, name: str, new_rows: np.ndarray,
     If the dataset doesn't exist yet, creates it with the supplied
     ``maxshape`` / ``chunks`` parameters so future appends work.
 
-    If the trailing dataset shape (everything except axis 0) doesn't
-    match ``new_rows.shape[1:]`` — e.g. the user changed nq between
-    saves — the dataset is rebuilt from scratch with the new rows.
-    Disk grows past in-memory shouldn't happen in normal flow (live
-    saves only ever extend), but if it does, that's also covered
-    here: a `del + recreate` is safer than leaving a tail of stale
-    rows.
+    O3: if the trailing dataset shape (everything except axis 0)
+    differs from ``new_rows.shape[1:]`` this function **raises
+    ValueError** instead of silently rebuilding from just the new
+    tail.  Pre-O3 the rebuild path dropped previously-saved rows on
+    the floor, so a mid-scan parameter change quietly truncated the
+    file to the new tail.  Callers (``_write_integrated_1d`` /
+    ``_write_integrated_2d``) detect the shape change *before*
+    invoking this helper and full-rewrite from the entire arch list
+    + refreshed q/chi axes; this raise is the safety net.
     """
     if name not in g:
         ds = g.create_dataset(
@@ -369,17 +375,14 @@ def _append_new_rows(g, name: str, new_rows: np.ndarray,
     ds = g[name]
     # Shape compatibility check — if axis-0 trailing dimensions
     # differ, the user changed integration parameters between saves.
-    # Rebuild from scratch.
+    # Raise so the caller can decide between (a) refusing the write
+    # and (b) a full rewrite path that includes all on-disk rows.
     if tuple(ds.shape[1:]) != tuple(new_rows.shape[1:]):
-        del g[name]
-        ds = g.create_dataset(
-            name, data=new_rows,
-            maxshape=maxshape, chunks=chunks,
+        raise ValueError(
+            f"_append_new_rows: row shape mismatch for {name!r} "
+            f"(on-disk={tuple(ds.shape[1:])}, new={tuple(new_rows.shape[1:])}); "
+            "caller must full-rewrite or refuse the write."
         )
-        if attrs:
-            for k, v in attrs.items():
-                ds.attrs[k] = v
-        return
     if new_rows.shape[0] == 0:
         # Nothing to append — most common path on a re-save with no
         # new frames since last save.
@@ -591,6 +594,30 @@ def _write_integrated_1d(f, sphere, *, entry: str,
     new_intensity = _stack_arches(new_arches, "int_1d.intensity")
     if new_intensity is None:
         return
+
+    # O3: shape-change detection for the append path.  If the new
+    # arches' row shape doesn't match what's on disk, the user
+    # changed numpoints / unit between saves; appending only the
+    # new rows would corrupt the file (different row sizes can't
+    # coexist) and the pre-O3 helper would silently drop prior
+    # rows.  Detect here while we have the full sphere context, do
+    # a clean full-rewrite from all arches with the refreshed
+    # q-axis, and skip the per-arch append below.
+    if group_path in h5f and "intensity" in h5f[group_path]:
+        on_disk_row = tuple(h5f[group_path]["intensity"].shape[1:])
+        new_row = tuple(new_intensity.shape[1:])
+        if on_disk_row != new_row:
+            logger.info(
+                "[APPEND-1D] row shape changed (on-disk=%s, new=%s); "
+                "rewriting integrated_1d from all %d arches",
+                on_disk_row, new_row, len(sphere.arches.index),
+            )
+            del h5f[group_path]
+            new_arches = [sphere.arches[i] for i in sphere.arches.index]
+            new_intensity = _stack_arches(new_arches, "int_1d.intensity")
+            if new_intensity is None:
+                return
+
     new_sigma = _stack_arches(new_arches, "int_1d.sigma")
     new_frame_index = np.array(
         [getattr(a, "idx", i) for i, a in enumerate(new_arches)], dtype=np.int32
@@ -696,6 +723,29 @@ def _write_integrated_2d(f, sphere, *, entry: str,
         np.transpose(new_intensity, (0, 2, 1))
         if new_intensity.ndim == 3 else new_intensity
     )
+
+    # O3: shape-change detection for the 2D append path — same
+    # rationale as ``_write_integrated_1d``.  ``npt_rad``/``npt_azim``
+    # changes between saves silently truncated the file pre-O3.
+    if group_path in h5f and "intensity" in h5f[group_path]:
+        on_disk_row = tuple(h5f[group_path]["intensity"].shape[1:])
+        new_row = tuple(new_intensity.shape[1:])
+        if on_disk_row != new_row:
+            logger.info(
+                "[APPEND-2D] row shape changed (on-disk=%s, new=%s); "
+                "rewriting integrated_2d from all %d arches",
+                on_disk_row, new_row, len(sphere.arches.index),
+            )
+            del h5f[group_path]
+            new_arches = [sphere.arches[i] for i in sphere.arches.index]
+            new_intensity = _stack_arches(new_arches, "int_2d.intensity")
+            if new_intensity is None:
+                return
+            new_intensity = (
+                np.transpose(new_intensity, (0, 2, 1))
+                if new_intensity.ndim == 3 else new_intensity
+            )
+
     new_frame_index = np.array(
         [getattr(a, "idx", i) for i, a in enumerate(new_arches)], dtype=np.int32
     )

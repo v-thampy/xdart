@@ -452,8 +452,15 @@ class EwaldSphere:
             self._load_from_nexus_v2(grp, data_only=data_only)
 
     def set_datafile(self, fname, name=None, keep_current_data=False,
-                     save_args={}, load_args={}):
-        """Sets the data_file."""
+                     save_args=None, load_args=None):
+        """Sets the data_file.
+
+        N5: save_args / load_args switched to None-sentinels (was
+        ``{}`` mutable defaults — shared across all callers who
+        omitted the kwarg).  Same trap F4 / F5 / H3 fixed elsewhere.
+        """
+        save_args = {} if save_args is None else save_args
+        load_args = {} if load_args is None else load_args
         with self.sphere_lock:
             self.data_file = fname
             if name is None:
@@ -553,7 +560,31 @@ class EwaldSphere:
             if name not in reserved_vars and ds[name].dims == ("frame",)
         }
         if motor_cols:
-            self.scan_data = pd.DataFrame(motor_cols)
+            # N2: index scan_data by the actual frame IDs (from the
+            # ``frame`` coord), not 0..N-1 default range index.
+            # Live acquisition writes rows by ``arch.idx`` via
+            # ``self.scan_data.loc[arch.idx] = ser`` — and the v2
+            # writer stamps ``integrated_*/frame_index`` from the
+            # same arch IDs.  If we left scan_data on the default
+            # range index, ``loc[arch.idx]`` on a reload would
+            # silently misalign for 1-based SPEC, gapped IDs, or
+            # any non-zero-based scheme.
+            frame_index = None
+            if "frame" in ds.coords:
+                try:
+                    frame_index = np.asarray(
+                        ds["frame"].values, dtype=int,
+                    )
+                except (TypeError, ValueError):
+                    frame_index = None
+            if frame_index is not None and len(frame_index) == len(
+                next(iter(motor_cols.values()))
+            ):
+                self.scan_data = pd.DataFrame(motor_cols, index=frame_index)
+            else:
+                # Fall back to default range index if ds lacks a
+                # ``frame`` coord (very old files / partial writes).
+                self.scan_data = pd.DataFrame(motor_cols)
 
         # ── wavelength + bai args from reduction config (if present) ─
         reduction = ds.attrs.get("reduction", {}) or {}

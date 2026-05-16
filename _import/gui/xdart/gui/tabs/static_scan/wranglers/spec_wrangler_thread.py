@@ -316,6 +316,12 @@ class specThread(wranglerThread):
         self._prefetch_queue = None      # queue.Queue of frame tuples or None sentinel
         self._prefetch_thread = None     # threading.Thread running the reader
         self._prefetch_stop_evt = None   # threading.Event — set to cancel worker
+        # O8: distinguish clean end-of-stream from worker failure.
+        # ``_prefetch_worker`` sets this to the str(exception) when
+        # it dies on an unexpected error; the consumer surfaces it
+        # via ``showLabel`` so the user sees "Eiger read failed: ..."
+        # instead of a silent end-of-scan.  None means "no error".
+        self._prefetch_error = None
 
     # ── Display helpers ──────────────────────────────────────────────────
 
@@ -362,6 +368,7 @@ class specThread(wranglerThread):
         self._prefetch_queue = None
         self._prefetch_thread = None
         self._prefetch_stop_evt = None
+        self._prefetch_error = None
         self.detector = get_detector(self.poni.detector) if self.poni.detector else None
         self.sub_label = ''
         det_mask = self.detector.mask if self.detector is not None else None  # pyFAI .mask property
@@ -668,6 +675,56 @@ class specThread(wranglerThread):
             self._frames_since_save = 0
         return count
 
+    def _prewarm_fiber_integrator_spec(self, sphere, pending_entry) -> None:
+        """Build ``sphere._cached_fiber_integrator`` from the first
+        pending frame.
+
+        O5: mirrors :meth:`nexusThread._prewarm_fiber_integrator` —
+        builds a throw-away arch from the first frame, computes its
+        incidence angle, and seeds the fiber integrator on the
+        sphere.  After this call ``_dispatch_batch_parallel`` can
+        build a fiber pool so every worker borrows a deep-copied
+        instance instead of constructing a fresh one per frame.
+
+        Pre-O5 the parallel batch path left ``_cached_fiber_integrator``
+        unset, ``fiber_pool`` came back None, and each worker built
+        its own fiber integrator per frame (~250 ms first-call CSR
+        LUT cost per worker per frame).  Costly for GI scans with
+        many cores.
+
+        ``pending_entry`` is one tuple from ``pending``:
+        ``(img_file, img_number, img_data, img_meta, bg_raw, t_read)``.
+        """
+        if not self.gi:
+            return
+        if sphere._cached_fiber_integrator is not None:
+            return
+        img_file, img_number, img_data, img_meta, bg_raw, _ = pending_entry
+        # Build a scratch arch identical in shape to what
+        # ``_process_one`` constructs so the angle math agrees.
+        scratch = EwaldArch(
+            img_number, img_data, poni=self.poni,
+            scan_info=img_meta, static=True, gi=True,
+            th_mtr=self.incidence_motor,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
+            series_average=self.series_average,
+            integrator=sphere._cached_integrator,
+        )
+        incident_angle = scratch._get_incident_angle()
+        sphere._cached_fiber_integrator = create_fiber_integrator(
+            scratch._poni_from_integrator(),
+            incident_angle=incident_angle,
+            tilt_angle=scratch.tilt_angle,
+            sample_orientation=self.sample_orientation,
+            angle_unit="deg",
+        )
+        # The per-frame angle-drift check in ``_integrate_one``
+        # compares against this cached value; if a later frame's
+        # incidence angle differs, that worker falls back to a
+        # locally-built fiber integrator at the right angle.
+        self._cached_gi_incident_angle = incident_angle
+
     def _dispatch_batch_parallel(self, sphere, pending):
         """Parallel batch processing using ThreadPoolExecutor.
 
@@ -698,6 +755,25 @@ class specThread(wranglerThread):
         if (getattr(sphere, '_cached_data_mask', None) is None
                 and pending):
             self._prewarm_arch_mask(sphere, pending[0][2])
+        # O5: prewarm the fiber integrator from the first pending
+        # frame so the per-worker fiber_pool below is non-None.
+        # Without this every worker built its own fiber integrator
+        # per frame (slow, especially for the first frame of each
+        # worker where pyFAI's CSR LUT cost is paid).  Mirrors the
+        # ``_prewarm_fiber_integrator`` path the NeXus wrangler
+        # already runs before its parallel section.
+        if (self.gi
+                and sphere._cached_fiber_integrator is None
+                and pending):
+            try:
+                self._prewarm_fiber_integrator_spec(sphere, pending[0])
+            except Exception as e:
+                # Fall through: workers still build their own fiber
+                # integrators per frame, just without the speedup.
+                logger.debug(
+                    "SPEC GI fiber prewarm failed (%s); workers will "
+                    "build their own per-frame", e,
+                )
         # H2: per-worker fiber-integrator pool (matches IntegratorPool
         # for the regular AzimuthalIntegrator).  None when GI is off
         # or when the prewarm hasn't seeded _cached_fiber_integrator
@@ -1169,7 +1245,7 @@ class specThread(wranglerThread):
             if self.command == 'stop':
                 return (None, None, 1, None, {})
             try:
-                return self._prefetch_queue.get(timeout=0.25)
+                item = self._prefetch_queue.get(timeout=0.25)
             except queue.Empty:
                 # If the worker is gone and queue is drained, fall through
                 # with an end-of-stream sentinel so the caller can exit.
@@ -1177,6 +1253,17 @@ class specThread(wranglerThread):
                         or not self._prefetch_thread.is_alive()):
                     return (None, None, 1, None, {})
                 continue
+            # O8: surface a worker-failure sentinel as a user-visible
+            # status before propagating end-of-stream.  A clean end
+            # has ``_prefetch_error is None``; a worker crash has the
+            # error string set in the worker's except branch.
+            if item[3] is None and self._prefetch_error:
+                self.showLabel.emit(
+                    f'Eiger read failed: {self._prefetch_error}'
+                )
+                # Clear so the next start (if any) doesn't re-emit.
+                self._prefetch_error = None
+            return item
 
     def _start_prefetcher(self):
         """Spin up the background prefetch thread (idempotent)."""
@@ -1299,6 +1386,12 @@ class specThread(wranglerThread):
                             return
         except Exception as e:
             logger.exception('Eiger prefetch worker failed: %s', e)
+            # O8: stamp the failure so the consumer of the sentinel
+            # can tell "scan ended cleanly" from "worker crashed".
+            # Surfaced via showLabel in _get_next_eiger_frame; without
+            # this the user sees a silent end-of-scan and assumes
+            # acquisition completed normally.
+            self._prefetch_error = str(e)
         finally:
             # Guarantee the consumer unblocks no matter how we exit
             # (stop event, command=='stop', exception, or normal return).
