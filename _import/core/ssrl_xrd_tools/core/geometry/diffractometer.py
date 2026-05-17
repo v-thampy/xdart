@@ -1,16 +1,19 @@
-"""Low-level geometry configuration primitives.
+"""Low-level diffractometer geometry primitives.
 
 Two unrelated geometry containers live here:
 
 * :class:`DiffractometerConfig` — used to build ``xrayutilities`` HXRD
-  objects for reciprocal-space mapping.  Imports ``xrayutilities``
-  lazily inside :meth:`make_hxrd`.
+  objects for reciprocal-space mapping.  Imports ``xrayutilities`` lazily
+  inside :meth:`make_hxrd`.
 
-* :class:`DiffractometerGeometry` — maps raw scan-file motor columns
-  to per-frame pyFAI rotations (``rot1``/``rot2``/``rot3``) and the
-  GI incidence angle.  Used by the v2 NeXus writer/reader (xdart 0.37+)
-  to support flexible diffractometer conventions (2-circle, psic,
+* :class:`DiffractometerGeometry` — maps raw scan-file motor columns to
+  per-frame pyFAI rotations (``rot1``/``rot2``/``rot3``) and the GI
+  incidence angle.  Used by the v2 NeXus writer/reader (xdart 0.37+) to
+  support flexible diffractometer conventions (2-circle, psic,
   psic-halpha, custom).
+
+These are the *per-frame, scalar* geometry primitives.  Per-pixel q-space
+mapping for RSM lives in :mod:`ssrl_xrd_tools.core.geometry.pixel_q`.
 """
 from __future__ import annotations
 
@@ -43,13 +46,24 @@ class DiffractometerConfig:
     init_area_tiltazimuth: str = "x+"
     ang2q_kwargs: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # Normalise tuple-typed fields after construction.  JSON load
+        # (``ExperimentConfig.from_file``) delivers lists here; without
+        # this normalisation a round-tripped config compares unequal
+        # to the original.  Also catches callers who pass lists by
+        # mistake.
+        for name in ("sample_rot", "detector_rot", "r_i", "hxrd_n", "hxrd_q"):
+            value = getattr(self, name)
+            if not isinstance(value, tuple):
+                setattr(self, name, tuple(value))
+
     def make_hxrd(self, energy: float) -> "xu.HXRD":
         """Build an ``xu.HXRD`` instance at the given energy.
 
         ``xrayutilities`` is imported lazily inside this method so that
         importing :mod:`ssrl_xrd_tools.core` never triggers the xu
-        import (it is still a declared dependency and must be
-        installed before calling this method).
+        import (it is still a declared dependency and must be installed
+        before calling this method).
         """
         import xrayutilities as xu  # noqa: PLC0415 — intentional lazy import
 
@@ -81,9 +95,9 @@ class AngleMapping:
     """Linear mapping from one raw motor column to a derived angle.
 
     ``derived = sign * motor_value + offset``, all in the same units
-    (degrees).  The consumer (``derive_per_frame``) handles
-    deg→rad conversion for ``rot1/rot2/rot3``; the incidence angle
-    stays in degrees.
+    (degrees).  The consumer (``derive_per_frame``) handles deg→rad
+    conversion for ``rot1/rot2/rot3``; the incidence angle stays in
+    degrees.
     """
 
     source_motor: str = ""

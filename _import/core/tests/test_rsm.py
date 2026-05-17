@@ -6,8 +6,10 @@ import numpy as np
 import pytest
 
 from ssrl_xrd_tools.rsm import (
+    DetectorHeader,
     DiffractometerConfig,
     ExperimentConfig,
+    PixelQMap,
     RSMVolume,
     ScanInfo,
     combine_grids,
@@ -18,6 +20,16 @@ from ssrl_xrd_tools.rsm import (
     mask_data,
     save_vtk,
 )
+
+
+def _default_header(Nch1: int = 0, Nch2: int = 0) -> DetectorHeader:
+    """Tiny test header — geometry values are arbitrary placeholders."""
+    return DetectorHeader(
+        cch1=5.0, cch2=5.0,
+        pwidth1=0.075, pwidth2=0.075,
+        distance=830.0,
+        Nch1=Nch1, Nch2=Nch2,
+    )
 
 try:
     import xrayutilities as xu
@@ -268,22 +280,22 @@ class TestGridImgData:
         import ssrl_xrd_tools.rsm.gridding as gridding_module
 
         monkeypatch.setattr(gridding_module.xu, "Gridder3D", _FakeGridder3D)
-
-        cfg = DiffractometerConfig()
         monkeypatch.setattr(DiffractometerConfig, "make_hxrd", lambda self, energy: _FakeHXRD())
 
+        mapper = PixelQMap(
+            diff_config=DiffractometerConfig(),
+            header=_default_header(Nch1=5, Nch2=6),
+        )
         img = np.random.default_rng(0).random((3, 5, 6))
         UB = np.eye(3)
         angles = [[0.0, 0.1, 0.2], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.1, 0.2, 0.3]]
-        header = {"cch1": "2", "cch2": "3"}
 
         out = grid_img_data(
-            img=img,
+            mapper,
+            img,
+            angles,
             energy=12000.0,
             UB=UB,
-            angles=angles,
-            header=header,
-            diff_config=cfg,
             bins=(8, 9, 10),
         )
         assert isinstance(out, RSMVolume)
@@ -296,6 +308,8 @@ class TestGridImgData:
             def init_area(self, *args, **kwargs):
                 captured["Nch1"] = kwargs.get("Nch1")
                 captured["Nch2"] = kwargs.get("Nch2")
+                captured["cch1"] = kwargs.get("cch1")
+                captured["cch2"] = kwargs.get("cch2")
                 return None
 
             def area(self, *args, **kwargs):
@@ -322,29 +336,32 @@ class TestGridImgData:
         import ssrl_xrd_tools.rsm.gridding as gridding_module
 
         monkeypatch.setattr(gridding_module.xu, "Gridder3D", _FakeGridder3D)
-
-        cfg = DiffractometerConfig()
         monkeypatch.setattr(DiffractometerConfig, "make_hxrd", lambda self, energy: _FakeHXRD())
 
+        mapper = PixelQMap(
+            diff_config=DiffractometerConfig(),
+            header=_default_header(Nch1=10, Nch2=10),
+        )
         img = np.random.default_rng(1).random((3, 10, 10))
         UB = np.eye(3)
         angles = [[0.0, 0.1, 0.2], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.1, 0.2, 0.3]]
-        header = {"cch1": "5", "cch2": "5"}
         roi = (2, 8, 1, 9)  # 6 x 8 cropped image
 
         out = grid_img_data(
-            img=img,
+            mapper,
+            img,
+            angles,
             energy=12000.0,
             UB=UB,
-            angles=angles,
-            header=header,
-            diff_config=cfg,
             bins=(5, 5, 5),
             roi=roi,
         )
         assert isinstance(out, RSMVolume)
         assert captured["Nch1"] == 6
         assert captured["Nch2"] == 8
+        # ROI also shifts the beam centre: cch1 - r0, cch2 - c0
+        assert captured["cch1"] == pytest.approx(5.0 - 2)
+        assert captured["cch2"] == pytest.approx(5.0 - 1)
 
 
 class TestCombineGrids:
@@ -410,11 +427,19 @@ class TestExperimentConfig:
     def test_post_init_creates_dir(self, tmp_path: Path) -> None:
         pdir = tmp_path / "pickles"
         assert not pdir.exists()
-        ExperimentConfig(base_path=tmp_path, pickle_dir=pdir, header={"cch1": "0", "cch2": "0"})
+        ExperimentConfig(
+            base_path=str(tmp_path),
+            pickle_dir=str(pdir),
+            header=_default_header(),
+        )
         assert pdir.exists()
 
     def test_find_h5(self, tmp_path: Path) -> None:
-        cfg = ExperimentConfig(base_path=tmp_path, pickle_dir=tmp_path / "pk", header={"cch1": "0", "cch2": "0"})
+        cfg = ExperimentConfig(
+            base_path=str(tmp_path),
+            pickle_dir=str(tmp_path / "pk"),
+            header=_default_header(),
+        )
         spec_dir = tmp_path / "spec"
         spec_dir.mkdir()
         expected = spec_dir / "sample_scan12_master.h5"
@@ -422,6 +447,37 @@ class TestExperimentConfig:
 
         found = cfg.find_h5(spec_dir, "sample", 12)
         assert found == expected
+
+    def test_mapper_property_bundles_diff_and_header(self, tmp_path: Path) -> None:
+        cfg = ExperimentConfig(
+            base_path=str(tmp_path),
+            pickle_dir=str(tmp_path / "pk"),
+            header=_default_header(Nch1=100, Nch2=200),
+            diff_config=DiffractometerConfig(),
+        )
+        mapper = cfg.mapper
+        assert isinstance(mapper, PixelQMap)
+        assert mapper.header.Nch1 == 100
+        assert mapper.header.Nch2 == 200
+        assert mapper.diff_config is cfg.diff_config
+
+    def test_json_roundtrip(self, tmp_path: Path) -> None:
+        cfg = ExperimentConfig(
+            base_path=str(tmp_path),
+            pickle_dir=str(tmp_path / "pk"),
+            header=DetectorHeader(
+                cch1=257.5, cch2=515.0,
+                pwidth1=0.075, pwidth2=0.075,
+                distance=830.0,
+                Nch1=514, Nch2=1030,
+            ),
+        )
+        path = tmp_path / "exp.json"
+        cfg.to_file(path)
+        loaded = ExperimentConfig.from_file(path)
+        assert loaded.header == cfg.header
+        assert loaded.diff_config == cfg.diff_config
+        assert loaded.bins == cfg.bins
 
 
 class TestProcessScanData:

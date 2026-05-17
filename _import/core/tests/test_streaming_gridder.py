@@ -1,0 +1,425 @@
+"""Tests for the streaming RSM gridder (ssrl_xrd_tools.rsm.gridding).
+
+Covers:
+
+* :class:`StreamingGridder` lifecycle (set_bounds / scout / add / to_volume)
+  with a mocked ``xu.Gridder3D`` so we can verify chunk handoff without
+  installing xrayutilities.
+* :func:`grid_img_data_streaming` chunking behaviour — equivalence to
+  the single-shot path within binning tolerance, scout-pass bounds.
+* :func:`grid_scans_streaming` multi-scan accumulation.
+* :func:`_corner_pixel_q` tiny-detector trick: cch'/pwidth' produce a
+  2×2 grid that lands on the original detector's corners.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+import pytest
+
+from ssrl_xrd_tools.core.geometry import (
+    DetectorHeader,
+    DiffractometerConfig,
+    PixelQMap,
+)
+# Import directly from submodules to avoid the rsm/__init__.py chain pulling
+# in pipeline → io.spec → silx (silx is not in the test sandbox).
+from ssrl_xrd_tools.rsm import gridding as gridding_module
+from ssrl_xrd_tools.rsm.gridding import (
+    StreamingGridder,
+    StreamingScan,
+    _corner_pixel_q,
+    grid_img_data_streaming,
+    grid_scans_streaming,
+)
+from ssrl_xrd_tools.rsm.volume import RSMVolume
+
+
+# ---------------------------------------------------------------------------
+# Mocks for xu.Gridder3D + DiffractometerConfig.make_hxrd
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _ChunkRecord:
+    qx: np.ndarray
+    qy: np.ndarray
+    qz: np.ndarray
+    data: np.ndarray
+
+
+class _FakeGridder3D:
+    """Records every chunk passed in; exposes the accumulated data as a sum."""
+
+    instances: list["_FakeGridder3D"] = []
+
+    def __init__(self, nx: int, ny: int, nz: int) -> None:
+        self.nx, self.ny, self.nz = nx, ny, nz
+        self.xaxis = np.linspace(-1, 1, nx)
+        self.yaxis = np.linspace(-1, 1, ny)
+        self.zaxis = np.linspace(-1, 1, nz)
+        self.data = np.zeros((nx, ny, nz), dtype=float)
+        self.keep_data: bool = False
+        self.data_range: tuple[float, ...] | None = None
+        self.data_range_fixed: bool = False
+        self.chunks: list[_ChunkRecord] = []
+        _FakeGridder3D.instances.append(self)
+
+    def KeepData(self, flag: bool) -> None:
+        self.keep_data = bool(flag)
+
+    def dataRange(  # noqa: N802 — matches xu API
+        self,
+        xmin: float, xmax: float,
+        ymin: float, ymax: float,
+        zmin: float, zmax: float,
+        fixed: bool = False,
+    ) -> None:
+        self.data_range = (xmin, xmax, ymin, ymax, zmin, zmax)
+        self.data_range_fixed = fixed
+        # Re-grid axes to match the requested range (close enough for tests)
+        self.xaxis = np.linspace(xmin, xmax, self.nx)
+        self.yaxis = np.linspace(ymin, ymax, self.ny)
+        self.zaxis = np.linspace(zmin, zmax, self.nz)
+
+    def __call__(
+        self,
+        qx: np.ndarray,
+        qy: np.ndarray,
+        qz: np.ndarray,
+        data: np.ndarray,
+    ) -> None:
+        self.chunks.append(_ChunkRecord(qx.copy(), qy.copy(), qz.copy(), data.copy()))
+        # Make the accumulator something testable — sum of (chunk mean × n_pixels)
+        self.data += float(np.nanmean(data))
+
+
+class _FakeAng2Q:
+    """Returns shape-consistent zero/one/two-valued q arrays so shape checks pass."""
+
+    def __init__(self) -> None:
+        self.init_kwargs: dict = {}
+
+    def init_area(self, *args: Any, **kwargs: Any) -> None:
+        self.init_kwargs = kwargs
+
+    def area(self, *args: Any, **kwargs: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # Determine N from the first positional (sample-axis) argument
+        N = len(np.atleast_1d(args[0]))
+        Nch1 = self.init_kwargs.get("Nch1")
+        Nch2 = self.init_kwargs.get("Nch2")
+        # Return q arrays that vary with frame + pixel so scouting produces
+        # non-degenerate (lo, hi) bounds.
+        frame_idx = np.arange(N, dtype=float).reshape(N, 1, 1)
+        row_idx = np.arange(Nch1, dtype=float).reshape(1, Nch1, 1)
+        col_idx = np.arange(Nch2, dtype=float).reshape(1, 1, Nch2)
+        qx = 0.5 + 0.01 * frame_idx + 0.001 * row_idx
+        qy = 1.5 + 0.02 * frame_idx + 0.002 * col_idx
+        qz = 2.5 + 0.03 * frame_idx + 0.003 * (row_idx + col_idx)
+        return (
+            np.broadcast_to(qx, (N, Nch1, Nch2)).astype(float, copy=True),
+            np.broadcast_to(qy, (N, Nch1, Nch2)).astype(float, copy=True),
+            np.broadcast_to(qz, (N, Nch1, Nch2)).astype(float, copy=True),
+        )
+
+
+class _FakeHXRD:
+    def __init__(self) -> None:
+        self.Ang2Q = _FakeAng2Q()
+
+
+@pytest.fixture(autouse=True)
+def _reset_gridder_instances():
+    _FakeGridder3D.instances.clear()
+    yield
+    _FakeGridder3D.instances.clear()
+
+
+@pytest.fixture
+def patched_xu(monkeypatch: pytest.MonkeyPatch):
+    """Patch the xu.Gridder3D used by gridding.py + DiffractometerConfig.make_hxrd."""
+    monkeypatch.setattr(gridding_module.xu, "Gridder3D", _FakeGridder3D)
+    monkeypatch.setattr(
+        DiffractometerConfig, "make_hxrd",
+        lambda self, energy: _FakeHXRD(),
+    )
+
+
+def _default_mapper(Nch1: int = 64, Nch2: int = 64) -> PixelQMap:
+    return PixelQMap(
+        diff_config=DiffractometerConfig(),
+        header=DetectorHeader(
+            cch1=Nch1 / 2.0, cch2=Nch2 / 2.0,
+            pwidth1=0.075, pwidth2=0.075,
+            distance=830.0,
+            Nch1=Nch1, Nch2=Nch2,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# _corner_pixel_q
+# ---------------------------------------------------------------------------
+
+class TestCornerPixelQ:
+    """The tiny-detector trick must reduce calls to Nch=2 for both axes."""
+
+    def test_uses_2x2_virtual_detector(self, patched_xu) -> None:
+        mapper = _default_mapper(Nch1=514, Nch2=1030)
+        angles = [np.array([0.0, 0.1, 0.2])]
+        qx, qy, qz = _corner_pixel_q(mapper, angles, energy=12000.0)
+        assert qx.shape == (3, 2, 2)
+        assert qy.shape == (3, 2, 2)
+        assert qz.shape == (3, 2, 2)
+
+    def test_cch_and_pwidth_scale(self, patched_xu) -> None:
+        """Verify the tiny-detector header math directly via init_area kwargs."""
+        # Construct a mapper whose make_hxrd we can inspect
+        captured: dict = {}
+
+        class _Tracker(_FakeAng2Q):
+            def init_area(self, *args: Any, **kwargs: Any) -> None:
+                super().init_area(*args, **kwargs)
+                captured.update(kwargs)
+
+        class _TrackerHXRD:
+            Ang2Q = _Tracker()
+
+        from ssrl_xrd_tools.core.geometry import diffractometer as diff_module
+
+        original = DiffractometerConfig.make_hxrd
+        try:
+            DiffractometerConfig.make_hxrd = lambda self, energy: _TrackerHXRD()  # type: ignore[method-assign]
+            mapper = _default_mapper(Nch1=514, Nch2=1030)
+            _corner_pixel_q(mapper, [np.array([0.0])], energy=12000.0)
+            # cch' = cch / (N - 1), pwidth' = pwidth * (N - 1)
+            assert captured["Nch1"] == 2
+            assert captured["Nch2"] == 2
+            assert captured["cch1"] == pytest.approx(257.0 / 513)
+            assert captured["cch2"] == pytest.approx(515.0 / 1029)
+            assert captured["pwidth1"] == pytest.approx(0.075 * 513)
+            assert captured["pwidth2"] == pytest.approx(0.075 * 1029)
+        finally:
+            DiffractometerConfig.make_hxrd = original  # type: ignore[method-assign]
+
+    def test_rejects_tiny_detector(self, patched_xu) -> None:
+        mapper = _default_mapper(Nch1=1, Nch2=64)
+        with pytest.raises(ValueError, match="corner scout requires"):
+            _corner_pixel_q(mapper, [np.array([0.0])], energy=12000.0)
+
+
+# ---------------------------------------------------------------------------
+# StreamingGridder lifecycle
+# ---------------------------------------------------------------------------
+
+class TestStreamingGridder:
+    def test_add_before_bounds_raises(self, patched_xu) -> None:
+        sg = StreamingGridder(_default_mapper(), (10, 10, 10))
+        with pytest.raises(RuntimeError, match="bounds not set"):
+            sg.add(np.zeros((1, 64, 64)), [np.array([0.0])], energy=12000.0)
+
+    def test_to_volume_before_add_raises(self, patched_xu) -> None:
+        sg = StreamingGridder(_default_mapper(), (10, 10, 10))
+        sg.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        with pytest.raises(RuntimeError, match="no chunks processed"):
+            sg.to_volume()
+
+    def test_set_bounds_twice_raises(self, patched_xu) -> None:
+        sg = StreamingGridder(_default_mapper(), (10, 10, 10))
+        sg.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        with pytest.raises(RuntimeError, match="bounds already set"):
+            sg.set_bounds((-2, 2), (-2, 2), (-2, 2))
+
+    def test_inverted_bounds_rejected(self, patched_xu) -> None:
+        sg = StreamingGridder(_default_mapper(), (10, 10, 10))
+        with pytest.raises(ValueError, match="qx range"):
+            sg.set_bounds((1, -1), (-1, 1), (-1, 1))
+        with pytest.raises(ValueError, match="qy range"):
+            sg.set_bounds((-1, 1), (1, -1), (-1, 1))
+        with pytest.raises(ValueError, match="qz range"):
+            sg.set_bounds((-1, 1), (-1, 1), (1, -1))
+
+    def test_gridder_configured_for_streaming(self, patched_xu) -> None:
+        """KeepData(True) and fixed dataRange are the heart of the streaming path."""
+        sg = StreamingGridder(_default_mapper(), (8, 9, 10))
+        sg.set_bounds((-1, 1), (-2, 2), (-3, 3))
+        sg.add(
+            np.zeros((1, 64, 64)),
+            [np.array([0.0])],
+            energy=12000.0,
+        )
+        g = _FakeGridder3D.instances[-1]
+        assert g.keep_data is True
+        assert g.data_range_fixed is True
+        assert g.data_range == (-1, 1, -2, 2, -3, 3)
+
+    def test_chunk_handoff_preserves_per_frame_count(self, patched_xu) -> None:
+        sg = StreamingGridder(_default_mapper(), (8, 9, 10))
+        sg.set_bounds((-1, 1), (-2, 2), (-3, 3))
+
+        # Three chunks of varying sizes
+        for chunk_n in (3, 4, 2):
+            sg.add(
+                np.random.default_rng(chunk_n).random((chunk_n, 64, 64)),
+                [np.linspace(0, chunk_n * 0.1, chunk_n)],
+                energy=12000.0,
+            )
+        assert sg.n_frames_processed == 9
+        # _FakeGridder3D records every chunk
+        g = _FakeGridder3D.instances[-1]
+        assert [c.data.shape[0] for c in g.chunks] == [3, 4, 2]
+        # And one StreamingGridder uses one xu.Gridder3D instance
+        assert len(_FakeGridder3D.instances) == 1
+
+    def test_scout_sets_bounds_from_corner_q(self, patched_xu) -> None:
+        sg = StreamingGridder(_default_mapper(), (8, 9, 10))
+        ((qx_lo, qx_hi), (qy_lo, qy_hi), (qz_lo, qz_hi)) = sg.scout(
+            [([np.array([0.0, 0.1])], 12000.0, None, (64, 64))],
+        )
+        # _FakeAng2Q.area now varies with frame + pixel, so bounds are
+        # non-degenerate (lo < hi on every axis).
+        assert qx_lo < qx_hi
+        assert qy_lo < qy_hi
+        assert qz_lo < qz_hi
+        # Bounds were pushed into the gridder via set_bounds → dataRange.
+        g = _FakeGridder3D.instances[-1]
+        assert g.data_range == (qx_lo, qx_hi, qy_lo, qy_hi, qz_lo, qz_hi)
+        assert g.data_range_fixed is True
+
+    def test_scout_pad_widens_bounds(self, patched_xu) -> None:
+        sg_no_pad = StreamingGridder(_default_mapper(), (4, 4, 4))
+        no_pad = sg_no_pad.scout(
+            [([np.array([0.0, 0.1, 0.2])], 12000.0, None, (32, 32))],
+        )
+        sg_pad = StreamingGridder(_default_mapper(), (4, 4, 4))
+        with_pad = sg_pad.scout(
+            [([np.array([0.0, 0.1, 0.2])], 12000.0, None, (32, 32))],
+            pad=0.1,
+        )
+        for ax in range(3):
+            assert with_pad[ax][0] < no_pad[ax][0]
+            assert with_pad[ax][1] > no_pad[ax][1]
+
+    def test_2d_chunk_promoted_to_3d(self, patched_xu) -> None:
+        sg = StreamingGridder(_default_mapper(), (4, 4, 4))
+        sg.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        sg.add(
+            np.zeros((64, 64)),  # 2D — single frame
+            [np.array([0.0])],
+            energy=12000.0,
+        )
+        assert sg.n_frames_processed == 1
+        g = _FakeGridder3D.instances[-1]
+        assert g.chunks[-1].data.shape == (1, 64, 64)
+
+
+# ---------------------------------------------------------------------------
+# grid_img_data_streaming
+# ---------------------------------------------------------------------------
+
+class TestGridImgDataStreaming:
+    def test_chunks_cover_all_frames(self, patched_xu) -> None:
+        mapper = _default_mapper(Nch1=32, Nch2=32)
+        img = np.random.default_rng(0).random((10, 32, 32))
+        angles = [np.linspace(0, 1, 10)]
+        out = grid_img_data_streaming(
+            mapper, img, angles, energy=12000.0,
+            bins=(4, 4, 4),
+            chunk_size=3,
+        )
+        assert isinstance(out, RSMVolume)
+        assert out.shape == (4, 4, 4)
+        # 10 frames in chunks of 3 → 4 chunks (3, 3, 3, 1)
+        g = _FakeGridder3D.instances[-1]
+        assert [c.data.shape[0] for c in g.chunks] == [3, 3, 3, 1]
+
+    def test_explicit_q_bounds_skips_scout(self, patched_xu) -> None:
+        """When q_bounds is provided, no scout should happen → only one xu.Gridder3D."""
+        mapper = _default_mapper(Nch1=32, Nch2=32)
+        img = np.random.default_rng(0).random((6, 32, 32))
+        angles = [np.linspace(0, 1, 6)]
+        grid_img_data_streaming(
+            mapper, img, angles, energy=12000.0,
+            bins=(4, 4, 4),
+            chunk_size=2,
+            q_bounds=((-1, 1), (-2, 2), (-3, 3)),
+        )
+        # Only the main accumulating gridder is constructed — the scout
+        # path is what would call mapper.pixel_q with a tiny detector
+        # (no separate Gridder3D); even so we expect exactly 1 instance.
+        assert len(_FakeGridder3D.instances) == 1
+        assert _FakeGridder3D.instances[0].data_range == (-1, 1, -2, 2, -3, 3)
+
+    def test_mismatched_angles_rejected(self, patched_xu) -> None:
+        mapper = _default_mapper()
+        img = np.zeros((10, 64, 64))
+        with pytest.raises(ValueError, match="length N matching"):
+            grid_img_data_streaming(
+                mapper, img,
+                [np.array([0.0, 0.1, 0.2])],  # only 3 entries for 10 frames
+                energy=12000.0,
+            )
+
+    def test_2d_img_rejected(self, patched_xu) -> None:
+        mapper = _default_mapper()
+        with pytest.raises(ValueError, match=r"img must be \(N, H, W\)"):
+            grid_img_data_streaming(
+                mapper, np.zeros((64, 64)),
+                [np.array([0.0])], energy=12000.0,
+            )
+
+
+# ---------------------------------------------------------------------------
+# grid_scans_streaming
+# ---------------------------------------------------------------------------
+
+class TestGridScansStreaming:
+    def test_multiple_scans_share_one_gridder(self, patched_xu) -> None:
+        mapper = _default_mapper(Nch1=32, Nch2=32)
+        scans = [
+            StreamingScan(
+                img=np.random.default_rng(i).random((4, 32, 32)),
+                angles=[np.linspace(0, 0.4, 4) + i],
+                energy=11000.0 + 100 * i,
+                UB=None,
+                roi=None,
+            )
+            for i in range(3)
+        ]
+        out = grid_scans_streaming(
+            mapper, scans,
+            bins=(4, 4, 4),
+            chunk_size=2,
+            q_bounds=((-5, 5), (-5, 5), (-5, 5)),
+        )
+        assert isinstance(out, RSMVolume)
+        # Only ONE Gridder3D is instantiated for the entire multi-scan run
+        assert len(_FakeGridder3D.instances) == 1
+        # And it sees all 12 frames in 2-frame chunks → 6 chunks
+        g = _FakeGridder3D.instances[0]
+        assert [c.data.shape[0] for c in g.chunks] == [2, 2, 2, 2, 2, 2]
+
+    def test_per_scan_roi_applied(self, patched_xu) -> None:
+        mapper = _default_mapper(Nch1=32, Nch2=32)
+        scans = [
+            StreamingScan(
+                img=np.random.default_rng(0).random((2, 32, 32)),
+                angles=[np.array([0.0, 0.1])],
+                energy=12000.0,
+                roi=(4, 28, 8, 24),  # 24 x 16 ROI
+            ),
+        ]
+        grid_scans_streaming(
+            mapper, scans,
+            bins=(4, 4, 4),
+            chunk_size=2,
+            q_bounds=((-1, 1), (-1, 1), (-1, 1)),
+        )
+        g = _FakeGridder3D.instances[0]
+        # Image chunk should be the ROI-cropped size
+        assert g.chunks[-1].data.shape == (2, 24, 16)
+
+    def test_empty_scans_rejected(self, patched_xu) -> None:
+        with pytest.raises(ValueError, match="must not be empty"):
+            grid_scans_streaming(_default_mapper(), [], bins=(4, 4, 4))

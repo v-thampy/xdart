@@ -25,6 +25,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
     "Topic :: Scientific/Engineering :: Chemistry",
 ]
+# Headless / batch-processing core.  Anything required by the
+# import-time chain of ssrl_xrd_tools.{core,io,integrate,viz} belongs here.
+# Domain-specific optional packages live under [project.optional-dependencies].
 dependencies = [
     "numpy",
     "scipy",
@@ -34,28 +37,54 @@ dependencies = [
     "fabio",
     "silx",
     "pyFAI>=2025.3,<2026",
-    "xrayutilities",
     "joblib",
     "natsort",
-    "lmfit",
-    "ipykernel",
-    "ipywidgets",
-    "jupyterlab",
+    # Plotting libraries (used by viz.mpl / viz.plotly — viz/__init__.py
+    # imports both eagerly).  Both render headless, neither requires
+    # Jupyter or a GUI toolkit at import time.
     "matplotlib",
-    "panel",
-    "holoviews",
-    "bokeh",
-    "jupyter_bokeh",
-    "pymatgen",
     "plotly",
+]
+
+[project.optional-dependencies]
+# Phase / peak fitting (analysis.fitting.*).
+fitting = ["lmfit", "pymatgen"]
+
+# Reciprocal-space mapping (rsm.*).  xrayutilities is the
+# Ang2Q / Gridder3D backend; pyevtk is for VTK export from RSMVolume.
+rsm = ["xrayutilities", "pyevtk"]
+
+# Interactive Jupyter widgets (gui.widgets.*).  ipywidgets +
+# plotly.FigureWidget for in-place updates; anywidget / ipyfilechooser
+# are convenience deps used by a handful of widgets.  (``plotly`` itself
+# is base because viz/__init__.py loads it eagerly; the widgets layer
+# adds the Jupyter-render side on top.)
+gui = [
+    "ipywidgets",
     "anywidget",
     "ipyfilechooser",
 ]
 
-[project.optional-dependencies]
+# Self-contained Jupyter environment (kernel + JupyterLab).  Useful
+# for users who want `pip install ssrl_xrd_tools[notebook,gui]` to give
+# them a working notebook out of the box.
+notebook = ["ipykernel", "jupyterlab"]
+
+# napari-based 3D viewer for RSM volumes.
 napari = ["napari"]
+
+# Tiled client for streaming live data.
 tiled = ["tiled[client]"]
+
+# Standalone VTK export utility (rsm[vtk] is preferred; kept for
+# back-compat).
 vtk = ["pyevtk"]
+
+# Convenience: install everything except dev.
+all = [
+    "ssrl_xrd_tools[fitting,rsm,gui,notebook,napari,tiled]",
+]
+
 dev = [
     "pytest",
     "build",

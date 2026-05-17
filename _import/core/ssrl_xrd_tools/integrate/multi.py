@@ -152,6 +152,7 @@ def stitch_2d(
     radial_range: tuple[float, float] | None = None,
     azimuth_range: tuple[float, float] | None = None,
     mask: np.ndarray | None = None,
+    normalization: np.ndarray | None = None,
     **kwargs: Any,
 ) -> IntegrationResult2D:
     """
@@ -178,6 +179,12 @@ def stitch_2d(
         construction.
     mask : ndarray or None, optional
         Single detector mask applied to every image.
+    normalization : array-like of float or None, optional
+        Per-image monitor counts.  Each image is divided by its
+        corresponding value before integration.  Matches the
+        ``normalization`` parameter on :func:`stitch_1d` — both stitching
+        paths share the same :func:`_prepare_images` helper so the math
+        is identical.
     **kwargs
         Extra keyword arguments forwarded to ``mg.integrate2d``.
 
@@ -188,7 +195,7 @@ def stitch_2d(
     """
     from pyFAI.multi_geometry import MultiGeometry
 
-    img_list = _prepare_images(images, normalization=None)
+    img_list = _prepare_images(images, normalization)
     lst_mask = [mask] * len(img_list) if mask is not None else None
 
     mg = MultiGeometry(

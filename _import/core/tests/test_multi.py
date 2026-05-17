@@ -157,3 +157,63 @@ def test_stitch_2d_runs(poni_fixture):
     assert result.radial.shape == (100,)
     assert result.azimuthal.shape == (50,)
     assert result.intensity.shape == (100, 50)
+
+
+def test_stitch_2d_normalization(poni_fixture):
+    """``normalization=`` on stitch_2d must match pre-dividing the images.
+
+    Regression test for the stitch_1d / stitch_2d asymmetry: prior to the
+    fix, stitch_2d ignored normalization entirely.  Both paths go through
+    the same ``_prepare_images`` helper now.
+    """
+    integrators = _make_small_integrators(poni_fixture, rot1_angles=[0.0, 5.0, 10.0])
+    images = _synthetic_images(n=3, shape=(100, 100), seed=42)
+    norm = np.array([1.0, 2.0, 0.5])
+
+    via_param = stitch_2d(
+        images,
+        integrators,
+        npt_rad=100,
+        npt_azim=50,
+        unit="q_A^-1",
+        method="BBox",
+        normalization=norm,
+        correctSolidAngle=False,
+    )
+
+    pre_divided = [img / n for img, n in zip(images, norm)]
+    via_premul = stitch_2d(
+        pre_divided,
+        integrators,
+        npt_rad=100,
+        npt_azim=50,
+        unit="q_A^-1",
+        method="BBox",
+        correctSolidAngle=False,
+    )
+
+    assert isinstance(via_param, IntegrationResult2D)
+    np.testing.assert_allclose(
+        via_param.intensity, via_premul.intensity,
+        rtol=1e-10, atol=1e-12,
+    )
+    np.testing.assert_allclose(via_param.radial, via_premul.radial)
+    np.testing.assert_allclose(via_param.azimuthal, via_premul.azimuthal)
+
+
+def test_stitch_2d_normalization_mismatched_length(poni_fixture):
+    """Same length-mismatch error as stitch_1d (shared via _prepare_images)."""
+    integrators = _make_small_integrators(poni_fixture, rot1_angles=[0.0, 5.0, 10.0])
+    images = _synthetic_images(n=3, shape=(100, 100), seed=4)
+
+    with pytest.raises(ValueError, match="normalization length"):
+        stitch_2d(
+            images,
+            integrators,
+            npt_rad=100,
+            npt_azim=50,
+            unit="q_A^-1",
+            method="BBox",
+            normalization=[1.0, 2.0],  # only 2 for 3 images
+            correctSolidAngle=False,
+        )
