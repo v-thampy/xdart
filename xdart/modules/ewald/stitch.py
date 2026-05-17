@@ -115,16 +115,28 @@ def run_stitch(
     #
     # P5: lazy-load ``map_raw`` for v2-reloaded arches.  On a sphere
     # loaded from disk (vs. one freshly produced by the wrangler),
-    # ``arch.map_raw`` is None until we ask :meth:`_lazy_load_raw`
+    # ``arch.map_raw`` is None until we ask :meth:`_lazy_load_raw``
     # to hydrate it from the source file (TIFF / NeXus master).
     # Without this call, ``arch.map_raw - arch.bg_raw`` would
     # TypeError on the None subtract and abort the whole stitch.
     # Frames whose source isn't on disk get logged + skipped rather
     # than crashing the whole run.
+    #
+    # Q2: when any frame is skipped, we must filter the geometry
+    # arrays and normalisation lookup to match the surviving image
+    # list.  Pre-Q2 the integrators were built from the full
+    # ``rot1_deg/rot2_deg`` while ``images`` had fewer entries —
+    # either pyFAI's MultiGeometry would mis-pair an image with the
+    # wrong rotation, or it would length-mismatch and raise.
+    # ``surviving_indices`` is the positional row in the original
+    # ``arches`` (and therefore ``scan_data``, ``rot*_deg``) for
+    # each frame that survived; we filter all three using it after
+    # the loop.
     import logging as _logging
     _logger = _logging.getLogger(__name__)
     images = []
     skipped = []
+    surviving_indices = []
     for i, arch in enumerate(arches):
         if arch.map_raw is None:
             try:
@@ -143,6 +155,7 @@ def run_stitch(
             if denom != 0:
                 img = img / denom
         images.append(img)
+        surviving_indices.append(i)
     if skipped:
         _logger.warning(
             'stitch: skipped %d arches with no raw data: %s',
@@ -154,6 +167,12 @@ def run_stitch(
             'all source files missing or unloadable'
         )
     img_stack = np.stack(images, axis=0)
+
+    # Q2: align geometry arrays with the surviving image stack.
+    # When no frames were skipped this is a no-op slice.
+    surviving_idx_arr = np.asarray(surviving_indices, dtype=int)
+    rot1_deg = rot1_deg[surviving_idx_arr]
+    rot2_deg = rot2_deg[surviving_idx_arr]
 
     from ssrl_xrd_tools.integrate.multi import (
         create_multigeometry_integrators,
