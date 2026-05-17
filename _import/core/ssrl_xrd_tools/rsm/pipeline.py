@@ -23,7 +23,11 @@ from ssrl_xrd_tools.io.spec import (
     get_angles,
 )
 from ssrl_xrd_tools.rsm.volume import RSMVolume
-from ssrl_xrd_tools.rsm.gridding import StreamingGridder, grid_img_data
+from ssrl_xrd_tools.rsm.gridding import (
+    StreamingGridder,
+    grid_img_data,
+    grid_img_data_streaming,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,9 +108,39 @@ def process_scan_data(
     parallel: bool = True,
     strict: bool = False,
     detector: str = "Pilatus300k",
+    *,
+    streaming: bool = True,
+    chunk_size: int = 8,
+    static_mask: np.ndarray | None = None,
 ) -> RSMVolume | None:
     """
     Pure processing path without cache I/O.
+
+    Parameters
+    ----------
+    streaming : bool, default True
+        When True, dispatch to :func:`grid_img_data_streaming` — the
+        ``xu.Gridder3D`` accumulates chunks of ``chunk_size`` frames so
+        only ``chunk_size × H × W × 32`` bytes of q + image memory are
+        held at any time (regardless of how many frames the scan has).
+        When False, fall back to the single-shot
+        :func:`grid_img_data` which materialises the full ``(N, H, W)``
+        stack plus the full ``(N, H, W)`` qx/qy/qz arrays — OOM-prone
+        for large scans.
+    chunk_size : int, default 8
+        Frames per chunk; only consulted when ``streaming=True``.
+    static_mask : ndarray of bool, optional
+        2D detector / hot-pixel mask applied per-chunk before gridding.
+        Only consulted when ``streaming=True``.
+
+    Note
+    ----
+    Image loading is still eager here (``load_images`` returns the full
+    stack into memory).  Streaming bounds the *gridding-side* memory
+    cost (3 q-arrays × stack size), not the image-stack memory.  For
+    fully lazy loading + streaming, use
+    :func:`process_scan_from_sphere` on a v2 NeXus sphere where each
+    arch's raw image is loaded one chunk at a time.
     """
     spec_file = scan_info.spec_path
     _, scan_num = get_scan_path_info(scan_name)
@@ -125,6 +159,18 @@ def process_scan_data(
             logger.warning("No image data for scan %s", scan_name)
             return None
 
+        if streaming:
+            return grid_img_data_streaming(
+                mapper,
+                img_arr,
+                angles,
+                energy,
+                UB=UB,
+                bins=bins,
+                chunk_size=chunk_size,
+                roi=roi,
+                static_mask=static_mask,
+            )
         return grid_img_data(
             mapper,
             img_arr,
@@ -154,9 +200,18 @@ def process_scan(
     parallel: bool = True,
     strict: bool = False,
     detector: str = "Pilatus300k",
+    *,
+    streaming: bool = True,
+    chunk_size: int = 8,
+    static_mask: np.ndarray | None = None,
 ) -> RSMVolume | None:
     """
     Process one scan to an RSMVolume, using cache if available.
+
+    ``streaming`` defaults to True (the safe / memory-bounded path);
+    pass ``streaming=False`` to use the legacy single-shot gridder for
+    back-compat / small scans.  See :func:`process_scan_data` for the
+    full parameter contract.
     """
     sample_name, scan_num = get_scan_path_info(scan_name)
     pickle_file = pickle_dir / f"{sample_name}_{scan_num[:-2]}.pkl"
@@ -184,6 +239,9 @@ def process_scan(
         parallel=parallel,
         strict=strict,
         detector=detector,
+        streaming=streaming,
+        chunk_size=chunk_size,
+        static_mask=static_mask,
     )
 
     if volume is not None:
@@ -286,9 +344,22 @@ def _iter_sphere_chunks(
 ) -> Iterator[tuple[np.ndarray, list[int]]]:
     """Yield ``(img_chunk, frame_indices)`` for the streaming gridder.
 
-    Each ``img_chunk`` is ``(n_chunk, H, W)``.  Frames are pulled one at
-    a time via ``arch._lazy_load_raw()`` so only ``chunk_size`` raw
-    frames live in memory at any moment.
+    Each ``img_chunk`` is ``(n_chunk, H, W)`` — a fresh ``np.stack``,
+    independent of the source arches.  Memory promise:
+
+    1. **Only ``chunk_size`` raw frames are resident at any time.**
+       Frames materialised by this iterator via ``_lazy_load_raw`` are
+       cleared (``arch.map_raw = None``) in a ``finally`` block after
+       the consumer is done with each chunk.  Without this, the
+       ``sphere.arches`` cache would hold every lazy-loaded frame in
+       memory and the "memory-bounded" promise of streaming would
+       degrade to "full-scan resident" for any user who actually has
+       v2-reloaded arches.
+    2. **Arches that arrived with ``map_raw`` already populated are
+       left alone.**  We only free what we ourselves loaded — caller-
+       owned data is not our responsibility to invalidate.
+    3. **The stacked chunk is a copy** (``np.stack`` allocates fresh
+       output), so it survives the per-arch clearing.
     """
     indices = list(sphere.arches.index)
     if chunk_size <= 0:
@@ -297,17 +368,30 @@ def _iter_sphere_chunks(
     for start in range(0, len(indices), chunk_size):
         chunk_indices = indices[start : start + chunk_size]
         frames: list[np.ndarray] = []
-        for idx in chunk_indices:
-            arch = sphere.arches[idx]
-            if arch.map_raw is None:
-                ok = arch._lazy_load_raw()
-                if not ok or arch.map_raw is None:
-                    raise RuntimeError(
-                        f"could not lazy-load raw frame for arch {idx} "
-                        f"(check source_file / source_frame_idx provenance)"
-                    )
-            frames.append(np.asarray(arch.map_raw))
-        yield np.stack(frames, axis=0), chunk_indices
+        arches: list[_ArchLike] = []
+        was_missing: list[bool] = []
+        try:
+            for idx in chunk_indices:
+                arch = sphere.arches[idx]
+                missing = arch.map_raw is None
+                arches.append(arch)
+                was_missing.append(missing)
+                if missing:
+                    ok = arch._lazy_load_raw()
+                    if not ok or arch.map_raw is None:
+                        raise RuntimeError(
+                            f"could not lazy-load raw frame for arch {idx} "
+                            f"(check source_file / source_frame_idx "
+                            f"provenance)"
+                        )
+                frames.append(np.asarray(arch.map_raw))
+            yield np.stack(frames, axis=0), chunk_indices
+        finally:
+            # Free only what we materialised ourselves; respect arches
+            # that arrived with map_raw already populated.
+            for arch, missing in zip(arches, was_missing):
+                if missing:
+                    arch.map_raw = None
 
 
 def process_scan_from_sphere(
@@ -323,7 +407,7 @@ def process_scan_from_sphere(
         tuple[float, float], tuple[float, float], tuple[float, float]
     ] | None = None,
     roi: tuple[int, int, int, int] | None = None,
-    mask_static_pixels: bool = True,
+    static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
 ) -> RSMVolume:
     """Stream-process a v2 :class:`EwaldSphere` into an :class:`RSMVolume`.
@@ -360,8 +444,12 @@ def process_scan_from_sphere(
         detector corners (no raw image data is read for scouting).
     roi : (r0, r1, c0, c1), optional
         Detector ROI applied per-chunk and to the mapper header.
-    mask_static_pixels : bool
-        See :meth:`StreamingGridder.add`.
+    static_mask : ndarray of bool, optional
+        2D mask applied to every chunk before gridding — use this for
+        a detector / hot-pixel mask that should be consistent across
+        the whole scan.  See :meth:`StreamingGridder.add` for why this
+        replaces the chunk-local std heuristic that earlier versions
+        used.
     scout_pad : float
         Padding fraction applied to scouted bounds.  Ignored when
         ``q_bounds`` is supplied.
@@ -396,7 +484,7 @@ def process_scan_from_sphere(
             energy,
             UB=UB,
             roi=roi,
-            mask_static_pixels=mask_static_pixels,
+            static_mask=static_mask,
         )
     return sg.to_volume()
 
@@ -425,7 +513,7 @@ def grid_spheres_streaming(
     q_bounds: tuple[
         tuple[float, float], tuple[float, float], tuple[float, float]
     ] | None = None,
-    mask_static_pixels: bool = True,
+    static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
 ) -> RSMVolume:
     """Stream multiple v2 :class:`EwaldSphere`s into one :class:`RSMVolume`.
@@ -477,6 +565,6 @@ def grid_spheres_streaming(
                 energy,
                 UB=si.UB,
                 roi=si.roi,
-                mask_static_pixels=mask_static_pixels,
+                static_mask=static_mask,
             )
     return sg.to_volume()

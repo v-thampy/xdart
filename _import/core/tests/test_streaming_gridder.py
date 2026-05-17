@@ -313,6 +313,98 @@ class TestStreamingGridder:
         g = _FakeGridder3D.instances[-1]
         assert g.chunks[-1].data.shape == (1, 64, 64)
 
+    def test_p2_chunk_size_independence(self, patched_xu) -> None:
+        """P2 regression: streaming results must NOT depend on chunk_size.
+
+        Pre-fix, the per-chunk std==0 masking made a pixel that was
+        constant within a small chunk get masked, while the same pixel
+        in a single-chunk run wouldn't be — so results drifted with
+        chunk_size.  The fix removes the chunk-local std heuristic in
+        favour of an explicit caller-supplied ``static_mask``.
+        """
+        mapper = _default_mapper(Nch1=16, Nch2=16)
+        # Image stack with at least one column whose intra-chunk-std is 0
+        # for chunk_size=2 but >0 for chunk_size=4 (deliberately
+        # constructed to expose the bug if it ever resurfaces).
+        rng = np.random.default_rng(7)
+        img = rng.random((8, 16, 16)).astype(float)
+        # Column 5 is constant within every adjacent pair (chunk_size=2)
+        for start in range(0, 8, 2):
+            img[start:start + 2, :, 5] = 42.0
+        angles = [np.linspace(0, 0.7, 8)]
+
+        out_chunk2 = grid_img_data_streaming(
+            mapper, img, angles, energy=12000.0,
+            bins=(4, 4, 4), chunk_size=2,
+            q_bounds=((-1, 1), (-1, 1), (-1, 1)),
+        )
+        out_chunk8 = grid_img_data_streaming(
+            mapper, img, angles, energy=12000.0,
+            bins=(4, 4, 4), chunk_size=8,
+            q_bounds=((-1, 1), (-1, 1), (-1, 1)),
+        )
+        out_chunk1 = grid_img_data_streaming(
+            mapper, img, angles, energy=12000.0,
+            bins=(4, 4, 4), chunk_size=1,
+            q_bounds=((-1, 1), (-1, 1), (-1, 1)),
+        )
+        # All three runs see the SAME pixel data because no chunk-local
+        # mask is applied.  Verify by comparing the per-chunk data
+        # arrays the mocked gridder recorded.
+        instances = [
+            inst for inst in _FakeGridder3D.instances
+            if inst.chunks  # ignore the ones that never received data
+        ]
+        # Collapse every gridder's chunk data into one flat array per run
+        flats = [
+            np.concatenate([c.data.ravel() for c in inst.chunks])
+            for inst in instances
+        ]
+        # All three runs should pass identical total pixel counts
+        # (chunk_size only changes how that data is sliced).
+        sizes = [f.size for f in flats]
+        assert sizes[0] == sizes[1] == sizes[2]
+        # And the NaN count must be identical (zero — no static masking).
+        nan_counts = [int(np.sum(np.isnan(f))) for f in flats]
+        assert nan_counts == [0, 0, 0]
+        # Output volumes also have the same shape (sanity).
+        assert out_chunk2.shape == out_chunk8.shape == out_chunk1.shape
+
+    def test_p2_static_mask_applied_per_chunk(self, patched_xu) -> None:
+        """``static_mask`` is applied independently per chunk — the same
+        mask hits every frame regardless of chunk_size.
+        """
+        mapper = _default_mapper(Nch1=8, Nch2=8)
+        img = np.ones((6, 8, 8), dtype=float)
+        angles = [np.linspace(0, 0.5, 6)]
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[0, 0] = True  # mask one pixel
+
+        grid_img_data_streaming(
+            mapper, img, angles, energy=12000.0,
+            bins=(2, 2, 2), chunk_size=2,
+            q_bounds=((-1, 1), (-1, 1), (-1, 1)),
+            static_mask=mask,
+        )
+        # Every chunk should have pixel (0, 0) set to NaN in every frame
+        g = _FakeGridder3D.instances[-1]
+        for chunk in g.chunks:
+            assert np.all(np.isnan(chunk.data[:, 0, 0]))
+            # Other pixels intact
+            assert not np.any(np.isnan(chunk.data[:, 1, 1]))
+
+    def test_p2_static_mask_shape_validation(self, patched_xu) -> None:
+        mapper = _default_mapper(Nch1=8, Nch2=8)
+        sg = StreamingGridder(mapper, (2, 2, 2))
+        sg.set_bounds((-1, 1), (-1, 1), (-1, 1))
+        with pytest.raises(ValueError, match="static_mask shape"):
+            sg.add(
+                np.zeros((2, 8, 8)),
+                [np.array([0.0, 0.1])],
+                energy=12000.0,
+                static_mask=np.zeros((4, 4), dtype=bool),  # wrong shape
+            )
+
 
 # ---------------------------------------------------------------------------
 # grid_img_data_streaming

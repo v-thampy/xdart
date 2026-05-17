@@ -269,9 +269,59 @@ class TestIterSphereChunks:
         for idx in range(4):
             arch = sphere.arches[idx]
             assert arch.lazy_load_calls == 1
-            assert arch.map_raw is not None
         # And the chunks shape-check out
         assert all(c[0].shape == (2, 32, 32) for c in chunks)
+
+    def test_p1_lazy_loaded_frames_freed_after_each_chunk(self) -> None:
+        """P1 regression: arches we materialised ourselves must have
+        ``map_raw`` cleared after the chunk is consumed, otherwise the
+        sphere cache holds every lazy-loaded frame and the streaming
+        memory promise breaks for large v2-reloaded scans.
+        """
+        sphere = _make_sphere(n_frames=6, lazy=True)
+        # All arches start with map_raw=None (lazy=True)
+        for arch in sphere.arches._by_idx.values():
+            assert arch.map_raw is None
+
+        chunks = list(_iter_sphere_chunks(sphere, chunk_size=2))
+        # Chunks themselves are valid
+        assert sum(c[0].shape[0] for c in chunks) == 6
+        # And after iteration, every arch we loaded has been cleared
+        for arch in sphere.arches._by_idx.values():
+            assert arch.lazy_load_calls == 1
+            assert arch.map_raw is None, (
+                f"arch {arch.idx} retained map_raw after iteration — "
+                f"streaming memory promise is broken"
+            )
+
+    def test_p1_pre_populated_frames_left_alone(self) -> None:
+        """P1 corollary: arches that arrived with map_raw populated must
+        NOT be cleared — the user might be holding a reference."""
+        rng = np.random.default_rng(0)
+        pre_loaded = rng.random((32, 32)).astype(np.float32)
+        arches = [
+            _FakeArch(idx=0, image=pre_loaded.copy()),  # NOT lazy
+            _FakeArch(idx=1, image=None, lazy_image=rng.random((32, 32))),
+        ]
+        sphere = _FakeSphere(arches, {"tth": [0.0, 0.1]})
+
+        list(_iter_sphere_chunks(sphere, chunk_size=2))
+        # Arch 0 was pre-populated → still has its image
+        assert sphere.arches[0].map_raw is not None
+        np.testing.assert_array_equal(sphere.arches[0].map_raw, pre_loaded)
+        # Arch 1 was lazy-loaded by us → cleared
+        assert sphere.arches[1].map_raw is None
+
+    def test_p1_clear_happens_even_on_consumer_error(self) -> None:
+        """try/finally semantics: if the consumer raises, we still clear."""
+        sphere = _make_sphere(n_frames=4, lazy=True)
+        with pytest.raises(RuntimeError, match="boom"):
+            for img_chunk, indices in _iter_sphere_chunks(sphere, chunk_size=2):
+                raise RuntimeError("boom")
+        # The first chunk's arches (idx 0, 1) were materialised and must
+        # be cleared even though the consumer raised mid-iteration.
+        assert sphere.arches[0].map_raw is None
+        assert sphere.arches[1].map_raw is None
 
     def test_lazy_load_failure_raises(self) -> None:
         bad = _FakeArch(0, image=None, lazy_fail=True)

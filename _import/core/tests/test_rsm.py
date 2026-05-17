@@ -485,8 +485,112 @@ class TestProcessScanData:
     def test_process_scan_data(self) -> None:
         pass
 
+    def test_p3_streaming_default_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P3 regression: process_scan_data defaults streaming=True so
+        the public SPEC/HDF5 path inherits the memory-bounded gridder."""
+        from ssrl_xrd_tools.rsm import pipeline as pipeline_module
+
+        calls: list[str] = []
+
+        def _fake_streaming(*args: Any, **kwargs: Any) -> RSMVolume:
+            calls.append("streaming")
+            return RSMVolume(
+                h=np.zeros(2), k=np.zeros(2), l=np.zeros(2),
+                intensity=np.zeros((2, 2, 2)),
+            )
+
+        def _fake_single_shot(*args: Any, **kwargs: Any) -> RSMVolume:
+            calls.append("single_shot")
+            return RSMVolume(
+                h=np.zeros(2), k=np.zeros(2), l=np.zeros(2),
+                intensity=np.zeros((2, 2, 2)),
+            )
+
+        monkeypatch.setattr(pipeline_module, "grid_img_data_streaming",
+                            _fake_streaming)
+        monkeypatch.setattr(pipeline_module, "grid_img_data", _fake_single_shot)
+        # Short-circuit the SPEC + image-load chain
+        monkeypatch.setattr(pipeline_module, "get_energy_and_UB",
+                            lambda *a, **k: (12000.0, np.eye(3)))
+        monkeypatch.setattr(pipeline_module, "get_angles",
+                            lambda *a, **k: [np.array([0.0, 0.1])])
+        monkeypatch.setattr(pipeline_module, "load_images",
+                            lambda *a, **k: np.zeros((2, 4, 4), dtype=float))
+        monkeypatch.setattr(pipeline_module, "get_scan_path_info",
+                            lambda name: (name, "1.1"))
+
+        mapper = PixelQMap(
+            diff_config=DiffractometerConfig(),
+            header=DetectorHeader(
+                cch1=2.0, cch2=2.0, pwidth1=0.075, pwidth2=0.075,
+                distance=830.0, Nch1=4, Nch2=4,
+            ),
+        )
+        scan_info = ScanInfo(spec_path=Path("/tmp/x"), img_dir=Path("/tmp/y"))
+
+        # Default call — should pick streaming.
+        pipeline_module.process_scan_data(
+            "test_scan", scan_info, mapper,
+            diff_motors=("tth",), bins=(2, 2, 2),
+        )
+        assert calls == ["streaming"]
+
+        # Explicit streaming=False — should fall back to single-shot.
+        calls.clear()
+        pipeline_module.process_scan_data(
+            "test_scan", scan_info, mapper,
+            diff_motors=("tth",), bins=(2, 2, 2),
+            streaming=False,
+        )
+        assert calls == ["single_shot"]
+
 
 class TestProcessScan:
     @pytest.mark.skip(reason="requires SPEC data and detector images")
     def test_process_scan(self) -> None:
         pass
+
+    def test_p3_chunk_size_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``chunk_size=`` on process_scan must reach grid_img_data_streaming."""
+        from ssrl_xrd_tools.rsm import pipeline as pipeline_module
+
+        captured: dict[str, Any] = {}
+
+        def _fake_streaming(*args: Any, **kwargs: Any) -> RSMVolume:
+            captured.update(kwargs)
+            return RSMVolume(
+                h=np.zeros(2), k=np.zeros(2), l=np.zeros(2),
+                intensity=np.zeros((2, 2, 2)),
+            )
+
+        monkeypatch.setattr(pipeline_module, "grid_img_data_streaming",
+                            _fake_streaming)
+        monkeypatch.setattr(pipeline_module, "get_energy_and_UB",
+                            lambda *a, **k: (12000.0, np.eye(3)))
+        monkeypatch.setattr(pipeline_module, "get_angles",
+                            lambda *a, **k: [np.array([0.0, 0.1])])
+        monkeypatch.setattr(pipeline_module, "load_images",
+                            lambda *a, **k: np.zeros((2, 4, 4), dtype=float))
+        monkeypatch.setattr(pipeline_module, "get_scan_path_info",
+                            lambda name: (name, "1.1"))
+
+        mapper = PixelQMap(
+            diff_config=DiffractometerConfig(),
+            header=DetectorHeader(
+                cch1=2.0, cch2=2.0, pwidth1=0.075, pwidth2=0.075,
+                distance=830.0, Nch1=4, Nch2=4,
+            ),
+        )
+        scan_info = ScanInfo(spec_path=Path("/tmp/x"), img_dir=Path("/tmp/y"))
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline_module.process_scan(
+                "test_scan", scan_info,
+                bins=(2, 2, 2), mapper=mapper,
+                diff_motors=("tth",),
+                pickle_dir=Path(tmp),
+                chunk_size=4,
+                reprocess=True,
+            )
+        assert captured.get("chunk_size") == 4

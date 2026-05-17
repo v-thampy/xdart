@@ -53,8 +53,40 @@ uv pip install xdart       # or: pip install xdart
 Or, library only:
 
 ```bash
-uv pip install ssrl_xrd_tools    # or: pip install ssrl_xrd_tools
+# Minimum headless install (12 deps; sufficient for io / integrate / viz):
+uv pip install ssrl_xrd_tools
+
+# Common notebook user (RSM + phase fitting + Jupyter widgets):
+uv pip install "ssrl_xrd_tools[fitting,rsm,gui]"
+
+# Everything except dev tooling:
+uv pip install "ssrl_xrd_tools[all]"
 ```
+
+#### What each extra enables
+
+The base install is now **headless / scriptable**: just `core`, `io`,
+`integrate`, `viz`.  Domain-specific features live under
+[PEP 621 extras](https://peps.python.org/pep-0621/) so the dependency
+footprint stays modest for batch / pipeline / CI use cases.
+
+| Extra        | What it enables                                              | Packages                                                |
+| ------------ | ------------------------------------------------------------ | ------------------------------------------------------- |
+| *(base)*     | `core`, `io`, `integrate`, `viz` — headless / batch / scripts | numpy, scipy, xarray, h5py, nexusformat, fabio, silx, pyFAI, joblib, natsort, matplotlib, plotly |
+| `[fitting]`  | `analysis.fitting.*` — peak / phase / strain fitting          | lmfit, pymatgen                                         |
+| `[rsm]`      | `rsm.*` — Ang2Q, Gridder3D, VTK export                        | xrayutilities, pyevtk                                   |
+| `[gui]`      | `gui.widgets.*` — Jupyter UI on top of plotly                 | ipywidgets, anywidget, ipyfilechooser                   |
+| `[notebook]` | self-contained Jupyter environment                            | ipykernel, jupyterlab                                   |
+| `[napari]`   | napari 3D viewer for RSM volumes                              | napari                                                  |
+| `[tiled]`    | Tiled client for Bluesky-collected data                       | tiled[client]                                           |
+| `[vtk]`      | back-compat alias for `pyevtk` (now also in `[rsm]`)          | pyevtk                                                  |
+| `[all]`      | everything except dev                                         | `ssrl_xrd_tools[fitting,rsm,gui,notebook,napari,tiled]` |
+| `[dev]`      | test / build / release                                        | pytest, build, twine                                    |
+
+Extras compose: `pip install "ssrl_xrd_tools[fitting,rsm,gui,napari]"`
+gives you the full interactive notebook stack plus napari viewing
+without the heavy `[notebook]` jupyterlab install (assumes you have
+your own Jupyter environment already).
 
 > **Tip — use `uv` if you have it.** [`uv`](https://docs.astral.sh/uv/) is a drop-in pip replacement from Astral that's typically **10–100× faster** on cold installs and ships an aggressive resolver and binary cache. With the scientific-stack dependency tree (pyFAI, h5py, silx, …) the difference is often the gap between a fresh-env install finishing in a few seconds versus several minutes. Install once: `pip install uv` (or `brew install uv` on macOS, `winget install astral-sh.uv` on Windows). Plain `pip` works just as well — just slower.
 
@@ -354,27 +386,38 @@ result = fitter.fit(params)
 
 ## Dependencies
 
-### Core
+The full extras matrix is documented in
+[**Installation → What each extra enables**](#what-each-extra-enables).
+Summary:
 
-- `numpy` — Numerical arrays
-- `scipy` — Scientific computing (interpolation, optimization)
-- `h5py` — HDF5 file access
-- `fabio` — Detector image I/O
-- `silx` — Data visualization toolkit (used for NeXus and HDF5 utilities)
-- `pyFAI` — Azimuthal integration engine
-- `xrayutilities` — Crystallography calculations
-- `joblib` — Parallel processing
-- `natsort` — Human-friendly file sorting
-- `lmfit` — Nonlinear least-squares fitting and peak modeling
+### Base (always installed)
 
-### Optional extras
+- `numpy` / `scipy` — numerical arrays + scientific computing
+- `xarray` — labelled n-D arrays (used in NeXus I/O)
+- `h5py` / `nexusformat` — HDF5 + NeXus file access
+- `fabio` — detector image I/O (TIFF, CBF, EDF, Eiger HDF5, …)
+- `silx` — SPEC-file parsing + HDF5 utilities
+- `pyFAI` — azimuthal integration engine
+- `joblib` — parallel image loading
+- `natsort` — natural file sorting
+- `matplotlib` / `plotly` — `viz.mpl` + `viz.plotly` headless plotting
 
-- **Napari** (`[napari]`) — `napari` viewer integration for 2D/3D image browsing
-- **Tiled** (`[tiled]`) — `tiled[client]` for Bluesky data access
-- **VTK** (`[vtk]`) — `pyevtk` for exporting reciprocal-space volumes to VTK
-- **Development** (`[dev]`) — `pytest`, `build`, `twine`
+### Optional (install via extras)
 
-Install with `pip install 'ssrl-xrd-tools[tiled,vtk]'` or via the installer script.
+| Extra        | Why you'd add it                                                        |
+| ------------ | ----------------------------------------------------------------------- |
+| `[fitting]`  | peak / phase / strain fitting via `analysis.fitting.*` (lmfit, pymatgen) |
+| `[rsm]`      | reciprocal-space mapping via `rsm.*` (xrayutilities, pyevtk)            |
+| `[gui]`      | Jupyter notebook widgets on top of plotly (ipywidgets, anywidget, ipyfilechooser) |
+| `[notebook]` | self-contained Jupyter environment (ipykernel, jupyterlab)              |
+| `[napari]`   | napari 3D viewer for RSM volumes                                        |
+| `[tiled]`    | Tiled client for Bluesky-collected runs                                 |
+| `[vtk]`      | back-compat alias for `pyevtk` (now also in `[rsm]`)                    |
+| `[all]`      | everything except dev                                                    |
+| `[dev]`      | test / build / release tooling (pytest, build, twine)                    |
+
+Combine extras as needed: `pip install "ssrl_xrd_tools[fitting,rsm,gui]"`
+is the typical "Jupyter notebook + RSM + phase fitting" combination.
 
 ## Python Version
 

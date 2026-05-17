@@ -308,7 +308,7 @@ class StreamingGridder:
         *,
         UB: np.ndarray | None = None,
         roi: tuple[int, int, int, int] | None = None,
-        mask_static_pixels: bool = True,
+        static_mask: np.ndarray | None = None,
     ) -> None:
         """Process one chunk of frames and accumulate it into the gridder.
 
@@ -326,12 +326,22 @@ class StreamingGridder:
             Sample orientation matrix.
         roi : (r0, r1, c0, c1), optional
             ROI crop applied to the chunk and to the mapper header.
-        mask_static_pixels : bool
-            Mask pixels whose per-frame variance within the chunk is
-            zero (typically hot/dead pixels).  Default ``True``.  Note:
-            this is a chunk-local check — a pixel that's constant within
-            one chunk but varies across chunks will be masked.  Pass
-            ``False`` if you need cross-chunk variance.
+        static_mask : ndarray of bool, optional
+            2D mask matching the per-frame image shape ``(H, W)``
+            *after* ROI cropping.  ``True`` → pixel is set to NaN
+            before gridding.  Use this to apply a detector / hot-pixel
+            mask consistently across all chunks; computing it from a
+            chunk-local std heuristic (as the old
+            ``mask_static_pixels=True`` did) makes results depend on
+            ``chunk_size``, which is a scientific-reproducibility bug.
+            The single-shot :func:`grid_img_data` retains its own
+            per-frame std heuristic only because there is only one
+            "chunk" (the full stack) — see its docstring.
+
+        Notes
+        -----
+        The chunk-shape contract is ``(n_chunk, H, W)``; ``static_mask``
+        must be ``(H, W)``.  Broadcast is applied along the frame axis.
         """
         if self._gridder is None:
             raise RuntimeError(
@@ -351,9 +361,14 @@ class StreamingGridder:
             r0, r1, c0, c1 = roi
             img = img[:, r0:r1, c0:c1]
 
-        if mask_static_pixels and img.shape[0] > 1:
-            std_dev = np.nanstd(img, axis=0)
-            img[:, std_dev == 0] = np.nan
+        if static_mask is not None:
+            sm = np.asarray(static_mask, dtype=bool)
+            if sm.shape != img.shape[1:]:
+                raise ValueError(
+                    f"static_mask shape {sm.shape} must match per-frame "
+                    f"image shape {img.shape[1:]} (after any ROI crop)"
+                )
+            img[:, sm] = np.nan
 
         qx, qy, qz = self.mapper.pixel_q(
             angles,
@@ -414,14 +429,16 @@ def grid_img_data_streaming(
         tuple[float, float], tuple[float, float], tuple[float, float]
     ] | None = None,
     roi: tuple[int, int, int, int] | None = None,
-    mask_static_pixels: bool = True,
+    static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
 ) -> RSMVolume:
     """Stream a single in-memory image stack through :class:`StreamingGridder`.
 
     Equivalent to :func:`grid_img_data` but memory-bounded: only a
     ``chunk_size``-frame slice of the stack and its q-arrays live in
-    memory at a time.
+    memory at a time.  Importantly the result is **independent of
+    ``chunk_size``** — see :meth:`StreamingGridder.add` for why we use
+    an explicit ``static_mask`` rather than a chunk-local std heuristic.
 
     Parameters
     ----------
@@ -433,6 +450,9 @@ def grid_img_data_streaming(
         Explicit grid bounds.  If omitted, a scout pass over the frame
         corners is run to determine bounds (cheap — no real image data
         is read).
+    static_mask : ndarray of bool, optional
+        2D mask applied to every chunk before gridding.  Apply your
+        detector mask (from pyFAI / a calibration step) here.
     scout_pad : float
         Multiplicative padding applied to scouted bounds.  Ignored if
         ``q_bounds`` is given.
@@ -465,7 +485,7 @@ def grid_img_data_streaming(
             energy,
             UB=UB,
             roi=roi,
-            mask_static_pixels=mask_static_pixels,
+            static_mask=static_mask,
         )
     return sg.to_volume()
 
@@ -479,7 +499,7 @@ def grid_scans_streaming(
     q_bounds: tuple[
         tuple[float, float], tuple[float, float], tuple[float, float]
     ] | None = None,
-    mask_static_pixels: bool = True,
+    static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
 ) -> RSMVolume:
     """Stream multiple in-memory scans into a single :class:`RSMVolume`.
@@ -496,6 +516,10 @@ def grid_scans_streaming(
         Each entry carries its own ``img`` stack, ``angles``, ``energy``,
         ``UB``, and optional ``roi``.  Different scans may have
         different UB / energy / ROI.
+    static_mask : ndarray of bool, optional
+        2D mask applied to every chunk of every scan before gridding.
+        Use this for a detector / hot-pixel mask that's constant across
+        the run.
     """
     if not scans:
         raise ValueError("scans must not be empty")
@@ -522,7 +546,7 @@ def grid_scans_streaming(
                 s.energy,
                 UB=s.UB,
                 roi=s.roi,
-                mask_static_pixels=mask_static_pixels,
+                static_mask=static_mask,
             )
     return sg.to_volume()
 
