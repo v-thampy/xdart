@@ -37,6 +37,7 @@ from ssrl_xrd_tools.io.nexus import (
     write_nexus,
     write_nexus_frame,
 )
+from ssrl_xrd_tools.io.chunk_size import adaptive_chunk_size
 
 try:
     from ssrl_xrd_tools.io.tiled import (

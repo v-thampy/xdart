@@ -26,9 +26,28 @@ The library handles the complete workflow from raw detector images through calib
 
 ## Installation
 
-Most users should install [**xdart**](https://github.com/v-thampy/xdart) — the desktop GUI — which pulls `ssrl_xrd_tools` in as a dependency automatically. If you only want the library (e.g. for headless scripting or Jupyter), follow the same three-step pattern below and install `ssrl_xrd_tools` directly.
+Most users should install [**xdart**](https://github.com/v-thampy/xdart) — the desktop GUI — which pulls `ssrl_xrd_tools` in as a dependency automatically. If you only want the library (e.g. for headless scripting or Jupyter), follow the same four-step pattern below and install `ssrl_xrd_tools` directly.
 
-### Quick install (3 steps)
+### 🚀 Strongly recommended: install [`uv`](https://docs.astral.sh/uv/) first
+
+All install commands below use **[`uv pip`](https://docs.astral.sh/uv/)** instead of plain `pip`. `uv` is a drop-in pip replacement from Astral that's typically **10–100× faster** on cold installs, ships an aggressive resolver, and has a binary cache. With the scientific-stack dependency tree (pyFAI, h5py, silx, xrayutilities, …) the difference is often the gap between a fresh-env install finishing in a few seconds versus several minutes.
+
+**Install `uv` once** — then every install / update command below works:
+
+```bash
+# macOS:
+brew install uv
+# Linux / WSL:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Windows (PowerShell):
+winget install astral-sh.uv
+# Cross-platform fallback (works anywhere Python is installed):
+pip install uv
+```
+
+> **If you'd rather not install uv**, every command below works with plain `pip` — just drop the `uv ` prefix and replace `uv pip install ...` with `pip install ...`. The result is the same, only slower. The full command lookup table at the end of this section shows both forms side-by-side.
+
+### Quick install (4 steps)
 
 **1. Install conda** (skip if you already have `mamba`, `conda`, or an Anaconda Prompt installed).
 
@@ -44,10 +63,12 @@ mamba create -n xrd python=3.12 -y
 mamba activate xrd
 ```
 
-**3. Install xdart (recommended — brings `ssrl_xrd_tools` in automatically):**
+**3. Install [`uv`](https://docs.astral.sh/uv/)** (see the callout above — skip if already installed).
+
+**4. Install xdart** (recommended — brings `ssrl_xrd_tools` in automatically):
 
 ```bash
-uv pip install xdart       # or: pip install xdart
+uv pip install xdart
 ```
 
 Or, library only:
@@ -62,6 +83,19 @@ uv pip install "ssrl_xrd_tools[fitting,rsm,gui]"
 # Everything except dev tooling:
 uv pip install "ssrl_xrd_tools[all]"
 ```
+
+#### Plain-pip equivalents
+
+If you skipped the `uv` install step, use these instead:
+
+| With `uv` (recommended)                                       | Plain `pip` (slower)                                       |
+| ------------------------------------------------------------- | ---------------------------------------------------------- |
+| `uv pip install xdart`                                        | `pip install xdart`                                        |
+| `uv pip install ssrl_xrd_tools`                               | `pip install ssrl_xrd_tools`                               |
+| `uv pip install "ssrl_xrd_tools[fitting,rsm,gui]"`            | `pip install "ssrl_xrd_tools[fitting,rsm,gui]"`            |
+| `uv pip install "ssrl_xrd_tools[all]"`                        | `pip install "ssrl_xrd_tools[all]"`                        |
+| `uv pip install -U xdart`                                     | `pip install -U xdart`                                     |
+| `uv pip install -e ./ssrl_xrd_tools`                          | `pip install -e ./ssrl_xrd_tools`                          |
 
 #### What each extra enables
 
@@ -83,18 +117,18 @@ footprint stays modest for batch / pipeline / CI use cases.
 | `[all]`      | everything except dev                                         | `ssrl_xrd_tools[fitting,rsm,gui,notebook,napari,tiled]` |
 | `[dev]`      | test / build / release                                        | pytest, build, twine                                    |
 
-Extras compose: `pip install "ssrl_xrd_tools[fitting,rsm,gui,napari]"`
+Extras compose: `uv pip install "ssrl_xrd_tools[fitting,rsm,gui,napari]"`
 gives you the full interactive notebook stack plus napari viewing
 without the heavy `[notebook]` jupyterlab install (assumes you have
 your own Jupyter environment already).
-
-> **Tip — use `uv` if you have it.** [`uv`](https://docs.astral.sh/uv/) is a drop-in pip replacement from Astral that's typically **10–100× faster** on cold installs and ships an aggressive resolver and binary cache. With the scientific-stack dependency tree (pyFAI, h5py, silx, …) the difference is often the gap between a fresh-env install finishing in a few seconds versus several minutes. Install once: `pip install uv` (or `brew install uv` on macOS, `winget install astral-sh.uv` on Windows). Plain `pip` works just as well — just slower.
 
 ### Updating
 
 ```bash
 mamba activate xrd
-uv pip install -U xdart    # or: pip install -U xdart / ssrl_xrd_tools
+uv pip install -U xdart                # or:  pip install -U xdart
+# library only:
+uv pip install -U ssrl_xrd_tools       # or:  pip install -U ssrl_xrd_tools
 ```
 
 ### Editable / developer install
@@ -103,8 +137,8 @@ uv pip install -U xdart    # or: pip install -U xdart / ssrl_xrd_tools
 git clone -b dev https://github.com/v-thampy/ssrl_xrd_tools.git
 git clone -b dev https://github.com/v-thampy/xdart.git         # optional
 mamba activate xrd
-uv pip install -e ./ssrl_xrd_tools    # or: pip install -e ./ssrl_xrd_tools
-uv pip install -e ./xdart             # optional
+uv pip install -e ./ssrl_xrd_tools     # or:  pip install -e ./ssrl_xrd_tools
+uv pip install -e ./xdart              # or:  pip install -e ./xdart   (optional)
 ```
 
 ### Conda-forge (in progress)
