@@ -724,6 +724,15 @@ class specThread(wranglerThread):
         # incidence angle differs, that worker falls back to a
         # locally-built fiber integrator at the right angle.
         self._cached_gi_incident_angle = incident_angle
+        # Q3: ``_borrow_fiber_integrator`` (the shared helper used
+        # by parallel workers) looks the angle up on the *sphere*,
+        # not on the wrangler instance, because it doesn't have a
+        # handle to the wrangler.  The NeXus prewarm sets the
+        # sphere attribute too; pre-Q3 the SPEC prewarm only set
+        # the wrangler attribute, so the borrow helper always saw
+        # cached_angle=None and built worker-local FiberIntegrators
+        # per frame — defeating the pool we just constructed.
+        sphere._cached_fiber_integrator_angle = incident_angle
 
     def _dispatch_batch_parallel(self, sphere, pending):
         """Parallel batch processing using ThreadPoolExecutor.

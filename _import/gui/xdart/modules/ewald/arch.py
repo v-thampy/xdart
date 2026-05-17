@@ -396,6 +396,40 @@ class EwaldArch():
         self.gi_1d = {}
         self.gi_2d = {}
             
+    def _resolve_monitor_norm(self, monitor) -> float:
+        """Resolve the monitor normalization scalar for this arch.
+
+        Centralises the lookup that ``integrate_1d`` and ``integrate_2d``
+        do independently — pre-fix ``integrate_2d`` set ``map_norm = 1``
+        unconditionally when ``monitor`` was provided, silently
+        skipping normalization, and never reset it when ``monitor``
+        was None (so a prior ``integrate_1d`` value leaked through).
+
+        Behaviour:
+
+        * ``monitor is None`` → return 1.0 (no normalization).  Always
+          reset state — don't inherit from a previous call.
+        * ``monitor.upper()`` in ``scan_info`` → use that value.
+        * ``monitor.lower()`` in ``scan_info`` → use that value (back-
+          compat with lowercase counter names some SPEC setups use).
+        * monitor not found → return 1.0 and log debug.
+
+        Returns the resolved scalar; callers are expected to assign
+        it to ``self.map_norm`` so the integrator divides by it.
+        """
+        if monitor is None:
+            return 1.0
+        if monitor.upper() in self.scan_info:
+            return float(self.scan_info[monitor.upper()])
+        if monitor.lower() in self.scan_info:
+            return float(self.scan_info[monitor.lower()])
+        import logging as _logging
+        _logging.getLogger(__name__).debug(
+            "monitor=%r not in scan_info keys=%s; using 1.0",
+            monitor, list(self.scan_info.keys()),
+        )
+        return 1.0
+
     def get_mask(self, global_mask=None):
         shape = self.map_raw.shape
         size = self.map_raw.size
@@ -439,12 +473,11 @@ class EwaldArch():
             if self.map_raw is None:
                 return  # no raw data and no source — cannot re-integrate
 
-            self.map_norm = 1
-            if monitor is not None:
-                if monitor.upper() in self.scan_info.keys():
-                    self.map_norm = self.scan_info[monitor.upper()]
-                elif monitor.lower() in self.scan_info.keys():
-                    self.map_norm = self.scan_info[monitor.lower()]
+            # Q1 (post-0.37.1 review): use the shared helper instead of
+            # the inline scan_info lookup so 1D and 2D integration paths
+            # agree on what "monitor=…" means.  ``map_norm`` is always
+            # reset (no inheritance from a prior call's value).
+            self.map_norm = self._resolve_monitor_norm(monitor)
 
             if self.mask is None:
                 self.mask = np.arange(self.map_raw.size)[self.map_raw.flatten() < 0]
@@ -584,8 +617,12 @@ class EwaldArch():
             if self.map_raw is None:
                 return  # no raw data and no source — cannot re-integrate
 
-            if monitor is not None:
-                self.map_norm = 1
+            # Q1: 2D normalization was effectively broken — pre-fix
+            # this set ``map_norm = 1`` (no normalization) whenever
+            # ``monitor`` was provided, and didn't reset state when
+            # ``monitor`` was None.  Use the shared helper so 1D
+            # and 2D agree on the lookup.
+            self.map_norm = self._resolve_monitor_norm(monitor)
 
             if self.mask is None:
                 self.mask = np.arange(self.map_raw.size)[self.map_raw.flatten() < 0]
