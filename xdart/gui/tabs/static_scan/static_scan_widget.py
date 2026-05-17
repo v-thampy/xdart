@@ -431,20 +431,18 @@ class staticWidget(QWidget):
                 logger.debug("In-memory arch hand-off failed for idx=%s",
                              idx, exc_info=True)
 
-        # ``file_lock`` deliberately not held here: ``latest_arch()``
-        # and ``h5viewer.update_data()`` both only touch Qt widgets +
-        # integer attrs — no h5 file I/O.  The old code wrapped this
-        # in ``with self.file_lock`` and that lock was contended by
-        # the wrangler's per-frame save path, causing visible
-        # stutter during live mode whenever the list-widget rebuild
-        # crossed a save boundary.  Updates run on the main thread so
-        # the writes to ``latest_idx`` / ``auto_last`` are race-free
-        # against other slots fired on the same thread; the wrangler
-        # thread only signals (queued).
+        # P4: per-frame the *only* thing we do is remember the latest
+        # idx + restart the coalescing timer.  The heavy list-widget
+        # rebuild (``h5viewer.update_data()``) and the cursor advance
+        # (``latest_arch()``) both fire from ``_flush_pending_update``
+        # after the 200 ms quiet period — running them per-frame made
+        # the GUI O(N) per frame (full list clear + insertItems for
+        # every new frame in a long scan), which compounded to O(N²)
+        # over the run and showed up as visible stutter on slow
+        # machines / very long scans.  The latest_idx assignment is
+        # cheap and must stay per-frame so the flush handler knows
+        # which frame to advance the cursor to.
         self.h5viewer.latest_idx = idx
-        if self.h5viewer.auto_last:
-            self.latest_arch()
-        self.h5viewer.update_data()
 
         # Record the latest index and (re)start the coalescing timer.
         # If the timer is already running, restart resets the countdown
@@ -456,12 +454,27 @@ class staticWidget(QWidget):
         """Render the most recently received wrangler update.
 
         Called by _update_timer after a short quiet period (200 ms).
-        This ensures the display always shows the latest data without
-        burning CPU on intermediate frames the user never sees.
+        Coalesces all per-frame GUI work that doesn't have to happen
+        immediately:
+
+        * ``h5viewer.update_data()`` — refresh the listData widget
+          (incremental append when possible — see
+          :meth:`h5viewer.update_data`).
+        * ``latest_arch()`` — advance the auto-last cursor to whatever
+          ``latest_idx`` is now (P4: was per-frame, now per-flush so
+          we don't rebuild the list widget more than once per timer
+          tick).
+        * ``displayframe.update()`` + ``metawidget.update()`` — repaint
+          the 2D image, 1D pattern, and metadata table.
         """
         if self._pending_update_idx is None:
             return
         self._pending_update_idx = None
+        # Heavy list-widget refresh first — auto-last cursor needs the
+        # list to contain the new index before it can select it.
+        self.h5viewer.update_data()
+        if self.h5viewer.auto_last:
+            self.latest_arch()
         self.displayframe.update()
         self.metawidget.update()
 

@@ -560,6 +560,21 @@ class H5Viewer(QWidget):
     
     def update_data(self):
         """Updates list with all arch ids.
+
+        Fast paths in order of likelihood for a live scan:
+
+        1. ``_idxs == items`` — list already shows everything the sphere
+           knows about (timer tick fired but no new frames since last
+           flush).  Just refresh the cursor if auto_last is on, done.
+        2. **P4 fast path**: ``_idxs`` is exactly ``items + tail`` — the
+           sphere appended new frames and the existing list is intact.
+           ``addItems(tail)`` instead of clearing + re-inserting all
+           items, so per-flush cost is O(new) not O(N).  Critical for
+           long scans: the previous code rebuilt the entire list every
+           time a frame arrived, which compounded to O(N²) over a run.
+        3. Slow path — full rebuild.  Used on out-of-order inserts,
+           reorderings, file reloads, anything that doesn't match the
+           append-only pattern.
         """
         if self.sphere.name == "null_main":
             return
@@ -574,7 +589,6 @@ class H5Viewer(QWidget):
 
         lw = self.ui.listData
         items = [lw.item(x).text() for x in range(lw.count())]
-        eq = _idxs == items
 
         if (len(_idxs) > 1) and (_idxs == items):
             if self.new_scan_loaded:
@@ -597,6 +611,38 @@ class H5Viewer(QWidget):
                 for item in matched:
                     self.ui.listData.setCurrentItem(item)
                 self.ui.listData.blockSignals(False)
+                self.data_changed()
+            return
+
+        # ── P4 incremental-append fast path ─────────────────────────
+        # The common case during a live scan: the sphere just gained
+        # one or more frames at the tail; everything else is the same.
+        # Avoid the full clear + insertItems(0, _idxs) rebuild and
+        # just addItems(new_tail), which is O(len(tail)) instead of
+        # O(len(_idxs)).  Guarded by:
+        #   - existing items are a strict prefix of _idxs (no inserts
+        #     in the middle, no relabels);
+        #   - we're not in the post-load "clear selection" path
+        #     (new_scan_loaded already handled by the equal-list
+        #     branch above, but we re-check here defensively);
+        #   - the listWidget isn't empty (clear+insert is cheaper for
+        #     small N anyway, and avoids fiddling with first-load
+        #     selection semantics).
+        if (len(items) >= 1
+                and len(_idxs) > len(items)
+                and _idxs[: len(items)] == items
+                and not self.new_scan_loaded):
+            new_tail = _idxs[len(items):]
+            self.ui.listData.blockSignals(True)
+            self.ui.listData.addItems(new_tail)
+            if self.auto_last and isinstance(self.latest_idx, int):
+                matched = self.ui.listData.findItems(
+                    str(self.latest_idx), QtCore.Qt.MatchExactly,
+                )
+                for item in matched:
+                    self.ui.listData.setCurrentItem(item)
+            self.ui.listData.blockSignals(False)
+            if self.auto_last:
                 self.data_changed()
             return
 
