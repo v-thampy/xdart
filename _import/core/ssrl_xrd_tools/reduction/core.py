@@ -58,6 +58,7 @@ class Frame:
     metadata: dict[str, Any] = field(default_factory=dict)
     source_path: Path | str | None = None
     source_frame_index: int | None = None
+    background: np.ndarray | float | None = None
     mask: np.ndarray | None = None
     normalization_factor: float | None = None
     loader: ImageLoader | None = None
@@ -182,8 +183,10 @@ class ReductionPlan:
     error_model: str | None = None
     polarization_factor: float | None = None
     normalization_factors: Mapping[int, float] | None = None
+    monitor_key: str | None = None
     threshold_min: float | None = None
     threshold_max: float | None = None
+    azimuth_offset: float = 0.0
     chunk_size: int = 1
     clear_frame_images: bool = False
     gi_incident_angle: float | None = None
@@ -369,8 +372,10 @@ def run_reduction(
                 _emit(progress_cb, scan.name, "load", frame.index, completed, total)
                 image = np.asarray(frame.load_image(), dtype=float)
                 image = _apply_thresholds(image, plan)
+                image = _subtract_background(image, frame.background)
                 mask = _combined_mask(plan.mask, frame.mask)
                 norm = _normalization_for(frame, plan)
+                azimuth_range = _integration_azimuth_range(plan)
 
                 _emit(progress_cb, scan.name, "integrate", frame.index, completed, total)
                 if plan.gi:
@@ -383,7 +388,7 @@ def run_reduction(
                             method=plan.gi_method,
                             mask=mask,
                             radial_range=plan.radial_range,
-                            azimuth_range=plan.azimuth_range,
+                            azimuth_range=azimuth_range,
                             **plan.extra_1d,
                         )
                         if plan.integrate_1d else None
@@ -398,7 +403,7 @@ def run_reduction(
                             method=plan.gi_method,
                             mask=mask,
                             radial_range=plan.radial_range,
-                            azimuth_range=plan.azimuth_range,
+                            azimuth_range=azimuth_range,
                             **plan.extra_2d,
                         )
                         if plan.integrate_2d else None
@@ -413,7 +418,7 @@ def run_reduction(
                             method=plan.method_1d,
                             mask=mask,
                             radial_range=plan.radial_range,
-                            azimuth_range=plan.azimuth_range,
+                            azimuth_range=azimuth_range,
                             error_model=plan.error_model,
                             polarization_factor=plan.polarization_factor,
                             normalization_factor=norm,
@@ -431,7 +436,7 @@ def run_reduction(
                             method=plan.method_2d,
                             mask=mask,
                             radial_range=plan.radial_range,
-                            azimuth_range=plan.azimuth_range,
+                            azimuth_range=azimuth_range,
                             error_model=plan.error_model,
                             polarization_factor=plan.polarization_factor,
                             normalization_factor=norm,
@@ -439,6 +444,8 @@ def run_reduction(
                         )
                         if plan.integrate_2d else None
                     )
+                    if r2d is not None and plan.azimuth_offset:
+                        r2d.azimuthal = r2d.azimuthal + float(plan.azimuth_offset)
 
                 reduction = FrameReduction(
                     frame_index=frame.index,
@@ -481,6 +488,27 @@ def _apply_thresholds(image: np.ndarray, plan: ReductionPlan) -> np.ndarray:
     return out
 
 
+def _subtract_background(
+    image: np.ndarray,
+    background: np.ndarray | float | None,
+) -> np.ndarray:
+    if background is None:
+        return image
+    return image - np.asarray(background, dtype=float)
+
+
+def _integration_azimuth_range(
+    plan: ReductionPlan,
+) -> tuple[float, float] | None:
+    if plan.azimuth_range is None:
+        return None
+    if not plan.azimuth_offset:
+        return plan.azimuth_range
+    lo, hi = plan.azimuth_range
+    offset = float(plan.azimuth_offset)
+    return lo - offset, hi - offset
+
+
 def _combined_mask(
     plan_mask: np.ndarray | None,
     frame_mask: np.ndarray | None,
@@ -497,6 +525,19 @@ def _normalization_for(frame: Frame, plan: ReductionPlan) -> float | None:
         return float(plan.normalization_factors[frame.index])
     if frame.normalization_factor is not None:
         return float(frame.normalization_factor)
+    if plan.monitor_key is not None:
+        key = plan.monitor_key
+        value = frame.metadata.get(key)
+        if value is None:
+            value = frame.metadata.get(key.upper())
+        if value is None:
+            value = frame.metadata.get(key.lower())
+        try:
+            norm = float(value)
+        except (TypeError, ValueError):
+            return None
+        if np.isfinite(norm) and norm != 0:
+            return norm
     return None
 
 

@@ -112,6 +112,7 @@ def test_run_reduction_1d_2d_mask_threshold_norm_and_progress(
             Frame(
                 index=0,
                 image=np.array([[1.0, 2.0], [100.0, -5.0]]),
+                background=np.ones((2, 2)),
                 mask=np.array([[False, True], [False, False]]),
             )
         ],
@@ -149,10 +150,53 @@ def test_run_reduction_1d_2d_mask_threshold_norm_and_progress(
         np.array([[False, True], [True, False]]),
     )
     assert not np.isnan(calls[0]["image"][0, 1])  # mask passed separately
+    assert calls[0]["image"][0, 0] == 0.0  # background subtracted
     assert np.isnan(calls[0]["image"][1, 0])  # threshold_max
     assert np.isnan(calls[0]["image"][1, 1])  # threshold_min
     assert calls[1]["npt_rad"] == 6
     assert calls[1]["npt_azim"] == 7
+
+
+def test_run_reduction_monitor_key_and_azimuth_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    def fake_1d(image, ai, **kwargs):
+        calls.append({"kind": "1d", **kwargs})
+        return _r1d(1.0)
+
+    def fake_2d(image, ai, **kwargs):
+        calls.append({"kind": "2d", **kwargs})
+        return IntegrationResult2D(
+            radial=np.array([0.0, 1.0]),
+            azimuthal=np.array([-5.0, 5.0]),
+            intensity=np.ones((2, 2)),
+            unit=kwargs["unit"],
+        )
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", fake_1d)
+    monkeypatch.setattr(reduction_core, "integrate_2d", fake_2d)
+
+    result = run_reduction(
+        ReductionPlan(
+            integrate_2d=True,
+            monitor_key="i0",
+            azimuth_range=(80.0, 100.0),
+            azimuth_offset=90.0,
+        ),
+        Scan(
+            "scan",
+            [Frame(0, image=np.ones((2, 2)), metadata={"I0": 25.0})],
+            integrator=object(),
+        ),
+    )
+
+    assert calls[0]["normalization_factor"] == 25.0
+    assert calls[0]["azimuth_range"] == (-10.0, 10.0)
+    assert calls[1]["normalization_factor"] == 25.0
+    assert calls[1]["azimuth_range"] == (-10.0, 10.0)
+    np.testing.assert_allclose(result.frames[0].result_2d.azimuthal, [85.0, 95.0])
 
 
 def test_run_reduction_cancellation_and_clear_images(
