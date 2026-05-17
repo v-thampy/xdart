@@ -5,12 +5,16 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from ssrl_xrd_tools.core.containers import PONI
+from ssrl_xrd_tools.reduction import FrameReduction, ReductionPlan, ReductionResult
 
 from xdart.modules.ewald import EwaldArch, EwaldSphere
+import xdart.modules.reduction as reduction_adapters
 from xdart.modules.reduction import (
     frame_from_ewald_arch,
     plan_from_ewald_sphere,
+    reduce_ewald_arch,
     scan_from_ewald_sphere,
 )
 
@@ -25,11 +29,31 @@ def _poni() -> PONI:
     )
 
 
+def _r1d() -> IntegrationResult1D:
+    return IntegrationResult1D(
+        radial=np.array([0.0, 1.0]),
+        intensity=np.array([10.0, 11.0]),
+        sigma=None,
+        unit="q_A^-1",
+    )
+
+
+def _r2d() -> IntegrationResult2D:
+    return IntegrationResult2D(
+        radial=np.array([0.0, 1.0]),
+        azimuthal=np.array([-90.0, 90.0]),
+        intensity=np.ones((2, 2)),
+        sigma=None,
+        unit="q_A^-1",
+    )
+
+
 def test_frame_from_ewald_arch_maps_simple_fields(tmp_path) -> None:
     arch = EwaldArch(
         idx=4,
         map_raw=np.arange(4).reshape(2, 2),
         poni=_poni(),
+        bg_raw=np.ones((2, 2)),
         mask=np.array([1, 3]),
         scan_info={"th": 1.2, "i0": 99.0},
     )
@@ -49,6 +73,7 @@ def test_frame_from_ewald_arch_maps_simple_fields(tmp_path) -> None:
     assert frame.metadata["th"] == 1.2
     assert frame.source_path == tmp_path / "frame_0004.tif"
     assert frame.source_frame_index == 2
+    np.testing.assert_array_equal(frame.background, np.ones((2, 2)))
     assert frame.normalization_factor == 5.0
 
 
@@ -81,10 +106,12 @@ def test_plan_from_ewald_sphere_maps_integration_settings() -> None:
         "scan",
         arches=[arch],
         bai_1d_args={
-            "npt": 123,
+            "numpoints": 123,
             "unit": "2th_deg",
             "method": "BBox",
             "radial_range": (1.0, 2.0),
+            "monitor": "i0",
+            "chi_offset": 90.0,
         },
         bai_2d_args={
             "npt_rad": 20,
@@ -107,6 +134,8 @@ def test_plan_from_ewald_sphere_maps_integration_settings() -> None:
     assert plan.method_2d == "csr"
     assert plan.radial_range == (1.0, 2.0)
     assert plan.azimuth_range == (-10.0, 10.0)
+    assert plan.monitor_key == "i0"
+    assert plan.azimuth_offset == 90.0
     assert plan.chunk_size == 4
     np.testing.assert_array_equal(
         plan.mask,
@@ -124,3 +153,49 @@ def test_plan_from_gi_sphere_requires_incident_angle() -> None:
         assert "gi_incident_angle" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected missing GI angle to fail")
+
+
+def test_reduce_ewald_arch_populates_existing_arch(monkeypatch) -> None:
+    arch = EwaldArch(
+        idx=7,
+        map_raw=np.arange(4).reshape(2, 2),
+        poni=_poni(),
+        bg_raw=np.ones((2, 2)),
+        scan_info={"I0": 33.0},
+        mask=np.array([0]),
+    )
+    plan = ReductionPlan(integrate_1d=True, integrate_2d=True, monitor_key="i0")
+
+    def fake_run_reduction(plan_arg, scan_arg):
+        assert plan_arg.monitor_key == "i0"
+        assert scan_arg.name == "scan"
+        assert scan_arg.integrator == "ai"
+        np.testing.assert_array_equal(scan_arg.frames[0].background, np.ones((2, 2)))
+        np.testing.assert_array_equal(
+            scan_arg.frames[0].mask,
+            np.array([[True, False], [False, False]]),
+        )
+        np.testing.assert_array_equal(
+            plan_arg.mask,
+            np.array([[False, False], [False, True]]),
+        )
+        return ReductionResult(
+            scan_name="scan",
+            frames={7: FrameReduction(7, result_1d=_r1d(), result_2d=_r2d())},
+            n_processed=1,
+        )
+
+    monkeypatch.setattr(reduction_adapters, "run_reduction", fake_run_reduction)
+
+    returned = reduce_ewald_arch(
+        arch,
+        plan,
+        scan_name="scan",
+        global_mask=np.array([3]),
+        integrator="ai",
+    )
+
+    assert returned is arch
+    assert arch.int_1d is not None
+    assert arch.int_2d is not None
+    assert arch.map_norm == 33.0
