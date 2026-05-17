@@ -60,6 +60,7 @@ from ssrl_xrd_tools.io.image import read_image
 from ssrl_xrd_tools.io.export import write_xye
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.utils.integrator_pool import ensure_integrator_pool
+from xdart.modules.reduction import plan_from_ewald_sphere, reduce_ewald_arch
 from .wrangler_widget import wranglerThread
 
 logger = logging.getLogger(__name__)
@@ -496,33 +497,41 @@ class nexusThread(wranglerThread):
                 mask=arch_mask,
             )
 
-            # GI fiber integrator: pre-warmed on the main thread for
-            # frame 0's incidence angle.  Reuse it when this frame's
-            # angle matches; otherwise build a worker-local one at
-            # the right angle.  Sin²ψ scans (fixed ω) stay on the
-            # fast cached path; ω-varying scans get correct results
-            # at the cost of one per-frame fiber-integrator build.
-            #
-            # H2: when reusing the cached integrator we BORROW a
-            # per-worker deepcopy from ``fiber_pool`` rather than
-            # share the single sphere-level instance — pyFAI's
-            # FiberIntegrator inherits the same CSR-scratch-buffer
-            # mutation pattern as AzimuthalIntegrator and is not
-            # safe across concurrent inputs.
-            with self._borrow_fiber_integrator(
-                sphere, fiber_pool, arch,
-            ) as fi:
-                arch.integrate_1d(
-                    global_mask=self.mask,
-                    fiber_integrator=fi,
-                    **sphere.bai_1d_args,
-                )
-                if not sphere.skip_2d:
-                    arch.integrate_2d(
+            if self.gi:
+                # GI fiber integrator: pre-warmed on the main thread for
+                # frame 0's incidence angle.  Reuse it when this frame's
+                # angle matches; otherwise build a worker-local one at
+                # the right angle.  Sin²ψ scans (fixed ω) stay on the
+                # fast cached path; ω-varying scans get correct results
+                # at the cost of one per-frame fiber-integrator build.
+                with self._borrow_fiber_integrator(
+                    sphere, fiber_pool, arch,
+                ) as fi:
+                    arch.integrate_1d(
                         global_mask=self.mask,
                         fiber_integrator=fi,
-                        **sphere.bai_2d_args,
+                        **sphere.bai_1d_args,
                     )
+                    if not sphere.skip_2d:
+                        arch.integrate_2d(
+                            global_mask=self.mask,
+                            fiber_integrator=fi,
+                            **sphere.bai_2d_args,
+                        )
+            else:
+                plan = plan_from_ewald_sphere(
+                    sphere,
+                    integrate_1d=True,
+                    integrate_2d=not sphere.skip_2d,
+                    chunk_size=1,
+                )
+                reduce_ewald_arch(
+                    arch,
+                    plan,
+                    scan_name=sphere.name,
+                    global_mask=self.mask,
+                    integrator=ai,
+                )
 
         # Detach the pool integrator from the arch — once the `with`
         # exits, another worker can borrow this same instance.  The

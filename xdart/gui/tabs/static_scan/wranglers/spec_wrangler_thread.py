@@ -46,6 +46,7 @@ from ssrl_xrd_tools.io.nexus import find_nexus_image_dataset
 from ssrl_xrd_tools.io.metadata import read_image_metadata
 from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
+from xdart.modules.reduction import plan_from_ewald_sphere, reduce_ewald_arch
 from .wrangler_widget import wranglerThread
 
 
@@ -812,6 +813,15 @@ class specThread(wranglerThread):
         bai_2d_args = dict(sphere.bai_2d_args)
         mask = self.mask
         gi = self.gi
+        standard_plan = (
+            plan_from_ewald_sphere(
+                sphere,
+                integrate_1d=True,
+                integrate_2d=not skip_2d,
+                chunk_size=1,
+            )
+            if not gi else None
+        )
         th_mtr = self.incidence_motor
         sample_orientation = self.sample_orientation
         tilt_angle = self.tilt_angle
@@ -857,28 +867,35 @@ class specThread(wranglerThread):
                     mask=arch_mask,
                 )
 
-                # H2: GI fiber integrator goes through the shared
-                # _borrow_fiber_integrator helper.  When the frame's
-                # incidence angle matches the prewarm cache (the
-                # sin²ψ common path) it borrows a private deepcopy
-                # from fiber_pool — same fix as IntegratorPool for
-                # the standard AzimuthalIntegrator.  Otherwise it
-                # builds a worker-local fiber integrator (ω-varying
-                # fall-back; slow but correct, single worker only).
-                with self._borrow_fiber_integrator(
-                    sphere, fiber_pool, arch,
-                ) as _fi:
-                    arch.integrate_1d(
-                        global_mask=mask,
-                        fiber_integrator=_fi,
-                        **bai_1d_args,
-                    )
-                    if not skip_2d:
-                        arch.integrate_2d(
+                if gi:
+                    # H2: GI fiber integrator goes through the shared
+                    # _borrow_fiber_integrator helper.  When the frame's
+                    # incidence angle matches the prewarm cache (the
+                    # sin²ψ common path) it borrows a private deepcopy
+                    # from fiber_pool.  Otherwise it builds a worker-local
+                    # fiber integrator at the correct angle.
+                    with self._borrow_fiber_integrator(
+                        sphere, fiber_pool, arch,
+                    ) as _fi:
+                        arch.integrate_1d(
                             global_mask=mask,
                             fiber_integrator=_fi,
-                            **bai_2d_args,
+                            **bai_1d_args,
                         )
+                        if not skip_2d:
+                            arch.integrate_2d(
+                                global_mask=mask,
+                                fiber_integrator=_fi,
+                                **bai_2d_args,
+                            )
+                else:
+                    reduce_ewald_arch(
+                        arch,
+                        standard_plan,
+                        scan_name=sphere.name,
+                        global_mask=mask,
+                        integrator=ai,
+                    )
 
             # Detach the pool integrator from this arch — once the
             # `with` block exited, the next worker can borrow this
@@ -1053,21 +1070,38 @@ class specThread(wranglerThread):
                 self._cached_gi_incident_angle = _incident_angle
 
         _t2 = time.time()
-        arch.integrate_1d(
-            global_mask=self.mask,
-            fiber_integrator=sphere._cached_fiber_integrator,
-            **sphere.bai_1d_args,
-        )
-        _t_1d = time.time() - _t2
-
-        _t3 = time.time()
-        if not sphere.skip_2d:
-            arch.integrate_2d(
+        if self.gi:
+            arch.integrate_1d(
                 global_mask=self.mask,
                 fiber_integrator=sphere._cached_fiber_integrator,
-                **sphere.bai_2d_args,
+                **sphere.bai_1d_args,
             )
-        _t_2d = time.time() - _t3
+            _t_1d = time.time() - _t2
+
+            _t3 = time.time()
+            if not sphere.skip_2d:
+                arch.integrate_2d(
+                    global_mask=self.mask,
+                    fiber_integrator=sphere._cached_fiber_integrator,
+                    **sphere.bai_2d_args,
+                )
+            _t_2d = time.time() - _t3
+        else:
+            plan = plan_from_ewald_sphere(
+                sphere,
+                integrate_1d=True,
+                integrate_2d=not sphere.skip_2d,
+                chunk_size=1,
+            )
+            reduce_ewald_arch(
+                arch,
+                plan,
+                scan_name=sphere.name,
+                global_mask=self.mask,
+                integrator=sphere._cached_integrator,
+            )
+            _t_1d = time.time() - _t2
+            _t_2d = 0.0
 
         # ── GUI data (skip in batch mode — no one is looking) ────────────
         _t_h5_total = _t_h5_wait = _t_h5_write = 0.0

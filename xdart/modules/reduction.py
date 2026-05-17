@@ -8,12 +8,13 @@ new headless reduction work should cross into ``ssrl_xrd_tools`` as
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Any
 
 import numpy as np
 
-from ssrl_xrd_tools.reduction import Frame, ReductionPlan, Scan
+from ssrl_xrd_tools.reduction import Frame, ReductionPlan, Scan, run_reduction
 
 
 def frame_from_ewald_arch(
@@ -36,6 +37,7 @@ def frame_from_ewald_arch(
         metadata=metadata,
         source_path=source_path,
         source_frame_index=int(getattr(arch, "source_frame_idx", 0) or 0),
+        background=getattr(arch, "bg_raw", None),
         mask=mask,
         normalization_factor=_normalization_factor(arch),
     )
@@ -98,22 +100,33 @@ def plan_from_ewald_sphere(
 
     args_1d = dict(getattr(sphere, "bai_1d_args", {}) or {})
     args_2d = dict(getattr(sphere, "bai_2d_args", {}) or {})
-    unit_1d = args_1d.pop("unit", None)
-    unit_2d = args_2d.pop("unit", None)
+    unit_1d = _pop_first(args_1d, ("unit",), None)
+    unit_2d = _pop_first(args_2d, ("unit",), None)
     unit = str(unit_1d if unit_1d is not None else (unit_2d or "q_A^-1"))
-    method_1d = str(args_1d.pop("method", "csr"))
-    method_2d = str(args_2d.pop("method", method_1d))
-    npt_1d = int(args_1d.pop("npt", args_1d.pop("npt_rad", 1000)))
+    method_1d = str(_pop_first(args_1d, ("method",), "csr"))
+    method_2d = str(_pop_first(args_2d, ("method",), method_1d))
+    npt_1d = int(_pop_first(args_1d, ("npt", "numpoints", "npt_rad"), 1000))
     npt_rad_2d, npt_azim_2d = _npt_2d(args_2d)
-    radial_range = args_1d.pop("radial_range", args_2d.pop("radial_range", None))
-    azimuth_range = args_1d.pop("azimuth_range", args_2d.pop("azimuth_range", None))
-    error_model = args_1d.pop("error_model", args_2d.pop("error_model", None))
-    polarization_factor = args_1d.pop(
-        "polarization_factor",
-        args_2d.pop("polarization_factor", None),
-    )
-    args_1d.pop("normalization_factor", None)
-    args_2d.pop("normalization_factor", None)
+    radial_range = _pop_first(args_1d, ("radial_range",), None)
+    if radial_range is None:
+        radial_range = _pop_first(args_2d, ("radial_range",), None)
+    azimuth_range = _pop_first(args_1d, ("azimuth_range",), None)
+    if azimuth_range is None:
+        azimuth_range = _pop_first(args_2d, ("azimuth_range",), None)
+    monitor_key = _pop_first(args_1d, ("monitor",), None)
+    if monitor_key is None:
+        monitor_key = _pop_first(args_2d, ("monitor",), None)
+    chi_offset = _pop_first(args_1d, ("chi_offset",), None)
+    if chi_offset is None:
+        chi_offset = _pop_first(args_2d, ("chi_offset",), 0.0)
+    error_model = _pop_first(args_1d, ("error_model",), None)
+    if error_model is None:
+        error_model = _pop_first(args_2d, ("error_model",), None)
+    polarization_factor = _pop_first(args_1d, ("polarization_factor",), None)
+    if polarization_factor is None:
+        polarization_factor = _pop_first(args_2d, ("polarization_factor",), None)
+    _pop_first(args_1d, ("normalization_factor",), None)
+    _pop_first(args_2d, ("normalization_factor",), None)
 
     gi = bool(getattr(sphere, "gi", False))
     if gi and gi_incident_angle is None:
@@ -131,6 +144,10 @@ def plan_from_ewald_sphere(
     except Exception:
         mask_shape = None
 
+    gi_method = _pop_first(args_1d, ("gi_method_1d",), None)
+    if gi_method is None:
+        gi_method = _pop_first(args_2d, ("gi_method_2d",), "no")
+
     return ReductionPlan(
         integrate_1d=integrate_1d,
         integrate_2d=integrate_2d,
@@ -146,12 +163,46 @@ def plan_from_ewald_sphere(
         azimuth_range=azimuth_range,
         error_model=error_model,
         polarization_factor=polarization_factor,
+        monitor_key=monitor_key,
+        azimuth_offset=float(chi_offset or 0.0),
         chunk_size=chunk_size,
         gi_incident_angle=gi_incident_angle,
-        gi_method=str(args_1d.pop("gi_method_1d", args_2d.pop("gi_method_2d", "no"))),
+        gi_method=str(gi_method),
         extra_1d=args_1d,
         extra_2d=args_2d,
     )
+
+
+def reduce_ewald_arch(
+    arch: Any,
+    plan: ReductionPlan,
+    *,
+    scan_name: str = "scan",
+    global_mask: Any = None,
+    integrator: Any = None,
+) -> Any:
+    """Reduce one ``EwaldArch`` through ``ssrl_xrd_tools.reduction``.
+
+    The returned object is the same ``arch`` instance, populated with
+    ``int_1d`` / ``int_2d`` so existing xdart display and writer code can
+    continue to operate while the computation crosses the new Scan/Frame API.
+    """
+    if getattr(arch, "gi", False):
+        raise ValueError("reduce_ewald_arch currently handles non-GI arches only.")
+    frame = frame_from_ewald_arch(arch)
+    plan = _plan_with_mask_for_arch(plan, global_mask, arch)
+    scan = Scan(
+        name=scan_name,
+        frames=[frame],
+        poni=getattr(arch, "poni", None),
+        integrator=integrator if integrator is not None else getattr(arch, "integrator", None),
+    )
+    result = run_reduction(plan, scan)
+    reduction = result.frames[int(arch.idx)]
+    arch.int_1d = reduction.result_1d
+    arch.int_2d = reduction.result_2d
+    arch.map_norm = _frame_norm(frame, plan)
+    return arch
 
 
 def _source_path(arch: Any) -> Path | None:
@@ -162,12 +213,49 @@ def _source_path(arch: Any) -> Path | None:
 
 def _normalization_factor(arch: Any) -> float | None:
     value = getattr(arch, "map_norm", None)
+    if value is None:
+        return None
     try:
-        if value is None or not np.isfinite(float(value)) or float(value) == 0:
+        norm = float(value)
+        if not np.isfinite(norm) or norm in (0.0, 1.0):
             return None
-        return float(value)
+        return norm
     except (TypeError, ValueError):
         return None
+
+
+def _frame_norm(frame: Frame, plan: ReductionPlan) -> float:
+    if plan.normalization_factors is not None and frame.index in plan.normalization_factors:
+        return float(plan.normalization_factors[frame.index])
+    if frame.normalization_factor is not None:
+        return float(frame.normalization_factor)
+    if plan.monitor_key:
+        key = plan.monitor_key
+        value = frame.metadata.get(key)
+        if value is None:
+            value = frame.metadata.get(key.upper())
+        if value is None:
+            value = frame.metadata.get(key.lower())
+        try:
+            value = float(value)
+            return value if np.isfinite(value) and value != 0 else 1.0
+        except (TypeError, ValueError):
+            return 1.0
+    return 1.0
+
+
+def _plan_with_mask_for_arch(
+    plan: ReductionPlan,
+    global_mask: Any,
+    arch: Any,
+) -> ReductionPlan:
+    shape = getattr(getattr(arch, "map_raw", None), "shape", None)
+    gmask = _flat_mask_as_bool(global_mask, shape)
+    if plan.mask is None:
+        return replace(plan, mask=gmask)
+    if gmask is None:
+        return plan
+    return replace(plan, mask=np.asarray(plan.mask, dtype=bool) | gmask)
 
 
 def _arch_mask_as_bool(arch: Any) -> np.ndarray | None:
@@ -205,8 +293,16 @@ def _npt_2d(args_2d: dict[str, Any]) -> tuple[int, int]:
     return int(npt_rad), int(npt_azim)
 
 
+def _pop_first(args: dict[str, Any], keys: tuple[str, ...], default: Any) -> Any:
+    for key in keys:
+        if key in args:
+            return args.pop(key)
+    return default
+
+
 __all__ = [
     "frame_from_ewald_arch",
     "scan_from_ewald_sphere",
     "plan_from_ewald_sphere",
+    "reduce_ewald_arch",
 ]
