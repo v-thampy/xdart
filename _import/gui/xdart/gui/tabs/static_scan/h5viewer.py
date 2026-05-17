@@ -65,7 +65,16 @@ class _LoadArchesWorker(QtCore.QObject):
     # N1: signals carry the worker's generation number so the GUI
     # can drop stale chunks from a cancelled worker that's still
     # draining its run loop.
-    chunkLoaded = QtCore.Signal(int, int, object)  # (generation, idx, arch)
+    #
+    # ``load_2d`` rides along in the signal payload so the receiver
+    # slot can be a plain bound method instead of a lambda — see
+    # ``H5Viewer.load_arches_data`` for the wiring.  Pre-fix the
+    # connection used a lambda to inject ``load_2d``, but Qt can't
+    # determine a lambda's thread affinity and fell back to
+    # direct-call delivery on the emitter (worker) thread, so the
+    # GUI-thread-only ``QTimer.start()`` inside ``_absorb_chunk``
+    # raised "Timers cannot be started from another thread".
+    chunkLoaded = QtCore.Signal(int, int, object, bool)  # (gen, idx, arch, load_2d)
     finished = QtCore.Signal(int)  # (generation,)
     cancelled = QtCore.Signal(int)  # (generation,)
 
@@ -140,8 +149,11 @@ class _LoadArchesWorker(QtCore.QObject):
                     continue
                 # Emit on the worker thread; Qt queues the slot
                 # invocation back to the GUI thread automatically
-                # because the signal target lives on the GUI thread.
-                self.chunkLoaded.emit(self.generation, int(idx), arch)
+                # because the signal target is a bound method on a
+                # QObject living on the GUI thread.
+                self.chunkLoaded.emit(
+                    self.generation, int(idx), arch, bool(self.load_2d),
+                )
         except Exception:
             logger.exception("LoadArchesWorker crashed unexpectedly")
         finally:
@@ -1146,14 +1158,16 @@ class H5Viewer(QWidget):
         )
         thread = QtCore.QThread(self)
         worker.moveToThread(thread)
-        # Capture load_2d in the slot closure since the worker only
-        # reports (gen, idx, arch) and we need to know which dict to
-        # fill.  Generation is checked inside _absorb_chunk.
-        worker.chunkLoaded.connect(
-            lambda g, idx, arch, _l2d=load_2d: self._absorb_chunk(
-                g, idx, arch, _l2d,
-            )
-        )
+        # Connect to the bound method directly (no lambda) so Qt can
+        # detect the receiver's thread affinity (the H5Viewer lives
+        # on the GUI thread) and use QueuedConnection automatically.
+        # The lambda-wrapped version of this connect fell back to
+        # DirectConnection on the worker thread, which made
+        # ``_update_coalesce_timer.start()`` raise on Windows with
+        # "Timers cannot be started from another thread" — Mac's Qt
+        # build happened to tolerate this but Windows is strict.
+        # ``load_2d`` rides in the signal payload (4th arg) now.
+        worker.chunkLoaded.connect(self._absorb_chunk)
         thread.started.connect(worker.run)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
