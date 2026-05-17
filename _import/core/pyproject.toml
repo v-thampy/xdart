@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssrl_xrd_tools"
-version = "0.37.1.dev0"
+version = "0.38.0"
 description = "SSRL X-ray diffraction data processing and visualization tools"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
