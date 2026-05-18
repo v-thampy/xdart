@@ -158,6 +158,7 @@ def test_flush_pending_update_owns_single_repaint():
         h5viewer=SimpleNamespace(
             auto_last=True,
             update_data=lambda **kwargs: calls.append(("update_data", kwargs)),
+            data_changed=lambda: calls.append(("data_changed", {})),
         ),
         latest_arch=lambda **kwargs: calls.append(("latest_arch", kwargs)),
         displayframe=SimpleNamespace(
@@ -174,6 +175,5 @@ def test_flush_pending_update_owns_single_repaint():
     assert calls == [
         ("update_data", {"emit_update": False}),
         ("latest_arch", {"emit_update": False}),
-        ("display", {}),
-        ("meta", {}),
+        ("data_changed", {}),
     ]
