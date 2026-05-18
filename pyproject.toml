@@ -26,7 +26,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Chemistry",
 ]
 dependencies = [
-    "ssrl_xrd_tools>=0.38.0",
+    "ssrl_xrd_tools>=0.38.1",
     "numpy",
     "scipy",
     "h5py",

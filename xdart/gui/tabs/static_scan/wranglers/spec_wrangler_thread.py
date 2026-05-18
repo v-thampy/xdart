@@ -37,7 +37,7 @@ import h5py
 from pyqtgraph import Qt
 
 # Project imports
-from xdart.modules.ewald import EwaldArch, EwaldSphere
+from xdart.modules.live import LiveFrame, LiveScan
 from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from ssrl_xrd_tools.io.image import read_image, count_frames
@@ -46,6 +46,10 @@ from ssrl_xrd_tools.io.nexus import find_nexus_image_dataset
 from ssrl_xrd_tools.io.metadata import read_image_metadata
 from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
+from xdart.modules.reduction import (
+    StandardPlanCache,
+    dispatch_live_frame_reduction,
+)
 from .wrangler_widget import wranglerThread
 
 
@@ -199,7 +203,7 @@ class specThread(wranglerThread):
         input_q: mp.Queue, queue for commands sent from parent
         signal_q: mp.Queue, queue for commands sent from process
         sphere_args: dict, used as **kwargs in sphere initialization.
-            see EwaldSphere.
+            see LiveScan.
         timeout: float or int, how long to continue checking for new
             data.
         command: command passed to start, stop etc.
@@ -322,6 +326,7 @@ class specThread(wranglerThread):
         # via ``showLabel`` so the user sees "Eiger read failed: ..."
         # instead of a silent end-of-scan.  None means "no error".
         self._prefetch_error = None
+        self._plan_cache = StandardPlanCache()
 
     # ── Display helpers ──────────────────────────────────────────────────
 
@@ -702,7 +707,7 @@ class specThread(wranglerThread):
         img_file, img_number, img_data, img_meta, bg_raw, _ = pending_entry
         # Build a scratch arch identical in shape to what
         # ``_process_one`` constructs so the angle math agrees.
-        scratch = EwaldArch(
+        scratch = LiveFrame(
             img_number, img_data, poni=self.poni,
             scan_info=img_meta, static=True, gi=True,
             th_mtr=self.incidence_motor,
@@ -738,7 +743,7 @@ class specThread(wranglerThread):
         """Parallel batch processing using ThreadPoolExecutor.
 
         Phase 1 — Parallel integration:
-            Each worker creates an EwaldArch, runs integrate_1d / integrate_2d,
+            Each worker creates a LiveFrame, runs integrate_1d / integrate_2d,
             and writes xye/csv.  pyFAI's Cython integration releases the GIL,
             so threads get true parallelism for the CPU-heavy part.
 
@@ -812,6 +817,7 @@ class specThread(wranglerThread):
         bai_2d_args = dict(sphere.bai_2d_args)
         mask = self.mask
         gi = self.gi
+        standard_plan = self._plan_cache.get(sphere, integrate_2d=not skip_2d)
         th_mtr = self.incidence_motor
         sample_orientation = self.sample_orientation
         tilt_angle = self.tilt_angle
@@ -846,7 +852,7 @@ class specThread(wranglerThread):
             # one worker at a time — that's what makes parallel
             # batch correct vs the old shared-instance code path.
             with integrator_pool.borrow() as ai:
-                arch = EwaldArch(
+                arch = LiveFrame(
                     img_number, img_data, poni=self.poni,
                     scan_info=img_meta, static=True, gi=gi,
                     th_mtr=th_mtr, bg_raw=bg_raw,
@@ -857,28 +863,33 @@ class specThread(wranglerThread):
                     mask=arch_mask,
                 )
 
-                # H2: GI fiber integrator goes through the shared
-                # _borrow_fiber_integrator helper.  When the frame's
-                # incidence angle matches the prewarm cache (the
-                # sin²ψ common path) it borrows a private deepcopy
-                # from fiber_pool — same fix as IntegratorPool for
-                # the standard AzimuthalIntegrator.  Otherwise it
-                # builds a worker-local fiber integrator (ω-varying
-                # fall-back; slow but correct, single worker only).
-                with self._borrow_fiber_integrator(
-                    sphere, fiber_pool, arch,
-                ) as _fi:
-                    arch.integrate_1d(
-                        global_mask=mask,
-                        fiber_integrator=_fi,
-                        **bai_1d_args,
-                    )
-                    if not skip_2d:
-                        arch.integrate_2d(
+                # H2 + S3 unified dispatch.  When ``standard_plan`` is
+                # None (GI sphere) we run the fiber-integrator path
+                # inside the legacy_gi closure; otherwise the headless
+                # ``reduce_live_frame`` handles it.
+                def _legacy_gi_for_arch() -> None:
+                    with self._borrow_fiber_integrator(
+                        sphere, fiber_pool, arch,
+                    ) as _fi:
+                        arch.integrate_1d(
                             global_mask=mask,
                             fiber_integrator=_fi,
-                            **bai_2d_args,
+                            **bai_1d_args,
                         )
+                        if not skip_2d:
+                            arch.integrate_2d(
+                                global_mask=mask,
+                                fiber_integrator=_fi,
+                                **bai_2d_args,
+                            )
+
+                dispatch_live_frame_reduction(
+                    arch, sphere,
+                    standard_plan=standard_plan,
+                    integrator=ai,
+                    global_mask=mask,
+                    legacy_gi=_legacy_gi_for_arch,
+                )
 
             # Detach the pool integrator from this arch — once the
             # `with` block exited, the next worker can borrow this
@@ -1027,7 +1038,7 @@ class specThread(wranglerThread):
         # why this is fast even with per-frame threshold filtering on.
         img_data = self._apply_threshold_inline(img_data)
         arch_mask = self._resolve_arch_mask(sphere, img_data)
-        arch = EwaldArch(
+        arch = LiveFrame(
             img_number, img_data, poni=self.poni,
             scan_info=img_meta, static=True, gi=self.gi,
             th_mtr=self.incidence_motor, bg_raw=bg_raw,
@@ -1053,21 +1064,34 @@ class specThread(wranglerThread):
                 self._cached_gi_incident_angle = _incident_angle
 
         _t2 = time.time()
-        arch.integrate_1d(
-            global_mask=self.mask,
-            fiber_integrator=sphere._cached_fiber_integrator,
-            **sphere.bai_1d_args,
-        )
-        _t_1d = time.time() - _t2
 
-        _t3 = time.time()
-        if not sphere.skip_2d:
-            arch.integrate_2d(
+        def _legacy_gi_for_single() -> None:
+            arch.integrate_1d(
                 global_mask=self.mask,
                 fiber_integrator=sphere._cached_fiber_integrator,
-                **sphere.bai_2d_args,
+                **sphere.bai_1d_args,
             )
-        _t_2d = time.time() - _t3
+            if not sphere.skip_2d:
+                arch.integrate_2d(
+                    global_mask=self.mask,
+                    fiber_integrator=sphere._cached_fiber_integrator,
+                    **sphere.bai_2d_args,
+                )
+
+        dispatch_live_frame_reduction(
+            arch, sphere,
+            standard_plan=self._plan_cache.get(
+                sphere, integrate_2d=not sphere.skip_2d,
+            ),
+            integrator=sphere._cached_integrator,
+            global_mask=self.mask,
+            legacy_gi=_legacy_gi_for_single,
+        )
+        # Timing kept for parity with the legacy logging; the
+        # standard path now does both 1D + 2D in one call so we
+        # bundle the total under _t_1d.
+        _t_1d = time.time() - _t2
+        _t_2d = 0.0
 
         # ── GUI data (skip in batch mode — no one is looking) ────────────
         _t_h5_total = _t_h5_wait = _t_h5_write = 0.0
@@ -1634,7 +1658,7 @@ class specThread(wranglerThread):
             pass
 
     def initialize_sphere(self):
-        """If scan changes, initialize new EwaldSphere object.
+        """If scan changes, initialize new LiveScan object.
         If mode is overwrite, replace existing HDF5 file, else append to it.
         """
         fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
@@ -1646,17 +1670,17 @@ class specThread(wranglerThread):
         # output path, and static_scan_widget.wrangler_finished
         # cannot find the generated file to reload at end of batch.
         self.fname = fname
-        sphere = EwaldSphere(self.scan_name,
-                             data_file=fname,
-                             static=True,
-                             gi=self.gi,
-                             incidence_motor=self.incidence_motor,
-                             series_average=self.series_average,
-                             single_img=self.single_img,
-                             global_mask=self.mask,
-                             # J2: share lock with wrangler save path
-                             file_lock=self.file_lock,
-                             **self.sphere_args)
+        sphere = LiveScan(self.scan_name,
+                          data_file=fname,
+                          static=True,
+                          gi=self.gi,
+                          incidence_motor=self.incidence_motor,
+                          series_average=self.series_average,
+                          single_img=self.single_img,
+                          global_mask=self.mask,
+                          # J2: share lock with wrangler save path
+                          file_lock=self.file_lock,
+                          **self.sphere_args)
         sphere.skip_2d = self.sphere.skip_2d
         # v2 NeXus writer needs a DiffractometerGeometry to derive per-frame
         # rot1/rot2/rot3 and incidence-angle arrays from scan_data.  The

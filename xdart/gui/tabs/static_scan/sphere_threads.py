@@ -15,8 +15,10 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Other imports
-from xdart.modules.ewald import EwaldArch
+from xdart.modules.reduction import (
+    StandardPlanCache,
+    dispatch_live_frame_reduction,
+)
 
 # Qt imports
 from pyqtgraph import Qt
@@ -44,7 +46,7 @@ class integratorThread(Qt.QtCore.QThread):
         method: str, which method to call in run
         mg_1d_args, mg_2d_args: dict, arguments for multigeometry
             integration
-        sphere: EwaldSphere, object that does the integration.
+        sphere: LiveScan, object that does the integration.
     
     methods:
         bai_1d_all: Calls by arch integration 1D for all arches
@@ -80,7 +82,9 @@ class integratorThread(Qt.QtCore.QThread):
         self.lock = Condition()
         self.mg_1d_args = {}
         self.mg_2d_args = {}
-    
+        # C1: cached standard ReductionPlan per scan.
+        self._plan_cache = StandardPlanCache()
+
     def run(self):
         """Calls self.method. Catches exception where method does
         not match any attributes.
@@ -116,7 +120,7 @@ class integratorThread(Qt.QtCore.QThread):
             ProcessPoolExecutor(...).submit(_reintegrate_arch, arch, ...)
 
         For a v2 file that's:
-        * ``list(self.sphere.arches)`` triggers ``ArchSeries.__iter__``,
+        * ``list(self.sphere.arches)`` triggers ``LiveFrameSeries.__iter__``,
           which lazy-loads every frame from disk sequentially BEFORE
           the first worker gets a task — seconds-to-tens-of-seconds of
           GUI-thread blocking before parallel work begins.
@@ -157,7 +161,7 @@ class integratorThread(Qt.QtCore.QThread):
 
             N3: ``sphere.arches[arch.idx] = arch`` is a sphere-state
             mutation that other threads (the wrangler thread, the
-            GUI's ArchSeries.__getitem__) can race against.  Hold
+            GUI's LiveFrameSeries.__getitem__) can race against.  Hold
             ``sphere_lock`` while we do it.  The lock is short — just
             the dict assignment + the bai accumulator — and the
             accumulator path itself already takes sphere_lock
@@ -176,13 +180,8 @@ class integratorThread(Qt.QtCore.QThread):
                         'int_2d': arch.int_2d,
                         'gi_2d': arch.gi_2d,
                     }
-                    # N9 Fix#4: a 2D reintegrate also recomputes the
-                    # 1D azimuthal cake via pyFAI's integrate2d output
-                    # → the cached data_1d entry from before the
-                    # reintegrate is now stale.  Refresh it so the 1D
-                    # viewer sees the new int_1d immediately rather
-                    # than waiting for a reselect to lazy-reload it
-                    # from disk.
+                    # A standard 2D reintegrate also refreshes 1D so
+                    # linked viewers do not keep stale cached curves.
                     self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
             else:
                 self.sphere._accumulate_bai_1d(arch)
@@ -192,6 +191,9 @@ class integratorThread(Qt.QtCore.QThread):
 
         label = '2D' if do_2d else '1D'
         n_workers = max(1, min(max_cores, len(indices)))
+        standard_plan = self._plan_cache.get(
+            self.sphere, integrate_2d=do_2d,
+        )
 
         # IntegratorPool: one deep-copied pyFAI integrator per worker.
         # If sphere._cached_integrator is None (sphere fresh-from-load
@@ -243,31 +245,50 @@ class integratorThread(Qt.QtCore.QThread):
             if integrator_pool is not None:
                 with integrator_pool.borrow() as ai:
                     arch.integrator = ai
-                    # P2: angle-aware fiber borrow — pool hit when the
-                    # arch's incidence angle matches the cached
-                    # prewarm angle (most scans), worker-local build
-                    # otherwise.  No-op (yields None) when GI is off
-                    # on this arch.
-                    with _borrow_fi(self.sphere, fiber_pool, arch) as fi:
-                        arch.integrate_1d(
-                            fiber_integrator=fi,
-                            **self.sphere.bai_1d_args,
-                        )
-                        if do_2d:
-                            arch.integrate_2d(
+
+                    def _legacy_gi_for_arch() -> None:
+                        # P2: angle-aware fiber borrow — pool hit when the
+                        # arch's incidence angle matches the cached
+                        # prewarm angle (most scans), worker-local build
+                        # otherwise.
+                        with _borrow_fi(self.sphere, fiber_pool, arch) as fi:
+                            arch.integrate_1d(
                                 fiber_integrator=fi,
-                                **self.sphere.bai_2d_args,
+                                **self.sphere.bai_1d_args,
                             )
+                            if do_2d:
+                                arch.integrate_2d(
+                                    fiber_integrator=fi,
+                                    **self.sphere.bai_2d_args,
+                                )
+
+                    dispatch_live_frame_reduction(
+                        arch, self.sphere,
+                        standard_plan=standard_plan,
+                        integrator=ai,
+                        global_mask=self.sphere.global_mask,
+                        legacy_gi=_legacy_gi_for_arch,
+                    )
                     # Detach pool integrator before the next worker
                     # borrows the same instance.
                     arch.integrator = self.sphere._cached_integrator
             else:
-                # Fallback: no integrator pool — fall back to serial
-                # (still on a thread to avoid blocking the GUI).
-                if do_2d:
-                    arch.integrate_2d(**self.sphere.bai_2d_args)
-                else:
-                    arch.integrate_1d(**self.sphere.bai_1d_args)
+                # Fallback: no integrator pool — still go through the
+                # shared dispatch helper so the GI vs standard logic
+                # stays in one place.
+                def _legacy_gi_serial() -> None:
+                    if do_2d:
+                        arch.integrate_2d(**self.sphere.bai_2d_args)
+                    else:
+                        arch.integrate_1d(**self.sphere.bai_1d_args)
+
+                dispatch_live_frame_reduction(
+                    arch, self.sphere,
+                    standard_plan=standard_plan,
+                    integrator=arch.integrator,
+                    global_mask=self.sphere.global_mask,
+                    legacy_gi=_legacy_gi_serial,
+                )
             return arch
 
         # Batched dispatch: lazy-load each batch right before
@@ -278,7 +299,7 @@ class integratorThread(Qt.QtCore.QThread):
         if max_cores > 1 and len(indices) > 1 and integrator_pool is not None:
             for i in range(0, len(indices), _RE_BATCH):
                 chunk_idxs = indices[i:i + _RE_BATCH]
-                # ArchSeries.__getitem__ does the lazy v2 load + sets
+                # LiveFrameSeries.__getitem__ does the lazy v2 load + sets
                 # source refs / _source_root for the L1 raw loader.
                 arches = [self.sphere.arches[idx] for idx in chunk_idxs]
                 with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -341,12 +362,23 @@ class integratorThread(Qt.QtCore.QThread):
         idxs = self.arch_ids
         if 'Overall' in self.arch_ids:
             idxs = self.sphere.arches.index
+        # C1: cached plan covers integrate_1d + integrate_2d together
+        # since a 2D reintegrate also refreshes the cached 1D entry.
+        plan = self._plan_cache.get(self.sphere, integrate_2d=True)
         # for idx in self.arches.keys():
         for idx in idxs:
-            # self.sphere.arches[arch].integrate_2d(**self.sphere.bai_2d_args)
-            self.sphere.arches[int(idx)].integrate_2d(**self.sphere.bai_2d_args)
-            # arch.integrate_2d(**self.sphere.bai_2d_args)
             arch = self.sphere.arches[int(idx)]
+
+            def _legacy_gi_2d(arch=arch) -> None:
+                arch.integrate_2d(**self.sphere.bai_2d_args)
+
+            dispatch_live_frame_reduction(
+                arch, self.sphere,
+                standard_plan=plan,
+                integrator=arch.integrator,
+                global_mask=self.sphere.global_mask,
+                legacy_gi=_legacy_gi_2d,
+            )
             with self.data_lock:
                 self.data_2d[int(idx)] = {
                     'map_raw': arch.map_raw,
@@ -354,6 +386,8 @@ class integratorThread(Qt.QtCore.QThread):
                     'mask': arch.mask,
                     'int_2d': arch.int_2d,
                     'gi_2d': arch.gi_2d}
+                if not self.sphere.gi:
+                    self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
             self.update.emit(idx)
 
     def bai_1d_SI(self):
@@ -362,11 +396,21 @@ class integratorThread(Qt.QtCore.QThread):
         idxs = self.arch_ids
         if 'Overall' in self.arch_ids:
             idxs = self.sphere.arches.index
+        plan = self._plan_cache.get(self.sphere, integrate_2d=False)
         # for (idx, arch) in self.arches.items():
         for idx in idxs:
-            # self.sphere.arches[arch].integrate_1d(**self.sphere.bai_1d_args)
-            self.sphere.arches[int(idx)].integrate_1d(**self.sphere.bai_1d_args)
             arch = self.sphere.arches[int(idx)]
+
+            def _legacy_gi_1d(arch=arch) -> None:
+                arch.integrate_1d(**self.sphere.bai_1d_args)
+
+            dispatch_live_frame_reduction(
+                arch, self.sphere,
+                standard_plan=plan,
+                integrator=arch.integrator,
+                global_mask=self.sphere.global_mask,
+                legacy_gi=_legacy_gi_1d,
+            )
             with self.data_lock:
                 self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
             self.update.emit(arch.idx)
@@ -393,8 +437,8 @@ class fileHandlerThread(Qt.QtCore.QThread):
         Parameters
         ----------
         file_lock : multiprocessing.Condition
-        arch : xdart.modules.ewald.EwaldArch
-        sphere : xdart.modules.ewald.EwaldSphere
+        arch : xdart.modules.live.LiveFrame
+        sphere : xdart.modules.live.LiveScan
         data_lock : threading.RLock, optional
             Shared lock guarding data_1d / data_2d; a private RLock is
             created when not provided.
@@ -460,7 +504,7 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 logger.debug("Failed to load sphere data from HDF5: %s", e)
 
     def load_arch(self):
-        """Load a single arch via the v2 lazy loader (ArchSeries.__getitem__)."""
+        """Load a single arch via the v2 lazy loader (LiveFrameSeries.__getitem__)."""
         try:
             self.arch = self.sphere.arches[self.arch.idx]
         except KeyError as e:
@@ -470,7 +514,7 @@ class fileHandlerThread(Qt.QtCore.QThread):
     def load_arches(self):
         """Populate data_1d/data_2d caches by lazy-loading arches via v2.
 
-        ArchSeries.__getitem__ now reads from the stacked
+        LiveFrameSeries.__getitem__ now reads from the stacked
         ``entry/integrated_1d`` / ``integrated_2d`` arrays and the
         per-frame ``frames/frame_NNNN/thumbnail`` group.  No v1 frame
         groups touched.

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Tests for ArchSeries._IndexedList — the list-with-O(1)-membership
-that lives behind ``ArchSeries.index``.
+"""Tests for LiveFrameSeries._IndexedList — the list-with-O(1)-membership
+that lives behind ``LiveFrameSeries.index``.
 
 Verifies that:
 * All list reads behave identically to a plain list.
