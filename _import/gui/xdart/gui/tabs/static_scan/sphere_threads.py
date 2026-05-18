@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Other imports
 from xdart.modules.ewald import EwaldArch
+from xdart.modules.reduction import plan_from_ewald_sphere, reduce_ewald_arch
 
 # Qt imports
 from pyqtgraph import Qt
@@ -192,6 +193,15 @@ class integratorThread(Qt.QtCore.QThread):
 
         label = '2D' if do_2d else '1D'
         n_workers = max(1, min(max_cores, len(indices)))
+        standard_plan = (
+            plan_from_ewald_sphere(
+                self.sphere,
+                integrate_1d=True,
+                integrate_2d=do_2d,
+                chunk_size=1,
+            )
+            if not getattr(self.sphere, 'gi', False) else None
+        )
 
         # IntegratorPool: one deep-copied pyFAI integrator per worker.
         # If sphere._cached_integrator is None (sphere fresh-from-load
@@ -243,31 +253,47 @@ class integratorThread(Qt.QtCore.QThread):
             if integrator_pool is not None:
                 with integrator_pool.borrow() as ai:
                     arch.integrator = ai
-                    # P2: angle-aware fiber borrow — pool hit when the
-                    # arch's incidence angle matches the cached
-                    # prewarm angle (most scans), worker-local build
-                    # otherwise.  No-op (yields None) when GI is off
-                    # on this arch.
-                    with _borrow_fi(self.sphere, fiber_pool, arch) as fi:
-                        arch.integrate_1d(
-                            fiber_integrator=fi,
-                            **self.sphere.bai_1d_args,
-                        )
-                        if do_2d:
-                            arch.integrate_2d(
+                    if self.sphere.gi:
+                        # P2: angle-aware fiber borrow — pool hit when the
+                        # arch's incidence angle matches the cached
+                        # prewarm angle (most scans), worker-local build
+                        # otherwise.
+                        with _borrow_fi(self.sphere, fiber_pool, arch) as fi:
+                            arch.integrate_1d(
                                 fiber_integrator=fi,
-                                **self.sphere.bai_2d_args,
+                                **self.sphere.bai_1d_args,
                             )
+                            if do_2d:
+                                arch.integrate_2d(
+                                    fiber_integrator=fi,
+                                    **self.sphere.bai_2d_args,
+                                )
+                    else:
+                        reduce_ewald_arch(
+                            arch,
+                            standard_plan,
+                            scan_name=self.sphere.name,
+                            global_mask=self.sphere.global_mask,
+                            integrator=ai,
+                        )
                     # Detach pool integrator before the next worker
                     # borrows the same instance.
                     arch.integrator = self.sphere._cached_integrator
             else:
                 # Fallback: no integrator pool — fall back to serial
                 # (still on a thread to avoid blocking the GUI).
-                if do_2d:
+                if self.sphere.gi and do_2d:
                     arch.integrate_2d(**self.sphere.bai_2d_args)
-                else:
+                elif self.sphere.gi:
                     arch.integrate_1d(**self.sphere.bai_1d_args)
+                else:
+                    reduce_ewald_arch(
+                        arch,
+                        standard_plan,
+                        scan_name=self.sphere.name,
+                        global_mask=self.sphere.global_mask,
+                        integrator=arch.integrator,
+                    )
             return arch
 
         # Batched dispatch: lazy-load each batch right before
@@ -343,10 +369,23 @@ class integratorThread(Qt.QtCore.QThread):
             idxs = self.sphere.arches.index
         # for idx in self.arches.keys():
         for idx in idxs:
-            # self.sphere.arches[arch].integrate_2d(**self.sphere.bai_2d_args)
-            self.sphere.arches[int(idx)].integrate_2d(**self.sphere.bai_2d_args)
-            # arch.integrate_2d(**self.sphere.bai_2d_args)
             arch = self.sphere.arches[int(idx)]
+            if self.sphere.gi:
+                arch.integrate_2d(**self.sphere.bai_2d_args)
+            else:
+                plan = plan_from_ewald_sphere(
+                    self.sphere,
+                    integrate_1d=False,
+                    integrate_2d=True,
+                    chunk_size=1,
+                )
+                reduce_ewald_arch(
+                    arch,
+                    plan,
+                    scan_name=self.sphere.name,
+                    global_mask=self.sphere.global_mask,
+                    integrator=arch.integrator,
+                )
             with self.data_lock:
                 self.data_2d[int(idx)] = {
                     'map_raw': arch.map_raw,
@@ -362,11 +401,28 @@ class integratorThread(Qt.QtCore.QThread):
         idxs = self.arch_ids
         if 'Overall' in self.arch_ids:
             idxs = self.sphere.arches.index
+        plan = (
+            plan_from_ewald_sphere(
+                self.sphere,
+                integrate_1d=True,
+                integrate_2d=False,
+                chunk_size=1,
+            )
+            if not self.sphere.gi else None
+        )
         # for (idx, arch) in self.arches.items():
         for idx in idxs:
-            # self.sphere.arches[arch].integrate_1d(**self.sphere.bai_1d_args)
-            self.sphere.arches[int(idx)].integrate_1d(**self.sphere.bai_1d_args)
             arch = self.sphere.arches[int(idx)]
+            if self.sphere.gi:
+                arch.integrate_1d(**self.sphere.bai_1d_args)
+            else:
+                reduce_ewald_arch(
+                    arch,
+                    plan,
+                    scan_name=self.sphere.name,
+                    global_mask=self.sphere.global_mask,
+                    integrator=arch.integrator,
+                )
             with self.data_lock:
                 self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
             self.update.emit(arch.idx)

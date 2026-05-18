@@ -257,6 +257,15 @@ class nexusThread(wranglerThread):
                 )
                 if self.gi else None
             )
+            standard_plan = (
+                plan_from_ewald_sphere(
+                    sphere,
+                    integrate_1d=True,
+                    integrate_2d=not sphere.skip_2d,
+                    chunk_size=1,
+                )
+                if not self.gi else None
+            )
             # If the GUI is single-core (max_cores=1) integrator_pool
             # still exists with one member; the worker borrows it like
             # everyone else.  Cleaner than branching on n_workers==1.
@@ -297,7 +306,7 @@ class nexusThread(wranglerThread):
                 arches = self._parallel_integrate(
                     items,
                     lambda item: self._integrate_one(
-                        sphere, integrator_pool, fiber_pool, *item,
+                        sphere, integrator_pool, fiber_pool, standard_plan, *item,
                     ),
                     n_workers,
                     label='NEXUS',
@@ -461,7 +470,7 @@ class nexusThread(wranglerThread):
         # pattern as specThread.
         sphere._cached_fiber_integrator_angle = incident_angle
 
-    def _integrate_one(self, sphere, integrator_pool, fiber_pool,
+    def _integrate_one(self, sphere, integrator_pool, fiber_pool, standard_plan,
                        frame_idx, img_data, img_meta):
         """Pure integration in a worker thread; returns the arch.
 
@@ -519,15 +528,9 @@ class nexusThread(wranglerThread):
                             **sphere.bai_2d_args,
                         )
             else:
-                plan = plan_from_ewald_sphere(
-                    sphere,
-                    integrate_1d=True,
-                    integrate_2d=not sphere.skip_2d,
-                    chunk_size=1,
-                )
                 reduce_ewald_arch(
                     arch,
-                    plan,
+                    standard_plan,
                     scan_name=sphere.name,
                     global_mask=self.mask,
                     integrator=ai,

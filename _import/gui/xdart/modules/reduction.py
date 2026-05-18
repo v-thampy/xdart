@@ -14,7 +14,25 @@ from typing import Iterable, Any
 
 import numpy as np
 
-from ssrl_xrd_tools.reduction import Frame, ReductionPlan, Scan, run_reduction
+from ssrl_xrd_tools.reduction import (
+    Frame,
+    Integration1DPlan,
+    Integration2DPlan,
+    ReductionPlan,
+    Scan,
+    run_reduction,
+)
+
+_GI_ONLY_ARGS = {
+    "gi_mode_1d",
+    "gi_mode_2d",
+    "npt_oop",
+    "npt_ip",
+    "sample_orientation",
+    "tilt_angle",
+    "x_range",
+    "y_range",
+}
 
 
 def frame_from_ewald_arch(
@@ -39,7 +57,6 @@ def frame_from_ewald_arch(
         source_frame_index=int(getattr(arch, "source_frame_idx", 0) or 0),
         background=getattr(arch, "bg_raw", None),
         mask=mask,
-        normalization_factor=_normalization_factor(arch),
     )
 
 
@@ -102,33 +119,31 @@ def plan_from_ewald_sphere(
     args_2d = dict(getattr(sphere, "bai_2d_args", {}) or {})
     unit_1d = _pop_first(args_1d, ("unit",), None)
     unit_2d = _pop_first(args_2d, ("unit",), None)
-    unit = str(unit_1d if unit_1d is not None else (unit_2d or "q_A^-1"))
     method_1d = str(_pop_first(args_1d, ("method",), "csr"))
-    method_2d = str(_pop_first(args_2d, ("method",), method_1d))
+    method_2d = str(_pop_first(args_2d, ("method",), "csr"))
     npt_1d = int(_pop_first(args_1d, ("npt", "numpoints", "npt_rad"), 1000))
     npt_rad_2d, npt_azim_2d = _npt_2d(args_2d)
     radial_range = _pop_first(args_1d, ("radial_range",), None)
-    if radial_range is None:
-        radial_range = _pop_first(args_2d, ("radial_range",), None)
-    azimuth_range = _pop_first(args_1d, ("azimuth_range",), None)
-    if azimuth_range is None:
-        azimuth_range = _pop_first(args_2d, ("azimuth_range",), None)
+    radial_range_2d = _pop_first(args_2d, ("radial_range",), None)
+    azimuth_range_1d = _pop_first(args_1d, ("azimuth_range",), None)
+    azimuth_range_2d = _pop_first(args_2d, ("azimuth_range",), None)
     monitor_key = _pop_first(args_1d, ("monitor",), None)
-    if monitor_key is None:
-        monitor_key = _pop_first(args_2d, ("monitor",), None)
-    chi_offset = _pop_first(args_1d, ("chi_offset",), None)
-    if chi_offset is None:
-        chi_offset = _pop_first(args_2d, ("chi_offset",), 0.0)
+    monitor_key_2d = _pop_first(args_2d, ("monitor",), None)
+    chi_offset_1d = _pop_first(args_1d, ("chi_offset",), 0.0)
+    chi_offset_2d = _pop_first(args_2d, ("chi_offset",), 0.0)
+    if chi_offset_1d:
+        azimuth_range_1d = _offset_range(azimuth_range_1d, float(chi_offset_1d))
     error_model = _pop_first(args_1d, ("error_model",), None)
-    if error_model is None:
-        error_model = _pop_first(args_2d, ("error_model",), None)
+    error_model_2d = _pop_first(args_2d, ("error_model",), None)
     polarization_factor = _pop_first(args_1d, ("polarization_factor",), None)
-    if polarization_factor is None:
-        polarization_factor = _pop_first(args_2d, ("polarization_factor",), None)
+    polarization_factor_2d = _pop_first(args_2d, ("polarization_factor",), None)
     _pop_first(args_1d, ("normalization_factor",), None)
     _pop_first(args_2d, ("normalization_factor",), None)
 
     gi = bool(getattr(sphere, "gi", False))
+    if not gi:
+        _strip_nonstandard_args(args_1d)
+        _strip_nonstandard_args(args_2d)
     if gi and gi_incident_angle is None:
         gi_incident_angle = getattr(sphere, "_cached_fiber_integrator_angle", None)
     if gi and gi_incident_angle is None:
@@ -149,27 +164,41 @@ def plan_from_ewald_sphere(
         gi_method = _pop_first(args_2d, ("gi_method_2d",), "no")
 
     return ReductionPlan(
-        integrate_1d=integrate_1d,
-        integrate_2d=integrate_2d,
+        integration_1d=(
+            Integration1DPlan(
+                npt=npt_1d,
+                unit=str(unit_1d or "q_A^-1"),
+                method=method_1d,
+                radial_range=radial_range,
+                azimuth_range=azimuth_range_1d,
+                monitor_key=monitor_key,
+                error_model=error_model,
+                polarization_factor=polarization_factor,
+                extra=args_1d,
+            )
+            if integrate_1d else None
+        ),
+        integration_2d=(
+            Integration2DPlan(
+                npt_rad=npt_rad_2d,
+                npt_azim=npt_azim_2d,
+                unit=str(unit_2d or "q_A^-1"),
+                method=method_2d,
+                radial_range=radial_range_2d,
+                azimuth_range=azimuth_range_2d,
+                azimuth_offset=float(chi_offset_2d or 0.0),
+                monitor_key=monitor_key_2d,
+                error_model=error_model_2d,
+                polarization_factor=polarization_factor_2d,
+                extra=args_2d,
+            )
+            if integrate_2d else None
+        ),
         gi=gi,
-        npt_1d=npt_1d,
-        npt_rad_2d=npt_rad_2d,
-        npt_azim_2d=npt_azim_2d,
-        unit=unit,
-        method_1d=method_1d,
-        method_2d=method_2d,
         mask=_flat_mask_as_bool(getattr(sphere, "global_mask", None), mask_shape),
-        radial_range=radial_range,
-        azimuth_range=azimuth_range,
-        error_model=error_model,
-        polarization_factor=polarization_factor,
-        monitor_key=monitor_key,
-        azimuth_offset=float(chi_offset or 0.0),
         chunk_size=chunk_size,
         gi_incident_angle=gi_incident_angle,
         gi_method=str(gi_method),
-        extra_1d=args_1d,
-        extra_2d=args_2d,
     )
 
 
@@ -225,12 +254,11 @@ def _normalization_factor(arch: Any) -> float | None:
 
 
 def _frame_norm(frame: Frame, plan: ReductionPlan) -> float:
-    if plan.normalization_factors is not None and frame.index in plan.normalization_factors:
-        return float(plan.normalization_factors[frame.index])
     if frame.normalization_factor is not None:
         return float(frame.normalization_factor)
-    if plan.monitor_key:
-        key = plan.monitor_key
+    integration = plan.integration_1d or plan.integration_2d
+    if integration and integration.monitor_key:
+        key = integration.monitor_key
         value = frame.metadata.get(key)
         if value is None:
             value = frame.metadata.get(key.upper())
@@ -269,13 +297,26 @@ def _flat_mask_as_bool(mask: Any, shape: tuple[int, int] | None) -> np.ndarray |
     if mask is None:
         return None
     arr = np.asarray(mask)
-    if arr.dtype == bool and (shape is None or arr.shape == shape):
-        return arr
     if shape is None:
-        return arr.astype(bool) if arr.ndim == 2 else None
+        if arr.ndim == 2:
+            return arr.astype(bool, copy=False)
+        return None
+    if arr.ndim == 2:
+        if arr.shape != shape:
+            raise ValueError(f"mask shape {arr.shape} does not match image shape {shape}")
+        return arr.astype(bool, copy=False)
+    if arr.ndim != 1:
+        raise ValueError(f"flat mask must be 1D; got shape {arr.shape}")
+    if arr.dtype == bool:
+        if arr.size != int(np.prod(shape)):
+            raise ValueError(
+                f"flat boolean mask length {arr.size} does not match image shape {shape}"
+            )
+        return arr.reshape(shape)
     out = np.zeros(int(np.prod(shape)), dtype=bool)
-    flat = arr.astype(int).ravel()
-    flat = flat[(flat >= 0) & (flat < out.size)]
+    flat = np.asarray(arr, dtype=int).ravel()
+    if np.any(flat < 0) or np.any(flat >= out.size):
+        raise ValueError(f"flat mask indices out of bounds for image shape {shape}")
     out[flat] = True
     return out.reshape(shape)
 
@@ -298,6 +339,20 @@ def _pop_first(args: dict[str, Any], keys: tuple[str, ...], default: Any) -> Any
         if key in args:
             return args.pop(key)
     return default
+
+
+def _strip_nonstandard_args(args: dict[str, Any]) -> None:
+    for key in _GI_ONLY_ARGS:
+        args.pop(key, None)
+
+
+def _offset_range(
+    value: tuple[float, float] | list[float] | None,
+    offset: float,
+) -> tuple[float, float] | None:
+    if value is None:
+        return None
+    return float(value[0]) - offset, float(value[1]) - offset
 
 
 __all__ = [
