@@ -12,8 +12,10 @@ from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResul
 from ssrl_xrd_tools.reduction import (
     CancelToken,
     Frame,
+    GIMode,
     Integration1DPlan,
     Integration2DPlan,
+    MaskSpec,
     MemorySink,
     NexusSink,
     ReductionPlan,
@@ -46,8 +48,8 @@ def test_scan_sorts_frames_and_synthesizes_metadata() -> None:
     scan = Scan(
         name="sample_scan1",
         frames=[
-            Frame(index=2, image=np.zeros((2, 2)), metadata={"i0": 20}),
-            Frame(index=1, image=np.zeros((2, 2)), metadata={"i0": 10}),
+            Frame(index=2, image=np.zeros((2, 2)), metadata={"I0": 20}),
+            Frame(index=1, image=np.zeros((2, 2)), metadata={"I0": 10}),
         ],
         energy=12.398,
         wavelength=1.0,
@@ -84,9 +86,6 @@ def test_frame_loads_with_custom_loader_once() -> None:
             {"integration_1d": None, "integration_2d": None},
             "integration_1d",
         ),
-        ({"integration_1d": Integration1DPlan(npt=1), "chunk_size": 0}, "chunk_size"),
-        ({"chunk_size": 0}, "chunk_size"),
-        ({"gi": True}, "gi_incident_angle"),
     ],
 )
 def test_reduction_plan_validation(kwargs: dict, message: str) -> None:
@@ -94,11 +93,33 @@ def test_reduction_plan_validation(kwargs: dict, message: str) -> None:
         ReductionPlan(**kwargs)
 
 
+def test_run_reduction_chunk_size_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    # chunk_size is a run_reduction kwarg now, not a plan field.
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kwargs: _r1d(1.0))
+    scan = Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object())
+    with pytest.raises(ValueError, match="chunk_size"):
+        run_reduction(ReductionPlan(), scan, chunk_size=0)
+
+
 def test_integration_plan_validation() -> None:
     with pytest.raises(ValueError, match="npt"):
         Integration1DPlan(npt=0)
     with pytest.raises(ValueError, match="npt_rad"):
         Integration2DPlan(npt_rad=0)
+
+
+def test_gi_mode_is_a_sum_type() -> None:
+    # GIMode bundles the GI-only parameters into one optional field on
+    # ReductionPlan; the type system rules out "gi=False, incident_angle=2.5".
+    gi = GIMode(incident_angle=2.5)
+    assert gi.incident_angle == 2.5
+    assert gi.tilt_angle == 0.0
+    plan = ReductionPlan(gi=gi)
+    assert plan.gi is gi
+    # GIMode is frozen — can't mutate after construction
+    with pytest.raises(Exception):
+        gi.incident_angle = 5.0  # type: ignore[misc]
 
 
 def test_run_reduction_1d_2d_mask_threshold_norm_and_progress(
@@ -145,11 +166,10 @@ def test_run_reduction_1d_2d_mask_threshold_norm_and_progress(
         mask=np.array([[False, False], [True, False]]),
         threshold_min=0.0,
         threshold_max=50.0,
-        chunk_size=1,
     )
     scan.frames[0].normalization_factor = 9.0
 
-    result = run_reduction(plan, scan, progress_cb=events.append)
+    result = run_reduction(plan, scan, chunk_size=1, progress_cb=events.append)
 
     assert result.n_processed == 1
     assert result.frames[0].result_1d is not None
@@ -170,6 +190,29 @@ def test_run_reduction_1d_2d_mask_threshold_norm_and_progress(
     assert np.isnan(calls[0]["image"][1, 1])  # threshold_min
     assert calls[1]["npt_rad"] == 6
     assert calls[1]["npt_azim"] == 7
+
+
+def test_run_reduction_resolves_flat_mask_spec_after_image_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    def fake_1d(image, ai, **kwargs):
+        calls.append(kwargs)
+        return _r1d(1.0)
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", fake_1d)
+
+    result = run_reduction(
+        ReductionPlan(mask=MaskSpec(np.array([0, 3]))),
+        Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object()),
+    )
+
+    assert result.n_processed == 1
+    np.testing.assert_array_equal(
+        calls[0]["mask"],
+        np.array([[True, False], [False, True]]),
+    )
 
 
 def test_run_reduction_uses_independent_1d_2d_settings(
@@ -257,8 +300,10 @@ def test_run_reduction_cancellation_and_clear_images(
     )
 
     result = run_reduction(
-        ReductionPlan(clear_frame_images=True, chunk_size=2),
+        ReductionPlan(),
         scan,
+        chunk_size=2,
+        clear_frame_images=True,
         cancel_token=token,
     )
 
