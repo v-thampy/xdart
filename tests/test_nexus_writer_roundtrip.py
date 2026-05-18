@@ -8,8 +8,8 @@ shape (NX_class, signal/axes, dataset shapes, units, mandatory
 groups).  Any future writer that produces the same assertions will
 be format-compatible with everything that already reads these files.
 
-Why a synthetic sphere (not a real EwaldArch + pyFAI integrator):
-constructing :class:`EwaldArch` pulls in pyFAI's azimuthal
+Why a synthetic sphere (not a real LiveFrame + pyFAI integrator):
+constructing :class:`LiveFrame` pulls in pyFAI's azimuthal
 integrator just to satisfy ``setup_integrator()`` in __init__.  The
 writer never touches the integrator — it only reads attribute trees
 off arches.  Duck-typed objects with the right attrs are enough and
@@ -77,7 +77,7 @@ class _DuckPONI:
 
 
 class _DuckArch:
-    """Minimal duck-typed EwaldArch."""
+    """Minimal duck-typed LiveFrame."""
 
     def __init__(self, idx, *, nq=N_Q, nchi=N_CHI, seed=0):
         rng = np.random.default_rng(seed + idx)
@@ -112,28 +112,28 @@ class _DuckArch:
 
 
 class _DuckArches:
-    """Minimal ArchSeries stand-in for the writer tests.
+    """Minimal LiveFrameSeries stand-in for the writer tests.
 
     Provides the three interfaces the writer needs:
 
     * ``.index`` — list of frame indices, matching
-      :class:`ArchSeries.index` (an attribute, not the inherited
+      :class:`LiveFrameSeries.index` (an attribute, not the inherited
       ``list.index`` method that the previous fixture exposed).
     * ``arches[idx]`` — fetch the arch with that *frame* index.
     * ``list(arches)`` — iterate arches in index order.
 
-    Real ArchSeries adds lazy-disk-load + an in-memory cache; this
+    Real LiveFrameSeries adds lazy-disk-load + an in-memory cache; this
     duck stores everything in a dict for in-memory speed.
     """
 
     def __init__(self, arches):
         self._by_idx = {a.idx: a for a in arches}
         self.index = [a.idx for a in arches]
-        # Mirror ArchSeries._in_memory — the writer's R4 helpers
+        # Mirror LiveFrameSeries._in_memory — the writer's R4 helpers
         # (_representative_poni, _write_per_frame_metadata) read this
         # directly to avoid materialising the full arch list on every
         # save.  Tests use the same dict as _by_idx so every arch is
-        # always "in memory" (real ArchSeries caps this at 64 with
+        # always "in memory" (real LiveFrameSeries caps this at 64 with
         # FIFO eviction; tests don't need to exercise that path).
         self._in_memory = self._by_idx
 
@@ -154,7 +154,7 @@ class _DuckArches:
 
 
 class _DuckSphere:
-    """Minimal duck-typed EwaldSphere."""
+    """Minimal duck-typed LiveScan."""
 
     def __init__(self, arches, *, scan_data=None, geometry=None,
                  global_mask=None):
@@ -472,8 +472,8 @@ def test_reload_only_flag_round_trips(tmp_path):
     save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
 
     # Fresh arches (from the wrangler) — default is_reload_only=False.
-    from xdart.modules.ewald.arch import EwaldArch
-    fresh = EwaldArch(idx=0)
+    from xdart.modules.ewald.arch import LiveFrame
+    fresh = LiveFrame(idx=0)
     assert fresh.is_reload_only is False
 
     # Reloaded arches — the loader stamps the flag.
@@ -483,17 +483,17 @@ def test_reload_only_flag_round_trips(tmp_path):
 
 
 def test_has_reload_only_frames_sphere_helper(tmp_path):
-    """EwaldSphere.has_reload_only_frames mirrors the in-memory cache."""
-    from xdart.modules.ewald.sphere import EwaldSphere
-    from xdart.modules.ewald.arch import EwaldArch
+    """LiveScan.has_reload_only_frames mirrors the in-memory cache."""
+    from xdart.modules.ewald.sphere import LiveScan
+    from xdart.modules.ewald.arch import LiveFrame
 
-    sphere = EwaldSphere(name='t', data_file=str(tmp_path / 'none.nxs'))
+    sphere = LiveScan(name='t', data_file=str(tmp_path / 'none.nxs'))
 
     # No arches → False (nothing to re-integrate, but nothing flagged).
     assert sphere.has_reload_only_frames() is False
 
     # A fresh arch (wrangler hand-off) — flag stays False.
-    fresh = EwaldArch(idx=0)
+    fresh = LiveFrame(idx=0)
     sphere.arches.stash(fresh)
     sphere.arches.index.append(0)
     assert sphere.has_reload_only_frames() is False
@@ -508,7 +508,7 @@ def test_acquire_save_reload_reintegrate_save_reload(tmp_path):
     → save → reload workflow that the GUI exercises, verifying that
     the second reload sees the post-reintegration values on disk.
 
-    Uses the real ArchSeries (not the duck) so the test covers the
+    Uses the real LiveFrameSeries (not the duck) so the test covers the
     actual lazy-load + replace-frames code path.  Re-integration
     here is faked by mutating the int_1d values on the in-memory
     arches — we're testing the writer's replace mode, not pyFAI.
@@ -926,7 +926,7 @@ def test_scan_data_index_aligns_with_gapped_frame_ids(tmp_path):
     appear as the reloaded ``scan_data`` index.
     """
     from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
-    from xdart.modules.ewald.sphere import EwaldSphere
+    from xdart.modules.ewald.sphere import LiveScan
     from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
 
     gapped = [10, 12, 17, 22]
@@ -944,8 +944,8 @@ def test_scan_data_index_aligns_with_gapped_frame_ids(tmp_path):
     path = tmp_path / "gapped.nxs"
     save_sphere_to_nexus(sphere, path, mode="w", finalize=False)
 
-    # Round-trip through the real EwaldSphere loader.
-    reloaded = EwaldSphere(name="gapped", data_file=str(path))
+    # Round-trip through the real LiveScan loader.
+    reloaded = LiveScan(name="gapped", data_file=str(path))
     reloaded.load_from_h5(replace=True, mode="r")
 
     # The reloaded scan_data index *is* the gapped frame IDs.
