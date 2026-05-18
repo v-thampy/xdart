@@ -944,6 +944,10 @@ class H5Viewer(QWidget):
             self.ui.listData.addItem(item)
         self.ui.listData.selectAll()
         self.ui.listData.blockSignals(False)
+        # Keep the live-scan boundary cache in sync with the freshly
+        # populated list so a subsequent update_data() doesn't take the
+        # append-only fast path against stale cached state.
+        self._remember_displayed_frames()
 
         self.sigUpdate.emit()
 
@@ -999,6 +1003,9 @@ class H5Viewer(QWidget):
             self._load_single_frame(fpath, frame_idx=0, arch_idx=1)
             self.arch_ids.append('1')
 
+        # Sync the live-scan boundary cache with whatever just landed in
+        # listData (frame-numbers list, or empty for single-frame files).
+        self._remember_displayed_frames()
         self.sigUpdate.emit()
 
     # Common detector shapes to try for raw binary files (name, shape)
@@ -1075,6 +1082,9 @@ class H5Viewer(QWidget):
                 self.ui.listData.itemSelectionChanged.disconnect(self.data_changed)
                 self.ui.listData.clear()
                 self.ui.listData.addItem('Loading...')
+                # Reset the live-scan boundary cache — the next
+                # update_data() must rebuild from the new sphere.
+                self._remember_displayed_frames()
                 # self.set_open_enabled(False)
                 self.file_thread.fname = fname
                 self.file_thread.queue.put("set_datafile")
