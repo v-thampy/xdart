@@ -21,7 +21,6 @@ from pyqtgraph import Qt
 from pyqtgraph.parametertree import Parameter
 
 # This module imports
-from xdart.modules.ewald import EwaldSphere
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from ssrl_xrd_tools.io.export import write_xye
 

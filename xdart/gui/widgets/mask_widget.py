@@ -16,7 +16,6 @@ from PySide6.QtCore import Signal
 import pyqtgraph as pg
 
 from xdart.utils.pgOverrides.ROI import XDEllipseROI, XDPolyLineROI
-from xdart.modules.ewald import EwaldArch, EwaldSphere
 from pyqtgraph import LineROI, ROI
 
 from .image_widget import XDImageWidget
@@ -240,5 +239,4 @@ class MaskWidget(QtWidgets.QWidget):
         self.ui.xMinBox.setValue(0)
         self.ui.xMaxBox.setValue(self.ui.xMaxBox.maximum())
         self.update_mask()
-
 

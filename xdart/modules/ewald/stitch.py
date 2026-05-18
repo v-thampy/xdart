@@ -1,4 +1,4 @@
-"""Batch stitching helper for the v2 ``EwaldSphere`` (xdart 0.37+).
+"""Batch stitching helper for the v2 ``LiveScan`` (xdart 0.37+).
 
 Thin orchestration layer over
 :mod:`ssrl_xrd_tools.integrate.multi` (which exports
@@ -21,11 +21,11 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 
 if TYPE_CHECKING:  # pragma: no cover
-    from xdart.modules.ewald.sphere import EwaldSphere
+    from xdart.modules.live import LiveScan
 
 
 def run_stitch(
-    sphere: "EwaldSphere",
+    sphere: "LiveScan",
     *,
     mode: Literal["1d", "2d"] = "1d",
     norm_motor: str | None = None,
@@ -88,12 +88,12 @@ def run_stitch(
         raise ValueError(f"mode must be '1d' or '2d', got {mode!r}")
     if sphere.geometry is None:
         raise RuntimeError(
-            "EwaldSphere.geometry is unset — set it before stitching "
+            "LiveScan.geometry is unset — set it before stitching "
             "(use ssrl_xrd_tools.core.geometry.DiffractometerGeometry)."
         )
     arches = list(sphere.arches)
     if not arches:
-        raise RuntimeError("EwaldSphere has no arches — load frames first")
+        raise RuntimeError("LiveScan has no frames — load frames first")
 
     base_poni = getattr(arches[0], "poni", None)
     if base_poni is None:

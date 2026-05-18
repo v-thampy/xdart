@@ -33,7 +33,7 @@ else:
     from pyqtgraph.Qt import QtWidgets, QtCore
 
 # This module imports
-from xdart.modules.ewald import EwaldSphere, EwaldArch
+from xdart.modules.live import LiveFrame, LiveScan
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer
 from .display_frame_widget import displayFrameWidget
@@ -59,11 +59,11 @@ wranglers = {
 def spherelocked(func):
     """Decorator that acquires sphere_lock before calling the wrapped method.
 
-    If self.sphere is not an EwaldSphere (e.g. during initialisation),
+    If self.sphere is not a LiveScan (e.g. during initialisation),
     the function is called without the lock rather than silently returning None.
     """
     def wrapper(self, *args, **kwargs):
-        if isinstance(self.sphere, EwaldSphere):
+        if isinstance(self.sphere, LiveScan):
             with self.sphere.sphere_lock:
                 return func(self, *args, **kwargs)
         return func(self, *args, **kwargs)
@@ -152,11 +152,11 @@ class staticWidget(QWidget):
         # J2: share ``file_lock`` with the sphere so direct
         # ArchSeries lazy loads use the same lock as the
         # wrangler's save paths.
-        self.sphere = EwaldSphere('null_main',
-                                  data_file=self.fname,
-                                  static=True,
-                                  file_lock=self.file_lock)
-        self.arch = EwaldArch(static=True, gi=self.sphere.gi)
+        self.sphere = LiveScan('null_main',
+                               data_file=self.fname,
+                               static=True,
+                               file_lock=self.file_lock)
+        self.arch = LiveFrame(static=True, gi=self.sphere.gi)
         self.arch_ids = []
         self.arches = OrderedDict()
         # O4: both 1D and 2D caches are bounded with the same cap.
@@ -677,7 +677,7 @@ class staticWidget(QWidget):
             name: str, scan name
             fname: str, path to data file for scan
         """
-        arch = EwaldArch(idx=arch_data['idx'], map_raw=arch_data['map_raw'],
+        arch = LiveFrame(idx=arch_data['idx'], map_raw=arch_data['map_raw'],
                          mask=arch_data['mask'], scan_info=arch_data['scan_info'],
                          poni_file=arch_data['poni_file'], static=self.sphere.static, gi=self.sphere.gi)
         arch.int_1d = arch_data['int_1d']

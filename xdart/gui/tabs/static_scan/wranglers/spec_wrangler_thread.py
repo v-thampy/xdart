@@ -37,7 +37,7 @@ import h5py
 from pyqtgraph import Qt
 
 # Project imports
-from xdart.modules.ewald import EwaldArch, EwaldSphere
+from xdart.modules.live import LiveFrame, LiveScan
 from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from ssrl_xrd_tools.io.image import read_image, count_frames
@@ -48,7 +48,7 @@ from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
     StandardPlanCache,
-    dispatch_arch_reduction,
+    dispatch_live_frame_reduction,
 )
 from .wrangler_widget import wranglerThread
 
@@ -203,7 +203,7 @@ class specThread(wranglerThread):
         input_q: mp.Queue, queue for commands sent from parent
         signal_q: mp.Queue, queue for commands sent from process
         sphere_args: dict, used as **kwargs in sphere initialization.
-            see EwaldSphere.
+            see LiveScan.
         timeout: float or int, how long to continue checking for new
             data.
         command: command passed to start, stop etc.
@@ -707,7 +707,7 @@ class specThread(wranglerThread):
         img_file, img_number, img_data, img_meta, bg_raw, _ = pending_entry
         # Build a scratch arch identical in shape to what
         # ``_process_one`` constructs so the angle math agrees.
-        scratch = EwaldArch(
+        scratch = LiveFrame(
             img_number, img_data, poni=self.poni,
             scan_info=img_meta, static=True, gi=True,
             th_mtr=self.incidence_motor,
@@ -743,7 +743,7 @@ class specThread(wranglerThread):
         """Parallel batch processing using ThreadPoolExecutor.
 
         Phase 1 — Parallel integration:
-            Each worker creates an EwaldArch, runs integrate_1d / integrate_2d,
+            Each worker creates a LiveFrame, runs integrate_1d / integrate_2d,
             and writes xye/csv.  pyFAI's Cython integration releases the GIL,
             so threads get true parallelism for the CPU-heavy part.
 
@@ -852,7 +852,7 @@ class specThread(wranglerThread):
             # one worker at a time — that's what makes parallel
             # batch correct vs the old shared-instance code path.
             with integrator_pool.borrow() as ai:
-                arch = EwaldArch(
+                arch = LiveFrame(
                     img_number, img_data, poni=self.poni,
                     scan_info=img_meta, static=True, gi=gi,
                     th_mtr=th_mtr, bg_raw=bg_raw,
@@ -866,7 +866,7 @@ class specThread(wranglerThread):
                 # H2 + S3 unified dispatch.  When ``standard_plan`` is
                 # None (GI sphere) we run the fiber-integrator path
                 # inside the legacy_gi closure; otherwise the headless
-                # ``reduce_ewald_arch`` handles it.
+                # ``reduce_live_frame`` handles it.
                 def _legacy_gi_for_arch() -> None:
                     with self._borrow_fiber_integrator(
                         sphere, fiber_pool, arch,
@@ -883,7 +883,7 @@ class specThread(wranglerThread):
                                 **bai_2d_args,
                             )
 
-                dispatch_arch_reduction(
+                dispatch_live_frame_reduction(
                     arch, sphere,
                     standard_plan=standard_plan,
                     integrator=ai,
@@ -1038,7 +1038,7 @@ class specThread(wranglerThread):
         # why this is fast even with per-frame threshold filtering on.
         img_data = self._apply_threshold_inline(img_data)
         arch_mask = self._resolve_arch_mask(sphere, img_data)
-        arch = EwaldArch(
+        arch = LiveFrame(
             img_number, img_data, poni=self.poni,
             scan_info=img_meta, static=True, gi=self.gi,
             th_mtr=self.incidence_motor, bg_raw=bg_raw,
@@ -1078,7 +1078,7 @@ class specThread(wranglerThread):
                     **sphere.bai_2d_args,
                 )
 
-        dispatch_arch_reduction(
+        dispatch_live_frame_reduction(
             arch, sphere,
             standard_plan=self._plan_cache.get(
                 sphere, integrate_2d=not sphere.skip_2d,
@@ -1658,7 +1658,7 @@ class specThread(wranglerThread):
             pass
 
     def initialize_sphere(self):
-        """If scan changes, initialize new EwaldSphere object.
+        """If scan changes, initialize new LiveScan object.
         If mode is overwrite, replace existing HDF5 file, else append to it.
         """
         fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
@@ -1670,17 +1670,17 @@ class specThread(wranglerThread):
         # output path, and static_scan_widget.wrangler_finished
         # cannot find the generated file to reload at end of batch.
         self.fname = fname
-        sphere = EwaldSphere(self.scan_name,
-                             data_file=fname,
-                             static=True,
-                             gi=self.gi,
-                             incidence_motor=self.incidence_motor,
-                             series_average=self.series_average,
-                             single_img=self.single_img,
-                             global_mask=self.mask,
-                             # J2: share lock with wrangler save path
-                             file_lock=self.file_lock,
-                             **self.sphere_args)
+        sphere = LiveScan(self.scan_name,
+                          data_file=fname,
+                          static=True,
+                          gi=self.gi,
+                          incidence_motor=self.incidence_motor,
+                          series_average=self.series_average,
+                          single_img=self.single_img,
+                          global_mask=self.mask,
+                          # J2: share lock with wrangler save path
+                          file_lock=self.file_lock,
+                          **self.sphere_args)
         sphere.skip_2d = self.sphere.skip_2d
         # v2 NeXus writer needs a DiffractometerGeometry to derive per-frame
         # rot1/rot2/rot3 and incidence-angle arrays from scan_data.  The
