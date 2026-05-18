@@ -115,9 +115,9 @@ class integratorTree(QtWidgets.QWidget):
 
     methods:
         get_args: Gets requested parameters and converts them to args
-            in EwaldSphere object.
+            in LiveScan object.
         setEnabled: Enables integration and parameter modification.
-        update: Grabs args from EwaldSphere object and sets all params
+        update: Grabs args from LiveScan object and sets all params
             to match.
     """
     def __init__(self, sphere, arch, file_lock,
@@ -382,7 +382,7 @@ class integratorTree(QtWidgets.QWidget):
         _update_params private methods to update.
 
         args:
-            sphere: EwaldSphere, object to get args from.
+            sphere: LiveScan, object to get args from.
         """
         self._update_params()
 
@@ -434,7 +434,7 @@ class integratorTree(QtWidgets.QWidget):
         """Grabs args from sphere and syncs parameters with them.
 
         args:
-            sphere: EwaldSphere, object to get args from.
+            sphere: LiveScan, object to get args from.
         """
         self._disconnect_inp_signals()
         with self.sphere.sphere_lock:
@@ -446,7 +446,7 @@ class integratorTree(QtWidgets.QWidget):
         """Updates sphere with all parameters held in integrator.
 
         args:
-            sphere: EwaldSphere, object to update
+            sphere: LiveScan, object to update
             key: str, which args to update.
         """
         with self.sphere.sphere_lock:
@@ -984,11 +984,11 @@ class integratorTree(QtWidgets.QWidget):
         any of the sphere's arches lacks a raw image AND no resolvable
         source file.
 
-        After L1 wired lazy raw load, ``EwaldArch.integrate_*``
+        After L1 wired lazy raw load, ``LiveFrame.integrate_*``
         auto-loads ``map_raw`` from ``arch.source_file`` /
         ``arch.source_frame_idx`` when it's missing — so this guard
         only fires when the source file has been moved/deleted
-        relative to the .nxs.  See ``EwaldSphere.has_reload_only_frames``
+        relative to the .nxs.  See ``LiveScan.has_reload_only_frames``
         for the predicate.
 
         Returns True iff the action was blocked.

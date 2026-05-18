@@ -54,7 +54,7 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         parameters: pyqtgraph Parameter, stores parameters from user
         scan_name: str, current scan name, used to handle syncing data
         sphere_args: dict, used as **kwargs in sphere initialization.
-            see EwaldSphere.
+            see LiveScan.
         thread: wranglerThread or subclass, QThread for controlling
             processes
     
@@ -148,7 +148,7 @@ class wranglerThread(Qt.QtCore.QThread):
         input_q: mp.Queue, queue for commands sent from parent
         signal_q: mp.Queue, queue for commands sent from process
         sphere_args: dict, used as **kwargs in sphere initialization.
-            see EwaldSphere.
+            see LiveScan.
     
     methods:
         run: Called by start, main thread task.
@@ -175,7 +175,7 @@ class wranglerThread(Qt.QtCore.QThread):
                  parent=None):
         """command_queue: mp.Queue, queue for commands sent from parent
         sphere_args: dict, used as **kwargs in sphere initialization.
-            see EwaldSphere.
+            see LiveScan.
         fname: str, path to data file.
         file_lock: mp.Condition, process safe lock for file access
         """
@@ -509,7 +509,7 @@ class wranglerThread(Qt.QtCore.QThread):
           * Returns arches in idx-sorted order so on-disk
             frame_index stays monotonic.
 
-        Returns a ``list[EwaldArch]`` with ``None`` entries elided.
+        Returns a ``list[LiveFrame]`` with ``None`` entries elided.
 
         P5: uses the persistent :attr:`_executor` instead of creating a
         fresh ``ThreadPoolExecutor`` per call.  Stop-mid-chunk cancels
