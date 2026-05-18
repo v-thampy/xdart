@@ -97,20 +97,12 @@ class DisplayPlotMixin:
         if ydata.ndim == 1:
             ydata = ydata[np.newaxis, :]
 
-        # ── Single-mode = one curve, always.
-        # During a live scan with auto_last the wrangler keeps publishing
-        # new frames and the listData selection may accumulate (e.g. the
-        # user clicked "Show All" earlier, or sticky selection from a
-        # prior plot-mode); without this guard, update_1d_view's
-        # ``(plotMethod=='Single' and ydata.shape[0]>1)`` fallback would
-        # silently turn Single into a Waterfall (stacked with offset).
-        # Pick the latest sorted row — that's the newest frame on a
-        # live scan and the picked frame when manually browsing (since
-        # the manual single-click path leaves ydata at shape[0]==1
-        # anyway, this guard is a no-op there).
-        if self.plotMethod == 'Single' and ydata.shape[0] > 1:
-            ydata = ydata[-1:, :]
-            arch_names = list(arch_names[-1:])
+        # Single-mode overplots whatever rows are in the current
+        # selection: a single-click gives one curve, shift/cmd-click
+        # gives several.  Live-scan selection accumulation (which used
+        # to silently turn Single into a Waterfall) is now prevented at
+        # the source by ClearAndSelect in h5viewer + latest_arch, so we
+        # don't need to narrow ydata here.
 
         current_plot_unit = self.ui.plotUnit.currentIndex()
         unit_changed = current_plot_unit != self._last_plot_unit
@@ -216,9 +208,10 @@ class DisplayPlotMixin:
 
         self.ui.yOffset.setEnabled(False)
         # yOffset is only meaningful when more than one curve is on screen.
-        # Single mode always shows exactly one curve (enforced in
-        # update_plot) so the offset widget stays disabled there.
-        if self.plotMethod == 'Overlay' and len(self.arch_names) > 1:
+        # That's Overlay with a multi-selection, or Single mode with a
+        # manual shift/cmd-click multi-selection (which behaves like Overlay).
+        if (self.plotMethod in ('Overlay', 'Single')
+                and len(self.arch_names) > 1):
             self.ui.yOffset.setEnabled(True)
 
         n_curves = len(self.plot_data[1])
@@ -269,9 +262,11 @@ class DisplayPlotMixin:
                 ydata = np.sqrt(ydata)
             ylabel = f'<math>&radic;</math>{int_label} (a.u.)'
 
-        # update_plot narrows ydata to one row in Single mode, so by the
-        # time we get here only Overlay/Waterfall ever produce >1 rows.
-        if self.plotMethod in ['Overlay', 'Waterfall']:
+        # Overlay/Waterfall always stack the selection.  Single also
+        # stacks when the user has multi-selected frames (shift/cmd-click) —
+        # that branch behaves like Overlay but without the yOffset.
+        multi_single = self.plotMethod == 'Single' and ydata.shape[0] > 1
+        if self.plotMethod in ['Overlay', 'Waterfall'] or multi_single:
             ydata = ydata[self.wf_start::self.wf_step]
             self.setup_curves()
 
