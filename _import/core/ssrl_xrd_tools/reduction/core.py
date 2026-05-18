@@ -62,7 +62,7 @@ class Frame:
     source_path: Path | str | None = None
     source_frame_index: int | None = None
     background: np.ndarray | float | None = None
-    mask: np.ndarray | None = None
+    mask: np.ndarray | MaskSpec | None = None
     normalization_factor: float | None = None
     loader: ImageLoader | None = None
 
