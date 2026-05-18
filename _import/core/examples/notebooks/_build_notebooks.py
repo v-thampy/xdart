@@ -87,7 +87,7 @@ Walk through the canonical batch-integration workflow in
 
 **Adapt the paths in the "Configuration" cell to your data.**
 """),
-    md("## 1. Imports"),
+    md("## Imports"),
     code("""from pathlib import Path
 
 import numpy as np
@@ -100,26 +100,43 @@ from ssrl_xrd_tools.integrate import (
     integrate_1d,
     integrate_2d,
 )"""),
-    md("## 2. Configuration\n\nAll paths and integration parameters live in this cell."),
-    code("""# ───────── EDIT THESE ─────────
-data_dir   = Path('~/data/my_scan').expanduser()
-poni_file  = data_dir / 'calibration.poni'
-mask_file  = data_dir / 'mask.edf'          # set to None if you don't have one
-image_glob = '*.tif'                        # pattern relative to data_dir
+    md("""## ✏️ Configuration
+
+**Edit the cell below**, then run the rest of the notebook top-to-bottom.
+Nothing in the later cells needs changing — the validation cell catches
+typos before integration starts."""),
+    code("""# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                  EDIT THIS CELL — paths + parameters                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ── REQUIRED ───────────────────────────────────────────────────────────
+data_dir   = Path('~/data/my_scan').expanduser()    # ← REPLACE
+poni_file  = data_dir / 'calibration.poni'           # ← REPLACE
+image_glob = '*.tif'                                  # pattern inside data_dir
+
+# ── OPTIONAL paths ─────────────────────────────────────────────────────
+mask_file  = data_dir / 'mask.edf'           # set to None if no mask file
 out_file   = data_dir / 'integrated.nxs'
 
-# Integration parameters
-npt_1d    = 1000                            # radial bins for 1D
-npt_2d    = (1000, 360)                     # (radial, azimuthal) for 2D
-unit      = 'q_A^-1'                        # or '2th_deg', 'd_A'
-method    = 'BBox'                          # pyFAI integration method
-# ──────────────────────────────"""),
-    md("## 3. Load calibration + mask"),
+# ── Integration tuning ─────────────────────────────────────────────────
+npt_1d  = 1000                # 1D radial bins
+npt_2d  = (1000, 360)          # (radial, azimuthal) for 2D
+unit    = 'q_A^-1'             # 'q_A^-1' | '2th_deg' | 'd_A'
+method  = 'BBox'               # pyFAI integration method"""),
+    md("### Validate the config"),
+    code("""assert data_dir.is_dir(), f'data_dir not found: {data_dir}'
+assert poni_file.is_file(), f'poni_file not found: {poni_file}'
+if mask_file is not None:
+    assert mask_file.is_file(), f'mask_file not found: {mask_file}'
+_images_preview = sorted(data_dir.glob(image_glob))
+assert _images_preview, f'No images match {image_glob!r} in {data_dir}'
+print(f'OK — {len(_images_preview)} image(s) found, PONI present.')"""),
+    md("## Load calibration + mask"),
     code("""poni = load_poni(poni_file)
 mask = load_mask(mask_file) if mask_file and mask_file.exists() else None
 print(f'PONI: dist={poni.dist:.4f} m, λ={poni.wavelength * 1e10:.4f} Å')
 print(f'Mask: {mask.shape if mask is not None else \"none\"}')"""),
-    md("## 4. Discover images + batch integrate"),
+    md("## Discover images + batch integrate"),
     code("""image_files = natsorted(data_dir.glob(image_glob))
 print(f'Found {len(image_files)} images matching {image_glob!r}')
 
@@ -132,7 +149,7 @@ for i, path in enumerate(image_files):
     results_2d.append(r2)
     if (i + 1) % 10 == 0 or i == len(image_files) - 1:
         print(f'  integrated {i + 1}/{len(image_files)}')"""),
-    md("""## 5. Save to NeXus
+    md("""## Save to NeXus
 
 `write_nexus` writes a single self-describing .nxs file containing all
 1D + 2D results with their axes, units, and metadata. Pass the result
@@ -148,7 +165,7 @@ write_nexus(
     overwrite=True,
 )
 print(f'Saved to {out_file}')"""),
-    md("## 6. Sanity-check: plot first frame"),
+    md("## Sanity-check: plot first frame"),
     code("""fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
 
 r1, r2 = results_1d[0], results_2d[0]
@@ -170,8 +187,13 @@ plt.show()"""),
 
 ### Next steps
 
-- For end-to-end automation (directory watching + parallel integration),
-  see `ssrl_xrd_tools.integrate.process_series`.
+- **Notebook 06 — Headless Reduction Pipeline** is the recommended
+  higher-level alternative to the per-frame `integrate_1d` /
+  `integrate_2d` loop above.  It uses `ReductionPlan` + `Scan` +
+  `Frame` + `NexusSink` so the same configuration can drive notebook,
+  CLI, and the xdart GUI without code changes.  Prefer it for
+  new code; this notebook stays as the "low-level building blocks"
+  reference.
 - For multi-detector-angle scans where the detector sweeps and you want
   one stitched pattern: see notebook **02 — MultiGeometry stitching**.
 - To do phase / peak fitting on the integrated results: see notebook
@@ -202,7 +224,7 @@ takes a base PONI and a per-frame list of detector rotation offsets.
 This notebook walks through the full pattern using a stack of images
 and a list of `rot1` (in-plane) angles.
 """),
-    md("## 1. Imports + configuration"),
+    md("## Imports"),
     code("""from pathlib import Path
 
 import numpy as np
@@ -215,31 +237,47 @@ from ssrl_xrd_tools.integrate import (
     create_multigeometry_integrators,
     stitch_1d,
     stitch_2d,
-)
+)"""),
+    md("""## ✏️ Configuration
 
-# ───────── EDIT THESE ─────────
-data_dir   = Path('~/data/my_stitched_scan').expanduser()
-poni_file  = data_dir / 'calibration.poni'
-mask_file  = data_dir / 'mask.edf'
-image_glob = '*_scan*.tif'
+**Edit the cell below**, then run the rest of the notebook top-to-bottom."""),
+    code("""# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                  EDIT THIS CELL — paths + parameters                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ── REQUIRED ───────────────────────────────────────────────────────────
+data_dir   = Path('~/data/my_stitched_scan').expanduser()  # ← REPLACE
+poni_file  = data_dir / 'calibration.poni'                  # ← REPLACE
+image_glob = '*_scan*.tif'                                   # pattern in data_dir
 
 # Per-image detector rotation offsets (degrees).  Length must match
-# the number of images discovered below.  For a 2-circle scan this
-# is typically the `del` / `tth` motor stream.
-rot1_angles = np.linspace(0.0, 30.0, 11)      # 11 frames, 0° → 30° in 3° steps
-rot2_angles = None                            # set to an array if you also vary rot2
+# the number of images discovered.  For a 2-circle scan this is
+# typically the `del` / `tth` motor stream.
+rot1_angles = np.linspace(0.0, 30.0, 11)     # ← REPLACE — 11 frames, 0° → 30°
+rot2_angles = None                            # set to an array if rot2 also varies
 
-# Optional per-image monitor normalisation (i0 / counts / etc.)
-normalization = None                          # or e.g. np.array([...])
+# ── OPTIONAL ───────────────────────────────────────────────────────────
+mask_file     = data_dir / 'mask.edf'        # set to None if no mask
+normalization = None                          # or np.array([...]) of per-frame i0
 
-# Stitched-output parameters
+# ── Stitched-output tuning ─────────────────────────────────────────────
 npt_1d       = 2000
 npt_rad_2d   = 1000
 npt_azim_2d  = 360
 unit         = 'q_A^-1'
-radial_range = None                           # (qmin, qmax) or None for auto
-# ──────────────────────────────"""),
-    md("## 2. Load PONI + images + mask"),
+radial_range = None                          # (qmin, qmax) or None for auto"""),
+    md("### Validate the config"),
+    code("""assert data_dir.is_dir(), f'data_dir not found: {data_dir}'
+assert poni_file.is_file(), f'poni_file not found: {poni_file}'
+if mask_file is not None:
+    assert mask_file.is_file(), f'mask_file not found: {mask_file}'
+_images_preview = natsorted(data_dir.glob(image_glob))
+assert _images_preview, f'No images match {image_glob!r} in {data_dir}'
+assert len(_images_preview) == len(rot1_angles), (
+    f'image count {len(_images_preview)} != rot1_angles length {len(rot1_angles)}'
+)
+print(f'OK — {len(_images_preview)} frame(s), PONI present.')"""),
+    md("## Load PONI + images + mask"),
     code("""poni = load_poni(poni_file)
 mask = load_mask(mask_file) if mask_file.exists() else None
 
@@ -252,7 +290,7 @@ assert len(image_files) == len(rot1_angles), (
 images = [read_image(p, mask=mask) for p in image_files]
 print(f'Loaded image stack: {len(images)} frames, '
       f'first shape {images[0].shape}')"""),
-    md("""## 3. Build per-image integrators
+    md("""## Build per-image integrators
 
 `create_multigeometry_integrators` clones the base PONI N times and
 applies the per-frame rotation offsets to each."""),
@@ -261,7 +299,7 @@ applies the per-frame rotation offsets to each."""),
 )
 print(f'Built {len(integrators)} per-image integrators')
 print(f'  rot1: {[f\"{np.rad2deg(ai.rot1):.2f}°\" for ai in integrators[:3]]} ...')"""),
-    md("## 4. Stitch into 1D + 2D"),
+    md("## Stitch into 1D + 2D"),
     code("""result_1d = stitch_1d(
     images, integrators,
     npt=npt_1d,
@@ -287,7 +325,7 @@ result_2d = stitch_2d(
 
 print(f'1D: {result_1d.intensity.shape}, unit={result_1d.unit}')
 print(f'2D: {result_2d.intensity.shape}, unit={result_2d.unit}')"""),
-    md("## 5. Plot the stitched results"),
+    md("## Plot the stitched results"),
     code("""fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
 
 ax1.plot(result_1d.radial, result_1d.intensity)
@@ -342,7 +380,7 @@ notebook fits the **same pattern** with both and compares results.
 
 **Adapt the paths + `q_range` in the configuration cell.**
 """),
-    md("## 1. Imports"),
+    md("## Imports"),
     code("""from pathlib import Path
 
 import numpy as np
@@ -355,20 +393,32 @@ from ssrl_xrd_tools.analysis.fitting import (
     extract_peaks,
     snip_1d,
 )"""),
-    md("## 2. Configuration"),
-    code("""# ───────── EDIT THESE ─────────
-data_file = Path('~/data/integrated_pattern.npz').expanduser()
-cif_dir   = Path('~/data/cifs').expanduser()
+    md("""## ✏️ Configuration
+
+**Edit the cell below**, then run the rest of the notebook top-to-bottom."""),
+    code("""# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                  EDIT THIS CELL — paths + parameters                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ── REQUIRED ───────────────────────────────────────────────────────────
+data_file = Path('~/data/integrated_pattern.npz').expanduser()  # ← REPLACE
+cif_dir   = Path('~/data/cifs').expanduser()                    # ← REPLACE
 cif_files = {
-    'alpha':  cif_dir / 'phase_alpha.cif',
+    'alpha':  cif_dir / 'phase_alpha.cif',     # ← REPLACE with your phases
     'beta':   cif_dir / 'phase_beta.cif',
 }
-wavelength_A = 1.5406                  # Cu Kα — set to YOUR wavelength
+wavelength_A = 1.5406              # ← REPLACE — Cu Kα default, set to YOUR wavelength
 
-q_range = (1.0, 5.0)                   # fit window in Å⁻¹
-background = 'snip'                    # 'snip' | 'chebyshev_5' | 'constant' | ...
-# ──────────────────────────────"""),
-    md("""## 3. Load a single integrated pattern
+# ── Fitting parameters ─────────────────────────────────────────────────
+q_range    = (1.0, 5.0)            # fit window in Å⁻¹
+background = 'snip'                # 'snip' | 'chebyshev_5' | 'constant' | ..."""),
+    md("### Validate the config"),
+    code("""assert data_file.is_file(), f'data_file not found: {data_file}'
+assert cif_dir.is_dir(), f'cif_dir not found: {cif_dir}'
+for name, path in cif_files.items():
+    assert path.is_file(), f'CIF {name!r} not found: {path}'
+print(f'OK — pattern + {len(cif_files)} CIF(s) present.')"""),
+    md("""## Load a single integrated pattern
 
 We assume the pattern is stored as an `npz` with `q` and `intensity`
 arrays.  Adapt this cell if you're reading from NeXus, XYE, etc."""),
@@ -380,7 +430,7 @@ ax.plot(q, intensity, lw=0.8)
 ax.set_xlabel('q (Å⁻¹)'); ax.set_ylabel('Intensity')
 ax.set_xlim(*q_range)
 plt.tight_layout(); plt.show()"""),
-    md("""## 4. Structure-informed: `PhaseFitter`
+    md("""## Structure-informed: `PhaseFitter`
 
 Build a `PhaseModel` per phase (peak positions + template intensities
 derived from the CIF via pymatgen), feed them into a `PhaseFitter`,
@@ -419,7 +469,7 @@ for name, comp in components.items():
 ax.set_xlabel('q (Å⁻¹)'); ax.set_ylabel('Intensity')
 ax.legend(loc='best')
 plt.tight_layout(); plt.show()"""),
-    md("""## 5. Structure-agnostic: `fit_peaks`
+    md("""## Structure-agnostic: `fit_peaks`
 
 `fit_peaks` accepts an explicit list of peak positions (or
 auto-estimates them when ``positions=None``) and fits each as an
@@ -450,7 +500,7 @@ for c, s, a in list(zip(peak_result.peak_centers,
                         peak_result.peak_sigmas,
                         peak_result.peak_amplitudes))[:3]:
     print(f'  q={c:.4f}  σ={s:.4f}  amp={a:.2f}')"""),
-    md("## 6. Compare side-by-side"),
+    md("## Compare side-by-side"),
     code("""fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True,
                          gridspec_kw={'height_ratios': [3, 1]})
 ax, axr = axes
@@ -498,7 +548,7 @@ The result is a `pandas.DataFrame` with one row per pattern, ready
 for plotting trends (phase fractions vs. position / temperature /
 composition).
 """),
-    md("## 1. Imports + paths"),
+    md("## Imports"),
     code("""from pathlib import Path
 
 import numpy as np
@@ -506,18 +556,32 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from ssrl_xrd_tools.analysis.phase import PhaseModel
-from ssrl_xrd_tools.analysis.fitting import FitConfig, fit_sequence
+from ssrl_xrd_tools.analysis.fitting import FitConfig, fit_sequence"""),
+    md("""## ✏️ Configuration
 
-# ───────── EDIT THESE ─────────
-data_dir    = Path('~/data/HZO_series').expanduser()
-patterns_pkl = data_dir / 'patterns.npz'   # or however you store them
-cif_dir     = data_dir / 'cifs'
-out_csv     = data_dir / 'phase_fractions.csv'
+**Edit the cell below**, then run the rest of the notebook top-to-bottom."""),
+    code("""# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                  EDIT THIS CELL — paths + parameters                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
 
-wavelength_A = 1.5406
-q_range      = (1.5, 5.5)
-# ──────────────────────────────"""),
-    md("""## 2. Load patterns
+# ── REQUIRED ───────────────────────────────────────────────────────────
+data_dir     = Path('~/data/HZO_series').expanduser()  # ← REPLACE
+patterns_pkl = data_dir / 'patterns.npz'                # ← REPLACE
+cif_dir      = data_dir / 'cifs'                        # ← REPLACE
+
+wavelength_A = 1.5406              # ← REPLACE — your beamline wavelength in Å
+
+# ── OPTIONAL ───────────────────────────────────────────────────────────
+out_csv  = data_dir / 'phase_fractions.csv'
+
+# ── Fit window ─────────────────────────────────────────────────────────
+q_range  = (1.5, 5.5)"""),
+    md("### Validate the config"),
+    code("""assert data_dir.is_dir(), f'data_dir not found: {data_dir}'
+assert patterns_pkl.is_file(), f'patterns_pkl not found: {patterns_pkl}'
+assert cif_dir.is_dir(), f'cif_dir not found: {cif_dir}'
+print(f'OK — patterns + CIF dir present.')"""),
+    md("""## Load patterns
 
 `fit_sequence` accepts a list of ``(q, intensity)`` tuples (or
 ``(q, intensity, sigma)`` if you have per-point errors).  Here we
@@ -532,7 +596,7 @@ labels         = list(npz['labels']) if 'labels' in npz else \\
 patterns       = [(q, intensities[i]) for i in range(intensities.shape[0])]
 print(f'Loaded {len(patterns)} patterns; q range '
       f'{q.min():.3f} → {q.max():.3f} Å⁻¹')"""),
-    md("## 3. Define phases"),
+    md("## Define phases"),
     code("""phases = [
     PhaseModel.from_cif(cif_dir / 'phase_alpha.cif', name='alpha'),
     PhaseModel.from_cif(cif_dir / 'phase_beta.cif',  name='beta'),
@@ -540,7 +604,7 @@ print(f'Loaded {len(patterns)} patterns; q range '
 for ph in phases:
     ph.calculate_peaks(wavelength=wavelength_A)
     print(f'  {ph.name}: {len(ph.peaks)} reflections (will be q-trimmed at fit time)')"""),
-    md("""## 4. Build a FitConfig
+    md("""## Build a FitConfig
 
 `FitConfig` captures **two** keyword dicts:
 
@@ -569,7 +633,7 @@ whole thing round-trips through JSON."""),
 config.save(data_dir / 'fit_config.json')
 print(f'Saved config → {data_dir / \"fit_config.json\"}')
 # Reload elsewhere:  config = FitConfig.load(data_dir / 'fit_config.json')"""),
-    md("## 5. Run the sequence"),
+    md("## Run the sequence"),
     code("""def _progress(i: int, n: int, result) -> None:
     if (i + 1) % 5 == 0 or i == n - 1:
         ok = 'OK' if result.success else 'FAIL'
@@ -583,12 +647,12 @@ store = fit_sequence(
     progress_callback=_progress,
 )
 print(f'\\nCompleted {len(store)} fits')"""),
-    md("## 6. Results as DataFrame"),
+    md("## Results as DataFrame"),
     code("""df = store.to_dataframe()
 print(df.head().to_string(index=False))
 df.to_csv(out_csv, index=False)
 print(f'\\nSaved → {out_csv}')"""),
-    md("## 7. Plot phase fractions"),
+    md("## Plot phase fractions"),
     code("""frac_cols = [c for c in df.columns if c.startswith('frac_')]
 
 fig, ax = plt.subplots(figsize=(9, 4))
@@ -599,7 +663,7 @@ ax.set_ylabel('phase fraction')
 ax.set_ylim(0, 1.05)
 ax.legend()
 plt.tight_layout(); plt.show()"""),
-    md("""## 8. (Optional) lattice-parameter trends
+    md("""## (Optional) lattice-parameter trends
 
 If `vary_cell_params=True` was set, the DataFrame also has columns
 like `alpha_a`, `alpha_b`, `alpha_c`, etc."""),
@@ -653,7 +717,7 @@ grazing-incidence detector image using the `sin²ψ` method:
 
 Or, one-call: `sin2psi_analysis(...)` does all four steps.
 """),
-    md("## 1. Imports"),
+    md("## Imports"),
     code("""from pathlib import Path
 
 import numpy as np
@@ -669,27 +733,47 @@ from ssrl_xrd_tools.analysis.strain import (
     sin2psi_regression,
     sin2psi_analysis,
 )"""),
-    md("## 2. Configuration"),
-    code("""# ───────── EDIT THESE ─────────
-data_path = Path('~/data/sin2psi').expanduser()
-poni_file = data_path / 'calibration.poni'
-data_file = data_path / 'sample_asDep.tif'
+    md("""## ✏️ Configuration
+
+**Edit the cell below**, then run the rest of the notebook top-to-bottom."""),
+    code("""# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                  EDIT THIS CELL — paths + parameters                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ── REQUIRED ───────────────────────────────────────────────────────────
+data_path = Path('~/data/sin2psi').expanduser()    # ← REPLACE
+poni_file = data_path / 'calibration.poni'           # ← REPLACE
+data_file = data_path / 'sample_asDep.tif'           # ← REPLACE
+
+# Peak of interest: q-window around the (hkl) being analysed.
+q_range = (3.0, 3.48)                                # ← REPLACE
+
+# ── OPTIONAL paths ─────────────────────────────────────────────────────
 meta_file = data_path / 'sample_asDep.txt'   # incidence angle, etc.
 mask_file = data_path / 'mask.edf'
 
-# Peak of interest: q-window around the (hkl) being analysed.
-q_range = (3.0, 3.48)
-
-# Sector configuration
+# ── Sector configuration ──────────────────────────────────────────────
 chi_width  = 5.0                          # degrees per ψ bin
 n_sectors  = 15                           # number of ψ bins
 
-# Optional elastic constants for stress output (same units as the
-# returned stress — use GPa here and you'll get GPa back).
-E   = 70.0                                # Young's modulus
-nu  = 0.34                                # Poisson's ratio
-# ──────────────────────────────"""),
-    md("## 3. Load image + build FiberIntegrator"),
+# ── Elastic constants (optional — for stress output) ──────────────────
+# Units of E set the units of the returned stress.
+E   = 70.0                                # Young's modulus, GPa
+nu  = 0.34                                # Poisson's ratio"""),
+    md("### Validate the config"),
+    code("""assert data_path.is_dir(), f'data_path not found: {data_path}'
+assert poni_file.is_file(), f'poni_file not found: {poni_file}'
+assert data_file.is_file(), f'data_file not found: {data_file}'
+if mask_file and mask_file.exists():
+    pass
+else:
+    mask_file = None     # silently disable if missing
+if meta_file and not meta_file.exists():
+    meta_file = None
+print(f'OK — image + PONI present; '
+      f'mask={\"yes\" if mask_file else \"no\"}, '
+      f'meta={\"yes\" if meta_file else \"no\"}.')"""),
+    md("## Load image + build FiberIntegrator"),
     code("""poni = load_poni(poni_file)
 mask = load_mask(mask_file) if mask_file.exists() else None
 data = read_image(data_file, mask=mask)
@@ -699,7 +783,7 @@ meta = read_txt_metadata(meta_file) if meta_file.exists() else {}
 incidence_angle = float(meta.get('th', 0.5))     # incidence angle in degrees
 fi = poni_to_fiber_integrator(poni, incidence_angle=incidence_angle)
 print(f'Loaded image {data.shape}, incidence = {incidence_angle}°')"""),
-    md("## 4. GI polar map (q_total vs. χ)"),
+    md("## GI polar map (q_total vs. χ)"),
     code("""polar = integrate_gi_polar(
     data, fi,
     npt_rad=800,
@@ -717,7 +801,7 @@ ax.set_xlabel(f'q ({polar.unit})'); ax.set_ylabel('χ (deg)')
 ax.set_title('GI polar map')
 plt.colorbar(im, ax=ax, label='Intensity')
 plt.tight_layout(); plt.show()"""),
-    md("""## 5. Extract χ sectors + fit the peak in each
+    md("""## Extract χ sectors + fit the peak in each
 
 `fit_peak_vs_psi` returns a list of `PeakFitResult` objects; each
 carries `psi`, `sin2psi`, `q_center`, `d_spacing`, and their 1-σ
@@ -740,7 +824,7 @@ qcs  = np.array([pf.q_center for pf in peak_fits])
 qerr = np.array([pf.q_center_err for pf in peak_fits])
 print(f'  ψ range : {psis.min():.1f}° → {psis.max():.1f}°')
 print(f'  q_peak  : {qcs.min():.4f} → {qcs.max():.4f} Å⁻¹')"""),
-    md("""## 6. sin²ψ regression → d₀, slope, optional stress
+    md("""## sin²ψ regression → d₀, slope, optional stress
 
 `sin2psi_regression` takes the list of `PeakFitResult` (NOT raw
 arrays).  Supply `E` and `nu` to get a stress value back in the same
@@ -754,7 +838,7 @@ if result.stress is not None:
           f'(units of E, here GPa)')
 # Strain along the in-plane direction is conventionally (slope / d0)
 print(f'  ε(sin²ψ→1) ≈ slope / d_0 = {result.slope / result.d0 * 100:.3f} %')"""),
-    md("## 7. Diagnostic plot"),
+    md("## Diagnostic plot"),
     code("""fig, axes = plt.subplots(1, 2, figsize=(11, 4))
 
 # d vs sin²ψ — the regression
@@ -775,7 +859,7 @@ ax.set_xlabel('ψ (deg)'); ax.set_ylabel('q_center (Å⁻¹)')
 ax.set_title('peak position vs ψ')
 
 plt.tight_layout(); plt.show()"""),
-    md("""## 8. One-call shortcut
+    md("""## One-call shortcut
 
 `sin2psi_analysis(result2d, q_range, ...)` chains the previous four
 steps.  Note it takes the **polar map** (`IntegrationResult2D`) — not
@@ -811,10 +895,241 @@ print(f'one-call stress = {one_shot.stress}'
 # Build everything
 # =============================================================================
 
+# =============================================================================
+# 06 — Headless reduction pipeline (ReductionPlan + run_reduction + sinks)
+# =============================================================================
+
+NB_REDUCTION_PIPELINE = [
+    md("""# Headless Reduction Pipeline
+
+The canonical headless reduction workflow in `ssrl_xrd_tools.reduction`:
+
+1. Wrap your data in a **`Scan`** of **`Frame`** objects (one per
+   detector image, with optional lazy loading).
+2. Describe what to do in a **`ReductionPlan`** (1D / 2D integration
+   settings, optional GI mode, mask, threshold).
+3. Pick a **sink** — `MemorySink` for in-notebook follow-up,
+   `NexusSink` for persistent batch processing, or your own custom
+   sink (e.g. a Qt signal sink for GUI streaming).
+4. Run **`run_reduction(plan, scan, sink, *, chunk_size, progress_cb,
+   cancel_token)`** — same call works in a notebook, a CLI, or
+   xdart's wrangler threads.
+
+This is the API the xdart wranglers were rewritten on top of —
+demonstrating it here in a notebook gives you the same canonical
+path that the GUI uses, without the GUI.
+"""),
+    md("## Imports"),
+    code("""from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+from natsort import natsorted
+
+from ssrl_xrd_tools.io import load_mask, read_image
+from ssrl_xrd_tools.integrate import load_poni
+from ssrl_xrd_tools.reduction import (
+    CancelToken,
+    Frame,
+    GIMode,
+    Integration1DPlan,
+    Integration2DPlan,
+    MaskSpec,
+    MemorySink,
+    NexusSink,
+    ReductionPlan,
+    ReductionProgress,
+    Scan,
+    run_reduction,
+)"""),
+    md("""## ✏️ Configuration
+
+**Edit the cell below**, then run the rest of the notebook top-to-bottom."""),
+    code("""# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                  EDIT THIS CELL — paths + parameters                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ── REQUIRED ───────────────────────────────────────────────────────────
+data_dir   = Path('~/data/my_scan').expanduser()    # ← REPLACE
+poni_file  = data_dir / 'calibration.poni'           # ← REPLACE
+image_glob = '*.tif'                                  # pattern inside data_dir
+
+# ── OPTIONAL paths ─────────────────────────────────────────────────────
+mask_file  = data_dir / 'mask.edf'           # set to None if no mask
+out_nxs    = data_dir / 'reduced.nxs'
+
+# ── Integration tuning ─────────────────────────────────────────────────
+npt_1d                   = 1000
+npt_2d_rad, npt_2d_azim  = 1000, 360
+unit                     = 'q_A^-1'
+method                   = 'csr'
+
+# ── Grazing incidence (optional) ──────────────────────────────────────
+# Set to None for transmission geometry.  Uncomment + set for GI.
+gi: GIMode | None = None
+# gi = GIMode(incident_angle=0.5)
+
+# ── Monitor normalisation (optional) ──────────────────────────────────
+# Key in each Frame.metadata that holds the i0/monitor reading.
+monitor_key: str | None = None       # e.g. 'i0'"""),
+    md("### Validate the config"),
+    code("""assert data_dir.is_dir(), f'data_dir not found: {data_dir}'
+assert poni_file.is_file(), f'poni_file not found: {poni_file}'
+if mask_file is not None and not mask_file.exists():
+    mask_file = None                 # silently disable if missing
+_images_preview = sorted(data_dir.glob(image_glob))
+assert _images_preview, f'No images match {image_glob!r} in {data_dir}'
+print(f'OK — {len(_images_preview)} image(s) found, PONI present.')"""),
+    md("## Build the `Scan` + `Frame` list"),
+    code("""poni = load_poni(poni_file)
+mask = load_mask(mask_file) if mask_file.exists() else None
+
+# Lazy loading: pass source_path instead of image=, and Frame.load_image()
+# reads the file on demand inside run_reduction.  Use clear_frame_images=
+# below to release each frame after it's been written to the sink.
+image_files = natsorted(data_dir.glob(image_glob))
+print(f'Found {len(image_files)} images')
+
+frames = [
+    Frame(
+        index=i,
+        source_path=path,
+        # metadata can carry per-frame counters that monitor_key picks up
+        metadata={'i0': 1.0},   # replace with your actual i0 readouts
+    )
+    for i, path in enumerate(image_files)
+]
+
+scan = Scan(
+    name='my_scan',
+    frames=frames,
+    poni=poni,
+    output_path=out_nxs,
+)
+print(f'Built Scan with {len(scan)} frames')"""),
+    md("""## Compose a `ReductionPlan`
+
+The plan captures *what* the reduction does — integration settings,
+mask, threshold, GI mode.  Execution-policy knobs like `chunk_size` /
+`clear_frame_images` are arguments to `run_reduction`, not part of the
+plan, so the same plan can be re-run on different scans with
+different chunking."""),
+    code("""plan = ReductionPlan(
+    integration_1d=Integration1DPlan(
+        npt=npt_1d,
+        unit=unit,
+        method=method,
+        monitor_key=monitor_key,
+    ),
+    integration_2d=Integration2DPlan(
+        npt_rad=npt_2d_rad,
+        npt_azim=npt_2d_azim,
+        unit=unit,
+        method=method,
+        monitor_key=monitor_key,
+    ),
+    # MaskSpec lets you pass a flat-index mask without knowing the
+    # detector shape upfront; the executor resolves it when the first
+    # frame is loaded.  Pass a plain 2D bool array to skip the wrapper.
+    mask=MaskSpec(mask) if mask is not None else None,
+    threshold_min=None,                # e.g. 0 to clip negative dark
+    threshold_max=None,                # e.g. 1e8 to clip hot pixels
+    gi=gi,                             # None for transmission, GIMode(...) for GI
+)
+print(plan)"""),
+    md("""## Run with the in-memory sink
+
+`MemorySink` collects every frame's `FrameReduction` into a dict —
+handy in notebooks where you want to inspect / plot the results
+immediately."""),
+    code("""sink = MemorySink()
+progress_events: list[ReductionProgress] = []
+
+result = run_reduction(
+    plan, scan, sink,
+    chunk_size=8,                    # tune to your detector + memory
+    clear_frame_images=True,         # release each frame's image after sink.write
+    progress_cb=progress_events.append,
+)
+
+print(f'Processed {result.n_processed}/{len(scan)} frames')
+print(f'Last 3 progress events: {progress_events[-3:]}')
+first = sink.frames[0]
+print(f'Frame 0: 1D shape {first.result_1d.intensity.shape}, '
+      f'2D shape {first.result_2d.intensity.shape}')"""),
+    md("## Re-run with a `NexusSink` for persistent batch output"),
+    code("""# Same plan + scan, different sink.  The .nxs file is written
+# frame-by-frame; flush_every=16 means the OS flushes after every
+# 16 frames so a crashed run is mostly recoverable.
+nx_sink = NexusSink(out_nxs, overwrite=True, flush_every=16)
+
+result = run_reduction(
+    plan, scan, nx_sink,
+    chunk_size=8,
+    clear_frame_images=True,
+)
+print(f'Wrote {result.n_processed} frames to {result.output_path}')"""),
+    md("""## Cancellation
+
+Any consumer can flip the cancel token to stop the loop at the next
+frame boundary.  Useful for GUI Stop buttons / Ctrl-C in notebooks."""),
+    code("""token = CancelToken()
+
+# Simulate a cancel after 3 frames have been processed.
+def _cancel_at_3(event: ReductionProgress) -> None:
+    if event.stage == 'write' and event.completed >= 3:
+        token.cancel()
+
+partial = run_reduction(
+    plan, scan, MemorySink(),
+    chunk_size=4,
+    progress_cb=_cancel_at_3,
+    cancel_token=token,
+)
+print(f'Cancelled? {partial.cancelled}; '
+      f'processed {partial.n_processed} of {len(scan)}')"""),
+    md("## Plot the first frame's results"),
+    code("""r1 = sink.frames[0].result_1d
+r2 = sink.frames[0].result_2d
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+ax1.plot(r1.radial, r1.intensity)
+ax1.set_xlabel(f'q ({r1.unit})')
+ax1.set_ylabel('Intensity')
+
+im = ax2.pcolormesh(r2.radial, r2.azimuthal, r2.intensity.T,
+                    shading='auto', cmap='viridis')
+ax2.set_xlabel(f'q ({r2.unit})')
+ax2.set_ylabel('χ (deg)')
+plt.colorbar(im, ax=ax2)
+plt.tight_layout()
+plt.show()"""),
+    md("""---
+
+### Notes
+
+- **GI workflow**: set `gi=GIMode(incident_angle=...)` on the plan;
+  the executor builds a `FiberIntegrator` from `scan.poni` + the
+  GIMode parameters and routes through `integrate_gi_1d` /
+  `integrate_gi_2d`.
+- **Custom sinks**: any class with `begin(scan, plan)` /
+  `write(frame, reduction)` / `finish(result)` methods is a valid
+  `ReductionSink` (it's a `typing.Protocol`).  xdart adds its own
+  Qt-signal sink on top of this; you can do the same with a plain
+  Python collector, a Tiled writer, a CSV row appender, etc.
+- **Same code in xdart**: the GUI's wrangler threads build a
+  `ReductionPlan` from sphere settings and call `run_reduction` —
+  the same workflow you just ran.  See the `keep_xdart_thin.md`
+  memory note for the design rationale.
+"""),
+]
+
+
 if __name__ == "__main__":
-    write_notebook("01_batch_integration.ipynb",      NB_BATCH_INTEGRATION)
-    write_notebook("02_multigeometry_stitching.ipynb", NB_STITCHING)
-    write_notebook("03_phase_and_peak_fitting.ipynb",  NB_PHASE_PEAK)
-    write_notebook("04_batch_phase_fitting.ipynb",     NB_BATCH_PHASE)
-    write_notebook("05_sin2psi_analysis.ipynb",        NB_SIN2PSI)
+    write_notebook("01_batch_integration.ipynb",        NB_BATCH_INTEGRATION)
+    write_notebook("02_multigeometry_stitching.ipynb",  NB_STITCHING)
+    write_notebook("03_phase_and_peak_fitting.ipynb",   NB_PHASE_PEAK)
+    write_notebook("04_batch_phase_fitting.ipynb",      NB_BATCH_PHASE)
+    write_notebook("05_sin2psi_analysis.ipynb",         NB_SIN2PSI)
+    write_notebook("06_headless_reduction_pipeline.ipynb", NB_REDUCTION_PIPELINE)
     print("\nDone.  Re-run after editing cell content above.")
