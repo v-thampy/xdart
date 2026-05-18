@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EwaldArch storage indexed by frame id, backed by an xdart v2 NeXus file.
+LiveFrame storage indexed by frame id, backed by an xdart v2 NeXus file.
 
 v2 schema (xdart 0.37+) is the only file shape we support:
 
@@ -11,11 +11,11 @@ v2 schema (xdart 0.37+) is the only file shape we support:
 * Raw motor positioners live under ``/entry/{sample,instrument/detector}/
   positioners/``.
 
-``ArchSeries.__setitem__`` is **in-memory only** — it appends the new
+``LiveFrameSeries.__setitem__`` is **in-memory only** — it appends the new
 frame index to ``self.index`` but does no disk I/O.  Persistence happens
 once per batch via :func:`xdart.modules.ewald.nexus_writer.save_sphere_to_nexus`.
 
-``ArchSeries.__getitem__`` lazy-loads an :class:`EwaldArch` from the v2
+``LiveFrameSeries.__getitem__`` lazy-loads a :class:`LiveFrame` from the v2
 stacked arrays + per-frame thumbnail group.
 """
 
@@ -108,7 +108,7 @@ class _IndexedList(list):
 from xdart.utils import catch_h5py_file as catch
 
 # This module imports
-from .arch import EwaldArch
+from .arch import LiveFrame
 
 
 def _ensure_frames_group(h5file):
@@ -136,8 +136,8 @@ def _frame_position(h5file, idx: int) -> int | None:
 
 
 def _load_arch_v2(h5file, idx: int, *, static: bool, gi: bool,
-                  source_root: str | None = None) -> EwaldArch:
-    """Build an :class:`EwaldArch` for ``idx`` from the v2 stacked arrays.
+                  source_root: str | None = None) -> LiveFrame:
+    """Build a :class:`LiveFrame` for ``idx`` from the v2 stacked arrays.
 
     Reads:
 
@@ -152,7 +152,7 @@ def _load_arch_v2(h5file, idx: int, *, static: bool, gi: bool,
         IntegrationResult1D, IntegrationResult2D,
     )
 
-    arch = EwaldArch(idx, static=static, gi=gi)
+    arch = LiveFrame(idx, static=static, gi=gi)
 
     pos = _frame_position(h5file, idx)
 
@@ -211,7 +211,7 @@ def _load_arch_v2(h5file, idx: int, *, static: bool, gi: bool,
         _load_source_ref(arch, fg)
 
     # L1 lazy raw load setup + R3 guardrail.
-    # Stash the source-root for ``EwaldArch._lazy_load_raw`` to
+    # Stash the source-root for ``LiveFrame._lazy_load_raw`` to
     # resolve relative paths against.  Then decide whether
     # re-integration is feasible by checking that the source file
     # exists on disk — if it does, lazy load can recover map_raw;
@@ -225,7 +225,7 @@ def _load_arch_v2(h5file, idx: int, *, static: bool, gi: bool,
     return arch
 
 
-def _load_source_ref(arch: EwaldArch, fg) -> None:
+def _load_source_ref(arch: LiveFrame, fg) -> None:
     """Populate ``arch.source_file`` and ``arch.source_frame_idx`` from a
     per-frame :class:`NXcollection`.
 
@@ -286,8 +286,8 @@ def _load_source_ref(arch: EwaldArch, fg) -> None:
                          arch.idx, e)
 
 
-class ArchSeries:
-    """Index-keyed container for :class:`EwaldArch` objects.
+class LiveFrameSeries:
+    """Index-keyed container for :class:`LiveFrame` objects.
 
     See module docstring for the storage contract.
     """
@@ -303,12 +303,12 @@ class ArchSeries:
         self.index: _IndexedList = _IndexedList()
         self.static = static
         self.gi = gi
-        # Hot-cache of fully-populated EwaldArch objects.  Used by the
+        # Hot-cache of fully-populated LiveFrame objects.  Used by the
         # writer to access freshly-integrated arches before they hit
         # disk, and by viewer code to avoid re-loading recently-touched
         # arches.  Bounded so long scans don't blow memory; see
         # ``_in_memory_cap``.
-        self._in_memory: dict[int, EwaldArch] = {}
+        self._in_memory: dict[int, LiveFrame] = {}
         self._in_memory_cap = 64
         if arches:
             for a in arches:
@@ -318,7 +318,7 @@ class ArchSeries:
     def stash(self, arch):
         """Keep ``arch`` in memory so the writer can read it next flush.
 
-        Called from :meth:`EwaldSphere.add_arch` after integrating a
+        Called from :meth:`LiveScan.add_arch` after integrating a
         fresh frame, so the v2 NeXus writer can pull
         ``int_1d``/``int_2d``/``thumbnail`` straight off the live object
         instead of re-loading from disk (which would fail for the
@@ -334,7 +334,7 @@ class ArchSeries:
             self._in_memory.pop(oldest, None)
 
     def __getitem__(self, idx):
-        """Return EwaldArch for ``idx``: in-memory hit, else lazy-load."""
+        """Return LiveFrame for ``idx``: in-memory hit, else lazy-load."""
         if idx not in self.index:
             raise KeyError(f"Arch not found with {idx} index")
         if idx in self._in_memory:
@@ -370,11 +370,11 @@ class ArchSeries:
 
     def append(self, arch, h5file=None, global_mask=None):
         """Add a new arch (or extract from a pandas Series) to the index."""
-        arches = ArchSeries(self.data_file, self.file_lock,
-                            static=self.static, gi=self.gi)
+        arches = LiveFrameSeries(self.data_file, self.file_lock,
+                                 static=self.static, gi=self.gi)
         # Preserve _IndexedList semantics (list[:] would degrade it).
         arches.index = _IndexedList(self.index)
-        # Preserve any in-memory cache on the new ArchSeries — losing it
+        # Preserve any in-memory cache on the new LiveFrameSeries — losing it
         # would force the v2 writer to re-load every arch from disk.
         arches._in_memory = dict(self._in_memory)
         arches._in_memory_cap = self._in_memory_cap
@@ -391,8 +391,8 @@ class ArchSeries:
         if inplace:
             self.index.sort()
             return None
-        arches = ArchSeries(self.data_file, self.file_lock,
-                            static=self.static, gi=self.gi)
+        arches = LiveFrameSeries(self.data_file, self.file_lock,
+                                 static=self.static, gi=self.gi)
         arches.index = _IndexedList(sorted(self.index))
         arches._in_memory = dict(self._in_memory)
         arches._in_memory_cap = self._in_memory_cap
@@ -408,3 +408,12 @@ class ArchSeries:
     def __iter__(self):
         self._i = 0
         return self
+
+
+# Transitional compatibility name. Keep this alias for one release so older
+# imports and old serialized references can resolve while new code uses
+# LiveFrameSeries.
+ArchSeries = LiveFrameSeries
+
+
+__all__ = ["LiveFrameSeries", "ArchSeries"]

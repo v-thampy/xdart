@@ -3,7 +3,7 @@
 nexusThread — worker thread for NeXus/Tiled wrangler.
 
 Reads frames from a NeXus HDF5 file (Bluesky suitcase-nexus format)
-and integrates each one using the same EwaldArch pipeline as specThread.
+and integrates each one using the same LiveFrame pipeline as specThread.
 
 Performance shape (post-P3A refactor 2026-05-13):
 
@@ -52,7 +52,7 @@ import numpy as np
 from pyqtgraph import Qt
 
 # Project imports
-from xdart.modules.ewald import EwaldArch, EwaldSphere
+from xdart.modules.live import LiveFrame
 from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from ssrl_xrd_tools.io.nexus import open_nexus_image_stack, read_nexus
@@ -62,7 +62,7 @@ from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.utils.integrator_pool import ensure_integrator_pool
 from xdart.modules.reduction import (
     StandardPlanCache,
-    dispatch_arch_reduction,
+    dispatch_live_frame_reduction,
 )
 from .wrangler_widget import wranglerThread
 
@@ -408,7 +408,7 @@ class nexusThread(wranglerThread):
     # ── Helpers ─────────────────────────────────────────────────────────
 
     def _initialize_sphere(self, scan_name):
-        """Create or reset the EwaldSphere for this scan."""
+        """Create or reset the LiveScan for this scan."""
         self.sphere.name = scan_name
         self.sphere.gi = self.gi
         self.sphere.static = True
@@ -450,7 +450,7 @@ class nexusThread(wranglerThread):
         """
         # Construct a throw-away arch just to compute the incidence
         # angle from frame 0 + base metadata.  The arch isn't kept.
-        scratch = EwaldArch(
+        scratch = LiveFrame(
             0, first_frame, poni=self.poni,
             scan_info=base_meta, static=True, gi=self.gi,
             th_mtr=self.incidence_motor,
@@ -498,7 +498,7 @@ class nexusThread(wranglerThread):
         # Borrow a private integrator — pyFAI isn't thread-safe with
         # different inputs on a shared instance.
         with integrator_pool.borrow() as ai:
-            arch = EwaldArch(
+            arch = LiveFrame(
                 frame_idx, img_data, poni=self.poni,
                 scan_info=img_meta, static=True, gi=self.gi,
                 th_mtr=self.incidence_motor,
@@ -528,7 +528,7 @@ class nexusThread(wranglerThread):
                             **sphere.bai_2d_args,
                         )
 
-            dispatch_arch_reduction(
+            dispatch_live_frame_reduction(
                 arch, sphere,
                 standard_plan=standard_plan,
                 integrator=ai,

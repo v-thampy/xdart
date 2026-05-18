@@ -18,12 +18,20 @@ from ssrl_xrd_tools.reduction import (
     ReductionResult,
 )
 
-from xdart.modules.ewald import EwaldArch, EwaldSphere
+from xdart.modules.ewald import ArchSeries, EwaldArch, EwaldSphere
+from xdart.modules.live import LiveFrame, LiveFrameSeries, LiveScan
+from xdart.modules.live_compat import normalize_live_class_names
 import xdart.modules.reduction as reduction_adapters
 from xdart.modules.reduction import (
+    dispatch_arch_reduction,
+    dispatch_live_frame_reduction,
+    frame_from_live_frame,
     frame_from_ewald_arch,
+    plan_from_live_scan,
     plan_from_ewald_sphere,
+    reduce_live_frame,
     reduce_ewald_arch,
+    scan_from_live_scan,
     scan_from_ewald_sphere,
 )
 
@@ -77,6 +85,67 @@ class _BorrowPool:
 
     def borrow(self):
         return self._Borrowed(self.ai)
+
+
+def test_live_names_are_canonical_and_ewald_names_are_aliases() -> None:
+    assert EwaldArch is LiveFrame
+    assert EwaldSphere is LiveScan
+    assert ArchSeries is LiveFrameSeries
+    assert frame_from_ewald_arch is frame_from_live_frame
+    assert scan_from_ewald_sphere is scan_from_live_scan
+    assert plan_from_ewald_sphere is plan_from_live_scan
+    assert reduce_ewald_arch is reduce_live_frame
+    assert dispatch_arch_reduction is dispatch_live_frame_reduction
+
+
+def test_legacy_live_class_names_are_normalized_from_reader_data() -> None:
+    provenance = {
+        "config": {
+            "class": "EwaldSphere",
+            "frames": ["EwaldArch", "xdart.modules.ewald.arch.EwaldArch"],
+            "series": {"type": "ArchSeries"},
+        },
+        "unchanged": "not_a_class_name",
+    }
+
+    normalized = normalize_live_class_names(provenance)
+
+    assert normalized["config"]["class"] == "LiveScan"
+    assert normalized["config"]["frames"] == [
+        "LiveFrame",
+        "xdart.modules.ewald.arch.LiveFrame",
+    ]
+    assert normalized["config"]["series"]["type"] == "LiveFrameSeries"
+    assert normalized["unchanged"] == "not_a_class_name"
+
+
+def test_live_scan_loader_normalizes_legacy_reduction_provenance(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import ssrl_xrd_tools.io.nexus as nexus_io
+
+    fake_ds = SimpleNamespace(
+        attrs={
+            "reduction": {
+                "config": {
+                    "bai_1d_args": {"owner": "EwaldArch"},
+                    "bai_2d_args": {"owner": "EwaldSphere"},
+                },
+            },
+        },
+        sizes={},
+        data_vars={},
+        dims={},
+        coords={},
+    )
+    monkeypatch.setattr(nexus_io, "read_sphere_metadata", lambda _path: fake_ds)
+
+    live_scan = LiveScan("old", data_file=str(tmp_path / "old_037.nxs"))
+    live_scan._load_from_nexus_v2(None)
+
+    assert live_scan.bai_1d_args["owner"] == "LiveFrame"
+    assert live_scan.bai_2d_args["owner"] == "LiveScan"
 
 
 def test_frame_from_ewald_arch_maps_simple_fields(tmp_path) -> None:
@@ -318,10 +387,10 @@ def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> Non
         arch.int_2d = _r2d()
         return arch
 
-    # dispatch_arch_reduction calls reduce_ewald_arch from its defining
+    # dispatch_live_frame_reduction calls reduce_live_frame from its defining
     # module (xdart.modules.reduction).  Patch the canonical name; the
     # symbol is no longer re-imported into the wrangler-thread modules.
-    monkeypatch.setattr(reduction_adapters, "reduce_ewald_arch", fake_reduce)
+    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
 
     sphere = SimpleNamespace(
         name="scan",
@@ -377,7 +446,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
         arch.int_2d = _r2d()
         return arch
 
-    monkeypatch.setattr(reduction_adapters, "reduce_ewald_arch", fake_reduce)
+    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
 
     class _Signal:
         def emit(self, *args):
@@ -480,7 +549,7 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
         arch.int_2d = _r2d()
         return arch
 
-    monkeypatch.setattr(reduction_adapters, "reduce_ewald_arch", fake_reduce)
+    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
 
     arch = EwaldArch(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
     sphere = EwaldSphere("scan", arches=[arch])

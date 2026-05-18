@@ -18,7 +18,7 @@ from ssrl_xrd_tools.io.export import read_xye
 from ssrl_xrd_tools.io.image import read_image, count_frames
 from xdart.utils.session import load_session, save_session
 from .ui.h5viewerUI import Ui_Form
-from xdart.modules.ewald import EwaldArch
+from xdart.modules.live import LiveFrame
 from .sphere_threads import fileHandlerThread
 from ...widgets import defaultWidget
 from xdart import utils
@@ -850,7 +850,7 @@ class H5Viewer(QWidget):
             int_1d = IntegrationResult1D(
                 radial=xdata, intensity=ydata, sigma=sigma, unit=unit,
             )
-            arch = EwaldArch(idx=idx, static=True, gi=False)
+            arch = LiveFrame(idx=idx, static=True, gi=False)
             arch.int_1d = int_1d
             arch.scan_info = {'source_file': os.path.basename(fpath)}
 
@@ -973,7 +973,7 @@ class H5Viewer(QWidget):
                 'thumbnail': None,
             }
             # Minimal data_1d entry so display doesn't crash
-            arch = EwaldArch(idx=arch_idx, static=True, gi=False)
+            arch = LiveFrame(idx=arch_idx, static=True, gi=False)
             arch.scan_info = {'source_file': os.path.basename(fpath)}
             self.data_1d[int(arch_idx)] = arch
     

@@ -15,11 +15,9 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Other imports
-from xdart.modules.ewald import EwaldArch
 from xdart.modules.reduction import (
     StandardPlanCache,
-    dispatch_arch_reduction,
+    dispatch_live_frame_reduction,
 )
 
 # Qt imports
@@ -48,7 +46,7 @@ class integratorThread(Qt.QtCore.QThread):
         method: str, which method to call in run
         mg_1d_args, mg_2d_args: dict, arguments for multigeometry
             integration
-        sphere: EwaldSphere, object that does the integration.
+        sphere: LiveScan, object that does the integration.
     
     methods:
         bai_1d_all: Calls by arch integration 1D for all arches
@@ -122,7 +120,7 @@ class integratorThread(Qt.QtCore.QThread):
             ProcessPoolExecutor(...).submit(_reintegrate_arch, arch, ...)
 
         For a v2 file that's:
-        * ``list(self.sphere.arches)`` triggers ``ArchSeries.__iter__``,
+        * ``list(self.sphere.arches)`` triggers ``LiveFrameSeries.__iter__``,
           which lazy-loads every frame from disk sequentially BEFORE
           the first worker gets a task — seconds-to-tens-of-seconds of
           GUI-thread blocking before parallel work begins.
@@ -163,7 +161,7 @@ class integratorThread(Qt.QtCore.QThread):
 
             N3: ``sphere.arches[arch.idx] = arch`` is a sphere-state
             mutation that other threads (the wrangler thread, the
-            GUI's ArchSeries.__getitem__) can race against.  Hold
+            GUI's LiveFrameSeries.__getitem__) can race against.  Hold
             ``sphere_lock`` while we do it.  The lock is short — just
             the dict assignment + the bai accumulator — and the
             accumulator path itself already takes sphere_lock
@@ -264,7 +262,7 @@ class integratorThread(Qt.QtCore.QThread):
                                     **self.sphere.bai_2d_args,
                                 )
 
-                    dispatch_arch_reduction(
+                    dispatch_live_frame_reduction(
                         arch, self.sphere,
                         standard_plan=standard_plan,
                         integrator=ai,
@@ -284,7 +282,7 @@ class integratorThread(Qt.QtCore.QThread):
                     else:
                         arch.integrate_1d(**self.sphere.bai_1d_args)
 
-                dispatch_arch_reduction(
+                dispatch_live_frame_reduction(
                     arch, self.sphere,
                     standard_plan=standard_plan,
                     integrator=arch.integrator,
@@ -301,7 +299,7 @@ class integratorThread(Qt.QtCore.QThread):
         if max_cores > 1 and len(indices) > 1 and integrator_pool is not None:
             for i in range(0, len(indices), _RE_BATCH):
                 chunk_idxs = indices[i:i + _RE_BATCH]
-                # ArchSeries.__getitem__ does the lazy v2 load + sets
+                # LiveFrameSeries.__getitem__ does the lazy v2 load + sets
                 # source refs / _source_root for the L1 raw loader.
                 arches = [self.sphere.arches[idx] for idx in chunk_idxs]
                 with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -374,7 +372,7 @@ class integratorThread(Qt.QtCore.QThread):
             def _legacy_gi_2d(arch=arch) -> None:
                 arch.integrate_2d(**self.sphere.bai_2d_args)
 
-            dispatch_arch_reduction(
+            dispatch_live_frame_reduction(
                 arch, self.sphere,
                 standard_plan=plan,
                 integrator=arch.integrator,
@@ -406,7 +404,7 @@ class integratorThread(Qt.QtCore.QThread):
             def _legacy_gi_1d(arch=arch) -> None:
                 arch.integrate_1d(**self.sphere.bai_1d_args)
 
-            dispatch_arch_reduction(
+            dispatch_live_frame_reduction(
                 arch, self.sphere,
                 standard_plan=plan,
                 integrator=arch.integrator,
@@ -439,8 +437,8 @@ class fileHandlerThread(Qt.QtCore.QThread):
         Parameters
         ----------
         file_lock : multiprocessing.Condition
-        arch : xdart.modules.ewald.EwaldArch
-        sphere : xdart.modules.ewald.EwaldSphere
+        arch : xdart.modules.live.LiveFrame
+        sphere : xdart.modules.live.LiveScan
         data_lock : threading.RLock, optional
             Shared lock guarding data_1d / data_2d; a private RLock is
             created when not provided.
@@ -506,7 +504,7 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 logger.debug("Failed to load sphere data from HDF5: %s", e)
 
     def load_arch(self):
-        """Load a single arch via the v2 lazy loader (ArchSeries.__getitem__)."""
+        """Load a single arch via the v2 lazy loader (LiveFrameSeries.__getitem__)."""
         try:
             self.arch = self.sphere.arches[self.arch.idx]
         except KeyError as e:
@@ -516,7 +514,7 @@ class fileHandlerThread(Qt.QtCore.QThread):
     def load_arches(self):
         """Populate data_1d/data_2d caches by lazy-loading arches via v2.
 
-        ArchSeries.__getitem__ now reads from the stacked
+        LiveFrameSeries.__getitem__ now reads from the stacked
         ``entry/integrated_1d`` / ``integrated_2d`` arrays and the
         per-frame ``frames/frame_NNNN/thumbnail`` group.  No v1 frame
         groups touched.

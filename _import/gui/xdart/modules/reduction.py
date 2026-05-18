@@ -1,9 +1,9 @@
-"""Adapters from legacy xdart Ewald objects to ssrl scan/frame APIs.
+"""Adapters from xdart live objects to ssrl scan/frame APIs.
 
 This module is the migration boundary for the thin-GUI refactor.  The rest of
-xdart may still speak in terms of ``EwaldArch`` / ``EwaldSphere`` for now, but
-new headless reduction work should cross into ``ssrl_xrd_tools`` as
-``Frame`` / ``Scan`` / ``ReductionPlan`` objects.
+xdart may still import the transitional ``Ewald*`` aliases for now, but new
+headless reduction work should cross into ``ssrl_xrd_tools`` as ``Frame`` /
+``Scan`` / ``ReductionPlan`` objects.
 """
 
 from __future__ import annotations
@@ -46,62 +46,62 @@ _GI_ONLY_ARGS: frozenset[str] = frozenset(
 )
 
 
-def frame_from_ewald_arch(
-    arch: Any,
+def frame_from_live_frame(
+    live_frame: Any,
     *,
     include_image: bool = True,
     include_background: bool = True,
 ) -> Frame:
-    """Build an ``ssrl_xrd_tools.reduction.Frame`` from an ``EwaldArch``."""
-    image = getattr(arch, "map_raw", None) if include_image else None
-    source_path = _source_path(arch)
-    mask = _arch_mask_as_bool(arch)
-    metadata = dict(getattr(arch, "scan_info", {}) or {})
-    bg_raw = getattr(arch, "bg_raw", None) if include_background else None
+    """Build an ``ssrl_xrd_tools.reduction.Frame`` from a ``LiveFrame``."""
+    image = getattr(live_frame, "map_raw", None) if include_image else None
+    source_path = _source_path(live_frame)
+    mask = _live_frame_mask_as_bool(live_frame)
+    metadata = dict(getattr(live_frame, "scan_info", {}) or {})
+    bg_raw = getattr(live_frame, "bg_raw", None) if include_background else None
     if bg_raw is not None and np.ndim(bg_raw) == 0:
         metadata.setdefault("bg_raw", float(bg_raw))
 
     return Frame(
-        index=int(getattr(arch, "idx", 0) or 0),
+        index=int(getattr(live_frame, "idx", 0) or 0),
         image=image,
         metadata=metadata,
         source_path=source_path,
-        source_frame_index=int(getattr(arch, "source_frame_idx", 0) or 0),
+        source_frame_index=int(getattr(live_frame, "source_frame_idx", 0) or 0),
         background=bg_raw,
         mask=mask,
     )
 
 
-def scan_from_ewald_sphere(
-    sphere: Any,
+def scan_from_live_scan(
+    live_scan: Any,
     *,
     frame_indices: Iterable[int] | None = None,
     include_images: bool = True,
     include_backgrounds: bool | None = None,
 ) -> Scan:
-    """Build an ``ssrl_xrd_tools.reduction.Scan`` from an ``EwaldSphere``."""
+    """Build an ``ssrl_xrd_tools.reduction.Scan`` from a ``LiveScan``."""
     if include_backgrounds is None:
         include_backgrounds = include_images
-    indices = list(frame_indices) if frame_indices is not None else list(sphere.arches.index)
+    indices = list(frame_indices) if frame_indices is not None else list(live_scan.arches.index)
     frames = [
-        frame_from_ewald_arch(
-            sphere.arches[int(idx)],
+        frame_from_live_frame(
+            live_scan.arches[int(idx)],
             include_image=include_images,
             include_background=include_backgrounds,
         )
         for idx in indices
     ]
-    first_arch = sphere.arches[int(indices[0])] if indices else None
-    poni = getattr(first_arch, "poni", None) if first_arch is not None else None
+    first_frame = live_scan.arches[int(indices[0])] if indices else None
+    poni = getattr(first_frame, "poni", None) if first_frame is not None else None
     wavelength_A = None
     try:
-        wavelength_m = float((getattr(sphere, "mg_args", {}) or {}).get("wavelength", 0))
+        wavelength_m = float((getattr(live_scan, "mg_args", {}) or {}).get("wavelength", 0))
         wavelength_A = wavelength_m * 1e10 if wavelength_m > 0 else None
     except (TypeError, ValueError):
         wavelength_A = None
 
     motors = {}
-    scan_data = getattr(sphere, "scan_data", None)
+    scan_data = getattr(live_scan, "scan_data", None)
     if scan_data is not None:
         try:
             motors = {
@@ -112,34 +112,34 @@ def scan_from_ewald_sphere(
             motors = {}
 
     return Scan(
-        name=str(getattr(sphere, "name", "scan")),
+        name=str(getattr(live_scan, "name", "scan")),
         frames=frames,
         poni=poni,
         wavelength=wavelength_A,
         motors=motors,
-        output_path=getattr(sphere, "data_file", None),
-        extra={"source": "xdart.EwaldSphere"},
+        output_path=getattr(live_scan, "data_file", None),
+        extra={"source": "xdart.LiveScan"},
     )
 
 
-def plan_from_ewald_sphere(
-    sphere: Any,
+def plan_from_live_scan(
+    live_scan: Any,
     *,
     integrate_1d: bool = True,
     integrate_2d: bool | None = None,
     gi_incident_angle: float | None = None,
 ) -> ReductionPlan:
-    """Create a ``ReductionPlan`` using xdart's current sphere settings.
+    """Create a ``ReductionPlan`` using xdart's current live scan settings.
 
     Note: ``chunk_size`` and other execution-policy knobs live on
-    :func:`run_reduction` (and on :func:`reduce_ewald_arch` by way of
+    :func:`run_reduction` (and on :func:`reduce_live_frame` by way of
     the single-frame call here), not on the plan itself.
     """
     if integrate_2d is None:
-        integrate_2d = not bool(getattr(sphere, "skip_2d", False))
+        integrate_2d = not bool(getattr(live_scan, "skip_2d", False))
 
-    args_1d = dict(getattr(sphere, "bai_1d_args", {}) or {})
-    args_2d = dict(getattr(sphere, "bai_2d_args", {}) or {})
+    args_1d = dict(getattr(live_scan, "bai_1d_args", {}) or {})
+    args_2d = dict(getattr(live_scan, "bai_2d_args", {}) or {})
     unit_1d = _pop_first(args_1d, ("unit",), None)
     unit_2d = _pop_first(args_2d, ("unit",), None)
     method_1d = str(_pop_first(args_1d, ("method",), "csr"))
@@ -163,7 +163,7 @@ def plan_from_ewald_sphere(
     _pop_first(args_1d, ("normalization_factor",), None)
     _pop_first(args_2d, ("normalization_factor",), None)
 
-    is_gi = bool(getattr(sphere, "gi", False))
+    is_gi = bool(getattr(live_scan, "gi", False))
     gi_method = _pop_first(args_1d, ("gi_method_1d",), None)
     if gi_method is None:
         gi_method = _pop_first(args_2d, ("gi_method_2d",), "no")
@@ -172,7 +172,7 @@ def plan_from_ewald_sphere(
         _strip_nonstandard_args(args_1d)
         _strip_nonstandard_args(args_2d)
     if is_gi and gi_incident_angle is None:
-        gi_incident_angle = getattr(sphere, "_cached_fiber_integrator_angle", None)
+        gi_incident_angle = getattr(live_scan, "_cached_fiber_integrator_angle", None)
     if is_gi and gi_incident_angle is None:
         raise ValueError(
             "Cannot build a GI ReductionPlan without gi_incident_angle."
@@ -180,8 +180,8 @@ def plan_from_ewald_sphere(
 
     mask_shape = None
     try:
-        first_idx = sphere.arches.index[0]
-        first_img = getattr(sphere.arches[int(first_idx)], "map_raw", None)
+        first_idx = live_scan.arches.index[0]
+        first_img = getattr(live_scan.arches[int(first_idx)], "map_raw", None)
         mask_shape = getattr(first_img, "shape", None)
     except Exception:
         mask_shape = None
@@ -189,8 +189,8 @@ def plan_from_ewald_sphere(
     gi_mode = (
         GIMode(
             incident_angle=float(gi_incident_angle),
-            tilt_angle=float(getattr(sphere, "tilt_angle", 0.0) or 0.0),
-            sample_orientation=int(getattr(sphere, "sample_orientation", 1) or 1),
+            tilt_angle=float(getattr(live_scan, "tilt_angle", 0.0) or 0.0),
+            sample_orientation=int(getattr(live_scan, "sample_orientation", 1) or 1),
             method=str(gi_method),
         )
         if is_gi else None
@@ -228,40 +228,40 @@ def plan_from_ewald_sphere(
             if integrate_2d else None
         ),
         gi=gi_mode,
-        mask=_mask_for_plan(getattr(sphere, "global_mask", None), mask_shape),
+        mask=_mask_for_plan(getattr(live_scan, "global_mask", None), mask_shape),
     )
 
 
-def reduce_ewald_arch(
-    arch: Any,
+def reduce_live_frame(
+    live_frame: Any,
     plan: ReductionPlan,
     *,
     scan_name: str = "scan",
     global_mask: Any = None,
     integrator: Any = None,
 ) -> Any:
-    """Reduce one ``EwaldArch`` through ``ssrl_xrd_tools.reduction``.
+    """Reduce one ``LiveFrame`` through ``ssrl_xrd_tools.reduction``.
 
-    The returned object is the same ``arch`` instance, populated with
+    The returned object is the same ``live_frame`` instance, populated with
     ``int_1d`` / ``int_2d`` so existing xdart display and writer code can
     continue to operate while the computation crosses the new Scan/Frame API.
     """
-    if getattr(arch, "gi", False):
-        raise ValueError("reduce_ewald_arch currently handles non-GI arches only.")
-    frame = frame_from_ewald_arch(arch)
-    plan = _plan_with_mask_for_arch(plan, global_mask, arch)
+    if getattr(live_frame, "gi", False):
+        raise ValueError("reduce_live_frame currently handles non-GI frames only.")
+    frame = frame_from_live_frame(live_frame)
+    plan = _plan_with_mask_for_live_frame(plan, global_mask, live_frame)
     scan = Scan(
         name=scan_name,
         frames=[frame],
-        poni=getattr(arch, "poni", None),
-        integrator=integrator if integrator is not None else getattr(arch, "integrator", None),
+        poni=getattr(live_frame, "poni", None),
+        integrator=integrator if integrator is not None else getattr(live_frame, "integrator", None),
     )
     result = run_reduction(plan, scan)
-    reduction = result.frames[int(arch.idx)]
-    arch.int_1d = reduction.result_1d
-    arch.int_2d = reduction.result_2d
-    arch.map_norm = _frame_norm(frame, plan)
-    return arch
+    reduction = result.frames[int(live_frame.idx)]
+    live_frame.int_1d = reduction.result_1d
+    live_frame.int_2d = reduction.result_2d
+    live_frame.map_norm = _frame_norm(frame, plan)
+    return live_frame
 
 
 # ---------------------------------------------------------------------------
@@ -270,11 +270,11 @@ def reduce_ewald_arch(
 # ---------------------------------------------------------------------------
 
 def _plan_signature(
-    sphere: Any,
+    live_scan: Any,
     integrate_1d: bool,
     integrate_2d: bool,
 ) -> tuple:
-    """Hashable signature of the inputs that ``plan_from_ewald_sphere`` reads.
+    """Hashable signature of the inputs that ``plan_from_live_scan`` reads.
 
     Used by :class:`StandardPlanCache` to skip plan rebuilds when nothing
     relevant on the sphere has changed.  Covers the bai_*_args dicts
@@ -286,7 +286,7 @@ def _plan_signature(
             sorted((str(key), repr(value)) for key, value in (args or {}).items())
         )
 
-    mask = getattr(sphere, "global_mask", None)
+    mask = getattr(live_scan, "global_mask", None)
     if mask is None:
         mask_sig: Any = None
     else:
@@ -303,11 +303,11 @@ def _plan_signature(
         mask_sig = (arr.shape, str(arr.dtype), int(arr.size), mask_sum, head, tail)
 
     return (
-        id(sphere),
+        id(live_scan),
         bool(integrate_1d),
         bool(integrate_2d),
-        _items(getattr(sphere, "bai_1d_args", {})),
-        _items(getattr(sphere, "bai_2d_args", {})),
+        _items(getattr(live_scan, "bai_1d_args", {})),
+        _items(getattr(live_scan, "bai_2d_args", {})),
         mask_sig,
     )
 
@@ -332,17 +332,17 @@ class StandardPlanCache:
 
     def get(
         self,
-        sphere: Any,
+        live_scan: Any,
         *,
         integrate_1d: bool = True,
         integrate_2d: bool = True,
     ) -> ReductionPlan | None:
-        if getattr(sphere, "gi", False):
+        if getattr(live_scan, "gi", False):
             return None
-        key = _plan_signature(sphere, integrate_1d, integrate_2d)
+        key = _plan_signature(live_scan, integrate_1d, integrate_2d)
         if self._plan is None or self._key != key:
-            self._plan = plan_from_ewald_sphere(
-                sphere,
+            self._plan = plan_from_live_scan(
+                live_scan,
                 integrate_1d=integrate_1d,
                 integrate_2d=integrate_2d,
             )
@@ -354,25 +354,25 @@ class StandardPlanCache:
         self._key = None
 
 
-def dispatch_arch_reduction(
-    arch: Any,
-    sphere: Any,
+def dispatch_live_frame_reduction(
+    live_frame: Any,
+    live_scan: Any,
     *,
     standard_plan: ReductionPlan | None,
     integrator: Any,
     global_mask: Any,
     legacy_gi: Callable[[], None],
 ) -> None:
-    """Run reduction for one arch via the right path (standard or GI).
+    """Run reduction for one live frame via the right path (standard or GI).
 
     Single dispatch point shared by all wrangler workers so the
-    ``if self.gi: <legacy>; else: reduce_ewald_arch(...)`` fork lives
+    ``if self.gi: <legacy>; else: reduce_live_frame(...)`` fork lives
     in exactly one place.
 
     Parameters
     ----------
-    arch, sphere
-        The arch to reduce and its parent sphere.
+    live_frame, live_scan
+        The live frame to reduce and its parent live scan.
     standard_plan
         ``ReductionPlan`` for the non-GI path; pass ``None`` to force
         the legacy callback (matches what
@@ -381,20 +381,20 @@ def dispatch_arch_reduction(
         Pre-built pyFAI integrator for the worker (typically borrowed
         from an :class:`IntegratorPool`).
     global_mask
-        Sphere-level mask passed through unchanged.
+        Scan-level mask passed through unchanged.
     legacy_gi
         Zero-arg callback that runs the GI fiber-integrator path.
         Invoked when ``standard_plan`` is ``None`` or
-        ``arch.gi`` is ``True``.  Caller is responsible for borrowing
+        ``live_frame.gi`` is ``True``.  Caller is responsible for borrowing
         the right fiber integrator inside this callback.
     """
-    if standard_plan is None or getattr(arch, "gi", False):
+    if standard_plan is None or getattr(live_frame, "gi", False):
         legacy_gi()
         return
-    reduce_ewald_arch(
-        arch,
+    reduce_live_frame(
+        live_frame,
         standard_plan,
-        scan_name=str(getattr(sphere, "name", "scan")),
+        scan_name=str(getattr(live_scan, "name", "scan")),
         global_mask=global_mask,
         integrator=integrator,
     )
@@ -425,12 +425,12 @@ def _frame_norm(frame: Frame, plan: ReductionPlan) -> float:
     return 1.0
 
 
-def _plan_with_mask_for_arch(
+def _plan_with_mask_for_live_frame(
     plan: ReductionPlan,
     global_mask: Any,
-    arch: Any,
+    live_frame: Any,
 ) -> ReductionPlan:
-    shape = getattr(getattr(arch, "map_raw", None), "shape", None)
+    shape = getattr(getattr(live_frame, "map_raw", None), "shape", None)
     gmask = _flat_mask_as_bool(global_mask, shape)
     plan_mask = _flat_mask_as_bool(plan.mask, shape)
     if plan_mask is None:
@@ -440,9 +440,9 @@ def _plan_with_mask_for_arch(
     return replace(plan, mask=plan_mask | gmask)
 
 
-def _arch_mask_as_bool(arch: Any) -> np.ndarray | None:
-    mask = getattr(arch, "mask", None)
-    image = getattr(arch, "map_raw", None)
+def _live_frame_mask_as_bool(live_frame: Any) -> np.ndarray | None:
+    mask = getattr(live_frame, "mask", None)
+    image = getattr(live_frame, "map_raw", None)
     shape = getattr(image, "shape", None)
     return _mask_for_plan(mask, shape)
 
@@ -522,11 +522,25 @@ def _offset_range(
     return float(value[0]) - offset, float(value[1]) - offset
 
 
+# Transitional compatibility adapter names. Keep these aliases for one release
+# while callers move from Ewald* vocabulary to Live* vocabulary.
+frame_from_ewald_arch = frame_from_live_frame
+scan_from_ewald_sphere = scan_from_live_scan
+plan_from_ewald_sphere = plan_from_live_scan
+reduce_ewald_arch = reduce_live_frame
+dispatch_arch_reduction = dispatch_live_frame_reduction
+
+
 __all__ = [
     "StandardPlanCache",
+    "dispatch_live_frame_reduction",
     "dispatch_arch_reduction",
+    "frame_from_live_frame",
     "frame_from_ewald_arch",
+    "scan_from_live_scan",
     "scan_from_ewald_sphere",
+    "plan_from_live_scan",
     "plan_from_ewald_sphere",
+    "reduce_live_frame",
     "reduce_ewald_arch",
 ]
