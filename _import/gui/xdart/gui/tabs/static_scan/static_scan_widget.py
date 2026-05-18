@@ -362,9 +362,11 @@ class staticWidget(QWidget):
         Instead of rendering immediately (which blocks the main thread
         and causes frame-skipping when the wrangler is faster than the
         GUI), we update the in-memory data structures and schedule a
-        coalesced display refresh via a short single-shot timer.  If
-        another sigUpdateData arrives before the timer fires, only the
-        latest index is rendered.
+        throttled display refresh via a short single-shot timer.  The
+        timer is started only when it isn't already pending, so during
+        a fast scan burst the display refreshes at roughly the timer
+        interval (~200 ms) instead of waiting for the burst to settle.
+        Each flush renders the most recently received index.
 
         Special case: ``idx == -1`` is the batch-complete signal —
         trigger a full display refresh without touching the h5 viewer.
@@ -372,7 +374,8 @@ class staticWidget(QWidget):
         if idx == -1:
             # Batch mode finished — just refresh the display
             self._pending_update_idx = -1
-            self._update_timer.start()
+            if not self._update_timer.isActive():
+                self._update_timer.start()
             return
 
         # Per-frame mid-scan refresh.  Append idx to sphere.arches.index
@@ -444,18 +447,23 @@ class staticWidget(QWidget):
         # which frame to advance the cursor to.
         self.h5viewer.latest_idx = idx
 
-        # Record the latest index and (re)start the coalescing timer.
-        # If the timer is already running, restart resets the countdown
-        # so only one render happens after the burst settles.
+        # Record the latest index and start the coalescing timer if it
+        # isn't already running.  Throttle, not debounce: during a fast
+        # scan burst (frame inter-arrival < timer interval) we want the
+        # display to refresh every ~200 ms, not only after the burst
+        # settles.  Debounce semantics (.start() unconditionally
+        # restarting the countdown) made the display freeze on whatever
+        # the last completed flush rendered until the scan finished —
+        # visible as "plots only update at end of scan."
         self._pending_update_idx = idx
-        self._update_timer.start()
+        if not self._update_timer.isActive():
+            self._update_timer.start()
 
     def _flush_pending_update(self):
         """Render the most recently received wrangler update.
 
-        Called by _update_timer after a short quiet period (200 ms).
-        Coalesces all per-frame GUI work that doesn't have to happen
-        immediately:
+        Called by _update_timer at most once per ~200 ms.  Coalesces
+        all per-frame GUI work that doesn't have to happen immediately:
 
         * ``h5viewer.update_data()`` — refresh the listData widget
           (incremental append when possible — see
@@ -472,9 +480,9 @@ class staticWidget(QWidget):
         self._pending_update_idx = None
         # Heavy list-widget refresh first — auto-last cursor needs the
         # list to contain the new index before it can select it.
-        self.h5viewer.update_data()
+        self.h5viewer.update_data(emit_update=False)
         if self.h5viewer.auto_last:
-            self.latest_arch()
+            self.latest_arch(emit_update=False)
         self.displayframe.update()
         self.metawidget.update()
 
@@ -778,32 +786,45 @@ class staticWidget(QWidget):
         # Refresh scan list to show/hide appropriate file types
         self.h5viewer.update_scans()
 
-    def latest_arch(self):
+    def latest_arch(self, checked=None, *, emit_update=True):
         """Advances to last arch in data list, updates displayframe, and
-        set auto_last to True
+        set auto_last to True.
+
+        Wraps the cursor advance in ``blockSignals`` and invokes
+        ``data_changed()`` explicitly — same pattern as
+        ``H5Viewer.update_data``.  Without the block, the
+        ``ClearAndSelect`` cursor move would fire
+        ``itemSelectionChanged`` → ``data_changed`` → ``sigUpdate`` →
+        ``set_data`` → a redundant ``displayframe.update()`` on top of
+        whatever the caller does next (every call site that drives
+        ``latest_arch`` follows it with its own display refresh).
         """
         self.h5viewer.auto_last = True
         if self.h5viewer.ui.listData.count() <= 1:
             return
 
+        lw = self.h5viewer.ui.listData
         idx = self.h5viewer.latest_idx
-        if isinstance(idx, int):
-            self.h5viewer.latest_idx = idx
-
-            items = self.h5viewer.ui.listData.findItems(str(idx), QtCore.Qt.MatchExactly)
-            if len(items):
+        lw.blockSignals(True)
+        try:
+            if isinstance(idx, int):
+                items = lw.findItems(str(idx), QtCore.Qt.MatchExactly)
                 for item in items:
-                    self.h5viewer.ui.listData.setCurrentItem(item)
-        else:
-            last_row = self.h5viewer.ui.listData.count() - 1
-            if last_row >= 0:
-                item = self.h5viewer.ui.listData.item(last_row)
-                if item is not None:
-                    try:
-                        self.h5viewer.latest_idx = int(item.text())
-                    except ValueError:
-                        self.h5viewer.latest_idx = item.text()
-                self.h5viewer.ui.listData.setCurrentRow(last_row)
+                    self.h5viewer.set_current_frame(item)
+            else:
+                last_row = lw.count() - 1
+                if last_row >= 0:
+                    item = lw.item(last_row)
+                    if item is not None:
+                        try:
+                            self.h5viewer.latest_idx = int(item.text())
+                        except ValueError:
+                            self.h5viewer.latest_idx = item.text()
+                    self.h5viewer.set_current_frame(last_row)
+        finally:
+            lw.blockSignals(False)
+        if emit_update:
+            self.h5viewer.data_changed()
 
     def raw_to_tiff(self):
         self.popup_detector_options()

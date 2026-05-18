@@ -333,6 +333,8 @@ class H5Viewer(QWidget):
         self.latest_idx = None
         self.new_scan_loaded = False
         self.viewer_mode = None
+        self._displayed_list_count = 0
+        self._displayed_last_label = None
 
     def _init_ui(self):
         """Set up the main UI form and default widget."""
@@ -557,8 +559,41 @@ class H5Viewer(QWidget):
                     # Normal mode: only HDF5/NeXus scan files
                     if name.split('.')[-1] in ('h5', 'hdf5', 'nxs'):
                         self.ui.listScans.addItem(name)
-    
-    def update_data(self):
+
+    # ── Selection helper ──────────────────────────────────────────────
+    def set_current_frame(self, item_or_row):
+        """Advance the listData cursor *and narrow the selection* to a
+        single entry.
+
+        ``QListWidget.setCurrentItem(item)`` and ``setCurrentRow(row)``
+        default to ``QItemSelectionModel.NoUpdate`` when the list is in
+        ``ExtendedSelection`` mode — the current item moves but the
+        selection is never narrowed.  During a live scan this is
+        visible as the entire Frames list lighting up as new frames
+        arrive.  Pass ``ClearAndSelect`` so the highlight follows the
+        cursor.
+
+        Callers that drive this from inside their own
+        ``blockSignals(True/False)`` block (and then invoke
+        ``data_changed()`` explicitly) get the same behaviour without
+        firing ``itemSelectionChanged``.
+        """
+        lw = self.ui.listData
+        if isinstance(item_or_row, int):
+            lw.setCurrentRow(item_or_row, QItemSelectionModel.ClearAndSelect)
+        else:
+            lw.setCurrentItem(item_or_row, QItemSelectionModel.ClearAndSelect)
+
+    def _remember_displayed_frames(self):
+        """Cache enough list state to recognize append-only live updates."""
+        lw = self.ui.listData
+        count = lw.count()
+        self._displayed_list_count = count
+        self._displayed_last_label = (
+            lw.item(count - 1).text() if count > 0 else None
+        )
+
+    def update_data(self, emit_update=True):
         """Updates list with all arch ids.
 
         Fast paths in order of likelihood for a live scan:
@@ -580,38 +615,76 @@ class H5Viewer(QWidget):
             return
 
         # with self.sphere.sphere_lock:
-        _idxs = [str(i) for i in list(self.sphere.arches.index)]
+        arch_index = self.sphere.arches.index
 
-        if len(_idxs) == 0:
+        if len(arch_index) == 0:
             self.ui.listData.clear()
+            self._remember_displayed_frames()
             # self.ui.listData.addItem('No Data')
             return
 
         lw = self.ui.listData
+
+        def _emit_changed():
+            if emit_update:
+                self.data_changed()
+
+        def _select_latest() -> bool:
+            if not (self.auto_last and isinstance(self.latest_idx, int)):
+                return False
+            target = str(self.latest_idx)
+            last_row = lw.count() - 1
+            if last_row >= 0 and lw.item(last_row).text() == target:
+                self.set_current_frame(last_row)
+                return True
+            matched = lw.findItems(target, QtCore.Qt.MatchExactly)
+            for item in matched:
+                self.set_current_frame(item)
+            return bool(matched)
+
+        # Common live-scan path: frame ids were appended at the tail since
+        # the last GUI flush.  Verify only the cached boundary instead of
+        # rebuilding and comparing the full list every 200 ms.
+        current_count = lw.count()
+        if (current_count >= 1
+                and len(arch_index) > current_count
+                and not self.new_scan_loaded):
+            current_last = lw.item(current_count - 1).text()
+            cached_count = getattr(self, "_displayed_list_count", 0)
+            cached_last = getattr(self, "_displayed_last_label", None)
+            expected_last = str(arch_index[current_count - 1])
+            if (current_count == cached_count
+                    and current_last == cached_last
+                    and current_last == expected_last):
+                new_tail = [
+                    str(arch_index[pos])
+                    for pos in range(current_count, len(arch_index))
+                ]
+                lw.blockSignals(True)
+                lw.addItems(new_tail)
+                if self.auto_last:
+                    _select_latest()
+                lw.blockSignals(False)
+                self._remember_displayed_frames()
+                if self.auto_last:
+                    _emit_changed()
+                return
+
+        _idxs = [str(i) for i in arch_index]
         items = [lw.item(x).text() for x in range(lw.count())]
 
-        if (len(_idxs) > 1) and (_idxs == items):
+        if _idxs == items:
             if self.new_scan_loaded:
                 self.new_scan_loaded = False
                 self.ui.listData.setCurrentRow(-1)
                 self.arch_ids = []
+                self._remember_displayed_frames()
                 return
             if self.auto_last and isinstance(self.latest_idx, int) and str(self.latest_idx) in _idxs:
                 self.ui.listData.blockSignals(True)
-                matched = self.ui.listData.findItems(str(self.latest_idx), QtCore.Qt.MatchExactly)
-                for item in matched:
-                    self.ui.listData.setCurrentItem(item)
+                _select_latest()
                 self.ui.listData.blockSignals(False)
-                self.data_changed()
-            return
-        if (len(_idxs) > 1) and (len(_idxs) == len(items)):
-            if self.auto_last and isinstance(self.latest_idx, int):
-                self.ui.listData.blockSignals(True)
-                matched = self.ui.listData.findItems(str(self.latest_idx), QtCore.Qt.MatchExactly)
-                for item in matched:
-                    self.ui.listData.setCurrentItem(item)
-                self.ui.listData.blockSignals(False)
-                self.data_changed()
+                _emit_changed()
             return
 
         # ── P4 incremental-append fast path ─────────────────────────
@@ -635,15 +708,12 @@ class H5Viewer(QWidget):
             new_tail = _idxs[len(items):]
             self.ui.listData.blockSignals(True)
             self.ui.listData.addItems(new_tail)
-            if self.auto_last and isinstance(self.latest_idx, int):
-                matched = self.ui.listData.findItems(
-                    str(self.latest_idx), QtCore.Qt.MatchExactly,
-                )
-                for item in matched:
-                    self.ui.listData.setCurrentItem(item)
-            self.ui.listData.blockSignals(False)
             if self.auto_last:
-                self.data_changed()
+                _select_latest()
+            self.ui.listData.blockSignals(False)
+            self._remember_displayed_frames()
+            if self.auto_last:
+                _emit_changed()
             return
 
         previous_loc = self.ui.listData.currentRow()
@@ -655,6 +725,7 @@ class H5Viewer(QWidget):
 
         self.ui.listData.clear()
         self.ui.listData.insertItems(0, _idxs)
+        self._remember_displayed_frames()
 
         if self.new_scan_loaded:
             self.new_scan_loaded = False
@@ -664,12 +735,9 @@ class H5Viewer(QWidget):
             return
 
         if self.auto_last and isinstance(self.latest_idx, int) and (str(self.latest_idx) in _idxs):
-            items = self.ui.listData.findItems(str(self.latest_idx), QtCore.Qt.MatchExactly)
-            if len(items):
-                for item in items:
-                    self.ui.listData.setCurrentItem(item)
+            _select_latest()
             self.ui.listData.blockSignals(False)
-            self.data_changed()
+            _emit_changed()
             return
 
         if previous_loc > self.ui.listData.count() - 1:
@@ -684,7 +752,7 @@ class H5Viewer(QWidget):
                     item.setSelected(True)
 
         self.ui.listData.blockSignals(False)
-        self.data_changed()
+        _emit_changed()
 
     def show_all(self):
 
@@ -701,7 +769,7 @@ class H5Viewer(QWidget):
             if getattr(self, '_auto_select_last_on_finish', False):
                 self._auto_select_last_on_finish = False
                 if self.ui.listData.count() > 0:
-                    self.ui.listData.setCurrentRow(self.ui.listData.count() - 1)
+                    self.set_current_frame(self.ui.listData.count() - 1)
         self.sigThreadFinished.emit()
     
     def _scans_single_clicked(self, q):
