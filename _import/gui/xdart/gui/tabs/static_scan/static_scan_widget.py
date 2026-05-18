@@ -472,8 +472,8 @@ class staticWidget(QWidget):
           ``latest_idx`` is now (P4: was per-frame, now per-flush so
           we don't rebuild the list widget more than once per timer
           tick).
-        * ``displayframe.update()`` + ``metawidget.update()`` — repaint
-          the 2D image, 1D pattern, and metadata table.
+        * ``h5viewer.data_changed()`` — publish the selected frame
+          through the normal ``sigUpdate`` path exactly once.
         """
         if self._pending_update_idx is None:
             return
@@ -483,8 +483,7 @@ class staticWidget(QWidget):
         self.h5viewer.update_data(emit_update=False)
         if self.h5viewer.auto_last:
             self.latest_arch(emit_update=False)
-        self.displayframe.update()
-        self.metawidget.update()
+        self.h5viewer.data_changed()
 
     def disable_auto_last(self, q):
         """
