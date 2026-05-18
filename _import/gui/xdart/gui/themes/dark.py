@@ -375,11 +375,11 @@ def apply_seaborn_plot_style(plot, *, font_pt: int = SEABORN_FONT_PT,
     if grid:
         # alpha gives the soft seaborn look — white gridlines
         # bleed through the lavender-grey panel without
-        # overwhelming the data traces.  0.3 is half of the
-        # earlier 0.6 — the gridlines were dominating data
-        # peaks on Vivek's display at the higher value.
+        # overwhelming the data traces.  0.25 is a hair under
+        # half of the earlier 0.6 default; 0.3 still read as
+        # too prominent on a high-DPI display.
         try:
-            plot.showGrid(x=True, y=True, alpha=0.3)
+            plot.showGrid(x=True, y=True, alpha=0.25)
         except Exception:  # pragma: no cover — older pyqtgraph
             pass
 

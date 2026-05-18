@@ -18,22 +18,29 @@ from ssrl_xrd_tools.reduction import (
     ReductionResult,
 )
 
-from xdart.modules.ewald import ArchSeries, EwaldArch, EwaldSphere
 from xdart.modules.live import LiveFrame, LiveFrameSeries, LiveScan
 from xdart.modules.live_compat import normalize_live_class_names
 import xdart.modules.reduction as reduction_adapters
 from xdart.modules.reduction import (
-    dispatch_arch_reduction,
     dispatch_live_frame_reduction,
     frame_from_live_frame,
-    frame_from_ewald_arch,
     plan_from_live_scan,
-    plan_from_ewald_sphere,
     reduce_live_frame,
-    reduce_ewald_arch,
     scan_from_live_scan,
-    scan_from_ewald_sphere,
 )
+
+
+# Convenience aliases used throughout the tests below to keep wording short.
+# These exist only inside the test module — the production aliases on
+# xdart.modules.{ewald,reduction} were dropped in the rename release.
+EwaldArch = LiveFrame
+EwaldSphere = LiveScan
+ArchSeries = LiveFrameSeries
+frame_from_ewald_arch = frame_from_live_frame
+scan_from_ewald_sphere = scan_from_live_scan
+plan_from_ewald_sphere = plan_from_live_scan
+reduce_ewald_arch = reduce_live_frame
+dispatch_arch_reduction = dispatch_live_frame_reduction
 
 
 def _poni() -> PONI:
@@ -87,15 +94,32 @@ class _BorrowPool:
         return self._Borrowed(self.ai)
 
 
-def test_live_names_are_canonical_and_ewald_names_are_aliases() -> None:
-    assert EwaldArch is LiveFrame
-    assert EwaldSphere is LiveScan
-    assert ArchSeries is LiveFrameSeries
-    assert frame_from_ewald_arch is frame_from_live_frame
-    assert scan_from_ewald_sphere is scan_from_live_scan
-    assert plan_from_ewald_sphere is plan_from_live_scan
-    assert reduce_ewald_arch is reduce_live_frame
-    assert dispatch_arch_reduction is dispatch_live_frame_reduction
+def test_legacy_ewald_aliases_are_dropped() -> None:
+    """The Live rename's transitional Ewald* class + function aliases were
+    removed at the end of the rename release window.  Reader-side string
+    normalisation in :mod:`xdart.modules.live_compat` still keeps old
+    ``.nxs`` files loading (covered by a separate test below).
+    """
+    import xdart.modules.ewald as ewald_pkg
+    import xdart.modules.reduction as reduction_pkg
+
+    for legacy_name in ("EwaldArch", "EwaldSphere", "ArchSeries"):
+        assert not hasattr(ewald_pkg, legacy_name), (
+            f"{legacy_name} should have been dropped; still on "
+            f"xdart.modules.ewald"
+        )
+
+    for legacy_fn in (
+        "frame_from_ewald_arch",
+        "scan_from_ewald_sphere",
+        "plan_from_ewald_sphere",
+        "reduce_ewald_arch",
+        "dispatch_arch_reduction",
+    ):
+        assert not hasattr(reduction_pkg, legacy_fn), (
+            f"{legacy_fn} should have been dropped; still on "
+            f"xdart.modules.reduction"
+        )
 
 
 def test_legacy_live_class_names_are_normalized_from_reader_data() -> None:

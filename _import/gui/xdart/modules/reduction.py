@@ -522,25 +522,11 @@ def _offset_range(
     return float(value[0]) - offset, float(value[1]) - offset
 
 
-# Transitional compatibility adapter names. Keep these aliases for one release
-# while callers move from Ewald* vocabulary to Live* vocabulary.
-frame_from_ewald_arch = frame_from_live_frame
-scan_from_ewald_sphere = scan_from_live_scan
-plan_from_ewald_sphere = plan_from_live_scan
-reduce_ewald_arch = reduce_live_frame
-dispatch_arch_reduction = dispatch_live_frame_reduction
-
-
 __all__ = [
     "StandardPlanCache",
     "dispatch_live_frame_reduction",
-    "dispatch_arch_reduction",
     "frame_from_live_frame",
-    "frame_from_ewald_arch",
     "scan_from_live_scan",
-    "scan_from_ewald_sphere",
     "plan_from_live_scan",
-    "plan_from_ewald_sphere",
     "reduce_live_frame",
-    "reduce_ewald_arch",
 ]

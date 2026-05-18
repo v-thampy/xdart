@@ -410,10 +410,4 @@ class LiveFrameSeries:
         return self
 
 
-# Transitional compatibility name. Keep this alias for one release so older
-# imports and old serialized references can resolve while new code uses
-# LiveFrameSeries.
-ArchSeries = LiveFrameSeries
-
-
-__all__ = ["LiveFrameSeries", "ArchSeries"]
+__all__ = ["LiveFrameSeries"]
