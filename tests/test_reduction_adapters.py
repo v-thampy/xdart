@@ -13,6 +13,7 @@ from ssrl_xrd_tools.reduction import (
     FrameReduction,
     Integration1DPlan,
     Integration2DPlan,
+    MaskSpec,
     ReductionPlan,
     ReductionResult,
 )
@@ -107,6 +108,24 @@ def test_frame_from_ewald_arch_maps_simple_fields(tmp_path) -> None:
     assert frame.normalization_factor is None
 
 
+def test_frame_from_ewald_arch_can_skip_large_background() -> None:
+    arch = EwaldArch(
+        idx=4,
+        map_raw=np.arange(4).reshape(2, 2),
+        poni=_poni(),
+        bg_raw=np.ones((2, 2)),
+    )
+
+    frame = frame_from_ewald_arch(
+        arch,
+        include_image=False,
+        include_background=False,
+    )
+
+    assert frame.image is None
+    assert frame.background is None
+
+
 def test_scan_from_ewald_sphere_uses_scan_frame_names() -> None:
     a2 = EwaldArch(idx=2, map_raw=np.ones((2, 2)), poni=_poni(),
                    scan_info={"th": 2.0})
@@ -157,7 +176,7 @@ def test_plan_from_ewald_sphere_maps_integration_settings() -> None:
         global_mask=np.array([0, 3]),
     )
 
-    plan = plan_from_ewald_sphere(sphere, chunk_size=4)
+    plan = plan_from_ewald_sphere(sphere)
 
     assert plan.integration_1d is not None
     assert plan.integration_2d is not None
@@ -177,7 +196,8 @@ def test_plan_from_ewald_sphere_maps_integration_settings() -> None:
     assert plan.integration_2d.azimuth_offset == 0.0
     assert "gi_mode_1d" not in plan.integration_1d.extra
     assert "gi_mode_2d" not in plan.integration_2d.extra
-    assert plan.chunk_size == 4
+    # plan.gi is None on a non-GI sphere (was bool flag pre-S2)
+    assert plan.gi is None
     np.testing.assert_array_equal(
         plan.mask,
         np.array([[True, False], [False, True]]),
@@ -271,6 +291,22 @@ def test_mask_conversion_is_strict() -> None:
         raise AssertionError("expected mask shape mismatch")
 
 
+def test_flat_global_mask_is_preserved_until_shape_is_known() -> None:
+    sphere = EwaldSphere(
+        "scan",
+        arches=[EwaldArch(idx=0, map_raw=None, poni=_poni())],
+        global_mask=np.array([0, 3]),
+    )
+
+    plan = plan_from_ewald_sphere(sphere)
+
+    assert isinstance(plan.mask, MaskSpec)
+    np.testing.assert_array_equal(
+        plan.mask.to_bool((2, 2)),
+        np.array([[True, False], [False, True]]),
+    )
+
+
 def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> None:
     from xdart.gui.tabs.static_scan.wranglers import nexus_wrangler_thread
 
@@ -282,7 +318,10 @@ def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> Non
         arch.int_2d = _r2d()
         return arch
 
-    monkeypatch.setattr(nexus_wrangler_thread, "reduce_ewald_arch", fake_reduce)
+    # dispatch_arch_reduction calls reduce_ewald_arch from its defining
+    # module (xdart.modules.reduction).  Patch the canonical name; the
+    # symbol is no longer re-imported into the wrangler-thread modules.
+    monkeypatch.setattr(reduction_adapters, "reduce_ewald_arch", fake_reduce)
 
     sphere = SimpleNamespace(
         name="scan",
@@ -338,7 +377,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
         arch.int_2d = _r2d()
         return arch
 
-    monkeypatch.setattr(spec_wrangler_thread, "reduce_ewald_arch", fake_reduce)
+    monkeypatch.setattr(reduction_adapters, "reduce_ewald_arch", fake_reduce)
 
     class _Signal:
         def emit(self, *args):
@@ -352,6 +391,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
         bai_1d_args={},
         bai_2d_args={},
     )
+    from xdart.modules.reduction import StandardPlanCache
     worker = SimpleNamespace(
         showLabel=_Signal(),
         _middle_truncate=lambda text: text,
@@ -369,6 +409,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
         sub_label="",
         _xye_lock=RLock(),
         _xye_buffer=[],
+        _plan_cache=StandardPlanCache(),
     )
 
     spec_wrangler_thread.specThread._process_one(
@@ -426,3 +467,40 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
     assert calls
     assert calls[0][0].integration_1d.monitor_key == "i0"
     assert data_1d[0].int_1d is not None
+
+
+def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
+    from xdart.gui.tabs.static_scan.sphere_threads import integratorThread
+
+    calls = []
+
+    def fake_reduce(arch, plan, *, scan_name, global_mask, integrator):
+        calls.append(plan)
+        arch.int_1d = _r1d()
+        arch.int_2d = _r2d()
+        return arch
+
+    monkeypatch.setattr(reduction_adapters, "reduce_ewald_arch", fake_reduce)
+
+    arch = EwaldArch(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    sphere = EwaldSphere("scan", arches=[arch])
+    sphere._cached_integrator = _FakeIntegrator()
+    data_1d = {}
+    data_2d = {}
+    thread = integratorThread(
+        sphere,
+        None,
+        None,
+        None,
+        [0],
+        data_1d,
+        data_2d,
+    )
+
+    thread.bai_2d_SI()
+
+    assert calls
+    assert calls[0].integration_1d is not None
+    assert calls[0].integration_2d is not None
+    assert data_1d[0].int_1d is not None
+    assert data_2d[0]["int_2d"] is not None

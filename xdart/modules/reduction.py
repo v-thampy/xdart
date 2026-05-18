@@ -8,45 +8,57 @@ new headless reduction work should cross into ``ssrl_xrd_tools`` as
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Any
 
 import numpy as np
 
+from dataclasses import fields as _dc_fields
+
 from ssrl_xrd_tools.reduction import (
     Frame,
+    GIMode,
     Integration1DPlan,
     Integration2DPlan,
+    MaskSpec,
     ReductionPlan,
     Scan,
     run_reduction,
 )
 
-_GI_ONLY_ARGS = {
-    "gi_mode_1d",
-    "gi_mode_2d",
-    "npt_oop",
-    "npt_ip",
-    "sample_orientation",
-    "tilt_angle",
-    "x_range",
-    "y_range",
-}
+# S4: GI-only sphere kwargs that must NOT flow through to the standard
+# pyFAI integrator path.  Derived from :class:`GIMode` (so adding a GIMode
+# field automatically excludes that name) plus a small set of legacy
+# xdart-only names that the GI widgets emit but :class:`GIMode` doesn't
+# own.  Anything not in this set rides through ``Integration*Plan.extra``.
+_GI_ONLY_ARGS: frozenset[str] = frozenset(
+    {field.name for field in _dc_fields(GIMode)}
+    | {
+        "gi_mode_1d",
+        "gi_mode_2d",
+        "npt_oop",
+        "npt_ip",
+        "x_range",
+        "y_range",
+    }
+)
 
 
 def frame_from_ewald_arch(
     arch: Any,
     *,
     include_image: bool = True,
+    include_background: bool = True,
 ) -> Frame:
     """Build an ``ssrl_xrd_tools.reduction.Frame`` from an ``EwaldArch``."""
     image = getattr(arch, "map_raw", None) if include_image else None
     source_path = _source_path(arch)
     mask = _arch_mask_as_bool(arch)
     metadata = dict(getattr(arch, "scan_info", {}) or {})
-    bg_raw = getattr(arch, "bg_raw", 0)
-    if np.ndim(bg_raw) == 0:
+    bg_raw = getattr(arch, "bg_raw", None) if include_background else None
+    if bg_raw is not None and np.ndim(bg_raw) == 0:
         metadata.setdefault("bg_raw", float(bg_raw))
 
     return Frame(
@@ -55,7 +67,7 @@ def frame_from_ewald_arch(
         metadata=metadata,
         source_path=source_path,
         source_frame_index=int(getattr(arch, "source_frame_idx", 0) or 0),
-        background=getattr(arch, "bg_raw", None),
+        background=bg_raw,
         mask=mask,
     )
 
@@ -65,11 +77,18 @@ def scan_from_ewald_sphere(
     *,
     frame_indices: Iterable[int] | None = None,
     include_images: bool = True,
+    include_backgrounds: bool | None = None,
 ) -> Scan:
     """Build an ``ssrl_xrd_tools.reduction.Scan`` from an ``EwaldSphere``."""
+    if include_backgrounds is None:
+        include_backgrounds = include_images
     indices = list(frame_indices) if frame_indices is not None else list(sphere.arches.index)
     frames = [
-        frame_from_ewald_arch(sphere.arches[int(idx)], include_image=include_images)
+        frame_from_ewald_arch(
+            sphere.arches[int(idx)],
+            include_image=include_images,
+            include_background=include_backgrounds,
+        )
         for idx in indices
     ]
     first_arch = sphere.arches[int(indices[0])] if indices else None
@@ -109,9 +128,13 @@ def plan_from_ewald_sphere(
     integrate_1d: bool = True,
     integrate_2d: bool | None = None,
     gi_incident_angle: float | None = None,
-    chunk_size: int = 1,
 ) -> ReductionPlan:
-    """Create a ``ReductionPlan`` using xdart's current sphere settings."""
+    """Create a ``ReductionPlan`` using xdart's current sphere settings.
+
+    Note: ``chunk_size`` and other execution-policy knobs live on
+    :func:`run_reduction` (and on :func:`reduce_ewald_arch` by way of
+    the single-frame call here), not on the plan itself.
+    """
     if integrate_2d is None:
         integrate_2d = not bool(getattr(sphere, "skip_2d", False))
 
@@ -140,13 +163,17 @@ def plan_from_ewald_sphere(
     _pop_first(args_1d, ("normalization_factor",), None)
     _pop_first(args_2d, ("normalization_factor",), None)
 
-    gi = bool(getattr(sphere, "gi", False))
-    if not gi:
+    is_gi = bool(getattr(sphere, "gi", False))
+    gi_method = _pop_first(args_1d, ("gi_method_1d",), None)
+    if gi_method is None:
+        gi_method = _pop_first(args_2d, ("gi_method_2d",), "no")
+
+    if not is_gi:
         _strip_nonstandard_args(args_1d)
         _strip_nonstandard_args(args_2d)
-    if gi and gi_incident_angle is None:
+    if is_gi and gi_incident_angle is None:
         gi_incident_angle = getattr(sphere, "_cached_fiber_integrator_angle", None)
-    if gi and gi_incident_angle is None:
+    if is_gi and gi_incident_angle is None:
         raise ValueError(
             "Cannot build a GI ReductionPlan without gi_incident_angle."
         )
@@ -159,9 +186,15 @@ def plan_from_ewald_sphere(
     except Exception:
         mask_shape = None
 
-    gi_method = _pop_first(args_1d, ("gi_method_1d",), None)
-    if gi_method is None:
-        gi_method = _pop_first(args_2d, ("gi_method_2d",), "no")
+    gi_mode = (
+        GIMode(
+            incident_angle=float(gi_incident_angle),
+            tilt_angle=float(getattr(sphere, "tilt_angle", 0.0) or 0.0),
+            sample_orientation=int(getattr(sphere, "sample_orientation", 1) or 1),
+            method=str(gi_method),
+        )
+        if is_gi else None
+    )
 
     return ReductionPlan(
         integration_1d=(
@@ -194,11 +227,8 @@ def plan_from_ewald_sphere(
             )
             if integrate_2d else None
         ),
-        gi=gi,
-        mask=_flat_mask_as_bool(getattr(sphere, "global_mask", None), mask_shape),
-        chunk_size=chunk_size,
-        gi_incident_angle=gi_incident_angle,
-        gi_method=str(gi_method),
+        gi=gi_mode,
+        mask=_mask_for_plan(getattr(sphere, "global_mask", None), mask_shape),
     )
 
 
@@ -234,23 +264,146 @@ def reduce_ewald_arch(
     return arch
 
 
+# ---------------------------------------------------------------------------
+# S3 + C1 helpers — used by every wrangler so the GI-vs-standard dispatch
+# and the per-sphere plan cache live in exactly one place.
+# ---------------------------------------------------------------------------
+
+def _plan_signature(
+    sphere: Any,
+    integrate_1d: bool,
+    integrate_2d: bool,
+) -> tuple:
+    """Hashable signature of the inputs that ``plan_from_ewald_sphere`` reads.
+
+    Used by :class:`StandardPlanCache` to skip plan rebuilds when nothing
+    relevant on the sphere has changed.  Covers the bai_*_args dicts
+    (sorted) and a digest of ``global_mask`` (shape + dtype + size +
+    head/tail/sum for numeric masks).
+    """
+    def _items(args: Any) -> tuple:
+        return tuple(
+            sorted((str(key), repr(value)) for key, value in (args or {}).items())
+        )
+
+    mask = getattr(sphere, "global_mask", None)
+    if mask is None:
+        mask_sig: Any = None
+    else:
+        arr = np.asarray(mask)
+        flat = arr.ravel()
+        if np.issubdtype(arr.dtype, np.number) and flat.size:
+            mask_sum = float(np.sum(flat, dtype=np.float64))
+            head = tuple(flat[:8].tolist())
+            tail = tuple(flat[-8:].tolist())
+        else:
+            mask_sum = None
+            head = ()
+            tail = ()
+        mask_sig = (arr.shape, str(arr.dtype), int(arr.size), mask_sum, head, tail)
+
+    return (
+        id(sphere),
+        bool(integrate_1d),
+        bool(integrate_2d),
+        _items(getattr(sphere, "bai_1d_args", {})),
+        _items(getattr(sphere, "bai_2d_args", {})),
+        mask_sig,
+    )
+
+
+class StandardPlanCache:
+    """Per-owner cache for the standard (non-GI) :class:`ReductionPlan`.
+
+    Wrappers (wranglers, integrator threads) keep one instance for the
+    lifetime of a scan; the cached plan is rebuilt only when one of the
+    sphere settings ``_plan_signature`` covers actually changes.
+
+    Returns ``None`` for GI spheres so callers can drop straight into the
+    legacy fiber-integrator path without an "is GI" check at every call
+    site (the per-dispatch helper below already does that).
+    """
+
+    __slots__ = ("_plan", "_key")
+
+    def __init__(self) -> None:
+        self._plan: ReductionPlan | None = None
+        self._key: tuple | None = None
+
+    def get(
+        self,
+        sphere: Any,
+        *,
+        integrate_1d: bool = True,
+        integrate_2d: bool = True,
+    ) -> ReductionPlan | None:
+        if getattr(sphere, "gi", False):
+            return None
+        key = _plan_signature(sphere, integrate_1d, integrate_2d)
+        if self._plan is None or self._key != key:
+            self._plan = plan_from_ewald_sphere(
+                sphere,
+                integrate_1d=integrate_1d,
+                integrate_2d=integrate_2d,
+            )
+            self._key = key
+        return self._plan
+
+    def invalidate(self) -> None:
+        self._plan = None
+        self._key = None
+
+
+def dispatch_arch_reduction(
+    arch: Any,
+    sphere: Any,
+    *,
+    standard_plan: ReductionPlan | None,
+    integrator: Any,
+    global_mask: Any,
+    legacy_gi: Callable[[], None],
+) -> None:
+    """Run reduction for one arch via the right path (standard or GI).
+
+    Single dispatch point shared by all wrangler workers so the
+    ``if self.gi: <legacy>; else: reduce_ewald_arch(...)`` fork lives
+    in exactly one place.
+
+    Parameters
+    ----------
+    arch, sphere
+        The arch to reduce and its parent sphere.
+    standard_plan
+        ``ReductionPlan`` for the non-GI path; pass ``None`` to force
+        the legacy callback (matches what
+        :meth:`StandardPlanCache.get` returns for GI spheres).
+    integrator
+        Pre-built pyFAI integrator for the worker (typically borrowed
+        from an :class:`IntegratorPool`).
+    global_mask
+        Sphere-level mask passed through unchanged.
+    legacy_gi
+        Zero-arg callback that runs the GI fiber-integrator path.
+        Invoked when ``standard_plan`` is ``None`` or
+        ``arch.gi`` is ``True``.  Caller is responsible for borrowing
+        the right fiber integrator inside this callback.
+    """
+    if standard_plan is None or getattr(arch, "gi", False):
+        legacy_gi()
+        return
+    reduce_ewald_arch(
+        arch,
+        standard_plan,
+        scan_name=str(getattr(sphere, "name", "scan")),
+        global_mask=global_mask,
+        integrator=integrator,
+    )
+
+
 def _source_path(arch: Any) -> Path | None:
     resolver = getattr(arch, "_resolved_source_path", None)
     path = resolver() if callable(resolver) else getattr(arch, "source_file", "")
     return Path(path) if path else None
-
-
-def _normalization_factor(arch: Any) -> float | None:
-    value = getattr(arch, "map_norm", None)
-    if value is None:
-        return None
-    try:
-        norm = float(value)
-        if not np.isfinite(norm) or norm in (0.0, 1.0):
-            return None
-        return norm
-    except (TypeError, ValueError):
-        return None
 
 
 def _frame_norm(frame: Frame, plan: ReductionPlan) -> float:
@@ -279,23 +432,37 @@ def _plan_with_mask_for_arch(
 ) -> ReductionPlan:
     shape = getattr(getattr(arch, "map_raw", None), "shape", None)
     gmask = _flat_mask_as_bool(global_mask, shape)
-    if plan.mask is None:
+    plan_mask = _flat_mask_as_bool(plan.mask, shape)
+    if plan_mask is None:
         return replace(plan, mask=gmask)
     if gmask is None:
-        return plan
-    return replace(plan, mask=np.asarray(plan.mask, dtype=bool) | gmask)
+        return replace(plan, mask=plan_mask)
+    return replace(plan, mask=plan_mask | gmask)
 
 
 def _arch_mask_as_bool(arch: Any) -> np.ndarray | None:
     mask = getattr(arch, "mask", None)
     image = getattr(arch, "map_raw", None)
     shape = getattr(image, "shape", None)
+    return _mask_for_plan(mask, shape)
+
+
+def _mask_for_plan(mask: Any, shape: tuple[int, int] | None) -> np.ndarray | MaskSpec | None:
+    if mask is None:
+        return None
+    arr = np.asarray(mask)
+    if shape is None and arr.ndim == 1:
+        return MaskSpec(arr.copy())
     return _flat_mask_as_bool(mask, shape)
 
 
 def _flat_mask_as_bool(mask: Any, shape: tuple[int, int] | None) -> np.ndarray | None:
     if mask is None:
         return None
+    if isinstance(mask, MaskSpec):
+        if shape is None:
+            return None
+        return mask.to_bool(shape)
     arr = np.asarray(mask)
     if shape is None:
         if arr.ndim == 2:
@@ -356,6 +523,8 @@ def _offset_range(
 
 
 __all__ = [
+    "StandardPlanCache",
+    "dispatch_arch_reduction",
     "frame_from_ewald_arch",
     "scan_from_ewald_sphere",
     "plan_from_ewald_sphere",
