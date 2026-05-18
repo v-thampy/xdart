@@ -12,6 +12,8 @@ from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResul
 from ssrl_xrd_tools.reduction import (
     CancelToken,
     Frame,
+    Integration1DPlan,
+    Integration2DPlan,
     MemorySink,
     NexusSink,
     ReductionPlan,
@@ -78,8 +80,11 @@ def test_frame_loads_with_custom_loader_once() -> None:
 @pytest.mark.parametrize(
     "kwargs, message",
     [
-        ({"integrate_1d": False, "integrate_2d": False}, "integrate_1d"),
-        ({"npt_1d": 0}, "npt_1d"),
+        (
+            {"integration_1d": None, "integration_2d": None},
+            "integration_1d",
+        ),
+        ({"integration_1d": Integration1DPlan(npt=1), "chunk_size": 0}, "chunk_size"),
         ({"chunk_size": 0}, "chunk_size"),
         ({"gi": True}, "gi_incident_angle"),
     ],
@@ -87,6 +92,13 @@ def test_frame_loads_with_custom_loader_once() -> None:
 def test_reduction_plan_validation(kwargs: dict, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         ReductionPlan(**kwargs)
+
+
+def test_integration_plan_validation() -> None:
+    with pytest.raises(ValueError, match="npt"):
+        Integration1DPlan(npt=0)
+    with pytest.raises(ValueError, match="npt_rad"):
+        Integration2DPlan(npt_rad=0)
 
 
 def test_run_reduction_1d_2d_mask_threshold_norm_and_progress(
@@ -119,20 +131,23 @@ def test_run_reduction_1d_2d_mask_threshold_norm_and_progress(
         integrator=object(),
     )
     plan = ReductionPlan(
-        integrate_1d=True,
-        integrate_2d=True,
-        npt_1d=5,
-        npt_rad_2d=6,
-        npt_azim_2d=7,
-        unit="2th_deg",
-        method_1d="BBox",
-        method_2d="csr",
+        integration_1d=Integration1DPlan(
+            npt=5,
+            unit="2th_deg",
+            method="BBox",
+        ),
+        integration_2d=Integration2DPlan(
+            npt_rad=6,
+            npt_azim=7,
+            unit="q_A^-1",
+            method="csr",
+        ),
         mask=np.array([[False, False], [True, False]]),
         threshold_min=0.0,
         threshold_max=50.0,
-        normalization_factors={0: 9.0},
         chunk_size=1,
     )
+    scan.frames[0].normalization_factor = 9.0
 
     result = run_reduction(plan, scan, progress_cb=events.append)
 
@@ -157,7 +172,7 @@ def test_run_reduction_1d_2d_mask_threshold_norm_and_progress(
     assert calls[1]["npt_azim"] == 7
 
 
-def test_run_reduction_monitor_key_and_azimuth_offset(
+def test_run_reduction_uses_independent_1d_2d_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict] = []
@@ -180,21 +195,42 @@ def test_run_reduction_monitor_key_and_azimuth_offset(
 
     result = run_reduction(
         ReductionPlan(
-            integrate_2d=True,
-            monitor_key="i0",
-            azimuth_range=(80.0, 100.0),
-            azimuth_offset=90.0,
+            integration_1d=Integration1DPlan(
+                npt=11,
+                unit="q_A^-1",
+                method="csr",
+                radial_range=(1.0, 2.0),
+                azimuth_range=(-30.0, 30.0),
+                monitor_key="i0",
+            ),
+            integration_2d=Integration2DPlan(
+                npt_rad=12,
+                npt_azim=13,
+                unit="2th_deg",
+                method="BBox",
+                radial_range=(10.0, 20.0),
+                azimuth_range=(80.0, 100.0),
+                azimuth_offset=90.0,
+                monitor_key="i1",
+            ),
         ),
         Scan(
             "scan",
-            [Frame(0, image=np.ones((2, 2)), metadata={"I0": 25.0})],
+            [Frame(0, image=np.ones((2, 2)), metadata={"I0": 25.0, "i1": 50.0})],
             integrator=object(),
         ),
     )
 
     assert calls[0]["normalization_factor"] == 25.0
-    assert calls[0]["azimuth_range"] == (-10.0, 10.0)
-    assert calls[1]["normalization_factor"] == 25.0
+    assert calls[0]["npt"] == 11
+    assert calls[0]["unit"] == "q_A^-1"
+    assert calls[0]["radial_range"] == (1.0, 2.0)
+    assert calls[0]["azimuth_range"] == (-30.0, 30.0)
+    assert calls[1]["normalization_factor"] == 50.0
+    assert calls[1]["npt_rad"] == 12
+    assert calls[1]["npt_azim"] == 13
+    assert calls[1]["unit"] == "2th_deg"
+    assert calls[1]["radial_range"] == (10.0, 20.0)
     assert calls[1]["azimuth_range"] == (-10.0, 10.0)
     np.testing.assert_allclose(result.frames[0].result_2d.azimuthal, [85.0, 95.0])
 
@@ -221,7 +257,7 @@ def test_run_reduction_cancellation_and_clear_images(
     )
 
     result = run_reduction(
-        ReductionPlan(integrate_2d=False, clear_frame_images=True, chunk_size=2),
+        ReductionPlan(clear_frame_images=True, chunk_size=2),
         scan,
         cancel_token=token,
     )
@@ -269,6 +305,73 @@ def test_nexus_sink_writes_frame_results(
         np.testing.assert_allclose(
             h5["entry/reduction/0/int_1d/intensity"][()],
             [3.0, 4.0],
+        )
+
+
+def test_reduction_validation_for_shapes_and_duplicate_frames() -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        Scan(
+            "scan",
+            [Frame(0, image=np.ones((2, 2))), Frame(0, image=np.ones((2, 2)))],
+        )
+
+    scan = Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object())
+    with pytest.raises(ValueError, match="mask shape"):
+        run_reduction(ReductionPlan(mask=np.ones((3, 3), dtype=bool)), scan)
+
+    scan = Scan(
+        "scan",
+        [Frame(0, image=np.ones((2, 2)), background=np.ones((3, 3)))],
+        integrator=object(),
+    )
+    with pytest.raises(ValueError, match="background shape"):
+        run_reduction(ReductionPlan(), scan)
+
+    scan = Scan("scan", [Frame(0)], integrator=object())
+    with pytest.raises(ValueError, match="no image"):
+        run_reduction(ReductionPlan(), scan)
+
+
+def test_nexus_sink_flush_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kwargs: _r1d(float(image[0, 0])))
+    calls = []
+
+    class FakeH5:
+        def flush(self):
+            calls.append("flush")
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(reduction_core, "open_nexus_writer", lambda *a, **k: FakeH5())
+    monkeypatch.setattr(reduction_core, "write_nexus_frame", lambda *a, **k: None)
+
+    result = run_reduction(
+        ReductionPlan(),
+        Scan(
+            "scan",
+            [
+                Frame(0, image=np.zeros((2, 2))),
+                Frame(1, image=np.ones((2, 2))),
+                Frame(2, image=np.full((2, 2), 2.0)),
+            ],
+            integrator=object(),
+            energy=12.398,
+            wavelength=1.0,
+        ),
+        NexusSink("scan.nxs", overwrite=True, flush_every=2),
+    )
+
+    assert result.n_processed == 3
+    assert calls == ["flush", "flush", "close"]  # frame 2, finish, close
+
+    with pytest.raises(ValueError, match="flush_every"):
+        NexusSink("scan.nxs", flush_every=0).begin(
+            Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object()),
+            ReductionPlan(),
         )
 
 

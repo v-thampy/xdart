@@ -9,7 +9,7 @@ integration loops itself.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -111,6 +111,10 @@ class Scan:
 
     def __post_init__(self) -> None:
         self.frames = sorted(list(self.frames), key=lambda f: f.index)
+        indices = [int(f.index) for f in self.frames]
+        if len(indices) != len(set(indices)):
+            dupes = sorted({idx for idx in indices if indices.count(idx) > 1})
+            raise ValueError(f"Scan contains duplicate frame indices: {dupes}")
         self.motors = {k: np.asarray(v, dtype=float) for k, v in self.motors.items()}
         if self.output_path is not None and not isinstance(self.output_path, Path):
             self.output_path = Path(self.output_path)
@@ -165,46 +169,69 @@ class Scan:
 
 
 @dataclass(slots=True)
+class Integration1DPlan:
+    """1D integration settings for one reduction output."""
+
+    npt: int = 1000
+    unit: str = "q_A^-1"
+    method: str = "csr"
+    radial_range: tuple[float, float] | None = None
+    azimuth_range: tuple[float, float] | None = None
+    monitor_key: str | None = None
+    error_model: str | None = None
+    polarization_factor: float | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.npt <= 0:
+            raise ValueError(f"Integration1DPlan.npt must be > 0; got {self.npt}")
+
+
+@dataclass(slots=True)
+class Integration2DPlan:
+    """2D integration settings for one reduction output."""
+
+    npt_rad: int = 1000
+    npt_azim: int = 360
+    unit: str = "q_A^-1"
+    method: str = "csr"
+    radial_range: tuple[float, float] | None = None
+    azimuth_range: tuple[float, float] | None = None
+    azimuth_offset: float = 0.0
+    monitor_key: str | None = None
+    error_model: str | None = None
+    polarization_factor: float | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.npt_rad <= 0 or self.npt_azim <= 0:
+            raise ValueError(
+                "Integration2DPlan.npt_rad and npt_azim must both be > 0; "
+                f"got ({self.npt_rad}, {self.npt_azim})"
+            )
+
+
+@dataclass(slots=True)
 class ReductionPlan:
     """Reduction settings shared by notebooks, CLIs, and xdart."""
 
-    integrate_1d: bool = True
-    integrate_2d: bool = False
+    integration_1d: Integration1DPlan | None = field(default_factory=Integration1DPlan)
+    integration_2d: Integration2DPlan | None = None
     gi: bool = False
-    npt_1d: int = 1000
-    npt_rad_2d: int = 1000
-    npt_azim_2d: int = 360
-    unit: str = "q_A^-1"
-    method_1d: str = "csr"
-    method_2d: str = "csr"
     mask: np.ndarray | None = None
-    radial_range: tuple[float, float] | None = None
-    azimuth_range: tuple[float, float] | None = None
-    error_model: str | None = None
-    polarization_factor: float | None = None
-    normalization_factors: Mapping[int, float] | None = None
-    monitor_key: str | None = None
     threshold_min: float | None = None
     threshold_max: float | None = None
-    azimuth_offset: float = 0.0
     chunk_size: int = 1
     clear_frame_images: bool = False
     gi_incident_angle: float | None = None
     gi_tilt_angle: float = 0.0
     gi_sample_orientation: int = 1
     gi_method: str = "no"
-    extra_1d: dict[str, Any] = field(default_factory=dict)
-    extra_2d: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.integrate_1d and not self.integrate_2d:
-            raise ValueError("ReductionPlan must enable integrate_1d or integrate_2d.")
-        if self.npt_1d <= 0:
-            raise ValueError(f"npt_1d must be > 0; got {self.npt_1d}")
-        if self.npt_rad_2d <= 0 or self.npt_azim_2d <= 0:
+        if self.integration_1d is None and self.integration_2d is None:
             raise ValueError(
-                "npt_rad_2d and npt_azim_2d must both be > 0; "
-                f"got ({self.npt_rad_2d}, {self.npt_azim_2d})"
+                "ReductionPlan must include integration_1d or integration_2d."
             )
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0; got {self.chunk_size}")
@@ -278,13 +305,18 @@ class NexusSink:
     compression: str | None = "lzf"
     overwrite: bool = False
     swmr: bool = False
+    flush_every: int | None = None
     _h5: Any | None = field(default=None, init=False, repr=False)
+    _n_written: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
             self.path = Path(self.path)
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None:
+        if self.flush_every is not None and self.flush_every <= 0:
+            raise ValueError(f"flush_every must be > 0 or None; got {self.flush_every}")
+        self._n_written = 0
         self._h5 = open_nexus_writer(
             self.path,
             metadata=scan.to_metadata(),
@@ -305,10 +337,13 @@ class NexusSink:
             entry=self.entry,
             compression=self.compression,
         )
-        self._h5.flush()
+        self._n_written += 1
+        if self.flush_every is not None and self._n_written % self.flush_every == 0:
+            self._h5.flush()
 
     def finish(self, result: ReductionResult) -> None:
         if self._h5 is not None:
+            self._h5.flush()
             self._h5.close()
             self._h5 = None
 
@@ -352,6 +387,7 @@ def run_reduction(
                 raise ValueError("Reduction requires scan.integrator or scan.poni.")
             ai = poni_to_integrator(scan.poni)
 
+    plan_mask = _as_bool_mask(plan.mask, "ReductionPlan.mask")
     sink.begin(scan, plan)
     _emit(progress_cb, scan.name, "start", None, completed, total)
     try:
@@ -371,11 +407,14 @@ def run_reduction(
                     break
                 _emit(progress_cb, scan.name, "load", frame.index, completed, total)
                 image = np.asarray(frame.load_image(), dtype=float)
+                if image.ndim != 2:
+                    raise ValueError(
+                        f"Frame {frame.index} image must be 2D; got shape {image.shape}"
+                    )
+                _validate_frame_inputs(frame, image.shape)
                 image = _apply_thresholds(image, plan)
                 image = _subtract_background(image, frame.background)
-                mask = _combined_mask(plan.mask, frame.mask)
-                norm = _normalization_for(frame, plan)
-                azimuth_range = _integration_azimuth_range(plan)
+                mask = _combined_mask(plan_mask, frame.mask, image.shape)
 
                 _emit(progress_cb, scan.name, "integrate", frame.index, completed, total)
                 if plan.gi:
@@ -383,69 +422,75 @@ def run_reduction(
                         integrate_gi_1d(
                             image,
                             fi,
-                            npt=plan.npt_1d,
-                            unit=plan.unit,
+                            npt=plan.integration_1d.npt,
+                            unit=plan.integration_1d.unit,
                             method=plan.gi_method,
                             mask=mask,
-                            radial_range=plan.radial_range,
-                            azimuth_range=azimuth_range,
-                            **plan.extra_1d,
+                            radial_range=plan.integration_1d.radial_range,
+                            azimuth_range=plan.integration_1d.azimuth_range,
+                            **plan.integration_1d.extra,
                         )
-                        if plan.integrate_1d else None
+                        if plan.integration_1d is not None else None
                     )
                     r2d = (
                         integrate_gi_2d(
                             image,
                             fi,
-                            npt_rad=plan.npt_rad_2d,
-                            npt_azim=plan.npt_azim_2d,
-                            unit=plan.unit,
+                            npt_rad=plan.integration_2d.npt_rad,
+                            npt_azim=plan.integration_2d.npt_azim,
+                            unit=plan.integration_2d.unit,
                             method=plan.gi_method,
                             mask=mask,
-                            radial_range=plan.radial_range,
-                            azimuth_range=azimuth_range,
-                            **plan.extra_2d,
+                            radial_range=plan.integration_2d.radial_range,
+                            azimuth_range=_integration_azimuth_range(plan.integration_2d),
+                            **plan.integration_2d.extra,
                         )
-                        if plan.integrate_2d else None
+                        if plan.integration_2d is not None else None
                     )
                 else:
                     r1d = (
                         integrate_1d(
                             image,
                             ai,
-                            npt=plan.npt_1d,
-                            unit=plan.unit,
-                            method=plan.method_1d,
+                            npt=plan.integration_1d.npt,
+                            unit=plan.integration_1d.unit,
+                            method=plan.integration_1d.method,
                             mask=mask,
-                            radial_range=plan.radial_range,
-                            azimuth_range=azimuth_range,
-                            error_model=plan.error_model,
-                            polarization_factor=plan.polarization_factor,
-                            normalization_factor=norm,
-                            **plan.extra_1d,
+                            radial_range=plan.integration_1d.radial_range,
+                            azimuth_range=plan.integration_1d.azimuth_range,
+                            error_model=plan.integration_1d.error_model,
+                            polarization_factor=plan.integration_1d.polarization_factor,
+                            normalization_factor=_normalization_for(
+                                frame, plan.integration_1d
+                            ),
+                            **plan.integration_1d.extra,
                         )
-                        if plan.integrate_1d else None
+                        if plan.integration_1d is not None else None
                     )
                     r2d = (
                         integrate_2d(
                             image,
                             ai,
-                            npt_rad=plan.npt_rad_2d,
-                            npt_azim=plan.npt_azim_2d,
-                            unit=plan.unit,
-                            method=plan.method_2d,
+                            npt_rad=plan.integration_2d.npt_rad,
+                            npt_azim=plan.integration_2d.npt_azim,
+                            unit=plan.integration_2d.unit,
+                            method=plan.integration_2d.method,
                             mask=mask,
-                            radial_range=plan.radial_range,
-                            azimuth_range=azimuth_range,
-                            error_model=plan.error_model,
-                            polarization_factor=plan.polarization_factor,
-                            normalization_factor=norm,
-                            **plan.extra_2d,
+                            radial_range=plan.integration_2d.radial_range,
+                            azimuth_range=_integration_azimuth_range(plan.integration_2d),
+                            error_model=plan.integration_2d.error_model,
+                            polarization_factor=plan.integration_2d.polarization_factor,
+                            normalization_factor=_normalization_for(
+                                frame, plan.integration_2d
+                            ),
+                            **plan.integration_2d.extra,
                         )
-                        if plan.integrate_2d else None
+                        if plan.integration_2d is not None else None
                     )
-                    if r2d is not None and plan.azimuth_offset:
-                        r2d.azimuthal = r2d.azimuthal + float(plan.azimuth_offset)
+                    if r2d is not None and plan.integration_2d.azimuth_offset:
+                        r2d.azimuthal = (
+                            r2d.azimuthal + float(plan.integration_2d.azimuth_offset)
+                        )
 
                 reduction = FrameReduction(
                     frame_index=frame.index,
@@ -494,11 +539,16 @@ def _subtract_background(
 ) -> np.ndarray:
     if background is None:
         return image
-    return image - np.asarray(background, dtype=float)
+    bg = np.asarray(background, dtype=float)
+    if bg.ndim > 0 and bg.shape != image.shape:
+        raise ValueError(
+            f"background shape {bg.shape} does not match image shape {image.shape}"
+        )
+    return image - bg
 
 
 def _integration_azimuth_range(
-    plan: ReductionPlan,
+    plan: Integration2DPlan,
 ) -> tuple[float, float] | None:
     if plan.azimuth_range is None:
         return None
@@ -512,17 +562,29 @@ def _integration_azimuth_range(
 def _combined_mask(
     plan_mask: np.ndarray | None,
     frame_mask: np.ndarray | None,
+    image_shape: tuple[int, int],
 ) -> np.ndarray | None:
+    frame_mask = _as_bool_mask(frame_mask, "Frame.mask")
+    if plan_mask is not None and plan_mask.shape != image_shape:
+        raise ValueError(
+            f"ReductionPlan.mask shape {plan_mask.shape} does not match "
+            f"image shape {image_shape}"
+        )
+    if frame_mask is not None and frame_mask.shape != image_shape:
+        raise ValueError(
+            f"Frame.mask shape {frame_mask.shape} does not match image shape {image_shape}"
+        )
     if plan_mask is None:
         return frame_mask
     if frame_mask is None:
         return plan_mask
-    return np.asarray(plan_mask, dtype=bool) | np.asarray(frame_mask, dtype=bool)
+    return plan_mask | frame_mask
 
 
-def _normalization_for(frame: Frame, plan: ReductionPlan) -> float | None:
-    if plan.normalization_factors is not None and frame.index in plan.normalization_factors:
-        return float(plan.normalization_factors[frame.index])
+def _normalization_for(
+    frame: Frame,
+    plan: Integration1DPlan | Integration2DPlan,
+) -> float | None:
     if frame.normalization_factor is not None:
         return float(frame.normalization_factor)
     if plan.monitor_key is not None:
@@ -539,6 +601,32 @@ def _normalization_for(frame: Frame, plan: ReductionPlan) -> float | None:
         if np.isfinite(norm) and norm != 0:
             return norm
     return None
+
+
+def _validate_frame_inputs(frame: Frame, image_shape: tuple[int, int]) -> None:
+    if frame.background is not None:
+        bg = np.asarray(frame.background)
+        if bg.ndim > 0 and bg.shape != image_shape:
+            raise ValueError(
+                f"Frame {frame.index} background shape {bg.shape} does not "
+                f"match image shape {image_shape}"
+            )
+    if frame.mask is not None:
+        mask = _as_bool_mask(frame.mask, "Frame.mask")
+        if mask.shape != image_shape:
+            raise ValueError(
+                f"Frame {frame.index} mask shape {mask.shape} does not "
+                f"match image shape {image_shape}"
+            )
+
+
+def _as_bool_mask(mask: np.ndarray | None, name: str) -> np.ndarray | None:
+    if mask is None:
+        return None
+    arr = np.asarray(mask)
+    if arr.ndim != 2:
+        raise ValueError(f"{name} must be a 2D boolean mask; got shape {arr.shape}")
+    return arr.astype(bool, copy=False)
 
 
 def _emit(
