@@ -671,10 +671,4 @@ class LiveScan:
             return
 
 
-# Transitional compatibility name. Keep this alias for one release so older
-# imports and old serialized references can resolve while new code uses
-# LiveScan.
-EwaldSphere = LiveScan
-
-
-__all__ = ["LiveScan", "EwaldSphere"]
+__all__ = ["LiveScan"]

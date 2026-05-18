@@ -834,9 +834,4 @@ class LiveFrame():
         return arch_copy
 
 
-# Transitional compatibility name. Keep this alias for one release so older
-# imports and serialized references can resolve while new code uses LiveFrame.
-EwaldArch = LiveFrame
-
-
-__all__ = ["LiveFrame", "EwaldArch"]
+__all__ = ["LiveFrame"]
