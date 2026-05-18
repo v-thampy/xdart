@@ -46,7 +46,10 @@ from ssrl_xrd_tools.io.nexus import find_nexus_image_dataset
 from ssrl_xrd_tools.io.metadata import read_image_metadata
 from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
-from xdart.modules.reduction import plan_from_ewald_sphere, reduce_ewald_arch
+from xdart.modules.reduction import (
+    StandardPlanCache,
+    dispatch_arch_reduction,
+)
 from .wrangler_widget import wranglerThread
 
 
@@ -323,6 +326,7 @@ class specThread(wranglerThread):
         # via ``showLabel`` so the user sees "Eiger read failed: ..."
         # instead of a silent end-of-scan.  None means "no error".
         self._prefetch_error = None
+        self._plan_cache = StandardPlanCache()
 
     # ── Display helpers ──────────────────────────────────────────────────
 
@@ -813,15 +817,7 @@ class specThread(wranglerThread):
         bai_2d_args = dict(sphere.bai_2d_args)
         mask = self.mask
         gi = self.gi
-        standard_plan = (
-            plan_from_ewald_sphere(
-                sphere,
-                integrate_1d=True,
-                integrate_2d=not skip_2d,
-                chunk_size=1,
-            )
-            if not gi else None
-        )
+        standard_plan = self._plan_cache.get(sphere, integrate_2d=not skip_2d)
         th_mtr = self.incidence_motor
         sample_orientation = self.sample_orientation
         tilt_angle = self.tilt_angle
@@ -867,13 +863,11 @@ class specThread(wranglerThread):
                     mask=arch_mask,
                 )
 
-                if gi:
-                    # H2: GI fiber integrator goes through the shared
-                    # _borrow_fiber_integrator helper.  When the frame's
-                    # incidence angle matches the prewarm cache (the
-                    # sin²ψ common path) it borrows a private deepcopy
-                    # from fiber_pool.  Otherwise it builds a worker-local
-                    # fiber integrator at the correct angle.
+                # H2 + S3 unified dispatch.  When ``standard_plan`` is
+                # None (GI sphere) we run the fiber-integrator path
+                # inside the legacy_gi closure; otherwise the headless
+                # ``reduce_ewald_arch`` handles it.
+                def _legacy_gi_for_arch() -> None:
                     with self._borrow_fiber_integrator(
                         sphere, fiber_pool, arch,
                     ) as _fi:
@@ -888,14 +882,14 @@ class specThread(wranglerThread):
                                 fiber_integrator=_fi,
                                 **bai_2d_args,
                             )
-                else:
-                    reduce_ewald_arch(
-                        arch,
-                        standard_plan,
-                        scan_name=sphere.name,
-                        global_mask=mask,
-                        integrator=ai,
-                    )
+
+                dispatch_arch_reduction(
+                    arch, sphere,
+                    standard_plan=standard_plan,
+                    integrator=ai,
+                    global_mask=mask,
+                    legacy_gi=_legacy_gi_for_arch,
+                )
 
             # Detach the pool integrator from this arch — once the
             # `with` block exited, the next worker can borrow this
@@ -1070,38 +1064,34 @@ class specThread(wranglerThread):
                 self._cached_gi_incident_angle = _incident_angle
 
         _t2 = time.time()
-        if self.gi:
+
+        def _legacy_gi_for_single() -> None:
             arch.integrate_1d(
                 global_mask=self.mask,
                 fiber_integrator=sphere._cached_fiber_integrator,
                 **sphere.bai_1d_args,
             )
-            _t_1d = time.time() - _t2
-
-            _t3 = time.time()
             if not sphere.skip_2d:
                 arch.integrate_2d(
                     global_mask=self.mask,
                     fiber_integrator=sphere._cached_fiber_integrator,
                     **sphere.bai_2d_args,
                 )
-            _t_2d = time.time() - _t3
-        else:
-            plan = plan_from_ewald_sphere(
-                sphere,
-                integrate_1d=True,
-                integrate_2d=not sphere.skip_2d,
-                chunk_size=1,
-            )
-            reduce_ewald_arch(
-                arch,
-                plan,
-                scan_name=sphere.name,
-                global_mask=self.mask,
-                integrator=sphere._cached_integrator,
-            )
-            _t_1d = time.time() - _t2
-            _t_2d = 0.0
+
+        dispatch_arch_reduction(
+            arch, sphere,
+            standard_plan=self._plan_cache.get(
+                sphere, integrate_2d=not sphere.skip_2d,
+            ),
+            integrator=sphere._cached_integrator,
+            global_mask=self.mask,
+            legacy_gi=_legacy_gi_for_single,
+        )
+        # Timing kept for parity with the legacy logging; the
+        # standard path now does both 1D + 2D in one call so we
+        # bundle the total under _t_1d.
+        _t_1d = time.time() - _t2
+        _t_2d = 0.0
 
         # ── GUI data (skip in batch mode — no one is looking) ────────────
         _t_h5_total = _t_h5_wait = _t_h5_write = 0.0

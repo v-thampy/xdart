@@ -60,7 +60,10 @@ from ssrl_xrd_tools.io.image import read_image
 from ssrl_xrd_tools.io.export import write_xye
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.utils.integrator_pool import ensure_integrator_pool
-from xdart.modules.reduction import plan_from_ewald_sphere, reduce_ewald_arch
+from xdart.modules.reduction import (
+    StandardPlanCache,
+    dispatch_arch_reduction,
+)
 from .wrangler_widget import wranglerThread
 
 logger = logging.getLogger(__name__)
@@ -146,6 +149,10 @@ class nexusThread(wranglerThread):
         # Settable from outside (e.g. before .start()) when the GUI
         # eventually exposes a Cores spinbox for the NeXus wrangler.
         self.max_cores = _DEFAULT_MAX_CORES
+        # C1: cached standard ReductionPlan, rebuilt only when sphere
+        # settings change.  Lives on the thread so it survives across
+        # chunks within a single run.
+        self._plan_cache = StandardPlanCache()
 
     # ── Main entry point ─────────────────────────────────────────────────
 
@@ -257,14 +264,10 @@ class nexusThread(wranglerThread):
                 )
                 if self.gi else None
             )
-            standard_plan = (
-                plan_from_ewald_sphere(
-                    sphere,
-                    integrate_1d=True,
-                    integrate_2d=not sphere.skip_2d,
-                    chunk_size=1,
-                )
-                if not self.gi else None
+            # C1: cached per-sphere plan — rebuilt only when sphere
+            # integration settings or mask change between chunks.
+            standard_plan = self._plan_cache.get(
+                sphere, integrate_2d=not sphere.skip_2d,
             )
             # If the GUI is single-core (max_cores=1) integrator_pool
             # still exists with one member; the worker borrows it like
@@ -506,13 +509,10 @@ class nexusThread(wranglerThread):
                 mask=arch_mask,
             )
 
-            if self.gi:
-                # GI fiber integrator: pre-warmed on the main thread for
-                # frame 0's incidence angle.  Reuse it when this frame's
-                # angle matches; otherwise build a worker-local one at
-                # the right angle.  Sin²ψ scans (fixed ω) stay on the
-                # fast cached path; ω-varying scans get correct results
-                # at the cost of one per-frame fiber-integrator build.
+            # S3: unified dispatch — GI fiber-integrator path lives in
+            # the closure so the GI fiber-integrator pool stays local
+            # to the worker.  Non-GI dispatches to the headless API.
+            def _legacy_gi_for_frame() -> None:
                 with self._borrow_fiber_integrator(
                     sphere, fiber_pool, arch,
                 ) as fi:
@@ -527,14 +527,14 @@ class nexusThread(wranglerThread):
                             fiber_integrator=fi,
                             **sphere.bai_2d_args,
                         )
-            else:
-                reduce_ewald_arch(
-                    arch,
-                    standard_plan,
-                    scan_name=sphere.name,
-                    global_mask=self.mask,
-                    integrator=ai,
-                )
+
+            dispatch_arch_reduction(
+                arch, sphere,
+                standard_plan=standard_plan,
+                integrator=ai,
+                global_mask=self.mask,
+                legacy_gi=_legacy_gi_for_frame,
+            )
 
         # Detach the pool integrator from the arch — once the `with`
         # exits, another worker can borrow this same instance.  The
