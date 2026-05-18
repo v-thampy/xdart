@@ -72,7 +72,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # plot methods don't require shift/ctrl multi-select.
     sigPlotMethodChanged = Qt.QtCore.Signal(str)
 
-    """Widget for displaying 2D image data and 1D plots from EwaldSphere
+    """Widget for displaying 2D image data and 1D plots from LiveScan
     objects.
 
     Inherits data-access helpers from ``DisplayDataMixin`` and
@@ -93,10 +93,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         plot_layout: QVBoxLayout, for holding the 1D plotting widgets
         plot_win: pyqtgraph GraphicsLayoutWidget, layout for the 1D
             data
-        sphere: EwaldSphere, unused.
-        arch: EwaldArch, currently loaded arch object
-        arch_ids: List of EwaldArch indices currently loaded
-        arches: Dictionary of currently loaded EwaldArches
+        sphere: LiveScan, unused.
+        arch: LiveFrame, currently loaded arch object
+        arch_ids: List of LiveFrame indices currently loaded
+        arches: Dictionary of currently loaded LiveFrames
         data_1d: Dictionary object holding all 1D data in memory
         data_2d: Dictionary object holding all 2D data in memory
         ui: Ui_Form from qtdesigner

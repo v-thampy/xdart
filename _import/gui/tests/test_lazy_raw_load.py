@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tests for L1 lazy raw load: EwaldArch._lazy_load_raw + the
+"""Tests for L1 lazy raw load: LiveFrame._lazy_load_raw + the
 re-evaluated ``is_reload_only`` flag set by _load_arch_v2.
 
 Covers both source types the wranglers stamp into v2 files:
@@ -72,21 +72,21 @@ def _write_eiger_master(tmp_path, n_files=2, frames_per_file=3,
 
 class TestResolvedSourcePath:
     def test_no_source_file_returns_empty(self):
-        from xdart.modules.ewald.arch import EwaldArch
-        a = EwaldArch(idx=0)
+        from xdart.modules.ewald.arch import LiveFrame
+        a = LiveFrame(idx=0)
         a.source_file = ""
         assert a._resolved_source_path() == ""
 
     def test_absolute_source_file_kept(self, tmp_path):
-        from xdart.modules.ewald.arch import EwaldArch
-        a = EwaldArch(idx=0)
+        from xdart.modules.ewald.arch import LiveFrame
+        a = LiveFrame(idx=0)
         a.source_file = str(tmp_path / "abs.tif")
         a._source_root = "/should/be/ignored"
         assert a._resolved_source_path() == str(tmp_path / "abs.tif")
 
     def test_relative_joined_against_source_root(self, tmp_path):
-        from xdart.modules.ewald.arch import EwaldArch
-        a = EwaldArch(idx=0)
+        from xdart.modules.ewald.arch import LiveFrame
+        a = LiveFrame(idx=0)
         a.source_file = "frame_0001.tif"
         a._source_root = str(tmp_path)
         assert a._resolved_source_path() == str(tmp_path / "frame_0001.tif")
@@ -94,8 +94,8 @@ class TestResolvedSourcePath:
     def test_relative_with_empty_root_uses_cwd(self):
         """Defensive: pre-R2 reloads might lack _source_root; the lazy
         load shouldn't crash, it should return False on os.path.exists."""
-        from xdart.modules.ewald.arch import EwaldArch
-        a = EwaldArch(idx=0)
+        from xdart.modules.ewald.arch import LiveFrame
+        a = LiveFrame(idx=0)
         a.source_file = "frame_0001.tif"
         a._source_root = ""
         # Returns the bare relpath (matches "use cwd" semantics).
@@ -109,11 +109,11 @@ class TestResolvedSourcePath:
 class TestLazyLoadTif:
     def test_loads_tif_frame_from_relative_path(self, tmp_path):
         pytest.importorskip("tifffile")
-        from xdart.modules.ewald.arch import EwaldArch
+        from xdart.modules.ewald.arch import LiveFrame
 
         img = _write_tif(tmp_path / "frame_0000.tif", shape=(10, 12), seed=7)
 
-        a = EwaldArch(idx=0)
+        a = LiveFrame(idx=0)
         a.map_raw = None
         a.source_file = "frame_0000.tif"
         a.source_frame_idx = 0  # SPEC TIFs are always frame 0
@@ -126,8 +126,8 @@ class TestLazyLoadTif:
         assert np.allclose(a.map_raw, img.astype(np.float32))
 
     def test_no_op_when_map_raw_already_set(self, tmp_path):
-        from xdart.modules.ewald.arch import EwaldArch
-        a = EwaldArch(idx=0)
+        from xdart.modules.ewald.arch import LiveFrame
+        a = LiveFrame(idx=0)
         a.map_raw = np.ones((4, 4), dtype=np.float32) * 42
         a.source_file = "nonexistent.tif"
         a._source_root = str(tmp_path)
@@ -136,8 +136,8 @@ class TestLazyLoadTif:
         assert np.all(a.map_raw == 42)
 
     def test_missing_file_returns_false(self, tmp_path):
-        from xdart.modules.ewald.arch import EwaldArch
-        a = EwaldArch(idx=0)
+        from xdart.modules.ewald.arch import LiveFrame
+        a = LiveFrame(idx=0)
         a.map_raw = None
         a.source_file = "ghost.tif"
         a._source_root = str(tmp_path)
@@ -145,14 +145,14 @@ class TestLazyLoadTif:
         assert a.map_raw is None
 
     def test_no_source_file_returns_false(self):
-        from xdart.modules.ewald.arch import EwaldArch
-        a = EwaldArch(idx=0)
+        from xdart.modules.ewald.arch import LiveFrame
+        a = LiveFrame(idx=0)
         a.map_raw = None
         a.source_file = ""
         assert a._lazy_load_raw() is False
 
     def test_copy_preserves_lazy_load_provenance(self, tmp_path):
-        """P4 regression: ``EwaldArch.copy(include_2d=False)`` must
+        """P4 regression: ``LiveFrame.copy(include_2d=False)`` must
         preserve ``source_frame_idx``, ``_source_root``, and
         ``is_reload_only`` along with ``source_file``.
 
@@ -164,9 +164,9 @@ class TestLazyLoadTif:
         regress it.
         """
         pytest.importorskip("tifffile")
-        from xdart.modules.ewald.arch import EwaldArch
+        from xdart.modules.ewald.arch import LiveFrame
 
-        a = EwaldArch(idx=7)
+        a = LiveFrame(idx=7)
         a.source_file = "stack.tif"
         a.source_frame_idx = 3
         a._source_root = str(tmp_path)
@@ -193,7 +193,7 @@ class TestLazyLoadTif:
         the first slice for every arch — silently wrong.
         """
         pytest.importorskip("tifffile")
-        from xdart.modules.ewald.arch import EwaldArch
+        from xdart.modules.ewald.arch import LiveFrame
         import tifffile
 
         rng = np.random.default_rng(31)
@@ -203,7 +203,7 @@ class TestLazyLoadTif:
         tifffile.imwrite(str(stack_path), stack)
 
         target_idx = 3
-        a = EwaldArch(idx=target_idx)
+        a = LiveFrame(idx=target_idx)
         a.map_raw = None
         a.source_file = "stack.tif"
         a.source_frame_idx = target_idx
@@ -224,13 +224,13 @@ class TestLazyLoadTif:
 
 class TestLazyLoadNexus:
     def test_loads_specific_frame_from_eiger_master(self, tmp_path):
-        from xdart.modules.ewald.arch import EwaldArch
+        from xdart.modules.ewald.arch import LiveFrame
         master, full = _write_eiger_master(
             tmp_path, n_files=3, frames_per_file=4, shape=(7, 9), seed=11,
         )
         target_idx = 9  # crosses the data_000001 → data_000002 boundary
 
-        a = EwaldArch(idx=target_idx)
+        a = LiveFrame(idx=target_idx)
         a.map_raw = None
         a.source_file = master.name
         a.source_frame_idx = target_idx  # NeXus: global stack index
@@ -243,11 +243,11 @@ class TestLazyLoadNexus:
     def test_falls_back_to_idx_when_source_frame_idx_missing(self, tmp_path):
         """Reload-from-older-file path: source_frame_idx is None →
         lazy loader uses arch.idx instead."""
-        from xdart.modules.ewald.arch import EwaldArch
+        from xdart.modules.ewald.arch import LiveFrame
         master, full = _write_eiger_master(
             tmp_path, n_files=2, frames_per_file=3, shape=(5, 5), seed=13,
         )
-        a = EwaldArch(idx=2)
+        a = LiveFrame(idx=2)
         a.map_raw = None
         a.source_file = master.name
         a.source_frame_idx = None
@@ -256,8 +256,8 @@ class TestLazyLoadNexus:
         assert np.allclose(a.map_raw, full[2].astype(np.float32))
 
     def test_missing_master_returns_false(self, tmp_path):
-        from xdart.modules.ewald.arch import EwaldArch
-        a = EwaldArch(idx=0)
+        from xdart.modules.ewald.arch import LiveFrame
+        a = LiveFrame(idx=0)
         a.map_raw = None
         a.source_file = "no_such_master.h5"
         a.source_frame_idx = 0
@@ -375,9 +375,9 @@ class TestPicklingPreservesLazyLoadCapability:
 
     def test_attrs_round_trip_through_pickle(self, tmp_path):
         import pickle
-        from xdart.modules.ewald.arch import EwaldArch
+        from xdart.modules.ewald.arch import LiveFrame
 
-        a = EwaldArch(idx=42)
+        a = LiveFrame(idx=42)
         a.source_file = "frame_0042.tif"
         a.source_frame_idx = 0
         a._source_root = str(tmp_path)
@@ -405,12 +405,12 @@ class TestPicklingPreservesLazyLoadCapability:
         what sphere_threads.bai_*_all does under the hood.
         """
         pytest.importorskip("tifffile")
-        from xdart.modules.ewald.arch import EwaldArch
+        from xdart.modules.ewald.arch import LiveFrame
 
         img = _write_tif(tmp_path / "frame_0007.tif",
                          shape=(8, 10), seed=42)
 
-        a = EwaldArch(idx=7)
+        a = LiveFrame(idx=7)
         a.map_raw = None
         a.source_file = "frame_0007.tif"
         a.source_frame_idx = 0
@@ -451,12 +451,12 @@ class TestIntegrateTriggersLazyLoad:
 
     def test_integrate_1d_lazy_loads_before_pyfai(self, tmp_path):
         pytest.importorskip("tifffile")
-        from xdart.modules.ewald.arch import EwaldArch
+        from xdart.modules.ewald.arch import LiveFrame
 
         # Write a real TIF.
         _write_tif(tmp_path / "frame_0000.tif", shape=(16, 16), seed=99)
 
-        a = EwaldArch(idx=0)
+        a = LiveFrame(idx=0)
         a.map_raw = None
         a.source_file = "frame_0000.tif"
         a.source_frame_idx = 0

@@ -104,7 +104,7 @@ class Ui_Form(object):
     def retranslateUi(self, Form):
         Form.setWindowTitle(QCoreApplication.translate("Form", u"Form", None))
         self.label_3.setText(QCoreApplication.translate("Form", u"  Scans", None))
-        self.label_4.setText(QCoreApplication.translate("Form", u"Data", None))
+        self.label_4.setText(QCoreApplication.translate("Form", u"Frames", None))
         self.show_all.setText(QCoreApplication.translate("Form", u"Show All", None))
         self.auto_last.setText(QCoreApplication.translate("Form", u"Auto Last", None))
     # retranslateUi

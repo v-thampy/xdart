@@ -120,7 +120,7 @@ class specWrangler(wranglerWidget):
         parameters: pyqtgraph Parameter, stores parameters from user
         scan_name: str, current scan name, used to handle syncing data
         sphere_args: dict, used as **kwargs in sphere initialization.
-            see EwaldSphere.
+            see LiveScan.
         thread: wranglerThread or subclass, QThread for controlling
             processes
         timeout: int, how long before thread stops looking for new

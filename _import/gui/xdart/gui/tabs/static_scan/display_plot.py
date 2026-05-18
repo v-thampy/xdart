@@ -97,6 +97,13 @@ class DisplayPlotMixin:
         if ydata.ndim == 1:
             ydata = ydata[np.newaxis, :]
 
+        # Single-mode overplots whatever rows are in the current
+        # selection: a single-click gives one curve, shift/cmd-click
+        # gives several.  Live-scan selection accumulation (which used
+        # to silently turn Single into a Waterfall) is now prevented at
+        # the source by ClearAndSelect in h5viewer + latest_arch, so we
+        # don't need to narrow ydata here.
+
         current_plot_unit = self.ui.plotUnit.currentIndex()
         unit_changed = current_plot_unit != self._last_plot_unit
         self._last_plot_unit = current_plot_unit
@@ -200,7 +207,11 @@ class DisplayPlotMixin:
         self.plotMethod = self.ui.plotMethod.currentText()
 
         self.ui.yOffset.setEnabled(False)
-        if (self.plotMethod in ['Overlay', 'Single']) and (len(self.arch_names) > 1):
+        # yOffset is only meaningful when more than one curve is on screen.
+        # That's Overlay with a multi-selection, or Single mode with a
+        # manual shift/cmd-click multi-selection (which behaves like Overlay).
+        if (self.plotMethod in ('Overlay', 'Single')
+                and len(self.arch_names) > 1):
             self.ui.yOffset.setEnabled(True)
 
         n_curves = len(self.plot_data[1])
@@ -251,8 +262,11 @@ class DisplayPlotMixin:
                 ydata = np.sqrt(ydata)
             ylabel = f'<math>&radic;</math>{int_label} (a.u.)'
 
-        if ((self.plotMethod in ['Overlay', 'Waterfall']) or
-                ((self.plotMethod == 'Single') and (ydata.shape[0] > 1))):
+        # Overlay/Waterfall always stack the selection.  Single also
+        # stacks when the user has multi-selected frames (shift/cmd-click) —
+        # that branch behaves like Overlay but without the yOffset.
+        multi_single = self.plotMethod == 'Single' and ydata.shape[0] > 1
+        if self.plotMethod in ['Overlay', 'Waterfall'] or multi_single:
             ydata = ydata[self.wf_start::self.wf_step]
             self.setup_curves()
 

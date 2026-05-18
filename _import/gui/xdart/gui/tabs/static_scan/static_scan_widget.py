@@ -33,7 +33,7 @@ else:
     from pyqtgraph.Qt import QtWidgets, QtCore
 
 # This module imports
-from xdart.modules.ewald import EwaldSphere, EwaldArch
+from xdart.modules.live import LiveFrame, LiveScan
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer
 from .display_frame_widget import displayFrameWidget
@@ -59,11 +59,11 @@ wranglers = {
 def spherelocked(func):
     """Decorator that acquires sphere_lock before calling the wrapped method.
 
-    If self.sphere is not an EwaldSphere (e.g. during initialisation),
+    If self.sphere is not a LiveScan (e.g. during initialisation),
     the function is called without the lock rather than silently returning None.
     """
     def wrapper(self, *args, **kwargs):
-        if isinstance(self.sphere, EwaldSphere):
+        if isinstance(self.sphere, LiveScan):
             with self.sphere.sphere_lock:
                 return func(self, *args, **kwargs)
         return func(self, *args, **kwargs)
@@ -93,16 +93,16 @@ class staticWidget(QWidget):
             entire scan or individual image.
 
     attributes:
-        arch: EwaldArch, currently loaded arch object
-        arch_ids: List of EwaldArch indices currently loaded
-        arches: Dictionary of currently loaded EwaldArches
+        arch: LiveFrame, currently loaded arch object
+        arch_ids: List of LiveFrame indices currently loaded
+        arches: Dictionary of currently loaded LiveFrames
         data_1d: Dictionary object holding all 1D data in memory
         data_2d: Dictionary object holding all 2D data in memory
         command_queue: Queue, used to send commands to wrangler
         dirname: str, absolute path of current directory for scan
         file_lock: mp.Condition, process safe lock
         fname: str, current data file name
-        sphere: EwaldSphere, current scan data
+        sphere: LiveScan, current scan data
         timer: QTimer, currently unused but can be used for periodic
             functions.
         ui: Ui_Form, layout from qtdesigner
@@ -150,13 +150,13 @@ class staticWidget(QWidget):
 
         self.fname = os.path.join(self.dirname, 'default.nxs')
         # J2: share ``file_lock`` with the sphere so direct
-        # ArchSeries lazy loads use the same lock as the
+        # LiveFrameSeries lazy loads use the same lock as the
         # wrangler's save paths.
-        self.sphere = EwaldSphere('null_main',
-                                  data_file=self.fname,
-                                  static=True,
-                                  file_lock=self.file_lock)
-        self.arch = EwaldArch(static=True, gi=self.sphere.gi)
+        self.sphere = LiveScan('null_main',
+                               data_file=self.fname,
+                               static=True,
+                               file_lock=self.file_lock)
+        self.arch = LiveFrame(static=True, gi=self.sphere.gi)
         self.arch_ids = []
         self.arches = OrderedDict()
         # O4: both 1D and 2D caches are bounded with the same cap.
@@ -362,9 +362,11 @@ class staticWidget(QWidget):
         Instead of rendering immediately (which blocks the main thread
         and causes frame-skipping when the wrangler is faster than the
         GUI), we update the in-memory data structures and schedule a
-        coalesced display refresh via a short single-shot timer.  If
-        another sigUpdateData arrives before the timer fires, only the
-        latest index is rendered.
+        throttled display refresh via a short single-shot timer.  The
+        timer is started only when it isn't already pending, so during
+        a fast scan burst the display refreshes at roughly the timer
+        interval (~200 ms) instead of waiting for the burst to settle.
+        Each flush renders the most recently received index.
 
         Special case: ``idx == -1`` is the batch-complete signal —
         trigger a full display refresh without touching the h5 viewer.
@@ -372,7 +374,8 @@ class staticWidget(QWidget):
         if idx == -1:
             # Batch mode finished — just refresh the display
             self._pending_update_idx = -1
-            self._update_timer.start()
+            if not self._update_timer.isActive():
+                self._update_timer.start()
             return
 
         # Per-frame mid-scan refresh.  Append idx to sphere.arches.index
@@ -444,18 +447,23 @@ class staticWidget(QWidget):
         # which frame to advance the cursor to.
         self.h5viewer.latest_idx = idx
 
-        # Record the latest index and (re)start the coalescing timer.
-        # If the timer is already running, restart resets the countdown
-        # so only one render happens after the burst settles.
+        # Record the latest index and start the coalescing timer if it
+        # isn't already running.  Throttle, not debounce: during a fast
+        # scan burst (frame inter-arrival < timer interval) we want the
+        # display to refresh every ~200 ms, not only after the burst
+        # settles.  Debounce semantics (.start() unconditionally
+        # restarting the countdown) made the display freeze on whatever
+        # the last completed flush rendered until the scan finished —
+        # visible as "plots only update at end of scan."
         self._pending_update_idx = idx
-        self._update_timer.start()
+        if not self._update_timer.isActive():
+            self._update_timer.start()
 
     def _flush_pending_update(self):
         """Render the most recently received wrangler update.
 
-        Called by _update_timer after a short quiet period (200 ms).
-        Coalesces all per-frame GUI work that doesn't have to happen
-        immediately:
+        Called by _update_timer at most once per ~200 ms.  Coalesces
+        all per-frame GUI work that doesn't have to happen immediately:
 
         * ``h5viewer.update_data()`` — refresh the listData widget
           (incremental append when possible — see
@@ -464,19 +472,18 @@ class staticWidget(QWidget):
           ``latest_idx`` is now (P4: was per-frame, now per-flush so
           we don't rebuild the list widget more than once per timer
           tick).
-        * ``displayframe.update()`` + ``metawidget.update()`` — repaint
-          the 2D image, 1D pattern, and metadata table.
+        * ``h5viewer.data_changed()`` — publish the selected frame
+          through the normal ``sigUpdate`` path exactly once.
         """
         if self._pending_update_idx is None:
             return
         self._pending_update_idx = None
         # Heavy list-widget refresh first — auto-last cursor needs the
         # list to contain the new index before it can select it.
-        self.h5viewer.update_data()
+        self.h5viewer.update_data(emit_update=False)
         if self.h5viewer.auto_last:
-            self.latest_arch()
-        self.displayframe.update()
-        self.metawidget.update()
+            self.latest_arch(emit_update=False)
+        self.h5viewer.data_changed()
 
     def disable_auto_last(self, q):
         """
@@ -677,7 +684,7 @@ class staticWidget(QWidget):
             name: str, scan name
             fname: str, path to data file for scan
         """
-        arch = EwaldArch(idx=arch_data['idx'], map_raw=arch_data['map_raw'],
+        arch = LiveFrame(idx=arch_data['idx'], map_raw=arch_data['map_raw'],
                          mask=arch_data['mask'], scan_info=arch_data['scan_info'],
                          poni_file=arch_data['poni_file'], static=self.sphere.static, gi=self.sphere.gi)
         arch.int_1d = arch_data['int_1d']
@@ -778,32 +785,45 @@ class staticWidget(QWidget):
         # Refresh scan list to show/hide appropriate file types
         self.h5viewer.update_scans()
 
-    def latest_arch(self):
+    def latest_arch(self, checked=None, *, emit_update=True):
         """Advances to last arch in data list, updates displayframe, and
-        set auto_last to True
+        set auto_last to True.
+
+        Wraps the cursor advance in ``blockSignals`` and invokes
+        ``data_changed()`` explicitly — same pattern as
+        ``H5Viewer.update_data``.  Without the block, the
+        ``ClearAndSelect`` cursor move would fire
+        ``itemSelectionChanged`` → ``data_changed`` → ``sigUpdate`` →
+        ``set_data`` → a redundant ``displayframe.update()`` on top of
+        whatever the caller does next (every call site that drives
+        ``latest_arch`` follows it with its own display refresh).
         """
         self.h5viewer.auto_last = True
         if self.h5viewer.ui.listData.count() <= 1:
             return
 
+        lw = self.h5viewer.ui.listData
         idx = self.h5viewer.latest_idx
-        if isinstance(idx, int):
-            self.h5viewer.latest_idx = idx
-
-            items = self.h5viewer.ui.listData.findItems(str(idx), QtCore.Qt.MatchExactly)
-            if len(items):
+        lw.blockSignals(True)
+        try:
+            if isinstance(idx, int):
+                items = lw.findItems(str(idx), QtCore.Qt.MatchExactly)
                 for item in items:
-                    self.h5viewer.ui.listData.setCurrentItem(item)
-        else:
-            last_row = self.h5viewer.ui.listData.count() - 1
-            if last_row >= 0:
-                item = self.h5viewer.ui.listData.item(last_row)
-                if item is not None:
-                    try:
-                        self.h5viewer.latest_idx = int(item.text())
-                    except ValueError:
-                        self.h5viewer.latest_idx = item.text()
-                self.h5viewer.ui.listData.setCurrentRow(last_row)
+                    self.h5viewer.set_current_frame(item)
+            else:
+                last_row = lw.count() - 1
+                if last_row >= 0:
+                    item = lw.item(last_row)
+                    if item is not None:
+                        try:
+                            self.h5viewer.latest_idx = int(item.text())
+                        except ValueError:
+                            self.h5viewer.latest_idx = item.text()
+                    self.h5viewer.set_current_frame(last_row)
+        finally:
+            lw.blockSignals(False)
+        if emit_update:
+            self.h5viewer.data_changed()
 
     def raw_to_tiff(self):
         self.popup_detector_options()

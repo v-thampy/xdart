@@ -7,14 +7,15 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-from .arch import EwaldArch
-from .arch_series import ArchSeries
+from .arch import LiveFrame
+from .arch_series import LiveFrameSeries
 from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xdart import utils
+from xdart.modules.live_compat import normalize_live_class_names
 
 
-class EwaldSphere:
-    """Class for storing multiple arch objects in v2 NeXus-formatted HDF5 files.
+class LiveScan:
+    """Stateful xdart live scan in v2 NeXus-formatted HDF5 files.
 
     Output file structure (xdart v2 schema, written by
     :func:`xdart.modules.ewald.nexus_writer.save_sphere_to_nexus`)::
@@ -61,10 +62,10 @@ class EwaldSphere:
         # J2: file_lock unification.  Callers can pass in their own
         # ``threading.Condition`` so the wrangler-level file_lock
         # (used by save paths under ``self.file_lock``) is the same
-        # lock that ``ArchSeries.__getitem__`` uses for lazy loads.
+        # lock that ``LiveFrameSeries.__getitem__`` uses for lazy loads.
         # Pre-J2 each sphere created its own Condition() and the
         # wrangler's GUI file_lock was a *different* lock — direct
-        # ``ArchSeries.__getitem__`` reads could happen mid-save
+        # ``LiveFrameSeries.__getitem__`` reads could happen mid-save
         # while the wrangler thought the file was quiescent.  With a
         # single shared lock the read just waits.  Existing callers
         # that don't pass file_lock still work — they just get the
@@ -103,11 +104,11 @@ class EwaldSphere:
         self._cached_fiber_integrator = None
 
         if arches:
-            self.arches = ArchSeries(self.data_file, self.file_lock, arches,
-                                     static=self.static, gi=self.gi)
+            self.arches = LiveFrameSeries(self.data_file, self.file_lock, arches,
+                                          static=self.static, gi=self.gi)
         else:
-            self.arches = ArchSeries(self.data_file, self.file_lock,
-                                     static=self.static, gi=self.gi)
+            self.arches = LiveFrameSeries(self.data_file, self.file_lock,
+                                          static=self.static, gi=self.gi)
         self.scan_data = scan_data
 
         # ``mg_args`` retained: nexus_writer reads
@@ -134,8 +135,8 @@ class EwaldSphere:
         """Resets all held data objects to blank state."""
         with self.sphere_lock:
             self.scan_data = pd.DataFrame()
-            self.arches = ArchSeries(self.data_file, self.file_lock,
-                                     static=self.static, gi=self.gi)
+            self.arches = LiveFrameSeries(self.data_file, self.file_lock,
+                                          static=self.static, gi=self.gi)
             self.global_mask = None
             self.bai_1d = None
             self.bai_2d = None
@@ -156,7 +157,7 @@ class EwaldSphere:
         Path B — empty cache (freshly opened .nxs, before any arch
         has been materialised): probe the first frame's
         ``/entry/frames/frame_NNNN/source/path`` directly from h5py
-        WITHOUT materialising an :class:`EwaldArch`.  This is the C2
+        WITHOUT materialising a :class:`LiveFrame`.  This is the C2
         fix — the pre-C2 code returned ``True`` whenever the cache
         was empty + the index had rows, which falsely blocked
         re-integration on a freshly opened .nxs even when every
@@ -309,16 +310,16 @@ class EwaldSphere:
         """
         # Eat any stale ``set_mg`` kwarg for backwards compat with
         # one or two release-old call sites.  Other unknown kwargs
-        # land in **kwargs and are forwarded to EwaldArch below.
+        # land in **kwargs and are forwarded to LiveFrame below.
         kwargs.pop("set_mg", None)
         with self.sphere_lock:
             if arch is None:
-                arch = EwaldArch(**kwargs)
+                arch = LiveFrame(**kwargs)
             if calculate:
                 arch.integrate_1d(global_mask=self.global_mask, **self.bai_1d_args)
                 arch.integrate_2d(global_mask=self.global_mask, **self.bai_2d_args)
             arch.file_lock = self.file_lock
-            # In-memory append only; ArchSeries.__setitem__ does no disk I/O.
+            # In-memory append only; LiveFrameSeries.__setitem__ does no disk I/O.
             if arch.idx not in self.arches.index:
                 self.arches.index.append(arch.idx)
                 self.arches.index.sort()
@@ -516,7 +517,7 @@ class EwaldSphere:
         ``read_sphere``) — we only need frame_index, axes, motor
         columns, and the reduction provenance attrs.  The heavy
         ``intensity_1d`` / ``intensity_2d`` stacks stay on disk and
-        :class:`ArchSeries.__getitem__` lazy-loads each frame's
+        :class:`LiveFrameSeries.__getitem__` lazy-loads each frame's
         slices on demand via :func:`_load_arch_v2`.  For a 10k-frame
         Eiger scan this is the difference between ~seconds (full
         materialisation) and ~tens of ms (frame index + a few KB of
@@ -587,7 +588,7 @@ class EwaldSphere:
                 self.scan_data = pd.DataFrame(motor_cols)
 
         # ── wavelength + bai args from reduction config (if present) ─
-        reduction = ds.attrs.get("reduction", {}) or {}
+        reduction = normalize_live_class_names(ds.attrs.get("reduction", {}) or {})
         config = reduction.get("config", {}) or {}
         if isinstance(config.get("bai_1d_args"), dict):
             self.bai_1d_args = dict(config["bai_1d_args"])
@@ -624,7 +625,7 @@ class EwaldSphere:
 
         # ── populate arches.index (always — required even in data_only
         # mode so the wrangler's per-frame `update_sphere` refresh has
-        # something for the GUI's listData to render).  ArchSeries lazy-
+        # something for the GUI's listData to render).  LiveFrameSeries lazy-
         # loads each arch on demand from the stacked v2 datasets via
         # _load_arch_v2; nothing to materialize up-front.
         #
@@ -639,7 +640,7 @@ class EwaldSphere:
                 )
             else:
                 frame_indices = []
-            empty_series = ArchSeries(
+            empty_series = LiveFrameSeries(
                 self.data_file, self.file_lock,
                 static=self.static, gi=self.gi,
             )
@@ -670,3 +671,4 @@ class EwaldSphere:
             return
 
 
+__all__ = ["LiveScan"]

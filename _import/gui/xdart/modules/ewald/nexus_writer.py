@@ -3,7 +3,7 @@
 This module produces files conforming to the layout described in
 ``xdart/docs/nexus_stitch_refactor_plan.md`` §2.  The single public
 entry point is :func:`save_sphere_to_nexus`, called from
-:meth:`EwaldSphere._save_to_nexus`.
+:meth:`LiveScan._save_to_nexus`.
 
 Key invariants of the v2 schema:
 
@@ -41,7 +41,7 @@ import numpy as np
 if TYPE_CHECKING:  # pragma: no cover
     from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
 
-    from xdart.modules.ewald.sphere import EwaldSphere
+    from xdart.modules.live import LiveScan
 
 
 logger = logging.getLogger(__name__)
@@ -109,7 +109,7 @@ def _assign_nxgroup(f, path: str, value) -> None:
 # ---------------------------------------------------------------------------
 
 def save_sphere_to_nexus(
-    sphere: "EwaldSphere",
+    sphere: "LiveScan",
     path: Union[str, "Path"],
     *,
     mode: str = "a",
@@ -138,7 +138,7 @@ def save_sphere_to_nexus(
     Parameters
     ----------
     sphere
-        :class:`EwaldSphere` carrying the in-memory state.  Must expose
+        :class:`LiveScan` carrying the in-memory state.  Must expose
         ``arches`` (ordered), ``scan_data`` (pandas DataFrame),
         ``bai_1d_args``, ``bai_2d_args``, optionally ``geometry``
         (:class:`DiffractometerGeometry`) and ``incidence_motor``.
@@ -491,7 +491,7 @@ def _new_arches_for_write(sphere, h5f, group_path: str) -> tuple[list, int]:
     ``[existing_n:total_n]`` of ``sphere.arches.index``.
 
     For normal append workflows the new arches are always in
-    ``ArchSeries._in_memory`` (the wrangler just stashed them via
+    ``LiveFrameSeries._in_memory`` (the wrangler just stashed them via
     ``add_arch``) so this materialises without any disk reads.
 
     If on-disk has *more* frames than in-memory — rare; sphere
@@ -791,9 +791,9 @@ def _write_per_frame_metadata(f, sphere, *, entry: str) -> None:
     Performance note: per-frame groups are *append-only* during a
     scan — once a frame's thumbnail/metadata is on disk, it doesn't
     change.  We pull the list of already-written frame keys directly
-    from h5py and only materialise an :class:`EwaldArch` for the
+    from h5py and only materialise a :class:`LiveFrame` for the
     indices that are *not* yet on disk — those hit the in-memory
-    cache (``ArchSeries._in_memory``) populated by the wrangler
+    cache (``LiveFrameSeries._in_memory``) populated by the wrangler
     moments earlier, so a single save costs O(new frames) and zero
     lazy-loads.  The old code path did ``list(sphere.arches)`` which
     materialised every arch on every save, lazy-loading old frames
@@ -1081,7 +1081,7 @@ def _representative_poni(sphere):
 
     Resolution order:
 
-    1. Any arch in ``ArchSeries._in_memory`` — the wrangler always
+    1. Any arch in ``LiveFrameSeries._in_memory`` — the wrangler always
        leaves at least the most recent batch's arches here, so this
        is the zero-disk path.
     2. The sphere's cached pyFAI integrator (if attached by the

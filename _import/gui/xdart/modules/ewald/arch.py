@@ -83,8 +83,8 @@ def _make_thumbnail(image, mask_idx=None, global_mask=None, max_size=_THUMBNAIL_
     return ndimage_zoom(arr, factor, order=1).astype(np.float32)
 
 
-class EwaldArch():
-    """Class for storing area detector data collected in
+class LiveFrame():
+    """Stateful xdart detector frame collected in
     X-ray diffraction experiments.
 
     Attributes:
@@ -147,13 +147,13 @@ class EwaldArch():
         alias kwarg and mapped here; ``self.th_mtr`` remains a
         property alias for backward read access.
         """
-        super(EwaldArch, self).__init__()
+        super().__init__()
         # F4: None-sentinel pattern.  Mutable defaults in the signature
         # (scan_info={}, ai_args={}, file_lock=Condition()) are
         # constructed once at module-import time and shared by every
         # caller who omits the kwarg — silently producing cross-arch
         # state.  Materialise per-instance defaults here, matching
-        # what EwaldSphere already does.
+        # what LiveScan already does.
         self.idx = idx
         self.map_raw = map_raw
         self.bg_raw = bg_raw
@@ -214,7 +214,7 @@ class EwaldArch():
         # (lazy load can't recover the raw — re-integrate would
         # silently no-op).  The GUI's "Reintegrate" buttons check
         # ``sphere.has_reload_only_frames()`` and pop a message
-        # rather than no-op'ing inside ``EwaldArch.integrate_*``.
+        # rather than no-op'ing inside ``LiveFrame.integrate_*``.
         self.is_reload_only: bool = False
         # L1 lazy raw load: the directory ``source_file`` resolves
         # against (typically ``os.path.dirname(sphere.data_file)``,
@@ -224,7 +224,7 @@ class EwaldArch():
         self._source_root: str = ""
 
     def __getstate__(self):
-        """Exclude threading.Condition objects so EwaldArch can be pickled
+        """Exclude threading.Condition objects so LiveFrame can be pickled
         for use with concurrent.futures.ProcessPoolExecutor."""
         state = self.__dict__.copy()
         state.pop('arch_lock', None)
@@ -381,7 +381,7 @@ class EwaldArch():
             return 0.0
 
     def reset(self):
-        """Clears all data, resets to a default EwaldArch.
+        """Clears all data, resets to a default LiveFrame.
         """
         self.idx = None
         self.map_raw = None
@@ -766,7 +766,7 @@ class EwaldArch():
         ----------
         global_mask : array-like or None
             Flat indices of detector-level masked pixels, typically
-            ``EwaldSphere.global_mask`` / wrangler ``self.mask``.  Masked
+            ``LiveScan.global_mask`` / wrangler ``self.mask``.  Masked
             pixels become NaN in the thumbnail before downsampling.
         """
         if self.thumbnail is not None:
@@ -794,7 +794,7 @@ class EwaldArch():
     def copy(self, include_2d=True):
         """Returns a copy of self.
         """
-        arch_copy = EwaldArch(
+        arch_copy = LiveFrame(
             copy.deepcopy(self.idx), None,
             copy.deepcopy(self.poni), None,
             copy.deepcopy(self.scan_info), copy.deepcopy(self.ai_args),
@@ -832,3 +832,6 @@ class EwaldArch():
             arch_copy.gi_2d = copy.deepcopy(self.gi_2d)
 
         return arch_copy
+
+
+__all__ = ["LiveFrame"]
