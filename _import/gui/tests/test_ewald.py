@@ -23,7 +23,7 @@ else:
 if xdart_dir not in sys.path:
     sys.path.append(xdart_dir)
 
-from xdart.modules.ewald import EwaldArch, EwaldSphere
+from xdart.modules.ewald import LiveFrame, LiveScan
 from xdart.utils.containers import PONI
 
 # Skip all tests if the test data directory does not exist on this machine.
@@ -105,7 +105,7 @@ def make_sphere(calib_path, poni_file, stepsize, user, image_path, spec_path,
     times = {'overall':[], 'creation':[], 'int':[], 'add':[]}
     detector = pyFAI.detectors.Detector(172e-6, 172e-6)
     data_file_path = os.path.join(xdart_dir, "tests/test_data/spec_pd100k/test_save.h5")
-    sphere = EwaldSphere(data_file=data_file_path)
+    sphere = LiveScan(data_file=data_file_path)
     sphere.save_to_nexus(replace=True)
     poni = PONI.from_poni_file(os.path.join(calib_path, poni_file))
     for k in range(1, len(tth)):
@@ -118,7 +118,7 @@ def make_sphere(calib_path, poni_file, stepsize, user, image_path, spec_path,
         rot2 = np.radians(-tth[k])
         poni.rot2 = rot2
         start_c = time.time()
-        arch = EwaldArch(idx=k, map_raw=map_raw, poni=poni, scan_info={'i0':i0[k]})
+        arch = LiveFrame(idx=k, map_raw=map_raw, poni=poni, scan_info={'i0':i0[k]})
         times['creation'].append(time.time() - start_c)
         start_i = time.time()
         arch.integrate_1d(numpoints=18000, monitor='i0', radial_range=[0,180], 
@@ -136,7 +136,7 @@ def make_sphere(calib_path, poni_file, stepsize, user, image_path, spec_path,
 
 
 @unittest.skipUnless(_TEST_DATA_DIR.exists(), _SKIP_REASON)
-class TestEwaldSphere(unittest.TestCase):
+class TestLiveScan(unittest.TestCase):
     def setUp(self):
         self.sphere = make_sphere(
             calib_path=os.path.join(xdart_dir, "tests/test_data/spec_pd100k/"),
@@ -196,7 +196,7 @@ class TestEwaldSphere(unittest.TestCase):
         # internal _accumulate_bai_1d.  We rebuild that here so the
         # assertion against true_1d_norm still validates the
         # integration result.
-        from xdart.modules.ewald.arch import EwaldArch  # noqa: F401
+        from xdart.modules.ewald.arch import LiveFrame  # noqa: F401
         args = dict(numpoints=18000, monitor='i0', radial_range=[0, 180],
                     unit=units.TTH_DEG, correctSolidAngle=False,
                     method='csr')
