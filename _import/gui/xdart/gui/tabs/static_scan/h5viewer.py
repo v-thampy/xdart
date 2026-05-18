@@ -270,7 +270,7 @@ class _AccumulatingClickFilter(QtCore.QObject):
 
 
 class H5Viewer(QWidget):
-    """Widget for displaying the contents of an EwaldSphere object and
+    """Widget for displaying the contents of an LiveScan object and
     a basic file explorer. Also holds menus for more general tasks like
     setting defaults.
     
@@ -1301,7 +1301,7 @@ class H5Viewer(QWidget):
             self.sigUpdate.emit()
 
     # Removed legacy load_arch_data — all reads now go through
-    # EwaldArch.load_from_nexus via load_arches_data above.
+    # LiveFrame.load_from_nexus via load_arches_data above.
     #
     # Removed get_arches_sum / _safe_accumulate / _raw_minus_bg and the
     # add_idxs/sub_idxs/sum_int_2d/sum_map_raw machinery: combining 2D

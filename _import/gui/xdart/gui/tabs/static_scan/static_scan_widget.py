@@ -93,16 +93,16 @@ class staticWidget(QWidget):
             entire scan or individual image.
 
     attributes:
-        arch: EwaldArch, currently loaded arch object
-        arch_ids: List of EwaldArch indices currently loaded
-        arches: Dictionary of currently loaded EwaldArches
+        arch: LiveFrame, currently loaded arch object
+        arch_ids: List of LiveFrame indices currently loaded
+        arches: Dictionary of currently loaded LiveFrames
         data_1d: Dictionary object holding all 1D data in memory
         data_2d: Dictionary object holding all 2D data in memory
         command_queue: Queue, used to send commands to wrangler
         dirname: str, absolute path of current directory for scan
         file_lock: mp.Condition, process safe lock
         fname: str, current data file name
-        sphere: EwaldSphere, current scan data
+        sphere: LiveScan, current scan data
         timer: QTimer, currently unused but can be used for periodic
             functions.
         ui: Ui_Form, layout from qtdesigner
@@ -150,7 +150,7 @@ class staticWidget(QWidget):
 
         self.fname = os.path.join(self.dirname, 'default.nxs')
         # J2: share ``file_lock`` with the sphere so direct
-        # ArchSeries lazy loads use the same lock as the
+        # LiveFrameSeries lazy loads use the same lock as the
         # wrangler's save paths.
         self.sphere = LiveScan('null_main',
                                data_file=self.fname,

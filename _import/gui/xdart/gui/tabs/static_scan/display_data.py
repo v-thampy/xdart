@@ -3,7 +3,7 @@
 
 This mixin extracts ~500 lines of data-access logic from the monolithic
 displayFrameWidget class.  Methods here deal with reading data from
-EwaldSphere / EwaldArch containers, normalization, unit conversion,
+LiveScan / LiveFrame containers, normalization, unit conversion,
 colour generation, and saving results to disk.
 
 The mixin is designed to be inherited by displayFrameWidget alongside
@@ -376,7 +376,7 @@ class DisplayDataMixin:
         differs from the integration unit stored in int_1d.
 
         args:
-            arch: EwaldArch copy (data_1d entry) holding int_1d and gi_1d
+            arch: LiveFrame copy (data_1d entry) holding int_1d and gi_1d
 
         returns:
             xdata: numpy array, x axis data for plot.
@@ -520,7 +520,7 @@ class DisplayDataMixin:
         """Extract intensity profile along chi from arch.
 
         Args:
-            arch: EwaldArch object with 2D integration data.
+            arch: LiveFrame object with 2D integration data.
 
         Returns:
             ndarray: Intensity integrated along chi over the Q range
@@ -534,7 +534,7 @@ class DisplayDataMixin:
         """Extract 1D chi profile from arch.
 
         Args:
-            arch: EwaldArch object with 2D integration data.
+            arch: LiveFrame object with 2D integration data.
 
         Returns:
             ndarray: 1D intensity vs chi extracted from 2D data.
