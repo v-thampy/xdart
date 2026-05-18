@@ -1,16 +1,26 @@
 # `ssrl_xrd_tools` example notebooks
 
 End-to-end demonstrations of the headless `ssrl_xrd_tools` API.
-Each notebook is **self-contained** — open it, edit the
-"Configuration" cell at the top to point at your data, and run.
+
+Every notebook follows the same convention:
+
+1. **Imports** cell (no edits needed).
+2. **✏️ Configuration** cell — *the only cell you need to edit*.
+   Sectioned into REQUIRED, OPTIONAL, and tuning groups; REPLACE
+   markers flag the lines that always need attention.
+3. **Validation** cell — runs `assert` checks on the paths and
+   reports `OK` if everything is in place.  Catches typos before
+   any integration / fitting starts.
+4. The rest of the notebook runs top-to-bottom unchanged.
 
 | #   | Notebook                                | What it shows                                                                  | Modules exercised                                       |
 | --- | --------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------- |
-| 01  | [`01_batch_integration.ipynb`](01_batch_integration.ipynb)            | Batch 1D + 2D azimuthal integration; NeXus round-trip                          | `io`, `integrate.single`                                |
+| 01  | [`01_batch_integration.ipynb`](01_batch_integration.ipynb)            | Per-frame `integrate_1d` / `integrate_2d` loop over an image directory; NeXus round-trip.  **Low-level reference** — see 06 for the recommended high-level path. | `io`, `integrate.single`                                |
 | 02  | [`02_multigeometry_stitching.ipynb`](02_multigeometry_stitching.ipynb) | `MultiGeometry` 1D + 2D stitching across detector-angle scans                  | `integrate.multi` (`create_multigeometry_integrators`, `stitch_1d`, `stitch_2d`) |
 | 03  | [`03_phase_and_peak_fitting.ipynb`](03_phase_and_peak_fitting.ipynb)   | Structure-informed (`PhaseFitter`) **and** structure-agnostic (`fit_peaks`) on the same pattern — side-by-side comparison | `analysis.phase`, `analysis.fitting`                    |
 | 04  | [`04_batch_phase_fitting.ipynb`](04_batch_phase_fitting.ipynb)         | `FitConfig` + `fit_sequence` + `FitResultStore` over a sequence of patterns; phase fractions + lattice trends as a DataFrame | `analysis.fitting.batch`                                |
 | 05  | [`05_sin2psi_analysis.ipynb`](05_sin2psi_analysis.ipynb)               | GI polar integration → χ-sector peak fits → sin²ψ regression → strain / stress | `integrate.gid`, `analysis.strain`                      |
+| 06  | [`06_headless_reduction_pipeline.ipynb`](06_headless_reduction_pipeline.ipynb) | **Canonical headless reduction**: `ReductionPlan` + `Scan` + `Frame` + `MemorySink` / `NexusSink` + `run_reduction`.  Same workflow xdart's wranglers use internally; the recommended path for new code. | `reduction` (`Frame`, `Scan`, `ReductionPlan`, `GIMode`, `MaskSpec`, `MemorySink`, `NexusSink`, `run_reduction`) |
 
 ## Prerequisites
 
