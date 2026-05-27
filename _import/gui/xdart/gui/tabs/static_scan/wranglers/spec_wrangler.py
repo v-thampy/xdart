@@ -19,6 +19,11 @@ from pyqtgraph.parametertree import ParameterTree, Parameter
 # Project imports
 from ssrl_xrd_tools.core.containers import PONI
 from ssrl_xrd_tools.io.metadata import read_image_metadata
+# ``_extract_scan_info`` is a private helper but the wrangler uses it
+# to predict whether the SPEC sidecar exists for a given image file —
+# same parser the SSRL reader uses, so the UI's existence check stays
+# in sync with what ``read_image_metadata`` will actually look for.
+from ssrl_xrd_tools.io.metadata import _extract_scan_info
 from .wrangler_widget import wranglerWidget
 from .spec_wrangler_thread import specThread, _get_scan_info  # noqa: F401
 from .ui.specUI import Ui_Form

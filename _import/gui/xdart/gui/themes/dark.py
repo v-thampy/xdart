@@ -338,11 +338,13 @@ def apply_dark_theme(app) -> None:
 /* ── Windows-only font tweaks ─────────────────────────────────
    Calibrate + Make Mask buttons are sized for the macOS default
    button font (~13 px AppleSystemFont).  On Windows, Qt's default
-   QPushButton font renders ~10% larger and the labels overflow.
-   Shrink the font for just those two buttons by name.  ~10%
-   reduction from the typical 9 pt Windows default → 8 pt. */
+   QPushButton font renders larger and the labels overflow.  Shrink
+   the font for just those two buttons by name.  8.5 pt = ~5%
+   bigger than the initial 8 pt (which was a too-aggressive ~11%
+   reduction from the platform-default 9 pt) — gives the labels
+   enough room without looking visibly small. */
 QPushButton#pyfai_calib, QPushButton#get_mask {
-    font-size: 8pt;
+    font-size: 8.5pt;
 }
 """
     app.setStyleSheet(qss)
