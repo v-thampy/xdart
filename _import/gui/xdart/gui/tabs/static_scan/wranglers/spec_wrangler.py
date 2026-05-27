@@ -54,6 +54,13 @@ params = [
         {'name': 'series_average', 'title': 'Average Scan', 'type': 'bool', 'value': False, 'visible': True},
         {'name': 'meta_ext', 'title': 'Meta File', 'type': 'list',
          'values': ['None', 'txt', 'pdi', 'SPEC'], 'value': 'txt'},
+        # Optional override for the SPEC file's directory.  Shown only
+        # when ``meta_ext == 'SPEC'`` (see ``set_meta_ext``).  Blank
+        # → use the default search (image dir + immediate parent);
+        # set → that directory is searched first.
+        {'name': 'meta_dir', 'title': 'Meta Directory', 'type': 'str',
+         'value': '', 'visible': False},
+        NamedActionParameter(name='meta_dir_browse', title='Browse...', visible=False),
         {'name': 'Filter', 'type': 'str', 'value': '', 'visible': False},
         {'name': 'write_mode', 'title': 'Write Mode  ', 'type': 'list',
          'values': ['Append', 'Overwrite'], 'value': 'Append'},
@@ -216,6 +223,10 @@ class specWrangler(wranglerWidget):
         self.meta_ext = self.parameters.child('Signal').child('meta_ext').value()
         if self.meta_ext == 'None':
             self.meta_ext = None
+        # Optional explicit dir for SPEC files; '' falls back to the
+        # ssrl_xrd_tools default (image dir + parent search).  Wired
+        # to the thread so workers pass it to read_image_metadata.
+        self.meta_dir = self.parameters.child('Signal').child('meta_dir').value()
 
         # Mask
         self.mask_file = self.parameters.child('Signal').child('mask_file').value()
@@ -282,6 +293,9 @@ class specWrangler(wranglerWidget):
         )
         self.parameters.child('Signal').child('meta_ext').sigValueChanged.connect(
             self.set_meta_ext
+        )
+        self.parameters.child('Signal').child('meta_dir_browse').sigActivated.connect(
+            self.set_meta_dir
         )
         self.parameters.child('BG').child('bg_type').sigValueChanged.connect(
             self.set_bg_type
@@ -378,6 +392,7 @@ class specWrangler(wranglerWidget):
         ('img_ext',        ('Signal', 'img_ext'),                    False, 'img_ext'),
         ('series_average', ('Signal', 'series_average'),             False, 'series_average'),
         ('meta_ext',       ('Signal', 'meta_ext'),                   False, None),
+        ('meta_dir',       ('Signal', 'meta_dir'),                   True,  'meta_dir'),
         ('file_filter',    ('Signal', 'Filter'),                     False, 'file_filter'),
         ('write_mode',     ('Signal', 'write_mode'),                 False, 'write_mode'),
         ('mask_file',      ('Signal', 'mask_file'),                  True,  'mask_file'),
@@ -587,6 +602,7 @@ class specWrangler(wranglerWidget):
 
         self.thread.series_average = self.series_average
         self.thread.meta_ext = self.meta_ext
+        self.thread.meta_dir = self.meta_dir
 
         self.thread.h5_dir = self.h5_dir
         self.fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
@@ -824,8 +840,30 @@ class specWrangler(wranglerWidget):
         self.meta_ext = self.parameters.child('Signal').child('meta_ext').value()
         if self.meta_ext == 'None':
             self.meta_ext = None
+        # Show "Meta Directory" + Browse only for SPEC mode.  Other
+        # formats (txt/pdi) look next to the image — no separate dir
+        # makes sense.  This mirrors the bg_dir pattern.
+        is_spec = (self.meta_ext == 'SPEC')
+        self.parameters.child('Signal').child('meta_dir').show(is_spec)
+        self.parameters.child('Signal').child('meta_dir_browse').show(is_spec)
         self._save_to_session()
         self.get_img_fname()
+
+    def set_meta_dir(self):
+        """Opens a directory chooser for the SPEC file's location.
+
+        Sets ``meta_dir`` to the picked path; leaves it alone if the
+        user cancels.  Empty string means "use the default search
+        (image dir + immediate parent)".
+        """
+        path = QFileDialog().getExistingDirectory(
+            caption='Choose Meta (SPEC) Directory',
+            dir=self.meta_dir or '',
+            options=QFileDialog.ShowDirsOnly,
+        )
+        if path:
+            self.parameters.child('Signal').child('meta_dir').setValue(path)
+            self.meta_dir = path
 
     def _sync_meta_ext_to_img_ext(self):
         """Force meta_ext='None' and lock it when the image type is NeXus.
@@ -855,7 +893,15 @@ class specWrangler(wranglerWidget):
             spec_fname, _, _ = _extract_scan_info(Path(img_file))
             if spec_fname:
                 img_fpath = Path(img_file)
-                for parent in (img_fpath.parent, img_fpath.parents[1]):
+                # Honour the optional explicit Meta Directory before
+                # falling back to the image dir + parent search, so
+                # the existence check matches what ``read_image_metadata``
+                # will actually look at when SPEC is selected.
+                search_dirs = []
+                if getattr(self, 'meta_dir', None):
+                    search_dirs.append(Path(self.meta_dir))
+                search_dirs.extend([img_fpath.parent, img_fpath.parents[1]])
+                for parent in search_dirs:
                     if (parent / spec_fname).is_file():
                         return True
 

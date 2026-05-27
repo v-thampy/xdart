@@ -34,7 +34,17 @@ dependencies = [
     "nexusformat",
     "fabio",
     "silx",
-    "pyFAI>=2025.3,<2026",
+    # silx.gui.plot pulls qtawesome at import time for its plot
+    # toolbar icons, but silx doesn't list it in install_requires.
+    # pyFAI-calib2 and pyFAI.app.drawmask both go through that
+    # import path, so on a clean Windows env without qtawesome
+    # they fail to launch with ModuleNotFoundError: 'qtawesome'.
+    # Pin it explicitly here so users get it transitively.
+    "qtawesome",
+    # pyFAI 2025.12 ships a broken pyFAI-calib2 on Windows (silx.gui
+    # import path / qt plugin issue); cap to <2025.12 until that's
+    # fixed upstream.  Confirmed 2025.3-2025.11 work.
+    "pyFAI>=2025.3,<2025.12",
     "xrayutilities",
     "PySide6>=6.5",
     "pyqtgraph>=0.13.7",

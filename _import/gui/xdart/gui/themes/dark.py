@@ -327,7 +327,25 @@ def apply_dark_theme(app) -> None:
     app
         A live :class:`QtWidgets.QApplication`.
     """
-    app.setStyleSheet(DARK_QSS)
+    # Build the final stylesheet by appending platform-conditional
+    # overrides to the base DARK_QSS.  Currently only Windows needs
+    # extra rules — Qt's default button font is larger there than
+    # on macOS, so a couple of named buttons get squeezed.
+    qss = DARK_QSS
+    import sys as _sys
+    if _sys.platform == "win32":
+        qss += """
+/* ── Windows-only font tweaks ─────────────────────────────────
+   Calibrate + Make Mask buttons are sized for the macOS default
+   button font (~13 px AppleSystemFont).  On Windows, Qt's default
+   QPushButton font renders ~10% larger and the labels overflow.
+   Shrink the font for just those two buttons by name.  ~10%
+   reduction from the typical 9 pt Windows default → 8 pt. */
+QPushButton#pyfai_calib, QPushButton#get_mask {
+    font-size: 8pt;
+}
+"""
+    app.setStyleSheet(qss)
     # Imported here to avoid a hard dependency at module import
     # time (e.g. in headless test sandboxes).
     try:
