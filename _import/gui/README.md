@@ -68,7 +68,7 @@ uv pip install -U xdart    # or: pip install -U xdart
 
 ### Editable / developer install
 
-Clone the repos and install in editable mode into the same environment:
+Create a new `xrd` mamba/conda environment as in **Step 2** above (`mamba create -n xrd python=3.12 -y && mamba activate xrd`), then clone the repos and install in editable mode into that environment:
 
 ```bash
 git clone -b dev https://github.com/v-thampy/ssrl_xrd_tools.git

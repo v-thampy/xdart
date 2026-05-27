@@ -272,6 +272,11 @@ class specThread(wranglerThread):
         self.img_ext = img_ext
         self.series_average = series_average
         self.meta_ext = meta_ext
+        # Optional explicit SPEC search dir.  Set by the wrangler
+        # widget (set_meta_dir / setup) — None / '' falls back to
+        # the ssrl_xrd_tools default heuristic.  Threaded through
+        # to every read_image_metadata call below.
+        self.meta_dir = None
         self.file_filter = file_filter
         self.mask_file = mask_file
         self.write_mode = write_mode
@@ -1395,7 +1400,7 @@ class specThread(wranglerThread):
                         )
 
                     meta = (read_image_metadata(self._eiger_master_path,
-                                                meta_format=self.meta_ext)
+                                                meta_format=self.meta_ext, meta_dir=self.meta_dir)
                             if self.meta_ext else {})
                     master_stem = Path(self._eiger_master_path).stem
                     scan_name = (master_stem[:-7]
@@ -1547,7 +1552,7 @@ class specThread(wranglerThread):
             logger.error('Error reading frame %d from %s: %s', frame_idx, self._eiger_master_path, e)
             img_data = None
 
-        meta = read_image_metadata(self._eiger_master_path, meta_format=self.meta_ext) if self.meta_ext else {}
+        meta = read_image_metadata(self._eiger_master_path, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
 
         master_stem = Path(self._eiger_master_path).stem
         scan_name = master_stem[:-7] if master_stem.endswith('_master') else master_stem
@@ -1563,7 +1568,7 @@ class specThread(wranglerThread):
 
         if self.single_img and not is_master:
             img_data = np.asarray(read_image(self.img_file), dtype=float)
-            meta = read_image_metadata(self.img_file, meta_format=self.meta_ext) if self.meta_ext else {}
+            meta = read_image_metadata(self.img_file, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
             scan_name, img_number = _get_scan_info(self.img_file)
             return self.img_file, scan_name, img_number, img_data, meta
 
@@ -1616,7 +1621,7 @@ class specThread(wranglerThread):
             if data is None or not np.isfinite(data).any():
                 continue
 
-            meta = read_image_metadata(fname, meta_format=self.meta_ext) if self.meta_ext else {}
+            meta = read_image_metadata(fname, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
             n += 1
 
             if (not self.series_average) or (snumber is None):
@@ -1648,7 +1653,7 @@ class specThread(wranglerThread):
     # ── Metadata / Background ────────────────────────────────────────────
 
     def get_meta_data(self, img_file):
-        return read_image_metadata(img_file, meta_format=self.meta_ext)
+        return read_image_metadata(img_file, meta_format=self.meta_ext, meta_dir=self.meta_dir)
 
     def subtract_bg(self, img_data, img_file, img_number, img_meta):
         bg = self.get_background(img_file, img_number, img_meta)
@@ -1762,7 +1767,7 @@ class specThread(wranglerThread):
         if self.bg_type == 'Single BG File':
             if self.bg_file:
                 bg_file = self.bg_file
-                bg_meta = read_image_metadata(bg_file, meta_format=self.meta_ext)
+                bg_meta = read_image_metadata(bg_file, meta_format=self.meta_ext, meta_dir=self.meta_dir)
         elif self.bg_type == 'Series Average':
             if self.bg_file:
                 sname, fnames, bg, bg_meta = get_series_avg(self.bg_file, self.detector, self.meta_ext)
@@ -1785,7 +1790,7 @@ class specThread(wranglerThread):
                         bg_file = None
                         continue
 
-                    bg_meta = read_image_metadata(bg_file, meta_format=self.meta_ext)
+                    bg_meta = read_image_metadata(bg_file, meta_format=self.meta_ext, meta_dir=self.meta_dir)
                     if self.bg_match_fname:
                         _, meta_img_num = _get_scan_info(meta_file)
                         if img_number == meta_img_num:
