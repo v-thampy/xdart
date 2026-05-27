@@ -79,13 +79,23 @@ def _find_sidecar(image_path: Path, ext: str) -> Path | None:
 def _extract_scan_info(image_path: Path) -> tuple[str | None, int | None, int]:
     """Parse SSRL filename conventions to extract scan metadata.
 
-    Expected filename pattern::
+    Recognised image-filename layouts:
 
-        {prefix}_{specname}_scan{N}_{M}.{ext}
+    1. ``b_{username}_{specname}_scan{N}_{M}.{ext}`` — the SSRL
+       Pilatus convention where the SPEC username is prefixed with
+       ``b_``.  Strip everything through the second underscore
+       (i.e. ``b_thampy_``) to recover ``{specname}_scan{N}_{M}``.
+    2. ``checkout_{specname}_scan{N}_{M}.{ext}`` — the one
+       non-``b_`` username currently in use at the beamline; strip
+       the literal ``checkout_`` prefix.
+    3. ``{specname}_scan{N}_{M}.{ext}`` — generic; no prefix strip.
+       Also covers Eiger HDF5 masters whose filenames end in
+       ``_scan{N}_master`` (no per-frame index in the filename
+       itself; ``image_number`` returns 0).
 
-    where ``N`` is the scan number and ``M`` is the image number within that
-    scan.  A leading ``b_`` prefix (background files) is stripped before
-    parsing.
+    For the trailing ``_scan{N}_{M}`` part, ``{M}`` is either an
+    integer frame index or the literal ``master`` (Eiger).  ``{M}``
+    as ``master`` returns ``image_number=0``.
 
     Parameters
     ----------
@@ -102,16 +112,28 @@ def _extract_scan_info(image_path: Path) -> tuple[str | None, int | None, int]:
         the pattern is not found.
     """
     stem = image_path.stem
-    if stem.startswith("b_"):
-        stem = stem[2:]
 
-    match = re.search(r"_scan(\d+)_(\d+)$", stem)
+    # Rule 1: ``b_<username>_...`` → strip through second underscore.
+    if stem.startswith("b_"):
+        first = stem.find("_")
+        second = stem.find("_", first + 1) if first >= 0 else -1
+        if second >= 0:
+            stem = stem[second + 1:]
+    # Rule 2: ``checkout_...`` → strip literal prefix.
+    elif stem.startswith("checkout_"):
+        stem = stem[len("checkout_"):]
+    # Rule 3: no prefix strip — generic case.
+
+    # ``_scan<N>_<M>`` where <M> is digits (TIF/RAW/CBF/EDF per-frame
+    # file) or the literal "master" (Eiger HDF5 master file).
+    match = re.search(r"_scan(\d+)_(\d+|master)$", stem)
     if match is None:
         return None, None, 0
 
     scan_number = int(match.group(1))
-    image_number = int(match.group(2))
-    spec_fname = stem[stem.find("_") + 1 : match.start()]
+    suffix = match.group(2)
+    image_number = int(suffix) if suffix.isdigit() else 0
+    spec_fname = stem[: match.start()]
 
     return spec_fname, scan_number, image_number
 
@@ -236,6 +258,7 @@ def read_pdi_metadata(path: Path | str) -> dict[str, float]:
 def read_image_metadata(
     image_path: Path | str,
     meta_format: str = "txt",
+    meta_dir: Path | str | None = None,
 ) -> dict[str, float]:
     """Unified metadata reader for SSRL detector image sidecar files.
 
@@ -244,7 +267,14 @@ def read_image_metadata(
     image_path : Path | str
         Path to the detector image file.
     meta_format : str
-        One of ``"txt"``, ``"pdi"``, or ``"spec"``.
+        One of ``"txt"``, ``"pdi"``, or ``"spec"``.  Case-insensitive.
+    meta_dir : Path | str | None
+        Optional explicit directory to search for the metadata file.
+        Currently used only for ``meta_format="spec"`` — overrides the
+        default (image folder + immediate parent) when set.  Useful when
+        the SPEC file is stored separately from the image files.  Pass
+        ``None`` (default) or the empty string to use the default
+        location heuristic.
 
     Returns
     -------
@@ -254,21 +284,34 @@ def read_image_metadata(
     """
     image_path = Path(image_path)
 
-    if meta_format in ("txt", "pdi"):
-        sidecar = _find_sidecar(image_path, meta_format)
+    # Normalise case so callers can pass "SPEC" / "Spec" / "spec"
+    # interchangeably — xdart's UI surfaces the value as "SPEC" in
+    # the metadata format combobox, but the comparison below expects
+    # lowercase.  Pre-fix this silently returned ``{}`` and logged
+    # "unknown meta_format" for every SPEC frame, so positioners
+    # never made it into the sphere.
+    meta_format_norm = (meta_format or "").strip().lower()
+
+    if meta_format_norm in ("txt", "pdi"):
+        sidecar = _find_sidecar(image_path, meta_format_norm)
         if sidecar is None:
             logger.debug(
                 "read_image_metadata: no %s sidecar found for %s",
-                meta_format,
+                meta_format_norm,
                 image_path,
             )
             return {}
-        if meta_format == "txt":
+        if meta_format_norm == "txt":
             return read_txt_metadata(sidecar)
         return read_pdi_metadata(sidecar)
 
-    if meta_format == "spec":
-        return _read_spec_metadata(image_path)
+    if meta_format_norm == "spec":
+        # Normalise empty-string to None for downstream "use default
+        # heuristic" branch.
+        search_dir = (
+            Path(meta_dir) if meta_dir not in (None, "") else None
+        )
+        return _read_spec_metadata(image_path, search_dir=search_dir)
 
     logger.warning("read_image_metadata: unknown meta_format %r", meta_format)
     return {}
@@ -279,17 +322,30 @@ def read_image_metadata(
 # ---------------------------------------------------------------------------
 
 
-def _read_spec_metadata(image_path: Path) -> dict[str, float]:
+def _read_spec_metadata(
+    image_path: Path,
+    search_dir: Path | None = None,
+) -> dict[str, float]:
     """Extract per-image counters and motor positions from a SPEC file.
 
-    The SPEC file is located by searching the image's directory and its
-    immediate parent.  The scan and image numbers are inferred from the
-    filename stem using SSRL naming conventions.
+    The SPEC file is located by, in order:
+
+    1. ``search_dir`` (when provided) — the explicit directory the
+       caller passed in via ``read_image_metadata(meta_dir=...)``.
+       Useful when the SPEC file lives apart from the image files.
+    2. The image's directory.
+    3. The image's parent directory.
+
+    The scan and image numbers are inferred from the filename stem
+    using SSRL naming conventions.
 
     Parameters
     ----------
     image_path : Path
         Path to the detector image file.
+    search_dir : Path | None
+        Explicit directory to look in first.  ``None`` falls back to
+        the image-dir + parent-dir search.
 
     Returns
     -------
@@ -312,18 +368,26 @@ def _read_spec_metadata(image_path: Path) -> dict[str, float]:
             )
             return {}
 
+        # Build the ordered search list — explicit dir first (when
+        # given), then the default fallbacks.  Duplicates are harmless
+        # but we skip None entries.
+        candidate_dirs: list[Path] = []
+        if search_dir is not None:
+            candidate_dirs.append(Path(search_dir))
+        candidate_dirs.extend([image_path.parent, image_path.parent.parent])
+
         spec_file: Path | None = None
-        for search_dir in (image_path.parent, image_path.parent.parent):
-            candidate = search_dir / spec_fname
+        for sd in candidate_dirs:
+            candidate = sd / spec_fname
             if candidate.is_file():
                 spec_file = candidate
                 break
 
         if spec_file is None:
             logger.warning(
-                "_read_spec_metadata: SPEC file %r not found near %s",
+                "_read_spec_metadata: SPEC file %r not found in %s",
                 spec_fname,
-                image_path,
+                [str(d) for d in candidate_dirs],
             )
             return {}
 

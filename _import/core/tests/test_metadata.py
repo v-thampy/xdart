@@ -350,22 +350,55 @@ class TestHelpers:
         assert found == replaced
 
     # --- _extract_scan_info ---
+    #
+    # Three filename layouts are recognised, see _extract_scan_info docstring:
+    #   1. ``b_<username>_<specname>_scan<N>_<M>.<ext>``     (Pilatus convention)
+    #   2. ``checkout_<specname>_scan<N>_<M>.<ext>``         (one specific user)
+    #   3. ``<specname>_scan<N>_<M>.<ext>``                  (generic; no strip)
+    # And the trailing ``_scan<N>_<M>`` token's <M> is either an integer
+    # (single-frame TIF/RAW/CBF/EDF) or the literal "master" (Eiger HDF5).
 
-    def test_extract_scan_info_standard(self, tmp_path: Path) -> None:
-        p = tmp_path / "prefix_specname_scan42_0003.tif"
+    def test_extract_scan_info_generic_no_prefix_strip(self, tmp_path: Path) -> None:
+        """Rule 3: filenames that don't match b_ or checkout_ keep
+        their whole prefix as the SPEC name."""
+        p = tmp_path / "eiger_NbH_ctrl_eta3p0_scan001_0003.tif"
         spec_fname, scan_num, img_num = _extract_scan_info(p)
 
-        assert spec_fname == "specname"
-        assert scan_num == 42
+        assert spec_fname == "eiger_NbH_ctrl_eta3p0"
+        assert scan_num == 1
         assert img_num == 3
 
     def test_extract_scan_info_with_b_prefix(self, tmp_path: Path) -> None:
-        p = tmp_path / "b_prefix_specname_scan10_0001.edf"
+        """Rule 1: ``b_<username>_<specname>_scan...`` strips through the
+        second underscore (the one after the username)."""
+        p = tmp_path / "b_thampy_STO_align_scan20_0000.raw"
         spec_fname, scan_num, img_num = _extract_scan_info(p)
 
-        assert spec_fname == "specname"
-        assert scan_num == 10
+        assert spec_fname == "STO_align"
+        assert scan_num == 20
+        assert img_num == 0
+
+    def test_extract_scan_info_with_checkout_prefix(self, tmp_path: Path) -> None:
+        """Rule 2: ``checkout_<specname>_scan...`` strips the literal
+        ``checkout_`` prefix.  The one non-``b_`` username at the
+        beamline."""
+        p = tmp_path / "checkout_NbH_eta3p0_scan001_0001.tif"
+        spec_fname, scan_num, img_num = _extract_scan_info(p)
+
+        assert spec_fname == "NbH_eta3p0"
+        assert scan_num == 1
         assert img_num == 1
+
+    def test_extract_scan_info_eiger_master(self, tmp_path: Path) -> None:
+        """Eiger master HDF5 filenames end in ``_scan<N>_master`` —
+        no per-frame index in the filename itself, so
+        ``image_number`` returns 0."""
+        p = tmp_path / "eiger_NbH_ctrl_eta3p0_scan001_master.h5"
+        spec_fname, scan_num, img_num = _extract_scan_info(p)
+
+        assert spec_fname == "eiger_NbH_ctrl_eta3p0"
+        assert scan_num == 1
+        assert img_num == 0
 
     def test_extract_scan_info_no_match(self, tmp_path: Path) -> None:
         p = tmp_path / "notanssrlfile.tif"
@@ -375,17 +408,19 @@ class TestHelpers:
         assert scan_num is None
 
     def test_extract_scan_info_multi_part_spec_name(self, tmp_path: Path) -> None:
-        """Spec filenames with underscores: prefix_part1_part2_scan5_0002.tif."""
+        """Generic (Rule 3) with an underscore-bearing SPEC name."""
         p = tmp_path / "smpl_spec_file_scan5_0002.tif"
         spec_fname, scan_num, img_num = _extract_scan_info(p)
 
-        assert spec_fname == "spec_file"
+        assert spec_fname == "smpl_spec_file"
         assert scan_num == 5
         assert img_num == 2
 
     def test_extract_scan_info_zero_padded_numbers(self, tmp_path: Path) -> None:
+        """Generic (Rule 3): zero-padded scan/image numbers parse as ints."""
         p = tmp_path / "run_myspec_scan001_0099.tif"
         spec_fname, scan_num, img_num = _extract_scan_info(p)
 
+        assert spec_fname == "run_myspec"
         assert scan_num == 1
         assert img_num == 99
