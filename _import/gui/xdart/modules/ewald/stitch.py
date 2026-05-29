@@ -163,9 +163,20 @@ def run_stitch(
     # the loop.
     import logging as _logging
     _logger = _logging.getLogger(__name__)
+
+    # Validate the normalization column up front.  Silently skipping a
+    # requested ``norm_motor`` that isn't in scan_data would produce an
+    # *un-normalized* stitch that looks normalized — fail loudly instead.
+    if norm_motor is not None and norm_motor not in scan.scan_data.columns:
+        raise ValueError(
+            f"norm_motor {norm_motor!r} not found in scan_data columns "
+            f"{list(scan.scan_data.columns)}; cannot normalize the stitch."
+        )
+
     images = []
     skipped = []
     surviving_indices = []
+    zero_norm = []  # frames with a zero normalization value (left un-normalized)
     for i, frame in enumerate(frames):
         if frame.map_raw is None:
             try:
@@ -179,12 +190,23 @@ def run_stitch(
             skipped.append(frame.idx)
             continue
         img = np.asarray(frame.map_raw - frame.bg_raw, dtype=float)
-        if norm_motor is not None and norm_motor in scan.scan_data.columns:
+        if norm_motor is not None:
             denom = float(scan.scan_data[norm_motor].iloc[i])
             if denom != 0:
                 img = img / denom
+            else:
+                # Dividing by zero would give inf/nan; leave this frame
+                # un-normalized but flag it — silently mixing normalized
+                # and un-normalized frames skews the stitch.
+                zero_norm.append(frame.idx)
         images.append(img)
         surviving_indices.append(i)
+    if zero_norm:
+        _logger.warning(
+            'stitch: %d frame(s) had %s == 0 and were left un-normalized '
+            '(stitch may be biased): %s',
+            len(zero_norm), norm_motor, zero_norm,
+        )
     if skipped:
         _logger.warning(
             'stitch: skipped %d frames with no raw data: %s',
