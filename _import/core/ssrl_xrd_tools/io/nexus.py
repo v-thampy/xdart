@@ -995,7 +995,7 @@ def _read_data_group(
 # v1 (xdart ≤ 0.36.x) is intentionally not supported — re-reduce old
 # data with current xdart if you need to view it.
 #
-# Dataset shape produced by ``read_sphere``:
+# Dataset shape produced by ``read_scan``:
 #   dims:   frame, q, q_2d, chi
 #   vars:   intensity_1d   (frame, q)
 #           sigma_1d       (frame, q)         optional
@@ -1022,9 +1022,9 @@ def _read_positioners(grp: h5py.Group) -> dict[str, np.ndarray]:
     return out
 
 
-def _read_sphere_v2(path: Path, entry: str, groups: tuple[str, ...],
-                   include_thumbnails: bool):
-    """v2-schema reader.  Body of public ``read_sphere``."""
+def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
+                  include_thumbnails: bool):
+    """v2-schema reader.  Body of public ``read_scan``."""
     import xarray as xr
 
     from ssrl_xrd_tools.core.provenance import read_provenance
@@ -1078,11 +1078,26 @@ def _read_sphere_v2(path: Path, entry: str, groups: tuple[str, ...],
             if "frame_index" in g2 and "frame" not in coords:
                 coords["frame"] = np.asarray(g2["frame_index"][()])
 
+        # Reject per-frame columns whose length disagrees with the frame
+        # coord (malformed/partial file) so one bad column doesn't make the
+        # whole xr.Dataset construction raise and the viewer come up empty.
+        n_frames = len(coords["frame"]) if "frame" in coords else None
+
+        def _add_frame_var(name, arr):
+            arr = np.asarray(arr)
+            if n_frames is not None and arr.ndim >= 1 and arr.shape[0] != n_frames:
+                logger.warning(
+                    "Skipping per-frame column %r in %s: length %d != %d frames",
+                    name, path, arr.shape[0], n_frames,
+                )
+                return
+            data_vars[name] = (("frame",), arr)
+
         if "per_frame_geometry" in e:
             gg = e["per_frame_geometry"]
             for key in ("rot1", "rot2", "rot3", "incident_angle"):
                 if key in gg:
-                    data_vars[key] = (("frame",), np.asarray(gg[key][()]))
+                    _add_frame_var(key, gg[key][()])
             if "frame_index" in gg and "frame" not in coords:
                 coords["frame"] = np.asarray(gg["frame_index"][()])
 
@@ -1098,7 +1113,7 @@ def _read_sphere_v2(path: Path, entry: str, groups: tuple[str, ...],
                         var_name = f"{category}_{k}"
                     else:
                         var_name = k
-                    data_vars[var_name] = (("frame",), arr)
+                    _add_frame_var(var_name, arr)
 
         if include_thumbnails and "frames" in e:
             thumbs: list[np.ndarray] = []
@@ -1133,14 +1148,14 @@ def _read_sphere_v2(path: Path, entry: str, groups: tuple[str, ...],
     return ds
 
 
-def read_sphere_metadata(
+def read_scan_metadata(
     path: Path | str,
     *,
     entry: str = "entry",
 ):
     """Read everything *except* the heavy integrated stacks.
 
-    Returns an :class:`xarray.Dataset` shaped like :func:`read_sphere`
+    Returns an :class:`xarray.Dataset` shaped like :func:`read_scan`
     but with ``intensity_1d``, ``intensity_2d``, ``sigma_1d``, and
     thumbnails omitted.  Still includes:
 
@@ -1202,12 +1217,29 @@ def read_sphere_metadata(
                 if u is not None:
                     attrs_per_coord["chi"] = {"units": _v2_decode_str(u)}
 
+        # Number of frames implied by the frame coord, used to reject
+        # per-frame columns whose length disagrees (a malformed/partial
+        # file — e.g. 16 integrated frames but only 8 ``th`` positions).
+        # Without this guard a single mismatched column makes the whole
+        # xr.Dataset construction raise and the viewer comes up empty.
+        n_frames = len(coords["frame"]) if "frame" in coords else None
+
+        def _add_frame_var(name, arr):
+            arr = np.asarray(arr)
+            if n_frames is not None and arr.ndim >= 1 and arr.shape[0] != n_frames:
+                logger.warning(
+                    "Skipping per-frame column %r in %s: length %d != %d frames",
+                    name, path, arr.shape[0], n_frames,
+                )
+                return
+            data_vars[name] = (("frame",), arr)
+
         # Derived per-frame geometry (rot1/2/3, incident_angle).
         if "per_frame_geometry" in e:
             gg = e["per_frame_geometry"]
             for key in ("rot1", "rot2", "rot3", "incident_angle"):
                 if key in gg:
-                    data_vars[key] = (("frame",), np.asarray(gg[key][()]))
+                    _add_frame_var(key, gg[key][()])
 
         # Positioners.
         for category, path_in in [
@@ -1222,7 +1254,7 @@ def read_sphere_metadata(
                         var_name = f"{category}_{k}"
                     else:
                         var_name = k
-                    data_vars[var_name] = (("frame",), arr)
+                    _add_frame_var(var_name, arr)
 
         # Fallback frame coord if neither integrated_* nor
         # per_frame_geometry carried frame_index but positioners
@@ -1244,14 +1276,14 @@ def read_sphere_metadata(
     return ds
 
 
-def read_sphere(
+def read_scan(
     path: Path | str,
     *,
     entry: str = "entry",
     groups: tuple[str, ...] = ("1d", "2d"),
     include_thumbnails: bool = False,
 ):
-    """Read an xdart v2 NeXus file into an :class:`xarray.Dataset`.
+    """Read an xdart v2 NeXus scan file into an :class:`xarray.Dataset`.
 
     v1 (xdart ≤ 0.36.x) is intentionally not supported.  Re-reduce
     older data with current xdart if you need to open it.
@@ -1273,7 +1305,7 @@ def read_sphere(
     xarray.Dataset
         See module-level docstring for the canonical shape.
     """
-    return _read_sphere_v2(Path(path), entry, groups, include_thumbnails)
+    return _read_scan_v2(Path(path), entry, groups, include_thumbnails)
 
 
 def read_stitched(
@@ -1330,7 +1362,7 @@ __all__ = [
     "write_nexus",
     "write_nexus_frame",
     # v2 (xdart 0.37+)
-    "read_sphere",
-    "read_sphere_metadata",
+    "read_scan",
+    "read_scan_metadata",
     "read_stitched",
 ]

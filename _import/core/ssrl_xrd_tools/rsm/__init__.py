@@ -34,12 +34,12 @@ from ssrl_xrd_tools.rsm.gridding import (
 from ssrl_xrd_tools.rsm.pipeline import (
     ExperimentConfig,
     ScanInfo,
-    SphereInput,
-    grid_spheres_streaming,
+    ScanInput,
+    grid_scans_streaming,
     load_images,
     process_scan,
     process_scan_data,
-    process_scan_from_sphere,
+    process_scan_from_nexus,
 )
 
 # Backward-compatible alias
@@ -68,10 +68,10 @@ __all__ = [
     # Pipeline
     "ExperimentConfig",
     "ScanInfo",
-    "SphereInput",
-    "grid_spheres_streaming",
+    "ScanInput",
+    "grid_scans_streaming",
     "load_images",
     "process_scan",
     "process_scan_data",
-    "process_scan_from_sphere",
+    "process_scan_from_nexus",
 ]

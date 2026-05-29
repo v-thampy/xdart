@@ -376,14 +376,14 @@ def fit_nexus(
 ) -> "FitResultStore":
     """Fit every 1-D pattern in an xdart NeXus file (v1 or v2 schema).
 
-    Reads via :func:`ssrl_xrd_tools.io.nexus.read_sphere`, which
+    Reads via :func:`ssrl_xrd_tools.io.nexus.read_scan`, which
     auto-detects schema version — works on both pre-0.37 and 0.37+
     files.  Replaces per-frame ``h5py.File`` round-trips with a single
     load.
     """
-    from ssrl_xrd_tools.io.nexus import read_sphere
+    from ssrl_xrd_tools.io.nexus import read_scan
 
-    ds = read_sphere(path, entry=entry, groups=("1d",))
+    ds = read_scan(path, entry=entry, groups=("1d",))
 
     if "intensity_1d" not in ds.data_vars:
         raise ValueError(

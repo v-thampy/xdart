@@ -1118,9 +1118,168 @@ plt.show()"""),
   Qt-signal sink on top of this; you can do the same with a plain
   Python collector, a Tiled writer, a CSV row appender, etc.
 - **Same code in xdart**: the GUI's wrangler threads build a
-  `ReductionPlan` from sphere settings and call `run_reduction` —
-  the same workflow you just ran.  See the `keep_xdart_thin.md`
+  `ReductionPlan` from the live scan's settings and call `run_reduction`
+  — the same workflow you just ran.  See the `keep_xdart_thin.md`
   memory note for the design rationale.
+"""),
+]
+
+
+# =============================================================================
+# 07 — Reading processed .nxs files (convenience readers)
+# =============================================================================
+
+NB_READING_PROCESSED = [
+    md("""# Reading processed `.nxs` files
+
+Once a scan has been reduced (by the xdart GUI, by notebook 01, or by
+the headless pipeline in notebook 06) the results live in a v2 NeXus
+`.nxs` file.  This notebook shows the **simplest possible way** to pull
+1D and 2D integrated patterns back out for plotting or analysis, using
+the `get_*` convenience readers in `ssrl_xrd_tools.io`.
+
+A processed file is a **scan**: a stack of integrated **frames**.  Each
+reader takes a `frame` label (the value stored in the file, e.g. 1-based
+for SPEC, possibly gapped) or `None` for all frames.
+
+For the full `xarray.Dataset` (every motor column + provenance) use
+`read_scan` / `read_scan_metadata` instead — but for "open a file,
+get arrays I can plot" the helpers below are all you need."""),
+    md("## Imports"),
+    code("""from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from ssrl_xrd_tools.io import (
+    get_frames,
+    get_metadata,
+    get_1d,
+    get_2d,
+    get_thumbnail,
+    open_scan,
+)"""),
+    md("""## ✏️ Configuration
+
+**Edit the cell below**, then run the rest top-to-bottom."""),
+    code("""# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                  EDIT THIS CELL — path + frame to inspect             ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# ── REQUIRED ───────────────────────────────────────────────────────────
+scan_file = Path('~/data/my_scan/integrated.nxs').expanduser()   # ← REPLACE
+
+# ── OPTIONAL ───────────────────────────────────────────────────────────
+# Which single frame to spotlight in the per-frame plots below.  Leave as
+# None to auto-pick the first frame in the file.
+frame_to_show = None"""),
+    md("### Validate the config"),
+    code("""assert scan_file.is_file(), f'scan_file not found: {scan_file}'
+assert scan_file.suffix == '.nxs', f'expected a .nxs file, got {scan_file.suffix}'
+print(f'OK — reading {scan_file.name}')"""),
+    md("""## What's in the file?
+
+`get_frames` lists the frame labels; `get_metadata` returns a flat dict
+of scan-level info (no heavy intensity arrays loaded)."""),
+    code("""frames = get_frames(scan_file)
+meta = get_metadata(scan_file)
+
+print(f'frames ({meta[\"n_frames\"]}): {frames.tolist()}')
+print(f'sample : {meta[\"sample_name\"] or \"(unnamed)\"}')
+print(f'energy : {meta[\"energy_keV\"]:.4f} keV   λ = {meta[\"wavelength_A\"]:.5f} Å')
+print(f'has 1D : {meta[\"has_1d\"]}    has 2D : {meta[\"has_2d\"]}')
+print(f'motors : {list(meta[\"positioners\"].keys())}')
+
+# Pick the frame to spotlight (first one if not set above)
+spotlight = frame_to_show if frame_to_show is not None else int(frames[0])
+print(f'\\nSpotlighting frame {spotlight}')"""),
+    md("""## 1D pattern for a single frame
+
+`get_1d` returns a named tuple `(q, intensity, sigma, q_unit, frames)`.
+`intensity` is a 1D array for a single frame."""),
+    code("""r = get_1d(scan_file, frame=spotlight)
+print(f'q: {r.q.shape}   intensity: {r.intensity.shape}   unit: {r.q_unit}')
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.plot(r.q, r.intensity, lw=1)
+if r.sigma is not None:
+    ax.fill_between(r.q, r.intensity - r.sigma, r.intensity + r.sigma,
+                    alpha=0.25, label='±σ')
+    ax.legend()
+ax.set_xlabel(f'q ({r.q_unit})')
+ax.set_ylabel('Intensity')
+ax.set_title(f'Frame {spotlight} — 1D')
+plt.tight_layout(); plt.show()"""),
+    md("""## All frames at once — waterfall
+
+Passing `frame=None` (the default) returns every frame stacked as
+`(n_frames, n_q)`."""),
+    code("""allr = get_1d(scan_file)              # (n_frames, n_q)
+print(f'stacked intensity: {allr.intensity.shape}')
+
+fig, ax = plt.subplots(figsize=(7, 5))
+offset = 0.0
+step = np.nanmax(allr.intensity) * 0.5
+for lbl, curve in zip(allr.frames, allr.intensity):
+    ax.plot(allr.q, curve + offset, lw=0.8, label=f'frame {lbl}')
+    offset += step
+ax.set_xlabel(f'q ({allr.q_unit})')
+ax.set_ylabel('Intensity (offset per frame)')
+ax.set_title('1D waterfall — all frames')
+if allr.intensity.shape[0] <= 10:
+    ax.legend(fontsize=8)
+plt.tight_layout(); plt.show()"""),
+    md("""## 2D (cake / q–χ) pattern
+
+`get_2d` returns `(q, chi, intensity, q_unit, chi_unit, frames)`.  For a
+single frame `intensity` is `(n_chi, n_q)` — ready to `pcolormesh`
+directly."""),
+    code("""if meta['has_2d']:
+    r2 = get_2d(scan_file, frame=spotlight)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    im = ax.pcolormesh(r2.q, r2.chi, r2.intensity, shading='auto', cmap='viridis')
+    ax.set_xlabel(f'q ({r2.q_unit})')
+    ax.set_ylabel(f'χ ({r2.chi_unit})')
+    ax.set_title(f'Frame {spotlight} — 2D')
+    plt.colorbar(im, ax=ax, label='Intensity')
+    plt.tight_layout(); plt.show()
+else:
+    print('No 2D data in this file (1D-only reduction).')"""),
+    md("""## Thumbnail (if stored)
+
+Some files keep a small downsampled raw image per frame."""),
+    code("""try:
+    thumb = get_thumbnail(scan_file, spotlight)
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ax.imshow(thumb, cmap='gray')
+    ax.set_title(f'Frame {spotlight} — thumbnail')
+    ax.axis('off')
+    plt.tight_layout(); plt.show()
+except KeyError as e:
+    print(f'No thumbnail available: {e}')"""),
+    md("""## Object-style sugar: `open_scan`
+
+If you'd rather not repeat the path, `open_scan` gives a lightweight
+handle with the same readers as methods."""),
+    code("""scan = open_scan(scan_file)
+print(scan)                       # Scan('integrated.nxs', n_frames=N)
+print('frames:', scan.frames.tolist())
+
+first = scan.get_1d(int(scan.frames[0]))
+print('first-frame 1D intensity shape:', first.intensity.shape)
+# scan.get_2d(frame), scan.get_thumbnail(frame), scan.metadata also available"""),
+    md("""---
+
+### Next steps
+
+- To **re-integrate or change reduction settings**, see notebook
+  **06 — Headless Reduction Pipeline** (writes the `.nxs` these readers
+  consume).
+- To **fit phases / peaks** on a pattern you just read, feed `r.q` and
+  `r.intensity` into notebook **03 — Phase + peak fitting**.
+- For the full `xarray.Dataset` (lazy per-frame access over very large
+  scans), use `read_scan_metadata` / `read_scan` from
+  `ssrl_xrd_tools.io`.
 """),
 ]
 
@@ -1132,4 +1291,5 @@ if __name__ == "__main__":
     write_notebook("04_batch_phase_fitting.ipynb",      NB_BATCH_PHASE)
     write_notebook("05_sin2psi_analysis.ipynb",         NB_SIN2PSI)
     write_notebook("06_headless_reduction_pipeline.ipynb", NB_REDUCTION_PIPELINE)
+    write_notebook("07_reading_processed_nxs.ipynb",    NB_READING_PROCESSED)
     print("\nDone.  Re-run after editing cell content above.")

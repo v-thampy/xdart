@@ -172,7 +172,7 @@ class StreamingScan:
     """One scan's data for :func:`grid_scans_streaming`.
 
     The ``img`` field is the eager in-memory stack.  For lazy / on-disk
-    loading (e.g. v2 NeXus spheres) prefer driving :class:`StreamingGridder`
+    loading (e.g. v2 NeXus scans) prefer driving :class:`StreamingGridder`
     directly so frames can be materialised one chunk at a time.
     """
 

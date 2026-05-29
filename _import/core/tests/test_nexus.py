@@ -13,7 +13,7 @@ from ssrl_xrd_tools.io.nexus import (
     open_nexus_image_stack,
     open_nexus_writer,
     read_nexus,
-    read_sphere_metadata,
+    read_scan_metadata,
     write_nexus,
     write_nexus_frame,
 )
@@ -475,7 +475,7 @@ class TestReadSphereMetadata:
         return p
 
     def test_returns_frame_coord_and_axes(self, synth_v2_sphere):
-        ds = read_sphere_metadata(synth_v2_sphere)
+        ds = read_scan_metadata(synth_v2_sphere)
         assert "frame" in ds.coords
         assert "q" in ds.coords
         assert "q_2d" in ds.coords
@@ -484,20 +484,20 @@ class TestReadSphereMetadata:
         assert list(ds["frame"].values) == list(range(1, 101))
 
     def test_omits_intensity_arrays(self, synth_v2_sphere):
-        ds = read_sphere_metadata(synth_v2_sphere)
+        ds = read_scan_metadata(synth_v2_sphere)
         assert "intensity_1d" not in ds.data_vars
         assert "intensity_2d" not in ds.data_vars
         assert "sigma_1d" not in ds.data_vars
         assert "thumbnail" not in ds.data_vars
 
     def test_includes_positioners(self, synth_v2_sphere):
-        ds = read_sphere_metadata(synth_v2_sphere)
+        ds = read_scan_metadata(synth_v2_sphere)
         assert "th" in ds.data_vars
         assert ds["th"].dims == ("frame",)
         assert ds["th"].shape == (100,)
 
     def test_units_round_trip(self, synth_v2_sphere):
-        ds = read_sphere_metadata(synth_v2_sphere)
+        ds = read_scan_metadata(synth_v2_sphere)
         assert ds["q"].attrs.get("units") == "1/angstrom"
         assert ds["chi"].attrs.get("units") == "deg"
 
