@@ -289,3 +289,47 @@ class TestMixedQResolution:
         assert ds["intensity_2d"].dims == ("frame", "chi", "q_2d")
         # 1D's radial dim stays q
         assert ds["intensity_1d"].dims == ("frame", "q")
+
+
+# ---------------------------------------------------------------------------
+# 1D / 2D frame-label alignment in read_scan
+# ---------------------------------------------------------------------------
+
+def _write_1d2d(path, fidx_1d, fidx_2d, *, nq=6, nchi=4):
+    """Minimal v2 file with independent 1D/2D frame_index vectors."""
+    rng = np.random.default_rng(0)
+    with h5py.File(path, "w") as f:
+        e = f.create_group("entry")
+        g1 = e.create_group("integrated_1d")
+        g1.create_dataset("intensity", data=rng.random((len(fidx_1d), nq)).astype("f4"))
+        g1.create_dataset("q", data=np.linspace(1, 5, nq))
+        g1.create_dataset("frame_index", data=np.asarray(fidx_1d, "i4"))
+        g2 = e.create_group("integrated_2d")
+        # distinct value per 2D row so mislabeling would be detectable
+        i2 = np.stack([np.full((nchi, nq), float(k)) for k in range(len(fidx_2d))])
+        g2.create_dataset("intensity", data=i2.astype("f4"))
+        g2.create_dataset("q", data=np.linspace(1, 5, nq))
+        g2.create_dataset("chi", data=np.linspace(-180, 180, nchi, endpoint=False))
+        g2.create_dataset("frame_index", data=np.asarray(fidx_2d, "i4"))
+
+
+def test_read_scan_shared_frame_when_labels_match(tmp_path):
+    p = tmp_path / "match.nxs"
+    _write_1d2d(p, [0, 1, 2], [0, 1, 2])
+    ds = read_scan(p)
+    assert ds["intensity_1d"].dims == ("frame", "q")
+    assert ds["intensity_2d"].dims == ("frame", "chi", "q_2d")
+    assert "frame_2d" not in ds.coords
+
+
+def test_read_scan_separate_dim_when_labels_differ(tmp_path):
+    """1D and 2D reduced over different frame labels must NOT be forced
+    onto one 'frame' coord (silent mislabel) — 2D gets its own dim."""
+    p = tmp_path / "mismatch.nxs"
+    _write_1d2d(p, [0, 1, 2], [10, 11, 12])
+    ds = read_scan(p)
+    assert list(ds["frame"].values) == [0, 1, 2]
+    assert ds["intensity_2d"].dims == ("frame_2d", "chi", "q_2d")
+    assert list(ds["frame_2d"].values) == [10, 11, 12]
+    # row k still holds value k (orientation/order preserved, not mislabeled)
+    np.testing.assert_allclose(ds["intensity_2d"].values[1], 1.0)

@@ -1125,13 +1125,39 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
 
         if "2d" in groups and "integrated_2d" in e:
             g2 = e["integrated_2d"]
+            fidx_2d = (
+                np.asarray(g2["frame_index"][()])
+                if "frame_index" in g2 else None
+            )
+            # Decide which frame dimension the 2D stack rides on.  Normally
+            # 1D and 2D were reduced over the same frames and share labels →
+            # shared ``frame``.  If they differ (partial / separately
+            # re-reduced outputs), forcing 2D onto the 1D ``frame`` coord
+            # would silently mislabel rows (or, if lengths differ, make the
+            # Dataset construction raise).  In that case give the 2D stack
+            # its own ``frame_2d`` dimension so both load correctly and the
+            # mismatch is explicit rather than silent.
+            frame_dim = "frame"
+            if "frame" in coords and fidx_2d is not None:
+                f1 = coords["frame"]
+                if f1.shape != fidx_2d.shape or not np.array_equal(f1, fidx_2d):
+                    frame_dim = "frame_2d"
+                    coords["frame_2d"] = fidx_2d
+                    logger.warning(
+                        "integrated_1d and integrated_2d carry different "
+                        "frame_index in %s; loading 2D on a separate "
+                        "'frame_2d' dimension to avoid mislabeling.", path,
+                    )
+            elif fidx_2d is not None:
+                coords["frame"] = fidx_2d
+
             # 1D and 2D radial axes are the same physical quantity (q
             # magnitude) but sampled at independent resolutions
             # (npt=2000 for 1D, npt_rad=500 for 2D is typical).  xarray
             # requires distinct dim names for differently-sized axes,
             # so 2D's radial axis lives under ``q_2d``.
             data_vars["intensity_2d"] = (
-                ("frame", "chi", "q_2d"),
+                (frame_dim, "chi", "q_2d"),
                 np.asarray(g2["intensity"][()]),
             )
             coords["q_2d"] = np.asarray(g2["q"][()])
@@ -1142,8 +1168,6 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
             u = g2["chi"].attrs.get("units", None)
             if u is not None:
                 attrs_per_coord["chi"] = {"units": _v2_decode_str(u)}
-            if "frame_index" in g2 and "frame" not in coords:
-                coords["frame"] = np.asarray(g2["frame_index"][()])
 
         # Reject per-frame columns whose length disagrees with the frame
         # coord (malformed/partial file) so one bad column doesn't make the

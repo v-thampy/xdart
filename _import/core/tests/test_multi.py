@@ -217,3 +217,35 @@ def test_stitch_2d_normalization_mismatched_length(poni_fixture):
             normalization=[1.0, 2.0],  # only 2 for 3 images
             correctSolidAngle=False,
         )
+
+
+def test_stitch_images_routes_and_handles_rot2(monkeypatch):
+    """stitch_images dispatches mode->stitch_1d/2d, builds integrators from
+    rot1/rot2, and treats all-zero rot2 as a pure rot1 scan."""
+    import ssrl_xrd_tools.integrate.multi as multi
+
+    monkeypatch.setattr(
+        multi, "create_multigeometry_integrators",
+        lambda poni, rot1_angles, rot2_angles=None: ("INTEG", rot1_angles, rot2_angles),
+    )
+    monkeypatch.setattr(multi, "stitch_1d", lambda images, integ, **kw: ("1d", integ, kw))
+    monkeypatch.setattr(multi, "stitch_2d", lambda images, integ, **kw: ("2d", integ, kw))
+
+    imgs = np.zeros((2, 3, 3))
+
+    r1 = multi.stitch_images(imgs, "PONI", [10.0, 20.0], mode="1d", npt_1d=500)
+    assert r1[0] == "1d"
+    assert r1[1][2] is None              # rot2=None when absent
+    assert r1[2]["npt"] == 500
+
+    r1z = multi.stitch_images(imgs, "PONI", [10.0, 20.0], [0.0, 0.0], mode="1d")
+    assert r1z[1][2] is None             # all-zero rot2 -> None
+
+    r2 = multi.stitch_images(imgs, "PONI", [10.0, 20.0], [1.0, 2.0],
+                             mode="2d", npt_rad_2d=300)
+    assert r2[0] == "2d"
+    assert list(r2[1][2]) == [1.0, 2.0]  # nonzero rot2 passed through
+    assert r2[2]["npt_rad"] == 300
+
+    with pytest.raises(ValueError):
+        multi.stitch_images(imgs, "PONI", [10.0], mode="bogus")
