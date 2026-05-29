@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Tests for L1 lazy raw load: LiveFrame._lazy_load_raw + the
-re-evaluated ``is_reload_only`` flag set by _load_arch_v2.
+re-evaluated ``is_reload_only`` flag set by _load_frame_v2.
 
 Covers both source types the wranglers stamp into v2 files:
 
@@ -10,7 +10,7 @@ Covers both source types the wranglers stamp into v2 files:
 
 Tests exercise the lazy-load path directly (no full pyFAI
 integration) so they stay fast and don't need a real PONI.  The
-integrate methods would just consume ``arch.map_raw`` after the
+integrate methods would just consume ``frame.map_raw`` after the
 lazy load — and that's covered separately in the integrate tests.
 """
 
@@ -72,20 +72,20 @@ def _write_eiger_master(tmp_path, n_files=2, frames_per_file=3,
 
 class TestResolvedSourcePath:
     def test_no_source_file_returns_empty(self):
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
         a = LiveFrame(idx=0)
         a.source_file = ""
         assert a._resolved_source_path() == ""
 
     def test_absolute_source_file_kept(self, tmp_path):
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
         a = LiveFrame(idx=0)
         a.source_file = str(tmp_path / "abs.tif")
         a._source_root = "/should/be/ignored"
         assert a._resolved_source_path() == str(tmp_path / "abs.tif")
 
     def test_relative_joined_against_source_root(self, tmp_path):
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
         a = LiveFrame(idx=0)
         a.source_file = "frame_0001.tif"
         a._source_root = str(tmp_path)
@@ -94,7 +94,7 @@ class TestResolvedSourcePath:
     def test_relative_with_empty_root_uses_cwd(self):
         """Defensive: pre-R2 reloads might lack _source_root; the lazy
         load shouldn't crash, it should return False on os.path.exists."""
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
         a = LiveFrame(idx=0)
         a.source_file = "frame_0001.tif"
         a._source_root = ""
@@ -109,7 +109,7 @@ class TestResolvedSourcePath:
 class TestLazyLoadTif:
     def test_loads_tif_frame_from_relative_path(self, tmp_path):
         pytest.importorskip("tifffile")
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
 
         img = _write_tif(tmp_path / "frame_0000.tif", shape=(10, 12), seed=7)
 
@@ -126,7 +126,7 @@ class TestLazyLoadTif:
         assert np.allclose(a.map_raw, img.astype(np.float32))
 
     def test_no_op_when_map_raw_already_set(self, tmp_path):
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
         a = LiveFrame(idx=0)
         a.map_raw = np.ones((4, 4), dtype=np.float32) * 42
         a.source_file = "nonexistent.tif"
@@ -136,7 +136,7 @@ class TestLazyLoadTif:
         assert np.all(a.map_raw == 42)
 
     def test_missing_file_returns_false(self, tmp_path):
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
         a = LiveFrame(idx=0)
         a.map_raw = None
         a.source_file = "ghost.tif"
@@ -145,7 +145,7 @@ class TestLazyLoadTif:
         assert a.map_raw is None
 
     def test_no_source_file_returns_false(self):
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
         a = LiveFrame(idx=0)
         a.map_raw = None
         a.source_file = ""
@@ -164,7 +164,7 @@ class TestLazyLoadTif:
         regress it.
         """
         pytest.importorskip("tifffile")
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
 
         a = LiveFrame(idx=7)
         a.source_file = "stack.tif"
@@ -190,10 +190,10 @@ class TestLazyLoadTif:
 
         Pre-O2 the non-HDF5 branch called ``read_image(full)`` with
         no frame arg, so reload from a multi-frame stack returned
-        the first slice for every arch — silently wrong.
+        the first slice for every frame — silently wrong.
         """
         pytest.importorskip("tifffile")
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
         import tifffile
 
         rng = np.random.default_rng(31)
@@ -224,7 +224,7 @@ class TestLazyLoadTif:
 
 class TestLazyLoadNexus:
     def test_loads_specific_frame_from_eiger_master(self, tmp_path):
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
         master, full = _write_eiger_master(
             tmp_path, n_files=3, frames_per_file=4, shape=(7, 9), seed=11,
         )
@@ -242,8 +242,8 @@ class TestLazyLoadNexus:
 
     def test_falls_back_to_idx_when_source_frame_idx_missing(self, tmp_path):
         """Reload-from-older-file path: source_frame_idx is None →
-        lazy loader uses arch.idx instead."""
-        from xdart.modules.ewald.arch import LiveFrame
+        lazy loader uses frame.idx instead."""
+        from xdart.modules.ewald.frame import LiveFrame
         master, full = _write_eiger_master(
             tmp_path, n_files=2, frames_per_file=3, shape=(5, 5), seed=13,
         )
@@ -256,7 +256,7 @@ class TestLazyLoadNexus:
         assert np.allclose(a.map_raw, full[2].astype(np.float32))
 
     def test_missing_master_returns_false(self, tmp_path):
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
         a = LiveFrame(idx=0)
         a.map_raw = None
         a.source_file = "no_such_master.h5"
@@ -266,44 +266,44 @@ class TestLazyLoadNexus:
 
 
 # ---------------------------------------------------------------------------
-# _load_arch_v2 — flag is reload-feasibility-aware after L1
+# _load_frame_v2 — flag is reload-feasibility-aware after L1
 # ---------------------------------------------------------------------------
 
 class TestReloadOnlyFlagWiring:
     """``is_reload_only`` should reflect whether lazy load will succeed.
 
-    Verified end-to-end: write a sphere with a real-on-disk source, then
-    re-load and inspect arch.is_reload_only.  Going through
-    save_sphere_to_nexus + _load_arch_v2 ensures the wiring through
-    arch_series is exercised.
+    Verified end-to-end: write a scan with a real-on-disk source, then
+    re-load and inspect frame.is_reload_only.  Going through
+    save_scan_to_nexus + _load_frame_v2 ensures the wiring through
+    frame_series is exercised.
     """
 
     def test_is_reload_only_false_when_source_exists(self, tmp_path):
         pytest.importorskip("tifffile")
-        from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
-        from xdart.modules.ewald.arch_series import _load_arch_v2
+        from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+        from xdart.modules.ewald.frame_series import _load_frame_v2
 
         # Test fixture pieces inlined to keep this file standalone.
         from tests.test_nexus_writer_roundtrip import (
             _DuckArch, _DuckSphere, N_Q,
         )
 
-        # Build a real on-disk TIF and stamp it on the duck arch.
+        # Build a real on-disk TIF and stamp it on the duck frame.
         tif_path = tmp_path / "frame_0000.tif"
         _write_tif(tif_path, shape=(8, 8))
 
         a = _DuckArch(idx=0)
         a.source_file = "frame_0000.tif"
         a.source_frame_idx = 0
-        sphere = _DuckSphere([a])
+        scan = _DuckSphere([a])
 
         nxs = tmp_path / "scan.nxs"
-        save_sphere_to_nexus(sphere, nxs, entry="entry", finalize=False)
+        save_scan_to_nexus(scan, nxs, entry="entry", finalize=False)
 
         # Reload via the same code path as the GUI viewer.
         source_root = str(tmp_path)
         with h5py.File(nxs, "r") as f:
-            loaded = _load_arch_v2(f, 0, static=False, gi=False,
+            loaded = _load_frame_v2(f, 0, static=False, gi=False,
                                    source_root=source_root)
         # With the source file present, lazy load is feasible.
         assert loaded.is_reload_only is False
@@ -311,8 +311,8 @@ class TestReloadOnlyFlagWiring:
         assert loaded._source_root == source_root
 
     def test_is_reload_only_true_when_source_missing(self, tmp_path):
-        from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
-        from xdart.modules.ewald.arch_series import _load_arch_v2
+        from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+        from xdart.modules.ewald.frame_series import _load_frame_v2
         from tests.test_nexus_writer_roundtrip import (
             _DuckArch, _DuckSphere,
         )
@@ -323,21 +323,21 @@ class TestReloadOnlyFlagWiring:
         a = _DuckArch(idx=0)
         a.source_file = "nonexistent_frame.tif"
         a.source_frame_idx = 0
-        sphere = _DuckSphere([a])
+        scan = _DuckSphere([a])
 
         nxs = tmp_path / "scan.nxs"
-        save_sphere_to_nexus(sphere, nxs, entry="entry", finalize=False)
+        save_scan_to_nexus(scan, nxs, entry="entry", finalize=False)
 
         with h5py.File(nxs, "r") as f:
-            loaded = _load_arch_v2(f, 0, static=False, gi=False,
+            loaded = _load_frame_v2(f, 0, static=False, gi=False,
                                    source_root=str(tmp_path))
         assert loaded.is_reload_only is True
 
     def test_is_reload_only_true_when_no_source_file(self, tmp_path):
         """Edge: empty source_file (older v2 files written before
         R2's source-ref schema landed) — guardrail must still fire."""
-        from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
-        from xdart.modules.ewald.arch_series import _load_arch_v2
+        from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+        from xdart.modules.ewald.frame_series import _load_frame_v2
         from tests.test_nexus_writer_roundtrip import (
             _DuckArch, _DuckSphere,
         )
@@ -345,12 +345,12 @@ class TestReloadOnlyFlagWiring:
         a = _DuckArch(idx=0)
         a.source_file = ""
         a.source_frame_idx = 0
-        sphere = _DuckSphere([a])
+        scan = _DuckSphere([a])
         nxs = tmp_path / "scan.nxs"
-        save_sphere_to_nexus(sphere, nxs, entry="entry", finalize=False)
+        save_scan_to_nexus(scan, nxs, entry="entry", finalize=False)
 
         with h5py.File(nxs, "r") as f:
-            loaded = _load_arch_v2(f, 0, static=False, gi=False,
+            loaded = _load_frame_v2(f, 0, static=False, gi=False,
                                    source_root=str(tmp_path))
         assert loaded.is_reload_only is True
 
@@ -362,7 +362,7 @@ class TestReloadOnlyFlagWiring:
 class TestPicklingPreservesLazyLoadCapability:
     """F8 / L1 follow-up.
 
-    The sphere_threads.bai_*_all reintegrate path sends arches into
+    The scan_threads.bai_*_all reintegrate path sends frames into
     a ProcessPoolExecutor.  Arches reloaded from v2 .nxs lack
     ``map_raw`` and depend on ``_source_root`` + ``source_file`` to
     lazy-load it.  The review flagged a suspicion that ``_source_root``
@@ -375,7 +375,7 @@ class TestPicklingPreservesLazyLoadCapability:
 
     def test_attrs_round_trip_through_pickle(self, tmp_path):
         import pickle
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
 
         a = LiveFrame(idx=42)
         a.source_file = "frame_0042.tif"
@@ -400,12 +400,12 @@ class TestPicklingPreservesLazyLoadCapability:
         )
 
     def test_subprocess_can_lazy_load_via_pickled_arch(self, tmp_path):
-        """End-to-end: spawn a real subprocess, pickle an arch into
+        """End-to-end: spawn a real subprocess, pickle an frame into
         it, ask it to lazy-load, get the loaded array back.  This is
-        what sphere_threads.bai_*_all does under the hood.
+        what scan_threads.bai_*_all does under the hood.
         """
         pytest.importorskip("tifffile")
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
 
         img = _write_tif(tmp_path / "frame_0007.tif",
                          shape=(8, 10), seed=42)
@@ -417,7 +417,7 @@ class TestPicklingPreservesLazyLoadCapability:
         a._source_root = str(tmp_path)
 
         # Use a ProcessPoolExecutor to mirror the real reintegrate
-        # path (sphere_threads._reintegrate_all uses ProcessPoolExecutor).
+        # path (scan_threads._reintegrate_all uses ProcessPoolExecutor).
         from concurrent.futures import ProcessPoolExecutor
 
         with ProcessPoolExecutor(max_workers=1) as pool:
@@ -432,11 +432,11 @@ class TestPicklingPreservesLazyLoadCapability:
         assert result_root == str(tmp_path)
 
 
-def _load_and_return_raw(arch):
+def _load_and_return_raw(frame):
     """Helper for ProcessPoolExecutor — must be module-level for
     pickling to work."""
-    arch._lazy_load_raw()
-    return arch.map_raw, arch._source_root
+    frame._lazy_load_raw()
+    return frame.map_raw, frame._source_root
 
 
 class TestIntegrateTriggersLazyLoad:
@@ -451,7 +451,7 @@ class TestIntegrateTriggersLazyLoad:
 
     def test_integrate_1d_lazy_loads_before_pyfai(self, tmp_path):
         pytest.importorskip("tifffile")
-        from xdart.modules.ewald.arch import LiveFrame
+        from xdart.modules.ewald.frame import LiveFrame
 
         # Write a real TIF.
         _write_tif(tmp_path / "frame_0000.tif", shape=(16, 16), seed=99)
@@ -467,7 +467,7 @@ class TestIntegrateTriggersLazyLoad:
         def fake_integrate1d_ng(data, **kwargs):
             captured['shape'] = data.shape
             captured['n_nan'] = int(np.isnan(data).sum())
-            # Return a duck result with attrs the arch consumer reads.
+            # Return a duck result with attrs the frame consumer reads.
             class _R:
                 radial = np.linspace(0, 5, 10).astype(np.float32)
                 intensity = np.zeros(10, dtype=np.float32)

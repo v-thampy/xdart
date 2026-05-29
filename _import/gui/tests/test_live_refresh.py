@@ -88,13 +88,13 @@ def _viewer(frame_ids, displayed):
 
     calls = []
     viewer = SimpleNamespace(
-        sphere=SimpleNamespace(
+        scan=SimpleNamespace(
             name="scan",
-            arches=SimpleNamespace(index=list(frame_ids)),
+            frames=SimpleNamespace(index=list(frame_ids)),
         ),
         ui=SimpleNamespace(listData=list_data),
         new_scan_loaded=False,
-        arch_ids=[],
+        frame_ids=[],
         auto_last=True,
         latest_idx=None,
         data_changed=lambda *args, **kwargs: calls.append((args, kwargs)),
@@ -160,7 +160,7 @@ def test_flush_pending_update_owns_single_repaint():
             update_data=lambda **kwargs: calls.append(("update_data", kwargs)),
             data_changed=lambda: calls.append(("data_changed", {})),
         ),
-        latest_arch=lambda **kwargs: calls.append(("latest_arch", kwargs)),
+        latest_frame=lambda **kwargs: calls.append(("latest_frame", kwargs)),
         displayframe=SimpleNamespace(
             update=lambda: calls.append(("display", {})),
         ),
@@ -174,6 +174,6 @@ def test_flush_pending_update_owns_single_repaint():
     assert widget._pending_update_idx is None
     assert calls == [
         ("update_data", {"emit_update": False}),
-        ("latest_arch", {"emit_update": False}),
+        ("latest_frame", {"emit_update": False}),
         ("data_changed", {}),
     ]

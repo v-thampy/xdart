@@ -434,15 +434,37 @@ class LiveFrame():
         shape = self.map_raw.shape
         size = self.map_raw.size
         mask = np.zeros(size, dtype=bool)
-        try:
-            if self.mask is not None and len(self.mask):
+        # Apply the frame's own bad-pixel mask (always derived from this
+        # image, so in-bounds) first.
+        if self.mask is not None and len(self.mask):
+            try:
                 mask[self.mask] = True
-            if global_mask is not None and len(global_mask):
-                mask[global_mask] = True
-            return mask.reshape(shape)
-        except IndexError:
-            print('Mask File Shape Mismatch')
-            return mask.reshape(shape) if mask.size == size else mask
+            except IndexError:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Ignoring frame mask: indices out of bounds for image "
+                    "size %d.", size,
+                )
+        # The external detector/global mask may have been built for a
+        # different detector shape (wrong calibration, resized frame, …).
+        # Ignore it with a warning rather than raising — reducing unmasked
+        # beats aborting the scan.  Mirrors reduction._flat_mask_as_bool.
+        if global_mask is not None and len(global_mask):
+            gm = np.asarray(global_mask)
+            incompatible = (
+                (gm.dtype == bool and gm.size != size)
+                or (gm.dtype != bool and gm.size
+                    and (gm.min() < 0 or gm.max() >= size))
+            )
+            if incompatible:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Ignoring detector/global mask: incompatible with image "
+                    "shape %s (image has %d pixels).", shape, size,
+                )
+            else:
+                mask[gm.ravel() if gm.dtype == bool else gm] = True
+        return mask.reshape(shape)
 
     def integrate_1d(self, numpoints=10000, radial_range=None,
                      monitor=None, unit=units.TTH_DEG, global_mask=None,

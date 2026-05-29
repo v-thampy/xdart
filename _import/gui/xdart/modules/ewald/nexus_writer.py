@@ -916,6 +916,19 @@ def _write_positioners(f, scan, *, entry: str) -> None:
     if scan_data is None or len(scan_data) == 0:
         return
 
+    # Align scan_data to the full integrated-frame index before pulling
+    # motor columns.  In batch mode a frame whose metadata sidecar was
+    # missing/empty adds no scan_data row (see LiveScan.add_frame), so
+    # scan_data can be shorter than the integrated frame set.  Writing
+    # positioners straight from the short scan_data produced a (N_meta,)
+    # array while integrated_1d/2d were (N_frames,) — and read_scan then
+    # raised "conflicting sizes for dimension 'frame'" and the viewer came
+    # up empty.  Reindexing to frames.index pads the gaps with NaN so the
+    # NeXus per-frame dim is always consistent across groups.
+    frame_index = list(getattr(getattr(scan, "frames", None), "index", []) or [])
+    if frame_index and len(scan_data) != len(frame_index):
+        scan_data = scan_data.reindex(frame_index)
+
     sample_motors: tuple[str, ...] = (
         tuple(geom.sample_motors) if geom else ()
     )
@@ -994,6 +1007,17 @@ def _write_per_frame_geometry(f, scan, *, entry: str) -> None:
     scan_data = getattr(scan, "scan_data", None)
     if geom is None or scan_data is None or len(scan_data) == 0:
         return
+
+    # Align scan_data to the integrated-frame index (same rationale as
+    # _write_positioners): batch frames with missing metadata leave
+    # scan_data shorter than the frame set, which would otherwise emit a
+    # per_frame_geometry whose frame dim disagrees with integrated_1d.
+    # Reindexing to frames.index pads missing rows with NaN (→ NaN derived
+    # geometry, honest) and trims any extra rows to exactly the integrated
+    # frames, so the 1:1 path below runs.
+    _frame_ids_full = list(getattr(getattr(scan, "frames", None), "index", []) or [])
+    if _frame_ids_full and len(scan_data) != len(_frame_ids_full):
+        scan_data = scan_data.reindex(_frame_ids_full)
 
     referenced = geom.all_referenced_motors()
     motors = {
@@ -1290,4 +1314,8 @@ def _quantize_thumbnail(
     return (norm * 255).astype(np.uint8), (float(vmin), float(vmax), "uint8")
 
 
-__all__ = ["save_scan_to_nexus"]
+# Deprecated alias (sphere/arch → scan/frame rename); removed in a future
+# release once all callers use save_scan_to_nexus.
+save_sphere_to_nexus = save_scan_to_nexus
+
+__all__ = ["save_scan_to_nexus", "save_sphere_to_nexus"]

@@ -8,12 +8,15 @@ headless reduction work should cross into ``ssrl_xrd_tools`` as ``Frame`` /
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from dataclasses import fields as _dc_fields
 
@@ -468,22 +471,38 @@ def _flat_mask_as_bool(mask: Any, shape: tuple[int, int] | None) -> np.ndarray |
         if arr.ndim == 2:
             return arr.astype(bool, copy=False)
         return None
+    # A mask that doesn't fit this image (wrong detector/calibration, a
+    # resized frame, a stale flat-index mask, …) is ignored with a warning
+    # rather than crashing the whole scan — reducing unmasked is far better
+    # than aborting the run.  Structural problems degrade the same way.
     if arr.ndim == 2:
         if arr.shape != shape:
-            raise ValueError(f"mask shape {arr.shape} does not match image shape {shape}")
+            logger.warning(
+                "Ignoring mask: shape %s does not match image shape %s.",
+                arr.shape, shape,
+            )
+            return None
         return arr.astype(bool, copy=False)
     if arr.ndim != 1:
-        raise ValueError(f"flat mask must be 1D; got shape {arr.shape}")
+        logger.warning("Ignoring mask: expected 1D flat mask, got shape %s.", arr.shape)
+        return None
     if arr.dtype == bool:
         if arr.size != int(np.prod(shape)):
-            raise ValueError(
-                f"flat boolean mask length {arr.size} does not match image shape {shape}"
+            logger.warning(
+                "Ignoring boolean mask: length %d does not match image shape %s.",
+                arr.size, shape,
             )
+            return None
         return arr.reshape(shape)
     out = np.zeros(int(np.prod(shape)), dtype=bool)
     flat = np.asarray(arr, dtype=int).ravel()
-    if np.any(flat < 0) or np.any(flat >= out.size):
-        raise ValueError(f"flat mask indices out of bounds for image shape {shape}")
+    if flat.size and (flat.min() < 0 or flat.max() >= out.size):
+        logger.warning(
+            "Ignoring mask: flat indices out of bounds for image shape %s "
+            "(index range [%d, %d], image has %d pixels).",
+            shape, int(flat.min()), int(flat.max()), out.size,
+        )
+        return None
     out[flat] = True
     return out.reshape(shape)
 

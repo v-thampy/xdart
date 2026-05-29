@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from xdart.modules.ewald.arch_series import _IndexedList
+from xdart.modules.ewald.frame_series import _IndexedList
 
 
 class TestReadOpsMatchList:
