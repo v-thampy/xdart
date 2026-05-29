@@ -468,24 +468,53 @@ class specThread(wranglerThread):
 
             # Flush and switch sphere when scan name changes.
             #
-            # ``force_save=True`` is critical here: without it, the
-            # serial dispatch path (chosen when len(pending) == 1) only
-            # writes to .nxs once ``_frames_since_save >= LIVE_SAVE_INTERVAL``,
-            # so a short pending batch (1 frame) at scan boundary stays
-            # in memory.  Then ``sphere = self.initialize_sphere()`` on
-            # the next line replaces the local sphere variable; the
-            # old sphere with its unsaved frame is dropped, and its
-            # .nxs file is left at the empty state ``initialize_sphere``
-            # created.  Bug observed with Eiger Image-Directory mode
-            # producing N-1 empty .nxs files and only the last scan's
-            # file populated (because only the final-flush path below
-            # passes ``force_save=True``).
+            # Two save paths matter here, both needed to keep N-1
+            # .nxs files from ending up empty in multi-scan mode
+            # (the bug observed with Eiger Image-Directory + LaB6
+            # calibration scans, one frame per master):
+            #
+            # 1. ``force_save=True`` on the pending dispatch — covers
+            #    batch_mode runs where the partial pending tail at
+            #    scan boundary stayed in-memory because the serial
+            #    path only writes when ``_frames_since_save >=
+            #    LIVE_SAVE_INTERVAL``.
+            # 2. Explicit ``_save_to_nexus`` on the old sphere — covers
+            #    non-batch (live-mode-style) runs where each frame
+            #    was already dispatched immediately by the line-529
+            #    cadence (``pending`` is empty by the time we get
+            #    here), but ``_frames_since_save`` accumulated without
+            #    hitting the save interval.  Without this, the old
+            #    sphere's in-memory arches get dropped when
+            #    ``initialize_sphere()`` reassigns the local variable.
+            #
+            # Only the end-of-loop final-flush passed ``force_save``
+            # before, which is why only the last scan's file ever
+            # got data.
             if (sphere is None) or (scan_name != sphere.name):
                 if pending:
                     files_processed += self._dispatch_batch(
                         sphere, pending, force_save=True,
                     )
                     pending = []
+                # Catch the case where pending was already drained by
+                # the per-iteration dispatch cadence below: the old
+                # sphere may have integrated-but-unsaved arches in
+                # memory whose save_to_nexus call never fired.
+                if (sphere is not None
+                        and not self.xye_only
+                        and self._frames_since_save > 0):
+                    _get_h5pool().pause(sphere.data_file)
+                    try:
+                        with self.file_lock:
+                            sphere._save_to_nexus()
+                    finally:
+                        _get_h5pool().resume(sphere.data_file)
+                    self._flush_xye_buffer(sphere)
+                    logger.info(
+                        '[SAVE-ON-SWAP] %d frames flushed for %s',
+                        self._frames_since_save, sphere.name,
+                    )
+                    self._frames_since_save = 0
                 sphere = self.initialize_sphere()
                 _cached_poni = None
 
