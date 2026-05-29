@@ -31,6 +31,7 @@ Performance features:
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -1022,9 +1023,9 @@ def _read_positioners(grp: h5py.Group) -> dict[str, np.ndarray]:
     return out
 
 
-def _read_sphere_v2(path: Path, entry: str, groups: tuple[str, ...],
-                   include_thumbnails: bool):
-    """v2-schema reader.  Body of public ``read_sphere``."""
+def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
+                  include_thumbnails: bool):
+    """v2-schema reader.  Body of public ``read_scan``."""
     import xarray as xr
 
     from ssrl_xrd_tools.core.provenance import read_provenance
@@ -1133,14 +1134,14 @@ def _read_sphere_v2(path: Path, entry: str, groups: tuple[str, ...],
     return ds
 
 
-def read_sphere_metadata(
+def read_scan_metadata(
     path: Path | str,
     *,
     entry: str = "entry",
 ):
     """Read everything *except* the heavy integrated stacks.
 
-    Returns an :class:`xarray.Dataset` shaped like :func:`read_sphere`
+    Returns an :class:`xarray.Dataset` shaped like :func:`read_scan`
     but with ``intensity_1d``, ``intensity_2d``, ``sigma_1d``, and
     thumbnails omitted.  Still includes:
 
@@ -1244,14 +1245,14 @@ def read_sphere_metadata(
     return ds
 
 
-def read_sphere(
+def read_scan(
     path: Path | str,
     *,
     entry: str = "entry",
     groups: tuple[str, ...] = ("1d", "2d"),
     include_thumbnails: bool = False,
 ):
-    """Read an xdart v2 NeXus file into an :class:`xarray.Dataset`.
+    """Read an xdart v2 NeXus scan file into an :class:`xarray.Dataset`.
 
     v1 (xdart ≤ 0.36.x) is intentionally not supported.  Re-reduce
     older data with current xdart if you need to open it.
@@ -1273,7 +1274,34 @@ def read_sphere(
     xarray.Dataset
         See module-level docstring for the canonical shape.
     """
-    return _read_sphere_v2(Path(path), entry, groups, include_thumbnails)
+    return _read_scan_v2(Path(path), entry, groups, include_thumbnails)
+
+
+# ---------------------------------------------------------------------------
+# Deprecated aliases — sphere/arch → scan/frame rename (kept one release).
+# ---------------------------------------------------------------------------
+
+def read_sphere(path, *, entry: str = "entry",
+                groups: tuple[str, ...] = ("1d", "2d"),
+                include_thumbnails: bool = False):
+    """Deprecated alias for :func:`read_scan`.  Will be removed in a
+    future release; update callers to ``read_scan``."""
+    warnings.warn(
+        "read_sphere() is deprecated; use read_scan().",
+        DeprecationWarning, stacklevel=2,
+    )
+    return read_scan(path, entry=entry, groups=groups,
+                     include_thumbnails=include_thumbnails)
+
+
+def read_sphere_metadata(path, *, entry: str = "entry"):
+    """Deprecated alias for :func:`read_scan_metadata`.  Will be removed
+    in a future release; update callers to ``read_scan_metadata``."""
+    warnings.warn(
+        "read_sphere_metadata() is deprecated; use read_scan_metadata().",
+        DeprecationWarning, stacklevel=2,
+    )
+    return read_scan_metadata(path, entry=entry)
 
 
 def read_stitched(
@@ -1330,7 +1358,10 @@ __all__ = [
     "write_nexus",
     "write_nexus_frame",
     # v2 (xdart 0.37+)
+    "read_scan",
+    "read_scan_metadata",
+    "read_stitched",
+    # deprecated aliases (removed in a future release)
     "read_sphere",
     "read_sphere_metadata",
-    "read_stitched",
 ]

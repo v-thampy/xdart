@@ -1,4 +1,4 @@
-"""Tests for the v2 NeXus reader (``read_sphere`` / ``read_stitched``).
+"""Tests for the v2 NeXus reader (``read_scan`` / ``read_stitched``).
 
 We hand-craft a small NXroot fixture with pure h5py — no xdart
 dependency, no captured-file dependency — and round-trip it through
@@ -13,7 +13,7 @@ import pytest
 
 from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
 from ssrl_xrd_tools.core.provenance import write_provenance
-from ssrl_xrd_tools.io.nexus import read_sphere, read_stitched
+from ssrl_xrd_tools.io.nexus import read_scan, read_stitched
 
 
 N_FRAMES = 5
@@ -129,13 +129,13 @@ def v2_fixture(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# read_sphere
+# read_scan
 # ---------------------------------------------------------------------------
 
 class TestReadSphere:
     def test_basic_dims_and_shapes(self, v2_fixture):
         p, _, _ = v2_fixture
-        ds = read_sphere(p)
+        ds = read_scan(p)
         assert ds.sizes["frame"] == N_FRAMES
         assert ds.sizes["q"] == N_Q
         assert ds.sizes["chi"] == N_CHI
@@ -146,13 +146,13 @@ class TestReadSphere:
 
     def test_sigma_1d_loaded(self, v2_fixture):
         p, _, _ = v2_fixture
-        ds = read_sphere(p)
+        ds = read_scan(p)
         assert "sigma_1d" in ds.data_vars
         assert ds["sigma_1d"].shape == (N_FRAMES, N_Q)
 
     def test_groups_filter_skips_2d(self, v2_fixture):
         p, _, _ = v2_fixture
-        ds = read_sphere(p, groups=("1d",))
+        ds = read_scan(p, groups=("1d",))
         assert "intensity_1d" in ds.data_vars
         assert "intensity_2d" not in ds.data_vars
         # chi dim should not be present either
@@ -160,7 +160,7 @@ class TestReadSphere:
 
     def test_per_frame_geometry_loaded(self, v2_fixture):
         p, _, derived = v2_fixture
-        ds = read_sphere(p)
+        ds = read_scan(p)
         for key in ("rot1", "rot2", "rot3", "incident_angle"):
             assert key in ds.data_vars
             np.testing.assert_allclose(
@@ -169,7 +169,7 @@ class TestReadSphere:
 
     def test_motor_positioners_loaded(self, v2_fixture):
         p, _, _ = v2_fixture
-        ds = read_sphere(p)
+        ds = read_scan(p)
         # Sample motors
         for m in ("eta", "phi", "mu"):
             assert m in ds.data_vars
@@ -184,13 +184,13 @@ class TestReadSphere:
 
     def test_q_units_attr(self, v2_fixture):
         p, _, _ = v2_fixture
-        ds = read_sphere(p)
+        ds = read_scan(p)
         assert ds["q"].attrs.get("units") == "1/angstrom"
         assert ds["chi"].attrs.get("units") == "deg"
 
     def test_reduction_attrs_attached(self, v2_fixture):
         p, _, _ = v2_fixture
-        ds = read_sphere(p)
+        ds = read_scan(p)
         red = ds.attrs.get("reduction", {})
         assert red["program"] == "xdart"
         assert red["version"] == "0.37.0-dev0"
@@ -199,7 +199,7 @@ class TestReadSphere:
 
     def test_frame_coord_present(self, v2_fixture):
         p, _, _ = v2_fixture
-        ds = read_sphere(p)
+        ds = read_scan(p)
         np.testing.assert_array_equal(
             ds["frame"].values, np.arange(N_FRAMES)
         )
@@ -209,11 +209,11 @@ class TestReadSphere:
         with h5py.File(p, "w") as f:
             f.create_group("not_entry")
         with pytest.raises(KeyError):
-            read_sphere(p)
+            read_scan(p)
 
     def test_thumbnails_off_by_default(self, v2_fixture):
         p, _, _ = v2_fixture
-        ds = read_sphere(p)
+        ds = read_scan(p)
         assert "thumbnail" not in ds.data_vars
 
 
@@ -281,7 +281,7 @@ class TestMixedQResolution:
                               data=np.linspace(-180.0, 180.0, n_chi,
                                                endpoint=False, dtype=np.float32))
 
-        ds = read_sphere(p)
+        ds = read_scan(p)
         # Both q axes present with their own sizes
         assert ds.sizes["q"] == n_q_1d
         assert ds.sizes["q_2d"] == n_q_2d

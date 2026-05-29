@@ -232,7 +232,7 @@ def plot_scan_1d(
     """Plot one or many 1-D patterns from a NeXus reader :class:`xr.Dataset`.
 
     Works on the canonical Dataset shape returned by
-    :func:`ssrl_xrd_tools.io.nexus.read_sphere` (either schema).
+    :func:`ssrl_xrd_tools.io.nexus.read_scan` (either schema).
     """
     if "intensity_1d" not in ds.data_vars or "q" not in ds.coords:
         raise ValueError("Dataset missing 'intensity_1d' or 'q' coord")

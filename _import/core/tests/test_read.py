@@ -166,6 +166,24 @@ def test_get_metadata(scan_file):
     assert "q" in m and "chi" in m
 
 
+def test_read_sphere_alias_deprecated(scan_file):
+    """The old read_sphere* names still work but emit DeprecationWarning."""
+    import warnings
+    from ssrl_xrd_tools.io.nexus import (
+        read_scan, read_scan_metadata, read_sphere, read_sphere_metadata,
+    )
+    p, _ = scan_file
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        ds = read_sphere(p)
+        meta = read_sphere_metadata(p)
+    msgs = [str(x.message) for x in w if issubclass(x.category, DeprecationWarning)]
+    assert any("read_sphere" in m for m in msgs)
+    # aliases return the same thing as the canonical names
+    assert set(ds.data_vars) == set(read_scan(p).data_vars)
+    assert set(meta.coords) == set(read_scan_metadata(p).coords)
+
+
 def test_scan_sugar(scan_file):
     p, ref = scan_file
     scan = open_scan(p)

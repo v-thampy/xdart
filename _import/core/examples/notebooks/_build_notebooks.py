@@ -1143,7 +1143,7 @@ reader takes a `frame` label (the value stored in the file, e.g. 1-based
 for SPEC, possibly gapped) or `None` for all frames.
 
 For the full `xarray.Dataset` (every motor column + provenance) use
-`read_sphere` / `read_sphere_metadata` instead — but for "open a file,
+`read_scan` / `read_scan_metadata` instead — but for "open a file,
 get arrays I can plot" the helpers below are all you need."""),
     md("## Imports"),
     code("""from pathlib import Path
@@ -1278,7 +1278,7 @@ print('first-frame 1D intensity shape:', first.intensity.shape)
 - To **fit phases / peaks** on a pattern you just read, feed `r.q` and
   `r.intensity` into notebook **03 — Phase + peak fitting**.
 - For the full `xarray.Dataset` (lazy per-frame access over very large
-  scans), use `read_sphere_metadata` / `read_sphere` from
+  scans), use `read_scan_metadata` / `read_scan` from
   `ssrl_xrd_tools.io`.
 """),
 ]

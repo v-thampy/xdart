@@ -376,7 +376,7 @@ scan.frames, len(scan), scan.get_1d(2), scan.metadata
 ```
 
 For the full `xarray.Dataset` (lazy per-frame access over very large
-scans) use `read_sphere` / `read_sphere_metadata`. A runnable walkthrough
+scans) use `read_scan` / `read_scan_metadata`. A runnable walkthrough
 is in [`examples/notebooks/07_reading_processed_nxs.ipynb`](examples/notebooks/).
 
 ### Working with SPEC Files

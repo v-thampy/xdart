@@ -6,8 +6,8 @@ metadata out of a scan file with a single function call and no xarray
 knowledge required — the intent is "open a file, get arrays I can plot."
 
 For the full :class:`xarray.Dataset` (every frame, every motor column,
-provenance) use :func:`ssrl_xrd_tools.io.read_sphere` /
-:func:`read_sphere_metadata`.  These ``get_*`` helpers sit on top of the
+provenance) use :func:`ssrl_xrd_tools.io.read_scan` /
+:func:`read_scan_metadata`.  These ``get_*`` helpers sit on top of the
 same v2 layout but slice **one frame at a time straight from h5py**, so
 ``get_2d(scan, frame=k)`` does not materialise the full
 ``(n_frames, chi, q)`` tensor — important for 10k-frame Eiger scans.
@@ -229,14 +229,14 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
     # Reuse the canonical metadata-only reader for axes / positioners /
     # provenance, then add the instrument/sample scalars it doesn't carry.
     from ssrl_xrd_tools.io.nexus import (
-        read_sphere_metadata,
+        read_scan_metadata,
         _read_energy,
         _read_wavelength,
         _read_ub_matrix,
         _read_sample_name,
     )
 
-    ds = read_sphere_metadata(scan_file, entry=entry)
+    ds = read_scan_metadata(scan_file, entry=entry)
     reserved = {"rot1", "rot2", "rot3", "incident_angle"}
     positioners = {
         name: np.asarray(ds[name].values)
