@@ -393,9 +393,17 @@ class staticWidget(QWidget):
             # the wrangler scan's, so it never contends with the
             # wrangler's disk writes (no GUI stall).
             with self.scan.scan_lock:
-                if idx not in self.scan.frames.index:
-                    self.scan.frames.index.append(idx)
-                    self.scan.frames.index.sort()
+                index = self.scan.frames.index
+                if idx not in index:
+                    # Common case — frames arrive in order: append without
+                    # the O(N log N) re-sort.  Only out-of-order inserts
+                    # (rare: reload/replace) pay for a sort, so a long scan
+                    # stays O(1) per frame instead of O(N log N).
+                    if not index or idx > index[-1]:
+                        index.append(idx)
+                    else:
+                        index.append(idx)
+                        index.sort()
         except AttributeError:
             # frames may briefly be None or replaced during set_datafile.
             pass

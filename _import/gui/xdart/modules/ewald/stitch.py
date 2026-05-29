@@ -37,6 +37,7 @@ def run_stitch(
     radial_range: tuple[float, float] | None = None,
     azimuth_range: tuple[float, float] | None = None,
     unit: str = "q_A^-1",
+    max_stack_bytes: float = 16e9,
 ) -> None:
     """Stitch the scan's per-frame images into a single merged pattern.
 
@@ -98,6 +99,29 @@ def run_stitch(
     base_poni = getattr(frames[0], "poni", None)
     if base_poni is None:
         raise RuntimeError("No PONI on frames[0] — cannot stitch")
+
+    # Memory guard: pyFAI MultiGeometry needs every image resident at once
+    # (the images list + np.stack below), so a long Eiger run can demand
+    # hundreds of GB and swap the machine to death.  Estimate the float64
+    # stack size up front and refuse loudly instead.  Raise ``max_stack_bytes``
+    # if you have the RAM, or stitch a subset of frames.
+    _shape = getattr(getattr(frames[0], "map_raw", None), "shape", None)
+    if _shape is None and getattr(frames[0], "_lazy_load_raw", None) is not None:
+        try:
+            frames[0]._lazy_load_raw()
+            _shape = getattr(frames[0].map_raw, "shape", None)
+        except Exception:
+            _shape = None
+    if _shape is not None:
+        est_bytes = len(frames) * int(np.prod(_shape)) * 8  # float64 stack
+        if est_bytes > max_stack_bytes:
+            raise MemoryError(
+                f"Stitch would need ~{est_bytes / 1e9:.1f} GB to hold "
+                f"{len(frames)} frames of {_shape} in memory (limit "
+                f"{max_stack_bytes / 1e9:.1f} GB). pyFAI MultiGeometry "
+                "requires all images at once — stitch fewer frames or raise "
+                "max_stack_bytes if you have the RAM."
+            )
 
     # Per-frame rotations (in degrees, since multi.py expects degrees)
     geom = scan.geometry

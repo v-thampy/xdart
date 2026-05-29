@@ -237,24 +237,28 @@ class DisplayDataMixin:
         if idxs is None:
             idxs = self.idxs_1d
 
-        ydata = None
+        # Collect rows then stack once.  The previous code re-allocated a
+        # growing array with np.vstack on every iteration — O(N^2) over the
+        # frames of a Waterfall/Overlay/Sum/Average; one stack at the end is
+        # O(N).
         xdata = None
+        ys: list = []
         for idx in idxs:
-            arch_1d = self.data_1d.get(int(idx), None)
-            if arch_1d is None:
+            frame_1d = self.data_1d.get(int(idx), None)
+            if frame_1d is None:
                 continue
-            arch_2d = self.data_2d.get(int(idx), None)
-            x, y = self.get_int_1d(arch_1d, arch_2d, idx)
+            frame_2d = self.data_2d.get(int(idx), None)
+            x, y = self.get_int_1d(frame_1d, frame_2d, idx)
             if x is None or y is None:
                 continue
-            if ydata is None:
+            if xdata is None:
                 xdata = x
-                ydata = y
-            else:
-                ydata = np.vstack((ydata, y))
+            ys.append(y)
 
-        if ydata is None:
+        if not ys:
             return None, None
+
+        ydata = ys[0] if len(ys) == 1 else np.vstack(ys)
 
         if ydata.ndim == 2:
             if rv == 'average':
