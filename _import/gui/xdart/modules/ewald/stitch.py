@@ -198,40 +198,30 @@ def run_stitch(
     rot1_deg = rot1_deg[surviving_idx_arr]
     rot2_deg = rot2_deg[surviving_idx_arr]
 
-    from ssrl_xrd_tools.integrate.multi import (
-        create_multigeometry_integrators,
-        stitch_1d,
-        stitch_2d,
-    )
+    # The integrator-build + 1D/2D dispatch lives in ssrl_xrd_tools now
+    # (keep-xdart-thin): this function's job is the LiveScan-specific
+    # gathering above; the stitch orchestration is shared headless code.
+    from ssrl_xrd_tools.integrate.multi import stitch_images
 
-    integrators = create_multigeometry_integrators(
+    result = stitch_images(
+        img_stack,
         base_poni,
-        rot1_angles=rot1_deg,
-        rot2_angles=rot2_deg if np.any(rot2_deg) else None,
+        rot1_deg,
+        rot2_deg,
+        mode=mode,
+        npt_1d=npt_1d,
+        npt_rad_2d=npt_rad_2d,
+        npt_azim_2d=npt_azim_2d,
+        unit=unit,
+        method=method,
+        radial_range=radial_range,
+        azimuth_range=azimuth_range,
+        mask=mask,
     )
-
     if mode == "1d":
-        scan.stitched_1d = stitch_1d(
-            img_stack,
-            integrators,
-            npt=npt_1d,
-            unit=unit,
-            method=method,
-            mask=mask,
-            radial_range=radial_range,
-        )
+        scan.stitched_1d = result
     else:
-        scan.stitched_2d = stitch_2d(
-            img_stack,
-            integrators,
-            npt_rad=npt_rad_2d,
-            npt_azim=npt_azim_2d,
-            unit=unit,
-            method=method,
-            mask=mask,
-            radial_range=radial_range,
-            azimuth_range=azimuth_range,
-        )
+        scan.stitched_2d = result
 
 
 __all__ = ["run_stitch"]
