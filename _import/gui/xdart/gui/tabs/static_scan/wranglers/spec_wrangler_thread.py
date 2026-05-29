@@ -66,7 +66,7 @@ def _raw_lives_in_source(path):
     """Return True if the raw image for ``path`` is already embedded in the
     source file (Eiger master or any HDF5/NeXus container).
 
-    When this is the case, writing ``map_raw`` into the output sphere HDF5
+    When this is the case, writing ``map_raw`` into the output scan HDF5
     is pure duplication and can dominate the per-frame write cost.
     """
     if not path:
@@ -104,7 +104,7 @@ _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
 # contains thousands of frames in a single file (e.g. Bluesky .nxs with
 # a 1000-frame Eiger stack at 2167x2070 int32 ~= 18 GB if collected in
 # one go).  Larger values amortise ThreadPoolExecutor startup and the
-# end-of-batch sphere._save_to_nexus flush across more frames, so raise
+# end-of-batch scan._save_to_nexus flush across more frames, so raise
 # this when RAM allows.
 #
 # 16 frames of a 2167x2070 int32 Eiger image is ~300 MB of peak buffer
@@ -137,7 +137,7 @@ _PREFETCH_QUEUE_SIZE = 4
 _PREFETCH_READ_CHUNK = 16
 
 # File extensions whose raw image data already lives in the source file
-# — no need to duplicate `map_raw` into the output sphere HDF5.  This is
+# — no need to duplicate `map_raw` into the output scan HDF5.  This is
 # the single biggest write-time win for multi-frame NeXus / HDF5 inputs.
 _RAW_EMBEDDED_EXTS = frozenset({'.h5', '.hdf5', '.nxs'})
 
@@ -202,7 +202,7 @@ class specThread(wranglerThread):
         detector: str, Detector name
         input_q: mp.Queue, queue for commands sent from parent
         signal_q: mp.Queue, queue for commands sent from process
-        sphere_args: dict, used as **kwargs in sphere initialization.
+        scan_args: dict, used as **kwargs in scan initialization.
             see LiveScan.
         timeout: float or int, how long to continue checking for new
             data.
@@ -220,7 +220,7 @@ class specThread(wranglerThread):
     def __init__(
             self,
             command_queue,
-            sphere_args,
+            scan_args,
             file_lock,
             fname,
             h5_dir,
@@ -252,14 +252,14 @@ class specThread(wranglerThread):
             gi_mode_1d,
             gi_mode_2d,
             command,
-            sphere,
+            scan,
             data_1d,
             data_2d,
             live_mode=False,
             max_cores=1,
             parent=None):
 
-        super().__init__(command_queue, sphere_args, fname, file_lock, parent)
+        super().__init__(command_queue, scan_args, fname, file_lock, parent)
 
         self.h5_dir = h5_dir
         self.scan_name = scan_name
@@ -297,12 +297,12 @@ class specThread(wranglerThread):
         self.live_mode = live_mode
         # batch_mode / xye_only / apply_threshold / threshold_min /
         # threshold_max / sub_label / _xye_buffer / _xye_lock /
-        # _frames_since_save / _published_arches are all initialised
+        # _frames_since_save / _published_frames are all initialised
         # by the wranglerThread base class — see wrangler_widget.py.
         # specThread only needs to set the spec-specific extras here.
         self.max_cores = max_cores
         self.command = command
-        self.sphere = sphere
+        self.scan = scan
         self.data_1d = data_1d
         self.data_2d = data_2d
 
@@ -395,10 +395,10 @@ class specThread(wranglerThread):
         self.mask = np.flatnonzero(det_mask) if det_mask is not None else None
         self._cached_gi_incident_angle = None
 
-        # Sync GI mode selections from spec_wrangler into sphere.bai_*_args
+        # Sync GI mode selections from spec_wrangler into scan.bai_*_args
         if self.gi:
-            self.sphere.bai_1d_args['gi_mode_1d'] = self.gi_mode_1d
-            self.sphere.bai_2d_args['gi_mode_2d'] = self.gi_mode_2d
+            self.scan.bai_1d_args['gi_mode_1d'] = self.gi_mode_1d
+            self.scan.bai_2d_args['gi_mode_2d'] = self.gi_mode_2d
 
         try:
             self.process_scan()
@@ -416,7 +416,7 @@ class specThread(wranglerThread):
         # Trailing newline gives a visual gap before the next scan's
         # 'New Scan' banner (or before the next prompt if this was the
         # last scan in the session).
-        output_path = getattr(self, 'fname', None) or getattr(self.sphere, 'data_file', None)
+        output_path = getattr(self, 'fname', None) or getattr(self.scan, 'data_file', None)
         if output_path:
             logger.info('Output file: %s\n', output_path)
 
@@ -427,7 +427,7 @@ class specThread(wranglerThread):
         Phase 2 — Process: sequential with cached AzimuthalIntegrator (~0.35 s/frame).
         Phase 3 — Watch (live mode only): poll every 2 s for new files; process each immediately.
         """
-        sphere = None
+        scan = None
         files_processed = 0
         _cached_poni = None
         is_eiger = _is_eiger_master(self.img_file) if self.img_file else False
@@ -466,7 +466,7 @@ class specThread(wranglerThread):
             img_number = 1 if img_number is None else img_number
             self.scan_name = scan_name
 
-            # Flush and switch sphere when scan name changes.
+            # Flush and switch scan when scan name changes.
             #
             # Two save paths matter here, both needed to keep N-1
             # .nxs files from ending up empty in multi-scan mode
@@ -478,54 +478,54 @@ class specThread(wranglerThread):
             #    scan boundary stayed in-memory because the serial
             #    path only writes when ``_frames_since_save >=
             #    LIVE_SAVE_INTERVAL``.
-            # 2. Explicit ``_save_to_nexus`` on the old sphere — covers
+            # 2. Explicit ``_save_to_nexus`` on the old scan — covers
             #    non-batch (live-mode-style) runs where each frame
             #    was already dispatched immediately by the line-529
             #    cadence (``pending`` is empty by the time we get
             #    here), but ``_frames_since_save`` accumulated without
             #    hitting the save interval.  Without this, the old
-            #    sphere's in-memory arches get dropped when
-            #    ``initialize_sphere()`` reassigns the local variable.
+            #    scan's in-memory frames get dropped when
+            #    ``initialize_scan()`` reassigns the local variable.
             #
             # Only the end-of-loop final-flush passed ``force_save``
             # before, which is why only the last scan's file ever
             # got data.
-            if (sphere is None) or (scan_name != sphere.name):
+            if (scan is None) or (scan_name != scan.name):
                 if pending:
                     files_processed += self._dispatch_batch(
-                        sphere, pending, force_save=True,
+                        scan, pending, force_save=True,
                     )
                     pending = []
                 # Catch the case where pending was already drained by
                 # the per-iteration dispatch cadence below: the old
-                # sphere may have integrated-but-unsaved arches in
+                # scan may have integrated-but-unsaved frames in
                 # memory whose save_to_nexus call never fired.
-                if (sphere is not None
+                if (scan is not None
                         and not self.xye_only
                         and self._frames_since_save > 0):
-                    _get_h5pool().pause(sphere.data_file)
+                    _get_h5pool().pause(scan.data_file)
                     try:
                         with self.file_lock:
-                            sphere._save_to_nexus()
+                            scan._save_to_nexus()
                     finally:
-                        _get_h5pool().resume(sphere.data_file)
-                    self._flush_xye_buffer(sphere)
+                        _get_h5pool().resume(scan.data_file)
+                    self._flush_xye_buffer(scan)
                     logger.info(
                         '[SAVE-ON-SWAP] %d frames flushed for %s',
-                        self._frames_since_save, sphere.name,
+                        self._frames_since_save, scan.name,
                     )
                     self._frames_since_save = 0
-                sphere = self.initialize_sphere()
+                scan = self.initialize_scan()
                 _cached_poni = None
 
             # Rebuild cached AzimuthalIntegrator when poni identity changes
             if self.poni is not _cached_poni:
-                sphere._cached_integrator = poni_to_integrator(self.poni)
-                sphere._cached_fiber_integrator = None
+                scan._cached_integrator = poni_to_integrator(self.poni)
+                scan._cached_fiber_integrator = None
                 _cached_poni = self.poni
                 self._cached_gi_incident_angle = None
 
-            if img_number in sphere.arches.index:
+            if img_number in scan.frames.index:
                 if self.single_img and not is_eiger:
                     self.sigUpdate.emit(img_number)
                     break
@@ -555,7 +555,7 @@ class specThread(wranglerThread):
                         f'Integrating {len(pending)} frames (partial batch)...'
                     )
                 _t_disp = time.time()
-                files_processed += self._dispatch_batch(sphere, pending)
+                files_processed += self._dispatch_batch(scan, pending)
                 if self.batch_mode or _t_read_accum >= 0.5:
                     logger.info(
                         '[FLUSH] %d frames  read=%.2fs  dispatch=%.2fs',
@@ -566,31 +566,31 @@ class specThread(wranglerThread):
 
         # Process whatever is left.  force_save=True so any remaining
         # _frames_since_save tail in live mode is flushed to disk.
-        if pending and sphere is not None and self.command != 'stop':
+        if pending and scan is not None and self.command != 'stop':
             _t_disp = time.time()
             files_processed += self._dispatch_batch(
-                sphere, pending, force_save=True,
+                scan, pending, force_save=True,
             )
             logger.info(
                 '[FLUSH-FINAL] %d frames  read=%.2fs  dispatch=%.2fs',
                 len(pending), _t_read_accum, time.time() - _t_disp,
             )
-        elif (sphere is not None and not self.xye_only
+        elif (scan is not None and not self.xye_only
               and self._frames_since_save > 0 and self.command != 'stop'):
             # Pending was empty but the live-save batcher has unflushed
             # frames (last batch hit the divisor exactly).  Force a save
             # before leaving the collect loop.
-            _get_h5pool().pause(sphere.data_file)
+            _get_h5pool().pause(scan.data_file)
             try:
                 with self.file_lock:
-                    sphere._save_to_nexus()
+                    scan._save_to_nexus()
             finally:
-                _get_h5pool().resume(sphere.data_file)
-            self._flush_xye_buffer(sphere)
+                _get_h5pool().resume(scan.data_file)
+            self._flush_xye_buffer(scan)
             self._frames_since_save = 0
 
         # ── Phase 3: live watching ────────────────────────────────────────────
-        if self.live_mode and self.command != 'stop' and sphere is not None:
+        if self.live_mode and self.command != 'stop' and scan is not None:
             self.showLabel.emit('Watching for new files...')
             # Adaptive backoff between filesystem polls.  Starts tight
             # so first-frame latency is small (~100 ms vs the old fixed
@@ -619,47 +619,47 @@ class specThread(wranglerThread):
                 img_number = 1 if img_number is None else img_number
                 self.scan_name = scan_name
 
-                if (sphere is None) or (scan_name != sphere.name):
-                    sphere = self.initialize_sphere()
+                if (scan is None) or (scan_name != scan.name):
+                    scan = self.initialize_scan()
                     _cached_poni = None
 
                 if self.poni is not _cached_poni:
-                    sphere._cached_integrator = poni_to_integrator(self.poni)
-                    sphere._cached_fiber_integrator = None
+                    scan._cached_integrator = poni_to_integrator(self.poni)
+                    scan._cached_fiber_integrator = None
                     _cached_poni = self.poni
                     self._cached_gi_incident_angle = None
 
-                if img_number in sphere.arches.index:
+                if img_number in scan.frames.index:
                     continue
 
                 bg_raw = self.get_background(img_file, img_number, img_meta)
                 # Process immediately — single-threaded for low latency.
-                # _process_one uses add_arch(batch_save=True), so the
+                # _process_one uses add_frame(batch_save=True), so the
                 # disk save still rides on _frames_since_save below.
-                self._process_one(sphere, img_file, img_number, img_data, img_meta, bg_raw)
+                self._process_one(scan, img_file, img_number, img_data, img_meta, bg_raw)
                 files_processed += 1
                 self._frames_since_save += 1
                 if self._frames_since_save >= self.LIVE_SAVE_INTERVAL and not self.xye_only:
-                    _get_h5pool().pause(sphere.data_file)
+                    _get_h5pool().pause(scan.data_file)
                     try:
                         with self.file_lock:
-                            sphere._save_to_nexus()
+                            scan._save_to_nexus()
                     finally:
-                        _get_h5pool().resume(sphere.data_file)
-                    self._flush_xye_buffer(sphere)
+                        _get_h5pool().resume(scan.data_file)
+                    self._flush_xye_buffer(scan)
                     self._frames_since_save = 0
 
         # Final flush on exit (live-watch tail or stop request) so the
         # last few frames aren't lost.
-        if (sphere is not None and not self.xye_only
+        if (scan is not None and not self.xye_only
                 and self._frames_since_save > 0):
-            _get_h5pool().pause(sphere.data_file)
+            _get_h5pool().pause(scan.data_file)
             try:
                 with self.file_lock:
-                    sphere._save_to_nexus()
+                    scan._save_to_nexus()
             finally:
-                _get_h5pool().resume(sphere.data_file)
-            self._flush_xye_buffer(sphere)
+                _get_h5pool().resume(scan.data_file)
+            self._flush_xye_buffer(scan)
             self._frames_since_save = 0
 
         # In batch mode, emit a single final signal so the GUI can refresh
@@ -669,7 +669,7 @@ class specThread(wranglerThread):
 
     # ── Batch dispatch ────────────────────────────────────────────────────────
 
-    def _dispatch_batch(self, sphere, pending, *, force_save=False):
+    def _dispatch_batch(self, scan, pending, *, force_save=False):
         """Process a list of pending images — parallel in batch mode, serial otherwise.
 
         ``force_save`` only affects the serial path (live mode); the
@@ -677,15 +677,15 @@ class specThread(wranglerThread):
         (the whole point of batch mode is one big save per dispatch).
         """
         if self.batch_mode and len(pending) > 1:
-            return self._dispatch_batch_parallel(sphere, pending)
-        return self._dispatch_batch_serial(sphere, pending, force_save=force_save)
+            return self._dispatch_batch_parallel(scan, pending)
+        return self._dispatch_batch_serial(scan, pending, force_save=force_save)
 
-    # ``_resolve_arch_mask``, ``_apply_threshold_inline``, and
+    # ``_resolve_frame_mask``, ``_apply_threshold_inline``, and
     # ``_flush_xye_buffer`` moved to wranglerThread (the base class)
     # in May 2026 — both specThread and nexusThread inherit them now.
     # See xdart/gui/tabs/static_scan/wranglers/wrangler_widget.py.
 
-    def _dispatch_batch_serial(self, sphere, pending, *, force_save=False):
+    def _dispatch_batch_serial(self, scan, pending, *, force_save=False):
         """Sequential dispatch (live mode or single-image batches).
 
         Each frame in ``pending`` gets integrated + GUI-updated
@@ -701,7 +701,7 @@ class specThread(wranglerThread):
             if self.command == 'stop':
                 break
             # item is (img_file, img_number, img_data, img_meta, bg_raw, t_read)
-            self._process_one(sphere, *item)
+            self._process_one(scan, *item)
             count += 1
 
         self._frames_since_save += count
@@ -712,15 +712,15 @@ class specThread(wranglerThread):
         )
         if should_save and self._frames_since_save > 0:
             _t_save0 = time.time()
-            _get_h5pool().pause(sphere.data_file)
+            _get_h5pool().pause(scan.data_file)
             try:
                 with self.file_lock:
-                    sphere._save_to_nexus()
+                    scan._save_to_nexus()
             finally:
-                _get_h5pool().resume(sphere.data_file)
+                _get_h5pool().resume(scan.data_file)
             _t_save = time.time() - _t_save0
             _t_xye0 = time.time()
-            self._flush_xye_buffer(sphere)
+            self._flush_xye_buffer(scan)
             _t_xye = time.time() - _t_xye0
             logger.info(
                 '[SAVE] %d frames since last save  save=%.3fs  xye=%.3fs',
@@ -729,14 +729,14 @@ class specThread(wranglerThread):
             self._frames_since_save = 0
         return count
 
-    def _prewarm_fiber_integrator_spec(self, sphere, pending_entry) -> None:
-        """Build ``sphere._cached_fiber_integrator`` from the first
+    def _prewarm_fiber_integrator_spec(self, scan, pending_entry) -> None:
+        """Build ``scan._cached_fiber_integrator`` from the first
         pending frame.
 
         O5: mirrors :meth:`nexusThread._prewarm_fiber_integrator` —
-        builds a throw-away arch from the first frame, computes its
+        builds a throw-away frame from the first frame, computes its
         incidence angle, and seeds the fiber integrator on the
-        sphere.  After this call ``_dispatch_batch_parallel`` can
+        scan.  After this call ``_dispatch_batch_parallel`` can
         build a fiber pool so every worker borrows a deep-copied
         instance instead of constructing a fresh one per frame.
 
@@ -751,10 +751,10 @@ class specThread(wranglerThread):
         """
         if not self.gi:
             return
-        if sphere._cached_fiber_integrator is not None:
+        if scan._cached_fiber_integrator is not None:
             return
         img_file, img_number, img_data, img_meta, bg_raw, _ = pending_entry
-        # Build a scratch arch identical in shape to what
+        # Build a scratch frame identical in shape to what
         # ``_process_one`` constructs so the angle math agrees.
         scratch = LiveFrame(
             img_number, img_data, poni=self.poni,
@@ -763,10 +763,10 @@ class specThread(wranglerThread):
             sample_orientation=self.sample_orientation,
             tilt_angle=self.tilt_angle,
             series_average=self.series_average,
-            integrator=sphere._cached_integrator,
+            integrator=scan._cached_integrator,
         )
         incident_angle = scratch._get_incident_angle()
-        sphere._cached_fiber_integrator = create_fiber_integrator(
+        scan._cached_fiber_integrator = create_fiber_integrator(
             scratch._poni_from_integrator(),
             incident_angle=incident_angle,
             tilt_angle=scratch.tilt_angle,
@@ -779,16 +779,16 @@ class specThread(wranglerThread):
         # locally-built fiber integrator at the right angle.
         self._cached_gi_incident_angle = incident_angle
         # Q3: ``_borrow_fiber_integrator`` (the shared helper used
-        # by parallel workers) looks the angle up on the *sphere*,
+        # by parallel workers) looks the angle up on the *scan*,
         # not on the wrangler instance, because it doesn't have a
         # handle to the wrangler.  The NeXus prewarm sets the
-        # sphere attribute too; pre-Q3 the SPEC prewarm only set
+        # scan attribute too; pre-Q3 the SPEC prewarm only set
         # the wrangler attribute, so the borrow helper always saw
         # cached_angle=None and built worker-local FiberIntegrators
         # per frame — defeating the pool we just constructed.
-        sphere._cached_fiber_integrator_angle = incident_angle
+        scan._cached_fiber_integrator_angle = incident_angle
 
-    def _dispatch_batch_parallel(self, sphere, pending):
+    def _dispatch_batch_parallel(self, scan, pending):
         """Parallel batch processing using ThreadPoolExecutor.
 
         Phase 1 — Parallel integration:
@@ -797,7 +797,7 @@ class specThread(wranglerThread):
             so threads get true parallelism for the CPU-heavy part.
 
         Phase 2 — Serial HDF5 write:
-            All completed arches are written to HDF5 under a single file_lock
+            All completed frames are written to HDF5 under a single file_lock
             acquisition.  Skipped entirely in xye_only mode.
         """
         n_workers = min(self.max_cores, len(pending))
@@ -805,19 +805,19 @@ class specThread(wranglerThread):
         # pyFAI's AzimuthalIntegrator isn't thread-safe across workers
         # with different inputs.  See xdart.utils.integrator_pool.
         integrator_pool = ensure_integrator_pool(
-            sphere, '_cached_integrator', n_workers,
+            scan, '_cached_integrator', n_workers,
         )
         if integrator_pool is None:
             # No cached integrator yet — fall back to serial dispatch
             # (the source integrator gets built on the first call).
-            return self._dispatch_batch_serial(sphere, pending)
+            return self._dispatch_batch_serial(scan, pending)
         # F3: prewarm the bad-pixel mask on the main thread before
         # any worker reads it, so cache initialization isn't racy.
         # ``pending`` tuple shape: (img_file, img_number, img_data,
         # img_meta, bg_raw, t_read) — index 2 is the image.
-        if (getattr(sphere, '_cached_data_mask', None) is None
+        if (getattr(scan, '_cached_data_mask', None) is None
                 and pending):
-            self._prewarm_arch_mask(sphere, pending[0][2])
+            self._prewarm_frame_mask(scan, pending[0][2])
         # O5: prewarm the fiber integrator from the first pending
         # frame so the per-worker fiber_pool below is non-None.
         # Without this every worker built its own fiber integrator
@@ -826,10 +826,10 @@ class specThread(wranglerThread):
         # ``_prewarm_fiber_integrator`` path the NeXus wrangler
         # already runs before its parallel section.
         if (self.gi
-                and sphere._cached_fiber_integrator is None
+                and scan._cached_fiber_integrator is None
                 and pending):
             try:
-                self._prewarm_fiber_integrator_spec(sphere, pending[0])
+                self._prewarm_fiber_integrator_spec(scan, pending[0])
             except Exception as e:
                 # Fall through: workers still build their own fiber
                 # integrators per frame, just without the speedup.
@@ -844,14 +844,14 @@ class specThread(wranglerThread):
         # build in those cases.
         fiber_pool = (
             ensure_integrator_pool(
-                sphere, '_cached_fiber_integrator', n_workers,
+                scan, '_cached_fiber_integrator', n_workers,
                 pool_attr='_cached_fiber_integrator_pool',
             )
-            if self.gi and sphere._cached_fiber_integrator is not None
+            if self.gi and scan._cached_fiber_integrator is not None
             else None
         )
         # Capture the angle the prewarmed fiber integrator was built
-        # for.  When ``gi`` is on and a per-frame arch's incidence
+        # for.  When ``gi`` is on and a per-frame frame's incidence
         # angle drifts from this (i.e. ω varies across the scan, as
         # opposed to a sin²ψ-style fixed-ω χ/φ scan), the worker has
         # to fall back to a worker-local fiber integrator built at
@@ -861,12 +861,12 @@ class specThread(wranglerThread):
         # and well below pyFAI's solid-angle sensitivity.
         cached_gi_angle = self._cached_gi_incident_angle
         _GI_ANGLE_TOL = 1e-4
-        skip_2d = sphere.skip_2d
-        bai_1d_args = dict(sphere.bai_1d_args)
-        bai_2d_args = dict(sphere.bai_2d_args)
+        skip_2d = scan.skip_2d
+        bai_1d_args = dict(scan.bai_1d_args)
+        bai_2d_args = dict(scan.bai_2d_args)
         mask = self.mask
         gi = self.gi
-        standard_plan = self._plan_cache.get(sphere, integrate_2d=not skip_2d)
+        standard_plan = self._plan_cache.get(scan, integrate_2d=not skip_2d)
         th_mtr = self.incidence_motor
         sample_orientation = self.sample_orientation
         tilt_angle = self.tilt_angle
@@ -888,11 +888,11 @@ class specThread(wranglerThread):
                 return None
             _t0 = time.time()
             # Threshold filtering: replace out-of-band pixels with the
-            # dummy sentinel in a fresh float32 copy.  The arch mask
+            # dummy sentinel in a fresh float32 copy.  The frame mask
             # stays stable (cached from frame 1) so pyFAI's CSR engine
             # cache survives across frames.
             img_data = self._apply_threshold_inline(img_data)
-            arch_mask = self._resolve_arch_mask(sphere, img_data)
+            frame_mask = self._resolve_frame_mask(scan, img_data)
 
             # Borrow a private integrator for the duration of this
             # frame's integration.  When the worker exits the `with`
@@ -901,7 +901,7 @@ class specThread(wranglerThread):
             # one worker at a time — that's what makes parallel
             # batch correct vs the old shared-instance code path.
             with integrator_pool.borrow() as ai:
-                arch = LiveFrame(
+                frame = LiveFrame(
                     img_number, img_data, poni=self.poni,
                     scan_info=img_meta, static=True, gi=gi,
                     th_mtr=th_mtr, bg_raw=bg_raw,
@@ -909,50 +909,50 @@ class specThread(wranglerThread):
                     tilt_angle=tilt_angle,
                     series_average=series_average,
                     integrator=ai,
-                    mask=arch_mask,
+                    mask=frame_mask,
                 )
 
                 # H2 + S3 unified dispatch.  When ``standard_plan`` is
-                # None (GI sphere) we run the fiber-integrator path
+                # None (GI scan) we run the fiber-integrator path
                 # inside the legacy_gi closure; otherwise the headless
                 # ``reduce_live_frame`` handles it.
-                def _legacy_gi_for_arch() -> None:
+                def _legacy_gi_for_frame() -> None:
                     with self._borrow_fiber_integrator(
-                        sphere, fiber_pool, arch,
+                        scan, fiber_pool, frame,
                     ) as _fi:
-                        arch.integrate_1d(
+                        frame.integrate_1d(
                             global_mask=mask,
                             fiber_integrator=_fi,
                             **bai_1d_args,
                         )
                         if not skip_2d:
-                            arch.integrate_2d(
+                            frame.integrate_2d(
                                 global_mask=mask,
                                 fiber_integrator=_fi,
                                 **bai_2d_args,
                             )
 
                 dispatch_live_frame_reduction(
-                    arch, sphere,
+                    frame, scan,
                     standard_plan=standard_plan,
                     integrator=ai,
                     global_mask=mask,
-                    legacy_gi=_legacy_gi_for_arch,
+                    legacy_gi=_legacy_gi_for_frame,
                 )
 
-            # Detach the pool integrator from this arch — once the
+            # Detach the pool integrator from this frame — once the
             # `with` block exited, the next worker can borrow this
             # same instance and start mutating it.  Replace with the
-            # sphere's source integrator (which the pool never hands
+            # scan's source integrator (which the pool never hands
             # out, so it's safe to share with non-parallel consumers).
-            arch.integrator = sphere._cached_integrator
+            frame.integrator = scan._cached_integrator
 
             # Precompute the raw-image thumbnail here, in parallel with
             # other workers' integrations, rather than on the serial Phase 2
             # writer thread.  scipy.ndimage.zoom and numpy subtract release
             # the GIL for their C code, so this overlaps cleanly.
             try:
-                arch.make_thumbnail(global_mask=mask)
+                frame.make_thumbnail(global_mask=mask)
             except Exception as e:
                 logger.warning('Thumbnail precompute failed for image %s: %s',
                                img_number, e)
@@ -962,12 +962,12 @@ class specThread(wranglerThread):
             # groups disk traffic so it doesn't interleave with the
             # next batch's integration.
             with self._xye_lock:
-                self._xye_buffer.append((img_number, arch))
+                self._xye_buffer.append((img_number, frame))
 
             _elapsed = time.time() - _t0
             fname = os.path.splitext(os.path.basename(img_file))[0]
             logger.info('[PARALLEL] image_%04d (%s): %.2fs', img_number, fname[-30:], _elapsed)
-            return arch
+            return frame
 
         # ── Phase 1: parallel integration ────────────────────────────────────
         # Shared base helper handles ThreadPoolExecutor wiring,
@@ -976,7 +976,7 @@ class specThread(wranglerThread):
         # share this primitive.
         self.showLabel.emit(f'Integrating {len(pending)} images ({n_workers} workers)...')
         _t_phase1 = time.time()
-        arches = self._parallel_integrate(
+        frames = self._parallel_integrate(
             pending,
             lambda item: _integrate_one(*item),
             n_workers,
@@ -984,35 +984,35 @@ class specThread(wranglerThread):
         )
         _t_phase1 = time.time() - _t_phase1
         logger.info('[BATCH] Phase 1 (parallel integration): %d frames in %.2fs',
-                    len(arches), _t_phase1)
+                    len(frames), _t_phase1)
 
-        if not arches:
+        if not frames:
             return 0
 
         # ── Phase 2: serial HDF5 batch write ─────────────────────────────────
         if not self.xye_only:
-            self.showLabel.emit(f'Writing {len(arches)} frames to HDF5...')
+            self.showLabel.emit(f'Writing {len(frames)} frames to HDF5...')
             _t_phase2 = time.time()
             # img_number → img_file lookup for NeXus provenance.  Keyed
-            # on arch.idx (== img_number) so the lookup matches the
-            # arch-only result list returned by _parallel_integrate.
+            # on frame.idx (== img_number) so the lookup matches the
+            # frame-only result list returned by _parallel_integrate.
             _img_files = {item[1]: item[0] for item in pending}
-            _get_h5pool().pause(sphere.data_file)
+            _get_h5pool().pause(scan.data_file)
             try:
                 with self.file_lock:
                     # Phase 2a: in-memory accumulation only (batch_save=True
-                    # makes add_arch a pure in-memory op; no file I/O).
-                    for arch in arches:
-                        img_number = arch.idx
+                    # makes add_frame a pure in-memory op; no file I/O).
+                    for frame in frames:
+                        img_number = frame.idx
                         img_file = _img_files.get(img_number, '')
                         if img_file:
                             try:
-                                arch.source_file = os.path.relpath(
-                                    img_file, os.path.dirname(sphere.data_file))
+                                frame.source_file = os.path.relpath(
+                                    img_file, os.path.dirname(scan.data_file))
                             except ValueError:
-                                arch.source_file = str(img_file)
+                                frame.source_file = str(img_file)
                         else:
-                            arch.source_file = ""
+                            frame.source_file = ""
                         # source_frame_idx is the *per-source-file*
                         # 0-based frame offset, which lazy raw load
                         # passes to NexusImageStack(source_file)[idx].
@@ -1026,13 +1026,13 @@ class specThread(wranglerThread):
                         # reload + lazy raw read on Eiger always
                         # returned frame 0 — silently wrong.
                         if _raw_lives_in_source(img_file):
-                            arch.source_frame_idx = int(img_number) - 1
+                            frame.source_frame_idx = int(img_number) - 1
                         else:
-                            arch.source_frame_idx = 0
-                        arch.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
+                            frame.source_frame_idx = 0
+                        frame.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
 
-                        sphere.add_arch(
-                            arch=arch, calculate=False, update=True,
+                        scan.add_frame(
+                            frame=frame, calculate=False, update=True,
                             get_sd=True, set_mg=False, static=True, gi=gi,
                             th_mtr=th_mtr, series_average=series_average,
                             batch_save=True,
@@ -1040,26 +1040,26 @@ class specThread(wranglerThread):
                     # Phase 2b: single batch flush — one slice-assign per
                     # stacked dataset for all frames in this batch.
                     # The writer owns its file handle now.
-                    sphere._save_to_nexus()
+                    scan._save_to_nexus()
             finally:
-                _get_h5pool().resume(sphere.data_file)
+                _get_h5pool().resume(scan.data_file)
             _t_phase2 = time.time() - _t_phase2
-            logger.info('[BATCH] Phase 2 (HDF5 write): %d frames in %.2fs', len(arches), _t_phase2)
+            logger.info('[BATCH] Phase 2 (HDF5 write): %d frames in %.2fs', len(frames), _t_phase2)
 
         # Flush buffered XYE writes for this batch.  P3: pass the
-        # set of arch.idx values that actually landed in .nxs so
+        # set of frame.idx values that actually landed in .nxs so
         # in-flight workers from a Stop'd batch don't leave orphan
         # XYE files for frames that were never published.
         _t_xye = time.time()
-        published_idxs = {a.idx for a in arches}
-        self._flush_xye_buffer(sphere, published_idxs=published_idxs)
+        published_idxs = {a.idx for a in frames}
+        self._flush_xye_buffer(scan, published_idxs=published_idxs)
         _t_xye = time.time() - _t_xye
         if _t_xye > 0.01:
-            logger.info('[BATCH] XYE flush: %d frames in %.2fs', len(arches), _t_xye)
+            logger.info('[BATCH] XYE flush: %d frames in %.2fs', len(frames), _t_xye)
 
-        return len(arches)
+        return len(frames)
 
-    def _process_one(self, sphere, img_file, img_number, img_data, img_meta,
+    def _process_one(self, scan, img_file, img_number, img_data, img_meta,
                      bg_raw, t_read=0.0):
         """Integrate one image sequentially and save. Includes timing instrumentation.
 
@@ -1083,30 +1083,30 @@ class specThread(wranglerThread):
 
         _t1 = time.time()
         # Threshold via dummy sentinel + stable cached mask — see
-        # _apply_threshold_inline / _resolve_arch_mask docstrings for
+        # _apply_threshold_inline / _resolve_frame_mask docstrings for
         # why this is fast even with per-frame threshold filtering on.
         img_data = self._apply_threshold_inline(img_data)
-        arch_mask = self._resolve_arch_mask(sphere, img_data)
-        arch = LiveFrame(
+        frame_mask = self._resolve_frame_mask(scan, img_data)
+        frame = LiveFrame(
             img_number, img_data, poni=self.poni,
             scan_info=img_meta, static=True, gi=self.gi,
             th_mtr=self.incidence_motor, bg_raw=bg_raw,
             sample_orientation=self.sample_orientation,
             tilt_angle=self.tilt_angle,
             series_average=self.series_average,
-            integrator=sphere._cached_integrator,
-            mask=arch_mask,
+            integrator=scan._cached_integrator,
+            mask=frame_mask,
         )
-        _t_arch = time.time() - _t1
+        _t_frame = time.time() - _t1
 
         if self.gi:
-            _incident_angle = arch._get_incident_angle()
-            if (sphere._cached_fiber_integrator is None
+            _incident_angle = frame._get_incident_angle()
+            if (scan._cached_fiber_integrator is None
                     or _incident_angle != self._cached_gi_incident_angle):
-                sphere._cached_fiber_integrator = create_fiber_integrator(
-                    arch._poni_from_integrator(),
+                scan._cached_fiber_integrator = create_fiber_integrator(
+                    frame._poni_from_integrator(),
                     incident_angle=_incident_angle,
-                    tilt_angle=arch.tilt_angle,
+                    tilt_angle=frame.tilt_angle,
                     sample_orientation=self.sample_orientation,
                     angle_unit="deg",
                 )
@@ -1115,24 +1115,24 @@ class specThread(wranglerThread):
         _t2 = time.time()
 
         def _legacy_gi_for_single() -> None:
-            arch.integrate_1d(
+            frame.integrate_1d(
                 global_mask=self.mask,
-                fiber_integrator=sphere._cached_fiber_integrator,
-                **sphere.bai_1d_args,
+                fiber_integrator=scan._cached_fiber_integrator,
+                **scan.bai_1d_args,
             )
-            if not sphere.skip_2d:
-                arch.integrate_2d(
+            if not scan.skip_2d:
+                frame.integrate_2d(
                     global_mask=self.mask,
-                    fiber_integrator=sphere._cached_fiber_integrator,
-                    **sphere.bai_2d_args,
+                    fiber_integrator=scan._cached_fiber_integrator,
+                    **scan.bai_2d_args,
                 )
 
         dispatch_live_frame_reduction(
-            arch, sphere,
+            frame, scan,
             standard_plan=self._plan_cache.get(
-                sphere, integrate_2d=not sphere.skip_2d,
+                scan, integrate_2d=not scan.skip_2d,
             ),
-            integrator=sphere._cached_integrator,
+            integrator=scan._cached_integrator,
             global_mask=self.mask,
             legacy_gi=_legacy_gi_for_single,
         )
@@ -1145,13 +1145,13 @@ class specThread(wranglerThread):
         # ── GUI data (skip in batch mode — no one is looking) ────────────
         _t_h5_total = _t_h5_wait = _t_h5_write = 0.0
         if not self.batch_mode:
-            self.data_1d[int(img_number)] = arch.copy(include_2d=False)
+            self.data_1d[int(img_number)] = frame.copy(include_2d=False)
             self.data_2d[int(img_number)] = {
-                'map_raw': arch.map_raw,
-                'bg_raw': arch.bg_raw,
-                'mask': arch.mask,
-                'int_2d': arch.int_2d,
-                'gi_2d': arch.gi_2d,
+                'map_raw': frame.map_raw,
+                'bg_raw': frame.bg_raw,
+                'mask': frame.mask,
+                'int_2d': frame.int_2d,
+                'gi_2d': frame.gi_2d,
                 'thumbnail': None,
             }
 
@@ -1160,28 +1160,28 @@ class specThread(wranglerThread):
             # Set source file as relative path from HDF5 dir for NeXus provenance
             if img_file:
                 try:
-                    arch.source_file = os.path.relpath(
-                        img_file, os.path.dirname(sphere.data_file))
+                    frame.source_file = os.path.relpath(
+                        img_file, os.path.dirname(scan.data_file))
                 except ValueError:
-                    arch.source_file = str(img_file)
+                    frame.source_file = str(img_file)
             else:
-                arch.source_file = ""
+                frame.source_file = ""
             # source_frame_idx: per-source-file 0-based frame offset.
             # See the matching block in ``_dispatch_batch_parallel``
             # for the full rationale.  Eiger / HDF5 masters get
             # ``img_number - 1``; everything else stays at 0.
             if _raw_lives_in_source(img_file):
-                arch.source_frame_idx = int(img_number) - 1
+                frame.source_frame_idx = int(img_number) - 1
             else:
-                arch.source_frame_idx = 0
+                frame.source_frame_idx = 0
             # For Eiger: raw frames already live in the master file — don't double-store them.
-            arch.skip_map_raw = sphere.skip_2d or _raw_lives_in_source(img_file)
+            frame.skip_map_raw = scan.skip_2d or _raw_lives_in_source(img_file)
             _t4 = time.time()
             # batch_save=True → pure in-memory (stash + index + bai_*).
-            # The serial dispatcher calls sphere._save_to_nexus once at
+            # The serial dispatcher calls scan._save_to_nexus once at
             # end-of-batch, so we don't pay per-frame write cost here.
-            sphere.add_arch(
-                arch=arch, calculate=False, update=True,
+            scan.add_frame(
+                frame=frame, calculate=False, update=True,
                 get_sd=True, set_mg=False, static=True, gi=self.gi,
                 th_mtr=self.incidence_motor, series_average=self.series_average,
                 batch_save=True,
@@ -1193,13 +1193,13 @@ class specThread(wranglerThread):
         # ── XYE buffer (flushed at end of batch by the dispatcher) ──────
         _t5 = time.time()
         with self._xye_lock:
-            self._xye_buffer.append((img_number, arch))
+            self._xye_buffer.append((img_number, frame))
         _t_csv = time.time() - _t5
 
-        _t_total = t_read + _t_arch + _t_1d + _t_2d + _t_h5_total + _t_csv
+        _t_total = t_read + _t_frame + _t_1d + _t_2d + _t_h5_total + _t_csv
         # Merged per-frame line: timing + the user-facing "processed
         # <file>" annotation.  3-decimal precision so sub-10ms
-        # components (in-memory add_arch, XYE buffer append) don't
+        # components (in-memory add_frame, XYE buffer append) don't
         # round to 0.00.  For multi-frame containers (.h5/.hdf5/.nxs)
         # the label is "<master> frame N" — the frame number is
         # already explicit there, so we drop the redundant
@@ -1211,10 +1211,10 @@ class specThread(wranglerThread):
             _label = f'image_{img_number:04d} {fname}'
         _sub = f' {self.sub_label}' if self.sub_label else ''
         logger.info(
-            '[TIMING] %s: read=%.3fs arch_init=%.3fs '
-            'int_1d=%.3fs int_2d=%.3fs add_arch=%.3fs csv=%.3fs '
+            '[TIMING] %s: read=%.3fs frame_init=%.3fs '
+            'int_1d=%.3fs int_2d=%.3fs add_frame=%.3fs csv=%.3fs '
             'total=%.3fs%s',
-            _label, t_read, _t_arch, _t_1d, _t_2d,
+            _label, t_read, _t_frame, _t_1d, _t_2d,
             _t_h5_total, _t_csv, _t_total, _sub,
         )
         # In batch mode, suppress per-frame GUI signals — emit once at end
@@ -1222,10 +1222,10 @@ class specThread(wranglerThread):
         # exists precisely to skip GUI work during the run and let
         # the wrangler focus on integration throughput.
         if not self.batch_mode:
-            # Publish the freshly-integrated arch so the main thread can
+            # Publish the freshly-integrated frame so the main thread can
             # consume it without going back to disk.  See
             # static_scan_widget.update_data for the consumer side.
-            self._published_arches[img_number] = arch
+            self._published_frames[img_number] = frame
             self.sigUpdate.emit(img_number)
 
     # ── Eiger HDF5 helpers ────────────────────────────────────────────────
@@ -1709,7 +1709,7 @@ class specThread(wranglerThread):
         except ValueError:
             pass
 
-    def initialize_sphere(self):
+    def initialize_scan(self):
         """If scan changes, initialize new LiveScan object.
         If mode is overwrite, replace existing HDF5 file, else append to it.
         """
@@ -1718,11 +1718,11 @@ class specThread(wranglerThread):
         # ``_master`` suffix stripped from scan_name (see
         # _get_next_eiger_frame). Without this sync, the wrangler
         # widget's self.fname (set from the original master filename
-        # in spec_wrangler.setup()) diverges from the actual sphere
+        # in spec_wrangler.setup()) diverges from the actual scan
         # output path, and static_scan_widget.wrangler_finished
         # cannot find the generated file to reload at end of batch.
         self.fname = fname
-        sphere = LiveScan(self.scan_name,
+        scan = LiveScan(self.scan_name,
                           data_file=fname,
                           static=True,
                           gi=self.gi,
@@ -1732,39 +1732,39 @@ class specThread(wranglerThread):
                           global_mask=self.mask,
                           # J2: share lock with wrangler save path
                           file_lock=self.file_lock,
-                          **self.sphere_args)
-        sphere.skip_2d = self.sphere.skip_2d
+                          **self.scan_args)
+        scan.skip_2d = self.scan.skip_2d
         # v2 NeXus writer needs a DiffractometerGeometry to derive per-frame
         # rot1/rot2/rot3 and incidence-angle arrays from scan_data.  The
         # default is a two-circle convention using `tth` (detector arm) and
         # whatever `th_mtr` resolves to (sample tilt).  Override later from
         # the geometry UI panel when the user picks a non-default convention.
-        sphere.default_geometry()
+        scan.default_geometry()
 
         write_mode = self.write_mode
         if not os.path.exists(fname):
             write_mode = 'Overwrite'
 
-        _get_h5pool().pause(sphere.data_file)
+        _get_h5pool().pause(scan.data_file)
         try:
             with self.file_lock:
                 if write_mode == 'Append':
                     # v2 NeXus loader (the only one we support now).
-                    sphere.load_from_h5(replace=False, mode='a')
-                    sphere.skip_2d = self.sphere.skip_2d
-                    for (k, v) in self.sphere_args.items():
-                        setattr(sphere, k, v)
-                    existing_arches = sphere.arches.index
-                    if len(existing_arches) == 0:
-                        sphere.save_to_nexus(replace=True)
+                    scan.load_from_h5(replace=False, mode='a')
+                    scan.skip_2d = self.scan.skip_2d
+                    for (k, v) in self.scan_args.items():
+                        setattr(scan, k, v)
+                    existing_frames = scan.frames.index
+                    if len(existing_frames) == 0:
+                        scan.save_to_nexus(replace=True)
                 else:
-                    sphere.save_to_nexus(replace=True)
+                    scan.save_to_nexus(replace=True)
         finally:
-            _get_h5pool().resume(sphere.data_file)
+            _get_h5pool().resume(scan.data_file)
 
-        # Copy integration args (including GI modes) from the main sphere.
-        sphere.bai_1d_args = self.sphere.bai_1d_args.copy()
-        sphere.bai_2d_args = self.sphere.bai_2d_args.copy()
+        # Copy integration args (including GI modes) from the main scan.
+        scan.bai_1d_args = self.scan.bai_1d_args.copy()
+        scan.bai_2d_args = self.scan.bai_2d_args.copy()
 
         self.sigUpdateFile.emit(
             self.scan_name, fname,
@@ -1774,7 +1774,7 @@ class specThread(wranglerThread):
         logger.info('***** New Scan *****')
         logger.info('Output file: %s', fname)
 
-        return sphere
+        return scan
 
     def get_mask(self):
         """Get mask array from mask file."""

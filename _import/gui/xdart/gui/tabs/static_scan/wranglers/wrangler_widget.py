@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # story (lessons 2, 3 in particular).
 _THRESHOLD_NAN = np.float32(np.nan)
 
-# Default cadence: flush sphere state to disk every N frames in batch
+# Default cadence: flush scan state to disk every N frames in batch
 # / live modes.  Subclasses can override per-instance via the
 # ``LIVE_SAVE_INTERVAL`` attribute if they want a different rhythm.
 _LIVE_SAVE_INTERVAL = 8
@@ -53,7 +53,7 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         fname: str, path to data file
         parameters: pyqtgraph Parameter, stores parameters from user
         scan_name: str, current scan name, used to handle syncing data
-        sphere_args: dict, used as **kwargs in sphere initialization.
+        scan_args: dict, used as **kwargs in scan initialization.
             see LiveScan.
         thread: wranglerThread or subclass, QThread for controlling
             processes
@@ -67,7 +67,7 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         finished: Should be connected to thread.finished signal
         sigStart: Tells tthetaWidget to start the thread and prepare
             for new data.
-        sigUpdateData: int, signals a new arch has been added.
+        sigUpdateData: int, signals a new frame has been added.
         sigUpdateFile: (str, str, bool, str, bool, bool), sends new scan_name, file name
             GI flag (grazing incidence), theta motor for GI, single_image and
             series_average flag to static_scan_Widget.
@@ -91,10 +91,10 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         self.parameters = Parameter.create(
             name='wrangler_widget', type='int', value=0
         )
-        self.sphere_args = {}
+        self.scan_args = {}
 
         self.command_queue = Queue()
-        self.thread = wranglerThread(self.command_queue, self.sphere_args, self.fname, self.file_lock, self)
+        self.thread = wranglerThread(self.command_queue, self.scan_args, self.fname, self.file_lock, self)
         self.thread.finished.connect(self.finished.emit)
         self.thread.started.connect(self.started.emit)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
@@ -119,7 +119,7 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
             self.thread.sigUpdateGI.disconnect(self.sigUpdateGI.emit)
         except (TypeError, RuntimeError):
             pass  # Signals were never connected or already disconnected
-        self.thread = wranglerThread(self.command_queue, self.sphere_args, self.fname, self.file_lock, self)
+        self.thread = wranglerThread(self.command_queue, self.scan_args, self.fname, self.file_lock, self)
         self.thread.finished.connect(self.finished.emit)
         self.thread.started.connect(self.started.emit)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
@@ -147,14 +147,14 @@ class wranglerThread(Qt.QtCore.QThread):
         fname: str, path to data file.
         input_q: mp.Queue, queue for commands sent from parent
         signal_q: mp.Queue, queue for commands sent from process
-        sphere_args: dict, used as **kwargs in sphere initialization.
+        scan_args: dict, used as **kwargs in scan initialization.
             see LiveScan.
     
     methods:
         run: Called by start, main thread task.
     
     signals:
-        sigUpdate: int, signals a new arch has been added.
+        sigUpdate: int, signals a new frame has been added.
         sigUpdateFile: (str, str, bool, str, bool, bool), sends new scan_name, file name
             GI flag (grazing incidence), theta motor for GI, single_image and
             series_average flag to static_scan_Widget.
@@ -171,17 +171,17 @@ class wranglerThread(Qt.QtCore.QThread):
     # subclass's dispatch loop.
     LIVE_SAVE_INTERVAL = _LIVE_SAVE_INTERVAL
 
-    def __init__(self, command_queue, sphere_args, fname, file_lock,
+    def __init__(self, command_queue, scan_args, fname, file_lock,
                  parent=None):
         """command_queue: mp.Queue, queue for commands sent from parent
-        sphere_args: dict, used as **kwargs in sphere initialization.
+        scan_args: dict, used as **kwargs in scan initialization.
             see LiveScan.
         fname: str, path to data file.
         file_lock: mp.Condition, process safe lock for file access
         """
         super().__init__(parent)
         self.input_q = command_queue # thread queue
-        self.sphere_args = sphere_args
+        self.scan_args = scan_args
         self.fname = fname
         self.file_lock = file_lock
         self.signal_q = Queue()
@@ -201,10 +201,10 @@ class wranglerThread(Qt.QtCore.QThread):
         # _save_to_disk fires.
         self._frames_since_save = 0
 
-        # In-memory hand-off of just-integrated arches to the main
+        # In-memory hand-off of just-integrated frames to the main
         # thread so it doesn't have to round-trip through disk.  The
         # main thread's update_data consumes this dict.
-        self._published_arches: dict = {}
+        self._published_frames: dict = {}
 
         # Threshold filtering — subclass sets these from its UI; the
         # base default is "no threshold" so nexus / other wranglers
@@ -280,11 +280,11 @@ class wranglerThread(Qt.QtCore.QThread):
 
     # ── Shared batch helpers ────────────────────────────────────────
 
-    def _resolve_arch_mask(self, sphere, img_data):
-        """Return a stable per-scan "bad pixel" mask cached on the sphere.
+    def _resolve_frame_mask(self, scan, img_data):
+        """Return a stable per-scan "bad pixel" mask cached on the scan.
 
         Computed once from ``img_data < 0`` of the first frame seen
-        by this sphere; reused for every subsequent frame.  Keeping
+        by this scan; reused for every subsequent frame.  Keeping
         the mask stable across frames is what lets pyFAI's CSR
         engine cache stay valid — a single pixel changing in the
         mask invalidates the cache and forces a ~250 ms LUT rebuild
@@ -296,7 +296,7 @@ class wranglerThread(Qt.QtCore.QThread):
         (NaN-sentinel in the data, mask CRC unchanged).
 
         F3: callers in the parallel section should pre-warm the
-        cache via :meth:`_prewarm_arch_mask` on the main thread
+        cache via :meth:`_prewarm_frame_mask` on the main thread
         BEFORE submitting work, so the cache is fully populated
         when N workers read it.  Without the prewarm, the first N
         workers all see ``None`` and race to write the same value —
@@ -304,25 +304,25 @@ class wranglerThread(Qt.QtCore.QThread):
         but the invariant isn't enforced by the code and a future
         change (e.g. per-worker thresholding) could break it.
         """
-        cached = getattr(sphere, '_cached_data_mask', None)
+        cached = getattr(scan, '_cached_data_mask', None)
         if cached is None:
             try:
                 cached = np.arange(img_data.size)[
                     np.asarray(img_data).flatten() < 0
                 ]
             except (AttributeError, TypeError, ValueError) as e:
-                logger.debug("arch-mask compute failed: %s", e)
+                logger.debug("frame-mask compute failed: %s", e)
                 cached = None
-            sphere._cached_data_mask = cached
+            scan._cached_data_mask = cached
         return cached
 
     @staticmethod
     @contextmanager
-    def _borrow_fiber_integrator(sphere, fiber_pool, arch,
+    def _borrow_fiber_integrator(scan, fiber_pool, frame,
                                  *, angle_tol: float = 1e-4):
         """H2 fiber-integrator borrow.
 
-        Yields a :class:`FiberIntegrator` for this arch's incidence
+        Yields a :class:`FiberIntegrator` for this frame's incidence
         angle, with the following preference order:
 
         1. **Borrow from pool** when the angle matches the prewarmed
@@ -333,7 +333,7 @@ class wranglerThread(Qt.QtCore.QThread):
            ``promote("FiberIntegrator")`` call but only on
            ω-varying scans, and only for frames that drift.  No
            shared state, so thread-safe by construction.
-        3. **Yield None** when GI isn't enabled at all — the arch
+        3. **Yield None** when GI isn't enabled at all — the frame
            integrators ignore the ``fiber_integrator`` kwarg in
            that case.
 
@@ -344,33 +344,33 @@ class wranglerThread(Qt.QtCore.QThread):
         # Local import: ssrl_xrd_tools.integrate.gid pulls pyFAI; we
         # don't want to drag that into every test that constructs a
         # wranglerThread for unrelated reasons.
-        gi = bool(getattr(arch, "gi", False))
+        gi = bool(getattr(frame, "gi", False))
         if not gi:
             yield None
             return
-        cached_angle = getattr(sphere, "_cached_fiber_integrator_angle", None)
+        cached_angle = getattr(scan, "_cached_fiber_integrator_angle", None)
         try:
-            arch_angle = arch._get_incident_angle()
+            frame_angle = frame._get_incident_angle()
         except (AttributeError, ValueError):
-            arch_angle = None
+            frame_angle = None
         if (fiber_pool is not None and cached_angle is not None
-                and arch_angle is not None
-                and abs(arch_angle - cached_angle) < angle_tol):
+                and frame_angle is not None
+                and abs(frame_angle - cached_angle) < angle_tol):
             with fiber_pool.borrow() as fi:
                 yield fi
         else:
             from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
             fi = create_fiber_integrator(
-                arch._poni_from_integrator(),
-                incident_angle=arch_angle if arch_angle is not None else 0.0,
-                tilt_angle=arch.tilt_angle,
-                sample_orientation=arch.sample_orientation,
+                frame._poni_from_integrator(),
+                incident_angle=frame_angle if frame_angle is not None else 0.0,
+                tilt_angle=frame.tilt_angle,
+                sample_orientation=frame.sample_orientation,
                 angle_unit="deg",
             )
             yield fi
 
-    def _prewarm_arch_mask(self, sphere, img_data) -> None:
-        """Populate ``sphere._cached_data_mask`` on the main thread.
+    def _prewarm_frame_mask(self, scan, img_data) -> None:
+        """Populate ``scan._cached_data_mask`` on the main thread.
 
         F3 — prevents the racy initialization that happens when N
         parallel workers all simultaneously see a ``None`` cache and
@@ -382,9 +382,9 @@ class wranglerThread(Qt.QtCore.QThread):
         from each wrangler's run loop with the first frame's
         ``img_data`` before the parallel section.
         """
-        if getattr(sphere, '_cached_data_mask', None) is not None:
+        if getattr(scan, '_cached_data_mask', None) is not None:
             return
-        self._resolve_arch_mask(sphere, img_data)
+        self._resolve_frame_mask(scan, img_data)
 
     def _apply_threshold_inline(self, img_data):
         """Pre-clamp pixels outside the threshold band to NaN.
@@ -393,7 +393,7 @@ class wranglerThread(Qt.QtCore.QThread):
         replaced by NaN.  pyFAI's CSR integrator skips NaN pixels
         automatically (no ``dummy``/``delta_dummy`` kwargs needed),
         and NaN propagates cleanly through bg subtraction and monitor
-        normalization arithmetic inside ``arch.integrate_1d/2d``.
+        normalization arithmetic inside ``frame.integrate_1d/2d``.
 
         No-op when ``self.apply_threshold`` is False — subclasses
         that don't expose a threshold UI inherit a free pass-through.
@@ -405,7 +405,7 @@ class wranglerThread(Qt.QtCore.QThread):
         img[bad] = _THRESHOLD_NAN
         return img
 
-    def _flush_xye_buffer(self, sphere, published_idxs=None):
+    def _flush_xye_buffer(self, scan, published_idxs=None):
         """Drain ``self._xye_buffer`` and write each pending XYE file.
 
         Drains under :attr:`_xye_lock` so workers can keep appending
@@ -414,8 +414,8 @@ class wranglerThread(Qt.QtCore.QThread):
         file shouldn't kill an otherwise-valid scan.
 
         P3: when ``published_idxs`` is provided, only buffer entries
-        whose ``img_number`` (a.k.a. ``arch.idx``) appears in the set
-        are written to disk; entries for arches that finished
+        whose ``img_number`` (a.k.a. ``frame.idx``) appears in the set
+        are written to disk; entries for frames that finished
         integration but never got published to the .nxs are dropped.
         This keeps the XYE directory and the .nxs frame set in sync
         after a Stop mid-batch — without the filter, in-flight
@@ -436,40 +436,40 @@ class wranglerThread(Qt.QtCore.QThread):
                     'XYE: dropped %d unpublished entries (Stop mid-batch)',
                     len(dropped),
                 )
-        for img_number, arch in buf:
+        for img_number, frame in buf:
             try:
-                self.save_1d(sphere, arch, img_number)
+                self.save_1d(scan, frame, img_number)
             except Exception as e:
                 logger.warning(
                     'XYE write failed for frame %s: %s', img_number, e,
                 )
 
     @staticmethod
-    def save_1d(sphere, arch, idx):
-        """Write a single-frame XYE next to the sphere's .nxs file.
+    def save_1d(scan, frame, idx):
+        """Write a single-frame XYE next to the scan's .nxs file.
 
-        Static because it only depends on the sphere + arch state —
+        Static because it only depends on the scan + frame state —
         not on per-wrangler attributes.  Filename layout matches the
         prior specWrangler convention so existing downstream tools
         keep working: ``<scan_dir>/<scan_name>/iq_<scan>_NNNN.xye``
         (or ``itth_...`` for 2θ units).
         """
-        if arch.int_1d is None:
+        if frame.int_1d is None:
             return
-        path = os.path.dirname(sphere.data_file)
-        path = os.path.join(path, sphere.name)
+        path = os.path.dirname(scan.data_file)
+        path = os.path.join(path, scan.name)
         Path(path).mkdir(parents=True, exist_ok=True)
-        r1d = arch.int_1d
+        r1d = frame.int_1d
         is_q = r1d.unit in ('q_A^-1', 'q_nm^-1')
         prefix = 'iq' if is_q else 'itth'
         fname = os.path.join(
-            path, f'{prefix}_{sphere.name}_{str(idx).zfill(4)}.xye'
+            path, f'{prefix}_{scan.name}_{str(idx).zfill(4)}.xye'
         )
         write_xye(fname, r1d.radial, r1d.intensity,
                   np.sqrt(np.abs(r1d.intensity)))
 
-    def _save_to_disk(self, sphere):
-        """Persist sphere state to its .nxs file (intermediate save).
+    def _save_to_disk(self, scan):
+        """Persist scan state to its .nxs file (intermediate save).
 
         Honours the h5pool pause/resume protocol so the GUI's
         h5viewer doesn't fight the writer for the file handle, and
@@ -478,12 +478,12 @@ class wranglerThread(Qt.QtCore.QThread):
         """
         if self.xye_only:
             return
-        _get_h5pool().pause(sphere.data_file)
+        _get_h5pool().pause(scan.data_file)
         try:
             with self.file_lock:
-                sphere._save_to_nexus()
+                scan._save_to_nexus()
         finally:
-            _get_h5pool().resume(sphere.data_file)
+            _get_h5pool().resume(scan.data_file)
 
     def _parallel_integrate(self, items, integrate_fn, n_workers,
                              *, label="integration"):
@@ -505,8 +505,8 @@ class wranglerThread(Qt.QtCore.QThread):
             wait up to one full chunk after pressing Stop, because
             running workers kept going to completion.
           * Per-item exceptions are logged at error level and the
-            corresponding arch is dropped from the result list.
-          * Returns arches in idx-sorted order so on-disk
+            corresponding frame is dropped from the result list.
+          * Returns frames in idx-sorted order so on-disk
             frame_index stays monotonic.
 
         Returns a ``list[LiveFrame]`` with ``None`` entries elided.
@@ -533,15 +533,15 @@ class wranglerThread(Qt.QtCore.QThread):
                         f.cancel()
                     break
                 try:
-                    arch = fut.result()
+                    frame = fut.result()
                 except Exception as e:
                     logger.error(
                         '[%s] worker raised: %s', label, e, exc_info=True,
                     )
                     continue
-                if arch is None:
+                if frame is None:
                     continue
-                completed.append(arch)
+                completed.append(frame)
         finally:
             # On Stop, drain any remaining futures we cancelled above so
             # they don't leak into the next chunk's wait set.  No pool

@@ -32,12 +32,12 @@ class DisplayPlotMixin:
     Expects the host widget to expose at least:
 
     - ``self.ui`` (the Ui_Form instance)
-    - ``self.sphere``, ``self.arch_ids``, ``self.data_1d``, ``self.data_2d``
+    - ``self.scan``, ``self.frame_ids``, ``self.data_1d``, ``self.data_2d``
     - ``self.idxs``, ``self.idxs_1d``
     - ``self.plot``, ``self.plot_win``, ``self.plot_layout``
     - ``self.wf_widget``, ``self.wf_*`` (waterfall state)
     - ``self.curves``, ``self.legend``, ``self.pos_label``
-    - ``self.plot_data``, ``self.plot_data_range``, ``self.arch_names``
+    - ``self.plot_data``, ``self.plot_data_range``, ``self.frame_names``
     - ``self.plotMethod``, ``self.scale``, ``self.cmap``
     - ``self.overlay``, ``self.binned_data``, ``self.binned_widget``
     - ``self._plot_axis_info``, ``self._last_plot_unit``
@@ -50,11 +50,11 @@ class DisplayPlotMixin:
     def update_plot(self):
         """Updates data in plot frame
         """
-        if (self.sphere.name == 'null_main') or (len(self.arch_ids) == 0):
+        if (self.scan.name == 'null_main') or (len(self.frame_ids) == 0):
             data = (np.arange(100), np.arange(100))
             return data
 
-        # Get 1D data for all arches
+        # Get 1D data for all frames
         ydata, xdata = self.get_arches_int_1d()
 
         # 2D-derived axes require 2D data; fall back gracefully if unavailable
@@ -66,7 +66,7 @@ class DisplayPlotMixin:
                      else None)
             needs_2d = ((_info and _info['source'] in ('2d', '1d_2d'))
                         or self.ui.slice.isChecked())
-            if needs_2d and getattr(self.sphere, 'skip_2d', False):
+            if needs_2d and getattr(self.scan, 'skip_2d', False):
                 try:
                     self.window().statusBar().showMessage(
                         "Chi slicing requires 2D integration (1D Only is enabled).", 4000)
@@ -78,18 +78,18 @@ class DisplayPlotMixin:
             if xdata is None or ydata is None:
                 return
 
-        if self.sphere.series_average:
-            arch_names = [self.sphere.name]
+        if self.scan.series_average:
+            frame_names = [self.scan.name]
         else:
-            arch_names = [f'{self.sphere.name}_{i}' for i in self.idxs]
+            frame_names = [f'{self.scan.name}_{i}' for i in self.idxs]
 
-        # When slicing is active, include slice parameters in arch names
+        # When slicing is active, include slice parameters in frame names
         # so the same image with different slice ranges can be overlaid.
         if self.ui.slice.isEnabled() and self.ui.slice.isChecked():
             center = self.ui.slice_center.value()
             width = self.ui.slice_width.value()
             suffix = f' [{center:.1f}\u00b1{width:.1f}]'
-            arch_names = [n + suffix for n in arch_names]
+            frame_names = [n + suffix for n in frame_names]
 
         # Subtract background
         if self.bkg_1d is not None:
@@ -101,14 +101,14 @@ class DisplayPlotMixin:
         # selection: a single-click gives one curve, shift/cmd-click
         # gives several.  Live-scan selection accumulation (which used
         # to silently turn Single into a Waterfall) is now prevented at
-        # the source by ClearAndSelect in h5viewer + latest_arch, so we
+        # the source by ClearAndSelect in h5viewer + latest_frame, so we
         # don't need to narrow ydata here.
 
         current_plot_unit = self.ui.plotUnit.currentIndex()
         unit_changed = current_plot_unit != self._last_plot_unit
         self._last_plot_unit = current_plot_unit
 
-        # In Overlay/Waterfall: accumulate new arches, skip duplicates.
+        # In Overlay/Waterfall: accumulate new frames, skip duplicates.
         # In Single/Sum/Average: always replace with current selection.
         current_method = self.ui.plotMethod.currentText()
         accumulate = (current_method in ('Overlay', 'Waterfall')
@@ -116,8 +116,8 @@ class DisplayPlotMixin:
                       and len(self.plot_data[0]) > 0)
 
         if accumulate:
-            for arch_name, row in zip(arch_names, ydata):
-                if arch_name not in self.arch_names:
+            for frame_name, row in zip(frame_names, ydata):
+                if frame_name not in self.frame_names:
                     old_x = self.plot_data[0]
                     if old_x.shape == xdata.shape and np.allclose(old_x, xdata):
                         # Same grid — just append
@@ -142,11 +142,11 @@ class DisplayPlotMixin:
                         new_row = _reinterp(xdata, row, merged_x)
                         self.plot_data = [merged_x,
                                           np.vstack((new_old, new_row))]
-                    self.arch_names.append(arch_name)
+                    self.frame_names.append(frame_name)
         else:
             # Fresh start: Single/Sum/Average, unit changed, or no existing data
             self.plot_data = [xdata, ydata]
-            self.arch_names = list(arch_names)
+            self.frame_names = list(frame_names)
 
         xdata, ydata = self.plot_data
         if xdata.size == 0 or ydata.size == 0:
@@ -179,13 +179,13 @@ class DisplayPlotMixin:
         if new_method == 'Single':
             # Reset accumulated data — rebuild from current selection
             self.plot_data = [np.array([]), np.array([])]
-            self.arch_names = []
+            self.frame_names = []
             self.update_plot()
         elif new_method in ('Sum', 'Average'):
             # No accumulation needed: aggregation happens inside
             # update_1d_view() based on the current selection.
             self.plot_data = [np.array([]), np.array([])]
-            self.arch_names = []
+            self.frame_names = []
             self.update_plot()
         else:
             # Overlay / Waterfall: keep existing accumulated curves and
@@ -197,7 +197,7 @@ class DisplayPlotMixin:
     def update_plot_view(self):
         """Updates 1D view of data in plot frame
         """
-        if (len(self.arch_ids) == 0) or len(self.data_1d) == 0:
+        if (len(self.frame_ids) == 0) or len(self.data_1d) == 0:
             return
 
         # Clear curves
@@ -211,7 +211,7 @@ class DisplayPlotMixin:
         # That's Overlay with a multi-selection, or Single mode with a
         # manual shift/cmd-click multi-selection (which behaves like Overlay).
         if (self.plotMethod in ('Overlay', 'Single')
-                and len(self.arch_names) > 1):
+                and len(self.frame_names) > 1):
             self.ui.yOffset.setEnabled(True)
 
         n_curves = len(self.plot_data[1])
@@ -426,13 +426,13 @@ class DisplayPlotMixin:
         self.curves.clear()
         self.legend.clear()
 
-        arch_ids = self.arch_names[self.wf_start::self.wf_step]
+        frame_ids = self.frame_names[self.wf_start::self.wf_step]
         if (self.plotMethod in ['Sum', 'Average'] and
-                len(self.arch_names) > 1):
-            arch_ids = f'{self.plotMethod} [{self.arch_names[0]}'
-            for arch_name in self.arch_names[1:]:
-                arch_ids += f', {arch_name}'
-            arch_ids = [arch_ids + ']']
+                len(self.frame_names) > 1):
+            frame_ids = f'{self.plotMethod} [{self.frame_names[0]}'
+            for frame_name in self.frame_names[1:]:
+                frame_ids += f', {frame_name}'
+            frame_ids = [frame_ids + ']']
 
         colors = self.get_colors()
         self.curves = [self.plot.plot(
@@ -440,8 +440,8 @@ class DisplayPlotMixin:
             symbolBrush=color,
             symbolPen=color,
             symbolSize=4,
-            name=arch_id,
-        ) for (color, arch_id) in zip(colors, arch_ids)]
+            name=frame_id,
+        ) for (color, frame_id) in zip(colors, frame_ids)]
 
         if not self.ui.showLegend.isChecked():
             self.legend.clear()
@@ -449,8 +449,8 @@ class DisplayPlotMixin:
     def clear_1D(self):
         """Initialize curves for line plots
         """
-        self.arch_names.clear()
-        self.arch_ids.clear()
+        self.frame_names.clear()
+        self.frame_ids.clear()
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.setup_1d_layout()
         self.plot.clear()
@@ -525,8 +525,8 @@ class DisplayPlotMixin:
         layout.addWidget(self.wf_accept_button, 2, 1)
         layout.addWidget(self.wf_cancel_button, 2, 2)
 
-        arch = self.data_1d[self.idxs_1d[0]]
-        counters = list(arch.scan_info.keys())
+        frame = self.data_1d[self.idxs_1d[0]]
+        counters = list(frame.scan_info.keys())
         counters = ['Frame #', 'Time (s)', 'Time (minutes)'] + counters
         self.wf_yaxis_widget.addItems(counters)
 
@@ -679,23 +679,23 @@ class DisplayPlotMixin:
 
         # In GI mode or when metadata explicitly defines the slice axis,
         # no unit conversion is needed — just refresh
-        if self.sphere.gi or (info and info['source'] not in ('2d', '1d_2d')):
+        if self.scan.gi or (info and info['source'] not in ('2d', '1d_2d')):
             self.update_plot()
             return
 
         # Standard mode, chi axis: handle Q ↔ 2θ conversion
-        if not self.sphere.gi and info and info.get('axis') == 'azimuthal':
+        if not self.scan.gi and info and info.get('axis') == 'azimuthal':
             imageUnit = self.ui.imageUnit.currentIndex()
             cen = self.ui.slice_center.value()
             wid = self.ui.slice_width.value()
             _range = np.array([cen - wid, cen + wid])
 
             try:
-                arch_for_wl = self.data_1d[self.idxs_1d[0]]
+                frame_for_wl = self.data_1d[self.idxs_1d[0]]
             except (IndexError, KeyError):
                 self.update_plot()
                 return
-            wavelength = self._get_wavelength(arch_for_wl)
+            wavelength = self._get_wavelength(frame_for_wl)
             if wavelength is None or wavelength <= 0:
                 self.update_plot()
                 return

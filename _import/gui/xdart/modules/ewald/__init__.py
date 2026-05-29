@@ -12,9 +12,9 @@ Reader-side compatibility for ``.nxs`` files written by xdart 0.37.x
 still works — see :mod:`xdart.modules.live_compat`.
 """
 
-from .arch import LiveFrame
-from .arch_series import LiveFrameSeries
-from .sphere import LiveScan
+from .frame import LiveFrame
+from .frame_series import LiveFrameSeries
+from .scan import LiveScan
 
 __all__ = [
     "LiveFrame",

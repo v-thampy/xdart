@@ -83,12 +83,12 @@ class nexusWrangler(wranglerWidget):
     """
     showLabel = QtCore.Signal(str)
 
-    def __init__(self, fname, file_lock, sphere, data_1d, data_2d, parent=None):
+    def __init__(self, fname, file_lock, scan, data_1d, data_2d, parent=None):
         super().__init__(fname, file_lock, parent)
 
         self.poni = None
         self.command = None
-        self.sphere = sphere
+        self.scan = scan
         self.data_1d = data_1d
         self.data_2d = data_2d
 
@@ -165,7 +165,7 @@ class nexusWrangler(wranglerWidget):
 
         self.startButton.clicked.connect(self.start)
         self.stopButton.clicked.connect(self.stop)
-        # Reflect dropdown choice into sphere.skip_2d + self.xye_only
+        # Reflect dropdown choice into scan.skip_2d + self.xye_only
         # immediately on selection — the thread reads both before each
         # frame, so the user can change mode between runs without
         # restarting xdart.  Save the mode to session so the next
@@ -176,7 +176,7 @@ class nexusWrangler(wranglerWidget):
         )
         # Apply the default selection once now that the signal is
         # wired up.  Without this, the first run after launch would
-        # see ``sphere.skip_2d`` unchanged from whatever the previous
+        # see ``scan.skip_2d`` unchanged from whatever the previous
         # consumer left it as.
         self._on_mode_changed(self.processingModeCombo.currentText())
 
@@ -207,7 +207,7 @@ class nexusWrangler(wranglerWidget):
         # Setup thread
         self.thread = nexusThread(
             self.command_queue,
-            self.sphere_args,
+            self.scan_args,
             self.file_lock,
             self.fname,
             self.nexus_file,
@@ -220,7 +220,7 @@ class nexusWrangler(wranglerWidget):
             self.gi_mode_1d,
             self.gi_mode_2d,
             self.command,
-            self.sphere,
+            self.scan,
             self.data_1d,
             self.data_2d,
             entry=self.entry,
@@ -325,7 +325,7 @@ class nexusWrangler(wranglerWidget):
     # ── Processing-mode dropdown ─────────────────────────────────────
 
     def _on_mode_changed(self, mode_text: str) -> None:
-        """Sync sphere/thread flags to the dropdown's current text.
+        """Sync scan/thread flags to the dropdown's current text.
 
         Mirror of ``specWrangler._on_mode_changed``'s logic, minus the
         viewer modes (the NeXus wrangler always runs the integration
@@ -339,7 +339,7 @@ class nexusWrangler(wranglerWidget):
         # contains '1D' (vs '2D') skips 2D integration.  Matches even
         # if we add new label variants later (e.g. 'Int 1D (cake-XYE)').
         skip_2d = ('1D' in mode_text) and ('2D' not in mode_text)
-        self.sphere.skip_2d = skip_2d
+        self.scan.skip_2d = skip_2d
         self.xye_only = (mode_text == 'Int 1D (XYE)')
         # Push down to the thread immediately so a mid-session mode
         # change picks up on the next run without going through start().
@@ -413,13 +413,13 @@ class nexusWrangler(wranglerWidget):
         self.sample_orientation = self.parameters.child('GI').child('sample_orientation').value()
         self.tilt_angle = self.parameters.child('GI').child('tilt_angle').value()
         # GI modes are driven by the integrator panel (axis1D / axis2D)
-        self.gi_mode_1d = self.sphere.bai_1d_args.get('gi_mode_1d', 'q_total')
-        self.gi_mode_2d = self.sphere.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+        self.gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
+        self.gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
 
         # Recreate thread with current params
         self.thread = nexusThread(
             self.command_queue,
-            self.sphere_args,
+            self.scan_args,
             self.file_lock,
             self.fname,
             self.nexus_file,
@@ -432,7 +432,7 @@ class nexusWrangler(wranglerWidget):
             self.gi_mode_1d,
             self.gi_mode_2d,
             self.command,
-            self.sphere,
+            self.scan,
             self.data_1d,
             self.data_2d,
             entry=self.entry,
@@ -446,8 +446,8 @@ class nexusWrangler(wranglerWidget):
         self.sigUpdateGI.emit(self.gi)
 
         self.thread.file_lock = self.file_lock
-        self.thread.sphere_args = self.sphere_args
-        self.thread.sphere = self.sphere
+        self.thread.scan_args = self.scan_args
+        self.thread.scan = self.scan
         self.thread.data_1d = self.data_1d
         self.thread.data_2d = self.data_2d
         self.thread.command = self.command
@@ -459,7 +459,7 @@ class nexusWrangler(wranglerWidget):
         # The thread caches it as ``self.max_cores`` and uses it when
         # building the ThreadPoolExecutor for parallel integration.
         self.thread.max_cores = self.maxCoresSpinBox.value()
-        # Re-sync processing-mode flags onto sphere + thread so a
+        # Re-sync processing-mode flags onto scan + thread so a
         # stale ``thread`` instance (recreated in :meth:`setup` since
         # the last mode-change signal) sees the latest selection.
         self._on_mode_changed(self.processingModeCombo.currentText())

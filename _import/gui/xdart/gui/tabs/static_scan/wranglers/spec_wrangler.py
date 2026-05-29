@@ -131,7 +131,7 @@ class specWrangler(wranglerWidget):
         fname: str, path to data file
         parameters: pyqtgraph Parameter, stores parameters from user
         scan_name: str, current scan name, used to handle syncing data
-        sphere_args: dict, used as **kwargs in sphere initialization.
+        scan_args: dict, used as **kwargs in scan initialization.
             see LiveScan.
         thread: wranglerThread or subclass, QThread for controlling
             processes
@@ -153,7 +153,7 @@ class specWrangler(wranglerWidget):
         finished: Connected to thread.finished signal
         sigStart: Tells tthetaWidget to start the thread and prepare
             for new data.
-        sigUpdateData: int, signals a new arch has been added.
+        sigUpdateData: int, signals a new frame has been added.
         sigUpdateFile: (str, str, bool, str, bool, bool), sends new scan_name, file name
             GI flag (grazing incidence), theta motor for GI, single_image and
             series_average flag to static_scan_Widget.
@@ -163,7 +163,7 @@ class specWrangler(wranglerWidget):
     """
     showLabel = QtCore.Signal(str)
 
-    def __init__(self, fname, file_lock, sphere, data_1d, data_2d, parent=None):
+    def __init__(self, fname, file_lock, scan, data_1d, data_2d, parent=None):
         """fname: str, file path
         file_lock: mp.Condition, process safe lock
         """
@@ -175,7 +175,7 @@ class specWrangler(wranglerWidget):
         self.counters = []
         self.motors = []
         self.command = None
-        self.sphere = sphere
+        self.scan = scan
         self.data_1d = data_1d
         self.data_2d = data_2d
 
@@ -260,9 +260,9 @@ class specWrangler(wranglerWidget):
         self.sample_orientation = self.parameters.child('GI').child('sample_orientation').value()
         self.tilt_angle = self.parameters.child('GI').child('tilt_angle').value()
         # gi_mode_1d / gi_mode_2d are driven by the integrator panel;
-        # default here, actual values set from sphere.bai_*_args at thread start.
-        self.gi_mode_1d = self.sphere.bai_1d_args.get('gi_mode_1d', 'q_total')
-        self.gi_mode_2d = self.sphere.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+        # default here, actual values set from scan.bai_*_args at thread start.
+        self.gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
+        self.gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
 
         # HDF5 Save Path
         self.h5_dir = self.parameters.child('h5_dir').value()
@@ -330,7 +330,7 @@ class specWrangler(wranglerWidget):
         # Setup thread
         self.thread = specThread(
             self.command_queue,
-            self.sphere_args,
+            self.scan_args,
             self.file_lock,
             self.fname,
             self.h5_dir,
@@ -362,7 +362,7 @@ class specWrangler(wranglerWidget):
             self.gi_mode_1d,
             self.gi_mode_2d,
             self.command,
-            self.sphere,
+            self.scan,
             self.data_1d,
             self.data_2d,
             live_mode=self.live_mode,
@@ -529,13 +529,13 @@ class specWrangler(wranglerWidget):
         
         if mode_text == 'Image Viewer':
             self.viewer_mode = 'image'
-            self.sphere.skip_2d = False
+            self.scan.skip_2d = False
         elif mode_text == 'XYE Viewer':
             self.viewer_mode = 'xye'
-            self.sphere.skip_2d = False
+            self.scan.skip_2d = False
         else:
             self.viewer_mode = None
-            self.sphere.skip_2d = '1D' in mode_text
+            self.scan.skip_2d = '1D' in mode_text
 
         # Sync to thread
         self.thread.batch_mode = self.batch_mode
@@ -667,9 +667,9 @@ class specWrangler(wranglerWidget):
         self.thread.tilt_angle = self.tilt_angle
 
         # GI modes are driven by the integrator panel (axis1D / axis2D),
-        # so read them from sphere.bai_*_args which the integrator updates.
-        self.gi_mode_1d = self.sphere.bai_1d_args.get('gi_mode_1d', 'q_total')
-        self.gi_mode_2d = self.sphere.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+        # so read them from scan.bai_*_args which the integrator updates.
+        self.gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
+        self.gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
         self.thread.gi_mode_1d = self.gi_mode_1d
         self.thread.gi_mode_2d = self.gi_mode_2d
 
@@ -681,14 +681,14 @@ class specWrangler(wranglerWidget):
         self.thread.batch_mode = self.batch_mode
         self.thread.xye_only = self.xye_only
         self.thread.max_cores = self.ui.maxCoresSpinBox.value()
-        self.sphere.max_cores = self.thread.max_cores  # used by sphere_threads
+        self.scan.max_cores = self.thread.max_cores  # used by scan_threads
 
         self.thread.command = self.command
 
         self.thread.file_lock = self.file_lock
-        self.thread.sphere_args = self.sphere_args
+        self.thread.scan_args = self.scan_args
 
-        self.thread.sphere = self.sphere
+        self.thread.scan = self.scan
         self.thread.data_1d = self.data_1d
         self.thread.data_2d = self.data_2d
 

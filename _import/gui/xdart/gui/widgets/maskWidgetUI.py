@@ -155,10 +155,10 @@ class Ui_Form(object):
 
         self.gridLayout.addWidget(self.polyMaskButton, 3, 1, 1, 1)
 
-        self.archList = QComboBox(self.toolsFrame)
-        self.archList.setObjectName(u"archList")
+        self.frameList = QComboBox(self.toolsFrame)
+        self.frameList.setObjectName(u"frameList")
 
-        self.gridLayout.addWidget(self.archList, 0, 0, 1, 1)
+        self.gridLayout.addWidget(self.frameList, 0, 0, 1, 1)
 
         self.clearButton = QPushButton(self.toolsFrame)
         self.clearButton.setObjectName(u"clearButton")

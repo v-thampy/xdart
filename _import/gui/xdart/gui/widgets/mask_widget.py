@@ -30,7 +30,7 @@ class MaskWidget(QtWidgets.QWidget):
     newMask = Signal(int, np.ndarray)
     requestMask = Signal(int)
 
-    def __init__(self, parent=None, sphere=None, arch=None):
+    def __init__(self, parent=None, scan=None, frame=None):
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
@@ -56,7 +56,7 @@ class MaskWidget(QtWidgets.QWidget):
         self.base_mask = np.array([])
         self.data = np.array([])
 
-        self.ui.archList.currentTextChanged.connect(self._request_data)
+        self.ui.frameList.currentTextChanged.connect(self._request_data)
         self.ui.setGlobal.clicked.connect(self._send_global)
         self.ui.setCurrent.clicked.connect(self._send_local)
 
@@ -99,11 +99,11 @@ class MaskWidget(QtWidgets.QWidget):
         self._send_and_set(-1)
 
     def _send_local(self, q=None):
-        if self.ui.archList.currentText().lower() == "global":
+        if self.ui.frameList.currentText().lower() == "global":
             self._send_global()
         else:
             try:
-                index = int(self.ui.archList.currentText())
+                index = int(self.ui.frameList.currentText())
                 self._send_and_set(index)
             except ValueError:
                 print("Invalid index encountered while trying to emit local mask.")
