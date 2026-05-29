@@ -650,9 +650,24 @@ class staticWidget(QWidget):
         self.integratorTree.get_args('bai_2d')
         self.integratorTree.set_image_units()
 
-        # Clear data objects
-        self.data_1d.clear()
-        self.data_2d.clear()
+        # Flush any throttled update from the *previous* scan before we
+        # blow away its in-memory state.  Without this, in non-batch
+        # multi-scan runs (Image Directory + Eiger) the per-frame
+        # sigUpdate from the previous scan was scheduled but never had
+        # a chance to render before this slot wiped the caches and
+        # repointed the viewer — so the user only ever saw blanks
+        # during the run and the final scan at the end.
+        self._update_timer.stop()
+        self._flush_pending_update()
+
+        # Clear arch index lists (fast; rebuilt by h5viewer.update_data)
+        # but DO NOT clear ``data_1d`` / ``data_2d``.  Pre-fix this
+        # blanked the display the instant a new scan started and the
+        # FixSizeOrderedDict eviction would have handled the memory
+        # bound anyway as new frames came in.  Leaving the data dicts
+        # alone lets the previous scan's last-rendered frame linger
+        # visibly until the new scan's first frame replaces it on
+        # the next ``_flush_pending_update`` tick.
         self.arches.clear()
         self.arch_ids.clear()
 
