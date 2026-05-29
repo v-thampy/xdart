@@ -466,10 +466,25 @@ class specThread(wranglerThread):
             img_number = 1 if img_number is None else img_number
             self.scan_name = scan_name
 
-            # Flush and switch sphere when scan name changes
+            # Flush and switch sphere when scan name changes.
+            #
+            # ``force_save=True`` is critical here: without it, the
+            # serial dispatch path (chosen when len(pending) == 1) only
+            # writes to .nxs once ``_frames_since_save >= LIVE_SAVE_INTERVAL``,
+            # so a short pending batch (1 frame) at scan boundary stays
+            # in memory.  Then ``sphere = self.initialize_sphere()`` on
+            # the next line replaces the local sphere variable; the
+            # old sphere with its unsaved frame is dropped, and its
+            # .nxs file is left at the empty state ``initialize_sphere``
+            # created.  Bug observed with Eiger Image-Directory mode
+            # producing N-1 empty .nxs files and only the last scan's
+            # file populated (because only the final-flush path below
+            # passes ``force_save=True``).
             if (sphere is None) or (scan_name != sphere.name):
                 if pending:
-                    files_processed += self._dispatch_batch(sphere, pending)
+                    files_processed += self._dispatch_batch(
+                        sphere, pending, force_save=True,
+                    )
                     pending = []
                 sphere = self.initialize_sphere()
                 _cached_poni = None
