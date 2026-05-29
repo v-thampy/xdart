@@ -113,14 +113,19 @@ def run_stitch(
         except Exception:
             _shape = None
     if _shape is not None:
-        est_bytes = len(frames) * int(np.prod(_shape)) * 8  # float64 stack
+        # Peak holds the per-frame float ``images`` list AND the fresh
+        # ``np.stack`` copy simultaneously (≈2× the float64 stack), on top
+        # of any still-resident raw ``map_raw`` arrays.  Estimate the 2×
+        # transient so the guard doesn't under-count and let an OOM through.
+        one_stack = len(frames) * int(np.prod(_shape)) * 8  # float64 stack
+        est_bytes = 2 * one_stack
         if est_bytes > max_stack_bytes:
             raise MemoryError(
-                f"Stitch would need ~{est_bytes / 1e9:.1f} GB to hold "
-                f"{len(frames)} frames of {_shape} in memory (limit "
-                f"{max_stack_bytes / 1e9:.1f} GB). pyFAI MultiGeometry "
-                "requires all images at once — stitch fewer frames or raise "
-                "max_stack_bytes if you have the RAM."
+                f"Stitch would need ~{est_bytes / 1e9:.1f} GB peak (list + "
+                f"stacked copy) to hold {len(frames)} frames of {_shape} in "
+                f"memory (limit {max_stack_bytes / 1e9:.1f} GB). pyFAI "
+                "MultiGeometry requires all images at once — stitch fewer "
+                "frames or raise max_stack_bytes if you have the RAM."
             )
 
     # Per-frame rotations (in degrees, since multi.py expects degrees)

@@ -320,9 +320,17 @@ class LiveScan:
                 frame.integrate_2d(global_mask=self.global_mask, **self.bai_2d_args)
             frame.file_lock = self.file_lock
             # In-memory append only; LiveFrameSeries.__setitem__ does no disk I/O.
-            if frame.idx not in self.frames.index:
-                self.frames.index.append(frame.idx)
-                self.frames.index.sort()
+            # Fast path: frames arrive in order, so append without the
+            # O(N log N) re-sort.  Only an out-of-order index (rare:
+            # reintegrate/reload) pays for a sort — keeps long live scans
+            # O(1) per frame instead of O(N log N).
+            index = self.frames.index
+            if frame.idx not in index:
+                if not index or frame.idx > index[-1]:
+                    index.append(frame.idx)
+                else:
+                    index.append(frame.idx)
+                    index.sort()
             # Stash the live frame object so the v2 writer can read its
             # int_1d/int_2d/thumbnail without going back to disk.
             self.frames.stash(frame)
