@@ -289,7 +289,7 @@ def read_image_metadata(
     # the metadata format combobox, but the comparison below expects
     # lowercase.  Pre-fix this silently returned ``{}`` and logged
     # "unknown meta_format" for every SPEC frame, so positioners
-    # never made it into the sphere.
+    # never made it into the scan.
     meta_format_norm = (meta_format or "").strip().lower()
 
     if meta_format_norm in ("txt", "pdi"):
