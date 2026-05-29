@@ -1218,6 +1218,9 @@ class specThread(wranglerThread):
             _t_h5_total, _t_csv, _t_total, _sub,
         )
         # In batch mode, suppress per-frame GUI signals — emit once at end
+        # via process_scan's final ``sigUpdate.emit(-1)``.  Batch mode
+        # exists precisely to skip GUI work during the run and let
+        # the wrangler focus on integration throughput.
         if not self.batch_mode:
             # Publish the freshly-integrated arch so the main thread can
             # consume it without going back to disk.  See
