@@ -346,9 +346,11 @@ def test_nexus_sink_writes_frame_results(
 
     assert result.output_path == out
     with h5py.File(out, "r") as h5:
-        assert "entry/reduction/0/int_1d/intensity" in h5
+        # Stacked read_scan-compatible layout: (n_frames, n_q).
+        assert "entry/integrated_1d/intensity" in h5
+        assert list(h5["entry/integrated_1d/frame_index"][()]) == [0]
         np.testing.assert_allclose(
-            h5["entry/reduction/0/int_1d/intensity"][()],
+            h5["entry/integrated_1d/intensity"][0],
             [3.0, 4.0],
         )
 
