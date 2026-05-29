@@ -128,12 +128,27 @@ def run_stitch(
                 "frames or raise max_stack_bytes if you have the RAM."
             )
 
+    # Align scan_data to frame order BEFORE deriving motors/normalization.
+    # ``frames`` is iterated in scan.frames.index order; scan_data is indexed
+    # by frame id.  Using positional ``.values`` / ``.iloc[i]`` assumes the
+    # two orders coincide — for gapped or out-of-order scans they don't, and
+    # angles/monitors would attach to the wrong image.  Reindex to the actual
+    # frame ids so row i corresponds to frames[i] (NaN for any frame missing
+    # from scan_data).
+    frame_ids = [f.idx for f in frames]
+    scan_data = scan.scan_data
+    try:
+        if list(scan_data.index) != frame_ids:
+            scan_data = scan_data.reindex(frame_ids)
+    except (TypeError, ValueError):
+        scan_data = scan.scan_data  # non-aligned index — fall back to as-is
+
     # Per-frame rotations (in degrees, since multi.py expects degrees)
     geom = scan.geometry
     motors = {
-        m: np.asarray(scan.scan_data[m].values, dtype=float)
+        m: np.asarray(scan_data[m].values, dtype=float)
         for m in geom.all_referenced_motors()
-        if m in scan.scan_data.columns
+        if m in scan_data.columns
     }
     derived = geom.derive_per_frame(motors)
     # multi.py expects degrees, not radians — invert deg2rad on rot1/rot2
@@ -167,10 +182,10 @@ def run_stitch(
     # Validate the normalization column up front.  Silently skipping a
     # requested ``norm_motor`` that isn't in scan_data would produce an
     # *un-normalized* stitch that looks normalized — fail loudly instead.
-    if norm_motor is not None and norm_motor not in scan.scan_data.columns:
+    if norm_motor is not None and norm_motor not in scan_data.columns:
         raise ValueError(
             f"norm_motor {norm_motor!r} not found in scan_data columns "
-            f"{list(scan.scan_data.columns)}; cannot normalize the stitch."
+            f"{list(scan_data.columns)}; cannot normalize the stitch."
         )
 
     images = []
@@ -191,7 +206,7 @@ def run_stitch(
             continue
         img = np.asarray(frame.map_raw - frame.bg_raw, dtype=float)
         if norm_motor is not None:
-            denom = float(scan.scan_data[norm_motor].iloc[i])
+            denom = float(scan_data[norm_motor].iloc[i])
             if denom != 0:
                 img = img / denom
             else:
