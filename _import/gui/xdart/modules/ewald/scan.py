@@ -42,15 +42,9 @@ class LiveScan:
                  single_img=False,
                  global_mask=None,
                  file_lock=None,
-                 arches=None,
                  **_unused,
                  ):
         super().__init__()
-        # Deprecated ``arches=`` kwarg → ``frames=`` (sphere/arch → scan/frame
-        # rename).  Kept so older callers/scripts constructing
-        # ``LiveScan(arches=[...])`` (or via the EwaldSphere alias) keep working.
-        if arches is not None and frames is None:
-            frames = arches
         # None-sentinel pattern: mutable defaults (lists, dicts, DataFrames)
         # in function signatures are shared across all calls that omit them,
         # so any mutation leaks between instances. Resolve them here instead.
@@ -136,26 +130,6 @@ class LiveScan:
         # deleted).  Drifted from disk under R1 replace-frames and
         # was never repopulated on v2 reload.
         self.global_mask = global_mask
-
-    # ── Deprecated sphere/arch aliases (removed in a future release) ──────
-    # The canonical names are ``frames`` / ``add_frame`` / ``scan_lock``;
-    # these keep ``.arches`` / ``.add_arch`` / ``.sphere_lock`` working for
-    # external callers (e.g. ssrl_xrd_tools RSM) during the cross-repo
-    # rename.  Drop this block once both repos are fully converted.
-    @property
-    def arches(self):
-        return self.frames
-
-    @arches.setter
-    def arches(self, value):
-        self.frames = value
-
-    @property
-    def sphere_lock(self):
-        return self.scan_lock
-
-    def add_arch(self, *args, **kwargs):
-        return self.add_frame(*args, **kwargs)
 
     def reset(self):
         """Resets all held data objects to blank state."""
@@ -539,8 +513,8 @@ class LiveScan:
     def _load_from_nexus_v2(self, grp, *, data_only: bool = False) -> None:
         """Populate scan state from a v2 NXroot.
 
-        C5: uses :func:`read_sphere_metadata` (not the full
-        ``read_sphere``) — we only need frame_index, axes, motor
+        C5: uses :func:`read_scan_metadata` (not the full
+        ``read_scan``) — we only need frame_index, axes, motor
         columns, and the reduction provenance attrs.  The heavy
         ``intensity_1d`` / ``intensity_2d`` stacks stay on disk and
         :class:`LiveFrameSeries.__getitem__` lazy-loads each frame's
@@ -549,22 +523,12 @@ class LiveScan:
         materialisation) and ~tens of ms (frame index + a few KB of
         coords + motor columns).
         """
-        # Prefer the metadata-only loader — it skips the heavy stacks.
-        # ssrl_xrd_tools renamed read_sphere*→read_scan* (with deprecated
-        # aliases); try the new names first, then the old ones so xdart
-        # works against both new and pre-rename ssrl_xrd_tools installs.
+        # Prefer the metadata-only loader — it skips the heavy stacks;
+        # fall back to the full reader on older builds that lack it.
         try:
             from ssrl_xrd_tools.io.nexus import read_scan_metadata as _read
         except ImportError:
-            try:
-                from ssrl_xrd_tools.io.nexus import read_scan as _read
-            except ImportError:
-                try:
-                    from ssrl_xrd_tools.io.nexus import (
-                        read_sphere_metadata as _read,
-                    )
-                except ImportError:
-                    from ssrl_xrd_tools.io.nexus import read_sphere as _read
+            from ssrl_xrd_tools.io.nexus import read_scan as _read
 
         try:
             ds = _read(self.data_file)

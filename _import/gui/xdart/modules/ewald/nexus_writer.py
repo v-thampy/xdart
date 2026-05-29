@@ -1314,8 +1314,4 @@ def _quantize_thumbnail(
     return (norm * 255).astype(np.uint8), (float(vmin), float(vmax), "uint8")
 
 
-# Deprecated alias (sphere/arch → scan/frame rename); removed in a future
-# release once all callers use save_scan_to_nexus.
-save_sphere_to_nexus = save_scan_to_nexus
-
-__all__ = ["save_scan_to_nexus", "save_sphere_to_nexus"]
+__all__ = ["save_scan_to_nexus"]

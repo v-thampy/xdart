@@ -137,7 +137,7 @@ def test_legacy_live_class_names_are_normalized_from_reader_data() -> None:
     assert normalized["config"]["class"] == "LiveScan"
     assert normalized["config"]["frames"] == [
         "LiveFrame",
-        "xdart.modules.ewald.arch.LiveFrame",
+        "xdart.modules.ewald.frame.LiveFrame",
     ]
     assert normalized["config"]["series"]["type"] == "LiveFrameSeries"
     assert normalized["unchanged"] == "not_a_class_name"
