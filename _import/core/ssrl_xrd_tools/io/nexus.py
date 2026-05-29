@@ -623,13 +623,15 @@ def write_nexus(
         proc.attrs["NX_class"] = "NXprocess"
         proc.attrs.setdefault("program", "ssrl_xrd_tools")
 
+        # Stacked v2 layout (read_scan-compatible).  Iterate in ascending
+        # frame order so frame_index is monotonic on disk.
         if results_1d:
-            for frame_key, r1d in results_1d.items():
-                _write_result_1d(proc, str(frame_key), r1d, comp_kwargs)
+            for frame_key in sorted(results_1d, key=lambda k: int(k)):
+                _append_stacked_1d(grp, frame_key, results_1d[frame_key], comp_kwargs)
 
         if results_2d:
-            for frame_key, r2d in results_2d.items():
-                _write_result_2d(proc, str(frame_key), r2d, comp_kwargs)
+            for frame_key in sorted(results_2d, key=lambda k: int(k)):
+                _append_stacked_2d(grp, frame_key, results_2d[frame_key], comp_kwargs)
 
     logger.debug("Wrote NeXus file: %s", p)
     return p
@@ -745,14 +747,13 @@ def write_nexus_frame(
         Compression filter.
     """
     ck = _comp_kwargs(compression)
-    proc = h5[entry].require_group("reduction")
-    frame_str = str(frame)
+    e = h5[entry]
 
     if result_1d is not None:
-        _write_result_1d(proc, frame_str, result_1d, ck)
+        _append_stacked_1d(e, frame, result_1d, ck)
 
     if result_2d is not None:
-        _write_result_2d(proc, frame_str, result_2d, ck)
+        _append_stacked_2d(e, frame, result_2d, ck)
 
 
 # ---------------------------------------------------------------------------
@@ -809,48 +810,114 @@ def _write_metadata(
 # Private helpers — results
 # ---------------------------------------------------------------------------
 
-def _write_result_1d(
-    proc_grp: h5py.Group,
-    frame_key: str,
+def _append_stacked_1d(
+    entry_grp: h5py.Group,
+    frame_idx: int | str,
     r: IntegrationResult1D,
     comp_kwargs: dict[str, Any],
 ) -> None:
-    """Write one IntegrationResult1D into /{entry}/reduction/{frame}/int_1d/."""
-    frame_grp = proc_grp.require_group(frame_key)
-    grp = frame_grp.require_group("int_1d")
-    grp.attrs["NX_class"] = "NXdata"
-    grp.attrs["signal"] = "intensity"
-    grp.attrs["axes"] = ["radial"]
+    """Append one IntegrationResult1D as a row of the stacked
+    ``/{entry}/integrated_1d`` NXdata group.
 
-    _replace(grp, "radial", r.radial, **comp_kwargs)
-    _replace(grp, "intensity", r.intensity, **comp_kwargs)
-    if r.sigma is not None:
-        _replace(grp, "sigma", r.sigma, **comp_kwargs)
-    grp.attrs["unit"] = r.unit
+    This is the canonical v2 layout that :func:`read_scan` consumes (and
+    that the xdart GUI writer produces): resizable ``intensity`` of shape
+    ``(n_frames, n_q)``, a shared ``q`` axis, optional stacked ``sigma``,
+    and a ``frame_index`` vector.  Frames are appended in call order.
+    """
+    intensity = np.asarray(r.intensity, dtype=np.float32)
+    n_q = intensity.shape[0]
+    idx = int(frame_idx)
+
+    if "integrated_1d" not in entry_grp:
+        g = entry_grp.create_group("integrated_1d")
+        g.attrs["NX_class"] = "NXdata"
+        g.attrs["signal"] = "intensity"
+        g.attrs["axes"] = ["frame_index", "q"]
+        g.create_dataset("intensity", data=intensity[None, :],
+                         maxshape=(None, n_q), chunks=(1, n_q), **comp_kwargs)
+        qd = g.create_dataset("q", data=np.asarray(r.radial, dtype=np.float32))
+        qd.attrs["units"] = r.unit
+        g.create_dataset("frame_index", data=np.asarray([idx], dtype=np.int64),
+                         maxshape=(None,), chunks=(64,))
+        if r.sigma is not None:
+            g.create_dataset("sigma", data=np.asarray(r.sigma, dtype=np.float32)[None, :],
+                             maxshape=(None, n_q), chunks=(1, n_q), **comp_kwargs)
+        return
+
+    g = entry_grp["integrated_1d"]
+    di = g["intensity"]
+    if di.shape[1] != n_q:
+        raise ValueError(
+            f"integrated_1d row size {n_q} != on-disk {di.shape[1]}; "
+            "all frames in a scan must share the same npt."
+        )
+    n = di.shape[0]
+    di.resize(n + 1, axis=0)
+    di[n] = intensity
+    fi = g["frame_index"]
+    fi.resize(n + 1, axis=0)
+    fi[n] = idx
+    if "sigma" in g and r.sigma is not None:
+        ds = g["sigma"]
+        ds.resize(n + 1, axis=0)
+        ds[n] = np.asarray(r.sigma, dtype=np.float32)
 
 
-def _write_result_2d(
-    proc_grp: h5py.Group,
-    frame_key: str,
+def _append_stacked_2d(
+    entry_grp: h5py.Group,
+    frame_idx: int | str,
     r: IntegrationResult2D,
     comp_kwargs: dict[str, Any],
 ) -> None:
-    """Write one IntegrationResult2D into /{entry}/reduction/{frame}/int_2d/."""
-    frame_grp = proc_grp.require_group(frame_key)
-    grp = frame_grp.require_group("int_2d")
-    grp.attrs["NX_class"] = "NXdata"
-    grp.attrs["signal"] = "intensity"
-    grp.attrs["axes"] = ["radial", "azimuthal"]
+    """Append one IntegrationResult2D as a slice of the stacked
+    ``/{entry}/integrated_2d`` NXdata group ``(n_frames, n_chi, n_q)``.
 
-    _replace(grp, "radial", r.radial, **comp_kwargs)
-    _replace(grp, "azimuthal", r.azimuthal, **comp_kwargs)
+    ``IntegrationResult2D.intensity`` is ``(n_q, n_chi)`` (the integrate_2d
+    convention); :func:`read_scan` reads ``(frame, chi, q)``, so each frame
+    is transposed to ``(n_chi, n_q)`` on write.
+    """
+    intensity = np.asarray(r.intensity, dtype=np.float32).T  # (n_chi, n_q)
+    n_chi, n_q = intensity.shape
+    idx = int(frame_idx)
 
-    chunks = (r.intensity.shape[0], min(r.intensity.shape[1], 64))
-    _replace(grp, "intensity", r.intensity, chunks=chunks, **comp_kwargs)
-    if r.sigma is not None:
-        _replace(grp, "sigma", r.sigma, chunks=chunks, **comp_kwargs)
-    grp.attrs["unit"] = r.unit
-    grp.attrs["azimuthal_unit"] = r.azimuthal_unit
+    if "integrated_2d" not in entry_grp:
+        g = entry_grp.create_group("integrated_2d")
+        g.attrs["NX_class"] = "NXdata"
+        g.attrs["signal"] = "intensity"
+        g.attrs["axes"] = ["frame_index", "chi", "q"]
+        g.create_dataset("intensity", data=intensity[None],
+                         maxshape=(None, n_chi, n_q),
+                         chunks=(1, n_chi, n_q), **comp_kwargs)
+        qd = g.create_dataset("q", data=np.asarray(r.radial, dtype=np.float32))
+        qd.attrs["units"] = r.unit
+        cd = g.create_dataset("chi", data=np.asarray(r.azimuthal, dtype=np.float32))
+        cd.attrs["units"] = r.azimuthal_unit
+        g.create_dataset("frame_index", data=np.asarray([idx], dtype=np.int64),
+                         maxshape=(None,), chunks=(64,))
+        if r.sigma is not None:
+            g.create_dataset("sigma",
+                             data=np.asarray(r.sigma, dtype=np.float32).T[None],
+                             maxshape=(None, n_chi, n_q),
+                             chunks=(1, n_chi, n_q), **comp_kwargs)
+        return
+
+    g = entry_grp["integrated_2d"]
+    di = g["intensity"]
+    if di.shape[1:] != (n_chi, n_q):
+        raise ValueError(
+            f"integrated_2d slice {(n_chi, n_q)} != on-disk {tuple(di.shape[1:])}; "
+            "all frames in a scan must share the same (npt_azim, npt_rad)."
+        )
+    n = di.shape[0]
+    di.resize(n + 1, axis=0)
+    di[n] = intensity
+    fi = g["frame_index"]
+    fi.resize(n + 1, axis=0)
+    fi[n] = idx
+    if "sigma" in g and r.sigma is not None:
+        ds = g["sigma"]
+        ds.resize(n + 1, axis=0)
+        ds[n] = np.asarray(r.sigma, dtype=np.float32).T
 
 
 # ---------------------------------------------------------------------------

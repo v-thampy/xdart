@@ -79,9 +79,21 @@ def _decode(v):
     return v.decode("utf-8") if isinstance(v, (bytes, np.bytes_)) else v
 
 
-def _frame_index(grp: h5py.Group) -> np.ndarray:
-    """Return the frame-label array, trying each group that may carry it."""
-    for name in ("integrated_1d", "integrated_2d", "per_frame_geometry"):
+def _frame_index(grp: h5py.Group, prefer: str | None = None) -> np.ndarray:
+    """Return the frame-label array for an entry.
+
+    ``prefer`` names the group whose ``frame_index`` to use first — pass
+    ``"integrated_2d"`` from :func:`get_2d` so frames resolve against the
+    2D output's own labels.  This matters when 1D and 2D were reduced over
+    different frame subsets (or re-reduced with different labels): a
+    ``frame=`` request must index the group it's reading from, not the
+    other one.  Falls back to the usual order if the preferred group has
+    no ``frame_index``.
+    """
+    order = ("integrated_1d", "integrated_2d", "per_frame_geometry")
+    if prefer is not None:
+        order = (prefer,) + tuple(n for n in order if n != prefer)
+    for name in order:
         if name in grp and "frame_index" in grp[name]:
             return np.asarray(grp[name]["frame_index"][()])
     raise KeyError("No frame_index found (integrated_1d/2d/per_frame_geometry)")
@@ -153,7 +165,8 @@ def get_1d(
         if "integrated_1d" not in e:
             raise KeyError(f"{scan_file} has no integrated_1d group")
         g = e["integrated_1d"]
-        positions, frames, single = _resolve_positions(_frame_index(e), frame)
+        positions, frames, single = _resolve_positions(
+            _frame_index(e, prefer="integrated_1d"), frame)
 
         q = np.asarray(g["q"][()])
         q_unit = _decode(g["q"].attrs.get("units")) if "units" in g["q"].attrs else None
@@ -184,7 +197,8 @@ def get_2d(
         if "integrated_2d" not in e:
             raise KeyError(f"{scan_file} has no integrated_2d group")
         g = e["integrated_2d"]
-        positions, frames, single = _resolve_positions(_frame_index(e), frame)
+        positions, frames, single = _resolve_positions(
+            _frame_index(e, prefer="integrated_2d"), frame)
 
         q = np.asarray(g["q"][()])
         chi = np.asarray(g["chi"][()])

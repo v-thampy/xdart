@@ -209,6 +209,35 @@ def test_legacy_read_sphere_names_are_gone():
     assert hasattr(nexus_io, "read_scan_metadata")
 
 
+def test_get_2d_resolves_against_its_own_frame_labels(tmp_path):
+    """When 1D and 2D were reduced over different frame labels, get_2d must
+    index integrated_2d's own frame_index (not integrated_1d's)."""
+    p = tmp_path / "diff_labels.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g1 = e.create_group("integrated_1d")
+        g1.create_dataset("intensity", data=np.zeros((3, 5), dtype="f4"))
+        g1.create_dataset("q", data=np.linspace(1, 5, 5))
+        g1.create_dataset("frame_index", data=np.array([0, 1, 2], dtype="i4"))
+        g2 = e.create_group("integrated_2d")
+        # distinct value per 2D row so we can tell which one we got
+        i2 = np.stack([np.full((4, 5), float(k)) for k in range(3)]).astype("f4")
+        g2.create_dataset("intensity", data=i2)
+        g2.create_dataset("q", data=np.linspace(1, 5, 5))
+        g2.create_dataset("chi", data=np.linspace(-180, 180, 4, endpoint=False))
+        g2.create_dataset("frame_index", data=np.array([10, 11, 12], dtype="i4"))
+
+    # 2D label 11 → row 1 (value 1.0 everywhere); must NOT raise or pick row 0.
+    r = get_2d(p, frame=11)
+    assert r.frames == 11
+    assert np.allclose(r.intensity, 1.0)
+    # a label that only exists in 1D is not a valid 2D frame
+    with pytest.raises(KeyError):
+        get_2d(p, frame=0)
+    # 1D still indexes its own labels
+    assert get_1d(p, frame=2).intensity.shape == (5,)
+
+
 def test_scan_sugar(scan_file):
     p, ref = scan_file
     scan = open_scan(p)

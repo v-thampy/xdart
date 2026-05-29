@@ -600,36 +600,31 @@ class TestWriteNexus:
         write_nexus(p, results_1d={0: result_1d})
         write_nexus(p, results_1d={1: result_1d}, overwrite=True)
         with h5py.File(p, "r") as f:
-            frames = list(f["entry/reduction"].keys())
-        assert "0" not in frames  # old frame gone
-        assert "1" in frames
+            frames = list(f["entry/integrated_1d/frame_index"][()])
+        assert frames == [1]  # old frame gone
 
     def test_append_default(self, tmp_path, result_1d):
         p = tmp_path / "app.h5"
         write_nexus(p, results_1d={0: result_1d})
         write_nexus(p, results_1d={1: result_1d})  # append
         with h5py.File(p, "r") as f:
-            frames = list(f["entry/reduction"].keys())
-        assert "0" in frames
-        assert "1" in frames
+            frames = list(f["entry/integrated_1d/frame_index"][()])
+        assert frames == [0, 1]
 
     def test_compression_none(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "nc.h5", results_1d={0: result_1d}, compression=None)
         with h5py.File(p, "r") as f:
-            ds = f["entry/reduction/0/int_1d/intensity"]
-            assert ds.compression is None
+            assert f["entry/integrated_1d/intensity"].compression is None
 
     def test_compression_lzf(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "lzf.h5", results_1d={0: result_1d}, compression="lzf")
         with h5py.File(p, "r") as f:
-            ds = f["entry/reduction/0/int_1d/intensity"]
-            assert ds.compression == "lzf"
+            assert f["entry/integrated_1d/intensity"].compression == "lzf"
 
     def test_compression_gzip(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "gz.h5", results_1d={0: result_1d}, compression="gzip")
         with h5py.File(p, "r") as f:
-            ds = f["entry/reduction/0/int_1d/intensity"]
-            assert ds.compression == "gzip"
+            assert f["entry/integrated_1d/intensity"].compression == "gzip"
 
     def test_custom_entry_name(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "e.h5", results_1d={0: result_1d}, entry="scan_1")
@@ -643,68 +638,67 @@ class TestWriteNexus:
 # ---------------------------------------------------------------------------
 
 class TestWriteNexusResult1D:
-    def test_frame_group_created(self, tmp_path, result_1d):
+    """Stacked /entry/integrated_1d layout (read_scan-compatible)."""
+
+    def test_group_created(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
-            assert "0" in f["entry/reduction"]
-            assert "int_1d" in f["entry/reduction/0"]
+            assert "integrated_1d" in f["entry"]
+            assert "intensity" in f["entry/integrated_1d"]
 
     def test_nxdata_class(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
-            grp = f["entry/reduction/0/int_1d"]
+            grp = f["entry/integrated_1d"]
             assert grp.attrs["NX_class"] == "NXdata"
             assert grp.attrs["signal"] == "intensity"
-            assert list(grp.attrs["axes"]) == ["radial"]
+            assert list(grp.attrs["axes"]) == ["frame_index", "q"]
 
-    def test_radial_values(self, tmp_path, result_1d):
+    def test_q_axis_values(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
             np.testing.assert_allclose(
-                f["entry/reduction/0/int_1d/radial"][()], result_1d.radial
+                f["entry/integrated_1d/q"][()], result_1d.radial, rtol=1e-6,
             )
 
-    def test_intensity_values(self, tmp_path, result_1d):
+    def test_intensity_values_stacked(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
-            np.testing.assert_allclose(
-                f["entry/reduction/0/int_1d/intensity"][()], result_1d.intensity
-            )
+            stored = f["entry/integrated_1d/intensity"][()]
+        assert stored.shape == (1, result_1d.intensity.shape[0])
+        np.testing.assert_allclose(stored[0], result_1d.intensity, rtol=1e-6)
 
     def test_sigma_written_when_present(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
-            assert "sigma" in f["entry/reduction/0/int_1d"]
+            assert "sigma" in f["entry/integrated_1d"]
             np.testing.assert_allclose(
-                f["entry/reduction/0/int_1d/sigma"][()], result_1d.sigma
+                f["entry/integrated_1d/sigma"][0], result_1d.sigma, rtol=1e-6,
             )
 
     def test_sigma_absent_when_none(self, tmp_path):
         r = IntegrationResult1D(
-            radial=np.linspace(0, 5, 50),
-            intensity=np.ones(50),
-            unit="q_A^-1",
+            radial=np.linspace(0, 5, 50), intensity=np.ones(50), unit="q_A^-1",
         )
         p = write_nexus(tmp_path / "a.h5", results_1d={0: r})
         with h5py.File(p, "r") as f:
-            assert "sigma" not in f["entry/reduction/0/int_1d"]
+            assert "sigma" not in f["entry/integrated_1d"]
 
-    def test_unit_attribute(self, tmp_path, result_1d):
+    def test_unit_on_q_axis(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "a.h5", results_1d={0: result_1d})
         with h5py.File(p, "r") as f:
-            assert f["entry/reduction/0/int_1d"].attrs["unit"] == "q_A^-1"
+            assert f["entry/integrated_1d/q"].attrs["units"] == "q_A^-1"
 
-    def test_string_frame_key(self, tmp_path, result_1d):
-        p = write_nexus(tmp_path / "a.h5", results_1d={"frame_5": result_1d})
-        with h5py.File(p, "r") as f:
-            assert "frame_5" in f["entry/reduction"]
+    def test_non_integer_frame_key_raises(self, tmp_path, result_1d):
+        # The stacked frame_index requires integer frame labels.
+        with pytest.raises(ValueError):
+            write_nexus(tmp_path / "a.h5", results_1d={"frame_5": result_1d})
 
-    def test_multiple_frames(self, tmp_path, result_1d):
-        results = {i: result_1d for i in range(5)}
-        p = write_nexus(tmp_path / "a.h5", results_1d=results)
+    def test_multiple_frames_stacked(self, tmp_path, result_1d):
+        p = write_nexus(tmp_path / "a.h5", results_1d={i: result_1d for i in range(5)})
         with h5py.File(p, "r") as f:
-            frames = set(f["entry/reduction"].keys())
-        assert frames == {"0", "1", "2", "3", "4"}
+            assert list(f["entry/integrated_1d/frame_index"][()]) == [0, 1, 2, 3, 4]
+            assert f["entry/integrated_1d/intensity"].shape[0] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -712,57 +706,58 @@ class TestWriteNexusResult1D:
 # ---------------------------------------------------------------------------
 
 class TestWriteNexusResult2D:
-    def test_frame_group_created(self, tmp_path, result_2d):
+    """Stacked /entry/integrated_2d layout (read_scan-compatible)."""
+
+    def test_group_created(self, tmp_path, result_2d):
         p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
-            assert "int_2d" in f["entry/reduction/0"]
+            assert "integrated_2d" in f["entry"]
 
     def test_nxdata_class(self, tmp_path, result_2d):
         p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
-            grp = f["entry/reduction/0/int_2d"]
+            grp = f["entry/integrated_2d"]
             assert grp.attrs["NX_class"] == "NXdata"
             assert grp.attrs["signal"] == "intensity"
-            assert list(grp.attrs["axes"]) == ["radial", "azimuthal"]
+            assert list(grp.attrs["axes"]) == ["frame_index", "chi", "q"]
 
     def test_axes_values(self, tmp_path, result_2d):
         p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
             np.testing.assert_allclose(
-                f["entry/reduction/0/int_2d/radial"][()], result_2d.radial
+                f["entry/integrated_2d/q"][()], result_2d.radial, rtol=1e-6,
             )
             np.testing.assert_allclose(
-                f["entry/reduction/0/int_2d/azimuthal"][()], result_2d.azimuthal
+                f["entry/integrated_2d/chi"][()], result_2d.azimuthal, rtol=1e-6,
             )
 
-    def test_intensity_shape(self, tmp_path, result_2d):
+    def test_intensity_shape_and_orientation(self, tmp_path, result_2d):
+        # IntegrationResult2D.intensity is (n_q, n_chi); stored (frame, chi, q).
         p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
-            stored = f["entry/reduction/0/int_2d/intensity"][()]
-        assert stored.shape == result_2d.intensity.shape
-        np.testing.assert_allclose(stored, result_2d.intensity)
+            stored = f["entry/integrated_2d/intensity"][()]
+        n_q, n_chi = result_2d.intensity.shape
+        assert stored.shape == (1, n_chi, n_q)
+        np.testing.assert_allclose(stored[0], result_2d.intensity.T, rtol=1e-6)
 
     def test_intensity_chunked(self, tmp_path, result_2d):
         p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d}, compression="lzf")
         with h5py.File(p, "r") as f:
-            ds = f["entry/reduction/0/int_2d/intensity"]
-            assert ds.chunks is not None
+            assert f["entry/integrated_2d/intensity"].chunks is not None
 
     def test_sigma_written_when_present(self, tmp_path):
         q = np.linspace(0.1, 5, 30)
         chi = np.linspace(-90, 90, 20)
-        intensity = np.ones((30, 20))
-        sigma = intensity * 0.1
-        r = IntegrationResult2D(radial=q, azimuthal=chi, intensity=intensity,
-                                sigma=sigma, unit="q_A^-1")
+        r = IntegrationResult2D(radial=q, azimuthal=chi, intensity=np.ones((30, 20)),
+                                sigma=np.ones((30, 20)) * 0.1, unit="q_A^-1")
         p = write_nexus(tmp_path / "a.h5", results_2d={0: r})
         with h5py.File(p, "r") as f:
-            assert "sigma" in f["entry/reduction/0/int_2d"]
+            assert "sigma" in f["entry/integrated_2d"]
 
-    def test_unit_attribute(self, tmp_path, result_2d):
+    def test_unit_on_q_axis(self, tmp_path, result_2d):
         p = write_nexus(tmp_path / "a.h5", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
-            assert f["entry/reduction/0/int_2d"].attrs["unit"] == "q_A^-1"
+            assert f["entry/integrated_2d/q"].attrs["units"] == "q_A^-1"
 
 
 # ---------------------------------------------------------------------------
@@ -909,7 +904,7 @@ class TestWriteNexusFrame:
             h5.close()
         with h5py.File(p, "r") as f:
             np.testing.assert_allclose(
-                f["entry/reduction/0/int_1d/intensity"][()], result_1d.intensity
+                f["entry/integrated_1d/intensity"][0], result_1d.intensity, rtol=1e-6,
             )
 
     def test_writes_2d_result(self, tmp_path, result_2d):
@@ -920,8 +915,8 @@ class TestWriteNexusFrame:
         finally:
             h5.close()
         with h5py.File(p, "r") as f:
-            stored = f["entry/reduction/0/int_2d/intensity"][()]
-        np.testing.assert_allclose(stored, result_2d.intensity)
+            stored = f["entry/integrated_2d/intensity"][0]   # (chi, q)
+        np.testing.assert_allclose(stored, result_2d.intensity.T, rtol=1e-6)
 
     def test_writes_multiple_frames(self, tmp_path, result_1d):
         p = tmp_path / "live.h5"
@@ -932,23 +927,25 @@ class TestWriteNexusFrame:
         finally:
             h5.close()
         with h5py.File(p, "r") as f:
-            frames = set(f["entry/reduction"].keys())
-        assert frames == {"0", "1", "2", "3"}
+            assert list(f["entry/integrated_1d/frame_index"][()]) == [0, 1, 2, 3]
+            assert f["entry/integrated_1d/intensity"].shape[0] == 4
 
-    def test_overwrites_existing_frame(self, tmp_path, result_1d):
-        """Writing the same frame key twice replaces the data (_replace semantics)."""
+    def test_appends_in_call_order(self, tmp_path, result_1d):
+        """Stacked write is append-only — frames land in the order written."""
         q_new = np.linspace(1, 6, 200)
-        r_new = IntegrationResult1D(radial=q_new, intensity=np.ones(200), unit="q_A^-1")
+        r_new = IntegrationResult1D(radial=q_new, intensity=np.full(200, 2.0), unit="q_A^-1")
         p = tmp_path / "live.h5"
         h5 = open_nexus_writer(p)
         try:
             write_nexus_frame(h5, 0, result_1d=result_1d)
-            write_nexus_frame(h5, 0, result_1d=r_new)
+            write_nexus_frame(h5, 1, result_1d=r_new)
         finally:
             h5.close()
         with h5py.File(p, "r") as f:
-            radial = f["entry/reduction/0/int_1d/radial"][()]
-        np.testing.assert_allclose(radial, q_new)
+            assert list(f["entry/integrated_1d/frame_index"][()]) == [0, 1]
+            np.testing.assert_allclose(
+                f["entry/integrated_1d/intensity"][1], r_new.intensity, rtol=1e-6,
+            )
 
     def test_frame_with_both_1d_and_2d(self, tmp_path, result_1d, result_2d):
         p = tmp_path / "live.h5"
@@ -958,8 +955,8 @@ class TestWriteNexusFrame:
         finally:
             h5.close()
         with h5py.File(p, "r") as f:
-            assert "int_1d" in f["entry/reduction/0"]
-            assert "int_2d" in f["entry/reduction/0"]
+            assert "integrated_1d" in f["entry"]
+            assert "integrated_2d" in f["entry"]
 
     def test_flush_does_not_corrupt(self, tmp_path, result_1d):
         p = tmp_path / "live.h5"
@@ -972,18 +969,16 @@ class TestWriteNexusFrame:
         finally:
             h5.close()
         with h5py.File(p, "r") as f:
-            assert "0" in f["entry/reduction"]
-            assert "1" in f["entry/reduction"]
+            assert list(f["entry/integrated_1d/frame_index"][()]) == [0, 1]
 
-    def test_string_frame_key(self, tmp_path, result_1d):
+    def test_non_integer_frame_key_raises(self, tmp_path, result_1d):
         p = tmp_path / "live.h5"
         h5 = open_nexus_writer(p)
         try:
-            write_nexus_frame(h5, "frame_007", result_1d=result_1d)
+            with pytest.raises(ValueError):
+                write_nexus_frame(h5, "frame_007", result_1d=result_1d)
         finally:
             h5.close()
-        with h5py.File(p, "r") as f:
-            assert "frame_007" in f["entry/reduction"]
 
     def test_no_result_is_noop(self, tmp_path):
         p = tmp_path / "live.h5"
@@ -993,8 +988,7 @@ class TestWriteNexusFrame:
         finally:
             h5.close()
         with h5py.File(p, "r") as f:
-            # frame group may or may not exist — just no crash
-            pass
+            assert "integrated_1d" not in f["entry"]
 
 
 # ---------------------------------------------------------------------------
@@ -1009,20 +1003,21 @@ class TestRoundtrip:
             results_1d={0: result_1d, 1: result_1d},
         )
         with h5py.File(p, "r") as f:
-            for frame in ("0", "1"):
-                grp = f[f"entry/reduction/{frame}/int_1d"]
-                np.testing.assert_allclose(grp["radial"][()], result_1d.radial)
-                np.testing.assert_allclose(grp["intensity"][()], result_1d.intensity)
-                np.testing.assert_allclose(grp["sigma"][()], result_1d.sigma)
-                assert grp.attrs["unit"] == "q_A^-1"
+            g = f["entry/integrated_1d"]
+            assert list(g["frame_index"][()]) == [0, 1]
+            np.testing.assert_allclose(g["q"][()], result_1d.radial, rtol=1e-6)
+            for row in (0, 1):
+                np.testing.assert_allclose(g["intensity"][row], result_1d.intensity, rtol=1e-6)
+                np.testing.assert_allclose(g["sigma"][row], result_1d.sigma, rtol=1e-6)
+            assert g["q"].attrs["units"] == "q_A^-1"
 
     def test_2d_full_roundtrip(self, tmp_path, result_2d):
         p = write_nexus(tmp_path / "scan.h5", results_2d={0: result_2d})
         with h5py.File(p, "r") as f:
-            grp = f["entry/reduction/0/int_2d"]
-            np.testing.assert_allclose(grp["radial"][()], result_2d.radial)
-            np.testing.assert_allclose(grp["azimuthal"][()], result_2d.azimuthal)
-            np.testing.assert_allclose(grp["intensity"][()], result_2d.intensity)
+            g = f["entry/integrated_2d"]
+            np.testing.assert_allclose(g["q"][()], result_2d.radial, rtol=1e-6)
+            np.testing.assert_allclose(g["chi"][()], result_2d.azimuthal, rtol=1e-6)
+            np.testing.assert_allclose(g["intensity"][0], result_2d.intensity.T, rtol=1e-6)
 
     def test_list_entries_after_write(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "scan.h5", results_1d={0: result_1d}, entry="entry_001")
@@ -1030,8 +1025,8 @@ class TestRoundtrip:
         assert "entry_001" in entries
 
     def test_incremental_same_as_batch(self, tmp_path, result_1d, result_2d):
-        """open_nexus_writer + write_nexus_frame should produce the same structure
-        as a single write_nexus call."""
+        """open_nexus_writer + write_nexus_frame produces the same stacked
+        structure as a single write_nexus call."""
         p_batch = tmp_path / "batch.h5"
         write_nexus(p_batch, results_1d={0: result_1d}, results_2d={0: result_2d})
 
@@ -1043,9 +1038,6 @@ class TestRoundtrip:
             h5.close()
 
         with h5py.File(p_batch, "r") as fb, h5py.File(p_incr, "r") as fi:
-            for key in ("int_1d/radial", "int_1d/intensity",
-                        "int_2d/radial", "int_2d/azimuthal", "int_2d/intensity"):
-                np.testing.assert_allclose(
-                    fb[f"entry/reduction/0/{key}"][()],
-                    fi[f"entry/reduction/0/{key}"][()],
-                )
+            for key in ("integrated_1d/q", "integrated_1d/intensity",
+                        "integrated_2d/q", "integrated_2d/chi", "integrated_2d/intensity"):
+                np.testing.assert_allclose(fb[f"entry/{key}"][()], fi[f"entry/{key}"][()])
