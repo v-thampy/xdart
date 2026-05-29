@@ -30,17 +30,6 @@ from xdart.modules.reduction import (
 )
 
 
-# Convenience aliases used throughout the tests below to keep wording short.
-# These exist only inside the test module — the production aliases on
-# xdart.modules.{ewald,reduction} were dropped in the rename release.
-EwaldArch = LiveFrame
-EwaldSphere = LiveScan
-ArchSeries = LiveFrameSeries
-frame_from_ewald_arch = frame_from_live_frame
-scan_from_ewald_sphere = scan_from_live_scan
-plan_from_ewald_sphere = plan_from_live_scan
-reduce_ewald_arch = reduce_live_frame
-dispatch_arch_reduction = dispatch_live_frame_reduction
 
 
 def _poni() -> PONI:
@@ -172,8 +161,8 @@ def test_live_scan_loader_normalizes_legacy_reduction_provenance(
     assert live_scan.bai_2d_args["owner"] == "LiveScan"
 
 
-def test_frame_from_ewald_arch_maps_simple_fields(tmp_path) -> None:
-    frame = EwaldArch(
+def test_frame_from_live_frame_maps_simple_fields(tmp_path) -> None:
+    frame = LiveFrame(
         idx=4,
         map_raw=np.arange(4).reshape(2, 2),
         poni=_poni(),
@@ -186,7 +175,7 @@ def test_frame_from_ewald_arch_maps_simple_fields(tmp_path) -> None:
     frame._source_root = str(tmp_path)
     frame.map_norm = 5.0
 
-    frame = frame_from_ewald_arch(frame)
+    frame = frame_from_live_frame(frame)
 
     assert frame.index == 4
     np.testing.assert_array_equal(frame.image, np.arange(4).reshape(2, 2))
@@ -201,15 +190,15 @@ def test_frame_from_ewald_arch_maps_simple_fields(tmp_path) -> None:
     assert frame.normalization_factor is None
 
 
-def test_frame_from_ewald_arch_can_skip_large_background() -> None:
-    frame = EwaldArch(
+def test_frame_from_live_frame_can_skip_large_background() -> None:
+    frame = LiveFrame(
         idx=4,
         map_raw=np.arange(4).reshape(2, 2),
         poni=_poni(),
         bg_raw=np.ones((2, 2)),
     )
 
-    frame = frame_from_ewald_arch(
+    frame = frame_from_live_frame(
         frame,
         include_image=False,
         include_background=False,
@@ -219,12 +208,12 @@ def test_frame_from_ewald_arch_can_skip_large_background() -> None:
     assert frame.background is None
 
 
-def test_scan_from_ewald_sphere_uses_scan_frame_names() -> None:
-    a2 = EwaldArch(idx=2, map_raw=np.ones((2, 2)), poni=_poni(),
+def test_scan_from_live_scan_uses_scan_frame_names() -> None:
+    a2 = LiveFrame(idx=2, map_raw=np.ones((2, 2)), poni=_poni(),
                    scan_info={"th": 2.0})
-    a1 = EwaldArch(idx=1, map_raw=np.zeros((2, 2)), poni=_poni(),
+    a1 = LiveFrame(idx=1, map_raw=np.zeros((2, 2)), poni=_poni(),
                    scan_info={"th": 1.0})
-    scan = EwaldSphere(
+    scan = LiveScan(
         "scan42",
         frames=[a2, a1],
         scan_data=pd.DataFrame({"th": [1.0, 2.0]}, index=[1, 2]),
@@ -232,7 +221,7 @@ def test_scan_from_ewald_sphere_uses_scan_frame_names() -> None:
         data_file="scan42.nxs",
     )
 
-    scan = scan_from_ewald_sphere(scan)
+    scan = scan_from_live_scan(scan)
 
     assert scan.name == "scan42"
     assert [f.index for f in scan.frames] == [1, 2]
@@ -242,9 +231,9 @@ def test_scan_from_ewald_sphere_uses_scan_frame_names() -> None:
     assert scan.output_path.name == "scan42.nxs"
 
 
-def test_plan_from_ewald_sphere_maps_integration_settings() -> None:
-    frame = EwaldArch(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
-    scan = EwaldSphere(
+def test_plan_from_live_scan_maps_integration_settings() -> None:
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan(
         "scan",
         frames=[frame],
         bai_1d_args={
@@ -269,7 +258,7 @@ def test_plan_from_ewald_sphere_maps_integration_settings() -> None:
         global_mask=np.array([0, 3]),
     )
 
-    plan = plan_from_ewald_sphere(scan)
+    plan = plan_from_live_scan(scan)
 
     assert plan.integration_1d is not None
     assert plan.integration_2d is not None
@@ -297,20 +286,20 @@ def test_plan_from_ewald_sphere_maps_integration_settings() -> None:
     )
 
 
-def test_plan_from_gi_sphere_requires_incident_angle() -> None:
-    scan = EwaldSphere("scan", frames=[EwaldArch(idx=0, map_raw=np.ones((2, 2)))],
+def test_plan_from_gi_scan_requires_incident_angle() -> None:
+    scan = LiveScan("scan", frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)))],
                          gi=True)
 
     try:
-        plan_from_ewald_sphere(scan)
+        plan_from_live_scan(scan)
     except ValueError as exc:
         assert "gi_incident_angle" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected missing GI angle to fail")
 
 
-def test_reduce_ewald_arch_populates_existing_arch(monkeypatch) -> None:
-    frame = EwaldArch(
+def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
+    frame = LiveFrame(
         idx=7,
         map_raw=np.arange(4).reshape(2, 2),
         poni=_poni(),
@@ -344,7 +333,7 @@ def test_reduce_ewald_arch_populates_existing_arch(monkeypatch) -> None:
 
     monkeypatch.setattr(reduction_adapters, "run_reduction", fake_run_reduction)
 
-    returned = reduce_ewald_arch(
+    returned = reduce_live_frame(
         frame,
         plan,
         scan_name="scan",
@@ -362,35 +351,35 @@ def test_mask_conversion_ignores_incompatible_mask() -> None:
     """A matching mask is applied; a shape-incompatible mask is ignored
     (plan.mask is None) with a warning rather than raising — reducing
     unmasked beats aborting the scan."""
-    frame = EwaldArch(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
-    scan = EwaldSphere(
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan(
         "scan",
         frames=[frame],
         global_mask=np.array([[1, 0], [0, 1]]),
     )
-    plan = plan_from_ewald_sphere(scan)
+    plan = plan_from_live_scan(scan)
     np.testing.assert_array_equal(
         plan.mask,
         np.array([[True, False], [False, True]]),
     )
 
-    bad = EwaldSphere(
+    bad = LiveScan(
         "scan",
         frames=[frame],
         global_mask=np.ones((3, 3)),  # wrong shape for a 2x2 image
     )
-    bad_plan = plan_from_ewald_sphere(bad)
+    bad_plan = plan_from_live_scan(bad)
     assert bad_plan.mask is None
 
 
 def test_flat_global_mask_is_preserved_until_shape_is_known() -> None:
-    scan = EwaldSphere(
+    scan = LiveScan(
         "scan",
-        frames=[EwaldArch(idx=0, map_raw=None, poni=_poni())],
+        frames=[LiveFrame(idx=0, map_raw=None, poni=_poni())],
         global_mask=np.array([0, 3]),
     )
 
-    plan = plan_from_ewald_sphere(scan)
+    plan = plan_from_live_scan(scan)
 
     assert isinstance(plan.mask, MaskSpec)
     np.testing.assert_array_equal(
@@ -435,7 +424,7 @@ def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> Non
         _xye_buffer=[],
         nexus_file="scan.nxs",
     )
-    worker._resolve_frame_mask = lambda _sphere, _img: np.array([0])
+    worker._resolve_frame_mask = lambda _scan, _img: np.array([0])
 
     frame = nexus_wrangler_thread.nexusThread._integrate_one(
         worker,
@@ -488,7 +477,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
         showLabel=_Signal(),
         _middle_truncate=lambda text: text,
         _apply_threshold_inline=lambda img: img,
-        _resolve_frame_mask=lambda _sphere, _img: np.array([0]),
+        _resolve_frame_mask=lambda _scan, _img: np.array([0]),
         gi=False,
         poni=_poni(),
         incidence_motor="th",
@@ -535,8 +524,8 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
 
     monkeypatch.setattr(reduction_adapters, "run_reduction", fake_run_reduction)
 
-    frame = EwaldArch(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
-    scan = EwaldSphere(
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan(
         "scan",
         frames=[frame],
         bai_1d_args={"monitor": "i0"},
@@ -574,8 +563,8 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
 
     monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
 
-    frame = EwaldArch(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
-    scan = EwaldSphere("scan", frames=[frame])
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan("scan", frames=[frame])
     scan._cached_integrator = _FakeIntegrator()
     data_1d = {}
     data_2d = {}

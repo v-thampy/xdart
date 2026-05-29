@@ -37,7 +37,7 @@ QFileDialog = QtWidgets.QFileDialog
 QItemSelectionModel = QtCore.QItemSelectionModel
 
 
-class _LoadArchesWorker(QtCore.QObject):
+class _LoadFramesWorker(QtCore.QObject):
     """M1 background worker for ``load_frames_data``.
 
     Runs ``_load_frame_v2`` for each requested frame on a dedicated
@@ -45,7 +45,7 @@ class _LoadArchesWorker(QtCore.QObject):
 
     Usage::
 
-        worker = _LoadArchesWorker(data_file, file_lock, gi, frame_ids, load_2d)
+        worker = _LoadFramesWorker(data_file, file_lock, gi, frame_ids, load_2d)
         thread = QtCore.QThread()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -155,7 +155,7 @@ class _LoadArchesWorker(QtCore.QObject):
                     self.generation, int(idx), frame, bool(self.load_2d),
                 )
         except Exception:
-            logger.exception("LoadArchesWorker crashed unexpectedly")
+            logger.exception("LoadFramesWorker crashed unexpectedly")
         finally:
             self.finished.emit(self.generation)
 
@@ -477,7 +477,7 @@ class H5Viewer(QWidget):
         self.file_thread.sigUpdate.connect(self.sigUpdate.emit)
         self.file_thread.start(Qt.QtCore.QThread.LowPriority)
         self._h5pool = get_pool()
-        # M1: handle for the per-selection LoadArchesWorker.  None
+        # M1: handle for the per-selection LoadFramesWorker.  None
         # when no load is in flight.  Owns a QThread that gets
         # created on demand and reaped between selections.
         self._load_worker = None
@@ -490,7 +490,7 @@ class H5Viewer(QWidget):
         # new selection's data dicts.
         self._load_generation = 0
         # O6: coalesce ``sigUpdate`` emits while a chunk burst is
-        # streaming in from ``_LoadArchesWorker``.  Without this, a
+        # streaming in from ``_LoadFramesWorker``.  Without this, a
         # 100-frame selection fires 100 full-display repaints in
         # rapid succession.  With it, the burst is debounced to a
         # single emit ~100 ms after the last chunk lands — and the
@@ -1163,7 +1163,7 @@ class H5Viewer(QWidget):
             idxs_memory = [int(idx) for idx in idxs if int(idx) in self.data_1d.keys()]
 
         # Multi-frame combination is now done on demand by
-        # get_arches_int_2d / get_frames_map_raw — no shared accumulator
+        # get_frames_int_2d / get_frames_map_raw — no shared accumulator
         # state to maintain here. Just figure out which frames still
         # need to be loaded from disk.
         frame_ids = [int(idx) for idx in idxs
@@ -1246,7 +1246,7 @@ class H5Viewer(QWidget):
         self.set_file(fname)
 
     def load_frames_data(self, frame_ids, load_2d):
-        """Dispatch a background ``_LoadArchesWorker`` for the given
+        """Dispatch a background ``_LoadFramesWorker`` for the given
         frame_ids and return immediately.
 
         M1: pre-M1 this method ran ``_load_frame_v2`` for every frame
@@ -1287,7 +1287,7 @@ class H5Viewer(QWidget):
         # from the previous worker are dropped.
         self._load_generation += 1
         gen = self._load_generation
-        worker = _LoadArchesWorker(
+        worker = _LoadFramesWorker(
             data_file=self.scan.data_file,
             file_lock=self.file_lock,
             gi=self.scan.gi,
@@ -1321,7 +1321,7 @@ class H5Viewer(QWidget):
         thread.start()
 
     def _absorb_chunk(self, generation, idx, frame, load_2d) -> None:
-        """Slot for ``_LoadArchesWorker.chunkLoaded``.  Runs on the
+        """Slot for ``_LoadFramesWorker.chunkLoaded``.  Runs on the
         GUI thread; writes the loaded frame into the viewer dicts
         under ``data_lock`` and emits ``sigUpdate`` so the display
         repaints incrementally.
@@ -1399,7 +1399,7 @@ class H5Viewer(QWidget):
     # Removed get_frames_sum / _safe_accumulate / _raw_minus_bg and the
     # add_idxs/sub_idxs/sum_int_2d/sum_map_raw machinery: combining 2D
     # data across multiple selected frames is now done on demand by
-    # display_data.get_arches_int_2d / get_frames_map_raw, which iterate
+    # display_data.get_frames_int_2d / get_frames_map_raw, which iterate
     # the current selection straight from data_2d. The old stateful
-    # approach was both inconsistent with the 1D path (get_arches_int_1d)
+    # approach was both inconsistent with the 1D path (get_frames_int_1d)
     # and silently dead for sum_map_raw, which was never read anywhere.

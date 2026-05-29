@@ -38,7 +38,7 @@ class DisplayDataMixin:
 
     ``data_1d`` and ``data_2d`` are shared between the wrangler
     thread, the integrator thread, the fileHandlerThread / the M1
-    LoadArchesWorker, and the GUI thread.  All **mutating** access
+    LoadFramesWorker, and the GUI thread.  All **mutating** access
     (assignment, ``del``, ``clear``, ``pop``) goes through
     ``self.data_lock``.  **Read** access either takes ``data_lock``
     explicitly (when iterating multiple keys) or uses
@@ -55,7 +55,7 @@ class DisplayDataMixin:
     """
 
     def _snapshot_data(self, idxs):
-        """Return a small {idx: (arch_1d, arch_2d_dict)} dict for
+        """Return a small {idx: (frame_1d, frame_2d_dict)} dict for
         the requested ``idxs``, sampled atomically under
         ``self.data_lock``.
 
@@ -99,13 +99,13 @@ class DisplayDataMixin:
 
         intensity, ctr = 0., 0
         for nn, idx in enumerate(idxs):
-            arch_1d, arch_2d = snapshot.get(int(idx), (None, {}))
-            raw = arch_2d.get('map_raw')
-            bg = arch_2d.get('bg_raw', 0)
+            frame_1d, frame_2d = snapshot.get(int(idx), (None, {}))
+            raw = frame_2d.get('map_raw')
+            bg = frame_2d.get('bg_raw', 0)
             # Try thumbnail from data_2d, then fall back to data_1d
-            thumb = arch_2d.get('thumbnail')
-            if thumb is None and arch_1d is not None:
-                thumb = getattr(arch_1d, 'thumbnail', None)
+            thumb = frame_2d.get('thumbnail')
+            if thumb is None and frame_1d is not None:
+                thumb = getattr(frame_1d, 'thumbnail', None)
             # F1: was `for kk in range(3): try: ...; break; except
             # ValueError: time.sleep(0.5)`.  The retry/sleep pattern
             # was running on the Qt thread — visible UI freeze on
@@ -116,7 +116,7 @@ class DisplayDataMixin:
             # frames, so a missed average will be recomputed next
             # cycle).
             try:
-                scan_info = arch_1d.scan_info if arch_1d is not None else {}
+                scan_info = frame_1d.scan_info if frame_1d is not None else {}
                 if raw is not None:
                     intensity += self.normalize(raw - bg, scan_info)
                     ctr += 1
@@ -146,10 +146,10 @@ class DisplayDataMixin:
 
     # ── 2D integration data access ────────────────────────────────
 
-    def get_arches_int_2d(self, idxs=None):
+    def get_frames_int_2d(self, idxs=None):
         """Return 2D frame data for multiple frames (averaged).
 
-        Mirrors :meth:`get_frames_map_raw` / :meth:`get_arches_int_1d`:
+        Mirrors :meth:`get_frames_map_raw` / :meth:`get_frames_int_1d`:
         accumulates per-frame normalized intensity from ``data_2d`` and
         averages on the fly. No external state required — always reflects
         the current selection in ``data_2d``.
@@ -173,19 +173,19 @@ class DisplayDataMixin:
         xdata = ydata = None
         ctr = 0
         for idx in idxs:
-            arch_1d, arch_2d = snapshot.get(int(idx), (None, None))
-            if arch_2d is None or arch_2d.get('int_2d') is None:
+            frame_1d, frame_2d = snapshot.get(int(idx), (None, None))
+            if frame_2d is None or frame_2d.get('int_2d') is None:
                 continue
-            _gi2d = arch_2d.get('gi_2d', {})
+            _gi2d = frame_2d.get('gi_2d', {})
             try:
-                _i = self.get_int_2d(arch_2d['int_2d'], arch_1d, gi_2d=_gi2d)
+                _i = self.get_int_2d(frame_2d['int_2d'], frame_1d, gi_2d=_gi2d)
             except (ValueError, AttributeError, TypeError):
                 continue
             if _i.ndim != 2:
                 continue
             if intensity is None:
                 intensity = np.asarray(_i, dtype=float)
-                xdata, ydata = self.get_xydata(arch_2d['int_2d'], gi_2d=_gi2d)
+                xdata, ydata = self.get_xydata(frame_2d['int_2d'], gi_2d=_gi2d)
             else:
                 try:
                     intensity = intensity + _i
@@ -199,15 +199,15 @@ class DisplayDataMixin:
         intensity = intensity / ctr
         return intensity, xdata, ydata
 
-    # G2: get_sphere_int_2d was deleted.  It read scan.bai_2d, an
+    # G2: get_scan_int_2d was deleted.  It read scan.bai_2d, an
     # in-memory accumulator that doesn't survive v2 reload.  The
     # Overall view in update_binned now uses
-    # get_arches_int_2d(list(scan.frames.index)).  The comment
+    # get_frames_int_2d(list(scan.frames.index)).  The comment
     # at the call site (display_frame_widget.update_binned) already
     # noted this path returned 1×1 zeros for NeXus files — so it's
     # been functionally dead since v2 landed.
 
-    def get_int_2d(self, int_2d, arch_1d=None, normalize=True, gi_2d=None):
+    def get_int_2d(self, int_2d, frame_1d=None, normalize=True, gi_2d=None):
         """Returns the appropriate 2D data depending on the chosen axes.
         In GI mode, int_2d already holds the selected mode's data.
         """
@@ -218,8 +218,8 @@ class DisplayDataMixin:
         intensity = np.asarray(intensity_2d.copy(), dtype=float)
 
         if normalize:
-            if arch_1d is not None:
-                intensity = self.normalize(intensity, arch_1d.scan_info)
+            if frame_1d is not None:
+                intensity = self.normalize(intensity, frame_1d.scan_info)
             else:
                 norm_fac = len(self.scan.frames.index)
                 if self.normChannel:
@@ -232,7 +232,7 @@ class DisplayDataMixin:
 
     # ── 1D integration data access ────────────────────────────────
 
-    def get_arches_int_1d(self, idxs=None, rv='all'):
+    def get_frames_int_1d(self, idxs=None, rv='all'):
         """Return 1D data for multiple frames"""
         if idxs is None:
             idxs = self.idxs_1d
@@ -268,7 +268,7 @@ class DisplayDataMixin:
 
         return ydata, xdata
 
-    def get_int_1d(self, frame, arch_2d, idx):
+    def get_int_1d(self, frame, frame_2d, idx):
         """Returns 1D integrated data for frame.
 
         Uses ``self._plot_axis_info`` to determine whether the selected
@@ -298,15 +298,15 @@ class DisplayDataMixin:
             return xdata, ydata
 
         # --- 2D path: project from 2D map ---
-        if arch_2d is None:
+        if frame_2d is None:
             return None, None
 
-        intensity = self.get_int_2d(arch_2d['int_2d'], frame, normalize=False,
-                                    gi_2d=arch_2d.get('gi_2d', {}))
+        intensity = self.get_int_2d(frame_2d['int_2d'], frame, normalize=False,
+                                    gi_2d=frame_2d.get('gi_2d', {}))
         if intensity.ndim < 2:
             return None, None
 
-        _i2d = arch_2d['int_2d']
+        _i2d = frame_2d['int_2d']
         radial = _i2d.radial if _i2d is not None else np.array([])
         azimuthal = _i2d.azimuthal if _i2d is not None else np.array([])
 

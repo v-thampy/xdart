@@ -35,7 +35,7 @@ class _NullLock:
         return False
 
 
-def _fake_sphere():
+def _fake_scan():
     calls = []
     scan = SimpleNamespace(
         data_file="old.nxs",
@@ -47,7 +47,7 @@ def _fake_sphere():
 
 
 def _file_thread(live_run):
-    scan, calls = _fake_sphere()
+    scan, calls = _fake_scan()
     thread = SimpleNamespace(
         file_lock=_NullLock(),
         fname="/data/scan_42.nxs",

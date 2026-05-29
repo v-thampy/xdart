@@ -97,7 +97,7 @@ def SPECread(filename, scan_number):
     return tth, i0
 
 
-def make_sphere(calib_path, poni_file, stepsize, user, image_path, spec_path, 
+def make_scan(calib_path, poni_file, stepsize, user, image_path, spec_path, 
                 spec_name, scan_number):
     tth, i0 = SPECread(spec_path + spec_name, scan_number)
     xmax_global = 0.0  
@@ -138,7 +138,7 @@ def make_sphere(calib_path, poni_file, stepsize, user, image_path, spec_path,
 @unittest.skipUnless(_TEST_DATA_DIR.exists(), _SKIP_REASON)
 class TestLiveScan(unittest.TestCase):
     def setUp(self):
-        self.scan = make_sphere(
+        self.scan = make_scan(
             calib_path=os.path.join(xdart_dir, "tests/test_data/spec_pd100k/"),
             poni_file="poni.poni",
             stepsize=0.01,
@@ -214,7 +214,7 @@ class TestLiveScan(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-    # scan = make_sphere(
+    # scan = make_scan(
     #         calib_path="test_data/spec_pd100k/",
     #         poni_file="poni.poni",
     #         stepsize=0.01,

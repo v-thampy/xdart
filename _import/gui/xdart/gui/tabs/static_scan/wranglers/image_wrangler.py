@@ -377,7 +377,7 @@ class imageWrangler(wranglerWidget):
         self.thread.sigUpdateFile.connect(self.sigUpdateFile.emit)
         self.thread.finished.connect(self.finished.emit)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
-        # self.thread.sigUpdateArch.connect(self.sigUpdateArch.emit)
+        # self.thread.sigUpdateFrame.connect(self.sigUpdateFrame.emit)
         self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
 
         # Enable/disable buttons initially

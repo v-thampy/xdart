@@ -41,7 +41,7 @@ class DisplayPlotMixin:
     - ``self.plotMethod``, ``self.scale``, ``self.cmap``
     - ``self.overlay``, ``self.binned_data``, ``self.binned_widget``
     - ``self._plot_axis_info``, ``self._last_plot_unit``
-    - Methods from DisplayDataMixin: ``get_arches_int_1d``, ``get_colors``,
+    - Methods from DisplayDataMixin: ``get_frames_int_1d``, ``get_colors``,
       ``normalize``, ``show_slice_overlay``
     """
 
@@ -55,7 +55,7 @@ class DisplayPlotMixin:
             return data
 
         # Get 1D data for all frames
-        ydata, xdata = self.get_arches_int_1d()
+        ydata, xdata = self.get_frames_int_1d()
 
         # 2D-derived axes require 2D data; fall back gracefully if unavailable
         if xdata is None or ydata is None:
@@ -74,7 +74,7 @@ class DisplayPlotMixin:
                     logger.debug("Failed to show status bar message about chi slicing", exc_info=True)
             # Fall back: disable slice, retry with plain 1D
             self.ui.slice.setChecked(False)
-            ydata, xdata = self.get_arches_int_1d()
+            ydata, xdata = self.get_frames_int_1d()
             if xdata is None or ydata is None:
                 return
 

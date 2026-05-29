@@ -482,7 +482,7 @@ def test_reload_only_flag_round_trips(tmp_path):
     assert loaded.is_reload_only is True
 
 
-def test_has_reload_only_frames_sphere_helper(tmp_path):
+def test_has_reload_only_frames_scan_helper(tmp_path):
     """LiveScan.has_reload_only_frames mirrors the in-memory cache."""
     from xdart.modules.ewald.scan import LiveScan
     from xdart.modules.ewald.frame import LiveFrame

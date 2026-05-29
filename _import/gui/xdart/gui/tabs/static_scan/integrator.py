@@ -617,7 +617,7 @@ class integratorTree(QtWidgets.QWidget):
         connect()
 
     def _get_radial_range_1D(self):
-        """Sets Sphere 1D radial range in bai_1d_args from UI values"""
+        """Sets Scan 1D radial range in bai_1d_args from UI values"""
         self._get_range_into_args(
             auto_cb=self.ui.radial_autoRange_1D,
             low_edit=self.ui.radial_low_1D,
@@ -628,7 +628,7 @@ class integratorTree(QtWidgets.QWidget):
         )
 
     def _set_radial_range_1D(self):
-        """Sets UI values from Sphere 1D radial range in bai_1d_args"""
+        """Sets UI values from Scan 1D radial range in bai_1d_args"""
         self._set_range_from_args(
             auto_cb=self.ui.radial_autoRange_1D,
             low_edit=self.ui.radial_low_1D,
@@ -641,7 +641,7 @@ class integratorTree(QtWidgets.QWidget):
         )
 
     def _get_azim_range_1D(self):
-        """Sets Sphere 1D azimuth range in bai_1d_args from UI values"""
+        """Sets Scan 1D azimuth range in bai_1d_args from UI values"""
         # Toggling auto can flip the q_total path between fast (1 Pts) and
         # slow (2 Pts); refresh the npts_oop_1D visibility after the
         # dict update lands.
@@ -656,7 +656,7 @@ class integratorTree(QtWidgets.QWidget):
         )
 
     def _set_azim_range_1D(self):
-        """Sets UI values from Sphere 1D azimuth range in bai_1d_args."""
+        """Sets UI values from Scan 1D azimuth range in bai_1d_args."""
         self._set_range_from_args(
             auto_cb=self.ui.azim_autoRange_1D,
             low_edit=self.ui.azim_low_1D,
@@ -670,7 +670,7 @@ class integratorTree(QtWidgets.QWidget):
         )
 
     def _get_radial_range_2D(self):
-        """Sets Sphere 2D radial range in bai_2d_args from UI values.
+        """Sets Scan 2D radial range in bai_2d_args from UI values.
 
         GI Qip-vs-Qoop swaps the dict key from ``radial_range`` to
         ``x_range`` (handled by ``gi_alt_key``).
@@ -686,7 +686,7 @@ class integratorTree(QtWidgets.QWidget):
         )
 
     def _set_radial_range_2D(self):
-        """Sets UI values from Sphere 2D radial range in bai_2d_args.
+        """Sets UI values from Scan 2D radial range in bai_2d_args.
 
         Reads ``radial_range`` regardless of GI mode (the UI line
         edits only bind to that key; see the _get counterpart).
@@ -703,7 +703,7 @@ class integratorTree(QtWidgets.QWidget):
         )
 
     def _get_azim_range_2D(self):
-        """Sets Sphere 2D azimuth range in bai_2d_args from UI values.
+        """Sets Scan 2D azimuth range in bai_2d_args from UI values.
 
         GI Qip-vs-Qoop swaps to ``y_range``.
         """
@@ -718,7 +718,7 @@ class integratorTree(QtWidgets.QWidget):
         )
 
     def _set_azim_range_2D(self):
-        """Sets UI values from Sphere 2D azimuth range in bai_2d_args."""
+        """Sets UI values from Scan 2D azimuth range in bai_2d_args."""
         self._set_range_from_args(
             auto_cb=self.ui.azim_autoRange_2D,
             low_edit=self.ui.azim_low_2D,
@@ -996,7 +996,7 @@ class integratorTree(QtWidgets.QWidget):
         try:
             blocked = self.scan.has_reload_only_frames()
         except (AttributeError, RuntimeError) as e:
-            # Sphere torn down mid-call, or has_reload_only_frames
+            # Scan torn down mid-call, or has_reload_only_frames
             # itself errored.  Don't block — the integrate path's
             # own guard will catch a genuinely empty map_raw.
             logger.debug("reload-only check errored, not blocking: %s", e)

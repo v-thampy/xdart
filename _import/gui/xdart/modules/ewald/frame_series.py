@@ -336,7 +336,7 @@ class LiveFrameSeries:
     def __getitem__(self, idx):
         """Return LiveFrame for ``idx``: in-memory hit, else lazy-load."""
         if idx not in self.index:
-            raise KeyError(f"Arch not found with {idx} index")
+            raise KeyError(f"Frame not found with {idx} index")
         if idx in self._in_memory:
             return self._in_memory[idx]
         # Resolve the source-root (scan data_file directory) once

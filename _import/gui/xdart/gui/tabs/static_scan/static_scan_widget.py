@@ -293,7 +293,7 @@ class staticWidget(QWidget):
         self.wrangler.sigStart.connect(self.start_wrangler)
         self.wrangler.sigUpdateData.connect(self.update_data)
         self.wrangler.sigUpdateFile.connect(self.new_scan)
-        # self.wrangler.sigUpdateArch.connect(self.new_frame)
+        # self.wrangler.sigUpdateFrame.connect(self.new_frame)
         self.wrangler.sigUpdateGI.connect(self.update_scattering_geometry)
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
@@ -421,7 +421,7 @@ class staticWidget(QWidget):
                     self.h5viewer.data_1d[int(idx)] = frame.copy(include_2d=False)
                     # 2D payload as a dict matching what file_thread.load_frames
                     # produces (see scan_threads.load_frames).  Keys are what
-                    # displayframe.get_frames_map_raw / get_arches_int_2d
+                    # displayframe.get_frames_map_raw / get_frames_int_2d
                     # look for.
                     if not getattr(self.scan, "skip_2d", False):
                         self.h5viewer.data_2d[int(idx)] = {

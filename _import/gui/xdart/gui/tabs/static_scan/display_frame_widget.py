@@ -104,8 +104,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     methods:
         get_frames_map_raw: Gets averaged 2D raw data from frames
         get_scan_map_raw: Gets averaged (and normalized) 2D raw data for all images
-        get_arches_int_2d: Gets averaged 2D rebinned data from frames
-        get_sphere_int_2d: Gets overall 2D data for the scan
+        get_frames_int_2d: Gets averaged 2D rebinned data from frames
+        get_scan_int_2d: Gets overall 2D data for the scan
         update: Updates the displayed image and plot
         update_image: Updates image data based on selections
         update_plot: Updates plot data based on selections
@@ -158,7 +158,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.viewer_mode = None
         self._wrangler = None
 
-        # Arch index tracking
+        # Frame index tracking
         self.idxs = []
         self.idxs_1d = []
         self.idxs_2d = []
@@ -677,8 +677,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # None for an evicted key; falling back to None mask is
             # the same as having no mask, so render continues.
             with self.data_lock:
-                arch_2d = self.data_2d.get(self.idxs_2d[0])
-            mask = arch_2d['mask'] if arch_2d is not None else None
+                frame_2d = self.data_2d.get(self.idxs_2d[0])
+            mask = frame_2d['mask'] if frame_2d is not None else None
         data = np.asarray(data, dtype=float)
 
         # Apply detector + global mask.
@@ -723,15 +723,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.update_plot_view()
 
         # Always aggregate from per-frame data_2d.  Pre-G2 there was a
-        # fall-through to get_sphere_int_2d() (now deleted — it read
+        # fall-through to get_scan_int_2d() (now deleted — it read
         # the in-memory scan.bai_2d accumulator that didn't survive
         # v2 reload).  If selecting "Overall" with the current
         # idxs_2d cache empty / partial, widen the aggregation
         # across the full frames.index so we don't render a partial
         # average.
-        intensity, xdata, ydata = self.get_arches_int_2d()
+        intensity, xdata, ydata = self.get_frames_int_2d()
         if intensity is None and self.overall and len(self.frame_ids) > 1:
-            intensity, xdata, ydata = self.get_arches_int_2d(
+            intensity, xdata, ydata = self.get_frames_int_2d(
                 list(self.scan.frames.index),
             )
 
@@ -814,8 +814,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if self.overall:
                 idxs = sorted(list(self.scan.frames.index))
 
-            self.bkg_1d, _ = self.get_arches_int_1d(idxs, rv='average')
-            self.bkg_2d, _, _ = self.get_arches_int_2d(idxs)
+            self.bkg_1d, _ = self.get_frames_int_1d(idxs, rv='average')
+            self.bkg_2d, _, _ = self.get_frames_int_2d(idxs)
             self.bkg_map_raw = self.get_frames_map_raw(idxs)
             if self.bkg_map_raw is None:
                 # F5: be honest about a no-op 2D background.  Pre-F5
@@ -1001,10 +1001,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # O8: snapshot under data_lock so a concurrent writer can't
         # evict the key between the lookup and the read.
         with self.data_lock:
-            arch_2d = self.data_2d.get(self.idxs_2d[0])
-        if arch_2d is None:
+            frame_2d = self.data_2d.get(self.idxs_2d[0])
+        if frame_2d is None:
             return
-        data = np.asarray(arch_2d['map_raw'], dtype=float)
+        data = np.asarray(frame_2d['map_raw'], dtype=float)
 
         # Apply threshold from wrangler if enabled
         w = self._wrangler

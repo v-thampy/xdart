@@ -399,7 +399,7 @@ class TestPicklingPreservesLazyLoadCapability:
             os.path.join(str(tmp_path), "frame_0042.tif")
         )
 
-    def test_subprocess_can_lazy_load_via_pickled_arch(self, tmp_path):
+    def test_subprocess_can_lazy_load_via_pickled_frame(self, tmp_path):
         """End-to-end: spawn a real subprocess, pickle an frame into
         it, ask it to lazy-load, get the loaded array back.  This is
         what scan_threads.bai_*_all does under the hood.
