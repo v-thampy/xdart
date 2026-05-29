@@ -37,6 +37,7 @@ from ssrl_xrd_tools.io.nexus import (
     read_scan,
     read_scan_metadata,
     read_stitched,
+    write_integrated_stack,
     write_nexus,
     write_nexus_frame,
 )

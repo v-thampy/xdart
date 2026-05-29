@@ -99,6 +99,43 @@ def test_rewriting_a_frame_upserts_not_duplicates(tmp_path):
     np.testing.assert_allclose(ds["intensity_1d"].values[0], 7.0)  # row 0 updated
 
 
+def test_write_integrated_stack_bulk_then_incremental(tmp_path):
+    """The shared stacked-write primitive: bulk-create on first save, then
+    incremental upsert (re-saving a label replaces, new labels append)."""
+    import h5py
+    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+
+    p = tmp_path / "stack.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        # bulk create: 3 frames, 1D + 2D, compressed
+        write_integrated_stack(
+            e, frame_indices=[0, 1, 2],
+            results_1d=[_r1d(0), _r1d(1), _r1d(2)],
+            results_2d=[_r2d(0), _r2d(1), _r2d(2)],
+            compression="lzf",
+        )
+
+    ds = read_scan(p)
+    assert list(ds["frame"].values) == [0, 1, 2]
+    assert ds["intensity_1d"].shape == (3, N_Q)
+    assert ds["intensity_2d"].shape == (3, N_CHI, N_Q)
+
+    # incremental: upsert frame 1, append frame 3
+    new1 = IntegrationResult1D(
+        radial=np.linspace(0.5, 5.0, N_Q), intensity=np.full(N_Q, 9.0), unit="q_A^-1",
+    )
+    with h5py.File(p, "a") as f:
+        write_integrated_stack(
+            f["entry"], frame_indices=[1, 3],
+            results_1d=[new1, _r1d(3)], compression="lzf",
+        )
+
+    ds2 = read_scan(p, groups=("1d",))
+    assert list(ds2["frame"].values) == [0, 1, 2, 3]      # 1 upserted, 3 appended
+    np.testing.assert_allclose(ds2["intensity_1d"].values[1], 9.0)  # row 1 updated
+
+
 def test_nexus_sink_roundtrips_through_read_scan(tmp_path):
     """The NexusSink itself (begin/write/finish) → read_scan."""
     import pytest

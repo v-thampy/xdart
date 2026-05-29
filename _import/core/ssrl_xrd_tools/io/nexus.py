@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import h5py
 import numpy as np
@@ -939,6 +939,98 @@ def _append_stacked_2d(
         ds[n] = np.asarray(r.sigma, dtype=np.float32).T
 
 
+def write_integrated_stack(
+    entry_grp: h5py.Group,
+    *,
+    frame_indices: Sequence[int],
+    results_1d: Sequence[IntegrationResult1D] | None = None,
+    results_2d: Sequence[IntegrationResult2D] | None = None,
+    compression: str | None = None,
+) -> None:
+    """Write/extend the stacked ``integrated_1d`` / ``integrated_2d`` NXdata
+    groups from aligned lists of IntegrationResult + their frame labels.
+
+    The canonical stacked-write primitive — the headless path and
+    (eventually, #18) the xdart GUI writer both target this so a single
+    implementation owns the on-disk layout ``read_scan`` consumes.
+
+    First save (group absent) creates the whole stack in one write — O(N),
+    with multi-frame chunks.  Subsequent calls fall back to the per-frame
+    upsert appenders (:func:`_append_stacked_1d` / ``_2d``), so re-saving a
+    frame label replaces its row rather than duplicating it.  ``int64``
+    frame_index; ``compression`` applies to the intensity/sigma stacks.
+    """
+    fis = [int(x) for x in frame_indices]
+    ck = _comp_kwargs(compression)
+
+    def _bulk_create_1d():
+        r0 = results_1d[0]
+        n_q = np.asarray(r0.intensity).shape[0]
+        rows = max(1, min(len(fis), 32))
+        g = entry_grp.create_group("integrated_1d")
+        g.attrs["NX_class"] = "NXdata"
+        g.attrs["signal"] = "intensity"
+        g.attrs["axes"] = ["frame_index", "q"]
+        g.create_dataset(
+            "intensity",
+            data=np.stack([np.asarray(r.intensity, np.float32) for r in results_1d]),
+            maxshape=(None, n_q), chunks=(rows, n_q), **ck,
+        )
+        qd = g.create_dataset("q", data=np.asarray(r0.radial, np.float32))
+        qd.attrs["units"] = r0.unit
+        g.create_dataset("frame_index", data=np.asarray(fis, np.int64),
+                         maxshape=(None,), chunks=(64,))
+        if all(r.sigma is not None for r in results_1d):
+            g.create_dataset(
+                "sigma",
+                data=np.stack([np.asarray(r.sigma, np.float32) for r in results_1d]),
+                maxshape=(None, n_q), chunks=(rows, n_q), **ck,
+            )
+
+    def _bulk_create_2d():
+        r0 = results_2d[0]
+        stacked = np.stack(
+            [np.asarray(r.intensity, np.float32).T for r in results_2d]
+        )  # (N, n_chi, n_q)
+        n_chi, n_q = stacked.shape[1], stacked.shape[2]
+        g = entry_grp.create_group("integrated_2d")
+        g.attrs["NX_class"] = "NXdata"
+        g.attrs["signal"] = "intensity"
+        g.attrs["axes"] = ["frame_index", "chi", "q"]
+        g.create_dataset("intensity", data=stacked,
+                         maxshape=(None, n_chi, n_q), chunks=(1, n_chi, n_q), **ck)
+        qd = g.create_dataset("q", data=np.asarray(r0.radial, np.float32))
+        qd.attrs["units"] = r0.unit
+        cd = g.create_dataset("chi", data=np.asarray(r0.azimuthal, np.float32))
+        cd.attrs["units"] = r0.azimuthal_unit
+        g.create_dataset("frame_index", data=np.asarray(fis, np.int64),
+                         maxshape=(None,), chunks=(64,))
+        if all(r.sigma is not None for r in results_2d):
+            g.create_dataset(
+                "sigma",
+                data=np.stack([np.asarray(r.sigma, np.float32).T for r in results_2d]),
+                maxshape=(None, n_chi, n_q), chunks=(1, n_chi, n_q), **ck,
+            )
+
+    if results_1d is not None and len(results_1d):
+        if len(results_1d) != len(fis):
+            raise ValueError("results_1d length must match frame_indices")
+        if "integrated_1d" not in entry_grp:
+            _bulk_create_1d()
+        else:
+            for fi, r in zip(fis, results_1d):
+                _append_stacked_1d(entry_grp, fi, r, ck)
+
+    if results_2d is not None and len(results_2d):
+        if len(results_2d) != len(fis):
+            raise ValueError("results_2d length must match frame_indices")
+        if "integrated_2d" not in entry_grp:
+            _bulk_create_2d()
+        else:
+            for fi, r in zip(fis, results_2d):
+                _append_stacked_2d(entry_grp, fi, r, ck)
+
+
 # ---------------------------------------------------------------------------
 # Private helpers — HDF5 utilities
 # ---------------------------------------------------------------------------
@@ -1485,6 +1577,7 @@ __all__ = [
     "open_nexus_writer",
     "write_nexus",
     "write_nexus_frame",
+    "write_integrated_stack",
     # v2 (xdart 0.37+)
     "read_scan",
     "read_scan_metadata",
