@@ -1118,8 +1118,8 @@ plt.show()"""),
   Qt-signal sink on top of this; you can do the same with a plain
   Python collector, a Tiled writer, a CSV row appender, etc.
 - **Same code in xdart**: the GUI's wrangler threads build a
-  `ReductionPlan` from sphere settings and call `run_reduction` —
-  the same workflow you just ran.  See the `keep_xdart_thin.md`
+  `ReductionPlan` from the live scan's settings and call `run_reduction`
+  — the same workflow you just ran.  See the `keep_xdart_thin.md`
   memory note for the design rationale.
 """),
 ]

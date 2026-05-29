@@ -139,8 +139,8 @@ def process_scan_data(
     stack into memory).  Streaming bounds the *gridding-side* memory
     cost (3 q-arrays × stack size), not the image-stack memory.  For
     fully lazy loading + streaming, use
-    :func:`process_scan_from_sphere` on a v2 NeXus sphere where each
-    arch's raw image is loaded one chunk at a time.
+    :func:`process_scan_from_nexus` on a v2 NeXus scan where each
+    frame's raw image is loaded one chunk at a time.
     """
     spec_file = scan_info.spec_path
     _, scan_num = get_scan_path_info(scan_name)
@@ -251,20 +251,20 @@ def process_scan(
 
 
 # ---------------------------------------------------------------------------
-# v2 NeXus sphere as a data source
+# v2 NeXus scan as a data source
 # ---------------------------------------------------------------------------
 #
-# Lets the RSM pipeline consume an xdart v2 :class:`EwaldSphere` directly,
+# Lets the RSM pipeline consume an xdart v2 :class:`LiveScan` directly,
 # so a scan that's already been through xdart's 1D/2D integration can be
 # re-used as the RSM input without re-parsing SPEC + raw image files.
 #
-# Per-sphere quantities pulled here:
+# Per-scan quantities pulled here:
 #
-# * Energy (eV)  — from ``sphere.mg_args['wavelength']`` (metres) unless
+# * Energy (eV)  — from ``scan.mg_args['wavelength']`` (metres) unless
 #   the caller passes ``energy=`` explicitly.
-# * Per-frame motor positions — ``sphere.scan_data[motor].values``, indexed
-#   by the frame IDs in ``sphere.arches.index``.
-# * Raw images — one chunk at a time via ``arch._lazy_load_raw()``; arches
+# * Per-frame motor positions — ``scan.scan_data[motor].values``, indexed
+#   by the frame IDs in ``scan.frames.index``.
+# * Raw images — one chunk at a time via ``frame._lazy_load_raw()``; frames
 #   are released after each chunk so peak memory stays at chunk_size frames.
 #
 # UB is **not** in the v2 NeXus schema yet (xdart's integration pipeline
@@ -272,130 +272,130 @@ def process_scan(
 # ``/entry/sample/UB`` field we'll auto-resolve it the same way as energy.
 #
 # To avoid a circular import (ssrl_xrd_tools is below xdart in the stack)
-# the sphere is duck-typed against the protocol below.
+# the scan is duck-typed against the protocol below.
 
 
-class _ArchLike(Protocol):
-    """Minimal arch interface needed by the v2-sphere RSM path."""
+class _FrameLike(Protocol):
+    """Minimal frame interface needed by the v2-scan RSM path."""
     idx: int
     map_raw: np.ndarray | None
     def _lazy_load_raw(self) -> bool: ...
 
 
-class _ArchSeriesLike(Protocol):
-    """Minimal ArchSeries interface — index + lazy __getitem__."""
+class _FrameSeriesLike(Protocol):
+    """Minimal LiveFrameSeries interface — index + lazy __getitem__."""
     index: list[int]
-    def __getitem__(self, idx: int) -> _ArchLike: ...
+    def __getitem__(self, idx: int) -> _FrameLike: ...
 
 
-class _SphereLike(Protocol):
-    """Minimal EwaldSphere interface for RSM v2-sphere processing."""
+class _ScanLike(Protocol):
+    """Minimal LiveScan interface for RSM v2-scan processing."""
     scan_data: Any                       # pandas.DataFrame
-    arches: _ArchSeriesLike
+    frames: _FrameSeriesLike
     mg_args: dict[str, Any]
 
 
-def _energy_from_sphere(sphere: _SphereLike) -> float:
-    """Resolve X-ray energy in eV from the sphere's stored wavelength.
+def _energy_from_scan(scan: _ScanLike) -> float:
+    """Resolve X-ray energy in eV from the scan's stored wavelength.
 
-    ``sphere.mg_args['wavelength']`` is in metres (pyFAI convention),
+    ``scan.mg_args['wavelength']`` is in metres (pyFAI convention),
     so ``E = h c / λ`` simplifies to ``E_eV = 12398 / λ_Å``.
     """
-    wavelength_m = sphere.mg_args.get("wavelength")
+    wavelength_m = scan.mg_args.get("wavelength")
     if not wavelength_m or wavelength_m <= 0:
         raise ValueError(
-            "sphere has no usable wavelength in mg_args; "
+            "scan has no usable wavelength in mg_args; "
             "pass energy= explicitly."
         )
     return 12398.0 / (float(wavelength_m) * 1e10)
 
 
 def _angles_for_indices(
-    sphere: _SphereLike,
+    scan: _ScanLike,
     diff_motors: list[str] | tuple[str, ...],
     indices: list[int] | None = None,
 ) -> list[np.ndarray]:
-    """Pull per-frame motor arrays from ``sphere.scan_data``.
+    """Pull per-frame motor arrays from ``scan.scan_data``.
 
     Returns a list aligned with ``diff_motors``: one ndarray per motor,
     each of length ``len(indices)`` (or len(scan_data) if indices is None).
     Raises :class:`KeyError` if any motor is missing from the DataFrame.
     """
-    cols = list(sphere.scan_data.columns)
+    cols = list(scan.scan_data.columns)
     missing = [m for m in diff_motors if m not in cols]
     if missing:
         raise KeyError(
-            f"motors {missing!r} not in sphere.scan_data (have {cols!r})"
+            f"motors {missing!r} not in scan.scan_data (have {cols!r})"
         )
     if indices is None:
         return [
-            np.asarray(sphere.scan_data[m].values, dtype=float)
+            np.asarray(scan.scan_data[m].values, dtype=float)
             for m in diff_motors
         ]
     return [
-        np.asarray(sphere.scan_data.loc[indices, m].values, dtype=float)
+        np.asarray(scan.scan_data.loc[indices, m].values, dtype=float)
         for m in diff_motors
     ]
 
 
-def _iter_sphere_chunks(
-    sphere: _SphereLike,
+def _iter_scan_chunks(
+    scan: _ScanLike,
     chunk_size: int,
 ) -> Iterator[tuple[np.ndarray, list[int]]]:
     """Yield ``(img_chunk, frame_indices)`` for the streaming gridder.
 
     Each ``img_chunk`` is ``(n_chunk, H, W)`` — a fresh ``np.stack``,
-    independent of the source arches.  Memory promise:
+    independent of the source frames.  Memory promise:
 
     1. **Only ``chunk_size`` raw frames are resident at any time.**
        Frames materialised by this iterator via ``_lazy_load_raw`` are
-       cleared (``arch.map_raw = None``) in a ``finally`` block after
+       cleared (``frame.map_raw = None``) in a ``finally`` block after
        the consumer is done with each chunk.  Without this, the
-       ``sphere.arches`` cache would hold every lazy-loaded frame in
+       ``scan.frames`` cache would hold every lazy-loaded frame in
        memory and the "memory-bounded" promise of streaming would
        degrade to "full-scan resident" for any user who actually has
-       v2-reloaded arches.
+       v2-reloaded frames.
     2. **Arches that arrived with ``map_raw`` already populated are
        left alone.**  We only free what we ourselves loaded — caller-
        owned data is not our responsibility to invalidate.
     3. **The stacked chunk is a copy** (``np.stack`` allocates fresh
-       output), so it survives the per-arch clearing.
+       output), so it survives the per-frame clearing.
     """
-    indices = list(sphere.arches.index)
+    indices = list(scan.frames.index)
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
 
     for start in range(0, len(indices), chunk_size):
         chunk_indices = indices[start : start + chunk_size]
-        frames: list[np.ndarray] = []
-        arches: list[_ArchLike] = []
+        images: list[np.ndarray] = []
+        frames: list[_FrameLike] = []
         was_missing: list[bool] = []
         try:
             for idx in chunk_indices:
-                arch = sphere.arches[idx]
-                missing = arch.map_raw is None
-                arches.append(arch)
+                frame = scan.frames[idx]
+                missing = frame.map_raw is None
+                frames.append(frame)
                 was_missing.append(missing)
                 if missing:
-                    ok = arch._lazy_load_raw()
-                    if not ok or arch.map_raw is None:
+                    ok = frame._lazy_load_raw()
+                    if not ok or frame.map_raw is None:
                         raise RuntimeError(
-                            f"could not lazy-load raw frame for arch {idx} "
+                            f"could not lazy-load raw frame for frame {idx} "
                             f"(check source_file / source_frame_idx "
                             f"provenance)"
                         )
-                frames.append(np.asarray(arch.map_raw))
-            yield np.stack(frames, axis=0), chunk_indices
+                images.append(np.asarray(frame.map_raw))
+            yield np.stack(images, axis=0), chunk_indices
         finally:
-            # Free only what we materialised ourselves; respect arches
+            # Free only what we materialised ourselves; respect frames
             # that arrived with map_raw already populated.
-            for arch, missing in zip(arches, was_missing):
+            for frame, missing in zip(frames, was_missing):
                 if missing:
-                    arch.map_raw = None
+                    frame.map_raw = None
 
 
-def process_scan_from_sphere(
-    sphere: _SphereLike,
+def process_scan_from_nexus(
+    scan: _ScanLike,
     mapper: PixelQMap,
     diff_motors: list[str] | tuple[str, ...],
     bins: tuple[int, int, int],
@@ -410,25 +410,25 @@ def process_scan_from_sphere(
     static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
 ) -> RSMVolume:
-    """Stream-process a v2 :class:`EwaldSphere` into an :class:`RSMVolume`.
+    """Stream-process a v2 :class:`LiveScan` into an :class:`RSMVolume`.
 
-    Reads per-frame motor positions from ``sphere.scan_data``, energy
-    from ``sphere.mg_args['wavelength']`` (unless ``energy=`` is given),
-    and raw images one chunk at a time via ``arch._lazy_load_raw``.
+    Reads per-frame motor positions from ``scan.scan_data``, energy
+    from ``scan.mg_args['wavelength']`` (unless ``energy=`` is given),
+    and raw images one chunk at a time via ``frame._lazy_load_raw``.
     All frames flow through a single :class:`StreamingGridder` so peak
     memory is bounded by ``chunk_size`` regardless of total frame count.
 
     Parameters
     ----------
-    sphere : EwaldSphere (duck-typed)
+    scan : LiveScan (duck-typed)
         Must expose ``scan_data`` (pandas DataFrame indexed by frame IDs),
-        ``arches`` (indexable by frame ID, yielding objects with
+        ``frames`` (indexable by frame ID, yielding objects with
         ``map_raw`` + ``_lazy_load_raw``), and ``mg_args`` (dict with
         ``wavelength`` in metres).
     mapper : PixelQMap
         Diffractometer convention + detector header.
     diff_motors : sequence of str
-        Motor column names in ``sphere.scan_data`` to feed into
+        Motor column names in ``scan.scan_data`` to feed into
         ``xu.QConversion`` (sample axes first, then detector axes).
     bins : tuple of int
         ``xu.Gridder3D`` bin counts.
@@ -436,7 +436,7 @@ def process_scan_from_sphere(
         Sample orientation matrix.  v2 NeXus doesn't store this yet —
         pass it explicitly until the schema is extended.
     energy : float, optional
-        X-ray energy in eV.  ``None`` → resolved from the sphere.
+        X-ray energy in eV.  ``None`` → resolved from the scan.
     chunk_size : int
         Frames per chunk handed to :class:`StreamingGridder`.  Default 8.
     q_bounds : ((qx_lo, qx_hi), (qy_lo, qy_hi), (qz_lo, qz_hi)), optional
@@ -460,8 +460,8 @@ def process_scan_from_sphere(
         Gridded reciprocal-space volume.
     """
     if energy is None:
-        energy = _energy_from_sphere(sphere)
-    angles_full = _angles_for_indices(sphere, diff_motors)
+        energy = _energy_from_scan(scan)
+    angles_full = _angles_for_indices(scan, diff_motors)
 
     sg = StreamingGridder(mapper, bins)
     if q_bounds is None:
@@ -476,8 +476,8 @@ def process_scan_from_sphere(
     else:
         sg.set_bounds(*q_bounds)
 
-    for img_chunk, chunk_indices in _iter_sphere_chunks(sphere, chunk_size):
-        angles_chunk = _angles_for_indices(sphere, diff_motors, chunk_indices)
+    for img_chunk, chunk_indices in _iter_scan_chunks(scan, chunk_size):
+        angles_chunk = _angles_for_indices(scan, diff_motors, chunk_indices)
         sg.add(
             img_chunk,
             angles_chunk,
@@ -490,22 +490,22 @@ def process_scan_from_sphere(
 
 
 @dataclass(frozen=True)
-class SphereInput:
-    """One scan's data for :func:`grid_spheres_streaming`.
+class ScanInput:
+    """One scan's data for :func:`grid_scans_streaming`.
 
-    ``energy`` defaults to ``None`` so the per-sphere resolver kicks in;
+    ``energy`` defaults to ``None`` so the per-scan resolver kicks in;
     pass an explicit value to override.  ``UB`` and ``roi`` are
-    per-sphere and may differ across the list.
+    per-scan and may differ across the list.
     """
-    sphere: Any  # _SphereLike — typed as Any to keep the dataclass simple
+    scan: Any  # _ScanLike — typed as Any to keep the dataclass simple
     energy: float | None = None
     UB: np.ndarray | None = None
     roi: tuple[int, int, int, int] | None = None
 
 
-def grid_spheres_streaming(
+def grid_scans_streaming(
     mapper: PixelQMap,
-    sphere_inputs: Iterable[SphereInput],
+    scan_inputs: Iterable[ScanInput],
     diff_motors: list[str] | tuple[str, ...],
     bins: tuple[int, int, int],
     *,
@@ -516,28 +516,28 @@ def grid_spheres_streaming(
     static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
 ) -> RSMVolume:
-    """Stream multiple v2 :class:`EwaldSphere`s into one :class:`RSMVolume`.
+    """Stream multiple v2 :class:`LiveScan`s into one :class:`RSMVolume`.
 
-    Per-sphere :class:`SphereInput` carries its own ``energy``, ``UB``,
-    and ``roi``.  All spheres' frames feed a single
+    Per-scan :class:`ScanInput` carries its own ``energy``, ``UB``,
+    and ``roi``.  All scans' frames feed a single
     :class:`StreamingGridder`, so total peak memory stays at
-    ``chunk_size`` frames regardless of how many spheres or how many
+    ``chunk_size`` frames regardless of how many scans or how many
     frames each contains.
 
-    Strictly cheaper than ``[process_scan_from_sphere(s) for s in ...]``
+    Strictly cheaper than ``[process_scan_from_nexus(s) for s in ...]``
     followed by :func:`combine_grids`: there's no intermediate per-scan
     volume, no ``RegularGridInterpolator`` rebin at the end, and no
     correlated-NaN bookkeeping.
     """
-    sphere_inputs = list(sphere_inputs)
-    if not sphere_inputs:
-        raise ValueError("sphere_inputs must not be empty")
+    scan_inputs = list(scan_inputs)
+    if not scan_inputs:
+        raise ValueError("scan_inputs must not be empty")
 
-    # Resolve per-sphere energies up-front so the scout pass has them.
-    resolved: list[tuple[SphereInput, float, list[np.ndarray]]] = []
-    for si in sphere_inputs:
-        e = si.energy if si.energy is not None else _energy_from_sphere(si.sphere)
-        angles_full = _angles_for_indices(si.sphere, diff_motors)
+    # Resolve per-scan energies up-front so the scout pass has them.
+    resolved: list[tuple[ScanInput, float, list[np.ndarray]]] = []
+    for si in scan_inputs:
+        e = si.energy if si.energy is not None else _energy_from_scan(si.scan)
+        angles_full = _angles_for_indices(si.scan, diff_motors)
         resolved.append((si, e, angles_full))
 
     sg = StreamingGridder(mapper, bins)
@@ -548,16 +548,16 @@ def grid_spheres_streaming(
                  (mapper.header.Nch1, mapper.header.Nch2))
                 for (si, energy, angles_full) in resolved
             ],
-            roi=None,  # ROI is per-sphere; union across all without it
+            roi=None,  # ROI is per-scan; union across all without it
             pad=scout_pad,
         )
     else:
         sg.set_bounds(*q_bounds)
 
     for si, energy, _full_angles in resolved:
-        for img_chunk, chunk_indices in _iter_sphere_chunks(si.sphere, chunk_size):
+        for img_chunk, chunk_indices in _iter_scan_chunks(si.scan, chunk_size):
             angles_chunk = _angles_for_indices(
-                si.sphere, diff_motors, chunk_indices,
+                si.scan, diff_motors, chunk_indices,
             )
             sg.add(
                 img_chunk,

@@ -166,6 +166,36 @@ def test_get_metadata(scan_file):
     assert "q" in m and "chi" in m
 
 
+def test_mismatched_positioner_length_is_skipped_not_fatal(tmp_path):
+    """A per-frame column whose length != frame count (malformed/partial
+    file, e.g. 4 integrated frames but 2 'th' positions) must be skipped
+    with a warning, not crash the whole reader."""
+    from ssrl_xrd_tools.io.nexus import read_scan, read_scan_metadata
+
+    p = tmp_path / "mismatch.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g1 = e.create_group("integrated_1d")
+        g1.create_dataset("intensity", data=np.zeros((4, 8), dtype="f4"))
+        g1.create_dataset("q", data=np.linspace(1, 5, 8))
+        g1.create_dataset("frame_index", data=np.arange(4, dtype="i4"))
+        # 'th' positioner with only 2 values for a 4-frame scan.
+        sp = e.create_group("sample/positioners")
+        pg = sp.create_group("th")
+        pg.attrs["NX_class"] = "NXpositioner"
+        pg.create_dataset("value", data=np.array([0.1, 0.2], dtype="f4"))
+        # a well-formed positioner of the right length survives.
+        pg2 = sp.create_group("samz")
+        pg2.attrs["NX_class"] = "NXpositioner"
+        pg2.create_dataset("value", data=np.arange(4, dtype="f4"))
+
+    for reader in (read_scan_metadata, lambda x: read_scan(x)):
+        ds = reader(p)
+        assert ds.sizes["frame"] == 4
+        assert "th" not in ds.data_vars          # mismatched → skipped
+        assert "samz" in ds.data_vars            # matching → kept
+
+
 def test_read_sphere_alias_deprecated(scan_file):
     """The old read_sphere* names still work but emit DeprecationWarning."""
     import warnings

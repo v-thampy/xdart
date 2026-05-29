@@ -1079,11 +1079,26 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
             if "frame_index" in g2 and "frame" not in coords:
                 coords["frame"] = np.asarray(g2["frame_index"][()])
 
+        # Reject per-frame columns whose length disagrees with the frame
+        # coord (malformed/partial file) so one bad column doesn't make the
+        # whole xr.Dataset construction raise and the viewer come up empty.
+        n_frames = len(coords["frame"]) if "frame" in coords else None
+
+        def _add_frame_var(name, arr):
+            arr = np.asarray(arr)
+            if n_frames is not None and arr.ndim >= 1 and arr.shape[0] != n_frames:
+                logger.warning(
+                    "Skipping per-frame column %r in %s: length %d != %d frames",
+                    name, path, arr.shape[0], n_frames,
+                )
+                return
+            data_vars[name] = (("frame",), arr)
+
         if "per_frame_geometry" in e:
             gg = e["per_frame_geometry"]
             for key in ("rot1", "rot2", "rot3", "incident_angle"):
                 if key in gg:
-                    data_vars[key] = (("frame",), np.asarray(gg[key][()]))
+                    _add_frame_var(key, gg[key][()])
             if "frame_index" in gg and "frame" not in coords:
                 coords["frame"] = np.asarray(gg["frame_index"][()])
 
@@ -1099,7 +1114,7 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
                         var_name = f"{category}_{k}"
                     else:
                         var_name = k
-                    data_vars[var_name] = (("frame",), arr)
+                    _add_frame_var(var_name, arr)
 
         if include_thumbnails and "frames" in e:
             thumbs: list[np.ndarray] = []
@@ -1203,12 +1218,29 @@ def read_scan_metadata(
                 if u is not None:
                     attrs_per_coord["chi"] = {"units": _v2_decode_str(u)}
 
+        # Number of frames implied by the frame coord, used to reject
+        # per-frame columns whose length disagrees (a malformed/partial
+        # file — e.g. 16 integrated frames but only 8 ``th`` positions).
+        # Without this guard a single mismatched column makes the whole
+        # xr.Dataset construction raise and the viewer comes up empty.
+        n_frames = len(coords["frame"]) if "frame" in coords else None
+
+        def _add_frame_var(name, arr):
+            arr = np.asarray(arr)
+            if n_frames is not None and arr.ndim >= 1 and arr.shape[0] != n_frames:
+                logger.warning(
+                    "Skipping per-frame column %r in %s: length %d != %d frames",
+                    name, path, arr.shape[0], n_frames,
+                )
+                return
+            data_vars[name] = (("frame",), arr)
+
         # Derived per-frame geometry (rot1/2/3, incident_angle).
         if "per_frame_geometry" in e:
             gg = e["per_frame_geometry"]
             for key in ("rot1", "rot2", "rot3", "incident_angle"):
                 if key in gg:
-                    data_vars[key] = (("frame",), np.asarray(gg[key][()]))
+                    _add_frame_var(key, gg[key][()])
 
         # Positioners.
         for category, path_in in [
@@ -1223,7 +1255,7 @@ def read_scan_metadata(
                         var_name = f"{category}_{k}"
                     else:
                         var_name = k
-                    data_vars[var_name] = (("frame",), arr)
+                    _add_frame_var(var_name, arr)
 
         # Fallback frame coord if neither integrated_* nor
         # per_frame_geometry carried frame_index but positioners
