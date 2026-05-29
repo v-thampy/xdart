@@ -271,6 +271,10 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
             "ub_matrix": _read_ub_matrix(e),
         }
     meta["n_frames"] = int(meta["frames"].size)
+    # When 1D and 2D were reduced over different frame labels, read_scan_metadata
+    # exposes the 2D labels separately; surface them so this matches read_scan.
+    if "frame_2d" in ds.coords:
+        meta["frames_2d"] = np.asarray(ds["frame_2d"].values)
     for axis in ("q", "q_2d", "chi"):
         if axis in ds.coords:
             meta[axis] = np.asarray(ds[axis].values)

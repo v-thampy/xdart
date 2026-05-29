@@ -822,7 +822,12 @@ def _append_stacked_1d(
     This is the canonical v2 layout that :func:`read_scan` consumes (and
     that the xdart GUI writer produces): resizable ``intensity`` of shape
     ``(n_frames, n_q)``, a shared ``q`` axis, optional stacked ``sigma``,
-    and a ``frame_index`` vector.  Frames are appended in call order.
+    and a ``frame_index`` vector.
+
+    Upsert semantics (matches the "append/update" contract): a frame whose
+    label is already on disk replaces that row in place; a new label is
+    appended.  This keeps reruns / partial reprocessing idempotent instead
+    of producing duplicate ``frame_index`` entries.
     """
     intensity = np.asarray(r.intensity, dtype=np.float32)
     n_q = intensity.shape[0]
@@ -851,10 +856,17 @@ def _append_stacked_1d(
             f"integrated_1d row size {n_q} != on-disk {di.shape[1]}; "
             "all frames in a scan must share the same npt."
         )
+    fi = g["frame_index"]
+    match = np.where(np.asarray(fi[()]) == idx)[0]
+    if match.size:
+        pos = int(match[0])  # upsert: replace existing row for this label
+        di[pos] = intensity
+        if "sigma" in g and r.sigma is not None:
+            g["sigma"][pos] = np.asarray(r.sigma, dtype=np.float32)
+        return
     n = di.shape[0]
     di.resize(n + 1, axis=0)
     di[n] = intensity
-    fi = g["frame_index"]
     fi.resize(n + 1, axis=0)
     fi[n] = idx
     if "sigma" in g and r.sigma is not None:
@@ -908,10 +920,17 @@ def _append_stacked_2d(
             f"integrated_2d slice {(n_chi, n_q)} != on-disk {tuple(di.shape[1:])}; "
             "all frames in a scan must share the same (npt_azim, npt_rad)."
         )
+    fi = g["frame_index"]
+    match = np.where(np.asarray(fi[()]) == idx)[0]
+    if match.size:
+        pos = int(match[0])  # upsert: replace existing row for this label
+        di[pos] = intensity
+        if "sigma" in g and r.sigma is not None:
+            g["sigma"][pos] = np.asarray(r.sigma, dtype=np.float32).T
+        return
     n = di.shape[0]
     di.resize(n + 1, axis=0)
     di[n] = intensity
-    fi = g["frame_index"]
     fi.resize(n + 1, axis=0)
     fi[n] = idx
     if "sigma" in g and r.sigma is not None:
@@ -1288,6 +1307,20 @@ def read_scan_metadata(
                     e[grp_name]["frame_index"][()]
                 )
                 break
+
+        # Consistency with read_scan: if 1D and 2D were reduced over
+        # different frame labels, surface the 2D labels on a separate
+        # ``frame_2d`` coord too, so the lightweight metadata path doesn't
+        # silently report only the 1D labels (the get_metadata "frames"
+        # would otherwise disagree with read_scan / get_2d).
+        if (
+            "integrated_1d" in e and "frame_index" in e["integrated_1d"]
+            and "integrated_2d" in e and "frame_index" in e["integrated_2d"]
+        ):
+            f1 = np.asarray(e["integrated_1d"]["frame_index"][()])
+            f2 = np.asarray(e["integrated_2d"]["frame_index"][()])
+            if f1.shape != f2.shape or not np.array_equal(f1, f2):
+                coords["frame_2d"] = f2
 
         # q / chi axes (small).
         if "integrated_1d" in e and "q" in e["integrated_1d"]:

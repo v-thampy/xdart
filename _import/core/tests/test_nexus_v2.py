@@ -333,3 +333,17 @@ def test_read_scan_separate_dim_when_labels_differ(tmp_path):
     assert list(ds["frame_2d"].values) == [10, 11, 12]
     # row k still holds value k (orientation/order preserved, not mislabeled)
     np.testing.assert_allclose(ds["intensity_2d"].values[1], 1.0)
+
+
+def test_read_scan_metadata_surfaces_frame_2d_on_mismatch(tmp_path):
+    """The lightweight metadata path mirrors read_scan: divergent 2D labels
+    appear on a frame_2d coord (so get_metadata doesn't disagree)."""
+    from ssrl_xrd_tools.io.nexus import read_scan_metadata
+    p = tmp_path / "meta_mismatch.nxs"
+    _write_1d2d(p, [0, 1, 2], [10, 11, 12])
+    ds = read_scan_metadata(p)
+    assert list(ds["frame"].values) == [0, 1, 2]
+    assert list(ds["frame_2d"].values) == [10, 11, 12]
+    p2 = tmp_path / "meta_match.nxs"
+    _write_1d2d(p2, [0, 1, 2], [0, 1, 2])
+    assert "frame_2d" not in read_scan_metadata(p2).coords

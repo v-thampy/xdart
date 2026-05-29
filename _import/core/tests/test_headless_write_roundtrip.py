@@ -77,6 +77,28 @@ def test_write_nexus_frame_incremental_roundtrips(tmp_path):
     np.testing.assert_allclose(ds["intensity_1d"].values[0], _r1d(5).intensity, rtol=1e-6)
 
 
+def test_rewriting_a_frame_upserts_not_duplicates(tmp_path):
+    """Writing the same frame label twice updates the row in place (no
+    duplicate frame_index) — keeps reruns/partial reprocessing idempotent."""
+    p = tmp_path / "rerun.nxs"
+    h5 = open_nexus_writer(p, overwrite=True)
+    try:
+        write_nexus_frame(h5, 0, result_1d=_r1d(0), result_2d=_r2d(0))
+        write_nexus_frame(h5, 1, result_1d=_r1d(1), result_2d=_r2d(1))
+        # rerun frame 0 with fresh values
+        new0 = IntegrationResult1D(
+            radial=np.linspace(0.5, 5.0, N_Q), intensity=np.full(N_Q, 7.0),
+            unit="q_A^-1",
+        )
+        write_nexus_frame(h5, 0, result_1d=new0)
+    finally:
+        h5.close()
+
+    ds = read_scan(p, groups=("1d",))
+    assert list(ds["frame"].values) == [0, 1]   # not [0, 1, 0]
+    np.testing.assert_allclose(ds["intensity_1d"].values[0], 7.0)  # row 0 updated
+
+
 def test_nexus_sink_roundtrips_through_read_scan(tmp_path):
     """The NexusSink itself (begin/write/finish) → read_scan."""
     import pytest
