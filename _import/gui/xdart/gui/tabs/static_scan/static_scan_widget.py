@@ -629,7 +629,21 @@ class staticWidget(QWidget):
                 positional so the rename is purely cosmetic at this
                 boundary — the value still flows through unchanged.
         """
-        # if self.sphere.name != name or self.sphere.name == 'null_main':
+        # Eagerly set the sphere's name to the new scan's name so the
+        # per-frame ``h5viewer.update_data`` path doesn't bail on the
+        # ``if sphere.name == "null_main": return`` guard.  Without
+        # this, the sphere name only became real after the async
+        # ``file_thread`` processed the queued ``set_datafile``
+        # command — by which time the wrangler had often moved on
+        # to the next scan.  Visible symptom: in multi-scan Image
+        # Directory runs the plots stayed blank during the entire
+        # run and only the last scan's data appeared at the end.
+        # ``self.h5viewer.set_file`` below still queues the proper
+        # ``set_datafile`` so the sphere's ``data_file`` and the
+        # canonical name resolution (via ``sphere.set_datafile``)
+        # land correctly; this assignment just unblocks the
+        # synchronous render path immediately.
+        self.sphere.name = name
         self.h5viewer.dirname = os.path.dirname(fname)
         self.h5viewer.set_file(fname)
         self.sphere.gi = gi
