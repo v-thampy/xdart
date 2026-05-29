@@ -25,7 +25,7 @@ from ssrl_xrd_tools.io.metadata import read_image_metadata
 # in sync with what ``read_image_metadata`` will actually look for.
 from ssrl_xrd_tools.io.metadata import _extract_scan_info
 from .wrangler_widget import wranglerWidget
-from .spec_wrangler_thread import specThread, _get_scan_info  # noqa: F401
+from .image_wrangler_thread import imageThread, _get_scan_info  # noqa: F401
 from .ui.specUI import Ui_Form
 from ....gui_utils import NamedActionParameter
 from xdart.utils import get_fname_dir, match_img_detector
@@ -120,10 +120,13 @@ ctr = 1
 
 
 
-class specWrangler(wranglerWidget):
-    """Widget for integrating data associated with spec file. Can be
-    used "live", will continue to poll data folders until image data
-    and corresponding spec data are available.
+class imageWrangler(wranglerWidget):
+    """Widget for integrating detector image files (TIFF/EDF/CBF/Eiger
+    master; as an image series, image directory, or single image).
+    Per-frame metadata is read from an optional sidecar — a SPEC file,
+    a ``.txt``/``.pdi`` file, or nothing (the ``Meta Format`` option).
+    Can be used "live": it polls the data folder for new images (and
+    their metadata, if any) until the scan is complete.
 
     attributes:
         command_queue: Queue, used to send commands to thread
@@ -200,7 +203,7 @@ class specWrangler(wranglerWidget):
         self.tree.setMinimumWidth(150)
         self.stylize_ParameterTree()
         self.parameters = Parameter.create(
-            name='spec_wrangler', type='group', children=params
+            name='image_wrangler', type='group', children=params
         )
         self.tree.setParameters(self.parameters, showTop=False)
         # Squeeze parameter tree columns to reduce panel width
@@ -328,7 +331,7 @@ class specWrangler(wranglerWidget):
         )
 
         # Setup thread
-        self.thread = specThread(
+        self.thread = imageThread(
             self.command_queue,
             self.scan_args,
             self.file_lock,

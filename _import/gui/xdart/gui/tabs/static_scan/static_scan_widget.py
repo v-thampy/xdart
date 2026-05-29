@@ -39,7 +39,7 @@ from .h5viewer import H5Viewer
 from .display_frame_widget import displayFrameWidget
 from .integrator import integratorTree
 from .metadata import metadataWidget
-from .wranglers import specWrangler, nexusWrangler, wranglerWidget
+from .wranglers import imageWrangler, nexusWrangler, wranglerWidget
 from xdart.utils._utils import FixSizeOrderedDict, get_fname_dir, get_img_data
 
 QWidget = QtWidgets.QWidget
@@ -51,7 +51,7 @@ QInputDialog = QtWidgets.QInputDialog
 QCombo = QtWidgets.QComboBox
 
 wranglers = {
-    'SPEC': specWrangler,
+    'Image Files': imageWrangler,
     'NeXus': nexusWrangler,
 }
 

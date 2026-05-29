@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-specThread — worker thread for spec_wrangler.
+imageThread — worker thread for image_wrangler.
 
 Handles all image processing, integration, background subtraction,
 and file I/O in a separate QThread.
@@ -179,10 +179,10 @@ def natural_sort_float(list_to_sort):
 
 
 # ---------------------------------------------------------------------------
-# specThread
+# imageThread
 # ---------------------------------------------------------------------------
 
-class specThread(wranglerThread):
+class imageThread(wranglerThread):
     """Thread for controlling image processing.  Receives and manages a
     command and signal queue to pass commands from the main thread and
     communicate back relevant signals.
@@ -299,7 +299,7 @@ class specThread(wranglerThread):
         # threshold_max / sub_label / _xye_buffer / _xye_lock /
         # _frames_since_save / _published_frames are all initialised
         # by the wranglerThread base class — see wrangler_widget.py.
-        # specThread only needs to set the spec-specific extras here.
+        # imageThread only needs to set the spec-specific extras here.
         self.max_cores = max_cores
         self.command = command
         self.scan = scan
@@ -395,7 +395,7 @@ class specThread(wranglerThread):
         self.mask = np.flatnonzero(det_mask) if det_mask is not None else None
         self._cached_gi_incident_angle = None
 
-        # Sync GI mode selections from spec_wrangler into scan.bai_*_args
+        # Sync GI mode selections from image_wrangler into scan.bai_*_args
         if self.gi:
             self.scan.bai_1d_args['gi_mode_1d'] = self.gi_mode_1d
             self.scan.bai_2d_args['gi_mode_2d'] = self.gi_mode_2d
@@ -682,7 +682,7 @@ class specThread(wranglerThread):
 
     # ``_resolve_frame_mask``, ``_apply_threshold_inline``, and
     # ``_flush_xye_buffer`` moved to wranglerThread (the base class)
-    # in May 2026 — both specThread and nexusThread inherit them now.
+    # in May 2026 — both imageThread and nexusThread inherit them now.
     # See xdart/gui/tabs/static_scan/wranglers/wrangler_widget.py.
 
     def _dispatch_batch_serial(self, scan, pending, *, force_save=False):
@@ -1718,7 +1718,7 @@ class specThread(wranglerThread):
         # ``_master`` suffix stripped from scan_name (see
         # _get_next_eiger_frame). Without this sync, the wrangler
         # widget's self.fname (set from the original master filename
-        # in spec_wrangler.setup()) diverges from the actual scan
+        # in image_wrangler.setup()) diverges from the actual scan
         # output path, and static_scan_widget.wrangler_finished
         # cannot find the generated file to reload at end of batch.
         self.fname = fname

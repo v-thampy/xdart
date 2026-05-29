@@ -75,7 +75,7 @@ params = [
 class nexusWrangler(wranglerWidget):
     """Widget for processing NeXus/HDF5 image stacks.
 
-    A simpler alternative to specWrangler for data already stored
+    A simpler alternative to imageWrangler for data already stored
     in NeXus format (e.g. from Bluesky).
 
     signals:
@@ -128,7 +128,7 @@ class nexusWrangler(wranglerWidget):
         self.stopButton = QtWidgets.QPushButton('Stop')
         self.stopButton.setObjectName('stopButton')
 
-        # Processing-mode dropdown — same items as specWrangler so the
+        # Processing-mode dropdown — same items as imageWrangler so the
         # two paths feel interchangeable.  Selecting "Int 1D" or
         # "Int 1D (XYE)" skips 2D integration (faster batches on big
         # detectors).  "Int 1D (XYE)" also bypasses the HDF5 write
@@ -145,7 +145,7 @@ class nexusWrangler(wranglerWidget):
 
         # Cores spinbox — controls how many worker threads the
         # nexusThread spawns for parallel batch integration.  Same
-        # convention as specWrangler.maxCoresSpinBox.  Pushed down
+        # convention as imageWrangler.maxCoresSpinBox.  Pushed down
         # to ``self.thread.max_cores`` before each scan starts (see
         # :meth:`start`).  Default = min(CPU-1, 4) so we don't
         # saturate a busy laptop by default.
@@ -327,7 +327,7 @@ class nexusWrangler(wranglerWidget):
     def _on_mode_changed(self, mode_text: str) -> None:
         """Sync scan/thread flags to the dropdown's current text.
 
-        Mirror of ``specWrangler._on_mode_changed``'s logic, minus the
+        Mirror of ``imageWrangler._on_mode_changed``'s logic, minus the
         viewer modes (the NeXus wrangler always runs the integration
         pipeline — it has no separate display-only viewer panel).
 

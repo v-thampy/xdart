@@ -3,7 +3,7 @@
 nexusThread — worker thread for NeXus/Tiled wrangler.
 
 Reads frames from a NeXus HDF5 file (Bluesky suitcase-nexus format)
-and integrates each one using the same LiveFrame pipeline as specThread.
+and integrates each one using the same LiveFrame pipeline as imageThread.
 
 Performance shape (post-P3A refactor 2026-05-13):
 
@@ -446,7 +446,7 @@ class nexusThread(wranglerThread):
 
         We need this *before* the parallel section starts so workers
         can read the cached instance instead of racing to create one.
-        Same pattern as specThread.
+        Same pattern as imageThread.
         """
         # Construct a throw-away frame just to compute the incidence
         # angle from frame 0 + base metadata.  The frame isn't kept.
@@ -470,7 +470,7 @@ class nexusThread(wranglerThread):
         # Cache the angle so the parallel workers in :meth:`_integrate_one`
         # can detect drift on ω-varying scans and fall back to a
         # worker-local fiber integrator at the correct angle.  Same
-        # pattern as specThread.
+        # pattern as imageThread.
         scan._cached_fiber_integrator_angle = incident_angle
 
     def _integrate_one(self, scan, integrator_pool, fiber_pool, standard_plan,
@@ -492,7 +492,7 @@ class nexusThread(wranglerThread):
         _t0 = time.time()
         # Stable bad-pixel mask cached on the scan across frames so
         # pyFAI's CSR cache stays valid.  Helper now lives on the
-        # wranglerThread base class — same impl as specThread uses.
+        # wranglerThread base class — same impl as imageThread uses.
         frame_mask = self._resolve_frame_mask(scan, img_data)
 
         # Borrow a private integrator — pyFAI isn't thread-safe with
@@ -560,7 +560,7 @@ class nexusThread(wranglerThread):
         frame.skip_map_raw = True
 
         # Buffer the XYE write — flushed at end of each chunk by the
-        # main loop.  Mirrors the specThread pattern; keeps the worker
+        # main loop.  Mirrors the imageThread pattern; keeps the worker
         # thread cheap and groups disk traffic so it doesn't interleave
         # with the next chunk's integration.  The flush itself respects
         # ``xye_only`` mode (see ``_flush_xye_buffer``); the buffer is
@@ -587,7 +587,7 @@ class nexusThread(wranglerThread):
         the frame in ``self._published_frames[frame.idx]`` and emit
         ``sigUpdate``; ``static_scan_widget.update_data`` pops it and
         owns the dict updates + bounded eviction.  Same single
-        source-of-truth contract that specThread's live path uses.
+        source-of-truth contract that imageThread's live path uses.
         """
         # In-memory accumulate only — the chunked flush at the end of
         # the dispatch loop (and the final ``save_to_nexus(finalize=True)``

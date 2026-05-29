@@ -459,7 +459,7 @@ def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> Non
 
 
 def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> None:
-    from xdart.gui.tabs.static_scan.wranglers import spec_wrangler_thread
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler_thread
 
     calls = []
 
@@ -504,7 +504,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
         _plan_cache=StandardPlanCache(),
     )
 
-    spec_wrangler_thread.specThread._process_one(
+    image_wrangler_thread.imageThread._process_one(
         worker,
         scan,
         "frame_0001.tif",

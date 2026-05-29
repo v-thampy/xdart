@@ -275,7 +275,7 @@ class wranglerThread(Qt.QtCore.QThread):
             pass
 
     def run(self):
-        """Main task. Subclasses (e.g. specThread) override this."""
+        """Main task. Subclasses (e.g. imageThread) override this."""
         pass
 
     # ── Shared batch helpers ────────────────────────────────────────
@@ -450,7 +450,7 @@ class wranglerThread(Qt.QtCore.QThread):
 
         Static because it only depends on the scan + frame state —
         not on per-wrangler attributes.  Filename layout matches the
-        prior specWrangler convention so existing downstream tools
+        prior imageWrangler convention so existing downstream tools
         keep working: ``<scan_dir>/<scan_name>/iq_<scan>_NNNN.xye``
         (or ``itth_...`` for 2θ units).
         """
