@@ -249,3 +249,25 @@ def test_stitch_images_routes_and_handles_rot2(monkeypatch):
 
     with pytest.raises(ValueError):
         multi.stitch_images(imgs, "PONI", [10.0], mode="bogus")
+
+
+def test_stitch_images_rejects_count_mismatch():
+    """stitch_images must reject images != angles before MultiGeometry."""
+    imgs = [np.zeros((3, 3)), np.zeros((3, 3)), np.zeros((3, 3))]
+    poni = PONI(dist=0.1, poni1=0.01, poni2=0.02, wavelength=1e-10, detector="Detector")
+    from ssrl_xrd_tools.integrate.multi import stitch_images
+    with pytest.raises(ValueError, match="images != "):
+        stitch_images(imgs, poni, [10.0, 20.0])  # 3 images, 2 angles
+
+
+def test_prepare_images_rejects_bad_normalization():
+    """Zero / non-finite normalization values fail early (no divide-by-zero)."""
+    from ssrl_xrd_tools.integrate.multi import _prepare_images
+    imgs = [np.ones((2, 2)), np.ones((2, 2))]
+    with pytest.raises(ValueError, match="zero"):
+        _prepare_images(imgs, [1.0, 0.0])
+    with pytest.raises(ValueError, match="non-finite"):
+        _prepare_images(imgs, [1.0, np.inf])
+    # valid normalization still works
+    out = _prepare_images(imgs, [2.0, 4.0])
+    assert np.allclose(out[0], 0.5) and np.allclose(out[1], 0.25)

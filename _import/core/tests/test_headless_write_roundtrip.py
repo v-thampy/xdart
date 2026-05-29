@@ -136,6 +136,44 @@ def test_write_integrated_stack_bulk_then_incremental(tmp_path):
     np.testing.assert_allclose(ds2["intensity_1d"].values[1], 9.0)  # row 1 updated
 
 
+def test_write_stitched_roundtrips_through_read_stitched(tmp_path):
+    """write_stitched ↔ read_stitched: stitched_2d is (q, chi) as-is (NOT
+    transposed like integrated_2d)."""
+    import h5py
+    from ssrl_xrd_tools.io.nexus import write_stitched, read_stitched
+
+    p = tmp_path / "stitched.nxs"
+    s1 = _r1d(0)                       # (N_Q,)
+    s2 = IntegrationResult2D(          # intensity (N_Q, N_CHI) — q-major, as-is
+        radial=np.linspace(0.5, 4.0, N_Q),
+        azimuthal=np.linspace(-180, 180, N_CHI, endpoint=False),
+        intensity=np.random.default_rng(3).random((N_Q, N_CHI)),
+        unit="q_A^-1", azimuthal_unit="chi_deg",
+    )
+    with h5py.File(p, "w") as f:
+        write_stitched(f.create_group("entry"), stitched_1d=s1, stitched_2d=s2)
+
+    ds = read_stitched(p)
+    assert ds["stitched_1d"].dims == ("q",)
+    assert ds["stitched_2d"].dims == ("q", "chi")
+    assert ds["stitched_2d"].shape == (N_Q, N_CHI)
+    np.testing.assert_allclose(ds["stitched_2d"].values, s2.intensity, rtol=1e-6)
+    np.testing.assert_allclose(ds["stitched_1d"].values, s1.intensity, rtol=1e-6)
+
+
+def test_write_integrated_stack_rejects_duplicate_labels(tmp_path):
+    import h5py
+    import pytest
+    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    p = tmp_path / "dup.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        with pytest.raises(ValueError, match="duplicate"):
+            write_integrated_stack(
+                e, frame_indices=[0, 0], results_1d=[_r1d(0), _r1d(1)],
+            )
+
+
 def test_nexus_sink_roundtrips_through_read_scan(tmp_path):
     """The NexusSink itself (begin/write/finish) → read_scan."""
     import pytest

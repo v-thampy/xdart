@@ -961,6 +961,8 @@ def write_integrated_stack(
     frame_index; ``compression`` applies to the intensity/sigma stacks.
     """
     fis = [int(x) for x in frame_indices]
+    if len(set(fis)) != len(fis):
+        raise ValueError(f"frame_indices contains duplicate labels: {fis}")
     ck = _comp_kwargs(compression)
 
     def _bulk_create_1d():
@@ -1029,6 +1031,54 @@ def write_integrated_stack(
         else:
             for fi, r in zip(fis, results_2d):
                 _append_stacked_2d(entry_grp, fi, r, ck)
+
+
+def write_stitched(
+    entry_grp: h5py.Group,
+    *,
+    stitched_1d: IntegrationResult1D | None = None,
+    stitched_2d: IntegrationResult2D | None = None,
+    compression: str | None = None,
+) -> None:
+    """Write ``/entry/stitched_1d`` / ``/entry/stitched_2d`` — the symmetric
+    counterpart to :func:`read_stitched`.
+
+    Note the orientation: unlike the per-frame ``integrated_2d`` stack
+    (stored ``(frame, chi, q)``), ``stitched_2d/intensity`` is stored
+    **as-is** ``(n_q, n_chi)`` and read back with dims ``(q, chi)`` — this
+    matches the existing xdart writer + ``read_stitched`` so files stay
+    interchangeable.  Each group is replaced atomically (idempotent).
+    """
+    ck = _comp_kwargs(compression)
+
+    if stitched_1d is not None:
+        if "stitched_1d" in entry_grp:
+            del entry_grp["stitched_1d"]
+        g = entry_grp.create_group("stitched_1d")
+        g.attrs["NX_class"] = "NXdata"
+        g.attrs["signal"] = "intensity"
+        g.attrs["axes"] = ["q"]
+        g.create_dataset("intensity",
+                         data=np.asarray(stitched_1d.intensity, np.float32), **ck)
+        qd = g.create_dataset("q", data=np.asarray(stitched_1d.radial, np.float32))
+        qd.attrs["units"] = stitched_1d.unit
+        if stitched_1d.sigma is not None:
+            g.create_dataset("sigma",
+                             data=np.asarray(stitched_1d.sigma, np.float32), **ck)
+
+    if stitched_2d is not None:
+        if "stitched_2d" in entry_grp:
+            del entry_grp["stitched_2d"]
+        g = entry_grp.create_group("stitched_2d")
+        g.attrs["NX_class"] = "NXdata"
+        g.attrs["signal"] = "intensity"
+        g.attrs["axes"] = ["q", "chi"]
+        g.create_dataset("intensity",  # (n_q, n_chi) as-is — see docstring
+                         data=np.asarray(stitched_2d.intensity, np.float32), **ck)
+        qd = g.create_dataset("q", data=np.asarray(stitched_2d.radial, np.float32))
+        qd.attrs["units"] = stitched_2d.unit
+        cd = g.create_dataset("chi", data=np.asarray(stitched_2d.azimuthal, np.float32))
+        cd.attrs["units"] = stitched_2d.azimuthal_unit
 
 
 # ---------------------------------------------------------------------------
@@ -1578,6 +1628,7 @@ __all__ = [
     "write_nexus",
     "write_nexus_frame",
     "write_integrated_stack",
+    "write_stitched",
     # v2 (xdart 0.37+)
     "read_scan",
     "read_scan_metadata",

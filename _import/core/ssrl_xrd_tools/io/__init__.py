@@ -40,6 +40,7 @@ from ssrl_xrd_tools.io.nexus import (
     write_integrated_stack,
     write_nexus,
     write_nexus_frame,
+    write_stitched,
 )
 from ssrl_xrd_tools.io.read import (
     Integrated1D,

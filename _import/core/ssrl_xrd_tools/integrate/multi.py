@@ -252,6 +252,10 @@ def _prepare_images(
             raise ValueError(
                 f"normalization length {norm.shape} != number of images {len(img_list)}"
             )
+        if not np.all(np.isfinite(norm)):
+            raise ValueError("normalization contains non-finite (nan/inf) values")
+        if np.any(norm == 0):
+            raise ValueError("normalization contains zero values (would divide by zero)")
         img_list = [img / n for img, n in zip(img_list, norm)]
 
     return img_list
@@ -287,6 +291,19 @@ def stitch_images(
     selects which.  ``rot2_angles`` that are all-zero (or ``None``) are
     treated as a pure ``rot1`` scan.
     """
+    # Fail early on a count mismatch — feeding MultiGeometry an unequal
+    # number of images and integrators silently mispairs images with the
+    # wrong detector angle (or raises deep inside pyFAI).
+    rot1 = np.asarray(rot1_angles, dtype=float)
+    n_images = images.shape[0] if (
+        isinstance(images, np.ndarray) and images.ndim == 3
+    ) else len(images)
+    if n_images != rot1.shape[0]:
+        raise ValueError(
+            f"stitch_images: {n_images} images != {rot1.shape[0]} angles; "
+            "one detector angle is required per image."
+        )
+
     rot2 = (
         rot2_angles
         if rot2_angles is not None and np.any(np.asarray(rot2_angles))
