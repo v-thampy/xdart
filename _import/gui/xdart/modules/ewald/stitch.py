@@ -5,8 +5,8 @@ Thin orchestration layer over
 ``create_multigeometry_integrators``, ``stitch_1d``, ``stitch_2d``).
 
 The wrangler calls :func:`run_stitch` once all frames are loaded.
-Stitched outputs are stored on the sphere as
-``sphere.stitched_1d`` / ``sphere.stitched_2d`` and persisted by the
+Stitched outputs are stored on the scan as
+``scan.stitched_1d`` / ``scan.stitched_2d`` and persisted by the
 v2 NeXus writer's ``finalize=True`` pass.
 
 Per plan §4.5: stitch is **batch-only**.  Per-image
@@ -25,7 +25,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 def run_stitch(
-    sphere: "LiveScan",
+    scan: "LiveScan",
     *,
     mode: Literal["1d", "2d"] = "1d",
     norm_motor: str | None = None,
@@ -38,30 +38,30 @@ def run_stitch(
     azimuth_range: tuple[float, float] | None = None,
     unit: str = "q_A^-1",
 ) -> None:
-    """Stitch the sphere's per-frame images into a single merged pattern.
+    """Stitch the scan's per-frame images into a single merged pattern.
 
     Reads:
 
-    * ``sphere.arches`` — image stack (via ``arch.map_raw - arch.bg_raw``).
-    * ``sphere.geometry`` — :class:`DiffractometerGeometry` for the
+    * ``scan.frames`` — image stack (via ``frame.map_raw - frame.bg_raw``).
+    * ``scan.geometry`` — :class:`DiffractometerGeometry` for the
       per-frame ``rot1``/``rot2`` derivation.
-    * ``sphere.scan_data`` — motor positions (DataFrame).
-    * ``sphere.arches[0].poni`` — base PONI geometry shared across
+    * ``scan.scan_data`` — motor positions (DataFrame).
+    * ``scan.frames[0].poni`` — base PONI geometry shared across
       all frames.
 
     Writes:
 
-    * ``sphere.stitched_1d`` (mode ``"1d"``) — an ``IntegrationResult1D``.
-    * ``sphere.stitched_2d`` (mode ``"2d"``) — an ``IntegrationResult2D``.
+    * ``scan.stitched_1d`` (mode ``"1d"``) — an ``IntegrationResult1D``.
+    * ``scan.stitched_2d`` (mode ``"2d"``) — an ``IntegrationResult2D``.
 
     Parameters
     ----------
-    sphere
-        Source of arches, geometry, scan_data, and base PONI.
+    scan
+        Source of frames, geometry, scan_data, and base PONI.
     mode
         ``"1d"`` for ``I(q)``, ``"2d"`` for ``I(q, χ)``.
     norm_motor
-        Name of a column in ``sphere.scan_data`` whose values are used
+        Name of a column in ``scan.scan_data`` whose values are used
         to divide each image (per-image normalization, e.g. ``"i1"``).
         If ``None``, no normalization is applied.
     mask
@@ -80,31 +80,31 @@ def run_stitch(
     Raises
     ------
     RuntimeError
-        If ``sphere.geometry`` is unset or no PONI is available.
+        If ``scan.geometry`` is unset or no PONI is available.
     ValueError
         If ``mode`` isn't ``"1d"`` or ``"2d"``.
     """
     if mode not in ("1d", "2d"):
         raise ValueError(f"mode must be '1d' or '2d', got {mode!r}")
-    if sphere.geometry is None:
+    if scan.geometry is None:
         raise RuntimeError(
             "LiveScan.geometry is unset — set it before stitching "
             "(use ssrl_xrd_tools.core.geometry.DiffractometerGeometry)."
         )
-    arches = list(sphere.arches)
-    if not arches:
+    frames = list(scan.frames)
+    if not frames:
         raise RuntimeError("LiveScan has no frames — load frames first")
 
-    base_poni = getattr(arches[0], "poni", None)
+    base_poni = getattr(frames[0], "poni", None)
     if base_poni is None:
-        raise RuntimeError("No PONI on arches[0] — cannot stitch")
+        raise RuntimeError("No PONI on frames[0] — cannot stitch")
 
     # Per-frame rotations (in degrees, since multi.py expects degrees)
-    geom = sphere.geometry
+    geom = scan.geometry
     motors = {
-        m: np.asarray(sphere.scan_data[m].values, dtype=float)
+        m: np.asarray(scan.scan_data[m].values, dtype=float)
         for m in geom.all_referenced_motors()
-        if m in sphere.scan_data.columns
+        if m in scan.scan_data.columns
     }
     derived = geom.derive_per_frame(motors)
     # multi.py expects degrees, not radians — invert deg2rad on rot1/rot2
@@ -113,11 +113,11 @@ def run_stitch(
 
     # Image stack — bg-subtracted, optionally per-image normalized.
     #
-    # P5: lazy-load ``map_raw`` for v2-reloaded arches.  On a sphere
+    # P5: lazy-load ``map_raw`` for v2-reloaded frames.  On a scan
     # loaded from disk (vs. one freshly produced by the wrangler),
-    # ``arch.map_raw`` is None until we ask :meth:`_lazy_load_raw``
+    # ``frame.map_raw`` is None until we ask :meth:`_lazy_load_raw``
     # to hydrate it from the source file (TIFF / NeXus master).
-    # Without this call, ``arch.map_raw - arch.bg_raw`` would
+    # Without this call, ``frame.map_raw - frame.bg_raw`` would
     # TypeError on the None subtract and abort the whole stitch.
     # Frames whose source isn't on disk get logged + skipped rather
     # than crashing the whole run.
@@ -129,7 +129,7 @@ def run_stitch(
     # either pyFAI's MultiGeometry would mis-pair an image with the
     # wrong rotation, or it would length-mismatch and raise.
     # ``surviving_indices`` is the positional row in the original
-    # ``arches`` (and therefore ``scan_data``, ``rot*_deg``) for
+    # ``frames`` (and therefore ``scan_data``, ``rot*_deg``) for
     # each frame that survived; we filter all three using it after
     # the loop.
     import logging as _logging
@@ -137,33 +137,33 @@ def run_stitch(
     images = []
     skipped = []
     surviving_indices = []
-    for i, arch in enumerate(arches):
-        if arch.map_raw is None:
+    for i, frame in enumerate(frames):
+        if frame.map_raw is None:
             try:
-                arch._lazy_load_raw()
+                frame._lazy_load_raw()
             except Exception as e:
                 _logger.warning(
-                    'stitch: lazy raw load failed for arch %s: %s',
-                    arch.idx, e,
+                    'stitch: lazy raw load failed for frame %s: %s',
+                    frame.idx, e,
                 )
-        if arch.map_raw is None:
-            skipped.append(arch.idx)
+        if frame.map_raw is None:
+            skipped.append(frame.idx)
             continue
-        img = np.asarray(arch.map_raw - arch.bg_raw, dtype=float)
-        if norm_motor is not None and norm_motor in sphere.scan_data.columns:
-            denom = float(sphere.scan_data[norm_motor].iloc[i])
+        img = np.asarray(frame.map_raw - frame.bg_raw, dtype=float)
+        if norm_motor is not None and norm_motor in scan.scan_data.columns:
+            denom = float(scan.scan_data[norm_motor].iloc[i])
             if denom != 0:
                 img = img / denom
         images.append(img)
         surviving_indices.append(i)
     if skipped:
         _logger.warning(
-            'stitch: skipped %d arches with no raw data: %s',
+            'stitch: skipped %d frames with no raw data: %s',
             len(skipped), skipped,
         )
     if not images:
         raise RuntimeError(
-            'stitch: no arches with raw data available — '
+            'stitch: no frames with raw data available — '
             'all source files missing or unloadable'
         )
     img_stack = np.stack(images, axis=0)
@@ -187,7 +187,7 @@ def run_stitch(
     )
 
     if mode == "1d":
-        sphere.stitched_1d = stitch_1d(
+        scan.stitched_1d = stitch_1d(
             img_stack,
             integrators,
             npt=npt_1d,
@@ -197,7 +197,7 @@ def run_stitch(
             radial_range=radial_range,
         )
     else:
-        sphere.stitched_2d = stitch_2d(
+        scan.stitched_2d = stitch_2d(
             img_stack,
             integrators,
             npt_rad=npt_rad_2d,

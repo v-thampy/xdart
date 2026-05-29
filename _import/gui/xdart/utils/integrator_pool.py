@@ -14,7 +14,7 @@ The fix is one integrator per worker.  This module provides:
 * :class:`IntegratorPool` — a thread-safe queue of N integrator
   deep-copies handed out via a ``borrow()`` context manager.
 * :func:`ensure_integrator_pool` — convenience that caches the pool
-  on an arbitrary sphere-like object so its lifetime is one scan
+  on an arbitrary scan-like object so its lifetime is one scan
   (not one batch dispatch), amortising the ~250 ms first-call CSR
   LUT cost across all subsequent integrations.
 
@@ -42,15 +42,15 @@ class IntegratorPool:
     Use as a context manager::
 
         with pool.borrow() as ai:
-            arch.integrate_1d(integrator=ai, ...)
+            frame.integrate_1d(integrator=ai, ...)
 
     :meth:`borrow` blocks if all integrators are out — never happens
     in practice because the caller's executor is bounded to the same
     ``n``.  The source integrator itself is intentionally **not** put
     in the pool; it's reserved for non-parallel consumers (GUI
     display, single-threaded re-integration) and the wrangler can
-    safely detach pool members from per-frame archs without leaking
-    a pool reference into long-lived sphere state.
+    safely detach pool members from per-frame frames without leaking
+    a pool reference into long-lived scan state.
     """
 
     __slots__ = ("_integrators", "_q", "_size")
@@ -93,10 +93,10 @@ def ensure_integrator_pool(holder: Any, source_attr: str, n_workers: int,
 
     Typical use in a wrangler::
 
-        pool = ensure_integrator_pool(sphere, '_cached_integrator',
+        pool = ensure_integrator_pool(scan, '_cached_integrator',
                                        n_workers=self.max_cores)
         if pool is None:
-            return self._dispatch_batch_serial(sphere, pending)
+            return self._dispatch_batch_serial(scan, pending)
         ...
     """
     base = getattr(holder, source_attr, None)

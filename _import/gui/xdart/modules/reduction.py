@@ -8,12 +8,15 @@ headless reduction work should cross into ``ssrl_xrd_tools`` as ``Frame`` /
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from dataclasses import fields as _dc_fields
 
@@ -28,7 +31,7 @@ from ssrl_xrd_tools.reduction import (
     run_reduction,
 )
 
-# S4: GI-only sphere kwargs that must NOT flow through to the standard
+# S4: GI-only scan kwargs that must NOT flow through to the standard
 # pyFAI integrator path.  Derived from :class:`GIMode` (so adding a GIMode
 # field automatically excludes that name) plus a small set of legacy
 # xdart-only names that the GI widgets emit but :class:`GIMode` doesn't
@@ -82,16 +85,16 @@ def scan_from_live_scan(
     """Build an ``ssrl_xrd_tools.reduction.Scan`` from a ``LiveScan``."""
     if include_backgrounds is None:
         include_backgrounds = include_images
-    indices = list(frame_indices) if frame_indices is not None else list(live_scan.arches.index)
+    indices = list(frame_indices) if frame_indices is not None else list(live_scan.frames.index)
     frames = [
         frame_from_live_frame(
-            live_scan.arches[int(idx)],
+            live_scan.frames[int(idx)],
             include_image=include_images,
             include_background=include_backgrounds,
         )
         for idx in indices
     ]
-    first_frame = live_scan.arches[int(indices[0])] if indices else None
+    first_frame = live_scan.frames[int(indices[0])] if indices else None
     poni = getattr(first_frame, "poni", None) if first_frame is not None else None
     wavelength_A = None
     try:
@@ -180,8 +183,8 @@ def plan_from_live_scan(
 
     mask_shape = None
     try:
-        first_idx = live_scan.arches.index[0]
-        first_img = getattr(live_scan.arches[int(first_idx)], "map_raw", None)
+        first_idx = live_scan.frames.index[0]
+        first_img = getattr(live_scan.frames[int(first_idx)], "map_raw", None)
         mask_shape = getattr(first_img, "shape", None)
     except Exception:
         mask_shape = None
@@ -266,7 +269,7 @@ def reduce_live_frame(
 
 # ---------------------------------------------------------------------------
 # S3 + C1 helpers — used by every wrangler so the GI-vs-standard dispatch
-# and the per-sphere plan cache live in exactly one place.
+# and the per-scan plan cache live in exactly one place.
 # ---------------------------------------------------------------------------
 
 def _plan_signature(
@@ -277,7 +280,7 @@ def _plan_signature(
     """Hashable signature of the inputs that ``plan_from_live_scan`` reads.
 
     Used by :class:`StandardPlanCache` to skip plan rebuilds when nothing
-    relevant on the sphere has changed.  Covers the bai_*_args dicts
+    relevant on the scan has changed.  Covers the bai_*_args dicts
     (sorted) and a digest of ``global_mask`` (shape + dtype + size +
     head/tail/sum for numeric masks).
     """
@@ -317,9 +320,9 @@ class StandardPlanCache:
 
     Wrappers (wranglers, integrator threads) keep one instance for the
     lifetime of a scan; the cached plan is rebuilt only when one of the
-    sphere settings ``_plan_signature`` covers actually changes.
+    scan settings ``_plan_signature`` covers actually changes.
 
-    Returns ``None`` for GI spheres so callers can drop straight into the
+    Returns ``None`` for GI scans so callers can drop straight into the
     legacy fiber-integrator path without an "is GI" check at every call
     site (the per-dispatch helper below already does that).
     """
@@ -376,7 +379,7 @@ def dispatch_live_frame_reduction(
     standard_plan
         ``ReductionPlan`` for the non-GI path; pass ``None`` to force
         the legacy callback (matches what
-        :meth:`StandardPlanCache.get` returns for GI spheres).
+        :meth:`StandardPlanCache.get` returns for GI scans).
     integrator
         Pre-built pyFAI integrator for the worker (typically borrowed
         from an :class:`IntegratorPool`).
@@ -400,9 +403,9 @@ def dispatch_live_frame_reduction(
     )
 
 
-def _source_path(arch: Any) -> Path | None:
-    resolver = getattr(arch, "_resolved_source_path", None)
-    path = resolver() if callable(resolver) else getattr(arch, "source_file", "")
+def _source_path(frame: Any) -> Path | None:
+    resolver = getattr(frame, "_resolved_source_path", None)
+    path = resolver() if callable(resolver) else getattr(frame, "source_file", "")
     return Path(path) if path else None
 
 
@@ -468,22 +471,38 @@ def _flat_mask_as_bool(mask: Any, shape: tuple[int, int] | None) -> np.ndarray |
         if arr.ndim == 2:
             return arr.astype(bool, copy=False)
         return None
+    # A mask that doesn't fit this image (wrong detector/calibration, a
+    # resized frame, a stale flat-index mask, …) is ignored with a warning
+    # rather than crashing the whole scan — reducing unmasked is far better
+    # than aborting the run.  Structural problems degrade the same way.
     if arr.ndim == 2:
         if arr.shape != shape:
-            raise ValueError(f"mask shape {arr.shape} does not match image shape {shape}")
+            logger.warning(
+                "Ignoring mask: shape %s does not match image shape %s.",
+                arr.shape, shape,
+            )
+            return None
         return arr.astype(bool, copy=False)
     if arr.ndim != 1:
-        raise ValueError(f"flat mask must be 1D; got shape {arr.shape}")
+        logger.warning("Ignoring mask: expected 1D flat mask, got shape %s.", arr.shape)
+        return None
     if arr.dtype == bool:
         if arr.size != int(np.prod(shape)):
-            raise ValueError(
-                f"flat boolean mask length {arr.size} does not match image shape {shape}"
+            logger.warning(
+                "Ignoring boolean mask: length %d does not match image shape %s.",
+                arr.size, shape,
             )
+            return None
         return arr.reshape(shape)
     out = np.zeros(int(np.prod(shape)), dtype=bool)
     flat = np.asarray(arr, dtype=int).ravel()
-    if np.any(flat < 0) or np.any(flat >= out.size):
-        raise ValueError(f"flat mask indices out of bounds for image shape {shape}")
+    if flat.size and (flat.min() < 0 or flat.max() >= out.size):
+        logger.warning(
+            "Ignoring mask: flat indices out of bounds for image shape %s "
+            "(index range [%d, %d], image has %d pixels).",
+            shape, int(flat.min()), int(flat.max()), out.size,
+        )
+        return None
     out[flat] = True
     return out.reshape(shape)
 

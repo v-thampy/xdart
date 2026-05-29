@@ -142,7 +142,7 @@ def test_pool_does_not_include_source(synthetic_setup):
 
     None of the pool's three integrators should be ``is`` the source
     integrator — they must all be independent deep-copies.  Otherwise
-    a "detach arch from pool" step in the wrangler could accidentally
+    a "detach frame from pool" step in the wrangler could accidentally
     leak the source into the pool's borrow rotation.
     """
     ai, _ = synthetic_setup

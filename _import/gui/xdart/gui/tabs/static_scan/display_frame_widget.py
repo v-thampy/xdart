@@ -80,7 +80,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     attributes:
         curve1: pyqtgraph pen, overall data line
-        curve2: pyqtgraph pen, individual arch data line
+        curve2: pyqtgraph pen, individual frame data line
         histogram: pyqtgraph HistogramLUTWidget, used for adjusting min
             and max level for image
         image: pyqtgraph ImageItem, displays the 2D data
@@ -93,25 +93,25 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         plot_layout: QVBoxLayout, for holding the 1D plotting widgets
         plot_win: pyqtgraph GraphicsLayoutWidget, layout for the 1D
             data
-        sphere: LiveScan, unused.
-        arch: LiveFrame, currently loaded arch object
-        arch_ids: List of LiveFrame indices currently loaded
-        arches: Dictionary of currently loaded LiveFrames
+        scan: LiveScan, unused.
+        frame: LiveFrame, currently loaded frame object
+        frame_ids: List of LiveFrame indices currently loaded
+        frames: Dictionary of currently loaded LiveFrames
         data_1d: Dictionary object holding all 1D data in memory
         data_2d: Dictionary object holding all 2D data in memory
         ui: Ui_Form from qtdesigner
 
     methods:
-        get_arches_map_raw: Gets averaged 2D raw data from arches
-        get_sphere_map_raw: Gets averaged (and normalized) 2D raw data for all images
-        get_arches_int_2d: Gets averaged 2D rebinned data from arches
-        get_sphere_int_2d: Gets overall 2D data for the sphere
+        get_frames_map_raw: Gets averaged 2D raw data from frames
+        get_scan_map_raw: Gets averaged (and normalized) 2D raw data for all images
+        get_arches_int_2d: Gets averaged 2D rebinned data from frames
+        get_sphere_int_2d: Gets overall 2D data for the scan
         update: Updates the displayed image and plot
         update_image: Updates image data based on selections
         update_plot: Updates plot data based on selections
     """
 
-    def __init__(self, sphere, arch, arch_ids, arches, data_1d, data_2d,
+    def __init__(self, scan, frame, frame_ids, frames, data_1d, data_2d,
                  parent=None, data_lock=None):
         super().__init__(parent)
         self.ui = Ui_Form()
@@ -119,7 +119,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Shared reentrant lock guarding data_1d / data_2d.  When created
         # standalone (tests, viewer mode) fall back to a private lock.
         self.data_lock = data_lock if data_lock is not None else threading.RLock()
-        self._init_data_objects(sphere, arch, arch_ids, arches, data_1d, data_2d)
+        self._init_data_objects(scan, frame, frame_ids, frames, data_1d, data_2d)
         self._init_display_panes()
         self._init_plot_panes()
         self._connect_signals()
@@ -127,7 +127,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     # ── Initialization helpers ─────────────────────────────────────
 
-    def _init_data_objects(self, sphere, arch, arch_ids, arches, data_1d, data_2d):
+    def _init_data_objects(self, scan, frame, frame_ids, frames, data_1d, data_2d):
         """Initialize data references, plotting state, and index tracking."""
         self.ui.slice.setText(Chi)
 
@@ -143,11 +143,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.wf_step = 1
 
         # Data object references
-        self.sphere = sphere
-        self.arch = arch
-        self.arch_ids = arch_ids
-        self.arches = arches
-        self.arch_names = []
+        self.scan = scan
+        self.frame = frame
+        self.frame_ids = frame_ids
+        self.frames = frames
+        self.frame_names = []
         self.data_1d = data_1d
         self.data_2d = data_2d
         self.bkg_1d = 0.
@@ -295,24 +295,24 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # ── Index management ──────────────────────────────────────────
 
     def get_idxs(self):
-        """ Return selected arch indices.
+        """ Return selected frame indices.
 
         Thread-safety: snapshots of data_1d / data_2d keys are taken under
         ``data_lock`` to avoid racing with integrator / file-handler worker
         threads that mutate these dicts concurrently.
         """
         self.idxs, self.idxs_1d, self.idxs_2d = [], [], []
-        if len(self.arch_ids) == 0 or self.arch_ids[0] == 'No data':
+        if len(self.frame_ids) == 0 or self.frame_ids[0] == 'No data':
             return
 
         with self.data_lock:
-            with self.sphere.sphere_lock:
-                if len(self.arch_ids) == len(self.sphere.arches.index) > 1:
+            with self.scan.scan_lock:
+                if len(self.frame_ids) == len(self.scan.frames.index) > 1:
                     self.overall = True
-                    self.idxs = sorted(np.asarray(self.sphere.arches.index, dtype=int))
+                    self.idxs = sorted(np.asarray(self.scan.frames.index, dtype=int))
                 else:
                     self.overall = False
-                    self.idxs = sorted(self.arch_ids)
+                    self.idxs = sorted(self.frame_ids)
 
             try:
                 self.idxs = list(np.asarray(self.idxs, dtype=int))
@@ -335,9 +335,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _updated(self):
         """Check if there is data to update
         """
-        # In viewer mode, bypass the sphere.name check — no HDF5 scan is loaded
+        # In viewer mode, bypass the scan.name check — no HDF5 scan is loaded
         if self.viewer_mode is not None:
-            if len(self.arch_ids) == 0:
+            if len(self.frame_ids) == 0:
                 return False
             if self.viewer_mode == 'image' and len(self.data_2d) == 0:
                 return False
@@ -345,7 +345,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 return False
             return True
 
-        if (len(self.arch_ids) == 0) or (self.sphere.name == 'null_main'):
+        if (len(self.frame_ids) == 0) or (self.scan.name == 'null_main'):
             return False
         if (len(self.data_1d) == 0) or (len(self.idxs_1d) == 0):
             return False
@@ -433,7 +433,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # ── 1D-only visibility ────────────────────────────────────────
 
     def _apply_1d_only_visibility(self):
-        """Show or hide 2D panes based on sphere.skip_2d.
+        """Show or hide 2D panes based on scan.skip_2d.
 
         In 1D-only mode (skip_2d), collapse the 2D image panels and
         image toolbar while keeping the top toolbar (Norm Channel, Scale,
@@ -443,7 +443,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # In viewer mode, set_viewer_display_mode() controls panels
         if self.viewer_mode is not None:
             return
-        skip = getattr(self.sphere, 'skip_2d', False)
+        skip = getattr(self.scan, 'skip_2d', False)
         if skip:
             # Hide 2D panels and image toolbar, keep frame_top visible
             self.ui.twoDWindow.setMaximumHeight(0)
@@ -524,9 +524,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.imageUnit.clear()
         self._plot_axis_info = []
 
-        if self.sphere.gi:
-            gi_mode_1d = self.sphere.bai_1d_args.get('gi_mode_1d', 'q_total')
-            gi_mode_2d = self.sphere.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+        if self.scan.gi:
+            gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
+            gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
             idx_1d = GI_MODES_1D.index(gi_mode_1d) if gi_mode_1d in GI_MODES_1D else 0
             idx_2d = GI_MODES_2D.index(gi_mode_2d) if gi_mode_2d in GI_MODES_2D else 0
 
@@ -623,7 +623,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return
 
         info = self._plot_axis_info[idx]
-        skip_2d = getattr(self.sphere, 'skip_2d', False)
+        skip_2d = getattr(self.scan, 'skip_2d', False)
         # Slicing requires 2D data and the axis must come from 2D
         can_slice = (not skip_2d) and info['source'] in ('2d', '1d_2d')
 
@@ -655,18 +655,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         would not match the thumbnail's smaller shape.
         """
         mask = None
-        if self.overall and len(self.arch_ids) > 1:
-            # G2: aggregate via per-arch dict instead of the deleted
-            # sphere.overall_raw accumulator.  Stays correct after v2
+        if self.overall and len(self.frame_ids) > 1:
+            # G2: aggregate via per-frame dict instead of the deleted
+            # scan.overall_raw accumulator.  Stays correct after v2
             # reload (the accumulator didn't), and after replace-frames
             # reintegration (the accumulator drifted).
-            data = self.get_arches_map_raw(
-                list(self.sphere.arches.index),
+            data = self.get_frames_map_raw(
+                list(self.scan.frames.index),
             )
             if data is None:
                 return
         else:
-            data = self.get_arches_map_raw()
+            data = self.get_frames_map_raw()
             if data is None:
                 return
 
@@ -682,7 +682,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         data = np.asarray(data, dtype=float)
 
         # Apply detector + global mask.
-        global_mask = self.sphere.global_mask if self.sphere.global_mask is not None else []
+        global_mask = self.scan.global_mask if self.scan.global_mask is not None else []
         mask = mask if mask is not None else []
         mask = np.asarray(np.unique(np.append(mask, global_mask)), dtype=int)
         if len(mask) > 0 and mask.max() < data.size:
@@ -722,17 +722,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
             self.update_plot_view()
 
-        # Always aggregate from per-arch data_2d.  Pre-G2 there was a
+        # Always aggregate from per-frame data_2d.  Pre-G2 there was a
         # fall-through to get_sphere_int_2d() (now deleted — it read
-        # the in-memory sphere.bai_2d accumulator that didn't survive
+        # the in-memory scan.bai_2d accumulator that didn't survive
         # v2 reload).  If selecting "Overall" with the current
         # idxs_2d cache empty / partial, widen the aggregation
-        # across the full arches.index so we don't render a partial
+        # across the full frames.index so we don't render a partial
         # average.
         intensity, xdata, ydata = self.get_arches_int_2d()
-        if intensity is None and self.overall and len(self.arch_ids) > 1:
+        if intensity is None and self.overall and len(self.frame_ids) > 1:
             intensity, xdata, ydata = self.get_arches_int_2d(
-                list(self.sphere.arches.index),
+                list(self.scan.frames.index),
             )
 
         if intensity is None:
@@ -756,8 +756,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.binned_widget.setRect(rect)
 
         imageUnit = self.ui.imageUnit.currentIndex()
-        if self.sphere.gi:
-            gi_mode_2d = self.sphere.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+        if self.scan.gi:
+            gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
             gi_idx = GI_MODES_2D.index(gi_mode_2d) if gi_mode_2d in GI_MODES_2D else 0
             _xl2 = gi_x_labels_2D[gi_idx]
             _xu2 = gi_x_units_2D[gi_idx]
@@ -778,45 +778,45 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """Updates 2D Label
         """
         # Sets title text
-        label = self.sphere.name
+        label = self.scan.name
         if len(label) > 40:
             label = f'{label[:10]}.....{label[-30:]}'
 
-        if (self.overall or self.sphere.single_img) and (len(self.arch_ids) > 1):
+        if (self.overall or self.scan.single_img) and (len(self.frame_ids) > 1):
             self.ui.labelCurrent.setText(label)
-        elif self.sphere.series_average:
+        elif self.scan.series_average:
             self.ui.labelCurrent.setText(label)
-        elif len(self.arch_ids) > 1:
+        elif len(self.frame_ids) > 1:
             self.ui.labelCurrent.setText(f'{label} [Average]')
         else:
-            self.ui.labelCurrent.setText(f'{label}_{self.arch_ids[0]}')
+            self.ui.labelCurrent.setText(f'{label}_{self.frame_ids[0]}')
 
     # ── Normalization / background handlers ───────────────────────
 
     def normUpdate(self):
         """Update plots if norm channel exists"""
         self.normChannel = self.get_normChannel()
-        if self.normChannel and (self.sphere.scan_data[self.normChannel].sum() == 0.):
+        if self.normChannel and (self.scan.scan_data[self.normChannel].sum() == 0.):
             self.normChannel = None
         # Clear stale plot_data so update_plot() rebuilds all overlay curves
         self.plot_data = [np.zeros(0), np.zeros(0)]
-        self.arch_names = []
+        self.frame_names = []
         self.update()
 
     def setBkg(self):
         """Sets selected points as background.
         If background is already selected, it unsets it"""
-        if (len(self.arch_ids) == 0) or (len(self.idxs) == 0):
+        if (len(self.frame_ids) == 0) or (len(self.idxs) == 0):
             return
 
         if self.ui.setBkg.text() == 'Set Bkg':
-            idxs = self.arch_ids
+            idxs = self.frame_ids
             if self.overall:
-                idxs = sorted(list(self.sphere.arches.index))
+                idxs = sorted(list(self.scan.frames.index))
 
             self.bkg_1d, _ = self.get_arches_int_1d(idxs, rv='average')
             self.bkg_2d, _, _ = self.get_arches_int_2d(idxs)
-            self.bkg_map_raw = self.get_arches_map_raw(idxs)
+            self.bkg_map_raw = self.get_frames_map_raw(idxs)
             if self.bkg_map_raw is None:
                 # F5: be honest about a no-op 2D background.  Pre-F5
                 # this silently set bkg=0.: 1D/2D bkg subtraction
@@ -827,7 +827,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 # subtract in the 2D map view; log it.
                 logger.warning(
                     "setBkg: no raw image data available for selected "
-                    "arches; 2D background subtraction inactive "
+                    "frames; 2D background subtraction inactive "
                     "(1D / int_2d background still applied).  This "
                     "usually means the .nxs was reloaded without "
                     "access to the original source files."
@@ -927,18 +927,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.save_1D.setEnabled(True)
 
     def _update_xye_viewer(self):
-        """Render 1D line data in XYE viewer mode (no sphere/integration).
+        """Render 1D line data in XYE viewer mode (no scan/integration).
 
-        Builds plot_data and arch_names from the loaded XYE data,
+        Builds plot_data and frame_names from the loaded XYE data,
         then delegates to the standard update_plot_view() so that
         Single/Overlay/Waterfall/Sum/Average all work.
         """
         if len(self.idxs_1d) == 0:
             return
 
-        # Determine axis label from first arch
-        first_arch = self.data_1d[self.idxs_1d[0]]
-        unit = getattr(first_arch.int_1d, 'unit', '2th_deg')
+        # Determine axis label from first frame
+        first_frame = self.data_1d[self.idxs_1d[0]]
+        unit = getattr(first_frame.int_1d, 'unit', '2th_deg')
         if 'q' in unit.lower():
             xlabel = u'Q (\u212b\u207b\u00b9)'
             xunits = u'\u212b\u207b\u00b9'
@@ -947,16 +947,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             xunits = u'\u00b0'
 
         # Build xdata and ydata arrays from all selected indices.
-        ref_x = np.asarray(first_arch.int_1d.radial, dtype=float)
-        arch_names = []
+        ref_x = np.asarray(first_frame.int_1d.radial, dtype=float)
+        frame_names = []
         rows = []
         for idx in self.idxs_1d:
-            arch = self.data_1d[idx]
-            int_1d = arch.int_1d
+            frame = self.data_1d[idx]
+            int_1d = frame.int_1d
             if int_1d is None:
                 continue
-            fname = arch.scan_info.get('source_file', f'xye_{idx}')
-            arch_names.append(os.path.basename(fname))
+            fname = frame.scan_info.get('source_file', f'xye_{idx}')
+            frame_names.append(os.path.basename(fname))
             xdata = np.asarray(int_1d.radial, dtype=float)
             ydata = np.asarray(int_1d.intensity, dtype=float)
             if xdata.shape != ref_x.shape or not np.allclose(xdata, ref_x):
@@ -974,14 +974,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if current_method in ('Overlay', 'Waterfall') and \
                 len(self.plot_data[0]) > 0 and \
                 self.plot_data[0].shape == xdata.shape:
-            for name, row in zip(arch_names, ydata):
-                if name not in self.arch_names:
+            for name, row in zip(frame_names, ydata):
+                if name not in self.frame_names:
                     self.plot_data[1] = np.vstack(
                         (self.plot_data[1], row[np.newaxis, :]))
-                    self.arch_names.append(name)
+                    self.frame_names.append(name)
         else:
             self.plot_data = [xdata, ydata]
-            self.arch_names = list(arch_names)
+            self.frame_names = list(frame_names)
 
         xdata, ydata = self.plot_data
         self.plot_data_range = [
@@ -1084,9 +1084,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         # Try to get thumbnail from loaded 1D data
         thumb = None
-        arch = self.data_1d.get(int(idx))
-        if arch is not None:
-            thumb = getattr(arch, 'thumbnail', None)
+        frame = self.data_1d.get(int(idx))
+        if frame is not None:
+            thumb = getattr(frame, 'thumbnail', None)
 
         # Fall back to 2D data dict
         if thumb is None and int(idx) in self.data_2d:

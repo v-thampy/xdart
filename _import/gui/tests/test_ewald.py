@@ -105,8 +105,8 @@ def make_sphere(calib_path, poni_file, stepsize, user, image_path, spec_path,
     times = {'overall':[], 'creation':[], 'int':[], 'add':[]}
     detector = pyFAI.detectors.Detector(172e-6, 172e-6)
     data_file_path = os.path.join(xdart_dir, "tests/test_data/spec_pd100k/test_save.h5")
-    sphere = LiveScan(data_file=data_file_path)
-    sphere.save_to_nexus(replace=True)
+    scan = LiveScan(data_file=data_file_path)
+    scan.save_to_nexus(replace=True)
     poni = PONI.from_poni_file(os.path.join(calib_path, poni_file))
     for k in range(1, len(tth)):
         start = time.time()
@@ -118,27 +118,27 @@ def make_sphere(calib_path, poni_file, stepsize, user, image_path, spec_path,
         rot2 = np.radians(-tth[k])
         poni.rot2 = rot2
         start_c = time.time()
-        arch = LiveFrame(idx=k, map_raw=map_raw, poni=poni, scan_info={'i0':i0[k]})
+        frame = LiveFrame(idx=k, map_raw=map_raw, poni=poni, scan_info={'i0':i0[k]})
         times['creation'].append(time.time() - start_c)
         start_i = time.time()
-        arch.integrate_1d(numpoints=18000, monitor='i0', radial_range=[0,180], 
+        frame.integrate_1d(numpoints=18000, monitor='i0', radial_range=[0,180], 
                         unit=units.TTH_DEG, correctSolidAngle=False, 
                         method='csr')
-        arch.integrate_2d(npt_rad=1000, npt_azim=1000, monitor='i0', radial_range=[0,30], azimuth_range=[70,110], method='csr')
+        frame.integrate_2d(npt_rad=1000, npt_azim=1000, monitor='i0', radial_range=[0,30], azimuth_range=[70,110], method='csr')
         times['int'].append(time.time() - start_i)
         start_a = time.time()
-        sphere.add_arch(arch.copy(), calculate=False, set_mg=False)
-        # add_arch itself persists via the v2 writer; no explicit save needed.
+        scan.add_frame(frame.copy(), calculate=False, set_mg=False)
+        # add_frame itself persists via the v2 writer; no explicit save needed.
         times['add'].append(time.time() - start_a)
         
         times['overall'].append(time.time() - start)
-    return sphere
+    return scan
 
 
 @unittest.skipUnless(_TEST_DATA_DIR.exists(), _SKIP_REASON)
 class TestLiveScan(unittest.TestCase):
     def setUp(self):
-        self.sphere = make_sphere(
+        self.scan = make_sphere(
             calib_path=os.path.join(xdart_dir, "tests/test_data/spec_pd100k/"),
             poni_file="poni.poni",
             stepsize=0.01,
@@ -169,52 +169,52 @@ class TestLiveScan(unittest.TestCase):
     #@unittest.skip("Known to pass")
     def test_1d(self):
         self.assertTrue(np.isclose(self.true_1d_ttheta, 
-                                   self.sphere.bai_1d.ttheta).all())
+                                   self.scan.bai_1d.ttheta).all())
         self.assertTrue(np.isclose(self.true_1d_norm, 
-                                   self.sphere.bai_1d.norm.full(),
+                                   self.scan.bai_1d.norm.full(),
                                    rtol=1e-3, atol=1e-4).all())
     
     #@unittest.skip("Known to pass")
     def test_2d(self):
         self.assertTrue(np.isclose(self.true_2d_ttheta, 
-                                   self.sphere.bai_2d.ttheta).all())
+                                   self.scan.bai_2d.ttheta).all())
         self.assertTrue(np.isclose(self.true_2d_norm, 
-                                   self.sphere.bai_2d.norm.full(),
+                                   self.scan.bai_2d.norm.full(),
                                    rtol=1e-3, atol=1e-4).all())
         self.assertTrue(np.isclose(self.true_2d_chi, 
-                                   self.sphere.bai_2d.chi).all())
+                                   self.scan.bai_2d.chi).all())
     
     def test_save(self):
-        self.sphere.save_to_nexus(replace=True)
-        self.sphere.save_to_nexus(replace=False)
+        self.scan.save_to_nexus(replace=True)
+        self.scan.save_to_nexus(replace=False)
     
     def test_bai(self):
-        # F6 removed sphere.by_arch_integrate_1d / by_arch_integrate_2d
+        # F6 removed scan.by_arch_integrate_1d / by_arch_integrate_2d
         # (unreachable from the GUI; only this test exercised it).
-        # The equivalent through the supported API is per-arch
-        # integrate_1d followed by accumulation via add_arch's
+        # The equivalent through the supported API is per-frame
+        # integrate_1d followed by accumulation via add_frame's
         # internal _accumulate_bai_1d.  We rebuild that here so the
         # assertion against true_1d_norm still validates the
         # integration result.
-        from xdart.modules.ewald.arch import LiveFrame  # noqa: F401
+        from xdart.modules.ewald.frame import LiveFrame  # noqa: F401
         args = dict(numpoints=18000, monitor='i0', radial_range=[0, 180],
                     unit=units.TTH_DEG, correctSolidAngle=False,
                     method='csr')
-        self.sphere.bai_1d_args = args.copy()
-        with self.sphere.sphere_lock:
-            self.sphere.bai_1d = None
-            for arch in self.sphere.arches:
-                arch.integrate_1d(global_mask=self.sphere.global_mask, **args)
-                self.sphere._accumulate_bai_1d(arch)
-        self.assertEqual(self.sphere.bai_1d_args['method'], 'csr')
+        self.scan.bai_1d_args = args.copy()
+        with self.scan.scan_lock:
+            self.scan.bai_1d = None
+            for frame in self.scan.frames:
+                frame.integrate_1d(global_mask=self.scan.global_mask, **args)
+                self.scan._accumulate_bai_1d(frame)
+        self.assertEqual(self.scan.bai_1d_args['method'], 'csr')
         self.assertTrue(np.isclose(self.true_1d_norm,
-                                   self.sphere.bai_1d.norm.full(),
+                                   self.scan.bai_1d.norm.full(),
                                    rtol=1e-3, atol=1e-4).all())
 
 
 if __name__ == '__main__':
     unittest.main()
-    # sphere = make_sphere(
+    # scan = make_sphere(
     #         calib_path="test_data/spec_pd100k/",
     #         poni_file="poni.poni",
     #         stepsize=0.01,
