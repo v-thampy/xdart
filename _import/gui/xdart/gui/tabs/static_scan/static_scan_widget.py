@@ -386,9 +386,16 @@ class staticWidget(QWidget):
         # All we need for the displayframe — no disk hit, no file-lock
         # contention with the wrangler's per-frame write.
         try:
-            if idx not in self.sphere.arches.index:
-                self.sphere.arches.index.append(idx)
-                self.sphere.arches.index.sort()
+            # Guard the in-memory index mutation with the sphere's own
+            # lock — the file-thread (load_arches / set_datafile) also
+            # touches this list, and h5viewer.update_data reads it on the
+            # GUI thread.  This is the GUI sphere's lock, distinct from
+            # the wrangler sphere's, so it never contends with the
+            # wrangler's disk writes (no GUI stall).
+            with self.sphere.sphere_lock:
+                if idx not in self.sphere.arches.index:
+                    self.sphere.arches.index.append(idx)
+                    self.sphere.arches.index.sort()
         except AttributeError:
             # arches may briefly be None or replaced during set_datafile.
             pass
@@ -695,8 +702,9 @@ class staticWidget(QWidget):
         # screen until this scan's first frame replaces it.
         if self.h5viewer.live_run_active:
             try:
-                self.sphere.arches.index.clear()
-                self.sphere.arches._in_memory.clear()
+                with self.sphere.sphere_lock:
+                    self.sphere.arches.index.clear()
+                    self.sphere.arches._in_memory.clear()
             except AttributeError:
                 pass
 
