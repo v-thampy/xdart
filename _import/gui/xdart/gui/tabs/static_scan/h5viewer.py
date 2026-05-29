@@ -333,6 +333,11 @@ class H5Viewer(QWidget):
         self.latest_idx = None
         self.new_scan_loaded = False
         self.viewer_mode = None
+        # True only while a live (non-batch) wrangler run is in progress.
+        # Suppresses ``data_reset`` (wired to the async ``sigNewFile``)
+        # so the per-frame in-memory caches the live display depends on
+        # aren't wiped mid-run.  Toggled by static_scan_widget.
+        self.live_run_active = False
         self._displayed_list_count = 0
         self._displayed_last_label = None
 
@@ -1176,6 +1181,16 @@ class H5Viewer(QWidget):
     def data_reset(self):
         """Resets data in memory (self.arches, self.arch_ids, self.data_..
         """
+        # During a live (non-batch) wrangler run the display is driven by
+        # the in-memory per-frame hand-off in static_scan_widget.update_data.
+        # This slot is wired to ``sigNewFile``, which the async file-thread
+        # ``set_datafile`` emits a few ms after new_scan() — clearing the
+        # freshly-populated data_1d/data_2d/arches before the throttled
+        # refresh can render them.  That is the multi-scan Eiger "plots
+        # stay blank" bug.  new_scan() already does the controlled reset
+        # the live path needs, so skip the wipe while a run is active.
+        if self.live_run_active:
+            return
         self._h5pool.close(self.sphere.data_file)
         self.arches.clear()
         self.arch_ids.clear()

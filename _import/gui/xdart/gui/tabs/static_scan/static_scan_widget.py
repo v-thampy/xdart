@@ -685,6 +685,21 @@ class staticWidget(QWidget):
         self.arches.clear()
         self.arch_ids.clear()
 
+        # During a live (non-batch) run the async file-thread set_datafile
+        # no longer reloads arches from disk (it would clobber the live
+        # in-memory index — see fileHandlerThread.set_datafile).  So reset
+        # the new scan's frame index synchronously here: drop the previous
+        # scan's indices + cached frames so per-frame sigUpdate appends
+        # build this scan up from empty.  The data_1d / data_2d snapshots
+        # are intentionally left populated so the prior frame lingers on
+        # screen until this scan's first frame replaces it.
+        if self.h5viewer.live_run_active:
+            try:
+                self.sphere.arches.index.clear()
+                self.sphere.arches._in_memory.clear()
+            except AttributeError:
+                pass
+
         self.displayframe.set_axes()
         # self.displayframe.auto_last = True
 
@@ -737,6 +752,17 @@ class staticWidget(QWidget):
         self.wrangler.sphere_args = copy.deepcopy(args)
         self.wrangler.setup()
         self.h5viewer.auto_last = True
+
+        # Live (non-batch) runs drive the display from the in-memory
+        # per-frame hand-off.  Flag the run so the async set_datafile
+        # repoints the file without a disk reload and data_reset doesn't
+        # wipe the live caches (the multi-scan Eiger blank-plot fix).
+        # Batch / XYE-only runs keep the original reload-on-new-file
+        # behaviour — their final refresh reads arches from disk.
+        live = not getattr(self.wrangler.thread, 'batch_mode', False)
+        self.h5viewer.live_run_active = live
+        self.h5viewer.file_thread.live_run = live
+
         self.wrangler.thread.start()
 
     def wrangler_finished(self):
@@ -746,6 +772,14 @@ class staticWidget(QWidget):
         # Flush any pending coalesced update so the final frame is shown.
         self._update_timer.stop()
         self._flush_pending_update()
+
+        # End the live-run window before the end-of-batch reload below:
+        # the auto-load set_file(generated_file) must run the full
+        # set_datafile (disk reload) so arches/scan_data come back from
+        # the finished file, and data_reset must be free to clear stale
+        # caches again.
+        self.h5viewer.live_run_active = False
+        self.h5viewer.file_thread.live_run = False
 
         self.thread_state_changed()
         self.wrangler.stop()

@@ -5,6 +5,7 @@
 
 # Standard library imports
 import logging
+import os
 from queue import Queue
 from threading import Condition, RLock
 # M2 dropped ProcessPoolExecutor; ThreadPoolExecutor + as_completed
@@ -462,6 +463,13 @@ class fileHandlerThread(Qt.QtCore.QThread):
         self.lock = Condition()
         self.running = False
         self.update_2d = True
+        # When True, ``set_datafile`` only repoints ``data_file`` at the
+        # new scan instead of reloading the (lagging) on-disk arches.
+        # Set by static_scan_widget for the duration of a live, non-batch
+        # wrangler run — during which the GUI sphere is driven entirely
+        # by the in-memory per-frame hand-off and a disk reload would
+        # blank the live display.  See static_scan_widget.start_wrangler.
+        self.live_run = False
 
     def run(self):
         while True:
@@ -482,15 +490,29 @@ class fileHandlerThread(Qt.QtCore.QThread):
     def set_datafile(self):
         with self.file_lock:
             skip_2d = getattr(self.sphere, 'skip_2d', False)
-            # O7: dropped legacy ``save_args={'compression': None}``
-            # passthrough — the v2 writer (save_to_nexus) doesn't
-            # accept a ``compression`` kwarg.  N5 made set_datafile's
-            # defaults None-sentinels, so omitting save_args is the
-            # right call.  The stale dict was stripped inside
-            # set_datafile via ``save_args.pop('compression', None)``
-            # but that workaround is unnecessary now that the caller
-            # doesn't supply the dead kwarg in the first place.
-            self.sphere.set_datafile(self.fname)
+            if getattr(self, 'live_run', False):
+                # Live, non-batch run: the wrangler owns this file and
+                # is feeding the GUI in-memory arches per frame.  A full
+                # ``sphere.set_datafile`` would call ``load_from_h5``,
+                # which replaces ``sphere.arches`` with a disk-backed
+                # series whose index only reflects flushed frames (saves
+                # are batched every LIVE_SAVE_INTERVAL).  That discards
+                # the just-appended in-memory frame indices and blanks
+                # the display until the next disk flush — the multi-scan
+                # Eiger "plots never update" bug.  Repoint the path only;
+                # new_scan() already reset the index for this scan.
+                self.sphere.data_file = self.fname
+                self.sphere.name = os.path.split(self.fname)[-1].split('.')[0]
+            else:
+                # O7: dropped legacy ``save_args={'compression': None}``
+                # passthrough — the v2 writer (save_to_nexus) doesn't
+                # accept a ``compression`` kwarg.  N5 made set_datafile's
+                # defaults None-sentinels, so omitting save_args is the
+                # right call.  The stale dict was stripped inside
+                # set_datafile via ``save_args.pop('compression', None)``
+                # but that workaround is unnecessary now that the caller
+                # doesn't supply the dead kwarg in the first place.
+                self.sphere.set_datafile(self.fname)
             self.sphere.skip_2d = skip_2d  # preserve checkbox state across load
         self.sigNewFile.emit(self.fname)
         self.sigUpdate.emit()
