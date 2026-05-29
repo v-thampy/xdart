@@ -31,7 +31,6 @@ Performance features:
 from __future__ import annotations
 
 import logging
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -996,7 +995,7 @@ def _read_data_group(
 # v1 (xdart ≤ 0.36.x) is intentionally not supported — re-reduce old
 # data with current xdart if you need to view it.
 #
-# Dataset shape produced by ``read_sphere``:
+# Dataset shape produced by ``read_scan``:
 #   dims:   frame, q, q_2d, chi
 #   vars:   intensity_1d   (frame, q)
 #           sigma_1d       (frame, q)         optional
@@ -1309,33 +1308,6 @@ def read_scan(
     return _read_scan_v2(Path(path), entry, groups, include_thumbnails)
 
 
-# ---------------------------------------------------------------------------
-# Deprecated aliases — sphere/arch → scan/frame rename (kept one release).
-# ---------------------------------------------------------------------------
-
-def read_sphere(path, *, entry: str = "entry",
-                groups: tuple[str, ...] = ("1d", "2d"),
-                include_thumbnails: bool = False):
-    """Deprecated alias for :func:`read_scan`.  Will be removed in a
-    future release; update callers to ``read_scan``."""
-    warnings.warn(
-        "read_sphere() is deprecated; use read_scan().",
-        DeprecationWarning, stacklevel=2,
-    )
-    return read_scan(path, entry=entry, groups=groups,
-                     include_thumbnails=include_thumbnails)
-
-
-def read_sphere_metadata(path, *, entry: str = "entry"):
-    """Deprecated alias for :func:`read_scan_metadata`.  Will be removed
-    in a future release; update callers to ``read_scan_metadata``."""
-    warnings.warn(
-        "read_sphere_metadata() is deprecated; use read_scan_metadata().",
-        DeprecationWarning, stacklevel=2,
-    )
-    return read_scan_metadata(path, entry=entry)
-
-
 def read_stitched(
     path: Path | str,
     *,
@@ -1393,7 +1365,4 @@ __all__ = [
     "read_scan",
     "read_scan_metadata",
     "read_stitched",
-    # deprecated aliases (removed in a future release)
-    "read_sphere",
-    "read_sphere_metadata",
 ]

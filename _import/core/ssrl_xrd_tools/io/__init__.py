@@ -36,8 +36,6 @@ from ssrl_xrd_tools.io.nexus import (
     read_nexus,
     read_scan,
     read_scan_metadata,
-    read_sphere,           # deprecated alias for read_scan
-    read_sphere_metadata,  # deprecated alias for read_scan_metadata
     read_stitched,
     write_nexus,
     write_nexus_frame,

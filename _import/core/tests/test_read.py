@@ -196,22 +196,17 @@ def test_mismatched_positioner_length_is_skipped_not_fatal(tmp_path):
         assert "samz" in ds.data_vars            # matching → kept
 
 
-def test_read_sphere_alias_deprecated(scan_file):
-    """The old read_sphere* names still work but emit DeprecationWarning."""
-    import warnings
-    from ssrl_xrd_tools.io.nexus import (
-        read_scan, read_scan_metadata, read_sphere, read_sphere_metadata,
-    )
-    p, _ = scan_file
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        ds = read_sphere(p)
-        meta = read_sphere_metadata(p)
-    msgs = [str(x.message) for x in w if issubclass(x.category, DeprecationWarning)]
-    assert any("read_sphere" in m for m in msgs)
-    # aliases return the same thing as the canonical names
-    assert set(ds.data_vars) == set(read_scan(p).data_vars)
-    assert set(meta.coords) == set(read_scan_metadata(p).coords)
+def test_legacy_read_sphere_names_are_gone():
+    """The transitional read_sphere* aliases were removed in the rename
+    release — only read_scan / read_scan_metadata exist now."""
+    import ssrl_xrd_tools.io.nexus as nexus_io
+    import ssrl_xrd_tools.io as io_pkg
+
+    for legacy in ("read_sphere", "read_sphere_metadata"):
+        assert not hasattr(nexus_io, legacy), f"{legacy} should be removed"
+        assert not hasattr(io_pkg, legacy), f"{legacy} should not be re-exported"
+    assert hasattr(nexus_io, "read_scan")
+    assert hasattr(nexus_io, "read_scan_metadata")
 
 
 def test_scan_sugar(scan_file):
