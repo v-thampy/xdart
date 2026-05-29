@@ -350,6 +350,35 @@ write_h5("result.h5", result_1d)
 data = read_nexus("data.nxs", entry="/entry_0")
 ```
 
+### Reading Processed Scan Files
+
+Once a scan has been reduced (by xdart or the headless pipeline) the
+results live in a v2 NeXus `.nxs` file. The `get_*` convenience readers
+pull 1D / 2D patterns, thumbnails, and metadata back out in one line —
+no xarray knowledge required. A processed file is a **scan**; each
+reader takes a **frame** label or `None` for all frames.
+
+```python
+from ssrl_xrd_tools.io import (
+    get_frames, get_metadata, get_1d, get_2d, get_thumbnail, open_scan,
+)
+
+get_frames("scan.nxs")              # -> array of frame labels, e.g. [1, 2, 3]
+meta = get_metadata("scan.nxs")     # sample, energy, wavelength, axes, motors
+
+r = get_1d("scan.nxs", frame=2)     # one frame:  r.q, r.intensity, r.sigma
+allr = get_1d("scan.nxs")           # all frames: (n_frames, n_q)
+cake = get_2d("scan.nxs", frame=2)  # cake.q, cake.chi, cake.intensity (n_chi, n_q)
+
+# object-style sugar
+scan = open_scan("scan.nxs")
+scan.frames, len(scan), scan.get_1d(2), scan.metadata
+```
+
+For the full `xarray.Dataset` (lazy per-frame access over very large
+scans) use `read_sphere` / `read_sphere_metadata`. A runnable walkthrough
+is in [`examples/notebooks/07_reading_processed_nxs.ipynb`](examples/notebooks/).
+
 ### Working with SPEC Files
 
 ```python
@@ -417,6 +446,25 @@ fitter.add_phase(phase)
 params = fitter.build_params()
 result = fitter.fit(params)
 ```
+
+## Example Notebooks
+
+End-to-end, runnable demonstrations live in
+[`examples/notebooks/`](examples/notebooks/) (each has a single
+`✏️ Configuration` cell to edit, then runs top-to-bottom):
+
+| #  | Notebook | What it shows |
+| -- | -------- | ------------- |
+| 01 | Batch integration | Per-frame `integrate_1d` / `integrate_2d` over an image directory + NeXus round-trip |
+| 02 | MultiGeometry stitching | 1D + 2D stitching across detector-angle scans |
+| 03 | Phase + peak fitting | `PhaseFitter` vs structure-agnostic `fit_peaks` side by side |
+| 04 | Batch phase fitting | `fit_sequence` over many patterns → phase fractions + lattice trends |
+| 05 | sin²ψ analysis | GI integration → χ-sector fits → strain / stress |
+| 06 | Headless reduction pipeline | Canonical `ReductionPlan` + `Scan` + `Frame` + `NexusSink` (the path xdart uses) |
+| 07 | **Reading processed `.nxs`** | Pull 1D / 2D / thumbnails / metadata back out with one-line `get_1d` / `get_2d` / `get_metadata` |
+
+See [`examples/notebooks/README.md`](examples/notebooks/README.md) for the
+full table, prerequisites, and install hints.
 
 ## Dependencies
 

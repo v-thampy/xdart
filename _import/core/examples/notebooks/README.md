@@ -21,16 +21,20 @@ Every notebook follows the same convention:
 | 04  | [`04_batch_phase_fitting.ipynb`](04_batch_phase_fitting.ipynb)         | `FitConfig` + `fit_sequence` + `FitResultStore` over a sequence of patterns; phase fractions + lattice trends as a DataFrame | `analysis.fitting.batch`                                |
 | 05  | [`05_sin2psi_analysis.ipynb`](05_sin2psi_analysis.ipynb)               | GI polar integration → χ-sector peak fits → sin²ψ regression → strain / stress | `integrate.gid`, `analysis.strain`                      |
 | 06  | [`06_headless_reduction_pipeline.ipynb`](06_headless_reduction_pipeline.ipynb) | **Canonical headless reduction**: `ReductionPlan` + `Scan` + `Frame` + `MemorySink` / `NexusSink` + `run_reduction`.  Same workflow xdart's wranglers use internally; the recommended path for new code. | `reduction` (`Frame`, `Scan`, `ReductionPlan`, `GIMode`, `MaskSpec`, `MemorySink`, `NexusSink`, `run_reduction`) |
+| 07  | [`07_reading_processed_nxs.ipynb`](07_reading_processed_nxs.ipynb)     | **Reading results back**: pull 1D / 2D patterns, thumbnails, and metadata out of a processed `.nxs` with one-line `get_1d` / `get_2d` / `get_metadata` calls (+ `open_scan` sugar).  The companion to 01/06 — start here when the file already exists. | `io` (`get_1d`, `get_2d`, `get_thumbnail`, `get_metadata`, `get_frames`, `open_scan`) |
 
 ## Prerequisites
 
-Every notebook needs at minimum:
+Notebooks 01–06 need at minimum:
 
 - A pyFAI **PONI** calibration file.
 - One or more detector **images** (TIFF/EDF/CBF/HDF5/NeXus — fabio
   handles them all).
 - Optionally a detector **mask** (EDF/NPY) — without it the
   notebooks still work, just with no pixel masking.
+
+Notebook 07 needs **none** of the above — only an already-processed
+`.nxs` file (an output of notebook 01, 06, or the xdart GUI).
 
 Notebooks 03, 04 also need:
 
