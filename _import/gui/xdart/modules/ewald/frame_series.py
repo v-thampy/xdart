@@ -120,19 +120,48 @@ def _ensure_frames_group(h5file):
     return frames
 
 
+# Cache of the label→row map for the integrated_1d frame_index, keyed by
+# id(h5file).  Each entry is ``(fingerprint, {label: row})`` where the
+# fingerprint is ``(length, first_label, last_label)`` — read O(1) from the
+# dataset on every call.  We rebuild the full map only when the fingerprint
+# changes, which catches BOTH growth (append) and a same-length relabel
+# (reintegration that reorders/renumbers frames).  The fingerprint guards
+# against id() recycling too: a recycled handle pointing at a different file
+# will almost always have a different fingerprint, and if it doesn't the map
+# is still valid for that content.  Without this cache each lookup scanned
+# the whole frame_index, making a K-frame multi-select O(K·N).
+_FRAME_POS_CACHE: dict[int, tuple[tuple, dict[int, int]]] = {}
+
+
 def _frame_position(h5file, idx: int) -> int | None:
     """Return the row of ``idx`` inside the stacked ``frame_index`` array.
 
     Returns ``None`` when the file has no integrated_1d group yet
     (i.e. the batch flush hasn't happened) or when idx isn't present.
+
+    Uses a fingerprint-validated label→row cache so repeated lookups
+    against the same open file are O(1) instead of an O(N) array scan each.
     """
     if "entry/integrated_1d/frame_index" not in h5file:
         return None
-    fi = np.asarray(h5file["entry/integrated_1d/frame_index"][()])
-    where = np.where(fi == idx)[0]
-    if where.size == 0:
+    ds = h5file["entry/integrated_1d/frame_index"]
+    n = int(ds.shape[0])
+    if n == 0:
         return None
-    return int(where[0])
+    # Cheap fingerprint: length + endpoints.  Catches append (length) and
+    # relabel (endpoints) without reading the whole array.
+    fp = (n, int(ds[0]), int(ds[n - 1]))
+    key = id(h5file)
+    cached = _FRAME_POS_CACHE.get(key)
+    if cached is None or cached[0] != fp:
+        if len(_FRAME_POS_CACHE) > 64:
+            _FRAME_POS_CACHE.clear()
+        fi = np.asarray(ds[()])
+        lookup = {int(lbl): row for row, lbl in enumerate(fi)}
+        _FRAME_POS_CACHE[key] = (fp, lookup)
+    else:
+        lookup = cached[1]
+    return lookup.get(int(idx))
 
 
 def _load_frame_v2(h5file, idx: int, *, static: bool, gi: bool,

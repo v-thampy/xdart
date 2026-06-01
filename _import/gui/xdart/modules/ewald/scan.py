@@ -340,13 +340,19 @@ class LiveScan:
                 if list(self.scan_data.columns):
                     try:
                         self.scan_data.loc[frame.idx] = ser
+                        # In-order fast path: frames usually arrive ascending,
+                        # so the row just added is already last — only sort
+                        # when it landed out of order (rare: late/reordered
+                        # frame).  Avoids an O(N log N) sort every frame.
+                        sidx = self.scan_data.index
+                        if len(sidx) >= 2 and sidx[-1] < sidx[-2]:
+                            self.scan_data.sort_index(inplace=True)
                     except ValueError:
                         print('Mismatched columns')
                 else:
                     self.scan_data = pd.DataFrame(
                         frame.scan_info, index=[frame.idx], dtype='float64'
                     )
-                self.scan_data.sort_index(inplace=True)
 
             if update:
                 self._accumulate_bai_1d(frame)

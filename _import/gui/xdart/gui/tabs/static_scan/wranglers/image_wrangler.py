@@ -189,18 +189,27 @@ class imageWrangler(wranglerWidget):
         # self.ui.startButton.clicked.connect(self.sigStart.emit)
         self.ui.stopButton.clicked.connect(self.stop)
         self.ui.processingModeCombo.currentTextChanged.connect(self._on_mode_changed)
-        self.ui.liveCheckBox.stateChanged.connect(self._on_mode_changed)
-        self.ui.batchCheckBox.stateChanged.connect(self._on_mode_changed)
+        # Live/Batch are checkable QPushButtons now — use ``toggled`` (bool)
+        # rather than the QCheckBox-only ``stateChanged``.
+        self.ui.liveCheckBox.toggled.connect(self._on_mode_changed)
+        self.ui.batchCheckBox.toggled.connect(self._on_mode_changed)
+        # Live doubles as a start/stop toggle.  Connected AFTER
+        # _on_mode_changed so live_mode is already set when we start.
+        self.ui.liveCheckBox.toggled.connect(self._on_live_toggled)
         self.ui.processingModeCombo.currentTextChanged.connect(lambda _: self._save_to_session())
-        self.ui.liveCheckBox.stateChanged.connect(lambda _: self._save_to_session())
-        self.ui.batchCheckBox.stateChanged.connect(lambda _: self._save_to_session())
+        self.ui.liveCheckBox.toggled.connect(lambda _: self._save_to_session())
+        self.ui.batchCheckBox.toggled.connect(lambda _: self._save_to_session())
         self._on_mode_changed()
+        self._set_wrangler_tooltips()
 
         self.showLabel.connect(self.ui.specLabel.setText)
 
         # Setup parameter tree
         self.tree = ParameterTree()
-        self.tree.setMinimumWidth(150)
+        # This (and the name-column width below) is the dominant floor on
+        # how narrow the right panel drags — the param tree is the widest
+        # fixed content.  Keep it small so the panel can shrink.
+        self.tree.setMinimumWidth(80)
         self.stylize_ParameterTree()
         self.parameters = Parameter.create(
             name='image_wrangler', type='group', children=params
@@ -209,7 +218,8 @@ class imageWrangler(wranglerWidget):
         # Squeeze parameter tree columns to reduce panel width
         header = self.tree.header()
         header.setStretchLastSection(True)
-        header.resizeSection(0, 130)  # name column
+        header.resizeSection(0, 100)  # name column
+        header.setMinimumSectionSize(40)
         self.layout = QtWidgets.QVBoxLayout(self.ui.paramFrame)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.addWidget(self.tree)
@@ -435,7 +445,9 @@ class imageWrangler(wranglerWidget):
             except (AttributeError, KeyError, TypeError) as e:
                 logger.debug("Failed to save session parameter %s: %s", key, e)
         data['processing_mode'] = self.ui.processingModeCombo.currentText()
-        data['live_mode'] = self.ui.liveCheckBox.isChecked()
+        # Live is a momentary start/stop control now (not a persisted mode);
+        # its checked state means "a live run is active", which must never be
+        # restored — doing so would auto-start a run on launch.
         data['batch_mode'] = self.ui.batchCheckBox.isChecked()
         save_session(data)
 
@@ -462,8 +474,9 @@ class imageWrangler(wranglerWidget):
             idx = self.ui.processingModeCombo.findText(mode)
             if idx >= 0:
                 self.ui.processingModeCombo.setCurrentIndex(idx)
-        if 'live_mode' in session:
-            self.ui.liveCheckBox.setChecked(session['live_mode'])
+        # Deliberately do NOT restore Live's checked state — it's a
+        # start/stop control, and setChecked(True) would fire its toggled
+        # handler and auto-start a live run on launch.
         if 'batch_mode' in session:
             self.ui.batchCheckBox.setChecked(session['batch_mode'])
         # meta_ext needs None conversion (sigValueChanged fires set_meta_ext automatically)
@@ -522,9 +535,16 @@ class imageWrangler(wranglerWidget):
         self.ui.liveCheckBox.blockSignals(False)
         self.ui.batchCheckBox.blockSignals(False)
 
-        # Ensure cores are always visible
-        self.ui.coresLabel.setVisible(True)
-        self.ui.maxCoresSpinBox.setVisible(True)
+        # Cores only matters for parallel batch processing — hide it
+        # entirely unless batch is active (XYE forces batch on).
+        if is_viewer:
+            cores_visible = False
+        elif is_xye:
+            cores_visible = True
+        else:
+            cores_visible = self.ui.batchCheckBox.isChecked()
+        self.ui.coresLabel.setVisible(cores_visible)
+        self.ui.maxCoresSpinBox.setVisible(cores_visible)
 
         self.batch_mode = self.ui.batchCheckBox.isChecked()
         self.live_mode = self.ui.liveCheckBox.isChecked()
@@ -695,17 +715,54 @@ class imageWrangler(wranglerWidget):
         self.thread.data_1d = self.data_1d
         self.thread.data_2d = self.data_2d
 
+    def _set_wrangler_tooltips(self):
+        """Hover tooltips for the wrangler command/run controls."""
+        tips = {
+            'processingModeCombo': 'What to produce: integrate (1D/2D/XYE), '
+                                   'stitch, or just view images/patterns.',
+            'liveCheckBox': 'Start/stop live acquisition — process frames as '
+                            'they arrive.',
+            'batchCheckBox': 'Process all frames as a batch (parallel across '
+                             'Cores) instead of one-at-a-time.',
+            'maxCoresSpinBox': 'CPU cores for parallel batch processing.',
+            'coresLabel': 'CPU cores for parallel batch processing.',
+            'advancedButton': 'Advanced integration / detector options.',
+            'startButton': 'Start processing with the current settings.',
+            'stopButton': 'Stop the running process.',
+        }
+        for name, tip in tips.items():
+            w = getattr(self.ui, name, None)
+            if w is not None:
+                w.setToolTip(tip)
+
     def start(self):
         self.command = 'start'
         self.thread.command = 'start'
         self.ui.stopButton.setEnabled(True)
         self.sigStart.emit()
 
+    def _on_live_toggled(self, checked):
+        """Live button is a start/stop toggle for live acquisition:
+        checking it starts a live run (live_mode is already set by
+        :meth:`_on_mode_changed`, which runs first); unchecking it stops
+        the run.  Fires only on genuine user clicks — the programmatic
+        resets in :meth:`stop` / :meth:`enabled` block the signal."""
+        if checked:
+            self.start()
+        else:
+            self.stop()
+
     def stop(self):
         self.command = 'stop'
         self.thread.command = 'stop'
         self.ui.stopButton.setEnabled(False)
         self.ui.specLabel.setText('')
+        # Keep the Live toggle in sync when stopped via the Stop button or
+        # programmatically — uncheck it without re-entering stop().
+        if self.ui.liveCheckBox.isChecked():
+            self.ui.liveCheckBox.blockSignals(True)
+            self.ui.liveCheckBox.setChecked(False)
+            self.ui.liveCheckBox.blockSignals(False)
 
     def set_poni_file(self):
         """Opens file dialogue and sets the calibration file
@@ -1084,6 +1141,17 @@ class imageWrangler(wranglerWidget):
         """
         self.tree.setEnabled(enable)
         self.ui.startButton.setEnabled(enable)
+        # Live toggle state vs. the run lifecycle:
+        if enable:
+            # Run finished — reset Live to off (no re-trigger) and re-enable.
+            self.ui.liveCheckBox.blockSignals(True)
+            self.ui.liveCheckBox.setChecked(False)
+            self.ui.liveCheckBox.blockSignals(False)
+            self.ui.liveCheckBox.setEnabled(True)
+        else:
+            # Run active — keep Live clickable only for a *live* run (so it
+            # can be toggled off to stop); a batch run disables it.
+            self.ui.liveCheckBox.setEnabled(self.live_mode)
 
     def stylize_ParameterTree(self):
         self.tree.setStyleSheet("""

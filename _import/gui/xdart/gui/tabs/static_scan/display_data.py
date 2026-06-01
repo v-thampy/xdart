@@ -102,6 +102,36 @@ class DisplayDataMixin:
             frame_1d, frame_2d = snapshot.get(int(idx), (None, {}))
             raw = frame_2d.get('map_raw')
             bg = frame_2d.get('bg_raw', 0)
+            # Batch / reloaded scans keep no full-resolution raw in the
+            # display cache — only a thumbnail is stored in the processed
+            # file.  Pull the full raw from the source master via the
+            # frame's lazy loader so the detector mask (flat indices for
+            # the FULL detector) can be applied; on the smaller thumbnail
+            # those indices are out of range and the mask is silently
+            # dropped.  Falls through to the thumbnail if the master is
+            # gone.
+            #
+            # Only do this synchronous disk read when the 2D raw pane is
+            # actually on screen — in 1D-only mode and the XYE viewer the
+            # 2D pane is hidden, so a routine 1D repaint must NOT block on
+            # loading full detector frames; the thumbnail (or nothing) is
+            # enough there.
+            _want_raw = (not getattr(self.scan, 'skip_2d', False)
+                         and getattr(self, 'viewer_mode', None) != 'xye')
+            if _want_raw and raw is None and frame_1d is not None:
+                try:
+                    if (getattr(frame_1d, 'map_raw', None) is None
+                            and hasattr(frame_1d, '_lazy_load_raw')):
+                        frame_1d._lazy_load_raw()
+                    lazy_raw = getattr(frame_1d, 'map_raw', None)
+                    if lazy_raw is not None:
+                        raw = np.asarray(lazy_raw, dtype=float)
+                        bg = getattr(frame_1d, 'bg_raw', bg)
+                except Exception:
+                    logger.debug(
+                        'get_frames_map_raw: lazy raw load failed for %s',
+                        idx, exc_info=True,
+                    )
             # Try thumbnail from data_2d, then fall back to data_1d
             thumb = frame_2d.get('thumbnail')
             if thumb is None and frame_1d is not None:
@@ -185,7 +215,8 @@ class DisplayDataMixin:
                 continue
             if intensity is None:
                 intensity = np.asarray(_i, dtype=float)
-                xdata, ydata = self.get_xydata(frame_2d['int_2d'], gi_2d=_gi2d)
+                xdata, ydata = self.get_xydata(
+                    frame_2d['int_2d'], gi_2d=_gi2d, frame=frame_1d)
             else:
                 try:
                     intensity = intensity + _i
@@ -355,23 +386,51 @@ class DisplayDataMixin:
 
     # ── Axis data helpers ─────────────────────────────────────────
 
-    def get_xydata(self, int_2d, gi_2d=None):
-        """Reads the unit box and returns appropriate xdata.
+    def get_xydata(self, int_2d, gi_2d=None, frame=None):
+        """Reads the 2D unit box and returns the appropriate radial / azimuthal
+        axes, converting Q ↔ 2θ on the fly when the selected ``imageUnit``
+        differs from the integration unit (mirrors :meth:`get_xdata` for the
+        1D plot — without this the cake's x-axis stayed in Q while only the
+        label switched to 2θ).
 
-        In GI mode, int_2d already holds the selected mode's result,
-        so radial/azimuthal axes are always correct.
+        In GI mode ``int_2d`` already holds the selected GI-mode result
+        (qz/qxy or q/χ), so the axes are returned as-is — there's no
+        Q↔2θ toggle there (the imageUnit combo is fixed/disabled in GI).
 
         args:
             int_2d: IntegrationResult2D, primary integration result
             gi_2d: dict of IntegrationResult2D for GI modes (unused, kept
                    for API compatibility)
+            frame: optional LiveFrame for the wavelength lookup
 
         returns:
             xdata, ydata: numpy arrays for radial and azimuthal axes.
         """
         if int_2d is None:
             return np.array([]), np.array([])
-        return int_2d.radial, int_2d.azimuthal
+        radial = np.asarray(int_2d.radial, dtype=float)
+        azimuthal = int_2d.azimuthal
+        if getattr(self.scan, 'gi', False):
+            return radial, azimuthal
+
+        from .display_constants import AA_inv, Th
+
+        image_label = self.ui.imageUnit.currentText()
+        data_unit = getattr(int_2d, 'unit', 'q_A^-1')
+        want_tth = (Th in image_label)         # imageUnit label contains θ
+        have_tth = ('2th' in data_unit)
+        if want_tth and not have_tth:
+            wl = self._get_wavelength(frame)
+            if wl and wl > 0:
+                lam_A = wl * 1e10
+                arg = np.clip(radial * lam_A / (4 * np.pi), -1, 1)
+                radial = 2 * np.degrees(np.arcsin(arg))
+        elif not want_tth and have_tth and (AA_inv in image_label):
+            wl = self._get_wavelength(frame)
+            if wl and wl > 0:
+                lam_A = wl * 1e10
+                radial = (4 * np.pi / lam_A) * np.sin(np.radians(radial / 2))
+        return radial, azimuthal
 
     def get_xdata(self, frame):
         """Reads the unit box and returns appropriate xdata for 1D plot.

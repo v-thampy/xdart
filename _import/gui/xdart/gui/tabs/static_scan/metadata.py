@@ -46,6 +46,16 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         # fallback for legacy code paths.
         self.data_1d = data_1d
 
+    def showEvent(self, event):
+        """Refresh when the panel becomes visible — ``update()`` short-
+        circuits while hidden (perf), so a deferred render is needed when
+        the user brings the panel back on screen."""
+        super().showEvent(event)
+        try:
+            self.update()
+        except Exception:
+            pass
+
     def _resolve_selected_frame(self):
         """Return the frame whose metadata should be shown, or None.
 
@@ -78,18 +88,28 @@ class metadataWidget(Qt.QtWidgets.QWidget):
     def update(self):
         """Updates the table with new data.
 
-        O4: shows the selected frame's ``scan_info`` (from the data
-        caches) when a selection exists, otherwise the whole-scan
-        ``scan.scan_data`` table.
+        Shows the **whole-scan** metadata table (``scan.scan_data``,
+        transposed so rows are metadata keys and columns are frames) —
+        this is the historical behaviour the metadata panel is expected
+        to have.  Only when there is no scan-wide table yet (e.g. the
+        file/XYE viewer, or live mode before scan_data is populated) does
+        it fall back to the selected frame's ``scan_info``.
         """
+        # Skip the (potentially large) transpose + model rebuild when the
+        # panel isn't on screen — during a fast live scan this slot fires
+        # per refresh, and rebuilding a hidden table is wasted work.  The
+        # panel re-renders from the current scan_data the next time it
+        # becomes visible (Qt repaints on show).
+        if not self.isVisible():
+            return
+        sd = getattr(self.scan, "scan_data", None)
+        if sd is not None and len(sd.index) and len(sd.columns):
+            self.tableview.setModel(DFTableModel(sd.transpose()))
+            return
+        # No whole-scan table — fall back to the selected frame's info.
         selected = self._resolve_selected_frame()
         if selected is not None and getattr(selected, "scan_info", None):
-            data = pd.DataFrame(
-                selected.scan_info, index=[selected.idx],
-            )
+            data = pd.DataFrame(selected.scan_info, index=[selected.idx])
             self.tableview.setModel(DFTableModel(data.transpose()))
             return
-        # No specific selection — show the whole-scan motor table.
-        self.tableview.setModel(
-            DFTableModel(self.scan.scan_data.transpose())
-        )
+        self.tableview.setModel(DFTableModel())

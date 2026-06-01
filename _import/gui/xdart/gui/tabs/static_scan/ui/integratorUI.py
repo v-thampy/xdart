@@ -121,8 +121,9 @@ class Ui_Form(object):
         self.gridLayout_1D = QGridLayout()
         self.gridLayout_1D.setObjectName(u"gridLayout_1D")
         self.gridLayout_1D.setHorizontalSpacing(6)
-        self.radial_autoRange_1D = QCheckBox(self.frame1D_range)
+        self.radial_autoRange_1D = QPushButton(self.frame1D_range)
         self.radial_autoRange_1D.setObjectName(u"radial_autoRange_1D")
+        self.radial_autoRange_1D.setCheckable(True)
         self.radial_autoRange_1D.setChecked(True)
 
         self.gridLayout_1D.addWidget(self.radial_autoRange_1D, 0, 4, 1, 1)
@@ -151,8 +152,9 @@ class Ui_Form(object):
 
         self.gridLayout_1D.addWidget(self.radial_low_1D, 0, 1, 1, 1)
 
-        self.azim_autoRange_1D = QCheckBox(self.frame1D_range)
+        self.azim_autoRange_1D = QPushButton(self.frame1D_range)
         self.azim_autoRange_1D.setObjectName(u"azim_autoRange_1D")
+        self.azim_autoRange_1D.setCheckable(True)
         self.azim_autoRange_1D.setChecked(True)
 
         self.gridLayout_1D.addWidget(self.azim_autoRange_1D, 1, 4, 1, 1)
@@ -305,8 +307,9 @@ class Ui_Form(object):
         self.gridLayout_2D = QGridLayout()
         self.gridLayout_2D.setObjectName(u"gridLayout_2D")
         self.gridLayout_2D.setHorizontalSpacing(6)
-        self.radial_autoRange_2D = QCheckBox(self.frame2D_range)
+        self.radial_autoRange_2D = QPushButton(self.frame2D_range)
         self.radial_autoRange_2D.setObjectName(u"radial_autoRange_2D")
+        self.radial_autoRange_2D.setCheckable(True)
         self.radial_autoRange_2D.setChecked(True)
 
         self.gridLayout_2D.addWidget(self.radial_autoRange_2D, 0, 4, 1, 1)
@@ -335,8 +338,9 @@ class Ui_Form(object):
 
         self.gridLayout_2D.addWidget(self.radial_low_2D, 0, 1, 1, 1)
 
-        self.azim_autoRange_2D = QCheckBox(self.frame2D_range)
+        self.azim_autoRange_2D = QPushButton(self.frame2D_range)
         self.azim_autoRange_2D.setObjectName(u"azim_autoRange_2D")
+        self.azim_autoRange_2D.setCheckable(True)
         self.azim_autoRange_2D.setChecked(True)
 
         self.gridLayout_2D.addWidget(self.azim_autoRange_2D, 1, 4, 1, 1)

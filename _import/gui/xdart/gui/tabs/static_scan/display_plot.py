@@ -267,7 +267,7 @@ class DisplayPlotMixin:
         # that branch behaves like Overlay but without the yOffset.
         multi_single = self.plotMethod == 'Single' and ydata.shape[0] > 1
         if self.plotMethod in ['Overlay', 'Waterfall'] or multi_single:
-            ydata = ydata[self.wf_start::self.wf_step]
+            ydata = ydata[self.wf_start:self.wf_stop:self.wf_step]
             self.setup_curves()
 
             offset = self.ui.yOffset.value()
@@ -342,7 +342,7 @@ class DisplayPlotMixin:
                     [self.data_1d[idx].scan_info[self.wf_yaxis]
                      for idx in self.idxs]
                 )
-            return s_ydata[self.wf_start::self.wf_step]
+            return s_ydata[self.wf_start:self.wf_stop:self.wf_step]
         except KeyError as e:
             logger.debug('Counter %s not present in metadata: %s',
                          self.wf_yaxis, e)
@@ -355,7 +355,7 @@ class DisplayPlotMixin:
 
         xdata_, data_ = self.plot_data
         s_xdata, data = xdata_.copy(), data_.copy()
-        data = data[self.wf_start::self.wf_step, :]
+        data = data[self.wf_start:self.wf_stop:self.wf_step, :]
 
         s_ydata = self._wf_y_axis(data.shape[0])
         if s_ydata is None:
@@ -384,7 +384,7 @@ class DisplayPlotMixin:
 
         xdata_, data_ = self.plot_data
         s_xdata, data = xdata_.copy(), data_.copy()
-        data = data[self.wf_start::self.wf_step, :]
+        data = data[self.wf_start:self.wf_stop:self.wf_step, :]
 
         x_max, x_min = np.max(s_xdata), np.min(s_xdata)
         x_step = (x_max - x_min)/len(s_xdata)
@@ -426,7 +426,7 @@ class DisplayPlotMixin:
         self.curves.clear()
         self.legend.clear()
 
-        frame_ids = self.frame_names[self.wf_start::self.wf_step]
+        frame_ids = self.frame_names[self.wf_start:self.wf_stop:self.wf_step]
         if (self.plotMethod in ['Sum', 'Average'] and
                 len(self.frame_names) > 1):
             frame_ids = f'{self.plotMethod} [{self.frame_names[0]}'
@@ -469,9 +469,12 @@ class DisplayPlotMixin:
         self.wf_widget.setParent(None)
         self.plot_layout.addWidget(self.plot_win)
 
-        self.ui.wf_options.setEnabled(False)
+        # Options is always reachable now — it holds Legend + Overlay Offset
+        # (the waterfall y-axis/start/step inside grey out when not in a
+        # waterfall).  Was disabled in single-curve mode, which would have
+        # hidden the Legend toggle.
+        self.ui.wf_options.setEnabled(True)
         if len(self.plot_data[1]) > 1:
-            self.ui.wf_options.setEnabled(True)
             self.wf_yaxis_widget.setEnabled(False)
 
     def setup_wf_widget(self):
@@ -507,23 +510,50 @@ class DisplayPlotMixin:
         self.wf_dialog.show()
 
     def setup_wf_options_widget(self):
+        """Build the 1D-plot Options dialog, grouped into three sections:
+
+        * **Waterfall** — y-axis source (Frame #/Time/metadata), Start, Stop,
+          Step.  Govern which frames map onto the waterfall image and its
+          y-axis.
+        * **Overlay** — Offset (vertical stacking between curves).
+        * **Legend** — show/hide the curve legend.
         """
-        Setup y-axis option for Waterfall plot
-        Setup first image and step size for wf and overlay plots
-        """
-        layout = QtWidgets.QGridLayout()
+        layout = QtWidgets.QVBoxLayout()
         self.wf_dialog.setLayout(layout)
 
-        layout.addWidget(QtWidgets.QLabel('Y-Axis'), 0, 0)
-        layout.addWidget(QtWidgets.QLabel('Start'), 0, 1)
-        layout.addWidget(QtWidgets.QLabel('Step'), 0, 2)
+        def _section(title):
+            box = QtWidgets.QGroupBox(title)
+            grid = QtWidgets.QGridLayout()
+            box.setLayout(grid)
+            layout.addWidget(box)
+            return grid
 
-        layout.addWidget(self.wf_yaxis_widget, 1, 0)
-        layout.addWidget(self.wf_start_widget, 1, 1)
-        layout.addWidget(self.wf_step_widget, 1, 2)
+        # ── Waterfall ─────────────────────────────────────────────
+        wf = _section('Waterfall')
+        wf.addWidget(QtWidgets.QLabel('Y-Axis'), 0, 0)
+        wf.addWidget(QtWidgets.QLabel('Start'), 0, 1)
+        wf.addWidget(QtWidgets.QLabel('Stop'), 0, 2)
+        wf.addWidget(QtWidgets.QLabel('Step'), 0, 3)
+        wf.addWidget(self.wf_yaxis_widget, 1, 0)
+        wf.addWidget(self.wf_start_widget, 1, 1)
+        wf.addWidget(self.wf_stop_widget, 1, 2)
+        wf.addWidget(self.wf_step_widget, 1, 3)
 
-        layout.addWidget(self.wf_accept_button, 2, 1)
-        layout.addWidget(self.wf_cancel_button, 2, 2)
+        # ── Overlay ───────────────────────────────────────────────
+        ov = _section('Overlay')
+        ov.addWidget(QtWidgets.QLabel('Offset'), 0, 0)
+        ov.addWidget(self.ui.yOffset, 0, 1)
+
+        # ── Legend ────────────────────────────────────────────────
+        lg = _section('Legend')
+        lg.addWidget(self.ui.showLegend, 0, 0)
+
+        # ── Dialog buttons ────────────────────────────────────────
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        btns.addWidget(self.wf_accept_button)
+        btns.addWidget(self.wf_cancel_button)
+        layout.addLayout(btns)
 
         frame = self.data_1d[self.idxs_1d[0]]
         counters = list(frame.scan_info.keys())
@@ -531,10 +561,17 @@ class DisplayPlotMixin:
         self.wf_yaxis_widget.addItems(counters)
 
         self.wf_start_widget.setDecimals(0)
-        self.wf_start_widget.setRange(1, 1000)
+        self.wf_start_widget.setRange(1, 100000)
+        self.wf_start_widget.setValue(1)
+
+        # Stop: 0 is the sentinel for "through the last frame".
+        self.wf_stop_widget.setDecimals(0)
+        self.wf_stop_widget.setRange(0, 100000)
+        self.wf_stop_widget.setValue(0)
+        self.wf_stop_widget.setSpecialValueText('End')  # shown when value==0
 
         self.wf_step_widget.setDecimals(0)
-        self.wf_step_widget.setRange(1, 100)
+        self.wf_step_widget.setRange(1, 1000)
 
         self.wf_accept_button.clicked.connect(self.get_wf_option)
         self.wf_cancel_button.clicked.connect(self.close_wf_popup)
@@ -543,6 +580,10 @@ class DisplayPlotMixin:
         self.wf_yaxis = self.wf_yaxis_widget.currentText()
 
         self.wf_start = int(self.wf_start_widget.value()) - 1
+        # Stop: 0 (shown as "End") → None = slice through the last frame;
+        # otherwise it's a 1-based inclusive end (→ exclusive Python stop).
+        _stop = int(self.wf_stop_widget.value())
+        self.wf_stop = None if _stop <= 0 else _stop
         self.wf_step = int(self.wf_step_widget.value())
 
         self.close_wf_popup()

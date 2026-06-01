@@ -244,20 +244,10 @@ class Ui_Form(object):
 
         self.horizontalLayout_2.addItem(self.horizontalSpacer_2)
 
-        self.update2D = QCheckBox(self.imageToolbar)
-        self.update2D.setObjectName(u"update2D")
-        self.update2D.setFocusPolicy(Qt.StrongFocus)
-        self.update2D.setChecked(True)
-
-        self.horizontalLayout_2.addWidget(self.update2D)
-
-        self.horizontalSpacer_9 = QSpacerItem(40, 20, QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Minimum)
-
-        self.horizontalLayout_2.addItem(self.horizontalSpacer_9)
-
-        self.shareAxis = QCheckBox(self.imageToolbar)
+        self.shareAxis = QPushButton(self.imageToolbar)
         self.shareAxis.setObjectName(u"shareAxis")
-        self.shareAxis.setMaximumSize(QSize(90, 16777215))
+        self.shareAxis.setCheckable(True)
+        self.shareAxis.setMaximumSize(QSize(100, 16777215))
         self.shareAxis.setFocusPolicy(Qt.StrongFocus)
 
         self.horizontalLayout_2.addWidget(self.shareAxis)
@@ -265,11 +255,6 @@ class Ui_Form(object):
         self.horizontalSpacer_14 = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
 
         self.horizontalLayout_2.addItem(self.horizontalSpacer_14)
-
-        self.save_2D = QPushButton(self.imageToolbar)
-        self.save_2D.setObjectName(u"save_2D")
-
-        self.horizontalLayout_2.addWidget(self.save_2D)
 
 
         self.verticalLayout_3.addWidget(self.imageToolbar)
@@ -330,15 +315,16 @@ class Ui_Form(object):
 
         self.horizontalLayout.addWidget(self.plotUnit)
 
-        self.slice = QCheckBox(self.plotToolBar)
+        self.slice = QPushButton(self.plotToolBar)
         self.slice.setObjectName(u"slice")
+        self.slice.setCheckable(True)
         sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         sizePolicy1.setHorizontalStretch(0)
         sizePolicy1.setVerticalStretch(0)
         sizePolicy1.setHeightForWidth(self.slice.sizePolicy().hasHeightForWidth())
         self.slice.setSizePolicy(sizePolicy1)
         self.slice.setMinimumSize(QSize(80, 0))
-        self.slice.setMaximumSize(QSize(80, 16777215))
+        self.slice.setMaximumSize(QSize(90, 16777215))
 
         self.horizontalLayout.addWidget(self.slice)
 
@@ -411,10 +397,12 @@ class Ui_Form(object):
 
         self.horizontalLayout.addItem(self.horizontalSpacer_6)
 
-        self.showLegend = QCheckBox(self.plotToolBar)
+        self.showLegend = QPushButton(self.plotToolBar)
         self.showLegend.setObjectName(u"showLegend")
+        self.showLegend.setCheckable(True)
         self.showLegend.setFocusPolicy(Qt.StrongFocus)
         self.showLegend.setChecked(True)
+        self.showLegend.setMaximumSize(QSize(90, 16777215))
 
         self.horizontalLayout.addWidget(self.showLegend)
 
@@ -422,11 +410,6 @@ class Ui_Form(object):
         self.clear_1D.setObjectName(u"clear_1D")
 
         self.horizontalLayout.addWidget(self.clear_1D)
-
-        self.save_1D = QPushButton(self.plotToolBar)
-        self.save_1D.setObjectName(u"save_1D")
-
-        self.horizontalLayout.addWidget(self.save_1D)
 
 
         self.verticalLayout_4.addWidget(self.plotToolBar)
@@ -439,13 +422,11 @@ class Ui_Form(object):
         QWidget.setTabOrder(self.setBkg, self.scale)
         QWidget.setTabOrder(self.scale, self.cmap)
         QWidget.setTabOrder(self.cmap, self.imageUnit)
-        QWidget.setTabOrder(self.imageUnit, self.save_2D)
-        QWidget.setTabOrder(self.save_2D, self.plotUnit)
+        QWidget.setTabOrder(self.imageUnit, self.plotUnit)
         QWidget.setTabOrder(self.plotUnit, self.slice_center)
         QWidget.setTabOrder(self.slice_center, self.slice_width)
         QWidget.setTabOrder(self.slice_width, self.plotMethod)
         QWidget.setTabOrder(self.plotMethod, self.yOffset)
-        QWidget.setTabOrder(self.yOffset, self.save_1D)
 
         self.retranslateUi(Form)
 
@@ -484,9 +465,7 @@ class Ui_Form(object):
         self.imageUnit.setItemText(1, QCoreApplication.translate("Form", u"2Th-Chi", None))
         self.imageUnit.setItemText(2, QCoreApplication.translate("Form", u"Qz-Qxy", None))
 
-        self.update2D.setText(QCoreApplication.translate("Form", u"Update 2D", None))
         self.shareAxis.setText(QCoreApplication.translate("Form", u"Share Axis", None))
-        self.save_2D.setText(QCoreApplication.translate("Form", u"Save", None))
         self.plotUnit.setItemText(0, QCoreApplication.translate("Form", u"Q (A-1)", None))
         self.plotUnit.setItemText(1, QCoreApplication.translate("Form", u"2 u\\u03B8", None))
         self.plotUnit.setItemText(2, QCoreApplication.translate("Form", u"Chi", None))
@@ -523,6 +502,5 @@ class Ui_Form(object):
         self.wf_options.setText(QCoreApplication.translate("Form", u"Options", None))
         self.showLegend.setText(QCoreApplication.translate("Form", u"Legend", None))
         self.clear_1D.setText(QCoreApplication.translate("Form", u"Clear", None))
-        self.save_1D.setText(QCoreApplication.translate("Form", u"Save", None))
     # retranslateUi
 

@@ -238,10 +238,11 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.unit_2D.currentIndexChanged.connect(self._save_to_session)
         self.ui.axis1D.currentIndexChanged.connect(self._save_to_session)
         self.ui.axis2D.currentIndexChanged.connect(self._save_to_session)
-        self.ui.radial_autoRange_1D.stateChanged.connect(self._save_to_session)
-        self.ui.azim_autoRange_1D.stateChanged.connect(self._save_to_session)
-        self.ui.radial_autoRange_2D.stateChanged.connect(self._save_to_session)
-        self.ui.azim_autoRange_2D.stateChanged.connect(self._save_to_session)
+        # Auto-range toggles are checkable QPushButtons now → ``toggled``.
+        self.ui.radial_autoRange_1D.toggled.connect(self._save_to_session)
+        self.ui.azim_autoRange_1D.toggled.connect(self._save_to_session)
+        self.ui.radial_autoRange_2D.toggled.connect(self._save_to_session)
+        self.ui.azim_autoRange_2D.toggled.connect(self._save_to_session)
         self.ui.radial_low_1D.textChanged.connect(self._save_to_session)
         self.ui.radial_high_1D.textChanged.connect(self._save_to_session)
         self.ui.azim_low_1D.textChanged.connect(self._save_to_session)
@@ -889,7 +890,7 @@ class integratorTree(QtWidgets.QWidget):
                 handler = getattr(self, getter)
                 getattr(self.ui, low).textChanged.connect(handler)
                 getattr(self.ui, high).textChanged.connect(handler)
-                getattr(self.ui, auto).stateChanged.connect(handler)
+                getattr(self.ui, auto).toggled.connect(handler)
                 return
 
     def _disconnect_range_signals(self, name):
@@ -900,7 +901,7 @@ class integratorTree(QtWidgets.QWidget):
                 handler = getattr(self, getter)
                 getattr(self.ui, low).textChanged.disconnect(handler)
                 getattr(self.ui, high).textChanged.disconnect(handler)
-                getattr(self.ui, auto).stateChanged.disconnect(handler)
+                getattr(self.ui, auto).toggled.disconnect(handler)
                 return
 
     def _connect_all_range_signals(self):

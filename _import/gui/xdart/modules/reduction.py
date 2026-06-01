@@ -272,38 +272,54 @@ def reduce_live_frame(
 # and the per-scan plan cache live in exactly one place.
 # ---------------------------------------------------------------------------
 
+_UNSET = object()  # sentinel: "mask_sig not supplied" (distinct from None)
+
+
+def _mask_signature(mask: Any) -> Any:
+    """Content digest of a detector mask (shape + dtype + size + sum +
+    head/tail for numeric masks).  This is the O(N) part — it touches the
+    whole array via ``np.sum`` — so callers in per-frame hot loops should
+    memoize it by mask identity rather than recompute it every frame
+    (see :meth:`StandardPlanCache._mask_sig_for`)."""
+    if mask is None:
+        return None
+    arr = np.asarray(mask)
+    flat = arr.ravel()
+    if np.issubdtype(arr.dtype, np.number) and flat.size:
+        mask_sum = float(np.sum(flat, dtype=np.float64))
+        head = tuple(flat[:8].tolist())
+        tail = tuple(flat[-8:].tolist())
+    else:
+        mask_sum = None
+        head = ()
+        tail = ()
+    return (arr.shape, str(arr.dtype), int(arr.size), mask_sum, head, tail)
+
+
 def _plan_signature(
     live_scan: Any,
     integrate_1d: bool,
     integrate_2d: bool,
+    *,
+    mask_sig: Any = _UNSET,
 ) -> tuple:
     """Hashable signature of the inputs that ``plan_from_live_scan`` reads.
 
     Used by :class:`StandardPlanCache` to skip plan rebuilds when nothing
     relevant on the scan has changed.  Covers the bai_*_args dicts
-    (sorted) and a digest of ``global_mask`` (shape + dtype + size +
-    head/tail/sum for numeric masks).
+    (sorted) and a digest of ``global_mask``.
+
+    ``mask_sig`` lets the caller pass an already-computed mask digest so
+    the O(N) :func:`_mask_signature` isn't recomputed on every per-frame
+    call; when omitted it's derived from ``live_scan.global_mask``.
     """
     def _items(args: Any) -> tuple:
         return tuple(
             sorted((str(key), repr(value)) for key, value in (args or {}).items())
         )
 
-    mask = getattr(live_scan, "global_mask", None)
-    if mask is None:
-        mask_sig: Any = None
-    else:
-        arr = np.asarray(mask)
-        flat = arr.ravel()
-        if np.issubdtype(arr.dtype, np.number) and flat.size:
-            mask_sum = float(np.sum(flat, dtype=np.float64))
-            head = tuple(flat[:8].tolist())
-            tail = tuple(flat[-8:].tolist())
-        else:
-            mask_sum = None
-            head = ()
-            tail = ()
-        mask_sig = (arr.shape, str(arr.dtype), int(arr.size), mask_sum, head, tail)
+    if mask_sig is _UNSET:
+        mask_sig = _mask_signature(getattr(live_scan, "global_mask", None))
 
     return (
         id(live_scan),
@@ -327,11 +343,32 @@ class StandardPlanCache:
     site (the per-dispatch helper below already does that).
     """
 
-    __slots__ = ("_plan", "_key")
+    __slots__ = ("_plan", "_key", "_mask_obj", "_mask_sig")
 
     def __init__(self) -> None:
         self._plan: ReductionPlan | None = None
         self._key: tuple | None = None
+        # Memoized mask digest, keyed by the mask *object* (see below).
+        self._mask_obj: Any = _UNSET
+        self._mask_sig: Any = None
+
+    def _mask_sig_for(self, mask: Any) -> Any:
+        """Return the mask digest, recomputing the O(N) part only when the
+        mask object itself changes.
+
+        ``global_mask`` is built once per scan (detector mask + user mask)
+        and *replaced* — not mutated in place — when the user swaps the
+        mask file, so object identity is a sound proxy for "contents
+        unchanged".  Holding a reference in ``_mask_obj`` also pins the id
+        so it can't be reused by a later array.  This keeps the per-frame
+        ``get()`` off the full-array ``np.sum`` that dominated mask digest
+        cost on large detectors.
+        """
+        if mask is self._mask_obj:
+            return self._mask_sig
+        self._mask_obj = mask
+        self._mask_sig = _mask_signature(mask)
+        return self._mask_sig
 
     def get(
         self,
@@ -342,7 +379,10 @@ class StandardPlanCache:
     ) -> ReductionPlan | None:
         if getattr(live_scan, "gi", False):
             return None
-        key = _plan_signature(live_scan, integrate_1d, integrate_2d)
+        mask_sig = self._mask_sig_for(getattr(live_scan, "global_mask", None))
+        key = _plan_signature(
+            live_scan, integrate_1d, integrate_2d, mask_sig=mask_sig,
+        )
         if self._plan is None or self._key != key:
             self._plan = plan_from_live_scan(
                 live_scan,
@@ -355,6 +395,8 @@ class StandardPlanCache:
     def invalidate(self) -> None:
         self._plan = None
         self._key = None
+        self._mask_obj = _UNSET
+        self._mask_sig = None
 
 
 def dispatch_live_frame_reduction(

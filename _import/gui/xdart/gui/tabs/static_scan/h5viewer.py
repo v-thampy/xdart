@@ -956,6 +956,19 @@ class H5Viewer(QWidget):
 
         self.sigUpdate.emit()
 
+    @staticmethod
+    def _is_xdart_processed(fpath):
+        """True if ``fpath`` is a processed xdart v2 scan file (integrated
+        data + per-frame source pointers), not a raw detector file."""
+        try:
+            import h5py
+            with h5py.File(fpath, 'r') as f:
+                return ('entry/integrated_1d' in f
+                        or 'entry/integrated_2d' in f
+                        or 'entry/frames' in f)
+        except Exception:
+            return False
+
     def _load_image_file(self, fpath):
         """Load an image file for viewing.
 
@@ -971,6 +984,33 @@ class H5Viewer(QWidget):
 
         ext = os.path.splitext(fpath)[1].lower()
         nframes = 1
+
+        # ── Processed xdart v2 scan file ─────────────────────────────
+        # No raw images live inside — load each frame's raw via its stored
+        # source pointer (get_raw_frame), listed by the file's actual frame
+        # labels (which may be 0-based / gapped), not 1..N.
+        self._viewer_is_xdart = (
+            ext in ('.h5', '.hdf5', '.nxs') and self._is_xdart_processed(fpath)
+        )
+        if self._viewer_is_xdart:
+            from ssrl_xrd_tools.io import get_frames as _get_frames
+            try:
+                labels = [int(x) for x in _get_frames(fpath)]
+            except Exception:
+                logger.debug("Failed to read frame labels from %s", fpath, exc_info=True)
+                labels = []
+            if labels:
+                self._viewer_image_path = fpath
+                self._viewer_image_nframes = len(labels)
+                for lbl in labels:
+                    self.ui.listData.addItem(str(lbl))
+                self._load_single_frame(fpath, frame_idx=labels[0], frame_id=labels[0])
+                self.frame_ids.append(str(labels[0]))
+                self.ui.listData.setCurrentRow(0)
+                self._remember_displayed_frames()
+                self.sigUpdate.emit()
+                return
+            # No labels found — fall through to the generic handling.
 
         # Check for multi-frame files
         if ext in ('.h5', '.hdf5', '.nxs'):
@@ -1024,7 +1064,44 @@ class H5Viewer(QWidget):
     ]
 
     def _load_single_frame(self, fpath, frame_idx=0, frame_id=1):
-        """Load a single frame from an image file into data_2d."""
+        """Load a single frame from an image file into data_2d.
+
+        ``frame_idx`` is the 0-based offset *within the file* (passed to
+        ``read_image``); ``frame_id`` is the 1-based id shown in listData
+        and stored in ``frame_ids``.  The data dicts must be keyed by
+        ``frame_id`` — ``data_changed``/``get_idxs`` look them up by the
+        1-based id from the list, so keying by the 0-based ``frame_idx``
+        (the old behaviour) left the viewer unable to find the image and
+        showed a blank panel.
+        """
+        # Processed xdart v2 file: no raw images inside.  Resolve the raw
+        # detector frame via the stored per-frame source pointer (falling
+        # back to the stored thumbnail).  ``frame_id`` is the frame label.
+        if getattr(self, '_viewer_is_xdart', False):
+            try:
+                from ssrl_xrd_tools.io import get_raw_frame
+                img_data = np.asarray(
+                    get_raw_frame(fpath, frame=frame_id), dtype=float,
+                )
+            except Exception:
+                logger.warning('Could not load raw frame %s from processed file %s',
+                               frame_id, os.path.basename(fpath))
+                logger.debug('get_raw_frame failed', exc_info=True)
+                return
+            with self.data_lock:
+                self.data_2d[int(frame_id)] = {
+                    'map_raw': img_data,
+                    'bg_raw': np.zeros_like(img_data),
+                    'mask': None,
+                    'int_2d': None,
+                    'gi_2d': {},
+                    'thumbnail': None,
+                }
+                frame = LiveFrame(idx=frame_id, static=True, gi=False)
+                frame.scan_info = {'source_file': os.path.basename(fpath)}
+                self.data_1d[int(frame_id)] = frame
+            return
+
         try:
             img_data = np.asarray(
                 read_image(fpath, frame=frame_idx), dtype=float,
@@ -1044,7 +1121,7 @@ class H5Viewer(QWidget):
                 return
 
         with self.data_lock:
-            self.data_2d[int(frame_idx)] = {
+            self.data_2d[int(frame_id)] = {
                 'map_raw': img_data,
                 'bg_raw': np.zeros_like(img_data),
                 'mask': None,
@@ -1053,9 +1130,9 @@ class H5Viewer(QWidget):
                 'thumbnail': None,
             }
             # Minimal data_1d entry so display doesn't crash
-            frame = LiveFrame(idx=frame_idx, static=True, gi=False)
+            frame = LiveFrame(idx=frame_id, static=True, gi=False)
             frame.scan_info = {'source_file': os.path.basename(fpath)}
-            self.data_1d[int(frame_idx)] = frame
+            self.data_1d[int(frame_id)] = frame
     
     def _try_raw_detectors(self, fpath):
         """Try reading a raw binary file with common detector shapes."""

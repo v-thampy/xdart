@@ -128,9 +128,42 @@ class staticWidget(QWidget):
         self._init_child_widgets()
         self._connect_signals()
         self._init_wranglers()
+        self._strip_combo_checkmarks()
         self._init_defaults_and_timer()
         self.show()
         self.ui.wranglerFrame.activateWindow()
+
+    def _strip_combo_checkmarks(self):
+        """Polish every dropdown in the tab in one sweep:
+
+        * Replace the item delegate with a plain QStyledItemDelegate so the
+          popup shows the selection by highlight only — the default
+          QComboBox delegate draws a current-item checkmark that QSS
+          ``::indicator`` can't remove, and it clipped the longer names.
+        * Widen the popup to its longest entry (the combo box itself stays
+          compact in the toolbar) so options like "Image Viewer" / "Int 1D
+          (XYE)" aren't truncated.
+
+        Covers the mode combo (in wranglerStack), the 1D plot Single/Q-θ
+        combos, the top-bar Scale/colormap, the 2D-unit combo, and the
+        integrator unit combos — all are descendants here.
+        """
+        for combo in self.findChildren(QtWidgets.QComboBox):
+            combo.setItemDelegate(QtWidgets.QStyledItemDelegate(combo))
+            view = combo.view()
+            try:
+                view.setTextElideMode(QtCore.Qt.ElideNone)
+                fm = combo.fontMetrics()
+                widest = max(
+                    (fm.horizontalAdvance(combo.itemText(i))
+                     for i in range(combo.count())),
+                    default=0,
+                )
+                if widest:
+                    # + room for item padding and the popup scrollbar.
+                    view.setMinimumWidth(widest + 44)
+            except Exception:
+                logger.debug("combo popup sizing skipped", exc_info=True)
 
     # ── Initialization helpers ─────────────────────────────────────
 
@@ -226,8 +259,10 @@ class staticWidget(QWidget):
         self.h5viewer.ui.auto_last.clicked.connect(self.enable_auto_last)
         self.h5viewer.ui.auto_last.clicked.connect(self.latest_frame)
 
-        # DisplayFrame signals
-        self.displayframe.ui.update2D.stateChanged.connect(self.update_h5_options)
+        # DisplayFrame signals.  (The "Update 2D" toggle was removed — 2D
+        # now always renders.  The File ▸ Export menu actions still drive
+        # the save_image / save_1D methods even though the in-panel Save
+        # buttons are gone.)
         self.h5viewer.actionSaveImage.triggered.connect(self.displayframe.save_image)
         self.h5viewer.actionSaveArray.triggered.connect(self.displayframe.save_1D)
         # Plot method changes drive the H5 data list selection mode so
@@ -448,6 +483,36 @@ class staticWidget(QWidget):
                 # from disk via file_thread.load_frame as fallback.
                 logger.debug("In-memory frame hand-off failed for idx=%s",
                              idx, exc_info=True)
+
+            # Mirror add_frame's scan_data accumulation: the live hand-off
+            # bypasses scan.add_frame, so without this the GUI scan's
+            # scan_data stays empty in non-batch and the metadata panel can
+            # only fall back to the single selected frame.  Build the
+            # whole-scan table here so it shows every frame (as it did
+            # before the live fast-path).
+            info = getattr(frame, "scan_info", None)
+            if info:
+                import pandas as pd
+                try:
+                    ser = pd.Series(info, dtype="float64")
+                    with self.scan.scan_lock:
+                        sd = self.scan.scan_data
+                        if list(sd.columns):
+                            sd.loc[idx] = ser
+                            # In-order fast path: frames usually arrive in
+                            # ascending order, so the row just appended is
+                            # already last — skip the O(N log N) sort_index
+                            # on every frame.  Only an out-of-order insert
+                            # (rare: reload/replace) pays for the sort.
+                            index = sd.index
+                            if len(index) >= 2 and index[-1] < index[-2]:
+                                sd.sort_index(inplace=True)
+                        else:
+                            self.scan.scan_data = pd.DataFrame(
+                                info, index=[idx], dtype="float64")
+                except (ValueError, TypeError):
+                    logger.debug("scan_data update skipped for idx=%s", idx,
+                                 exc_info=True)
 
         # P4: per-frame the *only* thing we do is remember the latest
         # idx + restart the coalescing timer.  The heavy list-widget
@@ -830,11 +895,6 @@ class staticWidget(QWidget):
             self.wrangler.enabled(True)
 
         gc.collect()
-
-    def update_h5_options(self, state):
-        """Changes H5Widget Option to update only 1D or both views
-        """
-        self.h5viewer.update_2d = state
 
     def _on_viewer_mode_changed(self, viewer_mode_str):
         """Enable or disable the integrator panel and update h5viewer for viewer mode.

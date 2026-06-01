@@ -124,8 +124,93 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._init_plot_panes()
         self._connect_signals()
         self._init_controls()
+        self._reflow_controls()
+        self._set_tooltips()
 
     # ── Initialization helpers ─────────────────────────────────────
+
+    def _set_tooltips(self):
+        """Hover tooltips for the display-frame controls (PySide6 setToolTip)."""
+        tips = {
+            'normChannel': 'Normalize intensity by this monitor/counter channel.',
+            'setBkg': 'Use the current frame(s) as a background to subtract.',
+            'scale': 'Intensity scale: Linear / Log / Sqrt.',
+            'cmap': 'Colormap for the 2D images.',
+            'imageUnit': '2D cake radial axis: Q-χ or 2θ-χ.',
+            'shareAxis': "Lock the 1D plot x-axis to the 2D cake's x-axis.",
+            'plotUnit': '1D plot x-axis (Q, 2θ, or χ from the 2D cake).',
+            'plotMethod': 'Combine frames: Single / Overlay / Waterfall / '
+                          'Sum / Average.',
+            'slice': 'Restrict the 1D pattern to a χ range (needs 2D data).',
+            'slice_center': 'Center of the χ slice (degrees).',
+            'slice_width': 'Width of the χ slice (degrees).',
+            'wf_options': 'Waterfall / Overlay / Legend options.',
+            'clear_1D': 'Clear accumulated overlay/waterfall curves.',
+        }
+        for name, tip in tips.items():
+            w = getattr(self.ui, name, None)
+            if w is not None:
+                w.setToolTip(tip)
+        if getattr(self, '_showImageBtn', None) is not None:
+            self._showImageBtn.setToolTip(
+                'Show the raw detector image for the selected frame.')
+
+    def _reflow_controls(self):
+        """Consolidate the 1D plot controls into the middle bar
+        (``imageToolbar``, which sits between the 2D cake and the 1D plot)
+        and collapse the now-empty bottom bar so the 1D plot gets that
+        height back.
+
+        Left→right the middle bar becomes: the 1D controls grouped by
+        function (unit + X-Range, then Single/Overlay + Options, then
+        Legend + Clear), a stretch, then the 2D-only controls (Share Axis,
+        2D unit) at the far right under the cake.  The Offset control folds
+        into the Options popup, so it leaves the bar entirely.
+
+        Per-mode show/hide of the 2D-only controls + slice is handled by
+        :meth:`_set_2d_controls_visible`.
+        """
+        mid = self.ui.horizontalLayout_2     # imageToolbar (middle bar)
+        bot = self.ui.horizontalLayout       # plotToolBar (bottom, emptied)
+
+        # Detach whatever is currently in the middle bar (imageUnit,
+        # shareAxis, spacers) so we can re-add in the new order.
+        while mid.count():
+            mid.takeAt(0)
+
+        # Offset + Legend fold into the Options popup — pull them out of
+        # the toolbar (they get re-parented into the dialog when it's built).
+        for w in (self.ui.yOffsetLabel, self.ui.yOffset, self.ui.showLegend):
+            bot.removeWidget(w)
+            w.setParent(None)
+
+        # Move the remaining 1D controls out of the bottom bar.
+        ones = (self.ui.plotUnit, self.ui.slice, self.ui.slice_center,
+                self.ui.slice_width, self.ui.plotMethod, self.ui.wf_options,
+                self.ui.clear_1D)
+        for w in ones:
+            bot.removeWidget(w)
+
+        # Rebuild the middle bar: 1D controls, stretch, then 2D controls.
+        for w in ones:
+            mid.addWidget(w)
+        mid.addStretch(1)
+        mid.addWidget(self.ui.shareAxis)
+        mid.addWidget(self.ui.imageUnit)
+
+        # The bottom bar is empty now — collapse it so the 1D plot grows.
+        self.ui.plotToolBar.setMaximumHeight(0)
+        self.ui.plotToolBar.setMinimumHeight(0)
+        self.ui.plotToolBar.setVisible(False)
+
+    def _set_2d_controls_visible(self, visible: bool):
+        """Show/hide the controls that only make sense with 2D data:
+        the Share Axis + 2D-unit buttons and the X-Range slice trio
+        (the slice is computed from the 2D cake).  The plain 1D controls
+        (unit, Single/Overlay, Options, Legend, Clear) stay visible."""
+        for w in (self.ui.shareAxis, self.ui.imageUnit, self.ui.slice,
+                  self.ui.slice_center, self.ui.slice_width):
+            w.setVisible(visible)
 
     def _init_data_objects(self, scan, frame, frame_ids, frames, data_1d, data_2d):
         """Initialize data references, plotting state, and index tracking."""
@@ -140,6 +225,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.scale = self.ui.scale.currentText()
         self.wf_yaxis = 'Frame #'
         self.wf_start = 0
+        self.wf_stop = None  # None → slice through the last frame
         self.wf_step = 1
 
         # Data object references
@@ -240,8 +326,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.setBkg.clicked.connect(self.setBkg)
         self.ui.scale.currentIndexChanged.connect(self.update_views)
         self.ui.cmap.currentIndexChanged.connect(self.update_views)
-        self.ui.shareAxis.stateChanged.connect(self.update)
-        self.ui.update2D.stateChanged.connect(self.enable_2D_buttons)
+        # shareAxis / showLegend / slice are checkable QPushButtons now —
+        # use ``toggled`` (bool) rather than the QCheckBox-only stateChanged.
+        self.ui.shareAxis.toggled.connect(self.update)
+        # On *unchecking* Share Axis, release the x-link and rescale the 1D
+        # plot to its own data (update() relinks/unlinks but leaves the
+        # range frozen at the cake's).  Connected after update so the unlink
+        # has already happened.
+        self.ui.shareAxis.toggled.connect(self._on_share_axis_toggled)
 
         # 2D image controls
         self.ui.imageUnit.activated.connect(self.update_binned)
@@ -252,17 +344,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.yOffset.valueChanged.connect(self.update_plot_view)
         self.ui.plotUnit.activated.connect(self._on_plotUnit_changed)
         self.ui.plotUnit.activated.connect(self.update_plot)
-        self.ui.showLegend.stateChanged.connect(self.update_legend)
-        self.ui.slice.stateChanged.connect(self.update_plot)
-        self.ui.slice.stateChanged.connect(self._update_slice_range)
+        self.ui.showLegend.toggled.connect(self.update_legend)
+        self.ui.slice.toggled.connect(self._sync_slice_controls)
+        self.ui.slice.toggled.connect(self.update_plot)
+        self.ui.slice.toggled.connect(self._update_slice_range)
         self.ui.slice_center.valueChanged.connect(self.update_plot_range)
         self.ui.slice_width.valueChanged.connect(self.update_plot_range)
         self.ui.wf_options.clicked.connect(self.popup_wf_options)
 
-        # Action buttons
+        # Action buttons.  (The in-panel Save buttons were removed — use
+        # pyqtgraph's right-click Export, or File ▸ Export.  The
+        # save_image / save_1D methods are still wired to those menu
+        # actions in static_scan_widget.)
         self.ui.clear_1D.clicked.connect(self.clear_1D)
-        self.ui.save_2D.clicked.connect(self.save_image)
-        self.ui.save_1D.clicked.connect(self.save_1D)
 
     def _init_controls(self):
         """Initialize image units, waterfall options, and preview button."""
@@ -273,6 +367,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.wf_dialog = QDialog()
         self.wf_yaxis_widget = QCombo()
         self.wf_start_widget = QtWidgets.QDoubleSpinBox()
+        self.wf_stop_widget = QtWidgets.QDoubleSpinBox()
         self.wf_step_widget = QtWidgets.QDoubleSpinBox()
         self.wf_accept_button = QtWidgets.QPushButton('Okay')
         self.wf_cancel_button = QtWidgets.QPushButton('Cancel')
@@ -390,19 +485,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         except TypeError:
             return False
 
-        if self.ui.update2D.isChecked():
-            try:
-                self.update_image()
-            except TypeError:
-                return False
-            try:
-                self.update_binned()
-            except TypeError:
-                return False
+        # 2D always updates now (the old "Update 2D" perf toggle is gone —
+        # 1D-only modes hide the 2D panel via _apply_1d_only_visibility, and
+        # the try/except guards a missing-2D-data frame).
+        try:
+            self.update_image()
+        except TypeError:
+            return False
+        try:
+            self.update_binned()
+        except TypeError:
+            return False
 
         # Apply label to 2D view
-        if self.ui.update2D.isChecked():
-            self.update_2d_label()
+        self.update_2d_label()
 
         # Update the image preview popup if it is open
         self._update_image_preview()
@@ -424,10 +520,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.update_image_view()
             return
 
-        if self.ui.update2D.isChecked():
-            self.update_image_view()
-            self.update_binned_view()
-            self.update_2d_label()
+        self.update_image_view()
+        self.update_binned_view()
+        self.update_2d_label()
         self.update_plot_view()
 
     # ── 1D-only visibility ────────────────────────────────────────
@@ -445,22 +540,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return
         skip = getattr(self.scan, 'skip_2d', False)
         if skip:
-            # Hide 2D panels and image toolbar, keep frame_top visible
+            # Hide the 2D image but KEEP the middle control bar
+            # (imageToolbar) — it now holds the 1D plot controls.  Shrink
+            # imageWindow to the title + control bar (frame_top 35 +
+            # imageToolbar 40).
             self.ui.twoDWindow.setMaximumHeight(0)
             self.ui.twoDWindow.setMinimumHeight(0)
-            self.ui.imageToolbar.setMaximumHeight(0)
-            self.ui.imageToolbar.setMinimumHeight(0)
-            # Shrink imageWindow to just the top toolbar height
-            self.ui.imageWindow.setMinimumHeight(35)
-            self.ui.imageWindow.setMaximumHeight(35)
-            self.ui.update2D.setChecked(False)
-            self.ui.update2D.setEnabled(False)
+            self.ui.imageToolbar.setMinimumHeight(40)
+            self.ui.imageToolbar.setMaximumHeight(40)
+            self.ui.imageWindow.setMinimumHeight(80)
+            self.ui.imageWindow.setMaximumHeight(85)
+            # 2D-only controls (Share Axis, 2D unit, X-Range slice) off.
             if self.ui.slice.isChecked():
                 self.ui.slice.setChecked(False)
-            self.ui.slice.setEnabled(False)
-            self.ui.slice_center.setEnabled(False)
-            self.ui.slice_width.setEnabled(False)
-            self.ui.imageUnit.setEnabled(False)
+            self._set_2d_controls_visible(False)
 
             # Show the raw image preview button in 1D-only mode
             self._showImageBtn.setVisible(True)
@@ -479,16 +572,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.plotUnit.blockSignals(False)
             self._was_skip_2d = True
         else:
-            # Restore 2D panels and image toolbar
+            # Restore the 2D image + all controls.
             self.ui.twoDWindow.setMinimumHeight(0)
             self.ui.twoDWindow.setMaximumHeight(16777215)
             self.ui.imageToolbar.setMinimumHeight(40)
             self.ui.imageToolbar.setMaximumHeight(40)
             self.ui.imageWindow.setMinimumHeight(200)
             self.ui.imageWindow.setMaximumHeight(16777215)
-            self.ui.update2D.setEnabled(True)
-            self.ui.update2D.setChecked(True)
-            self.ui.imageUnit.setEnabled(True)
+            self._set_2d_controls_visible(True)
             # Hide the raw image preview button in 2D modes
             self._showImageBtn.setVisible(False)
             # Only rebuild plotUnit when transitioning from 1D-only mode,
@@ -627,22 +718,54 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Slicing requires 2D data and the axis must come from 2D
         can_slice = (not skip_2d) and info['source'] in ('2d', '1d_2d')
 
-        # Enable/disable slice UI
+        # The X Range button is available when slicing is possible; the
+        # center/width spinboxes are only live once X Range is *checked*.
         self.ui.slice.setEnabled(can_slice)
-        self.ui.slice_center.setEnabled(can_slice)
-        self.ui.slice_width.setEnabled(can_slice)
         if not can_slice:
             self.ui.slice.setChecked(False)
             self.clear_slice_overlay()
+        self._sync_slice_controls()
+
+        # Share Axis only makes sense when the 1D plot and the 2D cake can
+        # be on the SAME x-axis — i.e. the 1D plotUnit is the radial axis
+        # (Q or 2θ), which the cake also uses for its x.  When the 1D plot
+        # is on χ (the cake's azimuthal/y axis) there's nothing to share,
+        # so disable it.  Also disabled in 1D-only mode (no 2D cake).
+        can_share = (not skip_2d) and (
+            info.get('axis') == 'radial' or info['source'] == '1d_2d'
+        )
+        was_checked = self.ui.shareAxis.isChecked()
+        self.ui.shareAxis.setEnabled(can_share)
+        if not can_share and was_checked:
+            # Auto-disabling Share Axis (e.g. switched 1D to χ): unchecking
+            # emits ``toggled`` → update() (unlinks the axes) +
+            # _on_share_axis_toggled() (rescales the 1D plot to its data).
+            self.ui.shareAxis.setChecked(False)
+
+    def _sync_slice_controls(self, _=None):
+        """Enable the slice center/width spinboxes only while the X Range
+        button is both available and checked."""
+        active = self.ui.slice.isEnabled() and self.ui.slice.isChecked()
+        self.ui.slice_center.setEnabled(active)
+        self.ui.slice_width.setEnabled(active)
+
+    def _on_share_axis_toggled(self, checked):
+        """Rescale the 1D plot to its own data when Share Axis is turned off.
+
+        While shared, the 1D plot's x-axis is XLinked to the 2D cake; the
+        ``update`` slot calls ``setXLink(None)`` on uncheck but pyqtgraph
+        leaves the view frozen at the cake's range, so the user sees a
+        stuck axis.  Re-enable autoRange so it fits the 1D curve."""
+        if not checked:
+            try:
+                self.plot.enableAutoRange()
+                self.plot.autoRange()
+            except Exception:
+                logger.debug("1D autoscale on Share Axis off failed",
+                             exc_info=True)
 
         # Update slice range label
         self._set_slice_range()
-
-    def enable_2D_buttons(self):
-        """Placeholder: disable 2D-related buttons when update2D is unchecked.
-
-        Currently a no-op; 2D button visibility is managed elsewhere.
-        """
 
     # ── 2D image rendering ────────────────────────────────────────
 
@@ -854,8 +977,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                   None    — restore normal layout.
         """
         self.viewer_mode = mode
+        is_viewer = mode in ('image', 'xye')
+        # In a viewer the top bar carries only the filename label (frame_5):
+        # the norm/bkg controls (frame_4) and scale/cmap (frame_6) are
+        # process-mode concerns.  The bottom toolbar is permanently
+        # collapsed (its controls moved to the middle bar in _reflow).
+        self.ui.frame_4.setVisible(not is_viewer)
+        self.ui.frame_6.setVisible(not is_viewer)
+        self.ui.plotToolBar.setVisible(False)
+
         if mode == 'image':
-            # Show 2D image panel, collapse 1D plot panel
+            # Top bar (filename only) + raw image; no controls, collapse 1D.
+            self.ui.frame_top.setVisible(True)
+            self.ui.twoDWindow.setVisible(True)
+            self.ui.imageToolbar.setVisible(False)
             self.ui.imageWindow.setMinimumHeight(200)
             self.ui.imageWindow.setMaximumHeight(16777215)
             self.ui.plotWindow.setMinimumHeight(0)
@@ -863,44 +998,25 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # Hide binned frame — only raw image relevant
             self.ui.binnedFrame.setMaximumWidth(0)
             self.ui.binnedFrame.setMinimumWidth(0)
-
-            # Disable all controls not relevant in image viewer mode
-            self.ui.normChannel.setEnabled(False)
-            self.ui.setBkg.setEnabled(False)
-            self.ui.update2D.setChecked(False)
-            self.ui.update2D.setEnabled(False)
-            self.ui.shareAxis.setEnabled(False)
-            self.ui.imageUnit.setEnabled(False)
-            self.ui.slice.setEnabled(False)
             self._showImageBtn.setVisible(False)
-
-            # Keep these active: scale (Linear/Log), cmap, save_2D
-            self.ui.scale.setEnabled(True)
-            self.ui.cmap.setEnabled(True)
-            self.ui.save_2D.setEnabled(True)
         elif mode == 'xye':
-            # Collapse 2D image panel, show 1D plot panel
-            self.ui.imageWindow.setMinimumHeight(0)
-            self.ui.imageWindow.setMaximumHeight(0)
+            # 1D overlay view: hide the 2D image but KEEP the middle control
+            # bar (the 1D controls — unit/Single/Options/Legend/Clear — are
+            # useful for overlays); hide the 2D-only controls + slice.  The
+            # imageWindow shrinks to the title + control bar above the plot.
+            self.ui.frame_top.setVisible(True)
+            self.ui.twoDWindow.setVisible(False)
+            self.ui.imageToolbar.setVisible(True)
+            self._set_2d_controls_visible(False)
+            self.ui.imageWindow.setMinimumHeight(80)
+            self.ui.imageWindow.setMaximumHeight(85)
             self.ui.plotWindow.setMinimumHeight(200)
             self.ui.plotWindow.setMaximumHeight(16777215)
-            self.ui.update2D.setChecked(False)
-            self.ui.update2D.setEnabled(False)
-            # Disable controls not applicable to raw XYE data
-            self.ui.slice.setEnabled(False)
-            self.ui.slice_center.setEnabled(False)
-            self.ui.slice_width.setEnabled(False)
-            self.ui.plotUnit.setEnabled(False)
-            self.ui.shareAxis.setEnabled(False)
-            # Keep plot method, legend, clear, save functional
-            self.ui.plotMethod.setEnabled(True)
-            self.ui.yOffset.setEnabled(True)
-            self.ui.showLegend.setEnabled(True)
-            self.ui.clear_1D.setEnabled(True)
-            self.ui.save_1D.setEnabled(True)
-            self.ui.wf_options.setEnabled(True)
         else:
-            # Normal mode — restore both panels
+            # Normal mode — restore panels + the middle control bar.
+            self.ui.frame_top.setVisible(True)
+            self.ui.twoDWindow.setVisible(True)
+            self.ui.imageToolbar.setVisible(True)
             self.ui.imageWindow.setMinimumHeight(200)
             self.ui.imageWindow.setMaximumHeight(16777215)
             self.ui.plotWindow.setMinimumHeight(200)
@@ -911,20 +1027,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # Re-enable all controls
             self.ui.normChannel.setEnabled(True)
             self.ui.setBkg.setEnabled(True)
-            self.ui.update2D.setEnabled(True)
-            self.ui.update2D.setChecked(True)
             self.ui.shareAxis.setEnabled(True)
             self.ui.imageUnit.setEnabled(True)
             self.ui.scale.setEnabled(True)
             self.ui.cmap.setEnabled(True)
-            self.ui.save_2D.setEnabled(True)
             self.ui.plotUnit.setEnabled(True)
             self.ui.plotMethod.setEnabled(True)
             # Slice enable/disable depends on which axis is selected
             self._on_plotUnit_changed()
             self.ui.showLegend.setEnabled(True)
             self.ui.clear_1D.setEnabled(True)
-            self.ui.save_1D.setEnabled(True)
+            # Re-apply 2D-control visibility for the current processing
+            # mode (Int 1D hides the 2D controls + slice; Int 2D shows all).
+            self._apply_1d_only_visibility()
 
     def _update_xye_viewer(self):
         """Render 1D line data in XYE viewer mode (no scan/integration).
@@ -935,6 +1050,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """
         if len(self.idxs_1d) == 0:
             return
+
+        # Title bar: the xye filename(s) — same convention as the image viewer.
+        self._set_viewer_title(self.idxs_1d)
 
         # Determine axis label from first frame
         first_frame = self.data_1d[self.idxs_1d[0]]
@@ -1030,7 +1148,47 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         data = data.T[:, ::-1]
         rect = get_rect(np.arange(data.shape[0]), np.arange(data.shape[1]))
         self.image_data = (data, rect)
+        self._set_viewer_title(self.idxs_2d)
         self.update_image_view()
+
+    @staticmethod
+    def _truncate_name(name, limit=100, head=48, tail=48):
+        """Middle-ellipsis only very long filenames.  With the viewer top
+        bar trimmed to just the label there's room for the full name, so the
+        limit is generous (100 chars); longer names show the first ``head``
+        and last ``tail`` characters with ``...`` between."""
+        if name and len(name) > limit:
+            return f'{name[:head]}...{name[-tail:]}'
+        return name
+
+    def _set_viewer_title(self, idxs):
+        """Set the title label in viewer modes from the selected frame's
+        source file: plain filename for single-image formats (tiff/raw/xye),
+        ``Filename #N`` for multi-image HDF5/NeXus files.  ``idxs`` is the
+        list of selected frame keys; extra selections (XYE overlay) add a
+        ``(+k more)`` suffix."""
+        idxs = list(idxs) if idxs else []
+        if not idxs:
+            self.ui.labelCurrent.setText('Image Viewer')
+            return
+        idx0 = idxs[0]
+        src = ''
+        with self.data_lock:
+            d1 = self.data_1d.get(idx0)
+        if d1 is not None:
+            info = getattr(d1, 'scan_info', None) or {}
+            src = info.get('source_file', '') or ''
+        name = os.path.basename(src) if src else ''
+        ext = os.path.splitext(name)[1].lower()
+        if not name:
+            title = 'Viewer'
+        elif ext in ('.h5', '.hdf5', '.nxs'):
+            title = f'{self._truncate_name(name)} #{idx0}'
+        else:
+            title = self._truncate_name(name)
+        if len(idxs) > 1:
+            title += f'  (+{len(idxs) - 1} more)'
+        self.ui.labelCurrent.setText(title)
 
     # ── Image preview dialog ──────────────────────────────────────
 

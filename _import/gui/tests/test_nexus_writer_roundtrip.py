@@ -217,9 +217,12 @@ def written_nxs_with_stitched(tmp_path):
         radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
         azimuthal=np.linspace(-180, 180, nchi, endpoint=False,
                               dtype=np.float32),
-        # Stitched 2D intensity is stored in the natural (nchi, nq) shape
-        # (no transpose); this matches how stitch_2d returns its result.
-        intensity=np.random.default_rng(8).random((nchi, nq), dtype=np.float32),
+        # stitch_2d returns IntegrationResult2D.intensity as (npt_rad,
+        # npt_azim) == (nq, nchi); write_stitched stores it AS-IS with
+        # dims (q, chi).  (The old xdart writer mislabelled the axes
+        # [chi, q] over (nq, nchi) data — the delegated primitive fixes
+        # that, so the fixture now uses the real (nq, nchi) orientation.)
+        intensity=np.random.default_rng(8).random((nq, nchi), dtype=np.float32),
     )
 
     frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
@@ -295,9 +298,12 @@ def test_integrated_1d_nxdata(written_nxs):
     assert g["frame_index"].shape == (N_FRAMES,)
     assert g["sigma"].shape == (N_FRAMES, N_Q)
 
-    # Units on the radial axis
+    # Units on the radial axis.  The shared write_integrated_stack
+    # primitive stores the IntegrationResult's raw unit string verbatim
+    # ("q_A^-1") rather than the old xdart "1/angstrom" remap — this
+    # matches the headless write path so files are interchangeable.
     q_units = g["q"].attrs.get("units", "")
-    assert q_units in ("1/angstrom", "1/nm")
+    assert q_units in ("q_A^-1", "1/angstrom", "1/nm")
 
 
 def test_integrated_2d_nxdata(written_nxs):
@@ -659,6 +665,62 @@ def test_source_ref_omitted_when_no_source_file(tmp_path):
             assert "source" not in f[f"entry/frames/frame_{i:04d}"]
 
 
+def test_late_out_of_order_frame_is_written(tmp_path):
+    """P2: a late frame whose label lands *between* already-saved labels
+    (save [0, 2], then frame 1 arrives) must get its integrated row written
+    — the old positional-tail selection skipped it."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    # First save with frames 0 and 2 only.
+    scan = _DuckSphere([_DuckArch(idx=0), _DuckArch(idx=2)])
+    path = tmp_path / "late.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    with h5py.File(path, "r") as f:
+        assert sorted(f["entry/integrated_1d/frame_index"][()]) == [0, 2]
+
+    # Frame 1 arrives late; rebuild the scan with [0, 1, 2] in order.
+    scan2 = _DuckSphere([_DuckArch(idx=0), _DuckArch(idx=1), _DuckArch(idx=2)])
+    save_scan_to_nexus(scan2, path, mode="a", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        on_disk = sorted(int(x) for x in f["entry/integrated_1d/frame_index"][()])
+        assert on_disk == [0, 1, 2]            # frame 1 now present
+        assert f["entry/integrated_1d/intensity"].shape[0] == 3
+
+
+def test_scan_data_grows_on_incremental_saves(tmp_path):
+    """P1: scan_data (and positioners/geometry) must track the integrated
+    frame count across per-frame saves — not freeze at the first save's
+    length (live mode never passes finalize=True)."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    import h5py
+
+    geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
+
+    def _scan(n):
+        frames = [_DuckArch(idx=i) for i in range(n)]
+        sd = pd.DataFrame({
+            "tth": np.linspace(10.0, 14.0, n, dtype=np.float32),
+            "th": np.linspace(0.0, 0.3, n, dtype=np.float32),
+            "i0": np.linspace(1e6, 1.2e6, n, dtype=np.float32),
+        }, index=range(n))
+        return _DuckSphere(frames, scan_data=sd, geometry=geom)
+
+    path = tmp_path / "grow.nxs"
+    save_scan_to_nexus(_scan(2), path, mode="w", finalize=False)   # 2 frames
+    save_scan_to_nexus(_scan(5), path, mode="a", finalize=False)   # grows to 5
+
+    with h5py.File(path, "r") as f:
+        assert f["entry/integrated_1d/intensity"].shape[0] == 5
+        # scan_data + positioners + geometry all caught up to 5 (not stuck at 2)
+        assert f["entry/scan_data/frame_index"].shape[0] == 5
+        assert f["entry/scan_data/i0"].shape[0] == 5
+        assert f["entry/sample/positioners/th/value"].shape[0] == 5
+        assert f["entry/per_frame_geometry/frame_index"].shape[0] == 5
+
+
 def test_instrument_groups(written_nxs):
     """Instrument tree: NXinstrument/NXdetector with mask + PONI scalars."""
     root = nx.nxload(str(written_nxs))
@@ -753,12 +815,14 @@ def test_stitched_outputs(written_nxs_with_stitched):
     assert s1.nxclass == "NXdata"
     assert s1["intensity"].shape == (nq,)
     assert s1["q"].shape == (nq,)
-    assert s1["q"].attrs.get("units") in ("1/angstrom", "1/nm")
+    assert s1["q"].attrs.get("units") in ("q_A^-1", "1/angstrom", "1/nm")
     assert s1["sigma"].shape == (nq,)
 
     s2 = e["stitched_2d"]
     assert s2.nxclass == "NXdata"
-    assert s2["intensity"].shape == (nchi, nq)
+    # stitched_2d is stored AS-IS (q, chi) == (nq, nchi) — unlike the
+    # per-frame integrated_2d stack which is (frame, chi, q).
+    assert s2["intensity"].shape == (nq, nchi)
     assert s2["q"].shape == (nq,)
     assert s2["chi"].shape == (nchi,)
     assert s2["chi"].attrs.get("units") in ("deg", "rad")
@@ -933,11 +997,21 @@ def test_scan_data_index_aligns_with_gapped_frame_ids(tmp_path):
     geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
 
     frames = [_DuckArch(idx=i) for i in gapped]
+    # Real LiveScan indexes scan_data by frame.idx (live:
+    # ``scan_data.loc[frame.idx] = ser``; reload:
+    # ``pd.DataFrame(motor_cols, index=frame_index)``), so the fixture
+    # must too — the writer aligns positioners/geometry to the frame
+    # set by *reindexing on that id index*.  (The pre-#18 writer used a
+    # "reindex only when lengths differ" heuristic that silently fell
+    # back to positional alignment; that tolerated a mis-indexed
+    # scan_data but would mis-pair motors to frames after a delete /
+    # reorder.  The shared ssrl primitive aligns by id instead.)
     scan_data = pd.DataFrame(
         {
             "tth": np.array([11.0, 12.5, 14.0, 15.5], dtype=np.float32),
             "th":  np.array([0.10, 0.15, 0.20, 0.25], dtype=np.float32),
-        }
+        },
+        index=gapped,
     )
     scan = _DuckSphere(frames, scan_data=scan_data, geometry=geom)
 
