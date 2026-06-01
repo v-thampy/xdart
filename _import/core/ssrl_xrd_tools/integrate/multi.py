@@ -295,9 +295,13 @@ def stitch_images(
     # number of images and integrators silently mispairs images with the
     # wrong detector angle (or raises deep inside pyFAI).
     rot1 = np.asarray(rot1_angles, dtype=float)
-    n_images = images.shape[0] if (
-        isinstance(images, np.ndarray) and images.ndim == 3
-    ) else len(images)
+    # Count images the same way _prepare_images interprets them: a 3-D
+    # ndarray is a stack (count = shape[0]); a 2-D ndarray is a single
+    # image (count = 1, NOT shape[0]); anything else is a sequence.
+    if isinstance(images, np.ndarray):
+        n_images = images.shape[0] if images.ndim == 3 else 1
+    else:
+        n_images = len(images)
     if n_images != rot1.shape[0]:
         raise ValueError(
             f"stitch_images: {n_images} images != {rot1.shape[0]} angles; "

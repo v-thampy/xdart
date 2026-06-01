@@ -856,23 +856,99 @@ def _append_stacked_1d(
             f"integrated_1d row size {n_q} != on-disk {di.shape[1]}; "
             "all frames in a scan must share the same npt."
         )
+    # Per-frame appends can't refresh the shared q axis / units, so a frame
+    # whose radial axis differs from what's on disk would be stored under a
+    # stale axis (silent corruption).  The bulk ``write_integrated_stack``
+    # path detects this earlier and rebuilds; the live / NexusSink path
+    # reaches here directly, so reject it loudly.
+    if not _axes_match_1d(g, r):
+        raise ValueError(
+            "integrated_1d radial axis/unit differs from what's on disk; "
+            "a frame's q axis must match the rest of the scan (use "
+            "write_integrated_stack with all frames to re-axis a reintegration)."
+        )
     fi = g["frame_index"]
     match = np.where(np.asarray(fi[()]) == idx)[0]
     if match.size:
         pos = int(match[0])  # upsert: replace existing row for this label
         di[pos] = intensity
-        if "sigma" in g and r.sigma is not None:
-            g["sigma"][pos] = np.asarray(r.sigma, dtype=np.float32)
+        _upsert_sigma_1d(g, pos, r, n_q)
         return
     n = di.shape[0]
     di.resize(n + 1, axis=0)
     di[n] = intensity
     fi.resize(n + 1, axis=0)
     fi[n] = idx
-    if "sigma" in g and r.sigma is not None:
+    _append_sigma_row(g, n, (None if r.sigma is None
+                             else np.asarray(r.sigma, np.float32)),
+                      (n_q,), comp_kwargs)
+
+
+def _append_sigma_row(g, new_row_pos, sigma_row, row_shape, comp_kwargs):
+    """Append a frame's sigma at position ``new_row_pos`` (= the index of the
+    just-appended intensity row), keeping sigma row-aligned with intensity.
+
+    Handles the three sigma cases the per-frame appenders must get right:
+
+    * sigma exists, frame has sigma → extend + write the value;
+    * sigma exists, frame has none → extend + NaN-pad (don't desync);
+    * sigma does NOT exist yet but THIS frame brings sigma → create the
+      dataset and NaN-backfill the earlier rows, then write this row (so a
+      sigma introduced mid-scan isn't silently discarded).
+    """
+    if "sigma" in g:
         ds = g["sigma"]
-        ds.resize(n + 1, axis=0)
-        ds[n] = np.asarray(r.sigma, dtype=np.float32)
+        ds.resize(new_row_pos + 1, axis=0)
+        ds[new_row_pos] = (sigma_row if sigma_row is not None
+                           else np.full(row_shape, np.nan, np.float32))
+    elif sigma_row is not None:
+        # First sigma in the scan arrives after some sigma-less frames —
+        # create the stack NaN-backfilled for the prior rows.
+        n_rows = new_row_pos + 1
+        chunks = (max(1, min(n_rows, 32)),) + tuple(row_shape)
+        data = np.full((n_rows,) + tuple(row_shape), np.nan, np.float32)
+        data[new_row_pos] = sigma_row
+        g.create_dataset("sigma", data=data,
+                         maxshape=(None,) + tuple(row_shape),
+                         chunks=chunks, **comp_kwargs)
+
+
+def _upsert_sigma_1d(g, pos, r, n_q):
+    """Update sigma for an upserted (replaced) 1D row.
+
+    * frame has sigma → write it (creating the dataset NaN-backfilled if it
+      didn't exist yet — a sigma introduced on reintegration);
+    * frame has NO sigma but a sigma dataset exists → write NaN, so a
+      reintegration that dropped sigma doesn't leave a STALE uncertainty.
+    """
+    if r.sigma is not None:
+        row = np.asarray(r.sigma, np.float32)
+        if "sigma" in g:
+            g["sigma"][pos] = row
+        else:
+            n_rows = g["intensity"].shape[0]
+            data = np.full((n_rows, n_q), np.nan, np.float32)
+            data[pos] = row
+            g.create_dataset("sigma", data=data, maxshape=(None, n_q),
+                             chunks=(max(1, min(n_rows, 32)), n_q))
+    elif "sigma" in g:
+        g["sigma"][pos] = np.full(n_q, np.nan, np.float32)
+
+
+def _upsert_sigma_2d(g, pos, r, n_chi, n_q):
+    """2D analogue of :func:`_upsert_sigma_1d` (sigma stored transposed)."""
+    if r.sigma is not None:
+        row = np.asarray(r.sigma, np.float32).T
+        if "sigma" in g:
+            g["sigma"][pos] = row
+        else:
+            n_rows = g["intensity"].shape[0]
+            data = np.full((n_rows, n_chi, n_q), np.nan, np.float32)
+            data[pos] = row
+            g.create_dataset("sigma", data=data, maxshape=(None, n_chi, n_q),
+                             chunks=(1, n_chi, n_q))
+    elif "sigma" in g:
+        g["sigma"][pos] = np.full((n_chi, n_q), np.nan, np.float32)
 
 
 def _append_stacked_2d(
@@ -920,23 +996,104 @@ def _append_stacked_2d(
             f"integrated_2d slice {(n_chi, n_q)} != on-disk {tuple(di.shape[1:])}; "
             "all frames in a scan must share the same (npt_azim, npt_rad)."
         )
+    # Reject a frame whose q/chi axis differs from disk (see _append_stacked_1d).
+    if not _axes_match_2d(g, r):
+        raise ValueError(
+            "integrated_2d q/chi axis or unit differs from what's on disk; "
+            "a frame's axes must match the rest of the scan (use "
+            "write_integrated_stack with all frames to re-axis a reintegration)."
+        )
     fi = g["frame_index"]
     match = np.where(np.asarray(fi[()]) == idx)[0]
     if match.size:
         pos = int(match[0])  # upsert: replace existing row for this label
         di[pos] = intensity
-        if "sigma" in g and r.sigma is not None:
-            g["sigma"][pos] = np.asarray(r.sigma, dtype=np.float32).T
+        _upsert_sigma_2d(g, pos, r, n_chi, n_q)
         return
     n = di.shape[0]
     di.resize(n + 1, axis=0)
     di[n] = intensity
     fi.resize(n + 1, axis=0)
     fi[n] = idx
-    if "sigma" in g and r.sigma is not None:
-        ds = g["sigma"]
-        ds.resize(n + 1, axis=0)
-        ds[n] = np.asarray(r.sigma, dtype=np.float32).T
+    _append_sigma_row(g, n, (None if r.sigma is None
+                             else np.asarray(r.sigma, np.float32).T),
+                      (n_chi, n_q), comp_kwargs)
+
+
+def _require_uniform_axes_1d(results_1d) -> None:
+    """Raise if any 1D result in the batch has a radial axis/unit differing
+    from the first — they all share one stored ``q`` axis, so a divergent
+    row would be silently mislabeled."""
+    r0 = results_1d[0]
+    q0 = np.asarray(r0.radial, np.float32)
+    u0 = r0.unit or ""
+    for i, r in enumerate(results_1d[1:], start=1):
+        q = np.asarray(r.radial, np.float32)
+        if q.shape != q0.shape or not np.allclose(q, q0, rtol=1e-5, atol=1e-8) \
+                or (r.unit or "") != u0:
+            raise ValueError(
+                f"results_1d[{i}] has a different radial axis/unit than "
+                "results_1d[0]; all frames in a batch must share one q axis."
+            )
+
+
+def _require_uniform_axes_2d(results_2d) -> None:
+    """Raise if any 2D result's q/chi axis or unit differs from the first."""
+    r0 = results_2d[0]
+    q0 = np.asarray(r0.radial, np.float32)
+    c0 = np.asarray(r0.azimuthal, np.float32)
+    u0 = r0.unit or ""
+    au0 = getattr(r0, "azimuthal_unit", "") or ""
+    for i, r in enumerate(results_2d[1:], start=1):
+        q = np.asarray(r.radial, np.float32)
+        c = np.asarray(r.azimuthal, np.float32)
+        if (q.shape != q0.shape or not np.allclose(q, q0, rtol=1e-5, atol=1e-8)
+                or c.shape != c0.shape
+                or not np.allclose(c, c0, rtol=1e-5, atol=1e-8)
+                or (r.unit or "") != u0
+                or (getattr(r, "azimuthal_unit", "") or "") != au0):
+            raise ValueError(
+                f"results_2d[{i}] has a different q/chi axis or unit than "
+                "results_2d[0]; all frames in a batch must share one axis set."
+            )
+
+
+def _axes_match_1d(g, r0) -> bool:
+    """True if the on-disk integrated_1d q axis + units match ``r0``.
+
+    Lets a same-bin-count reintegration upsert in place (axes unchanged)
+    vs. rebuild (e.g. q_A^-1→2th_deg, or a different radial range at the
+    same npt).  Missing q dataset → treated as a match."""
+    if "q" not in g:
+        return True
+    q = np.asarray(g["q"][()])
+    new_q = np.asarray(r0.radial, np.float32)
+    if q.shape != new_q.shape or not np.allclose(q, new_q, rtol=1e-5, atol=1e-8):
+        return False
+    return _v2_decode_str(g["q"].attrs.get("units", "")) == (r0.unit or "")
+
+
+def _axes_match_2d(g, r0) -> bool:
+    """True if the on-disk integrated_2d q + chi axes + units match ``r0``."""
+    new_q = np.asarray(r0.radial, np.float32)
+    new_chi = np.asarray(r0.azimuthal, np.float32)
+    if "q" in g:
+        q = np.asarray(g["q"][()])
+        if q.shape != new_q.shape or not np.allclose(q, new_q, rtol=1e-5, atol=1e-8):
+            return False
+        if _v2_decode_str(g["q"].attrs.get("units", "")) != (r0.unit or ""):
+            return False
+    if "chi" in g:
+        chi = np.asarray(g["chi"][()])
+        if chi.shape != new_chi.shape or not np.allclose(
+            chi, new_chi, rtol=1e-5, atol=1e-8
+        ):
+            return False
+        if _v2_decode_str(g["chi"].attrs.get("units", "")) != (
+            getattr(r0, "azimuthal_unit", "") or ""
+        ):
+            return False
+    return True
 
 
 def write_integrated_stack(
@@ -959,11 +1116,36 @@ def write_integrated_stack(
     upsert appenders (:func:`_append_stacked_1d` / ``_2d``), so re-saving a
     frame label replaces its row rather than duplicating it.  ``int64``
     frame_index; ``compression`` applies to the intensity/sigma stacks.
+
+    Reintegration shape change (C3): if the incoming row size differs from
+    what's on disk (a different ``npt`` / ``npt_rad`` / ``npt_azim``), the
+    existing group is dropped and rewritten from this batch so the q/chi
+    axes refresh — pass *all* frames in that case, not a subset.
     """
     fis = [int(x) for x in frame_indices]
     if len(set(fis)) != len(fis):
         raise ValueError(f"frame_indices contains duplicate labels: {fis}")
     ck = _comp_kwargs(compression)
+
+    def _require_batch_covers_existing(group, name: str) -> None:
+        """Guard the C3 shape-change full-rewrite.
+
+        Rewriting a group from the incoming batch is only safe when that
+        batch covers *every* frame already on disk — otherwise the rows
+        for the omitted frames are silently dropped.  A reintegration
+        that changes the bin count must therefore pass all frames.  Raise
+        (rather than lose data) on a partial batch.
+        """
+        existing = {int(x) for x in np.asarray(group["frame_index"][()]).ravel()}
+        missing = existing - set(fis)
+        if missing:
+            raise ValueError(
+                f"write_integrated_stack: {name} row size changed but the "
+                f"incoming batch is missing frame(s) {sorted(missing)} already "
+                "on disk. A reintegration that changes the bin count must pass "
+                "all frames (full rewrite), not a subset — otherwise the "
+                "omitted rows would be dropped."
+            )
 
     def _bulk_create_1d():
         r0 = results_1d[0]
@@ -982,12 +1164,16 @@ def write_integrated_stack(
         qd.attrs["units"] = r0.unit
         g.create_dataset("frame_index", data=np.asarray(fis, np.int64),
                          maxshape=(None,), chunks=(64,))
-        if all(r.sigma is not None for r in results_1d):
-            g.create_dataset(
-                "sigma",
-                data=np.stack([np.asarray(r.sigma, np.float32) for r in results_1d]),
-                maxshape=(None, n_q), chunks=(rows, n_q), **ck,
-            )
+        # Write sigma if ANY frame has it (NaN-pad the frames that don't) —
+        # an all-or-nothing test silently dropped sigma for a mixed batch.
+        if any(r.sigma is not None for r in results_1d):
+            sig = np.stack([
+                (np.asarray(r.sigma, np.float32) if r.sigma is not None
+                 else np.full(n_q, np.nan, np.float32))
+                for r in results_1d
+            ])
+            g.create_dataset("sigma", data=sig,
+                             maxshape=(None, n_q), chunks=(rows, n_q), **ck)
 
     def _bulk_create_2d():
         r0 = results_2d[0]
@@ -1007,17 +1193,40 @@ def write_integrated_stack(
         cd.attrs["units"] = r0.azimuthal_unit
         g.create_dataset("frame_index", data=np.asarray(fis, np.int64),
                          maxshape=(None,), chunks=(64,))
-        if all(r.sigma is not None for r in results_2d):
-            g.create_dataset(
-                "sigma",
-                data=np.stack([np.asarray(r.sigma, np.float32).T for r in results_2d]),
-                maxshape=(None, n_chi, n_q), chunks=(1, n_chi, n_q), **ck,
-            )
+        # Sigma if ANY frame has it (NaN-pad the rest) — see _bulk_create_1d.
+        if any(r.sigma is not None for r in results_2d):
+            sig = np.stack([
+                (np.asarray(r.sigma, np.float32).T if r.sigma is not None
+                 else np.full((n_chi, n_q), np.nan, np.float32))
+                for r in results_2d
+            ])
+            g.create_dataset("sigma", data=sig,
+                             maxshape=(None, n_chi, n_q),
+                             chunks=(1, n_chi, n_q), **ck)
 
     if results_1d is not None and len(results_1d):
         if len(results_1d) != len(fis):
             raise ValueError("results_1d length must match frame_indices")
-        if "integrated_1d" not in entry_grp:
+        # Every row must share one radial axis + unit — they all land under
+        # the single stored ``q`` axis, so a row with a different grid would
+        # be silently mislabeled.  Validate the whole batch BEFORE touching
+        # the file (checking only results[0] missed later divergent rows).
+        _require_uniform_axes_1d(results_1d)
+        g = entry_grp.get("integrated_1d")
+        # Rebuild trigger: reintegration that changes the npt (row size) OR
+        # the radial axis / unit (e.g. q_A^-1 → 2th_deg, or a different
+        # radial range at the same bin count).  The per-frame upsert path
+        # only rewrites intensity, leaving the stored q axis + units stale,
+        # so any axis change must drop the group and rewrite from this
+        # (full) batch.  Same-axis re-saves take the upsert path.
+        if g is not None and (
+            g["intensity"].shape[1] != np.asarray(results_1d[0].intensity).shape[0]
+            or not _axes_match_1d(g, results_1d[0])
+        ):
+            _require_batch_covers_existing(g, "integrated_1d")
+            del entry_grp["integrated_1d"]
+            g = None
+        if g is None:
             _bulk_create_1d()
         else:
             for fi, r in zip(fis, results_1d):
@@ -1026,7 +1235,19 @@ def write_integrated_stack(
     if results_2d is not None and len(results_2d):
         if len(results_2d) != len(fis):
             raise ValueError("results_2d length must match frame_indices")
-        if "integrated_2d" not in entry_grp:
+        _require_uniform_axes_2d(results_2d)
+        g = entry_grp.get("integrated_2d")
+        new_2d_shape = np.asarray(results_2d[0].intensity).T.shape  # (n_chi, n_q)
+        # Rebuild on a row-shape change OR a q/chi axis / unit change (see
+        # the 1D block) — the upsert path can't refresh the stored axes.
+        if g is not None and (
+            tuple(g["intensity"].shape[1:]) != new_2d_shape
+            or not _axes_match_2d(g, results_2d[0])
+        ):
+            _require_batch_covers_existing(g, "integrated_2d")
+            del entry_grp["integrated_2d"]
+            g = None
+        if g is None:
             _bulk_create_2d()
         else:
             for fi, r in zip(fis, results_2d):
@@ -1079,6 +1300,218 @@ def write_stitched(
         qd.attrs["units"] = stitched_2d.unit
         cd = g.create_dataset("chi", data=np.asarray(stitched_2d.azimuthal, np.float32))
         cd.attrs["units"] = stitched_2d.azimuthal_unit
+
+
+def _reindex_scan_data_to_frames(scan_data, frame_indices):
+    """Return ``scan_data`` rows aligned 1:1 to ``frame_indices``.
+
+    Reindexes when the scan_data index isn't already exactly the frame ids
+    (different order, gaps, or a shorter batch — missing rows become NaN),
+    so positioners / per-frame geometry always share the integrated-frame
+    dimension and can't attach a motor value to the wrong frame.
+    """
+    fis = [int(x) for x in frame_indices]
+    if fis and list(scan_data.index) != fis:
+        scan_data = scan_data.reindex(fis)
+    return scan_data, fis
+
+
+def write_positioners(
+    entry_grp: h5py.Group,
+    scan_data,
+    frame_indices: Sequence[int],
+    geometry,
+    *,
+    compression: str | None = None,
+) -> None:
+    """Write motor positioners under ``/entry/sample`` and
+    ``/entry/instrument/detector`` (NXcollection of NXpositioner/value).
+
+    Sample- vs detector-axis split comes from ``geometry``; no geometry → no-op.
+    ``scan_data`` is aligned to ``frame_indices`` first (see
+    :func:`_reindex_scan_data_to_frames`).  Mirrors what
+    :func:`read_scan_metadata` reads back.
+    """
+    if geometry is None or scan_data is None or len(scan_data) == 0:
+        return
+    scan_data, _ = _reindex_scan_data_to_frames(scan_data, frame_indices)
+    ck = _comp_kwargs(compression)
+
+    def _write_coll(parent_path: str, motors, nx_class: str) -> None:
+        present = [m for m in motors if m in scan_data.columns]
+        if not present:
+            return
+        parent = entry_grp.require_group(parent_path)
+        parent.attrs["NX_class"] = nx_class
+        if "positioners" in parent:
+            del parent["positioners"]
+        coll = parent.create_group("positioners")
+        coll.attrs["NX_class"] = "NXcollection"
+        for m in present:
+            pg = coll.create_group(m)
+            pg.attrs["NX_class"] = "NXpositioner"
+            ds = pg.create_dataset(
+                "value", data=np.asarray(scan_data[m].values, dtype=np.float32), **ck,
+            )
+            ds.attrs["units"] = "deg"
+
+    if geometry.detector_motors:
+        entry_grp.require_group("instrument").attrs["NX_class"] = "NXinstrument"
+    _write_coll("sample", tuple(geometry.sample_motors), "NXsample")
+    _write_coll("instrument/detector", tuple(geometry.detector_motors), "NXdetector")
+
+
+def write_per_frame_geometry(
+    entry_grp: h5py.Group,
+    scan_data,
+    frame_indices: Sequence[int],
+    geometry,
+    *,
+    compression: str | None = None,
+) -> None:
+    """Write ``/entry/per_frame_geometry`` (rot1/2/3 + incident_angle +
+    frame_index) derived from ``scan_data`` motor columns via
+    ``geometry.derive_per_frame``.
+
+    ``scan_data`` is aligned to ``frame_indices`` first so the per-frame
+    dimension matches ``integrated_1d``/``integrated_2d`` (a missing row →
+    NaN-padded → NaN derived geometry, honestly flagged rather than
+    misaligned).  No geometry / no usable motor columns → no-op.
+    """
+    if geometry is None or scan_data is None or len(scan_data) == 0:
+        return
+    scan_data, fis = _reindex_scan_data_to_frames(scan_data, frame_indices)
+    motors = {
+        m: np.asarray(scan_data[m].values, dtype=float)
+        for m in geometry.all_referenced_motors()
+        if m in scan_data.columns
+    }
+    if not motors:
+        return
+    try:
+        derived = geometry.derive_per_frame(motors)
+    except Exception:
+        logger.debug("per_frame_geometry: derive_per_frame failed", exc_info=True)
+        return
+
+    frame_idx_arr = np.asarray(fis if fis else range(len(scan_data)), dtype=np.int64)
+    ck = _comp_kwargs(compression)
+    if "per_frame_geometry" in entry_grp:
+        del entry_grp["per_frame_geometry"]
+    g = entry_grp.create_group("per_frame_geometry")
+    g.attrs["NX_class"] = "NXcollection"
+    g.create_dataset("frame_index", data=frame_idx_arr)
+    for key, arr in derived.items():
+        ds = g.create_dataset(key, data=np.asarray(arr, dtype=np.float32), **ck)
+        ds.attrs["units"] = "deg" if key == "incident_angle" else "rad"
+
+
+def write_scan_metadata(
+    entry_grp: h5py.Group,
+    scan_data,
+    frame_indices: Sequence[int],
+    *,
+    compression: str | None = None,
+) -> None:
+    """Persist the **full** per-frame scan metadata table under
+    ``/entry/scan_data`` (NXcollection: ``frame_index`` + one float
+    dataset per column).
+
+    The ``positioners`` group only carries the geometry-referenced motors;
+    this stores the complete ``scan_data`` DataFrame — every counter and
+    motor the wrangler recorded (monitor, i0, temperature, …) — so that a
+    reload restores the same metadata the live in-memory scan had, not just
+    the geometry motors.  ``read_scan`` / ``read_scan_metadata`` surface
+    these columns as per-frame variables (preferred over positioners, which
+    they then read only for any motor not already present here).
+
+    Non-numeric columns are skipped (the table is stored as float32).
+    """
+    if scan_data is None or len(scan_data) == 0 or not len(scan_data.columns):
+        return
+    scan_data, fis = _reindex_scan_data_to_frames(scan_data, frame_indices)
+    ck = _comp_kwargs(compression)
+    if "scan_data" in entry_grp:
+        del entry_grp["scan_data"]
+    g = entry_grp.create_group("scan_data")
+    g.attrs["NX_class"] = "NXcollection"
+    g.create_dataset(
+        "frame_index",
+        data=np.asarray(fis if fis else range(len(scan_data)), dtype=np.int64),
+    )
+    for col in scan_data.columns:
+        try:
+            arr = np.asarray(scan_data[col].values, dtype=np.float32)
+        except (TypeError, ValueError):
+            continue  # non-numeric column — not representable in the table
+        g.create_dataset(str(col), data=arr, **ck)
+
+
+def _read_scan_data_group(e, add_frame_var, data_vars, coords) -> set:
+    """Read ``/entry/scan_data`` (full metadata table) into per-frame vars.
+
+    Returns the set of column keys loaded so the positioner reader can skip
+    duplicates.  No-op (empty set) when the group is absent — old files fall
+    back to the positioners.
+    """
+    loaded: set = set()
+    if "scan_data" not in e:
+        return loaded
+    sd = e["scan_data"]
+
+    # Align scan_data rows to the established frame coordinate BY LABEL.
+    # scan_data carries its own frame_index; if a ``frame`` coord already
+    # exists (from integrated_1d/2d) and scan_data's labels differ — even
+    # at equal length, e.g. integrated [0, 2] but scan_data stored for
+    # [0, 1] — attaching the columns positionally would assign metadata to
+    # the wrong frames.  Build a row-permutation that maps each coord
+    # label to its scan_data row (NaN where absent) so columns land on the
+    # right frame.  When labels already match (or no coord yet) this is a
+    # no-op identity.
+    sd_labels = (np.asarray(sd["frame_index"][()]) if "frame_index" in sd
+                 else None)
+    coord = coords.get("frame")
+    perm = None          # row-permutation: coord position → scan_data row
+    fully_covers = True  # does scan_data cover every coord label?
+    if sd_labels is not None and coord is not None:
+        if not (len(sd_labels) == len(coord)
+                and np.array_equal(sd_labels, coord)):
+            row_of = {int(lbl): i for i, lbl in enumerate(sd_labels)}
+            perm = [row_of.get(int(c), -1) for c in coord]  # -1 → missing
+            fully_covers = all(src >= 0 for src in perm)
+
+    def _aligned(arr):
+        if perm is None:
+            return arr
+        arr = np.asarray(arr)
+        out = np.full((len(perm),) + arr.shape[1:], np.nan, dtype=float)
+        for i, src in enumerate(perm):
+            if src >= 0:
+                out[i] = arr[src]
+        return out
+
+    # If scan_data is a reorder of the same labels, align by label.  If it
+    # only covers a SUBSET of the integrated frames (a stale/partial table,
+    # the batch-misalign case), skip its columns entirely so a complete
+    # same-named NXpositioner provides the data instead of a NaN-gapped
+    # column — and so we never mis-assign metadata to the wrong frame.
+    if not fully_covers:
+        return loaded  # nothing loaded; positioners fill in
+
+    for k, item in sd.items():
+        if k == "frame_index" or not isinstance(item, h5py.Dataset):
+            continue
+        name = f"meta_{k}" if (k in {"q", "chi", "frame"} or k in data_vars) else k
+        add_frame_var(name, _aligned(item[()]))
+        # Only suppress the positioner fallback for this key if the column
+        # was actually accepted — ``add_frame_var`` skips length-mismatched
+        # columns, and a valid same-named NXpositioner should still load.
+        if name in data_vars:
+            loaded.add(k)
+    # Establish the frame coord from scan_data only when nothing else has.
+    if sd_labels is not None and "frame" not in coords:
+        coords["frame"] = sd_labels
+    return loaded
 
 
 # ---------------------------------------------------------------------------
@@ -1353,6 +1786,10 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
             if "frame_index" in gg and "frame" not in coords:
                 coords["frame"] = np.asarray(gg["frame_index"][()])
 
+        # Full per-frame metadata table (preferred source); positioners
+        # below only fill in geometry motors it didn't already carry.
+        _sd_loaded = _read_scan_data_group(e, _add_frame_var, data_vars, coords)
+
         for category, path_in in [
             ("sample", "sample/positioners"),
             ("detector", "instrument/detector/positioners"),
@@ -1360,6 +1797,8 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
             if path_in in e:
                 pos = _read_positioners(e[path_in])
                 for k, arr in pos.items():
+                    if k in _sd_loaded:
+                        continue  # already loaded from /entry/scan_data
                     reserved = {"q", "chi", "frame"}
                     if k in reserved or k in data_vars:
                         var_name = f"{category}_{k}"
@@ -1507,6 +1946,10 @@ def read_scan_metadata(
                 if key in gg:
                     _add_frame_var(key, gg[key][()])
 
+        # Full per-frame metadata table (preferred source); positioners
+        # below only fill in geometry motors it didn't already carry.
+        _sd_loaded = _read_scan_data_group(e, _add_frame_var, data_vars, coords)
+
         # Positioners.
         for category, path_in in [
             ("sample", "sample/positioners"),
@@ -1515,6 +1958,8 @@ def read_scan_metadata(
             if path_in in e:
                 pos = _read_positioners(e[path_in])
                 for k, arr in pos.items():
+                    if k in _sd_loaded:
+                        continue  # already loaded from /entry/scan_data
                     reserved = {"q", "chi", "frame"}
                     if k in reserved or k in data_vars:
                         var_name = f"{category}_{k}"
@@ -1629,6 +2074,9 @@ __all__ = [
     "write_nexus_frame",
     "write_integrated_stack",
     "write_stitched",
+    "write_positioners",
+    "write_per_frame_geometry",
+    "write_scan_metadata",
     # v2 (xdart 0.37+)
     "read_scan",
     "read_scan_metadata",

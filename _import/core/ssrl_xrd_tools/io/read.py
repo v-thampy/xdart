@@ -37,12 +37,15 @@ array([1, 2, 3, 4, 5])
 
 from __future__ import annotations
 
+import logging
 from collections import namedtuple
 from pathlib import Path
 from typing import Iterable
 
 import h5py
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "Integrated1D",
@@ -51,6 +54,7 @@ __all__ = [
     "get_1d",
     "get_2d",
     "get_thumbnail",
+    "get_raw_frame",
     "get_metadata",
     "open_scan",
     "Scan",
@@ -232,18 +236,102 @@ def get_thumbnail(
         return np.asarray(e[key][()])
 
 
+def _dequantize_thumbnail(ds: h5py.Dataset) -> np.ndarray:
+    """Invert the uint8/uint16 thumbnail quantization back to intensities.
+
+    Thumbnails are stored as ``clip((x-vmin)/(vmax-vmin),0,1)*scale`` (scale
+    255 for uint8, 65535 for uint16) with ``vmin``/``vmax``/``dtype`` attrs.
+    """
+    arr = np.asarray(ds[()], dtype=float)
+    vmin = float(ds.attrs.get("vmin", 0.0))
+    vmax = float(ds.attrs.get("vmax", 1.0))
+    dt = _decode(ds.attrs.get("dtype", "uint8"))
+    scale = 65535.0 if str(dt) == "uint16" else 255.0
+    return vmin + (arr / scale) * (vmax - vmin)
+
+
+def get_raw_frame(
+    scan_file: str | Path,
+    frame: int,
+    *,
+    entry: str = "entry",
+) -> np.ndarray:
+    """Return the raw detector image for one ``frame`` of a processed scan.
+
+    A processed v2 ``.nxs`` stores integrated patterns, not raw detector
+    images — but each frame carries a *source pointer*
+    (``frames/frame_NNNN/source/{path,frame_index}``) back to the original
+    detector master plus a quantized *thumbnail*.  This resolves the source
+    pointer (``path`` is relative to the scan file's directory) and reads the
+    full-resolution raw image from the master via
+    :func:`ssrl_xrd_tools.io.image.read_image`.  If the master can't be
+    located or read, it falls back to the stored thumbnail (dequantized to
+    its original intensity range).
+
+    ``frame`` is the frame **label** (the ``frame_index`` value), matching
+    the other ``get_*`` readers.  Raises ``KeyError`` when neither a usable
+    source pointer nor a thumbnail is present.
+    """
+    from ssrl_xrd_tools.io.image import read_image
+
+    scan_file = Path(scan_file)
+    master: Path | None = None
+    src_frame_idx = 0
+    thumb: np.ndarray | None = None
+
+    with h5py.File(scan_file, "r") as f:
+        e = _entry(f, entry)
+        fg = e.get(f"frames/frame_{int(frame):04d}")
+        if fg is None:
+            raise KeyError(f"No frame group for frame {frame} in {scan_file}")
+        src = fg.get("source")
+        if src is not None and "path" in src:
+            rel = _decode(src["path"][()])
+            if "frame_index" in src:
+                src_frame_idx = int(np.asarray(src["frame_index"][()]).ravel()[0])
+            if rel:
+                cand = (scan_file.parent / rel).resolve()
+                if cand.exists():
+                    master = cand
+        thumb_ds = fg.get("thumbnail")
+        if thumb_ds is not None:
+            thumb = _dequantize_thumbnail(thumb_ds)
+
+    if master is not None:
+        try:
+            return np.asarray(read_image(master, frame=src_frame_idx), dtype=float)
+        except Exception:
+            logger.debug("get_raw_frame: failed reading master %s frame %d; "
+                         "falling back to thumbnail", master, src_frame_idx,
+                         exc_info=True)
+    if thumb is not None:
+        return thumb
+    raise KeyError(
+        f"frame {frame}: source master file not found/readable and no "
+        f"thumbnail stored in {scan_file}"
+    )
+
+
 def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
     """Return a flat dict of scan-level metadata (no heavy intensity arrays).
 
     Keys: ``frames``, ``n_frames``, ``has_1d``, ``has_2d``, ``q``, ``q_2d``,
     ``chi`` (axes, when present), ``sample_name``, ``energy_keV``,
     ``wavelength_A``, ``ub_matrix`` (or ``None``), ``positioners`` (dict of
-    per-frame motor arrays), and ``reduction`` (provenance dict).
+    per-frame **geometry-motor** arrays only), ``scan_data`` (dict of *all*
+    per-frame columns — motors AND counters), and ``reduction`` (provenance).
+
+    ``positioners`` is intentionally narrow (just the diffractometer motors
+    from the ``sample``/``detector`` positioner groups) so geometry/
+    normalization APIs that consume it stay unambiguous; the complete
+    per-frame metadata table (i0, monitor, temperature, …) is in
+    ``scan_data``.
     """
     # Reuse the canonical metadata-only reader for axes / positioners /
     # provenance, then add the instrument/sample scalars it doesn't carry.
     from ssrl_xrd_tools.io.nexus import (
         read_scan_metadata,
+        _read_positioners,
         _read_energy,
         _read_wavelength,
         _read_ub_matrix,
@@ -251,15 +339,25 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
     )
 
     ds = read_scan_metadata(scan_file, entry=entry)
+    # Full per-frame table: every (frame,) data_var except the derived
+    # geometry rotations (those are computed, not recorded metadata).
     reserved = {"rot1", "rot2", "rot3", "incident_angle"}
-    positioners = {
+    scan_data = {
         name: np.asarray(ds[name].values)
         for name in ds.data_vars
         if name not in reserved and ds[name].dims == ("frame",)
     }
+    # Narrow positioners: ONLY the motors stored in the sample/detector
+    # NXpositioner groups (the diffractometer geometry motors), not the
+    # counters folded into the full scan_data table.
 
     with h5py.File(Path(scan_file), "r") as f:
         e = _entry(f, entry)
+        positioners: dict = {}
+        for path_in in ("sample/positioners",
+                        "instrument/detector/positioners"):
+            if path_in in e:
+                positioners.update(_read_positioners(e[path_in]))
         energy = _read_energy(e)
         meta = {
             "frames": np.asarray(ds["frame"].values) if "frame" in ds.coords else np.array([]),
@@ -279,6 +377,7 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
         if axis in ds.coords:
             meta[axis] = np.asarray(ds[axis].values)
     meta["positioners"] = positioners
+    meta["scan_data"] = scan_data
     meta["reduction"] = ds.attrs.get("reduction", {})
     return meta
 

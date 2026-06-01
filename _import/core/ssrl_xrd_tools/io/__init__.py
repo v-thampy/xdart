@@ -40,6 +40,9 @@ from ssrl_xrd_tools.io.nexus import (
     write_integrated_stack,
     write_nexus,
     write_nexus_frame,
+    write_per_frame_geometry,
+    write_positioners,
+    write_scan_metadata,
     write_stitched,
 )
 from ssrl_xrd_tools.io.read import (
@@ -50,6 +53,7 @@ from ssrl_xrd_tools.io.read import (
     get_2d,
     get_frames,
     get_metadata,
+    get_raw_frame,
     get_thumbnail,
     open_scan,
 )

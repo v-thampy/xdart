@@ -166,6 +166,41 @@ def test_get_metadata(scan_file):
     assert "q" in m and "chi" in m
 
 
+def test_get_metadata_positioners_vs_scan_data_split(tmp_path):
+    """``positioners`` is geometry motors only (from the NXpositioner
+    groups); the full per-frame table (motors + counters like i0) lives in
+    ``scan_data`` — so normalization/geometry consumers of positioners
+    aren't polluted with counters."""
+    import pandas as pd
+    from ssrl_xrd_tools.io import write_scan_metadata, get_metadata
+
+    p = tmp_path / "split.nxs"
+    sd = pd.DataFrame(
+        {"th": [0.1, 0.2, 0.3], "i0": [1e6, 1.1e6, 1.2e6],
+         "mon": [33.0, 34.0, 35.0]},
+        index=[0, 1, 2],
+    )
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
+        g.create_dataset("intensity", data=np.zeros((3, 4)))
+        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4))
+        g.create_dataset("frame_index", data=np.array([0, 1, 2], dtype=np.int64))
+        write_scan_metadata(e, sd, [0, 1, 2])          # full table → /entry/scan_data
+        pg = e.create_group("sample/positioners/th")   # th ALSO a geometry motor
+        pg.attrs["NX_class"] = "NXpositioner"
+        pg.create_dataset("value", data=np.array([0.1, 0.2, 0.3], dtype=np.float32))
+
+    m = get_metadata(p)
+    # positioners: only the geometry motor th, NOT the counters
+    assert set(m["positioners"]) == {"th"}
+    assert "i0" not in m["positioners"] and "mon" not in m["positioners"]
+    # scan_data: the full table including counters
+    assert {"th", "i0", "mon"}.issubset(set(m["scan_data"]))
+    np.testing.assert_allclose(m["scan_data"]["i0"], [1e6, 1.1e6, 1.2e6])
+
+
 def test_mismatched_positioner_length_is_skipped_not_fatal(tmp_path):
     """A per-frame column whose length != frame count (malformed/partial
     file, e.g. 4 integrated frames but 2 'th' positions) must be skipped
@@ -247,3 +282,199 @@ def test_scan_sugar(scan_file):
     np.testing.assert_array_equal(scan.get_1d(1).intensity, ref["intensity_1d"][0])
     assert scan.get_2d(2).intensity.shape == (N_CHI, N_Q)
     assert "LaB6" in repr(scan) or "n_frames=5" in repr(scan)
+
+
+# ---------------------------------------------------------------------------
+# get_raw_frame: resolve raw via source pointer, fall back to thumbnail
+# ---------------------------------------------------------------------------
+
+def test_get_raw_frame_resolves_source_pointer(tmp_path):
+    """A processed file points each frame back to the detector master via
+    ``frames/frame_NNNN/source``; get_raw_frame loads the full-res raw."""
+    from ssrl_xrd_tools.io import get_raw_frame
+
+    # synthetic raw master (.h5) in the same dir, two frames
+    master = tmp_path / "scan_master.h5"
+    raw = np.arange(2 * 8 * 8, dtype=float).reshape(2, 8, 8)
+    with h5py.File(master, "w") as f:
+        f.create_dataset("entry/data/data", data=raw)
+
+    nxs = tmp_path / "scan.nxs"
+    with h5py.File(nxs, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
+        g.create_dataset("intensity", data=np.zeros((1, 5)))
+        g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
+        s = e.create_group("frames/frame_0000/source")
+        s.create_dataset("path", data=np.bytes_(b"scan_master.h5"))
+        s.create_dataset("frame_index", data=1)  # → master frame 1
+
+    img = get_raw_frame(nxs, frame=0)
+    assert img.shape == (8, 8)
+    np.testing.assert_allclose(img, raw[1])
+
+
+def test_get_raw_frame_falls_back_to_thumbnail(tmp_path):
+    """When the source master is missing, get_raw_frame returns the stored
+    thumbnail, dequantized to its original intensity range."""
+    from ssrl_xrd_tools.io import get_raw_frame
+
+    nxs = tmp_path / "scan.nxs"
+    with h5py.File(nxs, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
+        g.create_dataset("intensity", data=np.zeros((1, 5)))
+        g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
+        s = e.create_group("frames/frame_0000/source")
+        s.create_dataset("path", data=np.bytes_(b"does_not_exist.h5"))
+        s.create_dataset("frame_index", data=0)
+        th = e.create_dataset(
+            "frames/frame_0000/thumbnail",
+            data=(np.ones((4, 4)) * 128).astype(np.uint8),
+        )
+        th.attrs["vmin"] = 10.0; th.attrs["vmax"] = 20.0; th.attrs["dtype"] = "uint8"
+
+    img = get_raw_frame(nxs, frame=0)
+    assert img.shape == (4, 4)
+    # 128/255 * (20-10) + 10
+    np.testing.assert_allclose(img, 10.0 + (128 / 255) * 10.0, atol=1e-6)
+
+
+def test_read_image_rejects_processed_file(tmp_path):
+    """read_image must not mis-read a processed scan's integrated_1d as a
+    raw detector image — it raises pointing at get_raw_frame instead."""
+    from ssrl_xrd_tools.io.image import read_image
+
+    nxs = tmp_path / "processed.nxs"
+    with h5py.File(nxs, "w") as f:
+        g = f.create_group("entry/integrated_1d")
+        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
+        g.create_dataset("intensity", data=np.zeros((1, 2000)))  # (1, n_q)
+        g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
+
+    with pytest.raises(ValueError, match="processed xdart"):
+        read_image(nxs, frame=0)
+
+
+# ---------------------------------------------------------------------------
+# write_scan_metadata: full per-frame metadata survives a read-back
+# ---------------------------------------------------------------------------
+
+def test_scan_metadata_full_table_round_trips(tmp_path):
+    """write_scan_metadata persists every column (not just geometry
+    motors), and read_scan surfaces them as per-frame vars — so a reload
+    restores the whole metadata table, not just the incidence motor."""
+    import pandas as pd
+    from ssrl_xrd_tools.io import write_scan_metadata, read_scan, read_scan_metadata
+
+    p = tmp_path / "meta.nxs"
+    sd = pd.DataFrame(
+        {"i0": [1e6, 1.1e6, 1.2e6], "mon": [33.6, 34.1, 35.0],
+         "th": [0.1, 0.15, 0.2], "TEMP": [300.0, 301.0, 302.0]},
+        index=[0, 2, 5],  # gapped labels
+    )
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
+        g.create_dataset("intensity", data=np.zeros((3, 10)))
+        g.create_dataset("q", data=np.linspace(0.5, 5.0, 10))
+        g.create_dataset("frame_index", data=np.array([0, 2, 5], dtype=np.int64))
+        write_scan_metadata(e, sd, [0, 2, 5])
+
+    ds = read_scan(p, groups=("1d",))
+    for col in ("i0", "mon", "th", "TEMP"):
+        assert col in ds.data_vars
+    np.testing.assert_allclose(ds["TEMP"].values, [300.0, 301.0, 302.0])
+    assert list(ds["frame"].values) == [0, 2, 5]
+    # metadata-only reader carries them too
+    assert "mon" in read_scan_metadata(p).data_vars
+
+
+def test_scan_metadata_dedupes_positioners(tmp_path):
+    """When a motor is in both /entry/scan_data and a positioners group,
+    read_scan loads it once (from scan_data) — no duplicate sample_*/th."""
+    import pandas as pd
+    from ssrl_xrd_tools.io import write_scan_metadata, read_scan
+
+    p = tmp_path / "dedup.nxs"
+    sd = pd.DataFrame({"th": [0.1, 0.2], "i0": [1e6, 2e6]}, index=[0, 1])
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
+        g.create_dataset("intensity", data=np.zeros((2, 4)))
+        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4))
+        g.create_dataset("frame_index", data=np.array([0, 1], dtype=np.int64))
+        write_scan_metadata(e, sd, [0, 1])
+        # a positioners group that also carries th (geometry motor)
+        pg = e.create_group("sample/positioners/th")
+        pg.attrs["NX_class"] = "NXpositioner"
+        pg.create_dataset("value", data=np.array([0.1, 0.2], dtype=np.float32))
+
+    ds = read_scan(p, groups=("1d",))
+    assert "th" in ds.data_vars
+    assert "sample_th" not in ds.data_vars   # not duplicated
+
+
+def test_stale_scan_data_column_falls_back_to_positioner(tmp_path):
+    """P2: a scan_data column whose length disagrees with the frame count
+    is rejected on read — a valid same-named NXpositioner must still load
+    (the rejected key shouldn't suppress the positioner fallback)."""
+    import h5py
+    from ssrl_xrd_tools.io import write_scan_metadata, read_scan
+
+    p = tmp_path / "stale.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
+        g.create_dataset("intensity", data=np.zeros((3, 4)))   # 3 frames
+        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4))
+        g.create_dataset("frame_index", data=np.array([0, 1, 2], dtype=np.int64))
+        # scan_data 'th' is STALE — only 2 rows for 3 frames (length mismatch).
+        sd_grp = e.create_group("scan_data")
+        sd_grp.attrs["NX_class"] = "NXcollection"
+        sd_grp.create_dataset("frame_index", data=np.array([0, 1], dtype=np.int64))
+        sd_grp.create_dataset("th", data=np.array([0.1, 0.2], dtype=np.float32))
+        # A valid full-length positioner with the same name.
+        pg = e.create_group("sample/positioners/th")
+        pg.attrs["NX_class"] = "NXpositioner"
+        pg.create_dataset("value",
+                          data=np.array([0.1, 0.2, 0.3], dtype=np.float32))
+
+    ds = read_scan(p, groups=("1d",))
+    # th loaded from the positioner (length 3), not dropped because the
+    # stale scan_data column was skipped.
+    assert "th" in ds.data_vars
+    assert ds["th"].shape == (3,)
+    np.testing.assert_allclose(ds["th"].values, [0.1, 0.2, 0.3])
+
+
+def test_scan_data_aligned_by_label_not_position(tmp_path):
+    """P2: scan_data is attached BY LABEL, not positionally — integrated
+    frames [0, 2] with scan_data stored in a different label order must
+    still get each frame's own metadata, not a positional mismatch."""
+    import h5py
+    from ssrl_xrd_tools.io import read_scan
+
+    p = tmp_path / "reorder.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.attrs["NX_class"] = "NXdata"; g.attrs["signal"] = "intensity"
+        g.create_dataset("intensity", data=np.zeros((2, 4)))
+        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4))
+        g.create_dataset("frame_index", data=np.array([0, 2], dtype=np.int64))
+        # scan_data covers the same labels {0, 2} but stored 2-then-0.
+        sd = e.create_group("scan_data")
+        sd.attrs["NX_class"] = "NXcollection"
+        sd.create_dataset("frame_index", data=np.array([2, 0], dtype=np.int64))
+        sd.create_dataset("th", data=np.array([0.22, 0.00], dtype=np.float32))
+
+    ds = read_scan(p, groups=("1d",))
+    # frame 0 → th 0.00, frame 2 → th 0.22 (aligned by label, not row order)
+    assert list(ds["frame"].values) == [0, 2]
+    np.testing.assert_allclose(ds["th"].values, [0.00, 0.22], atol=1e-6)

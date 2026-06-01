@@ -260,6 +260,25 @@ def test_stitch_images_rejects_count_mismatch():
         stitch_images(imgs, poni, [10.0, 20.0])  # 3 images, 2 angles
 
 
+def test_stitch_images_accepts_single_2d_ndarray(monkeypatch):
+    """A bare (H, W) ndarray is one image, not H images — the count guard
+    must not reject it (P2 regression: len(2D ndarray) == H was wrong)."""
+    import ssrl_xrd_tools.integrate.multi as multi
+
+    monkeypatch.setattr(
+        multi, "create_multigeometry_integrators",
+        lambda poni, rot1_angles, rot2_angles=None: "INTEG",
+    )
+    monkeypatch.setattr(multi, "stitch_1d", lambda images, integ, **kw: "OK")
+
+    # (4, 4) image + a single angle: count must resolve to 1, not 4.
+    assert multi.stitch_images(np.zeros((4, 4)), "PONI", [10.0], mode="1d") == "OK"
+
+    # And a genuine mismatch (1 image, 2 angles) still raises.
+    with pytest.raises(ValueError, match="images != "):
+        multi.stitch_images(np.zeros((4, 4)), "PONI", [10.0, 20.0], mode="1d")
+
+
 def test_prepare_images_rejects_bad_normalization():
     """Zero / non-finite normalization values fail early (no divide-by-zero)."""
     from ssrl_xrd_tools.integrate.multi import _prepare_images

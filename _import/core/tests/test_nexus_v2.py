@@ -347,3 +347,53 @@ def test_read_scan_metadata_surfaces_frame_2d_on_mismatch(tmp_path):
     p2 = tmp_path / "meta_match.nxs"
     _write_1d2d(p2, [0, 1, 2], [0, 1, 2])
     assert "frame_2d" not in read_scan_metadata(p2).coords
+
+
+def test_write_positioners_and_geometry_roundtrip(tmp_path):
+    """ssrl write_positioners + write_per_frame_geometry round-trip through
+    read_scan_metadata, aligned to gapped frame ids."""
+    import pandas as pd
+    from ssrl_xrd_tools.io.nexus import (
+        write_positioners, write_per_frame_geometry, read_scan_metadata,
+    )
+    geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
+    fis = [1, 2, 4]  # gapped + 1-based to exercise reindex/alignment
+    sd = pd.DataFrame({"tth": [10.0, 11.0, 12.0], "th": [0.1, 0.2, 0.3]}, index=fis)
+
+    p = tmp_path / "geom.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g1 = e.create_group("integrated_1d")
+        g1.create_dataset("intensity", data=np.zeros((3, 5), "f4"))
+        g1.create_dataset("q", data=np.linspace(1, 5, 5))
+        g1.create_dataset("frame_index", data=np.asarray(fis, "i4"))
+        write_positioners(e, sd, fis, geom)
+        write_per_frame_geometry(e, sd, fis, geom)
+
+    ds = read_scan_metadata(p)
+    assert list(ds["frame"].values) == fis
+    assert "th" in ds.data_vars
+    np.testing.assert_allclose(ds["th"].values, [0.1, 0.2, 0.3], rtol=1e-5)
+    assert "rot1" in ds.data_vars and ds["rot1"].shape == (3,)
+
+
+def test_write_positioners_reindexes_out_of_order(tmp_path):
+    """scan_data rows in a different order than frame_indices must be aligned,
+    not attached positionally (mirrors the stitch fix)."""
+    import pandas as pd
+    from ssrl_xrd_tools.io.nexus import write_positioners, read_scan_metadata
+    geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
+    fis = [0, 1, 2]
+    # scan_data rows are in REVERSE order vs fis
+    sd = pd.DataFrame({"tth": [12.0, 11.0, 10.0], "th": [0.3, 0.2, 0.1]}, index=[2, 1, 0])
+    p = tmp_path / "ooo.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g1 = e.create_group("integrated_1d")
+        g1.create_dataset("intensity", data=np.zeros((3, 5), "f4"))
+        g1.create_dataset("q", data=np.linspace(1, 5, 5))
+        g1.create_dataset("frame_index", data=np.asarray(fis, "i4"))
+        write_positioners(e, sd, fis, geom)
+    ds = read_scan_metadata(p)
+    # th for frame 0 must be 0.1 (its scan_data row), not 0.3 (positional row 0)
+    np.testing.assert_allclose(ds["th"].values, [0.1, 0.2, 0.3], rtol=1e-5)

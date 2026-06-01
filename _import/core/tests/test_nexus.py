@@ -931,9 +931,13 @@ class TestWriteNexusFrame:
             assert f["entry/integrated_1d/intensity"].shape[0] == 4
 
     def test_appends_in_call_order(self, tmp_path, result_1d):
-        """Stacked write is append-only — frames land in the order written."""
-        q_new = np.linspace(1, 6, 200)
-        r_new = IntegrationResult1D(radial=q_new, intensity=np.full(200, 2.0), unit="q_A^-1")
+        """Stacked write is append-only — frames land in the order written.
+
+        Frames in one scan share the q axis (the second frame reuses
+        ``result_1d.radial``); see ``test_append_rejects_divergent_axis``
+        for the case where it differs."""
+        r_new = IntegrationResult1D(
+            radial=result_1d.radial, intensity=np.full(200, 2.0), unit="q_A^-1")
         p = tmp_path / "live.h5"
         h5 = open_nexus_writer(p)
         try:
@@ -946,6 +950,23 @@ class TestWriteNexusFrame:
             np.testing.assert_allclose(
                 f["entry/integrated_1d/intensity"][1], r_new.intensity, rtol=1e-6,
             )
+
+    def test_append_rejects_divergent_axis(self, tmp_path, result_1d):
+        """Per-frame append (NexusSink path) can't refresh the shared q axis,
+        so a frame whose radial grid/unit differs from disk is rejected
+        rather than stored under the stale axis (silent corruption)."""
+        import pytest
+        p = tmp_path / "live.h5"
+        h5 = open_nexus_writer(p)
+        try:
+            write_nexus_frame(h5, 0, result_1d=result_1d)        # q_A^-1
+            tth = IntegrationResult1D(  # same length, different axis + unit
+                radial=np.linspace(1, 6, 200),
+                intensity=np.full(200, 2.0), unit="2th_deg")
+            with pytest.raises(ValueError, match="axis"):
+                write_nexus_frame(h5, 1, result_1d=tth)
+        finally:
+            h5.close()
 
     def test_frame_with_both_1d_and_2d(self, tmp_path, result_1d, result_2d):
         p = tmp_path / "live.h5"
