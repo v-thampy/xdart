@@ -882,7 +882,7 @@ class imageThread(wranglerThread):
             )
             result = getattr(scratch, 'int_1d', None)
             if result is not None and _freeze_gi_1d_range_from_result(args, result):
-                logger.info(
+                logger.debug(
                     'GI 1D auto radial range frozen from scout frame %s: %s',
                     img_number, args.get('radial_range'),
                 )
@@ -943,7 +943,7 @@ class imageThread(wranglerThread):
             )
             result = getattr(scratch, 'int_2d', None)
             if result is not None and _freeze_gi_2d_ranges_from_result(args, result):
-                logger.info(
+                logger.debug(
                     'GI 2D auto ranges frozen from scout frame %s: %s=%s, %s=%s',
                     img_number, keys[0], args.get(keys[0]),
                     keys[1], args.get(keys[1]),
