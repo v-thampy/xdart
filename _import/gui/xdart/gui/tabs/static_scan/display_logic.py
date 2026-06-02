@@ -360,9 +360,130 @@ def gi_axes_uniform(axes_per_frame, *, rtol=1e-5, atol=1e-8):
     raise NotImplementedError(_STAGE4)
 
 
+_SCAN_MODES = (Mode.INT_1D, Mode.INT_2D)
+_PLOT_PRIMARY_MODES = (Mode.INT_1D, Mode.XYE_VIEWER)  # primary data is 1D
+
+
+def _availability(raw_availability, fid):
+    """Per-frame ``{'has_raw', 'has_thumbnail'}`` lookup, tolerant of int
+    vs label keys and a missing entry."""
+    if not isinstance(raw_availability, dict):
+        return {}
+    entry = raw_availability.get(fid)
+    if entry is None:
+        try:
+            entry = raw_availability.get(int(fid))
+        except (TypeError, ValueError):
+            entry = None
+    return entry or {}
+
+
 def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys,
                           loaded_2d_keys, gi, plot_unit, method, unit_changed,
-                          prev_overlaid_ids, raw_availability, titles):
-    """Compose the above into one :class:`DisplayState`.  THE function the
-    GUI calls."""
-    raise NotImplementedError(_STAGE2)
+                          prev_overlaid_ids, raw_availability, titles,
+                          generation=0, loading=False):
+    """Compose the pure selectors into one immutable :class:`DisplayState`
+    describing exactly what each panel should show.  THE function the GUI
+    calls.  Pure: no Qt, no I/O, no mutation of inputs.
+
+    ``raw_availability`` maps a frame id to ``{'has_raw': bool,
+    'has_thumbnail': bool}``; a special ``'__error__'`` key (mapped to a
+    message) marks a failed load.  ``titles`` maps ``mode.value`` to the
+    title/filename for the current selection.  ``loading`` is True while a
+    load is in flight (lets EMPTY and LOADING be distinguished).
+    """
+    loaded_1d = set(loaded_1d_keys)
+    loaded_2d = set(loaded_2d_keys)
+
+    # Effective selection: scan modes may aggregate the whole scan; viewer
+    # modes never do (their ids are *viewer* ids, not scan frame ids, and
+    # must not consult scan.frames — §8 invariant).
+    if mode in _SCAN_MODES:
+        try:
+            ids, overall = resolve_selection(selected_ids, all_frame_index)
+        except (TypeError, ValueError):
+            ids, overall = (), False
+    else:
+        try:
+            ids = tuple(sorted(int(i) for i in selected_ids))
+        except (TypeError, ValueError):
+            ids = ()
+        overall = False
+
+    render_1d = resolve_render_ids(ids, overall, all_frame_index, loaded_1d)
+    render_2d = resolve_render_ids(ids, overall, all_frame_index, loaded_2d)
+    primary = render_1d if mode in _PLOT_PRIMARY_MODES else render_2d
+
+    x_label, _sym = x_axis_for_unit(plot_unit)
+
+    # Failed load -> ERROR with a message; never a half-populated display
+    # (§8 invariant).  Blank panels + blank title.
+    err = raw_availability.get('__error__') if isinstance(raw_availability, dict) else None
+    if err:
+        load_status = LoadStatus.ERROR
+        error_message = str(err)
+        render_ids = ()
+        title = ''
+    else:
+        error_message = None
+        render_ids = primary
+        if render_ids:
+            load_status = LoadStatus.READY
+        elif loading:
+            load_status = LoadStatus.LOADING
+        else:
+            load_status = LoadStatus.EMPTY
+        # Title is computed *in* the state from the same inputs, so it can
+        # never drift from the payload it describes (§8 invariant).  Only a
+        # READY state carries a title; EMPTY/LOADING/ERROR blank it.
+        title = titles.get(mode.value, '') if load_status is LoadStatus.READY else ''
+
+    ready = load_status is LoadStatus.READY
+
+    # 2D-raw panel: the raw-vs-thumbnail-vs-none decision (mask only on full
+    # raw — §8 invariant).  Overall aggregation prefers thumbnails, matching
+    # update_image's prefer_thumbnail path.
+    if ready and render_2d:
+        avail = _availability(raw_availability, render_2d[0])
+        prefer_thumb = overall and len(render_2d) > 1
+        raw_src = choose_raw_source(
+            bool(avail.get('has_raw')), bool(avail.get('has_thumbnail')),
+            prefer_thumbnail=prefer_thumb, want_raw=True)
+    else:
+        raw_src = RawSource.NONE
+
+    raw_panel = PanelPlan(
+        visible=True, has_data=(raw_src is not RawSource.NONE),
+        source=raw_src, apply_mask=apply_mask_for(raw_src))
+    cake_panel = PanelPlan(visible=True, has_data=ready and bool(render_2d))
+    plot_panel = PanelPlan(visible=True, has_data=ready and bool(render_1d))
+
+    if mode is Mode.IMAGE_VIEWER:
+        panels = ((PanelRole.RAW_2D, raw_panel),)
+    elif mode is Mode.XYE_VIEWER:
+        panels = ((PanelRole.PLOT_1D, plot_panel),)
+    else:  # INT_1D / INT_2D: raw + cake + 1D plot
+        panels = (
+            (PanelRole.RAW_2D, raw_panel),
+            (PanelRole.CAKE_2D, cake_panel),
+            (PanelRole.PLOT_1D, plot_panel),
+        )
+
+    return DisplayState(
+        mode=mode,
+        load_status=load_status,
+        error_message=error_message,
+        generation=generation,
+        selected_ids=tuple(ids),
+        render_ids=tuple(render_ids),
+        overall=overall,
+        gi=bool(gi),
+        x_unit=plot_unit,
+        x_label=x_label,
+        method=method,
+        overlay=OverlayAction.REPLACE,   # plan_overlay wiring lands in Stage 4
+        overlaid_ids=tuple(prev_overlaid_ids or ()),
+        title=title,
+        panels=panels,
+        results=None,
+    )

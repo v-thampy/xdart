@@ -402,6 +402,83 @@ def test_clear_display_state_resets_visible_and_cached_state():
     np.testing.assert_array_equal(wf_widget.images[-1], np.zeros((2, 2)))
 
 
+def test_display_generation_bumps_on_mode_switch_and_selection():
+    # Stage 2: the monotonic display generation must advance on a mode
+    # switch (the exact case that caused stale renders) and on a selection
+    # change, but not when nothing changed.
+    from unittest.mock import MagicMock
+
+    host = SimpleNamespace(
+        viewer_mode=None,
+        display_generation=0,
+        _last_selection_sig=None,
+        idxs=[],
+        overall=False,
+        _viewer_x_axis_label=None,
+        ui=MagicMock(),
+        _showImageBtn=MagicMock(),
+    )
+    host.clear_display_state = MagicMock()
+    host._set_2d_controls_visible = MagicMock()
+    host._bump_display_generation = MethodType(
+        displayFrameWidget._bump_display_generation, host)
+    host._note_selection_generation = MethodType(
+        displayFrameWidget._note_selection_generation, host)
+    host.set_viewer_display_mode = MethodType(
+        displayFrameWidget.set_viewer_display_mode, host)
+
+    # Mode switch bumps; re-selecting the same mode does not.
+    host.set_viewer_display_mode('image')
+    assert host.display_generation == 1
+    host.set_viewer_display_mode('image')
+    assert host.display_generation == 1
+    host.set_viewer_display_mode('xye')
+    assert host.display_generation == 2
+
+    # Selection: first call records the baseline (no bump), then changes bump.
+    host._note_selection_generation()
+    assert host.display_generation == 2
+    host.idxs = [0, 1]
+    host._note_selection_generation()
+    assert host.display_generation == 3
+    host._note_selection_generation()          # unchanged
+    assert host.display_generation == 3
+
+
+def test_shadow_display_state_check_agrees_and_never_raises(caplog):
+    # Stage 2 shadow mode: building a DisplayState from live inputs must
+    # agree with the existing render path's idxs and never raise into the
+    # session.  (Evidence for "no shadow assert fires" during use.)
+    import logging
+
+    host = SimpleNamespace(
+        viewer_mode=None,
+        display_generation=3,
+        frame_ids=['0', '1'],
+        idxs=[0, 1], idxs_1d=[0, 1], idxs_2d=[0, 1],
+        overall=True,
+        overlaid_idxs=[],
+        data_1d={0: object(), 1: object()},
+        data_2d={
+            0: {'map_raw': np.ones((2, 2)), 'thumbnail': None},
+            1: {'map_raw': np.ones((2, 2)), 'thumbnail': None},
+        },
+        data_lock=RLock(),
+        scan=SimpleNamespace(scan_lock=RLock(),
+                             frames=SimpleNamespace(index=[0, 1]), gi=False),
+        ui=SimpleNamespace(plotMethod=SimpleNamespace(currentText=lambda: 'Single')),
+    )
+    host._shadow_mode = MethodType(displayFrameWidget._shadow_mode, host)
+    host._shadow_check_display_state = MethodType(
+        displayFrameWidget._shadow_check_display_state, host)
+
+    logger_name = 'xdart.gui.tabs.static_scan.display_frame_widget'
+    with caplog.at_level(logging.DEBUG, logger=logger_name):
+        host._shadow_check_display_state()       # must not raise
+
+    assert not any('shadow: render_ids' in r.getMessage() for r in caplog.records)
+
+
 def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     worker = _FakeWorker()
     timer = _FakeTimer(active=True)

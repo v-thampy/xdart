@@ -48,7 +48,10 @@ from .display_constants import (
 )
 from .display_data import DisplayDataMixin
 from .display_plot import DisplayPlotMixin
-from .display_logic import resolve_selection, resolve_render_ids
+from .display_logic import (
+    Mode, LoadStatus, compute_display_state,
+    resolve_selection, resolve_render_ids,
+)
 
 QFileDialog = QtWidgets.QFileDialog
 QInputDialog = QtWidgets.QInputDialog
@@ -251,6 +254,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.idxs_1d = []
         self.idxs_2d = []
         self.overall = False
+
+        # Stage 2: monotonic display generation.  Bumped on the events that
+        # must invalidate a stale render — mode switch, new selection, new
+        # scan/file load — so a worker result computed against an old
+        # generation can be dropped (full enforcement lands in Stage 5).
+        self.display_generation = 0
+        self._last_selection_sig = None
+
         self.get_idxs()
 
         # Plotting variables
@@ -423,6 +434,99 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.idxs_1d = list(resolve_render_ids(ids, False, (), data_1d_keys))
         self.idxs_2d = list(resolve_render_ids(ids, False, (), data_2d_keys))
 
+    # ── Display generation (Stage 2) ──────────────────────────────────
+
+    def _bump_display_generation(self):
+        """Advance the monotonic display generation.  A render/worker result
+        stamped with an older generation is stale and may be dropped (full
+        enforcement: Stage 5)."""
+        self.display_generation += 1
+        return self.display_generation
+
+    def _note_selection_generation(self):
+        """Bump the generation when the *effective* selection changes.
+
+        Keyed on the resolved ``idxs`` (+ overall), so it is robust to how
+        ``frame_ids`` was mutated (assignment, ``.clear()``, ``.append()``).
+        A new scan/file load resets the selection, so this also covers most
+        load events; explicit load-lifecycle bumps land with the
+        controllers in Stage 5.  The first call only records the baseline."""
+        sig = (tuple(self.idxs), bool(self.overall))
+        if sig != self._last_selection_sig:
+            if self._last_selection_sig is not None:
+                self._bump_display_generation()
+            self._last_selection_sig = sig
+
+    def _shadow_mode(self):
+        """Map the widget's viewer state to a :class:`Mode` for the shadow
+        check.  Normal mode is represented as INT_1D (the 1D plot is the
+        primary panel; render_ids then compares against idxs_1d)."""
+        if self.viewer_mode == 'image':
+            return Mode.IMAGE_VIEWER
+        if self.viewer_mode == 'xye':
+            return Mode.XYE_VIEWER
+        return Mode.INT_1D
+
+    def _shadow_check_display_state(self):
+        """Stage 2 shadow mode: build a :class:`DisplayState` from the live
+        widget inputs and confirm its decisions match what the existing
+        render path computed (the *corrected* intended behaviour).  Nothing
+        is rendered from it here — Stage 3 renders from the state.
+
+        Debug-only and crash-proof: it runs only when DEBUG logging is on
+        and never raises into a user session (a mismatch or any error is
+        logged, not thrown).  These asserts are temporary — Stage 3
+        replaces the old path with ``render(state, build_payload(...))``."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        try:
+            mode = self._shadow_mode()
+            # Viewer-mode states must not depend on scan.frames (§8); only
+            # scan modes consult the scan frame index.
+            if mode in (Mode.INT_1D, Mode.INT_2D):
+                with self.scan.scan_lock:
+                    all_index = list(np.asarray(self.scan.frames.index, dtype=int))
+                gi = bool(getattr(self.scan, 'gi', False))
+            else:
+                all_index = []
+                gi = False
+            with self.data_lock:
+                loaded_1d = set(self.data_1d.keys())
+                loaded_2d = set(self.data_2d.keys())
+                raw_avail = {
+                    int(k): {
+                        'has_raw': v.get('map_raw') is not None,
+                        'has_thumbnail': v.get('thumbnail') is not None,
+                    }
+                    for k, v in self.data_2d.items()
+                    if isinstance(v, dict)
+                }
+            state = compute_display_state(
+                mode=mode,
+                selected_ids=list(self.frame_ids),
+                all_frame_index=all_index,
+                loaded_1d_keys=loaded_1d,
+                loaded_2d_keys=loaded_2d,
+                gi=gi,
+                plot_unit='q_A^-1',          # affects only x_label, not render_ids
+                method=self.ui.plotMethod.currentText(),
+                unit_changed=False,
+                prev_overlaid_ids=tuple(self.overlaid_idxs),
+                raw_availability=raw_avail,
+                titles={},
+                generation=self.display_generation,
+            )
+            expected = (sorted(self.idxs_2d)
+                        if mode in (Mode.INT_2D, Mode.IMAGE_VIEWER)
+                        else sorted(self.idxs_1d))
+            if list(state.render_ids) != expected:
+                logger.debug(
+                    "shadow: render_ids %s != live idxs %s (mode=%s, status=%s)",
+                    state.render_ids, expected, mode, state.load_status,
+                )
+        except Exception:
+            logger.debug("shadow display-state check failed", exc_info=True)
+
     def update_plot_range(self):
         if self.ui.slice.isChecked():
             self.update_plot()
@@ -453,6 +557,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """Updates image and plot frames based on toolbar options
         """
         self.get_idxs()
+        self._note_selection_generation()   # Stage 2: bump on selection change
+        self._shadow_check_display_state()   # Stage 2: shadow (debug-only, no render)
 
         if not self._updated():
             return True
@@ -1066,6 +1172,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                   'xye'   — show only the 1D plot panel,
                   None    — restore normal layout.
         """
+        # Stage 2: a mode switch must invalidate any stale render computed
+        # for the previous mode (the exact failure this guards against).
+        if mode != self.viewer_mode:
+            self._bump_display_generation()
         self.viewer_mode = mode
         self._viewer_x_axis_label = None
         is_viewer = mode in ('image', 'xye')

@@ -201,6 +201,67 @@ def test_image_viewer_does_not_depend_on_scan_frames():
     assert state.panel(dl.PanelRole.RAW_2D).has_data is True
 
 
+def test_load_status_transitions():
+    # EMPTY: nothing selected.
+    empty = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_1D, selected_ids=(), loaded_1d_keys=set()))
+    assert empty.load_status is dl.LoadStatus.EMPTY
+    # LOADING: selected, nothing loaded yet, a load is in flight.
+    loading = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_1D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys=set(), loading=True))
+    assert loading.load_status is dl.LoadStatus.LOADING
+    # READY: selected frame is loaded.
+    ready = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_1D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys={0}))
+    assert ready.load_status is dl.LoadStatus.READY
+    # ERROR: load failed -> message, no partial display.
+    error = dl.compute_display_state(**_base_state_kwargs(
+        raw_availability={'__error__': 'kaboom'}))
+    assert error.load_status is dl.LoadStatus.ERROR
+    assert error.error_message == 'kaboom'
+
+
+def test_compute_stamps_generation():
+    # The state carries the generation it was computed against (Stage 2
+    # plumbing for dropping stale worker results in Stage 5).
+    state = dl.compute_display_state(**_base_state_kwargs(generation=7))
+    assert state.generation == 7
+
+
+def test_render_ids_intersect_loaded_in_state():
+    # render_ids = (overall ? all : selected) ∩ loaded keys, in-state.
+    state = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_1D, selected_ids=(0, 1, 2), all_frame_index=[0, 1, 2],
+        loaded_1d_keys={0, 2}))
+    assert state.render_ids == (0, 2)
+    assert state.overall is True   # all 3 of 3 frames selected
+
+
+def test_compute_display_state_is_deterministic_and_frozen():
+    kw = _base_state_kwargs(mode=dl.Mode.INT_1D, selected_ids=(0,),
+                            loaded_1d_keys={0})
+    a = dl.compute_display_state(**kw)
+    b = dl.compute_display_state(**kw)
+    assert a == b                              # same inputs ⇒ same state
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        a.title = 'mutated'                    # frozen: cannot mutate
+
+
+def test_title_blank_unless_ready():
+    # §8: a title is only ever set together with a valid (READY) payload.
+    empty = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.IMAGE_VIEWER, selected_ids=(), loaded_2d_keys=set(),
+        titles={'image_viewer': 'frame_0007.tif'}))
+    assert empty.load_status is dl.LoadStatus.EMPTY
+    assert empty.title == ''                   # no stale/early title
+    err = dl.compute_display_state(**_base_state_kwargs(
+        raw_availability={'__error__': 'x'},
+        titles={'int_1d': 'should_not_show'}))
+    assert err.title == ''
+
+
 # ── §10 seams: the contract surface is open to future modules ─────────
 
 def _make_display_state(**over):
