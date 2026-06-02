@@ -48,6 +48,7 @@ from .display_constants import (
 )
 from .display_data import DisplayDataMixin
 from .display_plot import DisplayPlotMixin
+from .display_logic import resolve_selection, resolve_render_ids
 
 QFileDialog = QtWidgets.QFileDialog
 QInputDialog = QtWidgets.QInputDialog
@@ -403,24 +404,24 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         with self.data_lock:
             with self.scan.scan_lock:
-                if len(self.frame_ids) == len(self.scan.frames.index) > 1:
-                    self.overall = True
-                    self.idxs = sorted(np.asarray(self.scan.frames.index, dtype=int))
-                else:
-                    self.overall = False
-                    self.idxs = sorted(self.frame_ids)
+                # Stage 1: selection logic is the pure ``resolve_selection``
+                # / ``resolve_render_ids`` (unit-tested headlessly).
+                try:
+                    ids, self.overall = resolve_selection(
+                        self.frame_ids, self.scan.frames.index)
+                except ValueError:
+                    return
 
-            try:
-                self.idxs = list(np.asarray(self.idxs, dtype=int))
-            except ValueError:
-                return
+            self.idxs = list(ids)
             # Snapshot current dict keys while the lock is held, then release
             # before doing list-comprehension work.
             data_1d_keys = set(self.data_1d.keys())
             data_2d_keys = set(self.data_2d.keys())
 
-        self.idxs_1d = [int(idx) for idx in self.idxs if idx in data_1d_keys]
-        self.idxs_2d = [int(idx) for idx in self.idxs if idx in data_2d_keys]
+        # ``ids`` is already the effective set (all-or-selected), so intersect
+        # it directly with the loaded keys for each panel.
+        self.idxs_1d = list(resolve_render_ids(ids, False, (), data_1d_keys))
+        self.idxs_2d = list(resolve_render_ids(ids, False, (), data_2d_keys))
 
     def update_plot_range(self):
         if self.ui.slice.isChecked():

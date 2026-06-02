@@ -31,6 +31,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+import numpy as np  # allowed: the purity guard forbids only Qt/pyqtgraph/h5py/pyFAI/fabio
+
 __all__ = [
     "Mode",
     "RawSource",
@@ -127,11 +129,10 @@ class DisplayPayload:
 
 # ── Pure functions (§5 of the plan) ───────────────────────────────────
 #
-# Stage 0: stubs only.  Bodies move here from the widget in Stage 1+.
-# They are declared now so the test file (the behaviour contract) can
-# import and call them; they raise until the owning stage implements them.
+# Stage 1 selectors are implemented below and called from the widget.
+# Functions owned by later stages still raise NotImplementedError so the
+# behaviour-contract tests stay red until their stage lands.
 
-_STAGE1 = "implemented in Stage 1 of the display refactor"
 _STAGE2 = "implemented in Stage 2 of the display refactor"
 _STAGE4 = "implemented in Stage 4 of the display refactor"
 
@@ -139,33 +140,74 @@ _STAGE4 = "implemented in Stage 4 of the display refactor"
 def resolve_selection(frame_ids, all_frame_index):
     """Return ``(sorted_ids, overall)``.  ``overall`` is True iff every
     scan frame is selected and there is more than one.  Replaces the body
-    of ``displayFrameWidget.get_idxs``."""
-    raise NotImplementedError(_STAGE1)
+    of ``displayFrameWidget.get_idxs``.
+
+    Ids are cast to ``int`` and sorted *numerically* (the old code sorted
+    the raw labels before casting, which mis-ordered string ids like
+    ``'10'`` < ``'2'``).  Raises ``ValueError`` if a label is not an int,
+    matching the old ``np.asarray(..., dtype=int)`` contract so callers
+    can bail out cleanly.
+    """
+    n_all = len(all_frame_index)
+    overall = (len(frame_ids) == n_all) and (n_all > 1)
+    base = all_frame_index if overall else frame_ids
+    ids = tuple(sorted(int(i) for i in base))
+    return ids, overall
 
 
 def resolve_render_ids(selected_ids, overall, all_frame_index, loaded_keys):
     """Frames we can actually draw = ``(overall ? all : selected) ∩ loaded_keys``,
-    sorted."""
-    raise NotImplementedError(_STAGE1)
+    sorted numerically."""
+    base = all_frame_index if overall else selected_ids
+    loaded = set(loaded_keys)
+    return tuple(sorted(i for i in (int(x) for x in base) if i in loaded))
 
 
 def choose_raw_source(has_raw, has_thumbnail, *, prefer_thumbnail, want_raw):
     """The map_raw vs thumbnail vs none decision currently inside
-    ``get_frames_map_raw``."""
-    raise NotImplementedError(_STAGE1)
+    ``get_frames_map_raw``.
+
+    Priority: an explicit thumbnail preference wins when a thumbnail
+    exists; otherwise full raw (when wanted and present); otherwise a
+    thumbnail; otherwise nothing.
+    """
+    if prefer_thumbnail and has_thumbnail:
+        return RawSource.THUMBNAIL
+    if want_raw and has_raw:
+        return RawSource.RAW
+    if has_thumbnail:
+        return RawSource.THUMBNAIL
+    return RawSource.NONE
 
 
 def apply_mask_for(source):
     """True only for :attr:`RawSource.RAW` — detector/flat masks are
-    applied to full-resolution raw arrays only, never to thumbnails."""
-    raise NotImplementedError(_STAGE1)
+    applied to full-resolution raw arrays only, never to thumbnails
+    (their mask is already baked in) and never to an absent panel."""
+    return source is RawSource.RAW
+
+
+# Canonical-unit → (axis label, unit symbol) table.  The Unicode glyphs
+# mirror ``display_constants`` (AA_inv / Th / Chi / Deg); they are inlined
+# here rather than imported because ``display_constants`` pulls in pyFAI
+# (via ``integrator``), which would break this module's purity guarantee.
+_AA_INV = u'\u212B\u207B\u00B9'  # Angstrom^-1 (matches display_constants.AA_inv)
+_TH = u'\u03B8'                     # theta (display_constants.Th)
+_CHI = u'\u03C7'                    # chi (display_constants.Chi)
+_DEG = u'\u00B0'                    # degree (display_constants.Deg)
+
+_X_AXIS_TABLE = {
+    'q_A^-1': ('Q', _AA_INV),
+    '2th_deg': (f"2{_TH}", _DEG),
+    'chi_deg': (_CHI, _DEG),
+}
 
 
 def x_axis_for_unit(unit):
     """``(label, unit_symbol)`` for a plot/integration unit.  One table,
-    used by both normal mode and the XYE viewer.  ``'unknown'`` →
-    ``('x', '')`` — never an assumed 2θ."""
-    raise NotImplementedError(_STAGE1)
+    used by both normal mode and the XYE viewer.  ``'unknown'`` (and any
+    unrecognised unit) → ``('x', '')`` — never an assumed 2θ."""
+    return _X_AXIS_TABLE.get(unit, ('x', ''))
 
 
 def xye_unit_from_filename(name):
@@ -187,9 +229,25 @@ def plan_overlay(method, unit_changed, has_existing, new_ids, prev_overlaid_ids)
 
 
 def sentinel_mask(arr):
-    """Return ``arr`` with NaN where values are non-finite or hit the
-    uint32 dead/hot-pixel sentinel (e.g. 4294967295 from Eiger)."""
-    raise NotImplementedError(_STAGE1)
+    """Return a float copy of ``arr`` with detector sentinels masked to NaN.
+
+    Masks non-finite values and the uint32 dead/hot-pixel ceiling
+    (4294967295, e.g. from Eiger masters).  Some 16-bit readers preserve
+    invalid pixels at the uint16 ceiling (65535); when enough pixels sit
+    exactly there, that ceiling is treated as a display sentinel too, so
+    autoscale uses the real image range instead of rendering nearly black.
+    """
+    a = np.asarray(arr, dtype=float)
+    bad = ~np.isfinite(a) | (a >= 4294967295.0)
+    if a.size and np.isfinite(a).any():
+        finite = np.isfinite(a)
+        sentinel16 = finite & (a == 65535.0)
+        if sentinel16.any() and sentinel16.sum() / a.size > 1e-4:
+            bad |= sentinel16
+    if bad.any():
+        a = a.copy()
+        a[bad] = np.nan
+    return a
 
 
 def gi_axes_uniform(axes_per_frame, *, rtol=1e-5, atol=1e-8):
