@@ -80,7 +80,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     attributes:
         curve1: pyqtgraph pen, overall data line
-        curve2: pyqtgraph pen, individual arch data line
+        curve2: pyqtgraph pen, individual frame data line
         histogram: pyqtgraph HistogramLUTWidget, used for adjusting min
             and max level for image
         image: pyqtgraph ImageItem, displays the 2D data
@@ -93,25 +93,25 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         plot_layout: QVBoxLayout, for holding the 1D plotting widgets
         plot_win: pyqtgraph GraphicsLayoutWidget, layout for the 1D
             data
-        sphere: LiveScan, unused.
-        arch: LiveFrame, currently loaded arch object
-        arch_ids: List of LiveFrame indices currently loaded
-        arches: Dictionary of currently loaded LiveFrames
+        scan: LiveScan, unused.
+        frame: LiveFrame, currently loaded frame object
+        frame_ids: List of LiveFrame indices currently loaded
+        frames: Dictionary of currently loaded LiveFrames
         data_1d: Dictionary object holding all 1D data in memory
         data_2d: Dictionary object holding all 2D data in memory
         ui: Ui_Form from qtdesigner
 
     methods:
-        get_arches_map_raw: Gets averaged 2D raw data from arches
-        get_sphere_map_raw: Gets averaged (and normalized) 2D raw data for all images
-        get_arches_int_2d: Gets averaged 2D rebinned data from arches
-        get_sphere_int_2d: Gets overall 2D data for the sphere
+        get_frames_map_raw: Gets averaged 2D raw data from frames
+        get_scan_map_raw: Gets averaged (and normalized) 2D raw data for all images
+        get_frames_int_2d: Gets averaged 2D rebinned data from frames
+        get_scan_int_2d: Gets overall 2D data for the scan
         update: Updates the displayed image and plot
         update_image: Updates image data based on selections
         update_plot: Updates plot data based on selections
     """
 
-    def __init__(self, sphere, arch, arch_ids, arches, data_1d, data_2d,
+    def __init__(self, scan, frame, frame_ids, frames, data_1d, data_2d,
                  parent=None, data_lock=None):
         super().__init__(parent)
         self.ui = Ui_Form()
@@ -119,15 +119,100 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Shared reentrant lock guarding data_1d / data_2d.  When created
         # standalone (tests, viewer mode) fall back to a private lock.
         self.data_lock = data_lock if data_lock is not None else threading.RLock()
-        self._init_data_objects(sphere, arch, arch_ids, arches, data_1d, data_2d)
+        self._init_data_objects(scan, frame, frame_ids, frames, data_1d, data_2d)
         self._init_display_panes()
         self._init_plot_panes()
         self._connect_signals()
         self._init_controls()
+        self._reflow_controls()
+        self._set_tooltips()
 
     # ── Initialization helpers ─────────────────────────────────────
 
-    def _init_data_objects(self, sphere, arch, arch_ids, arches, data_1d, data_2d):
+    def _set_tooltips(self):
+        """Hover tooltips for the display-frame controls (PySide6 setToolTip)."""
+        tips = {
+            'normChannel': 'Normalize intensity by this monitor/counter channel.',
+            'setBkg': 'Use the current frame(s) as a background to subtract.',
+            'scale': 'Intensity scale: Linear / Log / Sqrt.',
+            'cmap': 'Colormap for the 2D images.',
+            'imageUnit': '2D cake radial axis: Q-χ or 2θ-χ.',
+            'shareAxis': "Lock the 1D plot x-axis to the 2D cake's x-axis.",
+            'plotUnit': '1D plot x-axis (Q, 2θ, or χ from the 2D cake).',
+            'plotMethod': 'Combine frames: Single / Overlay / Waterfall / '
+                          'Sum / Average.',
+            'slice': 'Restrict the 1D pattern to a χ range (needs 2D data).',
+            'slice_center': 'Center of the χ slice (degrees).',
+            'slice_width': 'Width of the χ slice (degrees).',
+            'wf_options': 'Waterfall / Overlay / Legend options.',
+            'clear_1D': 'Clear accumulated overlay/waterfall curves.',
+        }
+        for name, tip in tips.items():
+            w = getattr(self.ui, name, None)
+            if w is not None:
+                w.setToolTip(tip)
+        if getattr(self, '_showImageBtn', None) is not None:
+            self._showImageBtn.setToolTip(
+                'Show the raw detector image for the selected frame.')
+
+    def _reflow_controls(self):
+        """Consolidate the 1D plot controls into the middle bar
+        (``imageToolbar``, which sits between the 2D cake and the 1D plot)
+        and collapse the now-empty bottom bar so the 1D plot gets that
+        height back.
+
+        Left→right the middle bar becomes: the 1D controls grouped by
+        function (unit + X-Range, then Single/Overlay + Options, then
+        Legend + Clear), a stretch, then the 2D-only controls (Share Axis,
+        2D unit) at the far right under the cake.  The Offset control folds
+        into the Options popup, so it leaves the bar entirely.
+
+        Per-mode show/hide of the 2D-only controls + slice is handled by
+        :meth:`_set_2d_controls_visible`.
+        """
+        mid = self.ui.horizontalLayout_2     # imageToolbar (middle bar)
+        bot = self.ui.horizontalLayout       # plotToolBar (bottom, emptied)
+
+        # Detach whatever is currently in the middle bar (imageUnit,
+        # shareAxis, spacers) so we can re-add in the new order.
+        while mid.count():
+            mid.takeAt(0)
+
+        # Offset + Legend fold into the Options popup — pull them out of
+        # the toolbar (they get re-parented into the dialog when it's built).
+        for w in (self.ui.yOffsetLabel, self.ui.yOffset, self.ui.showLegend):
+            bot.removeWidget(w)
+            w.setParent(None)
+
+        # Move the remaining 1D controls out of the bottom bar.
+        ones = (self.ui.plotUnit, self.ui.slice, self.ui.slice_center,
+                self.ui.slice_width, self.ui.plotMethod, self.ui.wf_options,
+                self.ui.clear_1D)
+        for w in ones:
+            bot.removeWidget(w)
+
+        # Rebuild the middle bar: 1D controls, stretch, then 2D controls.
+        for w in ones:
+            mid.addWidget(w)
+        mid.addStretch(1)
+        mid.addWidget(self.ui.shareAxis)
+        mid.addWidget(self.ui.imageUnit)
+
+        # The bottom bar is empty now — collapse it so the 1D plot grows.
+        self.ui.plotToolBar.setMaximumHeight(0)
+        self.ui.plotToolBar.setMinimumHeight(0)
+        self.ui.plotToolBar.setVisible(False)
+
+    def _set_2d_controls_visible(self, visible: bool):
+        """Show/hide the controls that only make sense with 2D data:
+        the Share Axis + 2D-unit buttons and the X-Range slice trio
+        (the slice is computed from the 2D cake).  The plain 1D controls
+        (unit, Single/Overlay, Options, Legend, Clear) stay visible."""
+        for w in (self.ui.shareAxis, self.ui.imageUnit, self.ui.slice,
+                  self.ui.slice_center, self.ui.slice_width):
+            w.setVisible(visible)
+
+    def _init_data_objects(self, scan, frame, frame_ids, frames, data_1d, data_2d):
         """Initialize data references, plotting state, and index tracking."""
         self.ui.slice.setText(Chi)
 
@@ -140,14 +225,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.scale = self.ui.scale.currentText()
         self.wf_yaxis = 'Frame #'
         self.wf_start = 0
+        self.wf_stop = None  # None → slice through the last frame
         self.wf_step = 1
 
         # Data object references
-        self.sphere = sphere
-        self.arch = arch
-        self.arch_ids = arch_ids
-        self.arches = arches
-        self.arch_names = []
+        self.scan = scan
+        self.frame = frame
+        self.frame_ids = frame_ids
+        self.frames = frames
+        self.frame_names = []
+        self.overlaid_idxs = []
         self.data_1d = data_1d
         self.data_2d = data_2d
         self.bkg_1d = 0.
@@ -158,7 +245,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.viewer_mode = None
         self._wrangler = None
 
-        # Arch index tracking
+        # Frame index tracking
         self.idxs = []
         self.idxs_1d = []
         self.idxs_2d = []
@@ -240,8 +327,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.setBkg.clicked.connect(self.setBkg)
         self.ui.scale.currentIndexChanged.connect(self.update_views)
         self.ui.cmap.currentIndexChanged.connect(self.update_views)
-        self.ui.shareAxis.stateChanged.connect(self.update)
-        self.ui.update2D.stateChanged.connect(self.enable_2D_buttons)
+        # shareAxis / showLegend / slice are checkable QPushButtons now —
+        # use ``toggled`` (bool) rather than the QCheckBox-only stateChanged.
+        self.ui.shareAxis.toggled.connect(self.update)
+        # On *unchecking* Share Axis, release the x-link and rescale the 1D
+        # plot to its own data (update() relinks/unlinks but leaves the
+        # range frozen at the cake's).  Connected after update so the unlink
+        # has already happened.
+        self.ui.shareAxis.toggled.connect(self._on_share_axis_toggled)
 
         # 2D image controls
         self.ui.imageUnit.activated.connect(self.update_binned)
@@ -252,17 +345,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.yOffset.valueChanged.connect(self.update_plot_view)
         self.ui.plotUnit.activated.connect(self._on_plotUnit_changed)
         self.ui.plotUnit.activated.connect(self.update_plot)
-        self.ui.showLegend.stateChanged.connect(self.update_legend)
-        self.ui.slice.stateChanged.connect(self.update_plot)
-        self.ui.slice.stateChanged.connect(self._update_slice_range)
+        self.ui.showLegend.toggled.connect(self.update_legend)
+        self.ui.slice.toggled.connect(self._sync_slice_controls)
+        self.ui.slice.toggled.connect(self.update_plot)
+        self.ui.slice.toggled.connect(self._update_slice_range)
         self.ui.slice_center.valueChanged.connect(self.update_plot_range)
         self.ui.slice_width.valueChanged.connect(self.update_plot_range)
         self.ui.wf_options.clicked.connect(self.popup_wf_options)
 
-        # Action buttons
+        # Action buttons.  (The in-panel Save buttons were removed — use
+        # pyqtgraph's right-click Export, or File ▸ Export.  The
+        # save_image / save_1D methods are still wired to those menu
+        # actions in static_scan_widget.)
         self.ui.clear_1D.clicked.connect(self.clear_1D)
-        self.ui.save_2D.clicked.connect(self.save_image)
-        self.ui.save_1D.clicked.connect(self.save_1D)
 
     def _init_controls(self):
         """Initialize image units, waterfall options, and preview button."""
@@ -273,6 +368,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.wf_dialog = QDialog()
         self.wf_yaxis_widget = QCombo()
         self.wf_start_widget = QtWidgets.QDoubleSpinBox()
+        self.wf_stop_widget = QtWidgets.QDoubleSpinBox()
         self.wf_step_widget = QtWidgets.QDoubleSpinBox()
         self.wf_accept_button = QtWidgets.QPushButton('Okay')
         self.wf_cancel_button = QtWidgets.QPushButton('Cancel')
@@ -295,24 +391,24 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # ── Index management ──────────────────────────────────────────
 
     def get_idxs(self):
-        """ Return selected arch indices.
+        """ Return selected frame indices.
 
         Thread-safety: snapshots of data_1d / data_2d keys are taken under
         ``data_lock`` to avoid racing with integrator / file-handler worker
         threads that mutate these dicts concurrently.
         """
         self.idxs, self.idxs_1d, self.idxs_2d = [], [], []
-        if len(self.arch_ids) == 0 or self.arch_ids[0] == 'No data':
+        if len(self.frame_ids) == 0 or self.frame_ids[0] == 'No data':
             return
 
         with self.data_lock:
-            with self.sphere.sphere_lock:
-                if len(self.arch_ids) == len(self.sphere.arches.index) > 1:
+            with self.scan.scan_lock:
+                if len(self.frame_ids) == len(self.scan.frames.index) > 1:
                     self.overall = True
-                    self.idxs = sorted(np.asarray(self.sphere.arches.index, dtype=int))
+                    self.idxs = sorted(np.asarray(self.scan.frames.index, dtype=int))
                 else:
                     self.overall = False
-                    self.idxs = sorted(self.arch_ids)
+                    self.idxs = sorted(self.frame_ids)
 
             try:
                 self.idxs = list(np.asarray(self.idxs, dtype=int))
@@ -335,9 +431,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _updated(self):
         """Check if there is data to update
         """
-        # In viewer mode, bypass the sphere.name check — no HDF5 scan is loaded
+        # In viewer mode, bypass the scan.name check — no HDF5 scan is loaded
         if self.viewer_mode is not None:
-            if len(self.arch_ids) == 0:
+            if len(self.frame_ids) == 0:
                 return False
             if self.viewer_mode == 'image' and len(self.data_2d) == 0:
                 return False
@@ -345,7 +441,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 return False
             return True
 
-        if (len(self.arch_ids) == 0) or (self.sphere.name == 'null_main'):
+        if (len(self.frame_ids) == 0) or (self.scan.name == 'null_main'):
             return False
         if (len(self.data_1d) == 0) or (len(self.idxs_1d) == 0):
             return False
@@ -390,19 +486,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         except TypeError:
             return False
 
-        if self.ui.update2D.isChecked():
-            try:
-                self.update_image()
-            except TypeError:
-                return False
-            try:
-                self.update_binned()
-            except TypeError:
-                return False
+        # 2D always updates now (the old "Update 2D" perf toggle is gone —
+        # 1D-only modes hide the 2D panel via _apply_1d_only_visibility, and
+        # the try/except guards a missing-2D-data frame).
+        try:
+            self.update_image()
+        except TypeError:
+            return False
+        try:
+            self.update_binned()
+        except TypeError:
+            return False
 
         # Apply label to 2D view
-        if self.ui.update2D.isChecked():
-            self.update_2d_label()
+        self.update_2d_label()
 
         # Update the image preview popup if it is open
         self._update_image_preview()
@@ -424,16 +521,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.update_image_view()
             return
 
-        if self.ui.update2D.isChecked():
-            self.update_image_view()
-            self.update_binned_view()
-            self.update_2d_label()
+        self.update_image_view()
+        self.update_binned_view()
+        self.update_2d_label()
         self.update_plot_view()
 
     # ── 1D-only visibility ────────────────────────────────────────
 
     def _apply_1d_only_visibility(self):
-        """Show or hide 2D panes based on sphere.skip_2d.
+        """Show or hide 2D panes based on scan.skip_2d.
 
         In 1D-only mode (skip_2d), collapse the 2D image panels and
         image toolbar while keeping the top toolbar (Norm Channel, Scale,
@@ -443,24 +539,22 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # In viewer mode, set_viewer_display_mode() controls panels
         if self.viewer_mode is not None:
             return
-        skip = getattr(self.sphere, 'skip_2d', False)
+        skip = getattr(self.scan, 'skip_2d', False)
         if skip:
-            # Hide 2D panels and image toolbar, keep frame_top visible
+            # Hide the 2D image but KEEP the middle control bar
+            # (imageToolbar) — it now holds the 1D plot controls.  Shrink
+            # imageWindow to the title + control bar (frame_top 35 +
+            # imageToolbar 40).
             self.ui.twoDWindow.setMaximumHeight(0)
             self.ui.twoDWindow.setMinimumHeight(0)
-            self.ui.imageToolbar.setMaximumHeight(0)
-            self.ui.imageToolbar.setMinimumHeight(0)
-            # Shrink imageWindow to just the top toolbar height
-            self.ui.imageWindow.setMinimumHeight(35)
-            self.ui.imageWindow.setMaximumHeight(35)
-            self.ui.update2D.setChecked(False)
-            self.ui.update2D.setEnabled(False)
+            self.ui.imageToolbar.setMinimumHeight(40)
+            self.ui.imageToolbar.setMaximumHeight(40)
+            self.ui.imageWindow.setMinimumHeight(80)
+            self.ui.imageWindow.setMaximumHeight(85)
+            # 2D-only controls (Share Axis, 2D unit, X-Range slice) off.
             if self.ui.slice.isChecked():
                 self.ui.slice.setChecked(False)
-            self.ui.slice.setEnabled(False)
-            self.ui.slice_center.setEnabled(False)
-            self.ui.slice_width.setEnabled(False)
-            self.ui.imageUnit.setEnabled(False)
+            self._set_2d_controls_visible(False)
 
             # Show the raw image preview button in 1D-only mode
             self._showImageBtn.setVisible(True)
@@ -479,16 +573,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.plotUnit.blockSignals(False)
             self._was_skip_2d = True
         else:
-            # Restore 2D panels and image toolbar
+            # Restore the 2D image + all controls.
             self.ui.twoDWindow.setMinimumHeight(0)
             self.ui.twoDWindow.setMaximumHeight(16777215)
             self.ui.imageToolbar.setMinimumHeight(40)
             self.ui.imageToolbar.setMaximumHeight(40)
             self.ui.imageWindow.setMinimumHeight(200)
             self.ui.imageWindow.setMaximumHeight(16777215)
-            self.ui.update2D.setEnabled(True)
-            self.ui.update2D.setChecked(True)
-            self.ui.imageUnit.setEnabled(True)
+            self._set_2d_controls_visible(True)
             # Hide the raw image preview button in 2D modes
             self._showImageBtn.setVisible(False)
             # Only rebuild plotUnit when transitioning from 1D-only mode,
@@ -523,10 +615,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.plotUnit.clear()
         self.ui.imageUnit.clear()
         self._plot_axis_info = []
+        target_plot_idx = 0
 
-        if self.sphere.gi:
-            gi_mode_1d = self.sphere.bai_1d_args.get('gi_mode_1d', 'q_total')
-            gi_mode_2d = self.sphere.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+        if self.scan.gi:
+            gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
+            gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
             idx_1d = GI_MODES_1D.index(gi_mode_1d) if gi_mode_1d in GI_MODES_1D else 0
             idx_2d = GI_MODES_2D.index(gi_mode_2d) if gi_mode_2d in GI_MODES_2D else 0
 
@@ -581,6 +674,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.imageUnit.addItem(_translate("Form", gi_imageUnits[idx_2d]))
             self.ui.plotUnit.setEnabled(True)
             self.ui.imageUnit.setEnabled(False)
+            unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
+            if gi_mode_1d == 'q_total' and '2th' in unit_1d:
+                target_plot_idx = 1
         else:
             # Standard mode: Q, 2θ from 1D but can also slice via 2D chi;
             # χ purely from 2D
@@ -603,7 +699,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self.ui.imageUnit.addItem(_translate("Form", label))
             self.ui.plotUnit.setEnabled(True)
             self.ui.imageUnit.setEnabled(True)
+            unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
+            if '2th' in unit_1d:
+                target_plot_idx = 1
 
+        if self.ui.plotUnit.count() > 0:
+            self.ui.plotUnit.setCurrentIndex(
+                min(target_plot_idx, self.ui.plotUnit.count() - 1)
+            )
         self.ui.plotUnit.blockSignals(False)
         self.ui.imageUnit.blockSignals(False)
 
@@ -623,26 +726,58 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return
 
         info = self._plot_axis_info[idx]
-        skip_2d = getattr(self.sphere, 'skip_2d', False)
+        skip_2d = getattr(self.scan, 'skip_2d', False)
         # Slicing requires 2D data and the axis must come from 2D
         can_slice = (not skip_2d) and info['source'] in ('2d', '1d_2d')
 
-        # Enable/disable slice UI
+        # The X Range button is available when slicing is possible; the
+        # center/width spinboxes are only live once X Range is *checked*.
         self.ui.slice.setEnabled(can_slice)
-        self.ui.slice_center.setEnabled(can_slice)
-        self.ui.slice_width.setEnabled(can_slice)
         if not can_slice:
             self.ui.slice.setChecked(False)
             self.clear_slice_overlay()
+        self._sync_slice_controls()
+
+        # Share Axis only makes sense when the 1D plot and the 2D cake can
+        # be on the SAME x-axis — i.e. the 1D plotUnit is the radial axis
+        # (Q or 2θ), which the cake also uses for its x.  When the 1D plot
+        # is on χ (the cake's azimuthal/y axis) there's nothing to share,
+        # so disable it.  Also disabled in 1D-only mode (no 2D cake).
+        can_share = (not skip_2d) and (
+            info.get('axis') == 'radial' or info['source'] == '1d_2d'
+        )
+        was_checked = self.ui.shareAxis.isChecked()
+        self.ui.shareAxis.setEnabled(can_share)
+        if not can_share and was_checked:
+            # Auto-disabling Share Axis (e.g. switched 1D to χ): unchecking
+            # emits ``toggled`` → update() (unlinks the axes) +
+            # _on_share_axis_toggled() (rescales the 1D plot to its data).
+            self.ui.shareAxis.setChecked(False)
+
+    def _sync_slice_controls(self, _=None):
+        """Enable the slice center/width spinboxes only while the X Range
+        button is both available and checked."""
+        active = self.ui.slice.isEnabled() and self.ui.slice.isChecked()
+        self.ui.slice_center.setEnabled(active)
+        self.ui.slice_width.setEnabled(active)
+
+    def _on_share_axis_toggled(self, checked):
+        """Rescale the 1D plot to its own data when Share Axis is turned off.
+
+        While shared, the 1D plot's x-axis is XLinked to the 2D cake; the
+        ``update`` slot calls ``setXLink(None)`` on uncheck but pyqtgraph
+        leaves the view frozen at the cake's range, so the user sees a
+        stuck axis.  Re-enable autoRange so it fits the 1D curve."""
+        if not checked:
+            try:
+                self.plot.enableAutoRange()
+                self.plot.autoRange()
+            except Exception:
+                logger.debug("1D autoscale on Share Axis off failed",
+                             exc_info=True)
 
         # Update slice range label
         self._set_slice_range()
-
-    def enable_2D_buttons(self):
-        """Placeholder: disable 2D-related buttons when update2D is unchecked.
-
-        Currently a no-op; 2D button visibility is managed elsewhere.
-        """
 
     # ── 2D image rendering ────────────────────────────────────────
 
@@ -655,19 +790,24 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         would not match the thumbnail's smaller shape.
         """
         mask = None
-        if self.overall and len(self.arch_ids) > 1:
-            # G2: aggregate via per-arch dict instead of the deleted
-            # sphere.overall_raw accumulator.  Stays correct after v2
+        if self.overall and len(self.frame_ids) > 1:
+            # G2: aggregate via per-frame dict instead of the deleted
+            # scan.overall_raw accumulator.  Stays correct after v2
             # reload (the accumulator didn't), and after replace-frames
             # reintegration (the accumulator drifted).
-            data = self.get_arches_map_raw(
-                list(self.sphere.arches.index),
+            data, raw_source = self.get_frames_map_raw(
+                list(self.scan.frames.index),
+                prefer_thumbnail=True,
+                return_source=True,
+                require_all=True,
             )
             if data is None:
+                self.clear_image_view()
                 return
         else:
-            data = self.get_arches_map_raw()
+            data, raw_source = self.get_frames_map_raw(return_source=True)
             if data is None:
+                self.clear_image_view()
                 return
 
             # Apply Mask — O8: snapshot under data_lock so a
@@ -677,20 +817,36 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # None for an evicted key; falling back to None mask is
             # the same as having no mask, so render continues.
             with self.data_lock:
-                arch_2d = self.data_2d.get(self.idxs_2d[0])
-            mask = arch_2d['mask'] if arch_2d is not None else None
+                frame_2d = self.data_2d.get(self.idxs_2d[0])
+            mask = frame_2d['mask'] if frame_2d is not None else None
         data = np.asarray(data, dtype=float)
 
-        # Apply detector + global mask.
-        global_mask = self.sphere.global_mask if self.sphere.global_mask is not None else []
-        mask = mask if mask is not None else []
-        mask = np.asarray(np.unique(np.append(mask, global_mask)), dtype=int)
-        if len(mask) > 0 and mask.max() < data.size:
-            mask = np.unravel_index(mask, data.shape)
-            data[mask] = np.nan
+        # Apply detector + global mask only to full-resolution raw data.
+        # Thumbnails already bake the mask into the preview before
+        # downsampling; flat detector indices point at unrelated pixels there.
+        if raw_source == 'raw':
+            global_mask = (
+                self.scan.global_mask if self.scan.global_mask is not None else []
+            )
+            mask = mask if mask is not None else []
+            mask = np.asarray(np.unique(np.append(mask, global_mask)), dtype=int)
+            if len(mask) > 0 and mask.max() < data.size:
+                mask = np.unravel_index(mask, data.shape)
+                data[mask] = np.nan
 
         # Subtract background
-        data -= self.bkg_map_raw
+        bkg = np.asarray(self.bkg_map_raw)
+        if bkg.shape == () or bkg.shape == data.shape:
+            data -= self.bkg_map_raw
+        else:
+            logger.debug(
+                "Skipping raw-image background with shape %s for display shape %s",
+                bkg.shape, data.shape,
+            )
+
+        if data.size == 0 or not np.isfinite(data).any():
+            self.clear_image_view()
+            return
 
         data = data.T[:, ::-1]
 
@@ -722,20 +878,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
             self.update_plot_view()
 
-        # Always aggregate from per-arch data_2d.  Pre-G2 there was a
-        # fall-through to get_sphere_int_2d() (now deleted — it read
-        # the in-memory sphere.bai_2d accumulator that didn't survive
-        # v2 reload).  If selecting "Overall" with the current
-        # idxs_2d cache empty / partial, widen the aggregation
-        # across the full arches.index so we don't render a partial
-        # average.
-        intensity, xdata, ydata = self.get_arches_int_2d()
-        if intensity is None and self.overall and len(self.arch_ids) > 1:
-            intensity, xdata, ydata = self.get_arches_int_2d(
-                list(self.sphere.arches.index),
+        # Always aggregate from per-frame data_2d.  In Overall mode require
+        # every frame's 2D row to be present; otherwise a bounded cache would
+        # quietly average only the rows that happen to be loaded.
+        if self.overall and len(self.frame_ids) > 1:
+            intensity, xdata, ydata = self.get_frames_int_2d(
+                list(self.scan.frames.index), require_all=True,
             )
+        else:
+            intensity, xdata, ydata = self.get_frames_int_2d()
 
         if intensity is None:
+            self.clear_binned_view()
             return
 
         # Subtract background
@@ -756,8 +910,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.binned_widget.setRect(rect)
 
         imageUnit = self.ui.imageUnit.currentIndex()
-        if self.sphere.gi:
-            gi_mode_2d = self.sphere.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+        if self.scan.gi:
+            gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
             gi_idx = GI_MODES_2D.index(gi_mode_2d) if gi_mode_2d in GI_MODES_2D else 0
             _xl2 = gi_x_labels_2D[gi_idx]
             _xu2 = gi_x_units_2D[gi_idx]
@@ -778,45 +932,46 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """Updates 2D Label
         """
         # Sets title text
-        label = self.sphere.name
+        label = self.scan.name
         if len(label) > 40:
             label = f'{label[:10]}.....{label[-30:]}'
 
-        if (self.overall or self.sphere.single_img) and (len(self.arch_ids) > 1):
+        if (self.overall or self.scan.single_img) and (len(self.frame_ids) > 1):
             self.ui.labelCurrent.setText(label)
-        elif self.sphere.series_average:
+        elif self.scan.series_average:
             self.ui.labelCurrent.setText(label)
-        elif len(self.arch_ids) > 1:
+        elif len(self.frame_ids) > 1:
             self.ui.labelCurrent.setText(f'{label} [Average]')
         else:
-            self.ui.labelCurrent.setText(f'{label}_{self.arch_ids[0]}')
+            self.ui.labelCurrent.setText(f'{label}_{self.frame_ids[0]}')
 
     # ── Normalization / background handlers ───────────────────────
 
     def normUpdate(self):
         """Update plots if norm channel exists"""
         self.normChannel = self.get_normChannel()
-        if self.normChannel and (self.sphere.scan_data[self.normChannel].sum() == 0.):
+        if self.normChannel and (self.scan.scan_data[self.normChannel].sum() == 0.):
             self.normChannel = None
         # Clear stale plot_data so update_plot() rebuilds all overlay curves
         self.plot_data = [np.zeros(0), np.zeros(0)]
-        self.arch_names = []
+        self.frame_names = []
+        self.overlaid_idxs = []
         self.update()
 
     def setBkg(self):
         """Sets selected points as background.
         If background is already selected, it unsets it"""
-        if (len(self.arch_ids) == 0) or (len(self.idxs) == 0):
+        if (len(self.frame_ids) == 0) or (len(self.idxs) == 0):
             return
 
         if self.ui.setBkg.text() == 'Set Bkg':
-            idxs = self.arch_ids
+            idxs = self.frame_ids
             if self.overall:
-                idxs = sorted(list(self.sphere.arches.index))
+                idxs = sorted(list(self.scan.frames.index))
 
-            self.bkg_1d, _ = self.get_arches_int_1d(idxs, rv='average')
-            self.bkg_2d, _, _ = self.get_arches_int_2d(idxs)
-            self.bkg_map_raw = self.get_arches_map_raw(idxs)
+            self.bkg_1d, _ = self.get_frames_int_1d(idxs, rv='average')
+            self.bkg_2d, _, _ = self.get_frames_int_2d(idxs)
+            self.bkg_map_raw = self.get_frames_map_raw(idxs)
             if self.bkg_map_raw is None:
                 # F5: be honest about a no-op 2D background.  Pre-F5
                 # this silently set bkg=0.: 1D/2D bkg subtraction
@@ -827,7 +982,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 # subtract in the 2D map view; log it.
                 logger.warning(
                     "setBkg: no raw image data available for selected "
-                    "arches; 2D background subtraction inactive "
+                    "frames; 2D background subtraction inactive "
                     "(1D / int_2d background still applied).  This "
                     "usually means the .nxs was reloaded without "
                     "access to the original source files."
@@ -845,6 +1000,63 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     # ── Viewer modes ──────────────────────────────────────────────
 
+    def clear_overlay(self):
+        """Drop accumulated overlay curves + names."""
+        self.plot_data = [np.zeros(0), np.zeros(0)]
+        self.plot_data_range = [[0, 0], [0, 0]]
+        self.frame_names = []
+        self.overlaid_idxs = []
+
+    # ── Panel clears (safety net for empty selections) ────────────
+    # When a render path has no data for the current selection it must
+    # blank its panel instead of returning early and leaving the last
+    # frame on screen — otherwise a mode switch or an unhydrated frame
+    # shows a stale image/cake/curve that looks like real data.
+
+    def clear_image_view(self):
+        """Blank the raw 2D image panel."""
+        try:
+            blank = np.zeros((2, 2))
+            rect = get_rect(np.arange(2), np.arange(2))
+            self.image_data = (blank, rect)
+            self.image_widget.setImage(blank)
+            self.image_widget.setRect(rect)
+        except Exception:
+            logger.debug("clear_image_view failed", exc_info=True)
+
+    def clear_binned_view(self):
+        """Blank the 2D cake panel."""
+        try:
+            blank = np.zeros((2, 2))
+            rect = get_rect(np.arange(2), np.arange(2))
+            self.binned_data = (blank, rect)
+            self.binned_widget.setImage(blank)
+            self.binned_widget.setRect(rect)
+        except Exception:
+            logger.debug("clear_binned_view failed", exc_info=True)
+
+    def clear_plot_view(self):
+        """Remove all 1D curves and reset cached plot state."""
+        try:
+            self.clear_overlay()
+            for curve in self.curves:
+                curve.clear()
+            self.curves.clear()
+            if getattr(self, 'legend', None) is not None:
+                self.legend.clear()
+            if getattr(self, 'wf_widget', None) is not None:
+                self.wf_widget.setImage(np.zeros((2, 2)))
+        except Exception:
+            logger.debug("clear_plot_view failed", exc_info=True)
+
+    def clear_display_state(self, title=None):
+        """Blank all rendered panels and cached display data."""
+        self.clear_image_view()
+        self.clear_binned_view()
+        self.clear_plot_view()
+        if title is not None:
+            self.ui.labelCurrent.setText(title)
+
     def set_viewer_display_mode(self, mode):
         """Configure display panels for viewer modes.
 
@@ -854,8 +1066,30 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                   None    — restore normal layout.
         """
         self.viewer_mode = mode
+        self._viewer_x_axis_label = None
+        is_viewer = mode in ('image', 'xye')
         if mode == 'image':
-            # Show 2D image panel, collapse 1D plot panel
+            title = 'Image Viewer'
+        elif mode == 'xye':
+            title = 'XYE Viewer'
+        else:
+            title = ''
+        # A mode transition must not carry the previous mode's visible
+        # image/curve or cached overlay data into the new one.
+        self.clear_display_state(title)
+        # In a viewer the top bar carries only the filename label (frame_5):
+        # the norm/bkg controls (frame_4) and scale/cmap (frame_6) are
+        # process-mode concerns.  The bottom toolbar is permanently
+        # collapsed (its controls moved to the middle bar in _reflow).
+        self.ui.frame_4.setVisible(not is_viewer)
+        self.ui.frame_6.setVisible(not is_viewer)
+        self.ui.plotToolBar.setVisible(False)
+
+        if mode == 'image':
+            # Top bar (filename only) + raw image; no controls, collapse 1D.
+            self.ui.frame_top.setVisible(True)
+            self.ui.twoDWindow.setVisible(True)
+            self.ui.imageToolbar.setVisible(False)
             self.ui.imageWindow.setMinimumHeight(200)
             self.ui.imageWindow.setMaximumHeight(16777215)
             self.ui.plotWindow.setMinimumHeight(0)
@@ -863,44 +1097,25 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # Hide binned frame — only raw image relevant
             self.ui.binnedFrame.setMaximumWidth(0)
             self.ui.binnedFrame.setMinimumWidth(0)
-
-            # Disable all controls not relevant in image viewer mode
-            self.ui.normChannel.setEnabled(False)
-            self.ui.setBkg.setEnabled(False)
-            self.ui.update2D.setChecked(False)
-            self.ui.update2D.setEnabled(False)
-            self.ui.shareAxis.setEnabled(False)
-            self.ui.imageUnit.setEnabled(False)
-            self.ui.slice.setEnabled(False)
             self._showImageBtn.setVisible(False)
-
-            # Keep these active: scale (Linear/Log), cmap, save_2D
-            self.ui.scale.setEnabled(True)
-            self.ui.cmap.setEnabled(True)
-            self.ui.save_2D.setEnabled(True)
         elif mode == 'xye':
-            # Collapse 2D image panel, show 1D plot panel
-            self.ui.imageWindow.setMinimumHeight(0)
-            self.ui.imageWindow.setMaximumHeight(0)
+            # 1D overlay view: hide the 2D image but KEEP the middle control
+            # bar (Single/Options/Legend/Clear are useful for overlays).
+            # The XYE file owns its x-axis, so hide the transform combo.
+            self.ui.frame_top.setVisible(True)
+            self.ui.twoDWindow.setVisible(False)
+            self.ui.imageToolbar.setVisible(True)
+            self.ui.plotUnit.setVisible(False)
+            self._set_2d_controls_visible(False)
+            self.ui.imageWindow.setMinimumHeight(80)
+            self.ui.imageWindow.setMaximumHeight(85)
             self.ui.plotWindow.setMinimumHeight(200)
             self.ui.plotWindow.setMaximumHeight(16777215)
-            self.ui.update2D.setChecked(False)
-            self.ui.update2D.setEnabled(False)
-            # Disable controls not applicable to raw XYE data
-            self.ui.slice.setEnabled(False)
-            self.ui.slice_center.setEnabled(False)
-            self.ui.slice_width.setEnabled(False)
-            self.ui.plotUnit.setEnabled(False)
-            self.ui.shareAxis.setEnabled(False)
-            # Keep plot method, legend, clear, save functional
-            self.ui.plotMethod.setEnabled(True)
-            self.ui.yOffset.setEnabled(True)
-            self.ui.showLegend.setEnabled(True)
-            self.ui.clear_1D.setEnabled(True)
-            self.ui.save_1D.setEnabled(True)
-            self.ui.wf_options.setEnabled(True)
         else:
-            # Normal mode — restore both panels
+            # Normal mode — restore panels + the middle control bar.
+            self.ui.frame_top.setVisible(True)
+            self.ui.twoDWindow.setVisible(True)
+            self.ui.imageToolbar.setVisible(True)
             self.ui.imageWindow.setMinimumHeight(200)
             self.ui.imageWindow.setMaximumHeight(16777215)
             self.ui.plotWindow.setMinimumHeight(200)
@@ -911,52 +1126,62 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # Re-enable all controls
             self.ui.normChannel.setEnabled(True)
             self.ui.setBkg.setEnabled(True)
-            self.ui.update2D.setEnabled(True)
-            self.ui.update2D.setChecked(True)
             self.ui.shareAxis.setEnabled(True)
             self.ui.imageUnit.setEnabled(True)
             self.ui.scale.setEnabled(True)
             self.ui.cmap.setEnabled(True)
-            self.ui.save_2D.setEnabled(True)
+            self.ui.plotUnit.setVisible(True)
             self.ui.plotUnit.setEnabled(True)
             self.ui.plotMethod.setEnabled(True)
             # Slice enable/disable depends on which axis is selected
             self._on_plotUnit_changed()
             self.ui.showLegend.setEnabled(True)
             self.ui.clear_1D.setEnabled(True)
-            self.ui.save_1D.setEnabled(True)
+            # Re-apply 2D-control visibility for the current processing
+            # mode (Int 1D hides the 2D controls + slice; Int 2D shows all).
+            self._apply_1d_only_visibility()
 
     def _update_xye_viewer(self):
-        """Render 1D line data in XYE viewer mode (no sphere/integration).
+        """Render 1D line data in XYE viewer mode (no scan/integration).
 
-        Builds plot_data and arch_names from the loaded XYE data,
+        Builds plot_data and frame_names from the loaded XYE data,
         then delegates to the standard update_plot_view() so that
         Single/Overlay/Waterfall/Sum/Average all work.
         """
         if len(self.idxs_1d) == 0:
+            self.clear_plot_view()
             return
 
-        # Determine axis label from first arch
-        first_arch = self.data_1d[self.idxs_1d[0]]
-        unit = getattr(first_arch.int_1d, 'unit', '2th_deg')
-        if 'q' in unit.lower():
-            xlabel = u'Q (\u212b\u207b\u00b9)'
+        # Title bar: the xye filename(s) — same convention as the image viewer.
+        self._set_viewer_title(self.idxs_1d)
+
+        # Determine axis label from first frame
+        first_frame = self.data_1d[self.idxs_1d[0]]
+        unit = str(getattr(first_frame.int_1d, 'unit', 'unknown')).lower()
+        if unit.startswith('q') or unit in ('q_a^-1', 'q_a-1'):
+            # Label is the quantity only; pyqtgraph appends ``units`` as
+            # "(\u00c5\u207b\u00b9)".  Embedding it here too rendered "Q (\u00c5\u207b\u00b9) (\u00c5\u207b\u00b9)".
+            xlabel = u'Q'
             xunits = u'\u212b\u207b\u00b9'
-        else:
+        elif '2th' in unit or '2theta' in unit:
             xlabel = u'2\u03b8'
             xunits = u'\u00b0'
+        else:
+            xlabel = 'x'
+            xunits = ''
+        self._viewer_x_axis_label = (xlabel, xunits)
 
         # Build xdata and ydata arrays from all selected indices.
-        ref_x = np.asarray(first_arch.int_1d.radial, dtype=float)
-        arch_names = []
+        ref_x = np.asarray(first_frame.int_1d.radial, dtype=float)
+        frame_names = []
         rows = []
         for idx in self.idxs_1d:
-            arch = self.data_1d[idx]
-            int_1d = arch.int_1d
+            frame = self.data_1d[idx]
+            int_1d = frame.int_1d
             if int_1d is None:
                 continue
-            fname = arch.scan_info.get('source_file', f'xye_{idx}')
-            arch_names.append(os.path.basename(fname))
+            fname = frame.scan_info.get('source_file', f'xye_{idx}')
+            frame_names.append(os.path.basename(fname))
             xdata = np.asarray(int_1d.radial, dtype=float)
             ydata = np.asarray(int_1d.intensity, dtype=float)
             if xdata.shape != ref_x.shape or not np.allclose(xdata, ref_x):
@@ -964,6 +1189,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             rows.append(ydata)
 
         if not rows:
+            self.clear_plot_view()
             return
 
         xdata = ref_x
@@ -974,14 +1200,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if current_method in ('Overlay', 'Waterfall') and \
                 len(self.plot_data[0]) > 0 and \
                 self.plot_data[0].shape == xdata.shape:
-            for name, row in zip(arch_names, ydata):
-                if name not in self.arch_names:
+            for name, row in zip(frame_names, ydata):
+                if name not in self.frame_names:
                     self.plot_data[1] = np.vstack(
                         (self.plot_data[1], row[np.newaxis, :]))
-                    self.arch_names.append(name)
+                    self.frame_names.append(name)
         else:
             self.plot_data = [xdata, ydata]
-            self.arch_names = list(arch_names)
+            self.frame_names = list(frame_names)
 
         xdata, ydata = self.plot_data
         self.plot_data_range = [
@@ -997,14 +1223,34 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _update_image_viewer(self):
         """Render raw image data in viewer mode with optional mask/threshold."""
         if len(self.idxs_2d) == 0:
+            self.clear_image_view()
             return
         # O8: snapshot under data_lock so a concurrent writer can't
         # evict the key between the lookup and the read.
         with self.data_lock:
-            arch_2d = self.data_2d.get(self.idxs_2d[0])
-        if arch_2d is None:
+            frame_2d = self.data_2d.get(self.idxs_2d[0])
+        if frame_2d is None:
+            self.clear_image_view()
             return
-        data = np.asarray(arch_2d['map_raw'], dtype=float)
+        # The detector array may not be hydrated yet (the loader publishes a
+        # thumbnail-backed preview first, then the full frame), or it may have
+        # been evicted from the bounded raw cache.  Fall back to the stored
+        # thumbnail rather than crashing on ``np.asarray(None)`` (blank panel).
+        raw = frame_2d.get('map_raw')
+        if raw is None:
+            raw = frame_2d.get('thumbnail')
+        if raw is None:
+            self.clear_image_view()
+            return
+        data = self._sanitize_display_image(raw)
+
+        # Dead/hot-pixel sentinels (e.g. uint32 max 4294967295 from Eiger
+        # masters) blow out the autoscale and render the frame blank/dark.
+        # Mask them to NaN so the real dynamic range drives the colormap.
+        if data.size == 0 or not np.isfinite(data).any():
+            self._set_viewer_title(self.idxs_2d)
+            self.clear_image_view()
+            return
 
         # Apply threshold from wrangler if enabled
         w = self._wrangler
@@ -1027,10 +1273,55 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 except Exception:
                     logger.debug("Failed to load or apply mask file %s", mask_file, exc_info=True)
 
+        if data.size == 0 or not np.isfinite(data).any():
+            self._set_viewer_title(self.idxs_2d)
+            self.clear_image_view()
+            return
+
         data = data.T[:, ::-1]
         rect = get_rect(np.arange(data.shape[0]), np.arange(data.shape[1]))
         self.image_data = (data, rect)
+        self._set_viewer_title(self.idxs_2d)
         self.update_image_view()
+
+    @staticmethod
+    def _truncate_name(name, limit=100, head=48, tail=48):
+        """Middle-ellipsis only very long filenames.  With the viewer top
+        bar trimmed to just the label there's room for the full name, so the
+        limit is generous (100 chars); longer names show the first ``head``
+        and last ``tail`` characters with ``...`` between."""
+        if name and len(name) > limit:
+            return f'{name[:head]}...{name[-tail:]}'
+        return name
+
+    def _set_viewer_title(self, idxs):
+        """Set the title label in viewer modes from the selected frame's
+        source file: plain filename for single-image formats (tiff/raw/xye),
+        ``Filename #N`` for multi-image HDF5/NeXus files.  ``idxs`` is the
+        list of selected frame keys; extra selections (XYE overlay) add a
+        ``(+k more)`` suffix."""
+        idxs = list(idxs) if idxs else []
+        if not idxs:
+            self.ui.labelCurrent.setText('Image Viewer')
+            return
+        idx0 = idxs[0]
+        src = ''
+        with self.data_lock:
+            d1 = self.data_1d.get(idx0)
+        if d1 is not None:
+            info = getattr(d1, 'scan_info', None) or {}
+            src = info.get('source_file', '') or ''
+        name = os.path.basename(src) if src else ''
+        ext = os.path.splitext(name)[1].lower()
+        if not name:
+            title = 'Viewer'
+        elif ext in ('.h5', '.hdf5', '.nxs'):
+            title = f'{self._truncate_name(name)} #{idx0}'
+        else:
+            title = self._truncate_name(name)
+        if len(idxs) > 1:
+            title += f'  (+{len(idxs) - 1} more)'
+        self.ui.labelCurrent.setText(title)
 
     # ── Image preview dialog ──────────────────────────────────────
 
@@ -1084,9 +1375,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         # Try to get thumbnail from loaded 1D data
         thumb = None
-        arch = self.data_1d.get(int(idx))
-        if arch is not None:
-            thumb = getattr(arch, 'thumbnail', None)
+        frame = self.data_1d.get(int(idx))
+        if frame is not None:
+            thumb = getattr(frame, 'thumbnail', None)
 
         # Fall back to 2D data dict
         if thumb is None and int(idx) in self.data_2d:

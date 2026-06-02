@@ -69,17 +69,21 @@ class Ui_Form(object):
             "Image Viewer",
             "XYE Viewer",
         ])
+        # The dropdown popup's current-item check column is removed
+        # globally in the dark theme (QComboBox QAbstractItemView::indicator)
+        # so the chosen option shows by highlight only — frees the space the
+        # checkmark was clipping the longer mode names with.
         self.commandLayout.addWidget(self.processingModeCombo)
 
-        self.liveCheckBox = QCheckBox(self.commandFrame)
-        self.liveCheckBox.setObjectName(u"liveCheckBox")
-        self.liveCheckBox.setText(u"Live")
-        self.commandLayout.addWidget(self.liveCheckBox)
-
-        self.batchCheckBox = QCheckBox(self.commandFrame)
+        # NOTE: the Live button now lives in the Start/Stop frame below
+        # (it's a start/stop toggle for live acquisition).  Batch stays
+        # here as a mode toggle.
+        self.batchCheckBox = QPushButton(self.commandFrame)
         self.batchCheckBox.setObjectName(u"batchCheckBox")
         self.batchCheckBox.setText(u"Batch")
+        self.batchCheckBox.setCheckable(True)
         self.batchCheckBox.setChecked(True)
+        self.batchCheckBox.setMaximumSize(QSize(70, 16777215))
         self.commandLayout.addWidget(self.batchCheckBox)
 
         self.coresLabel = QLabel(self.commandFrame)
@@ -87,6 +91,8 @@ class Ui_Form(object):
         self.commandLayout.addWidget(self.coresLabel)
         self.maxCoresSpinBox = QSpinBox(self.commandFrame)
         self.maxCoresSpinBox.setObjectName(u"maxCoresSpinBox")
+        # Half-width — the value is at most a 2-digit core count.
+        self.maxCoresSpinBox.setMaximumSize(QSize(55, 16777215))
         _cpu = _os.cpu_count() or 4
         self.maxCoresSpinBox.setMinimum(1)
         self.maxCoresSpinBox.setMaximum(_cpu)
@@ -106,6 +112,16 @@ class Ui_Form(object):
         self.horizontalLayout = QHBoxLayout(self.frame)
         self.horizontalLayout.setObjectName(u"horizontalLayout")
         self.horizontalLayout.setContentsMargins(0, 0, 0, 0)
+        # Live: a start/stop toggle for live acquisition, sitting with the
+        # Start/Stop buttons.  Checkable so it highlights while a live run
+        # is active (start/stop wiring + state sync live in image_wrangler).
+        self.liveCheckBox = QPushButton(self.frame)
+        self.liveCheckBox.setObjectName(u"liveCheckBox")
+        self.liveCheckBox.setText(u"Live")
+        self.liveCheckBox.setCheckable(True)
+        self.liveCheckBox.setFocusPolicy(Qt.ClickFocus)
+        self.liveCheckBox.setMaximumSize(QSize(140, 16777215))
+        self.horizontalLayout.addWidget(self.liveCheckBox)
         self.startButton = QPushButton(self.frame)
         self.startButton.setObjectName(u"startButton")
         self.startButton.setFocusPolicy(Qt.ClickFocus)

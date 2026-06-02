@@ -25,7 +25,7 @@ from ssrl_xrd_tools.io.metadata import read_image_metadata
 # in sync with what ``read_image_metadata`` will actually look for.
 from ssrl_xrd_tools.io.metadata import _extract_scan_info
 from .wrangler_widget import wranglerWidget
-from .spec_wrangler_thread import specThread, _get_scan_info  # noqa: F401
+from .image_wrangler_thread import imageThread, _get_scan_info  # noqa: F401
 from .ui.specUI import Ui_Form
 from ....gui_utils import NamedActionParameter
 from xdart.utils import get_fname_dir, match_img_detector
@@ -120,10 +120,13 @@ ctr = 1
 
 
 
-class specWrangler(wranglerWidget):
-    """Widget for integrating data associated with spec file. Can be
-    used "live", will continue to poll data folders until image data
-    and corresponding spec data are available.
+class imageWrangler(wranglerWidget):
+    """Widget for integrating detector image files (TIFF/EDF/CBF/Eiger
+    master; as an image series, image directory, or single image).
+    Per-frame metadata is read from an optional sidecar — a SPEC file,
+    a ``.txt``/``.pdi`` file, or nothing (the ``Meta Format`` option).
+    Can be used "live": it polls the data folder for new images (and
+    their metadata, if any) until the scan is complete.
 
     attributes:
         command_queue: Queue, used to send commands to thread
@@ -131,7 +134,7 @@ class specWrangler(wranglerWidget):
         fname: str, path to data file
         parameters: pyqtgraph Parameter, stores parameters from user
         scan_name: str, current scan name, used to handle syncing data
-        sphere_args: dict, used as **kwargs in sphere initialization.
+        scan_args: dict, used as **kwargs in scan initialization.
             see LiveScan.
         thread: wranglerThread or subclass, QThread for controlling
             processes
@@ -153,7 +156,7 @@ class specWrangler(wranglerWidget):
         finished: Connected to thread.finished signal
         sigStart: Tells tthetaWidget to start the thread and prepare
             for new data.
-        sigUpdateData: int, signals a new arch has been added.
+        sigUpdateData: int, signals a new frame has been added.
         sigUpdateFile: (str, str, bool, str, bool, bool), sends new scan_name, file name
             GI flag (grazing incidence), theta motor for GI, single_image and
             series_average flag to static_scan_Widget.
@@ -163,7 +166,7 @@ class specWrangler(wranglerWidget):
     """
     showLabel = QtCore.Signal(str)
 
-    def __init__(self, fname, file_lock, sphere, data_1d, data_2d, parent=None):
+    def __init__(self, fname, file_lock, scan, data_1d, data_2d, parent=None):
         """fname: str, file path
         file_lock: mp.Condition, process safe lock
         """
@@ -175,38 +178,48 @@ class specWrangler(wranglerWidget):
         self.counters = []
         self.motors = []
         self.command = None
-        self.sphere = sphere
+        self.scan = scan
         self.data_1d = data_1d
         self.data_2d = data_2d
 
         # Setup gui elements
         self.ui = Ui_Form()
         self.ui.setupUi(self)
-        self.ui.startButton.clicked.connect(self.start)
+        self.ui.startButton.clicked.connect(self._on_start_clicked)
         # self.ui.startButton.clicked.connect(self.sigStart.emit)
         self.ui.stopButton.clicked.connect(self.stop)
         self.ui.processingModeCombo.currentTextChanged.connect(self._on_mode_changed)
-        self.ui.liveCheckBox.stateChanged.connect(self._on_mode_changed)
-        self.ui.batchCheckBox.stateChanged.connect(self._on_mode_changed)
+        # Live/Batch are checkable QPushButtons now — use ``toggled`` (bool)
+        # rather than the QCheckBox-only ``stateChanged``.
+        self.ui.liveCheckBox.toggled.connect(self._on_mode_changed)
+        self.ui.batchCheckBox.toggled.connect(self._on_mode_changed)
+        # Live doubles as a start/stop toggle.  Connected AFTER
+        # _on_mode_changed so live_mode is already set when we start.
+        self.ui.liveCheckBox.toggled.connect(self._on_live_toggled)
         self.ui.processingModeCombo.currentTextChanged.connect(lambda _: self._save_to_session())
-        self.ui.liveCheckBox.stateChanged.connect(lambda _: self._save_to_session())
-        self.ui.batchCheckBox.stateChanged.connect(lambda _: self._save_to_session())
+        self.ui.liveCheckBox.toggled.connect(lambda _: self._save_to_session())
+        self.ui.batchCheckBox.toggled.connect(lambda _: self._save_to_session())
         self._on_mode_changed()
+        self._set_wrangler_tooltips()
 
         self.showLabel.connect(self.ui.specLabel.setText)
 
         # Setup parameter tree
         self.tree = ParameterTree()
-        self.tree.setMinimumWidth(150)
+        # This (and the name-column width below) is the dominant floor on
+        # how narrow the right panel drags — the param tree is the widest
+        # fixed content.  Keep it small so the panel can shrink.
+        self.tree.setMinimumWidth(80)
         self.stylize_ParameterTree()
         self.parameters = Parameter.create(
-            name='spec_wrangler', type='group', children=params
+            name='image_wrangler', type='group', children=params
         )
         self.tree.setParameters(self.parameters, showTop=False)
         # Squeeze parameter tree columns to reduce panel width
         header = self.tree.header()
         header.setStretchLastSection(True)
-        header.resizeSection(0, 130)  # name column
+        header.resizeSection(0, 100)  # name column
+        header.setMinimumSectionSize(40)
         self.layout = QtWidgets.QVBoxLayout(self.ui.paramFrame)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.addWidget(self.tree)
@@ -260,9 +273,9 @@ class specWrangler(wranglerWidget):
         self.sample_orientation = self.parameters.child('GI').child('sample_orientation').value()
         self.tilt_angle = self.parameters.child('GI').child('tilt_angle').value()
         # gi_mode_1d / gi_mode_2d are driven by the integrator panel;
-        # default here, actual values set from sphere.bai_*_args at thread start.
-        self.gi_mode_1d = self.sphere.bai_1d_args.get('gi_mode_1d', 'q_total')
-        self.gi_mode_2d = self.sphere.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+        # default here, actual values set from scan.bai_*_args at thread start.
+        self.gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
+        self.gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
 
         # HDF5 Save Path
         self.h5_dir = self.parameters.child('h5_dir').value()
@@ -328,9 +341,9 @@ class specWrangler(wranglerWidget):
         )
 
         # Setup thread
-        self.thread = specThread(
+        self.thread = imageThread(
             self.command_queue,
-            self.sphere_args,
+            self.scan_args,
             self.file_lock,
             self.fname,
             self.h5_dir,
@@ -362,7 +375,7 @@ class specWrangler(wranglerWidget):
             self.gi_mode_1d,
             self.gi_mode_2d,
             self.command,
-            self.sphere,
+            self.scan,
             self.data_1d,
             self.data_2d,
             live_mode=self.live_mode,
@@ -374,7 +387,7 @@ class specWrangler(wranglerWidget):
         self.thread.sigUpdateFile.connect(self.sigUpdateFile.emit)
         self.thread.finished.connect(self.finished.emit)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
-        # self.thread.sigUpdateArch.connect(self.sigUpdateArch.emit)
+        # self.thread.sigUpdateFrame.connect(self.sigUpdateFrame.emit)
         self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
 
         # Enable/disable buttons initially
@@ -432,7 +445,9 @@ class specWrangler(wranglerWidget):
             except (AttributeError, KeyError, TypeError) as e:
                 logger.debug("Failed to save session parameter %s: %s", key, e)
         data['processing_mode'] = self.ui.processingModeCombo.currentText()
-        data['live_mode'] = self.ui.liveCheckBox.isChecked()
+        # Live is a momentary start/stop control now (not a persisted mode);
+        # its checked state means "a live run is active", which must never be
+        # restored — doing so would auto-start a run on launch.
         data['batch_mode'] = self.ui.batchCheckBox.isChecked()
         save_session(data)
 
@@ -459,8 +474,9 @@ class specWrangler(wranglerWidget):
             idx = self.ui.processingModeCombo.findText(mode)
             if idx >= 0:
                 self.ui.processingModeCombo.setCurrentIndex(idx)
-        if 'live_mode' in session:
-            self.ui.liveCheckBox.setChecked(session['live_mode'])
+        # Deliberately do NOT restore Live's checked state — it's a
+        # start/stop control, and setChecked(True) would fire its toggled
+        # handler and auto-start a live run on launch.
         if 'batch_mode' in session:
             self.ui.batchCheckBox.setChecked(session['batch_mode'])
         # meta_ext needs None conversion (sigValueChanged fires set_meta_ext automatically)
@@ -495,22 +511,25 @@ class specWrangler(wranglerWidget):
             self.ui.coresLabel.setEnabled(True)
             self.ui.maxCoresSpinBox.setEnabled(True)
         else:
+            # Both toggles stay clickable in a normal processing mode; they
+            # are kept mutually exclusive by auto-unchecking the other one
+            # rather than greying it out.  Greying Live out whenever Batch
+            # was checked left it dead after a mode switch until a run
+            # finished and enabled(True) reset it (bug #1).
             self.ui.liveCheckBox.setEnabled(True)
             self.ui.batchCheckBox.setEnabled(True)
 
-            # Mutual exclusion: when one is checked, uncheck the other
             is_live = self.ui.liveCheckBox.isChecked()
             is_batch = self.ui.batchCheckBox.isChecked()
             if is_live and is_batch:
-                # Live was just checked — uncheck batch (or vice versa).
-                # Determine which was the trigger by checking the sender.
-                # If unclear, prefer live (last action wins).
-                self.ui.batchCheckBox.setChecked(False)
-                is_batch = False
-            if is_live:
-                self.ui.batchCheckBox.setEnabled(False)
-            if is_batch:
-                self.ui.liveCheckBox.setEnabled(False)
+                # Uncheck whichever one was NOT just toggled.  When the
+                # trigger is the mode combo (or unknown), prefer Live.
+                if self.sender() is self.ui.batchCheckBox:
+                    self.ui.liveCheckBox.setChecked(False)
+                    is_live = False
+                else:
+                    self.ui.batchCheckBox.setChecked(False)
+                    is_batch = False
 
             # Sync cores enabled state with batch checkbox
             self.ui.coresLabel.setEnabled(is_batch)
@@ -519,9 +538,16 @@ class specWrangler(wranglerWidget):
         self.ui.liveCheckBox.blockSignals(False)
         self.ui.batchCheckBox.blockSignals(False)
 
-        # Ensure cores are always visible
-        self.ui.coresLabel.setVisible(True)
-        self.ui.maxCoresSpinBox.setVisible(True)
+        # Cores only matters for parallel batch processing — hide it
+        # entirely unless batch is active (XYE forces batch on).
+        if is_viewer:
+            cores_visible = False
+        elif is_xye:
+            cores_visible = True
+        else:
+            cores_visible = self.ui.batchCheckBox.isChecked()
+        self.ui.coresLabel.setVisible(cores_visible)
+        self.ui.maxCoresSpinBox.setVisible(cores_visible)
 
         self.batch_mode = self.ui.batchCheckBox.isChecked()
         self.live_mode = self.ui.liveCheckBox.isChecked()
@@ -529,13 +555,13 @@ class specWrangler(wranglerWidget):
         
         if mode_text == 'Image Viewer':
             self.viewer_mode = 'image'
-            self.sphere.skip_2d = False
+            self.scan.skip_2d = False
         elif mode_text == 'XYE Viewer':
             self.viewer_mode = 'xye'
-            self.sphere.skip_2d = False
+            self.scan.skip_2d = False
         else:
             self.viewer_mode = None
-            self.sphere.skip_2d = '1D' in mode_text
+            self.scan.skip_2d = '1D' in mode_text
 
         # Sync to thread
         self.thread.batch_mode = self.batch_mode
@@ -555,9 +581,12 @@ class specWrangler(wranglerWidget):
             self._prev_viewer_mode = new_vm
             self.sigViewerModeChanged.emit(new_vm)
 
-    def _set_integration_controls_enabled(self, enabled):
+    def _set_integration_controls_enabled(self, enabled, *, include_gi=True):
         """Enable or disable parameter tree groups related to integration."""
-        for group_name in ('Calibration', 'BG', 'Mask', 'GI'):
+        group_names = ['Calibration', 'BG', 'Mask']
+        if include_gi:
+            group_names.append('GI')
+        for group_name in group_names:
             try:
                 grp = self.parameters.child(group_name)
                 grp.setOpts(enabled=enabled)
@@ -575,6 +604,25 @@ class specWrangler(wranglerWidget):
             self.parameters.child('h5_dir_browse').setOpts(enabled=enabled)
         except (AttributeError, KeyError) as e:
             logger.debug("Failed to set enabled state for h5_dir parameters: %s", e)
+
+    def _set_parameter_readonly(self, param, readonly):
+        """Recursively set pyqtgraph Parameter readonly state when available."""
+        try:
+            param.setOpts(readonly=readonly)
+        except (AttributeError, TypeError):
+            return
+        try:
+            children = param.children()
+        except AttributeError:
+            children = ()
+        for child in children:
+            self._set_parameter_readonly(child, readonly)
+
+    def _set_gi_controls_readonly(self, readonly):
+        try:
+            self._set_parameter_readonly(self.parameters.child('GI'), readonly)
+        except (AttributeError, KeyError) as e:
+            logger.debug("Failed to set GI readonly state: %s", e)
 
     def setup(self):
         """Sets up the child thread, syncs all parameters.
@@ -667,9 +715,9 @@ class specWrangler(wranglerWidget):
         self.thread.tilt_angle = self.tilt_angle
 
         # GI modes are driven by the integrator panel (axis1D / axis2D),
-        # so read them from sphere.bai_*_args which the integrator updates.
-        self.gi_mode_1d = self.sphere.bai_1d_args.get('gi_mode_1d', 'q_total')
-        self.gi_mode_2d = self.sphere.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+        # so read them from scan.bai_*_args which the integrator updates.
+        self.gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
+        self.gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
         self.thread.gi_mode_1d = self.gi_mode_1d
         self.thread.gi_mode_2d = self.gi_mode_2d
 
@@ -681,16 +729,55 @@ class specWrangler(wranglerWidget):
         self.thread.batch_mode = self.batch_mode
         self.thread.xye_only = self.xye_only
         self.thread.max_cores = self.ui.maxCoresSpinBox.value()
-        self.sphere.max_cores = self.thread.max_cores  # used by sphere_threads
+        self.scan.max_cores = self.thread.max_cores  # used by scan_threads
 
         self.thread.command = self.command
 
         self.thread.file_lock = self.file_lock
-        self.thread.sphere_args = self.sphere_args
+        self.thread.scan_args = self.scan_args
 
-        self.thread.sphere = self.sphere
+        self.thread.scan = self.scan
         self.thread.data_1d = self.data_1d
         self.thread.data_2d = self.data_2d
+
+    def _set_wrangler_tooltips(self):
+        """Hover tooltips for the wrangler command/run controls."""
+        tips = {
+            'processingModeCombo': 'What to produce: integrate (1D/2D/XYE), '
+                                   'stitch, or just view images/patterns.',
+            'liveCheckBox': 'Start/stop live acquisition — process frames as '
+                            'they arrive.',
+            'batchCheckBox': 'Process all frames as a batch (parallel across '
+                             'Cores) instead of one-at-a-time.',
+            'maxCoresSpinBox': 'CPU cores for parallel batch processing.',
+            'coresLabel': 'CPU cores for parallel batch processing.',
+            'advancedButton': 'Advanced integration / detector options.',
+            'startButton': 'Start processing with the current settings.',
+            'stopButton': 'Stop the running process.',
+        }
+        for name, tip in tips.items():
+            w = getattr(self.ui, name, None)
+            if w is not None:
+                w.setToolTip(tip)
+
+    def _on_start_clicked(self):
+        """Start button = an explicit NON-live processing run.
+
+        The Start button and the Live toggle both funnel into :meth:`start`,
+        and ``live_mode`` only ever tracks the Live toggle's checked state.
+        If Live happened to be left checked, a Start click would silently run
+        in live-watching mode ("Watching for new files...") with the Live
+        button lit.  Force a non-live run here: uncheck Live (without firing
+        its start/stop handler) and clear ``live_mode`` so the wrangler runs
+        once over the existing files and ``enabled(False)`` greys Live out for
+        the duration."""
+        if self.ui.liveCheckBox.isChecked():
+            self.ui.liveCheckBox.blockSignals(True)
+            self.ui.liveCheckBox.setChecked(False)
+            self.ui.liveCheckBox.blockSignals(False)
+        self.live_mode = False
+        self.thread.live_mode = False
+        self.start()
 
     def start(self):
         self.command = 'start'
@@ -698,11 +785,33 @@ class specWrangler(wranglerWidget):
         self.ui.stopButton.setEnabled(True)
         self.sigStart.emit()
 
+    def _on_live_toggled(self, checked):
+        """Live button is a start/stop toggle for live acquisition:
+        checking it starts a live run (live_mode is already set by
+        :meth:`_on_mode_changed`, which runs first); unchecking it stops
+        the run.  Fires only on genuine user clicks — the programmatic
+        resets in :meth:`stop` / :meth:`enabled` block the signal."""
+        if checked:
+            self.start()
+        else:
+            self.stop()
+
     def stop(self):
         self.command = 'stop'
         self.thread.command = 'stop'
         self.ui.stopButton.setEnabled(False)
         self.ui.specLabel.setText('')
+        # Keep the Live toggle in sync when stopped via the Stop button or
+        # programmatically — uncheck it without re-entering stop().  Because
+        # the uncheck is done with signals blocked, ``_on_mode_changed`` does
+        # NOT run, so reset ``live_mode`` explicitly here; otherwise it stays
+        # stale-True and the next Start click silently runs in live mode.
+        if self.ui.liveCheckBox.isChecked():
+            self.ui.liveCheckBox.blockSignals(True)
+            self.ui.liveCheckBox.setChecked(False)
+            self.ui.liveCheckBox.blockSignals(False)
+        self.live_mode = False
+        self.thread.live_mode = False
 
     def set_poni_file(self):
         """Opens file dialogue and sets the calibration file
@@ -1079,8 +1188,34 @@ class specWrangler(wranglerWidget):
         args:
             enable: bool, True for enabled False for disabled.
         """
-        self.tree.setEnabled(enable)
+        # Disabling the entire ParameterTree causes pyqtgraph's bool editor to
+        # repaint checked boxes as unchecked on some platforms.  Keep the tree
+        # itself enabled during an active run and disable the processing
+        # controls individually below; this preserves the visual state of the
+        # GI/Grazing checkbox while the thread uses the setup-time value.
+        self.tree.setEnabled(True)
         self.ui.startButton.setEnabled(enable)
+        # Live toggle state vs. the run lifecycle:
+        if enable:
+            self._set_gi_controls_readonly(False)
+            # Run finished — reset Live to off (no re-trigger) and re-enable
+            # both toggles so the next run can be either live or batch.
+            self.ui.liveCheckBox.blockSignals(True)
+            self.ui.liveCheckBox.setChecked(False)
+            self.ui.liveCheckBox.blockSignals(False)
+            self.ui.liveCheckBox.setEnabled(True)
+            self.ui.batchCheckBox.setEnabled(True)
+            # Uncheck is signal-blocked → sync the flag (see stop()).
+            self.live_mode = False
+            self._on_mode_changed()
+        else:
+            self._set_integration_controls_enabled(False, include_gi=False)
+            self._set_gi_controls_readonly(True)
+            # Run active — keep Live clickable only for a *live* run (so it
+            # can be toggled off to stop); mode toggles stay locked until the
+            # run finishes.
+            self.ui.liveCheckBox.setEnabled(self.live_mode)
+            self.ui.batchCheckBox.setEnabled(False)
 
     def stylize_ParameterTree(self):
         self.tree.setStyleSheet("""
@@ -1089,5 +1224,3 @@ class specWrangler(wranglerWidget):
             color: rgb(30, 30, 30);
         }
             """)
-
-

@@ -30,17 +30,6 @@ from xdart.modules.reduction import (
 )
 
 
-# Convenience aliases used throughout the tests below to keep wording short.
-# These exist only inside the test module — the production aliases on
-# xdart.modules.{ewald,reduction} were dropped in the rename release.
-EwaldArch = LiveFrame
-EwaldSphere = LiveScan
-ArchSeries = LiveFrameSeries
-frame_from_ewald_arch = frame_from_live_frame
-scan_from_ewald_sphere = scan_from_live_scan
-plan_from_ewald_sphere = plan_from_live_scan
-reduce_ewald_arch = reduce_live_frame
-dispatch_arch_reduction = dispatch_live_frame_reduction
 
 
 def _poni() -> PONI:
@@ -137,7 +126,7 @@ def test_legacy_live_class_names_are_normalized_from_reader_data() -> None:
     assert normalized["config"]["class"] == "LiveScan"
     assert normalized["config"]["frames"] == [
         "LiveFrame",
-        "xdart.modules.ewald.arch.LiveFrame",
+        "xdart.modules.ewald.frame.LiveFrame",
     ]
     assert normalized["config"]["series"]["type"] == "LiveFrameSeries"
     assert normalized["unchanged"] == "not_a_class_name"
@@ -163,7 +152,7 @@ def test_live_scan_loader_normalizes_legacy_reduction_provenance(
         dims={},
         coords={},
     )
-    monkeypatch.setattr(nexus_io, "read_sphere_metadata", lambda _path: fake_ds)
+    monkeypatch.setattr(nexus_io, "read_scan_metadata", lambda _path: fake_ds)
 
     live_scan = LiveScan("old", data_file=str(tmp_path / "old_037.nxs"))
     live_scan._load_from_nexus_v2(None)
@@ -172,8 +161,67 @@ def test_live_scan_loader_normalizes_legacy_reduction_provenance(
     assert live_scan.bai_2d_args["owner"] == "LiveScan"
 
 
-def test_frame_from_ewald_arch_maps_simple_fields(tmp_path) -> None:
-    arch = EwaldArch(
+def test_live_scan_loader_uses_union_of_1d_and_2d_labels(monkeypatch, tmp_path) -> None:
+    import ssrl_xrd_tools.io.nexus as nexus_io
+
+    class _FakeDataset:
+        attrs = {"reduction": {}}
+        sizes = {"frame": 2, "frame_2d": 2}
+        data_vars = {}
+        dims = {"frame": 2, "frame_2d": 2}
+        coords = {
+            "frame": SimpleNamespace(values=np.array([0, 2])),
+            "frame_2d": SimpleNamespace(values=np.array([1, 2])),
+        }
+
+        def __getitem__(self, key):
+            return self.coords[key]
+
+    fake_ds = _FakeDataset()
+    monkeypatch.setattr(nexus_io, "read_scan_metadata", lambda _path: fake_ds)
+
+    live_scan = LiveScan("union", data_file=str(tmp_path / "union.nxs"))
+    live_scan._load_from_nexus_v2(None)
+    assert list(live_scan.frames.index) == [0, 1, 2]
+
+
+def test_live_scan_loader_reindexes_metadata_to_union_labels(monkeypatch, tmp_path) -> None:
+    import ssrl_xrd_tools.io.nexus as nexus_io
+
+    class _Var:
+        def __init__(self, values, dims):
+            self.values = np.asarray(values)
+            self.dims = dims
+
+    class _FakeDataset:
+        attrs = {"reduction": {}}
+        sizes = {"frame": 2, "frame_2d": 2}
+        data_vars = {"i0": _Var([10.0, 20.0], ("frame",))}
+        dims = {"frame": 2, "frame_2d": 2}
+        coords = {
+            "frame": _Var([0, 2], ("frame",)),
+            "frame_2d": _Var([1, 2], ("frame_2d",)),
+        }
+
+        def __getitem__(self, key):
+            if key in self.coords:
+                return self.coords[key]
+            return self.data_vars[key]
+
+    monkeypatch.setattr(nexus_io, "read_scan_metadata", lambda _path: _FakeDataset())
+
+    live_scan = LiveScan("union_meta", data_file=str(tmp_path / "union_meta.nxs"))
+    live_scan._load_from_nexus_v2(None)
+
+    assert list(live_scan.frames.index) == [0, 1, 2]
+    assert list(live_scan.scan_data.index) == [0, 1, 2]
+    assert live_scan.scan_data.loc[0, "i0"] == 10.0
+    assert np.isnan(live_scan.scan_data.loc[1, "i0"])
+    assert live_scan.scan_data.loc[2, "i0"] == 20.0
+
+
+def test_frame_from_live_frame_maps_simple_fields(tmp_path) -> None:
+    frame = LiveFrame(
         idx=4,
         map_raw=np.arange(4).reshape(2, 2),
         poni=_poni(),
@@ -181,12 +229,12 @@ def test_frame_from_ewald_arch_maps_simple_fields(tmp_path) -> None:
         mask=np.array([1, 3]),
         scan_info={"th": 1.2, "i0": 99.0},
     )
-    arch.source_file = "frame_0004.tif"
-    arch.source_frame_idx = 2
-    arch._source_root = str(tmp_path)
-    arch.map_norm = 5.0
+    frame.source_file = "frame_0004.tif"
+    frame.source_frame_idx = 2
+    frame._source_root = str(tmp_path)
+    frame.map_norm = 5.0
 
-    frame = frame_from_ewald_arch(arch)
+    frame = frame_from_live_frame(frame)
 
     assert frame.index == 4
     np.testing.assert_array_equal(frame.image, np.arange(4).reshape(2, 2))
@@ -201,16 +249,16 @@ def test_frame_from_ewald_arch_maps_simple_fields(tmp_path) -> None:
     assert frame.normalization_factor is None
 
 
-def test_frame_from_ewald_arch_can_skip_large_background() -> None:
-    arch = EwaldArch(
+def test_frame_from_live_frame_can_skip_large_background() -> None:
+    frame = LiveFrame(
         idx=4,
         map_raw=np.arange(4).reshape(2, 2),
         poni=_poni(),
         bg_raw=np.ones((2, 2)),
     )
 
-    frame = frame_from_ewald_arch(
-        arch,
+    frame = frame_from_live_frame(
+        frame,
         include_image=False,
         include_background=False,
     )
@@ -219,20 +267,20 @@ def test_frame_from_ewald_arch_can_skip_large_background() -> None:
     assert frame.background is None
 
 
-def test_scan_from_ewald_sphere_uses_scan_frame_names() -> None:
-    a2 = EwaldArch(idx=2, map_raw=np.ones((2, 2)), poni=_poni(),
+def test_scan_from_live_scan_uses_scan_frame_names() -> None:
+    a2 = LiveFrame(idx=2, map_raw=np.ones((2, 2)), poni=_poni(),
                    scan_info={"th": 2.0})
-    a1 = EwaldArch(idx=1, map_raw=np.zeros((2, 2)), poni=_poni(),
+    a1 = LiveFrame(idx=1, map_raw=np.zeros((2, 2)), poni=_poni(),
                    scan_info={"th": 1.0})
-    sphere = EwaldSphere(
+    scan = LiveScan(
         "scan42",
-        arches=[a2, a1],
+        frames=[a2, a1],
         scan_data=pd.DataFrame({"th": [1.0, 2.0]}, index=[1, 2]),
         mg_args={"wavelength": 1e-10},
         data_file="scan42.nxs",
     )
 
-    scan = scan_from_ewald_sphere(sphere)
+    scan = scan_from_live_scan(scan)
 
     assert scan.name == "scan42"
     assert [f.index for f in scan.frames] == [1, 2]
@@ -242,11 +290,24 @@ def test_scan_from_ewald_sphere_uses_scan_frame_names() -> None:
     assert scan.output_path.name == "scan42.nxs"
 
 
-def test_plan_from_ewald_sphere_maps_integration_settings() -> None:
-    arch = EwaldArch(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
-    sphere = EwaldSphere(
+def test_scan_from_live_scan_fills_frame_metadata_from_scan_data() -> None:
+    frame = LiveFrame(idx=5, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan(
         "scan",
-        arches=[arch],
+        frames=[frame],
+        scan_data=pd.DataFrame({"i0": [42.0]}, index=[5]),
+    )
+
+    headless = scan_from_live_scan(scan)
+
+    assert headless.frames[0].metadata["i0"] == 42.0
+
+
+def test_plan_from_live_scan_maps_integration_settings() -> None:
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan(
+        "scan",
+        frames=[frame],
         bai_1d_args={
             "numpoints": 123,
             "unit": "2th_deg",
@@ -269,7 +330,7 @@ def test_plan_from_ewald_sphere_maps_integration_settings() -> None:
         global_mask=np.array([0, 3]),
     )
 
-    plan = plan_from_ewald_sphere(sphere)
+    plan = plan_from_live_scan(scan)
 
     assert plan.integration_1d is not None
     assert plan.integration_2d is not None
@@ -289,7 +350,7 @@ def test_plan_from_ewald_sphere_maps_integration_settings() -> None:
     assert plan.integration_2d.azimuth_offset == 0.0
     assert "gi_mode_1d" not in plan.integration_1d.extra
     assert "gi_mode_2d" not in plan.integration_2d.extra
-    # plan.gi is None on a non-GI sphere (was bool flag pre-S2)
+    # plan.gi is None on a non-GI scan (was bool flag pre-S2)
     assert plan.gi is None
     np.testing.assert_array_equal(
         plan.mask,
@@ -297,20 +358,20 @@ def test_plan_from_ewald_sphere_maps_integration_settings() -> None:
     )
 
 
-def test_plan_from_gi_sphere_requires_incident_angle() -> None:
-    sphere = EwaldSphere("scan", arches=[EwaldArch(idx=0, map_raw=np.ones((2, 2)))],
+def test_plan_from_gi_scan_requires_incident_angle() -> None:
+    scan = LiveScan("scan", frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)))],
                          gi=True)
 
     try:
-        plan_from_ewald_sphere(sphere)
+        plan_from_live_scan(scan)
     except ValueError as exc:
         assert "gi_incident_angle" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected missing GI angle to fail")
 
 
-def test_reduce_ewald_arch_populates_existing_arch(monkeypatch) -> None:
-    arch = EwaldArch(
+def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
+    frame = LiveFrame(
         idx=7,
         map_raw=np.arange(4).reshape(2, 2),
         poni=_poni(),
@@ -344,54 +405,53 @@ def test_reduce_ewald_arch_populates_existing_arch(monkeypatch) -> None:
 
     monkeypatch.setattr(reduction_adapters, "run_reduction", fake_run_reduction)
 
-    returned = reduce_ewald_arch(
-        arch,
+    returned = reduce_live_frame(
+        frame,
         plan,
         scan_name="scan",
         global_mask=np.array([3]),
         integrator="ai",
     )
 
-    assert returned is arch
-    assert arch.int_1d is not None
-    assert arch.int_2d is not None
-    assert arch.map_norm == 33.0
+    assert returned is frame
+    assert frame.int_1d is not None
+    assert frame.int_2d is not None
+    assert frame.map_norm == 33.0
 
 
-def test_mask_conversion_is_strict() -> None:
-    arch = EwaldArch(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
-    sphere = EwaldSphere(
+def test_mask_conversion_ignores_incompatible_mask() -> None:
+    """A matching mask is applied; a shape-incompatible mask is ignored
+    (plan.mask is None) with a warning rather than raising — reducing
+    unmasked beats aborting the scan."""
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan(
         "scan",
-        arches=[arch],
+        frames=[frame],
         global_mask=np.array([[1, 0], [0, 1]]),
     )
-    plan = plan_from_ewald_sphere(sphere)
+    plan = plan_from_live_scan(scan)
     np.testing.assert_array_equal(
         plan.mask,
         np.array([[True, False], [False, True]]),
     )
 
-    bad = EwaldSphere(
+    bad = LiveScan(
         "scan",
-        arches=[arch],
-        global_mask=np.ones((3, 3)),
+        frames=[frame],
+        global_mask=np.ones((3, 3)),  # wrong shape for a 2x2 image
     )
-    try:
-        plan_from_ewald_sphere(bad)
-    except ValueError as exc:
-        assert "mask shape" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("expected mask shape mismatch")
+    bad_plan = plan_from_live_scan(bad)
+    assert bad_plan.mask is None
 
 
 def test_flat_global_mask_is_preserved_until_shape_is_known() -> None:
-    sphere = EwaldSphere(
+    scan = LiveScan(
         "scan",
-        arches=[EwaldArch(idx=0, map_raw=None, poni=_poni())],
+        frames=[LiveFrame(idx=0, map_raw=None, poni=_poni())],
         global_mask=np.array([0, 3]),
     )
 
-    plan = plan_from_ewald_sphere(sphere)
+    plan = plan_from_live_scan(scan)
 
     assert isinstance(plan.mask, MaskSpec)
     np.testing.assert_array_equal(
@@ -405,18 +465,18 @@ def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> Non
 
     calls = []
 
-    def fake_reduce(arch, plan, *, scan_name, global_mask, integrator):
-        calls.append((arch.idx, plan, scan_name, global_mask, integrator))
-        arch.int_1d = _r1d()
-        arch.int_2d = _r2d()
-        return arch
+    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
+        calls.append((frame.idx, plan, scan_name, global_mask, integrator))
+        frame.int_1d = _r1d()
+        frame.int_2d = _r2d()
+        return frame
 
     # dispatch_live_frame_reduction calls reduce_live_frame from its defining
     # module (xdart.modules.reduction).  Patch the canonical name; the
     # symbol is no longer re-imported into the wrangler-thread modules.
     monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
 
-    sphere = SimpleNamespace(
+    scan = SimpleNamespace(
         name="scan",
         data_file="scan_out.nxs",
         skip_2d=False,
@@ -436,11 +496,11 @@ def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> Non
         _xye_buffer=[],
         nexus_file="scan.nxs",
     )
-    worker._resolve_arch_mask = lambda _sphere, _img: np.array([0])
+    worker._resolve_frame_mask = lambda _scan, _img: np.array([0])
 
-    arch = nexus_wrangler_thread.nexusThread._integrate_one(
+    frame = nexus_wrangler_thread.nexusThread._integrate_one(
         worker,
-        sphere,
+        scan,
         _BorrowPool(),
         None,
         ReductionPlan(
@@ -452,23 +512,23 @@ def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> Non
         {"i0": 1.0},
     )
 
-    assert arch.idx == 5
-    assert arch.int_1d is not None
-    assert arch.int_2d is not None
+    assert frame.idx == 5
+    assert frame.int_1d is not None
+    assert frame.int_2d is not None
     assert calls and calls[0][0] == 5
     assert worker._xye_buffer[0][0] == 5
 
 
 def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> None:
-    from xdart.gui.tabs.static_scan.wranglers import spec_wrangler_thread
+    from xdart.gui.tabs.static_scan.wranglers import image_wrangler_thread
 
     calls = []
 
-    def fake_reduce(arch, plan, *, scan_name, global_mask, integrator):
-        calls.append((arch.idx, plan, scan_name, global_mask, integrator))
-        arch.int_1d = _r1d()
-        arch.int_2d = _r2d()
-        return arch
+    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
+        calls.append((frame.idx, plan, scan_name, global_mask, integrator))
+        frame.int_1d = _r1d()
+        frame.int_2d = _r2d()
+        return frame
 
     monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
 
@@ -476,7 +536,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
         def emit(self, *args):
             return None
 
-    sphere = SimpleNamespace(
+    scan = SimpleNamespace(
         name="scan",
         data_file="scan_out.nxs",
         skip_2d=False,
@@ -489,7 +549,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
         showLabel=_Signal(),
         _middle_truncate=lambda text: text,
         _apply_threshold_inline=lambda img: img,
-        _resolve_arch_mask=lambda _sphere, _img: np.array([0]),
+        _resolve_frame_mask=lambda _scan, _img: np.array([0]),
         gi=False,
         poni=_poni(),
         incidence_motor="th",
@@ -505,9 +565,9 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
         _plan_cache=StandardPlanCache(),
     )
 
-    spec_wrangler_thread.specThread._process_one(
+    image_wrangler_thread.imageThread._process_one(
         worker,
-        sphere,
+        scan,
         "frame_0001.tif",
         1,
         np.ones((2, 2)),
@@ -520,7 +580,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
 
 
 def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None:
-    from xdart.gui.tabs.static_scan.sphere_threads import integratorThread
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
 
     calls = []
 
@@ -536,18 +596,18 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
 
     monkeypatch.setattr(reduction_adapters, "run_reduction", fake_run_reduction)
 
-    arch = EwaldArch(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
-    sphere = EwaldSphere(
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan(
         "scan",
-        arches=[arch],
+        frames=[frame],
         bai_1d_args={"monitor": "i0"},
     )
-    sphere._cached_integrator = _FakeIntegrator()
-    sphere.global_mask = np.array([3])
+    scan._cached_integrator = _FakeIntegrator()
+    scan.global_mask = np.array([3])
 
     data_1d = {}
     thread = integratorThread(
-        sphere,
+        scan,
         None,
         None,
         None,
@@ -563,25 +623,25 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
 
 
 def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
-    from xdart.gui.tabs.static_scan.sphere_threads import integratorThread
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
 
     calls = []
 
-    def fake_reduce(arch, plan, *, scan_name, global_mask, integrator):
+    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
         calls.append(plan)
-        arch.int_1d = _r1d()
-        arch.int_2d = _r2d()
-        return arch
+        frame.int_1d = _r1d()
+        frame.int_2d = _r2d()
+        return frame
 
     monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
 
-    arch = EwaldArch(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
-    sphere = EwaldSphere("scan", arches=[arch])
-    sphere._cached_integrator = _FakeIntegrator()
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan("scan", frames=[frame])
+    scan._cached_integrator = _FakeIntegrator()
     data_1d = {}
     data_2d = {}
     thread = integratorThread(
-        sphere,
+        scan,
         None,
         None,
         None,
@@ -597,3 +657,40 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
     assert calls[0].integration_2d is not None
     assert data_1d[0].int_1d is not None
     assert data_2d[0]["int_2d"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Mask-incompatibility handling: a mask that doesn't fit the image is ignored
+# (returns None) with a warning, not a hard error that aborts the scan.
+# ---------------------------------------------------------------------------
+
+def test_flat_mask_out_of_bounds_is_ignored(caplog):
+    """Flat-index mask with indices past the image size → ignored (None)."""
+    shape = (4, 5)  # 20 pixels
+    bad = np.array([0, 1, 999], dtype=np.int64)  # 999 out of range
+    with caplog.at_level("WARNING"):
+        out = reduction_adapters._flat_mask_as_bool(bad, shape)
+    assert out is None
+    assert any("out of bounds" in r.message for r in caplog.records)
+
+
+def test_2d_mask_shape_mismatch_is_ignored():
+    shape = (4, 5)
+    bad = np.ones((4, 6), dtype=bool)  # wrong width
+    assert reduction_adapters._flat_mask_as_bool(bad, shape) is None
+
+
+def test_bool_mask_length_mismatch_is_ignored():
+    shape = (4, 5)
+    bad = np.ones(19, dtype=bool)  # 19 != 20
+    assert reduction_adapters._flat_mask_as_bool(bad, shape) is None
+
+
+def test_valid_flat_mask_still_applied():
+    shape = (2, 3)  # 6 pixels
+    good = np.array([0, 5], dtype=np.int64)
+    out = reduction_adapters._flat_mask_as_bool(good, shape)
+    assert out is not None
+    assert out.shape == shape
+    assert out.ravel()[0] and out.ravel()[5]
+    assert out.sum() == 2

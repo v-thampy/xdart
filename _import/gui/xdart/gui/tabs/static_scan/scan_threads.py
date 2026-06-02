@@ -5,6 +5,7 @@
 
 # Standard library imports
 import logging
+import os
 from queue import Queue
 from threading import Condition, RLock
 # M2 dropped ProcessPoolExecutor; ThreadPoolExecutor + as_completed
@@ -29,7 +30,7 @@ from xdart.utils import catch_h5py_file as catch
 
 
 
-# M2: _reintegrate_arch (the module-level pickle-safe worker for the
+# M2: _reintegrate_frame (the module-level pickle-safe worker for the
 # pre-M2 ProcessPoolExecutor reintegrate path) removed.  The new
 # _reintegrate_all uses ThreadPoolExecutor + an inline closure
 # instead — no pickling, no IPC, GIL released by pyFAI's Cython
@@ -41,18 +42,18 @@ class integratorThread(Qt.QtCore.QThread):
     intensive calculations.
     
     attributes:
-        arch: int, idx of arch to integrate
+        frame: int, idx of frame to integrate
         lock: Condition, lock to handle access to thread attributes
         method: str, which method to call in run
         mg_1d_args, mg_2d_args: dict, arguments for multigeometry
             integration
-        sphere: LiveScan, object that does the integration.
+        scan: LiveScan, object that does the integration.
     
     methods:
-        bai_1d_all: Calls by arch integration 1D for all arches
-        bai_1d_SI: Calls by arch integration 1D for specified arch
-        bai_2d_all: Calls by arch integration 2D for all arches
-        bai_2d_SI: Calls by arch integration 2D for specified arch
+        bai_1d_all: Calls by frame integration 1D for all frames
+        bai_1d_SI: Calls by frame integration 1D for specified frame
+        bai_2d_all: Calls by frame integration 2D for all frames
+        bai_2d_SI: Calls by frame integration 2D for specified frame
         load: Loads data 
         mg_1d: multigeometry 1d integration
         mg_2d: multigeometry 2d integration
@@ -64,15 +65,15 @@ class integratorThread(Qt.QtCore.QThread):
     """
     update = Qt.QtCore.Signal(int)
 
-    def __init__(self, sphere, arch, file_lock,
-                 arches, arch_ids, data_1d, data_2d,
+    def __init__(self, scan, frame, file_lock,
+                 frames, frame_ids, data_1d, data_2d,
                  parent=None, data_lock=None):
         super().__init__(parent)
-        self.sphere = sphere
-        self.arch = arch
+        self.scan = scan
+        self.frame = frame
         self.file_lock = file_lock
-        self.arches = arches
-        self.arch_ids = arch_ids
+        self.frames = frames
+        self.frame_ids = frame_ids
         self.data_1d = data_1d
         self.data_2d = data_2d
         # Shared reentrant lock guarding data_1d / data_2d access.  Falls
@@ -98,37 +99,37 @@ class integratorThread(Qt.QtCore.QThread):
                 traceback.print_exc()
 
     def bai_2d_all(self):
-        """Integrates all arches 2d.  Thin wrapper over _reintegrate_all."""
-        if getattr(self.sphere, 'skip_2d', False):
+        """Integrates all frames 2d.  Thin wrapper over _reintegrate_all."""
+        if getattr(self.scan, 'skip_2d', False):
             return
         self._reintegrate_all(do_2d=True)
 
     def bai_1d_all(self):
-        """Integrates all arches 1d.  Thin wrapper over _reintegrate_all."""
+        """Integrates all frames 1d.  Thin wrapper over _reintegrate_all."""
         self._reintegrate_all(do_2d=False)
 
     def _reintegrate_all(self, *, do_2d: bool) -> None:
         """Shared GUI-button reintegration body for 1D and 2D paths.
 
         M2 rewrite: switched from ``ProcessPoolExecutor`` over an
-        eagerly-materialised arch list to **batched lazy iteration +
+        eagerly-materialised frame list to **batched lazy iteration +
         ThreadPoolExecutor + IntegratorPool** — the same primitive
         the wranglers use.
 
         Why the change.  Pre-M2 the path was:
-            all_arches = list(self.sphere.arches)
-            ProcessPoolExecutor(...).submit(_reintegrate_arch, arch, ...)
+            all_frames = list(self.scan.frames)
+            ProcessPoolExecutor(...).submit(_reintegrate_frame, frame, ...)
 
         For a v2 file that's:
-        * ``list(self.sphere.arches)`` triggers ``LiveFrameSeries.__iter__``,
+        * ``list(self.scan.frames)`` triggers ``LiveFrameSeries.__iter__``,
           which lazy-loads every frame from disk sequentially BEFORE
           the first worker gets a task — seconds-to-tens-of-seconds of
           GUI-thread blocking before parallel work begins.
-        * Each arch (with L1 lazy raw load) carries a multi-MB
+        * Each frame (with L1 lazy raw load) carries a multi-MB
           ``map_raw`` numpy array.  ProcessPoolExecutor pickles every
           one of those into a child process — gigabytes of IPC on a
           10k-frame Eiger scan.
-        * Peak RAM holds the full list of N arches in the parent,
+        * Peak RAM holds the full list of N frames in the parent,
           defeating the ``_in_memory_cap=64`` eviction policy.
 
         After M2:
@@ -145,77 +146,81 @@ class integratorThread(Qt.QtCore.QThread):
                 self.data_2d.clear()
             else:
                 self.data_1d.clear()
-        with self.sphere.sphere_lock:
+        with self.scan.scan_lock:
             if do_2d:
-                self.sphere.bai_2d = None
+                self.scan.bai_2d = None
             else:
-                self.sphere.bai_1d = None
+                self.scan.bai_1d = None
 
-        max_cores = getattr(self.sphere, 'max_cores', 1)
-        indices = list(self.sphere.arches.index)
+        max_cores = getattr(self.scan, 'max_cores', 1)
+        indices = list(self.scan.frames.index)
         if not indices:
             return
 
-        def _publish(arch):
-            """Reattach arch into sphere and viewer dicts.
+        def _publish(frame):
+            """Reattach frame into scan and viewer dicts.
 
-            N3: ``sphere.arches[arch.idx] = arch`` is a sphere-state
+            N3: ``scan.frames[frame.idx] = frame`` is a scan-state
             mutation that other threads (the wrangler thread, the
             GUI's LiveFrameSeries.__getitem__) can race against.  Hold
-            ``sphere_lock`` while we do it.  The lock is short — just
+            ``scan_lock`` while we do it.  The lock is short — just
             the dict assignment + the bai accumulator — and the
-            accumulator path itself already takes sphere_lock
+            accumulator path itself already takes scan_lock
             internally, so we don't deadlock by nesting (Condition
             is reentrant).
             """
-            with self.sphere.sphere_lock:
-                self.sphere.arches[arch.idx] = arch
+            with self.scan.scan_lock:
+                self.scan.frames[frame.idx] = frame
             if do_2d:
-                self.sphere._accumulate_bai_2d(arch)
+                self.scan._accumulate_bai_2d(frame)
                 with self.data_lock:
-                    self.data_2d[int(arch.idx)] = {
-                        'map_raw': arch.map_raw,
-                        'bg_raw': arch.bg_raw,
-                        'mask': arch.mask,
-                        'int_2d': arch.int_2d,
-                        'gi_2d': arch.gi_2d,
+                    self.data_2d[int(frame.idx)] = {
+                        'map_raw': frame.map_raw,
+                        'bg_raw': frame.bg_raw,
+                        'mask': frame.mask,
+                        'int_2d': frame.int_2d,
+                        'gi_2d': frame.gi_2d,
                     }
                     # A standard 2D reintegrate also refreshes 1D so
                     # linked viewers do not keep stale cached curves.
-                    self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
+                    self.data_1d[int(frame.idx)] = frame.copy_for_display(
+                        include_2d=False,
+                    )
             else:
-                self.sphere._accumulate_bai_1d(arch)
+                self.scan._accumulate_bai_1d(frame)
                 with self.data_lock:
-                    self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
-            self.update.emit(arch.idx)
+                    self.data_1d[int(frame.idx)] = frame.copy_for_display(
+                        include_2d=False,
+                    )
+            self.update.emit(frame.idx)
 
         label = '2D' if do_2d else '1D'
         n_workers = max(1, min(max_cores, len(indices)))
         standard_plan = self._plan_cache.get(
-            self.sphere, integrate_2d=do_2d,
+            self.scan, integrate_2d=do_2d,
         )
 
         # IntegratorPool: one deep-copied pyFAI integrator per worker.
-        # If sphere._cached_integrator is None (sphere fresh-from-load
+        # If scan._cached_integrator is None (scan fresh-from-load
         # without a wrangler having attached an integrator), the pool
         # comes back None and we fall back to the serial path.
         from xdart.utils.integrator_pool import ensure_integrator_pool
         from concurrent.futures import ThreadPoolExecutor
 
         integrator_pool = ensure_integrator_pool(
-            self.sphere, '_cached_integrator', n_workers,
+            self.scan, '_cached_integrator', n_workers,
         )
 
         # Same per-worker pattern for the GI fiber integrator (H2).
-        # Only relevant when sphere.gi is set AND a fiber integrator
+        # Only relevant when scan.gi is set AND a fiber integrator
         # has been pre-built; otherwise None and the integrate calls
         # treat the fiber arg as a no-op.
         fiber_pool = None
-        if (self.sphere.gi
-                and getattr(self.sphere, '_cached_fiber_integrator', None)
+        if (self.scan.gi
+                and getattr(self.scan, '_cached_fiber_integrator', None)
                 is not None):
             fiber_pool = ensure_integrator_pool(
-                self.sphere, '_cached_fiber_integrator', n_workers,
+                self.scan, '_cached_fiber_integrator', n_workers,
                 pool_attr='_cached_fiber_integrator_pool',
             )
 
@@ -233,67 +238,67 @@ class integratorThread(Qt.QtCore.QThread):
         )
         _borrow_fi = wranglerThread._borrow_fiber_integrator
 
-        def _worker(arch):
-            """Re-integrate one arch on a thread.  Borrows a private
+        def _worker(frame):
+            """Re-integrate one frame on a thread.  Borrows a private
             integrator from the pool to avoid pyFAI's CSR scratch
             buffer races; same fix as IntegratorPool in the wranglers.
             """
-            if self.sphere.static:
-                arch.static = True
-            if self.sphere.gi:
-                arch.gi = True
+            if self.scan.static:
+                frame.static = True
+            if self.scan.gi:
+                frame.gi = True
             if integrator_pool is not None:
                 with integrator_pool.borrow() as ai:
-                    arch.integrator = ai
+                    frame.integrator = ai
 
-                    def _legacy_gi_for_arch() -> None:
+                    def _legacy_gi_for_frame() -> None:
                         # P2: angle-aware fiber borrow — pool hit when the
-                        # arch's incidence angle matches the cached
+                        # frame's incidence angle matches the cached
                         # prewarm angle (most scans), worker-local build
                         # otherwise.
-                        with _borrow_fi(self.sphere, fiber_pool, arch) as fi:
-                            arch.integrate_1d(
+                        with _borrow_fi(self.scan, fiber_pool, frame) as fi:
+                            frame.integrate_1d(
                                 fiber_integrator=fi,
-                                **self.sphere.bai_1d_args,
+                                **self.scan.bai_1d_args,
                             )
                             if do_2d:
-                                arch.integrate_2d(
+                                frame.integrate_2d(
                                     fiber_integrator=fi,
-                                    **self.sphere.bai_2d_args,
+                                    **self.scan.bai_2d_args,
                                 )
 
                     dispatch_live_frame_reduction(
-                        arch, self.sphere,
+                        frame, self.scan,
                         standard_plan=standard_plan,
                         integrator=ai,
-                        global_mask=self.sphere.global_mask,
-                        legacy_gi=_legacy_gi_for_arch,
+                        global_mask=self.scan.global_mask,
+                        legacy_gi=_legacy_gi_for_frame,
                     )
                     # Detach pool integrator before the next worker
                     # borrows the same instance.
-                    arch.integrator = self.sphere._cached_integrator
+                    frame.integrator = self.scan._cached_integrator
             else:
                 # Fallback: no integrator pool — still go through the
                 # shared dispatch helper so the GI vs standard logic
                 # stays in one place.
                 def _legacy_gi_serial() -> None:
                     if do_2d:
-                        arch.integrate_2d(**self.sphere.bai_2d_args)
+                        frame.integrate_2d(**self.scan.bai_2d_args)
                     else:
-                        arch.integrate_1d(**self.sphere.bai_1d_args)
+                        frame.integrate_1d(**self.scan.bai_1d_args)
 
                 dispatch_live_frame_reduction(
-                    arch, self.sphere,
+                    frame, self.scan,
                     standard_plan=standard_plan,
-                    integrator=arch.integrator,
-                    global_mask=self.sphere.global_mask,
+                    integrator=frame.integrator,
+                    global_mask=self.scan.global_mask,
                     legacy_gi=_legacy_gi_serial,
                 )
-            return arch
+            return frame
 
         # Batched dispatch: lazy-load each batch right before
         # submitting it, publish results, then drop the batch's
-        # arches so RAM stays bounded.
+        # frames so RAM stays bounded.
         _RE_BATCH = max(8, 32 * n_workers)
 
         if max_cores > 1 and len(indices) > 1 and integrator_pool is not None:
@@ -301,24 +306,24 @@ class integratorThread(Qt.QtCore.QThread):
                 chunk_idxs = indices[i:i + _RE_BATCH]
                 # LiveFrameSeries.__getitem__ does the lazy v2 load + sets
                 # source refs / _source_root for the L1 raw loader.
-                arches = [self.sphere.arches[idx] for idx in chunk_idxs]
+                frames = [self.scan.frames[idx] for idx in chunk_idxs]
                 with ThreadPoolExecutor(max_workers=n_workers) as pool:
                     futures = {
-                        pool.submit(_worker, arch): arch.idx
-                        for arch in arches
+                        pool.submit(_worker, frame): frame.idx
+                        for frame in frames
                     }
                     from concurrent.futures import as_completed
                     for fut in as_completed(futures):
                         try:
                             _publish(fut.result())
                         except Exception as e:
-                            arch_idx = futures[fut]
+                            frame_idx = futures[fut]
                             logger.error(
-                                "%s integration failed for arch %s: %s",
-                                label, arch_idx, e, exc_info=True,
+                                "%s integration failed for frame %s: %s",
+                                label, frame_idx, e, exc_info=True,
                             )
-                            self.update.emit(arch_idx)
-                # ``arches`` goes out of scope at the end of the
+                            self.update.emit(frame_idx)
+                # ``frames`` goes out of scope at the end of the
                 # iteration, so the FIFO _in_memory_cap eviction
                 # can free those frames before the next chunk loads.
         else:
@@ -326,8 +331,8 @@ class integratorThread(Qt.QtCore.QThread):
             # integrator pool available).  Still lazy-loaded one
             # at a time so we don't materialise the full list.
             for idx in indices:
-                arch = self.sphere.arches[idx]
-                _publish(_worker(arch))
+                frame = self.scan.frames[idx]
+                _publish(_worker(frame))
 
         # Persist recomputed int_* rows back to disk via the v2
         # replace-frames path.  The save re-writes /entry/reduction
@@ -343,82 +348,86 @@ class integratorThread(Qt.QtCore.QThread):
         # release.  Wrangler save paths already do this; the
         # reintegrate path was the one save site that didn't, which
         # could race a viewer's open handle on the same .nxs file.
-        replace_idxs = list(self.sphere.arches.index)
+        replace_idxs = list(self.scan.frames.index)
         if replace_idxs:
             from xdart.utils.h5pool import get_pool as _get_h5pool
-            _get_h5pool().pause(self.sphere.data_file)
+            _get_h5pool().pause(self.scan.data_file)
             try:
-                self.sphere.save_to_nexus(
+                self.scan.save_to_nexus(
                     replace_frame_indices=replace_idxs,
                 )
             finally:
-                _get_h5pool().resume(self.sphere.data_file)
+                _get_h5pool().resume(self.scan.data_file)
 
     def bai_2d_SI(self):
-        """Integrate the current arch, 2d
+        """Integrate the current frame, 2d
         """
-        if getattr(self.sphere, 'skip_2d', False):
+        if getattr(self.scan, 'skip_2d', False):
             return
-        idxs = self.arch_ids
-        if 'Overall' in self.arch_ids:
-            idxs = self.sphere.arches.index
+        idxs = self.frame_ids
+        if 'Overall' in self.frame_ids:
+            idxs = self.scan.frames.index
         # C1: cached plan covers integrate_1d + integrate_2d together
         # since a 2D reintegrate also refreshes the cached 1D entry.
-        plan = self._plan_cache.get(self.sphere, integrate_2d=True)
-        # for idx in self.arches.keys():
+        plan = self._plan_cache.get(self.scan, integrate_2d=True)
+        # for idx in self.frames.keys():
         for idx in idxs:
-            arch = self.sphere.arches[int(idx)]
+            frame = self.scan.frames[int(idx)]
 
-            def _legacy_gi_2d(arch=arch) -> None:
-                arch.integrate_2d(**self.sphere.bai_2d_args)
+            def _legacy_gi_2d(frame=frame) -> None:
+                frame.integrate_2d(**self.scan.bai_2d_args)
 
             dispatch_live_frame_reduction(
-                arch, self.sphere,
+                frame, self.scan,
                 standard_plan=plan,
-                integrator=arch.integrator,
-                global_mask=self.sphere.global_mask,
+                integrator=frame.integrator,
+                global_mask=self.scan.global_mask,
                 legacy_gi=_legacy_gi_2d,
             )
             with self.data_lock:
                 self.data_2d[int(idx)] = {
-                    'map_raw': arch.map_raw,
-                    'bg_raw': arch.bg_raw,
-                    'mask': arch.mask,
-                    'int_2d': arch.int_2d,
-                    'gi_2d': arch.gi_2d}
-                if not self.sphere.gi:
-                    self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
+                    'map_raw': frame.map_raw,
+                    'bg_raw': frame.bg_raw,
+                    'mask': frame.mask,
+                    'int_2d': frame.int_2d,
+                    'gi_2d': frame.gi_2d}
+                if not self.scan.gi:
+                    self.data_1d[int(frame.idx)] = frame.copy_for_display(
+                        include_2d=False,
+                    )
             self.update.emit(idx)
 
     def bai_1d_SI(self):
-        """Integrate the current arch, 1d.
+        """Integrate the current frame, 1d.
         """
-        idxs = self.arch_ids
-        if 'Overall' in self.arch_ids:
-            idxs = self.sphere.arches.index
-        plan = self._plan_cache.get(self.sphere, integrate_2d=False)
-        # for (idx, arch) in self.arches.items():
+        idxs = self.frame_ids
+        if 'Overall' in self.frame_ids:
+            idxs = self.scan.frames.index
+        plan = self._plan_cache.get(self.scan, integrate_2d=False)
+        # for (idx, frame) in self.frames.items():
         for idx in idxs:
-            arch = self.sphere.arches[int(idx)]
+            frame = self.scan.frames[int(idx)]
 
-            def _legacy_gi_1d(arch=arch) -> None:
-                arch.integrate_1d(**self.sphere.bai_1d_args)
+            def _legacy_gi_1d(frame=frame) -> None:
+                frame.integrate_1d(**self.scan.bai_1d_args)
 
             dispatch_live_frame_reduction(
-                arch, self.sphere,
+                frame, self.scan,
                 standard_plan=plan,
-                integrator=arch.integrator,
-                global_mask=self.sphere.global_mask,
+                integrator=frame.integrator,
+                global_mask=self.scan.global_mask,
                 legacy_gi=_legacy_gi_1d,
             )
             with self.data_lock:
-                self.data_1d[int(arch.idx)] = arch.copy(include_2d=False)
-            self.update.emit(arch.idx)
+                self.data_1d[int(frame.idx)] = frame.copy_for_display(
+                    include_2d=False,
+                )
+            self.update.emit(frame.idx)
 
     def load(self):
         """Load data.
         """
-        self.sphere.load_from_h5()
+        self.scan.load_from_h5()
 
 
 class fileHandlerThread(Qt.QtCore.QThread):
@@ -430,38 +439,45 @@ class fileHandlerThread(Qt.QtCore.QThread):
     sigTaskStarted = Qt.QtCore.Signal()
     sigTaskDone = Qt.QtCore.Signal(str)
     
-    def __init__(self, sphere, arch, file_lock,
-                 parent=None, arch_ids=None, arches=None,
+    def __init__(self, scan, frame, file_lock,
+                 parent=None, frame_ids=None, frames=None,
                  data_1d=None, data_2d=None, data_lock=None):
         """
         Parameters
         ----------
         file_lock : multiprocessing.Condition
-        arch : xdart.modules.live.LiveFrame
-        sphere : xdart.modules.live.LiveScan
+        frame : xdart.modules.live.LiveFrame
+        scan : xdart.modules.live.LiveScan
         data_lock : threading.RLock, optional
             Shared lock guarding data_1d / data_2d; a private RLock is
             created when not provided.
 
-        H3: ``arch_ids``, ``data_1d``, ``data_2d`` default to None
+        H3: ``frame_ids``, ``data_1d``, ``data_2d`` default to None
         (was ``[]`` / ``{}`` — mutable defaults shared across all
         instances that omit the kwarg).
         """
         super().__init__(parent)
-        self.sphere = sphere
-        self.arch = arch
-        self.arch_ids = arch_ids if arch_ids is not None else []
-        self.arches = arches
+        self.scan = scan
+        self.frame = frame
+        self.frame_ids = frame_ids if frame_ids is not None else []
+        self.frames = frames
         self.data_1d = data_1d if data_1d is not None else {}
         self.data_2d = data_2d if data_2d is not None else {}
         self.data_lock = data_lock if data_lock is not None else RLock()
         self.file_lock = file_lock
         self.queue = Queue()
-        self.fname = sphere.data_file
+        self.fname = scan.data_file
         self.new_fname = None
         self.lock = Condition()
         self.running = False
         self.update_2d = True
+        # When True, ``set_datafile`` only repoints ``data_file`` at the
+        # new scan instead of reloading the (lagging) on-disk frames.
+        # Set by static_scan_widget for the duration of a live, non-batch
+        # wrangler run — during which the GUI scan is driven entirely
+        # by the in-memory per-frame hand-off and a disk reload would
+        # blank the live display.  See static_scan_widget.start_wrangler.
+        self.live_run = False
 
     def run(self):
         while True:
@@ -481,67 +497,81 @@ class fileHandlerThread(Qt.QtCore.QThread):
     
     def set_datafile(self):
         with self.file_lock:
-            skip_2d = getattr(self.sphere, 'skip_2d', False)
-            # O7: dropped legacy ``save_args={'compression': None}``
-            # passthrough — the v2 writer (save_to_nexus) doesn't
-            # accept a ``compression`` kwarg.  N5 made set_datafile's
-            # defaults None-sentinels, so omitting save_args is the
-            # right call.  The stale dict was stripped inside
-            # set_datafile via ``save_args.pop('compression', None)``
-            # but that workaround is unnecessary now that the caller
-            # doesn't supply the dead kwarg in the first place.
-            self.sphere.set_datafile(self.fname)
-            self.sphere.skip_2d = skip_2d  # preserve checkbox state across load
+            skip_2d = getattr(self.scan, 'skip_2d', False)
+            if getattr(self, 'live_run', False):
+                # Live, non-batch run: the wrangler owns this file and
+                # is feeding the GUI in-memory frames per frame.  A full
+                # ``scan.set_datafile`` would call ``load_from_h5``,
+                # which replaces ``scan.frames`` with a disk-backed
+                # series whose index only reflects flushed frames (saves
+                # are batched every LIVE_SAVE_INTERVAL).  That discards
+                # the just-appended in-memory frame indices and blanks
+                # the display until the next disk flush — the multi-scan
+                # Eiger "plots never update" bug.  Repoint the path only;
+                # new_scan() already reset the index for this scan.
+                self.scan.data_file = self.fname
+                self.scan.name = os.path.split(self.fname)[-1].split('.')[0]
+            else:
+                # O7: dropped legacy ``save_args={'compression': None}``
+                # passthrough — the v2 writer (save_to_nexus) doesn't
+                # accept a ``compression`` kwarg.  N5 made set_datafile's
+                # defaults None-sentinels, so omitting save_args is the
+                # right call.  The stale dict was stripped inside
+                # set_datafile via ``save_args.pop('compression', None)``
+                # but that workaround is unnecessary now that the caller
+                # doesn't supply the dead kwarg in the first place.
+                self.scan.set_datafile(self.fname)
+            self.scan.skip_2d = skip_2d  # preserve checkbox state across load
         self.sigNewFile.emit(self.fname)
         self.sigUpdate.emit()
     
-    def update_sphere(self):
+    def update_scan(self):
         with self.file_lock:
             try:
-                self.sphere.load_from_h5(replace=False, data_only=True,
+                self.scan.load_from_h5(replace=False, data_only=True,
                                          set_mg=False)
             except KeyError as e:
-                logger.debug("Failed to load sphere data from HDF5: %s", e)
+                logger.debug("Failed to load scan data from HDF5: %s", e)
 
-    def load_arch(self):
-        """Load a single arch via the v2 lazy loader (LiveFrameSeries.__getitem__)."""
+    def load_frame(self):
+        """Load a single frame via the v2 lazy loader (LiveFrameSeries.__getitem__)."""
         try:
-            self.arch = self.sphere.arches[self.arch.idx]
+            self.frame = self.scan.frames[self.frame.idx]
         except KeyError as e:
-            logger.debug("load_arch: %s", e)
+            logger.debug("load_frame: %s", e)
         self.sigUpdate.emit()
 
-    def load_arches(self):
-        """Populate data_1d/data_2d caches by lazy-loading arches via v2.
+    def load_frames(self):
+        """Populate data_1d/data_2d caches by lazy-loading frames via v2.
 
         LiveFrameSeries.__getitem__ now reads from the stacked
         ``entry/integrated_1d`` / ``integrated_2d`` arrays and the
         per-frame ``frames/frame_NNNN/thumbnail`` group.  No v1 frame
         groups touched.
         """
-        for idx in self.arch_ids:
+        for idx in self.frame_ids:
             try:
-                arch = self.sphere.arches[int(idx)]
+                frame = self.scan.frames[int(idx)]
             except (KeyError, IndexError) as e:
-                logger.debug("Data missing for arch %s: %s", idx, e)
+                logger.debug("Data missing for frame %s: %s", idx, e)
                 continue
             with self.data_lock:
-                self.data_1d[int(idx)] = arch.copy(include_2d=False)
+                self.data_1d[int(idx)] = frame.copy_for_display(include_2d=False)
                 if self.update_2d:
                     self.data_2d[int(idx)] = {
-                        'map_raw': getattr(arch, 'map_raw', None),
-                        'bg_raw': getattr(arch, 'bg_raw', 0),
-                        'mask': getattr(arch, 'mask', None),
-                        'int_2d': getattr(arch, 'int_2d', None),
-                        'gi_2d': getattr(arch, 'gi_2d', {}),
-                        'thumbnail': getattr(arch, 'thumbnail', None),
+                        'map_raw': getattr(frame, 'map_raw', None),
+                        'bg_raw': getattr(frame, 'bg_raw', 0),
+                        'mask': getattr(frame, 'mask', None),
+                        'int_2d': getattr(frame, 'int_2d', None),
+                        'gi_2d': getattr(frame, 'gi_2d', {}),
+                        'thumbnail': getattr(frame, 'thumbnail', None),
                     }
         self.sigUpdate.emit()
 
     def save_data_as(self):
         if self.new_fname is not None and self.new_fname != "":
             with self.file_lock:
-                with catch(self.sphere.data_file, 'r') as f1:
+                with catch(self.scan.data_file, 'r') as f1:
                     with catch(self.new_fname, 'w') as f2:
                         for key in f1:
                             f1.copy(key, f2)

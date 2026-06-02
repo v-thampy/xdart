@@ -39,7 +39,7 @@ from .h5viewer import H5Viewer
 from .display_frame_widget import displayFrameWidget
 from .integrator import integratorTree
 from .metadata import metadataWidget
-from .wranglers import specWrangler, nexusWrangler, wranglerWidget
+from .wranglers import imageWrangler, nexusWrangler, wranglerWidget
 from xdart.utils._utils import FixSizeOrderedDict, get_fname_dir, get_img_data
 
 QWidget = QtWidgets.QWidget
@@ -51,20 +51,20 @@ QInputDialog = QtWidgets.QInputDialog
 QCombo = QtWidgets.QComboBox
 
 wranglers = {
-    'SPEC': specWrangler,
+    'Image Files': imageWrangler,
     'NeXus': nexusWrangler,
 }
 
 
-def spherelocked(func):
-    """Decorator that acquires sphere_lock before calling the wrapped method.
+def scanlocked(func):
+    """Decorator that acquires scan_lock before calling the wrapped method.
 
-    If self.sphere is not a LiveScan (e.g. during initialisation),
+    If self.scan is not a LiveScan (e.g. during initialisation),
     the function is called without the lock rather than silently returning None.
     """
     def wrapper(self, *args, **kwargs):
-        if isinstance(self.sphere, LiveScan):
-            with self.sphere.sphere_lock:
+        if isinstance(self.scan, LiveScan):
+            with self.scan.scan_lock:
                 return func(self, *args, **kwargs)
         return func(self, *args, **kwargs)
 
@@ -93,16 +93,16 @@ class staticWidget(QWidget):
             entire scan or individual image.
 
     attributes:
-        arch: LiveFrame, currently loaded arch object
-        arch_ids: List of LiveFrame indices currently loaded
-        arches: Dictionary of currently loaded LiveFrames
+        frame: LiveFrame, currently loaded frame object
+        frame_ids: List of LiveFrame indices currently loaded
+        frames: Dictionary of currently loaded LiveFrames
         data_1d: Dictionary object holding all 1D data in memory
         data_2d: Dictionary object holding all 2D data in memory
         command_queue: Queue, used to send commands to wrangler
         dirname: str, absolute path of current directory for scan
         file_lock: mp.Condition, process safe lock
         fname: str, current data file name
-        sphere: LiveScan, current scan data
+        scan: LiveScan, current scan data
         timer: QTimer, currently unused but can be used for periodic
             functions.
         ui: Ui_Form, layout from qtdesigner
@@ -114,11 +114,11 @@ class staticWidget(QWidget):
         close: Handles cleanup prior to closing
         enable_integration: Sets enabled status of widgets related to
             integration
-        first_arch, latest_arch, next_arch: Handle moving between
-            different arches in the overall sphere
+        first_frame, latest_frame, next_frame: Handle moving between
+            different frames in the overall scan
         load_and_set: Combination of load and set methods. Also governs
             file explorer behavior in h5viewer.
-        load_sphere:
+        load_scan:
     """
 
     def __init__(self, parent=None):
@@ -128,9 +128,42 @@ class staticWidget(QWidget):
         self._init_child_widgets()
         self._connect_signals()
         self._init_wranglers()
+        self._strip_combo_checkmarks()
         self._init_defaults_and_timer()
         self.show()
         self.ui.wranglerFrame.activateWindow()
+
+    def _strip_combo_checkmarks(self):
+        """Polish every dropdown in the tab in one sweep:
+
+        * Replace the item delegate with a plain QStyledItemDelegate so the
+          popup shows the selection by highlight only — the default
+          QComboBox delegate draws a current-item checkmark that QSS
+          ``::indicator`` can't remove, and it clipped the longer names.
+        * Widen the popup to its longest entry (the combo box itself stays
+          compact in the toolbar) so options like "Image Viewer" / "Int 1D
+          (XYE)" aren't truncated.
+
+        Covers the mode combo (in wranglerStack), the 1D plot Single/Q-θ
+        combos, the top-bar Scale/colormap, the 2D-unit combo, and the
+        integrator unit combos — all are descendants here.
+        """
+        for combo in self.findChildren(QtWidgets.QComboBox):
+            combo.setItemDelegate(QtWidgets.QStyledItemDelegate(combo))
+            view = combo.view()
+            try:
+                view.setTextElideMode(QtCore.Qt.ElideNone)
+                fm = combo.fontMetrics()
+                widest = max(
+                    (fm.horizontalAdvance(combo.itemText(i))
+                     for i in range(combo.count())),
+                    default=0,
+                )
+                if widest:
+                    # + room for item padding and the popup scrollbar.
+                    view.setMinimumWidth(widest + 44)
+            except Exception:
+                logger.debug("combo popup sizing skipped", exc_info=True)
 
     # ── Initialization helpers ─────────────────────────────────────
 
@@ -140,7 +173,7 @@ class staticWidget(QWidget):
         # Reentrant lock guarding concurrent access to data_1d / data_2d from
         # the GUI thread, integratorThread, and fileHandlerThread. Shared with
         # all child widgets and worker threads. Always the OUTER lock when
-        # paired with sphere.sphere_lock (data_lock → sphere_lock).
+        # paired with scan.scan_lock (data_lock → scan_lock).
         self.data_lock = threading.RLock()
         # Scratch directory for working .nxs files (under the user's home).
         self.local_path = get_fname_dir()
@@ -149,16 +182,16 @@ class staticWidget(QWidget):
             os.mkdir(self.dirname)
 
         self.fname = os.path.join(self.dirname, 'default.nxs')
-        # J2: share ``file_lock`` with the sphere so direct
+        # J2: share ``file_lock`` with the scan so direct
         # LiveFrameSeries lazy loads use the same lock as the
         # wrangler's save paths.
-        self.sphere = LiveScan('null_main',
+        self.scan = LiveScan('null_main',
                                data_file=self.fname,
                                static=True,
                                file_lock=self.file_lock)
-        self.arch = LiveFrame(static=True, gi=self.sphere.gi)
-        self.arch_ids = []
-        self.arches = OrderedDict()
+        self.frame = LiveFrame(static=True, gi=self.scan.gi)
+        self.frame_ids = []
+        self.frames = OrderedDict()
         # O4: both 1D and 2D caches are bounded with the same cap.
         # Pre-O4 ``data_1d`` was an unbounded OrderedDict while
         # ``data_2d`` was FixSizeOrderedDict(max=20), and the manual
@@ -186,15 +219,15 @@ class staticWidget(QWidget):
         """Create H5Viewer, DisplayFrame, IntegratorTree, and Metadata widgets."""
         # H5Viewer
         self.h5viewer = H5Viewer(self.file_lock, self.local_path, self.dirname,
-                                 self.sphere, self.arch, self.arch_ids, self.arches,
+                                 self.scan, self.frame, self.frame_ids, self.frames,
                                  self.data_1d, self.data_2d,
                                  self.ui.hdf5Frame, data_lock=self.data_lock)
         self.ui.hdf5Frame.setLayout(self.h5viewer.layout)
         self.h5viewer.update_scans()
 
         # DisplayFrame
-        self.displayframe = displayFrameWidget(self.sphere, self.arch,
-                                               self.arch_ids, self.arches,
+        self.displayframe = displayFrameWidget(self.scan, self.frame,
+                                               self.frame_ids, self.frames,
                                                self.data_1d, self.data_2d,
                                                parent=self.ui.middleFrame,
                                                data_lock=self.data_lock)
@@ -202,17 +235,17 @@ class staticWidget(QWidget):
 
         # IntegratorTree
         self.integratorTree = integratorTree(
-            self.sphere, self.arch, self.file_lock,
-            self.arches, self.arch_ids, self.data_1d, self.data_2d,
+            self.scan, self.frame, self.file_lock,
+            self.frames, self.frame_ids, self.data_1d, self.data_2d,
             data_lock=self.data_lock)
         self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
-        if len(self.sphere.arches.index) > 0:
+        if len(self.scan.frames.index) > 0:
             self.integratorTree.update()
         self.integratorTree.ui.raw_to_tif.hide()
 
         # Metadata
-        self.metawidget = metadataWidget(self.sphere, self.arch,
-                                         self.arch_ids, self.arches,
+        self.metawidget = metadataWidget(self.scan, self.frame,
+                                         self.frame_ids, self.frames,
                                          data_1d=self.data_1d)
         self.ui.metaFrame.setLayout(self.metawidget.layout)
 
@@ -224,10 +257,12 @@ class staticWidget(QWidget):
         self.h5viewer.sigThreadFinished.connect(self.thread_state_changed)
         self.h5viewer.ui.listData.itemClicked.connect(self.disable_auto_last)
         self.h5viewer.ui.auto_last.clicked.connect(self.enable_auto_last)
-        self.h5viewer.ui.auto_last.clicked.connect(self.latest_arch)
+        self.h5viewer.ui.auto_last.clicked.connect(self.latest_frame)
 
-        # DisplayFrame signals
-        self.displayframe.ui.update2D.stateChanged.connect(self.update_h5_options)
+        # DisplayFrame signals.  (The "Update 2D" toggle was removed — 2D
+        # now always renders.  The File ▸ Export menu actions still drive
+        # the save_image / save_1D methods even though the in-panel Save
+        # buttons are gone.)
         self.h5viewer.actionSaveImage.triggered.connect(self.displayframe.save_image)
         self.h5viewer.actionSaveArray.triggered.connect(self.displayframe.save_1D)
         # Plot method changes drive the H5 data list selection mode so
@@ -251,7 +286,7 @@ class staticWidget(QWidget):
             self.ui.wranglerStack.addWidget(
                 w(
                     self.fname, self.file_lock,
-                    self.sphere, self.data_1d, self.data_2d,
+                    self.scan, self.data_1d, self.data_2d,
                 )
             )
         self.ui.wranglerStack.currentChanged.connect(self.set_wrangler)
@@ -293,7 +328,7 @@ class staticWidget(QWidget):
         self.wrangler.sigStart.connect(self.start_wrangler)
         self.wrangler.sigUpdateData.connect(self.update_data)
         self.wrangler.sigUpdateFile.connect(self.new_scan)
-        # self.wrangler.sigUpdateArch.connect(self.new_arch)
+        # self.wrangler.sigUpdateFrame.connect(self.new_frame)
         self.wrangler.sigUpdateGI.connect(self.update_scattering_geometry)
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
@@ -303,8 +338,13 @@ class staticWidget(QWidget):
                 if 'Viewer' in mode_text:
                     return
                 self.displayframe._apply_1d_only_visibility()
-                if '2D' in mode_text:
-                    self.displayframe.update()
+                # Drop any visible/cached content from the previous mode,
+                # then reload the current selection for the new processing
+                # mode. Calling update() alone can leave a stale image/cake
+                # or curve visible when the new mode needs data that has not
+                # been loaded yet.
+                self.displayframe.clear_display_state()
+                self.h5viewer.data_changed()
             self.wrangler.ui.processingModeCombo.currentTextChanged.connect(_on_mode_changed)
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
             self.wrangler.sigViewerModeChanged.connect(self._on_viewer_mode_changed)
@@ -357,7 +397,7 @@ class staticWidget(QWidget):
         return
 
     def update_data(self, idx):
-        """Called by signal from wrangler when a new arch is processed.
+        """Called by signal from wrangler when a new frame is processed.
 
         Instead of rendering immediately (which blocks the main thread
         and causes frame-skipping when the wrangler is faster than the
@@ -378,44 +418,61 @@ class staticWidget(QWidget):
                 self._update_timer.start()
             return
 
-        # Per-frame mid-scan refresh.  Append idx to sphere.arches.index
-        # and bypass the file_thread.load_arch disk read by pulling the
-        # freshly-integrated arch directly out of the wrangler's in-memory
-        # publication slot (see wrangler_thread._published_arches).
-        # The arch contains map_raw, mask, int_1d, int_2d, gi_2d, etc.
+        # Per-frame mid-scan refresh.  Append idx to scan.frames.index
+        # and bypass the file_thread.load_frame disk read by pulling the
+        # freshly-integrated frame directly out of the wrangler's in-memory
+        # publication slot (see wrangler_thread._published_frames).
+        # The frame contains map_raw, mask, int_1d, int_2d, gi_2d, etc.
         # All we need for the displayframe — no disk hit, no file-lock
         # contention with the wrangler's per-frame write.
         try:
-            if idx not in self.sphere.arches.index:
-                self.sphere.arches.index.append(idx)
-                self.sphere.arches.index.sort()
+            # Guard the in-memory index mutation with the scan's own
+            # lock — the file-thread (load_frames / set_datafile) also
+            # touches this list, and h5viewer.update_data reads it on the
+            # GUI thread.  This is the GUI scan's lock, distinct from
+            # the wrangler scan's, so it never contends with the
+            # wrangler's disk writes (no GUI stall).
+            with self.scan.scan_lock:
+                index = self.scan.frames.index
+                if idx not in index:
+                    # Common case — frames arrive in order: append without
+                    # the O(N log N) re-sort.  Only out-of-order inserts
+                    # (rare: reload/replace) pay for a sort, so a long scan
+                    # stays O(1) per frame instead of O(N log N).
+                    if not index or idx > index[-1]:
+                        index.append(idx)
+                    else:
+                        index.append(idx)
+                        index.sort()
         except AttributeError:
-            # arches may briefly be None or replaced during set_datafile.
+            # frames may briefly be None or replaced during set_datafile.
             pass
 
-        # Consume the published arch from the wrangler thread.
+        # Consume the published frame from the wrangler thread.
         published = getattr(self.wrangler, "thread", None)
         if published is not None:
-            arch = getattr(published, "_published_arches", {}).pop(idx, None)
+            frame = getattr(published, "_published_frames", {}).pop(idx, None)
         else:
-            arch = None
-        if arch is not None:
+            frame = None
+        if frame is not None:
             try:
                 with self.h5viewer.data_lock:
                     # 1D copy (no map_raw / 2D payload) — small object
-                    self.h5viewer.data_1d[int(idx)] = arch.copy(include_2d=False)
-                    # 2D payload as a dict matching what file_thread.load_arches
-                    # produces (see sphere_threads.load_arches).  Keys are what
-                    # displayframe.get_arches_map_raw / get_arches_int_2d
+                    self.h5viewer.data_1d[int(idx)] = frame.copy_for_display(
+                        include_2d=False,
+                    )
+                    # 2D payload as a dict matching what file_thread.load_frames
+                    # produces (see scan_threads.load_frames).  Keys are what
+                    # displayframe.get_frames_map_raw / get_frames_int_2d
                     # look for.
-                    if not getattr(self.sphere, "skip_2d", False):
+                    if not getattr(self.scan, "skip_2d", False):
                         self.h5viewer.data_2d[int(idx)] = {
-                            "map_raw": getattr(arch, "map_raw", None),
-                            "bg_raw": getattr(arch, "bg_raw", 0),
-                            "mask": getattr(arch, "mask", None),
-                            "int_2d": getattr(arch, "int_2d", None),
-                            "gi_2d": getattr(arch, "gi_2d", {}),
-                            "thumbnail": getattr(arch, "thumbnail", None),
+                            "map_raw": getattr(frame, "map_raw", None),
+                            "bg_raw": getattr(frame, "bg_raw", 0),
+                            "mask": getattr(frame, "mask", None),
+                            "int_2d": getattr(frame, "int_2d", None),
+                            "gi_2d": getattr(frame, "gi_2d", {}),
+                            "thumbnail": getattr(frame, "thumbnail", None),
                         }
                     # ── Bounded cache eviction ────────────────────────
                     # O4: ``data_1d`` and ``data_2d`` are both bounded
@@ -430,14 +487,44 @@ class staticWidget(QWidget):
                     # misses fall through to the file_thread lazy load.
             except Exception:
                 # Cache miss is non-fatal — displayframe will lazy-load
-                # from disk via file_thread.load_arch as fallback.
-                logger.debug("In-memory arch hand-off failed for idx=%s",
+                # from disk via file_thread.load_frame as fallback.
+                logger.debug("In-memory frame hand-off failed for idx=%s",
                              idx, exc_info=True)
+
+            # Mirror add_frame's scan_data accumulation: the live hand-off
+            # bypasses scan.add_frame, so without this the GUI scan's
+            # scan_data stays empty in non-batch and the metadata panel can
+            # only fall back to the single selected frame.  Build the
+            # whole-scan table here so it shows every frame (as it did
+            # before the live fast-path).
+            info = getattr(frame, "scan_info", None)
+            if info:
+                import pandas as pd
+                try:
+                    ser = pd.Series(info, dtype="float64")
+                    with self.scan.scan_lock:
+                        sd = self.scan.scan_data
+                        if list(sd.columns):
+                            sd.loc[idx] = ser
+                            # In-order fast path: frames usually arrive in
+                            # ascending order, so the row just appended is
+                            # already last — skip the O(N log N) sort_index
+                            # on every frame.  Only an out-of-order insert
+                            # (rare: reload/replace) pays for the sort.
+                            index = sd.index
+                            if len(index) >= 2 and index[-1] < index[-2]:
+                                sd.sort_index(inplace=True)
+                        else:
+                            self.scan.scan_data = pd.DataFrame(
+                                info, index=[idx], dtype="float64")
+                except (ValueError, TypeError):
+                    logger.debug("scan_data update skipped for idx=%s", idx,
+                                 exc_info=True)
 
         # P4: per-frame the *only* thing we do is remember the latest
         # idx + restart the coalescing timer.  The heavy list-widget
         # rebuild (``h5viewer.update_data()``) and the cursor advance
-        # (``latest_arch()``) both fire from ``_flush_pending_update``
+        # (``latest_frame()``) both fire from ``_flush_pending_update``
         # after the 200 ms quiet period — running them per-frame made
         # the GUI O(N) per frame (full list clear + insertItems for
         # every new frame in a long scan), which compounded to O(N²)
@@ -468,7 +555,7 @@ class staticWidget(QWidget):
         * ``h5viewer.update_data()`` — refresh the listData widget
           (incremental append when possible — see
           :meth:`h5viewer.update_data`).
-        * ``latest_arch()`` — advance the auto-last cursor to whatever
+        * ``latest_frame()`` — advance the auto-last cursor to whatever
           ``latest_idx`` is now (P4: was per-frame, now per-flush so
           we don't rebuild the list widget more than once per timer
           tick).
@@ -482,7 +569,7 @@ class staticWidget(QWidget):
         # list to contain the new index before it can select it.
         self.h5viewer.update_data(emit_update=False)
         if self.h5viewer.auto_last:
-            self.latest_arch(emit_update=False)
+            self.latest_frame(emit_update=False)
         self.h5viewer.data_changed()
 
     def disable_auto_last(self, q):
@@ -505,18 +592,18 @@ class staticWidget(QWidget):
         """Connected to h5viewer, sets the data in displayframe based
         on the selected image or overall data.
         """
-        # In viewer mode, always update display (no sphere dependency)
+        # In viewer mode, always update display (no scan dependency)
         is_viewer = getattr(self.h5viewer, 'viewer_mode', None) is not None
-        if is_viewer or self.sphere.name != 'null_main':
+        if is_viewer or self.scan.name != 'null_main':
             self.displayframe.update()
-            # # if (len(self.arches.keys()) > 0) and (len(self.sphere.arches.index) > 0):
+            # # if (len(self.frames.keys()) > 0) and (len(self.scan.frames.index) > 0):
             # if ((len(self.data_1d.keys()) > 0) and
-            #         (len(self.arch_ids) > 0) and
-            #         (self.arch_ids[0] != 'No data') and
-            #         (len(self.sphere.arches.index) > 0)):
+            #         (len(self.frame_ids) > 0) and
+            #         (self.frame_ids[0] != 'No data') and
+            #         (len(self.scan.frames.index) > 0)):
 
             if not is_viewer:
-                if len(self.arch_ids) == 0:
+                if len(self.frame_ids) == 0:
                     self.integratorTree.ui.integrate1D.setEnabled(False)
                     self.integratorTree.ui.integrate2D.setEnabled(False)
                 else:
@@ -529,10 +616,10 @@ class staticWidget(QWidget):
     def close(self):
         """Tries a graceful close.
         """
-        del self.sphere
-        del self.displayframe.sphere
-        del self.arch
-        del self.displayframe.arch
+        del self.scan
+        del self.displayframe.scan
+        del self.frame
+        del self.displayframe.frame
         super().close()
 
         gc.collect()
@@ -587,7 +674,7 @@ class staticWidget(QWidget):
 
         self.h5viewer.update_data()
         if self.h5viewer.auto_last:
-            self.latest_arch()
+            self.latest_frame()
 
         self.displayframe.update()
         self.metawidget.update()
@@ -601,7 +688,7 @@ class staticWidget(QWidget):
         self.h5viewer.update_data()
         
         if self.h5viewer.auto_last:
-            self.latest_arch()
+            self.latest_frame()
             
         self.displayframe.update()
 
@@ -629,32 +716,77 @@ class staticWidget(QWidget):
                 positional so the rename is purely cosmetic at this
                 boundary — the value still flows through unchanged.
         """
-        # if self.sphere.name != name or self.sphere.name == 'null_main':
+        # Eagerly set the scan's name to the new scan's name so the
+        # per-frame ``h5viewer.update_data`` path doesn't bail on the
+        # ``if scan.name == "null_main": return`` guard.  Without
+        # this, the scan name only became real after the async
+        # ``file_thread`` processed the queued ``set_datafile``
+        # command — by which time the wrangler had often moved on
+        # to the next scan.  Visible symptom: in multi-scan Image
+        # Directory runs the plots stayed blank during the entire
+        # run and only the last scan's data appeared at the end.
+        # ``self.h5viewer.set_file`` below still queues the proper
+        # ``set_datafile`` so the scan's ``data_file`` and the
+        # canonical name resolution (via ``scan.set_datafile``)
+        # land correctly; this assignment just unblocks the
+        # synchronous render path immediately.
+        self.scan.name = name
         self.h5viewer.dirname = os.path.dirname(fname)
         self.h5viewer.set_file(fname)
-        self.sphere.gi = gi
-        self.sphere.incidence_motor = incidence_motor
-        self.sphere.single_img = single_img
-        self.sphere.series_average = series_average
+        self.scan.gi = gi
+        self.scan.incidence_motor = incidence_motor
+        self.scan.single_img = single_img
+        self.scan.series_average = series_average
         # Propagate the wrangler-loaded mask (detector + user Mask File,
-        # combined into flat indices) into the main sphere so the
+        # combined into flat indices) into the main scan so the
         # displayframe can overlay it on the raw image.  Without this,
-        # self.sphere.global_mask stays None after a scan and no mask
+        # self.scan.global_mask stays None after a scan and no mask
         # overlay is drawn (regression introduced by the v2 refactor).
         wrangler_mask = getattr(getattr(self.wrangler, 'thread', None),
                                 'mask', None)
         if wrangler_mask is not None:
-            self.sphere.global_mask = wrangler_mask
+            self.scan.global_mask = wrangler_mask
 
         self.integratorTree.get_args('bai_1d')
         self.integratorTree.get_args('bai_2d')
         self.integratorTree.set_image_units()
 
-        # Clear data objects
-        self.data_1d.clear()
-        self.data_2d.clear()
-        self.arches.clear()
-        self.arch_ids.clear()
+        # Flush any throttled update from the *previous* scan before we
+        # blow away its in-memory state.  Without this, in non-batch
+        # multi-scan runs (Image Directory + Eiger) the per-frame
+        # sigUpdate from the previous scan was scheduled but never had
+        # a chance to render before this slot wiped the caches and
+        # repointed the viewer — so the user only ever saw blanks
+        # during the run and the final scan at the end.
+        self._update_timer.stop()
+        self._flush_pending_update()
+
+        # Clear frame index lists (fast; rebuilt by h5viewer.update_data)
+        # but DO NOT clear ``data_1d`` / ``data_2d``.  Pre-fix this
+        # blanked the display the instant a new scan started and the
+        # FixSizeOrderedDict eviction would have handled the memory
+        # bound anyway as new frames came in.  Leaving the data dicts
+        # alone lets the previous scan's last-rendered frame linger
+        # visibly until the new scan's first frame replaces it on
+        # the next ``_flush_pending_update`` tick.
+        self.frames.clear()
+        self.frame_ids.clear()
+
+        # During a live (non-batch) run the async file-thread set_datafile
+        # no longer reloads frames from disk (it would clobber the live
+        # in-memory index — see fileHandlerThread.set_datafile).  So reset
+        # the new scan's frame index synchronously here: drop the previous
+        # scan's indices + cached frames so per-frame sigUpdate appends
+        # build this scan up from empty.  The data_1d / data_2d snapshots
+        # are intentionally left populated so the prior frame lingers on
+        # screen until this scan's first frame replaces it.
+        if self.h5viewer.live_run_active:
+            try:
+                with self.scan.scan_lock:
+                    self.scan.frames.index.clear()
+                    self.scan.frames._in_memory.clear()
+            except AttributeError:
+                pass
 
         self.displayframe.set_axes()
         # self.displayframe.auto_last = True
@@ -672,11 +804,11 @@ class staticWidget(QWidget):
         args:
             gi: bool, flag for determining if in Grazing incidence
         """
-        self.sphere.gi = gi
+        self.scan.gi = gi
         self.integratorTree.set_image_units()
         self.displayframe.set_axes()
 
-    def new_arch(self, arch_data):
+    def new_frame(self, frame_data):
         """Connected to sigUpdateFile from wrangler. Called when a new
         scan is started.
 
@@ -684,13 +816,13 @@ class staticWidget(QWidget):
             name: str, scan name
             fname: str, path to data file for scan
         """
-        arch = LiveFrame(idx=arch_data['idx'], map_raw=arch_data['map_raw'],
-                         mask=arch_data['mask'], scan_info=arch_data['scan_info'],
-                         poni_file=arch_data['poni_file'], static=self.sphere.static, gi=self.sphere.gi)
-        arch.int_1d = arch_data['int_1d']
-        arch.int_2d = arch_data['int_2d']
-        arch.map_norm = arch_data['map_norm']
-        # self.data_2d[str(arch.idx)] = arch
+        frame = LiveFrame(idx=frame_data['idx'], map_raw=frame_data['map_raw'],
+                         mask=frame_data['mask'], scan_info=frame_data['scan_info'],
+                         poni_file=frame_data['poni_file'], static=self.scan.static, gi=self.scan.gi)
+        frame.int_1d = frame_data['int_1d']
+        frame.int_2d = frame_data['int_2d']
+        frame.map_norm = frame_data['map_norm']
+        # self.data_2d[str(frame.idx)] = frame
 
     def start_wrangler(self):
         """Sets up wrangler, ensures properly synced args, and starts
@@ -703,11 +835,22 @@ class staticWidget(QWidget):
         self.integratorTree.get_args('bai_1d')
         self.integratorTree.get_args('bai_2d')
 
-        args = {'bai_1d_args': self.sphere.bai_1d_args,
-                'bai_2d_args': self.sphere.bai_2d_args}
-        self.wrangler.sphere_args = copy.deepcopy(args)
+        args = {'bai_1d_args': self.scan.bai_1d_args,
+                'bai_2d_args': self.scan.bai_2d_args}
+        self.wrangler.scan_args = copy.deepcopy(args)
         self.wrangler.setup()
         self.h5viewer.auto_last = True
+
+        # Live (non-batch) runs drive the display from the in-memory
+        # per-frame hand-off.  Flag the run so the async set_datafile
+        # repoints the file without a disk reload and data_reset doesn't
+        # wipe the live caches (the multi-scan Eiger blank-plot fix).
+        # Batch / XYE-only runs keep the original reload-on-new-file
+        # behaviour — their final refresh reads frames from disk.
+        live = not getattr(self.wrangler.thread, 'batch_mode', False)
+        self.h5viewer.live_run_active = live
+        self.h5viewer.file_thread.live_run = live
+
         self.wrangler.thread.start()
 
     def wrangler_finished(self):
@@ -717,6 +860,14 @@ class staticWidget(QWidget):
         # Flush any pending coalesced update so the final frame is shown.
         self._update_timer.stop()
         self._flush_pending_update()
+
+        # End the live-run window before the end-of-batch reload below:
+        # the auto-load set_file(generated_file) must run the full
+        # set_datafile (disk reload) so frames/scan_data come back from
+        # the finished file, and data_reset must be free to clear stale
+        # caches again.
+        self.h5viewer.live_run_active = False
+        self.h5viewer.file_thread.live_run = False
 
         self.thread_state_changed()
         self.wrangler.stop()
@@ -732,7 +883,7 @@ class staticWidget(QWidget):
             # and may diverge (e.g. spec strips the ``_master`` suffix
             # from eiger master filenames inside the thread, so the
             # widget's fname ends with ``_master.nxs`` but the actual
-            # sphere output is ``<stem>.nxs``).
+            # scan output is ``<stem>.nxs``).
             generated_file = (getattr(self.wrangler.thread, 'fname', None)
                               or getattr(self.wrangler, 'fname', None))
             if generated_file and os.path.exists(generated_file):
@@ -745,17 +896,12 @@ class staticWidget(QWidget):
                 self.h5viewer._auto_select_last_on_finish = True
                 self.h5viewer.set_file(generated_file)
 
-        if self.sphere.name == self.wrangler.scan_name:
+        if self.scan.name == self.wrangler.scan_name:
             self.integrator_thread_finished()
         else:
             self.wrangler.enabled(True)
 
         gc.collect()
-
-    def update_h5_options(self, state):
-        """Changes H5Widget Option to update only 1D or both views
-        """
-        self.h5viewer.update_2d = state
 
     def _on_viewer_mode_changed(self, viewer_mode_str):
         """Enable or disable the integrator panel and update h5viewer for viewer mode.
@@ -765,28 +911,42 @@ class staticWidget(QWidget):
         """
         viewer_mode = viewer_mode_str or None  # '' → None
         is_viewer = viewer_mode is not None
-        # Keep integratorTree enabled so mask/threshold controls remain accessible
-        self.h5viewer.viewer_mode = viewer_mode
-        # Give displayframe a reference to the wrangler for mask/threshold
-        self.displayframe._wrangler = self.wrangler if is_viewer else None
-        # In viewer mode, disable New/Save (keep Open Folder and Export)
-        self.h5viewer.actionNewFile.setEnabled(not is_viewer)
-        self.h5viewer.actionSaveDataAs.setEnabled(not is_viewer)
-        # XYE viewer: allow multi-select for overlay; others: single select
         from PySide6.QtWidgets import QAbstractItemView
-        if viewer_mode == 'xye':
-            self.h5viewer.ui.listScans.setSelectionMode(
-                QAbstractItemView.ExtendedSelection)
-        else:
-            self.h5viewer.ui.listScans.setSelectionMode(
-                QAbstractItemView.SingleSelection)
-        # Configure display panels for the viewer mode
-        self.displayframe.set_viewer_display_mode(viewer_mode)
-        # Refresh scan list to show/hide appropriate file types
-        self.h5viewer.update_scans()
 
-    def latest_arch(self, checked=None, *, emit_update=True):
-        """Advances to last arch in data list, updates displayframe, and
+        scans = self.h5viewer.ui.listScans
+        prev_suspend = getattr(
+            self.h5viewer, '_suspend_scan_selection_loads', False,
+        )
+        was_blocked = scans.blockSignals(True)
+        self.h5viewer._suspend_scan_selection_loads = True
+        try:
+            # Keep integratorTree enabled so mask/threshold controls remain accessible
+            self.h5viewer.viewer_mode = viewer_mode
+            # Give displayframe a reference to the wrangler for mask/threshold
+            self.displayframe._wrangler = self.wrangler if is_viewer else None
+            # In viewer mode, disable New/Save (keep Open Folder and Export)
+            self.h5viewer.actionNewFile.setEnabled(not is_viewer)
+            self.h5viewer.actionSaveDataAs.setEnabled(not is_viewer)
+            # XYE viewer: allow multi-select for overlay; others: single select
+            if viewer_mode == 'xye':
+                scans.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            else:
+                scans.setSelectionMode(QAbstractItemView.SingleSelection)
+            # Configure display panels for the viewer mode
+            self.displayframe.set_viewer_display_mode(viewer_mode)
+            if is_viewer:
+                self.h5viewer.enter_viewer_mode_cleanup()
+            else:
+                self.h5viewer.cancel_pending_loads()
+                self.displayframe.clear_display_state()
+            # Refresh scan list to show/hide appropriate file types
+            self.h5viewer.update_scans()
+        finally:
+            self.h5viewer._suspend_scan_selection_loads = prev_suspend
+            scans.blockSignals(was_blocked)
+
+    def latest_frame(self, checked=None, *, emit_update=True):
+        """Advances to last frame in data list, updates displayframe, and
         set auto_last to True.
 
         Wraps the cursor advance in ``blockSignals`` and invokes
@@ -796,7 +956,7 @@ class staticWidget(QWidget):
         ``itemSelectionChanged`` → ``data_changed`` → ``sigUpdate`` →
         ``set_data`` → a redundant ``displayframe.update()`` on top of
         whatever the caller does next (every call site that drives
-        ``latest_arch`` follows it with its own display refresh).
+        ``latest_frame`` follows it with its own display refresh).
         """
         self.h5viewer.auto_last = True
         if self.h5viewer.ui.listData.count() <= 1:

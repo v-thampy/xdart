@@ -8,11 +8,11 @@ shape (NX_class, signal/axes, dataset shapes, units, mandatory
 groups).  Any future writer that produces the same assertions will
 be format-compatible with everything that already reads these files.
 
-Why a synthetic sphere (not a real LiveFrame + pyFAI integrator):
+Why a synthetic scan (not a real LiveFrame + pyFAI integrator):
 constructing :class:`LiveFrame` pulls in pyFAI's azimuthal
 integrator just to satisfy ``setup_integrator()`` in __init__.  The
 writer never touches the integrator — it only reads attribute trees
-off arches.  Duck-typed objects with the right attrs are enough and
+off frames.  Duck-typed objects with the right attrs are enough and
 keep the test fast / dep-free.
 """
 
@@ -29,7 +29,7 @@ nx = pytest.importorskip("nexusformat.nexus")
 
 
 # ---------------------------------------------------------------------------
-# Synthetic sphere fixture
+# Synthetic scan fixture
 # ---------------------------------------------------------------------------
 
 N_FRAMES = 4
@@ -107,7 +107,7 @@ class _DuckArch:
         )
         self.gi_1d = {}
         self.gi_2d = {}
-        # Thumbnail mirrors what arch.make_thumbnail produces — small 2D float.
+        # Thumbnail mirrors what frame.make_thumbnail produces — small 2D float.
         self.thumbnail = rng.random((64, 64), dtype=np.float32)
 
 
@@ -119,20 +119,20 @@ class _DuckArches:
     * ``.index`` — list of frame indices, matching
       :class:`LiveFrameSeries.index` (an attribute, not the inherited
       ``list.index`` method that the previous fixture exposed).
-    * ``arches[idx]`` — fetch the arch with that *frame* index.
-    * ``list(arches)`` — iterate arches in index order.
+    * ``frames[idx]`` — fetch the frame with that *frame* index.
+    * ``list(frames)`` — iterate frames in index order.
 
     Real LiveFrameSeries adds lazy-disk-load + an in-memory cache; this
     duck stores everything in a dict for in-memory speed.
     """
 
-    def __init__(self, arches):
-        self._by_idx = {a.idx: a for a in arches}
-        self.index = [a.idx for a in arches]
+    def __init__(self, frames):
+        self._by_idx = {a.idx: a for a in frames}
+        self.index = [a.idx for a in frames]
         # Mirror LiveFrameSeries._in_memory — the writer's R4 helpers
         # (_representative_poni, _write_per_frame_metadata) read this
-        # directly to avoid materialising the full arch list on every
-        # save.  Tests use the same dict as _by_idx so every arch is
+        # directly to avoid materialising the full frame list on every
+        # save.  Tests use the same dict as _by_idx so every frame is
         # always "in memory" (real LiveFrameSeries caps this at 64 with
         # FIFO eviction; tests don't need to exercise that path).
         self._in_memory = self._by_idx
@@ -146,25 +146,26 @@ class _DuckArches:
     def __len__(self):
         return len(self.index)
 
-    def append(self, arch):
+    def append(self, frame):
         """Extend the series — used by the new write-then-extend test."""
-        self._by_idx[arch.idx] = arch
-        if arch.idx not in self.index:
-            self.index.append(arch.idx)
+        self._by_idx[frame.idx] = frame
+        if frame.idx not in self.index:
+            self.index.append(frame.idx)
 
 
 class _DuckSphere:
     """Minimal duck-typed LiveScan."""
 
-    def __init__(self, arches, *, scan_data=None, geometry=None,
-                 global_mask=None):
-        self.arches = _DuckArches(arches)
+    def __init__(self, frames, *, scan_data=None, geometry=None,
+                 global_mask=None, gi=False):
+        self.frames = _DuckArches(frames)
         self.scan_data = scan_data if scan_data is not None else pd.DataFrame()
         self.bai_1d_args = {"numpoints": N_Q}
         self.bai_2d_args = {"npt_rad": N_Q, "npt_azim": N_CHI}
         self.mg_args = {"wavelength": 1.0e-10}
         self.geometry = geometry
         self.global_mask = global_mask
+        self.gi = gi
         self.stitched_1d = None
         self.stitched_2d = None
         # Stitching writes only happen with finalize=True; not exercised here.
@@ -176,10 +177,10 @@ class _DuckSphere:
 
 @pytest.fixture
 def written_nxs(tmp_path):
-    """Build a synthetic 4-frame sphere and run it through the writer."""
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    """Build a synthetic 4-frame scan and run it through the writer."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
 
-    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
     scan_data = pd.DataFrame({
         "tth": np.linspace(10.0, 14.0, N_FRAMES, dtype=np.float32),
         "th": np.linspace(0.0, 0.3, N_FRAMES, dtype=np.float32),
@@ -190,22 +191,22 @@ def written_nxs(tmp_path):
     # detector — the values are arbitrary; the writer just stores them.
     global_mask = np.array([0, 1, 256, 65535], dtype=np.int64)
 
-    sphere = _DuckSphere(arches, scan_data=scan_data, global_mask=global_mask)
+    scan = _DuckSphere(frames, scan_data=scan_data, global_mask=global_mask)
 
     path = tmp_path / "roundtrip.nxs"
-    save_sphere_to_nexus(sphere, path, mode="w", finalize=False)
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
     return path
 
 
 @pytest.fixture
 def written_nxs_with_stitched(tmp_path):
-    """4-frame sphere whose ``stitched_1d``/``stitched_2d`` are populated.
+    """4-frame scan whose ``stitched_1d``/``stitched_2d`` are populated.
 
     Exercises the ``finalize=True`` path of
-    :func:`save_sphere_to_nexus`, which writes the stitched outputs
+    :func:`save_scan_to_nexus`, which writes the stitched outputs
     only on the final save of the scan.
     """
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
 
     nq, nchi = 64, 24
     s1 = _DuckResult1D(
@@ -217,46 +218,49 @@ def written_nxs_with_stitched(tmp_path):
         radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
         azimuthal=np.linspace(-180, 180, nchi, endpoint=False,
                               dtype=np.float32),
-        # Stitched 2D intensity is stored in the natural (nchi, nq) shape
-        # (no transpose); this matches how stitch_2d returns its result.
-        intensity=np.random.default_rng(8).random((nchi, nq), dtype=np.float32),
+        # stitch_2d returns IntegrationResult2D.intensity as (npt_rad,
+        # npt_azim) == (nq, nchi); write_stitched stores it AS-IS with
+        # dims (q, chi).  (The old xdart writer mislabelled the axes
+        # [chi, q] over (nq, nchi) data — the delegated primitive fixes
+        # that, so the fixture now uses the real (nq, nchi) orientation.)
+        intensity=np.random.default_rng(8).random((nq, nchi), dtype=np.float32),
     )
 
-    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
-    sphere = _DuckSphere(
-        arches,
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    scan = _DuckSphere(
+        frames,
         scan_data=pd.DataFrame({"tth": np.linspace(10, 14, N_FRAMES,
                                                    dtype=np.float32)}),
     )
-    sphere.stitched_1d = s1
-    sphere.stitched_2d = s2
+    scan.stitched_1d = s1
+    scan.stitched_2d = s2
 
     path = tmp_path / "stitched.nxs"
-    save_sphere_to_nexus(sphere, path, mode="w", finalize=True)
+    save_scan_to_nexus(scan, path, mode="w", finalize=True)
     return path, nq, nchi
 
 
 @pytest.fixture
 def written_nxs_with_geometry(tmp_path):
-    """4-frame sphere WITH a DiffractometerGeometry attached.
+    """4-frame scan WITH a DiffractometerGeometry attached.
 
     Exercises the positioner + per-frame-geometry write paths that the
     bare ``written_nxs`` fixture doesn't touch.
     """
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
 
     geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
 
-    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
     scan_data = pd.DataFrame({
         "tth": np.linspace(10.0, 14.0, N_FRAMES, dtype=np.float32),
         "th": np.linspace(0.0, 0.3, N_FRAMES, dtype=np.float32),
     })
-    sphere = _DuckSphere(arches, scan_data=scan_data, geometry=geom)
+    scan = _DuckSphere(frames, scan_data=scan_data, geometry=geom)
 
     path = tmp_path / "geometry.nxs"
-    save_sphere_to_nexus(sphere, path, mode="w", finalize=False)
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
     return path
 
 
@@ -295,9 +299,12 @@ def test_integrated_1d_nxdata(written_nxs):
     assert g["frame_index"].shape == (N_FRAMES,)
     assert g["sigma"].shape == (N_FRAMES, N_Q)
 
-    # Units on the radial axis
+    # Units on the radial axis.  The shared write_integrated_stack
+    # primitive stores the IntegrationResult's raw unit string verbatim
+    # ("q_A^-1") rather than the old xdart "1/angstrom" remap — this
+    # matches the headless write path so files are interchangeable.
     q_units = g["q"].attrs.get("units", "")
-    assert q_units in ("1/angstrom", "1/nm")
+    assert q_units in ("q_A^-1", "1/angstrom", "1/nm")
 
 
 def test_integrated_2d_nxdata(written_nxs):
@@ -318,6 +325,24 @@ def test_integrated_2d_nxdata(written_nxs):
     assert g["chi"].attrs.get("units") in ("deg", "rad")
 
 
+def test_gi_nonuniform_stacked_2d_writer_stays_strict(tmp_path):
+    """GI 2D outputs still need one shared axis before stacked writing."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    frames = [_DuckArch(idx=0), _DuckArch(idx=1)]
+    frames[1].int_2d = _DuckResult2D(
+        radial=np.linspace(0.6, 5.1, N_Q, dtype=np.float32),
+        azimuthal=np.linspace(-170.0, 170.0, N_CHI, endpoint=False,
+                              dtype=np.float32),
+        intensity=np.ones((N_Q, N_CHI), dtype=np.float32),
+    )
+    scan = _DuckSphere(frames, gi=True)
+
+    path = tmp_path / "gi_nonuniform_2d.nxs"
+    with pytest.raises(ValueError, match="different q/chi axis"):
+        save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+
 def test_frames_group_and_thumbnails(written_nxs):
     """Per-frame metadata lives under NXcollection/frames/frame_NNNN."""
     root = nx.nxload(str(written_nxs))
@@ -332,36 +357,36 @@ def test_frames_group_and_thumbnails(written_nxs):
         assert "vmax" in thumb.attrs
         assert thumb.attrs["dtype"] in ("uint8", "uint16")
         # R2 source ref: path + frame_index always present when the
-        # arch carried a source_file (every test arch does).
+        # frame carried a source_file (every test frame does).
         assert "source" in sub
         src = sub["source"]
         assert src.nxclass == "NXcollection"
         assert "path" in src
         assert "frame_index" in src
-        # The duck fixture sets source_file = "frame_NNNN.tif" and
-        # source_frame_idx = 0 — those should round-trip verbatim.
+        # Source paths are persisted as absolute paths so Image Viewer can
+        # resolve raw masters even when processed files live elsewhere.
         path = src["path"].nxdata
         if isinstance(path, bytes):
             path = path.decode("utf-8")
-        assert path == f"frame_{i:04d}.tif"
+        assert path == str((written_nxs.parent / f"frame_{i:04d}.tif").resolve())
         assert int(src["frame_index"].nxdata) == 0
 
 
 def test_source_ref_multiframe(tmp_path):
     """Eiger-shaped source ref: same source_file, varying frame_index."""
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     import h5py
 
-    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
     # Mimic a NeXus wrangler stamp: every frame points to the same
     # master file, source_frame_idx = global index within the master.
-    for i, a in enumerate(arches):
+    for i, a in enumerate(frames):
         a.source_file = "scan_001_master.h5"
         a.source_frame_idx = 1000 + i  # arbitrary global offset
 
-    sphere = _DuckSphere(arches)
+    scan = _DuckSphere(frames)
     path = tmp_path / "multiframe.nxs"
-    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
 
     with h5py.File(path, "r") as f:
         for i in range(N_FRAMES):
@@ -369,7 +394,7 @@ def test_source_ref_multiframe(tmp_path):
             v = src["path"][()]
             if isinstance(v, bytes):
                 v = v.decode("utf-8")
-            assert v == "scan_001_master.h5"
+            assert v == str((path.parent / "scan_001_master.h5").resolve())
             assert int(src["frame_index"][()]) == 1000 + i
 
 
@@ -377,14 +402,14 @@ def test_replace_frame_indices_updates_only_targets(tmp_path):
     """Replace mode: slice-assign new int_1d/int_2d over the listed
     frames; leave all other rows byte-identical.
     """
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     import h5py
 
     n = 5
-    arches = [_DuckArch(idx=i) for i in range(n)]
-    sphere = _DuckSphere(arches)
+    frames = [_DuckArch(idx=i) for i in range(n)]
+    scan = _DuckSphere(frames)
     path = tmp_path / "replace.nxs"
-    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
 
     # Snapshot original on-disk rows so we can verify untouched frames.
     with h5py.File(path, "r") as f:
@@ -399,7 +424,7 @@ def test_replace_frame_indices_updates_only_targets(tmp_path):
     new_2d_arr = rng.random((N_Q, N_CHI), dtype=np.float32)
     targets = [1, 3]
     for fi in targets:
-        a = arches[fi]
+        a = frames[fi]
         a.int_1d = _DuckResult1D(
             radial=np.asarray(a.int_1d.radial),
             intensity=new_1d_arr.copy(),
@@ -411,8 +436,8 @@ def test_replace_frame_indices_updates_only_targets(tmp_path):
             intensity=new_2d_arr.copy(),
         )
 
-    save_sphere_to_nexus(
-        sphere, path, entry="entry", finalize=False,
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
         replace_frame_indices=targets,
     )
 
@@ -425,7 +450,7 @@ def test_replace_frame_indices_updates_only_targets(tmp_path):
     # Targets: rows updated to the new values.
     for fi in targets:
         assert np.allclose(new_on_disk_1d[fi], new_1d_arr)
-        # 2D layout on disk is (frame, chi, q); arch int_2d is (q, chi).
+        # 2D layout on disk is (frame, chi, q); frame int_2d is (q, chi).
         assert np.allclose(new_on_disk_2d[fi], new_2d_arr.T)
 
     # Non-targets: rows byte-identical to original.
@@ -439,15 +464,15 @@ def test_replace_with_no_existing_file_degrades_to_append(tmp_path):
     """First save with replace_frame_indices set should still succeed —
     no on-disk dataset means there's nothing to replace, so the writer
     falls back to append mode for those frames."""
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     import h5py
 
-    arches = [_DuckArch(idx=i) for i in range(3)]
-    sphere = _DuckSphere(arches)
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
     path = tmp_path / "replace_first.nxs"
     # User somehow calls replace before any append save existed.
-    save_sphere_to_nexus(
-        sphere, path, entry="entry", finalize=False,
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
         replace_frame_indices=[0, 1, 2],
     )
     # Result: the file was created via the append fallback; all rows
@@ -458,49 +483,49 @@ def test_replace_with_no_existing_file_degrades_to_append(tmp_path):
 
 
 def test_reload_only_flag_round_trips(tmp_path):
-    """Frames loaded from disk via _load_arch_v2 should carry
-    is_reload_only=True; freshly-integrated arches handed from the
+    """Frames loaded from disk via _load_frame_v2 should carry
+    is_reload_only=True; freshly-integrated frames handed from the
     wrangler should not.
     """
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
-    from xdart.modules.ewald.arch_series import _load_arch_v2
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.frame_series import _load_frame_v2
     import h5py
 
-    arches = [_DuckArch(idx=i) for i in range(2)]
-    sphere = _DuckSphere(arches)
+    frames = [_DuckArch(idx=i) for i in range(2)]
+    scan = _DuckSphere(frames)
     path = tmp_path / "reload_flag.nxs"
-    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
 
-    # Fresh arches (from the wrangler) — default is_reload_only=False.
-    from xdart.modules.ewald.arch import LiveFrame
+    # Fresh frames (from the wrangler) — default is_reload_only=False.
+    from xdart.modules.ewald.frame import LiveFrame
     fresh = LiveFrame(idx=0)
     assert fresh.is_reload_only is False
 
-    # Reloaded arches — the loader stamps the flag.
+    # Reloaded frames — the loader stamps the flag.
     with h5py.File(path, "r") as f:
-        loaded = _load_arch_v2(f, 0, static=False, gi=False)
+        loaded = _load_frame_v2(f, 0, static=False, gi=False)
     assert loaded.is_reload_only is True
 
 
-def test_has_reload_only_frames_sphere_helper(tmp_path):
+def test_has_reload_only_frames_scan_helper(tmp_path):
     """LiveScan.has_reload_only_frames mirrors the in-memory cache."""
-    from xdart.modules.ewald.sphere import LiveScan
-    from xdart.modules.ewald.arch import LiveFrame
+    from xdart.modules.ewald.scan import LiveScan
+    from xdart.modules.ewald.frame import LiveFrame
 
-    sphere = LiveScan(name='t', data_file=str(tmp_path / 'none.nxs'))
+    scan = LiveScan(name='t', data_file=str(tmp_path / 'none.nxs'))
 
-    # No arches → False (nothing to re-integrate, but nothing flagged).
-    assert sphere.has_reload_only_frames() is False
+    # No frames → False (nothing to re-integrate, but nothing flagged).
+    assert scan.has_reload_only_frames() is False
 
-    # A fresh arch (wrangler hand-off) — flag stays False.
+    # A fresh frame (wrangler hand-off) — flag stays False.
     fresh = LiveFrame(idx=0)
-    sphere.arches.stash(fresh)
-    sphere.arches.index.append(0)
-    assert sphere.has_reload_only_frames() is False
+    scan.frames.stash(fresh)
+    scan.frames.index.append(0)
+    assert scan.has_reload_only_frames() is False
 
     # Mark one as reload-only → True.
     fresh.is_reload_only = True
-    assert sphere.has_reload_only_frames() is True
+    assert scan.has_reload_only_frames() is True
 
 
 def test_acquire_save_reload_reintegrate_save_reload(tmp_path):
@@ -511,17 +536,17 @@ def test_acquire_save_reload_reintegrate_save_reload(tmp_path):
     Uses the real LiveFrameSeries (not the duck) so the test covers the
     actual lazy-load + replace-frames code path.  Re-integration
     here is faked by mutating the int_1d values on the in-memory
-    arches — we're testing the writer's replace mode, not pyFAI.
+    frames — we're testing the writer's replace mode, not pyFAI.
     """
     import h5py
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
-    from xdart.modules.ewald.arch_series import _load_arch_v2
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.frame_series import _load_frame_v2
 
     # --- Phase 1: acquire + save -------------------------------------
-    arches = [_DuckArch(idx=i) for i in range(4)]
-    sphere = _DuckSphere(arches)
+    frames = [_DuckArch(idx=i) for i in range(4)]
+    scan = _DuckSphere(frames)
     path = tmp_path / "lifecycle.nxs"
-    save_sphere_to_nexus(sphere, path, entry="entry", finalize=True)
+    save_scan_to_nexus(scan, path, entry="entry", finalize=True)
 
     # --- Phase 2: reload --------------------------------------------
     with h5py.File(path, "r") as f:
@@ -530,20 +555,20 @@ def test_acquire_save_reload_reintegrate_save_reload(tmp_path):
     # --- Phase 3: simulate reintegration on frames 1 + 2 ------------
     new_intensity_frame1 = np.full(N_Q, 7.0, dtype=np.float32)
     new_intensity_frame2 = np.full(N_Q, 9.0, dtype=np.float32)
-    arches[1].int_1d = _DuckResult1D(
-        radial=np.asarray(arches[1].int_1d.radial),
+    frames[1].int_1d = _DuckResult1D(
+        radial=np.asarray(frames[1].int_1d.radial),
         intensity=new_intensity_frame1.copy(),
-        sigma=arches[1].int_1d.sigma,
+        sigma=frames[1].int_1d.sigma,
     )
-    arches[2].int_1d = _DuckResult1D(
-        radial=np.asarray(arches[2].int_1d.radial),
+    frames[2].int_1d = _DuckResult1D(
+        radial=np.asarray(frames[2].int_1d.radial),
         intensity=new_intensity_frame2.copy(),
-        sigma=arches[2].int_1d.sigma,
+        sigma=frames[2].int_1d.sigma,
     )
 
     # --- Phase 4: save replace --------------------------------------
-    save_sphere_to_nexus(
-        sphere, path, entry="entry", finalize=False,
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
         replace_frame_indices=[1, 2],
     )
 
@@ -566,14 +591,14 @@ def test_replace_with_shape_change_falls_back_to_full_rewrite(tmp_path):
     can't work — writer should delete the group and rewrite from
     scratch so the q/chi axes refresh too.
     """
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     import h5py
 
     n = 3
-    arches = [_DuckArch(idx=i, nq=N_Q, nchi=N_CHI) for i in range(n)]
-    sphere = _DuckSphere(arches)
+    frames = [_DuckArch(idx=i, nq=N_Q, nchi=N_CHI) for i in range(n)]
+    scan = _DuckSphere(frames)
     path = tmp_path / "shape_change.nxs"
-    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
 
     with h5py.File(path, "r") as f:
         assert f["entry/integrated_1d/intensity"].shape == (n, N_Q)
@@ -586,7 +611,7 @@ def test_replace_with_shape_change_falls_back_to_full_rewrite(tmp_path):
     radial_new = np.linspace(0.5, 5.0, NQ2, dtype=np.float32)
     chi_new = np.linspace(-180.0, 180.0, NCHI2, endpoint=False,
                           dtype=np.float32)
-    for a in arches:
+    for a in frames:
         a.int_1d = _DuckResult1D(
             radial=radial_new,
             intensity=rng.random(NQ2, dtype=np.float32),
@@ -601,8 +626,8 @@ def test_replace_with_shape_change_falls_back_to_full_rewrite(tmp_path):
     # Trigger replace mode for all frames.  Shape change should be
     # detected and the writer should rewrite the stacked datasets +
     # refresh the q/chi axes.
-    save_sphere_to_nexus(
-        sphere, path, entry="entry", finalize=False,
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
         replace_frame_indices=[0, 1, 2],
     )
 
@@ -618,24 +643,24 @@ def test_replace_with_shape_change_falls_back_to_full_rewrite(tmp_path):
 def test_replace_unknown_frame_idx_is_silent(tmp_path):
     """Listing a frame_idx that doesn't exist on disk: no error, no
     write, other targets still processed."""
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     import h5py
 
-    arches = [_DuckArch(idx=i) for i in range(3)]
-    sphere = _DuckSphere(arches)
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
     path = tmp_path / "replace_unknown.nxs"
-    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
 
     # Mutate frame 1 only.
     new_arr = np.full(N_Q, 99.0, dtype=np.float32)
-    arches[1].int_1d = _DuckResult1D(
-        radial=np.asarray(arches[1].int_1d.radial),
+    frames[1].int_1d = _DuckResult1D(
+        radial=np.asarray(frames[1].int_1d.radial),
         intensity=new_arr.copy(),
-        sigma=arches[1].int_1d.sigma,
+        sigma=frames[1].int_1d.sigma,
     )
     # Pass valid + invalid frame idx.
-    save_sphere_to_nexus(
-        sphere, path, entry="entry", finalize=False,
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
         replace_frame_indices=[1, 999],
     )
     with h5py.File(path, "r") as f:
@@ -643,20 +668,332 @@ def test_replace_unknown_frame_idx_is_silent(tmp_path):
 
 
 def test_source_ref_omitted_when_no_source_file(tmp_path):
-    """No source/ subgroup is written when arch.source_file is empty."""
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    """No source/ subgroup is written when frame.source_file is empty."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     import h5py
 
-    arches = [_DuckArch(idx=i) for i in range(2)]
-    for a in arches:
+    frames = [_DuckArch(idx=i) for i in range(2)]
+    for a in frames:
         a.source_file = ""  # no source
-    sphere = _DuckSphere(arches)
+    scan = _DuckSphere(frames)
     path = tmp_path / "no_source.nxs"
-    save_sphere_to_nexus(sphere, path, entry="entry", finalize=False)
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
 
     with h5py.File(path, "r") as f:
         for i in range(2):
             assert "source" not in f[f"entry/frames/frame_{i:04d}"]
+
+
+def test_late_out_of_order_frame_is_written(tmp_path):
+    """P2: a late frame whose label lands *between* already-saved labels
+    (save [0, 2], then frame 1 arrives) must get its integrated row written
+    — the old positional-tail selection skipped it."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    # First save with frames 0 and 2 only.
+    scan = _DuckSphere([_DuckArch(idx=0), _DuckArch(idx=2)])
+    path = tmp_path / "late.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    with h5py.File(path, "r") as f:
+        assert sorted(f["entry/integrated_1d/frame_index"][()]) == [0, 2]
+
+    # Frame 1 arrives late; rebuild the scan with [0, 1, 2] in order.
+    scan2 = _DuckSphere([_DuckArch(idx=0), _DuckArch(idx=1), _DuckArch(idx=2)])
+    save_scan_to_nexus(scan2, path, mode="a", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        on_disk = sorted(int(x) for x in f["entry/integrated_1d/frame_index"][()])
+        assert on_disk == [0, 1, 2]            # frame 1 now present
+        assert f["entry/integrated_1d/intensity"].shape[0] == 3
+
+
+def test_scan_data_grows_on_incremental_saves(tmp_path):
+    """P1: scan_data (and positioners/geometry) must track the integrated
+    frame count across per-frame saves — not freeze at the first save's
+    length (live mode never passes finalize=True)."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    import h5py
+
+    geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
+
+    def _scan(n):
+        frames = [_DuckArch(idx=i) for i in range(n)]
+        sd = pd.DataFrame({
+            "tth": np.linspace(10.0, 14.0, n, dtype=np.float32),
+            "th": np.linspace(0.0, 0.3, n, dtype=np.float32),
+            "i0": np.linspace(1e6, 1.2e6, n, dtype=np.float32),
+        }, index=range(n))
+        return _DuckSphere(frames, scan_data=sd, geometry=geom)
+
+    path = tmp_path / "grow.nxs"
+    save_scan_to_nexus(_scan(2), path, mode="w", finalize=False)   # 2 frames
+    save_scan_to_nexus(_scan(5), path, mode="a", finalize=False)   # grows to 5
+
+    with h5py.File(path, "r") as f:
+        assert f["entry/integrated_1d/intensity"].shape[0] == 5
+        # scan_data + positioners + geometry all caught up to 5 (not stuck at 2)
+        assert f["entry/scan_data/frame_index"].shape[0] == 5
+        assert f["entry/scan_data/i0"].shape[0] == 5
+        assert f["entry/sample/positioners/th/value"].shape[0] == 5
+        assert f["entry/per_frame_geometry/frame_index"].shape[0] == 5
+
+
+def test_load_frame_v2_uses_independent_2d_rows_units_and_sigma(tmp_path):
+    """1D and 2D stacks may have different label order and units."""
+    import h5py
+    from xdart.modules.ewald.frame_series import _load_frame_v2
+
+    p = tmp_path / "independent_2d.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g1 = e.create_group("integrated_1d")
+        g1.create_dataset("frame_index", data=np.array([0, 2]))
+        g1.create_dataset("q", data=np.array([1.0, 2.0]))
+        g1.create_dataset("intensity", data=np.array([[10.0, 11.0], [20.0, 21.0]]))
+        g2 = e.create_group("integrated_2d")
+        g2.create_dataset("frame_index", data=np.array([2, 0]))
+        q = g2.create_dataset("q", data=np.array([3.0, 4.0]))
+        q.attrs["units"] = "2th_deg"
+        chi = g2.create_dataset("chi", data=np.array([-1.0, 1.0]))
+        chi.attrs["units"] = "deg"
+        g2.create_dataset(
+            "intensity",
+            data=np.array([[[200.0, 201.0], [202.0, 203.0]],
+                           [[100.0, 101.0], [102.0, 103.0]]]),
+        )
+        g2.create_dataset(
+            "sigma",
+            data=np.array([[[20.0, 21.0], [22.0, 23.0]],
+                           [[10.0, 11.0], [12.0, 13.0]]]),
+        )
+
+    with h5py.File(p, "r") as f:
+        frame = _load_frame_v2(f, 0, static=False, gi=False)
+    np.testing.assert_array_equal(frame.int_2d.intensity,
+                                  [[100.0, 102.0], [101.0, 103.0]])
+    np.testing.assert_array_equal(frame.int_2d.sigma,
+                                  [[10.0, 12.0], [11.0, 13.0]])
+    assert frame.int_2d.unit == "2th_deg"
+
+
+def test_load_frame_v2_restores_scan_info_for_normalization(tmp_path):
+    """Reloaded frames need scan_info for GUI/headless monitor normalization."""
+    import h5py
+    from xdart.modules.ewald.frame_series import _load_frame_v2
+
+    p = tmp_path / "scan_info.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g1 = e.create_group("integrated_1d")
+        g1.create_dataset("frame_index", data=np.array([10, 17], dtype=np.int64))
+        q = g1.create_dataset("q", data=np.array([1.0, 2.0]))
+        q.attrs["units"] = "q_A^-1"
+        g1.create_dataset("intensity", data=np.array([[1.0, 2.0], [3.0, 4.0]]))
+        sd = e.create_group("scan_data")
+        sd.create_dataset("frame_index", data=np.array([10, 17], dtype=np.int64))
+        sd.create_dataset("i0", data=np.array([100.0, 250.0]))
+        sd.create_dataset("th", data=np.array([0.1, 0.2]))
+
+    with h5py.File(p, "r") as f:
+        frame = _load_frame_v2(f, 17, static=False, gi=False)
+
+    assert frame.scan_info["i0"] == 250.0
+    assert frame.scan_info["th"] == pytest.approx(0.2)
+
+
+def test_frame_position_cache_separates_groups_and_clears_recreated_rows(tmp_path):
+    import h5py
+    from xdart.modules.ewald.frame_series import (
+        _frame_position,
+        clear_frame_position_cache,
+    )
+
+    p = tmp_path / "row_cache.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        for name, labels in (("integrated_1d", [0, 1, 2]),
+                             ("integrated_2d", [2, 1, 0])):
+            g = e.create_group(name)
+            g.create_dataset("frame_index", data=np.asarray(labels))
+        assert _frame_position(f, 0, "integrated_1d") == 0
+        assert _frame_position(f, 0, "integrated_2d") == 2
+        del e["integrated_1d"]
+        g = e.create_group("integrated_1d")
+        g.create_dataset("frame_index", data=np.array([0, 9, 2]))
+        clear_frame_position_cache(f.filename)
+        assert _frame_position(f, 1, "integrated_1d") is None
+        assert _frame_position(f, 9, "integrated_1d") == 1
+
+
+def test_partial_same_size_axis_change_requires_full_reintegration(tmp_path):
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "partial_axis_change.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    frame = frames[1]
+    frame.int_1d = _DuckResult1D(
+        radial=np.linspace(1.0, 6.0, N_Q, dtype=np.float32),
+        intensity=np.asarray(frame.int_1d.intensity),
+    )
+    with pytest.raises(ValueError, match="Recompute and save every frame"):
+        save_scan_to_nexus(
+            scan, path, replace_frame_indices=[1], finalize=False,
+        )
+
+
+def test_write_cursor_fast_path_reads_only_tail_labels():
+    """The trusted periodic-save path must not materialize all disk labels."""
+    from xdart.modules.ewald.nexus_writer import (
+        NexusWriteCursor,
+        _index_structure_signature,
+        _new_frames_for_write,
+    )
+    from xdart.modules.ewald.frame_series import _IndexedList
+
+    class _NoFullReadLabels:
+        shape = (2,)
+
+        def __getitem__(self, key):
+            if key == ():
+                raise AssertionError("fast path read the full frame_index")
+            return [0, 1][key]
+
+    class _Intensity:
+        shape = (2, N_Q)
+
+    class _FakeH5(dict):
+        pass
+
+    group_path = "entry/integrated_1d"
+    h5f = _FakeH5({group_path: {"intensity": _Intensity(),
+                                "frame_index": _NoFullReadLabels()}})
+    scan = _DuckSphere([_DuckArch(idx=i) for i in range(2)])
+    scan.frames.index = _IndexedList(scan.frames.index)
+    cursor = NexusWriteCursor(
+        path="fake",
+        groups={group_path: (2, 1, _index_structure_signature(scan.frames.index, 2))},
+    )
+    scan.frames.append(_DuckArch(idx=2))
+    frames, existing_n = _new_frames_for_write(scan, h5f, group_path, cursor)
+    assert existing_n == 2
+    assert [frame.idx for frame in frames] == [2]
+
+
+def test_same_scan_metadata_cursor_appends_new_tail(tmp_path):
+    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
+    scan = _DuckSphere(
+        [_DuckArch(idx=0), _DuckArch(idx=1)],
+        scan_data=pd.DataFrame({"tth": [10.0, 11.0], "th": [0.1, 0.2]},
+                               index=[0, 1]),
+        geometry=geom,
+    )
+    path = tmp_path / "metadata_tail.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    scan.frames.append(_DuckArch(idx=2))
+    scan.scan_data.loc[2] = {"tth": 12.0, "th": 0.3}
+    save_scan_to_nexus(scan, path, mode="a", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(f["entry/scan_data/frame_index"][()], [0, 1, 2])
+        np.testing.assert_allclose(f["entry/scan_data/tth"][()], [10.0, 11.0, 12.0])
+        np.testing.assert_array_equal(
+            f["entry/sample/positioners/frame_index"][()], [0, 1, 2],
+        )
+        np.testing.assert_array_equal(
+            f["entry/per_frame_geometry/frame_index"][()], [0, 1, 2],
+        )
+
+
+def test_resume_missing_metadata_groups_rebuilds_full_history(tmp_path):
+    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    path = tmp_path / "resume_metadata.nxs"
+    scan = _DuckSphere(
+        [_DuckArch(idx=0), _DuckArch(idx=1)],
+        scan_data=pd.DataFrame({"tth": [10.0, 11.0], "th": [0.1, 0.2]},
+                               index=[0, 1]),
+        geometry=None,
+    )
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    scan.geometry = DiffractometerGeometry.two_circle(tth="tth", th="th")
+    scan.frames.append(_DuckArch(idx=2))
+    scan.scan_data.loc[2] = {"tth": 12.0, "th": 0.3}
+    save_scan_to_nexus(scan, path, mode="a", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(f["entry/scan_data/frame_index"][()], [0, 1, 2])
+        np.testing.assert_array_equal(
+            f["entry/sample/positioners/frame_index"][()], [0, 1, 2],
+        )
+        np.testing.assert_array_equal(
+            f["entry/per_frame_geometry/frame_index"][()], [0, 1, 2],
+        )
+
+
+def test_xdart_save_preflights_1d_2d_before_mutation(tmp_path):
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    path = tmp_path / "xdart_no_half_commit.nxs"
+    scan = _DuckSphere([_DuckArch(idx=0), _DuckArch(idx=1)])
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    frame = _DuckArch(idx=2)
+    frame.int_2d.radial = np.linspace(9.0, 10.0, N_Q, dtype=np.float32)
+    scan.frames.append(frame)
+    with pytest.raises(ValueError, match="Integration settings changed"):
+        save_scan_to_nexus(scan, path, mode="a", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(f["entry/integrated_1d/frame_index"][()], [0, 1])
+        np.testing.assert_array_equal(f["entry/integrated_2d/frame_index"][()], [0, 1])
+
+
+def test_write_cursor_reconciles_after_interior_relabel(tmp_path):
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    path = tmp_path / "cursor_relabel.nxs"
+    scan = _DuckSphere([_DuckArch(idx=0), _DuckArch(idx=1), _DuckArch(idx=2)])
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    frame = scan.frames._by_idx.pop(1)
+    frame.idx = 9
+    scan.frames._by_idx[9] = frame
+    scan.frames.index[1] = 9
+    scan.frames.append(_DuckArch(idx=3))
+    with pytest.raises(ValueError, match="persisted frame labels"):
+        save_scan_to_nexus(scan, path, mode="a", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(f["entry/integrated_1d/frame_index"][()], [0, 1, 2])
+        np.testing.assert_array_equal(f["entry/integrated_2d/frame_index"][()], [0, 1, 2])
+
+
+def test_instrument_mask_rewrites_when_live_mask_changes(tmp_path):
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    path = tmp_path / "instrument_dirty.nxs"
+    scan = _DuckSphere([_DuckArch(idx=0)], global_mask=np.array([0, 1]))
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    scan.global_mask = np.array([7, 8, 9])
+    scan.frames.append(_DuckArch(idx=1))
+    save_scan_to_nexus(scan, path, mode="a", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(f["entry/instrument/detector/mask"][()], [7, 8, 9])
 
 
 def test_instrument_groups(written_nxs):
@@ -667,7 +1004,7 @@ def test_instrument_groups(written_nxs):
     det = instr["detector"]
     assert det.nxclass == "NXdetector"
 
-    # PONI scalars from arches[0] (six numbers)
+    # PONI scalars from frames[0] (six numbers)
     for k in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3"):
         assert k in det
 
@@ -753,35 +1090,37 @@ def test_stitched_outputs(written_nxs_with_stitched):
     assert s1.nxclass == "NXdata"
     assert s1["intensity"].shape == (nq,)
     assert s1["q"].shape == (nq,)
-    assert s1["q"].attrs.get("units") in ("1/angstrom", "1/nm")
+    assert s1["q"].attrs.get("units") in ("q_A^-1", "1/angstrom", "1/nm")
     assert s1["sigma"].shape == (nq,)
 
     s2 = e["stitched_2d"]
     assert s2.nxclass == "NXdata"
-    assert s2["intensity"].shape == (nchi, nq)
+    # stitched_2d is stored AS-IS (q, chi) == (nq, nchi) — unlike the
+    # per-frame integrated_2d stack which is (frame, chi, q).
+    assert s2["intensity"].shape == (nq, nchi)
     assert s2["q"].shape == (nq,)
     assert s2["chi"].shape == (nchi,)
     assert s2["chi"].attrs.get("units") in ("deg", "rad")
 
 
 def test_h5py_layout_is_idempotent(tmp_path):
-    """Calling save_sphere_to_nexus twice on the same file is safe — the
+    """Calling save_scan_to_nexus twice on the same file is safe — the
     stacked datasets get replaced cleanly with no leftover ghost entries.
 
     This guards the idempotent ``_replace_ds`` pattern that the live-
     mode + batch flushes both rely on.
     """
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
 
-    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
     scan_data = pd.DataFrame({
         "tth": np.linspace(10.0, 14.0, N_FRAMES, dtype=np.float32),
     })
-    sphere = _DuckSphere(arches, scan_data=scan_data)
+    scan = _DuckSphere(frames, scan_data=scan_data)
 
     path = tmp_path / "idempotent.nxs"
-    save_sphere_to_nexus(sphere, path, mode="w")
-    save_sphere_to_nexus(sphere, path, mode="a")
+    save_scan_to_nexus(scan, path, mode="w")
+    save_scan_to_nexus(scan, path, mode="a")
 
     # Second write should not have produced duplicate keys or shape drift.
     root = nx.nxload(str(path))
@@ -792,7 +1131,7 @@ def test_h5py_layout_is_idempotent(tmp_path):
 def test_incremental_save_appends_only_new_frames(tmp_path):
     """P1: per-save Python prep should be O(new frames), not O(all frames).
 
-    Writes K=4 frames, then *extends* the sphere with another 4 and
+    Writes K=4 frames, then *extends* the scan with another 4 and
     re-saves.  Verifies:
 
     * Final on-disk shape is (8, nq) — both batches landed.
@@ -802,19 +1141,19 @@ def test_incremental_save_appends_only_new_frames(tmp_path):
 
     Without the P1 incremental refactor the second save still wrote
     correct *values* (full-array rewrite was idempotent), but it
-    re-stacked all N arches every time.  This test pins down the
+    re-stacked all N frames every time.  This test pins down the
     append-only behaviour so future refactors don't regress.
     """
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
 
     scan_data = pd.DataFrame({
         "tth": np.linspace(10.0, 14.0, N_FRAMES, dtype=np.float32),
     })
     # Phase 1 — 4 frames + initial save.
-    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
-    sphere = _DuckSphere(arches, scan_data=scan_data)
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    scan = _DuckSphere(frames, scan_data=scan_data)
     path = tmp_path / "incremental.nxs"
-    save_sphere_to_nexus(sphere, path, mode="w")
+    save_scan_to_nexus(scan, path, mode="w")
 
     # Snapshot row 0 of intensity from the first checkpoint — must
     # survive the second save unchanged.
@@ -824,10 +1163,10 @@ def test_incremental_save_appends_only_new_frames(tmp_path):
     assert intensity_a.shape == (N_FRAMES, N_Q)
     intensity_a_rows = intensity_a.copy()
 
-    # Phase 2 — extend the sphere by another N_FRAMES frames + re-save.
+    # Phase 2 — extend the scan by another N_FRAMES frames + re-save.
     for i in range(N_FRAMES, 2 * N_FRAMES):
-        sphere.arches.append(_DuckArch(idx=i, seed=100))
-    save_sphere_to_nexus(sphere, path, mode="a")
+        scan.frames.append(_DuckArch(idx=i, seed=100))
+    save_scan_to_nexus(scan, path, mode="a")
 
     # Verify the extended file.
     root_b = nx.nxload(str(path))
@@ -838,7 +1177,7 @@ def test_incremental_save_appends_only_new_frames(tmp_path):
     # The pre-existing rows are byte-identical to the first checkpoint.
     np.testing.assert_array_equal(intensity_b[:N_FRAMES], intensity_a_rows)
     np.testing.assert_array_equal(frame_index_b[:N_FRAMES], frame_index_a)
-    # The new rows have the new arches' frame indices.
+    # The new rows have the new frames' frame indices.
     assert frame_index_b[N_FRAMES:].tolist() == list(range(N_FRAMES, 2 * N_FRAMES))
 
     # 2D side also extends correctly (parallel append).
@@ -846,19 +1185,19 @@ def test_incremental_save_appends_only_new_frames(tmp_path):
     assert intensity_2d_b.shape == (2 * N_FRAMES, N_CHI, N_Q)
 
 
-def test_append_with_shape_change_full_rewrites(tmp_path):
-    """O3: a follow-up save whose new arches have a different
+def test_append_with_shape_change_requires_full_reintegration(tmp_path):
+    """O3: a follow-up save whose new frames have a different
     integration row shape than the on-disk dataset must NOT silently
-    drop the previously-saved rows.  Instead it falls back to a
-    full rewrite from all sphere arches with refreshed q/chi axes.
+    drop the previously-saved rows or rebuild from stale frames.  The append
+    path must stop and require an explicit full reintegration.
 
     Pre-O3 ``_append_new_rows`` recreated the dataset with only
     the new tail when shape changed — so e.g. saving 4 frames at
     nq=32 then 4 more at nq=64 produced a 4-row file (the first
     4 lost).  Post-O3 the file ends at 8 rows of nq=64 (all
-    arches re-stacked with the new shape).
+    frames explicitly supplied through replace mode).
     """
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     import h5py
 
     nq1 = N_Q          # 32
@@ -867,57 +1206,48 @@ def test_append_with_shape_change_full_rewrites(tmp_path):
     nchi2 = N_CHI + 4  # 20 — different!
 
     # Phase 1: 4 frames at original shape.
-    arches = [_DuckArch(idx=i, nq=nq1, nchi=nchi1) for i in range(N_FRAMES)]
-    sphere = _DuckSphere(
-        arches,
+    frames = [_DuckArch(idx=i, nq=nq1, nchi=nchi1) for i in range(N_FRAMES)]
+    scan = _DuckSphere(
+        frames,
         scan_data=pd.DataFrame({"tth": np.linspace(10, 14, N_FRAMES,
                                                    dtype=np.float32)}),
     )
     path = tmp_path / "shape_drift.nxs"
-    save_sphere_to_nexus(sphere, path, mode="w")
+    save_scan_to_nexus(scan, path, mode="w")
 
     with h5py.File(path, "r") as f:
         assert f["entry/integrated_1d/intensity"].shape == (N_FRAMES, nq1)
         assert f["entry/integrated_2d/intensity"].shape == (N_FRAMES,
                                                             nchi1, nq1)
 
-    # Phase 2: replace the in-memory arches with new ones at a
+    # Phase 2: replace the in-memory frames with new ones at a
     # different shape — and *also* extend the series.  This is the
     # bug scenario: a user reintegrating with new numpoints mid-scan,
     # then continuing to acquire frames.
-    new_arches = [
+    new_frames = [
         _DuckArch(idx=i, nq=nq2, nchi=nchi2, seed=50)
         for i in range(2 * N_FRAMES)
     ]
-    # Re-seat sphere.arches to point at the reshaped arches.
-    sphere.arches = _DuckArches(new_arches)
-    save_sphere_to_nexus(sphere, path, mode="a")
+    # Re-seat scan.frames to point at the reshaped frames.
+    scan.frames = _DuckArches(new_frames)
+    with pytest.raises(ValueError, match="Integration settings changed"):
+        save_scan_to_nexus(scan, path, mode="a")
 
-    # File contains 8 rows at the *new* shape; the original 4 rows
-    # at nq1 are gone (correctly — full rewrite refreshed both rows
-    # and axes).  Pre-O3 the file would have been *4* rows at nq2
-    # (the helper rebuilt from just the "new tail" of 4 arches).
+    # The failed append leaves the original stack intact. A caller can now
+    # reintegrate every frame and save them together via replace mode.
     with h5py.File(path, "r") as f:
-        assert f["entry/integrated_1d/intensity"].shape == (
-            2 * N_FRAMES, nq2,
-        ), "O3 regression: integrated_1d full rewrite must include all arches"
-        assert f["entry/integrated_2d/intensity"].shape == (
-            2 * N_FRAMES, nchi2, nq2,
-        ), "O3 regression: integrated_2d full rewrite must include all arches"
-        # frame_index also rebuilt — covers the parallel _append_new_rows
-        # call for the index array.
-        assert f["entry/integrated_1d/frame_index"].shape == (2 * N_FRAMES,)
-        assert f["entry/integrated_1d/q"].shape == (nq2,)
+        assert f["entry/integrated_1d/intensity"].shape == (N_FRAMES, nq1)
+        assert f["entry/integrated_2d/intensity"].shape == (N_FRAMES, nchi1, nq1)
 
 
 def test_scan_data_index_aligns_with_gapped_frame_ids(tmp_path):
     """O1 / N2 regression: after writer → loader round-trip, the
-    reloaded ``sphere.scan_data`` DataFrame must be indexed by the
-    actual frame IDs (``arch.idx``), not a default 0..N-1 range
+    reloaded ``scan.scan_data`` DataFrame must be indexed by the
+    actual frame IDs (``frame.idx``), not a default 0..N-1 range
     index.
 
-    Live acquisition does ``scan_data.loc[arch.idx] = ser``.  If
-    reload built a default RangeIndex, ``loc[arch.idx]`` after
+    Live acquisition does ``scan_data.loc[frame.idx] = ser``.  If
+    reload built a default RangeIndex, ``loc[frame.idx]`` after
     reload would silently misalign whenever the IDs were not
     ``range(N)`` — e.g. 1-based SPEC, gapped Eiger external links,
     or post-deletion holes.
@@ -925,24 +1255,34 @@ def test_scan_data_index_aligns_with_gapped_frame_ids(tmp_path):
     Test gaps the IDs to ``[10, 12, 17, 22]`` and asserts they
     appear as the reloaded ``scan_data`` index.
     """
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
-    from xdart.modules.ewald.sphere import LiveScan
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
     from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
 
     gapped = [10, 12, 17, 22]
     geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
 
-    arches = [_DuckArch(idx=i) for i in gapped]
+    frames = [_DuckArch(idx=i) for i in gapped]
+    # Real LiveScan indexes scan_data by frame.idx (live:
+    # ``scan_data.loc[frame.idx] = ser``; reload:
+    # ``pd.DataFrame(motor_cols, index=frame_index)``), so the fixture
+    # must too — the writer aligns positioners/geometry to the frame
+    # set by *reindexing on that id index*.  (The pre-#18 writer used a
+    # "reindex only when lengths differ" heuristic that silently fell
+    # back to positional alignment; that tolerated a mis-indexed
+    # scan_data but would mis-pair motors to frames after a delete /
+    # reorder.  The shared ssrl primitive aligns by id instead.)
     scan_data = pd.DataFrame(
         {
             "tth": np.array([11.0, 12.5, 14.0, 15.5], dtype=np.float32),
             "th":  np.array([0.10, 0.15, 0.20, 0.25], dtype=np.float32),
-        }
+        },
+        index=gapped,
     )
-    sphere = _DuckSphere(arches, scan_data=scan_data, geometry=geom)
+    scan = _DuckSphere(frames, scan_data=scan_data, geometry=geom)
 
     path = tmp_path / "gapped.nxs"
-    save_sphere_to_nexus(sphere, path, mode="w", finalize=False)
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
 
     # Round-trip through the real LiveScan loader.
     reloaded = LiveScan(name="gapped", data_file=str(path))
@@ -956,7 +1296,7 @@ def test_scan_data_index_aligns_with_gapped_frame_ids(tmp_path):
     np.testing.assert_allclose(
         reloaded.scan_data.loc[17, "tth"], 14.0, atol=1e-5,
     )
-    # Most importantly: a ``.loc[arch.idx]`` lookup pattern that
+    # Most importantly: a ``.loc[frame.idx]`` lookup pattern that
     # the GUI uses produces the right row, not row-position 17.
     np.testing.assert_allclose(
         reloaded.scan_data.loc[22, "th"], 0.25, atol=1e-5,
@@ -964,25 +1304,58 @@ def test_scan_data_index_aligns_with_gapped_frame_ids(tmp_path):
 
 
 def test_incremental_save_with_no_new_frames_is_noop(tmp_path):
-    """Re-saving with no new arches must not change anything on disk.
+    """Re-saving with no new frames must not change anything on disk.
 
     Specifically: dataset shapes stay constant, contents stay
-    byte-identical.  Guards the ``if not new_arches: return`` early
+    byte-identical.  Guards the ``if not new_frames: return`` early
     exit in :func:`_write_integrated_1d` / :func:`_write_integrated_2d`.
     """
-    from xdart.modules.ewald.nexus_writer import save_sphere_to_nexus
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
 
-    arches = [_DuckArch(idx=i) for i in range(N_FRAMES)]
-    sphere = _DuckSphere(
-        arches,
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    scan = _DuckSphere(
+        frames,
         scan_data=pd.DataFrame({"tth": np.zeros(N_FRAMES, dtype=np.float32)}),
     )
     path = tmp_path / "noop.nxs"
-    save_sphere_to_nexus(sphere, path, mode="w")
+    save_scan_to_nexus(scan, path, mode="w")
 
     before = np.asarray(nx.nxload(str(path))["entry/integrated_1d/intensity"])
-    save_sphere_to_nexus(sphere, path, mode="a")  # no new arches added
+    save_scan_to_nexus(scan, path, mode="a")  # no new frames added
     after = np.asarray(nx.nxload(str(path))["entry/integrated_1d/intensity"])
 
     assert after.shape == before.shape == (N_FRAMES, N_Q)
     np.testing.assert_array_equal(after, before)
+
+
+def test_positioners_align_to_frame_count_when_metadata_partial(tmp_path):
+    """Batch frames with missing metadata leave ``scan_data`` shorter than
+    the integrated frame set.  Positioners (and per-frame geometry) must
+    still be written at the full integrated-frame length — NaN-padded for
+    the metadata-less frames — so the per-frame dim agrees across groups
+    and ``read_scan`` doesn't raise "conflicting sizes for dimension
+    'frame'" (the Combi angle-dependence batch-mode bug).
+    """
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+
+    geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]  # 4 integrated frames
+    # Only the first 2 frames carried metadata → scan_data has 2 rows.
+    scan_data = pd.DataFrame(
+        {"th": [0.0, 0.1], "tth": [10.0, 11.0]}, index=[0, 1],
+    )
+    scan = _DuckSphere(frames, scan_data=scan_data, geometry=geom)
+
+    path = tmp_path / "partial_meta.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        e = f["entry"]
+        n_int = e["integrated_1d/frame_index"].shape[0]
+        th = np.asarray(e["sample/positioners/th/value"])
+        assert n_int == N_FRAMES
+        assert th.shape[0] == N_FRAMES        # aligned, not 2
+        assert not np.isnan(th[:2]).any()     # real metadata preserved
+        assert np.isnan(th[2:]).all()         # missing frames NaN-padded

@@ -49,7 +49,7 @@ def _make_thumbnail(image, mask_idx=None, global_mask=None, max_size=_THUMBNAIL_
     image : ndarray
         2D detector image (typically map_raw - bg_raw).
     mask_idx : array-like or None
-        Flat indices of pixels to mask (arch-level mask).
+        Flat indices of pixels to mask (frame-level mask).
     global_mask : array-like or None
         Flat indices of pixels to mask (detector-level mask).
     max_size : int
@@ -89,11 +89,11 @@ class LiveFrame():
 
     Attributes:
         ai_args: dict, arguments passed to AzimuthalIntegrator
-        arch_lock: Condition, threading lock used to ensure only one
+        frame_lock: Condition, threading lock used to ensure only one
             process can access data at a time
         file_lock: Condition, lock to ensure only one writer to
             data file
-        idx: int, integer name of arch
+        idx: int, integer name of frame
         int_1d: int_1d_data/_static object from containers (for scanning/static detectors)
         int_2d: int_2d_data/_static object from containers (for scanning/static detectors)
         integrator: AzimuthalIntegrator object from pyFAI
@@ -111,7 +111,7 @@ class LiveFrame():
         series_average: bool, flag to specify if series of images is averaged
 
     Methods:
-        copy: create copy of arch
+        copy: create copy of frame
         get_mask: return mask array to feed into integrate1d
         integrate_1d: integrate the image data, results stored in
             int_1d_data
@@ -134,7 +134,7 @@ class LiveFrame():
                  *, th_mtr=None,  # J1: legacy alias, mapped to incidence_motor
                  ):
         # pylint: disable=too-many-arguments
-        """idx: int, name of the arch.
+        """idx: int, name of the frame.
         map_raw: numpy array, raw image data
         bg_raw: numpy array, raw image data for BG
         poni: PONI object, calibration data
@@ -151,7 +151,7 @@ class LiveFrame():
         # F4: None-sentinel pattern.  Mutable defaults in the signature
         # (scan_info={}, ai_args={}, file_lock=Condition()) are
         # constructed once at module-import time and shared by every
-        # caller who omits the kwarg — silently producing cross-arch
+        # caller who omits the kwarg — silently producing cross-frame
         # state.  Materialise per-instance defaults here, matching
         # what LiveScan already does.
         self.idx = idx
@@ -175,7 +175,7 @@ class LiveFrame():
         # value from either kwarg with ``incidence_motor=`` winning
         # if both happen to be passed (shouldn't be — but be
         # deterministic).  Default 'th' preserves the historical
-        # arch behavior.
+        # frame behavior.
         if incidence_motor is None:
             incidence_motor = th_mtr if th_mtr is not None else 'th'
         self.incidence_motor = incidence_motor
@@ -188,7 +188,7 @@ class LiveFrame():
         # with > 50% masked pixels (e.g. threshold masks).
         self.integrator.USE_LEGACY_MASK_NORMALIZATION = False
 
-        self.arch_lock = Condition()
+        self.frame_lock = Condition()
         self.map_norm = 1
 
         self.int_1d: IntegrationResult1D | None = None
@@ -199,27 +199,27 @@ class LiveFrame():
         #   source_file       relpath to the raw source file (image or .nxs master)
         #   source_frame_idx  index of *this* frame within source_file
         # Both written to /entry/frames/frame_NNNN/source/ by the v2
-        # writer and round-tripped by _load_arch_v2.  source_frame_idx
+        # writer and round-tripped by _load_frame_v2.  source_frame_idx
         # defaults to None — the writer falls back to ``idx`` for
         # single-frame source files (typical SPEC layout) when it's None.
         self.source_file: str = ""
         self.source_frame_idx: int | None = None
         self.thumbnail: np.ndarray | None = None  # downsampled (map_raw - bg_raw)
-        # R3 guardrail: when an arch is reconstructed from a v2 .nxs
+        # R3 guardrail: when an frame is reconstructed from a v2 .nxs
         # without a raw image (the common case — v2 doesn't store
         # map_raw to save disk), reintegration is impossible until a
         # lazy raw loader fetches the frame back from ``source_file``.
-        # ``_load_arch_v2`` sets ``is_reload_only=False`` when the
+        # ``_load_frame_v2`` sets ``is_reload_only=False`` when the
         # source path resolves (lazy load will succeed), else ``True``
         # (lazy load can't recover the raw — re-integrate would
         # silently no-op).  The GUI's "Reintegrate" buttons check
-        # ``sphere.has_reload_only_frames()`` and pop a message
+        # ``scan.has_reload_only_frames()`` and pop a message
         # rather than no-op'ing inside ``LiveFrame.integrate_*``.
         self.is_reload_only: bool = False
         # L1 lazy raw load: the directory ``source_file`` resolves
-        # against (typically ``os.path.dirname(sphere.data_file)``,
-        # set by :func:`_load_arch_v2`).  Empty for fresh-from-wrangler
-        # arches that already carry ``map_raw`` and never need lazy
+        # against (typically ``os.path.dirname(scan.data_file)``,
+        # set by :func:`_load_frame_v2`).  Empty for fresh-from-wrangler
+        # frames that already carry ``map_raw`` and never need lazy
         # load.
         self._source_root: str = ""
 
@@ -227,14 +227,14 @@ class LiveFrame():
         """Exclude threading.Condition objects so LiveFrame can be pickled
         for use with concurrent.futures.ProcessPoolExecutor."""
         state = self.__dict__.copy()
-        state.pop('arch_lock', None)
+        state.pop('frame_lock', None)
         state.pop('file_lock', None)
         return state
 
     def __setstate__(self, state):
         """Restore threading.Condition objects after unpickling."""
         self.__dict__.update(state)
-        self.arch_lock = Condition()
+        self.frame_lock = Condition()
         self.file_lock = Condition()
 
     def setup_integrator(self):
@@ -263,8 +263,8 @@ class LiveFrame():
         """Return the absolute path to ``source_file`` for lazy raw load.
 
         Joins ``source_file`` (relpath as stored by the wrangler)
-        against ``_source_root`` (the sphere's data_file directory,
-        set by :func:`_load_arch_v2`).  Returns an empty string when
+        against ``_source_root`` (the scan's data_file directory,
+        set by :func:`_load_frame_v2`).  Returns an empty string when
         either is missing, leaves it to the caller to detect.
         """
         if not self.source_file:
@@ -273,7 +273,7 @@ class LiveFrame():
             return self.source_file
         if not self._source_root:
             # Pre-R2 reloads might lack the root — assume cwd.  Real
-            # callers always go through _load_arch_v2 which sets it.
+            # callers always go through _load_frame_v2 which sets it.
             return self.source_file
         return os.path.normpath(
             os.path.join(self._source_root, self.source_file)
@@ -282,7 +282,7 @@ class LiveFrame():
     def _lazy_load_resolvable(self) -> bool:
         """Return True iff a lazy raw load would find the source file.
 
-        Used by :func:`_load_arch_v2` to decide ``is_reload_only`` at
+        Used by :func:`_load_frame_v2` to decide ``is_reload_only`` at
         load time — without it the R3 guardrail would have to either
         always pop (treating every reload as unrecoverable) or never
         pop (silently no-op'ing when the source file is missing).
@@ -308,7 +308,7 @@ class LiveFrame():
         IO error).  Never raises — callers can fall through to the
         existing "no raw, can't integrate" guard.
 
-        Note: this method does **not** acquire ``arch_lock``; callers
+        Note: this method does **not** acquire ``frame_lock``; callers
         that are already inside the lock (the integrate methods) must
         avoid re-entering.
         """
@@ -397,7 +397,7 @@ class LiveFrame():
         self.gi_2d = {}
             
     def _resolve_monitor_norm(self, monitor) -> float:
-        """Resolve the monitor normalization scalar for this arch.
+        """Resolve the monitor normalization scalar for this frame.
 
         Centralises the lookup that ``integrate_1d`` and ``integrate_2d``
         do independently — pre-fix ``integrate_2d`` set ``map_norm = 1``
@@ -434,15 +434,37 @@ class LiveFrame():
         shape = self.map_raw.shape
         size = self.map_raw.size
         mask = np.zeros(size, dtype=bool)
-        try:
-            if self.mask is not None and len(self.mask):
+        # Apply the frame's own bad-pixel mask (always derived from this
+        # image, so in-bounds) first.
+        if self.mask is not None and len(self.mask):
+            try:
                 mask[self.mask] = True
-            if global_mask is not None and len(global_mask):
-                mask[global_mask] = True
-            return mask.reshape(shape)
-        except IndexError:
-            print('Mask File Shape Mismatch')
-            return mask.reshape(shape) if mask.size == size else mask
+            except IndexError:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Ignoring frame mask: indices out of bounds for image "
+                    "size %d.", size,
+                )
+        # The external detector/global mask may have been built for a
+        # different detector shape (wrong calibration, resized frame, …).
+        # Ignore it with a warning rather than raising — reducing unmasked
+        # beats aborting the scan.  Mirrors reduction._flat_mask_as_bool.
+        if global_mask is not None and len(global_mask):
+            gm = np.asarray(global_mask)
+            incompatible = (
+                (gm.dtype == bool and gm.size != size)
+                or (gm.dtype != bool and gm.size
+                    and (gm.min() < 0 or gm.max() >= size))
+            )
+            if incompatible:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Ignoring detector/global mask: incompatible with image "
+                    "shape %s (image has %d pixels).", shape, size,
+                )
+            else:
+                mask[gm.ravel() if gm.dtype == bool else gm] = True
+        return mask.reshape(shape)
 
     def integrate_1d(self, numpoints=10000, radial_range=None,
                      monitor=None, unit=units.TTH_DEG, global_mask=None,
@@ -461,10 +483,10 @@ class LiveFrame():
         returns:
             result: integrate1d result from pyFAI.
         """
-        with self.arch_lock:
+        with self.frame_lock:
             if self.map_raw is None:
                 # L1: try a lazy raw load from source_file before
-                # giving up.  Reloaded-from-v2 arches don't carry
+                # giving up.  Reloaded-from-v2 frames don't carry
                 # map_raw on disk (intentional schema choice) but
                 # the wrangler stamps source_file + source_frame_idx,
                 # which _lazy_load_raw can use to fetch the original
@@ -534,7 +556,7 @@ class LiveFrame():
                 # method='csr' triggers a "No fast path for space" warning
                 # and falls back to a much slower (and visually incorrect)
                 # code path.  Keep 'no' here.  The standard transmission
-                # integration in arch.integrate_1d (non-GI branch) still
+                # integration in frame.integrate_1d (non-GI branch) still
                 # uses csr via bai_1d_args['method'].
                 gi_method = 'no'
 
@@ -610,7 +632,7 @@ class LiveFrame():
         returns:
             result: integrate2d result from pyFAI.
         """
-        with self.arch_lock:
+        with self.frame_lock:
             if self.map_raw is None:
                 # L1: same lazy-load attempt as integrate_1d.
                 self._lazy_load_raw()
@@ -733,26 +755,26 @@ class LiveFrame():
             None
         """
 
-        with self.arch_lock:
+        with self.frame_lock:
             self.ai_args = args
             self.integrator = self.setup_integrator()
 
     def set_map_raw(self, new_data):
-        with self.arch_lock:
+        with self.frame_lock:
             self.map_raw = new_data
             if self.mask is None:
                 self.mask = np.arange(new_data.size)[new_data.flatten() < 0]
 
     def set_poni(self, new_data):
-        with self.arch_lock:
+        with self.frame_lock:
             self.poni = new_data
 
     def set_mask(self, new_data):
-        with self.arch_lock:
+        with self.frame_lock:
             self.mask = new_data
 
     def set_scan_info(self, new_data):
-        with self.arch_lock:
+        with self.frame_lock:
             self.scan_info = new_data
 
     def make_thumbnail(self, global_mask=None):
@@ -773,7 +795,7 @@ class LiveFrame():
             return
         if self.map_raw is None:
             # F5: try L1 lazy load before giving up.  Lets thumbnail
-            # regeneration work on reloaded v2 spheres whose source
+            # regeneration work on reloaded v2 scans whose source
             # files are still available.
             self._lazy_load_raw()
         if self.map_raw is None:
@@ -794,7 +816,7 @@ class LiveFrame():
     def copy(self, include_2d=True):
         """Returns a copy of self.
         """
-        arch_copy = LiveFrame(
+        frame_copy = LiveFrame(
             copy.deepcopy(self.idx), None,
             copy.deepcopy(self.poni), None,
             copy.deepcopy(self.scan_info), copy.deepcopy(self.ai_args),
@@ -804,34 +826,57 @@ class LiveFrame():
             sample_orientation=self.sample_orientation,
             series_average=copy.deepcopy(self.series_average)
         )
-        arch_copy.integrator = copy.deepcopy(self.integrator)
-        arch_copy.arch_lock = Condition()
-        arch_copy.int_1d = copy.deepcopy(self.int_1d)
-        arch_copy.gi_1d = copy.deepcopy(self.gi_1d)
+        frame_copy.integrator = copy.deepcopy(self.integrator)
+        frame_copy.frame_lock = Condition()
+        frame_copy.int_1d = copy.deepcopy(self.int_1d)
+        frame_copy.gi_1d = copy.deepcopy(self.gi_1d)
         # P4: lazy-raw-load provenance.  Pre-P4 ``source_file`` was
         # copied but ``source_frame_idx``, ``_source_root``, and
-        # ``is_reload_only`` were not — so an ``arch.copy(include_2d=False)``
+        # ``is_reload_only`` were not — so an ``frame.copy(include_2d=False)``
         # stash in ``data_1d`` couldn't recover ``map_raw`` via
         # :meth:`_lazy_load_raw` later (it'd resolve to the wrong
         # frame or be unable to resolve a relpath at all).  Copy
         # all four so a 1D-only copy retains the ability to lazy-
         # load the raw frame on demand (reintegrate, thumbnail
         # regeneration, etc.).
-        arch_copy.source_file = self.source_file
-        arch_copy.source_frame_idx = self.source_frame_idx
-        arch_copy._source_root = self._source_root
-        arch_copy.is_reload_only = self.is_reload_only
+        frame_copy.source_file = self.source_file
+        frame_copy.source_frame_idx = self.source_frame_idx
+        frame_copy._source_root = self._source_root
+        frame_copy.is_reload_only = self.is_reload_only
         # Always copy thumbnail — it's small and needed for image preview
-        arch_copy.thumbnail = copy.deepcopy(self.thumbnail)
+        frame_copy.thumbnail = copy.deepcopy(self.thumbnail)
         if include_2d:
-            arch_copy.map_raw = copy.deepcopy(self.map_raw)
-            arch_copy.bg_raw = copy.deepcopy(self.bg_raw)
-            arch_copy.mask = copy.deepcopy(self.mask)
-            arch_copy.map_norm = copy.deepcopy(self.map_norm)
-            arch_copy.int_2d = copy.deepcopy(self.int_2d)
-            arch_copy.gi_2d = copy.deepcopy(self.gi_2d)
+            frame_copy.map_raw = copy.deepcopy(self.map_raw)
+            frame_copy.bg_raw = copy.deepcopy(self.bg_raw)
+            frame_copy.mask = copy.deepcopy(self.mask)
+            frame_copy.map_norm = copy.deepcopy(self.map_norm)
+            frame_copy.int_2d = copy.deepcopy(self.int_2d)
+            frame_copy.gi_2d = copy.deepcopy(self.gi_2d)
 
-        return arch_copy
+        return frame_copy
+
+    def copy_for_display(self, include_2d=False):
+        """Return a lightweight cache copy for GUI display dictionaries.
+
+        Unlike :meth:`copy`, this does not construct or deep-copy a pyFAI
+        integrator.  Display paths treat the cached frame as read-only and
+        only need metadata, thumbnails, and reduced results.
+        """
+        frame_copy = copy.copy(self)
+        frame_copy.frame_lock = Condition()
+        frame_copy.scan_info = dict(self.scan_info)
+        frame_copy.ai_args = dict(self.ai_args)
+        frame_copy.gi_1d = dict(self.gi_1d)
+        frame_copy.thumbnail = copy.copy(self.thumbnail)
+        if include_2d:
+            frame_copy.gi_2d = dict(self.gi_2d)
+        else:
+            frame_copy.map_raw = None
+            frame_copy.bg_raw = 0
+            frame_copy.mask = None
+            frame_copy.int_2d = None
+            frame_copy.gi_2d = {}
+        return frame_copy
 
 
 __all__ = ["LiveFrame"]

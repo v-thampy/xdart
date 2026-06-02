@@ -126,6 +126,25 @@ QPushButton:disabled {
     color: #6272a4;
 }
 
+/* Checkable *toggle* buttons (Live, Batch, Auto, Legend, Share Axis,
+   X Range, …) — fill with the purple accent when active so the on/off
+   state is obvious.  ``:checked`` only matches checkable buttons, so
+   plain action buttons are unaffected. */
+QPushButton:checked {
+    background-color: #bd93f9;
+    color: #1a1a1a;
+    border: 1px solid #bd93f9;
+    font-weight: bold;
+}
+QPushButton:checked:hover {
+    background-color: #caa6fb;
+}
+QPushButton:checked:disabled {
+    background-color: #3d3550;
+    color: #6272a4;
+    border-color: #3d3550;
+}
+
 /* Accented Start / Stop — colour-coded primary CTAs.  Wranglers
    use the object names ``startButton`` and ``stopButton``. */
 QPushButton#startButton {

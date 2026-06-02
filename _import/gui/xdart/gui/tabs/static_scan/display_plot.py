@@ -32,30 +32,62 @@ class DisplayPlotMixin:
     Expects the host widget to expose at least:
 
     - ``self.ui`` (the Ui_Form instance)
-    - ``self.sphere``, ``self.arch_ids``, ``self.data_1d``, ``self.data_2d``
+    - ``self.scan``, ``self.frame_ids``, ``self.data_1d``, ``self.data_2d``
     - ``self.idxs``, ``self.idxs_1d``
     - ``self.plot``, ``self.plot_win``, ``self.plot_layout``
     - ``self.wf_widget``, ``self.wf_*`` (waterfall state)
     - ``self.curves``, ``self.legend``, ``self.pos_label``
-    - ``self.plot_data``, ``self.plot_data_range``, ``self.arch_names``
+    - ``self.plot_data``, ``self.plot_data_range``, ``self.frame_names``
     - ``self.plotMethod``, ``self.scale``, ``self.cmap``
     - ``self.overlay``, ``self.binned_data``, ``self.binned_widget``
     - ``self._plot_axis_info``, ``self._last_plot_unit``
-    - Methods from DisplayDataMixin: ``get_arches_int_1d``, ``get_colors``,
+    - Methods from DisplayDataMixin: ``get_frames_int_1d``, ``get_colors``,
       ``normalize``, ``show_slice_overlay``
     """
 
     # ── 1D plot data accumulation ─────────────────────────────────
 
+    def _loaded_1d_overlay_labels(self, idxs, *, max_rows=None):
+        """Return loaded frame ids and labels that can produce 1D rows."""
+        kept = []
+        names = []
+        slice_suffix = ''
+        try:
+            if self.ui.slice.isEnabled() and self.ui.slice.isChecked():
+                center = self.ui.slice_center.value()
+                width = self.ui.slice_width.value()
+                slice_suffix = f' [{center:.1f}\u00b1{width:.1f}]'
+        except Exception:
+            slice_suffix = ''
+        for idx in idxs:
+            idx = int(idx)
+            frame_1d = self.data_1d.get(idx)
+            if frame_1d is None:
+                continue
+            frame_2d = self.data_2d.get(idx)
+            try:
+                x, y = self.get_int_1d(frame_1d, frame_2d, idx)
+            except Exception:
+                logger.debug("overlay label rebuild skipped frame %s",
+                             idx, exc_info=True)
+                continue
+            if x is None or y is None:
+                continue
+            kept.append(idx)
+            names.append(f'{self.scan.name}_{idx}{slice_suffix}')
+            if max_rows is not None and len(kept) >= max_rows:
+                break
+        return kept, names
+
     def update_plot(self):
         """Updates data in plot frame
         """
-        if (self.sphere.name == 'null_main') or (len(self.arch_ids) == 0):
+        if (self.scan.name == 'null_main') or (len(self.frame_ids) == 0):
             data = (np.arange(100), np.arange(100))
             return data
 
-        # Get 1D data for all arches
-        ydata, xdata = self.get_arches_int_1d()
+        # Get 1D data for all frames
+        ydata, xdata = self.get_frames_int_1d()
 
         # 2D-derived axes require 2D data; fall back gracefully if unavailable
         if xdata is None or ydata is None:
@@ -66,7 +98,7 @@ class DisplayPlotMixin:
                      else None)
             needs_2d = ((_info and _info['source'] in ('2d', '1d_2d'))
                         or self.ui.slice.isChecked())
-            if needs_2d and getattr(self.sphere, 'skip_2d', False):
+            if needs_2d and getattr(self.scan, 'skip_2d', False):
                 try:
                     self.window().statusBar().showMessage(
                         "Chi slicing requires 2D integration (1D Only is enabled).", 4000)
@@ -74,22 +106,23 @@ class DisplayPlotMixin:
                     logger.debug("Failed to show status bar message about chi slicing", exc_info=True)
             # Fall back: disable slice, retry with plain 1D
             self.ui.slice.setChecked(False)
-            ydata, xdata = self.get_arches_int_1d()
+            ydata, xdata = self.get_frames_int_1d()
             if xdata is None or ydata is None:
+                self.clear_plot_view()
                 return
 
-        if self.sphere.series_average:
-            arch_names = [self.sphere.name]
+        if self.scan.series_average:
+            frame_names = [self.scan.name]
         else:
-            arch_names = [f'{self.sphere.name}_{i}' for i in self.idxs]
+            frame_names = [f'{self.scan.name}_{i}' for i in self.idxs]
 
-        # When slicing is active, include slice parameters in arch names
+        # When slicing is active, include slice parameters in frame names
         # so the same image with different slice ranges can be overlaid.
         if self.ui.slice.isEnabled() and self.ui.slice.isChecked():
             center = self.ui.slice_center.value()
             width = self.ui.slice_width.value()
             suffix = f' [{center:.1f}\u00b1{width:.1f}]'
-            arch_names = [n + suffix for n in arch_names]
+            frame_names = [n + suffix for n in frame_names]
 
         # Subtract background
         if self.bkg_1d is not None:
@@ -101,23 +134,46 @@ class DisplayPlotMixin:
         # selection: a single-click gives one curve, shift/cmd-click
         # gives several.  Live-scan selection accumulation (which used
         # to silently turn Single into a Waterfall) is now prevented at
-        # the source by ClearAndSelect in h5viewer + latest_arch, so we
+        # the source by ClearAndSelect in h5viewer + latest_frame, so we
         # don't need to narrow ydata here.
 
         current_plot_unit = self.ui.plotUnit.currentIndex()
         unit_changed = current_plot_unit != self._last_plot_unit
         self._last_plot_unit = current_plot_unit
 
-        # In Overlay/Waterfall: accumulate new arches, skip duplicates.
-        # In Single/Sum/Average: always replace with current selection.
+        # In Overlay/Waterfall: accumulate new frames, skip duplicates.
+        # On a unit change, rebuild the accumulated set in the new unit
+        # instead of appending across incompatible x grids or dropping all
+        # prior curves.  In Single/Sum/Average: always replace with the
+        # current selection.
         current_method = self.ui.plotMethod.currentText()
+        overlay_mode = current_method in ('Overlay', 'Waterfall')
         accumulate = (current_method in ('Overlay', 'Waterfall')
                       and (not unit_changed)
                       and len(self.plot_data[0]) > 0)
 
-        if accumulate:
-            for arch_name, row in zip(arch_names, ydata):
-                if arch_name not in self.arch_names:
+        if (overlay_mode and unit_changed
+                and len(getattr(self, 'overlaid_idxs', [])) > 0):
+            rebuild_idxs = list(self.overlaid_idxs)
+            y_new, x_new = self.get_frames_int_1d(rebuild_idxs)
+            if x_new is not None and y_new is not None:
+                if self.bkg_1d is not None:
+                    y_new = y_new - self.bkg_1d
+                if y_new.ndim == 1:
+                    y_new = y_new[np.newaxis, :]
+                self.plot_data = [x_new, y_new]
+                kept, kept_names = self._loaded_1d_overlay_labels(
+                    rebuild_idxs, max_rows=y_new.shape[0],
+                )
+                self.overlaid_idxs = kept
+                self.frame_names = kept_names
+            else:
+                self.plot_data = [xdata, ydata]
+                self.frame_names = list(frame_names)
+                self.overlaid_idxs = list(self.idxs_1d)
+        elif accumulate:
+            for idx, frame_name, row in zip(self.idxs_1d, frame_names, ydata):
+                if frame_name not in self.frame_names:
                     old_x = self.plot_data[0]
                     if old_x.shape == xdata.shape and np.allclose(old_x, xdata):
                         # Same grid — just append
@@ -142,11 +198,13 @@ class DisplayPlotMixin:
                         new_row = _reinterp(xdata, row, merged_x)
                         self.plot_data = [merged_x,
                                           np.vstack((new_old, new_row))]
-                    self.arch_names.append(arch_name)
+                    self.frame_names.append(frame_name)
+                    self.overlaid_idxs.append(int(idx))
         else:
             # Fresh start: Single/Sum/Average, unit changed, or no existing data
             self.plot_data = [xdata, ydata]
-            self.arch_names = list(arch_names)
+            self.frame_names = list(frame_names)
+            self.overlaid_idxs = list(self.idxs_1d)
 
         xdata, ydata = self.plot_data
         if xdata.size == 0 or ydata.size == 0:
@@ -176,28 +234,49 @@ class DisplayPlotMixin:
         except Exception:
             logger.debug("sigPlotMethodChanged emit failed", exc_info=True)
 
+        if getattr(self, 'viewer_mode', None) == 'xye':
+            if new_method in ('Single', 'Sum', 'Average'):
+                self.clear_overlay()
+            self._update_xye_viewer()
+            return
+
         if new_method == 'Single':
             # Reset accumulated data — rebuild from current selection
             self.plot_data = [np.array([]), np.array([])]
-            self.arch_names = []
+            self.frame_names = []
+            self.overlaid_idxs = []
             self.update_plot()
         elif new_method in ('Sum', 'Average'):
             # No accumulation needed: aggregation happens inside
             # update_1d_view() based on the current selection.
             self.plot_data = [np.array([]), np.array([])]
-            self.arch_names = []
+            self.frame_names = []
+            self.overlaid_idxs = []
             self.update_plot()
         else:
             # Overlay / Waterfall: keep existing accumulated curves and
             # just refresh the rendered view.
             self.update_plot_view()
 
+    def _current_plot_axis_label(self):
+        """Return the bottom-axis label and unit for the current 1D view."""
+        if getattr(self, 'viewer_mode', None) == 'xye':
+            axis = getattr(self, '_viewer_x_axis_label', None)
+            if axis is not None:
+                return axis
+
+        plot_text = self.ui.plotUnit.currentText()
+        m = re.match(r'^(.+?)\s*\((.+)\)$', plot_text)
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
+        return plot_text, ''
+
     # ── 1D plot view rendering ────────────────────────────────────
 
     def update_plot_view(self):
         """Updates 1D view of data in plot frame
         """
-        if (len(self.arch_ids) == 0) or len(self.data_1d) == 0:
+        if (len(self.frame_ids) == 0) or len(self.data_1d) == 0:
             return
 
         # Clear curves
@@ -211,7 +290,7 @@ class DisplayPlotMixin:
         # That's Overlay with a multi-selection, or Single mode with a
         # manual shift/cmd-click multi-selection (which behaves like Overlay).
         if (self.plotMethod in ('Overlay', 'Single')
-                and len(self.arch_names) > 1):
+                and len(self.frame_names) > 1):
             self.ui.yOffset.setEnabled(True)
 
         n_curves = len(self.plot_data[1])
@@ -267,7 +346,7 @@ class DisplayPlotMixin:
         # that branch behaves like Overlay but without the yOffset.
         multi_single = self.plotMethod == 'Single' and ydata.shape[0] > 1
         if self.plotMethod in ['Overlay', 'Waterfall'] or multi_single:
-            ydata = ydata[self.wf_start::self.wf_step]
+            ydata = ydata[self.wf_start:self.wf_stop:self.wf_step]
             self.setup_curves()
 
             offset = self.ui.yOffset.value()
@@ -285,14 +364,7 @@ class DisplayPlotMixin:
 
             self.curves[0].setData(s_xdata, s_ydata.squeeze())
 
-        # Apply labels to plot — parse from plotUnit combo text
-        plot_text = self.ui.plotUnit.currentText()
-        # Extract label and units from "Label (Units)" format
-        m = re.match(r'^(.+?)\s*\((.+)\)$', plot_text)
-        if m:
-            _xl, _xu = m.group(1).strip(), m.group(2).strip()
-        else:
-            _xl, _xu = plot_text, ''
+        _xl, _xu = self._current_plot_axis_label()
         self.plot.setLabel("bottom", _xl, units=_xu)
         self.plot.setLabel("left", ylabel)
 
@@ -342,7 +414,7 @@ class DisplayPlotMixin:
                     [self.data_1d[idx].scan_info[self.wf_yaxis]
                      for idx in self.idxs]
                 )
-            return s_ydata[self.wf_start::self.wf_step]
+            return s_ydata[self.wf_start:self.wf_stop:self.wf_step]
         except KeyError as e:
             logger.debug('Counter %s not present in metadata: %s',
                          self.wf_yaxis, e)
@@ -355,7 +427,7 @@ class DisplayPlotMixin:
 
         xdata_, data_ = self.plot_data
         s_xdata, data = xdata_.copy(), data_.copy()
-        data = data[self.wf_start::self.wf_step, :]
+        data = data[self.wf_start:self.wf_stop:self.wf_step, :]
 
         s_ydata = self._wf_y_axis(data.shape[0])
         if s_ydata is None:
@@ -367,13 +439,7 @@ class DisplayPlotMixin:
         self.wf_widget.setImage(data.T, scale=self.scale, cmap=self.cmap)
         self.wf_widget.setRect(rect)
 
-        # Parse label from plotUnit combo text
-        plot_text = self.ui.plotUnit.currentText()
-        m = re.match(r'^(.+?)\s*\((.+)\)$', plot_text)
-        if m:
-            _xl, _xu = m.group(1).strip(), m.group(2).strip()
-        else:
-            _xl, _xu = plot_text, ''
+        _xl, _xu = self._current_plot_axis_label()
         self.wf_widget.image_plot.setLabel("bottom", _xl, units=_xu)
         self.wf_widget.image_plot.setLabel("left", self.wf_yaxis)
 
@@ -384,7 +450,7 @@ class DisplayPlotMixin:
 
         xdata_, data_ = self.plot_data
         s_xdata, data = xdata_.copy(), data_.copy()
-        data = data[self.wf_start::self.wf_step, :]
+        data = data[self.wf_start:self.wf_stop:self.wf_step, :]
 
         x_max, x_min = np.max(s_xdata), np.min(s_xdata)
         x_step = (x_max - x_min)/len(s_xdata)
@@ -411,9 +477,12 @@ class DisplayPlotMixin:
         rect = get_rect(s_xdata[:, 0], s_ydata[0])
         self.wf_widget.setRect(rect)
 
-        plotUnit = self.ui.plotUnit.currentIndex()
-        self.wf_widget.image_plot.setLabel("bottom", x_labels_1D[plotUnit],
-                                           units=x_units_1D[plotUnit])
+        if getattr(self, 'viewer_mode', None) == 'xye':
+            _xl, _xu = self._current_plot_axis_label()
+        else:
+            plotUnit = self.ui.plotUnit.currentIndex()
+            _xl, _xu = x_labels_1D[plotUnit], x_units_1D[plotUnit]
+        self.wf_widget.image_plot.setLabel("bottom", _xl, units=_xu)
         self.wf_widget.image_plot.setLabel("left", self.wf_yaxis)
 
         return data
@@ -426,13 +495,13 @@ class DisplayPlotMixin:
         self.curves.clear()
         self.legend.clear()
 
-        arch_ids = self.arch_names[self.wf_start::self.wf_step]
+        frame_ids = self.frame_names[self.wf_start:self.wf_stop:self.wf_step]
         if (self.plotMethod in ['Sum', 'Average'] and
-                len(self.arch_names) > 1):
-            arch_ids = f'{self.plotMethod} [{self.arch_names[0]}'
-            for arch_name in self.arch_names[1:]:
-                arch_ids += f', {arch_name}'
-            arch_ids = [arch_ids + ']']
+                len(self.frame_names) > 1):
+            frame_ids = f'{self.plotMethod} [{self.frame_names[0]}'
+            for frame_name in self.frame_names[1:]:
+                frame_ids += f', {frame_name}'
+            frame_ids = [frame_ids + ']']
 
         colors = self.get_colors()
         self.curves = [self.plot.plot(
@@ -440,8 +509,8 @@ class DisplayPlotMixin:
             symbolBrush=color,
             symbolPen=color,
             symbolSize=4,
-            name=arch_id,
-        ) for (color, arch_id) in zip(colors, arch_ids)]
+            name=frame_id,
+        ) for (color, frame_id) in zip(colors, frame_ids)]
 
         if not self.ui.showLegend.isChecked():
             self.legend.clear()
@@ -449,8 +518,8 @@ class DisplayPlotMixin:
     def clear_1D(self):
         """Initialize curves for line plots
         """
-        self.arch_names.clear()
-        self.arch_ids.clear()
+        self.frame_names.clear()
+        self.frame_ids.clear()
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.setup_1d_layout()
         self.plot.clear()
@@ -469,9 +538,12 @@ class DisplayPlotMixin:
         self.wf_widget.setParent(None)
         self.plot_layout.addWidget(self.plot_win)
 
-        self.ui.wf_options.setEnabled(False)
+        # Options is always reachable now — it holds Legend + Overlay Offset
+        # (the waterfall y-axis/start/step inside grey out when not in a
+        # waterfall).  Was disabled in single-curve mode, which would have
+        # hidden the Legend toggle.
+        self.ui.wf_options.setEnabled(True)
         if len(self.plot_data[1]) > 1:
-            self.ui.wf_options.setEnabled(True)
             self.wf_yaxis_widget.setEnabled(False)
 
     def setup_wf_widget(self):
@@ -507,34 +579,68 @@ class DisplayPlotMixin:
         self.wf_dialog.show()
 
     def setup_wf_options_widget(self):
+        """Build the 1D-plot Options dialog, grouped into three sections:
+
+        * **Waterfall** — y-axis source (Frame #/Time/metadata), Start, Stop,
+          Step.  Govern which frames map onto the waterfall image and its
+          y-axis.
+        * **Overlay** — Offset (vertical stacking between curves).
+        * **Legend** — show/hide the curve legend.
         """
-        Setup y-axis option for Waterfall plot
-        Setup first image and step size for wf and overlay plots
-        """
-        layout = QtWidgets.QGridLayout()
+        layout = QtWidgets.QVBoxLayout()
         self.wf_dialog.setLayout(layout)
 
-        layout.addWidget(QtWidgets.QLabel('Y-Axis'), 0, 0)
-        layout.addWidget(QtWidgets.QLabel('Start'), 0, 1)
-        layout.addWidget(QtWidgets.QLabel('Step'), 0, 2)
+        def _section(title):
+            box = QtWidgets.QGroupBox(title)
+            grid = QtWidgets.QGridLayout()
+            box.setLayout(grid)
+            layout.addWidget(box)
+            return grid
 
-        layout.addWidget(self.wf_yaxis_widget, 1, 0)
-        layout.addWidget(self.wf_start_widget, 1, 1)
-        layout.addWidget(self.wf_step_widget, 1, 2)
+        # ── Waterfall ─────────────────────────────────────────────
+        wf = _section('Waterfall')
+        wf.addWidget(QtWidgets.QLabel('Y-Axis'), 0, 0)
+        wf.addWidget(QtWidgets.QLabel('Start'), 0, 1)
+        wf.addWidget(QtWidgets.QLabel('Stop'), 0, 2)
+        wf.addWidget(QtWidgets.QLabel('Step'), 0, 3)
+        wf.addWidget(self.wf_yaxis_widget, 1, 0)
+        wf.addWidget(self.wf_start_widget, 1, 1)
+        wf.addWidget(self.wf_stop_widget, 1, 2)
+        wf.addWidget(self.wf_step_widget, 1, 3)
 
-        layout.addWidget(self.wf_accept_button, 2, 1)
-        layout.addWidget(self.wf_cancel_button, 2, 2)
+        # ── Overlay ───────────────────────────────────────────────
+        ov = _section('Overlay')
+        ov.addWidget(QtWidgets.QLabel('Offset'), 0, 0)
+        ov.addWidget(self.ui.yOffset, 0, 1)
 
-        arch = self.data_1d[self.idxs_1d[0]]
-        counters = list(arch.scan_info.keys())
+        # ── Legend ────────────────────────────────────────────────
+        lg = _section('Legend')
+        lg.addWidget(self.ui.showLegend, 0, 0)
+
+        # ── Dialog buttons ────────────────────────────────────────
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        btns.addWidget(self.wf_accept_button)
+        btns.addWidget(self.wf_cancel_button)
+        layout.addLayout(btns)
+
+        frame = self.data_1d[self.idxs_1d[0]]
+        counters = list(frame.scan_info.keys())
         counters = ['Frame #', 'Time (s)', 'Time (minutes)'] + counters
         self.wf_yaxis_widget.addItems(counters)
 
         self.wf_start_widget.setDecimals(0)
-        self.wf_start_widget.setRange(1, 1000)
+        self.wf_start_widget.setRange(1, 100000)
+        self.wf_start_widget.setValue(1)
+
+        # Stop: 0 is the sentinel for "through the last frame".
+        self.wf_stop_widget.setDecimals(0)
+        self.wf_stop_widget.setRange(0, 100000)
+        self.wf_stop_widget.setValue(0)
+        self.wf_stop_widget.setSpecialValueText('End')  # shown when value==0
 
         self.wf_step_widget.setDecimals(0)
-        self.wf_step_widget.setRange(1, 100)
+        self.wf_step_widget.setRange(1, 1000)
 
         self.wf_accept_button.clicked.connect(self.get_wf_option)
         self.wf_cancel_button.clicked.connect(self.close_wf_popup)
@@ -543,6 +649,10 @@ class DisplayPlotMixin:
         self.wf_yaxis = self.wf_yaxis_widget.currentText()
 
         self.wf_start = int(self.wf_start_widget.value()) - 1
+        # Stop: 0 (shown as "End") → None = slice through the last frame;
+        # otherwise it's a 1-based inclusive end (→ exclusive Python stop).
+        _stop = int(self.wf_stop_widget.value())
+        self.wf_stop = None if _stop <= 0 else _stop
         self.wf_step = int(self.wf_step_widget.value())
 
         self.close_wf_popup()
@@ -679,23 +789,23 @@ class DisplayPlotMixin:
 
         # In GI mode or when metadata explicitly defines the slice axis,
         # no unit conversion is needed — just refresh
-        if self.sphere.gi or (info and info['source'] not in ('2d', '1d_2d')):
+        if self.scan.gi or (info and info['source'] not in ('2d', '1d_2d')):
             self.update_plot()
             return
 
         # Standard mode, chi axis: handle Q ↔ 2θ conversion
-        if not self.sphere.gi and info and info.get('axis') == 'azimuthal':
+        if not self.scan.gi and info and info.get('axis') == 'azimuthal':
             imageUnit = self.ui.imageUnit.currentIndex()
             cen = self.ui.slice_center.value()
             wid = self.ui.slice_width.value()
             _range = np.array([cen - wid, cen + wid])
 
             try:
-                arch_for_wl = self.data_1d[self.idxs_1d[0]]
+                frame_for_wl = self.data_1d[self.idxs_1d[0]]
             except (IndexError, KeyError):
                 self.update_plot()
                 return
-            wavelength = self._get_wavelength(arch_for_wl)
+            wavelength = self._get_wavelength(frame_for_wl)
             if wavelength is None or wavelength <= 0:
                 self.update_plot()
                 return

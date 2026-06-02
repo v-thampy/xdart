@@ -8,12 +8,15 @@ headless reduction work should cross into ``ssrl_xrd_tools`` as ``Frame`` /
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from dataclasses import fields as _dc_fields
 
@@ -28,7 +31,7 @@ from ssrl_xrd_tools.reduction import (
     run_reduction,
 )
 
-# S4: GI-only sphere kwargs that must NOT flow through to the standard
+# S4: GI-only scan kwargs that must NOT flow through to the standard
 # pyFAI integrator path.  Derived from :class:`GIMode` (so adding a GIMode
 # field automatically excludes that name) plus a small set of legacy
 # xdart-only names that the GI widgets emit but :class:`GIMode` doesn't
@@ -82,16 +85,24 @@ def scan_from_live_scan(
     """Build an ``ssrl_xrd_tools.reduction.Scan`` from a ``LiveScan``."""
     if include_backgrounds is None:
         include_backgrounds = include_images
-    indices = list(frame_indices) if frame_indices is not None else list(live_scan.arches.index)
-    frames = [
-        frame_from_live_frame(
-            live_scan.arches[int(idx)],
+    indices = list(frame_indices) if frame_indices is not None else list(live_scan.frames.index)
+    scan_data = getattr(live_scan, "scan_data", None)
+    frames = []
+    for idx in indices:
+        frame = frame_from_live_frame(
+            live_scan.frames[int(idx)],
             include_image=include_images,
             include_background=include_backgrounds,
         )
-        for idx in indices
-    ]
-    first_frame = live_scan.arches[int(indices[0])] if indices else None
+        frame.metadata.update(
+            {
+                key: value
+                for key, value in _scan_data_row(scan_data, int(idx)).items()
+                if key not in frame.metadata
+            }
+        )
+        frames.append(frame)
+    first_frame = live_scan.frames[int(indices[0])] if indices else None
     poni = getattr(first_frame, "poni", None) if first_frame is not None else None
     wavelength_A = None
     try:
@@ -101,7 +112,6 @@ def scan_from_live_scan(
         wavelength_A = None
 
     motors = {}
-    scan_data = getattr(live_scan, "scan_data", None)
     if scan_data is not None:
         try:
             motors = {
@@ -180,8 +190,8 @@ def plan_from_live_scan(
 
     mask_shape = None
     try:
-        first_idx = live_scan.arches.index[0]
-        first_img = getattr(live_scan.arches[int(first_idx)], "map_raw", None)
+        first_idx = live_scan.frames.index[0]
+        first_img = getattr(live_scan.frames[int(first_idx)], "map_raw", None)
         mask_shape = getattr(first_img, "shape", None)
     except Exception:
         mask_shape = None
@@ -266,41 +276,57 @@ def reduce_live_frame(
 
 # ---------------------------------------------------------------------------
 # S3 + C1 helpers — used by every wrangler so the GI-vs-standard dispatch
-# and the per-sphere plan cache live in exactly one place.
+# and the per-scan plan cache live in exactly one place.
 # ---------------------------------------------------------------------------
+
+_UNSET = object()  # sentinel: "mask_sig not supplied" (distinct from None)
+
+
+def _mask_signature(mask: Any) -> Any:
+    """Content digest of a detector mask (shape + dtype + size + sum +
+    head/tail for numeric masks).  This is the O(N) part — it touches the
+    whole array via ``np.sum`` — so callers in per-frame hot loops should
+    memoize it by mask identity rather than recompute it every frame
+    (see :meth:`StandardPlanCache._mask_sig_for`)."""
+    if mask is None:
+        return None
+    arr = np.asarray(mask)
+    flat = arr.ravel()
+    if np.issubdtype(arr.dtype, np.number) and flat.size:
+        mask_sum = float(np.sum(flat, dtype=np.float64))
+        head = tuple(flat[:8].tolist())
+        tail = tuple(flat[-8:].tolist())
+    else:
+        mask_sum = None
+        head = ()
+        tail = ()
+    return (arr.shape, str(arr.dtype), int(arr.size), mask_sum, head, tail)
+
 
 def _plan_signature(
     live_scan: Any,
     integrate_1d: bool,
     integrate_2d: bool,
+    *,
+    mask_sig: Any = _UNSET,
 ) -> tuple:
     """Hashable signature of the inputs that ``plan_from_live_scan`` reads.
 
     Used by :class:`StandardPlanCache` to skip plan rebuilds when nothing
-    relevant on the sphere has changed.  Covers the bai_*_args dicts
-    (sorted) and a digest of ``global_mask`` (shape + dtype + size +
-    head/tail/sum for numeric masks).
+    relevant on the scan has changed.  Covers the bai_*_args dicts
+    (sorted) and a digest of ``global_mask``.
+
+    ``mask_sig`` lets the caller pass an already-computed mask digest so
+    the O(N) :func:`_mask_signature` isn't recomputed on every per-frame
+    call; when omitted it's derived from ``live_scan.global_mask``.
     """
     def _items(args: Any) -> tuple:
         return tuple(
             sorted((str(key), repr(value)) for key, value in (args or {}).items())
         )
 
-    mask = getattr(live_scan, "global_mask", None)
-    if mask is None:
-        mask_sig: Any = None
-    else:
-        arr = np.asarray(mask)
-        flat = arr.ravel()
-        if np.issubdtype(arr.dtype, np.number) and flat.size:
-            mask_sum = float(np.sum(flat, dtype=np.float64))
-            head = tuple(flat[:8].tolist())
-            tail = tuple(flat[-8:].tolist())
-        else:
-            mask_sum = None
-            head = ()
-            tail = ()
-        mask_sig = (arr.shape, str(arr.dtype), int(arr.size), mask_sum, head, tail)
+    if mask_sig is _UNSET:
+        mask_sig = _mask_signature(getattr(live_scan, "global_mask", None))
 
     return (
         id(live_scan),
@@ -317,18 +343,39 @@ class StandardPlanCache:
 
     Wrappers (wranglers, integrator threads) keep one instance for the
     lifetime of a scan; the cached plan is rebuilt only when one of the
-    sphere settings ``_plan_signature`` covers actually changes.
+    scan settings ``_plan_signature`` covers actually changes.
 
-    Returns ``None`` for GI spheres so callers can drop straight into the
+    Returns ``None`` for GI scans so callers can drop straight into the
     legacy fiber-integrator path without an "is GI" check at every call
     site (the per-dispatch helper below already does that).
     """
 
-    __slots__ = ("_plan", "_key")
+    __slots__ = ("_plan", "_key", "_mask_obj", "_mask_sig")
 
     def __init__(self) -> None:
         self._plan: ReductionPlan | None = None
         self._key: tuple | None = None
+        # Memoized mask digest, keyed by the mask *object* (see below).
+        self._mask_obj: Any = _UNSET
+        self._mask_sig: Any = None
+
+    def _mask_sig_for(self, mask: Any) -> Any:
+        """Return the mask digest, recomputing the O(N) part only when the
+        mask object itself changes.
+
+        ``global_mask`` is built once per scan (detector mask + user mask)
+        and *replaced* — not mutated in place — when the user swaps the
+        mask file, so object identity is a sound proxy for "contents
+        unchanged".  Holding a reference in ``_mask_obj`` also pins the id
+        so it can't be reused by a later array.  This keeps the per-frame
+        ``get()`` off the full-array ``np.sum`` that dominated mask digest
+        cost on large detectors.
+        """
+        if mask is self._mask_obj:
+            return self._mask_sig
+        self._mask_obj = mask
+        self._mask_sig = _mask_signature(mask)
+        return self._mask_sig
 
     def get(
         self,
@@ -339,7 +386,10 @@ class StandardPlanCache:
     ) -> ReductionPlan | None:
         if getattr(live_scan, "gi", False):
             return None
-        key = _plan_signature(live_scan, integrate_1d, integrate_2d)
+        mask_sig = self._mask_sig_for(getattr(live_scan, "global_mask", None))
+        key = _plan_signature(
+            live_scan, integrate_1d, integrate_2d, mask_sig=mask_sig,
+        )
         if self._plan is None or self._key != key:
             self._plan = plan_from_live_scan(
                 live_scan,
@@ -352,6 +402,8 @@ class StandardPlanCache:
     def invalidate(self) -> None:
         self._plan = None
         self._key = None
+        self._mask_obj = _UNSET
+        self._mask_sig = None
 
 
 def dispatch_live_frame_reduction(
@@ -376,7 +428,7 @@ def dispatch_live_frame_reduction(
     standard_plan
         ``ReductionPlan`` for the non-GI path; pass ``None`` to force
         the legacy callback (matches what
-        :meth:`StandardPlanCache.get` returns for GI spheres).
+        :meth:`StandardPlanCache.get` returns for GI scans).
     integrator
         Pre-built pyFAI integrator for the worker (typically borrowed
         from an :class:`IntegratorPool`).
@@ -400,10 +452,28 @@ def dispatch_live_frame_reduction(
     )
 
 
-def _source_path(arch: Any) -> Path | None:
-    resolver = getattr(arch, "_resolved_source_path", None)
-    path = resolver() if callable(resolver) else getattr(arch, "source_file", "")
+def _source_path(frame: Any) -> Path | None:
+    resolver = getattr(frame, "_resolved_source_path", None)
+    path = resolver() if callable(resolver) else getattr(frame, "source_file", "")
     return Path(path) if path else None
+
+
+def _scan_data_row(scan_data: Any, idx: int) -> dict[str, Any]:
+    if scan_data is None or not hasattr(scan_data, "loc"):
+        return {}
+    try:
+        row = scan_data.loc[int(idx)]
+    except (KeyError, TypeError, ValueError):
+        return {}
+    if hasattr(row, "iloc") and getattr(row, "ndim", 1) > 1:
+        row = row.iloc[0]
+    try:
+        return {
+            str(key): value
+            for key, value in row.to_dict().items()
+        }
+    except AttributeError:
+        return {}
 
 
 def _frame_norm(frame: Frame, plan: ReductionPlan) -> float:
@@ -468,22 +538,38 @@ def _flat_mask_as_bool(mask: Any, shape: tuple[int, int] | None) -> np.ndarray |
         if arr.ndim == 2:
             return arr.astype(bool, copy=False)
         return None
+    # A mask that doesn't fit this image (wrong detector/calibration, a
+    # resized frame, a stale flat-index mask, …) is ignored with a warning
+    # rather than crashing the whole scan — reducing unmasked is far better
+    # than aborting the run.  Structural problems degrade the same way.
     if arr.ndim == 2:
         if arr.shape != shape:
-            raise ValueError(f"mask shape {arr.shape} does not match image shape {shape}")
+            logger.warning(
+                "Ignoring mask: shape %s does not match image shape %s.",
+                arr.shape, shape,
+            )
+            return None
         return arr.astype(bool, copy=False)
     if arr.ndim != 1:
-        raise ValueError(f"flat mask must be 1D; got shape {arr.shape}")
+        logger.warning("Ignoring mask: expected 1D flat mask, got shape %s.", arr.shape)
+        return None
     if arr.dtype == bool:
         if arr.size != int(np.prod(shape)):
-            raise ValueError(
-                f"flat boolean mask length {arr.size} does not match image shape {shape}"
+            logger.warning(
+                "Ignoring boolean mask: length %d does not match image shape %s.",
+                arr.size, shape,
             )
+            return None
         return arr.reshape(shape)
     out = np.zeros(int(np.prod(shape)), dtype=bool)
     flat = np.asarray(arr, dtype=int).ravel()
-    if np.any(flat < 0) or np.any(flat >= out.size):
-        raise ValueError(f"flat mask indices out of bounds for image shape {shape}")
+    if flat.size and (flat.min() < 0 or flat.max() >= out.size):
+        logger.warning(
+            "Ignoring mask: flat indices out of bounds for image shape %s "
+            "(index range [%d, %d], image has %d pixels).",
+            shape, int(flat.min()), int(flat.max()), out.size,
+        )
+        return None
     out[flat] = True
     return out.reshape(shape)
 

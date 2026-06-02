@@ -6,14 +6,19 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
+# Maps legacy serialized class names (as they appear in pre-rename .nxs
+# provenance) to the current canonical names + module paths.  Keys are the
+# historical strings on disk; values are today's locations
+# (ewald.frame / ewald.scan / ewald.frame_series).  Pure string mapping —
+# nothing here is imported.
 LEGACY_LIVE_NAME_ALIASES: dict[str, str] = {
     "EwaldArch": "LiveFrame",
-    "xdart.modules.ewald.arch.EwaldArch": "xdart.modules.ewald.arch.LiveFrame",
+    "xdart.modules.ewald.arch.EwaldArch": "xdart.modules.ewald.frame.LiveFrame",
     "EwaldSphere": "LiveScan",
-    "xdart.modules.ewald.sphere.EwaldSphere": "xdart.modules.ewald.sphere.LiveScan",
+    "xdart.modules.ewald.sphere.EwaldSphere": "xdart.modules.ewald.scan.LiveScan",
     "ArchSeries": "LiveFrameSeries",
     "xdart.modules.ewald.arch_series.ArchSeries": (
-        "xdart.modules.ewald.arch_series.LiveFrameSeries"
+        "xdart.modules.ewald.frame_series.LiveFrameSeries"
     ),
 }
 

@@ -33,7 +33,7 @@ from pyqtgraph.parametertree import Parameter
 # This module imports
 from .ui.integratorUI import Ui_Form
 
-from .sphere_threads import integratorThread
+from .scan_threads import integratorThread
 from xdart.utils.session import save_session, load_session
 
 _translate = QtCore.QCoreApplication.translate
@@ -120,17 +120,17 @@ class integratorTree(QtWidgets.QWidget):
         update: Grabs args from LiveScan object and sets all params
             to match.
     """
-    def __init__(self, sphere, arch, file_lock,
-                 arches, arch_ids, data_1d, data_2d, parent=None,
+    def __init__(self, scan, frame, file_lock,
+                 frames, frame_ids, data_1d, data_2d, parent=None,
                  data_lock=None):
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
-        self.sphere = sphere
-        self.arch = arch
+        self.scan = scan
+        self.frame = frame
         self.file_lock = file_lock
-        self.arches = arches
-        self.arch_ids = arch_ids
+        self.frames = frames
+        self.frame_ids = frame_ids
         self.data_1d = data_1d
         self.data_2d = data_2d
         # Shared lock guarding data_1d / data_2d; falls back to a private lock
@@ -180,8 +180,8 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.integrate2D.clicked.connect(self.bai_2d)
 
         self.integrator_thread = integratorThread(
-            self.sphere, self.arch, self.file_lock,
-            self.arches, self.arch_ids, self.data_1d, self.data_2d,
+            self.scan, self.frame, self.file_lock,
+            self.frames, self.frame_ids, self.data_1d, self.data_2d,
             data_lock=self.data_lock,
         )
 
@@ -238,10 +238,11 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.unit_2D.currentIndexChanged.connect(self._save_to_session)
         self.ui.axis1D.currentIndexChanged.connect(self._save_to_session)
         self.ui.axis2D.currentIndexChanged.connect(self._save_to_session)
-        self.ui.radial_autoRange_1D.stateChanged.connect(self._save_to_session)
-        self.ui.azim_autoRange_1D.stateChanged.connect(self._save_to_session)
-        self.ui.radial_autoRange_2D.stateChanged.connect(self._save_to_session)
-        self.ui.azim_autoRange_2D.stateChanged.connect(self._save_to_session)
+        # Auto-range toggles are checkable QPushButtons now → ``toggled``.
+        self.ui.radial_autoRange_1D.toggled.connect(self._save_to_session)
+        self.ui.azim_autoRange_1D.toggled.connect(self._save_to_session)
+        self.ui.radial_autoRange_2D.toggled.connect(self._save_to_session)
+        self.ui.azim_autoRange_2D.toggled.connect(self._save_to_session)
         self.ui.radial_low_1D.textChanged.connect(self._save_to_session)
         self.ui.radial_high_1D.textChanged.connect(self._save_to_session)
         self.ui.azim_low_1D.textChanged.connect(self._save_to_session)
@@ -378,11 +379,11 @@ class integratorTree(QtWidgets.QWidget):
         self._connect_inp_signals()
 
     def update(self):
-        """Grabs args from sphere and uses _sync_ranges and
+        """Grabs args from scan and uses _sync_ranges and
         _update_params private methods to update.
 
         args:
-            sphere: LiveScan, object to get args from.
+            scan: LiveScan, object to get args from.
         """
         self._update_params()
 
@@ -431,31 +432,31 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.azim_high_2D.setValidator(QtGui.QDoubleValidator(-180, 180, 2))
 
     def _update_params(self):
-        """Grabs args from sphere and syncs parameters with them.
+        """Grabs args from scan and syncs parameters with them.
 
         args:
-            sphere: LiveScan, object to get args from.
+            scan: LiveScan, object to get args from.
         """
         self._disconnect_inp_signals()
-        with self.sphere.sphere_lock:
-            self._args_to_params(self.sphere.bai_1d_args, self.bai_1d_pars, dim='1D')
-            self._args_to_params(self.sphere.bai_2d_args, self.bai_2d_pars, dim='2D')
+        with self.scan.scan_lock:
+            self._args_to_params(self.scan.bai_1d_args, self.bai_1d_pars, dim='1D')
+            self._args_to_params(self.scan.bai_2d_args, self.bai_2d_pars, dim='2D')
         self._connect_inp_signals()
 
     def get_args(self, key):
-        """Updates sphere with all parameters held in integrator.
+        """Updates scan with all parameters held in integrator.
 
         args:
-            sphere: LiveScan, object to update
+            scan: LiveScan, object to update
             key: str, which args to update.
         """
-        with self.sphere.sphere_lock:
+        with self.scan.scan_lock:
             if key == 'bai_1d':
                 self._get_npts_1D()
                 self._get_unit_1D()
                 self._get_radial_range_1D()
                 self._get_azim_range_1D()
-                self._params_to_args(self.sphere.bai_1d_args, self.bai_1d_pars)
+                self._params_to_args(self.scan.bai_1d_args, self.bai_1d_pars)
 
             elif key == 'bai_2d':
                 self._get_npts_radial_2D()
@@ -463,7 +464,7 @@ class integratorTree(QtWidgets.QWidget):
                 self._get_unit_2D()
                 self._get_radial_range_2D()
                 self._get_azim_range_2D()
-                self._params_to_args(self.sphere.bai_2d_args, self.bai_2d_pars)
+                self._params_to_args(self.scan.bai_2d_args, self.bai_2d_pars)
 
     def _args_to_params(self, args, tree, dim='1D'):
         """Takes in args dictionary and sets all parameters in tree
@@ -566,7 +567,7 @@ class integratorTree(QtWidgets.QWidget):
                               gi_alt_key=None, after=None):
         """Read auto-checkbox + (low, high) line edits into args_dict.
 
-        ``gi_alt_key`` (2D only): when set, and the sphere is in GI
+        ``gi_alt_key`` (2D only): when set, and the scan is in GI
         mode with axis2D == Qip vs Qoop, store under that key instead
         of ``key``.  Pre-G3 this was a hand-written `if` in every
         2D ``_get_*`` method.
@@ -581,7 +582,7 @@ class integratorTree(QtWidgets.QWidget):
             _range = self._get_valid_range(low_edit, high_edit)
         effective_key = key
         if (gi_alt_key
-                and self.sphere.gi
+                and self.scan.gi
                 and self.ui.axis2D.currentIndex() == 0):
             effective_key = gi_alt_key
         args_dict[effective_key] = _range
@@ -617,23 +618,23 @@ class integratorTree(QtWidgets.QWidget):
         connect()
 
     def _get_radial_range_1D(self):
-        """Sets Sphere 1D radial range in bai_1d_args from UI values"""
+        """Sets Scan 1D radial range in bai_1d_args from UI values"""
         self._get_range_into_args(
             auto_cb=self.ui.radial_autoRange_1D,
             low_edit=self.ui.radial_low_1D,
             high_edit=self.ui.radial_high_1D,
-            args_dict=self.sphere.bai_1d_args,
+            args_dict=self.scan.bai_1d_args,
             key='radial_range',
             auto_attr='radial_autoRange_1D',
         )
 
     def _set_radial_range_1D(self):
-        """Sets UI values from Sphere 1D radial range in bai_1d_args"""
+        """Sets UI values from Scan 1D radial range in bai_1d_args"""
         self._set_range_from_args(
             auto_cb=self.ui.radial_autoRange_1D,
             low_edit=self.ui.radial_low_1D,
             high_edit=self.ui.radial_high_1D,
-            args_dict=self.sphere.bai_1d_args,
+            args_dict=self.scan.bai_1d_args,
             key='radial_range',
             auto_attr='radial_autoRange_1D',
             disconnect=self._disconnect_radial_range_1D_signals,
@@ -641,7 +642,7 @@ class integratorTree(QtWidgets.QWidget):
         )
 
     def _get_azim_range_1D(self):
-        """Sets Sphere 1D azimuth range in bai_1d_args from UI values"""
+        """Sets Scan 1D azimuth range in bai_1d_args from UI values"""
         # Toggling auto can flip the q_total path between fast (1 Pts) and
         # slow (2 Pts); refresh the npts_oop_1D visibility after the
         # dict update lands.
@@ -649,19 +650,19 @@ class integratorTree(QtWidgets.QWidget):
             auto_cb=self.ui.azim_autoRange_1D,
             low_edit=self.ui.azim_low_1D,
             high_edit=self.ui.azim_high_1D,
-            args_dict=self.sphere.bai_1d_args,
+            args_dict=self.scan.bai_1d_args,
             key='azimuth_range',
             auto_attr='azim_autoRange_1D',
             after=self._update_npts_oop_visibility_1d,
         )
 
     def _set_azim_range_1D(self):
-        """Sets UI values from Sphere 1D azimuth range in bai_1d_args."""
+        """Sets UI values from Scan 1D azimuth range in bai_1d_args."""
         self._set_range_from_args(
             auto_cb=self.ui.azim_autoRange_1D,
             low_edit=self.ui.azim_low_1D,
             high_edit=self.ui.azim_high_1D,
-            args_dict=self.sphere.bai_1d_args,
+            args_dict=self.scan.bai_1d_args,
             key='azimuth_range',
             auto_attr='azim_autoRange_1D',
             disconnect=self._disconnect_azim_range_1D_signals,
@@ -670,7 +671,7 @@ class integratorTree(QtWidgets.QWidget):
         )
 
     def _get_radial_range_2D(self):
-        """Sets Sphere 2D radial range in bai_2d_args from UI values.
+        """Sets Scan 2D radial range in bai_2d_args from UI values.
 
         GI Qip-vs-Qoop swaps the dict key from ``radial_range`` to
         ``x_range`` (handled by ``gi_alt_key``).
@@ -679,14 +680,14 @@ class integratorTree(QtWidgets.QWidget):
             auto_cb=self.ui.radial_autoRange_2D,
             low_edit=self.ui.radial_low_2D,
             high_edit=self.ui.radial_high_2D,
-            args_dict=self.sphere.bai_2d_args,
+            args_dict=self.scan.bai_2d_args,
             key='radial_range',
             auto_attr='radial_autoRange_2D',
             gi_alt_key='x_range',
         )
 
     def _set_radial_range_2D(self):
-        """Sets UI values from Sphere 2D radial range in bai_2d_args.
+        """Sets UI values from Scan 2D radial range in bai_2d_args.
 
         Reads ``radial_range`` regardless of GI mode (the UI line
         edits only bind to that key; see the _get counterpart).
@@ -695,7 +696,7 @@ class integratorTree(QtWidgets.QWidget):
             auto_cb=self.ui.radial_autoRange_2D,
             low_edit=self.ui.radial_low_2D,
             high_edit=self.ui.radial_high_2D,
-            args_dict=self.sphere.bai_2d_args,
+            args_dict=self.scan.bai_2d_args,
             key='radial_range',
             auto_attr='radial_autoRange_2D',
             disconnect=self._disconnect_radial_range_2D_signals,
@@ -703,7 +704,7 @@ class integratorTree(QtWidgets.QWidget):
         )
 
     def _get_azim_range_2D(self):
-        """Sets Sphere 2D azimuth range in bai_2d_args from UI values.
+        """Sets Scan 2D azimuth range in bai_2d_args from UI values.
 
         GI Qip-vs-Qoop swaps to ``y_range``.
         """
@@ -711,19 +712,19 @@ class integratorTree(QtWidgets.QWidget):
             auto_cb=self.ui.azim_autoRange_2D,
             low_edit=self.ui.azim_low_2D,
             high_edit=self.ui.azim_high_2D,
-            args_dict=self.sphere.bai_2d_args,
+            args_dict=self.scan.bai_2d_args,
             key='azimuth_range',
             auto_attr='azim_autoRange_2D',
             gi_alt_key='y_range',
         )
 
     def _set_azim_range_2D(self):
-        """Sets UI values from Sphere 2D azimuth range in bai_2d_args."""
+        """Sets UI values from Scan 2D azimuth range in bai_2d_args."""
         self._set_range_from_args(
             auto_cb=self.ui.azim_autoRange_2D,
             low_edit=self.ui.azim_low_2D,
             high_edit=self.ui.azim_high_2D,
-            args_dict=self.sphere.bai_2d_args,
+            args_dict=self.scan.bai_2d_args,
             key='azimuth_range',
             auto_attr='azim_autoRange_2D',
             disconnect=self._disconnect_azim_range_2D_signals,
@@ -754,23 +755,23 @@ class integratorTree(QtWidgets.QWidget):
 
     def _get_unit_1D(self):
         val = self.ui.unit_1D.currentText()
-        self.sphere.bai_1d_args['unit'] = Units_dict[val]
+        self.scan.bai_1d_args['unit'] = Units_dict[val]
         self._validate_ranges()
 
     def _set_unit_1D(self):
         self.ui.unit_1D.currentTextChanged.disconnect(self._get_unit_1D)
-        val = self.sphere.bai_1d_args['unit']
+        val = self.scan.bai_1d_args['unit']
         self.ui.unit_1D.setCurrentIndex(Units_dict_inv[val])
         self.ui.unit_1D.currentTextChanged.connect(self._get_unit_1D)
 
     def _get_unit_2D(self):
         val = self.ui.unit_2D.currentText()
-        self.sphere.bai_2d_args['unit'] = Units_dict[val]
+        self.scan.bai_2d_args['unit'] = Units_dict[val]
         self._validate_ranges()
 
     def _set_unit_2D(self):
         self.ui.unit_2D.currentTextChanged.disconnect(self._get_unit_2D)
-        val = self.sphere.bai_2d_args['unit']
+        val = self.scan.bai_2d_args['unit']
         self.ui.unit_2D.setCurrentIndex(Units_dict_inv[val])
         # self.ui.unit_2D.setCurrentText(Units_dict_inv[val])
         self.ui.unit_2D.currentTextChanged.connect(self._get_unit_2D)
@@ -778,28 +779,28 @@ class integratorTree(QtWidgets.QWidget):
     def _get_npts_1D(self):
         val = self.ui.npts_1D.text()
         val = 500 if (not val) else int(val)
-        self.sphere.bai_1d_args['numpoints'] = val
+        self.scan.bai_1d_args['numpoints'] = val
         # npts_oop_1D is only authoritative when visible: for GI modes that
         # use the fiber methods (q_ip / q_oop / exit_angle), or for q_total
-        # with a restricted χ range.  When hidden, arch.py falls back to
+        # with a restricted χ range.  When hidden, frame.py falls back to
         # npt_oop = numpoints.
-        if self.sphere.gi and self.ui.npts_oop_1D.isVisible():
+        if self.scan.gi and self.ui.npts_oop_1D.isVisible():
             oop_val = self.ui.npts_oop_1D.text()
             oop_val = val if (not oop_val) else int(oop_val)
-            self.sphere.bai_1d_args['npt_oop'] = oop_val
+            self.scan.bai_1d_args['npt_oop'] = oop_val
 
     def _set_npts_1D(self):
         self.ui.npts_1D.textChanged.disconnect(self._get_npts_1D)
-        if self.sphere.gi:
+        if self.scan.gi:
             try:
                 self.ui.npts_oop_1D.textChanged.disconnect(self._get_npts_1D)
             except TypeError:
                 pass
-        val = str(self.sphere.bai_1d_args.get('numpoints', 500))
+        val = str(self.scan.bai_1d_args.get('numpoints', 500))
         self.ui.npts_1D.setText(val)
-        if self.sphere.gi:
-            oop_val = str(self.sphere.bai_1d_args.get('npt_oop',
-                            self.sphere.bai_1d_args.get('numpoints', 500)))
+        if self.scan.gi:
+            oop_val = str(self.scan.bai_1d_args.get('npt_oop',
+                            self.scan.bai_1d_args.get('numpoints', 500)))
             self.ui.npts_oop_1D.setText(oop_val)
             self.ui.npts_oop_1D.textChanged.connect(self._get_npts_1D)
         self.ui.npts_1D.textChanged.connect(self._get_npts_1D)
@@ -807,27 +808,27 @@ class integratorTree(QtWidgets.QWidget):
     def _get_npts_radial_2D(self):
         val = self.ui.npts_radial_2D.text()
         val = 500 if (not val) else int(val)
-        self.sphere.bai_2d_args['npt_rad'] = val
+        self.scan.bai_2d_args['npt_rad'] = val
 
     def _set_npts_radial_2D(self):
         self.ui.npts_radial_2D.textChanged.disconnect(self._get_npts_radial_2D)
-        val = str(self.sphere.bai_2d_args['npt_rad'])
+        val = str(self.scan.bai_2d_args['npt_rad'])
         self.ui.npts_radial_2D.setText(val)
         self.ui.npts_radial_2D.textChanged.connect(self._get_npts_radial_2D)
 
     def _get_npts_azim_2D(self):
         val = self.ui.npts_azim_2D.text()
         val = 500 if (not val) else int(val)
-        self.sphere.bai_2d_args['npt_azim'] = val
+        self.scan.bai_2d_args['npt_azim'] = val
 
     def _set_npts_azim_2D(self):
         self.ui.npts_azim_2D.textChanged.disconnect(self._get_npts_azim_2D)
-        val = str(self.sphere.bai_2d_args['npt_azim'])
+        val = str(self.scan.bai_2d_args['npt_azim'])
         self.ui.npts_azim_2D.setText(val)
         self.ui.npts_azim_2D.textChanged.connect(self._get_npts_azim_2D)
 
     def _connect_inp_signals(self):
-        """Connect signals for all input sphere bai parameters"""
+        """Connect signals for all input scan bai parameters"""
         # Connect points and units signals
         self.ui.npts_1D.textChanged.connect(self._get_npts_1D)
         self.ui.unit_1D.currentTextChanged.connect(self._get_unit_1D)
@@ -844,10 +845,10 @@ class integratorTree(QtWidgets.QWidget):
         self.advancedWidget2D.sigUpdateArgs.connect(self.get_args)
 
     def _disconnect_inp_signals(self):
-        """Disconnect signals for all input sphere bai parameters"""
+        """Disconnect signals for all input scan bai parameters"""
         # Disconnect points and units signals
         self.ui.npts_1D.textChanged.disconnect(self._get_npts_1D)
-        if self.sphere.gi:
+        if self.scan.gi:
             try:
                 self.ui.npts_oop_1D.textChanged.disconnect(self._get_npts_1D)
             except TypeError:
@@ -889,7 +890,7 @@ class integratorTree(QtWidgets.QWidget):
                 handler = getattr(self, getter)
                 getattr(self.ui, low).textChanged.connect(handler)
                 getattr(self.ui, high).textChanged.connect(handler)
-                getattr(self.ui, auto).stateChanged.connect(handler)
+                getattr(self.ui, auto).toggled.connect(handler)
                 return
 
     def _disconnect_range_signals(self, name):
@@ -900,7 +901,7 @@ class integratorTree(QtWidgets.QWidget):
                 handler = getattr(self, getter)
                 getattr(self.ui, low).textChanged.disconnect(handler)
                 getattr(self.ui, high).textChanged.disconnect(handler)
-                getattr(self.ui, auto).stateChanged.disconnect(handler)
+                getattr(self.ui, auto).toggled.disconnect(handler)
                 return
 
     def _connect_all_range_signals(self):
@@ -944,7 +945,7 @@ class integratorTree(QtWidgets.QWidget):
         if self._block_if_reload_only_frames('1D'):
             return
         with self.integrator_thread.lock:
-            if len(self.sphere.arches.index) > 0:
+            if len(self.scan.frames.index) > 0:
                 self.integrator_thread.method = 'bai_1d_all'
         # N3: clear under data_lock to avoid racing with the
         # integrator thread's _publish or with the GUI's
@@ -966,7 +967,7 @@ class integratorTree(QtWidgets.QWidget):
         if self._block_if_reload_only_frames('2D'):
             return
         with self.integrator_thread.lock:
-            if len(self.sphere.arches.index) > 0:
+            if len(self.scan.frames.index) > 0:
                 self.integrator_thread.method = 'bai_2d_all'
         # N3: same data_lock discipline as bai_1d above.
         data_lock = getattr(self.integrator_thread, 'data_lock', None)
@@ -981,12 +982,12 @@ class integratorTree(QtWidgets.QWidget):
 
     def _block_if_reload_only_frames(self, dim_label: str) -> bool:
         """R3 guardrail.  Abort re-integration with a status message when
-        any of the sphere's arches lacks a raw image AND no resolvable
+        any of the scan's frames lacks a raw image AND no resolvable
         source file.
 
         After L1 wired lazy raw load, ``LiveFrame.integrate_*``
-        auto-loads ``map_raw`` from ``arch.source_file`` /
-        ``arch.source_frame_idx`` when it's missing — so this guard
+        auto-loads ``map_raw`` from ``frame.source_file`` /
+        ``frame.source_frame_idx`` when it's missing — so this guard
         only fires when the source file has been moved/deleted
         relative to the .nxs.  See ``LiveScan.has_reload_only_frames``
         for the predicate.
@@ -994,9 +995,9 @@ class integratorTree(QtWidgets.QWidget):
         Returns True iff the action was blocked.
         """
         try:
-            blocked = self.sphere.has_reload_only_frames()
+            blocked = self.scan.has_reload_only_frames()
         except (AttributeError, RuntimeError) as e:
-            # Sphere torn down mid-call, or has_reload_only_frames
+            # Scan torn down mid-call, or has_reload_only_frames
             # itself errored.  Don't block — the integrate path's
             # own guard will catch a genuinely empty map_raw.
             logger.debug("reload-only check errored, not blocking: %s", e)
@@ -1008,9 +1009,9 @@ class integratorTree(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(
                 self,
                 f'Cannot re-integrate {dim_label}',
-                'This sphere was reloaded from a .nxs file and its '
+                'This scan was reloaded from a .nxs file and its '
                 'raw source images can no longer be found '
-                '(arch.source_file did not resolve to an existing '
+                '(frame.source_file did not resolve to an existing '
                 'file).  Re-integration needs the raw frames.\n\n'
                 'Make sure the original detector files are still in '
                 'the location stored in the .nxs, or re-run the '
@@ -1081,7 +1082,7 @@ class integratorTree(QtWidgets.QWidget):
             self.ui.axis2D.currentIndexChanged.disconnect(self._update_gi_mode_2d)
         except TypeError:
             pass
-        if not self.sphere.gi:
+        if not self.scan.gi:
             # Populate axis combos with Q / 2θ options for standard mode
             self.ui.axis1D.clear()
             self.ui.axis1D.addItem(_translate("Form", Units[0]))   # Q (Å⁻¹)
@@ -1090,9 +1091,9 @@ class integratorTree(QtWidgets.QWidget):
             self.ui.axis2D.addItem(_translate("Form", f"Q-{Chi}"))
             self.ui.axis2D.addItem(_translate("Form", f"2{Th}-{Chi}"))
             # Sync axis combos to current unit selection
-            cur_unit_1d = self.sphere.bai_1d_args.get('unit', 'q_A^-1')
+            cur_unit_1d = self.scan.bai_1d_args.get('unit', 'q_A^-1')
             self.ui.axis1D.setCurrentIndex(Units_dict_inv.get(cur_unit_1d, 0))
-            cur_unit_2d = self.sphere.bai_2d_args.get('unit', 'q_A^-1')
+            cur_unit_2d = self.scan.bai_2d_args.get('unit', 'q_A^-1')
             self.ui.axis2D.setCurrentIndex(Units_dict_inv.get(cur_unit_2d, 0))
             # Hide the separate unit combos — axis combos now drive the unit
             self.ui.unit_1D.hide()
@@ -1124,9 +1125,9 @@ class integratorTree(QtWidgets.QWidget):
                     or self.ui.npts_1D.text() in ("1000", "3000")):
                 self.ui.npts_1D.setText("2000")
             self.ui.label_npts_1D.setText("Pts")
-            # Sync axis combos to current sphere.bai_args GI mode
-            gi_mode_1d = self.sphere.bai_1d_args.get('gi_mode_1d', 'q_total')
-            gi_mode_2d = self.sphere.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
+            # Sync axis combos to current scan.bai_args GI mode
+            gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
+            gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
             idx_1d = GI_MODES_1D.index(gi_mode_1d) if gi_mode_1d in GI_MODES_1D else 0
             idx_2d = GI_MODES_2D.index(gi_mode_2d) if gi_mode_2d in GI_MODES_2D else 0
             self.ui.axis1D.setCurrentIndex(idx_1d)
@@ -1151,9 +1152,9 @@ class integratorTree(QtWidgets.QWidget):
             # Auto mode: write defaults as placeholders, range = None
             self.ui.radial_low_1D.setText(str(rad_lo))
             self.ui.radial_high_1D.setText(str(rad_hi))
-            self.sphere.bai_1d_args['radial_range'] = None
+            self.scan.bai_1d_args['radial_range'] = None
         else:
-            # Manual mode: keep user's values, sync to sphere
+            # Manual mode: keep user's values, sync to scan
             _range = self._get_valid_range(self.ui.radial_low_1D,
                                            self.ui.radial_high_1D)
             if _range is None:
@@ -1161,12 +1162,12 @@ class integratorTree(QtWidgets.QWidget):
                 self.ui.radial_low_1D.setText(str(rad_lo))
                 self.ui.radial_high_1D.setText(str(rad_hi))
                 _range = (rad_lo, rad_hi)
-            self.sphere.bai_1d_args['radial_range'] = _range
+            self.scan.bai_1d_args['radial_range'] = _range
         if azim_lo is not None and azim_hi is not None:
             if self.ui.azim_autoRange_1D.isChecked():
                 self.ui.azim_low_1D.setText(str(azim_lo))
                 self.ui.azim_high_1D.setText(str(azim_hi))
-                self.sphere.bai_1d_args['azimuth_range'] = None
+                self.scan.bai_1d_args['azimuth_range'] = None
             else:
                 _arange = self._get_valid_range(self.ui.azim_low_1D,
                                                 self.ui.azim_high_1D)
@@ -1174,12 +1175,12 @@ class integratorTree(QtWidgets.QWidget):
                     self.ui.azim_low_1D.setText(str(azim_lo))
                     self.ui.azim_high_1D.setText(str(azim_hi))
                     _arange = (azim_lo, azim_hi)
-                self.sphere.bai_1d_args['azimuth_range'] = _arange
+                self.scan.bai_1d_args['azimuth_range'] = _arange
         else:
             self.ui.azim_autoRange_1D.setChecked(True)
             self.ui.azim_low_1D.setEnabled(False)
             self.ui.azim_high_1D.setEnabled(False)
-            self.sphere.bai_1d_args['azimuth_range'] = None
+            self.scan.bai_1d_args['azimuth_range'] = None
         self._connect_radial_range_1D_signals()
         self._connect_azim_range_1D_signals()
 
@@ -1196,7 +1197,7 @@ class integratorTree(QtWidgets.QWidget):
         if self.ui.radial_autoRange_2D.isChecked():
             self.ui.radial_low_2D.setText(str(rad_lo))
             self.ui.radial_high_2D.setText(str(rad_hi))
-            self.sphere.bai_2d_args['radial_range'] = None
+            self.scan.bai_2d_args['radial_range'] = None
         else:
             _range = self._get_valid_range(self.ui.radial_low_2D,
                                            self.ui.radial_high_2D)
@@ -1204,12 +1205,12 @@ class integratorTree(QtWidgets.QWidget):
                 self.ui.radial_low_2D.setText(str(rad_lo))
                 self.ui.radial_high_2D.setText(str(rad_hi))
                 _range = (rad_lo, rad_hi)
-            self.sphere.bai_2d_args['radial_range'] = _range
+            self.scan.bai_2d_args['radial_range'] = _range
         if azim_lo is not None and azim_hi is not None:
             if self.ui.azim_autoRange_2D.isChecked():
                 self.ui.azim_low_2D.setText(str(azim_lo))
                 self.ui.azim_high_2D.setText(str(azim_hi))
-                self.sphere.bai_2d_args['azimuth_range'] = None
+                self.scan.bai_2d_args['azimuth_range'] = None
             else:
                 _arange = self._get_valid_range(self.ui.azim_low_2D,
                                                 self.ui.azim_high_2D)
@@ -1217,26 +1218,26 @@ class integratorTree(QtWidgets.QWidget):
                     self.ui.azim_low_2D.setText(str(azim_lo))
                     self.ui.azim_high_2D.setText(str(azim_hi))
                     _arange = (azim_lo, azim_hi)
-                self.sphere.bai_2d_args['azimuth_range'] = _arange
+                self.scan.bai_2d_args['azimuth_range'] = _arange
         else:
             self.ui.azim_autoRange_2D.setChecked(True)
             self.ui.azim_low_2D.setEnabled(False)
             self.ui.azim_high_2D.setEnabled(False)
-            self.sphere.bai_2d_args['azimuth_range'] = None
+            self.scan.bai_2d_args['azimuth_range'] = None
         self._connect_radial_range_2D_signals()
         self._connect_azim_range_2D_signals()
 
     def _update_gi_mode_1d(self, n):
         """Update 1D integration mode from axis1D combo selection.
 
-        In GI mode, updates sphere.bai_1d_args['gi_mode_1d'] and adjusts
+        In GI mode, updates scan.bai_1d_args['gi_mode_1d'] and adjusts
         range / unit labels.  In standard mode, switches between Q and 2θ.
         """
-        if not self.sphere.gi:
+        if not self.scan.gi:
             self._update_standard_1d_label(n)
             return
         mode = GI_MODES_1D[n] if n < len(GI_MODES_1D) else 'q_total'
-        self.sphere.bai_1d_args['gi_mode_1d'] = mode
+        self.scan.bai_1d_args['gi_mode_1d'] = mode
         if mode in ('q_ip', 'q_oop'):
             self.ui.unit_1D.hide()
             self.ui.gi_radial_label_1D.setText(f"IP ({AA_inv})")
@@ -1269,10 +1270,10 @@ class integratorTree(QtWidgets.QWidget):
         wedge), the underlying fiber methods need both npt_ip and npt_oop.
         Expose the second Pts field iff the slow path will be used.
         """
-        if not self.sphere.gi:
+        if not self.scan.gi:
             self.ui.npts_oop_1D.hide()
             return
-        mode = self.sphere.bai_1d_args.get('gi_mode_1d', 'q_total')
+        mode = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
         azim_auto = self.ui.azim_autoRange_1D.isChecked()
         show_oop = (mode != 'q_total') or (not azim_auto)
         if show_oop:
@@ -1287,14 +1288,14 @@ class integratorTree(QtWidgets.QWidget):
     def _update_gi_mode_2d(self, n):
         """Update 2D integration mode from axis2D combo selection.
 
-        In GI mode, updates sphere.bai_2d_args['gi_mode_2d'] and adjusts
+        In GI mode, updates scan.bai_2d_args['gi_mode_2d'] and adjusts
         range / unit labels.  In standard mode, switches between Q-χ and 2θ-χ.
         """
-        if not self.sphere.gi:
+        if not self.scan.gi:
             self._update_standard_2d_label(n)
             return
         mode = GI_MODES_2D[n] if n < len(GI_MODES_2D) else 'qip_qoop'
-        self.sphere.bai_2d_args['gi_mode_2d'] = mode
+        self.scan.bai_2d_args['gi_mode_2d'] = mode
         if mode == 'qip_qoop':
             self.ui.unit_2D.hide()
             self.ui.gi_radial_label_2D.setText(f"IP ({AA_inv})")
@@ -1327,7 +1328,7 @@ class integratorTree(QtWidgets.QWidget):
             unit = 'q_A^-1'
             label = f"Q ({AA_inv})"
             self._set_range_defaults_1d(0, 5, -180, 180)
-        self.sphere.bai_1d_args['unit'] = unit
+        self.scan.bai_1d_args['unit'] = unit
         # Sync the hidden unit_1D combo so _get_unit_1D / _set_unit_1D stay consistent
         try:
             self.ui.unit_1D.currentTextChanged.disconnect(self._get_unit_1D)
@@ -1349,7 +1350,7 @@ class integratorTree(QtWidgets.QWidget):
             unit = 'q_A^-1'
             label = f"Q ({AA_inv})"
             self._set_range_defaults_2d(0, 5, -180, 180)
-        self.sphere.bai_2d_args['unit'] = unit
+        self.scan.bai_2d_args['unit'] = unit
         # Sync the hidden unit_2D combo
         try:
             self.ui.unit_2D.currentTextChanged.disconnect(self._get_unit_2D)
