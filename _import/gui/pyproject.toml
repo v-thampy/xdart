@@ -79,6 +79,9 @@ where = ["."]
 include = ["xdart*"]
 
 [tool.pytest.ini_options]
+markers = [
+    "display_logic: pure, Qt-free display-decision tests (no Qt/pyFAI/h5py needed). Run with `pytest -m display_logic`.",
+]
 filterwarnings = [
     # Upstream noise from pyFAI 2025/2026 — uses the deprecated
     # `numpy.ndarray.strides` setter (NumPy 2.4 deprecation).  Not
