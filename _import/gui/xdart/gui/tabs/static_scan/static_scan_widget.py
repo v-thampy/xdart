@@ -689,8 +689,9 @@ class staticWidget(QWidget):
         
         if self.h5viewer.auto_last:
             self.latest_frame()
-            
+
         self.displayframe.update()
+        self.metawidget.update()
 
     def integrator_thread_finished(self):
         """Function connected to threadFinished signals for
@@ -796,6 +797,10 @@ class staticWidget(QWidget):
         self.h5viewer.latest_idx = 1
         self.h5viewer.update_scans()
         self.h5viewer.update()
+        # Refresh the metadata panel when a new scan starts — otherwise it
+        # only repopulates on the existing set_data / update_all paths and
+        # can stay empty for the first frames of a run.
+        self.metawidget.update()
 
     def update_scattering_geometry(self, gi):
         """Connected to sigUpdateGI from wrangler. Called when scattering

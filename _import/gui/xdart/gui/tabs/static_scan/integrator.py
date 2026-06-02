@@ -256,7 +256,23 @@ class integratorTree(QtWidgets.QWidget):
     # --- Session persistence ---
 
     def _save_to_session(self, *args):
-        """Save current integrator UI state to ~/.xdart/session.json."""
+        """Save current integrator UI state to ~/.xdart/session.json.
+
+        This slot is wired to widget / param-tree change signals.  Reading
+        Qt widgets (``.text()``, ``.value()``, …) is only safe on the GUI
+        thread, but a programmatic param-tree write that happens on a worker
+        thread during a batch run (e.g. the GI range sync) would deliver
+        these signals on that worker thread and run us there too — which is
+        what produced the off-thread ``save_session`` crash.  Session
+        persistence is a convenience, so if we're not on the GUI thread we
+        skip rather than touch Qt off-thread.
+        """
+        if QtCore.QThread.currentThread() is not self.thread():
+            logger.debug(
+                "_save_to_session called off the GUI thread; skipping "
+                "(unsafe to read Qt widgets here)"
+            )
+            return
         data = {
             'integ_npts_1D': self.ui.npts_1D.text(),
             'integ_npts_radial_2D': self.ui.npts_radial_2D.text(),

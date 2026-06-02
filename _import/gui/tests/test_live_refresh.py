@@ -547,6 +547,8 @@ def test_gi_motor_options_default_manual_when_no_metadata():
         def setOpts(self, **o):
             if "value" in o:
                 self._v = o["value"]
+            if "visible" in o:
+                self.visible = o["visible"]
             self.opts = o
         def hide(self):
             self.visible = False

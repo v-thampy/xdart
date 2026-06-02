@@ -1193,12 +1193,23 @@ class imageWrangler(wranglerWidget):
         self.set_gi_th_motor()
 
     def set_gi_th_motor(self):
-        """Update Grazing theta motor"""
-        self.incidence_motor = self.parameters.child('GI').child('th_motor').value()
-        self.parameters.child('GI').child('th_val').hide()
-        if self.incidence_motor == 'Manual':
-            self.parameters.child('GI').child('th_val').show()
-            self.incidence_motor = self.parameters.child('GI').child('th_val').value()
+        """Update Grazing theta motor.
+
+        Reveals the Manual 'Theta' value field only when Theta Motor is
+        'Manual', and hides it otherwise.  Eiger / metadata-less files have
+        no ``th`` to read, so without this input field the Manual path can't
+        supply an incidence angle and the GI cake stays blank.  Use
+        ``setOpts(visible=...)`` (not hide()/show()) so the param-tree row
+        reliably re-renders.
+        """
+        th_motor = self.parameters.child('GI').child('th_motor').value()
+        th_val = self.parameters.child('GI').child('th_val')
+        if th_motor == 'Manual':
+            th_val.setOpts(visible=True)
+            self.incidence_motor = th_val.value()
+        else:
+            th_val.setOpts(visible=False)
+            self.incidence_motor = th_motor
 
     def get_scan_parameters(self):
         """ Reads image metadata to populate matching parameters
