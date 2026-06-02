@@ -1036,12 +1036,12 @@ class H5Viewer(QWidget):
             ImageSourceKind.PROCESSED_XDART, ImageSourceKind.THUMBNAIL_ONLY,
         )
         if self._viewer_is_xdart:
-            from ssrl_xrd_tools.io import get_frames as _get_frames
-            try:
-                labels = [int(x) for x in _get_frames(fpath, union=True)]
-            except Exception:
-                logger.debug("Failed to read frame labels from %s", fpath, exc_info=True)
-                labels = []
+            # Use the classifier's *displayable* frame labels — the frame
+            # groups that actually carry a thumbnail/source.  (The old
+            # get_frames(union=True) returned the integrated frame_index
+            # union, which can list labels with no frame group; loading the
+            # first such label returned no image and blanked the viewer.)
+            labels = [int(x) for x in self._viewer_source_info.frame_labels]
             if labels:
                 self._viewer_image_path = fpath
                 self._viewer_image_nframes = len(labels)
@@ -1594,7 +1594,7 @@ class H5Viewer(QWidget):
         self.new_scan_loaded = False
 
         for attr in ('_viewer_image_path', '_viewer_image_nframes',
-                     '_viewer_is_xdart'):
+                     '_viewer_is_xdart', '_viewer_source_info'):
             if hasattr(self, attr):
                 try:
                     delattr(self, attr)
