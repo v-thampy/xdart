@@ -445,6 +445,47 @@ def test_display_generation_bumps_on_mode_switch_and_selection():
     assert host.display_generation == 3
 
 
+def test_data_changed_tolerates_non_integer_labels():
+    # Regression: data_changed crashed with ValueError int('..._0001.xye')
+    # when listData still held xye filenames during a viewer<->scan mode
+    # transition (viewer_mode not yet 'xye').  It must treat non-integer
+    # labels as "nothing to load" instead of crashing.
+    from PySide6 import QtCore
+
+    class _Item:
+        def __init__(self, text):
+            self._text = text
+        def text(self):
+            return self._text
+        def data(self, role):
+            return None
+
+    class _List:
+        def __init__(self, items):
+            self._items = items
+        def selectedItems(self):
+            return self._items
+
+    loaded = []
+    host = SimpleNamespace(
+        viewer_mode=None,                       # NOT 'xye' — the crash condition
+        frame_ids=[],
+        update_2d=False,
+        data_1d={}, data_2d={},
+        scan=SimpleNamespace(frames=SimpleNamespace(index=[0, 1, 2])),
+        ui=SimpleNamespace(listData=_List([
+            _Item('iq_eiger_w2s3_test_2_scan001_0001.xye'),
+            _Item('iq_eiger_w2s3_test_2_scan001_0002.xye'),
+        ])),
+        load_frames_data=lambda *a, **k: loaded.append(a),
+        sigUpdate=SimpleNamespace(emit=lambda: None),
+    )
+    host.data_changed = MethodType(H5Viewer.data_changed, host)
+
+    host.data_changed()                          # must not raise
+    assert loaded == []                          # nothing loaded from xye names
+
+
 def test_absorb_chunk_drops_stale_generation():
     # Stage 5: a background load worker publishes ONLY through a
     # generation-checked snapshot — a chunk whose generation no longer

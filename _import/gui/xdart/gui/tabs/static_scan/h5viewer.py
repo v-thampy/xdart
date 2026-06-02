@@ -1330,23 +1330,35 @@ class H5Viewer(QWidget):
             return
 
         # ── Normal mode: load from HDF5 ──────────────────────────────
+        # Selected labels must be integer scan-frame ids.  During a
+        # viewer<->scan mode transition listData can still hold non-integer
+        # labels (e.g. xye filenames) before viewer_mode flips and the list
+        # is rebuilt; treat those as "nothing to load" instead of crashing on
+        # int('..._0001.xye').
+        int_idxs = []
+        for idx in idxs:
+            try:
+                int_idxs.append(int(idx))
+            except (TypeError, ValueError):
+                continue
+        if not int_idxs:
+            self.sigUpdate.emit()
+            return
+
         load_2d = self.update_2d
 
         if len(self.scan.frames.index) > 1:
-            if len(idxs) == len(self.scan.frames.index):
+            if len(int_idxs) == len(self.scan.frames.index):
                 load_2d = False
 
-        if load_2d:
-            idxs_memory = [int(idx) for idx in idxs if int(idx) in self.data_2d.keys()]
-        else:
-            idxs_memory = [int(idx) for idx in idxs if int(idx) in self.data_1d.keys()]
+        keys = self.data_2d.keys() if load_2d else self.data_1d.keys()
+        idxs_memory = [i for i in int_idxs if i in keys]
 
         # Multi-frame combination is now done on demand by
         # get_frames_int_2d / get_frames_map_raw — no shared accumulator
         # state to maintain here. Just figure out which frames still
         # need to be loaded from disk.
-        frame_ids = [int(idx) for idx in idxs
-                    if int(idx) not in idxs_memory]
+        frame_ids = [i for i in int_idxs if i not in idxs_memory]
 
         if len(frame_ids) > 0:
             self.load_frames_data(frame_ids, load_2d)
