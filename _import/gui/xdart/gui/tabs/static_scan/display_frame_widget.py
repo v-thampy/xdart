@@ -1309,8 +1309,29 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         source_name = ''
         if getattr(first_frame, 'scan_info', None):
             source_name = first_frame.scan_info.get('source_file', '')
-        xlabel, xunits = x_axis_for_unit(xye_unit_from_filename(source_name))
+        first_unit = xye_unit_from_filename(source_name)
+        xlabel, xunits = x_axis_for_unit(first_unit)
         self._viewer_x_axis_label = (xlabel, xunits)
+
+        # Overlaying xye files of different units mixes incompatible x-axes —
+        # we label from the first file (above); warn if the selection mixes
+        # known prefixes (iq with itth) so the user knows the axis is the
+        # first file's, not a shared one.
+        if len(self.idxs_1d) > 1:
+            units = set()
+            for idx in self.idxs_1d:
+                fr = self.data_1d.get(idx)
+                sinfo = getattr(fr, 'scan_info', None) if fr is not None else None
+                src = sinfo.get('source_file', '') if sinfo else ''
+                u = xye_unit_from_filename(src)
+                if u != 'unknown':
+                    units.add(u)
+            if len(units) > 1:
+                logger.warning(
+                    'XYE overlay mixes different x-axis units %s; labelling '
+                    'the axis from the first file (%s). Overlaid curves are '
+                    'on incompatible axes.', sorted(units), first_unit,
+                )
 
         # Build xdata and ydata arrays from all selected indices.
         ref_x = np.asarray(first_frame.int_1d.radial, dtype=float)

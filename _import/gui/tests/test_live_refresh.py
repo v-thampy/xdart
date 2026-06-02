@@ -445,6 +445,55 @@ def test_display_generation_bumps_on_mode_switch_and_selection():
     assert host.display_generation == 3
 
 
+def test_absorb_chunk_drops_stale_generation():
+    # Stage 5: a background load worker publishes ONLY through a
+    # generation-checked snapshot — a chunk whose generation no longer
+    # matches the store's _load_generation (a newer load/selection has begun)
+    # is dropped, never written into data_1d/data_2d.
+    viewer = SimpleNamespace(
+        _load_generation=7,
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+    )
+    viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+
+    class _Frame:
+        def copy_for_display(self, include_2d=False):
+            return self
+
+    # Stale chunk (gen 6 < current 7) -> dropped.
+    viewer._absorb_chunk(6, 3, _Frame(), False)
+    assert viewer.data_1d == {} and viewer.data_2d == {}
+
+
+def test_gi_common_grid_freeze_yields_uniform_axes():
+    # Stage 5 (gi_axes_uniform tie-in): the shipped GI common-grid freeze
+    # turns per-frame Auto axes (which differ frame-to-frame in an
+    # angle-dependence GI scan and can't stack) into ONE shared grid.
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        _freeze_gi_1d_range_from_result,
+    )
+    from xdart.gui.tabs.static_scan.display_logic import gi_axes_uniform
+
+    npt = 8
+    # Auto: each frame auto-ranges to its own extent -> non-uniform stack.
+    auto = [
+        (np.linspace(1.00, 5.00, npt),),
+        (np.linspace(1.15, 5.30, npt),),   # different incident angle
+    ]
+    assert gi_axes_uniform(auto) is False
+
+    # Freeze a single radial range from a scout frame, then every frame
+    # integrates onto linspace(frozen_range, npt) — one shared axis.
+    args = {'radial_range': None}
+    scout = SimpleNamespace(radial=np.array([1.0, 5.0]))
+    assert _freeze_gi_1d_range_from_result(args, scout) is True
+    lo, hi = args['radial_range']
+    frozen = [(np.linspace(lo, hi, npt),), (np.linspace(lo, hi, npt),)]
+    assert gi_axes_uniform(frozen) is True
+
+
 def test_default_controllers_registered():
     # Stage 5: importing display_controllers registers a controller for every
     # core mode, so the widget never dispatches to a missing handler.
