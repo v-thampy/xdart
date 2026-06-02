@@ -475,6 +475,36 @@ def test_select_last_scan_entry_picks_last_file_row():
     assert host2.select_last_scan_entry() == -1
 
 
+def test_metadata_panel_populates_when_layout_reparented():
+    # Regression: the host installs only metadataWidget.layout into its
+    # metaFrame, so the metadataWidget QWidget itself is never shown and
+    # self.isVisible() is always False — update() must gate on the tableview
+    # (which IS on screen), else the metadata panel stays blank.
+    import pandas as pd
+    from PySide6 import QtWidgets
+    from PySide6.QtCore import QModelIndex
+    from xdart.gui.tabs.static_scan.metadata import metadataWidget
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    scan = SimpleNamespace(
+        scan_data=pd.DataFrame({"th": [0.1, 0.2], "i0": [1e6, 1.1e6]}, index=[1, 2]))
+    mw = metadataWidget(scan, None, ["1"], {})
+    assert not mw.isVisible()                    # the widget itself never shows
+
+    frame = QtWidgets.QFrame()
+    frame.setLayout(mw.layout)                   # mirror static_scan_widget
+    win = QtWidgets.QWidget()
+    QtWidgets.QVBoxLayout(win).addWidget(frame)
+    win.show()
+    app.processEvents()
+
+    assert mw.tableview.isVisible()              # the tableview IS on screen
+    mw.update()
+    model = mw.tableview.model()
+    assert model.rowCount(QModelIndex()) == 2    # th + i0 -> populated, not blank
+    win.close()
+
+
 def test_gi_motor_options_default_manual_when_no_metadata():
     # GI incidence: when no motors are found (eiger / no metadata), the Theta
     # Motor must default to 'Manual' and reveal the Theta value field so the
