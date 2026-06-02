@@ -424,15 +424,19 @@ def test_rsm_2x3_layout_with_repeated_roles_round_trips():
 
 
 def test_controller_registry_register_and_lookup():
-    # §10 seam 3: open Mode -> controller registry; no controllers wired
-    # in core yet, so an unregistered mode resolves to None.
+    # §10 seam 3: open Mode -> controller registry.  An unregistered mode
+    # resolves to None; register_controller overrides by mode.
     sentinel = object()
-    assert dl.controller_for(dl.Mode.INT_2D) is None
+    fresh_mode = dl.Mode.INT_1D
+    prev = dl.controller_for(fresh_mode)
     try:
-        dl.register_controller(dl.Mode.INT_2D, sentinel)
-        assert dl.controller_for(dl.Mode.INT_2D) is sentinel
+        dl.register_controller(fresh_mode, sentinel)
+        assert dl.controller_for(fresh_mode) is sentinel
     finally:
-        dl._CONTROLLER_REGISTRY.pop(dl.Mode.INT_2D, None)  # don't leak across tests
+        if prev is not None:
+            dl.register_controller(fresh_mode, prev)   # restore the real one
+        else:
+            dl._CONTROLLER_REGISTRY.pop(fresh_mode, None)
 
 
 # ── Stage 3: build_payload + render_plan (the testable render core) ───

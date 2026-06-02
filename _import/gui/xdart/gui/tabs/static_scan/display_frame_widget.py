@@ -50,10 +50,11 @@ from .display_data import DisplayDataMixin
 from .display_plot import DisplayPlotMixin
 from .display_logic import (
     Mode, LoadStatus, PanelRole, compute_display_state,
-    build_payload, render_plan,
+    build_payload, render_plan, controller_for,
     resolve_selection, resolve_render_ids,
     xye_unit_from_filename, x_axis_for_unit, default_plot_unit,
 )
+from .display_controllers import register_default_controllers
 
 QFileDialog = QtWidgets.QFileDialog
 QInputDialog = QtWidgets.QInputDialog
@@ -264,6 +265,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.display_generation = 0
         self._last_selection_sig = None
 
+        # Stage 5: register the mode controllers (Scan/ImageViewer/XYEViewer)
+        # into the open registry; _live_display_state dispatches through them.
+        register_default_controllers()
+
         self.get_idxs()
 
         # Plotting variables
@@ -472,47 +477,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return Mode.INT_2D
 
     def _live_display_state(self):
-        """Build the :class:`DisplayState` for the current widget inputs.
+        """Build the :class:`DisplayState` for the current widget inputs by
+        dispatching to the mode controller (Stage 5).
 
         The single place the GUI snapshots its state for the display layer.
-        Viewer-mode states never consult scan.frames or the integration unit
-        (§8); only scan modes read the scan frame index.  ``plot_unit`` only
-        sets x_label here — the live x-axis still flows through the legacy
-        plot path (Stage 4 routes it through the state)."""
+        Each controller owns its mode's selection rules — viewer controllers
+        never consult scan.frames or the integration unit (§8); the scan
+        controller reads the scan frame index for Overall aggregation."""
         mode = self._live_mode()
-        if mode in (Mode.INT_1D, Mode.INT_2D):
-            with self.scan.scan_lock:
-                all_index = list(np.asarray(self.scan.frames.index, dtype=int))
-            gi = bool(getattr(self.scan, 'gi', False))
-        else:
-            all_index = []
-            gi = False
-        with self.data_lock:
-            loaded_1d = set(self.data_1d.keys())
-            loaded_2d = set(self.data_2d.keys())
-            raw_avail = {
-                int(k): {
-                    'has_raw': v.get('map_raw') is not None,
-                    'has_thumbnail': v.get('thumbnail') is not None,
-                }
-                for k, v in self.data_2d.items()
-                if isinstance(v, dict)
-            }
-        return compute_display_state(
-            mode=mode,
-            selected_ids=list(self.frame_ids),
-            all_frame_index=all_index,
-            loaded_1d_keys=loaded_1d,
-            loaded_2d_keys=loaded_2d,
-            gi=gi,
-            plot_unit='q_A^-1',          # affects only x_label, not render_ids
-            method=self.ui.plotMethod.currentText(),
-            unit_changed=False,
-            prev_overlaid_ids=tuple(self.overlaid_idxs),
-            raw_availability=raw_avail,
-            titles={},
-            generation=self.display_generation,
-        )
+        return controller_for(mode).compute_state(self, mode)
 
     def _shadow_check_display_state(self, state=None):
         """Debug-only cross-check: confirm the DisplayState's render_ids
@@ -576,9 +549,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if not self._updated():
             return True
 
-        state = self._live_display_state()
+        mode = self._live_mode()
+        ctrl = controller_for(mode)
+        state = ctrl.compute_state(self, mode)
         self._shadow_check_display_state(state)  # debug-only cross-check
-        payload = build_payload(state)           # Stage 3: store=None ⇒ delegate draws
+        payload = ctrl.build_payload(self, state)  # store=None ⇒ delegate draws
         return self.render_display(state, payload)
 
     # ── Render (Stage 3) ──────────────────────────────────────────────

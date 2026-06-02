@@ -445,6 +445,15 @@ def test_display_generation_bumps_on_mode_switch_and_selection():
     assert host.display_generation == 3
 
 
+def test_default_controllers_registered():
+    # Stage 5: importing display_controllers registers a controller for every
+    # core mode, so the widget never dispatches to a missing handler.
+    from xdart.gui.tabs.static_scan import display_controllers  # noqa: F401
+    from xdart.gui.tabs.static_scan.display_logic import controller_for, Mode
+    for mode in (Mode.INT_1D, Mode.INT_2D, Mode.IMAGE_VIEWER, Mode.XYE_VIEWER):
+        assert controller_for(mode) is not None
+
+
 def _update_smoke_host():
     """Host that drives the REAL update()->render_display orchestration
     (get_idxs, _live_display_state, compute_display_state, build_payload,
@@ -800,7 +809,6 @@ def test_old_processed_xdart_nxs_not_loaded_as_generic_image(tmp_path):
         _viewer_is_xdart=False,
         _remember_displayed_frames=lambda: calls.append("remember"),
         sigUpdate=_FakeSignal(),
-        _is_xdart_processed=H5Viewer._is_xdart_processed,
         _load_single_frame=lambda *args, **kwargs: calls.append("load"),
     )
     # Bind the cache clear after the namespace exists.
@@ -839,7 +847,6 @@ def test_reduction_group_raw_nexus_loads_as_generic_image(tmp_path):
         _viewer_is_xdart=True,
         _remember_displayed_frames=lambda: calls.append("remember"),
         sigUpdate=_FakeSignal(),
-        _is_xdart_processed=H5Viewer._is_xdart_processed,
         _load_single_frame=lambda _path, frame_idx=0, frame_id=1: calls.append(
             ("load", frame_idx, frame_id),
         ),
@@ -862,6 +869,10 @@ def test_reduction_group_raw_nexus_loads_as_generic_image(tmp_path):
 
 def test_processed_xdart_markers_still_short_circuit_image_loader(tmp_path):
     import h5py
+    from ssrl_xrd_tools.io import ImageSourceKind
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        ImageViewerController,
+    )
 
     for marker in ("integrated_1d", "integrated_2d", "frames"):
         path = tmp_path / f"processed_{marker}.nxs"
@@ -869,7 +880,12 @@ def test_processed_xdart_markers_still_short_circuit_image_loader(tmp_path):
             entry = f.create_group("entry")
             entry.create_group(marker)
 
-        assert H5Viewer._is_xdart_processed(str(path)) is True
+        # Stage 5: classification is the ssrl boundary; these markers must
+        # classify as a processed xdart file (not a raw detector image).
+        info = ImageViewerController.classify(str(path))
+        assert info.kind in (
+            ImageSourceKind.PROCESSED_XDART, ImageSourceKind.THUMBNAIL_ONLY,
+        )
 
 
 def test_image_viewer_missing_raw_and_thumbnail_clears_panel():
@@ -1123,46 +1139,21 @@ def test_standard_plot_axis_defaults_to_integrated_2theta_unit():
     assert "2" in plot_unit.currentText()
 
 
-def test_processed_image_viewer_falls_back_to_thumbnail(monkeypatch):
-    import ssrl_xrd_tools.io as ssrl_io
-
-    thumb = np.array([[5.0, 6.0], [7.0, 8.0]])
-
-    def fake_get_raw_frame(_path, *, frame, allow_thumbnail=True):
-        assert frame == 5
-        if not allow_thumbnail:
-            raise OSError("missing source")
-        return thumb
-
-    monkeypatch.setattr(ssrl_io, "get_raw_frame", fake_get_raw_frame)
-    viewer = SimpleNamespace(
-        _viewer_is_xdart=True,
-        data_lock=RLock(),
-        data_1d={},
-        data_2d={},
-    )
-
-    H5Viewer._load_single_frame(
-        viewer, "processed.nxs", frame_idx=0, frame_id=5,
-    )
-
-    np.testing.assert_array_equal(viewer.data_2d[5]["map_raw"], thumb)
-    np.testing.assert_array_equal(viewer.data_2d[5]["thumbnail"], thumb)
-
-
-def test_processed_image_viewer_reads_thumbnail_directly_if_helper_fails(
-        monkeypatch, tmp_path):
+def test_processed_image_viewer_falls_back_to_thumbnail(tmp_path):
+    # Stage 5: a processed .nxs whose source master is missing loads the
+    # dequantized thumbnail (via the ssrl boundary), stored as a thumbnail
+    # (its mask is already baked in) — _load_single_frame integration.
     import h5py
-    import ssrl_xrd_tools.io as ssrl_io
 
-    def failing_get_raw_frame(*_args, **_kwargs):
-        raise KeyError("missing source and helper fallback")
-
-    monkeypatch.setattr(ssrl_io, "get_raw_frame", failing_get_raw_frame)
-    path = tmp_path / "processed_thumbnail_only.nxs"
+    path = tmp_path / "thumb_fallback.nxs"
     with h5py.File(path, "w") as f:
-        ds = f.create_dataset(
-            "entry/frames/frame_0005/thumbnail",
+        e = f.create_group("entry")
+        e.create_group("integrated_1d")
+        s = e.create_group("frames/frame_0005/source")
+        s.create_dataset("path", data=np.bytes_(b"missing_master.h5"))
+        s.create_dataset("frame_index", data=0)
+        ds = e.create_dataset(
+            "frames/frame_0005/thumbnail",
             data=(np.ones((3, 4)) * 128).astype(np.uint8),
         )
         ds.attrs["vmin"] = 10.0
@@ -1170,24 +1161,18 @@ def test_processed_image_viewer_reads_thumbnail_directly_if_helper_fails(
         ds.attrs["dtype"] = "uint8"
 
     viewer = SimpleNamespace(
-        _viewer_is_xdart=True,
-        data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        _viewer_is_xdart=True, data_lock=RLock(), data_1d={}, data_2d={},
     )
-    viewer._read_processed_thumbnail = H5Viewer._read_processed_thumbnail
-
     loaded = H5Viewer._load_single_frame(
         viewer, str(path), frame_idx=5, frame_id=5,
     )
 
     assert loaded is True
-    assert 5 in viewer.data_2d
     assert viewer.data_2d[5]["map_raw"].shape == (3, 4)
-    np.testing.assert_allclose(
-        viewer.data_2d[5]["map_raw"],
-        10.0 + (128 / 255) * 10.0,
-    )
+    expected = 10.0 + (128 / 255) * 10.0   # dequantize(128, vmin=10, vmax=20)
+    np.testing.assert_allclose(viewer.data_2d[5]["map_raw"], expected)
+    # Stored as a thumbnail so the renderer won't re-apply a flat mask.
+    np.testing.assert_allclose(viewer.data_2d[5]["thumbnail"], expected)
 
 
 def test_image_viewer_single_raw_file_gets_selectable_frame(tmp_path):
@@ -1202,7 +1187,6 @@ def test_image_viewer_single_raw_file_gets_selectable_frame(tmp_path):
         frame_ids=[],
         ui=SimpleNamespace(listData=_FakeListWidget()),
         _raw_cache_order=[],
-        _is_xdart_processed=H5Viewer._is_xdart_processed,
         _remember_displayed_frames=lambda: None,
         sigUpdate=_FakeSignal(),
     )

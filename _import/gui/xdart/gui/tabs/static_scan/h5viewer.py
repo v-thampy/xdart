@@ -21,6 +21,8 @@ from .ui.h5viewerUI import Ui_Form
 from xdart.modules.live import LiveFrame
 from .scan_threads import fileHandlerThread
 from .display_logic import xye_unit_from_filename
+from .display_controllers import ImageViewerController
+from ssrl_xrd_tools.io import ImageSourceKind
 from ...widgets import defaultWidget
 from xdart import utils
 from xdart.utils import catch_h5py_file as catch
@@ -1002,53 +1004,6 @@ class H5Viewer(QWidget):
 
         self.sigUpdate.emit()
 
-    @staticmethod
-    def _is_xdart_processed(fpath):
-        """True if ``fpath`` is a processed xdart v2 scan file (integrated
-        data + per-frame source pointers), not a raw detector file."""
-        try:
-            import h5py
-            with h5py.File(fpath, 'r') as f:
-                if ('entry/integrated_1d' in f
-                        or 'entry/integrated_2d' in f
-                        or 'entry/frames' in f):
-                    return True
-                if 'entry/reduction' not in f:
-                    return False
-
-                raw_candidates = (
-                    'entry/instrument/detector/data',
-                    'entry/instrument/detector/data_000001',
-                    'entry/data/data',
-                    'entry/measurement/data',
-                    'entry/data',
-                )
-                for candidate in raw_candidates:
-                    if candidate in f:
-                        obj = f[candidate]
-                        if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
-                            return False
-
-                entry = f.get('entry')
-                instrument = (
-                    entry.get('instrument') if hasattr(entry, 'get') else None
-                )
-                if isinstance(instrument, h5py.Group):
-                    for obj in instrument.values():
-                        nx_class = obj.attrs.get('NX_class') if isinstance(
-                            obj, h5py.Group,
-                        ) else None
-                        if (isinstance(obj, h5py.Group)
-                                and nx_class in (b'NXdetector', 'NXdetector')
-                                and 'data' in obj
-                                and isinstance(obj['data'], h5py.Dataset)
-                                and obj['data'].ndim >= 2):
-                            return False
-
-                return True
-        except Exception:
-            return False
-
     def _load_image_file(self, fpath):
         """Load an image file for viewing.
 
@@ -1072,10 +1027,13 @@ class H5Viewer(QWidget):
 
         # ── Processed xdart v2 scan file ─────────────────────────────
         # No raw images live inside — load each frame's raw via its stored
-        # source pointer (get_raw_frame), listed by the file's actual frame
-        # labels (which may be 0-based / gapped), not 1..N.
-        self._viewer_is_xdart = (
-            ext in ('.h5', '.hdf5', '.nxs') and self._is_xdart_processed(fpath)
+        # source pointer, listed by the file's actual frame labels (which may
+        # be 0-based / gapped), not 1..N.  Stage 5: classification goes
+        # through the headless ssrl boundary — xdart no longer opens HDF5 to
+        # guess what the file is.
+        self._viewer_source_info = ImageViewerController.classify(fpath)
+        self._viewer_is_xdart = self._viewer_source_info.kind in (
+            ImageSourceKind.PROCESSED_XDART, ImageSourceKind.THUMBNAIL_ONLY,
         )
         if self._viewer_is_xdart:
             from ssrl_xrd_tools.io import get_frames as _get_frames
@@ -1193,55 +1151,21 @@ class H5Viewer(QWidget):
         showed a blank panel.
         """
         # Processed xdart v2 file: no raw images inside.  Resolve the raw
-        # detector frame via the stored per-frame source pointer (falling
-        # back to the stored thumbnail).  ``frame_id`` is the frame label.
+        # detector frame via the stored per-frame source pointer, falling
+        # back to the dequantized thumbnail — through the headless ssrl
+        # boundary (Stage 5).  ``frame_id`` is the frame label.  The result
+        # records which source it returned, so a thumbnail is stored as a
+        # thumbnail (its mask is already baked in — never re-masked).
         if getattr(self, '_viewer_is_xdart', False):
-            thumb_data = None
-            try:
-                from ssrl_xrd_tools.io import get_raw_frame
-                img_data = np.asarray(
-                    get_raw_frame(
-                        fpath, frame=frame_id, allow_thumbnail=False,
-                    ),
-                    dtype=float,
+            res = ImageViewerController.load_processed_frame(fpath, frame_id)
+            if res.image is None:
+                logger.warning(
+                    'Could not load raw frame or thumbnail %s from '
+                    'processed file %s', frame_id, os.path.basename(fpath),
                 )
-            except Exception:
-                logger.debug(
-                    'Raw source for processed frame %s failed; trying '
-                    'thumbnail fallback',
-                    frame_id,
-                    exc_info=True,
-                )
-                try:
-                    img_data = np.asarray(
-                        get_raw_frame(
-                            fpath, frame=frame_id, allow_thumbnail=True,
-                        ),
-                        dtype=float,
-                    )
-                    thumb_data = img_data
-                except Exception:
-                    logger.debug(
-                        'get_raw_frame thumbnail fallback failed for frame %s; '
-                        'trying direct thumbnail read',
-                        frame_id,
-                        exc_info=True,
-                    )
-                    try:
-                        img_data = self._read_processed_thumbnail(
-                            fpath, frame_id,
-                        )
-                        thumb_data = img_data
-                    except Exception:
-                        logger.warning(
-                            'Could not load raw frame or thumbnail %s from '
-                            'processed file %s',
-                            frame_id, os.path.basename(fpath),
-                        )
-                        logger.debug(
-                            'processed image fallback failed', exc_info=True,
-                        )
-                        return False
+                return False
+            img_data = np.asarray(res.image, dtype=float)
+            thumb_data = img_data if res.source == 'thumbnail' else None
             with self.data_lock:
                 self.data_2d[int(frame_id)] = {
                     'map_raw': img_data,
@@ -1255,9 +1179,10 @@ class H5Viewer(QWidget):
                 frame.scan_info = {'source_file': os.path.basename(fpath)}
                 self.data_1d[int(frame_id)] = frame
             logger.debug(
-                'Image Viewer loaded processed frame %s from %s: shape=%s '
-                'finite=%d',
-                frame_id, os.path.basename(fpath), getattr(img_data, 'shape', None),
+                'Image Viewer loaded processed frame %s from %s via %s: '
+                'shape=%s finite=%d',
+                frame_id, os.path.basename(fpath), res.source,
+                getattr(img_data, 'shape', None),
                 int(np.isfinite(img_data).sum()),
             )
             return True
@@ -1303,20 +1228,6 @@ class H5Viewer(QWidget):
         )
         return True
 
-    @staticmethod
-    def _read_processed_thumbnail(fpath, frame_id):
-        """Read a stored processed-file thumbnail directly."""
-        import h5py
-        from ssrl_xrd_tools.io.read import _dequantize_thumbnail
-
-        with h5py.File(fpath, 'r') as f:
-            key = f'entry/frames/frame_{int(frame_id):04d}/thumbnail'
-            if key not in f:
-                raise KeyError(
-                    f'No thumbnail for frame {frame_id} in {fpath}',
-                )
-            return np.asarray(_dequantize_thumbnail(f[key]), dtype=float)
-    
     def _try_raw_detectors(self, fpath):
         """Try reading a raw binary file with common detector shapes."""
         fallbacks = getattr(
