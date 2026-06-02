@@ -475,6 +475,30 @@ def test_select_last_scan_entry_picks_last_file_row():
     assert host2.select_last_scan_entry() == -1
 
 
+def test_gi_readonly_skips_bool_so_grazing_stays_checked():
+    # Regression: making the GI group readonly during a run set readonly on
+    # the Grazing bool, which pyqtgraph renders UNCHECKED (cosmetic).  The
+    # readonly toggle must skip bool params so Grazing keeps its real state;
+    # non-bool params (th_motor) still become readonly.
+    from PySide6 import QtWidgets
+    from pyqtgraph.parametertree import Parameter
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    p = Parameter.create(name="GI", type="group", children=[
+        {"name": "Grazing", "type": "bool", "value": True},
+        {"name": "th_motor", "type": "list", "values": ["th", "Manual"], "value": "th"},
+    ])
+    host = SimpleNamespace()
+    host._set_parameter_readonly = MethodType(
+        imageWrangler._set_parameter_readonly, host)
+
+    host._set_parameter_readonly(p, True)
+    assert p.child("Grazing").value() is True            # value preserved
+    assert not p.child("Grazing").opts.get("readonly")   # bool NOT made readonly
+    assert p.child("th_motor").opts.get("readonly") is True   # non-bool is
+
+
 def test_metadata_panel_populates_when_layout_reparented():
     # Regression: the host installs only metadataWidget.layout into its
     # metaFrame, so the metadataWidget QWidget itself is never shown and

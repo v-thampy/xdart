@@ -606,11 +606,20 @@ class imageWrangler(wranglerWidget):
             logger.debug("Failed to set enabled state for h5_dir parameters: %s", e)
 
     def _set_parameter_readonly(self, param, readonly):
-        """Recursively set pyqtgraph Parameter readonly state when available."""
-        try:
-            param.setOpts(readonly=readonly)
-        except (AttributeError, TypeError):
-            return
+        """Recursively set pyqtgraph Parameter readonly state when available.
+
+        Skips ``bool`` params: pyqtgraph renders a *readonly* checkbox as
+        UNCHECKED regardless of its value (cosmetic), which made the GI
+        'Grazing' box flip to unchecked for the duration of a run.  The value
+        is unaffected and the run uses the setup-time ``gi`` flag, and the
+        Start button is disabled, so leaving the checkbox interactive is
+        harmless — and it keeps showing its real state.
+        """
+        if param.opts.get('type') != 'bool':
+            try:
+                param.setOpts(readonly=readonly)
+            except (AttributeError, TypeError):
+                pass
         try:
             children = param.children()
         except AttributeError:
