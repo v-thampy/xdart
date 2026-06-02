@@ -282,6 +282,7 @@ def _make_display_state(**over):
         overlaid_ids=(),
         title='',
         panels=(),
+        layout=(),
     )
     base.update(over)
     return dl.DisplayState(**base)
@@ -341,6 +342,68 @@ def test_extension_panel_role_and_fit_trace_round_trip():
     # The fit trace survives, distinct from the data trace, on one payload.
     assert [t.kind for t in plot.traces] == ['data', 'fit']
     assert plot.axis_x.unit == "A^-1" and plot.axis_x.log is False
+
+
+def test_compute_display_state_emits_layout():
+    # §10.1: the computed state carries a layout descriptor — arrangement is
+    # data, not mode-branching.  Int = raw|cake on top, plot below.
+    state = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_1D, selected_ids=(0,), loaded_1d_keys={0},
+        loaded_2d_keys={0}, raw_availability={0: dict(has_raw=True)}))
+    roles = tuple(tuple(k.role for k in row) for row in state.layout)
+    assert roles == (
+        (dl.PanelRole.RAW_2D, dl.PanelRole.CAKE_2D),
+        (dl.PanelRole.PLOT_1D,),
+    )
+    # Every key in the layout resolves to a panel plan.
+    for row in state.layout:
+        for key in row:
+            assert state.panel(key) is not None
+    # Viewer mode is a single-panel layout (no raw/cake).
+    img = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.IMAGE_VIEWER, selected_ids=(0,), loaded_2d_keys={0},
+        raw_availability={0: dict(has_raw=True)}))
+    assert img.layout == ((dl.PanelKey(dl.PanelRole.RAW_2D),),)
+
+
+def test_rsm_2x3_layout_with_repeated_roles_round_trips():
+    """The RSM mockup — 2×3 grid of 3 reciprocal-space slices over their 3
+    projections — round-trips through a generic, render-style dispatch.
+    This is the case a fixed 3-field DisplayState could not express: 6
+    panels, repeated SLICE_2D / PROJ_1D roles disambiguated by instance id,
+    and arbitrary H/K/L axes.  No display_logic core change is needed."""
+    np = pytest.importorskip("numpy")
+
+    slices = [dl.PanelKey(dl.PanelRole.SLICE_2D, i) for i in ("HK", "HL", "KL")]
+    projs = [dl.PanelKey(dl.PanelRole.PROJ_1D, i) for i in ("H", "K", "L")]
+    panels = tuple(
+        (k, dl.PanelPlan(visible=True, has_data=True)) for k in slices + projs)
+    layout = (tuple(slices), tuple(projs))   # 2 rows × 3 columns
+    state = _make_display_state(panels=panels, layout=layout)
+
+    # Arbitrary reciprocal-space axes (H/K/L, r.l.u.) — Axis takes any label.
+    ax = dl.Axis("H", unit="r.l.u.")
+    assert ax.label == "H" and ax.unit == "r.l.u."
+
+    # Generic "render contract": lay out by the descriptor, dispatch each
+    # panel by role.  The dispatch loop is fixed and role-agnostic; an
+    # extension only registers handlers.
+    handlers = {
+        dl.PanelRole.SLICE_2D: lambda key, plan: ("slice", key.instance, plan.has_data),
+        dl.PanelRole.PROJ_1D: lambda key, plan: ("proj", key.instance, plan.has_data),
+    }
+    grid = []
+    for row in state.layout:
+        grid.append([handlers[key.role](key, state.panel(key)) for key in row])
+
+    assert len(grid) == 2 and all(len(r) == 3 for r in grid)
+    assert grid[0] == [("slice", "HK", True), ("slice", "HL", True), ("slice", "KL", True)]
+    assert grid[1] == [("proj", "H", True), ("proj", "K", True), ("proj", "L", True)]
+
+    # Repeated roles are disambiguated by instance via exact-key lookup,
+    # while a bare-role lookup still returns the first matching panel.
+    assert state.panel(slices[0]) is not state.panel(slices[1])
+    assert state.panel(dl.PanelRole.SLICE_2D) is state.panel(slices[0])
 
 
 def test_controller_registry_register_and_lookup():

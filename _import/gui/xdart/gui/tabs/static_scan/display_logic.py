@@ -46,6 +46,7 @@ __all__ = [
     "OverlayAction",
     "LoadStatus",
     "PanelRole",
+    "PanelKey",
     "PanelPlan",
     "Axis",
     "Trace",
@@ -79,17 +80,20 @@ class Mode(Enum):
 
 
 class PanelRole(Enum):
-    """Identifies a render panel.  ``render`` iterates ``DisplayState.panels``
-    and dispatches each role to a registered widget, so a module can add a
-    new role without editing core render/compute logic (§10 seam 1).
+    """Identifies the *kind* of a render panel.  ``render`` lays panels out
+    by ``DisplayState.layout`` and dispatches each panel to a widget by its
+    role, so a module can add a new role/arrangement without editing core
+    render/compute logic (§10 seam 1).
 
     Used by the integration view today; the rest are reserved so the
-    stitching/fitting modules plug in later without reshaping the core."""
+    stitching/fitting/RSM modules plug in later without reshaping the core."""
     RAW_2D = "raw_2d"            # full/thumbnail detector image
     CAKE_2D = "cake_2d"          # 2D integrated (cake) image
     PLOT_1D = "plot_1d"          # 1D pattern(s)
     RESIDUAL_1D = "residual_1d"  # reserved: fitting residual trace panel
     STITCH_2D = "stitch_2d"      # reserved: stitched 2D image
+    SLICE_2D = "slice_2d"        # reserved: RSM reciprocal-space 2D slice (repeats)
+    PROJ_1D = "proj_1d"          # reserved: RSM 1D projection (repeats)
     RESULTS = "results"          # reserved: tables/scalars (non-array)
 
 
@@ -113,6 +117,18 @@ class LoadStatus(Enum):
 
 
 # ── Data shapes (§4 + §10 of the plan) ────────────────────────────────
+
+@dataclass(frozen=True)
+class PanelKey:
+    """Identity of one panel instance.  ``instance`` disambiguates a role
+    that repeats within a layout — e.g. RSM's three SLICE_2D panels
+    (instance ``"HK"`` / ``"HL"`` / ``"KL"``) and three PROJ_1D panels
+    (``"H"`` / ``"K"`` / ``"L"``).  For a role that never repeats the
+    instance is ``""``, so ``PanelKey(PanelRole.RAW_2D)`` is the whole
+    identity.  Frozen ⇒ hashable, so it works as a dict/lookup key."""
+    role: PanelRole
+    instance: str = ""
+
 
 @dataclass(frozen=True)
 class PanelPlan:
@@ -176,17 +192,27 @@ class DisplayState:
     overlay: OverlayAction
     overlaid_ids: tuple
     title: str
-    # §10 seam 1: panels are a keyed collection, not three named fields.
-    # render iterates these and dispatches each role to a registered widget.
-    panels: tuple = ()               # tuple[tuple[PanelRole, PanelPlan], ...]
+    # §10 seam 1: panels are a keyed collection + a layout descriptor, not
+    # three named fields.  ``panels`` maps a PanelKey to its plan; ``layout``
+    # is a tuple of rows, each a tuple of PanelKeys, describing the ARRANGEMENT
+    # (Int-2D: raw|cake / plot; Stitch-2D: cake / plot; RSM: a 2×3 grid of
+    # repeated SLICE_2D/PROJ_1D roles).  render lays out by ``layout`` and
+    # dispatches each panel to a widget by role — it never branches on mode.
+    panels: tuple = ()               # tuple[tuple[PanelKey, PanelPlan], ...]
+    layout: tuple = ()               # tuple[tuple[PanelKey, ...], ...] — rows of keys
     # §10 seam 5: non-array results channel; None for every current mode.
     results: "ResultsView | None" = None
 
-    def panel(self, role):
-        """Return the :class:`PanelPlan` for ``role``, or ``None`` if this
-        state has no panel of that role."""
-        for r, plan in self.panels:
-            if r is role:
+    def panel(self, key):
+        """Return the :class:`PanelPlan` for ``key``, or ``None``.
+
+        ``key`` may be a :class:`PanelKey` (exact match) or a bare
+        :class:`PanelRole` (returns the first panel with that role — the
+        ergonomic path for the non-repeating integration roles)."""
+        for k, plan in self.panels:
+            if k == key:
+                return plan
+            if isinstance(key, PanelRole) and getattr(k, 'role', k) is key:
                 return plan
         return None
 
@@ -458,16 +484,23 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     cake_panel = PanelPlan(visible=True, has_data=ready and bool(render_2d))
     plot_panel = PanelPlan(visible=True, has_data=ready and bool(render_1d))
 
+    raw_key = PanelKey(PanelRole.RAW_2D)
+    cake_key = PanelKey(PanelRole.CAKE_2D)
+    plot_key = PanelKey(PanelRole.PLOT_1D)
+
     if mode is Mode.IMAGE_VIEWER:
-        panels = ((PanelRole.RAW_2D, raw_panel),)
+        panels = ((raw_key, raw_panel),)
+        layout = ((raw_key,),)
     elif mode is Mode.XYE_VIEWER:
-        panels = ((PanelRole.PLOT_1D, plot_panel),)
-    else:  # INT_1D / INT_2D: raw + cake + 1D plot
+        panels = ((plot_key, plot_panel),)
+        layout = ((plot_key,),)
+    else:  # INT_1D / INT_2D: raw | cake on top, 1D plot below
         panels = (
-            (PanelRole.RAW_2D, raw_panel),
-            (PanelRole.CAKE_2D, cake_panel),
-            (PanelRole.PLOT_1D, plot_panel),
+            (raw_key, raw_panel),
+            (cake_key, cake_panel),
+            (plot_key, plot_panel),
         )
+        layout = ((raw_key, cake_key), (plot_key,))
 
     return DisplayState(
         mode=mode,
@@ -485,5 +518,6 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
         overlaid_ids=tuple(prev_overlaid_ids or ()),
         title=title,
         panels=panels,
+        layout=layout,
         results=None,
     )
