@@ -917,6 +917,9 @@ class staticWidget(QWidget):
                     # Same path the XYE Viewer combo takes: set viewer_mode,
                     # panels, selection mode, and refresh listScans.
                     self._on_viewer_mode_changed('xye')
+                    # Auto-select the last (most recent) generated file so
+                    # the final pattern is shown without a manual click.
+                    self.h5viewer.select_last_scan_entry()
                 else:
                     logger.debug(
                         'XYE-only batch finished but output dir not found: %s',

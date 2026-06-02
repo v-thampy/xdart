@@ -602,6 +602,22 @@ class H5Viewer(QWidget):
         finally:
             lw.blockSignals(was_blocked)
 
+    def select_last_scan_entry(self):
+        """Select the last data-file entry in listScans (the most recent
+        output, since the list is naturally sorted), triggering its load via
+        itemSelectionChanged.  Skips '..' and directories.  Returns the
+        selected row, or -1 if there is no selectable entry."""
+        lw = self.ui.listScans
+        last_row = -1
+        for row in range(lw.count()):
+            text = lw.item(row).text()
+            if text == '..' or text.endswith('/'):
+                continue
+            last_row = row
+        if last_row >= 0:
+            lw.setCurrentRow(last_row, QItemSelectionModel.ClearAndSelect)
+        return last_row
+
     # ── Selection helper ──────────────────────────────────────────────
     def set_current_frame(self, item_or_row):
         """Advance the listData cursor *and narrow the selection* to a

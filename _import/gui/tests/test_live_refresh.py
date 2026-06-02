@@ -445,6 +445,36 @@ def test_display_generation_bumps_on_mode_switch_and_selection():
     assert host.display_generation == 3
 
 
+def test_select_last_scan_entry_picks_last_file_row():
+    # End-of-(XYE)-batch auto-select: select the last data-file row in
+    # listScans (most recent output), skipping '..' and directories.
+    from xdart.gui.tabs.static_scan.h5viewer import H5Viewer
+
+    class _Item:
+        def __init__(self, t): self._t = t
+        def text(self): return self._t
+
+    selected = {}
+    class _List:
+        def __init__(self, texts): self._items = [_Item(t) for t in texts]
+        def count(self): return len(self._items)
+        def item(self, r): return self._items[r]
+        def setCurrentRow(self, r, _mode=None): selected['row'] = r
+
+    host = SimpleNamespace(ui=SimpleNamespace(listScans=_List(
+        ['..', 'subdir/', 'iq_scan_0001.xye', 'iq_scan_0002.xye', 'iq_scan_0003.xye'])))
+    host.select_last_scan_entry = MethodType(H5Viewer.select_last_scan_entry, host)
+
+    row = host.select_last_scan_entry()
+    assert row == 4                          # last .xye row, not '..' or the dir
+    assert selected['row'] == 4
+
+    # Nothing selectable -> -1, no crash.
+    host2 = SimpleNamespace(ui=SimpleNamespace(listScans=_List(['..', 'd/'])))
+    host2.select_last_scan_entry = MethodType(H5Viewer.select_last_scan_entry, host2)
+    assert host2.select_last_scan_entry() == -1
+
+
 def test_data_changed_tolerates_non_integer_labels():
     # Regression: data_changed crashed with ValueError int('..._0001.xye')
     # when listData still held xye filenames during a viewer<->scan mode
