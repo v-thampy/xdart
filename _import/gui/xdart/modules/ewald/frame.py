@@ -369,7 +369,19 @@ class LiveFrame():
         self.incidence_motor = value
 
     def _get_incident_angle(self):
-        """Return incident angle in degrees from incidence_motor or scan_info."""
+        """Return incident angle in degrees.
+
+        Resolution order:
+        1. ``incidence_motor`` parsed directly as a number — this is the
+           Manual-Theta path (the GI panel sets ``incidence_motor`` to the
+           entered ``th_val`` when "Theta Motor" is *Manual*, e.g. for Eiger
+           with no metadata).
+        2. ``incidence_motor`` treated as a motor name, looked up
+           case-insensitively in ``scan_info`` (the metadata).
+        3. Last resort 0.0 — but a GI integration at 0° degenerates the
+           qip/qoop transform (blank cake), so warn rather than do it
+           silently.  Set "Theta Motor" to Manual + enter the angle.
+        """
         try:
             return float(self.incidence_motor)
         except (ValueError, TypeError):
@@ -378,6 +390,13 @@ class LiveFrame():
             for key, val in self.scan_info.items():
                 if key.lower() == motor:
                     return float(val)
+            import logging
+            logging.getLogger(__name__).warning(
+                "GI incidence motor %r not found in frame metadata and not a "
+                "number; defaulting incidence angle to 0° (degenerate GI "
+                "2D). Set 'Theta Motor' to Manual and enter the angle.",
+                self.incidence_motor,
+            )
             return 0.0
 
     def reset(self):

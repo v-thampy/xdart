@@ -475,6 +475,53 @@ def test_select_last_scan_entry_picks_last_file_row():
     assert host2.select_last_scan_entry() == -1
 
 
+def test_gi_motor_options_default_manual_when_no_metadata():
+    # GI incidence: when no motors are found (eiger / no metadata), the Theta
+    # Motor must default to 'Manual' and reveal the Theta value field so the
+    # incidence angle can be entered directly.  With a 'th' motor present it
+    # selects 'th' and hides the manual field.
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    class _P:
+        def __init__(self, value=None):
+            self._v = value
+            self.visible = True
+        def value(self):
+            return self._v
+        def setValue(self, v):
+            self._v = v
+        def setOpts(self, **o):
+            if "value" in o:
+                self._v = o["value"]
+            self.opts = o
+        def hide(self):
+            self.visible = False
+        def show(self):
+            self.visible = True
+
+    def _host(motors):
+        gi = {"th_motor": _P("th"), "th_val": _P("0.1")}
+        params = SimpleNamespace(child=lambda name: SimpleNamespace(child=lambda n: gi[n]))
+        h = SimpleNamespace(motors=motors, parameters=params, incidence_motor=None)
+        h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
+        h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
+        return h, gi
+
+    # No metadata -> Manual default, Theta field visible, incidence = th_val.
+    h, gi = _host([])
+    h.set_gi_motor_options()
+    assert gi["th_motor"].value() == "Manual"
+    assert gi["th_val"].visible is True
+    assert h.incidence_motor == "0.1"
+
+    # 'th' present -> selects th, manual field hidden.
+    h, gi = _host(["th", "i0"])
+    h.set_gi_motor_options()
+    assert gi["th_motor"].value() == "th"
+    assert gi["th_val"].visible is False
+    assert h.incidence_motor == "th"
+
+
 def test_data_changed_tolerates_non_integer_labels():
     # Regression: data_changed crashed with ValueError int('..._0001.xye')
     # when listData still held xye filenames during a viewer<->scan mode

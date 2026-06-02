@@ -74,8 +74,8 @@ params = [
     ], 'expanded': True, 'visible': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'children': [
         {'name': 'Grazing', 'type': 'bool', 'value': False},
-        {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'list', 'values': ['th'],
-         'value': 'th'},
+        {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'list',
+         'values': ['th', 'Manual'], 'value': 'th'},
         {'name': 'th_val', 'title': 'Theta', 'type': 'str', 'value': '0.1', 'visible': False},
         {'name': 'sample_orientation', 'title': 'Sample Orientation', 'type': 'int', 'value': 4,
          'limits': (1, 8), 'step': 1,
@@ -1146,7 +1146,11 @@ class imageWrangler(wranglerWidget):
         self.bg_norm_channel = self.parameters.child('BG').child('norm_channel').value()
 
     def set_gi_motor_options(self):
-        """Reads image metadata to populate possible GI theta motor
+        """Reads image metadata to populate possible GI theta motor.
+
+        Always offers a 'Manual' option (enter the incidence angle directly
+        via the Theta field).  When no motors are found — e.g. Eiger / no
+        metadata — Manual is the default, since there's no ``th`` to read.
         """
         pars = [p for p in self.motors if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
         if 'th' in pars:
@@ -1155,13 +1159,20 @@ class imageWrangler(wranglerWidget):
         elif 'theta' in pars:
             pars.insert(0, pars.pop(pars.index('theta')))
             value = 'theta'
+        elif pars:
+            value = pars[0]
         else:
-            value = 'Theta'
+            # No motors (no metadata) → default to Manual incidence entry.
+            value = 'Manual'
 
         pars = ['Manual'] + pars
 
         opts = {'values': pars, 'limits': pars, 'value': value}
         self.parameters.child('GI').child('th_motor').setOpts(**opts)
+        # Sync the Theta-value field visibility + incidence_motor to the
+        # (possibly newly-defaulted) selection — setOpts may not re-fire
+        # sigValueChanged when the value is set programmatically.
+        self.set_gi_th_motor()
 
     def set_gi_th_motor(self):
         """Update Grazing theta motor"""
