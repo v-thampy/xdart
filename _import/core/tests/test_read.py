@@ -315,6 +315,54 @@ def test_get_raw_frame_resolves_source_pointer(tmp_path):
     np.testing.assert_allclose(img, raw[1])
 
 
+def test_get_raw_frame_resolves_absolute_source_pointer(tmp_path):
+    from ssrl_xrd_tools.io import get_raw_frame
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    processed_dir = tmp_path / "processed"
+    processed_dir.mkdir()
+    master = raw_dir / "scan_master.h5"
+    raw = np.arange(2 * 4 * 4, dtype=float).reshape(2, 4, 4)
+    with h5py.File(master, "w") as f:
+        f.create_dataset("entry/data/data", data=raw)
+
+    nxs = processed_dir / "scan.nxs"
+    with h5py.File(nxs, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.create_dataset("intensity", data=np.zeros((1, 5)))
+        g.create_dataset("frame_index", data=np.array([3], dtype=np.int64))
+        s = e.create_group("frames/frame_0003/source")
+        s.create_dataset("path", data=np.bytes_(str(master).encode()))
+        s.create_dataset("frame_index", data=1)
+
+    np.testing.assert_allclose(get_raw_frame(nxs, frame=3), raw[1])
+
+
+def test_get_raw_frame_resolves_sibling_basename_when_old_path_is_stale(tmp_path):
+    from ssrl_xrd_tools.io import get_raw_frame
+
+    processed_dir = tmp_path / "processed"
+    processed_dir.mkdir()
+    master = processed_dir / "scan_master.h5"
+    raw = np.arange(4 * 4, dtype=float).reshape(1, 4, 4)
+    with h5py.File(master, "w") as f:
+        f.create_dataset("entry/data/data", data=raw)
+
+    nxs = processed_dir / "scan.nxs"
+    with h5py.File(nxs, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.create_dataset("intensity", data=np.zeros((1, 5)))
+        g.create_dataset("frame_index", data=np.array([7], dtype=np.int64))
+        s = e.create_group("frames/frame_0007/source")
+        s.create_dataset("path", data=np.bytes_(b"old/raw/scan_master.h5"))
+        s.create_dataset("frame_index", data=0)
+
+    np.testing.assert_allclose(get_raw_frame(nxs, frame=7), raw[0])
+
+
 def test_get_raw_frame_falls_back_to_thumbnail(tmp_path):
     """When the source master is missing, get_raw_frame returns the stored
     thumbnail, dequantized to its original intensity range."""
@@ -342,6 +390,54 @@ def test_get_raw_frame_falls_back_to_thumbnail(tmp_path):
     np.testing.assert_allclose(img, 10.0 + (128 / 255) * 10.0, atol=1e-6)
 
 
+def test_open_scan_strict_raw_does_not_use_thumbnail(tmp_path):
+    import pytest
+    from ssrl_xrd_tools.io import get_raw_frame, open_scan
+
+    nxs = tmp_path / "scan.nxs"
+    with h5py.File(nxs, "w") as f:
+        e = f.create_group("entry")
+        g1 = e.create_group("integrated_1d")
+        g1.create_dataset("intensity", data=np.zeros((1, 5)))
+        g1.create_dataset("q", data=np.linspace(0.5, 2.0, 5))
+        g1.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
+        s = e.create_group("frames/frame_0000/source")
+        s.create_dataset("path", data=np.bytes_(b"missing_master.h5"))
+        s.create_dataset("frame_index", data=0)
+        th = e.create_dataset("frames/frame_0000/thumbnail", data=np.ones((4, 4), dtype=np.uint8))
+        th.attrs["vmin"] = 0.0
+        th.attrs["vmax"] = 1.0
+        th.attrs["dtype"] = "uint8"
+
+    assert get_raw_frame(nxs, frame=0).shape == (4, 4)
+    with pytest.raises(KeyError, match="thumbnail fallback disabled"):
+        open_scan(nxs).load_frame(0)
+
+
+def test_open_scan_frame_source_uses_union_labels_and_scan_data(tmp_path):
+    from ssrl_xrd_tools.io import open_scan
+
+    nxs = tmp_path / "mixed_outputs.nxs"
+    with h5py.File(nxs, "w") as f:
+        e = f.create_group("entry")
+        g1 = e.create_group("integrated_1d")
+        g1.create_dataset("intensity", data=np.zeros((2, 5)))
+        g1.create_dataset("q", data=np.linspace(0.5, 2.0, 5))
+        g1.create_dataset("frame_index", data=np.array([0, 2], dtype=np.int64))
+        g2 = e.create_group("integrated_2d")
+        g2.create_dataset("intensity", data=np.zeros((2, 3, 5)))
+        g2.create_dataset("q", data=np.linspace(0.5, 2.0, 5))
+        g2.create_dataset("chi", data=np.linspace(-1.0, 1.0, 3))
+        g2.create_dataset("frame_index", data=np.array([1, 2], dtype=np.int64))
+        sd = e.create_group("scan_data")
+        sd.create_dataset("frame_index", data=np.array([0, 1, 2, 99], dtype=np.int64))
+        sd.create_dataset("th", data=np.array([0.1, 0.2, 0.3, 9.9]))
+
+    scan = open_scan(nxs)
+    assert scan.frame_indices == [0, 1, 2]
+    np.testing.assert_allclose(scan.scan_data["th"], [0.1, 0.2, 0.3])
+
+
 def test_read_image_rejects_processed_file(tmp_path):
     """read_image must not mis-read a processed scan's integrated_1d as a
     raw detector image — it raises pointing at get_raw_frame instead."""
@@ -356,6 +452,10 @@ def test_read_image_rejects_processed_file(tmp_path):
 
     with pytest.raises(ValueError, match="processed xdart"):
         read_image(nxs, frame=0)
+
+    from ssrl_xrd_tools.io.image import read_image_stack
+    with pytest.raises(ValueError, match="processed xdart"):
+        read_image_stack(nxs)
 
 
 # ---------------------------------------------------------------------------
@@ -478,3 +578,42 @@ def test_scan_data_aligned_by_label_not_position(tmp_path):
     # frame 0 → th 0.00, frame 2 → th 0.22 (aligned by label, not row order)
     assert list(ds["frame"].values) == [0, 2]
     np.testing.assert_allclose(ds["th"].values, [0.00, 0.22], atol=1e-6)
+
+
+def test_partial_thumbnails_use_independent_frame_coordinate(tmp_path):
+    import h5py
+    from ssrl_xrd_tools.io import read_scan
+
+    p = tmp_path / "partial_thumbnails.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.create_dataset("intensity", data=np.zeros((2, 4)))
+        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4))
+        g.create_dataset("frame_index", data=np.array([2, 0], dtype=np.int64))
+        fg = e.create_group("frames/frame_0002")
+        fg.create_dataset("thumbnail", data=np.ones((3, 4), dtype=np.uint8))
+
+    ds = read_scan(p, groups=("1d",), include_thumbnails=True)
+    assert ds["thumbnail"].dims == ("thumbnail_frame", "thumb_y", "thumb_x")
+    assert list(ds["thumbnail_frame"].values) == [2]
+
+
+def test_scan_data_duplicate_labels_rejected(tmp_path):
+    import h5py
+    import pytest
+    from ssrl_xrd_tools.io import read_scan
+
+    p = tmp_path / "duplicate_metadata.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.create_dataset("intensity", data=np.zeros((2, 4)))
+        g.create_dataset("q", data=np.linspace(0.5, 5.0, 4))
+        g.create_dataset("frame_index", data=np.array([0, 1], dtype=np.int64))
+        sd = e.create_group("scan_data")
+        sd.create_dataset("frame_index", data=np.array([0, 0], dtype=np.int64))
+        sd.create_dataset("th", data=np.array([1.0, 2.0]))
+
+    with pytest.raises(ValueError, match="duplicate labels"):
+        read_scan(p, groups=("1d",))

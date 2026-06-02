@@ -397,3 +397,80 @@ def test_write_positioners_reindexes_out_of_order(tmp_path):
     ds = read_scan_metadata(p)
     # th for frame 0 must be 0.1 (its scan_data row), not 0.3 (positional row 0)
     np.testing.assert_allclose(ds["th"].values, [0.1, 0.2, 0.3], rtol=1e-5)
+
+
+def test_replacement_metadata_writers_clear_empty_authoritative_state(tmp_path):
+    import pandas as pd
+    from ssrl_xrd_tools.io.nexus import (
+        write_per_frame_geometry,
+        write_positioners,
+        write_scan_metadata,
+    )
+
+    geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
+    sd = pd.DataFrame({"tth": [10.0], "th": [0.1], "i0": [1.0]}, index=[0])
+    p = tmp_path / "metadata_clear.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        write_positioners(e, sd, [0], geom)
+        write_per_frame_geometry(e, sd, [0], geom)
+        write_scan_metadata(e, sd, [0])
+        write_positioners(e, pd.DataFrame(), [], geom)
+        write_per_frame_geometry(e, pd.DataFrame(), [], geom)
+        write_scan_metadata(e, pd.DataFrame(), [])
+        assert "sample/positioners" not in e
+        assert "instrument/detector/positioners" not in e
+        assert "per_frame_geometry" not in e
+        assert "scan_data" not in e
+
+
+def test_write_scan_metadata_rejects_duplicate_labels(tmp_path):
+    import pandas as pd
+    import pytest
+    from ssrl_xrd_tools.io.nexus import write_scan_metadata
+
+    p = tmp_path / "duplicate_metadata_write.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        with pytest.raises(ValueError, match="duplicate labels"):
+            write_scan_metadata(
+                e,
+                pd.DataFrame({"th": [0.1, 0.2]}, index=[0, 0]),
+                [0, 0],
+            )
+        assert "scan_data" not in e
+
+
+def test_dup_label_write_preserves_existing_metadata(tmp_path):
+    """A malformed (duplicate-label) write must validate BEFORE deleting the
+    authoritative group, so an existing valid scan_data / per_frame_geometry
+    survives the failed call instead of being lost (delete-then-raise)."""
+    import pandas as pd
+    import pytest
+    from ssrl_xrd_tools.io.nexus import (
+        write_per_frame_geometry,
+        write_scan_metadata,
+    )
+
+    geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
+    good = pd.DataFrame({"tth": [10.0, 11.0], "th": [0.1, 0.2], "i0": [1.0, 2.0]},
+                        index=[0, 1])
+    dup = pd.DataFrame({"tth": [9.0, 9.0], "th": [0.0, 0.0], "i0": [9.0, 9.0]},
+                       index=[0, 0])
+
+    p = tmp_path / "preserve.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        write_scan_metadata(e, good, [0, 1])
+        write_per_frame_geometry(e, good, [0, 1], geom)
+        sd_before = e["scan_data/i0"][()].tolist()
+        geo_before = e["per_frame_geometry/frame_index"][()].tolist()
+
+        with pytest.raises(ValueError, match="duplicate labels"):
+            write_scan_metadata(e, dup, [0, 0])
+        with pytest.raises(ValueError, match="duplicate labels"):
+            write_per_frame_geometry(e, dup, [0, 0], geom)
+
+        assert "scan_data" in e and "per_frame_geometry" in e
+        assert e["scan_data/i0"][()].tolist() == sd_before
+        assert e["per_frame_geometry/frame_index"][()].tolist() == geo_before

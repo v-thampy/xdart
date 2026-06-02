@@ -136,6 +136,22 @@ def test_write_integrated_stack_bulk_then_incremental(tmp_path):
     np.testing.assert_allclose(ds2["intensity_1d"].values[1], 9.0)  # row 1 updated
 
 
+def test_monotonic_append_fast_path_falls_back_after_late_frame(tmp_path):
+    import h5py
+    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+
+    p = tmp_path / "late_frame.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        write_integrated_stack(e, frame_indices=[0, 2],
+                               results_1d=[_r1d(0), _r1d(2)])
+        assert bool(e["integrated_1d"].attrs["_frame_index_strictly_increasing"])
+        write_integrated_stack(e, frame_indices=[1], results_1d=[_r1d(1)])
+        assert not bool(e["integrated_1d"].attrs["_frame_index_strictly_increasing"])
+        write_integrated_stack(e, frame_indices=[2], results_1d=[_r1d(7)])
+        np.testing.assert_array_equal(e["integrated_1d/frame_index"][()], [0, 2, 1])
+
+
 def test_write_stitched_roundtrips_through_read_stitched(tmp_path):
     """write_stitched ↔ read_stitched: stitched_2d is (q, chi) as-is (NOT
     transposed like integrated_2d)."""
@@ -225,6 +241,57 @@ def test_write_integrated_stack_rejects_duplicate_labels(tmp_path):
             write_integrated_stack(
                 e, frame_indices=[0, 0], results_1d=[_r1d(0), _r1d(1)],
             )
+
+
+def test_write_nexus_validates_complete_batch_before_creating_file(tmp_path):
+    """A divergent later row must fail before the output is mutated."""
+    import pytest
+
+    p = tmp_path / "atomic_batch.nxs"
+    bad = IntegrationResult1D(
+        radial=np.linspace(0.5, 6.0, N_Q),
+        intensity=np.ones(N_Q),
+        unit="q_A^-1",
+    )
+    with pytest.raises(ValueError, match="radial axis"):
+        write_nexus(p, results_1d={0: _r1d(0), 1: bad}, overwrite=True)
+    assert not p.exists()
+
+
+def test_write_nexus_rejects_normalized_duplicate_labels(tmp_path):
+    import pytest
+
+    with pytest.raises(ValueError, match="duplicate normalized"):
+        write_nexus(
+            tmp_path / "duplicate_labels.nxs",
+            results_1d={1: _r1d(0), "1": _r1d(1)},
+            overwrite=True,
+        )
+
+
+def test_write_nexus_preflights_existing_1d_2d_before_mutation(tmp_path):
+    """If 2D is incompatible, a compatible 1D tail must not be appended."""
+    import h5py
+    import pytest
+
+    p = tmp_path / "no_half_commit.nxs"
+    write_nexus(
+        p,
+        results_1d={0: _r1d(0)},
+        results_2d={0: _r2d(0)},
+        overwrite=True,
+    )
+    bad_2d = _r2d(1)
+    bad_2d.radial = np.linspace(9.0, 10.0, N_Q)
+    with pytest.raises(ValueError, match="integrated_2d"):
+        write_nexus(
+            p,
+            results_1d={1: _r1d(1)},
+            results_2d={1: bad_2d},
+        )
+    with h5py.File(p, "r") as f:
+        np.testing.assert_array_equal(f["entry/integrated_1d/frame_index"][()], [0])
+        np.testing.assert_array_equal(f["entry/integrated_2d/frame_index"][()], [0])
 
 
 def test_nexus_sink_roundtrips_through_read_scan(tmp_path):

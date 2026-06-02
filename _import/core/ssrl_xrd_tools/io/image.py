@@ -243,6 +243,7 @@ def read_image_stack(
     ext = path.suffix.lower()
 
     if ext in {".h5", ".hdf5", ".nxs"} and not _is_eiger_master(path):
+        _reject_if_processed_xdart(path)
         # Non-Eiger HDF5 / NeXus — try fabio first, fall back to h5py
         try:
             arr = _read_fabio_stack(path)

@@ -335,6 +335,32 @@ class TestIterSphereChunks:
         with pytest.raises(ValueError, match="chunk_size must be > 0"):
             list(_iter_scan_chunks(scan, chunk_size=0))
 
+    def test_headless_frame_source_metadata_contract(self) -> None:
+        class _HeadlessSource:
+            frame_indices = [10, 20]
+            metadata = {
+                "energy_keV": 12.4,
+                "scan_data": {"tth": np.array([0.1, 0.2])},
+            }
+
+            def iter_chunks(self, chunk_size):
+                assert chunk_size == 2
+                yield np.ones((2, 4, 4)), [10, 20]
+
+        source = _HeadlessSource()
+        assert _energy_from_scan(source) == pytest.approx(12400.0)
+        np.testing.assert_allclose(
+            _angles_for_indices(source, ("tth",), indices=[20])[0], [0.2],
+        )
+        chunks = list(_iter_scan_chunks(source, chunk_size=2))
+        assert chunks[0][1] == [10, 20]
+
+    def test_energy_eV_attribute_is_used_without_keV_scaling(self) -> None:
+        class _HeadlessSource:
+            energy_eV = 12400.0
+
+        assert _energy_from_scan(_HeadlessSource()) == pytest.approx(12400.0)
+
 
 # ---------------------------------------------------------------------------
 # process_scan_from_nexus

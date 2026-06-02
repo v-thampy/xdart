@@ -611,10 +611,29 @@ def write_nexus(
     mode = "w" if overwrite else "a"
 
     comp_kwargs = _comp_kwargs(compression)
+    sorted_1d = _sorted_result_items(results_1d, "results_1d")
+    sorted_2d = _sorted_result_items(results_2d, "results_2d")
+    if sorted_1d:
+        _require_uniform_axes_1d([result for _, result in sorted_1d])
+    if sorted_2d:
+        _require_uniform_axes_2d([result for _, result in sorted_2d])
 
     with h5py.File(p, mode) as f:
         grp = f.require_group(entry)
         grp.attrs["NX_class"] = "NXentry"
+
+        if sorted_1d:
+            validate_integrated_stack_write(
+                grp,
+                frame_indices=[frame for frame, _ in sorted_1d],
+                results_1d=[result for _, result in sorted_1d],
+            )
+        if sorted_2d:
+            validate_integrated_stack_write(
+                grp,
+                frame_indices=[frame for frame, _ in sorted_2d],
+                results_2d=[result for _, result in sorted_2d],
+            )
 
         if metadata is not None:
             _write_metadata(grp, metadata, comp_kwargs)
@@ -625,16 +644,35 @@ def write_nexus(
 
         # Stacked v2 layout (read_scan-compatible).  Iterate in ascending
         # frame order so frame_index is monotonic on disk.
-        if results_1d:
-            for frame_key in sorted(results_1d, key=lambda k: int(k)):
-                _append_stacked_1d(grp, frame_key, results_1d[frame_key], comp_kwargs)
+        if sorted_1d:
+            write_integrated_stack(
+                grp,
+                frame_indices=[frame for frame, _ in sorted_1d],
+                results_1d=[result for _, result in sorted_1d],
+                compression=compression,
+            )
 
-        if results_2d:
-            for frame_key in sorted(results_2d, key=lambda k: int(k)):
-                _append_stacked_2d(grp, frame_key, results_2d[frame_key], comp_kwargs)
+        if sorted_2d:
+            write_integrated_stack(
+                grp,
+                frame_indices=[frame for frame, _ in sorted_2d],
+                results_2d=[result for _, result in sorted_2d],
+                compression=compression,
+            )
 
     logger.debug("Wrote NeXus file: %s", p)
     return p
+
+
+def _sorted_result_items(results, name: str) -> list[tuple[int, Any]]:
+    """Normalize result labels once and reject collisions before mutation."""
+    if not results:
+        return []
+    items = [(int(frame), result) for frame, result in results.items()]
+    labels = [frame for frame, _ in items]
+    if len(labels) != len(set(labels)):
+        raise ValueError(f"{name} contains duplicate normalized frame labels: {labels}")
+    return sorted(items, key=lambda item: item[0])
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +882,7 @@ def _append_stacked_1d(
         qd.attrs["units"] = r.unit
         g.create_dataset("frame_index", data=np.asarray([idx], dtype=np.int64),
                          maxshape=(None,), chunks=(64,))
+        g.attrs["_frame_index_strictly_increasing"] = True
         if r.sigma is not None:
             g.create_dataset("sigma", data=np.asarray(r.sigma, dtype=np.float32)[None, :],
                              maxshape=(None, n_q), chunks=(1, n_q), **comp_kwargs)
@@ -868,17 +907,26 @@ def _append_stacked_1d(
             "write_integrated_stack with all frames to re-axis a reintegration)."
         )
     fi = g["frame_index"]
-    match = np.where(np.asarray(fi[()]) == idx)[0]
+    n = di.shape[0]
+    monotonic = bool(g.attrs.get("_frame_index_strictly_increasing", False))
+    last_idx = int(fi[n - 1]) if n else None
+    match = (
+        np.empty(0, dtype=int)
+        if monotonic and (last_idx is None or idx > last_idx)
+        else np.where(np.asarray(fi[()]) == idx)[0]
+    )
     if match.size:
         pos = int(match[0])  # upsert: replace existing row for this label
         di[pos] = intensity
-        _upsert_sigma_1d(g, pos, r, n_q)
+        _upsert_sigma_1d(g, pos, r, n_q, comp_kwargs)
         return
-    n = di.shape[0]
     di.resize(n + 1, axis=0)
     di[n] = intensity
     fi.resize(n + 1, axis=0)
     fi[n] = idx
+    g.attrs["_frame_index_strictly_increasing"] = (
+        monotonic and (last_idx is None or idx > last_idx)
+    )
     _append_sigma_row(g, n, (None if r.sigma is None
                              else np.asarray(r.sigma, np.float32)),
                       (n_q,), comp_kwargs)
@@ -913,7 +961,7 @@ def _append_sigma_row(g, new_row_pos, sigma_row, row_shape, comp_kwargs):
                          chunks=chunks, **comp_kwargs)
 
 
-def _upsert_sigma_1d(g, pos, r, n_q):
+def _upsert_sigma_1d(g, pos, r, n_q, comp_kwargs=None):
     """Update sigma for an upserted (replaced) 1D row.
 
     * frame has sigma → write it (creating the dataset NaN-backfilled if it
@@ -930,12 +978,13 @@ def _upsert_sigma_1d(g, pos, r, n_q):
             data = np.full((n_rows, n_q), np.nan, np.float32)
             data[pos] = row
             g.create_dataset("sigma", data=data, maxshape=(None, n_q),
-                             chunks=(max(1, min(n_rows, 32)), n_q))
+                             chunks=(max(1, min(n_rows, 32)), n_q),
+                             **(comp_kwargs or {}))
     elif "sigma" in g:
         g["sigma"][pos] = np.full(n_q, np.nan, np.float32)
 
 
-def _upsert_sigma_2d(g, pos, r, n_chi, n_q):
+def _upsert_sigma_2d(g, pos, r, n_chi, n_q, comp_kwargs=None):
     """2D analogue of :func:`_upsert_sigma_1d` (sigma stored transposed)."""
     if r.sigma is not None:
         row = np.asarray(r.sigma, np.float32).T
@@ -946,7 +995,7 @@ def _upsert_sigma_2d(g, pos, r, n_chi, n_q):
             data = np.full((n_rows, n_chi, n_q), np.nan, np.float32)
             data[pos] = row
             g.create_dataset("sigma", data=data, maxshape=(None, n_chi, n_q),
-                             chunks=(1, n_chi, n_q))
+                             chunks=(1, n_chi, n_q), **(comp_kwargs or {}))
     elif "sigma" in g:
         g["sigma"][pos] = np.full((n_chi, n_q), np.nan, np.float32)
 
@@ -982,6 +1031,7 @@ def _append_stacked_2d(
         cd.attrs["units"] = r.azimuthal_unit
         g.create_dataset("frame_index", data=np.asarray([idx], dtype=np.int64),
                          maxshape=(None,), chunks=(64,))
+        g.attrs["_frame_index_strictly_increasing"] = True
         if r.sigma is not None:
             g.create_dataset("sigma",
                              data=np.asarray(r.sigma, dtype=np.float32).T[None],
@@ -1004,17 +1054,26 @@ def _append_stacked_2d(
             "write_integrated_stack with all frames to re-axis a reintegration)."
         )
     fi = g["frame_index"]
-    match = np.where(np.asarray(fi[()]) == idx)[0]
+    n = di.shape[0]
+    monotonic = bool(g.attrs.get("_frame_index_strictly_increasing", False))
+    last_idx = int(fi[n - 1]) if n else None
+    match = (
+        np.empty(0, dtype=int)
+        if monotonic and (last_idx is None or idx > last_idx)
+        else np.where(np.asarray(fi[()]) == idx)[0]
+    )
     if match.size:
         pos = int(match[0])  # upsert: replace existing row for this label
         di[pos] = intensity
-        _upsert_sigma_2d(g, pos, r, n_chi, n_q)
+        _upsert_sigma_2d(g, pos, r, n_chi, n_q, comp_kwargs)
         return
-    n = di.shape[0]
     di.resize(n + 1, axis=0)
     di[n] = intensity
     fi.resize(n + 1, axis=0)
     fi[n] = idx
+    g.attrs["_frame_index_strictly_increasing"] = (
+        monotonic and (last_idx is None or idx > last_idx)
+    )
     _append_sigma_row(g, n, (None if r.sigma is None
                              else np.asarray(r.sigma, np.float32).T),
                       (n_chi, n_q), comp_kwargs)
@@ -1096,6 +1155,67 @@ def _axes_match_2d(g, r0) -> bool:
     return True
 
 
+def _require_batch_covers_existing(
+    group: h5py.Group,
+    name: str,
+    frame_indices: Sequence[int],
+) -> None:
+    """Ensure a full-rewrite batch includes every persisted frame label."""
+    existing = {int(x) for x in np.asarray(group["frame_index"][()]).ravel()}
+    missing = existing - set(frame_indices)
+    if missing:
+        raise ValueError(
+            f"write_integrated_stack: {name} row size changed but the "
+            f"incoming batch is missing frame(s) {sorted(missing)} already "
+            "on disk. A reintegration that changes the bin count must pass "
+            "all frames (full rewrite), not a subset — otherwise the "
+            "omitted rows would be dropped."
+        )
+
+
+def validate_integrated_stack_write(
+    entry_grp: h5py.Group,
+    *,
+    frame_indices: Sequence[int],
+    results_1d: Sequence[IntegrationResult1D] | None = None,
+    results_2d: Sequence[IntegrationResult2D] | None = None,
+) -> list[int]:
+    """Validate a stacked integrated write without mutating ``entry_grp``.
+
+    This mirrors the compatibility checks in :func:`write_integrated_stack`
+    so callers that update multiple outputs can preflight every affected
+    group before any one output is committed.
+    """
+    fis = [int(x) for x in frame_indices]
+    if len(set(fis)) != len(fis):
+        raise ValueError(f"frame_indices contains duplicate labels: {fis}")
+
+    if results_1d is not None and len(results_1d):
+        if len(results_1d) != len(fis):
+            raise ValueError("results_1d length must match frame_indices")
+        _require_uniform_axes_1d(results_1d)
+        g = entry_grp.get("integrated_1d")
+        if g is not None and (
+            g["intensity"].shape[1] != np.asarray(results_1d[0].intensity).shape[0]
+            or not _axes_match_1d(g, results_1d[0])
+        ):
+            _require_batch_covers_existing(g, "integrated_1d", fis)
+
+    if results_2d is not None and len(results_2d):
+        if len(results_2d) != len(fis):
+            raise ValueError("results_2d length must match frame_indices")
+        _require_uniform_axes_2d(results_2d)
+        g = entry_grp.get("integrated_2d")
+        new_2d_shape = np.asarray(results_2d[0].intensity).T.shape
+        if g is not None and (
+            tuple(g["intensity"].shape[1:]) != new_2d_shape
+            or not _axes_match_2d(g, results_2d[0])
+        ):
+            _require_batch_covers_existing(g, "integrated_2d", fis)
+
+    return fis
+
+
 def write_integrated_stack(
     entry_grp: h5py.Group,
     *,
@@ -1122,30 +1242,13 @@ def write_integrated_stack(
     existing group is dropped and rewritten from this batch so the q/chi
     axes refresh — pass *all* frames in that case, not a subset.
     """
-    fis = [int(x) for x in frame_indices]
-    if len(set(fis)) != len(fis):
-        raise ValueError(f"frame_indices contains duplicate labels: {fis}")
+    fis = validate_integrated_stack_write(
+        entry_grp,
+        frame_indices=frame_indices,
+        results_1d=results_1d,
+        results_2d=results_2d,
+    )
     ck = _comp_kwargs(compression)
-
-    def _require_batch_covers_existing(group, name: str) -> None:
-        """Guard the C3 shape-change full-rewrite.
-
-        Rewriting a group from the incoming batch is only safe when that
-        batch covers *every* frame already on disk — otherwise the rows
-        for the omitted frames are silently dropped.  A reintegration
-        that changes the bin count must therefore pass all frames.  Raise
-        (rather than lose data) on a partial batch.
-        """
-        existing = {int(x) for x in np.asarray(group["frame_index"][()]).ravel()}
-        missing = existing - set(fis)
-        if missing:
-            raise ValueError(
-                f"write_integrated_stack: {name} row size changed but the "
-                f"incoming batch is missing frame(s) {sorted(missing)} already "
-                "on disk. A reintegration that changes the bin count must pass "
-                "all frames (full rewrite), not a subset — otherwise the "
-                "omitted rows would be dropped."
-            )
 
     def _bulk_create_1d():
         r0 = results_1d[0]
@@ -1164,6 +1267,9 @@ def write_integrated_stack(
         qd.attrs["units"] = r0.unit
         g.create_dataset("frame_index", data=np.asarray(fis, np.int64),
                          maxshape=(None,), chunks=(64,))
+        g.attrs["_frame_index_strictly_increasing"] = bool(
+            len(fis) < 2 or np.all(np.diff(fis) > 0)
+        )
         # Write sigma if ANY frame has it (NaN-pad the frames that don't) —
         # an all-or-nothing test silently dropped sigma for a mixed batch.
         if any(r.sigma is not None for r in results_1d):
@@ -1193,6 +1299,9 @@ def write_integrated_stack(
         cd.attrs["units"] = r0.azimuthal_unit
         g.create_dataset("frame_index", data=np.asarray(fis, np.int64),
                          maxshape=(None,), chunks=(64,))
+        g.attrs["_frame_index_strictly_increasing"] = bool(
+            len(fis) < 2 or np.all(np.diff(fis) > 0)
+        )
         # Sigma if ANY frame has it (NaN-pad the rest) — see _bulk_create_1d.
         if any(r.sigma is not None for r in results_2d):
             sig = np.stack([
@@ -1223,7 +1332,7 @@ def write_integrated_stack(
             g["intensity"].shape[1] != np.asarray(results_1d[0].intensity).shape[0]
             or not _axes_match_1d(g, results_1d[0])
         ):
-            _require_batch_covers_existing(g, "integrated_1d")
+            _require_batch_covers_existing(g, "integrated_1d", fis)
             del entry_grp["integrated_1d"]
             g = None
         if g is None:
@@ -1244,7 +1353,7 @@ def write_integrated_stack(
             tuple(g["intensity"].shape[1:]) != new_2d_shape
             or not _axes_match_2d(g, results_2d[0])
         ):
-            _require_batch_covers_existing(g, "integrated_2d")
+            _require_batch_covers_existing(g, "integrated_2d", fis)
             del entry_grp["integrated_2d"]
             g = None
         if g is None:
@@ -1311,6 +1420,14 @@ def _reindex_scan_data_to_frames(scan_data, frame_indices):
     dimension and can't attach a motor value to the wrong frame.
     """
     fis = [int(x) for x in frame_indices]
+    if len(fis) != len(set(fis)):
+        raise ValueError(f"frame_indices contains duplicate labels: {fis}")
+    try:
+        labels = [int(x) for x in scan_data.index]
+    except (TypeError, ValueError):
+        labels = []
+    if labels and len(labels) != len(set(labels)):
+        raise ValueError(f"scan_data index contains duplicate labels: {labels}")
     if fis and list(scan_data.index) != fis:
         scan_data = scan_data.reindex(fis)
     return scan_data, fis
@@ -1332,33 +1449,53 @@ def write_positioners(
     :func:`_reindex_scan_data_to_frames`).  Mirrors what
     :func:`read_scan_metadata` reads back.
     """
-    if geometry is None or scan_data is None or len(scan_data) == 0:
-        return
-    scan_data, _ = _reindex_scan_data_to_frames(scan_data, frame_indices)
-    ck = _comp_kwargs(compression)
-
     def _write_coll(parent_path: str, motors, nx_class: str) -> None:
+        parent = entry_grp.get(parent_path)
+        if parent is not None and "positioners" in parent:
+            del parent["positioners"]
         present = [m for m in motors if m in scan_data.columns]
         if not present:
             return
         parent = entry_grp.require_group(parent_path)
         parent.attrs["NX_class"] = nx_class
-        if "positioners" in parent:
-            del parent["positioners"]
         coll = parent.create_group("positioners")
         coll.attrs["NX_class"] = "NXcollection"
+        coll.attrs["_frame_index_strictly_increasing"] = bool(
+            len(fis) < 2 or np.all(np.diff(fis) > 0)
+        )
+        coll.create_dataset(
+            "frame_index",
+            data=np.asarray(fis, dtype=np.int64),
+            maxshape=(None,),
+            chunks=(64,),
+        )
         for m in present:
             pg = coll.create_group(m)
             pg.attrs["NX_class"] = "NXpositioner"
             ds = pg.create_dataset(
-                "value", data=np.asarray(scan_data[m].values, dtype=np.float32), **ck,
+                "value",
+                data=np.asarray(scan_data[m].values, dtype=np.float32),
+                maxshape=(None,),
+                chunks=(64,),
+                **ck,
             )
             ds.attrs["units"] = "deg"
 
-    if geometry.detector_motors:
+    sample_motors = tuple(geometry.sample_motors) if geometry is not None else ()
+    detector_motors = tuple(geometry.detector_motors) if geometry is not None else ()
+    if geometry is None or scan_data is None or len(scan_data) == 0:
+        for path in ("sample", "instrument/detector"):
+            parent = entry_grp.get(path)
+            if parent is not None and "positioners" in parent:
+                del parent["positioners"]
+        return
+    scan_data, fis = _reindex_scan_data_to_frames(scan_data, frame_indices)
+    ck = _comp_kwargs(compression)
+
+    if detector_motors:
         entry_grp.require_group("instrument").attrs["NX_class"] = "NXinstrument"
-    _write_coll("sample", tuple(geometry.sample_motors), "NXsample")
-    _write_coll("instrument/detector", tuple(geometry.detector_motors), "NXdetector")
+    _write_coll("sample", sample_motors, "NXsample")
+    _write_coll("instrument/detector", detector_motors, "NXdetector")
 
 
 def write_per_frame_geometry(
@@ -1379,8 +1516,17 @@ def write_per_frame_geometry(
     misaligned).  No geometry / no usable motor columns → no-op.
     """
     if geometry is None or scan_data is None or len(scan_data) == 0:
+        if "per_frame_geometry" in entry_grp:
+            del entry_grp["per_frame_geometry"]
         return
+    # Validate/align BEFORE deleting the authoritative group: a malformed
+    # frame_indices (e.g. duplicate labels) makes _reindex raise, and we must
+    # not have already destroyed the existing on-disk group at that point.
     scan_data, fis = _reindex_scan_data_to_frames(scan_data, frame_indices)
+    # Past validation — every exit below clears the stale group (matching the
+    # original always-rewrite behaviour) but only now that nothing can raise.
+    if "per_frame_geometry" in entry_grp:
+        del entry_grp["per_frame_geometry"]
     motors = {
         m: np.asarray(scan_data[m].values, dtype=float)
         for m in geometry.all_referenced_motors()
@@ -1396,13 +1542,20 @@ def write_per_frame_geometry(
 
     frame_idx_arr = np.asarray(fis if fis else range(len(scan_data)), dtype=np.int64)
     ck = _comp_kwargs(compression)
-    if "per_frame_geometry" in entry_grp:
-        del entry_grp["per_frame_geometry"]
     g = entry_grp.create_group("per_frame_geometry")
     g.attrs["NX_class"] = "NXcollection"
-    g.create_dataset("frame_index", data=frame_idx_arr)
+    g.attrs["_frame_index_strictly_increasing"] = bool(
+        len(frame_idx_arr) < 2 or np.all(np.diff(frame_idx_arr) > 0)
+    )
+    g.create_dataset("frame_index", data=frame_idx_arr, maxshape=(None,), chunks=(64,))
     for key, arr in derived.items():
-        ds = g.create_dataset(key, data=np.asarray(arr, dtype=np.float32), **ck)
+        ds = g.create_dataset(
+            key,
+            data=np.asarray(arr, dtype=np.float32),
+            maxshape=(None,),
+            chunks=(64,),
+            **ck,
+        )
         ds.attrs["units"] = "deg" if key == "incident_angle" else "rad"
 
 
@@ -1428,23 +1581,238 @@ def write_scan_metadata(
     Non-numeric columns are skipped (the table is stored as float32).
     """
     if scan_data is None or len(scan_data) == 0 or not len(scan_data.columns):
+        if "scan_data" in entry_grp:
+            del entry_grp["scan_data"]
         return
+    # Validate/align BEFORE deleting the authoritative group so a malformed
+    # frame_indices (duplicate labels) raises without losing existing data.
     scan_data, fis = _reindex_scan_data_to_frames(scan_data, frame_indices)
-    ck = _comp_kwargs(compression)
     if "scan_data" in entry_grp:
         del entry_grp["scan_data"]
+    ck = _comp_kwargs(compression)
     g = entry_grp.create_group("scan_data")
     g.attrs["NX_class"] = "NXcollection"
+    g.attrs["_frame_index_strictly_increasing"] = bool(
+        len(fis) < 2 or np.all(np.diff(fis) > 0)
+    )
     g.create_dataset(
         "frame_index",
         data=np.asarray(fis if fis else range(len(scan_data)), dtype=np.int64),
+        maxshape=(None,),
+        chunks=(64,),
     )
     for col in scan_data.columns:
         try:
             arr = np.asarray(scan_data[col].values, dtype=np.float32)
         except (TypeError, ValueError):
             continue  # non-numeric column — not representable in the table
-        g.create_dataset(str(col), data=arr, **ck)
+        g.create_dataset(str(col), data=arr, maxshape=(None,), chunks=(64,), **ck)
+
+
+def _upsert_indexed_group(
+    group: h5py.Group,
+    *,
+    frame_indices: Sequence[int],
+    values: dict[str, np.ndarray],
+) -> None:
+    """Update or append rows in an indexed metadata group.
+
+    The group must already use the appendable layout created by the
+    replacement writers above. Callers should fall back to a full replacement
+    when this raises, which keeps upgrades from older files honest.
+    """
+    fis = [int(x) for x in frame_indices]
+    if len(fis) != len(set(fis)):
+        raise ValueError(f"frame_indices contains duplicate labels: {fis}")
+    if "frame_index" not in group:
+        raise ValueError(f"{group.name} has no appendable frame_index")
+    existing_cols = {name for name, item in group.items()
+                     if name != "frame_index" and isinstance(item, h5py.Dataset)}
+    if existing_cols != set(values):
+        raise ValueError(
+            f"{group.name} metadata columns changed: "
+            f"disk={sorted(existing_cols)}, incoming={sorted(values)}"
+        )
+    labels_ds = group["frame_index"]
+    if labels_ds.maxshape is None or labels_ds.maxshape[0] is not None:
+        raise ValueError(f"{group.name}/frame_index is not appendable")
+    for col, arr in values.items():
+        if len(arr) != len(fis):
+            raise ValueError(f"{group.name}/{col} row count does not match frame_indices")
+        if group[col].maxshape is None or group[col].maxshape[0] is not None:
+            raise ValueError(f"{group.name}/{col} is not appendable")
+    n = int(labels_ds.shape[0])
+    last_label = int(labels_ds[n - 1]) if n else None
+    monotonic = bool(group.attrs.get("_frame_index_strictly_increasing", False))
+    if (fis and monotonic and _strictly_increasing(fis)
+            and (last_label is None or fis[0] > last_label)):
+        labels_ds.resize((n + len(fis),))
+        labels_ds[n:] = fis
+        for col, arr in values.items():
+            ds = group[col]
+            ds.resize((n + len(fis),))
+            ds[n:] = arr
+        return
+    labels = [int(x) for x in np.asarray(labels_ds[()]).ravel()]
+    if len(labels) != len(set(labels)):
+        raise ValueError(f"{group.name}/frame_index contains duplicate labels")
+    row_of = {label: row for row, label in enumerate(labels)}
+    for label_pos, label in enumerate(fis):
+        row = row_of.get(label)
+        if row is None:
+            row = int(labels_ds.shape[0])
+            labels_ds.resize((row + 1,))
+            labels_ds[row] = label
+            for col, arr in values.items():
+                ds = group[col]
+                ds.resize((row + 1,))
+                ds[row] = arr[label_pos]
+            row_of[label] = row
+        else:
+            for col, arr in values.items():
+                group[col][row] = arr[label_pos]
+    group.attrs["_frame_index_strictly_increasing"] = bool(
+        _strictly_increasing(list(row_of))
+    )
+
+
+def _strictly_increasing(labels: Sequence[int]) -> bool:
+    return all(a < b for a, b in zip(labels, labels[1:]))
+
+
+def upsert_scan_metadata(
+    entry_grp: h5py.Group,
+    scan_data,
+    frame_indices: Sequence[int],
+) -> None:
+    """Incrementally append or replace rows in ``/entry/scan_data``."""
+    if scan_data is None or len(scan_data) == 0:
+        return
+    scan_data, fis = _reindex_scan_data_to_frames(scan_data, frame_indices)
+    values: dict[str, np.ndarray] = {}
+    for col in scan_data.columns:
+        try:
+            values[str(col)] = np.asarray(scan_data[col].values, dtype=np.float32)
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        return
+    if "scan_data" not in entry_grp:
+        write_scan_metadata(entry_grp, scan_data, fis)
+        return
+    _upsert_indexed_group(entry_grp["scan_data"], frame_indices=fis, values=values)
+
+
+def upsert_per_frame_geometry(
+    entry_grp: h5py.Group,
+    scan_data,
+    frame_indices: Sequence[int],
+    geometry,
+    *,
+    allow_create: bool = True,
+) -> None:
+    """Incrementally append or replace derived geometry rows."""
+    if geometry is None or scan_data is None or len(scan_data) == 0:
+        return
+    scan_data, fis = _reindex_scan_data_to_frames(scan_data, frame_indices)
+    motors = {
+        m: np.asarray(scan_data[m].values, dtype=float)
+        for m in geometry.all_referenced_motors()
+        if m in scan_data.columns
+    }
+    if not motors:
+        return
+    derived = {
+        key: np.asarray(arr, dtype=np.float32)
+        for key, arr in geometry.derive_per_frame(motors).items()
+    }
+    if "per_frame_geometry" not in entry_grp:
+        if not allow_create:
+            raise ValueError("/entry/per_frame_geometry is missing; full replacement required")
+        write_per_frame_geometry(entry_grp, scan_data, fis, geometry)
+        return
+    _upsert_indexed_group(
+        entry_grp["per_frame_geometry"], frame_indices=fis, values=derived,
+    )
+
+
+def upsert_positioners(
+    entry_grp: h5py.Group,
+    scan_data,
+    frame_indices: Sequence[int],
+    geometry,
+    *,
+    allow_create: bool = True,
+) -> None:
+    """Incrementally append or replace NXpositioner rows."""
+    if geometry is None or scan_data is None or len(scan_data) == 0:
+        return
+    scan_data, fis = _reindex_scan_data_to_frames(scan_data, frame_indices)
+    for parent_path, motors in (
+        ("sample", tuple(geometry.sample_motors)),
+        ("instrument/detector", tuple(geometry.detector_motors)),
+    ):
+        present = [m for m in motors if m in scan_data.columns]
+        if not present:
+            continue
+        coll_path = f"{parent_path}/positioners"
+        if coll_path not in entry_grp:
+            if not allow_create:
+                raise ValueError(f"/entry/{coll_path} is missing; full replacement required")
+            write_positioners(entry_grp, scan_data, fis, geometry)
+            return
+        coll = entry_grp[coll_path]
+        values = {
+            m: np.asarray(scan_data[m].values, dtype=np.float32)
+            for m in present
+        }
+        flat = {name: coll[name]["value"] for name in present if name in coll}
+        if set(flat) != set(values):
+            raise ValueError(f"{coll.name} positioner columns changed")
+        labels_ds = coll.get("frame_index")
+        if labels_ds is None:
+            raise ValueError(f"{coll.name} has no appendable frame_index")
+        if labels_ds.maxshape is None or labels_ds.maxshape[0] is not None:
+            raise ValueError(f"{coll.name}/frame_index is not appendable")
+        for name, arr in values.items():
+            if len(arr) != len(fis):
+                raise ValueError(f"{coll.name}/{name} row count does not match frame_indices")
+            ds = flat[name]
+            if ds.maxshape is None or ds.maxshape[0] is not None:
+                raise ValueError(f"{ds.name} is not appendable")
+        n = int(labels_ds.shape[0])
+        last_label = int(labels_ds[n - 1]) if n else None
+        monotonic = bool(coll.attrs.get("_frame_index_strictly_increasing", False))
+        if (fis and monotonic and _strictly_increasing(fis)
+                and (last_label is None or fis[0] > last_label)):
+            labels_ds.resize((n + len(fis),))
+            labels_ds[n:] = fis
+            for name, arr in values.items():
+                ds = flat[name]
+                ds.resize((n + len(fis),))
+                ds[n:] = arr
+            continue
+        labels = [int(x) for x in np.asarray(labels_ds[()]).ravel()]
+        if len(labels) != len(set(labels)):
+            raise ValueError(f"{coll.name}/frame_index contains duplicate labels")
+        row_of = {label: row for row, label in enumerate(labels)}
+        for pos, label in enumerate(fis):
+            row = row_of.get(label)
+            if row is None:
+                row = int(labels_ds.shape[0])
+                labels_ds.resize((row + 1,))
+                labels_ds[row] = label
+                for name, arr in values.items():
+                    ds = flat[name]
+                    ds.resize((row + 1,))
+                    ds[row] = arr[pos]
+                row_of[label] = row
+            else:
+                for name, arr in values.items():
+                    flat[name][row] = arr[pos]
+        coll.attrs["_frame_index_strictly_increasing"] = bool(
+            _strictly_increasing(list(row_of))
+        )
 
 
 def _read_scan_data_group(e, add_frame_var, data_vars, coords) -> set:
@@ -1470,6 +1838,8 @@ def _read_scan_data_group(e, add_frame_var, data_vars, coords) -> set:
     # no-op identity.
     sd_labels = (np.asarray(sd["frame_index"][()]) if "frame_index" in sd
                  else None)
+    if sd_labels is not None and len(sd_labels) != len(set(map(int, sd_labels))):
+        raise ValueError("scan_data/frame_index contains duplicate labels")
     coord = coords.get("frame")
     perm = None          # row-permutation: coord position → scan_data row
     fully_covers = True  # does scan_data cover every coord label?
@@ -1675,6 +2045,8 @@ def _read_positioners(grp: h5py.Group) -> dict[str, np.ndarray]:
     """Read NXpositioner children of an NXcollection into a dict (v2)."""
     out: dict[str, np.ndarray] = {}
     for k, item in grp.items():
+        if k == "frame_index":
+            continue
         if isinstance(item, h5py.Group):
             if "value" in item:
                 out[k] = np.asarray(item["value"][()])
@@ -1808,15 +2180,22 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
 
         if include_thumbnails and "frames" in e:
             thumbs: list[np.ndarray] = []
+            thumb_labels: list[int] = []
             for name in sorted(e["frames"].keys()):
                 fg = e[f"frames/{name}"]
                 if "thumbnail" in fg:
                     thumbs.append(np.asarray(fg["thumbnail"][()]))
+                    try:
+                        thumb_labels.append(int(name.removeprefix("frame_")))
+                    except ValueError:
+                        logger.debug("Skipping thumbnail with unparseable group label %r", name)
+                        thumbs.pop()
             if thumbs:
                 data_vars["thumbnail"] = (
-                    ("frame", "thumb_y", "thumb_x"),
+                    ("thumbnail_frame", "thumb_y", "thumb_x"),
                     np.stack(thumbs, axis=0),
                 )
+                coords["thumbnail_frame"] = np.asarray(thumb_labels, dtype=np.int64)
 
         if "frame" not in coords:
             N = None
@@ -2008,8 +2387,8 @@ def read_scan(
     groups
         Which integrated stacks to load: subset of ``("1d", "2d")``.
     include_thumbnails
-        If ``True``, load per-frame thumbnails as a ``thumbnail`` data
-        variable.
+        If ``True``, load available thumbnails as a ``thumbnail`` data
+        variable indexed by the independent ``thumbnail_frame`` coordinate.
 
     Returns
     -------
@@ -2072,8 +2451,12 @@ __all__ = [
     "open_nexus_writer",
     "write_nexus",
     "write_nexus_frame",
+    "validate_integrated_stack_write",
     "write_integrated_stack",
     "write_stitched",
+    "upsert_scan_metadata",
+    "upsert_positioners",
+    "upsert_per_frame_geometry",
     "write_positioners",
     "write_per_frame_geometry",
     "write_scan_metadata",

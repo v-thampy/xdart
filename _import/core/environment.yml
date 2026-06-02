@@ -33,7 +33,7 @@ dependencies:
   - jupyter_bokeh
   - plotly
   - anywidget
-  - napari
+  # napari intentionally omitted until the RSM 3D viewer is wired up
   # VTK export
   - pyevtk
   # Dev

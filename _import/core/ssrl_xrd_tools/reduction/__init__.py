@@ -8,6 +8,7 @@ the GUI chooses a :class:`ReductionPlan`, supplies a :class:`Scan`, and lets
 from ssrl_xrd_tools.reduction.core import (
     CancelToken,
     Frame,
+    FrameSource,
     FrameReduction,
     GIMode,
     Integration1DPlan,
@@ -26,6 +27,7 @@ from ssrl_xrd_tools.reduction.core import (
 __all__ = [
     "CancelToken",
     "Frame",
+    "FrameSource",
     "FrameReduction",
     "GIMode",
     "Integration1DPlan",

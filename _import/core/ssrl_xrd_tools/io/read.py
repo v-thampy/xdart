@@ -40,7 +40,7 @@ from __future__ import annotations
 import logging
 from collections import namedtuple
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import h5py
 import numpy as np
@@ -103,6 +103,61 @@ def _frame_index(grp: h5py.Group, prefer: str | None = None) -> np.ndarray:
     raise KeyError("No frame_index found (integrated_1d/2d/per_frame_geometry)")
 
 
+def _all_frame_index(grp: h5py.Group) -> np.ndarray:
+    """Return the union of labels with reduced data or raw-source groups."""
+    labels: set[int] = set()
+    if "frames" in grp:
+        for name in grp["frames"]:
+            if not name.startswith("frame_"):
+                continue
+            try:
+                labels.add(int(name.removeprefix("frame_")))
+            except ValueError:
+                continue
+    for name in ("integrated_1d", "integrated_2d"):
+        if name in grp and "frame_index" in grp[name]:
+            labels.update(int(x) for x in np.asarray(grp[name]["frame_index"][()]).ravel())
+    if labels:
+        return np.asarray(sorted(labels), dtype=np.int64)
+    return _frame_index(grp)
+
+
+def _scan_data_for_frames(
+    scan_file: str | Path,
+    frames: Sequence[int],
+    *,
+    entry: str = "entry",
+) -> dict[str, np.ndarray]:
+    """Read /entry/scan_data aligned to explicit frame labels."""
+    frames = [int(frame) for frame in frames]
+    out: dict[str, np.ndarray] = {}
+    if not frames:
+        return out
+    with h5py.File(Path(scan_file), "r") as f:
+        e = _entry(f, entry)
+        if "scan_data" not in e or "frame_index" not in e["scan_data"]:
+            return out
+        sd = e["scan_data"]
+        labels = [int(x) for x in np.asarray(sd["frame_index"][()]).ravel()]
+        if len(labels) != len(set(labels)):
+            raise ValueError("scan_data/frame_index contains duplicate labels")
+        row_of = {label: row for row, label in enumerate(labels)}
+        rows = [row_of.get(frame, -1) for frame in frames]
+        for key, item in sd.items():
+            if key == "frame_index" or not isinstance(item, h5py.Dataset):
+                continue
+            try:
+                arr = np.asarray(item[()], dtype=float)
+            except (TypeError, ValueError):
+                continue
+            aligned = np.full((len(frames),) + arr.shape[1:], np.nan, dtype=float)
+            for dst, src in enumerate(rows):
+                if src >= 0:
+                    aligned[dst] = arr[src]
+            out[str(key)] = aligned
+    return out
+
+
 def _resolve_positions(frame_index: np.ndarray, frame):
     """Map requested frame label(s) to row position(s) in ``frame_index``.
 
@@ -135,10 +190,16 @@ def _resolve_positions(frame_index: np.ndarray, frame):
 # public readers
 # ---------------------------------------------------------------------------
 
-def get_frames(scan_file: str | Path, *, entry: str = "entry") -> np.ndarray:
+def get_frames(
+    scan_file: str | Path,
+    *,
+    entry: str = "entry",
+    union: bool = False,
+) -> np.ndarray:
     """Return the array of frame labels present in ``scan_file``."""
     with h5py.File(Path(scan_file), "r") as f:
-        return _frame_index(_entry(f, entry))
+        e = _entry(f, entry)
+        return _all_frame_index(e) if union else _frame_index(e)
 
 
 def get_1d(
@@ -255,6 +316,7 @@ def get_raw_frame(
     frame: int,
     *,
     entry: str = "entry",
+    allow_thumbnail: bool = True,
 ) -> np.ndarray:
     """Return the raw detector image for one ``frame`` of a processed scan.
 
@@ -266,7 +328,7 @@ def get_raw_frame(
     full-resolution raw image from the master via
     :func:`ssrl_xrd_tools.io.image.read_image`.  If the master can't be
     located or read, it falls back to the stored thumbnail (dequantized to
-    its original intensity range).
+    its original intensity range) unless ``allow_thumbnail=False``.
 
     ``frame`` is the frame **label** (the ``frame_index`` value), matching
     the other ``get_*`` readers.  Raises ``KeyError`` when neither a usable
@@ -290,9 +352,27 @@ def get_raw_frame(
             if "frame_index" in src:
                 src_frame_idx = int(np.asarray(src["frame_index"][()]).ravel()[0])
             if rel:
-                cand = (scan_file.parent / rel).resolve()
-                if cand.exists():
-                    master = cand
+                rel_path = Path(str(rel)).expanduser()
+                candidates = []
+                if rel_path.is_absolute():
+                    candidates.append(rel_path)
+                candidates.extend([
+                    scan_file.parent / rel_path,
+                    scan_file.parent / rel_path.name,
+                    rel_path,
+                ])
+                seen: set[Path] = set()
+                for cand in candidates:
+                    try:
+                        resolved = cand.resolve()
+                    except OSError:
+                        resolved = cand
+                    if resolved in seen:
+                        continue
+                    seen.add(resolved)
+                    if resolved.exists():
+                        master = resolved
+                        break
         thumb_ds = fg.get("thumbnail")
         if thumb_ds is not None:
             thumb = _dequantize_thumbnail(thumb_ds)
@@ -302,13 +382,18 @@ def get_raw_frame(
             return np.asarray(read_image(master, frame=src_frame_idx), dtype=float)
         except Exception:
             logger.debug("get_raw_frame: failed reading master %s frame %d; "
-                         "falling back to thumbnail", master, src_frame_idx,
+                         "%s thumbnail", master, src_frame_idx,
+                         "falling back to" if allow_thumbnail else "not falling back to",
                          exc_info=True)
-    if thumb is not None:
+    if allow_thumbnail and thumb is not None:
         return thumb
     raise KeyError(
-        f"frame {frame}: source master file not found/readable and no "
-        f"thumbnail stored in {scan_file}"
+        f"frame {frame}: source master file not found/readable"
+        + (
+            f" and no thumbnail stored in {scan_file}"
+            if allow_thumbnail else
+            "; thumbnail fallback disabled for strict raw loading"
+        )
     )
 
 
@@ -405,21 +490,56 @@ class Scan:
 
     Thin sugar over the module-level ``get_*`` functions so notebook code
     can read ``scan.get_1d(3)`` instead of repeating the path.  Holds no
-    open file handle and caches nothing heavy — every call re-reads from
-    disk (cheap, single-frame slices).
+    open file handle and caches only lightweight metadata; image and
+    integration slices are always read on demand.
     """
 
     def __init__(self, scan_file: str | Path, *, entry: str = "entry"):
         self.path = Path(scan_file)
         self.entry = entry
+        self._metadata_cache: dict | None = None
+        self._scan_data_cache: dict[str, np.ndarray] | None = None
 
     @property
     def frames(self) -> np.ndarray:
-        return get_frames(self.path, entry=self.entry)
+        return get_frames(self.path, entry=self.entry, union=True)
+
+    @property
+    def frame_indices(self) -> list[int]:
+        return [int(frame) for frame in self.frames]
 
     @property
     def metadata(self) -> dict:
-        return get_metadata(self.path, entry=self.entry)
+        if self._metadata_cache is None:
+            self._metadata_cache = get_metadata(self.path, entry=self.entry)
+        return self._metadata_cache
+
+    @property
+    def scan_data(self) -> dict[str, np.ndarray]:
+        if self._scan_data_cache is None:
+            self._scan_data_cache = _scan_data_for_frames(
+                self.path, self.frame_indices, entry=self.entry,
+            )
+        return self._scan_data_cache
+
+    @property
+    def energy(self) -> float | None:
+        return self.energy_keV
+
+    @property
+    def energy_keV(self) -> float | None:
+        return self.metadata.get("energy_keV")
+
+    @property
+    def energy_eV(self) -> float | None:
+        energy = self.energy_keV
+        return None if energy is None else float(energy) * 1000.0
+
+    def refresh_metadata(self) -> dict:
+        """Discard the lightweight cache and read the latest file metadata."""
+        self._metadata_cache = None
+        self._scan_data_cache = None
+        return self.metadata
 
     def get_1d(self, frame=None) -> Integrated1D:
         return get_1d(self.path, frame, entry=self.entry)
@@ -429,6 +549,21 @@ class Scan:
 
     def get_thumbnail(self, frame: int) -> np.ndarray:
         return get_thumbnail(self.path, frame, entry=self.entry)
+
+    def load_frame(self, index: int) -> np.ndarray:
+        """Load one raw detector frame through its stored source pointer."""
+        return get_raw_frame(
+            self.path, int(index), entry=self.entry, allow_thumbnail=False,
+        )
+
+    def iter_chunks(self, chunk_size: int):
+        """Yield bounded raw-image chunks for RSM and other streaming consumers."""
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
+        indices = self.frame_indices
+        for start in range(0, len(indices), chunk_size):
+            chunk_indices = indices[start:start + chunk_size]
+            yield np.stack([self.load_frame(idx) for idx in chunk_indices]), chunk_indices
 
     def __len__(self) -> int:
         try:

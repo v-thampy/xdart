@@ -70,8 +70,11 @@ gui = [
 # them a working notebook out of the box.
 notebook = ["ipykernel", "jupyterlab"]
 
-# napari-based 3D viewer for RSM volumes.
-napari = ["napari"]
+# napari-based 3D viewer for RSM volumes.  The napari dependency is
+# intentionally NOT declared yet — the viewer (gui/napari_viewer.py) is a
+# stub and nothing imports napari.  Re-add ``napari = ["napari"]`` here (and
+# put it back into ``all`` and environment.yml) when the RSM 3D viewer is
+# actually wired up.
 
 # Tiled client for streaming live data.
 tiled = ["tiled[client]"]
@@ -82,7 +85,7 @@ vtk = ["pyevtk"]
 
 # Convenience: install everything except dev.
 all = [
-    "ssrl_xrd_tools[fitting,rsm,gui,notebook,napari,tiled]",
+    "ssrl_xrd_tools[fitting,rsm,gui,notebook,tiled]",
 ]
 
 dev = [

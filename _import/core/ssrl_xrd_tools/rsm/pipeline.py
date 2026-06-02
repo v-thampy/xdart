@@ -289,10 +289,10 @@ class _FrameSeriesLike(Protocol):
 
 
 class _ScanLike(Protocol):
-    """Minimal LiveScan interface for RSM v2-scan processing."""
-    scan_data: Any                       # pandas.DataFrame
-    frames: _FrameSeriesLike
-    mg_args: dict[str, Any]
+    """Frame-source scan with motor metadata for RSM processing."""
+    @property
+    def frame_indices(self) -> list[int]: ...
+    def iter_chunks(self, chunk_size: int) -> Iterator[tuple[np.ndarray, list[int]]]: ...
 
 
 def _energy_from_scan(scan: _ScanLike) -> float:
@@ -301,13 +301,30 @@ def _energy_from_scan(scan: _ScanLike) -> float:
     ``scan.mg_args['wavelength']`` is in metres (pyFAI convention),
     so ``E = h c / λ`` simplifies to ``E_eV = 12398 / λ_Å``.
     """
-    wavelength_m = scan.mg_args.get("wavelength")
-    if not wavelength_m or wavelength_m <= 0:
-        raise ValueError(
-            "scan has no usable wavelength in mg_args; "
-            "pass energy= explicitly."
-        )
-    return 12398.0 / (float(wavelength_m) * 1e10)
+    mg_args = getattr(scan, "mg_args", {}) or {}
+    wavelength_m = mg_args.get("wavelength")
+    if wavelength_m and wavelength_m > 0:
+        return 12398.0 / (float(wavelength_m) * 1e10)
+    explicit_energy_eV = getattr(scan, "energy_eV", None)
+    if explicit_energy_eV is not None and np.isfinite(explicit_energy_eV):
+        return float(explicit_energy_eV)
+    explicit_energy_keV = getattr(scan, "energy_keV", None)
+    if explicit_energy_keV is not None and np.isfinite(explicit_energy_keV):
+        return float(explicit_energy_keV) * 1000.0
+    metadata = getattr(scan, "metadata", {}) or {}
+    if isinstance(metadata, dict):
+        energy_eV = metadata.get("energy_eV")
+        if energy_eV is not None and np.isfinite(energy_eV):
+            return float(energy_eV)
+        energy_keV = metadata.get("energy_keV")
+        if energy_keV is not None and np.isfinite(energy_keV):
+            return float(energy_keV) * 1000.0
+    explicit_energy = getattr(scan, "energy", None)
+    if explicit_energy is not None and np.isfinite(explicit_energy):
+        return float(explicit_energy) * 1000.0  # legacy Scan.energy is keV
+    raise ValueError(
+        "scan has no usable wavelength or energy metadata; pass energy= explicitly."
+    )
 
 
 def _angles_for_indices(
@@ -321,7 +338,18 @@ def _angles_for_indices(
     each of length ``len(indices)`` (or len(scan_data) if indices is None).
     Raises :class:`KeyError` if any motor is missing from the DataFrame.
     """
-    cols = list(scan.scan_data.columns)
+    scan_data = getattr(scan, "scan_data", None)
+    if scan_data is None:
+        metadata = getattr(scan, "metadata", {}) or {}
+        if isinstance(metadata, dict):
+            scan_data = metadata.get("scan_data")
+    if scan_data is None:
+        motors = getattr(scan, "motors", None)
+        if motors:
+            scan_data = motors
+    if scan_data is None:
+        raise ValueError("scan has no per-frame motor metadata")
+    cols = list(scan_data.columns) if hasattr(scan_data, "columns") else list(scan_data)
     missing = [m for m in diff_motors if m not in cols]
     if missing:
         raise KeyError(
@@ -329,11 +357,19 @@ def _angles_for_indices(
         )
     if indices is None:
         return [
-            np.asarray(scan.scan_data[m].values, dtype=float)
+            np.asarray(getattr(scan_data[m], "values", scan_data[m]), dtype=float)
             for m in diff_motors
         ]
+    if hasattr(scan_data, "loc"):
+        return [
+            np.asarray(scan_data.loc[indices, m].values, dtype=float)
+            for m in diff_motors
+        ]
+    labels = [int(idx) for idx in getattr(scan, "frame_indices")]
+    row_of = {label: row for row, label in enumerate(labels)}
+    rows = [row_of[int(idx)] for idx in indices]
     return [
-        np.asarray(scan.scan_data.loc[indices, m].values, dtype=float)
+        np.asarray(scan_data[m], dtype=float)[rows]
         for m in diff_motors
     ]
 
@@ -361,7 +397,15 @@ def _iter_scan_chunks(
     3. **The stacked chunk is a copy** (``np.stack`` allocates fresh
        output), so it survives the per-frame clearing.
     """
-    indices = list(scan.frames.index)
+    source_iter = getattr(scan, "iter_chunks", None)
+    if callable(source_iter):
+        yield from source_iter(chunk_size)
+        return
+
+    indices = getattr(scan, "frame_indices", None)
+    if indices is None:
+        indices = scan.frames.index
+    indices = list(indices)
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
 
@@ -410,21 +454,19 @@ def process_scan_from_nexus(
     static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
 ) -> RSMVolume:
-    """Stream-process a v2 :class:`LiveScan` into an :class:`RSMVolume`.
+    """Stream-process a frame-source scan into an :class:`RSMVolume`.
 
     Reads per-frame motor positions from ``scan.scan_data``, energy
     from ``scan.mg_args['wavelength']`` (unless ``energy=`` is given),
-    and raw images one chunk at a time via ``frame._lazy_load_raw``.
+    and raw images one chunk at a time via ``scan.iter_chunks``.
     All frames flow through a single :class:`StreamingGridder` so peak
     memory is bounded by ``chunk_size`` regardless of total frame count.
 
     Parameters
     ----------
-    scan : LiveScan (duck-typed)
-        Must expose ``scan_data`` (pandas DataFrame indexed by frame IDs),
-        ``frames`` (indexable by frame ID, yielding objects with
-        ``map_raw`` + ``_lazy_load_raw``), and ``mg_args`` (dict with
-        ``wavelength`` in metres).
+    scan : FrameSource scan (duck-typed)
+        Must expose chunk iteration plus per-frame motor metadata. xdart
+        ``LiveScan`` and ``io.read.Scan`` both satisfy this boundary.
     mapper : PixelQMap
         Diffractometer convention + detector header.
     diff_motors : sequence of str
