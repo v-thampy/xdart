@@ -54,6 +54,9 @@ __all__ = [
     "ResultsView",
     "DisplayState",
     "DisplayPayload",
+    "RenderPlan",
+    "build_payload",
+    "render_plan",
     "register_controller",
     "controller_for",
     "resolve_selection",
@@ -524,3 +527,77 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
         layout=layout,
         results=None,
     )
+
+
+# ── Stage 3: payload assembly + render plan (the testable render core) ─
+
+# The panel roles the integration renderer manages.  render iterates these,
+# drawing the ones the state wants and clearing the rest — so a role left
+# over from a previous mode/selection is always blanked (kills mode-switch
+# staleness), without render branching on mode.
+_RENDER_ROLES = (PanelRole.PLOT_1D, PanelRole.RAW_2D, PanelRole.CAKE_2D)
+
+
+def build_payload(state, store=None):
+    """Resolve the arrays/traces for ``state`` into a :class:`DisplayPayload`.
+
+    Pure and Qt-free.  Stamped with ``state.generation`` so render can drop
+    a payload that no longer matches the state (the §8 generation
+    invariant).  Arrays are resolved from ``store`` ONLY for panels that are
+    present, ``has_data`` and ``READY``; everything else is ``None`` (blank).
+
+    ``store`` is the source adapter (``raw_image(state)`` /
+    ``cake_image(state)`` / ``plot_payload(state)``).  When ``store`` is
+    ``None`` the payload resolves nothing — the renderer then delegates the
+    pixel push to its legacy draw methods.  This is the Stage 3 default; the
+    real store (and direct payload rendering) arrives with the controllers
+    in Stage 4–5.  Tests pass a fake store to exercise the gating here.
+    """
+    raw = cake = plot = None
+    if store is not None and state.load_status is LoadStatus.READY:
+        rp = state.panel(PanelRole.RAW_2D)
+        if rp is not None and rp.has_data:
+            raw = store.raw_image(state)
+        cp = state.panel(PanelRole.CAKE_2D)
+        if cp is not None and cp.has_data:
+            cake = store.cake_image(state)
+        pp = state.panel(PanelRole.PLOT_1D)
+        if pp is not None and pp.has_data:
+            plot = store.plot_payload(state)
+    return DisplayPayload(generation=state.generation, raw_image=raw,
+                          cake_image=cake, plot=plot)
+
+
+@dataclass(frozen=True)
+class RenderPlan:
+    """The pure decision render executes: drop a stale payload, blank
+    intentionally, and which panels to draw vs clear.  Same (state, payload)
+    ⇒ same plan — this is what makes render testable without Qt."""
+    drop: bool                       # generation mismatch ⇒ render nothing
+    error_message: "str | None"      # surfaced when load_status is ERROR
+    title: str
+    draw: tuple                      # roles to draw (present, has_data, READY)
+    clear: tuple                     # roles to blank (absent / no data / EMPTY / ERROR)
+
+
+def render_plan(state, payload):
+    """Decide what render should do for ``(state, payload)``.
+
+    A payload whose generation no longer matches the state is dropped
+    (``drop=True``).  In EMPTY/ERROR every managed panel is cleared (blank is
+    intentional, §8).  Otherwise a panel is drawn iff it is present in the
+    state with ``has_data``; the rest are cleared.
+    """
+    if payload is not None and payload.generation != state.generation:
+        return RenderPlan(drop=True, error_message=None, title=state.title,
+                          draw=(), clear=())
+    ready = state.load_status is LoadStatus.READY
+    draw, clear = [], []
+    for role in _RENDER_ROLES:
+        plan = state.panel(role)
+        if ready and plan is not None and plan.has_data:
+            draw.append(role)
+        else:
+            clear.append(role)
+    return RenderPlan(drop=False, error_message=state.error_message,
+                      title=state.title, draw=tuple(draw), clear=tuple(clear))

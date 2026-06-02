@@ -445,6 +445,77 @@ def test_display_generation_bumps_on_mode_switch_and_selection():
     assert host.display_generation == 3
 
 
+def _render_host():
+    """A host that records which draw/clear delegates render_display calls."""
+    from unittest.mock import MagicMock
+    from xdart.gui.tabs.static_scan import display_logic as dl
+
+    calls = []
+    def rec(name):
+        return lambda *a, **k: calls.append(name)
+
+    host = SimpleNamespace(
+        ui=MagicMock(),
+        plot=MagicMock(),
+        binned_widget=MagicMock(),
+        update_image=rec("draw_image"),
+        update_binned=rec("draw_binned"),
+        update_plot=rec("draw_plot"),
+        _update_image_viewer=rec("draw_viewer_image"),
+        _update_xye_viewer=rec("draw_viewer_xye"),
+        clear_image_view=rec("clear_image"),
+        clear_binned_view=rec("clear_binned"),
+        clear_plot_view=rec("clear_plot"),
+        _apply_1d_only_visibility=rec("apply_1d_only"),
+        update_2d_label=rec("label_2d"),
+        _update_image_preview=rec("preview"),
+    )
+    host.ui.shareAxis.isChecked.return_value = False
+    host.ui.imageUnit.currentIndex.return_value = 0
+    for name in ("_draw_delegate", "_clear_delegate", "render_display"):
+        setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
+    return host, calls, dl
+
+
+def test_render_display_int2d_draws_all_panels():
+    host, calls, dl = _render_host()
+    state = dl.compute_display_state(
+        mode=dl.Mode.INT_2D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys={0}, loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
+        method='Single', unit_changed=False, prev_overlaid_ids=(),
+        raw_availability={0: dict(has_raw=True)}, titles={}, generation=1)
+    host.render_display(state, dl.build_payload(state))
+    assert "draw_plot" in calls and "draw_image" in calls and "draw_binned" in calls
+    assert "label_2d" in calls and "preview" in calls
+    assert not any(c.startswith("clear_") for c in calls)
+
+
+def test_render_display_image_viewer_draws_raw_clears_others():
+    host, calls, dl = _render_host()
+    state = dl.compute_display_state(
+        mode=dl.Mode.IMAGE_VIEWER, selected_ids=(0,), all_frame_index=[],
+        loaded_1d_keys=set(), loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
+        method='Single', unit_changed=False, prev_overlaid_ids=(),
+        raw_availability={0: dict(has_raw=True)}, titles={}, generation=1)
+    host.render_display(state, dl.build_payload(state))
+    assert "draw_viewer_image" in calls         # RAW_2D via the viewer method
+    assert "clear_binned" in calls and "clear_plot" in calls  # absent panels blanked
+    assert "label_2d" not in calls              # viewer sets its own title
+    assert "draw_image" not in calls
+
+
+def test_render_display_drops_stale_generation():
+    host, calls, dl = _render_host()
+    state = dl.compute_display_state(
+        mode=dl.Mode.INT_2D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys={0}, loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
+        method='Single', unit_changed=False, prev_overlaid_ids=(),
+        raw_availability={0: dict(has_raw=True)}, titles={}, generation=7)
+    stale = dl.DisplayPayload(generation=6, raw_image=None, cake_image=None, plot=None)
+    host.render_display(state, stale)
+    assert calls == []                           # nothing drawn or cleared
+
+
 def test_shadow_display_state_check_agrees_and_never_raises(caplog):
     # Stage 2 shadow mode: building a DisplayState from live inputs must
     # agree with the existing render path's idxs and never raise into the
@@ -468,9 +539,8 @@ def test_shadow_display_state_check_agrees_and_never_raises(caplog):
                              frames=SimpleNamespace(index=[0, 1]), gi=False),
         ui=SimpleNamespace(plotMethod=SimpleNamespace(currentText=lambda: 'Single')),
     )
-    host._shadow_mode = MethodType(displayFrameWidget._shadow_mode, host)
-    host._shadow_check_display_state = MethodType(
-        displayFrameWidget._shadow_check_display_state, host)
+    for name in ('_live_mode', '_live_display_state', '_shadow_check_display_state'):
+        setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
 
     logger_name = 'xdart.gui.tabs.static_scan.display_frame_widget'
     with caplog.at_level(logging.DEBUG, logger=logger_name):

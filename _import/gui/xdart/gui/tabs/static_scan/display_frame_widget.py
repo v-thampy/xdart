@@ -49,7 +49,8 @@ from .display_constants import (
 from .display_data import DisplayDataMixin
 from .display_plot import DisplayPlotMixin
 from .display_logic import (
-    Mode, LoadStatus, compute_display_state,
+    Mode, LoadStatus, PanelRole, compute_display_state,
+    build_payload, render_plan,
     resolve_selection, resolve_render_ids,
 )
 
@@ -457,72 +458,79 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self._bump_display_generation()
             self._last_selection_sig = sig
 
-    def _shadow_mode(self):
-        """Map the widget's viewer state to a :class:`Mode` for the shadow
-        check.  Normal mode is represented as INT_1D (the 1D plot is the
-        primary panel; render_ids then compares against idxs_1d)."""
+    def _live_mode(self):
+        """Map the widget's viewer state to a :class:`Mode`.  Normal mode is
+        INT_1D when the scan is 1D-only (skip_2d) — plot-only, matching
+        _apply_1d_only_visibility — else INT_2D (raw|cake / plot)."""
         if self.viewer_mode == 'image':
             return Mode.IMAGE_VIEWER
         if self.viewer_mode == 'xye':
             return Mode.XYE_VIEWER
-        return Mode.INT_1D
+        if getattr(self.scan, 'skip_2d', False):
+            return Mode.INT_1D
+        return Mode.INT_2D
 
-    def _shadow_check_display_state(self):
-        """Stage 2 shadow mode: build a :class:`DisplayState` from the live
-        widget inputs and confirm its decisions match what the existing
-        render path computed (the *corrected* intended behaviour).  Nothing
-        is rendered from it here — Stage 3 renders from the state.
+    def _live_display_state(self):
+        """Build the :class:`DisplayState` for the current widget inputs.
 
-        Debug-only and crash-proof: it runs only when DEBUG logging is on
-        and never raises into a user session (a mismatch or any error is
-        logged, not thrown).  These asserts are temporary — Stage 3
-        replaces the old path with ``render(state, build_payload(...))``."""
+        The single place the GUI snapshots its state for the display layer.
+        Viewer-mode states never consult scan.frames or the integration unit
+        (§8); only scan modes read the scan frame index.  ``plot_unit`` only
+        sets x_label here — the live x-axis still flows through the legacy
+        plot path (Stage 4 routes it through the state)."""
+        mode = self._live_mode()
+        if mode in (Mode.INT_1D, Mode.INT_2D):
+            with self.scan.scan_lock:
+                all_index = list(np.asarray(self.scan.frames.index, dtype=int))
+            gi = bool(getattr(self.scan, 'gi', False))
+        else:
+            all_index = []
+            gi = False
+        with self.data_lock:
+            loaded_1d = set(self.data_1d.keys())
+            loaded_2d = set(self.data_2d.keys())
+            raw_avail = {
+                int(k): {
+                    'has_raw': v.get('map_raw') is not None,
+                    'has_thumbnail': v.get('thumbnail') is not None,
+                }
+                for k, v in self.data_2d.items()
+                if isinstance(v, dict)
+            }
+        return compute_display_state(
+            mode=mode,
+            selected_ids=list(self.frame_ids),
+            all_frame_index=all_index,
+            loaded_1d_keys=loaded_1d,
+            loaded_2d_keys=loaded_2d,
+            gi=gi,
+            plot_unit='q_A^-1',          # affects only x_label, not render_ids
+            method=self.ui.plotMethod.currentText(),
+            unit_changed=False,
+            prev_overlaid_ids=tuple(self.overlaid_idxs),
+            raw_availability=raw_avail,
+            titles={},
+            generation=self.display_generation,
+        )
+
+    def _shadow_check_display_state(self, state=None):
+        """Debug-only cross-check: confirm the DisplayState's render_ids
+        match what the legacy path computed (self.idxs_*).  Runs only when
+        DEBUG logging is on and never raises into a session (logged, not
+        thrown).  Temporary — drops out when the legacy idxs paths go in a
+        later stage."""
         if not logger.isEnabledFor(logging.DEBUG):
             return
         try:
-            mode = self._shadow_mode()
-            # Viewer-mode states must not depend on scan.frames (§8); only
-            # scan modes consult the scan frame index.
-            if mode in (Mode.INT_1D, Mode.INT_2D):
-                with self.scan.scan_lock:
-                    all_index = list(np.asarray(self.scan.frames.index, dtype=int))
-                gi = bool(getattr(self.scan, 'gi', False))
-            else:
-                all_index = []
-                gi = False
-            with self.data_lock:
-                loaded_1d = set(self.data_1d.keys())
-                loaded_2d = set(self.data_2d.keys())
-                raw_avail = {
-                    int(k): {
-                        'has_raw': v.get('map_raw') is not None,
-                        'has_thumbnail': v.get('thumbnail') is not None,
-                    }
-                    for k, v in self.data_2d.items()
-                    if isinstance(v, dict)
-                }
-            state = compute_display_state(
-                mode=mode,
-                selected_ids=list(self.frame_ids),
-                all_frame_index=all_index,
-                loaded_1d_keys=loaded_1d,
-                loaded_2d_keys=loaded_2d,
-                gi=gi,
-                plot_unit='q_A^-1',          # affects only x_label, not render_ids
-                method=self.ui.plotMethod.currentText(),
-                unit_changed=False,
-                prev_overlaid_ids=tuple(self.overlaid_idxs),
-                raw_availability=raw_avail,
-                titles={},
-                generation=self.display_generation,
-            )
+            if state is None:
+                state = self._live_display_state()
             expected = (sorted(self.idxs_2d)
-                        if mode in (Mode.INT_2D, Mode.IMAGE_VIEWER)
+                        if state.mode in (Mode.INT_2D, Mode.IMAGE_VIEWER)
                         else sorted(self.idxs_1d))
             if list(state.render_ids) != expected:
                 logger.debug(
                     "shadow: render_ids %s != live idxs %s (mode=%s, status=%s)",
-                    state.render_ids, expected, mode, state.load_status,
+                    state.render_ids, expected, state.mode, state.load_status,
                 )
         except Exception:
             logger.debug("shadow display-state check failed", exc_info=True)
@@ -554,63 +562,108 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return True
 
     def update(self):
-        """Updates image and plot frames based on toolbar options
+        """Updates image and plot frames based on toolbar options.
+
+        Stage 3: the per-mode dispatch is gone.  We compute one
+        :class:`DisplayState`, build its payload, and hand both to
+        :meth:`render`, which lays panels out by the state's layout and
+        draws-or-clears each — no ``if viewer_mode == ...`` here.
         """
         self.get_idxs()
         self._note_selection_generation()   # Stage 2: bump on selection change
-        self._shadow_check_display_state()   # Stage 2: shadow (debug-only, no render)
 
         if not self._updated():
             return True
 
-        # ── Viewer mode: simplified rendering ────────────────────────
-        if self.viewer_mode == 'image':
-            try:
-                self._update_image_viewer()
-            except Exception:
-                logger.debug('Image viewer update failed', exc_info=True)
+        state = self._live_display_state()
+        self._shadow_check_display_state(state)  # debug-only cross-check
+        payload = build_payload(state)           # Stage 3: store=None ⇒ delegate draws
+        return self.render_display(state, payload)
+
+    # ── Render (Stage 3) ──────────────────────────────────────────────
+
+    # Per-role draw delegates: render owns the *decision* (what to draw vs
+    # clear, gen-drop, blanking); the legacy methods own the pixel push.
+    # RAW_2D / PLOT_1D differ by mode (viewer vs normal); CAKE_2D is normal
+    # only.  These collapse into mode controllers in Stage 5.
+    def _draw_delegate(self, role, mode):
+        if role is PanelRole.RAW_2D:
+            return (self._update_image_viewer if mode is Mode.IMAGE_VIEWER
+                    else self.update_image)
+        if role is PanelRole.PLOT_1D:
+            return (self._update_xye_viewer if mode is Mode.XYE_VIEWER
+                    else self.update_plot)
+        if role is PanelRole.CAKE_2D:
+            return self.update_binned
+        return None
+
+    def _clear_delegate(self, role):
+        return {
+            PanelRole.RAW_2D: self.clear_image_view,
+            PanelRole.CAKE_2D: self.clear_binned_view,
+            PanelRole.PLOT_1D: self.clear_plot_view,
+        }.get(role)
+
+    def render_display(self, state, payload):
+        """Draw the display from ``state`` + ``payload``.  (Named
+        ``render_display`` to avoid shadowing ``QWidget.render``.)
+
+        Thin: it executes the pure :func:`render_plan` decision — drop a
+        stale-generation payload, then draw the panels the state wants and
+        clear the rest (so a panel left from a previous mode/selection is
+        always blanked, §8).  The pixel push is delegated to the legacy
+        draw/clear methods; the *decision* lives in render_plan.
+        """
+        plan = render_plan(state, payload)
+        if plan.drop:
+            # Payload computed against a superseded generation — never render
+            # it over the current state (§8 generation invariant).
+            logger.debug("render: dropping stale payload gen=%s vs state gen=%s",
+                         getattr(payload, 'generation', None), state.generation)
             return True
-        if self.viewer_mode == 'xye':
+
+        mode = state.mode
+
+        # Normal-mode input prep: Share-Axis link + 1D-only panel visibility.
+        if mode in (Mode.INT_1D, Mode.INT_2D):
+            if self.ui.shareAxis.isChecked() and (self.ui.imageUnit.currentIndex() < 2):
+                self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
+                self.ui.plotUnit.setEnabled(False)
+                self.plot.setXLink(self.binned_widget.image_plot)
+            else:
+                self.plot.setXLink(None)
+                self.ui.plotUnit.setEnabled(True)
+            self._apply_1d_only_visibility()
+
+        # Clear the panels this state does not want (kills stale content).
+        for role in plan.clear:
+            clear = self._clear_delegate(role)
+            if clear is not None:
+                clear()
+
+        # Draw the panels it does want.  Exception handling matches the
+        # legacy update(): normal-mode draws caught only TypeError (a
+        # missing-data frame) and let anything else propagate; the viewer
+        # draws were wrapped in a broad debug-logged guard.
+        is_viewer = mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER)
+        for role in plan.draw:
+            draw = self._draw_delegate(role, mode)
+            if draw is None:
+                continue
             try:
-                self._update_xye_viewer()
+                draw()
+            except TypeError:
+                return False
             except Exception:
-                logger.debug('XYE viewer update failed', exc_info=True)
-            return True
+                if not is_viewer:
+                    raise
+                logger.debug("render: viewer draw of %s failed", role, exc_info=True)
 
-        # ── Normal mode ──────────────────────────────────────────────
-        if self.ui.shareAxis.isChecked() and (self.ui.imageUnit.currentIndex() < 2):
-            self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
-            self.ui.plotUnit.setEnabled(False)
-            self.plot.setXLink(self.binned_widget.image_plot)
-        else:
-            self.plot.setXLink(None)
-            self.ui.plotUnit.setEnabled(True)
-
-        self._apply_1d_only_visibility()
-
-        try:
-            self.update_plot()
-        except TypeError:
-            return False
-
-        # 2D always updates now (the old "Update 2D" perf toggle is gone —
-        # 1D-only modes hide the 2D panel via _apply_1d_only_visibility, and
-        # the try/except guards a missing-2D-data frame).
-        try:
-            self.update_image()
-        except TypeError:
-            return False
-        try:
-            self.update_binned()
-        except TypeError:
-            return False
-
-        # Apply label to 2D view
-        self.update_2d_label()
-
-        # Update the image preview popup if it is open
-        self._update_image_preview()
-
+        # 2D title + image-preview popup (normal mode; viewer draw methods
+        # set their own title).  Delegated — behaviour-preserving.
+        if mode in (Mode.INT_1D, Mode.INT_2D):
+            self.update_2d_label()
+            self._update_image_preview()
         return True
 
     def update_views(self):

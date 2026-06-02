@@ -435,6 +435,92 @@ def test_controller_registry_register_and_lookup():
         dl._CONTROLLER_REGISTRY.pop(dl.Mode.INT_2D, None)  # don't leak across tests
 
 
+# ── Stage 3: build_payload + render_plan (the testable render core) ───
+
+class _FakeStore:
+    """Resolves every panel to a sentinel array/trace so build_payload's
+    gating (has_data + READY) is observable in a test."""
+    def raw_image(self, state):
+        return "RAW"
+    def cake_image(self, state):
+        return "CAKE"
+    def plot_payload(self, state):
+        return dl.PlotPayload(axis_x=dl.Axis("Q"), traces=())
+
+
+def test_build_payload_gates_on_has_data_and_stamps_generation():
+    # READY INT_2D with raw+cake+plot all present -> all resolved; generation
+    # stamped from the state.
+    state = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_2D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys={0}, loaded_2d_keys={0},
+        raw_availability={0: dict(has_raw=True)}, generation=5))
+    p = dl.build_payload(state, _FakeStore())
+    assert p.generation == 5
+    assert p.raw_image == "RAW" and p.cake_image == "CAKE"
+    assert isinstance(p.plot, dl.PlotPayload)
+
+    # A panel with has_data=False is not resolved (renders blank).
+    state_nodraw = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_2D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys={0}, loaded_2d_keys={0},
+        raw_availability={0: dict(has_raw=False, has_thumbnail=False)}))
+    p2 = dl.build_payload(state_nodraw, _FakeStore())
+    assert p2.raw_image is None              # RAW_2D has_data False -> blank
+    assert p2.cake_image == "CAKE"           # cake still has data
+
+
+def test_build_payload_blank_when_not_ready_or_no_store():
+    empty = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_2D, selected_ids=(), loaded_1d_keys=set(),
+        loaded_2d_keys=set()))
+    p = dl.build_payload(empty, _FakeStore())
+    assert (p.raw_image, p.cake_image, p.plot) == (None, None, None)
+    # No store -> nothing resolved (renderer delegates), generation still set.
+    ready = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_2D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys={0}, loaded_2d_keys={0},
+        raw_availability={0: dict(has_raw=True)}, generation=9))
+    p2 = dl.build_payload(ready)             # store=None
+    assert p2.generation == 9
+    assert (p2.raw_image, p2.cake_image, p2.plot) == (None, None, None)
+
+
+def test_render_plan_draws_present_clears_absent():
+    # INT_1D (plot-only): draw PLOT_1D, clear the two 2D panels that aren't
+    # in this state (kills stale panels from a previous mode).
+    state = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_1D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys={0}, loaded_2d_keys={0}))
+    plan = dl.render_plan(state, dl.build_payload(state))
+    assert plan.drop is False
+    assert plan.draw == (dl.PanelRole.PLOT_1D,)
+    assert set(plan.clear) == {dl.PanelRole.RAW_2D, dl.PanelRole.CAKE_2D}
+
+
+def test_render_plan_empty_and_error_clear_everything():
+    for kw in (dict(selected_ids=(), loaded_1d_keys=set()),
+               dict(raw_availability={'__error__': 'boom'})):
+        state = dl.compute_display_state(**_base_state_kwargs(mode=dl.Mode.INT_2D, **kw))
+        plan = dl.render_plan(state, dl.build_payload(state))
+        assert plan.draw == ()
+        assert set(plan.clear) == {dl.PanelRole.RAW_2D, dl.PanelRole.CAKE_2D, dl.PanelRole.PLOT_1D}
+    assert plan.error_message == 'boom'   # last loop (ERROR) surfaces the message
+
+
+def test_render_plan_drops_stale_generation_payload():
+    # §8: a payload whose generation no longer matches the state is dropped
+    # (a worker result computed before a mode switch must never render).
+    state = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_2D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys={0}, loaded_2d_keys={0}, generation=7))
+    stale = dl.DisplayPayload(generation=6, raw_image=None, cake_image=None, plot=None)
+    plan = dl.render_plan(state, stale)
+    assert plan.drop is True
+    fresh = dl.build_payload(state)          # generation 7
+    assert dl.render_plan(state, fresh).drop is False
+
+
 # ── §6/§9 guardrail: display_logic stays pure (no Qt/pyqtgraph/h5py/pyFAI) ──
 
 def test_display_logic_imports_no_heavy_deps():
