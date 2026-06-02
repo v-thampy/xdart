@@ -942,10 +942,19 @@ class imageWrangler(wranglerWidget):
                 if file_found or (not self.include_subdir):
                     break
 
-        if (((self.img_file != old_fname) or (self.img_file and (len(self.scan_parameters) < 1)))
-                and self.meta_ext):
-            if self.exists_meta_file(self.img_file):
+        if ((self.img_file != old_fname)
+                or (self.img_file and (len(self.scan_parameters) < 1))):
+            if (self.meta_ext and self.img_file
+                    and self.exists_meta_file(self.img_file)):
                 self.set_pars_from_meta()
+            elif self.img_file:
+                # New signal file with no sidecar metadata (e.g. Eiger):
+                # clear the previous file's stale motor/parameter options and
+                # default the GI Theta Motor to Manual (no 'th' to read), so
+                # the incidence angle can be entered directly.
+                self.scan_parameters = []
+                self.motors = []
+                self.set_gi_motor_options()
 
     def set_series_average(self):
         self.series_average = self.parameters.child('Signal').child('series_average').value()
