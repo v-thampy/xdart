@@ -434,7 +434,15 @@ class DisplayDataMixin:
             return np.array([]), np.array([])
         radial = np.asarray(int_2d.radial, dtype=float)
         azimuthal = int_2d.azimuthal
-        if getattr(self.scan, 'gi', False):
+        # Return GI reciprocal-space axes verbatim — no Q↔2θ conversion.
+        # Honour the result's *units* (not just the live ``scan.gi`` flag):
+        # a reloaded qip/qoop cake whose scan.gi wasn't restored would
+        # otherwise be run through the q→2θ arcsin path (out-of-range qip →
+        # collapsed/blank cake).  See display_logic.is_gi_2d_units.
+        from .display_logic import is_gi_2d_units
+        if getattr(self.scan, 'gi', False) or is_gi_2d_units(
+                getattr(int_2d, 'unit', ''),
+                getattr(int_2d, 'azimuthal_unit', '')):
             return radial, azimuthal
 
         from .display_constants import AA_inv, Th

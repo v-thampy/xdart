@@ -339,6 +339,39 @@ def x_axis_for_unit(unit):
     return _X_AXIS_TABLE.get(unit, ('x', ''))
 
 
+def two_d_kind_from_units(unit, azimuthal_unit):
+    """Classify a 2D integration result's axis identity from its unit strings.
+
+    The qip/qoop (and exit-angle) GI axis identity is persisted in the
+    NeXus file only via the ``q``/``chi`` dataset ``units`` attrs (e.g.
+    ``qip_A^-1`` / ``qoop_A^-1``).  When a saved scan is reloaded and the
+    GUI's ``scan.gi`` flag wasn't restored, the display would otherwise
+    treat a qip/qoop map as a standard q/χ cake — and, worse, run the qip
+    axis through the q→2θ conversion (arcsin of out-of-range values →
+    collapsed/blank cake).  Reconstructing the kind from the units lets
+    qip/qoop round-trip through the display.  This is the minimal version
+    of the ``TwoDKind`` seam from the data-source unification plan.
+
+    Returns one of ``'qip_qoop'``, ``'exit_angles'``, or ``'standard'``
+    (q/χ, the back-compatible default — GI polar q/χ is indistinguishable
+    from a standard cake by units alone and is treated as standard here).
+    """
+    u = str(unit or "").lower()
+    au = str(azimuthal_unit or "").lower()
+    if "qip" in u or "qip" in au or "qoop" in u or "qoop" in au:
+        return "qip_qoop"
+    if "exit" in u or "exit" in au:
+        return "exit_angles"
+    return "standard"
+
+
+def is_gi_2d_units(unit, azimuthal_unit):
+    """True if the 2D result's units mark it as a GI reciprocal-space map
+    whose axes must be displayed verbatim (no Q↔2θ conversion).  See
+    :func:`two_d_kind_from_units`."""
+    return two_d_kind_from_units(unit, azimuthal_unit) != "standard"
+
+
 def xye_unit_from_filename(name):
     """``'iq'``/``'iq_'`` → ``'q_A^-1'``; ``'itth'``/``'itth_'`` →
     ``'2th_deg'``; otherwise ``'unknown'`` (no assumption — an unknown
