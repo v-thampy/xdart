@@ -1403,3 +1403,19 @@ def test_scan_data_survives_save_then_load_from_h5(tmp_path):
         scan_data["th"].values, rtol=1e-4)
     # A pure (non-geometry) motor must survive too.
     assert "i0" in sd.columns
+
+
+def test_numeric_scan_info_drops_non_numeric_keeps_motors():
+    """Regression: a non-numeric metadata field (comment/name/date) must not
+    blank scan_data.  _numeric_scan_info keeps numeric motors (incl. the GI
+    'th' incidence motor) and drops only the non-coercible fields, instead of
+    pd.Series(dtype='float64') failing wholesale."""
+    from xdart.modules.ewald.scan import _numeric_scan_info
+    info = {"th": 0.2, "i0": 1.0e6, "tth": 12.5,
+            "UserComment": "hello", "date": "2026-03-27", "scan": "Combi4"}
+    out = _numeric_scan_info(info)
+    assert out == {"th": 0.2, "i0": 1.0e6, "tth": 12.5}
+    # numeric strings still coerce (SPEC metas often store numbers as text)
+    assert _numeric_scan_info({"th": "0.30"}) == {"th": 0.30}
+    # all-numeric input is unchanged (the historical working case)
+    assert _numeric_scan_info({"th": 0.1, "i0": 5.0}) == {"th": 0.1, "i0": 5.0}
