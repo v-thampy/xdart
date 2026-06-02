@@ -23,7 +23,14 @@ Populated across the staged refactor:
 
 Guardrail: this module must import **no** Qt, pyqtgraph, h5py or pyFAI.
 ``from __future__ import annotations`` keeps the numpy type hints as plain
-strings so we need not import numpy at module load either.
+strings (numpy itself is the only heavy import the purity guard allows).
+
+§10 seam 6: this core stays module-agnostic (selection, overlay, axes,
+sentinel, generation, the panel/trace shapes, the controller registry).
+Future modules add their OWN pure-logic modules — ``stitch_logic.py``,
+``fit_logic.py`` — that contribute ``DisplayState``/``PlotPayload``
+fragments and carry their own headless tests; this core never imports
+them.
 """
 
 from __future__ import annotations
@@ -38,9 +45,16 @@ __all__ = [
     "RawSource",
     "OverlayAction",
     "LoadStatus",
+    "PanelRole",
     "PanelPlan",
+    "Axis",
+    "Trace",
+    "PlotPayload",
+    "ResultsView",
     "DisplayState",
     "DisplayPayload",
+    "register_controller",
+    "controller_for",
     "resolve_selection",
     "resolve_render_ids",
     "choose_raw_source",
@@ -64,6 +78,21 @@ class Mode(Enum):
     XYE_VIEWER = "xye_viewer"
 
 
+class PanelRole(Enum):
+    """Identifies a render panel.  ``render`` iterates ``DisplayState.panels``
+    and dispatches each role to a registered widget, so a module can add a
+    new role without editing core render/compute logic (§10 seam 1).
+
+    Used by the integration view today; the rest are reserved so the
+    stitching/fitting modules plug in later without reshaping the core."""
+    RAW_2D = "raw_2d"            # full/thumbnail detector image
+    CAKE_2D = "cake_2d"          # 2D integrated (cake) image
+    PLOT_1D = "plot_1d"          # 1D pattern(s)
+    RESIDUAL_1D = "residual_1d"  # reserved: fitting residual trace panel
+    STITCH_2D = "stitch_2d"      # reserved: stitched 2D image
+    RESULTS = "results"          # reserved: tables/scalars (non-array)
+
+
 class RawSource(Enum):
     RAW = "raw"              # full-res detector array; detector mask applies
     THUMBNAIL = "thumbnail"  # mask already baked in; do NOT re-apply flat mask
@@ -83,7 +112,7 @@ class LoadStatus(Enum):
     ERROR = "error"      # load failed — blank + error_message, never half-populated
 
 
-# ── Data shapes (§4 of the plan) ──────────────────────────────────────
+# ── Data shapes (§4 + §10 of the plan) ────────────────────────────────
 
 @dataclass(frozen=True)
 class PanelPlan:
@@ -91,6 +120,44 @@ class PanelPlan:
     has_data: bool                       # False ⇒ render() clears this panel
     source: RawSource = RawSource.NONE   # 2D-raw panel only
     apply_mask: bool = False             # 2D-raw panel only
+
+
+@dataclass(frozen=True)
+class Axis:
+    """One plot/image axis.  Replaces the loose ``(label, unit)`` string
+    pair everywhere (§10 seam 2)."""
+    label: str
+    unit: str = ""
+    log: bool = False
+
+
+@dataclass(frozen=True)
+class Trace:
+    """One named curve on a 1D plot.  Integration/overlay emits
+    ``kind="data"`` today; fitting later layers ``fit`` / ``component`` /
+    ``background`` / ``residual`` traces onto the same payload with zero
+    change to ``render`` (§10 seam 2)."""
+    label: str
+    x: "np.ndarray"
+    y: "np.ndarray"
+    kind: str = "data"   # data | fit | component | background | residual
+
+
+@dataclass(frozen=True)
+class PlotPayload:
+    """Resolved content of a 1D plot panel: an x-axis plus layered traces."""
+    axis_x: Axis
+    traces: tuple = ()   # tuple[Trace, ...]
+
+
+@dataclass(frozen=True)
+class ResultsView:
+    """Stub for non-array results (fit parameters, CIs, tables) routed to a
+    results widget via the ``DisplayState.results`` channel (§10 seam 5).
+
+    Reserved only — nothing populates it in this refactor; every current
+    mode leaves ``DisplayState.results`` as ``None``."""
+    rows: tuple = ()     # tuple[tuple, ...] — table rows, when implemented
 
 
 @dataclass(frozen=True)
@@ -109,22 +176,59 @@ class DisplayState:
     overlay: OverlayAction
     overlaid_ids: tuple
     title: str
-    raw_panel: PanelPlan
-    cake_panel: PanelPlan
-    plot_panel: PanelPlan
+    # §10 seam 1: panels are a keyed collection, not three named fields.
+    # render iterates these and dispatches each role to a registered widget.
+    panels: tuple = ()               # tuple[tuple[PanelRole, PanelPlan], ...]
+    # §10 seam 5: non-array results channel; None for every current mode.
+    results: "ResultsView | None" = None
+
+    def panel(self, role):
+        """Return the :class:`PanelPlan` for ``role``, or ``None`` if this
+        state has no panel of that role."""
+        for r, plan in self.panels:
+            if r is role:
+                return plan
+        return None
 
 
 @dataclass(frozen=True)
 class DisplayPayload:
-    """Resolved arrays for one :class:`DisplayState` (assembled from the
-    DataStore).  Kept separate so :func:`compute_display_state` stays
+    """Resolved arrays/traces for one :class:`DisplayState` (assembled from
+    the DataStore).  Kept separate so :func:`compute_display_state` stays
     pure/cheap and array assembly is tested on its own.  ``None`` ⇒ that
-    panel renders blank."""
+    panel renders blank.
+
+    §10 seam 4: payloads are **source-agnostic** — they carry no provenance
+    field.  ``render``/``build_payload`` must not branch on whether the data
+    came from integration, stitch or a reload; only the controller that
+    produced it knew, and it is gone by the time we render."""
     generation: int                 # must match the DisplayState it pairs with
     raw_image: "np.ndarray | None"
     cake_image: "np.ndarray | None"
-    plot_x: "np.ndarray | None"
-    plot_y: "np.ndarray | None"     # 2D (rows × x) for overlay/waterfall
+    plot: "PlotPayload | None"      # 1D traces (§10 seam 2)
+
+
+# ── Controller registry (§10 seam 3) ──────────────────────────────────
+#
+# Open Mode -> controller map that modules register into, instead of a
+# closed switch in the core.  The core registers the scan/image/xye
+# controllers (Stage 5); stitch/fit modules register their own later, so
+# adding Mode.STITCH_2D / Mode.FIT never touches the dispatch core.  Only
+# the hook exists now — no controllers are implemented in this refactor.
+
+_CONTROLLER_REGISTRY = {}   # dict[Mode, controller]
+
+
+def register_controller(mode, ctrl):
+    """Register the controller that owns ``mode``'s selection rules and
+    loading lifecycle.  Idempotent overwrite by mode."""
+    _CONTROLLER_REGISTRY[mode] = ctrl
+    return ctrl
+
+
+def controller_for(mode):
+    """Return the controller registered for ``mode``, or ``None``."""
+    return _CONTROLLER_REGISTRY.get(mode)
 
 
 # ── Pure functions (§5 of the plan) ───────────────────────────────────

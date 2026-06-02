@@ -21,6 +21,7 @@ implemented function fails its own test rather than breaking collection
 for the green scaffold tests.
 """
 
+import dataclasses
 import math
 import os
 import subprocess
@@ -145,28 +146,26 @@ def _base_state_kwargs(**overrides):
 
 def test_compute_display_state_image_viewer_no_data_clears_panel():
     # Invariant: a panel never keeps old content when there is no data.
-    # IMAGE_VIEWER with neither raw nor thumbnail -> raw_panel.has_data False.
+    # IMAGE_VIEWER with neither raw nor thumbnail -> RAW_2D panel has_data False.
     state = dl.compute_display_state(**_base_state_kwargs(
         mode=dl.Mode.IMAGE_VIEWER,
         selected_ids=(0,),
         loaded_2d_keys=set(),
         raw_availability={0: dict(has_raw=False, has_thumbnail=False)},
     ))
-    assert state.raw_panel.has_data is False
+    assert state.panel(dl.PanelRole.RAW_2D).has_data is False
     assert state.load_status in (dl.LoadStatus.EMPTY, dl.LoadStatus.ERROR)
 
 
 def test_error_load_yields_error_status_not_partial():
     # Invariant: a failed load -> LoadStatus.ERROR with an error_message,
-    # never a half-populated display.
+    # never a half-populated display.  Every panel reports has_data=False.
     state = dl.compute_display_state(**_base_state_kwargs(
         raw_availability={'__error__': 'boom'},
     ))
     assert state.load_status is dl.LoadStatus.ERROR
     assert state.error_message
-    assert state.raw_panel.has_data is False
-    assert state.cake_panel.has_data is False
-    assert state.plot_panel.has_data is False
+    assert all(not plan.has_data for _role, plan in state.panels)
 
 
 def test_mode_switch_bumps_generation_and_clears_title():
@@ -199,7 +198,100 @@ def test_image_viewer_does_not_depend_on_scan_frames():
         raw_availability={0: dict(has_raw=True, has_thumbnail=False)},
     ))
     assert 0 in state.render_ids
-    assert state.raw_panel.has_data is True
+    assert state.panel(dl.PanelRole.RAW_2D).has_data is True
+
+
+# ── §10 seams: the contract surface is open to future modules ─────────
+
+def _make_display_state(**over):
+    """Construct a DisplayState directly (no compute) for shape tests."""
+    base = dict(
+        mode=dl.Mode.INT_1D,
+        load_status=dl.LoadStatus.READY,
+        error_message=None,
+        generation=0,
+        selected_ids=(0,),
+        render_ids=(0,),
+        overall=False,
+        gi=False,
+        x_unit='q_A^-1',
+        x_label='Q',
+        method='Single',
+        overlay=dl.OverlayAction.REPLACE,
+        overlaid_ids=(),
+        title='',
+        panels=(),
+    )
+    base.update(over)
+    return dl.DisplayState(**base)
+
+
+def test_panels_are_keyed_and_results_defaults_none():
+    # §10 seam 1 + 5: panels is a keyed collection; results defaults to None.
+    state = _make_display_state(panels=(
+        (dl.PanelRole.RAW_2D, dl.PanelPlan(visible=True, has_data=True)),
+        (dl.PanelRole.PLOT_1D, dl.PanelPlan(visible=True, has_data=False)),
+    ))
+    assert state.panel(dl.PanelRole.RAW_2D).has_data is True
+    assert state.panel(dl.PanelRole.PLOT_1D).has_data is False
+    assert state.panel(dl.PanelRole.CAKE_2D) is None   # not present -> None
+    assert state.results is None
+
+
+def test_payload_is_source_agnostic():
+    # §10 seam 4: the payload carries no provenance field — render must not
+    # be able to tell integration from stitch from reload.
+    np = pytest.importorskip("numpy")
+    field_names = {f.name for f in dataclasses.fields(dl.DisplayPayload)}
+    assert field_names == {'generation', 'raw_image', 'cake_image', 'plot'}
+    for forbidden in ('source', 'provenance', 'origin', 'producer'):
+        assert forbidden not in field_names
+
+
+def test_extension_panel_role_and_fit_trace_round_trip():
+    """A panel role the core never emits (RESIDUAL_1D, reserved for
+    fitting) plus a kind='fit' Trace round-trip through a generic,
+    render-style dispatch without any change to display_logic core —
+    proving §10 seams 1, 2 are actually open (not three hardcoded panels
+    / a single data trace)."""
+    np = pytest.importorskip("numpy")
+    x = np.linspace(0.0, 1.0, 5)
+    data = dl.Trace(label="pattern", x=x, y=x, kind="data")
+    fit = dl.Trace(label="model", x=x, y=x * 2, kind="fit")
+    plot = dl.PlotPayload(axis_x=dl.Axis("Q", unit="A^-1"), traces=(data, fit))
+
+    state = _make_display_state(panels=(
+        (dl.PanelRole.PLOT_1D, dl.PanelPlan(visible=True, has_data=True)),
+        (dl.PanelRole.RESIDUAL_1D, dl.PanelPlan(visible=True, has_data=True)),
+    ))
+
+    # Generic "render contract": iterate panels, dispatch each role to a
+    # handler from a registry.  An extension just registers a handler; the
+    # core dispatch loop below is unchanged and role-agnostic.
+    drawn = {}
+    handlers = {
+        dl.PanelRole.PLOT_1D: lambda plan: drawn.__setitem__('plot_1d', plan.has_data),
+        dl.PanelRole.RESIDUAL_1D: lambda plan: drawn.__setitem__('residual_1d', plan.has_data),
+    }
+    for role, plan in state.panels:
+        handlers[role](plan)
+
+    assert drawn == {'plot_1d': True, 'residual_1d': True}
+    # The fit trace survives, distinct from the data trace, on one payload.
+    assert [t.kind for t in plot.traces] == ['data', 'fit']
+    assert plot.axis_x.unit == "A^-1" and plot.axis_x.log is False
+
+
+def test_controller_registry_register_and_lookup():
+    # §10 seam 3: open Mode -> controller registry; no controllers wired
+    # in core yet, so an unregistered mode resolves to None.
+    sentinel = object()
+    assert dl.controller_for(dl.Mode.INT_2D) is None
+    try:
+        dl.register_controller(dl.Mode.INT_2D, sentinel)
+        assert dl.controller_for(dl.Mode.INT_2D) is sentinel
+    finally:
+        dl._CONTROLLER_REGISTRY.pop(dl.Mode.INT_2D, None)  # don't leak across tests
 
 
 # ── §6/§9 guardrail: display_logic stays pure (no Qt/pyqtgraph/h5py/pyFAI) ──
