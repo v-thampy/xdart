@@ -54,6 +54,25 @@ class DisplayDataMixin:
     during iteration").  Use ``_snapshot_data`` for those paths.
     """
 
+    @staticmethod
+    def _sanitize_display_image(data):
+        """Return a float image with detector sentinels masked to NaN."""
+        arr = np.asarray(data, dtype=float)
+        bad = ~np.isfinite(arr) | (arr >= 4294967295.0)
+        if arr.size and np.isfinite(arr).any():
+            # Some 16-bit detector/raw readers preserve invalid pixels as the
+            # uint16 ceiling.  If enough pixels sit exactly at 65535, treat
+            # that ceiling as a display sentinel so autoscale uses the real
+            # image range instead of rendering the frame nearly black.
+            finite = np.isfinite(arr)
+            sentinel16 = finite & (arr == 65535.0)
+            if sentinel16.any() and sentinel16.sum() / arr.size > 1e-4:
+                bad |= sentinel16
+        if bad.any():
+            arr = arr.copy()
+            arr[bad] = np.nan
+        return arr
+
     def _snapshot_data(self, idxs):
         """Return a small {idx: (frame_1d, frame_2d_dict)} dict for
         the requested ``idxs``, sampled atomically under
@@ -80,7 +99,8 @@ class DisplayDataMixin:
 
     # ── Raw 2D data access ────────────────────────────────────────
 
-    def get_frames_map_raw(self, idxs=None):
+    def get_frames_map_raw(self, idxs=None, *, prefer_thumbnail=False,
+                           return_source=False, require_all=False):
         """Return 2D frame data for multiple frames (averaged).
 
         Falls back to the stored thumbnail when full-resolution raw data
@@ -94,48 +114,34 @@ class DisplayDataMixin:
         """
         if idxs is None:
             idxs = self.idxs_2d
+        idxs = list(idxs)
 
         snapshot = self._snapshot_data(idxs)
 
         intensity, ctr = 0., 0
+        sources = set()
+        sanitize = getattr(
+            self, '_sanitize_display_image',
+            DisplayDataMixin._sanitize_display_image,
+        )
         for nn, idx in enumerate(idxs):
             frame_1d, frame_2d = snapshot.get(int(idx), (None, {}))
             raw = frame_2d.get('map_raw')
             bg = frame_2d.get('bg_raw', 0)
-            # Batch / reloaded scans keep no full-resolution raw in the
-            # display cache — only a thumbnail is stored in the processed
-            # file.  Pull the full raw from the source master via the
-            # frame's lazy loader so the detector mask (flat indices for
-            # the FULL detector) can be applied; on the smaller thumbnail
-            # those indices are out of range and the mask is silently
-            # dropped.  Falls through to the thumbnail if the master is
-            # gone.
-            #
-            # Only do this synchronous disk read when the 2D raw pane is
-            # actually on screen — in 1D-only mode and the XYE viewer the
-            # 2D pane is hidden, so a routine 1D repaint must NOT block on
-            # loading full detector frames; the thumbnail (or nothing) is
-            # enough there.
-            _want_raw = (not getattr(self.scan, 'skip_2d', False)
-                         and getattr(self, 'viewer_mode', None) != 'xye')
-            if _want_raw and raw is None and frame_1d is not None:
-                try:
-                    if (getattr(frame_1d, 'map_raw', None) is None
-                            and hasattr(frame_1d, '_lazy_load_raw')):
-                        frame_1d._lazy_load_raw()
-                    lazy_raw = getattr(frame_1d, 'map_raw', None)
-                    if lazy_raw is not None:
-                        raw = np.asarray(lazy_raw, dtype=float)
-                        bg = getattr(frame_1d, 'bg_raw', bg)
-                except Exception:
-                    logger.debug(
-                        'get_frames_map_raw: lazy raw load failed for %s',
-                        idx, exc_info=True,
-                    )
             # Try thumbnail from data_2d, then fall back to data_1d
             thumb = frame_2d.get('thumbnail')
             if thumb is None and frame_1d is not None:
                 thumb = getattr(frame_1d, 'thumbnail', None)
+            if prefer_thumbnail and thumb is not None:
+                raw = thumb
+                bg = 0
+                source = 'thumbnail'
+            elif raw is not None:
+                source = 'raw'
+            elif thumb is not None:
+                source = 'thumbnail'
+            else:
+                source = None
             # F1: was `for kk in range(3): try: ...; break; except
             # ValueError: time.sleep(0.5)`.  The retry/sleep pattern
             # was running on the Qt thread — visible UI freeze on
@@ -148,25 +154,43 @@ class DisplayDataMixin:
             try:
                 scan_info = frame_1d.scan_info if frame_1d is not None else {}
                 if raw is not None:
-                    intensity += self.normalize(raw - bg, scan_info)
+                    raw_data = sanitize(raw)
+                    intensity += self.normalize(raw_data - bg, scan_info)
                     ctr += 1
+                    sources.add(source or 'raw')
                 elif thumb is not None:
                     # Use thumbnail as fallback when raw isn't stored
+                    thumb_data = sanitize(thumb)
                     intensity += self.normalize(
-                        np.asarray(thumb, dtype=float), scan_info)
+                        thumb_data, scan_info)
                     ctr += 1
+                    sources.add('thumbnail')
             except ValueError as e:
                 logger.debug(
                     "get_frames_map_raw skipped frame %s due to shape "
                     "mismatch: %s", idx, e,
                 )
 
+        if require_all and ctr != len(idxs):
+            if return_source:
+                return None, None
+            return None
+
         if ctr > 0:
             intensity /= ctr
         else:
+            if return_source:
+                return None, None
             return None
 
-        return np.asarray(intensity, dtype=float)
+        if len(sources) == 1:
+            source = next(iter(sources))
+        else:
+            source = 'mixed'
+        data = np.asarray(intensity, dtype=float)
+        if return_source:
+            return data, source
+        return data
 
     # G2: get_scan_map_raw was deleted.  It read scan.overall_raw,
     # an in-memory accumulator that doesn't survive v2 reload (the
@@ -176,7 +200,7 @@ class DisplayDataMixin:
 
     # ── 2D integration data access ────────────────────────────────
 
-    def get_frames_int_2d(self, idxs=None):
+    def get_frames_int_2d(self, idxs=None, *, require_all=False):
         """Return 2D frame data for multiple frames (averaged).
 
         Mirrors :meth:`get_frames_map_raw` / :meth:`get_frames_int_1d`:
@@ -193,6 +217,7 @@ class DisplayDataMixin:
         """
         if idxs is None:
             idxs = self.idxs_2d
+        idxs = list(idxs)
 
         if not idxs:
             return None, None, None
@@ -223,6 +248,9 @@ class DisplayDataMixin:
                 except (ValueError, AttributeError, TypeError):
                     continue
             ctr += 1
+
+        if require_all and ctr != len(idxs):
+            return None, None, None
 
         if intensity is None or ctr == 0:
             return None, None, None

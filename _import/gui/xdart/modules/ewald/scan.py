@@ -172,6 +172,31 @@ class LiveScan:
             return False
         return self._probe_reload_only_via_h5()
 
+    @property
+    def frame_indices(self) -> list[int]:
+        """Ordered labels for the headless ``FrameSource`` boundary."""
+        return [int(idx) for idx in self.frames.index]
+
+    def load_frame(self, index: int) -> np.ndarray:
+        """Load one detector frame without retaining newly hydrated raw data."""
+        frame = self.frames[int(index)]
+        loaded_here = frame.map_raw is None
+        if loaded_here and not frame._lazy_load_raw():
+            raise RuntimeError(f"could not lazy-load raw frame {index}")
+        try:
+            return np.asarray(frame.map_raw)
+        finally:
+            if loaded_here:
+                frame.map_raw = None
+
+    def iter_chunks(self, chunk_size: int):
+        """Yield bounded raw-image chunks for headless RSM consumers."""
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
+        for start in range(0, len(self.frames.index), chunk_size):
+            indices = [int(idx) for idx in self.frames.index[start:start + chunk_size]]
+            yield np.stack([self.load_frame(idx) for idx in indices]), indices
+
     def _probe_reload_only_via_h5(self) -> bool:
         """Probe the .nxs file's per-frame source refs to gauge the flag.
 
@@ -573,6 +598,7 @@ class LiveScan:
             for name in ds.data_vars
             if name not in reserved_vars and ds[name].dims == ("frame",)
         }
+        loaded_scan_data = False
         if motor_cols:
             # N2: index scan_data by the actual frame IDs (from the
             # ``frame`` coord), not 0..N-1 default range index.
@@ -599,6 +625,7 @@ class LiveScan:
                 # Fall back to default range index if ds lacks a
                 # ``frame`` coord (very old files / partial writes).
                 self.scan_data = pd.DataFrame(motor_cols)
+            loaded_scan_data = True
 
         # ── wavelength + bai args from reduction config (if present) ─
         reduction = normalize_live_class_names(ds.attrs.get("reduction", {}) or {})
@@ -647,12 +674,13 @@ class LiveScan:
         # no ``frame`` dim — start with an empty index in that case.
         # Don't raise: the wrangler immediately follows with new frames.
         try:
-            if "frame" in ds.dims:
-                frame_indices = (
-                    np.asarray(ds["frame"].values).astype(int).tolist()
-                )
-            else:
-                frame_indices = []
+            frame_indices = []
+            for coord_name in ("frame", "frame_2d"):
+                if coord_name in ds.coords:
+                    frame_indices.extend(
+                        np.asarray(ds[coord_name].values).astype(int).tolist()
+                    )
+            frame_indices = sorted(set(frame_indices))
             empty_series = LiveFrameSeries(
                 self.data_file, self.file_lock,
                 static=self.static, gi=self.gi,
@@ -662,6 +690,11 @@ class LiveScan:
                     empty_series.index.append(idx)
             empty_series.index.sort()
             self.frames = empty_series
+            if frame_indices:
+                if loaded_scan_data:
+                    self.scan_data = self.scan_data.reindex(frame_indices)
+                elif not data_only and len(self.scan_data) == 0:
+                    self.scan_data = pd.DataFrame(index=frame_indices)
         except Exception:
             logger.exception(
                 "v2 NeXus load: failed to populate frames.index from %s",

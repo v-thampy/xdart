@@ -86,14 +86,22 @@ def scan_from_live_scan(
     if include_backgrounds is None:
         include_backgrounds = include_images
     indices = list(frame_indices) if frame_indices is not None else list(live_scan.frames.index)
-    frames = [
-        frame_from_live_frame(
+    scan_data = getattr(live_scan, "scan_data", None)
+    frames = []
+    for idx in indices:
+        frame = frame_from_live_frame(
             live_scan.frames[int(idx)],
             include_image=include_images,
             include_background=include_backgrounds,
         )
-        for idx in indices
-    ]
+        frame.metadata.update(
+            {
+                key: value
+                for key, value in _scan_data_row(scan_data, int(idx)).items()
+                if key not in frame.metadata
+            }
+        )
+        frames.append(frame)
     first_frame = live_scan.frames[int(indices[0])] if indices else None
     poni = getattr(first_frame, "poni", None) if first_frame is not None else None
     wavelength_A = None
@@ -104,7 +112,6 @@ def scan_from_live_scan(
         wavelength_A = None
 
     motors = {}
-    scan_data = getattr(live_scan, "scan_data", None)
     if scan_data is not None:
         try:
             motors = {
@@ -449,6 +456,24 @@ def _source_path(frame: Any) -> Path | None:
     resolver = getattr(frame, "_resolved_source_path", None)
     path = resolver() if callable(resolver) else getattr(frame, "source_file", "")
     return Path(path) if path else None
+
+
+def _scan_data_row(scan_data: Any, idx: int) -> dict[str, Any]:
+    if scan_data is None or not hasattr(scan_data, "loc"):
+        return {}
+    try:
+        row = scan_data.loc[int(idx)]
+    except (KeyError, TypeError, ValueError):
+        return {}
+    if hasattr(row, "iloc") and getattr(row, "ndim", 1) > 1:
+        row = row.iloc[0]
+    try:
+        return {
+            str(key): value
+            for key, value in row.to_dict().items()
+        }
+    except AttributeError:
+        return {}
 
 
 def _frame_norm(frame: Frame, plan: ReductionPlan) -> float:

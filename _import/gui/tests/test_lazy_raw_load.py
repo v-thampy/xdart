@@ -183,6 +183,24 @@ class TestLazyLoadTif:
         _write_tif(tmp_path / "stack.tif", shape=(4, 4))
         assert c._resolved_source_path() == a._resolved_source_path()
 
+    def test_display_copy_shares_integrator_and_drops_raw(self):
+        from types import SimpleNamespace
+        from xdart.modules.ewald.frame import LiveFrame
+
+        integrator = SimpleNamespace(USE_LEGACY_MASK_NORMALIZATION=True)
+        frame = LiveFrame(
+            idx=1,
+            map_raw=np.ones((4, 4)),
+            scan_info={"i0": 1.0},
+            integrator=integrator,
+        )
+
+        copied = frame.copy_for_display(include_2d=False)
+
+        assert copied.integrator is integrator
+        assert copied.map_raw is None
+        assert copied.scan_info == {"i0": 1.0}
+
     def test_loads_specific_frame_from_multiframe_tif(self, tmp_path):
         """O2 regression: for multi-frame TIFF/CBF stacks the lazy
         loader must forward ``source_frame_idx`` to read_image, not
@@ -307,7 +325,7 @@ class TestReloadOnlyFlagWiring:
                                    source_root=source_root)
         # With the source file present, lazy load is feasible.
         assert loaded.is_reload_only is False
-        assert loaded.source_file == "frame_0000.tif"
+        assert loaded.source_file == str(tif_path.resolve())
         assert loaded._source_root == source_root
 
     def test_is_reload_only_true_when_source_missing(self, tmp_path):

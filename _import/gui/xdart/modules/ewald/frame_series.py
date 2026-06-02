@@ -22,6 +22,7 @@ stacked arrays + per-frame thumbnail group.
 import logging
 import os
 
+import h5py
 from pandas import Series
 import numpy as np
 
@@ -46,11 +47,15 @@ class _IndexedList(list):
     (``_IndexedList(some_slice)``).
     """
 
-    __slots__ = ("_set",)
+    __slots__ = ("_set", "_structure_version")
 
     def __init__(self, items=()):
         super().__init__(items)
         self._set: set = set(self)
+        self._structure_version = 0
+
+    def _mark_structure_changed(self) -> None:
+        self._structure_version += 1
 
     def __contains__(self, x) -> bool:
         return x in self._set
@@ -67,42 +72,62 @@ class _IndexedList(list):
     def insert(self, i, x) -> None:
         super().insert(i, x)
         self._set.add(x)
+        self._mark_structure_changed()
 
     def remove(self, x) -> None:
         super().remove(x)
         if super().count(x) == 0:
             self._set.discard(x)
+        self._mark_structure_changed()
 
     def pop(self, i=-1):
         x = super().pop(i)
         if super().count(x) == 0:
             self._set.discard(x)
+        self._mark_structure_changed()
         return x
 
     def clear(self) -> None:
         super().clear()
         self._set.clear()
+        self._mark_structure_changed()
 
     def __setitem__(self, k, v):
         if isinstance(k, slice):
             super().__setitem__(k, v)
             self._set = set(self)
+            self._mark_structure_changed()
         else:
             old = super().__getitem__(k)
             super().__setitem__(k, v)
             if super().count(old) == 0:
                 self._set.discard(old)
             self._set.add(v)
+            if old != v:
+                self._mark_structure_changed()
 
     def __delitem__(self, k):
         if isinstance(k, slice):
             super().__delitem__(k)
             self._set = set(self)
+            self._mark_structure_changed()
         else:
             old = super().__getitem__(k)
             super().__delitem__(k)
             if super().count(old) == 0:
                 self._set.discard(old)
+            self._mark_structure_changed()
+
+    def sort(self, *args, **kwargs) -> None:
+        before = list(self)
+        super().sort(*args, **kwargs)
+        self._set = set(self)
+        if before != list(self):
+            self._mark_structure_changed()
+
+    def reverse(self) -> None:
+        super().reverse()
+        self._mark_structure_changed()
 
 # xdart imports
 from xdart.utils import catch_h5py_file as catch
@@ -120,38 +145,40 @@ def _ensure_frames_group(h5file):
     return frames
 
 
-# Cache of the label→row map for the integrated_1d frame_index, keyed by
-# id(h5file).  Each entry is ``(fingerprint, {label: row})`` where the
-# fingerprint is ``(length, first_label, last_label)`` — read O(1) from the
-# dataset on every call.  We rebuild the full map only when the fingerprint
-# changes, which catches BOTH growth (append) and a same-length relabel
-# (reintegration that reorders/renumbers frames).  The fingerprint guards
-# against id() recycling too: a recycled handle pointing at a different file
-# will almost always have a different fingerprint, and if it doesn't the map
-# is still valid for that content.  Without this cache each lookup scanned
-# the whole frame_index, making a K-frame multi-select O(K·N).
-_FRAME_POS_CACHE: dict[int, tuple[tuple, dict[int, int]]] = {}
+# Cache label→row maps independently for 1D and 2D output groups.  The HDF5
+# object address changes when a writer rebuilds a stacked group, including a
+# same-length rewrite whose endpoint labels happen to stay unchanged.
+_FRAME_POS_CACHE: dict[tuple[str, str], tuple[tuple[int, int], dict[int, int]]] = {}
 
 
-def _frame_position(h5file, idx: int) -> int | None:
+def clear_frame_position_cache(filename: str | None = None) -> None:
+    """Clear cached stacked-row lookups, optionally for one file."""
+    if filename is None:
+        _FRAME_POS_CACHE.clear()
+        return
+    target = os.fspath(filename)
+    for key in [key for key in _FRAME_POS_CACHE if key[0] == target]:
+        _FRAME_POS_CACHE.pop(key, None)
+
+
+def _frame_position(h5file, idx: int, group_name: str = "integrated_1d") -> int | None:
     """Return the row of ``idx`` inside the stacked ``frame_index`` array.
 
-    Returns ``None`` when the file has no integrated_1d group yet
+    Returns ``None`` when the requested integrated group has not been written
     (i.e. the batch flush hasn't happened) or when idx isn't present.
 
     Uses a fingerprint-validated label→row cache so repeated lookups
     against the same open file are O(1) instead of an O(N) array scan each.
     """
-    if "entry/integrated_1d/frame_index" not in h5file:
+    ds_path = f"entry/{group_name}/frame_index"
+    if ds_path not in h5file:
         return None
-    ds = h5file["entry/integrated_1d/frame_index"]
+    ds = h5file[ds_path]
     n = int(ds.shape[0])
     if n == 0:
         return None
-    # Cheap fingerprint: length + endpoints.  Catches append (length) and
-    # relabel (endpoints) without reading the whole array.
-    fp = (n, int(ds[0]), int(ds[n - 1]))
-    key = id(h5file)
+    fp = (int(h5py.h5o.get_info(ds.id).addr), n)
+    key = (os.fspath(h5file.filename), group_name)
     cached = _FRAME_POS_CACHE.get(key)
     if cached is None or cached[0] != fp:
         if len(_FRAME_POS_CACHE) > 64:
@@ -162,6 +189,64 @@ def _frame_position(h5file, idx: int) -> int | None:
     else:
         lookup = cached[1]
     return lookup.get(int(idx))
+
+
+def _as_scalar(value):
+    """Return a Python scalar when an HDF5 row value is scalar-shaped."""
+    arr = np.asarray(value)
+    if arr.shape == ():
+        item = arr.item()
+        return item.decode("utf-8", errors="replace") if isinstance(item, bytes) else item
+    return arr
+
+
+def _load_scan_info(h5file, idx: int) -> dict:
+    """Read one frame's saved metadata row from v2 NeXus groups.
+
+    ``LiveFrame.scan_info`` is the source used by xdart display
+    normalization and by the headless reduction adapter. Reloaded frames
+    therefore need the same per-frame counters/motors that live frames had.
+    Keep this lazy and per-row: loading a frame reads only the matching row
+    from ``/entry/scan_data`` plus geometry positioners when available.
+    """
+    info: dict = {}
+
+    pos = _frame_position(h5file, idx, "scan_data")
+    sd = h5file.get("entry/scan_data") if pos is not None else None
+    if sd is not None:
+        for key, item in sd.items():
+            if key == "frame_index" or not isinstance(item, h5py.Dataset):
+                continue
+            if item.ndim < 1 or item.shape[0] <= pos:
+                continue
+            try:
+                info[str(key)] = _as_scalar(item[pos])
+            except (OSError, TypeError, ValueError):
+                logger.debug("scan_data/%s read failed for frame %s",
+                             key, idx, exc_info=True)
+
+    # Older or hand-written v2 files may not carry /entry/scan_data but can
+    # still have NXpositioner rows. Use them as a fallback/fill-in source.
+    for group_name in ("sample/positioners", "instrument/detector/positioners"):
+        pos = _frame_position(h5file, idx, group_name)
+        pg = h5file.get(f"entry/{group_name}") if pos is not None else None
+        if pg is None:
+            continue
+        for key, item in pg.items():
+            if key == "frame_index":
+                continue
+            value_ds = item.get("value") if isinstance(item, h5py.Group) else item
+            if not isinstance(value_ds, h5py.Dataset):
+                continue
+            if value_ds.ndim < 1 or value_ds.shape[0] <= pos:
+                continue
+            try:
+                info.setdefault(str(key), _as_scalar(value_ds[pos]))
+            except (OSError, TypeError, ValueError):
+                logger.debug("%s/%s read failed for frame %s",
+                             group_name, key, idx, exc_info=True)
+
+    return info
 
 
 def _load_frame_v2(h5file, idx: int, *, static: bool, gi: bool,
@@ -182,16 +267,18 @@ def _load_frame_v2(h5file, idx: int, *, static: bool, gi: bool,
     )
 
     frame = LiveFrame(idx, static=static, gi=gi)
+    frame.scan_info = _load_scan_info(h5file, idx)
 
-    pos = _frame_position(h5file, idx)
+    pos_1d = _frame_position(h5file, idx, "integrated_1d")
+    pos_2d = _frame_position(h5file, idx, "integrated_2d")
 
     # ── 1D ────────────────────────────────────────────────────────
-    g1 = h5file.get("entry/integrated_1d") if pos is not None else None
+    g1 = h5file.get("entry/integrated_1d") if pos_1d is not None else None
     if g1 is not None and "intensity" in g1:
         q = np.asarray(g1["q"][()], dtype=float)
-        intensity = np.asarray(g1["intensity"][pos], dtype=float)
+        intensity = np.asarray(g1["intensity"][pos_1d], dtype=float)
         sigma = (
-            np.asarray(g1["sigma"][pos], dtype=float)
+            np.asarray(g1["sigma"][pos_1d], dtype=float)
             if "sigma" in g1 else None
         )
         unit_attr = g1["q"].attrs.get("units", b"") if "q" in g1 else b""
@@ -207,20 +294,27 @@ def _load_frame_v2(h5file, idx: int, *, static: bool, gi: bool,
         )
 
     # ── 2D ────────────────────────────────────────────────────────
-    g2 = h5file.get("entry/integrated_2d") if pos is not None else None
+    g2 = h5file.get("entry/integrated_2d") if pos_2d is not None else None
     if g2 is not None and "intensity" in g2:
         # File layout: (frame, chi, q).  xdart frame convention: (nq, nchi).
-        slab = np.asarray(g2["intensity"][pos], dtype=float)  # (chi, q)
+        slab = np.asarray(g2["intensity"][pos_2d], dtype=float)  # (chi, q)
         slab_xdart = slab.T  # (q, chi)
+        sigma = (
+            np.asarray(g2["sigma"][pos_2d], dtype=float).T
+            if "sigma" in g2 else None
+        )
         q2 = np.asarray(g2["q"][()], dtype=float)
         chi = np.asarray(g2["chi"][()], dtype=float)
+        q_unit_attr = g2["q"].attrs.get("units", b"") if "q" in g2 else b""
+        if isinstance(q_unit_attr, bytes):
+            q_unit_attr = q_unit_attr.decode("utf-8", errors="replace")
         chi_unit_attr = g2["chi"].attrs.get("units", b"") if "chi" in g2 else b""
         if isinstance(chi_unit_attr, bytes):
             chi_unit_attr = chi_unit_attr.decode("utf-8", errors="replace")
         frame.int_2d = IntegrationResult2D(
             radial=q2, azimuthal=chi, intensity=slab_xdart,
-            sigma=None,
-            unit=getattr(frame.int_1d, "unit", "q_A^-1") if frame.int_1d else "q_A^-1",
+            sigma=sigma,
+            unit=q_unit_attr or "q_A^-1",
             azimuthal_unit=chi_unit_attr or "deg",
         )
 
@@ -403,6 +497,7 @@ class LiveFrameSeries:
                                  static=self.static, gi=self.gi)
         # Preserve _IndexedList semantics (list[:] would degrade it).
         frames.index = _IndexedList(self.index)
+        frames.index._structure_version = getattr(self.index, "_structure_version", 0)
         # Preserve any in-memory cache on the new LiveFrameSeries — losing it
         # would force the v2 writer to re-load every frame from disk.
         frames._in_memory = dict(self._in_memory)
@@ -423,6 +518,7 @@ class LiveFrameSeries:
         frames = LiveFrameSeries(self.data_file, self.file_lock,
                                  static=self.static, gi=self.gi)
         frames.index = _IndexedList(sorted(self.index))
+        frames.index._structure_version = getattr(self.index, "_structure_version", 0) + 1
         frames._in_memory = dict(self._in_memory)
         frames._in_memory_cap = self._in_memory_cap
         return frames
@@ -439,4 +535,4 @@ class LiveFrameSeries:
         return self
 
 
-__all__ = ["LiveFrameSeries"]
+__all__ = ["LiveFrameSeries", "clear_frame_position_cache"]

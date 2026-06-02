@@ -183,11 +183,15 @@ class integratorThread(Qt.QtCore.QThread):
                     }
                     # A standard 2D reintegrate also refreshes 1D so
                     # linked viewers do not keep stale cached curves.
-                    self.data_1d[int(frame.idx)] = frame.copy(include_2d=False)
+                    self.data_1d[int(frame.idx)] = frame.copy_for_display(
+                        include_2d=False,
+                    )
             else:
                 self.scan._accumulate_bai_1d(frame)
                 with self.data_lock:
-                    self.data_1d[int(frame.idx)] = frame.copy(include_2d=False)
+                    self.data_1d[int(frame.idx)] = frame.copy_for_display(
+                        include_2d=False,
+                    )
             self.update.emit(frame.idx)
 
         label = '2D' if do_2d else '1D'
@@ -388,7 +392,9 @@ class integratorThread(Qt.QtCore.QThread):
                     'int_2d': frame.int_2d,
                     'gi_2d': frame.gi_2d}
                 if not self.scan.gi:
-                    self.data_1d[int(frame.idx)] = frame.copy(include_2d=False)
+                    self.data_1d[int(frame.idx)] = frame.copy_for_display(
+                        include_2d=False,
+                    )
             self.update.emit(idx)
 
     def bai_1d_SI(self):
@@ -413,7 +419,9 @@ class integratorThread(Qt.QtCore.QThread):
                 legacy_gi=_legacy_gi_1d,
             )
             with self.data_lock:
-                self.data_1d[int(frame.idx)] = frame.copy(include_2d=False)
+                self.data_1d[int(frame.idx)] = frame.copy_for_display(
+                    include_2d=False,
+                )
             self.update.emit(frame.idx)
 
     def load(self):
@@ -548,7 +556,7 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 logger.debug("Data missing for frame %s: %s", idx, e)
                 continue
             with self.data_lock:
-                self.data_1d[int(idx)] = frame.copy(include_2d=False)
+                self.data_1d[int(idx)] = frame.copy_for_display(include_2d=False)
                 if self.update_2d:
                     self.data_2d[int(idx)] = {
                         'map_raw': getattr(frame, 'map_raw', None),

@@ -855,5 +855,28 @@ class LiveFrame():
 
         return frame_copy
 
+    def copy_for_display(self, include_2d=False):
+        """Return a lightweight cache copy for GUI display dictionaries.
+
+        Unlike :meth:`copy`, this does not construct or deep-copy a pyFAI
+        integrator.  Display paths treat the cached frame as read-only and
+        only need metadata, thumbnails, and reduced results.
+        """
+        frame_copy = copy.copy(self)
+        frame_copy.frame_lock = Condition()
+        frame_copy.scan_info = dict(self.scan_info)
+        frame_copy.ai_args = dict(self.ai_args)
+        frame_copy.gi_1d = dict(self.gi_1d)
+        frame_copy.thumbnail = copy.copy(self.thumbnail)
+        if include_2d:
+            frame_copy.gi_2d = dict(self.gi_2d)
+        else:
+            frame_copy.map_raw = None
+            frame_copy.bg_raw = 0
+            frame_copy.mask = None
+            frame_copy.int_2d = None
+            frame_copy.gi_2d = {}
+        return frame_copy
+
 
 __all__ = ["LiveFrame"]

@@ -234,6 +234,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.frame_ids = frame_ids
         self.frames = frames
         self.frame_names = []
+        self.overlaid_idxs = []
         self.data_1d = data_1d
         self.data_2d = data_2d
         self.bkg_1d = 0.
@@ -614,6 +615,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.plotUnit.clear()
         self.ui.imageUnit.clear()
         self._plot_axis_info = []
+        target_plot_idx = 0
 
         if self.scan.gi:
             gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
@@ -672,6 +674,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.imageUnit.addItem(_translate("Form", gi_imageUnits[idx_2d]))
             self.ui.plotUnit.setEnabled(True)
             self.ui.imageUnit.setEnabled(False)
+            unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
+            if gi_mode_1d == 'q_total' and '2th' in unit_1d:
+                target_plot_idx = 1
         else:
             # Standard mode: Q, 2θ from 1D but can also slice via 2D chi;
             # χ purely from 2D
@@ -694,7 +699,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self.ui.imageUnit.addItem(_translate("Form", label))
             self.ui.plotUnit.setEnabled(True)
             self.ui.imageUnit.setEnabled(True)
+            unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
+            if '2th' in unit_1d:
+                target_plot_idx = 1
 
+        if self.ui.plotUnit.count() > 0:
+            self.ui.plotUnit.setCurrentIndex(
+                min(target_plot_idx, self.ui.plotUnit.count() - 1)
+            )
         self.ui.plotUnit.blockSignals(False)
         self.ui.imageUnit.blockSignals(False)
 
@@ -783,14 +795,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # scan.overall_raw accumulator.  Stays correct after v2
             # reload (the accumulator didn't), and after replace-frames
             # reintegration (the accumulator drifted).
-            data = self.get_frames_map_raw(
+            data, raw_source = self.get_frames_map_raw(
                 list(self.scan.frames.index),
+                prefer_thumbnail=True,
+                return_source=True,
+                require_all=True,
             )
             if data is None:
+                self.clear_image_view()
                 return
         else:
-            data = self.get_frames_map_raw()
+            data, raw_source = self.get_frames_map_raw(return_source=True)
             if data is None:
+                self.clear_image_view()
                 return
 
             # Apply Mask — O8: snapshot under data_lock so a
@@ -804,16 +821,32 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             mask = frame_2d['mask'] if frame_2d is not None else None
         data = np.asarray(data, dtype=float)
 
-        # Apply detector + global mask.
-        global_mask = self.scan.global_mask if self.scan.global_mask is not None else []
-        mask = mask if mask is not None else []
-        mask = np.asarray(np.unique(np.append(mask, global_mask)), dtype=int)
-        if len(mask) > 0 and mask.max() < data.size:
-            mask = np.unravel_index(mask, data.shape)
-            data[mask] = np.nan
+        # Apply detector + global mask only to full-resolution raw data.
+        # Thumbnails already bake the mask into the preview before
+        # downsampling; flat detector indices point at unrelated pixels there.
+        if raw_source == 'raw':
+            global_mask = (
+                self.scan.global_mask if self.scan.global_mask is not None else []
+            )
+            mask = mask if mask is not None else []
+            mask = np.asarray(np.unique(np.append(mask, global_mask)), dtype=int)
+            if len(mask) > 0 and mask.max() < data.size:
+                mask = np.unravel_index(mask, data.shape)
+                data[mask] = np.nan
 
         # Subtract background
-        data -= self.bkg_map_raw
+        bkg = np.asarray(self.bkg_map_raw)
+        if bkg.shape == () or bkg.shape == data.shape:
+            data -= self.bkg_map_raw
+        else:
+            logger.debug(
+                "Skipping raw-image background with shape %s for display shape %s",
+                bkg.shape, data.shape,
+            )
+
+        if data.size == 0 or not np.isfinite(data).any():
+            self.clear_image_view()
+            return
 
         data = data.T[:, ::-1]
 
@@ -845,20 +878,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
             self.update_plot_view()
 
-        # Always aggregate from per-frame data_2d.  Pre-G2 there was a
-        # fall-through to get_scan_int_2d() (now deleted — it read
-        # the in-memory scan.bai_2d accumulator that didn't survive
-        # v2 reload).  If selecting "Overall" with the current
-        # idxs_2d cache empty / partial, widen the aggregation
-        # across the full frames.index so we don't render a partial
-        # average.
-        intensity, xdata, ydata = self.get_frames_int_2d()
-        if intensity is None and self.overall and len(self.frame_ids) > 1:
+        # Always aggregate from per-frame data_2d.  In Overall mode require
+        # every frame's 2D row to be present; otherwise a bounded cache would
+        # quietly average only the rows that happen to be loaded.
+        if self.overall and len(self.frame_ids) > 1:
             intensity, xdata, ydata = self.get_frames_int_2d(
-                list(self.scan.frames.index),
+                list(self.scan.frames.index), require_all=True,
             )
+        else:
+            intensity, xdata, ydata = self.get_frames_int_2d()
 
         if intensity is None:
+            self.clear_binned_view()
             return
 
         # Subtract background
@@ -924,6 +955,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Clear stale plot_data so update_plot() rebuilds all overlay curves
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.frame_names = []
+        self.overlaid_idxs = []
         self.update()
 
     def setBkg(self):
@@ -968,6 +1000,63 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     # ── Viewer modes ──────────────────────────────────────────────
 
+    def clear_overlay(self):
+        """Drop accumulated overlay curves + names."""
+        self.plot_data = [np.zeros(0), np.zeros(0)]
+        self.plot_data_range = [[0, 0], [0, 0]]
+        self.frame_names = []
+        self.overlaid_idxs = []
+
+    # ── Panel clears (safety net for empty selections) ────────────
+    # When a render path has no data for the current selection it must
+    # blank its panel instead of returning early and leaving the last
+    # frame on screen — otherwise a mode switch or an unhydrated frame
+    # shows a stale image/cake/curve that looks like real data.
+
+    def clear_image_view(self):
+        """Blank the raw 2D image panel."""
+        try:
+            blank = np.zeros((2, 2))
+            rect = get_rect(np.arange(2), np.arange(2))
+            self.image_data = (blank, rect)
+            self.image_widget.setImage(blank)
+            self.image_widget.setRect(rect)
+        except Exception:
+            logger.debug("clear_image_view failed", exc_info=True)
+
+    def clear_binned_view(self):
+        """Blank the 2D cake panel."""
+        try:
+            blank = np.zeros((2, 2))
+            rect = get_rect(np.arange(2), np.arange(2))
+            self.binned_data = (blank, rect)
+            self.binned_widget.setImage(blank)
+            self.binned_widget.setRect(rect)
+        except Exception:
+            logger.debug("clear_binned_view failed", exc_info=True)
+
+    def clear_plot_view(self):
+        """Remove all 1D curves and reset cached plot state."""
+        try:
+            self.clear_overlay()
+            for curve in self.curves:
+                curve.clear()
+            self.curves.clear()
+            if getattr(self, 'legend', None) is not None:
+                self.legend.clear()
+            if getattr(self, 'wf_widget', None) is not None:
+                self.wf_widget.setImage(np.zeros((2, 2)))
+        except Exception:
+            logger.debug("clear_plot_view failed", exc_info=True)
+
+    def clear_display_state(self, title=None):
+        """Blank all rendered panels and cached display data."""
+        self.clear_image_view()
+        self.clear_binned_view()
+        self.clear_plot_view()
+        if title is not None:
+            self.ui.labelCurrent.setText(title)
+
     def set_viewer_display_mode(self, mode):
         """Configure display panels for viewer modes.
 
@@ -977,7 +1066,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                   None    — restore normal layout.
         """
         self.viewer_mode = mode
+        self._viewer_x_axis_label = None
         is_viewer = mode in ('image', 'xye')
+        if mode == 'image':
+            title = 'Image Viewer'
+        elif mode == 'xye':
+            title = 'XYE Viewer'
+        else:
+            title = ''
+        # A mode transition must not carry the previous mode's visible
+        # image/curve or cached overlay data into the new one.
+        self.clear_display_state(title)
         # In a viewer the top bar carries only the filename label (frame_5):
         # the norm/bkg controls (frame_4) and scale/cmap (frame_6) are
         # process-mode concerns.  The bottom toolbar is permanently
@@ -1001,12 +1100,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._showImageBtn.setVisible(False)
         elif mode == 'xye':
             # 1D overlay view: hide the 2D image but KEEP the middle control
-            # bar (the 1D controls — unit/Single/Options/Legend/Clear — are
-            # useful for overlays); hide the 2D-only controls + slice.  The
-            # imageWindow shrinks to the title + control bar above the plot.
+            # bar (Single/Options/Legend/Clear are useful for overlays).
+            # The XYE file owns its x-axis, so hide the transform combo.
             self.ui.frame_top.setVisible(True)
             self.ui.twoDWindow.setVisible(False)
             self.ui.imageToolbar.setVisible(True)
+            self.ui.plotUnit.setVisible(False)
             self._set_2d_controls_visible(False)
             self.ui.imageWindow.setMinimumHeight(80)
             self.ui.imageWindow.setMaximumHeight(85)
@@ -1031,6 +1130,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.imageUnit.setEnabled(True)
             self.ui.scale.setEnabled(True)
             self.ui.cmap.setEnabled(True)
+            self.ui.plotUnit.setVisible(True)
             self.ui.plotUnit.setEnabled(True)
             self.ui.plotMethod.setEnabled(True)
             # Slice enable/disable depends on which axis is selected
@@ -1049,6 +1149,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         Single/Overlay/Waterfall/Sum/Average all work.
         """
         if len(self.idxs_1d) == 0:
+            self.clear_plot_view()
             return
 
         # Title bar: the xye filename(s) — same convention as the image viewer.
@@ -1056,13 +1157,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         # Determine axis label from first frame
         first_frame = self.data_1d[self.idxs_1d[0]]
-        unit = getattr(first_frame.int_1d, 'unit', '2th_deg')
-        if 'q' in unit.lower():
-            xlabel = u'Q (\u212b\u207b\u00b9)'
+        unit = str(getattr(first_frame.int_1d, 'unit', 'unknown')).lower()
+        if unit.startswith('q') or unit in ('q_a^-1', 'q_a-1'):
+            # Label is the quantity only; pyqtgraph appends ``units`` as
+            # "(\u00c5\u207b\u00b9)".  Embedding it here too rendered "Q (\u00c5\u207b\u00b9) (\u00c5\u207b\u00b9)".
+            xlabel = u'Q'
             xunits = u'\u212b\u207b\u00b9'
-        else:
+        elif '2th' in unit or '2theta' in unit:
             xlabel = u'2\u03b8'
             xunits = u'\u00b0'
+        else:
+            xlabel = 'x'
+            xunits = ''
+        self._viewer_x_axis_label = (xlabel, xunits)
 
         # Build xdata and ydata arrays from all selected indices.
         ref_x = np.asarray(first_frame.int_1d.radial, dtype=float)
@@ -1082,6 +1189,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             rows.append(ydata)
 
         if not rows:
+            self.clear_plot_view()
             return
 
         xdata = ref_x
@@ -1115,14 +1223,34 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _update_image_viewer(self):
         """Render raw image data in viewer mode with optional mask/threshold."""
         if len(self.idxs_2d) == 0:
+            self.clear_image_view()
             return
         # O8: snapshot under data_lock so a concurrent writer can't
         # evict the key between the lookup and the read.
         with self.data_lock:
             frame_2d = self.data_2d.get(self.idxs_2d[0])
         if frame_2d is None:
+            self.clear_image_view()
             return
-        data = np.asarray(frame_2d['map_raw'], dtype=float)
+        # The detector array may not be hydrated yet (the loader publishes a
+        # thumbnail-backed preview first, then the full frame), or it may have
+        # been evicted from the bounded raw cache.  Fall back to the stored
+        # thumbnail rather than crashing on ``np.asarray(None)`` (blank panel).
+        raw = frame_2d.get('map_raw')
+        if raw is None:
+            raw = frame_2d.get('thumbnail')
+        if raw is None:
+            self.clear_image_view()
+            return
+        data = self._sanitize_display_image(raw)
+
+        # Dead/hot-pixel sentinels (e.g. uint32 max 4294967295 from Eiger
+        # masters) blow out the autoscale and render the frame blank/dark.
+        # Mask them to NaN so the real dynamic range drives the colormap.
+        if data.size == 0 or not np.isfinite(data).any():
+            self._set_viewer_title(self.idxs_2d)
+            self.clear_image_view()
+            return
 
         # Apply threshold from wrangler if enabled
         w = self._wrangler
@@ -1144,6 +1272,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                         data[mask] = np.nan
                 except Exception:
                     logger.debug("Failed to load or apply mask file %s", mask_file, exc_info=True)
+
+        if data.size == 0 or not np.isfinite(data).any():
+            self._set_viewer_title(self.idxs_2d)
+            self.clear_image_view()
+            return
 
         data = data.T[:, ::-1]
         rect = get_rect(np.arange(data.shape[0]), np.arange(data.shape[1]))

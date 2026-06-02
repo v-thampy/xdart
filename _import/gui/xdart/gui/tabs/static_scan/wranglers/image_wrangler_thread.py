@@ -91,6 +91,61 @@ def _get_scan_info(fname):
     return scan_name, img_number
 
 
+def _gi_2d_range_keys(args):
+    """Return the GI 2D range keys for the selected output mode."""
+    mode = args.get('gi_mode_2d', 'qip_qoop')
+    if mode == 'qip_qoop':
+        return 'x_range', 'y_range'
+    return 'radial_range', 'azimuth_range'
+
+
+def _padded_axis_range(axis, pad_fraction=0.02):
+    """Return a slightly padded finite range for an integrated axis."""
+    if axis is None:
+        return None
+    arr = np.asarray(axis, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    lo = float(np.nanmin(arr))
+    hi = float(np.nanmax(arr))
+    span = hi - lo
+    if span <= 0:
+        pad = max(abs(lo) * pad_fraction, 1e-6)
+    else:
+        pad = max(span * pad_fraction, 1e-9)
+    return lo - pad, hi + pad
+
+
+def _freeze_gi_2d_ranges_from_result(args, result):
+    """Freeze missing GI 2D auto-range args from one scout result."""
+    x_key, y_key = _gi_2d_range_keys(args)
+    missing = [key for key in (x_key, y_key) if args.get(key) is None]
+    if not missing:
+        return False
+    ranges = {
+        x_key: _padded_axis_range(getattr(result, 'radial', None)),
+        y_key: _padded_axis_range(getattr(result, 'azimuthal', None)),
+    }
+    changed = False
+    for key in missing:
+        if ranges[key] is not None:
+            args[key] = ranges[key]
+            changed = True
+    return changed
+
+
+def _freeze_gi_1d_range_from_result(args, result):
+    """Freeze a missing GI 1D radial auto-range from one scout result."""
+    if args.get('radial_range') is not None:
+        return False
+    radial_range = _padded_axis_range(getattr(result, 'radial', None))
+    if radial_range is None:
+        return False
+    args['radial_range'] = radial_range
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Natural sort helpers
 # ---------------------------------------------------------------------------
@@ -676,6 +731,8 @@ class imageThread(wranglerThread):
         parallel path always saves at end of batch by construction
         (the whole point of batch mode is one big save per dispatch).
         """
+        self._freeze_gi_1d_auto_range(scan, pending)
+        self._freeze_gi_2d_auto_ranges(scan, pending)
         if self.batch_mode and len(pending) > 1:
             return self._dispatch_batch_parallel(scan, pending)
         return self._dispatch_batch_serial(scan, pending, force_save=force_save)
@@ -787,6 +844,117 @@ class imageThread(wranglerThread):
         # cached_angle=None and built worker-local FiberIntegrators
         # per frame — defeating the pool we just constructed.
         scan._cached_fiber_integrator_angle = incident_angle
+
+    def _freeze_gi_1d_auto_range(self, scan, pending) -> None:
+        """Freeze GI 1D auto radial range once per scan before integration."""
+        if not self.gi or self.xye_only or not pending:
+            return
+        args = getattr(scan, 'bai_1d_args', None)
+        if not isinstance(args, dict) or args.get('radial_range') is not None:
+            return
+
+        img_file, img_number, img_data, img_meta, bg_raw, _ = pending[0]
+        try:
+            img_data = self._apply_threshold_inline(img_data)
+            frame_mask = self._resolve_frame_mask(scan, img_data)
+            scratch = LiveFrame(
+                img_number, img_data, poni=self.poni,
+                scan_info=img_meta, static=True, gi=True,
+                th_mtr=self.incidence_motor, bg_raw=bg_raw,
+                sample_orientation=self.sample_orientation,
+                tilt_angle=self.tilt_angle,
+                series_average=self.series_average,
+                integrator=scan._cached_integrator,
+                mask=frame_mask,
+            )
+            incident_angle = scratch._get_incident_angle()
+            fi = create_fiber_integrator(
+                scratch._poni_from_integrator(),
+                incident_angle=incident_angle,
+                tilt_angle=scratch.tilt_angle,
+                sample_orientation=self.sample_orientation,
+                angle_unit="deg",
+            )
+            scratch.integrate_1d(
+                global_mask=self.mask,
+                fiber_integrator=fi,
+                **dict(args),
+            )
+            result = getattr(scratch, 'int_1d', None)
+            if result is not None and _freeze_gi_1d_range_from_result(args, result):
+                logger.info(
+                    'GI 1D auto radial range frozen from scout frame %s: %s',
+                    img_number, args.get('radial_range'),
+                )
+        except Exception:
+            logger.debug(
+                'GI 1D auto-range scout failed for %s; continuing with '
+                'current range',
+                img_file,
+                exc_info=True,
+            )
+
+    def _freeze_gi_2d_auto_ranges(self, scan, pending) -> None:
+        """Freeze GI 2D auto ranges once per scan before integration.
+
+        pyFAI's GI auto-range is per-frame.  For angle-dependence scans that
+        means each frame can come back on a different qip/qoop or q/chi grid,
+        which the stacked NeXus writer correctly rejects.  A single scout
+        integration on the first pending frame gives us a representative grid;
+        we pad it slightly and then hand the same explicit ranges to every
+        frame in the scan.
+        """
+        if (not self.gi or self.xye_only or getattr(scan, 'skip_2d', False)
+                or not pending):
+            return
+        args = getattr(scan, 'bai_2d_args', None)
+        if not isinstance(args, dict):
+            return
+        keys = _gi_2d_range_keys(args)
+        if all(args.get(key) is not None for key in keys):
+            return
+
+        img_file, img_number, img_data, img_meta, bg_raw, _ = pending[0]
+        try:
+            img_data = self._apply_threshold_inline(img_data)
+            frame_mask = self._resolve_frame_mask(scan, img_data)
+            scratch = LiveFrame(
+                img_number, img_data, poni=self.poni,
+                scan_info=img_meta, static=True, gi=True,
+                th_mtr=self.incidence_motor, bg_raw=bg_raw,
+                sample_orientation=self.sample_orientation,
+                tilt_angle=self.tilt_angle,
+                series_average=self.series_average,
+                integrator=scan._cached_integrator,
+                mask=frame_mask,
+            )
+            incident_angle = scratch._get_incident_angle()
+            fi = create_fiber_integrator(
+                scratch._poni_from_integrator(),
+                incident_angle=incident_angle,
+                tilt_angle=scratch.tilt_angle,
+                sample_orientation=self.sample_orientation,
+                angle_unit="deg",
+            )
+            scratch.integrate_2d(
+                global_mask=self.mask,
+                fiber_integrator=fi,
+                **dict(args),
+            )
+            result = getattr(scratch, 'int_2d', None)
+            if result is not None and _freeze_gi_2d_ranges_from_result(args, result):
+                logger.info(
+                    'GI 2D auto ranges frozen from scout frame %s: %s=%s, %s=%s',
+                    img_number, keys[0], args.get(keys[0]),
+                    keys[1], args.get(keys[1]),
+                )
+        except Exception:
+            logger.debug(
+                'GI 2D auto-range scout failed for %s; continuing with '
+                'current ranges',
+                img_file,
+                exc_info=True,
+            )
 
     def _dispatch_batch_parallel(self, scan, pending):
         """Parallel batch processing using ThreadPoolExecutor.
@@ -1006,11 +1174,7 @@ class imageThread(wranglerThread):
                         img_number = frame.idx
                         img_file = _img_files.get(img_number, '')
                         if img_file:
-                            try:
-                                frame.source_file = os.path.relpath(
-                                    img_file, os.path.dirname(scan.data_file))
-                            except ValueError:
-                                frame.source_file = str(img_file)
+                            frame.source_file = os.path.abspath(str(img_file))
                         else:
                             frame.source_file = ""
                         # source_frame_idx is the *per-source-file*
@@ -1145,7 +1309,9 @@ class imageThread(wranglerThread):
         # ── GUI data (skip in batch mode — no one is looking) ────────────
         _t_h5_total = _t_h5_wait = _t_h5_write = 0.0
         if not self.batch_mode:
-            self.data_1d[int(img_number)] = frame.copy(include_2d=False)
+            self.data_1d[int(img_number)] = frame.copy_for_display(
+                include_2d=False,
+            )
             self.data_2d[int(img_number)] = {
                 'map_raw': frame.map_raw,
                 'bg_raw': frame.bg_raw,
@@ -1159,11 +1325,7 @@ class imageThread(wranglerThread):
         if not self.xye_only:
             # Set source file as relative path from HDF5 dir for NeXus provenance
             if img_file:
-                try:
-                    frame.source_file = os.path.relpath(
-                        img_file, os.path.dirname(scan.data_file))
-                except ValueError:
-                    frame.source_file = str(img_file)
+                frame.source_file = os.path.abspath(str(img_file))
             else:
                 frame.source_file = ""
             # source_frame_idx: per-source-file 0-based frame offset.

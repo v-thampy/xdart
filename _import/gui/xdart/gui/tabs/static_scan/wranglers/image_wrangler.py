@@ -185,7 +185,7 @@ class imageWrangler(wranglerWidget):
         # Setup gui elements
         self.ui = Ui_Form()
         self.ui.setupUi(self)
-        self.ui.startButton.clicked.connect(self.start)
+        self.ui.startButton.clicked.connect(self._on_start_clicked)
         # self.ui.startButton.clicked.connect(self.sigStart.emit)
         self.ui.stopButton.clicked.connect(self.stop)
         self.ui.processingModeCombo.currentTextChanged.connect(self._on_mode_changed)
@@ -511,22 +511,25 @@ class imageWrangler(wranglerWidget):
             self.ui.coresLabel.setEnabled(True)
             self.ui.maxCoresSpinBox.setEnabled(True)
         else:
+            # Both toggles stay clickable in a normal processing mode; they
+            # are kept mutually exclusive by auto-unchecking the other one
+            # rather than greying it out.  Greying Live out whenever Batch
+            # was checked left it dead after a mode switch until a run
+            # finished and enabled(True) reset it (bug #1).
             self.ui.liveCheckBox.setEnabled(True)
             self.ui.batchCheckBox.setEnabled(True)
 
-            # Mutual exclusion: when one is checked, uncheck the other
             is_live = self.ui.liveCheckBox.isChecked()
             is_batch = self.ui.batchCheckBox.isChecked()
             if is_live and is_batch:
-                # Live was just checked — uncheck batch (or vice versa).
-                # Determine which was the trigger by checking the sender.
-                # If unclear, prefer live (last action wins).
-                self.ui.batchCheckBox.setChecked(False)
-                is_batch = False
-            if is_live:
-                self.ui.batchCheckBox.setEnabled(False)
-            if is_batch:
-                self.ui.liveCheckBox.setEnabled(False)
+                # Uncheck whichever one was NOT just toggled.  When the
+                # trigger is the mode combo (or unknown), prefer Live.
+                if self.sender() is self.ui.batchCheckBox:
+                    self.ui.liveCheckBox.setChecked(False)
+                    is_live = False
+                else:
+                    self.ui.batchCheckBox.setChecked(False)
+                    is_batch = False
 
             # Sync cores enabled state with batch checkbox
             self.ui.coresLabel.setEnabled(is_batch)
@@ -578,9 +581,12 @@ class imageWrangler(wranglerWidget):
             self._prev_viewer_mode = new_vm
             self.sigViewerModeChanged.emit(new_vm)
 
-    def _set_integration_controls_enabled(self, enabled):
+    def _set_integration_controls_enabled(self, enabled, *, include_gi=True):
         """Enable or disable parameter tree groups related to integration."""
-        for group_name in ('Calibration', 'BG', 'Mask', 'GI'):
+        group_names = ['Calibration', 'BG', 'Mask']
+        if include_gi:
+            group_names.append('GI')
+        for group_name in group_names:
             try:
                 grp = self.parameters.child(group_name)
                 grp.setOpts(enabled=enabled)
@@ -598,6 +604,25 @@ class imageWrangler(wranglerWidget):
             self.parameters.child('h5_dir_browse').setOpts(enabled=enabled)
         except (AttributeError, KeyError) as e:
             logger.debug("Failed to set enabled state for h5_dir parameters: %s", e)
+
+    def _set_parameter_readonly(self, param, readonly):
+        """Recursively set pyqtgraph Parameter readonly state when available."""
+        try:
+            param.setOpts(readonly=readonly)
+        except (AttributeError, TypeError):
+            return
+        try:
+            children = param.children()
+        except AttributeError:
+            children = ()
+        for child in children:
+            self._set_parameter_readonly(child, readonly)
+
+    def _set_gi_controls_readonly(self, readonly):
+        try:
+            self._set_parameter_readonly(self.parameters.child('GI'), readonly)
+        except (AttributeError, KeyError) as e:
+            logger.debug("Failed to set GI readonly state: %s", e)
 
     def setup(self):
         """Sets up the child thread, syncs all parameters.
@@ -735,6 +760,25 @@ class imageWrangler(wranglerWidget):
             if w is not None:
                 w.setToolTip(tip)
 
+    def _on_start_clicked(self):
+        """Start button = an explicit NON-live processing run.
+
+        The Start button and the Live toggle both funnel into :meth:`start`,
+        and ``live_mode`` only ever tracks the Live toggle's checked state.
+        If Live happened to be left checked, a Start click would silently run
+        in live-watching mode ("Watching for new files...") with the Live
+        button lit.  Force a non-live run here: uncheck Live (without firing
+        its start/stop handler) and clear ``live_mode`` so the wrangler runs
+        once over the existing files and ``enabled(False)`` greys Live out for
+        the duration."""
+        if self.ui.liveCheckBox.isChecked():
+            self.ui.liveCheckBox.blockSignals(True)
+            self.ui.liveCheckBox.setChecked(False)
+            self.ui.liveCheckBox.blockSignals(False)
+        self.live_mode = False
+        self.thread.live_mode = False
+        self.start()
+
     def start(self):
         self.command = 'start'
         self.thread.command = 'start'
@@ -758,11 +802,16 @@ class imageWrangler(wranglerWidget):
         self.ui.stopButton.setEnabled(False)
         self.ui.specLabel.setText('')
         # Keep the Live toggle in sync when stopped via the Stop button or
-        # programmatically — uncheck it without re-entering stop().
+        # programmatically — uncheck it without re-entering stop().  Because
+        # the uncheck is done with signals blocked, ``_on_mode_changed`` does
+        # NOT run, so reset ``live_mode`` explicitly here; otherwise it stays
+        # stale-True and the next Start click silently runs in live mode.
         if self.ui.liveCheckBox.isChecked():
             self.ui.liveCheckBox.blockSignals(True)
             self.ui.liveCheckBox.setChecked(False)
             self.ui.liveCheckBox.blockSignals(False)
+        self.live_mode = False
+        self.thread.live_mode = False
 
     def set_poni_file(self):
         """Opens file dialogue and sets the calibration file
@@ -1139,19 +1188,34 @@ class imageWrangler(wranglerWidget):
         args:
             enable: bool, True for enabled False for disabled.
         """
-        self.tree.setEnabled(enable)
+        # Disabling the entire ParameterTree causes pyqtgraph's bool editor to
+        # repaint checked boxes as unchecked on some platforms.  Keep the tree
+        # itself enabled during an active run and disable the processing
+        # controls individually below; this preserves the visual state of the
+        # GI/Grazing checkbox while the thread uses the setup-time value.
+        self.tree.setEnabled(True)
         self.ui.startButton.setEnabled(enable)
         # Live toggle state vs. the run lifecycle:
         if enable:
-            # Run finished — reset Live to off (no re-trigger) and re-enable.
+            self._set_gi_controls_readonly(False)
+            # Run finished — reset Live to off (no re-trigger) and re-enable
+            # both toggles so the next run can be either live or batch.
             self.ui.liveCheckBox.blockSignals(True)
             self.ui.liveCheckBox.setChecked(False)
             self.ui.liveCheckBox.blockSignals(False)
             self.ui.liveCheckBox.setEnabled(True)
+            self.ui.batchCheckBox.setEnabled(True)
+            # Uncheck is signal-blocked → sync the flag (see stop()).
+            self.live_mode = False
+            self._on_mode_changed()
         else:
+            self._set_integration_controls_enabled(False, include_gi=False)
+            self._set_gi_controls_readonly(True)
             # Run active — keep Live clickable only for a *live* run (so it
-            # can be toggled off to stop); a batch run disables it.
+            # can be toggled off to stop); mode toggles stay locked until the
+            # run finishes.
             self.ui.liveCheckBox.setEnabled(self.live_mode)
+            self.ui.batchCheckBox.setEnabled(False)
 
     def stylize_ParameterTree(self):
         self.tree.setStyleSheet("""
@@ -1160,5 +1224,3 @@ class imageWrangler(wranglerWidget):
             color: rgb(30, 30, 30);
         }
             """)
-
-

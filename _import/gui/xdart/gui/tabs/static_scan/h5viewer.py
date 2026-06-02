@@ -37,6 +37,11 @@ QFileDialog = QtWidgets.QFileDialog
 QItemSelectionModel = QtCore.QItemSelectionModel
 
 
+def _clear_raw_cache_for(viewer) -> None:
+    """Reset hydrated-raw LRU state on real and lightweight test viewers."""
+    viewer._raw_cache_order = []
+
+
 class _LoadFramesWorker(QtCore.QObject):
     """M1 background worker for ``load_frames_data``.
 
@@ -79,13 +84,14 @@ class _LoadFramesWorker(QtCore.QObject):
     cancelled = QtCore.Signal(int)  # (generation,)
 
     def __init__(self, data_file, file_lock, gi, frame_ids, load_2d,
-                 generation, parent=None):
+                 generation, hydrate_raw=True, parent=None):
         super().__init__(parent)
         self.data_file = data_file
         self.file_lock = file_lock
         self.gi = gi
         self.frame_ids = list(frame_ids)
         self.load_2d = load_2d
+        self.hydrate_raw = bool(hydrate_raw)
         # N1: monotonic generation number assigned by the owning
         # H5Viewer.  Workers whose generation no longer matches
         # ``H5Viewer._load_generation`` have been superseded and
@@ -151,9 +157,28 @@ class _LoadFramesWorker(QtCore.QObject):
                 # invocation back to the GUI thread automatically
                 # because the signal target is a bound method on a
                 # QObject living on the GUI thread.
-                self.chunkLoaded.emit(
-                    self.generation, int(idx), frame, bool(self.load_2d),
+                preview = (
+                    frame.copy_for_display(include_2d=True)
+                    if (self.load_2d and self.hydrate_raw and frame.map_raw is None)
+                    else frame
                 )
+                self.chunkLoaded.emit(
+                    self.generation, int(idx), preview, bool(self.load_2d),
+                )
+                # Publish the lightweight thumbnail-backed frame first, then
+                # hydrate the detector source off the GUI thread.  A second
+                # chunk replaces the preview when raw data arrives.
+                if (self.load_2d and self.hydrate_raw
+                        and frame.map_raw is None
+                        and not self._cancel.is_set()):
+                    try:
+                        if frame._lazy_load_raw() and not self._cancel.is_set():
+                            self.chunkLoaded.emit(
+                                self.generation, int(idx), frame, True,
+                            )
+                    except Exception:
+                        logger.debug("load worker: raw frame %s unavailable",
+                                     idx, exc_info=True)
         except Exception:
             logger.exception("LoadFramesWorker crashed unexpectedly")
         finally:
@@ -489,6 +514,10 @@ class H5Viewer(QWidget):
         # draining its run loop after cancel()) from polluting the
         # new selection's data dicts.
         self._load_generation = 0
+        # Keep only a small working set of hydrated detector arrays. Reduced
+        # results and thumbnails stay cached for every loaded frame.
+        self._raw_cache_order = []
+        self._raw_cache_limit = 8
         # O6: coalesce ``sigUpdate`` emits while a chunk burst is
         # streaming in from ``_LoadFramesWorker``.  Without this, a
         # 100-frame selection fires 100 full-display repaints in
@@ -544,26 +573,31 @@ class H5Viewer(QWidget):
         if not os.path.exists(self.dirname):
             return
 
-        self.ui.listScans.clear()
-        self.ui.listScans.addItem('..')
+        lw = self.ui.listScans
+        was_blocked = lw.blockSignals(True)
+        try:
+            lw.clear()
+            lw.addItem('..')
 
-        names = sorted(os.listdir(self.dirname), key=self._natural_sort_key)
-        for name in names:
-            abspath = os.path.join(self.dirname, name)
-            if os.path.isdir(abspath):
-                self.ui.listScans.addItem(name + '/')
-            else:
-                ext = os.path.splitext(name)[1].lower()
-                if self.viewer_mode == 'image':
-                    if ext in self._IMAGE_EXTS:
-                        self.ui.listScans.addItem(name)
-                elif self.viewer_mode == 'xye':
-                    if ext in self._XYE_EXTS:
-                        self.ui.listScans.addItem(name)
+            names = sorted(os.listdir(self.dirname), key=self._natural_sort_key)
+            for name in names:
+                abspath = os.path.join(self.dirname, name)
+                if os.path.isdir(abspath):
+                    lw.addItem(name + '/')
                 else:
-                    # Normal mode: only HDF5/NeXus scan files
-                    if name.split('.')[-1] in ('h5', 'hdf5', 'nxs'):
-                        self.ui.listScans.addItem(name)
+                    ext = os.path.splitext(name)[1].lower()
+                    if self.viewer_mode == 'image':
+                        if ext in self._IMAGE_EXTS:
+                            lw.addItem(name)
+                    elif self.viewer_mode == 'xye':
+                        if ext in self._XYE_EXTS:
+                            lw.addItem(name)
+                    else:
+                        # Normal mode: only HDF5/NeXus scan files
+                        if name.split('.')[-1] in ('h5', 'hdf5', 'nxs'):
+                            lw.addItem(name)
+        finally:
+            lw.blockSignals(was_blocked)
 
     # ── Selection helper ──────────────────────────────────────────────
     def set_current_frame(self, item_or_row):
@@ -782,6 +816,8 @@ class H5Viewer(QWidget):
 
         XYE mode uses _scans_selection_changed instead to avoid double-firing.
         """
+        if getattr(self, '_suspend_scan_selection_loads', False):
+            return
         if self.viewer_mode is not None and self.viewer_mode != 'xye':
             self.scans_clicked(q)
 
@@ -796,6 +832,8 @@ class H5Viewer(QWidget):
         the selection is fully updated, avoiding off-by-one with
         Shift+arrow).
         """
+        if getattr(self, '_suspend_scan_selection_loads', False):
+            return
         if current is None or self.viewer_mode is None:
             return
         # XYE mode: handled by _scans_selection_changed
@@ -813,6 +851,8 @@ class H5Viewer(QWidget):
         Uses itemSelectionChanged which fires after the selection is
         fully updated, so Shift+arrow works correctly for multi-select.
         """
+        if getattr(self, '_suspend_scan_selection_loads', False):
+            return
         if self.viewer_mode != 'xye':
             return
         selected = self.ui.listScans.selectedItems()
@@ -846,6 +886,8 @@ class H5Viewer(QWidget):
         Image Viewer: loads a single image or populates listData for multi-frame files.
         XYE Viewer: loads a single xye file as a 1D line.
         """
+        if getattr(self, '_suspend_scan_selection_loads', False):
+            return
         try:
             item_text = q.data(0)
 
@@ -901,6 +943,7 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.data_1d.clear()
             self.data_2d.clear()
+            _clear_raw_cache_for(self)
         self.frame_ids.clear()
 
         idx = 1
@@ -916,9 +959,16 @@ class H5Viewer(QWidget):
                 logger.debug("Could not load xye file %s", fpath, exc_info=True)
                 continue
 
-            # Guess unit from filename prefix
+            # xdart XYE exports encode the integration unit in the prefix.
+            # Other XYE files do not carry enough information to transform
+            # or label the x-axis reliably.
             fname_lower = os.path.basename(fpath).lower()
-            unit = 'q_A^-1' if fname_lower.startswith('iq') else '2th_deg'
+            if fname_lower.startswith('iq_'):
+                unit = 'q_A^-1'
+            elif fname_lower.startswith('itth_'):
+                unit = '2th_deg'
+            else:
+                unit = 'unknown'
 
             int_1d = IntegrationResult1D(
                 radial=xdata, intensity=ydata, sigma=sigma, unit=unit,
@@ -963,9 +1013,43 @@ class H5Viewer(QWidget):
         try:
             import h5py
             with h5py.File(fpath, 'r') as f:
-                return ('entry/integrated_1d' in f
+                if ('entry/integrated_1d' in f
                         or 'entry/integrated_2d' in f
-                        or 'entry/frames' in f)
+                        or 'entry/frames' in f):
+                    return True
+                if 'entry/reduction' not in f:
+                    return False
+
+                raw_candidates = (
+                    'entry/instrument/detector/data',
+                    'entry/instrument/detector/data_000001',
+                    'entry/data/data',
+                    'entry/measurement/data',
+                    'entry/data',
+                )
+                for candidate in raw_candidates:
+                    if candidate in f:
+                        obj = f[candidate]
+                        if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
+                            return False
+
+                entry = f.get('entry')
+                instrument = (
+                    entry.get('instrument') if hasattr(entry, 'get') else None
+                )
+                if isinstance(instrument, h5py.Group):
+                    for obj in instrument.values():
+                        nx_class = obj.attrs.get('NX_class') if isinstance(
+                            obj, h5py.Group,
+                        ) else None
+                        if (isinstance(obj, h5py.Group)
+                                and nx_class in (b'NXdetector', 'NXdetector')
+                                and 'data' in obj
+                                and isinstance(obj['data'], h5py.Dataset)
+                                and obj['data'].ndim >= 2):
+                            return False
+
+                return True
         except Exception:
             return False
 
@@ -979,8 +1063,13 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.data_1d.clear()
             self.data_2d.clear()
+            _clear_raw_cache_for(self)
         self.frame_ids.clear()
-        self.ui.listData.clear()
+        was_blocked = self.ui.listData.blockSignals(True)
+        try:
+            self.ui.listData.clear()
+        finally:
+            self.ui.listData.blockSignals(was_blocked)
 
         ext = os.path.splitext(fpath)[1].lower()
         nframes = 1
@@ -995,22 +1084,33 @@ class H5Viewer(QWidget):
         if self._viewer_is_xdart:
             from ssrl_xrd_tools.io import get_frames as _get_frames
             try:
-                labels = [int(x) for x in _get_frames(fpath)]
+                labels = [int(x) for x in _get_frames(fpath, union=True)]
             except Exception:
                 logger.debug("Failed to read frame labels from %s", fpath, exc_info=True)
                 labels = []
             if labels:
                 self._viewer_image_path = fpath
                 self._viewer_image_nframes = len(labels)
-                for lbl in labels:
-                    self.ui.listData.addItem(str(lbl))
-                self._load_single_frame(fpath, frame_idx=labels[0], frame_id=labels[0])
-                self.frame_ids.append(str(labels[0]))
-                self.ui.listData.setCurrentRow(0)
+                self._populate_image_viewer_rows(labels, labels[0])
+                loaded = self._load_single_frame(
+                    fpath, frame_idx=labels[0], frame_id=labels[0],
+                )
+                if loaded is not False:
+                    self.frame_ids.append(str(labels[0]))
                 self._remember_displayed_frames()
                 self.sigUpdate.emit()
                 return
-            # No labels found — fall through to the generic handling.
+            logger.warning(
+                '%s is an xdart processed file without v2 raw-frame '
+                'source pointers; Image Viewer cannot treat it as a raw '
+                'detector image stack.',
+                os.path.basename(fpath),
+            )
+            self._viewer_image_path = None
+            self._viewer_image_nframes = 0
+            self._remember_displayed_frames()
+            self.sigUpdate.emit()
+            return
 
         # Check for multi-frame files
         if ext in ('.h5', '.hdf5', '.nxs'):
@@ -1033,25 +1133,47 @@ class H5Viewer(QWidget):
 
         if nframes > 1 or (is_hdf5 and nframes >= 1):
             # Multi-frame or HDF5: populate listData with frame numbers
-            for i in range(nframes):
-                self.ui.listData.addItem(str(i + 1))
+            labels = list(range(1, nframes + 1))
+            self._populate_image_viewer_rows(labels, 1)
             # Store the file path so data_changed can load individual frames
             self._viewer_image_path = fpath
             self._viewer_image_nframes = nframes
             # Load and display first frame
-            self._load_single_frame(fpath, frame_idx=0, frame_id=1)
-            self.frame_ids.append('1')
-            self.ui.listData.setCurrentRow(0)
+            loaded = self._load_single_frame(fpath, frame_idx=0, frame_id=1)
+            if loaded is not False:
+                self.frame_ids.append('1')
         else:
-            # Single frame (tif, raw, edf): load directly, leave listData blank
-            self._viewer_image_path = None
-            self._load_single_frame(fpath, frame_idx=0, frame_id=1)
-            self.frame_ids.append('1')
+            # Single frame (tif, raw, edf): still publish a synthetic row so
+            # Image Viewer has one coherent selection/display state.
+            self._viewer_image_path = fpath
+            self._viewer_image_nframes = 1
+            self._populate_image_viewer_rows([1], 1)
+            loaded = self._load_single_frame(fpath, frame_idx=0, frame_id=1)
+            if loaded is not False:
+                self.frame_ids.append('1')
 
         # Sync the live-scan boundary cache with whatever just landed in
         # listData (frame-numbers list, or empty for single-frame files).
         self._remember_displayed_frames()
         self.sigUpdate.emit()
+
+    def _populate_image_viewer_rows(self, labels, selected_label=None):
+        """Populate Image Viewer frame rows without emitting selection signals."""
+        lw = self.ui.listData
+        was_blocked = lw.blockSignals(True)
+        try:
+            lw.clear()
+            for label in labels:
+                lw.addItem(str(label))
+            if selected_label is not None:
+                try:
+                    row = list(labels).index(selected_label)
+                except ValueError:
+                    row = -1
+                if row >= 0:
+                    lw.setCurrentRow(row)
+        finally:
+            lw.blockSignals(was_blocked)
 
     # Common detector shapes to try for raw binary files (name, shape)
     _RAW_DETECTOR_FALLBACKS = [
@@ -1078,16 +1200,52 @@ class H5Viewer(QWidget):
         # detector frame via the stored per-frame source pointer (falling
         # back to the stored thumbnail).  ``frame_id`` is the frame label.
         if getattr(self, '_viewer_is_xdart', False):
+            thumb_data = None
             try:
                 from ssrl_xrd_tools.io import get_raw_frame
                 img_data = np.asarray(
-                    get_raw_frame(fpath, frame=frame_id), dtype=float,
+                    get_raw_frame(
+                        fpath, frame=frame_id, allow_thumbnail=False,
+                    ),
+                    dtype=float,
                 )
             except Exception:
-                logger.warning('Could not load raw frame %s from processed file %s',
-                               frame_id, os.path.basename(fpath))
-                logger.debug('get_raw_frame failed', exc_info=True)
-                return
+                logger.debug(
+                    'Raw source for processed frame %s failed; trying '
+                    'thumbnail fallback',
+                    frame_id,
+                    exc_info=True,
+                )
+                try:
+                    img_data = np.asarray(
+                        get_raw_frame(
+                            fpath, frame=frame_id, allow_thumbnail=True,
+                        ),
+                        dtype=float,
+                    )
+                    thumb_data = img_data
+                except Exception:
+                    logger.debug(
+                        'get_raw_frame thumbnail fallback failed for frame %s; '
+                        'trying direct thumbnail read',
+                        frame_id,
+                        exc_info=True,
+                    )
+                    try:
+                        img_data = self._read_processed_thumbnail(
+                            fpath, frame_id,
+                        )
+                        thumb_data = img_data
+                    except Exception:
+                        logger.warning(
+                            'Could not load raw frame or thumbnail %s from '
+                            'processed file %s',
+                            frame_id, os.path.basename(fpath),
+                        )
+                        logger.debug(
+                            'processed image fallback failed', exc_info=True,
+                        )
+                        return False
             with self.data_lock:
                 self.data_2d[int(frame_id)] = {
                     'map_raw': img_data,
@@ -1095,12 +1253,18 @@ class H5Viewer(QWidget):
                     'mask': None,
                     'int_2d': None,
                     'gi_2d': {},
-                    'thumbnail': None,
+                    'thumbnail': thumb_data,
                 }
                 frame = LiveFrame(idx=frame_id, static=True, gi=False)
                 frame.scan_info = {'source_file': os.path.basename(fpath)}
                 self.data_1d[int(frame_id)] = frame
-            return
+            logger.debug(
+                'Image Viewer loaded processed frame %s from %s: shape=%s '
+                'finite=%d',
+                frame_id, os.path.basename(fpath), getattr(img_data, 'shape', None),
+                int(np.isfinite(img_data).sum()),
+            )
+            return True
 
         try:
             img_data = np.asarray(
@@ -1115,10 +1279,10 @@ class H5Viewer(QWidget):
                 if img_data is None:
                     logger.warning('Cannot load %s — raw file does not match any '
                                    'known detector shape.', os.path.basename(fpath))
-                    return
+                    return False
             else:
                 logger.warning('Could not load image %s frame %d', fpath, frame_idx)
-                return
+                return False
 
         with self.data_lock:
             self.data_2d[int(frame_id)] = {
@@ -1133,10 +1297,36 @@ class H5Viewer(QWidget):
             frame = LiveFrame(idx=frame_id, static=True, gi=False)
             frame.scan_info = {'source_file': os.path.basename(fpath)}
             self.data_1d[int(frame_id)] = frame
+        logger.debug(
+            'Image Viewer loaded frame %s from %s: shape=%s finite=%d '
+            'min=%s max=%s',
+            frame_id, os.path.basename(fpath), getattr(img_data, 'shape', None),
+            int(np.isfinite(img_data).sum()),
+            np.nanmin(img_data) if np.isfinite(img_data).any() else None,
+            np.nanmax(img_data) if np.isfinite(img_data).any() else None,
+        )
+        return True
+
+    @staticmethod
+    def _read_processed_thumbnail(fpath, frame_id):
+        """Read a stored processed-file thumbnail directly."""
+        import h5py
+        from ssrl_xrd_tools.io.read import _dequantize_thumbnail
+
+        with h5py.File(fpath, 'r') as f:
+            key = f'entry/frames/frame_{int(frame_id):04d}/thumbnail'
+            if key not in f:
+                raise KeyError(
+                    f'No thumbnail for frame {frame_id} in {fpath}',
+                )
+            return np.asarray(_dequantize_thumbnail(f[key]), dtype=float)
     
     def _try_raw_detectors(self, fpath):
         """Try reading a raw binary file with common detector shapes."""
-        for name, shape in self._RAW_DETECTOR_FALLBACKS:
+        fallbacks = getattr(
+            self, "_RAW_DETECTOR_FALLBACKS", H5Viewer._RAW_DETECTOR_FALLBACKS,
+        )
+        for name, shape in fallbacks:
             try:
                 img_data = np.asarray(
                     read_image(fpath, detector_shape=shape), dtype=float,
@@ -1210,14 +1400,19 @@ class H5Viewer(QWidget):
             viewer_path = getattr(self, '_viewer_image_path', None)
             if viewer_path is not None:
                 # Multi-frame: load selected frames on demand
+                loaded_ids = []
                 for idx_str in idxs:
                     idx = int(idx_str)
                     if idx not in self.data_2d:
-                        self._load_single_frame(
+                        loaded = self._load_single_frame(
                             viewer_path,
-                            frame_idx=idx - 1,  # listData shows 1-based
+                            frame_idx=idx - 1,  # generic listData is 1-based
                             frame_id=idx,
                         )
+                        if loaded is False:
+                            continue
+                    loaded_ids.append(str(idx))
+                self.frame_ids[:] = loaded_ids
             # Single-frame: data already loaded by _load_image_file
             self.sigUpdate.emit()
             return
@@ -1274,6 +1469,7 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.data_1d.clear()
             self.data_2d.clear()
+            _clear_raw_cache_for(self)
         self.new_scan = True
 
     def open_folder(self):
@@ -1291,6 +1487,7 @@ class H5Viewer(QWidget):
             with self.data_lock:
                 self.data_1d.clear()
                 self.data_2d.clear()
+                _clear_raw_cache_for(self)
             self.new_scan = True
             self.update_scans()
     
@@ -1371,6 +1568,7 @@ class H5Viewer(QWidget):
             frame_ids=frame_ids,
             load_2d=load_2d,
             generation=gen,
+            hydrate_raw=True,
         )
         thread = QtCore.QThread(self)
         worker.moveToThread(thread)
@@ -1423,9 +1621,9 @@ class H5Viewer(QWidget):
         try:
             with self.data_lock:
                 if not load_2d:
-                    self.data_1d[int(idx)] = frame.copy(include_2d=False)
+                    self.data_1d[int(idx)] = frame.copy_for_display(include_2d=False)
                 else:
-                    self.data_1d[int(idx)] = frame.copy(include_2d=False)
+                    self.data_1d[int(idx)] = frame.copy_for_display(include_2d=False)
                     self.data_2d[int(idx)] = {
                         'map_raw': frame.map_raw,
                         'bg_raw': frame.bg_raw,
@@ -1434,6 +1632,8 @@ class H5Viewer(QWidget):
                         'gi_2d': frame.gi_2d,
                         'thumbnail': frame.thumbnail,
                     }
+                    if frame.map_raw is not None:
+                        self._remember_hydrated_raw(int(idx))
             # O6: coalesce display updates while a chunk burst is
             # streaming in.  Schedule (or restart) a debounced emit
             # rather than firing once per chunk.  ``_on_load_worker_finished``
@@ -1442,6 +1642,73 @@ class H5Viewer(QWidget):
             self._update_coalesce_timer.start()
         except (AttributeError, RuntimeError) as e:
             logger.debug("absorb_chunk skipped frame %s: %s", idx, e)
+
+    def _remember_hydrated_raw(self, idx: int) -> None:
+        """Retain a bounded LRU of full detector arrays in ``data_2d``."""
+        order = getattr(self, "_raw_cache_order", [])
+        if idx in order:
+            order.remove(idx)
+        order.append(idx)
+        limit = max(1, int(getattr(self, "_raw_cache_limit", 8)))
+        while len(order) > limit:
+            stale = order.pop(0)
+            payload = self.data_2d.get(stale)
+            if payload is not None:
+                payload["map_raw"] = None
+        self._raw_cache_order = order
+
+    def _clear_raw_cache(self) -> None:
+        """Reset the hydrated-raw LRU after data_2d is cleared."""
+        _clear_raw_cache_for(self)
+
+    def cancel_pending_loads(self) -> None:
+        """Cancel stale background frame hydration and reject queued chunks."""
+        self._load_generation += 1
+        worker = getattr(self, '_load_worker', None)
+        if worker is not None:
+            try:
+                worker.cancel()
+            except (RuntimeError, AttributeError):
+                pass
+        timer = getattr(self, '_update_coalesce_timer', None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+
+    def enter_viewer_mode_cleanup(self) -> None:
+        """Clear scan-frame state before Image/XYE viewer data is loaded."""
+        self.cancel_pending_loads()
+
+        with self.data_lock:
+            self.data_1d.clear()
+            self.data_2d.clear()
+            self._clear_raw_cache()
+        self.frame_ids.clear()
+        self.latest_idx = None
+        self.new_scan_loaded = False
+
+        for attr in ('_viewer_image_path', '_viewer_image_nframes',
+                     '_viewer_is_xdart'):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except AttributeError:
+                    pass
+
+        lw = self.ui.listData
+        was_blocked = lw.blockSignals(True)
+        try:
+            lw.clear()
+        finally:
+            lw.blockSignals(was_blocked)
+        self._remember_displayed_frames()
+
+        scans = self.ui.listScans
+        was_blocked = scans.blockSignals(True)
+        try:
+            scans.clearSelection()
+            scans.setCurrentRow(-1)
+        finally:
+            scans.blockSignals(was_blocked)
 
     def _clear_load_worker_refs(self) -> None:
         """Drop ``_load_worker`` / ``_load_thread`` once the worker

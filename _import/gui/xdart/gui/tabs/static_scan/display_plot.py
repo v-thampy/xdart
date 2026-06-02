@@ -47,6 +47,38 @@ class DisplayPlotMixin:
 
     # ── 1D plot data accumulation ─────────────────────────────────
 
+    def _loaded_1d_overlay_labels(self, idxs, *, max_rows=None):
+        """Return loaded frame ids and labels that can produce 1D rows."""
+        kept = []
+        names = []
+        slice_suffix = ''
+        try:
+            if self.ui.slice.isEnabled() and self.ui.slice.isChecked():
+                center = self.ui.slice_center.value()
+                width = self.ui.slice_width.value()
+                slice_suffix = f' [{center:.1f}\u00b1{width:.1f}]'
+        except Exception:
+            slice_suffix = ''
+        for idx in idxs:
+            idx = int(idx)
+            frame_1d = self.data_1d.get(idx)
+            if frame_1d is None:
+                continue
+            frame_2d = self.data_2d.get(idx)
+            try:
+                x, y = self.get_int_1d(frame_1d, frame_2d, idx)
+            except Exception:
+                logger.debug("overlay label rebuild skipped frame %s",
+                             idx, exc_info=True)
+                continue
+            if x is None or y is None:
+                continue
+            kept.append(idx)
+            names.append(f'{self.scan.name}_{idx}{slice_suffix}')
+            if max_rows is not None and len(kept) >= max_rows:
+                break
+        return kept, names
+
     def update_plot(self):
         """Updates data in plot frame
         """
@@ -76,6 +108,7 @@ class DisplayPlotMixin:
             self.ui.slice.setChecked(False)
             ydata, xdata = self.get_frames_int_1d()
             if xdata is None or ydata is None:
+                self.clear_plot_view()
                 return
 
         if self.scan.series_average:
@@ -109,14 +142,37 @@ class DisplayPlotMixin:
         self._last_plot_unit = current_plot_unit
 
         # In Overlay/Waterfall: accumulate new frames, skip duplicates.
-        # In Single/Sum/Average: always replace with current selection.
+        # On a unit change, rebuild the accumulated set in the new unit
+        # instead of appending across incompatible x grids or dropping all
+        # prior curves.  In Single/Sum/Average: always replace with the
+        # current selection.
         current_method = self.ui.plotMethod.currentText()
+        overlay_mode = current_method in ('Overlay', 'Waterfall')
         accumulate = (current_method in ('Overlay', 'Waterfall')
                       and (not unit_changed)
                       and len(self.plot_data[0]) > 0)
 
-        if accumulate:
-            for frame_name, row in zip(frame_names, ydata):
+        if (overlay_mode and unit_changed
+                and len(getattr(self, 'overlaid_idxs', [])) > 0):
+            rebuild_idxs = list(self.overlaid_idxs)
+            y_new, x_new = self.get_frames_int_1d(rebuild_idxs)
+            if x_new is not None and y_new is not None:
+                if self.bkg_1d is not None:
+                    y_new = y_new - self.bkg_1d
+                if y_new.ndim == 1:
+                    y_new = y_new[np.newaxis, :]
+                self.plot_data = [x_new, y_new]
+                kept, kept_names = self._loaded_1d_overlay_labels(
+                    rebuild_idxs, max_rows=y_new.shape[0],
+                )
+                self.overlaid_idxs = kept
+                self.frame_names = kept_names
+            else:
+                self.plot_data = [xdata, ydata]
+                self.frame_names = list(frame_names)
+                self.overlaid_idxs = list(self.idxs_1d)
+        elif accumulate:
+            for idx, frame_name, row in zip(self.idxs_1d, frame_names, ydata):
                 if frame_name not in self.frame_names:
                     old_x = self.plot_data[0]
                     if old_x.shape == xdata.shape and np.allclose(old_x, xdata):
@@ -143,10 +199,12 @@ class DisplayPlotMixin:
                         self.plot_data = [merged_x,
                                           np.vstack((new_old, new_row))]
                     self.frame_names.append(frame_name)
+                    self.overlaid_idxs.append(int(idx))
         else:
             # Fresh start: Single/Sum/Average, unit changed, or no existing data
             self.plot_data = [xdata, ydata]
             self.frame_names = list(frame_names)
+            self.overlaid_idxs = list(self.idxs_1d)
 
         xdata, ydata = self.plot_data
         if xdata.size == 0 or ydata.size == 0:
@@ -176,21 +234,42 @@ class DisplayPlotMixin:
         except Exception:
             logger.debug("sigPlotMethodChanged emit failed", exc_info=True)
 
+        if getattr(self, 'viewer_mode', None) == 'xye':
+            if new_method in ('Single', 'Sum', 'Average'):
+                self.clear_overlay()
+            self._update_xye_viewer()
+            return
+
         if new_method == 'Single':
             # Reset accumulated data — rebuild from current selection
             self.plot_data = [np.array([]), np.array([])]
             self.frame_names = []
+            self.overlaid_idxs = []
             self.update_plot()
         elif new_method in ('Sum', 'Average'):
             # No accumulation needed: aggregation happens inside
             # update_1d_view() based on the current selection.
             self.plot_data = [np.array([]), np.array([])]
             self.frame_names = []
+            self.overlaid_idxs = []
             self.update_plot()
         else:
             # Overlay / Waterfall: keep existing accumulated curves and
             # just refresh the rendered view.
             self.update_plot_view()
+
+    def _current_plot_axis_label(self):
+        """Return the bottom-axis label and unit for the current 1D view."""
+        if getattr(self, 'viewer_mode', None) == 'xye':
+            axis = getattr(self, '_viewer_x_axis_label', None)
+            if axis is not None:
+                return axis
+
+        plot_text = self.ui.plotUnit.currentText()
+        m = re.match(r'^(.+?)\s*\((.+)\)$', plot_text)
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
+        return plot_text, ''
 
     # ── 1D plot view rendering ────────────────────────────────────
 
@@ -285,14 +364,7 @@ class DisplayPlotMixin:
 
             self.curves[0].setData(s_xdata, s_ydata.squeeze())
 
-        # Apply labels to plot — parse from plotUnit combo text
-        plot_text = self.ui.plotUnit.currentText()
-        # Extract label and units from "Label (Units)" format
-        m = re.match(r'^(.+?)\s*\((.+)\)$', plot_text)
-        if m:
-            _xl, _xu = m.group(1).strip(), m.group(2).strip()
-        else:
-            _xl, _xu = plot_text, ''
+        _xl, _xu = self._current_plot_axis_label()
         self.plot.setLabel("bottom", _xl, units=_xu)
         self.plot.setLabel("left", ylabel)
 
@@ -367,13 +439,7 @@ class DisplayPlotMixin:
         self.wf_widget.setImage(data.T, scale=self.scale, cmap=self.cmap)
         self.wf_widget.setRect(rect)
 
-        # Parse label from plotUnit combo text
-        plot_text = self.ui.plotUnit.currentText()
-        m = re.match(r'^(.+?)\s*\((.+)\)$', plot_text)
-        if m:
-            _xl, _xu = m.group(1).strip(), m.group(2).strip()
-        else:
-            _xl, _xu = plot_text, ''
+        _xl, _xu = self._current_plot_axis_label()
         self.wf_widget.image_plot.setLabel("bottom", _xl, units=_xu)
         self.wf_widget.image_plot.setLabel("left", self.wf_yaxis)
 
@@ -411,9 +477,12 @@ class DisplayPlotMixin:
         rect = get_rect(s_xdata[:, 0], s_ydata[0])
         self.wf_widget.setRect(rect)
 
-        plotUnit = self.ui.plotUnit.currentIndex()
-        self.wf_widget.image_plot.setLabel("bottom", x_labels_1D[plotUnit],
-                                           units=x_units_1D[plotUnit])
+        if getattr(self, 'viewer_mode', None) == 'xye':
+            _xl, _xu = self._current_plot_axis_label()
+        else:
+            plotUnit = self.ui.plotUnit.currentIndex()
+            _xl, _xu = x_labels_1D[plotUnit], x_units_1D[plotUnit]
+        self.wf_widget.image_plot.setLabel("bottom", _xl, units=_xu)
         self.wf_widget.image_plot.setLabel("left", self.wf_yaxis)
 
         return data

@@ -14,7 +14,7 @@ shared, headless-reusable primitives in
 This module is now a thin GUI-side adapter: it gathers the LiveScan's
 in-memory state (frames, scan_data, geometry, PONI, thumbnails), decides
 *which* frames to hand the stacked-write primitive (the O(K) append
-cursor + the "rewrite from all frames on a shape change" guard live
+cursor + the "require an explicit full rewrite on axis change" guard live
 here), and keeps the things that are genuinely xdart-specific —
 NFS-retry file open, NXprocess provenance, per-frame thumbnails, the
 detector/source instrument stamp.
@@ -44,6 +44,8 @@ from __future__ import annotations
 import logging
 import os
 import time
+import hashlib
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
 
@@ -58,6 +60,51 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class NexusWriteCursor:
+    """Trusted append position for one live scan output file."""
+
+    path: str
+    groups: dict[str, tuple[int, int | None, tuple]] = field(default_factory=dict)
+    metadata: tuple[int, int | None, tuple] | None = None
+    instrument: tuple | None = None
+
+
+def _write_cursor(scan, h5f) -> NexusWriteCursor:
+    path = os.fspath(h5f.filename)
+    cursor = getattr(scan, "_nexus_write_cursor", None)
+    if cursor is None or cursor.path != path:
+        cursor = NexusWriteCursor(path=path)
+        try:
+            scan._nexus_write_cursor = cursor
+        except AttributeError:
+            pass
+    return cursor
+
+
+def _index_structure_signature(index, n: int) -> tuple:
+    """Cheaply identify whether the saved prefix can still be trusted."""
+    version = getattr(index, "_structure_version", None)
+    if version is not None:
+        return ("version", int(version))
+    prefix = [int(x) for x in list(index)[:n]]
+    return ("fingerprint", len(prefix), hash(tuple(prefix)))
+
+
+def _array_digest(arr) -> tuple:
+    if arr is None:
+        return ("none",)
+    try:
+        a = np.asarray(arr)
+    except (TypeError, ValueError):
+        return ("invalid", repr(arr))
+    if a.size == 0:
+        return ("empty",)
+    ac = np.ascontiguousarray(a)
+    digest = hashlib.blake2b(ac.view(np.uint8), digest_size=16).hexdigest()
+    return (tuple(ac.shape), str(ac.dtype), digest)
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +226,25 @@ def save_scan_to_nexus(
         _ensure_nxentry(f, entry)
         _t0 = _tick("entry", _t0)
         h5f = _h5(f)
+        cursor = _write_cursor(scan, h5f)
 
-        # 1. Provenance — append mode: only on first save or finalize.
+        # 1. Stacked integrated_1d and integrated_2d (delegated to
+        #    ssrl_xrd_tools.io.nexus.write_integrated_stack).  Select and
+        # validate both outputs before either is written so a 2D mismatch
+        # cannot leave 1D one frame ahead — or even refresh provenance.
+        prepared_1d = _prepare_integrated_1d(
+            f, scan, entry=entry,
+            replace_frame_indices=replace_frame_indices,
+            cursor=cursor,
+        )
+        prepared_2d = _prepare_integrated_2d(
+            f, scan, entry=entry,
+            replace_frame_indices=replace_frame_indices,
+            cursor=cursor,
+        )
+        _validate_prepared_integrated(h5f.require_group(entry), prepared_1d, prepared_2d)
+
+        # 2. Provenance — append mode: only on first save or finalize.
         # Replace mode: always rewrite so the persisted ``bai_*_args``
         # reflect whatever parameters the reintegration used (this is
         # the whole reason the user kicked off a re-integration in the
@@ -189,13 +253,9 @@ def save_scan_to_nexus(
             _write_reduction(h5f, scan, entry=entry)
         _t0 = _tick("reduction", _t0)
 
-        # 2. Stacked integrated_1d and integrated_2d (delegated to
-        #    ssrl_xrd_tools.io.nexus.write_integrated_stack).
-        _write_integrated_1d(f, scan, entry=entry,
-                             replace_frame_indices=replace_frame_indices)
+        _commit_integrated_1d(f, prepared_1d)
         _t0 = _tick("integrated_1d", _t0)
-        _write_integrated_2d(f, scan, entry=entry,
-                             replace_frame_indices=replace_frame_indices)
+        _commit_integrated_2d(f, prepared_2d)
         _t0 = _tick("integrated_2d", _t0)
 
         # 3-6: per-frame metadata, positioners, derived geometry and
@@ -215,9 +275,6 @@ def save_scan_to_nexus(
             # need them — live viewers index by frame_index from the
             # stacked integrated_* datasets, and the scan motor columns
             # are still inspectable via the source NeXus / SPEC file.
-            instr_path = f"{entry}/instrument"
-            first_instr = instr_path not in h5f
-
             # Per-frame metadata tables (scan_data, positioners,
             # per_frame_geometry) must stay the SAME length as the stacked
             # integrated_* rows.  Live mode never passes finalize=True and
@@ -226,28 +283,19 @@ def save_scan_to_nexus(
             # reloaded file then has e.g. 5 integrated frames but 2 metadata
             # rows (read_scan drops the short columns).  Rewrite each
             # whenever it's stale (on-disk length != current frame count).
-            # They're small metadata arrays (not images), so the full-table
-            # rewrite is cheap even per-frame.
-            n_frames = len(scan.frames.index)
-            sd_stale = _per_frame_len(h5f, f"{entry}/scan_data/frame_index") != n_frames
-            geom_stale = (
-                _per_frame_len(h5f, f"{entry}/per_frame_geometry/frame_index")
-                != n_frames
+            # Use tail upserts during ordered acquisition; reconcile the full
+            # metadata tables only after reload, reorder, or finalization.
+            _write_incremental_metadata(
+                f, scan, entry=entry, cursor=cursor, finalize=finalize,
             )
-            pos_stale = _positioners_len(h5f, entry) != n_frames
-
-            if finalize or sd_stale:
-                _write_scan_metadata(f, scan, entry=entry)
-                _t0 = _tick("scan_metadata", _t0)
-            if finalize or pos_stale:
-                _write_positioners(f, scan, entry=entry)
-                _t0 = _tick("positioners", _t0)
-            if finalize or geom_stale:
-                _write_per_frame_geometry(f, scan, entry=entry)
-                _t0 = _tick("per_frame_geometry", _t0)
-            if finalize or first_instr:
-                _write_instrument(f, scan, entry=entry)
-                _t0 = _tick("instrument", _t0)
+            _t0 = _tick("frame_metadata_tables", _t0)
+        instr_path = f"{entry}/instrument"
+        first_instr = instr_path not in h5f
+        instrument_sig = _instrument_signature(scan)
+        if finalize or first_instr or cursor.instrument != instrument_sig:
+            _write_instrument(f, scan, entry=entry)
+            cursor.instrument = instrument_sig
+            _t0 = _tick("instrument", _t0)
 
         # 7. Stitched outputs (if present on the scan) — finalize only.
         if finalize:
@@ -338,37 +386,8 @@ def _existing_dataset_n(h5f, path: str) -> int:
     return int(g["intensity"].shape[0])
 
 
-def _per_frame_len(h5f, ds_path: str) -> int:
-    """First-axis length of a per-frame dataset (e.g. a ``frame_index``), or
-    -1 if absent — used to detect a stale per-frame metadata table."""
-    if ds_path in h5f:
-        try:
-            return int(h5f[ds_path].shape[0])
-        except (TypeError, IndexError):
-            return -1
-    return -1
-
-
-def _positioners_len(h5f, entry: str) -> int:
-    """Length of any one NXpositioner ``value`` array (sample or detector),
-    or -1 if no positioners exist — staleness probe for the positioner
-    tables, which have no single frame_index of their own."""
-    for grp_path in (f"{entry}/sample/positioners",
-                     f"{entry}/instrument/detector/positioners"):
-        if grp_path not in h5f:
-            continue
-        grp = h5f[grp_path]
-        for key in grp:
-            val = grp[key].get("value") if hasattr(grp[key], "get") else None
-            if val is not None:
-                try:
-                    return int(val.shape[0])
-                except (TypeError, IndexError):
-                    return -1
-    return -1
-
-
-def _new_frames_for_write(scan, h5f, group_path: str) -> tuple[list, int]:
+def _new_frames_for_write(scan, h5f, group_path: str,
+                          cursor: NexusWriteCursor | None = None) -> tuple[list, int]:
     """Return ``(new_frames, existing_n)`` for an incremental append.
 
     ``existing_n`` is the on-disk row count for this group's
@@ -387,6 +406,19 @@ def _new_frames_for_write(scan, h5f, group_path: str) -> tuple[list, int]:
     total_n = len(scan.frames.index)
     if existing_n > total_n:
         return [], -1
+    if cursor is not None and group_path in cursor.groups:
+        cached_n, cached_last, cached_sig = cursor.groups[group_path]
+        disk_last = (
+            int(h5f[group_path]["frame_index"][existing_n - 1])
+            if existing_n and group_path in h5f and "frame_index" in h5f[group_path]
+            else None
+        )
+        memory_last = int(scan.frames.index[existing_n - 1]) if existing_n else None
+        memory_sig = _index_structure_signature(scan.frames.index, existing_n)
+        if (cached_n == existing_n and cached_last == disk_last
+                and cached_sig == memory_sig and memory_last == disk_last):
+            new_indices = list(scan.frames.index[existing_n:])
+            return [scan.frames[i] for i in new_indices], existing_n
     # Select frames whose *label* isn't already on disk, not a positional
     # tail slice.  A late/out-of-order frame (e.g. frame 1 arriving after
     # [0, 2] are saved) sits at a position inside the slice the tail would
@@ -395,14 +427,37 @@ def _new_frames_for_write(scan, h5f, group_path: str) -> tuple[list, int]:
     # writes exactly the rows missing from the stack.
     on_disk: set = set()
     if group_path in h5f and "frame_index" in h5f[group_path]:
-        on_disk = {
+        disk_ids = [
             int(x) for x in np.asarray(
                 h5f[group_path]["frame_index"][()]
             ).ravel()
-        }
+        ]
+        on_disk = set(disk_ids)
+        live_ids = {int(x) for x in scan.frames.index}
+        if not on_disk.issubset(live_ids):
+            return [], -2
     new_indices = [i for i in scan.frames.index if int(i) not in on_disk]
     new_frames = [scan.frames[i] for i in new_indices]
     return new_frames, existing_n
+
+
+def _refresh_group_cursor(
+    cursor: NexusWriteCursor | None,
+    h5f,
+    group_path: str,
+    scan_index=None,
+) -> None:
+    if cursor is None or group_path not in h5f or "frame_index" not in h5f[group_path]:
+        return
+    labels = h5f[group_path]["frame_index"]
+    n = int(labels.shape[0])
+    if scan_index is None:
+        scan_index = [int(x) for x in np.asarray(labels[()]).ravel()]
+    cursor.groups[group_path] = (
+        n,
+        int(labels[n - 1]) if n else None,
+        _index_structure_signature(scan_index, n),
+    )
 
 
 def _disk_row_shape(h5f, group_path: str) -> tuple | None:
@@ -413,13 +468,13 @@ def _disk_row_shape(h5f, group_path: str) -> tuple | None:
 
 
 def _select_frames_to_write(scan, h5f, group_path, replace_frame_indices,
-                            row_shape_fn) -> tuple[list, list]:
+                            row_shape_fn, axis_signature_fn,
+                            cursor: NexusWriteCursor | None = None) -> tuple[list, list]:
     """Choose ``(frames, frame_indices)`` to pass to ``write_integrated_stack``.
 
     ``row_shape_fn(frame)`` returns the on-disk row shape that frame's
     result would occupy (``None`` if the frame has no result), so a
-    mismatch against the existing stack can be detected and widened to a
-    full rewrite.
+    mismatch against the existing stack can require an explicit full rewrite.
     """
     all_ids = list(scan.frames.index)
 
@@ -428,9 +483,8 @@ def _select_frames_to_write(scan, h5f, group_path, replace_frame_indices,
 
     # ── Replace (reintegration) ──────────────────────────────────────
     # Hand the recomputed frames; the primitive upserts each row in
-    # place.  If the row size changed (numpoints/unit), the primitive
-    # rewrites from the batch — so widen to *all* frames to avoid
-    # dropping the ones not in ``replace_frame_indices``.
+    # place.  If its axis or shape changed, require the caller to have
+    # recomputed every frame; never widen a partial batch with stale rows.
     if replace_frame_indices is not None and group_path in h5f:
         ids = [i for i in replace_frame_indices if i in scan.frames.index]
         if not ids:
@@ -438,24 +492,46 @@ def _select_frames_to_write(scan, h5f, group_path, replace_frame_indices,
         frames = [scan.frames[i] for i in ids]
         disk = _disk_row_shape(h5f, group_path)
         new_shape = row_shape_fn(frames[0])
-        if disk is not None and new_shape is not None and disk != new_shape:
-            return _all_frames()
+        axis_changed = not _axis_signatures_equal(
+            _disk_axis_signature(h5f, group_path), axis_signature_fn(frames[0]),
+        )
+        if disk is not None and new_shape is not None and (disk != new_shape or axis_changed):
+            if set(map(int, ids)) != set(map(int, all_ids)):
+                raise ValueError(
+                    "Reintegration changed the output axis, unit, or row shape. "
+                    "Recompute and save every frame together; a partial rewrite "
+                    "would mix fresh rows with stale rows."
+                )
+            return frames, ids
         return frames, ids
 
     # ── Append (default; also replace-with-no-existing-group) ────────
-    new_frames, existing_n = _new_frames_for_write(scan, h5f, group_path)
+    new_frames, existing_n = _new_frames_for_write(scan, h5f, group_path, cursor)
     if existing_n == -1:
-        if group_path in h5f:
-            del h5f[group_path]
-        return _all_frames()
+        raise ValueError(
+            f"{group_path} has more persisted rows than the live scan; "
+            "reload or perform an explicit full reintegration."
+        )
+    if existing_n == -2:
+        raise ValueError(
+            f"{group_path} contains persisted frame labels that are no longer "
+            "present in the live scan; reload or perform an explicit full "
+            "reintegration."
+        )
     if not new_frames:
         return [], []
     disk = _disk_row_shape(h5f, group_path)
     new_shape = row_shape_fn(new_frames[0])
-    if disk is not None and new_shape is not None and disk != new_shape:
-        # Mid-scan parameter change: the primitive rewrites the group, so
-        # it must see every frame, not just the new tail.
-        return _all_frames()
+    if disk is not None and new_shape is not None and (
+        disk != new_shape
+        or not _axis_signatures_equal(
+            _disk_axis_signature(h5f, group_path), axis_signature_fn(new_frames[0]),
+        )
+    ):
+        raise ValueError(
+            "Integration settings changed during append. Reintegrate and save "
+            "the complete scan so persisted rows share one axis."
+        )
     return new_frames, [int(getattr(fr, "idx", i)) for i, fr in
                         zip(range(existing_n, existing_n + len(new_frames)),
                             new_frames)]
@@ -476,52 +552,166 @@ def _row_shape_2d(frame) -> tuple | None:
     return tuple(np.asarray(r.intensity).T.shape)
 
 
-def _write_integrated_1d(f, scan, *, entry: str,
-                         replace_frame_indices=None) -> None:
-    """Write/extend ``/entry/integrated_1d`` via the shared stacked-write
-    primitive.  See :func:`_select_frames_to_write` for the append-cursor
-    and shape-change handling that stays GUI-side."""
+def _decode_unit(value) -> str:
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value or "")
+
+
+def _axis_signature_1d(frame):
+    result = getattr(frame, "int_1d", None)
+    if result is None:
+        return None
+    return (np.asarray(result.radial), str(getattr(result, "unit", "") or ""))
+
+
+def _axis_signature_2d(frame):
+    result = getattr(frame, "int_2d", None)
+    if result is None:
+        return None
+    return (
+        np.asarray(result.radial),
+        np.asarray(result.azimuthal),
+        str(getattr(result, "unit", "") or ""),
+        str(getattr(result, "azimuthal_unit", "") or ""),
+    )
+
+
+def _disk_axis_signature(h5f, group_path: str):
+    if group_path not in h5f:
+        return None
+    group = h5f[group_path]
+    if "q" not in group:
+        return None
+    if group_path.endswith("integrated_1d"):
+        return (np.asarray(group["q"][()]), _decode_unit(group["q"].attrs.get("units", "")))
+    if "chi" not in group:
+        return None
+    return (
+        np.asarray(group["q"][()]),
+        np.asarray(group["chi"][()]),
+        _decode_unit(group["q"].attrs.get("units", "")),
+        _decode_unit(group["chi"].attrs.get("units", "")),
+    )
+
+
+def _axis_signatures_equal(left, right) -> bool:
+    if left is None or right is None or len(left) != len(right):
+        return left is right
+    for a, b in zip(left, right):
+        if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+            aa, bb = np.asarray(a), np.asarray(b)
+            if aa.shape != bb.shape or not np.allclose(aa, bb, rtol=1e-6, atol=1e-7,
+                               equal_nan=True):
+                return False
+        elif a != b:
+            return False
+    return True
+
+
+def _validate_prepared_integrated(entry_grp, prepared_1d, prepared_2d) -> None:
+    """Preflight every selected output before committing either one."""
+    from ssrl_xrd_tools.io.nexus import validate_integrated_stack_write
+    if prepared_1d is not None:
+        validate_integrated_stack_write(
+            entry_grp,
+            frame_indices=prepared_1d["indices"],
+            results_1d=prepared_1d["results"],
+        )
+    if prepared_2d is not None:
+        validate_integrated_stack_write(
+            entry_grp,
+            frame_indices=prepared_2d["indices"],
+            results_2d=prepared_2d["results"],
+        )
+
+
+def _prepare_integrated_1d(f, scan, *, entry: str,
+                           replace_frame_indices=None,
+                           cursor: NexusWriteCursor | None = None):
+    """Select the 1D rows that would be written, without mutating disk."""
     if not scan.frames.index:
-        return
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+        return None
 
     h5f = _h5(f)
     group_path = f"{entry}/integrated_1d"
     frames, indices = _select_frames_to_write(
         scan, h5f, group_path, replace_frame_indices, _row_shape_1d,
+        _axis_signature_1d, cursor,
     )
     if not frames:
         return
     results = [getattr(fr, "int_1d", None) for fr in frames]
     if any(r is None for r in results):
-        return
-    write_integrated_stack(
-        h5f.require_group(entry), frame_indices=indices, results_1d=results,
-    )
+        return None
+    return {
+        "entry": entry,
+        "group_path": group_path,
+        "indices": indices,
+        "results": results,
+        "cursor": cursor,
+        "scan_index": scan.frames.index,
+    }
 
 
-def _write_integrated_2d(f, scan, *, entry: str,
-                         replace_frame_indices=None) -> None:
-    """Write/extend ``/entry/integrated_2d`` via the shared stacked-write
-    primitive.  Per-frame ``int_2d`` is xdart-shape ``(nq, nchi)``; the
-    primitive transposes it to ``(nchi, nq)`` on disk."""
-    if not scan.frames.index:
+def _commit_integrated_1d(f, prepared) -> None:
+    if prepared is None:
         return
     from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    h5f = _h5(f)
+    write_integrated_stack(
+        h5f.require_group(prepared["entry"]),
+        frame_indices=prepared["indices"],
+        results_1d=prepared["results"],
+    )
+    _refresh_group_cursor(
+        prepared["cursor"], h5f, prepared["group_path"], prepared["scan_index"],
+    )
+    from xdart.modules.ewald.frame_series import clear_frame_position_cache
+    clear_frame_position_cache(h5f.filename)
+
+
+def _prepare_integrated_2d(f, scan, *, entry: str,
+                           replace_frame_indices=None,
+                           cursor: NexusWriteCursor | None = None):
+    """Select the 2D rows that would be written, without mutating disk."""
+    if not scan.frames.index:
+        return None
 
     h5f = _h5(f)
     group_path = f"{entry}/integrated_2d"
     frames, indices = _select_frames_to_write(
         scan, h5f, group_path, replace_frame_indices, _row_shape_2d,
+        _axis_signature_2d, cursor,
     )
     if not frames:
         return
     results = [getattr(fr, "int_2d", None) for fr in frames]
     if any(r is None for r in results):
+        return None
+    return {
+        "entry": entry,
+        "group_path": group_path,
+        "indices": indices,
+        "results": results,
+        "cursor": cursor,
+        "scan_index": scan.frames.index,
+    }
+
+
+def _commit_integrated_2d(f, prepared) -> None:
+    if prepared is None:
         return
+    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    h5f = _h5(f)
     write_integrated_stack(
-        h5f.require_group(entry), frame_indices=indices, results_2d=results,
+        h5f.require_group(prepared["entry"]),
+        frame_indices=prepared["indices"],
+        results_2d=prepared["results"],
     )
+    _refresh_group_cursor(
+        prepared["cursor"], h5f, prepared["group_path"], prepared["scan_index"],
+    )
+    from xdart.modules.ewald.frame_series import clear_frame_position_cache
+    clear_frame_position_cache(h5f.filename)
 
 
 def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
@@ -562,7 +752,9 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
     # Use the underlying h5py group for the existence check.  nx's
     # in-memory tree may not have refreshed since the last save, but
     # h5py reads off the open file directly — authoritative.
-    h5_frames = _h5(f)[frames_path]
+    h5f = _h5(f)
+    h5_frames = h5f[frames_path]
+    output_dir = os.path.dirname(os.path.abspath(h5f.filename))
     existing_frame_keys = set(h5_frames.keys())
 
     # Filter the index *before* touching any frame object.  This is
@@ -583,6 +775,15 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
         fg = nx.NXcollection()
 
         thumb = getattr(frame, "thumbnail", None)
+        if thumb is None and hasattr(frame, "make_thumbnail"):
+            try:
+                frame.make_thumbnail(global_mask=getattr(scan, "global_mask", None))
+                thumb = getattr(frame, "thumbnail", None)
+            except Exception:
+                logger.debug(
+                    "Failed to generate thumbnail for frame %s", idx,
+                    exc_info=True,
+                )
         if thumb is not None:
             arr, lut = _quantize_thumbnail(thumb)
             # ``dtype`` collides with NXfield's reserved kwarg (which
@@ -599,7 +800,7 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
         # frame.map_raw verbatim, which silently dumped 18 MB per
         # Eiger frame into the .nxs.  Don't bring that back.
 
-        _write_source_ref(fg, frame)
+        _write_source_ref(fg, frame, output_dir=output_dir)
 
         ts = getattr(frame, "timestamp", None)
         if ts is not None:
@@ -608,7 +809,7 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
         frames[frame_key] = fg
 
 
-def _write_source_ref(fg, frame) -> None:
+def _write_source_ref(fg, frame, *, output_dir: str | None = None) -> None:
     """Attach an ``NXcollection`` carrying the raw-source pointer.
 
     Writes ``source/path`` and ``source/frame_index`` under the
@@ -623,13 +824,110 @@ def _write_source_ref(fg, frame) -> None:
     src_path = getattr(frame, "source_file", "") or ""
     if not src_path:
         return
+    if not os.path.isabs(src_path):
+        resolved = ""
+        if hasattr(frame, "_resolved_source_path"):
+            try:
+                resolved = frame._resolved_source_path()
+            except Exception:
+                resolved = ""
+        if resolved and os.path.exists(resolved):
+            src_path = resolved
+        elif output_dir:
+            src_path = os.path.join(output_dir, src_path)
+        else:
+            src_path = os.path.abspath(src_path)
     src_frame_idx = getattr(frame, "source_frame_idx", None)
     if src_frame_idx is None:
         src_frame_idx = getattr(frame, "idx", 0)
     sub = nx.NXcollection()
-    sub["path"] = nx.NXfield(str(src_path))
+    sub["path"] = nx.NXfield(os.path.abspath(str(src_path)))
     sub["frame_index"] = nx.NXfield(int(src_frame_idx))
     fg["source"] = sub
+
+
+def _metadata_tail_ids(scan, h5f, entry: str,
+                       cursor: NexusWriteCursor) -> list[int] | None:
+    """Return the ordered metadata tail, or ``None`` when reconciliation is needed."""
+    ids = [int(idx) for idx in scan.frames.index]
+    ds_path = f"{entry}/scan_data/frame_index"
+    if ds_path not in h5f:
+        return ids
+    labels_ds = h5f[ds_path]
+    n = int(labels_ds.shape[0])
+    if n > len(ids):
+        return None
+    disk_last = int(labels_ds[n - 1]) if n else None
+    memory_last = ids[n - 1] if n else None
+    memory_sig = _index_structure_signature(scan.frames.index, n)
+    if cursor.metadata == (n, disk_last, memory_sig) and memory_last == disk_last:
+        return ids[n:]
+    disk_ids = [int(x) for x in np.asarray(labels_ds[()]).ravel()]
+    if disk_ids != ids[:n]:
+        return None
+    cursor.metadata = (n, disk_last, memory_sig)
+    return ids[n:]
+
+
+def _refresh_metadata_cursor(cursor: NexusWriteCursor, h5f, entry: str, scan_index=None) -> None:
+    path = f"{entry}/scan_data/frame_index"
+    if path not in h5f:
+        cursor.metadata = None
+        return
+    labels = h5f[path]
+    n = int(labels.shape[0])
+    if scan_index is None:
+        scan_index = [int(x) for x in np.asarray(labels[()]).ravel()]
+    cursor.metadata = (
+        n,
+        int(labels[n - 1]) if n else None,
+        _index_structure_signature(scan_index, n),
+    )
+
+
+def _write_incremental_metadata(f, scan, *, entry: str,
+                                cursor: NexusWriteCursor,
+                                finalize: bool) -> None:
+    """Append metadata rows during acquisition and reconcile on uncertainty."""
+    h5f = _h5(f)
+    had_scan_data = f"{entry}/scan_data/frame_index" in h5f
+    tail_ids = None if finalize else _metadata_tail_ids(scan, h5f, entry, cursor)
+    if tail_ids is None:
+        _write_scan_metadata(f, scan, entry=entry)
+        _write_positioners(f, scan, entry=entry)
+        _write_per_frame_geometry(f, scan, entry=entry)
+        _refresh_metadata_cursor(cursor, h5f, entry, scan.frames.index)
+        return
+    if not tail_ids:
+        return
+    scan_data = getattr(scan, "scan_data", None)
+    if scan_data is None:
+        return
+    rows = scan_data.reindex(tail_ids)
+    geom = getattr(scan, "geometry", None)
+    from ssrl_xrd_tools.io.nexus import (
+        upsert_per_frame_geometry,
+        upsert_positioners,
+        upsert_scan_metadata,
+    )
+    try:
+        upsert_scan_metadata(h5f.require_group(entry), rows, tail_ids)
+        if geom is not None:
+            upsert_positioners(
+                h5f.require_group(entry), rows, tail_ids, geom,
+                allow_create=not had_scan_data,
+            )
+            upsert_per_frame_geometry(
+                h5f.require_group(entry), rows, tail_ids, geom,
+                allow_create=not had_scan_data,
+            )
+    except (KeyError, TypeError, ValueError):
+        logger.debug("Incremental metadata append fell back to replacement",
+                     exc_info=True)
+        _write_scan_metadata(f, scan, entry=entry)
+        _write_positioners(f, scan, entry=entry)
+        _write_per_frame_geometry(f, scan, entry=entry)
+    _refresh_metadata_cursor(cursor, h5f, entry, scan.frames.index)
 
 
 def _write_positioners(f, scan, *, entry: str) -> None:
@@ -645,8 +943,6 @@ def _write_positioners(f, scan, *, entry: str) -> None:
 
     scan_data = getattr(scan, "scan_data", None)
     geom = getattr(scan, "geometry", None)
-    if geom is None or scan_data is None or len(scan_data) == 0:
-        return
     frame_index = list(getattr(getattr(scan, "frames", None), "index", []) or [])
     _wp(_h5(f).require_group(entry), scan_data, frame_index, geom)
 
@@ -663,8 +959,6 @@ def _write_scan_metadata(f, scan, *, entry: str) -> None:
     from ssrl_xrd_tools.io.nexus import write_scan_metadata as _wsm
 
     scan_data = getattr(scan, "scan_data", None)
-    if scan_data is None or len(scan_data) == 0:
-        return
     frame_index = list(getattr(getattr(scan, "frames", None), "index", []) or [])
     _wsm(_h5(f).require_group(entry), scan_data, frame_index)
 
@@ -684,8 +978,6 @@ def _write_per_frame_geometry(f, scan, *, entry: str) -> None:
 
     scan_data = getattr(scan, "scan_data", None)
     geom = getattr(scan, "geometry", None)
-    if geom is None or scan_data is None or len(scan_data) == 0:
-        return
     frame_index = list(getattr(getattr(scan, "frames", None), "index", []) or [])
     _wg(_h5(f).require_group(entry), scan_data, frame_index, geom)
 
@@ -737,6 +1029,28 @@ def _representative_poni(scan):
         rot1=float(getattr(ai, "rot1", 0.0)),
         rot2=float(getattr(ai, "rot2", 0.0)),
         rot3=float(getattr(ai, "rot3", 0.0)),
+    )
+
+
+def _instrument_signature(scan) -> tuple:
+    """Fingerprint persisted instrument fields so live changes rewrite them."""
+    wavelength = None
+    try:
+        wavelength = scan.mg_args.get("wavelength")
+    except AttributeError:
+        pass
+    poni = _representative_poni(scan)
+    poni_sig = None
+    if poni is not None:
+        poni_sig = tuple(
+            None if getattr(poni, key, None) is None
+            else float(getattr(poni, key))
+            for key in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3")
+        )
+    return (
+        None if wavelength is None else float(wavelength),
+        poni_sig,
+        _array_digest(getattr(scan, "global_mask", None)),
     )
 
 
@@ -863,4 +1177,4 @@ def _quantize_thumbnail(
     return (norm * 255).astype(np.uint8), (float(vmin), float(vmax), "uint8")
 
 
-__all__ = ["save_scan_to_nexus"]
+__all__ = ["NexusWriteCursor", "save_scan_to_nexus"]

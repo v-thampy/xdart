@@ -161,6 +161,65 @@ def test_live_scan_loader_normalizes_legacy_reduction_provenance(
     assert live_scan.bai_2d_args["owner"] == "LiveScan"
 
 
+def test_live_scan_loader_uses_union_of_1d_and_2d_labels(monkeypatch, tmp_path) -> None:
+    import ssrl_xrd_tools.io.nexus as nexus_io
+
+    class _FakeDataset:
+        attrs = {"reduction": {}}
+        sizes = {"frame": 2, "frame_2d": 2}
+        data_vars = {}
+        dims = {"frame": 2, "frame_2d": 2}
+        coords = {
+            "frame": SimpleNamespace(values=np.array([0, 2])),
+            "frame_2d": SimpleNamespace(values=np.array([1, 2])),
+        }
+
+        def __getitem__(self, key):
+            return self.coords[key]
+
+    fake_ds = _FakeDataset()
+    monkeypatch.setattr(nexus_io, "read_scan_metadata", lambda _path: fake_ds)
+
+    live_scan = LiveScan("union", data_file=str(tmp_path / "union.nxs"))
+    live_scan._load_from_nexus_v2(None)
+    assert list(live_scan.frames.index) == [0, 1, 2]
+
+
+def test_live_scan_loader_reindexes_metadata_to_union_labels(monkeypatch, tmp_path) -> None:
+    import ssrl_xrd_tools.io.nexus as nexus_io
+
+    class _Var:
+        def __init__(self, values, dims):
+            self.values = np.asarray(values)
+            self.dims = dims
+
+    class _FakeDataset:
+        attrs = {"reduction": {}}
+        sizes = {"frame": 2, "frame_2d": 2}
+        data_vars = {"i0": _Var([10.0, 20.0], ("frame",))}
+        dims = {"frame": 2, "frame_2d": 2}
+        coords = {
+            "frame": _Var([0, 2], ("frame",)),
+            "frame_2d": _Var([1, 2], ("frame_2d",)),
+        }
+
+        def __getitem__(self, key):
+            if key in self.coords:
+                return self.coords[key]
+            return self.data_vars[key]
+
+    monkeypatch.setattr(nexus_io, "read_scan_metadata", lambda _path: _FakeDataset())
+
+    live_scan = LiveScan("union_meta", data_file=str(tmp_path / "union_meta.nxs"))
+    live_scan._load_from_nexus_v2(None)
+
+    assert list(live_scan.frames.index) == [0, 1, 2]
+    assert list(live_scan.scan_data.index) == [0, 1, 2]
+    assert live_scan.scan_data.loc[0, "i0"] == 10.0
+    assert np.isnan(live_scan.scan_data.loc[1, "i0"])
+    assert live_scan.scan_data.loc[2, "i0"] == 20.0
+
+
 def test_frame_from_live_frame_maps_simple_fields(tmp_path) -> None:
     frame = LiveFrame(
         idx=4,
@@ -229,6 +288,19 @@ def test_scan_from_live_scan_uses_scan_frame_names() -> None:
     assert scan.wavelength == 1.0
     np.testing.assert_allclose(scan.motors["th"], [1.0, 2.0])
     assert scan.output_path.name == "scan42.nxs"
+
+
+def test_scan_from_live_scan_fills_frame_metadata_from_scan_data() -> None:
+    frame = LiveFrame(idx=5, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan(
+        "scan",
+        frames=[frame],
+        scan_data=pd.DataFrame({"i0": [42.0]}, index=[5]),
+    )
+
+    headless = scan_from_live_scan(scan)
+
+    assert headless.frames[0].metadata["i0"] == 42.0
 
 
 def test_plan_from_live_scan_maps_integration_settings() -> None:

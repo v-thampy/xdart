@@ -338,8 +338,13 @@ class staticWidget(QWidget):
                 if 'Viewer' in mode_text:
                     return
                 self.displayframe._apply_1d_only_visibility()
-                if '2D' in mode_text:
-                    self.displayframe.update()
+                # Drop any visible/cached content from the previous mode,
+                # then reload the current selection for the new processing
+                # mode. Calling update() alone can leave a stale image/cake
+                # or curve visible when the new mode needs data that has not
+                # been loaded yet.
+                self.displayframe.clear_display_state()
+                self.h5viewer.data_changed()
             self.wrangler.ui.processingModeCombo.currentTextChanged.connect(_on_mode_changed)
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
             self.wrangler.sigViewerModeChanged.connect(self._on_viewer_mode_changed)
@@ -453,7 +458,9 @@ class staticWidget(QWidget):
             try:
                 with self.h5viewer.data_lock:
                     # 1D copy (no map_raw / 2D payload) — small object
-                    self.h5viewer.data_1d[int(idx)] = frame.copy(include_2d=False)
+                    self.h5viewer.data_1d[int(idx)] = frame.copy_for_display(
+                        include_2d=False,
+                    )
                     # 2D payload as a dict matching what file_thread.load_frames
                     # produces (see scan_threads.load_frames).  Keys are what
                     # displayframe.get_frames_map_raw / get_frames_int_2d
@@ -904,25 +911,39 @@ class staticWidget(QWidget):
         """
         viewer_mode = viewer_mode_str or None  # '' → None
         is_viewer = viewer_mode is not None
-        # Keep integratorTree enabled so mask/threshold controls remain accessible
-        self.h5viewer.viewer_mode = viewer_mode
-        # Give displayframe a reference to the wrangler for mask/threshold
-        self.displayframe._wrangler = self.wrangler if is_viewer else None
-        # In viewer mode, disable New/Save (keep Open Folder and Export)
-        self.h5viewer.actionNewFile.setEnabled(not is_viewer)
-        self.h5viewer.actionSaveDataAs.setEnabled(not is_viewer)
-        # XYE viewer: allow multi-select for overlay; others: single select
         from PySide6.QtWidgets import QAbstractItemView
-        if viewer_mode == 'xye':
-            self.h5viewer.ui.listScans.setSelectionMode(
-                QAbstractItemView.ExtendedSelection)
-        else:
-            self.h5viewer.ui.listScans.setSelectionMode(
-                QAbstractItemView.SingleSelection)
-        # Configure display panels for the viewer mode
-        self.displayframe.set_viewer_display_mode(viewer_mode)
-        # Refresh scan list to show/hide appropriate file types
-        self.h5viewer.update_scans()
+
+        scans = self.h5viewer.ui.listScans
+        prev_suspend = getattr(
+            self.h5viewer, '_suspend_scan_selection_loads', False,
+        )
+        was_blocked = scans.blockSignals(True)
+        self.h5viewer._suspend_scan_selection_loads = True
+        try:
+            # Keep integratorTree enabled so mask/threshold controls remain accessible
+            self.h5viewer.viewer_mode = viewer_mode
+            # Give displayframe a reference to the wrangler for mask/threshold
+            self.displayframe._wrangler = self.wrangler if is_viewer else None
+            # In viewer mode, disable New/Save (keep Open Folder and Export)
+            self.h5viewer.actionNewFile.setEnabled(not is_viewer)
+            self.h5viewer.actionSaveDataAs.setEnabled(not is_viewer)
+            # XYE viewer: allow multi-select for overlay; others: single select
+            if viewer_mode == 'xye':
+                scans.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            else:
+                scans.setSelectionMode(QAbstractItemView.SingleSelection)
+            # Configure display panels for the viewer mode
+            self.displayframe.set_viewer_display_mode(viewer_mode)
+            if is_viewer:
+                self.h5viewer.enter_viewer_mode_cleanup()
+            else:
+                self.h5viewer.cancel_pending_loads()
+                self.displayframe.clear_display_state()
+            # Refresh scan list to show/hide appropriate file types
+            self.h5viewer.update_scans()
+        finally:
+            self.h5viewer._suspend_scan_selection_loads = prev_suspend
+            scans.blockSignals(was_blocked)
 
     def latest_frame(self, checked=None, *, emit_update=True):
         """Advances to last frame in data list, updates displayframe, and

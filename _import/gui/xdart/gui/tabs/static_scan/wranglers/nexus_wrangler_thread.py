@@ -548,12 +548,7 @@ class nexusThread(wranglerThread):
         # view), so a lazy raw loader can do
         # ``NexusImageStack(source_file)[source_frame_idx]`` directly
         # without needing to know which data_NNNNNN segment to open.
-        try:
-            frame.source_file = os.path.relpath(
-                self.nexus_file, os.path.dirname(scan.data_file),
-            )
-        except ValueError:
-            frame.source_file = str(self.nexus_file)
+        frame.source_file = os.path.abspath(str(self.nexus_file))
         frame.source_frame_idx = int(frame_idx)
         # NeXus frames already live in the source — don't double-store
         # them in the output .nxs.
