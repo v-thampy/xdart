@@ -22,6 +22,7 @@ from .display_constants import (
     AA_inv, Th, Chi, Deg,
     x_labels_1D, x_units_1D,
 )
+from .display_logic import plan_overlay, OverlayAction
 
 logger = logging.getLogger(__name__)
 
@@ -145,15 +146,18 @@ class DisplayPlotMixin:
         # On a unit change, rebuild the accumulated set in the new unit
         # instead of appending across incompatible x grids or dropping all
         # prior curves.  In Single/Sum/Average: always replace with the
-        # current selection.
+        # current selection.  Stage 4: the accumulate/rebuild/replace choice
+        # is the pure plan_overlay (unit-tested headlessly); the branch
+        # bodies below still own the array work + eviction filtering.
         current_method = self.ui.plotMethod.currentText()
-        overlay_mode = current_method in ('Overlay', 'Waterfall')
-        accumulate = (current_method in ('Overlay', 'Waterfall')
-                      and (not unit_changed)
-                      and len(self.plot_data[0]) > 0)
+        overlay_action, _ = plan_overlay(
+            current_method, unit_changed,
+            has_existing=len(self.overlaid_idxs) > 0,
+            new_ids=tuple(self.idxs_1d),
+            prev_overlaid_ids=tuple(self.overlaid_idxs),
+        )
 
-        if (overlay_mode and unit_changed
-                and len(getattr(self, 'overlaid_idxs', [])) > 0):
+        if overlay_action is OverlayAction.REBUILD:
             rebuild_idxs = list(self.overlaid_idxs)
             y_new, x_new = self.get_frames_int_1d(rebuild_idxs)
             if x_new is not None and y_new is not None:
@@ -171,7 +175,7 @@ class DisplayPlotMixin:
                 self.plot_data = [xdata, ydata]
                 self.frame_names = list(frame_names)
                 self.overlaid_idxs = list(self.idxs_1d)
-        elif accumulate:
+        elif overlay_action is OverlayAction.APPEND:
             for idx, frame_name, row in zip(self.idxs_1d, frame_names, ydata):
                 if frame_name not in self.frame_names:
                     old_x = self.plot_data[0]

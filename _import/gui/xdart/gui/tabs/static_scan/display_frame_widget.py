@@ -52,6 +52,7 @@ from .display_logic import (
     Mode, LoadStatus, PanelRole, compute_display_state,
     build_payload, render_plan,
     resolve_selection, resolve_render_ids,
+    xye_unit_from_filename, x_axis_for_unit, default_plot_unit,
 )
 
 QFileDialog = QtWidgets.QFileDialog
@@ -859,9 +860,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self.ui.imageUnit.addItem(_translate("Form", label))
             self.ui.plotUnit.setEnabled(True)
             self.ui.imageUnit.setEnabled(True)
+            # Default the plot unit to the entry matching the 1D integration
+            # unit (so a 2θ integration opens on a 2θ axis).  Standard combo
+            # order is (Q, 2θ, χ); normalise the pyFAI unit to canonical then
+            # route the index choice through the pure default_plot_unit.
             unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
-            if '2th' in unit_1d:
-                target_plot_idx = 1
+            canon_1d = ('2th_deg' if '2th' in unit_1d
+                        else 'chi_deg' if 'chi' in unit_1d else 'q_A^-1')
+            target_plot_idx = default_plot_unit(
+                canon_1d, ('q_A^-1', '2th_deg', 'chi_deg'))
 
         if self.ui.plotUnit.count() > 0:
             self.ui.plotUnit.setCurrentIndex(
@@ -1319,20 +1326,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Title bar: the xye filename(s) — same convention as the image viewer.
         self._set_viewer_title(self.idxs_1d)
 
-        # Determine axis label from first frame
+        # Axis label comes from the file's prefix (iq \u2192 Q, itth \u2192 2\u03b8), not a
+        # transform combo \u2014 an XYE file can't be re-transformed.  Stage 4:
+        # route through the pure xye_unit_from_filename + x_axis_for_unit so
+        # an UNKNOWN prefix labels the axis plain 'x' (never an assumed 2\u03b8).
         first_frame = self.data_1d[self.idxs_1d[0]]
-        unit = str(getattr(first_frame.int_1d, 'unit', 'unknown')).lower()
-        if unit.startswith('q') or unit in ('q_a^-1', 'q_a-1'):
-            # Label is the quantity only; pyqtgraph appends ``units`` as
-            # "(\u00c5\u207b\u00b9)".  Embedding it here too rendered "Q (\u00c5\u207b\u00b9) (\u00c5\u207b\u00b9)".
-            xlabel = u'Q'
-            xunits = u'\u212b\u207b\u00b9'
-        elif '2th' in unit or '2theta' in unit:
-            xlabel = u'2\u03b8'
-            xunits = u'\u00b0'
-        else:
-            xlabel = 'x'
-            xunits = ''
+        source_name = ''
+        if getattr(first_frame, 'scan_info', None):
+            source_name = first_frame.scan_info.get('source_file', '')
+        xlabel, xunits = x_axis_for_unit(xye_unit_from_filename(source_name))
         self._viewer_x_axis_label = (xlabel, xunits)
 
         # Build xdata and ydata arrays from all selected indices.

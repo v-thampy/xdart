@@ -262,12 +262,8 @@ def controller_for(mode):
 
 # ── Pure functions (§5 of the plan) ───────────────────────────────────
 #
-# Stage 1 selectors are implemented below and called from the widget.
-# Functions owned by later stages still raise NotImplementedError so the
-# behaviour-contract tests stay red until their stage lands.
-
-_STAGE2 = "implemented in Stage 2 of the display refactor"
-_STAGE4 = "implemented in Stage 4 of the display refactor"
+# The full testable core is implemented below and called from the widget
+# (selection, raw-source, sentinel, axes, overlay, GI uniformity).
 
 
 def resolve_selection(frame_ids, all_frame_index):
@@ -345,20 +341,48 @@ def x_axis_for_unit(unit):
 
 def xye_unit_from_filename(name):
     """``'iq'``/``'iq_'`` → ``'q_A^-1'``; ``'itth'``/``'itth_'`` →
-    ``'2th_deg'``; otherwise ``'unknown'`` (no assumption)."""
-    raise NotImplementedError(_STAGE4)
+    ``'2th_deg'``; otherwise ``'unknown'`` (no assumption — an unknown
+    prefix is NOT silently treated as 2θ; it labels the axis plain ``x``
+    via :func:`x_axis_for_unit`)."""
+    base = str(name).replace('\\', '/').rsplit('/', 1)[-1].lower()
+    if base.startswith('itth'):
+        return '2th_deg'
+    if base.startswith('iq'):
+        return 'q_A^-1'
+    return 'unknown'
 
 
 def default_plot_unit(bai_1d_unit, available_units):
-    """Index of the plot-unit combo entry matching the integration unit
-    (fixes 'integrate in 2θ but plot defaults to Q')."""
-    raise NotImplementedError(_STAGE4)
+    """Index of the plot-unit entry matching the integration unit so the
+    1D plot opens on the integrated axis (fixes 'integrate in 2θ but plot
+    defaults to Q').  ``available_units`` is the canonical-unit list in
+    combo order; unknown unit falls back to index 0."""
+    try:
+        return list(available_units).index(bai_1d_unit)
+    except (ValueError, TypeError):
+        return 0
 
 
 def plan_overlay(method, unit_changed, has_existing, new_ids, prev_overlaid_ids):
-    """Overlay/Waterfall accumulation incl. the unit-switch rebuild;
-    Single/Sum/Average → REPLACE."""
-    raise NotImplementedError(_STAGE4)
+    """Decide how Overlay/Waterfall accumulates, including the unit-switch
+    rebuild.  Returns ``(OverlayAction, ids)``:
+
+    * Single/Sum/Average → REPLACE with the current selection.
+    * Overlay/Waterfall + unit changed + existing curves → REBUILD: re-express
+      the SAME accumulated frames in the new unit (never drop to the last one).
+    * Overlay/Waterfall + existing curves (same unit) → APPEND the new frames.
+    * Overlay/Waterfall with nothing yet → REPLACE (fresh start).
+    """
+    new_ids = tuple(new_ids)
+    prev = tuple(prev_overlaid_ids)
+    if method not in ('Overlay', 'Waterfall'):
+        return OverlayAction.REPLACE, new_ids
+    if unit_changed and has_existing:
+        return OverlayAction.REBUILD, prev
+    if has_existing:
+        merged = prev + tuple(i for i in new_ids if i not in prev)
+        return OverlayAction.APPEND, merged
+    return OverlayAction.REPLACE, new_ids
 
 
 def sentinel_mask(arr):
@@ -385,8 +409,25 @@ def sentinel_mask(arr):
 
 def gi_axes_uniform(axes_per_frame, *, rtol=1e-5, atol=1e-8):
     """True iff every frame shares one axis set (the writer's stacking
-    precondition).  Decides whether a GI scan needs a frozen common grid."""
-    raise NotImplementedError(_STAGE4)
+    precondition).  Decides whether a GI scan needs a frozen common grid.
+
+    ``axes_per_frame`` is a sequence of per-frame axis tuples (e.g.
+    ``[(q, chi), (q, chi), ...]``); a frame mismatching the first in length,
+    shape or values (within ``rtol``/``atol``) makes the stack non-uniform.
+    This is the contract the GI common-grid freeze must satisfy — it never
+    relaxes the writer's uniform-axis validators, it asserts the result."""
+    if len(axes_per_frame) <= 1:
+        return True
+    first = axes_per_frame[0]
+    for axes in axes_per_frame[1:]:
+        if len(axes) != len(first):
+            return False
+        for a, b in zip(axes, first):
+            a = np.asarray(a, dtype=float)
+            b = np.asarray(b, dtype=float)
+            if a.shape != b.shape or not np.allclose(a, b, rtol=rtol, atol=atol):
+                return False
+    return True
 
 
 _SCAN_MODES = (Mode.INT_1D, Mode.INT_2D)

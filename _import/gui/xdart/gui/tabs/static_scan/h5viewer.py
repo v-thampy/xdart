@@ -20,6 +20,7 @@ from xdart.utils.session import load_session, save_session
 from .ui.h5viewerUI import Ui_Form
 from xdart.modules.live import LiveFrame
 from .scan_threads import fileHandlerThread
+from .display_logic import xye_unit_from_filename
 from ...widgets import defaultWidget
 from xdart import utils
 from xdart.utils import catch_h5py_file as catch
@@ -959,16 +960,11 @@ class H5Viewer(QWidget):
                 logger.debug("Could not load xye file %s", fpath, exc_info=True)
                 continue
 
-            # xdart XYE exports encode the integration unit in the prefix.
-            # Other XYE files do not carry enough information to transform
-            # or label the x-axis reliably.
-            fname_lower = os.path.basename(fpath).lower()
-            if fname_lower.startswith('iq_'):
-                unit = 'q_A^-1'
-            elif fname_lower.startswith('itth_'):
-                unit = '2th_deg'
-            else:
-                unit = 'unknown'
+            # xdart XYE exports encode the integration unit in the prefix
+            # (iq → q_A^-1, itth → 2th_deg); other files are 'unknown' and
+            # are labelled plain 'x' downstream, never an assumed 2θ.  Stage 4:
+            # single source of truth is the pure xye_unit_from_filename.
+            unit = xye_unit_from_filename(fpath)
 
             int_1d = IntegrationResult1D(
                 radial=xdata, intensity=ydata, sigma=sigma, unit=unit,
