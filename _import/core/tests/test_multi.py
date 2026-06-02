@@ -217,3 +217,76 @@ def test_stitch_2d_normalization_mismatched_length(poni_fixture):
             normalization=[1.0, 2.0],  # only 2 for 3 images
             correctSolidAngle=False,
         )
+
+
+def test_stitch_images_routes_and_handles_rot2(monkeypatch):
+    """stitch_images dispatches mode->stitch_1d/2d, builds integrators from
+    rot1/rot2, and treats all-zero rot2 as a pure rot1 scan."""
+    import ssrl_xrd_tools.integrate.multi as multi
+
+    monkeypatch.setattr(
+        multi, "create_multigeometry_integrators",
+        lambda poni, rot1_angles, rot2_angles=None: ("INTEG", rot1_angles, rot2_angles),
+    )
+    monkeypatch.setattr(multi, "stitch_1d", lambda images, integ, **kw: ("1d", integ, kw))
+    monkeypatch.setattr(multi, "stitch_2d", lambda images, integ, **kw: ("2d", integ, kw))
+
+    imgs = np.zeros((2, 3, 3))
+
+    r1 = multi.stitch_images(imgs, "PONI", [10.0, 20.0], mode="1d", npt_1d=500)
+    assert r1[0] == "1d"
+    assert r1[1][2] is None              # rot2=None when absent
+    assert r1[2]["npt"] == 500
+
+    r1z = multi.stitch_images(imgs, "PONI", [10.0, 20.0], [0.0, 0.0], mode="1d")
+    assert r1z[1][2] is None             # all-zero rot2 -> None
+
+    r2 = multi.stitch_images(imgs, "PONI", [10.0, 20.0], [1.0, 2.0],
+                             mode="2d", npt_rad_2d=300)
+    assert r2[0] == "2d"
+    assert list(r2[1][2]) == [1.0, 2.0]  # nonzero rot2 passed through
+    assert r2[2]["npt_rad"] == 300
+
+    with pytest.raises(ValueError):
+        multi.stitch_images(imgs, "PONI", [10.0], mode="bogus")
+
+
+def test_stitch_images_rejects_count_mismatch():
+    """stitch_images must reject images != angles before MultiGeometry."""
+    imgs = [np.zeros((3, 3)), np.zeros((3, 3)), np.zeros((3, 3))]
+    poni = PONI(dist=0.1, poni1=0.01, poni2=0.02, wavelength=1e-10, detector="Detector")
+    from ssrl_xrd_tools.integrate.multi import stitch_images
+    with pytest.raises(ValueError, match="images != "):
+        stitch_images(imgs, poni, [10.0, 20.0])  # 3 images, 2 angles
+
+
+def test_stitch_images_accepts_single_2d_ndarray(monkeypatch):
+    """A bare (H, W) ndarray is one image, not H images — the count guard
+    must not reject it (P2 regression: len(2D ndarray) == H was wrong)."""
+    import ssrl_xrd_tools.integrate.multi as multi
+
+    monkeypatch.setattr(
+        multi, "create_multigeometry_integrators",
+        lambda poni, rot1_angles, rot2_angles=None: "INTEG",
+    )
+    monkeypatch.setattr(multi, "stitch_1d", lambda images, integ, **kw: "OK")
+
+    # (4, 4) image + a single angle: count must resolve to 1, not 4.
+    assert multi.stitch_images(np.zeros((4, 4)), "PONI", [10.0], mode="1d") == "OK"
+
+    # And a genuine mismatch (1 image, 2 angles) still raises.
+    with pytest.raises(ValueError, match="images != "):
+        multi.stitch_images(np.zeros((4, 4)), "PONI", [10.0, 20.0], mode="1d")
+
+
+def test_prepare_images_rejects_bad_normalization():
+    """Zero / non-finite normalization values fail early (no divide-by-zero)."""
+    from ssrl_xrd_tools.integrate.multi import _prepare_images
+    imgs = [np.ones((2, 2)), np.ones((2, 2))]
+    with pytest.raises(ValueError, match="zero"):
+        _prepare_images(imgs, [1.0, 0.0])
+    with pytest.raises(ValueError, match="non-finite"):
+        _prepare_images(imgs, [1.0, np.inf])
+    # valid normalization still works
+    out = _prepare_images(imgs, [2.0, 4.0])
+    assert np.allclose(out[0], 0.5) and np.allclose(out[1], 0.25)

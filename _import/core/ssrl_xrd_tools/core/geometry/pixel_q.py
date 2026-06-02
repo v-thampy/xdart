@@ -131,7 +131,7 @@ class DetectorHeader:
         Bridges the xdart-side detector calibration (PONI, in SI units) to
         the xrayutilities-side header (mm + pixel units).  Useful when
         plumbing an :class:`~xdart.modules.ewald.EwaldSphere` into the RSM
-        pipeline — `arch.poni` plus the detector's pixel size are
+        pipeline — `frame.poni` plus the detector's pixel size are
         everything ``DetectorHeader`` needs apart from ``Nch1`` / ``Nch2``.
 
         Parameters
@@ -230,7 +230,7 @@ class PixelQMap:
     ``xu.HXRD.Ang2Q.init_area`` + ``Ang2Q.area``.
 
     The mapper is intentionally pure geometry: it knows nothing about
-    data sources (SPEC files, NeXus spheres, image files).  Pulling
+    data sources (SPEC files, NeXus scans, image files).  Pulling
     angles + energy from a v2 NeXus scan and feeding them in lives in
     :mod:`ssrl_xrd_tools.rsm.pipeline`.
     """

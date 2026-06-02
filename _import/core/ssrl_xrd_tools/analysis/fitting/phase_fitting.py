@@ -803,12 +803,28 @@ def _build_high_degree_polynomial_model(degree: int, prefix: str = "bg_") -> Mod
     if degree < 0:
         raise ValueError("polynomial degree must be non-negative")
     names = [f"c{i}" for i in range(degree + 1)]
-    sig_args = ", ".join(f"{n}=0.0" for n in names)
-    body = " + ".join(f"{n} * x**{i}" for i, n in enumerate(names))
-    src = f"def _poly(x, {sig_args}):\n    return {body}\n"
-    ns: dict = {}
-    exec(src, ns)
-    return Model(ns["_poly"], prefix=prefix)
+
+    # No dynamic code (no ``exec``): the evaluator takes ``**coeffs`` but
+    # advertises an explicit ``(x, c0=0.0, …, cN=0.0)`` signature via
+    # ``__signature__``.  lmfit introspects that signature to discover the
+    # parameter names + defaults, so this behaves exactly like the old
+    # exec-compiled function while remaining static-analysis / frozen-build
+    # friendly and free of code-injection risk.
+    def _poly(x, **coeffs):
+        x = np.asarray(x, dtype=float)
+        out = np.zeros_like(x, dtype=float)
+        for i, n in enumerate(names):
+            out = out + coeffs.get(n, 0.0) * x ** i
+        return out
+
+    import inspect
+    sig_params = [inspect.Parameter("x", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+    sig_params += [
+        inspect.Parameter(n, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=0.0)
+        for n in names
+    ]
+    _poly.__signature__ = inspect.Signature(sig_params)
+    return Model(_poly, prefix=prefix)
 
 
 def _make_fit_background_template_model(

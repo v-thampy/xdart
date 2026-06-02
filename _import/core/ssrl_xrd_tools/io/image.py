@@ -193,6 +193,10 @@ def read_image(
         # Eiger master files — fabio handles external data-file linking
         arr = _read_fabio_frame(path, frame)
     elif ext in {".h5", ".hdf5", ".nxs"}:
+        # Reject processed xdart scan files up front (before fabio, which
+        # might otherwise pick up a reduced dataset) — they carry no raw
+        # detector image; callers should use io.read.get_raw_frame.
+        _reject_if_processed_xdart(path)
         # Other HDF5 (NeXus, etc.) — try fabio first, fall back to h5py
         try:
             arr = _read_fabio_frame(path, frame)
@@ -239,6 +243,7 @@ def read_image_stack(
     ext = path.suffix.lower()
 
     if ext in {".h5", ".hdf5", ".nxs"} and not _is_eiger_master(path):
+        _reject_if_processed_xdart(path)
         # Non-Eiger HDF5 / NeXus — try fabio first, fall back to h5py
         try:
             arr = _read_fabio_stack(path)
@@ -447,6 +452,29 @@ def _read_fabio_stack(path: Path) -> np.ndarray:
         return np.stack([f.get_frame(i).data for i in range(f.nframes)])
 
 
+def _reject_if_processed_xdart(path: Path) -> None:
+    """Raise ``ValueError`` if ``path`` is a processed xdart v2 scan file.
+
+    Such files store reduced data (``integrated_1d``/``integrated_2d`` are
+    ndim>=2 NXData) and no raw detector frames — reading them as images
+    would silently return an integrated-pattern stack.  Raw frames live in
+    the original master; use ``io.read.get_raw_frame``.
+    """
+    try:
+        with h5py.File(path, "r") as f:
+            processed = any(
+                p in f for p in ("entry/integrated_1d", "entry/integrated_2d")
+            )
+    except OSError:
+        return  # not openable as HDF5 here — let the normal path report it
+    if processed:
+        raise ValueError(
+            f"{path} is a processed xdart scan file (no raw detector image "
+            "inside); use io.read.get_raw_frame to read raw frames via the "
+            "stored source pointer."
+        )
+
+
 def _read_hdf5_frame(path: Path, frame: int) -> np.ndarray:
     """Read a single frame via raw h5py (fallback for non-Eiger HDF5)."""
     with h5py.File(path, "r") as f:
@@ -500,6 +528,21 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
     3. NXdetector groups — ``/entry/**/NXdetector/data``.
     4. Fallback: the largest 2-D+ dataset anywhere in the file.
     """
+    # --- 0. Reject processed xdart v2 files ---------------------------------
+    # A processed scan file stores *reduced* data (integrated_1d/2d are
+    # NXData with ndim>=2), not raw detector frames — without this guard the
+    # search below would return ``integrated_1d`` (shape (N, n_q)) and the
+    # caller would display an integrated-pattern stack as if it were an
+    # image.  Raw frames for such a file live in the original detector
+    # master; use ``ssrl_xrd_tools.io.read.get_raw_frame`` (it resolves the
+    # per-frame source pointer) instead.
+    if any(p in f for p in ("entry/integrated_1d", "entry/integrated_2d")):
+        raise ValueError(
+            f"{f.filename} is a processed xdart scan file (no raw detector "
+            "image inside); use io.read.get_raw_frame to read raw frames via "
+            "the stored source pointer."
+        )
+
     # --- 1. Fixed candidate paths -------------------------------------------
     _FIXED_PATHS = (
         "/entry/data/data",

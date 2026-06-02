@@ -65,6 +65,40 @@ def test_scan_sorts_frames_and_synthesizes_metadata() -> None:
     np.testing.assert_allclose(meta.angles["tth"], [0.0, 1.0])
 
 
+def test_scan_frame_source_iterates_bounded_chunks() -> None:
+    from ssrl_xrd_tools.reduction import FrameSource
+
+    scan = Scan(
+        "source",
+        [Frame(2, image=np.full((2, 2), 2.0)),
+         Frame(0, image=np.zeros((2, 2))),
+         Frame(1, image=np.ones((2, 2)))],
+    )
+    assert isinstance(scan, FrameSource)
+    chunks = list(scan.iter_chunks(2))
+    assert [indices for _, indices in chunks] == [[0, 1], [2]]
+    np.testing.assert_array_equal(chunks[0][0][:, 0, 0], [0.0, 1.0])
+
+
+def test_scan_frame_source_clears_images_loaded_by_chunks() -> None:
+    calls: list[int] = []
+
+    def _loader(frame: Frame) -> np.ndarray:
+        calls.append(frame.index)
+        return np.full((2, 2), frame.index)
+
+    preloaded = Frame(0, image=np.zeros((2, 2)))
+    lazy = [Frame(1, loader=_loader), Frame(2, loader=_loader)]
+    scan = Scan("bounded", [preloaded, *lazy])
+
+    chunks = list(scan.iter_chunks(1))
+    assert [indices for _, indices in chunks] == [[0], [1], [2]]
+    assert calls == [1, 2]
+    assert preloaded.image is not None
+    assert lazy[0].image is None
+    assert lazy[1].image is None
+
+
 def test_frame_loads_with_custom_loader_once() -> None:
     calls: list[int] = []
 
@@ -346,9 +380,11 @@ def test_nexus_sink_writes_frame_results(
 
     assert result.output_path == out
     with h5py.File(out, "r") as h5:
-        assert "entry/reduction/0/int_1d/intensity" in h5
+        # Stacked read_scan-compatible layout: (n_frames, n_q).
+        assert "entry/integrated_1d/intensity" in h5
+        assert list(h5["entry/integrated_1d/frame_index"][()]) == [0]
         np.testing.assert_allclose(
-            h5["entry/reduction/0/int_1d/intensity"][()],
+            h5["entry/integrated_1d/intensity"][0],
             [3.0, 4.0],
         )
 

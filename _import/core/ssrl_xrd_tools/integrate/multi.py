@@ -252,13 +252,87 @@ def _prepare_images(
             raise ValueError(
                 f"normalization length {norm.shape} != number of images {len(img_list)}"
             )
+        if not np.all(np.isfinite(norm)):
+            raise ValueError("normalization contains non-finite (nan/inf) values")
+        if np.any(norm == 0):
+            raise ValueError("normalization contains zero values (would divide by zero)")
         img_list = [img / n for img, n in zip(img_list, norm)]
 
     return img_list
+
+
+def stitch_images(
+    images: list[np.ndarray] | np.ndarray,
+    base_poni: PONI,
+    rot1_angles: np.ndarray | Sequence[float],
+    rot2_angles: np.ndarray | Sequence[float] | None = None,
+    *,
+    mode: str = "1d",
+    npt_1d: int = 2000,
+    npt_rad_2d: int = 1500,
+    npt_azim_2d: int = 720,
+    unit: str = "q_A^-1",
+    method: str = "BBox",
+    radial_range: tuple[float, float] | None = None,
+    azimuth_range: tuple[float, float] | None = None,
+    mask: np.ndarray | None = None,
+    normalization: np.ndarray | Sequence[float] | None = None,
+) -> IntegrationResult1D | IntegrationResult2D:
+    """Stitch a detector-angle image stack into a 1D or 2D pattern.
+
+    High-level entry point that builds the per-image MultiGeometry
+    integrators from ``base_poni`` + per-image ``rot1``/``rot2`` offsets
+    (degrees) and dispatches to :func:`stitch_1d` / :func:`stitch_2d`.
+    This is the orchestration the xdart GUI used to carry inline; keeping
+    it here lets headless callers stitch without reimplementing the
+    integrator-build + dispatch.
+
+    Parameters mirror :func:`stitch_1d` / :func:`stitch_2d`; ``mode``
+    selects which.  ``rot2_angles`` that are all-zero (or ``None``) are
+    treated as a pure ``rot1`` scan.
+    """
+    # Fail early on a count mismatch — feeding MultiGeometry an unequal
+    # number of images and integrators silently mispairs images with the
+    # wrong detector angle (or raises deep inside pyFAI).
+    rot1 = np.asarray(rot1_angles, dtype=float)
+    # Count images the same way _prepare_images interprets them: a 3-D
+    # ndarray is a stack (count = shape[0]); a 2-D ndarray is a single
+    # image (count = 1, NOT shape[0]); anything else is a sequence.
+    if isinstance(images, np.ndarray):
+        n_images = images.shape[0] if images.ndim == 3 else 1
+    else:
+        n_images = len(images)
+    if n_images != rot1.shape[0]:
+        raise ValueError(
+            f"stitch_images: {n_images} images != {rot1.shape[0]} angles; "
+            "one detector angle is required per image."
+        )
+
+    rot2 = (
+        rot2_angles
+        if rot2_angles is not None and np.any(np.asarray(rot2_angles))
+        else None
+    )
+    integrators = create_multigeometry_integrators(
+        base_poni, rot1_angles=rot1_angles, rot2_angles=rot2,
+    )
+    if mode == "1d":
+        return stitch_1d(
+            images, integrators, npt=npt_1d, unit=unit, method=method,
+            radial_range=radial_range, mask=mask, normalization=normalization,
+        )
+    if mode == "2d":
+        return stitch_2d(
+            images, integrators, npt_rad=npt_rad_2d, npt_azim=npt_azim_2d,
+            unit=unit, method=method, radial_range=radial_range,
+            azimuth_range=azimuth_range, mask=mask, normalization=normalization,
+        )
+    raise ValueError(f"mode must be '1d' or '2d', got {mode!r}")
 
 
 __all__ = [
     "create_multigeometry_integrators",
     "stitch_1d",
     "stitch_2d",
+    "stitch_images",
 ]

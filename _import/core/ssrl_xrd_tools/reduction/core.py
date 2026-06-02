@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Iterator, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -141,6 +141,21 @@ class MaskSpec:
         return out.reshape(image_shape)
 
 
+@runtime_checkable
+class FrameSource(Protocol):
+    """Minimal image-stream boundary shared by reduction, RSM, and stitching."""
+
+    @property
+    def frame_indices(self) -> list[int]:
+        ...
+
+    def load_frame(self, index: int) -> np.ndarray:
+        ...
+
+    def iter_chunks(self, chunk_size: int) -> Iterator[tuple[np.ndarray, list[int]]]:
+        ...
+
+
 @dataclass(slots=True)
 class Scan:
     """Ordered set of frames with scan-level reduction context."""
@@ -159,22 +174,73 @@ class Scan:
     output_path: Path | str | None = None
     sample_name: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+    _frame_by_index: dict[int, Frame] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.frames = sorted(list(self.frames), key=lambda f: f.index)
         indices = [int(f.index) for f in self.frames]
         if len(indices) != len(set(indices)):
-            dupes = sorted({idx for idx in indices if indices.count(idx) > 1})
-            raise ValueError(f"Scan contains duplicate frame indices: {dupes}")
+            seen: set[int] = set()
+            dupes: set[int] = set()
+            for idx in indices:
+                if idx in seen:
+                    dupes.add(idx)
+                seen.add(idx)
+            raise ValueError(f"Scan contains duplicate frame indices: {sorted(dupes)}")
         self.motors = {k: np.asarray(v, dtype=float) for k, v in self.motors.items()}
         if self.output_path is not None and not isinstance(self.output_path, Path):
             self.output_path = Path(self.output_path)
+        self._frame_by_index = {int(frame.index): frame for frame in self.frames}
 
     def __len__(self) -> int:
         return len(self.frames)
 
     def __iter__(self) -> Iterable[Frame]:
         return iter(self.frames)
+
+    @property
+    def frame_indices(self) -> list[int]:
+        """Ordered labels exposed through the shared frame-source boundary."""
+        return [int(frame.index) for frame in self.frames]
+
+    @property
+    def energy_keV(self) -> float | None:
+        """Photon energy in keV, matching :class:`ScanMetadata.energy`."""
+        return self.energy
+
+    @property
+    def energy_eV(self) -> float | None:
+        """Photon energy in eV for RSM/gridder consumers."""
+        return None if self.energy is None else float(self.energy) * 1000.0
+
+    def load_frame(self, index: int) -> np.ndarray:
+        """Load one detector image by frame label."""
+        try:
+            frame = self._frame_by_index[int(index)]
+        except KeyError as exc:
+            raise KeyError(f"Scan has no frame {index}") from exc
+        return np.asarray(frame.load_image())
+
+    def iter_chunks(self, chunk_size: int) -> Iterator[tuple[np.ndarray, list[int]]]:
+        """Yield bounded image chunks for streaming consumers such as RSM."""
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
+        indices = self.frame_indices
+        for start in range(0, len(indices), chunk_size):
+            chunk_indices = indices[start:start + chunk_size]
+            loaded_here: list[Frame] = []
+            images: list[np.ndarray] = []
+            try:
+                for idx in chunk_indices:
+                    frame = self._frame_by_index[int(idx)]
+                    was_empty = frame.image is None
+                    images.append(np.asarray(frame.load_image()))
+                    if was_empty and frame.image is not None:
+                        loaded_here.append(frame)
+                yield np.stack(images), chunk_indices
+            finally:
+                for frame in loaded_here:
+                    frame.image = None
 
     def to_metadata(self) -> ScanMetadata | None:
         """Return explicit metadata or synthesize minimal NeXus metadata."""

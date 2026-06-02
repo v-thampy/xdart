@@ -365,9 +365,12 @@ class PONI:
             if field is None:
                 continue
             if field == "wavelength" and isinstance(v, str):
+                # ``float`` already parses scientific notation ("6.2e-11");
+                # no ``eval`` needed (and ``eval`` on file-sourced strings is
+                # an arbitrary-code-execution hazard).
                 try:
-                    v = float(eval(v))  # pyFAI sometimes writes wavelength as "6.2e-11"
-                except Exception:
+                    v = float(v)
+                except ValueError:
                     logger.warning("Could not parse wavelength %r; using 0.0", v)
                     v = 0.0
             if field == "detector":
