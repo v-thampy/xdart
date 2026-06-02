@@ -346,9 +346,9 @@ def test_extension_panel_role_and_fit_trace_round_trip():
 
 def test_compute_display_state_emits_layout():
     # §10.1: the computed state carries a layout descriptor — arrangement is
-    # data, not mode-branching.  Int = raw|cake on top, plot below.
+    # data, not mode-branching.  Int-2D = raw|cake on top, plot below.
     state = dl.compute_display_state(**_base_state_kwargs(
-        mode=dl.Mode.INT_1D, selected_ids=(0,), loaded_1d_keys={0},
+        mode=dl.Mode.INT_2D, selected_ids=(0,), loaded_1d_keys={0},
         loaded_2d_keys={0}, raw_availability={0: dict(has_raw=True)}))
     roles = tuple(tuple(k.role for k in row) for row in state.layout)
     assert roles == (
@@ -364,6 +364,23 @@ def test_compute_display_state_emits_layout():
         mode=dl.Mode.IMAGE_VIEWER, selected_ids=(0,), loaded_2d_keys={0},
         raw_availability={0: dict(has_raw=True)}))
     assert img.layout == ((dl.PanelKey(dl.PanelRole.RAW_2D),),)
+
+
+def test_int_1d_is_plot_only_int_2d_has_raw_cake_plot():
+    # INT_1D is 1D-only (skip_2d) -> plot-only panels/layout, matching
+    # _apply_1d_only_visibility.  INT_2D keeps raw + cake + plot.
+    kw = dict(selected_ids=(0,), all_frame_index=[0], loaded_1d_keys={0},
+              loaded_2d_keys={0}, raw_availability={0: dict(has_raw=True)})
+    one_d = dl.compute_display_state(**_base_state_kwargs(mode=dl.Mode.INT_1D, **kw))
+    two_d = dl.compute_display_state(**_base_state_kwargs(mode=dl.Mode.INT_2D, **kw))
+
+    roles_1d = {k.role for k, _ in one_d.panels}
+    roles_2d = {k.role for k, _ in two_d.panels}
+    assert roles_1d == {dl.PanelRole.PLOT_1D}
+    assert roles_2d == {dl.PanelRole.RAW_2D, dl.PanelRole.CAKE_2D, dl.PanelRole.PLOT_1D}
+    assert one_d.layout == ((dl.PanelKey(dl.PanelRole.PLOT_1D),),)
+    assert one_d.panel(dl.PanelRole.RAW_2D) is None      # no 2D panels in 1D-only
+    assert one_d.panel(dl.PanelRole.CAKE_2D) is None
 
 
 def test_rsm_2x3_layout_with_repeated_roles_round_trips():

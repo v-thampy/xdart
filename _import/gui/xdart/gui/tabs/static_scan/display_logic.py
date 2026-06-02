@@ -488,13 +488,16 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     cake_key = PanelKey(PanelRole.CAKE_2D)
     plot_key = PanelKey(PanelRole.PLOT_1D)
 
-    if mode is Mode.IMAGE_VIEWER:
+    if mode in (Mode.IMAGE_VIEWER,):
         panels = ((raw_key, raw_panel),)
         layout = ((raw_key,),)
-    elif mode is Mode.XYE_VIEWER:
+    elif mode in (Mode.XYE_VIEWER, Mode.INT_1D):
+        # INT_1D is 1D-only (skip_2d): collapse to a plot-only layout,
+        # matching the widget's _apply_1d_only_visibility.  The XYE viewer
+        # is likewise plot-only.
         panels = ((plot_key, plot_panel),)
         layout = ((plot_key,),)
-    else:  # INT_1D / INT_2D: raw | cake on top, 1D plot below
+    else:  # INT_2D: raw | cake on top, 1D plot below
         panels = (
             (raw_key, raw_panel),
             (cake_key, cake_panel),
