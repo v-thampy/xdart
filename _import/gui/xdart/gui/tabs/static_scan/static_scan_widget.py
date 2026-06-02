@@ -903,6 +903,29 @@ class staticWidget(QWidget):
 
         gc.collect()
 
+        # XYE-only batch (Int 1D (XYE)): there is no .nxs to auto-load, so the
+        # block above skipped the end-of-batch reload.  Show the folder of
+        # generated iq_/itth_ files (written to <scan_dir>/<scan_name> by
+        # save_1d) in XYE Viewer mode so the outputs are actually listed.
+        # Done last so integrator_thread_finished()'s refresh doesn't undo it.
+        if is_batch and is_xye_only:
+            try:
+                xye_dir = os.path.join(
+                    os.path.dirname(self.scan.data_file), self.scan.name)
+                if os.path.isdir(xye_dir):
+                    self.h5viewer.dirname = xye_dir
+                    # Same path the XYE Viewer combo takes: set viewer_mode,
+                    # panels, selection mode, and refresh listScans.
+                    self._on_viewer_mode_changed('xye')
+                else:
+                    logger.debug(
+                        'XYE-only batch finished but output dir not found: %s',
+                        xye_dir)
+            except Exception:
+                logger.debug(
+                    'Could not show XYE output folder after batch',
+                    exc_info=True)
+
     def _on_viewer_mode_changed(self, viewer_mode_str):
         """Enable or disable the integrator panel and update h5viewer for viewer mode.
 
