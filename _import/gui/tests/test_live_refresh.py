@@ -727,7 +727,7 @@ def _update_smoke_host():
     host.ui.imageUnit.currentIndex.return_value = 0
     host.ui.plotMethod.currentText.return_value = 'Single'
     for name in ('get_idxs', '_note_selection_generation', '_bump_display_generation',
-                 '_live_mode', '_live_display_state', '_shadow_check_display_state',
+                 '_live_mode', '_live_display_state',
                  '_draw_delegate', '_clear_delegate', 'render_display',
                  '_updated', 'update'):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
@@ -869,11 +869,11 @@ def test_render_display_drops_stale_generation():
     assert calls == []                           # nothing drawn or cleared
 
 
-def test_shadow_display_state_check_agrees_and_never_raises(caplog):
-    # Stage 2 shadow mode: building a DisplayState from live inputs must
-    # agree with the existing render path's idxs and never raise into the
-    # session.  (Evidence for "no shadow assert fires" during use.)
-    import logging
+def test_live_display_state_render_ids_match_legacy_idxs():
+    # The controller-built DisplayState's render_ids must match the legacy
+    # idxs the (delegated) draw methods consume — the two paths coexist until
+    # the data-source unification removes the idxs path.
+    from xdart.gui.tabs.static_scan.display_logic import Mode
 
     host = SimpleNamespace(
         viewer_mode=None,
@@ -892,14 +892,14 @@ def test_shadow_display_state_check_agrees_and_never_raises(caplog):
                              frames=SimpleNamespace(index=[0, 1]), gi=False),
         ui=SimpleNamespace(plotMethod=SimpleNamespace(currentText=lambda: 'Single')),
     )
-    for name in ('_live_mode', '_live_display_state', '_shadow_check_display_state'):
+    for name in ('_live_mode', '_live_display_state'):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
 
-    logger_name = 'xdart.gui.tabs.static_scan.display_frame_widget'
-    with caplog.at_level(logging.DEBUG, logger=logger_name):
-        host._shadow_check_display_state()       # must not raise
-
-    assert not any('shadow: render_ids' in r.getMessage() for r in caplog.records)
+    state = host._live_display_state()
+    expected = (sorted(host.idxs_2d)
+                if state.mode in (Mode.INT_2D, Mode.IMAGE_VIEWER)
+                else sorted(host.idxs_1d))
+    assert list(state.render_ids) == expected
 
 
 def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():

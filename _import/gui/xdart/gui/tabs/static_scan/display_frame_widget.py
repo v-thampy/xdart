@@ -487,28 +487,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         mode = self._live_mode()
         return controller_for(mode).compute_state(self, mode)
 
-    def _shadow_check_display_state(self, state=None):
-        """Debug-only cross-check: confirm the DisplayState's render_ids
-        match what the legacy path computed (self.idxs_*).  Runs only when
-        DEBUG logging is on and never raises into a session (logged, not
-        thrown).  Temporary — drops out when the legacy idxs paths go in a
-        later stage."""
-        if not logger.isEnabledFor(logging.DEBUG):
-            return
-        try:
-            if state is None:
-                state = self._live_display_state()
-            expected = (sorted(self.idxs_2d)
-                        if state.mode in (Mode.INT_2D, Mode.IMAGE_VIEWER)
-                        else sorted(self.idxs_1d))
-            if list(state.render_ids) != expected:
-                logger.debug(
-                    "shadow: render_ids %s != live idxs %s (mode=%s, status=%s)",
-                    state.render_ids, expected, state.mode, state.load_status,
-                )
-        except Exception:
-            logger.debug("shadow display-state check failed", exc_info=True)
-
     def update_plot_range(self):
         if self.ui.slice.isChecked():
             self.update_plot()
@@ -536,23 +514,22 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return True
 
     def update(self):
-        """Updates image and plot frames based on toolbar options.
+        """Update the image and plot panels for the current selection.
 
-        Stage 3: the per-mode dispatch is gone.  We compute one
-        :class:`DisplayState`, build its payload, and hand both to
-        :meth:`render`, which lays panels out by the state's layout and
-        draws-or-clears each — no ``if viewer_mode == ...`` here.
+        Mode-agnostic: snapshot one :class:`DisplayState` (via the mode
+        controller), build its payload, and hand both to
+        :meth:`render_display`, which lays panels out by the state's
+        ``layout`` and draws-or-clears each — no ``if viewer_mode == ...``
+        dispatch here.
         """
         self.get_idxs()
-        self._note_selection_generation()   # Stage 2: bump on selection change
+        self._note_selection_generation()   # bump generation on selection change
 
         if not self._updated():
             return True
 
-        mode = self._live_mode()
-        ctrl = controller_for(mode)
-        state = ctrl.compute_state(self, mode)
-        self._shadow_check_display_state(state)  # debug-only cross-check
+        state = self._live_display_state()
+        ctrl = controller_for(state.mode)
         payload = ctrl.build_payload(self, state)  # store=None ⇒ delegate draws
         return self.render_display(state, payload)
 
