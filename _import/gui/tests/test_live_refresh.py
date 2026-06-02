@@ -445,6 +445,127 @@ def test_display_generation_bumps_on_mode_switch_and_selection():
     assert host.display_generation == 3
 
 
+def _update_smoke_host():
+    """Host that drives the REAL update()->render_display orchestration
+    (get_idxs, _live_display_state, compute_display_state, build_payload,
+    render_plan, render_display, _draw/_clear_delegate) with only the
+    pixel-push leaves stubbed to record their calls.  This exercises the
+    integration path that the per-method tests don't cover."""
+    from unittest.mock import MagicMock
+    from xdart.gui.tabs.static_scan import display_logic as dl
+
+    calls = []
+    def rec(name):
+        return lambda *a, **k: calls.append(name)
+
+    host = SimpleNamespace(
+        viewer_mode=None,
+        display_generation=0,
+        _last_selection_sig=None,
+        frame_ids=['0', '1'],
+        idxs=[], idxs_1d=[], idxs_2d=[],
+        overall=False,
+        overlaid_idxs=[],
+        data_1d={0: object(), 1: object()},
+        data_2d={
+            0: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
+            1: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
+        },
+        data_lock=RLock(),
+        scan=SimpleNamespace(scan_lock=RLock(),
+                             frames=SimpleNamespace(index=[0, 1]),
+                             gi=False, skip_2d=False, name='scan'),
+        ui=MagicMock(),
+        plot=MagicMock(),
+        binned_widget=MagicMock(),
+        # pixel-push leaves (unchanged by Stage 3) — recorded, not run
+        update_image=rec("draw_image"),
+        update_binned=rec("draw_binned"),
+        update_plot=rec("draw_plot"),
+        _update_image_viewer=rec("draw_viewer_image"),
+        _update_xye_viewer=rec("draw_viewer_xye"),
+        clear_image_view=rec("clear_image"),
+        clear_binned_view=rec("clear_binned"),
+        clear_plot_view=rec("clear_plot"),
+        update_2d_label=rec("label_2d"),
+        _update_image_preview=rec("preview"),
+        _apply_1d_only_visibility=rec("apply_1d_only"),
+    )
+    host.ui.shareAxis.isChecked.return_value = False
+    host.ui.imageUnit.currentIndex.return_value = 0
+    host.ui.plotMethod.currentText.return_value = 'Single'
+    for name in ('get_idxs', '_note_selection_generation', '_bump_display_generation',
+                 '_live_mode', '_live_display_state', '_shadow_check_display_state',
+                 '_draw_delegate', '_clear_delegate', 'render_display',
+                 '_updated', 'update'):
+        setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
+    return host, calls, dl
+
+
+def test_update_render_smoke_int_collapse_and_mode_switches():
+    host, calls, dl = _update_smoke_host()
+
+    # Int-2D: full panel set.
+    host.update()
+    assert "draw_plot" in calls and "draw_image" in calls and "draw_binned" in calls
+    assert "label_2d" in calls and not any(c.startswith("clear_") for c in calls)
+
+    # Int-1D (skip_2d): 1D-only — plot drawn, the two 2D panels cleared.
+    calls.clear()
+    host.scan.skip_2d = True
+    host.update()
+    assert "draw_plot" in calls
+    assert "clear_image" in calls and "clear_binned" in calls
+    assert "draw_image" not in calls and "draw_binned" not in calls
+
+    # Switch to Image Viewer (mode switch bumps generation): raw drawn,
+    # the 1D plot + cake from the prior mode are cleared (no stale panels).
+    calls.clear()
+    host.scan.skip_2d = False
+    host.viewer_mode = 'image'
+    host._bump_display_generation()
+    host.update()
+    assert "draw_viewer_image" in calls
+    assert "clear_plot" in calls and "clear_binned" in calls
+    assert "label_2d" not in calls           # viewer owns its own title
+
+    # Switch to XYE Viewer: 1D drawn, the 2D panels cleared.
+    calls.clear()
+    host.viewer_mode = 'xye'
+    host._bump_display_generation()
+    host.update()
+    assert "draw_viewer_xye" in calls
+    assert "clear_image" in calls and "clear_binned" in calls
+
+    # Back to normal Int-2D: full panel set again.
+    calls.clear()
+    host.viewer_mode = None
+    host._bump_display_generation()
+    host.update()
+    assert {"draw_plot", "draw_image", "draw_binned"} <= set(calls)
+
+
+def test_update_render_smoke_gi_scan_propagates_and_dispatches():
+    # A GI scan still renders through the same path; gi flag propagates into
+    # the state and the cake/plot dispatch is unchanged (GI axis labelling is
+    # delegated to the legacy update_binned_view, covered elsewhere).
+    host, calls, dl = _update_smoke_host()
+    host.scan.gi = True
+    host.update()
+    assert host._live_display_state().gi is True
+    assert {"draw_plot", "draw_image", "draw_binned"} <= set(calls)
+
+
+def test_update_render_smoke_stale_generation_is_dropped():
+    host, calls, dl = _update_smoke_host()
+    state = host._live_display_state()
+    calls.clear()
+    stale = dl.DisplayPayload(generation=state.generation - 1, raw_image=None,
+                              cake_image=None, plot=None)
+    host.render_display(state, stale)
+    assert calls == []                        # nothing drawn or cleared
+
+
 def _render_host():
     """A host that records which draw/clear delegates render_display calls."""
     from unittest.mock import MagicMock
