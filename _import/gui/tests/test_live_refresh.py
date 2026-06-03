@@ -1319,6 +1319,7 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
             actionSaveDataAs=_FakeAction(),
             viewer_mode="xye",
             _suspend_scan_selection_loads=False,
+            _apply_frames_panel_width=lambda vm: None,
             enter_viewer_mode_cleanup=lambda: calls.append(
                 ("cleanup_suspend", widget.h5viewer._suspend_scan_selection_loads),
             ),
@@ -1639,6 +1640,34 @@ def test_nexus_viewer_loads_rows_and_previews_1d_2d_units(tmp_path):
     assert payload_raw["y_label"] == "row"
     assert viewer.data_1d[key_raw].scan_info["_shape"] == (2, 6, 7)
     assert viewer.data_1d[key_raw].scan_info["dtype"] == "uint16"
+
+
+def test_frames_panel_width_relaxes_in_nexus_mode_and_restores():
+    # P3 #7: the Frames (listData) max width is 60 px in the .ui (right for
+    # frame indices) but clips NeXus dataset labels.  It must relax in NeXus
+    # viewer mode and restore for every other mode.
+    class _FakeList:
+        def __init__(self):
+            self._maxw = 60
+
+        def maximumWidth(self):
+            return self._maxw
+
+        def setMaximumWidth(self, w):
+            self._maxw = int(w)
+
+    lw = _FakeList()
+    host = SimpleNamespace(ui=SimpleNamespace(listData=lw))
+    host._apply_frames_panel_width = MethodType(
+        H5Viewer._apply_frames_panel_width, host,
+    )
+
+    host._apply_frames_panel_width("nexus")
+    assert lw.maximumWidth() == 16777215          # relaxed for NeXus labels
+    host._apply_frames_panel_width(None)
+    assert lw.maximumWidth() == 60                # restored to .ui default
+    host._apply_frames_panel_width("image")
+    assert lw.maximumWidth() == 60                # other modes stay narrow
 
 
 def test_nexus_1d_selection_strides_large_axis_but_not_small():

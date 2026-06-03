@@ -2175,6 +2175,26 @@ class H5Viewer(QWidget):
         """Reset the hydrated-raw LRU after data_2d is cleared."""
         _clear_raw_cache_for(self)
 
+    def _apply_frames_panel_width(self, viewer_mode) -> None:
+        """Relax the Frames (``listData``) max width in NeXus viewer mode.
+
+        The base max width is set in the .ui (h5viewerUI, 60 px — right for
+        frame-index labels like "1"/"2").  NeXus rows are dataset-path /
+        field labels ("Integrated 1D", "Raw detector dataset") that clip at
+        60 px, so you can't tell what you're selecting.  Override the cap at
+        runtime here (not in the generated UI): unbounded in NeXus mode so
+        the splitter can size it, restored to the .ui default otherwise."""
+        lw = getattr(self.ui, "listData", None)
+        if lw is None:
+            return
+        if getattr(self, "_frames_panel_max_width", None) is None:
+            # Remember the .ui default once so we can restore it exactly.
+            self._frames_panel_max_width = lw.maximumWidth()
+        if viewer_mode == "nexus":
+            lw.setMaximumWidth(16777215)   # QWIDGETSIZE_MAX — splitter sizes it
+        else:
+            lw.setMaximumWidth(self._frames_panel_max_width)
+
     def cancel_pending_loads(self) -> None:
         """Cancel stale background frame hydration and reject queued chunks."""
         # Bump first so any chunk still queued from the outgoing worker is

@@ -995,6 +995,9 @@ class staticWidget(QWidget):
         try:
             # Keep integratorTree enabled so mask/threshold controls remain accessible
             self.h5viewer.viewer_mode = viewer_mode
+            # Relax the Frames panel width so NeXus dataset labels aren't
+            # clipped; restored on exit / other modes.
+            self.h5viewer._apply_frames_panel_width(viewer_mode)
             if hasattr(self, "metawidget"):
                 self.metawidget.viewer_mode = viewer_mode
             # Give displayframe a reference to the wrangler for mask/threshold
