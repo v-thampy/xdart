@@ -1141,10 +1141,47 @@ def test_instrument_groups(written_nxs):
     assert "mask" in det
     assert det["mask"].nxdata.tolist() == [0, 1, 256, 65535]
 
-    # Source/wavelength
-    src = instr["source"]
+    # Source/wavelength: the fixture has no integrator and only the mg_args
+    # 1e-10 (1.0 Å) sentinel, so the writer must NOT persist a misleading
+    # wavelength_A (A2).  A real wavelength is exercised in the dedicated
+    # wavelength tests below.
+    assert "source" not in instr
+
+
+def test_wavelength_not_written_for_sentinel_only(tmp_path):
+    # A2: with no integrator and only the mg_args 1e-10 (1.0 Å) sentinel,
+    # the writer must skip source/wavelength_A rather than persist 1.0 Å.
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    assert scan.mg_args["wavelength"] == 1.0e-10        # the sentinel
+    assert getattr(scan, "_cached_integrator", None) is None
+
+    path = tmp_path / "no_wl.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    root = nx.nxload(str(path))
+    assert "source" not in root["entry/instrument"]
+
+
+def test_wavelength_prefers_integrator_over_mg_args(tmp_path):
+    # A2: a real integrator wavelength wins over mg_args (and over the
+    # sentinel); the persisted wavelength_A is the integrator value in Å.
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan.mg_args = {"wavelength": 1.0e-10}              # sentinel-ish, must lose
+    scan._cached_integrator = SimpleNamespace(wavelength=0.7293e-10)
+
+    path = tmp_path / "wl_from_ai.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    root = nx.nxload(str(path))
+    src = root["entry/instrument/source"]
     assert src.nxclass == "NXsource"
-    assert "wavelength_A" in src
+    assert float(src["wavelength_A"].nxdata) == pytest.approx(0.7293)
 
 
 def test_reduction_provenance(written_nxs):

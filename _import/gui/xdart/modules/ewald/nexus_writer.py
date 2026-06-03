@@ -1283,7 +1283,24 @@ def _write_instrument(f, scan, *, entry: str) -> None:
     except (TypeError, ValueError):
         wavelength = None
     if wavelength is None:
-        wavelength = scan.mg_args.get("wavelength")
+        # Fall back to mg_args, but NEVER persist the constructor's 1e-10 m
+        # (1.0 Å) sentinel — that's exactly the misleading value the
+        # integrator-first logic exists to avoid.  Skip (and warn) rather
+        # than write a wrong wavelength; a bogus wavelength_A silently
+        # corrupts any downstream Q↔2θ.
+        mg_wl = scan.mg_args.get("wavelength") if scan.mg_args else None
+        try:
+            mg_wl = float(mg_wl) if mg_wl is not None else None
+        except (TypeError, ValueError):
+            mg_wl = None
+        if mg_wl is not None and mg_wl > 0 and abs(mg_wl - 1e-10) > 1e-14:
+            wavelength = mg_wl
+        elif mg_wl is not None:
+            logger.warning(
+                "Skipping source/wavelength_A: the only candidate is the "
+                "mg_args default sentinel (%g m = %.3g A) and no integrator "
+                "wavelength is available.", mg_wl, mg_wl * 1e10,
+            )
     if wavelength is not None:
         if "source" in instr:
             del instr["source"]
