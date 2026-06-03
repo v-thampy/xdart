@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from types import MethodType, SimpleNamespace
 from threading import RLock
@@ -804,13 +805,14 @@ def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
     assert publication.view.has_2d
 
 
-def test_absorb_chunk_skips_invalid_2d_cache_but_keeps_1d_publication():
+def test_absorb_chunk_skips_invalid_2d_cache_but_keeps_1d_publication(caplog):
     from ssrl_xrd_tools.core import IntegrationResult1D, IntegrationResult2D
     from xdart.modules.frame_publication import (
         PublicationStore,
         publication_has_2d_errors,
     )
 
+    caplog.set_level(logging.WARNING, logger="xdart.gui.tabs.static_scan.h5viewer")
     viewer = SimpleNamespace(
         _load_generation=8,
         data_lock=RLock(),
@@ -860,6 +862,7 @@ def test_absorb_chunk_skips_invalid_2d_cache_but_keeps_1d_publication():
     assert publication is not None
     assert publication.view.has_1d
     assert publication_has_2d_errors(publication)
+    assert "Skipping frame 12 2D display cache" in caplog.text
 
 
 def test_gi_common_grid_freeze_yields_uniform_axes():

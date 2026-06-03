@@ -25,6 +25,7 @@ from .display_controllers import ImageViewerController
 from ssrl_xrd_tools.io import ImageSourceKind
 from xdart.modules.frame_publication import (
     PublicationStore,
+    publication_error_details,
     publication_from_live_frame,
     publication_has_2d_errors,
 )
@@ -1642,6 +1643,12 @@ class H5Viewer(QWidget):
                         }
                         if frame.map_raw is not None:
                             self._remember_hydrated_raw(int(idx))
+                    else:
+                        logger.warning(
+                            "Skipping frame %s 2D display cache: %s",
+                            idx,
+                            publication_error_details(publication, "2d"),
+                        )
                 if store is not None:
                     store.upsert(publication)
             # O6: coalesce display updates while a chunk burst is

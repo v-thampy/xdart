@@ -67,12 +67,17 @@ class PublicationDiagnostics:
     dummy_fraction_2d: float | None = None
     axis_ranges: Mapping[str, tuple[float, float] | None] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    errors_1d: tuple[str, ...] = ()
+    errors_2d: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "axis_ranges", _readonly_mapping(self.axis_ranges))
         object.__setattr__(self, "warnings", tuple(self.warnings))
-        object.__setattr__(self, "errors", tuple(self.errors))
+        object.__setattr__(self, "errors_1d", tuple(self.errors_1d))
+        object.__setattr__(self, "errors_2d", tuple(self.errors_2d))
+        errors = tuple(self.errors) or self.errors_1d + self.errors_2d
+        object.__setattr__(self, "errors", tuple(errors))
 
     @property
     def ok(self) -> bool:
@@ -117,7 +122,8 @@ def validate_publication(
 
     view = publication.view
     warnings: list[str] = []
-    errors: list[str] = []
+    errors_1d: list[str] = []
+    errors_2d: list[str] = []
     finite_1d = _finite_fraction(view.intensity_1d)
     finite_2d = _finite_fraction(view.intensity_2d)
     dummy_2d = _dummy_fraction(view.intensity_2d)
@@ -128,17 +134,17 @@ def validate_publication(
     }
 
     if view.has_1d and (finite_1d is None or finite_1d == 0.0):
-        errors.append("1D intensity contains no finite values")
+        errors_1d.append("1D intensity contains no finite values")
     if view.has_2d:
         if finite_2d is None or finite_2d == 0.0:
-            errors.append("2D intensity contains no finite values")
+            errors_2d.append("2D intensity contains no finite values")
         if dummy_2d is not None and dummy_2d >= 0.95 and not allow_dummy_2d:
-            errors.append("2D intensity is almost entirely dummy pixels")
+            errors_2d.append("2D intensity is almost entirely dummy pixels")
         if view.two_d_kind is not TwoDKind.Q_CHI and view.incident_angle is None:
             warnings.append("GI 2D publication has no resolved incident angle")
         for name in ("axis_2d_x", "axis_2d_y"):
             if axis_ranges[name] is None:
-                errors.append(f"{name} has no finite range")
+                errors_2d.append(f"{name} has no finite range")
 
     diagnostics = PublicationDiagnostics(
         finite_fraction_1d=finite_1d,
@@ -146,7 +152,8 @@ def validate_publication(
         dummy_fraction_2d=dummy_2d,
         axis_ranges=axis_ranges,
         warnings=tuple(warnings),
-        errors=tuple(errors),
+        errors_1d=tuple(errors_1d),
+        errors_2d=tuple(errors_2d),
     )
     if raise_on_error and diagnostics.errors:
         raise ValueError("; ".join(diagnostics.errors))
@@ -154,14 +161,21 @@ def validate_publication(
 
 
 def publication_has_1d_errors(publication: FramePublication) -> bool:
-    return any(msg.startswith("1D") for msg in publication.diagnostics.errors)
+    return bool(publication.diagnostics.errors_1d)
 
 
 def publication_has_2d_errors(publication: FramePublication) -> bool:
-    return any(
-        msg.startswith("2D") or msg.startswith("axis_2d")
-        for msg in publication.diagnostics.errors
-    )
+    return bool(publication.diagnostics.errors_2d)
+
+
+def publication_error_details(publication: FramePublication, output: str) -> str:
+    if output == "1d":
+        errors = publication.diagnostics.errors_1d
+    elif output == "2d":
+        errors = publication.diagnostics.errors_2d
+    else:
+        errors = publication.diagnostics.errors
+    return "; ".join(errors)
 
 
 def publication_from_live_frame(
@@ -324,6 +338,7 @@ __all__ = [
     "publication_from_frame_view",
     "publication_from_live_frame",
     "publication_from_nexus_frame",
+    "publication_error_details",
     "publication_has_1d_errors",
     "publication_has_2d_errors",
     "validate_publication",

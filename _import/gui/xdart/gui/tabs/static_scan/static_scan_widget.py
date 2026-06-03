@@ -36,6 +36,7 @@ else:
 from xdart.modules.live import LiveFrame, LiveScan
 from xdart.modules.frame_publication import (
     PublicationStore,
+    publication_error_details,
     publication_from_live_frame,
     publication_has_2d_errors,
 )
@@ -479,10 +480,9 @@ class staticWidget(QWidget):
                     # produces (see scan_threads.load_frames).  Keys are what
                     # displayframe.get_frames_map_raw / get_frames_int_2d
                     # look for.
-                    if (
-                        not getattr(self.scan, "skip_2d", False)
-                        and not publication_has_2d_errors(publication)
-                    ):
+                    skip_2d = getattr(self.scan, "skip_2d", False)
+                    has_2d_errors = publication_has_2d_errors(publication)
+                    if not skip_2d and not has_2d_errors:
                         self.h5viewer.data_2d[int(idx)] = {
                             "map_raw": getattr(frame, "map_raw", None),
                             "bg_raw": getattr(frame, "bg_raw", 0),
@@ -491,6 +491,12 @@ class staticWidget(QWidget):
                             "gi_2d": getattr(frame, "gi_2d", {}),
                             "thumbnail": getattr(frame, "thumbnail", None),
                         }
+                    elif not skip_2d and has_2d_errors:
+                        logger.warning(
+                            "Skipping frame %s 2D display cache: %s",
+                            idx,
+                            publication_error_details(publication, "2d"),
+                        )
                     # ── Bounded cache eviction ────────────────────────
                     # O4: ``data_1d`` and ``data_2d`` are both bounded
                     # FixSizeOrderedDicts now (see __init__), so their

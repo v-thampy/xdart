@@ -14,6 +14,7 @@ from ssrl_xrd_tools.io.nexus import write_integrated_stack
 
 from xdart.modules.frame_publication import (
     PublicationStore,
+    publication_error_details,
     publication_from_nexus_frame,
     publication_from_live_frame,
     publication_has_1d_errors,
@@ -84,8 +85,11 @@ def test_gi_dummy_publication_is_flagged_before_display_or_save():
 
     assert publication.view.two_d_kind is TwoDKind.QIP_QOOP
     assert not publication.diagnostics.ok
+    assert publication.diagnostics.errors_1d == ()
+    assert publication.diagnostics.errors_2d
     assert publication_has_2d_errors(publication)
     assert not publication_has_1d_errors(publication)
+    assert "dummy" in publication_error_details(publication, "2d")
     assert any("dummy" in msg for msg in publication.diagnostics.errors)
     with pytest.raises(ValueError, match="dummy"):
         validate_publication(publication, raise_on_error=True)
@@ -101,6 +105,8 @@ def test_publication_1d_error_classification_is_independent_from_2d():
 
     publication = publication_from_live_frame(frame)
 
+    assert publication.diagnostics.errors_1d
+    assert publication.diagnostics.errors_2d == ()
     assert publication_has_1d_errors(publication)
     assert not publication_has_2d_errors(publication)
 

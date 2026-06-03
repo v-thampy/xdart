@@ -242,8 +242,10 @@ def save_scan_to_nexus(
             replace_frame_indices=replace_frame_indices,
             cursor=cursor,
         )
+        prepared_1d, prepared_2d = _filter_prepared_frame_publications(
+            prepared_1d, prepared_2d,
+        )
         _validate_prepared_integrated(h5f.require_group(entry), prepared_1d, prepared_2d)
-        _validate_frame_publications(prepared_1d, prepared_2d)
 
         # 2. Provenance — append mode: only on first save or finalize.
         # Replace mode: always rewrite so the persisted ``bai_*_args``
@@ -625,37 +627,91 @@ def _validate_prepared_integrated(entry_grp, prepared_1d, prepared_2d) -> None:
         )
 
 
-def _validate_frame_publications(prepared_1d, prepared_2d) -> None:
-    """Reject display-invalid frame publications before mutating disk.
+def _filter_prepared_frame_publications(prepared_1d, prepared_2d):
+    """Drop invalid rows per output before mutating disk.
 
     This complements the strict ssrl stack validators above: those ensure
     rows can be stacked consistently, while this gate catches frame-level
     diagnostics such as all-dummy GI cakes before they reach display or disk.
+    It filters 1D and 2D independently so one bad frame/output does not lose
+    the rest of the scan.
     """
     from xdart.modules.frame_publication import (
+        publication_error_details,
         publication_from_live_frame,
         publication_has_1d_errors,
         publication_has_2d_errors,
     )
 
     checked: dict[int, object] = {}
-    for prepared, has_errors, label in (
-        (prepared_1d, publication_has_1d_errors, "1D"),
-        (prepared_2d, publication_has_2d_errors, "2D"),
+    filtered_1d = _filter_prepared_output(
+        prepared_1d,
+        checked,
+        has_errors=publication_has_1d_errors,
+        error_details=lambda pub: publication_error_details(pub, "1d"),
+        label="1D",
+        publication_from_live_frame=publication_from_live_frame,
+    )
+    filtered_2d = _filter_prepared_output(
+        prepared_2d,
+        checked,
+        has_errors=publication_has_2d_errors,
+        error_details=lambda pub: publication_error_details(pub, "2d"),
+        label="2D",
+        publication_from_live_frame=publication_from_live_frame,
+    )
+    return filtered_1d, filtered_2d
+
+
+def _filter_prepared_output(
+    prepared,
+    checked: dict[int, object],
+    *,
+    has_errors,
+    error_details,
+    label: str,
+    publication_from_live_frame,
+):
+    if prepared is None:
+        return None
+
+    kept_frames = []
+    kept_indices = []
+    kept_results = []
+    for frame, idx, result in zip(
+        prepared["frames"], prepared["indices"], prepared["results"],
     ):
-        if prepared is None:
+        key = id(frame)
+        publication = checked.get(key)
+        if publication is None:
+            publication = publication_from_live_frame(frame, validate=True)
+            checked[key] = publication
+        if has_errors(publication):
+            logger.warning(
+                "Skipping frame %s %s write: %s",
+                idx,
+                label,
+                error_details(publication),
+            )
             continue
-        for frame, idx in zip(prepared["frames"], prepared["indices"]):
-            key = id(frame)
-            publication = checked.get(key)
-            if publication is None:
-                publication = publication_from_live_frame(frame, validate=True)
-                checked[key] = publication
-            if has_errors(publication):
-                details = "; ".join(publication.diagnostics.errors)
-                raise ValueError(
-                    f"Frame {idx} failed publication {label} validation: {details}"
-                )
+        kept_frames.append(frame)
+        kept_indices.append(idx)
+        kept_results.append(result)
+
+    if not kept_frames:
+        logger.warning(
+            "Skipping %s integrated stack write: every selected row failed "
+            "publication validation.",
+            label,
+        )
+        return None
+    if len(kept_frames) == len(prepared["frames"]):
+        return prepared
+    filtered = dict(prepared)
+    filtered["frames"] = kept_frames
+    filtered["indices"] = kept_indices
+    filtered["results"] = kept_results
+    return filtered
 
 
 def _prepare_integrated_1d(f, scan, *, entry: str,

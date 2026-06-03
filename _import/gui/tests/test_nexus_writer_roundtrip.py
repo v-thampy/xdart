@@ -18,6 +18,8 @@ keep the test fast / dep-free.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -343,11 +345,12 @@ def test_gi_nonuniform_stacked_2d_writer_stays_strict(tmp_path):
         save_scan_to_nexus(scan, path, mode="w", finalize=False)
 
 
-def test_publication_validation_rejects_dummy_gi_2d_before_write(tmp_path):
-    """All-dummy GI cakes should not be persisted as valid 2D rows."""
+def test_publication_validation_skips_dummy_gi_2d_but_keeps_1d(tmp_path, caplog):
+    """All-dummy GI cakes should not block the valid 1D stack."""
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     import h5py
 
+    caplog.set_level(logging.WARNING, logger="xdart.modules.ewald.nexus_writer")
     frame = _DuckArch(idx=0)
     frame.gi = True
     frame.int_2d = _DuckResult2D(
@@ -360,12 +363,66 @@ def test_publication_validation_rejects_dummy_gi_2d_before_write(tmp_path):
     scan = _DuckSphere([frame], gi=True)
 
     path = tmp_path / "dummy_gi_2d.nxs"
-    with pytest.raises(ValueError, match="publication 2D validation"):
-        save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
 
     with h5py.File(path, "r") as f:
-        assert "integrated_1d" not in f["entry"]
+        assert "integrated_1d" in f["entry"]
+        np.testing.assert_array_equal(f["entry/integrated_1d/frame_index"][()], [0])
         assert "integrated_2d" not in f["entry"]
+    assert "Skipping frame 0 2D write" in caplog.text
+
+
+def test_publication_validation_filters_bad_2d_rows_per_frame(tmp_path):
+    """A bad cake should not lose neighboring good 2D rows or any 1D rows."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    frames[1].gi = True
+    frames[1].int_2d = _DuckResult2D(
+        radial=np.linspace(-1.0, 1.0, N_Q, dtype=np.float32),
+        azimuthal=np.linspace(0.0, 3.0, N_CHI, dtype=np.float32),
+        intensity=np.full((N_Q, N_CHI), -1.0, dtype=np.float32),
+        unit="qip_A^-1",
+        azimuthal_unit="qoop_A^-1",
+    )
+    scan = _DuckSphere(frames, gi=True)
+
+    path = tmp_path / "one_bad_gi_2d.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f["entry/integrated_1d/frame_index"][()], [0, 1, 2],
+        )
+        np.testing.assert_array_equal(
+            f["entry/integrated_2d/frame_index"][()], [0, 2],
+        )
+
+
+def test_publication_validation_filters_bad_1d_without_blocking_2d(tmp_path):
+    """1D and 2D validation are independent persistence gates."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    frames = [_DuckArch(idx=i) for i in range(2)]
+    frames[1].int_1d = _DuckResult1D(
+        radial=np.asarray(frames[1].int_1d.radial),
+        intensity=np.full(N_Q, np.nan, dtype=np.float32),
+        sigma=frames[1].int_1d.sigma,
+    )
+    scan = _DuckSphere(frames)
+
+    path = tmp_path / "one_bad_1d.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f["entry/integrated_1d/frame_index"][()], [0],
+        )
+        np.testing.assert_array_equal(
+            f["entry/integrated_2d/frame_index"][()], [0, 1],
+        )
 
 
 def test_frames_group_and_thumbnails(written_nxs):
