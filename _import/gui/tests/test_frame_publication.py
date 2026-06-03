@@ -125,6 +125,37 @@ def test_publication_store_is_generation_aware():
     assert store.generation == 1
 
 
+def test_publication_store_bounds_heavy_payloads_but_keeps_metadata():
+    store = PublicationStore(max_heavy_items=2)
+    for idx in (1, 2, 3):
+        store.upsert(publication_from_live_frame(DuckFrame(idx=idx)))
+
+    assert store.labels() == (1, 2, 3)
+    evicted = store.get(1)
+    assert evicted is not None
+    assert evicted.raw_ref is None
+    assert evicted.raw_status == "evicted"
+    assert not evicted.view.has_1d
+    assert not evicted.view.has_2d
+    assert evicted.view.thumbnail is None
+    assert evicted.metadata_numeric["monitor"] == 100.0
+    assert evicted.diagnostics.ok
+
+    assert store.get(2).view.has_2d
+    assert store.get(3).view.has_2d
+
+
+def test_publication_store_can_bound_total_items():
+    store = PublicationStore(max_items=2, max_heavy_items=None)
+    for idx in (1, 2, 3):
+        store.upsert(publication_from_live_frame(DuckFrame(idx=idx)))
+
+    assert store.labels() == (2, 3)
+    assert store.get(1) is None
+    assert store.get(2).view.has_1d
+    assert store.get(3).view.has_1d
+
+
 def test_publication_from_nexus_frame_matches_live_style_view(tmp_path):
     frame = DuckFrame(idx=8)
     live_publication = publication_from_live_frame(frame, include_raw=False)

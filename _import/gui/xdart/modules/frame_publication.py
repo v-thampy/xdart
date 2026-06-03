@@ -285,13 +285,72 @@ def publication_from_nexus_frame(
     )
 
 
-class PublicationStore:
-    """Small generation-aware store for frame publications."""
+def _publication_has_heavy_payload(publication: FramePublication) -> bool:
+    view = publication.view
+    return any(
+        value is not None
+        for value in (
+            view.intensity_1d,
+            view.sigma_1d,
+            view.intensity_2d,
+            view.sigma_2d,
+            view.raw,
+            view.thumbnail,
+            publication.raw_ref,
+        )
+    )
 
-    def __init__(self) -> None:
+
+def _lightweight_publication(publication: FramePublication) -> FramePublication:
+    """Return a metadata/diagnostics-only copy without display-heavy arrays."""
+    view = publication.view
+    light_view = FrameView(
+        label=view.label,
+        two_d_kind=view.two_d_kind,
+        mask_baked=False,
+        metadata_raw=view.metadata_raw,
+        metadata_numeric=view.metadata_numeric,
+        incident_angle=view.incident_angle,
+        geometry=view.geometry,
+        source_path=view.source_path,
+        source_frame_index=view.source_frame_index,
+        extra=view.extra,
+    )
+    return replace(
+        publication,
+        view=light_view,
+        raw_ref=None,
+        raw_status="evicted",
+        metadata_raw=view.metadata_raw,
+        metadata_numeric=view.metadata_numeric,
+    )
+
+
+class PublicationStore:
+    """Small generation-aware store for frame publications.
+
+    ``max_heavy_items`` bounds display-heavy arrays while keeping the frame's
+    label, metadata, source identity, and diagnostics in the store.  Full
+    source/NeXus rehydration is intentionally deferred; this protects long live
+    scans from unbounded memory growth without changing the publication API.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_items: int | None = None,
+        max_heavy_items: int | None = 64,
+    ) -> None:
+        if max_items is not None and max_items < 1:
+            raise ValueError("max_items must be positive or None")
+        if max_heavy_items is not None and max_heavy_items < 0:
+            raise ValueError("max_heavy_items must be non-negative or None")
         self._lock = RLock()
         self._generation = 0
+        self._max_items = max_items
+        self._max_heavy_items = max_heavy_items
         self._items: dict[int | str, FramePublication] = {}
+        self._heavy_labels: list[int | str] = []
 
     @property
     def generation(self) -> int:
@@ -302,12 +361,20 @@ class PublicationStore:
         with self._lock:
             self._generation += 1
             self._items.clear()
+            self._heavy_labels.clear()
 
     def upsert(self, publication: FramePublication) -> FramePublication:
         with self._lock:
             if publication.generation != self._generation:
                 publication = replace(publication, generation=self._generation)
+            label = publication.label
+            if label in self._items:
+                self._items.pop(label)
+                self._drop_heavy_label_locked(label)
             self._items[publication.label] = publication
+            if _publication_has_heavy_payload(publication):
+                self._heavy_labels.append(label)
+            self._enforce_bounds_locked()
             return publication
 
     def extend(self, publications: Iterable[FramePublication]) -> tuple[FramePublication, ...]:
@@ -329,6 +396,28 @@ class PublicationStore:
     def __len__(self) -> int:
         with self._lock:
             return len(self._items)
+
+    def _drop_heavy_label_locked(self, label: int | str) -> None:
+        try:
+            self._heavy_labels.remove(label)
+        except ValueError:
+            pass
+
+    def _enforce_bounds_locked(self) -> None:
+        if self._max_items is not None:
+            while len(self._items) > self._max_items:
+                label = next(iter(self._items))
+                self._items.pop(label, None)
+                self._drop_heavy_label_locked(label)
+
+        if self._max_heavy_items is None:
+            return
+        while len(self._heavy_labels) > self._max_heavy_items:
+            label = self._heavy_labels.pop(0)
+            publication = self._items.get(label)
+            if publication is None:
+                continue
+            self._items[label] = _lightweight_publication(publication)
 
 
 __all__ = [

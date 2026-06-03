@@ -581,6 +581,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
 
 def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None:
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+    from xdart.modules.frame_publication import PublicationStore
 
     calls = []
 
@@ -606,6 +607,7 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
     scan.global_mask = np.array([3])
 
     data_1d = {}
+    store = PublicationStore()
     thread = integratorThread(
         scan,
         None,
@@ -614,16 +616,21 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
         [0],
         data_1d,
         {},
+        publication_store=store,
     )
     thread.bai_1d_SI()
 
     assert calls
     assert calls[0][0].integration_1d.monitor_key == "i0"
     assert data_1d[0].int_1d is not None
+    pub = store.get(0)
+    assert pub is not None
+    np.testing.assert_allclose(pub.view.intensity_1d, data_1d[0].int_1d.intensity)
 
 
 def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+    from xdart.modules.frame_publication import PublicationStore
 
     calls = []
 
@@ -640,6 +647,7 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
     scan._cached_integrator = _FakeIntegrator()
     data_1d = {}
     data_2d = {}
+    store = PublicationStore()
     thread = integratorThread(
         scan,
         None,
@@ -648,6 +656,7 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
         [0],
         data_1d,
         data_2d,
+        publication_store=store,
     )
 
     thread.bai_2d_SI()
@@ -657,6 +666,10 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
     assert calls[0].integration_2d is not None
     assert data_1d[0].int_1d is not None
     assert data_2d[0]["int_2d"] is not None
+    pub = store.get(0)
+    assert pub is not None
+    np.testing.assert_allclose(pub.view.intensity_1d, data_1d[0].int_1d.intensity)
+    np.testing.assert_allclose(pub.view.intensity_2d, data_2d[0]["int_2d"].intensity.T)
 
 
 def test_reintegrate_all_refreshes_publication_store(monkeypatch) -> None:
