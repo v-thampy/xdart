@@ -1974,6 +1974,48 @@ def test_image_viewer_masks_uint16_ceiling_sentinel_before_autoscale():
     assert np.nanmax(host.image_data[0]) == 30.0
 
 
+def test_display_preview_replaces_nan_with_low_finite_value():
+    from xdart.gui.tabs.static_scan.display_constants import _downsample_for_display
+
+    class _Widget:
+        def width(self):
+            return 200
+        def height(self):
+            return 200
+
+    data = np.array([[np.nan, 10.0], [20.0, np.inf]])
+
+    preview = _downsample_for_display(data, _Widget())
+
+    assert np.isfinite(preview).all()
+    assert preview[0, 0] == 10.0
+    assert preview[1, 1] == 10.0
+
+
+def test_real_eiger_preview_masks_sentinels_for_display():
+    from pathlib import Path
+    from ssrl_xrd_tools.io.image import read_image
+    from xdart.gui.tabs.static_scan.display_constants import _downsample_for_display
+
+    path = Path("/Users/vthampy/repos/test_data/eiger/Eiger_B_ctrl_test__2000mdeg_scan001_master.h5")
+    if not path.exists():
+        pytest.skip("real Eiger test data not available")
+
+    class _Widget:
+        def width(self):
+            return 500
+        def height(self):
+            return 500
+
+    raw = np.asarray(read_image(path, frame=0), dtype=float)
+    data = DisplayDataMixin._sanitize_display_image(raw).T[:, ::-1]
+
+    preview = _downsample_for_display(data, _Widget())
+
+    assert np.isfinite(preview).all()
+    assert np.nanmax(preview) < 4294967295.0
+
+
 def test_update_renders_blank_on_empty_no_data_instead_of_leaving_stale():
     # P2 #3: update() used to early-return when _updated() reported no usable
     # data (empty selection / failed load / cache miss), leaving a stale

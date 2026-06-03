@@ -82,9 +82,23 @@ STD_2D_AXES = {
 }
 
 
+def _finite_preview_image(data):
+    """Return a finite display copy, preserving real data elsewhere."""
+    arr = np.asarray(data, dtype=float)
+    finite = np.isfinite(arr)
+    if finite.all() or not finite.any():
+        return arr
+    out = arr.copy()
+    out[~finite] = float(np.min(out[finite]))
+    return out
+
+
 def _downsample_for_display(data, widget):
     """Reduce array resolution to match widget pixel size. Display-only."""
-    if data is None or data.ndim != 2:
+    if data is None:
+        return data
+    data = _finite_preview_image(data)
+    if data.ndim != 2:
         return data
     w = max(widget.width(), 200)
     h = max(widget.height(), 200)
