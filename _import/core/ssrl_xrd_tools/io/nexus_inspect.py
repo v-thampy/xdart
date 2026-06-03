@@ -132,6 +132,27 @@ class NexusDatasetPreview:
         object.__setattr__(self, "attrs", _readonly(self.attrs))
 
 
+@dataclass(frozen=True, slots=True)
+class NexusDatasetData:
+    """Dataset data loaded explicitly by a headless caller.
+
+    ``read_nexus_dataset(..., selection=None)`` reads the full dataset.  The
+    GUI should keep using :func:`preview_nexus_dataset` or pass an explicit
+    bounded selection; notebooks can opt into the full read when that is the
+    requested operation.
+    """
+
+    path: str
+    shape: tuple[int, ...]
+    dtype: str
+    selection: str
+    data: Any
+    attrs: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "attrs", _readonly(self.attrs))
+
+
 def inspect_nexus(
     path: str | Path,
     *,
@@ -194,6 +215,41 @@ def preview_nexus_dataset(
             selection=text,
             data=data,
             truncated=truncated,
+            attrs=_attrs(ds),
+        )
+
+
+def read_nexus_dataset(
+    path: str | Path,
+    dataset_path: str,
+    *,
+    selection: Any = None,
+) -> NexusDatasetData:
+    """Read a NeXus/HDF5 dataset, optionally with an explicit selection.
+
+    This is the headless "proper dataset" companion to the GUI preview
+    helper.  Omitting ``selection`` reads the full dataset; pass NumPy-style
+    slices/indices to bound the read.
+    """
+
+    p = Path(path)
+    with h5py.File(p, "r") as h5:
+        internal = dataset_path if dataset_path.startswith("/") else f"/{dataset_path}"
+        if internal not in h5:
+            raise KeyError(f"Dataset {internal!r} not found in {p}")
+        ds = h5[internal]
+        if not isinstance(ds, h5py.Dataset):
+            raise TypeError(f"{internal!r} is not a dataset")
+
+        if selection is None:
+            selection = _full_selection(ds.shape)
+        data = ds[selection]
+        return NexusDatasetData(
+            path=internal,
+            shape=tuple(int(v) for v in ds.shape),
+            dtype=str(ds.dtype),
+            selection=_selection_text(selection, ds.shape),
+            data=data,
             attrs=_attrs(ds),
         )
 
@@ -452,6 +508,12 @@ def _preview_selection(shape: tuple[int, ...], *, max_items: int) -> Any:
     return np.s_[()]
 
 
+def _full_selection(shape: tuple[int, ...]) -> Any:
+    if shape == ():
+        return ()
+    return tuple(slice(None) for _ in shape)
+
+
 def _selection_text(selection: Any, shape: tuple[int, ...]) -> str:
     if selection == ():
         return "scalar"
@@ -462,7 +524,10 @@ def _selection_text(selection: Any, shape: tuple[int, ...]) -> str:
         if isinstance(sel, slice):
             start = "" if sel.start in (None, 0) else str(sel.start)
             stop = "" if sel.stop is None or sel.stop == dim else str(sel.stop)
-            parts.append(f"{start}:{stop}")
+            if sel.step not in (None, 1):
+                parts.append(f"{start}:{stop}:{sel.step}")
+            else:
+                parts.append(f"{start}:{stop}")
         else:
             parts.append(str(sel))
     return "[" + ", ".join(parts) + "]"
@@ -488,10 +553,12 @@ def _selection_truncated(selection: Any, shape: tuple[int, ...]) -> bool:
 __all__ = [
     "NexusAxisSummary",
     "NexusDatasetPreview",
+    "NexusDatasetData",
     "NexusFileSummary",
     "NexusNodeSummary",
     "NexusReducedSummary",
     "NexusXDartSummary",
     "inspect_nexus",
     "preview_nexus_dataset",
+    "read_nexus_dataset",
 ]

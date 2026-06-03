@@ -4,7 +4,11 @@ import h5py
 import numpy as np
 
 from ssrl_xrd_tools.core import IntegrationResult1D, IntegrationResult2D, TwoDKind
-from ssrl_xrd_tools.io import inspect_nexus, preview_nexus_dataset
+from ssrl_xrd_tools.io import (
+    inspect_nexus,
+    preview_nexus_dataset,
+    read_nexus_dataset,
+)
 from ssrl_xrd_tools.io.nexus import write_integrated_stack
 
 
@@ -92,6 +96,24 @@ def test_preview_nexus_dataset_returns_bounded_head_slice(tmp_path):
     assert preview.truncated
     assert preview.attrs["units"] == "counts"
     assert preview.data == [[0, 1, 2], [10, 11, 12], [20, 21, 22]]
+
+
+def test_read_nexus_dataset_can_read_full_or_selected_data(tmp_path):
+    path = tmp_path / "read_dataset.nxs"
+    data = np.arange(24).reshape(2, 3, 4)
+    with h5py.File(path, "w") as h5:
+        ds = h5.create_dataset("entry/data", data=data)
+        ds.attrs["units"] = "counts"
+
+    full = read_nexus_dataset(path, "/entry/data")
+    assert full.shape == (2, 3, 4)
+    assert full.selection == "[:, :, :]"
+    assert full.attrs["units"] == "counts"
+    np.testing.assert_array_equal(full.data, data)
+
+    selected = read_nexus_dataset(path, "/entry/data", selection=np.s_[1, :, ::2])
+    assert selected.selection == "[1, :, ::2]"
+    np.testing.assert_array_equal(selected.data, data[1, :, ::2])
 
 
 def test_inspect_nexus_does_not_treat_native_frames_group_as_processed(tmp_path):

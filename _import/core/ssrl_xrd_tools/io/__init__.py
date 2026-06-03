@@ -67,6 +67,7 @@ from ssrl_xrd_tools.io.frame_view import (
 )
 from ssrl_xrd_tools.io.nexus_inspect import (
     NexusAxisSummary,
+    NexusDatasetData,
     NexusDatasetPreview,
     NexusFileSummary,
     NexusNodeSummary,
@@ -74,6 +75,7 @@ from ssrl_xrd_tools.io.nexus_inspect import (
     NexusXDartSummary,
     inspect_nexus,
     preview_nexus_dataset,
+    read_nexus_dataset,
 )
 from ssrl_xrd_tools.io.chunk_size import adaptive_chunk_size
 from ssrl_xrd_tools.io.image_source import (
