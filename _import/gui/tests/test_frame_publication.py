@@ -153,6 +153,18 @@ def test_publication_display_adapter_exposes_availability_and_plot_payload():
     assert raw_avail[9] == {"has_raw": True, "has_thumbnail": True}
 
     class _Widget:
+        scan = type("Scan", (), {"name": "scan", "gi": False})()
+        _plot_axis_info = [{"source": "1d", "slice_axis": None, "axis": None}]
+        ui = type("UI", (), {
+            "plotUnit": type("PlotUnit", (), {
+                "currentIndex": staticmethod(lambda: 0),
+                "currentText": staticmethod(lambda: "2θ (°)"),
+            })(),
+            "slice": type("Slice", (), {
+                "isChecked": staticmethod(lambda: False),
+            })(),
+        })()
+
         def normalize(self, data, metadata):
             return np.asarray(data, dtype=float) / metadata["monitor"]
 
@@ -176,6 +188,57 @@ def test_publication_display_adapter_exposes_availability_and_plot_payload():
     assert payload is not None
     assert payload.axis_x.label == "2θ"
     assert payload.axis_x.unit == "°"
-    assert payload.traces[0].label == "raw_0001.tif"
+    assert payload.traces[0].label == "scan_9"
     np.testing.assert_allclose(payload.traces[0].x, frame.int_1d.radial)
     np.testing.assert_allclose(payload.traces[0].y, frame.int_1d.intensity / 100.0)
+
+
+def test_publication_display_adapter_falls_back_for_non_native_plot_modes():
+    frame = DuckFrame(idx=10)
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+    loaded_1d, loaded_2d, raw_avail = publication_availability(store)
+    state = compute_display_state(
+        mode=Mode.INT_1D,
+        selected_ids=(10,),
+        all_frame_index=[10],
+        loaded_1d_keys=loaded_1d,
+        loaded_2d_keys=loaded_2d,
+        gi=False,
+        plot_unit="q_A^-1",
+        method="Single",
+        unit_changed=False,
+        prev_overlaid_ids=(),
+        raw_availability=raw_avail,
+        titles={},
+        generation=store.generation,
+    )
+
+    def widget(*, source="1d", sliced=False, gi=False, text="Q (Å⁻¹)"):
+        return type("Widget", (), {
+            "scan": type("Scan", (), {"name": "scan", "gi": gi})(),
+            "_plot_axis_info": [{"source": source, "slice_axis": "χ", "axis": "radial"}],
+            "ui": type("UI", (), {
+                "plotUnit": type("PlotUnit", (), {
+                    "currentIndex": staticmethod(lambda: 0),
+                    "currentText": staticmethod(lambda: text),
+                })(),
+                "slice": type("Slice", (), {
+                    "isChecked": staticmethod(lambda: sliced),
+                })(),
+            })(),
+            "normalize": staticmethod(lambda data, metadata: data),
+        })()
+
+    assert PublicationDisplayAdapter(
+        store, widget=widget(source="2d"),
+    ).plot_payload(state) is None
+    assert PublicationDisplayAdapter(
+        store, widget=widget(source="1d_2d", sliced=True),
+    ).plot_payload(state) is None
+    assert PublicationDisplayAdapter(
+        store, widget=widget(gi=True),
+    ).plot_payload(state) is None
+    assert PublicationDisplayAdapter(
+        store, widget=widget(text="2θ (°)"),
+    ).plot_payload(state) is None

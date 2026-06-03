@@ -1044,6 +1044,63 @@ def test_render_display_uses_publication_plot_payload_when_present():
     np.testing.assert_allclose(host.plot_data[1], [[1.0, 2.0, 3.0]])
 
 
+def test_publication_plot_fallback_uses_legacy_draw_for_derived_axes_and_slice():
+    from ssrl_xrd_tools.core import Axis, FrameView
+    from xdart.gui.tabs.static_scan.display_publication import PublicationDisplayAdapter
+    from xdart.modules.frame_publication import (
+        PublicationStore,
+        publication_from_frame_view,
+    )
+
+    def render_with_axis(source, sliced):
+        host, calls, dl = _render_host()
+        host.scan = SimpleNamespace(name="scan", gi=False)
+        host._plot_axis_info = [{
+            "source": source,
+            "slice_axis": "χ",
+            "axis": "radial",
+        }]
+        host.normalize = lambda data, metadata: data
+        host.ui.plotUnit.currentIndex.return_value = 0
+        host.ui.plotUnit.currentText.return_value = "Q (Å⁻¹)"
+        host.ui.slice.isChecked.return_value = sliced
+
+        store = PublicationStore()
+        store.upsert(
+            publication_from_frame_view(
+                FrameView(
+                    label=3,
+                    axis_1d=Axis("Q", "q_A^-1", values=np.arange(3)),
+                    intensity_1d=np.array([1.0, 2.0, 3.0]),
+                )
+            )
+        )
+        state = dl.compute_display_state(
+            mode=dl.Mode.INT_1D,
+            selected_ids=(3,),
+            all_frame_index=[3],
+            loaded_1d_keys={3},
+            loaded_2d_keys={3},
+            gi=False,
+            plot_unit='q_A^-1',
+            method='Single',
+            unit_changed=False,
+            prev_overlaid_ids=(),
+            raw_availability={},
+            titles={},
+            generation=store.generation,
+        )
+        payload = dl.build_payload(state, PublicationDisplayAdapter(store, widget=host))
+        host.render_display(state, payload)
+        return calls, payload
+
+    for source, sliced in (("2d", False), ("1d_2d", True)):
+        calls, payload = render_with_axis(source, sliced)
+        assert payload.plot is None
+        assert "draw_plot" in calls
+        assert "payload_plot" not in calls
+
+
 def test_render_display_image_viewer_draws_raw_clears_others():
     host, calls, dl = _render_host()
     state = dl.compute_display_state(

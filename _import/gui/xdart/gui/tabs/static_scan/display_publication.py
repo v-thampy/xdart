@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from .display_logic import Axis, PlotPayload, Trace, x_axis_for_unit
+from .display_logic import Axis, Mode, PlotPayload, Trace, x_axis_for_unit
 
 
 def _label_key(label: Any) -> Any:
@@ -31,7 +31,11 @@ def _axis_for_publication(axis) -> Axis:
     return Axis(label=label, unit=unit)
 
 
-def _trace_name(publication) -> str:
+def _trace_name(publication, widget=None) -> str:
+    scan = getattr(widget, "scan", None)
+    scan_name = getattr(scan, "name", "")
+    if scan_name and scan_name != "null_main":
+        return f"{scan_name}_{publication.label}"
     source = (
         publication.metadata_raw.get("source_file")
         or publication.view.source_path
@@ -41,6 +45,47 @@ def _trace_name(publication) -> str:
     if isinstance(source, str) and source:
         return os.path.basename(source)
     return str(publication.label)
+
+
+def _current_axis_info(widget) -> dict[str, Any]:
+    try:
+        idx = int(widget.ui.plotUnit.currentIndex())
+    except Exception:
+        return {"source": "1d", "slice_axis": None, "axis": None}
+    info = getattr(widget, "_plot_axis_info", ())
+    if 0 <= idx < len(info):
+        return dict(info[idx])
+    return {"source": "1d", "slice_axis": None, "axis": None}
+
+
+def _slice_enabled(widget) -> bool:
+    try:
+        return bool(widget.ui.slice.isChecked())
+    except Exception:
+        return False
+
+
+def _canonical_plot_unit(widget) -> str:
+    try:
+        text = str(widget.ui.plotUnit.currentText()).lower()
+    except Exception:
+        text = ""
+    if "2" in text and ("\u03b8" in text or "theta" in text or "th" in text):
+        return "2th"
+    if "\u03c7" in text or "chi" in text:
+        return "chi"
+    return "q"
+
+
+def _canonical_axis_unit(axis) -> str:
+    unit = str(getattr(axis, "unit", "") or "").lower()
+    if "2th" in unit:
+        return "2th"
+    if "chi" in unit or unit in {"deg", "degrees"}:
+        return "chi"
+    if "q" in unit or "angstrom" in unit:
+        return "q"
+    return unit
 
 
 class PublicationDisplayAdapter:
@@ -84,6 +129,8 @@ class PublicationDisplayAdapter:
         # publication payload owns overlay history explicitly.
         if state.method in ("Overlay", "Waterfall"):
             return None
+        if not self._can_use_native_1d_axis(state):
+            return None
 
         traces = []
         axis = None
@@ -104,11 +151,36 @@ class PublicationDisplayAdapter:
             elif x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
                 y = np.interp(ref_x, x, y)
                 x = ref_x
-            traces.append(Trace(label=_trace_name(publication), x=x, y=y))
+            traces.append(Trace(label=_trace_name(publication, self._widget), x=x, y=y))
 
         if not traces or axis is None:
             return None
         return PlotPayload(axis_x=axis, traces=tuple(traces))
+
+    def _can_use_native_1d_axis(self, state) -> bool:
+        widget = self._widget
+        if widget is None:
+            return True
+        if state.mode is not Mode.INT_1D and state.mode is not Mode.INT_2D:
+            return False
+        if getattr(getattr(widget, "scan", None), "gi", False):
+            return False
+        axis_info = _current_axis_info(widget)
+        source = axis_info.get("source", "1d")
+        if source == "2d":
+            return False
+        if source == "1d_2d" and _slice_enabled(widget):
+            return False
+
+        selected_unit = _canonical_plot_unit(widget)
+        for label in state.render_ids:
+            publication = self._items.get(_label_key(label))
+            if publication is None or not publication.view.has_1d:
+                continue
+            if _canonical_axis_unit(publication.view.axis_1d) != selected_unit:
+                return False
+            return True
+        return False
 
     def _normalize(self, data, metadata):
         widget = self._widget
