@@ -1641,6 +1641,48 @@ def test_nexus_viewer_loads_rows_and_previews_1d_2d_units(tmp_path):
     assert viewer.data_1d[key_raw].scan_info["dtype"] == "uint16"
 
 
+def test_nexus_1d_selection_strides_large_axis_but_not_small():
+    # P3 #5: short curves read whole; an oversized 1D axis is strided.
+    sel_small, axis_small = H5Viewer._nexus_1d_selection((2, 5), max_points=8192)
+    assert axis_small == slice(None)                 # full read for small data
+    assert sel_small == (0, slice(None))
+
+    sel_big, axis_big = H5Viewer._nexus_1d_selection((40000,), max_points=8192)
+    assert isinstance(axis_big, slice) and axis_big.step and axis_big.step > 1
+    assert len(range(0, 40000, axis_big.step)) <= 8192  # strided count within cap
+    assert sel_big == axis_big                          # 1D dataset → axis slice
+
+
+def test_nexus_1d_preview_downsamples_large_dataset(tmp_path):
+    # P3 #5 end-to-end: a huge 1D dataset is bounded for the GUI preview, x
+    # is strided to match y, and the truncated flag is set.
+    import h5py
+
+    path = tmp_path / "big1d.nxs"
+    n = 50000
+    with h5py.File(path, "w") as f:
+        e = f.create_group("entry")
+        e.create_dataset("big/signal", data=np.arange(n, dtype=float))
+        e.create_dataset("big/x", data=np.linspace(0.0, 10.0, n))
+
+    viewer = _nexus_viewer_host(tmp_path)
+    info = {
+        "dataset_path": "entry/big/signal",
+        "_shape": (n,),
+        "nexus_preview_kind": "plot_1d",
+        "_attrs": {"units": "counts"},
+        "x_axis_path": "entry/big/x",
+        "x_label": "x", "x_unit": "m",
+        "y_label": "sig", "y_unit": "counts",
+    }
+    payload, preview_info = viewer._load_nexus_preview_payload(str(path), info)
+
+    assert payload["kind"] == "plot_1d"
+    assert 0 < payload["y"].size <= 8192             # bounded
+    assert payload["x"].shape == payload["y"].shape  # x strided to match
+    assert preview_info["preview_truncated"] is True
+
+
 def test_nexus_controller_builds_plot_and_image_payloads(tmp_path):
     from xdart.gui.tabs.static_scan.display_logic import (
         ImagePayload,

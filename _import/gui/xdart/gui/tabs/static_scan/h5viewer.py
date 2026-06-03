@@ -1172,7 +1172,7 @@ class H5Viewer(QWidget):
         )
 
         if preview_kind == "plot_1d":
-            data_selection = self._nexus_1d_selection(shape)
+            data_selection, axis_sel = self._nexus_1d_selection(shape)
             data = read_nexus_dataset(
                 viewer_path, dataset_path, selection=data_selection,
             )
@@ -1183,6 +1183,7 @@ class H5Viewer(QWidget):
                 y.size,
                 info.get("x_label") or "index",
                 info.get("x_unit") or "",
+                axis_selection=axis_sel,
             )
             if x.shape != y.shape:
                 x = np.arange(y.size, dtype=float)
@@ -1199,7 +1200,9 @@ class H5Viewer(QWidget):
             }
             preview_info = {
                 "preview_selection": data.selection,
-                "preview_truncated": False,
+                "preview_truncated": bool(
+                    self._nexus_selection_truncated(shape, data_selection)
+                ),
                 "preview": self._nexus_value(data.data, max_len=800),
             }
             return payload, preview_info
@@ -1256,10 +1259,24 @@ class H5Viewer(QWidget):
         }
 
     @staticmethod
-    def _nexus_1d_selection(shape):
+    def _nexus_1d_selection(shape, *, max_points=8192):
+        """Bounded selection for the 1D GUI preview.
+
+        Strides a long 1D axis down to ``<= max_points`` so a generic NeXus
+        file's huge 1D dataset can't freeze the GUI; xdart's ~2000-pt curves
+        read whole (stride 1).  Returns ``(data_selection, axis_selection)``
+        so the x-axis is strided the same way (matching lengths).  The
+        headless ``read_nexus_dataset`` (called without a selection) still
+        reads in full — only this GUI preview path downsamples.
+        """
+        n = int(shape[-1]) if shape else 0
+        stride = max(1, math.ceil(n / max_points)) if n > max_points else 1
+        # Stride 1 stays a plain ``:`` (full read) so short xdart curves are
+        # unchanged; only an oversized axis gets a strided slice.
+        axis_sel = slice(None) if stride == 1 else slice(None, None, stride)
         if len(shape) <= 1:
-            return np.s_[:]
-        return tuple(0 for _ in range(len(shape) - 1)) + (slice(None),)
+            return axis_sel, axis_sel
+        return tuple(0 for _ in range(len(shape) - 1)) + (axis_sel,), axis_sel
 
     @staticmethod
     def _nexus_2d_selection(shape, *, max_pixels=262144):
