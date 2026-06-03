@@ -16,6 +16,7 @@ Skipped automatically in CI / on machines without the data.
 import os
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 
@@ -81,7 +82,8 @@ def _integrate_direct(poni, img, mask, incidence, bai_2d_args, sample_orientatio
 
 
 def _run_batch_parallel(poni, pending_data, mask, *, incidence_motor="th",
-                        sample_orientation=4):
+                        sample_orientation=4, gi=True,
+                        bai_1d_args=None, bai_2d_args=None):
     """Drive the REAL imageThread._dispatch_batch_parallel on real frames.
 
     ``pending_data`` is a list of ``(name, img, scan_info)``.
@@ -98,18 +100,44 @@ def _run_batch_parallel(poni, pending_data, mask, *, incidence_motor="th",
     from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 
+    if bai_1d_args is None:
+        bai_1d_args = {"gi_mode_1d": "q_total"} if gi else {
+            "numpoints": 256,
+            "unit": "q_A^-1",
+            "radial_range": (0.1, 6.0),
+            "method": "csr",
+        }
+    if bai_2d_args is None:
+        bai_2d_args = (
+            {
+                "gi_mode_2d": "qip_qoop", "x_range": None, "y_range": None,
+                "npt_rad": 500, "npt_azim": 500,
+            }
+            if gi else
+            {
+                "npt_rad": 96,
+                "npt_azim": 72,
+                "unit": "q_A^-1",
+                "radial_range": (0.1, 6.0),
+                "azimuth_range": (-90.0, 90.0),
+                "method": "csr",
+            }
+        )
+
     scan = SimpleNamespace(
+        name="equivalence_scan",
+        gi=gi,
         skip_2d=False,
-        bai_1d_args={"gi_mode_1d": "q_total"},
-        bai_2d_args={"gi_mode_2d": "qip_qoop", "x_range": None, "y_range": None,
-                     "npt_rad": 500, "npt_azim": 500},
+        bai_1d_args=dict(bai_1d_args),
+        bai_2d_args=dict(bai_2d_args),
+        global_mask=mask,
         _cached_integrator=poni_to_integrator(poni),
         _cached_fiber_integrator=None,
         _cached_fiber_integrator_angle=None,
         _cached_data_mask=None,
     )
     w = SimpleNamespace(
-        max_cores=2, gi=True, incidence_motor=incidence_motor,
+        max_cores=2, gi=gi, incidence_motor=incidence_motor,
         sample_orientation=sample_orientation, tilt_angle=0,
         series_average=False, mask=mask, poni=poni, command="",
         batch_mode=True, xye_only=True,
@@ -142,6 +170,187 @@ def _run_batch_parallel(poni, pending_data, mask, *, incidence_motor="th",
                for i, (name, img, info) in enumerate(pending_data)]
     imageThread._dispatch_batch_parallel(w, scan, pending)
     return captured
+
+
+def _run_live_single(poni, name, img, meta, mask, *, incidence_motor="th",
+                     sample_orientation=4, gi=True,
+                     bai_1d_args=None, bai_2d_args=None):
+    """Drive the real sequential/live single-frame path and capture its frame."""
+
+    from types import SimpleNamespace, MethodType
+    from threading import Condition, RLock
+    from ssrl_xrd_tools.integrate.calibration import poni_to_integrator
+    from xdart.modules.reduction import StandardPlanCache
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    if bai_1d_args is None:
+        bai_1d_args = {"gi_mode_1d": "q_total"} if gi else {
+            "numpoints": 256,
+            "unit": "q_A^-1",
+            "radial_range": (0.1, 6.0),
+            "method": "csr",
+        }
+    if bai_2d_args is None:
+        bai_2d_args = (
+            {
+                "gi_mode_2d": "qip_qoop", "x_range": None, "y_range": None,
+                "npt_rad": 500, "npt_azim": 500,
+            }
+            if gi else
+            {
+                "npt_rad": 96,
+                "npt_azim": 72,
+                "unit": "q_A^-1",
+                "radial_range": (0.1, 6.0),
+                "azimuth_range": (-90.0, 90.0),
+                "method": "csr",
+            }
+        )
+    scan = SimpleNamespace(
+        name="equivalence_scan",
+        gi=gi,
+        skip_2d=False,
+        bai_1d_args=dict(bai_1d_args),
+        bai_2d_args=dict(bai_2d_args),
+        global_mask=mask,
+        _cached_integrator=poni_to_integrator(poni),
+        _cached_fiber_integrator=None,
+        _cached_fiber_integrator_angle=None,
+        _cached_data_mask=None,
+    )
+    w = SimpleNamespace(
+        gi=gi, incidence_motor=incidence_motor,
+        sample_orientation=sample_orientation, tilt_angle=0,
+        series_average=False, mask=mask, poni=poni, command="",
+        batch_mode=False, xye_only=True,
+        apply_threshold=False, threshold_min=0, threshold_max=0,
+        _plan_cache=StandardPlanCache(), _xye_lock=RLock(), _xye_buffer=[],
+        _published_frames={}, _cached_gi_incident_angle=None,
+        data_1d={}, data_2d={}, file_lock=Condition(),
+        sub_label="",
+        sigUpdate=SimpleNamespace(emit=lambda *a: None),
+        showLabel=SimpleNamespace(emit=lambda *a: None),
+        _middle_truncate=lambda t: t,
+    )
+    for meth in ("_resolve_frame_mask", "_prewarm_frame_mask",
+                 "_apply_threshold_inline"):
+        setattr(w, meth, MethodType(getattr(wranglerThread, meth), w))
+    w._process_one = MethodType(imageThread._process_one, w)
+    imageThread._process_one(w, scan, name, 1, img, dict(meta), 0.0, 0.0)
+    return w._published_frames[1]
+
+
+def _canonicalize_thumbnail(frame, mask):
+    """Make frame.thumbnail match the quantized/dequantized NeXus value."""
+
+    from xdart.modules.ewald.nexus_writer import _quantize_thumbnail
+
+    frame.make_thumbnail(global_mask=mask)
+    thumb = getattr(frame, "thumbnail", None)
+    if thumb is None:
+        return None, None
+    quant, (vmin, vmax, dtype) = _quantize_thumbnail(np.asarray(thumb, dtype=float))
+    scale = 65535.0 if dtype == "uint16" else 255.0
+    deq = vmin + (quant.astype(float) / scale) * (vmax - vmin)
+    frame.thumbnail = deq
+    return quant, (vmin, vmax, dtype)
+
+
+def _write_publication_reload(path, frame, thumb_record=None):
+    from ssrl_xrd_tools.core import numeric_metadata
+    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xdart.modules.frame_publication import publication_from_nexus_frame
+
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        write_integrated_stack(
+            entry,
+            frame_indices=[int(frame.idx)],
+            results_1d=[frame.int_1d],
+            results_2d=[frame.int_2d],
+        )
+        numeric = numeric_metadata(frame.scan_info)
+        if numeric:
+            scan_data = entry.create_group("scan_data")
+            scan_data.create_dataset("frame_index", data=np.array([int(frame.idx)], dtype=np.int64))
+            for key, value in numeric.items():
+                scan_data.create_dataset(str(key), data=np.array([value], dtype=np.float64))
+        try:
+            incident_angle = float(frame._get_incident_angle()) if getattr(frame, "gi", False) else None
+        except Exception:
+            incident_angle = None
+        if incident_angle is not None:
+            geom = entry.create_group("per_frame_geometry")
+            geom.create_dataset("frame_index", data=np.array([int(frame.idx)], dtype=np.int64))
+            geom.create_dataset("incident_angle", data=np.array([incident_angle], dtype=np.float64))
+        if thumb_record is not None:
+            quant, (vmin, vmax, dtype) = thumb_record
+            fg = entry.create_group(f"frames/frame_{int(frame.idx):04d}")
+            ds = fg.create_dataset("thumbnail", data=quant)
+            ds.attrs["vmin"] = float(vmin)
+            ds.attrs["vmax"] = float(vmax)
+            ds.attrs["dtype"] = dtype
+    return publication_from_nexus_frame(str(path), int(frame.idx))
+
+
+def _assert_live_batch_reload_equivalent(tmp_path, *, gi):
+    from ssrl_xrd_tools.core import assert_frameview_equivalent
+    from xdart.modules.frame_publication import publication_from_live_frame
+
+    poni = _tiff_poni()
+    img, th, meta = _load_tiff(_TIFF_FRAMES[0])
+    mask = _tiff_mask(img)
+
+    if gi:
+        scout_args = {"gi_mode_2d": "qip_qoop", "x_range": None, "y_range": None,
+                      "npt_rad": 96, "npt_azim": 72}
+        scout = _integrate_direct(poni, img, mask, th, scout_args)
+        bai_1d = {"gi_mode_1d": "q_total", "numpoints": 256}
+        bai_2d = {
+            "gi_mode_2d": "qip_qoop",
+            "x_range": (float(np.nanmin(scout.radial)), float(np.nanmax(scout.radial))),
+            "y_range": (float(np.nanmin(scout.azimuthal)), float(np.nanmax(scout.azimuthal))),
+            "npt_rad": 96,
+            "npt_azim": 72,
+        }
+    else:
+        bai_1d = {
+            "numpoints": 256,
+            "unit": "q_A^-1",
+            "radial_range": (0.1, 6.0),
+            "method": "csr",
+        }
+        bai_2d = {
+            "npt_rad": 96,
+            "npt_azim": 72,
+            "unit": "q_A^-1",
+            "radial_range": (0.1, 6.0),
+            "azimuth_range": (-90.0, 90.0),
+            "method": "csr",
+        }
+
+    live = _run_live_single(
+        poni, _TIFF_FRAMES[0], img, meta, mask,
+        gi=gi, bai_1d_args=bai_1d, bai_2d_args=bai_2d,
+    )
+    batch = _run_batch_parallel(
+        poni, [(_TIFF_FRAMES[0], img, meta)], mask,
+        gi=gi, bai_1d_args=bai_1d, bai_2d_args=bai_2d,
+    )[1]
+
+    thumb_live = _canonicalize_thumbnail(live, mask)
+    _canonicalize_thumbnail(batch, mask)
+    pub_live = publication_from_live_frame(live)
+    pub_batch = publication_from_live_frame(batch)
+    pub_reload = _write_publication_reload(
+        tmp_path / ("equiv_gi.nxs" if gi else "equiv_standard.nxs"),
+        live,
+        thumb_live,
+    )
+
+    assert_frameview_equivalent(pub_live.view, pub_batch.view)
+    assert_frameview_equivalent(pub_live.view, pub_reload.view)
 
 
 def _assert_good_gi_publication_passes(frame, *, min_dummy_headroom=0.05):
@@ -218,6 +427,14 @@ def test_batch_parallel_eiger_cake_nondegenerate_manual_incidence():
     )
     assert not _result_intensity_all_dummy(i2)
     _assert_good_gi_publication_passes(out[1])
+
+
+def test_standard_publication_live_batch_reload_equivalence(tmp_path):
+    _assert_live_batch_reload_equivalent(tmp_path, gi=False)
+
+
+def test_gi_qip_qoop_publication_live_batch_reload_equivalence(tmp_path):
+    _assert_live_batch_reload_equivalent(tmp_path, gi=True)
 
 
 def test_eiger_incidence_unresolved_without_metadata():

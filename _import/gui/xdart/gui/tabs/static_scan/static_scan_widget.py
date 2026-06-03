@@ -492,6 +492,7 @@ class staticWidget(QWidget):
                             "thumbnail": getattr(frame, "thumbnail", None),
                         }
                     elif not skip_2d and has_2d_errors:
+                        self.h5viewer.data_2d.pop(int(idx), None)
                         logger.warning(
                             "Skipping frame %s 2D display cache: %s",
                             idx,

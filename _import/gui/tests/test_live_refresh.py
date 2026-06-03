@@ -552,6 +552,7 @@ def test_metadata_panel_populates_when_layout_reparented():
     mw.update()
     model = mw.tableview.model()
     assert model.rowCount(QModelIndex()) == 2    # th + i0 -> populated, not blank
+    assert list(model.dataFrame.columns) == [1]  # selected frame only, not whole scan
     win.close()
 
 
@@ -837,7 +838,7 @@ def test_absorb_chunk_skips_invalid_2d_cache_but_keeps_1d_publication(caplog):
         _load_generation=8,
         data_lock=RLock(),
         data_1d={},
-        data_2d={},
+        data_2d={12: {"int_2d": object()}},
         publication_store=PublicationStore(),
         _update_coalesce_timer=_FakeTimer(active=False),
         _raw_cache_order=[],
@@ -1579,6 +1580,13 @@ def _write_viewer_nexus_file(path):
         generic.attrs["units"] = "arb"
         generic.attrs["description"] = "Generic signal"
 
+        det = entry.create_group("instrument/detector")
+        raw = det.create_dataset(
+            "data",
+            data=np.arange(2 * 6 * 7, dtype=np.uint16).reshape(2, 6, 7),
+        )
+        raw.attrs["units"] = "counts"
+
 
 def test_nexus_viewer_loads_rows_and_previews_1d_2d_units(tmp_path):
     path = tmp_path / "viewer.nxs"
@@ -1590,8 +1598,10 @@ def test_nexus_viewer_loads_rows_and_previews_1d_2d_units(tmp_path):
     labels = [viewer.ui.listData.item(i).text() for i in range(viewer.ui.listData.count())]
     assert "Integrated 1D" in labels
     assert "Integrated 2D" in labels
+    assert "Raw detector dataset" in labels
     assert viewer.frame_ids == ["1"]
     assert viewer.ui.labelCurrent.text == path.name
+    assert viewer.data_1d[1].__class__.__name__ == "_ViewerRow"
 
     row_1d = labels.index("Integrated 1D")
     viewer.ui.listData.setCurrentRow(row_1d)
@@ -1617,6 +1627,18 @@ def test_nexus_viewer_loads_rows_and_previews_1d_2d_units(tmp_path):
     assert payload_2d["x_unit"] == "qip_A^-1"
     assert payload_2d["y_label"] == "Qoop"
     assert payload_2d["y_unit"] == "qoop_A^-1"
+
+    row_raw = labels.index("Raw detector dataset")
+    viewer.ui.listData.setCurrentRow(row_raw)
+    viewer.data_changed()
+    key_raw = viewer.ui.listData.item(row_raw).data(QtCore.Qt.UserRole)
+    payload_raw = viewer.data_1d[key_raw].nexus_preview_payload
+    assert payload_raw["kind"] == "image_2d"
+    assert payload_raw["image"].shape == (6, 7)
+    assert payload_raw["x_label"] == "column"
+    assert payload_raw["y_label"] == "row"
+    assert viewer.data_1d[key_raw].scan_info["_shape"] == (2, 6, 7)
+    assert viewer.data_1d[key_raw].scan_info["dtype"] == "uint16"
 
 
 def test_nexus_controller_builds_plot_and_image_payloads(tmp_path):

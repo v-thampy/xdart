@@ -3,6 +3,7 @@
 @author: walroth
 """
 # Standard library imports
+from dataclasses import dataclass
 import logging
 import os
 import time
@@ -67,6 +68,21 @@ def _clear_publication_store_for(viewer) -> None:
     store = getattr(viewer, "publication_store", None)
     if store is not None:
         store.clear()
+
+
+@dataclass
+class _ViewerRow:
+    """Lightweight row used by Image/XYE/NeXus viewer modes.
+
+    These rows are not live detector frames.  Keeping them distinct from
+    ``LiveFrame`` prevents browser-only state from accidentally entering
+    reduction/display paths that expect real frame caches and integration
+    results.
+    """
+
+    idx: int
+    scan_info: dict
+    nexus_preview_payload: dict | None = None
 
 
 class _LoadFramesWorker(QtCore.QObject):
@@ -1087,10 +1103,12 @@ class H5Viewer(QWidget):
 
         with self.data_lock:
             for row_id, (label, info) in enumerate(rows, start=1):
-                frame = LiveFrame(idx=row_id, static=True, gi=False)
-                frame.scan_info = dict(info)
-                frame.scan_info.setdefault("source_file", os.path.basename(fpath))
-                self.data_1d[row_id] = frame
+                scan_info = dict(info)
+                scan_info.setdefault("source_file", os.path.basename(fpath))
+                self.data_1d[row_id] = _ViewerRow(
+                    idx=row_id,
+                    scan_info=scan_info,
+                )
 
         was_blocked = self.ui.listData.blockSignals(True)
         try:
@@ -1358,11 +1376,21 @@ class H5Viewer(QWidget):
                 },
             ))
         if xdart.raw_image_dataset:
+            shape = tuple(xdart.raw_image_shape or ())
+            rank = len(shape)
+            preview_kind = "image_2d" if rank >= 2 else None
             rows.append((
                 "Raw detector dataset",
                 {
                     "kind": "raw_dataset",
                     "dataset_path": xdart.raw_image_dataset,
+                    "_shape": shape,
+                    "shape": self._nexus_value(shape),
+                    "dtype": xdart.raw_image_dtype or "",
+                    "nexus_preview_kind": preview_kind,
+                    "x_label": "column",
+                    "y_label": "row",
+                    "z_label": "Detector intensity",
                 },
             ))
         return rows
@@ -2095,6 +2123,7 @@ class H5Viewer(QWidget):
                         if frame.map_raw is not None:
                             self._remember_hydrated_raw(int(idx))
                     else:
+                        self.data_2d.pop(int(idx), None)
                         logger.warning(
                             "Skipping frame %s 2D display cache: %s",
                             idx,

@@ -217,6 +217,59 @@ def test_publication_display_adapter_exposes_availability_and_plot_payload():
     np.testing.assert_allclose(payload.traces[0].y, frame.int_1d.intensity / 100.0)
 
 
+def test_publication_display_adapter_builds_raw_and_cake_image_payloads():
+    frame = DuckFrame(idx=11)
+    frame.scan_info = {"monitor": 10.0}
+    frame.map_raw = np.arange(16, dtype=np.float32).reshape(4, 4)
+    frame.bg_raw = 1.0
+    frame.mask = np.array([0, 15])
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+    loaded_1d, loaded_2d, raw_avail = publication_availability(store)
+
+    class _Widget:
+        scan = type("Scan", (), {"name": "scan", "gi": False, "global_mask": np.array([5])})()
+        bkg_map_raw = 0.0
+        bkg_2d = 0.5
+
+        def normalize(self, data, metadata):
+            return np.asarray(data, dtype=float) / metadata["monitor"]
+
+    state = compute_display_state(
+        mode=Mode.INT_2D,
+        selected_ids=(11,),
+        all_frame_index=[11],
+        loaded_1d_keys=loaded_1d,
+        loaded_2d_keys=loaded_2d,
+        gi=False,
+        plot_unit="q_A^-1",
+        method="Single",
+        unit_changed=False,
+        prev_overlaid_ids=(),
+        raw_availability=raw_avail,
+        titles={},
+        generation=store.generation,
+    )
+    adapter = PublicationDisplayAdapter(store, widget=_Widget())
+
+    raw = adapter.raw_image(state)
+    cake = adapter.cake_image(state)
+
+    expected_raw = np.asarray(frame.map_raw, dtype=float)
+    expected_raw.ravel()[[0, 5, 15]] = np.nan
+    expected_raw = ((expected_raw - 1.0) / 10.0)[::-1, :]
+    assert raw is not None
+    np.testing.assert_allclose(raw.image, expected_raw, equal_nan=True)
+    assert raw.axis_x.label == "x"
+    assert raw.axis_y.label == "y"
+
+    expected_cake = frame.int_2d.intensity.T / 10.0 - 0.5
+    assert cake is not None
+    np.testing.assert_allclose(cake.image, expected_cake)
+    assert cake.axis_x.values.shape == (4,)
+    assert cake.axis_y.values.shape == (3,)
+
+
 def test_publication_display_adapter_falls_back_for_non_native_plot_modes():
     frame = DuckFrame(idx=10)
     store = PublicationStore()

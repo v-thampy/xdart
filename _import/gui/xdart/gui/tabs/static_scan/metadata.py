@@ -100,15 +100,32 @@ class metadataWidget(Qt.QtWidgets.QWidget):
             pass
         return self.publication_store.get(sel)
 
+    def _selected_scan_data(self, scan_data):
+        """Return scan_data rows for the current selection when possible."""
+
+        if not self.frame_ids:
+            return scan_data
+        labels = []
+        for item in self.frame_ids:
+            try:
+                labels.append(int(item))
+            except (TypeError, ValueError):
+                labels.append(item)
+        present = [label for label in labels if label in scan_data.index]
+        if not present:
+            return scan_data
+        return scan_data.loc[present]
+
     def update(self):
         """Updates the table with new data.
 
-        Shows the **whole-scan** metadata table (``scan.scan_data``,
-        transposed so rows are metadata keys and columns are frames) —
-        this is the historical behaviour the metadata panel is expected
-        to have.  Only when there is no scan-wide table yet (e.g. the
-        file/XYE viewer, or live mode before scan_data is populated) does
-        it fall back to the selected frame's ``scan_info``.
+        Shows selected rows from the scan metadata table when possible,
+        transposed so rows are metadata keys and columns are frames.  This
+        keeps live refresh bounded to the visible selection instead of
+        rebuilding the whole scan table every tick.  Only when there is no
+        scan-wide table yet (e.g. the file/XYE viewer, or live mode before
+        scan_data is populated) does it fall back to the selected frame's
+        ``scan_info``.
         """
         # Skip the (potentially large) transpose + model rebuild when the
         # panel isn't on screen — during a fast live scan this slot fires
@@ -131,7 +148,7 @@ class metadataWidget(Qt.QtWidgets.QWidget):
             and len(sd.index)
             and len(sd.columns)
         ):
-            self.tableview.setModel(DFTableModel(sd.transpose()))
+            self.tableview.setModel(DFTableModel(self._selected_scan_data(sd).transpose()))
             return
         # No whole-scan table — fall back to the selected frame's info.
         publication = self._resolve_selected_publication()

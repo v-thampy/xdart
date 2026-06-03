@@ -18,7 +18,17 @@ from xdart.modules.frame_publication import (
     publication_has_2d_errors,
 )
 
-from .display_logic import Axis, Mode, PlotPayload, Trace, x_axis_for_unit
+from .display_logic import (
+    Axis,
+    ImagePayload,
+    Mode,
+    PanelRole,
+    PlotPayload,
+    RawSource,
+    Trace,
+    sentinel_mask,
+    x_axis_for_unit,
+)
 
 
 def _label_key(label: Any) -> Any:
@@ -34,6 +44,17 @@ def _axis_for_publication(axis) -> Axis:
         label = axis.label
         unit = getattr(axis, "unit", "")
     return Axis(label=label, unit=unit)
+
+
+def _image_axis_for_publication(axis, *, fallback_label: str) -> Axis:
+    if axis is None:
+        return Axis(fallback_label, "")
+    label, unit = x_axis_for_unit(getattr(axis, "unit", ""))
+    if label == "x" and getattr(axis, "label", None):
+        label = axis.label
+        unit = getattr(axis, "unit", "") or ""
+    values = getattr(axis, "values", None)
+    return Axis(label=label, unit=unit, values=None if values is None else np.asarray(values, dtype=float))
 
 
 def _trace_name(publication, widget=None) -> str:
@@ -124,10 +145,105 @@ class PublicationDisplayAdapter:
         }
 
     def raw_image(self, state):
-        return None
+        panel = state.panel(PanelRole.RAW_2D)
+        if panel is None or not panel.has_data:
+            return None
+
+        accum = None
+        count = 0
+        for label in state.render_ids:
+            publication = self._items.get(_label_key(label))
+            if publication is None:
+                continue
+            data, source = self._raw_array(publication, panel.source)
+            if data is None:
+                continue
+            data = sentinel_mask(data)
+            if data.ndim != 2:
+                continue
+            bg = getattr(publication.raw_ref, "bg_raw", 0)
+            if source is RawSource.RAW:
+                data = self._apply_detector_mask(data, publication)
+                data = self._subtract_if_shape_matches(data, bg, "raw frame background")
+            data = self._normalize(data, publication.metadata_raw)
+            if accum is None:
+                accum = data
+            elif accum.shape == data.shape:
+                accum = accum + data
+            else:
+                continue
+            count += 1
+
+        if accum is None or count == 0:
+            return None
+        if state.overall and count != len(state.render_ids):
+            return None
+
+        image = accum / count
+        image = self._subtract_if_shape_matches(
+            image,
+            getattr(self._widget, "bkg_map_raw", 0),
+            "raw-image background",
+        )
+        if image.size == 0 or not np.isfinite(image).any():
+            return None
+
+        # Legacy raw rendering flipped the detector rows after transposing
+        # for pyqtgraph.  ImagePayload itself is row/column oriented, and
+        # display_frame_widget transposes every ImagePayload, so pre-flip
+        # here to preserve the visible detector orientation exactly.
+        image = np.asarray(image, dtype=float)[::-1, :]
+        return ImagePayload(
+            image=image,
+            axis_x=Axis("x", "Pixels", values=np.arange(image.shape[1])),
+            axis_y=Axis("y", "Pixels", values=np.arange(image.shape[0])),
+        )
 
     def cake_image(self, state):
-        return None
+        panel = state.panel(PanelRole.CAKE_2D)
+        if panel is None or not panel.has_data:
+            return None
+
+        accum = None
+        count = 0
+        axis_x = axis_y = None
+        for label in state.render_ids:
+            publication = self._items.get(_label_key(label))
+            if (
+                publication is None
+                or not publication.view.has_2d
+                or publication_has_2d_errors(publication)
+            ):
+                continue
+            view = publication.view
+            data = np.asarray(view.intensity_2d, dtype=float)
+            if data.ndim != 2:
+                continue
+            data = self._normalize(data, publication.metadata_raw)
+            if accum is None:
+                accum = data
+                axis_x = _image_axis_for_publication(view.axis_2d_x, fallback_label="x")
+                axis_y = _image_axis_for_publication(view.axis_2d_y, fallback_label="y")
+            elif accum.shape == data.shape:
+                accum = accum + data
+            else:
+                continue
+            count += 1
+
+        if accum is None or count == 0 or axis_x is None or axis_y is None:
+            return None
+        if state.overall and count != len(state.render_ids):
+            return None
+
+        image = accum / count
+        image = self._subtract_if_shape_matches(
+            image,
+            getattr(self._widget, "bkg_2d", 0),
+            "2D-image background",
+        )
+        if image.size == 0 or not np.isfinite(image).any():
+            return None
+        return ImagePayload(image=image, axis_x=axis_x, axis_y=axis_y)
 
     def plot_payload(self, state):
         # Overlay/Waterfall still use the legacy accumulator until the
@@ -196,6 +312,56 @@ class PublicationDisplayAdapter:
         if widget is None or not hasattr(widget, "normalize"):
             return np.asarray(data, dtype=float)
         return widget.normalize(np.asarray(data, dtype=float), metadata)
+
+    def _raw_array(self, publication, source):
+        if source is RawSource.THUMBNAIL:
+            data = publication.view.thumbnail
+            if data is None:
+                data = getattr(publication.raw_ref, "thumbnail", None)
+            return data, RawSource.THUMBNAIL
+
+        if source is RawSource.RAW:
+            data = publication.view.raw
+            if data is None:
+                data = getattr(publication.raw_ref, "map_raw", None)
+            if data is not None:
+                return data, RawSource.RAW
+
+        data = publication.view.thumbnail
+        if data is None:
+            data = getattr(publication.raw_ref, "thumbnail", None)
+        if data is not None:
+            return data, RawSource.THUMBNAIL
+        return None, RawSource.NONE
+
+    def _apply_detector_mask(self, data, publication):
+        data = np.asarray(data, dtype=float).copy()
+        masks = []
+        mask = getattr(publication.raw_ref, "mask", None)
+        if mask is not None:
+            masks.append(mask)
+        scan = getattr(self._widget, "scan", None)
+        global_mask = getattr(scan, "global_mask", None)
+        if global_mask is not None:
+            masks.append(global_mask)
+        if not masks:
+            return data
+        try:
+            flat = np.unique(np.concatenate([np.asarray(m, dtype=int).ravel() for m in masks]))
+        except (TypeError, ValueError):
+            return data
+        flat = flat[(flat >= 0) & (flat < data.size)]
+        if flat.size:
+            data[np.unravel_index(flat, data.shape)] = np.nan
+        return data
+
+    @staticmethod
+    def _subtract_if_shape_matches(data, background, label):
+        data = np.asarray(data, dtype=float)
+        bg = np.asarray(background)
+        if bg.shape == () or bg.shape == data.shape:
+            return data - background
+        return data
 
     @staticmethod
     def _has_thumbnail(publication) -> bool:
