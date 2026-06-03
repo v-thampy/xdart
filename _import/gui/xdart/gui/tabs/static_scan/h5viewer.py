@@ -588,17 +588,8 @@ class H5Viewer(QWidget):
         self.defaultWidget.save_defaults(fname=default_path)
 
     def update(self):
-        """Calls both update_scans and update_data.
-        """
-        # self.update_scans()
+        """Refresh the current file/frame selection."""
         self.update_data()
-
-        # Restore session
-        session = load_session()
-        saved_dir = session.get('data_dir', '')
-        if saved_dir and os.path.isdir(saved_dir):
-            self.dirname = saved_dir
-            self.update_scans()
 
     # File extensions for viewer modes
     _IMAGE_EXTS = {'.tif', '.tiff', '.raw', '.edf', '.h5', '.hdf5', '.nxs'}

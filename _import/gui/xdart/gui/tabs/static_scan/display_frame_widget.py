@@ -1294,25 +1294,36 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # frame on screen — otherwise a mode switch or an unhydrated frame
     # shows a stale image/cake/curve that looks like real data.
 
+    @staticmethod
+    def _clear_image_widget(widget):
+        """Clear a pyqtgraph image widget without drawing fake zero data."""
+        try:
+            widget.raw_image = np.zeros(0)
+            widget.displayed_image = np.zeros(0)
+        except Exception:
+            pass
+        item = getattr(widget, "imageItem", None)
+        try:
+            if item is not None and hasattr(item, "clear"):
+                item.clear()
+            elif hasattr(widget, "clear"):
+                widget.clear()
+        except Exception:
+            logger.debug("image widget clear failed", exc_info=True)
+
     def clear_image_view(self):
         """Blank the raw 2D image panel."""
         try:
-            blank = np.zeros((2, 2))
-            rect = get_rect(np.arange(2), np.arange(2))
-            self.image_data = (blank, rect)
-            self.image_widget.setImage(blank)
-            self.image_widget.setRect(rect)
+            self.image_data = None
+            self._clear_image_widget(self.image_widget)
         except Exception:
             logger.debug("clear_image_view failed", exc_info=True)
 
     def clear_binned_view(self):
         """Blank the 2D cake panel."""
         try:
-            blank = np.zeros((2, 2))
-            rect = get_rect(np.arange(2), np.arange(2))
-            self.binned_data = (blank, rect)
-            self.binned_widget.setImage(blank)
-            self.binned_widget.setRect(rect)
+            self.binned_data = None
+            self._clear_image_widget(self.binned_widget)
         except Exception:
             logger.debug("clear_binned_view failed", exc_info=True)
 
@@ -1326,7 +1337,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if getattr(self, 'legend', None) is not None:
                 self.legend.clear()
             if getattr(self, 'wf_widget', None) is not None:
-                self.wf_widget.setImage(np.zeros((2, 2)))
+                self._clear_image_widget(self.wf_widget)
             self._payload_x_axis_label = None
             self._payload_y_axis_label = None
         except Exception:

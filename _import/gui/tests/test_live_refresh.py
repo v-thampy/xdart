@@ -118,10 +118,21 @@ class _FakeListWidget:
         item.setSelected(True)
 
 
+class _FakeImageItem:
+    def __init__(self):
+        self.cleared = False
+
+    def clear(self):
+        self.cleared = True
+
+
 class _FakeImageWidget:
     def __init__(self):
         self.images = []
         self.rects = []
+        self.raw_image = np.ones((2, 2))
+        self.displayed_image = np.ones((2, 2))
+        self.imageItem = _FakeImageItem()
 
     def setImage(self, data, *args, **kwargs):
         self.images.append(np.asarray(data))
@@ -400,6 +411,7 @@ def _display_host():
         ui=SimpleNamespace(labelCurrent=label),
     )
     host.clear_overlay = MethodType(displayFrameWidget.clear_overlay, host)
+    host._clear_image_widget = displayFrameWidget._clear_image_widget
     host.clear_image_view = MethodType(displayFrameWidget.clear_image_view, host)
     host.clear_binned_view = MethodType(displayFrameWidget.clear_binned_view, host)
     host.clear_plot_view = MethodType(displayFrameWidget.clear_plot_view, host)
@@ -412,8 +424,8 @@ def test_clear_display_state_resets_visible_and_cached_state():
 
     host.clear_display_state("XYE Viewer")
 
-    np.testing.assert_array_equal(host.image_data[0], np.zeros((2, 2)))
-    np.testing.assert_array_equal(host.binned_data[0], np.zeros((2, 2)))
+    assert host.image_data is None
+    assert host.binned_data is None
     assert host.plot_data[0].size == 0
     assert host.plot_data[1].size == 0
     assert host.plot_data_range == [[0, 0], [0, 0]]
@@ -423,9 +435,15 @@ def test_clear_display_state_resets_visible_and_cached_state():
     assert curve.cleared is True
     assert legend.cleared is True
     assert label.text == "XYE Viewer"
-    np.testing.assert_array_equal(image_widget.images[-1], np.zeros((2, 2)))
-    np.testing.assert_array_equal(binned_widget.images[-1], np.zeros((2, 2)))
-    np.testing.assert_array_equal(wf_widget.images[-1], np.zeros((2, 2)))
+    assert image_widget.images == []
+    assert binned_widget.images == []
+    assert wf_widget.images == []
+    assert image_widget.imageItem.cleared is True
+    assert binned_widget.imageItem.cleared is True
+    assert wf_widget.imageItem.cleared is True
+    assert image_widget.raw_image.size == 0
+    assert binned_widget.raw_image.size == 0
+    assert wf_widget.raw_image.size == 0
 
 
 def test_display_generation_bumps_on_mode_switch_and_selection():
@@ -1339,12 +1357,17 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
         if not list_scans._signals_blocked:
             calls.append("autoload")
 
+    def sync_dir(path, *, refresh=True):
+        calls.append(("sync_dir", path, refresh))
+        widget.h5viewer.dirname = path
+
     widget = SimpleNamespace(
-        wrangler=object(),
+        wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out"),
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
             actionSaveDataAs=_FakeAction(),
+            dirname="/tmp/stale",
             viewer_mode="xye",
             _suspend_scan_selection_loads=False,
             _apply_frames_panel_width=lambda vm: None,
@@ -1359,15 +1382,80 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
             set_viewer_display_mode=lambda mode: calls.append(("display", mode)),
             clear_display_state=lambda: calls.append("clear_display"),
         ),
+        _sync_h5viewer_save_dir=sync_dir,
+        local_path="/tmp/stale",
     )
 
     staticWidget._on_viewer_mode_changed(widget, "image")
 
+    assert ("sync_dir", "/tmp/xdart-out", False) in calls
+    assert widget.h5viewer.dirname == "/tmp/xdart-out"
     assert ("cleanup_suspend", True) in calls
     assert ("update_scans_blocked", True) in calls
     assert "autoload" not in calls
     assert widget.h5viewer._suspend_scan_selection_loads is False
     assert list_scans._signals_blocked is False
+
+
+def test_h5viewer_update_does_not_restore_stale_session_directory(monkeypatch, tmp_path):
+    from xdart.gui.tabs.static_scan import h5viewer as h5mod
+
+    stale_dir = tmp_path / "stale"
+    current_dir = tmp_path / "current"
+    stale_dir.mkdir()
+    current_dir.mkdir()
+    calls = []
+    viewer = SimpleNamespace(
+        dirname=str(current_dir),
+        update_data=lambda: calls.append("update_data"),
+        update_scans=lambda: calls.append("update_scans"),
+    )
+    monkeypatch.setattr(
+        h5mod,
+        "load_session",
+        lambda: {"data_dir": str(stale_dir)},
+    )
+
+    H5Viewer.update(viewer)
+
+    assert calls == ["update_data"]
+    assert viewer.dirname == str(current_dir)
+
+
+def test_viewer_mode_keeps_explicit_open_folder():
+    calls = []
+    opened_dir = "/tmp/user-opened-images"
+    list_scans = _FakeListWidget(["raw.h5"])
+
+    widget = SimpleNamespace(
+        wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out"),
+        h5viewer=SimpleNamespace(
+            ui=SimpleNamespace(listScans=list_scans),
+            actionNewFile=_FakeAction(),
+            actionSaveDataAs=_FakeAction(),
+            dirname=opened_dir,
+            viewer_mode="",
+            _suspend_scan_selection_loads=False,
+            _apply_frames_panel_width=lambda vm: None,
+            enter_viewer_mode_cleanup=lambda: calls.append("cleanup"),
+            cancel_pending_loads=lambda: calls.append("cancel"),
+            update_scans=lambda: calls.append("update_scans"),
+        ),
+        displayframe=SimpleNamespace(
+            _wrangler=None,
+            set_viewer_display_mode=lambda mode: calls.append(("display", mode)),
+            clear_display_state=lambda: calls.append("clear_display"),
+        ),
+        _sync_h5viewer_save_dir=lambda path, *, refresh=True: calls.append(
+            ("sync_dir", path, refresh),
+        ),
+        local_path="/tmp/default-xdart",
+    )
+
+    staticWidget._on_viewer_mode_changed(widget, "image")
+
+    assert ("sync_dir", "/tmp/xdart-out", False) not in calls
+    assert widget.h5viewer.dirname == opened_dir
 
 
 def test_scan_selection_handlers_ignore_suspended_loads():

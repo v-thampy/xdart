@@ -1027,6 +1027,17 @@ class staticWidget(QWidget):
             # Configure display panels for the viewer mode
             self.displayframe.set_viewer_display_mode(viewer_mode)
             if is_viewer:
+                save_path = getattr(self.wrangler, 'h5_dir', None)
+                current_raw = str(getattr(self.h5viewer, 'dirname', '') or '')
+                current_dir = (
+                    os.path.abspath(os.path.expanduser(current_raw))
+                    if current_raw else ''
+                )
+                default_dir = os.path.abspath(os.path.expanduser(
+                    str(getattr(self, 'local_path', get_fname_dir())),
+                ))
+                if save_path and (not current_dir or current_dir == default_dir):
+                    self._sync_h5viewer_save_dir(save_path, refresh=False)
                 self.h5viewer.enter_viewer_mode_cleanup()
             else:
                 self.h5viewer.cancel_pending_loads()
