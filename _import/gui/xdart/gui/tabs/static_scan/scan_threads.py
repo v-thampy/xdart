@@ -67,7 +67,7 @@ class integratorThread(Qt.QtCore.QThread):
 
     def __init__(self, scan, frame, file_lock,
                  frames, frame_ids, data_1d, data_2d,
-                 parent=None, data_lock=None):
+                 parent=None, data_lock=None, publication_store=None):
         super().__init__(parent)
         self.scan = scan
         self.frame = frame
@@ -76,6 +76,11 @@ class integratorThread(Qt.QtCore.QThread):
         self.frame_ids = frame_ids
         self.data_1d = data_1d
         self.data_2d = data_2d
+        # Shared PublicationStore (same instance as H5Viewer / displayframe).
+        # Reintegration must refresh it alongside data_1d/data_2d, else the
+        # cake panel (payload path is preferred) keeps showing
+        # pre-reintegration pixels.
+        self.publication_store = publication_store
         # Shared reentrant lock guarding data_1d / data_2d access.  Falls
         # back to a private lock when constructed without one.
         self.data_lock = data_lock if data_lock is not None else RLock()
@@ -146,6 +151,11 @@ class integratorThread(Qt.QtCore.QThread):
                 self.data_2d.clear()
             else:
                 self.data_1d.clear()
+        # Drop stale publications and bump the store generation so any
+        # in-flight generation-checked subscribers reject pre-reintegration
+        # chunks.  Every frame is republished below via ``_publish``.
+        if self.publication_store is not None:
+            self.publication_store.clear()
         with self.scan.scan_lock:
             if do_2d:
                 self.scan.bai_2d = None
@@ -191,6 +201,25 @@ class integratorThread(Qt.QtCore.QThread):
                 with self.data_lock:
                     self.data_1d[int(frame.idx)] = frame.copy_for_display(
                         include_2d=False,
+                    )
+            # Republish the reintegrated frame so the store (the preferred
+            # display source) carries the NEW pixels, not the pre-reintegrate
+            # ones.  Built from the just-integrated frame, so its int_1d/int_2d
+            # are current.
+            if self.publication_store is not None:
+                try:
+                    from xdart.modules.frame_publication import (
+                        publication_from_live_frame,
+                    )
+                    self.publication_store.upsert(
+                        publication_from_live_frame(
+                            frame, generation=self.publication_store.generation,
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "reintegrate publication upsert failed for frame %s",
+                        getattr(frame, "idx", "?"), exc_info=True,
                     )
             self.update.emit(frame.idx)
 

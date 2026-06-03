@@ -246,7 +246,8 @@ class staticWidget(QWidget):
         self.integratorTree = integratorTree(
             self.scan, self.frame, self.file_lock,
             self.frames, self.frame_ids, self.data_1d, self.data_2d,
-            data_lock=self.data_lock)
+            data_lock=self.data_lock,
+            publication_store=self.publication_store)
         self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
         if len(self.scan.frames.index) > 0:
             self.integratorTree.update()

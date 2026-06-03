@@ -659,6 +659,54 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
     assert data_2d[0]["int_2d"] is not None
 
 
+def test_reintegrate_all_refreshes_publication_store(monkeypatch) -> None:
+    # A1: reintegrating ("Integrate 2D") must republish into the
+    # PublicationStore so the cake (payload path is preferred) shows the NEW
+    # pixels, not the pre-reintegrate ones.  fake_reduce makes the 2D shape
+    # depend on bai_2d_args['npt_rad'] so a changed arg is observable.
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+    from xdart.modules.frame_publication import PublicationStore
+
+    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
+        npt = int(scan.bai_2d_args.get("npt_rad", 10))
+        frame.int_1d = _r1d()
+        frame.int_2d = IntegrationResult2D(
+            radial=np.linspace(0.0, 1.0, npt),
+            azimuthal=np.linspace(-90.0, 90.0, 3),
+            intensity=np.ones((npt, 3)),
+            unit="q_A^-1", azimuthal_unit="chi_deg",
+        )
+        return frame
+
+    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
+
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan("scan", frames=[frame])
+    scan._cached_integrator = _FakeIntegrator()
+    scan.skip_2d = False
+    scan.bai_2d_args = {"npt_rad": 10, "gi_mode_2d": "qip_qoop"}
+    store = PublicationStore()
+
+    thread = integratorThread(
+        scan, None, None, None, [0], {}, {},
+        publication_store=store,
+    )
+
+    thread.bai_2d_all()
+    pub = store.get(0)
+    assert pub is not None
+    # view stores (y=azimuthal, x=radial) → (3, npt)
+    assert pub.view.intensity_2d.shape == (3, 10)
+
+    # Reintegrate with npt_rad halved → the store must reflect the NEW args,
+    # not the stale (3, 10) cake.
+    scan.bai_2d_args = {"npt_rad": 5, "gi_mode_2d": "qip_qoop"}
+    thread.bai_2d_all()
+    pub2 = store.get(0)
+    assert pub2 is not None
+    assert pub2.view.intensity_2d.shape == (3, 5)
+
+
 # ---------------------------------------------------------------------------
 # Mask-incompatibility handling: a mask that doesn't fit the image is ignored
 # (returns None) with a warning, not a hard error that aborts the scan.
