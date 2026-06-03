@@ -146,6 +146,38 @@ def _result_intensity_all_dummy(result, dummy=-1.0):
     return bool(np.all(finite <= dummy))
 
 
+def _gi_debug_dump(tag, img_number, frame, x_range, y_range, sample_orientation):
+    """TEMPORARY batch-vs-non-batch GI diagnostics.
+
+    Dumps, per frame at integration time: the frozen x_range/y_range
+    actually seen by this frame, the incidence angle + sample orientation
+    used, and the resulting qip/qoop extent.  Run tiff batch and tiff
+    non-batch, grep ``[GI-DEBUG]``, and diff the first frame to localize
+    the qoop collapse (stale args snapshot vs degenerate scout vs display).
+    REMOVE once the batch GI cake is fixed.
+    """
+    try:
+        inc = frame._get_incident_angle()
+    except Exception as exc:  # IncidenceAngleUnresolved et al.
+        inc = 'UNRESOLVED(%s)' % exc.__class__.__name__
+    i2 = getattr(frame, 'int_2d', None)
+    az = getattr(i2, 'azimuthal', None) if i2 is not None else None
+    if az is not None and np.size(az):
+        az = np.asarray(az, float)
+        rad = np.asarray(i2.radial, float)
+        qoop = '[%.4g,%.4g]' % (np.nanmin(az), np.nanmax(az))
+        qip = '[%.4g,%.4g]' % (np.nanmin(rad), np.nanmax(rad))
+        unit = '%s/%s' % (getattr(i2, 'unit', ''), getattr(i2, 'azimuthal_unit', ''))
+    else:
+        qoop = qip = unit = 'NO_INT_2D'
+    logger.warning(
+        '[GI-DEBUG] %s frame=%s x_range=%s y_range=%s incidence=%s orient=%s '
+        'qip=%s qoop=%s unit=%s',
+        tag, img_number, x_range, y_range, inc, sample_orientation,
+        qip, qoop, unit,
+    )
+
+
 def _freeze_gi_2d_ranges_from_result(args, result):
     """Freeze missing GI 2D auto-range args from one scout result."""
     x_key, y_key = _gi_2d_range_keys(args)
@@ -984,6 +1016,12 @@ class imageThread(wranglerThread):
                 **dict(args),
             )
             result = getattr(scratch, 'int_2d', None)
+            # TEMPORARY: dump the scout's incidence/orientation + the qoop
+            # extent it produced (this is what gets frozen).  Compare to the
+            # per-frame worker/serial dumps below.  REMOVE after the fix.
+            _gi_debug_dump('scout', img_number, scratch,
+                           dict(args).get(keys[0]), dict(args).get(keys[1]),
+                           self.sample_orientation)
             if result is not None and _result_intensity_all_dummy(result):
                 # Blank scout frame — freezing a grid off it would propagate
                 # an empty cake to the whole scan.  Almost always a degenerate
@@ -1183,6 +1221,15 @@ class imageThread(wranglerThread):
                     global_mask=mask,
                     legacy_gi=_legacy_gi_for_frame,
                 )
+
+            # TEMPORARY GI diagnostics: parallel batch worker uses the
+            # bai_2d_args SNAPSHOT captured at dispatch (post-freeze).
+            # REMOVE after the fix.
+            if gi:
+                _gi_debug_dump('worker', img_number, frame,
+                               bai_2d_args.get('x_range'),
+                               bai_2d_args.get('y_range'),
+                               sample_orientation)
 
             # Detach the pool integrator from this frame — once the
             # `with` block exited, the next worker can borrow this
@@ -1386,6 +1433,13 @@ class imageThread(wranglerThread):
             global_mask=self.mask,
             legacy_gi=_legacy_gi_for_single,
         )
+        # TEMPORARY GI diagnostics: non-batch path uses the LIVE
+        # scan.bai_2d_args at integration time.  REMOVE after the fix.
+        if self.gi:
+            _gi_debug_dump('serial', img_number, frame,
+                           scan.bai_2d_args.get('x_range'),
+                           scan.bai_2d_args.get('y_range'),
+                           self.sample_orientation)
         # Timing kept for parity with the legacy logging; the
         # standard path now does both 1D + 2D in one call so we
         # bundle the total under _t_1d.
