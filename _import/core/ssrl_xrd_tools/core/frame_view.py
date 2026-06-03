@@ -196,6 +196,8 @@ class FrameView:
             axis_2d_x = axis_from_unit(x_unit, getattr(result_2d, "radial", None))
             axis_2d_y = axis_from_unit(y_unit, getattr(result_2d, "azimuthal", None))
             raw_i2d = getattr(result_2d, "intensity", None)
+            # pyFAI result containers are (radial, azimuthal); FrameView's
+            # display convention is (y, x), matching the saved stack reader.
             intensity_2d = None if raw_i2d is None else np.asarray(raw_i2d).T
             raw_s2d = getattr(result_2d, "sigma", None)
             sigma_2d = None if raw_s2d is None else np.asarray(raw_s2d).T
@@ -294,6 +296,25 @@ def _assert_array_close(name: str, a: np.ndarray | None, b: np.ndarray | None, *
     np.testing.assert_allclose(a, b, rtol=rtol, atol=atol, equal_nan=True)
 
 
+def _assert_numeric_metadata_equivalent(
+    a: Mapping[str, float],
+    b: Mapping[str, float],
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    if set(a) != set(b):
+        raise AssertionError(
+            "metadata_numeric keys differ: "
+            f"{sorted(a)!r} != {sorted(b)!r}"
+        )
+    for key in a:
+        if not np.isclose(a[key], b[key], rtol=rtol, atol=atol, equal_nan=True):
+            raise AssertionError(
+                f"metadata_numeric[{key!r}] differs: {a[key]!r} != {b[key]!r}"
+            )
+
+
 def assert_frameview_equivalent(
     a: FrameView,
     b: FrameView,
@@ -303,6 +324,8 @@ def assert_frameview_equivalent(
 ) -> None:
     """Assert two frame views carry equivalent display/round-trip data."""
 
+    if a.label != b.label:
+        raise AssertionError(f"label differs: {a.label!r} != {b.label!r}")
     if a.two_d_kind != b.two_d_kind:
         raise AssertionError(f"two_d_kind differs: {a.two_d_kind!r} != {b.two_d_kind!r}")
     for name in ("axis_1d", "axis_2d_x", "axis_2d_y"):
@@ -324,3 +347,9 @@ def assert_frameview_equivalent(
             raise AssertionError("incident_angle: one side is None")
     elif not np.isclose(a.incident_angle, b.incident_angle, rtol=rtol, atol=atol, equal_nan=True):
         raise AssertionError(f"incident_angle differs: {a.incident_angle!r} != {b.incident_angle!r}")
+    _assert_numeric_metadata_equivalent(
+        a.metadata_numeric,
+        b.metadata_numeric,
+        rtol=rtol,
+        atol=atol,
+    )

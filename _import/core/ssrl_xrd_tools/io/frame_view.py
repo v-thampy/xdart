@@ -189,6 +189,8 @@ def read_frame_view(
             if result_2d is None
             else axis_from_unit(result_2d.chi_unit, result_2d.chi)
         ),
+        # get_2d slices the persisted stack, whose convention is already
+        # (axis_2d_y, axis_2d_x); unlike pyFAI result containers, no transpose.
         intensity_2d=None if result_2d is None else result_2d.intensity,
         sigma_2d=sigma_2d,
         two_d_kind=two_d_kind,

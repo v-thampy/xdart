@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import h5py
 import numpy as np
+import pytest
 
 from ssrl_xrd_tools.core import (
     FrameView,
@@ -123,3 +124,33 @@ def test_frame_view_infers_gi_kind_for_old_files_without_explicit_attr(tmp_path)
 
     view = read_frame_view(path, 1)
     assert view.two_d_kind is TwoDKind.QIP_QOOP
+
+
+def test_frame_view_equivalence_checks_label_and_numeric_metadata():
+    base = FrameView.from_results(
+        label=1,
+        result_1d=_r1d(),
+        metadata_raw={"monitor": 5.0, "sample": "LaB6"},
+    )
+    same = FrameView.from_results(
+        label=1,
+        result_1d=_r1d(),
+        metadata_raw={"monitor": 5.0, "sample": "different text is ignored"},
+    )
+    assert_frameview_equivalent(base, same)
+
+    different_label = FrameView.from_results(
+        label=2,
+        result_1d=_r1d(),
+        metadata_raw={"monitor": 5.0},
+    )
+    with pytest.raises(AssertionError, match="label differs"):
+        assert_frameview_equivalent(base, different_label)
+
+    different_metadata = FrameView.from_results(
+        label=1,
+        result_1d=_r1d(),
+        metadata_raw={"monitor": 6.0},
+    )
+    with pytest.raises(AssertionError, match="metadata_numeric"):
+        assert_frameview_equivalent(base, different_metadata)
