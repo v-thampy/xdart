@@ -34,6 +34,10 @@ else:
 
 # This module imports
 from xdart.modules.live import LiveFrame, LiveScan
+from xdart.modules.frame_publication import (
+    PublicationStore,
+    publication_from_live_frame,
+)
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer
 from .display_frame_widget import displayFrameWidget
@@ -192,6 +196,7 @@ class staticWidget(QWidget):
         self.frame = LiveFrame(static=True, gi=self.scan.gi)
         self.frame_ids = []
         self.frames = OrderedDict()
+        self.publication_store = PublicationStore()
         # O4: both 1D and 2D caches are bounded with the same cap.
         # Pre-O4 ``data_1d`` was an unbounded OrderedDict while
         # ``data_2d`` was FixSizeOrderedDict(max=20), and the manual
@@ -221,7 +226,8 @@ class staticWidget(QWidget):
         self.h5viewer = H5Viewer(self.file_lock, self.local_path, self.dirname,
                                  self.scan, self.frame, self.frame_ids, self.frames,
                                  self.data_1d, self.data_2d,
-                                 self.ui.hdf5Frame, data_lock=self.data_lock)
+                                 self.ui.hdf5Frame, data_lock=self.data_lock,
+                                 publication_store=self.publication_store)
         self.ui.hdf5Frame.setLayout(self.h5viewer.layout)
         self.h5viewer.update_scans()
 
@@ -230,7 +236,8 @@ class staticWidget(QWidget):
                                                self.frame_ids, self.frames,
                                                self.data_1d, self.data_2d,
                                                parent=self.ui.middleFrame,
-                                               data_lock=self.data_lock)
+                                               data_lock=self.data_lock,
+                                               publication_store=self.publication_store)
         self.ui.middleFrame.setLayout(self.displayframe.ui.layout)
 
         # IntegratorTree
@@ -246,7 +253,8 @@ class staticWidget(QWidget):
         # Metadata
         self.metawidget = metadataWidget(self.scan, self.frame,
                                          self.frame_ids, self.frames,
-                                         data_1d=self.data_1d)
+                                         data_1d=self.data_1d,
+                                         publication_store=self.publication_store)
         self.ui.metaFrame.setLayout(self.metawidget.layout)
 
     def _connect_signals(self):
@@ -485,6 +493,12 @@ class staticWidget(QWidget):
                     # unbounded) silently grew without bound.  No
                     # explicit eviction needed now; downstream cache
                     # misses fall through to the file_thread lazy load.
+                    self.publication_store.upsert(
+                        publication_from_live_frame(
+                            frame,
+                            generation=self.publication_store.generation,
+                        )
+                    )
             except Exception:
                 # Cache miss is non-fatal — displayframe will lazy-load
                 # from disk via file_thread.load_frame as fallback.

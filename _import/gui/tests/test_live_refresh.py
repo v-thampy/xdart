@@ -136,12 +136,17 @@ class _FakeLabel:
 class _FakeTimer:
     def __init__(self, active=True):
         self.active = active
+        self.started = 0
 
     def isActive(self):
         return self.active
 
     def stop(self):
         self.active = False
+
+    def start(self):
+        self.active = True
+        self.started += 1
 
 
 class _FakeWorker:
@@ -639,6 +644,58 @@ def test_absorb_chunk_drops_stale_generation():
     # Stale chunk (gen 6 < current 7) -> dropped.
     viewer._absorb_chunk(6, 3, _Frame(), False)
     assert viewer.data_1d == {} and viewer.data_2d == {}
+
+
+def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
+    from ssrl_xrd_tools.core import IntegrationResult1D, IntegrationResult2D
+    from xdart.modules.frame_publication import PublicationStore
+
+    viewer = SimpleNamespace(
+        _load_generation=7,
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+        publication_store=PublicationStore(),
+        _update_coalesce_timer=_FakeTimer(active=False),
+        _raw_cache_order=[],
+        _raw_cache_limit=8,
+    )
+    viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+    viewer._remember_hydrated_raw = MethodType(H5Viewer._remember_hydrated_raw, viewer)
+
+    class _Frame:
+        idx = 3
+        scan_info = {"th": 0.2, "monitor": 10.0}
+        source_file = "raw.tif"
+        source_frame_idx = 0
+        map_raw = np.ones((2, 2))
+        bg_raw = 0
+        mask = None
+        gi_2d = {}
+        thumbnail = np.ones((1, 1))
+        int_1d = IntegrationResult1D(
+            radial=np.arange(3), intensity=np.arange(3) + 1, unit="q_A^-1",
+        )
+        int_2d = IntegrationResult2D(
+            radial=np.arange(2), azimuthal=np.arange(2),
+            intensity=np.ones((2, 2)), unit="q_A^-1", azimuthal_unit="chi_deg",
+        )
+
+        def copy_for_display(self, include_2d=False):
+            return self
+
+    viewer._absorb_chunk(7, 3, _Frame(), False)
+    publication = viewer.publication_store.get(3)
+    assert publication is not None
+    assert publication.view.has_1d
+
+    frame = _Frame()
+    frame.idx = 4
+    viewer._absorb_chunk(7, 4, frame, True)
+    publication = viewer.publication_store.get(4)
+    assert publication is not None
+    assert publication.view.has_1d
+    assert publication.view.has_2d
 
 
 def test_gi_common_grid_freeze_yields_uniform_axes():

@@ -26,7 +26,7 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         update: Updates the data displayed
     """
     def __init__(self, scan, frame, frame_ids, frames, parent=None,
-                 data_1d=None):
+                 data_1d=None, publication_store=None):
         super().__init__(parent)
         self.layout = Qt.QtWidgets.QVBoxLayout()
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -45,6 +45,7 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         # happens to repurpose it).  Keeping the placeholder as a
         # fallback for legacy code paths.
         self.data_1d = data_1d
+        self.publication_store = publication_store
 
     def showEvent(self, event):
         """Refresh when the panel becomes visible — ``update()`` short-
@@ -85,6 +86,16 @@ class metadataWidget(Qt.QtWidgets.QWidget):
             return self.frame
         return None
 
+    def _resolve_selected_publication(self):
+        if not self.frame_ids or self.publication_store is None:
+            return None
+        sel = self.frame_ids[0]
+        try:
+            sel = int(sel)
+        except (TypeError, ValueError):
+            pass
+        return self.publication_store.get(sel)
+
     def update(self):
         """Updates the table with new data.
 
@@ -114,6 +125,11 @@ class metadataWidget(Qt.QtWidgets.QWidget):
             self.tableview.setModel(DFTableModel(sd.transpose()))
             return
         # No whole-scan table — fall back to the selected frame's info.
+        publication = self._resolve_selected_publication()
+        if publication is not None and publication.metadata_raw:
+            data = pd.DataFrame(publication.metadata_raw, index=[publication.label])
+            self.tableview.setModel(DFTableModel(data.transpose()))
+            return
         selected = self._resolve_selected_frame()
         if selected is not None and getattr(selected, "scan_info", None):
             data = pd.DataFrame(selected.scan_info, index=[selected.idx])

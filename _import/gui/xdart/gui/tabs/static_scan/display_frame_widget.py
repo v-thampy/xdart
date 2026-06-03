@@ -119,13 +119,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     """
 
     def __init__(self, scan, frame, frame_ids, frames, data_1d, data_2d,
-                 parent=None, data_lock=None):
+                 parent=None, data_lock=None, publication_store=None):
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
         # Shared reentrant lock guarding data_1d / data_2d.  When created
         # standalone (tests, viewer mode) fall back to a private lock.
         self.data_lock = data_lock if data_lock is not None else threading.RLock()
+        self.publication_store = publication_store
         self._init_data_objects(scan, frame, frame_ids, frames, data_1d, data_2d)
         self._init_display_panes()
         self._init_plot_panes()

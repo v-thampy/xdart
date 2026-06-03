@@ -23,6 +23,10 @@ from .scan_threads import fileHandlerThread
 from .display_logic import xye_unit_from_filename
 from .display_controllers import ImageViewerController
 from ssrl_xrd_tools.io import ImageSourceKind
+from xdart.modules.frame_publication import (
+    PublicationStore,
+    publication_from_live_frame,
+)
 from ...widgets import defaultWidget
 from xdart import utils
 from xdart.utils import catch_h5py_file as catch
@@ -53,6 +57,13 @@ QItemSelectionModel = QtCore.QItemSelectionModel
 def _clear_raw_cache_for(viewer) -> None:
     """Reset hydrated-raw LRU state on real and lightweight test viewers."""
     viewer._raw_cache_order = []
+
+
+def _clear_publication_store_for(viewer) -> None:
+    """Reset publication state when present on real or lightweight viewers."""
+    store = getattr(viewer, "publication_store", None)
+    if store is not None:
+        store.clear()
 
 
 class _LoadFramesWorker(QtCore.QObject):
@@ -338,13 +349,13 @@ class H5Viewer(QWidget):
     def __init__(self, file_lock, local_path, dirname,
                  scan, frame, frame_ids, frames,
                  data_1d, data_2d,
-                 parent=None, data_lock=None):
+                 parent=None, data_lock=None, publication_store=None):
         super().__init__(parent)
         import threading as _threading
         self.data_lock = data_lock if data_lock is not None else _threading.RLock()
         self._init_data_objects(file_lock, local_path, dirname,
                                 scan, frame, frame_ids, frames,
-                                data_1d, data_2d)
+                                data_1d, data_2d, publication_store)
         self._init_ui()
         self._init_toolbar()
         self._connect_signals()
@@ -354,7 +365,7 @@ class H5Viewer(QWidget):
 
     def _init_data_objects(self, file_lock, local_path, dirname,
                            scan, frame, frame_ids, frames,
-                           data_1d, data_2d):
+                           data_1d, data_2d, publication_store):
         """Initialize data references and state flags."""
         self.local_path = local_path
         self.file_lock = file_lock
@@ -365,6 +376,9 @@ class H5Viewer(QWidget):
         self.frames = frames
         self.data_1d = data_1d
         self.data_2d = data_2d
+        self.publication_store = (
+            publication_store if publication_store is not None else PublicationStore()
+        )
         self.new_scan = True
         self.update_2d = True
         self.auto_last = True
@@ -972,6 +986,7 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.data_1d.clear()
             self.data_2d.clear()
+            _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
         self.frame_ids.clear()
 
@@ -1040,6 +1055,7 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.data_1d.clear()
             self.data_2d.clear()
+            _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
         self.frame_ids.clear()
         was_blocked = self.ui.listData.blockSignals(True)
@@ -1586,6 +1602,14 @@ class H5Viewer(QWidget):
                     }
                     if frame.map_raw is not None:
                         self._remember_hydrated_raw(int(idx))
+                store = getattr(self, "publication_store", None)
+                if store is not None:
+                    store.upsert(
+                        publication_from_live_frame(
+                            frame,
+                            generation=store.generation,
+                        )
+                    )
             # O6: coalesce display updates while a chunk burst is
             # streaming in.  Schedule (or restart) a debounced emit
             # rather than firing once per chunk.  ``_on_load_worker_finished``
@@ -1633,6 +1657,7 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.data_1d.clear()
             self.data_2d.clear()
+            _clear_publication_store_for(self)
             self._clear_raw_cache()
         self.frame_ids.clear()
         self.latest_idx = None
