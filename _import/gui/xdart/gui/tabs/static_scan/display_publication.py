@@ -57,6 +57,39 @@ def _image_axis_for_publication(axis, *, fallback_label: str) -> Axis:
     return Axis(label=label, unit=unit, values=None if values is None else np.asarray(values, dtype=float))
 
 
+def _two_d_axes_match(ref_view, view, *, rtol=1e-5, atol=1e-8) -> bool:
+    """True when two FrameViews' 2D cakes share the same axis *identity* —
+    same ``two_d_kind``, same axis units, and same axis values (within
+    tolerance) — so they may be averaged together.
+
+    Multi-frame cake display averages same-shaped ``intensity_2d`` arrays;
+    without this, two frames with the same (nchi, nq) shape but different
+    q/chi (or qip/qoop) axes would silently blend.  That same-shape /
+    different-axis case is exactly the live↔batch↔reload drift the
+    publication contract is meant to catch, so a mismatch returns False
+    (the caller skips, never averages)."""
+    if getattr(ref_view, "two_d_kind", None) != getattr(view, "two_d_kind", None):
+        return False
+    pairs = (
+        (getattr(ref_view, "axis_2d_x", None), getattr(view, "axis_2d_x", None)),
+        (getattr(ref_view, "axis_2d_y", None), getattr(view, "axis_2d_y", None)),
+    )
+    for ref_axis, axis in pairs:
+        if ref_axis is None or axis is None:
+            if ref_axis is not axis:
+                return False
+            continue
+        if getattr(ref_axis, "unit", None) != getattr(axis, "unit", None):
+            return False
+        rv = np.asarray(getattr(ref_axis, "values", None), dtype=float)
+        av = np.asarray(getattr(axis, "values", None), dtype=float)
+        if rv.shape != av.shape or not np.allclose(
+            rv, av, rtol=rtol, atol=atol, equal_nan=True
+        ):
+            return False
+    return True
+
+
 def _trace_name(publication, widget=None) -> str:
     scan = getattr(widget, "scan", None)
     scan_name = getattr(scan, "name", "")
@@ -207,6 +240,7 @@ class PublicationDisplayAdapter:
         accum = None
         count = 0
         axis_x = axis_y = None
+        ref_view = None
         for label in state.render_ids:
             publication = self._items.get(_label_key(label))
             if (
@@ -222,11 +256,17 @@ class PublicationDisplayAdapter:
             data = self._normalize(data, publication.metadata_raw)
             if accum is None:
                 accum = data
+                ref_view = view
                 axis_x = _image_axis_for_publication(view.axis_2d_x, fallback_label="x")
                 axis_y = _image_axis_for_publication(view.axis_2d_y, fallback_label="y")
-            elif accum.shape == data.shape:
+            elif accum.shape == data.shape and _two_d_axes_match(ref_view, view):
                 accum = accum + data
             else:
+                # Same shape but a different 2D axis identity (two_d_kind /
+                # axis units / axis values) is real live↔batch↔reload drift.
+                # Averaging would blend e.g. qip/qoop with q/chi or two
+                # different grids — the publication contract exists to catch
+                # exactly this, so skip rather than silently blend.
                 continue
             count += 1
 

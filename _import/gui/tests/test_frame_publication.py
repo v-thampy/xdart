@@ -319,3 +319,88 @@ def test_publication_display_adapter_falls_back_for_non_native_plot_modes():
     assert PublicationDisplayAdapter(
         store, widget=widget(text="2θ (°)"),
     ).plot_payload(state) is None
+
+
+def _cake_widget(monitor_norm=True):
+    class _Widget:
+        scan = type("Scan", (), {"name": "scan", "gi": False,
+                                 "global_mask": np.array([], dtype=int)})()
+        bkg_map_raw = 0.0
+        bkg_2d = 0.0
+
+        def normalize(self, data, metadata):
+            if not monitor_norm:
+                return np.asarray(data, dtype=float)
+            return np.asarray(data, dtype=float) / metadata.get("monitor", 1.0)
+    return _Widget()
+
+
+def _two_cake_state(store):
+    loaded_1d, loaded_2d, raw_avail = publication_availability(store)
+    # all_frame_index has a 3rd id so selecting (1, 2) is NOT "overall" —
+    # otherwise the pre-existing overall guard (count != len(render_ids))
+    # would short-circuit when the mismatched frame is skipped, masking the
+    # skip behaviour we want to assert.
+    return compute_display_state(
+        mode=Mode.INT_2D,
+        selected_ids=(1, 2),
+        all_frame_index=[1, 2, 3],
+        loaded_1d_keys=loaded_1d,
+        loaded_2d_keys=loaded_2d,
+        gi=False,
+        plot_unit="q_A^-1",
+        method="Average",
+        unit_changed=False,
+        prev_overlaid_ids=(),
+        raw_availability=raw_avail,
+        titles={},
+        generation=store.generation,
+    )
+
+
+def _cake_frame(idx, *, intensity, azimuthal):
+    frame = DuckFrame(idx=idx)
+    frame.scan_info = {"monitor": 10.0}
+    frame.int_2d = IntegrationResult2D(
+        radial=np.linspace(0.5, 3.0, 4),
+        azimuthal=np.asarray(azimuthal, dtype=float),
+        intensity=np.full((4, 3), float(intensity)),
+        unit="q_A^-1",
+        azimuthal_unit="chi_deg",
+    )
+    return frame
+
+
+def test_cake_image_does_not_blend_same_shape_different_axis_publications():
+    # P2 #2: two cakes with the same (nchi, nq) shape but DIFFERENT chi axes
+    # must NOT be averaged together — that's live↔batch↔reload axis drift the
+    # publication contract is meant to catch.  Only the first (the accumulator
+    # reference) is used; the mismatched frame is skipped.
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(
+        _cake_frame(1, intensity=1.0, azimuthal=np.linspace(-90.0, 90.0, 3))))
+    store.upsert(publication_from_live_frame(
+        _cake_frame(2, intensity=3.0, azimuthal=np.linspace(-80.0, 100.0, 3))))
+
+    cake = PublicationDisplayAdapter(store, widget=_cake_widget()).cake_image(
+        _two_cake_state(store))
+
+    assert cake is not None
+    # Frame 1 only (1.0/10 = 0.1), NOT the blend (1.0+3.0)/2/10 = 0.2.
+    np.testing.assert_allclose(cake.image, np.full((3, 4), 0.1))
+
+
+def test_cake_image_blends_matching_axis_publications():
+    # Control: identical axes DO average (behavior preserved).
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(
+        _cake_frame(1, intensity=1.0, azimuthal=np.linspace(-90.0, 90.0, 3))))
+    store.upsert(publication_from_live_frame(
+        _cake_frame(2, intensity=3.0, azimuthal=np.linspace(-90.0, 90.0, 3))))
+
+    cake = PublicationDisplayAdapter(store, widget=_cake_widget()).cake_image(
+        _two_cake_state(store))
+
+    assert cake is not None
+    # Averaged: ((1.0 + 3.0) / 2) / 10 = 0.2.
+    np.testing.assert_allclose(cake.image, np.full((3, 4), 0.2))
