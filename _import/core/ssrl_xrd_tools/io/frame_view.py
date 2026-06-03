@@ -78,6 +78,10 @@ class FrameViewReader:
         self._axis_2d_x: Axis | None = None
         self._axis_2d_y: Axis | None = None
         self._two_d_kind = TwoDKind.Q_CHI
+        # Lazily-filled cache of the scan_data columns for THIS open, so a
+        # full-scan read slices each column once instead of re-reading every
+        # column for every frame (was O(N^2)).  Reset on open/close.
+        self._scan_data_columns: dict[str, np.ndarray] | None = None
 
     def __enter__(self) -> "FrameViewReader":
         self._h5 = h5py.File(self.path, "r")
@@ -90,6 +94,7 @@ class FrameViewReader:
         self._map_2d = _frame_map(self._g2)
         self._map_geom = _frame_map(self._geom)
         self._map_scan_data = _frame_map(self._scan_data)
+        self._scan_data_columns = None  # rebuild lazily for this open
 
         if self._g1 is not None and "q" in self._g1:
             self._axis_1d = axis_from_unit(
@@ -111,6 +116,7 @@ class FrameViewReader:
             self._h5.close()
         self._h5 = None
         self._entry = None
+        self._scan_data_columns = None
 
     def _row(self, mapping: dict[int, int], frame: int) -> int | None:
         return mapping.get(int(frame))
@@ -135,17 +141,29 @@ class FrameViewReader:
         group = self._scan_data
         if row is None or group is None:
             return {}
+        cols = self._scan_data_columns
+        if cols is None:
+            # Read each scan_data column ONCE per open, then slice by row —
+            # not once per (frame, column).  read_frame_views() loops every
+            # frame, so the old per-frame ``item[()]`` full-column read was
+            # O(N^2) in the column reads on long scans.
+            cols = {}
+            for key, item in group.items():
+                if key == "frame_index" or not isinstance(item, h5py.Dataset):
+                    continue
+                try:
+                    cols[str(key)] = np.asarray(item[()])
+                except (TypeError, ValueError):
+                    continue
+            self._scan_data_columns = cols
         out: dict[str, object] = {}
-        for key, item in group.items():
-            if key == "frame_index" or not isinstance(item, h5py.Dataset):
-                continue
+        for key, arr in cols.items():
             try:
-                arr = np.asarray(item[()])
                 value = arr[row]
-                if np.asarray(value).shape == ():
-                    out[str(key)] = np.asarray(value).item()
-            except (TypeError, ValueError, IndexError):
+            except (IndexError, TypeError):
                 continue
+            if np.asarray(value).shape == ():
+                out[key] = np.asarray(value).item()
         return out
 
     def _geometry_for_frame(self, frame: int) -> FrameGeometry | None:
@@ -257,25 +275,6 @@ def read_frame_view(
         return reader.read(int(frame))
 
 
-def read_frame_views(
-    scan_file: str | Path,
-    frames: Iterable[int] | None = None,
-    *,
-    entry: str = "entry",
-    include_thumbnail: bool = True,
-) -> tuple[FrameView, ...]:
-    """Read selected frame labels using one HDF5 open.
-
-    This is the preferred headless API for long scans and future RSM/stitching
-    pipelines that need many per-frame records.
-    """
-
-    path = Path(scan_file)
-    with FrameViewReader(path, entry=entry, include_thumbnail=include_thumbnail) as reader:
-        labels = reader.labels() if frames is None else frames
-        return tuple(reader.read(int(frame)) for frame in labels)
-
-
 def iter_frame_views(
     scan_file: str | Path,
     frames: Iterable[int] | None = None,
@@ -283,11 +282,37 @@ def iter_frame_views(
     entry: str = "entry",
     include_thumbnail: bool = True,
 ):
-    """Yield :class:`FrameView` objects for selected frame labels."""
+    """Yield :class:`FrameView` objects one at a time from a single open reader.
 
-    yield from read_frame_views(
-        scan_file,
-        frames,
-        entry=entry,
-        include_thumbnail=include_thumbnail,
+    Streams frame-by-frame so RSM / stitching / fitting can consume a long
+    scan without materialising every view first.  The HDF5 file stays open
+    for the life of the generator and is closed when it is exhausted (or
+    closed early via ``GeneratorExit``).
+    """
+
+    with FrameViewReader(
+        scan_file, entry=entry, include_thumbnail=include_thumbnail,
+    ) as reader:
+        labels = reader.labels() if frames is None else frames
+        for frame in labels:
+            yield reader.read(int(frame))
+
+
+def read_frame_views(
+    scan_file: str | Path,
+    frames: Iterable[int] | None = None,
+    *,
+    entry: str = "entry",
+    include_thumbnail: bool = True,
+) -> tuple[FrameView, ...]:
+    """Read selected frame labels using one HDF5 open (eager).
+
+    The preferred headless API for callers that want the whole list at once;
+    a thin ``tuple(iter_frame_views(...))`` over the streaming generator.
+    """
+
+    return tuple(
+        iter_frame_views(
+            scan_file, frames, entry=entry, include_thumbnail=include_thumbnail,
+        )
     )

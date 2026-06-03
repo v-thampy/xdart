@@ -11,7 +11,7 @@ from ssrl_xrd_tools.core import (
     TwoDKind,
     assert_frameview_equivalent,
 )
-from ssrl_xrd_tools.io import read_frame_view, read_frame_views
+from ssrl_xrd_tools.io import read_frame_view, read_frame_views, iter_frame_views
 from ssrl_xrd_tools.io.nexus import read_scan, write_integrated_stack
 
 
@@ -157,6 +157,58 @@ def test_read_frame_views_reads_many_labels_with_one_contract(tmp_path):
     selected = read_frame_views(path, [7])
     assert len(selected) == 1
     assert_frameview_equivalent(views[1], selected[0])
+
+
+def test_frame_view_reader_caches_scan_data_columns_per_open(tmp_path):
+    # P2 #4 (perf): scan_data columns are read ONCE per open and sliced per
+    # row, not re-read full for every (frame, column) — O(N^2) before.
+    # Values must stay correct per frame.
+    from ssrl_xrd_tools.io.frame_view import FrameViewReader
+
+    path = tmp_path / "cache_cols.nxs"
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("entry")
+        write_integrated_stack(
+            entry, frame_indices=[5, 7], results_1d=[_r1d(1.0), _r1d(2.0)],
+        )
+        scan_data = entry.create_group("scan_data")
+        scan_data.create_dataset("frame_index", data=np.array([5, 7], dtype=np.int64))
+        scan_data.create_dataset("monitor", data=np.array([10.0, 20.0], dtype=np.float32))
+
+    with FrameViewReader(path) as reader:
+        assert reader._scan_data_columns is None              # not read yet
+        assert reader.read(5).metadata_raw["monitor"] == 10.0
+        cols = reader._scan_data_columns
+        assert cols is not None and "monitor" in cols         # cached after 1st read
+        # Second frame slices the SAME cached column array (no re-read) and
+        # still gets its own row value.
+        assert reader.read(7).metadata_raw["monitor"] == 20.0
+        assert reader._scan_data_columns is cols
+
+
+def test_iter_frame_views_streams_one_at_a_time(tmp_path):
+    # P3 #6: iter_frame_views must yield frame-by-frame from one open reader
+    # (a generator), not materialise the whole scan first.
+    import types
+
+    path = tmp_path / "stream.nxs"
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("entry")
+        write_integrated_stack(
+            entry, frame_indices=[5, 7], results_1d=[_r1d(1.0), _r1d(2.0)],
+        )
+        scan_data = entry.create_group("scan_data")
+        scan_data.create_dataset("frame_index", data=np.array([5, 7], dtype=np.int64))
+        scan_data.create_dataset("monitor", data=np.array([10.0, 20.0], dtype=np.float32))
+
+    gen = iter_frame_views(path)
+    assert isinstance(gen, types.GeneratorType)        # lazy, not a list
+    first = next(gen)                                  # one frame, rest unread
+    assert first.label == 5
+    assert [v.label for v in gen] == [7]               # remaining stream out
+
+    # Eager wrapper yields the same set.
+    assert [v.label for v in read_frame_views(path)] == [5, 7]
 
 
 def test_frame_view_infers_gi_kind_for_old_files_without_explicit_attr(tmp_path):
