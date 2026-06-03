@@ -1391,8 +1391,9 @@ def test_scan_selection_handlers_ignore_suspended_loads():
     assert calls == []
 
 
-def test_old_processed_xdart_nxs_not_loaded_as_generic_image(tmp_path):
+def test_reduction_only_nxs_not_loaded_as_generic_image(tmp_path):
     import h5py
+    from ssrl_xrd_tools.io import ImageSourceKind
 
     path = tmp_path / "old_processed.nxs"
     with h5py.File(path, "w") as f:
@@ -1418,7 +1419,8 @@ def test_old_processed_xdart_nxs_not_loaded_as_generic_image(tmp_path):
 
     viewer._load_image_file(str(path))
 
-    assert viewer._viewer_is_xdart is True
+    assert viewer._viewer_source_info.kind is ImageSourceKind.UNKNOWN
+    assert viewer._viewer_is_xdart is False
     assert calls == ["remember"]
     assert viewer.ui.listData.count() == 0
     assert viewer.data_1d == {}
@@ -1514,6 +1516,12 @@ def test_processed_xdart_markers_still_short_circuit_image_loader(tmp_path):
         f.create_group("entry/frames")     # native eiger group, no content
     info = ImageViewerController.classify(str(bare_frames))
     assert info.kind is not ImageSourceKind.PROCESSED_XDART
+
+    reduction_only = tmp_path / "reduction_only.nxs"
+    with h5py.File(reduction_only, "w") as f:
+        f.create_group("entry/reduction")  # provenance only, no displayable data
+    info = ImageViewerController.classify(str(reduction_only))
+    assert info.kind is ImageSourceKind.UNKNOWN
 
 
 def _bind_nexus_viewer_methods(viewer):

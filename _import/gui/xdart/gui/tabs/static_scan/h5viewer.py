@@ -1594,6 +1594,18 @@ class H5Viewer(QWidget):
             self.sigUpdate.emit()
             return
 
+        if (ext in ('.h5', '.hdf5', '.nxs')
+                and self._viewer_source_info.kind is ImageSourceKind.UNKNOWN):
+            logger.warning(
+                '%s is not a viewable image or xdart processed scan.',
+                os.path.basename(fpath),
+            )
+            self._viewer_image_path = None
+            self._viewer_image_nframes = 0
+            self._remember_displayed_frames()
+            self.sigUpdate.emit()
+            return
+
         # Check for multi-frame files
         if ext in ('.h5', '.hdf5', '.nxs'):
             nframes = count_frames(fpath)
