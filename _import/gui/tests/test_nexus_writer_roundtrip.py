@@ -277,6 +277,39 @@ def test_nxload_opens_cleanly(written_nxs):
     assert root["entry"].nxclass == "NXentry"
 
 
+def test_overwrite_save_is_atomic_on_failure(tmp_path, monkeypatch):
+    import h5py
+    from xdart.modules.ewald import nexus_writer
+
+    path = tmp_path / "atomic.nxs"
+    original = _DuckSphere([_DuckArch(idx=i) for i in range(2)])
+    nexus_writer.save_scan_to_nexus(original, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        original_intensity = f["entry/integrated_1d/intensity"][()].copy()
+        original_frame_index = f["entry/integrated_1d/frame_index"][()].copy()
+
+    def fail_reduction(*args, **kwargs):
+        raise RuntimeError("forced writer failure")
+
+    monkeypatch.setattr(nexus_writer, "_write_reduction", fail_reduction)
+    replacement = _DuckSphere([_DuckArch(idx=i, seed=100) for i in range(3)])
+
+    with pytest.raises(RuntimeError, match="forced writer failure"):
+        nexus_writer.save_scan_to_nexus(replacement, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f["entry/integrated_1d/frame_index"][()],
+            original_frame_index,
+        )
+        np.testing.assert_allclose(
+            f["entry/integrated_1d/intensity"][()],
+            original_intensity,
+        )
+    assert not list(tmp_path.glob(".atomic.nxs.tmp-*"))
+
+
 def test_entry_attrs(written_nxs):
     """NXentry has the expected class + default plot pointer."""
     root = nx.nxload(str(written_nxs))

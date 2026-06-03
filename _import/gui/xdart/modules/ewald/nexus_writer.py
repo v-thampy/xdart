@@ -165,6 +165,7 @@ def save_scan_to_nexus(
     entry: str = "entry",
     finalize: bool = False,
     replace_frame_indices=None,
+    _atomic_write: bool = True,
 ) -> None:
     """Write ``scan``'s state into the file at ``path`` as a v2 NXroot.
 
@@ -208,6 +209,30 @@ def save_scan_to_nexus(
     replace_frame_indices
         See "Replace" mode above.  ``None`` (default) for append mode.
     """
+    path = Path(path)
+    if _atomic_write and mode == "w":
+        tmp_path = path.with_name(
+            f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+        )
+        try:
+            save_scan_to_nexus(
+                scan,
+                tmp_path,
+                mode=mode,
+                entry=entry,
+                finalize=finalize,
+                replace_frame_indices=replace_frame_indices,
+                _atomic_write=False,
+            )
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        return
+
     _logger = logging.getLogger(__name__)
     _verbose = _logger.isEnabledFor(logging.DEBUG)
 
