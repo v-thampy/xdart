@@ -1918,6 +1918,47 @@ def test_single_multiselect_unit_switch_still_uses_current_selection():
     assert host.overlaid_idxs == [1, 2, 3]
 
 
+def test_overlay_append_skips_empty_incoming_grid_without_crash():
+    # Regression (P1 #1): a frame whose 1D grid is empty (cache miss mid
+    # fast batch) reached the merge branch and _reinterp(np.interp on empty
+    # src_x) raised, aborting the whole render so completed traces never
+    # painted.  The empty-grid frame must be skipped, not crash.
+    host = _plot_host("Overlay")
+    host.idxs = [1]
+    host.idxs_1d = [1]
+    host.update_plot()
+    assert host.plot_data[1].shape == (1, 2)
+
+    # Frame 2 comes back with an empty x grid.
+    host.get_frames_int_1d = lambda idxs=None, rv="all": (
+        np.zeros((1, 0)), np.zeros(0))
+    host.idxs = [2]
+    host.idxs_1d = [2]
+    host.update_plot()  # must not raise
+
+    assert host.plot_data[1].shape == (1, 2)        # frame 2 skipped
+    assert "scan_2" not in host.frame_names
+    assert host.overlaid_idxs == [1]
+
+
+def test_overlay_append_empty_accumulator_seeds_fresh_grid():
+    # Regression (P1 #1): with overlay "active" (plan_overlay → APPEND) but
+    # an emptied accumulator (old_x empty), interpolating onto the empty x
+    # crashed.  It must seed the grid from the incoming frame instead.
+    host = _plot_host("Overlay")
+    host.overlaid_idxs = [99]
+    host.frame_names = ["scan_99"]
+    host.plot_data = [np.zeros(0), np.zeros((0, 0))]
+    host._last_plot_unit = 0          # no unit change → APPEND (not REBUILD)
+    host.idxs = [1]
+    host.idxs_1d = [1]
+    host.update_plot()  # must not raise
+
+    assert host.plot_data[0].size == 2              # grid seeded
+    assert host.plot_data[1].shape == (1, 2)
+    assert "scan_1" in host.frame_names
+
+
 def test_xye_single_method_change_clears_accumulated_traces_immediately():
     calls = []
     host = SimpleNamespace(

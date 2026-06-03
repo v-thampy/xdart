@@ -176,34 +176,53 @@ class DisplayPlotMixin:
                 self.frame_names = list(frame_names)
                 self.overlaid_idxs = list(self.idxs_1d)
         elif overlay_action is OverlayAction.APPEND:
+            def _reinterp(src_x, src_y, dst_x):
+                """Interpolate src onto dst, NaN outside range.
+
+                Returns an all-NaN row when either grid is empty: a fast
+                overlay/waterfall batch can hand us an empty ``src_x`` (a
+                frame whose 1D wasn't loaded yet / a cache miss), and
+                ``np.interp`` raises ``ValueError: array of sample points
+                is empty`` while ``src_x[0]``/``src_x[-1]`` would IndexError
+                — that crash aborted the whole render, so the completed
+                trace set never painted ("not all traces plotted").
+                """
+                if np.size(src_x) == 0 or np.size(dst_x) == 0:
+                    return np.full(np.shape(dst_x), np.nan)
+                out = np.interp(dst_x, src_x, src_y)
+                out[dst_x < src_x[0]] = np.nan
+                out[dst_x > src_x[-1]] = np.nan
+                return out
+
             for idx, frame_name, row in zip(self.idxs_1d, frame_names, ydata):
-                if frame_name not in self.frame_names:
-                    old_x = self.plot_data[0]
-                    if old_x.shape == xdata.shape and np.allclose(old_x, xdata):
-                        # Same grid — just append
-                        self.plot_data[1] = np.vstack((self.plot_data[1], row))
-                    else:
-                        # Different grid — merge and interpolate.
-                        merged_x = np.union1d(old_x, xdata)
-                        merged_x.sort()
-
-                        def _reinterp(src_x, src_y, dst_x):
-                            """Interpolate src onto dst, NaN outside range."""
-                            out = np.interp(dst_x, src_x, src_y)
-                            out[dst_x < src_x[0]] = np.nan
-                            out[dst_x > src_x[-1]] = np.nan
-                            return out
-
-                        old_y = self.plot_data[1]
-                        if old_y.ndim == 1:
-                            old_y = old_y[np.newaxis, :]
-                        new_old = np.array([_reinterp(old_x, r, merged_x)
-                                            for r in old_y])
-                        new_row = _reinterp(xdata, row, merged_x)
-                        self.plot_data = [merged_x,
-                                          np.vstack((new_old, new_row))]
-                    self.frame_names.append(frame_name)
-                    self.overlaid_idxs.append(int(idx))
+                if frame_name in self.frame_names:
+                    continue
+                # Skip an empty-grid incoming frame: it carries no usable x
+                # axis and would poison the accumulator.
+                if np.size(xdata) == 0:
+                    continue
+                old_x = self.plot_data[0]
+                if np.size(old_x) == 0:
+                    # Empty accumulator — seed it with this frame as the
+                    # fresh grid rather than interpolating onto an empty x.
+                    self.plot_data = [xdata, row[np.newaxis, :]]
+                elif old_x.shape == xdata.shape and np.allclose(old_x, xdata):
+                    # Same grid — just append
+                    self.plot_data[1] = np.vstack((self.plot_data[1], row))
+                else:
+                    # Different grid — merge and interpolate.
+                    merged_x = np.union1d(old_x, xdata)
+                    merged_x.sort()
+                    old_y = self.plot_data[1]
+                    if old_y.ndim == 1:
+                        old_y = old_y[np.newaxis, :]
+                    new_old = np.array([_reinterp(old_x, r, merged_x)
+                                        for r in old_y])
+                    new_row = _reinterp(xdata, row, merged_x)
+                    self.plot_data = [merged_x,
+                                      np.vstack((new_old, new_row))]
+                self.frame_names.append(frame_name)
+                self.overlaid_idxs.append(int(idx))
         else:
             # Fresh start: Single/Sum/Average, unit changed, or no existing data
             self.plot_data = [xdata, ydata]
