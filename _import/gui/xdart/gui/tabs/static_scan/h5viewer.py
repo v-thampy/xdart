@@ -1464,6 +1464,7 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.data_1d.clear()
             self.data_2d.clear()
+            _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
         self.new_scan = True
 
@@ -1482,6 +1483,7 @@ class H5Viewer(QWidget):
             with self.data_lock:
                 self.data_1d.clear()
                 self.data_2d.clear()
+                _clear_publication_store_for(self)
                 _clear_raw_cache_for(self)
             self.new_scan = True
             self.update_scans()

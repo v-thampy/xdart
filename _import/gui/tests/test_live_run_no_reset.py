@@ -84,6 +84,8 @@ def test_set_datafile_non_live_reloads_from_disk():
 
 
 def _reset_viewer(live_run_active):
+    from xdart.modules.frame_publication import PublicationStore
+
     viewer = SimpleNamespace(
         live_run_active=live_run_active,
         scan=SimpleNamespace(data_file="scan.nxs"),
@@ -92,6 +94,7 @@ def _reset_viewer(live_run_active):
         frame_ids=SimpleNamespace(cleared=False),
         data_1d={1: "a", 2: "b"},
         data_2d={1: "x"},
+        publication_store=PublicationStore(),
         data_lock=_NullLock(),
         new_scan=False,
     )
@@ -111,6 +114,7 @@ def test_data_reset_suppressed_during_live_run():
 
     assert viewer.data_1d == {1: "a", 2: "b"}
     assert viewer.data_2d == {1: "x"}
+    assert viewer.publication_store.generation == 0
     assert viewer.frames.cleared is False
     assert viewer.frame_ids.cleared is False
     assert viewer._h5pool.closed == []
@@ -125,6 +129,7 @@ def test_data_reset_clears_when_not_live():
 
     assert viewer.data_1d == {}
     assert viewer.data_2d == {}
+    assert viewer.publication_store.generation == 1
     assert viewer.frames.cleared is True
     assert viewer.frame_ids.cleared is True
     assert viewer._h5pool.closed == ["scan.nxs"]

@@ -254,7 +254,8 @@ class staticWidget(QWidget):
         self.metawidget = metadataWidget(self.scan, self.frame,
                                          self.frame_ids, self.frames,
                                          data_1d=self.data_1d,
-                                         publication_store=self.publication_store)
+                                         publication_store=self.publication_store,
+                                         data_lock=self.data_lock)
         self.ui.metaFrame.setLayout(self.metawidget.layout)
 
     def _connect_signals(self):
@@ -795,6 +796,7 @@ class staticWidget(QWidget):
         # the next ``_flush_pending_update`` tick.
         self.frames.clear()
         self.frame_ids.clear()
+        self.publication_store.clear()
 
         # During a live (non-batch) run the async file-thread set_datafile
         # no longer reloads frames from disk (it would clobber the live

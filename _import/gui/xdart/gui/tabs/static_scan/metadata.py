@@ -4,6 +4,7 @@
 """
 
 # Standard library imports
+import threading
 
 # Other imports
 import pandas as pd
@@ -26,7 +27,7 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         update: Updates the data displayed
     """
     def __init__(self, scan, frame, frame_ids, frames, parent=None,
-                 data_1d=None, publication_store=None):
+                 data_1d=None, publication_store=None, data_lock=None):
         super().__init__(parent)
         self.layout = Qt.QtWidgets.QVBoxLayout()
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -46,6 +47,7 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         # fallback for legacy code paths.
         self.data_1d = data_1d
         self.publication_store = publication_store
+        self.data_lock = data_lock if data_lock is not None else threading.RLock()
 
     def showEvent(self, event):
         """Refresh when the panel becomes visible — ``update()`` short-
@@ -75,10 +77,11 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         except (TypeError, ValueError):
             sel_int = sel
 
-        if self.data_1d is not None and sel_int in self.data_1d:
-            return self.data_1d[sel_int]
-        if sel_int in self.frames:
-            return self.frames[sel_int]
+        with self.data_lock:
+            if self.data_1d is not None and sel_int in self.data_1d:
+                return self.data_1d[sel_int]
+            if sel_int in self.frames:
+                return self.frames[sel_int]
         # Fallback to the placeholder if it's been populated for this
         # frame (live mode: wrangler stamps the latest frame on it).
         if (getattr(self.frame, "idx", None) is not None
@@ -127,7 +130,7 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         # No whole-scan table — fall back to the selected frame's info.
         publication = self._resolve_selected_publication()
         if publication is not None and publication.metadata_raw:
-            data = pd.DataFrame(publication.metadata_raw, index=[publication.label])
+            data = pd.DataFrame(dict(publication.metadata_raw), index=[publication.label])
             self.tableview.setModel(DFTableModel(data.transpose()))
             return
         selected = self._resolve_selected_frame()

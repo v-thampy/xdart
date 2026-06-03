@@ -534,6 +534,112 @@ def test_metadata_panel_populates_when_layout_reparented():
     win.close()
 
 
+def test_metadata_panel_accepts_store_mapping_proxy():
+    import pandas as pd
+    from PySide6 import QtWidgets
+    from PySide6.QtCore import QModelIndex
+    from ssrl_xrd_tools.core import FrameView
+    from xdart.gui.tabs.static_scan.metadata import metadataWidget
+    from xdart.modules.frame_publication import (
+        PublicationStore,
+        publication_from_frame_view,
+    )
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    store = PublicationStore()
+    store.upsert(
+        publication_from_frame_view(
+            FrameView(
+                label=7,
+                metadata_raw={"sample": "LaB6", "monitor": 2.0},
+            )
+        )
+    )
+    scan = SimpleNamespace(scan_data=pd.DataFrame())
+    mw = metadataWidget(
+        scan,
+        None,
+        ["7"],
+        {},
+        data_1d={},
+        publication_store=store,
+        data_lock=RLock(),
+    )
+
+    frame = QtWidgets.QFrame()
+    frame.setLayout(mw.layout)
+    win = QtWidgets.QWidget()
+    QtWidgets.QVBoxLayout(win).addWidget(frame)
+    win.show()
+    app.processEvents()
+
+    mw.update()
+    model = mw.tableview.model()
+    assert model.rowCount(QModelIndex()) == 2
+    win.close()
+
+
+def test_live_new_scan_invalidates_publication_store():
+    import pandas as pd
+    from xdart.modules.frame_publication import PublicationStore
+
+    store = PublicationStore()
+    old_generation = store.generation
+
+    scan = SimpleNamespace(
+        name="old",
+        gi=False,
+        incidence_motor="th",
+        single_img=False,
+        series_average=False,
+        global_mask=None,
+        scan_lock=RLock(),
+        frames=SimpleNamespace(index=[1], _in_memory={1: object()}),
+        scan_data=pd.DataFrame({"old": [1.0]}, index=[1]),
+    )
+    host = SimpleNamespace(
+        scan=scan,
+        h5viewer=SimpleNamespace(
+            dirname="",
+            live_run_active=True,
+            scan_name="old",
+            auto_last=False,
+            latest_idx=9,
+            set_file=lambda fname: None,
+            update_scans=lambda: None,
+            update=lambda: None,
+        ),
+        wrangler=SimpleNamespace(thread=SimpleNamespace(mask=None)),
+        integratorTree=SimpleNamespace(
+            get_args=lambda name: None,
+            set_image_units=lambda: None,
+        ),
+        _update_timer=SimpleNamespace(stop=lambda: None),
+        _flush_pending_update=lambda: None,
+        frames={1: object()},
+        frame_ids=["1"],
+        publication_store=store,
+        displayframe=SimpleNamespace(set_axes=lambda: None),
+        metawidget=SimpleNamespace(update=lambda: None),
+    )
+
+    staticWidget.new_scan(
+        host,
+        "new",
+        "/tmp/new.nxs",
+        False,
+        "th",
+        False,
+        False,
+    )
+
+    assert len(store) == 0
+    assert store.generation == old_generation + 1
+    assert host.frame_ids == []
+    assert list(scan.frames.index) == []
+    assert scan.scan_data.empty
+
+
 def test_gi_motor_options_default_manual_when_no_metadata():
     # GI incidence: when no motors are found (eiger / no metadata), the Theta
     # Motor must default to 'Manual' and reveal the Theta value field so the

@@ -10,6 +10,7 @@ store without reaching back through widget state.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from threading import RLock
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
@@ -263,37 +264,46 @@ class PublicationStore:
     """Small generation-aware store for frame publications."""
 
     def __init__(self) -> None:
+        self._lock = RLock()
         self._generation = 0
         self._items: dict[int | str, FramePublication] = {}
 
     @property
     def generation(self) -> int:
-        return self._generation
+        with self._lock:
+            return self._generation
 
     def clear(self) -> None:
-        self._generation += 1
-        self._items.clear()
+        with self._lock:
+            self._generation += 1
+            self._items.clear()
 
     def upsert(self, publication: FramePublication) -> FramePublication:
-        if publication.generation != self._generation:
-            publication = replace(publication, generation=self._generation)
-        self._items[publication.label] = publication
-        return publication
+        with self._lock:
+            if publication.generation != self._generation:
+                publication = replace(publication, generation=self._generation)
+            self._items[publication.label] = publication
+            return publication
 
     def extend(self, publications: Iterable[FramePublication]) -> tuple[FramePublication, ...]:
-        return tuple(self.upsert(publication) for publication in publications)
+        with self._lock:
+            return tuple(self.upsert(publication) for publication in publications)
 
     def get(self, label: int | str) -> FramePublication | None:
-        return self._items.get(label)
+        with self._lock:
+            return self._items.get(label)
 
     def labels(self) -> tuple[int | str, ...]:
-        return tuple(self._items)
+        with self._lock:
+            return tuple(self._items)
 
     def snapshot(self) -> Mapping[int | str, FramePublication]:
-        return MappingProxyType(dict(self._items))
+        with self._lock:
+            return MappingProxyType(dict(self._items))
 
     def __len__(self) -> int:
-        return len(self._items)
+        with self._lock:
+            return len(self._items)
 
 
 __all__ = [
