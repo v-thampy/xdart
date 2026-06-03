@@ -1084,7 +1084,22 @@ def _write_instrument(f, scan, *, entry: str) -> None:
     instr.attrs["NX_class"] = "NXinstrument"
 
     # ── source (NXsource) ─────────────────────────────────────────
-    wavelength = scan.mg_args.get("wavelength")
+    # Provenance fix: ``scan.mg_args`` defaults to {'wavelength': 1e-10}
+    # (= 1.0 Å) and is never updated from the PONI, so it was being
+    # persisted verbatim as wavelength_A=1.0.  Prefer the wavelength baked
+    # into the integrator built from the PONI (the real value, in metres);
+    # fall back to mg_args only when no integrator is available.  Mirrors
+    # the display-side lookup in display_data._get_wavelength.
+    wavelength = None
+    ai = getattr(scan, "_cached_integrator", None)
+    ai_wl = getattr(ai, "wavelength", None) if ai is not None else None
+    try:
+        if ai_wl is not None and float(ai_wl) > 0:
+            wavelength = float(ai_wl)
+    except (TypeError, ValueError):
+        wavelength = None
+    if wavelength is None:
+        wavelength = scan.mg_args.get("wavelength")
     if wavelength is not None:
         if "source" in instr:
             del instr["source"]

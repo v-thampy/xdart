@@ -29,20 +29,184 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _load_tiff_frame0():
-    import fabio
-    from ssrl_xrd_tools.core.containers import PONI
-    from ssrl_xrd_tools.io.metadata import read_image_metadata
+_TIFF_PONI = "LaB6_detz190_dety72_th5_03261554_0001.poni"
+# Two angle-dependence frames at DIFFERENT incidences — the case the
+# stale-fiber-integrator pool got wrong (frame 2 integrated at frame 0's
+# angle, collapsing its qoop).
+_TIFF_FRAMES = [
+    "Combi4_Angledependence_samz_4p9_03271002_0001.tif",  # th=0.15
+    "Combi4_Angledependence_samz_4p9_03271002_0005.tif",  # th=0.35
+]
 
-    poni = PONI.from_poni_file(
-        str(TIFF / "LaB6_detz190_dety72_th5_03261554_0001.poni")
-    )
-    img_path = TIFF / "Combi4_Angledependence_samz_4p9_03271002_0001.tif"
-    meta = read_image_metadata(str(img_path), meta_format="txt")
-    img = fabio.open(str(img_path)).data.astype(np.float32)
+
+def _load_tiff(name):
+    import fabio
+    from ssrl_xrd_tools.io.metadata import read_image_metadata
+    p = TIFF / name
+    meta = read_image_metadata(str(p), meta_format="txt")
+    img = fabio.open(str(p)).data.astype(np.float32)
+    return img, float(meta["th"]), dict(meta)
+
+
+def _tiff_poni():
+    from ssrl_xrd_tools.core.containers import PONI
+    return PONI.from_poni_file(str(TIFF / _TIFF_PONI))
+
+
+def _tiff_mask(img):
+    import fabio
     mask_edf = fabio.open(str(TIFF / "mask.edf")).data
-    mask = ((mask_edf != 0) | (img < 0)).astype(np.int8)
-    return poni, float(meta["th"]), img, mask
+    return ((mask_edf != 0) | (img < 0)).astype(np.int8)
+
+
+def _load_tiff_frame0():
+    poni = _tiff_poni()
+    img, th, _ = _load_tiff(_TIFF_FRAMES[0])
+    return poni, th, img, _tiff_mask(img)
+
+
+def _integrate_direct(poni, img, mask, incidence, bai_2d_args, sample_orientation=4):
+    """Reference: integrate one frame at its OWN incidence, as the serial
+    path does (fresh fiber integrator per frame)."""
+    from ssrl_xrd_tools.integrate.gid import create_fiber_integrator, integrate_gi_2d
+    fi = create_fiber_integrator(poni, incident_angle=incidence,
+                                 sample_orientation=sample_orientation,
+                                 angle_unit="deg")
+    a = dict(bai_2d_args)
+    return integrate_gi_2d(
+        img, fi, npt_rad=a.get("npt_rad", 500), npt_azim=a.get("npt_azim", 500),
+        method="no", mask=mask,
+        radial_range=a.get("x_range"), azimuth_range=a.get("y_range"),
+    )
+
+
+def _run_batch_parallel(poni, pending_data, mask, *, incidence_motor="th",
+                        sample_orientation=4):
+    """Drive the REAL imageThread._dispatch_batch_parallel on real frames.
+
+    ``pending_data`` is a list of ``(name, img, scan_info)``.
+    xye_only=True skips the Phase-2 HDF5 write but Phase-1 still integrates
+    2D (skip_2d=False) and buffers each integrated frame into _xye_buffer.
+    Returns {img_number: LiveFrame}.  No freeze is applied (we call the
+    parallel dispatcher directly), so every frame auto-ranges at its OWN
+    incidence — exactly the per-frame path the fiber-pool used to break.
+    """
+    from types import SimpleNamespace, MethodType
+    from threading import RLock
+    from ssrl_xrd_tools.integrate.calibration import poni_to_integrator
+    from xdart.modules.reduction import StandardPlanCache
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    scan = SimpleNamespace(
+        skip_2d=False,
+        bai_1d_args={"gi_mode_1d": "q_total"},
+        bai_2d_args={"gi_mode_2d": "qip_qoop", "x_range": None, "y_range": None,
+                     "npt_rad": 500, "npt_azim": 500},
+        _cached_integrator=poni_to_integrator(poni),
+        _cached_fiber_integrator=None,
+        _cached_fiber_integrator_angle=None,
+        _cached_data_mask=None,
+    )
+    w = SimpleNamespace(
+        max_cores=2, gi=True, incidence_motor=incidence_motor,
+        sample_orientation=sample_orientation, tilt_angle=0,
+        series_average=False, mask=mask, poni=poni, command="",
+        batch_mode=True, xye_only=True,
+        apply_threshold=False, threshold_min=0, threshold_max=0,
+        _plan_cache=StandardPlanCache(), _xye_lock=RLock(), _xye_buffer=[],
+        _cached_gi_incident_angle=None,
+        _executor=None, _executor_workers=0,
+        showLabel=SimpleNamespace(emit=lambda *a: None),
+        _middle_truncate=lambda t: t,
+    )
+    # Bind the real wranglerThread helpers (these are the integration path).
+    for meth in ("_resolve_frame_mask", "_prewarm_frame_mask",
+                 "_apply_threshold_inline", "_parallel_integrate",
+                 "_get_executor", "_shutdown_executor"):
+        setattr(w, meth, MethodType(getattr(wranglerThread, meth), w))
+    w._borrow_fiber_integrator = wranglerThread._borrow_fiber_integrator  # staticmethod
+    w._dispatch_batch_serial = MethodType(imageThread._dispatch_batch_serial, w)
+    # Spy on the xye flush: snapshot the Phase-1 integrated frames rather
+    # than writing xye files (and don't clear the buffer).
+    captured = {}
+
+    def _spy_flush(_scan, published_idxs=None):
+        for num, fr in w._xye_buffer:
+            captured[num] = fr
+    w._flush_xye_buffer = _spy_flush
+
+    # bg_raw=0 (no background) — matches _integrate_direct, which uses the
+    # raw image; the real get_background returns 0 when no bg is configured.
+    pending = [(name, i + 1, img, info, 0.0, 0.0)
+               for i, (name, img, info) in enumerate(pending_data)]
+    imageThread._dispatch_batch_parallel(w, scan, pending)
+    return captured
+
+
+def test_batch_parallel_tiff_cakes_nondegenerate_and_match_serial():
+    poni = _tiff_poni()
+    frames = [_load_tiff(n) for n in _TIFF_FRAMES]   # [(img, th, meta), ...]
+    mask = _tiff_mask(frames[0][0])
+    bai = {"gi_mode_2d": "qip_qoop", "x_range": None, "y_range": None,
+           "npt_rad": 500, "npt_azim": 500}
+
+    pending_data = [(name, frames[i][0], frames[i][2])
+                    for i, name in enumerate(_TIFF_FRAMES)]
+    out = _run_batch_parallel(poni, pending_data, mask)
+    assert set(out) == {1, 2}
+
+    for num, (img, th, _meta) in zip((1, 2), frames):
+        batch_i2 = out[num].int_2d
+        assert batch_i2 is not None
+        az = np.asarray(batch_i2.azimuthal, float)
+        # Non-degenerate qoop (the collapse bug gave span ~0.3; real ~5).
+        assert (az.max() - az.min()) > 1.0, f"frame {num} qoop collapsed: {az.min()},{az.max()}"
+        # Each batch frame integrated at ITS OWN incidence == direct ref.
+        ref = _integrate_direct(poni, img, mask, th, bai)
+        assert np.allclose(batch_i2.azimuthal, ref.azimuthal, atol=1e-4), \
+            f"frame {num} (th={th}) qoop != serial-at-own-incidence"
+        assert np.allclose(batch_i2.radial, ref.radial, atol=1e-4)
+        # The angle-dependence guard: frame 2 (th=0.35) must NOT match a
+        # frame-0-incidence integration (the old stale-pool bug).
+        if num == 2:
+            wrong = _integrate_direct(poni, img, mask, frames[0][1], bai)
+            assert not np.allclose(batch_i2.azimuthal, wrong.azimuthal, atol=1e-4), \
+                "frame 2 integrated at frame-0 incidence — stale fiber pool regressed"
+
+
+def test_batch_parallel_eiger_cake_nondegenerate_manual_incidence():
+    # Eiger has no metadata -> incidence supplied manually (the GUI's
+    # Manual Theta path: incidence_motor is the numeric angle string).
+    # The batch must still produce a non-degenerate cake (not all-dummy,
+    # not collapsed).
+    import h5py
+    from ssrl_xrd_tools.core.containers import PONI
+
+    poni_path = next(EIGER.glob("LaB6_detxn26*eta3.poni"), None)
+    if poni_path is None:
+        pytest.skip("eiger poni not found")
+    poni = PONI.from_poni_file(str(poni_path))
+    data_h5 = next(EIGER.glob("*_data_000001.h5"))
+    with h5py.File(str(data_h5), "r") as f:
+        img = np.asarray(f["entry/data/data"][0], dtype=np.float32)
+    mask = (img < 0).astype(np.int8)
+
+    out = _run_batch_parallel(
+        poni, [(data_h5.name, img, {})], mask,
+        incidence_motor="3.0",   # Manual incidence (deg)
+    )
+    i2 = out[1].int_2d
+    assert i2 is not None
+    az = np.asarray(i2.azimuthal, float)
+    # Manual incidence resolved (3.0°), so the qoop axis must be a real
+    # (non-collapsed) range, not the degenerate ~0 of a 0° integration.
+    assert (az.max() - az.min()) > 1.0
+    # And the cake must carry real signal, not an all-dummy grid.
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        _result_intensity_all_dummy,
+    )
+    assert not _result_intensity_all_dummy(i2)
 
 
 def test_eiger_incidence_unresolved_without_metadata():

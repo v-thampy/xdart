@@ -500,26 +500,35 @@ class staticWidget(QWidget):
             info = getattr(frame, "scan_info", None)
             if info:
                 import pandas as pd
-                try:
-                    ser = pd.Series(info, dtype="float64")
-                    with self.scan.scan_lock:
-                        sd = self.scan.scan_data
-                        if list(sd.columns):
-                            sd.loc[idx] = ser
-                            # In-order fast path: frames usually arrive in
-                            # ascending order, so the row just appended is
-                            # already last — skip the O(N log N) sort_index
-                            # on every frame.  Only an out-of-order insert
-                            # (rare: reload/replace) pays for the sort.
-                            index = sd.index
-                            if len(index) >= 2 and index[-1] < index[-2]:
-                                sd.sort_index(inplace=True)
-                        else:
-                            self.scan.scan_data = pd.DataFrame(
-                                info, index=[idx], dtype="float64")
-                except (ValueError, TypeError):
-                    logger.debug("scan_data update skipped for idx=%s", idx,
-                                 exc_info=True)
+                from xdart.modules.ewald.scan import _numeric_scan_info
+                # Keep only numeric-coercible fields — a single non-numeric
+                # value (sample name, "24.4C" temperature, timestamp) would
+                # otherwise make pd.Series(..., dtype="float64") raise and
+                # silently skip the whole row, leaving scan_data empty and
+                # the metadata panel blank in non-batch.  Mirrors
+                # LiveScan.add_frame's _numeric_scan_info filter.
+                numeric_info = _numeric_scan_info(info)
+                if numeric_info:
+                    try:
+                        ser = pd.Series(numeric_info, dtype="float64")
+                        with self.scan.scan_lock:
+                            sd = self.scan.scan_data
+                            if list(sd.columns):
+                                sd.loc[idx] = ser
+                                # In-order fast path: frames usually arrive in
+                                # ascending order, so the row just appended is
+                                # already last — skip the O(N log N) sort_index
+                                # on every frame.  Only an out-of-order insert
+                                # (rare: reload/replace) pays for the sort.
+                                index = sd.index
+                                if len(index) >= 2 and index[-1] < index[-2]:
+                                    sd.sort_index(inplace=True)
+                            else:
+                                self.scan.scan_data = pd.DataFrame(
+                                    numeric_info, index=[idx], dtype="float64")
+                    except (ValueError, TypeError):
+                        logger.debug("scan_data update skipped for idx=%s", idx,
+                                     exc_info=True)
 
         # P4: per-frame the *only* thing we do is remember the latest
         # idx + restart the coalescing timer.  The heavy list-widget

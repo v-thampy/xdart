@@ -146,38 +146,6 @@ def _result_intensity_all_dummy(result, dummy=-1.0):
     return bool(np.all(finite <= dummy))
 
 
-def _gi_debug_dump(tag, img_number, frame, x_range, y_range, sample_orientation):
-    """TEMPORARY batch-vs-non-batch GI diagnostics.
-
-    Dumps, per frame at integration time: the frozen x_range/y_range
-    actually seen by this frame, the incidence angle + sample orientation
-    used, and the resulting qip/qoop extent.  Run tiff batch and tiff
-    non-batch, grep ``[GI-DEBUG]``, and diff the first frame to localize
-    the qoop collapse (stale args snapshot vs degenerate scout vs display).
-    REMOVE once the batch GI cake is fixed.
-    """
-    try:
-        inc = frame._get_incident_angle()
-    except Exception as exc:  # IncidenceAngleUnresolved et al.
-        inc = 'UNRESOLVED(%s)' % exc.__class__.__name__
-    i2 = getattr(frame, 'int_2d', None)
-    az = getattr(i2, 'azimuthal', None) if i2 is not None else None
-    if az is not None and np.size(az):
-        az = np.asarray(az, float)
-        rad = np.asarray(i2.radial, float)
-        qoop = '[%.4g,%.4g]' % (np.nanmin(az), np.nanmax(az))
-        qip = '[%.4g,%.4g]' % (np.nanmin(rad), np.nanmax(rad))
-        unit = '%s/%s' % (getattr(i2, 'unit', ''), getattr(i2, 'azimuthal_unit', ''))
-    else:
-        qoop = qip = unit = 'NO_INT_2D'
-    logger.warning(
-        '[GI-DEBUG] %s frame=%s x_range=%s y_range=%s incidence=%s orient=%s '
-        'qip=%s qoop=%s unit=%s',
-        tag, img_number, x_range, y_range, inc, sample_orientation,
-        qip, qoop, unit,
-    )
-
-
 def _freeze_gi_2d_ranges_from_result(args, result):
     """Freeze missing GI 2D auto-range args from one scout result."""
     x_key, y_key = _gi_2d_range_keys(args)
@@ -1016,12 +984,6 @@ class imageThread(wranglerThread):
                 **dict(args),
             )
             result = getattr(scratch, 'int_2d', None)
-            # TEMPORARY: dump the scout's incidence/orientation + the qoop
-            # extent it produced (this is what gets frozen).  Compare to the
-            # per-frame worker/serial dumps below.  REMOVE after the fix.
-            _gi_debug_dump('scout', img_number, scratch,
-                           dict(args).get(keys[0]), dict(args).get(keys[1]),
-                           self.sample_orientation)
             if result is not None and _result_intensity_all_dummy(result):
                 # Blank scout frame — freezing a grid off it would propagate
                 # an empty cake to the whole scan.  Almost always a degenerate
@@ -1100,49 +1062,23 @@ class imageThread(wranglerThread):
         if (getattr(scan, '_cached_data_mask', None) is None
                 and pending):
             self._prewarm_frame_mask(scan, pending[0][2])
-        # O5: prewarm the fiber integrator from the first pending
-        # frame so the per-worker fiber_pool below is non-None.
-        # Without this every worker built its own fiber integrator
-        # per frame (slow, especially for the first frame of each
-        # worker where pyFAI's CSR LUT cost is paid).  Mirrors the
-        # ``_prewarm_fiber_integrator`` path the NeXus wrangler
-        # already runs before its parallel section.
-        if (self.gi
-                and scan._cached_fiber_integrator is None
-                and pending):
-            try:
-                self._prewarm_fiber_integrator_spec(scan, pending[0])
-            except Exception as e:
-                # Fall through: workers still build their own fiber
-                # integrators per frame, just without the speedup.
-                logger.debug(
-                    "SPEC GI fiber prewarm failed (%s); workers will "
-                    "build their own per-frame", e,
-                )
-        # H2: per-worker fiber-integrator pool (matches IntegratorPool
-        # for the regular AzimuthalIntegrator).  None when GI is off
-        # or when the prewarm hasn't seeded _cached_fiber_integrator
-        # yet — _borrow_fiber_integrator falls back to the per-frame
-        # build in those cases.
-        fiber_pool = (
-            ensure_integrator_pool(
-                scan, '_cached_fiber_integrator', n_workers,
-                pool_attr='_cached_fiber_integrator_pool',
-            )
-            if self.gi and scan._cached_fiber_integrator is not None
-            else None
-        )
-        # Capture the angle the prewarmed fiber integrator was built
-        # for.  When ``gi`` is on and a per-frame frame's incidence
-        # angle drifts from this (i.e. ω varies across the scan, as
-        # opposed to a sin²ψ-style fixed-ω χ/φ scan), the worker has
-        # to fall back to a worker-local fiber integrator built at
-        # the correct angle.  Reusing the prewarm would silently
-        # integrate every frame as if it were at frame 0's incidence.
-        # 1e-4 deg is below the noise floor of beamline motor readouts
-        # and well below pyFAI's solid-angle sensitivity.
-        cached_gi_angle = self._cached_gi_incident_angle
-        _GI_ANGLE_TOL = 1e-4
+        # GI batch builds a FRESH fiber integrator per frame at that
+        # frame's own resolved incidence angle — no prewarm, no pool.
+        #
+        # The pooled/prewarmed fiber integrator was seeded from frame 0's
+        # incidence and reused for frames whose angle matched within tol;
+        # on an angle-dependence scan (ω varies per frame) that silently
+        # integrated later frames at the wrong incidence, collapsing the
+        # qoop axis (the batch GI cake bug).  The pool gave ~no benefit
+        # for angle-dependence scans anyway (every frame's angle differs,
+        # so every frame rebuilt regardless).  An angle-keyed fiber pool
+        # is left as a later optimization.
+        #
+        # ``fiber_pool=None`` makes ``_borrow_fiber_integrator`` build a
+        # fresh integrator from ``frame._get_incident_angle()`` for every
+        # frame (and raise IncidenceAngleUnresolved → frame skipped +
+        # "set Manual theta" — never a degenerate 0°).
+        fiber_pool = None
         skip_2d = scan.skip_2d
         bai_1d_args = dict(scan.bai_1d_args)
         bai_2d_args = dict(scan.bai_2d_args)
@@ -1221,15 +1157,6 @@ class imageThread(wranglerThread):
                     global_mask=mask,
                     legacy_gi=_legacy_gi_for_frame,
                 )
-
-            # TEMPORARY GI diagnostics: parallel batch worker uses the
-            # bai_2d_args SNAPSHOT captured at dispatch (post-freeze).
-            # REMOVE after the fix.
-            if gi:
-                _gi_debug_dump('worker', img_number, frame,
-                               bai_2d_args.get('x_range'),
-                               bai_2d_args.get('y_range'),
-                               sample_orientation)
 
             # Detach the pool integrator from this frame — once the
             # `with` block exited, the next worker can borrow this
@@ -1433,13 +1360,6 @@ class imageThread(wranglerThread):
             global_mask=self.mask,
             legacy_gi=_legacy_gi_for_single,
         )
-        # TEMPORARY GI diagnostics: non-batch path uses the LIVE
-        # scan.bai_2d_args at integration time.  REMOVE after the fix.
-        if self.gi:
-            _gi_debug_dump('serial', img_number, frame,
-                           scan.bai_2d_args.get('x_range'),
-                           scan.bai_2d_args.get('y_range'),
-                           self.sample_orientation)
         # Timing kept for parity with the legacy logging; the
         # standard path now does both 1D + 2D in one call so we
         # bundle the total under _t_1d.
