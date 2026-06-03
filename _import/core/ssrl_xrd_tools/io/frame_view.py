@@ -9,6 +9,7 @@ import h5py
 import numpy as np
 
 from ssrl_xrd_tools.core.frame_view import (
+    Axis,
     FrameGeometry,
     FrameView,
     TwoDKind,
@@ -16,18 +17,7 @@ from ssrl_xrd_tools.core.frame_view import (
     numeric_metadata,
     two_d_kind_from_units,
 )
-from ssrl_xrd_tools.io.read import (
-    _decode,
-    _dequantize_thumbnail,
-    _entry,
-    _frame_index,
-    _resolve_positions,
-    _scan_data_for_frames,
-    _slice_stack,
-    get_1d,
-    get_2d,
-    get_frames,
-)
+from ssrl_xrd_tools.io.read import _decode, _dequantize_thumbnail, _entry
 
 
 def _decode_kind(value, x_unit: str | None, y_unit: str | None) -> TwoDKind:
@@ -39,49 +29,160 @@ def _decode_kind(value, x_unit: str | None, y_unit: str | None) -> TwoDKind:
     return two_d_kind_from_units(x_unit, y_unit)
 
 
-def _read_2d_sigma_and_kind(
-    scan_file: Path,
-    frame: int,
-    *,
-    entry: str,
-) -> tuple[np.ndarray | None, TwoDKind]:
-    with h5py.File(scan_file, "r") as f:
-        e = _entry(f, entry)
-        if "integrated_2d" not in e:
-            return None, TwoDKind.Q_CHI
-        g = e["integrated_2d"]
-        q_unit = _decode(g["q"].attrs.get("units")) if "q" in g and "units" in g["q"].attrs else None
-        chi_unit = _decode(g["chi"].attrs.get("units")) if "chi" in g and "units" in g["chi"].attrs else None
-        kind = _decode_kind(g.attrs.get("two_d_kind"), q_unit, chi_unit)
-        if "sigma" not in g:
-            return None, kind
-        positions, _, single = _resolve_positions(_frame_index(e, prefer="integrated_2d"), frame)
-        return _slice_stack(g["sigma"], positions, single), kind
+def _frame_map(group: h5py.Group | None) -> dict[int, int]:
+    if group is None or "frame_index" not in group:
+        return {}
+    labels = [int(v) for v in np.asarray(group["frame_index"][()]).ravel()]
+    if len(labels) != len(set(labels)):
+        raise ValueError(f"{group.name}/frame_index contains duplicate labels")
+    return {label: row for row, label in enumerate(labels)}
 
 
-def _read_thumbnail(
-    scan_file: Path,
-    frame: int,
-    *,
-    entry: str,
-) -> tuple[np.ndarray | None, bool]:
-    with h5py.File(scan_file, "r") as f:
-        e = _entry(f, entry)
-        fg = e.get(f"frames/frame_{int(frame):04d}")
+def _dataset_unit(group: h5py.Group | None, name: str) -> str | None:
+    if group is None or name not in group or "units" not in group[name].attrs:
+        return None
+    return _decode(group[name].attrs.get("units"))
+
+
+class FrameViewReader:
+    """Reusable reader for many :class:`FrameView` records from one scan.
+
+    The one-shot :func:`read_frame_view` API is convenient for notebooks and
+    selected-frame GUI reads.  Long scans, RSM, stitching, and batch
+    validation need the same contract without reopening the HDF5 file and
+    rereading axes for every frame.  This context manager opens once, caches
+    frame-label maps and axes, and slices only the requested rows.
+    """
+
+    def __init__(
+        self,
+        scan_file: str | Path,
+        *,
+        entry: str = "entry",
+        include_thumbnail: bool = True,
+    ) -> None:
+        self.path = Path(scan_file)
+        self.entry_name = entry
+        self.include_thumbnail = bool(include_thumbnail)
+        self._h5: h5py.File | None = None
+        self._entry: h5py.Group | None = None
+        self._g1: h5py.Group | None = None
+        self._g2: h5py.Group | None = None
+        self._geom: h5py.Group | None = None
+        self._scan_data: h5py.Group | None = None
+        self._map_1d: dict[int, int] = {}
+        self._map_2d: dict[int, int] = {}
+        self._map_geom: dict[int, int] = {}
+        self._map_scan_data: dict[int, int] = {}
+        self._axis_1d: Axis | None = None
+        self._axis_2d_x: Axis | None = None
+        self._axis_2d_y: Axis | None = None
+        self._two_d_kind = TwoDKind.Q_CHI
+
+    def __enter__(self) -> "FrameViewReader":
+        self._h5 = h5py.File(self.path, "r")
+        self._entry = _entry(self._h5, self.entry_name)
+        self._g1 = self._entry.get("integrated_1d")
+        self._g2 = self._entry.get("integrated_2d")
+        self._geom = self._entry.get("per_frame_geometry")
+        self._scan_data = self._entry.get("scan_data")
+        self._map_1d = _frame_map(self._g1)
+        self._map_2d = _frame_map(self._g2)
+        self._map_geom = _frame_map(self._geom)
+        self._map_scan_data = _frame_map(self._scan_data)
+
+        if self._g1 is not None and "q" in self._g1:
+            self._axis_1d = axis_from_unit(
+                _dataset_unit(self._g1, "q"),
+                np.asarray(self._g1["q"][()]),
+            )
+        if self._g2 is not None and "q" in self._g2 and "chi" in self._g2:
+            q_unit = _dataset_unit(self._g2, "q")
+            chi_unit = _dataset_unit(self._g2, "chi")
+            self._axis_2d_x = axis_from_unit(q_unit, np.asarray(self._g2["q"][()]))
+            self._axis_2d_y = axis_from_unit(chi_unit, np.asarray(self._g2["chi"][()]))
+            self._two_d_kind = _decode_kind(
+                self._g2.attrs.get("two_d_kind"), q_unit, chi_unit,
+            )
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._h5 is not None:
+            self._h5.close()
+        self._h5 = None
+        self._entry = None
+
+    def _row(self, mapping: dict[int, int], frame: int) -> int | None:
+        return mapping.get(int(frame))
+
+    def labels(self) -> tuple[int, ...]:
+        """Frame labels known to this scan without reopening the file."""
+
+        labels = set(self._map_1d) | set(self._map_2d) | set(self._map_geom) | set(self._map_scan_data)
+        entry = self._entry
+        if entry is not None and "frames" in entry:
+            for name in entry["frames"]:
+                if not str(name).startswith("frame_"):
+                    continue
+                try:
+                    labels.add(int(str(name).removeprefix("frame_")))
+                except ValueError:
+                    continue
+        return tuple(sorted(labels))
+
+    def _metadata_for_frame(self, frame: int) -> dict[str, object]:
+        row = self._row(self._map_scan_data, frame)
+        group = self._scan_data
+        if row is None or group is None:
+            return {}
+        out: dict[str, object] = {}
+        for key, item in group.items():
+            if key == "frame_index" or not isinstance(item, h5py.Dataset):
+                continue
+            try:
+                arr = np.asarray(item[()])
+                value = arr[row]
+                if np.asarray(value).shape == ():
+                    out[str(key)] = np.asarray(value).item()
+            except (TypeError, ValueError, IndexError):
+                continue
+        return out
+
+    def _geometry_for_frame(self, frame: int) -> FrameGeometry | None:
+        row = self._row(self._map_geom, frame)
+        group = self._geom
+        if row is None or group is None:
+            return None
+
+        def read_scalar(name: str) -> float | None:
+            if name not in group:
+                return None
+            try:
+                return float(np.asarray(group[name][row]).ravel()[0])
+            except (TypeError, ValueError, IndexError):
+                return None
+
+        return FrameGeometry(
+            rot1=read_scalar("rot1"),
+            rot2=read_scalar("rot2"),
+            rot3=read_scalar("rot3"),
+            incident_angle=read_scalar("incident_angle"),
+        )
+
+    def _thumbnail_for_frame(self, frame: int) -> tuple[np.ndarray | None, bool]:
+        entry = self._entry
+        if not self.include_thumbnail or entry is None:
+            return None, False
+        fg = entry.get(f"frames/frame_{int(frame):04d}")
         if fg is None or "thumbnail" not in fg:
             return None, False
         return _dequantize_thumbnail(fg["thumbnail"]), True
 
-
-def _read_source_ref(
-    scan_file: Path,
-    frame: int,
-    *,
-    entry: str,
-) -> tuple[str | None, int | None]:
-    with h5py.File(scan_file, "r") as f:
-        e = _entry(f, entry)
-        fg = e.get(f"frames/frame_{int(frame):04d}")
+    def _source_for_frame(self, frame: int) -> tuple[str | None, int | None]:
+        entry = self._entry
+        if entry is None:
+            return None, None
+        fg = entry.get(f"frames/frame_{int(frame):04d}")
         if fg is None or "source" not in fg:
             return None, None
         src = fg["source"]
@@ -93,34 +194,47 @@ def _read_source_ref(
             source_idx = int(np.asarray(src["frame_index"][()]).ravel()[0])
         return path, source_idx
 
+    def read(self, frame: int) -> FrameView:
+        frame = int(frame)
+        row_1d = self._row(self._map_1d, frame)
+        row_2d = self._row(self._map_2d, frame)
 
-def _read_geometry(
-    scan_file: Path,
-    frame: int,
-    *,
-    entry: str,
-) -> FrameGeometry | None:
-    with h5py.File(scan_file, "r") as f:
-        e = _entry(f, entry)
-        if "per_frame_geometry" not in e:
-            return None
-        g = e["per_frame_geometry"]
-        positions, _, single = _resolve_positions(_frame_index(e, prefer="per_frame_geometry"), frame)
+        intensity_1d = sigma_1d = None
+        if row_1d is not None and self._g1 is not None:
+            intensity_1d = np.asarray(self._g1["intensity"][row_1d])
+            if "sigma" in self._g1:
+                sigma_1d = np.asarray(self._g1["sigma"][row_1d])
 
-        def _read_scalar(name: str) -> float | None:
-            if name not in g:
-                return None
-            value = _slice_stack(g[name], positions, single)
-            try:
-                return float(np.asarray(value).ravel()[0])
-            except (TypeError, ValueError, IndexError):
-                return None
+        intensity_2d = sigma_2d = None
+        if row_2d is not None and self._g2 is not None:
+            intensity_2d = np.asarray(self._g2["intensity"][row_2d])
+            if "sigma" in self._g2:
+                sigma_2d = np.asarray(self._g2["sigma"][row_2d])
 
-        return FrameGeometry(
-            rot1=_read_scalar("rot1"),
-            rot2=_read_scalar("rot2"),
-            rot3=_read_scalar("rot3"),
-            incident_angle=_read_scalar("incident_angle"),
+        thumbnail, mask_baked = self._thumbnail_for_frame(frame)
+        source_path, source_frame_index = self._source_for_frame(frame)
+        metadata_raw = self._metadata_for_frame(frame)
+        geometry = self._geometry_for_frame(frame)
+        incident_angle = None if geometry is None else geometry.incident_angle
+
+        return FrameView(
+            label=frame,
+            axis_1d=self._axis_1d if intensity_1d is not None else None,
+            intensity_1d=intensity_1d,
+            sigma_1d=sigma_1d,
+            axis_2d_x=self._axis_2d_x if intensity_2d is not None else None,
+            axis_2d_y=self._axis_2d_y if intensity_2d is not None else None,
+            intensity_2d=intensity_2d,
+            sigma_2d=sigma_2d,
+            two_d_kind=self._two_d_kind,
+            thumbnail=thumbnail,
+            mask_baked=mask_baked,
+            metadata_raw=metadata_raw,
+            metadata_numeric=numeric_metadata(metadata_raw),
+            incident_angle=incident_angle,
+            geometry=geometry,
+            source_path=source_path,
+            source_frame_index=source_frame_index,
         )
 
 
@@ -137,72 +251,29 @@ def read_frame_view(
     ``(n_frames, chi, q)`` stack.
     """
 
+    with FrameViewReader(
+        scan_file, entry=entry, include_thumbnail=include_thumbnail,
+    ) as reader:
+        return reader.read(int(frame))
+
+
+def read_frame_views(
+    scan_file: str | Path,
+    frames: Iterable[int] | None = None,
+    *,
+    entry: str = "entry",
+    include_thumbnail: bool = True,
+) -> tuple[FrameView, ...]:
+    """Read selected frame labels using one HDF5 open.
+
+    This is the preferred headless API for long scans and future RSM/stitching
+    pipelines that need many per-frame records.
+    """
+
     path = Path(scan_file)
-    result_1d = None
-    try:
-        result_1d = get_1d(path, frame, entry=entry)
-    except KeyError:
-        pass
-
-    result_2d = None
-    try:
-        result_2d = get_2d(path, frame, entry=entry)
-    except KeyError:
-        pass
-
-    sigma_2d = None
-    two_d_kind = TwoDKind.Q_CHI
-    if result_2d is not None:
-        sigma_2d, two_d_kind = _read_2d_sigma_and_kind(path, int(frame), entry=entry)
-
-    thumbnail = None
-    mask_baked = False
-    if include_thumbnail:
-        thumbnail, mask_baked = _read_thumbnail(path, int(frame), entry=entry)
-
-    source_path, source_frame_index = _read_source_ref(path, int(frame), entry=entry)
-    metadata_arrays = _scan_data_for_frames(path, [int(frame)], entry=entry)
-    metadata_raw = {
-        key: np.asarray(value)[0].item()
-        for key, value in metadata_arrays.items()
-        if np.asarray(value).shape[:1] == (1,)
-    }
-    geometry = _read_geometry(path, int(frame), entry=entry)
-    incident_angle = None if geometry is None else geometry.incident_angle
-
-    return FrameView(
-        label=int(frame),
-        axis_1d=(
-            None
-            if result_1d is None
-            else axis_from_unit(result_1d.q_unit, result_1d.q)
-        ),
-        intensity_1d=None if result_1d is None else result_1d.intensity,
-        sigma_1d=None if result_1d is None else result_1d.sigma,
-        axis_2d_x=(
-            None
-            if result_2d is None
-            else axis_from_unit(result_2d.q_unit, result_2d.q)
-        ),
-        axis_2d_y=(
-            None
-            if result_2d is None
-            else axis_from_unit(result_2d.chi_unit, result_2d.chi)
-        ),
-        # get_2d slices the persisted stack, whose convention is already
-        # (axis_2d_y, axis_2d_x); unlike pyFAI result containers, no transpose.
-        intensity_2d=None if result_2d is None else result_2d.intensity,
-        sigma_2d=sigma_2d,
-        two_d_kind=two_d_kind,
-        thumbnail=thumbnail,
-        mask_baked=mask_baked,
-        metadata_raw=metadata_raw,
-        metadata_numeric=numeric_metadata(metadata_raw),
-        incident_angle=incident_angle,
-        geometry=geometry,
-        source_path=source_path,
-        source_frame_index=source_frame_index,
-    )
+    with FrameViewReader(path, entry=entry, include_thumbnail=include_thumbnail) as reader:
+        labels = reader.labels() if frames is None else frames
+        return tuple(reader.read(int(frame)) for frame in labels)
 
 
 def iter_frame_views(
@@ -214,12 +285,9 @@ def iter_frame_views(
 ):
     """Yield :class:`FrameView` objects for selected frame labels."""
 
-    path = Path(scan_file)
-    labels = get_frames(path, entry=entry, union=True) if frames is None else frames
-    for frame in labels:
-        yield read_frame_view(
-            path,
-            int(frame),
-            entry=entry,
-            include_thumbnail=include_thumbnail,
-        )
+    yield from read_frame_views(
+        scan_file,
+        frames,
+        entry=entry,
+        include_thumbnail=include_thumbnail,
+    )

@@ -63,6 +63,8 @@ def test_inspect_nexus_summarizes_xdart_schema_without_loading_arrays(tmp_path):
     assert summary.xdart.is_processed
     assert summary.xdart.frame_labels == (2, 4)
     assert summary.xdart.raw_image_dataset == "/entry/instrument/detector/data"
+    assert summary.xdart.raw_image_shape == (2, 8, 8)
+    assert summary.xdart.raw_image_dtype == "uint16"
     assert summary.xdart.scan_data_columns == ("th",)
     assert summary.xdart.geometry_columns == ("incident_angle",)
     assert summary.xdart.thumbnail_count == 1
@@ -131,6 +133,8 @@ def test_inspect_nexus_does_not_treat_native_frames_group_as_processed(tmp_path)
     assert not summary.xdart.is_processed
     assert summary.xdart.frame_labels == ()
     assert summary.xdart.raw_image_dataset == "/entry/data/data"
+    assert summary.xdart.raw_image_shape == (3, 4, 5)
+    assert summary.xdart.raw_image_dtype == "uint16"
 
 
 def test_inspect_nexus_raw_data_wins_over_reduction_only_marker(tmp_path):
@@ -149,6 +153,7 @@ def test_inspect_nexus_raw_data_wins_over_reduction_only_marker(tmp_path):
     assert not summary.xdart.is_processed
     assert summary.xdart.frame_labels == ()
     assert summary.xdart.raw_image_dataset == "/entry/data/data"
+    assert summary.xdart.raw_image_shape == (1, 4, 5)
 
 
 def test_raw_dataset_search_prunes_frames_subtree(tmp_path):

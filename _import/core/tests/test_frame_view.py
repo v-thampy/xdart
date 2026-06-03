@@ -11,7 +11,7 @@ from ssrl_xrd_tools.core import (
     TwoDKind,
     assert_frameview_equivalent,
 )
-from ssrl_xrd_tools.io import read_frame_view
+from ssrl_xrd_tools.io import read_frame_view, read_frame_views
 from ssrl_xrd_tools.io.nexus import read_scan, write_integrated_stack
 
 
@@ -112,6 +112,51 @@ def test_write_read_frame_view_roundtrips_gi_2d_sigma_kind_and_metadata(tmp_path
     assert loaded.geometry.rot1 == np.float32(0.1)
     assert loaded.source_path == "raw_master.h5"
     assert loaded.source_frame_index == 17
+
+
+def test_read_frame_views_reads_many_labels_with_one_contract(tmp_path):
+    path = tmp_path / "many_frame_views.nxs"
+    r1 = _r1d(1.0)
+    r2 = _r1d(2.0)
+    g1 = _gi_2d(1.0)
+    g2 = _gi_2d(3.0)
+
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("entry")
+        write_integrated_stack(
+            entry,
+            frame_indices=[5, 7],
+            results_1d=[r1, r2],
+            results_2d=[g1, g2],
+        )
+        scan_data = entry.create_group("scan_data")
+        scan_data.create_dataset("frame_index", data=np.array([5, 7], dtype=np.int64))
+        scan_data.create_dataset("monitor", data=np.array([10.0, 20.0], dtype=np.float32))
+
+    views = read_frame_views(path)
+
+    assert [view.label for view in views] == [5, 7]
+    assert_frameview_equivalent(
+        FrameView.from_results(
+            label=5,
+            result_1d=r1,
+            result_2d=g1,
+            metadata_raw={"monitor": 10.0},
+        ),
+        views[0],
+    )
+    assert_frameview_equivalent(
+        FrameView.from_results(
+            label=7,
+            result_1d=r2,
+            result_2d=g2,
+            metadata_raw={"monitor": 20.0},
+        ),
+        views[1],
+    )
+    selected = read_frame_views(path, [7])
+    assert len(selected) == 1
+    assert_frameview_equivalent(views[1], selected[0])
 
 
 def test_frame_view_infers_gi_kind_for_old_files_without_explicit_attr(tmp_path):

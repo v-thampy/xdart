@@ -62,8 +62,10 @@ from ssrl_xrd_tools.io.read import (
     open_scan,
 )
 from ssrl_xrd_tools.io.frame_view import (
+    FrameViewReader,
     iter_frame_views,
     read_frame_view,
+    read_frame_views,
 )
 from ssrl_xrd_tools.io.nexus_inspect import (
     NexusAxisSummary,

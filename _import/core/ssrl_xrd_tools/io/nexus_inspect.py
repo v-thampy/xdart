@@ -8,6 +8,7 @@ HDF5 browser or loading large detector/reduction arrays into memory.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -104,6 +105,8 @@ class NexusXDartSummary:
     thumbnail_count: int = 0
     source_count: int = 0
     raw_image_dataset: str | None = None
+    raw_image_shape: tuple[int, ...] | None = None
+    raw_image_dtype: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,7 +289,8 @@ def _summarize_node(
         )
 
     attrs = _attrs(obj)
-    keys = list(obj.keys())
+    child_count = len(obj)
+    keys = list(islice(obj.keys(), max_children))
     children: list[NexusNodeSummary] = []
     if depth < max_depth:
         for key in keys[:max_children]:
@@ -319,8 +323,8 @@ def _summarize_node(
         attrs=attrs,
         nx_class=_decode(attrs.get("NX_class")),
         children=tuple(children),
-        child_count=len(keys),
-        truncated=len(keys) > len(children),
+        child_count=child_count,
+        truncated=child_count > len(children),
     )
 
 
@@ -336,7 +340,7 @@ def _summarize_xdart_entry(h5: h5py.File, entry: str) -> NexusXDartSummary:
     scan_data_columns = _dataset_names(e.get("scan_data"), exclude={"frame_index"})
     geometry_columns = _dataset_names(e.get("per_frame_geometry"), exclude={"frame_index"})
     thumbnail_count, source_count = _frame_artifact_counts(e)
-    raw_image_dataset = _find_raw_image_dataset(e)
+    raw_image_dataset, raw_image_shape, raw_image_dtype = _find_raw_image_dataset(e)
     is_processed = bool(
         integrated_1d
         or integrated_2d
@@ -355,6 +359,8 @@ def _summarize_xdart_entry(h5: h5py.File, entry: str) -> NexusXDartSummary:
         thumbnail_count=thumbnail_count,
         source_count=source_count,
         raw_image_dataset=raw_image_dataset,
+        raw_image_shape=raw_image_shape,
+        raw_image_dtype=raw_image_dtype,
     )
 
 
@@ -459,7 +465,7 @@ def _frame_artifact_counts(e: h5py.Group) -> tuple[int, int]:
     return thumbnail_count, source_count
 
 
-def _find_raw_image_dataset(e: h5py.Group) -> str | None:
+def _find_raw_image_dataset(e: h5py.Group) -> tuple[str | None, tuple[int, ...] | None, str | None]:
     candidates = (
         f"{e.name}/instrument/detector/data",
         f"{e.name}/data/data",
@@ -467,8 +473,11 @@ def _find_raw_image_dataset(e: h5py.Group) -> str | None:
     for path in candidates:
         root = e.file
         if path in root and isinstance(root[path], h5py.Dataset) and root[path].ndim >= 2:
-            return path
+            ds = root[path]
+            return path, tuple(int(v) for v in ds.shape), str(ds.dtype)
     best_path: str | None = None
+    best_shape: tuple[int, ...] | None = None
+    best_dtype: str | None = None
     best_size = 0
 
     def visit_group(group: h5py.Group, prefix: str = "") -> None:
@@ -486,9 +495,11 @@ def _find_raw_image_dataset(e: h5py.Group) -> str | None:
             if size > best_size:
                 best_size = size
                 best_path = f"{e.name}/{rel}"
+                best_shape = tuple(int(v) for v in obj.shape)
+                best_dtype = str(obj.dtype)
 
     visit_group(e)
-    return best_path
+    return best_path, best_shape, best_dtype
 
 
 def _preview_selection(shape: tuple[int, ...], *, max_items: int) -> Any:
