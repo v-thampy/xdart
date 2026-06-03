@@ -6,6 +6,7 @@
 import logging
 import os
 import time
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -586,6 +587,7 @@ class H5Viewer(QWidget):
     # File extensions for viewer modes
     _IMAGE_EXTS = {'.tif', '.tiff', '.raw', '.edf', '.h5', '.hdf5', '.nxs'}
     _XYE_EXTS = {'.xye'}
+    _NEXUS_EXTS = {'.h5', '.hdf5', '.nxs'}
 
     @staticmethod
     def _natural_sort_key(text):
@@ -598,6 +600,7 @@ class H5Viewer(QWidget):
         In normal mode, shows HDF5 files and directories.
         In image viewer mode, shows image files and directories.
         In xye viewer mode, shows xye files and directories.
+        In nexus viewer mode, shows HDF5/NeXus files and directories.
         """
         if not os.path.exists(self.dirname):
             return
@@ -620,6 +623,9 @@ class H5Viewer(QWidget):
                             lw.addItem(name)
                     elif self.viewer_mode == 'xye':
                         if ext in self._XYE_EXTS:
+                            lw.addItem(name)
+                    elif self.viewer_mode == 'nexus':
+                        if ext in self._NEXUS_EXTS:
                             lw.addItem(name)
                     else:
                         # Normal mode: only HDF5/NeXus scan files
@@ -965,6 +971,9 @@ class H5Viewer(QWidget):
             if self.viewer_mode == 'image':
                 self._load_image_file(fpath)
                 return
+            if self.viewer_mode == 'nexus':
+                self._load_nexus_file(fpath)
+                return
 
             # ── Normal mode: open HDF5 scan ───────────────────────────
             self.set_file(fpath)
@@ -1046,6 +1055,436 @@ class H5Viewer(QWidget):
         self._remember_displayed_frames()
 
         self.sigUpdate.emit()
+
+    def _load_nexus_file(self, fpath):
+        """Inspect a NeXus/HDF5 file without loading large arrays."""
+        from ssrl_xrd_tools.io import inspect_nexus
+
+        with self.data_lock:
+            self.data_1d.clear()
+            self.data_2d.clear()
+            _clear_publication_store_for(self)
+            _clear_raw_cache_for(self)
+        self.frame_ids.clear()
+        was_blocked = self.ui.listData.blockSignals(True)
+        try:
+            self.ui.listData.clear()
+        finally:
+            self.ui.listData.blockSignals(was_blocked)
+
+        try:
+            summary = inspect_nexus(fpath, max_depth=4, max_children=300)
+        except Exception as exc:
+            logger.warning("Could not inspect NeXus file %s: %s", fpath, exc)
+            self.ui.labelCurrent.setText(os.path.basename(fpath))
+            self._remember_displayed_frames()
+            self.sigUpdate.emit()
+            return
+
+        rows = self._nexus_summary_rows(summary)
+        self._viewer_nexus_path = fpath
+        self._viewer_nexus_summary = summary
+
+        with self.data_lock:
+            for row_id, (label, info) in enumerate(rows, start=1):
+                frame = LiveFrame(idx=row_id, static=True, gi=False)
+                frame.scan_info = dict(info)
+                frame.scan_info.setdefault("source_file", os.path.basename(fpath))
+                self.data_1d[row_id] = frame
+
+        was_blocked = self.ui.listData.blockSignals(True)
+        try:
+            self.ui.listData.clear()
+            for row_id, (label, _info) in enumerate(rows, start=1):
+                item = QtWidgets.QListWidgetItem(str(label))
+                item.setData(QtCore.Qt.UserRole, row_id)
+                self.ui.listData.addItem(item)
+            if rows:
+                self.ui.listData.setCurrentRow(0)
+                self.frame_ids.append("1")
+        finally:
+            self.ui.listData.blockSignals(was_blocked)
+
+        self.ui.labelCurrent.setText(os.path.basename(fpath))
+        self._remember_displayed_frames()
+        self.sigUpdate.emit()
+
+    def _refresh_nexus_selected_preview(self, idxs):
+        """Attach a bounded dataset preview to the selected NeXus row."""
+        if not idxs:
+            return
+        try:
+            row_id = int(idxs[0])
+        except (TypeError, ValueError):
+            return
+        viewer_path = getattr(self, "_viewer_nexus_path", None)
+        if not viewer_path:
+            return
+        with self.data_lock:
+            frame = self.data_1d.get(row_id)
+        if frame is None:
+            return
+        info = dict(getattr(frame, "scan_info", None) or {})
+        dataset_path = info.get("dataset_path")
+        if not dataset_path:
+            return
+        frame.nexus_preview_payload = None
+        try:
+            preview = self._load_nexus_preview_payload(viewer_path, info)
+        except Exception as exc:
+            info["preview_error"] = str(exc)
+        else:
+            payload, preview_info = preview
+            frame.nexus_preview_payload = payload
+            info.update(preview_info)
+        frame.scan_info = info
+
+    def _load_nexus_preview_payload(self, viewer_path, info):
+        from ssrl_xrd_tools.io import preview_nexus_dataset, read_nexus_dataset
+
+        dataset_path = info["dataset_path"]
+        shape = tuple(info.get("_shape") or ())
+        preview_kind = info.get("nexus_preview_kind")
+        attrs = dict(info.get("_attrs") or {})
+        label = (
+            attrs.get("long_name")
+            or attrs.get("description")
+            or attrs.get("title")
+            or os.path.basename(str(dataset_path))
+        )
+
+        if preview_kind == "plot_1d":
+            data_selection = self._nexus_1d_selection(shape)
+            data = read_nexus_dataset(
+                viewer_path, dataset_path, selection=data_selection,
+            )
+            y = np.asarray(data.data, dtype=float).ravel()
+            x, x_label, x_unit = self._nexus_axis_values(
+                viewer_path,
+                info.get("x_axis_path"),
+                y.size,
+                info.get("x_label") or "index",
+                info.get("x_unit") or "",
+            )
+            if x.shape != y.shape:
+                x = np.arange(y.size, dtype=float)
+                x_label, x_unit = "index", ""
+            payload = {
+                "kind": "plot_1d",
+                "x": x,
+                "y": y,
+                "x_label": x_label,
+                "x_unit": x_unit,
+                "y_label": info.get("y_label") or str(label),
+                "y_unit": info.get("y_unit") or str(attrs.get("units") or ""),
+                "label": str(label),
+            }
+            preview_info = {
+                "preview_selection": data.selection,
+                "preview_truncated": False,
+                "preview": self._nexus_value(data.data, max_len=800),
+            }
+            return payload, preview_info
+
+        if preview_kind == "image_2d":
+            data_selection, row_sel, col_sel = self._nexus_2d_selection(shape)
+            data = read_nexus_dataset(
+                viewer_path, dataset_path, selection=data_selection,
+            )
+            image = np.asarray(data.data, dtype=float)
+            if image.ndim != 2:
+                image = np.squeeze(image)
+            if image.ndim != 2:
+                raise ValueError(f"Cannot preview {dataset_path}: expected 2D slice")
+            x, x_label, x_unit = self._nexus_axis_values(
+                viewer_path,
+                info.get("x_axis_path"),
+                image.shape[1],
+                info.get("x_label") or "x",
+                info.get("x_unit") or "",
+                axis_selection=col_sel,
+            )
+            y, y_label, y_unit = self._nexus_axis_values(
+                viewer_path,
+                info.get("y_axis_path"),
+                image.shape[0],
+                info.get("y_label") or "y",
+                info.get("y_unit") or "",
+                axis_selection=row_sel,
+            )
+            payload = {
+                "kind": "image_2d",
+                "image": image,
+                "x": x,
+                "y": y,
+                "x_label": x_label,
+                "x_unit": x_unit,
+                "y_label": y_label,
+                "y_unit": y_unit,
+                "label": str(label),
+            }
+            preview_info = {
+                "preview_selection": data.selection,
+                "preview_truncated": bool(self._nexus_selection_truncated(shape, data_selection)),
+                "preview": self._nexus_value(data.data, max_len=800),
+            }
+            return payload, preview_info
+
+        preview = preview_nexus_dataset(viewer_path, dataset_path, max_items=64)
+        return None, {
+            "preview_selection": preview.selection,
+            "preview_truncated": bool(preview.truncated),
+            "preview": self._nexus_value(preview.data, max_len=800),
+        }
+
+    @staticmethod
+    def _nexus_1d_selection(shape):
+        if len(shape) <= 1:
+            return np.s_[:]
+        return tuple(0 for _ in range(len(shape) - 1)) + (slice(None),)
+
+    @staticmethod
+    def _nexus_2d_selection(shape, *, max_pixels=262144):
+        if len(shape) < 2:
+            raise ValueError("2D preview needs at least two dataset dimensions")
+        rows, cols = int(shape[-2]), int(shape[-1])
+        stride = max(1, int(math.ceil(math.sqrt(max(1, rows * cols) / max_pixels))))
+        row_sel = slice(None, None, stride)
+        col_sel = slice(None, None, stride)
+        return (
+            tuple(0 for _ in range(len(shape) - 2)) + (row_sel, col_sel),
+            row_sel,
+            col_sel,
+        )
+
+    @staticmethod
+    def _nexus_selection_truncated(shape, selection):
+        if not isinstance(selection, tuple):
+            selection = (selection,)
+        if len(selection) != len(shape):
+            return True
+        for sel, dim in zip(selection, shape):
+            if isinstance(sel, slice):
+                start, stop, step = sel.indices(dim)
+                if start != 0 or stop != dim or step != 1:
+                    return True
+            elif dim != 1:
+                return True
+        return False
+
+    def _nexus_axis_values(
+        self,
+        viewer_path,
+        axis_path,
+        length,
+        label,
+        unit,
+        *,
+        axis_selection=None,
+    ):
+        if not axis_path:
+            return np.arange(length, dtype=float), label, unit
+        try:
+            from ssrl_xrd_tools.io import read_nexus_dataset
+            selection = axis_selection if axis_selection is not None else np.s_[:]
+            axis = read_nexus_dataset(viewer_path, axis_path, selection=selection)
+            values = np.asarray(axis.data, dtype=float).ravel()
+            attrs = dict(axis.attrs)
+            label = (
+                attrs.get("long_name")
+                or attrs.get("description")
+                or attrs.get("title")
+                or label
+            )
+            unit = attrs.get("units") or unit
+        except Exception:
+            logger.debug("Could not load NeXus axis %s", axis_path, exc_info=True)
+            values = np.arange(length, dtype=float)
+        return values, str(label), str(unit or "")
+
+    def _nexus_summary_rows(self, summary):
+        rows = []
+        path = getattr(summary, "path", "")
+        xdart = getattr(summary, "xdart", None)
+        rows.append((
+            "File summary",
+            {
+                "kind": "file",
+                "path": path,
+                "entries": ", ".join(getattr(summary, "entries", ()) or ()),
+                "processed_xdart": bool(getattr(xdart, "is_processed", False)),
+            },
+        ))
+        if xdart is not None:
+            rows.extend(self._nexus_xdart_rows(xdart))
+        rows.extend(self._nexus_tree_rows(getattr(summary, "tree", None)))
+        return rows
+
+    def _nexus_xdart_rows(self, xdart):
+        rows = []
+        if xdart.integrated_1d is not None:
+            rows.append((
+                "Integrated 1D",
+                self._nexus_reduced_info(xdart.integrated_1d),
+            ))
+        if xdart.integrated_2d is not None:
+            info = self._nexus_reduced_info(xdart.integrated_2d)
+            info["two_d_kind"] = getattr(xdart.integrated_2d.two_d_kind, "value", None)
+            rows.append(("Integrated 2D", info))
+        rows.append((
+            "Scan metadata",
+            {
+                "kind": "scan_data",
+                "columns": ", ".join(xdart.scan_data_columns),
+                "frame_labels": self._nexus_value(xdart.frame_labels),
+            },
+        ))
+        if xdart.geometry_columns:
+            rows.append((
+                "Per-frame geometry",
+                {
+                    "kind": "per_frame_geometry",
+                    "columns": ", ".join(xdart.geometry_columns),
+                },
+            ))
+        if xdart.thumbnail_count or xdart.source_count:
+            rows.append((
+                "Frame records",
+                {
+                    "kind": "frames",
+                    "frame_count": len(xdart.frame_labels),
+                    "thumbnail_count": xdart.thumbnail_count,
+                    "source_count": xdart.source_count,
+                },
+            ))
+        if xdart.raw_image_dataset:
+            rows.append((
+                "Raw detector dataset",
+                {
+                    "kind": "raw_dataset",
+                    "dataset_path": xdart.raw_image_dataset,
+                },
+            ))
+        return rows
+
+    def _nexus_reduced_info(self, reduced):
+        axes = [
+            f"{axis.name} {axis.shape}"
+            + (f" [{axis.units}]" if axis.units else "")
+            for axis in reduced.axes
+        ]
+        axis_by_name = {axis.name: axis for axis in reduced.axes}
+        intensity_shape = tuple(reduced.intensity_shape or ())
+        info = {
+            "kind": "reduced_stack",
+            "path": reduced.path,
+            "dataset_path": f"{reduced.path}/intensity",
+            "_shape": intensity_shape,
+            "frame_count": reduced.frame_count,
+            "frame_labels": self._nexus_value(reduced.frame_labels),
+            "intensity_shape": self._nexus_value(intensity_shape),
+            "axes": "; ".join(axes),
+            "y_label": "Intensity",
+        }
+        if len(reduced.axes) == 1:
+            q_axis = reduced.axes[0]
+            info.update({
+                "nexus_preview_kind": "plot_1d",
+                "x_axis_path": q_axis.path,
+                "x_label": q_axis.name,
+                "x_unit": q_axis.units or "",
+            })
+        elif len(reduced.axes) >= 2:
+            q_axis = axis_by_name.get("q") or reduced.axes[-1]
+            chi_axis = axis_by_name.get("chi") or reduced.axes[-2]
+            info.update({
+                "nexus_preview_kind": "image_2d",
+                "x_axis_path": q_axis.path,
+                "x_label": q_axis.name,
+                "x_unit": q_axis.units or "",
+                "y_axis_path": chi_axis.path,
+                "y_label": chi_axis.name,
+                "y_unit": chi_axis.units or "",
+            })
+        return info
+
+    def _nexus_tree_rows(self, root, *, max_nodes=200):
+        if root is None:
+            return []
+        rows = []
+
+        def walk(node, depth=0):
+            if len(rows) >= max_nodes:
+                return
+            if getattr(node, "path", "/") != "/":
+                prefix = "  " * max(0, depth - 1)
+                shape = getattr(node, "shape", None)
+                dtype = getattr(node, "dtype", None)
+                suffix = ""
+                if shape is not None:
+                    suffix = f" {shape}"
+                    if dtype:
+                        suffix += f" {dtype}"
+                label = f"{prefix}{getattr(node, 'path', '')}{suffix}"
+                info = {
+                    "kind": getattr(node, "kind", ""),
+                    "path": getattr(node, "path", ""),
+                    "shape": self._nexus_value(shape),
+                    "_shape": tuple(shape or ()),
+                    "dtype": dtype or "",
+                    "nx_class": getattr(node, "nx_class", None) or "",
+                    "attrs": self._nexus_value(getattr(node, "attrs", {})),
+                    "_attrs": dict(getattr(node, "attrs", {}) or {}),
+                }
+                if getattr(node, "kind", "") == "dataset":
+                    info["dataset_path"] = getattr(node, "path", "")
+                    rank = len(tuple(shape or ()))
+                    if rank == 1:
+                        info["nexus_preview_kind"] = "plot_1d"
+                        info["x_label"] = "index"
+                        attrs = dict(getattr(node, "attrs", {}) or {})
+                        info["y_label"] = (
+                            attrs.get("long_name")
+                            or attrs.get("description")
+                            or attrs.get("title")
+                            or getattr(node, "name", "")
+                            or "value"
+                        )
+                        info["y_unit"] = attrs.get("units", "")
+                    elif rank >= 2:
+                        info["nexus_preview_kind"] = "image_2d"
+                        attrs = dict(getattr(node, "attrs", {}) or {})
+                        info["x_label"] = "column"
+                        info["y_label"] = "row"
+                        info["z_label"] = (
+                            attrs.get("long_name")
+                            or attrs.get("description")
+                            or attrs.get("title")
+                            or getattr(node, "name", "")
+                            or "value"
+                        )
+                        info["z_unit"] = attrs.get("units", "")
+                if getattr(node, "error", None):
+                    info["error"] = node.error
+                rows.append((label, info))
+            for child in getattr(node, "children", ()):
+                walk(child, depth + 1)
+
+        walk(root)
+        return rows
+
+    @staticmethod
+    def _nexus_value(value, *, max_len=240):
+        value = "" if value is None else value
+        if isinstance(value, dict):
+            text = ", ".join(f"{k}={v}" for k, v in value.items())
+        elif isinstance(value, (list, tuple)):
+            text = ", ".join(str(v) for v in value)
+        else:
+            text = str(value)
+        if len(text) > max_len:
+            return text[: max_len - 3] + "..."
+        return text
 
     def _load_image_file(self, fpath):
         """Load an image file for viewing.
@@ -1363,6 +1802,12 @@ class H5Viewer(QWidget):
                 self.frame_ids += sorted(
                     [str(item.data(QtCore.Qt.UserRole)) for item in items
                      if item.data(QtCore.Qt.UserRole) is not None])
+            elif self.viewer_mode == 'nexus':
+                # NeXus viewer rows are schema/preview records, not scan
+                # frame labels; keep their stable numeric ids in UserRole.
+                self.frame_ids += sorted(
+                    [str(item.data(QtCore.Qt.UserRole)) for item in items
+                     if item.data(QtCore.Qt.UserRole) is not None])
             else:
                 self.frame_ids += sorted([str(item.text()) for item in items])
             idxs = self.frame_ids
@@ -1401,6 +1846,12 @@ class H5Viewer(QWidget):
 
         # ── XYE viewer: data already loaded by scans_clicked ─────────
         if self.viewer_mode == 'xye':
+            self.sigUpdate.emit()
+            return
+
+        # ── NeXus viewer: metadata row already loaded; refresh preview ─
+        if self.viewer_mode == 'nexus':
+            self._refresh_nexus_selected_preview(idxs)
             self.sigUpdate.emit()
             return
 

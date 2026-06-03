@@ -201,6 +201,44 @@ def test_image_viewer_does_not_depend_on_scan_frames():
     assert state.panel(dl.PanelRole.RAW_2D).has_data is True
 
 
+def test_nexus_viewer_routes_previewable_rows_to_plot_or_image():
+    empty = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.NEXUS_VIEWER,
+        selected_ids=(4,),
+        all_frame_index=[],
+        loaded_1d_keys=set(),
+        loaded_2d_keys=set(),
+    ))
+    assert empty.load_status is dl.LoadStatus.EMPTY
+    assert not empty.panel(dl.PanelRole.PLOT_1D).has_data
+    assert not empty.panel(dl.PanelRole.RAW_2D).has_data
+
+    one_d = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.NEXUS_VIEWER,
+        selected_ids=(4,),
+        all_frame_index=[],
+        loaded_1d_keys={4},
+        loaded_2d_keys=set(),
+    ))
+    assert one_d.load_status is dl.LoadStatus.READY
+    assert one_d.render_ids == (4,)
+    assert one_d.panel(dl.PanelRole.PLOT_1D).has_data
+    assert not one_d.panel(dl.PanelRole.RAW_2D).has_data
+
+    two_d = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.NEXUS_VIEWER,
+        selected_ids=(5,),
+        all_frame_index=[],
+        loaded_1d_keys=set(),
+        loaded_2d_keys={5},
+        raw_availability={5: dict(has_raw=True, has_thumbnail=False)},
+    ))
+    assert two_d.load_status is dl.LoadStatus.READY
+    assert two_d.render_ids == (5,)
+    assert two_d.panel(dl.PanelRole.RAW_2D).has_data
+    assert not two_d.panel(dl.PanelRole.PLOT_1D).has_data
+
+
 def test_load_status_transitions():
     # EMPTY: nothing selected.
     empty = dl.compute_display_state(**_base_state_kwargs(

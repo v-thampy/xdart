@@ -50,7 +50,7 @@ from .display_data import DisplayDataMixin
 from .display_plot import DisplayPlotMixin
 from .display_logic import (
     Mode, LoadStatus, PanelRole, compute_display_state,
-    build_payload, render_plan, controller_for,
+    build_payload, render_plan, controller_for, ImagePayload,
     resolve_selection, resolve_render_ids,
     xye_unit_from_filename, x_axis_for_unit, default_plot_unit,
 )
@@ -279,6 +279,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._plot_axis_info = []  # populated by set_axes()
         self._was_skip_2d = False  # track 1D-only state for transitions
         self._payload_x_axis_label = None
+        self._payload_y_axis_label = None
         self._using_publication_plot_payload = False
 
         # Cached display data
@@ -475,6 +476,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return Mode.IMAGE_VIEWER
         if self.viewer_mode == 'xye':
             return Mode.XYE_VIEWER
+        if self.viewer_mode == 'nexus':
+            return Mode.NEXUS_VIEWER
         if getattr(self.scan, 'skip_2d', False):
             return Mode.INT_1D
         return Mode.INT_2D
@@ -506,6 +509,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if self.viewer_mode == 'image' and len(self.data_2d) == 0:
                 return False
             if self.viewer_mode == 'xye' and len(self.data_1d) == 0:
+                return False
+            if self.viewer_mode == 'nexus' and len(self.data_1d) == 0:
                 return False
             return True
 
@@ -572,7 +577,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return None
 
     def _draw_payload(self, role, payload_value, state):
-        if role is not PanelRole.PLOT_1D or payload_value is None:
+        if payload_value is None:
+            return False
+
+        if role in (PanelRole.RAW_2D, PanelRole.CAKE_2D):
+            if not isinstance(payload_value, ImagePayload):
+                return False
+            return self._draw_image_payload(role, payload_value)
+
+        if role is not PanelRole.PLOT_1D:
             return False
 
         traces = tuple(getattr(payload_value, "traces", ()) or ())
@@ -606,6 +619,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.overlaid_idxs = list(state.render_ids)
         axis = payload_value.axis_x
         self._payload_x_axis_label = (axis.label, axis.unit)
+        axis_y = getattr(payload_value, "axis_y", None)
+        self._payload_y_axis_label = (
+            (axis_y.label, axis_y.unit) if axis_y is not None else None
+        )
 
         if ref_x.size == 0 or ydata.size == 0 or not np.isfinite(ydata).any():
             self.clear_plot_view()
@@ -620,6 +637,47 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.update_plot_view()
         finally:
             self._using_publication_plot_payload = False
+        return True
+
+    def _draw_image_payload(self, role, payload):
+        data = np.asarray(payload.image, dtype=float)
+        if data.ndim != 2 or data.size == 0 or not np.isfinite(data).any():
+            if role is PanelRole.RAW_2D:
+                self.clear_image_view()
+            else:
+                self.clear_binned_view()
+            return True
+
+        def _axis_values(axis, size):
+            values = getattr(axis, "values", None)
+            if values is None:
+                return np.arange(size)
+            values = np.asarray(values, dtype=float)
+            if values.shape != (size,):
+                return np.arange(size)
+            return values
+
+        # pyqtgraph images expect the first array axis to map to x and the
+        # second to y.  HDF5 image-like datasets are conventionally
+        # (rows=y, columns=x), so transpose for display.
+        image = data.T
+        x = _axis_values(payload.axis_x, image.shape[0])
+        y = _axis_values(payload.axis_y, image.shape[1])
+        rect = get_rect(x, y)
+        widget = self.image_widget if role is PanelRole.RAW_2D else self.binned_widget
+        display_data = _downsample_for_display(image, widget)
+        widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
+        widget.setRect(rect)
+        widget.image_plot.setLabel(
+            "bottom", payload.axis_x.label, units=payload.axis_x.unit,
+        )
+        widget.image_plot.setLabel(
+            "left", payload.axis_y.label, units=payload.axis_y.unit,
+        )
+        if role is PanelRole.RAW_2D:
+            self.image_data = (image, rect)
+        else:
+            self.binned_data = (image, rect)
         return True
 
     def render_display(self, state, payload):
@@ -663,13 +721,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # legacy update(): normal-mode draws caught only TypeError (a
         # missing-data frame) and let anything else propagate; the viewer
         # draws were wrapped in a broad debug-logged guard.
-        is_viewer = mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER)
+        is_viewer = mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER, Mode.NEXUS_VIEWER)
         for role in plan.draw:
             payload_value = self._payload_for_role(role, payload)
             if payload_value is not None and self._draw_payload(role, payload_value, state):
                 continue
             if role is PanelRole.PLOT_1D:
                 self._payload_x_axis_label = None
+                self._payload_y_axis_label = None
             draw = self._draw_delegate(role, mode)
             if draw is None:
                 continue
@@ -1235,6 +1294,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self.legend.clear()
             if getattr(self, 'wf_widget', None) is not None:
                 self.wf_widget.setImage(np.zeros((2, 2)))
+            self._payload_x_axis_label = None
+            self._payload_y_axis_label = None
         except Exception:
             logger.debug("clear_plot_view failed", exc_info=True)
 
@@ -1252,6 +1313,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         Args:
             mode: 'image' — show only the raw 2D image panel,
                   'xye'   — show only the 1D plot panel,
+                  'nexus' — show title-only center; details are in metadata,
                   None    — restore normal layout.
         """
         # Stage 2: a mode switch must invalidate any stale render computed
@@ -1260,11 +1322,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._bump_display_generation()
         self.viewer_mode = mode
         self._viewer_x_axis_label = None
-        is_viewer = mode in ('image', 'xye')
+        self._payload_x_axis_label = None
+        self._payload_y_axis_label = None
+        is_viewer = mode in ('image', 'xye', 'nexus')
         if mode == 'image':
             title = 'Image Viewer'
         elif mode == 'xye':
             title = 'XYE Viewer'
+        elif mode == 'nexus':
+            title = 'NeXus Viewer'
         else:
             title = ''
         # A mode transition must not carry the previous mode's visible
@@ -1304,6 +1370,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.imageWindow.setMaximumHeight(85)
             self.ui.plotWindow.setMinimumHeight(200)
             self.ui.plotWindow.setMaximumHeight(16777215)
+        elif mode == 'nexus':
+            # Schema/detail view with bounded dataset previews: selected
+            # 1D datasets draw in the plot panel, selected 2D datasets draw
+            # in the image panel, and metadata-only rows blank both.
+            self.ui.frame_top.setVisible(True)
+            self.ui.twoDWindow.setVisible(True)
+            self.ui.imageToolbar.setVisible(False)
+            self.ui.imageWindow.setMinimumHeight(200)
+            self.ui.imageWindow.setMaximumHeight(16777215)
+            self.ui.plotWindow.setMinimumHeight(200)
+            self.ui.plotWindow.setMaximumHeight(16777215)
+            self.ui.binnedFrame.setMaximumWidth(0)
+            self.ui.binnedFrame.setMinimumWidth(0)
+            self._showImageBtn.setVisible(False)
         else:
             # Normal mode — restore panels + the middle control bar.
             self.ui.frame_top.setVisible(True)

@@ -25,8 +25,18 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
+
 from .display_logic import (
-    Mode, compute_display_state, build_payload, register_controller,
+    Axis,
+    DisplayPayload,
+    ImagePayload,
+    Mode,
+    PlotPayload,
+    Trace,
+    compute_display_state,
+    build_payload,
+    register_controller,
 )
 from .display_publication import (
     PublicationDisplayAdapter,
@@ -39,6 +49,7 @@ __all__ = [
     "ScanDisplayController",
     "ImageViewerController",
     "XYEViewerController",
+    "NexusViewerController",
     "register_default_controllers",
 ]
 
@@ -148,10 +159,119 @@ class XYEViewerController(_BaseController):
     x-axis comes from the file prefix, not the integration-unit combo (§8)."""
 
 
+class NexusViewerController(_BaseController):
+    """Read-only NeXus schema viewer.
+
+    The actual HDF5 walking lives in ``ssrl_xrd_tools.io.inspect_nexus``.
+    This controller consumes the row preview published by ``H5Viewer``:
+    1D previews draw as plots, 2D previews draw as bounded images, and
+    metadata-only rows intentionally clear both panels.
+    """
+
+    def compute_state(self, widget, mode):
+        loaded_1d, loaded_2d, raw_avail = set(), set(), {}
+        with widget.data_lock:
+            for key, frame in widget.data_1d.items():
+                payload = getattr(frame, "nexus_preview_payload", None)
+                if not isinstance(payload, dict):
+                    continue
+                kind = payload.get("kind")
+                if kind == "plot_1d":
+                    loaded_1d.add(int(key))
+                elif kind == "image_2d":
+                    loaded_2d.add(int(key))
+                    raw_avail[int(key)] = {
+                        "has_raw": True,
+                        "has_thumbnail": False,
+                    }
+        return compute_display_state(
+            mode=mode,
+            selected_ids=list(widget.frame_ids),
+            all_frame_index=[],
+            loaded_1d_keys=loaded_1d,
+            loaded_2d_keys=loaded_2d,
+            gi=False,
+            plot_unit='q_A^-1',
+            method=widget.ui.plotMethod.currentText(),
+            unit_changed=False,
+            prev_overlaid_ids=tuple(widget.overlaid_idxs),
+            raw_availability=raw_avail,
+            titles={},
+            generation=widget.display_generation,
+        )
+
+    def build_payload(self, widget, state):
+        if not state.render_ids:
+            return DisplayPayload(
+                generation=state.generation,
+                raw_image=None,
+                cake_image=None,
+                plot=None,
+            )
+        idx = int(state.render_ids[0])
+        with widget.data_lock:
+            frame = widget.data_1d.get(idx)
+        payload = getattr(frame, "nexus_preview_payload", None) if frame else None
+        if not isinstance(payload, dict):
+            return DisplayPayload(
+                generation=state.generation,
+                raw_image=None,
+                cake_image=None,
+                plot=None,
+            )
+        kind = payload.get("kind")
+        if kind == "plot_1d":
+            x = np.asarray(payload.get("x", ()), dtype=float)
+            y = np.asarray(payload.get("y", ()), dtype=float)
+            axis_x = Axis(
+                str(payload.get("x_label") or "index"),
+                str(payload.get("x_unit") or ""),
+            )
+            axis_y = Axis(
+                str(payload.get("y_label") or "value"),
+                str(payload.get("y_unit") or ""),
+            )
+            trace = Trace(str(payload.get("label") or idx), x=x, y=y)
+            plot = PlotPayload(axis_x=axis_x, axis_y=axis_y, traces=(trace,))
+            return DisplayPayload(
+                generation=state.generation,
+                raw_image=None,
+                cake_image=None,
+                plot=plot,
+            )
+        if kind == "image_2d":
+            image = np.asarray(payload.get("image", ()), dtype=float)
+            axis_x = Axis(
+                str(payload.get("x_label") or "x"),
+                str(payload.get("x_unit") or ""),
+                values=np.asarray(payload.get("x", ()), dtype=float)
+                if payload.get("x") is not None else None,
+            )
+            axis_y = Axis(
+                str(payload.get("y_label") or "y"),
+                str(payload.get("y_unit") or ""),
+                values=np.asarray(payload.get("y", ()), dtype=float)
+                if payload.get("y") is not None else None,
+            )
+            return DisplayPayload(
+                generation=state.generation,
+                raw_image=ImagePayload(image=image, axis_x=axis_x, axis_y=axis_y),
+                cake_image=None,
+                plot=None,
+            )
+        return DisplayPayload(
+            generation=state.generation,
+            raw_image=None,
+            cake_image=None,
+            plot=None,
+        )
+
+
 # Singleton adapters (stateless) registered for each mode.
 _SCAN = ScanDisplayController()
 _IMAGE = ImageViewerController()
 _XYE = XYEViewerController()
+_NEXUS = NexusViewerController()
 
 
 def register_default_controllers():
@@ -161,6 +281,7 @@ def register_default_controllers():
     register_controller(Mode.INT_2D, _SCAN)
     register_controller(Mode.IMAGE_VIEWER, _IMAGE)
     register_controller(Mode.XYE_VIEWER, _XYE)
+    register_controller(Mode.NEXUS_VIEWER, _NEXUS)
 
 
 # Register on import so simply importing this module (or display_frame_widget)

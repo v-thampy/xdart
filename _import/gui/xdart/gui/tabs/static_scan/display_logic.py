@@ -51,6 +51,7 @@ __all__ = [
     "Axis",
     "Trace",
     "PlotPayload",
+    "ImagePayload",
     "ResultsView",
     "DisplayState",
     "DisplayPayload",
@@ -80,6 +81,7 @@ class Mode(Enum):
     INT_2D = "int_2d"
     IMAGE_VIEWER = "image_viewer"
     XYE_VIEWER = "xye_viewer"
+    NEXUS_VIEWER = "nexus_viewer"
 
 
 class PanelRole(Enum):
@@ -148,6 +150,7 @@ class Axis:
     label: str
     unit: str = ""
     log: bool = False
+    values: "np.ndarray | None" = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +170,15 @@ class PlotPayload:
     """Resolved content of a 1D plot panel: an x-axis plus layered traces."""
     axis_x: Axis
     traces: tuple = ()   # tuple[Trace, ...]
+    axis_y: "Axis | None" = None
+
+
+@dataclass(frozen=True)
+class ImagePayload:
+    """Resolved content of a 2D image panel."""
+    image: "np.ndarray"
+    axis_x: Axis = Axis("x", "")
+    axis_y: Axis = Axis("y", "")
 
 
 @dataclass(frozen=True)
@@ -232,8 +244,8 @@ class DisplayPayload:
     came from integration, stitch or a reload; only the controller that
     produced it knew, and it is gone by the time we render."""
     generation: int                 # must match the DisplayState it pairs with
-    raw_image: "np.ndarray | None"
-    cake_image: "np.ndarray | None"
+    raw_image: "np.ndarray | ImagePayload | None"
+    cake_image: "np.ndarray | ImagePayload | None"
     plot: "PlotPayload | None"      # 1D traces (§10 seam 2)
 
 
@@ -515,7 +527,10 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
 
     render_1d = resolve_render_ids(ids, overall, all_frame_index, loaded_1d)
     render_2d = resolve_render_ids(ids, overall, all_frame_index, loaded_2d)
-    primary = render_1d if mode in _PLOT_PRIMARY_MODES else render_2d
+    if mode is Mode.NEXUS_VIEWER:
+        primary = render_2d if render_2d else render_1d
+    else:
+        primary = render_1d if mode in _PLOT_PRIMARY_MODES else render_2d
 
     x_label, _sym = x_axis_for_unit(plot_unit)
 
@@ -565,7 +580,17 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     cake_key = PanelKey(PanelRole.CAKE_2D)
     plot_key = PanelKey(PanelRole.PLOT_1D)
 
-    if mode in (Mode.IMAGE_VIEWER,):
+    if mode in (Mode.NEXUS_VIEWER,):
+        raw_panel = PanelPlan(
+            visible=True,
+            has_data=ready and bool(render_2d),
+            source=RawSource.RAW if render_2d else RawSource.NONE,
+            apply_mask=False,
+        )
+        plot_panel = PanelPlan(visible=True, has_data=ready and bool(render_1d))
+        panels = ((raw_key, raw_panel), (plot_key, plot_panel))
+        layout = ((raw_key,), (plot_key,))
+    elif mode in (Mode.IMAGE_VIEWER,):
         panels = ((raw_key, raw_panel),)
         layout = ((raw_key,),)
     elif mode in (Mode.XYE_VIEWER, Mode.INT_1D):

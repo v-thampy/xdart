@@ -994,6 +994,8 @@ class staticWidget(QWidget):
         try:
             # Keep integratorTree enabled so mask/threshold controls remain accessible
             self.h5viewer.viewer_mode = viewer_mode
+            if hasattr(self, "metawidget"):
+                self.metawidget.viewer_mode = viewer_mode
             # Give displayframe a reference to the wrangler for mask/threshold
             self.displayframe._wrangler = self.wrangler if is_viewer else None
             # In viewer mode, disable New/Save (keep Open Folder and Export)

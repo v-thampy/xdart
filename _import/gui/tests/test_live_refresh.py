@@ -11,6 +11,8 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from pyqtgraph.Qt import QtCore
+
 from xdart.gui.tabs.static_scan.h5viewer import H5Viewer
 from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
 from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
@@ -20,11 +22,29 @@ from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
 class _FakeItem:
     def __init__(self, text):
-        self._text = str(text)
+        if hasattr(text, "text"):
+            self._text = str(text.text())
+            self._data = {}
+            try:
+                from pyqtgraph.Qt import QtCore
+                value = text.data(QtCore.Qt.UserRole)
+                if value is not None:
+                    self._data[QtCore.Qt.UserRole] = value
+            except Exception:
+                pass
+        else:
+            self._text = str(text)
+            self._data = {}
         self._selected = False
 
     def text(self):
         return self._text
+
+    def setData(self, role, value):
+        self._data[role] = value
+
+    def data(self, role):
+        return self._data.get(role)
 
     def setSelected(self, selected):
         self._selected = bool(selected)
@@ -41,7 +61,7 @@ class _FakeListWidget:
         self._items.extend(_FakeItem(item) for item in items)
 
     def addItem(self, item):
-        self._items.append(_FakeItem(item))
+        self._items.append(item if isinstance(item, _FakeItem) else _FakeItem(item))
 
     def insertItems(self, row, items):
         for offset, item in enumerate(items):
@@ -897,7 +917,13 @@ def test_default_controllers_registered():
     # core mode, so the widget never dispatches to a missing handler.
     from xdart.gui.tabs.static_scan import display_controllers  # noqa: F401
     from xdart.gui.tabs.static_scan.display_logic import controller_for, Mode
-    for mode in (Mode.INT_1D, Mode.INT_2D, Mode.IMAGE_VIEWER, Mode.XYE_VIEWER):
+    for mode in (
+        Mode.INT_1D,
+        Mode.INT_2D,
+        Mode.IMAGE_VIEWER,
+        Mode.XYE_VIEWER,
+        Mode.NEXUS_VIEWER,
+    ):
         assert controller_for(mode) is not None
 
 
@@ -1458,6 +1484,260 @@ def test_processed_xdart_markers_still_short_circuit_image_loader(tmp_path):
         f.create_group("entry/frames")     # native eiger group, no content
     info = ImageViewerController.classify(str(bare_frames))
     assert info.kind is not ImageSourceKind.PROCESSED_XDART
+
+
+def _bind_nexus_viewer_methods(viewer):
+    for name in (
+        "_load_nexus_file",
+        "_refresh_nexus_selected_preview",
+        "_load_nexus_preview_payload",
+        "_nexus_1d_selection",
+        "_nexus_2d_selection",
+        "_nexus_selection_truncated",
+        "_nexus_axis_values",
+        "_nexus_summary_rows",
+        "_nexus_xdart_rows",
+        "_nexus_reduced_info",
+        "_nexus_tree_rows",
+        "_nexus_value",
+        "data_changed",
+        "_remember_displayed_frames",
+    ):
+        if isinstance(H5Viewer.__dict__.get(name), staticmethod):
+            setattr(viewer, name, getattr(H5Viewer, name))
+        else:
+            setattr(viewer, name, MethodType(getattr(H5Viewer, name), viewer))
+
+
+def _nexus_viewer_host(tmp_path):
+    from PySide6 import QtWidgets
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    viewer = SimpleNamespace(
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+        frame_ids=[],
+        viewer_mode="nexus",
+        ui=SimpleNamespace(
+            listData=_FakeListWidget(),
+            labelCurrent=_FakeLabel(),
+        ),
+        _raw_cache_order=[],
+        publication_store=None,
+        sigUpdate=_FakeSignal(),
+        dirname=str(tmp_path),
+        scan=SimpleNamespace(
+            name="null_main",
+            frames=SimpleNamespace(index=[]),
+            scan_lock=RLock(),
+        ),
+    )
+    _bind_nexus_viewer_methods(viewer)
+    return viewer
+
+
+def _write_viewer_nexus_file(path):
+    import h5py
+
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+
+        g1 = entry.create_group("integrated_1d")
+        g1.attrs["NX_class"] = "NXdata"
+        g1.attrs["signal"] = "intensity"
+        g1.attrs["axes"] = ["frame_index", "q"]
+        g1.create_dataset("frame_index", data=np.array([10, 11]))
+        q = g1.create_dataset("q", data=np.linspace(0.5, 2.5, 5))
+        q.attrs["units"] = "q_A^-1"
+        q.attrs["long_name"] = "Q"
+        y = g1.create_dataset(
+            "intensity",
+            data=np.arange(10, dtype=float).reshape(2, 5),
+        )
+        y.attrs["units"] = "counts"
+        y.attrs["long_name"] = "Integrated intensity"
+
+        g2 = entry.create_group("integrated_2d")
+        g2.attrs["NX_class"] = "NXdata"
+        g2.attrs["signal"] = "intensity"
+        g2.attrs["axes"] = ["frame_index", "chi", "q"]
+        g2.create_dataset("frame_index", data=np.array([10, 11]))
+        q2 = g2.create_dataset("q", data=np.linspace(-1.0, 1.0, 4))
+        q2.attrs["units"] = "qip_A^-1"
+        q2.attrs["long_name"] = "Qip"
+        chi = g2.create_dataset("chi", data=np.linspace(0.0, 3.0, 3))
+        chi.attrs["units"] = "qoop_A^-1"
+        chi.attrs["long_name"] = "Qoop"
+        g2.create_dataset(
+            "intensity",
+            data=np.arange(24, dtype=float).reshape(2, 3, 4),
+        )
+
+        generic = entry.create_dataset("generic_1d", data=np.array([1.0, 2.0, 3.0]))
+        generic.attrs["units"] = "arb"
+        generic.attrs["description"] = "Generic signal"
+
+
+def test_nexus_viewer_loads_rows_and_previews_1d_2d_units(tmp_path):
+    path = tmp_path / "viewer.nxs"
+    _write_viewer_nexus_file(path)
+    viewer = _nexus_viewer_host(tmp_path)
+
+    viewer._load_nexus_file(str(path))
+
+    labels = [viewer.ui.listData.item(i).text() for i in range(viewer.ui.listData.count())]
+    assert "Integrated 1D" in labels
+    assert "Integrated 2D" in labels
+    assert viewer.frame_ids == ["1"]
+    assert viewer.ui.labelCurrent.text == path.name
+
+    row_1d = labels.index("Integrated 1D")
+    viewer.ui.listData.setCurrentRow(row_1d)
+    viewer.data_changed()
+    key_1d = viewer.ui.listData.item(row_1d).data(QtCore.Qt.UserRole)
+    payload_1d = viewer.data_1d[key_1d].nexus_preview_payload
+    assert payload_1d["kind"] == "plot_1d"
+    assert payload_1d["x_unit"] == "q_A^-1"
+    assert payload_1d["x_label"] == "Q"
+    assert payload_1d["y_label"] == "Intensity"
+    np.testing.assert_allclose(payload_1d["x"], np.linspace(0.5, 2.5, 5))
+    np.testing.assert_allclose(payload_1d["y"], np.arange(5, dtype=float))
+    assert viewer.data_1d[key_1d].scan_info["preview_selection"] == "[0, :]"
+
+    row_2d = labels.index("Integrated 2D")
+    viewer.ui.listData.setCurrentRow(row_2d)
+    viewer.data_changed()
+    key_2d = viewer.ui.listData.item(row_2d).data(QtCore.Qt.UserRole)
+    payload_2d = viewer.data_1d[key_2d].nexus_preview_payload
+    assert payload_2d["kind"] == "image_2d"
+    assert payload_2d["image"].shape == (3, 4)
+    assert payload_2d["x_label"] == "Qip"
+    assert payload_2d["x_unit"] == "qip_A^-1"
+    assert payload_2d["y_label"] == "Qoop"
+    assert payload_2d["y_unit"] == "qoop_A^-1"
+
+
+def test_nexus_controller_builds_plot_and_image_payloads(tmp_path):
+    from xdart.gui.tabs.static_scan.display_logic import (
+        ImagePayload,
+        Mode,
+        PanelRole,
+        controller_for,
+    )
+
+    path = tmp_path / "viewer.nxs"
+    _write_viewer_nexus_file(path)
+    viewer = _nexus_viewer_host(tmp_path)
+    viewer.display_generation = 4
+    viewer.overlaid_idxs = []
+    viewer.ui.plotMethod = _FakeCombo("Single")
+    viewer._load_nexus_file(str(path))
+    labels = [viewer.ui.listData.item(i).text() for i in range(viewer.ui.listData.count())]
+
+    row_1d = labels.index("Integrated 1D")
+    viewer.ui.listData.setCurrentRow(row_1d)
+    viewer.data_changed()
+    ctrl = controller_for(Mode.NEXUS_VIEWER)
+    state = ctrl.compute_state(viewer, Mode.NEXUS_VIEWER)
+    payload = ctrl.build_payload(viewer, state)
+    assert state.panel(PanelRole.PLOT_1D).has_data
+    assert not state.panel(PanelRole.RAW_2D).has_data
+    assert payload.plot.axis_x.unit == "q_A^-1"
+    assert payload.plot.axis_y.label == "Intensity"
+
+    row_2d = labels.index("Integrated 2D")
+    viewer.ui.listData.setCurrentRow(row_2d)
+    viewer.data_changed()
+    state = ctrl.compute_state(viewer, Mode.NEXUS_VIEWER)
+    payload = ctrl.build_payload(viewer, state)
+    assert state.panel(PanelRole.RAW_2D).has_data
+    assert not state.panel(PanelRole.PLOT_1D).has_data
+    assert isinstance(payload.raw_image, ImagePayload)
+    assert payload.raw_image.axis_x.unit == "qip_A^-1"
+    assert payload.raw_image.axis_y.unit == "qoop_A^-1"
+
+
+def test_nexus_viewer_real_xdart_processed_file_smoke():
+    path = (
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        + "/test_data/xdart_processed_data/"
+        + "Combi4_Angledependence_samz_4p9_03271002.nxs"
+    )
+    if not os.path.exists(path):
+        import pytest
+        pytest.skip("local xdart processed test data is not available")
+
+    viewer = _nexus_viewer_host(os.path.dirname(path))
+    viewer.display_generation = 11
+    viewer.overlaid_idxs = []
+    viewer.ui.plotMethod = _FakeCombo("Single")
+
+    viewer._load_nexus_file(path)
+
+    labels = [viewer.ui.listData.item(i).text() for i in range(viewer.ui.listData.count())]
+    assert "Integrated 1D" in labels
+    assert "Integrated 2D" in labels
+
+    row_1d = labels.index("Integrated 1D")
+    viewer.ui.listData.setCurrentRow(row_1d)
+    viewer.data_changed()
+    key_1d = viewer.ui.listData.item(row_1d).data(QtCore.Qt.UserRole)
+    payload_1d = viewer.data_1d[key_1d].nexus_preview_payload
+    assert payload_1d["kind"] == "plot_1d"
+    assert payload_1d["x"].size == payload_1d["y"].size
+    assert payload_1d["x_unit"]
+
+    row_2d = labels.index("Integrated 2D")
+    viewer.ui.listData.setCurrentRow(row_2d)
+    viewer.data_changed()
+    key_2d = viewer.ui.listData.item(row_2d).data(QtCore.Qt.UserRole)
+    payload_2d = viewer.data_1d[key_2d].nexus_preview_payload
+    assert payload_2d["kind"] == "image_2d"
+    assert payload_2d["image"].ndim == 2
+    assert payload_2d["image"].size > 0
+
+
+def test_metadata_panel_nexus_viewer_uses_selected_row_not_scan_table():
+    import pandas as pd
+    from PySide6 import QtWidgets
+    from PySide6.QtCore import QModelIndex
+    from xdart.gui.tabs.static_scan.metadata import metadataWidget
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    frame = SimpleNamespace(
+        idx=3,
+        scan_info={"kind": "dataset", "path": "/entry/data", "_attrs": {"hidden": True}},
+    )
+    scan = SimpleNamespace(
+        scan_data=pd.DataFrame({"stale_scan_value": [1.0]}, index=[3]),
+    )
+    mw = metadataWidget(
+        scan,
+        None,
+        ["3"],
+        {},
+        data_1d={3: frame},
+        data_lock=RLock(),
+    )
+    mw.viewer_mode = "nexus"
+
+    frame_widget = QtWidgets.QFrame()
+    frame_widget.setLayout(mw.layout)
+    win = QtWidgets.QWidget()
+    QtWidgets.QVBoxLayout(win).addWidget(frame_widget)
+    win.show()
+    app.processEvents()
+
+    mw.update()
+    model = mw.tableview.model()
+    assert "kind" in list(model.dataFrame.index)
+    assert "path" in list(model.dataFrame.index)
+    assert "stale_scan_value" not in list(model.dataFrame.index)
+    assert "_attrs" not in list(model.dataFrame.index)
+    assert model.rowCount(QModelIndex()) == 2
+    win.close()
 
 
 def test_image_viewer_missing_raw_and_thumbnail_clears_panel():
@@ -2049,16 +2329,17 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
 def test_wrangler_enabled_reapplies_viewer_mode_controls():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
-    host = _wrangler_host("Image Viewer", live=True, batch=True)
+    for mode in ("Image Viewer", "XYE Viewer", "NeXus Viewer"):
+        host = _wrangler_host(mode, live=True, batch=True)
 
-    imageWrangler.enabled(host, True)
+        imageWrangler.enabled(host, True)
 
-    assert host.ui.liveCheckBox.isChecked() is False
-    assert host.ui.liveCheckBox.isEnabled() is False
-    assert host.ui.batchCheckBox.isEnabled() is False
-    assert host.ui.frame.isVisible() is False
-    assert host._integration_controls_enabled is False
-    assert host.thread.live_mode is False
+        assert host.ui.liveCheckBox.isChecked() is False
+        assert host.ui.liveCheckBox.isEnabled() is False
+        assert host.ui.batchCheckBox.isEnabled() is False
+        assert host.ui.frame.isVisible() is False
+        assert host._integration_controls_enabled is False
+        assert host.thread.live_mode is False
 
 
 def test_wrangler_enabled_reapplies_xye_mode_controls():

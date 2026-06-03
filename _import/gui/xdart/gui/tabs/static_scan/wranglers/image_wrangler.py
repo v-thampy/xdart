@@ -491,7 +491,7 @@ class imageWrangler(wranglerWidget):
     def _on_mode_changed(self, *args):
         """Update all flags from the processing mode dropdown and checkboxes."""
         mode_text = self.ui.processingModeCombo.currentText()
-        is_viewer = mode_text in ('Image Viewer', 'XYE Viewer')
+        is_viewer = mode_text in ('Image Viewer', 'XYE Viewer', 'NeXus Viewer')
         is_xye = mode_text == 'Int 1D (XYE)'
 
         # Pre-process state overrides
@@ -558,6 +558,9 @@ class imageWrangler(wranglerWidget):
             self.scan.skip_2d = False
         elif mode_text == 'XYE Viewer':
             self.viewer_mode = 'xye'
+            self.scan.skip_2d = False
+        elif mode_text == 'NeXus Viewer':
+            self.viewer_mode = 'nexus'
             self.scan.skip_2d = False
         else:
             self.viewer_mode = None

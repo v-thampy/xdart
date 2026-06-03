@@ -323,6 +323,10 @@ class DisplayPlotMixin:
         self.plot.getAxis("left").setLogMode(False)
         self.plot.getAxis("bottom").setLogMode(False)
         ylabel = f'{int_label} (a.u.)'
+        payload_y_axis = getattr(self, '_payload_y_axis_label', None)
+        if payload_y_axis is not None:
+            y_label, y_unit = payload_y_axis
+            ylabel = y_label
         if self.scale == 'Log':
             if ydata.size == 0:
                 return
@@ -374,7 +378,10 @@ class DisplayPlotMixin:
 
         _xl, _xu = self._current_plot_axis_label()
         self.plot.setLabel("bottom", _xl, units=_xu)
-        self.plot.setLabel("left", ylabel)
+        if payload_y_axis is not None:
+            self.plot.setLabel("left", ylabel, units=y_unit)
+        else:
+            self.plot.setLabel("left", ylabel)
 
         return s_xdata, s_ydata
 

@@ -68,6 +68,7 @@ class Ui_Form(object):
             "Int 1D (XYE)",
             "Image Viewer",
             "XYE Viewer",
+            "NeXus Viewer",
         ])
         # The dropdown popup's current-item check column is removed
         # globally in the dark theme (QComboBox QAbstractItemView::indicator)
@@ -152,4 +153,3 @@ class Ui_Form(object):
         self.startButton.setText(QCoreApplication.translate("Form", u"Start", None))
         self.stopButton.setText(QCoreApplication.translate("Form", u"Stop", None))
     # retranslateUi
-

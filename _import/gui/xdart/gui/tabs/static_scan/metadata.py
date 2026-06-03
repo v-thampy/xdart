@@ -48,6 +48,7 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         self.data_1d = data_1d
         self.publication_store = publication_store
         self.data_lock = data_lock if data_lock is not None else threading.RLock()
+        self.viewer_mode = None
 
     def showEvent(self, event):
         """Refresh when the panel becomes visible — ``update()`` short-
@@ -124,7 +125,12 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         if not self.tableview.isVisible():
             return
         sd = getattr(self.scan, "scan_data", None)
-        if sd is not None and len(sd.index) and len(sd.columns):
+        if (
+            self.viewer_mode is None
+            and sd is not None
+            and len(sd.index)
+            and len(sd.columns)
+        ):
             self.tableview.setModel(DFTableModel(sd.transpose()))
             return
         # No whole-scan table — fall back to the selected frame's info.
@@ -135,7 +141,12 @@ class metadataWidget(Qt.QtWidgets.QWidget):
             return
         selected = self._resolve_selected_frame()
         if selected is not None and getattr(selected, "scan_info", None):
-            data = pd.DataFrame(selected.scan_info, index=[selected.idx])
+            visible_info = {
+                key: value
+                for key, value in selected.scan_info.items()
+                if not str(key).startswith("_")
+            }
+            data = pd.DataFrame(visible_info, index=[selected.idx])
             self.tableview.setModel(DFTableModel(data.transpose()))
             return
         self.tableview.setModel(DFTableModel())
