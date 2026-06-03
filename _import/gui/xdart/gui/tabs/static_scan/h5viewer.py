@@ -32,6 +32,16 @@ from xdart.utils.h5pool import get_pool
 from pyqtgraph import Qt
 from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
 
+try:
+    # shiboken validity check: True only while the C++ half of a QObject is
+    # still alive.  Used to avoid touching / GC-deleting a moveToThread'd
+    # worker whose ``deleteLater`` has already run (which crashes with
+    # "QObject: shared QObject was deleted directly").
+    from shiboken6 import isValid as _qt_isvalid
+except Exception:  # pragma: no cover - non-PySide6 / headless fallback
+    def _qt_isvalid(obj):
+        return obj is not None
+
 
 QTreeWidget = QtWidgets.QTreeWidget
 QTreeWidgetItem = QtWidgets.QTreeWidgetItem
@@ -58,8 +68,8 @@ class _LoadFramesWorker(QtCore.QObject):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.chunkLoaded.connect(viewer._absorb_chunk)
+        worker.finished.connect(worker.deleteLater)  # before quit (see below)
         worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -1382,6 +1392,9 @@ class H5Viewer(QWidget):
         self.sigUpdate.emit()
 
     def closeEvent(self, event):
+        # Retire any in-flight load worker before teardown so the interpreter
+        # doesn't GC-delete a still-running moveToThread'd QObject at shutdown.
+        self._teardown_load_worker()
         self._h5pool.close_all()
         super().closeEvent(event)
 
@@ -1481,14 +1494,13 @@ class H5Viewer(QWidget):
         """
         if not frame_ids:
             return
-        # Cancel any in-flight worker.  We don't wait — the worker's
-        # run loop checks the cancel flag between reads and exits
-        # cleanly on its own; the new worker can start immediately.
-        if self._load_worker is not None:
-            try:
-                self._load_worker.cancel()
-            except (RuntimeError, AttributeError):
-                pass
+        # Deterministically retire any in-flight worker BEFORE we drop our
+        # refs to it: cancel + quit + bounded wait so its event loop runs
+        # the worker's deleteLater and exits.  Dropping the ref without this
+        # (the old non-waiting cancel) let GC direct-delete a moveToThread'd
+        # worker whose deleteLater lost the race with thread.quit → "shared
+        # QObject was deleted directly" segfault.
+        self._teardown_load_worker()
 
         # Spin up the new worker.  Lives on its own QThread; both get
         # cleaned up after ``finished`` signals via deleteLater.
@@ -1518,8 +1530,13 @@ class H5Viewer(QWidget):
         # ``load_2d`` rides in the signal payload (4th arg) now.
         worker.chunkLoaded.connect(self._absorb_chunk)
         thread.started.connect(worker.run)
-        worker.finished.connect(thread.quit)
+        # Order matters: post the worker's deferred delete BEFORE asking the
+        # thread to quit, so the deleteLater is queued ahead of the event
+        # loop exit and gets processed on the worker thread.  (quit-first
+        # could stop the loop before the deferred delete ran, leaving the
+        # C++ worker for GC to direct-delete → crash.)
         worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
         thread.finished.connect(thread.deleteLater)
         # Drop refs after the thread is done so a later cancel() call
         # on a stale handle doesn't accidentally talk to a deleted
@@ -1598,13 +1615,13 @@ class H5Viewer(QWidget):
 
     def cancel_pending_loads(self) -> None:
         """Cancel stale background frame hydration and reject queued chunks."""
+        # Bump first so any chunk still queued from the outgoing worker is
+        # dropped by the generation gate in _absorb_chunk.
         self._load_generation += 1
-        worker = getattr(self, '_load_worker', None)
-        if worker is not None:
-            try:
-                worker.cancel()
-            except (RuntimeError, AttributeError):
-                pass
+        # Validity-guarded, deterministic teardown (cancel + quit + wait +
+        # null) — never touch or GC-delete a half-deleted moveToThread'd
+        # worker.
+        self._teardown_load_worker()
         timer = getattr(self, '_update_coalesce_timer', None)
         if timer is not None and timer.isActive():
             timer.stop()
@@ -1645,23 +1662,65 @@ class H5Viewer(QWidget):
         finally:
             scans.blockSignals(was_blocked)
 
+    def _teardown_load_worker(self) -> None:
+        """Stop + wait for the in-flight load worker/thread, THEN drop refs.
+
+        This is the only safe way to retire a ``moveToThread``'d worker:
+        we must let the worker thread's event loop run its
+        ``worker.deleteLater`` and exit before the Python reference is
+        dropped, otherwise GC tries to delete the C++ QObject directly and
+        the process crashes with "shared QObject was deleted directly".
+
+        * Every access is guarded with :func:`_qt_isvalid` so we never
+          touch a half-deleted worker.
+        * ``thread.quit(); thread.wait(2000)`` blocks the GUI thread
+          briefly (bounded, only at scan / selection boundaries) until the
+          worker's loop has fully exited — processing the deferred delete.
+        """
+        worker = getattr(self, '_load_worker', None)
+        thread = getattr(self, '_load_thread', None)
+        if worker is not None and _qt_isvalid(worker):
+            try:
+                worker.cancel()
+            except (RuntimeError, AttributeError):
+                pass
+        if thread is not None and _qt_isvalid(thread):
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    # Bounded wait: let the worker's event loop process the
+                    # posted deleteLater and exit before we release the ref.
+                    if not thread.wait(2000):
+                        logger.warning(
+                            "load thread did not exit within 2s; leaving "
+                            "refs for its finished-slot to clear")
+                        return
+            except (RuntimeError, AttributeError):
+                pass
+        self._load_worker = None
+        self._load_thread = None
+
     def _clear_load_worker_refs(self) -> None:
         """Drop ``_load_worker`` / ``_load_thread`` once the worker
         signals finished — but ONLY if our handle still points at
-        that worker.
+        that thread, and only by nulling (never by calling methods or
+        forcing deletion).
 
         Self-review fix #3: queued ``thread.finished`` slot for
         worker A can arrive AFTER ``load_frames_data`` has already
-        assigned worker B to ``self._load_worker``.  Pre-fix this
-        slot would null out worker B's handle, leaving the next
-        selection unable to ``cancel()`` it.  Identity-gate the
-        clear so only the actually-finished worker's slot wins.
+        assigned worker B to ``self._load_worker``.  Identity-gate the
+        clear so only the actually-finished thread's slot wins.
 
-        The sender is the QThread of the worker that finished;
-        compare to ``self._load_thread`` to identify it.
+        Race-safety: by the time this fires, ``worker.deleteLater`` has
+        already been processed by the worker's event loop (it is connected
+        BEFORE ``thread.quit`` — see :meth:`load_frames_data`), so the C++
+        objects are gone and nulling the Python handles can't trigger a
+        direct-delete of a live QObject.  We do NOT call any method on the
+        worker/thread here, and we only act on an exact identity match — a
+        stale or already-deleted sender is ignored.
         """
         sender = self.sender()
-        if sender is None or sender is self._load_thread:
+        if sender is not None and sender is self._load_thread:
             self._load_worker = None
             self._load_thread = None
             # O6: force one final sigUpdate so the burst's final

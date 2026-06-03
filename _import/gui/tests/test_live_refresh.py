@@ -931,6 +931,9 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     viewer._remember_displayed_frames = MethodType(
         H5Viewer._remember_displayed_frames, viewer,
     )
+    viewer._teardown_load_worker = MethodType(
+        H5Viewer._teardown_load_worker, viewer,
+    )
     viewer.cancel_pending_loads = MethodType(H5Viewer.cancel_pending_loads, viewer)
     viewer.enter_viewer_mode_cleanup = MethodType(
         H5Viewer.enter_viewer_mode_cleanup, viewer,
