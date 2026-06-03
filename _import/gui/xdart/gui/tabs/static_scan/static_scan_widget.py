@@ -579,7 +579,7 @@ class staticWidget(QWidget):
         self.h5viewer.update_data(emit_update=False)
         if self.h5viewer.auto_last:
             self.latest_frame(emit_update=False)
-        self.h5viewer.data_changed()
+        self.h5viewer.data_changed()  # → sigUpdate → set_data → metawidget.update()
 
     def disable_auto_last(self, q):
         """
@@ -792,9 +792,16 @@ class staticWidget(QWidget):
         # screen until this scan's first frame replaces it.
         if self.h5viewer.live_run_active:
             try:
+                import pandas as pd
                 with self.scan.scan_lock:
                     self.scan.frames.index.clear()
                     self.scan.frames._in_memory.clear()
+                    # Drop the previous scan's whole-scan metadata table so the
+                    # panel resets when a new scan starts; update_data rebuilds
+                    # it from this scan's frames.  Batch resets via its reload
+                    # path — the live run skips that, so without this the stale
+                    # table lingered and metawidget.update() below re-rendered it.
+                    self.scan.scan_data = pd.DataFrame()
             except AttributeError:
                 pass
 
