@@ -1095,23 +1095,50 @@ def test_reduction_group_raw_nexus_loads_as_generic_image(tmp_path):
 
 def test_processed_xdart_markers_still_short_circuit_image_loader(tmp_path):
     import h5py
+    import numpy as np
     from ssrl_xrd_tools.io import ImageSourceKind
     from xdart.gui.tabs.static_scan.display_controllers import (
         ImageViewerController,
     )
 
-    for marker in ("integrated_1d", "integrated_2d", "frames"):
+    # An integrated stack is an unambiguous xdart-processed marker, even when
+    # the group is otherwise bare.
+    for marker in ("integrated_1d", "integrated_2d"):
         path = tmp_path / f"processed_{marker}.nxs"
         with h5py.File(path, "w") as f:
             entry = f.create_group("entry")
             entry.create_group(marker)
 
-        # Stage 5: classification is the ssrl boundary; these markers must
-        # classify as a processed xdart file (not a raw detector image).
+        # Classification is the ssrl boundary; these markers must classify as a
+        # processed xdart file (not a raw detector image).
         info = ImageViewerController.classify(str(path))
         assert info.kind in (
             ImageSourceKind.PROCESSED_XDART, ImageSourceKind.THUMBNAIL_ONLY,
         )
+
+    # A ``frames`` group only marks a processed file when it carries real frame
+    # content (thumbnail/source).  A *bare* ``entry/frames`` is the native eiger
+    # group and must NOT be read as processed-xdart (regression: that misread
+    # made the Image Viewer refuse genuine raw eiger files).
+    frames_path = tmp_path / "processed_frames.nxs"
+    with h5py.File(frames_path, "w") as f:
+        e = f.create_group("entry")
+        thumb = np.linspace(0, 100, 16 * 16).reshape(16, 16)
+        q = (thumb / thumb.max() * 255.0).astype(np.uint8)
+        ds = e.create_dataset("frames/frame_0000/thumbnail", data=q)
+        ds.attrs["vmin"] = 0.0
+        ds.attrs["vmax"] = 100.0
+        ds.attrs["dtype"] = "uint8"
+    info = ImageViewerController.classify(str(frames_path))
+    assert info.kind in (
+        ImageSourceKind.PROCESSED_XDART, ImageSourceKind.THUMBNAIL_ONLY,
+    )
+
+    bare_frames = tmp_path / "bare_frames.nxs"
+    with h5py.File(bare_frames, "w") as f:
+        f.create_group("entry/frames")     # native eiger group, no content
+    info = ImageViewerController.classify(str(bare_frames))
+    assert info.kind is not ImageSourceKind.PROCESSED_XDART
 
 
 def test_image_viewer_missing_raw_and_thumbnail_clears_panel():
