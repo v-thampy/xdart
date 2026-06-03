@@ -48,6 +48,13 @@ from .display_constants import (
 )
 from .display_data import DisplayDataMixin
 from .display_plot import DisplayPlotMixin
+from .display_logic import (
+    Mode, LoadStatus, PanelRole, compute_display_state,
+    build_payload, render_plan, controller_for,
+    resolve_selection, resolve_render_ids,
+    xye_unit_from_filename, x_axis_for_unit, default_plot_unit,
+)
+from .display_controllers import register_default_controllers
 
 QFileDialog = QtWidgets.QFileDialog
 QInputDialog = QtWidgets.QInputDialog
@@ -250,6 +257,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.idxs_1d = []
         self.idxs_2d = []
         self.overall = False
+
+        # Stage 2: monotonic display generation.  Bumped on the events that
+        # must invalidate a stale render — mode switch, new selection, new
+        # scan/file load — so a worker result computed against an old
+        # generation can be dropped (full enforcement lands in Stage 5).
+        self.display_generation = 0
+        self._last_selection_sig = None
+
+        # Stage 5: register the mode controllers (Scan/ImageViewer/XYEViewer)
+        # into the open registry; _live_display_state dispatches through them.
+        register_default_controllers()
+
         self.get_idxs()
 
         # Plotting variables
@@ -403,24 +422,92 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         with self.data_lock:
             with self.scan.scan_lock:
-                if len(self.frame_ids) == len(self.scan.frames.index) > 1:
-                    self.overall = True
-                    self.idxs = sorted(np.asarray(self.scan.frames.index, dtype=int))
-                else:
-                    self.overall = False
-                    self.idxs = sorted(self.frame_ids)
+                # Stage 1: selection logic is the pure ``resolve_selection``
+                # / ``resolve_render_ids`` (unit-tested headlessly).
+                try:
+                    ids, self.overall = resolve_selection(
+                        self.frame_ids, self.scan.frames.index)
+                except ValueError:
+                    return
 
-            try:
-                self.idxs = list(np.asarray(self.idxs, dtype=int))
-            except ValueError:
-                return
+            self.idxs = list(ids)
             # Snapshot current dict keys while the lock is held, then release
             # before doing list-comprehension work.
             data_1d_keys = set(self.data_1d.keys())
             data_2d_keys = set(self.data_2d.keys())
 
-        self.idxs_1d = [int(idx) for idx in self.idxs if idx in data_1d_keys]
-        self.idxs_2d = [int(idx) for idx in self.idxs if idx in data_2d_keys]
+        # ``ids`` is already the effective set (all-or-selected), so intersect
+        # it directly with the loaded keys for each panel.
+        self.idxs_1d = list(resolve_render_ids(ids, False, (), data_1d_keys))
+        self.idxs_2d = list(resolve_render_ids(ids, False, (), data_2d_keys))
+
+    # ── Display generation (Stage 2) ──────────────────────────────────
+
+    def _bump_display_generation(self):
+        """Advance the monotonic display generation.  A render/worker result
+        stamped with an older generation is stale and may be dropped (full
+        enforcement: Stage 5)."""
+        self.display_generation += 1
+        return self.display_generation
+
+    def _note_selection_generation(self):
+        """Bump the generation when the *effective* selection changes.
+
+        Keyed on the resolved ``idxs`` (+ overall), so it is robust to how
+        ``frame_ids`` was mutated (assignment, ``.clear()``, ``.append()``).
+        A new scan/file load resets the selection, so this also covers most
+        load events; explicit load-lifecycle bumps land with the
+        controllers in Stage 5.  The first call only records the baseline."""
+        sig = (tuple(self.idxs), bool(self.overall))
+        if sig != self._last_selection_sig:
+            if self._last_selection_sig is not None:
+                self._bump_display_generation()
+            self._last_selection_sig = sig
+
+    def _live_mode(self):
+        """Map the widget's viewer state to a :class:`Mode`.  Normal mode is
+        INT_1D when the scan is 1D-only (skip_2d) — plot-only, matching
+        _apply_1d_only_visibility — else INT_2D (raw|cake / plot)."""
+        if self.viewer_mode == 'image':
+            return Mode.IMAGE_VIEWER
+        if self.viewer_mode == 'xye':
+            return Mode.XYE_VIEWER
+        if getattr(self.scan, 'skip_2d', False):
+            return Mode.INT_1D
+        return Mode.INT_2D
+
+    def _live_display_state(self):
+        """Build the :class:`DisplayState` for the current widget inputs by
+        dispatching to the mode controller (Stage 5).
+
+        The single place the GUI snapshots its state for the display layer.
+        Each controller owns its mode's selection rules — viewer controllers
+        never consult scan.frames or the integration unit (§8); the scan
+        controller reads the scan frame index for Overall aggregation."""
+        mode = self._live_mode()
+        return controller_for(mode).compute_state(self, mode)
+
+    def _shadow_check_display_state(self, state=None):
+        """Debug-only cross-check: confirm the DisplayState's render_ids
+        match what the legacy path computed (self.idxs_*).  Runs only when
+        DEBUG logging is on and never raises into a session (logged, not
+        thrown).  Temporary — drops out when the legacy idxs paths go in a
+        later stage."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        try:
+            if state is None:
+                state = self._live_display_state()
+            expected = (sorted(self.idxs_2d)
+                        if state.mode in (Mode.INT_2D, Mode.IMAGE_VIEWER)
+                        else sorted(self.idxs_1d))
+            if list(state.render_ids) != expected:
+                logger.debug(
+                    "shadow: render_ids %s != live idxs %s (mode=%s, status=%s)",
+                    state.render_ids, expected, state.mode, state.load_status,
+                )
+        except Exception:
+            logger.debug("shadow display-state check failed", exc_info=True)
 
     def update_plot_range(self):
         if self.ui.slice.isChecked():
@@ -449,61 +536,110 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return True
 
     def update(self):
-        """Updates image and plot frames based on toolbar options
+        """Updates image and plot frames based on toolbar options.
+
+        Stage 3: the per-mode dispatch is gone.  We compute one
+        :class:`DisplayState`, build its payload, and hand both to
+        :meth:`render`, which lays panels out by the state's layout and
+        draws-or-clears each — no ``if viewer_mode == ...`` here.
         """
         self.get_idxs()
+        self._note_selection_generation()   # Stage 2: bump on selection change
 
         if not self._updated():
             return True
 
-        # ── Viewer mode: simplified rendering ────────────────────────
-        if self.viewer_mode == 'image':
-            try:
-                self._update_image_viewer()
-            except Exception:
-                logger.debug('Image viewer update failed', exc_info=True)
+        mode = self._live_mode()
+        ctrl = controller_for(mode)
+        state = ctrl.compute_state(self, mode)
+        self._shadow_check_display_state(state)  # debug-only cross-check
+        payload = ctrl.build_payload(self, state)  # store=None ⇒ delegate draws
+        return self.render_display(state, payload)
+
+    # ── Render (Stage 3) ──────────────────────────────────────────────
+
+    # Per-role draw delegates: render owns the *decision* (what to draw vs
+    # clear, gen-drop, blanking); the legacy methods own the pixel push.
+    # RAW_2D / PLOT_1D differ by mode (viewer vs normal); CAKE_2D is normal
+    # only.  These collapse into mode controllers in Stage 5.
+    def _draw_delegate(self, role, mode):
+        if role is PanelRole.RAW_2D:
+            return (self._update_image_viewer if mode is Mode.IMAGE_VIEWER
+                    else self.update_image)
+        if role is PanelRole.PLOT_1D:
+            return (self._update_xye_viewer if mode is Mode.XYE_VIEWER
+                    else self.update_plot)
+        if role is PanelRole.CAKE_2D:
+            return self.update_binned
+        return None
+
+    def _clear_delegate(self, role):
+        return {
+            PanelRole.RAW_2D: self.clear_image_view,
+            PanelRole.CAKE_2D: self.clear_binned_view,
+            PanelRole.PLOT_1D: self.clear_plot_view,
+        }.get(role)
+
+    def render_display(self, state, payload):
+        """Draw the display from ``state`` + ``payload``.  (Named
+        ``render_display`` to avoid shadowing ``QWidget.render``.)
+
+        Thin: it executes the pure :func:`render_plan` decision — drop a
+        stale-generation payload, then draw the panels the state wants and
+        clear the rest (so a panel left from a previous mode/selection is
+        always blanked, §8).  The pixel push is delegated to the legacy
+        draw/clear methods; the *decision* lives in render_plan.
+        """
+        plan = render_plan(state, payload)
+        if plan.drop:
+            # Payload computed against a superseded generation — never render
+            # it over the current state (§8 generation invariant).
+            logger.debug("render: dropping stale payload gen=%s vs state gen=%s",
+                         getattr(payload, 'generation', None), state.generation)
             return True
-        if self.viewer_mode == 'xye':
+
+        mode = state.mode
+
+        # Normal-mode input prep: Share-Axis link + 1D-only panel visibility.
+        if mode in (Mode.INT_1D, Mode.INT_2D):
+            if self.ui.shareAxis.isChecked() and (self.ui.imageUnit.currentIndex() < 2):
+                self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
+                self.ui.plotUnit.setEnabled(False)
+                self.plot.setXLink(self.binned_widget.image_plot)
+            else:
+                self.plot.setXLink(None)
+                self.ui.plotUnit.setEnabled(True)
+            self._apply_1d_only_visibility()
+
+        # Clear the panels this state does not want (kills stale content).
+        for role in plan.clear:
+            clear = self._clear_delegate(role)
+            if clear is not None:
+                clear()
+
+        # Draw the panels it does want.  Exception handling matches the
+        # legacy update(): normal-mode draws caught only TypeError (a
+        # missing-data frame) and let anything else propagate; the viewer
+        # draws were wrapped in a broad debug-logged guard.
+        is_viewer = mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER)
+        for role in plan.draw:
+            draw = self._draw_delegate(role, mode)
+            if draw is None:
+                continue
             try:
-                self._update_xye_viewer()
+                draw()
+            except TypeError:
+                return False
             except Exception:
-                logger.debug('XYE viewer update failed', exc_info=True)
-            return True
+                if not is_viewer:
+                    raise
+                logger.debug("render: viewer draw of %s failed", role, exc_info=True)
 
-        # ── Normal mode ──────────────────────────────────────────────
-        if self.ui.shareAxis.isChecked() and (self.ui.imageUnit.currentIndex() < 2):
-            self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
-            self.ui.plotUnit.setEnabled(False)
-            self.plot.setXLink(self.binned_widget.image_plot)
-        else:
-            self.plot.setXLink(None)
-            self.ui.plotUnit.setEnabled(True)
-
-        self._apply_1d_only_visibility()
-
-        try:
-            self.update_plot()
-        except TypeError:
-            return False
-
-        # 2D always updates now (the old "Update 2D" perf toggle is gone —
-        # 1D-only modes hide the 2D panel via _apply_1d_only_visibility, and
-        # the try/except guards a missing-2D-data frame).
-        try:
-            self.update_image()
-        except TypeError:
-            return False
-        try:
-            self.update_binned()
-        except TypeError:
-            return False
-
-        # Apply label to 2D view
-        self.update_2d_label()
-
-        # Update the image preview popup if it is open
-        self._update_image_preview()
-
+        # 2D title + image-preview popup (normal mode; viewer draw methods
+        # set their own title).  Delegated — behaviour-preserving.
+        if mode in (Mode.INT_1D, Mode.INT_2D):
+            self.update_2d_label()
+            self._update_image_preview()
         return True
 
     def update_views(self):
@@ -699,9 +835,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self.ui.imageUnit.addItem(_translate("Form", label))
             self.ui.plotUnit.setEnabled(True)
             self.ui.imageUnit.setEnabled(True)
+            # Default the plot unit to the entry matching the 1D integration
+            # unit (so a 2θ integration opens on a 2θ axis).  Standard combo
+            # order is (Q, 2θ, χ); normalise the pyFAI unit to canonical then
+            # route the index choice through the pure default_plot_unit.
             unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
-            if '2th' in unit_1d:
-                target_plot_idx = 1
+            canon_1d = ('2th_deg' if '2th' in unit_1d
+                        else 'chi_deg' if 'chi' in unit_1d else 'q_A^-1')
+            target_plot_idx = default_plot_unit(
+                canon_1d, ('q_A^-1', '2th_deg', 'chi_deg'))
 
         if self.ui.plotUnit.count() > 0:
             self.ui.plotUnit.setCurrentIndex(
@@ -1065,6 +1207,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                   'xye'   — show only the 1D plot panel,
                   None    — restore normal layout.
         """
+        # Stage 2: a mode switch must invalidate any stale render computed
+        # for the previous mode (the exact failure this guards against).
+        if mode != self.viewer_mode:
+            self._bump_display_generation()
         self.viewer_mode = mode
         self._viewer_x_axis_label = None
         is_viewer = mode in ('image', 'xye')
@@ -1155,21 +1301,37 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Title bar: the xye filename(s) — same convention as the image viewer.
         self._set_viewer_title(self.idxs_1d)
 
-        # Determine axis label from first frame
+        # Axis label comes from the file's prefix (iq \u2192 Q, itth \u2192 2\u03b8), not a
+        # transform combo \u2014 an XYE file can't be re-transformed.  Stage 4:
+        # route through the pure xye_unit_from_filename + x_axis_for_unit so
+        # an UNKNOWN prefix labels the axis plain 'x' (never an assumed 2\u03b8).
         first_frame = self.data_1d[self.idxs_1d[0]]
-        unit = str(getattr(first_frame.int_1d, 'unit', 'unknown')).lower()
-        if unit.startswith('q') or unit in ('q_a^-1', 'q_a-1'):
-            # Label is the quantity only; pyqtgraph appends ``units`` as
-            # "(\u00c5\u207b\u00b9)".  Embedding it here too rendered "Q (\u00c5\u207b\u00b9) (\u00c5\u207b\u00b9)".
-            xlabel = u'Q'
-            xunits = u'\u212b\u207b\u00b9'
-        elif '2th' in unit or '2theta' in unit:
-            xlabel = u'2\u03b8'
-            xunits = u'\u00b0'
-        else:
-            xlabel = 'x'
-            xunits = ''
+        source_name = ''
+        if getattr(first_frame, 'scan_info', None):
+            source_name = first_frame.scan_info.get('source_file', '')
+        first_unit = xye_unit_from_filename(source_name)
+        xlabel, xunits = x_axis_for_unit(first_unit)
         self._viewer_x_axis_label = (xlabel, xunits)
+
+        # Overlaying xye files of different units mixes incompatible x-axes —
+        # we label from the first file (above); warn if the selection mixes
+        # known prefixes (iq with itth) so the user knows the axis is the
+        # first file's, not a shared one.
+        if len(self.idxs_1d) > 1:
+            units = set()
+            for idx in self.idxs_1d:
+                fr = self.data_1d.get(idx)
+                sinfo = getattr(fr, 'scan_info', None) if fr is not None else None
+                src = sinfo.get('source_file', '') if sinfo else ''
+                u = xye_unit_from_filename(src)
+                if u != 'unknown':
+                    units.add(u)
+            if len(units) > 1:
+                logger.warning(
+                    'XYE overlay mixes different x-axis units %s; labelling '
+                    'the axis from the first file (%s). Overlaid curves are '
+                    'on incompatible axes.', sorted(units), first_unit,
+                )
 
         # Build xdata and ydata arrays from all selected indices.
         ref_x = np.asarray(first_frame.int_1d.radial, dtype=float)

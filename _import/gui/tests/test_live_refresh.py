@@ -402,6 +402,506 @@ def test_clear_display_state_resets_visible_and_cached_state():
     np.testing.assert_array_equal(wf_widget.images[-1], np.zeros((2, 2)))
 
 
+def test_display_generation_bumps_on_mode_switch_and_selection():
+    # Stage 2: the monotonic display generation must advance on a mode
+    # switch (the exact case that caused stale renders) and on a selection
+    # change, but not when nothing changed.
+    from unittest.mock import MagicMock
+
+    host = SimpleNamespace(
+        viewer_mode=None,
+        display_generation=0,
+        _last_selection_sig=None,
+        idxs=[],
+        overall=False,
+        _viewer_x_axis_label=None,
+        ui=MagicMock(),
+        _showImageBtn=MagicMock(),
+    )
+    host.clear_display_state = MagicMock()
+    host._set_2d_controls_visible = MagicMock()
+    host._bump_display_generation = MethodType(
+        displayFrameWidget._bump_display_generation, host)
+    host._note_selection_generation = MethodType(
+        displayFrameWidget._note_selection_generation, host)
+    host.set_viewer_display_mode = MethodType(
+        displayFrameWidget.set_viewer_display_mode, host)
+
+    # Mode switch bumps; re-selecting the same mode does not.
+    host.set_viewer_display_mode('image')
+    assert host.display_generation == 1
+    host.set_viewer_display_mode('image')
+    assert host.display_generation == 1
+    host.set_viewer_display_mode('xye')
+    assert host.display_generation == 2
+
+    # Selection: first call records the baseline (no bump), then changes bump.
+    host._note_selection_generation()
+    assert host.display_generation == 2
+    host.idxs = [0, 1]
+    host._note_selection_generation()
+    assert host.display_generation == 3
+    host._note_selection_generation()          # unchanged
+    assert host.display_generation == 3
+
+
+def test_select_last_scan_entry_picks_last_file_row():
+    # End-of-(XYE)-batch auto-select: select the last data-file row in
+    # listScans (most recent output), skipping '..' and directories.
+    from xdart.gui.tabs.static_scan.h5viewer import H5Viewer
+
+    class _Item:
+        def __init__(self, t): self._t = t
+        def text(self): return self._t
+
+    selected = {}
+    class _List:
+        def __init__(self, texts): self._items = [_Item(t) for t in texts]
+        def count(self): return len(self._items)
+        def item(self, r): return self._items[r]
+        def setCurrentRow(self, r, _mode=None): selected['row'] = r
+
+    host = SimpleNamespace(ui=SimpleNamespace(listScans=_List(
+        ['..', 'subdir/', 'iq_scan_0001.xye', 'iq_scan_0002.xye', 'iq_scan_0003.xye'])))
+    host.select_last_scan_entry = MethodType(H5Viewer.select_last_scan_entry, host)
+
+    row = host.select_last_scan_entry()
+    assert row == 4                          # last .xye row, not '..' or the dir
+    assert selected['row'] == 4
+
+    # Nothing selectable -> -1, no crash.
+    host2 = SimpleNamespace(ui=SimpleNamespace(listScans=_List(['..', 'd/'])))
+    host2.select_last_scan_entry = MethodType(H5Viewer.select_last_scan_entry, host2)
+    assert host2.select_last_scan_entry() == -1
+
+
+def test_gi_readonly_skips_bool_so_grazing_stays_checked():
+    # Regression: making the GI group readonly during a run set readonly on
+    # the Grazing bool, which pyqtgraph renders UNCHECKED (cosmetic).  The
+    # readonly toggle must skip bool params so Grazing keeps its real state;
+    # non-bool params (th_motor) still become readonly.
+    from PySide6 import QtWidgets
+    from pyqtgraph.parametertree import Parameter
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    p = Parameter.create(name="GI", type="group", children=[
+        {"name": "Grazing", "type": "bool", "value": True},
+        {"name": "th_motor", "type": "list", "values": ["th", "Manual"], "value": "th"},
+    ])
+    host = SimpleNamespace()
+    host._set_parameter_readonly = MethodType(
+        imageWrangler._set_parameter_readonly, host)
+
+    host._set_parameter_readonly(p, True)
+    assert p.child("Grazing").value() is True            # value preserved
+    assert not p.child("Grazing").opts.get("readonly")   # bool NOT made readonly
+    assert p.child("th_motor").opts.get("readonly") is True   # non-bool is
+
+
+def test_metadata_panel_populates_when_layout_reparented():
+    # Regression: the host installs only metadataWidget.layout into its
+    # metaFrame, so the metadataWidget QWidget itself is never shown and
+    # self.isVisible() is always False — update() must gate on the tableview
+    # (which IS on screen), else the metadata panel stays blank.
+    import pandas as pd
+    from PySide6 import QtWidgets
+    from PySide6.QtCore import QModelIndex
+    from xdart.gui.tabs.static_scan.metadata import metadataWidget
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    scan = SimpleNamespace(
+        scan_data=pd.DataFrame({"th": [0.1, 0.2], "i0": [1e6, 1.1e6]}, index=[1, 2]))
+    mw = metadataWidget(scan, None, ["1"], {})
+    assert not mw.isVisible()                    # the widget itself never shows
+
+    frame = QtWidgets.QFrame()
+    frame.setLayout(mw.layout)                   # mirror static_scan_widget
+    win = QtWidgets.QWidget()
+    QtWidgets.QVBoxLayout(win).addWidget(frame)
+    win.show()
+    app.processEvents()
+
+    assert mw.tableview.isVisible()              # the tableview IS on screen
+    mw.update()
+    model = mw.tableview.model()
+    assert model.rowCount(QModelIndex()) == 2    # th + i0 -> populated, not blank
+    win.close()
+
+
+def test_gi_motor_options_default_manual_when_no_metadata():
+    # GI incidence: when no motors are found (eiger / no metadata), the Theta
+    # Motor must default to 'Manual' and reveal the Theta value field so the
+    # incidence angle can be entered directly.  With a 'th' motor present it
+    # selects 'th' and hides the manual field.
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    class _P:
+        def __init__(self, value=None):
+            self._v = value
+            self.visible = True
+        def value(self):
+            return self._v
+        def setValue(self, v):
+            self._v = v
+        def setOpts(self, **o):
+            if "value" in o:
+                self._v = o["value"]
+            if "visible" in o:
+                self.visible = o["visible"]
+            self.opts = o
+        def hide(self):
+            self.visible = False
+        def show(self):
+            self.visible = True
+
+    def _host(motors):
+        gi = {"th_motor": _P("th"), "th_val": _P("0.1")}
+        params = SimpleNamespace(child=lambda name: SimpleNamespace(child=lambda n: gi[n]))
+        h = SimpleNamespace(motors=motors, parameters=params, incidence_motor=None)
+        h.set_gi_th_motor = MethodType(imageWrangler.set_gi_th_motor, h)
+        h.set_gi_motor_options = MethodType(imageWrangler.set_gi_motor_options, h)
+        return h, gi
+
+    # No metadata -> Manual default, Theta field visible, incidence = th_val.
+    h, gi = _host([])
+    h.set_gi_motor_options()
+    assert gi["th_motor"].value() == "Manual"
+    assert gi["th_val"].visible is True
+    assert h.incidence_motor == "0.1"
+
+    # 'th' present -> selects th, manual field hidden.
+    h, gi = _host(["th", "i0"])
+    h.set_gi_motor_options()
+    assert gi["th_motor"].value() == "th"
+    assert gi["th_val"].visible is False
+    assert h.incidence_motor == "th"
+
+
+def test_data_changed_tolerates_non_integer_labels():
+    # Regression: data_changed crashed with ValueError int('..._0001.xye')
+    # when listData still held xye filenames during a viewer<->scan mode
+    # transition (viewer_mode not yet 'xye').  It must treat non-integer
+    # labels as "nothing to load" instead of crashing.
+    from PySide6 import QtCore
+
+    class _Item:
+        def __init__(self, text):
+            self._text = text
+        def text(self):
+            return self._text
+        def data(self, role):
+            return None
+
+    class _List:
+        def __init__(self, items):
+            self._items = items
+        def selectedItems(self):
+            return self._items
+
+    loaded = []
+    host = SimpleNamespace(
+        viewer_mode=None,                       # NOT 'xye' — the crash condition
+        frame_ids=[],
+        update_2d=False,
+        data_1d={}, data_2d={},
+        scan=SimpleNamespace(frames=SimpleNamespace(index=[0, 1, 2])),
+        ui=SimpleNamespace(listData=_List([
+            _Item('iq_eiger_w2s3_test_2_scan001_0001.xye'),
+            _Item('iq_eiger_w2s3_test_2_scan001_0002.xye'),
+        ])),
+        load_frames_data=lambda *a, **k: loaded.append(a),
+        sigUpdate=SimpleNamespace(emit=lambda: None),
+    )
+    host.data_changed = MethodType(H5Viewer.data_changed, host)
+
+    host.data_changed()                          # must not raise
+    assert loaded == []                          # nothing loaded from xye names
+
+
+def test_absorb_chunk_drops_stale_generation():
+    # Stage 5: a background load worker publishes ONLY through a
+    # generation-checked snapshot — a chunk whose generation no longer
+    # matches the store's _load_generation (a newer load/selection has begun)
+    # is dropped, never written into data_1d/data_2d.
+    viewer = SimpleNamespace(
+        _load_generation=7,
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+    )
+    viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+
+    class _Frame:
+        def copy_for_display(self, include_2d=False):
+            return self
+
+    # Stale chunk (gen 6 < current 7) -> dropped.
+    viewer._absorb_chunk(6, 3, _Frame(), False)
+    assert viewer.data_1d == {} and viewer.data_2d == {}
+
+
+def test_gi_common_grid_freeze_yields_uniform_axes():
+    # Stage 5 (gi_axes_uniform tie-in): the shipped GI common-grid freeze
+    # turns per-frame Auto axes (which differ frame-to-frame in an
+    # angle-dependence GI scan and can't stack) into ONE shared grid.
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        _freeze_gi_1d_range_from_result,
+    )
+    from xdart.gui.tabs.static_scan.display_logic import gi_axes_uniform
+
+    npt = 8
+    # Auto: each frame auto-ranges to its own extent -> non-uniform stack.
+    auto = [
+        (np.linspace(1.00, 5.00, npt),),
+        (np.linspace(1.15, 5.30, npt),),   # different incident angle
+    ]
+    assert gi_axes_uniform(auto) is False
+
+    # Freeze a single radial range from a scout frame, then every frame
+    # integrates onto linspace(frozen_range, npt) — one shared axis.
+    args = {'radial_range': None}
+    scout = SimpleNamespace(radial=np.array([1.0, 5.0]))
+    assert _freeze_gi_1d_range_from_result(args, scout) is True
+    lo, hi = args['radial_range']
+    frozen = [(np.linspace(lo, hi, npt),), (np.linspace(lo, hi, npt),)]
+    assert gi_axes_uniform(frozen) is True
+
+
+def test_default_controllers_registered():
+    # Stage 5: importing display_controllers registers a controller for every
+    # core mode, so the widget never dispatches to a missing handler.
+    from xdart.gui.tabs.static_scan import display_controllers  # noqa: F401
+    from xdart.gui.tabs.static_scan.display_logic import controller_for, Mode
+    for mode in (Mode.INT_1D, Mode.INT_2D, Mode.IMAGE_VIEWER, Mode.XYE_VIEWER):
+        assert controller_for(mode) is not None
+
+
+def _update_smoke_host():
+    """Host that drives the REAL update()->render_display orchestration
+    (get_idxs, _live_display_state, compute_display_state, build_payload,
+    render_plan, render_display, _draw/_clear_delegate) with only the
+    pixel-push leaves stubbed to record their calls.  This exercises the
+    integration path that the per-method tests don't cover."""
+    from unittest.mock import MagicMock
+    from xdart.gui.tabs.static_scan import display_logic as dl
+
+    calls = []
+    def rec(name):
+        return lambda *a, **k: calls.append(name)
+
+    host = SimpleNamespace(
+        viewer_mode=None,
+        display_generation=0,
+        _last_selection_sig=None,
+        frame_ids=['0', '1'],
+        idxs=[], idxs_1d=[], idxs_2d=[],
+        overall=False,
+        overlaid_idxs=[],
+        data_1d={0: object(), 1: object()},
+        data_2d={
+            0: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
+            1: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
+        },
+        data_lock=RLock(),
+        scan=SimpleNamespace(scan_lock=RLock(),
+                             frames=SimpleNamespace(index=[0, 1]),
+                             gi=False, skip_2d=False, name='scan'),
+        ui=MagicMock(),
+        plot=MagicMock(),
+        binned_widget=MagicMock(),
+        # pixel-push leaves (unchanged by Stage 3) — recorded, not run
+        update_image=rec("draw_image"),
+        update_binned=rec("draw_binned"),
+        update_plot=rec("draw_plot"),
+        _update_image_viewer=rec("draw_viewer_image"),
+        _update_xye_viewer=rec("draw_viewer_xye"),
+        clear_image_view=rec("clear_image"),
+        clear_binned_view=rec("clear_binned"),
+        clear_plot_view=rec("clear_plot"),
+        update_2d_label=rec("label_2d"),
+        _update_image_preview=rec("preview"),
+        _apply_1d_only_visibility=rec("apply_1d_only"),
+    )
+    host.ui.shareAxis.isChecked.return_value = False
+    host.ui.imageUnit.currentIndex.return_value = 0
+    host.ui.plotMethod.currentText.return_value = 'Single'
+    for name in ('get_idxs', '_note_selection_generation', '_bump_display_generation',
+                 '_live_mode', '_live_display_state', '_shadow_check_display_state',
+                 '_draw_delegate', '_clear_delegate', 'render_display',
+                 '_updated', 'update'):
+        setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
+    return host, calls, dl
+
+
+def test_update_render_smoke_int_collapse_and_mode_switches():
+    host, calls, dl = _update_smoke_host()
+
+    # Int-2D: full panel set.
+    host.update()
+    assert "draw_plot" in calls and "draw_image" in calls and "draw_binned" in calls
+    assert "label_2d" in calls and not any(c.startswith("clear_") for c in calls)
+
+    # Int-1D (skip_2d): 1D-only — plot drawn, the two 2D panels cleared.
+    calls.clear()
+    host.scan.skip_2d = True
+    host.update()
+    assert "draw_plot" in calls
+    assert "clear_image" in calls and "clear_binned" in calls
+    assert "draw_image" not in calls and "draw_binned" not in calls
+
+    # Switch to Image Viewer (mode switch bumps generation): raw drawn,
+    # the 1D plot + cake from the prior mode are cleared (no stale panels).
+    calls.clear()
+    host.scan.skip_2d = False
+    host.viewer_mode = 'image'
+    host._bump_display_generation()
+    host.update()
+    assert "draw_viewer_image" in calls
+    assert "clear_plot" in calls and "clear_binned" in calls
+    assert "label_2d" not in calls           # viewer owns its own title
+
+    # Switch to XYE Viewer: 1D drawn, the 2D panels cleared.
+    calls.clear()
+    host.viewer_mode = 'xye'
+    host._bump_display_generation()
+    host.update()
+    assert "draw_viewer_xye" in calls
+    assert "clear_image" in calls and "clear_binned" in calls
+
+    # Back to normal Int-2D: full panel set again.
+    calls.clear()
+    host.viewer_mode = None
+    host._bump_display_generation()
+    host.update()
+    assert {"draw_plot", "draw_image", "draw_binned"} <= set(calls)
+
+
+def test_update_render_smoke_gi_scan_propagates_and_dispatches():
+    # A GI scan still renders through the same path; gi flag propagates into
+    # the state and the cake/plot dispatch is unchanged (GI axis labelling is
+    # delegated to the legacy update_binned_view, covered elsewhere).
+    host, calls, dl = _update_smoke_host()
+    host.scan.gi = True
+    host.update()
+    assert host._live_display_state().gi is True
+    assert {"draw_plot", "draw_image", "draw_binned"} <= set(calls)
+
+
+def test_update_render_smoke_stale_generation_is_dropped():
+    host, calls, dl = _update_smoke_host()
+    state = host._live_display_state()
+    calls.clear()
+    stale = dl.DisplayPayload(generation=state.generation - 1, raw_image=None,
+                              cake_image=None, plot=None)
+    host.render_display(state, stale)
+    assert calls == []                        # nothing drawn or cleared
+
+
+def _render_host():
+    """A host that records which draw/clear delegates render_display calls."""
+    from unittest.mock import MagicMock
+    from xdart.gui.tabs.static_scan import display_logic as dl
+
+    calls = []
+    def rec(name):
+        return lambda *a, **k: calls.append(name)
+
+    host = SimpleNamespace(
+        ui=MagicMock(),
+        plot=MagicMock(),
+        binned_widget=MagicMock(),
+        update_image=rec("draw_image"),
+        update_binned=rec("draw_binned"),
+        update_plot=rec("draw_plot"),
+        _update_image_viewer=rec("draw_viewer_image"),
+        _update_xye_viewer=rec("draw_viewer_xye"),
+        clear_image_view=rec("clear_image"),
+        clear_binned_view=rec("clear_binned"),
+        clear_plot_view=rec("clear_plot"),
+        _apply_1d_only_visibility=rec("apply_1d_only"),
+        update_2d_label=rec("label_2d"),
+        _update_image_preview=rec("preview"),
+    )
+    host.ui.shareAxis.isChecked.return_value = False
+    host.ui.imageUnit.currentIndex.return_value = 0
+    for name in ("_draw_delegate", "_clear_delegate", "render_display"):
+        setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
+    return host, calls, dl
+
+
+def test_render_display_int2d_draws_all_panels():
+    host, calls, dl = _render_host()
+    state = dl.compute_display_state(
+        mode=dl.Mode.INT_2D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys={0}, loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
+        method='Single', unit_changed=False, prev_overlaid_ids=(),
+        raw_availability={0: dict(has_raw=True)}, titles={}, generation=1)
+    host.render_display(state, dl.build_payload(state))
+    assert "draw_plot" in calls and "draw_image" in calls and "draw_binned" in calls
+    assert "label_2d" in calls and "preview" in calls
+    assert not any(c.startswith("clear_") for c in calls)
+
+
+def test_render_display_image_viewer_draws_raw_clears_others():
+    host, calls, dl = _render_host()
+    state = dl.compute_display_state(
+        mode=dl.Mode.IMAGE_VIEWER, selected_ids=(0,), all_frame_index=[],
+        loaded_1d_keys=set(), loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
+        method='Single', unit_changed=False, prev_overlaid_ids=(),
+        raw_availability={0: dict(has_raw=True)}, titles={}, generation=1)
+    host.render_display(state, dl.build_payload(state))
+    assert "draw_viewer_image" in calls         # RAW_2D via the viewer method
+    assert "clear_binned" in calls and "clear_plot" in calls  # absent panels blanked
+    assert "label_2d" not in calls              # viewer sets its own title
+    assert "draw_image" not in calls
+
+
+def test_render_display_drops_stale_generation():
+    host, calls, dl = _render_host()
+    state = dl.compute_display_state(
+        mode=dl.Mode.INT_2D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys={0}, loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
+        method='Single', unit_changed=False, prev_overlaid_ids=(),
+        raw_availability={0: dict(has_raw=True)}, titles={}, generation=7)
+    stale = dl.DisplayPayload(generation=6, raw_image=None, cake_image=None, plot=None)
+    host.render_display(state, stale)
+    assert calls == []                           # nothing drawn or cleared
+
+
+def test_shadow_display_state_check_agrees_and_never_raises(caplog):
+    # Stage 2 shadow mode: building a DisplayState from live inputs must
+    # agree with the existing render path's idxs and never raise into the
+    # session.  (Evidence for "no shadow assert fires" during use.)
+    import logging
+
+    host = SimpleNamespace(
+        viewer_mode=None,
+        display_generation=3,
+        frame_ids=['0', '1'],
+        idxs=[0, 1], idxs_1d=[0, 1], idxs_2d=[0, 1],
+        overall=True,
+        overlaid_idxs=[],
+        data_1d={0: object(), 1: object()},
+        data_2d={
+            0: {'map_raw': np.ones((2, 2)), 'thumbnail': None},
+            1: {'map_raw': np.ones((2, 2)), 'thumbnail': None},
+        },
+        data_lock=RLock(),
+        scan=SimpleNamespace(scan_lock=RLock(),
+                             frames=SimpleNamespace(index=[0, 1]), gi=False),
+        ui=SimpleNamespace(plotMethod=SimpleNamespace(currentText=lambda: 'Single')),
+    )
+    for name in ('_live_mode', '_live_display_state', '_shadow_check_display_state'):
+        setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
+
+    logger_name = 'xdart.gui.tabs.static_scan.display_frame_widget'
+    with caplog.at_level(logging.DEBUG, logger=logger_name):
+        host._shadow_check_display_state()       # must not raise
+
+    assert not any('shadow: render_ids' in r.getMessage() for r in caplog.records)
+
+
 def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     worker = _FakeWorker()
     timer = _FakeTimer(active=True)
@@ -430,6 +930,9 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     viewer._clear_raw_cache = MethodType(H5Viewer._clear_raw_cache, viewer)
     viewer._remember_displayed_frames = MethodType(
         H5Viewer._remember_displayed_frames, viewer,
+    )
+    viewer._teardown_load_worker = MethodType(
+        H5Viewer._teardown_load_worker, viewer,
     )
     viewer.cancel_pending_loads = MethodType(H5Viewer.cancel_pending_loads, viewer)
     viewer.enter_viewer_mode_cleanup = MethodType(
@@ -532,7 +1035,6 @@ def test_old_processed_xdart_nxs_not_loaded_as_generic_image(tmp_path):
         _viewer_is_xdart=False,
         _remember_displayed_frames=lambda: calls.append("remember"),
         sigUpdate=_FakeSignal(),
-        _is_xdart_processed=H5Viewer._is_xdart_processed,
         _load_single_frame=lambda *args, **kwargs: calls.append("load"),
     )
     # Bind the cache clear after the namespace exists.
@@ -571,7 +1073,6 @@ def test_reduction_group_raw_nexus_loads_as_generic_image(tmp_path):
         _viewer_is_xdart=True,
         _remember_displayed_frames=lambda: calls.append("remember"),
         sigUpdate=_FakeSignal(),
-        _is_xdart_processed=H5Viewer._is_xdart_processed,
         _load_single_frame=lambda _path, frame_idx=0, frame_id=1: calls.append(
             ("load", frame_idx, frame_id),
         ),
@@ -594,14 +1095,50 @@ def test_reduction_group_raw_nexus_loads_as_generic_image(tmp_path):
 
 def test_processed_xdart_markers_still_short_circuit_image_loader(tmp_path):
     import h5py
+    import numpy as np
+    from ssrl_xrd_tools.io import ImageSourceKind
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        ImageViewerController,
+    )
 
-    for marker in ("integrated_1d", "integrated_2d", "frames"):
+    # An integrated stack is an unambiguous xdart-processed marker, even when
+    # the group is otherwise bare.
+    for marker in ("integrated_1d", "integrated_2d"):
         path = tmp_path / f"processed_{marker}.nxs"
         with h5py.File(path, "w") as f:
             entry = f.create_group("entry")
             entry.create_group(marker)
 
-        assert H5Viewer._is_xdart_processed(str(path)) is True
+        # Classification is the ssrl boundary; these markers must classify as a
+        # processed xdart file (not a raw detector image).
+        info = ImageViewerController.classify(str(path))
+        assert info.kind in (
+            ImageSourceKind.PROCESSED_XDART, ImageSourceKind.THUMBNAIL_ONLY,
+        )
+
+    # A ``frames`` group only marks a processed file when it carries real frame
+    # content (thumbnail/source).  A *bare* ``entry/frames`` is the native eiger
+    # group and must NOT be read as processed-xdart (regression: that misread
+    # made the Image Viewer refuse genuine raw eiger files).
+    frames_path = tmp_path / "processed_frames.nxs"
+    with h5py.File(frames_path, "w") as f:
+        e = f.create_group("entry")
+        thumb = np.linspace(0, 100, 16 * 16).reshape(16, 16)
+        q = (thumb / thumb.max() * 255.0).astype(np.uint8)
+        ds = e.create_dataset("frames/frame_0000/thumbnail", data=q)
+        ds.attrs["vmin"] = 0.0
+        ds.attrs["vmax"] = 100.0
+        ds.attrs["dtype"] = "uint8"
+    info = ImageViewerController.classify(str(frames_path))
+    assert info.kind in (
+        ImageSourceKind.PROCESSED_XDART, ImageSourceKind.THUMBNAIL_ONLY,
+    )
+
+    bare_frames = tmp_path / "bare_frames.nxs"
+    with h5py.File(bare_frames, "w") as f:
+        f.create_group("entry/frames")     # native eiger group, no content
+    info = ImageViewerController.classify(str(bare_frames))
+    assert info.kind is not ImageSourceKind.PROCESSED_XDART
 
 
 def test_image_viewer_missing_raw_and_thumbnail_clears_panel():
@@ -855,46 +1392,21 @@ def test_standard_plot_axis_defaults_to_integrated_2theta_unit():
     assert "2" in plot_unit.currentText()
 
 
-def test_processed_image_viewer_falls_back_to_thumbnail(monkeypatch):
-    import ssrl_xrd_tools.io as ssrl_io
-
-    thumb = np.array([[5.0, 6.0], [7.0, 8.0]])
-
-    def fake_get_raw_frame(_path, *, frame, allow_thumbnail=True):
-        assert frame == 5
-        if not allow_thumbnail:
-            raise OSError("missing source")
-        return thumb
-
-    monkeypatch.setattr(ssrl_io, "get_raw_frame", fake_get_raw_frame)
-    viewer = SimpleNamespace(
-        _viewer_is_xdart=True,
-        data_lock=RLock(),
-        data_1d={},
-        data_2d={},
-    )
-
-    H5Viewer._load_single_frame(
-        viewer, "processed.nxs", frame_idx=0, frame_id=5,
-    )
-
-    np.testing.assert_array_equal(viewer.data_2d[5]["map_raw"], thumb)
-    np.testing.assert_array_equal(viewer.data_2d[5]["thumbnail"], thumb)
-
-
-def test_processed_image_viewer_reads_thumbnail_directly_if_helper_fails(
-        monkeypatch, tmp_path):
+def test_processed_image_viewer_falls_back_to_thumbnail(tmp_path):
+    # Stage 5: a processed .nxs whose source master is missing loads the
+    # dequantized thumbnail (via the ssrl boundary), stored as a thumbnail
+    # (its mask is already baked in) — _load_single_frame integration.
     import h5py
-    import ssrl_xrd_tools.io as ssrl_io
 
-    def failing_get_raw_frame(*_args, **_kwargs):
-        raise KeyError("missing source and helper fallback")
-
-    monkeypatch.setattr(ssrl_io, "get_raw_frame", failing_get_raw_frame)
-    path = tmp_path / "processed_thumbnail_only.nxs"
+    path = tmp_path / "thumb_fallback.nxs"
     with h5py.File(path, "w") as f:
-        ds = f.create_dataset(
-            "entry/frames/frame_0005/thumbnail",
+        e = f.create_group("entry")
+        e.create_group("integrated_1d")
+        s = e.create_group("frames/frame_0005/source")
+        s.create_dataset("path", data=np.bytes_(b"missing_master.h5"))
+        s.create_dataset("frame_index", data=0)
+        ds = e.create_dataset(
+            "frames/frame_0005/thumbnail",
             data=(np.ones((3, 4)) * 128).astype(np.uint8),
         )
         ds.attrs["vmin"] = 10.0
@@ -902,24 +1414,18 @@ def test_processed_image_viewer_reads_thumbnail_directly_if_helper_fails(
         ds.attrs["dtype"] = "uint8"
 
     viewer = SimpleNamespace(
-        _viewer_is_xdart=True,
-        data_lock=RLock(),
-        data_1d={},
-        data_2d={},
+        _viewer_is_xdart=True, data_lock=RLock(), data_1d={}, data_2d={},
     )
-    viewer._read_processed_thumbnail = H5Viewer._read_processed_thumbnail
-
     loaded = H5Viewer._load_single_frame(
         viewer, str(path), frame_idx=5, frame_id=5,
     )
 
     assert loaded is True
-    assert 5 in viewer.data_2d
     assert viewer.data_2d[5]["map_raw"].shape == (3, 4)
-    np.testing.assert_allclose(
-        viewer.data_2d[5]["map_raw"],
-        10.0 + (128 / 255) * 10.0,
-    )
+    expected = 10.0 + (128 / 255) * 10.0   # dequantize(128, vmin=10, vmax=20)
+    np.testing.assert_allclose(viewer.data_2d[5]["map_raw"], expected)
+    # Stored as a thumbnail so the renderer won't re-apply a flat mask.
+    np.testing.assert_allclose(viewer.data_2d[5]["thumbnail"], expected)
 
 
 def test_image_viewer_single_raw_file_gets_selectable_frame(tmp_path):
@@ -934,7 +1440,6 @@ def test_image_viewer_single_raw_file_gets_selectable_frame(tmp_path):
         frame_ids=[],
         ui=SimpleNamespace(listData=_FakeListWidget()),
         _raw_cache_order=[],
-        _is_xdart_processed=H5Viewer._is_xdart_processed,
         _remember_displayed_frames=lambda: None,
         sigUpdate=_FakeSignal(),
     )

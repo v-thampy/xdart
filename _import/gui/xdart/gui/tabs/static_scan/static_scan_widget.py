@@ -500,26 +500,35 @@ class staticWidget(QWidget):
             info = getattr(frame, "scan_info", None)
             if info:
                 import pandas as pd
-                try:
-                    ser = pd.Series(info, dtype="float64")
-                    with self.scan.scan_lock:
-                        sd = self.scan.scan_data
-                        if list(sd.columns):
-                            sd.loc[idx] = ser
-                            # In-order fast path: frames usually arrive in
-                            # ascending order, so the row just appended is
-                            # already last — skip the O(N log N) sort_index
-                            # on every frame.  Only an out-of-order insert
-                            # (rare: reload/replace) pays for the sort.
-                            index = sd.index
-                            if len(index) >= 2 and index[-1] < index[-2]:
-                                sd.sort_index(inplace=True)
-                        else:
-                            self.scan.scan_data = pd.DataFrame(
-                                info, index=[idx], dtype="float64")
-                except (ValueError, TypeError):
-                    logger.debug("scan_data update skipped for idx=%s", idx,
-                                 exc_info=True)
+                from xdart.modules.ewald.scan import _numeric_scan_info
+                # Keep only numeric-coercible fields — a single non-numeric
+                # value (sample name, "24.4C" temperature, timestamp) would
+                # otherwise make pd.Series(..., dtype="float64") raise and
+                # silently skip the whole row, leaving scan_data empty and
+                # the metadata panel blank in non-batch.  Mirrors
+                # LiveScan.add_frame's _numeric_scan_info filter.
+                numeric_info = _numeric_scan_info(info)
+                if numeric_info:
+                    try:
+                        ser = pd.Series(numeric_info, dtype="float64")
+                        with self.scan.scan_lock:
+                            sd = self.scan.scan_data
+                            if list(sd.columns):
+                                sd.loc[idx] = ser
+                                # In-order fast path: frames usually arrive in
+                                # ascending order, so the row just appended is
+                                # already last — skip the O(N log N) sort_index
+                                # on every frame.  Only an out-of-order insert
+                                # (rare: reload/replace) pays for the sort.
+                                index = sd.index
+                                if len(index) >= 2 and index[-1] < index[-2]:
+                                    sd.sort_index(inplace=True)
+                            else:
+                                self.scan.scan_data = pd.DataFrame(
+                                    numeric_info, index=[idx], dtype="float64")
+                    except (ValueError, TypeError):
+                        logger.debug("scan_data update skipped for idx=%s", idx,
+                                     exc_info=True)
 
         # P4: per-frame the *only* thing we do is remember the latest
         # idx + restart the coalescing timer.  The heavy list-widget
@@ -570,7 +579,7 @@ class staticWidget(QWidget):
         self.h5viewer.update_data(emit_update=False)
         if self.h5viewer.auto_last:
             self.latest_frame(emit_update=False)
-        self.h5viewer.data_changed()
+        self.h5viewer.data_changed()  # → sigUpdate → set_data → metawidget.update()
 
     def disable_auto_last(self, q):
         """
@@ -689,8 +698,9 @@ class staticWidget(QWidget):
         
         if self.h5viewer.auto_last:
             self.latest_frame()
-            
+
         self.displayframe.update()
+        self.metawidget.update()
 
     def integrator_thread_finished(self):
         """Function connected to threadFinished signals for
@@ -782,9 +792,16 @@ class staticWidget(QWidget):
         # screen until this scan's first frame replaces it.
         if self.h5viewer.live_run_active:
             try:
+                import pandas as pd
                 with self.scan.scan_lock:
                     self.scan.frames.index.clear()
                     self.scan.frames._in_memory.clear()
+                    # Drop the previous scan's whole-scan metadata table so the
+                    # panel resets when a new scan starts; update_data rebuilds
+                    # it from this scan's frames.  Batch resets via its reload
+                    # path — the live run skips that, so without this the stale
+                    # table lingered and metawidget.update() below re-rendered it.
+                    self.scan.scan_data = pd.DataFrame()
             except AttributeError:
                 pass
 
@@ -796,6 +813,10 @@ class staticWidget(QWidget):
         self.h5viewer.latest_idx = 1
         self.h5viewer.update_scans()
         self.h5viewer.update()
+        # Refresh the metadata panel when a new scan starts — otherwise it
+        # only repopulates on the existing set_data / update_all paths and
+        # can stay empty for the first frames of a run.
+        self.metawidget.update()
 
     def update_scattering_geometry(self, gi):
         """Connected to sigUpdateGI from wrangler. Called when scattering
@@ -902,6 +923,32 @@ class staticWidget(QWidget):
             self.wrangler.enabled(True)
 
         gc.collect()
+
+        # XYE-only batch (Int 1D (XYE)): there is no .nxs to auto-load, so the
+        # block above skipped the end-of-batch reload.  Show the folder of
+        # generated iq_/itth_ files (written to <scan_dir>/<scan_name> by
+        # save_1d) in XYE Viewer mode so the outputs are actually listed.
+        # Done last so integrator_thread_finished()'s refresh doesn't undo it.
+        if is_batch and is_xye_only:
+            try:
+                xye_dir = os.path.join(
+                    os.path.dirname(self.scan.data_file), self.scan.name)
+                if os.path.isdir(xye_dir):
+                    self.h5viewer.dirname = xye_dir
+                    # Same path the XYE Viewer combo takes: set viewer_mode,
+                    # panels, selection mode, and refresh listScans.
+                    self._on_viewer_mode_changed('xye')
+                    # Auto-select the last (most recent) generated file so
+                    # the final pattern is shown without a manual click.
+                    self.h5viewer.select_last_scan_entry()
+                else:
+                    logger.debug(
+                        'XYE-only batch finished but output dir not found: %s',
+                        xye_dir)
+            except Exception:
+                logger.debug(
+                    'Could not show XYE output folder after batch',
+                    exc_info=True)
 
     def _on_viewer_mode_changed(self, viewer_mode_str):
         """Enable or disable the integrator panel and update h5viewer for viewer mode.

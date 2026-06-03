@@ -37,7 +37,7 @@ import h5py
 from pyqtgraph import Qt
 
 # Project imports
-from xdart.modules.live import LiveFrame, LiveScan
+from xdart.modules.live import LiveFrame, LiveScan, IncidenceAngleUnresolved
 from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from ssrl_xrd_tools.io.image import read_image, count_frames
@@ -100,7 +100,16 @@ def _gi_2d_range_keys(args):
 
 
 def _padded_axis_range(axis, pad_fraction=0.02):
-    """Return a slightly padded finite range for an integrated axis."""
+    """Return a slightly padded finite range for an integrated axis.
+
+    Returns ``None`` when the axis is missing, has no finite samples, or is
+    *collapsed* (span <= 0 — every finite value identical).  A collapsed
+    axis means the scout integration was degenerate (e.g. GI at a 0°
+    incidence); freezing a padded tiny range from it would clamp every
+    subsequent frame onto that collapsed grid and blank the whole scan.
+    Returning ``None`` leaves the range unfrozen so the caller can surface
+    the problem instead of silently squashing the output.
+    """
     if axis is None:
         return None
     arr = np.asarray(axis, dtype=float)
@@ -111,10 +120,30 @@ def _padded_axis_range(axis, pad_fraction=0.02):
     hi = float(np.nanmax(arr))
     span = hi - lo
     if span <= 0:
-        pad = max(abs(lo) * pad_fraction, 1e-6)
-    else:
-        pad = max(span * pad_fraction, 1e-9)
+        return None
+    pad = max(span * pad_fraction, 1e-9)
     return lo - pad, hi + pad
+
+
+def _result_intensity_all_dummy(result, dummy=-1.0):
+    """True if a 2D integration result has no real signal.
+
+    A grazing-incidence map integrated at a degenerate incidence (e.g. a
+    defaulted 0°) comes back as an all-dummy (``<= -1``) / empty grid — a
+    blank cake.  The scout uses this to refuse freezing a representative
+    grid off a blank scout frame, and tests use it to guard against the
+    eiger "all -1.0" regression.
+    """
+    intensity = getattr(result, 'intensity', None)
+    if intensity is None:
+        return False
+    arr = np.asarray(intensity, dtype=float)
+    if arr.size == 0:
+        return True
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return True
+    return bool(np.all(finite <= dummy))
 
 
 def _freeze_gi_2d_ranges_from_result(args, result):
@@ -822,7 +851,14 @@ class imageThread(wranglerThread):
             series_average=self.series_average,
             integrator=scan._cached_integrator,
         )
-        incident_angle = scratch._get_incident_angle()
+        try:
+            incident_angle = scratch._get_incident_angle()
+        except IncidenceAngleUnresolved as exc:
+            # No resolvable incidence — skip prewarm.  Per-frame integration
+            # raises the same way and surfaces "set Manual theta"; we don't
+            # want to seed a degenerate 0° fiber integrator on the scan.
+            logger.warning('GI fiber-integrator prewarm skipped: %s', exc)
+            return
         scan._cached_fiber_integrator = create_fiber_integrator(
             scratch._poni_from_integrator(),
             incident_angle=incident_angle,
@@ -882,10 +918,16 @@ class imageThread(wranglerThread):
             )
             result = getattr(scratch, 'int_1d', None)
             if result is not None and _freeze_gi_1d_range_from_result(args, result):
-                logger.info(
+                logger.debug(
                     'GI 1D auto radial range frozen from scout frame %s: %s',
                     img_number, args.get('radial_range'),
                 )
+        except IncidenceAngleUnresolved as exc:
+            self.showLabel.emit(
+                'GI 1D needs an incidence angle: set Theta Motor to Manual '
+                'and enter the angle.'
+            )
+            logger.warning('GI 1D auto-range scout skipped: %s', exc)
         except Exception:
             logger.debug(
                 'GI 1D auto-range scout failed for %s; continuing with '
@@ -942,12 +984,46 @@ class imageThread(wranglerThread):
                 **dict(args),
             )
             result = getattr(scratch, 'int_2d', None)
+            if result is not None and _result_intensity_all_dummy(result):
+                # Blank scout frame — freezing a grid off it would propagate
+                # an empty cake to the whole scan.  Almost always a degenerate
+                # incidence; surface the fix and leave ranges unfrozen.
+                self.showLabel.emit(
+                    'GI 2D scout frame is blank (no signal); check the '
+                    'incidence angle / Theta Motor.'
+                )
+                logger.warning(
+                    'GI 2D scout frame %s integrated to an all-dummy grid at '
+                    'incidence %g°; ranges left unfrozen', img_number,
+                    incident_angle,
+                )
+                return
             if result is not None and _freeze_gi_2d_ranges_from_result(args, result):
-                logger.info(
+                logger.debug(
                     'GI 2D auto ranges frozen from scout frame %s: %s=%s, %s=%s',
                     img_number, keys[0], args.get(keys[0]),
                     keys[1], args.get(keys[1]),
                 )
+            # _padded_axis_range refuses a collapsed axis (returns None), so a
+            # still-None key after a successful scout means the scout grid was
+            # degenerate — surface it rather than letting per-frame auto-range
+            # produce a non-uniform stack the writer will reject.
+            if any(args.get(key) is None for key in keys):
+                self.showLabel.emit(
+                    'GI 2D scout produced a degenerate grid (incidence '
+                    f'{incident_angle:g}°). Set Theta Motor to Manual and '
+                    'enter the incidence angle.'
+                )
+                logger.warning(
+                    'GI 2D scout grid degenerate at incidence %g° for %s; '
+                    'ranges left unfrozen', incident_angle, img_file,
+                )
+        except IncidenceAngleUnresolved as exc:
+            self.showLabel.emit(
+                'GI 2D needs an incidence angle: set Theta Motor to Manual '
+                'and enter the angle.'
+            )
+            logger.warning('GI 2D auto-range scout skipped: %s', exc)
         except Exception:
             logger.debug(
                 'GI 2D auto-range scout failed for %s; continuing with '
@@ -986,49 +1062,23 @@ class imageThread(wranglerThread):
         if (getattr(scan, '_cached_data_mask', None) is None
                 and pending):
             self._prewarm_frame_mask(scan, pending[0][2])
-        # O5: prewarm the fiber integrator from the first pending
-        # frame so the per-worker fiber_pool below is non-None.
-        # Without this every worker built its own fiber integrator
-        # per frame (slow, especially for the first frame of each
-        # worker where pyFAI's CSR LUT cost is paid).  Mirrors the
-        # ``_prewarm_fiber_integrator`` path the NeXus wrangler
-        # already runs before its parallel section.
-        if (self.gi
-                and scan._cached_fiber_integrator is None
-                and pending):
-            try:
-                self._prewarm_fiber_integrator_spec(scan, pending[0])
-            except Exception as e:
-                # Fall through: workers still build their own fiber
-                # integrators per frame, just without the speedup.
-                logger.debug(
-                    "SPEC GI fiber prewarm failed (%s); workers will "
-                    "build their own per-frame", e,
-                )
-        # H2: per-worker fiber-integrator pool (matches IntegratorPool
-        # for the regular AzimuthalIntegrator).  None when GI is off
-        # or when the prewarm hasn't seeded _cached_fiber_integrator
-        # yet — _borrow_fiber_integrator falls back to the per-frame
-        # build in those cases.
-        fiber_pool = (
-            ensure_integrator_pool(
-                scan, '_cached_fiber_integrator', n_workers,
-                pool_attr='_cached_fiber_integrator_pool',
-            )
-            if self.gi and scan._cached_fiber_integrator is not None
-            else None
-        )
-        # Capture the angle the prewarmed fiber integrator was built
-        # for.  When ``gi`` is on and a per-frame frame's incidence
-        # angle drifts from this (i.e. ω varies across the scan, as
-        # opposed to a sin²ψ-style fixed-ω χ/φ scan), the worker has
-        # to fall back to a worker-local fiber integrator built at
-        # the correct angle.  Reusing the prewarm would silently
-        # integrate every frame as if it were at frame 0's incidence.
-        # 1e-4 deg is below the noise floor of beamline motor readouts
-        # and well below pyFAI's solid-angle sensitivity.
-        cached_gi_angle = self._cached_gi_incident_angle
-        _GI_ANGLE_TOL = 1e-4
+        # GI batch builds a FRESH fiber integrator per frame at that
+        # frame's own resolved incidence angle — no prewarm, no pool.
+        #
+        # The pooled/prewarmed fiber integrator was seeded from frame 0's
+        # incidence and reused for frames whose angle matched within tol;
+        # on an angle-dependence scan (ω varies per frame) that silently
+        # integrated later frames at the wrong incidence, collapsing the
+        # qoop axis (the batch GI cake bug).  The pool gave ~no benefit
+        # for angle-dependence scans anyway (every frame's angle differs,
+        # so every frame rebuilt regardless).  An angle-keyed fiber pool
+        # is left as a later optimization.
+        #
+        # ``fiber_pool=None`` makes ``_borrow_fiber_integrator`` build a
+        # fresh integrator from ``frame._get_incident_angle()`` for every
+        # frame (and raise IncidenceAngleUnresolved → frame skipped +
+        # "set Manual theta" — never a degenerate 0°).
+        fiber_pool = None
         skip_2d = scan.skip_2d
         bai_1d_args = dict(scan.bai_1d_args)
         bai_2d_args = dict(scan.bai_2d_args)
@@ -1264,7 +1314,17 @@ class imageThread(wranglerThread):
         _t_frame = time.time() - _t1
 
         if self.gi:
-            _incident_angle = frame._get_incident_angle()
+            try:
+                _incident_angle = frame._get_incident_angle()
+            except IncidenceAngleUnresolved as exc:
+                # Refuse to integrate GI at a degenerate 0°.  Surface the
+                # fix and skip the frame rather than emit a blank cake.
+                self.showLabel.emit(
+                    'GI needs an incidence angle: set Theta Motor to Manual '
+                    'and enter the angle.'
+                )
+                logger.warning('Skipping GI frame %s: %s', img_file, exc)
+                return
             if (scan._cached_fiber_integrator is None
                     or _incident_angle != self._cached_gi_incident_angle):
                 scan._cached_fiber_integrator = create_fiber_integrator(

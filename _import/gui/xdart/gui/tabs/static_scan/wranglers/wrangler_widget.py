@@ -349,6 +349,11 @@ class wranglerThread(Qt.QtCore.QThread):
             yield None
             return
         cached_angle = getattr(scan, "_cached_fiber_integrator_angle", None)
+        # gi is True here (returned early otherwise), so an unresolved
+        # incidence is a real configuration error — re-raise it so the
+        # worker's integration fails fast instead of silently building a
+        # degenerate 0° fiber integrator (blank cake).  The wrangler
+        # surfaces "set Manual theta".
         try:
             frame_angle = frame._get_incident_angle()
         except (AttributeError, ValueError):

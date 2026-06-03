@@ -17,6 +17,8 @@ import time
 import numpy as np
 from pathlib import Path
 
+from .display_logic import RawSource, choose_raw_source, sentinel_mask
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,22 +58,12 @@ class DisplayDataMixin:
 
     @staticmethod
     def _sanitize_display_image(data):
-        """Return a float image with detector sentinels masked to NaN."""
-        arr = np.asarray(data, dtype=float)
-        bad = ~np.isfinite(arr) | (arr >= 4294967295.0)
-        if arr.size and np.isfinite(arr).any():
-            # Some 16-bit detector/raw readers preserve invalid pixels as the
-            # uint16 ceiling.  If enough pixels sit exactly at 65535, treat
-            # that ceiling as a display sentinel so autoscale uses the real
-            # image range instead of rendering the frame nearly black.
-            finite = np.isfinite(arr)
-            sentinel16 = finite & (arr == 65535.0)
-            if sentinel16.any() and sentinel16.sum() / arr.size > 1e-4:
-                bad |= sentinel16
-        if bad.any():
-            arr = arr.copy()
-            arr[bad] = np.nan
-        return arr
+        """Return a float image with detector sentinels masked to NaN.
+
+        Thin wrapper over the pure :func:`display_logic.sentinel_mask`
+        (Stage 1 extraction); the masking logic is unit-tested headlessly.
+        """
+        return sentinel_mask(data)
 
     def _snapshot_data(self, idxs):
         """Return a small {idx: (frame_1d, frame_2d_dict)} dict for
@@ -132,16 +124,20 @@ class DisplayDataMixin:
             thumb = frame_2d.get('thumbnail')
             if thumb is None and frame_1d is not None:
                 thumb = getattr(frame_1d, 'thumbnail', None)
-            if prefer_thumbnail and thumb is not None:
+            # Stage 1: the raw-vs-thumbnail-vs-none decision is the pure
+            # ``choose_raw_source`` (unit-tested headlessly).  want_raw is
+            # always True here — this path never refuses full raw data.
+            src = choose_raw_source(
+                raw is not None, thumb is not None,
+                prefer_thumbnail=prefer_thumbnail, want_raw=True,
+            )
+            if src is RawSource.THUMBNAIL and prefer_thumbnail:
+                # Honour an explicit thumbnail preference: feed the thumbnail
+                # through the raw path with no background subtraction (its
+                # mask is already baked in).
                 raw = thumb
                 bg = 0
-                source = 'thumbnail'
-            elif raw is not None:
-                source = 'raw'
-            elif thumb is not None:
-                source = 'thumbnail'
-            else:
-                source = None
+            source = src.value if src is not RawSource.NONE else None
             # F1: was `for kk in range(3): try: ...; break; except
             # ValueError: time.sleep(0.5)`.  The retry/sleep pattern
             # was running on the Qt thread — visible UI freeze on
@@ -438,7 +434,15 @@ class DisplayDataMixin:
             return np.array([]), np.array([])
         radial = np.asarray(int_2d.radial, dtype=float)
         azimuthal = int_2d.azimuthal
-        if getattr(self.scan, 'gi', False):
+        # Return GI reciprocal-space axes verbatim — no Q↔2θ conversion.
+        # Honour the result's *units* (not just the live ``scan.gi`` flag):
+        # a reloaded qip/qoop cake whose scan.gi wasn't restored would
+        # otherwise be run through the q→2θ arcsin path (out-of-range qip →
+        # collapsed/blank cake).  See display_logic.is_gi_2d_units.
+        from .display_logic import is_gi_2d_units
+        if getattr(self.scan, 'gi', False) or is_gi_2d_units(
+                getattr(int_2d, 'unit', ''),
+                getattr(int_2d, 'azimuthal_unit', '')):
             return radial, azimuthal
 
         from .display_constants import AA_inv, Th

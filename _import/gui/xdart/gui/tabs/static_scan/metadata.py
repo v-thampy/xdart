@@ -100,7 +100,14 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         # per refresh, and rebuilding a hidden table is wasted work.  The
         # panel re-renders from the current scan_data the next time it
         # becomes visible (Qt repaints on show).
-        if not self.isVisible():
+        #
+        # Gate on the TABLEVIEW, not ``self``: the host installs only this
+        # widget's *layout* into its metaFrame (``metaFrame.setLayout(
+        # metawidget.layout)``), so the metadataWidget QWidget itself is
+        # never shown and ``self.isVisible()`` is always False — which
+        # silently blanked the panel.  The tableview is the widget actually
+        # on screen, so its visibility is the correct gate.
+        if not self.tableview.isVisible():
             return
         sd = getattr(self.scan, "scan_data", None)
         if sd is not None and len(sd.index) and len(sd.columns):

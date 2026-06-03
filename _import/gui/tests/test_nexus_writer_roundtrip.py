@@ -1359,3 +1359,63 @@ def test_positioners_align_to_frame_count_when_metadata_partial(tmp_path):
         assert th.shape[0] == N_FRAMES        # aligned, not 2
         assert not np.isnan(th[:2]).any()     # real metadata preserved
         assert np.isnan(th[2:]).all()         # missing frames NaN-padded
+
+
+# ---------------------------------------------------------------------------
+# scan_data READ round-trip (the GUI batch->reload path, headless)
+# ---------------------------------------------------------------------------
+
+def test_scan_data_survives_save_then_load_from_h5(tmp_path):
+    """The batch flow writes scan_data then reloads the .nxs for display via
+    LiveScan.load_from_h5.  scan_data (motor metadata incl. the GI ``th``
+    incidence motor) must come back populated — an empty scan_data leaves the
+    metadata panel blank AND collapses the GI-2D geometry.  Reproduces the
+    reported regression headlessly: write via the real writer, reload via the
+    real loader, assert the table survives.
+    """
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
+    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+
+    geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
+    scan_data = pd.DataFrame({
+        "tth": np.linspace(10.0, 14.0, N_FRAMES, dtype=np.float32),
+        "th": np.linspace(0.10, 0.40, N_FRAMES, dtype=np.float32),
+        "i0": np.linspace(1e6, 1.2e6, N_FRAMES, dtype=np.float32),
+    })
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    scan = _DuckSphere(frames, scan_data=scan_data, geometry=geom)
+
+    path = tmp_path / "scan_data_rt.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    loaded = LiveScan(name="rt", data_file=str(path))
+    loaded.load_from_h5()
+
+    sd = loaded.scan_data
+    assert sd is not None and len(sd.index) == N_FRAMES, (
+        f"scan_data empty after reload (got {None if sd is None else len(sd.index)} rows)"
+    )
+    # The GI incidence motor must be recoverable for the geometry/panel.
+    assert "th" in sd.columns, f"'th' missing from reloaded scan_data {list(sd.columns)}"
+    np.testing.assert_allclose(
+        np.asarray(sd["th"].values, dtype=float),
+        scan_data["th"].values, rtol=1e-4)
+    # A pure (non-geometry) motor must survive too.
+    assert "i0" in sd.columns
+
+
+def test_numeric_scan_info_drops_non_numeric_keeps_motors():
+    """Regression: a non-numeric metadata field (comment/name/date) must not
+    blank scan_data.  _numeric_scan_info keeps numeric motors (incl. the GI
+    'th' incidence motor) and drops only the non-coercible fields, instead of
+    pd.Series(dtype='float64') failing wholesale."""
+    from xdart.modules.ewald.scan import _numeric_scan_info
+    info = {"th": 0.2, "i0": 1.0e6, "tth": 12.5,
+            "UserComment": "hello", "date": "2026-03-27", "scan": "Combi4"}
+    out = _numeric_scan_info(info)
+    assert out == {"th": 0.2, "i0": 1.0e6, "tth": 12.5}
+    # numeric strings still coerce (SPEC metas often store numbers as text)
+    assert _numeric_scan_info({"th": "0.30"}) == {"th": 0.30}
+    # all-numeric input is unchanged (the historical working case)
+    assert _numeric_scan_info({"th": 0.1, "i0": 5.0}) == {"th": 0.1, "i0": 5.0}

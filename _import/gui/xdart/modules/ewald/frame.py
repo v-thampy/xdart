@@ -33,6 +33,18 @@ from ssrl_xrd_tools.integrate.gid import (
 
 
 
+class IncidenceAngleUnresolved(Exception):
+    """A GI frame's incidence angle could not be resolved.
+
+    Raised by :meth:`LiveFrame._get_incident_angle` when the incidence
+    motor is neither a number (the Manual-Theta path) nor a motor name
+    present in the frame metadata.  Integrating a grazing-incidence map at
+    a defaulted 0° degenerates the qip/qoop transform (a blank/collapsed
+    cake), so callers must surface a "set Manual theta" state rather than
+    integrate silently.  See ``_get_incident_angle``.
+    """
+
+
 # Maximum thumbnail dimension — both axes are scaled to fit within this.
 _THUMBNAIL_MAX = 256
 
@@ -369,7 +381,21 @@ class LiveFrame():
         self.incidence_motor = value
 
     def _get_incident_angle(self):
-        """Return incident angle in degrees from incidence_motor or scan_info."""
+        """Return incident angle in degrees.
+
+        Resolution order:
+        1. ``incidence_motor`` parsed directly as a number — this is the
+           Manual-Theta path (the GI panel sets ``incidence_motor`` to the
+           entered ``th_val`` when "Theta Motor" is *Manual*, e.g. for Eiger
+           with no metadata).
+        2. ``incidence_motor`` treated as a motor name, looked up
+           case-insensitively in ``scan_info`` (the metadata).
+        3. Neither resolves → raise :class:`IncidenceAngleUnresolved`.
+           A GI integration at a defaulted 0° degenerates the qip/qoop
+           transform (blank/collapsed cake), so we refuse rather than
+           return 0.0 silently.  Callers surface "set Theta Motor to
+           Manual and enter the angle".
+        """
         try:
             return float(self.incidence_motor)
         except (ValueError, TypeError):
@@ -377,8 +403,16 @@ class LiveFrame():
             motor = str(self.incidence_motor).lower()
             for key, val in self.scan_info.items():
                 if key.lower() == motor:
-                    return float(val)
-            return 0.0
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        break
+            raise IncidenceAngleUnresolved(
+                "GI incidence motor {!r} is not a number and was not found "
+                "in the frame metadata; refusing to integrate at a degenerate "
+                "0°. Set 'Theta Motor' to Manual and enter the incidence "
+                "angle.".format(self.incidence_motor)
+            )
 
     def reset(self):
         """Clears all data, resets to a default LiveFrame.
