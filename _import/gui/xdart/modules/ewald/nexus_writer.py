@@ -246,6 +246,7 @@ def save_scan_to_nexus(
             prepared_1d, prepared_2d,
         )
         _validate_prepared_integrated(h5f.require_group(entry), prepared_1d, prepared_2d)
+        _drop_filtered_replace_rows(h5f, prepared_1d, prepared_2d)
 
         # 2. Provenance — append mode: only on first save or finalize.
         # Replace mode: always rewrite so the persisted ``bai_*_args``
@@ -613,13 +614,13 @@ def _axis_signatures_equal(left, right) -> bool:
 def _validate_prepared_integrated(entry_grp, prepared_1d, prepared_2d) -> None:
     """Preflight every selected output before committing either one."""
     from ssrl_xrd_tools.io.nexus import validate_integrated_stack_write
-    if prepared_1d is not None:
+    if prepared_1d is not None and prepared_1d["results"]:
         validate_integrated_stack_write(
             entry_grp,
             frame_indices=prepared_1d["indices"],
             results_1d=prepared_1d["results"],
         )
-    if prepared_2d is not None:
+    if prepared_2d is not None and prepared_2d["results"]:
         validate_integrated_stack_write(
             entry_grp,
             frame_indices=prepared_2d["indices"],
@@ -678,6 +679,7 @@ def _filter_prepared_output(
     kept_frames = []
     kept_indices = []
     kept_results = []
+    dropped_indices = []
     for frame, idx, result in zip(
         prepared["frames"], prepared["indices"], prepared["results"],
     ):
@@ -693,12 +695,13 @@ def _filter_prepared_output(
                 label,
                 error_details(publication),
             )
+            dropped_indices.append(idx)
             continue
         kept_frames.append(frame)
         kept_indices.append(idx)
         kept_results.append(result)
 
-    if not kept_frames:
+    if not kept_frames and not (dropped_indices and prepared.get("is_replace")):
         logger.warning(
             "Skipping %s integrated stack write: every selected row failed "
             "publication validation.",
@@ -711,7 +714,94 @@ def _filter_prepared_output(
     filtered["frames"] = kept_frames
     filtered["indices"] = kept_indices
     filtered["results"] = kept_results
+    filtered["dropped_indices"] = dropped_indices
     return filtered
+
+
+def _drop_filtered_replace_rows(h5f, *prepared_outputs) -> None:
+    for prepared in prepared_outputs:
+        if not prepared or not prepared.get("is_replace"):
+            continue
+        dropped = prepared.get("dropped_indices") or []
+        if not dropped:
+            continue
+        _drop_integrated_rows(h5f, prepared["group_path"], dropped)
+        _refresh_group_cursor(
+            prepared["cursor"], h5f, prepared["group_path"], prepared["scan_index"],
+        )
+        from xdart.modules.ewald.frame_series import clear_frame_position_cache
+        clear_frame_position_cache(h5f.filename)
+
+
+def _drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
+    """Remove stale rows from an existing integrated_* stack by frame label."""
+    if group_path not in h5f or "frame_index" not in h5f[group_path]:
+        return
+    group = h5f[group_path]
+    labels = np.asarray(group["frame_index"][()], dtype=np.int64)
+    drop = {int(idx) for idx in frame_indices}
+    keep_mask = np.asarray([int(label) not in drop for label in labels], dtype=bool)
+    if bool(np.all(keep_mask)):
+        return
+
+    parent_path, name = group_path.rsplit("/", 1)
+    parent = h5f[parent_path]
+    if not bool(np.any(keep_mask)):
+        del parent[name]
+        return
+
+    group_attrs = dict(group.attrs.items())
+    datasets = []
+    for key, obj in group.items():
+        if not isinstance(obj, h5py.Dataset):
+            continue
+        data = obj[()]
+        row_aligned = data.shape[:1] == labels.shape and key in {
+            "frame_index", "intensity", "sigma",
+        }
+        if row_aligned:
+            data = data[keep_mask]
+        datasets.append((
+            key,
+            data,
+            dict(obj.attrs.items()),
+            obj.compression,
+            obj.compression_opts,
+            obj.shuffle,
+            obj.fletcher32,
+            row_aligned,
+            obj.chunks,
+        ))
+
+    del parent[name]
+    new_group = parent.create_group(name)
+    for key, value in group_attrs.items():
+        new_group.attrs[key] = value
+    for (
+        key,
+        data,
+        attrs,
+        compression,
+        compression_opts,
+        shuffle,
+        fletcher32,
+        row_aligned,
+        chunks,
+    ) in datasets:
+        kwargs = {}
+        if row_aligned:
+            kwargs["maxshape"] = (None,) + tuple(np.asarray(data).shape[1:])
+            if chunks is not None:
+                kwargs["chunks"] = chunks
+        if compression is not None:
+            kwargs["compression"] = compression
+            if compression_opts is not None:
+                kwargs["compression_opts"] = compression_opts
+            kwargs["shuffle"] = shuffle
+            kwargs["fletcher32"] = fletcher32
+        ds = new_group.create_dataset(key, data=data, **kwargs)
+        for attr_key, value in attrs.items():
+            ds.attrs[attr_key] = value
 
 
 def _prepare_integrated_1d(f, scan, *, entry: str,
@@ -740,11 +830,12 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
         "results": results,
         "cursor": cursor,
         "scan_index": scan.frames.index,
+        "is_replace": replace_frame_indices is not None and group_path in h5f,
     }
 
 
 def _commit_integrated_1d(f, prepared) -> None:
-    if prepared is None:
+    if prepared is None or not prepared["results"]:
         return
     from ssrl_xrd_tools.io.nexus import write_integrated_stack
     h5f = _h5(f)
@@ -786,11 +877,12 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
         "results": results,
         "cursor": cursor,
         "scan_index": scan.frames.index,
+        "is_replace": replace_frame_indices is not None and group_path in h5f,
     }
 
 
 def _commit_integrated_2d(f, prepared) -> None:
-    if prepared is None:
+    if prepared is None or not prepared["results"]:
         return
     from ssrl_xrd_tools.io.nexus import write_integrated_stack
     h5f = _h5(f)

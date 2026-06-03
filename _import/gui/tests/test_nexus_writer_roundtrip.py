@@ -542,6 +542,53 @@ def test_replace_frame_indices_updates_only_targets(tmp_path):
         assert np.array_equal(new_on_disk_2d[fi], orig_2d[fi])
 
 
+def test_replace_filtered_2d_row_removes_stale_disk_row(tmp_path, caplog):
+    """A rejected replace-mode 2D row must not leave old cake data behind."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    caplog.set_level(logging.WARNING, logger="xdart.modules.ewald.nexus_writer")
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "replace_filtered_2d.nxs"
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        old_2d = np.asarray(f["entry/integrated_2d/intensity"][()])
+        np.testing.assert_array_equal(
+            f["entry/integrated_2d/frame_index"][()], [0, 1, 2],
+        )
+
+    new_1d = np.full(N_Q, 42.0, dtype=np.float32)
+    frames[1].int_1d = _DuckResult1D(
+        radial=np.asarray(frames[1].int_1d.radial),
+        intensity=new_1d,
+        sigma=frames[1].int_1d.sigma,
+    )
+    frames[1].int_2d = _DuckResult2D(
+        radial=np.asarray(frames[1].int_2d.radial),
+        azimuthal=np.asarray(frames[1].int_2d.azimuthal),
+        intensity=np.full((N_Q, N_CHI), -1.0, dtype=np.float32),
+    )
+
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
+        replace_frame_indices=[1],
+    )
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_allclose(
+            f["entry/integrated_1d/intensity"][1], new_1d,
+        )
+        np.testing.assert_array_equal(
+            f["entry/integrated_2d/frame_index"][()], [0, 2],
+        )
+        new_2d = np.asarray(f["entry/integrated_2d/intensity"][()])
+        np.testing.assert_array_equal(new_2d[0], old_2d[0])
+        np.testing.assert_array_equal(new_2d[1], old_2d[2])
+    assert "Skipping frame 1 2D write" in caplog.text
+
+
 def test_replace_with_no_existing_file_degrades_to_append(tmp_path):
     """First save with replace_frame_indices set should still succeed —
     no on-disk dataset means there's nothing to replace, so the writer
