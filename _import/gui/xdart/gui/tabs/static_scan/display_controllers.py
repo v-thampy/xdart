@@ -28,6 +28,10 @@ import logging
 from .display_logic import (
     Mode, compute_display_state, build_payload, register_controller,
 )
+from .display_publication import (
+    PublicationDisplayAdapter,
+    publication_availability,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,12 @@ def _data_snapshot(widget):
             for k, v in widget.data_2d.items()
             if isinstance(v, dict)
         }
+        store = getattr(widget, "publication_store", None)
+        if store is not None:
+            pub_1d, pub_2d, pub_raw = publication_availability(store)
+            loaded_1d.update(pub_1d)
+            loaded_2d.update(pub_2d)
+            raw_avail.update(pub_raw)
     return loaded_1d, loaded_2d, raw_avail
 
 
@@ -82,9 +92,12 @@ class _BaseController:
         )
 
     def build_payload(self, widget, state):
-        # store=None ⇒ the renderer delegates the pixel push to the legacy
-        # draw methods (Stage 3 default); a real store lands later.
-        return build_payload(state)
+        store = getattr(widget, "publication_store", None)
+        adapter = (
+            None if store is None
+            else PublicationDisplayAdapter(store, widget=widget)
+        )
+        return build_payload(state, adapter)
 
 
 class ScanDisplayController(_BaseController):

@@ -18,6 +18,11 @@ from xdart.modules.frame_publication import (
     publication_from_live_frame,
     validate_publication,
 )
+from xdart.gui.tabs.static_scan.display_logic import Mode, compute_display_state
+from xdart.gui.tabs.static_scan.display_publication import (
+    PublicationDisplayAdapter,
+    publication_availability,
+)
 
 
 class DuckFrame:
@@ -129,3 +134,48 @@ def test_publication_from_nexus_frame_matches_live_style_view(tmp_path):
         live_publication.view,
         reload_publication.view,
     )
+
+
+def test_publication_display_adapter_exposes_availability_and_plot_payload():
+    frame = DuckFrame(idx=9)
+    frame.int_1d = IntegrationResult1D(
+        radial=np.linspace(10.0, 20.0, 4),
+        intensity=np.array([10.0, 20.0, 30.0, 40.0]),
+        sigma=np.ones(4),
+        unit="2th_deg",
+    )
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+
+    loaded_1d, loaded_2d, raw_avail = publication_availability(store)
+    assert loaded_1d == {9}
+    assert loaded_2d == {9}
+    assert raw_avail[9] == {"has_raw": True, "has_thumbnail": True}
+
+    class _Widget:
+        def normalize(self, data, metadata):
+            return np.asarray(data, dtype=float) / metadata["monitor"]
+
+    state = compute_display_state(
+        mode=Mode.INT_1D,
+        selected_ids=(9,),
+        all_frame_index=[9],
+        loaded_1d_keys=loaded_1d,
+        loaded_2d_keys=loaded_2d,
+        gi=False,
+        plot_unit="q_A^-1",
+        method="Single",
+        unit_changed=False,
+        prev_overlaid_ids=(),
+        raw_availability=raw_avail,
+        titles={},
+        generation=store.generation,
+    )
+    payload = PublicationDisplayAdapter(store, widget=_Widget()).plot_payload(state)
+
+    assert payload is not None
+    assert payload.axis_x.label == "2θ"
+    assert payload.axis_x.unit == "°"
+    assert payload.traces[0].label == "raw_0001.tif"
+    np.testing.assert_allclose(payload.traces[0].x, frame.int_1d.radial)
+    np.testing.assert_allclose(payload.traces[0].y, frame.int_1d.intensity / 100.0)

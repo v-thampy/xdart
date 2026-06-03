@@ -268,6 +268,9 @@ class DisplayPlotMixin:
             axis = getattr(self, '_viewer_x_axis_label', None)
             if axis is not None:
                 return axis
+        axis = getattr(self, '_payload_x_axis_label', None)
+        if axis is not None:
+            return axis
 
         plot_text = self.ui.plotUnit.currentText()
         m = re.match(r'^(.+?)\s*\((.+)\)$', plot_text)
@@ -280,7 +283,8 @@ class DisplayPlotMixin:
     def update_plot_view(self):
         """Updates 1D view of data in plot frame
         """
-        if (len(self.frame_ids) == 0) or len(self.data_1d) == 0:
+        using_publication = getattr(self, '_using_publication_plot_payload', False)
+        if (len(self.frame_ids) == 0) or (len(self.data_1d) == 0 and not using_publication):
             return
 
         # Clear curves

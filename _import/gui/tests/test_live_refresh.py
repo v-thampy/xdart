@@ -785,7 +785,8 @@ def _update_smoke_host():
     host.ui.plotMethod.currentText.return_value = 'Single'
     for name in ('get_idxs', '_note_selection_generation', '_bump_display_generation',
                  '_live_mode', '_live_display_state',
-                 '_draw_delegate', '_clear_delegate', 'render_display',
+                 '_draw_delegate', '_clear_delegate', '_payload_for_role',
+                 'render_display',
                  '_updated', 'update'):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
     return host, calls, dl
@@ -882,7 +883,8 @@ def _render_host():
     )
     host.ui.shareAxis.isChecked.return_value = False
     host.ui.imageUnit.currentIndex.return_value = 0
-    for name in ("_draw_delegate", "_clear_delegate", "render_display"):
+    for name in ("_draw_delegate", "_clear_delegate", "_payload_for_role",
+                 "_draw_payload", "render_display"):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
     return host, calls, dl
 
@@ -898,6 +900,42 @@ def test_render_display_int2d_draws_all_panels():
     assert "draw_plot" in calls and "draw_image" in calls and "draw_binned" in calls
     assert "label_2d" in calls and "preview" in calls
     assert not any(c.startswith("clear_") for c in calls)
+
+
+def test_render_display_uses_publication_plot_payload_when_present():
+    host, calls, dl = _render_host()
+    host.bkg_1d = 0
+    host.plot_data = [np.zeros(0), np.zeros(0)]
+    host.plot_data_range = [[0, 0], [0, 0]]
+    host.frame_names = []
+    host.overlaid_idxs = []
+    host._payload_x_axis_label = None
+    host._using_publication_plot_payload = False
+    host.update_plot_view = lambda: calls.append("payload_plot")
+
+    state = dl.compute_display_state(
+        mode=dl.Mode.INT_1D, selected_ids=(3,), all_frame_index=[3],
+        loaded_1d_keys={3}, loaded_2d_keys=set(), gi=False, plot_unit='q_A^-1',
+        method='Single', unit_changed=False, prev_overlaid_ids=(),
+        raw_availability={}, titles={}, generation=4)
+    payload = dl.DisplayPayload(
+        generation=4,
+        raw_image=None,
+        cake_image=None,
+        plot=dl.PlotPayload(
+            axis_x=dl.Axis("2θ", "°"),
+            traces=(dl.Trace("frame3", np.arange(3), np.array([1.0, 2.0, 3.0])),),
+        ),
+    )
+
+    host.render_display(state, payload)
+
+    assert "payload_plot" in calls
+    assert "draw_plot" not in calls
+    assert host.frame_names == ["frame3"]
+    assert host._payload_x_axis_label == ("2θ", "°")
+    np.testing.assert_allclose(host.plot_data[0], np.arange(3))
+    np.testing.assert_allclose(host.plot_data[1], [[1.0, 2.0, 3.0]])
 
 
 def test_render_display_image_viewer_draws_raw_clears_others():

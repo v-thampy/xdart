@@ -278,6 +278,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._last_plot_unit = -1
         self._plot_axis_info = []  # populated by set_axes()
         self._was_skip_2d = False  # track 1D-only state for transitions
+        self._payload_x_axis_label = None
+        self._using_publication_plot_payload = False
 
         # Cached display data
         self.image_data = (None, None)
@@ -558,6 +560,68 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             PanelRole.PLOT_1D: self.clear_plot_view,
         }.get(role)
 
+    def _payload_for_role(self, role, payload):
+        if payload is None:
+            return None
+        if role is PanelRole.PLOT_1D:
+            return payload.plot
+        if role is PanelRole.RAW_2D:
+            return payload.raw_image
+        if role is PanelRole.CAKE_2D:
+            return payload.cake_image
+        return None
+
+    def _draw_payload(self, role, payload_value, state):
+        if role is not PanelRole.PLOT_1D or payload_value is None:
+            return False
+
+        traces = tuple(getattr(payload_value, "traces", ()) or ())
+        if not traces:
+            self.clear_plot_view()
+            return True
+
+        ref_x = np.asarray(traces[0].x, dtype=float)
+        rows = []
+        names = []
+        for trace in traces:
+            x = np.asarray(trace.x, dtype=float)
+            y = np.asarray(trace.y, dtype=float)
+            if x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
+                y = np.interp(ref_x, x, y)
+            rows.append(y)
+            names.append(str(trace.label))
+
+        ydata = np.vstack(rows)
+        if self.bkg_1d is not None:
+            try:
+                ydata = ydata - self.bkg_1d
+            except ValueError:
+                logger.debug(
+                    "Skipping publication plot background with shape %s for %s",
+                    np.shape(self.bkg_1d), ydata.shape,
+                )
+
+        self.plot_data = [ref_x, ydata]
+        self.frame_names = names
+        self.overlaid_idxs = list(state.render_ids)
+        axis = payload_value.axis_x
+        self._payload_x_axis_label = (axis.label, axis.unit)
+
+        if ref_x.size == 0 or ydata.size == 0 or not np.isfinite(ydata).any():
+            self.clear_plot_view()
+            return True
+
+        self.plot_data_range = [
+            [np.nanmin(ref_x), np.nanmax(ref_x)],
+            [np.nanmin(ydata), np.nanmax(ydata)],
+        ]
+        self._using_publication_plot_payload = True
+        try:
+            self.update_plot_view()
+        finally:
+            self._using_publication_plot_payload = False
+        return True
+
     def render_display(self, state, payload):
         """Draw the display from ``state`` + ``payload``.  (Named
         ``render_display`` to avoid shadowing ``QWidget.render``.)
@@ -601,6 +665,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # draws were wrapped in a broad debug-logged guard.
         is_viewer = mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER)
         for role in plan.draw:
+            payload_value = self._payload_for_role(role, payload)
+            if payload_value is not None and self._draw_payload(role, payload_value, state):
+                continue
+            if role is PanelRole.PLOT_1D:
+                self._payload_x_axis_label = None
             draw = self._draw_delegate(role, mode)
             if draw is None:
                 continue

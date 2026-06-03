@@ -1217,9 +1217,25 @@ class H5Viewer(QWidget):
                     'gi_2d': {},
                     'thumbnail': thumb_data,
                 }
-                frame = LiveFrame(idx=frame_id, static=True, gi=False)
-                frame.scan_info = {'source_file': os.path.basename(fpath)}
+                frame = LiveFrame(
+                    idx=frame_id,
+                    map_raw=img_data,
+                    static=True,
+                    gi=False,
+                    scan_info={'source_file': os.path.basename(fpath)},
+                )
+                frame.thumbnail = thumb_data
+                frame.source_file = fpath
+                frame.source_frame_idx = frame_id
                 self.data_1d[int(frame_id)] = frame
+                store = getattr(self, "publication_store", None)
+                if store is not None:
+                    store.upsert(
+                        publication_from_live_frame(
+                            frame,
+                            generation=store.generation,
+                        )
+                    )
             logger.debug(
                 'Image Viewer loaded processed frame %s from %s via %s: '
                 'shape=%s finite=%d',
@@ -1257,9 +1273,24 @@ class H5Viewer(QWidget):
                 'thumbnail': None,
             }
             # Minimal data_1d entry so display doesn't crash
-            frame = LiveFrame(idx=frame_id, static=True, gi=False)
-            frame.scan_info = {'source_file': os.path.basename(fpath)}
+            frame = LiveFrame(
+                idx=frame_id,
+                map_raw=img_data,
+                static=True,
+                gi=False,
+                scan_info={'source_file': os.path.basename(fpath)},
+            )
+            frame.source_file = fpath
+            frame.source_frame_idx = frame_idx
             self.data_1d[int(frame_id)] = frame
+            store = getattr(self, "publication_store", None)
+            if store is not None:
+                store.upsert(
+                    publication_from_live_frame(
+                        frame,
+                        generation=store.generation,
+                    )
+                )
         logger.debug(
             'Image Viewer loaded frame %s from %s: shape=%s finite=%d '
             'min=%s max=%s',
