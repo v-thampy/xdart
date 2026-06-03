@@ -1642,6 +1642,59 @@ def test_nexus_viewer_loads_rows_and_previews_1d_2d_units(tmp_path):
     assert viewer.data_1d[key_raw].scan_info["dtype"] == "uint16"
 
 
+def test_wrangler_expands_active_groups_on_startup():
+    # P3 #8: GI / Threshold / Background groups default folded; if their
+    # enabling toggle is on (e.g. a restored session) the group must expand.
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    class _P:
+        def __init__(self, value=None, children=None):
+            self._value = value
+            self._children = children or {}
+            self.opts = {}
+
+        def value(self):
+            return self._value
+
+        def child(self, *path):
+            node = self
+            for name in path:
+                node = node._children[name]
+            return node
+
+        def setOpts(self, **o):
+            self.opts.update(o)
+
+    def _tree(grazing, threshold, bg):
+        gi = _P(children={"Grazing": _P(grazing)})
+        mask = _P(children={"Threshold": _P(threshold)})
+        bgg = _P(children={"bg_type": _P(bg)})
+        root = _P(children={"GI": gi, "Mask": mask, "BG": bgg})
+        return root, gi, mask, bgg
+
+    # Toggles on / source selected → groups expand.
+    root, gi, mask, bgg = _tree(True, True, "Single BG File")
+    host = SimpleNamespace(parameters=root)
+    host._expand_active_groups = MethodType(
+        imageWrangler._expand_active_groups, host,
+    )
+    host._expand_active_groups()
+    assert gi.opts.get("expanded") is True
+    assert mask.opts.get("expanded") is True
+    assert bgg.opts.get("expanded") is True
+
+    # All off / no background → groups left collapsed (no expand opt set).
+    root, gi, mask, bgg = _tree(False, False, "None")
+    host = SimpleNamespace(parameters=root)
+    host._expand_active_groups = MethodType(
+        imageWrangler._expand_active_groups, host,
+    )
+    host._expand_active_groups()
+    assert "expanded" not in gi.opts
+    assert "expanded" not in mask.opts
+    assert "expanded" not in bgg.opts
+
+
 def test_frames_panel_width_relaxes_in_nexus_mode_and_restores():
     # P3 #7: the Frames (listData) max width is 60 px in the .ui (right for
     # frame indices) but clips NeXus dataset labels.  It must relax in NeXus

@@ -395,6 +395,33 @@ class imageWrangler(wranglerWidget):
 
         self.setup()
         self._restore_from_session()
+        # Open the GI / Threshold / Background groups when their toggle is on
+        # (e.g. from a restored session) so the relevant controls are visible
+        # instead of folded; collapsed when off.
+        self._expand_active_groups()
+
+    def _expand_active_groups(self):
+        """Expand each wrangler group whose enabling param is set.
+
+        The GI / Intensity-Threshold / Background groups default folded.  If
+        Grazing is checked, Threshold is enabled, or a Background source is
+        selected (incl. after a session restore), expand that group via
+        ``setOpts(expanded=True)``; leave it collapsed when off."""
+        groups = (
+            ('GI', ('GI', 'Grazing'), lambda v: bool(v)),
+            ('Mask', ('Mask', 'Threshold'), lambda v: bool(v)),
+            ('BG', ('BG', 'bg_type'), lambda v: v not in (None, '', 'None')),
+        )
+        for group_name, child_path, is_on in groups:
+            try:
+                group = self.parameters.child(group_name)
+                value = self.parameters.child(*child_path).value()
+            except Exception:
+                logger.debug("expand-active-group skipped for %s", group_name,
+                             exc_info=True)
+                continue
+            if is_on(value):
+                group.setOpts(expanded=True)
 
     # --- Session persistence ---
 
