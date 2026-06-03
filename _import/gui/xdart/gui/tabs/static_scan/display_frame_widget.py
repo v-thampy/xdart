@@ -51,6 +51,7 @@ from .display_plot import DisplayPlotMixin
 from .display_logic import (
     Mode, LoadStatus, PanelRole, compute_display_state,
     build_payload, render_plan, controller_for, ImagePayload,
+    empty_display_state,
     resolve_selection, resolve_render_ids,
     xye_unit_from_filename, x_axis_for_unit, default_plot_unit,
 )
@@ -264,6 +265,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # scan/file load — so a worker result computed against an old
         # generation can be dropped (full enforcement lands in Stage 5).
         self.display_generation = 0
+        # True once an empty/no-data update has blanked all panels; reset
+        # when a data render draws.  Lets update() no-op on repeated empty
+        # updates instead of re-clearing every time.
+        self._display_blanked = False
         self._last_selection_sig = None
 
         # Stage 5: register the mode controllers (Scan/ImageViewer/XYEViewer)
@@ -534,12 +539,24 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._note_selection_generation()   # bump generation on selection change
 
         if not self._updated():
-            return True
+            # No usable data — empty selection, failed load, or cache miss.
+            # Render an EXPLICIT empty state that blanks every panel rather
+            # than early-returning and leaving a stale plot/raw/cake on
+            # screen.  No-op fast path: skip when we've already blanked and
+            # nothing has drawn since (current content is already correct).
+            if getattr(self, "_display_blanked", False):
+                return True
+            empty = empty_display_state(self._live_mode(), self.display_generation)
+            result = self.render_display(empty, None)
+            self._display_blanked = True
+            return result
 
         state = self._live_display_state()
         ctrl = controller_for(state.mode)
         payload = ctrl.build_payload(self, state)  # store=None ⇒ delegate draws
-        return self.render_display(state, payload)
+        result = self.render_display(state, payload)
+        self._display_blanked = False
+        return result
 
     # ── Render (Stage 3) ──────────────────────────────────────────────
 

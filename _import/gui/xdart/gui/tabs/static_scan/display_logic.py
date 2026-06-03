@@ -57,6 +57,7 @@ __all__ = [
     "DisplayPayload",
     "RenderPlan",
     "build_payload",
+    "empty_display_state",
     "render_plan",
     "register_controller",
     "controller_for",
@@ -635,6 +636,35 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
 # over from a previous mode/selection is always blanked (kills mode-switch
 # staleness), without render branching on mode.
 _RENDER_ROLES = (PanelRole.PLOT_1D, PanelRole.RAW_2D, PanelRole.CAKE_2D)
+
+
+def empty_display_state(mode, generation, *, title=""):
+    """A panel-less :class:`DisplayState` with ``EMPTY`` status.
+
+    :func:`render_plan` puts every managed panel in ``clear`` for this state,
+    so :meth:`render_display` blanks the plot, raw and cake panels.  Used to
+    render an *explicit* blank on an empty selection / failed load / cache
+    miss instead of early-returning and leaving stale content on screen
+    (the blank is intentional, §8)."""
+    return DisplayState(
+        mode=mode,
+        load_status=LoadStatus.EMPTY,
+        error_message=None,
+        generation=generation,
+        selected_ids=(),
+        render_ids=(),
+        overall=False,
+        gi=False,
+        x_unit="unknown",
+        x_label="x",
+        method="Single",
+        overlay=OverlayAction.REPLACE,
+        overlaid_ids=(),
+        title=title,
+        panels=(),
+        layout=(),
+        results=None,
+    )
 
 
 def build_payload(state, store=None):

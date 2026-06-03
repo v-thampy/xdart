@@ -1814,6 +1814,38 @@ def test_image_viewer_masks_uint16_ceiling_sentinel_before_autoscale():
     assert np.nanmax(host.image_data[0]) == 30.0
 
 
+def test_update_renders_blank_on_empty_no_data_instead_of_leaving_stale():
+    # P2 #3: update() used to early-return when _updated() reported no usable
+    # data (empty selection / failed load / cache miss), leaving a stale
+    # plot/raw/cake on screen.  It must instead render an explicit empty
+    # state that blanks every panel.
+    from xdart.gui.tabs.static_scan.display_logic import Mode
+
+    calls = []
+    host = SimpleNamespace(
+        display_generation=3,
+        get_idxs=lambda: None,
+        _note_selection_generation=lambda: None,
+        _updated=lambda: False,
+        _live_mode=lambda: Mode.IMAGE_VIEWER,   # skips INT-mode axis setup
+        clear_plot_view=lambda: calls.append("plot"),
+        clear_image_view=lambda: calls.append("image"),
+        clear_binned_view=lambda: calls.append("cake"),
+    )
+    host._clear_delegate = MethodType(displayFrameWidget._clear_delegate, host)
+    host.render_display = MethodType(displayFrameWidget.render_display, host)
+    host.update = MethodType(displayFrameWidget.update, host)
+
+    assert host.update() is True
+    assert set(calls) == {"plot", "image", "cake"}   # every panel blanked
+    assert host._display_blanked is True
+
+    # Repeated empty update is a no-op — current content is already blank.
+    calls.clear()
+    assert host.update() is True
+    assert calls == []
+
+
 def _plot_host(method="Overlay"):
     unit = _FakeIndexedCombo("Q", 0)
     method_combo = _FakeCombo(method)
