@@ -115,6 +115,34 @@ def test_classify_unknown(tmp_path):
     assert info.kind is ImageSourceKind.UNKNOWN
 
 
+def test_reduction_only_file_is_unknown(tmp_path):
+    p = tmp_path / "reduction_only.nxs"
+    with h5py.File(p, "w") as f:
+        entry = f.create_group("entry")
+        entry.create_group("reduction")
+
+    info = classify_image_source(p)
+
+    assert info.kind is ImageSourceKind.UNKNOWN
+    assert info.frame_labels == ()
+    assert not info.has_raw
+    assert not info.has_thumbnail
+
+
+def test_reduction_marker_does_not_hide_raw_detector_data(tmp_path):
+    p = tmp_path / "raw_with_reduction_marker.nxs"
+    raw = np.arange(2 * 4 * 5, dtype=np.float32).reshape(2, 4, 5)
+    with h5py.File(p, "w") as f:
+        f.create_group("entry/reduction")
+        f.create_dataset("entry/data/data", data=raw)
+
+    info = classify_image_source(p)
+
+    assert info.kind is ImageSourceKind.RAW_MASTER
+    assert info.has_raw
+    assert info.frame_labels == (0, 1)
+
+
 # ── load_processed_raw_or_thumbnail ───────────────────────────────────
 
 def test_load_processed_returns_raw_when_master_resolves(processed_with_master):

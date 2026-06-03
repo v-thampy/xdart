@@ -234,11 +234,10 @@ def classify_image_source(path) -> ImageSourceInfo:
                         break
 
             # A real processed-xdart file has integrated data, OR frame groups
-            # carrying source/thumbnail, OR a reduction record.  A bare native
-            # ``entry/frames`` with none of these (and no raw dataset, handled
-            # above) is not displayable as raw or processed -> UNKNOWN.
-            if not (has_integrated or has_raw or has_thumbnail
-                    or "entry/reduction" in f):
+            # carrying source/thumbnail.  A reduction/provenance group by itself
+            # is not displayable and should remain UNKNOWN, otherwise interrupted
+            # partial writes look like empty processed scans in the Image Viewer.
+            if not (has_integrated or has_raw or has_thumbnail):
                 return ImageSourceInfo(kind=ImageSourceKind.UNKNOWN, path=str(p))
 
             if has_raw:
