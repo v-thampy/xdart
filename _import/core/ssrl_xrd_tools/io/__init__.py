@@ -61,6 +61,10 @@ from ssrl_xrd_tools.io.read import (
     get_thumbnail,
     open_scan,
 )
+from ssrl_xrd_tools.io.frame_view import (
+    iter_frame_views,
+    read_frame_view,
+)
 from ssrl_xrd_tools.io.chunk_size import adaptive_chunk_size
 from ssrl_xrd_tools.io.image_source import (
     ImageSourceInfo,
