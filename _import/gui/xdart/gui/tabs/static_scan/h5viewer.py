@@ -20,6 +20,9 @@ from xdart.utils.session import load_session, save_session
 from .ui.h5viewerUI import Ui_Form
 from xdart.modules.live import LiveFrame
 from .scan_threads import fileHandlerThread
+from .display_logic import xye_unit_from_filename
+from .display_controllers import ImageViewerController
+from ssrl_xrd_tools.io import ImageSourceKind
 from ...widgets import defaultWidget
 from xdart import utils
 from xdart.utils import catch_h5py_file as catch
@@ -28,6 +31,16 @@ from xdart.utils.h5pool import get_pool
 # Qt imports
 from pyqtgraph import Qt
 from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
+
+try:
+    # shiboken validity check: True only while the C++ half of a QObject is
+    # still alive.  Used to avoid touching / GC-deleting a moveToThread'd
+    # worker whose ``deleteLater`` has already run (which crashes with
+    # "QObject: shared QObject was deleted directly").
+    from shiboken6 import isValid as _qt_isvalid
+except Exception:  # pragma: no cover - non-PySide6 / headless fallback
+    def _qt_isvalid(obj):
+        return obj is not None
 
 
 QTreeWidget = QtWidgets.QTreeWidget
@@ -55,8 +68,8 @@ class _LoadFramesWorker(QtCore.QObject):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.chunkLoaded.connect(viewer._absorb_chunk)
+        worker.finished.connect(worker.deleteLater)  # before quit (see below)
         worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -599,6 +612,22 @@ class H5Viewer(QWidget):
         finally:
             lw.blockSignals(was_blocked)
 
+    def select_last_scan_entry(self):
+        """Select the last data-file entry in listScans (the most recent
+        output, since the list is naturally sorted), triggering its load via
+        itemSelectionChanged.  Skips '..' and directories.  Returns the
+        selected row, or -1 if there is no selectable entry."""
+        lw = self.ui.listScans
+        last_row = -1
+        for row in range(lw.count()):
+            text = lw.item(row).text()
+            if text == '..' or text.endswith('/'):
+                continue
+            last_row = row
+        if last_row >= 0:
+            lw.setCurrentRow(last_row, QItemSelectionModel.ClearAndSelect)
+        return last_row
+
     # ── Selection helper ──────────────────────────────────────────────
     def set_current_frame(self, item_or_row):
         """Advance the listData cursor *and narrow the selection* to a
@@ -959,16 +988,11 @@ class H5Viewer(QWidget):
                 logger.debug("Could not load xye file %s", fpath, exc_info=True)
                 continue
 
-            # xdart XYE exports encode the integration unit in the prefix.
-            # Other XYE files do not carry enough information to transform
-            # or label the x-axis reliably.
-            fname_lower = os.path.basename(fpath).lower()
-            if fname_lower.startswith('iq_'):
-                unit = 'q_A^-1'
-            elif fname_lower.startswith('itth_'):
-                unit = '2th_deg'
-            else:
-                unit = 'unknown'
+            # xdart XYE exports encode the integration unit in the prefix
+            # (iq → q_A^-1, itth → 2th_deg); other files are 'unknown' and
+            # are labelled plain 'x' downstream, never an assumed 2θ.  Stage 4:
+            # single source of truth is the pure xye_unit_from_filename.
+            unit = xye_unit_from_filename(fpath)
 
             int_1d = IntegrationResult1D(
                 radial=xdata, intensity=ydata, sigma=sigma, unit=unit,
@@ -1006,53 +1030,6 @@ class H5Viewer(QWidget):
 
         self.sigUpdate.emit()
 
-    @staticmethod
-    def _is_xdart_processed(fpath):
-        """True if ``fpath`` is a processed xdart v2 scan file (integrated
-        data + per-frame source pointers), not a raw detector file."""
-        try:
-            import h5py
-            with h5py.File(fpath, 'r') as f:
-                if ('entry/integrated_1d' in f
-                        or 'entry/integrated_2d' in f
-                        or 'entry/frames' in f):
-                    return True
-                if 'entry/reduction' not in f:
-                    return False
-
-                raw_candidates = (
-                    'entry/instrument/detector/data',
-                    'entry/instrument/detector/data_000001',
-                    'entry/data/data',
-                    'entry/measurement/data',
-                    'entry/data',
-                )
-                for candidate in raw_candidates:
-                    if candidate in f:
-                        obj = f[candidate]
-                        if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
-                            return False
-
-                entry = f.get('entry')
-                instrument = (
-                    entry.get('instrument') if hasattr(entry, 'get') else None
-                )
-                if isinstance(instrument, h5py.Group):
-                    for obj in instrument.values():
-                        nx_class = obj.attrs.get('NX_class') if isinstance(
-                            obj, h5py.Group,
-                        ) else None
-                        if (isinstance(obj, h5py.Group)
-                                and nx_class in (b'NXdetector', 'NXdetector')
-                                and 'data' in obj
-                                and isinstance(obj['data'], h5py.Dataset)
-                                and obj['data'].ndim >= 2):
-                            return False
-
-                return True
-        except Exception:
-            return False
-
     def _load_image_file(self, fpath):
         """Load an image file for viewing.
 
@@ -1076,18 +1053,21 @@ class H5Viewer(QWidget):
 
         # ── Processed xdart v2 scan file ─────────────────────────────
         # No raw images live inside — load each frame's raw via its stored
-        # source pointer (get_raw_frame), listed by the file's actual frame
-        # labels (which may be 0-based / gapped), not 1..N.
-        self._viewer_is_xdart = (
-            ext in ('.h5', '.hdf5', '.nxs') and self._is_xdart_processed(fpath)
+        # source pointer, listed by the file's actual frame labels (which may
+        # be 0-based / gapped), not 1..N.  Stage 5: classification goes
+        # through the headless ssrl boundary — xdart no longer opens HDF5 to
+        # guess what the file is.
+        self._viewer_source_info = ImageViewerController.classify(fpath)
+        self._viewer_is_xdart = self._viewer_source_info.kind in (
+            ImageSourceKind.PROCESSED_XDART, ImageSourceKind.THUMBNAIL_ONLY,
         )
         if self._viewer_is_xdart:
-            from ssrl_xrd_tools.io import get_frames as _get_frames
-            try:
-                labels = [int(x) for x in _get_frames(fpath, union=True)]
-            except Exception:
-                logger.debug("Failed to read frame labels from %s", fpath, exc_info=True)
-                labels = []
+            # Use the classifier's *displayable* frame labels — the frame
+            # groups that actually carry a thumbnail/source.  (The old
+            # get_frames(union=True) returned the integrated frame_index
+            # union, which can list labels with no frame group; loading the
+            # first such label returned no image and blanked the viewer.)
+            labels = [int(x) for x in self._viewer_source_info.frame_labels]
             if labels:
                 self._viewer_image_path = fpath
                 self._viewer_image_nframes = len(labels)
@@ -1197,55 +1177,21 @@ class H5Viewer(QWidget):
         showed a blank panel.
         """
         # Processed xdart v2 file: no raw images inside.  Resolve the raw
-        # detector frame via the stored per-frame source pointer (falling
-        # back to the stored thumbnail).  ``frame_id`` is the frame label.
+        # detector frame via the stored per-frame source pointer, falling
+        # back to the dequantized thumbnail — through the headless ssrl
+        # boundary (Stage 5).  ``frame_id`` is the frame label.  The result
+        # records which source it returned, so a thumbnail is stored as a
+        # thumbnail (its mask is already baked in — never re-masked).
         if getattr(self, '_viewer_is_xdart', False):
-            thumb_data = None
-            try:
-                from ssrl_xrd_tools.io import get_raw_frame
-                img_data = np.asarray(
-                    get_raw_frame(
-                        fpath, frame=frame_id, allow_thumbnail=False,
-                    ),
-                    dtype=float,
+            res = ImageViewerController.load_processed_frame(fpath, frame_id)
+            if res.image is None:
+                logger.warning(
+                    'Could not load raw frame or thumbnail %s from '
+                    'processed file %s', frame_id, os.path.basename(fpath),
                 )
-            except Exception:
-                logger.debug(
-                    'Raw source for processed frame %s failed; trying '
-                    'thumbnail fallback',
-                    frame_id,
-                    exc_info=True,
-                )
-                try:
-                    img_data = np.asarray(
-                        get_raw_frame(
-                            fpath, frame=frame_id, allow_thumbnail=True,
-                        ),
-                        dtype=float,
-                    )
-                    thumb_data = img_data
-                except Exception:
-                    logger.debug(
-                        'get_raw_frame thumbnail fallback failed for frame %s; '
-                        'trying direct thumbnail read',
-                        frame_id,
-                        exc_info=True,
-                    )
-                    try:
-                        img_data = self._read_processed_thumbnail(
-                            fpath, frame_id,
-                        )
-                        thumb_data = img_data
-                    except Exception:
-                        logger.warning(
-                            'Could not load raw frame or thumbnail %s from '
-                            'processed file %s',
-                            frame_id, os.path.basename(fpath),
-                        )
-                        logger.debug(
-                            'processed image fallback failed', exc_info=True,
-                        )
-                        return False
+                return False
+            img_data = np.asarray(res.image, dtype=float)
+            thumb_data = img_data if res.source == 'thumbnail' else None
             with self.data_lock:
                 self.data_2d[int(frame_id)] = {
                     'map_raw': img_data,
@@ -1259,9 +1205,10 @@ class H5Viewer(QWidget):
                 frame.scan_info = {'source_file': os.path.basename(fpath)}
                 self.data_1d[int(frame_id)] = frame
             logger.debug(
-                'Image Viewer loaded processed frame %s from %s: shape=%s '
-                'finite=%d',
-                frame_id, os.path.basename(fpath), getattr(img_data, 'shape', None),
+                'Image Viewer loaded processed frame %s from %s via %s: '
+                'shape=%s finite=%d',
+                frame_id, os.path.basename(fpath), res.source,
+                getattr(img_data, 'shape', None),
                 int(np.isfinite(img_data).sum()),
             )
             return True
@@ -1307,20 +1254,6 @@ class H5Viewer(QWidget):
         )
         return True
 
-    @staticmethod
-    def _read_processed_thumbnail(fpath, frame_id):
-        """Read a stored processed-file thumbnail directly."""
-        import h5py
-        from ssrl_xrd_tools.io.read import _dequantize_thumbnail
-
-        with h5py.File(fpath, 'r') as f:
-            key = f'entry/frames/frame_{int(frame_id):04d}/thumbnail'
-            if key not in f:
-                raise KeyError(
-                    f'No thumbnail for frame {frame_id} in {fpath}',
-                )
-            return np.asarray(_dequantize_thumbnail(f[key]), dtype=float)
-    
     def _try_raw_detectors(self, fpath):
         """Try reading a raw binary file with common detector shapes."""
         fallbacks = getattr(
@@ -1423,23 +1356,35 @@ class H5Viewer(QWidget):
             return
 
         # ── Normal mode: load from HDF5 ──────────────────────────────
+        # Selected labels must be integer scan-frame ids.  During a
+        # viewer<->scan mode transition listData can still hold non-integer
+        # labels (e.g. xye filenames) before viewer_mode flips and the list
+        # is rebuilt; treat those as "nothing to load" instead of crashing on
+        # int('..._0001.xye').
+        int_idxs = []
+        for idx in idxs:
+            try:
+                int_idxs.append(int(idx))
+            except (TypeError, ValueError):
+                continue
+        if not int_idxs:
+            self.sigUpdate.emit()
+            return
+
         load_2d = self.update_2d
 
         if len(self.scan.frames.index) > 1:
-            if len(idxs) == len(self.scan.frames.index):
+            if len(int_idxs) == len(self.scan.frames.index):
                 load_2d = False
 
-        if load_2d:
-            idxs_memory = [int(idx) for idx in idxs if int(idx) in self.data_2d.keys()]
-        else:
-            idxs_memory = [int(idx) for idx in idxs if int(idx) in self.data_1d.keys()]
+        keys = self.data_2d.keys() if load_2d else self.data_1d.keys()
+        idxs_memory = [i for i in int_idxs if i in keys]
 
         # Multi-frame combination is now done on demand by
         # get_frames_int_2d / get_frames_map_raw — no shared accumulator
         # state to maintain here. Just figure out which frames still
         # need to be loaded from disk.
-        frame_ids = [int(idx) for idx in idxs
-                    if int(idx) not in idxs_memory]
+        frame_ids = [i for i in int_idxs if i not in idxs_memory]
 
         if len(frame_ids) > 0:
             self.load_frames_data(frame_ids, load_2d)
@@ -1447,6 +1392,9 @@ class H5Viewer(QWidget):
         self.sigUpdate.emit()
 
     def closeEvent(self, event):
+        # Retire any in-flight load worker before teardown so the interpreter
+        # doesn't GC-delete a still-running moveToThread'd QObject at shutdown.
+        self._teardown_load_worker()
         self._h5pool.close_all()
         super().closeEvent(event)
 
@@ -1546,14 +1494,13 @@ class H5Viewer(QWidget):
         """
         if not frame_ids:
             return
-        # Cancel any in-flight worker.  We don't wait — the worker's
-        # run loop checks the cancel flag between reads and exits
-        # cleanly on its own; the new worker can start immediately.
-        if self._load_worker is not None:
-            try:
-                self._load_worker.cancel()
-            except (RuntimeError, AttributeError):
-                pass
+        # Deterministically retire any in-flight worker BEFORE we drop our
+        # refs to it: cancel + quit + bounded wait so its event loop runs
+        # the worker's deleteLater and exits.  Dropping the ref without this
+        # (the old non-waiting cancel) let GC direct-delete a moveToThread'd
+        # worker whose deleteLater lost the race with thread.quit → "shared
+        # QObject was deleted directly" segfault.
+        self._teardown_load_worker()
 
         # Spin up the new worker.  Lives on its own QThread; both get
         # cleaned up after ``finished`` signals via deleteLater.
@@ -1583,8 +1530,13 @@ class H5Viewer(QWidget):
         # ``load_2d`` rides in the signal payload (4th arg) now.
         worker.chunkLoaded.connect(self._absorb_chunk)
         thread.started.connect(worker.run)
-        worker.finished.connect(thread.quit)
+        # Order matters: post the worker's deferred delete BEFORE asking the
+        # thread to quit, so the deleteLater is queued ahead of the event
+        # loop exit and gets processed on the worker thread.  (quit-first
+        # could stop the loop before the deferred delete ran, leaving the
+        # C++ worker for GC to direct-delete → crash.)
         worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
         thread.finished.connect(thread.deleteLater)
         # Drop refs after the thread is done so a later cancel() call
         # on a stale handle doesn't accidentally talk to a deleted
@@ -1663,13 +1615,13 @@ class H5Viewer(QWidget):
 
     def cancel_pending_loads(self) -> None:
         """Cancel stale background frame hydration and reject queued chunks."""
+        # Bump first so any chunk still queued from the outgoing worker is
+        # dropped by the generation gate in _absorb_chunk.
         self._load_generation += 1
-        worker = getattr(self, '_load_worker', None)
-        if worker is not None:
-            try:
-                worker.cancel()
-            except (RuntimeError, AttributeError):
-                pass
+        # Validity-guarded, deterministic teardown (cancel + quit + wait +
+        # null) — never touch or GC-delete a half-deleted moveToThread'd
+        # worker.
+        self._teardown_load_worker()
         timer = getattr(self, '_update_coalesce_timer', None)
         if timer is not None and timer.isActive():
             timer.stop()
@@ -1687,7 +1639,7 @@ class H5Viewer(QWidget):
         self.new_scan_loaded = False
 
         for attr in ('_viewer_image_path', '_viewer_image_nframes',
-                     '_viewer_is_xdart'):
+                     '_viewer_is_xdart', '_viewer_source_info'):
             if hasattr(self, attr):
                 try:
                     delattr(self, attr)
@@ -1710,23 +1662,65 @@ class H5Viewer(QWidget):
         finally:
             scans.blockSignals(was_blocked)
 
+    def _teardown_load_worker(self) -> None:
+        """Stop + wait for the in-flight load worker/thread, THEN drop refs.
+
+        This is the only safe way to retire a ``moveToThread``'d worker:
+        we must let the worker thread's event loop run its
+        ``worker.deleteLater`` and exit before the Python reference is
+        dropped, otherwise GC tries to delete the C++ QObject directly and
+        the process crashes with "shared QObject was deleted directly".
+
+        * Every access is guarded with :func:`_qt_isvalid` so we never
+          touch a half-deleted worker.
+        * ``thread.quit(); thread.wait(2000)`` blocks the GUI thread
+          briefly (bounded, only at scan / selection boundaries) until the
+          worker's loop has fully exited — processing the deferred delete.
+        """
+        worker = getattr(self, '_load_worker', None)
+        thread = getattr(self, '_load_thread', None)
+        if worker is not None and _qt_isvalid(worker):
+            try:
+                worker.cancel()
+            except (RuntimeError, AttributeError):
+                pass
+        if thread is not None and _qt_isvalid(thread):
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    # Bounded wait: let the worker's event loop process the
+                    # posted deleteLater and exit before we release the ref.
+                    if not thread.wait(2000):
+                        logger.warning(
+                            "load thread did not exit within 2s; leaving "
+                            "refs for its finished-slot to clear")
+                        return
+            except (RuntimeError, AttributeError):
+                pass
+        self._load_worker = None
+        self._load_thread = None
+
     def _clear_load_worker_refs(self) -> None:
         """Drop ``_load_worker`` / ``_load_thread`` once the worker
         signals finished — but ONLY if our handle still points at
-        that worker.
+        that thread, and only by nulling (never by calling methods or
+        forcing deletion).
 
         Self-review fix #3: queued ``thread.finished`` slot for
         worker A can arrive AFTER ``load_frames_data`` has already
-        assigned worker B to ``self._load_worker``.  Pre-fix this
-        slot would null out worker B's handle, leaving the next
-        selection unable to ``cancel()`` it.  Identity-gate the
-        clear so only the actually-finished worker's slot wins.
+        assigned worker B to ``self._load_worker``.  Identity-gate the
+        clear so only the actually-finished thread's slot wins.
 
-        The sender is the QThread of the worker that finished;
-        compare to ``self._load_thread`` to identify it.
+        Race-safety: by the time this fires, ``worker.deleteLater`` has
+        already been processed by the worker's event loop (it is connected
+        BEFORE ``thread.quit`` — see :meth:`load_frames_data`), so the C++
+        objects are gone and nulling the Python handles can't trigger a
+        direct-delete of a live QObject.  We do NOT call any method on the
+        worker/thread here, and we only act on an exact identity match — a
+        stale or already-deleted sender is ignored.
         """
         sender = self.sender()
-        if sender is None or sender is self._load_thread:
+        if sender is not None and sender is self._load_thread:
             self._load_worker = None
             self._load_thread = None
             # O6: force one final sigUpdate so the burst's final

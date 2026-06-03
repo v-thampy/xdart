@@ -14,6 +14,23 @@ from xdart import utils
 from xdart.modules.live_compat import normalize_live_class_names
 
 
+def _numeric_scan_info(scan_info):
+    """Return ``scan_info`` keeping only numeric-coercible values (as floats).
+
+    Metadata dicts can carry non-numeric fields (comments, sample names,
+    timestamps); they are dropped here so a single one doesn't break the
+    float64 ``scan_data`` table.  Numeric motors — including the GI ``th``
+    incidence motor and monitor counts — are preserved.
+    """
+    out = {}
+    for key, value in scan_info.items():
+        try:
+            out[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 class LiveScan:
     """Stateful xdart live scan in v2 NeXus-formatted HDF5 files.
 
@@ -361,23 +378,38 @@ class LiveScan:
             self.frames.stash(frame)
 
             if frame.scan_info and get_sd:
-                ser = pd.Series(frame.scan_info, dtype='float64')
-                if list(self.scan_data.columns):
-                    try:
-                        self.scan_data.loc[frame.idx] = ser
-                        # In-order fast path: frames usually arrive ascending,
-                        # so the row just added is already last — only sort
-                        # when it landed out of order (rare: late/reordered
-                        # frame).  Avoids an O(N log N) sort every frame.
-                        sidx = self.scan_data.index
-                        if len(sidx) >= 2 and sidx[-1] < sidx[-2]:
-                            self.scan_data.sort_index(inplace=True)
-                    except ValueError:
-                        print('Mismatched columns')
-                else:
-                    self.scan_data = pd.DataFrame(
-                        frame.scan_info, index=[frame.idx], dtype='float64'
-                    )
+                # Keep only numeric-coercible fields.  A single non-numeric
+                # value (e.g. a comment / sample-name / date that a metadata
+                # reader includes) must NOT nuke the whole scan_data table:
+                # ``pd.Series(scan_info, dtype='float64')`` raises wholesale on
+                # any non-float, which silently emptied scan_data for every
+                # frame — blanking the metadata panel and (since the GI
+                # incidence ``th`` lives here) collapsing the GI-2D geometry.
+                numeric_info = _numeric_scan_info(frame.scan_info)
+                if numeric_info:
+                    ser = pd.Series(numeric_info, dtype='float64')
+                    if list(self.scan_data.columns):
+                        try:
+                            self.scan_data.loc[frame.idx] = ser
+                            # In-order fast path: frames usually arrive
+                            # ascending, so the row just added is already last
+                            # — only sort when it landed out of order (rare:
+                            # late/reordered frame).  Avoids an O(N log N) sort
+                            # every frame.
+                            sidx = self.scan_data.index
+                            if len(sidx) >= 2 and sidx[-1] < sidx[-2]:
+                                self.scan_data.sort_index(inplace=True)
+                        except ValueError:
+                            logger.debug(
+                                'scan_data column mismatch for frame %s '
+                                '(have %s, got %s)',
+                                frame.idx, list(self.scan_data.columns),
+                                list(numeric_info),
+                            )
+                    else:
+                        self.scan_data = pd.DataFrame(
+                            numeric_info, index=[frame.idx], dtype='float64'
+                        )
 
             if update:
                 self._accumulate_bai_1d(frame)

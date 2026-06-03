@@ -52,7 +52,7 @@ import numpy as np
 from pyqtgraph import Qt
 
 # Project imports
-from xdart.modules.live import LiveFrame
+from xdart.modules.live import LiveFrame, IncidenceAngleUnresolved
 from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
 from ssrl_xrd_tools.io.nexus import open_nexus_image_stack, read_nexus
@@ -459,7 +459,18 @@ class nexusThread(wranglerThread):
             series_average=False,
             integrator=scan._cached_integrator,
         )
-        incident_angle = scratch._get_incident_angle()
+        try:
+            incident_angle = scratch._get_incident_angle()
+        except IncidenceAngleUnresolved as exc:
+            # No resolvable incidence — skip prewarm and surface the fix.
+            # Per-frame integration raises the same way; don't seed a
+            # degenerate 0° fiber integrator on the scan.
+            self.showLabel.emit(
+                'GI needs an incidence angle: set Theta Motor to Manual '
+                'and enter the angle.'
+            )
+            logger.warning('GI fiber-integrator prewarm skipped: %s', exc)
+            return
         scan._cached_fiber_integrator = create_fiber_integrator(
             scratch._poni_from_integrator(),
             incident_angle=incident_angle,

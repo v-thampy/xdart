@@ -74,8 +74,8 @@ params = [
     ], 'expanded': True, 'visible': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'children': [
         {'name': 'Grazing', 'type': 'bool', 'value': False},
-        {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'list', 'values': ['th'],
-         'value': 'th'},
+        {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'list',
+         'values': ['th', 'Manual'], 'value': 'th'},
         {'name': 'th_val', 'title': 'Theta', 'type': 'str', 'value': '0.1', 'visible': False},
         {'name': 'sample_orientation', 'title': 'Sample Orientation', 'type': 'int', 'value': 4,
          'limits': (1, 8), 'step': 1,
@@ -606,11 +606,20 @@ class imageWrangler(wranglerWidget):
             logger.debug("Failed to set enabled state for h5_dir parameters: %s", e)
 
     def _set_parameter_readonly(self, param, readonly):
-        """Recursively set pyqtgraph Parameter readonly state when available."""
-        try:
-            param.setOpts(readonly=readonly)
-        except (AttributeError, TypeError):
-            return
+        """Recursively set pyqtgraph Parameter readonly state when available.
+
+        Skips ``bool`` params: pyqtgraph renders a *readonly* checkbox as
+        UNCHECKED regardless of its value (cosmetic), which made the GI
+        'Grazing' box flip to unchecked for the duration of a run.  The value
+        is unaffected and the run uses the setup-time ``gi`` flag, and the
+        Start button is disabled, so leaving the checkbox interactive is
+        harmless — and it keeps showing its real state.
+        """
+        if param.opts.get('type') != 'bool':
+            try:
+                param.setOpts(readonly=readonly)
+            except (AttributeError, TypeError):
+                pass
         try:
             children = param.children()
         except AttributeError:
@@ -942,10 +951,19 @@ class imageWrangler(wranglerWidget):
                 if file_found or (not self.include_subdir):
                     break
 
-        if (((self.img_file != old_fname) or (self.img_file and (len(self.scan_parameters) < 1)))
-                and self.meta_ext):
-            if self.exists_meta_file(self.img_file):
+        if ((self.img_file != old_fname)
+                or (self.img_file and (len(self.scan_parameters) < 1))):
+            if (self.meta_ext and self.img_file
+                    and self.exists_meta_file(self.img_file)):
                 self.set_pars_from_meta()
+            elif self.img_file:
+                # New signal file with no sidecar metadata (e.g. Eiger):
+                # clear the previous file's stale motor/parameter options and
+                # default the GI Theta Motor to Manual (no 'th' to read), so
+                # the incidence angle can be entered directly.
+                self.scan_parameters = []
+                self.motors = []
+                self.set_gi_motor_options()
 
     def set_series_average(self):
         self.series_average = self.parameters.child('Signal').child('series_average').value()
@@ -1146,7 +1164,11 @@ class imageWrangler(wranglerWidget):
         self.bg_norm_channel = self.parameters.child('BG').child('norm_channel').value()
 
     def set_gi_motor_options(self):
-        """Reads image metadata to populate possible GI theta motor
+        """Reads image metadata to populate possible GI theta motor.
+
+        Always offers a 'Manual' option (enter the incidence angle directly
+        via the Theta field).  When no motors are found — e.g. Eiger / no
+        metadata — Manual is the default, since there's no ``th`` to read.
         """
         pars = [p for p in self.motors if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
         if 'th' in pars:
@@ -1155,21 +1177,39 @@ class imageWrangler(wranglerWidget):
         elif 'theta' in pars:
             pars.insert(0, pars.pop(pars.index('theta')))
             value = 'theta'
+        elif pars:
+            value = pars[0]
         else:
-            value = 'Theta'
+            # No motors (no metadata) → default to Manual incidence entry.
+            value = 'Manual'
 
         pars = ['Manual'] + pars
 
         opts = {'values': pars, 'limits': pars, 'value': value}
         self.parameters.child('GI').child('th_motor').setOpts(**opts)
+        # Sync the Theta-value field visibility + incidence_motor to the
+        # (possibly newly-defaulted) selection — setOpts may not re-fire
+        # sigValueChanged when the value is set programmatically.
+        self.set_gi_th_motor()
 
     def set_gi_th_motor(self):
-        """Update Grazing theta motor"""
-        self.incidence_motor = self.parameters.child('GI').child('th_motor').value()
-        self.parameters.child('GI').child('th_val').hide()
-        if self.incidence_motor == 'Manual':
-            self.parameters.child('GI').child('th_val').show()
-            self.incidence_motor = self.parameters.child('GI').child('th_val').value()
+        """Update Grazing theta motor.
+
+        Reveals the Manual 'Theta' value field only when Theta Motor is
+        'Manual', and hides it otherwise.  Eiger / metadata-less files have
+        no ``th`` to read, so without this input field the Manual path can't
+        supply an incidence angle and the GI cake stays blank.  Use
+        ``setOpts(visible=...)`` (not hide()/show()) so the param-tree row
+        reliably re-renders.
+        """
+        th_motor = self.parameters.child('GI').child('th_motor').value()
+        th_val = self.parameters.child('GI').child('th_val')
+        if th_motor == 'Manual':
+            th_val.setOpts(visible=True)
+            self.incidence_motor = th_val.value()
+        else:
+            th_val.setOpts(visible=False)
+            self.incidence_motor = th_motor
 
     def get_scan_parameters(self):
         """ Reads image metadata to populate matching parameters
