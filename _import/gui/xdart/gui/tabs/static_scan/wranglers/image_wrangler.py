@@ -165,6 +165,7 @@ class imageWrangler(wranglerWidget):
             in specLabel
     """
     showLabel = QtCore.Signal(str)
+    sigSavePathChanged = QtCore.Signal(str)
 
     def __init__(self, fname, file_lock, scan, data_1d, data_2d, parent=None):
         """fname: str, file path
@@ -511,6 +512,14 @@ class imageWrangler(wranglerWidget):
         if session.get('poni_file') and Path(session['poni_file']).exists():
             self.get_poni_dict()
 
+    def _sync_h5_dir_from_parameters(self):
+        """Sync the Save Path parameter and notify the scans browser on change."""
+        path = self.parameters.child('h5_dir').value()
+        old_path = getattr(self, 'h5_dir', None)
+        self.h5_dir = path
+        if path and path != old_path:
+            self.sigSavePathChanged.emit(path)
+
     # Signal to notify static_scan_widget that viewer mode changed.
     # Emits the viewer_mode string ('image', 'xye') or '' for normal.
     sigViewerModeChanged = QtCore.Signal(str)
@@ -696,6 +705,7 @@ class imageWrangler(wranglerWidget):
         self.thread.meta_ext = self.meta_ext
         self.thread.meta_dir = self.meta_dir
 
+        self._sync_h5_dir_from_parameters()
         self.thread.h5_dir = self.h5_dir
         self.fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
         self.thread.fname = self.fname
@@ -1158,7 +1168,7 @@ class imageWrangler(wranglerWidget):
         if path != '':
             Path(path).mkdir(parents=True, exist_ok=True)
             self.parameters.child('h5_dir').setValue(path)
-            self.h5_dir = path
+            self._sync_h5_dir_from_parameters()
 
     def set_bg_matching_options(self):
         """Reads image metadata to populate matching parameters

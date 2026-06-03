@@ -1935,6 +1935,7 @@ class imageThread(wranglerThread):
         """If scan changes, initialize new LiveScan object.
         If mode is overwrite, replace existing HDF5 file, else append to it.
         """
+        Path(self.h5_dir).mkdir(parents=True, exist_ok=True)
         fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
         # Eiger master files are pre-processed with the trailing
         # ``_master`` suffix stripped from scan_name (see

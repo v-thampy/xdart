@@ -184,8 +184,6 @@ class staticWidget(QWidget):
         # Scratch directory for working .nxs files (under the user's home).
         self.local_path = get_fname_dir()
         self.dirname = self.local_path
-        if not os.path.isdir(self.dirname):
-            os.mkdir(self.dirname)
 
         self.fname = os.path.join(self.dirname, 'default.nxs')
         # J2: share ``file_lock`` with the scan so direct
@@ -366,12 +364,15 @@ class staticWidget(QWidget):
             vm = getattr(self.wrangler, 'viewer_mode', None)
             if vm is not None:
                 QtCore.QTimer.singleShot(0, lambda v=vm: self._on_viewer_mode_changed(v))
+        if hasattr(self.wrangler, 'sigSavePathChanged'):
+            self.wrangler.sigSavePathChanged.connect(self._sync_h5viewer_save_dir)
         # Wire the wrangler's Advanced button to show the integratorTree's
         # existing 1D/2D advanced parameter dialogs in a combined popup.
         if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'advancedButton'):
             self.wrangler.ui.advancedButton.clicked.connect(
                 self._show_integration_advanced)
         self.wrangler.setup()
+        self._sync_h5viewer_save_dir(getattr(self.wrangler, 'h5_dir', None))
         self.h5viewer.sigNewFile.connect(self.wrangler.set_fname)
         self.h5viewer.sigNewFile.connect(self.displayframe.set_axes)
         self.h5viewer.sigNewFile.connect(self.h5viewer.data_reset)
@@ -388,6 +389,8 @@ class staticWidget(QWidget):
                    self.h5viewer.sigNewFile]
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
             signals.append(self.wrangler.sigViewerModeChanged)
+        if hasattr(self.wrangler, 'sigSavePathChanged'):
+            signals.append(self.wrangler.sigSavePathChanged)
         # Disconnect Advanced button from integration popup
         if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'advancedButton'):
             try:
@@ -402,6 +405,16 @@ class staticWidget(QWidget):
                     signal.disconnect()
             except (TypeError, RuntimeError, SystemError) as e:
                 logger.debug("Failed to disconnect signal: %s", e)
+
+    def _sync_h5viewer_save_dir(self, path, *, refresh=True):
+        """Point the Scans browser at the active processed-output directory."""
+        if not path:
+            return
+        path = os.path.abspath(os.path.expanduser(str(path)))
+        self.dirname = path
+        self.h5viewer.dirname = path
+        if refresh:
+            self.h5viewer.update_scans()
 
     def thread_state_changed(self):
         """Called whenever a thread is started or finished.
@@ -767,7 +780,7 @@ class staticWidget(QWidget):
         # land correctly; this assignment just unblocks the
         # synchronous render path immediately.
         self.scan.name = name
-        self.h5viewer.dirname = os.path.dirname(fname)
+        self._sync_h5viewer_save_dir(os.path.dirname(fname), refresh=False)
         self.h5viewer.set_file(fname)
         self.scan.gi = gi
         self.scan.incidence_motor = incidence_motor

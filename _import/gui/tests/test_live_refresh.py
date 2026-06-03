@@ -644,6 +644,9 @@ def test_live_new_scan_invalidates_publication_store():
         displayframe=SimpleNamespace(set_axes=lambda: None),
         metawidget=SimpleNamespace(update=lambda: None),
     )
+    host._sync_h5viewer_save_dir = MethodType(
+        staticWidget._sync_h5viewer_save_dir, host,
+    )
 
     staticWidget.new_scan(
         host,
@@ -658,8 +661,33 @@ def test_live_new_scan_invalidates_publication_store():
     assert len(store) == 0
     assert store.generation == old_generation + 1
     assert host.frame_ids == []
+    assert host.dirname == "/tmp"
+    assert host.h5viewer.dirname == "/tmp"
     assert list(scan.frames.index) == []
     assert scan.scan_data.empty
+
+
+def test_save_path_sync_updates_scans_browser(tmp_path):
+    calls = []
+    host = SimpleNamespace(
+        dirname="old",
+        h5viewer=SimpleNamespace(
+            dirname="old",
+            update_scans=lambda: calls.append("update_scans"),
+        ),
+    )
+
+    staticWidget._sync_h5viewer_save_dir(host, tmp_path)
+
+    assert host.dirname == str(tmp_path)
+    assert host.h5viewer.dirname == str(tmp_path)
+    assert calls == ["update_scans"]
+
+    staticWidget._sync_h5viewer_save_dir(host, tmp_path / "next", refresh=False)
+
+    assert host.dirname == str(tmp_path / "next")
+    assert host.h5viewer.dirname == str(tmp_path / "next")
+    assert calls == ["update_scans"]
 
 
 def test_gi_motor_options_default_manual_when_no_metadata():
@@ -1952,6 +1980,9 @@ def test_update_renders_blank_on_empty_no_data_instead_of_leaving_stale():
         _note_selection_generation=lambda: None,
         _updated=lambda: False,
         _live_mode=lambda: Mode.IMAGE_VIEWER,   # skips INT-mode axis setup
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
         clear_plot_view=lambda: calls.append("plot"),
         clear_image_view=lambda: calls.append("image"),
         clear_binned_view=lambda: calls.append("cake"),
