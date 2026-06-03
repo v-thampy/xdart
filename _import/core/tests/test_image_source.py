@@ -217,6 +217,34 @@ def test_every_frame_label_loads_non_none_thumbnail_only(thumbnail_only):
         assert res.image is not None and res.source == "thumbnail"
 
 
+# ── raw detector data with a NATIVE entry/frames group (regression) ────
+
+def test_eiger_data_with_native_frames_group_is_raw_master(tmp_path):
+    """Eiger data files carry a raw ``entry/data/data`` stack AND a native
+    ``entry/frames`` group.  ``entry/frames`` alone must NOT mark the file
+    processed-xdart — the raw dataset wins → RAW_MASTER (regression: these
+    files were misclassified and the Image Viewer refused to show them)."""
+    p = tmp_path / "eiger_w2s3_scan001_data_000001.h5"
+    raw = np.arange(5 * 8 * 8, dtype=np.float32).reshape(5, 8, 8)
+    with h5py.File(p, "w") as f:
+        f.create_dataset("entry/data/data", data=raw)
+        f.create_group("entry/frames")          # native eiger group, no content
+    info = classify_image_source(p)
+    assert info.kind is ImageSourceKind.RAW_MASTER
+    assert info.has_raw and info.frame_labels == (0, 1, 2, 3, 4)
+
+
+def test_eiger_master_is_raw_master(tmp_path):
+    """A ``*_master.h5`` (data in linked files + a native frames group) is
+    raw detector data, classified by the eiger-master name."""
+    p = tmp_path / "eiger_w2s3_scan001_master.h5"
+    with h5py.File(p, "w") as f:
+        f.create_group("entry/frames")
+        f.create_group("entry/instrument/detector")
+    info = classify_image_source(p)
+    assert info.kind is ImageSourceKind.RAW_MASTER
+
+
 # ── load_image_frame ──────────────────────────────────────────────────
 
 def test_load_image_frame_reads_raw_master(raw_master):

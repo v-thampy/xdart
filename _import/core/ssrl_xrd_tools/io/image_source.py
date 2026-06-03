@@ -166,7 +166,7 @@ def classify_image_source(path) -> ImageSourceInfo:
     raw detector dataset; UNKNOWN when it can't be read or classified.
     """
     import h5py
-    from ssrl_xrd_tools.io.image import count_frames
+    from ssrl_xrd_tools.io.image import count_frames, _is_eiger_master
 
     p = Path(path)
 
@@ -183,16 +183,30 @@ def classify_image_source(path) -> ImageSourceInfo:
             kind=ImageSourceKind.RAW_MASTER, path=str(p),
             frame_labels=tuple(range(n)), has_raw=True, has_thumbnail=False)
 
+    # An Eiger master (.h5 ending in ``_master``) is raw detector data — its
+    # frames live in linked data files, and it carries a NATIVE ``entry/frames``
+    # group that must NOT be mistaken for xdart's processed frames.
+    if _is_eiger_master(p):
+        try:
+            n = max(int(count_frames(p)), 1)
+        except Exception:
+            n = 1
+        return ImageSourceInfo(
+            kind=ImageSourceKind.RAW_MASTER, path=str(p),
+            frame_labels=tuple(range(n)), has_raw=True, has_thumbnail=False)
+
     try:
         with h5py.File(p, "r") as f:
             entry = f.get("entry")
-            processed = (
-                "entry/integrated_1d" in f
-                or "entry/integrated_2d" in f
-                or "entry/frames" in f
+            # ``entry/frames`` ALONE is NOT an xdart-processed marker — Eiger
+            # data files carry a native ``entry/frames`` group alongside the raw
+            # ``entry/data/data`` stack.  Only integrated data, or frames that
+            # actually carry source/thumbnail content, mark a processed file.
+            has_integrated = (
+                "entry/integrated_1d" in f or "entry/integrated_2d" in f
             )
-            if not processed:
-                # Raw detector dataset present? -> raw master.
+            if not has_integrated:
+                # A genuine raw detector dataset wins over a native frames group.
                 for cand in _RAW_DATASET_CANDIDATES:
                     obj = f.get(cand)
                     if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
@@ -201,10 +215,6 @@ def classify_image_source(path) -> ImageSourceInfo:
                             kind=ImageSourceKind.RAW_MASTER, path=str(p),
                             frame_labels=tuple(range(int(n))),
                             has_raw=True, has_thumbnail=False)
-                if "entry/reduction" not in f:
-                    return ImageSourceInfo(
-                        kind=ImageSourceKind.UNKNOWN, path=str(p))
-                # reduction group with no raw dataset -> treat as processed.
 
             labels = _frame_labels_from_groups(entry) if entry is not None else []
 
@@ -223,12 +233,20 @@ def classify_image_source(path) -> ImageSourceInfo:
                     if has_raw and has_thumbnail:
                         break
 
+            # A real processed-xdart file has integrated data, OR frame groups
+            # carrying source/thumbnail, OR a reduction record.  A bare native
+            # ``entry/frames`` with none of these (and no raw dataset, handled
+            # above) is not displayable as raw or processed -> UNKNOWN.
+            if not (has_integrated or has_raw or has_thumbnail
+                    or "entry/reduction" in f):
+                return ImageSourceInfo(kind=ImageSourceKind.UNKNOWN, path=str(p))
+
             if has_raw:
                 kind = ImageSourceKind.PROCESSED_XDART
             elif has_thumbnail:
                 kind = ImageSourceKind.THUMBNAIL_ONLY
             else:
-                # Processed file we can't draw from (no master, no thumbnail).
+                # integrated/reduction present but no per-frame raw/thumbnail.
                 kind = ImageSourceKind.PROCESSED_XDART
             return ImageSourceInfo(
                 kind=kind, path=str(p), frame_labels=tuple(labels),
