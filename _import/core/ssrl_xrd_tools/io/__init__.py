@@ -62,6 +62,14 @@ from ssrl_xrd_tools.io.read import (
     open_scan,
 )
 from ssrl_xrd_tools.io.chunk_size import adaptive_chunk_size
+from ssrl_xrd_tools.io.image_source import (
+    ImageSourceInfo,
+    ImageSourceKind,
+    RawFrameResult,
+    classify_image_source,
+    load_image_frame,
+    load_processed_raw_or_thumbnail,
+)
 
 try:
     from ssrl_xrd_tools.io.tiled import (
