@@ -539,12 +539,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._note_selection_generation()   # bump generation on selection change
 
         if not self._updated():
-            # No usable data — empty selection, failed load, or cache miss.
-            # Render an EXPLICIT empty state that blanks every panel rather
-            # than early-returning and leaving a stale plot/raw/cake on
-            # screen.  No-op fast path: skip when we've already blanked and
-            # nothing has drawn since (current content is already correct).
+            # Nothing to draw yet for the current selection.  Only render the
+            # EXPLICIT blank when there is genuinely nothing cached — a fresh
+            # file, a cleared scan, or a failed load with no fallback.  When
+            # prior-scan / other-frame data is still cached (a new-scan gap, or
+            # a not-yet-loaded selection whose load is in flight), keep the
+            # current display instead of flashing blank; the imminent real
+            # render replaces it.  Kills the blank flicker at scan start and on
+            # frame selection without leaving stale content when there is
+            # truly nothing to show.
             if getattr(self, "_display_blanked", False):
+                return True
+            with self.data_lock:
+                has_cached = bool(self.data_1d) or bool(self.data_2d)
+            if has_cached:
                 return True
             empty = empty_display_state(self._live_mode(), self.display_generation)
             result = self.render_display(empty, None)
@@ -759,8 +767,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 logger.debug("render: viewer draw of %s failed", role, exc_info=True)
 
         # 2D title + image-preview popup (normal mode; viewer draw methods
-        # set their own title).  Delegated — behaviour-preserving.
-        if mode in (Mode.INT_1D, Mode.INT_2D):
+        # set their own title).  Skip on a non-READY (EMPTY/ERROR) state —
+        # there is no current frame to label or preview, and ``update_2d_label``
+        # would index an empty ``frame_ids`` (IndexError on the explicit-blank
+        # render at scan start).
+        if (mode in (Mode.INT_1D, Mode.INT_2D)
+                and state.load_status is LoadStatus.READY):
             self.update_2d_label()
             self._update_image_preview()
         return True
@@ -1207,8 +1219,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.labelCurrent.setText(label)
         elif len(self.frame_ids) > 1:
             self.ui.labelCurrent.setText(f'{label} [Average]')
-        else:
+        elif self.frame_ids:
             self.ui.labelCurrent.setText(f'{label}_{self.frame_ids[0]}')
+        else:
+            # No selection yet (e.g. a new scan before its first frame) — show
+            # the scan name alone rather than indexing an empty frame_ids list.
+            self.ui.labelCurrent.setText(label)
 
     # ── Normalization / background handlers ───────────────────────
 
