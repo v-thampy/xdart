@@ -144,6 +144,15 @@ def _run_batch_parallel(poni, pending_data, mask, *, incidence_motor="th",
     return captured
 
 
+def _assert_good_gi_publication_passes(frame, *, min_dummy_headroom=0.05):
+    from xdart.modules.frame_publication import publication_from_live_frame
+
+    publication = publication_from_live_frame(frame)
+    assert publication.diagnostics.ok
+    assert publication.diagnostics.dummy_fraction_2d is not None
+    assert publication.diagnostics.dummy_fraction_2d < (0.95 - min_dummy_headroom)
+
+
 def test_batch_parallel_tiff_cakes_nondegenerate_and_match_serial():
     poni = _tiff_poni()
     frames = [_load_tiff(n) for n in _TIFF_FRAMES]   # [(img, th, meta), ...]
@@ -167,6 +176,7 @@ def test_batch_parallel_tiff_cakes_nondegenerate_and_match_serial():
         assert np.allclose(batch_i2.azimuthal, ref.azimuthal, atol=1e-4), \
             f"frame {num} (th={th}) qoop != serial-at-own-incidence"
         assert np.allclose(batch_i2.radial, ref.radial, atol=1e-4)
+        _assert_good_gi_publication_passes(out[num])
         # The angle-dependence guard: frame 2 (th=0.35) must NOT match a
         # frame-0-incidence integration (the old stale-pool bug).
         if num == 2:
@@ -207,6 +217,7 @@ def test_batch_parallel_eiger_cake_nondegenerate_manual_incidence():
         _result_intensity_all_dummy,
     )
     assert not _result_intensity_all_dummy(i2)
+    _assert_good_gi_publication_passes(out[1])
 
 
 def test_eiger_incidence_unresolved_without_metadata():
