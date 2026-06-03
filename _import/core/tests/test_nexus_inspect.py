@@ -92,3 +92,52 @@ def test_preview_nexus_dataset_returns_bounded_head_slice(tmp_path):
     assert preview.truncated
     assert preview.attrs["units"] == "counts"
     assert preview.data == [[0, 1, 2], [10, 11, 12], [20, 21, 22]]
+
+
+def test_inspect_nexus_does_not_treat_native_frames_group_as_processed(tmp_path):
+    path = tmp_path / "raw_eiger_like.h5"
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_group("frames")
+        data = entry.create_group("data")
+        data.create_dataset("data", data=np.zeros((3, 4, 5), dtype=np.uint16))
+
+    summary = inspect_nexus(path)
+
+    assert summary.xdart is not None
+    assert not summary.xdart.is_processed
+    assert summary.xdart.frame_labels == ()
+    assert summary.xdart.raw_image_dataset == "/entry/data/data"
+
+
+def test_inspect_nexus_raw_data_wins_over_reduction_only_marker(tmp_path):
+    path = tmp_path / "raw_with_reduction_marker.h5"
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_group("reduction")
+        entry.create_group("frames/frame_0000")
+        data = entry.create_group("data")
+        data.create_dataset("data", data=np.zeros((1, 4, 5), dtype=np.uint16))
+
+    summary = inspect_nexus(path)
+
+    assert summary.xdart is not None
+    assert not summary.xdart.is_processed
+    assert summary.xdart.frame_labels == ()
+    assert summary.xdart.raw_image_dataset == "/entry/data/data"
+
+
+def test_raw_dataset_search_prunes_frames_subtree(tmp_path):
+    path = tmp_path / "fallback_raw_search.h5"
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("frames/frame_0000/native_blob", data=np.zeros((20, 20)))
+        entry.create_dataset("other/raw", data=np.zeros((2, 3)))
+
+    summary = inspect_nexus(path)
+
+    assert summary.xdart is not None
+    assert summary.xdart.raw_image_dataset == "/entry/other/raw"

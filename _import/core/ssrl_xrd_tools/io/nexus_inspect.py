@@ -281,9 +281,16 @@ def _summarize_xdart_entry(h5: h5py.File, entry: str) -> NexusXDartSummary:
     geometry_columns = _dataset_names(e.get("per_frame_geometry"), exclude={"frame_index"})
     thumbnail_count, source_count = _frame_artifact_counts(e)
     raw_image_dataset = _find_raw_image_dataset(e)
+    is_processed = bool(
+        integrated_1d
+        or integrated_2d
+        or thumbnail_count
+        or source_count
+        or ("reduction" in e and raw_image_dataset is None)
+    )
     return NexusXDartSummary(
         entry=entry,
-        is_processed=bool(integrated_1d or integrated_2d or "frames" in e),
+        is_processed=is_processed,
         integrated_1d=integrated_1d,
         integrated_2d=integrated_2d,
         frame_labels=tuple(int(v) for v in labels),
@@ -360,6 +367,13 @@ def _frame_group_labels(e: h5py.Group) -> tuple[int, ...]:
     for name in e["frames"].keys():
         if not name.startswith("frame_"):
             continue
+        group = e["frames"].get(name)
+        if (
+            group is None
+            or not isinstance(group, h5py.Group)
+            or ("thumbnail" not in group and "source" not in group)
+        ):
+            continue
         try:
             labels.append(int(name.removeprefix("frame_")))
         except ValueError:
@@ -401,18 +415,23 @@ def _find_raw_image_dataset(e: h5py.Group) -> str | None:
     best_path: str | None = None
     best_size = 0
 
-    def visit(name: str, obj: Any) -> None:
+    def visit_group(group: h5py.Group, prefix: str = "") -> None:
         nonlocal best_path, best_size
-        if not isinstance(obj, h5py.Dataset) or obj.ndim < 2:
-            return
-        if name.startswith(("integrated_1d/", "integrated_2d/", "frames/")):
-            return
-        size = int(np.prod(obj.shape))
-        if size > best_size:
-            best_size = size
-            best_path = f"{e.name}/{name}"
+        for name, obj in group.items():
+            rel = f"{prefix}/{name}" if prefix else name
+            if rel.startswith(("integrated_1d", "integrated_2d", "frames")):
+                continue
+            if isinstance(obj, h5py.Group):
+                visit_group(obj, rel)
+                continue
+            if not isinstance(obj, h5py.Dataset) or obj.ndim < 2:
+                continue
+            size = int(np.prod(obj.shape))
+            if size > best_size:
+                best_size = size
+                best_path = f"{e.name}/{rel}"
 
-    e.visititems(visit)
+    visit_group(e)
     return best_path
 
 
