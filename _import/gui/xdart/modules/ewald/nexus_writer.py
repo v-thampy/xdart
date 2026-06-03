@@ -243,6 +243,7 @@ def save_scan_to_nexus(
             cursor=cursor,
         )
         _validate_prepared_integrated(h5f.require_group(entry), prepared_1d, prepared_2d)
+        _validate_frame_publications(prepared_1d, prepared_2d)
 
         # 2. Provenance — append mode: only on first save or finalize.
         # Replace mode: always rewrite so the persisted ``bai_*_args``
@@ -624,6 +625,39 @@ def _validate_prepared_integrated(entry_grp, prepared_1d, prepared_2d) -> None:
         )
 
 
+def _validate_frame_publications(prepared_1d, prepared_2d) -> None:
+    """Reject display-invalid frame publications before mutating disk.
+
+    This complements the strict ssrl stack validators above: those ensure
+    rows can be stacked consistently, while this gate catches frame-level
+    diagnostics such as all-dummy GI cakes before they reach display or disk.
+    """
+    from xdart.modules.frame_publication import (
+        publication_from_live_frame,
+        publication_has_1d_errors,
+        publication_has_2d_errors,
+    )
+
+    checked: dict[int, object] = {}
+    for prepared, has_errors, label in (
+        (prepared_1d, publication_has_1d_errors, "1D"),
+        (prepared_2d, publication_has_2d_errors, "2D"),
+    ):
+        if prepared is None:
+            continue
+        for frame, idx in zip(prepared["frames"], prepared["indices"]):
+            key = id(frame)
+            publication = checked.get(key)
+            if publication is None:
+                publication = publication_from_live_frame(frame, validate=True)
+                checked[key] = publication
+            if has_errors(publication):
+                details = "; ".join(publication.diagnostics.errors)
+                raise ValueError(
+                    f"Frame {idx} failed publication {label} validation: {details}"
+                )
+
+
 def _prepare_integrated_1d(f, scan, *, entry: str,
                            replace_frame_indices=None,
                            cursor: NexusWriteCursor | None = None):
@@ -645,6 +679,7 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
     return {
         "entry": entry,
         "group_path": group_path,
+        "frames": frames,
         "indices": indices,
         "results": results,
         "cursor": cursor,
@@ -690,6 +725,7 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
     return {
         "entry": entry,
         "group_path": group_path,
+        "frames": frames,
         "indices": indices,
         "results": results,
         "cursor": cursor,

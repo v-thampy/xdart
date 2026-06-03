@@ -26,6 +26,7 @@ from ssrl_xrd_tools.io import ImageSourceKind
 from xdart.modules.frame_publication import (
     PublicationStore,
     publication_from_live_frame,
+    publication_has_2d_errors,
 )
 from ...widgets import defaultWidget
 from xdart import utils
@@ -1620,29 +1621,29 @@ class H5Viewer(QWidget):
             )
             return
         try:
+            store = getattr(self, "publication_store", None)
+            publication = publication_from_live_frame(
+                frame,
+                generation=(store.generation if store is not None else 0),
+            )
             with self.data_lock:
                 if not load_2d:
                     self.data_1d[int(idx)] = frame.copy_for_display(include_2d=False)
                 else:
                     self.data_1d[int(idx)] = frame.copy_for_display(include_2d=False)
-                    self.data_2d[int(idx)] = {
-                        'map_raw': frame.map_raw,
-                        'bg_raw': frame.bg_raw,
-                        'mask': frame.mask,
-                        'int_2d': frame.int_2d,
-                        'gi_2d': frame.gi_2d,
-                        'thumbnail': frame.thumbnail,
-                    }
-                    if frame.map_raw is not None:
-                        self._remember_hydrated_raw(int(idx))
-                store = getattr(self, "publication_store", None)
+                    if not publication_has_2d_errors(publication):
+                        self.data_2d[int(idx)] = {
+                            'map_raw': frame.map_raw,
+                            'bg_raw': frame.bg_raw,
+                            'mask': frame.mask,
+                            'int_2d': frame.int_2d,
+                            'gi_2d': frame.gi_2d,
+                            'thumbnail': frame.thumbnail,
+                        }
+                        if frame.map_raw is not None:
+                            self._remember_hydrated_raw(int(idx))
                 if store is not None:
-                    store.upsert(
-                        publication_from_live_frame(
-                            frame,
-                            generation=store.generation,
-                        )
-                    )
+                    store.upsert(publication)
             # O6: coalesce display updates while a chunk burst is
             # streaming in.  Schedule (or restart) a debounced emit
             # rather than firing once per chunk.  ``_on_load_worker_finished``

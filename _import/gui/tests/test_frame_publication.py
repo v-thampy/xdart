@@ -16,6 +16,8 @@ from xdart.modules.frame_publication import (
     PublicationStore,
     publication_from_nexus_frame,
     publication_from_live_frame,
+    publication_has_1d_errors,
+    publication_has_2d_errors,
     validate_publication,
 )
 from xdart.gui.tabs.static_scan.display_logic import Mode, compute_display_state
@@ -82,9 +84,25 @@ def test_gi_dummy_publication_is_flagged_before_display_or_save():
 
     assert publication.view.two_d_kind is TwoDKind.QIP_QOOP
     assert not publication.diagnostics.ok
+    assert publication_has_2d_errors(publication)
+    assert not publication_has_1d_errors(publication)
     assert any("dummy" in msg for msg in publication.diagnostics.errors)
     with pytest.raises(ValueError, match="dummy"):
         validate_publication(publication, raise_on_error=True)
+
+
+def test_publication_1d_error_classification_is_independent_from_2d():
+    frame = DuckFrame(idx=5)
+    frame.int_1d = IntegrationResult1D(
+        radial=np.linspace(0.5, 3.0, 6),
+        intensity=np.full(6, np.nan),
+        unit="q_A^-1",
+    )
+
+    publication = publication_from_live_frame(frame)
+
+    assert publication_has_1d_errors(publication)
+    assert not publication_has_2d_errors(publication)
 
 
 def test_publication_store_is_generation_aware():

@@ -37,6 +37,7 @@ from xdart.modules.live import LiveFrame, LiveScan
 from xdart.modules.frame_publication import (
     PublicationStore,
     publication_from_live_frame,
+    publication_has_2d_errors,
 )
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer
@@ -465,6 +466,10 @@ class staticWidget(QWidget):
             frame = None
         if frame is not None:
             try:
+                publication = publication_from_live_frame(
+                    frame,
+                    generation=self.publication_store.generation,
+                )
                 with self.h5viewer.data_lock:
                     # 1D copy (no map_raw / 2D payload) — small object
                     self.h5viewer.data_1d[int(idx)] = frame.copy_for_display(
@@ -474,7 +479,10 @@ class staticWidget(QWidget):
                     # produces (see scan_threads.load_frames).  Keys are what
                     # displayframe.get_frames_map_raw / get_frames_int_2d
                     # look for.
-                    if not getattr(self.scan, "skip_2d", False):
+                    if (
+                        not getattr(self.scan, "skip_2d", False)
+                        and not publication_has_2d_errors(publication)
+                    ):
                         self.h5viewer.data_2d[int(idx)] = {
                             "map_raw": getattr(frame, "map_raw", None),
                             "bg_raw": getattr(frame, "bg_raw", 0),
@@ -494,12 +502,7 @@ class staticWidget(QWidget):
                     # unbounded) silently grew without bound.  No
                     # explicit eviction needed now; downstream cache
                     # misses fall through to the file_thread lazy load.
-                    self.publication_store.upsert(
-                        publication_from_live_frame(
-                            frame,
-                            generation=self.publication_store.generation,
-                        )
-                    )
+                    self.publication_store.upsert(publication)
             except Exception:
                 # Cache miss is non-fatal — displayframe will lazy-load
                 # from disk via file_thread.load_frame as fallback.

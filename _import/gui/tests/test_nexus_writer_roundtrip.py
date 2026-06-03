@@ -343,6 +343,31 @@ def test_gi_nonuniform_stacked_2d_writer_stays_strict(tmp_path):
         save_scan_to_nexus(scan, path, mode="w", finalize=False)
 
 
+def test_publication_validation_rejects_dummy_gi_2d_before_write(tmp_path):
+    """All-dummy GI cakes should not be persisted as valid 2D rows."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    frame = _DuckArch(idx=0)
+    frame.gi = True
+    frame.int_2d = _DuckResult2D(
+        radial=np.linspace(-1.0, 1.0, N_Q, dtype=np.float32),
+        azimuthal=np.linspace(0.0, 3.0, N_CHI, dtype=np.float32),
+        intensity=np.full((N_Q, N_CHI), -1.0, dtype=np.float32),
+        unit="qip_A^-1",
+        azimuthal_unit="qoop_A^-1",
+    )
+    scan = _DuckSphere([frame], gi=True)
+
+    path = tmp_path / "dummy_gi_2d.nxs"
+    with pytest.raises(ValueError, match="publication 2D validation"):
+        save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        assert "integrated_1d" not in f["entry"]
+        assert "integrated_2d" not in f["entry"]
+
+
 def test_frames_group_and_thumbnails(written_nxs):
     """Per-frame metadata lives under NXcollection/frames/frame_NNNN."""
     root = nx.nxload(str(written_nxs))

@@ -153,6 +153,17 @@ def validate_publication(
     return diagnostics
 
 
+def publication_has_1d_errors(publication: FramePublication) -> bool:
+    return any(msg.startswith("1D") for msg in publication.diagnostics.errors)
+
+
+def publication_has_2d_errors(publication: FramePublication) -> bool:
+    return any(
+        msg.startswith("2D") or msg.startswith("axis_2d")
+        for msg in publication.diagnostics.errors
+    )
+
+
 def publication_from_live_frame(
     frame: Any,
     *,
@@ -313,5 +324,7 @@ __all__ = [
     "publication_from_frame_view",
     "publication_from_live_frame",
     "publication_from_nexus_frame",
+    "publication_has_1d_errors",
+    "publication_has_2d_errors",
     "validate_publication",
 ]

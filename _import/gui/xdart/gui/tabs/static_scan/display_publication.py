@@ -13,6 +13,11 @@ from typing import Any
 
 import numpy as np
 
+from xdart.modules.frame_publication import (
+    publication_has_1d_errors,
+    publication_has_2d_errors,
+)
+
 from .display_logic import Axis, Mode, PlotPayload, Trace, x_axis_for_unit
 
 
@@ -99,14 +104,14 @@ class PublicationDisplayAdapter:
         return {
             _label_key(label)
             for label, publication in self._items.items()
-            if publication.view.has_1d
+            if publication.view.has_1d and not publication_has_1d_errors(publication)
         }
 
     def available_2d_keys(self) -> set:
         return {
             _label_key(label)
             for label, publication in self._items.items()
-            if publication.view.has_2d
+            if publication.view.has_2d and not publication_has_2d_errors(publication)
         }
 
     def raw_availability(self) -> dict:
@@ -137,7 +142,11 @@ class PublicationDisplayAdapter:
         ref_x = None
         for label in state.render_ids:
             publication = self._items.get(_label_key(label))
-            if publication is None or not publication.view.has_1d:
+            if (
+                publication is None
+                or not publication.view.has_1d
+                or publication_has_1d_errors(publication)
+            ):
                 continue
             view = publication.view
             x = np.asarray(view.axis_1d.values, dtype=float)
