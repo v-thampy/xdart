@@ -477,9 +477,24 @@ def test_publication_cake_background_transposes_legacy_pyfai_background():
     np.testing.assert_allclose(cake.image, np.zeros((3, 4)))
 
 
-def test_image_viewer_publication_payload_ignores_processing_masks():
+def test_image_viewer_raw_image_defers_to_legacy_path():
+    """The Image Viewer is a raw detector-file browser, rendered by the
+    widget's legacy ``_update_image_viewer`` (standalone sentinel-fill vs
+    processed-xdart NaN-preserve, viewer display levels, and NO processing
+    mask / background / monitor normalization).  The publication adapter must
+    therefore NOT build the Image Viewer's raw panel: doing so re-applies
+    normalization + background, and when that yields a non-finite/unviewable
+    array ``_draw_image_payload`` blanks the panel and reports success, so the
+    legacy fallback never runs — the viewer goes blank (the reproducible
+    Int 1D (XYE) → Image Viewer failure, where the run leaves normalization /
+    Set-Background state on the widget).  ``raw_image`` returns ``None`` for
+    IMAGE_VIEWER regardless of store contents.  The actual raw render is
+    covered end-to-end in ``test_gui_modes_end_to_end.py``."""
     frame = DuckFrame(idx=1)
-    frame.scan_info = {"monitor": 1.0}
+    # A non-trivial monitor + background: on the old publication path these
+    # normalized / subtracted the raw image (here harmlessly, but in the field
+    # they blanked it).  The adapter must ignore them for the Image Viewer.
+    frame.scan_info = {"monitor": 250.0}
     frame.map_raw = np.array([[1.0, 65535.0], [3.0, 4.0]])
     frame.mask = np.array([0, 1, 2, 3])
     store = PublicationStore()
@@ -503,18 +518,11 @@ def test_image_viewer_publication_payload_ignores_processing_masks():
 
     class _Widget:
         _viewer_is_xdart = False
-        bkg_map_raw = 0.0
-        scan = type("Scan", (), {
-            "name": "scan",
-            "gi": False,
-            "global_mask": np.ones((2, 2), dtype=bool),
-        })()
+        bkg_map_raw = np.array([[10.0, 10.0], [10.0, 10.0]])
 
         def normalize(self, data, metadata):
-            return np.asarray(data, dtype=float)
+            return np.asarray(data, dtype=float) / 250.0
 
     raw = PublicationDisplayAdapter(store, widget=_Widget()).raw_image(state)
 
-    assert raw is not None
-    assert np.isfinite(raw.image).all()
-    assert 65535.0 in raw.image
+    assert raw is None

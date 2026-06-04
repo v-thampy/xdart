@@ -127,6 +127,71 @@ def test_xye_to_image_transition_renders(widget):
     assert img is not None and img.size > 0 and np.isfinite(img).any()
 
 
+def test_image_viewer_idxs_ignore_stale_scan_frames(widget):
+    """Regression (Int 1D (XYE) → Image Viewer real state corruption).
+
+    Running Int 1D (XYE) integrates a file and leaves ``scan.frames``
+    populated.  Opening that SAME file in Image Viewer makes
+    ``len(frame_ids) == len(scan.frames.index)``, which flips
+    ``resolve_selection``'s ``overall`` heuristic True and rebases the
+    selection onto the stale scan labels.  Those don't intersect the
+    viewer's loaded ``data_2d`` keys, so ``idxs_2d`` comes back empty and
+    the panel renders blank — even though the image loaded fine.  Reached
+    any other way (``scan.frames`` empty) it renders, which is the exact
+    asymmetry reported.  ``get_idxs`` must ignore ``scan.frames`` in viewer
+    mode."""
+    import threading
+    from types import SimpleNamespace
+    w = widget
+    w._on_viewer_mode_changed("image")
+    df = w.displayframe
+    # Stale scan from a prior Int 1D (XYE) run: same COUNT (3) as the image
+    # we're viewing, but DIFFERENT labels.  (Stubbed so the test also proves
+    # the fix path never consults scan.frames at all.)
+    df.scan = SimpleNamespace(
+        scan_lock=threading.RLock(),
+        frames=SimpleNamespace(index=[10, 11, 12]),
+        name="stale", skip_2d=False,
+    )
+    raw = np.arange(36, dtype=float).reshape(6, 6)
+    with df.data_lock:
+        df.data_1d.clear()
+        df.data_2d.clear()
+        for k in (1, 2, 3):
+            df.data_2d[k] = {"map_raw": raw, "bg_raw": 0, "mask": None,
+                             "int_2d": None, "gi_2d": {}, "thumbnail": None}
+    df.frame_ids[:] = ["1", "2", "3"]
+
+    df.get_idxs()
+
+    # Pre-fix: overall=True → ids rebased to [10,11,12] → idxs_2d == [] (blank).
+    # Post-fix: the loaded frame_ids drive the selection.
+    assert df.overall is False
+    assert df.idxs_2d == [1, 2, 3]
+
+
+def test_image_viewer_restores_twodwindow_height_after_1d_only(widget):
+    """Regression (Int 1D (XYE) -> Image Viewer blank, root cause).
+
+    A 1D-only processing mode (Int 1D / Int 1D (XYE)) collapses the 2D
+    container ``twoDWindow`` to height 0 via ``_apply_1d_only_visibility``.
+    Viewer modes return early from that method, so entering Image Viewer must
+    restore the container's height itself — otherwise the raw image is drawn
+    correctly into a zero-height widget and is invisible (the reported blank;
+    data + sanitize + draw were all confirmed identical to the working case,
+    the only difference was widget height = 0)."""
+    w = widget
+    df = w.displayframe
+    # Reproduce the collapse an Int 1D (XYE) run leaves behind.
+    df.scan.skip_2d = True
+    df.viewer_mode = None
+    df._apply_1d_only_visibility()
+    assert df.ui.twoDWindow.maximumHeight() == 0          # collapsed
+
+    df.set_viewer_display_mode("image")
+    assert df.ui.twoDWindow.maximumHeight() > 0           # restored, not 0
+
+
 # ── Real-data cells: exercise the full _load_image_file (classify + load) ──
 
 _TIFF = _DATA / "Tiff" / "Combi4_Angledependence_samz_4p9_03271002_0001.tif"

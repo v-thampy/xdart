@@ -199,6 +199,21 @@ class PublicationDisplayAdapter:
         }
 
     def raw_image(self, state):
+        # The Image Viewer is a raw detector-file browser.  Its raw panel is
+        # rendered by the legacy ``_update_image_viewer`` path, which is the
+        # single source of truth for raw previews: standalone sentinel-fill vs
+        # processed-xdart NaN-preserve (P0/S2), viewer-specific display levels,
+        # and — crucially — NO processing mask, background subtraction, or
+        # monitor normalization (a raw browser shows detector counts).  The
+        # publication adapter below re-applies normalization/background, which
+        # is wrong for a raw browser and competes with that path: when the
+        # result is non-finite or unviewable, ``_draw_image_payload`` blanks
+        # the panel and returns success, so the legacy fallback never runs —
+        # the Image Viewer goes blank (notably after an Int 1D (XYE) run leaves
+        # normalization/background/Set-Bkg state on the widget).  Defer to the
+        # legacy path entirely for the Image Viewer.
+        if state.mode is Mode.IMAGE_VIEWER:
+            return None
         panel = state.panel(PanelRole.RAW_2D)
         if panel is None or not panel.has_data:
             return None

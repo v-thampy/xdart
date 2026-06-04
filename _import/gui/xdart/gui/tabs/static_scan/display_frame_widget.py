@@ -491,22 +491,43 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if len(self.frame_ids) == 0 or self.frame_ids[0] == 'No data':
             return
 
-        with self.data_lock:
-            with self.scan.scan_lock:
-                # Stage 1: selection logic is the pure ``resolve_selection``
-                # / ``resolve_render_ids`` (unit-tested headlessly).
-                try:
-                    ids, self.overall = resolve_selection(
-                        self.frame_ids, self.scan.frames.index)
-                except ValueError:
-                    return
+        if self.viewer_mode is not None:
+            # Viewer modes (image/xye/nexus) are file browsers: the loaded
+            # ``frame_ids`` ARE the selection and must never be resolved
+            # against the integration scan's frame index (§8 invariant —
+            # viewer controllers never consult ``scan.frames``).  That index
+            # may be stale-populated from a prior run; in particular, opening
+            # the SAME file in Image Viewer that was just integrated via an
+            # Int 1D (XYE) batch makes ``len(frame_ids) == len(scan.frames)``,
+            # which flips ``resolve_selection``'s ``overall`` heuristic True
+            # and rebases ``ids`` onto the stale scan labels.  Those don't
+            # intersect the viewer's loaded data keys, so ``idxs`` come back
+            # empty and the panel renders blank.
+            try:
+                ids = tuple(sorted(int(i) for i in self.frame_ids))
+            except (TypeError, ValueError):
+                return
+            self.overall = False
+            with self.data_lock:
+                data_1d_keys = set(self.data_1d.keys())
+                data_2d_keys = set(self.data_2d.keys())
+        else:
+            with self.data_lock:
+                with self.scan.scan_lock:
+                    # Stage 1: selection logic is the pure ``resolve_selection``
+                    # / ``resolve_render_ids`` (unit-tested headlessly).
+                    try:
+                        ids, self.overall = resolve_selection(
+                            self.frame_ids, self.scan.frames.index)
+                    except ValueError:
+                        return
 
-            self.idxs = list(ids)
-            # Snapshot current dict keys while the lock is held, then release
-            # before doing list-comprehension work.
-            data_1d_keys = set(self.data_1d.keys())
-            data_2d_keys = set(self.data_2d.keys())
+                # Snapshot current dict keys while the lock is held, then
+                # release before doing list-comprehension work.
+                data_1d_keys = set(self.data_1d.keys())
+                data_2d_keys = set(self.data_2d.keys())
 
+        self.idxs = list(ids)
         # ``ids`` is already the effective set (all-or-selected), so intersect
         # it directly with the loaded keys for each panel.
         self.idxs_1d = list(resolve_render_ids(ids, False, (), data_1d_keys))
@@ -1651,6 +1672,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.frame_4.setVisible(not is_viewer)
         self.ui.frame_6.setVisible(not is_viewer)
         self.ui.plotToolBar.setVisible(False)
+
+        # Restore the 2D container's height.  A prior 1D-only processing mode
+        # (Int 1D / Int 1D (XYE)) collapses ``twoDWindow`` to height 0 via
+        # ``_apply_1d_only_visibility``; viewer modes return early from that
+        # method and so never undo it.  Without this reset a viewer that shows
+        # the 2D pane (image / nexus) renders its image into a zero-height
+        # widget — drawn correctly but invisible (the reproducible
+        # Int 1D (XYE) -> Image Viewer blank).  The per-mode branches below set
+        # the inner ``imageWindow``/``plotWindow`` heights; ``xye`` hides
+        # ``twoDWindow`` outright, so this reset is harmless there.
+        self.ui.twoDWindow.setMinimumHeight(0)
+        self.ui.twoDWindow.setMaximumHeight(16777215)
 
         if mode == 'image':
             # Top bar (filename only) + raw image; no controls, collapse 1D.
