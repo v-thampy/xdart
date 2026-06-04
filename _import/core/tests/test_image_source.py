@@ -107,6 +107,17 @@ def test_classify_raw_master(raw_master):
     assert info.n_frames == raw.shape[0]
 
 
+def test_classify_binary_raw_is_single_frame_without_fabio_warning(tmp_path, caplog):
+    raw = tmp_path / "single.raw"
+    raw.write_bytes(np.arange(195 * 487, dtype=np.int32).tobytes())
+
+    info = classify_image_source(raw)
+
+    assert info.kind is ImageSourceKind.RAW_MASTER
+    assert info.frame_labels == (0,)
+    assert "Could not determine frame count" not in caplog.text
+
+
 def test_classify_unknown(tmp_path):
     p = tmp_path / "empty.nxs"
     with h5py.File(p, "w") as f:

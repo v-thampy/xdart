@@ -172,12 +172,19 @@ def classify_image_source(path) -> ImageSourceInfo:
 
     if not _is_hdf5(p):
         # tiff / raw / eiger / non-HDF master — a genuine raw detector file.
-        try:
-            n = int(count_frames(p))
-        except Exception:
-            logger.debug("classify_image_source: count_frames failed for %s", p,
-                         exc_info=True)
+        if p.suffix.lower() == ".raw":
+            # Raw binary files have no self-describing frame count; the image
+            # loader resolves their detector shape later.  Treat them as one
+            # frame here so Image Viewer browsing does not emit a warning on
+            # every raw selection.
             n = 1
+        else:
+            try:
+                n = int(count_frames(p))
+            except Exception:
+                logger.debug("classify_image_source: count_frames failed for %s", p,
+                             exc_info=True)
+                n = 1
         n = max(n, 1)
         return ImageSourceInfo(
             kind=ImageSourceKind.RAW_MASTER, path=str(p),

@@ -1,0 +1,58 @@
+# ssrl_xrd_tools — working notes for Claude Code
+
+The headless XRD reduction + I/O library. **xdart (the Qt GUI) is the consumer** and pins this via
+`ssrl_xrd_tools>=` in its `pyproject.toml`. Anything that does not need Qt belongs here, not in
+xdart ("keep xdart thin"). This package must import **no Qt/pyqtgraph**.
+
+## Environment & tests
+- Env: `conda activate xrd_edit` (shared with xdart; has pyFAI/h5py/numpy). Editable install.
+- Tests: `python -m pytest tests/` (verbose by default). Fixtures are synthetic (see
+  `tests/conftest.py`: `poni_fixture`, `ai_fixture`); the suite is self-contained — no external data
+  env var required. Heavy/full-size cases are marked `slow` (`pytest -m "not slow"` to skip).
+
+## Guardrails (do not violate)
+- **Do NOT `git push`, publish, or bump versions** — leave releases to the maintainer.
+- **Keep the NeXus writer/reader correctness checks strict.** `validate_integrated_stack_write`,
+  `_require_uniform_axes_1d/2d`, and `_select_frames_to_write` (in `io/nexus.py`) exist to keep the
+  stacked schema consistent. Fix GI per-frame-axis issues by **freezing a common grid**, never by
+  relaxing a validator.
+- **NeXus schema changes are additive + back-compatible only.** Old files must still read; missing
+  axis identity defaults to `TwoDKind.Q_CHI`. Persisted wavelength comes from the active
+  PONI/integrator, never a default `1.0`.
+- **2D orientation convention (classic bug source).** `core.IntegrationResult2D.intensity` is
+  `(radial, azimuthal)`; the saved stack and `io.read.get_2d` are `(chi, q)` = `(y, x)`; `FrameView`
+  stores `(axis_2d_y, axis_2d_x)` = `(y, x)`. So `FrameView.from_results` transposes the pyFAI
+  result, `read_frame_view` does not transpose the already-`(y,x)` saved data. Don't "tidy" that
+  asymmetry into a bug.
+- When fixing a bug, label it **regression** (caused by recent work) vs **pre-existing**.
+
+## Package map (`ssrl_xrd_tools/`)
+- **`core/`** — pure data contracts (no I/O). `containers` (`PONI`, `IntegrationResult1D/2D`,
+  `ScanMetadata`), `frame_view` (`Axis`, `TwoDKind`, `FrameGeometry`, `FrameView`,
+  `assert_frameview_equivalent`, `numeric_metadata`, `two_d_kind_from_units`), `geometry/`,
+  `hdf5` (codec), `provenance`, `metadata`, `config`.
+- **`io/`** — persistence + readers.
+  - `nexus.py` — the stacked v2 writer/reader (`write_integrated_stack`, `read_scan`, the validators
+    above). The single source of truth for the on-disk schema.
+  - `read.py` — convenience readers: `read_scan`-adjacent `get_1d` / `get_2d` / `get_thumbnail` /
+    `get_metadata`, `get_raw_frame`, `open_scan` / `Scan`.
+  - `frame_view.py` — `read_frame_view` / `iter_frame_views` (per-frame `FrameView` reconstruction;
+    the headless half of xdart's live≡batch≡reload equivalence spine). `iter_frame_views` should
+    stream frame-by-frame (don't materialize the whole scan).
+  - `image_source.py` — `classify_image_source` / `load_image_frame` /
+    `load_processed_raw_or_thumbnail` (what kind of file is this + how to get a displayable frame).
+    A bare native `entry/frames` is NOT a processed marker (eiger masters carry one); raw dataset /
+    eiger-master wins.
+  - `nexus_inspect.py` — read-only structure/dataset inspection for the NeXus viewer
+    (`inspect_nexus`, `preview_nexus_dataset` bounded for GUI, `read_nexus_dataset` full for
+    headless). `is_processed` must match `classify_image_source` semantics (don't reintroduce the
+    bare-`entry/frames` heuristic).
+  - also: `image.py`, `export.py`, `spec.py`, `metadata.py`, `tiled.py`, `chunk_size.py`.
+- **`integrate/`** — pyFAI integration + GI (`calibration`, `gid`/FiberIntegrator, pixel-q maps).
+- **`reduction/`**, **`rsm/`** (`RSMVolume`, streaming gridder), **`transforms/`**, **`corrections/`**,
+  **`analysis/`** (phase/strain/sin2psi fitting), **`viz/`** (matplotlib only).
+
+## Relationship to xdart
+`FrameView` (here) is wrapped by xdart's `FramePublication`. The validation/display gate lives in
+xdart; the compute, persistence, and round-trip fidelity live here. The live≡batch≡reload
+equivalence spine is an xdart test, but `read_frame_view` is its reload half — keep it faithful.
