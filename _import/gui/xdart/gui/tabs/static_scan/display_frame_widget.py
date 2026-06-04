@@ -51,7 +51,7 @@ from .display_plot import DisplayPlotMixin
 from .display_logic import (
     Mode, LoadStatus, PanelRole, compute_display_state,
     build_payload, render_plan, controller_for, ImagePayload,
-    empty_display_state,
+    empty_display_state, PANEL_LAYOUT,
     resolve_selection, resolve_render_ids,
     xye_unit_from_filename, x_axis_for_unit, default_plot_unit,
 )
@@ -973,36 +973,68 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     # ── 1D-only visibility ────────────────────────────────────────
 
-    def _apply_1d_only_visibility(self):
-        """Show or hide 2D panes based on scan.skip_2d.
+    def _apply_layout(self, mode):
+        """Apply the *full* panel geometry for ``mode`` from ``PANEL_LAYOUT``.
 
-        In 1D-only mode (skip_2d), collapse the 2D image panels and
-        image toolbar while keeping the top toolbar (Norm Channel, Scale,
-        Set Bkg, etc.) visible.  Also removes pure-2D entries (like χ)
-        from the plotUnit combo so the user cannot select them.
+        Idempotent and self-contained: every managed widget's visibility +
+        (min,max) height/width is set unconditionally, with no reliance on the
+        prior mode's state.  This is the single source of panel geometry —
+        ``set_viewer_display_mode`` and ``_apply_1d_only_visibility`` route
+        through here instead of poking heights/visibility themselves, which
+        kills the "mode A collapsed X and mode B forgot to restore it" leak
+        class (the twoDWindow zero-height blank, the stuck 1D-only residue).
+
+        Geometry only: control enable/disable, the plotUnit 2D-entry rebuild,
+        the slice uncheck and the splitter equalization stay with their callers
+        for now (a later sub-step can fold the controls in too).
+        """
+        spec = PANEL_LAYOUT[mode]
+        ui = self.ui
+        # Visibility.
+        ui.frame_top.setVisible(spec.frame_top_vis)
+        ui.twoDWindow.setVisible(spec.twoDWindow_vis)
+        ui.imageToolbar.setVisible(spec.imageToolbar_vis)
+        ui.frame_4.setVisible(spec.frame_4_vis)
+        ui.frame_6.setVisible(spec.frame_6_vis)
+        ui.plotToolBar.setVisible(spec.plotToolBar_vis)
+        self._showImageBtn.setVisible(spec.show_image_btn_vis)
+        # Heights (min, max).
+        ui.twoDWindow.setMinimumHeight(spec.twoDWindow_h[0])
+        ui.twoDWindow.setMaximumHeight(spec.twoDWindow_h[1])
+        ui.imageWindow.setMinimumHeight(spec.imageWindow_h[0])
+        ui.imageWindow.setMaximumHeight(spec.imageWindow_h[1])
+        ui.plotWindow.setMinimumHeight(spec.plotWindow_h[0])
+        ui.plotWindow.setMaximumHeight(spec.plotWindow_h[1])
+        ui.imageToolbar.setMinimumHeight(spec.imageToolbar_h[0])
+        ui.imageToolbar.setMaximumHeight(spec.imageToolbar_h[1])
+        ui.plotToolBar.setMinimumHeight(spec.plotToolBar_h[0])
+        ui.plotToolBar.setMaximumHeight(spec.plotToolBar_h[1])
+        # Cake-panel width (collapsed to show raw only).
+        ui.binnedFrame.setMinimumWidth(spec.binnedFrame_w[0])
+        ui.binnedFrame.setMaximumWidth(spec.binnedFrame_w[1])
+
+    def _apply_1d_only_visibility(self):
+        """Apply the 1D-only vs full-2D *control state* for the current
+        processing mode (``scan.skip_2d``), and the matching panel geometry.
+
+        Geometry (panel heights/widths/visibility + the raw-preview button) is
+        owned by :meth:`_apply_layout`; this method keeps only the control-state
+        bits the geometry table deliberately does not own: the 2D-only controls
+        (Share Axis, 2D unit, X-Range slice), the slice uncheck, and removing
+        pure-2D entries (like χ) from the plotUnit combo so the user cannot
+        select them in 1D-only mode.
         """
         # In viewer mode, set_viewer_display_mode() controls panels
         if self.viewer_mode is not None:
             return
         skip = getattr(self.scan, 'skip_2d', False)
+        # Full panel geometry for this processing mode (idempotent).
+        self._apply_layout(Mode.INT_1D if skip else Mode.INT_2D)
         if skip:
-            # Hide the 2D image but KEEP the middle control bar
-            # (imageToolbar) — it now holds the 1D plot controls.  Shrink
-            # imageWindow to the title + control bar (frame_top 35 +
-            # imageToolbar 40).
-            self.ui.twoDWindow.setMaximumHeight(0)
-            self.ui.twoDWindow.setMinimumHeight(0)
-            self.ui.imageToolbar.setMinimumHeight(40)
-            self.ui.imageToolbar.setMaximumHeight(40)
-            self.ui.imageWindow.setMinimumHeight(80)
-            self.ui.imageWindow.setMaximumHeight(85)
             # 2D-only controls (Share Axis, 2D unit, X-Range slice) off.
             if self.ui.slice.isChecked():
                 self.ui.slice.setChecked(False)
             self._set_2d_controls_visible(False)
-
-            # Show the raw image preview button in 1D-only mode
-            self._showImageBtn.setVisible(True)
 
             # Remove pure-2D entries from plotUnit (e.g. χ)
             self.ui.plotUnit.blockSignals(True)
@@ -1018,16 +1050,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.plotUnit.blockSignals(False)
             self._was_skip_2d = True
         else:
-            # Restore the 2D image + all controls.
-            self.ui.twoDWindow.setMinimumHeight(0)
-            self.ui.twoDWindow.setMaximumHeight(16777215)
-            self.ui.imageToolbar.setMinimumHeight(40)
-            self.ui.imageToolbar.setMaximumHeight(40)
-            self.ui.imageWindow.setMinimumHeight(200)
-            self.ui.imageWindow.setMaximumHeight(16777215)
             self._set_2d_controls_visible(True)
-            # Hide the raw image preview button in 2D modes
-            self._showImageBtn.setVisible(False)
             # Only rebuild plotUnit when transitioning from 1D-only mode,
             # otherwise preserve the user's current plotUnit selection.
             if self._was_skip_2d:
@@ -1653,7 +1676,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._viewer_x_axis_label = None
         self._payload_x_axis_label = None
         self._payload_y_axis_label = None
-        is_viewer = mode in ('image', 'xye', 'nexus')
         if mode == 'image':
             title = 'Image Viewer'
         elif mode == 'xye':
@@ -1665,80 +1687,36 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # A mode transition must not carry the previous mode's visible
         # image/curve or cached overlay data into the new one.
         self.clear_display_state(title)
-        # In a viewer the top bar carries only the filename label (frame_5):
-        # the norm/bkg controls (frame_4) and scale/cmap (frame_6) are
-        # process-mode concerns.  The bottom toolbar is permanently
-        # collapsed (its controls moved to the middle bar in _reflow).
-        self.ui.frame_4.setVisible(not is_viewer)
-        self.ui.frame_6.setVisible(not is_viewer)
-        self.ui.plotToolBar.setVisible(False)
 
-        # Restore the 2D container's height.  A prior 1D-only processing mode
-        # (Int 1D / Int 1D (XYE)) collapses ``twoDWindow`` to height 0 via
-        # ``_apply_1d_only_visibility``; viewer modes return early from that
-        # method and so never undo it.  Without this reset a viewer that shows
-        # the 2D pane (image / nexus) renders its image into a zero-height
-        # widget — drawn correctly but invisible (the reproducible
-        # Int 1D (XYE) -> Image Viewer blank).  The per-mode branches below set
-        # the inner ``imageWindow``/``plotWindow`` heights; ``xye`` hides
-        # ``twoDWindow`` outright, so this reset is harmless there.
-        self.ui.twoDWindow.setMinimumHeight(0)
-        self.ui.twoDWindow.setMaximumHeight(16777215)
+        # Full panel geometry for this mode (idempotent, table-driven).  This
+        # owns *all* of the height/width/visibility that used to be poked per
+        # branch below — including the twoDWindow zero-height restore that a
+        # prior 1D-only mode required (the Int 1D (XYE) -> Image Viewer blank).
+        # A viewer mode maps to its own Mode; None/'' falls back to the current
+        # processing mode's geometry.
+        layout_mode = {
+            'image': Mode.IMAGE_VIEWER,
+            'xye': Mode.XYE_VIEWER,
+            'nexus': Mode.NEXUS_VIEWER,
+        }.get(mode)
+        if layout_mode is None:
+            layout_mode = (Mode.INT_1D if getattr(self.scan, 'skip_2d', False)
+                           else Mode.INT_2D)
+        self._apply_layout(layout_mode)
 
-        if mode == 'image':
-            # Top bar (filename only) + raw image; no controls, collapse 1D.
-            self.ui.frame_top.setVisible(True)
-            self.ui.twoDWindow.setVisible(True)
-            self.ui.imageToolbar.setVisible(False)
-            self.ui.imageWindow.setMinimumHeight(200)
-            self.ui.imageWindow.setMaximumHeight(16777215)
-            self.ui.plotWindow.setMinimumHeight(0)
-            self.ui.plotWindow.setMaximumHeight(0)
-            # Hide binned frame — only raw image relevant
-            self.ui.binnedFrame.setMaximumWidth(0)
-            self.ui.binnedFrame.setMinimumWidth(0)
-            self._showImageBtn.setVisible(False)
-        elif mode == 'xye':
-            # 1D overlay view: hide the 2D image but KEEP the middle control
-            # bar (Single/Options/Legend/Clear are useful for overlays).
-            # The XYE file owns its x-axis, so hide the transform combo.
-            self.ui.frame_top.setVisible(True)
-            self.ui.twoDWindow.setVisible(False)
-            self.ui.imageToolbar.setVisible(True)
+        # Control-state the geometry table deliberately does not own.
+        if mode == 'xye':
+            # The XYE file owns its x-axis, so hide the transform combo; the
+            # 2D-only controls (Share Axis, 2D unit, slice) are meaningless.
             self.ui.plotUnit.setVisible(False)
             self._set_2d_controls_visible(False)
-            self.ui.imageWindow.setMinimumHeight(80)
-            self.ui.imageWindow.setMaximumHeight(85)
-            self.ui.plotWindow.setMinimumHeight(200)
-            self.ui.plotWindow.setMaximumHeight(16777215)
-        elif mode == 'nexus':
-            # Schema/detail view with bounded dataset previews: selected
-            # 1D datasets draw in the plot panel, selected 2D datasets draw
-            # in the image panel, and metadata-only rows blank both.
-            self.ui.frame_top.setVisible(True)
-            self.ui.twoDWindow.setVisible(True)
-            self.ui.imageToolbar.setVisible(False)
-            self.ui.imageWindow.setMinimumHeight(200)
-            self.ui.imageWindow.setMaximumHeight(16777215)
-            self.ui.plotWindow.setMinimumHeight(200)
-            self.ui.plotWindow.setMaximumHeight(16777215)
-            self.ui.binnedFrame.setMaximumWidth(0)
-            self.ui.binnedFrame.setMinimumWidth(0)
-            self._showImageBtn.setVisible(False)
-            self._set_equal_primary_panel_heights()
+        elif mode in ('image', 'nexus'):
+            # Raw image / schema preview need no extra control state beyond the
+            # geometry table.
+            if mode == 'nexus':
+                self._set_equal_primary_panel_heights()
         else:
-            # Normal mode — restore panels + the middle control bar.
-            self.ui.frame_top.setVisible(True)
-            self.ui.twoDWindow.setVisible(True)
-            self.ui.imageToolbar.setVisible(True)
-            self.ui.imageWindow.setMinimumHeight(200)
-            self.ui.imageWindow.setMaximumHeight(16777215)
-            self.ui.plotWindow.setMinimumHeight(200)
-            self.ui.plotWindow.setMaximumHeight(16777215)
-            # Restore binned frame
-            self.ui.binnedFrame.setMinimumWidth(0)
-            self.ui.binnedFrame.setMaximumWidth(16777215)
-            # Re-enable all controls
+            # Normal mode — re-enable all process-mode controls.
             self.ui.normChannel.setEnabled(True)
             self.ui.setBkg.setEnabled(True)
             self.ui.shareAxis.setEnabled(True)
@@ -1752,8 +1730,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._on_plotUnit_changed()
             self.ui.showLegend.setEnabled(True)
             self.ui.clear_1D.setEnabled(True)
-            # Re-apply 2D-control visibility for the current processing
-            # mode (Int 1D hides the 2D controls + slice; Int 2D shows all).
+            # Re-apply 2D-control visibility for the current processing mode
+            # (Int 1D hides the 2D controls + slice; Int 2D shows all).  This
+            # re-asserts the geometry via _apply_layout (idempotent).
             self._apply_1d_only_visibility()
             self._set_equal_primary_panel_heights()
 

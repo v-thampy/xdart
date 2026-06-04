@@ -532,6 +532,10 @@ def test_display_generation_bumps_on_mode_switch_and_selection():
         displayFrameWidget._bump_display_generation, host)
     host._note_selection_generation = MethodType(
         displayFrameWidget._note_selection_generation, host)
+    # set_viewer_display_mode now routes panel geometry through the table-driven
+    # _apply_layout; bind it too (it pokes the mocked ui / _showImageBtn only).
+    host._apply_layout = MethodType(
+        displayFrameWidget._apply_layout, host)
     host.set_viewer_display_mode = MethodType(
         displayFrameWidget.set_viewer_display_mode, host)
 

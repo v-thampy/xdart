@@ -85,6 +85,126 @@ class Mode(Enum):
     NEXUS_VIEWER = "nexus_viewer"
 
 
+# ── Panel layout table (Stage 4/5 step 1) ────────────────────────────
+#
+# Panel geometry used to be set by *deltas* scattered across
+# ``set_viewer_display_mode`` (per-mode height/width/visibility pokes) and
+# ``_apply_1d_only_visibility`` (collapse/restore the 2D pane).  Each path set
+# only the fields it cared about and assumed a baseline the other may have
+# changed, so state leaked across mode transitions (e.g. a 1D-only mode left
+# ``twoDWindow`` at ``maximumHeight(0)``; a viewer that draws the 2D pane then
+# rendered its image into a zero-height widget → invisible).
+#
+# ``PANEL_LAYOUT`` makes geometry a pure, idempotent function of ``Mode``: the
+# *full* end state of every managed widget, for every mode, with no reliance on
+# prior state.  ``displayFrameWidget._apply_layout`` applies it unconditionally.
+# This is the Qt-free data half; the Qt application lives in the widget.
+
+_FULL = 16777215  # Qt's QWIDGETSIZE_MAX — "no maximum" sentinel for min/max.
+
+
+@dataclass(frozen=True)
+class PanelLayout:
+    """Complete panel geometry for one :class:`Mode`.
+
+    Every field is set unconditionally by ``_apply_layout`` — there are no
+    "leave it alone" fields, which is the whole point (a field left untouched
+    is exactly how geometry leaked across modes).  ``*_h`` / ``*_w`` are
+    ``(minimum, maximum)`` pairs in pixels; ``_FULL`` means "no maximum".
+
+    Widget roles (hierarchy: ``imageWindow`` is the top primary panel holding
+    the title bar + 2D container + middle toolbar; ``plotWindow`` is the bottom
+    primary panel; ``binnedFrame`` is the cake panel inside ``twoDWindow``):
+
+    * ``frame_top``    — title bar (filename + process controls); always shown.
+    * ``twoDWindow``   — the 2D image container (raw + cake).
+    * ``imageWindow``  — top primary panel height (title+2D+toolbar).
+    * ``plotWindow``   — bottom primary panel height (the 1D plot).
+    * ``binnedFrame``  — cake panel *width* (collapsed to show raw only).
+    * ``imageToolbar`` — middle control bar (40px tall by UI default).
+    * ``frame_4``/``frame_6`` — process-mode controls (norm/bkg, scale/cmap);
+      hidden in viewer modes.  ``_showImageBtn`` lives inside ``frame_6``.
+    * ``plotToolBar``  — permanently collapsed (its controls moved to the
+      middle bar in ``_reflow_controls``).
+    * ``show_image_btn`` — the raw-preview button (only meaningful in 1D-only
+      Int mode; its host ``frame_6`` is hidden in viewer modes regardless).
+    """
+    frame_top_vis: bool
+    twoDWindow_vis: bool
+    imageToolbar_vis: bool
+    frame_4_vis: bool
+    frame_6_vis: bool
+    plotToolBar_vis: bool
+    show_image_btn_vis: bool
+    twoDWindow_h: tuple
+    imageWindow_h: tuple
+    plotWindow_h: tuple
+    imageToolbar_h: tuple
+    plotToolBar_h: tuple
+    binnedFrame_w: tuple
+
+
+# Values extracted faithfully from the pre-table end states (see
+# ``set_viewer_display_mode`` / ``_apply_1d_only_visibility`` history).  Two
+# deliberate fixes vs the old scattered code, both behaviour-improving and
+# called out in the plan:
+#   * INT_1D sets ``plotWindow_h`` explicitly (the old 1D-only path left it
+#     implicit — a latent gap), and
+#   * viewer modes now set ``show_image_btn_vis`` False explicitly (the button's
+#     host ``frame_6`` is hidden there anyway, so this is invisible but removes a
+#     latent leak from a prior 1D-only mode).
+PANEL_LAYOUT = {
+    # Int 1D / Int 1D (XYE): 2D pane collapsed (height 0) but still "visible";
+    # imageWindow shrinks to the title + middle bar; raw-preview button shown.
+    Mode.INT_1D: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=True,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
+        show_image_btn_vis=True,
+        twoDWindow_h=(0, 0), imageWindow_h=(80, 85), plotWindow_h=(200, _FULL),
+        imageToolbar_h=(40, 40), plotToolBar_h=(0, 0), binnedFrame_w=(0, _FULL),
+    ),
+    # Int 2D: full 2D pane (raw + cake) over the 1D plot; all controls shown.
+    Mode.INT_2D: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=True,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
+        plotWindow_h=(200, _FULL), imageToolbar_h=(40, 40),
+        plotToolBar_h=(0, 0), binnedFrame_w=(0, _FULL),
+    ),
+    # Image Viewer: raw image only; 1D plot collapsed, cake collapsed,
+    # process controls + middle bar hidden.
+    Mode.IMAGE_VIEWER: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=False,
+        frame_4_vis=False, frame_6_vis=False, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
+        plotWindow_h=(0, 0), imageToolbar_h=(40, 40),
+        plotToolBar_h=(0, 0), binnedFrame_w=(0, 0),
+    ),
+    # XYE Viewer: 1D overlay only; 2D container hidden, middle bar kept
+    # (Single/Options/Legend/Clear), process controls hidden.
+    Mode.XYE_VIEWER: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=False, imageToolbar_vis=True,
+        frame_4_vis=False, frame_6_vis=False, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, _FULL), imageWindow_h=(80, 85),
+        plotWindow_h=(200, _FULL), imageToolbar_h=(40, 40),
+        plotToolBar_h=(0, 0), binnedFrame_w=(0, _FULL),
+    ),
+    # NeXus Viewer: 2D dataset preview over a 1D dataset preview; cake
+    # collapsed, process controls + middle bar hidden.
+    Mode.NEXUS_VIEWER: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=False,
+        frame_4_vis=False, frame_6_vis=False, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
+        plotWindow_h=(200, _FULL), imageToolbar_h=(40, 40),
+        plotToolBar_h=(0, 0), binnedFrame_w=(0, 0),
+    ),
+}
+
+
 class PanelRole(Enum):
     """Identifies the *kind* of a render panel.  ``render`` lays panels out
     by ``DisplayState.layout`` and dispatches each panel to a widget by its

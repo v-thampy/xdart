@@ -250,3 +250,148 @@ def test_image_viewer_real_processed_nxs_is_xdart_and_renders(widget):
     assert widget.h5viewer._viewer_is_xdart is True
     assert widget.displayframe._viewer_is_xdart is True   # propagated at set_data
     assert data is not None and data[0] is not None and data[0].size > 0
+
+
+# ── Layout table (Stage 4/5 step 1): `_apply_layout(mode)` geometry ────────
+#
+# Panel geometry is now a pure, idempotent function of Mode (PANEL_LAYOUT).
+# These drive the REAL staticWidget into each mode through the production entry
+# points and assert every managed widget's visibility + (min,max) height/width
+# matches the table — the per-mode invariant — and that the *destination*
+# geometry is correct regardless of origin — the leak class that produced the
+# Int 1D (XYE) -> Image Viewer blank (twoDWindow stuck at maximumHeight 0).
+
+from xdart.gui.tabs.static_scan.display_logic import Mode, PANEL_LAYOUT
+
+_VIEWER_STR = {
+    Mode.IMAGE_VIEWER: "image",
+    Mode.XYE_VIEWER: "xye",
+    Mode.NEXUS_VIEWER: "nexus",
+}
+_ALL_MODES = [Mode.INT_1D, Mode.INT_2D, Mode.IMAGE_VIEWER,
+              Mode.XYE_VIEWER, Mode.NEXUS_VIEWER]
+
+
+def _enter(w, mode):
+    """Drive the widget into ``mode`` through the production routing.
+
+    Viewer modes go through ``set_viewer_display_mode``; the Int processing
+    modes go through ``set_viewer_display_mode(None)`` (the normal-restore path
+    a user hits when switching a viewer back to Int 1D/2D), which itself routes
+    geometry through ``_apply_1d_only_visibility`` → ``_apply_layout``.
+    """
+    df = w.displayframe
+    if mode in _VIEWER_STR:
+        df.set_viewer_display_mode(_VIEWER_STR[mode])
+    else:
+        df.scan.skip_2d = (mode is Mode.INT_1D)
+        df.set_viewer_display_mode(None)
+    return df
+
+
+def _geom(df):
+    """Live geometry snapshot of every managed widget.
+
+    Visibility uses ``isHidden()`` (the widget's own explicit flag, independent
+    of whether the offscreen top-level was ever shown), which is exactly what
+    the table sets via ``setVisible``.
+    """
+    ui = df.ui
+    return {
+        "frame_top_vis": not ui.frame_top.isHidden(),
+        "twoDWindow_vis": not ui.twoDWindow.isHidden(),
+        "imageToolbar_vis": not ui.imageToolbar.isHidden(),
+        "frame_4_vis": not ui.frame_4.isHidden(),
+        "frame_6_vis": not ui.frame_6.isHidden(),
+        "plotToolBar_vis": not ui.plotToolBar.isHidden(),
+        "show_image_btn_vis": not df._showImageBtn.isHidden(),
+        "twoDWindow_h": (ui.twoDWindow.minimumHeight(), ui.twoDWindow.maximumHeight()),
+        "imageWindow_h": (ui.imageWindow.minimumHeight(), ui.imageWindow.maximumHeight()),
+        "plotWindow_h": (ui.plotWindow.minimumHeight(), ui.plotWindow.maximumHeight()),
+        "imageToolbar_h": (ui.imageToolbar.minimumHeight(), ui.imageToolbar.maximumHeight()),
+        "plotToolBar_h": (ui.plotToolBar.minimumHeight(), ui.plotToolBar.maximumHeight()),
+        "binnedFrame_w": (ui.binnedFrame.minimumWidth(), ui.binnedFrame.maximumWidth()),
+    }
+
+
+def _expected(mode):
+    """The geometry the table says ``mode`` must produce."""
+    s = PANEL_LAYOUT[mode]
+    return {
+        "frame_top_vis": s.frame_top_vis,
+        "twoDWindow_vis": s.twoDWindow_vis,
+        "imageToolbar_vis": s.imageToolbar_vis,
+        "frame_4_vis": s.frame_4_vis,
+        "frame_6_vis": s.frame_6_vis,
+        "plotToolBar_vis": s.plotToolBar_vis,
+        "show_image_btn_vis": s.show_image_btn_vis,
+        "twoDWindow_h": tuple(s.twoDWindow_h),
+        "imageWindow_h": tuple(s.imageWindow_h),
+        "plotWindow_h": tuple(s.plotWindow_h),
+        "imageToolbar_h": tuple(s.imageToolbar_h),
+        "plotToolBar_h": tuple(s.plotToolBar_h),
+        "binnedFrame_w": tuple(s.binnedFrame_w),
+    }
+
+
+@pytest.mark.parametrize("mode", _ALL_MODES, ids=lambda m: m.name)
+def test_layout_per_mode_matches_table(widget, mode):
+    """Each mode drives the production entry point to the full table geometry."""
+    df = _enter(widget, mode)
+    assert _geom(df) == _expected(mode)
+
+
+@pytest.mark.parametrize("mode", _ALL_MODES, ids=lambda m: m.name)
+def test_layout_idempotent(widget, mode):
+    """Applying a mode twice is a no-op vs once (no reliance on prior state)."""
+    df = widget.displayframe
+    df._apply_layout(mode)
+    once = _geom(df)
+    df._apply_layout(mode)
+    twice = _geom(df)
+    assert once == twice == _expected(mode)
+
+
+# Origin→destination cells that matter (the leak class): the destination
+# geometry must be correct no matter where we came from.
+_TRANSITIONS = [
+    (Mode.INT_1D, Mode.IMAGE_VIEWER),   # the original blank: twoDWindow restored
+    (Mode.INT_1D, Mode.NEXUS_VIEWER),   # 2D pane also needed by nexus
+    (Mode.XYE_VIEWER, Mode.IMAGE_VIEWER),
+    (Mode.IMAGE_VIEWER, Mode.INT_2D),
+    (Mode.INT_2D, Mode.IMAGE_VIEWER),
+    (Mode.IMAGE_VIEWER, Mode.INT_1D),   # viewer → normal (1D-only)
+    (Mode.NEXUS_VIEWER, Mode.INT_2D),   # viewer → normal (full 2D)
+]
+
+
+@pytest.mark.parametrize(
+    "origin,dest", _TRANSITIONS,
+    ids=[f"{o.name}->{d.name}" for o, d in _TRANSITIONS])
+def test_layout_transition_destination_geometry(widget, origin, dest):
+    """The destination geometry is independent of the origin mode."""
+    _enter(widget, origin)
+    df = _enter(widget, dest)
+    assert _geom(df) == _expected(dest)
+    # The exact leak that caused the blank: a 2D-pane mode reached from a
+    # 1D-only origin must have a non-zero twoDWindow height.
+    if dest in (Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER, Mode.INT_2D):
+        assert df.ui.twoDWindow.maximumHeight() > 0
+
+
+def test_layout_render_path_int_1d_only_is_self_sufficient(widget):
+    """The per-frame render path (``_apply_1d_only_visibility`` alone, without
+    going through ``set_viewer_display_mode``) must itself produce the FULL
+    INT_1D geometry.
+
+    This is the path that runs on every frame update, and the original blank
+    proved it was *not* self-sufficient (it left plotWindow implicit and never
+    reasserted a previously-collapsed twoDWindow).  Lock it: from a viewer
+    origin, switching the processing mode and running only the render-path
+    visibility hook lands the complete table."""
+    df = widget.displayframe
+    df.set_viewer_display_mode("image")        # a 2D-pane viewer origin
+    df.viewer_mode = None
+    df.scan.skip_2d = True
+    df._apply_1d_only_visibility()             # render-path entry only
+    assert _geom(df) == _expected(Mode.INT_1D)
