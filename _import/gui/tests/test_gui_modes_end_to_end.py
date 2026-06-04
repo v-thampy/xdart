@@ -45,6 +45,23 @@ def widget(qapp):
     try:
         yield w
     finally:
+        # Stop the long-running background threads the widget started before the
+        # module-scoped QApplication GCs it.  Otherwise the still-running
+        # fileHandlerThread (started in H5Viewer._init_file_thread) triggers
+        # "QThread: Destroyed while thread is still running" -> abort at
+        # interpreter shutdown.
+        try:
+            h5v = w.h5viewer
+            h5v.cancel_pending_loads()            # quit+wait the load worker
+            ft = getattr(h5v, "file_thread", None)
+            if ft is not None:
+                ft.queue.put(None)                # sentinel: clean run() exit
+                ft.wait(2000)
+            pool = getattr(h5v, "_h5pool", None)
+            if pool is not None:
+                pool.close_all()
+        except Exception:
+            pass
         try:
             w.close()
         except Exception:
