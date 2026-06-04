@@ -138,3 +138,6 @@ venv.bak/
 .idea/gradle.xml
 .DS_Store
 .claude/
+
+# Test artifact: LiveScan("scan") writes scan.nxs to CWD during tests
+/scan.nxs
