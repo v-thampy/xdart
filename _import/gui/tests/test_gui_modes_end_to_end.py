@@ -209,6 +209,50 @@ def test_image_viewer_restores_twodwindow_height_after_1d_only(widget):
     assert df.ui.twoDWindow.maximumHeight() > 0           # restored, not 0
 
 
+def test_image_viewer_uses_percentile_not_wrangler_threshold(widget):
+    """Regression: the Image Viewer color scale must be the nanpercentile
+    autoscale (same as the Int 2D raw/cake panels), NOT the wrangler Intensity
+    Threshold (Min/Max).  The threshold is an integration mask parameter; using
+    it as vmin/vmax washed the image out (a 0-1000 threshold flattening detector
+    counts that actually span ~0-60)."""
+    from types import SimpleNamespace
+    w = widget
+    w._on_viewer_mode_changed("image")
+    df = w.displayframe
+    # A wrangler with an active intensity threshold, exactly as in the report.
+    df._wrangler = SimpleNamespace(
+        apply_threshold=True, threshold_min=0.0, threshold_max=1000.0)
+    raw = np.arange(36, dtype=float).reshape(6, 6)     # data spans 0..35
+    _set_image_frame(w, 0, raw)
+    w.h5viewer._viewer_is_xdart = False
+    w.set_data()
+    df._update_image_viewer()
+    lo, hi = df.image_widget.imageItem.levels
+    # Percentile of 0..35 (~0.4..34.6), NOT the 1000 threshold ceiling.
+    assert hi < 100.0
+
+
+def test_image_widget_colorbar_limits_nan_aware(qapp):
+    """Regression: a NaN-masked frame must still display with percentile levels.
+
+    pgImageWidget.update_image set the colorbar lo/hi limits with np.min/np.max,
+    which return NaN on NaN-masked data (Image Viewer xdart frames).  NaN limits
+    clamp the nanpercentile(1,99) levels to [NaN,NaN], so the image fell back to
+    pyqtgraph autoscale (data min/max) — the "Image Viewer scaled to min/max"
+    symptom.  Limits must be nan-aware (finite)."""
+    from xdart.gui.widgets import pgImageWidget
+    w = pgImageWidget(lockAspect=True, raw=True)
+    try:
+        img = np.arange(100, dtype=float).reshape(10, 10)
+        img[0, 0] = np.nan                       # masked pixel
+        w.setImage(img, scale="Linear", cmap="viridis")
+        assert np.isfinite(w.histogram.lo_lim)
+        assert np.isfinite(w.histogram.hi_lim)
+    finally:
+        w.deleteLater()
+        qapp.processEvents()
+
+
 # ── Real-data cells: exercise the full _load_image_file (classify + load) ──
 
 _TIFF = _DATA / "Tiff" / "Combi4_Angledependence_samz_4p9_03271002_0001.tif"

@@ -1876,7 +1876,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         data = data.T[:, ::-1]
         rect = get_rect(np.arange(data.shape[0]), np.arange(data.shape[1]))
         self.image_data = (data, rect)
-        self._image_levels_override = displayFrameWidget._viewer_display_levels(self)
+        # Display levels = the nanpercentile autoscale from pgImageWidget.update_image
+        # (identical to the Int 2D raw/cake panels).  Do NOT use the wrangler
+        # Intensity Threshold (Min/Max) as the display range: it is an *integration*
+        # mask parameter, not a color scale, and coupling it to vmin/vmax washed the
+        # image out (a 0-1000 threshold flattening counts that actually span ~0-60).
+        self._image_levels_override = None
         self._set_viewer_title(self.idxs_2d)
         self.update_image_view()
 

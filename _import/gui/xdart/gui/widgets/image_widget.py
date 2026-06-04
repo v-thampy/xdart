@@ -188,7 +188,16 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             self.histogram.axis.setLogMode(False)
 
         self.histogram.setColorMap(cm)
-        low, high = np.min(self.displayed_image), np.max(self.displayed_image)
+        # Use nan-aware min/max: detector/processed frames carry NaN-masked
+        # pixels, and np.min/np.max return NaN there.  NaN colorbar limits make
+        # setLevels() clamp the nanpercentile levels to [NaN, NaN], so the image
+        # falls back to pyqtgraph autoscale (data min/max) instead of the
+        # percentile range — the Image Viewer "scaled to min/max" symptom.
+        if np.isfinite(self.displayed_image).any():
+            low, high = (np.nanmin(self.displayed_image),
+                         np.nanmax(self.displayed_image))
+        else:
+            low, high = 0.0, 1.0
         self.histogram.lo_lim, self.histogram.hi_lim = low, high
         self.histogram.setLevels(values=levels)
 
