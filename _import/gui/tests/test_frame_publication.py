@@ -259,7 +259,9 @@ def test_publication_display_adapter_builds_raw_and_cake_image_payloads():
     loaded_1d, loaded_2d, raw_avail = publication_availability(store)
 
     class _Widget:
-        scan = type("Scan", (), {"name": "scan", "gi": False, "global_mask": np.array([5])})()
+        global_mask = np.zeros((4, 4), dtype=bool)
+        global_mask[1, 1] = True
+        scan = type("Scan", (), {"name": "scan", "gi": False, "global_mask": global_mask})()
         bkg_map_raw = 0.0
         bkg_2d = 0.5
 
@@ -435,3 +437,84 @@ def test_cake_image_blends_matching_axis_publications():
     assert cake is not None
     # Averaged: ((1.0 + 3.0) / 2) / 10 = 0.2.
     np.testing.assert_allclose(cake.image, np.full((3, 4), 0.2))
+
+
+def test_publication_cake_background_transposes_legacy_pyfai_background():
+    frame = DuckFrame(idx=1)
+    legacy = np.arange(12, dtype=float).reshape(4, 3)
+    frame.scan_info = {"monitor": 1.0}
+    frame.int_2d = IntegrationResult2D(
+        radial=np.linspace(0.5, 3.0, 4),
+        azimuthal=np.linspace(-90.0, 90.0, 3),
+        intensity=legacy,
+        unit="q_A^-1",
+        azimuthal_unit="chi_deg",
+    )
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+    loaded_1d, loaded_2d, raw_avail = publication_availability(store)
+    state = compute_display_state(
+        mode=Mode.INT_2D,
+        selected_ids=(1,),
+        all_frame_index=[1],
+        loaded_1d_keys=loaded_1d,
+        loaded_2d_keys=loaded_2d,
+        gi=False,
+        plot_unit="q_A^-1",
+        method="Single",
+        unit_changed=False,
+        prev_overlaid_ids=(),
+        raw_availability=raw_avail,
+        titles={},
+        generation=store.generation,
+    )
+    widget = _cake_widget(monitor_norm=False)
+    widget.bkg_2d = legacy
+
+    cake = PublicationDisplayAdapter(store, widget=widget).cake_image(state)
+
+    assert cake is not None
+    np.testing.assert_allclose(cake.image, np.zeros((3, 4)))
+
+
+def test_image_viewer_publication_payload_ignores_processing_masks():
+    frame = DuckFrame(idx=1)
+    frame.scan_info = {"monitor": 1.0}
+    frame.map_raw = np.array([[1.0, 65535.0], [3.0, 4.0]])
+    frame.mask = np.array([0, 1, 2, 3])
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+    _, _, raw_avail = publication_availability(store)
+    state = compute_display_state(
+        mode=Mode.IMAGE_VIEWER,
+        selected_ids=(1,),
+        all_frame_index=[],
+        loaded_1d_keys=set(),
+        loaded_2d_keys={1},
+        gi=False,
+        plot_unit="q_A^-1",
+        method="Single",
+        unit_changed=False,
+        prev_overlaid_ids=(),
+        raw_availability=raw_avail,
+        titles={},
+        generation=store.generation,
+    )
+
+    class _Widget:
+        _viewer_is_xdart = False
+        bkg_map_raw = 0.0
+        scan = type("Scan", (), {
+            "name": "scan",
+            "gi": False,
+            "global_mask": np.ones((2, 2), dtype=bool),
+        })()
+
+        def normalize(self, data, metadata):
+            return np.asarray(data, dtype=float)
+
+    raw = PublicationDisplayAdapter(store, widget=_Widget()).raw_image(state)
+
+    assert raw is not None
+    assert np.isfinite(raw.image).all()
+    assert 65535.0 in raw.image

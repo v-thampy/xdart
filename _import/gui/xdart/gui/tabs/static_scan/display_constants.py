@@ -83,13 +83,23 @@ STD_2D_AXES = {
 
 
 def _finite_preview_image(data):
-    """Return a finite display copy, preserving real data elsewhere."""
+    """Return a display copy with ``inf`` collapsed but ``NaN`` preserved.
+
+    Only ``±inf`` is replaced — it poisons the widget's ``np.nanpercentile``
+    autoscale (→ blown-out levels → white streaks on e.g. Eiger sentinels).
+    ``NaN`` is left intact on purpose: the image widget already autoscales with
+    ``nanpercentile`` and renders NaN transparent, which is how masked pixels
+    show as masked.  Filling NaN here (the previous behaviour) made the
+    detector / global mask invisible on the raw image.
+    """
     arr = np.asarray(data, dtype=float)
-    finite = np.isfinite(arr)
-    if finite.all() or not finite.any():
+    inf_mask = np.isinf(arr)
+    if not inf_mask.any():
         return arr
+    finite = np.isfinite(arr)
+    fill = float(np.min(arr[finite])) if finite.any() else 0.0
     out = arr.copy()
-    out[~finite] = float(np.min(out[finite]))
+    out[inf_mask] = fill
     return out
 
 

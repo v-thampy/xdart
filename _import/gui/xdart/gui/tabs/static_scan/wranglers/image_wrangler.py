@@ -186,6 +186,14 @@ class imageWrangler(wranglerWidget):
         # Setup gui elements
         self.ui = Ui_Form()
         self.ui.setupUi(self)
+        # Deferred for this release: the NeXus Viewer mode is not yet usable on
+        # stacked datasets (integrated_1d/2d store the whole (N, ...) stack
+        # under one key, so it needs a per-frame slider).  Hide the option to
+        # avoid the half-baked viewer; the controller/mode code stays dormant
+        # and the option returns once the slider lands.
+        _nx_idx = self.ui.processingModeCombo.findText('NeXus Viewer')
+        if _nx_idx >= 0:
+            self.ui.processingModeCombo.removeItem(_nx_idx)
         self.ui.startButton.clicked.connect(self._on_start_clicked)
         # self.ui.startButton.clicked.connect(self.sigStart.emit)
         self.ui.stopButton.clicked.connect(self.stop)
@@ -528,6 +536,7 @@ class imageWrangler(wranglerWidget):
         """Update all flags from the processing mode dropdown and checkboxes."""
         mode_text = self.ui.processingModeCombo.currentText()
         is_viewer = mode_text in ('Image Viewer', 'XYE Viewer', 'NeXus Viewer')
+        is_file_viewer = mode_text in ('Image Viewer', 'XYE Viewer')
         is_xye = mode_text == 'Int 1D (XYE)'
 
         # Pre-process state overrides
@@ -609,6 +618,14 @@ class imageWrangler(wranglerWidget):
 
         # Gray out integration controls in viewer mode
         self._set_integration_controls_enabled(not is_viewer)
+        # Image/XYE viewers are file-inspection modes.  Disable the processing
+        # parameter tree itself so masks/background/calibration state cannot be
+        # edited or accidentally interpreted as viewer state.  The mode combo
+        # lives outside this tree, so the user can still switch back.
+        try:
+            self.tree.setEnabled(not is_file_viewer)
+        except AttributeError:
+            pass
         # Hide start/stop in viewer mode
         self.ui.frame.setVisible(not is_viewer)
         # Notify parent only when viewer mode actually changed (avoids

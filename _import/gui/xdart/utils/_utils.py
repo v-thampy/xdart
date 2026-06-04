@@ -53,15 +53,48 @@ from ssrl_xrd_tools.core.hdf5 import (  # noqa: E402
 
 def get_fname_dir():
     """
-    Returns directory on local drive to save temporary h5 files in.
+    Return the default processed-output directory path (``~/xdart_processed_data``).
+
+    This only *computes* the path — it does NOT create the directory.  Creating
+    it here meant the folder reappeared on every startup (get_fname_dir is
+    called during widget init) even when the user never saved there or had
+    deleted it.  The directory is created lazily by the write paths
+    (wrangler / display export), which ``mkdir(parents=True, exist_ok=True)``
+    immediately before writing, and the Scans browser tolerates a missing dir.
 
     Returns:
-        path: {str} Path where h5 file is saved
+        path: {str} default processed-output directory (may not exist yet)
     """
     home_path = str(Path.home())
-    path = os.path.join(home_path, 'xdart_processed_data')
-    Path(path).mkdir(parents=True, exist_ok=True)
-    return path
+    return os.path.join(home_path, 'xdart_processed_data')
+
+
+def get_config_dir():
+    """Platform-agnostic, persistent per-user config directory for xdart.
+
+    Used for app config such as ``last_defaults.json`` (restore-last-config).
+    This is a *persistent* location (not a temp dir, which would be wiped) so
+    the last configuration survives restarts.  The directory is created.
+
+    - macOS:   ~/Library/Application Support/xdart
+    - Windows: %APPDATA%/xdart
+    - Linux:   $XDG_CONFIG_HOME/xdart  (default ~/.config/xdart)
+    """
+    import sys
+    home = Path.home()
+    if sys.platform == 'darwin':
+        base = home / 'Library' / 'Application Support'
+    elif os.name == 'nt':
+        base = Path(os.environ.get('APPDATA', str(home)))
+    else:
+        base = Path(os.environ.get('XDG_CONFIG_HOME', str(home / '.config')))
+    path = base / 'xdart'
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Fall back to the home dir if the config base isn't writable.
+        path = home
+    return str(path)
 
 
 def split_file_name(fname):

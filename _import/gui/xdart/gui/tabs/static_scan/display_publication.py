@@ -90,6 +90,27 @@ def _two_d_axes_match(ref_view, view, *, rtol=1e-5, atol=1e-8) -> bool:
     return True
 
 
+def _standalone_viewer_image(data):
+    """Display-only cleanup for standalone Image Viewer files.
+
+    Standalone detector-file viewing is inspection, not processing: keep normal
+    high values and do not turn uint16 ceilings into NaN masks. Only true
+    non-finite values and the Eiger uint32 sentinel are filled with the low
+    finite value so autoscale remains usable without painting white mask holes.
+    """
+    arr = np.asarray(data, dtype=float)
+    bad = ~np.isfinite(arr) | (arr >= 4294967295.0)
+    if not bad.any():
+        return arr
+    valid = np.isfinite(arr) & ~bad
+    out = arr.astype(float, copy=True)
+    if not valid.any():
+        out[...] = np.nan
+        return out
+    out[bad] = float(np.nanmin(arr[valid]))
+    return out
+
+
 def _trace_name(publication, widget=None) -> str:
     scan = getattr(widget, "scan", None)
     scan_name = getattr(scan, "name", "")
@@ -191,11 +212,16 @@ class PublicationDisplayAdapter:
             data, source = self._raw_array(publication, panel.source)
             if data is None:
                 continue
-            data = sentinel_mask(data)
+            image_viewer = state.mode is Mode.IMAGE_VIEWER
+            viewer_is_xdart = bool(getattr(self._widget, "_viewer_is_xdart", False))
+            if image_viewer and not viewer_is_xdart:
+                data = _standalone_viewer_image(data)
+            else:
+                data = sentinel_mask(data)
             if data.ndim != 2:
                 continue
             bg = getattr(publication.raw_ref, "bg_raw", 0)
-            if source is RawSource.RAW:
+            if source is RawSource.RAW and not image_viewer:
                 data = self._apply_detector_mask(data, publication)
                 data = self._subtract_if_shape_matches(data, bg, "raw frame background")
             data = self._normalize(data, publication.metadata_raw)
@@ -276,9 +302,11 @@ class PublicationDisplayAdapter:
             return None
 
         image = accum / count
+        background = getattr(self._widget, "bkg_2d", 0)
+        background = self._cake_background_for_image(background, image)
         image = self._subtract_if_shape_matches(
             image,
-            getattr(self._widget, "bkg_2d", 0),
+            background,
             "2D-image background",
         )
         if image.size == 0 or not np.isfinite(image).any():
@@ -386,13 +414,29 @@ class PublicationDisplayAdapter:
             masks.append(global_mask)
         if not masks:
             return data
-        try:
-            flat = np.unique(np.concatenate([np.asarray(m, dtype=int).ravel() for m in masks]))
-        except (TypeError, ValueError):
-            return data
-        flat = flat[(flat >= 0) & (flat < data.size)]
-        if flat.size:
-            data[np.unravel_index(flat, data.shape)] = np.nan
+        flat_masks = []
+        for mask in masks:
+            try:
+                arr = np.asarray(mask)
+            except (TypeError, ValueError):
+                continue
+            if arr.dtype == bool:
+                # A boolean mask applies only when it matches the image shape;
+                # a bool array of any other shape is NOT a flat-index mask — skip
+                # it rather than coercing True/False into indices 1/0 (which
+                # would silently NaN pixels 0 and 1).
+                if arr.shape == data.shape:
+                    data[arr] = np.nan
+                continue
+            try:
+                flat_masks.append(np.asarray(arr, dtype=int).ravel())
+            except (TypeError, ValueError):
+                continue
+        if flat_masks:
+            flat = np.unique(np.concatenate(flat_masks))
+            flat = flat[(flat >= 0) & (flat < data.size)]
+            if flat.size:
+                data[np.unravel_index(flat, data.shape)] = np.nan
         return data
 
     @staticmethod
@@ -402,6 +446,24 @@ class PublicationDisplayAdapter:
         if bg.shape == () or bg.shape == data.shape:
             return data - background
         return data
+
+    @staticmethod
+    def _cake_background_for_image(background, image):
+        """Convert legacy pyFAI background orientation into FrameView space.
+
+        ``displayFrameWidget.setBkg`` still captures the 2D background through
+        ``get_frames_int_2d`` in pyFAI result orientation ``(radial,
+        azimuthal)``. Publication cakes are displayed through FrameView in
+        ``(axis_y, axis_x)`` orientation. Transpose array backgrounds before
+        subtracting so a selected frame subtracts to zero instead of subtracting
+        its vertically/axis-swapped copy.
+        """
+        bg = np.asarray(background)
+        if bg.shape == ():
+            return background
+        if bg.T.shape == np.asarray(image).shape:
+            return bg.T
+        return background
 
     @staticmethod
     def _has_thumbnail(publication) -> bool:

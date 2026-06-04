@@ -12,6 +12,7 @@ QWidget, so all ``self`` references resolve to the composite widget.
 
 import logging
 import os
+import re
 import time
 
 import numpy as np
@@ -20,6 +21,40 @@ from pathlib import Path
 from .display_logic import RawSource, choose_raw_source, sentinel_mask
 
 logger = logging.getLogger(__name__)
+
+
+def _norm_alias_key(name):
+    text = str(name or '').strip()
+    lower = text.lower()
+    if lower in {'sec', 'second', 'seconds'}:
+        return 'sec'
+    if lower in {'monitor', 'mon'}:
+        return 'Monitor'
+    match = re.fullmatch(r'i(\d+)', lower)
+    if match:
+        return f'i{int(match.group(1))}'
+    return None
+
+
+def _norm_display_label(alias):
+    return 'Monitor' if alias == 'Monitor' else alias
+
+
+def available_norm_channels(scan_data_keys):
+    """Return normalization channels present in scan metadata.
+
+    The display label is canonical/case-insensitive; the actual key preserves
+    the column name that exists in the scan table or per-frame metadata.
+    """
+    seen = set()
+    channels = []
+    for key in scan_data_keys or ():
+        alias = _norm_alias_key(key)
+        if alias is None or alias in seen:
+            continue
+        seen.add(alias)
+        channels.append((_norm_display_label(alias), key))
+    return channels
 
 
 class DisplayDataMixin:
@@ -566,17 +601,78 @@ class DisplayDataMixin:
 
     def get_normChannel(self, scan_data_keys=None):
         """Check to see if normalization channel exists in metadata and return name"""
-        normChannel = self.ui.normChannel.currentText()
-        if normChannel == 'sec':
-            normChannel = {'sec', 'seconds', 'Seconds', 'Sec', 'SECONDS', 'SEC'}
-        elif normChannel == 'Monitor':
-            normChannel = {'Monitor', 'monitor', 'mon', 'Mon', 'MON', 'MONITOR'}
-        else:
-            normChannel = {normChannel, normChannel.lower(), normChannel.upper()}
         if scan_data_keys is None:
             scan_data_keys = self.scan.scan_data.columns
-        normChannel = normChannel.intersection(scan_data_keys)
-        return normChannel.pop() if len(normChannel) > 0 else None
+        keys = list(scan_data_keys)
+        if not keys:
+            return None
+
+        key_by_lower = {str(key).lower(): key for key in keys}
+        try:
+            selected_actual = self.ui.normChannel.currentData()
+        except Exception:
+            selected_actual = None
+        if selected_actual is not None:
+            match = key_by_lower.get(str(selected_actual).lower())
+            if match is not None:
+                return match
+
+        selected = self.ui.normChannel.currentText()
+        alias = _norm_alias_key(selected)
+        if alias is None:
+            return None
+        for display, actual in available_norm_channels(keys):
+            if _norm_alias_key(display) == alias or _norm_alias_key(actual) == alias:
+                return actual
+        return None
+
+    def refresh_norm_channels(self):
+        """Populate the normalization combo from current scan metadata."""
+        combo = getattr(getattr(self, 'ui', None), 'normChannel', None)
+        if combo is None:
+            return
+        try:
+            keys = list(self.scan.scan_data.columns)
+        except Exception:
+            keys = []
+        channels = available_norm_channels(keys)
+        current = self.get_normChannel(scan_data_keys=keys)
+        signature = tuple(channels)
+        if signature == getattr(self, '_norm_channel_signature', None):
+            return
+
+        try:
+            was_blocked = combo.blockSignals(True)
+        except Exception:
+            was_blocked = None
+        try:
+            combo.clear()
+            def _add_item(label, data):
+                try:
+                    combo.addItem(label, data)
+                except TypeError:
+                    combo.addItem(label)
+                    try:
+                        combo.setItemData(combo.count() - 1, data)
+                    except Exception:
+                        pass
+
+            _add_item('Norm Channel', None)
+            selected_index = 0
+            self._norm_channel_map = {}
+            for row, (display, actual) in enumerate(channels, start=1):
+                _add_item(display, actual)
+                self._norm_channel_map[display] = actual
+                if current is not None and str(actual).lower() == str(current).lower():
+                    selected_index = row
+            combo.setCurrentIndex(selected_index)
+            self._norm_channel_signature = signature
+        finally:
+            if was_blocked is not None:
+                try:
+                    combo.blockSignals(was_blocked)
+                except Exception:
+                    pass
 
     # ── Colour generation ─────────────────────────────────────────
 

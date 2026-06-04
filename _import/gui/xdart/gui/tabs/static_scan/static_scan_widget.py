@@ -347,6 +347,15 @@ class staticWidget(QWidget):
                 # Skip when in viewer mode — set_viewer_display_mode controls panels
                 if 'Viewer' in mode_text:
                     return
+                # A non-viewer processing mode (Int 1D/2D, Int 1D (XYE)) must take
+                # the display OUT of any viewer mode it is stuck in.  The
+                # wrangler's sigViewerModeChanged is guarded by its own
+                # _prev_viewer_mode, which misses the case where the display was
+                # auto-switched to XYE after an Int 1D (XYE) batch (the wrangler's
+                # viewer_mode stayed None, so _prev stays '' and no reset emits).
+                # Force the display reset here so the combo and display can't desync.
+                if getattr(self.displayframe, 'viewer_mode', None) is not None:
+                    self._on_viewer_mode_changed('')
                 self.displayframe._apply_1d_only_visibility()
                 # Drop any visible/cached content from the previous mode,
                 # then reload the current selection for the new processing
@@ -481,6 +490,9 @@ class staticWidget(QWidget):
             frame = None
         if frame is not None:
             try:
+                global_mask = getattr(published, "mask", None)
+                if global_mask is not None:
+                    self.scan.global_mask = global_mask
                 publication = publication_from_live_frame(
                     frame,
                     generation=self.publication_store.generation,
@@ -618,6 +630,26 @@ class staticWidget(QWidget):
         self.h5viewer.update_data(emit_update=False)
         if self.h5viewer.auto_last:
             self.latest_frame(emit_update=False)
+
+        method = ""
+        try:
+            method = self.displayframe.ui.plotMethod.currentText()
+        except Exception:
+            method = ""
+        if self.h5viewer.auto_last and method in ("Overlay", "Waterfall"):
+            # Overlay/Waterfall must show EVERY processed frame, not just the
+            # frames that landed in this timer window.  Fast (non-GI) scans
+            # produce several frames between ticks; selecting only the tick's
+            # pending set dropped earlier curves (visible only in slow GI runs).
+            # Re-select the FULL processed set each refresh — idempotent and
+            # race-free, no pending-delta bookkeeping.
+            with self.scan.scan_lock:
+                selected = [str(int(i)) for i in self.scan.frames.index]
+            if selected:
+                self.h5viewer.frame_ids[:] = selected
+                self.h5viewer.data_changed(show_all=True)
+                return
+
         self.h5viewer.data_changed()  # → sigUpdate → set_data → metawidget.update()
 
     def disable_auto_last(self, q):
@@ -643,6 +675,14 @@ class staticWidget(QWidget):
         # In viewer mode, always update display (no scan dependency)
         is_viewer = getattr(self.h5viewer, 'viewer_mode', None) is not None
         if is_viewer or self.scan.name != 'null_main':
+            # Propagate the Image-Viewer file classification from the H5Viewer
+            # (which classifies on file select) to the display widget (which
+            # renders).  Without this, displayframe._viewer_is_xdart is always
+            # False, so _update_image_viewer takes the *standalone* branch even
+            # for processed xdart .nxs frames and fills their baked NaN mask
+            # (the inverse of the intended behaviour).
+            self.displayframe._viewer_is_xdart = getattr(
+                self.h5viewer, '_viewer_is_xdart', False)
             self.displayframe.update()
             # # if (len(self.frames.keys()) > 0) and (len(self.scan.frames.index) > 0):
             # if ((len(self.data_1d.keys()) > 0) and
@@ -998,6 +1038,7 @@ class staticWidget(QWidget):
         """
         viewer_mode = viewer_mode_str or None  # '' → None
         is_viewer = viewer_mode is not None
+        is_file_viewer = viewer_mode in ('image', 'xye')
         from PySide6.QtWidgets import QAbstractItemView
 
         scans = self.h5viewer.ui.listScans
@@ -1007,8 +1048,10 @@ class staticWidget(QWidget):
         was_blocked = scans.blockSignals(True)
         self.h5viewer._suspend_scan_selection_loads = True
         try:
-            # Keep integratorTree enabled so mask/threshold controls remain accessible
             self.h5viewer.viewer_mode = viewer_mode
+            tree = getattr(self.wrangler, 'tree', None)
+            if tree is not None:
+                tree.setEnabled(not is_file_viewer)
             # Relax the Frames panel width so NeXus dataset labels aren't
             # clipped; restored on exit / other modes.
             self.h5viewer._apply_frames_panel_width(viewer_mode)
@@ -1025,6 +1068,7 @@ class staticWidget(QWidget):
             else:
                 scans.setSelectionMode(QAbstractItemView.SingleSelection)
             # Configure display panels for the viewer mode
+            self.displayframe._viewer_is_xdart = False
             self.displayframe.set_viewer_display_mode(viewer_mode)
             if is_viewer:
                 save_path = getattr(self.wrangler, 'h5_dir', None)

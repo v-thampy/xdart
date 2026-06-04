@@ -177,7 +177,18 @@ class _LoadFramesWorker(QtCore.QObject):
                 if self._cancel.is_set():
                     self.cancelled.emit(self.generation)
                     return
-                file = pool.get(self.data_file)
+                try:
+                    file = pool.get(self.data_file)
+                except (FileNotFoundError, OSError) as e:
+                    # The scan file doesn't exist / can't be opened (e.g. a
+                    # default placeholder path before any scan is saved, or a
+                    # deleted file).  Bail cleanly rather than letting it reach
+                    # the top-level "crashed unexpectedly" handler.
+                    logger.debug(
+                        "load worker gen=%s: data file unavailable (%s); "
+                        "stopping", self.generation, e,
+                    )
+                    break
                 if file is None:
                     # Writer paused the pool — exit gracefully; the
                     # writer's resume() will trigger a sigUpdate
@@ -419,6 +430,7 @@ class H5Viewer(QWidget):
         self.layout = self.ui.gridLayout
         self.defaultWidget = defaultWidget()
         self.defaultWidget.sigSetUserDefaults.connect(self.set_user_defaults)
+        self._apply_frames_panel_width(None)
 
     def _init_toolbar(self):
         """Create toolbar with File and Config menus."""
@@ -520,7 +532,7 @@ class H5Viewer(QWidget):
         self._plot_method = plot_method
         if plot_method == 'Single' and prev_method != 'Single':
             lw = self.ui.listData
-            current = lw.currentItem()
+            current = lw.currentItem() if hasattr(lw, 'currentItem') else None
             selected = lw.selectedItems()
             if len(selected) > 1:
                 lw.blockSignals(True)
@@ -532,7 +544,10 @@ class H5Viewer(QWidget):
                         lw.setCurrentItem(keep)
                 finally:
                     lw.blockSignals(False)
-                self.data_changed()
+            # Always refresh frame_ids when leaving an accumulating mode.  The
+            # visible plot can otherwise rebuild from the old Overlay selection
+            # until another frame click arrives.
+            self.data_changed()
 
     def _init_file_thread(self):
         """Create and start the background file handler thread."""
@@ -577,14 +592,14 @@ class H5Viewer(QWidget):
         self._update_coalesce_timer.timeout.connect(self.sigUpdate.emit)
         
     def load_starting_defaults(self):
-        default_path = os.path.join(self.local_path, "last_defaults.json")
+        default_path = os.path.join(utils.get_config_dir(), "last_defaults.json")
         if os.path.exists(default_path):
             self.defaultWidget.load_defaults(fname=default_path)
         else:
             self.defaultWidget.save_defaults(fname=default_path)
 
     def set_user_defaults(self):
-        default_path = os.path.join(self.local_path, "last_defaults.json")
+        default_path = os.path.join(utils.get_config_dir(), "last_defaults.json")
         self.defaultWidget.save_defaults(fname=default_path)
 
     def update(self):
@@ -1104,16 +1119,25 @@ class H5Viewer(QWidget):
         was_blocked = self.ui.listData.blockSignals(True)
         try:
             self.ui.listData.clear()
+            initial_row = None
+            for row, (_label, info) in enumerate(rows):
+                if info.get("nexus_preview_kind") in ("plot_1d", "image_2d"):
+                    initial_row = row
+                    break
+            if initial_row is None and rows:
+                initial_row = 0
+
             for row_id, (label, _info) in enumerate(rows, start=1):
                 item = QtWidgets.QListWidgetItem(str(label))
                 item.setData(QtCore.Qt.UserRole, row_id)
                 self.ui.listData.addItem(item)
-            if rows:
-                self.ui.listData.setCurrentRow(0)
-                self.frame_ids.append("1")
+            if initial_row is not None:
+                self.ui.listData.setCurrentRow(initial_row)
+                self.frame_ids.append(str(initial_row + 1))
         finally:
             self.ui.listData.blockSignals(was_blocked)
 
+        self._refresh_nexus_selected_preview(self.frame_ids)
         self.ui.labelCurrent.setText(os.path.basename(fpath))
         self._remember_displayed_frames()
         self.sigUpdate.emit()
@@ -2044,6 +2068,14 @@ class H5Viewer(QWidget):
         """
         if not frame_ids:
             return
+        data_file = getattr(self.scan, 'data_file', None)
+        if not data_file or not os.path.exists(os.fspath(data_file)):
+            logger.debug(
+                "Skipping background frame load; data file is unavailable: %s",
+                data_file,
+            )
+            self.cancel_pending_loads()
+            return
         # Deterministically retire any in-flight worker BEFORE we drop our
         # refs to it: cancel + quit + bounded wait so its event loop runs
         # the worker's deleteLater and exits.  Dropping the ref without this
@@ -2059,7 +2091,7 @@ class H5Viewer(QWidget):
         self._load_generation += 1
         gen = self._load_generation
         worker = _LoadFramesWorker(
-            data_file=self.scan.data_file,
+            data_file=data_file,
             file_lock=self.file_lock,
             gi=self.scan.gi,
             frame_ids=frame_ids,
@@ -2196,7 +2228,10 @@ class H5Viewer(QWidget):
         if viewer_mode == "nexus":
             lw.setMaximumWidth(16777215)   # QWIDGETSIZE_MAX — splitter sizes it
         else:
-            lw.setMaximumWidth(self._frames_panel_max_width)
+            default = int(self._frames_panel_max_width)
+            if 0 < default < 16777215:
+                default = max(default, int(round(default * 1.5)))
+            lw.setMaximumWidth(default)
 
     def cancel_pending_loads(self) -> None:
         """Cancel stale background frame hydration and reject queued chunks."""

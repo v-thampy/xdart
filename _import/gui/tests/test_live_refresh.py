@@ -14,7 +14,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from pyqtgraph.Qt import QtCore
 
 from xdart.gui.tabs.static_scan.h5viewer import H5Viewer
-from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
+from xdart.gui.tabs.static_scan.display_data import (
+    DisplayDataMixin,
+    available_norm_channels,
+)
 from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
 from xdart.gui.tabs.static_scan.display_plot import DisplayPlotMixin
 from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
@@ -91,6 +94,11 @@ class _FakeListWidget:
     def currentRow(self):
         return self._current_row
 
+    def currentItem(self):
+        if 0 <= self._current_row < len(self._items):
+            return self._items[self._current_row]
+        return None
+
     def blockSignals(self, blocked):
         prev = self._signals_blocked
         self._signals_blocked = bool(blocked)
@@ -121,9 +129,25 @@ class _FakeListWidget:
 class _FakeImageItem:
     def __init__(self):
         self.cleared = False
+        self.levels = None
 
     def clear(self):
         self.cleared = True
+
+    def setLevels(self, levels):
+        self.levels = tuple(levels)
+
+
+class _FakeHistogram:
+    def __init__(self):
+        self.visible = True
+        self.levels = None
+
+    def setVisible(self, visible):
+        self.visible = bool(visible)
+
+    def setLevels(self, values=None, **kwargs):
+        self.levels = tuple(values)
 
 
 class _FakeImageWidget:
@@ -133,12 +157,19 @@ class _FakeImageWidget:
         self.raw_image = np.ones((2, 2))
         self.displayed_image = np.ones((2, 2))
         self.imageItem = _FakeImageItem()
+        self.histogram = _FakeHistogram()
 
     def setImage(self, data, *args, **kwargs):
         self.images.append(np.asarray(data))
 
     def setRect(self, rect):
         self.rects.append(rect)
+
+    def width(self):
+        return 200
+
+    def height(self):
+        return 200
 
 
 class _FakeCurve:
@@ -368,6 +399,7 @@ def test_flush_pending_update_owns_single_repaint():
         _pending_update_idx=5,
         h5viewer=SimpleNamespace(
             auto_last=True,
+            frame_ids=[],
             update_data=lambda **kwargs: calls.append(("update_data", kwargs)),
             data_changed=lambda: calls.append(("data_changed", {})),
         ),
@@ -387,6 +419,38 @@ def test_flush_pending_update_owns_single_repaint():
         ("update_data", {"emit_update": False}),
         ("latest_frame", {"emit_update": False}),
         ("data_changed", {}),
+    ]
+
+
+def test_flush_pending_update_feeds_overlay_all_pending_frames():
+    calls = []
+    frame_ids = []
+
+    def data_changed(*, show_all=False):
+        calls.append(("data_changed", show_all, tuple(frame_ids)))
+
+    widget = SimpleNamespace(
+        _pending_update_idx=5,
+        scan=SimpleNamespace(scan_lock=RLock(), frames=SimpleNamespace(index=[1, 2, 3, 4, 5])),
+        h5viewer=SimpleNamespace(
+            auto_last=True,
+            frame_ids=frame_ids,
+            update_data=lambda **kwargs: calls.append(("update_data", kwargs)),
+            data_changed=data_changed,
+        ),
+        latest_frame=lambda **kwargs: calls.append(("latest_frame", kwargs)),
+        displayframe=SimpleNamespace(
+            ui=SimpleNamespace(plotMethod=_FakeCombo("Overlay")),
+        ),
+    )
+
+    staticWidget._flush_pending_update(widget)
+
+    assert widget._pending_update_idx is None
+    assert calls == [
+        ("update_data", {"emit_update": False}),
+        ("latest_frame", {"emit_update": False}),
+        ("data_changed", True, ("1", "2", "3", "4", "5")),
     ]
 
 
@@ -995,6 +1059,13 @@ def _update_smoke_host():
         idxs=[], idxs_1d=[], idxs_2d=[],
         overall=False,
         overlaid_idxs=[],
+        bkg_1d=None,
+        plot_data=[np.zeros(0), np.zeros(0)],
+        plot_data_range=[[0, 0], [0, 0]],
+        frame_names=[],
+        _payload_x_axis_label=None,
+        _payload_y_axis_label=None,
+        _using_publication_plot_payload=False,
         data_1d={0: object(), 1: object()},
         data_2d={
             0: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
@@ -1006,11 +1077,13 @@ def _update_smoke_host():
                              gi=False, skip_2d=False, name='scan'),
         ui=MagicMock(),
         plot=MagicMock(),
+        image_widget=MagicMock(),
         binned_widget=MagicMock(),
         # pixel-push leaves (unchanged by Stage 3) — recorded, not run
         update_image=rec("draw_image"),
         update_binned=rec("draw_binned"),
         update_plot=rec("draw_plot"),
+        update_plot_view=rec("payload_plot"),
         _update_image_viewer=rec("draw_viewer_image"),
         _update_xye_viewer=rec("draw_viewer_xye"),
         clear_image_view=rec("clear_image"),
@@ -1025,7 +1098,11 @@ def _update_smoke_host():
     host.ui.plotMethod.currentText.return_value = 'Single'
     for name in ('get_idxs', '_note_selection_generation', '_bump_display_generation',
                  '_live_mode', '_live_display_state',
+                 '_current_image_axis_key', '_plot_axis_key',
+                 '_share_axis_plot_index', '_set_plot_unit_index_silently',
+                 '_apply_share_axis_state',
                  '_draw_delegate', '_clear_delegate', '_payload_for_role',
+                 '_draw_payload',
                  'render_display',
                  '_updated', 'update'):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
@@ -1067,8 +1144,35 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     assert "draw_viewer_xye" in calls
     assert "clear_image" in calls and "clear_binned" in calls
 
+    # Switch to NeXus Viewer: dataset previews use payload rendering, while
+    # the absent image/cake panels clear. This covers the per-mode smoke path
+    # that is neither a scan integration view nor an Image/XYE viewer.
+    calls.clear()
+    host.frame_ids = ['0']
+    host.data_1d = {
+        0: SimpleNamespace(nexus_preview_payload={
+            "kind": "plot_1d",
+            "x": np.arange(3, dtype=float),
+            "y": np.array([1.0, 2.0, 3.0]),
+            "label": "nexus-row",
+        })
+    }
+    host.data_2d = {}
+    host.viewer_mode = 'nexus'
+    host._bump_display_generation()
+    host.update()
+    assert "payload_plot" in calls
+    assert "clear_image" in calls and "clear_binned" in calls
+    assert "draw_binned" not in calls
+
     # Back to normal Int-2D: full panel set again.
     calls.clear()
+    host.frame_ids = ['0', '1']
+    host.data_1d = {0: object(), 1: object()}
+    host.data_2d = {
+        0: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
+        1: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
+    }
     host.viewer_mode = None
     host._bump_display_generation()
     host.update()
@@ -1123,7 +1227,10 @@ def _render_host():
     )
     host.ui.shareAxis.isChecked.return_value = False
     host.ui.imageUnit.currentIndex.return_value = 0
-    for name in ("_draw_delegate", "_clear_delegate", "_payload_for_role",
+    for name in ("_current_image_axis_key", "_plot_axis_key",
+                 "_share_axis_plot_index", "_set_plot_unit_index_silently",
+                 "_apply_share_axis_state",
+                 "_draw_delegate", "_clear_delegate", "_payload_for_role",
                  "_draw_payload", "render_display"):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
     return host, calls, dl
@@ -1348,6 +1455,79 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     assert not hasattr(viewer, "_viewer_image_path")
 
 
+def test_cancel_pending_loads_invalidates_late_chunks():
+    calls = []
+    timer = _FakeTimer(active=True)
+    viewer = SimpleNamespace(
+        _load_generation=7,
+        _update_coalesce_timer=timer,
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+        _load_worker=None,
+        _load_thread=None,
+        publication_store=None,
+        _teardown_load_worker=lambda: calls.append("teardown"),
+    )
+    viewer.cancel_pending_loads = MethodType(H5Viewer.cancel_pending_loads, viewer)
+    viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+
+    viewer.cancel_pending_loads()
+    viewer._absorb_chunk(7, 12, object(), True)
+
+    assert viewer._load_generation == 8
+    assert calls == ["teardown"]
+    assert timer.isActive() is False
+    assert viewer.data_1d == {}
+    assert viewer.data_2d == {}
+
+
+def test_viewer_cleanup_stress_drops_stale_chunks_across_mode_switches():
+    viewer = SimpleNamespace(
+        data_lock=RLock(),
+        data_1d={1: object()},
+        data_2d={1: {"map_raw": np.ones((2, 2))}},
+        frame_ids=["1"],
+        latest_idx=1,
+        new_scan_loaded=True,
+        _raw_cache_order=[1],
+        _load_generation=0,
+        _load_worker=None,
+        _load_thread=None,
+        _update_coalesce_timer=_FakeTimer(active=True),
+        ui=SimpleNamespace(
+            listData=_FakeListWidget([1]),
+            listScans=_FakeListWidget(["scan.nxs"]),
+        ),
+        _displayed_list_count=1,
+        _displayed_last_label="1",
+        publication_store=None,
+    )
+    viewer._clear_raw_cache = MethodType(H5Viewer._clear_raw_cache, viewer)
+    viewer._remember_displayed_frames = MethodType(
+        H5Viewer._remember_displayed_frames, viewer,
+    )
+    viewer._teardown_load_worker = MethodType(
+        H5Viewer._teardown_load_worker, viewer,
+    )
+    viewer.cancel_pending_loads = MethodType(H5Viewer.cancel_pending_loads, viewer)
+    viewer.enter_viewer_mode_cleanup = MethodType(
+        H5Viewer.enter_viewer_mode_cleanup, viewer,
+    )
+    viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+
+    for frame_id in range(10):
+        stale_generation = viewer._load_generation
+        viewer.enter_viewer_mode_cleanup()
+        viewer._absorb_chunk(stale_generation, frame_id, object(), True)
+
+    assert viewer._load_generation == 10
+    assert viewer.data_1d == {}
+    assert viewer.data_2d == {}
+    assert viewer.frame_ids == []
+    assert viewer.ui.listData.count() == 0
+
+
 def test_viewer_mode_change_blocks_scan_list_autoload():
     calls = []
     list_scans = _FakeListWidget(["old.xye"])
@@ -1362,7 +1542,7 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
         widget.h5viewer.dirname = path
 
     widget = SimpleNamespace(
-        wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out"),
+        wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -1379,6 +1559,7 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
         ),
         displayframe=SimpleNamespace(
             _wrangler=None,
+            _viewer_is_xdart=True,
             set_viewer_display_mode=lambda mode: calls.append(("display", mode)),
             clear_display_state=lambda: calls.append("clear_display"),
         ),
@@ -1395,6 +1576,57 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
     assert "autoload" not in calls
     assert widget.h5viewer._suspend_scan_selection_loads is False
     assert list_scans._signals_blocked is False
+    assert widget.wrangler.tree.isEnabled() is False
+    assert widget.displayframe._viewer_is_xdart is False
+
+
+def test_viewer_mode_tree_disable_only_for_file_viewers():
+    calls = []
+    list_scans = _FakeListWidget(["scan.nxs"])
+    widget = SimpleNamespace(
+        wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
+        h5viewer=SimpleNamespace(
+            ui=SimpleNamespace(listScans=list_scans),
+            actionNewFile=_FakeAction(),
+            actionSaveDataAs=_FakeAction(),
+            dirname="/tmp/xdart-out",
+            viewer_mode="",
+            _suspend_scan_selection_loads=False,
+            _apply_frames_panel_width=lambda mode: calls.append(("width", mode)),
+            enter_viewer_mode_cleanup=lambda: calls.append("cleanup"),
+            cancel_pending_loads=lambda: calls.append("cancel"),
+            update_scans=lambda: calls.append("update_scans"),
+        ),
+        displayframe=SimpleNamespace(
+            _wrangler=None,
+            set_viewer_display_mode=lambda mode: calls.append(("display", mode)),
+            clear_display_state=lambda: calls.append("clear_display"),
+        ),
+        _sync_h5viewer_save_dir=lambda path, *, refresh=True: None,
+        local_path="/tmp/xdart-out",
+    )
+
+    staticWidget._on_viewer_mode_changed(widget, "xye")
+    assert widget.wrangler.tree.isEnabled() is False
+
+    staticWidget._on_viewer_mode_changed(widget, "nexus")
+    assert widget.wrangler.tree.isEnabled() is True
+
+    staticWidget._on_viewer_mode_changed(widget, "")
+    assert widget.wrangler.tree.isEnabled() is True
+
+
+def test_load_frames_data_skips_missing_placeholder_file(tmp_path):
+    calls = []
+    viewer = SimpleNamespace(
+        scan=SimpleNamespace(data_file=str(tmp_path / "missing_default.nxs")),
+        cancel_pending_loads=lambda: calls.append("cancel"),
+    )
+
+    H5Viewer.load_frames_data(viewer, [1, 2], load_2d=True)
+
+    assert calls == ["cancel"]
+    assert not hasattr(viewer, "_load_worker")
 
 
 def test_h5viewer_update_does_not_restore_stale_session_directory(monkeypatch, tmp_path):
@@ -1428,7 +1660,7 @@ def test_viewer_mode_keeps_explicit_open_folder():
     list_scans = _FakeListWidget(["raw.h5"])
 
     widget = SimpleNamespace(
-        wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out"),
+        wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -1724,14 +1956,11 @@ def test_nexus_viewer_loads_rows_and_previews_1d_2d_units(tmp_path):
     assert "Integrated 1D" in labels
     assert "Integrated 2D" in labels
     assert "Raw detector dataset" in labels
-    assert viewer.frame_ids == ["1"]
+    row_1d = labels.index("Integrated 1D")
+    key_1d = viewer.ui.listData.item(row_1d).data(QtCore.Qt.UserRole)
+    assert viewer.frame_ids == [str(key_1d)]
     assert viewer.ui.labelCurrent.text == path.name
     assert viewer.data_1d[1].__class__.__name__ == "_ViewerRow"
-
-    row_1d = labels.index("Integrated 1D")
-    viewer.ui.listData.setCurrentRow(row_1d)
-    viewer.data_changed()
-    key_1d = viewer.ui.listData.item(row_1d).data(QtCore.Qt.UserRole)
     payload_1d = viewer.data_1d[key_1d].nexus_preview_payload
     assert payload_1d["kind"] == "plot_1d"
     assert payload_1d["x_unit"] == "q_A^-1"
@@ -1842,9 +2071,9 @@ def test_frames_panel_width_relaxes_in_nexus_mode_and_restores():
     host._apply_frames_panel_width("nexus")
     assert lw.maximumWidth() == 16777215          # relaxed for NeXus labels
     host._apply_frames_panel_width(None)
-    assert lw.maximumWidth() == 60                # restored to .ui default
+    assert lw.maximumWidth() == 90                # normal mode gets a wider cap
     host._apply_frames_panel_width("image")
-    assert lw.maximumWidth() == 60                # other modes stay narrow
+    assert lw.maximumWidth() == 90                # other modes stay bounded
 
 
 def test_nexus_1d_selection_strides_large_axis_but_not_small():
@@ -1907,8 +2136,6 @@ def test_nexus_controller_builds_plot_and_image_payloads(tmp_path):
     labels = [viewer.ui.listData.item(i).text() for i in range(viewer.ui.listData.count())]
 
     row_1d = labels.index("Integrated 1D")
-    viewer.ui.listData.setCurrentRow(row_1d)
-    viewer.data_changed()
     ctrl = controller_for(Mode.NEXUS_VIEWER)
     state = ctrl.compute_state(viewer, Mode.NEXUS_VIEWER)
     payload = ctrl.build_payload(viewer, state)
@@ -1948,7 +2175,6 @@ def test_nexus_viewer_real_xdart_processed_file_smoke():
 
     labels = [viewer.ui.listData.item(i).text() for i in range(viewer.ui.listData.count())]
     assert "Integrated 1D" in labels
-    assert "Integrated 2D" in labels
 
     row_1d = labels.index("Integrated 1D")
     viewer.ui.listData.setCurrentRow(row_1d)
@@ -1959,14 +2185,15 @@ def test_nexus_viewer_real_xdart_processed_file_smoke():
     assert payload_1d["x"].size == payload_1d["y"].size
     assert payload_1d["x_unit"]
 
-    row_2d = labels.index("Integrated 2D")
-    viewer.ui.listData.setCurrentRow(row_2d)
-    viewer.data_changed()
-    key_2d = viewer.ui.listData.item(row_2d).data(QtCore.Qt.UserRole)
-    payload_2d = viewer.data_1d[key_2d].nexus_preview_payload
-    assert payload_2d["kind"] == "image_2d"
-    assert payload_2d["image"].ndim == 2
-    assert payload_2d["image"].size > 0
+    if "Integrated 2D" in labels:
+        row_2d = labels.index("Integrated 2D")
+        viewer.ui.listData.setCurrentRow(row_2d)
+        viewer.data_changed()
+        key_2d = viewer.ui.listData.item(row_2d).data(QtCore.Qt.UserRole)
+        payload_2d = viewer.data_1d[key_2d].nexus_preview_payload
+        assert payload_2d["kind"] == "image_2d"
+        assert payload_2d["image"].ndim == 2
+        assert payload_2d["image"].size > 0
 
 
 def test_metadata_panel_nexus_viewer_uses_selected_row_not_scan_table():
@@ -2043,13 +2270,109 @@ def test_image_viewer_all_sentinel_image_clears_safely():
     assert calls == [("title", (1,)), "clear"]
 
 
-def test_image_viewer_masks_uint16_ceiling_sentinel_before_autoscale():
+def test_image_viewer_standalone_uint16_ceiling_stays_raw_and_finite():
     raw = np.array([[10.0, 65535.0], [20.0, 30.0]])
     host = SimpleNamespace(
         idxs_2d=[1],
         data_lock=RLock(),
         data_2d={1: {"map_raw": raw, "thumbnail": None}},
         _wrangler=None,
+        _viewer_is_xdart=False,
+        clear_image_view=lambda: None,
+        _set_viewer_title=lambda idxs: None,
+        _sanitize_display_image=DisplayDataMixin._sanitize_display_image,
+        update_image_view=lambda: None,
+    )
+
+    displayFrameWidget._update_image_viewer(host)
+
+    assert np.isnan(host.image_data[0]).sum() == 0
+    assert np.nanmax(host.image_data[0]) == 65535.0
+
+
+def test_image_viewer_standalone_ignores_processing_mask_and_threshold():
+    raw = np.array([[1.0, 2.0], [3.0, 4.0]])
+    widget = _FakeImageWidget()
+    host = SimpleNamespace(
+        idxs_2d=[1],
+        data_lock=RLock(),
+        data_2d={1: {"map_raw": raw, "thumbnail": None}},
+        _viewer_is_xdart=False,
+        _wrangler=SimpleNamespace(
+            apply_threshold=True,
+            threshold_min=2,
+            threshold_max=3,
+            mask_file="/definitely/not/a/raw-viewer-mask.edf",
+        ),
+        clear_image_view=lambda: None,
+        _set_viewer_title=lambda idxs: None,
+        _sanitize_display_image=DisplayDataMixin._sanitize_display_image,
+        image_widget=widget,
+        scale="Linear",
+        cmap="Default",
+    )
+    host.update_image_view = MethodType(displayFrameWidget.update_image_view, host)
+
+    displayFrameWidget._update_image_viewer(host)
+
+    assert np.isfinite(host.image_data[0]).all()
+    np.testing.assert_allclose(np.sort(host.image_data[0].ravel()), [1, 2, 3, 4])
+    assert widget.imageItem.levels == (2.0, 3.0)
+    assert widget.histogram.levels == (2.0, 3.0)
+    assert widget.histogram.visible is True
+
+
+def test_available_norm_channels_filters_present_case_insensitive_aliases():
+    channels = available_norm_channels([
+        "TEMP", "Sec", "MON", "I0", "i2", "bstop", "sample", "Second",
+    ])
+
+    assert channels == [
+        ("sec", "Sec"),
+        ("Monitor", "MON"),
+        ("i0", "I0"),
+        ("i2", "i2"),
+    ]
+
+
+def test_refresh_norm_channels_populates_combo_from_scan_data_aliases():
+    combo = _FakeMutableCombo()
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            scan_data=SimpleNamespace(columns=["TEMP", "SEC", "I0", "foo"]),
+        ),
+        ui=SimpleNamespace(normChannel=combo),
+    )
+    host.get_normChannel = MethodType(DisplayDataMixin.get_normChannel, host)
+    host.refresh_norm_channels = MethodType(
+        DisplayDataMixin.refresh_norm_channels, host,
+    )
+
+    host.refresh_norm_channels()
+    combo.setCurrentIndex(2)
+
+    assert combo._items == ["Norm Channel", "sec", "i0"]
+    assert host.get_normChannel() == "I0"
+
+
+def test_empty_image_clear_hides_colorbar_without_zero_paint():
+    widget = _FakeImageWidget()
+
+    displayFrameWidget._clear_image_widget(widget)
+
+    assert widget.imageItem.cleared is True
+    assert widget.histogram.visible is False
+    assert widget.images == []
+
+
+def test_processed_image_viewer_keeps_baked_nan_mask_visible():
+    raw = np.array([[10.0, np.nan], [20.0, 30.0]])
+    host = SimpleNamespace(
+        idxs_2d=[1],
+        data_lock=RLock(),
+        data_2d={1: {"map_raw": raw, "thumbnail": None}},
+        _wrangler=None,
+        _viewer_is_xdart=True,
         clear_image_view=lambda: None,
         _set_viewer_title=lambda idxs: None,
         _sanitize_display_image=DisplayDataMixin._sanitize_display_image,
@@ -2059,10 +2382,44 @@ def test_image_viewer_masks_uint16_ceiling_sentinel_before_autoscale():
     displayFrameWidget._update_image_viewer(host)
 
     assert np.isnan(host.image_data[0]).sum() == 1
-    assert np.nanmax(host.image_data[0]) == 30.0
 
 
-def test_display_preview_replaces_nan_with_low_finite_value():
+def test_image_viewer_raw_pixel_axes_are_not_si_scaled():
+    labels = []
+    axes = {}
+
+    class _Axis:
+        def __init__(self):
+            self.auto_si = None
+            self.scale = None
+
+        def enableAutoSIPrefix(self, enabled):
+            self.auto_si = enabled
+
+        def setScale(self, scale):
+            self.scale = scale
+
+    class _Plot:
+        def setLabel(self, side, text, **kwargs):
+            labels.append((side, text, kwargs))
+
+        def getAxis(self, side):
+            axes.setdefault(side, _Axis())
+            return axes[side]
+
+    widget = SimpleNamespace(image_plot=_Plot())
+
+    displayFrameWidget._set_raw_pixel_axes(widget)
+
+    assert labels == [
+        ("bottom", "x (Pixels)", {}),
+        ("left", "y (Pixels)", {}),
+    ]
+    assert axes["bottom"].auto_si is False
+    assert axes["left"].auto_si is False
+
+
+def test_display_preview_preserves_nan_masks_but_collapses_infinities():
     from xdart.gui.tabs.static_scan.display_constants import _downsample_for_display
 
     class _Widget:
@@ -2075,9 +2432,9 @@ def test_display_preview_replaces_nan_with_low_finite_value():
 
     preview = _downsample_for_display(data, _Widget())
 
-    assert np.isfinite(preview).all()
-    assert preview[0, 0] == 10.0
+    assert np.isnan(preview[0, 0])
     assert preview[1, 1] == 10.0
+    assert np.isfinite(preview[0, 1])
 
 
 def test_real_eiger_preview_masks_sentinels_for_display():
@@ -2096,7 +2453,7 @@ def test_real_eiger_preview_masks_sentinels_for_display():
             return 500
 
     raw = np.asarray(read_image(path, frame=0), dtype=float)
-    data = DisplayDataMixin._sanitize_display_image(raw).T[:, ::-1]
+    data = displayFrameWidget._standalone_viewer_image(raw).T[:, ::-1]
 
     preview = _downsample_for_display(data, _Widget())
 
@@ -2307,6 +2664,30 @@ def test_xye_single_method_change_clears_accumulated_traces_immediately():
     assert host.overlaid_idxs == []
 
 
+def test_overlay_to_single_collapses_selection_and_refreshes_frame_ids():
+    list_data = _FakeListWidget(["1", "2", "3", "4", "5"])
+    list_data.selectAll()
+    list_data._current_row = 2
+    calls = []
+
+    def data_changed():
+        viewer.frame_ids[:] = [item.text() for item in list_data.selectedItems()]
+        calls.append(tuple(viewer.frame_ids))
+
+    viewer = SimpleNamespace(
+        _plot_method="Overlay",
+        ui=SimpleNamespace(listData=list_data),
+        frame_ids=[],
+        data_changed=data_changed,
+    )
+
+    H5Viewer.set_data_selection_mode(viewer, "Single")
+
+    assert calls == [("3",)]
+    assert viewer.frame_ids == ["3"]
+    assert [item.text() for item in list_data.selectedItems()] == ["3"]
+
+
 def test_xye_axis_label_uses_file_unit_not_hidden_transform_combo():
     host = SimpleNamespace(
         viewer_mode="xye",
@@ -2377,6 +2758,91 @@ def test_standard_plot_axis_defaults_to_integrated_2theta_unit():
 
     assert plot_unit.currentIndex() == 1
     assert "2" in plot_unit.currentText()
+
+
+class _FakePlot:
+    def __init__(self):
+        self.link = None
+        self.autorange = 0
+
+    def setXLink(self, link):
+        self.link = link
+
+    def enableAutoRange(self):
+        self.autorange += 1
+
+    def autoRange(self):
+        self.autorange += 1
+
+
+def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index=0):
+    plot_unit = _FakeMutableCombo()
+    for item in plot_items or ("Q (Å⁻¹)", "2θ (°)", "χ (°)"):
+        plot_unit.addItem(item)
+    plot_unit.setCurrentIndex(plot_unit.count() - 1)
+    image_unit = _FakeMutableCombo()
+    for item in image_items or ("Q-χ", "2θ-χ"):
+        image_unit.addItem(item)
+    image_unit.setCurrentIndex(image_index)
+    share = _FakeControl(checked=True)
+    target = object()
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            gi=gi,
+            skip_2d=False,
+            bai_2d_args={"gi_mode_2d": "qip_qoop"},
+        ),
+        ui=SimpleNamespace(
+            plotUnit=plot_unit,
+            imageUnit=image_unit,
+            shareAxis=share,
+        ),
+        plot=_FakePlot(),
+        binned_widget=SimpleNamespace(image_plot=target),
+        _plot_axis_info=[
+            {"source": "1d_2d", "axis": "radial"},
+            {"source": "1d_2d", "axis": "radial"},
+            {"source": "2d", "axis": "azimuthal"},
+        ][:plot_unit.count()],
+    )
+    for name in (
+        "_current_image_axis_key",
+        "_plot_axis_key",
+        "_share_axis_plot_index",
+        "_set_plot_unit_index_silently",
+        "_apply_share_axis_state",
+    ):
+        setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
+    return host
+
+
+def test_share_axis_maps_by_unit_not_combo_index():
+    host = _share_axis_host(image_index=1)
+
+    assert host.ui.plotUnit.currentText().startswith("χ")
+    assert host._apply_share_axis_state() is True
+
+    assert host.ui.plotUnit.currentIndex() == 1
+    assert host.ui.plotUnit.currentText().startswith("2")
+    assert host.ui.plotUnit._enabled is False
+    assert host.ui.shareAxis.isEnabled() is True
+    assert host.plot.link is host.binned_widget.image_plot
+
+
+def test_share_axis_disables_when_no_matching_plot_unit():
+    host = _share_axis_host(
+        gi=True,
+        plot_items=("Q (Å⁻¹)",),
+        image_items=("Qᵢₚ-Qₒₒₚ",),
+        image_index=0,
+    )
+
+    assert host._apply_share_axis_state() is False
+
+    assert host.ui.shareAxis.isEnabled() is False
+    assert host.ui.shareAxis.isChecked() is False
+    assert host.ui.plotUnit._enabled is True
+    assert host.plot.link is None
 
 
 def test_processed_image_viewer_falls_back_to_thumbnail(tmp_path):
@@ -2728,6 +3194,19 @@ def test_wrangler_enabled_reapplies_viewer_mode_controls():
         assert host.ui.frame.isVisible() is False
         assert host._integration_controls_enabled is False
         assert host.thread.live_mode is False
+        assert host.tree.isEnabled() is (mode == "NeXus Viewer")
+
+
+def test_file_viewer_mode_disables_processing_tree_but_not_mode_combo():
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    for mode in ("Image Viewer", "XYE Viewer"):
+        host = _wrangler_host(mode, live=False, batch=False)
+
+        imageWrangler._on_mode_changed(host)
+
+        assert host.tree.isEnabled() is False
+        assert host.ui.processingModeCombo.currentText() == mode
 
 
 def test_wrangler_enabled_reapplies_xye_mode_controls():

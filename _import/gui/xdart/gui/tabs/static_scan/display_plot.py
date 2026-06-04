@@ -268,6 +268,8 @@ class DisplayPlotMixin:
             self.plot_data = [np.array([]), np.array([])]
             self.frame_names = []
             self.overlaid_idxs = []
+            if hasattr(self, "get_idxs"):
+                self.get_idxs()
             self.update_plot()
         elif new_method in ('Sum', 'Average'):
             # No accumulation needed: aggregation happens inside
@@ -275,6 +277,8 @@ class DisplayPlotMixin:
             self.plot_data = [np.array([]), np.array([])]
             self.frame_names = []
             self.overlaid_idxs = []
+            if hasattr(self, "get_idxs"):
+                self.get_idxs()
             self.update_plot()
         else:
             # Overlay / Waterfall: keep existing accumulated curves and

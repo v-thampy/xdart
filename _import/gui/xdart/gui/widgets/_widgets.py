@@ -6,6 +6,9 @@
 # Standard library imports
 import os
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Other imports
 import numpy as np
@@ -85,13 +88,21 @@ class defaultWidget(Qt.QtWidgets.QWidget):
             valdict: dictionary of parameter values
         """
         valdict = {}
-        if param.isType('group'):
+        # Recurse on any parent (not just 'group'-typed params), and only
+        # read a value from leaves that actually have one.  Action / button
+        # params (e.g. the 'Browse...' NamedActionParameters) and other
+        # valueless leaves have no 'value' key, so ``param.value()`` raises
+        # "No Value has been set" — which used to crash config save AND the
+        # save-on-exit / restore-last-config path.
+        if param.hasChildren():
             valdict[param.name()] = {}
-            if param.hasChildren():
-                for child in param.children():
-                    valdict[param.name()].update(self.param_to_valdict(child))
-        else:
-            valdict[param.name()] = param.value()
+            for child in param.children():
+                valdict[param.name()].update(self.param_to_valdict(child))
+        elif param.hasValue():
+            try:
+                valdict[param.name()] = param.value()
+            except Exception:
+                pass  # valueless leaf — nothing to persist
         return valdict
 
     def set_defaults(self, param, valdict):
@@ -102,13 +113,23 @@ class defaultWidget(Qt.QtWidgets.QWidget):
             param: pyqtgraph Parameter, value whose default will be set
             valdict: dict, values to be set as defaults.
         """
-        if param.isType('group'):
-            if param.hasChildren() and param.name() in valdict:
+        # Mirror param_to_valdict: recurse on any parent, set values only on
+        # leaves that have one and that were persisted.  Keeps load symmetric
+        # with save and tolerant of valueless / action params.
+        if param.hasChildren():
+            sub = valdict.get(param.name())
+            if isinstance(sub, dict):
                 for child in param.children():
-                    self.set_defaults(child, valdict[param.name()])
-        elif param.name() in valdict:
-            param.setDefault(valdict[param.name()])
-            param.setValue(valdict[param.name()])
+                    self.set_defaults(child, sub)
+        elif param.hasValue() and param.name() in valdict:
+            try:
+                param.setDefault(valdict[param.name()])
+                param.setValue(valdict[param.name()])
+            except Exception:
+                logger.debug(
+                    "set_defaults: could not restore %s", param.name(),
+                    exc_info=True,
+                )
     
     def save_defaults(self, checked=False, fname=None):
         """Opens a QFileDialog and saves the current values as json
@@ -128,6 +149,11 @@ class defaultWidget(Qt.QtWidgets.QWidget):
             jdict[key] = self.param_to_valdict(param)
 
         if fname != "":
+            # Ensure the parent directory exists (the config dir, or any path
+            # the user picked) so the write can't FileNotFoundError.
+            parent = os.path.dirname(fname)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(fname, 'w') as f:
                 json.dump(jdict, f, cls=XdartEncoder)
         if emit:
