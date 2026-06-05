@@ -587,35 +587,89 @@ def test_xye_viewer_mode_uses_extended_selection(widget):
             == QAbstractItemView.SingleSelection)
 
 
-def test_xye_plain_click_toggles_overlay(tmp_path, widget):
-    # E1: a plain left-click (no modifier) toggles a file into/out of the
-    # overlay; a third click removes it.
-    from PySide6.QtTest import QTest
-    from PySide6.QtCore import Qt
-    w = widget
-    for n in ("iq_a.xye", "iq_b.xye", "iq_c.xye"):
+def _xye_list(tmp_path, w, names=("iq_a.xye", "iq_b.xye", "iq_c.xye"), method="Single"):
+    """Set up the XYE file list in a given plotMethod; return the list widget."""
+    for n in names:
         (tmp_path / n).write_text("0 1\n1 2\n")
     h5v = w.h5viewer
     h5v.dirname = str(tmp_path)
     w._on_viewer_mode_changed("xye")
+    pm = w.displayframe.ui.plotMethod
+    pm.blockSignals(True)
+    pm.setCurrentText(method)
+    pm.blockSignals(False)
     h5v.update_scans()
-    lw = h5v.ui.listScans
+    return h5v.ui.listScans
 
-    def _click(text):
-        for row in range(lw.count()):
-            it = lw.item(row)
-            if it.text() == text:
-                QTest.mouseClick(lw.viewport(), Qt.LeftButton, Qt.NoModifier,
-                                 lw.visualItemRect(it).center())
-                return
-        pytest.skip(f"{text} not listed")
 
-    _click("iq_a.xye")
+def _click_item(lw, text):
+    from PySide6.QtTest import QTest
+    from PySide6.QtCore import Qt
+    for row in range(lw.count()):
+        it = lw.item(row)
+        if it.text() == text:
+            QTest.mouseClick(lw.viewport(), Qt.LeftButton, Qt.NoModifier,
+                             lw.visualItemRect(it).center())
+            return
+    pytest.skip(f"{text} not listed")
+
+
+def test_xye_plain_click_toggles_overlay_in_accumulating_mode(tmp_path, widget):
+    # E1/E2: in an accumulating method, a plain left-click toggles a file
+    # into/out of the overlay; a third click removes it.
+    w = widget
+    lw = _xye_list(tmp_path, w, method="Overlay")
+    _click_item(lw, "iq_a.xye")
     assert {i.text() for i in lw.selectedItems()} == {"iq_a.xye"}
-    _click("iq_b.xye")                              # plain click ADDS to overlay
+    _click_item(lw, "iq_b.xye")                    # plain click ADDS
     assert {i.text() for i in lw.selectedItems()} == {"iq_a.xye", "iq_b.xye"}
-    _click("iq_b.xye")                              # plain click again REMOVES it
+    _click_item(lw, "iq_b.xye")                    # plain click REMOVES
     assert {i.text() for i in lw.selectedItems()} == {"iq_a.xye"}
+
+
+def test_xye_plain_click_replaces_in_single_mode(tmp_path, widget):
+    # E2: in Single mode a plain click browses one file (replace, not toggle).
+    w = widget
+    lw = _xye_list(tmp_path, w, method="Single")
+    _click_item(lw, "iq_a.xye")
+    assert {i.text() for i in lw.selectedItems()} == {"iq_a.xye"}
+    _click_item(lw, "iq_b.xye")                    # replaces, not adds
+    assert {i.text() for i in lw.selectedItems()} == {"iq_b.xye"}
+
+
+def _arrow(lw, key):
+    from PySide6.QtTest import QTest
+    QTest.keyClick(lw, key)
+
+
+def test_xye_arrow_extends_selection_in_accumulating_mode(tmp_path, widget):
+    # E2: in an accumulating method, Up/Down arrows EXTEND the selection so
+    # arrow-browsing builds the comparison set.
+    from PySide6.QtCore import Qt
+    w = widget
+    lw = _xye_list(tmp_path, w, method="Overlay")
+    # Start on the first data row.
+    first = next(lw.item(r) for r in range(lw.count())
+                 if lw.item(r).text() == "iq_a.xye")
+    first.setSelected(True)
+    lw.setCurrentItem(first)
+    _arrow(lw, Qt.Key_Down)                        # -> iq_b added
+    _arrow(lw, Qt.Key_Down)                        # -> iq_c added
+    assert {i.text() for i in lw.selectedItems()} == {"iq_a.xye", "iq_b.xye", "iq_c.xye"}
+
+
+def test_xye_arrow_browses_single_in_single_mode(tmp_path, widget):
+    # E2: in Single mode arrows move one row (Qt default replace), not extend.
+    from PySide6.QtCore import Qt
+    w = widget
+    lw = _xye_list(tmp_path, w, method="Single")
+    first = next(lw.item(r) for r in range(lw.count())
+                 if lw.item(r).text() == "iq_a.xye")
+    first.setSelected(True)
+    lw.setCurrentItem(first)
+    _arrow(lw, Qt.Key_Down)
+    sel = {i.text() for i in lw.selectedItems()}
+    assert sel == {"iq_b.xye"}                     # moved + replaced, single row
 
 
 def test_xye_entry_has_no_default_overlay(tmp_path, widget):

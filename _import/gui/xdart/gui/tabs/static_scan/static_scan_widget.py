@@ -62,43 +62,92 @@ wranglers = {
 }
 
 
-class _XyeClickToggleFilter(QtCore.QObject):
-    """Modifier-free multi-select for the XYE file list (E1).
+class _XyeOverlayInputFilter(QtCore.QObject):
+    """Modifier-free, plotMethod-aware multi-select for the XYE file list (E1/E2).
 
-    In XYE viewer the scans list uses ``ExtendedSelection`` (so arrow keys
-    browse one file at a time with the plot following, and shift gives a
-    range).  This filter makes a *plain* left-click on a data file toggle it
-    into/out of the overlay — applying ctrl+click semantics on a plain click —
-    so the overlay is built without holding any modifier.  Directories / ``..``
-    keep their default click-to-navigate behaviour, and the filter is inert
-    outside XYE mode.
+    Active only in XYE viewer (the list is ``ExtendedSelection``).  Mirrors
+    ``h5viewer._AccumulatingClickFilter`` semantics on the file list:
+
+    * **Accumulating plot methods** (Overlay / Waterfall / Sum / Average) build a
+      comparison set — a plain left-click toggles a file in/out, and Up/Down
+      arrows EXTEND the selection (add the newly-current file without clearing),
+      so arrow-browsing accumulates just like clicking.
+    * **Single** mode browses one file — a plain click replaces (Qt default) and
+      arrows move one row (Qt default).
+
+    Directories / ``..`` keep default click-to-navigate; the filter is inert
+    outside XYE mode.  (Vivek's model: the *selection* accumulates and the plot =
+    the selected set per plotMethod, so Sum/Average accumulate on arrow too —
+    which diverges from Int 1D's plan_overlay where Sum/Average are REPLACE.)
     """
 
-    def __init__(self, list_widget, is_active):
+    _ACCUMULATING = ('Overlay', 'Waterfall', 'Sum', 'Average')
+
+    def __init__(self, list_widget, is_active, get_method):
         super().__init__(list_widget)
         self._list = list_widget
         self._is_active = is_active
+        self._get_method = get_method
+
+    def _accumulating(self):
+        try:
+            return self._get_method() in self._ACCUMULATING
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_data_item(item):
+        if item is None:
+            return False
+        text = item.text()
+        return text != '..' and not text.endswith('/')
 
     def eventFilter(self, obj, event):
-        if (event.type() == QtCore.QEvent.MouseButtonPress
-                and event.button() == QtCore.Qt.LeftButton
-                and event.modifiers() == QtCore.Qt.NoModifier
-                and self._is_active()):
-            try:
-                pos = event.position().toPoint()
-            except AttributeError:        # Qt5 fallback
-                pos = event.pos()
-            item = self._list.itemAt(pos)
-            if item is not None:
-                text = item.text()
-                if text != '..' and not text.endswith('/'):
-                    # Toggle this file in the overlay; move the cursor here
-                    # without disturbing the rest of the selection.
-                    item.setSelected(not item.isSelected())
-                    self._list.setCurrentItem(
-                        item, QtCore.QItemSelectionModel.NoUpdate)
-                    return True
+        if not self._is_active():
+            return False
+        etype = event.type()
+        if etype == QtCore.QEvent.MouseButtonPress:
+            return self._on_click(event)
+        if etype == QtCore.QEvent.KeyPress:
+            return self._on_key(event)
         return False
+
+    def _on_click(self, event):
+        if (event.button() != QtCore.Qt.LeftButton
+                or event.modifiers() != QtCore.Qt.NoModifier):
+            return False                  # let Qt handle shift/ctrl range/toggle
+        try:
+            pos = event.position().toPoint()
+        except AttributeError:            # Qt5 fallback
+            pos = event.pos()
+        item = self._list.itemAt(pos)
+        if not self._is_data_item(item):
+            return False
+        if not self._accumulating():
+            return False                  # Single: Qt replace (browse one)
+        # Accumulating: toggle this file in/out of the overlay.
+        item.setSelected(not item.isSelected())
+        self._list.setCurrentItem(item, QtCore.QItemSelectionModel.NoUpdate)
+        return True
+
+    def _on_key(self, event):
+        if (not self._accumulating()
+                or event.modifiers() != QtCore.Qt.NoModifier
+                or event.key() not in (QtCore.Qt.Key_Up, QtCore.Qt.Key_Down)):
+            return False                  # Single / modified: Qt default browse
+        step = -1 if event.key() == QtCore.Qt.Key_Up else 1
+        row = self._list.currentRow() + step
+        while 0 <= row < self._list.count():
+            item = self._list.item(row)
+            if self._is_data_item(item):
+                # Extend: add the newly-current file without clearing the rest,
+                # so arrow-browsing builds the comparison set.
+                item.setSelected(True)
+                self._list.setCurrentItem(
+                    item, QtCore.QItemSelectionModel.NoUpdate)
+                return True
+            row += step
+        return True                       # at an end / only dirs: consume
 
 
 def scanlocked(func):
@@ -430,14 +479,20 @@ class staticWidget(QWidget):
                 self._show_integration_advanced)
         self.wrangler.setup()
         self._sync_h5viewer_save_dir(getattr(self.wrangler, 'h5_dir', None))
-        # E1: plain-click-toggle for the XYE overlay (active only in xye mode).
+        # E1/E2: modifier-free, plotMethod-aware overlay build for the XYE file
+        # list (active only in xye mode).  Mouse presses go to the viewport, key
+        # presses to the list widget — install on both.
         try:
             scans = self.h5viewer.ui.listScans
-            self._xye_click_filter = _XyeClickToggleFilter(
-                scans, lambda: getattr(self.h5viewer, 'viewer_mode', None) == 'xye')
-            scans.viewport().installEventFilter(self._xye_click_filter)
+            self._xye_input_filter = _XyeOverlayInputFilter(
+                scans,
+                lambda: getattr(self.h5viewer, 'viewer_mode', None) == 'xye',
+                lambda: self.displayframe.ui.plotMethod.currentText(),
+            )
+            scans.viewport().installEventFilter(self._xye_input_filter)
+            scans.installEventFilter(self._xye_input_filter)
         except Exception:
-            logger.debug("XYE click-toggle filter install failed", exc_info=True)
+            logger.debug("XYE overlay input filter install failed", exc_info=True)
         self.h5viewer.sigNewFile.connect(self.wrangler.set_fname)
         self.h5viewer.sigNewFile.connect(self.displayframe.set_axes)
         self.h5viewer.sigNewFile.connect(self.h5viewer.data_reset)
@@ -1181,11 +1236,11 @@ class staticWidget(QWidget):
             self.h5viewer.actionNewFile.setEnabled(not is_viewer)
             self.h5viewer.actionSaveDataAs.setEnabled(not is_viewer)
             # XYE viewer: ExtendedSelection so arrow keys browse one file at a
-            # time with the plot following (shift+arrow / shift+click = range),
-            # PLUS a plain left-click toggles a file in/out of the overlay
-            # (modifier-free) via _XyeClickToggleFilter on the list viewport.
-            # Others: single select.  Start clean — show the current row only,
-            # never a default overlay.
+            # time with the plot following (shift+arrow / shift+click = range);
+            # _XyeOverlayInputFilter layers on modifier-free, plotMethod-aware
+            # accumulation (toggle/extend on click+arrow in Overlay/Waterfall/
+            # Sum/Average).  Others: single select.  Start clean — show the
+            # current row only, never a default overlay.
             if viewer_mode == 'xye':
                 scans.setSelectionMode(QAbstractItemView.ExtendedSelection)
                 scans.clearSelection()
