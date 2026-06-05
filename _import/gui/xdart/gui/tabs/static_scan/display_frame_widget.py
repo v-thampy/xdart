@@ -435,6 +435,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.yOffset.valueChanged.connect(self.update_plot_view)
         self.ui.plotUnit.activated.connect(self._on_plotUnit_changed)
         self.ui.plotUnit.activated.connect(self.update_plot)
+        # B2: a user 1D-unit change re-expresses the x-values (Q<->2θ), so the
+        # view must refit the new data range instead of staying at the old one.
+        # ``activated`` fires only on user interaction (not the silent Share-Axis
+        # setCurrentIndex), and after update_plot above, so plot_data is current.
+        self.ui.plotUnit.activated.connect(self._autorange_plot_view)
         self.ui.showLegend.toggled.connect(self.update_legend)
         self.ui.slice.toggled.connect(self._sync_slice_controls)
         self.ui.slice.toggled.connect(self.update_plot)
@@ -1259,6 +1264,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         # Update slice range label
         self._set_slice_range()
+
+    def _autorange_plot_view(self, *args):
+        """Refit the 1D plot view to the current data (B2).
+
+        A 1D-unit change re-expresses the x-values (Q<->2θ span very different
+        ranges), so the view must auto-range to the new data instead of staying
+        frozen at the previous unit's range."""
+        try:
+            self.plot.enableAutoRange()
+            self.plot.autoRange()
+        except Exception:
+            logger.debug("1D autoscale on unit change failed", exc_info=True)
 
     # ── 2D image rendering ────────────────────────────────────────
 

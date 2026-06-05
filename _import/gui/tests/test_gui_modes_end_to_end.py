@@ -940,3 +940,42 @@ def test_grazing_toggle_defers_display_combo_rebuild(widget):
     after = [df.ui.plotUnit.itemText(i) for i in range(df.ui.plotUnit.count())]
     assert after == before                         # display combo unchanged
     assert w.scan.gi is True                        # integration state updated
+
+
+# ── B1 / B2: Share Axis re-expresses the 1D curve; unit change autoranges ───
+
+def test_share_axis_reexpresses_1d_curve(widget):
+    # B1: Share Axis links the 1D plot to the cake unit AND converts the
+    # x-values (not just the label).  Non-GI; requires a wavelength.
+    w = widget
+    df = _set_int_scan(w, n=1)                      # INT 2D, Q-integrated
+    df.update()
+    q_x = np.asarray(df.plot_data[0], dtype=float)
+    assert q_x.max() < 4.0                          # Q (~0.5..3)
+
+    df.ui.imageUnit.setCurrentIndex(1)             # cake -> 2θ-χ
+    df.update()
+    assert df.ui.shareAxis.isEnabled()
+    df.ui.shareAxis.setChecked(True)
+    df.update()
+
+    tth_x = np.asarray(df.plot_data[0], dtype=float)
+    assert df.ui.plotUnit.currentText().strip().startswith("2")   # 2θ
+    assert tth_x.max() > 4.0                        # re-expressed to 2θ
+    assert not np.allclose(tth_x, q_x)              # values changed, not relabel
+
+
+def test_plot_unit_change_autoranges_view(widget):
+    # B2: a user 1D-unit change refits the plot view to the new data range.
+    w = widget
+    df = _set_int_scan(w, n=1)                      # INT 2D, Q
+    df.ui.plotUnit.setCurrentIndex(0)              # Q
+    df.update()
+    # Switch to 2θ via the user-interaction signal.
+    df.ui.plotUnit.setCurrentIndex(1)
+    df.ui.plotUnit.activated.emit(1)
+
+    xmax = float(np.nanmax(df.plot_data[0]))
+    assert xmax > 10.0                              # 2θ values (~4..28)
+    view_xmax = df.plot.viewRange()[0][1]
+    assert view_xmax > 10.0                         # view refit to 2θ, not Q (~3)
