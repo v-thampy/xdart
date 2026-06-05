@@ -882,8 +882,17 @@ class imageThread(wranglerThread):
         scan._cached_fiber_integrator_angle = incident_angle
 
     def _freeze_gi_1d_auto_range(self, scan, pending) -> None:
-        """Freeze GI 1D auto radial range once per scan before integration."""
-        if not self.gi or self.xye_only or not pending:
+        """Freeze GI 1D auto radial range once per scan before integration.
+
+        Must run for Int 1D (XYE) too (``xye_only``): that path still writes the
+        integrated stack to .nxs (``scan._save_to_nexus`` in
+        ``_dispatch_batch_parallel``), and the writer validates a uniform
+        per-frame q axis.  A GI scan whose per-frame qip/qoop axis drifts must be
+        frozen here or the stack write raises ``results_1d[i] has a different
+        radial axis than results_1d[0]``.  (Previously skipped on ``xye_only`` on
+        the assumption it produced no validated .nxs — it does.)
+        """
+        if not self.gi or not pending:
             return
         args = getattr(scan, 'bai_1d_args', None)
         if not isinstance(args, dict) or args.get('radial_range') is not None:
