@@ -346,6 +346,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._payload_x_axis_label = None
         self._payload_y_axis_label = None
         self._using_publication_plot_payload = False
+        self._plot_autorange_requested = False
 
         # Cached display data
         self.image_data = (None, None)
@@ -434,12 +435,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.plotMethod.currentIndexChanged.connect(self._on_plotMethod_changed)
         self.ui.yOffset.valueChanged.connect(self.update_plot_view)
         self.ui.plotUnit.activated.connect(self._on_plotUnit_changed)
+        self.ui.plotUnit.activated.connect(self.request_plot_autorange)
         self.ui.plotUnit.activated.connect(self.update_plot)
-        # B2: a user 1D-unit change re-expresses the x-values (Q<->2θ), so the
-        # view must refit the new data range instead of staying at the old one.
-        # ``activated`` fires only on user interaction (not the silent Share-Axis
-        # setCurrentIndex), and after update_plot above, so plot_data is current.
-        self.ui.plotUnit.activated.connect(self._autorange_plot_view)
         self.ui.showLegend.toggled.connect(self.update_legend)
         self.ui.slice.toggled.connect(self._sync_slice_controls)
         self.ui.slice.toggled.connect(self.update_plot)
@@ -653,14 +650,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         state = self._live_display_state()
         ctrl = controller_for(state.mode)
-        # Share Axis links the 1D plot to the cake's unit.  Apply it BEFORE the
-        # payload is built so the unit the 1D path reads (and re-expresses to)
-        # and the axis label come from the same post-link unit in ONE render —
-        # otherwise build_payload reads the stale plotUnit and renders Q data
-        # while the later relabel shows 2θ (the intermittent Share-Axis race,
-        # R2-2).  render_display re-applies it (idempotent).
-        if state.mode in (Mode.INT_1D, Mode.INT_2D):
-            self._apply_share_axis_state()
         payload = ctrl.build_payload(self, state)  # store=None ⇒ delegate draws
         result = self.render_display(state, payload)
         self._display_blanked = False
@@ -674,9 +663,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # only.  These collapse into mode controllers in Stage 5.
     def _draw_delegate(self, role, mode):
         # Payload-only viewer modes (Image / XYE / NeXus): a ``None`` payload
-        # means blank that panel — there is no legacy draw fallback.  Only the
-        # Int 1D / Int 2D integration views still fall back to the legacy
-        # ``update_*`` pixel pushers (that's step 4).
+        # means blank that panel — there is no legacy draw fallback.  Normal
+        # integration plots intentionally delegate to update_plot; raw images
+        # still keep update_image as their fallback.
         if role is PanelRole.RAW_2D:
             if mode in (Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER):
                 return self.clear_image_view

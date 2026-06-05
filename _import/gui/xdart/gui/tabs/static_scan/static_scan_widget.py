@@ -455,12 +455,8 @@ class staticWidget(QWidget):
                 # or curve visible when the new mode needs data that has not
                 # been loaded yet.
                 self.displayframe.clear_display_state()
+                self.displayframe.request_plot_autorange()
                 self.h5viewer.data_changed()
-                # R2-3: a processing-mode switch changes the 1D data span (and a
-                # prior Share-Axis link may have frozen the view) — refit the
-                # plot after the re-render settles.
-                QtCore.QTimer.singleShot(
-                    0, self.displayframe._autorange_plot_view)
             self.wrangler.ui.processingModeCombo.currentTextChanged.connect(_on_mode_changed)
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
             self.wrangler.sigViewerModeChanged.connect(self._on_viewer_mode_changed)

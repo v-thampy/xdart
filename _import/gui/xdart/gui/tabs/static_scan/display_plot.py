@@ -205,6 +205,13 @@ class DisplayPlotMixin:
     def draw_plot_state(self):
         """Draw the currently accumulated plot state."""
         self.update_plot_view()
+        if getattr(self, '_plot_autorange_requested', False):
+            self._plot_autorange_requested = False
+            self._autorange_plot_view()
+
+    def request_plot_autorange(self, *args):
+        """Request a 1D autorange after the next canonical plot draw."""
+        self._plot_autorange_requested = True
 
     def _loaded_1d_overlay_labels(self, idxs, *, max_rows=None):
         """Return loaded frame ids and labels that can produce 1D rows."""
@@ -378,9 +385,10 @@ class DisplayPlotMixin:
             # Overlay/Waterfall accumulation lives there now, keyed off the
             # widget's plot_data/frame_names (which clear_overlay resets above).
             self.update()
-            self._autorange_plot_view()   # R2-3: a method change rescales the data
+            self._autorange_plot_view()
             return
 
+        self.request_plot_autorange()
         if new_method == 'Single':
             # Reset accumulated data — rebuild from current selection
             self.plot_data = [np.array([]), np.array([])]
@@ -401,10 +409,7 @@ class DisplayPlotMixin:
         else:
             # Overlay / Waterfall: keep existing accumulated curves and
             # just refresh the rendered view.
-            self.update_plot_view()
-        # R2-3: Sum/Average/Overlay/Waterfall change the data span (and a prior
-        # Share-Axis link froze the view), so refit the plot to the new curves.
-        self._autorange_plot_view()
+            self.draw_plot_state()
 
     def _current_plot_axis_label(self):
         """Return the bottom-axis label and unit for the current 1D view."""
