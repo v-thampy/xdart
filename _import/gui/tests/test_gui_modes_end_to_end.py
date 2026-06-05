@@ -897,11 +897,9 @@ def test_int2d_cake_clears_without_publication(widget):
 
 # ── INT 1D plot characterization before update_plot cleanup ────────────────
 #
-# The normal INT plot currently has two live paths: native-axis
-# Single/Sum/Average draw from publication PlotPayload, while the stateful
-# modes and derived axes fall through to update_plot.  These tests lock the
-# computed render state (arrays/names/ranges/labels), not pixels, before the
-# cleanup makes update_plot canonical.
+# The normal INT plot is update_plot-canonical.  These tests lock the computed
+# render state (arrays/names/ranges/labels), not pixels, so the cleanup remains
+# behavior-preserving.
 
 def _plot_state(df):
     x, y = df.plot_data
@@ -919,38 +917,14 @@ def _plot_state(df):
     }
 
 
-def _assert_plot_states_equal(actual, expected):
-    np.testing.assert_allclose(actual["x"], expected["x"], equal_nan=True)
-    np.testing.assert_allclose(actual["y"], expected["y"], equal_nan=True)
-    assert actual["names"] == expected["names"]
-    assert actual["range"] == expected["range"]
-    assert actual["x_axis"] == expected["x_axis"]
-    assert actual["curves"] == expected["curves"]
-    assert actual["waterfall"] == expected["waterfall"]
-
-
-def _reset_plot_state(df):
-    df.clear_plot_view()
-    df.plot_data = [np.zeros(0), np.zeros(0)]
-    df.plot_data_range = [[0, 0], [0, 0]]
-    df.frame_names = []
-    df.overlaid_idxs = []
-    df._last_plot_unit = -1
-    df._payload_x_axis_label = None
-    df._payload_y_axis_label = None
-    df._using_publication_plot_payload = False
-
-
 @pytest.mark.parametrize("method, frame_ids", [
     ("Single", ["0"]),
     ("Single", ["0", "1", "2"]),
     ("Sum", ["0", "1", "2"]),
     ("Average", ["0", "1", "2"]),
 ])
-def test_int_plot_native_live_payload_matches_direct_update_plot(widget, method, frame_ids):
-    # Commit-4 gate: these native-axis methods are payload-rendered today.  A
-    # future route flip may only happen because direct update_plot already
-    # reproduces the same computed state.
+def test_int_plot_native_update_plot_state(widget, method, frame_ids):
+    from xdart.gui.tabs.static_scan.display_constants import AA_inv
     w = widget
     df = _set_int_scan(w, n=3)
     df.ui.plotMethod.setCurrentText(method)
@@ -960,15 +934,18 @@ def test_int_plot_native_live_payload_matches_direct_update_plot(widget, method,
     df.idxs_1d = [int(i) for i in frame_ids]
     df.idxs_2d = [int(i) for i in frame_ids]
 
-    df.update()                         # currently-live payload path
-    live_state = _plot_state(df)
-    assert df._using_publication_plot_payload is False
+    df.update()
 
-    _reset_plot_state(df)
-    df.update_plot()                    # future canonical path
-    direct_state = _plot_state(df)
-
-    _assert_plot_states_equal(direct_state, live_state)
+    state = _plot_state(df)
+    expected_ids = [int(i) for i in frame_ids]
+    expected_x = np.linspace(0.5, 3.0, 5)
+    expected_y = np.vstack([np.ones_like(expected_x) + i for i in expected_ids])
+    expected_names = tuple(f"scan_{i}" for i in expected_ids)
+    np.testing.assert_allclose(state["x"], expected_x)
+    np.testing.assert_allclose(state["y"], expected_y)
+    assert state["names"] == expected_names
+    assert state["x_axis"] == ("Q", AA_inv)
+    assert state["curves"] == (1 if method in ("Sum", "Average") else len(expected_ids))
 
 
 @pytest.mark.parametrize("method", ["Overlay", "Waterfall"])

@@ -1367,7 +1367,7 @@ def test_publication_plot_fallback_uses_legacy_draw_for_derived_axes_and_slice()
         host.render_display(state, payload)
         return calls, payload
 
-    for source, sliced in (("2d", False), ("1d_2d", True)):
+    for source, sliced in (("1d", False), ("2d", False), ("1d_2d", True)):
         calls, payload = render_with_axis(source, sliced)
         assert payload.plot is None
         assert "draw_plot" in calls

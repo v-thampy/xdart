@@ -191,7 +191,7 @@ def test_publication_from_nexus_frame_matches_live_style_view(tmp_path):
     )
 
 
-def test_publication_display_adapter_exposes_availability_and_plot_payload():
+def test_publication_display_adapter_exposes_availability_and_int_plot_fallback():
     frame = DuckFrame(idx=9)
     frame.int_1d = IntegrationResult1D(
         radial=np.linspace(10.0, 20.0, 4),
@@ -240,12 +240,7 @@ def test_publication_display_adapter_exposes_availability_and_plot_payload():
     )
     payload = PublicationDisplayAdapter(store, widget=_Widget()).plot_payload(state)
 
-    assert payload is not None
-    assert payload.axis_x.label == "2θ"
-    assert payload.axis_x.unit == "°"
-    assert payload.traces[0].label == "scan_9"
-    np.testing.assert_allclose(payload.traces[0].x, frame.int_1d.radial)
-    np.testing.assert_allclose(payload.traces[0].y, frame.int_1d.intensity / 100.0)
+    assert payload is None
 
 
 def test_publication_display_adapter_builds_raw_and_cake_image_payloads():
