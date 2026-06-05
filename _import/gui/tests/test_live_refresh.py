@@ -1591,6 +1591,7 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
 
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
+        _apply_integration_control_state=lambda: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -1633,6 +1634,7 @@ def test_viewer_mode_tree_disable_only_for_file_viewers():
     list_scans = _FakeListWidget(["scan.nxs"])
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
+        _apply_integration_control_state=lambda: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
@@ -1709,6 +1711,7 @@ def test_viewer_mode_keeps_explicit_open_folder():
 
     widget = SimpleNamespace(
         wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
+        _apply_integration_control_state=lambda: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
