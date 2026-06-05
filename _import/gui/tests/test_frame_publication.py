@@ -299,6 +299,93 @@ def test_publication_display_adapter_builds_raw_and_cake_image_payloads():
     expected_cake = frame.int_2d.intensity.T / 10.0 - 0.5
     assert cake is not None
     np.testing.assert_allclose(cake.image, expected_cake)
+
+
+def _cake_state(store, idx):
+    loaded_1d, loaded_2d, raw_avail = publication_availability(store)
+    return compute_display_state(
+        mode=Mode.INT_2D, selected_ids=(idx,), all_frame_index=[idx],
+        loaded_1d_keys=loaded_1d, loaded_2d_keys=loaded_2d, gi=False,
+        plot_unit="q_A^-1", method="Single", unit_changed=False,
+        prev_overlaid_ids=(), raw_availability=raw_avail,
+        titles={}, generation=store.generation)
+
+
+def test_cake_image_applies_imageunit_q_to_2theta_conversion():
+    # The 2D-unit (imageUnit) Q↔2θ toggle is owned by cake_image now (so the
+    # cake unit is consistent on every render, not only via the old
+    # update_binned redraw).  Selecting "2θ-χ" over a Q-integrated cake converts
+    # the radial axis values and relabels.
+    from xdart.gui.tabs.static_scan.display_constants import Th, Chi
+    frame = DuckFrame(idx=12)                      # int_2d.radial in Q (q_A^-1)
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+    lam_m = 1.0e-10                                # 1 Å
+
+    class _Combo:
+        def __init__(self, text):
+            self._text = text
+        def currentText(self):
+            return self._text
+
+    class _Widget:
+        scan = type("Scan", (), {"name": "scan", "gi": False, "global_mask": None})()
+        bkg_2d = 0
+        def __init__(self, label):
+            self.ui = type("UI", (), {"imageUnit": _Combo(label)})()
+        def normalize(self, data, metadata):
+            return np.asarray(data, dtype=float)
+        def _get_wavelength(self, frame=None):
+            return lam_m
+
+    state = _cake_state(store, 12)
+
+    # Default "Q-χ": no conversion — axis stays Q.
+    cake_q = PublicationDisplayAdapter(
+        store, widget=_Widget(f"Q-{Chi}")).cake_image(state)
+    assert cake_q is not None
+    np.testing.assert_allclose(cake_q.axis_x.values, frame.int_2d.radial)
+
+    # "2θ-χ": radial converted q -> 2θ and relabelled to degrees.
+    cake_tth = PublicationDisplayAdapter(
+        store, widget=_Widget(f"2{Th}-{Chi}")).cake_image(state)
+    assert cake_tth is not None
+    assert cake_tth.axis_x.unit == "°"        # degrees
+    q = np.asarray(frame.int_2d.radial, dtype=float)
+    lam_A = lam_m * 1e10
+    expected = 2 * np.degrees(np.arcsin(np.clip(q * lam_A / (4 * np.pi), -1, 1)))
+    np.testing.assert_allclose(cake_tth.axis_x.values, expected)
+    # The cake image data itself is unchanged by the axis toggle.
+    np.testing.assert_allclose(cake_tth.image, frame.int_2d.intensity.T)
+
+
+def test_cake_image_gi_ignores_imageunit_toggle():
+    # GI cakes keep their reciprocal-space axes verbatim (imageUnit disabled).
+    from xdart.gui.tabs.static_scan.display_constants import Th, Chi
+    frame = DuckFrame(idx=13)
+    frame.int_2d = IntegrationResult2D(
+        radial=np.linspace(0.0, 2.0, 4), azimuthal=np.linspace(0.0, 2.0, 3),
+        intensity=np.ones((4, 3)), unit="qip_A^-1", azimuthal_unit="qoop_A^-1")
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+
+    class _Combo:
+        def currentText(self):
+            return f"2{Th}-{Chi}"
+
+    class _Widget:
+        scan = type("Scan", (), {"name": "scan", "gi": True, "global_mask": None})()
+        bkg_2d = 0
+        ui = type("UI", (), {"imageUnit": _Combo()})()
+        def normalize(self, data, metadata):
+            return np.asarray(data, dtype=float)
+        def _get_wavelength(self, frame=None):
+            return 1.0e-10
+
+    cake = PublicationDisplayAdapter(store, widget=_Widget()).cake_image(
+        _cake_state(store, 13))
+    assert cake is not None
+    np.testing.assert_allclose(cake.axis_x.values, frame.int_2d.radial)   # verbatim
     assert cake.axis_x.values.shape == (4,)
     assert cake.axis_y.values.shape == (3,)
 

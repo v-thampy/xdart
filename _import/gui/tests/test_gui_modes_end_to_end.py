@@ -626,3 +626,105 @@ def test_nexus_viewer_metadata_row_clears_both(widget):
     assert df.image_data is None                          # image blanked
     assert df.image_widget.histogram.isVisible() is False  # colorbar hidden
     assert len(df.curves) == 0                            # plot blanked
+
+
+# ── Int 2D cake: payload-authoritative + the imageUnit Q↔2θ toggle (step 4-1) ─
+#
+# CAKE_2D renders solely from cake_image now (update_binned deleted), and
+# cake_image owns the 2D-unit (imageUnit) Q↔2θ conversion, so the cake unit is
+# consistent on every render and the toggle re-renders through the payload.
+
+def _set_int_scan(w, *, n=1, wavelength_m=1.0e-10):
+    """Populate the real widget for an Int 2D scan: data_2d + data_1d +
+    publications + a scan stub, selected, in Int 2D mode (non-GI, q-integrated)."""
+    import threading
+    from ssrl_xrd_tools.core import IntegrationResult1D, IntegrationResult2D
+    from xdart.modules.frame_publication import publication_from_live_frame
+    df = w.displayframe
+    q = np.linspace(0.5, 3.0, 5)
+    chi = np.linspace(-90.0, 90.0, 4)
+    w.publication_store.clear()
+    with w.data_lock:
+        w.data_1d.clear()
+        w.data_2d.clear()
+        for i in range(n):
+            f = SimpleNamespace()
+            f.idx = i
+            f.gi = False
+            f.scan_info = {}
+            f.source_file = f"scan_{i}.tif"
+            f.source_frame_idx = 0
+            f.map_raw = (np.arange(36, dtype=float).reshape(6, 6) + i)
+            f.bg_raw = 0
+            f.mask = None
+            f.gi_2d = {}
+            f.thumbnail = None
+            f.int_1d = IntegrationResult1D(
+                radial=q, intensity=np.ones_like(q) + i,
+                sigma=np.ones_like(q), unit="q_A^-1")
+            f.int_2d = IntegrationResult2D(
+                radial=q, azimuthal=chi,
+                intensity=np.ones((q.size, chi.size)) + i,
+                unit="q_A^-1", azimuthal_unit="chi_deg")
+            f._get_incident_angle = lambda: 0.2
+            w.data_2d[i] = {"map_raw": f.map_raw, "bg_raw": 0, "mask": None,
+                            "int_2d": f.int_2d, "gi_2d": {}, "thumbnail": None}
+            w.data_1d[i] = f
+            w.publication_store.upsert(publication_from_live_frame(f))
+    w.frame_ids[:] = [str(i) for i in range(n)]
+    df.idxs_2d = list(range(n))
+    df.idxs_1d = list(range(n))
+    df.scan = SimpleNamespace(
+        scan_lock=threading.RLock(),
+        frames=SimpleNamespace(index=list(range(n))),
+        gi=False, skip_2d=False, name="scan", global_mask=None,
+        scan_data=SimpleNamespace(columns=[]), bai_2d_args={},
+        series_average=False, single_img=False,
+        mg_args={"wavelength": wavelength_m})
+    df.viewer_mode = None
+    # Populate the 2D-unit combo with the non-GI Q-χ / 2θ-χ entries (the real
+    # non-GI scan-load flow does this; the stub above bypasses it).
+    from xdart.gui.tabs.static_scan.display_constants import imageUnits
+    df.ui.imageUnit.blockSignals(True)
+    df.ui.imageUnit.clear()
+    for u in imageUnits:
+        df.ui.imageUnit.addItem(u)
+    df.ui.imageUnit.setCurrentIndex(0)
+    df.ui.imageUnit.blockSignals(False)
+    return df
+
+
+def test_int2d_cake_draws_via_payload(widget):
+    w = widget
+    df = _set_int_scan(w, n=1)
+    df.update()
+    assert df.binned_data is not None              # cake drawn via cake_image
+    assert df.binned_data[0].size > 0
+
+
+def test_int2d_imageunit_toggle_reexpresses_cake(widget):
+    w = widget
+    df = _set_int_scan(w, n=1)                      # q-integrated cake
+    df.ui.imageUnit.setCurrentIndex(0)             # Q-χ
+    df.update()
+    q_rect = df.binned_data[1]
+    df.ui.imageUnit.setCurrentIndex(1)             # 2θ-χ
+    df.update()
+    tth_rect = df.binned_data[1]
+    assert q_rect is not None and tth_rect is not None
+    # The radial (x) extent changes: q (0.5..3.0) -> 2θ via the wavelength.
+    assert abs(q_rect.width() - tth_rect.width()) > 1e-6
+
+
+def test_int2d_cake_clears_without_publication(widget):
+    # The deletion's only behavior change: a 2D panel with data but no
+    # publication blanks (payload-only, no legacy update_binned fallback).
+    # The store-sync guarantee makes this unreachable for clean frames; this
+    # forces it to lock the clear-on-None contract.
+    w = widget
+    df = _set_int_scan(w, n=1)
+    df.update()
+    assert df.binned_data is not None
+    w.publication_store.clear()                     # data_2d kept, publications gone
+    df.update()
+    assert df.binned_data is None                   # cake blanked, not stale

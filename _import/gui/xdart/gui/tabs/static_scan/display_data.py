@@ -481,22 +481,16 @@ class DisplayDataMixin:
             return radial, azimuthal
 
         from .display_constants import AA_inv, Th
+        from .display_logic import convert_2d_radial
 
         image_label = self.ui.imageUnit.currentText()
-        data_unit = getattr(int_2d, 'unit', 'q_A^-1')
-        want_tth = (Th in image_label)         # imageUnit label contains θ
-        have_tth = ('2th' in data_unit)
-        if want_tth and not have_tth:
-            wl = self._get_wavelength(frame)
-            if wl and wl > 0:
-                lam_A = wl * 1e10
-                arg = np.clip(radial * lam_A / (4 * np.pi), -1, 1)
-                radial = 2 * np.degrees(np.arcsin(arg))
-        elif not want_tth and have_tth and (AA_inv in image_label):
-            wl = self._get_wavelength(frame)
-            if wl and wl > 0:
-                lam_A = wl * 1e10
-                radial = (4 * np.pi / lam_A) * np.sin(np.radians(radial / 2))
+        radial = convert_2d_radial(
+            radial,
+            data_unit=getattr(int_2d, 'unit', 'q_A^-1'),
+            want_tth=(Th in image_label),       # imageUnit label names 2θ
+            want_q=(AA_inv in image_label),      # imageUnit label names Q (Å⁻¹)
+            wavelength_m=self._get_wavelength(frame),
+        )
         return radial, azimuthal
 
     def get_xdata(self, frame):

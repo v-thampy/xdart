@@ -71,6 +71,7 @@ __all__ = [
     "plan_overlay",
     "sentinel_mask",
     "standalone_viewer_image",
+    "convert_2d_radial",
     "gi_axes_uniform",
     "compute_display_state",
 ]
@@ -593,6 +594,29 @@ def standalone_viewer_image(data):
         return out
     out[bad] = float(np.nanmin(arr[valid]))
     return out
+
+
+def convert_2d_radial(radial, *, data_unit, want_tth, want_q, wavelength_m):
+    """Convert a cake *radial* axis between Q (Å⁻¹) and 2θ (deg) on the fly,
+    mirroring ``display_data.get_xydata`` so the payload cake and the legacy
+    cake agree exactly under the 2D-unit (imageUnit) toggle.
+
+    ``want_tth`` / ``want_q`` come from the selected imageUnit label (does it
+    name 2θ / Q?); ``data_unit`` is the integration unit of the axis. The
+    conversion fires only when the wanted unit differs from the data's, and is
+    a no-op when the wavelength is unknown.  GI reciprocal-space axes must NOT
+    be passed here (their imageUnit combo is disabled; axes are verbatim)."""
+    radial = np.asarray(radial, dtype=float)
+    have_tth = '2th' in str(data_unit or '')
+    if not wavelength_m or wavelength_m <= 0:
+        return radial
+    lam_A = wavelength_m * 1e10
+    if want_tth and not have_tth:
+        arg = np.clip(radial * lam_A / (4 * np.pi), -1, 1)
+        return 2 * np.degrees(np.arcsin(arg))
+    if want_q and have_tth:
+        return (4 * np.pi / lam_A) * np.sin(np.radians(radial / 2))
+    return radial
 
 
 def gi_axes_uniform(axes_per_frame, *, rtol=1e-5, atol=1e-8):

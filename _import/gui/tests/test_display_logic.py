@@ -105,6 +105,29 @@ def test_sentinel_mask_sets_nan():
     assert out[0] == 1.0 and out[4] == 3.0            # real values untouched
 
 
+@pytest.mark.display_logic
+def test_convert_2d_radial_q_to_2theta_and_back():
+    np = pytest.importorskip("numpy")
+    lam_A = 1.0
+    q = np.array([0.5, 1.0, 2.0])
+    # Q -> 2θ (data is q, selection names 2θ)
+    tth = dl.convert_2d_radial(q, data_unit="q_A^-1", want_tth=True,
+                               want_q=False, wavelength_m=lam_A * 1e-10)
+    expected = 2 * np.degrees(np.arcsin(np.clip(q * lam_A / (4 * np.pi), -1, 1)))
+    np.testing.assert_allclose(tth, expected)
+    # 2θ -> Q (data is 2θ, selection names Q) round-trips
+    back = dl.convert_2d_radial(tth, data_unit="2th_deg", want_tth=False,
+                                want_q=True, wavelength_m=lam_A * 1e-10)
+    np.testing.assert_allclose(back, q, atol=1e-9)
+    # No-op when the selection already matches the data, or wavelength unknown.
+    same = dl.convert_2d_radial(q, data_unit="q_A^-1", want_tth=False,
+                                want_q=True, wavelength_m=lam_A * 1e-10)
+    np.testing.assert_allclose(same, q)
+    none_wl = dl.convert_2d_radial(q, data_unit="q_A^-1", want_tth=True,
+                                   want_q=False, wavelength_m=None)
+    np.testing.assert_allclose(none_wl, q)
+
+
 def test_default_plot_unit_follows_2theta():
     # integrate in 2θ -> the plot-unit combo should default to the 2θ entry,
     # not fall back to Q (the 'integrate in 2θ but plot defaults to Q' bug).

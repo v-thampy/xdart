@@ -1083,9 +1083,10 @@ def _update_smoke_host():
         plot=MagicMock(),
         image_widget=MagicMock(),
         binned_widget=MagicMock(),
-        # pixel-push leaves (unchanged by Stage 3) — recorded, not run
+        # pixel-push leaves (unchanged by Stage 3) — recorded, not run.
+        # CAKE_2D is payload-only now (no update_binned); this host has no
+        # publication_store, so its cake payload is None and CAKE_2D blanks.
         update_image=rec("draw_image"),
-        update_binned=rec("draw_binned"),
         update_plot=rec("draw_plot"),
         update_plot_view=rec("payload_plot"),
         # IMAGE_VIEWER / XYE_VIEWER now render through the payload path
@@ -1119,10 +1120,13 @@ def _update_smoke_host():
 def test_update_render_smoke_int_collapse_and_mode_switches():
     host, calls, dl = _update_smoke_host()
 
-    # Int-2D: full panel set.
+    # Int-2D: raw + plot via the legacy delegates; the CAKE_2D panel is
+    # payload-only now (no update_binned) and this host has no publication_store,
+    # so the cake payload is None and CAKE_2D blanks.
     host.update()
-    assert "draw_plot" in calls and "draw_image" in calls and "draw_binned" in calls
-    assert "label_2d" in calls and not any(c.startswith("clear_") for c in calls)
+    assert "draw_plot" in calls and "draw_image" in calls
+    assert "clear_binned" in calls
+    assert "label_2d" in calls
 
     # Int-1D (skip_2d): 1D-only — plot drawn, the two 2D panels cleared.
     calls.clear()
@@ -1191,18 +1195,20 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     host.viewer_mode = None
     host._bump_display_generation()
     host.update()
-    assert {"draw_plot", "draw_image", "draw_binned"} <= set(calls)
+    assert {"draw_plot", "draw_image"} <= set(calls)   # raw + plot legacy
+    assert "clear_binned" in calls                     # cake payload-only, no pub
 
 
 def test_update_render_smoke_gi_scan_propagates_and_dispatches():
     # A GI scan still renders through the same path; gi flag propagates into
-    # the state and the cake/plot dispatch is unchanged (GI axis labelling is
-    # delegated to the legacy update_binned_view, covered elsewhere).
+    # the state and the raw/plot dispatch is unchanged.  CAKE_2D is payload-only
+    # (no publication_store on this host -> the cake blanks).
     host, calls, dl = _update_smoke_host()
     host.scan.gi = True
     host.update()
     assert host._live_display_state().gi is True
-    assert {"draw_plot", "draw_image", "draw_binned"} <= set(calls)
+    assert {"draw_plot", "draw_image"} <= set(calls)
+    assert "clear_binned" in calls
 
 
 def test_update_render_smoke_stale_generation_is_dropped():
@@ -1229,7 +1235,6 @@ def _render_host():
         plot=MagicMock(),
         binned_widget=MagicMock(),
         update_image=rec("draw_image"),
-        update_binned=rec("draw_binned"),
         update_plot=rec("draw_plot"),
         # IMAGE_VIEWER renders its raw panel via the payload path; the title is
         # set by render_display (no longer a side effect of a legacy draw).
@@ -1260,8 +1265,15 @@ def test_render_display_int2d_draws_all_panels():
         loaded_1d_keys={0}, loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
         method='Single', unit_changed=False, prev_overlaid_ids=(),
         raw_availability={0: dict(has_raw=True)}, titles={}, generation=1)
-    host.render_display(state, dl.build_payload(state))
-    assert "draw_plot" in calls and "draw_image" in calls and "draw_binned" in calls
+    # RAW_2D + CAKE_2D draw via the payload path (_draw_image_payload); PLOT_1D
+    # has no payload here so it falls through to the legacy update_plot.
+    payload = dl.DisplayPayload(
+        generation=1,
+        raw_image=dl.ImagePayload(image=np.ones((2, 2))),
+        cake_image=dl.ImagePayload(image=np.ones((2, 2))),
+        plot=None)
+    host.render_display(state, payload)
+    assert "draw_payload_image" in calls and "draw_plot" in calls
     assert "label_2d" in calls and "preview" in calls
     assert not any(c.startswith("clear_") for c in calls)
 

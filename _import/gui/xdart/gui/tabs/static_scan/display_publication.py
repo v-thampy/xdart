@@ -28,7 +28,10 @@ from .display_logic import (
     Trace,
     sentinel_mask,
     x_axis_for_unit,
+    convert_2d_radial,
+    is_gi_2d_units,
 )
+from .display_constants import AA_inv, Th, x_labels_2D, x_units_2D
 
 
 def _label_key(label: Any) -> Any:
@@ -249,6 +252,7 @@ class PublicationDisplayAdapter:
         count = 0
         axis_x = axis_y = None
         ref_view = None
+        ref_publication = None
         for label in state.render_ids:
             publication = self._items.get(_label_key(label))
             if (
@@ -265,6 +269,7 @@ class PublicationDisplayAdapter:
             if accum is None:
                 accum = data
                 ref_view = view
+                ref_publication = publication
                 axis_x = _image_axis_for_publication(view.axis_2d_x, fallback_label="x")
                 axis_y = _image_axis_for_publication(view.axis_2d_y, fallback_label="y")
             elif accum.shape == data.shape and _two_d_axes_match(ref_view, view):
@@ -293,7 +298,50 @@ class PublicationDisplayAdapter:
         )
         if image.size == 0 or not np.isfinite(image).any():
             return None
+        axis_x = self._apply_image_unit_2d(axis_x, ref_view, ref_publication)
         return ImagePayload(image=image, axis_x=axis_x, axis_y=axis_y)
+
+    def _apply_image_unit_2d(self, axis_x, ref_view, ref_publication):
+        """Apply the 2D-unit (imageUnit) Q↔2θ toggle to the cake radial axis,
+        exactly like the legacy ``get_xydata``.
+
+        Default ``Q-χ`` (or a 2θ axis under ``2θ-χ``) is a **no-op** — the
+        publication-derived axis is returned unchanged, so the normal cake
+        render is byte-identical to before.  Only a genuine unit difference
+        (e.g. ``2θ-χ`` selected over a Q-integrated cake) converts the radial
+        *values* and relabels, so the toggle works on every render instead of
+        only via the old direct ``update_binned`` redraw.  GI cakes are left
+        verbatim (their imageUnit combo is disabled)."""
+        widget = self._widget
+        if (widget is None or axis_x is None or axis_x.values is None
+                or ref_view is None):
+            return axis_x
+        data_unit = str(getattr(ref_view.axis_2d_x, "unit", "") or "")
+        az_unit = str(getattr(getattr(ref_view, "axis_2d_y", None), "unit", "") or "")
+        scan = getattr(widget, "scan", None)
+        if getattr(scan, "gi", False) or is_gi_2d_units(data_unit, az_unit):
+            return axis_x
+        try:
+            image_label = widget.ui.imageUnit.currentText()
+        except Exception:
+            return axis_x
+        want_tth = Th in image_label
+        want_q = AA_inv in image_label
+        have_tth = "2th" in data_unit
+        # Nothing to do when the selection already matches the data's unit.
+        if not ((want_tth and not have_tth) or (want_q and have_tth)):
+            return axis_x
+        try:
+            wavelength_m = widget._get_wavelength(
+                getattr(ref_publication, "raw_ref", None))
+        except Exception:
+            wavelength_m = None
+        new_values = convert_2d_radial(
+            axis_x.values, data_unit=data_unit,
+            want_tth=want_tth, want_q=want_q, wavelength_m=wavelength_m,
+        )
+        idx = 1 if want_tth else 0
+        return Axis(label=x_labels_2D[idx], unit=x_units_2D[idx], values=new_values)
 
     def plot_payload(self, state):
         # Overlay/Waterfall still use the legacy accumulator until the

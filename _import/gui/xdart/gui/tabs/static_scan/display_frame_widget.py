@@ -424,8 +424,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # has already happened.
         self.ui.shareAxis.toggled.connect(self._on_share_axis_toggled)
 
-        # 2D image controls
-        self.ui.imageUnit.activated.connect(self.update_binned)
+        # 2D image controls — the Q-χ / 2θ-χ toggle re-renders through the
+        # payload path (cake_image owns the on-the-fly Q↔2θ conversion now), so
+        # the cake unit is consistent on every render, not just this redraw.
+        self.ui.imageUnit.activated.connect(self.update)
         self.ui.imageUnit.activated.connect(self._update_slice_range)
 
         # 1D plot controls
@@ -671,7 +673,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 return self.clear_plot_view
             return self.update_plot
         if role is PanelRole.CAKE_2D:
-            return self.update_binned
+            # CAKE_2D renders solely from the payload (cake_image); a None cake
+            # payload blanks the panel — no legacy update_binned fallback.
+            return self.clear_binned_view
         return None
 
     def _clear_delegate(self, role):
@@ -1351,41 +1355,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._image_levels_override = None
 
         displayFrameWidget._set_raw_pixel_axes(self.image_widget)
-
-    def update_binned(self):
-        """Updates image plotted in image frame.
-
-        Note: when shareAxis is checked, the plotUnit sync and
-        update_plot() are already handled by the main display_update
-        flow before update_binned is called.  We only need to refresh
-        the view here (no data re-accumulation).
-        """
-        if self._apply_share_axis_state():
-            self.update_plot()
-
-        # Always aggregate from per-frame data_2d.  In Overall mode require
-        # every frame's 2D row to be present; otherwise a bounded cache would
-        # quietly average only the rows that happen to be loaded.
-        if self.overall and len(self.frame_ids) > 1:
-            intensity, xdata, ydata = self.get_frames_int_2d(
-                list(self.scan.frames.index), require_all=True,
-            )
-        else:
-            intensity, xdata, ydata = self.get_frames_int_2d()
-
-        if intensity is None:
-            self.clear_binned_view()
-            return
-
-        # Subtract background
-        if self.bkg_2d is not None:
-            intensity -= self.bkg_2d
-
-        rect = get_rect(xdata, ydata)
-        self.binned_data = (intensity, rect)
-        self.update_binned_view()
-
-        return
 
     def update_binned_view(self):
         data, rect = self.binned_data
