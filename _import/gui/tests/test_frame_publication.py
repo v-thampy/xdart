@@ -386,6 +386,30 @@ def test_cake_image_gi_ignores_imageunit_toggle():
         _cake_state(store, 13))
     assert cake is not None
     np.testing.assert_allclose(cake.axis_x.values, frame.int_2d.radial)   # verbatim
+
+
+def test_gi_cake_axis_unit_is_angstrom_not_raw_key():
+    # D1: the GI Q_ip/Q_oop cake axes show the unit Å⁻¹, not the raw integration
+    # key qip_A^-1 / qoop_A^-1.  The *label* (Q_ip/Q_oop) is unchanged.
+    from xdart.gui.tabs.static_scan.display_constants import AA_inv
+    frame = DuckFrame(idx=14)
+    frame.int_2d = IntegrationResult2D(
+        radial=np.linspace(0.0, 2.0, 4), azimuthal=np.linspace(0.0, 2.0, 3),
+        intensity=np.ones((4, 3)), unit="qip_A^-1", azimuthal_unit="qoop_A^-1")
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+
+    class _Widget:
+        scan = type("Scan", (), {"name": "scan", "gi": True, "global_mask": None})()
+        bkg_2d = 0
+        def normalize(self, data, metadata):
+            return np.asarray(data, dtype=float)
+
+    cake = PublicationDisplayAdapter(store, widget=_Widget()).cake_image(
+        _cake_state(store, 14))
+    assert cake is not None
+    assert cake.axis_x.label == "Q_ip" and cake.axis_x.unit == AA_inv
+    assert cake.axis_y.label == "Q_oop" and cake.axis_y.unit == AA_inv
     assert cake.axis_x.values.shape == (4,)
     assert cake.axis_y.values.shape == (3,)
 

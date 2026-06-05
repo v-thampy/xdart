@@ -31,7 +31,7 @@ from .display_logic import (
     convert_2d_radial,
     is_gi_2d_units,
 )
-from .display_constants import AA_inv, Th, x_labels_2D, x_units_2D
+from .display_constants import AA_inv, Deg, Th, x_labels_2D, x_units_2D
 
 
 def _label_key(label: Any) -> Any:
@@ -41,11 +41,28 @@ def _label_key(label: Any) -> Any:
         return label
 
 
+def _display_unit_symbol(unit) -> str:
+    """Axis-label display symbol for a raw integration-unit string.
+
+    The GI reciprocal-space units (``qip_A^-1`` / ``qoop_A^-1`` / ``qz_A^-1`` /
+    ``qtot_A^-1`` …) and any Å⁻¹ unit display as ``Å⁻¹``; angle units
+    (``chi_deg``, ``exit_angle_deg``) as ``°``.  Anything else passes through.
+    Fixes GI cake axes reading ``Q_ip (qip_A^-1)`` instead of ``Q_ip (Å⁻¹)`` —
+    the *label* (Q_ip/Q_oop) is right; only the unit string was the raw key.
+    Only reached for units ``x_axis_for_unit`` doesn't already resolve."""
+    u = str(unit or "").lower()
+    if "a^-1" in u or "angstrom" in u:
+        return AA_inv
+    if "deg" in u:
+        return Deg
+    return str(unit or "")
+
+
 def _axis_for_publication(axis) -> Axis:
     label, unit = x_axis_for_unit(getattr(axis, "unit", ""))
     if label == "x" and getattr(axis, "label", None):
         label = axis.label
-        unit = getattr(axis, "unit", "")
+        unit = _display_unit_symbol(getattr(axis, "unit", ""))
     return Axis(label=label, unit=unit)
 
 
@@ -55,7 +72,7 @@ def _image_axis_for_publication(axis, *, fallback_label: str) -> Axis:
     label, unit = x_axis_for_unit(getattr(axis, "unit", ""))
     if label == "x" and getattr(axis, "label", None):
         label = axis.label
-        unit = getattr(axis, "unit", "") or ""
+        unit = _display_unit_symbol(getattr(axis, "unit", "") or "")
     values = getattr(axis, "values", None)
     return Axis(label=label, unit=unit, values=None if values is None else np.asarray(values, dtype=float))
 
