@@ -164,14 +164,32 @@ def _freeze_gi_2d_ranges_from_result(args, result):
     return changed
 
 
-def _freeze_gi_1d_range_from_result(args, result):
-    """Freeze a missing GI 1D radial auto-range from one scout result."""
-    if args.get('radial_range') is not None:
+def _gi_1d_output_range_key(gi_mode_1d):
+    """Which integration range param controls the 1D *output* axis for a GI
+    mode (gid maps radial_range→ip_range, azimuth_range→oop_range):
+
+      * q / q_ip          → output in-plane     → ``radial_range``
+      * q_oop / exit_angle → output out-of-plane → ``azimuth_range``
+
+    Freezing the wrong one leaves the output axis auto-ranging per incidence
+    angle, so it drifts across an angle scan → non-uniform stack / 'settings
+    changed during append'.  Default (q_total etc.) freezes ``radial_range``."""
+    return ('azimuth_range'
+            if gi_mode_1d in ('q_oop', 'exit_angle')
+            else 'radial_range')
+
+
+def _freeze_gi_1d_range_from_result(args, result, gi_mode_1d=None):
+    """Freeze the missing GI 1D *output-axis* range from one scout result so all
+    frames share one axis.  Picks radial_range vs azimuth_range by mode (see
+    :func:`_gi_1d_output_range_key`)."""
+    key = _gi_1d_output_range_key(gi_mode_1d)
+    if args.get(key) is not None:
         return False
-    radial_range = _padded_axis_range(getattr(result, 'radial', None))
-    if radial_range is None:
+    rng = _padded_axis_range(getattr(result, 'radial', None))
+    if rng is None:
         return False
-    args['radial_range'] = radial_range
+    args[key] = rng
     return True
 
 
@@ -895,7 +913,10 @@ class imageThread(wranglerThread):
         if not self.gi or not pending:
             return
         args = getattr(scan, 'bai_1d_args', None)
-        if not isinstance(args, dict) or args.get('radial_range') is not None:
+        if not isinstance(args, dict):
+            return
+        gi_mode_1d = args.get('gi_mode_1d', 'q_total')
+        if args.get(_gi_1d_output_range_key(gi_mode_1d)) is not None:
             return
 
         img_file, img_number, img_data, img_meta, bg_raw, _ = pending[0]
@@ -926,10 +947,12 @@ class imageThread(wranglerThread):
                 **dict(args),
             )
             result = getattr(scratch, 'int_1d', None)
-            if result is not None and _freeze_gi_1d_range_from_result(args, result):
+            if result is not None and _freeze_gi_1d_range_from_result(
+                    args, result, gi_mode_1d):
                 logger.debug(
-                    'GI 1D auto radial range frozen from scout frame %s: %s',
-                    img_number, args.get('radial_range'),
+                    'GI 1D auto output range frozen from scout frame %s '
+                    '(mode=%s): %s', img_number, gi_mode_1d,
+                    args.get(_gi_1d_output_range_key(gi_mode_1d)),
                 )
         except IncidenceAngleUnresolved as exc:
             self.showLabel.emit(

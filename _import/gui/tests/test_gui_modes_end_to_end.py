@@ -280,7 +280,22 @@ def test_image_widget_colorbar_limits_nan_aware(qapp):
         qapp.processEvents()
 
 
-def test_image_widget_linear_levels_are_2_95_percentile(qapp):
+def test_gi_1d_output_range_key_by_mode():
+    """The GI 1D freeze must lock the range param that controls the *output*
+    axis: q/q_ip → radial_range (ip), q_oop/exit_angle → azimuth_range (oop).
+    Freezing radial_range for the oop/exit modes left their output axis drifting
+    per incidence angle across an angle scan -> non-uniform 1D stack."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        _gi_1d_output_range_key,
+    )
+    assert _gi_1d_output_range_key('q_oop') == 'azimuth_range'
+    assert _gi_1d_output_range_key('exit_angle') == 'azimuth_range'
+    assert _gi_1d_output_range_key('q_ip') == 'radial_range'
+    assert _gi_1d_output_range_key('q_total') == 'radial_range'
+    assert _gi_1d_output_range_key('q') == 'radial_range'
+
+
+def test_image_widget_linear_levels_are_2_98_percentile(qapp):
     # R2-4: the Linear autoscale clips harder than the old (1, 99) so saturated
     # tiff pixels don't wash the image out.  Shared raw/cake/waterfall widget.
     from xdart.gui.widgets import pgImageWidget
@@ -289,7 +304,7 @@ def test_image_widget_linear_levels_are_2_95_percentile(qapp):
         img = np.arange(100, dtype=float).reshape(10, 10)
         w.setImage(img, scale="Linear", cmap="viridis")
         lo, hi = w.imageItem.levels
-        expected = np.nanpercentile(img, (2, 95))
+        expected = np.nanpercentile(img, (2, 98))
         assert np.isclose(lo, expected[0]) and np.isclose(hi, expected[1])
     finally:
         w.deleteLater()
