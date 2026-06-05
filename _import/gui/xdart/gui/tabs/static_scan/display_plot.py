@@ -27,6 +27,93 @@ from .display_logic import plan_overlay, OverlayAction
 logger = logging.getLogger(__name__)
 
 
+def _as_plot_rows(ydata):
+    ydata = np.asarray(ydata, dtype=float)
+    if ydata.ndim == 1:
+        ydata = ydata[np.newaxis, :]
+    return ydata
+
+
+def _reinterp_plot_row(src_x, src_y, dst_x):
+    """Interpolate one plot row onto ``dst_x``, NaN outside source range."""
+    if np.size(src_x) == 0 or np.size(dst_x) == 0:
+        return np.full(np.shape(dst_x), np.nan)
+    out = np.interp(dst_x, src_x, src_y)
+    out[dst_x < src_x[0]] = np.nan
+    out[dst_x > src_x[-1]] = np.nan
+    return out
+
+
+def update_plot_accumulator(
+    prev_plot_data,
+    prev_names,
+    prev_ids,
+    new_x,
+    new_y,
+    new_names,
+    new_ids,
+    method,
+    unit_changed,
+):
+    """Pure Overlay/Waterfall plot accumulator transform.
+
+    The widget owns all persistent state and passes it in.  This function only
+    computes the next ``plot_data`` / ``frame_names`` / ``overlaid_idxs`` tuple.
+    """
+    new_x = np.asarray(new_x, dtype=float)
+    new_y = _as_plot_rows(new_y)
+    names = list(prev_names or [])
+    ids = [int(i) for i in (prev_ids or [])]
+
+    overlay_action, _ = plan_overlay(
+        method, unit_changed,
+        has_existing=len(ids) > 0,
+        new_ids=tuple(int(i) for i in new_ids),
+        prev_overlaid_ids=tuple(ids),
+    )
+
+    if overlay_action is OverlayAction.REBUILD:
+        return [new_x, new_y], list(new_names), [int(i) for i in new_ids]
+
+    if overlay_action is not OverlayAction.APPEND:
+        return [new_x, new_y], list(new_names), [int(i) for i in new_ids]
+
+    prev_x, prev_y = prev_plot_data
+    prev_x = np.asarray(prev_x, dtype=float)
+    prev_y = _as_plot_rows(prev_y)
+    plot_data = [prev_x, prev_y]
+
+    for idx, frame_name, row in zip(new_ids, new_names, new_y):
+        if frame_name in names:
+            continue
+        # Skip an empty-grid incoming frame: it carries no usable x axis and
+        # would poison the accumulator.
+        if np.size(new_x) == 0:
+            continue
+        old_x = np.asarray(plot_data[0], dtype=float)
+        if np.size(old_x) == 0:
+            # Preserve the legacy behavior: the incoming frame seeds the array
+            # while existing names/ids remain in the caller-owned history.
+            plot_data = [new_x, row[np.newaxis, :]]
+        elif old_x.shape == new_x.shape and np.allclose(old_x, new_x):
+            old_y = _as_plot_rows(plot_data[1])
+            plot_data[1] = np.vstack((old_y, row))
+        else:
+            merged_x = np.union1d(old_x, new_x)
+            merged_x.sort()
+            old_y = _as_plot_rows(plot_data[1])
+            new_old = np.array([
+                _reinterp_plot_row(old_x, r, merged_x)
+                for r in old_y
+            ])
+            new_row = _reinterp_plot_row(new_x, row, merged_x)
+            plot_data = [merged_x, np.vstack((new_old, new_row))]
+        names.append(frame_name)
+        ids.append(int(idx))
+
+    return plot_data, names, ids
+
+
 class DisplayPlotMixin:
     """Mixin providing 1D plot, waterfall, slice overlay, and mouse helpers.
 
@@ -199,73 +286,66 @@ class DisplayPlotMixin:
             rebuild_idxs = list(self.overlaid_idxs)
             y_new, x_new = self.get_frames_int_1d(rebuild_idxs)
             if x_new is not None and y_new is not None:
-                if self.bkg_1d is not None:
-                    y_new = y_new - self.bkg_1d
-                if y_new.ndim == 1:
-                    y_new = y_new[np.newaxis, :]
-                self.plot_data = [x_new, y_new]
+                y_new = self.apply_plot_background(y_new)
                 kept, kept_names = self._loaded_1d_overlay_labels(
                     rebuild_idxs, max_rows=y_new.shape[0],
                 )
-                self.overlaid_idxs = kept
-                self.frame_names = kept_names
+                self.plot_data, self.frame_names, self.overlaid_idxs = (
+                    update_plot_accumulator(
+                        self.plot_data,
+                        self.frame_names,
+                        self.overlaid_idxs,
+                        x_new,
+                        y_new,
+                        kept_names,
+                        kept,
+                        current_method,
+                        unit_changed,
+                    )
+                )
             else:
-                self.plot_data = [xdata, ydata]
-                self.frame_names = list(frame_names)
-                self.overlaid_idxs = list(self.idxs_1d)
+                self.plot_data, self.frame_names, self.overlaid_idxs = (
+                    update_plot_accumulator(
+                        self.plot_data,
+                        self.frame_names,
+                        self.overlaid_idxs,
+                        xdata,
+                        ydata,
+                        frame_names,
+                        self.idxs_1d,
+                        current_method,
+                        unit_changed,
+                    )
+                )
         elif overlay_action is OverlayAction.APPEND:
-            def _reinterp(src_x, src_y, dst_x):
-                """Interpolate src onto dst, NaN outside range.
-
-                Returns an all-NaN row when either grid is empty: a fast
-                overlay/waterfall batch can hand us an empty ``src_x`` (a
-                frame whose 1D wasn't loaded yet / a cache miss), and
-                ``np.interp`` raises ``ValueError: array of sample points
-                is empty`` while ``src_x[0]``/``src_x[-1]`` would IndexError
-                — that crash aborted the whole render, so the completed
-                trace set never painted ("not all traces plotted").
-                """
-                if np.size(src_x) == 0 or np.size(dst_x) == 0:
-                    return np.full(np.shape(dst_x), np.nan)
-                out = np.interp(dst_x, src_x, src_y)
-                out[dst_x < src_x[0]] = np.nan
-                out[dst_x > src_x[-1]] = np.nan
-                return out
-
-            for idx, frame_name, row in zip(self.idxs_1d, frame_names, ydata):
-                if frame_name in self.frame_names:
-                    continue
-                # Skip an empty-grid incoming frame: it carries no usable x
-                # axis and would poison the accumulator.
-                if np.size(xdata) == 0:
-                    continue
-                old_x = self.plot_data[0]
-                if np.size(old_x) == 0:
-                    # Empty accumulator — seed it with this frame as the
-                    # fresh grid rather than interpolating onto an empty x.
-                    self.plot_data = [xdata, row[np.newaxis, :]]
-                elif old_x.shape == xdata.shape and np.allclose(old_x, xdata):
-                    # Same grid — just append
-                    self.plot_data[1] = np.vstack((self.plot_data[1], row))
-                else:
-                    # Different grid — merge and interpolate.
-                    merged_x = np.union1d(old_x, xdata)
-                    merged_x.sort()
-                    old_y = self.plot_data[1]
-                    if old_y.ndim == 1:
-                        old_y = old_y[np.newaxis, :]
-                    new_old = np.array([_reinterp(old_x, r, merged_x)
-                                        for r in old_y])
-                    new_row = _reinterp(xdata, row, merged_x)
-                    self.plot_data = [merged_x,
-                                      np.vstack((new_old, new_row))]
-                self.frame_names.append(frame_name)
-                self.overlaid_idxs.append(int(idx))
+            self.plot_data, self.frame_names, self.overlaid_idxs = (
+                update_plot_accumulator(
+                    self.plot_data,
+                    self.frame_names,
+                    self.overlaid_idxs,
+                    xdata,
+                    ydata,
+                    frame_names,
+                    self.idxs_1d,
+                    current_method,
+                    unit_changed,
+                )
+            )
         else:
             # Fresh start: Single/Sum/Average, unit changed, or no existing data
-            self.plot_data = [xdata, ydata]
-            self.frame_names = list(frame_names)
-            self.overlaid_idxs = list(self.idxs_1d)
+            self.plot_data, self.frame_names, self.overlaid_idxs = (
+                update_plot_accumulator(
+                    self.plot_data,
+                    self.frame_names,
+                    self.overlaid_idxs,
+                    xdata,
+                    ydata,
+                    frame_names,
+                    self.idxs_1d,
+                    current_method,
+                    unit_changed,
+                )
+            )
 
         xdata, ydata = self.plot_data
         if not self.compute_plot_range(xdata, ydata):

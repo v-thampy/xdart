@@ -19,7 +19,10 @@ from xdart.gui.tabs.static_scan.display_data import (
     available_norm_channels,
 )
 from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
-from xdart.gui.tabs.static_scan.display_plot import DisplayPlotMixin
+from xdart.gui.tabs.static_scan.display_plot import (
+    DisplayPlotMixin,
+    update_plot_accumulator,
+)
 from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
 
@@ -2603,6 +2606,89 @@ def _plot_host(method="Overlay"):
     ):
         setattr(host, name, MethodType(getattr(DisplayPlotMixin, name), host))
     return host
+
+
+def test_update_plot_accumulator_replaces_for_single_sum_average():
+    out, names, ids = update_plot_accumulator(
+        [np.array([99.0]), np.array([[99.0]])],
+        ["old"],
+        [99],
+        np.array([0.0, 1.0]),
+        np.array([[1.0, 2.0], [3.0, 4.0]]),
+        ["scan_1", "scan_2"],
+        [1, 2],
+        "Average",
+        False,
+    )
+
+    np.testing.assert_allclose(out[0], [0.0, 1.0])
+    np.testing.assert_allclose(out[1], [[1.0, 2.0], [3.0, 4.0]])
+    assert names == ["scan_1", "scan_2"]
+    assert ids == [1, 2]
+
+
+def test_update_plot_accumulator_appends_skips_duplicates_and_merges_grids():
+    out, names, ids = update_plot_accumulator(
+        [np.array([0.0, 1.0]), np.array([[1.0, 2.0]])],
+        ["scan_1"],
+        [1],
+        np.array([0.5, 1.5]),
+        np.array([[10.0, 20.0], [30.0, 40.0]]),
+        ["scan_1", "scan_2"],
+        [1, 2],
+        "Overlay",
+        False,
+    )
+
+    np.testing.assert_allclose(out[0], [0.0, 0.5, 1.0, 1.5])
+    np.testing.assert_allclose(
+        out[1],
+        [
+            [1.0, 1.5, 2.0, np.nan],
+            [np.nan, 30.0, 35.0, 40.0],
+        ],
+        equal_nan=True,
+    )
+    assert names == ["scan_1", "scan_2"]
+    assert ids == [1, 2]
+
+
+def test_update_plot_accumulator_rebuilds_on_unit_change():
+    out, names, ids = update_plot_accumulator(
+        [np.array([0.0, 1.0]), np.array([[1.0, 2.0]])],
+        ["scan_1"],
+        [1],
+        np.array([10.0, 11.0]),
+        np.array([[5.0, 6.0]]),
+        ["scan_1"],
+        [1],
+        "Waterfall",
+        True,
+    )
+
+    np.testing.assert_allclose(out[0], [10.0, 11.0])
+    np.testing.assert_allclose(out[1], [[5.0, 6.0]])
+    assert names == ["scan_1"]
+    assert ids == [1]
+
+
+def test_update_plot_accumulator_skips_empty_incoming_grid():
+    out, names, ids = update_plot_accumulator(
+        [np.array([0.0, 1.0]), np.array([[1.0, 2.0]])],
+        ["scan_1"],
+        [1],
+        np.array([]),
+        np.zeros((1, 0)),
+        ["scan_2"],
+        [2],
+        "Overlay",
+        False,
+    )
+
+    np.testing.assert_allclose(out[0], [0.0, 1.0])
+    np.testing.assert_allclose(out[1], [[1.0, 2.0]])
+    assert names == ["scan_1"]
+    assert ids == [1]
 
 
 def test_overlay_unit_switch_rebuilds_all_accumulated_curves():
