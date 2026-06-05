@@ -1074,3 +1074,31 @@ def test_plot_method_change_autoranges_view(widget):
     df._on_plotMethod_changed()                    # triggers re-render + autorange
     vx = df.plot.viewRange()[0]
     assert vx[0] < 50.0                            # refit to the Q data (~0.5..3)
+
+
+# ── R2-1: slice X-Range label = complementary 2D axis, refreshed on change ──
+
+def test_slice_range_label_tracks_plotunit_and_mode(widget):
+    from xdart.gui.tabs.static_scan.display_constants import Chi
+    df = widget.displayframe
+    df.viewer_mode = None
+
+    # GI qip/qoop: a 2D-derived plotUnit slices over the *complementary* axis
+    # (Q_ip -> Q_oop), so the label is a GI reciprocal axis, never χ.
+    df.scan = SimpleNamespace(
+        gi=True, skip_2d=False,
+        bai_1d_args={"gi_mode_1d": "q_total", "unit": "q_A^-1"},
+        bai_2d_args={"gi_mode_2d": "qip_qoop"})
+    df.set_axes()
+    gi_idx = next(i for i, info in enumerate(df._plot_axis_info)
+                  if info["source"] == "2d")
+    df.ui.plotUnit.setCurrentIndex(gi_idx)
+    df._on_plotUnit_changed()
+    assert df.ui.slice.text().endswith("Range")
+    assert Chi not in df.ui.slice.text()           # GI axis, not χ
+
+    # GI -> non-GI: set_axes rebuilds (plotUnit Q over a Q-χ cake) and the label
+    # must refresh to "χ Range" immediately — not stay the stale GI label.
+    df.scan.gi = False
+    df.set_axes()
+    assert Chi in df.ui.slice.text()               # refreshed, no click needed

@@ -1243,6 +1243,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.clear_slice_overlay()
         self._sync_slice_controls()
 
+        # R2-1: refresh the X-Range label + bounds to the *complementary* 2D
+        # axis for this plotUnit (read from _plot_axis_info[idx].slice_axis —
+        # Q_ip→Q_oop, Q→χ), driven from here so it tracks plotUnit AND mode/GI
+        # changes (set_axes ends by calling this) — not lazily on first click.
+        self._set_slice_range()
+
         # Share Axis is keyed to the cake x-axis unit, not the currently
         # selected plotUnit row.  That lets it switch a χ plot back to Q/2θ/qip
         # when possible, and disables only when no matching 1D axis exists.
