@@ -1062,9 +1062,9 @@ class H5Viewer(QWidget):
                 continue
 
             # xdart XYE exports encode the integration unit in the prefix
-            # (iq → q_A^-1, itth → 2th_deg); other files are 'unknown' and
-            # are labelled plain 'x' downstream, never an assumed 2θ.  Stage 4:
-            # single source of truth is the pure xye_unit_from_filename.
+            # (iq → q_A^-1, itth → 2th_deg); unprefixed files default to Q,
+            # never an assumed 2θ.  The single source of truth is the pure
+            # xye_unit_from_filename.
             unit = xye_unit_from_filename(fpath)
 
             int_1d = IntegrationResult1D(

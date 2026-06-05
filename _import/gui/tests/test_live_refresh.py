@@ -2844,7 +2844,7 @@ def test_xye_axis_label_uses_file_unit_not_hidden_transform_combo():
     )
 
 
-def test_xye_loader_marks_unknown_units_without_guessing(monkeypatch, tmp_path):
+def test_xye_loader_defaults_unprefixed_files_to_q(monkeypatch, tmp_path):
     import xdart.gui.tabs.static_scan.h5viewer as h5viewer_mod
 
     monkeypatch.setattr(
@@ -2881,7 +2881,7 @@ def test_xye_loader_marks_unknown_units_without_guessing(monkeypatch, tmp_path):
 
     assert viewer.data_1d[1].int_1d.unit == "q_A^-1"
     assert viewer.data_1d[2].int_1d.unit == "2th_deg"
-    assert viewer.data_1d[3].int_1d.unit == "unknown"
+    assert viewer.data_1d[3].int_1d.unit == "q_A^-1"
 
 
 def test_standard_plot_axis_defaults_to_integrated_2theta_unit():

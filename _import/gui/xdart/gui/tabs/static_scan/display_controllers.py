@@ -230,8 +230,8 @@ def _xye_plot_payload(widget, state):
 
     One trace per selected frame (``render_ids``, in order — XYE is
     multi-select); the x-axis label/unit come from the *first* file's name
-    prefix (``xye_unit_from_filename`` -> ``x_axis_for_unit``, so an UNKNOWN
-    prefix labels the axis plain ``x``, never an assumed 2θ), y-axis
+    prefix (``xye_unit_from_filename`` -> ``x_axis_for_unit``; unprefixed files
+    default to Q, never an assumed 2θ), y-axis
     ``Intensity``; each trace labelled by its filename.  Returns ``None`` (-> the
     renderer clears the plot) on an empty selection or when no selected frame has
     1D data.
