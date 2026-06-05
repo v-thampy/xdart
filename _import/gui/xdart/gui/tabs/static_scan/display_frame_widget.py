@@ -1040,9 +1040,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         Geometry (panel heights/widths/visibility + the raw-preview button) is
         owned by :meth:`_apply_layout`; this method keeps only the control-state
         bits the geometry table deliberately does not own: the 2D-only controls
-        (Share Axis, 2D unit, X-Range slice), the slice uncheck, and removing
-        pure-2D entries (like χ) from the plotUnit combo so the user cannot
-        select them in 1D-only mode.
+        (Share Axis, 2D unit, X-Range slice), the slice uncheck, and rebuilding
+        the plotUnit combo for the mode (``set_axes`` is skip-aware, so Int 1D
+        omits the 2D-derived axes outright — no post-hoc removal).
         """
         # In viewer mode, set_viewer_display_mode() controls panels
         if self.viewer_mode is not None:
@@ -1055,27 +1055,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if self.ui.slice.isChecked():
                 self.ui.slice.setChecked(False)
             self._set_2d_controls_visible(False)
-
-            # Remove pure-2D entries from plotUnit (e.g. χ)
-            self.ui.plotUnit.blockSignals(True)
-            i = 0
-            while i < self.ui.plotUnit.count():
-                if i < len(self._plot_axis_info):
-                    info = self._plot_axis_info[i]
-                    if info['source'] == '2d':
-                        self.ui.plotUnit.removeItem(i)
-                        self._plot_axis_info.pop(i)
-                        continue
-                i += 1
-            self.ui.plotUnit.blockSignals(False)
-            self._was_skip_2d = True
         else:
             self._set_2d_controls_visible(True)
-            # Only rebuild plotUnit when transitioning from 1D-only mode,
-            # otherwise preserve the user's current plotUnit selection.
-            if self._was_skip_2d:
-                self.set_axes()
-                self._was_skip_2d = False
+        # Rebuild the plotUnit combo only on a 1D-only<->2D *transition* (so the
+        # user's current selection is preserved on every other render).
+        # ``set_axes`` is skip-aware: Int 1D drops the 2D-derived axes, Int 2D
+        # restores them.
+        if skip != self._was_skip_2d:
+            self.set_axes()
+            self._was_skip_2d = skip
 
     # ── Axis configuration ────────────────────────────────────────
 
@@ -1104,6 +1092,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.imageUnit.clear()
         self._plot_axis_info = []
         target_plot_idx = 0
+
+        # Int 1D (skip_2d) has no cake, so a 2D-derived axis (χ, or the GI
+        # Q_ip/Q_oop reciprocal axes) can't be sliced from anything — offering it
+        # would plot nothing.  Build the combo skip-aware: in Int 1D include only
+        # axes computable from the 1D result ('1d' / '1d_2d'), excluding every
+        # 'source'=='2d' entry.  Int 2D keeps them all.  This replaces the old
+        # add-then-remove dance in _apply_1d_only_visibility (one source of truth).
+        skip = getattr(self.scan, 'skip_2d', False)
 
         if self.scan.gi:
             gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
@@ -1143,15 +1139,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                         'source': '1d', 'slice_axis': None, 'axis': None,
                     })
 
-            # --- 2D-derived axes ---
-            if radial_label != label_1d:
+            # --- 2D-derived axes (Int 2D only; sliced from the cake) ---
+            if not skip and radial_label != label_1d:
                 self.ui.plotUnit.addItem(_translate("Form", radial_label))
                 self._plot_axis_info.append({
                     'source': '2d', 'slice_axis': azimuthal_label,
                     'axis': 'radial',
                 })
 
-            if azimuthal_label != label_1d and azimuthal_label != radial_label:
+            if (not skip and azimuthal_label != label_1d
+                    and azimuthal_label != radial_label):
                 self.ui.plotUnit.addItem(_translate("Form", azimuthal_label))
                 self._plot_axis_info.append({
                     'source': '2d', 'slice_axis': radial_label,
@@ -1175,13 +1172,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     'slice_axis': f'{Chi} ({Deg})',
                     'axis': 'radial',
                 })
-            # χ is derived from 2D
-            self.ui.plotUnit.addItem(_translate("Form", plotUnits[2]))
-            self._plot_axis_info.append({
-                'source': '2d',
-                'slice_axis': None,  # determined dynamically by imageUnit
-                'axis': 'azimuthal',
-            })
+            # χ is derived from 2D (Int 2D only — no cake to slice in Int 1D)
+            if not skip:
+                self.ui.plotUnit.addItem(_translate("Form", plotUnits[2]))
+                self._plot_axis_info.append({
+                    'source': '2d',
+                    'slice_axis': None,  # determined dynamically by imageUnit
+                    'axis': 'azimuthal',
+                })
 
             for label in imageUnits:
                 self.ui.imageUnit.addItem(_translate("Form", label))

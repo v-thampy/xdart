@@ -763,3 +763,63 @@ def test_int2d_cake_clears_without_publication(widget):
     w.publication_store.clear()                     # data_2d kept, publications gone
     df.update()
     assert df.binned_data is None                   # cake blanked, not stale
+
+
+# ── plotUnit combo: Int 1D must not offer 2D-derived axes (step 4-2 fold-in) ──
+#
+# set_axes is skip_2d-aware: Int 1D offers only axes computable from the 1D
+# result (source '1d' / '1d_2d'); the 2D-derived axes (χ non-GI; the GI
+# Q_ip/Q_oop reciprocal axes) appear only in Int 2D, where they slice the cake.
+
+def _plotunit_sources(df):
+    return [info["source"] for info in df._plot_axis_info]
+
+
+def test_int1d_plotunit_excludes_chi(widget):
+    df = widget.displayframe
+    df.scan = SimpleNamespace(gi=False, skip_2d=False,
+                              bai_1d_args={"unit": "q_A^-1"}, bai_2d_args={})
+    df.set_axes()                                   # Int 2D
+    assert "2d" in _plotunit_sources(df)            # χ is 2D-derived
+    n_int2d = df.ui.plotUnit.count()                # Q, 2θ, χ
+    assert n_int2d == 3
+
+    df.scan.skip_2d = True
+    df.set_axes()                                   # Int 1D
+    assert "2d" not in _plotunit_sources(df)        # χ dropped
+    assert df.ui.plotUnit.count() == 2              # Q, 2θ only
+
+
+def test_int1d_gi_plotunit_excludes_reciprocal_axes(widget):
+    df = widget.displayframe
+    df.scan = SimpleNamespace(
+        gi=True, skip_2d=False,
+        bai_1d_args={"gi_mode_1d": "q_total", "unit": "q_A^-1"},
+        bai_2d_args={"gi_mode_2d": "qip_qoop"})
+    df.set_axes()                                   # Int 2D (GI)
+    assert "2d" in _plotunit_sources(df)            # Q_ip / Q_oop present
+
+    df.scan.skip_2d = True
+    df.set_axes()                                   # Int 1D (GI)
+    assert "2d" not in _plotunit_sources(df)        # reciprocal axes dropped
+    assert df.ui.plotUnit.count() == 2              # q_total, 2θ only
+
+
+def test_int_mode_transition_rebuilds_plotunit(widget):
+    df = widget.displayframe
+    df.viewer_mode = None
+    df.scan = SimpleNamespace(gi=False, skip_2d=False,
+                              bai_1d_args={"unit": "q_A^-1"}, bai_2d_args={})
+    df._was_skip_2d = False
+    df.set_axes()
+    assert df.ui.plotUnit.count() == 3              # Int 2D: Q, 2θ, χ
+
+    df.scan.skip_2d = True
+    df._apply_1d_only_visibility()                  # -> Int 1D
+    assert df.ui.plotUnit.count() == 2              # χ dropped on transition
+    assert "2d" not in _plotunit_sources(df)
+
+    df.scan.skip_2d = False
+    df._apply_1d_only_visibility()                  # -> Int 2D
+    assert df.ui.plotUnit.count() == 3              # restored
+    assert "2d" in _plotunit_sources(df)
