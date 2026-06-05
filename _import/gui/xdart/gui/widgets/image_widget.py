@@ -185,7 +185,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             # Linear autoscale: clip the top/bottom a bit harder than the old
             # (1, 99) so saturated tiff pixels don't wash the image out (R2-4).
             # Shared by the raw / cake / waterfall panels.  Log/Sqrt unchanged.
-            levels = np.nanpercentile(self.displayed_image, (2, 95))
+            levels = np.nanpercentile(self.displayed_image, (2, 98))
             self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
 
             self.histogram.axis.setLogMode(False)
