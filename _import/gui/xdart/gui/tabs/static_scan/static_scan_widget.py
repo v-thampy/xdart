@@ -948,8 +948,13 @@ class staticWidget(QWidget):
             gi: bool, flag for determining if in Grazing incidence
         """
         self.scan.gi = gi
+        # Update the integration-panel options now (the next run integrates in
+        # the new geometry).  Do NOT rebuild the *display* axis combos here (C1):
+        # the displayed plot is still the old-mode data, so switching the
+        # plotUnit/imageUnit combos to GI/non-GI axes immediately is misleading.
+        # The display combos rebuild via new_scan -> set_axes once a run actually
+        # produces plots in the new mode.
         self.integratorTree.set_image_units()
-        self.displayframe.set_axes()
 
     def new_frame(self, frame_data):
         """Connected to sigUpdateFile from wrangler. Called when a new

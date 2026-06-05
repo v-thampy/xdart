@@ -920,3 +920,23 @@ def test_integration_controls_enabled_per_mode(widget):
     # Back to Int 2D restores everything.
     _mode("Int 2D")
     assert iu.frame1D.isEnabled() and iu.frame2D.isEnabled()
+
+
+# ── C1: Grazing toggle defers the DISPLAY combo rebuild until a run ─────────
+
+def test_grazing_toggle_defers_display_combo_rebuild(widget):
+    w = widget
+    df = w.displayframe
+    df.scan = w.scan
+    w.scan.gi = False
+    df.set_axes()                                  # non-GI display combos
+    before = [df.ui.plotUnit.itemText(i) for i in range(df.ui.plotUnit.count())]
+    assert before                                  # has Q / 2θ / χ
+
+    # Toggle Grazing on: integration state + integrator panel update now, but
+    # the display plotUnit combo must NOT switch to GI axes yet (the plot is
+    # still old-mode data).
+    w.update_scattering_geometry(True)
+    after = [df.ui.plotUnit.itemText(i) for i in range(df.ui.plotUnit.count())]
+    assert after == before                         # display combo unchanged
+    assert w.scan.gi is True                        # integration state updated
