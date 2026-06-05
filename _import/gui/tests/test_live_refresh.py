@@ -1088,7 +1088,10 @@ def _update_smoke_host():
         update_binned=rec("draw_binned"),
         update_plot=rec("draw_plot"),
         update_plot_view=rec("payload_plot"),
-        _update_image_viewer=rec("draw_viewer_image"),
+        # IMAGE_VIEWER now renders its raw panel through the payload path
+        # (_draw_image_payload), not a legacy _update_image_viewer delegate.
+        _draw_image_payload=lambda *a, **k: calls.append("draw_payload_image") or True,
+        _set_viewer_title=rec("viewer_title"),
         _update_xye_viewer=rec("draw_viewer_xye"),
         clear_image_view=rec("clear_image"),
         clear_binned_view=rec("clear_binned"),
@@ -1136,7 +1139,7 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     host.viewer_mode = 'image'
     host._bump_display_generation()
     host.update()
-    assert "draw_viewer_image" in calls
+    assert "draw_payload_image" in calls      # raw drawn via the payload path
     assert "clear_plot" in calls and "clear_binned" in calls
     assert "label_2d" not in calls           # viewer owns its own title
 
@@ -1220,7 +1223,10 @@ def _render_host():
         update_image=rec("draw_image"),
         update_binned=rec("draw_binned"),
         update_plot=rec("draw_plot"),
-        _update_image_viewer=rec("draw_viewer_image"),
+        # IMAGE_VIEWER renders its raw panel via the payload path; the title is
+        # set by render_display (no longer a side effect of a legacy draw).
+        _draw_image_payload=lambda *a, **k: calls.append("draw_payload_image") or True,
+        _set_viewer_title=rec("viewer_title"),
         _update_xye_viewer=rec("draw_viewer_xye"),
         clear_image_view=rec("clear_image"),
         clear_binned_view=rec("clear_binned"),
@@ -1353,11 +1359,30 @@ def test_render_display_image_viewer_draws_raw_clears_others():
         loaded_1d_keys=set(), loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
         method='Single', unit_changed=False, prev_overlaid_ids=(),
         raw_availability={0: dict(has_raw=True)}, titles={}, generation=1)
-    host.render_display(state, dl.build_payload(state))
-    assert "draw_viewer_image" in calls         # RAW_2D via the viewer method
+    payload = dl.DisplayPayload(
+        generation=1,
+        raw_image=dl.ImagePayload(image=np.ones((2, 2))),
+        cake_image=None, plot=None)
+    host.render_display(state, payload)
+    assert "draw_payload_image" in calls        # RAW_2D via the payload path
     assert "clear_binned" in calls and "clear_plot" in calls  # absent panels blanked
     assert "label_2d" not in calls              # viewer sets its own title
-    assert "draw_image" not in calls
+    assert "viewer_title" in calls              # render_display set the title
+    assert "draw_image" not in calls            # not the Int-mode raw delegate
+
+
+def test_render_display_image_viewer_none_payload_clears_raw():
+    # A None raw payload (no frame / no map_raw / all-non-finite) must blank the
+    # Image Viewer's raw panel — there is no legacy fallback draw.
+    host, calls, dl = _render_host()
+    state = dl.compute_display_state(
+        mode=dl.Mode.IMAGE_VIEWER, selected_ids=(0,), all_frame_index=[],
+        loaded_1d_keys=set(), loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
+        method='Single', unit_changed=False, prev_overlaid_ids=(),
+        raw_availability={0: dict(has_raw=True)}, titles={}, generation=1)
+    host.render_display(state, dl.build_payload(state))   # store=None -> raw None
+    assert "clear_image" in calls               # raw panel blanked, not drawn
+    assert "draw_payload_image" not in calls and "draw_image" not in calls
 
 
 def test_render_display_drops_stale_generation():
@@ -2241,89 +2266,89 @@ def test_metadata_panel_nexus_viewer_uses_selected_row_not_scan_table():
     win.close()
 
 
-def test_image_viewer_missing_raw_and_thumbnail_clears_panel():
-    calls = []
+# ── ImageViewerController.build_payload (Stage 4/5 step 2): the raw-preview
+# semantics now live in the pure helper _image_viewer_raw_payload, replacing
+# the deleted legacy _update_image_viewer.  A None payload tells render to clear.
+
+def _img_state(render_ids):
+    """Minimal DisplayState stand-in: the helper reads only ``render_ids``."""
+    return SimpleNamespace(render_ids=tuple(render_ids), generation=1)
+
+
+def test_image_viewer_missing_raw_and_thumbnail_yields_no_payload():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
     host = SimpleNamespace(
-        idxs_2d=[1],
         data_lock=RLock(),
         data_2d={1: {"map_raw": None, "thumbnail": None}},
-        _wrangler=None,
-        clear_image_view=lambda: calls.append("clear"),
+        _viewer_is_xdart=False,
     )
-
-    displayFrameWidget._update_image_viewer(host)
-
-    assert calls == ["clear"]
+    assert _image_viewer_raw_payload(host, _img_state([1])) is None
 
 
-def test_image_viewer_all_sentinel_image_clears_safely():
-    calls = []
+def test_image_viewer_no_selection_yields_no_payload():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
+    host = SimpleNamespace(data_lock=RLock(), data_2d={}, _viewer_is_xdart=False)
+    assert _image_viewer_raw_payload(host, _img_state([])) is None
+
+
+def test_image_viewer_all_sentinel_image_yields_no_payload():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
     host = SimpleNamespace(
-        idxs_2d=[1],
         data_lock=RLock(),
         data_2d={1: {"map_raw": np.full((2, 2), 4294967295.0),
                      "thumbnail": None}},
-        _wrangler=None,
-        clear_image_view=lambda: calls.append("clear"),
-        _set_viewer_title=lambda idxs: calls.append(("title", tuple(idxs))),
-        _sanitize_display_image=DisplayDataMixin._sanitize_display_image,
+        _viewer_is_xdart=False,
     )
-
-    displayFrameWidget._update_image_viewer(host)
-
-    assert calls == [("title", (1,)), "clear"]
+    # All sentinel -> standalone fill leaves no finite pixel -> blank (None).
+    assert _image_viewer_raw_payload(host, _img_state([1])) is None
 
 
 def test_image_viewer_standalone_uint16_ceiling_stays_raw_and_finite():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
     raw = np.array([[10.0, 65535.0], [20.0, 30.0]])
     host = SimpleNamespace(
-        idxs_2d=[1],
         data_lock=RLock(),
         data_2d={1: {"map_raw": raw, "thumbnail": None}},
-        _wrangler=None,
         _viewer_is_xdart=False,
-        clear_image_view=lambda: None,
-        _set_viewer_title=lambda idxs: None,
-        _sanitize_display_image=DisplayDataMixin._sanitize_display_image,
-        update_image_view=lambda: None,
     )
+    payload = _image_viewer_raw_payload(host, _img_state([1]))
+    assert payload is not None
+    # uint16 ceiling is a real count for a standalone file (not a NaN mask).
+    assert np.isnan(payload.image).sum() == 0
+    assert np.nanmax(payload.image) == 65535.0
 
-    displayFrameWidget._update_image_viewer(host)
 
-    assert np.isnan(host.image_data[0]).sum() == 0
-    assert np.nanmax(host.image_data[0]) == 65535.0
-
-
-def test_image_viewer_standalone_ignores_processing_mask_and_threshold():
+def test_image_viewer_payload_applies_no_mask_background_or_normalization():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
     raw = np.array([[1.0, 2.0], [3.0, 4.0]])
-    widget = _FakeImageWidget()
     host = SimpleNamespace(
-        idxs_2d=[1],
         data_lock=RLock(),
         data_2d={1: {"map_raw": raw, "thumbnail": None}},
         _viewer_is_xdart=False,
+        # A wrangler threshold/mask + a background + a monitor that the raw
+        # browser must all IGNORE (it shows detector counts, not a processed
+        # frame).  None of these may alter the payload pixels.
         _wrangler=SimpleNamespace(
-            apply_threshold=True,
-            threshold_min=2,
-            threshold_max=3,
-            mask_file="/definitely/not/a/raw-viewer-mask.edf",
-        ),
-        clear_image_view=lambda: None,
-        _set_viewer_title=lambda idxs: None,
-        _sanitize_display_image=DisplayDataMixin._sanitize_display_image,
-        image_widget=widget,
-        scale="Linear",
-        cmap="Default",
+            apply_threshold=True, threshold_min=2, threshold_max=3,
+            mask_file="/definitely/not/a/raw-viewer-mask.edf"),
+        bkg_map_raw=np.array([[10.0, 10.0], [10.0, 10.0]]),
+        normalize=lambda data, metadata: np.asarray(data, dtype=float) / 250.0,
     )
-    host.update_image_view = MethodType(displayFrameWidget.update_image_view, host)
-
-    displayFrameWidget._update_image_viewer(host)
-
-    assert np.isfinite(host.image_data[0]).all()
-    np.testing.assert_allclose(np.sort(host.image_data[0].ravel()), [1, 2, 3, 4])
-    assert widget.imageItem.levels == (2.0, 3.0)
-    assert widget.histogram.levels == (2.0, 3.0)
-    assert widget.histogram.visible is True
+    payload = _image_viewer_raw_payload(host, _img_state([1]))
+    assert payload is not None
+    # Values preserved exactly (only orientation flipped) — no mask applied, no
+    # background subtracted, not divided by the monitor.
+    np.testing.assert_allclose(np.sort(payload.image.ravel()), [1, 2, 3, 4])
 
 
 def test_available_norm_channels_filters_present_case_insensitive_aliases():
@@ -2370,22 +2395,18 @@ def test_empty_image_clear_hides_colorbar_without_zero_paint():
 
 
 def test_processed_image_viewer_keeps_baked_nan_mask_visible():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
     raw = np.array([[10.0, np.nan], [20.0, 30.0]])
     host = SimpleNamespace(
-        idxs_2d=[1],
         data_lock=RLock(),
         data_2d={1: {"map_raw": raw, "thumbnail": None}},
-        _wrangler=None,
         _viewer_is_xdart=True,
-        clear_image_view=lambda: None,
-        _set_viewer_title=lambda idxs: None,
-        _sanitize_display_image=DisplayDataMixin._sanitize_display_image,
-        update_image_view=lambda: None,
     )
-
-    displayFrameWidget._update_image_viewer(host)
-
-    assert np.isnan(host.image_data[0]).sum() == 1
+    payload = _image_viewer_raw_payload(host, _img_state([1]))
+    assert payload is not None
+    assert np.isnan(payload.image).sum() == 1       # baked mask preserved
 
 
 def test_image_viewer_raw_pixel_axes_are_not_si_scaled():

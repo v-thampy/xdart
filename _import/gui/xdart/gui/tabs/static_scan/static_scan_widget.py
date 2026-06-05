@@ -678,9 +678,9 @@ class staticWidget(QWidget):
             # Propagate the Image-Viewer file classification from the H5Viewer
             # (which classifies on file select) to the display widget (which
             # renders).  Without this, displayframe._viewer_is_xdart is always
-            # False, so _update_image_viewer takes the *standalone* branch even
-            # for processed xdart .nxs frames and fills their baked NaN mask
-            # (the inverse of the intended behaviour).
+            # False, so the Image Viewer's raw-preview payload takes the
+            # *standalone* branch even for processed xdart .nxs frames and fills
+            # their baked NaN mask (the inverse of the intended behaviour).
             self.displayframe._viewer_is_xdart = getattr(
                 self.h5viewer, '_viewer_is_xdart', False)
             self.displayframe.update()

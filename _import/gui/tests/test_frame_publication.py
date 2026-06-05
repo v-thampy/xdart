@@ -477,29 +477,22 @@ def test_publication_cake_background_transposes_legacy_pyfai_background():
     np.testing.assert_allclose(cake.image, np.zeros((3, 4)))
 
 
-def test_image_viewer_raw_image_defers_to_legacy_path():
-    """The Image Viewer is a raw detector-file browser, rendered by the
-    widget's legacy ``_update_image_viewer`` (standalone sentinel-fill vs
-    processed-xdart NaN-preserve, viewer display levels, and NO processing
-    mask / background / monitor normalization).  The publication adapter must
-    therefore NOT build the Image Viewer's raw panel: doing so re-applies
-    normalization + background, and when that yields a non-finite/unviewable
-    array ``_draw_image_payload`` blanks the panel and reports success, so the
-    legacy fallback never runs — the viewer goes blank (the reproducible
-    Int 1D (XYE) → Image Viewer failure, where the run leaves normalization /
-    Set-Background state on the widget).  ``raw_image`` returns ``None`` for
-    IMAGE_VIEWER regardless of store contents.  The actual raw render is
-    covered end-to-end in ``test_gui_modes_end_to_end.py``."""
-    frame = DuckFrame(idx=1)
-    # A non-trivial monitor + background: on the old publication path these
-    # normalized / subtracted the raw image (here harmlessly, but in the field
-    # they blanked it).  The adapter must ignore them for the Image Viewer.
-    frame.scan_info = {"monitor": 250.0}
-    frame.map_raw = np.array([[1.0, 65535.0], [3.0, 4.0]])
-    frame.mask = np.array([0, 1, 2, 3])
-    store = PublicationStore()
-    store.upsert(publication_from_live_frame(frame))
-    _, _, raw_avail = publication_availability(store)
+def test_image_viewer_controller_owns_raw_preview_not_the_adapter():
+    """The Image Viewer is a raw detector-file browser: ``ImageViewerController``
+    builds its raw panel directly from the selected frame's stored detector
+    array, applying NO processing mask, background subtraction or monitor
+    normalization.  The publication adapter (which re-applies those, for the
+    integration views) must not be the Image Viewer's source — routing the
+    viewer through it blanked the panel after an Int 1D (XYE) run left
+    normalization / Set-Background state on the widget.  The render is covered
+    end-to-end in ``test_gui_modes_end_to_end.py``."""
+    from threading import RLock
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        ImageViewerController,
+    )
+    from xdart.gui.tabs.static_scan.display_logic import ImagePayload
+
+    raw = np.array([[1.0, 65535.0], [3.0, 4.0]])     # uint16 ceiling, no NaN
     state = compute_display_state(
         mode=Mode.IMAGE_VIEWER,
         selected_ids=(1,),
@@ -511,18 +504,30 @@ def test_image_viewer_raw_image_defers_to_legacy_path():
         method="Single",
         unit_changed=False,
         prev_overlaid_ids=(),
-        raw_availability=raw_avail,
+        raw_availability={1: {"has_raw": True, "has_thumbnail": False}},
         titles={},
-        generation=store.generation,
+        generation=7,
     )
 
     class _Widget:
-        _viewer_is_xdart = False
+        _viewer_is_xdart = False                      # standalone detector file
+        data_lock = RLock()
+        data_2d = {1: {"map_raw": raw, "thumbnail": None}}
+        # A monitor/background that MUST be ignored by the raw browser.
         bkg_map_raw = np.array([[10.0, 10.0], [10.0, 10.0]])
 
         def normalize(self, data, metadata):
             return np.asarray(data, dtype=float) / 250.0
 
-    raw = PublicationDisplayAdapter(store, widget=_Widget()).raw_image(state)
+    payload = ImageViewerController().build_payload(_Widget(), state)
 
-    assert raw is None
+    assert payload.generation == 7
+    assert payload.cake_image is None and payload.plot is None
+    assert isinstance(payload.raw_image, ImagePayload)
+    img = payload.raw_image.image
+    # Standalone uint16 ceiling kept (not NaN-masked), finite, and NOT divided
+    # by the monitor / background-subtracted.
+    assert np.isfinite(img).all()
+    assert np.nanmax(img) == 65535.0
+    np.testing.assert_allclose(np.sort(img.ravel()), [1, 3, 4, 65535])
+    assert payload.raw_image.axis_x.unit == "Pixels"

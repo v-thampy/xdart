@@ -659,8 +659,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # only.  These collapse into mode controllers in Stage 5.
     def _draw_delegate(self, role, mode):
         if role is PanelRole.RAW_2D:
-            return (self._update_image_viewer if mode is Mode.IMAGE_VIEWER
-                    else self.update_image)
+            if mode is Mode.IMAGE_VIEWER:
+                # The Image Viewer renders solely from its payload
+                # (``ImageViewerController.build_payload``).  A ``None`` raw
+                # payload — no frame, no map_raw/thumbnail, or an all-non-finite
+                # array — means blank the panel; there is no legacy fallback.
+                return self.clear_image_view
+            return self.update_image
         if role is PanelRole.PLOT_1D:
             return (self._update_xye_viewer if mode is Mode.XYE_VIEWER
                     else self.update_plot)
@@ -779,12 +784,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
         widget.setRect(rect)
         displayFrameWidget._set_image_widget_colorbar_visible(widget, True)
-        if role is PanelRole.RAW_2D and (
-                state is not None and state.mode is Mode.IMAGE_VIEWER):
-            displayFrameWidget._apply_image_levels(
-                widget,
-                displayFrameWidget._viewer_display_levels(self),
-            )
+        # Levels come from pgImageWidget.update_image's nanpercentile autoscale
+        # (the (1,99) Linear default), for the Image Viewer exactly as for the
+        # Int 2D raw/cake panels.  The wrangler Intensity Threshold is an
+        # integration mask parameter, NOT a colour scale, so it must not set
+        # display levels here (coupling it to vmin/vmax washed the image out).
         widget.image_plot.setLabel(
             "bottom", payload.axis_x.label, units=payload.axis_x.unit,
         )
@@ -949,6 +953,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 and state.load_status is LoadStatus.READY):
             self.update_2d_label()
             self._update_image_preview()
+        # The Image Viewer title (filename / ``Filename #N``) used to be a side
+        # effect of the legacy ``_update_image_viewer`` draw; now that the mode
+        # renders from its payload, set it here for the selected frame.
+        elif mode is Mode.IMAGE_VIEWER and state.load_status is LoadStatus.READY:
+            self._set_viewer_title(list(state.render_ids))
         return True
 
     def update_views(self):
@@ -1604,20 +1613,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             except Exception:
                 logger.debug("image colorbar level update failed", exc_info=True)
 
-    def _viewer_display_levels(self):
-        """Return optional Image Viewer display vmin/vmax from the controls."""
-        w = getattr(self, "_wrangler", None)
-        if w is None or not getattr(w, "apply_threshold", False):
-            return None
-        try:
-            lo = float(getattr(w, "threshold_min", None))
-            hi = float(getattr(w, "threshold_max", None))
-        except (TypeError, ValueError):
-            return None
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-            return None
-        return lo, hi
-
     def clear_image_view(self):
         """Blank the raw 2D image panel."""
         try:
@@ -1830,60 +1825,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.plot.setLabel('left', 'Intensity')
 
         self.update_plot_view()
-
-    def _update_image_viewer(self):
-        """Render raw image data in viewer mode.
-
-        Standalone detector files are displayed as raw previews: no current
-        processing mask file is applied, and threshold min/max only set display
-        color levels. Processed xdart frames keep any mask that is already
-        baked into the stored raw or thumbnail data.
-        """
-        if len(self.idxs_2d) == 0:
-            self._image_levels_override = None
-            self.clear_image_view()
-            return
-        # O8: snapshot under data_lock so a concurrent writer can't
-        # evict the key between the lookup and the read.
-        with self.data_lock:
-            frame_2d = self.data_2d.get(self.idxs_2d[0])
-        if frame_2d is None:
-            self._image_levels_override = None
-            self.clear_image_view()
-            return
-        # The detector array may not be hydrated yet (the loader publishes a
-        # thumbnail-backed preview first, then the full frame), or it may have
-        # been evicted from the bounded raw cache.  Fall back to the stored
-        # thumbnail rather than crashing on ``np.asarray(None)`` (blank panel).
-        raw = frame_2d.get('map_raw')
-        if raw is None:
-            raw = frame_2d.get('thumbnail')
-        if raw is None:
-            self._image_levels_override = None
-            self.clear_image_view()
-            return
-        if getattr(self, '_viewer_is_xdart', False):
-            data = self._sanitize_display_image(raw)
-        else:
-            data = displayFrameWidget._standalone_viewer_image(raw)
-
-        if data.size == 0 or not np.isfinite(data).any():
-            self._set_viewer_title(self.idxs_2d)
-            self._image_levels_override = None
-            self.clear_image_view()
-            return
-
-        data = data.T[:, ::-1]
-        rect = get_rect(np.arange(data.shape[0]), np.arange(data.shape[1]))
-        self.image_data = (data, rect)
-        # Display levels = the nanpercentile autoscale from pgImageWidget.update_image
-        # (identical to the Int 2D raw/cake panels).  Do NOT use the wrangler
-        # Intensity Threshold (Min/Max) as the display range: it is an *integration*
-        # mask parameter, not a color scale, and coupling it to vmin/vmax washed the
-        # image out (a 0-1000 threshold flattening counts that actually span ~0-60).
-        self._image_levels_override = None
-        self._set_viewer_title(self.idxs_2d)
-        self.update_image_view()
 
     @staticmethod
     def _truncate_name(name, limit=100, head=48, tail=48):

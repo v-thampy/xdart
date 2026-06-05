@@ -199,21 +199,14 @@ class PublicationDisplayAdapter:
         }
 
     def raw_image(self, state):
-        # The Image Viewer is a raw detector-file browser.  Its raw panel is
-        # rendered by the legacy ``_update_image_viewer`` path, which is the
-        # single source of truth for raw previews: standalone sentinel-fill vs
-        # processed-xdart NaN-preserve (P0/S2), viewer-specific display levels,
-        # and — crucially — NO processing mask, background subtraction, or
-        # monitor normalization (a raw browser shows detector counts).  The
-        # publication adapter below re-applies normalization/background, which
-        # is wrong for a raw browser and competes with that path: when the
-        # result is non-finite or unviewable, ``_draw_image_payload`` blanks
-        # the panel and returns success, so the legacy fallback never runs —
-        # the Image Viewer goes blank (notably after an Int 1D (XYE) run leaves
-        # normalization/background/Set-Bkg state on the widget).  Defer to the
-        # legacy path entirely for the Image Viewer.
-        if state.mode is Mode.IMAGE_VIEWER:
-            return None
+        # Resolves the raw detector panel for the *integration* views (the
+        # Int 2D raw image).  The Image Viewer does NOT use this path: it is a
+        # raw detector-file browser that applies NO processing mask, background
+        # subtraction or monitor normalization, so ``ImageViewerController``
+        # owns its raw-preview payload directly (``_image_viewer_raw_payload``).
+        # Routing the Image Viewer through here re-applied normalization +
+        # background and, when that yielded a non-finite array, blanked the
+        # panel (the reproducible Int 1D (XYE) -> Image Viewer blank).
         panel = state.panel(PanelRole.RAW_2D)
         if panel is None or not panel.has_data:
             return None
@@ -227,16 +220,11 @@ class PublicationDisplayAdapter:
             data, source = self._raw_array(publication, panel.source)
             if data is None:
                 continue
-            image_viewer = state.mode is Mode.IMAGE_VIEWER
-            viewer_is_xdart = bool(getattr(self._widget, "_viewer_is_xdart", False))
-            if image_viewer and not viewer_is_xdart:
-                data = _standalone_viewer_image(data)
-            else:
-                data = sentinel_mask(data)
+            data = sentinel_mask(data)
             if data.ndim != 2:
                 continue
             bg = getattr(publication.raw_ref, "bg_raw", 0)
-            if source is RawSource.RAW and not image_viewer:
+            if source is RawSource.RAW:
                 data = self._apply_detector_mask(data, publication)
                 data = self._subtract_if_shape_matches(data, bg, "raw frame background")
             data = self._normalize(data, publication.metadata_raw)

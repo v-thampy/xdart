@@ -95,11 +95,10 @@ def test_image_viewer_processed_nxs_preserves_baked_mask(widget):
     w.h5viewer._viewer_is_xdart = True
     w.displayframe._viewer_is_xdart = False
 
-    w.set_data()
+    w.set_data()                       # propagates classification + renders
 
     assert w.displayframe._viewer_is_xdart is True       # P0 propagation
-    w.displayframe._update_image_viewer()
-    img = w.displayframe.image_data[0]
+    img = w.displayframe.image_data[0]                   # rendered via the payload
     assert img is not None
     assert np.isnan(img).any()                            # mask preserved
 
@@ -114,11 +113,10 @@ def test_image_viewer_standalone_fills_sentinels(widget):
     raw[2, 3] = np.nan
     _set_image_frame(w, 0, raw)
     w.h5viewer._viewer_is_xdart = False
-    w.set_data()
+    w.set_data()                       # propagates classification + renders
 
     assert w.displayframe._viewer_is_xdart is False
-    w.displayframe._update_image_viewer()
-    img = w.displayframe.image_data[0]
+    img = w.displayframe.image_data[0]                   # rendered via the payload
     assert img is not None
     assert np.isfinite(img).all()                         # sentinel filled
 
@@ -138,9 +136,8 @@ def test_xye_to_image_transition_renders(widget):
     raw = np.arange(36, dtype=float).reshape(6, 6)
     _set_image_frame(w, 0, raw)
     w.h5viewer._viewer_is_xdart = False
-    w.set_data()
-    w.displayframe._update_image_viewer()
-    img = w.displayframe.image_data[0]
+    w.set_data()                       # propagates classification + renders
+    img = w.displayframe.image_data[0]                   # rendered via the payload
     assert img is not None and img.size > 0 and np.isfinite(img).any()
 
 
@@ -225,11 +222,40 @@ def test_image_viewer_uses_percentile_not_wrangler_threshold(widget):
     raw = np.arange(36, dtype=float).reshape(6, 6)     # data spans 0..35
     _set_image_frame(w, 0, raw)
     w.h5viewer._viewer_is_xdart = False
-    w.set_data()
-    df._update_image_viewer()
+    w.set_data()                       # renders through the payload path
     lo, hi = df.image_widget.imageItem.levels
     # Percentile of 0..35 (~0.4..34.6), NOT the 1000 threshold ceiling.
     assert hi < 100.0
+
+
+def test_image_viewer_all_nonfinite_payload_clears_panel_and_colorbar(widget):
+    """An all-non-finite frame yields a None raw payload, so the Image Viewer
+    must blank the image AND hide the colorbar — never a zero placeholder."""
+    w = widget
+    w._on_viewer_mode_changed("image")
+    df = w.displayframe
+    raw = np.full((6, 6), np.nan)                  # xdart frame, all masked
+    _set_image_frame(w, 0, raw)
+    w.h5viewer._viewer_is_xdart = True             # preserve NaN -> all-non-finite
+    w.set_data()                                   # renders through the payload path
+
+    assert df.image_data is None                   # cleared, not (zeros, rect)
+    assert df.image_widget.raw_image.size == 0     # no zero placeholder painted
+    assert df.image_widget.histogram.isVisible() is False    # colorbar hidden
+
+
+def test_image_viewer_no_selection_clears_panel(widget):
+    """With nothing selected the Image Viewer renders an explicit blank."""
+    w = widget
+    w._on_viewer_mode_changed("image")
+    df = w.displayframe
+    with w.data_lock:
+        w.data_1d.clear()
+        w.data_2d.clear()
+    w.frame_ids[:] = []
+    df.idxs_2d = []
+    df.update()
+    assert df.image_data is None
 
 
 def test_image_widget_colorbar_limits_nan_aware(qapp):
@@ -265,8 +291,7 @@ def _load_image_through_wire(w, path):
     w._on_viewer_mode_changed("image")
     w.h5viewer.dirname = str(Path(path).parent)
     w.h5viewer._load_image_file(str(path))
-    w.set_data()                       # propagates classification + renders
-    w.displayframe._update_image_viewer()
+    w.set_data()                       # propagates classification + renders via payload
     return w.displayframe.image_data
 
 

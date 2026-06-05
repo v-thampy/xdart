@@ -37,10 +37,12 @@ from .display_logic import (
     compute_display_state,
     build_payload,
     register_controller,
+    sentinel_mask,
 )
 from .display_publication import (
     PublicationDisplayAdapter,
     publication_availability,
+    _standalone_viewer_image,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,6 +77,54 @@ def _data_snapshot(widget):
             loaded_2d.update(pub_2d)
             raw_avail.update(pub_raw)
     return loaded_1d, loaded_2d, raw_avail
+
+
+def _image_viewer_raw_payload(widget, state):
+    """Build the Image Viewer's raw-preview :class:`ImagePayload` (or ``None``).
+
+    Mirrors the raw-browser semantics exactly (the behavior just fixed and
+    verified in the GUI):
+
+    * source: the selected frame's ``map_raw`` from ``data_2d``, falling back
+      to its dequantized ``thumbnail`` when the full array isn't hydrated;
+    * standalone files (``_viewer_is_xdart`` False): fill non-finite + the
+      uint32 ceiling sentinel with the low finite value, **no** NaN mask;
+    * processed-xdart files (``_viewer_is_xdart`` True): keep the baked NaN
+      mask (``sentinel_mask``);
+    * single-select — only ``render_ids[0]`` is shown (no overlay/accumulate);
+    * **no** processing mask file, background subtraction or normalization.
+
+    Returns ``None`` (→ the renderer clears the panel) when there is no
+    selected frame, no ``map_raw``/``thumbnail``, or the sanitized array has no
+    finite pixels.  The array is pre-flipped (``[::-1, :]``) because the
+    renderer transposes every ``ImagePayload``; combined that reproduces the
+    legacy ``data.T[:, ::-1]`` detector orientation, with ``Pixels`` axes.
+    """
+    if not state.render_ids:
+        return None
+    idx = int(state.render_ids[0])
+    with widget.data_lock:
+        frame_2d = widget.data_2d.get(idx)
+    if frame_2d is None:
+        return None
+    raw = frame_2d.get('map_raw')
+    if raw is None:
+        raw = frame_2d.get('thumbnail')
+    if raw is None:
+        return None
+    if getattr(widget, '_viewer_is_xdart', False):
+        data = sentinel_mask(raw)               # preserve baked NaN mask
+    else:
+        data = _standalone_viewer_image(raw)    # fill sentinels, no mask
+    data = np.asarray(data, dtype=float)
+    if data.ndim != 2 or data.size == 0 or not np.isfinite(data).any():
+        return None
+    image = data[::-1, :]
+    return ImagePayload(
+        image=image,
+        axis_x=Axis("x", "Pixels", values=np.arange(image.shape[1])),
+        axis_y=Axis("y", "Pixels", values=np.arange(image.shape[0])),
+    )
 
 
 class _BaseController:
@@ -152,6 +202,24 @@ class ImageViewerController(_BaseController):
         0-based index."""
         from ssrl_xrd_tools.io import load_image_frame
         return load_image_frame(path, frame_idx)
+
+    # ── raw-preview payload (Stage 4/5 step 2) ─────────────────────────
+    def build_payload(self, widget, state):
+        """Produce the Image Viewer's raw-preview payload directly.
+
+        The Image Viewer is a raw detector-file browser, so its single panel
+        is a ``RAW_2D`` :class:`ImagePayload` built straight from the selected
+        frame's stored detector array — with NO processing mask, background
+        subtraction or monitor normalization (those are integration concerns).
+        This is the one render path for the mode; there is no fallback to a
+        legacy ``_update_image_viewer``.
+        """
+        return DisplayPayload(
+            generation=state.generation,
+            raw_image=_image_viewer_raw_payload(widget, state),
+            cake_image=None,
+            plot=None,
+        )
 
 
 class XYEViewerController(_BaseController):
