@@ -2484,8 +2484,9 @@ def test_real_eiger_preview_masks_sentinels_for_display():
         def height(self):
             return 500
 
+    from xdart.gui.tabs.static_scan.display_logic import standalone_viewer_image
     raw = np.asarray(read_image(path, frame=0), dtype=float)
-    data = displayFrameWidget._standalone_viewer_image(raw).T[:, ::-1]
+    data = standalone_viewer_image(raw).T[:, ::-1]
 
     preview = _downsample_for_display(data, _Widget())
 

@@ -1440,46 +1440,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             except Exception:
                 logger.debug("raw pixel axis scale update failed", exc_info=True)
 
-    @staticmethod
-    def _fill_invalid_viewer_pixels(data, invalid_mask=None):
-        """Fill invalid raw-viewer pixels with the image's low finite value."""
-        arr = np.asarray(data, dtype=float)
-        bad = ~np.isfinite(arr)
-        if invalid_mask is not None:
-            try:
-                bad = bad | np.asarray(invalid_mask, dtype=bool)
-            except ValueError:
-                logger.debug("viewer invalid mask shape mismatch", exc_info=True)
-        if not bad.any():
-            return arr
-        valid = np.isfinite(arr) & ~bad
-        if not valid.any():
-            out = arr.astype(float, copy=True)
-            out[...] = np.nan
-            return out
-        out = arr.copy()
-        out[bad] = float(np.nanmin(arr[valid]))
-        return out
-
-    @staticmethod
-    def _neutralize_viewer_nan_image(data):
-        """Fill raw-viewer NaNs with a low finite value."""
-        return displayFrameWidget._fill_invalid_viewer_pixels(data)
-
-    @staticmethod
-    def _standalone_viewer_image(data):
-        """Prepare a standalone detector-file preview without applying masks.
-
-        Image Viewer is a raw inspection mode. It should not inherit the
-        processing mask/threshold settings from the right-hand controls, and it
-        should not convert normal uint16 ceiling values into a visible NaN mask.
-        Only true non-finite values and the Eiger uint32 ceiling sentinel are
-        filled in this display-only copy so autoscale remains sane.
-        """
-        arr = np.asarray(data, dtype=float)
-        invalid = ~np.isfinite(arr) | (arr >= 4294967295.0)
-        return displayFrameWidget._fill_invalid_viewer_pixels(arr, invalid)
-
     def update_2d_label(self):
         """Updates 2D Label
         """
