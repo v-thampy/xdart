@@ -225,35 +225,21 @@ class ImageViewerController(_BaseController):
         )
 
 
-def _xye_accumulated_traces(widget, ref_x):
-    """Reconstruct the Overlay/Waterfall curves already on the widget as
-    :class:`Trace`s, so a fresh render can keep them (the legacy
-    ``_update_xye_viewer`` sticky accumulation).
-
-    Only valid when the existing grid matches ``ref_x`` in shape (the legacy
-    guard); otherwise nothing carries over.
-    """
-    px = np.asarray(widget.plot_data[0], dtype=float)
-    if px.size == 0 or px.shape != ref_x.shape:
-        return []
-    py = np.atleast_2d(np.asarray(widget.plot_data[1], dtype=float))
-    out = []
-    for name, row in zip(widget.frame_names, py):
-        out.append(Trace(str(name), px, np.asarray(row, dtype=float)))
-    return out
-
-
 def _xye_plot_payload(widget, state):
     """Build the XYE viewer's :class:`PlotPayload` (or ``None``).
 
-    Reproduces ``_update_xye_viewer`` verbatim: one trace per selected frame
-    (``render_ids``, in order — XYE is multi-select); the x-axis label/unit come
-    from the *first* file's name prefix (``xye_unit_from_filename`` ->
-    ``x_axis_for_unit``, so an UNKNOWN prefix labels the axis plain ``x``, never
-    an assumed 2θ), y-axis ``Intensity``; each trace labelled by its filename;
-    and the Overlay/Waterfall sticky accumulation (keep already-drawn curves,
-    de-duped by name).  Returns ``None`` (-> the renderer clears the plot) on an
-    empty selection or when no selected frame has 1D data.
+    One trace per selected frame (``render_ids``, in order — XYE is
+    multi-select); the x-axis label/unit come from the *first* file's name
+    prefix (``xye_unit_from_filename`` -> ``x_axis_for_unit``, so an UNKNOWN
+    prefix labels the axis plain ``x``, never an assumed 2θ), y-axis
+    ``Intensity``; each trace labelled by its filename.  Returns ``None`` (-> the
+    renderer clears the plot) on an empty selection or when no selected frame has
+    1D data.
+
+    selection == shown: the payload renders exactly the selected frames, so
+    deselecting a file removes its curve immediately.  ``plotMethod``
+    (Single/Overlay/Waterfall/Sum/Average) still controls *how* the selected
+    curves are drawn; there is no lingering-after-deselect accumulation.
     """
     render_ids = []
     for i in state.render_ids:
@@ -295,7 +281,6 @@ def _xye_plot_payload(widget, state):
     first_int = getattr(first, 'int_1d', None) if first is not None else None
     if first_int is None:
         return None
-    ref_x = np.asarray(first_int.radial, dtype=float)
 
     traces = []
     for i in render_ids:
@@ -312,18 +297,6 @@ def _xye_plot_payload(widget, state):
         ))
     if not traces:
         return None
-
-    # Overlay / Waterfall: keep the already-accumulated curves (de-dup by name),
-    # matching _update_xye_viewer.  Single / Sum / Average build fresh.
-    try:
-        method = widget.ui.plotMethod.currentText()
-    except Exception:
-        method = 'Single'
-    if method in ('Overlay', 'Waterfall'):
-        existing = _xye_accumulated_traces(widget, ref_x)
-        if existing:
-            have = {t.label for t in existing}
-            traces = existing + [t for t in traces if t.label not in have]
 
     return PlotPayload(
         axis_x=Axis(xlabel, xunits),

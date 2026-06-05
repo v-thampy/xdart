@@ -1062,9 +1062,12 @@ class staticWidget(QWidget):
             # In viewer mode, disable New/Save (keep Open Folder and Export)
             self.h5viewer.actionNewFile.setEnabled(not is_viewer)
             self.h5viewer.actionSaveDataAs.setEnabled(not is_viewer)
-            # XYE viewer: allow multi-select for overlay; others: single select
+            # XYE viewer: modifier-free multi-select for overlay — a plain click
+            # toggles a row and leaves the others, so the user builds/trims the
+            # overlay one file at a time with no shift/ctrl, and the plot shows
+            # exactly the selected files.  Others: single select.
             if viewer_mode == 'xye':
-                scans.setSelectionMode(QAbstractItemView.ExtendedSelection)
+                scans.setSelectionMode(QAbstractItemView.MultiSelection)
             else:
                 scans.setSelectionMode(QAbstractItemView.SingleSelection)
             # Configure display panels for the viewer mode

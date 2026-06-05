@@ -630,6 +630,21 @@ class H5Viewer(QWidget):
         lw = self.ui.listScans
         was_blocked = lw.blockSignals(True)
         try:
+            # XYE overlay is built by modifier-free multi-select; during a live
+            # run new .xye files keep arriving and repopulate this list.  Capture
+            # the current selection by name so we can restore it after the
+            # rebuild — otherwise the overlay resets every time a file is written
+            # (the crux of the real-time compare/track workflow).
+            preserve_selection = self.viewer_mode == 'xye'
+            selected_names = (
+                {item.text() for item in lw.selectedItems()}
+                if preserve_selection else set()
+            )
+            current_name = (
+                lw.currentItem().text()
+                if preserve_selection and lw.currentItem() is not None else None
+            )
+
             lw.clear()
             lw.addItem('..')
 
@@ -653,6 +668,16 @@ class H5Viewer(QWidget):
                         # Normal mode: only HDF5/NeXus scan files
                         if name.split('.')[-1] in ('h5', 'hdf5', 'nxs'):
                             lw.addItem(name)
+
+            # Restore the prior multi-selection by name (signals stay blocked, so
+            # this doesn't re-trigger a load — the already-loaded curves remain).
+            if selected_names:
+                for row in range(lw.count()):
+                    item = lw.item(row)
+                    if item.text() in selected_names:
+                        item.setSelected(True)
+                    if item.text() == current_name:
+                        lw.setCurrentItem(item, QItemSelectionModel.NoUpdate)
         finally:
             lw.blockSignals(was_blocked)
 

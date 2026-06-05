@@ -537,10 +537,9 @@ def test_xye_viewer_empty_selection_clears_plot(widget):
     assert len(df.curves) == 0
 
 
-def test_xye_viewer_overlay_keeps_deselected_curve(widget):
-    # Behavior-preserving: Overlay/Waterfall is *sticky* — a curve stays drawn
-    # after its file is deselected (legacy _update_xye_viewer accumulation),
-    # until Single/Sum/Average or Clear resets it.
+def test_xye_viewer_selection_equals_shown_deselect_removes_curve(widget):
+    # selection == shown: in Overlay the plot draws exactly the selected files,
+    # so deselecting one removes its curve immediately (no lingering).
     w = widget
     w._on_viewer_mode_changed("xye")
     df = w.displayframe
@@ -551,10 +550,46 @@ def test_xye_viewer_overlay_keeps_deselected_curve(widget):
     ])
     df.update()
     assert set(df.frame_names) == {"iq_a.xye", "iq_b.xye"}
-    # Deselect b: only a is selected now, but Overlay keeps b on screen.
+    # Deselect b: only a is selected now -> only a is drawn (b's curve is gone).
     _set_xye_frames(w, [(0, "iq_a.xye", np.arange(5.0), np.ones(5))])
     df.update()
-    assert set(df.frame_names) == {"iq_a.xye", "iq_b.xye"}     # b retained
+    assert df.frame_names == ["iq_a.xye"]
+    assert df.plot_data[1].shape[0] == 1
+
+
+def test_xye_viewer_mode_uses_multiselection(widget):
+    from PySide6.QtWidgets import QAbstractItemView
+    w = widget
+    w._on_viewer_mode_changed("xye")
+    assert (w.h5viewer.ui.listScans.selectionMode()
+            == QAbstractItemView.MultiSelection)
+    # Image/NeXus stay single-select.
+    w._on_viewer_mode_changed("image")
+    assert (w.h5viewer.ui.listScans.selectionMode()
+            == QAbstractItemView.SingleSelection)
+
+
+def test_xye_live_refresh_preserves_multiselection(tmp_path, widget):
+    # Real-time use case: as new .xye files arrive and the scans list
+    # repopulates, the user's current multi-selection must survive the rebuild.
+    w = widget
+    (tmp_path / "iq_a.xye").write_text("0 1\n1 2\n")
+    (tmp_path / "iq_b.xye").write_text("0 1\n1 2\n")
+    h5v = w.h5viewer
+    h5v.dirname = str(tmp_path)
+    w._on_viewer_mode_changed("xye")
+    h5v.update_scans()
+    lw = h5v.ui.listScans
+    # Select A and B (modifier-free multi-select).
+    for row in range(lw.count()):
+        if lw.item(row).text() in ("iq_a.xye", "iq_b.xye"):
+            lw.item(row).setSelected(True)
+    assert {i.text() for i in lw.selectedItems()} == {"iq_a.xye", "iq_b.xye"}
+
+    # A new file C lands -> the list rebuilds; A and B must stay selected.
+    (tmp_path / "iq_c.xye").write_text("0 1\n1 2\n")
+    h5v.update_scans()
+    assert {i.text() for i in lw.selectedItems()} == {"iq_a.xye", "iq_b.xye"}
 
 
 def test_xye_viewer_mixed_units_warns_and_labels_from_first(widget, caplog):
