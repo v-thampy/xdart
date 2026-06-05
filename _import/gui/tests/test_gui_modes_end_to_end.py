@@ -823,3 +823,31 @@ def test_int_mode_transition_rebuilds_plotunit(widget):
     df._apply_1d_only_visibility()                  # -> Int 2D
     assert df.ui.plotUnit.count() == 3              # restored
     assert "2d" in _plotunit_sources(df)
+
+
+# ── A1: the DISPLAY unit toggle must never change the INTEGRATION unit ──────
+#
+# The plotUnit / imageUnit combos above the plots are *view* settings; toggling
+# them must not write scan.bai_1d_args / bai_2d_args (the integration unit comes
+# only from the right-hand integrator panel).  Locks the invariant — the leak
+# reported pre-refactor is gone now that the 2D toggle renders via cake_image
+# and the display layer only *reads* bai_args.
+
+def test_display_unit_toggle_does_not_change_integration_unit(widget):
+    w = widget
+    sc = w.scan
+    sc.bai_1d_args["unit"] = "q_A^-1"
+    sc.bai_2d_args["unit"] = "q_A^-1"
+    df = w.displayframe
+    df.scan = sc
+    df.set_axes()                                  # Q / 2θ display combos
+    # Toggle the DISPLAY 1D unit to 2θ and fire the production signal.
+    df.ui.plotUnit.setCurrentIndex(1)
+    df.ui.plotUnit.activated.emit(1)
+    # Toggle the DISPLAY 2D unit to 2θ-χ.
+    if df.ui.imageUnit.count() > 1:
+        df.ui.imageUnit.setCurrentIndex(1)
+        df.ui.imageUnit.activated.emit(1)
+    # Integration units are untouched — a later Int 1D (XYE) run still saves Q.
+    assert sc.bai_1d_args["unit"] == "q_A^-1"
+    assert sc.bai_2d_args["unit"] == "q_A^-1"
