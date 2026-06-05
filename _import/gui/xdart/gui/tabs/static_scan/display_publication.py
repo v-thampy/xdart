@@ -90,27 +90,6 @@ def _two_d_axes_match(ref_view, view, *, rtol=1e-5, atol=1e-8) -> bool:
     return True
 
 
-def _standalone_viewer_image(data):
-    """Display-only cleanup for standalone Image Viewer files.
-
-    Standalone detector-file viewing is inspection, not processing: keep normal
-    high values and do not turn uint16 ceilings into NaN masks. Only true
-    non-finite values and the Eiger uint32 sentinel are filled with the low
-    finite value so autoscale remains usable without painting white mask holes.
-    """
-    arr = np.asarray(data, dtype=float)
-    bad = ~np.isfinite(arr) | (arr >= 4294967295.0)
-    if not bad.any():
-        return arr
-    valid = np.isfinite(arr) & ~bad
-    out = arr.astype(float, copy=True)
-    if not valid.any():
-        out[...] = np.nan
-        return out
-    out[bad] = float(np.nanmin(arr[valid]))
-    return out
-
-
 def _trace_name(publication, widget=None) -> str:
     scan = getattr(widget, "scan", None)
     scan_name = getattr(scan, "name", "")

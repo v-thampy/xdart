@@ -53,7 +53,7 @@ from .display_logic import (
     build_payload, render_plan, controller_for, ImagePayload,
     empty_display_state, PANEL_LAYOUT,
     resolve_selection, resolve_render_ids,
-    xye_unit_from_filename, x_axis_for_unit, default_plot_unit,
+    default_plot_unit,
 )
 from .display_controllers import register_default_controllers
 
@@ -658,17 +658,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # RAW_2D / PLOT_1D differ by mode (viewer vs normal); CAKE_2D is normal
     # only.  These collapse into mode controllers in Stage 5.
     def _draw_delegate(self, role, mode):
+        # Payload-only viewer modes (Image / XYE / NeXus): a ``None`` payload
+        # means blank that panel — there is no legacy draw fallback.  Only the
+        # Int 1D / Int 2D integration views still fall back to the legacy
+        # ``update_*`` pixel pushers (that's step 4).
         if role is PanelRole.RAW_2D:
-            if mode is Mode.IMAGE_VIEWER:
-                # The Image Viewer renders solely from its payload
-                # (``ImageViewerController.build_payload``).  A ``None`` raw
-                # payload — no frame, no map_raw/thumbnail, or an all-non-finite
-                # array — means blank the panel; there is no legacy fallback.
+            if mode in (Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER):
                 return self.clear_image_view
             return self.update_image
         if role is PanelRole.PLOT_1D:
-            return (self._update_xye_viewer if mode is Mode.XYE_VIEWER
-                    else self.update_plot)
+            if mode in (Mode.XYE_VIEWER, Mode.NEXUS_VIEWER):
+                return self.clear_plot_view
+            return self.update_plot
         if role is PanelRole.CAKE_2D:
             return self.update_binned
         return None
@@ -734,6 +735,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.overlaid_idxs = list(state.render_ids)
         axis = payload_value.axis_x
         self._payload_x_axis_label = (axis.label, axis.unit)
+        # XYE labels its bottom axis from the file prefix; _current_plot_axis_label
+        # reads _viewer_x_axis_label first in xye mode, so keep it in sync.
+        if state.mode is Mode.XYE_VIEWER:
+            self._viewer_x_axis_label = (axis.label, axis.unit)
         axis_y = getattr(payload_value, "axis_y", None)
         self._payload_y_axis_label = (
             (axis_y.label, axis_y.unit) if axis_y is not None else None
@@ -953,10 +958,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 and state.load_status is LoadStatus.READY):
             self.update_2d_label()
             self._update_image_preview()
-        # The Image Viewer title (filename / ``Filename #N``) used to be a side
-        # effect of the legacy ``_update_image_viewer`` draw; now that the mode
-        # renders from its payload, set it here for the selected frame.
-        elif mode is Mode.IMAGE_VIEWER and state.load_status is LoadStatus.READY:
+        # The Image / XYE viewer title (filename(s) / ``Filename #N``) used to be
+        # a side effect of the legacy ``_update_image_viewer`` / ``_update_xye_viewer``
+        # draws; now that those modes render from their payloads, set it here for
+        # the selected frame(s).
+        elif (mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER)
+                and state.load_status is LoadStatus.READY):
             self._set_viewer_title(list(state.render_ids))
         return True
 
@@ -1730,101 +1737,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # re-asserts the geometry via _apply_layout (idempotent).
             self._apply_1d_only_visibility()
             self._set_equal_primary_panel_heights()
-
-    def _update_xye_viewer(self):
-        """Render 1D line data in XYE viewer mode (no scan/integration).
-
-        Builds plot_data and frame_names from the loaded XYE data,
-        then delegates to the standard update_plot_view() so that
-        Single/Overlay/Waterfall/Sum/Average all work.
-        """
-        if len(self.idxs_1d) == 0:
-            self.clear_plot_view()
-            return
-
-        # Title bar: the xye filename(s) — same convention as the image viewer.
-        self._set_viewer_title(self.idxs_1d)
-
-        # Axis label comes from the file's prefix (iq \u2192 Q, itth \u2192 2\u03b8), not a
-        # transform combo \u2014 an XYE file can't be re-transformed.  Stage 4:
-        # route through the pure xye_unit_from_filename + x_axis_for_unit so
-        # an UNKNOWN prefix labels the axis plain 'x' (never an assumed 2\u03b8).
-        first_frame = self.data_1d[self.idxs_1d[0]]
-        source_name = ''
-        if getattr(first_frame, 'scan_info', None):
-            source_name = first_frame.scan_info.get('source_file', '')
-        first_unit = xye_unit_from_filename(source_name)
-        xlabel, xunits = x_axis_for_unit(first_unit)
-        self._viewer_x_axis_label = (xlabel, xunits)
-
-        # Overlaying xye files of different units mixes incompatible x-axes —
-        # we label from the first file (above); warn if the selection mixes
-        # known prefixes (iq with itth) so the user knows the axis is the
-        # first file's, not a shared one.
-        if len(self.idxs_1d) > 1:
-            units = set()
-            for idx in self.idxs_1d:
-                fr = self.data_1d.get(idx)
-                sinfo = getattr(fr, 'scan_info', None) if fr is not None else None
-                src = sinfo.get('source_file', '') if sinfo else ''
-                u = xye_unit_from_filename(src)
-                if u != 'unknown':
-                    units.add(u)
-            if len(units) > 1:
-                logger.warning(
-                    'XYE overlay mixes different x-axis units %s; labelling '
-                    'the axis from the first file (%s). Overlaid curves are '
-                    'on incompatible axes.', sorted(units), first_unit,
-                )
-
-        # Build xdata and ydata arrays from all selected indices.
-        ref_x = np.asarray(first_frame.int_1d.radial, dtype=float)
-        frame_names = []
-        rows = []
-        for idx in self.idxs_1d:
-            frame = self.data_1d[idx]
-            int_1d = frame.int_1d
-            if int_1d is None:
-                continue
-            fname = frame.scan_info.get('source_file', f'xye_{idx}')
-            frame_names.append(os.path.basename(fname))
-            xdata = np.asarray(int_1d.radial, dtype=float)
-            ydata = np.asarray(int_1d.intensity, dtype=float)
-            if xdata.shape != ref_x.shape or not np.allclose(xdata, ref_x):
-                ydata = np.interp(ref_x, xdata, ydata)
-            rows.append(ydata)
-
-        if not rows:
-            self.clear_plot_view()
-            return
-
-        xdata = ref_x
-        ydata = np.vstack(rows) if len(rows) > 1 else rows[0][np.newaxis, :]
-
-        # In Overlay/Waterfall: accumulate, skip duplicates.
-        current_method = self.ui.plotMethod.currentText()
-        if current_method in ('Overlay', 'Waterfall') and \
-                len(self.plot_data[0]) > 0 and \
-                self.plot_data[0].shape == xdata.shape:
-            for name, row in zip(frame_names, ydata):
-                if name not in self.frame_names:
-                    self.plot_data[1] = np.vstack(
-                        (self.plot_data[1], row[np.newaxis, :]))
-                    self.frame_names.append(name)
-        else:
-            self.plot_data = [xdata, ydata]
-            self.frame_names = list(frame_names)
-
-        xdata, ydata = self.plot_data
-        self.plot_data_range = [
-            [xdata.min(), xdata.max()],
-            [ydata.min(), ydata.max()],
-        ]
-
-        self.plot.setLabel('bottom', xlabel, units=xunits)
-        self.plot.setLabel('left', 'Intensity')
-
-        self.update_plot_view()
 
     @staticmethod
     def _truncate_name(name, limit=100, head=48, tail=48):

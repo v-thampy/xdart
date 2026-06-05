@@ -24,6 +24,7 @@ Design rules (plan §3 / §8):
 from __future__ import annotations
 
 import logging
+import os
 
 import numpy as np
 
@@ -38,11 +39,13 @@ from .display_logic import (
     build_payload,
     register_controller,
     sentinel_mask,
+    standalone_viewer_image,
+    xye_unit_from_filename,
+    x_axis_for_unit,
 )
 from .display_publication import (
     PublicationDisplayAdapter,
     publication_availability,
-    _standalone_viewer_image,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,7 +118,7 @@ def _image_viewer_raw_payload(widget, state):
     if getattr(widget, '_viewer_is_xdart', False):
         data = sentinel_mask(raw)               # preserve baked NaN mask
     else:
-        data = _standalone_viewer_image(raw)    # fill sentinels, no mask
+        data = standalone_viewer_image(raw)     # fill sentinels, no mask
     data = np.asarray(data, dtype=float)
     if data.ndim != 2 or data.size == 0 or not np.isfinite(data).any():
         return None
@@ -222,9 +225,126 @@ class ImageViewerController(_BaseController):
         )
 
 
+def _xye_accumulated_traces(widget, ref_x):
+    """Reconstruct the Overlay/Waterfall curves already on the widget as
+    :class:`Trace`s, so a fresh render can keep them (the legacy
+    ``_update_xye_viewer`` sticky accumulation).
+
+    Only valid when the existing grid matches ``ref_x`` in shape (the legacy
+    guard); otherwise nothing carries over.
+    """
+    px = np.asarray(widget.plot_data[0], dtype=float)
+    if px.size == 0 or px.shape != ref_x.shape:
+        return []
+    py = np.atleast_2d(np.asarray(widget.plot_data[1], dtype=float))
+    out = []
+    for name, row in zip(widget.frame_names, py):
+        out.append(Trace(str(name), px, np.asarray(row, dtype=float)))
+    return out
+
+
+def _xye_plot_payload(widget, state):
+    """Build the XYE viewer's :class:`PlotPayload` (or ``None``).
+
+    Reproduces ``_update_xye_viewer`` verbatim: one trace per selected frame
+    (``render_ids``, in order — XYE is multi-select); the x-axis label/unit come
+    from the *first* file's name prefix (``xye_unit_from_filename`` ->
+    ``x_axis_for_unit``, so an UNKNOWN prefix labels the axis plain ``x``, never
+    an assumed 2θ), y-axis ``Intensity``; each trace labelled by its filename;
+    and the Overlay/Waterfall sticky accumulation (keep already-drawn curves,
+    de-duped by name).  Returns ``None`` (-> the renderer clears the plot) on an
+    empty selection or when no selected frame has 1D data.
+    """
+    render_ids = []
+    for i in state.render_ids:
+        try:
+            render_ids.append(int(i))
+        except (TypeError, ValueError):
+            continue
+    if not render_ids:
+        return None
+    with widget.data_lock:
+        frames = {i: widget.data_1d.get(i) for i in render_ids}
+
+    # X-axis label from the first selected file's prefix (not a transform combo).
+    first = frames.get(render_ids[0])
+    source_name = ''
+    if first is not None and getattr(first, 'scan_info', None):
+        source_name = first.scan_info.get('source_file', '') or ''
+    first_unit = xye_unit_from_filename(source_name)
+    xlabel, xunits = x_axis_for_unit(first_unit)
+
+    # Overlaying files of different known units mixes incompatible x-axes; we
+    # label from the first file and warn so the user knows the axis isn't shared.
+    if len(render_ids) > 1:
+        units = set()
+        for i in render_ids:
+            fr = frames.get(i)
+            sinfo = getattr(fr, 'scan_info', None) if fr is not None else None
+            src = sinfo.get('source_file', '') if sinfo else ''
+            u = xye_unit_from_filename(src)
+            if u != 'unknown':
+                units.add(u)
+        if len(units) > 1:
+            logger.warning(
+                'XYE overlay mixes different x-axis units %s; labelling the '
+                'axis from the first file (%s). Overlaid curves are on '
+                'incompatible axes.', sorted(units), first_unit,
+            )
+
+    first_int = getattr(first, 'int_1d', None) if first is not None else None
+    if first_int is None:
+        return None
+    ref_x = np.asarray(first_int.radial, dtype=float)
+
+    traces = []
+    for i in render_ids:
+        fr = frames.get(i)
+        int_1d = getattr(fr, 'int_1d', None) if fr is not None else None
+        if int_1d is None:
+            continue
+        sinfo = getattr(fr, 'scan_info', None) or {}
+        fname = sinfo.get('source_file', f'xye_{i}')
+        traces.append(Trace(
+            os.path.basename(fname),
+            np.asarray(int_1d.radial, dtype=float),
+            np.asarray(int_1d.intensity, dtype=float),
+        ))
+    if not traces:
+        return None
+
+    # Overlay / Waterfall: keep the already-accumulated curves (de-dup by name),
+    # matching _update_xye_viewer.  Single / Sum / Average build fresh.
+    try:
+        method = widget.ui.plotMethod.currentText()
+    except Exception:
+        method = 'Single'
+    if method in ('Overlay', 'Waterfall'):
+        existing = _xye_accumulated_traces(widget, ref_x)
+        if existing:
+            have = {t.label for t in existing}
+            traces = existing + [t for t in traces if t.label not in have]
+
+    return PlotPayload(
+        axis_x=Axis(xlabel, xunits),
+        traces=tuple(traces),
+        axis_y=Axis('Intensity', ''),
+    )
+
+
 class XYEViewerController(_BaseController):
     """1D ``.xye`` overlay viewer.  Selection is *viewer* frame ids; the
     x-axis comes from the file prefix, not the integration-unit combo (§8)."""
+
+    def build_payload(self, widget, state):
+        """Render the XYE overlay through a :class:`PlotPayload` — the one
+        render path for the mode (no legacy ``_update_xye_viewer`` fallback)."""
+        return DisplayPayload(
+            generation=state.generation,
+            raw_image=None,
+            cake_image=None,
+            plot=_xye_plot_payload(widget, state),
+        )
 
 
 class NexusViewerController(_BaseController):

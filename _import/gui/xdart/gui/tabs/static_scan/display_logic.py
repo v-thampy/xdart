@@ -70,6 +70,7 @@ __all__ = [
     "default_plot_unit",
     "plan_overlay",
     "sentinel_mask",
+    "standalone_viewer_image",
     "gi_axes_uniform",
     "compute_display_state",
 ]
@@ -571,6 +572,27 @@ def sentinel_mask(arr):
         a = a.copy()
         a[bad] = np.nan
     return a
+
+
+def standalone_viewer_image(data):
+    """Display-only cleanup for standalone Image Viewer files.
+
+    Standalone detector-file viewing is inspection, not processing: keep normal
+    high values and do not turn uint16 ceilings into NaN masks. Only true
+    non-finite values and the Eiger uint32 sentinel are filled with the low
+    finite value so autoscale remains usable without painting white mask holes.
+    """
+    arr = np.asarray(data, dtype=float)
+    bad = ~np.isfinite(arr) | (arr >= 4294967295.0)
+    if not bad.any():
+        return arr
+    valid = np.isfinite(arr) & ~bad
+    out = arr.astype(float, copy=True)
+    if not valid.any():
+        out[...] = np.nan
+        return out
+    out[bad] = float(np.nanmin(arr[valid]))
+    return out
 
 
 def gi_axes_uniform(axes_per_frame, *, rtol=1e-5, atol=1e-8):

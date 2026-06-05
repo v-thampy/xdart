@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -464,3 +465,164 @@ def test_layout_render_path_int_1d_only_is_self_sufficient(widget):
     df.scan.skip_2d = True
     df._apply_1d_only_visibility()             # render-path entry only
     assert _geom(df) == _expected(Mode.INT_1D)
+
+
+# ── XYE Viewer payload-only rendering (Stage 4/5 step 3, Part A) ───────────
+#
+# XYE renders through XYEViewerController.build_payload -> PlotPayload; these
+# drive the real wire (set frames -> update -> render_display) and assert the
+# plot draws with the filename-derived axis and that Overlay accumulation +
+# the mixed-unit warning are preserved (no legacy _update_xye_viewer).
+
+def _set_xye_frames(w, frames):
+    """Load synthetic 1D viewer frames + select them all.
+
+    ``frames``: list of ``(idx, source_file, radial, intensity)``.
+    """
+    with w.data_lock:
+        w.data_1d.clear()
+        w.data_2d.clear()
+        for idx, src, radial, intensity in frames:
+            w.data_1d[idx] = SimpleNamespace(
+                int_1d=SimpleNamespace(
+                    radial=np.asarray(radial, dtype=float),
+                    intensity=np.asarray(intensity, dtype=float)),
+                scan_info={"source_file": src},
+            )
+    w.frame_ids[:] = [str(idx) for idx, *_ in frames]
+    w.displayframe.idxs_1d = [idx for idx, *_ in frames]
+
+
+def test_xye_viewer_single_curve_uses_filename_axis(widget):
+    w = widget
+    w._on_viewer_mode_changed("xye")
+    df = w.displayframe
+    _set_xye_frames(w, [(0, "iq_sample.xye", np.arange(5.0),
+                         np.array([1.0, 2.0, 3.0, 2.0, 1.0]))])
+    from xdart.gui.tabs.static_scan.display_logic import x_axis_for_unit
+    df.update()
+    assert df.frame_names == ["iq_sample.xye"]
+    assert df.plot_data[1].shape[0] == 1                 # one curve drawn
+    # x-axis label comes from the iq prefix (Q), not the hidden transform combo.
+    assert df._current_plot_axis_label() == x_axis_for_unit("q_A^-1")
+
+
+def test_xye_viewer_multiselect_draws_all(widget):
+    w = widget
+    w._on_viewer_mode_changed("xye")
+    df = w.displayframe
+    _set_xye_frames(w, [
+        (0, "iq_a.xye", np.arange(5.0), np.ones(5)),
+        (1, "iq_b.xye", np.arange(5.0), 2.0 * np.ones(5)),
+    ])
+    df.update()
+    assert set(df.frame_names) == {"iq_a.xye", "iq_b.xye"}
+    assert df.plot_data[1].shape[0] == 2                 # both selected drawn
+
+
+def test_xye_viewer_empty_selection_clears_plot(widget):
+    w = widget
+    w._on_viewer_mode_changed("xye")
+    df = w.displayframe
+    _set_xye_frames(w, [(0, "iq_a.xye", np.arange(5.0), np.ones(5))])
+    df.update()
+    assert df.plot_data[1].shape[0] == 1
+    # Deselect everything -> the plot must clear (no stale curve).
+    with w.data_lock:
+        w.data_1d.clear()
+        w.data_2d.clear()
+    w.frame_ids[:] = []
+    df.idxs_1d = []
+    df.update()
+    assert len(df.curves) == 0
+
+
+def test_xye_viewer_overlay_keeps_deselected_curve(widget):
+    # Behavior-preserving: Overlay/Waterfall is *sticky* — a curve stays drawn
+    # after its file is deselected (legacy _update_xye_viewer accumulation),
+    # until Single/Sum/Average or Clear resets it.
+    w = widget
+    w._on_viewer_mode_changed("xye")
+    df = w.displayframe
+    df.ui.plotMethod.setCurrentText("Overlay")
+    _set_xye_frames(w, [
+        (0, "iq_a.xye", np.arange(5.0), np.ones(5)),
+        (1, "iq_b.xye", np.arange(5.0), 2.0 * np.ones(5)),
+    ])
+    df.update()
+    assert set(df.frame_names) == {"iq_a.xye", "iq_b.xye"}
+    # Deselect b: only a is selected now, but Overlay keeps b on screen.
+    _set_xye_frames(w, [(0, "iq_a.xye", np.arange(5.0), np.ones(5))])
+    df.update()
+    assert set(df.frame_names) == {"iq_a.xye", "iq_b.xye"}     # b retained
+
+
+def test_xye_viewer_mixed_units_warns_and_labels_from_first(widget, caplog):
+    import logging
+    w = widget
+    w._on_viewer_mode_changed("xye")
+    df = w.displayframe
+    _set_xye_frames(w, [
+        (0, "iq_a.xye", np.arange(5.0), np.ones(5)),       # Q
+        (1, "itth_b.xye", np.arange(5.0), np.ones(5)),     # 2theta
+    ])
+    from xdart.gui.tabs.static_scan.display_logic import x_axis_for_unit
+    with caplog.at_level(logging.WARNING):
+        df.update()
+    assert any("mixes different x-axis units" in r.message for r in caplog.records)
+    # Axis labelled from the FIRST file (Q), not the mixed-in 2theta.
+    assert df._current_plot_axis_label() == x_axis_for_unit("q_A^-1")
+
+
+# ── NeXus Viewer payload-only rendering (Stage 4/5 step 3, Part B) ─────────
+
+def _set_nexus_row(w, idx, payload):
+    """Load one NeXus preview row + select it."""
+    with w.data_lock:
+        w.data_1d.clear()
+        w.data_2d.clear()
+        w.data_1d[idx] = SimpleNamespace(
+            nexus_preview_payload=payload, scan_info={})
+    w.frame_ids[:] = [str(idx)]
+    w.displayframe.idxs_1d = [idx]
+
+
+def test_nexus_viewer_plot_row_draws_plot_clears_image(widget):
+    w = widget
+    w._on_viewer_mode_changed("nexus")
+    df = w.displayframe
+    _set_nexus_row(w, 0, {
+        "kind": "plot_1d",
+        "x": np.arange(4.0), "y": np.array([1.0, 2.0, 3.0, 4.0]),
+        "label": "I(q)", "x_label": "Q", "x_unit": "A^-1",
+    })
+    df.update()
+    assert df.plot_data[1].shape[0] == 1                  # 1D preview drawn
+    assert df._current_plot_axis_label() == ("Q", "A^-1")  # dataset units/label
+    assert df.image_data is None                          # 2D panel cleared
+
+
+def test_nexus_viewer_image_row_draws_image_clears_plot(widget):
+    w = widget
+    w._on_viewer_mode_changed("nexus")
+    df = w.displayframe
+    _set_nexus_row(w, 0, {
+        "kind": "image_2d",
+        "image": np.arange(12.0).reshape(3, 4),
+    })
+    df.update()
+    assert df.image_data is not None                      # 2D preview drawn
+    assert df.image_data[0].size > 0
+    assert len(df.curves) == 0                            # plot cleared
+
+
+def test_nexus_viewer_metadata_row_clears_both(widget):
+    w = widget
+    w._on_viewer_mode_changed("nexus")
+    df = w.displayframe
+    # A metadata-only row (neither plot_1d nor image_2d) blanks both panels.
+    _set_nexus_row(w, 0, {"kind": "dataset", "path": "/entry/instrument"})
+    df.update()
+    assert df.image_data is None                          # image blanked
+    assert df.image_widget.histogram.isVisible() is False  # colorbar hidden
+    assert len(df.curves) == 0                            # plot blanked

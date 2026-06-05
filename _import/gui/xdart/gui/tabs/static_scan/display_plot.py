@@ -260,7 +260,10 @@ class DisplayPlotMixin:
         if getattr(self, 'viewer_mode', None) == 'xye':
             if new_method in ('Single', 'Sum', 'Average'):
                 self.clear_overlay()
-            self._update_xye_viewer()
+            # Re-render through the payload path (XYEViewerController.build_payload);
+            # Overlay/Waterfall accumulation lives there now, keyed off the
+            # widget's plot_data/frame_names (which clear_overlay resets above).
+            self.update()
             return
 
         if new_method == 'Single':

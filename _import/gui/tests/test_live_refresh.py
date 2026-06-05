@@ -1088,11 +1088,11 @@ def _update_smoke_host():
         update_binned=rec("draw_binned"),
         update_plot=rec("draw_plot"),
         update_plot_view=rec("payload_plot"),
-        # IMAGE_VIEWER now renders its raw panel through the payload path
-        # (_draw_image_payload), not a legacy _update_image_viewer delegate.
+        # IMAGE_VIEWER / XYE_VIEWER now render through the payload path
+        # (_draw_image_payload / _draw_payload -> update_plot_view), not legacy
+        # _update_image_viewer / _update_xye_viewer delegates.
         _draw_image_payload=lambda *a, **k: calls.append("draw_payload_image") or True,
         _set_viewer_title=rec("viewer_title"),
-        _update_xye_viewer=rec("draw_viewer_xye"),
         clear_image_view=rec("clear_image"),
         clear_binned_view=rec("clear_binned"),
         clear_plot_view=rec("clear_plot"),
@@ -1143,12 +1143,20 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     assert "clear_plot" in calls and "clear_binned" in calls
     assert "label_2d" not in calls           # viewer owns its own title
 
-    # Switch to XYE Viewer: 1D drawn, the 2D panels cleared.
+    # Switch to XYE Viewer: 1D drawn via the payload path, the 2D panels cleared.
     calls.clear()
+    host.frame_ids = ['0']
+    host.data_1d = {
+        0: SimpleNamespace(
+            int_1d=SimpleNamespace(radial=np.arange(3, dtype=float),
+                                   intensity=np.array([1.0, 2.0, 3.0])),
+            scan_info={'source_file': 'iq_a.xye'})
+    }
+    host.data_2d = {}
     host.viewer_mode = 'xye'
     host._bump_display_generation()
     host.update()
-    assert "draw_viewer_xye" in calls
+    assert "payload_plot" in calls           # 1D drawn via the payload path
     assert "clear_image" in calls and "clear_binned" in calls
 
     # Switch to NeXus Viewer: dataset previews use payload rendering, while
@@ -1227,7 +1235,6 @@ def _render_host():
         # set by render_display (no longer a side effect of a legacy draw).
         _draw_image_payload=lambda *a, **k: calls.append("draw_payload_image") or True,
         _set_viewer_title=rec("viewer_title"),
-        _update_xye_viewer=rec("draw_viewer_xye"),
         clear_image_view=rec("clear_image"),
         clear_binned_view=rec("clear_binned"),
         clear_plot_view=rec("clear_plot"),
@@ -2676,13 +2683,15 @@ def test_xye_single_method_change_clears_accumulated_traces_immediately():
         plot_data_range=[[0, 1], [0, 1]],
         frame_names=["old_a", "old_b"],
         overlaid_idxs=[1, 2],
-        _update_xye_viewer=lambda: calls.append("xye"),
+        # Switching to Single clears the accumulation then re-renders through the
+        # payload path (update()), not the deleted _update_xye_viewer.
+        update=lambda: calls.append("update"),
     )
     host.clear_overlay = MethodType(displayFrameWidget.clear_overlay, host)
 
     DisplayPlotMixin._on_plotMethod_changed(host)
 
-    assert calls == ["xye"]
+    assert calls == ["update"]
     assert host.plot_data[0].size == 0
     assert host.plot_data[1].size == 0
     assert host.frame_names == []
