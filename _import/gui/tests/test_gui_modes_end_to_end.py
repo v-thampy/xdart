@@ -1040,3 +1040,24 @@ def test_plot_unit_change_autoranges_view(widget):
     assert xmax > 10.0                              # 2θ values (~4..28)
     view_xmax = df.plot.viewRange()[0][1]
     assert view_xmax > 10.0                         # view refit to 2θ, not Q (~3)
+
+
+def test_share_axis_converts_in_a_single_toggle_render(widget):
+    # R2-2 (reopen B1): toggling Share Axis ONCE must re-express the 1D values
+    # AND set the matching label in one render — no intermittent label-2θ-over-
+    # Q-data flash.  Drives the toggle via the production signal only (no extra
+    # update()), which is what the previous race failed.
+    w = widget
+    df = _set_int_scan(w, n=1)                      # INT 2D, Q
+    df.update()
+    df.ui.imageUnit.setCurrentIndex(1)             # cake -> 2θ-χ
+    df.update()
+    assert df.ui.shareAxis.isEnabled()
+
+    # Single user toggle: shareAxis.toggled -> update() fires exactly once.
+    df.ui.shareAxis.setChecked(True)
+
+    tth_x = np.asarray(df.plot_data[0], dtype=float)
+    assert tth_x.max() > 4.0                        # values converted in 1 render
+    label, unit = df._current_plot_axis_label()
+    assert label.strip().startswith("2")           # …and the label is 2θ, atomically

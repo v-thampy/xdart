@@ -653,6 +653,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         state = self._live_display_state()
         ctrl = controller_for(state.mode)
+        # Share Axis links the 1D plot to the cake's unit.  Apply it BEFORE the
+        # payload is built so the unit the 1D path reads (and re-expresses to)
+        # and the axis label come from the same post-link unit in ONE render —
+        # otherwise build_payload reads the stale plotUnit and renders Q data
+        # while the later relabel shows 2θ (the intermittent Share-Axis race,
+        # R2-2).  render_display re-applies it (idempotent).
+        if state.mode in (Mode.INT_1D, Mode.INT_2D):
+            self._apply_share_axis_state()
         payload = ctrl.build_payload(self, state)  # store=None ⇒ delegate draws
         result = self.render_display(state, payload)
         self._display_blanked = False
