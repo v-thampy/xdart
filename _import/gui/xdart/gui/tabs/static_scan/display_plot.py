@@ -264,6 +264,7 @@ class DisplayPlotMixin:
             # Overlay/Waterfall accumulation lives there now, keyed off the
             # widget's plot_data/frame_names (which clear_overlay resets above).
             self.update()
+            self._autorange_plot_view()   # R2-3: a method change rescales the data
             return
 
         if new_method == 'Single':
@@ -287,6 +288,9 @@ class DisplayPlotMixin:
             # Overlay / Waterfall: keep existing accumulated curves and
             # just refresh the rendered view.
             self.update_plot_view()
+        # R2-3: Sum/Average/Overlay/Waterfall change the data span (and a prior
+        # Share-Axis link froze the view), so refit the plot to the new curves.
+        self._autorange_plot_view()
 
     def _current_plot_axis_label(self):
         """Return the bottom-axis label and unit for the current 1D view."""

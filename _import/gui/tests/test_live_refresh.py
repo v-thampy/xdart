@@ -2702,6 +2702,7 @@ def test_xye_single_method_change_clears_accumulated_traces_immediately():
         # Switching to Single clears the accumulation then re-renders through the
         # payload path (update()), not the deleted _update_xye_viewer.
         update=lambda: calls.append("update"),
+        _autorange_plot_view=lambda: None,    # R2-3 autorange (no-op here)
     )
     host.clear_overlay = MethodType(displayFrameWidget.clear_overlay, host)
 

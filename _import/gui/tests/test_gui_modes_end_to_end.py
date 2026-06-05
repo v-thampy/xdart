@@ -1061,3 +1061,16 @@ def test_share_axis_converts_in_a_single_toggle_render(widget):
     assert tth_x.max() > 4.0                        # values converted in 1 render
     label, unit = df._current_plot_axis_label()
     assert label.strip().startswith("2")           # …and the label is 2θ, atomically
+
+
+def test_plot_method_change_autoranges_view(widget):
+    # R2-3: a plotMethod change (and other option/mode changes) refits the 1D
+    # plot view instead of leaving it frozen at the old range.
+    w = widget
+    df = _set_int_scan(w, n=2)                      # INT 2D, Q
+    df.update()
+    df.plot.setXRange(100.0, 200.0, padding=0)     # freeze at a wrong range
+    assert df.plot.viewRange()[0][0] > 50.0
+    df._on_plotMethod_changed()                    # triggers re-render + autorange
+    vx = df.plot.viewRange()[0]
+    assert vx[0] < 50.0                            # refit to the Q data (~0.5..3)
