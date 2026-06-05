@@ -280,6 +280,22 @@ def test_image_widget_colorbar_limits_nan_aware(qapp):
         qapp.processEvents()
 
 
+def test_image_widget_linear_levels_are_2_95_percentile(qapp):
+    # R2-4: the Linear autoscale clips harder than the old (1, 99) so saturated
+    # tiff pixels don't wash the image out.  Shared raw/cake/waterfall widget.
+    from xdart.gui.widgets import pgImageWidget
+    w = pgImageWidget(lockAspect=True, raw=True)
+    try:
+        img = np.arange(100, dtype=float).reshape(10, 10)
+        w.setImage(img, scale="Linear", cmap="viridis")
+        lo, hi = w.imageItem.levels
+        expected = np.nanpercentile(img, (2, 95))
+        assert np.isclose(lo, expected[0]) and np.isclose(hi, expected[1])
+    finally:
+        w.deleteLater()
+        qapp.processEvents()
+
+
 # ── Real-data cells: exercise the full _load_image_file (classify + load) ──
 
 _TIFF = _DATA / "Tiff" / "Combi4_Angledependence_samz_4p9_03271002_0001.tif"
