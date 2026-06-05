@@ -67,6 +67,7 @@ __all__ = [
     "apply_mask_for",
     "x_axis_for_unit",
     "xye_unit_from_filename",
+    "xye_prefix_for_unit",
     "default_plot_unit",
     "plan_overlay",
     "sentinel_mask",
@@ -464,6 +465,9 @@ _X_AXIS_TABLE = {
     'q_A^-1': ('Q', _AA_INV),
     '2th_deg': (f"2{_TH}", _DEG),
     'chi_deg': (_CHI, _DEG),
+    'qip_A^-1': ('Q_ip', _AA_INV),
+    'qoop_A^-1': ('Q_oop', _AA_INV),
+    'exit_angle_deg': ('Exit Angle', _DEG),
 }
 
 
@@ -507,17 +511,50 @@ def is_gi_2d_units(unit, azimuthal_unit):
     return two_d_kind_from_units(unit, azimuthal_unit) != "standard"
 
 
+def xye_prefix_for_unit(unit):
+    """Filename prefix encoding the 1D integration axis, so the XYE reader can
+    recover the x-axis from the name (inverse of :func:`xye_unit_from_filename`):
+
+    * Q → ``iq``; 2θ → ``itth``;
+    * GI Q_ip → ``iqip``; Q_oop → ``iqoop``; exit-angle → ``iexit``;
+    * anything else → ``iq`` (Q default).
+
+    Matched on a normalised (underscore-stripped, lowercased) unit so it's robust
+    to ``q_ip`` vs ``qip_A^-1`` etc.  This replaces the old ``'iq' if q else
+    'itth'`` rule, which mislabeled every non-Q axis (Q_ip/Q_oop/exit) as 2θ."""
+    u = str(unit).lower().replace('_', '')
+    if 'qip' in u:
+        return 'iqip'
+    if 'qoop' in u:
+        return 'iqoop'
+    if 'exit' in u:
+        return 'iexit'
+    if '2th' in u or 'tth' in u:
+        return 'itth'
+    return 'iq'
+
+
 def xye_unit_from_filename(name):
-    """``'iq'``/``'iq_'`` → ``'q_A^-1'``; ``'itth'``/``'itth_'`` →
-    ``'2th_deg'``; otherwise ``'unknown'`` (no assumption — an unknown
-    prefix is NOT silently treated as 2θ; it labels the axis plain ``x``
-    via :func:`x_axis_for_unit`)."""
+    """Recover the x-axis unit from an XYE filename prefix (inverse of
+    :func:`xye_prefix_for_unit`): ``iqip``→``qip_A^-1``, ``iqoop``→``qoop_A^-1``,
+    ``iexit``→``exit_angle_deg``, ``itth``→``2th_deg``, ``iq``→``q_A^-1``.
+
+    Anything else falls back to ``q_A^-1`` (Q): XRD 1D patterns are Q by
+    convention, so a non-prefixed file is assumed Q rather than left unlabelled.
+    NB the GI prefixes are checked before the generic ``iq`` (``iqip`` etc. also
+    start with ``iq``)."""
     base = str(name).replace('\\', '/').rsplit('/', 1)[-1].lower()
+    if base.startswith('iqip'):
+        return 'qip_A^-1'
+    if base.startswith('iqoop'):
+        return 'qoop_A^-1'
+    if base.startswith('iexit'):
+        return 'exit_angle_deg'
     if base.startswith('itth'):
         return '2th_deg'
     if base.startswith('iq'):
         return 'q_A^-1'
-    return 'unknown'
+    return 'q_A^-1'
 
 
 def default_plot_unit(bai_1d_unit, available_units):

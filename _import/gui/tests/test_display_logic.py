@@ -70,10 +70,29 @@ def test_choose_raw_source_priority_and_mask():
 def test_xye_unit_from_filename():
     assert dl.xye_unit_from_filename('iq_scan_0001.xye') == 'q_A^-1'
     assert dl.xye_unit_from_filename('itth_scan_0001.xye') == '2th_deg'
-    # unknown prefix: NO assumption (must not become 2θ)
-    assert dl.xye_unit_from_filename('random_scan.xye') == 'unknown'
-    # unknown unit -> plain x, no unit symbol
+    # GI prefixes (checked before the generic 'iq')
+    assert dl.xye_unit_from_filename('iqip_scan_0001.xye') == 'qip_A^-1'
+    assert dl.xye_unit_from_filename('iqoop_scan_0001.xye') == 'qoop_A^-1'
+    assert dl.xye_unit_from_filename('iexit_scan_0001.xye') == 'exit_angle_deg'
+    # unknown prefix now falls back to Q (XRD 1D is Q by convention)
+    assert dl.xye_unit_from_filename('random_scan.xye') == 'q_A^-1'
+    # unknown unit -> plain x, no unit symbol (x_axis_for_unit unchanged)
     assert dl.x_axis_for_unit('unknown') == ('x', '')
+
+
+def test_xye_prefix_unit_roundtrip():
+    """Writer prefix <-> reader unit must be consistent, and every recovered
+    unit must resolve to a real axis label (not plain 'x')."""
+    cases = {
+        'q_A^-1': 'iq', 'q_nm^-1': 'iq', '2th_deg': 'itth', '2th_rad': 'itth',
+        'qip_A^-1': 'iqip', 'qoop_A^-1': 'iqoop',
+        'exit_angle_horz_deg': 'iexit',
+    }
+    for unit, prefix in cases.items():
+        assert dl.xye_prefix_for_unit(unit) == prefix
+        recovered = dl.xye_unit_from_filename(f'{prefix}_scan_0001.xye')
+        # the recovered unit resolves to a labelled axis (never ('x', ''))
+        assert dl.x_axis_for_unit(recovered) != ('x', '')
 
 
 def test_plan_overlay_rebuild_on_unit_change_keeps_all_ids():

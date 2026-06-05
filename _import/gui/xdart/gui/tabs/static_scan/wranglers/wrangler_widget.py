@@ -465,8 +465,11 @@ class wranglerThread(Qt.QtCore.QThread):
         path = os.path.join(path, scan.name)
         Path(path).mkdir(parents=True, exist_ok=True)
         r1d = frame.int_1d
-        is_q = r1d.unit in ('q_A^-1', 'q_nm^-1')
-        prefix = 'iq' if is_q else 'itth'
+        # Encode the actual 1D integration axis in the prefix so the XYE reader
+        # recovers the x-axis from the name.  The old `iq if q else itth` rule
+        # mislabeled every non-Q axis (GI Q_ip/Q_oop/exit) as 2θ.
+        from ..display_logic import xye_prefix_for_unit
+        prefix = xye_prefix_for_unit(r1d.unit)
         fname = os.path.join(
             path, f'{prefix}_{scan.name}_{str(idx).zfill(4)}.xye'
         )
