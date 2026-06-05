@@ -2591,10 +2591,17 @@ def _plot_host(method="Overlay"):
 
     host.get_frames_int_1d = get_frames_int_1d
     host.get_int_1d = get_int_1d
-    host.update_plot = MethodType(DisplayPlotMixin.update_plot, host)
-    host._loaded_1d_overlay_labels = MethodType(
-        DisplayPlotMixin._loaded_1d_overlay_labels, host,
-    )
+    for name in (
+        "resolve_plot_axis",
+        "collect_plot_rows",
+        "build_plot_names",
+        "apply_plot_background",
+        "compute_plot_range",
+        "draw_plot_state",
+        "_loaded_1d_overlay_labels",
+        "update_plot",
+    ):
+        setattr(host, name, MethodType(getattr(DisplayPlotMixin, name), host))
     return host
 
 

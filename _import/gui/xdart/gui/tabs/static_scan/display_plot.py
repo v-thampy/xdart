@@ -48,6 +48,77 @@ class DisplayPlotMixin:
 
     # ── 1D plot data accumulation ─────────────────────────────────
 
+    def resolve_plot_axis(self):
+        """Return the selected plot-axis metadata and whether it needs 2D."""
+        _idx = self.ui.plotUnit.currentIndex()
+        info = (self._plot_axis_info[_idx]
+                if hasattr(self, '_plot_axis_info')
+                   and 0 <= _idx < len(self._plot_axis_info)
+                else None)
+        needs_2d = ((info and info['source'] in ('2d', '1d_2d'))
+                    or self.ui.slice.isChecked())
+        return info, needs_2d
+
+    def collect_plot_rows(self):
+        """Collect x/y rows for the current plot selection.
+
+        Preserves the legacy fallback: when the selected axis needs 2D data
+        but only 1D data is available, disable slicing and retry on plain 1D.
+        """
+        ydata, xdata = self.get_frames_int_1d()
+        if xdata is not None and ydata is not None:
+            return ydata, xdata
+
+        _info, needs_2d = self.resolve_plot_axis()
+        if needs_2d and getattr(self.scan, 'skip_2d', False):
+            try:
+                self.window().statusBar().showMessage(
+                    "Chi slicing requires 2D integration (1D Only is enabled).", 4000)
+            except Exception:
+                logger.debug("Failed to show status bar message about chi slicing", exc_info=True)
+
+        # Fall back: disable slice, retry with plain 1D.
+        self.ui.slice.setChecked(False)
+        return self.get_frames_int_1d()
+
+    def build_plot_names(self):
+        """Return current trace names, including slice-range suffixes."""
+        if self.scan.series_average:
+            frame_names = [self.scan.name]
+        else:
+            frame_names = [f'{self.scan.name}_{i}' for i in self.idxs]
+
+        # When slicing is active, include slice parameters in frame names
+        # so the same image with different slice ranges can be overlaid.
+        if self.ui.slice.isEnabled() and self.ui.slice.isChecked():
+            center = self.ui.slice_center.value()
+            width = self.ui.slice_width.value()
+            suffix = f' [{center:.1f}\u00b1{width:.1f}]'
+            frame_names = [n + suffix for n in frame_names]
+        return frame_names
+
+    def apply_plot_background(self, ydata):
+        """Subtract the current 1D background and return row-shaped ydata."""
+        if self.bkg_1d is not None:
+            ydata -= self.bkg_1d
+        if ydata.ndim == 1:
+            ydata = ydata[np.newaxis, :]
+        return ydata
+
+    def compute_plot_range(self, xdata, ydata):
+        """Update ``plot_data_range`` for non-empty plot arrays."""
+        if xdata.size == 0 or ydata.size == 0:
+            return False
+        self.plot_data_range = [
+            [np.nanmin(xdata), np.nanmax(xdata)],
+            [np.nanmin(ydata), np.nanmax(ydata)],
+        ]
+        return True
+
+    def draw_plot_state(self):
+        """Draw the currently accumulated plot state."""
+        self.update_plot_view()
+
     def _loaded_1d_overlay_labels(self, idxs, *, max_rows=None):
         """Return loaded frame ids and labels that can produce 1D rows."""
         kept = []
@@ -88,48 +159,15 @@ class DisplayPlotMixin:
             return data
 
         # Get 1D data for all frames
-        ydata, xdata = self.get_frames_int_1d()
-
-        # 2D-derived axes require 2D data; fall back gracefully if unavailable
+        ydata, xdata = self.collect_plot_rows()
         if xdata is None or ydata is None:
-            _idx = self.ui.plotUnit.currentIndex()
-            _info = (self._plot_axis_info[_idx]
-                     if hasattr(self, '_plot_axis_info')
-                        and 0 <= _idx < len(self._plot_axis_info)
-                     else None)
-            needs_2d = ((_info and _info['source'] in ('2d', '1d_2d'))
-                        or self.ui.slice.isChecked())
-            if needs_2d and getattr(self.scan, 'skip_2d', False):
-                try:
-                    self.window().statusBar().showMessage(
-                        "Chi slicing requires 2D integration (1D Only is enabled).", 4000)
-                except Exception:
-                    logger.debug("Failed to show status bar message about chi slicing", exc_info=True)
-            # Fall back: disable slice, retry with plain 1D
-            self.ui.slice.setChecked(False)
-            ydata, xdata = self.get_frames_int_1d()
-            if xdata is None or ydata is None:
-                self.clear_plot_view()
-                return
+            self.clear_plot_view()
+            return
 
-        if self.scan.series_average:
-            frame_names = [self.scan.name]
-        else:
-            frame_names = [f'{self.scan.name}_{i}' for i in self.idxs]
-
-        # When slicing is active, include slice parameters in frame names
-        # so the same image with different slice ranges can be overlaid.
-        if self.ui.slice.isEnabled() and self.ui.slice.isChecked():
-            center = self.ui.slice_center.value()
-            width = self.ui.slice_width.value()
-            suffix = f' [{center:.1f}\u00b1{width:.1f}]'
-            frame_names = [n + suffix for n in frame_names]
+        frame_names = self.build_plot_names()
 
         # Subtract background
-        if self.bkg_1d is not None:
-            ydata -= self.bkg_1d
-        if ydata.ndim == 1:
-            ydata = ydata[np.newaxis, :]
+        ydata = self.apply_plot_background(ydata)
 
         # Single-mode overplots whatever rows are in the current
         # selection: a single-click gives one curve, shift/cmd-click
@@ -230,14 +268,10 @@ class DisplayPlotMixin:
             self.overlaid_idxs = list(self.idxs_1d)
 
         xdata, ydata = self.plot_data
-        if xdata.size == 0 or ydata.size == 0:
+        if not self.compute_plot_range(xdata, ydata):
             return
-        self.plot_data_range = [
-            [np.nanmin(xdata), np.nanmax(xdata)],
-            [np.nanmin(ydata), np.nanmax(ydata)],
-        ]
 
-        self.update_plot_view()
+        self.draw_plot_state()
 
     def _on_plotMethod_changed(self):
         """Handle plotMethod combo box changes.
