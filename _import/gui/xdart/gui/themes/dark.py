@@ -34,6 +34,18 @@ QWidget {
     selection-color: #f8f8f2;
 }
 
+/* Disabled text reads as dimmed everywhere (D2): the input widgets already
+   grey out (QLineEdit/QComboBox/QPushButton :disabled below), but a disabled
+   panel's *labels* and check/radio text stayed bright, so a disabled 2-D /
+   integration panel didn't read as off.  Grey the labels too. */
+QLabel:disabled,
+QCheckBox:disabled,
+QRadioButton:disabled,
+QGroupBox:disabled,
+QGroupBox::title:disabled {
+    color: #6272a4;
+}
+
 QMainWindow, QDialog {
     background-color: #282a36;
 }
