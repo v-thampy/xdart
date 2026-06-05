@@ -895,6 +895,140 @@ def test_int2d_cake_clears_without_publication(widget):
     assert df.binned_data is None                   # cake blanked, not stale
 
 
+# ── INT 1D plot characterization before update_plot cleanup ────────────────
+#
+# The normal INT plot currently has two live paths: native-axis
+# Single/Sum/Average draw from publication PlotPayload, while the stateful
+# modes and derived axes fall through to update_plot.  These tests lock the
+# computed render state (arrays/names/ranges/labels), not pixels, before the
+# cleanup makes update_plot canonical.
+
+def _plot_state(df):
+    x, y = df.plot_data
+    y = np.asarray(y)
+    return {
+        "x": np.asarray(x, dtype=float).copy(),
+        "y": np.asarray(y, dtype=float).copy(),
+        "names": tuple(df.frame_names),
+        "range": tuple(tuple(float(v) for v in row)
+                       for row in df.plot_data_range),
+        "x_axis": df._current_plot_axis_label(),
+        "curves": len(df.curves),
+        "waterfall": bool(df.plotMethod == "Waterfall"
+                          and (y.shape[0] if y.ndim > 1 else 1) > 3),
+    }
+
+
+def _assert_plot_states_equal(actual, expected):
+    np.testing.assert_allclose(actual["x"], expected["x"], equal_nan=True)
+    np.testing.assert_allclose(actual["y"], expected["y"], equal_nan=True)
+    assert actual["names"] == expected["names"]
+    assert actual["range"] == expected["range"]
+    assert actual["x_axis"] == expected["x_axis"]
+    assert actual["curves"] == expected["curves"]
+    assert actual["waterfall"] == expected["waterfall"]
+
+
+def _reset_plot_state(df):
+    df.clear_plot_view()
+    df.plot_data = [np.zeros(0), np.zeros(0)]
+    df.plot_data_range = [[0, 0], [0, 0]]
+    df.frame_names = []
+    df.overlaid_idxs = []
+    df._last_plot_unit = -1
+    df._payload_x_axis_label = None
+    df._payload_y_axis_label = None
+    df._using_publication_plot_payload = False
+
+
+@pytest.mark.parametrize("method, frame_ids", [
+    ("Single", ["0"]),
+    ("Single", ["0", "1", "2"]),
+    ("Sum", ["0", "1", "2"]),
+    ("Average", ["0", "1", "2"]),
+])
+def test_int_plot_native_live_payload_matches_direct_update_plot(widget, method, frame_ids):
+    # Commit-4 gate: these native-axis methods are payload-rendered today.  A
+    # future route flip may only happen because direct update_plot already
+    # reproduces the same computed state.
+    w = widget
+    df = _set_int_scan(w, n=3)
+    df.ui.plotMethod.setCurrentText(method)
+    df.ui.plotUnit.setCurrentIndex(0)  # native Q axis
+    w.frame_ids[:] = list(frame_ids)
+    df.frame_ids = list(frame_ids)
+    df.idxs_1d = [int(i) for i in frame_ids]
+    df.idxs_2d = [int(i) for i in frame_ids]
+
+    df.update()                         # currently-live payload path
+    live_state = _plot_state(df)
+    assert df._using_publication_plot_payload is False
+
+    _reset_plot_state(df)
+    df.update_plot()                    # future canonical path
+    direct_state = _plot_state(df)
+
+    _assert_plot_states_equal(direct_state, live_state)
+
+
+@pytest.mark.parametrize("method", ["Overlay", "Waterfall"])
+def test_int_plot_accumulating_modes_characterize_update_plot_state(widget, method):
+    # Overlay/Waterfall are intentionally update_plot-live today because they
+    # own cross-render history.  Lock append + duplicate-skip state.
+    w = widget
+    df = _set_int_scan(w, n=3)
+    df.ui.plotMethod.setCurrentText(method)
+    df.ui.plotUnit.setCurrentIndex(0)
+    for frame_id in ("0", "1", "1", "2"):
+        w.frame_ids[:] = [frame_id]
+        df.frame_ids = [frame_id]
+        df.idxs_1d = [int(frame_id)]
+        df.idxs_2d = [int(frame_id)]
+        df.update()
+
+    state = _plot_state(df)
+    assert state["names"] == ("scan_0", "scan_1", "scan_2")
+    assert state["y"].shape == (3, 5)
+    assert df.overlaid_idxs == [0, 1, 2]
+
+    df.ui.plotUnit.setCurrentIndex(1)   # unit-switch rebuild, not last-only
+    w.frame_ids[:] = ["2"]
+    df.frame_ids = ["2"]
+    df.idxs_1d = [2]
+    df.update()
+    rebuilt = _plot_state(df)
+    assert rebuilt["names"] == ("scan_0", "scan_1", "scan_2")
+    assert rebuilt["y"].shape == (3, 5)
+    assert df.overlaid_idxs == [0, 1, 2]
+    assert rebuilt["x_axis"][0].startswith("2")
+
+
+def test_int_plot_slice_characterizes_update_plot_state(widget):
+    # Slice-derived 1D is update_plot-live: it projects from the cake and
+    # includes the slice parameters in the trace name.
+    w = widget
+    df = _set_int_scan(w, n=1)
+    df.ui.plotMethod.setCurrentText("Single")
+    chi_index = df.ui.plotUnit.findText("χ (°)")
+    assert chi_index >= 0
+    df.ui.plotUnit.setCurrentIndex(chi_index)
+    df._on_plotUnit_changed()
+    df.ui.slice.setChecked(True)
+    df.ui.slice_center.setValue(0)
+    df.ui.slice_width.setValue(10)
+    w.frame_ids[:] = ["0"]
+    df.frame_ids = ["0"]
+    df.idxs_1d = [0]
+    df.idxs_2d = [0]
+
+    df.update()
+
+    state = _plot_state(df)
+    assert state["names"] == ("scan_0 [0.0±10.0]",)
+    assert state["y"].shape == (1, 4)
+    assert state["x_axis"][0] == "χ"
+
+
 # ── plotUnit combo: Int 1D must not offer 2D-derived axes (step 4-2 fold-in) ──
 #
 # set_axes is skip_2d-aware: Int 1D offers only axes computable from the 1D
