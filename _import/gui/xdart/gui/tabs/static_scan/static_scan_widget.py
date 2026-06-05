@@ -344,7 +344,11 @@ class staticWidget(QWidget):
         self.wrangler.finished.connect(self.wrangler_finished)
         if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'processingModeCombo'):
             def _on_mode_changed(mode_text):
-                # Skip when in viewer mode — set_viewer_display_mode controls panels
+                # Per-mode integration control enable/dim (C3/C4) — runs for
+                # every processing-mode change, including the viewer modes.
+                self._apply_integration_control_state()
+                # Skip the rest when in viewer mode — set_viewer_display_mode
+                # controls panels.
                 if 'Viewer' in mode_text:
                     return
                 # A non-viewer processing mode (Int 1D/2D, Int 1D (XYE)) must take
@@ -745,6 +749,44 @@ class staticWidget(QWidget):
         """
         self.integratorTree.setEnabled(enable)
 
+    def _apply_integration_control_state(self):
+        """Enable/disable the integration controls for the current mode (C3/C4).
+
+        - Int 1D / Int 1D (XYE): the 2-D integration panel is disabled — there
+          is no cake in a 1D-only run.
+        - Image / XYE / NeXus Viewer: the 1-D and 2-D integration panels are
+          disabled (file-browser modes; the wrangler processing params are
+          disabled separately via the wrangler ``tree``), but **Calibrate** and
+          **Make Mask** stay enabled — they're still useful in a viewer.
+        - Int 2D: everything enabled.
+
+        Disabled widgets dim via the theme's ``:disabled`` style (D2).  Keyed
+        off the processing-mode combo so it's one source of truth.
+        """
+        itree = getattr(self, 'integratorTree', None)
+        if itree is None or not hasattr(itree, 'ui'):
+            return
+        try:
+            mode_text = self.wrangler.ui.processingModeCombo.currentText()
+        except Exception:
+            mode_text = ''
+        is_viewer = mode_text in ('Image Viewer', 'XYE Viewer', 'NeXus Viewer')
+        is_1d_only = mode_text in ('Int 1D', 'Int 1D (XYE)')
+        ui = itree.ui
+        # 2-D integration panel: only in Int 2D.
+        frame2d = getattr(ui, 'frame2D', None)
+        if frame2d is not None:
+            frame2d.setEnabled(not is_viewer and not is_1d_only)
+        # 1-D integration panel: any Int mode, not viewers.
+        frame1d = getattr(ui, 'frame1D', None)
+        if frame1d is not None:
+            frame1d.setEnabled(not is_viewer)
+        # Calibrate / Make Mask stay enabled everywhere (incl. viewers).
+        for name in ('pyfai_calib', 'get_mask'):
+            btn = getattr(ui, name, None)
+            if btn is not None:
+                btn.setEnabled(True)
+
     def update_all(self, idx=None):
         """Updates all data in displays.
 
@@ -1068,6 +1110,9 @@ class staticWidget(QWidget):
                     if mode_text else is_file_viewer
                 )
                 tree.setEnabled(not viewer_processing)
+            # Per-mode integration control enable/dim (C3/C4): disable the 1-D/2-D
+            # integration panels in viewers, keep Calibrate / Make Mask enabled.
+            self._apply_integration_control_state()
             # Relax the Frames panel width so NeXus dataset labels aren't
             # clipped; restored on exit / other modes.
             self.h5viewer._apply_frames_panel_width(viewer_mode)

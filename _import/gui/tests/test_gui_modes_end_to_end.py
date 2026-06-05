@@ -879,3 +879,44 @@ def test_int1d_xye_keeps_wrangler_inputs_enabled(widget):
     _set_mode("XYE Viewer")
     w._on_viewer_mode_changed("xye")
     assert tree.isEnabled() is False
+
+
+# ── C3 / C4: per-mode integration control enable/dim ───────────────────────
+
+def test_integration_controls_enabled_per_mode(widget):
+    w = widget
+    combo = w.wrangler.ui.processingModeCombo
+    iu = w.integratorTree.ui
+
+    def _mode(text):
+        i = combo.findText(text)
+        if i < 0:
+            pytest.skip(f"processing mode {text!r} not available")
+        combo.blockSignals(True)
+        combo.setCurrentIndex(i)
+        combo.blockSignals(False)
+        w._apply_integration_control_state()
+
+    # Int 2D: both integration panels enabled.
+    _mode("Int 2D")
+    assert iu.frame1D.isEnabled() and iu.frame2D.isEnabled()
+
+    # Int 1D: the 2-D panel is disabled (no cake); 1-D stays.
+    _mode("Int 1D")
+    assert iu.frame1D.isEnabled() and not iu.frame2D.isEnabled()
+
+    # Int 1D (XYE): also 1D-only -> 2-D panel disabled.
+    i = combo.findText("Int 1D (XYE)")
+    if i >= 0:
+        _mode("Int 1D (XYE)")
+        assert not iu.frame2D.isEnabled()
+
+    # XYE Viewer: both integration panels disabled, but Calibrate / Make Mask
+    # stay enabled.
+    _mode("XYE Viewer")
+    assert not iu.frame1D.isEnabled() and not iu.frame2D.isEnabled()
+    assert iu.pyfai_calib.isEnabled() and iu.get_mask.isEnabled()
+
+    # Back to Int 2D restores everything.
+    _mode("Int 2D")
+    assert iu.frame1D.isEnabled() and iu.frame2D.isEnabled()
