@@ -851,3 +851,31 @@ def test_display_unit_toggle_does_not_change_integration_unit(widget):
     # Integration units are untouched — a later Int 1D (XYE) run still saves Q.
     assert sc.bai_1d_args["unit"] == "q_A^-1"
     assert sc.bai_2d_args["unit"] == "q_A^-1"
+
+
+# ── C2: Int 1D (XYE) is a processing mode — keep wrangler inputs enabled ────
+
+def test_int1d_xye_keeps_wrangler_inputs_enabled(widget):
+    w = widget
+    tree = getattr(w.wrangler, "tree", None)
+    assert tree is not None
+    combo = w.wrangler.ui.processingModeCombo
+
+    def _set_mode(text):
+        i = combo.findText(text)
+        if i < 0:
+            pytest.skip(f"processing mode {text!r} not available")
+        combo.blockSignals(True)
+        combo.setCurrentIndex(i)
+        combo.blockSignals(False)
+
+    # Int 1D (XYE): display auto-switches to XYE to list outputs, but it's a
+    # processing mode — inputs stay enabled.
+    _set_mode("Int 1D (XYE)")
+    w._on_viewer_mode_changed("xye")
+    assert tree.isEnabled() is True
+
+    # XYE Viewer: a file browser — inputs disabled.
+    _set_mode("XYE Viewer")
+    w._on_viewer_mode_changed("xye")
+    assert tree.isEnabled() is False

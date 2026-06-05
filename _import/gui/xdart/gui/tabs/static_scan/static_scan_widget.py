@@ -1051,7 +1051,23 @@ class staticWidget(QWidget):
             self.h5viewer.viewer_mode = viewer_mode
             tree = getattr(self.wrangler, 'tree', None)
             if tree is not None:
-                tree.setEnabled(not is_file_viewer)
+                # Only the actual file-Viewer *processing* modes disable the
+                # wrangler inputs.  Int 1D (XYE) is a processing mode whose
+                # display auto-switches to XYE to list the generated files, but
+                # its inputs (Image File / mask / …) must stay enabled so the
+                # user can keep processing.  Key off the processing-mode combo,
+                # not the display viewer_mode; fall back to the display when the
+                # combo is unavailable.
+                mode_text = ''
+                try:
+                    mode_text = self.wrangler.ui.processingModeCombo.currentText()
+                except Exception:
+                    mode_text = ''
+                viewer_processing = (
+                    mode_text in ('Image Viewer', 'XYE Viewer')
+                    if mode_text else is_file_viewer
+                )
+                tree.setEnabled(not viewer_processing)
             # Relax the Frames panel width so NeXus dataset labels aren't
             # clipped; restored on exit / other modes.
             self.h5viewer._apply_frames_panel_width(viewer_mode)
