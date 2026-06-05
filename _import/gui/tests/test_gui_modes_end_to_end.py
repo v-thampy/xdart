@@ -557,16 +557,61 @@ def test_xye_viewer_selection_equals_shown_deselect_removes_curve(widget):
     assert df.plot_data[1].shape[0] == 1
 
 
-def test_xye_viewer_mode_uses_multiselection(widget):
+def test_xye_viewer_mode_uses_extended_selection(widget):
+    # E1: ExtendedSelection restores arrow-key single-browse (the plot follows);
+    # a plain-click overlay toggle is layered on via the click filter.
     from PySide6.QtWidgets import QAbstractItemView
     w = widget
     w._on_viewer_mode_changed("xye")
     assert (w.h5viewer.ui.listScans.selectionMode()
-            == QAbstractItemView.MultiSelection)
+            == QAbstractItemView.ExtendedSelection)
     # Image/NeXus stay single-select.
     w._on_viewer_mode_changed("image")
     assert (w.h5viewer.ui.listScans.selectionMode()
             == QAbstractItemView.SingleSelection)
+
+
+def test_xye_plain_click_toggles_overlay(tmp_path, widget):
+    # E1: a plain left-click (no modifier) toggles a file into/out of the
+    # overlay; a third click removes it.
+    from PySide6.QtTest import QTest
+    from PySide6.QtCore import Qt
+    w = widget
+    for n in ("iq_a.xye", "iq_b.xye", "iq_c.xye"):
+        (tmp_path / n).write_text("0 1\n1 2\n")
+    h5v = w.h5viewer
+    h5v.dirname = str(tmp_path)
+    w._on_viewer_mode_changed("xye")
+    h5v.update_scans()
+    lw = h5v.ui.listScans
+
+    def _click(text):
+        for row in range(lw.count()):
+            it = lw.item(row)
+            if it.text() == text:
+                QTest.mouseClick(lw.viewport(), Qt.LeftButton, Qt.NoModifier,
+                                 lw.visualItemRect(it).center())
+                return
+        pytest.skip(f"{text} not listed")
+
+    _click("iq_a.xye")
+    assert {i.text() for i in lw.selectedItems()} == {"iq_a.xye"}
+    _click("iq_b.xye")                              # plain click ADDS to overlay
+    assert {i.text() for i in lw.selectedItems()} == {"iq_a.xye", "iq_b.xye"}
+    _click("iq_b.xye")                              # plain click again REMOVES it
+    assert {i.text() for i in lw.selectedItems()} == {"iq_a.xye"}
+
+
+def test_xye_entry_has_no_default_overlay(tmp_path, widget):
+    # E1: entering XYE shows the current row (or nothing), not a default overlay.
+    w = widget
+    for n in ("iq_a.xye", "iq_b.xye"):
+        (tmp_path / n).write_text("0 1\n1 2\n")
+    h5v = w.h5viewer
+    h5v.dirname = str(tmp_path)
+    w._on_viewer_mode_changed("xye")
+    h5v.update_scans()
+    assert len(h5v.ui.listScans.selectedItems()) <= 1
 
 
 def test_xye_live_refresh_preserves_multiselection(tmp_path, widget):

@@ -62,6 +62,45 @@ wranglers = {
 }
 
 
+class _XyeClickToggleFilter(QtCore.QObject):
+    """Modifier-free multi-select for the XYE file list (E1).
+
+    In XYE viewer the scans list uses ``ExtendedSelection`` (so arrow keys
+    browse one file at a time with the plot following, and shift gives a
+    range).  This filter makes a *plain* left-click on a data file toggle it
+    into/out of the overlay — applying ctrl+click semantics on a plain click —
+    so the overlay is built without holding any modifier.  Directories / ``..``
+    keep their default click-to-navigate behaviour, and the filter is inert
+    outside XYE mode.
+    """
+
+    def __init__(self, list_widget, is_active):
+        super().__init__(list_widget)
+        self._list = list_widget
+        self._is_active = is_active
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QtCore.QEvent.MouseButtonPress
+                and event.button() == QtCore.Qt.LeftButton
+                and event.modifiers() == QtCore.Qt.NoModifier
+                and self._is_active()):
+            try:
+                pos = event.position().toPoint()
+            except AttributeError:        # Qt5 fallback
+                pos = event.pos()
+            item = self._list.itemAt(pos)
+            if item is not None:
+                text = item.text()
+                if text != '..' and not text.endswith('/'):
+                    # Toggle this file in the overlay; move the cursor here
+                    # without disturbing the rest of the selection.
+                    item.setSelected(not item.isSelected())
+                    self._list.setCurrentItem(
+                        item, QtCore.QItemSelectionModel.NoUpdate)
+                    return True
+        return False
+
+
 def scanlocked(func):
     """Decorator that acquires scan_lock before calling the wrapped method.
 
@@ -386,6 +425,14 @@ class staticWidget(QWidget):
                 self._show_integration_advanced)
         self.wrangler.setup()
         self._sync_h5viewer_save_dir(getattr(self.wrangler, 'h5_dir', None))
+        # E1: plain-click-toggle for the XYE overlay (active only in xye mode).
+        try:
+            scans = self.h5viewer.ui.listScans
+            self._xye_click_filter = _XyeClickToggleFilter(
+                scans, lambda: getattr(self.h5viewer, 'viewer_mode', None) == 'xye')
+            scans.viewport().installEventFilter(self._xye_click_filter)
+        except Exception:
+            logger.debug("XYE click-toggle filter install failed", exc_info=True)
         self.h5viewer.sigNewFile.connect(self.wrangler.set_fname)
         self.h5viewer.sigNewFile.connect(self.displayframe.set_axes)
         self.h5viewer.sigNewFile.connect(self.h5viewer.data_reset)
@@ -1128,12 +1175,15 @@ class staticWidget(QWidget):
             # In viewer mode, disable New/Save (keep Open Folder and Export)
             self.h5viewer.actionNewFile.setEnabled(not is_viewer)
             self.h5viewer.actionSaveDataAs.setEnabled(not is_viewer)
-            # XYE viewer: modifier-free multi-select for overlay — a plain click
-            # toggles a row and leaves the others, so the user builds/trims the
-            # overlay one file at a time with no shift/ctrl, and the plot shows
-            # exactly the selected files.  Others: single select.
+            # XYE viewer: ExtendedSelection so arrow keys browse one file at a
+            # time with the plot following (shift+arrow / shift+click = range),
+            # PLUS a plain left-click toggles a file in/out of the overlay
+            # (modifier-free) via _XyeClickToggleFilter on the list viewport.
+            # Others: single select.  Start clean — show the current row only,
+            # never a default overlay.
             if viewer_mode == 'xye':
-                scans.setSelectionMode(QAbstractItemView.MultiSelection)
+                scans.setSelectionMode(QAbstractItemView.ExtendedSelection)
+                scans.clearSelection()
             else:
                 scans.setSelectionMode(QAbstractItemView.SingleSelection)
             # Configure display panels for the viewer mode
