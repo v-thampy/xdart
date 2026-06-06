@@ -361,6 +361,11 @@ class PublicationDisplayAdapter:
         return Axis(label=x_labels_2D[idx], unit=x_units_2D[idx], values=new_values)
 
     def plot_payload(self, state):
+        # INT 1D analysis plots are intentionally update_plot-canonical.  This
+        # scan-mode adapter supplies raw/cake payloads only; viewer plot
+        # payloads are built by their dedicated controllers.
+        if state.mode in (Mode.INT_1D, Mode.INT_2D):
+            return None
         # Overlay/Waterfall still use the legacy accumulator until the
         # publication payload owns overlay history explicitly.
         if state.method in ("Overlay", "Waterfall"):

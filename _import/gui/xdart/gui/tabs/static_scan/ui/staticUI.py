@@ -37,7 +37,7 @@ class Ui_Form(object):
         sizePolicy.setVerticalStretch(0)
         sizePolicy.setHeightForWidth(self.leftFrame.sizePolicy().hasHeightForWidth())
         self.leftFrame.setSizePolicy(sizePolicy)
-        self.leftFrame.setMinimumSize(QSize(200, 0))
+        self.leftFrame.setMinimumSize(QSize(360, 0))
         self.leftFrame.setFrameShape(QFrame.StyledPanel)
         self.leftFrame.setFrameShadow(QFrame.Raised)
         self.leftFrame.setLineWidth(5)

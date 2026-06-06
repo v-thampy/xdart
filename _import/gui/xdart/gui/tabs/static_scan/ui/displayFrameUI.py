@@ -151,7 +151,6 @@ class Ui_Form(object):
         self.scale.addItem("")
         self.scale.addItem("")
         self.scale.addItem("")
-        self.scale.addItem("")
         self.scale.setObjectName(u"scale")
         self.scale.setMinimumSize(QSize(80, 0))
         self.scale.setMaximumSize(QSize(80, 16777215))
@@ -446,8 +445,7 @@ class Ui_Form(object):
         self.labelCurrent.setText(QCoreApplication.translate("Form", u"Current", None))
         self.scale.setItemText(0, QCoreApplication.translate("Form", u"Linear", None))
         self.scale.setItemText(1, QCoreApplication.translate("Form", u"Log", None))
-        self.scale.setItemText(2, QCoreApplication.translate("Form", u"Log-Log", None))
-        self.scale.setItemText(3, QCoreApplication.translate("Form", u"Sqrt", None))
+        self.scale.setItemText(2, QCoreApplication.translate("Form", u"Sqrt", None))
 
         self.cmap.setItemText(0, QCoreApplication.translate("Form", u"Default", None))
         self.cmap.setItemText(1, QCoreApplication.translate("Form", u"viridis", None))

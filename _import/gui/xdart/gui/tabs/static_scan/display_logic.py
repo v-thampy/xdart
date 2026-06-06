@@ -176,20 +176,23 @@ PANEL_LAYOUT = {
         plotToolBar_h=(0, 0), binnedFrame_w=(0, _FULL),
     ),
     # Image Viewer: raw image only; 1D plot collapsed, cake collapsed,
-    # process controls + middle bar hidden.
+    # process controls hidden.  frame_6 (scale + cmap) kept so the Linear/Log
+    # scale and colormap apply to the raw image.
     Mode.IMAGE_VIEWER: PanelLayout(
         frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=False,
-        frame_4_vis=False, frame_6_vis=False, plotToolBar_vis=False,
+        frame_4_vis=False, frame_6_vis=True, plotToolBar_vis=False,
         show_image_btn_vis=False,
         twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
         plotWindow_h=(0, 0), imageToolbar_h=(40, 40),
         plotToolBar_h=(0, 0), binnedFrame_w=(0, 0),
     ),
     # XYE Viewer: 1D overlay only; 2D container hidden, middle bar kept
-    # (Single/Options/Legend/Clear), process controls hidden.
+    # (Single/Options/Legend/Clear), process controls hidden.  frame_6 kept so
+    # the Linear/Log scale applies to the 1D plot (cmap is hidden separately —
+    # it's 2D-only).
     Mode.XYE_VIEWER: PanelLayout(
         frame_top_vis=True, twoDWindow_vis=False, imageToolbar_vis=True,
-        frame_4_vis=False, frame_6_vis=False, plotToolBar_vis=False,
+        frame_4_vis=False, frame_6_vis=True, plotToolBar_vis=False,
         show_image_btn_vis=False,
         twoDWindow_h=(0, _FULL), imageWindow_h=(80, 85),
         plotWindow_h=(200, _FULL), imageToolbar_h=(40, 40),

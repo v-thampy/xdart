@@ -19,7 +19,10 @@ from xdart.gui.tabs.static_scan.display_data import (
     available_norm_channels,
 )
 from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
-from xdart.gui.tabs.static_scan.display_plot import DisplayPlotMixin
+from xdart.gui.tabs.static_scan.display_plot import (
+    DisplayPlotMixin,
+    update_plot_accumulator,
+)
 from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
 
@@ -508,6 +511,141 @@ def test_clear_display_state_resets_visible_and_cached_state():
     assert image_widget.raw_image.size == 0
     assert binned_widget.raw_image.size == 0
     assert wf_widget.raw_image.size == 0
+
+
+def _persist_image_host(processing, persist=True, data=None):
+    """Minimal host to exercise update_image's blank-vs-keep-last decision."""
+    image_widget = _FakeImageWidget()
+    cleared = []
+    host = SimpleNamespace(
+        PERSIST_2D_DURING_PROCESSING=persist,
+        _processing_active=processing,
+        _image_levels_override=None,
+        overall=False,
+        frame_ids=[],
+        image_widget=image_widget,
+        get_frames_map_raw=lambda *a, **k: (data, None),
+    )
+    host.clear_image_view = lambda: cleared.append(True)
+    host.update_image = MethodType(displayFrameWidget.update_image, host)
+    return host, cleared
+
+
+def test_update_image_keeps_last_during_run_when_data_missing():
+    # Panel-consistency: while a run is active, a missing in-flight frame must
+    # NOT blank the raw panel — it keeps the last image (like the 1D plot).
+    host, cleared = _persist_image_host(processing=True, data=None)
+
+    host.update_image()
+
+    assert cleared == []                 # not blanked during the run
+
+
+def test_update_image_blanks_when_idle_and_data_missing():
+    # Outside a run the old behavior is unchanged: missing data blanks the raw
+    # panel (so mode-switch / selection still clears stale content).
+    host, cleared = _persist_image_host(processing=False, data=None)
+
+    host.update_image()
+
+    assert cleared == [True]             # blanked when not running
+
+
+def test_update_image_blanks_during_run_when_flag_off():
+    # The revert switch restores blanking even during a run.
+    host, cleared = _persist_image_host(processing=True, persist=False, data=None)
+
+    host.update_image()
+
+    assert cleared == [True]
+
+
+def test_draw_delegate_cake_persists_during_run():
+    # CAKE_2D: a None cake payload normally returns clear_binned_view (blank);
+    # during a run it returns None so render skips the panel (keep last).
+    from xdart.gui.tabs.static_scan.display_logic import Mode, PanelRole
+
+    host = SimpleNamespace(
+        PERSIST_2D_DURING_PROCESSING=True,
+        _processing_active=False,
+        clear_binned_view=lambda: None,
+    )
+    host._draw_delegate = MethodType(displayFrameWidget._draw_delegate, host)
+
+    # Idle -> blanks the cake (old behavior).
+    assert host._draw_delegate(PanelRole.CAKE_2D, Mode.INT_2D) is host.clear_binned_view
+
+    # Running -> keep last (None delegate -> render skips this panel).
+    host._processing_active = True
+    assert host._draw_delegate(PanelRole.CAKE_2D, Mode.INT_2D) is None
+
+    # Revert switch off -> blanks even during a run.
+    host.PERSIST_2D_DURING_PROCESSING = False
+    assert host._draw_delegate(PanelRole.CAKE_2D, Mode.INT_2D) is host.clear_binned_view
+
+
+def test_set_processing_active_sets_flag():
+    host = SimpleNamespace(_processing_active=False)
+    host.set_processing_active = MethodType(
+        displayFrameWidget.set_processing_active, host)
+    host.set_processing_active(True)
+    assert host._processing_active is True
+    host.set_processing_active(False)
+    assert host._processing_active is False
+
+
+def _empty_update_host(processing, persist=True):
+    """Host that drives update()'s nothing-to-draw branch with empty caches
+    (the silent-batch case): _updated() False, no cached data."""
+    rendered = []
+    host = SimpleNamespace(
+        PERSIST_2D_DURING_PROCESSING=persist,
+        _processing_active=processing,
+        _display_blanked=False,
+        display_generation=0,
+        data_1d={},                 # empty caches == silent batch
+        data_2d={},
+        data_lock=RLock(),
+        refresh_norm_channels=lambda: None,
+        get_idxs=lambda: None,
+        _note_selection_generation=lambda: None,
+        _updated=lambda: False,     # nothing to draw for the selection
+        _live_mode=lambda: False,
+        render_display=lambda state, payload: rendered.append("render"),
+    )
+    host.update = MethodType(displayFrameWidget.update, host)
+    return host, rendered
+
+
+def test_update_keeps_display_during_run_when_caches_empty():
+    # Silent batch: nothing cached, but a run is active -> keep the current
+    # display (no empty render), so 1D + 2D persist together.
+    host, rendered = _empty_update_host(processing=True)
+
+    host.update()
+
+    assert rendered == []                 # no empty render -> no blank
+    assert host._display_blanked is False
+
+
+def test_update_blanks_when_idle_and_caches_empty():
+    # Not running + nothing cached -> the explicit blank still happens.
+    host, rendered = _empty_update_host(processing=False)
+
+    host.update()
+
+    assert rendered == ["render"]         # empty_display_state rendered
+    assert host._display_blanked is True
+
+
+def test_update_blanks_during_run_when_flag_off():
+    # Revert switch restores the old mid-run blank.
+    host, rendered = _empty_update_host(processing=True, persist=False)
+
+    host.update()
+
+    assert rendered == ["render"]
+    assert host._display_blanked is True
 
 
 def test_display_generation_bumps_on_mode_switch_and_selection():
@@ -1364,7 +1502,7 @@ def test_publication_plot_fallback_uses_legacy_draw_for_derived_axes_and_slice()
         host.render_display(state, payload)
         return calls, payload
 
-    for source, sliced in (("2d", False), ("1d_2d", True)):
+    for source, sliced in (("1d", False), ("2d", False), ("1d_2d", True)):
         calls, payload = render_with_axis(source, sliced)
         assert payload.plot is None
         assert "draw_plot" in calls
@@ -2591,11 +2729,101 @@ def _plot_host(method="Overlay"):
 
     host.get_frames_int_1d = get_frames_int_1d
     host.get_int_1d = get_int_1d
-    host.update_plot = MethodType(DisplayPlotMixin.update_plot, host)
-    host._loaded_1d_overlay_labels = MethodType(
-        DisplayPlotMixin._loaded_1d_overlay_labels, host,
-    )
+    for name in (
+        "resolve_plot_axis",
+        "collect_plot_rows",
+        "build_plot_names",
+        "apply_plot_background",
+        "compute_plot_range",
+        "draw_plot_state",
+        "_loaded_1d_overlay_labels",
+        "update_plot",
+    ):
+        setattr(host, name, MethodType(getattr(DisplayPlotMixin, name), host))
     return host
+
+
+def test_update_plot_accumulator_replaces_for_single_sum_average():
+    out, names, ids = update_plot_accumulator(
+        [np.array([99.0]), np.array([[99.0]])],
+        ["old"],
+        [99],
+        np.array([0.0, 1.0]),
+        np.array([[1.0, 2.0], [3.0, 4.0]]),
+        ["scan_1", "scan_2"],
+        [1, 2],
+        "Average",
+        False,
+    )
+
+    np.testing.assert_allclose(out[0], [0.0, 1.0])
+    np.testing.assert_allclose(out[1], [[1.0, 2.0], [3.0, 4.0]])
+    assert names == ["scan_1", "scan_2"]
+    assert ids == [1, 2]
+
+
+def test_update_plot_accumulator_appends_skips_duplicates_and_merges_grids():
+    out, names, ids = update_plot_accumulator(
+        [np.array([0.0, 1.0]), np.array([[1.0, 2.0]])],
+        ["scan_1"],
+        [1],
+        np.array([0.5, 1.5]),
+        np.array([[10.0, 20.0], [30.0, 40.0]]),
+        ["scan_1", "scan_2"],
+        [1, 2],
+        "Overlay",
+        False,
+    )
+
+    np.testing.assert_allclose(out[0], [0.0, 0.5, 1.0, 1.5])
+    np.testing.assert_allclose(
+        out[1],
+        [
+            [1.0, 1.5, 2.0, np.nan],
+            [np.nan, 30.0, 35.0, 40.0],
+        ],
+        equal_nan=True,
+    )
+    assert names == ["scan_1", "scan_2"]
+    assert ids == [1, 2]
+
+
+def test_update_plot_accumulator_rebuilds_on_unit_change():
+    out, names, ids = update_plot_accumulator(
+        [np.array([0.0, 1.0]), np.array([[1.0, 2.0]])],
+        ["scan_1"],
+        [1],
+        np.array([10.0, 11.0]),
+        np.array([[5.0, 6.0]]),
+        ["scan_1"],
+        [1],
+        "Waterfall",
+        True,
+    )
+
+    np.testing.assert_allclose(out[0], [10.0, 11.0])
+    np.testing.assert_allclose(out[1], [[5.0, 6.0]])
+    assert names == ["scan_1"]
+    assert ids == [1]
+
+
+def test_update_plot_accumulator_skips_empty_incoming_grid():
+    out, names, ids = update_plot_accumulator(
+        [np.array([0.0, 1.0]), np.array([[1.0, 2.0]])],
+        ["scan_1"],
+        [1],
+        np.array([]),
+        np.zeros((1, 0)),
+        ["scan_2"],
+        [2],
+        "Overlay",
+        False,
+    )
+
+    np.testing.assert_allclose(out[0], [0.0, 1.0])
+    np.testing.assert_allclose(out[1], [[1.0, 2.0]])
+    assert names == ["scan_1"]
+    assert ids == [1]
 
 
 def test_overlay_unit_switch_rebuilds_all_accumulated_curves():
@@ -2686,7 +2914,8 @@ def test_overlay_append_empty_accumulator_seeds_fresh_grid():
 
     assert host.plot_data[0].size == 2              # grid seeded
     assert host.plot_data[1].shape == (1, 2)
-    assert "scan_1" in host.frame_names
+    assert host.frame_names == ["scan_1"]
+    assert host.overlaid_idxs == [1]
 
 
 def test_xye_single_method_change_clears_accumulated_traces_immediately():
@@ -2751,7 +2980,7 @@ def test_xye_axis_label_uses_file_unit_not_hidden_transform_combo():
     )
 
 
-def test_xye_loader_marks_unknown_units_without_guessing(monkeypatch, tmp_path):
+def test_xye_loader_defaults_unprefixed_files_to_q(monkeypatch, tmp_path):
     import xdart.gui.tabs.static_scan.h5viewer as h5viewer_mod
 
     monkeypatch.setattr(
@@ -2788,7 +3017,7 @@ def test_xye_loader_marks_unknown_units_without_guessing(monkeypatch, tmp_path):
 
     assert viewer.data_1d[1].int_1d.unit == "q_A^-1"
     assert viewer.data_1d[2].int_1d.unit == "2th_deg"
-    assert viewer.data_1d[3].int_1d.unit == "unknown"
+    assert viewer.data_1d[3].int_1d.unit == "q_A^-1"
 
 
 def test_standard_plot_axis_defaults_to_integrated_2theta_unit():

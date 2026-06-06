@@ -112,10 +112,29 @@ class _XyeOverlayInputFilter(QtCore.QObject):
             return self._on_key(event)
         return False
 
+    @staticmethod
+    def _meaningful_modifiers(event):
+        """Return the shift/ctrl/meta bits held, coerced to int.
+
+        Mirrors ``_AccumulatingClickFilter``: raw ``modifiers() != NoModifier``
+        comparisons are unreliable under PySide6 (a plain click can carry a
+        stray flag, notably on macOS), so coerce to int and mask to the only
+        modifiers we care about.  Returns ``(has_shift, has_toggle_mod)``."""
+        try:
+            mods = int(event.modifiers())
+        except (TypeError, ValueError):
+            return False, False
+        shift_bit = int(QtCore.Qt.ShiftModifier)
+        ctrl_bit = int(QtCore.Qt.ControlModifier)
+        meta_bit = int(QtCore.Qt.MetaModifier)
+        return bool(mods & shift_bit), bool(mods & (ctrl_bit | meta_bit))
+
     def _on_click(self, event):
-        if (event.button() != QtCore.Qt.LeftButton
-                or event.modifiers() != QtCore.Qt.NoModifier):
-            return False                  # let Qt handle shift/ctrl range/toggle
+        if event.button() != QtCore.Qt.LeftButton:
+            return False
+        has_shift, has_toggle_mod = self._meaningful_modifiers(event)
+        if has_shift:
+            return False                  # let Qt handle shift range-select
         try:
             pos = event.position().toPoint()
         except AttributeError:            # Qt5 fallback
@@ -123,16 +142,20 @@ class _XyeOverlayInputFilter(QtCore.QObject):
         item = self._list.itemAt(pos)
         if not self._is_data_item(item):
             return False
-        if not self._accumulating():
-            return False                  # Single: Qt replace (browse one)
-        # Accumulating: toggle this file in/out of the overlay.
-        item.setSelected(not item.isSelected())
-        self._list.setCurrentItem(item, QtCore.QItemSelectionModel.NoUpdate)
+        if not (has_toggle_mod or self._accumulating()):
+            return False                  # Single plain click: Qt replace
+        # Accumulating (or explicit ctrl/cmd-toggle): toggle this file in/out of
+        # the overlay via the selection model (robust in ExtendedSelection).
+        sm = self._list.selectionModel()
+        idx = self._list.indexFromItem(item)
+        sm.select(idx, QtCore.QItemSelectionModel.Toggle)
+        sm.setCurrentIndex(idx, QtCore.QItemSelectionModel.NoUpdate)
         return True
 
     def _on_key(self, event):
+        has_shift, has_toggle_mod = self._meaningful_modifiers(event)
         if (not self._accumulating()
-                or event.modifiers() != QtCore.Qt.NoModifier
+                or has_shift or has_toggle_mod
                 or event.key() not in (QtCore.Qt.Key_Up, QtCore.Qt.Key_Down)):
             return False                  # Single / modified: Qt default browse
         step = -1 if event.key() == QtCore.Qt.Key_Up else 1
@@ -374,6 +397,10 @@ class staticWidget(QWidget):
 
         # Integrator signals
         self.integratorTree.integrator_thread.started.connect(self.thread_state_changed)
+        # Panel-consistency: re-integration is a "run" too — keep the 2D panels
+        # persistent for its duration (cleared in integrator_thread_finished).
+        self.integratorTree.integrator_thread.started.connect(
+            lambda: self.displayframe.set_processing_active(True))
         self.integratorTree.integrator_thread.update.connect(self.integrator_thread_update)
         self.integratorTree.integrator_thread.finished.connect(self.integrator_thread_finished)
 
@@ -455,12 +482,8 @@ class staticWidget(QWidget):
                 # or curve visible when the new mode needs data that has not
                 # been loaded yet.
                 self.displayframe.clear_display_state()
+                self.displayframe.request_plot_autorange()
                 self.h5viewer.data_changed()
-                # R2-3: a processing-mode switch changes the 1D data span (and a
-                # prior Share-Axis link may have frozen the view) — refit the
-                # plot after the re-render settles.
-                QtCore.QTimer.singleShot(
-                    0, self.displayframe._autorange_plot_view)
             self.wrangler.ui.processingModeCombo.currentTextChanged.connect(_on_mode_changed)
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
             self.wrangler.sigViewerModeChanged.connect(self._on_viewer_mode_changed)
@@ -935,6 +958,9 @@ class staticWidget(QWidget):
         integratorThread
         """
         self.thread_state_changed()
+        # End the processing-active window BEFORE the final refresh so the 2D
+        # panels resume normal blank-on-missing behavior for the final frame.
+        self.displayframe.set_processing_active(False)
         self.enable_integration(True)
         self.h5viewer.set_open_enabled(True)
         self.update_all()
@@ -1105,6 +1131,17 @@ class staticWidget(QWidget):
         live = not getattr(self.wrangler.thread, 'batch_mode', False)
         self.h5viewer.live_run_active = live
         self.h5viewer.file_thread.live_run = live
+        # Int 1D (XYE) writes only .xye files (no .nxs); tell the file thread
+        # not to try loading a .nxs that will never exist.  Cleared in
+        # wrangler_finished so a later normal open still loads from disk.
+        self.h5viewer.file_thread.no_nxs = getattr(
+            self.wrangler.thread, 'xye_only', False)
+
+        # Panel-consistency: mark the run active so the 2D panels keep their
+        # last-rendered content (instead of blanking) while the run's frames
+        # arrive — matching the 1D plot's persistence.  Cleared in
+        # wrangler_finished.
+        self.displayframe.set_processing_active(True)
 
         self.wrangler.thread.start()
 
@@ -1112,6 +1149,10 @@ class staticWidget(QWidget):
         """Called by the wrangler finished signal. If current scan
         matches the wrangler scan, allows for integration.
         """
+        # End the processing-active window BEFORE the final flush so the 2D
+        # panels resume normal blank-on-missing behavior for the final frame.
+        self.displayframe.set_processing_active(False)
+
         # Flush any pending coalesced update so the final frame is shown.
         self._update_timer.stop()
         self._flush_pending_update()
@@ -1123,6 +1164,9 @@ class staticWidget(QWidget):
         # caches again.
         self.h5viewer.live_run_active = False
         self.h5viewer.file_thread.live_run = False
+        # Clear the XYE-only no-load flag so the end-of-batch auto-load (and any
+        # later normal file open) reads the .nxs from disk again.
+        self.h5viewer.file_thread.no_nxs = False
 
         self.thread_state_changed()
         self.wrangler.stop()
@@ -1172,9 +1216,10 @@ class staticWidget(QWidget):
                     # Same path the XYE Viewer combo takes: set viewer_mode,
                     # panels, selection mode, and refresh listScans.
                     self._on_viewer_mode_changed('xye')
-                    # Auto-select the last (most recent) generated file so
-                    # the final pattern is shown without a manual click.
-                    self.h5viewer.select_last_scan_entry()
+                    # Auto-select the most recently *written* file (by mtime),
+                    # not the name-last one, so the final pattern from this run
+                    # is shown without a manual click.
+                    self.h5viewer.select_most_recent_scan_entry()
                 else:
                     logger.debug(
                         'XYE-only batch finished but output dir not found: %s',

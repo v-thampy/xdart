@@ -116,6 +116,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # plot methods don't require shift/ctrl multi-select.
     sigPlotMethodChanged = Qt.QtCore.Signal(str)
 
+    # Feature flag: during a processing run, keep the last-rendered 2D panels
+    # (raw image + cake) on screen instead of blanking them when the in-flight
+    # frame's 2D data isn't available yet — so the 2D panels persist exactly
+    # like the 1D plot does (which keeps its curve).  Set False to restore the
+    # previous behavior (2D panels blank during the run).  This is the single
+    # revert switch for the panel-consistency feature.
+    PERSIST_2D_DURING_PROCESSING = True
+
     """Widget for displaying 2D image data and 1D plots from LiveScan
     objects.
 
@@ -331,6 +339,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._display_blanked = False
         self._last_selection_sig = None
 
+        # True while a wrangler/integrator run is in progress.  Set by
+        # staticWidget at run start, cleared at run end (incl. Stop).  Drives
+        # the PERSIST_2D_DURING_PROCESSING feature: while a run is active, the
+        # 2D panels keep their last-rendered content instead of blanking when
+        # the in-flight frame's 2D data isn't available yet.
+        self._processing_active = False
+
         # Stage 5: register the mode controllers (Scan/ImageViewer/XYEViewer)
         # into the open registry; _live_display_state dispatches through them.
         register_default_controllers()
@@ -346,6 +361,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._payload_x_axis_label = None
         self._payload_y_axis_label = None
         self._using_publication_plot_payload = False
+        self._plot_autorange_requested = False
 
         # Cached display data
         self.image_data = (None, None)
@@ -434,12 +450,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.plotMethod.currentIndexChanged.connect(self._on_plotMethod_changed)
         self.ui.yOffset.valueChanged.connect(self.update_plot_view)
         self.ui.plotUnit.activated.connect(self._on_plotUnit_changed)
+        self.ui.plotUnit.activated.connect(self.request_plot_autorange)
         self.ui.plotUnit.activated.connect(self.update_plot)
-        # B2: a user 1D-unit change re-expresses the x-values (Q<->2θ), so the
-        # view must refit the new data range instead of staying at the old one.
-        # ``activated`` fires only on user interaction (not the silent Share-Axis
-        # setCurrentIndex), and after update_plot above, so plot_data is current.
-        self.ui.plotUnit.activated.connect(self._autorange_plot_view)
         self.ui.showLegend.toggled.connect(self.update_legend)
         self.ui.slice.toggled.connect(self._sync_slice_controls)
         self.ui.slice.toggled.connect(self.update_plot)
@@ -644,7 +656,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 return True
             with self.data_lock:
                 has_cached = bool(self.data_1d) or bool(self.data_2d)
-            if has_cached:
+            # Panel-consistency: while a run is active, keep the current display
+            # instead of blanking when there's nothing new to draw.  A silent
+            # batch run populates the GUI caches only at the end, so without this
+            # the empty-render path blanks all panels mid-run (2D goes blank, and
+            # clear_plot_view drops the 1D legend) — the inconsistency Vivek saw.
+            # Keeping the display freezes ALL panels (1D + 2D) until the run's
+            # data lands, so they persist together.
+            if has_cached or (getattr(self, 'PERSIST_2D_DURING_PROCESSING', True)
+                              and getattr(self, '_processing_active', False)):
                 return True
             empty = empty_display_state(self._live_mode(), self.display_generation)
             result = self.render_display(empty, None)
@@ -653,14 +673,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         state = self._live_display_state()
         ctrl = controller_for(state.mode)
-        # Share Axis links the 1D plot to the cake's unit.  Apply it BEFORE the
-        # payload is built so the unit the 1D path reads (and re-expresses to)
-        # and the axis label come from the same post-link unit in ONE render —
-        # otherwise build_payload reads the stale plotUnit and renders Q data
-        # while the later relabel shows 2θ (the intermittent Share-Axis race,
-        # R2-2).  render_display re-applies it (idempotent).
-        if state.mode in (Mode.INT_1D, Mode.INT_2D):
-            self._apply_share_axis_state()
         payload = ctrl.build_payload(self, state)  # store=None ⇒ delegate draws
         result = self.render_display(state, payload)
         self._display_blanked = False
@@ -674,9 +686,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # only.  These collapse into mode controllers in Stage 5.
     def _draw_delegate(self, role, mode):
         # Payload-only viewer modes (Image / XYE / NeXus): a ``None`` payload
-        # means blank that panel — there is no legacy draw fallback.  Only the
-        # Int 1D / Int 2D integration views still fall back to the legacy
-        # ``update_*`` pixel pushers (that's step 4).
+        # means blank that panel — there is no legacy draw fallback.  Normal
+        # integration plots intentionally delegate to update_plot; raw images
+        # still keep update_image as their fallback.
         if role is PanelRole.RAW_2D:
             if mode in (Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER):
                 return self.clear_image_view
@@ -687,7 +699,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return self.update_plot
         if role is PanelRole.CAKE_2D:
             # CAKE_2D renders solely from the payload (cake_image); a None cake
-            # payload blanks the panel — no legacy update_binned fallback.
+            # payload normally blanks the panel (no legacy update_binned
+            # fallback).  Panel-consistency: while a run is active, keep the last
+            # cake on screen instead of blanking (None delegate -> render skips
+            # this panel) so it persists like the 1D plot.
+            if (getattr(self, 'PERSIST_2D_DURING_PROCESSING', True)
+                    and getattr(self, '_processing_active', False)):
+                return None
             return self.clear_binned_view
         return None
 
@@ -994,9 +1012,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.plotMethod = self.ui.plotMethod.currentText()
         self.scale = self.ui.scale.currentText()
 
-        if self.viewer_mode == 'image':
-            # Image viewer: only update the raw image panel
-            self.update_image_view()
+        if self.viewer_mode is not None:
+            # Viewer modes render through the payload path (_draw_image_payload /
+            # update_plot_view), which read self.scale / self.cmap directly.  Go
+            # through update() so a Linear/Log (or colormap) change redraws the
+            # Image/XYE viewer correctly instead of using the Int-mode draws.
+            self.update()
             return
 
         self.update_image_view()
@@ -1270,8 +1291,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         stuck axis.  Re-enable autoRange so it fits the 1D curve."""
         if not checked:
             try:
-                self.plot.enableAutoRange()
+                # Immediate fit, then re-arm continuous tracking (see
+                # _autorange_plot_view for why the order matters).
                 self.plot.autoRange()
+                self.plot.enableAutoRange()
             except Exception:
                 logger.debug("1D autoscale on Share Axis off failed",
                              exc_info=True)
@@ -1280,14 +1303,23 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._set_slice_range()
 
     def _autorange_plot_view(self, *args):
-        """Refit the 1D plot view to the current data (B2).
+        """Refit the 1D plot view to the current data and KEEP auto-ranging on.
 
         A 1D-unit change re-expresses the x-values (Q<->2θ span very different
         ranges), so the view must auto-range to the new data instead of staying
-        frozen at the previous unit's range."""
+        frozen at the previous unit's range.
+
+        Do a one-shot ``autoRange()`` for an IMMEDIATE refit (synchronous — the
+        headless tests and the user both need the view to reflect the new data
+        right away), then re-arm continuous auto with ``enableAutoRange()``.
+        Order matters: ``autoRange()`` internally calls
+        ``setRange(disableAutoRange=True)`` which turns continuous tracking OFF,
+        so the trailing ``enableAutoRange()`` is what keeps the y-axis following
+        new live traces (instead of freezing and clipping a taller peak) until
+        the user manually zooms."""
         try:
-            self.plot.enableAutoRange()
-            self.plot.autoRange()
+            self.plot.autoRange()        # immediate fit (disables auto)
+            self.plot.enableAutoRange()  # re-arm continuous tracking
         except Exception:
             logger.debug("1D autoscale on unit change failed", exc_info=True)
 
@@ -1302,6 +1334,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         would not match the thumbnail's smaller shape.
         """
         self._image_levels_override = None
+        # Panel-consistency: while a run is active, keep the last raw image on
+        # screen rather than blanking when the in-flight frame's data isn't
+        # available yet — so the raw panel persists like the 1D plot.
+        keep_last = (getattr(self, 'PERSIST_2D_DURING_PROCESSING', True)
+                     and getattr(self, '_processing_active', False))
         mask = None
         if self.overall and len(self.frame_ids) > 1:
             # G2: aggregate via per-frame dict instead of the deleted
@@ -1315,12 +1352,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 require_all=True,
             )
             if data is None:
-                self.clear_image_view()
+                if not keep_last:
+                    self.clear_image_view()
                 return
         else:
             data, raw_source = self.get_frames_map_raw(return_source=True)
             if data is None:
-                self.clear_image_view()
+                if not keep_last:
+                    self.clear_image_view()
                 return
 
             # Apply Mask — O8: snapshot under data_lock so a
@@ -1358,7 +1397,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             )
 
         if data.size == 0 or not np.isfinite(data).any():
-            self.clear_image_view()
+            if not keep_last:
+                self.clear_image_view()
             return
 
         data = data.T[:, ::-1]
@@ -1618,6 +1658,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if title is not None:
             self.ui.labelCurrent.setText(title)
 
+    def set_processing_active(self, active):
+        """Mark a wrangler/integrator run as in progress (or finished).
+
+        Called by ``staticWidget`` at run start/end (incl. Stop).  While active,
+        the PERSIST_2D_DURING_PROCESSING feature keeps the last-rendered 2D
+        panels on screen instead of blanking them when the in-flight frame's 2D
+        data isn't available yet — so the 2D panels persist like the 1D plot.
+        """
+        self._processing_active = bool(active)
+
     def set_viewer_display_mode(self, mode):
         """Configure display panels for viewer modes.
 
@@ -1670,9 +1720,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # 2D-only controls (Share Axis, 2D unit, slice) are meaningless.
             self.ui.plotUnit.setVisible(False)
             self._set_2d_controls_visible(False)
+            # frame_6 is shown so the Linear/Log scale applies to the 1D plot,
+            # but the colormap combo is 2D-only — hide it here.
+            self.ui.cmap.setVisible(False)
+            self.ui.scale.setEnabled(True)
         elif mode in ('image', 'nexus'):
             # Raw image / schema preview need no extra control state beyond the
-            # geometry table.
+            # geometry table.  The Linear/Log scale + colormap apply to the raw
+            # image, so make sure both are shown/enabled (cmap may have been
+            # hidden by a prior XYE-viewer visit).
+            self.ui.cmap.setVisible(True)
+            self.ui.cmap.setEnabled(True)
+            self.ui.scale.setEnabled(True)
             if mode == 'nexus':
                 self._set_equal_primary_panel_heights()
         else:
@@ -1683,6 +1742,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.imageUnit.setEnabled(True)
             self.ui.scale.setEnabled(True)
             self.ui.cmap.setEnabled(True)
+            self.ui.cmap.setVisible(True)   # restore if hidden by XYE viewer
             self.ui.plotUnit.setVisible(True)
             self.ui.plotUnit.setEnabled(True)
             self.ui.plotMethod.setEnabled(True)

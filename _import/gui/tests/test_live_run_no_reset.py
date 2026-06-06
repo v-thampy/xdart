@@ -83,6 +83,20 @@ def test_set_datafile_non_live_reloads_from_disk():
     assert calls == ["/data/scan_42.nxs"]  # scan.set_datafile was called
 
 
+def test_set_datafile_no_nxs_repoints_without_load():
+    """Int 1D (XYE) sets ``no_nxs`` because it never writes a .nxs.  Even in a
+    non-live (batch) run, set_datafile must then repoint only — never call
+    scan.set_datafile (which would try to load/create the absent .nxs)."""
+    thread, scan, calls = _file_thread(live_run=False)
+    thread.no_nxs = True
+
+    thread.set_datafile()
+
+    assert calls == []                       # no load/create attempted
+    assert scan.data_file == "/data/scan_42.nxs"
+    assert scan.name == "scan_42"
+
+
 def _reset_viewer(live_run_active):
     from xdart.modules.frame_publication import PublicationStore
 

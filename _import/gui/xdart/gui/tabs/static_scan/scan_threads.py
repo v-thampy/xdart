@@ -540,7 +540,16 @@ class fileHandlerThread(Qt.QtCore.QThread):
     def set_datafile(self):
         with self.file_lock:
             skip_2d = getattr(self.scan, 'skip_2d', False)
-            if getattr(self, 'live_run', False):
+            if getattr(self, 'no_nxs', False):
+                # Int 1D (XYE) writes only .xye files and never creates the
+                # .nxs, so there is nothing to load — repoint the path/name
+                # only.  Gated by an explicit flag (set per-run in
+                # start_wrangler) rather than os.path.exists, so a genuinely
+                # missing .nxs in normal mode still surfaces as a load error
+                # instead of being silently treated as an empty XYE result.
+                self.scan.data_file = self.fname
+                self.scan.name = os.path.split(self.fname)[-1].split('.')[0]
+            elif getattr(self, 'live_run', False):
                 # Live, non-batch run: the wrangler owns this file and
                 # is feeding the GUI in-memory frames per frame.  A full
                 # ``scan.set_datafile`` would call ``load_from_h5``,
