@@ -428,9 +428,51 @@ class H5Viewer(QWidget):
         self.ui = Ui_Form()
         self.ui.setupUi(self)
         self.layout = self.ui.gridLayout
+        self._add_refresh_button()
         self.defaultWidget = defaultWidget()
         self.defaultWidget.sigSetUserDefaults.connect(self.set_user_defaults)
         self._apply_frames_panel_width(None)
+
+    def _add_refresh_button(self):
+        """Add a Refresh button to the left of Show All / Auto Last.
+
+        It re-reads the current directory listing (``update_scans``) — handy in
+        Image/XYE Viewer modes where new files may be written outside xdart
+        while a run is in progress.  The three buttons are reflowed into one
+        row so Refresh sits to the left of the existing two.
+        """
+        self.ui.refresh = QtWidgets.QPushButton('Refresh')
+        self.ui.refresh.setObjectName('refresh')
+        self.ui.refresh.setMaximumSize(QtCore.QSize(16777215, 25))
+
+        btn_row = QtWidgets.QWidget()
+        # Constrain the row to the button height so it doesn't steal vertical
+        # stretch from the lists splitter above (which would leave the buttons
+        # floating in the middle of the panel).
+        btn_row.setFixedHeight(25)
+        btn_row.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        btn_layout = QtWidgets.QHBoxLayout(btn_row)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(self.ui.gridLayout.horizontalSpacing())
+        # Move the existing buttons out of the grid into the row.
+        self.ui.gridLayout.removeWidget(self.ui.show_all)
+        self.ui.gridLayout.removeWidget(self.ui.auto_last)
+        btn_layout.addWidget(self.ui.refresh)
+        btn_layout.addWidget(self.ui.show_all)
+        btn_layout.addWidget(self.ui.auto_last)
+        self.ui.gridLayout.addWidget(btn_row, 3, 0, 1, 2)
+
+    def refresh_directory(self):
+        """Re-read the current directory's file listing (Refresh button).
+
+        Repopulates ``listScans`` from ``self.dirname``; ``update_scans``
+        preserves the XYE-overlay selection so a refresh mid-compare doesn't
+        drop the user's selected files.
+        """
+        self.update_scans()
 
     def _init_toolbar(self):
         """Create toolbar with File and Config menus."""
@@ -513,6 +555,7 @@ class H5Viewer(QWidget):
             self.ui.listData, lambda: self._plot_method)
         self.ui.listData.viewport().installEventFilter(self._list_click_filter)
         self.ui.show_all.clicked.connect(self.show_all)
+        self.ui.refresh.clicked.connect(self.refresh_directory)
         self.actionOpenFolder.triggered.connect(self.open_folder)
         self.actionSaveDataAs.triggered.connect(self.save_data_as)
         self.actionNewFile.triggered.connect(self.new_file)
@@ -696,6 +739,31 @@ class H5Viewer(QWidget):
         if last_row >= 0:
             lw.setCurrentRow(last_row, QItemSelectionModel.ClearAndSelect)
         return last_row
+
+    def select_most_recent_scan_entry(self):
+        """Select the most recently *modified* data-file entry in listScans.
+
+        ``select_last_scan_entry`` picks the name-last row, but the file that
+        was saved last isn't necessarily name-last (mixed prefixes, or files
+        left over from earlier runs that sort later).  Pick by mtime so the
+        final pattern just written is the one selected; among files with the
+        same mtime (a batch flush writes them together) the name-last one
+        (highest frame number) wins.  Returns the selected row, or -1."""
+        lw = self.ui.listScans
+        best_row, best_mtime = -1, None
+        for row in range(lw.count()):
+            text = lw.item(row).text()
+            if text == '..' or text.endswith('/'):
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(self.dirname, text))
+            except OSError:
+                continue
+            if best_mtime is None or mtime >= best_mtime:
+                best_mtime, best_row = mtime, row
+        if best_row >= 0:
+            lw.setCurrentRow(best_row, QItemSelectionModel.ClearAndSelect)
+        return best_row
 
     # ── Selection helper ──────────────────────────────────────────────
     def set_current_frame(self, item_or_row):

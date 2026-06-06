@@ -518,9 +518,14 @@ class imageThread(wranglerThread):
         # Trailing newline gives a visual gap before the next scan's
         # 'New Scan' banner (or before the next prompt if this was the
         # last scan in the session).
-        output_path = getattr(self, 'fname', None) or getattr(self.scan, 'data_file', None)
-        if output_path:
-            logger.info('Output file: %s\n', output_path)
+        if self.xye_only:
+            # Int 1D (XYE) writes only .xye files (no .nxs) into <dir>/<scan>.
+            logger.info('Output (XYE) folder: %s\n',
+                        os.path.join(self.h5_dir, self.scan_name))
+        else:
+            output_path = getattr(self, 'fname', None) or getattr(self.scan, 'data_file', None)
+            if output_path:
+                logger.info('Output file: %s\n', output_path)
 
     def process_scan(self):
         """Batch-integrate all existing images, then optionally watch for new ones (live mode).
@@ -2000,22 +2005,27 @@ class imageThread(wranglerThread):
         if not os.path.exists(fname):
             write_mode = 'Overwrite'
 
-        _get_h5pool().pause(scan.data_file)
-        try:
-            with self.file_lock:
-                if write_mode == 'Append':
-                    # v2 NeXus loader (the only one we support now).
-                    scan.load_from_h5(replace=False, mode='a')
-                    scan.skip_2d = self.scan.skip_2d
-                    for (k, v) in self.scan_args.items():
-                        setattr(scan, k, v)
-                    existing_frames = scan.frames.index
-                    if len(existing_frames) == 0:
+        # Int 1D (XYE) writes ONLY .xye files (via the XYE flush); it must not
+        # create or write the .nxs stack at all.  Skip all NeXus disk I/O here —
+        # the per-batch ``scan._save_to_nexus`` is already gated off for
+        # xye_only, so the scan object is used purely in-memory for integration.
+        if not self.xye_only:
+            _get_h5pool().pause(scan.data_file)
+            try:
+                with self.file_lock:
+                    if write_mode == 'Append':
+                        # v2 NeXus loader (the only one we support now).
+                        scan.load_from_h5(replace=False, mode='a')
+                        scan.skip_2d = self.scan.skip_2d
+                        for (k, v) in self.scan_args.items():
+                            setattr(scan, k, v)
+                        existing_frames = scan.frames.index
+                        if len(existing_frames) == 0:
+                            scan.save_to_nexus(replace=True)
+                    else:
                         scan.save_to_nexus(replace=True)
-                else:
-                    scan.save_to_nexus(replace=True)
-        finally:
-            _get_h5pool().resume(scan.data_file)
+            finally:
+                _get_h5pool().resume(scan.data_file)
 
         # Copy integration args (including GI modes) from the main scan.
         scan.bai_1d_args = self.scan.bai_1d_args.copy()
@@ -2027,7 +2037,11 @@ class imageThread(wranglerThread):
             self.series_average
         )
         logger.info('***** New Scan *****')
-        logger.info('Output file: %s', fname)
+        if self.xye_only:
+            logger.info('Output (XYE) folder: %s',
+                        os.path.join(self.h5_dir, self.scan_name))
+        else:
+            logger.info('Output file: %s', fname)
 
         return scan
 

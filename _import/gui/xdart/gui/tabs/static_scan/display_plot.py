@@ -92,9 +92,12 @@ def update_plot_accumulator(
             continue
         old_x = np.asarray(plot_data[0], dtype=float)
         if np.size(old_x) == 0:
-            # Preserve the legacy behavior: the incoming frame seeds the array
-            # while existing names/ids remain in the caller-owned history.
+            # An empty x grid means the visible accumulator was cleared or never
+            # initialized.  Start a fresh, internally consistent history instead
+            # of carrying stale ids/names forward.
             plot_data = [new_x, row[np.newaxis, :]]
+            names = []
+            ids = []
         elif old_x.shape == new_x.shape and np.allclose(old_x, new_x):
             old_y = _as_plot_rows(plot_data[1])
             plot_data[1] = np.vstack((old_y, row))
@@ -484,15 +487,6 @@ class DisplayPlotMixin:
             ydata = np.log10(ydata)
             self.plot.getAxis("left").setLogMode(True)
             ylabel = f'Log {int_label}(a.u.)'
-        elif self.scale == 'Log-Log':
-            if ydata.min() < 1:
-                ydata -= (ydata.min() - 1.)
-            ydata = np.log10(ydata)
-            self.plot.getAxis("left").setLogMode(True)
-            ylabel = f'Log {int_label}(a.u.)'
-
-            s_xdata = np.log10(s_xdata)
-            self.plot.getAxis("bottom").setLogMode(True)
         elif self.scale == 'Sqrt':
             if ydata.min() < 0.:
                 ydata_ = np.sqrt(np.abs(ydata))
@@ -682,9 +676,14 @@ class DisplayPlotMixin:
     def clear_1D(self):
         """Initialize curves for line plots
         """
-        self.frame_names.clear()
+        if hasattr(self, "clear_overlay"):
+            self.clear_overlay()
+        else:
+            self.frame_names.clear()
+            self.plot_data = [np.zeros(0), np.zeros(0)]
+            self.plot_data_range = [[0, 0], [0, 0]]
+            self.overlaid_idxs = []
         self.frame_ids.clear()
-        self.plot_data = [np.zeros(0), np.zeros(0)]
         self.setup_1d_layout()
         self.plot.clear()
         # Re-add legend (plot.clear() removes it)
