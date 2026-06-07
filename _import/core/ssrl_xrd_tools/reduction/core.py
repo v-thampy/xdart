@@ -22,6 +22,13 @@ from ssrl_xrd_tools.core.containers import (
     PONI,
 )
 from ssrl_xrd_tools.core.metadata import ScanMetadata
+from ssrl_xrd_tools.core.scan import (
+    FrameSource as CoreFrameSource,
+    ImageLoader,
+    MaskSpec as CoreMaskSpec,
+    Scan as CoreScan,
+    ScanFrame,
+)
 from ssrl_xrd_tools.integrate.calibration import (
     poni_to_fiber_integrator,
     poni_to_integrator,
@@ -39,7 +46,6 @@ from ssrl_xrd_tools.io.nexus import (
 if TYPE_CHECKING:  # C4 — tighter Scan.integrator type without forcing the import
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 
-ImageLoader = Callable[["Frame"], np.ndarray]
 ProgressCallback = Callable[["ReductionProgress"], None]
 
 
@@ -320,6 +326,15 @@ class Scan:
             if values.ndim == 1 and values.shape[0] == len(idx):
                 df[str(name)] = values
         return df
+
+
+# Architecture-v2 canonical aliases.  The legacy definitions above remain
+# temporarily as an internal migration cushion; public reduction imports now
+# resolve to the headless core contracts in ``ssrl_xrd_tools.core.scan``.
+Frame = ScanFrame
+MaskSpec = CoreMaskSpec
+FrameSource = CoreFrameSource
+Scan = CoreScan
 
 
 @dataclass(slots=True)

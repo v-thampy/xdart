@@ -75,3 +75,30 @@ __all__ = [
     "soft_list_eval",
     "catch_h5py_file",
 ]
+from ssrl_xrd_tools.core.scan import (
+    Frame,
+    FrameGeometry,
+    FrameSource,
+    HeterogeneousMetadata,
+    MaskSpec,
+    Scan,
+    ScanFrame,
+    SourceCapabilities,
+    SourceKind,
+    SourceSpec,
+    numeric_metadata,
+)
+
+__all__ = [
+    "Frame",
+    "FrameGeometry",
+    "FrameSource",
+    "HeterogeneousMetadata",
+    "MaskSpec",
+    "Scan",
+    "ScanFrame",
+    "SourceCapabilities",
+    "SourceKind",
+    "SourceSpec",
+    "numeric_metadata",
+]
