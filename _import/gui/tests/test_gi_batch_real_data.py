@@ -125,14 +125,12 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
         apply_threshold=False, threshold_min=0, threshold_max=0,
         _plan_cache=StandardPlanCache(), _xye_lock=RLock(), _xye_buffer=[],
         _cached_gi_incident_angle=None,
-        _executor=None, _executor_workers=0,
         showLabel=SimpleNamespace(emit=lambda *a: None),
         _middle_truncate=lambda t: t,
     )
     # Bind the real wranglerThread helpers (these are the integration path).
     for meth in ("_resolve_frame_mask", "_prewarm_frame_mask",
-                 "_apply_threshold_inline", "_parallel_integrate",
-                 "_get_executor", "_shutdown_executor"):
+                 "_apply_threshold_inline"):
         setattr(w, meth, MethodType(getattr(wranglerThread, meth), w))
     w._borrow_fiber_integrator = wranglerThread._borrow_fiber_integrator  # staticmethod
     w._dispatch_batch_serial = MethodType(imageThread._dispatch_batch_serial, w)
