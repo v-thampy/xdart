@@ -156,6 +156,23 @@ def test_inspect_nexus_raw_data_wins_over_reduction_only_marker(tmp_path):
     assert summary.xdart.raw_image_shape == (1, 4, 5)
 
 
+def test_inspect_nexus_reduction_only_is_not_processed(tmp_path):
+    path = tmp_path / "reduction_only_partial.nxs"
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_group("reduction")
+
+    summary = inspect_nexus(path)
+
+    assert summary.xdart is not None
+    assert not summary.xdart.is_processed
+    assert summary.xdart.frame_labels == ()
+    assert summary.xdart.raw_image_dataset is None
+    assert summary.xdart.integrated_1d is None
+    assert summary.xdart.integrated_2d is None
+
+
 def test_raw_dataset_search_prunes_frames_subtree(tmp_path):
     path = tmp_path / "fallback_raw_search.h5"
     with h5py.File(path, "w") as h5:

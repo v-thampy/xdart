@@ -346,7 +346,6 @@ def _summarize_xdart_entry(h5: h5py.File, entry: str) -> NexusXDartSummary:
         or integrated_2d
         or thumbnail_count
         or source_count
-        or ("reduction" in e and raw_image_dataset is None)
     )
     return NexusXDartSummary(
         entry=entry,
