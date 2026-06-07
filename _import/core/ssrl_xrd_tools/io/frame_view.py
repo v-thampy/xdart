@@ -44,6 +44,15 @@ def _dataset_unit(group: h5py.Group | None, name: str) -> str | None:
     return _decode(group[name].attrs.get("units"))
 
 
+def _dataset_values(ds: h5py.Dataset) -> np.ndarray:
+    if h5py.check_string_dtype(ds.dtype) is not None:
+        return np.asarray(ds.asstr()[()])
+    arr = np.asarray(ds[()])
+    if arr.dtype.kind == "S":
+        return arr.astype(str)
+    return arr
+
+
 class FrameViewReader:
     """Reusable reader for many :class:`FrameView` records from one scan.
 
@@ -152,7 +161,7 @@ class FrameViewReader:
                 if key == "frame_index" or not isinstance(item, h5py.Dataset):
                     continue
                 try:
-                    cols[str(key)] = np.asarray(item[()])
+                    cols[str(key)] = _dataset_values(item)
                 except (TypeError, ValueError):
                     continue
             self._scan_data_columns = cols
@@ -163,7 +172,8 @@ class FrameViewReader:
             except (IndexError, TypeError):
                 continue
             if np.asarray(value).shape == ():
-                out[key] = np.asarray(value).item()
+                scalar = np.asarray(value).item()
+                out[key] = _decode(scalar)
         return out
 
     def _geometry_for_frame(self, frame: int) -> FrameGeometry | None:

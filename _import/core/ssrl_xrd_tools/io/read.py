@@ -83,6 +83,15 @@ def _decode(v):
     return v.decode("utf-8") if isinstance(v, (bytes, np.bytes_)) else v
 
 
+def _dataset_values(ds: h5py.Dataset) -> np.ndarray:
+    if h5py.check_string_dtype(ds.dtype) is not None:
+        return np.asarray(ds.asstr()[()])
+    arr = np.asarray(ds[()])
+    if arr.dtype.kind == "S":
+        return arr.astype(str)
+    return arr
+
+
 def _frame_index(grp: h5py.Group, prefer: str | None = None) -> np.ndarray:
     """Return the frame-label array for an entry.
 
@@ -146,11 +155,11 @@ def _scan_data_for_frames(
         for key, item in sd.items():
             if key == "frame_index" or not isinstance(item, h5py.Dataset):
                 continue
-            try:
-                arr = np.asarray(item[()], dtype=float)
-            except (TypeError, ValueError):
-                continue
-            aligned = np.full((len(frames),) + arr.shape[1:], np.nan, dtype=float)
+            arr = _dataset_values(item)
+            if arr.dtype.kind in {"O", "U", "S"}:
+                aligned = np.full((len(frames),) + arr.shape[1:], "", dtype=object)
+            else:
+                aligned = np.full((len(frames),) + arr.shape[1:], np.nan, dtype=float)
             for dst, src in enumerate(rows):
                 if src >= 0:
                     aligned[dst] = arr[src]

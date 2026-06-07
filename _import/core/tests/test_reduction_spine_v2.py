@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import h5py
 import numpy as np
 import pytest
 
@@ -13,10 +14,16 @@ from ssrl_xrd_tools.reduction import (
     Integration1DPlan,
     Integration2DPlan,
     MemorySink,
+    NexusSink,
     ReductionPlan,
     Scan,
     XYESink,
     run_reduction,
+)
+from ssrl_xrd_tools.io.frame_view import read_frame_view
+from ssrl_xrd_tools.io.nexus import (
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
 )
 from ssrl_xrd_tools.sources import MemoryFrameSource
 import ssrl_xrd_tools.reduction.core as reduction_core
@@ -85,6 +92,54 @@ def test_run_reduction_fans_out_to_memory_and_xye(
     assert out.exists()
     saved = np.loadtxt(out)
     assert np.allclose(saved[:, 1], [4.0, 5.0])
+
+
+def test_nexus_sink_preserves_non_numeric_scan_metadata(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(float(np.sum(image))),
+    )
+    path = tmp_path / "mixed_metadata.nxs"
+    scan = Scan(
+        "mixed",
+        [
+            Frame(
+                5,
+                image=np.ones((2, 2)),
+                metadata={"phase": "alpha", "operator": "sam", "temperature": 295.5},
+            ),
+            Frame(
+                8,
+                image=np.full((2, 2), 2.0),
+                metadata={"phase": "beta", "operator": "lee", "temperature": 296.0},
+            ),
+        ],
+        integrator=object(),
+    )
+
+    run_reduction(
+        ReductionPlan(integration_1d=Integration1DPlan(npt=2)),
+        scan,
+        NexusSink(path, overwrite=True),
+    )
+
+    with h5py.File(path, "r") as h5:
+        entry = h5["entry"]
+        assert entry.attrs["ssrl_schema"] == PROCESSED_SCHEMA_NAME
+        assert entry.attrs["ssrl_schema_version"] == PROCESSED_SCHEMA_VERSION
+        phase = entry["scan_data/phase"]
+        assert h5py.check_string_dtype(phase.dtype) is not None
+        assert phase.attrs["ssrl_dtype"] == "string"
+        assert list(phase.asstr()[()]) == ["alpha", "beta"]
+        assert entry["scan_data/temperature"].attrs["ssrl_dtype"] == "float32"
+
+    view = read_frame_view(path, frame=8)
+    assert view.metadata_raw["phase"] == "beta"
+    assert view.metadata_raw["operator"] == "lee"
+    assert view.metadata_numeric["temperature"] == pytest.approx(296.0)
 
 
 def test_run_reduction_gi_resolves_incidence_and_dispatches_modes(

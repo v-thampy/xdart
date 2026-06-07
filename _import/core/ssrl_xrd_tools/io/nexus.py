@@ -44,6 +44,10 @@ from ssrl_xrd_tools.transforms import energy_to_wavelength
 
 logger = logging.getLogger(__name__)
 
+PROCESSED_SCHEMA_NAME = "ssrl_xrd_tools.processed_scan"
+PROCESSED_SCHEMA_VERSION = 2
+_UTF8_DTYPE = h5py.string_dtype(encoding="utf-8")
+
 # Datasets that are counters/scalers rather than motor angles.
 _DEFAULT_COUNTER_NAMES: frozenset[str] = frozenset(
     {"i0", "i1", "i2", "monitor", "mon", "det", "diode", "seconds", "epoch", "time"}
@@ -622,6 +626,7 @@ def write_nexus(
     with h5py.File(p, mode) as f:
         grp = f.require_group(entry)
         grp.attrs["NX_class"] = "NXentry"
+        _stamp_processed_schema(grp)
 
         if sorted_1d:
             validate_integrated_stack_write(
@@ -743,6 +748,7 @@ def open_nexus_writer(
 
     grp = f.require_group(entry)
     grp.attrs["NX_class"] = "NXentry"
+    _stamp_processed_schema(grp)
 
     if metadata is not None:
         _write_metadata(grp, metadata, ck)
@@ -1574,8 +1580,8 @@ def write_scan_metadata(
     compression: str | None = None,
 ) -> None:
     """Persist the **full** per-frame scan metadata table under
-    ``/entry/scan_data`` (NXcollection: ``frame_index`` + one float
-    dataset per column).
+    ``/entry/scan_data`` (NXcollection: ``frame_index`` + one typed dataset
+    per column).
 
     The ``positioners`` group only carries the geometry-referenced motors;
     this stores the complete ``scan_data`` DataFrame — every counter and
@@ -1585,7 +1591,9 @@ def write_scan_metadata(
     these columns as per-frame variables (preferred over positioners, which
     they then read only for any motor not already present here).
 
-    Non-numeric columns are skipped (the table is stored as float32).
+    Numeric columns are stored as float32. Non-numeric columns are stored as
+    UTF-8 variable-length strings so notebook/headless readers preserve
+    labels, modes, source file names, operator notes, and similar context.
     """
     if scan_data is None or len(scan_data) == 0 or not len(scan_data.columns):
         if "scan_data" in entry_grp:
@@ -1609,11 +1617,16 @@ def write_scan_metadata(
         chunks=(64,),
     )
     for col in scan_data.columns:
-        try:
-            arr = np.asarray(scan_data[col].values, dtype=np.float32)
-        except (TypeError, ValueError):
-            continue  # non-numeric column — not representable in the table
-        g.create_dataset(str(col), data=arr, maxshape=(None,), chunks=(64,), **ck)
+        arr, create_kwargs, attrs = _scan_data_column_payload(scan_data[col].values)
+        ds = g.create_dataset(
+            str(col),
+            data=arr,
+            maxshape=(None,),
+            chunks=(64,),
+            **create_kwargs,
+            **({} if attrs["ssrl_dtype"] == "string" else ck),
+        )
+        ds.attrs.update(attrs)
 
 
 def _upsert_indexed_group(
@@ -1687,6 +1700,42 @@ def _strictly_increasing(labels: Sequence[int]) -> bool:
     return all(a < b for a, b in zip(labels, labels[1:]))
 
 
+def _stamp_processed_schema(entry_grp: h5py.Group) -> None:
+    entry_grp.attrs["ssrl_schema"] = PROCESSED_SCHEMA_NAME
+    entry_grp.attrs["ssrl_schema_version"] = PROCESSED_SCHEMA_VERSION
+
+
+def _stringify_scan_value(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if np.asarray(value).shape == () and isinstance(float(value), float):
+            if not np.isfinite(float(value)):
+                return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _scan_data_column_payload(values: Any) -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:
+    try:
+        arr = np.asarray(values, dtype=np.float32)
+    except (TypeError, ValueError):
+        arr = np.asarray([_stringify_scan_value(v) for v in values], dtype=object)
+        return arr, {"dtype": _UTF8_DTYPE}, {
+            "ssrl_dtype": "string",
+            "description": "Per-frame scan metadata column",
+            "missing_value": "",
+            "encoding": "utf-8",
+        }
+    return arr, {}, {
+        "ssrl_dtype": "float32",
+        "description": "Per-frame scan metadata column",
+    }
+
+
 def upsert_scan_metadata(
     entry_grp: h5py.Group,
     scan_data,
@@ -1698,10 +1747,7 @@ def upsert_scan_metadata(
     scan_data, fis = _reindex_scan_data_to_frames(scan_data, frame_indices)
     values: dict[str, np.ndarray] = {}
     for col in scan_data.columns:
-        try:
-            values[str(col)] = np.asarray(scan_data[col].values, dtype=np.float32)
-        except (TypeError, ValueError):
-            continue
+        values[str(col)] = _scan_data_column_payload(scan_data[col].values)[0]
     if not values:
         return
     if "scan_data" not in entry_grp:
@@ -1861,7 +1907,10 @@ def _read_scan_data_group(e, add_frame_var, data_vars, coords) -> set:
         if perm is None:
             return arr
         arr = np.asarray(arr)
-        out = np.full((len(perm),) + arr.shape[1:], np.nan, dtype=float)
+        if arr.dtype.kind in {"O", "U", "S"}:
+            out = np.full((len(perm),) + arr.shape[1:], "", dtype=object)
+        else:
+            out = np.full((len(perm),) + arr.shape[1:], np.nan, dtype=float)
         for i, src in enumerate(perm):
             if src >= 0:
                 out[i] = arr[src]
@@ -1879,7 +1928,7 @@ def _read_scan_data_group(e, add_frame_var, data_vars, coords) -> set:
         if k == "frame_index" or not isinstance(item, h5py.Dataset):
             continue
         name = f"meta_{k}" if (k in {"q", "chi", "frame"} or k in data_vars) else k
-        add_frame_var(name, _aligned(item[()]))
+        add_frame_var(name, _aligned(_dataset_to_native_array(item)))
         # Only suppress the positioner fallback for this key if the column
         # was actually accepted — ``add_frame_var`` skips length-mismatched
         # columns, and a valid same-named NXpositioner should still load.
@@ -2046,6 +2095,15 @@ def _read_data_group(
 
 def _v2_decode_str(v):
     return v.decode("utf-8") if isinstance(v, bytes) else v
+
+
+def _dataset_to_native_array(ds: h5py.Dataset) -> np.ndarray:
+    if h5py.check_string_dtype(ds.dtype) is not None:
+        return np.asarray(ds.asstr()[()])
+    arr = np.asarray(ds[()])
+    if arr.dtype.kind == "S":
+        return arr.astype(str)
+    return arr
 
 
 def _read_positioners(grp: h5py.Group) -> dict[str, np.ndarray]:
@@ -2471,6 +2529,8 @@ def read_stitched(
 
 
 __all__ = [
+    "PROCESSED_SCHEMA_NAME",
+    "PROCESSED_SCHEMA_VERSION",
     # v1 (legacy beamline files)
     "find_nexus_image_dataset",
     "NexusImageStack",
