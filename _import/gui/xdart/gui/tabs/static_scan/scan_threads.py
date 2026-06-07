@@ -8,9 +8,6 @@ import logging
 import os
 from queue import Queue
 from threading import Condition, RLock
-# M2 dropped ProcessPoolExecutor; ThreadPoolExecutor + as_completed
-# are imported locally in _reintegrate_all to keep the top-of-file
-# imports tight.
 import traceback
 import numpy as np
 
@@ -18,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 from xdart.modules.reduction import (
     StandardPlanCache,
-    dispatch_live_frame_reduction,
+    reduce_live_frames,
 )
 
 # Qt imports
@@ -31,10 +28,9 @@ from xdart.utils import catch_h5py_file as catch
 
 
 # M2: _reintegrate_frame (the module-level pickle-safe worker for the
-# pre-M2 ProcessPoolExecutor reintegrate path) removed.  The new
-# _reintegrate_all uses ThreadPoolExecutor + an inline closure
-# instead — no pickling, no IPC, GIL released by pyFAI's Cython
-# integration during the call.
+# pre-M2 ProcessPoolExecutor reintegrate path) removed.  Architecture-v2
+# routes reintegration through ssrl_xrd_tools.reduction.run_reduction so
+# xdart no longer owns a second per-frame integration engine here.
 
 
 class integratorThread(Qt.QtCore.QThread):
@@ -123,6 +119,33 @@ class integratorThread(Qt.QtCore.QThread):
                 getattr(frame, "idx", "?"), exc_info=True,
             )
 
+    def _prepare_frame_for_headless_reduction(self, frame):
+        if self.scan.static:
+            frame.static = True
+        if self.scan.gi:
+            frame.gi = True
+        if getattr(self.scan, "_cached_integrator", None) is not None:
+            frame.integrator = self.scan._cached_integrator
+        return frame
+
+    def _reduce_reintegration_batch(self, frames, plan, *, n_workers: int = 1):
+        frames = [
+            self._prepare_frame_for_headless_reduction(frame)
+            for frame in frames
+        ]
+        if not frames:
+            return []
+        executor = n_workers if n_workers > 1 and len(frames) > 1 else None
+        return reduce_live_frames(
+            frames,
+            plan,
+            scan_name=str(getattr(self.scan, "name", "scan")),
+            global_mask=getattr(self.scan, "global_mask", None),
+            integrator=getattr(self.scan, "_cached_integrator", None),
+            executor=executor,
+            chunk_size=max(1, min(n_workers, len(frames))),
+        )
+
     def _publish_reintegrated_display(
         self,
         frame,
@@ -161,10 +184,9 @@ class integratorThread(Qt.QtCore.QThread):
     def _reintegrate_all(self, *, do_2d: bool) -> None:
         """Shared GUI-button reintegration body for 1D and 2D paths.
 
-        M2 rewrite: switched from ``ProcessPoolExecutor`` over an
+        Architecture-v2 rewrite: switched from ``ProcessPoolExecutor`` over an
         eagerly-materialised frame list to **batched lazy iteration +
-        ThreadPoolExecutor + IntegratorPool** — the same primitive
-        the wranglers use.
+        ssrl_xrd_tools.reduction.run_reduction**.
 
         Why the change.  Pre-M2 the path was:
             all_frames = list(self.scan.frames)
@@ -182,14 +204,13 @@ class integratorThread(Qt.QtCore.QThread):
         * Peak RAM holds the full list of N frames in the parent,
           defeating the ``_in_memory_cap=64`` eviction policy.
 
-        After M2:
+        Now:
         * Iterate the index in batches of ``_RE_BATCH`` (default
           ``32 * n_workers``); each batch is lazy-loaded just before
           dispatch and goes out of scope after publish.
-        * ``IntegratorPool`` borrows + worker-thread integration — no
-          pickling cost, GIL released by pyFAI's Cython path.
-        * Stop is honoured between batches (and inside workers,
-          inherited from the wranglers' pattern).
+        * ``run_reduction`` owns worker-thread integration and private
+          integrator copies — xdart only publishes results.
+        * Stop is honoured between batches.
         """
         with self.data_lock:
             if do_2d:
@@ -249,87 +270,51 @@ class integratorThread(Qt.QtCore.QThread):
             self.scan, integrate_2d=do_2d,
         )
 
-        # IntegratorPool: one deep-copied pyFAI integrator per worker.
-        # If scan._cached_integrator is None (scan fresh-from-load
-        # without a wrangler having attached an integrator), the pool
-        # comes back None and we fall back to the serial path.
-        from xdart.utils.integrator_pool import ensure_integrator_pool
-        from concurrent.futures import ThreadPoolExecutor
-
-        integrator_pool = ensure_integrator_pool(
-            self.scan, '_cached_integrator', n_workers,
-        )
-
-        def _worker(frame):
-            """Re-integrate one frame on a thread.  Borrows a private
-            integrator from the pool to avoid pyFAI's CSR scratch
-            buffer races; same fix as IntegratorPool in the wranglers.
-            """
-            if self.scan.static:
-                frame.static = True
-            if self.scan.gi:
-                frame.gi = True
-            if integrator_pool is not None:
-                with integrator_pool.borrow() as ai:
-                    frame.integrator = ai
-
-                    dispatch_live_frame_reduction(
-                        frame, self.scan,
-                        standard_plan=standard_plan,
-                        integrator=ai,
-                        global_mask=self.scan.global_mask,
-                    )
-                    # Detach pool integrator before the next worker
-                    # borrows the same instance.
-                    frame.integrator = self.scan._cached_integrator
-            else:
-                # Fallback: no integrator pool — still go through the
-                # shared headless dispatch helper.
-                dispatch_live_frame_reduction(
-                    frame, self.scan,
-                    standard_plan=standard_plan,
-                    integrator=frame.integrator,
-                    global_mask=self.scan.global_mask,
-                )
-            return frame
-
         # Batched dispatch: lazy-load each batch right before
         # submitting it, publish results, then drop the batch's
         # frames so RAM stays bounded.
         _RE_BATCH = max(8, 32 * n_workers)
 
-        if max_cores > 1 and len(indices) > 1 and integrator_pool is not None:
-            for i in range(0, len(indices), _RE_BATCH):
-                chunk_idxs = indices[i:i + _RE_BATCH]
-                # LiveFrameSeries.__getitem__ does the lazy v2 load + sets
-                # source refs / _source_root for the L1 raw loader.
-                frames = [self.scan.frames[idx] for idx in chunk_idxs]
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    futures = {
-                        pool.submit(_worker, frame): frame.idx
-                        for frame in frames
-                    }
-                    from concurrent.futures import as_completed
-                    for fut in as_completed(futures):
-                        try:
-                            _publish(fut.result())
-                        except Exception as e:
-                            frame_idx = futures[fut]
-                            logger.error(
-                                "%s integration failed for frame %s: %s",
-                                label, frame_idx, e, exc_info=True,
+        for i in range(0, len(indices), _RE_BATCH):
+            chunk_idxs = indices[i:i + _RE_BATCH]
+            # LiveFrameSeries.__getitem__ does the lazy v2 load + sets
+            # source refs / _source_root for the L1 raw loader.
+            frames = [self.scan.frames[idx] for idx in chunk_idxs]
+            try:
+                reduced_frames = self._reduce_reintegration_batch(
+                    frames,
+                    standard_plan,
+                    n_workers=n_workers,
+                )
+            except Exception as exc:
+                logger.error(
+                    "%s batch reintegration failed for frames %s-%s: %s; "
+                    "retrying frame-by-frame",
+                    label, chunk_idxs[0], chunk_idxs[-1], exc,
+                    exc_info=True,
+                )
+                reduced_frames = []
+                for frame in frames:
+                    try:
+                        reduced_frames.extend(
+                            self._reduce_reintegration_batch(
+                                [frame],
+                                standard_plan,
+                                n_workers=1,
                             )
-                            self.update.emit(frame_idx)
-                # ``frames`` goes out of scope at the end of the
-                # iteration, so the FIFO _in_memory_cap eviction
-                # can free those frames before the next chunk loads.
-        else:
-            # Serial fallback (max_cores=1, single frame, or no
-            # integrator pool available).  Still lazy-loaded one
-            # at a time so we don't materialise the full list.
-            for idx in indices:
-                frame = self.scan.frames[idx]
-                _publish(_worker(frame))
+                        )
+                    except Exception as frame_exc:
+                        logger.error(
+                            "%s integration failed for frame %s: %s",
+                            label, getattr(frame, "idx", None), frame_exc,
+                            exc_info=True,
+                        )
+                        self.update.emit(getattr(frame, "idx", -1))
+            for frame in reduced_frames:
+                _publish(frame)
+            # ``frames`` goes out of scope at the end of the iteration, so
+            # the FIFO _in_memory_cap eviction can free old frames before
+            # the next chunk loads.
 
         # Persist recomputed int_* rows back to disk via the v2
         # replace-frames path.  The save re-writes /entry/reduction
@@ -371,12 +356,7 @@ class integratorThread(Qt.QtCore.QThread):
         for idx in idxs:
             frame = self.scan.frames[int(idx)]
 
-            dispatch_live_frame_reduction(
-                frame, self.scan,
-                standard_plan=plan,
-                integrator=frame.integrator,
-                global_mask=self.scan.global_mask,
-            )
+            self._reduce_reintegration_batch([frame], plan, n_workers=1)
             self._publish_reintegrated_display(
                 frame,
                 include_2d=True,
@@ -394,12 +374,7 @@ class integratorThread(Qt.QtCore.QThread):
         for idx in idxs:
             frame = self.scan.frames[int(idx)]
 
-            dispatch_live_frame_reduction(
-                frame, self.scan,
-                standard_plan=plan,
-                integrator=frame.integrator,
-                global_mask=self.scan.global_mask,
-            )
+            self._reduce_reintegration_batch([frame], plan, n_workers=1)
             self._publish_reintegrated_display(
                 frame,
                 include_2d=False,

@@ -673,22 +673,20 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
 
 
 def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None:
+    from xdart.gui.tabs.static_scan import scan_threads
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
     from xdart.modules.frame_publication import PublicationStore
 
     calls = []
 
-    def fake_run_reduction(plan_arg, scan_arg):
-        calls.append((plan_arg, scan_arg))
-        return ReductionResult(
-            scan_name=scan_arg.name,
-            frames={
-                0: FrameReduction(0, result_1d=_r1d(), result_2d=None),
-            },
-            n_processed=1,
-        )
+    def fake_reduce_frames(frames, plan, **kwargs):
+        calls.append((plan, list(frames), kwargs))
+        for frame in frames:
+            frame.int_1d = _r1d()
+            frame.int_2d = None
+        return list(frames)
 
-    monkeypatch.setattr(reduction_adapters, "run_reduction", fake_run_reduction)
+    monkeypatch.setattr(scan_threads, "reduce_live_frames", fake_reduce_frames)
 
     frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
     scan = LiveScan(
@@ -715,6 +713,7 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
 
     assert calls
     assert calls[0][0].integration_1d.monitor_key == "i0"
+    assert calls[0][2]["scan_name"] == "scan"
     assert data_1d[0].int_1d is not None
     pub = store.get(0)
     assert pub is not None
@@ -722,18 +721,20 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
 
 
 def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
+    from xdart.gui.tabs.static_scan import scan_threads
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
     from xdart.modules.frame_publication import PublicationStore
 
     calls = []
 
-    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
+    def fake_reduce_frames(frames, plan, **kwargs):
         calls.append(plan)
-        frame.int_1d = _r1d()
-        frame.int_2d = _r2d()
-        return frame
+        for frame in frames:
+            frame.int_1d = _r1d()
+            frame.int_2d = _r2d()
+        return list(frames)
 
-    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
+    monkeypatch.setattr(scan_threads, "reduce_live_frames", fake_reduce_frames)
 
     frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
     scan = LiveScan("scan", frames=[frame])
@@ -770,21 +771,23 @@ def test_reintegrate_all_refreshes_publication_store(monkeypatch) -> None:
     # PublicationStore so the cake (payload path is preferred) shows the NEW
     # pixels, not the pre-reintegrate ones.  fake_reduce makes the 2D shape
     # depend on bai_2d_args['npt_rad'] so a changed arg is observable.
+    from xdart.gui.tabs.static_scan import scan_threads
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
     from xdart.modules.frame_publication import PublicationStore
 
-    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
+    def fake_reduce_frames(frames, plan, **kwargs):
         npt = int(scan.bai_2d_args.get("npt_rad", 10))
-        frame.int_1d = _r1d()
-        frame.int_2d = IntegrationResult2D(
-            radial=np.linspace(0.0, 1.0, npt),
-            azimuthal=np.linspace(-90.0, 90.0, 3),
-            intensity=np.ones((npt, 3)),
-            unit="q_A^-1", azimuthal_unit="chi_deg",
-        )
-        return frame
+        for frame in frames:
+            frame.int_1d = _r1d()
+            frame.int_2d = IntegrationResult2D(
+                radial=np.linspace(0.0, 1.0, npt),
+                azimuthal=np.linspace(-90.0, 90.0, 3),
+                intensity=np.ones((npt, 3)),
+                unit="q_A^-1", azimuthal_unit="chi_deg",
+            )
+        return list(frames)
 
-    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
+    monkeypatch.setattr(scan_threads, "reduce_live_frames", fake_reduce_frames)
 
     frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
     scan = LiveScan("scan", frames=[frame])
