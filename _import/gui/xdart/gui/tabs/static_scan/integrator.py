@@ -122,7 +122,7 @@ class integratorTree(QtWidgets.QWidget):
     """
     def __init__(self, scan, frame, file_lock,
                  frames, frame_ids, data_1d, data_2d, parent=None,
-                 data_lock=None):
+                 data_lock=None, publication_store=None):
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
@@ -133,6 +133,7 @@ class integratorTree(QtWidgets.QWidget):
         self.frame_ids = frame_ids
         self.data_1d = data_1d
         self.data_2d = data_2d
+        self.publication_store = publication_store
         # Shared lock guarding data_1d / data_2d; falls back to a private lock
         # when used stand-alone.
         import threading as _threading
@@ -183,6 +184,7 @@ class integratorTree(QtWidgets.QWidget):
             self.scan, self.frame, self.file_lock,
             self.frames, self.frame_ids, self.data_1d, self.data_2d,
             data_lock=self.data_lock,
+            publication_store=self.publication_store,
         )
 
         # Connect Calibrate and Mask Buttons

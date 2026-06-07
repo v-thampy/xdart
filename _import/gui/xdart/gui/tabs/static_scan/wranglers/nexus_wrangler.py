@@ -475,5 +475,19 @@ class nexusWrangler(wranglerWidget):
         self.stopButton.setEnabled(False)
 
     def enabled(self, enable):
+        """Enable/disable the WHOLE wrangler panel for the run lifecycle (#72),
+        except Stop.
+
+        Hard-disables the parameter tree (greyed + non-interactive, matching the
+        integration panel) plus the non-param widgets (processing-mode combo,
+        Cores spinbox + label).  A disabled pyqtgraph bool checkbox may repaint
+        unchecked during the run (#56), but the value is preserved/restored on
+        re-enable; the full visible disable was chosen over that cosmetic
+        ("minimize complexity").
+        """
         self.startButton.setEnabled(enable)
         self.tree.setEnabled(enable)
+        for w in (self.processingModeCombo, self.maxCoresSpinBox,
+                  getattr(self, 'coresLabel', None)):
+            if w is not None:
+                w.setEnabled(enable)

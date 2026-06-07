@@ -67,7 +67,7 @@ class integratorThread(Qt.QtCore.QThread):
 
     def __init__(self, scan, frame, file_lock,
                  frames, frame_ids, data_1d, data_2d,
-                 parent=None, data_lock=None):
+                 parent=None, data_lock=None, publication_store=None):
         super().__init__(parent)
         self.scan = scan
         self.frame = frame
@@ -76,6 +76,11 @@ class integratorThread(Qt.QtCore.QThread):
         self.frame_ids = frame_ids
         self.data_1d = data_1d
         self.data_2d = data_2d
+        # Shared PublicationStore (same instance as H5Viewer / displayframe).
+        # Reintegration must refresh it alongside data_1d/data_2d, else the
+        # cake panel (payload path is preferred) keeps showing
+        # pre-reintegration pixels.
+        self.publication_store = publication_store
         # Shared reentrant lock guarding data_1d / data_2d access.  Falls
         # back to a private lock when constructed without one.
         self.data_lock = data_lock if data_lock is not None else RLock()
@@ -97,6 +102,51 @@ class integratorThread(Qt.QtCore.QThread):
             except KeyError as e:
                 logger.error("Method %s failed with KeyError: %s", self.method, e, exc_info=True)
                 traceback.print_exc()
+
+    def _upsert_publication_for_frame(self, frame) -> None:
+        """Refresh the publication snapshot for one reintegrated frame."""
+        if self.publication_store is None:
+            return
+        try:
+            from xdart.modules.frame_publication import (
+                publication_from_live_frame,
+            )
+            self.publication_store.upsert(
+                publication_from_live_frame(
+                    frame,
+                    generation=self.publication_store.generation,
+                )
+            )
+        except Exception:
+            logger.debug(
+                "reintegrate publication upsert failed for frame %s",
+                getattr(frame, "idx", "?"), exc_info=True,
+            )
+
+    def _publish_reintegrated_display(
+        self,
+        frame,
+        *,
+        include_2d: bool,
+        refresh_1d: bool = True,
+    ) -> None:
+        """Refresh legacy display caches and the publication store together."""
+        idx = int(frame.idx)
+        with self.data_lock:
+            if include_2d:
+                self.data_2d[idx] = {
+                    'map_raw': frame.map_raw,
+                    'bg_raw': frame.bg_raw,
+                    'mask': frame.mask,
+                    'int_2d': frame.int_2d,
+                    'gi_2d': frame.gi_2d,
+                }
+            if refresh_1d:
+                self.data_1d[idx] = frame.copy_for_display(
+                    include_2d=False,
+                )
+        self._upsert_publication_for_frame(frame)
+        self.update.emit(idx)
 
     def bai_2d_all(self):
         """Integrates all frames 2d.  Thin wrapper over _reintegrate_all."""
@@ -146,6 +196,11 @@ class integratorThread(Qt.QtCore.QThread):
                 self.data_2d.clear()
             else:
                 self.data_1d.clear()
+        # Drop stale publications and bump the store generation so any
+        # in-flight generation-checked subscribers reject pre-reintegration
+        # chunks.  Every frame is republished below via ``_publish``.
+        if self.publication_store is not None:
+            self.publication_store.clear()
         with self.scan.scan_lock:
             if do_2d:
                 self.scan.bai_2d = None
@@ -173,26 +228,20 @@ class integratorThread(Qt.QtCore.QThread):
                 self.scan.frames[frame.idx] = frame
             if do_2d:
                 self.scan._accumulate_bai_2d(frame)
-                with self.data_lock:
-                    self.data_2d[int(frame.idx)] = {
-                        'map_raw': frame.map_raw,
-                        'bg_raw': frame.bg_raw,
-                        'mask': frame.mask,
-                        'int_2d': frame.int_2d,
-                        'gi_2d': frame.gi_2d,
-                    }
-                    # A standard 2D reintegrate also refreshes 1D so
-                    # linked viewers do not keep stale cached curves.
-                    self.data_1d[int(frame.idx)] = frame.copy_for_display(
-                        include_2d=False,
-                    )
+                # A standard 2D reintegrate also refreshes 1D so linked
+                # viewers do not keep stale cached curves.
+                self._publish_reintegrated_display(
+                    frame,
+                    include_2d=True,
+                    refresh_1d=True,
+                )
             else:
                 self.scan._accumulate_bai_1d(frame)
-                with self.data_lock:
-                    self.data_1d[int(frame.idx)] = frame.copy_for_display(
-                        include_2d=False,
-                    )
-            self.update.emit(frame.idx)
+                self._publish_reintegrated_display(
+                    frame,
+                    include_2d=False,
+                    refresh_1d=True,
+                )
 
         label = '2D' if do_2d else '1D'
         n_workers = max(1, min(max_cores, len(indices)))
@@ -384,18 +433,11 @@ class integratorThread(Qt.QtCore.QThread):
                 global_mask=self.scan.global_mask,
                 legacy_gi=_legacy_gi_2d,
             )
-            with self.data_lock:
-                self.data_2d[int(idx)] = {
-                    'map_raw': frame.map_raw,
-                    'bg_raw': frame.bg_raw,
-                    'mask': frame.mask,
-                    'int_2d': frame.int_2d,
-                    'gi_2d': frame.gi_2d}
-                if not self.scan.gi:
-                    self.data_1d[int(frame.idx)] = frame.copy_for_display(
-                        include_2d=False,
-                    )
-            self.update.emit(idx)
+            self._publish_reintegrated_display(
+                frame,
+                include_2d=True,
+                refresh_1d=not self.scan.gi,
+            )
 
     def bai_1d_SI(self):
         """Integrate the current frame, 1d.
@@ -418,11 +460,11 @@ class integratorThread(Qt.QtCore.QThread):
                 global_mask=self.scan.global_mask,
                 legacy_gi=_legacy_gi_1d,
             )
-            with self.data_lock:
-                self.data_1d[int(frame.idx)] = frame.copy_for_display(
-                    include_2d=False,
-                )
-            self.update.emit(frame.idx)
+            self._publish_reintegrated_display(
+                frame,
+                include_2d=False,
+                refresh_1d=True,
+            )
 
     def load(self):
         """Load data.
@@ -498,7 +540,16 @@ class fileHandlerThread(Qt.QtCore.QThread):
     def set_datafile(self):
         with self.file_lock:
             skip_2d = getattr(self.scan, 'skip_2d', False)
-            if getattr(self, 'live_run', False):
+            if getattr(self, 'no_nxs', False):
+                # Int 1D (XYE) writes only .xye files and never creates the
+                # .nxs, so there is nothing to load — repoint the path/name
+                # only.  Gated by an explicit flag (set per-run in
+                # start_wrangler) rather than os.path.exists, so a genuinely
+                # missing .nxs in normal mode still surfaces as a load error
+                # instead of being silently treated as an empty XYE result.
+                self.scan.data_file = self.fname
+                self.scan.name = os.path.split(self.fname)[-1].split('.')[0]
+            elif getattr(self, 'live_run', False):
                 # Live, non-batch run: the wrangler owns this file and
                 # is feeding the GUI in-memory frames per frame.  A full
                 # ``scan.set_datafile`` would call ``load_from_h5``,

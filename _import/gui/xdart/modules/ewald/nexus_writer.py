@@ -165,6 +165,7 @@ def save_scan_to_nexus(
     entry: str = "entry",
     finalize: bool = False,
     replace_frame_indices=None,
+    _atomic_write: bool = True,
 ) -> None:
     """Write ``scan``'s state into the file at ``path`` as a v2 NXroot.
 
@@ -208,6 +209,30 @@ def save_scan_to_nexus(
     replace_frame_indices
         See "Replace" mode above.  ``None`` (default) for append mode.
     """
+    path = Path(path)
+    if _atomic_write and mode == "w":
+        tmp_path = path.with_name(
+            f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+        )
+        try:
+            save_scan_to_nexus(
+                scan,
+                tmp_path,
+                mode=mode,
+                entry=entry,
+                finalize=finalize,
+                replace_frame_indices=replace_frame_indices,
+                _atomic_write=False,
+            )
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        return
+
     _logger = logging.getLogger(__name__)
     _verbose = _logger.isEnabledFor(logging.DEBUG)
 
@@ -242,7 +267,11 @@ def save_scan_to_nexus(
             replace_frame_indices=replace_frame_indices,
             cursor=cursor,
         )
+        prepared_1d, prepared_2d = _filter_prepared_frame_publications(
+            prepared_1d, prepared_2d,
+        )
         _validate_prepared_integrated(h5f.require_group(entry), prepared_1d, prepared_2d)
+        _drop_filtered_replace_rows(h5f, prepared_1d, prepared_2d)
 
         # 2. Provenance — append mode: only on first save or finalize.
         # Replace mode: always rewrite so the persisted ``bai_*_args``
@@ -610,18 +639,194 @@ def _axis_signatures_equal(left, right) -> bool:
 def _validate_prepared_integrated(entry_grp, prepared_1d, prepared_2d) -> None:
     """Preflight every selected output before committing either one."""
     from ssrl_xrd_tools.io.nexus import validate_integrated_stack_write
-    if prepared_1d is not None:
+    if prepared_1d is not None and prepared_1d["results"]:
         validate_integrated_stack_write(
             entry_grp,
             frame_indices=prepared_1d["indices"],
             results_1d=prepared_1d["results"],
         )
-    if prepared_2d is not None:
+    if prepared_2d is not None and prepared_2d["results"]:
         validate_integrated_stack_write(
             entry_grp,
             frame_indices=prepared_2d["indices"],
             results_2d=prepared_2d["results"],
         )
+
+
+def _filter_prepared_frame_publications(prepared_1d, prepared_2d):
+    """Drop invalid rows per output before mutating disk.
+
+    This complements the strict ssrl stack validators above: those ensure
+    rows can be stacked consistently, while this gate catches frame-level
+    diagnostics such as all-dummy GI cakes before they reach display or disk.
+    It filters 1D and 2D independently so one bad frame/output does not lose
+    the rest of the scan.
+    """
+    from xdart.modules.frame_publication import (
+        publication_error_details,
+        publication_from_live_frame,
+        publication_has_1d_errors,
+        publication_has_2d_errors,
+    )
+
+    checked: dict[int, object] = {}
+    filtered_1d = _filter_prepared_output(
+        prepared_1d,
+        checked,
+        has_errors=publication_has_1d_errors,
+        error_details=lambda pub: publication_error_details(pub, "1d"),
+        label="1D",
+        publication_from_live_frame=publication_from_live_frame,
+    )
+    filtered_2d = _filter_prepared_output(
+        prepared_2d,
+        checked,
+        has_errors=publication_has_2d_errors,
+        error_details=lambda pub: publication_error_details(pub, "2d"),
+        label="2D",
+        publication_from_live_frame=publication_from_live_frame,
+    )
+    return filtered_1d, filtered_2d
+
+
+def _filter_prepared_output(
+    prepared,
+    checked: dict[int, object],
+    *,
+    has_errors,
+    error_details,
+    label: str,
+    publication_from_live_frame,
+):
+    if prepared is None:
+        return None
+
+    kept_frames = []
+    kept_indices = []
+    kept_results = []
+    dropped_indices = []
+    for frame, idx, result in zip(
+        prepared["frames"], prepared["indices"], prepared["results"],
+    ):
+        key = id(frame)
+        publication = checked.get(key)
+        if publication is None:
+            publication = publication_from_live_frame(frame, validate=True)
+            checked[key] = publication
+        if has_errors(publication):
+            logger.warning(
+                "Skipping frame %s %s write: %s",
+                idx,
+                label,
+                error_details(publication),
+            )
+            dropped_indices.append(idx)
+            continue
+        kept_frames.append(frame)
+        kept_indices.append(idx)
+        kept_results.append(result)
+
+    if not kept_frames and not (dropped_indices and prepared.get("is_replace")):
+        logger.warning(
+            "Skipping %s integrated stack write: every selected row failed "
+            "publication validation.",
+            label,
+        )
+        return None
+    if len(kept_frames) == len(prepared["frames"]):
+        return prepared
+    filtered = dict(prepared)
+    filtered["frames"] = kept_frames
+    filtered["indices"] = kept_indices
+    filtered["results"] = kept_results
+    filtered["dropped_indices"] = dropped_indices
+    return filtered
+
+
+def _drop_filtered_replace_rows(h5f, *prepared_outputs) -> None:
+    for prepared in prepared_outputs:
+        if not prepared or not prepared.get("is_replace"):
+            continue
+        dropped = prepared.get("dropped_indices") or []
+        if not dropped:
+            continue
+        _drop_integrated_rows(h5f, prepared["group_path"], dropped)
+        _refresh_group_cursor(
+            prepared["cursor"], h5f, prepared["group_path"], prepared["scan_index"],
+        )
+        from xdart.modules.ewald.frame_series import clear_frame_position_cache
+        clear_frame_position_cache(h5f.filename)
+
+
+def _drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
+    """Remove stale rows from an existing integrated_* stack by frame label."""
+    if group_path not in h5f or "frame_index" not in h5f[group_path]:
+        return
+    group = h5f[group_path]
+    labels = np.asarray(group["frame_index"][()], dtype=np.int64)
+    drop = {int(idx) for idx in frame_indices}
+    keep_mask = np.asarray([int(label) not in drop for label in labels], dtype=bool)
+    if bool(np.all(keep_mask)):
+        return
+
+    parent_path, name = group_path.rsplit("/", 1)
+    parent = h5f[parent_path]
+    if not bool(np.any(keep_mask)):
+        del parent[name]
+        return
+
+    group_attrs = dict(group.attrs.items())
+    datasets = []
+    for key, obj in group.items():
+        if not isinstance(obj, h5py.Dataset):
+            continue
+        data = obj[()]
+        row_aligned = data.shape[:1] == labels.shape and key in {
+            "frame_index", "intensity", "sigma",
+        }
+        if row_aligned:
+            data = data[keep_mask]
+        datasets.append((
+            key,
+            data,
+            dict(obj.attrs.items()),
+            obj.compression,
+            obj.compression_opts,
+            obj.shuffle,
+            obj.fletcher32,
+            row_aligned,
+            obj.chunks,
+        ))
+
+    del parent[name]
+    new_group = parent.create_group(name)
+    for key, value in group_attrs.items():
+        new_group.attrs[key] = value
+    for (
+        key,
+        data,
+        attrs,
+        compression,
+        compression_opts,
+        shuffle,
+        fletcher32,
+        row_aligned,
+        chunks,
+    ) in datasets:
+        kwargs = {}
+        if row_aligned:
+            kwargs["maxshape"] = (None,) + tuple(np.asarray(data).shape[1:])
+            if chunks is not None:
+                kwargs["chunks"] = chunks
+        if compression is not None:
+            kwargs["compression"] = compression
+            if compression_opts is not None:
+                kwargs["compression_opts"] = compression_opts
+            kwargs["shuffle"] = shuffle
+            kwargs["fletcher32"] = fletcher32
+        ds = new_group.create_dataset(key, data=data, **kwargs)
+        for attr_key, value in attrs.items():
+            ds.attrs[attr_key] = value
 
 
 def _prepare_integrated_1d(f, scan, *, entry: str,
@@ -645,15 +850,17 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
     return {
         "entry": entry,
         "group_path": group_path,
+        "frames": frames,
         "indices": indices,
         "results": results,
         "cursor": cursor,
         "scan_index": scan.frames.index,
+        "is_replace": replace_frame_indices is not None and group_path in h5f,
     }
 
 
 def _commit_integrated_1d(f, prepared) -> None:
-    if prepared is None:
+    if prepared is None or not prepared["results"]:
         return
     from ssrl_xrd_tools.io.nexus import write_integrated_stack
     h5f = _h5(f)
@@ -690,15 +897,17 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
     return {
         "entry": entry,
         "group_path": group_path,
+        "frames": frames,
         "indices": indices,
         "results": results,
         "cursor": cursor,
         "scan_index": scan.frames.index,
+        "is_replace": replace_frame_indices is not None and group_path in h5f,
     }
 
 
 def _commit_integrated_2d(f, prepared) -> None:
-    if prepared is None:
+    if prepared is None or not prepared["results"]:
         return
     from ssrl_xrd_tools.io.nexus import write_integrated_stack
     h5f = _h5(f)
@@ -1099,7 +1308,24 @@ def _write_instrument(f, scan, *, entry: str) -> None:
     except (TypeError, ValueError):
         wavelength = None
     if wavelength is None:
-        wavelength = scan.mg_args.get("wavelength")
+        # Fall back to mg_args, but NEVER persist the constructor's 1e-10 m
+        # (1.0 Å) sentinel — that's exactly the misleading value the
+        # integrator-first logic exists to avoid.  Skip (and warn) rather
+        # than write a wrong wavelength; a bogus wavelength_A silently
+        # corrupts any downstream Q↔2θ.
+        mg_wl = scan.mg_args.get("wavelength") if scan.mg_args else None
+        try:
+            mg_wl = float(mg_wl) if mg_wl is not None else None
+        except (TypeError, ValueError):
+            mg_wl = None
+        if mg_wl is not None and mg_wl > 0 and abs(mg_wl - 1e-10) > 1e-14:
+            wavelength = mg_wl
+        elif mg_wl is not None:
+            logger.warning(
+                "Skipping source/wavelength_A: the only candidate is the "
+                "mg_args default sentinel (%g m = %.3g A) and no integrator "
+                "wavelength is available.", mg_wl, mg_wl * 1e10,
+            )
     if wavelength is not None:
         if "source" in instr:
             del instr["source"]

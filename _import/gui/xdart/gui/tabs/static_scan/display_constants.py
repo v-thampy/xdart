@@ -82,9 +82,33 @@ STD_2D_AXES = {
 }
 
 
+def _finite_preview_image(data):
+    """Return a display copy with ``inf`` collapsed but ``NaN`` preserved.
+
+    Only ``±inf`` is replaced — it poisons the widget's ``np.nanpercentile``
+    autoscale (→ blown-out levels → white streaks on e.g. Eiger sentinels).
+    ``NaN`` is left intact on purpose: the image widget already autoscales with
+    ``nanpercentile`` and renders NaN transparent, which is how masked pixels
+    show as masked.  Filling NaN here (the previous behaviour) made the
+    detector / global mask invisible on the raw image.
+    """
+    arr = np.asarray(data, dtype=float)
+    inf_mask = np.isinf(arr)
+    if not inf_mask.any():
+        return arr
+    finite = np.isfinite(arr)
+    fill = float(np.min(arr[finite])) if finite.any() else 0.0
+    out = arr.copy()
+    out[inf_mask] = fill
+    return out
+
+
 def _downsample_for_display(data, widget):
     """Reduce array resolution to match widget pixel size. Display-only."""
-    if data is None or data.ndim != 2:
+    if data is None:
+        return data
+    data = _finite_preview_image(data)
+    if data.ndim != 2:
         return data
     w = max(widget.width(), 200)
     h = max(widget.height(), 200)

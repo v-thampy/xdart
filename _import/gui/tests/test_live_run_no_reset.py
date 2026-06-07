@@ -83,7 +83,23 @@ def test_set_datafile_non_live_reloads_from_disk():
     assert calls == ["/data/scan_42.nxs"]  # scan.set_datafile was called
 
 
+def test_set_datafile_no_nxs_repoints_without_load():
+    """Int 1D (XYE) sets ``no_nxs`` because it never writes a .nxs.  Even in a
+    non-live (batch) run, set_datafile must then repoint only — never call
+    scan.set_datafile (which would try to load/create the absent .nxs)."""
+    thread, scan, calls = _file_thread(live_run=False)
+    thread.no_nxs = True
+
+    thread.set_datafile()
+
+    assert calls == []                       # no load/create attempted
+    assert scan.data_file == "/data/scan_42.nxs"
+    assert scan.name == "scan_42"
+
+
 def _reset_viewer(live_run_active):
+    from xdart.modules.frame_publication import PublicationStore
+
     viewer = SimpleNamespace(
         live_run_active=live_run_active,
         scan=SimpleNamespace(data_file="scan.nxs"),
@@ -92,6 +108,7 @@ def _reset_viewer(live_run_active):
         frame_ids=SimpleNamespace(cleared=False),
         data_1d={1: "a", 2: "b"},
         data_2d={1: "x"},
+        publication_store=PublicationStore(),
         data_lock=_NullLock(),
         new_scan=False,
     )
@@ -111,6 +128,7 @@ def test_data_reset_suppressed_during_live_run():
 
     assert viewer.data_1d == {1: "a", 2: "b"}
     assert viewer.data_2d == {1: "x"}
+    assert viewer.publication_store.generation == 0
     assert viewer.frames.cleared is False
     assert viewer.frame_ids.cleared is False
     assert viewer._h5pool.closed == []
@@ -125,6 +143,7 @@ def test_data_reset_clears_when_not_live():
 
     assert viewer.data_1d == {}
     assert viewer.data_2d == {}
+    assert viewer.publication_store.generation == 1
     assert viewer.frames.cleared is True
     assert viewer.frame_ids.cleared is True
     assert viewer._h5pool.closed == ["scan.nxs"]

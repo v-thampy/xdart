@@ -18,6 +18,8 @@ keep the test fast / dep-free.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -275,6 +277,39 @@ def test_nxload_opens_cleanly(written_nxs):
     assert root["entry"].nxclass == "NXentry"
 
 
+def test_overwrite_save_is_atomic_on_failure(tmp_path, monkeypatch):
+    import h5py
+    from xdart.modules.ewald import nexus_writer
+
+    path = tmp_path / "atomic.nxs"
+    original = _DuckSphere([_DuckArch(idx=i) for i in range(2)])
+    nexus_writer.save_scan_to_nexus(original, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        original_intensity = f["entry/integrated_1d/intensity"][()].copy()
+        original_frame_index = f["entry/integrated_1d/frame_index"][()].copy()
+
+    def fail_reduction(*args, **kwargs):
+        raise RuntimeError("forced writer failure")
+
+    monkeypatch.setattr(nexus_writer, "_write_reduction", fail_reduction)
+    replacement = _DuckSphere([_DuckArch(idx=i, seed=100) for i in range(3)])
+
+    with pytest.raises(RuntimeError, match="forced writer failure"):
+        nexus_writer.save_scan_to_nexus(replacement, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f["entry/integrated_1d/frame_index"][()],
+            original_frame_index,
+        )
+        np.testing.assert_allclose(
+            f["entry/integrated_1d/intensity"][()],
+            original_intensity,
+        )
+    assert not list(tmp_path.glob(".atomic.nxs.tmp-*"))
+
+
 def test_entry_attrs(written_nxs):
     """NXentry has the expected class + default plot pointer."""
     root = nx.nxload(str(written_nxs))
@@ -341,6 +376,86 @@ def test_gi_nonuniform_stacked_2d_writer_stays_strict(tmp_path):
     path = tmp_path / "gi_nonuniform_2d.nxs"
     with pytest.raises(ValueError, match="different q/chi axis"):
         save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+
+def test_publication_validation_skips_dummy_gi_2d_but_keeps_1d(tmp_path, caplog):
+    """All-dummy GI cakes should not block the valid 1D stack."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    caplog.set_level(logging.WARNING, logger="xdart.modules.ewald.nexus_writer")
+    frame = _DuckArch(idx=0)
+    frame.gi = True
+    frame.int_2d = _DuckResult2D(
+        radial=np.linspace(-1.0, 1.0, N_Q, dtype=np.float32),
+        azimuthal=np.linspace(0.0, 3.0, N_CHI, dtype=np.float32),
+        intensity=np.full((N_Q, N_CHI), -1.0, dtype=np.float32),
+        unit="qip_A^-1",
+        azimuthal_unit="qoop_A^-1",
+    )
+    scan = _DuckSphere([frame], gi=True)
+
+    path = tmp_path / "dummy_gi_2d.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        assert "integrated_1d" in f["entry"]
+        np.testing.assert_array_equal(f["entry/integrated_1d/frame_index"][()], [0])
+        assert "integrated_2d" not in f["entry"]
+    assert "Skipping frame 0 2D write" in caplog.text
+
+
+def test_publication_validation_filters_bad_2d_rows_per_frame(tmp_path):
+    """A bad cake should not lose neighboring good 2D rows or any 1D rows."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    frames[1].gi = True
+    frames[1].int_2d = _DuckResult2D(
+        radial=np.linspace(-1.0, 1.0, N_Q, dtype=np.float32),
+        azimuthal=np.linspace(0.0, 3.0, N_CHI, dtype=np.float32),
+        intensity=np.full((N_Q, N_CHI), -1.0, dtype=np.float32),
+        unit="qip_A^-1",
+        azimuthal_unit="qoop_A^-1",
+    )
+    scan = _DuckSphere(frames, gi=True)
+
+    path = tmp_path / "one_bad_gi_2d.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f["entry/integrated_1d/frame_index"][()], [0, 1, 2],
+        )
+        np.testing.assert_array_equal(
+            f["entry/integrated_2d/frame_index"][()], [0, 2],
+        )
+
+
+def test_publication_validation_filters_bad_1d_without_blocking_2d(tmp_path):
+    """1D and 2D validation are independent persistence gates."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    frames = [_DuckArch(idx=i) for i in range(2)]
+    frames[1].int_1d = _DuckResult1D(
+        radial=np.asarray(frames[1].int_1d.radial),
+        intensity=np.full(N_Q, np.nan, dtype=np.float32),
+        sigma=frames[1].int_1d.sigma,
+    )
+    scan = _DuckSphere(frames)
+
+    path = tmp_path / "one_bad_1d.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f["entry/integrated_1d/frame_index"][()], [0],
+        )
+        np.testing.assert_array_equal(
+            f["entry/integrated_2d/frame_index"][()], [0, 1],
+        )
 
 
 def test_frames_group_and_thumbnails(written_nxs):
@@ -458,6 +573,53 @@ def test_replace_frame_indices_updates_only_targets(tmp_path):
     for fi in untouched:
         assert np.array_equal(new_on_disk_1d[fi], orig_1d[fi])
         assert np.array_equal(new_on_disk_2d[fi], orig_2d[fi])
+
+
+def test_replace_filtered_2d_row_removes_stale_disk_row(tmp_path, caplog):
+    """A rejected replace-mode 2D row must not leave old cake data behind."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    caplog.set_level(logging.WARNING, logger="xdart.modules.ewald.nexus_writer")
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "replace_filtered_2d.nxs"
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        old_2d = np.asarray(f["entry/integrated_2d/intensity"][()])
+        np.testing.assert_array_equal(
+            f["entry/integrated_2d/frame_index"][()], [0, 1, 2],
+        )
+
+    new_1d = np.full(N_Q, 42.0, dtype=np.float32)
+    frames[1].int_1d = _DuckResult1D(
+        radial=np.asarray(frames[1].int_1d.radial),
+        intensity=new_1d,
+        sigma=frames[1].int_1d.sigma,
+    )
+    frames[1].int_2d = _DuckResult2D(
+        radial=np.asarray(frames[1].int_2d.radial),
+        azimuthal=np.asarray(frames[1].int_2d.azimuthal),
+        intensity=np.full((N_Q, N_CHI), -1.0, dtype=np.float32),
+    )
+
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
+        replace_frame_indices=[1],
+    )
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_allclose(
+            f["entry/integrated_1d/intensity"][1], new_1d,
+        )
+        np.testing.assert_array_equal(
+            f["entry/integrated_2d/frame_index"][()], [0, 2],
+        )
+        new_2d = np.asarray(f["entry/integrated_2d/intensity"][()])
+        np.testing.assert_array_equal(new_2d[0], old_2d[0])
+        np.testing.assert_array_equal(new_2d[1], old_2d[2])
+    assert "Skipping frame 1 2D write" in caplog.text
 
 
 def test_replace_with_no_existing_file_degrades_to_append(tmp_path):
@@ -1012,10 +1174,47 @@ def test_instrument_groups(written_nxs):
     assert "mask" in det
     assert det["mask"].nxdata.tolist() == [0, 1, 256, 65535]
 
-    # Source/wavelength
-    src = instr["source"]
+    # Source/wavelength: the fixture has no integrator and only the mg_args
+    # 1e-10 (1.0 Å) sentinel, so the writer must NOT persist a misleading
+    # wavelength_A (A2).  A real wavelength is exercised in the dedicated
+    # wavelength tests below.
+    assert "source" not in instr
+
+
+def test_wavelength_not_written_for_sentinel_only(tmp_path):
+    # A2: with no integrator and only the mg_args 1e-10 (1.0 Å) sentinel,
+    # the writer must skip source/wavelength_A rather than persist 1.0 Å.
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    assert scan.mg_args["wavelength"] == 1.0e-10        # the sentinel
+    assert getattr(scan, "_cached_integrator", None) is None
+
+    path = tmp_path / "no_wl.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    root = nx.nxload(str(path))
+    assert "source" not in root["entry/instrument"]
+
+
+def test_wavelength_prefers_integrator_over_mg_args(tmp_path):
+    # A2: a real integrator wavelength wins over mg_args (and over the
+    # sentinel); the persisted wavelength_A is the integrator value in Å.
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan.mg_args = {"wavelength": 1.0e-10}              # sentinel-ish, must lose
+    scan._cached_integrator = SimpleNamespace(wavelength=0.7293e-10)
+
+    path = tmp_path / "wl_from_ai.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    root = nx.nxload(str(path))
+    src = root["entry/instrument/source"]
     assert src.nxclass == "NXsource"
-    assert "wavelength_A" in src
+    assert float(src["wavelength_A"].nxdata) == pytest.approx(0.7293)
 
 
 def test_reduction_provenance(written_nxs):

@@ -4,6 +4,7 @@
 """
 
 # Standard library imports
+import threading
 
 # Other imports
 import pandas as pd
@@ -26,7 +27,7 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         update: Updates the data displayed
     """
     def __init__(self, scan, frame, frame_ids, frames, parent=None,
-                 data_1d=None):
+                 data_1d=None, publication_store=None, data_lock=None):
         super().__init__(parent)
         self.layout = Qt.QtWidgets.QVBoxLayout()
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -45,6 +46,9 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         # happens to repurpose it).  Keeping the placeholder as a
         # fallback for legacy code paths.
         self.data_1d = data_1d
+        self.publication_store = publication_store
+        self.data_lock = data_lock if data_lock is not None else threading.RLock()
+        self.viewer_mode = None
 
     def showEvent(self, event):
         """Refresh when the panel becomes visible — ``update()`` short-
@@ -74,10 +78,11 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         except (TypeError, ValueError):
             sel_int = sel
 
-        if self.data_1d is not None and sel_int in self.data_1d:
-            return self.data_1d[sel_int]
-        if sel_int in self.frames:
-            return self.frames[sel_int]
+        with self.data_lock:
+            if self.data_1d is not None and sel_int in self.data_1d:
+                return self.data_1d[sel_int]
+            if sel_int in self.frames:
+                return self.frames[sel_int]
         # Fallback to the placeholder if it's been populated for this
         # frame (live mode: wrangler stamps the latest frame on it).
         if (getattr(self.frame, "idx", None) is not None
@@ -85,15 +90,42 @@ class metadataWidget(Qt.QtWidgets.QWidget):
             return self.frame
         return None
 
+    def _resolve_selected_publication(self):
+        if not self.frame_ids or self.publication_store is None:
+            return None
+        sel = self.frame_ids[0]
+        try:
+            sel = int(sel)
+        except (TypeError, ValueError):
+            pass
+        return self.publication_store.get(sel)
+
+    def _selected_scan_data(self, scan_data):
+        """Return scan_data rows for the current selection when possible."""
+
+        if not self.frame_ids:
+            return scan_data
+        labels = []
+        for item in self.frame_ids:
+            try:
+                labels.append(int(item))
+            except (TypeError, ValueError):
+                labels.append(item)
+        present = [label for label in labels if label in scan_data.index]
+        if not present:
+            return scan_data
+        return scan_data.loc[present]
+
     def update(self):
         """Updates the table with new data.
 
-        Shows the **whole-scan** metadata table (``scan.scan_data``,
-        transposed so rows are metadata keys and columns are frames) —
-        this is the historical behaviour the metadata panel is expected
-        to have.  Only when there is no scan-wide table yet (e.g. the
-        file/XYE viewer, or live mode before scan_data is populated) does
-        it fall back to the selected frame's ``scan_info``.
+        Shows selected rows from the scan metadata table when possible,
+        transposed so rows are metadata keys and columns are frames.  This
+        keeps live refresh bounded to the visible selection instead of
+        rebuilding the whole scan table every tick.  Only when there is no
+        scan-wide table yet (e.g. the file/XYE viewer, or live mode before
+        scan_data is populated) does it fall back to the selected frame's
+        ``scan_info``.
         """
         # Skip the (potentially large) transpose + model rebuild when the
         # panel isn't on screen — during a fast live scan this slot fires
@@ -110,13 +142,28 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         if not self.tableview.isVisible():
             return
         sd = getattr(self.scan, "scan_data", None)
-        if sd is not None and len(sd.index) and len(sd.columns):
-            self.tableview.setModel(DFTableModel(sd.transpose()))
+        if (
+            self.viewer_mode is None
+            and sd is not None
+            and len(sd.index)
+            and len(sd.columns)
+        ):
+            self.tableview.setModel(DFTableModel(self._selected_scan_data(sd).transpose()))
             return
         # No whole-scan table — fall back to the selected frame's info.
+        publication = self._resolve_selected_publication()
+        if publication is not None and publication.metadata_raw:
+            data = pd.DataFrame(dict(publication.metadata_raw), index=[publication.label])
+            self.tableview.setModel(DFTableModel(data.transpose()))
+            return
         selected = self._resolve_selected_frame()
         if selected is not None and getattr(selected, "scan_info", None):
-            data = pd.DataFrame(selected.scan_info, index=[selected.idx])
+            visible_info = {
+                key: value
+                for key, value in selected.scan_info.items()
+                if not str(key).startswith("_")
+            }
+            data = pd.DataFrame(visible_info, index=[selected.idx])
             self.tableview.setModel(DFTableModel(data.transpose()))
             return
         self.tableview.setModel(DFTableModel())

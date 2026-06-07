@@ -34,6 +34,18 @@ QWidget {
     selection-color: #f8f8f2;
 }
 
+/* Disabled text reads as dimmed everywhere (D2): the input widgets already
+   grey out (QLineEdit/QComboBox/QPushButton :disabled below), but a disabled
+   panel's *labels* and check/radio text stayed bright, so a disabled 2-D /
+   integration panel didn't read as off.  Grey the labels too. */
+QLabel:disabled,
+QCheckBox:disabled,
+QRadioButton:disabled,
+QGroupBox:disabled,
+QGroupBox::title:disabled {
+    color: #6272a4;
+}
+
 QMainWindow, QDialog {
     background-color: #282a36;
 }
@@ -202,6 +214,20 @@ QTableView::item:selected {
 QListWidget::item:hover, QTreeView::item:hover,
 QTableView::item:hover {
     background-color: #3a3d4d;
+}
+/* Disabled item views (e.g. the wrangler ParameterTree during a run) must dim
+   their text like the QLabel/QCheckBox/QPushButton :disabled rules above —
+   without this the parameter-name labels stay bright and the panel reads as
+   active even though it's locked.  Group-header rows that carry a widget-local
+   colour (image_wrangler.stylize_ParameterTree) get their own :disabled variant
+   there. */
+QListWidget:disabled, QListView:disabled, QTreeView:disabled,
+QTreeWidget:disabled, QTableView:disabled, QTableWidget:disabled {
+    color: #6272a4;
+}
+QListWidget::item:disabled, QTreeView::item:disabled,
+QTableView::item:disabled {
+    color: #6272a4;
 }
 
 QHeaderView::section {

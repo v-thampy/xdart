@@ -70,10 +70,29 @@ def test_choose_raw_source_priority_and_mask():
 def test_xye_unit_from_filename():
     assert dl.xye_unit_from_filename('iq_scan_0001.xye') == 'q_A^-1'
     assert dl.xye_unit_from_filename('itth_scan_0001.xye') == '2th_deg'
-    # unknown prefix: NO assumption (must not become 2θ)
-    assert dl.xye_unit_from_filename('random_scan.xye') == 'unknown'
-    # unknown unit -> plain x, no unit symbol
+    # GI prefixes (checked before the generic 'iq')
+    assert dl.xye_unit_from_filename('iqip_scan_0001.xye') == 'qip_A^-1'
+    assert dl.xye_unit_from_filename('iqoop_scan_0001.xye') == 'qoop_A^-1'
+    assert dl.xye_unit_from_filename('iexit_scan_0001.xye') == 'exit_angle_deg'
+    # unknown prefix now falls back to Q (XRD 1D is Q by convention)
+    assert dl.xye_unit_from_filename('random_scan.xye') == 'q_A^-1'
+    # unknown unit -> plain x, no unit symbol (x_axis_for_unit unchanged)
     assert dl.x_axis_for_unit('unknown') == ('x', '')
+
+
+def test_xye_prefix_unit_roundtrip():
+    """Writer prefix <-> reader unit must be consistent, and every recovered
+    unit must resolve to a real axis label (not plain 'x')."""
+    cases = {
+        'q_A^-1': 'iq', 'q_nm^-1': 'iq', '2th_deg': 'itth', '2th_rad': 'itth',
+        'qip_A^-1': 'iqip', 'qoop_A^-1': 'iqoop',
+        'exit_angle_horz_deg': 'iexit',
+    }
+    for unit, prefix in cases.items():
+        assert dl.xye_prefix_for_unit(unit) == prefix
+        recovered = dl.xye_unit_from_filename(f'{prefix}_scan_0001.xye')
+        # the recovered unit resolves to a labelled axis (never ('x', ''))
+        assert dl.x_axis_for_unit(recovered) != ('x', '')
 
 
 def test_plan_overlay_rebuild_on_unit_change_keeps_all_ids():
@@ -103,6 +122,29 @@ def test_sentinel_mask_sets_nan():
     assert math.isnan(out[1])              # uint32 dead/hot-pixel sentinel
     assert math.isnan(out[2]) and math.isnan(out[3])  # non-finite
     assert out[0] == 1.0 and out[4] == 3.0            # real values untouched
+
+
+@pytest.mark.display_logic
+def test_convert_2d_radial_q_to_2theta_and_back():
+    np = pytest.importorskip("numpy")
+    lam_A = 1.0
+    q = np.array([0.5, 1.0, 2.0])
+    # Q -> 2θ (data is q, selection names 2θ)
+    tth = dl.convert_2d_radial(q, data_unit="q_A^-1", want_tth=True,
+                               want_q=False, wavelength_m=lam_A * 1e-10)
+    expected = 2 * np.degrees(np.arcsin(np.clip(q * lam_A / (4 * np.pi), -1, 1)))
+    np.testing.assert_allclose(tth, expected)
+    # 2θ -> Q (data is 2θ, selection names Q) round-trips
+    back = dl.convert_2d_radial(tth, data_unit="2th_deg", want_tth=False,
+                                want_q=True, wavelength_m=lam_A * 1e-10)
+    np.testing.assert_allclose(back, q, atol=1e-9)
+    # No-op when the selection already matches the data, or wavelength unknown.
+    same = dl.convert_2d_radial(q, data_unit="q_A^-1", want_tth=False,
+                                want_q=True, wavelength_m=lam_A * 1e-10)
+    np.testing.assert_allclose(same, q)
+    none_wl = dl.convert_2d_radial(q, data_unit="q_A^-1", want_tth=True,
+                                   want_q=False, wavelength_m=None)
+    np.testing.assert_allclose(none_wl, q)
 
 
 def test_default_plot_unit_follows_2theta():
@@ -199,6 +241,44 @@ def test_image_viewer_does_not_depend_on_scan_frames():
     ))
     assert 0 in state.render_ids
     assert state.panel(dl.PanelRole.RAW_2D).has_data is True
+
+
+def test_nexus_viewer_routes_previewable_rows_to_plot_or_image():
+    empty = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.NEXUS_VIEWER,
+        selected_ids=(4,),
+        all_frame_index=[],
+        loaded_1d_keys=set(),
+        loaded_2d_keys=set(),
+    ))
+    assert empty.load_status is dl.LoadStatus.EMPTY
+    assert not empty.panel(dl.PanelRole.PLOT_1D).has_data
+    assert not empty.panel(dl.PanelRole.RAW_2D).has_data
+
+    one_d = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.NEXUS_VIEWER,
+        selected_ids=(4,),
+        all_frame_index=[],
+        loaded_1d_keys={4},
+        loaded_2d_keys=set(),
+    ))
+    assert one_d.load_status is dl.LoadStatus.READY
+    assert one_d.render_ids == (4,)
+    assert one_d.panel(dl.PanelRole.PLOT_1D).has_data
+    assert not one_d.panel(dl.PanelRole.RAW_2D).has_data
+
+    two_d = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.NEXUS_VIEWER,
+        selected_ids=(5,),
+        all_frame_index=[],
+        loaded_1d_keys=set(),
+        loaded_2d_keys={5},
+        raw_availability={5: dict(has_raw=True, has_thumbnail=False)},
+    ))
+    assert two_d.load_status is dl.LoadStatus.READY
+    assert two_d.render_ids == (5,)
+    assert two_d.panel(dl.PanelRole.RAW_2D).has_data
+    assert not two_d.panel(dl.PanelRole.PLOT_1D).has_data
 
 
 def test_load_status_transitions():

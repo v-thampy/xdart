@@ -51,11 +51,13 @@ __all__ = [
     "Axis",
     "Trace",
     "PlotPayload",
+    "ImagePayload",
     "ResultsView",
     "DisplayState",
     "DisplayPayload",
     "RenderPlan",
     "build_payload",
+    "empty_display_state",
     "render_plan",
     "register_controller",
     "controller_for",
@@ -65,9 +67,12 @@ __all__ = [
     "apply_mask_for",
     "x_axis_for_unit",
     "xye_unit_from_filename",
+    "xye_prefix_for_unit",
     "default_plot_unit",
     "plan_overlay",
     "sentinel_mask",
+    "standalone_viewer_image",
+    "convert_2d_radial",
     "gi_axes_uniform",
     "compute_display_state",
 ]
@@ -80,6 +85,130 @@ class Mode(Enum):
     INT_2D = "int_2d"
     IMAGE_VIEWER = "image_viewer"
     XYE_VIEWER = "xye_viewer"
+    NEXUS_VIEWER = "nexus_viewer"
+
+
+# ── Panel layout table (Stage 4/5 step 1) ────────────────────────────
+#
+# Panel geometry used to be set by *deltas* scattered across
+# ``set_viewer_display_mode`` (per-mode height/width/visibility pokes) and
+# ``_apply_1d_only_visibility`` (collapse/restore the 2D pane).  Each path set
+# only the fields it cared about and assumed a baseline the other may have
+# changed, so state leaked across mode transitions (e.g. a 1D-only mode left
+# ``twoDWindow`` at ``maximumHeight(0)``; a viewer that draws the 2D pane then
+# rendered its image into a zero-height widget → invisible).
+#
+# ``PANEL_LAYOUT`` makes geometry a pure, idempotent function of ``Mode``: the
+# *full* end state of every managed widget, for every mode, with no reliance on
+# prior state.  ``displayFrameWidget._apply_layout`` applies it unconditionally.
+# This is the Qt-free data half; the Qt application lives in the widget.
+
+_FULL = 16777215  # Qt's QWIDGETSIZE_MAX — "no maximum" sentinel for min/max.
+
+
+@dataclass(frozen=True)
+class PanelLayout:
+    """Complete panel geometry for one :class:`Mode`.
+
+    Every field is set unconditionally by ``_apply_layout`` — there are no
+    "leave it alone" fields, which is the whole point (a field left untouched
+    is exactly how geometry leaked across modes).  ``*_h`` / ``*_w`` are
+    ``(minimum, maximum)`` pairs in pixels; ``_FULL`` means "no maximum".
+
+    Widget roles (hierarchy: ``imageWindow`` is the top primary panel holding
+    the title bar + 2D container + middle toolbar; ``plotWindow`` is the bottom
+    primary panel; ``binnedFrame`` is the cake panel inside ``twoDWindow``):
+
+    * ``frame_top``    — title bar (filename + process controls); always shown.
+    * ``twoDWindow``   — the 2D image container (raw + cake).
+    * ``imageWindow``  — top primary panel height (title+2D+toolbar).
+    * ``plotWindow``   — bottom primary panel height (the 1D plot).
+    * ``binnedFrame``  — cake panel *width* (collapsed to show raw only).
+    * ``imageToolbar`` — middle control bar (40px tall by UI default).
+    * ``frame_4``/``frame_6`` — process-mode controls (norm/bkg, scale/cmap);
+      hidden in viewer modes.  ``_showImageBtn`` lives inside ``frame_6``.
+    * ``plotToolBar``  — permanently collapsed (its controls moved to the
+      middle bar in ``_reflow_controls``).
+    * ``show_image_btn`` — the raw-preview button (only meaningful in 1D-only
+      Int mode; its host ``frame_6`` is hidden in viewer modes regardless).
+    """
+    frame_top_vis: bool
+    twoDWindow_vis: bool
+    imageToolbar_vis: bool
+    frame_4_vis: bool
+    frame_6_vis: bool
+    plotToolBar_vis: bool
+    show_image_btn_vis: bool
+    twoDWindow_h: tuple
+    imageWindow_h: tuple
+    plotWindow_h: tuple
+    imageToolbar_h: tuple
+    plotToolBar_h: tuple
+    binnedFrame_w: tuple
+
+
+# Values extracted faithfully from the pre-table end states (see
+# ``set_viewer_display_mode`` / ``_apply_1d_only_visibility`` history).  Two
+# deliberate fixes vs the old scattered code, both behaviour-improving and
+# called out in the plan:
+#   * INT_1D sets ``plotWindow_h`` explicitly (the old 1D-only path left it
+#     implicit — a latent gap), and
+#   * viewer modes now set ``show_image_btn_vis`` False explicitly (the button's
+#     host ``frame_6`` is hidden there anyway, so this is invisible but removes a
+#     latent leak from a prior 1D-only mode).
+PANEL_LAYOUT = {
+    # Int 1D / Int 1D (XYE): 2D pane collapsed (height 0) but still "visible";
+    # imageWindow shrinks to the title + middle bar; raw-preview button shown.
+    Mode.INT_1D: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=True,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
+        show_image_btn_vis=True,
+        twoDWindow_h=(0, 0), imageWindow_h=(80, 85), plotWindow_h=(200, _FULL),
+        imageToolbar_h=(40, 40), plotToolBar_h=(0, 0), binnedFrame_w=(0, _FULL),
+    ),
+    # Int 2D: full 2D pane (raw + cake) over the 1D plot; all controls shown.
+    Mode.INT_2D: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=True,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
+        plotWindow_h=(200, _FULL), imageToolbar_h=(40, 40),
+        plotToolBar_h=(0, 0), binnedFrame_w=(0, _FULL),
+    ),
+    # Image Viewer: raw image only; 1D plot collapsed, cake collapsed,
+    # process controls hidden.  frame_6 (scale + cmap) kept so the Linear/Log
+    # scale and colormap apply to the raw image.
+    Mode.IMAGE_VIEWER: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=False,
+        frame_4_vis=False, frame_6_vis=True, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
+        plotWindow_h=(0, 0), imageToolbar_h=(40, 40),
+        plotToolBar_h=(0, 0), binnedFrame_w=(0, 0),
+    ),
+    # XYE Viewer: 1D overlay only; 2D container hidden, middle bar kept
+    # (Single/Options/Legend/Clear), process controls hidden.  frame_6 kept so
+    # the Linear/Log scale applies to the 1D plot (cmap is hidden separately —
+    # it's 2D-only).
+    Mode.XYE_VIEWER: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=False, imageToolbar_vis=True,
+        frame_4_vis=False, frame_6_vis=True, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, _FULL), imageWindow_h=(80, 85),
+        plotWindow_h=(200, _FULL), imageToolbar_h=(40, 40),
+        plotToolBar_h=(0, 0), binnedFrame_w=(0, _FULL),
+    ),
+    # NeXus Viewer: 2D dataset preview over a 1D dataset preview; cake
+    # collapsed, process controls + middle bar hidden.
+    Mode.NEXUS_VIEWER: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=False,
+        frame_4_vis=False, frame_6_vis=False, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
+        plotWindow_h=(200, _FULL), imageToolbar_h=(40, 40),
+        plotToolBar_h=(0, 0), binnedFrame_w=(0, 0),
+    ),
+}
 
 
 class PanelRole(Enum):
@@ -148,6 +277,7 @@ class Axis:
     label: str
     unit: str = ""
     log: bool = False
+    values: "np.ndarray | None" = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +297,15 @@ class PlotPayload:
     """Resolved content of a 1D plot panel: an x-axis plus layered traces."""
     axis_x: Axis
     traces: tuple = ()   # tuple[Trace, ...]
+    axis_y: "Axis | None" = None
+
+
+@dataclass(frozen=True)
+class ImagePayload:
+    """Resolved content of a 2D image panel."""
+    image: "np.ndarray"
+    axis_x: Axis = Axis("x", "")
+    axis_y: Axis = Axis("y", "")
 
 
 @dataclass(frozen=True)
@@ -232,8 +371,8 @@ class DisplayPayload:
     came from integration, stitch or a reload; only the controller that
     produced it knew, and it is gone by the time we render."""
     generation: int                 # must match the DisplayState it pairs with
-    raw_image: "np.ndarray | None"
-    cake_image: "np.ndarray | None"
+    raw_image: "np.ndarray | ImagePayload | None"
+    cake_image: "np.ndarray | ImagePayload | None"
     plot: "PlotPayload | None"      # 1D traces (§10 seam 2)
 
 
@@ -329,6 +468,9 @@ _X_AXIS_TABLE = {
     'q_A^-1': ('Q', _AA_INV),
     '2th_deg': (f"2{_TH}", _DEG),
     'chi_deg': (_CHI, _DEG),
+    'qip_A^-1': ('Q_ip', _AA_INV),
+    'qoop_A^-1': ('Q_oop', _AA_INV),
+    'exit_angle_deg': ('Exit Angle', _DEG),
 }
 
 
@@ -372,17 +514,50 @@ def is_gi_2d_units(unit, azimuthal_unit):
     return two_d_kind_from_units(unit, azimuthal_unit) != "standard"
 
 
+def xye_prefix_for_unit(unit):
+    """Filename prefix encoding the 1D integration axis, so the XYE reader can
+    recover the x-axis from the name (inverse of :func:`xye_unit_from_filename`):
+
+    * Q → ``iq``; 2θ → ``itth``;
+    * GI Q_ip → ``iqip``; Q_oop → ``iqoop``; exit-angle → ``iexit``;
+    * anything else → ``iq`` (Q default).
+
+    Matched on a normalised (underscore-stripped, lowercased) unit so it's robust
+    to ``q_ip`` vs ``qip_A^-1`` etc.  This replaces the old ``'iq' if q else
+    'itth'`` rule, which mislabeled every non-Q axis (Q_ip/Q_oop/exit) as 2θ."""
+    u = str(unit).lower().replace('_', '')
+    if 'qip' in u:
+        return 'iqip'
+    if 'qoop' in u:
+        return 'iqoop'
+    if 'exit' in u:
+        return 'iexit'
+    if '2th' in u or 'tth' in u:
+        return 'itth'
+    return 'iq'
+
+
 def xye_unit_from_filename(name):
-    """``'iq'``/``'iq_'`` → ``'q_A^-1'``; ``'itth'``/``'itth_'`` →
-    ``'2th_deg'``; otherwise ``'unknown'`` (no assumption — an unknown
-    prefix is NOT silently treated as 2θ; it labels the axis plain ``x``
-    via :func:`x_axis_for_unit`)."""
+    """Recover the x-axis unit from an XYE filename prefix (inverse of
+    :func:`xye_prefix_for_unit`): ``iqip``→``qip_A^-1``, ``iqoop``→``qoop_A^-1``,
+    ``iexit``→``exit_angle_deg``, ``itth``→``2th_deg``, ``iq``→``q_A^-1``.
+
+    Anything else falls back to ``q_A^-1`` (Q): XRD 1D patterns are Q by
+    convention, so a non-prefixed file is assumed Q rather than left unlabelled.
+    NB the GI prefixes are checked before the generic ``iq`` (``iqip`` etc. also
+    start with ``iq``)."""
     base = str(name).replace('\\', '/').rsplit('/', 1)[-1].lower()
+    if base.startswith('iqip'):
+        return 'qip_A^-1'
+    if base.startswith('iqoop'):
+        return 'qoop_A^-1'
+    if base.startswith('iexit'):
+        return 'exit_angle_deg'
     if base.startswith('itth'):
         return '2th_deg'
     if base.startswith('iq'):
         return 'q_A^-1'
-    return 'unknown'
+    return 'q_A^-1'
 
 
 def default_plot_unit(bai_1d_unit, available_units):
@@ -438,6 +613,50 @@ def sentinel_mask(arr):
         a = a.copy()
         a[bad] = np.nan
     return a
+
+
+def standalone_viewer_image(data):
+    """Display-only cleanup for standalone Image Viewer files.
+
+    Standalone detector-file viewing is inspection, not processing: keep normal
+    high values and do not turn uint16 ceilings into NaN masks. Only true
+    non-finite values and the Eiger uint32 sentinel are filled with the low
+    finite value so autoscale remains usable without painting white mask holes.
+    """
+    arr = np.asarray(data, dtype=float)
+    bad = ~np.isfinite(arr) | (arr >= 4294967295.0)
+    if not bad.any():
+        return arr
+    valid = np.isfinite(arr) & ~bad
+    out = arr.astype(float, copy=True)
+    if not valid.any():
+        out[...] = np.nan
+        return out
+    out[bad] = float(np.nanmin(arr[valid]))
+    return out
+
+
+def convert_2d_radial(radial, *, data_unit, want_tth, want_q, wavelength_m):
+    """Convert a cake *radial* axis between Q (Å⁻¹) and 2θ (deg) on the fly,
+    mirroring ``display_data.get_xydata`` so the payload cake and the legacy
+    cake agree exactly under the 2D-unit (imageUnit) toggle.
+
+    ``want_tth`` / ``want_q`` come from the selected imageUnit label (does it
+    name 2θ / Q?); ``data_unit`` is the integration unit of the axis. The
+    conversion fires only when the wanted unit differs from the data's, and is
+    a no-op when the wavelength is unknown.  GI reciprocal-space axes must NOT
+    be passed here (their imageUnit combo is disabled; axes are verbatim)."""
+    radial = np.asarray(radial, dtype=float)
+    have_tth = '2th' in str(data_unit or '')
+    if not wavelength_m or wavelength_m <= 0:
+        return radial
+    lam_A = wavelength_m * 1e10
+    if want_tth and not have_tth:
+        arg = np.clip(radial * lam_A / (4 * np.pi), -1, 1)
+        return 2 * np.degrees(np.arcsin(arg))
+    if want_q and have_tth:
+        return (4 * np.pi / lam_A) * np.sin(np.radians(radial / 2))
+    return radial
 
 
 def gi_axes_uniform(axes_per_frame, *, rtol=1e-5, atol=1e-8):
@@ -515,7 +734,10 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
 
     render_1d = resolve_render_ids(ids, overall, all_frame_index, loaded_1d)
     render_2d = resolve_render_ids(ids, overall, all_frame_index, loaded_2d)
-    primary = render_1d if mode in _PLOT_PRIMARY_MODES else render_2d
+    if mode is Mode.NEXUS_VIEWER:
+        primary = render_2d if render_2d else render_1d
+    else:
+        primary = render_1d if mode in _PLOT_PRIMARY_MODES else render_2d
 
     x_label, _sym = x_axis_for_unit(plot_unit)
 
@@ -565,7 +787,17 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     cake_key = PanelKey(PanelRole.CAKE_2D)
     plot_key = PanelKey(PanelRole.PLOT_1D)
 
-    if mode in (Mode.IMAGE_VIEWER,):
+    if mode in (Mode.NEXUS_VIEWER,):
+        raw_panel = PanelPlan(
+            visible=True,
+            has_data=ready and bool(render_2d),
+            source=RawSource.RAW if render_2d else RawSource.NONE,
+            apply_mask=False,
+        )
+        plot_panel = PanelPlan(visible=True, has_data=ready and bool(render_1d))
+        panels = ((raw_key, raw_panel), (plot_key, plot_panel))
+        layout = ((raw_key,), (plot_key,))
+    elif mode in (Mode.IMAGE_VIEWER,):
         panels = ((raw_key, raw_panel),)
         layout = ((raw_key,),)
     elif mode in (Mode.XYE_VIEWER, Mode.INT_1D):
@@ -610,6 +842,35 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
 # over from a previous mode/selection is always blanked (kills mode-switch
 # staleness), without render branching on mode.
 _RENDER_ROLES = (PanelRole.PLOT_1D, PanelRole.RAW_2D, PanelRole.CAKE_2D)
+
+
+def empty_display_state(mode, generation, *, title=""):
+    """A panel-less :class:`DisplayState` with ``EMPTY`` status.
+
+    :func:`render_plan` puts every managed panel in ``clear`` for this state,
+    so :meth:`render_display` blanks the plot, raw and cake panels.  Used to
+    render an *explicit* blank on an empty selection / failed load / cache
+    miss instead of early-returning and leaving stale content on screen
+    (the blank is intentional, §8)."""
+    return DisplayState(
+        mode=mode,
+        load_status=LoadStatus.EMPTY,
+        error_message=None,
+        generation=generation,
+        selected_ids=(),
+        render_ids=(),
+        overall=False,
+        gi=False,
+        x_unit="unknown",
+        x_label="x",
+        method="Single",
+        overlay=OverlayAction.REPLACE,
+        overlaid_ids=(),
+        title=title,
+        panels=(),
+        layout=(),
+        results=None,
+    )
 
 
 def build_payload(state, store=None):

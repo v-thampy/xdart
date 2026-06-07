@@ -182,13 +182,25 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
 
         else:
-            levels = np.nanpercentile(self.displayed_image, (1, 99))
+            # Linear autoscale: clip the top/bottom a bit harder than the old
+            # (1, 99) so saturated tiff pixels don't wash the image out (R2-4).
+            # Shared by the raw / cake / waterfall panels.  Log/Sqrt unchanged.
+            levels = np.nanpercentile(self.displayed_image, (2, 98))
             self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
 
             self.histogram.axis.setLogMode(False)
 
         self.histogram.setColorMap(cm)
-        low, high = np.min(self.displayed_image), np.max(self.displayed_image)
+        # Use nan-aware min/max: detector/processed frames carry NaN-masked
+        # pixels, and np.min/np.max return NaN there.  NaN colorbar limits make
+        # setLevels() clamp the nanpercentile levels to [NaN, NaN], so the image
+        # falls back to pyqtgraph autoscale (data min/max) instead of the
+        # percentile range — the Image Viewer "scaled to min/max" symptom.
+        if np.isfinite(self.displayed_image).any():
+            low, high = (np.nanmin(self.displayed_image),
+                         np.nanmax(self.displayed_image))
+        else:
+            low, high = 0.0, 1.0
         self.histogram.lo_lim, self.histogram.hi_lim = low, high
         self.histogram.setLevels(values=levels)
 

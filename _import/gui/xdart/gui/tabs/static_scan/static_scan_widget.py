@@ -34,6 +34,12 @@ else:
 
 # This module imports
 from xdart.modules.live import LiveFrame, LiveScan
+from xdart.modules.frame_publication import (
+    PublicationStore,
+    publication_error_details,
+    publication_from_live_frame,
+    publication_has_2d_errors,
+)
 from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer
 from .display_frame_widget import displayFrameWidget
@@ -54,6 +60,117 @@ wranglers = {
     'Image Files': imageWrangler,
     'NeXus': nexusWrangler,
 }
+
+
+class _XyeOverlayInputFilter(QtCore.QObject):
+    """Modifier-free, plotMethod-aware multi-select for the XYE file list (E1/E2).
+
+    Active only in XYE viewer (the list is ``ExtendedSelection``).  Mirrors
+    ``h5viewer._AccumulatingClickFilter`` semantics on the file list:
+
+    * **Accumulating plot methods** (Overlay / Waterfall / Sum / Average) build a
+      comparison set — a plain left-click toggles a file in/out, and Up/Down
+      arrows EXTEND the selection (add the newly-current file without clearing),
+      so arrow-browsing accumulates just like clicking.
+    * **Single** mode browses one file — a plain click replaces (Qt default) and
+      arrows move one row (Qt default).
+
+    Directories / ``..`` keep default click-to-navigate; the filter is inert
+    outside XYE mode.  (Vivek's model: the *selection* accumulates and the plot =
+    the selected set per plotMethod, so Sum/Average accumulate on arrow too —
+    which diverges from Int 1D's plan_overlay where Sum/Average are REPLACE.)
+    """
+
+    _ACCUMULATING = ('Overlay', 'Waterfall', 'Sum', 'Average')
+
+    def __init__(self, list_widget, is_active, get_method):
+        super().__init__(list_widget)
+        self._list = list_widget
+        self._is_active = is_active
+        self._get_method = get_method
+
+    def _accumulating(self):
+        try:
+            return self._get_method() in self._ACCUMULATING
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_data_item(item):
+        if item is None:
+            return False
+        text = item.text()
+        return text != '..' and not text.endswith('/')
+
+    def eventFilter(self, obj, event):
+        if not self._is_active():
+            return False
+        etype = event.type()
+        if etype == QtCore.QEvent.MouseButtonPress:
+            return self._on_click(event)
+        if etype == QtCore.QEvent.KeyPress:
+            return self._on_key(event)
+        return False
+
+    @staticmethod
+    def _meaningful_modifiers(event):
+        """Return the shift/ctrl/meta bits held, coerced to int.
+
+        Mirrors ``_AccumulatingClickFilter``: raw ``modifiers() != NoModifier``
+        comparisons are unreliable under PySide6 (a plain click can carry a
+        stray flag, notably on macOS), so coerce to int and mask to the only
+        modifiers we care about.  Returns ``(has_shift, has_toggle_mod)``."""
+        try:
+            mods = int(event.modifiers())
+        except (TypeError, ValueError):
+            return False, False
+        shift_bit = int(QtCore.Qt.ShiftModifier)
+        ctrl_bit = int(QtCore.Qt.ControlModifier)
+        meta_bit = int(QtCore.Qt.MetaModifier)
+        return bool(mods & shift_bit), bool(mods & (ctrl_bit | meta_bit))
+
+    def _on_click(self, event):
+        if event.button() != QtCore.Qt.LeftButton:
+            return False
+        has_shift, has_toggle_mod = self._meaningful_modifiers(event)
+        if has_shift:
+            return False                  # let Qt handle shift range-select
+        try:
+            pos = event.position().toPoint()
+        except AttributeError:            # Qt5 fallback
+            pos = event.pos()
+        item = self._list.itemAt(pos)
+        if not self._is_data_item(item):
+            return False
+        if not (has_toggle_mod or self._accumulating()):
+            return False                  # Single plain click: Qt replace
+        # Accumulating (or explicit ctrl/cmd-toggle): toggle this file in/out of
+        # the overlay via the selection model (robust in ExtendedSelection).
+        sm = self._list.selectionModel()
+        idx = self._list.indexFromItem(item)
+        sm.select(idx, QtCore.QItemSelectionModel.Toggle)
+        sm.setCurrentIndex(idx, QtCore.QItemSelectionModel.NoUpdate)
+        return True
+
+    def _on_key(self, event):
+        has_shift, has_toggle_mod = self._meaningful_modifiers(event)
+        if (not self._accumulating()
+                or has_shift or has_toggle_mod
+                or event.key() not in (QtCore.Qt.Key_Up, QtCore.Qt.Key_Down)):
+            return False                  # Single / modified: Qt default browse
+        step = -1 if event.key() == QtCore.Qt.Key_Up else 1
+        row = self._list.currentRow() + step
+        while 0 <= row < self._list.count():
+            item = self._list.item(row)
+            if self._is_data_item(item):
+                # Extend: add the newly-current file without clearing the rest,
+                # so arrow-browsing builds the comparison set.
+                item.setSelected(True)
+                self._list.setCurrentItem(
+                    item, QtCore.QItemSelectionModel.NoUpdate)
+                return True
+            row += step
+        return True                       # at an end / only dirs: consume
 
 
 def scanlocked(func):
@@ -178,8 +295,6 @@ class staticWidget(QWidget):
         # Scratch directory for working .nxs files (under the user's home).
         self.local_path = get_fname_dir()
         self.dirname = self.local_path
-        if not os.path.isdir(self.dirname):
-            os.mkdir(self.dirname)
 
         self.fname = os.path.join(self.dirname, 'default.nxs')
         # J2: share ``file_lock`` with the scan so direct
@@ -192,6 +307,7 @@ class staticWidget(QWidget):
         self.frame = LiveFrame(static=True, gi=self.scan.gi)
         self.frame_ids = []
         self.frames = OrderedDict()
+        self.publication_store = PublicationStore()
         # O4: both 1D and 2D caches are bounded with the same cap.
         # Pre-O4 ``data_1d`` was an unbounded OrderedDict while
         # ``data_2d`` was FixSizeOrderedDict(max=20), and the manual
@@ -221,7 +337,8 @@ class staticWidget(QWidget):
         self.h5viewer = H5Viewer(self.file_lock, self.local_path, self.dirname,
                                  self.scan, self.frame, self.frame_ids, self.frames,
                                  self.data_1d, self.data_2d,
-                                 self.ui.hdf5Frame, data_lock=self.data_lock)
+                                 self.ui.hdf5Frame, data_lock=self.data_lock,
+                                 publication_store=self.publication_store)
         self.ui.hdf5Frame.setLayout(self.h5viewer.layout)
         self.h5viewer.update_scans()
 
@@ -230,14 +347,16 @@ class staticWidget(QWidget):
                                                self.frame_ids, self.frames,
                                                self.data_1d, self.data_2d,
                                                parent=self.ui.middleFrame,
-                                               data_lock=self.data_lock)
+                                               data_lock=self.data_lock,
+                                               publication_store=self.publication_store)
         self.ui.middleFrame.setLayout(self.displayframe.ui.layout)
 
         # IntegratorTree
         self.integratorTree = integratorTree(
             self.scan, self.frame, self.file_lock,
             self.frames, self.frame_ids, self.data_1d, self.data_2d,
-            data_lock=self.data_lock)
+            data_lock=self.data_lock,
+            publication_store=self.publication_store)
         self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
         if len(self.scan.frames.index) > 0:
             self.integratorTree.update()
@@ -246,7 +365,9 @@ class staticWidget(QWidget):
         # Metadata
         self.metawidget = metadataWidget(self.scan, self.frame,
                                          self.frame_ids, self.frames,
-                                         data_1d=self.data_1d)
+                                         data_1d=self.data_1d,
+                                         publication_store=self.publication_store,
+                                         data_lock=self.data_lock)
         self.ui.metaFrame.setLayout(self.metawidget.layout)
 
     def _connect_signals(self):
@@ -276,6 +397,11 @@ class staticWidget(QWidget):
 
         # Integrator signals
         self.integratorTree.integrator_thread.started.connect(self.thread_state_changed)
+        # Re-integration is a "run" too: route its START through the single
+        # run-state owner (task #68) — keeps the 2D panels persistent AND
+        # disables the processing controls (task #71) for its duration; cleared
+        # in integrator_thread_finished via _exit_run_state.
+        self.integratorTree.integrator_thread.started.connect(self._enter_run_state)
         self.integratorTree.integrator_thread.update.connect(self.integrator_thread_update)
         self.integratorTree.integrator_thread.finished.connect(self.integrator_thread_finished)
 
@@ -301,6 +427,12 @@ class staticWidget(QWidget):
             w = self.ui.wranglerStack.widget(i)
             parameters.append(w.parameters)
         self.h5viewer.defaultWidget.set_parameters(parameters)
+
+        # Single source of truth for "a wrangler/integrator run is in
+        # progress" (task #68).  Flipped only by _enter_run_state /
+        # _exit_run_state, which drive the display persist flag AND the
+        # processing-control disable (task #71) so the two can never desync.
+        self._run_active = False
 
         # Coalescing timer for wrangler updates: when the wrangler thread
         # processes images faster than the GUI can render, only the most
@@ -334,9 +466,22 @@ class staticWidget(QWidget):
         self.wrangler.finished.connect(self.wrangler_finished)
         if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'processingModeCombo'):
             def _on_mode_changed(mode_text):
-                # Skip when in viewer mode — set_viewer_display_mode controls panels
+                # Per-mode integration control enable/dim (C3/C4) — runs for
+                # every processing-mode change, including the viewer modes.
+                self._apply_integration_control_state()
+                # Skip the rest when in viewer mode — set_viewer_display_mode
+                # controls panels.
                 if 'Viewer' in mode_text:
                     return
+                # A non-viewer processing mode (Int 1D/2D, Int 1D (XYE)) must take
+                # the display OUT of any viewer mode it is stuck in.  The
+                # wrangler's sigViewerModeChanged is guarded by its own
+                # _prev_viewer_mode, which misses the case where the display was
+                # auto-switched to XYE after an Int 1D (XYE) batch (the wrangler's
+                # viewer_mode stayed None, so _prev stays '' and no reset emits).
+                # Force the display reset here so the combo and display can't desync.
+                if getattr(self.displayframe, 'viewer_mode', None) is not None:
+                    self._on_viewer_mode_changed('')
                 self.displayframe._apply_1d_only_visibility()
                 # Drop any visible/cached content from the previous mode,
                 # then reload the current selection for the new processing
@@ -344,6 +489,7 @@ class staticWidget(QWidget):
                 # or curve visible when the new mode needs data that has not
                 # been loaded yet.
                 self.displayframe.clear_display_state()
+                self.displayframe.request_plot_autorange()
                 self.h5viewer.data_changed()
             self.wrangler.ui.processingModeCombo.currentTextChanged.connect(_on_mode_changed)
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
@@ -354,12 +500,29 @@ class staticWidget(QWidget):
             vm = getattr(self.wrangler, 'viewer_mode', None)
             if vm is not None:
                 QtCore.QTimer.singleShot(0, lambda v=vm: self._on_viewer_mode_changed(v))
+        if hasattr(self.wrangler, 'sigSavePathChanged'):
+            self.wrangler.sigSavePathChanged.connect(self._sync_h5viewer_save_dir)
         # Wire the wrangler's Advanced button to show the integratorTree's
         # existing 1D/2D advanced parameter dialogs in a combined popup.
         if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'advancedButton'):
             self.wrangler.ui.advancedButton.clicked.connect(
                 self._show_integration_advanced)
         self.wrangler.setup()
+        self._sync_h5viewer_save_dir(getattr(self.wrangler, 'h5_dir', None))
+        # E1/E2: modifier-free, plotMethod-aware overlay build for the XYE file
+        # list (active only in xye mode).  Mouse presses go to the viewport, key
+        # presses to the list widget — install on both.
+        try:
+            scans = self.h5viewer.ui.listScans
+            self._xye_input_filter = _XyeOverlayInputFilter(
+                scans,
+                lambda: getattr(self.h5viewer, 'viewer_mode', None) == 'xye',
+                lambda: self.displayframe.ui.plotMethod.currentText(),
+            )
+            scans.viewport().installEventFilter(self._xye_input_filter)
+            scans.installEventFilter(self._xye_input_filter)
+        except Exception:
+            logger.debug("XYE overlay input filter install failed", exc_info=True)
         self.h5viewer.sigNewFile.connect(self.wrangler.set_fname)
         self.h5viewer.sigNewFile.connect(self.displayframe.set_axes)
         self.h5viewer.sigNewFile.connect(self.h5viewer.data_reset)
@@ -376,6 +539,8 @@ class staticWidget(QWidget):
                    self.h5viewer.sigNewFile]
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
             signals.append(self.wrangler.sigViewerModeChanged)
+        if hasattr(self.wrangler, 'sigSavePathChanged'):
+            signals.append(self.wrangler.sigSavePathChanged)
         # Disconnect Advanced button from integration popup
         if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'advancedButton'):
             try:
@@ -390,6 +555,16 @@ class staticWidget(QWidget):
                     signal.disconnect()
             except (TypeError, RuntimeError, SystemError) as e:
                 logger.debug("Failed to disconnect signal: %s", e)
+
+    def _sync_h5viewer_save_dir(self, path, *, refresh=True):
+        """Point the Scans browser at the active processed-output directory."""
+        if not path:
+            return
+        path = os.path.abspath(os.path.expanduser(str(path)))
+        self.dirname = path
+        self.h5viewer.dirname = path
+        if refresh:
+            self.h5viewer.update_scans()
 
     def thread_state_changed(self):
         """Called whenever a thread is started or finished.
@@ -456,6 +631,13 @@ class staticWidget(QWidget):
             frame = None
         if frame is not None:
             try:
+                global_mask = getattr(published, "mask", None)
+                if global_mask is not None:
+                    self.scan.global_mask = global_mask
+                publication = publication_from_live_frame(
+                    frame,
+                    generation=self.publication_store.generation,
+                )
                 with self.h5viewer.data_lock:
                     # 1D copy (no map_raw / 2D payload) — small object
                     self.h5viewer.data_1d[int(idx)] = frame.copy_for_display(
@@ -465,7 +647,9 @@ class staticWidget(QWidget):
                     # produces (see scan_threads.load_frames).  Keys are what
                     # displayframe.get_frames_map_raw / get_frames_int_2d
                     # look for.
-                    if not getattr(self.scan, "skip_2d", False):
+                    skip_2d = getattr(self.scan, "skip_2d", False)
+                    has_2d_errors = publication_has_2d_errors(publication)
+                    if not skip_2d and not has_2d_errors:
                         self.h5viewer.data_2d[int(idx)] = {
                             "map_raw": getattr(frame, "map_raw", None),
                             "bg_raw": getattr(frame, "bg_raw", 0),
@@ -474,6 +658,13 @@ class staticWidget(QWidget):
                             "gi_2d": getattr(frame, "gi_2d", {}),
                             "thumbnail": getattr(frame, "thumbnail", None),
                         }
+                    elif not skip_2d and has_2d_errors:
+                        self.h5viewer.data_2d.pop(int(idx), None)
+                        logger.warning(
+                            "Skipping frame %s 2D display cache: %s",
+                            idx,
+                            publication_error_details(publication, "2d"),
+                        )
                     # ── Bounded cache eviction ────────────────────────
                     # O4: ``data_1d`` and ``data_2d`` are both bounded
                     # FixSizeOrderedDicts now (see __init__), so their
@@ -485,6 +676,7 @@ class staticWidget(QWidget):
                     # unbounded) silently grew without bound.  No
                     # explicit eviction needed now; downstream cache
                     # misses fall through to the file_thread lazy load.
+                    self.publication_store.upsert(publication)
             except Exception:
                 # Cache miss is non-fatal — displayframe will lazy-load
                 # from disk via file_thread.load_frame as fallback.
@@ -579,6 +771,26 @@ class staticWidget(QWidget):
         self.h5viewer.update_data(emit_update=False)
         if self.h5viewer.auto_last:
             self.latest_frame(emit_update=False)
+
+        method = ""
+        try:
+            method = self.displayframe.ui.plotMethod.currentText()
+        except Exception:
+            method = ""
+        if self.h5viewer.auto_last and method in ("Overlay", "Waterfall"):
+            # Overlay/Waterfall must show EVERY processed frame, not just the
+            # frames that landed in this timer window.  Fast (non-GI) scans
+            # produce several frames between ticks; selecting only the tick's
+            # pending set dropped earlier curves (visible only in slow GI runs).
+            # Re-select the FULL processed set each refresh — idempotent and
+            # race-free, no pending-delta bookkeeping.
+            with self.scan.scan_lock:
+                selected = [str(int(i)) for i in self.scan.frames.index]
+            if selected:
+                self.h5viewer.frame_ids[:] = selected
+                self.h5viewer.data_changed(show_all=True)
+                return
+
         self.h5viewer.data_changed()  # → sigUpdate → set_data → metawidget.update()
 
     def disable_auto_last(self, q):
@@ -604,6 +816,14 @@ class staticWidget(QWidget):
         # In viewer mode, always update display (no scan dependency)
         is_viewer = getattr(self.h5viewer, 'viewer_mode', None) is not None
         if is_viewer or self.scan.name != 'null_main':
+            # Propagate the Image-Viewer file classification from the H5Viewer
+            # (which classifies on file select) to the display widget (which
+            # renders).  Without this, displayframe._viewer_is_xdart is always
+            # False, so the Image Viewer's raw-preview payload takes the
+            # *standalone* branch even for processed xdart .nxs frames and fills
+            # their baked NaN mask (the inverse of the intended behaviour).
+            self.displayframe._viewer_is_xdart = getattr(
+                self.h5viewer, '_viewer_is_xdart', False)
             self.displayframe.update()
             # # if (len(self.frames.keys()) > 0) and (len(self.scan.frames.index) > 0):
             # if ((len(self.data_1d.keys()) > 0) and
@@ -625,6 +845,17 @@ class staticWidget(QWidget):
     def close(self):
         """Tries a graceful close.
         """
+        # Stop the viewer's long-running background threads BEFORE teardown so
+        # the persistent fileHandlerThread / async load worker aren't destroyed
+        # while running ("QThread: Destroyed while thread is still running") on
+        # tab/app close.  Mirrors the GUI-test fixture teardown.
+        try:
+            h5v = getattr(self, 'h5viewer', None)
+            if h5v is not None and hasattr(h5v, 'shutdown_threads'):
+                h5v.shutdown_threads()
+        except Exception:
+            logger.debug("background-thread shutdown on close failed",
+                         exc_info=True)
         del self.scan
         del self.displayframe.scan
         del self.frame
@@ -665,6 +896,111 @@ class staticWidget(QWidget):
         """Calls the integratorTree setEnabled function.
         """
         self.integratorTree.setEnabled(enable)
+
+    def _apply_integration_control_state(self):
+        """Enable/disable the integration controls for the current mode (C3/C4).
+
+        - Int 1D / Int 1D (XYE): the 2-D integration panel is disabled — there
+          is no cake in a 1D-only run.
+        - Image / XYE / NeXus Viewer: the 1-D and 2-D integration panels are
+          disabled (file-browser modes; the wrangler processing params are
+          disabled separately via the wrangler ``tree``), but **Calibrate** and
+          **Make Mask** stay enabled — they're still useful in a viewer.
+        - Int 2D: everything enabled.
+
+        While a run is active (``self._run_active``, task #71) the
+        processing-affecting controls are force-disabled *on top of* the
+        per-mode state: the 1-D and 2-D panels (whose children are the range
+        fields, point counts, Auto toggles, unit + GI-mode combos, and the
+        Re-Integrate buttons), plus **Calibrate** and **Make Mask** (they mutate
+        the PONI / mask the run depends on).  The running frames use a
+        deep-copied arg snapshot, but a mid-run edit would otherwise leak into
+        the next scan of a multi-scan run and into a later reintegrate.  The
+        frame1D/frame2D contents are plain Qt widgets (checkable ``QPushButton``
+        Auto toggles, ``QComboBox`` units/modes), so ``setEnabled(False)`` here
+        keeps their checked look — the pyqtgraph readonly-checkbox repaint bug
+        only affects the wrangler's ParameterTree, not these.  (The Advanced
+        1D/2D dialogs ARE pyqtgraph ParameterTrees; they also feed bai_*_args and
+        are locked per-widget in _enter_run_state — not blanket-disabled here.)
+        ``Stop`` lives on the wrangler and is left enabled; display/h5viewer
+        browsing is untouched.
+
+        Disabled widgets dim via the theme's ``:disabled`` style (D2).  Keyed
+        off the processing-mode combo + run-state so it's one source of truth.
+        """
+        itree = getattr(self, 'integratorTree', None)
+        if itree is None or not hasattr(itree, 'ui'):
+            return
+        try:
+            mode_text = self.wrangler.ui.processingModeCombo.currentText()
+        except Exception:
+            mode_text = ''
+        is_viewer = mode_text in ('Image Viewer', 'XYE Viewer', 'NeXus Viewer')
+        is_1d_only = mode_text in ('Int 1D', 'Int 1D (XYE)')
+        run_active = getattr(self, '_run_active', False)
+        ui = itree.ui
+        # 2-D integration panel: only in Int 2D, and never during a run.
+        frame2d = getattr(ui, 'frame2D', None)
+        if frame2d is not None:
+            frame2d.setEnabled(not is_viewer and not is_1d_only and not run_active)
+        # 1-D integration panel: any Int mode, not viewers, never during a run.
+        frame1d = getattr(ui, 'frame1D', None)
+        if frame1d is not None:
+            frame1d.setEnabled(not is_viewer and not run_active)
+        # Calibrate / Make Mask stay enabled everywhere (incl. viewers) EXCEPT
+        # during a run — they mutate the PONI / mask the run depends on.
+        for name in ('pyfai_calib', 'get_mask'):
+            btn = getattr(ui, name, None)
+            if btn is not None:
+                btn.setEnabled(not run_active)
+
+    def _enter_run_state(self):
+        """Single owner of run START (task #68): mark a wrangler/integrator run
+        in progress.  Idempotent — re-entry while already active is a no-op so
+        re-fired ``started`` signals don't double-toggle.
+
+        Drives BOTH the display persist flag (so the 2-D panels keep their last
+        content during the run, matching the 1-D plot) AND the processing-control
+        disable (task #71), so the two can't desync.  Wired through the paths
+        that always fire on a run start: ``start_wrangler`` (wrangler live/batch)
+        and the ``integrator_thread.started`` signal (reintegrate).
+        """
+        if self._run_active:
+            return
+        self._run_active = True
+        self.displayframe.set_processing_active(True)
+        self._apply_integration_control_state()   # run_active=True → disable
+        # The Advanced 1D/2D parameter dialogs also feed bai_*_args (their
+        # sigUpdateArgs → get_args mutates scan.bai_1d/2d_args), so a dialog left
+        # open from before the run could leak a mid-run edit into the next scan.
+        # Disable them too (per-widget, as reintegrate already does via
+        # integratorTree.setEnabled(False)); re-enabled by enable_integration in
+        # _exit_run_state.
+        itree = getattr(self, 'integratorTree', None)
+        for name in ('advancedWidget1D', 'advancedWidget2D'):
+            adv = getattr(itree, name, None)
+            if adv is not None:
+                adv.setEnabled(False)
+
+    def _exit_run_state(self):
+        """Single owner of run END (task #68): mark the run finished.
+        Idempotent — exiting an already-idle state is a no-op.
+
+        Reached on every end path including Stop and exceptions, because it is
+        driven from the ``finished`` handlers (``QThread.finished`` fires
+        whenever ``run()`` returns).  Ends the display persist window, then
+        re-enables the integration controls and re-asserts the *mode-correct*
+        per-mode state (Int 1D vs Int 2D vs viewer) rather than a blanket enable,
+        so the controls are right for the current mode after the run.
+        """
+        if not self._run_active:
+            return
+        self._run_active = False
+        self.displayframe.set_processing_active(False)
+        # Re-enable the tree (restores the auto-range field gating) then overlay
+        # the mode-correct state (run_active is now False).
+        self.enable_integration(True)
+        self._apply_integration_control_state()
 
     def update_all(self, idx=None):
         """Updates all data in displays.
@@ -707,7 +1043,17 @@ class staticWidget(QWidget):
         integratorThread
         """
         self.thread_state_changed()
-        self.enable_integration(True)
+        # End the run through the single run-state owner (task #68) BEFORE the
+        # final refresh so the 2D panels resume normal blank-on-missing for the
+        # final frame.  _exit_run_state re-enables the integration controls and
+        # re-asserts the mode-correct per-mode state (it folds in the former
+        # enable_integration(True) call).  Only exit if no wrangler run is still
+        # in flight: a wrangler can be started while a reintegrate runs, and its
+        # frames still need the controls locked — its own finished handler will
+        # exit the shared run-state then (mirrors the wrangler-enable guard
+        # below).
+        if not self.wrangler.thread.isRunning():
+            self._exit_run_state()
         self.h5viewer.set_open_enabled(True)
         self.update_all()
         if not self.wrangler.thread.isRunning():
@@ -741,7 +1087,7 @@ class staticWidget(QWidget):
         # land correctly; this assignment just unblocks the
         # synchronous render path immediately.
         self.scan.name = name
-        self.h5viewer.dirname = os.path.dirname(fname)
+        self._sync_h5viewer_save_dir(os.path.dirname(fname), refresh=False)
         self.h5viewer.set_file(fname)
         self.scan.gi = gi
         self.scan.incidence_motor = incidence_motor
@@ -781,6 +1127,7 @@ class staticWidget(QWidget):
         # the next ``_flush_pending_update`` tick.
         self.frames.clear()
         self.frame_ids.clear()
+        self.publication_store.clear()
 
         # During a live (non-batch) run the async file-thread set_datafile
         # no longer reloads frames from disk (it would clobber the live
@@ -826,8 +1173,13 @@ class staticWidget(QWidget):
             gi: bool, flag for determining if in Grazing incidence
         """
         self.scan.gi = gi
+        # Update the integration-panel options now (the next run integrates in
+        # the new geometry).  Do NOT rebuild the *display* axis combos here (C1):
+        # the displayed plot is still the old-mode data, so switching the
+        # plotUnit/imageUnit combos to GI/non-GI axes immediately is misleading.
+        # The display combos rebuild via new_scan -> set_axes once a run actually
+        # produces plots in the new mode.
         self.integratorTree.set_image_units()
-        self.displayframe.set_axes()
 
     def new_frame(self, frame_data):
         """Connected to sigUpdateFile from wrangler. Called when a new
@@ -871,6 +1223,19 @@ class staticWidget(QWidget):
         live = not getattr(self.wrangler.thread, 'batch_mode', False)
         self.h5viewer.live_run_active = live
         self.h5viewer.file_thread.live_run = live
+        # Int 1D (XYE) writes only .xye files (no .nxs); tell the file thread
+        # not to try loading a .nxs that will never exist.  Cleared in
+        # wrangler_finished so a later normal open still loads from disk.
+        self.h5viewer.file_thread.no_nxs = getattr(
+            self.wrangler.thread, 'xye_only', False)
+
+        # Mark the run active through the single run-state owner (task #68):
+        # the 2D panels keep their last-rendered content (instead of blanking)
+        # while the run's frames arrive — matching the 1D plot's persistence —
+        # AND the integration controls are disabled for the run (task #71).
+        # Called synchronously here (GUI thread) so the controls lock before the
+        # thread starts.  Cleared in wrangler_finished.
+        self._enter_run_state()
 
         self.wrangler.thread.start()
 
@@ -878,6 +1243,18 @@ class staticWidget(QWidget):
         """Called by the wrangler finished signal. If current scan
         matches the wrangler scan, allows for integration.
         """
+        # End the run through the single run-state owner (task #68) BEFORE the
+        # final flush so the 2D panels resume normal blank-on-missing for the
+        # final frame.  Idempotent: a later integrator_thread_finished() (when
+        # the scan matches, below) calls _exit_run_state again as a no-op.
+        # Overlap guard (symmetric with integrator_thread_finished): a wrangler
+        # can be started while a reintegrate is still running, and if it
+        # finishes first the reintegrate's frames still need the controls
+        # locked — only exit the shared run-state when the integrator run is
+        # also done; its finished handler exits it otherwise.
+        if not self.integratorTree.integrator_thread.isRunning():
+            self._exit_run_state()
+
         # Flush any pending coalesced update so the final frame is shown.
         self._update_timer.stop()
         self._flush_pending_update()
@@ -889,6 +1266,9 @@ class staticWidget(QWidget):
         # caches again.
         self.h5viewer.live_run_active = False
         self.h5viewer.file_thread.live_run = False
+        # Clear the XYE-only no-load flag so the end-of-batch auto-load (and any
+        # later normal file open) reads the .nxs from disk again.
+        self.h5viewer.file_thread.no_nxs = False
 
         self.thread_state_changed()
         self.wrangler.stop()
@@ -917,7 +1297,15 @@ class staticWidget(QWidget):
                 self.h5viewer._auto_select_last_on_finish = True
                 self.h5viewer.set_file(generated_file)
 
-        if self.scan.name == self.wrangler.scan_name:
+        # The scan-matches branch delegates to integrator_thread_finished() to
+        # run the post-integration UI enable + exit the run-state.  Skip it when
+        # a real reintegrate is still running (the overlap case): calling it
+        # would exit the shared run-state and re-enable the controls mid-
+        # reintegrate.  In that case just re-enable the wrangler (its run IS
+        # done); the integrator's own finished handler exits the run-state when
+        # the reintegrate completes.
+        if (self.scan.name == self.wrangler.scan_name
+                and not self.integratorTree.integrator_thread.isRunning()):
             self.integrator_thread_finished()
         else:
             self.wrangler.enabled(True)
@@ -938,9 +1326,10 @@ class staticWidget(QWidget):
                     # Same path the XYE Viewer combo takes: set viewer_mode,
                     # panels, selection mode, and refresh listScans.
                     self._on_viewer_mode_changed('xye')
-                    # Auto-select the last (most recent) generated file so
-                    # the final pattern is shown without a manual click.
-                    self.h5viewer.select_last_scan_entry()
+                    # Auto-select the most recently *written* file (by mtime),
+                    # not the name-last one, so the final pattern from this run
+                    # is shown without a manual click.
+                    self.h5viewer.select_most_recent_scan_entry()
                 else:
                     logger.debug(
                         'XYE-only batch finished but output dir not found: %s',
@@ -958,6 +1347,7 @@ class staticWidget(QWidget):
         """
         viewer_mode = viewer_mode_str or None  # '' → None
         is_viewer = viewer_mode is not None
+        is_file_viewer = viewer_mode in ('image', 'xye')
         from PySide6.QtWidgets import QAbstractItemView
 
         scans = self.h5viewer.ui.listScans
@@ -967,21 +1357,65 @@ class staticWidget(QWidget):
         was_blocked = scans.blockSignals(True)
         self.h5viewer._suspend_scan_selection_loads = True
         try:
-            # Keep integratorTree enabled so mask/threshold controls remain accessible
             self.h5viewer.viewer_mode = viewer_mode
+            tree = getattr(self.wrangler, 'tree', None)
+            if tree is not None:
+                # Only the actual file-Viewer *processing* modes disable the
+                # wrangler inputs.  Int 1D (XYE) is a processing mode whose
+                # display auto-switches to XYE to list the generated files, but
+                # its inputs (Image File / mask / …) must stay enabled so the
+                # user can keep processing.  Key off the processing-mode combo,
+                # not the display viewer_mode; fall back to the display when the
+                # combo is unavailable.
+                mode_text = ''
+                try:
+                    mode_text = self.wrangler.ui.processingModeCombo.currentText()
+                except Exception:
+                    mode_text = ''
+                viewer_processing = (
+                    mode_text in ('Image Viewer', 'XYE Viewer')
+                    if mode_text else is_file_viewer
+                )
+                tree.setEnabled(not viewer_processing)
+            # Per-mode integration control enable/dim (C3/C4): disable the 1-D/2-D
+            # integration panels in viewers, keep Calibrate / Make Mask enabled.
+            self._apply_integration_control_state()
+            # Relax the Frames panel width so NeXus dataset labels aren't
+            # clipped; restored on exit / other modes.
+            self.h5viewer._apply_frames_panel_width(viewer_mode)
+            if hasattr(self, "metawidget"):
+                self.metawidget.viewer_mode = viewer_mode
             # Give displayframe a reference to the wrangler for mask/threshold
             self.displayframe._wrangler = self.wrangler if is_viewer else None
             # In viewer mode, disable New/Save (keep Open Folder and Export)
             self.h5viewer.actionNewFile.setEnabled(not is_viewer)
             self.h5viewer.actionSaveDataAs.setEnabled(not is_viewer)
-            # XYE viewer: allow multi-select for overlay; others: single select
+            # XYE viewer: ExtendedSelection so arrow keys browse one file at a
+            # time with the plot following (shift+arrow / shift+click = range);
+            # _XyeOverlayInputFilter layers on modifier-free, plotMethod-aware
+            # accumulation (toggle/extend on click+arrow in Overlay/Waterfall/
+            # Sum/Average).  Others: single select.  Start clean — show the
+            # current row only, never a default overlay.
             if viewer_mode == 'xye':
                 scans.setSelectionMode(QAbstractItemView.ExtendedSelection)
+                scans.clearSelection()
             else:
                 scans.setSelectionMode(QAbstractItemView.SingleSelection)
             # Configure display panels for the viewer mode
+            self.displayframe._viewer_is_xdart = False
             self.displayframe.set_viewer_display_mode(viewer_mode)
             if is_viewer:
+                save_path = getattr(self.wrangler, 'h5_dir', None)
+                current_raw = str(getattr(self.h5viewer, 'dirname', '') or '')
+                current_dir = (
+                    os.path.abspath(os.path.expanduser(current_raw))
+                    if current_raw else ''
+                )
+                default_dir = os.path.abspath(os.path.expanduser(
+                    str(getattr(self, 'local_path', get_fname_dir())),
+                ))
+                if save_path and (not current_dir or current_dir == default_dir):
+                    self._sync_h5viewer_save_dir(save_path, refresh=False)
                 self.h5viewer.enter_viewer_mode_cleanup()
             else:
                 self.h5viewer.cancel_pending_loads()

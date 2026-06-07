@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from types import MethodType, SimpleNamespace
 from threading import RLock
@@ -10,20 +11,46 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from pyqtgraph.Qt import QtCore
+
 from xdart.gui.tabs.static_scan.h5viewer import H5Viewer
-from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
+from xdart.gui.tabs.static_scan.display_data import (
+    DisplayDataMixin,
+    available_norm_channels,
+)
 from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
-from xdart.gui.tabs.static_scan.display_plot import DisplayPlotMixin
+from xdart.gui.tabs.static_scan.display_plot import (
+    DisplayPlotMixin,
+    update_plot_accumulator,
+)
 from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
 
 class _FakeItem:
     def __init__(self, text):
-        self._text = str(text)
+        if hasattr(text, "text"):
+            self._text = str(text.text())
+            self._data = {}
+            try:
+                from pyqtgraph.Qt import QtCore
+                value = text.data(QtCore.Qt.UserRole)
+                if value is not None:
+                    self._data[QtCore.Qt.UserRole] = value
+            except Exception:
+                pass
+        else:
+            self._text = str(text)
+            self._data = {}
         self._selected = False
 
     def text(self):
         return self._text
+
+    def setData(self, role, value):
+        self._data[role] = value
+
+    def data(self, role):
+        return self._data.get(role)
 
     def setSelected(self, selected):
         self._selected = bool(selected)
@@ -40,7 +67,7 @@ class _FakeListWidget:
         self._items.extend(_FakeItem(item) for item in items)
 
     def addItem(self, item):
-        self._items.append(_FakeItem(item))
+        self._items.append(item if isinstance(item, _FakeItem) else _FakeItem(item))
 
     def insertItems(self, row, items):
         for offset, item in enumerate(items):
@@ -70,6 +97,11 @@ class _FakeListWidget:
     def currentRow(self):
         return self._current_row
 
+    def currentItem(self):
+        if 0 <= self._current_row < len(self._items):
+            return self._items[self._current_row]
+        return None
+
     def blockSignals(self, blocked):
         prev = self._signals_blocked
         self._signals_blocked = bool(blocked)
@@ -97,16 +129,50 @@ class _FakeListWidget:
         item.setSelected(True)
 
 
+class _FakeImageItem:
+    def __init__(self):
+        self.cleared = False
+        self.levels = None
+
+    def clear(self):
+        self.cleared = True
+
+    def setLevels(self, levels):
+        self.levels = tuple(levels)
+
+
+class _FakeHistogram:
+    def __init__(self):
+        self.visible = True
+        self.levels = None
+
+    def setVisible(self, visible):
+        self.visible = bool(visible)
+
+    def setLevels(self, values=None, **kwargs):
+        self.levels = tuple(values)
+
+
 class _FakeImageWidget:
     def __init__(self):
         self.images = []
         self.rects = []
+        self.raw_image = np.ones((2, 2))
+        self.displayed_image = np.ones((2, 2))
+        self.imageItem = _FakeImageItem()
+        self.histogram = _FakeHistogram()
 
     def setImage(self, data, *args, **kwargs):
         self.images.append(np.asarray(data))
 
     def setRect(self, rect):
         self.rects.append(rect)
+
+    def width(self):
+        return 200
+
+    def height(self):
+        return 200
 
 
 class _FakeCurve:
@@ -136,12 +202,17 @@ class _FakeLabel:
 class _FakeTimer:
     def __init__(self, active=True):
         self.active = active
+        self.started = 0
 
     def isActive(self):
         return self.active
 
     def stop(self):
         self.active = False
+
+    def start(self):
+        self.active = True
+        self.started += 1
 
 
 class _FakeWorker:
@@ -184,9 +255,16 @@ class _FakeControl:
 class _FakeCombo:
     def __init__(self, text):
         self._text = text
+        self._enabled = True
 
     def currentText(self):
         return self._text
+
+    def setEnabled(self, enabled):
+        self._enabled = bool(enabled)
+
+    def isEnabled(self):
+        return self._enabled
 
 
 class _FakeIndexedCombo(_FakeCombo):
@@ -331,6 +409,7 @@ def test_flush_pending_update_owns_single_repaint():
         _pending_update_idx=5,
         h5viewer=SimpleNamespace(
             auto_last=True,
+            frame_ids=[],
             update_data=lambda **kwargs: calls.append(("update_data", kwargs)),
             data_changed=lambda: calls.append(("data_changed", {})),
         ),
@@ -350,6 +429,38 @@ def test_flush_pending_update_owns_single_repaint():
         ("update_data", {"emit_update": False}),
         ("latest_frame", {"emit_update": False}),
         ("data_changed", {}),
+    ]
+
+
+def test_flush_pending_update_feeds_overlay_all_pending_frames():
+    calls = []
+    frame_ids = []
+
+    def data_changed(*, show_all=False):
+        calls.append(("data_changed", show_all, tuple(frame_ids)))
+
+    widget = SimpleNamespace(
+        _pending_update_idx=5,
+        scan=SimpleNamespace(scan_lock=RLock(), frames=SimpleNamespace(index=[1, 2, 3, 4, 5])),
+        h5viewer=SimpleNamespace(
+            auto_last=True,
+            frame_ids=frame_ids,
+            update_data=lambda **kwargs: calls.append(("update_data", kwargs)),
+            data_changed=data_changed,
+        ),
+        latest_frame=lambda **kwargs: calls.append(("latest_frame", kwargs)),
+        displayframe=SimpleNamespace(
+            ui=SimpleNamespace(plotMethod=_FakeCombo("Overlay")),
+        ),
+    )
+
+    staticWidget._flush_pending_update(widget)
+
+    assert widget._pending_update_idx is None
+    assert calls == [
+        ("update_data", {"emit_update": False}),
+        ("latest_frame", {"emit_update": False}),
+        ("data_changed", True, ("1", "2", "3", "4", "5")),
     ]
 
 
@@ -374,6 +485,7 @@ def _display_host():
         ui=SimpleNamespace(labelCurrent=label),
     )
     host.clear_overlay = MethodType(displayFrameWidget.clear_overlay, host)
+    host._clear_image_widget = displayFrameWidget._clear_image_widget
     host.clear_image_view = MethodType(displayFrameWidget.clear_image_view, host)
     host.clear_binned_view = MethodType(displayFrameWidget.clear_binned_view, host)
     host.clear_plot_view = MethodType(displayFrameWidget.clear_plot_view, host)
@@ -386,8 +498,8 @@ def test_clear_display_state_resets_visible_and_cached_state():
 
     host.clear_display_state("XYE Viewer")
 
-    np.testing.assert_array_equal(host.image_data[0], np.zeros((2, 2)))
-    np.testing.assert_array_equal(host.binned_data[0], np.zeros((2, 2)))
+    assert host.image_data is None
+    assert host.binned_data is None
     assert host.plot_data[0].size == 0
     assert host.plot_data[1].size == 0
     assert host.plot_data_range == [[0, 0], [0, 0]]
@@ -397,9 +509,150 @@ def test_clear_display_state_resets_visible_and_cached_state():
     assert curve.cleared is True
     assert legend.cleared is True
     assert label.text == "XYE Viewer"
-    np.testing.assert_array_equal(image_widget.images[-1], np.zeros((2, 2)))
-    np.testing.assert_array_equal(binned_widget.images[-1], np.zeros((2, 2)))
-    np.testing.assert_array_equal(wf_widget.images[-1], np.zeros((2, 2)))
+    assert image_widget.images == []
+    assert binned_widget.images == []
+    assert wf_widget.images == []
+    assert image_widget.imageItem.cleared is True
+    assert binned_widget.imageItem.cleared is True
+    assert wf_widget.imageItem.cleared is True
+    assert image_widget.raw_image.size == 0
+    assert binned_widget.raw_image.size == 0
+    assert wf_widget.raw_image.size == 0
+
+
+def _persist_image_host(processing, persist=True, data=None):
+    """Minimal host to exercise update_image's blank-vs-keep-last decision."""
+    image_widget = _FakeImageWidget()
+    cleared = []
+    host = SimpleNamespace(
+        PERSIST_2D_DURING_PROCESSING=persist,
+        _processing_active=processing,
+        _image_levels_override=None,
+        overall=False,
+        frame_ids=[],
+        image_widget=image_widget,
+        get_frames_map_raw=lambda *a, **k: (data, None),
+    )
+    host.clear_image_view = lambda: cleared.append(True)
+    host.update_image = MethodType(displayFrameWidget.update_image, host)
+    return host, cleared
+
+
+def test_update_image_keeps_last_during_run_when_data_missing():
+    # Panel-consistency: while a run is active, a missing in-flight frame must
+    # NOT blank the raw panel — it keeps the last image (like the 1D plot).
+    host, cleared = _persist_image_host(processing=True, data=None)
+
+    host.update_image()
+
+    assert cleared == []                 # not blanked during the run
+
+
+def test_update_image_blanks_when_idle_and_data_missing():
+    # Outside a run the old behavior is unchanged: missing data blanks the raw
+    # panel (so mode-switch / selection still clears stale content).
+    host, cleared = _persist_image_host(processing=False, data=None)
+
+    host.update_image()
+
+    assert cleared == [True]             # blanked when not running
+
+
+def test_update_image_blanks_during_run_when_flag_off():
+    # The revert switch restores blanking even during a run.
+    host, cleared = _persist_image_host(processing=True, persist=False, data=None)
+
+    host.update_image()
+
+    assert cleared == [True]
+
+
+def test_draw_delegate_cake_persists_during_run():
+    # CAKE_2D: a None cake payload normally returns clear_binned_view (blank);
+    # during a run it returns None so render skips the panel (keep last).
+    from xdart.gui.tabs.static_scan.display_logic import Mode, PanelRole
+
+    host = SimpleNamespace(
+        PERSIST_2D_DURING_PROCESSING=True,
+        _processing_active=False,
+        clear_binned_view=lambda: None,
+    )
+    host._draw_delegate = MethodType(displayFrameWidget._draw_delegate, host)
+
+    # Idle -> blanks the cake (old behavior).
+    assert host._draw_delegate(PanelRole.CAKE_2D, Mode.INT_2D) is host.clear_binned_view
+
+    # Running -> keep last (None delegate -> render skips this panel).
+    host._processing_active = True
+    assert host._draw_delegate(PanelRole.CAKE_2D, Mode.INT_2D) is None
+
+    # Revert switch off -> blanks even during a run.
+    host.PERSIST_2D_DURING_PROCESSING = False
+    assert host._draw_delegate(PanelRole.CAKE_2D, Mode.INT_2D) is host.clear_binned_view
+
+
+def test_set_processing_active_sets_flag():
+    host = SimpleNamespace(_processing_active=False)
+    host.set_processing_active = MethodType(
+        displayFrameWidget.set_processing_active, host)
+    host.set_processing_active(True)
+    assert host._processing_active is True
+    host.set_processing_active(False)
+    assert host._processing_active is False
+
+
+def _empty_update_host(processing, persist=True):
+    """Host that drives update()'s nothing-to-draw branch with empty caches
+    (the silent-batch case): _updated() False, no cached data."""
+    rendered = []
+    host = SimpleNamespace(
+        PERSIST_2D_DURING_PROCESSING=persist,
+        _processing_active=processing,
+        _display_blanked=False,
+        display_generation=0,
+        data_1d={},                 # empty caches == silent batch
+        data_2d={},
+        data_lock=RLock(),
+        refresh_norm_channels=lambda: None,
+        get_idxs=lambda: None,
+        _note_selection_generation=lambda: None,
+        _updated=lambda: False,     # nothing to draw for the selection
+        _live_mode=lambda: False,
+        render_display=lambda state, payload: rendered.append("render"),
+    )
+    host.update = MethodType(displayFrameWidget.update, host)
+    return host, rendered
+
+
+def test_update_keeps_display_during_run_when_caches_empty():
+    # Silent batch: nothing cached, but a run is active -> keep the current
+    # display (no empty render), so 1D + 2D persist together.
+    host, rendered = _empty_update_host(processing=True)
+
+    host.update()
+
+    assert rendered == []                 # no empty render -> no blank
+    assert host._display_blanked is False
+
+
+def test_update_blanks_when_idle_and_caches_empty():
+    # Not running + nothing cached -> the explicit blank still happens.
+    host, rendered = _empty_update_host(processing=False)
+
+    host.update()
+
+    assert rendered == ["render"]         # empty_display_state rendered
+    assert host._display_blanked is True
+
+
+def test_update_blanks_during_run_when_flag_off():
+    # Revert switch restores the old mid-run blank.
+    host, rendered = _empty_update_host(processing=True, persist=False)
+
+    host.update()
+
+    assert rendered == ["render"]
+    assert host._display_blanked is True
 
 
 def test_display_generation_bumps_on_mode_switch_and_selection():
@@ -424,6 +677,10 @@ def test_display_generation_bumps_on_mode_switch_and_selection():
         displayFrameWidget._bump_display_generation, host)
     host._note_selection_generation = MethodType(
         displayFrameWidget._note_selection_generation, host)
+    # set_viewer_display_mode now routes panel geometry through the table-driven
+    # _apply_layout; bind it too (it pokes the mocked ui / _showImageBtn only).
+    host._apply_layout = MethodType(
+        displayFrameWidget._apply_layout, host)
     host.set_viewer_display_mode = MethodType(
         displayFrameWidget.set_viewer_display_mode, host)
 
@@ -526,7 +783,142 @@ def test_metadata_panel_populates_when_layout_reparented():
     mw.update()
     model = mw.tableview.model()
     assert model.rowCount(QModelIndex()) == 2    # th + i0 -> populated, not blank
+    assert list(model.dataFrame.columns) == [1]  # selected frame only, not whole scan
     win.close()
+
+
+def test_metadata_panel_accepts_store_mapping_proxy():
+    import pandas as pd
+    from PySide6 import QtWidgets
+    from PySide6.QtCore import QModelIndex
+    from ssrl_xrd_tools.core import FrameView
+    from xdart.gui.tabs.static_scan.metadata import metadataWidget
+    from xdart.modules.frame_publication import (
+        PublicationStore,
+        publication_from_frame_view,
+    )
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    store = PublicationStore()
+    store.upsert(
+        publication_from_frame_view(
+            FrameView(
+                label=7,
+                metadata_raw={"sample": "LaB6", "monitor": 2.0},
+            )
+        )
+    )
+    scan = SimpleNamespace(scan_data=pd.DataFrame())
+    mw = metadataWidget(
+        scan,
+        None,
+        ["7"],
+        {},
+        data_1d={},
+        publication_store=store,
+        data_lock=RLock(),
+    )
+
+    frame = QtWidgets.QFrame()
+    frame.setLayout(mw.layout)
+    win = QtWidgets.QWidget()
+    QtWidgets.QVBoxLayout(win).addWidget(frame)
+    win.show()
+    app.processEvents()
+
+    mw.update()
+    model = mw.tableview.model()
+    assert model.rowCount(QModelIndex()) == 2
+    win.close()
+
+
+def test_live_new_scan_invalidates_publication_store():
+    import pandas as pd
+    from xdart.modules.frame_publication import PublicationStore
+
+    store = PublicationStore()
+    old_generation = store.generation
+
+    scan = SimpleNamespace(
+        name="old",
+        gi=False,
+        incidence_motor="th",
+        single_img=False,
+        series_average=False,
+        global_mask=None,
+        scan_lock=RLock(),
+        frames=SimpleNamespace(index=[1], _in_memory={1: object()}),
+        scan_data=pd.DataFrame({"old": [1.0]}, index=[1]),
+    )
+    host = SimpleNamespace(
+        scan=scan,
+        h5viewer=SimpleNamespace(
+            dirname="",
+            live_run_active=True,
+            scan_name="old",
+            auto_last=False,
+            latest_idx=9,
+            set_file=lambda fname: None,
+            update_scans=lambda: None,
+            update=lambda: None,
+        ),
+        wrangler=SimpleNamespace(thread=SimpleNamespace(mask=None)),
+        integratorTree=SimpleNamespace(
+            get_args=lambda name: None,
+            set_image_units=lambda: None,
+        ),
+        _update_timer=SimpleNamespace(stop=lambda: None),
+        _flush_pending_update=lambda: None,
+        frames={1: object()},
+        frame_ids=["1"],
+        publication_store=store,
+        displayframe=SimpleNamespace(set_axes=lambda: None),
+        metawidget=SimpleNamespace(update=lambda: None),
+    )
+    host._sync_h5viewer_save_dir = MethodType(
+        staticWidget._sync_h5viewer_save_dir, host,
+    )
+
+    staticWidget.new_scan(
+        host,
+        "new",
+        "/tmp/new.nxs",
+        False,
+        "th",
+        False,
+        False,
+    )
+
+    assert len(store) == 0
+    assert store.generation == old_generation + 1
+    assert host.frame_ids == []
+    assert host.dirname == "/tmp"
+    assert host.h5viewer.dirname == "/tmp"
+    assert list(scan.frames.index) == []
+    assert scan.scan_data.empty
+
+
+def test_save_path_sync_updates_scans_browser(tmp_path):
+    calls = []
+    host = SimpleNamespace(
+        dirname="old",
+        h5viewer=SimpleNamespace(
+            dirname="old",
+            update_scans=lambda: calls.append("update_scans"),
+        ),
+    )
+
+    staticWidget._sync_h5viewer_save_dir(host, tmp_path)
+
+    assert host.dirname == str(tmp_path)
+    assert host.h5viewer.dirname == str(tmp_path)
+    assert calls == ["update_scans"]
+
+    staticWidget._sync_h5viewer_save_dir(host, tmp_path / "next", refresh=False)
+
+    assert host.dirname == str(tmp_path / "next")
+    assert host.h5viewer.dirname == str(tmp_path / "next")
+    assert calls == ["update_scans"]
 
 
 def test_gi_motor_options_default_manual_when_no_metadata():
@@ -641,6 +1033,221 @@ def test_absorb_chunk_drops_stale_generation():
     assert viewer.data_1d == {} and viewer.data_2d == {}
 
 
+def test_live_gi_clip_warning_fires_once_in_live_gi_only():
+    """#75: live GI emits a one-time 'reprocess in batch' clip advisory; batch
+    and non-GI never warn."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    def _host(*, gi, batch):
+        labels = []
+        h = SimpleNamespace(
+            gi=gi, batch_mode=batch,
+            showLabel=SimpleNamespace(emit=labels.append),
+        )
+        h._maybe_warn_live_gi_clip = MethodType(
+            imageThread._maybe_warn_live_gi_clip, h)
+        return h, labels
+
+    # Live + GI → warns exactly once.
+    h, labels = _host(gi=True, batch=False)
+    h._maybe_warn_live_gi_clip()
+    assert len(labels) == 1 and "batch" in labels[0].lower()
+    h._maybe_warn_live_gi_clip()
+    assert len(labels) == 1                      # once only
+
+    # Batch GI → never (union scout brackets all frames).
+    h, labels = _host(gi=True, batch=True)
+    h._maybe_warn_live_gi_clip()
+    assert labels == []
+
+    # Live non-GI → never.
+    h, labels = _host(gi=False, batch=False)
+    h._maybe_warn_live_gi_clip()
+    assert labels == []
+
+
+def test_wrangler_executor_shutdown_contract():
+    """The persistent integration pool must be reclaimable: _get_executor builds
+    it, _shutdown_executor tears it down and is idempotent.  run()'s finally
+    calls _shutdown_executor so worker threads don't leak past a run (verified
+    by reading run(); exercised end-to-end by a real GUI run)."""
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+    host = SimpleNamespace(_executor=None, _executor_workers=0)
+    host._get_executor = MethodType(wranglerThread._get_executor, host)
+    host._shutdown_executor = MethodType(wranglerThread._shutdown_executor, host)
+
+    ex = host._get_executor(2)
+    assert host._executor is ex and host._executor_workers == 2
+    # Same worker count → same pool reused (the P5 within-run optimization).
+    assert host._get_executor(2) is ex
+
+    host._shutdown_executor()
+    assert host._executor is None and host._executor_workers == 0
+    # Idempotent — safe to call again (run() finally + __del__ both call it).
+    host._shutdown_executor()
+    assert host._executor is None
+
+
+def _scout_host(motor):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    host = SimpleNamespace(incidence_motor=motor)
+    host._scout_pending_frames = MethodType(imageThread._scout_pending_frames, host)
+    return host
+
+
+def _scout_pending(incs, motor='th'):
+    # Minimal pending entries: (img_file, img_number, img_data, meta, bg_raw, _).
+    # _scout_pending_frames only reads entry[3] (meta) via the motor key.
+    out = []
+    for i, inc in enumerate(incs):
+        meta = {} if inc is None else {motor: inc}
+        out.append((f'f{i}', i + 1, None, meta, 0.0, 0.0))
+    return out
+
+
+def test_scout_picks_incidence_extremes_order_independent():
+    host = _scout_host('th')
+    asc = _scout_pending([0.1, 0.2, 0.3, 0.4])
+    assert host._scout_pending_frames(asc) == [asc[0], asc[3]]
+    desc = _scout_pending([0.4, 0.3, 0.2, 0.1])
+    # Extremes by VALUE (idx3 lowest, idx0 highest), not position → order-independent.
+    assert host._scout_pending_frames(desc) == [desc[0], desc[3]]
+    unsorted_ = _scout_pending([0.3, 0.1, 0.4, 0.2])
+    assert host._scout_pending_frames(unsorted_) == [unsorted_[1], unsorted_[2]]  # min@1, max@2
+
+
+def test_scout_partial_metadata_adds_positional_ends():
+    host = _scout_host('th')
+    # idx1 unreadable; resolvable min@0 (0.1), max@2 (0.3); + positional ends 0,3.
+    pending = _scout_pending([0.1, None, 0.3, 0.2])
+    got = host._scout_pending_frames(pending)
+    assert got == [pending[0], pending[2], pending[3]]   # {0,2} ∪ {0,3}
+
+
+def test_scout_all_metadata_missing_falls_back_to_ends():
+    host = _scout_host('th')
+    pending = _scout_pending([None, None, None])
+    assert host._scout_pending_frames(pending) == [pending[0], pending[2]]
+
+
+def test_scout_manual_numeric_incidence_single_frame():
+    host = _scout_host('0.2')   # Manual numeric → all frames equal
+    pending = _scout_pending([None, None, None], motor='th')
+    assert host._scout_pending_frames(pending) == [pending[0]]
+
+
+def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
+    from ssrl_xrd_tools.core import IntegrationResult1D, IntegrationResult2D
+    from xdart.modules.frame_publication import PublicationStore
+
+    viewer = SimpleNamespace(
+        _load_generation=7,
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+        publication_store=PublicationStore(),
+        _update_coalesce_timer=_FakeTimer(active=False),
+        _raw_cache_order=[],
+        _raw_cache_limit=8,
+    )
+    viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+    viewer._remember_hydrated_raw = MethodType(H5Viewer._remember_hydrated_raw, viewer)
+
+    class _Frame:
+        idx = 3
+        scan_info = {"th": 0.2, "monitor": 10.0}
+        source_file = "raw.tif"
+        source_frame_idx = 0
+        map_raw = np.ones((2, 2))
+        bg_raw = 0
+        mask = None
+        gi_2d = {}
+        thumbnail = np.ones((1, 1))
+        int_1d = IntegrationResult1D(
+            radial=np.arange(3), intensity=np.arange(3) + 1, unit="q_A^-1",
+        )
+        int_2d = IntegrationResult2D(
+            radial=np.arange(2), azimuthal=np.arange(2),
+            intensity=np.ones((2, 2)), unit="q_A^-1", azimuthal_unit="chi_deg",
+        )
+
+        def copy_for_display(self, include_2d=False):
+            return self
+
+    viewer._absorb_chunk(7, 3, _Frame(), False)
+    publication = viewer.publication_store.get(3)
+    assert publication is not None
+    assert publication.view.has_1d
+
+    frame = _Frame()
+    frame.idx = 4
+    viewer._absorb_chunk(7, 4, frame, True)
+    publication = viewer.publication_store.get(4)
+    assert publication is not None
+    assert publication.view.has_1d
+    assert publication.view.has_2d
+
+
+def test_absorb_chunk_skips_invalid_2d_cache_but_keeps_1d_publication(caplog):
+    from ssrl_xrd_tools.core import IntegrationResult1D, IntegrationResult2D
+    from xdart.modules.frame_publication import (
+        PublicationStore,
+        publication_has_2d_errors,
+    )
+
+    caplog.set_level(logging.WARNING, logger="xdart.gui.tabs.static_scan.h5viewer")
+    viewer = SimpleNamespace(
+        _load_generation=8,
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={12: {"int_2d": object()}},
+        publication_store=PublicationStore(),
+        _update_coalesce_timer=_FakeTimer(active=False),
+        _raw_cache_order=[],
+        _raw_cache_limit=8,
+    )
+    viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+    viewer._remember_hydrated_raw = MethodType(H5Viewer._remember_hydrated_raw, viewer)
+
+    class _Frame:
+        idx = 12
+        gi = True
+        scan_info = {"th": 0.2, "monitor": 10.0}
+        source_file = "raw.tif"
+        source_frame_idx = 0
+        map_raw = np.ones((2, 2))
+        bg_raw = 0
+        mask = None
+        gi_2d = {}
+        thumbnail = np.ones((1, 1))
+        int_1d = IntegrationResult1D(
+            radial=np.arange(3), intensity=np.arange(3) + 1, unit="q_A^-1",
+        )
+        int_2d = IntegrationResult2D(
+            radial=np.linspace(-1.0, 1.0, 2),
+            azimuthal=np.linspace(0.0, 3.0, 2),
+            intensity=np.full((2, 2), -1.0),
+            unit="qip_A^-1",
+            azimuthal_unit="qoop_A^-1",
+        )
+
+        def _get_incident_angle(self):
+            return 0.2
+
+        def copy_for_display(self, include_2d=False):
+            return self
+
+    viewer._absorb_chunk(8, 12, _Frame(), True)
+
+    assert 12 in viewer.data_1d
+    assert 12 not in viewer.data_2d
+    publication = viewer.publication_store.get(12)
+    assert publication is not None
+    assert publication.view.has_1d
+    assert publication_has_2d_errors(publication)
+    assert "Skipping frame 12 2D display cache" in caplog.text
+
+
 def test_gi_common_grid_freeze_yields_uniform_axes():
     # Stage 5 (gi_axes_uniform tie-in): the shipped GI common-grid freeze
     # turns per-frame Auto axes (which differ frame-to-frame in an
@@ -673,7 +1280,13 @@ def test_default_controllers_registered():
     # core mode, so the widget never dispatches to a missing handler.
     from xdart.gui.tabs.static_scan import display_controllers  # noqa: F401
     from xdart.gui.tabs.static_scan.display_logic import controller_for, Mode
-    for mode in (Mode.INT_1D, Mode.INT_2D, Mode.IMAGE_VIEWER, Mode.XYE_VIEWER):
+    for mode in (
+        Mode.INT_1D,
+        Mode.INT_2D,
+        Mode.IMAGE_VIEWER,
+        Mode.XYE_VIEWER,
+        Mode.NEXUS_VIEWER,
+    ):
         assert controller_for(mode) is not None
 
 
@@ -698,6 +1311,13 @@ def _update_smoke_host():
         idxs=[], idxs_1d=[], idxs_2d=[],
         overall=False,
         overlaid_idxs=[],
+        bkg_1d=None,
+        plot_data=[np.zeros(0), np.zeros(0)],
+        plot_data_range=[[0, 0], [0, 0]],
+        frame_names=[],
+        _payload_x_axis_label=None,
+        _payload_y_axis_label=None,
+        _using_publication_plot_payload=False,
         data_1d={0: object(), 1: object()},
         data_2d={
             0: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
@@ -709,13 +1329,19 @@ def _update_smoke_host():
                              gi=False, skip_2d=False, name='scan'),
         ui=MagicMock(),
         plot=MagicMock(),
+        image_widget=MagicMock(),
         binned_widget=MagicMock(),
-        # pixel-push leaves (unchanged by Stage 3) — recorded, not run
+        # pixel-push leaves (unchanged by Stage 3) — recorded, not run.
+        # CAKE_2D is payload-only now (no update_binned); this host has no
+        # publication_store, so its cake payload is None and CAKE_2D blanks.
         update_image=rec("draw_image"),
-        update_binned=rec("draw_binned"),
         update_plot=rec("draw_plot"),
-        _update_image_viewer=rec("draw_viewer_image"),
-        _update_xye_viewer=rec("draw_viewer_xye"),
+        update_plot_view=rec("payload_plot"),
+        # IMAGE_VIEWER / XYE_VIEWER now render through the payload path
+        # (_draw_image_payload / _draw_payload -> update_plot_view), not legacy
+        # _update_image_viewer / _update_xye_viewer delegates.
+        _draw_image_payload=lambda *a, **k: calls.append("draw_payload_image") or True,
+        _set_viewer_title=rec("viewer_title"),
         clear_image_view=rec("clear_image"),
         clear_binned_view=rec("clear_binned"),
         clear_plot_view=rec("clear_plot"),
@@ -728,7 +1354,12 @@ def _update_smoke_host():
     host.ui.plotMethod.currentText.return_value = 'Single'
     for name in ('get_idxs', '_note_selection_generation', '_bump_display_generation',
                  '_live_mode', '_live_display_state',
-                 '_draw_delegate', '_clear_delegate', 'render_display',
+                 '_current_image_axis_key', '_plot_axis_key',
+                 '_share_axis_plot_index', '_set_plot_unit_index_silently',
+                 '_apply_share_axis_state',
+                 '_draw_delegate', '_clear_delegate', '_payload_for_role',
+                 '_draw_payload',
+                 'render_display',
                  '_updated', 'update'):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
     return host, calls, dl
@@ -737,10 +1368,13 @@ def _update_smoke_host():
 def test_update_render_smoke_int_collapse_and_mode_switches():
     host, calls, dl = _update_smoke_host()
 
-    # Int-2D: full panel set.
+    # Int-2D: raw + plot via the legacy delegates; the CAKE_2D panel is
+    # payload-only now (no update_binned) and this host has no publication_store,
+    # so the cake payload is None and CAKE_2D blanks.
     host.update()
-    assert "draw_plot" in calls and "draw_image" in calls and "draw_binned" in calls
-    assert "label_2d" in calls and not any(c.startswith("clear_") for c in calls)
+    assert "draw_plot" in calls and "draw_image" in calls
+    assert "clear_binned" in calls
+    assert "label_2d" in calls
 
     # Int-1D (skip_2d): 1D-only — plot drawn, the two 2D panels cleared.
     calls.clear()
@@ -757,35 +1391,72 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     host.viewer_mode = 'image'
     host._bump_display_generation()
     host.update()
-    assert "draw_viewer_image" in calls
+    assert "draw_payload_image" in calls      # raw drawn via the payload path
     assert "clear_plot" in calls and "clear_binned" in calls
     assert "label_2d" not in calls           # viewer owns its own title
 
-    # Switch to XYE Viewer: 1D drawn, the 2D panels cleared.
+    # Switch to XYE Viewer: 1D drawn via the payload path, the 2D panels cleared.
     calls.clear()
+    host.frame_ids = ['0']
+    host.data_1d = {
+        0: SimpleNamespace(
+            int_1d=SimpleNamespace(radial=np.arange(3, dtype=float),
+                                   intensity=np.array([1.0, 2.0, 3.0])),
+            scan_info={'source_file': 'iq_a.xye'})
+    }
+    host.data_2d = {}
     host.viewer_mode = 'xye'
     host._bump_display_generation()
     host.update()
-    assert "draw_viewer_xye" in calls
+    assert "payload_plot" in calls           # 1D drawn via the payload path
     assert "clear_image" in calls and "clear_binned" in calls
+
+    # Switch to NeXus Viewer: dataset previews use payload rendering, while
+    # the absent image/cake panels clear. This covers the per-mode smoke path
+    # that is neither a scan integration view nor an Image/XYE viewer.
+    calls.clear()
+    host.frame_ids = ['0']
+    host.data_1d = {
+        0: SimpleNamespace(nexus_preview_payload={
+            "kind": "plot_1d",
+            "x": np.arange(3, dtype=float),
+            "y": np.array([1.0, 2.0, 3.0]),
+            "label": "nexus-row",
+        })
+    }
+    host.data_2d = {}
+    host.viewer_mode = 'nexus'
+    host._bump_display_generation()
+    host.update()
+    assert "payload_plot" in calls
+    assert "clear_image" in calls and "clear_binned" in calls
+    assert "draw_binned" not in calls
 
     # Back to normal Int-2D: full panel set again.
     calls.clear()
+    host.frame_ids = ['0', '1']
+    host.data_1d = {0: object(), 1: object()}
+    host.data_2d = {
+        0: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
+        1: {'map_raw': np.ones((4, 4)), 'thumbnail': None},
+    }
     host.viewer_mode = None
     host._bump_display_generation()
     host.update()
-    assert {"draw_plot", "draw_image", "draw_binned"} <= set(calls)
+    assert {"draw_plot", "draw_image"} <= set(calls)   # raw + plot legacy
+    assert "clear_binned" in calls                     # cake payload-only, no pub
 
 
 def test_update_render_smoke_gi_scan_propagates_and_dispatches():
     # A GI scan still renders through the same path; gi flag propagates into
-    # the state and the cake/plot dispatch is unchanged (GI axis labelling is
-    # delegated to the legacy update_binned_view, covered elsewhere).
+    # the state and the raw/plot dispatch is unchanged.  CAKE_2D is payload-only
+    # (no publication_store on this host -> the cake blanks).
     host, calls, dl = _update_smoke_host()
     host.scan.gi = True
     host.update()
     assert host._live_display_state().gi is True
-    assert {"draw_plot", "draw_image", "draw_binned"} <= set(calls)
+    assert {"draw_plot", "draw_image"} <= set(calls)
+    assert "clear_binned" in calls
 
 
 def test_update_render_smoke_stale_generation_is_dropped():
@@ -812,10 +1483,11 @@ def _render_host():
         plot=MagicMock(),
         binned_widget=MagicMock(),
         update_image=rec("draw_image"),
-        update_binned=rec("draw_binned"),
         update_plot=rec("draw_plot"),
-        _update_image_viewer=rec("draw_viewer_image"),
-        _update_xye_viewer=rec("draw_viewer_xye"),
+        # IMAGE_VIEWER renders its raw panel via the payload path; the title is
+        # set by render_display (no longer a side effect of a legacy draw).
+        _draw_image_payload=lambda *a, **k: calls.append("draw_payload_image") or True,
+        _set_viewer_title=rec("viewer_title"),
         clear_image_view=rec("clear_image"),
         clear_binned_view=rec("clear_binned"),
         clear_plot_view=rec("clear_plot"),
@@ -825,7 +1497,11 @@ def _render_host():
     )
     host.ui.shareAxis.isChecked.return_value = False
     host.ui.imageUnit.currentIndex.return_value = 0
-    for name in ("_draw_delegate", "_clear_delegate", "render_display"):
+    for name in ("_current_image_axis_key", "_plot_axis_key",
+                 "_share_axis_plot_index", "_set_plot_unit_index_silently",
+                 "_apply_share_axis_state",
+                 "_draw_delegate", "_clear_delegate", "_payload_for_role",
+                 "_draw_payload", "render_display"):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
     return host, calls, dl
 
@@ -837,10 +1513,110 @@ def test_render_display_int2d_draws_all_panels():
         loaded_1d_keys={0}, loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
         method='Single', unit_changed=False, prev_overlaid_ids=(),
         raw_availability={0: dict(has_raw=True)}, titles={}, generation=1)
-    host.render_display(state, dl.build_payload(state))
-    assert "draw_plot" in calls and "draw_image" in calls and "draw_binned" in calls
+    # RAW_2D + CAKE_2D draw via the payload path (_draw_image_payload); PLOT_1D
+    # has no payload here so it falls through to the legacy update_plot.
+    payload = dl.DisplayPayload(
+        generation=1,
+        raw_image=dl.ImagePayload(image=np.ones((2, 2))),
+        cake_image=dl.ImagePayload(image=np.ones((2, 2))),
+        plot=None)
+    host.render_display(state, payload)
+    assert "draw_payload_image" in calls and "draw_plot" in calls
     assert "label_2d" in calls and "preview" in calls
     assert not any(c.startswith("clear_") for c in calls)
+
+
+def test_render_display_uses_publication_plot_payload_when_present():
+    host, calls, dl = _render_host()
+    host.bkg_1d = 0
+    host.plot_data = [np.zeros(0), np.zeros(0)]
+    host.plot_data_range = [[0, 0], [0, 0]]
+    host.frame_names = []
+    host.overlaid_idxs = []
+    host._payload_x_axis_label = None
+    host._using_publication_plot_payload = False
+    host.update_plot_view = lambda: calls.append("payload_plot")
+
+    state = dl.compute_display_state(
+        mode=dl.Mode.INT_1D, selected_ids=(3,), all_frame_index=[3],
+        loaded_1d_keys={3}, loaded_2d_keys=set(), gi=False, plot_unit='q_A^-1',
+        method='Single', unit_changed=False, prev_overlaid_ids=(),
+        raw_availability={}, titles={}, generation=4)
+    payload = dl.DisplayPayload(
+        generation=4,
+        raw_image=None,
+        cake_image=None,
+        plot=dl.PlotPayload(
+            axis_x=dl.Axis("2θ", "°"),
+            traces=(dl.Trace("frame3", np.arange(3), np.array([1.0, 2.0, 3.0])),),
+        ),
+    )
+
+    host.render_display(state, payload)
+
+    assert "payload_plot" in calls
+    assert "draw_plot" not in calls
+    assert host.frame_names == ["frame3"]
+    assert host._payload_x_axis_label == ("2θ", "°")
+    np.testing.assert_allclose(host.plot_data[0], np.arange(3))
+    np.testing.assert_allclose(host.plot_data[1], [[1.0, 2.0, 3.0]])
+
+
+def test_publication_plot_fallback_uses_legacy_draw_for_derived_axes_and_slice():
+    from ssrl_xrd_tools.core import Axis, FrameView
+    from xdart.gui.tabs.static_scan.display_publication import PublicationDisplayAdapter
+    from xdart.modules.frame_publication import (
+        PublicationStore,
+        publication_from_frame_view,
+    )
+
+    def render_with_axis(source, sliced):
+        host, calls, dl = _render_host()
+        host.scan = SimpleNamespace(name="scan", gi=False)
+        host._plot_axis_info = [{
+            "source": source,
+            "slice_axis": "χ",
+            "axis": "radial",
+        }]
+        host.normalize = lambda data, metadata: data
+        host.ui.plotUnit.currentIndex.return_value = 0
+        host.ui.plotUnit.currentText.return_value = "Q (Å⁻¹)"
+        host.ui.slice.isChecked.return_value = sliced
+
+        store = PublicationStore()
+        store.upsert(
+            publication_from_frame_view(
+                FrameView(
+                    label=3,
+                    axis_1d=Axis("Q", "q_A^-1", values=np.arange(3)),
+                    intensity_1d=np.array([1.0, 2.0, 3.0]),
+                )
+            )
+        )
+        state = dl.compute_display_state(
+            mode=dl.Mode.INT_1D,
+            selected_ids=(3,),
+            all_frame_index=[3],
+            loaded_1d_keys={3},
+            loaded_2d_keys={3},
+            gi=False,
+            plot_unit='q_A^-1',
+            method='Single',
+            unit_changed=False,
+            prev_overlaid_ids=(),
+            raw_availability={},
+            titles={},
+            generation=store.generation,
+        )
+        payload = dl.build_payload(state, PublicationDisplayAdapter(store, widget=host))
+        host.render_display(state, payload)
+        return calls, payload
+
+    for source, sliced in (("1d", False), ("2d", False), ("1d_2d", True)):
+        calls, payload = render_with_axis(source, sliced)
+        assert payload.plot is None
+        assert "draw_plot" in calls
+        assert "payload_plot" not in calls
 
 
 def test_render_display_image_viewer_draws_raw_clears_others():
@@ -850,11 +1626,30 @@ def test_render_display_image_viewer_draws_raw_clears_others():
         loaded_1d_keys=set(), loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
         method='Single', unit_changed=False, prev_overlaid_ids=(),
         raw_availability={0: dict(has_raw=True)}, titles={}, generation=1)
-    host.render_display(state, dl.build_payload(state))
-    assert "draw_viewer_image" in calls         # RAW_2D via the viewer method
+    payload = dl.DisplayPayload(
+        generation=1,
+        raw_image=dl.ImagePayload(image=np.ones((2, 2))),
+        cake_image=None, plot=None)
+    host.render_display(state, payload)
+    assert "draw_payload_image" in calls        # RAW_2D via the payload path
     assert "clear_binned" in calls and "clear_plot" in calls  # absent panels blanked
     assert "label_2d" not in calls              # viewer sets its own title
-    assert "draw_image" not in calls
+    assert "viewer_title" in calls              # render_display set the title
+    assert "draw_image" not in calls            # not the Int-mode raw delegate
+
+
+def test_render_display_image_viewer_none_payload_clears_raw():
+    # A None raw payload (no frame / no map_raw / all-non-finite) must blank the
+    # Image Viewer's raw panel — there is no legacy fallback draw.
+    host, calls, dl = _render_host()
+    state = dl.compute_display_state(
+        mode=dl.Mode.IMAGE_VIEWER, selected_ids=(0,), all_frame_index=[],
+        loaded_1d_keys=set(), loaded_2d_keys={0}, gi=False, plot_unit='q_A^-1',
+        method='Single', unit_changed=False, prev_overlaid_ids=(),
+        raw_availability={0: dict(has_raw=True)}, titles={}, generation=1)
+    host.render_display(state, dl.build_payload(state))   # store=None -> raw None
+    assert "clear_image" in calls               # raw panel blanked, not drawn
+    assert "draw_payload_image" not in calls and "draw_image" not in calls
 
 
 def test_render_display_drops_stale_generation():
@@ -956,6 +1751,79 @@ def test_enter_viewer_mode_cleanup_clears_lists_and_cancels_loader():
     assert not hasattr(viewer, "_viewer_image_path")
 
 
+def test_cancel_pending_loads_invalidates_late_chunks():
+    calls = []
+    timer = _FakeTimer(active=True)
+    viewer = SimpleNamespace(
+        _load_generation=7,
+        _update_coalesce_timer=timer,
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+        _load_worker=None,
+        _load_thread=None,
+        publication_store=None,
+        _teardown_load_worker=lambda: calls.append("teardown"),
+    )
+    viewer.cancel_pending_loads = MethodType(H5Viewer.cancel_pending_loads, viewer)
+    viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+
+    viewer.cancel_pending_loads()
+    viewer._absorb_chunk(7, 12, object(), True)
+
+    assert viewer._load_generation == 8
+    assert calls == ["teardown"]
+    assert timer.isActive() is False
+    assert viewer.data_1d == {}
+    assert viewer.data_2d == {}
+
+
+def test_viewer_cleanup_stress_drops_stale_chunks_across_mode_switches():
+    viewer = SimpleNamespace(
+        data_lock=RLock(),
+        data_1d={1: object()},
+        data_2d={1: {"map_raw": np.ones((2, 2))}},
+        frame_ids=["1"],
+        latest_idx=1,
+        new_scan_loaded=True,
+        _raw_cache_order=[1],
+        _load_generation=0,
+        _load_worker=None,
+        _load_thread=None,
+        _update_coalesce_timer=_FakeTimer(active=True),
+        ui=SimpleNamespace(
+            listData=_FakeListWidget([1]),
+            listScans=_FakeListWidget(["scan.nxs"]),
+        ),
+        _displayed_list_count=1,
+        _displayed_last_label="1",
+        publication_store=None,
+    )
+    viewer._clear_raw_cache = MethodType(H5Viewer._clear_raw_cache, viewer)
+    viewer._remember_displayed_frames = MethodType(
+        H5Viewer._remember_displayed_frames, viewer,
+    )
+    viewer._teardown_load_worker = MethodType(
+        H5Viewer._teardown_load_worker, viewer,
+    )
+    viewer.cancel_pending_loads = MethodType(H5Viewer.cancel_pending_loads, viewer)
+    viewer.enter_viewer_mode_cleanup = MethodType(
+        H5Viewer.enter_viewer_mode_cleanup, viewer,
+    )
+    viewer._absorb_chunk = MethodType(H5Viewer._absorb_chunk, viewer)
+
+    for frame_id in range(10):
+        stale_generation = viewer._load_generation
+        viewer.enter_viewer_mode_cleanup()
+        viewer._absorb_chunk(stale_generation, frame_id, object(), True)
+
+    assert viewer._load_generation == 10
+    assert viewer.data_1d == {}
+    assert viewer.data_2d == {}
+    assert viewer.frame_ids == []
+    assert viewer.ui.listData.count() == 0
+
+
 def test_viewer_mode_change_blocks_scan_list_autoload():
     calls = []
     list_scans = _FakeListWidget(["old.xye"])
@@ -965,14 +1833,21 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
         if not list_scans._signals_blocked:
             calls.append("autoload")
 
+    def sync_dir(path, *, refresh=True):
+        calls.append(("sync_dir", path, refresh))
+        widget.h5viewer.dirname = path
+
     widget = SimpleNamespace(
-        wrangler=object(),
+        wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
+        _apply_integration_control_state=lambda: None,
         h5viewer=SimpleNamespace(
             ui=SimpleNamespace(listScans=list_scans),
             actionNewFile=_FakeAction(),
             actionSaveDataAs=_FakeAction(),
+            dirname="/tmp/stale",
             viewer_mode="xye",
             _suspend_scan_selection_loads=False,
+            _apply_frames_panel_width=lambda vm: None,
             enter_viewer_mode_cleanup=lambda: calls.append(
                 ("cleanup_suspend", widget.h5viewer._suspend_scan_selection_loads),
             ),
@@ -981,18 +1856,137 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
         ),
         displayframe=SimpleNamespace(
             _wrangler=None,
+            _viewer_is_xdart=True,
             set_viewer_display_mode=lambda mode: calls.append(("display", mode)),
             clear_display_state=lambda: calls.append("clear_display"),
         ),
+        _sync_h5viewer_save_dir=sync_dir,
+        local_path="/tmp/stale",
     )
 
     staticWidget._on_viewer_mode_changed(widget, "image")
 
+    assert ("sync_dir", "/tmp/xdart-out", False) in calls
+    assert widget.h5viewer.dirname == "/tmp/xdart-out"
     assert ("cleanup_suspend", True) in calls
     assert ("update_scans_blocked", True) in calls
     assert "autoload" not in calls
     assert widget.h5viewer._suspend_scan_selection_loads is False
     assert list_scans._signals_blocked is False
+    assert widget.wrangler.tree.isEnabled() is False
+    assert widget.displayframe._viewer_is_xdart is False
+
+
+def test_viewer_mode_tree_disable_only_for_file_viewers():
+    calls = []
+    list_scans = _FakeListWidget(["scan.nxs"])
+    widget = SimpleNamespace(
+        wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
+        _apply_integration_control_state=lambda: None,
+        h5viewer=SimpleNamespace(
+            ui=SimpleNamespace(listScans=list_scans),
+            actionNewFile=_FakeAction(),
+            actionSaveDataAs=_FakeAction(),
+            dirname="/tmp/xdart-out",
+            viewer_mode="",
+            _suspend_scan_selection_loads=False,
+            _apply_frames_panel_width=lambda mode: calls.append(("width", mode)),
+            enter_viewer_mode_cleanup=lambda: calls.append("cleanup"),
+            cancel_pending_loads=lambda: calls.append("cancel"),
+            update_scans=lambda: calls.append("update_scans"),
+        ),
+        displayframe=SimpleNamespace(
+            _wrangler=None,
+            set_viewer_display_mode=lambda mode: calls.append(("display", mode)),
+            clear_display_state=lambda: calls.append("clear_display"),
+        ),
+        _sync_h5viewer_save_dir=lambda path, *, refresh=True: None,
+        local_path="/tmp/xdart-out",
+    )
+
+    staticWidget._on_viewer_mode_changed(widget, "xye")
+    assert widget.wrangler.tree.isEnabled() is False
+
+    staticWidget._on_viewer_mode_changed(widget, "nexus")
+    assert widget.wrangler.tree.isEnabled() is True
+
+    staticWidget._on_viewer_mode_changed(widget, "")
+    assert widget.wrangler.tree.isEnabled() is True
+
+
+def test_load_frames_data_skips_missing_placeholder_file(tmp_path):
+    calls = []
+    viewer = SimpleNamespace(
+        scan=SimpleNamespace(data_file=str(tmp_path / "missing_default.nxs")),
+        cancel_pending_loads=lambda: calls.append("cancel"),
+    )
+
+    H5Viewer.load_frames_data(viewer, [1, 2], load_2d=True)
+
+    assert calls == ["cancel"]
+    assert not hasattr(viewer, "_load_worker")
+
+
+def test_h5viewer_update_does_not_restore_stale_session_directory(monkeypatch, tmp_path):
+    from xdart.gui.tabs.static_scan import h5viewer as h5mod
+
+    stale_dir = tmp_path / "stale"
+    current_dir = tmp_path / "current"
+    stale_dir.mkdir()
+    current_dir.mkdir()
+    calls = []
+    viewer = SimpleNamespace(
+        dirname=str(current_dir),
+        update_data=lambda: calls.append("update_data"),
+        update_scans=lambda: calls.append("update_scans"),
+    )
+    monkeypatch.setattr(
+        h5mod,
+        "load_session",
+        lambda: {"data_dir": str(stale_dir)},
+    )
+
+    H5Viewer.update(viewer)
+
+    assert calls == ["update_data"]
+    assert viewer.dirname == str(current_dir)
+
+
+def test_viewer_mode_keeps_explicit_open_folder():
+    calls = []
+    opened_dir = "/tmp/user-opened-images"
+    list_scans = _FakeListWidget(["raw.h5"])
+
+    widget = SimpleNamespace(
+        wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
+        _apply_integration_control_state=lambda: None,
+        h5viewer=SimpleNamespace(
+            ui=SimpleNamespace(listScans=list_scans),
+            actionNewFile=_FakeAction(),
+            actionSaveDataAs=_FakeAction(),
+            dirname=opened_dir,
+            viewer_mode="",
+            _suspend_scan_selection_loads=False,
+            _apply_frames_panel_width=lambda vm: None,
+            enter_viewer_mode_cleanup=lambda: calls.append("cleanup"),
+            cancel_pending_loads=lambda: calls.append("cancel"),
+            update_scans=lambda: calls.append("update_scans"),
+        ),
+        displayframe=SimpleNamespace(
+            _wrangler=None,
+            set_viewer_display_mode=lambda mode: calls.append(("display", mode)),
+            clear_display_state=lambda: calls.append("clear_display"),
+        ),
+        _sync_h5viewer_save_dir=lambda path, *, refresh=True: calls.append(
+            ("sync_dir", path, refresh),
+        ),
+        local_path="/tmp/default-xdart",
+    )
+
+    staticWidget._on_viewer_mode_changed(widget, "image")
+
+    assert ("sync_dir", "/tmp/xdart-out", False) not in calls
+    assert widget.h5viewer.dirname == opened_dir
 
 
 def test_scan_selection_handlers_ignore_suspended_loads():
@@ -1016,8 +2010,9 @@ def test_scan_selection_handlers_ignore_suspended_loads():
     assert calls == []
 
 
-def test_old_processed_xdart_nxs_not_loaded_as_generic_image(tmp_path):
+def test_reduction_only_nxs_not_loaded_as_generic_image(tmp_path):
     import h5py
+    from ssrl_xrd_tools.io import ImageSourceKind
 
     path = tmp_path / "old_processed.nxs"
     with h5py.File(path, "w") as f:
@@ -1043,7 +2038,8 @@ def test_old_processed_xdart_nxs_not_loaded_as_generic_image(tmp_path):
 
     viewer._load_image_file(str(path))
 
-    assert viewer._viewer_is_xdart is True
+    assert viewer._viewer_source_info.kind is ImageSourceKind.UNKNOWN
+    assert viewer._viewer_is_xdart is False
     assert calls == ["remember"]
     assert viewer.ui.listData.count() == 0
     assert viewer.data_1d == {}
@@ -1140,57 +2136,660 @@ def test_processed_xdart_markers_still_short_circuit_image_loader(tmp_path):
     info = ImageViewerController.classify(str(bare_frames))
     assert info.kind is not ImageSourceKind.PROCESSED_XDART
 
+    reduction_only = tmp_path / "reduction_only.nxs"
+    with h5py.File(reduction_only, "w") as f:
+        f.create_group("entry/reduction")  # provenance only, no displayable data
+    info = ImageViewerController.classify(str(reduction_only))
+    assert info.kind is ImageSourceKind.UNKNOWN
 
-def test_image_viewer_missing_raw_and_thumbnail_clears_panel():
-    calls = []
-    host = SimpleNamespace(
-        idxs_2d=[1],
+
+def _bind_nexus_viewer_methods(viewer):
+    for name in (
+        "_load_nexus_file",
+        "_refresh_nexus_selected_preview",
+        "_load_nexus_preview_payload",
+        "_nexus_1d_selection",
+        "_nexus_2d_selection",
+        "_nexus_selection_truncated",
+        "_nexus_axis_values",
+        "_nexus_summary_rows",
+        "_nexus_xdart_rows",
+        "_nexus_reduced_info",
+        "_nexus_tree_rows",
+        "_nexus_value",
+        "data_changed",
+        "_remember_displayed_frames",
+    ):
+        if isinstance(H5Viewer.__dict__.get(name), staticmethod):
+            setattr(viewer, name, getattr(H5Viewer, name))
+        else:
+            setattr(viewer, name, MethodType(getattr(H5Viewer, name), viewer))
+
+
+def _nexus_viewer_host(tmp_path):
+    from PySide6 import QtWidgets
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    viewer = SimpleNamespace(
         data_lock=RLock(),
-        data_2d={1: {"map_raw": None, "thumbnail": None}},
-        _wrangler=None,
-        clear_image_view=lambda: calls.append("clear"),
+        data_1d={},
+        data_2d={},
+        frame_ids=[],
+        viewer_mode="nexus",
+        ui=SimpleNamespace(
+            listData=_FakeListWidget(),
+            labelCurrent=_FakeLabel(),
+        ),
+        _raw_cache_order=[],
+        publication_store=None,
+        sigUpdate=_FakeSignal(),
+        dirname=str(tmp_path),
+        scan=SimpleNamespace(
+            name="null_main",
+            frames=SimpleNamespace(index=[]),
+            scan_lock=RLock(),
+        ),
+    )
+    _bind_nexus_viewer_methods(viewer)
+    return viewer
+
+
+def _write_viewer_nexus_file(path):
+    import h5py
+
+    with h5py.File(path, "w") as h5:
+        entry = h5.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+
+        g1 = entry.create_group("integrated_1d")
+        g1.attrs["NX_class"] = "NXdata"
+        g1.attrs["signal"] = "intensity"
+        g1.attrs["axes"] = ["frame_index", "q"]
+        g1.create_dataset("frame_index", data=np.array([10, 11]))
+        q = g1.create_dataset("q", data=np.linspace(0.5, 2.5, 5))
+        q.attrs["units"] = "q_A^-1"
+        q.attrs["long_name"] = "Q"
+        y = g1.create_dataset(
+            "intensity",
+            data=np.arange(10, dtype=float).reshape(2, 5),
+        )
+        y.attrs["units"] = "counts"
+        y.attrs["long_name"] = "Integrated intensity"
+
+        g2 = entry.create_group("integrated_2d")
+        g2.attrs["NX_class"] = "NXdata"
+        g2.attrs["signal"] = "intensity"
+        g2.attrs["axes"] = ["frame_index", "chi", "q"]
+        g2.create_dataset("frame_index", data=np.array([10, 11]))
+        q2 = g2.create_dataset("q", data=np.linspace(-1.0, 1.0, 4))
+        q2.attrs["units"] = "qip_A^-1"
+        q2.attrs["long_name"] = "Qip"
+        chi = g2.create_dataset("chi", data=np.linspace(0.0, 3.0, 3))
+        chi.attrs["units"] = "qoop_A^-1"
+        chi.attrs["long_name"] = "Qoop"
+        g2.create_dataset(
+            "intensity",
+            data=np.arange(24, dtype=float).reshape(2, 3, 4),
+        )
+
+        generic = entry.create_dataset("generic_1d", data=np.array([1.0, 2.0, 3.0]))
+        generic.attrs["units"] = "arb"
+        generic.attrs["description"] = "Generic signal"
+
+        det = entry.create_group("instrument/detector")
+        raw = det.create_dataset(
+            "data",
+            data=np.arange(2 * 6 * 7, dtype=np.uint16).reshape(2, 6, 7),
+        )
+        raw.attrs["units"] = "counts"
+
+
+def test_nexus_viewer_loads_rows_and_previews_1d_2d_units(tmp_path):
+    path = tmp_path / "viewer.nxs"
+    _write_viewer_nexus_file(path)
+    viewer = _nexus_viewer_host(tmp_path)
+
+    viewer._load_nexus_file(str(path))
+
+    labels = [viewer.ui.listData.item(i).text() for i in range(viewer.ui.listData.count())]
+    assert "Integrated 1D" in labels
+    assert "Integrated 2D" in labels
+    assert "Raw detector dataset" in labels
+    row_1d = labels.index("Integrated 1D")
+    key_1d = viewer.ui.listData.item(row_1d).data(QtCore.Qt.UserRole)
+    assert viewer.frame_ids == [str(key_1d)]
+    assert viewer.ui.labelCurrent.text == path.name
+    assert viewer.data_1d[1].__class__.__name__ == "_ViewerRow"
+    payload_1d = viewer.data_1d[key_1d].nexus_preview_payload
+    assert payload_1d["kind"] == "plot_1d"
+    assert payload_1d["x_unit"] == "q_A^-1"
+    assert payload_1d["x_label"] == "Q"
+    assert payload_1d["y_label"] == "Intensity"
+    np.testing.assert_allclose(payload_1d["x"], np.linspace(0.5, 2.5, 5))
+    np.testing.assert_allclose(payload_1d["y"], np.arange(5, dtype=float))
+    assert viewer.data_1d[key_1d].scan_info["preview_selection"] == "[0, :]"
+
+    row_2d = labels.index("Integrated 2D")
+    viewer.ui.listData.setCurrentRow(row_2d)
+    viewer.data_changed()
+    key_2d = viewer.ui.listData.item(row_2d).data(QtCore.Qt.UserRole)
+    payload_2d = viewer.data_1d[key_2d].nexus_preview_payload
+    assert payload_2d["kind"] == "image_2d"
+    assert payload_2d["image"].shape == (3, 4)
+    assert payload_2d["x_label"] == "Qip"
+    assert payload_2d["x_unit"] == "qip_A^-1"
+    assert payload_2d["y_label"] == "Qoop"
+    assert payload_2d["y_unit"] == "qoop_A^-1"
+
+    row_raw = labels.index("Raw detector dataset")
+    viewer.ui.listData.setCurrentRow(row_raw)
+    viewer.data_changed()
+    key_raw = viewer.ui.listData.item(row_raw).data(QtCore.Qt.UserRole)
+    payload_raw = viewer.data_1d[key_raw].nexus_preview_payload
+    assert payload_raw["kind"] == "image_2d"
+    assert payload_raw["image"].shape == (6, 7)
+    assert payload_raw["x_label"] == "column"
+    assert payload_raw["y_label"] == "row"
+    assert viewer.data_1d[key_raw].scan_info["_shape"] == (2, 6, 7)
+    assert viewer.data_1d[key_raw].scan_info["dtype"] == "uint16"
+
+
+def test_wrangler_expands_active_groups_on_startup():
+    # P3 #8: GI / Threshold / Background groups default folded; if their
+    # enabling toggle is on (e.g. a restored session) the group must expand.
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    class _P:
+        def __init__(self, value=None, children=None):
+            self._value = value
+            self._children = children or {}
+            self.opts = {}
+
+        def value(self):
+            return self._value
+
+        def child(self, *path):
+            node = self
+            for name in path:
+                node = node._children[name]
+            return node
+
+        def setOpts(self, **o):
+            self.opts.update(o)
+
+    def _tree(grazing, threshold, bg):
+        gi = _P(children={"Grazing": _P(grazing)})
+        mask = _P(children={"Threshold": _P(threshold)})
+        bgg = _P(children={"bg_type": _P(bg)})
+        root = _P(children={"GI": gi, "Mask": mask, "BG": bgg})
+        return root, gi, mask, bgg
+
+    # Toggles on / source selected → groups expand.
+    root, gi, mask, bgg = _tree(True, True, "Single BG File")
+    host = SimpleNamespace(parameters=root)
+    host._expand_active_groups = MethodType(
+        imageWrangler._expand_active_groups, host,
+    )
+    host._expand_active_groups()
+    assert gi.opts.get("expanded") is True
+    assert mask.opts.get("expanded") is True
+    assert bgg.opts.get("expanded") is True
+
+    # All off / no background → groups left collapsed (no expand opt set).
+    root, gi, mask, bgg = _tree(False, False, "None")
+    host = SimpleNamespace(parameters=root)
+    host._expand_active_groups = MethodType(
+        imageWrangler._expand_active_groups, host,
+    )
+    host._expand_active_groups()
+    assert "expanded" not in gi.opts
+    assert "expanded" not in mask.opts
+    assert "expanded" not in bgg.opts
+
+
+def test_frames_panel_width_relaxes_in_nexus_mode_and_restores():
+    # P3 #7: the Frames (listData) max width is 60 px in the .ui (right for
+    # frame indices) but clips NeXus dataset labels.  It must relax in NeXus
+    # viewer mode and restore for every other mode.
+    class _FakeList:
+        def __init__(self):
+            self._maxw = 60
+
+        def maximumWidth(self):
+            return self._maxw
+
+        def setMaximumWidth(self, w):
+            self._maxw = int(w)
+
+    lw = _FakeList()
+    host = SimpleNamespace(ui=SimpleNamespace(listData=lw))
+    host._apply_frames_panel_width = MethodType(
+        H5Viewer._apply_frames_panel_width, host,
     )
 
-    displayFrameWidget._update_image_viewer(host)
+    host._apply_frames_panel_width("nexus")
+    assert lw.maximumWidth() == 16777215          # relaxed for NeXus labels
+    host._apply_frames_panel_width(None)
+    assert lw.maximumWidth() == 90                # normal mode gets a wider cap
+    host._apply_frames_panel_width("image")
+    assert lw.maximumWidth() == 90                # other modes stay bounded
 
-    assert calls == ["clear"]
+
+def test_nexus_1d_selection_strides_large_axis_but_not_small():
+    # P3 #5: short curves read whole; an oversized 1D axis is strided.
+    sel_small, axis_small = H5Viewer._nexus_1d_selection((2, 5), max_points=8192)
+    assert axis_small == slice(None)                 # full read for small data
+    assert sel_small == (0, slice(None))
+
+    sel_big, axis_big = H5Viewer._nexus_1d_selection((40000,), max_points=8192)
+    assert isinstance(axis_big, slice) and axis_big.step and axis_big.step > 1
+    assert len(range(0, 40000, axis_big.step)) <= 8192  # strided count within cap
+    assert sel_big == axis_big                          # 1D dataset → axis slice
 
 
-def test_image_viewer_all_sentinel_image_clears_safely():
-    calls = []
+def test_nexus_1d_preview_downsamples_large_dataset(tmp_path):
+    # P3 #5 end-to-end: a huge 1D dataset is bounded for the GUI preview, x
+    # is strided to match y, and the truncated flag is set.
+    import h5py
+
+    path = tmp_path / "big1d.nxs"
+    n = 50000
+    with h5py.File(path, "w") as f:
+        e = f.create_group("entry")
+        e.create_dataset("big/signal", data=np.arange(n, dtype=float))
+        e.create_dataset("big/x", data=np.linspace(0.0, 10.0, n))
+
+    viewer = _nexus_viewer_host(tmp_path)
+    info = {
+        "dataset_path": "entry/big/signal",
+        "_shape": (n,),
+        "nexus_preview_kind": "plot_1d",
+        "_attrs": {"units": "counts"},
+        "x_axis_path": "entry/big/x",
+        "x_label": "x", "x_unit": "m",
+        "y_label": "sig", "y_unit": "counts",
+    }
+    payload, preview_info = viewer._load_nexus_preview_payload(str(path), info)
+
+    assert payload["kind"] == "plot_1d"
+    assert 0 < payload["y"].size <= 8192             # bounded
+    assert payload["x"].shape == payload["y"].shape  # x strided to match
+    assert preview_info["preview_truncated"] is True
+
+
+def test_nexus_controller_builds_plot_and_image_payloads(tmp_path):
+    from xdart.gui.tabs.static_scan.display_logic import (
+        ImagePayload,
+        Mode,
+        PanelRole,
+        controller_for,
+    )
+
+    path = tmp_path / "viewer.nxs"
+    _write_viewer_nexus_file(path)
+    viewer = _nexus_viewer_host(tmp_path)
+    viewer.display_generation = 4
+    viewer.overlaid_idxs = []
+    viewer.ui.plotMethod = _FakeCombo("Single")
+    viewer._load_nexus_file(str(path))
+    labels = [viewer.ui.listData.item(i).text() for i in range(viewer.ui.listData.count())]
+
+    row_1d = labels.index("Integrated 1D")
+    ctrl = controller_for(Mode.NEXUS_VIEWER)
+    state = ctrl.compute_state(viewer, Mode.NEXUS_VIEWER)
+    payload = ctrl.build_payload(viewer, state)
+    assert state.panel(PanelRole.PLOT_1D).has_data
+    assert not state.panel(PanelRole.RAW_2D).has_data
+    assert payload.plot.axis_x.unit == "q_A^-1"
+    assert payload.plot.axis_y.label == "Intensity"
+
+    row_2d = labels.index("Integrated 2D")
+    viewer.ui.listData.setCurrentRow(row_2d)
+    viewer.data_changed()
+    state = ctrl.compute_state(viewer, Mode.NEXUS_VIEWER)
+    payload = ctrl.build_payload(viewer, state)
+    assert state.panel(PanelRole.RAW_2D).has_data
+    assert not state.panel(PanelRole.PLOT_1D).has_data
+    assert isinstance(payload.raw_image, ImagePayload)
+    assert payload.raw_image.axis_x.unit == "qip_A^-1"
+    assert payload.raw_image.axis_y.unit == "qoop_A^-1"
+
+
+def test_nexus_viewer_real_xdart_processed_file_smoke():
+    path = (
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        + "/test_data/xdart_processed_data/"
+        + "Combi4_Angledependence_samz_4p9_03271002.nxs"
+    )
+    if not os.path.exists(path):
+        import pytest
+        pytest.skip("local xdart processed test data is not available")
+
+    viewer = _nexus_viewer_host(os.path.dirname(path))
+    viewer.display_generation = 11
+    viewer.overlaid_idxs = []
+    viewer.ui.plotMethod = _FakeCombo("Single")
+
+    viewer._load_nexus_file(path)
+
+    labels = [viewer.ui.listData.item(i).text() for i in range(viewer.ui.listData.count())]
+    assert "Integrated 1D" in labels
+
+    row_1d = labels.index("Integrated 1D")
+    viewer.ui.listData.setCurrentRow(row_1d)
+    viewer.data_changed()
+    key_1d = viewer.ui.listData.item(row_1d).data(QtCore.Qt.UserRole)
+    payload_1d = viewer.data_1d[key_1d].nexus_preview_payload
+    assert payload_1d["kind"] == "plot_1d"
+    assert payload_1d["x"].size == payload_1d["y"].size
+    assert payload_1d["x_unit"]
+
+    if "Integrated 2D" in labels:
+        row_2d = labels.index("Integrated 2D")
+        viewer.ui.listData.setCurrentRow(row_2d)
+        viewer.data_changed()
+        key_2d = viewer.ui.listData.item(row_2d).data(QtCore.Qt.UserRole)
+        payload_2d = viewer.data_1d[key_2d].nexus_preview_payload
+        assert payload_2d["kind"] == "image_2d"
+        assert payload_2d["image"].ndim == 2
+        assert payload_2d["image"].size > 0
+
+
+def test_metadata_panel_nexus_viewer_uses_selected_row_not_scan_table():
+    import pandas as pd
+    from PySide6 import QtWidgets
+    from PySide6.QtCore import QModelIndex
+    from xdart.gui.tabs.static_scan.metadata import metadataWidget
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    frame = SimpleNamespace(
+        idx=3,
+        scan_info={"kind": "dataset", "path": "/entry/data", "_attrs": {"hidden": True}},
+    )
+    scan = SimpleNamespace(
+        scan_data=pd.DataFrame({"stale_scan_value": [1.0]}, index=[3]),
+    )
+    mw = metadataWidget(
+        scan,
+        None,
+        ["3"],
+        {},
+        data_1d={3: frame},
+        data_lock=RLock(),
+    )
+    mw.viewer_mode = "nexus"
+
+    frame_widget = QtWidgets.QFrame()
+    frame_widget.setLayout(mw.layout)
+    win = QtWidgets.QWidget()
+    QtWidgets.QVBoxLayout(win).addWidget(frame_widget)
+    win.show()
+    app.processEvents()
+
+    mw.update()
+    model = mw.tableview.model()
+    assert "kind" in list(model.dataFrame.index)
+    assert "path" in list(model.dataFrame.index)
+    assert "stale_scan_value" not in list(model.dataFrame.index)
+    assert "_attrs" not in list(model.dataFrame.index)
+    assert model.rowCount(QModelIndex()) == 2
+    win.close()
+
+
+# ── ImageViewerController.build_payload (Stage 4/5 step 2): the raw-preview
+# semantics now live in the pure helper _image_viewer_raw_payload, replacing
+# the deleted legacy _update_image_viewer.  A None payload tells render to clear.
+
+def _img_state(render_ids):
+    """Minimal DisplayState stand-in: the helper reads only ``render_ids``."""
+    return SimpleNamespace(render_ids=tuple(render_ids), generation=1)
+
+
+def test_image_viewer_missing_raw_and_thumbnail_yields_no_payload():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
     host = SimpleNamespace(
-        idxs_2d=[1],
+        data_lock=RLock(),
+        data_2d={1: {"map_raw": None, "thumbnail": None}},
+        _viewer_is_xdart=False,
+    )
+    assert _image_viewer_raw_payload(host, _img_state([1])) is None
+
+
+def test_image_viewer_no_selection_yields_no_payload():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
+    host = SimpleNamespace(data_lock=RLock(), data_2d={}, _viewer_is_xdart=False)
+    assert _image_viewer_raw_payload(host, _img_state([])) is None
+
+
+def test_image_viewer_all_sentinel_image_yields_no_payload():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
+    host = SimpleNamespace(
         data_lock=RLock(),
         data_2d={1: {"map_raw": np.full((2, 2), 4294967295.0),
                      "thumbnail": None}},
-        _wrangler=None,
-        clear_image_view=lambda: calls.append("clear"),
-        _set_viewer_title=lambda idxs: calls.append(("title", tuple(idxs))),
-        _sanitize_display_image=DisplayDataMixin._sanitize_display_image,
+        _viewer_is_xdart=False,
     )
-
-    displayFrameWidget._update_image_viewer(host)
-
-    assert calls == [("title", (1,)), "clear"]
+    # All sentinel -> standalone fill leaves no finite pixel -> blank (None).
+    assert _image_viewer_raw_payload(host, _img_state([1])) is None
 
 
-def test_image_viewer_masks_uint16_ceiling_sentinel_before_autoscale():
+def test_image_viewer_standalone_uint16_ceiling_stays_raw_and_finite():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
     raw = np.array([[10.0, 65535.0], [20.0, 30.0]])
     host = SimpleNamespace(
-        idxs_2d=[1],
         data_lock=RLock(),
         data_2d={1: {"map_raw": raw, "thumbnail": None}},
-        _wrangler=None,
-        clear_image_view=lambda: None,
-        _set_viewer_title=lambda idxs: None,
-        _sanitize_display_image=DisplayDataMixin._sanitize_display_image,
-        update_image_view=lambda: None,
+        _viewer_is_xdart=False,
+    )
+    payload = _image_viewer_raw_payload(host, _img_state([1]))
+    assert payload is not None
+    # uint16 ceiling is a real count for a standalone file (not a NaN mask).
+    assert np.isnan(payload.image).sum() == 0
+    assert np.nanmax(payload.image) == 65535.0
+
+
+def test_image_viewer_payload_applies_no_mask_background_or_normalization():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
+    raw = np.array([[1.0, 2.0], [3.0, 4.0]])
+    host = SimpleNamespace(
+        data_lock=RLock(),
+        data_2d={1: {"map_raw": raw, "thumbnail": None}},
+        _viewer_is_xdart=False,
+        # A wrangler threshold/mask + a background + a monitor that the raw
+        # browser must all IGNORE (it shows detector counts, not a processed
+        # frame).  None of these may alter the payload pixels.
+        _wrangler=SimpleNamespace(
+            apply_threshold=True, threshold_min=2, threshold_max=3,
+            mask_file="/definitely/not/a/raw-viewer-mask.edf"),
+        bkg_map_raw=np.array([[10.0, 10.0], [10.0, 10.0]]),
+        normalize=lambda data, metadata: np.asarray(data, dtype=float) / 250.0,
+    )
+    payload = _image_viewer_raw_payload(host, _img_state([1]))
+    assert payload is not None
+    # Values preserved exactly (only orientation flipped) — no mask applied, no
+    # background subtracted, not divided by the monitor.
+    np.testing.assert_allclose(np.sort(payload.image.ravel()), [1, 2, 3, 4])
+
+
+def test_available_norm_channels_filters_present_case_insensitive_aliases():
+    channels = available_norm_channels([
+        "TEMP", "Sec", "MON", "I0", "i2", "bstop", "sample", "Second",
+    ])
+
+    assert channels == [
+        ("sec", "Sec"),
+        ("Monitor", "MON"),
+        ("i0", "I0"),
+        ("i2", "i2"),
+    ]
+
+
+def test_refresh_norm_channels_populates_combo_from_scan_data_aliases():
+    combo = _FakeMutableCombo()
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            scan_data=SimpleNamespace(columns=["TEMP", "SEC", "I0", "foo"]),
+        ),
+        ui=SimpleNamespace(normChannel=combo),
+    )
+    host.get_normChannel = MethodType(DisplayDataMixin.get_normChannel, host)
+    host.refresh_norm_channels = MethodType(
+        DisplayDataMixin.refresh_norm_channels, host,
     )
 
-    displayFrameWidget._update_image_viewer(host)
+    host.refresh_norm_channels()
+    combo.setCurrentIndex(2)
 
-    assert np.isnan(host.image_data[0]).sum() == 1
-    assert np.nanmax(host.image_data[0]) == 30.0
+    assert combo._items == ["Norm Channel", "sec", "i0"]
+    assert host.get_normChannel() == "I0"
+
+
+def test_empty_image_clear_hides_colorbar_without_zero_paint():
+    widget = _FakeImageWidget()
+
+    displayFrameWidget._clear_image_widget(widget)
+
+    assert widget.imageItem.cleared is True
+    assert widget.histogram.visible is False
+    assert widget.images == []
+
+
+def test_processed_image_viewer_keeps_baked_nan_mask_visible():
+    from xdart.gui.tabs.static_scan.display_controllers import (
+        _image_viewer_raw_payload,
+    )
+    raw = np.array([[10.0, np.nan], [20.0, 30.0]])
+    host = SimpleNamespace(
+        data_lock=RLock(),
+        data_2d={1: {"map_raw": raw, "thumbnail": None}},
+        _viewer_is_xdart=True,
+    )
+    payload = _image_viewer_raw_payload(host, _img_state([1]))
+    assert payload is not None
+    assert np.isnan(payload.image).sum() == 1       # baked mask preserved
+
+
+def test_image_viewer_raw_pixel_axes_are_not_si_scaled():
+    labels = []
+    axes = {}
+
+    class _Axis:
+        def __init__(self):
+            self.auto_si = None
+            self.scale = None
+
+        def enableAutoSIPrefix(self, enabled):
+            self.auto_si = enabled
+
+        def setScale(self, scale):
+            self.scale = scale
+
+    class _Plot:
+        def setLabel(self, side, text, **kwargs):
+            labels.append((side, text, kwargs))
+
+        def getAxis(self, side):
+            axes.setdefault(side, _Axis())
+            return axes[side]
+
+    widget = SimpleNamespace(image_plot=_Plot())
+
+    displayFrameWidget._set_raw_pixel_axes(widget)
+
+    assert labels == [
+        ("bottom", "x (Pixels)", {}),
+        ("left", "y (Pixels)", {}),
+    ]
+    assert axes["bottom"].auto_si is False
+    assert axes["left"].auto_si is False
+
+
+def test_display_preview_preserves_nan_masks_but_collapses_infinities():
+    from xdart.gui.tabs.static_scan.display_constants import _downsample_for_display
+
+    class _Widget:
+        def width(self):
+            return 200
+        def height(self):
+            return 200
+
+    data = np.array([[np.nan, 10.0], [20.0, np.inf]])
+
+    preview = _downsample_for_display(data, _Widget())
+
+    assert np.isnan(preview[0, 0])
+    assert preview[1, 1] == 10.0
+    assert np.isfinite(preview[0, 1])
+
+
+def test_real_eiger_preview_masks_sentinels_for_display():
+    from pathlib import Path
+    from ssrl_xrd_tools.io.image import read_image
+    from xdart.gui.tabs.static_scan.display_constants import _downsample_for_display
+
+    path = Path("/Users/vthampy/repos/test_data/eiger/Eiger_B_ctrl_test__2000mdeg_scan001_master.h5")
+    if not path.exists():
+        pytest.skip("real Eiger test data not available")
+
+    class _Widget:
+        def width(self):
+            return 500
+        def height(self):
+            return 500
+
+    from xdart.gui.tabs.static_scan.display_logic import standalone_viewer_image
+    raw = np.asarray(read_image(path, frame=0), dtype=float)
+    data = standalone_viewer_image(raw).T[:, ::-1]
+
+    preview = _downsample_for_display(data, _Widget())
+
+    assert np.isfinite(preview).all()
+    assert np.nanmax(preview) < 4294967295.0
+
+
+def test_update_renders_blank_on_empty_no_data_instead_of_leaving_stale():
+    # P2 #3: update() used to early-return when _updated() reported no usable
+    # data (empty selection / failed load / cache miss), leaving a stale
+    # plot/raw/cake on screen.  It must instead render an explicit empty
+    # state that blanks every panel.
+    from xdart.gui.tabs.static_scan.display_logic import Mode
+
+    calls = []
+    host = SimpleNamespace(
+        display_generation=3,
+        get_idxs=lambda: None,
+        _note_selection_generation=lambda: None,
+        _updated=lambda: False,
+        _live_mode=lambda: Mode.IMAGE_VIEWER,   # skips INT-mode axis setup
+        data_lock=RLock(),
+        data_1d={},
+        data_2d={},
+        clear_plot_view=lambda: calls.append("plot"),
+        clear_image_view=lambda: calls.append("image"),
+        clear_binned_view=lambda: calls.append("cake"),
+    )
+    host._clear_delegate = MethodType(displayFrameWidget._clear_delegate, host)
+    host.render_display = MethodType(displayFrameWidget.render_display, host)
+    host.update = MethodType(displayFrameWidget.update, host)
+
+    assert host.update() is True
+    assert set(calls) == {"plot", "image", "cake"}   # every panel blanked
+    assert host._display_blanked is True
+
+    # Repeated empty update is a no-op — current content is already blank.
+    calls.clear()
+    assert host.update() is True
+    assert calls == []
 
 
 def _plot_host(method="Overlay"):
@@ -1240,11 +2839,101 @@ def _plot_host(method="Overlay"):
 
     host.get_frames_int_1d = get_frames_int_1d
     host.get_int_1d = get_int_1d
-    host.update_plot = MethodType(DisplayPlotMixin.update_plot, host)
-    host._loaded_1d_overlay_labels = MethodType(
-        DisplayPlotMixin._loaded_1d_overlay_labels, host,
-    )
+    for name in (
+        "resolve_plot_axis",
+        "collect_plot_rows",
+        "build_plot_names",
+        "apply_plot_background",
+        "compute_plot_range",
+        "draw_plot_state",
+        "_loaded_1d_overlay_labels",
+        "update_plot",
+    ):
+        setattr(host, name, MethodType(getattr(DisplayPlotMixin, name), host))
     return host
+
+
+def test_update_plot_accumulator_replaces_for_single_sum_average():
+    out, names, ids = update_plot_accumulator(
+        [np.array([99.0]), np.array([[99.0]])],
+        ["old"],
+        [99],
+        np.array([0.0, 1.0]),
+        np.array([[1.0, 2.0], [3.0, 4.0]]),
+        ["scan_1", "scan_2"],
+        [1, 2],
+        "Average",
+        False,
+    )
+
+    np.testing.assert_allclose(out[0], [0.0, 1.0])
+    np.testing.assert_allclose(out[1], [[1.0, 2.0], [3.0, 4.0]])
+    assert names == ["scan_1", "scan_2"]
+    assert ids == [1, 2]
+
+
+def test_update_plot_accumulator_appends_skips_duplicates_and_merges_grids():
+    out, names, ids = update_plot_accumulator(
+        [np.array([0.0, 1.0]), np.array([[1.0, 2.0]])],
+        ["scan_1"],
+        [1],
+        np.array([0.5, 1.5]),
+        np.array([[10.0, 20.0], [30.0, 40.0]]),
+        ["scan_1", "scan_2"],
+        [1, 2],
+        "Overlay",
+        False,
+    )
+
+    np.testing.assert_allclose(out[0], [0.0, 0.5, 1.0, 1.5])
+    np.testing.assert_allclose(
+        out[1],
+        [
+            [1.0, 1.5, 2.0, np.nan],
+            [np.nan, 30.0, 35.0, 40.0],
+        ],
+        equal_nan=True,
+    )
+    assert names == ["scan_1", "scan_2"]
+    assert ids == [1, 2]
+
+
+def test_update_plot_accumulator_rebuilds_on_unit_change():
+    out, names, ids = update_plot_accumulator(
+        [np.array([0.0, 1.0]), np.array([[1.0, 2.0]])],
+        ["scan_1"],
+        [1],
+        np.array([10.0, 11.0]),
+        np.array([[5.0, 6.0]]),
+        ["scan_1"],
+        [1],
+        "Waterfall",
+        True,
+    )
+
+    np.testing.assert_allclose(out[0], [10.0, 11.0])
+    np.testing.assert_allclose(out[1], [[5.0, 6.0]])
+    assert names == ["scan_1"]
+    assert ids == [1]
+
+
+def test_update_plot_accumulator_skips_empty_incoming_grid():
+    out, names, ids = update_plot_accumulator(
+        [np.array([0.0, 1.0]), np.array([[1.0, 2.0]])],
+        ["scan_1"],
+        [1],
+        np.array([]),
+        np.zeros((1, 0)),
+        ["scan_2"],
+        [2],
+        "Overlay",
+        False,
+    )
+
+    np.testing.assert_allclose(out[0], [0.0, 1.0])
+    np.testing.assert_allclose(out[1], [[1.0, 2.0]])
+    assert names == ["scan_1"]
+    assert ids == [1]
 
 
 def test_overlay_unit_switch_rebuilds_all_accumulated_curves():
@@ -1297,6 +2986,48 @@ def test_single_multiselect_unit_switch_still_uses_current_selection():
     assert host.overlaid_idxs == [1, 2, 3]
 
 
+def test_overlay_append_skips_empty_incoming_grid_without_crash():
+    # Regression (P1 #1): a frame whose 1D grid is empty (cache miss mid
+    # fast batch) reached the merge branch and _reinterp(np.interp on empty
+    # src_x) raised, aborting the whole render so completed traces never
+    # painted.  The empty-grid frame must be skipped, not crash.
+    host = _plot_host("Overlay")
+    host.idxs = [1]
+    host.idxs_1d = [1]
+    host.update_plot()
+    assert host.plot_data[1].shape == (1, 2)
+
+    # Frame 2 comes back with an empty x grid.
+    host.get_frames_int_1d = lambda idxs=None, rv="all": (
+        np.zeros((1, 0)), np.zeros(0))
+    host.idxs = [2]
+    host.idxs_1d = [2]
+    host.update_plot()  # must not raise
+
+    assert host.plot_data[1].shape == (1, 2)        # frame 2 skipped
+    assert "scan_2" not in host.frame_names
+    assert host.overlaid_idxs == [1]
+
+
+def test_overlay_append_empty_accumulator_seeds_fresh_grid():
+    # Regression (P1 #1): with overlay "active" (plan_overlay → APPEND) but
+    # an emptied accumulator (old_x empty), interpolating onto the empty x
+    # crashed.  It must seed the grid from the incoming frame instead.
+    host = _plot_host("Overlay")
+    host.overlaid_idxs = [99]
+    host.frame_names = ["scan_99"]
+    host.plot_data = [np.zeros(0), np.zeros((0, 0))]
+    host._last_plot_unit = 0          # no unit change → APPEND (not REBUILD)
+    host.idxs = [1]
+    host.idxs_1d = [1]
+    host.update_plot()  # must not raise
+
+    assert host.plot_data[0].size == 2              # grid seeded
+    assert host.plot_data[1].shape == (1, 2)
+    assert host.frame_names == ["scan_1"]
+    assert host.overlaid_idxs == [1]
+
+
 def test_xye_single_method_change_clears_accumulated_traces_immediately():
     calls = []
     host = SimpleNamespace(
@@ -1307,17 +3038,44 @@ def test_xye_single_method_change_clears_accumulated_traces_immediately():
         plot_data_range=[[0, 1], [0, 1]],
         frame_names=["old_a", "old_b"],
         overlaid_idxs=[1, 2],
-        _update_xye_viewer=lambda: calls.append("xye"),
+        # Switching to Single clears the accumulation then re-renders through the
+        # payload path (update()), not the deleted _update_xye_viewer.
+        update=lambda: calls.append("update"),
+        _autorange_plot_view=lambda: None,    # R2-3 autorange (no-op here)
     )
     host.clear_overlay = MethodType(displayFrameWidget.clear_overlay, host)
 
     DisplayPlotMixin._on_plotMethod_changed(host)
 
-    assert calls == ["xye"]
+    assert calls == ["update"]
     assert host.plot_data[0].size == 0
     assert host.plot_data[1].size == 0
     assert host.frame_names == []
     assert host.overlaid_idxs == []
+
+
+def test_overlay_to_single_collapses_selection_and_refreshes_frame_ids():
+    list_data = _FakeListWidget(["1", "2", "3", "4", "5"])
+    list_data.selectAll()
+    list_data._current_row = 2
+    calls = []
+
+    def data_changed():
+        viewer.frame_ids[:] = [item.text() for item in list_data.selectedItems()]
+        calls.append(tuple(viewer.frame_ids))
+
+    viewer = SimpleNamespace(
+        _plot_method="Overlay",
+        ui=SimpleNamespace(listData=list_data),
+        frame_ids=[],
+        data_changed=data_changed,
+    )
+
+    H5Viewer.set_data_selection_mode(viewer, "Single")
+
+    assert calls == [("3",)]
+    assert viewer.frame_ids == ["3"]
+    assert [item.text() for item in list_data.selectedItems()] == ["3"]
 
 
 def test_xye_axis_label_uses_file_unit_not_hidden_transform_combo():
@@ -1332,7 +3090,7 @@ def test_xye_axis_label_uses_file_unit_not_hidden_transform_combo():
     )
 
 
-def test_xye_loader_marks_unknown_units_without_guessing(monkeypatch, tmp_path):
+def test_xye_loader_defaults_unprefixed_files_to_q(monkeypatch, tmp_path):
     import xdart.gui.tabs.static_scan.h5viewer as h5viewer_mod
 
     monkeypatch.setattr(
@@ -1369,7 +3127,7 @@ def test_xye_loader_marks_unknown_units_without_guessing(monkeypatch, tmp_path):
 
     assert viewer.data_1d[1].int_1d.unit == "q_A^-1"
     assert viewer.data_1d[2].int_1d.unit == "2th_deg"
-    assert viewer.data_1d[3].int_1d.unit == "unknown"
+    assert viewer.data_1d[3].int_1d.unit == "q_A^-1"
 
 
 def test_standard_plot_axis_defaults_to_integrated_2theta_unit():
@@ -1390,6 +3148,91 @@ def test_standard_plot_axis_defaults_to_integrated_2theta_unit():
 
     assert plot_unit.currentIndex() == 1
     assert "2" in plot_unit.currentText()
+
+
+class _FakePlot:
+    def __init__(self):
+        self.link = None
+        self.autorange = 0
+
+    def setXLink(self, link):
+        self.link = link
+
+    def enableAutoRange(self):
+        self.autorange += 1
+
+    def autoRange(self):
+        self.autorange += 1
+
+
+def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index=0):
+    plot_unit = _FakeMutableCombo()
+    for item in plot_items or ("Q (Å⁻¹)", "2θ (°)", "χ (°)"):
+        plot_unit.addItem(item)
+    plot_unit.setCurrentIndex(plot_unit.count() - 1)
+    image_unit = _FakeMutableCombo()
+    for item in image_items or ("Q-χ", "2θ-χ"):
+        image_unit.addItem(item)
+    image_unit.setCurrentIndex(image_index)
+    share = _FakeControl(checked=True)
+    target = object()
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            gi=gi,
+            skip_2d=False,
+            bai_2d_args={"gi_mode_2d": "qip_qoop"},
+        ),
+        ui=SimpleNamespace(
+            plotUnit=plot_unit,
+            imageUnit=image_unit,
+            shareAxis=share,
+        ),
+        plot=_FakePlot(),
+        binned_widget=SimpleNamespace(image_plot=target),
+        _plot_axis_info=[
+            {"source": "1d_2d", "axis": "radial"},
+            {"source": "1d_2d", "axis": "radial"},
+            {"source": "2d", "axis": "azimuthal"},
+        ][:plot_unit.count()],
+    )
+    for name in (
+        "_current_image_axis_key",
+        "_plot_axis_key",
+        "_share_axis_plot_index",
+        "_set_plot_unit_index_silently",
+        "_apply_share_axis_state",
+    ):
+        setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
+    return host
+
+
+def test_share_axis_maps_by_unit_not_combo_index():
+    host = _share_axis_host(image_index=1)
+
+    assert host.ui.plotUnit.currentText().startswith("χ")
+    assert host._apply_share_axis_state() is True
+
+    assert host.ui.plotUnit.currentIndex() == 1
+    assert host.ui.plotUnit.currentText().startswith("2")
+    assert host.ui.plotUnit._enabled is False
+    assert host.ui.shareAxis.isEnabled() is True
+    assert host.plot.link is host.binned_widget.image_plot
+
+
+def test_share_axis_disables_when_no_matching_plot_unit():
+    host = _share_axis_host(
+        gi=True,
+        plot_items=("Q (Å⁻¹)",),
+        image_items=("Qᵢₚ-Qₒₒₚ",),
+        image_index=0,
+    )
+
+    assert host._apply_share_axis_state() is False
+
+    assert host.ui.shareAxis.isEnabled() is False
+    assert host.ui.shareAxis.isChecked() is False
+    assert host.ui.plotUnit._enabled is True
+    assert host.plot.link is None
 
 
 def test_processed_image_viewer_falls_back_to_thumbnail(tmp_path):
@@ -1697,6 +3540,7 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
         batchCheckBox=_FakeControl(batch),
         coresLabel=_FakeControl(),
         maxCoresSpinBox=_FakeControl(),
+        advancedButton=_FakeControl(),
         startButton=_FakeControl(),
         stopButton=_FakeControl(),
         frame=_FakeControl(),
@@ -1721,6 +3565,11 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
         _set_gi_controls_readonly=lambda readonly: setattr(
             host, "_gi_readonly", readonly,
         ),
+        # #72: enabled() now locks the whole tree via _set_tree_readonly; record
+        # the requested state instead of walking a real ParameterTree.
+        _set_tree_readonly=lambda readonly: setattr(
+            host, "_tree_readonly", readonly,
+        ),
     )
     host._on_mode_changed = MethodType(imageWrangler._on_mode_changed, host)
     host.start = MethodType(imageWrangler.start, host)
@@ -1730,16 +3579,30 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
 def test_wrangler_enabled_reapplies_viewer_mode_controls():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
-    host = _wrangler_host("Image Viewer", live=True, batch=True)
+    for mode in ("Image Viewer", "XYE Viewer", "NeXus Viewer"):
+        host = _wrangler_host(mode, live=True, batch=True)
 
-    imageWrangler.enabled(host, True)
+        imageWrangler.enabled(host, True)
 
-    assert host.ui.liveCheckBox.isChecked() is False
-    assert host.ui.liveCheckBox.isEnabled() is False
-    assert host.ui.batchCheckBox.isEnabled() is False
-    assert host.ui.frame.isVisible() is False
-    assert host._integration_controls_enabled is False
-    assert host.thread.live_mode is False
+        assert host.ui.liveCheckBox.isChecked() is False
+        assert host.ui.liveCheckBox.isEnabled() is False
+        assert host.ui.batchCheckBox.isEnabled() is False
+        assert host.ui.frame.isVisible() is False
+        assert host._integration_controls_enabled is False
+        assert host.thread.live_mode is False
+        assert host.tree.isEnabled() is (mode == "NeXus Viewer")
+
+
+def test_file_viewer_mode_disables_processing_tree_but_not_mode_combo():
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    for mode in ("Image Viewer", "XYE Viewer"):
+        host = _wrangler_host(mode, live=False, batch=False)
+
+        imageWrangler._on_mode_changed(host)
+
+        assert host.tree.isEnabled() is False
+        assert host.ui.processingModeCombo.currentText() == mode
 
 
 def test_wrangler_enabled_reapplies_xye_mode_controls():
@@ -1798,10 +3661,12 @@ def test_active_live_run_disables_batch_but_keeps_live_clickable():
     assert host.ui.startButton.isEnabled() is False
     assert host.ui.liveCheckBox.isEnabled() is True
     assert host.ui.batchCheckBox.isEnabled() is False
-    assert host._integration_calls[-1] == (
-        False, {"include_gi": False},
-    )
-    assert host._gi_readonly is True
+    # #72: the whole tree is hard-disabled and the non-param widgets disabled.
+    assert host.tree.isEnabled() is False
+    assert host.ui.processingModeCombo.isEnabled() is False
+    assert host.ui.maxCoresSpinBox.isEnabled() is False
+    assert host.ui.advancedButton.isEnabled() is False
+    assert host.ui.stopButton.isEnabled() is True    # Stop never disabled
 
 
 def test_active_non_live_run_disables_live_and_batch():
@@ -1815,18 +3680,163 @@ def test_active_non_live_run_disables_live_and_batch():
     assert host.ui.startButton.isEnabled() is False
     assert host.ui.liveCheckBox.isEnabled() is False
     assert host.ui.batchCheckBox.isEnabled() is False
-    assert host._gi_readonly is True
+    assert host.tree.isEnabled() is False
 
 
-def test_active_run_keeps_parameter_tree_enabled_for_gi_checkbox_paint():
+def test_active_run_hard_disables_parameter_tree():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=False, batch=False)
 
     imageWrangler.enabled(host, False)
 
+    # #72 (revised): the whole tree is hard-disabled during a run (greyed +
+    # non-interactive), matching the integration panel.  A disabled pyqtgraph
+    # bool checkbox may repaint unchecked (#56) — accepted over a panel that
+    # still looks active ("minimize complexity").
+    assert host.tree.isEnabled() is False
+
+
+def test_set_parameter_readonly_skips_bools_disables_actions():
+    """The whole-tree run lock (#72) on a REAL ParameterTree must: make value
+    params read-only, DISABLE action (Browse) params, and SKIP bool params —
+    disabling a pyqtgraph bool repaints it unchecked (the #56 Grazing
+    regression).  Bool VALUES must be preserved throughout."""
+    from PySide6 import QtWidgets
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    from pyqtgraph.parametertree import Parameter
+    from xdart.gui.gui_utils import NamedActionParameter
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerWidget
+
+    params = Parameter.create(name='root', type='group', children=[
+        {'name': 'grp', 'type': 'group', 'children': [
+            {'name': 'val', 'type': 'str', 'value': 'x'},
+            {'name': 'flag', 'type': 'bool', 'value': True},
+            # list/combo params ignore readonly in pyqtgraph — must be disabled.
+            {'name': 'pick', 'type': 'list', 'values': ['a', 'b'], 'value': 'a'},
+            NamedActionParameter(name='browse', title='Browse...'),
+        ]},
+    ])
+    host = SimpleNamespace()
+    host._set_parameter_readonly = MethodType(
+        wranglerWidget._set_parameter_readonly, host)
+
+    host._set_parameter_readonly(params, True)            # lock (run active)
+    grp = params.child('grp')
+    assert grp.child('val').opts.get('enabled') is False       # value leaf disabled
+    assert grp.child('pick').opts.get('enabled') is False      # list leaf disabled
+    assert grp.child('browse').opts.get('enabled') is False    # action disabled
+    assert grp.opts.get('enabled') is not False                # GROUP never disabled (#56)
+    assert grp.child('flag').opts.get('readonly') is not True  # bool SKIPPED
+    assert grp.child('flag').opts.get('enabled') is not False  # bool not disabled
+    assert grp.child('flag').value() is True                   # value preserved
+    assert grp.child('pick').value() == 'a'                    # list value preserved
+
+    host._set_parameter_readonly(params, False)           # unlock (run finished)
+    assert grp.child('val').opts.get('enabled') is True
+    assert grp.child('pick').opts.get('enabled') is True
+    assert grp.child('browse').opts.get('enabled') is True
+    assert grp.child('flag').value() is True
+
+
+def test_wrangler_enabled_restore_unlocks_tree_and_nonparam_widgets():
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=True, batch=True)
+    imageWrangler.enabled(host, False)
+    assert host.tree.isEnabled() is False
+    assert host.ui.processingModeCombo.isEnabled() is False
+
+    imageWrangler.enabled(host, True)
     assert host.tree.isEnabled() is True
-    assert host._integration_calls[-1] == (
-        False, {"include_gi": False},
+    assert host.ui.processingModeCombo.isEnabled() is True
+    assert host.ui.advancedButton.isEnabled() is True
+    # batch=True host → _on_mode_changed re-enables the Cores widgets.
+    assert host.ui.maxCoresSpinBox.isEnabled() is True
+    assert host.ui.coresLabel.isEnabled() is True
+
+
+def test_nexus_wrangler_enabled_locks_whole_panel_keeps_stop():
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler import nexusWrangler
+
+    host = SimpleNamespace(
+        startButton=_FakeControl(),
+        stopButton=_FakeControl(),          # set in start/stop; untouched by enabled()
+        processingModeCombo=_FakeControl(),
+        maxCoresSpinBox=_FakeControl(),
+        coresLabel=_FakeControl(),
+        tree=_FakeControl(),
     )
-    assert host._gi_readonly is True
+    host._set_tree_readonly = lambda readonly: setattr(host, "_tree_readonly", readonly)
+
+    nexusWrangler.enabled(host, False)                    # run active
+    assert host.tree.isEnabled() is False                # whole tree hard-disabled
+    assert host.startButton.isEnabled() is False
+    assert host.processingModeCombo.isEnabled() is False
+    assert host.maxCoresSpinBox.isEnabled() is False
+    assert host.stopButton.isEnabled() is True           # Stop untouched
+
+    nexusWrangler.enabled(host, True)                     # run finished
+    assert host.tree.isEnabled() is True
+    assert host.startButton.isEnabled() is True
+    assert host.processingModeCombo.isEnabled() is True
+
+
+def _iter_params(param):
+    yield param
+    try:
+        children = param.children()
+    except AttributeError:
+        children = ()
+    for c in children:
+        yield from _iter_params(c)
+
+
+def _build_real_wrangler(cls):
+    import threading
+    from PySide6 import QtWidgets
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    scan = SimpleNamespace(
+        skip_2d=None, bai_1d_args={}, bai_2d_args={},
+        scan_lock=threading.RLock(), gi=False, poni_file='', name='null_main')
+    return cls("test", threading.Condition(), scan, {}, {})
+
+
+def test_real_wrangler_run_lock_covers_whole_tree():
+    """End-to-end on REAL wrangler instances (not injected hosts): enabled(False)
+    HARD-disables the entire real ParameterTree widget (greyed + non-interactive,
+    matching the integration panel) and the non-param widgets, while keeping Stop
+    enabled; enabled(True) restores it.  The whole-tree lock is the widget disable
+    itself, not per-param readonly opts — so we assert tree.isEnabled() flips, not
+    per-param state.  A disabled pyqtgraph bool checkbox may repaint unchecked
+    during the run (#56), but its *value* is preserved (and restored on re-enable);
+    that accepted cosmetic was chosen over the read-only approach, which left the
+    panel looking active.  Covers both wranglers (image .ui + nexus direct attrs)."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler import nexusWrangler
+
+    for cls in (imageWrangler, nexusWrangler):
+        w = _build_real_wrangler(cls)
+        ui = w.ui if hasattr(w, 'ui') else w       # image uses .ui; nexus direct attrs
+        ui.stopButton.setEnabled(True)             # mimic the start flow
+
+        bool_before = [(p, p.value()) for p in _iter_params(w.parameters)
+                       if p.opts.get('type') == 'bool']
+        assert bool_before, f"{cls.__name__}: expected a bool param (e.g. Grazing)"
+
+        # ── run active ─────────────────────────────────────────────────────────
+        w.enabled(False)
+        assert w.tree.isEnabled() is False         # whole tree hard-disabled
+        assert ui.stopButton.isEnabled() is True   # Stop never disabled
+        assert ui.processingModeCombo.isEnabled() is False
+        assert ui.maxCoresSpinBox.isEnabled() is False
+        # Param *values* survive the lock (the #56 checkbox repaint is cosmetic only).
+        for p, val in bool_before:
+            assert p.value() == val, f"{cls.__name__}: bool {p.name()} value changed by lock"
+
+        # ── run finished ───────────────────────────────────────────────────────
+        w.enabled(True)
+        assert w.tree.isEnabled() is True          # tree re-enabled
+        assert ui.processingModeCombo.isEnabled() is True
+        for p, val in bool_before:
+            assert p.value() == val, f"{cls.__name__}: bool {p.name()} value changed after restore"

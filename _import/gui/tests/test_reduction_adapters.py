@@ -581,6 +581,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
 
 def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None:
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+    from xdart.modules.frame_publication import PublicationStore
 
     calls = []
 
@@ -606,6 +607,7 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
     scan.global_mask = np.array([3])
 
     data_1d = {}
+    store = PublicationStore()
     thread = integratorThread(
         scan,
         None,
@@ -614,16 +616,21 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
         [0],
         data_1d,
         {},
+        publication_store=store,
     )
     thread.bai_1d_SI()
 
     assert calls
     assert calls[0][0].integration_1d.monitor_key == "i0"
     assert data_1d[0].int_1d is not None
+    pub = store.get(0)
+    assert pub is not None
+    np.testing.assert_allclose(pub.view.intensity_1d, data_1d[0].int_1d.intensity)
 
 
 def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+    from xdart.modules.frame_publication import PublicationStore
 
     calls = []
 
@@ -640,6 +647,7 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
     scan._cached_integrator = _FakeIntegrator()
     data_1d = {}
     data_2d = {}
+    store = PublicationStore()
     thread = integratorThread(
         scan,
         None,
@@ -648,6 +656,7 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
         [0],
         data_1d,
         data_2d,
+        publication_store=store,
     )
 
     thread.bai_2d_SI()
@@ -657,6 +666,58 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
     assert calls[0].integration_2d is not None
     assert data_1d[0].int_1d is not None
     assert data_2d[0]["int_2d"] is not None
+    pub = store.get(0)
+    assert pub is not None
+    np.testing.assert_allclose(pub.view.intensity_1d, data_1d[0].int_1d.intensity)
+    np.testing.assert_allclose(pub.view.intensity_2d, data_2d[0]["int_2d"].intensity.T)
+
+
+def test_reintegrate_all_refreshes_publication_store(monkeypatch) -> None:
+    # A1: reintegrating ("Integrate 2D") must republish into the
+    # PublicationStore so the cake (payload path is preferred) shows the NEW
+    # pixels, not the pre-reintegrate ones.  fake_reduce makes the 2D shape
+    # depend on bai_2d_args['npt_rad'] so a changed arg is observable.
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+    from xdart.modules.frame_publication import PublicationStore
+
+    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
+        npt = int(scan.bai_2d_args.get("npt_rad", 10))
+        frame.int_1d = _r1d()
+        frame.int_2d = IntegrationResult2D(
+            radial=np.linspace(0.0, 1.0, npt),
+            azimuthal=np.linspace(-90.0, 90.0, 3),
+            intensity=np.ones((npt, 3)),
+            unit="q_A^-1", azimuthal_unit="chi_deg",
+        )
+        return frame
+
+    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
+
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan("scan", frames=[frame])
+    scan._cached_integrator = _FakeIntegrator()
+    scan.skip_2d = False
+    scan.bai_2d_args = {"npt_rad": 10, "gi_mode_2d": "qip_qoop"}
+    store = PublicationStore()
+
+    thread = integratorThread(
+        scan, None, None, None, [0], {}, {},
+        publication_store=store,
+    )
+
+    thread.bai_2d_all()
+    pub = store.get(0)
+    assert pub is not None
+    # view stores (y=azimuthal, x=radial) → (3, npt)
+    assert pub.view.intensity_2d.shape == (3, 10)
+
+    # Reintegrate with npt_rad halved → the store must reflect the NEW args,
+    # not the stale (3, 10) cake.
+    scan.bai_2d_args = {"npt_rad": 5, "gi_mode_2d": "qip_qoop"}
+    thread.bai_2d_all()
+    pub2 = store.get(0)
+    assert pub2 is not None
+    assert pub2.view.intensity_2d.shape == (3, 5)
 
 
 # ---------------------------------------------------------------------------

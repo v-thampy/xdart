@@ -165,6 +165,7 @@ class imageWrangler(wranglerWidget):
             in specLabel
     """
     showLabel = QtCore.Signal(str)
+    sigSavePathChanged = QtCore.Signal(str)
 
     def __init__(self, fname, file_lock, scan, data_1d, data_2d, parent=None):
         """fname: str, file path
@@ -185,6 +186,14 @@ class imageWrangler(wranglerWidget):
         # Setup gui elements
         self.ui = Ui_Form()
         self.ui.setupUi(self)
+        # Deferred for this release: the NeXus Viewer mode is not yet usable on
+        # stacked datasets (integrated_1d/2d store the whole (N, ...) stack
+        # under one key, so it needs a per-frame slider).  Hide the option to
+        # avoid the half-baked viewer; the controller/mode code stays dormant
+        # and the option returns once the slider lands.
+        _nx_idx = self.ui.processingModeCombo.findText('NeXus Viewer')
+        if _nx_idx >= 0:
+            self.ui.processingModeCombo.removeItem(_nx_idx)
         self.ui.startButton.clicked.connect(self._on_start_clicked)
         # self.ui.startButton.clicked.connect(self.sigStart.emit)
         self.ui.stopButton.clicked.connect(self.stop)
@@ -395,6 +404,33 @@ class imageWrangler(wranglerWidget):
 
         self.setup()
         self._restore_from_session()
+        # Open the GI / Threshold / Background groups when their toggle is on
+        # (e.g. from a restored session) so the relevant controls are visible
+        # instead of folded; collapsed when off.
+        self._expand_active_groups()
+
+    def _expand_active_groups(self):
+        """Expand each wrangler group whose enabling param is set.
+
+        The GI / Intensity-Threshold / Background groups default folded.  If
+        Grazing is checked, Threshold is enabled, or a Background source is
+        selected (incl. after a session restore), expand that group via
+        ``setOpts(expanded=True)``; leave it collapsed when off."""
+        groups = (
+            ('GI', ('GI', 'Grazing'), lambda v: bool(v)),
+            ('Mask', ('Mask', 'Threshold'), lambda v: bool(v)),
+            ('BG', ('BG', 'bg_type'), lambda v: v not in (None, '', 'None')),
+        )
+        for group_name, child_path, is_on in groups:
+            try:
+                group = self.parameters.child(group_name)
+                value = self.parameters.child(*child_path).value()
+            except Exception:
+                logger.debug("expand-active-group skipped for %s", group_name,
+                             exc_info=True)
+                continue
+            if is_on(value):
+                group.setOpts(expanded=True)
 
     # --- Session persistence ---
 
@@ -484,6 +520,14 @@ class imageWrangler(wranglerWidget):
         if session.get('poni_file') and Path(session['poni_file']).exists():
             self.get_poni_dict()
 
+    def _sync_h5_dir_from_parameters(self):
+        """Sync the Save Path parameter and notify the scans browser on change."""
+        path = self.parameters.child('h5_dir').value()
+        old_path = getattr(self, 'h5_dir', None)
+        self.h5_dir = path
+        if path and path != old_path:
+            self.sigSavePathChanged.emit(path)
+
     # Signal to notify static_scan_widget that viewer mode changed.
     # Emits the viewer_mode string ('image', 'xye') or '' for normal.
     sigViewerModeChanged = QtCore.Signal(str)
@@ -491,7 +535,8 @@ class imageWrangler(wranglerWidget):
     def _on_mode_changed(self, *args):
         """Update all flags from the processing mode dropdown and checkboxes."""
         mode_text = self.ui.processingModeCombo.currentText()
-        is_viewer = mode_text in ('Image Viewer', 'XYE Viewer')
+        is_viewer = mode_text in ('Image Viewer', 'XYE Viewer', 'NeXus Viewer')
+        is_file_viewer = mode_text in ('Image Viewer', 'XYE Viewer')
         is_xye = mode_text == 'Int 1D (XYE)'
 
         # Pre-process state overrides
@@ -559,6 +604,9 @@ class imageWrangler(wranglerWidget):
         elif mode_text == 'XYE Viewer':
             self.viewer_mode = 'xye'
             self.scan.skip_2d = False
+        elif mode_text == 'NeXus Viewer':
+            self.viewer_mode = 'nexus'
+            self.scan.skip_2d = False
         else:
             self.viewer_mode = None
             self.scan.skip_2d = '1D' in mode_text
@@ -570,6 +618,14 @@ class imageWrangler(wranglerWidget):
 
         # Gray out integration controls in viewer mode
         self._set_integration_controls_enabled(not is_viewer)
+        # Image/XYE viewers are file-inspection modes.  Disable the processing
+        # parameter tree itself so masks/background/calibration state cannot be
+        # edited or accidentally interpreted as viewer state.  The mode combo
+        # lives outside this tree, so the user can still switch back.
+        try:
+            self.tree.setEnabled(not is_file_viewer)
+        except AttributeError:
+            pass
         # Hide start/stop in viewer mode
         self.ui.frame.setVisible(not is_viewer)
         # Notify parent only when viewer mode actually changed (avoids
@@ -605,27 +661,8 @@ class imageWrangler(wranglerWidget):
         except (AttributeError, KeyError) as e:
             logger.debug("Failed to set enabled state for h5_dir parameters: %s", e)
 
-    def _set_parameter_readonly(self, param, readonly):
-        """Recursively set pyqtgraph Parameter readonly state when available.
-
-        Skips ``bool`` params: pyqtgraph renders a *readonly* checkbox as
-        UNCHECKED regardless of its value (cosmetic), which made the GI
-        'Grazing' box flip to unchecked for the duration of a run.  The value
-        is unaffected and the run uses the setup-time ``gi`` flag, and the
-        Start button is disabled, so leaving the checkbox interactive is
-        harmless — and it keeps showing its real state.
-        """
-        if param.opts.get('type') != 'bool':
-            try:
-                param.setOpts(readonly=readonly)
-            except (AttributeError, TypeError):
-                pass
-        try:
-            children = param.children()
-        except AttributeError:
-            children = ()
-        for child in children:
-            self._set_parameter_readonly(child, readonly)
+    # _set_parameter_readonly now lives on the base wranglerWidget (shared with
+    # nexusWrangler); _set_gi_controls_readonly below still uses it via self.
 
     def _set_gi_controls_readonly(self, readonly):
         try:
@@ -666,6 +703,7 @@ class imageWrangler(wranglerWidget):
         self.thread.meta_ext = self.meta_ext
         self.thread.meta_dir = self.meta_dir
 
+        self._sync_h5_dir_from_parameters()
         self.thread.h5_dir = self.h5_dir
         self.fname = os.path.join(self.h5_dir, self.scan_name + '.nxs')
         self.thread.fname = self.fname
@@ -1128,7 +1166,7 @@ class imageWrangler(wranglerWidget):
         if path != '':
             Path(path).mkdir(parents=True, exist_ok=True)
             self.parameters.child('h5_dir').setValue(path)
-            self.h5_dir = path
+            self._sync_h5_dir_from_parameters()
 
     def set_bg_matching_options(self):
         """Reads image metadata to populate matching parameters
@@ -1223,21 +1261,32 @@ class imageWrangler(wranglerWidget):
         self.motors = self.scan_parameters
 
     def enabled(self, enable):
-        """Sets tree and start button to enable.
+        """Enable/disable the WHOLE wrangler panel for the run lifecycle (#72).
+
+        During a run everything is locked except Stop: the parameter tree is
+        hard-disabled (greyed + fully non-interactive, matching the integration
+        panel above it), and the non-param widgets (processing-mode combo, Cores
+        spinbox + label, Advanced button) are disabled too.  A disabled pyqtgraph
+        bool checkbox (Grazing, Average Scan, …) may repaint unchecked during the
+        run (#56), but the value is preserved and restored on re-enable — the
+        full visible disable was chosen over that cosmetic ("minimize
+        complexity").  The running thread uses the setup-time arg snapshot
+        regardless.
 
         args:
             enable: bool, True for enabled False for disabled.
         """
-        # Disabling the entire ParameterTree causes pyqtgraph's bool editor to
-        # repaint checked boxes as unchecked on some platforms.  Keep the tree
-        # itself enabled during an active run and disable the processing
-        # controls individually below; this preserves the visual state of the
-        # GI/Grazing checkbox while the thread uses the setup-time value.
-        self.tree.setEnabled(True)
+        self.tree.setEnabled(enable)
         self.ui.startButton.setEnabled(enable)
+        # Non-param widgets (live outside the ParameterTree): mode combo, Cores
+        # spinbox + label, Advanced button.  Stop is left alone (stays enabled).
+        for name in ('processingModeCombo', 'maxCoresSpinBox', 'coresLabel',
+                     'advancedButton'):
+            w = getattr(self.ui, name, None)
+            if w is not None:
+                w.setEnabled(enable)
         # Live toggle state vs. the run lifecycle:
         if enable:
-            self._set_gi_controls_readonly(False)
             # Run finished — reset Live to off (no re-trigger) and re-enable
             # both toggles so the next run can be either live or batch.
             self.ui.liveCheckBox.blockSignals(True)
@@ -1247,10 +1296,10 @@ class imageWrangler(wranglerWidget):
             self.ui.batchCheckBox.setEnabled(True)
             # Uncheck is signal-blocked → sync the flag (see stop()).
             self.live_mode = False
+            # Re-assert per-mode widget state (cores/labels/toggles, viewer
+            # dimming) now that the run lock is lifted.
             self._on_mode_changed()
         else:
-            self._set_integration_controls_enabled(False, include_gi=False)
-            self._set_gi_controls_readonly(True)
             # Run active — keep Live clickable only for a *live* run (so it
             # can be toggled off to stop); mode toggles stay locked until the
             # run finishes.
@@ -1260,7 +1309,11 @@ class imageWrangler(wranglerWidget):
     def stylize_ParameterTree(self):
         self.tree.setStyleSheet("""
         QTreeView::item:has-children {
-            background-color: rgb(230, 230, 230); 
+            background-color: rgb(230, 230, 230);
             color: rgb(30, 30, 30);
+        }
+        QTreeView::item:has-children:disabled {
+            background-color: #3a3d4d;
+            color: #6272a4;
         }
             """)

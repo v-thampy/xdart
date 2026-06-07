@@ -3,9 +3,11 @@
 @author: walroth
 """
 # Standard library imports
+from dataclasses import dataclass
 import logging
 import os
 import time
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,12 @@ from .scan_threads import fileHandlerThread
 from .display_logic import xye_unit_from_filename
 from .display_controllers import ImageViewerController
 from ssrl_xrd_tools.io import ImageSourceKind
+from xdart.modules.frame_publication import (
+    PublicationStore,
+    publication_error_details,
+    publication_from_live_frame,
+    publication_has_2d_errors,
+)
 from ...widgets import defaultWidget
 from xdart import utils
 from xdart.utils import catch_h5py_file as catch
@@ -53,6 +61,28 @@ QItemSelectionModel = QtCore.QItemSelectionModel
 def _clear_raw_cache_for(viewer) -> None:
     """Reset hydrated-raw LRU state on real and lightweight test viewers."""
     viewer._raw_cache_order = []
+
+
+def _clear_publication_store_for(viewer) -> None:
+    """Reset publication state when present on real or lightweight viewers."""
+    store = getattr(viewer, "publication_store", None)
+    if store is not None:
+        store.clear()
+
+
+@dataclass
+class _ViewerRow:
+    """Lightweight row used by Image/XYE/NeXus viewer modes.
+
+    These rows are not live detector frames.  Keeping them distinct from
+    ``LiveFrame`` prevents browser-only state from accidentally entering
+    reduction/display paths that expect real frame caches and integration
+    results.
+    """
+
+    idx: int
+    scan_info: dict
+    nexus_preview_payload: dict | None = None
 
 
 class _LoadFramesWorker(QtCore.QObject):
@@ -147,7 +177,18 @@ class _LoadFramesWorker(QtCore.QObject):
                 if self._cancel.is_set():
                     self.cancelled.emit(self.generation)
                     return
-                file = pool.get(self.data_file)
+                try:
+                    file = pool.get(self.data_file)
+                except (FileNotFoundError, OSError) as e:
+                    # The scan file doesn't exist / can't be opened (e.g. a
+                    # default placeholder path before any scan is saved, or a
+                    # deleted file).  Bail cleanly rather than letting it reach
+                    # the top-level "crashed unexpectedly" handler.
+                    logger.debug(
+                        "load worker gen=%s: data file unavailable (%s); "
+                        "stopping", self.generation, e,
+                    )
+                    break
                 if file is None:
                     # Writer paused the pool — exit gracefully; the
                     # writer's resume() will trigger a sigUpdate
@@ -338,13 +379,13 @@ class H5Viewer(QWidget):
     def __init__(self, file_lock, local_path, dirname,
                  scan, frame, frame_ids, frames,
                  data_1d, data_2d,
-                 parent=None, data_lock=None):
+                 parent=None, data_lock=None, publication_store=None):
         super().__init__(parent)
         import threading as _threading
         self.data_lock = data_lock if data_lock is not None else _threading.RLock()
         self._init_data_objects(file_lock, local_path, dirname,
                                 scan, frame, frame_ids, frames,
-                                data_1d, data_2d)
+                                data_1d, data_2d, publication_store)
         self._init_ui()
         self._init_toolbar()
         self._connect_signals()
@@ -354,7 +395,7 @@ class H5Viewer(QWidget):
 
     def _init_data_objects(self, file_lock, local_path, dirname,
                            scan, frame, frame_ids, frames,
-                           data_1d, data_2d):
+                           data_1d, data_2d, publication_store):
         """Initialize data references and state flags."""
         self.local_path = local_path
         self.file_lock = file_lock
@@ -365,6 +406,9 @@ class H5Viewer(QWidget):
         self.frames = frames
         self.data_1d = data_1d
         self.data_2d = data_2d
+        self.publication_store = (
+            publication_store if publication_store is not None else PublicationStore()
+        )
         self.new_scan = True
         self.update_2d = True
         self.auto_last = True
@@ -384,8 +428,51 @@ class H5Viewer(QWidget):
         self.ui = Ui_Form()
         self.ui.setupUi(self)
         self.layout = self.ui.gridLayout
+        self._add_refresh_button()
         self.defaultWidget = defaultWidget()
         self.defaultWidget.sigSetUserDefaults.connect(self.set_user_defaults)
+        self._apply_frames_panel_width(None)
+
+    def _add_refresh_button(self):
+        """Add a Refresh button to the left of Show All / Auto Last.
+
+        It re-reads the current directory listing (``update_scans``) — handy in
+        Image/XYE Viewer modes where new files may be written outside xdart
+        while a run is in progress.  The three buttons are reflowed into one
+        row so Refresh sits to the left of the existing two.
+        """
+        self.ui.refresh = QtWidgets.QPushButton('Refresh')
+        self.ui.refresh.setObjectName('refresh')
+        self.ui.refresh.setMaximumSize(QtCore.QSize(16777215, 25))
+
+        btn_row = QtWidgets.QWidget()
+        # Constrain the row to the button height so it doesn't steal vertical
+        # stretch from the lists splitter above (which would leave the buttons
+        # floating in the middle of the panel).
+        btn_row.setFixedHeight(25)
+        btn_row.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        btn_layout = QtWidgets.QHBoxLayout(btn_row)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(self.ui.gridLayout.horizontalSpacing())
+        # Move the existing buttons out of the grid into the row.
+        self.ui.gridLayout.removeWidget(self.ui.show_all)
+        self.ui.gridLayout.removeWidget(self.ui.auto_last)
+        btn_layout.addWidget(self.ui.refresh)
+        btn_layout.addWidget(self.ui.show_all)
+        btn_layout.addWidget(self.ui.auto_last)
+        self.ui.gridLayout.addWidget(btn_row, 3, 0, 1, 2)
+
+    def refresh_directory(self):
+        """Re-read the current directory's file listing (Refresh button).
+
+        Repopulates ``listScans`` from ``self.dirname``; ``update_scans``
+        preserves the XYE-overlay selection so a refresh mid-compare doesn't
+        drop the user's selected files.
+        """
+        self.update_scans()
 
     def _init_toolbar(self):
         """Create toolbar with File and Config menus."""
@@ -468,6 +555,7 @@ class H5Viewer(QWidget):
             self.ui.listData, lambda: self._plot_method)
         self.ui.listData.viewport().installEventFilter(self._list_click_filter)
         self.ui.show_all.clicked.connect(self.show_all)
+        self.ui.refresh.clicked.connect(self.refresh_directory)
         self.actionOpenFolder.triggered.connect(self.open_folder)
         self.actionSaveDataAs.triggered.connect(self.save_data_as)
         self.actionNewFile.triggered.connect(self.new_file)
@@ -487,7 +575,7 @@ class H5Viewer(QWidget):
         self._plot_method = plot_method
         if plot_method == 'Single' and prev_method != 'Single':
             lw = self.ui.listData
-            current = lw.currentItem()
+            current = lw.currentItem() if hasattr(lw, 'currentItem') else None
             selected = lw.selectedItems()
             if len(selected) > 1:
                 lw.blockSignals(True)
@@ -499,7 +587,10 @@ class H5Viewer(QWidget):
                         lw.setCurrentItem(keep)
                 finally:
                     lw.blockSignals(False)
-                self.data_changed()
+            # Always refresh frame_ids when leaving an accumulating mode.  The
+            # visible plot can otherwise rebuild from the old Overlay selection
+            # until another frame click arrives.
+            self.data_changed()
 
     def _init_file_thread(self):
         """Create and start the background file handler thread."""
@@ -544,32 +635,24 @@ class H5Viewer(QWidget):
         self._update_coalesce_timer.timeout.connect(self.sigUpdate.emit)
         
     def load_starting_defaults(self):
-        default_path = os.path.join(self.local_path, "last_defaults.json")
+        default_path = os.path.join(utils.get_config_dir(), "last_defaults.json")
         if os.path.exists(default_path):
             self.defaultWidget.load_defaults(fname=default_path)
         else:
             self.defaultWidget.save_defaults(fname=default_path)
 
     def set_user_defaults(self):
-        default_path = os.path.join(self.local_path, "last_defaults.json")
+        default_path = os.path.join(utils.get_config_dir(), "last_defaults.json")
         self.defaultWidget.save_defaults(fname=default_path)
 
     def update(self):
-        """Calls both update_scans and update_data.
-        """
-        # self.update_scans()
+        """Refresh the current file/frame selection."""
         self.update_data()
-
-        # Restore session
-        session = load_session()
-        saved_dir = session.get('data_dir', '')
-        if saved_dir and os.path.isdir(saved_dir):
-            self.dirname = saved_dir
-            self.update_scans()
 
     # File extensions for viewer modes
     _IMAGE_EXTS = {'.tif', '.tiff', '.raw', '.edf', '.h5', '.hdf5', '.nxs'}
     _XYE_EXTS = {'.xye'}
+    _NEXUS_EXTS = {'.h5', '.hdf5', '.nxs'}
 
     @staticmethod
     def _natural_sort_key(text):
@@ -582,6 +665,7 @@ class H5Viewer(QWidget):
         In normal mode, shows HDF5 files and directories.
         In image viewer mode, shows image files and directories.
         In xye viewer mode, shows xye files and directories.
+        In nexus viewer mode, shows HDF5/NeXus files and directories.
         """
         if not os.path.exists(self.dirname):
             return
@@ -589,6 +673,21 @@ class H5Viewer(QWidget):
         lw = self.ui.listScans
         was_blocked = lw.blockSignals(True)
         try:
+            # XYE overlay is built by modifier-free multi-select; during a live
+            # run new .xye files keep arriving and repopulate this list.  Capture
+            # the current selection by name so we can restore it after the
+            # rebuild — otherwise the overlay resets every time a file is written
+            # (the crux of the real-time compare/track workflow).
+            preserve_selection = self.viewer_mode == 'xye'
+            selected_names = (
+                {item.text() for item in lw.selectedItems()}
+                if preserve_selection else set()
+            )
+            current_name = (
+                lw.currentItem().text()
+                if preserve_selection and lw.currentItem() is not None else None
+            )
+
             lw.clear()
             lw.addItem('..')
 
@@ -605,10 +704,23 @@ class H5Viewer(QWidget):
                     elif self.viewer_mode == 'xye':
                         if ext in self._XYE_EXTS:
                             lw.addItem(name)
+                    elif self.viewer_mode == 'nexus':
+                        if ext in self._NEXUS_EXTS:
+                            lw.addItem(name)
                     else:
                         # Normal mode: only HDF5/NeXus scan files
                         if name.split('.')[-1] in ('h5', 'hdf5', 'nxs'):
                             lw.addItem(name)
+
+            # Restore the prior multi-selection by name (signals stay blocked, so
+            # this doesn't re-trigger a load — the already-loaded curves remain).
+            if selected_names:
+                for row in range(lw.count()):
+                    item = lw.item(row)
+                    if item.text() in selected_names:
+                        item.setSelected(True)
+                    if item.text() == current_name:
+                        lw.setCurrentItem(item, QItemSelectionModel.NoUpdate)
         finally:
             lw.blockSignals(was_blocked)
 
@@ -627,6 +739,31 @@ class H5Viewer(QWidget):
         if last_row >= 0:
             lw.setCurrentRow(last_row, QItemSelectionModel.ClearAndSelect)
         return last_row
+
+    def select_most_recent_scan_entry(self):
+        """Select the most recently *modified* data-file entry in listScans.
+
+        ``select_last_scan_entry`` picks the name-last row, but the file that
+        was saved last isn't necessarily name-last (mixed prefixes, or files
+        left over from earlier runs that sort later).  Pick by mtime so the
+        final pattern just written is the one selected; among files with the
+        same mtime (a batch flush writes them together) the name-last one
+        (highest frame number) wins.  Returns the selected row, or -1."""
+        lw = self.ui.listScans
+        best_row, best_mtime = -1, None
+        for row in range(lw.count()):
+            text = lw.item(row).text()
+            if text == '..' or text.endswith('/'):
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(self.dirname, text))
+            except OSError:
+                continue
+            if best_mtime is None or mtime >= best_mtime:
+                best_mtime, best_row = mtime, row
+        if best_row >= 0:
+            lw.setCurrentRow(best_row, QItemSelectionModel.ClearAndSelect)
+        return best_row
 
     # ── Selection helper ──────────────────────────────────────────────
     def set_current_frame(self, item_or_row):
@@ -949,6 +1086,9 @@ class H5Viewer(QWidget):
             if self.viewer_mode == 'image':
                 self._load_image_file(fpath)
                 return
+            if self.viewer_mode == 'nexus':
+                self._load_nexus_file(fpath)
+                return
 
             # ── Normal mode: open HDF5 scan ───────────────────────────
             self.set_file(fpath)
@@ -972,6 +1112,7 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.data_1d.clear()
             self.data_2d.clear()
+            _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
         self.frame_ids.clear()
 
@@ -989,9 +1130,9 @@ class H5Viewer(QWidget):
                 continue
 
             # xdart XYE exports encode the integration unit in the prefix
-            # (iq → q_A^-1, itth → 2th_deg); other files are 'unknown' and
-            # are labelled plain 'x' downstream, never an assumed 2θ.  Stage 4:
-            # single source of truth is the pure xye_unit_from_filename.
+            # (iq → q_A^-1, itth → 2th_deg); unprefixed files default to Q,
+            # never an assumed 2θ.  The single source of truth is the pure
+            # xye_unit_from_filename.
             unit = xye_unit_from_filename(fpath)
 
             int_1d = IntegrationResult1D(
@@ -1030,6 +1171,474 @@ class H5Viewer(QWidget):
 
         self.sigUpdate.emit()
 
+    def _load_nexus_file(self, fpath):
+        """Inspect a NeXus/HDF5 file without loading large arrays."""
+        from ssrl_xrd_tools.io import inspect_nexus
+
+        with self.data_lock:
+            self.data_1d.clear()
+            self.data_2d.clear()
+            _clear_publication_store_for(self)
+            _clear_raw_cache_for(self)
+        self.frame_ids.clear()
+        was_blocked = self.ui.listData.blockSignals(True)
+        try:
+            self.ui.listData.clear()
+        finally:
+            self.ui.listData.blockSignals(was_blocked)
+
+        try:
+            summary = inspect_nexus(fpath, max_depth=4, max_children=300)
+        except Exception as exc:
+            logger.warning("Could not inspect NeXus file %s: %s", fpath, exc)
+            self.ui.labelCurrent.setText(os.path.basename(fpath))
+            self._remember_displayed_frames()
+            self.sigUpdate.emit()
+            return
+
+        rows = self._nexus_summary_rows(summary)
+        self._viewer_nexus_path = fpath
+        self._viewer_nexus_summary = summary
+
+        with self.data_lock:
+            for row_id, (label, info) in enumerate(rows, start=1):
+                scan_info = dict(info)
+                scan_info.setdefault("source_file", os.path.basename(fpath))
+                self.data_1d[row_id] = _ViewerRow(
+                    idx=row_id,
+                    scan_info=scan_info,
+                )
+
+        was_blocked = self.ui.listData.blockSignals(True)
+        try:
+            self.ui.listData.clear()
+            initial_row = None
+            for row, (_label, info) in enumerate(rows):
+                if info.get("nexus_preview_kind") in ("plot_1d", "image_2d"):
+                    initial_row = row
+                    break
+            if initial_row is None and rows:
+                initial_row = 0
+
+            for row_id, (label, _info) in enumerate(rows, start=1):
+                item = QtWidgets.QListWidgetItem(str(label))
+                item.setData(QtCore.Qt.UserRole, row_id)
+                self.ui.listData.addItem(item)
+            if initial_row is not None:
+                self.ui.listData.setCurrentRow(initial_row)
+                self.frame_ids.append(str(initial_row + 1))
+        finally:
+            self.ui.listData.blockSignals(was_blocked)
+
+        self._refresh_nexus_selected_preview(self.frame_ids)
+        self.ui.labelCurrent.setText(os.path.basename(fpath))
+        self._remember_displayed_frames()
+        self.sigUpdate.emit()
+
+    def _refresh_nexus_selected_preview(self, idxs):
+        """Attach a bounded dataset preview to the selected NeXus row."""
+        if not idxs:
+            return
+        try:
+            row_id = int(idxs[0])
+        except (TypeError, ValueError):
+            return
+        viewer_path = getattr(self, "_viewer_nexus_path", None)
+        if not viewer_path:
+            return
+        with self.data_lock:
+            frame = self.data_1d.get(row_id)
+        if frame is None:
+            return
+        info = dict(getattr(frame, "scan_info", None) or {})
+        dataset_path = info.get("dataset_path")
+        if not dataset_path:
+            return
+        frame.nexus_preview_payload = None
+        try:
+            preview = self._load_nexus_preview_payload(viewer_path, info)
+        except Exception as exc:
+            info["preview_error"] = str(exc)
+        else:
+            payload, preview_info = preview
+            frame.nexus_preview_payload = payload
+            info.update(preview_info)
+        frame.scan_info = info
+
+    def _load_nexus_preview_payload(self, viewer_path, info):
+        from ssrl_xrd_tools.io import preview_nexus_dataset, read_nexus_dataset
+
+        dataset_path = info["dataset_path"]
+        shape = tuple(info.get("_shape") or ())
+        preview_kind = info.get("nexus_preview_kind")
+        attrs = dict(info.get("_attrs") or {})
+        label = (
+            attrs.get("long_name")
+            or attrs.get("description")
+            or attrs.get("title")
+            or os.path.basename(str(dataset_path))
+        )
+
+        if preview_kind == "plot_1d":
+            data_selection, axis_sel = self._nexus_1d_selection(shape)
+            data = read_nexus_dataset(
+                viewer_path, dataset_path, selection=data_selection,
+            )
+            y = np.asarray(data.data, dtype=float).ravel()
+            x, x_label, x_unit = self._nexus_axis_values(
+                viewer_path,
+                info.get("x_axis_path"),
+                y.size,
+                info.get("x_label") or "index",
+                info.get("x_unit") or "",
+                axis_selection=axis_sel,
+            )
+            if x.shape != y.shape:
+                x = np.arange(y.size, dtype=float)
+                x_label, x_unit = "index", ""
+            payload = {
+                "kind": "plot_1d",
+                "x": x,
+                "y": y,
+                "x_label": x_label,
+                "x_unit": x_unit,
+                "y_label": info.get("y_label") or str(label),
+                "y_unit": info.get("y_unit") or str(attrs.get("units") or ""),
+                "label": str(label),
+            }
+            preview_info = {
+                "preview_selection": data.selection,
+                "preview_truncated": bool(
+                    self._nexus_selection_truncated(shape, data_selection)
+                ),
+                "preview": self._nexus_value(data.data, max_len=800),
+            }
+            return payload, preview_info
+
+        if preview_kind == "image_2d":
+            data_selection, row_sel, col_sel = self._nexus_2d_selection(shape)
+            data = read_nexus_dataset(
+                viewer_path, dataset_path, selection=data_selection,
+            )
+            image = np.asarray(data.data, dtype=float)
+            if image.ndim != 2:
+                image = np.squeeze(image)
+            if image.ndim != 2:
+                raise ValueError(f"Cannot preview {dataset_path}: expected 2D slice")
+            x, x_label, x_unit = self._nexus_axis_values(
+                viewer_path,
+                info.get("x_axis_path"),
+                image.shape[1],
+                info.get("x_label") or "x",
+                info.get("x_unit") or "",
+                axis_selection=col_sel,
+            )
+            y, y_label, y_unit = self._nexus_axis_values(
+                viewer_path,
+                info.get("y_axis_path"),
+                image.shape[0],
+                info.get("y_label") or "y",
+                info.get("y_unit") or "",
+                axis_selection=row_sel,
+            )
+            payload = {
+                "kind": "image_2d",
+                "image": image,
+                "x": x,
+                "y": y,
+                "x_label": x_label,
+                "x_unit": x_unit,
+                "y_label": y_label,
+                "y_unit": y_unit,
+                "label": str(label),
+            }
+            preview_info = {
+                "preview_selection": data.selection,
+                "preview_truncated": bool(self._nexus_selection_truncated(shape, data_selection)),
+                "preview": self._nexus_value(data.data, max_len=800),
+            }
+            return payload, preview_info
+
+        preview = preview_nexus_dataset(viewer_path, dataset_path, max_items=64)
+        return None, {
+            "preview_selection": preview.selection,
+            "preview_truncated": bool(preview.truncated),
+            "preview": self._nexus_value(preview.data, max_len=800),
+        }
+
+    @staticmethod
+    def _nexus_1d_selection(shape, *, max_points=8192):
+        """Bounded selection for the 1D GUI preview.
+
+        Strides a long 1D axis down to ``<= max_points`` so a generic NeXus
+        file's huge 1D dataset can't freeze the GUI; xdart's ~2000-pt curves
+        read whole (stride 1).  Returns ``(data_selection, axis_selection)``
+        so the x-axis is strided the same way (matching lengths).  The
+        headless ``read_nexus_dataset`` (called without a selection) still
+        reads in full — only this GUI preview path downsamples.
+        """
+        n = int(shape[-1]) if shape else 0
+        stride = max(1, math.ceil(n / max_points)) if n > max_points else 1
+        # Stride 1 stays a plain ``:`` (full read) so short xdart curves are
+        # unchanged; only an oversized axis gets a strided slice.
+        axis_sel = slice(None) if stride == 1 else slice(None, None, stride)
+        if len(shape) <= 1:
+            return axis_sel, axis_sel
+        return tuple(0 for _ in range(len(shape) - 1)) + (axis_sel,), axis_sel
+
+    @staticmethod
+    def _nexus_2d_selection(shape, *, max_pixels=262144):
+        if len(shape) < 2:
+            raise ValueError("2D preview needs at least two dataset dimensions")
+        rows, cols = int(shape[-2]), int(shape[-1])
+        stride = max(1, int(math.ceil(math.sqrt(max(1, rows * cols) / max_pixels))))
+        row_sel = slice(None, None, stride)
+        col_sel = slice(None, None, stride)
+        return (
+            tuple(0 for _ in range(len(shape) - 2)) + (row_sel, col_sel),
+            row_sel,
+            col_sel,
+        )
+
+    @staticmethod
+    def _nexus_selection_truncated(shape, selection):
+        if not isinstance(selection, tuple):
+            selection = (selection,)
+        if len(selection) != len(shape):
+            return True
+        for sel, dim in zip(selection, shape):
+            if isinstance(sel, slice):
+                start, stop, step = sel.indices(dim)
+                if start != 0 or stop != dim or step != 1:
+                    return True
+            elif dim != 1:
+                return True
+        return False
+
+    def _nexus_axis_values(
+        self,
+        viewer_path,
+        axis_path,
+        length,
+        label,
+        unit,
+        *,
+        axis_selection=None,
+    ):
+        if not axis_path:
+            return np.arange(length, dtype=float), label, unit
+        try:
+            from ssrl_xrd_tools.io import read_nexus_dataset
+            selection = axis_selection if axis_selection is not None else np.s_[:]
+            axis = read_nexus_dataset(viewer_path, axis_path, selection=selection)
+            values = np.asarray(axis.data, dtype=float).ravel()
+            attrs = dict(axis.attrs)
+            label = (
+                attrs.get("long_name")
+                or attrs.get("description")
+                or attrs.get("title")
+                or label
+            )
+            unit = attrs.get("units") or unit
+        except Exception:
+            logger.debug("Could not load NeXus axis %s", axis_path, exc_info=True)
+            values = np.arange(length, dtype=float)
+        return values, str(label), str(unit or "")
+
+    def _nexus_summary_rows(self, summary):
+        rows = []
+        path = getattr(summary, "path", "")
+        xdart = getattr(summary, "xdart", None)
+        rows.append((
+            "File summary",
+            {
+                "kind": "file",
+                "path": path,
+                "entries": ", ".join(getattr(summary, "entries", ()) or ()),
+                "processed_xdart": bool(getattr(xdart, "is_processed", False)),
+            },
+        ))
+        if xdart is not None:
+            rows.extend(self._nexus_xdart_rows(xdart))
+        rows.extend(self._nexus_tree_rows(getattr(summary, "tree", None)))
+        return rows
+
+    def _nexus_xdart_rows(self, xdart):
+        rows = []
+        if xdart.integrated_1d is not None:
+            rows.append((
+                "Integrated 1D",
+                self._nexus_reduced_info(xdart.integrated_1d),
+            ))
+        if xdart.integrated_2d is not None:
+            info = self._nexus_reduced_info(xdart.integrated_2d)
+            info["two_d_kind"] = getattr(xdart.integrated_2d.two_d_kind, "value", None)
+            rows.append(("Integrated 2D", info))
+        rows.append((
+            "Scan metadata",
+            {
+                "kind": "scan_data",
+                "columns": ", ".join(xdart.scan_data_columns),
+                "frame_labels": self._nexus_value(xdart.frame_labels),
+            },
+        ))
+        if xdart.geometry_columns:
+            rows.append((
+                "Per-frame geometry",
+                {
+                    "kind": "per_frame_geometry",
+                    "columns": ", ".join(xdart.geometry_columns),
+                },
+            ))
+        if xdart.thumbnail_count or xdart.source_count:
+            rows.append((
+                "Frame records",
+                {
+                    "kind": "frames",
+                    "frame_count": len(xdart.frame_labels),
+                    "thumbnail_count": xdart.thumbnail_count,
+                    "source_count": xdart.source_count,
+                },
+            ))
+        if xdart.raw_image_dataset:
+            shape = tuple(xdart.raw_image_shape or ())
+            rank = len(shape)
+            preview_kind = "image_2d" if rank >= 2 else None
+            rows.append((
+                "Raw detector dataset",
+                {
+                    "kind": "raw_dataset",
+                    "dataset_path": xdart.raw_image_dataset,
+                    "_shape": shape,
+                    "shape": self._nexus_value(shape),
+                    "dtype": xdart.raw_image_dtype or "",
+                    "nexus_preview_kind": preview_kind,
+                    "x_label": "column",
+                    "y_label": "row",
+                    "z_label": "Detector intensity",
+                },
+            ))
+        return rows
+
+    def _nexus_reduced_info(self, reduced):
+        axes = [
+            f"{axis.name} {axis.shape}"
+            + (f" [{axis.units}]" if axis.units else "")
+            for axis in reduced.axes
+        ]
+        axis_by_name = {axis.name: axis for axis in reduced.axes}
+        intensity_shape = tuple(reduced.intensity_shape or ())
+        info = {
+            "kind": "reduced_stack",
+            "path": reduced.path,
+            "dataset_path": f"{reduced.path}/intensity",
+            "_shape": intensity_shape,
+            "frame_count": reduced.frame_count,
+            "frame_labels": self._nexus_value(reduced.frame_labels),
+            "intensity_shape": self._nexus_value(intensity_shape),
+            "axes": "; ".join(axes),
+            "y_label": "Intensity",
+        }
+        if len(reduced.axes) == 1:
+            q_axis = reduced.axes[0]
+            info.update({
+                "nexus_preview_kind": "plot_1d",
+                "x_axis_path": q_axis.path,
+                "x_label": q_axis.name,
+                "x_unit": q_axis.units or "",
+            })
+        elif len(reduced.axes) >= 2:
+            q_axis = axis_by_name.get("q") or reduced.axes[-1]
+            chi_axis = axis_by_name.get("chi") or reduced.axes[-2]
+            info.update({
+                "nexus_preview_kind": "image_2d",
+                "x_axis_path": q_axis.path,
+                "x_label": q_axis.name,
+                "x_unit": q_axis.units or "",
+                "y_axis_path": chi_axis.path,
+                "y_label": chi_axis.name,
+                "y_unit": chi_axis.units or "",
+            })
+        return info
+
+    def _nexus_tree_rows(self, root, *, max_nodes=200):
+        if root is None:
+            return []
+        rows = []
+
+        def walk(node, depth=0):
+            if len(rows) >= max_nodes:
+                return
+            if getattr(node, "path", "/") != "/":
+                prefix = "  " * max(0, depth - 1)
+                shape = getattr(node, "shape", None)
+                dtype = getattr(node, "dtype", None)
+                suffix = ""
+                if shape is not None:
+                    suffix = f" {shape}"
+                    if dtype:
+                        suffix += f" {dtype}"
+                label = f"{prefix}{getattr(node, 'path', '')}{suffix}"
+                info = {
+                    "kind": getattr(node, "kind", ""),
+                    "path": getattr(node, "path", ""),
+                    "shape": self._nexus_value(shape),
+                    "_shape": tuple(shape or ()),
+                    "dtype": dtype or "",
+                    "nx_class": getattr(node, "nx_class", None) or "",
+                    "attrs": self._nexus_value(getattr(node, "attrs", {})),
+                    "_attrs": dict(getattr(node, "attrs", {}) or {}),
+                }
+                if getattr(node, "kind", "") == "dataset":
+                    info["dataset_path"] = getattr(node, "path", "")
+                    rank = len(tuple(shape or ()))
+                    if rank == 1:
+                        info["nexus_preview_kind"] = "plot_1d"
+                        info["x_label"] = "index"
+                        attrs = dict(getattr(node, "attrs", {}) or {})
+                        info["y_label"] = (
+                            attrs.get("long_name")
+                            or attrs.get("description")
+                            or attrs.get("title")
+                            or getattr(node, "name", "")
+                            or "value"
+                        )
+                        info["y_unit"] = attrs.get("units", "")
+                    elif rank >= 2:
+                        info["nexus_preview_kind"] = "image_2d"
+                        attrs = dict(getattr(node, "attrs", {}) or {})
+                        info["x_label"] = "column"
+                        info["y_label"] = "row"
+                        info["z_label"] = (
+                            attrs.get("long_name")
+                            or attrs.get("description")
+                            or attrs.get("title")
+                            or getattr(node, "name", "")
+                            or "value"
+                        )
+                        info["z_unit"] = attrs.get("units", "")
+                if getattr(node, "error", None):
+                    info["error"] = node.error
+                rows.append((label, info))
+            for child in getattr(node, "children", ()):
+                walk(child, depth + 1)
+
+        walk(root)
+        return rows
+
+    @staticmethod
+    def _nexus_value(value, *, max_len=240):
+        value = "" if value is None else value
+        if isinstance(value, dict):
+            text = ", ".join(f"{k}={v}" for k, v in value.items())
+        elif isinstance(value, (list, tuple)):
+            text = ", ".join(str(v) for v in value)
+        else:
+            text = str(value)
+        if len(text) > max_len:
+            return text[: max_len - 3] + "..."
+        return text
+
     def _load_image_file(self, fpath):
         """Load an image file for viewing.
 
@@ -1040,6 +1649,7 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.data_1d.clear()
             self.data_2d.clear()
+            _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
         self.frame_ids.clear()
         was_blocked = self.ui.listData.blockSignals(True)
@@ -1084,6 +1694,18 @@ class H5Viewer(QWidget):
                 '%s is an xdart processed file without v2 raw-frame '
                 'source pointers; Image Viewer cannot treat it as a raw '
                 'detector image stack.',
+                os.path.basename(fpath),
+            )
+            self._viewer_image_path = None
+            self._viewer_image_nframes = 0
+            self._remember_displayed_frames()
+            self.sigUpdate.emit()
+            return
+
+        if (ext in ('.h5', '.hdf5', '.nxs')
+                and self._viewer_source_info.kind is ImageSourceKind.UNKNOWN):
+            logger.warning(
+                '%s is not a viewable image or xdart processed scan.',
                 os.path.basename(fpath),
             )
             self._viewer_image_path = None
@@ -1201,9 +1823,25 @@ class H5Viewer(QWidget):
                     'gi_2d': {},
                     'thumbnail': thumb_data,
                 }
-                frame = LiveFrame(idx=frame_id, static=True, gi=False)
-                frame.scan_info = {'source_file': os.path.basename(fpath)}
+                frame = LiveFrame(
+                    idx=frame_id,
+                    map_raw=img_data,
+                    static=True,
+                    gi=False,
+                    scan_info={'source_file': os.path.basename(fpath)},
+                )
+                frame.thumbnail = thumb_data
+                frame.source_file = fpath
+                frame.source_frame_idx = frame_id
                 self.data_1d[int(frame_id)] = frame
+                store = getattr(self, "publication_store", None)
+                if store is not None:
+                    store.upsert(
+                        publication_from_live_frame(
+                            frame,
+                            generation=store.generation,
+                        )
+                    )
             logger.debug(
                 'Image Viewer loaded processed frame %s from %s via %s: '
                 'shape=%s finite=%d',
@@ -1241,9 +1879,24 @@ class H5Viewer(QWidget):
                 'thumbnail': None,
             }
             # Minimal data_1d entry so display doesn't crash
-            frame = LiveFrame(idx=frame_id, static=True, gi=False)
-            frame.scan_info = {'source_file': os.path.basename(fpath)}
+            frame = LiveFrame(
+                idx=frame_id,
+                map_raw=img_data,
+                static=True,
+                gi=False,
+                scan_info={'source_file': os.path.basename(fpath)},
+            )
+            frame.source_file = fpath
+            frame.source_frame_idx = frame_idx
             self.data_1d[int(frame_id)] = frame
+            store = getattr(self, "publication_store", None)
+            if store is not None:
+                store.upsert(
+                    publication_from_live_frame(
+                        frame,
+                        generation=store.generation,
+                    )
+                )
         logger.debug(
             'Image Viewer loaded frame %s from %s: shape=%s finite=%d '
             'min=%s max=%s',
@@ -1314,6 +1967,12 @@ class H5Viewer(QWidget):
                 self.frame_ids += sorted(
                     [str(item.data(QtCore.Qt.UserRole)) for item in items
                      if item.data(QtCore.Qt.UserRole) is not None])
+            elif self.viewer_mode == 'nexus':
+                # NeXus viewer rows are schema/preview records, not scan
+                # frame labels; keep their stable numeric ids in UserRole.
+                self.frame_ids += sorted(
+                    [str(item.data(QtCore.Qt.UserRole)) for item in items
+                     if item.data(QtCore.Qt.UserRole) is not None])
             else:
                 self.frame_ids += sorted([str(item.text()) for item in items])
             idxs = self.frame_ids
@@ -1352,6 +2011,12 @@ class H5Viewer(QWidget):
 
         # ── XYE viewer: data already loaded by scans_clicked ─────────
         if self.viewer_mode == 'xye':
+            self.sigUpdate.emit()
+            return
+
+        # ── NeXus viewer: metadata row already loaded; refresh preview ─
+        if self.viewer_mode == 'nexus':
+            self._refresh_nexus_selected_preview(idxs)
             self.sigUpdate.emit()
             return
 
@@ -1417,6 +2082,7 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.data_1d.clear()
             self.data_2d.clear()
+            _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
         self.new_scan = True
 
@@ -1435,6 +2101,7 @@ class H5Viewer(QWidget):
             with self.data_lock:
                 self.data_1d.clear()
                 self.data_2d.clear()
+                _clear_publication_store_for(self)
                 _clear_raw_cache_for(self)
             self.new_scan = True
             self.update_scans()
@@ -1494,6 +2161,14 @@ class H5Viewer(QWidget):
         """
         if not frame_ids:
             return
+        data_file = getattr(self.scan, 'data_file', None)
+        if not data_file or not os.path.exists(os.fspath(data_file)):
+            logger.debug(
+                "Skipping background frame load; data file is unavailable: %s",
+                data_file,
+            )
+            self.cancel_pending_loads()
+            return
         # Deterministically retire any in-flight worker BEFORE we drop our
         # refs to it: cancel + quit + bounded wait so its event loop runs
         # the worker's deleteLater and exits.  Dropping the ref without this
@@ -1509,7 +2184,7 @@ class H5Viewer(QWidget):
         self._load_generation += 1
         gen = self._load_generation
         worker = _LoadFramesWorker(
-            data_file=self.scan.data_file,
+            data_file=data_file,
             file_lock=self.file_lock,
             gi=self.scan.gi,
             frame_ids=frame_ids,
@@ -1571,21 +2246,36 @@ class H5Viewer(QWidget):
             )
             return
         try:
+            store = getattr(self, "publication_store", None)
+            publication = publication_from_live_frame(
+                frame,
+                generation=(store.generation if store is not None else 0),
+            )
             with self.data_lock:
                 if not load_2d:
                     self.data_1d[int(idx)] = frame.copy_for_display(include_2d=False)
                 else:
                     self.data_1d[int(idx)] = frame.copy_for_display(include_2d=False)
-                    self.data_2d[int(idx)] = {
-                        'map_raw': frame.map_raw,
-                        'bg_raw': frame.bg_raw,
-                        'mask': frame.mask,
-                        'int_2d': frame.int_2d,
-                        'gi_2d': frame.gi_2d,
-                        'thumbnail': frame.thumbnail,
-                    }
-                    if frame.map_raw is not None:
-                        self._remember_hydrated_raw(int(idx))
+                    if not publication_has_2d_errors(publication):
+                        self.data_2d[int(idx)] = {
+                            'map_raw': frame.map_raw,
+                            'bg_raw': frame.bg_raw,
+                            'mask': frame.mask,
+                            'int_2d': frame.int_2d,
+                            'gi_2d': frame.gi_2d,
+                            'thumbnail': frame.thumbnail,
+                        }
+                        if frame.map_raw is not None:
+                            self._remember_hydrated_raw(int(idx))
+                    else:
+                        self.data_2d.pop(int(idx), None)
+                        logger.warning(
+                            "Skipping frame %s 2D display cache: %s",
+                            idx,
+                            publication_error_details(publication, "2d"),
+                        )
+                if store is not None:
+                    store.upsert(publication)
             # O6: coalesce display updates while a chunk burst is
             # streaming in.  Schedule (or restart) a debounced emit
             # rather than firing once per chunk.  ``_on_load_worker_finished``
@@ -1613,6 +2303,29 @@ class H5Viewer(QWidget):
         """Reset the hydrated-raw LRU after data_2d is cleared."""
         _clear_raw_cache_for(self)
 
+    def _apply_frames_panel_width(self, viewer_mode) -> None:
+        """Relax the Frames (``listData``) max width in NeXus viewer mode.
+
+        The base max width is set in the .ui (h5viewerUI, 60 px — right for
+        frame-index labels like "1"/"2").  NeXus rows are dataset-path /
+        field labels ("Integrated 1D", "Raw detector dataset") that clip at
+        60 px, so you can't tell what you're selecting.  Override the cap at
+        runtime here (not in the generated UI): unbounded in NeXus mode so
+        the splitter can size it, restored to the .ui default otherwise."""
+        lw = getattr(self.ui, "listData", None)
+        if lw is None:
+            return
+        if getattr(self, "_frames_panel_max_width", None) is None:
+            # Remember the .ui default once so we can restore it exactly.
+            self._frames_panel_max_width = lw.maximumWidth()
+        if viewer_mode == "nexus":
+            lw.setMaximumWidth(16777215)   # QWIDGETSIZE_MAX — splitter sizes it
+        else:
+            default = int(self._frames_panel_max_width)
+            if 0 < default < 16777215:
+                default = max(default, int(round(default * 1.5)))
+            lw.setMaximumWidth(default)
+
     def cancel_pending_loads(self) -> None:
         """Cancel stale background frame hydration and reject queued chunks."""
         # Bump first so any chunk still queued from the outgoing worker is
@@ -1626,6 +2339,31 @@ class H5Viewer(QWidget):
         if timer is not None and timer.isActive():
             timer.stop()
 
+    def shutdown_threads(self) -> None:
+        """Stop the persistent background threads this viewer owns so they are
+        not destroyed while running on tab/app close.
+
+        Without this the long-lived ``fileHandlerThread`` (an infinite
+        queue-driven loop in ``run()``) and the async load worker keep running
+        after the widget is torn down, which trips Qt's
+        "QThread: Destroyed while thread is still running" abort at interpreter
+        shutdown.  This is the production version of what the GUI test fixture
+        already does on teardown.  Idempotent and exception-safe.
+        """
+        try:
+            self.cancel_pending_loads()          # quit + wait the load worker
+        except Exception:
+            logger.debug("cancel_pending_loads on shutdown failed",
+                         exc_info=True)
+        ft = getattr(self, 'file_thread', None)
+        if ft is not None:
+            try:
+                if ft.isRunning():
+                    ft.queue.put(None)           # sentinel -> run() breaks
+                    ft.wait(2000)                # bounded wait
+            except Exception:
+                logger.debug("file_thread shutdown failed", exc_info=True)
+
     def enter_viewer_mode_cleanup(self) -> None:
         """Clear scan-frame state before Image/XYE viewer data is loaded."""
         self.cancel_pending_loads()
@@ -1633,6 +2371,7 @@ class H5Viewer(QWidget):
         with self.data_lock:
             self.data_1d.clear()
             self.data_2d.clear()
+            _clear_publication_store_for(self)
             self._clear_raw_cache()
         self.frame_ids.clear()
         self.latest_idx = None

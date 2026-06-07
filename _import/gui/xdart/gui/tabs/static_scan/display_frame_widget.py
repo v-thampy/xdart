@@ -50,9 +50,10 @@ from .display_data import DisplayDataMixin
 from .display_plot import DisplayPlotMixin
 from .display_logic import (
     Mode, LoadStatus, PanelRole, compute_display_state,
-    build_payload, render_plan, controller_for,
+    build_payload, render_plan, controller_for, ImagePayload,
+    empty_display_state, PANEL_LAYOUT,
     resolve_selection, resolve_render_ids,
-    xye_unit_from_filename, x_axis_for_unit, default_plot_unit,
+    default_plot_unit,
 )
 from .display_controllers import register_default_controllers
 
@@ -67,6 +68,42 @@ formats = [
     Qt.QtGui.QImageReader.supportedImageFormats()
 ]
 
+
+def _axis_key_from_label(label):
+    """Canonical key for matching plot/cake axes without relying on row order."""
+    text = str(label or '')
+    lower = text.lower()
+    if Qoop_s in text or 'qoop' in lower or 'q_oop' in lower:
+        return 'qoop_A^-1'
+    if Qip_s in text or 'qip' in lower or 'q_ip' in lower:
+        return 'qip_A^-1'
+    if 'exit' in lower:
+        return 'exit_angle_deg'
+    if '2th' in lower or f'2{Th}' in text:
+        return '2th_deg'
+    if Chi in text or 'chi' in lower:
+        return 'chi_deg'
+    if 'q' in lower or AA_inv in text:
+        return 'q_A^-1'
+    return lower.strip()
+
+
+def _combo_text(combo, index):
+    """Return item text from a real QComboBox or the lightweight test fakes."""
+    try:
+        return combo.itemText(index)
+    except AttributeError:
+        items = getattr(combo, '_items', None)
+        if items is not None and 0 <= index < len(items):
+            return items[index]
+    try:
+        current = combo.currentIndex()
+        if int(current) == int(index):
+            return combo.currentText()
+    except Exception:
+        pass
+    return ''
+
 # Switch to using white background and black foreground
 pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
@@ -78,6 +115,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # H5Viewer) use this to switch listData selection mode so accumulating
     # plot methods don't require shift/ctrl multi-select.
     sigPlotMethodChanged = Qt.QtCore.Signal(str)
+
+    # Feature flag: during a processing run, keep the last-rendered 2D panels
+    # (raw image + cake) on screen instead of blanking them when the in-flight
+    # frame's 2D data isn't available yet — so the 2D panels persist exactly
+    # like the 1D plot does (which keeps its curve).  Set False to restore the
+    # previous behavior (2D panels blank during the run).  This is the single
+    # revert switch for the panel-consistency feature.
+    PERSIST_2D_DURING_PROCESSING = True
 
     """Widget for displaying 2D image data and 1D plots from LiveScan
     objects.
@@ -119,13 +164,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     """
 
     def __init__(self, scan, frame, frame_ids, frames, data_1d, data_2d,
-                 parent=None, data_lock=None):
+                 parent=None, data_lock=None, publication_store=None):
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
         # Shared reentrant lock guarding data_1d / data_2d.  When created
         # standalone (tests, viewer mode) fall back to a private lock.
         self.data_lock = data_lock if data_lock is not None else threading.RLock()
+        self.publication_store = publication_store
         self._init_data_objects(scan, frame, frame_ids, frames, data_1d, data_2d)
         self._init_display_panes()
         self._init_plot_panes()
@@ -133,6 +179,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._init_controls()
         self._reflow_controls()
         self._set_tooltips()
+        self._set_equal_primary_panel_heights()
 
     # ── Initialization helpers ─────────────────────────────────────
 
@@ -219,6 +266,28 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                   self.ui.slice_center, self.ui.slice_width):
             w.setVisible(visible)
 
+    def _set_equal_primary_panel_heights(self):
+        """Give the 2D and 1D primary panels equal splitter space."""
+        splitter = getattr(self.ui, "splitter", None)
+        if splitter is None:
+            return
+
+        def _apply():
+            try:
+                if (
+                    self.ui.imageWindow.maximumHeight() != 0
+                    and self.ui.plotWindow.maximumHeight() != 0
+                ):
+                    splitter.setSizes([1, 1])
+            except RuntimeError:
+                pass
+
+        _apply()
+        try:
+            Qt.QtCore.QTimer.singleShot(0, _apply)
+        except RuntimeError:
+            pass
+
     def _init_data_objects(self, scan, frame, frame_ids, frames, data_1d, data_2d):
         """Initialize data references, plotting state, and index tracking."""
         self.ui.slice.setText(Chi)
@@ -247,6 +316,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.bkg_1d = 0.
         self.bkg_2d = 0.
         self.bkg_map_raw = 0.
+        self._norm_channel_map = {}
 
         # Viewer mode: None (normal), 'image', or 'xye'
         self.viewer_mode = None
@@ -263,7 +333,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # scan/file load — so a worker result computed against an old
         # generation can be dropped (full enforcement lands in Stage 5).
         self.display_generation = 0
+        # True once an empty/no-data update has blanked all panels; reset
+        # when a data render draws.  Lets update() no-op on repeated empty
+        # updates instead of re-clearing every time.
+        self._display_blanked = False
         self._last_selection_sig = None
+
+        # True while a wrangler/integrator run is in progress.  Set by
+        # staticWidget at run start, cleared at run end (incl. Stop).  Drives
+        # the PERSIST_2D_DURING_PROCESSING feature: while a run is active, the
+        # 2D panels keep their last-rendered content instead of blanking when
+        # the in-flight frame's 2D data isn't available yet.
+        self._processing_active = False
 
         # Stage 5: register the mode controllers (Scan/ImageViewer/XYEViewer)
         # into the open registry; _live_display_state dispatches through them.
@@ -277,6 +358,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._last_plot_unit = -1
         self._plot_axis_info = []  # populated by set_axes()
         self._was_skip_2d = False  # track 1D-only state for transitions
+        self._payload_x_axis_label = None
+        self._payload_y_axis_label = None
+        self._using_publication_plot_payload = False
+        self._plot_autorange_requested = False
 
         # Cached display data
         self.image_data = (None, None)
@@ -355,14 +440,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # has already happened.
         self.ui.shareAxis.toggled.connect(self._on_share_axis_toggled)
 
-        # 2D image controls
-        self.ui.imageUnit.activated.connect(self.update_binned)
+        # 2D image controls — the Q-χ / 2θ-χ toggle re-renders through the
+        # payload path (cake_image owns the on-the-fly Q↔2θ conversion now), so
+        # the cake unit is consistent on every render, not just this redraw.
+        self.ui.imageUnit.activated.connect(self.update)
         self.ui.imageUnit.activated.connect(self._update_slice_range)
 
         # 1D plot controls
         self.ui.plotMethod.currentIndexChanged.connect(self._on_plotMethod_changed)
         self.ui.yOffset.valueChanged.connect(self.update_plot_view)
         self.ui.plotUnit.activated.connect(self._on_plotUnit_changed)
+        self.ui.plotUnit.activated.connect(self.request_plot_autorange)
         self.ui.plotUnit.activated.connect(self.update_plot)
         self.ui.showLegend.toggled.connect(self.update_legend)
         self.ui.slice.toggled.connect(self._sync_slice_controls)
@@ -381,6 +469,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _init_controls(self):
         """Initialize image units, waterfall options, and preview button."""
         self.set_axes()
+        if hasattr(self, 'refresh_norm_channels'):
+            self.refresh_norm_channels()
         self._set_slice_range(initialize=True)
 
         # Waterfall options popup widgets
@@ -420,22 +510,43 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if len(self.frame_ids) == 0 or self.frame_ids[0] == 'No data':
             return
 
-        with self.data_lock:
-            with self.scan.scan_lock:
-                # Stage 1: selection logic is the pure ``resolve_selection``
-                # / ``resolve_render_ids`` (unit-tested headlessly).
-                try:
-                    ids, self.overall = resolve_selection(
-                        self.frame_ids, self.scan.frames.index)
-                except ValueError:
-                    return
+        if self.viewer_mode is not None:
+            # Viewer modes (image/xye/nexus) are file browsers: the loaded
+            # ``frame_ids`` ARE the selection and must never be resolved
+            # against the integration scan's frame index (§8 invariant —
+            # viewer controllers never consult ``scan.frames``).  That index
+            # may be stale-populated from a prior run; in particular, opening
+            # the SAME file in Image Viewer that was just integrated via an
+            # Int 1D (XYE) batch makes ``len(frame_ids) == len(scan.frames)``,
+            # which flips ``resolve_selection``'s ``overall`` heuristic True
+            # and rebases ``ids`` onto the stale scan labels.  Those don't
+            # intersect the viewer's loaded data keys, so ``idxs`` come back
+            # empty and the panel renders blank.
+            try:
+                ids = tuple(sorted(int(i) for i in self.frame_ids))
+            except (TypeError, ValueError):
+                return
+            self.overall = False
+            with self.data_lock:
+                data_1d_keys = set(self.data_1d.keys())
+                data_2d_keys = set(self.data_2d.keys())
+        else:
+            with self.data_lock:
+                with self.scan.scan_lock:
+                    # Stage 1: selection logic is the pure ``resolve_selection``
+                    # / ``resolve_render_ids`` (unit-tested headlessly).
+                    try:
+                        ids, self.overall = resolve_selection(
+                            self.frame_ids, self.scan.frames.index)
+                    except ValueError:
+                        return
 
-            self.idxs = list(ids)
-            # Snapshot current dict keys while the lock is held, then release
-            # before doing list-comprehension work.
-            data_1d_keys = set(self.data_1d.keys())
-            data_2d_keys = set(self.data_2d.keys())
+                # Snapshot current dict keys while the lock is held, then
+                # release before doing list-comprehension work.
+                data_1d_keys = set(self.data_1d.keys())
+                data_2d_keys = set(self.data_2d.keys())
 
+        self.idxs = list(ids)
         # ``ids`` is already the effective set (all-or-selected), so intersect
         # it directly with the loaded keys for each panel.
         self.idxs_1d = list(resolve_render_ids(ids, False, (), data_1d_keys))
@@ -472,6 +583,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return Mode.IMAGE_VIEWER
         if self.viewer_mode == 'xye':
             return Mode.XYE_VIEWER
+        if self.viewer_mode == 'nexus':
+            return Mode.NEXUS_VIEWER
         if getattr(self.scan, 'skip_2d', False):
             return Mode.INT_1D
         return Mode.INT_2D
@@ -504,6 +617,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 return False
             if self.viewer_mode == 'xye' and len(self.data_1d) == 0:
                 return False
+            if self.viewer_mode == 'nexus' and len(self.data_1d) == 0:
+                return False
             return True
 
         if (len(self.frame_ids) == 0) or (self.scan.name == 'null_main'):
@@ -522,16 +637,46 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         ``layout`` and draws-or-clears each — no ``if viewer_mode == ...``
         dispatch here.
         """
+        if hasattr(self, 'refresh_norm_channels'):
+            self.refresh_norm_channels()
         self.get_idxs()
         self._note_selection_generation()   # bump generation on selection change
 
         if not self._updated():
-            return True
+            # Nothing to draw yet for the current selection.  Only render the
+            # EXPLICIT blank when there is genuinely nothing cached — a fresh
+            # file, a cleared scan, or a failed load with no fallback.  When
+            # prior-scan / other-frame data is still cached (a new-scan gap, or
+            # a not-yet-loaded selection whose load is in flight), keep the
+            # current display instead of flashing blank; the imminent real
+            # render replaces it.  Kills the blank flicker at scan start and on
+            # frame selection without leaving stale content when there is
+            # truly nothing to show.
+            if getattr(self, "_display_blanked", False):
+                return True
+            with self.data_lock:
+                has_cached = bool(self.data_1d) or bool(self.data_2d)
+            # Panel-consistency: while a run is active, keep the current display
+            # instead of blanking when there's nothing new to draw.  A silent
+            # batch run populates the GUI caches only at the end, so without this
+            # the empty-render path blanks all panels mid-run (2D goes blank, and
+            # clear_plot_view drops the 1D legend) — the inconsistency Vivek saw.
+            # Keeping the display freezes ALL panels (1D + 2D) until the run's
+            # data lands, so they persist together.
+            if has_cached or (getattr(self, 'PERSIST_2D_DURING_PROCESSING', True)
+                              and getattr(self, '_processing_active', False)):
+                return True
+            empty = empty_display_state(self._live_mode(), self.display_generation)
+            result = self.render_display(empty, None)
+            self._display_blanked = True
+            return result
 
         state = self._live_display_state()
         ctrl = controller_for(state.mode)
         payload = ctrl.build_payload(self, state)  # store=None ⇒ delegate draws
-        return self.render_display(state, payload)
+        result = self.render_display(state, payload)
+        self._display_blanked = False
+        return result
 
     # ── Render (Stage 3) ──────────────────────────────────────────────
 
@@ -540,14 +685,28 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # RAW_2D / PLOT_1D differ by mode (viewer vs normal); CAKE_2D is normal
     # only.  These collapse into mode controllers in Stage 5.
     def _draw_delegate(self, role, mode):
+        # Payload-only viewer modes (Image / XYE / NeXus): a ``None`` payload
+        # means blank that panel — there is no legacy draw fallback.  Normal
+        # integration plots intentionally delegate to update_plot; raw images
+        # still keep update_image as their fallback.
         if role is PanelRole.RAW_2D:
-            return (self._update_image_viewer if mode is Mode.IMAGE_VIEWER
-                    else self.update_image)
+            if mode in (Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER):
+                return self.clear_image_view
+            return self.update_image
         if role is PanelRole.PLOT_1D:
-            return (self._update_xye_viewer if mode is Mode.XYE_VIEWER
-                    else self.update_plot)
+            if mode in (Mode.XYE_VIEWER, Mode.NEXUS_VIEWER):
+                return self.clear_plot_view
+            return self.update_plot
         if role is PanelRole.CAKE_2D:
-            return self.update_binned
+            # CAKE_2D renders solely from the payload (cake_image); a None cake
+            # payload normally blanks the panel (no legacy update_binned
+            # fallback).  Panel-consistency: while a run is active, keep the last
+            # cake on screen instead of blanking (None delegate -> render skips
+            # this panel) so it persists like the 1D plot.
+            if (getattr(self, 'PERSIST_2D_DURING_PROCESSING', True)
+                    and getattr(self, '_processing_active', False)):
+                return None
+            return self.clear_binned_view
         return None
 
     def _clear_delegate(self, role):
@@ -556,6 +715,219 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             PanelRole.CAKE_2D: self.clear_binned_view,
             PanelRole.PLOT_1D: self.clear_plot_view,
         }.get(role)
+
+    def _payload_for_role(self, role, payload):
+        if payload is None:
+            return None
+        if role is PanelRole.PLOT_1D:
+            return payload.plot
+        if role is PanelRole.RAW_2D:
+            return payload.raw_image
+        if role is PanelRole.CAKE_2D:
+            return payload.cake_image
+        return None
+
+    def _draw_payload(self, role, payload_value, state):
+        if payload_value is None:
+            return False
+
+        if role in (PanelRole.RAW_2D, PanelRole.CAKE_2D):
+            if not isinstance(payload_value, ImagePayload):
+                return False
+            return self._draw_image_payload(role, payload_value, state)
+
+        if role is not PanelRole.PLOT_1D:
+            return False
+
+        traces = tuple(getattr(payload_value, "traces", ()) or ())
+        if not traces:
+            self.clear_plot_view()
+            return True
+
+        ref_x = np.asarray(traces[0].x, dtype=float)
+        rows = []
+        names = []
+        for trace in traces:
+            x = np.asarray(trace.x, dtype=float)
+            y = np.asarray(trace.y, dtype=float)
+            if x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
+                y = np.interp(ref_x, x, y)
+            rows.append(y)
+            names.append(str(trace.label))
+
+        ydata = np.vstack(rows)
+        if self.bkg_1d is not None:
+            try:
+                ydata = ydata - self.bkg_1d
+            except ValueError:
+                logger.debug(
+                    "Skipping publication plot background with shape %s for %s",
+                    np.shape(self.bkg_1d), ydata.shape,
+                )
+
+        self.plot_data = [ref_x, ydata]
+        self.frame_names = names
+        self.overlaid_idxs = list(state.render_ids)
+        axis = payload_value.axis_x
+        self._payload_x_axis_label = (axis.label, axis.unit)
+        # XYE labels its bottom axis from the file prefix; _current_plot_axis_label
+        # reads _viewer_x_axis_label first in xye mode, so keep it in sync.
+        if state.mode is Mode.XYE_VIEWER:
+            self._viewer_x_axis_label = (axis.label, axis.unit)
+        axis_y = getattr(payload_value, "axis_y", None)
+        self._payload_y_axis_label = (
+            (axis_y.label, axis_y.unit) if axis_y is not None else None
+        )
+
+        if ref_x.size == 0 or ydata.size == 0 or not np.isfinite(ydata).any():
+            self.clear_plot_view()
+            return True
+
+        self.plot_data_range = [
+            [np.nanmin(ref_x), np.nanmax(ref_x)],
+            [np.nanmin(ydata), np.nanmax(ydata)],
+        ]
+        self._using_publication_plot_payload = True
+        try:
+            self.update_plot_view()
+        finally:
+            self._using_publication_plot_payload = False
+        return True
+
+    def _draw_image_payload(self, role, payload, state=None):
+        data = np.asarray(payload.image, dtype=float)
+        if data.ndim != 2 or data.size == 0 or not np.isfinite(data).any():
+            if role is PanelRole.RAW_2D:
+                self.clear_image_view()
+            else:
+                self.clear_binned_view()
+            return True
+
+        def _axis_values(axis, size):
+            values = getattr(axis, "values", None)
+            if values is None:
+                return np.arange(size)
+            values = np.asarray(values, dtype=float)
+            if values.shape != (size,):
+                return np.arange(size)
+            return values
+
+        # pyqtgraph images expect the first array axis to map to x and the
+        # second to y.  HDF5 image-like datasets are conventionally
+        # (rows=y, columns=x), so transpose for display.
+        image = data.T
+        x = _axis_values(payload.axis_x, image.shape[0])
+        y = _axis_values(payload.axis_y, image.shape[1])
+        rect = get_rect(x, y)
+        widget = self.image_widget if role is PanelRole.RAW_2D else self.binned_widget
+        display_data = _downsample_for_display(image, widget)
+        widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
+        widget.setRect(rect)
+        displayFrameWidget._set_image_widget_colorbar_visible(widget, True)
+        # Levels come from pgImageWidget.update_image's nanpercentile autoscale
+        # (the (1,99) Linear default), for the Image Viewer exactly as for the
+        # Int 2D raw/cake panels.  The wrangler Intensity Threshold is an
+        # integration mask parameter, NOT a colour scale, so it must not set
+        # display levels here (coupling it to vmin/vmax washed the image out).
+        widget.image_plot.setLabel(
+            "bottom", payload.axis_x.label, units=payload.axis_x.unit,
+        )
+        widget.image_plot.setLabel(
+            "left", payload.axis_y.label, units=payload.axis_y.unit,
+        )
+        if role is PanelRole.RAW_2D:
+            displayFrameWidget._set_raw_pixel_axes(widget)
+            self.image_data = (image, rect)
+        else:
+            self.binned_data = (image, rect)
+        return True
+
+    def _current_image_axis_key(self):
+        """Canonical key for the current 2D cake x-axis."""
+        scan = getattr(self, 'scan', None)
+        if scan is None:
+            return None
+        if getattr(scan, 'gi', False):
+            gi_args = getattr(scan, 'bai_2d_args', {}) or {}
+            gi_mode_2d = gi_args.get('gi_mode_2d', 'qip_qoop')
+            gi_idx = GI_MODES_2D.index(gi_mode_2d) if gi_mode_2d in GI_MODES_2D else 0
+            return _axis_key_from_label(
+                f"{gi_x_labels_2D[gi_idx]} ({gi_x_units_2D[gi_idx]})"
+            )
+        return '2th_deg' if self.ui.imageUnit.currentIndex() == 1 else 'q_A^-1'
+
+    def _plot_axis_key(self, index):
+        info = (
+            self._plot_axis_info[index]
+            if hasattr(self, '_plot_axis_info') and 0 <= index < len(self._plot_axis_info)
+            else {}
+        )
+        key = info.get('unit_key')
+        if key:
+            return key
+        return _axis_key_from_label(_combo_text(self.ui.plotUnit, index))
+
+    def _share_axis_plot_index(self):
+        """Return plotUnit index matching the cake x-axis, or None."""
+        scan = getattr(self, 'scan', None)
+        if scan is None or getattr(scan, 'skip_2d', False):
+            return None
+        target_key = self._current_image_axis_key()
+        if target_key is None:
+            return None
+        try:
+            count = int(self.ui.plotUnit.count())
+        except Exception:
+            return None
+        for idx in range(count):
+            info = (
+                self._plot_axis_info[idx]
+                if hasattr(self, '_plot_axis_info') and idx < len(self._plot_axis_info)
+                else {}
+            )
+            if info and not (
+                info.get('axis') == 'radial' or info.get('source') == '1d_2d'
+            ):
+                continue
+            if self._plot_axis_key(idx) == target_key:
+                return idx
+        return None
+
+    def _set_plot_unit_index_silently(self, index):
+        blocker = None
+        try:
+            blocker = self.ui.plotUnit.blockSignals(True)
+        except Exception:
+            blocker = None
+        try:
+            if self.ui.plotUnit.currentIndex() != index:
+                self.ui.plotUnit.setCurrentIndex(index)
+        finally:
+            try:
+                self.ui.plotUnit.blockSignals(False if blocker is None else blocker)
+            except Exception:
+                pass
+
+    def _apply_share_axis_state(self):
+        """Synchronize Share Axis by axis identity, never combo row number."""
+        target_idx = self._share_axis_plot_index()
+        can_share = target_idx is not None
+        was_checked = self.ui.shareAxis.isChecked()
+        self.ui.shareAxis.setEnabled(can_share)
+        if not can_share:
+            if was_checked:
+                self.ui.shareAxis.setChecked(False)
+            self.plot.setXLink(None)
+            self.ui.plotUnit.setEnabled(True)
+            return False
+        if was_checked:
+            self._set_plot_unit_index_silently(target_idx)
+            self.ui.plotUnit.setEnabled(False)
+            self.plot.setXLink(self.binned_widget.image_plot)
+            return True
+        self.plot.setXLink(None)
+        self.ui.plotUnit.setEnabled(True)
+        return False
 
     def render_display(self, state, payload):
         """Draw the display from ``state`` + ``payload``.  (Named
@@ -579,13 +951,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         # Normal-mode input prep: Share-Axis link + 1D-only panel visibility.
         if mode in (Mode.INT_1D, Mode.INT_2D):
-            if self.ui.shareAxis.isChecked() and (self.ui.imageUnit.currentIndex() < 2):
-                self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
-                self.ui.plotUnit.setEnabled(False)
-                self.plot.setXLink(self.binned_widget.image_plot)
-            else:
-                self.plot.setXLink(None)
-                self.ui.plotUnit.setEnabled(True)
+            self._apply_share_axis_state()
             self._apply_1d_only_visibility()
 
         # Clear the panels this state does not want (kills stale content).
@@ -598,8 +964,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # legacy update(): normal-mode draws caught only TypeError (a
         # missing-data frame) and let anything else propagate; the viewer
         # draws were wrapped in a broad debug-logged guard.
-        is_viewer = mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER)
+        is_viewer = mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER, Mode.NEXUS_VIEWER)
         for role in plan.draw:
+            payload_value = self._payload_for_role(role, payload)
+            if payload_value is not None and self._draw_payload(role, payload_value, state):
+                continue
+            if role is PanelRole.PLOT_1D:
+                self._payload_x_axis_label = None
+                self._payload_y_axis_label = None
             draw = self._draw_delegate(role, mode)
             if draw is None:
                 continue
@@ -613,10 +985,21 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 logger.debug("render: viewer draw of %s failed", role, exc_info=True)
 
         # 2D title + image-preview popup (normal mode; viewer draw methods
-        # set their own title).  Delegated — behaviour-preserving.
-        if mode in (Mode.INT_1D, Mode.INT_2D):
+        # set their own title).  Skip on a non-READY (EMPTY/ERROR) state —
+        # there is no current frame to label or preview, and ``update_2d_label``
+        # would index an empty ``frame_ids`` (IndexError on the explicit-blank
+        # render at scan start).
+        if (mode in (Mode.INT_1D, Mode.INT_2D)
+                and state.load_status is LoadStatus.READY):
             self.update_2d_label()
             self._update_image_preview()
+        # The Image / XYE viewer title (filename(s) / ``Filename #N``) used to be
+        # a side effect of the legacy ``_update_image_viewer`` / ``_update_xye_viewer``
+        # draws; now that those modes render from their payloads, set it here for
+        # the selected frame(s).
+        elif (mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER)
+                and state.load_status is LoadStatus.READY):
+            self._set_viewer_title(list(state.render_ids))
         return True
 
     def update_views(self):
@@ -629,9 +1012,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.plotMethod = self.ui.plotMethod.currentText()
         self.scale = self.ui.scale.currentText()
 
-        if self.viewer_mode == 'image':
-            # Image viewer: only update the raw image panel
-            self.update_image_view()
+        if self.viewer_mode is not None:
+            # Viewer modes render through the payload path (_draw_image_payload /
+            # update_plot_view), which read self.scale / self.cmap directly.  Go
+            # through update() so a Linear/Log (or colormap) change redraws the
+            # Image/XYE viewer correctly instead of using the Int-mode draws.
+            self.update()
             return
 
         self.update_image_view()
@@ -641,66 +1027,77 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     # ── 1D-only visibility ────────────────────────────────────────
 
-    def _apply_1d_only_visibility(self):
-        """Show or hide 2D panes based on scan.skip_2d.
+    def _apply_layout(self, mode):
+        """Apply the *full* panel geometry for ``mode`` from ``PANEL_LAYOUT``.
 
-        In 1D-only mode (skip_2d), collapse the 2D image panels and
-        image toolbar while keeping the top toolbar (Norm Channel, Scale,
-        Set Bkg, etc.) visible.  Also removes pure-2D entries (like χ)
-        from the plotUnit combo so the user cannot select them.
+        Idempotent and self-contained: every managed widget's visibility +
+        (min,max) height/width is set unconditionally, with no reliance on the
+        prior mode's state.  This is the single source of panel geometry —
+        ``set_viewer_display_mode`` and ``_apply_1d_only_visibility`` route
+        through here instead of poking heights/visibility themselves, which
+        kills the "mode A collapsed X and mode B forgot to restore it" leak
+        class (the twoDWindow zero-height blank, the stuck 1D-only residue).
+
+        Geometry only: control enable/disable, the plotUnit 2D-entry rebuild,
+        the slice uncheck and the splitter equalization stay with their callers
+        for now (a later sub-step can fold the controls in too).
+        """
+        spec = PANEL_LAYOUT[mode]
+        ui = self.ui
+        # Visibility.
+        ui.frame_top.setVisible(spec.frame_top_vis)
+        ui.twoDWindow.setVisible(spec.twoDWindow_vis)
+        ui.imageToolbar.setVisible(spec.imageToolbar_vis)
+        ui.frame_4.setVisible(spec.frame_4_vis)
+        ui.frame_6.setVisible(spec.frame_6_vis)
+        ui.plotToolBar.setVisible(spec.plotToolBar_vis)
+        self._showImageBtn.setVisible(spec.show_image_btn_vis)
+        # Heights (min, max).
+        ui.twoDWindow.setMinimumHeight(spec.twoDWindow_h[0])
+        ui.twoDWindow.setMaximumHeight(spec.twoDWindow_h[1])
+        ui.imageWindow.setMinimumHeight(spec.imageWindow_h[0])
+        ui.imageWindow.setMaximumHeight(spec.imageWindow_h[1])
+        ui.plotWindow.setMinimumHeight(spec.plotWindow_h[0])
+        ui.plotWindow.setMaximumHeight(spec.plotWindow_h[1])
+        ui.imageToolbar.setMinimumHeight(spec.imageToolbar_h[0])
+        ui.imageToolbar.setMaximumHeight(spec.imageToolbar_h[1])
+        ui.plotToolBar.setMinimumHeight(spec.plotToolBar_h[0])
+        ui.plotToolBar.setMaximumHeight(spec.plotToolBar_h[1])
+        # Cake-panel width (collapsed to show raw only).
+        ui.binnedFrame.setMinimumWidth(spec.binnedFrame_w[0])
+        ui.binnedFrame.setMaximumWidth(spec.binnedFrame_w[1])
+
+    def _apply_1d_only_visibility(self):
+        """Apply the 1D-only vs full-2D *control state* for the current
+        processing mode (``scan.skip_2d``), and the matching panel geometry.
+
+        Geometry (panel heights/widths/visibility + the raw-preview button) is
+        owned by :meth:`_apply_layout`; this method keeps only the control-state
+        bits the geometry table deliberately does not own: the 2D-only controls
+        (Share Axis, 2D unit, X-Range slice), the slice uncheck, and rebuilding
+        the plotUnit combo for the mode (``set_axes`` is skip-aware, so Int 1D
+        omits the 2D-derived axes outright — no post-hoc removal).
         """
         # In viewer mode, set_viewer_display_mode() controls panels
         if self.viewer_mode is not None:
             return
         skip = getattr(self.scan, 'skip_2d', False)
+        # Full panel geometry for this processing mode (idempotent).
+        self._apply_layout(Mode.INT_1D if skip else Mode.INT_2D)
         if skip:
-            # Hide the 2D image but KEEP the middle control bar
-            # (imageToolbar) — it now holds the 1D plot controls.  Shrink
-            # imageWindow to the title + control bar (frame_top 35 +
-            # imageToolbar 40).
-            self.ui.twoDWindow.setMaximumHeight(0)
-            self.ui.twoDWindow.setMinimumHeight(0)
-            self.ui.imageToolbar.setMinimumHeight(40)
-            self.ui.imageToolbar.setMaximumHeight(40)
-            self.ui.imageWindow.setMinimumHeight(80)
-            self.ui.imageWindow.setMaximumHeight(85)
             # 2D-only controls (Share Axis, 2D unit, X-Range slice) off.
             if self.ui.slice.isChecked():
                 self.ui.slice.setChecked(False)
             self._set_2d_controls_visible(False)
-
-            # Show the raw image preview button in 1D-only mode
-            self._showImageBtn.setVisible(True)
-
-            # Remove pure-2D entries from plotUnit (e.g. χ)
-            self.ui.plotUnit.blockSignals(True)
-            i = 0
-            while i < self.ui.plotUnit.count():
-                if i < len(self._plot_axis_info):
-                    info = self._plot_axis_info[i]
-                    if info['source'] == '2d':
-                        self.ui.plotUnit.removeItem(i)
-                        self._plot_axis_info.pop(i)
-                        continue
-                i += 1
-            self.ui.plotUnit.blockSignals(False)
-            self._was_skip_2d = True
         else:
-            # Restore the 2D image + all controls.
-            self.ui.twoDWindow.setMinimumHeight(0)
-            self.ui.twoDWindow.setMaximumHeight(16777215)
-            self.ui.imageToolbar.setMinimumHeight(40)
-            self.ui.imageToolbar.setMaximumHeight(40)
-            self.ui.imageWindow.setMinimumHeight(200)
-            self.ui.imageWindow.setMaximumHeight(16777215)
             self._set_2d_controls_visible(True)
-            # Hide the raw image preview button in 2D modes
-            self._showImageBtn.setVisible(False)
-            # Only rebuild plotUnit when transitioning from 1D-only mode,
-            # otherwise preserve the user's current plotUnit selection.
-            if self._was_skip_2d:
-                self.set_axes()
-                self._was_skip_2d = False
+        # Rebuild the plotUnit combo only on a 1D-only<->2D *transition* (so the
+        # user's current selection is preserved on every other render).
+        # ``set_axes`` is skip-aware: Int 1D drops the 2D-derived axes, Int 2D
+        # restores them.
+        if skip != self._was_skip_2d:
+            self.set_axes()
+            self._was_skip_2d = skip
 
     # ── Axis configuration ────────────────────────────────────────
 
@@ -729,6 +1126,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.imageUnit.clear()
         self._plot_axis_info = []
         target_plot_idx = 0
+
+        # Int 1D (skip_2d) has no cake, so a 2D-derived axis (χ, or the GI
+        # Q_ip/Q_oop reciprocal axes) can't be sliced from anything — offering it
+        # would plot nothing.  Build the combo skip-aware: in Int 1D include only
+        # axes computable from the 1D result ('1d' / '1d_2d'), excluding every
+        # 'source'=='2d' entry.  Int 2D keeps them all.  This replaces the old
+        # add-then-remove dance in _apply_1d_only_visibility (one source of truth).
+        skip = getattr(self.scan, 'skip_2d', False)
 
         if self.scan.gi:
             gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
@@ -768,15 +1173,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                         'source': '1d', 'slice_axis': None, 'axis': None,
                     })
 
-            # --- 2D-derived axes ---
-            if radial_label != label_1d:
+            # --- 2D-derived axes (Int 2D only; sliced from the cake) ---
+            if not skip and radial_label != label_1d:
                 self.ui.plotUnit.addItem(_translate("Form", radial_label))
                 self._plot_axis_info.append({
                     'source': '2d', 'slice_axis': azimuthal_label,
                     'axis': 'radial',
                 })
 
-            if azimuthal_label != label_1d and azimuthal_label != radial_label:
+            if (not skip and azimuthal_label != label_1d
+                    and azimuthal_label != radial_label):
                 self.ui.plotUnit.addItem(_translate("Form", azimuthal_label))
                 self._plot_axis_info.append({
                     'source': '2d', 'slice_axis': radial_label,
@@ -800,13 +1206,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     'slice_axis': f'{Chi} ({Deg})',
                     'axis': 'radial',
                 })
-            # χ is derived from 2D
-            self.ui.plotUnit.addItem(_translate("Form", plotUnits[2]))
-            self._plot_axis_info.append({
-                'source': '2d',
-                'slice_axis': None,  # determined dynamically by imageUnit
-                'axis': 'azimuthal',
-            })
+            # χ is derived from 2D (Int 2D only — no cake to slice in Int 1D)
+            if not skip:
+                self.ui.plotUnit.addItem(_translate("Form", plotUnits[2]))
+                self._plot_axis_info.append({
+                    'source': '2d',
+                    'slice_axis': None,  # determined dynamically by imageUnit
+                    'axis': 'azimuthal',
+                })
 
             for label in imageUnits:
                 self.ui.imageUnit.addItem(_translate("Form", label))
@@ -857,21 +1264,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.clear_slice_overlay()
         self._sync_slice_controls()
 
-        # Share Axis only makes sense when the 1D plot and the 2D cake can
-        # be on the SAME x-axis — i.e. the 1D plotUnit is the radial axis
-        # (Q or 2θ), which the cake also uses for its x.  When the 1D plot
-        # is on χ (the cake's azimuthal/y axis) there's nothing to share,
-        # so disable it.  Also disabled in 1D-only mode (no 2D cake).
-        can_share = (not skip_2d) and (
-            info.get('axis') == 'radial' or info['source'] == '1d_2d'
-        )
-        was_checked = self.ui.shareAxis.isChecked()
-        self.ui.shareAxis.setEnabled(can_share)
-        if not can_share and was_checked:
-            # Auto-disabling Share Axis (e.g. switched 1D to χ): unchecking
-            # emits ``toggled`` → update() (unlinks the axes) +
-            # _on_share_axis_toggled() (rescales the 1D plot to its data).
-            self.ui.shareAxis.setChecked(False)
+        # R2-1: refresh the X-Range label + bounds to the *complementary* 2D
+        # axis for this plotUnit (read from _plot_axis_info[idx].slice_axis —
+        # Q_ip→Q_oop, Q→χ), driven from here so it tracks plotUnit AND mode/GI
+        # changes (set_axes ends by calling this) — not lazily on first click.
+        self._set_slice_range()
+
+        # Share Axis is keyed to the cake x-axis unit, not the currently
+        # selected plotUnit row.  That lets it switch a χ plot back to Q/2θ/qip
+        # when possible, and disables only when no matching 1D axis exists.
+        self._apply_share_axis_state()
 
     def _sync_slice_controls(self, _=None):
         """Enable the slice center/width spinboxes only while the X Range
@@ -889,14 +1291,37 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         stuck axis.  Re-enable autoRange so it fits the 1D curve."""
         if not checked:
             try:
-                self.plot.enableAutoRange()
+                # Immediate fit, then re-arm continuous tracking (see
+                # _autorange_plot_view for why the order matters).
                 self.plot.autoRange()
+                self.plot.enableAutoRange()
             except Exception:
                 logger.debug("1D autoscale on Share Axis off failed",
                              exc_info=True)
 
         # Update slice range label
         self._set_slice_range()
+
+    def _autorange_plot_view(self, *args):
+        """Refit the 1D plot view to the current data and KEEP auto-ranging on.
+
+        A 1D-unit change re-expresses the x-values (Q<->2θ span very different
+        ranges), so the view must auto-range to the new data instead of staying
+        frozen at the previous unit's range.
+
+        Do a one-shot ``autoRange()`` for an IMMEDIATE refit (synchronous — the
+        headless tests and the user both need the view to reflect the new data
+        right away), then re-arm continuous auto with ``enableAutoRange()``.
+        Order matters: ``autoRange()`` internally calls
+        ``setRange(disableAutoRange=True)`` which turns continuous tracking OFF,
+        so the trailing ``enableAutoRange()`` is what keeps the y-axis following
+        new live traces (instead of freezing and clipping a taller peak) until
+        the user manually zooms."""
+        try:
+            self.plot.autoRange()        # immediate fit (disables auto)
+            self.plot.enableAutoRange()  # re-arm continuous tracking
+        except Exception:
+            logger.debug("1D autoscale on unit change failed", exc_info=True)
 
     # ── 2D image rendering ────────────────────────────────────────
 
@@ -908,6 +1333,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         NaN), the mask application is skipped because the flat indices
         would not match the thumbnail's smaller shape.
         """
+        self._image_levels_override = None
+        # Panel-consistency: while a run is active, keep the last raw image on
+        # screen rather than blanking when the in-flight frame's data isn't
+        # available yet — so the raw panel persists like the 1D plot.
+        keep_last = (getattr(self, 'PERSIST_2D_DURING_PROCESSING', True)
+                     and getattr(self, '_processing_active', False))
         mask = None
         if self.overall and len(self.frame_ids) > 1:
             # G2: aggregate via per-frame dict instead of the deleted
@@ -921,12 +1352,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 require_all=True,
             )
             if data is None:
-                self.clear_image_view()
+                if not keep_last:
+                    self.clear_image_view()
                 return
         else:
             data, raw_source = self.get_frames_map_raw(return_source=True)
             if data is None:
-                self.clear_image_view()
+                if not keep_last:
+                    self.clear_image_view()
                 return
 
             # Apply Mask — O8: snapshot under data_lock so a
@@ -964,7 +1397,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             )
 
         if data.size == 0 or not np.isfinite(data).any():
-            self.clear_image_view()
+            if not keep_last:
+                self.clear_image_view()
             return
 
         data = data.T[:, ::-1]
@@ -981,45 +1415,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         display_data = _downsample_for_display(data, self.image_widget)
         self.image_widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
         self.image_widget.setRect(rect)
+        displayFrameWidget._set_image_widget_colorbar_visible(
+            self.image_widget, True)
+        displayFrameWidget._apply_image_levels(
+            self.image_widget,
+            getattr(self, "_image_levels_override", None),
+        )
+        self._image_levels_override = None
 
-        self.image_widget.image_plot.setLabel("bottom", 'x (Pixels)')
-        self.image_widget.image_plot.setLabel("left", 'y (Pixels)')
-
-    def update_binned(self):
-        """Updates image plotted in image frame.
-
-        Note: when shareAxis is checked, the plotUnit sync and
-        update_plot() are already handled by the main display_update
-        flow before update_binned is called.  We only need to refresh
-        the view here (no data re-accumulation).
-        """
-        if self.ui.shareAxis.isChecked() and (self.ui.imageUnit.currentIndex() < 2):
-            self.ui.plotUnit.setCurrentIndex(self.ui.imageUnit.currentIndex())
-            self.update_plot_view()
-
-        # Always aggregate from per-frame data_2d.  In Overall mode require
-        # every frame's 2D row to be present; otherwise a bounded cache would
-        # quietly average only the rows that happen to be loaded.
-        if self.overall and len(self.frame_ids) > 1:
-            intensity, xdata, ydata = self.get_frames_int_2d(
-                list(self.scan.frames.index), require_all=True,
-            )
-        else:
-            intensity, xdata, ydata = self.get_frames_int_2d()
-
-        if intensity is None:
-            self.clear_binned_view()
-            return
-
-        # Subtract background
-        if self.bkg_2d is not None:
-            intensity -= self.bkg_2d
-
-        rect = get_rect(xdata, ydata)
-        self.binned_data = (intensity, rect)
-        self.update_binned_view()
-
-        return
+        displayFrameWidget._set_raw_pixel_axes(self.image_widget)
 
     def update_binned_view(self):
         data, rect = self.binned_data
@@ -1027,6 +1431,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         display_data = _downsample_for_display(data, self.binned_widget)
         self.binned_widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
         self.binned_widget.setRect(rect)
+        displayFrameWidget._set_image_widget_colorbar_visible(
+            self.binned_widget, True)
 
         imageUnit = self.ui.imageUnit.currentIndex()
         if self.scan.gi:
@@ -1047,6 +1453,31 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.show_slice_overlay()
         return data
 
+    @staticmethod
+    def _set_raw_pixel_axes(widget):
+        """Use literal detector pixels; do not let pyqtgraph scale to kPixels."""
+        plot = getattr(widget, 'image_plot', None)
+        if plot is None:
+            return
+        try:
+            # Avoid ``units='Pixels'`` here: AxisItem treats units as SI-scaleable
+            # and can relabel large detector axes as kPixels. The Image Viewer
+            # should show detector pixels literally.
+            plot.setLabel("bottom", 'x (Pixels)')
+            plot.setLabel("left", 'y (Pixels)')
+        except Exception:
+            logger.debug("raw pixel axis label update failed", exc_info=True)
+            return
+        for axis_name in ('bottom', 'left'):
+            try:
+                axis = plot.getAxis(axis_name)
+                if hasattr(axis, 'enableAutoSIPrefix'):
+                    axis.enableAutoSIPrefix(False)
+                if hasattr(axis, 'setScale'):
+                    axis.setScale(1.0)
+            except Exception:
+                logger.debug("raw pixel axis scale update failed", exc_info=True)
+
     def update_2d_label(self):
         """Updates 2D Label
         """
@@ -1061,8 +1492,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.labelCurrent.setText(label)
         elif len(self.frame_ids) > 1:
             self.ui.labelCurrent.setText(f'{label} [Average]')
-        else:
+        elif self.frame_ids:
             self.ui.labelCurrent.setText(f'{label}_{self.frame_ids[0]}')
+        else:
+            # No selection yet (e.g. a new scan before its first frame) — show
+            # the scan name alone rather than indexing an empty frame_ids list.
+            self.ui.labelCurrent.setText(label)
 
     # ── Normalization / background handlers ───────────────────────
 
@@ -1132,25 +1567,70 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # frame on screen — otherwise a mode switch or an unhydrated frame
     # shows a stale image/cake/curve that looks like real data.
 
+    @staticmethod
+    def _clear_image_widget(widget):
+        """Clear a pyqtgraph image widget without drawing fake zero data."""
+        try:
+            widget.raw_image = np.zeros(0)
+            widget.displayed_image = np.zeros(0)
+        except Exception:
+            pass
+        item = getattr(widget, "imageItem", None)
+        try:
+            if item is not None and hasattr(item, "clear"):
+                item.clear()
+            elif hasattr(widget, "clear"):
+                widget.clear()
+        except Exception:
+            logger.debug("image widget clear failed", exc_info=True)
+        displayFrameWidget._set_image_widget_colorbar_visible(widget, False)
+
+    @staticmethod
+    def _set_image_widget_colorbar_visible(widget, visible):
+        """Hide colorbars when an image panel is intentionally blank."""
+        hist = getattr(widget, "histogram", None)
+        if hist is None:
+            return
+        try:
+            hist.setVisible(bool(visible))
+        except Exception:
+            logger.debug("image colorbar visibility update failed", exc_info=True)
+
+    @staticmethod
+    def _apply_image_levels(widget, levels):
+        """Apply display-only color levels without changing image pixels."""
+        if levels is None:
+            return
+        try:
+            lo, hi = float(levels[0]), float(levels[1])
+        except (TypeError, ValueError, IndexError):
+            return
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return
+        try:
+            widget.imageItem.setLevels((lo, hi))
+        except Exception:
+            logger.debug("image item level update failed", exc_info=True)
+        hist = getattr(widget, "histogram", None)
+        if hist is not None and hasattr(hist, "setLevels"):
+            try:
+                hist.setLevels(values=(lo, hi))
+            except Exception:
+                logger.debug("image colorbar level update failed", exc_info=True)
+
     def clear_image_view(self):
         """Blank the raw 2D image panel."""
         try:
-            blank = np.zeros((2, 2))
-            rect = get_rect(np.arange(2), np.arange(2))
-            self.image_data = (blank, rect)
-            self.image_widget.setImage(blank)
-            self.image_widget.setRect(rect)
+            self.image_data = None
+            self._clear_image_widget(self.image_widget)
         except Exception:
             logger.debug("clear_image_view failed", exc_info=True)
 
     def clear_binned_view(self):
         """Blank the 2D cake panel."""
         try:
-            blank = np.zeros((2, 2))
-            rect = get_rect(np.arange(2), np.arange(2))
-            self.binned_data = (blank, rect)
-            self.binned_widget.setImage(blank)
-            self.binned_widget.setRect(rect)
+            self.binned_data = None
+            self._clear_image_widget(self.binned_widget)
         except Exception:
             logger.debug("clear_binned_view failed", exc_info=True)
 
@@ -1164,7 +1644,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if getattr(self, 'legend', None) is not None:
                 self.legend.clear()
             if getattr(self, 'wf_widget', None) is not None:
-                self.wf_widget.setImage(np.zeros((2, 2)))
+                self._clear_image_widget(self.wf_widget)
+            self._payload_x_axis_label = None
+            self._payload_y_axis_label = None
         except Exception:
             logger.debug("clear_plot_view failed", exc_info=True)
 
@@ -1176,12 +1658,23 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if title is not None:
             self.ui.labelCurrent.setText(title)
 
+    def set_processing_active(self, active):
+        """Mark a wrangler/integrator run as in progress (or finished).
+
+        Called by ``staticWidget`` at run start/end (incl. Stop).  While active,
+        the PERSIST_2D_DURING_PROCESSING feature keeps the last-rendered 2D
+        panels on screen instead of blanking them when the in-flight frame's 2D
+        data isn't available yet — so the 2D panels persist like the 1D plot.
+        """
+        self._processing_active = bool(active)
+
     def set_viewer_display_mode(self, mode):
         """Configure display panels for viewer modes.
 
         Args:
             mode: 'image' — show only the raw 2D image panel,
                   'xye'   — show only the 1D plot panel,
+                  'nexus' — show title-only center; details are in metadata,
                   None    — restore normal layout.
         """
         # Stage 2: a mode switch must invalidate any stale render computed
@@ -1189,70 +1682,67 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if mode != self.viewer_mode:
             self._bump_display_generation()
         self.viewer_mode = mode
+        self._viewer_is_xdart = False
         self._viewer_x_axis_label = None
-        is_viewer = mode in ('image', 'xye')
+        self._payload_x_axis_label = None
+        self._payload_y_axis_label = None
         if mode == 'image':
             title = 'Image Viewer'
         elif mode == 'xye':
             title = 'XYE Viewer'
+        elif mode == 'nexus':
+            title = 'NeXus Viewer'
         else:
             title = ''
         # A mode transition must not carry the previous mode's visible
         # image/curve or cached overlay data into the new one.
         self.clear_display_state(title)
-        # In a viewer the top bar carries only the filename label (frame_5):
-        # the norm/bkg controls (frame_4) and scale/cmap (frame_6) are
-        # process-mode concerns.  The bottom toolbar is permanently
-        # collapsed (its controls moved to the middle bar in _reflow).
-        self.ui.frame_4.setVisible(not is_viewer)
-        self.ui.frame_6.setVisible(not is_viewer)
-        self.ui.plotToolBar.setVisible(False)
 
-        if mode == 'image':
-            # Top bar (filename only) + raw image; no controls, collapse 1D.
-            self.ui.frame_top.setVisible(True)
-            self.ui.twoDWindow.setVisible(True)
-            self.ui.imageToolbar.setVisible(False)
-            self.ui.imageWindow.setMinimumHeight(200)
-            self.ui.imageWindow.setMaximumHeight(16777215)
-            self.ui.plotWindow.setMinimumHeight(0)
-            self.ui.plotWindow.setMaximumHeight(0)
-            # Hide binned frame — only raw image relevant
-            self.ui.binnedFrame.setMaximumWidth(0)
-            self.ui.binnedFrame.setMinimumWidth(0)
-            self._showImageBtn.setVisible(False)
-        elif mode == 'xye':
-            # 1D overlay view: hide the 2D image but KEEP the middle control
-            # bar (Single/Options/Legend/Clear are useful for overlays).
-            # The XYE file owns its x-axis, so hide the transform combo.
-            self.ui.frame_top.setVisible(True)
-            self.ui.twoDWindow.setVisible(False)
-            self.ui.imageToolbar.setVisible(True)
+        # Full panel geometry for this mode (idempotent, table-driven).  This
+        # owns *all* of the height/width/visibility that used to be poked per
+        # branch below — including the twoDWindow zero-height restore that a
+        # prior 1D-only mode required (the Int 1D (XYE) -> Image Viewer blank).
+        # A viewer mode maps to its own Mode; None/'' falls back to the current
+        # processing mode's geometry.
+        layout_mode = {
+            'image': Mode.IMAGE_VIEWER,
+            'xye': Mode.XYE_VIEWER,
+            'nexus': Mode.NEXUS_VIEWER,
+        }.get(mode)
+        if layout_mode is None:
+            layout_mode = (Mode.INT_1D if getattr(self.scan, 'skip_2d', False)
+                           else Mode.INT_2D)
+        self._apply_layout(layout_mode)
+
+        # Control-state the geometry table deliberately does not own.
+        if mode == 'xye':
+            # The XYE file owns its x-axis, so hide the transform combo; the
+            # 2D-only controls (Share Axis, 2D unit, slice) are meaningless.
             self.ui.plotUnit.setVisible(False)
             self._set_2d_controls_visible(False)
-            self.ui.imageWindow.setMinimumHeight(80)
-            self.ui.imageWindow.setMaximumHeight(85)
-            self.ui.plotWindow.setMinimumHeight(200)
-            self.ui.plotWindow.setMaximumHeight(16777215)
+            # frame_6 is shown so the Linear/Log scale applies to the 1D plot,
+            # but the colormap combo is 2D-only — hide it here.
+            self.ui.cmap.setVisible(False)
+            self.ui.scale.setEnabled(True)
+        elif mode in ('image', 'nexus'):
+            # Raw image / schema preview need no extra control state beyond the
+            # geometry table.  The Linear/Log scale + colormap apply to the raw
+            # image, so make sure both are shown/enabled (cmap may have been
+            # hidden by a prior XYE-viewer visit).
+            self.ui.cmap.setVisible(True)
+            self.ui.cmap.setEnabled(True)
+            self.ui.scale.setEnabled(True)
+            if mode == 'nexus':
+                self._set_equal_primary_panel_heights()
         else:
-            # Normal mode — restore panels + the middle control bar.
-            self.ui.frame_top.setVisible(True)
-            self.ui.twoDWindow.setVisible(True)
-            self.ui.imageToolbar.setVisible(True)
-            self.ui.imageWindow.setMinimumHeight(200)
-            self.ui.imageWindow.setMaximumHeight(16777215)
-            self.ui.plotWindow.setMinimumHeight(200)
-            self.ui.plotWindow.setMaximumHeight(16777215)
-            # Restore binned frame
-            self.ui.binnedFrame.setMinimumWidth(0)
-            self.ui.binnedFrame.setMaximumWidth(16777215)
-            # Re-enable all controls
+            # Normal mode — re-enable all process-mode controls.
             self.ui.normChannel.setEnabled(True)
             self.ui.setBkg.setEnabled(True)
             self.ui.shareAxis.setEnabled(True)
             self.ui.imageUnit.setEnabled(True)
             self.ui.scale.setEnabled(True)
             self.ui.cmap.setEnabled(True)
+            self.ui.cmap.setVisible(True)   # restore if hidden by XYE viewer
             self.ui.plotUnit.setVisible(True)
             self.ui.plotUnit.setEnabled(True)
             self.ui.plotMethod.setEnabled(True)
@@ -1260,168 +1750,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._on_plotUnit_changed()
             self.ui.showLegend.setEnabled(True)
             self.ui.clear_1D.setEnabled(True)
-            # Re-apply 2D-control visibility for the current processing
-            # mode (Int 1D hides the 2D controls + slice; Int 2D shows all).
+            # Re-apply 2D-control visibility for the current processing mode
+            # (Int 1D hides the 2D controls + slice; Int 2D shows all).  This
+            # re-asserts the geometry via _apply_layout (idempotent).
             self._apply_1d_only_visibility()
-
-    def _update_xye_viewer(self):
-        """Render 1D line data in XYE viewer mode (no scan/integration).
-
-        Builds plot_data and frame_names from the loaded XYE data,
-        then delegates to the standard update_plot_view() so that
-        Single/Overlay/Waterfall/Sum/Average all work.
-        """
-        if len(self.idxs_1d) == 0:
-            self.clear_plot_view()
-            return
-
-        # Title bar: the xye filename(s) — same convention as the image viewer.
-        self._set_viewer_title(self.idxs_1d)
-
-        # Axis label comes from the file's prefix (iq \u2192 Q, itth \u2192 2\u03b8), not a
-        # transform combo \u2014 an XYE file can't be re-transformed.  Stage 4:
-        # route through the pure xye_unit_from_filename + x_axis_for_unit so
-        # an UNKNOWN prefix labels the axis plain 'x' (never an assumed 2\u03b8).
-        first_frame = self.data_1d[self.idxs_1d[0]]
-        source_name = ''
-        if getattr(first_frame, 'scan_info', None):
-            source_name = first_frame.scan_info.get('source_file', '')
-        first_unit = xye_unit_from_filename(source_name)
-        xlabel, xunits = x_axis_for_unit(first_unit)
-        self._viewer_x_axis_label = (xlabel, xunits)
-
-        # Overlaying xye files of different units mixes incompatible x-axes —
-        # we label from the first file (above); warn if the selection mixes
-        # known prefixes (iq with itth) so the user knows the axis is the
-        # first file's, not a shared one.
-        if len(self.idxs_1d) > 1:
-            units = set()
-            for idx in self.idxs_1d:
-                fr = self.data_1d.get(idx)
-                sinfo = getattr(fr, 'scan_info', None) if fr is not None else None
-                src = sinfo.get('source_file', '') if sinfo else ''
-                u = xye_unit_from_filename(src)
-                if u != 'unknown':
-                    units.add(u)
-            if len(units) > 1:
-                logger.warning(
-                    'XYE overlay mixes different x-axis units %s; labelling '
-                    'the axis from the first file (%s). Overlaid curves are '
-                    'on incompatible axes.', sorted(units), first_unit,
-                )
-
-        # Build xdata and ydata arrays from all selected indices.
-        ref_x = np.asarray(first_frame.int_1d.radial, dtype=float)
-        frame_names = []
-        rows = []
-        for idx in self.idxs_1d:
-            frame = self.data_1d[idx]
-            int_1d = frame.int_1d
-            if int_1d is None:
-                continue
-            fname = frame.scan_info.get('source_file', f'xye_{idx}')
-            frame_names.append(os.path.basename(fname))
-            xdata = np.asarray(int_1d.radial, dtype=float)
-            ydata = np.asarray(int_1d.intensity, dtype=float)
-            if xdata.shape != ref_x.shape or not np.allclose(xdata, ref_x):
-                ydata = np.interp(ref_x, xdata, ydata)
-            rows.append(ydata)
-
-        if not rows:
-            self.clear_plot_view()
-            return
-
-        xdata = ref_x
-        ydata = np.vstack(rows) if len(rows) > 1 else rows[0][np.newaxis, :]
-
-        # In Overlay/Waterfall: accumulate, skip duplicates.
-        current_method = self.ui.plotMethod.currentText()
-        if current_method in ('Overlay', 'Waterfall') and \
-                len(self.plot_data[0]) > 0 and \
-                self.plot_data[0].shape == xdata.shape:
-            for name, row in zip(frame_names, ydata):
-                if name not in self.frame_names:
-                    self.plot_data[1] = np.vstack(
-                        (self.plot_data[1], row[np.newaxis, :]))
-                    self.frame_names.append(name)
-        else:
-            self.plot_data = [xdata, ydata]
-            self.frame_names = list(frame_names)
-
-        xdata, ydata = self.plot_data
-        self.plot_data_range = [
-            [xdata.min(), xdata.max()],
-            [ydata.min(), ydata.max()],
-        ]
-
-        self.plot.setLabel('bottom', xlabel, units=xunits)
-        self.plot.setLabel('left', 'Intensity')
-
-        self.update_plot_view()
-
-    def _update_image_viewer(self):
-        """Render raw image data in viewer mode with optional mask/threshold."""
-        if len(self.idxs_2d) == 0:
-            self.clear_image_view()
-            return
-        # O8: snapshot under data_lock so a concurrent writer can't
-        # evict the key between the lookup and the read.
-        with self.data_lock:
-            frame_2d = self.data_2d.get(self.idxs_2d[0])
-        if frame_2d is None:
-            self.clear_image_view()
-            return
-        # The detector array may not be hydrated yet (the loader publishes a
-        # thumbnail-backed preview first, then the full frame), or it may have
-        # been evicted from the bounded raw cache.  Fall back to the stored
-        # thumbnail rather than crashing on ``np.asarray(None)`` (blank panel).
-        raw = frame_2d.get('map_raw')
-        if raw is None:
-            raw = frame_2d.get('thumbnail')
-        if raw is None:
-            self.clear_image_view()
-            return
-        data = self._sanitize_display_image(raw)
-
-        # Dead/hot-pixel sentinels (e.g. uint32 max 4294967295 from Eiger
-        # masters) blow out the autoscale and render the frame blank/dark.
-        # Mask them to NaN so the real dynamic range drives the colormap.
-        if data.size == 0 or not np.isfinite(data).any():
-            self._set_viewer_title(self.idxs_2d)
-            self.clear_image_view()
-            return
-
-        # Apply threshold from wrangler if enabled
-        w = self._wrangler
-        if w is not None:
-            if getattr(w, 'apply_threshold', False):
-                lo = getattr(w, 'threshold_min', 0)
-                hi = getattr(w, 'threshold_max', 0)
-                if hi > lo:
-                    data[data < lo] = np.nan
-                    data[data > hi] = np.nan
-
-            # Apply mask file if shape matches
-            mask_file = getattr(w, 'mask_file', '')
-            if mask_file and os.path.exists(mask_file):
-                try:
-                    from ssrl_xrd_tools.io.image import read_image as _read_img
-                    mask = np.asarray(_read_img(mask_file), dtype=bool)
-                    if mask.shape == data.shape:
-                        data[mask] = np.nan
-                except Exception:
-                    logger.debug("Failed to load or apply mask file %s", mask_file, exc_info=True)
-
-        if data.size == 0 or not np.isfinite(data).any():
-            self._set_viewer_title(self.idxs_2d)
-            self.clear_image_view()
-            return
-
-        data = data.T[:, ::-1]
-        rect = get_rect(np.arange(data.shape[0]), np.arange(data.shape[1]))
-        self.image_data = (data, rect)
-        self._set_viewer_title(self.idxs_2d)
-        self.update_image_view()
+            self._set_equal_primary_panel_heights()
 
     @staticmethod
     def _truncate_name(name, limit=100, head=48, tail=48):

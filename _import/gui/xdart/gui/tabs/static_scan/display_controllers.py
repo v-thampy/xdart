@@ -24,9 +24,28 @@ Design rules (plan §3 / §8):
 from __future__ import annotations
 
 import logging
+import os
+
+import numpy as np
 
 from .display_logic import (
-    Mode, compute_display_state, build_payload, register_controller,
+    Axis,
+    DisplayPayload,
+    ImagePayload,
+    Mode,
+    PlotPayload,
+    Trace,
+    compute_display_state,
+    build_payload,
+    register_controller,
+    sentinel_mask,
+    standalone_viewer_image,
+    xye_unit_from_filename,
+    x_axis_for_unit,
+)
+from .display_publication import (
+    PublicationDisplayAdapter,
+    publication_availability,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,6 +54,7 @@ __all__ = [
     "ScanDisplayController",
     "ImageViewerController",
     "XYEViewerController",
+    "NexusViewerController",
     "register_default_controllers",
 ]
 
@@ -53,7 +73,61 @@ def _data_snapshot(widget):
             for k, v in widget.data_2d.items()
             if isinstance(v, dict)
         }
+        store = getattr(widget, "publication_store", None)
+        if store is not None:
+            pub_1d, pub_2d, pub_raw = publication_availability(store)
+            loaded_1d.update(pub_1d)
+            loaded_2d.update(pub_2d)
+            raw_avail.update(pub_raw)
     return loaded_1d, loaded_2d, raw_avail
+
+
+def _image_viewer_raw_payload(widget, state):
+    """Build the Image Viewer's raw-preview :class:`ImagePayload` (or ``None``).
+
+    Mirrors the raw-browser semantics exactly (the behavior just fixed and
+    verified in the GUI):
+
+    * source: the selected frame's ``map_raw`` from ``data_2d``, falling back
+      to its dequantized ``thumbnail`` when the full array isn't hydrated;
+    * standalone files (``_viewer_is_xdart`` False): fill non-finite + the
+      uint32 ceiling sentinel with the low finite value, **no** NaN mask;
+    * processed-xdart files (``_viewer_is_xdart`` True): keep the baked NaN
+      mask (``sentinel_mask``);
+    * single-select — only ``render_ids[0]`` is shown (no overlay/accumulate);
+    * **no** processing mask file, background subtraction or normalization.
+
+    Returns ``None`` (→ the renderer clears the panel) when there is no
+    selected frame, no ``map_raw``/``thumbnail``, or the sanitized array has no
+    finite pixels.  The array is pre-flipped (``[::-1, :]``) because the
+    renderer transposes every ``ImagePayload``; combined that reproduces the
+    legacy ``data.T[:, ::-1]`` detector orientation, with ``Pixels`` axes.
+    """
+    if not state.render_ids:
+        return None
+    idx = int(state.render_ids[0])
+    with widget.data_lock:
+        frame_2d = widget.data_2d.get(idx)
+    if frame_2d is None:
+        return None
+    raw = frame_2d.get('map_raw')
+    if raw is None:
+        raw = frame_2d.get('thumbnail')
+    if raw is None:
+        return None
+    if getattr(widget, '_viewer_is_xdart', False):
+        data = sentinel_mask(raw)               # preserve baked NaN mask
+    else:
+        data = standalone_viewer_image(raw)     # fill sentinels, no mask
+    data = np.asarray(data, dtype=float)
+    if data.ndim != 2 or data.size == 0 or not np.isfinite(data).any():
+        return None
+    image = data[::-1, :]
+    return ImagePayload(
+        image=image,
+        axis_x=Axis("x", "Pixels", values=np.arange(image.shape[1])),
+        axis_y=Axis("y", "Pixels", values=np.arange(image.shape[0])),
+    )
 
 
 class _BaseController:
@@ -82,9 +156,12 @@ class _BaseController:
         )
 
     def build_payload(self, widget, state):
-        # store=None ⇒ the renderer delegates the pixel push to the legacy
-        # draw methods (Stage 3 default); a real store lands later.
-        return build_payload(state)
+        store = getattr(widget, "publication_store", None)
+        adapter = (
+            None if store is None
+            else PublicationDisplayAdapter(store, widget=widget)
+        )
+        return build_payload(state, adapter)
 
 
 class ScanDisplayController(_BaseController):
@@ -129,16 +206,233 @@ class ImageViewerController(_BaseController):
         from ssrl_xrd_tools.io import load_image_frame
         return load_image_frame(path, frame_idx)
 
+    # ── raw-preview payload (Stage 4/5 step 2) ─────────────────────────
+    def build_payload(self, widget, state):
+        """Produce the Image Viewer's raw-preview payload directly.
+
+        The Image Viewer is a raw detector-file browser, so its single panel
+        is a ``RAW_2D`` :class:`ImagePayload` built straight from the selected
+        frame's stored detector array — with NO processing mask, background
+        subtraction or monitor normalization (those are integration concerns).
+        This is the one render path for the mode; there is no fallback to a
+        legacy ``_update_image_viewer``.
+        """
+        return DisplayPayload(
+            generation=state.generation,
+            raw_image=_image_viewer_raw_payload(widget, state),
+            cake_image=None,
+            plot=None,
+        )
+
+
+def _xye_plot_payload(widget, state):
+    """Build the XYE viewer's :class:`PlotPayload` (or ``None``).
+
+    One trace per selected frame (``render_ids``, in order — XYE is
+    multi-select); the x-axis label/unit come from the *first* file's name
+    prefix (``xye_unit_from_filename`` -> ``x_axis_for_unit``; unprefixed files
+    default to Q, never an assumed 2θ), y-axis
+    ``Intensity``; each trace labelled by its filename.  Returns ``None`` (-> the
+    renderer clears the plot) on an empty selection or when no selected frame has
+    1D data.
+
+    selection == shown: the payload renders exactly the selected frames, so
+    deselecting a file removes its curve immediately.  ``plotMethod``
+    (Single/Overlay/Waterfall/Sum/Average) still controls *how* the selected
+    curves are drawn; there is no lingering-after-deselect accumulation.
+    """
+    render_ids = []
+    for i in state.render_ids:
+        try:
+            render_ids.append(int(i))
+        except (TypeError, ValueError):
+            continue
+    if not render_ids:
+        return None
+    with widget.data_lock:
+        frames = {i: widget.data_1d.get(i) for i in render_ids}
+
+    # X-axis label from the first selected file's prefix (not a transform combo).
+    first = frames.get(render_ids[0])
+    source_name = ''
+    if first is not None and getattr(first, 'scan_info', None):
+        source_name = first.scan_info.get('source_file', '') or ''
+    first_unit = xye_unit_from_filename(source_name)
+    xlabel, xunits = x_axis_for_unit(first_unit)
+
+    # Overlaying files of different known units mixes incompatible x-axes; we
+    # label from the first file and warn so the user knows the axis isn't shared.
+    if len(render_ids) > 1:
+        units = set()
+        for i in render_ids:
+            fr = frames.get(i)
+            sinfo = getattr(fr, 'scan_info', None) if fr is not None else None
+            src = sinfo.get('source_file', '') if sinfo else ''
+            u = xye_unit_from_filename(src)
+            if u != 'unknown':
+                units.add(u)
+        if len(units) > 1:
+            logger.warning(
+                'XYE overlay mixes different x-axis units %s; labelling the '
+                'axis from the first file (%s). Overlaid curves are on '
+                'incompatible axes.', sorted(units), first_unit,
+            )
+
+    first_int = getattr(first, 'int_1d', None) if first is not None else None
+    if first_int is None:
+        return None
+
+    traces = []
+    for i in render_ids:
+        fr = frames.get(i)
+        int_1d = getattr(fr, 'int_1d', None) if fr is not None else None
+        if int_1d is None:
+            continue
+        sinfo = getattr(fr, 'scan_info', None) or {}
+        fname = sinfo.get('source_file', f'xye_{i}')
+        traces.append(Trace(
+            os.path.basename(fname),
+            np.asarray(int_1d.radial, dtype=float),
+            np.asarray(int_1d.intensity, dtype=float),
+        ))
+    if not traces:
+        return None
+
+    return PlotPayload(
+        axis_x=Axis(xlabel, xunits),
+        traces=tuple(traces),
+        axis_y=Axis('Intensity', ''),
+    )
+
 
 class XYEViewerController(_BaseController):
     """1D ``.xye`` overlay viewer.  Selection is *viewer* frame ids; the
     x-axis comes from the file prefix, not the integration-unit combo (§8)."""
+
+    def build_payload(self, widget, state):
+        """Render the XYE overlay through a :class:`PlotPayload` — the one
+        render path for the mode (no legacy ``_update_xye_viewer`` fallback)."""
+        return DisplayPayload(
+            generation=state.generation,
+            raw_image=None,
+            cake_image=None,
+            plot=_xye_plot_payload(widget, state),
+        )
+
+
+class NexusViewerController(_BaseController):
+    """Read-only NeXus schema viewer.
+
+    The actual HDF5 walking lives in ``ssrl_xrd_tools.io.inspect_nexus``.
+    This controller consumes the row preview published by ``H5Viewer``:
+    1D previews draw as plots, 2D previews draw as bounded images, and
+    metadata-only rows intentionally clear both panels.
+    """
+
+    def compute_state(self, widget, mode):
+        loaded_1d, loaded_2d, raw_avail = set(), set(), {}
+        with widget.data_lock:
+            for key, frame in widget.data_1d.items():
+                payload = getattr(frame, "nexus_preview_payload", None)
+                if not isinstance(payload, dict):
+                    continue
+                kind = payload.get("kind")
+                if kind == "plot_1d":
+                    loaded_1d.add(int(key))
+                elif kind == "image_2d":
+                    loaded_2d.add(int(key))
+                    raw_avail[int(key)] = {
+                        "has_raw": True,
+                        "has_thumbnail": False,
+                    }
+        return compute_display_state(
+            mode=mode,
+            selected_ids=list(widget.frame_ids),
+            all_frame_index=[],
+            loaded_1d_keys=loaded_1d,
+            loaded_2d_keys=loaded_2d,
+            gi=False,
+            plot_unit='q_A^-1',
+            method=widget.ui.plotMethod.currentText(),
+            unit_changed=False,
+            prev_overlaid_ids=tuple(widget.overlaid_idxs),
+            raw_availability=raw_avail,
+            titles={},
+            generation=widget.display_generation,
+        )
+
+    def build_payload(self, widget, state):
+        if not state.render_ids:
+            return DisplayPayload(
+                generation=state.generation,
+                raw_image=None,
+                cake_image=None,
+                plot=None,
+            )
+        idx = int(state.render_ids[0])
+        with widget.data_lock:
+            frame = widget.data_1d.get(idx)
+        payload = getattr(frame, "nexus_preview_payload", None) if frame else None
+        if not isinstance(payload, dict):
+            return DisplayPayload(
+                generation=state.generation,
+                raw_image=None,
+                cake_image=None,
+                plot=None,
+            )
+        kind = payload.get("kind")
+        if kind == "plot_1d":
+            x = np.asarray(payload.get("x", ()), dtype=float)
+            y = np.asarray(payload.get("y", ()), dtype=float)
+            axis_x = Axis(
+                str(payload.get("x_label") or "index"),
+                str(payload.get("x_unit") or ""),
+            )
+            axis_y = Axis(
+                str(payload.get("y_label") or "value"),
+                str(payload.get("y_unit") or ""),
+            )
+            trace = Trace(str(payload.get("label") or idx), x=x, y=y)
+            plot = PlotPayload(axis_x=axis_x, axis_y=axis_y, traces=(trace,))
+            return DisplayPayload(
+                generation=state.generation,
+                raw_image=None,
+                cake_image=None,
+                plot=plot,
+            )
+        if kind == "image_2d":
+            image = np.asarray(payload.get("image", ()), dtype=float)
+            axis_x = Axis(
+                str(payload.get("x_label") or "x"),
+                str(payload.get("x_unit") or ""),
+                values=np.asarray(payload.get("x", ()), dtype=float)
+                if payload.get("x") is not None else None,
+            )
+            axis_y = Axis(
+                str(payload.get("y_label") or "y"),
+                str(payload.get("y_unit") or ""),
+                values=np.asarray(payload.get("y", ()), dtype=float)
+                if payload.get("y") is not None else None,
+            )
+            return DisplayPayload(
+                generation=state.generation,
+                raw_image=ImagePayload(image=image, axis_x=axis_x, axis_y=axis_y),
+                cake_image=None,
+                plot=None,
+            )
+        return DisplayPayload(
+            generation=state.generation,
+            raw_image=None,
+            cake_image=None,
+            plot=None,
+        )
 
 
 # Singleton adapters (stateless) registered for each mode.
 _SCAN = ScanDisplayController()
 _IMAGE = ImageViewerController()
 _XYE = XYEViewerController()
+_NEXUS = NexusViewerController()
 
 
 def register_default_controllers():
@@ -148,6 +442,7 @@ def register_default_controllers():
     register_controller(Mode.INT_2D, _SCAN)
     register_controller(Mode.IMAGE_VIEWER, _IMAGE)
     register_controller(Mode.XYE_VIEWER, _XYE)
+    register_controller(Mode.NEXUS_VIEWER, _NEXUS)
 
 
 # Register on import so simply importing this module (or display_frame_widget)
