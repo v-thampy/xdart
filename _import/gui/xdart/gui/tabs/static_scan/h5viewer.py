@@ -2339,6 +2339,31 @@ class H5Viewer(QWidget):
         if timer is not None and timer.isActive():
             timer.stop()
 
+    def shutdown_threads(self) -> None:
+        """Stop the persistent background threads this viewer owns so they are
+        not destroyed while running on tab/app close.
+
+        Without this the long-lived ``fileHandlerThread`` (an infinite
+        queue-driven loop in ``run()``) and the async load worker keep running
+        after the widget is torn down, which trips Qt's
+        "QThread: Destroyed while thread is still running" abort at interpreter
+        shutdown.  This is the production version of what the GUI test fixture
+        already does on teardown.  Idempotent and exception-safe.
+        """
+        try:
+            self.cancel_pending_loads()          # quit + wait the load worker
+        except Exception:
+            logger.debug("cancel_pending_loads on shutdown failed",
+                         exc_info=True)
+        ft = getattr(self, 'file_thread', None)
+        if ft is not None:
+            try:
+                if ft.isRunning():
+                    ft.queue.put(None)           # sentinel -> run() breaks
+                    ft.wait(2000)                # bounded wait
+            except Exception:
+                logger.debug("file_thread shutdown failed", exc_info=True)
+
     def enter_viewer_mode_cleanup(self) -> None:
         """Clear scan-frame state before Image/XYE viewer data is loaded."""
         self.cancel_pending_loads()

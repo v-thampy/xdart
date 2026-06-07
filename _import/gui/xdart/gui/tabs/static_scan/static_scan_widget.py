@@ -845,6 +845,17 @@ class staticWidget(QWidget):
     def close(self):
         """Tries a graceful close.
         """
+        # Stop the viewer's long-running background threads BEFORE teardown so
+        # the persistent fileHandlerThread / async load worker aren't destroyed
+        # while running ("QThread: Destroyed while thread is still running") on
+        # tab/app close.  Mirrors the GUI-test fixture teardown.
+        try:
+            h5v = getattr(self, 'h5viewer', None)
+            if h5v is not None and hasattr(h5v, 'shutdown_threads'):
+                h5v.shutdown_threads()
+        except Exception:
+            logger.debug("background-thread shutdown on close failed",
+                         exc_info=True)
         del self.scan
         del self.displayframe.scan
         del self.frame
@@ -1236,7 +1247,13 @@ class staticWidget(QWidget):
         # final flush so the 2D panels resume normal blank-on-missing for the
         # final frame.  Idempotent: a later integrator_thread_finished() (when
         # the scan matches, below) calls _exit_run_state again as a no-op.
-        self._exit_run_state()
+        # Overlap guard (symmetric with integrator_thread_finished): a wrangler
+        # can be started while a reintegrate is still running, and if it
+        # finishes first the reintegrate's frames still need the controls
+        # locked — only exit the shared run-state when the integrator run is
+        # also done; its finished handler exits it otherwise.
+        if not self.integratorTree.integrator_thread.isRunning():
+            self._exit_run_state()
 
         # Flush any pending coalesced update so the final frame is shown.
         self._update_timer.stop()
@@ -1280,7 +1297,15 @@ class staticWidget(QWidget):
                 self.h5viewer._auto_select_last_on_finish = True
                 self.h5viewer.set_file(generated_file)
 
-        if self.scan.name == self.wrangler.scan_name:
+        # The scan-matches branch delegates to integrator_thread_finished() to
+        # run the post-integration UI enable + exit the run-state.  Skip it when
+        # a real reintegrate is still running (the overlap case): calling it
+        # would exit the shared run-state and re-enable the controls mid-
+        # reintegrate.  In that case just re-enable the wrangler (its run IS
+        # done); the integrator's own finished handler exits the run-state when
+        # the reintegrate completes.
+        if (self.scan.name == self.wrangler.scan_name
+                and not self.integratorTree.integrator_thread.isRunning()):
             self.integrator_thread_finished()
         else:
             self.wrangler.enabled(True)

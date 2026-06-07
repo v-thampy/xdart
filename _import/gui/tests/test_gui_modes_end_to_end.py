@@ -1524,3 +1524,51 @@ def test_integrator_finish_while_wrangler_running_keeps_controls_locked(widget, 
     assert w._run_active is False
     ui = w.integratorTree.ui
     assert ui.frame1D.isEnabled() and ui.frame2D.isEnabled()
+
+
+def test_wrangler_finish_while_reintegrate_running_keeps_controls_locked(widget, monkeypatch):
+    """Mirror overlap guard: a wrangler started mid-reintegrate can FINISH first.
+    wrangler_finished must NOT exit the shared run-state (directly OR via the
+    scan-matches delegation to integrator_thread_finished) while the reintegrate
+    is still running — otherwise the controls re-enable mid-reintegrate."""
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    w._enter_run_state()
+    assert w._run_active is True and not any(_proc_controls(w).values())
+
+    # Reintegrate still running; this wrangler's own thread has finished.
+    monkeypatch.setattr(w.integratorTree.integrator_thread, 'isRunning', lambda: True)
+    monkeypatch.setattr(w.wrangler.thread, 'isRunning', lambda: False)
+    monkeypatch.setattr(w.wrangler.thread, 'batch_mode', False, raising=False)
+    monkeypatch.setattr(w.wrangler.thread, 'xye_only', False, raising=False)
+    # Force the scan-matches branch so the delegation guard (not the name check)
+    # is what prevents the exit.
+    monkeypatch.setattr(w.wrangler, 'scan_name', w.scan.name, raising=False)
+    # Stub the heavy collaborators wrangler_finished would otherwise drive.
+    monkeypatch.setattr(w, '_flush_pending_update', lambda: None)
+    monkeypatch.setattr(w.wrangler, 'stop', lambda: None)
+    delegated = []
+    monkeypatch.setattr(w, 'integrator_thread_finished',
+                        lambda: delegated.append(1))
+
+    w.wrangler_finished()
+
+    assert w._run_active is True, "run-state exited while reintegrate still running"
+    assert delegated == [], "delegated to integrator_thread_finished mid-reintegrate"
+    assert not any(_proc_controls(w).values()), "controls re-enabled mid-reintegrate"
+
+
+def test_shutdown_threads_stops_file_thread(widget):
+    """Production teardown must stop the persistent fileHandlerThread so it is
+    not 'destroyed while running' on tab/app close.  Idempotent."""
+    w = widget
+    ft = w.h5viewer.file_thread
+    assert ft.isRunning(), "file_thread should be running on a live widget"
+
+    w.h5viewer.shutdown_threads()
+    assert ft.wait(2000)
+    assert not ft.isRunning(), "file_thread still running after shutdown_threads"
+
+    # Idempotent — a second call (and the close() path that also calls it) is safe.
+    w.h5viewer.shutdown_threads()
+    assert not ft.isRunning()
