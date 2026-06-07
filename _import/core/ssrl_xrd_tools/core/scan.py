@@ -19,7 +19,6 @@ import numpy as np
 from ssrl_xrd_tools.core.containers import PONI
 from ssrl_xrd_tools.core.metadata import ScanMetadata
 from ssrl_xrd_tools.io.image import read_image
-from ssrl_xrd_tools.io.nexus import open_nexus_image_stack
 
 
 ImageLoader = Callable[["ScanFrame"], np.ndarray]
@@ -207,6 +206,11 @@ class ScanFrame:
         path = Path(self.source_path)
         ext = path.suffix.lower()
         if ext in {".h5", ".hdf5", ".nxs"} and self.source_frame_index is not None:
+            # Keep the canonical contracts import-light: ssrl_xrd_tools.io.nexus
+            # imports core containers, so importing this at module load time
+            # creates a circular import through ssrl_xrd_tools.core.__init__.
+            from ssrl_xrd_tools.io.nexus import open_nexus_image_stack
+
             with open_nexus_image_stack(path) as stack:
                 self.image = np.asarray(stack[int(self.source_frame_index)])
         else:
