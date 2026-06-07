@@ -174,6 +174,11 @@ def plan_from_live_scan(
     _pop_first(args_2d, ("normalization_factor",), None)
 
     is_gi = bool(getattr(live_scan, "gi", False))
+    gi_mode_1d = _pop_first(args_1d, ("gi_mode_1d",), "q_total")
+    gi_mode_2d = _pop_first(args_2d, ("gi_mode_2d",), "qip_qoop")
+    npt_oop = _pop_first(args_1d, ("npt_oop",), None)
+    if npt_oop is None:
+        npt_oop = _pop_first(args_2d, ("npt_oop",), None)
     gi_method = _pop_first(args_1d, ("gi_method_1d",), None)
     if gi_method is None:
         gi_method = _pop_first(args_2d, ("gi_method_2d",), "no")
@@ -183,9 +188,14 @@ def plan_from_live_scan(
         _strip_nonstandard_args(args_2d)
     if is_gi and gi_incident_angle is None:
         gi_incident_angle = getattr(live_scan, "_cached_fiber_integrator_angle", None)
-    if is_gi and gi_incident_angle is None:
+    incidence_motor = getattr(live_scan, "incidence_motor", None)
+    if (
+        is_gi
+        and gi_incident_angle is None
+        and not _incidence_available(live_scan, incidence_motor)
+    ):
         raise ValueError(
-            "Cannot build a GI ReductionPlan without gi_incident_angle."
+            "Cannot build a GI ReductionPlan without gi_incident_angle or incidence_motor."
         )
 
     mask_shape = None
@@ -198,10 +208,14 @@ def plan_from_live_scan(
 
     gi_mode = (
         GIMode(
-            incident_angle=float(gi_incident_angle),
+            incident_angle=(float(gi_incident_angle) if gi_incident_angle is not None else None),
+            incidence_motor=str(incidence_motor) if incidence_motor else None,
             tilt_angle=float(getattr(live_scan, "tilt_angle", 0.0) or 0.0),
             sample_orientation=int(getattr(live_scan, "sample_orientation", 1) or 1),
             method=str(gi_method),
+            mode_1d=str(gi_mode_1d),
+            mode_2d=str(gi_mode_2d),
+            npt_oop=(int(npt_oop) if npt_oop is not None else None),
         )
         if is_gi else None
     )
@@ -456,6 +470,30 @@ def _source_path(frame: Any) -> Path | None:
     resolver = getattr(frame, "_resolved_source_path", None)
     path = resolver() if callable(resolver) else getattr(frame, "source_file", "")
     return Path(path) if path else None
+
+
+def _incidence_available(live_scan: Any, incidence_motor: Any) -> bool:
+    if incidence_motor is None:
+        return False
+    try:
+        float(incidence_motor)
+        return True
+    except (TypeError, ValueError):
+        pass
+    key = str(incidence_motor).lower()
+    scan_data = getattr(live_scan, "scan_data", None)
+    if scan_data is not None and hasattr(scan_data, "columns"):
+        if any(str(col).lower() == key for col in scan_data.columns):
+            return True
+    frames = getattr(live_scan, "frames", None)
+    for idx in list(getattr(frames, "index", []) or []):
+        try:
+            info = getattr(frames[int(idx)], "scan_info", {}) or {}
+        except Exception:
+            continue
+        if any(str(candidate).lower() == key for candidate in info):
+            return True
+    return False
 
 
 def _scan_data_row(scan_data: Any, idx: int) -> dict[str, Any]:
