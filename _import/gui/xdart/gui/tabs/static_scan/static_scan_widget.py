@@ -397,10 +397,10 @@ class staticWidget(QWidget):
 
         # Integrator signals
         self.integratorTree.integrator_thread.started.connect(self.thread_state_changed)
-        # Panel-consistency: re-integration is a "run" too — keep the 2D panels
-        # persistent for its duration (cleared in integrator_thread_finished).
-        self.integratorTree.integrator_thread.started.connect(
-            lambda: self.displayframe.set_processing_active(True))
+        # Re-integration is a "run" too: route its START through the single
+        # run-state owner (task #68) — keeps the 2D panels persistent for its
+        # duration; cleared in integrator_thread_finished via _exit_run_state.
+        self.integratorTree.integrator_thread.started.connect(self._enter_run_state)
         self.integratorTree.integrator_thread.update.connect(self.integrator_thread_update)
         self.integratorTree.integrator_thread.finished.connect(self.integrator_thread_finished)
 
@@ -426,6 +426,12 @@ class staticWidget(QWidget):
             w = self.ui.wranglerStack.widget(i)
             parameters.append(w.parameters)
         self.h5viewer.defaultWidget.set_parameters(parameters)
+
+        # Single source of truth for "a wrangler/integrator run is in
+        # progress" (task #68).  Flipped only by _enter_run_state /
+        # _exit_run_state, which drive the display persist flag (and, in Part 2,
+        # the processing-control disable) so the two can never desync.
+        self._run_active = False
 
         # Coalescing timer for wrangler updates: when the wrangler thread
         # processes images faster than the GUI can render, only the most
@@ -917,6 +923,36 @@ class staticWidget(QWidget):
             if btn is not None:
                 btn.setEnabled(True)
 
+    def _enter_run_state(self):
+        """Single owner of run START (task #68): mark a wrangler/integrator run
+        in progress.  Idempotent — re-entry while already active is a no-op so
+        re-fired ``started`` signals don't double-toggle.
+
+        Drives the display persist flag (so the 2-D panels keep their last
+        content during the run, matching the 1-D plot).  Wired through the paths
+        that always fire on a run start: ``start_wrangler`` (wrangler live/batch)
+        and the ``integrator_thread.started`` signal (reintegrate).  Part 2
+        extends this owner to also disable the processing controls.
+        """
+        if self._run_active:
+            return
+        self._run_active = True
+        self.displayframe.set_processing_active(True)
+
+    def _exit_run_state(self):
+        """Single owner of run END (task #68): mark the run finished.
+        Idempotent — exiting an already-idle state is a no-op.
+
+        Reached on every end path including Stop and exceptions, because it is
+        driven from the ``finished`` handlers (``QThread.finished`` fires
+        whenever ``run()`` returns).  Ends the display persist window.  Part 2
+        extends this owner to also re-enable the controls mode-correctly.
+        """
+        if not self._run_active:
+            return
+        self._run_active = False
+        self.displayframe.set_processing_active(False)
+
     def update_all(self, idx=None):
         """Updates all data in displays.
 
@@ -958,9 +994,10 @@ class staticWidget(QWidget):
         integratorThread
         """
         self.thread_state_changed()
-        # End the processing-active window BEFORE the final refresh so the 2D
-        # panels resume normal blank-on-missing behavior for the final frame.
-        self.displayframe.set_processing_active(False)
+        # End the run through the single run-state owner (task #68) BEFORE the
+        # final refresh so the 2D panels resume normal blank-on-missing for the
+        # final frame.
+        self._exit_run_state()
         self.enable_integration(True)
         self.h5viewer.set_open_enabled(True)
         self.update_all()
@@ -1137,11 +1174,11 @@ class staticWidget(QWidget):
         self.h5viewer.file_thread.no_nxs = getattr(
             self.wrangler.thread, 'xye_only', False)
 
-        # Panel-consistency: mark the run active so the 2D panels keep their
-        # last-rendered content (instead of blanking) while the run's frames
-        # arrive — matching the 1D plot's persistence.  Cleared in
-        # wrangler_finished.
-        self.displayframe.set_processing_active(True)
+        # Mark the run active through the single run-state owner (task #68):
+        # the 2D panels keep their last-rendered content (instead of blanking)
+        # while the run's frames arrive — matching the 1D plot's persistence.
+        # Called synchronously here (GUI thread).  Cleared in wrangler_finished.
+        self._enter_run_state()
 
         self.wrangler.thread.start()
 
@@ -1149,9 +1186,11 @@ class staticWidget(QWidget):
         """Called by the wrangler finished signal. If current scan
         matches the wrangler scan, allows for integration.
         """
-        # End the processing-active window BEFORE the final flush so the 2D
-        # panels resume normal blank-on-missing behavior for the final frame.
-        self.displayframe.set_processing_active(False)
+        # End the run through the single run-state owner (task #68) BEFORE the
+        # final flush so the 2D panels resume normal blank-on-missing for the
+        # final frame.  Idempotent: a later integrator_thread_finished() (when
+        # the scan matches, below) calls _exit_run_state again as a no-op.
+        self._exit_run_state()
 
         # Flush any pending coalesced update so the final frame is shown.
         self._update_timer.stop()

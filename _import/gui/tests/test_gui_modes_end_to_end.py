@@ -1282,3 +1282,62 @@ def test_slice_range_label_tracks_plotunit_and_mode(widget):
     df.scan.gi = False
     df.set_axes()
     assert Chi in df.ui.slice.text()               # refreshed, no click needed
+
+
+# ---------------------------------------------------------------------------
+# Run-state owner (task #68) — single source of truth for "a run is active".
+#
+# These drive the REAL staticWidget's run-state owner (_enter_run_state /
+# _exit_run_state) and assert it flips displayframe._processing_active on
+# start/finish, that the finished slot (which fires on success AND Stop/abort)
+# reaches the exit, and that re-entry is idempotent.  (Part 2 adds the
+# control-disable tests on top of this owner.)
+# ---------------------------------------------------------------------------
+
+def test_run_state_toggles_processing_active(widget):
+    w = widget
+    w._exit_run_state()                      # idle baseline
+    assert w._run_active is False
+
+    w._enter_run_state()
+    assert w._run_active is True
+    assert w.displayframe._processing_active is True
+
+    w._exit_run_state()
+    assert w._run_active is False
+    assert w.displayframe._processing_active is False
+
+
+def test_run_state_is_idempotent(widget):
+    w = widget
+    w._exit_run_state()                      # idle baseline (exit-when-idle is a no-op)
+    assert w._run_active is False
+
+    calls = []
+    real = type(w.displayframe).set_processing_active
+    w.displayframe.set_processing_active = lambda active: (
+        calls.append(active), real(w.displayframe, active))[1]
+
+    w._enter_run_state()
+    w._enter_run_state()                     # re-entry: no-op (guard)
+    w._exit_run_state()
+    w._exit_run_state()                      # re-exit: no-op (guard)
+
+    # The setter fired exactly once True then once False — no double-toggle.
+    assert calls == [True, False], calls
+    assert w._run_active is False
+
+
+def test_finished_slot_reaches_exit_state(widget):
+    """QThread.finished fires on success AND Stop/exception, so the finished
+    slot must drive _exit_run_state.  Calling the real integrator_thread_finished
+    slot while a run is active must land in the idle end-state — the same path a
+    Stop/abort takes (finished always emits)."""
+    w = widget
+    w._enter_run_state()
+    assert w.displayframe._processing_active is True and w._run_active is True
+
+    w.integrator_thread_finished()           # the finished slot (success/Stop/abort)
+
+    assert w.displayframe._processing_active is False
+    assert w._run_active is False
