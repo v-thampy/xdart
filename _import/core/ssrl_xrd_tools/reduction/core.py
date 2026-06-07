@@ -12,6 +12,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Protocol, runtime_checkable
 
@@ -34,7 +35,14 @@ from ssrl_xrd_tools.integrate.calibration import (
     poni_to_fiber_integrator,
     poni_to_integrator,
 )
-from ssrl_xrd_tools.integrate.gid import integrate_gi_1d, integrate_gi_2d
+from ssrl_xrd_tools.integrate.gid import (
+    integrate_gi_1d,
+    integrate_gi_2d,
+    integrate_gi_exitangles,
+    integrate_gi_exitangles_1d,
+    integrate_gi_polar,
+    integrate_gi_polar_1d,
+)
 from ssrl_xrd_tools.integrate.single import integrate_1d, integrate_2d
 from ssrl_xrd_tools.io.export import write_xye
 from ssrl_xrd_tools.io.image import read_image
@@ -382,6 +390,23 @@ class Integration2DPlan:
             )
 
 
+class GI1DMode(str, Enum):
+    """Supported grazing-incidence 1D output coordinates."""
+
+    Q_TOTAL = "q_total"
+    Q_IP = "q_ip"
+    Q_OOP = "q_oop"
+    EXIT_ANGLE = "exit_angle"
+
+
+class GI2DMode(str, Enum):
+    """Supported grazing-incidence 2D output coordinates."""
+
+    QIP_QOOP = "qip_qoop"
+    Q_CHI = "q_chi"
+    EXIT_ANGLES = "exit_angles"
+
+
 @dataclass(frozen=True, slots=True)
 class GIMode:
     """Grazing-incidence reduction parameters.
@@ -397,10 +422,24 @@ class GIMode:
     aren't representable.
     """
 
-    incident_angle: float
+    incident_angle: float | None = None
+    incidence_motor: str | None = None
     tilt_angle: float = 0.0
     sample_orientation: int = 1
     method: str = "no"
+    mode_1d: GI1DMode | str = GI1DMode.Q_TOTAL
+    mode_2d: GI2DMode | str = GI2DMode.QIP_QOOP
+    npt_oop: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mode_1d", _coerce_gi_1d_mode(self.mode_1d))
+        object.__setattr__(self, "mode_2d", _coerce_gi_2d_mode(self.mode_2d))
+        if self.incident_angle is not None:
+            object.__setattr__(self, "incident_angle", float(self.incident_angle))
+        if self.npt_oop is not None and int(self.npt_oop) <= 0:
+            raise ValueError(f"GIMode.npt_oop must be > 0; got {self.npt_oop}")
+        if self.npt_oop is not None:
+            object.__setattr__(self, "npt_oop", int(self.npt_oop))
 
 
 @dataclass(slots=True)
@@ -694,9 +733,13 @@ def run_reduction(
     if plan.gi is not None:
         if scan.poni is None:
             raise ValueError("GI reduction requires scan.poni.")
+        initial_incident_angle = _resolve_gi_incident_angle(
+            scan.frames[0] if scan.frames else None,
+            plan.gi,
+        )
         fi = poni_to_fiber_integrator(
             scan.poni,
-            incident_angle=float(plan.gi.incident_angle),
+            incident_angle=float(initial_incident_angle),
             tilt_angle=float(plan.gi.tilt_angle),
             sample_orientation=int(plan.gi.sample_orientation),
         )
@@ -744,33 +787,32 @@ def run_reduction(
 
                 _emit(progress_cb, scan.name, "integrate", frame.index, completed, total)
                 if plan.gi is not None:
-                    gi_method = plan.gi.method
+                    incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
                     r1d = (
-                        integrate_gi_1d(
+                        _run_gi_1d(
                             image,
                             fi,
-                            npt=plan.integration_1d.npt,
-                            unit=plan.integration_1d.unit,
-                            method=gi_method,
+                            plan.integration_1d,
+                            plan.gi,
                             mask=mask,
-                            radial_range=plan.integration_1d.radial_range,
-                            azimuth_range=plan.integration_1d.azimuth_range,
-                            **plan.integration_1d.extra,
+                            incident_angle=incident_angle,
+                            normalization_factor=_normalization_for(
+                                frame, plan.integration_1d
+                            ),
                         )
                         if plan.integration_1d is not None else None
                     )
                     r2d = (
-                        integrate_gi_2d(
+                        _run_gi_2d(
                             image,
                             fi,
-                            npt_rad=plan.integration_2d.npt_rad,
-                            npt_azim=plan.integration_2d.npt_azim,
-                            unit=plan.integration_2d.unit,
-                            method=gi_method,
+                            plan.integration_2d,
+                            plan.gi,
                             mask=mask,
-                            radial_range=plan.integration_2d.radial_range,
-                            azimuth_range=_integration_azimuth_range(plan.integration_2d),
-                            **plan.integration_2d.extra,
+                            incident_angle=incident_angle,
+                            normalization_factor=_normalization_for(
+                                frame, plan.integration_2d
+                            ),
                         )
                         if plan.integration_2d is not None else None
                     )
@@ -884,6 +926,203 @@ def _integration_azimuth_range(
     lo, hi = plan.azimuth_range
     offset = float(plan.azimuth_offset)
     return lo - offset, hi - offset
+
+
+def _coerce_gi_1d_mode(mode: GI1DMode | str) -> GI1DMode:
+    if isinstance(mode, GI1DMode):
+        return mode
+    aliases = {
+        "qip": GI1DMode.Q_IP,
+        "q_ip": GI1DMode.Q_IP,
+        "qoop": GI1DMode.Q_OOP,
+        "q_oop": GI1DMode.Q_OOP,
+        "qtot": GI1DMode.Q_TOTAL,
+        "q_total": GI1DMode.Q_TOTAL,
+        "qtotal": GI1DMode.Q_TOTAL,
+        "polar": GI1DMode.Q_TOTAL,
+        "exit": GI1DMode.EXIT_ANGLE,
+        "exit_angle": GI1DMode.EXIT_ANGLE,
+    }
+    key = str(mode).strip().lower()
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(m.value for m in GI1DMode)
+        raise ValueError(f"unknown GI 1D mode {mode!r}; expected one of {allowed}") from exc
+
+
+def _coerce_gi_2d_mode(mode: GI2DMode | str) -> GI2DMode:
+    if isinstance(mode, GI2DMode):
+        return mode
+    aliases = {
+        "qip_qoop": GI2DMode.QIP_QOOP,
+        "qip-qoop": GI2DMode.QIP_QOOP,
+        "gi2d": GI2DMode.QIP_QOOP,
+        "q_chi": GI2DMode.Q_CHI,
+        "q-chi": GI2DMode.Q_CHI,
+        "polar": GI2DMode.Q_CHI,
+        "exit": GI2DMode.EXIT_ANGLES,
+        "exit_angle": GI2DMode.EXIT_ANGLES,
+        "exit_angles": GI2DMode.EXIT_ANGLES,
+    }
+    key = str(mode).strip().lower()
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(m.value for m in GI2DMode)
+        raise ValueError(f"unknown GI 2D mode {mode!r}; expected one of {allowed}") from exc
+
+
+def _resolve_gi_incident_angle(frame: Frame | None, gi: GIMode) -> float:
+    if gi.incident_angle is not None:
+        return float(gi.incident_angle)
+    if frame is not None and frame.geometry is not None:
+        if frame.geometry.incident_angle is not None:
+            return float(frame.geometry.incident_angle)
+    if frame is not None and gi.incidence_motor:
+        value = _metadata_get_case_insensitive(frame.metadata, gi.incidence_motor)
+        try:
+            angle = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Frame {frame.index} cannot resolve GI incident angle from "
+                f"metadata motor {gi.incidence_motor!r}."
+            ) from exc
+        if np.isfinite(angle):
+            return angle
+    detail = (
+        f"Frame {frame.index} " if frame is not None else ""
+    )
+    raise ValueError(
+        detail
+        + "GI reduction requires GIMode.incident_angle, "
+        "Frame.geometry.incident_angle, or GIMode.incidence_motor metadata."
+    )
+
+
+def _gi_plan_extra(
+    plan: Integration1DPlan | Integration2DPlan,
+    normalization_factor: float | None,
+) -> dict[str, Any]:
+    extra = dict(plan.extra)
+    if plan.error_model is not None:
+        extra.setdefault("error_model", plan.error_model)
+    if plan.polarization_factor is not None:
+        extra.setdefault("polarization_factor", plan.polarization_factor)
+    if normalization_factor is not None:
+        extra.setdefault("normalization_factor", normalization_factor)
+    return extra
+
+
+def _run_gi_1d(
+    image: np.ndarray,
+    fi: Any,
+    plan: Integration1DPlan,
+    gi: GIMode,
+    *,
+    mask: np.ndarray | None,
+    incident_angle: float,
+    normalization_factor: float | None,
+) -> IntegrationResult1D:
+    extra = _gi_plan_extra(plan, normalization_factor)
+    npt_oop = extra.pop("npt_oop", gi.npt_oop if gi.npt_oop is not None else plan.npt)
+    common = dict(
+        npt=plan.npt,
+        method=gi.method,
+        mask=mask,
+        radial_range=plan.radial_range,
+        azimuth_range=plan.azimuth_range,
+        incident_angle=incident_angle,
+        tilt_angle=gi.tilt_angle,
+        sample_orientation=gi.sample_orientation,
+    )
+    if gi.mode_1d is GI1DMode.Q_IP:
+        return integrate_gi_1d(
+            image,
+            fi,
+            unit="qip_A^-1",
+            npt_oop=npt_oop,
+            vertical_integration=False,
+            **common,
+            **extra,
+        )
+    if gi.mode_1d is GI1DMode.Q_OOP:
+        return integrate_gi_1d(
+            image,
+            fi,
+            unit="qoop_A^-1",
+            npt_oop=npt_oop,
+            vertical_integration=True,
+            **common,
+            **extra,
+        )
+    if gi.mode_1d is GI1DMode.EXIT_ANGLE:
+        return integrate_gi_exitangles_1d(
+            image,
+            fi,
+            **common,
+            **extra,
+        )
+    return integrate_gi_polar_1d(
+        image,
+        fi,
+        unit=plan.unit,
+        **common,
+        **extra,
+    )
+
+
+def _run_gi_2d(
+    image: np.ndarray,
+    fi: Any,
+    plan: Integration2DPlan,
+    gi: GIMode,
+    *,
+    mask: np.ndarray | None,
+    incident_angle: float,
+    normalization_factor: float | None,
+) -> IntegrationResult2D:
+    extra = _gi_plan_extra(plan, normalization_factor)
+    common = dict(
+        npt_rad=plan.npt_rad,
+        npt_azim=plan.npt_azim,
+        method=gi.method,
+        mask=mask,
+        incident_angle=incident_angle,
+        tilt_angle=gi.tilt_angle,
+        sample_orientation=gi.sample_orientation,
+    )
+    if gi.mode_2d is GI2DMode.Q_CHI:
+        return integrate_gi_polar(
+            image,
+            fi,
+            unit=plan.unit,
+            radial_range=plan.radial_range,
+            azimuth_range=_integration_azimuth_range(plan),
+            **common,
+            **extra,
+        )
+    if gi.mode_2d is GI2DMode.EXIT_ANGLES:
+        return integrate_gi_exitangles(
+            image,
+            fi,
+            unit=plan.unit,
+            radial_range=plan.radial_range,
+            azimuth_range=_integration_azimuth_range(plan),
+            **common,
+            **extra,
+        )
+    x_range = extra.pop("x_range", plan.radial_range)
+    y_range = extra.pop("y_range", _integration_azimuth_range(plan))
+    return integrate_gi_2d(
+        image,
+        fi,
+        unit=plan.unit,
+        radial_range=x_range,
+        azimuth_range=y_range,
+        **common,
+        **extra,
+    )
 
 
 def _cached_mask_for_shape(

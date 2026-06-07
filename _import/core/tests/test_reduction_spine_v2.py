@@ -3,11 +3,18 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D
+from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from ssrl_xrd_tools.core.scan import FrameGeometry
 from ssrl_xrd_tools.reduction import (
+    Frame,
+    GI1DMode,
+    GI2DMode,
+    GIMode,
     Integration1DPlan,
+    Integration2DPlan,
     MemorySink,
     ReductionPlan,
+    Scan,
     XYESink,
     run_reduction,
 )
@@ -21,6 +28,17 @@ def _r1d(value: float) -> IntegrationResult1D:
         intensity=np.array([value, value + 1.0]),
         sigma=np.array([0.1, 0.2]),
         unit="q_A^-1",
+    )
+
+
+def _r2d(value: float) -> IntegrationResult2D:
+    return IntegrationResult2D(
+        radial=np.array([0.0, 1.0]),
+        azimuthal=np.array([-1.0, 1.0]),
+        intensity=np.full((2, 2), value, dtype=float),
+        sigma=None,
+        unit="qip_A^-1",
+        azimuthal_unit="qoop_A^-1",
     )
 
 
@@ -67,6 +85,136 @@ def test_run_reduction_fans_out_to_memory_and_xye(
     assert out.exists()
     saved = np.loadtxt(out)
     assert np.allclose(saved[:, 1], [4.0, 5.0])
+
+
+def test_run_reduction_gi_resolves_incidence_and_dispatches_modes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[str, dict]] = []
+    fake_fi = object()
+
+    monkeypatch.setattr(
+        reduction_core,
+        "poni_to_fiber_integrator",
+        lambda poni, **kwargs: calls.append(("fiber", kwargs)) or fake_fi,
+    )
+
+    def fake_gi_1d(image, fi, **kwargs):
+        calls.append(("gi1d", kwargs))
+        assert fi is fake_fi
+        return _r1d(float(np.sum(image)))
+
+    def fake_gi_2d(image, fi, **kwargs):
+        calls.append(("gi2d", kwargs))
+        assert fi is fake_fi
+        return _r2d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_gi_1d", fake_gi_1d)
+    monkeypatch.setattr(reduction_core, "integrate_gi_2d", fake_gi_2d)
+
+    scan = Scan(
+        "gi",
+        [
+            Frame(0, image=np.ones((2, 2)), metadata={"Th": 0.15, "I0": 10.0}),
+            Frame(1, image=np.full((2, 2), 2.0), metadata={"th": 0.20, "I0": 20.0}),
+        ],
+        poni=object(),
+    )
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=3, monitor_key="i0"),
+        integration_2d=Integration2DPlan(
+            npt_rad=4,
+            npt_azim=5,
+            unit="qip_A^-1",
+            monitor_key="I0",
+            extra={"x_range": (-1.0, 1.0), "y_range": (0.0, 2.0)},
+        ),
+        gi=GIMode(
+            incidence_motor="TH",
+            mode_1d="q_oop",
+            mode_2d="qip_qoop",
+            npt_oop=7,
+        ),
+    )
+
+    result = run_reduction(plan, scan)
+
+    assert result.n_processed == 2
+    assert calls[0] == (
+        "fiber",
+        {"incident_angle": 0.15, "tilt_angle": 0.0, "sample_orientation": 1},
+    )
+    first_1d = calls[1][1]
+    assert first_1d["unit"] == "qoop_A^-1"
+    assert first_1d["vertical_integration"] is True
+    assert first_1d["npt_oop"] == 7
+    assert first_1d["incident_angle"] == 0.15
+    assert first_1d["normalization_factor"] == 10.0
+    first_2d = calls[2][1]
+    assert first_2d["unit"] == "qip_A^-1"
+    assert first_2d["radial_range"] == (-1.0, 1.0)
+    assert first_2d["azimuth_range"] == (0.0, 2.0)
+    assert first_2d["incident_angle"] == 0.15
+    assert first_2d["normalization_factor"] == 10.0
+    assert calls[3][1]["incident_angle"] == 0.20
+
+
+def test_run_reduction_gi_dispatches_polar_and_exit_angle_modes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[str] = []
+    monkeypatch.setattr(reduction_core, "poni_to_fiber_integrator", lambda *a, **k: object())
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_gi_polar_1d",
+        lambda image, fi, **kwargs: calls.append("polar_1d") or _r1d(1.0),
+    )
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_gi_exitangles_1d",
+        lambda image, fi, **kwargs: calls.append("exit_1d") or _r1d(2.0),
+    )
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_gi_polar",
+        lambda image, fi, **kwargs: calls.append("polar_2d") or _r2d(3.0),
+    )
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_gi_exitangles",
+        lambda image, fi, **kwargs: calls.append("exit_2d") or _r2d(4.0),
+    )
+
+    scan = Scan(
+        "gi",
+        [Frame(0, image=np.ones((2, 2)), geometry=FrameGeometry(incident_angle=0.3))],
+        poni=object(),
+    )
+    run_reduction(
+        ReductionPlan(
+            integration_1d=Integration1DPlan(),
+            integration_2d=Integration2DPlan(),
+            gi=GIMode(mode_1d=GI1DMode.Q_TOTAL, mode_2d=GI2DMode.Q_CHI),
+        ),
+        scan,
+    )
+    run_reduction(
+        ReductionPlan(
+            integration_1d=Integration1DPlan(),
+            integration_2d=Integration2DPlan(),
+            gi=GIMode(mode_1d=GI1DMode.EXIT_ANGLE, mode_2d=GI2DMode.EXIT_ANGLES),
+        ),
+        scan,
+    )
+
+    assert calls == ["polar_1d", "polar_2d", "exit_1d", "exit_2d"]
+
+
+def test_gi_incident_angle_must_be_resolvable(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(reduction_core, "poni_to_fiber_integrator", lambda *a, **k: object())
+    scan = Scan("gi", [Frame(0, image=np.ones((2, 2)))], poni=object())
+    with pytest.raises(ValueError, match="incident_angle"):
+        run_reduction(ReductionPlan(gi=GIMode()), scan)
 
 
 def test_run_reduction_executor_and_freeze_policy_are_explicit_todos(
