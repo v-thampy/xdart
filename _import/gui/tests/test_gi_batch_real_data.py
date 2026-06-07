@@ -144,6 +144,9 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     # The real scout-freeze methods (the code under test for the GI matrix).
     w._freeze_gi_1d_auto_range = MethodType(imageThread._freeze_gi_1d_auto_range, w)
     w._freeze_gi_2d_auto_ranges = MethodType(imageThread._freeze_gi_2d_auto_ranges, w)
+    # #70: the freeze now scouts first+last via these helpers (union of extremes).
+    w._scout_pending_frames = MethodType(imageThread._scout_pending_frames, w)
+    w._build_scout = MethodType(imageThread._build_scout, w)
     # Spy on the xye flush: snapshot the Phase-1 integrated frames rather
     # than writing xye files (and don't clear the buffer).
     captured = {}
@@ -801,3 +804,84 @@ def test_gi_freeze_covers_last_frame_extent():
     tol = (yr[1] - yr[0]) * 1e-5
     assert yr[0] - tol <= lo and hi <= yr[1] + tol, \
         f"2D qoop frozen y_range {yr} clips last-frame qoop ({lo:.4f},{hi:.4f})"
+
+
+# ---------------------------------------------------------------------------
+# Union-scout freeze coverage (#70): the freeze must bracket the WHOLE scan, not
+# just frame 0.  The hard, data-independent bite (a single scout clipping a
+# drifted second scout) is the headless ssrl freeze_common_axis unit test; here
+# we confirm on real multi-incidence data that the union scout covers every
+# frame and that the incidence extremes genuinely differ (so a single-frame
+# pending[0] scout would clip the other extreme — the spine can't catch this
+# because live/batch/reload all share the same frozen range).
+#
+# NOTE: the available angle-dependence fixtures span only th 0.15-0.35°, where
+# the 2% pad largely absorbs the per-frame shift — so the *absolute* clip on
+# this data is sub-pad.  A genuinely wide-incidence fixture would make the
+# absolute clip large; the union fix is correct regardless and is bitten hard by
+# the ssrl unit test.
+# ---------------------------------------------------------------------------
+
+def _freeze_1d_output_range(poni, mask, pending, gi_mode_1d):
+    """Drive the production GI 1D freeze over ``pending`` and return the frozen
+    output-axis (lo, hi) it wrote into bai_1d_args (or None)."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        gi_1d_output_axis_key,
+    )
+    w, _ = _build_batch_thread(poni, mask, gi=True)
+    w.xye_only = False
+    scan = _make_scan(
+        poni, mask, {"gi_mode_1d": gi_mode_1d, "numpoints": 128},
+        {"gi_mode_2d": "qip_qoop", "npt_rad": 64, "npt_azim": 48}, gi=True)
+    w._freeze_gi_1d_auto_range(scan, pending)
+    return scan.bai_1d_args.get(gi_1d_output_axis_key(gi_mode_1d))
+
+
+def test_gi_union_scout_covers_all_frames_not_just_frame0():
+    poni = _tiff_poni()
+    names = [f"Combi4_Angledependence_samz_4p9_03271002_{i:04d}.tif"
+             for i in range(1, 6)]                  # th 0.15 .. 0.35, 5 frames
+    raw = [_load_tiff(n) for n in names]
+    mask = _tiff_mask(raw[0][0])
+    pending = [(names[i], i + 1, raw[i][0], raw[i][2], 0.0, 0.0)
+               for i in range(len(names))]
+    gi_mode_1d = "q_oop"                            # out-of-plane → incidence-sensitive
+
+    union = _freeze_1d_output_range(poni, mask, pending, gi_mode_1d)
+    assert union is not None
+    singles = [_freeze_1d_output_range(poni, mask, [pending[i]], gi_mode_1d)
+               for i in range(len(pending))]
+    assert all(s is not None for s in singles)
+
+    ulo, uhi = union
+    # The union scout brackets EVERY frame's frozen extent — the whole scan.
+    for i, (slo, shi) in enumerate(singles):
+        assert ulo <= slo + 1e-9 and uhi >= shi - 1e-9, \
+            f"union {union} does not cover frame {i} extent {(slo, shi)}"
+
+    # Load-bearing: the two incidence extremes do NOT mutually bracket, so a
+    # single-frame scout from one extreme clips the other — the union is needed.
+    first, last = singles[0], singles[-1]
+
+    def _brackets(a, b):
+        return a[0] <= b[0] + 1e-9 and a[1] >= b[1] - 1e-9
+
+    assert not (_brackets(first, last) and _brackets(last, first)), (
+        "the incidence extremes have identical extents — union not exercised "
+        "(need multi-incidence data)")
+    # The union strictly extends beyond at least one single-frame scout.
+    assert ulo < first[0] - 1e-12 or ulo < last[0] - 1e-12 \
+        or uhi > first[1] + 1e-12 or uhi > last[1] + 1e-12
+
+    # Order-independence (the operative fix vs the old pending[0] scout): the
+    # freeze scouts by metadata incidence, so REVERSING the pending order yields
+    # the SAME frozen range.  A single pending[0] scout is order-DEPENDENT (it
+    # would freeze from whichever frame is first, clipping the rest on a
+    # descending / unsorted scan) — which is exactly the bug this fixes.
+    union_rev = _freeze_1d_output_range(
+        poni, mask, list(reversed(pending)), gi_mode_1d)
+    assert union_rev == pytest.approx(union), \
+        "freeze is order-dependent — must scout by incidence, not position"
+    # Sanity that the order test is meaningful: pending[0] differs between the
+    # two orders, so an order-dependent (single-scout) freeze WOULD diverge.
+    assert singles[0] != pytest.approx(singles[-1])
