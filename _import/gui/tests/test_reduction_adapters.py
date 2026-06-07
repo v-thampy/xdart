@@ -67,24 +67,6 @@ class _FakeIntegrator:
     pass
 
 
-class _BorrowPool:
-    class _Borrowed:
-        def __init__(self, ai):
-            self.ai = ai
-
-        def __enter__(self):
-            return self.ai
-
-        def __exit__(self, *args):
-            return False
-
-    def __init__(self):
-        self.ai = _FakeIntegrator()
-
-    def borrow(self):
-        return self._Borrowed(self.ai)
-
-
 def test_legacy_ewald_aliases_are_dropped() -> None:
     """The Live rename's transitional Ewald* class + function aliases were
     removed at the end of the rename release window.  Reader-side string
@@ -587,21 +569,8 @@ def test_flat_global_mask_is_preserved_until_shape_is_known() -> None:
     )
 
 
-def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> None:
+def test_nexus_worker_builds_headless_frame_shell() -> None:
     from xdart.gui.tabs.static_scan.wranglers import nexus_wrangler_thread
-
-    calls = []
-
-    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
-        calls.append((frame.idx, plan, scan_name, global_mask, integrator))
-        frame.int_1d = _r1d()
-        frame.int_2d = _r2d()
-        return frame
-
-    # dispatch_live_frame_reduction calls reduce_live_frame from its defining
-    # module (xdart.modules.reduction).  Patch the canonical name; the
-    # symbol is no longer re-imported into the wrangler-thread modules.
-    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
 
     scan = SimpleNamespace(
         name="scan",
@@ -625,24 +594,22 @@ def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> Non
     )
     worker._resolve_frame_mask = lambda _scan, _img: np.array([0])
 
-    frame = nexus_wrangler_thread.nexusThread._integrate_one(
+    frame = nexus_wrangler_thread.nexusThread._build_frame(
         worker,
         scan,
-        _BorrowPool(),
-        ReductionPlan(
-            integration_1d=Integration1DPlan(),
-            integration_2d=Integration2DPlan(),
-        ),
         5,
         np.ones((2, 2)),
         {"i0": 1.0},
     )
 
     assert frame.idx == 5
-    assert frame.int_1d is not None
-    assert frame.int_2d is not None
-    assert calls and calls[0][0] == 5
-    assert worker._xye_buffer[0][0] == 5
+    assert frame.int_1d is None
+    assert frame.int_2d is None
+    assert frame.source_file.endswith("scan.nxs")
+    assert frame.source_frame_idx == 5
+    assert frame.skip_map_raw is True
+    np.testing.assert_array_equal(frame.mask, np.array([0]))
+    assert worker._xye_buffer == []
 
 
 def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> None:
