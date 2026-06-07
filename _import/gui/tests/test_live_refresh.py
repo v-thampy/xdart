@@ -1066,26 +1066,18 @@ def test_live_gi_clip_warning_fires_once_in_live_gi_only():
     assert labels == []
 
 
-def test_wrangler_executor_shutdown_contract():
-    """The persistent integration pool must be reclaimable: _get_executor builds
-    it, _shutdown_executor tears it down and is idempotent.  run()'s finally
-    calls _shutdown_executor so worker threads don't leak past a run (verified
-    by reading run(); exercised end-to-end by a real GUI run)."""
+def test_wrangler_thread_no_longer_owns_integration_executor():
+    """The GUI wrangler base should not keep an integration executor.
+
+    Batch parallelism is owned by ssrl_xrd_tools.reduction.run_reduction now;
+    keeping a second GUI-side executor makes shutdown and cancellation harder
+    to reason about.
+    """
     from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
-    host = SimpleNamespace(_executor=None, _executor_workers=0)
-    host._get_executor = MethodType(wranglerThread._get_executor, host)
-    host._shutdown_executor = MethodType(wranglerThread._shutdown_executor, host)
 
-    ex = host._get_executor(2)
-    assert host._executor is ex and host._executor_workers == 2
-    # Same worker count → same pool reused (the P5 within-run optimization).
-    assert host._get_executor(2) is ex
-
-    host._shutdown_executor()
-    assert host._executor is None and host._executor_workers == 0
-    # Idempotent — safe to call again (run() finally + __del__ both call it).
-    host._shutdown_executor()
-    assert host._executor is None
+    assert not hasattr(wranglerThread, "_get_executor")
+    assert not hasattr(wranglerThread, "_shutdown_executor")
+    assert not hasattr(wranglerThread, "_parallel_integrate")
 
 
 def _scout_host(motor):

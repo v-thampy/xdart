@@ -6,7 +6,6 @@
 # Standard library imports
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from queue import Queue
 import threading
@@ -274,57 +273,6 @@ class wranglerThread(Qt.QtCore.QThread):
         self.xye_only = False
         self.max_cores = 1
 
-        # ── P5: persistent ThreadPoolExecutor ───────────────────────
-        # Re-used across every ``_parallel_integrate`` call instead of
-        # being recreated per chunk.  Lazy-created on first use, and
-        # recreated only if the requested worker count changes between
-        # calls (the wrangler GUI lets the user retune ``max_cores``
-        # mid-scan via the parameter tree).  Pre-fix this created a
-        # fresh pool every 16-frame SPEC batch; the overhead is small
-        # per chunk but adds up on long fast scans and on slow CPUs
-        # where pool start-up dominates the chunk's CPU budget.
-        self._executor: ThreadPoolExecutor | None = None
-        self._executor_workers: int = 0
-
-    def _get_executor(self, n_workers: int) -> ThreadPoolExecutor:
-        """Return the persistent executor, (re)creating it if needed.
-
-        Recreates only if the requested ``n_workers`` differs from the
-        currently-cached value — so a stable scan reuses one pool for
-        every chunk.
-        """
-        n_workers = max(1, int(n_workers))
-        if self._executor is None or self._executor_workers != n_workers:
-            self._shutdown_executor()
-            self._executor = ThreadPoolExecutor(max_workers=n_workers)
-            self._executor_workers = n_workers
-        return self._executor
-
-    def _shutdown_executor(self) -> None:
-        """Tear down the persistent executor if one is held.
-
-        Called automatically by :meth:`_get_executor` when the worker
-        count changes, and again by the destructor.  Subclasses that
-        want to be tidy at end-of-scan may call this explicitly from
-        their ``run()`` ``finally`` blocks, but it's not required —
-        the pool will be cleaned up at QThread destruction either way.
-        """
-        if self._executor is not None:
-            try:
-                self._executor.shutdown(wait=True, cancel_futures=True)
-            except TypeError:  # pragma: no cover  - py < 3.9
-                self._executor.shutdown(wait=True)
-            self._executor = None
-            self._executor_workers = 0
-
-    def __del__(self) -> None:  # pragma: no cover — destructor timing
-        # Belt-and-braces cleanup so the worker threads exit when the
-        # wrangler widget is destroyed.  Safe to call repeatedly.
-        try:
-            self._shutdown_executor()
-        except Exception:
-            pass
-
     def run(self):
         """Main task. Subclasses (e.g. imageThread) override this."""
         pass
@@ -543,71 +491,3 @@ class wranglerThread(Qt.QtCore.QThread):
                 scan._save_to_nexus()
         finally:
             _get_h5pool().resume(scan.data_file)
-
-    def _parallel_integrate(self, items, integrate_fn, n_workers,
-                             *, label="integration"):
-        """Run ``integrate_fn`` over ``items`` in a ThreadPoolExecutor.
-
-        Shared dispatch primitive used by both SPEC batch and NeXus
-        chunked workers.  Each wrangler still owns its own per-item
-        ``integrate_fn`` (signatures differ) and its own post-publish
-        / save / xye logic.
-
-        Behavior:
-          * Submits one future per item up-front, then waits.
-          * F2 cancel-fast: on Stop, calls
-            ``pool.shutdown(wait=True, cancel_futures=True)`` so
-            queued-but-not-running futures are dropped immediately.
-            ``integrate_fn`` should ALSO check ``self.command``
-            early so already-running workers can bail before the
-            expensive 2D integration starts; pre-F2 the user could
-            wait up to one full chunk after pressing Stop, because
-            running workers kept going to completion.
-          * Per-item exceptions are logged at error level and the
-            corresponding frame is dropped from the result list.
-          * Returns frames in idx-sorted order so on-disk
-            frame_index stays monotonic.
-
-        Returns a ``list[LiveFrame]`` with ``None`` entries elided.
-
-        P5: uses the persistent :attr:`_executor` instead of creating a
-        fresh ``ThreadPoolExecutor`` per call.  Stop-mid-chunk cancels
-        only the queued futures of THIS chunk (not the whole pool); the
-        executor stays alive for the next chunk.
-        """
-        if not items:
-            return []
-
-        completed: list = []
-        pool = self._get_executor(n_workers)
-        futures = [pool.submit(integrate_fn, item) for item in items]
-        try:
-            for fut in as_completed(futures):
-                if self.command == 'stop':
-                    # Cancel everything still queued; let in-flight
-                    # workers finish (Python doesn't pre-empt threads,
-                    # but the integrate_fn's own stop checks will
-                    # short-circuit before they hit pyFAI).
-                    for f in futures:
-                        f.cancel()
-                    break
-                try:
-                    frame = fut.result()
-                except Exception as e:
-                    logger.error(
-                        '[%s] worker raised: %s', label, e, exc_info=True,
-                    )
-                    continue
-                if frame is None:
-                    continue
-                completed.append(frame)
-        finally:
-            # On Stop, drain any remaining futures we cancelled above so
-            # they don't leak into the next chunk's wait set.  No pool
-            # shutdown — the executor persists for the next chunk.
-            for f in futures:
-                if not f.done():
-                    f.cancel()
-
-        completed.sort(key=lambda a: getattr(a, 'idx', 0) or 0)
-        return completed

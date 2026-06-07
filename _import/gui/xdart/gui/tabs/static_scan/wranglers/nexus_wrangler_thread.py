@@ -84,8 +84,8 @@ class nexusThread(wranglerThread):
     """Thread for processing NeXus/HDF5 image stacks.
 
     Reads an image dataset from a NeXus file, integrates each frame
-    via a parallel ``ThreadPoolExecutor``, and emits ``sigUpdate``
-    after each one.
+    through the headless reduction spine, and emits ``sigUpdate`` after
+    each one.
 
     signals:
         showLabel: str, status text for the UI label
@@ -152,13 +152,8 @@ class nexusThread(wranglerThread):
     # ── Main entry point ─────────────────────────────────────────────────
 
     def run(self):
-        """QThread entry: run the integration body, always reclaiming the
-        integration pool — even on an exception-aborted run — so worker threads
-        don't outlive the run (matches imageThread.run()'s finally)."""
-        try:
-            self._run_impl()
-        finally:
-            self._shutdown_executor()
+        """QThread entry: run the integration body."""
+        self._run_impl()
 
     def _run_impl(self):
         """Read frames from a NeXus file and integrate them in parallel."""
