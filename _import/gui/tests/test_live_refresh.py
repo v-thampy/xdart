@@ -1033,6 +1033,28 @@ def test_absorb_chunk_drops_stale_generation():
     assert viewer.data_1d == {} and viewer.data_2d == {}
 
 
+def test_wrangler_executor_shutdown_contract():
+    """The persistent integration pool must be reclaimable: _get_executor builds
+    it, _shutdown_executor tears it down and is idempotent.  run()'s finally
+    calls _shutdown_executor so worker threads don't leak past a run (verified
+    by reading run(); exercised end-to-end by a real GUI run)."""
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+    host = SimpleNamespace(_executor=None, _executor_workers=0)
+    host._get_executor = MethodType(wranglerThread._get_executor, host)
+    host._shutdown_executor = MethodType(wranglerThread._shutdown_executor, host)
+
+    ex = host._get_executor(2)
+    assert host._executor is ex and host._executor_workers == 2
+    # Same worker count → same pool reused (the P5 within-run optimization).
+    assert host._get_executor(2) is ex
+
+    host._shutdown_executor()
+    assert host._executor is None and host._executor_workers == 0
+    # Idempotent — safe to call again (run() finally + __del__ both call it).
+    host._shutdown_executor()
+    assert host._executor is None
+
+
 def _scout_host(motor):
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
     host = SimpleNamespace(incidence_motor=motor)

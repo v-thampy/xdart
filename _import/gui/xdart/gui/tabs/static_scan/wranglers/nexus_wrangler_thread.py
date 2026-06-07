@@ -404,6 +404,10 @@ class nexusThread(wranglerThread):
             'NeXus total time: %.2fs, %d frames', time.time() - t0,
             files_processed,
         )
+        # Reclaim the persistent integration pool at end of run rather than
+        # leaking its worker threads until QThread.__del__.  Idempotent;
+        # __del__ remains the backstop for an exception-aborted run.
+        self._shutdown_executor()
 
     # ── Helpers ─────────────────────────────────────────────────────────
 

@@ -513,6 +513,11 @@ class imageThread(wranglerThread):
             # prefetcher.
             self._prefetch_stop_prior()
             self._eiger_close_master()  # ensure Eiger handle is released
+            # Reclaim the persistent integration pool at end of run instead of
+            # leaking its worker threads until QThread.__del__ (which can also
+            # block the finalizer if a worker is wedged in pyFAI).  The pool is
+            # reused per-chunk WITHIN a run; recreated on the next run.
+            self._shutdown_executor()
         logger.info('Total Time: %.2fs', time.time() - t0)
         # Final echo so the user can copy the output path straight from
         # the terminal without scrolling back to the per-scan banner.
