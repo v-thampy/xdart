@@ -46,7 +46,6 @@ from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
     StandardPlanCache,
-    dispatch_live_frame_reduction,
     reduce_live_frames,
     sync_live_scan_gi_settings,
 )
@@ -1291,13 +1290,14 @@ class imageThread(wranglerThread):
             tilt_angle=self.tilt_angle,
         )
 
-        dispatch_live_frame_reduction(
-            frame, scan,
-            standard_plan=self._plan_cache.get(
-                scan, integrate_2d=not scan.skip_2d,
-            ),
-            integrator=scan._cached_integrator,
+        reduce_live_frames(
+            [frame],
+            self._plan_cache.get(scan, integrate_2d=not scan.skip_2d),
+            scan_name=str(getattr(scan, "name", "scan")),
             global_mask=self.mask,
+            integrator=scan._cached_integrator,
+            poni=self.poni,
+            chunk_size=1,
         )
         # Timing kept for parity with the legacy logging; the
         # standard path now does both 1D + 2D in one call so we

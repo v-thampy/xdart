@@ -23,7 +23,6 @@ from xdart.modules.live import LiveFrame, LiveFrameSeries, LiveScan
 from xdart.modules.live_compat import normalize_live_class_names
 import xdart.modules.reduction as reduction_adapters
 from xdart.modules.reduction import (
-    dispatch_live_frame_reduction,
     frame_from_live_frame,
     plan_from_live_scan,
     reduce_live_frame,
@@ -392,44 +391,6 @@ def test_standard_plan_cache_returns_headless_plan_for_gi_scan() -> None:
     assert plan.gi.incidence_motor == "th"
 
 
-def test_dispatch_gi_frame_uses_headless_reduction_when_plan_present(monkeypatch) -> None:
-    calls = []
-
-    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
-        calls.append((frame.idx, plan, scan_name, global_mask, integrator))
-        frame.int_1d = _r1d()
-        frame.int_2d = _r2d()
-        return frame
-
-    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
-    frame = LiveFrame(idx=4, map_raw=np.ones((2, 2)), gi=True, scan_info={"th": 0.2})
-    scan = LiveScan("scan", frames=[frame], gi=True, incidence_motor="th")
-
-    dispatch_live_frame_reduction(
-        frame,
-        scan,
-        standard_plan=ReductionPlan(gi=reduction_adapters.GIMode(incidence_motor="th")),
-        integrator="ai",
-        global_mask=np.array([0]),
-    )
-
-    assert calls and calls[0][0] == 4
-
-
-def test_dispatch_requires_headless_plan() -> None:
-    frame = LiveFrame(idx=4, map_raw=np.ones((2, 2)))
-    scan = LiveScan("scan", frames=[frame])
-
-    with pytest.raises(ValueError, match="ReductionPlan"):
-        dispatch_live_frame_reduction(
-            frame,
-            scan,
-            standard_plan=None,
-            integrator="ai",
-            global_mask=None,
-        )
-
-
 def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
     frame = LiveFrame(
         idx=7,
@@ -617,13 +578,14 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
 
     calls = []
 
-    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
-        calls.append((frame.idx, plan, scan_name, global_mask, integrator))
-        frame.int_1d = _r1d()
-        frame.int_2d = _r2d()
-        return frame
+    def fake_reduce_frames(frames, plan, **kwargs):
+        calls.append((frames[0].idx, plan, kwargs))
+        for frame in frames:
+            frame.int_1d = _r1d()
+            frame.int_2d = _r2d()
+        return list(frames)
 
-    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
+    monkeypatch.setattr(image_wrangler_thread, "reduce_live_frames", fake_reduce_frames)
 
     class _Signal:
         def emit(self, *args):
@@ -669,6 +631,7 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
     )
 
     assert calls and calls[0][0] == 1
+    assert calls[0][2]["scan_name"] == "scan"
     assert worker._xye_buffer[0][0] == 1
 
 

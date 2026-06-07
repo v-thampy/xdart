@@ -465,45 +465,6 @@ class StandardPlanCache:
         self._mask_sig = None
 
 
-def dispatch_live_frame_reduction(
-    live_frame: Any,
-    live_scan: Any,
-    *,
-    standard_plan: ReductionPlan | None,
-    integrator: Any,
-    global_mask: Any,
-) -> None:
-    """Run reduction for one live frame through the headless path.
-
-    Single dispatch point shared by wrangler workers.  Standard and GI frames
-    both reduce through ``ssrl_xrd_tools.reduction.run_reduction`` now; a
-    missing plan is a programmer error, not a fallback to xdart's old
-    integration engine.
-
-    Parameters
-    ----------
-    live_frame, live_scan
-        The live frame to reduce and its parent live scan.
-    standard_plan
-        ``ReductionPlan`` for the headless path; pass ``None`` to force the
-        legacy callback.
-    integrator
-        Pre-built pyFAI integrator for the worker (typically borrowed
-        from an :class:`IntegratorPool`).
-    global_mask
-        Scan-level mask passed through unchanged.
-    """
-    if standard_plan is None:
-        raise ValueError("dispatch_live_frame_reduction requires a ReductionPlan.")
-    reduce_live_frame(
-        live_frame,
-        standard_plan,
-        scan_name=str(getattr(live_scan, "name", "scan")),
-        global_mask=global_mask,
-        integrator=integrator,
-    )
-
-
 def sync_live_scan_gi_settings(
     live_scan: Any,
     *,
@@ -725,7 +686,6 @@ def _gi_2d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
 
 __all__ = [
     "StandardPlanCache",
-    "dispatch_live_frame_reduction",
     "frame_from_live_frame",
     "scan_from_live_scan",
     "plan_from_live_scan",
