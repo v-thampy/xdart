@@ -22,6 +22,42 @@ def _default_fit_config():
     return FitConfig()
 
 
+def stitch_images(*args: Any, **kwargs: Any) -> Any:
+    from ssrl_xrd_tools.integrate.multi import stitch_images as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def process_scan_from_nexus(*args: Any, **kwargs: Any) -> Any:
+    from ssrl_xrd_tools.rsm.pipeline import process_scan_from_nexus as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def grid_scans_streaming(*args: Any, **kwargs: Any) -> Any:
+    from ssrl_xrd_tools.rsm.pipeline import grid_scans_streaming as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def fit_peaks(*args: Any, **kwargs: Any) -> Any:
+    from ssrl_xrd_tools.analysis.fitting import fit_peaks as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def fit_sequence(*args: Any, **kwargs: Any) -> Any:
+    from ssrl_xrd_tools.analysis.fitting import fit_sequence as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def sin2psi_analysis(*args: Any, **kwargs: Any) -> Any:
+    from ssrl_xrd_tools.analysis.strain import sin2psi_analysis as _impl
+
+    return _impl(*args, **kwargs)
+
+
 @dataclass(slots=True)
 class AnalysisResult:
     """Small JSON-friendly envelope around an analysis payload."""
@@ -105,8 +141,6 @@ def run_stitch(
         _metadata_series(src, labels, plan.monitor_key)
         if plan.monitor_key is not None else None
     )
-    from ssrl_xrd_tools.integrate.multi import stitch_images
-
     payload = stitch_images(
         images,
         base_poni,
@@ -157,7 +191,7 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
     """Run the streaming RSM pipeline for one source or a list of sources."""
 
     if isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
-        from ssrl_xrd_tools.rsm.pipeline import ScanInput, grid_scans_streaming
+        from ssrl_xrd_tools.rsm.pipeline import ScanInput
 
         inputs = [
             ScanInput(scan=ensure_frame_source(scan), energy=plan.energy, UB=plan.UB, roi=plan.roi)
@@ -175,8 +209,6 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
         )
         n_sources = len(inputs)
     else:
-        from ssrl_xrd_tools.rsm.pipeline import process_scan_from_nexus
-
         src = ensure_frame_source(source)  # type: ignore[arg-type]
         payload = process_scan_from_nexus(
             src,
@@ -215,8 +247,6 @@ class PeakFitPlan:
 
 
 def run_peak_fit(plan: PeakFitPlan, x: np.ndarray, y: np.ndarray) -> AnalysisResult:
-    from ssrl_xrd_tools.analysis.fitting import fit_peaks
-
     payload = fit_peaks(
         x,
         y,
@@ -256,8 +286,6 @@ def run_phase_fit(
     progress_callback=None,
     fit_background_template: np.ndarray | tuple[np.ndarray, np.ndarray] | None = None,
 ) -> AnalysisResult:
-    from ssrl_xrd_tools.analysis.fitting import fit_sequence
-
     normalized = [
         (p.radial, p.intensity, p.sigma)
         if isinstance(p, IntegrationResult1D) else p
@@ -292,8 +320,6 @@ class Sin2PsiPlan:
 
 
 def run_sin2psi(plan: Sin2PsiPlan, result2d: IntegrationResult2D) -> AnalysisResult:
-    from ssrl_xrd_tools.analysis.strain import sin2psi_analysis
-
     payload = sin2psi_analysis(
         result2d,
         q_range=plan.q_range,
