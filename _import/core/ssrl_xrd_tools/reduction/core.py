@@ -32,6 +32,7 @@ from ssrl_xrd_tools.io.image import read_image
 from ssrl_xrd_tools.io.nexus import (
     open_nexus_image_stack,
     open_nexus_writer,
+    upsert_scan_metadata,
     write_nexus_frame,
 )
 
@@ -284,6 +285,42 @@ class Scan:
             extra=self.extra.copy(),
         )
 
+    def to_scan_data(self):
+        """Per-frame condition table as a pandas DataFrame (one row per frame).
+
+        Index = :attr:`frame_indices`; columns = the union of every
+        ``Frame.metadata`` key (first-seen order) plus any per-frame
+        :attr:`motors` array, one value per frame.  Keys missing on a given
+        frame become ``NaN``; a motor array overrides a same-named metadata
+        column (the motor array is the authoritative per-frame record).
+
+        This is the headless analog of the GUI's ``scan.scan_data`` — the table
+        :class:`NexusSink` persists under ``/entry/scan_data`` so that
+        variable-correlated analyses (lattice vs stress, texture vs angle,
+        property vs time/temperature) can correlate each integrated frame with
+        the experimental conditions that produced it.
+        """
+        import pandas as pd
+
+        idx = self.frame_indices
+        keys: list[Any] = []
+        seen: set = set()
+        for frame in self.frames:
+            for key in (frame.metadata or {}):
+                if key not in seen:
+                    seen.add(key)
+                    keys.append(key)
+        data = {
+            str(key): [(frame.metadata or {}).get(key) for frame in self.frames]
+            for key in keys
+        }
+        df = pd.DataFrame(data, index=idx) if data else pd.DataFrame(index=idx)
+        for name, arr in self.motors.items():
+            values = np.asarray(arr)
+            if values.ndim == 1 and values.shape[0] == len(idx):
+                df[str(name)] = values
+        return df
+
 
 @dataclass(slots=True)
 class Integration1DPlan:
@@ -441,6 +478,7 @@ class NexusSink:
     flush_every: int | None = 16
     _h5: Any | None = field(default=None, init=False, repr=False)
     _n_written: int = field(default=0, init=False, repr=False)
+    _scan: "Scan | None" = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
@@ -450,6 +488,9 @@ class NexusSink:
         if self.flush_every is not None and self.flush_every <= 0:
             raise ValueError(f"flush_every must be > 0 or None; got {self.flush_every}")
         self._n_written = 0
+        # Stash the scan so finish() can persist its per-frame condition table
+        # (scan_data) alongside the integrated stacks (core provenance).
+        self._scan = scan
         self._h5 = open_nexus_writer(
             self.path,
             metadata=scan.to_metadata(),
@@ -475,10 +516,28 @@ class NexusSink:
             self._h5.flush()
 
     def finish(self, result: ReductionResult) -> None:
-        if self._h5 is not None:
+        if self._h5 is None:
+            return
+        try:
+            # Persist the per-frame condition table (scan_data) after the final
+            # integrated frame, before close.  A finish-time single upsert is
+            # correct for a batch sink; only the GUI's SWMR live consumers would
+            # need scan_data mid-run (they'd require a per-write incremental
+            # upsert).  Any failure here propagates (after the file is closed
+            # below) so a lost condition table is surfaced, not silent — the
+            # integrated stacks written during write() are already intact.
+            scan = self._scan
+            if scan is not None:
+                scan_data = scan.to_scan_data()
+                if scan_data is not None and len(scan_data.columns):
+                    upsert_scan_metadata(
+                        self._h5[self.entry], scan_data, scan.frame_indices,
+                    )
+        finally:
             self._h5.flush()
             self._h5.close()
             self._h5 = None
+            self._scan = None
 
 
 def run_reduction(

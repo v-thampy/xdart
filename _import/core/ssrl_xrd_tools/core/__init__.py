@@ -10,6 +10,16 @@ from ssrl_xrd_tools.core.containers import (
     IntegrationResult2D,
     PONI,
 )
+from ssrl_xrd_tools.core.frame_view import (
+    Axis,
+    FrameGeometry,
+    FrameView,
+    TwoDKind,
+    assert_frameview_equivalent,
+    axis_from_unit,
+    numeric_metadata,
+    two_d_kind_from_units,
+)
 from ssrl_xrd_tools.core.metadata import ScanMetadata
 from ssrl_xrd_tools.core.hdf5 import (
     data_to_h5,
@@ -36,6 +46,14 @@ __all__ = [
     "IntegrationResult1D",
     "IntegrationResult2D",
     "PONI",
+    "Axis",
+    "FrameGeometry",
+    "FrameView",
+    "TwoDKind",
+    "assert_frameview_equivalent",
+    "axis_from_unit",
+    "numeric_metadata",
+    "two_d_kind_from_units",
     "ScanMetadata",
     # HDF5 codec
     "data_to_h5",

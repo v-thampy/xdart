@@ -38,6 +38,7 @@ import h5py
 import numpy as np
 
 from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from ssrl_xrd_tools.core.frame_view import two_d_kind_from_units
 from ssrl_xrd_tools.core.metadata import ScanMetadata
 from ssrl_xrd_tools.transforms import energy_to_wavelength
 
@@ -1022,6 +1023,7 @@ def _append_stacked_2d(
         g.attrs["NX_class"] = "NXdata"
         g.attrs["signal"] = "intensity"
         g.attrs["axes"] = ["frame_index", "chi", "q"]
+        g.attrs["two_d_kind"] = two_d_kind_from_units(r.unit, r.azimuthal_unit).value
         g.create_dataset("intensity", data=intensity[None],
                          maxshape=(None, n_chi, n_q),
                          chunks=(1, n_chi, n_q), **comp_kwargs)
@@ -1040,6 +1042,8 @@ def _append_stacked_2d(
         return
 
     g = entry_grp["integrated_2d"]
+    if "two_d_kind" not in g.attrs:
+        g.attrs["two_d_kind"] = two_d_kind_from_units(r.unit, r.azimuthal_unit).value
     di = g["intensity"]
     if di.shape[1:] != (n_chi, n_q):
         raise ValueError(
@@ -1291,6 +1295,9 @@ def write_integrated_stack(
         g.attrs["NX_class"] = "NXdata"
         g.attrs["signal"] = "intensity"
         g.attrs["axes"] = ["frame_index", "chi", "q"]
+        g.attrs["two_d_kind"] = two_d_kind_from_units(
+            r0.unit, r0.azimuthal_unit
+        ).value
         g.create_dataset("intensity", data=stacked,
                          maxshape=(None, n_chi, n_q), chunks=(1, n_chi, n_q), **ck)
         qd = g.create_dataset("q", data=np.asarray(r0.radial, np.float32))
@@ -2065,6 +2072,7 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
     data_vars: dict[str, tuple] = {}
     coords: dict[str, np.ndarray] = {}
     attrs_per_coord: dict[str, dict] = {}
+    attrs_per_var: dict[str, dict] = {}
 
     with h5py.File(path, "r") as f:
         if entry not in f:
@@ -2126,6 +2134,24 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
                 (frame_dim, "chi", "q_2d"),
                 np.asarray(g2["intensity"][()]),
             )
+            attrs_per_var["intensity_2d"] = {
+                "two_d_kind": _v2_decode_str(
+                    g2.attrs.get(
+                        "two_d_kind",
+                        two_d_kind_from_units(
+                            _v2_decode_str(g2["q"].attrs.get("units", ""))
+                            if "q" in g2 else "",
+                            _v2_decode_str(g2["chi"].attrs.get("units", ""))
+                            if "chi" in g2 else "",
+                        ).value,
+                    )
+                )
+            }
+            if "sigma" in g2:
+                data_vars["sigma_2d"] = (
+                    (frame_dim, "chi", "q_2d"),
+                    np.asarray(g2["sigma"][()]),
+                )
             coords["q_2d"] = np.asarray(g2["q"][()])
             u_q2 = g2["q"].attrs.get("units", None)
             if u_q2 is not None:
@@ -2209,6 +2235,9 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
     ds = xr.Dataset(data_vars=data_vars, coords=coords)
     for var, attrs in attrs_per_coord.items():
         if var in ds.coords:
+            ds[var].attrs.update(attrs)
+    for var, attrs in attrs_per_var.items():
+        if var in ds.data_vars:
             ds[var].attrs.update(attrs)
 
     try:

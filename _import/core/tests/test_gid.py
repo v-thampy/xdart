@@ -8,6 +8,9 @@ import pytest
 from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from ssrl_xrd_tools.integrate.gid import (
     create_fiber_integrator,
+    freeze_common_axes_2d,
+    freeze_common_axis,
+    gi_1d_output_axis_key,
     integrate_gi_1d,
     integrate_gi_2d,
     integrate_gi_exitangles,
@@ -119,3 +122,91 @@ def test_integrate_gi_exitangles_1d(poni_fixture, synthetic_image):
     assert isinstance(result, IntegrationResult1D)
     assert result.radial.shape == (500,)
     assert result.intensity.shape == (500,)
+
+
+# ---------------------------------------------------------------------------
+# Common-grid freeze primitive (pure — no pyFAI, always runs in CI)
+# ---------------------------------------------------------------------------
+
+def _r1d(radial):
+    radial = np.asarray(radial, float)
+    return IntegrationResult1D(
+        radial=radial, intensity=np.ones(radial.shape[0]), unit="q_A^-1")
+
+
+def _r2d(radial, azimuthal):
+    radial = np.asarray(radial, float)
+    azimuthal = np.asarray(azimuthal, float)
+    return IntegrationResult2D(
+        radial=radial, azimuthal=azimuthal,
+        intensity=np.ones((radial.shape[0], azimuthal.shape[0])), unit="q_A^-1")
+
+
+def test_gi_1d_output_axis_key_by_mode():
+    assert gi_1d_output_axis_key("q_total") == "radial_range"
+    assert gi_1d_output_axis_key("q_ip") == "radial_range"
+    assert gi_1d_output_axis_key(None) == "radial_range"
+    assert gi_1d_output_axis_key("q_oop") == "azimuth_range"
+    assert gi_1d_output_axis_key("exit_angle") == "azimuth_range"
+
+
+def test_freeze_common_axis_single_scout_pads():
+    key, rng = freeze_common_axis(_r1d(np.linspace(0.0, 10.0, 50)),
+                                  gi_mode_1d="q_total", pad_fraction=0.02)
+    assert key == "radial_range"
+    lo, hi = rng
+    assert lo == pytest.approx(-0.2, abs=1e-9)   # 0 - 2% of span(10)
+    assert hi == pytest.approx(10.2, abs=1e-9)
+
+
+def test_freeze_common_axis_union_covers_both_drifted_scouts():
+    """The crux: two scouts at different incidences have DRIFTED output extents;
+    the frozen range must be the padded UNION covering BOTH — and a single scout
+    would clip the other (that's why the union is load-bearing)."""
+    lo_scout = _r1d(np.linspace(-0.5, 5.0, 60))    # widest low end
+    hi_scout = _r1d(np.linspace(0.3, 5.6, 60))     # widest high end
+    key, (lo, hi) = freeze_common_axis([lo_scout, hi_scout],
+                                       gi_mode_1d="q_oop", pad_fraction=0.0)
+    assert key == "azimuth_range"
+    # Union brackets both scouts' extents exactly (pad=0).
+    assert lo == pytest.approx(-0.5)
+    assert hi == pytest.approx(5.6)
+
+    # Load-bearing: a SINGLE scout clips the other.
+    _, (s1_lo, s1_hi) = freeze_common_axis(hi_scout, gi_mode_1d="q_oop",
+                                           pad_fraction=0.0)
+    assert s1_lo > lo_scout.radial.min()           # hi-scout range clips lo end
+    _, (s0_lo, s0_hi) = freeze_common_axis(lo_scout, gi_mode_1d="q_oop",
+                                           pad_fraction=0.0)
+    assert s0_hi < hi_scout.radial.max()           # lo-scout range clips hi end
+
+
+def test_freeze_common_axis_degenerate_returns_none():
+    key, rng = freeze_common_axis(_r1d(np.full(20, 3.0)), gi_mode_1d="q_total")
+    assert key == "radial_range"
+    assert rng is None                              # collapsed span → unfrozen
+    # NaN-only axis → also None.
+    key, rng = freeze_common_axis(_r1d(np.full(20, np.nan)))
+    assert rng is None
+
+
+def test_freeze_common_axes_2d_union_and_keys():
+    # qip_qoop → x_range/y_range; union over two drifted scouts.
+    s0 = _r2d(np.linspace(-3.6, 3.5, 40), np.linspace(-0.1, 5.0, 30))
+    s1 = _r2d(np.linspace(-3.4, 3.7, 40), np.linspace(0.0, 5.2, 30))
+    out = freeze_common_axes_2d([s0, s1], gi_mode_2d="qip_qoop", pad_fraction=0.0)
+    assert set(out) == {"x_range", "y_range"}
+    assert out["x_range"] == pytest.approx((-3.6, 3.7))     # union of radials
+    assert out["y_range"] == pytest.approx((-0.1, 5.2))     # union of azimuthals
+
+    # non-qip_qoop → radial_range/azimuth_range keys.
+    out2 = freeze_common_axes_2d(s0, gi_mode_2d="q_chi", pad_fraction=0.0)
+    assert set(out2) == {"radial_range", "azimuth_range"}
+
+
+def test_freeze_common_axes_2d_omits_degenerate_axis():
+    # azimuthal collapsed → y key omitted, x key still frozen.
+    s = _r2d(np.linspace(0.0, 5.0, 40), np.full(30, 2.0))
+    out = freeze_common_axes_2d(s, gi_mode_2d="qip_qoop")
+    assert "x_range" in out
+    assert "y_range" not in out
