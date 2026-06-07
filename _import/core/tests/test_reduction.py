@@ -476,3 +476,80 @@ def test_existing_notebook_import_surface_still_imports() -> None:
     assert fit_peaks
     assert FitConfig
     assert sin2psi_analysis
+
+
+# ---------------------------------------------------------------------------
+# scan_data persistence (#nexussink_scan_data — core provenance)
+# ---------------------------------------------------------------------------
+
+def test_scan_to_scan_data_assembles_per_frame_table() -> None:
+    import math
+
+    import pandas as pd
+
+    scan = Scan(
+        name="conditions",
+        frames=[
+            # frame 0 has tag (string) but no stress; frame 1 has stress but no tag
+            Frame(index=0, image=np.zeros((2, 2)),
+                  metadata={"temperature": 300.0, "tag": "a"}),
+            Frame(index=1, image=np.zeros((2, 2)),
+                  metadata={"temperature": 310.0, "stress": 5.0}),
+        ],
+        motors={"th": np.array([0.1, 0.2])},
+    )
+    df = scan.to_scan_data()
+
+    assert list(df.index) == [0, 1]
+    assert {"temperature", "tag", "stress", "th"} <= set(df.columns)
+    # union of frame metadata, aligned per frame
+    assert df.loc[0, "temperature"] == 300.0
+    assert df.loc[1, "temperature"] == 310.0
+    # per-frame motor array folded in
+    assert df.loc[0, "th"] == 0.1 and df.loc[1, "th"] == 0.2
+    # keys missing on a frame → NaN/None
+    assert pd.isna(df.loc[0, "stress"])
+    assert pd.isna(df.loc[1, "tag"])
+    # column order is metadata-first-seen then motors
+    assert list(df.columns)[:3] == ["temperature", "tag", "stress"]
+
+
+def test_scan_to_scan_data_empty_scan() -> None:
+    df = Scan(name="empty", frames=[]).to_scan_data()
+    assert len(df) == 0
+    assert list(df.columns) == []
+
+
+def test_nexussink_persists_scan_data_roundtrip(tmp_path: Path) -> None:
+    from ssrl_xrd_tools.io.read import get_metadata
+
+    path = tmp_path / "scan_conditions.nxs"
+    scan = Scan(
+        name="ramp",
+        frames=[
+            Frame(index=1, image=np.zeros((2, 2)),
+                  metadata={"temperature": 300.0, "stress": 2.0, "th": 0.15}),
+            Frame(index=2, image=np.zeros((2, 2)),
+                  metadata={"temperature": 305.0, "stress": 4.0, "th": 0.25}),
+            Frame(index=3, image=np.zeros((2, 2)),
+                  metadata={"temperature": 310.0, "stress": 6.0, "th": 0.35}),
+        ],
+    )
+    sink = NexusSink(path)
+    sink.begin(scan, ReductionPlan())
+    for frame in scan.frames:
+        sink.write(
+            frame,
+            reduction_core.FrameReduction(
+                frame_index=frame.index, result_1d=_r1d(float(frame.index)),
+            ),
+        )
+    sink.finish(reduction_core.ReductionResult("ramp", {}, len(scan)))
+
+    meta = get_metadata(path)
+    sd = meta["scan_data"]
+    assert {"temperature", "stress", "th"} <= set(sd)
+    # per-frame condition columns round-trip, aligned to frame indices 1,2,3
+    np.testing.assert_allclose(sd["temperature"], [300.0, 305.0, 310.0])
+    np.testing.assert_allclose(sd["stress"], [2.0, 4.0, 6.0])
+    np.testing.assert_allclose(sd["th"], [0.15, 0.25, 0.35])
