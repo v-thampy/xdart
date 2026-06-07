@@ -8,12 +8,15 @@ import h5py
 
 from ssrl_xrd_tools.io.nexus import (
     NexusImageStack,
+    _require_uniform_axes_1d,
+    _require_uniform_axes_2d,
     find_nexus_image_dataset,
     list_entries,
     open_nexus_image_stack,
     open_nexus_writer,
     read_nexus,
     read_scan_metadata,
+    write_integrated_stack,
     write_nexus,
     write_nexus_frame,
 )
@@ -1062,3 +1065,126 @@ class TestRoundtrip:
             for key in ("integrated_1d/q", "integrated_1d/intensity",
                         "integrated_2d/q", "integrated_2d/chi", "integrated_2d/intensity"):
                 np.testing.assert_allclose(fb[f"entry/{key}"][()], fi[f"entry/{key}"][()])
+
+
+class TestRequireUniformAxesGuard:
+    """Lock the stacked-write uniform-axes invariant in isolation.
+
+    A batch ``integrated_1d`` / ``integrated_2d`` stack stores ONE shared axis
+    for every frame, so all frames must agree on it.  ``_require_uniform_axes``
+    is the contract a multi-frame writer (and any per-frame-axis freeze that
+    feeds it — e.g. the grazing-incidence common-grid freeze in xdart's
+    ``image_wrangler_thread``) must satisfy: identical (frozen) per-frame axes
+    are accepted; axis/unit drift beyond ``rtol=1e-5`` is rejected.
+
+    These run without any detector data (unlike xdart's real-data GI matrix,
+    which is skipped in CI), so they are the always-on guard for the invariant.
+    """
+
+    @staticmethod
+    def _r1d(radial, *, unit="q_A^-1"):
+        radial = np.asarray(radial, float)
+        return IntegrationResult1D(
+            radial=radial, intensity=np.ones(radial.shape[0]), unit=unit)
+
+    @staticmethod
+    def _r2d(radial, azimuthal, *, unit="q_A^-1", azimuthal_unit="deg"):
+        radial = np.asarray(radial, float)
+        azimuthal = np.asarray(azimuthal, float)
+        r = IntegrationResult2D(
+            radial=radial, azimuthal=azimuthal,
+            intensity=np.ones((radial.shape[0], azimuthal.shape[0])), unit=unit)
+        # azimuthal_unit is optional on the container; set when supported so
+        # the unit-drift branch of the 2D validator is exercised.
+        try:
+            r.azimuthal_unit = azimuthal_unit
+        except Exception:
+            pass
+        return r
+
+    # ── 1D ───────────────────────────────────────────────────────────────────
+    def test_uniform_axes_1d_accepts_frozen_grid(self):
+        q = np.linspace(0.1, 5.0, 200)
+        # Two frames on the SAME frozen q grid — the freeze's whole job.
+        _require_uniform_axes_1d([self._r1d(q), self._r1d(q.copy())])
+
+    def test_uniform_axes_1d_accepts_within_tolerance_jitter(self):
+        q = np.linspace(0.1, 5.0, 200)
+        # Tiny numerical jitter strictly inside rtol=1e-5 must NOT trip it
+        # (the frozen grid need only match to the writer's tolerance).
+        _require_uniform_axes_1d([self._r1d(q), self._r1d(q * (1.0 + 1e-7))])
+
+    def test_uniform_axes_1d_rejects_drift(self):
+        q = np.linspace(0.1, 5.0, 200)
+        drifted = np.linspace(0.12, 5.05, 200)  # per-frame auto-range drift
+        with pytest.raises(ValueError,
+                           match=r"results_1d\[1\] has a different radial axis"):
+            _require_uniform_axes_1d([self._r1d(q), self._r1d(drifted)])
+
+    def test_uniform_axes_1d_rejects_unit_change(self):
+        q = np.linspace(0.1, 5.0, 200)
+        with pytest.raises(ValueError, match=r"results_1d\[1\] has a different"):
+            _require_uniform_axes_1d(
+                [self._r1d(q, unit="q_A^-1"), self._r1d(q, unit="2th_deg")])
+
+    # ── 2D ───────────────────────────────────────────────────────────────────
+    def test_uniform_axes_2d_accepts_frozen_grid(self):
+        q = np.linspace(0.1, 5.0, 100)
+        chi = np.linspace(-180.0, 180.0, 80)
+        _require_uniform_axes_2d(
+            [self._r2d(q, chi), self._r2d(q.copy(), chi.copy())])
+
+    def test_uniform_axes_2d_rejects_azimuthal_drift(self):
+        # The grazing-incidence out-of-plane (qoop / chi / exit-angle) axis is
+        # the one that drifts per incidence — the exact crash the freeze fixes.
+        q = np.linspace(0.1, 5.0, 100)
+        chi = np.linspace(-180.0, 180.0, 80)
+        chi_drift = np.linspace(-175.0, 178.0, 80)
+        with pytest.raises(ValueError,
+                           match=r"results_2d\[1\] has a different q/chi axis"):
+            _require_uniform_axes_2d([self._r2d(q, chi), self._r2d(q, chi_drift)])
+
+    def test_uniform_axes_2d_rejects_radial_drift(self):
+        q = np.linspace(0.1, 5.0, 100)
+        q_drift = np.linspace(0.15, 5.1, 100)
+        chi = np.linspace(-180.0, 180.0, 80)
+        with pytest.raises(ValueError, match=r"results_2d\[1\] has a different"):
+            _require_uniform_axes_2d([self._r2d(q, chi), self._r2d(q_drift, chi)])
+
+    # ── end-to-end through the writer (mirrors xdart's real-data matrix) ──────
+    def test_write_integrated_stack_rejects_drifted_axes(self, tmp_path):
+        q = np.linspace(0.1, 5.0, 200)
+        drifted = np.linspace(0.12, 5.05, 200)
+        with h5py.File(tmp_path / "drift_1d.h5", "w") as h5:
+            entry = h5.create_group("entry")
+            with pytest.raises(ValueError,
+                               match=r"results_1d\[1\] has a different"):
+                write_integrated_stack(
+                    entry, frame_indices=[0, 1],
+                    results_1d=[self._r1d(q), self._r1d(drifted)])
+
+        q2 = np.linspace(0.1, 5.0, 100)
+        chi = np.linspace(-180.0, 180.0, 80)
+        chi_drift = np.linspace(-175.0, 178.0, 80)
+        with h5py.File(tmp_path / "drift_2d.h5", "w") as h5:
+            entry = h5.create_group("entry")
+            with pytest.raises(ValueError,
+                               match=r"results_2d\[1\] has a different"):
+                write_integrated_stack(
+                    entry, frame_indices=[0, 1],
+                    results_2d=[self._r2d(q2, chi), self._r2d(q2, chi_drift)])
+
+    def test_write_integrated_stack_accepts_frozen_grid(self, tmp_path):
+        q = np.linspace(0.1, 5.0, 200)
+        q2 = np.linspace(0.1, 5.0, 100)
+        chi = np.linspace(-180.0, 180.0, 80)
+        with h5py.File(tmp_path / "frozen.h5", "w") as h5:
+            entry = h5.create_group("entry")
+            # Frozen grid → writes cleanly, no ValueError.
+            write_integrated_stack(
+                entry, frame_indices=[0, 1],
+                results_1d=[self._r1d(q), self._r1d(q.copy())],
+                results_2d=[self._r2d(q2, chi), self._r2d(q2.copy(), chi.copy())])
+        with h5py.File(tmp_path / "frozen.h5", "r") as f:
+            assert list(f["entry/integrated_1d/frame_index"][()]) == [0, 1]
+            assert list(f["entry/integrated_2d/frame_index"][()]) == [0, 1]
