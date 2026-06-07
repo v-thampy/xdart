@@ -107,6 +107,57 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         """
         pass
 
+    def _set_parameter_readonly(self, param, readonly):
+        """Recursively set the pyqtgraph Parameter read-only state, used to lock
+        the whole wrangler tree during a run while keeping the tree widget
+        itself enabled.
+
+        Skips ``bool`` params: pyqtgraph renders a *readonly* checkbox as
+        UNCHECKED regardless of its value (cosmetic) — the GI 'Grazing' box flip
+        regression (#56).  The value is unaffected and the run uses the
+        setup-time snapshot, so leaving the checkbox interactive is harmless and
+        it keeps showing its real state.
+
+        ``readonly`` does NOT lock every param type: pyqtgraph ignores it for
+        list/combo params and for action (Browse) params (which have no editable
+        value).  So leaf non-bool params are ALSO disabled via ``enabled`` — a
+        leaf's enabled state doesn't propagate, so its bool siblings are safe.
+        GROUP params get ``readonly`` only and are NEVER disabled: ``enabled=
+        False`` on a group propagates to its bool descendants and repaints them
+        unchecked.  (NamedActionParameter reports ``type`` None; the leaf-disable
+        covers it regardless of type.)
+        """
+        ptype = param.opts.get('type') if hasattr(param, 'opts') else None
+        try:
+            children = param.children()
+        except AttributeError:
+            children = ()
+        if ptype != 'bool':
+            try:
+                param.setOpts(readonly=readonly)
+            except (AttributeError, TypeError):
+                pass
+            # Leaf (no children) non-bool param: disable it too, so list/combo
+            # and action params (which ignore readonly) are actually locked.
+            # Never disable a group (would repaint bool descendants — #56).
+            if not children:
+                try:
+                    param.setOpts(enabled=not readonly)
+                except (AttributeError, TypeError):
+                    pass
+        for child in children:
+            self._set_parameter_readonly(child, readonly)
+
+    def _set_tree_readonly(self, readonly):
+        """Lock (``readonly=True``) or unlock the entire wrangler parameter tree
+        in one call — skip-bool, see :meth:`_set_parameter_readonly`.  Disables
+        every processing param (Calibration, Signal, GI, Threshold, Background,
+        save path, Cores-as-param, …) during a run without disabling the tree
+        widget (which would repaint the bool checkboxes)."""
+        params = getattr(self, 'parameters', None)
+        if params is not None:
+            self._set_parameter_readonly(params, readonly)
+
     def setup(self):
         """Sets the thread child object. Called by tthetaWidget prior
         to starting thread.

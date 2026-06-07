@@ -475,5 +475,20 @@ class nexusWrangler(wranglerWidget):
         self.stopButton.setEnabled(False)
 
     def enabled(self, enable):
+        """Enable/disable the WHOLE wrangler panel for the run lifecycle (#72),
+        except Stop.
+
+        Locks the entire parameter tree via per-param read-only (skip-bool) and
+        keeps the tree widget itself enabled — the previous blanket
+        ``tree.setEnabled(enable)`` repainted the GI 'Grazing' bool checkbox
+        unchecked during a run (#56); this avoids that.  Also disables the
+        non-param widgets (processing-mode combo, Cores spinbox + label).  Bool
+        checkboxes stay interactive (same accepted tradeoff as imageWrangler).
+        """
         self.startButton.setEnabled(enable)
-        self.tree.setEnabled(enable)
+        self.tree.setEnabled(True)
+        self._set_tree_readonly(not enable)
+        for w in (self.processingModeCombo, self.maxCoresSpinBox,
+                  getattr(self, 'coresLabel', None)):
+            if w is not None:
+                w.setEnabled(enable)

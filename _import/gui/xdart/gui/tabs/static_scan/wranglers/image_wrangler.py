@@ -661,27 +661,8 @@ class imageWrangler(wranglerWidget):
         except (AttributeError, KeyError) as e:
             logger.debug("Failed to set enabled state for h5_dir parameters: %s", e)
 
-    def _set_parameter_readonly(self, param, readonly):
-        """Recursively set pyqtgraph Parameter readonly state when available.
-
-        Skips ``bool`` params: pyqtgraph renders a *readonly* checkbox as
-        UNCHECKED regardless of its value (cosmetic), which made the GI
-        'Grazing' box flip to unchecked for the duration of a run.  The value
-        is unaffected and the run uses the setup-time ``gi`` flag, and the
-        Start button is disabled, so leaving the checkbox interactive is
-        harmless — and it keeps showing its real state.
-        """
-        if param.opts.get('type') != 'bool':
-            try:
-                param.setOpts(readonly=readonly)
-            except (AttributeError, TypeError):
-                pass
-        try:
-            children = param.children()
-        except AttributeError:
-            children = ()
-        for child in children:
-            self._set_parameter_readonly(child, readonly)
+    # _set_parameter_readonly now lives on the base wranglerWidget (shared with
+    # nexusWrangler); _set_gi_controls_readonly below still uses it via self.
 
     def _set_gi_controls_readonly(self, readonly):
         try:
@@ -1280,21 +1261,35 @@ class imageWrangler(wranglerWidget):
         self.motors = self.scan_parameters
 
     def enabled(self, enable):
-        """Sets tree and start button to enable.
+        """Enable/disable the WHOLE wrangler panel for the run lifecycle (#72).
+
+        During a run everything is locked except Stop: the entire parameter tree
+        is made read-only (skip-bool, so the GI/Grazing checkbox doesn't repaint
+        unchecked — #56), and the non-param widgets (processing-mode combo, Cores
+        spinbox + label, Advanced button) are disabled.  Bool checkboxes
+        (Grazing, Average Scan, Image Series, Threshold-enable) are intentionally
+        left interactive — disabling a pyqtgraph bool repaints it unchecked, and
+        the running thread uses the setup-time snapshot so a mid-run toggle can't
+        affect the current run (a multi-scan next-scan leak is the same accepted
+        tradeoff as the existing GI-Grazing decision).
 
         args:
             enable: bool, True for enabled False for disabled.
         """
-        # Disabling the entire ParameterTree causes pyqtgraph's bool editor to
-        # repaint checked boxes as unchecked on some platforms.  Keep the tree
-        # itself enabled during an active run and disable the processing
-        # controls individually below; this preserves the visual state of the
-        # GI/Grazing checkbox while the thread uses the setup-time value.
+        # Keep the tree widget itself enabled (disabling it repaints bool
+        # checkboxes); lock its contents via per-param read-only instead.
         self.tree.setEnabled(True)
+        self._set_tree_readonly(not enable)
         self.ui.startButton.setEnabled(enable)
+        # Non-param widgets (live outside the ParameterTree): mode combo, Cores
+        # spinbox + label, Advanced button.  Stop is left alone (stays enabled).
+        for name in ('processingModeCombo', 'maxCoresSpinBox', 'coresLabel',
+                     'advancedButton'):
+            w = getattr(self.ui, name, None)
+            if w is not None:
+                w.setEnabled(enable)
         # Live toggle state vs. the run lifecycle:
         if enable:
-            self._set_gi_controls_readonly(False)
             # Run finished — reset Live to off (no re-trigger) and re-enable
             # both toggles so the next run can be either live or batch.
             self.ui.liveCheckBox.blockSignals(True)
@@ -1304,10 +1299,10 @@ class imageWrangler(wranglerWidget):
             self.ui.batchCheckBox.setEnabled(True)
             # Uncheck is signal-blocked → sync the flag (see stop()).
             self.live_mode = False
+            # Re-assert per-mode widget state (cores/labels/toggles, viewer
+            # dimming) now that the run lock is lifted.
             self._on_mode_changed()
         else:
-            self._set_integration_controls_enabled(False, include_gi=False)
-            self._set_gi_controls_readonly(True)
             # Run active — keep Live clickable only for a *live* run (so it
             # can be toggled off to stop); mode toggles stay locked until the
             # run finishes.
