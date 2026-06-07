@@ -905,15 +905,19 @@ class imageThread(wranglerThread):
         scan._cached_fiber_integrator_angle = incident_angle
 
     def _freeze_gi_1d_auto_range(self, scan, pending) -> None:
-        """Freeze GI 1D auto radial range once per scan before integration.
+        """Freeze the GI 1D auto output-axis range once per scan before
+        integration so every frame shares one common grid.
 
-        Must run for Int 1D (XYE) too (``xye_only``): that path still writes the
-        integrated stack to .nxs (``scan._save_to_nexus`` in
-        ``_dispatch_batch_parallel``), and the writer validates a uniform
-        per-frame q axis.  A GI scan whose per-frame qip/qoop axis drifts must be
-        frozen here or the stack write raises ``results_1d[i] has a different
-        radial axis than results_1d[0]``.  (Previously skipped on ``xye_only`` on
-        the assumption it produced no validated .nxs — it does.)
+        Runs for Int 1D (XYE) too (``xye_only``).  In the .nxs paths this is
+        what lets the stacked writer's uniform-axis validator accept the batch
+        (a GI scan whose per-frame qip/qoop axis drifts would otherwise raise
+        ``results_1d[i] has a different radial axis than results_1d[0]``).  In
+        ``xye_only`` mode NO .nxs is written, but the freeze still matters: it
+        makes the per-frame ``.xye`` files share one x-grid so they overlay /
+        compare directly (locked by
+        ``test_gi_submode_xye_only_uniform_xgrid``).  Either way the range is
+        frozen from a scout frame; see ``_gi_1d_output_range_key`` for which arg
+        (radial_range vs azimuth_range) controls the output axis per mode.
         """
         if not self.gi or not pending:
             return
