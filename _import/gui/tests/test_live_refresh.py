@@ -1026,6 +1026,54 @@ def test_absorb_chunk_drops_stale_generation():
     assert viewer.data_1d == {} and viewer.data_2d == {}
 
 
+def _scout_host(motor):
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    host = SimpleNamespace(incidence_motor=motor)
+    host._scout_pending_frames = MethodType(imageThread._scout_pending_frames, host)
+    return host
+
+
+def _scout_pending(incs, motor='th'):
+    # Minimal pending entries: (img_file, img_number, img_data, meta, bg_raw, _).
+    # _scout_pending_frames only reads entry[3] (meta) via the motor key.
+    out = []
+    for i, inc in enumerate(incs):
+        meta = {} if inc is None else {motor: inc}
+        out.append((f'f{i}', i + 1, None, meta, 0.0, 0.0))
+    return out
+
+
+def test_scout_picks_incidence_extremes_order_independent():
+    host = _scout_host('th')
+    asc = _scout_pending([0.1, 0.2, 0.3, 0.4])
+    assert host._scout_pending_frames(asc) == [asc[0], asc[3]]
+    desc = _scout_pending([0.4, 0.3, 0.2, 0.1])
+    # Extremes by VALUE (idx3 lowest, idx0 highest), not position → order-independent.
+    assert host._scout_pending_frames(desc) == [desc[0], desc[3]]
+    unsorted_ = _scout_pending([0.3, 0.1, 0.4, 0.2])
+    assert host._scout_pending_frames(unsorted_) == [unsorted_[1], unsorted_[2]]  # min@1, max@2
+
+
+def test_scout_partial_metadata_adds_positional_ends():
+    host = _scout_host('th')
+    # idx1 unreadable; resolvable min@0 (0.1), max@2 (0.3); + positional ends 0,3.
+    pending = _scout_pending([0.1, None, 0.3, 0.2])
+    got = host._scout_pending_frames(pending)
+    assert got == [pending[0], pending[2], pending[3]]   # {0,2} ∪ {0,3}
+
+
+def test_scout_all_metadata_missing_falls_back_to_ends():
+    host = _scout_host('th')
+    pending = _scout_pending([None, None, None])
+    assert host._scout_pending_frames(pending) == [pending[0], pending[2]]
+
+
+def test_scout_manual_numeric_incidence_single_frame():
+    host = _scout_host('0.2')   # Manual numeric → all frames equal
+    pending = _scout_pending([None, None, None], motor='th')
+    assert host._scout_pending_frames(pending) == [pending[0]]
+
+
 def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
     from ssrl_xrd_tools.core import IntegrationResult1D, IntegrationResult2D
     from xdart.modules.frame_publication import PublicationStore

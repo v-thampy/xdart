@@ -911,9 +911,14 @@ class imageThread(wranglerThread):
         monotonic scan, so the unioned range covers the interior.
 
         Picks by per-frame incidence from metadata when resolvable (handles a
-        descending / unsorted scan); falls back to first + last positionally
-        otherwise.  A numeric (Manual) incidence is identical for every frame, so
-        one scout suffices.  Always ~2 integrations — never the whole scan.
+        descending / unsorted scan).  Robust to *partial* metadata: it scouts the
+        min/max of whatever incidences ARE resolvable, and additionally includes
+        the positional first + last frames whenever any incidence is unresolved
+        (so a frame whose angle we couldn't read still gets bracketed if it's an
+        end).  A numeric (Manual) incidence is identical for every frame, so one
+        scout suffices.  Bounded to ≤4 integrations — never the whole scan.
+        Adding extra scouts is always safe: the freeze takes the UNION, which can
+        only widen the range, never clip.
         """
         if len(pending) <= 1:
             return list(pending)
@@ -923,19 +928,23 @@ class imageThread(wranglerThread):
             return [pending[0]]
         except (TypeError, ValueError):
             pass
-        incs = []
-        for entry in pending:
+        resolved = []             # (index, incidence) for readable frames
+        any_unresolved = False
+        for i, entry in enumerate(pending):
             meta = entry[3] or {}
             try:
-                incs.append(float(meta.get(motor)))
+                resolved.append((i, float(meta.get(motor))))
             except (TypeError, ValueError):
-                incs = None
-                break
-        if incs:
-            lo_i = min(range(len(incs)), key=incs.__getitem__)
-            hi_i = max(range(len(incs)), key=incs.__getitem__)
-            return [pending[i] for i in sorted({lo_i, hi_i})]
-        return [pending[0], pending[-1]]
+                any_unresolved = True
+        idxs = set()
+        if resolved:
+            idxs.add(min(resolved, key=lambda t: t[1])[0])   # lowest incidence
+            idxs.add(max(resolved, key=lambda t: t[1])[0])   # highest incidence
+        if any_unresolved or not resolved:
+            # Partial/no metadata: add the positional ends as a safety net so
+            # frames whose incidence we couldn't read are still bracketed.
+            idxs.update((0, len(pending) - 1))
+        return [pending[i] for i in sorted(idxs)]
 
     def _build_scout(self, scan, entry):
         """Build + return ``(scratch_frame, fiber_integrator, incident_angle)``
