@@ -9,6 +9,7 @@ integration loops itself.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,7 @@ from ssrl_xrd_tools.integrate.calibration import (
 )
 from ssrl_xrd_tools.integrate.gid import integrate_gi_1d, integrate_gi_2d
 from ssrl_xrd_tools.integrate.single import integrate_1d, integrate_2d
+from ssrl_xrd_tools.io.export import write_xye
 from ssrl_xrd_tools.io.image import read_image
 from ssrl_xrd_tools.io.nexus import (
     open_nexus_image_stack,
@@ -482,6 +484,62 @@ class MemorySink:
 
 
 @dataclass(slots=True)
+class CompositeSink:
+    """Fan out reduction products to multiple sinks."""
+
+    sinks: tuple[ReductionSink, ...]
+
+    def begin(self, scan: Scan, plan: ReductionPlan) -> None:
+        for sink in self.sinks:
+            sink.begin(scan, plan)
+
+    def write(self, frame: Frame, reduction: FrameReduction) -> None:
+        for sink in self.sinks:
+            sink.write(frame, reduction)
+
+    def finish(self, result: ReductionResult) -> None:
+        errors: list[BaseException] = []
+        for sink in self.sinks:
+            try:
+                sink.finish(result)
+            except BaseException as exc:  # pragma: no cover - defensive fan-out
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+
+@dataclass(slots=True)
+class XYESink:
+    """Write 1D reductions as one ``.xye`` file per frame."""
+
+    directory: Path | str
+    pattern: str = "{scan}_{frame:04d}.xye"
+    _scan_name: str = field(default="", init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.directory, Path):
+            self.directory = Path(self.directory)
+
+    def begin(self, scan: Scan, plan: ReductionPlan) -> None:
+        self._scan_name = scan.name
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def write(self, frame: Frame, reduction: FrameReduction) -> None:
+        result = reduction.result_1d
+        if result is None:
+            return
+        path = self.directory / self.pattern.format(
+            scan=self._scan_name,
+            frame=int(frame.index),
+            label=frame.label,
+        )
+        write_xye(path, result.radial, result.intensity, result.sigma)
+
+    def finish(self, result: ReductionResult) -> None:
+        return None
+
+
+@dataclass(slots=True)
 class NexusSink:
     """Frame-by-frame NeXus sink backed by ``ssrl_xrd_tools.io.nexus``."""
 
@@ -557,15 +615,17 @@ class NexusSink:
 
 def run_reduction(
     plan: ReductionPlan,
-    scan: Scan,
-    sink: ReductionSink | None = None,
+    scan: Scan | FrameSource,
+    sink: ReductionSink | Iterable[ReductionSink] | None = None,
     *,
     chunk_size: int = 1,
     clear_frame_images: bool = False,
     progress_cb: ProgressCallback | None = None,
     cancel_token: CancelToken | None = None,
+    executor: Any | None = None,
+    gi_freeze_mode: str | None = None,
 ) -> ReductionResult:
-    """Run a headless reduction job over all frames in ``scan``.
+    """Run a headless reduction job over all frames in ``scan`` or a source.
 
     Parameters
     ----------
@@ -573,7 +633,8 @@ def run_reduction(
         Content of the reduction (what to integrate, mask, thresholds,
         optional :class:`GIMode`).
     scan
-        Frames + scan-level context (PONI / integrator / motors).
+        Frames + scan-level context (PONI / integrator / motors), or any
+        :class:`FrameSource` that can be materialized into one.
     sink
         Where to send per-frame :class:`FrameReduction`.  Defaults to
         an in-memory :class:`MemorySink`.
@@ -589,12 +650,36 @@ def run_reduction(
     cancel_token
         Polled per frame; cancellation stops at the next frame
         boundary (pyFAI doesn't yield mid-integration).
+    executor
+        Accepted as the architecture-v2 execution policy seam.  Current
+        implementation remains serial unless a caller supplies a future
+        executor-aware reduction helper.
+    gi_freeze_mode
+        Placeholder for the headless GI common-grid freeze policy.  Existing
+        callers should pre-freeze ranges exactly as before.
     """
-    if sink is None:
-        sink = MemorySink()
+    scan = _coerce_to_scan(scan)
+    sink = _coerce_sink(sink)
     cancel_token = cancel_token or CancelToken()
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
+    if executor is not None:
+        warnings.warn(
+            "run_reduction(executor=...) is accepted as the architecture-v2 "
+            "policy seam, but execution remains serial until the per-worker "
+            "integrator pool is moved into ssrl_xrd_tools. "
+            "RESTRUCTURE-TODO(WS-C): implement executor-backed reduction.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if gi_freeze_mode not in (None, "none", "pre_frozen"):
+        warnings.warn(
+            "GI freeze policy is not yet applied inside run_reduction. "
+            "RESTRUCTURE-TODO(WS-C): move scout_union/first_frame GI freeze "
+            "into the headless reduction spine.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     total = len(scan)
     output_path = _sink_path(sink) or (
@@ -916,5 +1001,62 @@ def _emit(
 
 
 def _sink_path(sink: ReductionSink) -> Path | None:
+    if isinstance(sink, CompositeSink):
+        for child in sink.sinks:
+            path = _sink_path(child)
+            if path is not None:
+                return path
     path = getattr(sink, "path", None)
     return path if isinstance(path, Path) else None
+
+
+def _coerce_sink(
+    sink: ReductionSink | Iterable[ReductionSink] | None,
+) -> ReductionSink:
+    if sink is None:
+        return MemorySink()
+    if hasattr(sink, "begin") and hasattr(sink, "write") and hasattr(sink, "finish"):
+        return sink  # type: ignore[return-value]
+    sinks = tuple(sink)
+    if not sinks:
+        return MemorySink()
+    if len(sinks) == 1:
+        return sinks[0]
+    return CompositeSink(sinks)
+
+
+def _coerce_to_scan(source: Scan | FrameSource) -> Scan:
+    if isinstance(source, Scan):
+        return source
+    to_scan = getattr(source, "to_scan", None)
+    if callable(to_scan):
+        kwargs = {}
+        for name in (
+            "poni",
+            "integrator",
+            "metadata",
+            "energy",
+            "wavelength",
+            "motors",
+            "output_path",
+            "sample_name",
+            "extra",
+        ):
+            if hasattr(source, name):
+                kwargs[name] = getattr(source, name)
+        return to_scan(**kwargs)
+    if not hasattr(source, "frame_indices") or not hasattr(source, "load_frame"):
+        raise TypeError(f"object does not implement FrameSource: {type(source)!r}")
+
+    frames: list[Frame] = []
+    for idx in source.frame_indices:
+        metadata_for = getattr(source, "metadata_for", None)
+        metadata = metadata_for(idx) if callable(metadata_for) else {}
+        frames.append(
+            Frame(
+                index=int(idx),
+                metadata=dict(metadata or {}),
+                loader=lambda frame, src=source, label=int(idx): src.load_frame(label),
+            )
+        )
+    return Scan(getattr(source, "name", "source"), frames)
