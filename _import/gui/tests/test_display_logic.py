@@ -582,6 +582,40 @@ def test_render_plan_draws_present_clears_absent():
     assert set(plan.clear) == {dl.PanelRole.RAW_2D, dl.PanelRole.CAKE_2D}
 
 
+def test_render_roles_follow_layout_but_keep_legacy_cleanup():
+    # The descriptor order is primary, but absent legacy panels are still
+    # managed so stale content from a prior mode is blanked.
+    state = _make_display_state(
+        panels=(
+            (dl.PanelKey(dl.PanelRole.RAW_2D), dl.PanelPlan(visible=True, has_data=True)),
+        ),
+        layout=((dl.PanelKey(dl.PanelRole.RAW_2D),),),
+    )
+    assert dl.render_roles_for_state(state) == (
+        dl.PanelRole.RAW_2D,
+        dl.PanelRole.PLOT_1D,
+        dl.PanelRole.CAKE_2D,
+    )
+
+
+def test_render_plan_includes_extension_roles_from_layout():
+    # RSM/Stitch/Fit roles are not tied to the legacy three-panel tuple: the
+    # render decision sees roles from the layout descriptor.  The Qt widget
+    # still needs concrete delegates before those roles become visible panels.
+    slice_key = dl.PanelKey(dl.PanelRole.SLICE_2D, "HK")
+    proj_key = dl.PanelKey(dl.PanelRole.PROJ_1D, "H")
+    state = _make_display_state(
+        panels=(
+            (slice_key, dl.PanelPlan(visible=True, has_data=True)),
+            (proj_key, dl.PanelPlan(visible=True, has_data=True)),
+        ),
+        layout=((slice_key,), (proj_key,)),
+    )
+    plan = dl.render_plan(state, dl.build_payload(state))
+    assert plan.draw[:2] == (dl.PanelRole.SLICE_2D, dl.PanelRole.PROJ_1D)
+    assert set(plan.clear) == {dl.PanelRole.PLOT_1D, dl.PanelRole.RAW_2D, dl.PanelRole.CAKE_2D}
+
+
 def test_render_plan_empty_and_error_clear_everything():
     for kw in (dict(selected_ids=(), loaded_1d_keys=set()),
                dict(raw_availability={'__error__': 'boom'})):
