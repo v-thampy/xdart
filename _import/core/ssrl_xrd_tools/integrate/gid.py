@@ -713,6 +713,131 @@ def integrate_gi_exitangles_1d(
     )
 
 
+# ---------------------------------------------------------------------------
+# Common-grid freeze (pure axis math)
+# ---------------------------------------------------------------------------
+#
+# A grazing-incidence angle-dependence scan integrates many frames that must
+# share ONE output grid (the stacked NeXus writer rejects per-frame axis drift).
+# The GUI "freezes" a common output range from a few scout integrations and
+# hands the same explicit range to every frame.  The *pure* part — given one or
+# more scout results, compute the padded, unioned output range and which
+# integration arg key it maps to — lives here so it is headless + testable and
+# reusable by future RSM / stitching axis logic.  The GUI keeps only the Qt
+# orchestration (pick + run the scout integrations, write the result into args).
+
+
+def gi_1d_output_axis_key(gi_mode_1d: str | None) -> str:
+    """Which 1D integration range arg controls the *output* axis for a GI mode.
+
+    gid maps ``radial_range`` → in-plane (ip) and ``azimuth_range`` → out-of-plane
+    (oop) output, so:
+
+      * ``q_total`` / ``q_ip`` → in-plane output  → ``radial_range``
+      * ``q_oop`` / ``exit_angle`` → out-of-plane output → ``azimuth_range``
+
+    Freezing the wrong key leaves the real output axis auto-ranging per incidence
+    angle, so it drifts across an angle scan → a non-uniform stack the writer
+    rejects.  The 1D output axis is always stored in ``IntegrationResult1D.radial``
+    regardless of mode.
+    """
+    return ('azimuth_range'
+            if gi_mode_1d in ('q_oop', 'exit_angle')
+            else 'radial_range')
+
+
+def _padded_union_range(axes, pad_fraction: float = 0.02):
+    """Padded union of the finite extents of several axis arrays.
+
+    Returns ``(lo - pad, hi + pad)`` where ``lo`` is the min over all axes' finite
+    minima and ``hi`` the max over their finite maxima (so the range brackets
+    EVERY scout, not just one), with ``pad = max(span * pad_fraction, 1e-9)``.
+
+    Returns ``None`` when no axis has finite samples, or the union is *collapsed*
+    (span <= 0 — e.g. every scout degenerate at a 0° incidence): freezing a
+    padded tiny range from a collapsed axis would clamp the whole scan onto it
+    and blank the output, so the caller leaves the range unfrozen and surfaces
+    the problem instead.
+    """
+    los, his = [], []
+    for axis in axes:
+        if axis is None:
+            continue
+        arr = np.asarray(axis, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            continue
+        los.append(float(arr.min()))
+        his.append(float(arr.max()))
+    if not los:
+        return None
+    lo, hi = min(los), max(his)
+    span = hi - lo
+    if span <= 0:
+        return None
+    pad = max(span * pad_fraction, 1e-9)
+    return lo - pad, hi + pad
+
+
+def freeze_common_axis(results, *, gi_mode_1d: str | None = None,
+                       pad_fraction: float = 0.02):
+    """Compute the frozen 1D output-axis range from one or more scout results.
+
+    Parameters
+    ----------
+    results
+        A single :class:`IntegrationResult1D` or an iterable of them — the scout
+        integrations (e.g. the lowest- and highest-incidence frames) whose output
+        extents should be bracketed.
+    gi_mode_1d
+        The GI 1D mode; selects the output arg key (see
+        :func:`gi_1d_output_axis_key`).
+    pad_fraction
+        Fractional padding applied to the unioned span (default 2%).
+
+    Returns
+    -------
+    (key, range)
+        ``key`` is the integration arg name (``'radial_range'`` or
+        ``'azimuth_range'``); ``range`` is the padded union ``(lo, hi)`` covering
+        every scout, or ``None`` if no scout yields a finite, non-collapsed
+        extent (caller should then leave the range unfrozen).
+    """
+    if isinstance(results, IntegrationResult1D):
+        results = [results]
+    key = gi_1d_output_axis_key(gi_mode_1d)
+    rng = _padded_union_range(
+        [getattr(r, 'radial', None) for r in results], pad_fraction)
+    return key, rng
+
+
+def freeze_common_axes_2d(results, *, gi_mode_2d: str = 'qip_qoop',
+                          pad_fraction: float = 0.02) -> dict:
+    """Compute the frozen 2D ranges from one or more scout results.
+
+    Returns a ``{arg_key: (lo, hi)}`` dict for the GI 2D range keys — ``x_range``/
+    ``y_range`` for ``qip_qoop``, else ``radial_range``/``azimuth_range`` — each
+    the padded union (covering every scout) of that axis' extents
+    (``.radial`` → x/radial, ``.azimuthal`` → y/azimuth).  A key whose union is
+    missing or collapsed is omitted, so the caller leaves it unfrozen.
+    """
+    if isinstance(results, IntegrationResult2D):
+        results = [results]
+    results = list(results)
+    x_key, y_key = (('x_range', 'y_range') if gi_mode_2d == 'qip_qoop'
+                    else ('radial_range', 'azimuth_range'))
+    out: dict = {}
+    rx = _padded_union_range(
+        [getattr(r, 'radial', None) for r in results], pad_fraction)
+    ry = _padded_union_range(
+        [getattr(r, 'azimuthal', None) for r in results], pad_fraction)
+    if rx is not None:
+        out[x_key] = rx
+    if ry is not None:
+        out[y_key] = ry
+    return out
+
+
 __all__ = [
     "create_fiber_integrator",
     "integrate_gi_1d",
@@ -721,4 +846,7 @@ __all__ = [
     "integrate_gi_exitangles_1d",
     "integrate_gi_polar",
     "integrate_gi_polar_1d",
+    "gi_1d_output_axis_key",
+    "freeze_common_axis",
+    "freeze_common_axes_2d",
 ]
