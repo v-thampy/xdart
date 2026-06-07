@@ -791,9 +791,36 @@ class imageThread(wranglerThread):
         """
         self._freeze_gi_1d_auto_range(scan, pending)
         self._freeze_gi_2d_auto_ranges(scan, pending)
+        self._maybe_warn_live_gi_clip()
         if self.batch_mode and len(pending) > 1:
             return self._dispatch_batch_parallel(scan, pending)
         return self._dispatch_batch_serial(scan, pending, force_save=force_save)
+
+    def _maybe_warn_live_gi_clip(self) -> None:
+        """One-time advisory for live GI runs (#75).
+
+        In a live run the common GI output grid is frozen from the FIRST frame
+        only — there's no lookahead to later incidence angles — so a scan that
+        sweeps incidence can write clipped later frames (uniform axis, no crash,
+        truncated tail).  Batch reprocessing uses the union of the incidence
+        extremes (#70) and recovers the full range.  Phrased conditionally
+        ("if this scan sweeps …") because live can't yet know whether incidence
+        varies, and source-agnostic (no assumption about the frame source).
+        Batch runs bracket all frames, so this never fires there.
+        """
+        if (not self.gi or self.batch_mode
+                or getattr(self, '_warned_live_gi_clip', False)):
+            return
+        self._warned_live_gi_clip = True
+        msg = ('Live GI: output range frozen from the first frame — if this '
+               'scan sweeps a range of incidence angles, later frames may be '
+               'clipped. Reprocess in batch for the full range.')
+        logger.warning(msg)
+        try:
+            self.showLabel.emit(msg)
+        except Exception:
+            logger.debug("showLabel emit failed for live-GI clip warning",
+                         exc_info=True)
 
     # ``_resolve_frame_mask``, ``_apply_threshold_inline``, and
     # ``_flush_xye_buffer`` moved to wranglerThread (the base class)

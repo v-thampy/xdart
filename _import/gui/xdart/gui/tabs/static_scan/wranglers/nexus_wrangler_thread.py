@@ -157,6 +157,15 @@ class nexusThread(wranglerThread):
     # ── Main entry point ─────────────────────────────────────────────────
 
     def run(self):
+        """QThread entry: run the integration body, always reclaiming the
+        integration pool — even on an exception-aborted run — so worker threads
+        don't outlive the run (matches imageThread.run()'s finally)."""
+        try:
+            self._run_impl()
+        finally:
+            self._shutdown_executor()
+
+    def _run_impl(self):
         """Read frames from a NeXus file and integrate them in parallel."""
         t0 = time.time()
         if self.poni is None or not self.nexus_file:
@@ -404,10 +413,8 @@ class nexusThread(wranglerThread):
             'NeXus total time: %.2fs, %d frames', time.time() - t0,
             files_processed,
         )
-        # Reclaim the persistent integration pool at end of run rather than
-        # leaking its worker threads until QThread.__del__.  Idempotent;
-        # __del__ remains the backstop for an exception-aborted run.
-        self._shutdown_executor()
+        # Pool reclamation is handled by run()'s finally (covers normal AND
+        # exception-aborted runs).
 
     # ── Helpers ─────────────────────────────────────────────────────────
 

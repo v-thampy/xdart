@@ -141,6 +141,11 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     # parallel/serial dispatcher) — used to exercise the Int-1D-XYE path where
     # the 2D freeze self-skips on xye_only.
     w._dispatch_batch = MethodType(imageThread._dispatch_batch, w)
+    # _dispatch_batch calls this one-time live-GI clip advisory (#75); bind it so
+    # the double doesn't AttributeError.  No-op here (batch_mode=True → early
+    # return), so the GI matrix assertions are unaffected.
+    w._maybe_warn_live_gi_clip = MethodType(
+        imageThread._maybe_warn_live_gi_clip, w)
     # The real scout-freeze methods (the code under test for the GI matrix).
     w._freeze_gi_1d_auto_range = MethodType(imageThread._freeze_gi_1d_auto_range, w)
     w._freeze_gi_2d_auto_ranges = MethodType(imageThread._freeze_gi_2d_auto_ranges, w)

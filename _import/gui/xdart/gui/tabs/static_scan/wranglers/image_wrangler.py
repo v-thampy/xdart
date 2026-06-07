@@ -1263,23 +1263,20 @@ class imageWrangler(wranglerWidget):
     def enabled(self, enable):
         """Enable/disable the WHOLE wrangler panel for the run lifecycle (#72).
 
-        During a run everything is locked except Stop: the entire parameter tree
-        is made read-only (skip-bool, so the GI/Grazing checkbox doesn't repaint
-        unchecked — #56), and the non-param widgets (processing-mode combo, Cores
-        spinbox + label, Advanced button) are disabled.  Bool checkboxes
-        (Grazing, Average Scan, Image Series, Threshold-enable) are intentionally
-        left interactive — disabling a pyqtgraph bool repaints it unchecked, and
-        the running thread uses the setup-time snapshot so a mid-run toggle can't
-        affect the current run (a multi-scan next-scan leak is the same accepted
-        tradeoff as the existing GI-Grazing decision).
+        During a run everything is locked except Stop: the parameter tree is
+        hard-disabled (greyed + fully non-interactive, matching the integration
+        panel above it), and the non-param widgets (processing-mode combo, Cores
+        spinbox + label, Advanced button) are disabled too.  A disabled pyqtgraph
+        bool checkbox (Grazing, Average Scan, …) may repaint unchecked during the
+        run (#56), but the value is preserved and restored on re-enable — the
+        full visible disable was chosen over that cosmetic ("minimize
+        complexity").  The running thread uses the setup-time arg snapshot
+        regardless.
 
         args:
             enable: bool, True for enabled False for disabled.
         """
-        # Keep the tree widget itself enabled (disabling it repaints bool
-        # checkboxes); lock its contents via per-param read-only instead.
-        self.tree.setEnabled(True)
-        self._set_tree_readonly(not enable)
+        self.tree.setEnabled(enable)
         self.ui.startButton.setEnabled(enable)
         # Non-param widgets (live outside the ParameterTree): mode combo, Cores
         # spinbox + label, Advanced button.  Stop is left alone (stays enabled).
@@ -1312,7 +1309,11 @@ class imageWrangler(wranglerWidget):
     def stylize_ParameterTree(self):
         self.tree.setStyleSheet("""
         QTreeView::item:has-children {
-            background-color: rgb(230, 230, 230); 
+            background-color: rgb(230, 230, 230);
             color: rgb(30, 30, 30);
+        }
+        QTreeView::item:has-children:disabled {
+            background-color: #3a3d4d;
+            color: #6272a4;
         }
             """)
