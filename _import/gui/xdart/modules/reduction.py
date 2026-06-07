@@ -289,6 +289,48 @@ def reduce_live_frame(
     return live_frame
 
 
+def reduce_live_frames(
+    live_frames: Iterable[Any],
+    plan: ReductionPlan,
+    *,
+    scan_name: str = "scan",
+    global_mask: Any = None,
+    integrator: Any = None,
+    poni: Any = None,
+    executor: Any = None,
+    chunk_size: int | None = None,
+    gi_freeze_mode: str | None = None,
+) -> list[Any]:
+    """Reduce a batch of ``LiveFrame`` objects through one headless run."""
+
+    frames = list(live_frames)
+    if not frames:
+        return []
+    plan = _plan_with_mask_for_live_frame(plan, global_mask, frames[0])
+    headless_frames = [frame_from_live_frame(frame) for frame in frames]
+    scan = Scan(
+        name=scan_name,
+        frames=headless_frames,
+        poni=poni if poni is not None else getattr(frames[0], "poni", None),
+        integrator=integrator if integrator is not None else getattr(frames[0], "integrator", None),
+    )
+    result = run_reduction(
+        plan,
+        scan,
+        executor=executor,
+        chunk_size=chunk_size or (len(frames) if executor is not None else 1),
+        gi_freeze_mode=gi_freeze_mode,
+    )
+    by_index = {int(frame.idx): frame for frame in frames}
+    for headless_frame in headless_frames:
+        live_frame = by_index[int(headless_frame.index)]
+        reduction = result.frames[int(headless_frame.index)]
+        live_frame.int_1d = reduction.result_1d
+        live_frame.int_2d = reduction.result_2d
+        live_frame.map_norm = _frame_norm(headless_frame, plan)
+    return frames
+
+
 # ---------------------------------------------------------------------------
 # S3 + C1 helpers — used by every wrangler so the GI-vs-standard dispatch
 # and the per-scan plan cache live in exactly one place.
@@ -688,5 +730,6 @@ __all__ = [
     "scan_from_live_scan",
     "plan_from_live_scan",
     "reduce_live_frame",
+    "reduce_live_frames",
     "sync_live_scan_gi_settings",
 ]

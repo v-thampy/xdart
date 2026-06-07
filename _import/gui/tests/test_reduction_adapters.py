@@ -27,6 +27,7 @@ from xdart.modules.reduction import (
     frame_from_live_frame,
     plan_from_live_scan,
     reduce_live_frame,
+    reduce_live_frames,
     scan_from_live_scan,
 )
 
@@ -494,6 +495,55 @@ def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
     assert frame.int_1d is not None
     assert frame.int_2d is not None
     assert frame.map_norm == 33.0
+
+
+def test_reduce_live_frames_uses_one_headless_batch(monkeypatch) -> None:
+    frames = [
+        LiveFrame(idx=1, map_raw=np.ones((2, 2)), poni=_poni(), scan_info={"i0": 2.0}),
+        LiveFrame(idx=2, map_raw=np.full((2, 2), 2.0), poni=_poni(), scan_info={"i0": 4.0}),
+    ]
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(monitor_key="i0"),
+        integration_2d=Integration2DPlan(),
+    )
+    calls = []
+
+    def fake_run_reduction(plan_arg, scan_arg, **kwargs):
+        calls.append((plan_arg, scan_arg, kwargs))
+        return ReductionResult(
+            scan_name=scan_arg.name,
+            frames={
+                frame.index: FrameReduction(
+                    frame.index,
+                    result_1d=_r1d(),
+                    result_2d=_r2d(),
+                )
+                for frame in scan_arg.frames
+            },
+            n_processed=len(scan_arg.frames),
+        )
+
+    monkeypatch.setattr(reduction_adapters, "run_reduction", fake_run_reduction)
+
+    out = reduce_live_frames(
+        frames,
+        plan,
+        scan_name="scan",
+        global_mask=np.array([0]),
+        integrator="ai",
+        executor=2,
+    )
+
+    assert out == frames
+    assert len(calls) == 1
+    assert calls[0][1].name == "scan"
+    assert [frame.index for frame in calls[0][1].frames] == [1, 2]
+    assert calls[0][2]["executor"] == 2
+    assert calls[0][2]["chunk_size"] == 2
+    assert frames[0].int_1d is not None
+    assert frames[1].int_2d is not None
+    assert frames[0].map_norm == 2.0
+    assert frames[1].map_norm == 4.0
 
 
 def test_mask_conversion_ignores_incompatible_mask() -> None:

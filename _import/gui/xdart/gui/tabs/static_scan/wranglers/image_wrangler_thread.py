@@ -54,6 +54,7 @@ from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
     StandardPlanCache,
     dispatch_live_frame_reduction,
+    reduce_live_frames,
     sync_live_scan_gi_settings,
 )
 from .wrangler_widget import wranglerThread
@@ -1100,25 +1101,18 @@ class imageThread(wranglerThread):
             )
 
     def _dispatch_batch_parallel(self, scan, pending):
-        """Parallel batch processing using ThreadPoolExecutor.
+        """Batch processing through the headless reduction executor.
 
         Phase 1 — Parallel integration:
-            Each worker creates a LiveFrame, runs integrate_1d / integrate_2d,
-            and writes xye/csv.  pyFAI's Cython integration releases the GIL,
-            so threads get true parallelism for the CPU-heavy part.
+            Build LiveFrame shells, then let ssrl_xrd_tools.run_reduction own
+            the per-frame ThreadPoolExecutor work.
 
         Phase 2 — Serial HDF5 write:
             All completed frames are written to HDF5 under a single file_lock
             acquisition.  Skipped entirely in xye_only mode.
         """
         n_workers = min(self.max_cores, len(pending))
-        # Per-scan pool of N integrator copies — required because
-        # pyFAI's AzimuthalIntegrator isn't thread-safe across workers
-        # with different inputs.  See xdart.utils.integrator_pool.
-        integrator_pool = ensure_integrator_pool(
-            scan, '_cached_integrator', n_workers,
-        )
-        if integrator_pool is None:
+        if getattr(scan, "_cached_integrator", None) is None:
             # No cached integrator yet — fall back to serial dispatch
             # (the source integrator gets built on the first call).
             return self._dispatch_batch_serial(scan, pending)
@@ -1144,95 +1138,55 @@ class imageThread(wranglerThread):
         standard_plan = self._plan_cache.get(scan, integrate_2d=not skip_2d)
         series_average = self.series_average
 
-        def _integrate_one(img_file, img_number, img_data, img_meta, bg_raw,
-                           t_read=0.0):
-            """Pure integration + xye write — no shared mutable state.
-
-            ``t_read`` is accepted for tuple-shape compatibility with
-            _process_one but isn't surfaced — parallel batch mode logs
-            its read times via the per-batch [FLUSH] line.
-
-            F2 cancel-fast: returns ``None`` immediately when Stop
-            has been requested, so already-running workers exit
-            before they hit pyFAI (the expensive part).
-            """
+        frames = []
+        for img_file, img_number, img_data, img_meta, bg_raw, _t_read in pending:
             if self.command == 'stop':
-                return None
-            _t0 = time.time()
-            # Threshold filtering: replace out-of-band pixels with the
-            # dummy sentinel in a fresh float32 copy.  The frame mask
-            # stays stable (cached from frame 1) so pyFAI's CSR engine
-            # cache survives across frames.
+                break
             img_data = self._apply_threshold_inline(img_data)
             frame_mask = self._resolve_frame_mask(scan, img_data)
+            frame = LiveFrame(
+                img_number, img_data, poni=self.poni,
+                scan_info=img_meta, static=True, gi=gi,
+                th_mtr=th_mtr, bg_raw=bg_raw,
+                sample_orientation=sample_orientation,
+                tilt_angle=tilt_angle,
+                series_average=series_average,
+                integrator=scan._cached_integrator,
+                mask=frame_mask,
+            )
+            if img_file:
+                frame.source_file = os.path.abspath(str(img_file))
+            else:
+                frame.source_file = ""
+            if _raw_lives_in_source(img_file):
+                frame.source_frame_idx = int(img_number) - 1
+            else:
+                frame.source_frame_idx = 0
+            frame.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
+            frames.append(frame)
 
-            # Borrow a private integrator for the duration of this
-            # frame's integration.  When the worker exits the `with`
-            # block the integrator returns to the pool for the next
-            # frame to grab.  Each integrator is touched by at most
-            # one worker at a time — that's what makes parallel
-            # batch correct vs the old shared-instance code path.
-            with integrator_pool.borrow() as ai:
-                frame = LiveFrame(
-                    img_number, img_data, poni=self.poni,
-                    scan_info=img_meta, static=True, gi=gi,
-                    th_mtr=th_mtr, bg_raw=bg_raw,
-                    sample_orientation=sample_orientation,
-                    tilt_angle=tilt_angle,
-                    series_average=series_average,
-                    integrator=ai,
-                    mask=frame_mask,
-                )
-
-                dispatch_live_frame_reduction(
-                    frame, scan,
-                    standard_plan=standard_plan,
-                    integrator=ai,
-                    global_mask=mask,
-                )
-
-            # Detach the pool integrator from this frame — once the
-            # `with` block exited, the next worker can borrow this
-            # same instance and start mutating it.  Replace with the
-            # scan's source integrator (which the pool never hands
-            # out, so it's safe to share with non-parallel consumers).
+        # ── Phase 1: headless parallel integration ───────────────────────────
+        self.showLabel.emit(f'Integrating {len(frames)} images ({n_workers} workers)...')
+        _t_phase1 = time.time()
+        frames = reduce_live_frames(
+            frames,
+            standard_plan,
+            scan_name=str(getattr(scan, "name", "scan")),
+            global_mask=mask,
+            integrator=scan._cached_integrator,
+            poni=self.poni,
+            executor=n_workers,
+            chunk_size=len(frames) if frames else 1,
+        )
+        for frame in frames:
             frame.integrator = scan._cached_integrator
-
-            # Precompute the raw-image thumbnail here, in parallel with
-            # other workers' integrations, rather than on the serial Phase 2
-            # writer thread.  scipy.ndimage.zoom and numpy subtract release
-            # the GIL for their C code, so this overlaps cleanly.
             try:
                 frame.make_thumbnail(global_mask=mask)
             except Exception as e:
                 logger.warning('Thumbnail precompute failed for image %s: %s',
-                               img_number, e)
-
-            # Buffer the XYE write — flushed at end of batch by the
-            # serial dispatcher.  Keeps the worker thread cheap and
-            # groups disk traffic so it doesn't interleave with the
-            # next batch's integration.
+                               frame.idx, e)
             with self._xye_lock:
-                self._xye_buffer.append((img_number, frame))
-
-            _elapsed = time.time() - _t0
-            fname = os.path.splitext(os.path.basename(img_file))[0]
-            logger.info('[PARALLEL] image_%04d (%s): %.2fs', img_number, fname[-30:], _elapsed)
-            return frame
-
-        # ── Phase 1: parallel integration ────────────────────────────────────
-        # Shared base helper handles ThreadPoolExecutor wiring,
-        # stop-flag honoring, per-worker exception logging, and
-        # idx-sort.  Both SPEC batch and NeXus chunked dispatch now
-        # share this primitive.
-        self.showLabel.emit(f'Integrating {len(pending)} images ({n_workers} workers)...')
-        _t_phase1 = time.time()
-        frames = self._parallel_integrate(
-            pending,
-            lambda item: _integrate_one(*item),
-            n_workers,
-            label='BATCH',
-        )
+                self._xye_buffer.append((frame.idx, frame))
         _t_phase1 = time.time() - _t_phase1
         logger.info('[BATCH] Phase 1 (parallel integration): %d frames in %.2fs',
                     len(frames), _t_phase1)
@@ -1244,40 +1198,12 @@ class imageThread(wranglerThread):
         if not self.xye_only:
             self.showLabel.emit(f'Writing {len(frames)} frames to HDF5...')
             _t_phase2 = time.time()
-            # img_number → img_file lookup for NeXus provenance.  Keyed
-            # on frame.idx (== img_number) so the lookup matches the
-            # frame-only result list returned by _parallel_integrate.
-            _img_files = {item[1]: item[0] for item in pending}
             _get_h5pool().pause(scan.data_file)
             try:
                 with self.file_lock:
                     # Phase 2a: in-memory accumulation only (batch_save=True
                     # makes add_frame a pure in-memory op; no file I/O).
                     for frame in frames:
-                        img_number = frame.idx
-                        img_file = _img_files.get(img_number, '')
-                        if img_file:
-                            frame.source_file = os.path.abspath(str(img_file))
-                        else:
-                            frame.source_file = ""
-                        # source_frame_idx is the *per-source-file*
-                        # 0-based frame offset, which lazy raw load
-                        # passes to NexusImageStack(source_file)[idx].
-                        # • Single-frame sources (TIF/EDF/CBF/…) →
-                        #   source IS the frame; idx is always 0.
-                        # • Multi-frame sources (Eiger / NeXus master)
-                        #   → use img_number-1, since
-                        #   ``_get_next_eiger_frame_sync`` emits
-                        #   ``img_number = frame_idx + 1`` (1-based).
-                        # Pre-C1 this was hardcoded to 0, so any
-                        # reload + lazy raw read on Eiger always
-                        # returned frame 0 — silently wrong.
-                        if _raw_lives_in_source(img_file):
-                            frame.source_frame_idx = int(img_number) - 1
-                        else:
-                            frame.source_frame_idx = 0
-                        frame.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
-
                         scan.add_frame(
                             frame=frame, calculate=False, update=True,
                             get_sd=True, set_mg=False, static=True, gi=gi,
