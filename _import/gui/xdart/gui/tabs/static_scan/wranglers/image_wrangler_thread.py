@@ -645,7 +645,7 @@ class imageThread(wranglerThread):
 
             # ── Dispatch cadence ────────────────────────────────────────────
             # Batch mode keeps the 16-frame pending buffer so the
-            # ThreadPoolExecutor can integrate them in parallel.
+            # headless reduction spine can integrate them in parallel.
             # Live (non-batch) mode dispatches immediately so the GUI
             # sees per-frame updates as soon as each image lands; the
             # disk save still gets batched separately inside

@@ -493,8 +493,8 @@ class nexusWrangler(wranglerWidget):
         self.command = 'start'
         self.thread.command = 'start'
         # Push the current Cores selection into the worker thread.
-        # The thread caches it as ``self.max_cores`` and uses it when
-        # building the ThreadPoolExecutor for parallel integration.
+        # The thread caches it as ``self.max_cores`` and passes it to
+        # the headless reduction executor for parallel integration.
         self.thread.max_cores = self.maxCoresSpinBox.value()
         # Re-sync processing-mode flags onto scan + thread so a
         # stale ``thread`` instance (recreated in :meth:`setup` since

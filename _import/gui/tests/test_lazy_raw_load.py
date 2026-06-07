@@ -380,7 +380,7 @@ class TestReloadOnlyFlagWiring:
 class TestPicklingPreservesLazyLoadCapability:
     """F8 / L1 follow-up.
 
-    The scan_threads.bai_*_all reintegrate path sends frames into
+    Older reintegration paths and external callers may send frames into
     a ProcessPoolExecutor.  Arches reloaded from v2 .nxs lack
     ``map_raw`` and depend on ``_source_root`` + ``source_file`` to
     lazy-load it.  The review flagged a suspicion that ``_source_root``
@@ -420,7 +420,8 @@ class TestPicklingPreservesLazyLoadCapability:
     def test_subprocess_can_lazy_load_via_pickled_frame(self, tmp_path):
         """End-to-end: spawn a real subprocess, pickle an frame into
         it, ask it to lazy-load, get the loaded array back.  This is
-        what scan_threads.bai_*_all does under the hood.
+        now a compatibility check for callers that still use process
+        pools outside the main GUI reduction spine.
         """
         pytest.importorskip("tifffile")
         from xdart.modules.ewald.frame import LiveFrame
@@ -434,13 +435,14 @@ class TestPicklingPreservesLazyLoadCapability:
         a.source_frame_idx = 0
         a._source_root = str(tmp_path)
 
-        # Use a ProcessPoolExecutor to mirror the real reintegrate
-        # path (scan_threads._reintegrate_all uses ProcessPoolExecutor).
         from concurrent.futures import ProcessPoolExecutor
 
-        with ProcessPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_load_and_return_raw, a)
-            result_arr, result_root = future.result()
+        try:
+            with ProcessPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_load_and_return_raw, a)
+                result_arr, result_root = future.result()
+        except (NotImplementedError, PermissionError) as exc:
+            pytest.skip(f"process pools are unavailable in this environment: {exc}")
 
         # Lazy load succeeded inside the subprocess.
         assert result_arr is not None
