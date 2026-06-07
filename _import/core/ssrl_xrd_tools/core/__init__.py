@@ -86,6 +86,7 @@ from ssrl_xrd_tools.core.scan import (
     SourceCapabilities,
     SourceKind,
     SourceSpec,
+    coerce_source_kind,
     numeric_metadata,
 )
 
@@ -100,5 +101,6 @@ __all__ = [
     "SourceCapabilities",
     "SourceKind",
     "SourceSpec",
+    "coerce_source_kind",
     "numeric_metadata",
 ]

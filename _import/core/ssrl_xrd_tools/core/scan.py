@@ -88,6 +88,12 @@ class SourceKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+def coerce_source_kind(value: SourceKind | str) -> SourceKind:
+    if isinstance(value, SourceKind):
+        return value
+    return SourceKind(str(value))
+
+
 @dataclass(frozen=True, slots=True)
 class SourceSpec:
     """Serializable description of an image/frame source."""
@@ -99,8 +105,7 @@ class SourceSpec:
     options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.kind, SourceKind):
-            object.__setattr__(self, "kind", SourceKind(str(self.kind)))
+        object.__setattr__(self, "kind", coerce_source_kind(self.kind))
         object.__setattr__(self, "options", MappingProxyType(dict(self.options or {})))
 
 
@@ -401,5 +406,6 @@ __all__ = [
     "SourceCapabilities",
     "SourceKind",
     "SourceSpec",
+    "coerce_source_kind",
     "numeric_metadata",
 ]
