@@ -1746,14 +1746,20 @@ def upsert_scan_metadata(
         return
     scan_data, fis = _reindex_scan_data_to_frames(scan_data, frame_indices)
     values: dict[str, np.ndarray] = {}
+    attrs_by_col: dict[str, dict[str, Any]] = {}
     for col in scan_data.columns:
-        values[str(col)] = _scan_data_column_payload(scan_data[col].values)[0]
+        arr, _create_kwargs, attrs = _scan_data_column_payload(scan_data[col].values)
+        values[str(col)] = arr
+        attrs_by_col[str(col)] = attrs
     if not values:
         return
     if "scan_data" not in entry_grp:
         write_scan_metadata(entry_grp, scan_data, fis)
         return
     _upsert_indexed_group(entry_grp["scan_data"], frame_indices=fis, values=values)
+    for col, attrs in attrs_by_col.items():
+        if col in entry_grp["scan_data"]:
+            entry_grp["scan_data"][col].attrs.update(attrs)
 
 
 def upsert_per_frame_geometry(

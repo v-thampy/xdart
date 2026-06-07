@@ -38,15 +38,31 @@ def test_headless_contract_imports_do_not_pull_gui_modules():
     before = set(sys.modules)
     for name in (
         "ssrl_xrd_tools",
+        "ssrl_xrd_tools.analysis.plans",
+        "ssrl_xrd_tools.core",
         "ssrl_xrd_tools.core.frame_view",
         "ssrl_xrd_tools.core.metadata",
+        "ssrl_xrd_tools.core.scan",
         "ssrl_xrd_tools.reduction",
         "ssrl_xrd_tools.io.nexus",
         "ssrl_xrd_tools.io.nexus_inspect",
+        "ssrl_xrd_tools.sources",
+        "ssrl_xrd_tools.sources.base",
+        "ssrl_xrd_tools.sources.image",
+        "ssrl_xrd_tools.sources.memory",
+        "ssrl_xrd_tools.sources.nexus",
+        "ssrl_xrd_tools.sources.registry",
     ):
         importlib.import_module(name)
     loaded = set(sys.modules) - before
-    forbidden_roots = ("PySide", "PyQt", "qtpy", "napari")
+    forbidden_roots = (
+        "PySide",
+        "PyQt",
+        "qtpy",
+        "napari",
+        "pyqtgraph",
+        "matplotlib",
+    )
     forbidden = sorted(
         name for name in loaded
         if name.startswith(forbidden_roots)

@@ -90,6 +90,10 @@ class TiffSeriesSource(BaseFrameSource):
     ) -> None:
         self.files = [Path(p) for p in files]
         self.metadata_format = metadata_format
+        self._path_by_index = {
+            int(index): path
+            for index, path in zip(range(1, len(self.files) + 1), self.files)
+        }
         super().__init__(
             name=name or (self.files[0].stem if self.files else "tiff_series"),
             frame_indices=range(1, len(self.files) + 1),
@@ -113,7 +117,10 @@ class TiffSeriesSource(BaseFrameSource):
         return cls(sorted(Path(directory).glob(pattern)), metadata_format=metadata_format)
 
     def _path_for(self, index: int) -> Path:
-        return self.files[self.frame_indices.index(int(index))]
+        try:
+            return self._path_by_index[int(index)]
+        except KeyError as exc:
+            raise IndexError(f"frame {index} is not in TIFF series {self.name!r}") from exc
 
     def load_frame(self, index: int) -> np.ndarray:
         return np.asarray(read_image(self._path_for(index)))

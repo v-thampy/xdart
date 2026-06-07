@@ -136,6 +136,84 @@ def test_run_reduction_chunk_size_validation(monkeypatch: pytest.MonkeyPatch) ->
         run_reduction(ReductionPlan(), scan, chunk_size=0)
 
 
+def test_run_reduction_uses_frame_source_iter_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(float(image[0, 0])),
+    )
+
+    class ChunkSource:
+        name = "chunked"
+        frame_indices = [10, 11, 12]
+        integrator = object()
+        output_path = None
+
+        def __init__(self):
+            self.loaded: list[int] = []
+            self.chunks: list[int] = []
+
+        def load_frame(self, index):
+            self.loaded.append(int(index))
+            raise AssertionError("run_reduction should use iter_chunks pixels")
+
+        def frame_for(self, index):
+            return Frame(
+                int(index),
+                loader=lambda frame: self.load_frame(frame.index),
+            )
+
+        def iter_chunks(self, chunk_size):
+            self.chunks.append(int(chunk_size))
+            yield np.stack([np.full((2, 2), 10.0), np.full((2, 2), 11.0)]), [10, 11]
+            yield np.stack([np.full((2, 2), 12.0)]), [12]
+
+        def to_scan(self, **kwargs):
+            return Scan(
+                self.name,
+                [self.frame_for(i) for i in self.frame_indices],
+                integrator=self.integrator,
+            )
+
+    source = ChunkSource()
+    result = run_reduction(ReductionPlan(), source, chunk_size=2)
+
+    assert source.chunks == [2]
+    assert source.loaded == []
+    assert result.n_processed == 3
+    assert [result.frames[i].result_1d.intensity[0] for i in (10, 11, 12)] == [
+        10.0,
+        11.0,
+        12.0,
+    ]
+
+
+def test_run_reduction_executor_matches_serial(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(float(np.sum(image))),
+    )
+    frames_serial = [Frame(i, image=np.full((2, 2), i, dtype=float)) for i in range(5)]
+    frames_parallel = [Frame(i, image=np.full((2, 2), i, dtype=float)) for i in range(5)]
+    plan = ReductionPlan(integration_2d=None)
+
+    serial = run_reduction(plan, Scan("serial", frames_serial, integrator=object()))
+    parallel = run_reduction(
+        plan,
+        Scan("parallel", frames_parallel, integrator=object()),
+        executor=2,
+        chunk_size=5,
+    )
+
+    assert list(serial.frames) == list(parallel.frames)
+    for idx in serial.frames:
+        np.testing.assert_allclose(
+            parallel.frames[idx].result_1d.intensity,
+            serial.frames[idx].result_1d.intensity,
+        )
+
+
 def test_integration_plan_validation() -> None:
     with pytest.raises(ValueError, match="npt"):
         Integration1DPlan(npt=0)
@@ -389,6 +467,35 @@ def test_nexus_sink_writes_frame_results(
         )
 
 
+def test_nexus_sink_atomic_overwrite_preserves_target_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(3.0),
+    )
+
+    def fail_write(*args, **kwargs):
+        raise RuntimeError("simulated write failure")
+
+    monkeypatch.setattr(reduction_core, "write_nexus_frame", fail_write)
+    out = tmp_path / "scan.nxs"
+    original = b"old complete file"
+    out.write_bytes(original)
+
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        run_reduction(
+            ReductionPlan(),
+            Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object()),
+            NexusSink(out, overwrite=True),
+        )
+
+    assert out.read_bytes() == original
+    assert not list(tmp_path.glob(".scan.nxs.*.tmp"))
+
+
 def test_reduction_validation_for_shapes_and_duplicate_frames() -> None:
     with pytest.raises(ValueError, match="duplicate"):
         Scan(
@@ -443,7 +550,7 @@ def test_nexus_sink_flush_policy(
             energy=12.398,
             wavelength=1.0,
         ),
-        NexusSink("scan.nxs", overwrite=True, flush_every=2),
+        NexusSink("scan.nxs", overwrite=True, flush_every=2, atomic=False),
     )
 
     assert result.n_processed == 3

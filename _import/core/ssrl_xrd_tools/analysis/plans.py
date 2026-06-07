@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field, is_dataclass
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 
-from ssrl_xrd_tools.analysis.fitting import FitConfig, PhaseFitter, fit_peaks, fit_sequence
-from ssrl_xrd_tools.analysis.strain import sin2psi_analysis
 from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D, PONI
 from ssrl_xrd_tools.core.scan import FrameSource
-from ssrl_xrd_tools.integrate.multi import stitch_images
-from ssrl_xrd_tools.rsm.pipeline import ScanInput, grid_scans_streaming, process_scan_from_nexus
 from ssrl_xrd_tools.sources import ensure_frame_source
+
+if TYPE_CHECKING:
+    from ssrl_xrd_tools.analysis.fitting import FitConfig, PhaseFitter
+
+
+def _default_fit_config():
+    from ssrl_xrd_tools.analysis.fitting import FitConfig
+
+    return FitConfig()
 
 
 @dataclass(slots=True)
@@ -25,15 +30,18 @@ class AnalysisResult:
     payload: Any
     provenance: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, include_payload: bool = True) -> dict[str, Any]:
+        data = {
             "kind": self.kind,
             "payload_type": type(self.payload).__name__,
             "provenance": _json_safe(self.provenance),
         }
+        if include_payload:
+            data["payload"] = _json_safe(self.payload)
+        return data
 
-    def to_json(self, **kwargs: Any) -> str:
-        return json.dumps(self.to_dict(), **kwargs)
+    def to_json(self, *, include_payload: bool = True, **kwargs: Any) -> str:
+        return json.dumps(self.to_dict(include_payload=include_payload), **kwargs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +61,7 @@ class StitchPlan:
     radial_range: tuple[float, float] | None = None
     azimuth_range: tuple[float, float] | None = None
     mask: np.ndarray | None = field(default=None, repr=False, compare=False)
+    max_eager_bytes: int | None = 2 * 1024 * 1024 * 1024
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -72,7 +81,21 @@ def run_stitch(
     if base_poni is None:
         raise ValueError("StitchPlan.base_poni or source.poni is required")
 
-    images = [np.asarray(src.load_frame(i), dtype=float) for i in labels]
+    images: list[np.ndarray] = []
+    eager_bytes = 0
+    for label in labels:
+        image = np.asarray(src.load_frame(label), dtype=float)
+        eager_bytes += int(image.nbytes)
+        if plan.max_eager_bytes is not None and eager_bytes > int(plan.max_eager_bytes):
+            raise MemoryError(
+                "run_stitch currently materializes all selected images before "
+                "calling pyFAI MultiGeometry. Selected frames require at least "
+                f"{eager_bytes / (1024 ** 3):.2f} GiB, exceeding "
+                f"StitchPlan.max_eager_bytes={plan.max_eager_bytes}. "
+                "Use fewer frames, raise the limit intentionally, or migrate "
+                "this call to the future streaming StitchPlan backend."
+            )
+        images.append(image)
     rot1 = _metadata_series(src, labels, plan.rot1_key)
     rot2 = (
         _metadata_series(src, labels, plan.rot2_key)
@@ -82,6 +105,8 @@ def run_stitch(
         _metadata_series(src, labels, plan.monitor_key)
         if plan.monitor_key is not None else None
     )
+    from ssrl_xrd_tools.integrate.multi import stitch_images
+
     payload = stitch_images(
         images,
         base_poni,
@@ -132,6 +157,8 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
     """Run the streaming RSM pipeline for one source or a list of sources."""
 
     if isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
+        from ssrl_xrd_tools.rsm.pipeline import ScanInput, grid_scans_streaming
+
         inputs = [
             ScanInput(scan=ensure_frame_source(scan), energy=plan.energy, UB=plan.UB, roi=plan.roi)
             for scan in source
@@ -148,6 +175,8 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
         )
         n_sources = len(inputs)
     else:
+        from ssrl_xrd_tools.rsm.pipeline import process_scan_from_nexus
+
         src = ensure_frame_source(source)  # type: ignore[arg-type]
         payload = process_scan_from_nexus(
             src,
@@ -186,6 +215,8 @@ class PeakFitPlan:
 
 
 def run_peak_fit(plan: PeakFitPlan, x: np.ndarray, y: np.ndarray) -> AnalysisResult:
+    from ssrl_xrd_tools.analysis.fitting import fit_peaks
+
     payload = fit_peaks(
         x,
         y,
@@ -208,7 +239,7 @@ def run_peak_fit(plan: PeakFitPlan, x: np.ndarray, y: np.ndarray) -> AnalysisRes
 class PhaseFitPlan:
     """Plan wrapper for phase-aware fitting."""
 
-    config: FitConfig = field(default_factory=FitConfig)
+    config: "FitConfig" = field(default_factory=_default_fit_config)
     sequential: bool = False
 
 
@@ -225,6 +256,8 @@ def run_phase_fit(
     progress_callback=None,
     fit_background_template: np.ndarray | tuple[np.ndarray, np.ndarray] | None = None,
 ) -> AnalysisResult:
+    from ssrl_xrd_tools.analysis.fitting import fit_sequence
+
     normalized = [
         (p.radial, p.intensity, p.sigma)
         if isinstance(p, IntegrationResult1D) else p
@@ -259,6 +292,8 @@ class Sin2PsiPlan:
 
 
 def run_sin2psi(plan: Sin2PsiPlan, result2d: IntegrationResult2D) -> AnalysisResult:
+    from ssrl_xrd_tools.analysis.strain import sin2psi_analysis
+
     payload = sin2psi_analysis(
         result2d,
         q_range=plan.q_range,
@@ -282,6 +317,8 @@ def make_phase_fitter(
     **kwargs: Any,
 ) -> PhaseFitter:
     """Convenience factory that accepts either an IntegrationResult1D or arrays."""
+
+    from ssrl_xrd_tools.analysis.fitting import PhaseFitter
 
     if isinstance(result, IntegrationResult1D):
         return PhaseFitter(result.radial, result.intensity, result.sigma, **kwargs)

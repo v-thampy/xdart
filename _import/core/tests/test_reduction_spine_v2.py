@@ -265,6 +265,36 @@ def test_run_reduction_gi_dispatches_polar_and_exit_angle_modes(
     assert calls == ["polar_1d", "polar_2d", "exit_1d", "exit_2d"]
 
 
+def test_run_reduction_gi_qip_qoop_coerces_stale_standard_unit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[dict] = []
+    monkeypatch.setattr(reduction_core, "poni_to_fiber_integrator", lambda *a, **k: object())
+
+    def fake_gi_2d(image, fi, **kwargs):
+        calls.append(kwargs)
+        return _r2d(1.0)
+
+    monkeypatch.setattr(reduction_core, "integrate_gi_2d", fake_gi_2d)
+
+    scan = Scan(
+        "gi",
+        [Frame(0, image=np.ones((2, 2)), geometry=FrameGeometry(incident_angle=0.3))],
+        poni=object(),
+    )
+
+    run_reduction(
+        ReductionPlan(
+            integration_1d=None,
+            integration_2d=Integration2DPlan(unit="q_A^-1"),
+            gi=GIMode(mode_2d=GI2DMode.QIP_QOOP),
+        ),
+        scan,
+    )
+
+    assert calls[0]["unit"] == "qip_A^-1"
+
+
 def test_gi_incident_angle_must_be_resolvable(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(reduction_core, "poni_to_fiber_integrator", lambda *a, **k: object())
     scan = Scan("gi", [Frame(0, image=np.ones((2, 2)))], poni=object())
@@ -272,20 +302,70 @@ def test_gi_incident_angle_must_be_resolvable(monkeypatch: pytest.MonkeyPatch):
         run_reduction(ReductionPlan(gi=GIMode()), scan)
 
 
-def test_run_reduction_executor_and_freeze_policy_are_explicit_todos(
+def test_run_reduction_gi_scout_union_freezes_missing_output_ranges(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setattr(
-        reduction_core,
-        "integrate_1d",
-        lambda image, ai, **kwargs: _r1d(float(np.sum(image))),
-    )
-    source = MemoryFrameSource([np.ones((2, 2))])
+    monkeypatch.setattr(reduction_core, "poni_to_fiber_integrator", lambda *a, **k: object())
+    calls_1d: list[dict] = []
+    calls_2d: list[dict] = []
 
-    with pytest.warns(RuntimeWarning, match="RESTRUCTURE-TODO\\(WS-C\\)"):
-        run_reduction(
-            ReductionPlan(integration_1d=Integration1DPlan(npt=2)),
-            source.to_scan(integrator=object()),
-            executor=object(),
-            gi_freeze_mode="scout_union",
+    def fake_gi_1d(image, fi, **kwargs):
+        calls_1d.append(kwargs)
+        inc = float(kwargs["incident_angle"])
+        return IntegrationResult1D(
+            radial=np.array([inc, inc + 1.0]),
+            intensity=np.ones(2),
+            unit=kwargs["unit"],
         )
+
+    def fake_gi_2d(image, fi, **kwargs):
+        calls_2d.append(kwargs)
+        inc = float(kwargs["incident_angle"])
+        return IntegrationResult2D(
+            radial=np.array([inc, inc + 2.0]),
+            azimuthal=np.array([inc * 10.0, inc * 10.0 + 1.0]),
+            intensity=np.ones((2, 2)),
+            unit="qip_A^-1",
+            azimuthal_unit="qoop_A^-1",
+        )
+
+    monkeypatch.setattr(reduction_core, "integrate_gi_1d", fake_gi_1d)
+    monkeypatch.setattr(reduction_core, "integrate_gi_2d", fake_gi_2d)
+
+    scan = Scan(
+        "gi-freeze",
+        [
+            Frame(0, image=np.ones((2, 2)), metadata={"th": 0.10}),
+            Frame(1, image=np.full((2, 2), 2.0), metadata={"th": 0.20}),
+        ],
+        poni=object(),
+    )
+
+    result = run_reduction(
+        ReductionPlan(
+            integration_1d=Integration1DPlan(npt=2),
+            integration_2d=Integration2DPlan(npt_rad=2, npt_azim=2),
+            gi=GIMode(
+                incidence_motor="th",
+                mode_1d=GI1DMode.Q_OOP,
+                mode_2d=GI2DMode.QIP_QOOP,
+            ),
+        ),
+        scan,
+        gi_freeze_mode="scout_union",
+    )
+
+    assert result.n_processed == 2
+    # First two 1D/2D calls are scouts.  Main-frame calls use the frozen
+    # union range and therefore share one axis set.
+    main_1d = calls_1d[-2:]
+    main_2d = calls_2d[-2:]
+    assert main_1d[0]["azimuth_range"] == main_1d[1]["azimuth_range"]
+    assert main_1d[0]["azimuth_range"][0] <= 0.10
+    assert main_1d[0]["azimuth_range"][1] >= 1.20
+    assert main_2d[0]["radial_range"] == main_2d[1]["radial_range"]
+    assert main_2d[0]["azimuth_range"] == main_2d[1]["azimuth_range"]
+    assert main_2d[0]["radial_range"][0] <= 0.10
+    assert main_2d[0]["radial_range"][1] >= 2.20
+    assert main_2d[0]["azimuth_range"][0] <= 1.0
+    assert main_2d[0]["azimuth_range"][1] >= 3.0

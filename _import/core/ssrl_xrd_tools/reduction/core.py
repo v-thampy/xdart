@@ -9,9 +9,12 @@ integration loops itself.
 
 from __future__ import annotations
 
-import warnings
+import os
+import threading
+import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Protocol, runtime_checkable
@@ -31,19 +34,6 @@ from ssrl_xrd_tools.core.scan import (
     Scan as CoreScan,
     ScanFrame,
 )
-from ssrl_xrd_tools.integrate.calibration import (
-    poni_to_fiber_integrator,
-    poni_to_integrator,
-)
-from ssrl_xrd_tools.integrate.gid import (
-    integrate_gi_1d,
-    integrate_gi_2d,
-    integrate_gi_exitangles,
-    integrate_gi_exitangles_1d,
-    integrate_gi_polar,
-    integrate_gi_polar_1d,
-)
-from ssrl_xrd_tools.integrate.single import integrate_1d, integrate_2d
 from ssrl_xrd_tools.io.export import write_xye
 from ssrl_xrd_tools.io.image import read_image
 from ssrl_xrd_tools.io.nexus import (
@@ -57,6 +47,68 @@ if TYPE_CHECKING:  # C4 — tighter Scan.integrator type without forcing the imp
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 
 ProgressCallback = Callable[["ReductionProgress"], None]
+
+
+def poni_to_integrator(*args: Any, **kwargs: Any) -> Any:
+    from ssrl_xrd_tools.integrate.calibration import poni_to_integrator as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def poni_to_fiber_integrator(*args: Any, **kwargs: Any) -> Any:
+    from ssrl_xrd_tools.integrate.calibration import (
+        poni_to_fiber_integrator as _impl,
+    )
+
+    return _impl(*args, **kwargs)
+
+
+def integrate_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
+    from ssrl_xrd_tools.integrate.single import integrate_1d as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def integrate_2d(*args: Any, **kwargs: Any) -> IntegrationResult2D:
+    from ssrl_xrd_tools.integrate.single import integrate_2d as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def integrate_gi_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
+    from ssrl_xrd_tools.integrate.gid import integrate_gi_1d as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def integrate_gi_2d(*args: Any, **kwargs: Any) -> IntegrationResult2D:
+    from ssrl_xrd_tools.integrate.gid import integrate_gi_2d as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def integrate_gi_exitangles(*args: Any, **kwargs: Any) -> IntegrationResult2D:
+    from ssrl_xrd_tools.integrate.gid import integrate_gi_exitangles as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def integrate_gi_exitangles_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
+    from ssrl_xrd_tools.integrate.gid import integrate_gi_exitangles_1d as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def integrate_gi_polar(*args: Any, **kwargs: Any) -> IntegrationResult2D:
+    from ssrl_xrd_tools.integrate.gid import integrate_gi_polar as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def integrate_gi_polar_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
+    from ssrl_xrd_tools.integrate.gid import integrate_gi_polar_1d as _impl
+
+    return _impl(*args, **kwargs)
 
 
 @dataclass(slots=True)
@@ -457,6 +509,7 @@ class ReductionPlan:
     mask: np.ndarray | MaskSpec | None = None
     threshold_min: float | None = None
     threshold_max: float | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.integration_1d is None and self.integration_2d is None:
@@ -496,6 +549,8 @@ class ReductionResult:
     n_processed: int
     cancelled: bool = False
     output_path: Path | None = None
+    failed: bool = False
+    error: str | None = None
 
 
 class ReductionSink(Protocol):
@@ -546,6 +601,20 @@ class CompositeSink:
         if errors:
             raise errors[0]
 
+    def abort(self, result: ReductionResult) -> None:
+        errors: list[BaseException] = []
+        for sink in self.sinks:
+            abort = getattr(sink, "abort", None)
+            try:
+                if callable(abort):
+                    abort(result)
+                else:
+                    sink.finish(result)
+            except BaseException as exc:  # pragma: no cover - defensive fan-out
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
 
 @dataclass(slots=True)
 class XYESink:
@@ -588,9 +657,12 @@ class NexusSink:
     overwrite: bool = False
     swmr: bool = False
     flush_every: int | None = 16
+    atomic: bool | None = None
     _h5: Any | None = field(default=None, init=False, repr=False)
     _n_written: int = field(default=0, init=False, repr=False)
     _scan: "Scan | None" = field(default=None, init=False, repr=False)
+    _active_path: Path | None = field(default=None, init=False, repr=False)
+    _tmp_path: Path | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
@@ -603,13 +675,26 @@ class NexusSink:
         # Stash the scan so finish() can persist its per-frame condition table
         # (scan_data) alongside the integrated stacks (core provenance).
         self._scan = scan
+        use_atomic = (
+            bool(self.atomic)
+            if self.atomic is not None
+            else (not self.swmr and (self.overwrite or not self.path.exists()))
+        )
+        self._tmp_path = None
+        self._active_path = self.path
+        if use_atomic:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._tmp_path = self.path.with_name(
+                f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            self._active_path = self._tmp_path
         self._h5 = open_nexus_writer(
-            self.path,
+            self._active_path,
             metadata=scan.to_metadata(),
             entry=self.entry,
             compression=self.compression,
             swmr=self.swmr,
-            overwrite=self.overwrite,
+            overwrite=True if use_atomic else self.overwrite,
         )
 
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
@@ -630,6 +715,7 @@ class NexusSink:
     def finish(self, result: ReductionResult) -> None:
         if self._h5 is None:
             return
+        tmp_path = self._tmp_path
         try:
             # Persist the per-frame condition table (scan_data) after the final
             # integrated frame, before close.  A finish-time single upsert is
@@ -645,11 +731,38 @@ class NexusSink:
                     upsert_scan_metadata(
                         self._h5[self.entry], scan_data, scan.frame_indices,
                     )
-        finally:
             self._h5.flush()
             self._h5.close()
             self._h5 = None
             self._scan = None
+            if tmp_path is not None:
+                tmp_path.replace(self.path)
+        except BaseException:
+            try:
+                self.abort(result)
+            finally:
+                raise
+        finally:
+            self._active_path = None
+            self._tmp_path = None
+
+    def abort(self, result: ReductionResult) -> None:
+        h5 = self._h5
+        tmp_path = self._tmp_path
+        self._h5 = None
+        self._scan = None
+        self._active_path = None
+        self._tmp_path = None
+        if h5 is not None:
+            try:
+                h5.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
 
 
 def run_reduction(
@@ -690,35 +803,24 @@ def run_reduction(
         Polled per frame; cancellation stops at the next frame
         boundary (pyFAI doesn't yield mid-integration).
     executor
-        Accepted as the architecture-v2 execution policy seam.  Current
-        implementation remains serial unless a caller supplies a future
-        executor-aware reduction helper.
+        Optional execution policy for per-frame work inside each chunk.  Pass
+        an executor with ``submit()``, ``True`` for a default
+        :class:`ThreadPoolExecutor`, or an integer worker count.  Sink writes
+        remain ordered on the caller thread.
     gi_freeze_mode
-        Placeholder for the headless GI common-grid freeze policy.  Existing
-        callers should pre-freeze ranges exactly as before.
+        Optional grazing-incidence common-grid freeze policy.  ``"first_frame"``
+        scouts the first frame; ``"scout_union"`` scouts first+last (or
+        ``plan.extra["gi_freeze_scout_indices"]``) and freezes the missing
+        output-axis ranges before the main reduction.  Explicit caller ranges
+        are preserved.
     """
+    source = scan
     scan = _coerce_to_scan(scan)
     sink = _coerce_sink(sink)
     cancel_token = cancel_token or CancelToken()
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
-    if executor is not None:
-        warnings.warn(
-            "run_reduction(executor=...) is accepted as the architecture-v2 "
-            "policy seam, but execution remains serial until the per-worker "
-            "integrator pool is moved into ssrl_xrd_tools. "
-            "RESTRUCTURE-TODO(WS-C): implement executor-backed reduction.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    if gi_freeze_mode not in (None, "none", "pre_frozen"):
-        warnings.warn(
-            "GI freeze policy is not yet applied inside run_reduction. "
-            "RESTRUCTURE-TODO(WS-C): move scout_union/first_frame GI freeze "
-            "into the headless reduction spine.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+    freeze_policy = _normalize_gi_freeze_mode(gi_freeze_mode)
 
     total = len(scan)
     output_path = _sink_path(sink) or (
@@ -730,6 +832,7 @@ def run_reduction(
 
     ai = None
     fi = None
+    initial_incident_angle = None
     if plan.gi is not None:
         if scan.poni is None:
             raise ValueError("GI reduction requires scan.poni.")
@@ -743,19 +846,37 @@ def run_reduction(
             tilt_angle=float(plan.gi.tilt_angle),
             sample_orientation=int(plan.gi.sample_orientation),
         )
+        plan = _apply_gi_freeze_policy(
+            plan,
+            scan,
+            freeze_policy=freeze_policy,
+            fi=fi,
+            initial_incident_angle=initial_incident_angle,
+        )
     else:
         ai = scan.integrator if scan.integrator is not None else None
         if ai is None:
             if scan.poni is None:
                 raise ValueError("Reduction requires scan.integrator or scan.poni.")
             ai = poni_to_integrator(scan.poni)
+    integrators = _ReductionIntegratorProvider(
+        scan=scan,
+        plan=plan,
+        ai=ai,
+        fi=fi,
+        initial_incident_angle=initial_incident_angle,
+    )
+    worker, owns_worker = _coerce_executor(executor)
 
     plan_masks: dict[tuple[int, int], np.ndarray | None] = {}
-    sink.begin(scan, plan)
-    _emit(progress_cb, scan.name, "start", None, completed, total)
+    result: ReductionResult | None = None
+    failure: BaseException | None = None
+    sink_started = False
     try:
-        for chunk_start in range(0, total, chunk_size):
-            chunk = scan.frames[chunk_start : chunk_start + chunk_size]
+        sink.begin(scan, plan)
+        sink_started = True
+        _emit(progress_cb, scan.name, "start", None, completed, total)
+        for chunk, chunk_images in _iter_reduction_chunks(source, scan, chunk_size):
             _emit(
                 progress_cb,
                 scan.name,
@@ -764,108 +885,41 @@ def run_reduction(
                 completed,
                 total,
             )
-            for frame in chunk:
+            pending = []
+            for frame, raw_image in zip(chunk, chunk_images):
                 if cancel_token.cancelled:
                     cancelled = True
                     break
                 _emit(progress_cb, scan.name, "load", frame.index, completed, total)
-                image = np.asarray(frame.load_image(), dtype=float)
-                if image.ndim != 2:
-                    raise ValueError(
-                        f"Frame {frame.index} image must be 2D; got shape {image.shape}"
-                    )
-                _validate_frame_inputs(frame, image.shape)
-                image = _apply_thresholds(image, plan)
-                image = _subtract_background(image, frame.background)
-                plan_mask = _cached_mask_for_shape(
-                    plan.mask,
-                    image.shape,
-                    "ReductionPlan.mask",
-                    plan_masks,
-                )
-                mask = _combined_mask(plan_mask, frame.mask, image.shape)
-
                 _emit(progress_cb, scan.name, "integrate", frame.index, completed, total)
-                if plan.gi is not None:
-                    incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
-                    r1d = (
-                        _run_gi_1d(
-                            image,
-                            fi,
-                            plan.integration_1d,
-                            plan.gi,
-                            mask=mask,
-                            incident_angle=incident_angle,
-                            normalization_factor=_normalization_for(
-                                frame, plan.integration_1d
-                            ),
-                        )
-                        if plan.integration_1d is not None else None
-                    )
-                    r2d = (
-                        _run_gi_2d(
-                            image,
-                            fi,
-                            plan.integration_2d,
-                            plan.gi,
-                            mask=mask,
-                            incident_angle=incident_angle,
-                            normalization_factor=_normalization_for(
-                                frame, plan.integration_2d
-                            ),
-                        )
-                        if plan.integration_2d is not None else None
-                    )
+                if worker is None:
+                    pending.append((
+                        frame,
+                        _reduce_frame(
+                            frame,
+                            raw_image,
+                            plan,
+                            integrators,
+                            plan_masks,
+                        ),
+                    ))
                 else:
-                    r1d = (
-                        integrate_1d(
-                            image,
-                            ai,
-                            npt=plan.integration_1d.npt,
-                            unit=plan.integration_1d.unit,
-                            method=plan.integration_1d.method,
-                            mask=mask,
-                            radial_range=plan.integration_1d.radial_range,
-                            azimuth_range=plan.integration_1d.azimuth_range,
-                            error_model=plan.integration_1d.error_model,
-                            polarization_factor=plan.integration_1d.polarization_factor,
-                            normalization_factor=_normalization_for(
-                                frame, plan.integration_1d
-                            ),
-                            **plan.integration_1d.extra,
-                        )
-                        if plan.integration_1d is not None else None
-                    )
-                    r2d = (
-                        integrate_2d(
-                            image,
-                            ai,
-                            npt_rad=plan.integration_2d.npt_rad,
-                            npt_azim=plan.integration_2d.npt_azim,
-                            unit=plan.integration_2d.unit,
-                            method=plan.integration_2d.method,
-                            mask=mask,
-                            radial_range=plan.integration_2d.radial_range,
-                            azimuth_range=_integration_azimuth_range(plan.integration_2d),
-                            error_model=plan.integration_2d.error_model,
-                            polarization_factor=plan.integration_2d.polarization_factor,
-                            normalization_factor=_normalization_for(
-                                frame, plan.integration_2d
-                            ),
-                            **plan.integration_2d.extra,
-                        )
-                        if plan.integration_2d is not None else None
-                    )
-                    if r2d is not None and plan.integration_2d.azimuth_offset:
-                        r2d.azimuthal = (
-                            r2d.azimuthal + float(plan.integration_2d.azimuth_offset)
-                        )
-
-                reduction = FrameReduction(
-                    frame_index=frame.index,
-                    result_1d=r1d,
-                    result_2d=r2d,
-                    metadata=dict(frame.metadata),
+                    pending.append((
+                        frame,
+                        worker.submit(
+                            _reduce_frame,
+                            frame,
+                            raw_image,
+                            plan,
+                            integrators,
+                            {},
+                        ),
+                    ))
+            for frame, reduction_or_future in pending:
+                reduction = (
+                    reduction_or_future
+                    if worker is None
+                    else reduction_or_future.result()
                 )
                 sink.write(frame, reduction)
                 products[int(frame.index)] = reduction
@@ -873,8 +927,12 @@ def run_reduction(
                 _emit(progress_cb, scan.name, "write", frame.index, completed, total)
                 if clear_frame_images:
                     frame.image = None
+                    _clear_source_frame_image(source, frame.index)
             if cancelled:
                 break
+    except BaseException as exc:
+        failure = exc
+        raise
     finally:
         result = ReductionResult(
             scan_name=scan.name,
@@ -882,11 +940,372 @@ def run_reduction(
             n_processed=completed,
             cancelled=cancelled or cancel_token.cancelled,
             output_path=output_path,
+            failed=failure is not None,
+            error=None if failure is None else str(failure),
         )
-        sink.finish(result)
+        try:
+            if sink_started:
+                if failure is None:
+                    sink.finish(result)
+                else:
+                    abort = getattr(sink, "abort", None)
+                    if callable(abort):
+                        abort(result)
+                    else:
+                        sink.finish(result)
+        finally:
+            if owns_worker and worker is not None:
+                worker.shutdown(wait=True, cancel_futures=True)
 
     _emit(progress_cb, scan.name, "finish", None, completed, total)
     return result
+
+
+def _normalize_gi_freeze_mode(mode: str | None) -> str | None:
+    if mode is None:
+        return None
+    value = str(mode).strip().lower()
+    if value in {"", "none", "pre_frozen", "pre-frozen"}:
+        return None
+    if value not in {"first_frame", "first-frame", "scout_union", "scout-union"}:
+        raise ValueError(
+            "gi_freeze_mode must be None, 'first_frame', or 'scout_union'; "
+            f"got {mode!r}"
+        )
+    return value.replace("-", "_")
+
+
+def _apply_gi_freeze_policy(
+    plan: ReductionPlan,
+    scan: Scan,
+    *,
+    freeze_policy: str | None,
+    fi: Any,
+    initial_incident_angle: float | None,
+) -> ReductionPlan:
+    """Return a copy of *plan* with missing GI output ranges frozen.
+
+    The pre-pass is intentionally bounded: live mode can use ``first_frame``,
+    while batch mode can use ``scout_union`` over first+last or an explicit
+    ``plan.extra["gi_freeze_scout_indices"]`` iterable.  Existing explicit
+    ranges win; the freeze only fills missing output-axis ranges so notebook
+    callers can still choose their own grids exactly.
+    """
+
+    if freeze_policy is None or plan.gi is None or not scan.frames:
+        return plan
+
+    needs_1d = _gi_1d_freeze_key(plan)
+    needs_2d = _gi_2d_freeze_keys(plan)
+    if needs_1d is None and not needs_2d:
+        return plan
+
+    scout_indices = _gi_freeze_scout_indices(plan, scan, freeze_policy)
+    if not scout_indices:
+        return plan
+
+    scout_integrators = _ReductionIntegratorProvider(
+        scan=scan,
+        plan=plan,
+        ai=None,
+        fi=fi,
+        initial_incident_angle=initial_incident_angle,
+    )
+    scout_results_1d: list[IntegrationResult1D] = []
+    scout_results_2d: list[IntegrationResult2D] = []
+    masks: dict[tuple[int, int], np.ndarray | None] = {}
+    for idx in scout_indices:
+        frame = scan._frame_by_index[int(idx)]
+        was_empty = frame.image is None
+        reduction = _reduce_frame(frame, None, plan, scout_integrators, masks)
+        if reduction.result_1d is not None:
+            scout_results_1d.append(reduction.result_1d)
+        if reduction.result_2d is not None:
+            scout_results_2d.append(reduction.result_2d)
+        if was_empty:
+            frame.image = None
+
+    out = plan
+    if needs_1d is not None and scout_results_1d:
+        from ssrl_xrd_tools.integrate.gid import freeze_common_axis
+
+        key, rng = freeze_common_axis(
+            scout_results_1d,
+            gi_mode_1d=out.gi.mode_1d.value,
+        )
+        if rng is not None and key == needs_1d:
+            out = _replace_integration_1d_range(out, key, rng)
+    if needs_2d and scout_results_2d:
+        from ssrl_xrd_tools.integrate.gid import freeze_common_axes_2d
+
+        ranges = freeze_common_axes_2d(
+            scout_results_2d,
+            gi_mode_2d=out.gi.mode_2d.value,
+        )
+        out = _replace_integration_2d_ranges(
+            out,
+            {
+                key: value
+                for key, value in ranges.items()
+                if key in needs_2d
+            },
+        )
+    return out
+
+
+def _gi_freeze_scout_indices(
+    plan: ReductionPlan,
+    scan: Scan,
+    freeze_policy: str,
+) -> list[int]:
+    extra = getattr(plan, "extra", None) or {}
+    explicit = extra.get("gi_freeze_scout_indices") if isinstance(extra, dict) else None
+    if explicit is not None:
+        allowed = set(scan.frame_indices)
+        out = []
+        for value in explicit:
+            idx = int(value)
+            if idx not in allowed:
+                raise ValueError(f"GI freeze scout frame {idx} is not in scan {scan.name!r}")
+            if idx not in out:
+                out.append(idx)
+        return out
+    if freeze_policy == "first_frame" or len(scan.frames) == 1:
+        return [int(scan.frames[0].index)]
+    return [int(scan.frames[0].index), int(scan.frames[-1].index)]
+
+
+def _gi_1d_freeze_key(plan: ReductionPlan) -> str | None:
+    if plan.gi is None or plan.integration_1d is None:
+        return None
+    from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
+
+    key = gi_1d_output_axis_key(plan.gi.mode_1d.value)
+    return key if getattr(plan.integration_1d, key) is None else None
+
+
+def _gi_2d_freeze_keys(plan: ReductionPlan) -> set[str]:
+    if plan.gi is None or plan.integration_2d is None:
+        return set()
+    p2d = plan.integration_2d
+    if plan.gi.mode_2d is GI2DMode.QIP_QOOP:
+        out: set[str] = set()
+        if p2d.extra.get("x_range") is None and p2d.radial_range is None:
+            out.add("x_range")
+        if p2d.extra.get("y_range") is None and p2d.azimuth_range is None:
+            out.add("y_range")
+        return out
+    out = set()
+    if p2d.radial_range is None:
+        out.add("radial_range")
+    if p2d.azimuth_range is None:
+        out.add("azimuth_range")
+    return out
+
+
+def _replace_integration_1d_range(
+    plan: ReductionPlan,
+    key: str,
+    value: tuple[float, float],
+) -> ReductionPlan:
+    if plan.integration_1d is None:
+        return plan
+    if key == "radial_range":
+        p1d = replace(plan.integration_1d, radial_range=tuple(map(float, value)))
+    elif key == "azimuth_range":
+        p1d = replace(plan.integration_1d, azimuth_range=tuple(map(float, value)))
+    else:
+        return plan
+    return replace(plan, integration_1d=p1d)
+
+
+def _replace_integration_2d_ranges(
+    plan: ReductionPlan,
+    ranges: dict[str, tuple[float, float]],
+) -> ReductionPlan:
+    if not ranges or plan.integration_2d is None:
+        return plan
+    p2d = plan.integration_2d
+    extra = dict(p2d.extra)
+    kwargs: dict[str, Any] = {}
+    for key, value in ranges.items():
+        frozen = tuple(map(float, value))
+        if key == "x_range":
+            extra["x_range"] = frozen
+        elif key == "y_range":
+            extra["y_range"] = frozen
+        elif key == "radial_range":
+            kwargs["radial_range"] = frozen
+        elif key == "azimuth_range":
+            kwargs["azimuth_range"] = frozen
+    p2d = replace(p2d, extra=extra, **kwargs)
+    return replace(plan, integration_2d=p2d)
+
+
+class _ReductionIntegratorProvider:
+    """Per-thread integrator cache for executor-backed reductions."""
+
+    def __init__(
+        self,
+        *,
+        scan: Scan,
+        plan: ReductionPlan,
+        ai: Any,
+        fi: Any,
+        initial_incident_angle: float | None,
+    ) -> None:
+        self.scan = scan
+        self.plan = plan
+        self.ai = ai
+        self.fi = fi
+        self.initial_incident_angle = initial_incident_angle
+        self._local = threading.local()
+        self._owner_thread = threading.get_ident()
+
+    def standard(self) -> Any:
+        if self.scan.poni is None:
+            return self.ai
+        if threading.get_ident() == self._owner_thread and self.ai is not None:
+            return self.ai
+        ai = getattr(self._local, "ai", None)
+        if ai is None:
+            ai = poni_to_integrator(self.scan.poni)
+            self._local.ai = ai
+        return ai
+
+    def fiber(self) -> Any:
+        if self.scan.poni is None:
+            return self.fi
+        if threading.get_ident() == self._owner_thread and self.fi is not None:
+            return self.fi
+        fi = getattr(self._local, "fi", None)
+        if fi is None:
+            gi = self.plan.gi
+            if gi is None:
+                return None
+            fi = poni_to_fiber_integrator(
+                self.scan.poni,
+                incident_angle=float(self.initial_incident_angle or 0.0),
+                tilt_angle=float(gi.tilt_angle),
+                sample_orientation=int(gi.sample_orientation),
+            )
+            self._local.fi = fi
+        return fi
+
+
+def _coerce_executor(executor: Any | None):
+    if executor is None or executor is False:
+        return None, False
+    if executor is True:
+        return ThreadPoolExecutor(), True
+    if isinstance(executor, int):
+        if executor <= 0:
+            raise ValueError(f"executor worker count must be > 0; got {executor}")
+        return ThreadPoolExecutor(max_workers=executor), True
+    if hasattr(executor, "submit"):
+        return executor, False
+    raise TypeError(
+        "executor must be None, False, True, a positive worker count, "
+        "or an object with submit()"
+    )
+
+
+def _reduce_frame(
+    frame: Frame,
+    raw_image: np.ndarray | None,
+    plan: ReductionPlan,
+    integrators: _ReductionIntegratorProvider,
+    plan_masks: dict[tuple[int, int], np.ndarray | None],
+) -> FrameReduction:
+    if raw_image is not None:
+        frame.image = np.asarray(raw_image)
+    image = np.asarray(frame.load_image(), dtype=float)
+    if image.ndim != 2:
+        raise ValueError(f"Frame {frame.index} image must be 2D; got shape {image.shape}")
+    _validate_frame_inputs(frame, image.shape)
+    image = _apply_thresholds(image, plan)
+    image = _subtract_background(image, frame.background)
+    plan_mask = _cached_mask_for_shape(
+        plan.mask,
+        image.shape,
+        "ReductionPlan.mask",
+        plan_masks,
+    )
+    mask = _combined_mask(plan_mask, frame.mask, image.shape)
+
+    if plan.gi is not None:
+        fi = integrators.fiber()
+        incident_angle = _resolve_gi_incident_angle(frame, plan.gi)
+        r1d = (
+            _run_gi_1d(
+                image,
+                fi,
+                plan.integration_1d,
+                plan.gi,
+                mask=mask,
+                incident_angle=incident_angle,
+                normalization_factor=_normalization_for(frame, plan.integration_1d),
+            )
+            if plan.integration_1d is not None else None
+        )
+        r2d = (
+            _run_gi_2d(
+                image,
+                fi,
+                plan.integration_2d,
+                plan.gi,
+                mask=mask,
+                incident_angle=incident_angle,
+                normalization_factor=_normalization_for(frame, plan.integration_2d),
+            )
+            if plan.integration_2d is not None else None
+        )
+    else:
+        ai = integrators.standard()
+        r1d = (
+            integrate_1d(
+                image,
+                ai,
+                npt=plan.integration_1d.npt,
+                unit=plan.integration_1d.unit,
+                method=plan.integration_1d.method,
+                mask=mask,
+                radial_range=plan.integration_1d.radial_range,
+                azimuth_range=plan.integration_1d.azimuth_range,
+                error_model=plan.integration_1d.error_model,
+                polarization_factor=plan.integration_1d.polarization_factor,
+                normalization_factor=_normalization_for(frame, plan.integration_1d),
+                **plan.integration_1d.extra,
+            )
+            if plan.integration_1d is not None else None
+        )
+        r2d = (
+            integrate_2d(
+                image,
+                ai,
+                npt_rad=plan.integration_2d.npt_rad,
+                npt_azim=plan.integration_2d.npt_azim,
+                unit=plan.integration_2d.unit,
+                method=plan.integration_2d.method,
+                mask=mask,
+                radial_range=plan.integration_2d.radial_range,
+                azimuth_range=_integration_azimuth_range(plan.integration_2d),
+                error_model=plan.integration_2d.error_model,
+                polarization_factor=plan.integration_2d.polarization_factor,
+                normalization_factor=_normalization_for(frame, plan.integration_2d),
+                **plan.integration_2d.extra,
+            )
+            if plan.integration_2d is not None else None
+        )
+        if r2d is not None and plan.integration_2d.azimuth_offset:
+            r2d.azimuthal = r2d.azimuthal + float(plan.integration_2d.azimuth_offset)
+
+    return FrameReduction(
+        frame_index=frame.index,
+        result_1d=r1d,
+        result_2d=r2d,
+        metadata=dict(frame.metadata),
+    )
 
 
 def _apply_thresholds(image: np.ndarray, plan: ReductionPlan) -> np.ndarray:
@@ -1117,12 +1536,26 @@ def _run_gi_2d(
     return integrate_gi_2d(
         image,
         fi,
-        unit=plan.unit,
+        unit=_qip_qoop_unit(plan.unit),
         radial_range=x_range,
         azimuth_range=y_range,
         **common,
         **extra,
     )
+
+
+def _qip_qoop_unit(unit: str | None) -> str:
+    """Return a valid in-plane FiberIntegrator unit for qip/qoop maps.
+
+    GUI state can legitimately carry a stale standard-AI unit such as
+    ``q_A^-1`` when a user switches into GI qip/qoop mode.  Treat that as an
+    unspecified GI unit and fall back to the FiberIntegrator default instead
+    of letting pyFAI fail deep in unit parsing.
+    """
+    text = str(unit or "").strip()
+    if text.startswith("qip_"):
+        return text
+    return "qip_A^-1"
 
 
 def _cached_mask_for_shape(
@@ -1247,6 +1680,75 @@ def _sink_path(sink: ReductionSink) -> Path | None:
                 return path
     path = getattr(sink, "path", None)
     return path if isinstance(path, Path) else None
+
+
+def _iter_reduction_chunks(
+    source: Scan | FrameSource,
+    scan: Scan,
+    chunk_size: int,
+) -> Iterator[tuple[list[Frame], list[np.ndarray | None]]]:
+    """Yield scan frames paired with optional source-loaded image arrays.
+
+    ``run_reduction`` materializes every source into a canonical ``Scan`` so
+    geometry, metadata, and writer provenance are uniform.  The actual pixels
+    should still come from ``FrameSource.iter_chunks`` when available: NeXus
+    and Eiger sources can then hold one file handle and read a contiguous stack
+    slice instead of reopening the file once per frame.
+    """
+
+    frame_by_index = {int(frame.index): frame for frame in scan.frames}
+    if not isinstance(source, Scan):
+        iter_chunks = getattr(source, "iter_chunks", None)
+        if callable(iter_chunks):
+            for images, labels in iter_chunks(chunk_size):
+                frame_labels = [int(label) for label in labels]
+                chunk_frames = []
+                for label in frame_labels:
+                    try:
+                        chunk_frames.append(frame_by_index[label])
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"source yielded frame {label}, which is not present "
+                            f"in materialized scan {scan.name!r}"
+                        ) from exc
+                yield chunk_frames, _chunk_images_as_list(images, frame_labels)
+            return
+
+    for start in range(0, len(scan.frames), chunk_size):
+        chunk_frames = scan.frames[start:start + chunk_size]
+        yield chunk_frames, [None] * len(chunk_frames)
+
+
+def _chunk_images_as_list(images: Any, labels: list[int]) -> list[np.ndarray]:
+    """Normalize a source chunk payload into one image per label."""
+
+    if len(labels) == 1:
+        arr = np.asarray(images)
+        if arr.ndim == 2:
+            return [arr]
+
+    if isinstance(images, np.ndarray):
+        if images.shape[0] != len(labels):
+            raise ValueError(
+                f"source chunk returned {images.shape[0]} images for "
+                f"{len(labels)} frame labels"
+            )
+        return [np.asarray(images[i]) for i in range(len(labels))]
+
+    out = [np.asarray(image) for image in images]
+    if len(out) != len(labels):
+        raise ValueError(
+            f"source chunk returned {len(out)} images for {len(labels)} frame labels"
+        )
+    return out
+
+
+def _clear_source_frame_image(source: Scan | FrameSource, index: int) -> None:
+    """Best-effort hook for sources that own mutable image caches."""
+
+    clear = getattr(source, "clear_frame_image", None)
+    if callable(clear):
+        clear(int(index))
 
 
 def _coerce_sink(
