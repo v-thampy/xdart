@@ -397,10 +397,11 @@ class staticWidget(QWidget):
 
         # Integrator signals
         self.integratorTree.integrator_thread.started.connect(self.thread_state_changed)
-        # Panel-consistency: re-integration is a "run" too — keep the 2D panels
-        # persistent for its duration (cleared in integrator_thread_finished).
-        self.integratorTree.integrator_thread.started.connect(
-            lambda: self.displayframe.set_processing_active(True))
+        # Re-integration is a "run" too: route its START through the single
+        # run-state owner (task #68) — keeps the 2D panels persistent AND
+        # disables the processing controls (task #71) for its duration; cleared
+        # in integrator_thread_finished via _exit_run_state.
+        self.integratorTree.integrator_thread.started.connect(self._enter_run_state)
         self.integratorTree.integrator_thread.update.connect(self.integrator_thread_update)
         self.integratorTree.integrator_thread.finished.connect(self.integrator_thread_finished)
 
@@ -426,6 +427,12 @@ class staticWidget(QWidget):
             w = self.ui.wranglerStack.widget(i)
             parameters.append(w.parameters)
         self.h5viewer.defaultWidget.set_parameters(parameters)
+
+        # Single source of truth for "a wrangler/integrator run is in
+        # progress" (task #68).  Flipped only by _enter_run_state /
+        # _exit_run_state, which drive the display persist flag AND the
+        # processing-control disable (task #71) so the two can never desync.
+        self._run_active = False
 
         # Coalescing timer for wrangler updates: when the wrangler thread
         # processes images faster than the GUI can render, only the most
@@ -838,6 +845,17 @@ class staticWidget(QWidget):
     def close(self):
         """Tries a graceful close.
         """
+        # Stop the viewer's long-running background threads BEFORE teardown so
+        # the persistent fileHandlerThread / async load worker aren't destroyed
+        # while running ("QThread: Destroyed while thread is still running") on
+        # tab/app close.  Mirrors the GUI-test fixture teardown.
+        try:
+            h5v = getattr(self, 'h5viewer', None)
+            if h5v is not None and hasattr(h5v, 'shutdown_threads'):
+                h5v.shutdown_threads()
+        except Exception:
+            logger.debug("background-thread shutdown on close failed",
+                         exc_info=True)
         del self.scan
         del self.displayframe.scan
         del self.frame
@@ -890,8 +908,25 @@ class staticWidget(QWidget):
           **Make Mask** stay enabled — they're still useful in a viewer.
         - Int 2D: everything enabled.
 
+        While a run is active (``self._run_active``, task #71) the
+        processing-affecting controls are force-disabled *on top of* the
+        per-mode state: the 1-D and 2-D panels (whose children are the range
+        fields, point counts, Auto toggles, unit + GI-mode combos, and the
+        Re-Integrate buttons), plus **Calibrate** and **Make Mask** (they mutate
+        the PONI / mask the run depends on).  The running frames use a
+        deep-copied arg snapshot, but a mid-run edit would otherwise leak into
+        the next scan of a multi-scan run and into a later reintegrate.  The
+        frame1D/frame2D contents are plain Qt widgets (checkable ``QPushButton``
+        Auto toggles, ``QComboBox`` units/modes), so ``setEnabled(False)`` here
+        keeps their checked look — the pyqtgraph readonly-checkbox repaint bug
+        only affects the wrangler's ParameterTree, not these.  (The Advanced
+        1D/2D dialogs ARE pyqtgraph ParameterTrees; they also feed bai_*_args and
+        are locked per-widget in _enter_run_state — not blanket-disabled here.)
+        ``Stop`` lives on the wrangler and is left enabled; display/h5viewer
+        browsing is untouched.
+
         Disabled widgets dim via the theme's ``:disabled`` style (D2).  Keyed
-        off the processing-mode combo so it's one source of truth.
+        off the processing-mode combo + run-state so it's one source of truth.
         """
         itree = getattr(self, 'integratorTree', None)
         if itree is None or not hasattr(itree, 'ui'):
@@ -902,20 +937,70 @@ class staticWidget(QWidget):
             mode_text = ''
         is_viewer = mode_text in ('Image Viewer', 'XYE Viewer', 'NeXus Viewer')
         is_1d_only = mode_text in ('Int 1D', 'Int 1D (XYE)')
+        run_active = getattr(self, '_run_active', False)
         ui = itree.ui
-        # 2-D integration panel: only in Int 2D.
+        # 2-D integration panel: only in Int 2D, and never during a run.
         frame2d = getattr(ui, 'frame2D', None)
         if frame2d is not None:
-            frame2d.setEnabled(not is_viewer and not is_1d_only)
-        # 1-D integration panel: any Int mode, not viewers.
+            frame2d.setEnabled(not is_viewer and not is_1d_only and not run_active)
+        # 1-D integration panel: any Int mode, not viewers, never during a run.
         frame1d = getattr(ui, 'frame1D', None)
         if frame1d is not None:
-            frame1d.setEnabled(not is_viewer)
-        # Calibrate / Make Mask stay enabled everywhere (incl. viewers).
+            frame1d.setEnabled(not is_viewer and not run_active)
+        # Calibrate / Make Mask stay enabled everywhere (incl. viewers) EXCEPT
+        # during a run — they mutate the PONI / mask the run depends on.
         for name in ('pyfai_calib', 'get_mask'):
             btn = getattr(ui, name, None)
             if btn is not None:
-                btn.setEnabled(True)
+                btn.setEnabled(not run_active)
+
+    def _enter_run_state(self):
+        """Single owner of run START (task #68): mark a wrangler/integrator run
+        in progress.  Idempotent — re-entry while already active is a no-op so
+        re-fired ``started`` signals don't double-toggle.
+
+        Drives BOTH the display persist flag (so the 2-D panels keep their last
+        content during the run, matching the 1-D plot) AND the processing-control
+        disable (task #71), so the two can't desync.  Wired through the paths
+        that always fire on a run start: ``start_wrangler`` (wrangler live/batch)
+        and the ``integrator_thread.started`` signal (reintegrate).
+        """
+        if self._run_active:
+            return
+        self._run_active = True
+        self.displayframe.set_processing_active(True)
+        self._apply_integration_control_state()   # run_active=True → disable
+        # The Advanced 1D/2D parameter dialogs also feed bai_*_args (their
+        # sigUpdateArgs → get_args mutates scan.bai_1d/2d_args), so a dialog left
+        # open from before the run could leak a mid-run edit into the next scan.
+        # Disable them too (per-widget, as reintegrate already does via
+        # integratorTree.setEnabled(False)); re-enabled by enable_integration in
+        # _exit_run_state.
+        itree = getattr(self, 'integratorTree', None)
+        for name in ('advancedWidget1D', 'advancedWidget2D'):
+            adv = getattr(itree, name, None)
+            if adv is not None:
+                adv.setEnabled(False)
+
+    def _exit_run_state(self):
+        """Single owner of run END (task #68): mark the run finished.
+        Idempotent — exiting an already-idle state is a no-op.
+
+        Reached on every end path including Stop and exceptions, because it is
+        driven from the ``finished`` handlers (``QThread.finished`` fires
+        whenever ``run()`` returns).  Ends the display persist window, then
+        re-enables the integration controls and re-asserts the *mode-correct*
+        per-mode state (Int 1D vs Int 2D vs viewer) rather than a blanket enable,
+        so the controls are right for the current mode after the run.
+        """
+        if not self._run_active:
+            return
+        self._run_active = False
+        self.displayframe.set_processing_active(False)
+        # Re-enable the tree (restores the auto-range field gating) then overlay
+        # the mode-correct state (run_active is now False).
+        self.enable_integration(True)
+        self._apply_integration_control_state()
 
     def update_all(self, idx=None):
         """Updates all data in displays.
@@ -958,10 +1043,17 @@ class staticWidget(QWidget):
         integratorThread
         """
         self.thread_state_changed()
-        # End the processing-active window BEFORE the final refresh so the 2D
-        # panels resume normal blank-on-missing behavior for the final frame.
-        self.displayframe.set_processing_active(False)
-        self.enable_integration(True)
+        # End the run through the single run-state owner (task #68) BEFORE the
+        # final refresh so the 2D panels resume normal blank-on-missing for the
+        # final frame.  _exit_run_state re-enables the integration controls and
+        # re-asserts the mode-correct per-mode state (it folds in the former
+        # enable_integration(True) call).  Only exit if no wrangler run is still
+        # in flight: a wrangler can be started while a reintegrate runs, and its
+        # frames still need the controls locked — its own finished handler will
+        # exit the shared run-state then (mirrors the wrangler-enable guard
+        # below).
+        if not self.wrangler.thread.isRunning():
+            self._exit_run_state()
         self.h5viewer.set_open_enabled(True)
         self.update_all()
         if not self.wrangler.thread.isRunning():
@@ -1137,11 +1229,13 @@ class staticWidget(QWidget):
         self.h5viewer.file_thread.no_nxs = getattr(
             self.wrangler.thread, 'xye_only', False)
 
-        # Panel-consistency: mark the run active so the 2D panels keep their
-        # last-rendered content (instead of blanking) while the run's frames
-        # arrive — matching the 1D plot's persistence.  Cleared in
-        # wrangler_finished.
-        self.displayframe.set_processing_active(True)
+        # Mark the run active through the single run-state owner (task #68):
+        # the 2D panels keep their last-rendered content (instead of blanking)
+        # while the run's frames arrive — matching the 1D plot's persistence —
+        # AND the integration controls are disabled for the run (task #71).
+        # Called synchronously here (GUI thread) so the controls lock before the
+        # thread starts.  Cleared in wrangler_finished.
+        self._enter_run_state()
 
         self.wrangler.thread.start()
 
@@ -1149,9 +1243,17 @@ class staticWidget(QWidget):
         """Called by the wrangler finished signal. If current scan
         matches the wrangler scan, allows for integration.
         """
-        # End the processing-active window BEFORE the final flush so the 2D
-        # panels resume normal blank-on-missing behavior for the final frame.
-        self.displayframe.set_processing_active(False)
+        # End the run through the single run-state owner (task #68) BEFORE the
+        # final flush so the 2D panels resume normal blank-on-missing for the
+        # final frame.  Idempotent: a later integrator_thread_finished() (when
+        # the scan matches, below) calls _exit_run_state again as a no-op.
+        # Overlap guard (symmetric with integrator_thread_finished): a wrangler
+        # can be started while a reintegrate is still running, and if it
+        # finishes first the reintegrate's frames still need the controls
+        # locked — only exit the shared run-state when the integrator run is
+        # also done; its finished handler exits it otherwise.
+        if not self.integratorTree.integrator_thread.isRunning():
+            self._exit_run_state()
 
         # Flush any pending coalesced update so the final frame is shown.
         self._update_timer.stop()
@@ -1195,7 +1297,15 @@ class staticWidget(QWidget):
                 self.h5viewer._auto_select_last_on_finish = True
                 self.h5viewer.set_file(generated_file)
 
-        if self.scan.name == self.wrangler.scan_name:
+        # The scan-matches branch delegates to integrator_thread_finished() to
+        # run the post-integration UI enable + exit the run-state.  Skip it when
+        # a real reintegrate is still running (the overlap case): calling it
+        # would exit the shared run-state and re-enable the controls mid-
+        # reintegrate.  In that case just re-enable the wrangler (its run IS
+        # done); the integrator's own finished handler exits the run-state when
+        # the reintegrate completes.
+        if (self.scan.name == self.wrangler.scan_name
+                and not self.integratorTree.integrator_thread.isRunning()):
             self.integrator_thread_finished()
         else:
             self.wrangler.enabled(True)

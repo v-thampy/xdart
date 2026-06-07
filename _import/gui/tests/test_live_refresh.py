@@ -255,9 +255,16 @@ class _FakeControl:
 class _FakeCombo:
     def __init__(self, text):
         self._text = text
+        self._enabled = True
 
     def currentText(self):
         return self._text
+
+    def setEnabled(self, enabled):
+        self._enabled = bool(enabled)
+
+    def isEnabled(self):
+        return self._enabled
 
 
 class _FakeIndexedCombo(_FakeCombo):
@@ -3430,6 +3437,7 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
         batchCheckBox=_FakeControl(batch),
         coresLabel=_FakeControl(),
         maxCoresSpinBox=_FakeControl(),
+        advancedButton=_FakeControl(),
         startButton=_FakeControl(),
         stopButton=_FakeControl(),
         frame=_FakeControl(),
@@ -3453,6 +3461,11 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
         ),
         _set_gi_controls_readonly=lambda readonly: setattr(
             host, "_gi_readonly", readonly,
+        ),
+        # #72: enabled() now locks the whole tree via _set_tree_readonly; record
+        # the requested state instead of walking a real ParameterTree.
+        _set_tree_readonly=lambda readonly: setattr(
+            host, "_tree_readonly", readonly,
         ),
     )
     host._on_mode_changed = MethodType(imageWrangler._on_mode_changed, host)
@@ -3545,10 +3558,12 @@ def test_active_live_run_disables_batch_but_keeps_live_clickable():
     assert host.ui.startButton.isEnabled() is False
     assert host.ui.liveCheckBox.isEnabled() is True
     assert host.ui.batchCheckBox.isEnabled() is False
-    assert host._integration_calls[-1] == (
-        False, {"include_gi": False},
-    )
-    assert host._gi_readonly is True
+    # #72: the whole tree is locked read-only and the non-param widgets disabled.
+    assert host._tree_readonly is True
+    assert host.ui.processingModeCombo.isEnabled() is False
+    assert host.ui.maxCoresSpinBox.isEnabled() is False
+    assert host.ui.advancedButton.isEnabled() is False
+    assert host.ui.stopButton.isEnabled() is True    # Stop never disabled
 
 
 def test_active_non_live_run_disables_live_and_batch():
@@ -3562,7 +3577,7 @@ def test_active_non_live_run_disables_live_and_batch():
     assert host.ui.startButton.isEnabled() is False
     assert host.ui.liveCheckBox.isEnabled() is False
     assert host.ui.batchCheckBox.isEnabled() is False
-    assert host._gi_readonly is True
+    assert host._tree_readonly is True
 
 
 def test_active_run_keeps_parameter_tree_enabled_for_gi_checkbox_paint():
@@ -3572,8 +3587,174 @@ def test_active_run_keeps_parameter_tree_enabled_for_gi_checkbox_paint():
 
     imageWrangler.enabled(host, False)
 
+    # The tree WIDGET stays enabled (disabling it repaints bool checkboxes); its
+    # contents are locked via read-only instead (#72/#56).
     assert host.tree.isEnabled() is True
-    assert host._integration_calls[-1] == (
-        False, {"include_gi": False},
+    assert host._tree_readonly is True
+
+
+def test_set_parameter_readonly_skips_bools_disables_actions():
+    """The whole-tree run lock (#72) on a REAL ParameterTree must: make value
+    params read-only, DISABLE action (Browse) params, and SKIP bool params —
+    disabling a pyqtgraph bool repaints it unchecked (the #56 Grazing
+    regression).  Bool VALUES must be preserved throughout."""
+    from PySide6 import QtWidgets
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    from pyqtgraph.parametertree import Parameter
+    from xdart.gui.gui_utils import NamedActionParameter
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerWidget
+
+    params = Parameter.create(name='root', type='group', children=[
+        {'name': 'grp', 'type': 'group', 'children': [
+            {'name': 'val', 'type': 'str', 'value': 'x'},
+            {'name': 'flag', 'type': 'bool', 'value': True},
+            # list/combo params ignore readonly in pyqtgraph — must be disabled.
+            {'name': 'pick', 'type': 'list', 'values': ['a', 'b'], 'value': 'a'},
+            NamedActionParameter(name='browse', title='Browse...'),
+        ]},
+    ])
+    host = SimpleNamespace()
+    host._set_parameter_readonly = MethodType(
+        wranglerWidget._set_parameter_readonly, host)
+
+    host._set_parameter_readonly(params, True)            # lock (run active)
+    grp = params.child('grp')
+    assert grp.child('val').opts.get('enabled') is False       # value leaf disabled
+    assert grp.child('pick').opts.get('enabled') is False      # list leaf disabled
+    assert grp.child('browse').opts.get('enabled') is False    # action disabled
+    assert grp.opts.get('enabled') is not False                # GROUP never disabled (#56)
+    assert grp.child('flag').opts.get('readonly') is not True  # bool SKIPPED
+    assert grp.child('flag').opts.get('enabled') is not False  # bool not disabled
+    assert grp.child('flag').value() is True                   # value preserved
+    assert grp.child('pick').value() == 'a'                    # list value preserved
+
+    host._set_parameter_readonly(params, False)           # unlock (run finished)
+    assert grp.child('val').opts.get('enabled') is True
+    assert grp.child('pick').opts.get('enabled') is True
+    assert grp.child('browse').opts.get('enabled') is True
+    assert grp.child('flag').value() is True
+
+
+def test_wrangler_enabled_restore_unlocks_tree_and_nonparam_widgets():
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=True, batch=True)
+    imageWrangler.enabled(host, False)
+    assert host._tree_readonly is True
+    assert host.ui.processingModeCombo.isEnabled() is False
+
+    imageWrangler.enabled(host, True)
+    assert host._tree_readonly is False
+    assert host.ui.processingModeCombo.isEnabled() is True
+    assert host.ui.advancedButton.isEnabled() is True
+    # batch=True host → _on_mode_changed re-enables the Cores widgets.
+    assert host.ui.maxCoresSpinBox.isEnabled() is True
+    assert host.ui.coresLabel.isEnabled() is True
+
+
+def test_nexus_wrangler_enabled_locks_whole_panel_keeps_stop_and_tree_widget():
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler import nexusWrangler
+
+    host = SimpleNamespace(
+        startButton=_FakeControl(),
+        stopButton=_FakeControl(),          # set in start/stop; untouched by enabled()
+        processingModeCombo=_FakeControl(),
+        maxCoresSpinBox=_FakeControl(),
+        coresLabel=_FakeControl(),
+        tree=_FakeControl(),
     )
-    assert host._gi_readonly is True
+    host._set_tree_readonly = lambda readonly: setattr(host, "_tree_readonly", readonly)
+
+    nexusWrangler.enabled(host, False)                    # run active
+    assert host._tree_readonly is True
+    assert host.tree.isEnabled() is True                 # widget enabled (#56)
+    assert host.startButton.isEnabled() is False
+    assert host.processingModeCombo.isEnabled() is False
+    assert host.maxCoresSpinBox.isEnabled() is False
+    assert host.stopButton.isEnabled() is True           # Stop untouched
+
+    nexusWrangler.enabled(host, True)                     # run finished
+    assert host._tree_readonly is False
+    assert host.startButton.isEnabled() is True
+    assert host.processingModeCombo.isEnabled() is True
+
+
+def _iter_params(param):
+    yield param
+    try:
+        children = param.children()
+    except AttributeError:
+        children = ()
+    for c in children:
+        yield from _iter_params(c)
+
+
+def _build_real_wrangler(cls):
+    import threading
+    from PySide6 import QtWidgets
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    scan = SimpleNamespace(
+        skip_2d=None, bai_1d_args={}, bai_2d_args={},
+        scan_lock=threading.RLock(), gi=False, poni_file='', name='null_main')
+    return cls("test", threading.Condition(), scan, {}, {})
+
+
+def test_real_wrangler_run_lock_covers_whole_tree():
+    """End-to-end on REAL wrangler instances (not injected hosts): enabled(False)
+    locks the ENTIRE real ParameterTree read-only (value params readonly, Browse
+    actions disabled, bool params SKIPPED with values preserved — #56), disables
+    the non-param widgets, and keeps Stop + the tree widget enabled; enabled(True)
+    restores it.  This is the spec's "every wrangler param group reads read-only
+    during a run, all re-enabled after" lock, on the actual tree (covers both
+    wranglers, incl. nexus whose blanket tree.setEnabled had the latent #56 bug)."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler import nexusWrangler
+
+    for cls in (imageWrangler, nexusWrangler):
+        w = _build_real_wrangler(cls)
+        ui = w.ui if hasattr(w, 'ui') else w       # image uses .ui; nexus direct attrs
+        ui.stopButton.setEnabled(True)             # mimic the start flow
+
+        bool_before = [(p, p.value()) for p in _iter_params(w.parameters)
+                       if p.opts.get('type') == 'bool']
+        assert bool_before, f"{cls.__name__}: expected a bool param (e.g. Grazing)"
+
+        # ── run active ─────────────────────────────────────────────────────────
+        w.enabled(False)
+        assert w.tree.isEnabled() is True          # widget stays enabled (#56)
+        assert ui.stopButton.isEnabled() is True   # Stop never disabled
+        assert ui.processingModeCombo.isEnabled() is False
+        assert ui.maxCoresSpinBox.isEnabled() is False
+        for p in _iter_params(w.parameters):
+            ptype = p.opts.get('type')
+            children = list(p.children()) if hasattr(p, 'children') else []
+            if ptype == 'bool':
+                assert p.opts.get('readonly') is not True, \
+                    f"{cls.__name__}: bool {p.name()} made readonly (#56)"
+                assert p.opts.get('enabled') is not False, \
+                    f"{cls.__name__}: bool {p.name()} disabled (would repaint, #56)"
+            elif children:
+                pass                               # group: read-only only, never disabled
+            else:
+                # leaf non-bool: locked via readonly (str/int/float) OR
+                # enabled=False (list/combo + action, which ignore readonly).
+                locked = (p.opts.get('readonly') is True) or (p.opts.get('enabled') is False)
+                assert locked, \
+                    f"{cls.__name__}: leaf {p.name()} ({ptype}) editable mid-run"
+        for p, val in bool_before:
+            assert p.value() == val, f"{cls.__name__}: bool {p.name()} value changed by lock"
+
+        # ── run finished ───────────────────────────────────────────────────────
+        w.enabled(True)
+        assert ui.processingModeCombo.isEnabled() is True
+        for p in _iter_params(w.parameters):
+            ptype = p.opts.get('type')
+            children = list(p.children()) if hasattr(p, 'children') else []
+            if ptype == 'bool' or children:
+                continue
+            assert not p.opts.get('readonly'), \
+                f"{cls.__name__}: leaf {p.name()} left readonly after run"
+            assert p.opts.get('enabled') is not False, \
+                f"{cls.__name__}: leaf {p.name()} left disabled after run"
+        for p, val in bool_before:
+            assert p.value() == val, f"{cls.__name__}: bool {p.name()} value changed after restore"
