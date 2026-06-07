@@ -1341,3 +1341,186 @@ def test_finished_slot_reaches_exit_state(widget):
 
     assert w.displayframe._processing_active is False
     assert w._run_active is False
+
+
+# ---------------------------------------------------------------------------
+# Processing-control disable during a run (task #71) — layered on the owner.
+#
+# During a run the integratorTree processing controls (1D/2D range fields,
+# point counts, Auto toggles, unit + GI-mode combos, the Re-Integrate buttons,
+# all children of frame1D/frame2D) plus Calibrate / Make Mask must disable, and
+# re-enable MODE-CORRECTLY after.  The integratorTree controls are plain Qt
+# widgets, so disabling keeps a checkable Auto toggle's checked look (no
+# pyqtgraph repaint-to-unchecked).
+# ---------------------------------------------------------------------------
+
+def _set_processing_mode(w, mode_text):
+    """Set the wrangler processing-mode combo the per-mode control state keys
+    off.  Skips if the active wrangler has no such combo."""
+    combo = getattr(getattr(w.wrangler, 'ui', None), 'processingModeCombo', None)
+    if combo is None:
+        pytest.skip("active wrangler has no processingModeCombo")
+    combo.setCurrentText(mode_text)
+
+
+def _proc_controls(w):
+    ui = w.integratorTree.ui
+    d = {name: getattr(ui, name).isEnabled() for name in (
+        'frame1D', 'frame2D', 'integrate1D', 'integrate2D',
+        'pyfai_calib', 'get_mask')}
+    # Advanced 1D/2D dialogs are integratorTree attrs (pyqtgraph trees), not ui.
+    for name in ('advancedWidget1D', 'advancedWidget2D'):
+        adv = getattr(w.integratorTree, name, None)
+        if adv is not None:
+            d[name] = adv.isEnabled()
+    return d
+
+
+def test_run_disables_processing_controls(widget):
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    w._exit_run_state()                      # idle baseline
+    assert all(_proc_controls(w).values())   # all enabled when idle (Int 2D)
+
+    w._enter_run_state()
+    ctl = _proc_controls(w)
+    # Every processing-affecting control is locked, incl. the Re-Integrate
+    # buttons (children of frame1D/frame2D) and Calibrate / Make Mask.
+    assert not any(ctl.values()), f"controls not all disabled during run: {ctl}"
+
+
+def test_run_keeps_stop_and_browsing_alone(widget):
+    # Stop lives on the wrangler; the run-control disable must not touch it,
+    # nor the h5viewer browsing list.
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    stop = getattr(w.wrangler.ui, 'stopButton', None)
+    list_data = w.h5viewer.ui.listData
+    if stop is not None:
+        stop.setEnabled(True)
+    list_enabled_before = list_data.isEnabled()
+    w._enter_run_state()
+    if stop is not None:
+        assert stop.isEnabled(), "Stop must stay enabled during a run"
+    assert list_data.isEnabled() == list_enabled_before
+
+
+def test_exit_restores_mode_correct_int_2d(widget):
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    w._enter_run_state()
+    w._exit_run_state()
+
+    ui = w.integratorTree.ui
+    # Int 2D: both panels back on; Calibrate / Make Mask back on.
+    assert ui.frame1D.isEnabled() and ui.frame2D.isEnabled()
+    assert ui.pyfai_calib.isEnabled() and ui.get_mask.isEnabled()
+
+
+def test_exit_restores_mode_correct_int_1d_keeps_2d_off(widget):
+    w = widget
+    _set_processing_mode(w, 'Int 1D')
+    w._enter_run_state()
+    w._exit_run_state()
+
+    ui = w.integratorTree.ui
+    # Mode-correct restore — NOT a blanket enable: Int 1D has no cake, so the
+    # 2D panel stays disabled after the run.
+    assert ui.frame1D.isEnabled()
+    assert not ui.frame2D.isEnabled()
+    assert ui.pyfai_calib.isEnabled() and ui.get_mask.isEnabled()
+
+
+def test_run_preserves_auto_toggle_checked_look(widget):
+    """The repaint-to-unchecked bug must NOT bite the integratorTree: its Auto
+    toggles are checkable QPushButtons, whose checked state (== visual look)
+    survives setEnabled(False).  Also the GI-mode combo keeps its selection."""
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    ui = w.integratorTree.ui
+    ui.radial_autoRange_1D.setChecked(True)
+    ui.azim_autoRange_2D.setChecked(True)
+    axis_before = ui.axis1D.currentText()
+
+    w._enter_run_state()
+    # Disabled, but the checked look + combo selection are preserved.
+    assert not ui.radial_autoRange_1D.isEnabled()
+    assert ui.radial_autoRange_1D.isChecked()
+    assert ui.azim_autoRange_2D.isChecked()
+    assert ui.axis1D.currentText() == axis_before
+
+    w._exit_run_state()
+    assert ui.radial_autoRange_1D.isChecked()
+    assert ui.azim_autoRange_2D.isChecked()
+
+
+def test_finished_slot_restores_controls(widget):
+    # The finished slot (Stop/abort path) must also restore the controls.
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    w._enter_run_state()
+    assert not any(_proc_controls(w).values())
+
+    w.integrator_thread_finished()
+    ui = w.integratorTree.ui
+    assert ui.frame1D.isEnabled() and ui.frame2D.isEnabled()
+    assert ui.pyfai_calib.isEnabled() and ui.get_mask.isEnabled()
+
+
+def test_run_disables_advanced_param_dialogs(widget):
+    """The Advanced 1D/2D dialogs feed bai_*_args too (a leak vector if left
+    open mid-run); they must disable during a run and re-enable after."""
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    adv1d = getattr(w.integratorTree, 'advancedWidget1D', None)
+    adv2d = getattr(w.integratorTree, 'advancedWidget2D', None)
+    if adv1d is None or adv2d is None:
+        pytest.skip("advancedWidget1D/2D not present")
+    w._exit_run_state()                      # idle baseline
+    assert adv1d.isEnabled() and adv2d.isEnabled()
+
+    w._enter_run_state()
+    assert not adv1d.isEnabled() and not adv2d.isEnabled()
+
+    w._exit_run_state()
+    assert adv1d.isEnabled() and adv2d.isEnabled()
+
+
+def test_exit_restores_mode_correct_viewer(widget):
+    """After a run in a Viewer mode, the 1D/2D panels stay disabled (file-browser
+    mode) but Calibrate / Make Mask re-enable — the run overlay must not leave
+    them stuck off."""
+    w = widget
+    ui = w.integratorTree.ui
+    for viewer_mode in ('Image Viewer', 'XYE Viewer'):
+        _set_processing_mode(w, viewer_mode)
+        w._enter_run_state()
+        w._exit_run_state()
+        assert not ui.frame1D.isEnabled(), f"{viewer_mode}: frame1D should stay disabled"
+        assert not ui.frame2D.isEnabled(), f"{viewer_mode}: frame2D should stay disabled"
+        assert ui.pyfai_calib.isEnabled(), f"{viewer_mode}: Calibrate should re-enable"
+        assert ui.get_mask.isEnabled(), f"{viewer_mode}: Make Mask should re-enable"
+
+
+def test_integrator_finish_while_wrangler_running_keeps_controls_locked(widget, monkeypatch):
+    """Overlap guard: a reintegrate can finish while a wrangler run is still
+    active (a wrangler can be started mid-reintegrate).  The integrator finished
+    slot must NOT exit the shared run-state while the wrangler still runs —
+    controls stay locked until the wrangler's own finished handler exits."""
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    w._enter_run_state()
+    assert w._run_active is True
+
+    # Simulate the wrangler thread still running while the integrator finishes.
+    monkeypatch.setattr(w.wrangler.thread, 'isRunning', lambda: True)
+    w.integrator_thread_finished()
+    assert w._run_active is True, "run-state exited while wrangler still running"
+    assert not any(_proc_controls(w).values()), "controls re-enabled mid-wrangler-run"
+
+    # Now the wrangler finishes too → the integrator finished slot exits cleanly.
+    monkeypatch.setattr(w.wrangler.thread, 'isRunning', lambda: False)
+    w.integrator_thread_finished()
+    assert w._run_active is False
+    ui = w.integratorTree.ui
+    assert ui.frame1D.isEnabled() and ui.frame2D.isEnabled()
