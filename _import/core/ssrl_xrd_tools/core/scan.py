@@ -390,6 +390,11 @@ class Scan:
                 df[str(name)] = values
         return df
 
+    @property
+    def scan_data(self):
+        """Pandas-compatible per-frame metadata table for RSM-style consumers."""
+        return self.to_scan_data()
+
 
 Frame = ScanFrame
 
