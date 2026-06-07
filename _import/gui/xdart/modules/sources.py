@@ -243,9 +243,10 @@ def build_reduction_job(
 ) -> ReductionJob:
     """Build the architecture-v2 reduction job for a live scan.
 
-    RESTRUCTURE-TODO(WS-X1): migrate image/nexus wrangler threads to build and
-    run this job directly for standard and GI modes once the real-data gates
-    cover all historical GUI paths.
+    RESTRUCTURE-TODO(WS-X1): image/nexus/live/reintegrate compute paths now
+    call the headless reducer through ``reduce_live_frames``.  Promote the
+    wrangler threads themselves to build and run ``ReductionJob`` directly
+    once save/progress/cancel semantics are represented entirely as sinks.
     """
 
     source = LiveScanFrameSource(live_scan, frame_indices=frame_indices)
