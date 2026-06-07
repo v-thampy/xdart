@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 from threading import RLock
 from types import SimpleNamespace
 
@@ -358,9 +359,13 @@ def test_plan_from_live_scan_maps_integration_settings() -> None:
     )
 
 
-def test_plan_from_gi_scan_requires_incident_angle() -> None:
-    scan = LiveScan("scan", frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)))],
-                         gi=True)
+def test_plan_from_gi_scan_requires_incident_angle_or_motor() -> None:
+    scan = LiveScan(
+        "scan",
+        frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)))],
+        gi=True,
+        incidence_motor="",
+    )
 
     try:
         plan_from_live_scan(scan)
@@ -368,6 +373,78 @@ def test_plan_from_gi_scan_requires_incident_angle() -> None:
         assert "gi_incident_angle" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected missing GI angle to fail")
+
+
+def test_plan_from_gi_scan_maps_manual_numeric_incidence() -> None:
+    scan = LiveScan(
+        "scan",
+        frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)))],
+        gi=True,
+        incidence_motor="3.0",
+    )
+
+    plan = plan_from_live_scan(scan)
+
+    assert plan.gi is not None
+    assert plan.gi.incident_angle == 3.0
+    assert plan.gi.incidence_motor is None
+    assert plan.integration_1d.unit == "q_A^-1"
+    assert plan.integration_2d.unit == "qip_A^-1"
+
+
+def test_standard_plan_cache_returns_headless_plan_for_gi_scan() -> None:
+    from xdart.modules.reduction import StandardPlanCache
+
+    scan = LiveScan(
+        "scan",
+        frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)), scan_info={"th": 0.2})],
+        gi=True,
+        incidence_motor="th",
+    )
+
+    plan = StandardPlanCache().get(scan)
+
+    assert plan is not None
+    assert plan.gi is not None
+    assert plan.gi.incidence_motor == "th"
+
+
+def test_dispatch_gi_frame_uses_headless_reduction_when_plan_present(monkeypatch) -> None:
+    calls = []
+
+    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
+        calls.append((frame.idx, plan, scan_name, global_mask, integrator))
+        frame.int_1d = _r1d()
+        frame.int_2d = _r2d()
+        return frame
+
+    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
+    frame = LiveFrame(idx=4, map_raw=np.ones((2, 2)), gi=True, scan_info={"th": 0.2})
+    scan = LiveScan("scan", frames=[frame], gi=True, incidence_motor="th")
+
+    dispatch_live_frame_reduction(
+        frame,
+        scan,
+        standard_plan=ReductionPlan(gi=reduction_adapters.GIMode(incidence_motor="th")),
+        integrator="ai",
+        global_mask=np.array([0]),
+    )
+
+    assert calls and calls[0][0] == 4
+
+
+def test_dispatch_requires_headless_plan() -> None:
+    frame = LiveFrame(idx=4, map_raw=np.ones((2, 2)))
+    scan = LiveScan("scan", frames=[frame])
+
+    with pytest.raises(ValueError, match="ReductionPlan"):
+        dispatch_live_frame_reduction(
+            frame,
+            scan,
+            standard_plan=None,
+            integrator="ai",
+            global_mask=None,
+        )
 
 
 def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
@@ -502,7 +579,6 @@ def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> Non
         worker,
         scan,
         _BorrowPool(),
-        None,
         ReductionPlan(
             integration_1d=Integration1DPlan(),
             integration_2d=Integration2DPlan(),

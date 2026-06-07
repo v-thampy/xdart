@@ -113,6 +113,16 @@ class LiveScanFrameSource:
             chunk = labels[start:start + chunk_size]
             yield np.stack([self.load_frame(i) for i in chunk]), chunk
 
+    def clear_frame_image(self, index: int) -> None:
+        """Drop the live-frame raw image cache after downstream sinks publish it."""
+
+        try:
+            frame = self.live_scan.frames[int(index)]
+        except Exception:
+            return
+        if hasattr(frame, "map_raw"):
+            frame.map_raw = None
+
     def to_scan(self, *, name: str | None = None, **kwargs: Any) -> Scan:
         return Scan(
             name or self.name,
@@ -124,6 +134,29 @@ class LiveScanFrameSource:
             extra={"source": "xdart.LiveScanFrameSource", **kwargs.pop("extra", {})},
             **kwargs,
         )
+
+
+@dataclass(slots=True)
+class HeadlessRawRef:
+    """Display-compatible raw reference around a headless ``ScanFrame``."""
+
+    frame: ScanFrame
+
+    @property
+    def map_raw(self):
+        return self.frame.image
+
+    @property
+    def bg_raw(self):
+        return self.frame.background
+
+    @property
+    def mask(self):
+        return self.frame.mask
+
+    @property
+    def thumbnail(self):
+        return None
 
 
 @dataclass(slots=True)
@@ -139,21 +172,23 @@ class PublicationSink:
         self._scan_name = scan.name
 
     def write(self, frame: ScanFrame, reduction) -> None:
+        raw = None if frame.image is None else np.asarray(frame.image)
         view = FrameView.from_results(
             label=int(frame.index),
             result_1d=reduction.result_1d,
             result_2d=reduction.result_2d,
+            raw=raw,
             metadata_raw=reduction.metadata,
-            metadata_numeric=None,
-            source_path=frame.source_path,
+            metadata_numeric=dict(getattr(frame, "metadata_numeric", {}) or {}),
+            source_path=None if frame.source_path is None else str(frame.source_path),
             source_frame_index=frame.source_frame_index,
         )
         publication = publication_from_frame_view(
             view,
             generation=self.generation,
             source_identity=f"{self._scan_name}:{frame.index}",
-            raw_ref=frame,
-            raw_status=("ready" if frame.image is not None else "lazy"),
+            raw_ref=HeadlessRawRef(frame),
+            raw_status=("ready" if raw is not None else "lazy"),
             validate=self.validate,
         )
         self.callback(publication)

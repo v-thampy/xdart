@@ -54,6 +54,7 @@ from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
     StandardPlanCache,
     dispatch_live_frame_reduction,
+    sync_live_scan_gi_settings,
 )
 from .wrangler_widget import wranglerThread
 
@@ -871,72 +872,6 @@ class imageThread(wranglerThread):
             self._frames_since_save = 0
         return count
 
-    def _prewarm_fiber_integrator_spec(self, scan, pending_entry) -> None:
-        """Build ``scan._cached_fiber_integrator`` from the first
-        pending frame.
-
-        O5: mirrors :meth:`nexusThread._prewarm_fiber_integrator` —
-        builds a throw-away frame from the first frame, computes its
-        incidence angle, and seeds the fiber integrator on the
-        scan.  After this call ``_dispatch_batch_parallel`` can
-        build a fiber pool so every worker borrows a deep-copied
-        instance instead of constructing a fresh one per frame.
-
-        Pre-O5 the parallel batch path left ``_cached_fiber_integrator``
-        unset, ``fiber_pool`` came back None, and each worker built
-        its own fiber integrator per frame (~250 ms first-call CSR
-        LUT cost per worker per frame).  Costly for GI scans with
-        many cores.
-
-        ``pending_entry`` is one tuple from ``pending``:
-        ``(img_file, img_number, img_data, img_meta, bg_raw, t_read)``.
-        """
-        if not self.gi:
-            return
-        if scan._cached_fiber_integrator is not None:
-            return
-        img_file, img_number, img_data, img_meta, bg_raw, _ = pending_entry
-        # Build a scratch frame identical in shape to what
-        # ``_process_one`` constructs so the angle math agrees.
-        scratch = LiveFrame(
-            img_number, img_data, poni=self.poni,
-            scan_info=img_meta, static=True, gi=True,
-            th_mtr=self.incidence_motor,
-            sample_orientation=self.sample_orientation,
-            tilt_angle=self.tilt_angle,
-            series_average=self.series_average,
-            integrator=scan._cached_integrator,
-        )
-        try:
-            incident_angle = scratch._get_incident_angle()
-        except IncidenceAngleUnresolved as exc:
-            # No resolvable incidence — skip prewarm.  Per-frame integration
-            # raises the same way and surfaces "set Manual theta"; we don't
-            # want to seed a degenerate 0° fiber integrator on the scan.
-            logger.warning('GI fiber-integrator prewarm skipped: %s', exc)
-            return
-        scan._cached_fiber_integrator = create_fiber_integrator(
-            scratch._poni_from_integrator(),
-            incident_angle=incident_angle,
-            tilt_angle=scratch.tilt_angle,
-            sample_orientation=self.sample_orientation,
-            angle_unit="deg",
-        )
-        # The per-frame angle-drift check in ``_integrate_one``
-        # compares against this cached value; if a later frame's
-        # incidence angle differs, that worker falls back to a
-        # locally-built fiber integrator at the right angle.
-        self._cached_gi_incident_angle = incident_angle
-        # Q3: ``_borrow_fiber_integrator`` (the shared helper used
-        # by parallel workers) looks the angle up on the *scan*,
-        # not on the wrangler instance, because it doesn't have a
-        # handle to the wrangler.  The NeXus prewarm sets the
-        # scan attribute too; pre-Q3 the SPEC prewarm only set
-        # the wrangler attribute, so the borrow helper always saw
-        # cached_angle=None and built worker-local FiberIntegrators
-        # per frame — defeating the pool we just constructed.
-        scan._cached_fiber_integrator_angle = incident_angle
-
     def _scout_pending_frames(self, pending):
         """Pending entries to scout for the common-grid freeze (#70): the
         lowest- and highest-incidence frames, whose output extents bracket a
@@ -1194,32 +1129,19 @@ class imageThread(wranglerThread):
         if (getattr(scan, '_cached_data_mask', None) is None
                 and pending):
             self._prewarm_frame_mask(scan, pending[0][2])
-        # GI batch builds a FRESH fiber integrator per frame at that
-        # frame's own resolved incidence angle — no prewarm, no pool.
-        #
-        # The pooled/prewarmed fiber integrator was seeded from frame 0's
-        # incidence and reused for frames whose angle matched within tol;
-        # on an angle-dependence scan (ω varies per frame) that silently
-        # integrated later frames at the wrong incidence, collapsing the
-        # qoop axis (the batch GI cake bug).  The pool gave ~no benefit
-        # for angle-dependence scans anyway (every frame's angle differs,
-        # so every frame rebuilt regardless).  An angle-keyed fiber pool
-        # is left as a later optimization.
-        #
-        # ``fiber_pool=None`` makes ``_borrow_fiber_integrator`` build a
-        # fresh integrator from ``frame._get_incident_angle()`` for every
-        # frame (and raise IncidenceAngleUnresolved → frame skipped +
-        # "set Manual theta" — never a degenerate 0°).
-        fiber_pool = None
         skip_2d = scan.skip_2d
-        bai_1d_args = dict(scan.bai_1d_args)
-        bai_2d_args = dict(scan.bai_2d_args)
         mask = self.mask
         gi = self.gi
-        standard_plan = self._plan_cache.get(scan, integrate_2d=not skip_2d)
         th_mtr = self.incidence_motor
         sample_orientation = self.sample_orientation
         tilt_angle = self.tilt_angle
+        sync_live_scan_gi_settings(
+            scan,
+            incidence_motor=th_mtr,
+            sample_orientation=sample_orientation,
+            tilt_angle=tilt_angle,
+        )
+        standard_plan = self._plan_cache.get(scan, integrate_2d=not skip_2d)
         series_average = self.series_average
 
         def _integrate_one(img_file, img_number, img_data, img_meta, bg_raw,
@@ -1262,32 +1184,11 @@ class imageThread(wranglerThread):
                     mask=frame_mask,
                 )
 
-                # H2 + S3 unified dispatch.  When ``standard_plan`` is
-                # None (GI scan) we run the fiber-integrator path
-                # inside the legacy_gi closure; otherwise the headless
-                # ``reduce_live_frame`` handles it.
-                def _legacy_gi_for_frame() -> None:
-                    with self._borrow_fiber_integrator(
-                        scan, fiber_pool, frame,
-                    ) as _fi:
-                        frame.integrate_1d(
-                            global_mask=mask,
-                            fiber_integrator=_fi,
-                            **bai_1d_args,
-                        )
-                        if not skip_2d:
-                            frame.integrate_2d(
-                                global_mask=mask,
-                                fiber_integrator=_fi,
-                                **bai_2d_args,
-                            )
-
                 dispatch_live_frame_reduction(
                     frame, scan,
                     standard_plan=standard_plan,
                     integrator=ai,
                     global_mask=mask,
-                    legacy_gi=_legacy_gi_for_frame,
                 )
 
             # Detach the pool integrator from this frame — once the
@@ -1469,19 +1370,12 @@ class imageThread(wranglerThread):
                 self._cached_gi_incident_angle = _incident_angle
 
         _t2 = time.time()
-
-        def _legacy_gi_for_single() -> None:
-            frame.integrate_1d(
-                global_mask=self.mask,
-                fiber_integrator=scan._cached_fiber_integrator,
-                **scan.bai_1d_args,
-            )
-            if not scan.skip_2d:
-                frame.integrate_2d(
-                    global_mask=self.mask,
-                    fiber_integrator=scan._cached_fiber_integrator,
-                    **scan.bai_2d_args,
-                )
+        sync_live_scan_gi_settings(
+            scan,
+            incidence_motor=self.incidence_motor,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
+        )
 
         dispatch_live_frame_reduction(
             frame, scan,
@@ -1490,7 +1384,6 @@ class imageThread(wranglerThread):
             ),
             integrator=scan._cached_integrator,
             global_mask=self.mask,
-            legacy_gi=_legacy_gi_for_single,
         )
         # Timing kept for parity with the legacy logging; the
         # standard path now does both 1D + 2D in one call so we

@@ -7,3 +7,5 @@ modules import ``pyqtgraph.Qt`` directly.
 import os
 
 os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
+os.environ.setdefault("QT_API", "PySide6")
+os.environ.setdefault("MPLBACKEND", "Agg")

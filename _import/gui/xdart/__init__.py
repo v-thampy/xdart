@@ -8,6 +8,7 @@ import os as _os
 # tests and occasional app startup crashes.  Pin pyqtgraph before any module can
 # import ``pyqtgraph.Qt``.
 _os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
+_os.environ.setdefault("QT_API", "PySide6")
 
 # Single-source the version from installed package metadata so we don't
 # have to keep a hard-coded string in sync with pyproject.toml on every

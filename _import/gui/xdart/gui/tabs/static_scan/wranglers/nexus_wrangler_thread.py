@@ -63,6 +63,7 @@ from xdart.utils.integrator_pool import ensure_integrator_pool
 from xdart.modules.reduction import (
     StandardPlanCache,
     dispatch_live_frame_reduction,
+    sync_live_scan_gi_settings,
 )
 from .wrangler_widget import wranglerThread
 
@@ -259,22 +260,14 @@ class nexusThread(wranglerThread):
             integrator_pool = ensure_integrator_pool(
                 scan, '_cached_integrator', n_workers,
             )
-            # H2: pyFAI FiberIntegrator inherits from
-            # AzimuthalIntegrator and shares the CSR-scratch-buffer
-            # mutation pattern.  Same fix as IntegratorPool — one
-            # deepcopy per worker, borrowed via context manager.
-            # Built only when GI is enabled and the prewarm seeded
-            # _cached_fiber_integrator; otherwise stays None and
-            # the worker uses its own per-frame fiber integrator.
-            fiber_pool = (
-                ensure_integrator_pool(
-                    scan, '_cached_fiber_integrator', n_workers,
-                    pool_attr='_cached_fiber_integrator_pool',
-                )
-                if self.gi else None
-            )
             # C1: cached per-scan plan — rebuilt only when scan
             # integration settings or mask change between chunks.
+            sync_live_scan_gi_settings(
+                scan,
+                incidence_motor=self.incidence_motor,
+                sample_orientation=self.sample_orientation,
+                tilt_angle=self.tilt_angle,
+            )
             standard_plan = self._plan_cache.get(
                 scan, integrate_2d=not scan.skip_2d,
             )
@@ -318,7 +311,7 @@ class nexusThread(wranglerThread):
                 frames = self._parallel_integrate(
                     items,
                     lambda item: self._integrate_one(
-                        scan, integrator_pool, fiber_pool, standard_plan, *item,
+                        scan, integrator_pool, standard_plan, *item,
                     ),
                     n_workers,
                     label='NEXUS',
@@ -495,7 +488,7 @@ class nexusThread(wranglerThread):
         # pattern as imageThread.
         scan._cached_fiber_integrator_angle = incident_angle
 
-    def _integrate_one(self, scan, integrator_pool, fiber_pool, standard_plan,
+    def _integrate_one(self, scan, integrator_pool, standard_plan,
                        frame_idx, img_data, img_meta):
         """Pure integration in a worker thread; returns the frame.
 
@@ -531,31 +524,11 @@ class nexusThread(wranglerThread):
                 mask=frame_mask,
             )
 
-            # S3: unified dispatch — GI fiber-integrator path lives in
-            # the closure so the GI fiber-integrator pool stays local
-            # to the worker.  Non-GI dispatches to the headless API.
-            def _legacy_gi_for_frame() -> None:
-                with self._borrow_fiber_integrator(
-                    scan, fiber_pool, frame,
-                ) as fi:
-                    frame.integrate_1d(
-                        global_mask=self.mask,
-                        fiber_integrator=fi,
-                        **scan.bai_1d_args,
-                    )
-                    if not scan.skip_2d:
-                        frame.integrate_2d(
-                            global_mask=self.mask,
-                            fiber_integrator=fi,
-                            **scan.bai_2d_args,
-                        )
-
             dispatch_live_frame_reduction(
                 frame, scan,
                 standard_plan=standard_plan,
                 integrator=ai,
                 global_mask=self.mask,
-                legacy_gi=_legacy_gi_for_frame,
             )
 
         # Detach the pool integrator from the frame — once the `with`

@@ -260,33 +260,6 @@ class integratorThread(Qt.QtCore.QThread):
             self.scan, '_cached_integrator', n_workers,
         )
 
-        # Same per-worker pattern for the GI fiber integrator (H2).
-        # Only relevant when scan.gi is set AND a fiber integrator
-        # has been pre-built; otherwise None and the integrate calls
-        # treat the fiber arg as a no-op.
-        fiber_pool = None
-        if (self.scan.gi
-                and getattr(self.scan, '_cached_fiber_integrator', None)
-                is not None):
-            fiber_pool = ensure_integrator_pool(
-                self.scan, '_cached_fiber_integrator', n_workers,
-                pool_attr='_cached_fiber_integrator_pool',
-            )
-
-        # P2: re-use the wrangler base class's angle-aware borrow.
-        # The plain ``fiber_pool.borrow()`` below was unconditionally
-        # handing out the prewarmed (frame-0) FiberIntegrator to every
-        # worker.  For ω-varying GI scans (e.g. sin²ψ sweeps) the
-        # per-frame incidence angle drifts and the prewarmed instance
-        # silently integrates every frame at frame-0 geometry —
-        # silently wrong.  The helper falls back to a worker-local
-        # fiber integrator built at the right angle when the
-        # per-frame angle differs from ``_cached_fiber_integrator_angle``.
-        from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import (
-            wranglerThread,
-        )
-        _borrow_fi = wranglerThread._borrow_fiber_integrator
-
         def _worker(frame):
             """Re-integrate one frame on a thread.  Borrows a private
             integrator from the pool to avoid pyFAI's CSR scratch
@@ -300,48 +273,23 @@ class integratorThread(Qt.QtCore.QThread):
                 with integrator_pool.borrow() as ai:
                     frame.integrator = ai
 
-                    def _legacy_gi_for_frame() -> None:
-                        # P2: angle-aware fiber borrow — pool hit when the
-                        # frame's incidence angle matches the cached
-                        # prewarm angle (most scans), worker-local build
-                        # otherwise.
-                        with _borrow_fi(self.scan, fiber_pool, frame) as fi:
-                            frame.integrate_1d(
-                                fiber_integrator=fi,
-                                **self.scan.bai_1d_args,
-                            )
-                            if do_2d:
-                                frame.integrate_2d(
-                                    fiber_integrator=fi,
-                                    **self.scan.bai_2d_args,
-                                )
-
                     dispatch_live_frame_reduction(
                         frame, self.scan,
                         standard_plan=standard_plan,
                         integrator=ai,
                         global_mask=self.scan.global_mask,
-                        legacy_gi=_legacy_gi_for_frame,
                     )
                     # Detach pool integrator before the next worker
                     # borrows the same instance.
                     frame.integrator = self.scan._cached_integrator
             else:
                 # Fallback: no integrator pool — still go through the
-                # shared dispatch helper so the GI vs standard logic
-                # stays in one place.
-                def _legacy_gi_serial() -> None:
-                    if do_2d:
-                        frame.integrate_2d(**self.scan.bai_2d_args)
-                    else:
-                        frame.integrate_1d(**self.scan.bai_1d_args)
-
+                # shared headless dispatch helper.
                 dispatch_live_frame_reduction(
                     frame, self.scan,
                     standard_plan=standard_plan,
                     integrator=frame.integrator,
                     global_mask=self.scan.global_mask,
-                    legacy_gi=_legacy_gi_serial,
                 )
             return frame
 
@@ -423,15 +371,11 @@ class integratorThread(Qt.QtCore.QThread):
         for idx in idxs:
             frame = self.scan.frames[int(idx)]
 
-            def _legacy_gi_2d(frame=frame) -> None:
-                frame.integrate_2d(**self.scan.bai_2d_args)
-
             dispatch_live_frame_reduction(
                 frame, self.scan,
                 standard_plan=plan,
                 integrator=frame.integrator,
                 global_mask=self.scan.global_mask,
-                legacy_gi=_legacy_gi_2d,
             )
             self._publish_reintegrated_display(
                 frame,
@@ -450,15 +394,11 @@ class integratorThread(Qt.QtCore.QThread):
         for idx in idxs:
             frame = self.scan.frames[int(idx)]
 
-            def _legacy_gi_1d(frame=frame) -> None:
-                frame.integrate_1d(**self.scan.bai_1d_args)
-
             dispatch_live_frame_reduction(
                 frame, self.scan,
                 standard_plan=plan,
                 integrator=frame.integrator,
                 global_mask=self.scan.global_mask,
-                legacy_gi=_legacy_gi_1d,
             )
             self._publish_reintegrated_display(
                 frame,

@@ -1419,6 +1419,8 @@ class staticWidget(QWidget):
                 self.h5viewer.enter_viewer_mode_cleanup()
             else:
                 self.h5viewer.cancel_pending_loads()
+                if hasattr(self, 'scan') and hasattr(self.scan, 'global_mask'):
+                    self.scan.global_mask = None
                 self.displayframe.clear_display_state()
             # Refresh scan list to show/hide appropriate file types
             self.h5viewer.update_scans()

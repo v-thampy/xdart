@@ -9,7 +9,6 @@ headless reduction work should cross into ``ssrl_xrd_tools`` as ``Frame`` /
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Any
@@ -189,11 +188,13 @@ def plan_from_live_scan(
     if is_gi and gi_incident_angle is None:
         gi_incident_angle = getattr(live_scan, "_cached_fiber_integrator_angle", None)
     incidence_motor = getattr(live_scan, "incidence_motor", None)
-    if (
-        is_gi
-        and gi_incident_angle is None
-        and not _incidence_available(live_scan, incidence_motor)
-    ):
+    if is_gi and gi_incident_angle is None and incidence_motor is not None:
+        try:
+            gi_incident_angle = float(incidence_motor)
+            incidence_motor = None
+        except (TypeError, ValueError):
+            pass
+    if is_gi and gi_incident_angle is None and not incidence_motor:
         raise ValueError(
             "Cannot build a GI ReductionPlan without gi_incident_angle or incidence_motor."
         )
@@ -219,12 +220,14 @@ def plan_from_live_scan(
         )
         if is_gi else None
     )
+    unit_1d = _gi_1d_unit_default(unit_1d, str(gi_mode_1d), is_gi=is_gi)
+    unit_2d = _gi_2d_unit_default(unit_2d, str(gi_mode_2d), is_gi=is_gi)
 
     return ReductionPlan(
         integration_1d=(
             Integration1DPlan(
                 npt=npt_1d,
-                unit=str(unit_1d or "q_A^-1"),
+                unit=unit_1d,
                 method=method_1d,
                 radial_range=radial_range,
                 azimuth_range=azimuth_range_1d,
@@ -239,7 +242,7 @@ def plan_from_live_scan(
             Integration2DPlan(
                 npt_rad=npt_rad_2d,
                 npt_azim=npt_azim_2d,
-                unit=str(unit_2d or "q_A^-1"),
+                unit=unit_2d,
                 method=method_2d,
                 radial_range=radial_range_2d,
                 azimuth_range=azimuth_range_2d,
@@ -270,8 +273,6 @@ def reduce_live_frame(
     ``int_1d`` / ``int_2d`` so existing xdart display and writer code can
     continue to operate while the computation crosses the new Scan/Frame API.
     """
-    if getattr(live_frame, "gi", False):
-        raise ValueError("reduce_live_frame currently handles non-GI frames only.")
     frame = frame_from_live_frame(live_frame)
     plan = _plan_with_mask_for_live_frame(plan, global_mask, live_frame)
     scan = Scan(
@@ -346,6 +347,10 @@ def _plan_signature(
         id(live_scan),
         bool(integrate_1d),
         bool(integrate_2d),
+        bool(getattr(live_scan, "gi", False)),
+        repr(getattr(live_scan, "incidence_motor", None)),
+        repr(getattr(live_scan, "tilt_angle", None)),
+        repr(getattr(live_scan, "sample_orientation", None)),
         _items(getattr(live_scan, "bai_1d_args", {})),
         _items(getattr(live_scan, "bai_2d_args", {})),
         mask_sig,
@@ -359,9 +364,9 @@ class StandardPlanCache:
     lifetime of a scan; the cached plan is rebuilt only when one of the
     scan settings ``_plan_signature`` covers actually changes.
 
-    Returns ``None`` for GI scans so callers can drop straight into the
-    legacy fiber-integrator path without an "is GI" check at every call
-    site (the per-dispatch helper below already does that).
+    GI scans now get real headless plans too; callers may still pass
+    ``None`` explicitly to the dispatch helper as an escape hatch for a
+    known-legacy site, but the cache no longer forces that fork.
     """
 
     __slots__ = ("_plan", "_key", "_mask_obj", "_mask_sig")
@@ -398,8 +403,6 @@ class StandardPlanCache:
         integrate_1d: bool = True,
         integrate_2d: bool = True,
     ) -> ReductionPlan | None:
-        if getattr(live_scan, "gi", False):
-            return None
         mask_sig = self._mask_sig_for(getattr(live_scan, "global_mask", None))
         key = _plan_signature(
             live_scan, integrate_1d, integrate_2d, mask_sig=mask_sig,
@@ -427,36 +430,29 @@ def dispatch_live_frame_reduction(
     standard_plan: ReductionPlan | None,
     integrator: Any,
     global_mask: Any,
-    legacy_gi: Callable[[], None],
 ) -> None:
-    """Run reduction for one live frame via the right path (standard or GI).
+    """Run reduction for one live frame through the headless path.
 
-    Single dispatch point shared by all wrangler workers so the
-    ``if self.gi: <legacy>; else: reduce_live_frame(...)`` fork lives
-    in exactly one place.
+    Single dispatch point shared by wrangler workers.  Standard and GI frames
+    both reduce through ``ssrl_xrd_tools.reduction.run_reduction`` now; a
+    missing plan is a programmer error, not a fallback to xdart's old
+    integration engine.
 
     Parameters
     ----------
     live_frame, live_scan
         The live frame to reduce and its parent live scan.
     standard_plan
-        ``ReductionPlan`` for the non-GI path; pass ``None`` to force
-        the legacy callback (matches what
-        :meth:`StandardPlanCache.get` returns for GI scans).
+        ``ReductionPlan`` for the headless path; pass ``None`` to force the
+        legacy callback.
     integrator
         Pre-built pyFAI integrator for the worker (typically borrowed
         from an :class:`IntegratorPool`).
     global_mask
         Scan-level mask passed through unchanged.
-    legacy_gi
-        Zero-arg callback that runs the GI fiber-integrator path.
-        Invoked when ``standard_plan`` is ``None`` or
-        ``live_frame.gi`` is ``True``.  Caller is responsible for borrowing
-        the right fiber integrator inside this callback.
     """
-    if standard_plan is None or getattr(live_frame, "gi", False):
-        legacy_gi()
-        return
+    if standard_plan is None:
+        raise ValueError("dispatch_live_frame_reduction requires a ReductionPlan.")
     reduce_live_frame(
         live_frame,
         standard_plan,
@@ -464,6 +460,26 @@ def dispatch_live_frame_reduction(
         global_mask=global_mask,
         integrator=integrator,
     )
+
+
+def sync_live_scan_gi_settings(
+    live_scan: Any,
+    *,
+    incidence_motor: Any = None,
+    sample_orientation: Any = None,
+    tilt_angle: Any = None,
+) -> None:
+    """Mirror wrangler-thread GI settings onto a live scan before planning."""
+
+    if not bool(getattr(live_scan, "gi", False)):
+        return
+    if incidence_motor is not None:
+        live_scan.incidence_motor = incidence_motor
+        live_scan.th_mtr = incidence_motor
+    if sample_orientation is not None:
+        live_scan.sample_orientation = sample_orientation
+    if tilt_angle is not None:
+        live_scan.tilt_angle = tilt_angle
 
 
 def _source_path(frame: Any) -> Path | None:
@@ -646,6 +662,25 @@ def _offset_range(
     return float(value[0]) - offset, float(value[1]) - offset
 
 
+def _gi_1d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
+    if not is_gi:
+        return str(unit or "q_A^-1")
+    if mode == "q_ip":
+        return "qip_A^-1"
+    if mode == "q_oop":
+        return "qoop_A^-1"
+    return str(unit or "q_A^-1")
+
+
+def _gi_2d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
+    text = str(unit or "").strip()
+    if not is_gi:
+        return text or "q_A^-1"
+    if mode == "qip_qoop":
+        return text if text.startswith("qip_") else "qip_A^-1"
+    return text or "q_A^-1"
+
+
 __all__ = [
     "StandardPlanCache",
     "dispatch_live_frame_reduction",
@@ -653,4 +688,5 @@ __all__ = [
     "scan_from_live_scan",
     "plan_from_live_scan",
     "reduce_live_frame",
+    "sync_live_scan_gi_settings",
 ]

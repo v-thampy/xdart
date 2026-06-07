@@ -49,8 +49,12 @@ params = [
         {'name': 'mask_file', 'title': 'Mask File    ', 'type': 'str', 'value': ''},
         NamedActionParameter(name='mask_file_browse', title='Browse...'),
     ], 'expanded': False},
-    {'name': 'GI', 'type': 'group', 'children': [
-        {'name': 'Grazing', 'title': 'Grazing Incidence', 'type': 'bool', 'value': False},
+    {'name': 'GI', 'type': 'group', 'title': 'Grazing Incidence',
+     'syncExpanded': True, 'children': [
+        # Hidden compatibility value.  The visible on/off control is the group
+        # header expansion state: expanded = enabled, collapsed = disabled.
+        {'name': 'Grazing', 'title': 'Grazing Incidence', 'type': 'bool',
+         'value': False, 'visible': False},
         {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'str', 'value': 'th'},
         {'name': 'th_val', 'title': 'Theta Value', 'type': 'float', 'value': 0.0},
         {'name': 'sample_orientation', 'title': 'Sample Orientation', 'type': 'int',
@@ -203,6 +207,7 @@ class nexusWrangler(wranglerWidget):
         self.parameters.child('Output').child('h5_dir_browse').sigActivated.connect(
             self.browse_h5_dir
         )
+        self.parameters.sigTreeStateChanged.connect(self._sync_group_toggles)
 
         # Setup thread
         self.thread = nexusThread(
@@ -233,6 +238,7 @@ class nexusWrangler(wranglerWidget):
         self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
 
         self._restore_from_session()
+        self._expand_active_groups()
 
     # ── Session persistence ──────────────────────────────────────────
 
@@ -248,6 +254,37 @@ class nexusWrangler(wranglerWidget):
         ('gi_mode_1d',          ('GI', 'gi_mode_1d'),            False, 'gi_mode_1d'),
         ('gi_mode_2d',          ('GI', 'gi_mode_2d'),            False, 'gi_mode_2d'),
     ]
+
+    def _set_hidden_toggle_value(self, child, value):
+        if getattr(self, '_syncing_group_toggle', False):
+            return
+        self._syncing_group_toggle = True
+        try:
+            child.setValue(bool(value))
+        finally:
+            self._syncing_group_toggle = False
+
+    def _sync_group_toggles(self, *args):
+        changes = args[1] if len(args) > 1 else ()
+        for changed, change, data in changes:
+            if change != 'options' or 'expanded' not in data:
+                continue
+            try:
+                group = self.parameters.child('GI')
+                if changed is group:
+                    self._set_hidden_toggle_value(
+                        group.child('Grazing'), bool(data['expanded']),
+                    )
+            except Exception:
+                logger.debug("failed to sync NeXus GI toggle", exc_info=True)
+
+    def _expand_active_groups(self):
+        try:
+            group = self.parameters.child('GI')
+            if bool(group.child('Grazing').value()):
+                group.setOpts(expanded=True)
+        except Exception:
+            logger.debug("failed to restore NeXus GI group state", exc_info=True)
 
     def _restore_from_session(self):
         """Restore parameters from session.json."""
@@ -475,18 +512,10 @@ class nexusWrangler(wranglerWidget):
         self.stopButton.setEnabled(False)
 
     def enabled(self, enable):
-        """Enable/disable the WHOLE wrangler panel for the run lifecycle (#72),
-        except Stop.
-
-        Hard-disables the parameter tree (greyed + non-interactive, matching the
-        integration panel) plus the non-param widgets (processing-mode combo,
-        Cores spinbox + label).  A disabled pyqtgraph bool checkbox may repaint
-        unchecked during the run (#56), but the value is preserved/restored on
-        re-enable; the full visible disable was chosen over that cosmetic
-        ("minimize complexity").
-        """
+        """Enable/disable processing inputs while preserving toggle visuals."""
         self.startButton.setEnabled(enable)
-        self.tree.setEnabled(enable)
+        self.tree.setEnabled(True)
+        self._set_tree_readonly(not enable)
         for w in (self.processingModeCombo, self.maxCoresSpinBox,
                   getattr(self, 'coresLabel', None)):
             if w is not None:
