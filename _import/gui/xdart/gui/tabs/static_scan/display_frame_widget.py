@@ -1097,6 +1097,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # restores them.
         if skip != self._was_skip_2d:
             self.set_axes()
+            # On a 1D-only -> 2D transition the 2D panel was collapsed; the
+            # viewer-mode path re-equalizes the primary panels but the
+            # update_views path did not, leaving the 2D panel contracted
+            # (UI-3).  Re-split the primary panels 50/50, on the transition
+            # only (not every render).
+            if not skip:
+                self._set_equal_primary_panel_heights()
             self._was_skip_2d = skip
 
     # ── Axis configuration ────────────────────────────────────────
@@ -1484,7 +1491,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Sets title text
         label = self.scan.name
         if len(label) > 40:
-            label = f'{label[:10]}.....{label[-30:]}'
+            label = f'{label[:18]}...{label[-18:]}'
 
         if (self.overall or self.scan.single_img) and (len(self.frame_ids) > 1):
             self.ui.labelCurrent.setText(label)

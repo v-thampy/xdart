@@ -188,6 +188,19 @@ class nexusWrangler(wranglerWidget):
             name='nexus_wrangler', type='group', children=params
         )
         self.tree.setParameters(self.parameters, showTop=False)
+        # Match the image wrangler's tree styling so the group headers (and
+        # their expand/collapse arrows) are legible against the Dracula theme
+        # -- the nexus tree previously had no styling at all (UI-4).
+        self.tree.setStyleSheet("""
+        QTreeView::item:has-children {
+            background-color: #44475a;
+            color: #f8f8f2;
+        }
+        QTreeView::item:has-children:disabled {
+            background-color: #3a3d4d;
+            color: #6272a4;
+        }
+            """)
         layout.addWidget(self.tree)
 
         # Connect parameter browse buttons

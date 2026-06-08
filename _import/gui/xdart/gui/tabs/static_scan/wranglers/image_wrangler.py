@@ -549,6 +549,11 @@ class imageWrangler(wranglerWidget):
             self.ui.coresLabel.setEnabled(False)
             self.ui.maxCoresSpinBox.setEnabled(False)
         elif is_xye:
+            # Stash the user's Batch choice once on entering XYE so it can be
+            # restored on leaving -- XYE force-checks Batch, and the normal
+            # branch used to leave it stuck checked (UI-2).
+            if getattr(self, '_pre_xye_batch', None) is None:
+                self._pre_xye_batch = self.ui.batchCheckBox.isChecked()
             self.ui.liveCheckBox.setChecked(False)
             self.ui.liveCheckBox.setEnabled(False)
             self.ui.batchCheckBox.setChecked(True)
@@ -556,6 +561,10 @@ class imageWrangler(wranglerWidget):
             self.ui.coresLabel.setEnabled(True)
             self.ui.maxCoresSpinBox.setEnabled(True)
         else:
+            # Restore the pre-XYE Batch choice when leaving XYE (UI-2).
+            if getattr(self, '_pre_xye_batch', None) is not None:
+                self.ui.batchCheckBox.setChecked(self._pre_xye_batch)
+                self._pre_xye_batch = None
             # Both toggles stay clickable in a normal processing mode; they
             # are kept mutually exclusive by auto-unchecking the other one
             # rather than greying it out.  Greying Live out whenever Batch
@@ -1339,8 +1348,8 @@ class imageWrangler(wranglerWidget):
     def stylize_ParameterTree(self):
         self.tree.setStyleSheet("""
         QTreeView::item:has-children {
-            background-color: rgb(230, 230, 230);
-            color: rgb(30, 30, 30);
+            background-color: #44475a;
+            color: #f8f8f2;
         }
         QTreeView::item:has-children:disabled {
             background-color: #3a3d4d;
