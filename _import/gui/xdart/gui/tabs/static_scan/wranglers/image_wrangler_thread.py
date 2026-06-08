@@ -55,9 +55,17 @@ from .wrangler_widget import wranglerThread
 # Batch execution policy (PERF-4b/WS-X1).  "chunked" (default) is the proven
 # read-chunk -> integrate -> Phase-2-write path.  "streaming" routes the batch
 # through one persistent ReductionSession + QtNexusSink (submit-per-frame,
-# single writer thread).  Flip to "streaming" to A/B; the default stays chunked
-# until streaming is proven equal-or-better on the spine + the Cores=8 wall-time.
-_BATCH_EXECUTION = "chunked"
+# single writer thread).  The default stays chunked until streaming is proven
+# equal-or-better on the spine + the Cores=8 wall-time.
+#
+# A/B without editing code: set XDART_BATCH_EXECUTION=streaming in the
+# environment before launching xdart (unset / =chunked for the proven path).
+# Read once at import — relaunch to switch.
+_BATCH_EXECUTION = os.environ.get("XDART_BATCH_EXECUTION", "chunked").strip().lower()
+if _BATCH_EXECUTION not in ("chunked", "streaming"):
+    logger.warning("XDART_BATCH_EXECUTION=%r is not 'chunked' or 'streaming'; "
+                   "using 'chunked'.", _BATCH_EXECUTION)
+    _BATCH_EXECUTION = "chunked"
 
 
 # ---------------------------------------------------------------------------
