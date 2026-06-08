@@ -308,20 +308,25 @@ class staticWidget(QWidget):
         self.frame_ids = []
         self.frames = OrderedDict()
         self.publication_store = PublicationStore()
-        # O4: both 1D and 2D caches are bounded with the same cap.
-        # Pre-O4 ``data_1d`` was an unbounded OrderedDict while
-        # ``data_2d`` was FixSizeOrderedDict(max=20), and the manual
-        # eviction loop keyed off ``len(data_2d) > 32`` could never
-        # fire because data_2d auto-capped at 20.  Net effect: data_1d
-        # grew without bound on long live runs (a frame's int_1d copy
-        # is small but ~10k frames still added up).  Same cap on both
-        # keeps the two snapshots roughly in sync — they're separate
-        # dicts (the snapshots they hold are different sizes, so a
-        # single shared store would lose typing precision), but
-        # FixSizeOrderedDict's farthest-from-new-key eviction policy
-        # converges on roughly the same active window.
-        self.data_1d = FixSizeOrderedDict(max=_FRAME_CACHE_MAX)
-        self.data_2d = FixSizeOrderedDict(max=20)
+        # Live-browse caches.  Both reset per scan (data_reset /
+        # scan_threads new-file clear), so neither accumulates across scans.
+        #
+        # 1D: UNBOUNDED (max=0).  A 1D snapshot (int_1d copy, include_2d=False)
+        # is tiny (~tens of KB), so keeping every frame of the current scan
+        # resident lets the user scroll back to ANY 1D frame DURING a live run
+        # straight from RAM — no disk read, so it never trips the
+        # writer-active freeze guard.  Even ~10k frames is only a few hundred
+        # MB, freed at scan end.
+        #
+        # 2D: bounded at 40.  Unlike 1D, each data_2d entry carries the full
+        # ``map_raw`` detector image (~18 MB) plus the cake, so the cap is a
+        # memory ceiling (~40 x 18 MB ≈ 0.7 GB), not a correctness limit.
+        # 40 covers the recent-frame 2D live-browse window for most scans;
+        # raising it is a straight RAM tradeoff.  Older-than-window 2D frames
+        # are available after the run (or while Paused), not mid-run (the
+        # writer-active freeze guard refuses to read the file being appended).
+        self.data_1d = FixSizeOrderedDict(max=0)
+        self.data_2d = FixSizeOrderedDict(max=40)
 
     def _init_ui(self):
         """Set up the main UI form and detector dialog."""
