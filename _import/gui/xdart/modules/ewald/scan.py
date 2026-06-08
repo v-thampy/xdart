@@ -508,6 +508,15 @@ class LiveScan:
                 entry=entry, finalize=finalize,
                 replace_frame_indices=replace_frame_indices,
             )
+            # Persist-before-evict (data-loss guard): every frame now in the
+            # index is written to disk, so the in-memory cache may evict them.
+            # Until this mark, ``LiveFrameSeries.stash`` refuses to drop them
+            # (their int_1d/int_2d live only on the in-memory LiveFrame). Only
+            # reached on a successful save — a raising writer leaves the frames
+            # unmarked (and therefore un-evictable).
+            mark = getattr(self.frames, "mark_persisted", None)
+            if callable(mark):
+                mark(list(self.frames.index))
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
         """Load scan state from a v2 NeXus file.

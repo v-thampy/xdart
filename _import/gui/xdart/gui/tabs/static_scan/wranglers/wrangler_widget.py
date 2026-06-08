@@ -41,7 +41,14 @@ _LIVE_SAVE_INTERVAL = 8
 # fixed per-save overhead (not per-frame compute) that made long Int-1D scans
 # crawl as the frame count grew.  2D keeps the tight default so peak RAM stays
 # bounded.  (PERF-2)
-_LIVE_SAVE_INTERVAL_1D = 500
+# This is now an UPPER bound on save spacing, not the effective cadence: the
+# persist-before-evict fix (LiveFrameSeries._persisted + mark_persisted, and the
+# _save_due cap bound in imageWranglerThread) guarantees a save fires before the
+# unsaved in-memory set reaches _in_memory_cap, so no frame's int_1d is ever
+# evicted before it's written — the high interval is safe on scans longer than
+# the cap.  Effective cadence is therefore min(this, cap-margin).  See
+# review/CC_data_loss_save_vs_evict_jun2026.md.
+_LIVE_SAVE_INTERVAL_1D = 1000
 
 
 class _CommandCancelToken:

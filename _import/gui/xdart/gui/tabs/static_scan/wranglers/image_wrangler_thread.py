@@ -764,7 +764,7 @@ class imageThread(wranglerThread):
                 self._process_one(scan, img_file, img_number, img_data, img_meta, bg_raw)
                 files_processed += 1
                 self._frames_since_save += 1
-                if self._frames_since_save >= self.LIVE_SAVE_INTERVAL and not self.xye_only:
+                if self._save_due(scan):
                     _get_h5pool().pause(scan.data_file)
                     try:
                         with self.file_lock:
@@ -958,6 +958,29 @@ class imageThread(wranglerThread):
             gi_freeze_mode="scout_union" if self.batch_mode else "first_frame",
         )
 
+    def _save_due(self, scan, *, force=False):
+        """Whether a non-batch v2 save should fire now (persist-before-evict).
+
+        A save is due when forced (final flush), when ``LIVE_SAVE_INTERVAL``
+        frames have accumulated since the last save, OR when the *unsaved*
+        in-memory frame set is about to reach the frame-cache cap
+        (``LiveFrameSeries._in_memory_cap``).  The cap bound is the data-loss
+        fix: the writer reads int_1d/int_2d straight off the in-memory frames,
+        and ``stash`` refuses to evict unsaved ones — so we must save before
+        the unsaved set fills the cache, else it would grow unbounded.  Net:
+        ``LIVE_SAVE_INTERVAL`` is an UPPER bound on save spacing; the cap is a
+        HARD bound, so the high interval is safe even on scans longer than the
+        cap.  Never saves in xye_only mode (no .nxs target).
+        """
+        if self.xye_only or self._frames_since_save <= 0:
+            return False
+        if force or self._frames_since_save >= self.LIVE_SAVE_INTERVAL:
+            return True
+        cap = getattr(scan.frames, "_in_memory_cap", 64)
+        counter = getattr(scan.frames, "unsaved_in_memory_count", None)
+        unsaved = counter() if callable(counter) else self._frames_since_save
+        return unsaved >= max(1, cap - 8)
+
     def _dispatch_batch_serial(self, scan, pending, *, force_save=False):
         """Sequential dispatch (live mode or single-image batches).
 
@@ -979,11 +1002,7 @@ class imageThread(wranglerThread):
 
         self._frames_since_save += count
 
-        should_save = (
-            not self.xye_only
-            and (force_save or self._frames_since_save >= self.LIVE_SAVE_INTERVAL)
-        )
-        if should_save and self._frames_since_save > 0:
+        if self._save_due(scan, force=force_save):
             _t_save0 = time.time()
             _get_h5pool().pause(scan.data_file)
             try:

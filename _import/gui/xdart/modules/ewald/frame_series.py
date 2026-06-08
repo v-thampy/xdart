@@ -433,6 +433,13 @@ class LiveFrameSeries:
         # ``_in_memory_cap``.
         self._in_memory: dict[int, LiveFrame] = {}
         self._in_memory_cap = 64
+        # Indices known to be safely written to disk.  ``stash`` refuses to
+        # evict an in-memory frame that is NOT in this set (persist-before-
+        # evict): the v2 writer reads int_1d/int_2d/thumbnail straight off the
+        # in-memory LiveFrame, so evicting an unsaved frame loses its results
+        # (the disk lazy-load finds nothing).  The writer marks frames here via
+        # ``mark_persisted`` after a successful save.
+        self._persisted: set[int] = set()
         if frames:
             for a in frames:
                 self.__setitem__(a.idx, a, h5file=h5file)
@@ -447,14 +454,49 @@ class LiveFrameSeries:
         instead of re-loading from disk (which would fail for the
         first-ever frame, before any stacked dataset has been written).
 
-        Older entries beyond ``_in_memory_cap`` are evicted in FIFO
-        order to keep memory bounded on long scans.
+        Entries beyond ``_in_memory_cap`` are evicted oldest-first to keep
+        memory bounded on long scans — but ONLY frames already persisted to
+        disk (``_persisted``).  An unsaved frame holds the sole copy of its
+        ``int_1d``/``int_2d`` (the writer reads them straight off this object;
+        ``__getitem__`` lazy-loads evicted frames from disk), so FIFO-dropping
+        an unsaved frame silently loses its results — the data-loss bug this
+        guards.  If nothing in memory is persisted yet, eviction is skipped
+        (the cache exceeds the cap until the next save); the non-batch
+        dispatcher forces a save before the unsaved set can grow unbounded.
         """
         self._in_memory[frame.idx] = frame
+        # A freshly-stashed frame carries new in-memory state that may differ
+        # from any on-disk copy, so it is unsaved until the writer re-marks it.
+        self._persisted.discard(frame.idx)
         if len(self._in_memory) > self._in_memory_cap:
-            # FIFO eviction — drop the oldest key
-            oldest = next(iter(self._in_memory))
-            self._in_memory.pop(oldest, None)
+            excess = len(self._in_memory) - self._in_memory_cap
+            evicted = 0
+            for idx in list(self._in_memory.keys()):
+                if evicted >= excess:
+                    break
+                if idx in self._persisted:
+                    self._in_memory.pop(idx, None)
+                    evicted += 1
+
+    def mark_persisted(self, idxs) -> None:
+        """Record that ``idxs`` are safely written to disk (evictable).
+
+        Called by the v2 writer (:meth:`LiveScan._save_to_nexus`) after a
+        successful save.  Until a frame is marked here, :meth:`stash` will not
+        evict it, so its integration results cannot be silently lost to FIFO
+        eviction when ``LIVE_SAVE_INTERVAL`` exceeds ``_in_memory_cap`` on a
+        scan longer than the cap.
+        """
+        self._persisted.update(int(i) for i in idxs)
+
+    def unsaved_in_memory_count(self) -> int:
+        """How many in-memory frames are not yet persisted to disk.
+
+        The non-batch dispatcher uses this to force a save before the unsaved
+        set reaches ``_in_memory_cap`` (so eviction always has persisted frames
+        to drop and the cache stays bounded).
+        """
+        return sum(1 for idx in self._in_memory if idx not in self._persisted)
 
     def __getitem__(self, idx):
         """Return LiveFrame for ``idx``: in-memory hit, else lazy-load."""
@@ -470,8 +512,24 @@ class LiveFrameSeries:
         )
         with self.file_lock:
             with catch(self.data_file, 'r') as f:
-                return _load_frame_v2(f, idx, static=self.static, gi=self.gi,
-                                     source_root=source_root)
+                frame = _load_frame_v2(f, idx, static=self.static, gi=self.gi,
+                                       source_root=source_root)
+        # Data-loss guard: an indexed frame that lazy-loads with NO integrated
+        # data of any kind (1D, 2D, or GI) was almost certainly evicted before
+        # being saved (the persist-before-evict bug) or comes from a truncated
+        # .nxs.  With the fix this can't happen, so flag it loudly rather than
+        # let it pass as a silently-empty frame.  Logged (not raised) so a
+        # legitimately partial/old file still opens.
+        if frame is not None and frame.int_1d is None and frame.int_2d is None \
+                and not getattr(frame, "gi_1d", None) and not getattr(frame, "gi_2d", None):
+            logger.error(
+                "frame %s is indexed but has no integrated data on disk; it may "
+                "have been evicted before it was saved (persist-before-evict "
+                "guard) or the .nxs is truncated.", idx,
+            )
+        # A frame just read back from disk is by definition persisted.
+        self._persisted.add(idx)
+        return frame
 
     def iloc(self, idx):
         """Location-based retrieval of frames (returns by position in index)."""
@@ -502,6 +560,7 @@ class LiveFrameSeries:
         # would force the v2 writer to re-load every frame from disk.
         frames._in_memory = dict(self._in_memory)
         frames._in_memory_cap = self._in_memory_cap
+        frames._persisted = set(self._persisted)
         if isinstance(frame, Series):
             _frame = frame.iloc[0]
         else:
@@ -521,6 +580,7 @@ class LiveFrameSeries:
         frames.index._structure_version = getattr(self.index, "_structure_version", 0) + 1
         frames._in_memory = dict(self._in_memory)
         frames._in_memory_cap = self._in_memory_cap
+        frames._persisted = set(self._persisted)
         return frames
 
     def __next__(self):
