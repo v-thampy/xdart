@@ -1604,17 +1604,53 @@ def test_scan_data_survives_save_then_load_from_h5(tmp_path):
     assert "i0" in sd.columns
 
 
-def test_numeric_scan_info_drops_non_numeric_keeps_motors():
-    """Regression: a non-numeric metadata field (comment/name/date) must not
-    blank scan_data.  _numeric_scan_info keeps numeric motors (incl. the GI
-    'th' incidence motor) and drops only the non-coercible fields, instead of
-    pd.Series(dtype='float64') failing wholesale."""
-    from xdart.modules.ewald.scan import _numeric_scan_info
+def test_coerce_scan_info_keeps_non_numeric_columns():
+    """N2: heterogeneous per-frame metadata survives ingestion.
+
+    ``_coerce_scan_info`` keeps every field -- numbers (and numeric strings,
+    since SPEC stores numbers as text) coerced to float, genuinely non-numeric
+    values kept as strings -- instead of dropping the whole column, so the
+    writer can persist it (numeric -> float32, non-numeric -> vlen string)."""
+    from xdart.modules.ewald.scan import _coerce_scan_info
     info = {"th": 0.2, "i0": 1.0e6, "tth": 12.5,
-            "UserComment": "hello", "date": "2026-03-27", "scan": "Combi4"}
-    out = _numeric_scan_info(info)
-    assert out == {"th": 0.2, "i0": 1.0e6, "tth": 12.5}
-    # numeric strings still coerce (SPEC metas often store numbers as text)
-    assert _numeric_scan_info({"th": "0.30"}) == {"th": 0.30}
-    # all-numeric input is unchanged (the historical working case)
-    assert _numeric_scan_info({"th": 0.1, "i0": 5.0}) == {"th": 0.1, "i0": 5.0}
+            "keith_I": "0V", "sample": "Combi4", "date": "2026-03-27"}
+    assert _coerce_scan_info(info) == {
+        "th": 0.2, "i0": 1.0e6, "tth": 12.5,
+        "keith_I": "0V", "sample": "Combi4", "date": "2026-03-27",
+    }
+    # numeric strings still coerce to float (motors / monitors stay numeric)
+    assert _coerce_scan_info({"th": "0.30"}) == {"th": 0.30}
+    # the assembled scan_data keeps the string column heterogeneous (no float64)
+    sd = pd.DataFrame([_coerce_scan_info({"th": 0.2, "keith_I": "0V"})], index=[0])
+    sd.loc[1] = pd.Series(_coerce_scan_info({"th": 0.3, "keith_I": "1V"}))
+    assert list(sd["keith_I"]) == ["0V", "1V"]
+    assert sd["th"].tolist() == [0.2, 0.3]
+
+
+def test_heterogeneous_scan_data_roundtrips_to_nexus(tmp_path):
+    """N2 gate: a mixed numeric+string scan_data table round-trips -- the
+    string column persists as a vlen UTF-8 column (``ssrl_dtype='string'``)
+    and numeric columns are unchanged."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from ssrl_xrd_tools.io.read import get_metadata
+
+    sd = pd.DataFrame(
+        {"i0": [100.0, 101.0, 102.0], "keith_I": ["0V", "1V", "2V"]},
+        index=[0, 1, 2],
+    )
+    scan = _DuckSphere([_DuckArch(idx=i) for i in range(3)], scan_data=sd)
+    path = tmp_path / "hetero_scan_data.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=True)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_allclose(f["entry/scan_data/i0"][()], [100.0, 101.0, 102.0])
+        ki = f["entry/scan_data/keith_I"]
+        assert ki.attrs["ssrl_dtype"] == "string"
+        assert list(ki.asstr()[()]) == ["0V", "1V", "2V"]
+
+    meta = get_metadata(path)
+    assert list(np.asarray(meta["scan_data"]["keith_I"]).astype(str)) == ["0V", "1V", "2V"]
+    np.testing.assert_allclose(
+        np.asarray(meta["scan_data"]["i0"], dtype=float), [100.0, 101.0, 102.0],
+    )

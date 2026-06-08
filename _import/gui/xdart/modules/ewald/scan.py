@@ -14,20 +14,24 @@ from xdart import utils
 from xdart.modules.live_compat import normalize_live_class_names
 
 
-def _numeric_scan_info(scan_info):
-    """Return ``scan_info`` keeping only numeric-coercible values (as floats).
+def _coerce_scan_info(scan_info):
+    """Return ``scan_info`` with numeric-looking values coerced to float and
+    genuinely non-numeric values (tags, status, comments, timestamps) kept as
+    strings.  Every key is preserved.
 
-    Metadata dicts can carry non-numeric fields (comments, sample names,
-    timestamps); they are dropped here so a single one doesn't break the
-    float64 ``scan_data`` table.  Numeric motors — including the GI ``th``
-    incidence motor and monitor counts — are preserved.
+    The numeric-vs-string decision for each *column* belongs at the NeXus
+    writer (numeric -> float32, non-numeric -> vlen UTF-8 string), not here:
+    dropping a whole column because one value won't parse silently loses
+    provenance (N2 -- e.g. a SPEC counter reported as ``"0V"``).  Numeric
+    strings (SPEC often stores numbers as text) still coerce, so motors --
+    including the GI ``th`` incidence motor and monitor counts -- stay numeric.
     """
     out = {}
     for key, value in scan_info.items():
         try:
             out[key] = float(value)
         except (TypeError, ValueError):
-            continue
+            out[key] = value if isinstance(value, str) else str(value)
     return out
 
 
@@ -382,16 +386,15 @@ class LiveScan:
             self.frames.stash(frame)
 
             if frame.scan_info and get_sd:
-                # Keep only numeric-coercible fields.  A single non-numeric
-                # value (e.g. a comment / sample-name / date that a metadata
-                # reader includes) must NOT nuke the whole scan_data table:
-                # ``pd.Series(scan_info, dtype='float64')`` raises wholesale on
-                # any non-float, which silently emptied scan_data for every
-                # frame — blanking the metadata panel and (since the GI
-                # incidence ``th`` lives here) collapsing the GI-2D geometry.
-                numeric_info = _numeric_scan_info(frame.scan_info)
-                if numeric_info:
-                    ser = pd.Series(numeric_info, dtype='float64')
+                # Keep every metadata field heterogeneous (numeric coerced to
+                # float, non-numeric kept as strings) so non-numeric provenance
+                # (sample tag, status, "0V" counter) survives to the writer,
+                # which persists numeric columns as float32 and non-numeric as
+                # vlen UTF-8 strings (N2).  No forced float64 dtype: pandas
+                # infers per column.
+                coerced_info = _coerce_scan_info(frame.scan_info)
+                if coerced_info:
+                    ser = pd.Series(coerced_info)
                     if list(self.scan_data.columns):
                         try:
                             self.scan_data.loc[frame.idx] = ser
@@ -403,16 +406,16 @@ class LiveScan:
                             sidx = self.scan_data.index
                             if len(sidx) >= 2 and sidx[-1] < sidx[-2]:
                                 self.scan_data.sort_index(inplace=True)
-                        except ValueError:
+                        except (ValueError, TypeError):
                             logger.debug(
                                 'scan_data column mismatch for frame %s '
                                 '(have %s, got %s)',
                                 frame.idx, list(self.scan_data.columns),
-                                list(numeric_info),
+                                list(coerced_info),
                             )
                     else:
                         self.scan_data = pd.DataFrame(
-                            numeric_info, index=[frame.idx], dtype='float64'
+                            [coerced_info], index=[frame.idx]
                         )
 
             if update:

@@ -313,7 +313,13 @@ class DisplayDataMixin:
             else:
                 norm_fac = len(self.scan.frames.index)
                 if self.normChannel:
-                    norm = self.scan.scan_data[self.normChannel].sum()
+                    # scan_data may now carry non-numeric columns (N2); a
+                    # non-numeric norm channel degrades to no normalization
+                    # rather than crashing on a string ``.sum()``.
+                    try:
+                        norm = float(self.scan.scan_data[self.normChannel].sum())
+                    except (TypeError, ValueError):
+                        norm = 0.0
                     if norm > 0:
                         norm_fac = norm
                 intensity /= norm_fac

@@ -692,17 +692,15 @@ class staticWidget(QWidget):
             info = getattr(frame, "scan_info", None)
             if info:
                 import pandas as pd
-                from xdart.modules.ewald.scan import _numeric_scan_info
-                # Keep only numeric-coercible fields — a single non-numeric
-                # value (sample name, "24.4C" temperature, timestamp) would
-                # otherwise make pd.Series(..., dtype="float64") raise and
-                # silently skip the whole row, leaving scan_data empty and
-                # the metadata panel blank in non-batch.  Mirrors
-                # LiveScan.add_frame's _numeric_scan_info filter.
-                numeric_info = _numeric_scan_info(info)
-                if numeric_info:
+                from xdart.modules.ewald.scan import _coerce_scan_info
+                # Keep metadata heterogeneous (numeric coerced, non-numeric kept
+                # as strings) so non-numeric provenance survives to the writer.
+                # No forced float64 dtype -- pandas infers per column.  Mirrors
+                # LiveScan.add_frame (N2).
+                coerced_info = _coerce_scan_info(info)
+                if coerced_info:
                     try:
-                        ser = pd.Series(numeric_info, dtype="float64")
+                        ser = pd.Series(coerced_info)
                         with self.scan.scan_lock:
                             sd = self.scan.scan_data
                             if list(sd.columns):
@@ -717,7 +715,7 @@ class staticWidget(QWidget):
                                     sd.sort_index(inplace=True)
                             else:
                                 self.scan.scan_data = pd.DataFrame(
-                                    numeric_info, index=[idx], dtype="float64")
+                                    [coerced_info], index=[idx])
                     except (ValueError, TypeError):
                         logger.debug("scan_data update skipped for idx=%s", idx,
                                      exc_info=True)

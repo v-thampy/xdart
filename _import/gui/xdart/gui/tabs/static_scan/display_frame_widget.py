@@ -1504,8 +1504,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def normUpdate(self):
         """Update plots if norm channel exists"""
         self.normChannel = self.get_normChannel()
-        if self.normChannel and (self.scan.scan_data[self.normChannel].sum() == 0.):
-            self.normChannel = None
+        if self.normChannel:
+            # scan_data may now carry non-numeric columns (N2): treat a
+            # non-numeric / zero norm channel as "no normalization".
+            try:
+                norm_sum = float(self.scan.scan_data[self.normChannel].sum())
+            except (TypeError, ValueError):
+                norm_sum = 0.0
+            if norm_sum == 0.:
+                self.normChannel = None
         # Clear stale plot_data so update_plot() rebuilds all overlay curves
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.frame_names = []
