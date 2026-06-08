@@ -1373,20 +1373,17 @@ class imageThread(wranglerThread):
             _t_h5_wait = 0.0
             _t_h5_write = _t_h5_total
 
-            # PERF-3: the stashed LiveFrame pins its ~18 MB map_raw for the
-            # whole live scan (scan.frames is never pruned), so a long run at
-            # save interval 1000 would hold ~18 GB.  Compute the thumbnail
-            # eagerly NOW — the v2 writer otherwise makes it lazily from
-            # map_raw at the interval flush (nexus_writer
-            # _write_per_frame_metadata), which after a free would have to
-            # re-read the raw from source.  make_thumbnail is idempotent +
-            # caches on frame.thumbnail, so this just relocates work already
-            # done at flush.  free_raw then drops the raw, but only when it's
-            # losslessly reloadable from source; the display copy (data_2d
-            # above) keeps its own array ref, and XYE flush + reintegration
-            # use int_1d / lazy reload, so nothing downstream blanks.
-            frame.make_thumbnail(global_mask=getattr(scan, 'global_mask', None))
-            frame.free_raw()
+            # NOTE: no PERF-3 raw-free here.  This is the live/non-batch path,
+            # where the display copy above (data_2d[idx]['map_raw']) keeps its
+            # own ref to the raw for the whole scan — so freeing frame.map_raw
+            # would NOT release memory (data_2d still pins it), it would only
+            # cost an eager per-frame make_thumbnail (~7-15 ms each on the hot
+            # loop) to keep the interval-flush thumbnail writer from reloading.
+            # Net: pure regression on the lean 1D stream for zero RAM win.  The
+            # raw-free lives only in the batch path (_dispatch_batch_parallel),
+            # where data_2d is not populated so the free actually frees and the
+            # thumbnail is already precomputed across workers.  Live-mode RAM is
+            # bounded by the display-cache lifecycle, not by PERF-3.
 
         # ── XYE buffer (flushed at end of batch by the dispatcher) ──────
         _t5 = time.time()
