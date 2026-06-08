@@ -1654,3 +1654,28 @@ def test_heterogeneous_scan_data_roundtrips_to_nexus(tmp_path):
     np.testing.assert_allclose(
         np.asarray(meta["scan_data"]["i0"], dtype=float), [100.0, 101.0, 102.0],
     )
+
+
+def test_gi_config_roundtrips_to_reduction_config(tmp_path):
+    """N3: the GI output mode persists as a first-class
+    /entry/reduction/config/gi_config field, recoverable on read without
+    sniffing the q-unit string."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    scan = _DuckSphere(
+        [_DuckArch(idx=i) for i in range(2)],
+        scan_data=pd.DataFrame({"i0": [1.0, 2.0]}, index=[0, 1]),
+        gi=True,
+    )
+    scan.gi_config = {"gi_mode_1d": "q_oop", "gi_mode_2d": "qip_qoop",
+                      "incidence_motor": "th", "tilt_angle": 0.0,
+                      "sample_orientation": 1}
+    path = tmp_path / "gi_config.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=True)
+
+    # read_scan's metadata recovers it as a parsed, first-class field.
+    from ssrl_xrd_tools.io.read import get_metadata
+    gi = get_metadata(path)["reduction"]["config"]["gi_config"]
+    assert gi["gi_mode_1d"] == "q_oop"
+    assert gi["gi_mode_2d"] == "qip_qoop"

@@ -759,6 +759,22 @@ class imageWrangler(wranglerWidget):
         self.thread.gi_mode_1d = self.gi_mode_1d
         self.thread.gi_mode_2d = self.gi_mode_2d
 
+        # N3: record the GI output mode + geometry as a first-class
+        # ``scan.gi_config`` (persisted by the writer to
+        # /entry/reduction/config/gi_config), so read_scan can recover the GI
+        # mode + axis meaning without sniffing the q-unit string or digging the
+        # mode key out of bai_*_args.
+        if self.gi:
+            self.scan.gi_config = {
+                'gi_mode_1d': str(self.gi_mode_1d),
+                'gi_mode_2d': str(self.gi_mode_2d),
+                'incidence_motor': str(getattr(self, 'incidence_motor', '') or ''),
+                'tilt_angle': float(getattr(self, 'tilt_angle', 0.0) or 0.0),
+                'sample_orientation': int(getattr(self, 'sample_orientation', 1) or 1),
+            }
+        else:
+            self.scan.gi_config = {}
+
         # Notify integrator panel so labels/widgets update immediately.
         self.sigUpdateGI.emit(self.gi)
 
