@@ -1022,17 +1022,26 @@ class ReductionSession:
             self._cancelled = True
             self._semaphore.release()
             return
-        future = self._worker.submit(
-            _reduce_frame,
-            frame,
-            image,
-            self.plan,
-            self._integrators,
-            self._plan_masks,
-            self.cancel_token,
-        )
+        future = self._worker.submit(self._stream_reduce, frame, image)
         self._submitted += 1
         self._write_queue.put((frame, future))
+
+    def _stream_reduce(self, frame: Frame, image: np.ndarray | None):
+        """Worker-thread task: integrate, then run the sink's per-frame
+        ``worker_process`` hook (if any) so expensive per-frame prep — e.g.
+        xdart's thumbnail + raw-free — happens in PARALLEL across the pool
+        rather than serially on the single writer thread.  The writer then only
+        does the index-addressed HDF5 write.  Cancellation/errors propagate
+        through the future to the writer loop unchanged.
+        """
+        reduction = _reduce_frame(
+            frame, image, self.plan, self._integrators, self._plan_masks,
+            self.cancel_token,
+        )
+        worker_process = getattr(self._sink, "worker_process", None)
+        if callable(worker_process):
+            worker_process(frame, reduction)
+        return reduction
 
     def _writer_loop(self) -> None:
         """The single consumer thread: drain completed frames → sink by index.
