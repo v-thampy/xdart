@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import h5py
@@ -20,6 +21,7 @@ from ssrl_xrd_tools.reduction import (
     NexusSink,
     ReductionPlan,
     Scan,
+    ReductionSession,
     run_reduction,
 )
 import ssrl_xrd_tools.reduction.core as reduction_core
@@ -199,6 +201,23 @@ def test_run_reduction_executor_matches_serial(monkeypatch: pytest.MonkeyPatch) 
     plan = ReductionPlan(integration_2d=None)
 
     serial = run_reduction(plan, Scan("serial", frames_serial, integrator=object()))
+
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+    worker_thread_ids: set[int] = set()
+    call_count = 0
+
+    def fake_parallel_1d(image, ai, **kwargs):
+        nonlocal call_count
+        with lock:
+            worker_thread_ids.add(threading.get_ident())
+            call_number = call_count
+            call_count += 1
+        if call_number < 2:
+            barrier.wait(timeout=5)
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", fake_parallel_1d)
     parallel = run_reduction(
         plan,
         Scan("parallel", frames_parallel, integrator=object()),
@@ -212,6 +231,7 @@ def test_run_reduction_executor_matches_serial(monkeypatch: pytest.MonkeyPatch) 
             parallel.frames[idx].result_1d.intensity,
             serial.frames[idx].result_1d.intensity,
         )
+    assert len(worker_thread_ids) >= 2
 
 
 def test_integration_plan_validation() -> None:
@@ -424,6 +444,112 @@ def test_run_reduction_cancellation_and_clear_images(
     assert seen == [0]
     assert scan.frames[0].image is None
     assert scan.frames[1].image is not None
+
+
+def test_reduction_session_reuses_thread_integrators_across_process_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build_thread_ids: list[int] = []
+    integrate_lock = threading.Lock()
+    integrate_barrier = threading.Barrier(2)
+    integrate_calls = 0
+
+    def fake_poni_to_integrator(poni):
+        build_thread_ids.append(threading.get_ident())
+        return object()
+
+    def fake_1d(image, ai, **kwargs):
+        nonlocal integrate_calls
+        with integrate_lock:
+            call_number = integrate_calls
+            integrate_calls += 1
+        if call_number < 2:
+            integrate_barrier.wait(timeout=5)
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "poni_to_integrator", fake_poni_to_integrator)
+    monkeypatch.setattr(reduction_core, "integrate_1d", fake_1d)
+    plan = ReductionPlan(integration_2d=None)
+    poni = object()
+    frames = [Frame(i, image=np.full((2, 2), i, dtype=float)) for i in range(4)]
+    # Match the GUI/live path: the session opens on the first chunk, then later
+    # chunks arrive as explicit Frame objects without rebuilding resources.
+    scan = Scan(
+        "scan",
+        [Frame(0, image=np.zeros((2, 2))), Frame(1, image=np.ones((2, 2)))],
+        poni=poni,
+    )
+
+    with ReductionSession(plan, scan, executor=2, chunk_size=2) as session:
+        session.process(frames[:2])
+        session.process(frames[2:])
+        result = session.finish()
+
+    assert result.n_processed == 4
+    assert session.scan.frame_indices == [0, 1, 2, 3]
+    assert session.integrator_provider_builds == 1
+    assert len(build_thread_ids) == 2
+    assert len(set(build_thread_ids)) == 2
+
+
+def test_reduction_session_replace_refed_index_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-feeding an already-processed index is a replace, not a new frame.
+
+    Reintegrate / replace re-feeds must not double-count progress
+    (``n_processed`` stays at the number of distinct indices) and must not
+    double-``write`` the sink -- the re-feed routes to the sink's ``replace``
+    hook when it has one.
+    """
+
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(float(np.sum(image))),
+    )
+
+    class RecordingSink:
+        def __init__(self) -> None:
+            self.writes: list[int] = []
+            self.replaces: list[int] = []
+            self.frames: dict[int, object] = {}
+
+        def begin(self, scan, plan) -> None:
+            self.writes.clear()
+            self.replaces.clear()
+            self.frames.clear()
+
+        def write(self, frame, reduction) -> None:
+            self.writes.append(int(frame.index))
+            self.frames[int(frame.index)] = reduction
+
+        def replace(self, frame, reduction) -> None:
+            self.replaces.append(int(frame.index))
+            self.frames[int(frame.index)] = reduction
+
+        def finish(self, result) -> None:
+            return None
+
+    plan = ReductionPlan(integration_2d=None)
+    sink = RecordingSink()
+    scan = Scan("scan", [Frame(0, image=np.zeros((2, 2)))], integrator=object())
+
+    with ReductionSession(plan, scan, sink=sink) as session:
+        session.process([Frame(0, image=np.zeros((2, 2)))])
+        session.process([Frame(1, image=np.ones((2, 2)))])
+        # Re-feed index 0 (reintegrate / replace) with a different image.
+        session.process([Frame(0, image=np.full((2, 2), 5.0))])
+        result = session.finish()
+
+    # Progress counts distinct indices {0, 1}, not the three feeds.
+    assert result.n_processed == 2
+    assert session.scan.frame_indices == [0, 1]
+    # One logical first-write per index; the re-feed went to replace.
+    assert sorted(sink.writes) == [0, 1]
+    assert sink.replaces == [0]
+    # The replaced product reflects the latest re-fed image (sum 4*5 = 20).
+    np.testing.assert_allclose(session.frames[0].result_1d.intensity[0], 20.0)
 
 
 def test_memory_sink_can_be_supplied(monkeypatch: pytest.MonkeyPatch) -> None:

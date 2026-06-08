@@ -49,6 +49,16 @@ if TYPE_CHECKING:  # C4 — tighter Scan.integrator type without forcing the imp
 ProgressCallback = Callable[["ReductionProgress"], None]
 
 
+class GIFreezeError(ValueError):
+    """Raised when the GI output-range freeze pre-pass cannot produce a grid.
+
+    Subclasses :class:`ValueError` so existing broad ``except ValueError``
+    callers still catch it, while letting GUIs translate this *specific* GI
+    failure (a blank or degenerate scout frame) into actionable guidance
+    without matching on the message text.
+    """
+
+
 def poni_to_integrator(*args: Any, **kwargs: Any) -> Any:
     from ssrl_xrd_tools.integrate.calibration import poni_to_integrator as _impl
 
@@ -591,6 +601,10 @@ class CompositeSink:
         for sink in self.sinks:
             sink.write(frame, reduction)
 
+    def replace(self, frame: Frame, reduction: FrameReduction) -> None:
+        for sink in self.sinks:
+            _emit_sink_replace(sink, frame, reduction)
+
     def finish(self, result: ReductionResult) -> None:
         errors: list[BaseException] = []
         for sink in self.sinks:
@@ -614,6 +628,25 @@ class CompositeSink:
                 errors.append(exc)
         if errors:
             raise errors[0]
+
+
+def _emit_sink_replace(
+    sink: ReductionSink, frame: Frame, reduction: FrameReduction
+) -> None:
+    """Re-emit an already-written frame as a *replace*.
+
+    Used when a session is fed an index it has already processed (reintegrate /
+    replace re-feed).  Sinks that distinguish replace from first-write expose a
+    ``replace`` hook; the rest fall back to ``write`` because their ``write`` is
+    already idempotent per frame index (MemorySink/XYESink overwrite by index,
+    NexusSink upserts the frame slot).
+    """
+
+    replace = getattr(sink, "replace", None)
+    if callable(replace):
+        replace(frame, reduction)
+    else:
+        sink.write(frame, reduction)
 
 
 @dataclass(slots=True)
@@ -765,6 +798,342 @@ class NexusSink:
                 pass
 
 
+@dataclass(slots=True)
+class ReductionSession:
+    """Incremental headless reduction engine for one scan/run.
+
+    ``ReductionSession`` is the stateful counterpart to
+    :func:`run_reduction`.  It owns the executor, per-thread pyFAI
+    integrators, sink lifecycle, progress, and cancellation for the scan
+    lifetime, so callers can feed chunks without rebuilding CSR-LUTs or
+    reopening sinks every chunk.
+    """
+
+    plan: ReductionPlan
+    source: Scan | FrameSource
+    sink: ReductionSink | Iterable[ReductionSink] | None = None
+    chunk_size: int = 1
+    clear_frame_images: bool = False
+    progress_cb: ProgressCallback | None = None
+    cancel_token: CancelToken | None = None
+    executor: Any | None = None
+    gi_freeze_mode: str | None = None
+    scan: Scan = field(init=False)
+    result: ReductionResult | None = field(default=None, init=False)
+    integrator_provider_builds: int = field(default=0, init=False)
+    _sink: ReductionSink = field(init=False, repr=False)
+    _worker: Any | None = field(default=None, init=False, repr=False)
+    _owns_worker: bool = field(default=False, init=False, repr=False)
+    _integrators: _ReductionIntegratorProvider = field(init=False, repr=False)
+    _plan_masks: dict[tuple[int, int], np.ndarray | None] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _products: dict[int, FrameReduction] = field(default_factory=dict, init=False, repr=False)
+    _completed: int = field(default=0, init=False, repr=False)
+    _cancelled: bool = field(default=False, init=False, repr=False)
+    _failure: BaseException | None = field(default=None, init=False, repr=False)
+    _started: bool = field(default=False, init=False, repr=False)
+    _finished: bool = field(default=False, init=False, repr=False)
+    _output_path: Path | None = field(default=None, init=False, repr=False)
+    _freeze_policy: str | None = field(default=None, init=False, repr=False)
+    _initial_incident_angle: float | None = field(default=None, init=False, repr=False)
+    _gi_freeze_applied: bool = field(default=False, init=False, repr=False)
+    _scan_frame_positions: dict[int, int] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0; got {self.chunk_size}")
+        self.scan = _coerce_to_scan(self.source)
+        self._sink = _coerce_sink(self.sink)
+        self.cancel_token = self.cancel_token or CancelToken()
+        self._freeze_policy = _normalize_gi_freeze_mode(self.gi_freeze_mode)
+        self._output_path = _sink_path(self._sink) or (
+            self.scan.output_path if isinstance(self.scan.output_path, Path) else None
+        )
+        self._scan_frame_positions = {
+            int(frame.index): pos for pos, frame in enumerate(self.scan.frames)
+        }
+
+        ai = None
+        fi = None
+        if self.plan.gi is not None:
+            if self.scan.poni is None:
+                raise ValueError("GI reduction requires scan.poni.")
+            self._initial_incident_angle = _resolve_gi_incident_angle(
+                self.scan.frames[0] if self.scan.frames else None,
+                self.plan.gi,
+            )
+            if self._freeze_policy in {"first_frame", "scout_union"}:
+                self._apply_gi_freeze(self._freeze_policy)
+        else:
+            ai = self.scan.integrator
+            if ai is None and self.scan.poni is None:
+                raise ValueError("Reduction requires scan.integrator or scan.poni.")
+
+        self._integrators = _ReductionIntegratorProvider(
+            scan=self.scan,
+            plan=self.plan,
+            ai=ai,
+            fi=fi,
+            initial_incident_angle=self._initial_incident_angle,
+        )
+        self.integrator_provider_builds = 1
+        self._worker, self._owns_worker = _coerce_executor(self.executor)
+        self._sink.begin(self.scan, self.plan)
+        self._started = True
+        _emit(self.progress_cb, self.scan.name, "start", None, 0, len(self.scan))
+
+    def __enter__(self) -> ReductionSession:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc is not None:
+            self._failure = exc
+        self.finish()
+
+    @property
+    def frames(self) -> dict[int, FrameReduction]:
+        """Completed frame reductions accumulated so far."""
+
+        return self._products
+
+    def process(
+        self,
+        frames_or_chunk: Iterable[Frame] | tuple[Any, Iterable[int]] | None = None,
+        images: Iterable[np.ndarray | None] | None = None,
+    ) -> None:
+        """Reduce the next frames/chunk.
+
+        With no argument, the session streams its original source using
+        ``chunk_size``.  Supplying frames (and optional image arrays) lets a GUI
+        feed newly-acquired chunks while preserving this session's executor,
+        integrators, sinks, and progress accounting.
+        """
+
+        if self._finished:
+            raise RuntimeError("ReductionSession.process called after finish().")
+        if self._cancelled or self.cancel_token.cancelled:
+            self._cancelled = True
+            return
+
+        try:
+            if frames_or_chunk is None:
+                for chunk, chunk_images in _iter_reduction_chunks(
+                    self.source, self.scan, self.chunk_size,
+                ):
+                    self._process_chunk(chunk, chunk_images)
+                    if self._cancelled:
+                        break
+                return
+
+            chunk, chunk_images = self._normalize_process_input(frames_or_chunk, images)
+            self._register_process_frames(chunk)
+            self._process_chunk(chunk, chunk_images)
+        except BaseException as exc:
+            self._failure = exc
+            raise
+
+    def finish(self) -> ReductionResult:
+        if self._finished and self.result is not None:
+            return self.result
+
+        self.result = ReductionResult(
+            scan_name=self.scan.name,
+            frames=self._products,
+            n_processed=self._completed,
+            cancelled=self._cancelled or self.cancel_token.cancelled,
+            output_path=self._output_path,
+            failed=self._failure is not None,
+            error=None if self._failure is None else str(self._failure),
+        )
+        try:
+            if self._started:
+                if self._failure is None:
+                    self._sink.finish(self.result)
+                else:
+                    abort = getattr(self._sink, "abort", None)
+                    if callable(abort):
+                        abort(self.result)
+                    else:
+                        self._sink.finish(self.result)
+        finally:
+            if self._owns_worker and self._worker is not None:
+                self._worker.shutdown(wait=True, cancel_futures=True)
+            self._worker = None
+            self._finished = True
+
+        _emit(
+            self.progress_cb,
+            self.scan.name,
+            "finish",
+            None,
+            self._completed,
+            len(self.scan),
+        )
+        return self.result
+
+    def _apply_gi_freeze(self, freeze_policy: str) -> None:
+        if self._gi_freeze_applied or self.plan.gi is None:
+            return
+        self.plan = _apply_gi_freeze_policy(
+            self.plan,
+            self.scan,
+            freeze_policy=freeze_policy,
+            fi=None,
+            initial_incident_angle=self._initial_incident_angle,
+        )
+        self._gi_freeze_applied = True
+
+    def _normalize_process_input(
+        self,
+        frames_or_chunk: Iterable[Frame] | tuple[Any, Iterable[int]],
+        images: Iterable[np.ndarray | None] | None,
+    ) -> tuple[list[Frame], list[np.ndarray | None]]:
+        if isinstance(frames_or_chunk, tuple) and len(frames_or_chunk) == 2:
+            chunk_images, labels = frames_or_chunk
+            frame_by_index = {int(frame.index): frame for frame in self.scan.frames}
+            chunk = [frame_by_index[int(label)] for label in labels]
+            return chunk, _chunk_images_as_list(chunk_images, [int(label) for label in labels])
+
+        chunk = list(frames_or_chunk)
+        if images is None:
+            return chunk, [None] * len(chunk)
+        chunk_images = [None if image is None else np.asarray(image) for image in images]
+        if len(chunk_images) != len(chunk):
+            raise ValueError(
+                f"got {len(chunk_images)} images for {len(chunk)} reduction frames"
+            )
+        return chunk, chunk_images
+
+    def _register_process_frames(self, chunk: list[Frame]) -> None:
+        """Keep the session scan inventory in sync with explicitly-fed chunks.
+
+        GUI/live callers commonly open the session from the first available
+        chunk, then feed later chunks as fresh ``Frame`` objects.  The reducer can
+        compute those frames without registering them, but sinks, scan metadata,
+        progress totals, and future replay/debug hooks need the session's scan to
+        describe the whole run.  This is O(new frames) for ordered acquisition and
+        only sorts when callers feed out-of-order labels.
+        """
+
+        if not chunk:
+            return
+
+        frames = self.scan.frames
+        positions = self._scan_frame_positions
+        last_index = int(frames[-1].index) if frames else None
+        needs_sort = False
+
+        for frame in chunk:
+            idx = int(frame.index)
+            pos = positions.get(idx)
+            if pos is None:
+                positions[idx] = len(frames)
+                frames.append(frame)
+                self.scan._frame_by_index[idx] = frame
+                if last_index is not None and idx < last_index:
+                    needs_sort = True
+                last_index = idx
+                continue
+
+            # Replace the frame object for this label with the caller's latest
+            # explicit frame.  xdart builds a fresh headless Frame for the chunk
+            # it feeds, so identity equality is not expected even for the first
+            # chunk used to open the session.
+            frames[pos] = frame
+            self.scan._frame_by_index[idx] = frame
+
+        if needs_sort:
+            frames.sort(key=lambda item: int(item.index))
+            positions.clear()
+            positions.update({int(frame.index): pos for pos, frame in enumerate(frames)})
+
+    def _process_chunk(
+        self,
+        chunk: list[Frame],
+        chunk_images: list[np.ndarray | None],
+    ) -> None:
+        if not chunk:
+            return
+        _emit(
+            self.progress_cb,
+            self.scan.name,
+            "chunk",
+            chunk[0].index,
+            self._completed,
+            len(self.scan),
+        )
+        pending: list[tuple[Frame, Any]] = []
+        for frame, raw_image in zip(chunk, chunk_images):
+            if self.cancel_token.cancelled:
+                self._cancelled = True
+                break
+            _emit(self.progress_cb, self.scan.name, "load", frame.index, self._completed, len(self.scan))
+            _emit(self.progress_cb, self.scan.name, "integrate", frame.index, self._completed, len(self.scan))
+            if self._worker is None:
+                try:
+                    reduction = _reduce_frame(
+                        frame,
+                        raw_image,
+                        self.plan,
+                        self._integrators,
+                        self._plan_masks,
+                        cancel_token=self.cancel_token,
+                    )
+                except _ReductionCancelled:
+                    self._cancelled = True
+                    break
+                pending.append((frame, reduction))
+            else:
+                pending.append((
+                    frame,
+                    self._worker.submit(
+                        _reduce_frame,
+                        frame,
+                        raw_image,
+                        self.plan,
+                        self._integrators,
+                        {},
+                        self.cancel_token,
+                    ),
+                ))
+
+        for pos, (frame, reduction_or_future) in enumerate(pending):
+            try:
+                reduction = (
+                    reduction_or_future
+                    if self._worker is None
+                    else reduction_or_future.result()
+                )
+            except _ReductionCancelled:
+                self._cancelled = True
+                _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
+                break
+            idx = int(frame.index)
+            # Re-feeding an already-processed index (reintegrate / replace
+            # re-feed) is a *replace*, not a new completion: overwrite the
+            # product, re-emit to the sink as a replace where supported, and do
+            # not double-count progress -- ``n_processed`` must never exceed the
+            # number of distinct frames in the scan.
+            replacing = idx in self._products
+            self._products[idx] = reduction
+            if replacing:
+                _emit_sink_replace(self._sink, frame, reduction)
+            else:
+                self._sink.write(frame, reduction)
+                self._completed += 1
+            _emit(self.progress_cb, self.scan.name, "write", frame.index, self._completed, len(self.scan))
+            if self.clear_frame_images:
+                frame.image = None
+                _clear_source_frame_image(self.source, frame.index)
+            if self.cancel_token.cancelled:
+                self._cancelled = True
+                _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
+                break
+
+
 def run_reduction(
     plan: ReductionPlan,
     scan: Scan | FrameSource,
@@ -814,151 +1183,19 @@ def run_reduction(
         output-axis ranges before the main reduction.  Explicit caller ranges
         are preserved.
     """
-    source = scan
-    scan = _coerce_to_scan(scan)
-    sink = _coerce_sink(sink)
-    cancel_token = cancel_token or CancelToken()
-    if chunk_size <= 0:
-        raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
-    freeze_policy = _normalize_gi_freeze_mode(gi_freeze_mode)
-
-    total = len(scan)
-    output_path = _sink_path(sink) or (
-        scan.output_path if isinstance(scan.output_path, Path) else None
-    )
-    products: dict[int, FrameReduction] = {}
-    completed = 0
-    cancelled = False
-
-    ai = None
-    fi = None
-    initial_incident_angle = None
-    if plan.gi is not None:
-        if scan.poni is None:
-            raise ValueError("GI reduction requires scan.poni.")
-        initial_incident_angle = _resolve_gi_incident_angle(
-            scan.frames[0] if scan.frames else None,
-            plan.gi,
-        )
-        fi = poni_to_fiber_integrator(
-            scan.poni,
-            incident_angle=float(initial_incident_angle),
-            tilt_angle=float(plan.gi.tilt_angle),
-            sample_orientation=int(plan.gi.sample_orientation),
-        )
-        plan = _apply_gi_freeze_policy(
-            plan,
-            scan,
-            freeze_policy=freeze_policy,
-            fi=fi,
-            initial_incident_angle=initial_incident_angle,
-        )
-    else:
-        ai = scan.integrator if scan.integrator is not None else None
-        if ai is None:
-            if scan.poni is None:
-                raise ValueError("Reduction requires scan.integrator or scan.poni.")
-            ai = poni_to_integrator(scan.poni)
-    integrators = _ReductionIntegratorProvider(
-        scan=scan,
-        plan=plan,
-        ai=ai,
-        fi=fi,
-        initial_incident_angle=initial_incident_angle,
-    )
-    worker, owns_worker = _coerce_executor(executor)
-
-    plan_masks: dict[tuple[int, int], np.ndarray | None] = {}
-    result: ReductionResult | None = None
-    failure: BaseException | None = None
-    sink_started = False
-    try:
-        sink.begin(scan, plan)
-        sink_started = True
-        _emit(progress_cb, scan.name, "start", None, completed, total)
-        for chunk, chunk_images in _iter_reduction_chunks(source, scan, chunk_size):
-            _emit(
-                progress_cb,
-                scan.name,
-                "chunk",
-                chunk[0].index if chunk else None,
-                completed,
-                total,
-            )
-            pending = []
-            for frame, raw_image in zip(chunk, chunk_images):
-                if cancel_token.cancelled:
-                    cancelled = True
-                    break
-                _emit(progress_cb, scan.name, "load", frame.index, completed, total)
-                _emit(progress_cb, scan.name, "integrate", frame.index, completed, total)
-                if worker is None:
-                    pending.append((
-                        frame,
-                        _reduce_frame(
-                            frame,
-                            raw_image,
-                            plan,
-                            integrators,
-                            plan_masks,
-                        ),
-                    ))
-                else:
-                    pending.append((
-                        frame,
-                        worker.submit(
-                            _reduce_frame,
-                            frame,
-                            raw_image,
-                            plan,
-                            integrators,
-                            {},
-                        ),
-                    ))
-            for frame, reduction_or_future in pending:
-                reduction = (
-                    reduction_or_future
-                    if worker is None
-                    else reduction_or_future.result()
-                )
-                sink.write(frame, reduction)
-                products[int(frame.index)] = reduction
-                completed += 1
-                _emit(progress_cb, scan.name, "write", frame.index, completed, total)
-                if clear_frame_images:
-                    frame.image = None
-                    _clear_source_frame_image(source, frame.index)
-            if cancelled:
-                break
-    except BaseException as exc:
-        failure = exc
-        raise
-    finally:
-        result = ReductionResult(
-            scan_name=scan.name,
-            frames=products,
-            n_processed=completed,
-            cancelled=cancelled or cancel_token.cancelled,
-            output_path=output_path,
-            failed=failure is not None,
-            error=None if failure is None else str(failure),
-        )
-        try:
-            if sink_started:
-                if failure is None:
-                    sink.finish(result)
-                else:
-                    abort = getattr(sink, "abort", None)
-                    if callable(abort):
-                        abort(result)
-                    else:
-                        sink.finish(result)
-        finally:
-            if owns_worker and worker is not None:
-                worker.shutdown(wait=True, cancel_futures=True)
-
-    _emit(progress_cb, scan.name, "finish", None, completed, total)
-    return result
+    with ReductionSession(
+        plan,
+        scan,
+        sink,
+        chunk_size=chunk_size,
+        clear_frame_images=clear_frame_images,
+        progress_cb=progress_cb,
+        cancel_token=cancel_token,
+        executor=executor,
+        gi_freeze_mode=gi_freeze_mode,
+    ) as session:
+        session.process()
+        return session.finish()
 
 
 def _normalize_gi_freeze_mode(mode: str | None) -> str | None:
@@ -1021,6 +1258,8 @@ def _apply_gi_freeze_policy(
         if reduction.result_1d is not None:
             scout_results_1d.append(reduction.result_1d)
         if reduction.result_2d is not None:
+            if _is_all_dummy_2d(reduction.result_2d):
+                continue
             scout_results_2d.append(reduction.result_2d)
         if was_empty:
             frame.image = None
@@ -1050,7 +1289,25 @@ def _apply_gi_freeze_policy(
                 if key in needs_2d
             },
         )
+    elif needs_2d:
+        raise GIFreezeError(
+            "GI 2D freeze scout produced no non-dummy 2D results; "
+            "check the incident angle / incidence motor."
+        )
     return out
+
+
+def _is_all_dummy_2d(result: IntegrationResult2D, *, dummy: float = -1.0) -> bool:
+    intensity = getattr(result, "intensity", None)
+    if intensity is None:
+        return False
+    arr = np.asarray(intensity, dtype=float)
+    if arr.size == 0:
+        return True
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return True
+    return bool(np.all(finite <= dummy))
 
 
 def _gi_freeze_scout_indices(
@@ -1210,16 +1467,34 @@ def _coerce_executor(executor: Any | None):
     )
 
 
+class _ReductionCancelled(Exception):
+    """Internal sentinel used to stop queued worker tasks without failure."""
+
+
+def _cancel_pending_futures(pending: list[tuple[Frame, Any]], *, worker: Any | None) -> None:
+    if worker is None:
+        return
+    for _frame, candidate in pending:
+        cancel = getattr(candidate, "cancel", None)
+        if callable(cancel):
+            cancel()
+
+
 def _reduce_frame(
     frame: Frame,
     raw_image: np.ndarray | None,
     plan: ReductionPlan,
     integrators: _ReductionIntegratorProvider,
     plan_masks: dict[tuple[int, int], np.ndarray | None],
+    cancel_token: CancelToken | None = None,
 ) -> FrameReduction:
+    if cancel_token is not None and cancel_token.cancelled:
+        raise _ReductionCancelled
     if raw_image is not None:
         frame.image = np.asarray(raw_image)
     image = np.asarray(frame.load_image(), dtype=float)
+    if cancel_token is not None and cancel_token.cancelled:
+        raise _ReductionCancelled
     if image.ndim != 2:
         raise ValueError(f"Frame {frame.index} image must be 2D; got shape {image.shape}")
     _validate_frame_inputs(frame, image.shape)

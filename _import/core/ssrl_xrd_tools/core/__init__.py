@@ -20,7 +20,6 @@ from ssrl_xrd_tools.core.frame_view import (
     TwoDKind,
     assert_frameview_equivalent,
     axis_from_unit,
-    numeric_metadata as frame_view_numeric_metadata,
     two_d_kind_from_units,
 )
 from ssrl_xrd_tools.core.hdf5 import (
@@ -43,12 +42,15 @@ from ssrl_xrd_tools.core.hdf5 import (
     soft_list_eval,
     str_to_h5,
 )
-from ssrl_xrd_tools.core.metadata import ScanMetadata
+from ssrl_xrd_tools.core.metadata import (
+    HeterogeneousMetadata,
+    ScanMetadata,
+    numeric_metadata,
+)
 from ssrl_xrd_tools.core.scan import (
     Frame,
     FrameGeometry,
     FrameSource,
-    HeterogeneousMetadata,
     MaskSpec,
     Scan,
     ScanFrame,
@@ -56,7 +58,6 @@ from ssrl_xrd_tools.core.scan import (
     SourceKind,
     SourceSpec,
     coerce_source_kind,
-    numeric_metadata,
 )
 
 __all__ = [
@@ -70,7 +71,6 @@ __all__ = [
     "TwoDKind",
     "assert_frameview_equivalent",
     "axis_from_unit",
-    "frame_view_numeric_metadata",
     "two_d_kind_from_units",
     "ScanMetadata",
     "Frame",

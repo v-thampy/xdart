@@ -17,7 +17,11 @@ from typing import Any, Protocol, runtime_checkable
 import numpy as np
 
 from ssrl_xrd_tools.core.containers import PONI
-from ssrl_xrd_tools.core.metadata import ScanMetadata
+from ssrl_xrd_tools.core.metadata import (
+    HeterogeneousMetadata,
+    ScanMetadata,
+    numeric_metadata,
+)
 from ssrl_xrd_tools.io.image import read_image
 
 
@@ -30,32 +34,6 @@ def _metadata_get_case_insensitive(metadata: Mapping[str, Any], key: str) -> Any
         if str(existing).lower() == key_lower:
             return value
     return None
-
-
-def numeric_metadata(metadata: Mapping[str, Any] | None) -> dict[str, float]:
-    """Return numeric-coercible metadata without dropping heterogeneous fields."""
-
-    out: dict[str, float] = {}
-    for key, value in (metadata or {}).items():
-        try:
-            out[str(key)] = float(value)
-        except (TypeError, ValueError):
-            continue
-    return out
-
-
-@dataclass(frozen=True, slots=True)
-class HeterogeneousMetadata:
-    """Per-frame metadata preserving raw values plus a numeric view."""
-
-    raw: Mapping[str, Any] = field(default_factory=dict)
-    numeric: Mapping[str, float] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        raw = MappingProxyType(dict(self.raw or {}))
-        numeric = dict(self.numeric or numeric_metadata(raw))
-        object.__setattr__(self, "raw", raw)
-        object.__setattr__(self, "numeric", MappingProxyType(numeric))
 
 
 @dataclass(frozen=True, slots=True)

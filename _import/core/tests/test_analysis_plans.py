@@ -3,18 +3,21 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 
 from ssrl_xrd_tools.analysis import (
     AnalysisResult,
     PeakFitPlan,
     RSMPlan,
+    Sin2PsiPlan,
     StitchPlan,
     run_peak_fit,
     run_rsm,
+    run_sin2psi,
     run_stitch,
 )
 import ssrl_xrd_tools.analysis.plans as plan_mod
-from ssrl_xrd_tools.core.containers import IntegrationResult1D
+from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from ssrl_xrd_tools.core.scan import Scan, ScanFrame
 from ssrl_xrd_tools.sources import MemoryFrameSource
 
@@ -121,3 +124,63 @@ def test_peak_fit_plan_and_result_envelope_are_json_safe(monkeypatch):
     assert data["payload_type"] == "dict"
     assert data["provenance"]["plan"]["positions"] == [1.0]
     assert data["provenance"]["plan"]["fit_kwargs"]["method"] == "leastsq"
+
+
+def test_peak_fit_plan_runs_real_synthetic_peak():
+    x = np.linspace(0.0, 3.0, 301)
+    y = 2.0 + 0.2 * x + 50.0 * np.exp(-0.5 * ((x - 1.25) / 0.08) ** 2)
+
+    result = run_peak_fit(
+        PeakFitPlan(
+            positions=(1.25,),
+            model="gaussian",
+            background="linear",
+            sigma_init=0.08,
+            sigma_bounds=(0.02, 0.2),
+            center_bounds_delta=0.2,
+        ),
+        x,
+        y,
+    )
+
+    assert result.kind == "peak_fit"
+    assert result.payload.success
+    assert result.payload.n_peaks == 1
+    assert result.payload.peak_centers[0] == pytest.approx(1.25, abs=0.01)
+
+
+def test_sin2psi_plan_runs_real_synthetic_map():
+    q = np.linspace(1.75, 2.25, 241)
+    chi = np.linspace(-60.0, 60.0, 25)
+    intensity = np.empty((q.size, chi.size), dtype=float)
+    q0 = 2.0
+    for j, chi_val in enumerate(chi):
+        center = q0 + 0.025 * np.sin(np.deg2rad(abs(chi_val))) ** 2
+        intensity[:, j] = 5.0 + 100.0 * np.exp(-0.5 * ((q - center) / 0.025) ** 2)
+
+    result2d = IntegrationResult2D(
+        radial=q,
+        azimuthal=chi,
+        intensity=intensity,
+        unit="q_A^-1",
+        azimuthal_unit="chi_deg",
+    )
+
+    result = run_sin2psi(
+        Sin2PsiPlan(
+            q_range=(1.92, 2.12),
+            chi_centers=(-50.0, -25.0, 0.0, 25.0, 50.0),
+            chi_width=8.0,
+            model="gaussian",
+            background="constant",
+            sigma_init=0.025,
+            sigma_bounds=(0.005, 0.08),
+            center_bounds_delta=0.08,
+        ),
+        result2d,
+    )
+
+    assert result.kind == "sin2psi"
+    assert len(result.payload.peak_fits) == 5
+    assert np.all(np.isfinite(result.payload.d_values))
+    assert result.payload.r_squared > 0.95

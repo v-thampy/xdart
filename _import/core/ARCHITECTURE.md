@@ -13,8 +13,15 @@ The goal is one headless ingestion, reduction, persistence, and result spine in
 - `FrameView` is the reduced-frame/result contract. It is immutable,
   GUI-free, and carries axes, 1D/2D intensities, raw/thumbnail references,
   heterogeneous metadata, source provenance, and GI identity.
-- `run_reduction` is the only reduction spine. Live, batch, notebook, XYE, and
-  NeXus workflows differ by source, sink, executor, and policy.
+- `ReductionSession` is the core reduction primitive: it owns the executor,
+  per-thread pyFAI integrators, sink lifecycle, the GI-freeze pre-pass,
+  progress, and cancellation for a scan's lifetime, so callers feed chunks
+  without rebuilding CSR-LUTs or reopening sinks. `run_reduction(...)` is the
+  one-shot batch convenience wrapper over it. Live, batch, notebook, XYE, and
+  NeXus workflows differ only by source, sink, executor, and policy.
+- Sinks are the output seam — `MemorySink`, `XYESink`, `NexusSink`, and the
+  `CompositeSink` fanout. Re-feeding an already-processed frame index is a
+  `replace` (idempotent), not a second write/count.
 - NeXus is the persistence contract. Writer validators remain strict; fixes
   must make data faithful rather than relaxing validation.
 
@@ -38,20 +45,26 @@ gate is strict live/batch/reload equivalence plus full headless and GUI suites.
 - `ssrl_xrd_tools.sources` provides `open_source(...)` and adapters for memory,
   live streams, image files, TIFF series, NeXus stacks, and processed xdart
   NeXus files.
-- `run_reduction(...)` accepts a `FrameSource`, supports multiple sinks,
-  chunking, cancellation, progress callbacks, XYE output, and NeXus output.
+- `ReductionSession` / `run_reduction(...)` accept a `Scan` or `FrameSource`,
+  reuse one executor + per-thread integrator set across the whole scan (the
+  per-scan CSR-LUT build is asserted once by the perf gate), support multiple
+  sinks, chunking, cancellation, progress callbacks, XYE output, and NeXus
+  output.
 - GI reduction modes are represented in the headless plan via typed 1D/2D mode
-  enums, incident-angle resolution, and per-frame dispatch.
+  enums and incident-angle resolution; the GI output-range freeze runs as a
+  pre-pass inside the session (`first_frame` for live, `scout_union` for batch).
+  A blank/degenerate scout raises the typed `GIFreezeError`.
 - Processed NeXus files are stamped as schema v2 and preserve string metadata
   alongside numeric metadata.
 - Typed notebook/headless analysis entry points exist for stitching, RSM, peak
   fitting, phase fitting, and sin2psi. These are intentionally thin wrappers
   over existing engines until each workflow receives its own equivalence gate.
 
-## Open Seams
+## Open Seams (backlog)
 
-- Executor-backed reduction and non-`pre_frozen` GI freeze policies are marked
-  with `RESTRUCTURE-TODO(WS-C)` warnings. They should fail loudly as unfinished
-  policy choices rather than pretending to be complete.
-- The typed analysis wrappers are public API scaffolding, not a replacement for
-  workflow-specific validation, persistence, or GUI tools.
+- The typed analysis entry points (stitching, RSM, peak/phase fitting, sin2psi)
+  are public API scaffolding over the existing engines, not a replacement for
+  per-workflow validation, persistence, or GUI tools. A generic
+  `AnalysisStep`/registry abstraction is deliberately deferred until at least
+  two of these typed plans converge (`RESTRUCTURE-TODO`: generic analysis
+  protocol) — premature unification would lock in the wrong shape.

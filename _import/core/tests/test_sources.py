@@ -68,6 +68,31 @@ def test_image_file_source_uses_existing_reader(tmp_path):
     assert isinstance(open_source(path), ImageFileSource)
 
 
+def test_tiff_series_from_directory_uses_natural_order_and_pattern(tmp_path):
+    from ssrl_xrd_tools.sources import TiffSeriesSource
+
+    for name in (
+        "scan_1.tif",
+        "scan_10.tif",
+        "scan_2.tif",
+        "scan_9.tif",
+        "other_3.tif",
+        "scan_4.edf",
+        "scan_11.txt",
+    ):
+        (tmp_path / name).touch()
+
+    source = TiffSeriesSource.from_directory(tmp_path, pattern="scan_*.tif")
+
+    assert [path.name for path in source.files] == [
+        "scan_1.tif",
+        "scan_2.tif",
+        "scan_9.tif",
+        "scan_10.tif",
+    ]
+    assert source.frame_indices == [1, 2, 3, 4]
+
+
 def test_processed_nexus_source_reads_frame_views(tmp_path):
     from ssrl_xrd_tools.sources import ProcessedNexusSource, open_source
 

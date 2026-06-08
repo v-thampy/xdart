@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from ssrl_xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind, SourceSpec
-from ssrl_xrd_tools.io.image import count_frames, read_image
+from ssrl_xrd_tools.io.image import count_frames, find_image_files, read_image
 from ssrl_xrd_tools.io.metadata import read_image_metadata
 from ssrl_xrd_tools.sources.base import BaseFrameSource
 
@@ -114,7 +115,11 @@ class TiffSeriesSource(BaseFrameSource):
         pattern: str = "*.tif*",
         metadata_format: str | None = "txt",
     ) -> "TiffSeriesSource":
-        return cls(sorted(Path(directory).glob(pattern)), metadata_format=metadata_format)
+        files = [
+            path for path in find_image_files(directory)
+            if fnmatch.fnmatch(path.name, pattern)
+        ]
+        return cls(files, metadata_format=metadata_format)
 
     def _path_for(self, index: int) -> Path:
         try:

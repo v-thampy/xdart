@@ -9,10 +9,43 @@ consumes them without knowing the data source.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
+
+
+def numeric_metadata(metadata: Mapping[str, Any] | None) -> dict[str, float]:
+    """Return finite scalar numeric values from heterogeneous metadata."""
+
+    out: dict[str, float] = {}
+    for key, value in (metadata or {}).items():
+        try:
+            arr = np.asarray(value)
+            if arr.shape != ():
+                continue
+            numeric = float(arr)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(numeric):
+            continue
+        out[str(key)] = numeric
+    return out
+
+
+@dataclass(frozen=True, slots=True)
+class HeterogeneousMetadata:
+    """Per-frame metadata preserving raw values plus a numeric view."""
+
+    raw: Mapping[str, Any] = field(default_factory=dict)
+    numeric: Mapping[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        raw = MappingProxyType(dict(self.raw or {}))
+        numeric = dict(self.numeric or numeric_metadata(raw))
+        object.__setattr__(self, "raw", raw)
+        object.__setattr__(self, "numeric", MappingProxyType(numeric))
 
 
 @dataclass(slots=True)

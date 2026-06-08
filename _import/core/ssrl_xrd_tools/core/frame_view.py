@@ -14,6 +14,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from ssrl_xrd_tools.core.metadata import numeric_metadata
+
 
 class TwoDKind(str, Enum):
     """Identity of the two axes in a 2D integrated image."""
@@ -269,23 +271,6 @@ def two_d_kind_from_units(x_unit: str | None, y_unit: str | None) -> TwoDKind:
     if x.startswith("exit_angle") or y.startswith("exit_angle"):
         return TwoDKind.EXIT_ANGLES
     return TwoDKind.Q_CHI
-
-
-def numeric_metadata(metadata: Mapping[str, Any]) -> dict[str, float]:
-    """Return scalar numeric values from a metadata mapping."""
-
-    out: dict[str, float] = {}
-    for key, value in metadata.items():
-        try:
-            arr = np.asarray(value)
-            if arr.shape != ():
-                continue
-            val = float(arr)
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(val):
-            out[str(key)] = val
-    return out
 
 
 def _assert_array_close(name: str, a: np.ndarray | None, b: np.ndarray | None, *, rtol: float, atol: float) -> None:
