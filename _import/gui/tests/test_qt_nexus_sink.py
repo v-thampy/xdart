@@ -21,9 +21,19 @@ def _r1d(value, nq=16):
     )
 
 
-def _reduction(idx):
+def _r2d(value, nq=16, nchi=6):
+    from ssrl_xrd_tools.core.containers import IntegrationResult2D
+    return IntegrationResult2D(
+        radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
+        azimuthal=np.linspace(-180, 180, nchi, endpoint=False).astype(np.float32),
+        intensity=np.full((nq, nchi), float(value), dtype=np.float32),
+        sigma=None, unit="q_A^-1")
+
+
+def _reduction(idx, *, with_2d=False):
     from ssrl_xrd_tools.reduction.core import FrameReduction
-    return FrameReduction(frame_index=idx, result_1d=_r1d(idx + 1), result_2d=None)
+    return FrameReduction(frame_index=idx, result_1d=_r1d(idx + 1),
+                          result_2d=_r2d(idx + 1) if with_2d else None)
 
 
 def _headless(idx):
@@ -60,6 +70,7 @@ class _FakeHost:
         self.xye_written = []
         self.data_1d = {}
         self.data_2d = {}
+        self._published_frames = {}
 
     @property
     def LIVE_SAVE_INTERVAL(self):
@@ -159,10 +170,13 @@ def test_worker_process_makes_thumbnail_off_the_writer(tmp_path):
     assert live.thumbnail is not None          # made on the worker, not the writer
 
 
-def test_live_mode_publishes_display_and_keeps_raw(tmp_path):
-    """#3: in live (non-batch) mode the sink does the per-frame display publish
-    (data_1d/data_2d + sigUpdate) and worker_process KEEPS map_raw (the 2D panel
-    reads it), unlike batch which frees it."""
+def test_live_mode_hands_off_via_published_frames(tmp_path):
+    """#3 (display contract): in live (non-batch) mode the sink does the
+    single-source-of-truth hand-off the serial path uses — it stashes the
+    fully-hydrated LiveFrame into host._published_frames and emits a lightweight
+    sigUpdate, doing NO copy_for_display / data_1d / data_2d work on the writer
+    thread (the GUI-thread update_data consumer owns that, incl. the publication
+    that the cake renders from).  worker_process still KEEPS map_raw for live."""
     from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
     from xdart.modules.ewald import LiveScan
 
@@ -174,14 +188,19 @@ def test_live_mode_publishes_display_and_keeps_raw(tmp_path):
     live = _live_frame(0)
     assert live.map_raw is not None
     sink.register(live)
-    sink.worker_process(_headless(0), _reduction(0))
-    assert live.thumbnail is not None           # thumbnail made (2D)
-    assert live.map_raw is not None             # but raw kept for the display
-    sink.write(_headless(0), _reduction(0))
-    # per-frame display publish happened + the frame's raw is in data_2d.
-    assert 0 in host.data_1d and 0 in host.data_2d
-    assert host.data_2d[0]['map_raw'] is not None
-    assert 0 in host._signals                   # per-frame sigUpdate emitted
+    sink.worker_process(_headless(0), _reduction(0, with_2d=True))
+    assert live.thumbnail is not None           # thumbnail made on the worker (2D)
+    assert live.map_raw is not None             # raw KEPT for the live display
+    sink.write(_headless(0), _reduction(0, with_2d=True))
+    # Fully-hydrated frame handed off via _published_frames; per-frame sigUpdate
+    # emitted.  The frame carries int_2d (so update_data can build the cake's
+    # publication) and map_raw.
+    assert host._published_frames.get(0) is live
+    assert live.int_2d is not None and live.map_raw is not None
+    assert 0 in host._signals                   # lightweight queued sigUpdate
+    # The writer thread did NO display-cache work — update_data (GUI thread) owns
+    # data_1d / data_2d / publication / scan_data now.
+    assert 0 not in host.data_1d and 0 not in host.data_2d
 
 
 def test_sink_xye_only_writes_xye_no_nxs(tmp_path):

@@ -83,33 +83,38 @@ class QtNexusSink:
             )
             return
         self._hydrate(live, frame, reduction)
-        self._publish_display(live)      # live-mode per-frame GUI publish (no-op in batch)
         self._stash_and_buffer(live)
         self._published.add(int(live.idx))
+        self._publish_display(live)      # live-mode per-frame GUI hand-off (no-op in batch)
         self._since_save += 1
         if self._due_to_save():
             self._flush()
 
     def _publish_display(self, live) -> None:
-        """Live-mode per-frame display publish: populate the GUI's data_1d /
-        data_2d caches and emit the per-frame sigUpdate so the view refreshes as
-        each frame lands.  Runs on the writer thread (the same background-thread
-        contract the old _process_one used).  No-op in batch mode (silent run).
-        The raw was NOT freed for live (worker_process gates free_raw on batch),
-        so map_raw is present for the 2D panel.
+        """Live-mode per-frame display hand-off.  Mirrors the SERIAL path
+        (``image_wrangler_thread._process_one``: ``_published_frames[idx] = frame;
+        sigUpdate.emit(idx)``): the writer/worker threads do ZERO Qt/display work
+        — they only stash the fully-hydrated ``LiveFrame`` into the host's
+        ``_published_frames`` map and emit a lightweight queued ``sigUpdate``.
+        The GUI thread's ``static_scan_widget.update_data`` consumer (coalesced
+        by the ~200 ms timer) then does ALL the display work: ``copy_for_display``,
+        the ``data_1d`` / ``data_2d`` mirrors, ``publication_store.upsert`` (the
+        cake's ONLY render source), and ``scan_data`` accumulation — going through
+        the same auto-follow-vs-manual-selection arbitration as serial.
+
+        This is the single-source-of-truth live-display contract every other live
+        path already uses; doing the heavy copy/dict-build + the high-rate emit on
+        the session's single WRITER thread (which also owns the .nxs flush) was
+        what blanked the cake (publication never populated), stuttered the GUI
+        (writer-thread Qt work flooding the coalescer), and fought the selection.
+        No-op in batch (silent run; the GUI reloads from the .nxs at end-of-batch).
         """
         if getattr(self._host, "batch_mode", True):
             return
         idx = int(live.idx)
-        try:
-            self._host.data_1d[idx] = live.copy_for_display(include_2d=False)
-            self._host.data_2d[idx] = {
-                'map_raw': live.map_raw, 'bg_raw': live.bg_raw,
-                'mask': live.mask, 'int_2d': live.int_2d,
-                'gi_2d': live.gi_2d, 'thumbnail': None,
-            }
-        except Exception:
-            logger.debug("live display publish failed for %s", idx, exc_info=True)
+        published = getattr(self._host, "_published_frames", None)
+        if published is not None:
+            published[idx] = live
         sig = getattr(self._host, "sigUpdate", None)
         if sig is not None:
             try:

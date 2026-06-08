@@ -956,13 +956,28 @@ class H5Viewer(QWidget):
         if previous_loc > self.ui.listData.count() - 1:
             previous_loc = self.ui.listData.count() - 1
 
-        if len(previous_sel) < 2:
-            self.ui.listData.setCurrentRow(previous_loc)
-        else:
+        # Restore the prior selection by frame TEXT (id), not row index.  Under
+        # streaming the pool completes frames out of order, so the list above is
+        # re-sorted on (nearly) every coalesce tick; a saved row index then
+        # points at a DIFFERENT frame, so a single-frame click would jump to a
+        # stale neighbour and get re-clobbered each tick (the "shows 47 while 52
+        # is selected" bug).  Text lookup is immune to reordering — this is what
+        # the multi-select branch always did; the single-select branch used to
+        # use the fragile row index.  Fall back to the row only when nothing was
+        # selected (or the selected frame no longer exists).
+        if previous_sel:
+            current_item = None
             for text in previous_sel:
-                matched = self.ui.listData.findItems(text, QtCore.Qt.MatchExactly)
-                for item in matched:
+                for item in self.ui.listData.findItems(text, QtCore.Qt.MatchExactly):
                     item.setSelected(True)
+                    if current_item is None:
+                        current_item = item
+            if current_item is not None:
+                self.ui.listData.setCurrentItem(current_item)
+            else:
+                self.ui.listData.setCurrentRow(previous_loc)
+        else:
+            self.ui.listData.setCurrentRow(previous_loc)
 
         self.ui.listData.blockSignals(False)
         _emit_changed()
