@@ -81,8 +81,8 @@ class Ui_Form(object):
         self.normChannel.addItem("")
         self.normChannel.addItem("")
         self.normChannel.setObjectName(u"normChannel")
-        self.normChannel.setMinimumSize(QSize(135, 0))
-        self.normChannel.setMaximumSize(QSize(140, 16777215))
+        self.normChannel.setMinimumSize(QSize(95, 0))
+        self.normChannel.setMaximumSize(QSize(110, 16777215))
         self.normChannel.setFocusPolicy(Qt.StrongFocus)
 
         self.horizontalLayout_7.addWidget(self.normChannel)
