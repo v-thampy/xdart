@@ -55,9 +55,11 @@ class _FakeHost:
         self.file_lock = threading.RLock()
         self._xye_lock = threading.RLock()
         self._xye_buffer = []
-        self.sigUpdate = SimpleNamespace(emit=lambda *_: self._signals.append("update"))
+        self.sigUpdate = SimpleNamespace(emit=lambda idx=None: self._signals.append(idx))
         self._signals = []
         self.xye_written = []
+        self.data_1d = {}
+        self.data_2d = {}
 
     @property
     def LIVE_SAVE_INTERVAL(self):
@@ -111,9 +113,10 @@ def test_sink_writes_all_frames_to_nxs_and_pops_register(tmp_path):
         assert fr.int_1d is not None
         np.testing.assert_allclose(np.asarray(fr.int_1d.intensity)[0], float(i + 1),
                                    atol=1e-4)
-    # XYE rows flushed for every published frame; batch end-signal emitted once.
+    # XYE rows flushed for every published frame; one end-of-run refresh (-1),
+    # and NO per-frame signals (batch is silent during the run).
     assert sorted(host.xye_written) == list(range(N))
-    assert host._signals == ["update"]
+    assert host._signals == [-1]
 
 
 def test_sink_persist_before_evict_no_unsaved_eviction(tmp_path):
@@ -154,6 +157,31 @@ def test_worker_process_makes_thumbnail_off_the_writer(tmp_path):
     sink.register(live)
     sink.worker_process(_headless(0), _reduction(0))
     assert live.thumbnail is not None          # made on the worker, not the writer
+
+
+def test_live_mode_publishes_display_and_keeps_raw(tmp_path):
+    """#3: in live (non-batch) mode the sink does the per-frame display publish
+    (data_1d/data_2d + sigUpdate) and worker_process KEEPS map_raw (the 2D panel
+    reads it), unlike batch which frees it."""
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+    from xdart.modules.ewald import LiveScan
+
+    scan = LiveScan(data_file=str(tmp_path / "s.nxs"))
+    scan.skip_2d = False
+    host = _FakeHost(batch_mode=False)          # live
+    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink.begin(None, None)
+    live = _live_frame(0)
+    assert live.map_raw is not None
+    sink.register(live)
+    sink.worker_process(_headless(0), _reduction(0))
+    assert live.thumbnail is not None           # thumbnail made (2D)
+    assert live.map_raw is not None             # but raw kept for the display
+    sink.write(_headless(0), _reduction(0))
+    # per-frame display publish happened + the frame's raw is in data_2d.
+    assert 0 in host.data_1d and 0 in host.data_2d
+    assert host.data_2d[0]['map_raw'] is not None
+    assert 0 in host._signals                   # per-frame sigUpdate emitted
 
 
 def test_sink_xye_only_writes_xye_no_nxs(tmp_path):

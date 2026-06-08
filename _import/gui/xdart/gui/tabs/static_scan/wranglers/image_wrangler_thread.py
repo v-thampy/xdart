@@ -67,6 +67,19 @@ if _BATCH_EXECUTION not in ("chunked", "streaming"):
                    "using 'streaming'.", _BATCH_EXECUTION)
     _BATCH_EXECUTION = "streaming"
 
+# Live (non-batch) execution policy (PERF-4b/WS-X1 #3 — unify live onto the
+# streaming sink).  "serial" (default) is the proven per-frame _process_one
+# path.  "streaming" routes non-batch through the SAME persistent
+# ReductionSession + QtNexusSink as batch (the sink does the per-frame display
+# publish for live), which parallelizes a non-batch *reprocess* and gives one
+# write path.  Default stays serial until the live A/B (1D non-batch must not
+# regress + display/Stop verified).  Override: XDART_LIVE_EXECUTION=streaming.
+_LIVE_EXECUTION = os.environ.get("XDART_LIVE_EXECUTION", "serial").strip().lower()
+if _LIVE_EXECUTION not in ("serial", "streaming"):
+    logger.warning("XDART_LIVE_EXECUTION=%r is not 'serial' or 'streaming'; "
+                   "using 'serial'.", _LIVE_EXECUTION)
+    _LIVE_EXECUTION = "serial"
+
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -823,12 +836,22 @@ class imageThread(wranglerThread):
             if self._batch_execution() == "streaming":
                 return self._dispatch_batch_streaming(scan, pending)
             return self._dispatch_batch_parallel(scan, pending)
+        # Live (non-batch): #3 routes it through the SAME streaming session +
+        # QtNexusSink (which does the per-frame display publish for live), behind
+        # the live flag; the proven per-frame _process_one path is the default.
+        if self._live_execution() == "streaming":
+            return self._dispatch_batch_streaming(scan, pending)
         return self._dispatch_batch_serial(scan, pending, force_save=force_save)
 
     def _batch_execution(self) -> str:
         """Active batch execution policy ('chunked' | 'streaming').  Instance
         override (``self.batch_execution``) wins over the module default."""
         return getattr(self, "batch_execution", None) or _BATCH_EXECUTION
+
+    def _live_execution(self) -> str:
+        """Active live (non-batch) execution policy ('serial' | 'streaming').
+        Instance override (``self.live_execution``) wins over the module default."""
+        return getattr(self, "live_execution", None) or _LIVE_EXECUTION
 
     def _maybe_warn_live_gi_clip(self) -> None:
         """One-time advisory for live GI runs (#75).
@@ -1131,9 +1154,12 @@ class imageThread(wranglerThread):
         n_workers = max(1, self.max_cores)
         executor = n_workers if n_workers > 1 else None
         cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
-        gi_freeze_mode = getattr(
-            self, "gi_freeze_mode", "scout_union" if self.gi else None,
-        )
+        # Batch brackets all frames (scout_union over first+last of the chunk);
+        # live has no last frame at session open, so it freezes from the first
+        # frame only (matches the legacy _process_one live path + the #75 advisory).
+        _default_freeze = ("scout_union" if self.batch_mode else "first_frame") \
+            if self.gi else None
+        gi_freeze_mode = getattr(self, "gi_freeze_mode", _default_freeze)
         sink = QtNexusSink(self, scan, standard_plan, mask=self.mask)
         try:
             session = open_live_reduction_session(

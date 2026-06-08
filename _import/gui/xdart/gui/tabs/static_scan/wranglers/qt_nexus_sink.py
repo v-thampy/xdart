@@ -83,11 +83,39 @@ class QtNexusSink:
             )
             return
         self._hydrate(live, frame, reduction)
+        self._publish_display(live)      # live-mode per-frame GUI publish (no-op in batch)
         self._stash_and_buffer(live)
         self._published.add(int(live.idx))
         self._since_save += 1
         if self._due_to_save():
             self._flush()
+
+    def _publish_display(self, live) -> None:
+        """Live-mode per-frame display publish: populate the GUI's data_1d /
+        data_2d caches and emit the per-frame sigUpdate so the view refreshes as
+        each frame lands.  Runs on the writer thread (the same background-thread
+        contract the old _process_one used).  No-op in batch mode (silent run).
+        The raw was NOT freed for live (worker_process gates free_raw on batch),
+        so map_raw is present for the 2D panel.
+        """
+        if getattr(self._host, "batch_mode", True):
+            return
+        idx = int(live.idx)
+        try:
+            self._host.data_1d[idx] = live.copy_for_display(include_2d=False)
+            self._host.data_2d[idx] = {
+                'map_raw': live.map_raw, 'bg_raw': live.bg_raw,
+                'mask': live.mask, 'int_2d': live.int_2d,
+                'gi_2d': live.gi_2d, 'thumbnail': None,
+            }
+        except Exception:
+            logger.debug("live display publish failed for %s", idx, exc_info=True)
+        sig = getattr(self._host, "sigUpdate", None)
+        if sig is not None:
+            try:
+                sig.emit(idx)
+            except Exception:
+                logger.debug("sigUpdate emit failed for %s", idx, exc_info=True)
 
     def worker_process(self, frame, reduction) -> None:
         """Per-frame prep run on the POOL worker thread (PARALLEL), not the
@@ -114,7 +142,12 @@ class QtNexusSink:
             except Exception as e:
                 logger.warning("QtNexusSink thumbnail failed for %s: %s",
                                getattr(live, "idx", "?"), e)
-        live.free_raw()                  # PERF-3 (after the thumbnail)
+        # PERF-3: free the raw in BATCH mode only.  In live (non-batch) mode the
+        # display needs map_raw (the 2D raw panel + the bounded data_2d window
+        # read it), so keep it — live RAM is already bounded by data_2d (max 20)
+        # + _in_memory (cap 64).
+        if getattr(self._host, "batch_mode", True):
+            live.free_raw()
 
     def replace(self, frame, reduction) -> None:
         # Re-fed index (reintegration): hydrate + upsert in memory, but do not
