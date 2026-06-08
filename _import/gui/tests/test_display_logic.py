@@ -80,6 +80,21 @@ def test_xye_unit_from_filename():
     assert dl.x_axis_for_unit('unknown') == ('x', '')
 
 
+def test_pretty_unit():
+    """Display-layer prettify: raw pyFAI tokens -> symbols; unknown/empty pass
+    through unchanged (the stored/headless unit stays canonical)."""
+    assert dl.pretty_unit('q_A^-1') == dl._AA_INV       # Å⁻¹
+    assert dl.pretty_unit('qip_A^-1') == dl._AA_INV
+    assert dl.pretty_unit('qoop_A^-1') == dl._AA_INV
+    assert dl.pretty_unit('2th_deg') == dl._DEG          # °
+    assert dl.pretty_unit('chi_deg') == dl._DEG
+    assert dl.pretty_unit('r_mm') == 'mm'
+    # unknown / empty / None pass through unchanged
+    assert dl.pretty_unit('counts') == 'counts'
+    assert dl.pretty_unit('') == ''
+    assert dl.pretty_unit(None) is None
+
+
 def test_xye_prefix_unit_roundtrip():
     """Writer prefix <-> reader unit must be consistent, and every recovered
     unit must resolve to a real axis label (not plain 'x')."""

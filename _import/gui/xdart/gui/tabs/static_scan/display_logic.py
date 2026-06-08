@@ -67,6 +67,7 @@ __all__ = [
     "choose_raw_source",
     "apply_mask_for",
     "x_axis_for_unit",
+    "pretty_unit",
     "xye_unit_from_filename",
     "xye_prefix_for_unit",
     "default_plot_unit",
@@ -472,6 +473,8 @@ _X_AXIS_TABLE = {
     'qip_A^-1': ('Q_ip', _AA_INV),
     'qoop_A^-1': ('Q_oop', _AA_INV),
     'exit_angle_deg': ('Exit Angle', _DEG),
+    'exit_angle': ('Exit Angle', _DEG),
+    'r_mm': ('r', 'mm'),
 }
 
 
@@ -480,6 +483,18 @@ def x_axis_for_unit(unit):
     used by both normal mode and the XYE viewer.  ``'unknown'`` (and any
     unrecognised unit) → ``('x', '')`` — never an assumed 2θ."""
     return _X_AXIS_TABLE.get(unit, ('x', ''))
+
+
+def pretty_unit(unit):
+    """Display symbol for a unit string (``'q_A^-1'`` -> ``Å⁻¹``, ``'2th_deg'``
+    -> ``°``, ...).  Unrecognised/empty units pass through unchanged.  This is
+    display-only -- the stored/headless unit stays the canonical pyFAI token
+    (N3-units, done at the display layer so the NeXus ``units`` attr and the
+    FrameView equivalence contract are untouched)."""
+    if not unit:
+        return unit
+    symbol = _X_AXIS_TABLE.get(unit, (None, None))[1]
+    return symbol if symbol else unit
 
 
 def two_d_kind_from_units(unit, azimuthal_unit):

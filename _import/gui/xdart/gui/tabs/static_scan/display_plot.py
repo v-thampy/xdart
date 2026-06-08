@@ -22,7 +22,7 @@ from .display_constants import (
     AA_inv, Th, Chi, Deg,
     x_labels_1D, x_units_1D,
 )
-from .display_logic import plan_overlay, OverlayAction
+from .display_logic import plan_overlay, OverlayAction, pretty_unit
 
 logger = logging.getLogger(__name__)
 
@@ -419,15 +419,15 @@ class DisplayPlotMixin:
         if getattr(self, 'viewer_mode', None) == 'xye':
             axis = getattr(self, '_viewer_x_axis_label', None)
             if axis is not None:
-                return axis
+                return axis[0], pretty_unit(axis[1])
         axis = getattr(self, '_payload_x_axis_label', None)
         if axis is not None:
-            return axis
+            return axis[0], pretty_unit(axis[1])
 
         plot_text = self.ui.plotUnit.currentText()
         m = re.match(r'^(.+?)\s*\((.+)\)$', plot_text)
         if m:
-            return m.group(1).strip(), m.group(2).strip()
+            return m.group(1).strip(), pretty_unit(m.group(2).strip())
         return plot_text, ''
 
     # ── 1D plot view rendering ────────────────────────────────────

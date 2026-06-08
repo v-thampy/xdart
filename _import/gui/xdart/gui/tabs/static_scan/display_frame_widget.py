@@ -53,7 +53,7 @@ from .display_logic import (
     build_payload, render_plan, controller_for, ImagePayload,
     empty_display_state, PANEL_LAYOUT,
     resolve_selection, resolve_render_ids,
-    default_plot_unit,
+    default_plot_unit, pretty_unit,
 )
 from .display_controllers import register_default_controllers
 
@@ -830,10 +830,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # integration mask parameter, NOT a colour scale, so it must not set
         # display levels here (coupling it to vmin/vmax washed the image out).
         widget.image_plot.setLabel(
-            "bottom", payload.axis_x.label, units=payload.axis_x.unit,
+            "bottom", payload.axis_x.label, units=pretty_unit(payload.axis_x.unit),
         )
         widget.image_plot.setLabel(
-            "left", payload.axis_y.label, units=payload.axis_y.unit,
+            "left", payload.axis_y.label, units=pretty_unit(payload.axis_y.unit),
         )
         if role is PanelRole.RAW_2D:
             displayFrameWidget._set_raw_pixel_axes(widget)
@@ -1454,8 +1454,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _xu2 = x_units_2D[imageUnit] if imageUnit < len(x_units_2D) else x_units_2D[0]
             _yl2 = y_labels_2D[imageUnit] if imageUnit < len(y_labels_2D) else y_labels_2D[0]
             _yu2 = y_units_2D[imageUnit] if imageUnit < len(y_units_2D) else y_units_2D[0]
-        self.binned_widget.image_plot.setLabel("bottom", _xl2, units=_xu2)
-        self.binned_widget.image_plot.setLabel("left", _yl2, units=_yu2)
+        self.binned_widget.image_plot.setLabel("bottom", _xl2, units=pretty_unit(_xu2))
+        self.binned_widget.image_plot.setLabel("left", _yl2, units=pretty_unit(_yu2))
 
         self.show_slice_overlay()
         return data
