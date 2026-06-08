@@ -1095,7 +1095,13 @@ class ReductionSession:
                         raw_image,
                         self.plan,
                         self._integrators,
-                        {},
+                        # PERF: share the session's persistent mask cache with
+                        # the worker (ThreadPoolExecutor => shared memory) so the
+                        # bool mask is expanded once per detector shape, not once
+                        # per frame per worker.  Keyed by image shape; a dict set
+                        # is atomic under the GIL and a concurrent first-write
+                        # recomputes the identical array, so sharing is safe.
+                        self._plan_masks,
                         self.cancel_token,
                     ),
                 ))
