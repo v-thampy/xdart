@@ -930,6 +930,10 @@ class imageWrangler(wranglerWidget):
 
         for child in self.parameters.children():
             child.show()
+        # A valid PONI is loaded -> clear the "Load a PONI..." prompt so it
+        # doesn't linger after a session-restored calibration (the prompt
+        # should show only when no PONI is loaded).
+        self.ui.specLabel.setText('')
 
     def set_inp_type(self):
         """Change Parameter Names depending on Input Type

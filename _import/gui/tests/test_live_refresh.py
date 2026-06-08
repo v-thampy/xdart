@@ -3466,6 +3466,8 @@ def test_overall_preview_requires_all_requested_frames_when_strict():
         normalize=lambda arr, _info: arr,
     )
     host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
+    host._hydrate_frame_from_disk = MethodType(
+        DisplayDataMixin._hydrate_frame_from_disk, host)
 
     data = DisplayDataMixin.get_frames_map_raw(
         host, [1, 2], prefer_thumbnail=True, require_all=True,
@@ -3492,6 +3494,8 @@ def test_overall_2d_requires_all_requested_frames_when_strict():
         ),
     )
     host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
+    host._hydrate_frame_from_disk = MethodType(
+        DisplayDataMixin._hydrate_frame_from_disk, host)
 
     intensity, xdata, ydata = DisplayDataMixin.get_frames_int_2d(
         host, [1, 2], require_all=True,
