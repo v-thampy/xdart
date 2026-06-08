@@ -19,6 +19,7 @@ import glob
 import numpy as np
 from pathlib import Path
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -1125,14 +1126,29 @@ class imageThread(wranglerThread):
         finally:
             if close_session:
                 session.finish()
-        for frame in frames:
+        # Precompute thumbnails in PARALLEL.  make_thumbnail is per-frame
+        # numpy/scipy on the in-memory map_raw (the session doesn't clear it),
+        # so it is thread-safe -- but it was the dominant *serial* cost left in
+        # the batch path (~0.03s/frame, run on the main thread after the parallel
+        # integration; ~17s of a 651-frame 2D batch, and the reason Int-1D batch
+        # was 2x serial).  Fan it out over the same worker count as the
+        # integration so batch wall-time matches/beats the old engine.
+        def _precompute_thumbnail(frame):
             frame.integrator = scan._cached_integrator
             try:
                 frame.make_thumbnail(global_mask=mask)
             except Exception as e:
                 logger.warning('Thumbnail precompute failed for image %s: %s',
                                frame.idx, e)
-            with self._xye_lock:
+
+        if n_workers > 1 and len(frames) > 1:
+            with ThreadPoolExecutor(max_workers=n_workers) as _thumb_pool:
+                list(_thumb_pool.map(_precompute_thumbnail, frames))
+        else:
+            for frame in frames:
+                _precompute_thumbnail(frame)
+        with self._xye_lock:
+            for frame in frames:
                 self._xye_buffer.append((frame.idx, frame))
         _t_phase1 = time.time() - _t_phase1
         logger.info('[BATCH] Phase 1 (parallel integration): %d frames in %.2fs',
