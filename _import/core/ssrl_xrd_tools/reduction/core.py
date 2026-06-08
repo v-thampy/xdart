@@ -10,6 +10,7 @@ integration loops itself.
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import uuid
 from collections.abc import Callable, Iterable
@@ -818,6 +819,18 @@ class ReductionSession:
     cancel_token: CancelToken | None = None
     executor: Any | None = None
     gi_freeze_mode: str | None = None
+    # Execution policy.  "chunked" (default) keeps the existing
+    # ``process(chunk)`` submit-then-drain-in-order loop.  "streaming" exposes
+    # ``submit(frame)`` — each frame is dispatched to the persistent pool the
+    # instant it is read (no chunk barrier), a bounded in-flight window keeps
+    # the reader from outrunning integration, and ONE internal writer/consumer
+    # thread drains completed reductions and calls the sink by frame index
+    # (HDF5 is not thread-safe → exactly one thread ever touches the sink).
+    execution: str = "chunked"
+    # Max frames in flight (submitted but not yet written) in streaming mode.
+    # ``None`` → 2× the pool's worker count.  This bounds peak memory and stops
+    # the reader starving the pool.
+    inflight_max: int | None = None
     scan: Scan = field(init=False)
     result: ReductionResult | None = field(default=None, init=False)
     integrator_provider_builds: int = field(default=0, init=False)
@@ -841,6 +854,13 @@ class ReductionSession:
     _scan_frame_positions: dict[int, int] = field(
         default_factory=dict, init=False, repr=False,
     )
+    # Streaming-mode machinery (execution="streaming"); unused when chunked.
+    _semaphore: Any = field(default=None, init=False, repr=False)
+    _write_queue: Any = field(default=None, init=False, repr=False)
+    _writer_thread: Any = field(default=None, init=False, repr=False)
+    _stream_started: bool = field(default=False, init=False, repr=False)
+    _submitted: int = field(default=0, init=False, repr=False)
+    _writer_ident: int | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.chunk_size <= 0:
@@ -885,6 +905,13 @@ class ReductionSession:
         self._started = True
         _emit(self.progress_cb, self.scan.name, "start", None, 0, len(self.scan))
 
+        if self.execution not in ("chunked", "streaming"):
+            raise ValueError(
+                f"execution must be 'chunked' or 'streaming'; got {self.execution!r}"
+            )
+        if self.execution == "streaming":
+            self._init_streaming()
+
     def __enter__(self) -> ReductionSession:
         return self
 
@@ -912,6 +939,10 @@ class ReductionSession:
         integrators, sinks, and progress accounting.
         """
 
+        if self.execution == "streaming":
+            raise RuntimeError(
+                "execution='streaming' uses submit(); process() is chunked-only"
+            )
         if self._finished:
             raise RuntimeError("ReductionSession.process called after finish().")
         if self._cancelled or self.cancel_token.cancelled:
@@ -935,9 +966,132 @@ class ReductionSession:
             self._failure = exc
             raise
 
+    def _init_streaming(self) -> None:
+        """Set up the bounded in-flight window + single writer thread.
+
+        Reuses the persistent pool (``self._worker``) and the per-thread
+        integrator provider; only adds a ``Semaphore`` (the in-flight bound), a
+        FIFO queue, and one consumer thread.  Called once from ``__post_init__``
+        AFTER the executor + integrators + GI freeze are in place, so the freeze
+        (which needs first+last frames) is fixed before any frame is submitted.
+        """
+        if self._worker is None:
+            # Streaming needs a real pool; build a default owned one when the
+            # caller passed executor=None/False.
+            self._worker, self._owns_worker = ThreadPoolExecutor(), True
+        n_workers = getattr(self._worker, "_max_workers", None) or 4
+        bound = (
+            self.inflight_max
+            if self.inflight_max and self.inflight_max > 0
+            else max(2, 2 * n_workers)
+        )
+        self.inflight_max = bound
+        self._semaphore = threading.Semaphore(bound)
+        self._write_queue = queue.Queue()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name=f"reduction-writer-{self.scan.name}",
+            daemon=True,
+        )
+        self._writer_thread.start()
+        self._stream_started = True
+
+    def submit(self, frame: Frame, image: np.ndarray | None = None) -> None:
+        """Stream one frame into the pool immediately (execution="streaming").
+
+        Blocks when ``inflight_max`` frames are already in flight (bounded
+        memory), then dispatches integration to the persistent pool and hands
+        the ``(frame, future)`` to the single writer thread, which writes it to
+        the sink by frame index once it completes.  Out-of-order completion is
+        fine — the sink/writer is index-addressed.  A no-op once cancelled.
+        """
+        if self.execution != "streaming":
+            raise RuntimeError("submit() requires execution='streaming'")
+        if self._finished:
+            raise RuntimeError("ReductionSession.submit called after finish().")
+        if self._failure is not None:
+            raise self._failure
+        if self._cancelled or self.cancel_token.cancelled:
+            self._cancelled = True
+            return
+        self._register_process_frames([frame])
+        # Bounded in-flight: blocks the reader so it can't outrun integration
+        # (flat peak memory).  Released by the writer thread per frame.
+        self._semaphore.acquire()
+        if self._cancelled or self.cancel_token.cancelled:
+            self._cancelled = True
+            self._semaphore.release()
+            return
+        future = self._worker.submit(
+            _reduce_frame,
+            frame,
+            image,
+            self.plan,
+            self._integrators,
+            self._plan_masks,
+            self.cancel_token,
+        )
+        self._submitted += 1
+        self._write_queue.put((frame, future))
+
+    def _writer_loop(self) -> None:
+        """The single consumer thread: drain completed frames → sink by index.
+
+        The ONLY thread that ever calls the sink (``write``/``replace``),
+        satisfying the HDF5-single-writer invariant.  Releases one in-flight
+        slot per frame so ``submit`` can proceed.  Records (does not raise)
+        failures so a bad write surfaces in ``finish`` without deadlocking the
+        bounded window.  A re-fed index is a *replace* (not a new completion),
+        preserving the A1 idempotency contract.
+        """
+        self._writer_ident = threading.get_ident()
+        while True:
+            item = self._write_queue.get()
+            if item is _STREAM_SENTINEL:
+                self._write_queue.task_done()
+                break
+            frame, future = item
+            try:
+                try:
+                    reduction = future.result()
+                except _ReductionCancelled:
+                    self._cancelled = True
+                    continue
+                except BaseException as exc:  # integration failure for one frame
+                    self._failure = self._failure or exc
+                    continue
+                idx = int(frame.index)
+                replacing = idx in self._products
+                self._products[idx] = reduction
+                try:
+                    if replacing:
+                        _emit_sink_replace(self._sink, frame, reduction)
+                    else:
+                        self._sink.write(frame, reduction)
+                        self._completed += 1
+                except BaseException as exc:
+                    self._failure = self._failure or exc
+                else:
+                    _emit(self.progress_cb, self.scan.name, "write",
+                          frame.index, self._completed, len(self.scan))
+                    if self.clear_frame_images:
+                        frame.image = None
+                        _clear_source_frame_image(self.source, frame.index)
+            finally:
+                self._semaphore.release()
+                self._write_queue.task_done()
+
     def finish(self) -> ReductionResult:
         if self._finished and self.result is not None:
             return self.result
+
+        if self.execution == "streaming" and self._stream_started:
+            # No more submits: tell the writer to drain the queue and exit, then
+            # join it so only completed frames are flushed (never a torn frame).
+            self._write_queue.put(_STREAM_SENTINEL)
+            if self._writer_thread is not None:
+                self._writer_thread.join()
+                self._writer_thread = None
 
         self.result = ReductionResult(
             scan_name=self.scan.name,
@@ -1475,6 +1629,11 @@ def _coerce_executor(executor: Any | None):
 
 class _ReductionCancelled(Exception):
     """Internal sentinel used to stop queued worker tasks without failure."""
+
+
+# Pushed onto a streaming session's write queue by ``finish`` to tell the
+# single writer/consumer thread to drain and exit.
+_STREAM_SENTINEL = object()
 
 
 def _cancel_pending_futures(pending: list[tuple[Frame, Any]], *, worker: Any | None) -> None:
