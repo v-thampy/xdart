@@ -52,20 +52,20 @@ from xdart.modules.reduction import (
 from .qt_nexus_sink import QtNexusSink
 from .wrangler_widget import wranglerThread
 
-# Batch execution policy (PERF-4b/WS-X1).  "chunked" (default) is the proven
-# read-chunk -> integrate -> Phase-2-write path.  "streaming" routes the batch
-# through one persistent ReductionSession + QtNexusSink (submit-per-frame,
-# single writer thread).  The default stays chunked until streaming is proven
-# equal-or-better on the spine + the Cores=8 wall-time.
+# Batch execution policy (PERF-4b/WS-X1).  "streaming" (default) routes the
+# batch through one persistent ReductionSession + QtNexusSink (submit-per-frame,
+# single writer thread, thumbnail parallelized in the worker) — proven on the
+# 651-frame Eiger scan at 8 cores to be byte-identical to and >= the old chunked
+# path (2D 32.6s vs 38.8s, XYE 23.7s vs 25.4s, 1D ~equal).  "chunked" is the old
+# read-chunk -> integrate -> Phase-2-write path, kept one cycle as a fallback.
 #
-# A/B without editing code: set XDART_BATCH_EXECUTION=streaming in the
-# environment before launching xdart (unset / =chunked for the proven path).
-# Read once at import — relaunch to switch.
-_BATCH_EXECUTION = os.environ.get("XDART_BATCH_EXECUTION", "chunked").strip().lower()
+# Override without editing code: set XDART_BATCH_EXECUTION=chunked (or
+# =streaming) in the environment before launching xdart.  Read once at import.
+_BATCH_EXECUTION = os.environ.get("XDART_BATCH_EXECUTION", "streaming").strip().lower()
 if _BATCH_EXECUTION not in ("chunked", "streaming"):
     logger.warning("XDART_BATCH_EXECUTION=%r is not 'chunked' or 'streaming'; "
-                   "using 'chunked'.", _BATCH_EXECUTION)
-    _BATCH_EXECUTION = "chunked"
+                   "using 'streaming'.", _BATCH_EXECUTION)
+    _BATCH_EXECUTION = "streaming"
 
 
 # ---------------------------------------------------------------------------

@@ -142,6 +142,10 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     w._dispatch_batch = MethodType(imageThread._dispatch_batch, w)
     # Batch execution-policy selector (chunked vs streaming) used by _dispatch_batch.
     w._batch_execution = MethodType(imageThread._batch_execution, w)
+    # This rig drives the CHUNKED dispatcher directly; pin the policy so it is
+    # unaffected by the module default (now "streaming").  The streaming path is
+    # covered by test_streaming_batch_xye_matches_chunked, which overrides this.
+    w.batch_execution = "chunked"
     # _dispatch_batch calls this one-time live-GI clip advisory (#75); bind it so
     # the double doesn't AttributeError.  No-op here (batch_mode=True → early
     # return), so the GI matrix assertions are unaffected.
