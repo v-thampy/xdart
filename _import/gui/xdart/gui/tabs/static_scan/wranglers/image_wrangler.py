@@ -833,7 +833,24 @@ class imageWrangler(wranglerWidget):
         self.thread.live_mode = False
         self.start()
 
+    def _inputs_valid(self):
+        """Whether the wrangler can start a run.
+
+        A loaded PONI calibration is required; without this gate a Start/Live
+        click with no (or an invalid) PONI ran the *previous* scan with the
+        stale calibration (BUG-1).  The image source / save path remain guarded
+        inside the run thread."""
+        if self.poni is None:
+            self.ui.specLabel.setText('Load a PONI calibration file to begin.')
+            return False
+        return True
+
     def start(self):
+        # Gate both the Start button and the Live toggle (both funnel here):
+        # refuse to run without a valid PONI rather than re-running the stale
+        # previous scan.
+        if not self._inputs_valid():
+            return
         self.command = 'start'
         self.thread.command = 'start'
         self.ui.stopButton.setEnabled(True)
@@ -881,8 +898,13 @@ class imageWrangler(wranglerWidget):
     def get_poni_dict(self):
         """Load the PONI calibration file and store as a PONI object."""
         if not os.path.exists(self.poni_file):
-            for child in self.parameters.children():
-                child.hide()
+            # No calibration: clear any stale PONI so the run guard +
+            # _inputs_valid trip, and show a message instead of hiding the whole
+            # tree -- hiding it left the previous scan's PONI live, so a Start
+            # click ran the old scan with the stale calibration (BUG-1).
+            self.poni = None
+            self.thread.poni = None
+            self.ui.specLabel.setText('Load a PONI calibration file to begin.')
             self.parameters.child('Calibration').show()
             return
 
@@ -893,6 +915,7 @@ class imageWrangler(wranglerWidget):
             self.poni = None
         if self.poni is None:
             logger.warning('Invalid Poni File: %s', self.poni_file)
+            self.thread.poni = None
             self.thread.signal_q.put(('message', 'Invalid Poni File'))
             return
 

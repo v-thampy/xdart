@@ -3574,11 +3574,15 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
         startButton=_FakeControl(),
         stopButton=_FakeControl(),
         frame=_FakeControl(),
+        specLabel=SimpleNamespace(setText=lambda *a, **k: None),
     )
     integration_calls = []
     host = SimpleNamespace(
         ui=ui,
         tree=_FakeControl(),
+        # A loaded PONI by default so the start() input-gate (BUG-1) passes;
+        # tests that exercise the gate set ``host.poni = None`` explicitly.
+        poni=object(),
         live_mode=live,
         batch_mode=batch,
         xye_only=False,
@@ -3595,6 +3599,7 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
     )
     host._on_mode_changed = MethodType(imageWrangler._on_mode_changed, host)
     host.start = MethodType(imageWrangler.start, host)
+    host._inputs_valid = MethodType(imageWrangler._inputs_valid, host)
     return host
 
 
@@ -3670,6 +3675,20 @@ def test_start_click_forces_non_live_run():
     assert host.thread.command == "start"
     assert host.ui.stopButton.isEnabled() is True
     assert host.sigStart.emitted == [()]
+
+
+def test_start_without_poni_is_gated():
+    """BUG-1: Start/Live must refuse to run without a loaded PONI rather than
+    re-running the previous scan with the stale calibration."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=False, batch=False)
+    host.poni = None  # no calibration loaded
+
+    imageWrangler.start(host)
+
+    assert host.sigStart.emitted == []          # did not start
+    assert getattr(host, "command", None) != "start"
 
 
 def test_active_live_run_disables_batch_but_keeps_live_clickable():
