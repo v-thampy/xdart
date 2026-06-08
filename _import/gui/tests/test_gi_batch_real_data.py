@@ -134,10 +134,14 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
         setattr(w, meth, MethodType(getattr(wranglerThread, meth), w))
     w._dispatch_batch_serial = MethodType(imageThread._dispatch_batch_serial, w)
     w._dispatch_batch_parallel = MethodType(imageThread._dispatch_batch_parallel, w)
+    # Frame-shell builder extracted from the parallel/streaming dispatchers.
+    w._build_batch_frames = MethodType(imageThread._build_batch_frames, w)
     # The real freeze+dispatch orchestrator (freezes, then routes to the
     # parallel/serial dispatcher) — used to exercise the Int-1D-XYE path where
     # the 2D freeze self-skips on xye_only.
     w._dispatch_batch = MethodType(imageThread._dispatch_batch, w)
+    # Batch execution-policy selector (chunked vs streaming) used by _dispatch_batch.
+    w._batch_execution = MethodType(imageThread._batch_execution, w)
     # _dispatch_batch calls this one-time live-GI clip advisory (#75); bind it so
     # the double doesn't AttributeError.  No-op here (batch_mode=True → early
     # return), so the GI matrix assertions are unaffected.
@@ -741,6 +745,69 @@ def test_gi_submode_xye_only_uniform_xgrid(gi_mode_1d):
     # Same tolerance the stacked writer uses for the uniform-axes check.
     assert np.allclose(r0, r1, rtol=1e-5, atol=1e-8), \
         f"{gi_mode_1d}: per-frame xye x-grid drifted across incidences"
+
+
+@pytest.mark.parametrize("gi_mode_1d", GI_MODES_1D)
+def test_streaming_batch_xye_matches_chunked(gi_mode_1d):
+    """PERF-4b/WS-X1: the streaming batch path (ReductionSession +
+    QtNexusSink, submit-per-frame + single writer thread) produces the SAME
+    per-frame 1D results as the chunked path, byte-for-byte — the equivalence
+    that lets the streaming default flip once perf is proven."""
+    from types import SimpleNamespace, MethodType
+    from threading import RLock
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    poni = _tiff_poni()
+    raw = [_load_tiff(n) for n in _TIFF_FRAMES]
+    mask = _tiff_mask(raw[0][0])
+
+    def _run(execution):
+        w, captured = _build_batch_thread(poni, mask, gi=True)
+        w.xye_only = True
+        scan = _make_scan(
+            poni, mask,
+            {"gi_mode_1d": gi_mode_1d, "numpoints": 128},
+            {"gi_mode_2d": "qip_qoop", "npt_rad": 64, "npt_azim": 48},
+            gi=True,
+        )
+        scan.skip_2d = True
+        pending = [(_TIFF_FRAMES[i], i + 1, raw[i][0], raw[i][2], 0.0, 0.0)
+                   for i in range(2)]
+        if execution == "streaming":
+            w.batch_execution = "streaming"
+            w.file_lock = RLock()
+            w.sigUpdate = SimpleNamespace(emit=lambda *a: None)
+            w.LIVE_SAVE_INTERVAL = 1000
+            w._streaming_session = None
+            w._streaming_sink = None
+            w._streaming_scan_id = None
+            w._reduction_session = None
+            w._reduction_session_key = None
+            w._cancel_token = MethodType(wranglerThread._cancel_token, w)
+            w._close_reduction_session = MethodType(
+                wranglerThread._close_reduction_session, w)
+            for meth in ("_dispatch_batch_streaming", "_get_streaming_session"):
+                setattr(w, meth, MethodType(getattr(imageThread, meth), w))
+        w._dispatch_batch(scan, pending)
+        if execution == "streaming":
+            w._close_reduction_session()    # finish -> QtNexusSink final flush
+        return captured
+
+    chunked = _run("chunked")
+    streaming = _run("streaming")
+
+    assert set(streaming) == set(chunked) == {1, 2}
+    for k in (1, 2):
+        np.testing.assert_array_equal(
+            np.asarray(streaming[k].int_1d.radial, float),
+            np.asarray(chunked[k].int_1d.radial, float),
+        )
+        np.testing.assert_allclose(
+            np.asarray(streaming[k].int_1d.intensity, float),
+            np.asarray(chunked[k].int_1d.intensity, float),
+            rtol=0, atol=0,
+        )
 
 
 def test_gi_freeze_covers_last_frame_extent():

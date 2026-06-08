@@ -361,13 +361,18 @@ def open_live_reduction_session(
     cancel_token: Any = None,
     chunk_size: int | None = None,
     gi_freeze_mode: str | None = None,
+    sink: Any = None,
+    execution: str = "chunked",
+    inflight_max: int | None = None,
 ) -> ReductionSession:
     """Open a persistent headless reducer for xdart live-frame chunks.
 
     The returned session owns the worker pool and per-thread pyFAI
     integrators.  Callers feed subsequent chunks with
-    :func:`reduce_live_frames(..., session=session)` and close it at the end of
-    the scan/run.
+    :func:`reduce_live_frames(..., session=session)` (chunked) or
+    ``session.submit(frame)`` (``execution="streaming"``) and close it at the
+    end of the scan/run.  Pass a ``sink`` (e.g. xdart's ``QtNexusSink``) to have
+    the session drive the write itself instead of copying results back.
     """
 
     frames = list(live_frames)
@@ -384,10 +389,13 @@ def open_live_reduction_session(
     return ReductionSession(
         plan,
         scan,
+        sink=sink,
         executor=executor,
         cancel_token=cancel_token,
         chunk_size=chunk_size or (len(frames) if executor is not None else 1),
         gi_freeze_mode=gi_freeze_mode,
+        execution=execution,
+        inflight_max=inflight_max,
     )
 
 

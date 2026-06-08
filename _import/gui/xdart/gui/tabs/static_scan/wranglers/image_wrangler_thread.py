@@ -43,12 +43,21 @@ from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
     freeze_live_scan_gi_ranges,
+    frame_from_live_frame,
     open_live_reduction_session,
     StandardPlanCache,
     reduce_live_frames,
     sync_live_scan_gi_settings,
 )
+from .qt_nexus_sink import QtNexusSink
 from .wrangler_widget import wranglerThread
+
+# Batch execution policy (PERF-4b/WS-X1).  "chunked" (default) is the proven
+# read-chunk -> integrate -> Phase-2-write path.  "streaming" routes the batch
+# through one persistent ReductionSession + QtNexusSink (submit-per-frame,
+# single writer thread).  Flip to "streaming" to A/B; the default stays chunked
+# until streaming is proven equal-or-better on the spine + the Cores=8 wall-time.
+_BATCH_EXECUTION = "chunked"
 
 
 # ---------------------------------------------------------------------------
@@ -803,8 +812,15 @@ class imageThread(wranglerThread):
         """
         self._maybe_warn_live_gi_clip()
         if self.batch_mode and len(pending) > 1:
+            if self._batch_execution() == "streaming":
+                return self._dispatch_batch_streaming(scan, pending)
             return self._dispatch_batch_parallel(scan, pending)
         return self._dispatch_batch_serial(scan, pending, force_save=force_save)
+
+    def _batch_execution(self) -> str:
+        """Active batch execution policy ('chunked' | 'streaming').  Instance
+        override (``self.batch_execution``) wins over the module default."""
+        return getattr(self, "batch_execution", None) or _BATCH_EXECUTION
 
     def _maybe_warn_live_gi_clip(self) -> None:
         """One-time advisory for live GI runs (#75).
@@ -1021,6 +1037,126 @@ class imageThread(wranglerThread):
             self._frames_since_save = 0
         return count
 
+    def _build_batch_frames(self, scan, pending):
+        """Build the LiveFrame shells for a batch chunk (shared by the chunked
+        and streaming dispatchers).  Stamps source refs + skip_map_raw."""
+        skip_2d = scan.skip_2d
+        gi = self.gi
+        th_mtr = self.incidence_motor
+        sample_orientation = self.sample_orientation
+        tilt_angle = self.tilt_angle
+        series_average = self.series_average
+        frames = []
+        for img_file, img_number, img_data, img_meta, bg_raw, _t_read in pending:
+            if self.command == 'stop':
+                break
+            img_data = self._apply_threshold_inline(img_data)
+            frame_mask = self._resolve_frame_mask(scan, img_data)
+            frame = LiveFrame(
+                img_number, img_data, poni=self.poni,
+                scan_info=img_meta, static=True, gi=gi,
+                th_mtr=th_mtr, bg_raw=bg_raw,
+                sample_orientation=sample_orientation,
+                tilt_angle=tilt_angle,
+                series_average=series_average,
+                integrator=scan._cached_integrator,
+                mask=frame_mask,
+            )
+            if img_file:
+                frame.source_file = os.path.abspath(str(img_file))
+            else:
+                frame.source_file = ""
+            if _raw_lives_in_source(img_file):
+                frame.source_frame_idx = int(img_number) - 1
+            else:
+                frame.source_frame_idx = 0
+            frame.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
+            frames.append(frame)
+        return frames
+
+    def _dispatch_batch_streaming(self, scan, pending):
+        """Stream a batch chunk through a persistent ReductionSession +
+        QtNexusSink (PERF-4b/WS-X1).
+
+        One session spans the whole scan: it owns the worker pool + the single
+        writer thread, and ``QtNexusSink`` owns the .nxs/XYE write.  Each frame
+        is registered + submitted the instant it's built; the per-scan
+        ``_close_reduction_session`` ``finish()`` drains the writer and does the
+        final flush.  Behind the execution flag; chunked is the default.
+        """
+        if getattr(scan, "_cached_integrator", None) is None:
+            return self._dispatch_batch_serial(scan, pending)
+        if getattr(scan, '_cached_data_mask', None) is None and pending:
+            self._prewarm_frame_mask(scan, pending[0][2])
+        sync_live_scan_gi_settings(
+            scan,
+            incidence_motor=self.incidence_motor,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
+        )
+        frames = self._build_batch_frames(scan, pending)
+        if not frames:
+            return 0
+        session, sink = self._get_streaming_session(scan, frames)
+        if session is None:
+            return 0
+        self.showLabel.emit(f'Streaming {len(frames)} images...')
+        count = 0
+        for live in frames:
+            if self.command == 'stop':
+                break
+            sink.register(live)
+            session.submit(frame_from_live_frame(live))
+            count += 1
+        return count
+
+    def _get_streaming_session(self, scan, frames):
+        """Build (once per scan) or return the persistent streaming session +
+        its ``QtNexusSink``.  Returns ``(None, None)`` if the GI freeze scout
+        fails (the batch is skipped with an advisory, as in the chunked path)."""
+        if (self._streaming_session is not None
+                and self._streaming_scan_id == id(scan)):
+            return self._streaming_session, self._streaming_sink
+        if self._streaming_session is not None:   # a different scan started
+            self._close_reduction_session()
+        standard_plan = self._plan_cache.get(scan, integrate_2d=not scan.skip_2d)
+        n_workers = max(1, self.max_cores)
+        executor = n_workers if n_workers > 1 else None
+        cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
+        gi_freeze_mode = getattr(
+            self, "gi_freeze_mode", "scout_union" if self.gi else None,
+        )
+        sink = QtNexusSink(self, scan, standard_plan, mask=self.mask)
+        try:
+            session = open_live_reduction_session(
+                frames,
+                standard_plan,
+                scan_name=str(getattr(scan, "name", "scan")),
+                global_mask=self.mask,
+                integrator=scan._cached_integrator,
+                poni=self.poni,
+                executor=executor,
+                cancel_token=cancel_token,
+                gi_freeze_mode=gi_freeze_mode,
+                sink=sink,
+                execution="streaming",
+            )
+        except GIFreezeError as exc:
+            self.showLabel.emit(
+                'GI 2D scout frame is blank or the grid is degenerate: set '
+                'Theta Motor to Manual and enter the incident angle, or check '
+                'the mask / threshold.'
+            )
+            logger.warning('GI freeze scout failed for streaming batch: %s', exc)
+            self._streaming_session = None
+            self._streaming_sink = None
+            self._streaming_scan_id = None
+            return None, None
+        self._streaming_session = session
+        self._streaming_sink = sink
+        self._streaming_scan_id = id(scan)
+        return session, sink
+
     def _dispatch_batch_parallel(self, scan, pending):
         """Batch processing through the headless reduction executor.
 
@@ -1059,32 +1195,7 @@ class imageThread(wranglerThread):
         standard_plan = self._plan_cache.get(scan, integrate_2d=not skip_2d)
         series_average = self.series_average
 
-        frames = []
-        for img_file, img_number, img_data, img_meta, bg_raw, _t_read in pending:
-            if self.command == 'stop':
-                break
-            img_data = self._apply_threshold_inline(img_data)
-            frame_mask = self._resolve_frame_mask(scan, img_data)
-            frame = LiveFrame(
-                img_number, img_data, poni=self.poni,
-                scan_info=img_meta, static=True, gi=gi,
-                th_mtr=th_mtr, bg_raw=bg_raw,
-                sample_orientation=sample_orientation,
-                tilt_angle=tilt_angle,
-                series_average=series_average,
-                integrator=scan._cached_integrator,
-                mask=frame_mask,
-            )
-            if img_file:
-                frame.source_file = os.path.abspath(str(img_file))
-            else:
-                frame.source_file = ""
-            if _raw_lives_in_source(img_file):
-                frame.source_frame_idx = int(img_number) - 1
-            else:
-                frame.source_frame_idx = 0
-            frame.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
-            frames.append(frame)
+        frames = self._build_batch_frames(scan, pending)
 
         # ── Phase 1: headless parallel integration ───────────────────────────
         self.showLabel.emit(f'Integrating {len(frames)} images ({n_workers} workers)...')

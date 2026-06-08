@@ -256,6 +256,13 @@ class wranglerThread(Qt.QtCore.QThread):
         self.max_cores = 1
         self._reduction_session = None
         self._reduction_session_key = None
+        # Streaming (PERF-4b) session + its QtNexusSink, kept on dedicated slots
+        # because one persistent session spans the WHOLE scan (the chunked cache
+        # keys on per-chunk n_workers, which varies).  Finished at scan end by
+        # _close_reduction_session.
+        self._streaming_session = None
+        self._streaming_sink = None
+        self._streaming_scan_id = None
 
     def run(self):
         """Main task. Subclasses (e.g. imageThread) override this."""
@@ -301,11 +308,19 @@ class wranglerThread(Qt.QtCore.QThread):
         session = self._reduction_session
         self._reduction_session = None
         self._reduction_session_key = None
-        if session is not None:
-            try:
-                session.finish()
-            except Exception:
-                logger.debug("failed to close reduction session", exc_info=True)
+        # The streaming session's finish() drains the writer thread + does the
+        # final QtNexusSink flush (save + XYE + end-of-run signal), so closing
+        # it here is the streaming batch's end-of-scan write.
+        streaming = self._streaming_session
+        self._streaming_session = None
+        self._streaming_sink = None
+        self._streaming_scan_id = None
+        for sess in (session, streaming):
+            if sess is not None:
+                try:
+                    sess.finish()
+                except Exception:
+                    logger.debug("failed to close reduction session", exc_info=True)
 
     def _resolve_frame_mask(self, scan, img_data):
         """Return a stable per-scan "bad pixel" mask cached on the scan.
