@@ -138,6 +138,24 @@ def test_sink_persist_before_evict_no_unsaved_eviction(tmp_path):
     assert len(reloaded.frames.index) == N
 
 
+def test_worker_process_makes_thumbnail_off_the_writer(tmp_path):
+    """The thumbnail is made by worker_process (the parallel pool hook), so the
+    single writer thread never has to -- this is what closes the streaming 2D
+    gap vs chunked."""
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+    from xdart.modules.ewald import LiveScan
+
+    scan = LiveScan(data_file=str(tmp_path / "s.nxs"))
+    scan.skip_2d = False                       # 2D mode -> thumbnail wanted
+    sink = QtNexusSink(_FakeHost(batch_mode=True), scan, _minimal_plan(), mask=None)
+    sink.begin(None, None)
+    live = _live_frame(0)
+    assert live.thumbnail is None
+    sink.register(live)
+    sink.worker_process(_headless(0), _reduction(0))
+    assert live.thumbnail is not None          # made on the worker, not the writer
+
+
 def test_sink_xye_only_writes_xye_no_nxs(tmp_path):
     from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
     from xdart.modules.ewald import LiveScan

@@ -89,6 +89,33 @@ class QtNexusSink:
         if self._due_to_save():
             self._flush()
 
+    def worker_process(self, frame, reduction) -> None:
+        """Per-frame prep run on the POOL worker thread (PARALLEL), not the
+        single writer thread.  The ssrl streaming worker calls this right after
+        integration, so the expensive ~per-frame thumbnail is fanned out across
+        the pool instead of serializing on the one writer thread (the only thing
+        that made streaming 2D slower than chunked).  Order: make the PERF-5-
+        gated thumbnail from the raw, then ``free_raw`` (PERF-3).  The writer
+        (:meth:`write`) then ONLY stashes + writes the already-prepared frame —
+        it never makes a thumbnail, preserving the single-writer invariant.
+        Reads the register map WITHOUT popping (the writer pops in ``write``).
+        """
+        live = self._registry.get(int(frame.index))
+        if live is None:
+            return
+        skip = (
+            self._host.xye_only
+            or (hasattr(live, "can_skip_thumbnail")
+                and live.can_skip_thumbnail(getattr(self._scan, "skip_2d", False)))
+        )
+        if not skip:
+            try:
+                live.make_thumbnail(global_mask=self._mask)
+            except Exception as e:
+                logger.warning("QtNexusSink thumbnail failed for %s: %s",
+                               getattr(live, "idx", "?"), e)
+        live.free_raw()                  # PERF-3 (after the thumbnail)
+
     def replace(self, frame, reduction) -> None:
         # Re-fed index (reintegration): hydrate + upsert in memory, but do not
         # advance the new-frame save counter or re-buffer XYE (the original
@@ -121,6 +148,9 @@ class QtNexusSink:
 
     # -- internals --------------------------------------------------------
     def _hydrate(self, live, frame, reduction) -> None:
+        # Cheap reference copy of the integration products onto the LiveFrame.
+        # The expensive thumbnail + free_raw is done in PARALLEL by
+        # ``worker_process`` (on the pool worker), not here on the writer thread.
         live.int_1d = reduction.result_1d
         live.int_2d = reduction.result_2d
         try:
@@ -129,20 +159,6 @@ class QtNexusSink:
         except Exception:
             logger.debug("map_norm hydrate failed for %s", getattr(live, "idx", "?"),
                          exc_info=True)
-        # PERF-5: skip the thumbnail for reloadable 1D-only frames (and xye_only,
-        # where nothing is persisted).  Made on this single writer thread; for
-        # 2D it's hidden under the much longer integration.
-        skip = (
-            self._host.xye_only
-            or (hasattr(live, "can_skip_thumbnail")
-                and live.can_skip_thumbnail(getattr(self._scan, "skip_2d", False)))
-        )
-        if not skip:
-            try:
-                live.make_thumbnail(global_mask=self._mask)
-            except Exception as e:
-                logger.warning("QtNexusSink thumbnail failed for %s: %s",
-                               getattr(live, "idx", "?"), e)
 
     def _add_frame(self, live) -> None:
         self._scan.add_frame(
@@ -154,9 +170,10 @@ class QtNexusSink:
         )
 
     def _stash_and_buffer(self, live) -> None:
+        # raw was already freed in worker_process (parallel); the writer only
+        # stashes the integrated result + buffers the XYE row.
         if not self._host.xye_only:
             self._add_frame(live)        # in-memory stash (no disk I/O)
-        live.free_raw()                  # PERF-3 (after thumbnail, before XYE)
         with self._host._xye_lock:
             self._host._xye_buffer.append((live.idx, live))
 
