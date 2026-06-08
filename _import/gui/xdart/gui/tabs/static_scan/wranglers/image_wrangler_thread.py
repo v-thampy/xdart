@@ -206,23 +206,26 @@ _INT_PATTERN = re.compile(r'(\d+)')
 _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
 
 # Maximum number of frames to accumulate in the pending list before
-# dispatching a partial batch.  Keeps peak memory bounded when the input
-# contains thousands of frames in a single file (e.g. Bluesky .nxs with
-# a 1000-frame Eiger stack at 2167x2070 int32 ~= 18 GB if collected in
-# one go).  Larger values amortise ThreadPoolExecutor startup and the
-# end-of-batch scan._save_to_nexus flush across more frames, so raise
-# this when RAM allows.
+# dispatching a partial batch.  This is the batch *chunk* size: read N →
+# integrate N across workers → thumbnails → serial HDF5 write → repeat.
+# Each barrier (read/integrate/write phase boundary) leaves cores idle, so
+# fewer, bigger chunks amortise the ThreadPoolExecutor dispatch + the
+# end-of-batch scan._save_to_nexus flush over more frames (PERF-4a).
 #
-# 16 frames of a 2167x2070 int32 Eiger image is ~300 MB of peak buffer
-# — fits comfortably on a slow-disk laptop while still giving the user
-# visible per-batch UI refreshes every ~25 s at typical 1.5 s/frame
-# integration.  Earlier value of 64 made first-batch latency painful on
-# spinning-disk source files (16-frame reads finish ~4× sooner).
-_PENDING_FLUSH_SIZE = 16
+# Peak buffer per batch ≈ flush_size × ~18 MB (one 2167x2070 int32 Eiger
+# frame), plus the 2D cake per frame.  PERF-3 frees each frame's raw at
+# end-of-batch, so this peak is now bounded to ONE chunk regardless of scan
+# length (pre-PERF-3 the stash pinned raw for every frame for the whole
+# scan), which is what makes raising the chunk size safe.  64 frames ≈
+# ~1.5 GB peak — fine on a workstation; dial back toward 16 only on a
+# RAM-starved / spinning-disk laptop (smaller reads finish sooner, so
+# first-batch latency is lower).
+_PENDING_FLUSH_SIZE = 64
 # 1D-only batches carry no multi-MB cake arrays, so a larger pending buffer
 # (fewer, bigger parallel dispatches) is cheaper without the 2D RAM cost.  Kept
-# separate so the 2D-sized buffer is never globally raised.  (PERF-2)
-_PENDING_FLUSH_SIZE_1D = 64
+# separate so the 2D-sized buffer is never globally raised.  256 × ~18 MB ≈
+# ~4.6 GB peak (PERF-3 bounds it to one chunk).  (PERF-2 / PERF-4a)
+_PENDING_FLUSH_SIZE_1D = 256
 
 # How many integrated frames to accumulate between v2 _save_to_nexus
 # Live-save cadence and threshold-sentinel constants moved to the
@@ -659,11 +662,11 @@ class imageThread(wranglerThread):
                 break
 
             # ── Dispatch cadence ────────────────────────────────────────────
-            # Batch mode keeps the 16-frame pending buffer so the
-            # headless reduction spine can integrate them in parallel.
-            # Live (non-batch) mode dispatches immediately so the GUI
-            # sees per-frame updates as soon as each image lands; the
-            # disk save still gets batched separately inside
+            # Batch mode accumulates a pending buffer (_PENDING_FLUSH_SIZE /
+            # _PENDING_FLUSH_SIZE_1D) so the headless reduction spine can
+            # integrate them in parallel.  Live (non-batch) mode dispatches
+            # immediately so the GUI sees per-frame updates as soon as each
+            # image lands; the disk save still gets batched separately inside
             # _dispatch_batch_serial via _frames_since_save.
             flush_size = (
                 (_PENDING_FLUSH_SIZE_1D if getattr(self.scan, "skip_2d", False)
