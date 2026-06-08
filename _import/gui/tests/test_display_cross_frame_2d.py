@@ -1,0 +1,132 @@
+# -*- coding: utf-8 -*-
+"""Cross-frame 2D readers: on-demand disk hydration + the axis-identity guard.
+
+Bug (shipped): ``data_2d`` is a bounded window (FixSizeOrderedDict max=20), but
+``get_frames_int_2d``/``get_frames_map_raw`` iterate the selection and skip a
+``data_2d`` miss — so a 2D sum/average / Set-Bkg over a selection larger than
+the cache silently averaged only the cached subset.  Fix: hydrate evicted frames
+from disk.  Plus an axis-identity guard so the reducer never sums misaligned
+cakes (the writer enforces within-scan uniform axes; the guard makes it explicit).
+"""
+
+from __future__ import annotations
+
+import threading
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+
+def _ir1d(val, nq=8):
+    from ssrl_xrd_tools.core.containers import IntegrationResult1D
+    return IntegrationResult1D(
+        radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
+        intensity=np.full(nq, float(val), dtype=np.float32),
+        sigma=np.ones(nq, dtype=np.float32), unit="q_A^-1")
+
+
+def _ir2d(val, *, nq=8, nchi=6, rad=None):
+    from ssrl_xrd_tools.core.containers import IntegrationResult2D
+    if rad is None:
+        rad = np.linspace(0.5, 5.0, nq, dtype=np.float32)
+    return IntegrationResult2D(
+        radial=np.asarray(rad, dtype=np.float32),
+        azimuthal=np.linspace(-180, 180, nchi, endpoint=False).astype(np.float32),
+        intensity=np.full((len(rad), nchi), float(val), dtype=np.float32),
+        sigma=None, unit="q_A^-1")
+
+
+def _make_host(scan, data_2d, data_1d=None):
+    from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
+    h = DisplayDataMixin.__new__(DisplayDataMixin)
+    h.scan = scan
+    h.data_1d = data_1d if data_1d is not None else {}
+    h.data_2d = data_2d
+    h.data_lock = threading.RLock()
+    h.normChannel = None
+    h.idxs_2d = []
+    h.idxs_1d = []
+    h.ui = SimpleNamespace(
+        normChannel=SimpleNamespace(currentData=lambda: None, currentText=lambda: ""),
+        plotUnit=SimpleNamespace(currentIndex=lambda: 0, currentText=lambda: ""),
+        slice=SimpleNamespace(isChecked=lambda: False))
+    return h
+
+
+def _build_scan_on_disk(tmp_path, N, nq=8, nchi=6):
+    from xdart.modules.ewald import LiveScan
+    from xdart.modules.ewald.frame import LiveFrame
+    nxs = str(tmp_path / "scan.nxs")
+    scan = LiveScan(data_file=nxs)
+    scan.skip_2d = False
+    for i in range(N):
+        fr = LiveFrame(idx=i)
+        fr.int_1d = _ir1d(i, nq)
+        fr.int_2d = _ir2d(i, nq=nq, nchi=nchi)
+        fr.scan_info = {}
+        fr.source_file = ""
+        fr.source_frame_idx = 0
+        scan.add_frame(frame=fr, calculate=False, update=True,
+                       get_sd=True, batch_save=True)
+    scan._save_to_nexus()
+    reloaded = LiveScan(data_file=nxs)
+    reloaded.load_from_h5()
+    return reloaded
+
+
+class TestCrossFrame2DHydration:
+    def test_int_2d_hydrates_evicted_frames(self, tmp_path):
+        N = 30
+        scan = _build_scan_on_disk(tmp_path, N)
+        # data_2d EMPTY -> every selected frame is a cache miss -> must hydrate.
+        result, _x, _y = _make_host(scan, data_2d={}).get_frames_int_2d(list(range(N)))
+        assert result is not None, "cross-frame 2D returned None (hydration failed)"
+        np.testing.assert_allclose(result, (N - 1) / 2.0, atol=1e-4)
+
+    def test_int_2d_hydrated_equals_cached(self, tmp_path):
+        N = 30
+        scan = _build_scan_on_disk(tmp_path, N)
+        hydrated, _, _ = _make_host(scan, {}).get_frames_int_2d(list(range(N)))
+        # Production populates data_1d + data_2d together, so the cached path
+        # normalizes via the frame's scan_info (identity here) — matching what
+        # hydration does with the reloaded LiveFrame.
+        full = {i: {'int_2d': scan.frames[i].int_2d, 'gi_2d': {}} for i in range(N)}
+        d1d = {i: SimpleNamespace(scan_info={}, thumbnail=None) for i in range(N)}
+        cached, _, _ = _make_host(scan, full, d1d).get_frames_int_2d(list(range(N)))
+        np.testing.assert_allclose(hydrated, cached)
+
+    def test_int_2d_axis_guard_excludes_mismatched(self, tmp_path):
+        scan = _build_scan_on_disk(tmp_path, 2)   # real scan for get_xydata
+        rad_a = np.linspace(0.5, 5.0, 8, dtype=np.float32)
+        rad_b = np.linspace(1.0, 9.0, 8, dtype=np.float32)   # same shape, diff grid
+        data_2d = {
+            0: {'int_2d': _ir2d(1.0, rad=rad_a), 'gi_2d': {}},
+            1: {'int_2d': _ir2d(99.0, rad=rad_b), 'gi_2d': {}},
+        }
+        data_1d = {0: SimpleNamespace(scan_info={}, thumbnail=None),
+                   1: SimpleNamespace(scan_info={}, thumbnail=None)}
+        result, _x, _y = _make_host(scan, data_2d, data_1d).get_frames_int_2d([0, 1])
+        # Frame 1 (different q grid) excluded -> result is frame 0's value (1.0),
+        # NOT the silent misaligned mean of 1 and 99.
+        np.testing.assert_allclose(result, 1.0)
+
+    def test_cache_hit_unchanged_when_all_present(self, tmp_path):
+        scan = _build_scan_on_disk(tmp_path, 5)
+        full = {i: {'int_2d': scan.frames[i].int_2d, 'gi_2d': {}} for i in range(5)}
+        d1d = {i: SimpleNamespace(scan_info={}, thumbnail=None) for i in range(5)}
+        result, _, _ = _make_host(scan, full, d1d).get_frames_int_2d(list(range(5)))
+        np.testing.assert_allclose(result, 2.0, atol=1e-4)   # mean(0..4)
+
+
+class TestCrossFrame1DHydration:
+    def test_int_1d_hydrates_evicted_frames(self, tmp_path):
+        # 1D sibling of the same bug (data_1d is also a bounded cache): a 1D
+        # average over a selection larger than the window must hydrate from disk,
+        # not silently average only the cached frames (Set-Bkg consistency).
+        N = 40
+        scan = _build_scan_on_disk(tmp_path, N)
+        host = _make_host(scan, data_2d={})           # data_1d empty too
+        ydata, xdata = host.get_frames_int_1d(list(range(N)), rv='average')
+        assert ydata is not None, "1D cross-frame returned None (hydration failed)"
+        np.testing.assert_allclose(ydata, (N - 1) / 2.0, atol=1e-4)  # mean(0..N-1)

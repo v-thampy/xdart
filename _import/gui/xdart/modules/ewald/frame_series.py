@@ -21,6 +21,7 @@ stacked arrays + per-frame thumbnail group.
 
 import logging
 import os
+import threading
 
 import h5py
 from pandas import Series
@@ -440,6 +441,14 @@ class LiveFrameSeries:
         # (the disk lazy-load finds nothing).  The writer marks frames here via
         # ``mark_persisted`` after a successful save.
         self._persisted: set[int] = set()
+        # Guards the _in_memory + _persisted mutations.  These are touched by
+        # the wrangler thread (stash/mark_persisted under the scan's scan_lock)
+        # AND the GUI thread (``__getitem__`` lazy-load marking persisted, e.g.
+        # display-cache hydration).  A dedicated lock (NOT scan_lock — the
+        # writer takes file_lock→scan_lock, so reusing scan_lock here would
+        # deadlock against the file_lock the lazy-load holds).  Held only for
+        # tiny set/dict ops, never across I/O.
+        self._cache_lock = threading.Lock()
         if frames:
             for a in frames:
                 self.__setitem__(a.idx, a, h5file=h5file)
@@ -464,19 +473,21 @@ class LiveFrameSeries:
         (the cache exceeds the cap until the next save); the non-batch
         dispatcher forces a save before the unsaved set can grow unbounded.
         """
-        self._in_memory[frame.idx] = frame
-        # A freshly-stashed frame carries new in-memory state that may differ
-        # from any on-disk copy, so it is unsaved until the writer re-marks it.
-        self._persisted.discard(frame.idx)
-        if len(self._in_memory) > self._in_memory_cap:
-            excess = len(self._in_memory) - self._in_memory_cap
-            evicted = 0
-            for idx in list(self._in_memory.keys()):
-                if evicted >= excess:
-                    break
-                if idx in self._persisted:
-                    self._in_memory.pop(idx, None)
-                    evicted += 1
+        with self._cache_lock:
+            self._in_memory[frame.idx] = frame
+            # A freshly-stashed frame carries new in-memory state that may
+            # differ from any on-disk copy, so it is unsaved until the writer
+            # re-marks it.
+            self._persisted.discard(frame.idx)
+            if len(self._in_memory) > self._in_memory_cap:
+                excess = len(self._in_memory) - self._in_memory_cap
+                evicted = 0
+                for idx in list(self._in_memory.keys()):
+                    if evicted >= excess:
+                        break
+                    if idx in self._persisted:
+                        self._in_memory.pop(idx, None)
+                        evicted += 1
 
     def mark_persisted(self, idxs) -> None:
         """Record that ``idxs`` are safely written to disk (evictable).
@@ -487,7 +498,8 @@ class LiveFrameSeries:
         eviction when ``LIVE_SAVE_INTERVAL`` exceeds ``_in_memory_cap`` on a
         scan longer than the cap.
         """
-        self._persisted.update(int(i) for i in idxs)
+        with self._cache_lock:
+            self._persisted.update(int(i) for i in idxs)
 
     def unsaved_in_memory_count(self) -> int:
         """How many in-memory frames are not yet persisted to disk.
@@ -496,7 +508,8 @@ class LiveFrameSeries:
         set reaches ``_in_memory_cap`` (so eviction always has persisted frames
         to drop and the cache stays bounded).
         """
-        return sum(1 for idx in self._in_memory if idx not in self._persisted)
+        with self._cache_lock:
+            return sum(1 for idx in self._in_memory if idx not in self._persisted)
 
     def __getitem__(self, idx):
         """Return LiveFrame for ``idx``: in-memory hit, else lazy-load."""
@@ -527,8 +540,14 @@ class LiveFrameSeries:
                 "have been evicted before it was saved (persist-before-evict "
                 "guard) or the .nxs is truncated.", idx,
             )
-        # A frame just read back from disk is by definition persisted.
-        self._persisted.add(idx)
+        # A frame just read back from disk is by definition persisted.  Guard
+        # the shared-set mutation (this runs on the GUI thread for display-cache
+        # hydration, concurrent with the wrangler's stash), and re-check that the
+        # wrangler hasn't meanwhile stashed a fresh UNSAVED frame at this index —
+        # marking that persisted would let stash evict it (the data-loss bug).
+        with self._cache_lock:
+            if idx not in self._in_memory:
+                self._persisted.add(idx)
         return frame
 
     def iloc(self, idx):
