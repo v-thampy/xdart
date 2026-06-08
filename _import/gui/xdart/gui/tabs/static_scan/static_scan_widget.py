@@ -967,6 +967,12 @@ class staticWidget(QWidget):
             return
         self._run_active = True
         self.displayframe.set_processing_active(True)
+        # Same run-state, pushed to the h5viewer so the frame-selection disk-load
+        # guard (data_changed) and the reader-side hydration guard
+        # (_processing_active, just set above) share one source of truth and can't
+        # drift across live/batch/reintegrate (the GUI must not read the .nxs the
+        # writer is churning — that's the frame-click freeze).
+        self.h5viewer.set_run_writing(True)
         self._apply_integration_control_state()   # run_active=True → disable
         # The Advanced 1D/2D parameter dialogs also feed bai_*_args (their
         # sigUpdateArgs → get_args mutates scan.bai_1d/2d_args), so a dialog left
@@ -995,6 +1001,10 @@ class staticWidget(QWidget):
             return
         self._run_active = False
         self.displayframe.set_processing_active(False)
+        # File is idle again: clear the disk-load guard.  set_run_writing(False)
+        # also re-fires the standing frame selection so any frame skipped during
+        # the run (evicted + disk-load suppressed) loads now from the idle file.
+        self.h5viewer.set_run_writing(False)
         # Re-enable the tree (restores the auto-range field gating) then overlay
         # the mode-correct state (run_active is now False).
         self.enable_integration(True)

@@ -420,6 +420,14 @@ class H5Viewer(QWidget):
         # so the per-frame in-memory caches the live display depends on
         # aren't wiped mid-run.  Toggled by static_scan_widget.
         self.live_run_active = False
+        # True while ANY run (live / batch / reintegrate) is writing the .nxs.
+        # Set by the task-#68 run-state owner (static_scan_widget._enter/_exit_
+        # run_state) alongside the displayframe's _processing_active, so the
+        # frame-selection disk-load guard (data_changed) and the reader-side
+        # hydration guard (display_data._hydrate_frame_from_disk) share one
+        # source of truth and can't drift.  Distinct from live_run_active, which
+        # is live-only and also drives data_reset / the file-thread repoint.
+        self._run_writing = False
         self._displayed_list_count = 0
         self._displayed_last_label = None
 
@@ -1952,6 +1960,24 @@ class H5Viewer(QWidget):
                 logger.exception("Failed to set file: %s", fname)
                 return
 
+    def set_run_writing(self, active):
+        """Single switch (driven by the run-state owner ``_enter``/``_exit_run_
+        state``) telling frame selection NOT to read the ``.nxs`` while a run is
+        writing it.  On rising edge, cancel any in-flight load so a stale worker
+        isn't left churning against the now-active writer; on falling edge,
+        re-fire the standing selection so any frame that was skipped (evicted +
+        disk-load suppressed during the run) loads now that the file is idle.
+        """
+        active = bool(active)
+        was = self._run_writing
+        self._run_writing = active
+        if active and not was:
+            self.cancel_pending_loads()
+        elif was and not active and self.ui.listData.selectedItems():
+            # File is idle again — load whatever the user has selected (the
+            # disk-load guard in data_changed is now open).
+            self.data_changed()
+
     def data_changed(self, show_all=False):
         """Connected to itemSelectionChanged signal of listData.
 
@@ -2051,8 +2077,24 @@ class H5Viewer(QWidget):
         # need to be loaded from disk.
         frame_ids = [i for i in int_idxs if i not in idxs_memory]
 
-        if len(frame_ids) > 0:
+        # While ANY run is writing the .nxs, reading it here contends on
+        # file_lock/h5pool with the writer and, worse, drags the GUI thread into
+        # load_frames_data -> _teardown_load_worker's thread.wait(2000) on every
+        # writer save (each save re-fires sigUpdate -> re-fires this load) -> a
+        # multi-minute beachball that only clears at run end.  Serve frame
+        # selection from the in-memory caches only while a run is active
+        # (``_run_writing`` is set by the task-#68 run-state owner alongside the
+        # displayframe's ``_processing_active`` that gates the reader-side
+        # hydration, so the two guards can't drift across live/batch/reintegrate).
+        # Cached frames display instantly; evicted frames repaint when the run
+        # ends (set_run_writing(False) re-fires this handler).
+        if frame_ids and not getattr(self, '_run_writing', False):
             self.load_frames_data(frame_ids, load_2d)
+        elif frame_ids:
+            logger.debug(
+                "Run active: skipping disk load of %d evicted frame(s) %s; "
+                "serving cache only until the run ends", len(frame_ids), frame_ids,
+            )
 
         self.sigUpdate.emit()
 
