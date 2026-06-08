@@ -68,17 +68,21 @@ if _BATCH_EXECUTION not in ("chunked", "streaming"):
     _BATCH_EXECUTION = "streaming"
 
 # Live (non-batch) execution policy (PERF-4b/WS-X1 #3 — unify live onto the
-# streaming sink).  "serial" (default) is the proven per-frame _process_one
-# path.  "streaming" routes non-batch through the SAME persistent
-# ReductionSession + QtNexusSink as batch (the sink does the per-frame display
-# publish for live), which parallelizes a non-batch *reprocess* and gives one
-# write path.  Default stays serial until the live A/B (1D non-batch must not
-# regress + display/Stop verified).  Override: XDART_LIVE_EXECUTION=streaming.
-_LIVE_EXECUTION = os.environ.get("XDART_LIVE_EXECUTION", "serial").strip().lower()
+# streaming sink).  "streaming" (DEFAULT as of the WS-X1 flip) routes a non-batch
+# *reprocess* (Phase 1/2 collect loop) through the SAME persistent
+# ReductionSession + QtNexusSink as batch — one write path, and the parallel pool
+# pipelines I/O+compute (651-frame 2D reprocess ~30s vs ~60-76s serial; 1D ~21 vs
+# ~27s; the live display is published GUI-side via _published_frames, see
+# QtNexusSink._publish_display).  "serial" is the legacy per-frame _process_one
+# reprocess path, kept one cycle as a fallback (XDART_LIVE_EXECUTION=serial).
+# NOTE: the true-live *watch* (Phase 3, detector-rate, in-order one-at-a-time)
+# always uses _process_one regardless of this flag — streaming's parallelism is
+# moot there, and it stays the proven path.
+_LIVE_EXECUTION = os.environ.get("XDART_LIVE_EXECUTION", "streaming").strip().lower()
 if _LIVE_EXECUTION not in ("serial", "streaming"):
     logger.warning("XDART_LIVE_EXECUTION=%r is not 'serial' or 'streaming'; "
-                   "using 'serial'.", _LIVE_EXECUTION)
-    _LIVE_EXECUTION = "serial"
+                   "using 'streaming'.", _LIVE_EXECUTION)
+    _LIVE_EXECUTION = "streaming"
 
 
 # ---------------------------------------------------------------------------
