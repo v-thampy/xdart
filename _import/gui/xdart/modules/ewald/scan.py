@@ -118,6 +118,10 @@ class LiveScan:
         self.series_average = series_average
         self.skip_2d = False
         self._cached_integrator = None
+        # PONI used to build ``_cached_integrator`` -- stashed so the
+        # reintegration path can pass it to the headless GI session (which
+        # requires ``scan.poni`` to build the fiber integrator).
+        self._cached_poni = None
         self._cached_fiber_integrator = None
 
         if frames:

@@ -50,11 +50,13 @@ from pyqtgraph import Qt
 # Project imports
 from xdart.modules.live import LiveFrame
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
+from ssrl_xrd_tools.reduction import GIFreezeError
 from ssrl_xrd_tools.io.nexus import open_nexus_image_stack, read_nexus
 from ssrl_xrd_tools.io.image import read_image
 from ssrl_xrd_tools.io.export import write_xye
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
+    open_live_reduction_session,
     StandardPlanCache,
     reduce_live_frames,
     sync_live_scan_gi_settings,
@@ -153,7 +155,10 @@ class nexusThread(wranglerThread):
 
     def run(self):
         """QThread entry: run the integration body."""
-        self._run_impl()
+        try:
+            self._run_impl()
+        finally:
+            self._close_reduction_session()
 
     def _run_impl(self):
         """Read frames from a NeXus file and integrate them in parallel."""
@@ -194,6 +199,7 @@ class nexusThread(wranglerThread):
         scan_name = Path(self.nexus_file).stem
         scan = self._initialize_scan(scan_name)
         scan._cached_integrator = poni_to_integrator(self.poni)
+        scan._cached_poni = self.poni
         scan._cached_fiber_integrator = None
 
         # Notify the GUI that a new scan is being processed.
@@ -275,6 +281,35 @@ class nexusThread(wranglerThread):
                     f'/{nframes} ({n_workers} workers)'
                 )
                 _t_phase1 = time.time()
+                executor = n_workers if n_workers > 1 else None
+                try:
+                    session = self._get_reduction_session(
+                        self._reduction_session_key_for(scan, standard_plan, n_workers),
+                        lambda: open_live_reduction_session(
+                            frames,
+                            standard_plan,
+                            scan_name=str(getattr(scan, "name", "scan")),
+                            global_mask=self.mask,
+                            integrator=scan._cached_integrator,
+                            poni=self.poni,
+                            executor=executor,
+                            cancel_token=self._cancel_token(),
+                            chunk_size=len(frames) if frames else 1,
+                            gi_freeze_mode="scout_union" if self.gi else None,
+                        ),
+                    )
+                except GIFreezeError as exc:
+                    # GI freeze scout (run when the session is built) found a
+                    # blank/degenerate grid.  The whole scan shares the GI
+                    # geometry, so retrying later chunks won't help -- surface
+                    # the fix and stop.
+                    self.showLabel.emit(
+                        'GI 2D scout frame is blank or the grid is degenerate: '
+                        'set Theta Motor to Manual and enter the incident '
+                        'angle, or check the mask / threshold.'
+                    )
+                    logger.warning('GI freeze scout failed: %s', exc)
+                    break
                 frames = reduce_live_frames(
                     frames,
                     standard_plan,
@@ -282,8 +317,10 @@ class nexusThread(wranglerThread):
                     global_mask=self.mask,
                     integrator=scan._cached_integrator,
                     poni=self.poni,
-                    executor=n_workers,
+                    session=session,
+                    cancel_token=self._cancel_token(),
                     chunk_size=len(frames) if frames else 1,
+                    gi_freeze_mode="scout_union" if self.gi else None,
                 )
                 _t_phase1 = time.time() - _t_phase1
 

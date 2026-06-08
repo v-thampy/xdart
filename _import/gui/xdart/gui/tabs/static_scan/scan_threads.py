@@ -14,6 +14,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 from xdart.modules.reduction import (
+    open_live_reduction_session,
     StandardPlanCache,
     reduce_live_frames,
 )
@@ -86,6 +87,8 @@ class integratorThread(Qt.QtCore.QThread):
         self.mg_2d_args = {}
         # C1: cached standard ReductionPlan per scan.
         self._plan_cache = StandardPlanCache()
+        self._reduction_session = None
+        self._reduction_session_key = None
 
     def run(self):
         """Calls self.method. Catches exception where method does
@@ -98,6 +101,37 @@ class integratorThread(Qt.QtCore.QThread):
             except KeyError as e:
                 logger.error("Method %s failed with KeyError: %s", self.method, e, exc_info=True)
                 traceback.print_exc()
+            finally:
+                self._close_reduction_session()
+
+    def _get_reduction_session(self, key, factory):
+        if self._reduction_session is not None and self._reduction_session_key == key:
+            return self._reduction_session
+        self._close_reduction_session()
+        self._reduction_session = factory()
+        self._reduction_session_key = key
+        return self._reduction_session
+
+    def _close_reduction_session(self):
+        session = self._reduction_session
+        self._reduction_session = None
+        self._reduction_session_key = None
+        if session is not None:
+            try:
+                session.finish()
+            except Exception:
+                logger.debug("failed to close reintegration session", exc_info=True)
+
+    def _session_key(self, n_workers: int, plan):
+        key = max(1, int(n_workers or 1))
+        return (
+            id(self.scan),
+            str(getattr(self.scan, "name", "scan")),
+            key,
+            bool(getattr(self.scan, "gi", False)),
+            bool(getattr(self.scan, "skip_2d", False)),
+            id(plan),
+        )
 
     def _upsert_publication_for_frame(self, frame) -> None:
         """Refresh the publication snapshot for one reintegrated frame."""
@@ -135,15 +169,47 @@ class integratorThread(Qt.QtCore.QThread):
         ]
         if not frames:
             return []
-        executor = n_workers if n_workers > 1 and len(frames) > 1 else None
+        is_gi = bool(getattr(self.scan, "gi", False))
+        # GI reduction builds a fiber integrator from a PONI; the headless
+        # session raises ``ValueError("GI reduction requires scan.poni.")`` if
+        # neither the scan nor a frame carries one.  Pass the PONI the wrangler
+        # stashed alongside the cached integrator, and guard the no-calibration
+        # case with a clear message instead of letting an unhandled raise tear
+        # down the reintegration thread.
+        poni = getattr(self.scan, "_cached_poni", None)
+        if is_gi and poni is None and getattr(frames[0], "poni", None) is None:
+            logger.error(
+                "GI reintegration needs a loaded PONI/calibration; none is "
+                "available on the scan. Load the calibration and retry."
+            )
+            return []
+        n_workers = n_workers if len(frames) > 1 else 1
+        executor = n_workers if n_workers > 1 else None
+        gi_freeze_mode = "scout_union" if is_gi else None
+        session = self._get_reduction_session(
+            self._session_key(n_workers, plan),
+            lambda: open_live_reduction_session(
+                frames,
+                plan,
+                scan_name=str(getattr(self.scan, "name", "scan")),
+                global_mask=getattr(self.scan, "global_mask", None),
+                integrator=getattr(self.scan, "_cached_integrator", None),
+                poni=poni,
+                executor=executor,
+                chunk_size=max(1, min(n_workers, len(frames))),
+                gi_freeze_mode=gi_freeze_mode,
+            ),
+        )
         return reduce_live_frames(
             frames,
             plan,
             scan_name=str(getattr(self.scan, "name", "scan")),
             global_mask=getattr(self.scan, "global_mask", None),
             integrator=getattr(self.scan, "_cached_integrator", None),
-            executor=executor,
+            poni=poni,
+            session=session,
             chunk_size=max(1, min(n_workers, len(frames))),
+            gi_freeze_mode=gi_freeze_mode,
         )
 
     def _publish_reintegrated_display(

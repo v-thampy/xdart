@@ -26,6 +26,7 @@ from ssrl_xrd_tools.reduction import (
     Integration2DPlan,
     MaskSpec,
     ReductionPlan,
+    ReductionSession,
     Scan,
     run_reduction,
 )
@@ -298,6 +299,8 @@ def reduce_live_frames(
     integrator: Any = None,
     poni: Any = None,
     executor: Any = None,
+    session: ReductionSession | None = None,
+    cancel_token: Any = None,
     chunk_size: int | None = None,
     gi_freeze_mode: str | None = None,
 ) -> list[Any]:
@@ -306,6 +309,70 @@ def reduce_live_frames(
     frames = list(live_frames)
     if not frames:
         return []
+    headless_frames = [frame_from_live_frame(frame) for frame in frames]
+    if session is None:
+        # Only the one-shot path needs its own Scan + masked plan; a supplied
+        # session already owns both (it was opened from the first chunk), so
+        # building them here would be throwaway work.
+        plan = _plan_with_mask_for_live_frame(plan, global_mask, frames[0])
+        scan = Scan(
+            name=scan_name,
+            frames=headless_frames,
+            poni=poni if poni is not None else getattr(frames[0], "poni", None),
+            integrator=integrator if integrator is not None else getattr(frames[0], "integrator", None),
+        )
+        result = run_reduction(
+            plan,
+            scan,
+            executor=executor,
+            cancel_token=cancel_token,
+            chunk_size=chunk_size or (len(frames) if executor is not None else 1),
+            gi_freeze_mode=gi_freeze_mode,
+        )
+        result_frames = result.frames
+        active_plan = plan
+    else:
+        session.process(headless_frames)
+        result_frames = session.frames
+        active_plan = session.plan
+    by_index = {int(frame.idx): frame for frame in frames}
+    reduced_frames = []
+    for headless_frame in headless_frames:
+        live_frame = by_index[int(headless_frame.index)]
+        reduction = result_frames.get(int(headless_frame.index))
+        if reduction is None:
+            continue
+        live_frame.int_1d = reduction.result_1d
+        live_frame.int_2d = reduction.result_2d
+        live_frame.map_norm = _frame_norm(headless_frame, active_plan)
+        reduced_frames.append(live_frame)
+    return reduced_frames
+
+
+def open_live_reduction_session(
+    live_frames: Iterable[Any],
+    plan: ReductionPlan,
+    *,
+    scan_name: str = "scan",
+    global_mask: Any = None,
+    integrator: Any = None,
+    poni: Any = None,
+    executor: Any = None,
+    cancel_token: Any = None,
+    chunk_size: int | None = None,
+    gi_freeze_mode: str | None = None,
+) -> ReductionSession:
+    """Open a persistent headless reducer for xdart live-frame chunks.
+
+    The returned session owns the worker pool and per-thread pyFAI
+    integrators.  Callers feed subsequent chunks with
+    :func:`reduce_live_frames(..., session=session)` and close it at the end of
+    the scan/run.
+    """
+
+    frames = list(live_frames)
+    if not frames:
+        raise ValueError("cannot open a reduction session without frames")
     plan = _plan_with_mask_for_live_frame(plan, global_mask, frames[0])
     headless_frames = [frame_from_live_frame(frame) for frame in frames]
     scan = Scan(
@@ -314,21 +381,102 @@ def reduce_live_frames(
         poni=poni if poni is not None else getattr(frames[0], "poni", None),
         integrator=integrator if integrator is not None else getattr(frames[0], "integrator", None),
     )
-    result = run_reduction(
+    return ReductionSession(
         plan,
         scan,
         executor=executor,
+        cancel_token=cancel_token,
         chunk_size=chunk_size or (len(frames) if executor is not None else 1),
         gi_freeze_mode=gi_freeze_mode,
     )
-    by_index = {int(frame.idx): frame for frame in frames}
-    for headless_frame in headless_frames:
-        live_frame = by_index[int(headless_frame.index)]
-        reduction = result.frames[int(headless_frame.index)]
-        live_frame.int_1d = reduction.result_1d
-        live_frame.int_2d = reduction.result_2d
-        live_frame.map_norm = _frame_norm(headless_frame, plan)
-    return frames
+
+
+def freeze_live_scan_gi_ranges(
+    live_scan: Any,
+    live_frames: Iterable[Any],
+    *,
+    scan_name: str = "scan",
+    global_mask: Any = None,
+    integrator: Any = None,
+    poni: Any = None,
+    integrate_1d: bool = True,
+    integrate_2d: bool = True,
+    gi_freeze_mode: str = "scout_union",
+) -> ReductionPlan:
+    """Freeze missing GI output ranges through the headless reducer.
+
+    This is the xdart boundary adapter for the old GI scout step.  The actual
+    scout integrations and common-grid calculation live in
+    :class:`ssrl_xrd_tools.reduction.ReductionSession`; xdart only mirrors the
+    frozen plan ranges back into ``bai_1d_args`` / ``bai_2d_args`` so the
+    existing writer and display state stay coherent.
+    """
+
+    frames = list(live_frames)
+    if not frames:
+        return plan_from_live_scan(
+            live_scan,
+            integrate_1d=integrate_1d,
+            integrate_2d=integrate_2d,
+        )
+    plan = plan_from_live_scan(
+        live_scan,
+        integrate_1d=integrate_1d,
+        integrate_2d=integrate_2d,
+    )
+    session = open_live_reduction_session(
+        frames,
+        plan,
+        scan_name=scan_name,
+        global_mask=global_mask,
+        integrator=integrator,
+        poni=poni,
+        executor=None,
+        chunk_size=len(frames),
+        gi_freeze_mode=gi_freeze_mode,
+    )
+    try:
+        frozen = session.plan
+    finally:
+        session.finish()
+    _copy_frozen_gi_ranges_to_live_scan(live_scan, frozen)
+    return frozen
+
+
+def _copy_frozen_gi_ranges_to_live_scan(
+    live_scan: Any,
+    plan: ReductionPlan,
+) -> None:
+    if plan.gi is None:
+        return
+    if plan.integration_1d is not None:
+        args_1d = getattr(live_scan, "bai_1d_args", None)
+        if isinstance(args_1d, dict):
+            from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
+
+            key = gi_1d_output_axis_key(plan.gi.mode_1d.value)
+            value = getattr(plan.integration_1d, key, None)
+            if value is not None and args_1d.get(key) is None:
+                args_1d[key] = tuple(map(float, value))
+
+    if plan.integration_2d is not None:
+        args_2d = getattr(live_scan, "bai_2d_args", None)
+        if not isinstance(args_2d, dict):
+            return
+        p2d = plan.integration_2d
+        if plan.gi.mode_2d.value == "qip_qoop":
+            ranges = {
+                "x_range": p2d.extra.get("x_range"),
+                "y_range": p2d.extra.get("y_range"),
+            }
+        else:
+            ranges = {
+                "radial_range": p2d.radial_range,
+                "azimuth_range": p2d.azimuth_range,
+            }
+        for key, value in ranges.items():
+            if value is not None and args_2d.get(key) is None:
+                args_2d[key] = tuple(map(float, value))
 
 
 # ---------------------------------------------------------------------------
@@ -691,5 +839,7 @@ __all__ = [
     "plan_from_live_scan",
     "reduce_live_frame",
     "reduce_live_frames",
+    "open_live_reduction_session",
+    "freeze_live_scan_gi_ranges",
     "sync_live_scan_gi_settings",
 ]

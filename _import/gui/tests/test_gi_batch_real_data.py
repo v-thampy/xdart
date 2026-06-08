@@ -132,7 +132,6 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     for meth in ("_resolve_frame_mask", "_prewarm_frame_mask",
                  "_apply_threshold_inline"):
         setattr(w, meth, MethodType(getattr(wranglerThread, meth), w))
-    w._borrow_fiber_integrator = wranglerThread._borrow_fiber_integrator  # staticmethod
     w._dispatch_batch_serial = MethodType(imageThread._dispatch_batch_serial, w)
     w._dispatch_batch_parallel = MethodType(imageThread._dispatch_batch_parallel, w)
     # The real freeze+dispatch orchestrator (freezes, then routes to the
@@ -267,6 +266,11 @@ def _run_batch_parallel(poni, pending_data, mask, *, incidence_motor="th",
         w._freeze_gi_1d_auto_range(scan, pending)
         w._freeze_gi_2d_auto_ranges(scan, pending)
         w.xye_only = prev_xye_only
+    else:
+        # Production freezes GI through ReductionSession by default.  This
+        # explicit test hook exercises the old unfrozen drift path so the writer
+        # validator remains proven load-bearing.
+        w.gi_freeze_mode = None
     imageThread._dispatch_batch_parallel(w, scan, pending)
     return captured
 

@@ -72,11 +72,8 @@ params = [
         {'name': 'mask_file', 'title': 'Mask File', 'type': 'str', 'value': ''},
         NamedActionParameter(name='mask_file_browse', title='Browse...'),
     ], 'expanded': True, 'visible': False},
-    {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group',
-     'syncExpanded': True, 'children': [
-        # Hidden compatibility value.  The visible on/off control is the group
-        # header expansion state: expanded = enabled, collapsed = disabled.
-        {'name': 'Grazing', 'type': 'bool', 'value': False, 'visible': False},
+    {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'children': [
+        {'name': 'Grazing', 'type': 'bool', 'value': False},
         {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'list',
          'values': ['th', 'Manual'], 'value': 'th'},
         {'name': 'th_val', 'title': 'Theta', 'type': 'str', 'value': '0.1', 'visible': False},
@@ -94,11 +91,8 @@ params = [
          'values': {u'Q\u1D62\u209A\u2013Q\u2092\u2092\u209A': 'qip_qoop', u'Q-\u03C7': 'q_chi'},
          'value': 'qip_qoop', 'visible': False},
     ], 'expanded': False, 'visible': False},
-    {'name': 'Mask', 'title': 'Intensity Threshold', 'type': 'group',
-     'syncExpanded': True, 'children': [
-        # Hidden compatibility value.  The visible on/off control is the group
-        # header expansion state: expanded = enabled, collapsed = disabled.
-        {'name': 'Threshold', 'type': 'bool', 'value': False, 'visible': False},
+    {'name': 'Mask', 'title': 'Intensity Threshold', 'type': 'group', 'children': [
+        {'name': 'Threshold', 'type': 'bool', 'value': False},
         {'name': 'min', 'title': 'Min', 'type': 'int', 'value': 0},
         {'name': 'max', 'title': 'Max', 'type': 'int', 'value': 0},
     ], 'expanded': False, 'visible': False},
@@ -300,7 +294,6 @@ class imageWrangler(wranglerWidget):
         # existing advancedWidget1D / advancedWidget2D dialogs directly.
 
         # Wire signals from parameter tree based buttons
-        self.parameters.sigTreeStateChanged.connect(self._sync_group_toggles)
         self.parameters.sigTreeStateChanged.connect(self.setup)
         self.parameters.sigTreeStateChanged.connect(self._save_to_session)
 
@@ -438,32 +431,6 @@ class imageWrangler(wranglerWidget):
                 continue
             if is_on(value):
                 group.setOpts(expanded=True)
-
-    def _set_hidden_toggle_value(self, child, value):
-        if getattr(self, '_syncing_group_toggle', False):
-            return
-        self._syncing_group_toggle = True
-        try:
-            child.setValue(bool(value))
-        finally:
-            self._syncing_group_toggle = False
-
-    def _sync_group_toggles(self, *args):
-        """Mirror click-to-expand group toggles into hidden worker booleans."""
-
-        changes = args[1] if len(args) > 1 else ()
-        for changed, change, data in changes:
-            if change != 'options' or 'expanded' not in data:
-                continue
-            for group_name, child_name in (('GI', 'Grazing'), ('Mask', 'Threshold')):
-                try:
-                    if changed is self.parameters.child(group_name):
-                        self._set_hidden_toggle_value(
-                            self.parameters.child(group_name).child(child_name),
-                            bool(data['expanded']),
-                        )
-                except Exception:
-                    logger.debug("failed to sync %s toggle", group_name, exc_info=True)
 
     # --- Session persistence ---
 
@@ -693,15 +660,6 @@ class imageWrangler(wranglerWidget):
             self.parameters.child('h5_dir_browse').setOpts(enabled=enabled)
         except (AttributeError, KeyError) as e:
             logger.debug("Failed to set enabled state for h5_dir parameters: %s", e)
-
-    # _set_parameter_readonly now lives on the base wranglerWidget (shared with
-    # nexusWrangler); _set_gi_controls_readonly below still uses it via self.
-
-    def _set_gi_controls_readonly(self, readonly):
-        try:
-            self._set_parameter_readonly(self.parameters.child('GI'), readonly)
-        except (AttributeError, KeyError) as e:
-            logger.debug("Failed to set GI readonly state: %s", e)
 
     def setup(self):
         """Sets up the child thread, syncs all parameters.
@@ -1294,18 +1252,22 @@ class imageWrangler(wranglerWidget):
         self.motors = self.scan_parameters
 
     def enabled(self, enable):
-        """Enable/disable processing inputs for the run lifecycle.
+        """Enable/disable the WHOLE wrangler panel for the run lifecycle (#72).
 
-        Keep the ParameterTree widget itself enabled and lock its parameters
-        read-only instead.  Pyqtgraph can repaint disabled bool values as
-        visually unchecked; the header-toggle GI/threshold groups and readonly
-        tree avoid that while still preventing mid-run edits.
+        During a run everything is locked except Stop: the parameter tree is
+        hard-disabled (greyed + fully non-interactive, matching the integration
+        panel above it), and the non-param widgets (processing-mode combo, Cores
+        spinbox + label, Advanced button) are disabled too.  A disabled pyqtgraph
+        bool checkbox (Grazing, Average Scan, …) may repaint unchecked during the
+        run (#56), but the value is preserved and restored on re-enable — the
+        full visible disable was chosen over that cosmetic ("minimize
+        complexity").  The running thread uses the setup-time arg snapshot
+        regardless.
 
         args:
             enable: bool, True for enabled False for disabled.
         """
-        self.tree.setEnabled(True)
-        self._set_tree_readonly(not enable)
+        self.tree.setEnabled(enable)
         self.ui.startButton.setEnabled(enable)
         # Non-param widgets (live outside the ParameterTree): mode combo, Cores
         # spinbox + label, Advanced button.  Stop is left alone (stays enabled).

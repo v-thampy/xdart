@@ -1,20 +1,13 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import numpy as np
 import pandas as pd
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D, PONI
-from ssrl_xrd_tools.reduction import FrameReduction, ReductionPlan
+from ssrl_xrd_tools.core.containers import PONI
 
 from xdart.modules.live import LiveFrame, LiveScan
 from xdart.modules.reduction import plan_from_live_scan
-from xdart.modules.sources import (
-    LiveScanFrameSource,
-    PublicationSink,
-    build_reduction_job,
-)
+from xdart.modules.sources import LiveScanFrameSource
 
 
 def _poni() -> PONI:
@@ -24,25 +17,6 @@ def _poni() -> PONI:
         poni2=0.02,
         wavelength=1e-10,
         detector="Detector",
-    )
-
-
-def _r1d() -> IntegrationResult1D:
-    return IntegrationResult1D(
-        radial=np.array([0.0, 1.0]),
-        intensity=np.array([1.0, 2.0]),
-        sigma=None,
-        unit="q_A^-1",
-    )
-
-
-def _r2d() -> IntegrationResult2D:
-    return IntegrationResult2D(
-        radial=np.array([0.0, 1.0]),
-        azimuthal=np.array([-1.0, 1.0]),
-        intensity=np.ones((2, 2)),
-        sigma=None,
-        unit="q_A^-1",
     )
 
 
@@ -98,41 +72,3 @@ def test_plan_from_live_scan_preserves_gi_submodes(tmp_path):
     assert plan.gi.npt_oop == 123
     assert plan.integration_1d.npt == 7
     assert plan.integration_2d.npt_rad == 8
-
-
-def test_build_reduction_job_uses_source_plan_and_default_memory_sink(tmp_path):
-    scan = LiveScan("scan", data_file=str(tmp_path / "scan.nxs"))
-    scan.frames[1] = LiveFrame(idx=1, map_raw=np.ones((2, 2)), poni=_poni())
-
-    job = build_reduction_job(scan, frame_indices=[1], integrate_2d=False)
-
-    assert isinstance(job.source, LiveScanFrameSource)
-    assert isinstance(job.plan, ReductionPlan)
-    assert job.source.frame_indices == [1]
-    assert job.plan.integration_1d is not None
-    assert job.plan.integration_2d is None
-
-
-def test_publication_sink_publishes_frame_publication():
-    publications = []
-    sink = PublicationSink(publications.append, generation=4)
-    scan = SimpleNamespace(name="scan")
-    frame = SimpleNamespace(index=2, source_path=None, source_frame_index=None, image=None)
-    sink.begin(scan, ReductionPlan())
-
-    sink.write(
-        frame,
-        FrameReduction(
-            frame_index=2,
-            result_1d=_r1d(),
-            result_2d=_r2d(),
-            metadata={"phase": "alpha", "i0": 10.0},
-        ),
-    )
-
-    assert len(publications) == 1
-    pub = publications[0]
-    assert pub.label == 2
-    assert pub.generation == 4
-    assert pub.metadata_raw["phase"] == "alpha"
-    assert pub.metadata_numeric["i0"] == 10.0

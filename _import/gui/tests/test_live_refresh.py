@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from queue import Queue
 from types import MethodType, SimpleNamespace
 from threading import RLock
 
@@ -732,30 +733,6 @@ def test_select_last_scan_entry_picks_last_file_row():
     assert host2.select_last_scan_entry() == -1
 
 
-def test_gi_readonly_skips_bool_so_grazing_stays_checked():
-    # Regression: making the GI group readonly during a run set readonly on
-    # the Grazing bool, which pyqtgraph renders UNCHECKED (cosmetic).  The
-    # readonly toggle must skip bool params so Grazing keeps its real state;
-    # non-bool params (th_motor) still become readonly.
-    from PySide6 import QtWidgets
-    from pyqtgraph.parametertree import Parameter
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
-
-    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    p = Parameter.create(name="GI", type="group", children=[
-        {"name": "Grazing", "type": "bool", "value": True},
-        {"name": "th_motor", "type": "list", "values": ["th", "Manual"], "value": "th"},
-    ])
-    host = SimpleNamespace()
-    host._set_parameter_readonly = MethodType(
-        imageWrangler._set_parameter_readonly, host)
-
-    host._set_parameter_readonly(p, True)
-    assert p.child("Grazing").value() is True            # value preserved
-    assert not p.child("Grazing").opts.get("readonly")   # bool NOT made readonly
-    assert p.child("th_motor").opts.get("readonly") is True   # non-bool is
-
-
 def test_metadata_panel_populates_when_layout_reparented():
     # Regression: the host installs only metadataWidget.layout into its
     # metaFrame, so the metadataWidget QWidget itself is never shown and
@@ -1078,6 +1055,32 @@ def test_wrangler_thread_no_longer_owns_integration_executor():
     assert not hasattr(wranglerThread, "_get_executor")
     assert not hasattr(wranglerThread, "_shutdown_executor")
     assert not hasattr(wranglerThread, "_parallel_integrate")
+
+
+def test_wrangler_thread_reuses_reduction_session_by_key():
+    """Reducer sessions persist across chunks but reset when policy changes."""
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+
+    class _Session:
+        def __init__(self):
+            self.finished = False
+
+        def finish(self):
+            self.finished = True
+            return None
+
+    thread = wranglerThread(Queue(), {}, "scan.nxs", None)
+    first = thread._get_reduction_session(("scan", 4), _Session)
+    second = thread._get_reduction_session(("scan", 4), _Session)
+    third = thread._get_reduction_session(("scan", 2), _Session)
+
+    try:
+        assert first is second
+        assert third is not first
+        assert first.finished
+        assert not third.finished
+    finally:
+        thread._close_reduction_session()
 
 
 def _scout_host(motor):
@@ -2374,84 +2377,6 @@ def test_wrangler_expands_active_groups_on_startup():
     assert "expanded" not in bgg.opts
 
 
-def test_image_wrangler_group_expansion_drives_hidden_toggles():
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
-
-    class _P:
-        def __init__(self, value=None, children=None):
-            self._value = value
-            self._children = children or {}
-
-        def value(self):
-            return self._value
-
-        def setValue(self, value):
-            self._value = bool(value)
-
-        def child(self, *path):
-            node = self
-            for name in path:
-                node = node._children[name]
-            return node
-
-    gi = _P(children={"Grazing": _P(False)})
-    mask = _P(children={"Threshold": _P(False)})
-    root = _P(children={"GI": gi, "Mask": mask})
-    host = SimpleNamespace(parameters=root)
-    host._set_hidden_toggle_value = MethodType(
-        imageWrangler._set_hidden_toggle_value, host,
-    )
-    host._sync_group_toggles = MethodType(
-        imageWrangler._sync_group_toggles, host,
-    )
-
-    host._sync_group_toggles(root, [(gi, "options", {"expanded": True})])
-    assert gi.child("Grazing").value() is True
-    assert mask.child("Threshold").value() is False
-
-    host._sync_group_toggles(root, [(mask, "options", {"expanded": True})])
-    assert mask.child("Threshold").value() is True
-
-    host._sync_group_toggles(root, [(gi, "options", {"expanded": False})])
-    assert gi.child("Grazing").value() is False
-
-
-def test_nexus_wrangler_group_expansion_drives_hidden_gi_toggle():
-    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler import nexusWrangler
-
-    class _P:
-        def __init__(self, value=None, children=None):
-            self._value = value
-            self._children = children or {}
-
-        def value(self):
-            return self._value
-
-        def setValue(self, value):
-            self._value = bool(value)
-
-        def child(self, *path):
-            node = self
-            for name in path:
-                node = node._children[name]
-            return node
-
-    gi = _P(children={"Grazing": _P(False)})
-    root = _P(children={"GI": gi})
-    host = SimpleNamespace(parameters=root)
-    host._set_hidden_toggle_value = MethodType(
-        nexusWrangler._set_hidden_toggle_value, host,
-    )
-    host._sync_group_toggles = MethodType(
-        nexusWrangler._sync_group_toggles, host,
-    )
-
-    host._sync_group_toggles(root, [(gi, "options", {"expanded": True})])
-    assert gi.child("Grazing").value() is True
-    host._sync_group_toggles(root, [(gi, "options", {"expanded": False})])
-    assert gi.child("Grazing").value() is False
-
-
 def test_frames_panel_width_relaxes_in_nexus_mode_and_restores():
     # P3 #7: the Frames (listData) max width is 60 px in the .ui (right for
     # frame indices) but clips NeXus dataset labels.  It must relax in NeXus
@@ -3667,14 +3592,6 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
             integration_calls.append((enabled, kwargs)),
             setattr(host, "_integration_controls_enabled", enabled),
         ),
-        _set_gi_controls_readonly=lambda readonly: setattr(
-            host, "_gi_readonly", readonly,
-        ),
-        # #72: enabled() now locks the whole tree via _set_tree_readonly; record
-        # the requested state instead of walking a real ParameterTree.
-        _set_tree_readonly=lambda readonly: setattr(
-            host, "_tree_readonly", readonly,
-        ),
     )
     host._on_mode_changed = MethodType(imageWrangler._on_mode_changed, host)
     host.start = MethodType(imageWrangler.start, host)
@@ -3766,8 +3683,7 @@ def test_active_live_run_disables_batch_but_keeps_live_clickable():
     assert host.ui.startButton.isEnabled() is False
     assert host.ui.liveCheckBox.isEnabled() is True
     assert host.ui.batchCheckBox.isEnabled() is False
-    assert host.tree.isEnabled() is True
-    assert host._tree_readonly is True
+    assert host.tree.isEnabled() is False
     assert host.ui.processingModeCombo.isEnabled() is False
     assert host.ui.maxCoresSpinBox.isEnabled() is False
     assert host.ui.advancedButton.isEnabled() is False
@@ -3785,61 +3701,17 @@ def test_active_non_live_run_disables_live_and_batch():
     assert host.ui.startButton.isEnabled() is False
     assert host.ui.liveCheckBox.isEnabled() is False
     assert host.ui.batchCheckBox.isEnabled() is False
-    assert host.tree.isEnabled() is True
-    assert host._tree_readonly is True
+    assert host.tree.isEnabled() is False
 
 
-def test_active_run_locks_parameter_tree_without_disabling_widget():
+def test_active_run_disables_parameter_tree():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=False, batch=False)
 
     imageWrangler.enabled(host, False)
 
-    assert host.tree.isEnabled() is True
-    assert host._tree_readonly is True
-
-
-def test_set_parameter_readonly_skips_bools_disables_actions():
-    """The whole-tree run lock (#72) on a REAL ParameterTree must: make value
-    params read-only, DISABLE action (Browse) params, and SKIP bool params —
-    disabling a pyqtgraph bool repaints it unchecked (the #56 Grazing
-    regression).  Bool VALUES must be preserved throughout."""
-    from PySide6 import QtWidgets
-    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    from pyqtgraph.parametertree import Parameter
-    from xdart.gui.gui_utils import NamedActionParameter
-    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerWidget
-
-    params = Parameter.create(name='root', type='group', children=[
-        {'name': 'grp', 'type': 'group', 'children': [
-            {'name': 'val', 'type': 'str', 'value': 'x'},
-            {'name': 'flag', 'type': 'bool', 'value': True},
-            # list/combo params ignore readonly in pyqtgraph — must be disabled.
-            {'name': 'pick', 'type': 'list', 'values': ['a', 'b'], 'value': 'a'},
-            NamedActionParameter(name='browse', title='Browse...'),
-        ]},
-    ])
-    host = SimpleNamespace()
-    host._set_parameter_readonly = MethodType(
-        wranglerWidget._set_parameter_readonly, host)
-
-    host._set_parameter_readonly(params, True)            # lock (run active)
-    grp = params.child('grp')
-    assert grp.child('val').opts.get('enabled') is False       # value leaf disabled
-    assert grp.child('pick').opts.get('enabled') is False      # list leaf disabled
-    assert grp.child('browse').opts.get('enabled') is False    # action disabled
-    assert grp.opts.get('enabled') is not False                # GROUP never disabled (#56)
-    assert grp.child('flag').opts.get('readonly') is not True  # bool SKIPPED
-    assert grp.child('flag').opts.get('enabled') is not False  # bool not disabled
-    assert grp.child('flag').value() is True                   # value preserved
-    assert grp.child('pick').value() == 'a'                    # list value preserved
-
-    host._set_parameter_readonly(params, False)           # unlock (run finished)
-    assert grp.child('val').opts.get('enabled') is True
-    assert grp.child('pick').opts.get('enabled') is True
-    assert grp.child('browse').opts.get('enabled') is True
-    assert grp.child('flag').value() is True
+    assert host.tree.isEnabled() is False
 
 
 def test_wrangler_enabled_restore_unlocks_tree_and_nonparam_widgets():
@@ -3847,13 +3719,11 @@ def test_wrangler_enabled_restore_unlocks_tree_and_nonparam_widgets():
 
     host = _wrangler_host("Int 2D", live=True, batch=True)
     imageWrangler.enabled(host, False)
-    assert host.tree.isEnabled() is True
-    assert host._tree_readonly is True
+    assert host.tree.isEnabled() is False
     assert host.ui.processingModeCombo.isEnabled() is False
 
     imageWrangler.enabled(host, True)
     assert host.tree.isEnabled() is True
-    assert host._tree_readonly is False
     assert host.ui.processingModeCombo.isEnabled() is True
     assert host.ui.advancedButton.isEnabled() is True
     # batch=True host → _on_mode_changed re-enables the Cores widgets.
@@ -3872,11 +3742,8 @@ def test_nexus_wrangler_enabled_locks_whole_panel_keeps_stop():
         coresLabel=_FakeControl(),
         tree=_FakeControl(),
     )
-    host._set_tree_readonly = lambda readonly: setattr(host, "_tree_readonly", readonly)
-
     nexusWrangler.enabled(host, False)                    # run active
-    assert host.tree.isEnabled() is True
-    assert host._tree_readonly is True
+    assert host.tree.isEnabled() is False
     assert host.startButton.isEnabled() is False
     assert host.processingModeCombo.isEnabled() is False
     assert host.maxCoresSpinBox.isEnabled() is False
@@ -3884,7 +3751,6 @@ def test_nexus_wrangler_enabled_locks_whole_panel_keeps_stop():
 
     nexusWrangler.enabled(host, True)                     # run finished
     assert host.tree.isEnabled() is True
-    assert host._tree_readonly is False
     assert host.startButton.isEnabled() is True
     assert host.processingModeCombo.isEnabled() is True
 
@@ -3909,13 +3775,10 @@ def _build_real_wrangler(cls):
     return cls("test", threading.Condition(), scan, {}, {})
 
 
-def test_real_wrangler_run_lock_covers_tree_without_checkbox_repaint():
+def test_real_wrangler_run_lock_disables_tree_and_keeps_values():
     """End-to-end on REAL wrangler instances (not injected hosts): enabled(False)
-    keeps the ParameterTree widget enabled, locks non-bool leaf params read-only/
-    disabled, disables non-param widgets, and keeps Stop enabled.  The tree
-    widget itself must not be disabled because pyqtgraph can repaint disabled
-    bool values as unchecked.  Covers both wranglers (image .ui + nexus direct
-    attrs)."""
+    disables the processing tree and non-param widgets while keeping Stop
+    enabled.  Parameter values must survive the disabled run state."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
     from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler import nexusWrangler
 
@@ -3930,11 +3793,11 @@ def test_real_wrangler_run_lock_covers_tree_without_checkbox_repaint():
 
         # ── run active ─────────────────────────────────────────────────────────
         w.enabled(False)
-        assert w.tree.isEnabled() is True
+        assert w.tree.isEnabled() is False
         assert ui.stopButton.isEnabled() is True   # Stop never disabled
         assert ui.processingModeCombo.isEnabled() is False
         assert ui.maxCoresSpinBox.isEnabled() is False
-        # Param *values* survive the lock (the #56 checkbox repaint is cosmetic only).
+        # Param *values* survive the lock.
         for p, val in bool_before:
             assert p.value() == val, f"{cls.__name__}: bool {p.name()} value changed by lock"
 

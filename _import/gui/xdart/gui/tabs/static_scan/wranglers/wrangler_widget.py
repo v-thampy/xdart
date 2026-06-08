@@ -6,7 +6,6 @@
 # Standard library imports
 import logging
 import os
-from contextlib import contextmanager
 from queue import Queue
 import threading
 import traceback
@@ -38,6 +37,17 @@ _THRESHOLD_NAN = np.float32(np.nan)
 # / live modes.  Subclasses can override per-instance via the
 # ``LIVE_SAVE_INTERVAL`` attribute if they want a different rhythm.
 _LIVE_SAVE_INTERVAL = 8
+
+
+class _CommandCancelToken:
+    """Duck-typed ssrl CancelToken bound to a wrangler thread command."""
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    @property
+    def cancelled(self):
+        return getattr(self._owner, 'command', None) == 'stop'
 
 
 class wranglerWidget(Qt.QtWidgets.QWidget):
@@ -105,57 +115,6 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         during integration.
         """
         pass
-
-    def _set_parameter_readonly(self, param, readonly):
-        """Recursively set the pyqtgraph Parameter read-only state, used to lock
-        the whole wrangler tree during a run while keeping the tree widget
-        itself enabled.
-
-        Skips ``bool`` params: pyqtgraph renders a *readonly* checkbox as
-        UNCHECKED regardless of its value (cosmetic) — the GI 'Grazing' box flip
-        regression (#56).  The value is unaffected and the run uses the
-        setup-time snapshot, so leaving the checkbox interactive is harmless and
-        it keeps showing its real state.
-
-        ``readonly`` does NOT lock every param type: pyqtgraph ignores it for
-        list/combo params and for action (Browse) params (which have no editable
-        value).  So leaf non-bool params are ALSO disabled via ``enabled`` — a
-        leaf's enabled state doesn't propagate, so its bool siblings are safe.
-        GROUP params get ``readonly`` only and are NEVER disabled: ``enabled=
-        False`` on a group propagates to its bool descendants and repaints them
-        unchecked.  (NamedActionParameter reports ``type`` None; the leaf-disable
-        covers it regardless of type.)
-        """
-        ptype = param.opts.get('type') if hasattr(param, 'opts') else None
-        try:
-            children = param.children()
-        except AttributeError:
-            children = ()
-        if ptype != 'bool':
-            try:
-                param.setOpts(readonly=readonly)
-            except (AttributeError, TypeError):
-                pass
-            # Leaf (no children) non-bool param: disable it too, so list/combo
-            # and action params (which ignore readonly) are actually locked.
-            # Never disable a group (would repaint bool descendants — #56).
-            if not children:
-                try:
-                    param.setOpts(enabled=not readonly)
-                except (AttributeError, TypeError):
-                    pass
-        for child in children:
-            self._set_parameter_readonly(child, readonly)
-
-    def _set_tree_readonly(self, readonly):
-        """Lock (``readonly=True``) or unlock the entire wrangler parameter tree
-        in one call — skip-bool, see :meth:`_set_parameter_readonly`.  Disables
-        every processing param (Calibration, Signal, GI, Threshold, Background,
-        save path, Cores-as-param, …) during a run without disabling the tree
-        widget (which would repaint the bool checkboxes)."""
-        params = getattr(self, 'parameters', None)
-        if params is not None:
-            self._set_parameter_readonly(params, readonly)
 
     def setup(self):
         """Sets the thread child object. Called by tthetaWidget prior
@@ -272,12 +231,58 @@ class wranglerThread(Qt.QtCore.QThread):
         self.batch_mode = False
         self.xye_only = False
         self.max_cores = 1
+        self._reduction_session = None
+        self._reduction_session_key = None
 
     def run(self):
         """Main task. Subclasses (e.g. imageThread) override this."""
         pass
 
     # ── Shared batch helpers ────────────────────────────────────────
+
+    def _cancel_token(self):
+        return _CommandCancelToken(self)
+
+    def _get_reduction_session(self, key, factory):
+        """Return the persistent headless reduction session for *key*.
+
+        The session owns the executor and per-thread pyFAI integrators for the
+        scan/run lifetime.  The caller supplies a key that includes scan identity
+        and execution policy; changing either closes the old session and opens a
+        fresh one from the provided factory.
+        """
+        if self._reduction_session is not None and self._reduction_session_key == key:
+            return self._reduction_session
+
+        self._close_reduction_session()
+        self._reduction_session = factory()
+        self._reduction_session_key = key
+        return self._reduction_session
+
+    def _reduction_session_key_for(self, scan, plan, n_workers):
+        try:
+            n_workers = int(n_workers or 1)
+        except (TypeError, ValueError):
+            n_workers = 1
+        return (
+            id(scan),
+            str(getattr(scan, "name", "scan")),
+            str(getattr(scan, "data_file", "")),
+            max(1, n_workers),
+            bool(getattr(scan, "gi", False)),
+            bool(getattr(scan, "skip_2d", False)),
+            id(plan),
+        )
+
+    def _close_reduction_session(self):
+        session = self._reduction_session
+        self._reduction_session = None
+        self._reduction_session_key = None
+        if session is not None:
+            try:
+                session.finish()
+            except Exception:
+                logger.debug("failed to close reduction session", exc_info=True)
 
     def _resolve_frame_mask(self, scan, img_data):
         """Return a stable per-scan "bad pixel" mask cached on the scan.
@@ -314,64 +319,6 @@ class wranglerThread(Qt.QtCore.QThread):
                 cached = None
             scan._cached_data_mask = cached
         return cached
-
-    @staticmethod
-    @contextmanager
-    def _borrow_fiber_integrator(scan, fiber_pool, frame,
-                                 *, angle_tol: float = 1e-4):
-        """H2 fiber-integrator borrow.
-
-        Yields a :class:`FiberIntegrator` for this frame's incidence
-        angle, with the following preference order:
-
-        1. **Borrow from pool** when the angle matches the prewarmed
-           cache (within ``angle_tol`` degrees) — workers get their
-           own deepcopy, no CSR-buffer races.  Most common path for
-           sin²ψ / fixed-ω scans.
-        2. **Build worker-local** when angle differs — slower
-           ``promote("FiberIntegrator")`` call but only on
-           ω-varying scans, and only for frames that drift.  No
-           shared state, so thread-safe by construction.
-        3. **Yield None** when GI isn't enabled at all — the frame
-           integrators ignore the ``fiber_integrator`` kwarg in
-           that case.
-
-        Yielded values that came from the pool are returned to the
-        pool on context exit (pool members are reused by subsequent
-        frames).  Worker-local fi instances become garbage at exit.
-        """
-        # Local import: ssrl_xrd_tools.integrate.gid pulls pyFAI; we
-        # don't want to drag that into every test that constructs a
-        # wranglerThread for unrelated reasons.
-        gi = bool(getattr(frame, "gi", False))
-        if not gi:
-            yield None
-            return
-        cached_angle = getattr(scan, "_cached_fiber_integrator_angle", None)
-        # gi is True here (returned early otherwise), so an unresolved
-        # incidence is a real configuration error — re-raise it so the
-        # worker's integration fails fast instead of silently building a
-        # degenerate 0° fiber integrator (blank cake).  The wrangler
-        # surfaces "set Manual theta".
-        try:
-            frame_angle = frame._get_incident_angle()
-        except (AttributeError, ValueError):
-            frame_angle = None
-        if (fiber_pool is not None and cached_angle is not None
-                and frame_angle is not None
-                and abs(frame_angle - cached_angle) < angle_tol):
-            with fiber_pool.borrow() as fi:
-                yield fi
-        else:
-            from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
-            fi = create_fiber_integrator(
-                frame._poni_from_integrator(),
-                incident_angle=frame_angle if frame_angle is not None else 0.0,
-                tilt_angle=frame.tilt_angle,
-                sample_orientation=frame.sample_orientation,
-                angle_unit="deg",
-            )
-            yield fi
 
     def _prewarm_frame_mask(self, scan, img_data) -> None:
         """Populate ``scan._cached_data_mask`` on the main thread.

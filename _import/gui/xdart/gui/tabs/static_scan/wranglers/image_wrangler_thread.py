@@ -31,13 +31,9 @@ from pyqtgraph import Qt
 
 # Project imports
 from xdart.modules.live import LiveFrame, LiveScan, IncidenceAngleUnresolved
-from ssrl_xrd_tools.integrate.gid import (
-    create_fiber_integrator,
-    freeze_common_axes_2d,
-    freeze_common_axis,
-    gi_1d_output_axis_key,
-)
+from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
+from ssrl_xrd_tools.reduction import GIFreezeError
 from ssrl_xrd_tools.io.image import read_image, count_frames
 from ssrl_xrd_tools.io.export import write_xye
 from ssrl_xrd_tools.io.nexus import find_nexus_image_dataset
@@ -45,6 +41,8 @@ from ssrl_xrd_tools.io.metadata import read_image_metadata
 from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
+    freeze_live_scan_gi_ranges,
+    open_live_reduction_session,
     StandardPlanCache,
     reduce_live_frames,
     sync_live_scan_gi_settings,
@@ -98,6 +96,16 @@ def _gi_2d_range_keys(args):
     return 'radial_range', 'azimuth_range'
 
 
+# RESTRUCTURE-TODO(B2): the GI-scout helpers below (_padded_axis_range,
+# _result_intensity_all_dummy, _freeze_gi_2d_ranges_from_result,
+# _freeze_gi_1d_range_from_result) plus the scout methods on imageThread
+# (_scout_pending_frames, _build_scout, _freeze_gi_1d_auto_range,
+# _freeze_gi_2d_auto_ranges) are TEST-ONLY.  Production GI common-grid freezing
+# now lives in ssrl_xrd_tools.reduction.ReductionSession; these remain only so
+# the GI live==batch==reload equivalence tests can validate the ssrl freeze
+# against the original xdart scout (the tests bind the methods via MethodType).
+# Relocate this whole cluster to a tests/ helper module together with that test
+# refactor -- it should not sit in a production module.
 def _padded_axis_range(axis, pad_fraction=0.02):
     """Return a slightly padded finite range for an integrated axis.
 
@@ -500,6 +508,7 @@ class imageThread(wranglerThread):
         try:
             self.process_scan()
         finally:
+            self._close_reduction_session()
             # Stop background prefetcher from the main thread BEFORE closing the
             # master handle.  _eiger_close_master() is called from inside the
             # prefetch worker when switching masters, so triggering a stop from
@@ -623,6 +632,7 @@ class imageThread(wranglerThread):
             # Rebuild cached AzimuthalIntegrator when poni identity changes
             if self.poni is not _cached_poni:
                 scan._cached_integrator = poni_to_integrator(self.poni)
+                scan._cached_poni = self.poni
                 scan._cached_fiber_integrator = None
                 _cached_poni = self.poni
                 self._cached_gi_incident_angle = None
@@ -727,6 +737,7 @@ class imageThread(wranglerThread):
 
                 if self.poni is not _cached_poni:
                     scan._cached_integrator = poni_to_integrator(self.poni)
+                    scan._cached_poni = self.poni
                     scan._cached_fiber_integrator = None
                     _cached_poni = self.poni
                     self._cached_gi_incident_angle = None
@@ -778,8 +789,6 @@ class imageThread(wranglerThread):
         parallel path always saves at end of batch by construction
         (the whole point of batch mode is one big save per dispatch).
         """
-        self._freeze_gi_1d_auto_range(scan, pending)
-        self._freeze_gi_2d_auto_ranges(scan, pending)
         self._maybe_warn_live_gi_clip()
         if self.batch_mode and len(pending) > 1:
             return self._dispatch_batch_parallel(scan, pending)
@@ -815,6 +824,127 @@ class imageThread(wranglerThread):
     # ``_flush_xye_buffer`` moved to wranglerThread (the base class)
     # in May 2026 — both imageThread and nexusThread inherit them now.
     # See xdart/gui/tabs/static_scan/wranglers/wrangler_widget.py.
+
+    # RESTRUCTURE-TODO(B2): _scout_pending_frames / _build_scout /
+    # _freeze_gi_1d_auto_range / _freeze_gi_2d_auto_ranges are test-only scout
+    # fixtures (see the cluster note near _padded_axis_range) -- relocate to a
+    # tests/ helper module with the GI-equivalence test refactor.
+    def _scout_pending_frames(self, pending):
+        """Return bounded representative pending entries for freeze tests.
+
+        Production no longer calls this pre-pass; GI common-grid freezing is
+        driven by :class:`ssrl_xrd_tools.reduction.ReductionSession` when the
+        reduction session opens.  The method remains as a compatibility fixture
+        for real-data tests that inspect scout selection directly.
+        """
+        if len(pending) <= 1:
+            return list(pending)
+        motor = self.incidence_motor
+        try:
+            float(motor)
+            return [pending[0]]
+        except (TypeError, ValueError):
+            pass
+        resolved = []
+        any_unresolved = False
+        for i, entry in enumerate(pending):
+            meta = entry[3] or {}
+            try:
+                resolved.append((i, float(meta.get(motor))))
+            except (TypeError, ValueError):
+                any_unresolved = True
+        idxs = set()
+        if resolved:
+            idxs.add(min(resolved, key=lambda item: item[1])[0])
+            idxs.add(max(resolved, key=lambda item: item[1])[0])
+        if any_unresolved or not resolved:
+            idxs.update((0, len(pending) - 1))
+        return [pending[i] for i in sorted(idxs)]
+
+    def _build_scout(self, scan, entry):
+        """Build a temporary ``LiveFrame`` for the headless freeze adapter."""
+        img_file, img_number, img_data, img_meta, bg_raw, _ = entry
+        img_data = self._apply_threshold_inline(img_data)
+        frame_mask = self._resolve_frame_mask(scan, img_data)
+        scratch = LiveFrame(
+            img_number, img_data, poni=self.poni,
+            scan_info=img_meta, static=True, gi=True,
+            th_mtr=self.incidence_motor, bg_raw=bg_raw,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
+            series_average=self.series_average,
+            integrator=scan._cached_integrator,
+            mask=frame_mask,
+        )
+        if img_file:
+            scratch.source_file = os.path.abspath(str(img_file))
+        if _raw_lives_in_source(img_file):
+            scratch.source_frame_idx = int(img_number) - 1
+        else:
+            scratch.source_frame_idx = 0
+        scratch._get_incident_angle()
+        return scratch
+
+    def _freeze_gi_1d_auto_range(self, scan, pending) -> None:
+        """Compatibility wrapper for tests; delegates freeze to ssrl."""
+        if not self.gi or not pending:
+            return
+        args = getattr(scan, 'bai_1d_args', None)
+        if not isinstance(args, dict):
+            return
+        key = gi_1d_output_axis_key(args.get('gi_mode_1d', 'q_total'))
+        if args.get(key) is not None:
+            return
+        sync_live_scan_gi_settings(
+            scan,
+            incidence_motor=self.incidence_motor,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
+        )
+        scouts = [self._build_scout(scan, entry)
+                  for entry in self._scout_pending_frames(pending)]
+        freeze_live_scan_gi_ranges(
+            scan,
+            scouts,
+            scan_name=str(getattr(scan, "name", "scan")),
+            global_mask=self.mask,
+            integrator=getattr(scan, "_cached_integrator", None),
+            poni=self.poni,
+            integrate_1d=True,
+            integrate_2d=False,
+            gi_freeze_mode="scout_union" if self.batch_mode else "first_frame",
+        )
+
+    def _freeze_gi_2d_auto_ranges(self, scan, pending) -> None:
+        """Compatibility wrapper for tests; delegates freeze to ssrl."""
+        if (not self.gi or self.xye_only or getattr(scan, 'skip_2d', False)
+                or not pending):
+            return
+        args = getattr(scan, 'bai_2d_args', None)
+        if not isinstance(args, dict):
+            return
+        keys = _gi_2d_range_keys(args)
+        if all(args.get(key) is not None for key in keys):
+            return
+        sync_live_scan_gi_settings(
+            scan,
+            incidence_motor=self.incidence_motor,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
+        )
+        scouts = [self._build_scout(scan, entry)
+                  for entry in self._scout_pending_frames(pending)]
+        freeze_live_scan_gi_ranges(
+            scan,
+            scouts,
+            scan_name=str(getattr(scan, "name", "scan")),
+            global_mask=self.mask,
+            integrator=getattr(scan, "_cached_integrator", None),
+            poni=self.poni,
+            integrate_1d=False,
+            integrate_2d=True,
+            gi_freeze_mode="scout_union" if self.batch_mode else "first_frame",
+        )
 
     def _dispatch_batch_serial(self, scan, pending, *, force_save=False):
         """Sequential dispatch (live mode or single-image batches).
@@ -859,233 +989,6 @@ class imageThread(wranglerThread):
             )
             self._frames_since_save = 0
         return count
-
-    def _scout_pending_frames(self, pending):
-        """Pending entries to scout for the common-grid freeze (#70): the
-        lowest- and highest-incidence frames, whose output extents bracket a
-        monotonic scan, so the unioned range covers the interior.
-
-        Picks by per-frame incidence from metadata when resolvable (handles a
-        descending / unsorted scan).  Robust to *partial* metadata: it scouts the
-        min/max of whatever incidences ARE resolvable, and additionally includes
-        the positional first + last frames whenever any incidence is unresolved
-        (so a frame whose angle we couldn't read still gets bracketed if it's an
-        end).  A numeric (Manual) incidence is identical for every frame, so one
-        scout suffices.  Bounded to ≤4 integrations — never the whole scan.
-        Adding extra scouts is always safe: the freeze takes the UNION, which can
-        only widen the range, never clip.
-        """
-        if len(pending) <= 1:
-            return list(pending)
-        motor = self.incidence_motor
-        try:
-            float(motor)          # Manual numeric incidence → all frames equal
-            return [pending[0]]
-        except (TypeError, ValueError):
-            pass
-        resolved = []             # (index, incidence) for readable frames
-        any_unresolved = False
-        for i, entry in enumerate(pending):
-            meta = entry[3] or {}
-            try:
-                resolved.append((i, float(meta.get(motor))))
-            except (TypeError, ValueError):
-                any_unresolved = True
-        idxs = set()
-        if resolved:
-            idxs.add(min(resolved, key=lambda t: t[1])[0])   # lowest incidence
-            idxs.add(max(resolved, key=lambda t: t[1])[0])   # highest incidence
-        if any_unresolved or not resolved:
-            # Partial/no metadata: add the positional ends as a safety net so
-            # frames whose incidence we couldn't read are still bracketed.
-            idxs.update((0, len(pending) - 1))
-        return [pending[i] for i in sorted(idxs)]
-
-    def _build_scout(self, scan, entry):
-        """Build + return ``(scratch_frame, fiber_integrator, incident_angle)``
-        for one scout ``entry``; the caller runs ``integrate_1d``/``integrate_2d``
-        on the frame.  Raises ``IncidenceAngleUnresolved`` if the incidence can't
-        be resolved (caller surfaces the "set Manual theta" message)."""
-        img_file, img_number, img_data, img_meta, bg_raw, _ = entry
-        img_data = self._apply_threshold_inline(img_data)
-        frame_mask = self._resolve_frame_mask(scan, img_data)
-        scratch = LiveFrame(
-            img_number, img_data, poni=self.poni,
-            scan_info=img_meta, static=True, gi=True,
-            th_mtr=self.incidence_motor, bg_raw=bg_raw,
-            sample_orientation=self.sample_orientation,
-            tilt_angle=self.tilt_angle,
-            series_average=self.series_average,
-            integrator=scan._cached_integrator,
-            mask=frame_mask,
-        )
-        incident_angle = scratch._get_incident_angle()
-        fi = create_fiber_integrator(
-            scratch._poni_from_integrator(),
-            incident_angle=incident_angle,
-            tilt_angle=scratch.tilt_angle,
-            sample_orientation=self.sample_orientation,
-            angle_unit="deg",
-        )
-        return scratch, fi, incident_angle
-
-    def _freeze_gi_1d_auto_range(self, scan, pending) -> None:
-        """Freeze the GI 1D auto output-axis range once per scan before
-        integration so every frame shares one common grid.
-
-        Scouts the lowest- AND highest-incidence frames (#70) and freezes the
-        padded UNION of their output extents via
-        :func:`ssrl_xrd_tools.integrate.gid.freeze_common_axis`.  A single
-        (frame-0) scout could clip later frames across a wide incidence span
-        (the accessible q_oop / exit-angle range shifts per frame); the union of
-        the incidence extremes covers the interior.
-
-        Runs for Int 1D (XYE) too (``xye_only``).  In the .nxs paths this is what
-        lets the stacked writer's uniform-axis validator accept the batch; in
-        ``xye_only`` mode NO .nxs is written, but the freeze still makes the
-        per-frame ``.xye`` files share one x-grid.  See ``_gi_1d_output_range_key``
-        for which arg controls the output axis per mode; an explicit user-set
-        range is honored (early return).
-
-        Scope: the union spans the whole scan only in BATCH mode, where every
-        frame is available up front.  In live mode ``pending`` is one frame at a
-        time, so the range is frozen from the FIRST live frame and reused (the
-        key is set, so later frames early-return) — a wide-incidence *live* scan
-        can still clip.  Batch is the publication path that feeds the stacked
-        writer; live is the interactive preview path.
-        """
-        if not self.gi or not pending:
-            return
-        args = getattr(scan, 'bai_1d_args', None)
-        if not isinstance(args, dict):
-            return
-        gi_mode_1d = args.get('gi_mode_1d', 'q_total')
-        if args.get(gi_1d_output_axis_key(gi_mode_1d)) is not None:
-            return
-
-        scouts = self._scout_pending_frames(pending)
-        results = []
-        try:
-            for entry in scouts:
-                scratch, fi, _inc = self._build_scout(scan, entry)
-                scratch.integrate_1d(
-                    global_mask=self.mask, fiber_integrator=fi, **dict(args))
-                result = getattr(scratch, 'int_1d', None)
-                if result is not None:
-                    results.append(result)
-        except IncidenceAngleUnresolved as exc:
-            self.showLabel.emit(
-                'GI 1D needs an incidence angle: set Theta Motor to Manual '
-                'and enter the angle.'
-            )
-            logger.warning('GI 1D auto-range scout skipped: %s', exc)
-            return
-        except Exception:
-            # Range left unfrozen → per-frame auto-range, which the stacked
-            # writer may then reject; warn (not debug) so it's visible.
-            logger.warning(
-                'GI 1D auto-range scout failed; continuing with current range',
-                exc_info=True,
-            )
-            return
-        if not results:
-            return
-        key, rng = freeze_common_axis(results, gi_mode_1d=gi_mode_1d)
-        if rng is not None:
-            args[key] = rng
-            logger.debug(
-                'GI 1D auto output range frozen from %d scout(s) (mode=%s): '
-                '%s=%s', len(results), gi_mode_1d, key, rng,
-            )
-
-    def _freeze_gi_2d_auto_ranges(self, scan, pending) -> None:
-        """Freeze GI 2D auto ranges once per scan before integration.
-
-        pyFAI's GI auto-range is per-frame, so an angle-dependence scan returns
-        each frame on a different qip/qoop or q/chi grid, which the stacked NeXus
-        writer correctly rejects.  Scouts the lowest- AND highest-incidence
-        frames (#70) and freezes the padded UNION of their extents via
-        :func:`ssrl_xrd_tools.integrate.gid.freeze_common_axes_2d`, so the common
-        grid covers every frame's accessible range (a single frame-0 scout could
-        clip later frames across a wide incidence span).  An explicit user-set
-        range is honored (only missing keys are frozen).
-        """
-        if (not self.gi or self.xye_only or getattr(scan, 'skip_2d', False)
-                or not pending):
-            return
-        args = getattr(scan, 'bai_2d_args', None)
-        if not isinstance(args, dict):
-            return
-        gi_mode_2d = args.get('gi_mode_2d', 'qip_qoop')
-        keys = _gi_2d_range_keys(args)
-        if all(args.get(key) is not None for key in keys):
-            return
-
-        scouts = self._scout_pending_frames(pending)
-        results = []
-        last_inc = None
-        try:
-            for entry in scouts:
-                scratch, fi, last_inc = self._build_scout(scan, entry)
-                scratch.integrate_2d(
-                    global_mask=self.mask, fiber_integrator=fi, **dict(args))
-                result = getattr(scratch, 'int_2d', None)
-                if result is None:
-                    continue
-                if _result_intensity_all_dummy(result):
-                    # Blank scout (almost always a degenerate incidence) — skip
-                    # it; if EVERY scout is blank we surface the fix below.
-                    logger.warning(
-                        'GI 2D scout frame %s all-dummy at incidence %g°; '
-                        'skipped', entry[1], last_inc,
-                    )
-                    continue
-                results.append(result)
-        except IncidenceAngleUnresolved as exc:
-            self.showLabel.emit(
-                'GI 2D needs an incidence angle: set Theta Motor to Manual '
-                'and enter the angle.'
-            )
-            logger.warning('GI 2D auto-range scout skipped: %s', exc)
-            return
-        except Exception:
-            # Ranges left unfrozen → per-frame auto-range, which the stacked
-            # writer may then reject; warn (not debug) so it's visible.
-            logger.warning(
-                'GI 2D auto-range scout failed; continuing with current ranges',
-                exc_info=True,
-            )
-            return
-        if not results:
-            # Every scout came back blank — freezing off it would propagate an
-            # empty cake to the whole scan; surface the fix, leave unfrozen.
-            self.showLabel.emit(
-                'GI 2D scout frame is blank (no signal); check the incidence '
-                'angle / Theta Motor.'
-            )
-            return
-        frozen = freeze_common_axes_2d(results, gi_mode_2d=gi_mode_2d)
-        for key, rng in frozen.items():
-            if args.get(key) is None:
-                args[key] = rng
-        if frozen:
-            logger.debug(
-                'GI 2D auto ranges frozen from %d scout(s): %s',
-                len(results), frozen,
-            )
-        # A still-None key after a successful scout means the union grid was
-        # degenerate (collapsed axis) — surface it rather than letting per-frame
-        # auto-range produce a non-uniform stack the writer will reject.
-        if any(args.get(key) is None for key in keys):
-            self.showLabel.emit(
-                'GI 2D scout produced a degenerate grid (incidence '
-                f'{last_inc:g}°). Set Theta Motor to Manual and '
-                'enter the incidence angle.'
-            )
-            logger.warning(
-                'GI 2D scout grid degenerate at incidence %g°; ranges left '
-                'unfrozen', last_inc,
-            )
 
     def _dispatch_batch_parallel(self, scan, pending):
         """Batch processing through the headless reduction executor.
@@ -1155,16 +1058,65 @@ class imageThread(wranglerThread):
         # ── Phase 1: headless parallel integration ───────────────────────────
         self.showLabel.emit(f'Integrating {len(frames)} images ({n_workers} workers)...')
         _t_phase1 = time.time()
-        frames = reduce_live_frames(
-            frames,
-            standard_plan,
-            scan_name=str(getattr(scan, "name", "scan")),
-            global_mask=mask,
-            integrator=scan._cached_integrator,
-            poni=self.poni,
-            executor=n_workers,
-            chunk_size=len(frames) if frames else 1,
+        executor = n_workers if n_workers > 1 else None
+        cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
+        gi_freeze_mode = getattr(
+            self,
+            "gi_freeze_mode",
+            "scout_union" if self.gi else None,
         )
+
+        def _session_factory():
+            return open_live_reduction_session(
+                frames,
+                standard_plan,
+                scan_name=str(getattr(scan, "name", "scan")),
+                global_mask=mask,
+                integrator=scan._cached_integrator,
+                poni=self.poni,
+                executor=executor,
+                cancel_token=cancel_token,
+                chunk_size=len(frames) if frames else 1,
+                gi_freeze_mode=gi_freeze_mode,
+            )
+
+        session_getter = getattr(self, "_get_reduction_session", None)
+        close_session = not callable(session_getter)
+        try:
+            if close_session:
+                session = _session_factory()
+            else:
+                session = session_getter(
+                    self._reduction_session_key_for(scan, standard_plan, n_workers),
+                    _session_factory,
+                )
+        except GIFreezeError as exc:
+            # The GI freeze pre-pass scouts the grid when the session is built;
+            # a blank/degenerate scout raises here.  Surface the fix and skip
+            # this batch rather than aborting the run with an opaque traceback.
+            self.showLabel.emit(
+                'GI 2D scout frame is blank or the grid is degenerate: set '
+                'Theta Motor to Manual and enter the incident angle, or check '
+                'the mask / threshold.'
+            )
+            logger.warning('GI freeze scout failed for batch: %s', exc)
+            return 0
+        try:
+            frames = reduce_live_frames(
+                frames,
+                standard_plan,
+                scan_name=str(getattr(scan, "name", "scan")),
+                global_mask=mask,
+                integrator=scan._cached_integrator,
+                poni=self.poni,
+                session=session,
+                cancel_token=cancel_token,
+                chunk_size=len(frames) if frames else 1,
+                gi_freeze_mode=gi_freeze_mode,
+            )
+        finally:
+            if close_session:
+                session.finish()
         for frame in frames:
             frame.integrator = scan._cached_integrator
             try:
@@ -1261,7 +1213,7 @@ class imageThread(wranglerThread):
 
         if self.gi:
             try:
-                _incident_angle = frame._get_incident_angle()
+                frame._get_incident_angle()
             except IncidenceAngleUnresolved as exc:
                 # Refuse to integrate GI at a degenerate 0°.  Surface the
                 # fix and skip the frame rather than emit a blank cake.
@@ -1271,16 +1223,6 @@ class imageThread(wranglerThread):
                 )
                 logger.warning('Skipping GI frame %s: %s', img_file, exc)
                 return
-            if (scan._cached_fiber_integrator is None
-                    or _incident_angle != self._cached_gi_incident_angle):
-                scan._cached_fiber_integrator = create_fiber_integrator(
-                    frame._poni_from_integrator(),
-                    incident_angle=_incident_angle,
-                    tilt_angle=frame.tilt_angle,
-                    sample_orientation=self.sample_orientation,
-                    angle_unit="deg",
-                )
-                self._cached_gi_incident_angle = _incident_angle
 
         _t2 = time.time()
         sync_live_scan_gi_settings(
@@ -1290,15 +1232,58 @@ class imageThread(wranglerThread):
             tilt_angle=self.tilt_angle,
         )
 
-        reduce_live_frames(
-            [frame],
-            self._plan_cache.get(scan, integrate_2d=not scan.skip_2d),
-            scan_name=str(getattr(scan, "name", "scan")),
-            global_mask=self.mask,
-            integrator=scan._cached_integrator,
-            poni=self.poni,
-            chunk_size=1,
-        )
+        plan = self._plan_cache.get(scan, integrate_2d=not scan.skip_2d)
+        cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
+
+        def _session_factory():
+            return open_live_reduction_session(
+                [frame],
+                plan,
+                scan_name=str(getattr(scan, "name", "scan")),
+                global_mask=self.mask,
+                integrator=scan._cached_integrator,
+                poni=self.poni,
+                cancel_token=cancel_token,
+                chunk_size=1,
+                gi_freeze_mode="first_frame" if self.gi else None,
+            )
+
+        session_getter = getattr(self, "_get_reduction_session", None)
+        close_session = not callable(session_getter)
+        try:
+            if close_session:
+                session = _session_factory()
+            else:
+                session = session_getter(
+                    self._reduction_session_key_for(scan, plan, 1),
+                    _session_factory,
+                )
+        except GIFreezeError as exc:
+            # Blank/degenerate GI scout (raised while building the session).
+            # Mirror the IncidenceAngleUnresolved guidance and skip the frame.
+            self.showLabel.emit(
+                'GI 2D scout frame is blank or the grid is degenerate: set '
+                'Theta Motor to Manual and enter the incident angle, or check '
+                'the mask / threshold.'
+            )
+            logger.warning('GI freeze scout failed for frame: %s', exc)
+            return
+        try:
+            reduce_live_frames(
+                [frame],
+                plan,
+                scan_name=str(getattr(scan, "name", "scan")),
+                global_mask=self.mask,
+                integrator=scan._cached_integrator,
+                poni=self.poni,
+                session=session,
+                cancel_token=cancel_token,
+                chunk_size=1,
+                gi_freeze_mode="first_frame" if self.gi else None,
+            )
+        finally:
+            if close_session:
+                session.finish()
         # Timing kept for parity with the legacy logging; the
         # standard path now does both 1D + 2D in one call so we
         # bundle the total under _t_1d.

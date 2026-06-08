@@ -2,30 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from ssrl_xrd_tools.core import FrameGeometry, FrameView, SourceCapabilities, SourceKind
+from ssrl_xrd_tools.core import FrameGeometry, SourceCapabilities, SourceKind
 from ssrl_xrd_tools.core.scan import Scan, ScanFrame
-from ssrl_xrd_tools.reduction import (
-    CompositeSink,
-    NexusSink,
-    ReductionPlan,
-    ReductionResult,
-    ReductionSink,
-    XYESink,
-    run_reduction,
-)
-
-from xdart.modules.frame_publication import (
-    FramePublication,
-    publication_from_frame_view,
-)
-from xdart.modules.reduction import plan_from_live_scan
 
 
 class LiveScanFrameSource:
@@ -136,150 +120,12 @@ class LiveScanFrameSource:
         )
 
 
-@dataclass(slots=True)
-class HeadlessRawRef:
-    """Display-compatible raw reference around a headless ``ScanFrame``."""
-
-    frame: ScanFrame
-
-    @property
-    def map_raw(self):
-        return self.frame.image
-
-    @property
-    def bg_raw(self):
-        return self.frame.background
-
-    @property
-    def mask(self):
-        return self.frame.mask
-
-    @property
-    def thumbnail(self):
-        return None
-
-
-@dataclass(slots=True)
-class PublicationSink:
-    """Reduction sink that publishes FramePublication snapshots."""
-
-    callback: Callable[[FramePublication], None]
-    generation: int = 0
-    validate: bool = True
-    _scan_name: str = field(default="", init=False, repr=False)
-
-    def begin(self, scan: Scan, plan: ReductionPlan) -> None:
-        self._scan_name = scan.name
-
-    def write(self, frame: ScanFrame, reduction) -> None:
-        raw = None if frame.image is None else np.asarray(frame.image)
-        view = FrameView.from_results(
-            label=int(frame.index),
-            result_1d=reduction.result_1d,
-            result_2d=reduction.result_2d,
-            raw=raw,
-            metadata_raw=reduction.metadata,
-            metadata_numeric=dict(getattr(frame, "metadata_numeric", {}) or {}),
-            source_path=None if frame.source_path is None else str(frame.source_path),
-            source_frame_index=frame.source_frame_index,
-        )
-        publication = publication_from_frame_view(
-            view,
-            generation=self.generation,
-            source_identity=f"{self._scan_name}:{frame.index}",
-            raw_ref=HeadlessRawRef(frame),
-            raw_status=("ready" if raw is not None else "lazy"),
-            validate=self.validate,
-        )
-        self.callback(publication)
-
-    def finish(self, result: ReductionResult) -> None:
-        return None
-
-
-@dataclass(slots=True)
-class ReductionJob:
-    """A complete xdart-to-ssrl reduction call description."""
-
-    source: LiveScanFrameSource
-    plan: ReductionPlan
-    sink: ReductionSink
-    chunk_size: int = 1
-    clear_frame_images: bool = False
-    run_kwargs: dict[str, Any] = field(default_factory=dict)
-
-    def run(self) -> ReductionResult:
-        return run_reduction(
-            self.plan,
-            self.source,
-            self.sink,
-            chunk_size=self.chunk_size,
-            clear_frame_images=self.clear_frame_images,
-            **self.run_kwargs,
-        )
-
-
 def source_from_live_scan(
     live_scan: Any,
     *,
     frame_indices: Iterable[int] | None = None,
 ) -> LiveScanFrameSource:
     return LiveScanFrameSource(live_scan, frame_indices=frame_indices)
-
-
-def build_reduction_job(
-    live_scan: Any,
-    *,
-    frame_indices: Iterable[int] | None = None,
-    integrate_1d: bool = True,
-    integrate_2d: bool | None = None,
-    sinks: Iterable[ReductionSink] | None = None,
-    publish: Callable[[FramePublication], None] | None = None,
-    output_nexus: str | Path | None = None,
-    output_xye: str | Path | None = None,
-    chunk_size: int = 1,
-    clear_frame_images: bool = True,
-    **run_kwargs: Any,
-) -> ReductionJob:
-    """Build the architecture-v2 reduction job for a live scan.
-
-    RESTRUCTURE-TODO(WS-X1): image/nexus/live/reintegrate compute paths now
-    call the headless reducer through ``reduce_live_frames``.  Promote the
-    wrangler threads themselves to build and run ``ReductionJob`` directly
-    once save/progress/cancel semantics are represented entirely as sinks.
-    """
-
-    source = LiveScanFrameSource(live_scan, frame_indices=frame_indices)
-    plan = plan_from_live_scan(
-        live_scan,
-        integrate_1d=integrate_1d,
-        integrate_2d=integrate_2d,
-        gi_incident_angle=_safe_first_incident_angle(live_scan, source.frame_indices),
-    )
-    sink_list: list[ReductionSink] = list(sinks or [])
-    if publish is not None:
-        sink_list.append(PublicationSink(publish))
-    if output_nexus is not None:
-        sink_list.append(NexusSink(output_nexus, overwrite=True))
-    if output_xye is not None:
-        sink_list.append(XYESink(output_xye))
-    sink: ReductionSink
-    if not sink_list:
-        from ssrl_xrd_tools.reduction import MemorySink
-
-        sink = MemorySink()
-    elif len(sink_list) == 1:
-        sink = sink_list[0]
-    else:
-        sink = CompositeSink(tuple(sink_list))
-    return ReductionJob(
-        source=source,
-        plan=plan,
-        sink=sink,
-        chunk_size=chunk_size,
-        clear_frame_images=clear_frame_images,
-        run_kwargs=run_kwargs,
-    )
 
 
 def _resolved_source_path(frame: Any) -> Path | None:
@@ -341,19 +187,7 @@ def _frame_geometry(frame: Any) -> FrameGeometry | None:
     return FrameGeometry(incident_angle=incident) if incident is not None else None
 
 
-def _safe_first_incident_angle(live_scan: Any, labels: list[int]) -> float | None:
-    if not getattr(live_scan, "gi", False) or not labels:
-        return None
-    try:
-        return float(live_scan.frames[int(labels[0])]._get_incident_angle())
-    except Exception:
-        return None
-
-
 __all__ = [
     "LiveScanFrameSource",
-    "PublicationSink",
-    "ReductionJob",
-    "build_reduction_job",
     "source_from_live_scan",
 ]

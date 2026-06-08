@@ -489,6 +489,36 @@ def test_reduce_live_frames_uses_one_headless_batch(monkeypatch) -> None:
     assert frames[1].map_norm == 4.0
 
 
+def test_reduce_live_frames_skips_missing_results(monkeypatch) -> None:
+    frames = [
+        LiveFrame(idx=1, map_raw=np.ones((2, 2)), poni=_poni()),
+        LiveFrame(idx=2, map_raw=np.full((2, 2), 2.0), poni=_poni()),
+    ]
+    plan = ReductionPlan(integration_1d=Integration1DPlan(), integration_2d=None)
+
+    def fake_run_reduction(plan_arg, scan_arg, **kwargs):
+        return ReductionResult(
+            scan_name=scan_arg.name,
+            frames={
+                1: FrameReduction(
+                    1,
+                    result_1d=_r1d(),
+                    result_2d=None,
+                )
+            },
+            n_processed=1,
+            cancelled=True,
+        )
+
+    monkeypatch.setattr(reduction_adapters, "run_reduction", fake_run_reduction)
+
+    out = reduce_live_frames(frames, plan, scan_name="scan")
+
+    assert out == [frames[0]]
+    assert frames[0].int_1d is not None
+    assert frames[1].int_1d is None
+
+
 def test_mask_conversion_ignores_incompatible_mask() -> None:
     """A matching mask is applied; a shape-incompatible mask is ignored
     (plan.mask is None) with a warning rather than raising — reducing
@@ -618,6 +648,9 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
         _xye_lock=RLock(),
         _xye_buffer=[],
         _plan_cache=StandardPlanCache(),
+        _reduction_session_key_for=lambda *_args: ("scan", 1),
+        _get_reduction_session=lambda _key, _factory: object(),
+        _cancel_token=lambda: None,
     )
 
     image_wrangler_thread.imageThread._process_one(
