@@ -159,7 +159,7 @@ class _DuckSphere:
     """Minimal duck-typed LiveScan."""
 
     def __init__(self, frames, *, scan_data=None, geometry=None,
-                 global_mask=None, gi=False):
+                 global_mask=None, gi=False, skip_2d=False):
         self.frames = _DuckArches(frames)
         self.scan_data = scan_data if scan_data is not None else pd.DataFrame()
         self.bai_1d_args = {"numpoints": N_Q}
@@ -168,6 +168,7 @@ class _DuckSphere:
         self.geometry = geometry
         self.global_mask = global_mask
         self.gi = gi
+        self.skip_2d = skip_2d
         self.stitched_1d = None
         self.stitched_2d = None
         # Stitching writes only happen with finalize=True; not exercised here.
@@ -456,6 +457,71 @@ def test_publication_validation_filters_bad_1d_without_blocking_2d(tmp_path):
         np.testing.assert_array_equal(
             f["entry/integrated_2d/frame_index"][()], [0, 1],
         )
+
+
+class _DuckArchReloadable1D(_DuckArch):
+    """1D-only frame whose raw is reloadable from source (PERF-5).
+
+    Carries no precomputed thumbnail and reports it can be skipped, mirroring
+    a real ``LiveFrame`` in a ``skip_2d`` scan whose source master resolves.
+    """
+
+    def __init__(self, idx, **kw):
+        super().__init__(idx, **kw)
+        self.thumbnail = None
+
+    def can_skip_thumbnail(self, skip_2d):
+        return bool(skip_2d)
+
+    def make_thumbnail(self, global_mask=None):  # must never be called when skipped
+        raise AssertionError(
+            "make_thumbnail called for a frame whose thumbnail should be skipped"
+        )
+
+
+def test_thumbnail_skipped_for_reloadable_1d_frames(tmp_path):
+    """PERF-5: a 1D-only (skip_2d) scan whose frames are reloadable from source
+    writes NO per-frame thumbnail (and never lazily computes one), but still
+    writes the source ref so the Image Viewer can reload the raw on demand."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    frames = [_DuckArchReloadable1D(idx=i) for i in range(2)]
+    scan = _DuckSphere(frames, skip_2d=True)
+
+    path = tmp_path / "skip2d_no_thumb.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    root = nx.nxload(str(path))
+    for i in range(2):
+        sub = root[f"entry/frames/frame_{i:04d}"]
+        # No thumbnail dataset (the make_thumbnail AssertionError also guards
+        # against a lazy save-time recompute).
+        assert "thumbnail" not in sub
+        # But the source ref is present so the viewer reloads raw on demand.
+        assert "source" in sub
+        assert "path" in sub["source"]
+        assert "frame_index" in sub["source"]
+
+
+def test_thumbnail_kept_for_2d_scan_even_if_reloadable(tmp_path):
+    """PERF-5 guard: a 2D scan (skip_2d=False) keeps the thumbnail even when the
+    frame would otherwise be reloadable — it is the 2D preview."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    frames = [_DuckArchReloadable1D(idx=i) for i in range(2)]
+    # thumbnail is None and make_thumbnail raises, so the writer must NOT try to
+    # make one — for a 2D scan can_skip_thumbnail(False) is False, so the writer
+    # would call make_thumbnail.  Give it a thumbnail so the 2D path persists it.
+    for fr in frames:
+        fr.thumbnail = np.random.default_rng(0).random((16, 16), dtype=np.float32)
+    scan = _DuckSphere(frames, skip_2d=False)
+
+    path = tmp_path / "twod_keeps_thumb.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    root = nx.nxload(str(path))
+    for i in range(2):
+        assert "thumbnail" in root[f"entry/frames/frame_{i:04d}"]
 
 
 def test_frames_group_and_thumbnails(written_nxs):

@@ -331,6 +331,25 @@ class LiveFrame():
             self.bg_raw = None
         return True
 
+    def can_skip_thumbnail(self, skip_2d: bool) -> bool:
+        """True when the per-frame 2D thumbnail can be omitted for this frame.
+
+        PERF-5: for a 1D-only scan (``skip_2d``) whose raw is losslessly
+        reloadable from source (:meth:`_lazy_load_resolvable`), the 2D
+        thumbnail preview is redundant — the Image Viewer reloads the raw on
+        demand via the per-frame source pointer
+        (``ssrl_xrd_tools.io.load_processed_raw_or_thumbnail`` tries the source
+        master *before* any stored thumbnail).  Skipping generation + storage
+        avoids the per-frame ``make_thumbnail`` cost (the dominant residual
+        cost of the lean 1D stream).  2D modes, and 1D frames with no
+        reloadable source, keep the thumbnail as their only preview — this
+        returns ``False`` for them.  The batch precompute
+        (``image_wrangler_thread._dispatch_batch_parallel``) and the writer
+        (``nexus_writer._write_per_frame_metadata``) gate on this identically,
+        so a skipped frame is never lazily re-thumbnailed at save time.
+        """
+        return bool(skip_2d) and self._lazy_load_resolvable()
+
     def _lazy_load_raw(self) -> bool:
         """Best-effort load of ``map_raw`` from the source file on disk.
 

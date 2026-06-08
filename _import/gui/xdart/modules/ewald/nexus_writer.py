@@ -984,7 +984,22 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
         fg = nx.NXcollection()
 
         thumb = getattr(frame, "thumbnail", None)
-        if thumb is None and hasattr(frame, "make_thumbnail"):
+        # PERF-5: for 1D-only (skip_2d) frames whose raw is reloadable from
+        # source, don't generate a thumbnail at save time -- the Image Viewer
+        # reloads the raw on demand via the per-frame source pointer written
+        # just below (load_processed_raw_or_thumbnail tries the source master
+        # before any stored thumbnail).  This avoids both the make_thumbnail
+        # cost and, after a raw-free, a source reload purely to build a
+        # preview.  Matches the batch precompute's frame.can_skip_thumbnail()
+        # gate so a precompute-skipped frame is never re-thumbnailed here.  A
+        # thumbnail already present (a 2D frame, or a prior reintegration) is
+        # still persisted.
+        _can_skip_thumb = (
+            thumb is None
+            and hasattr(frame, "can_skip_thumbnail")
+            and frame.can_skip_thumbnail(getattr(scan, "skip_2d", False))
+        )
+        if thumb is None and not _can_skip_thumb and hasattr(frame, "make_thumbnail"):
             try:
                 frame.make_thumbnail(global_mask=getattr(scan, "global_mask", None))
                 thumb = getattr(frame, "thumbnail", None)

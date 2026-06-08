@@ -1137,25 +1137,35 @@ class imageThread(wranglerThread):
         # was 2x serial).  Fan it out over the same worker count as the
         # integration so batch wall-time matches/beats the old engine.
         #
-        # Skip entirely in xye_only mode: there the thumbnail is never persisted
-        # (the Phase 2 HDF5 write is gated off below) and never displayed (batch
-        # is silent), so computing it is pure dead work that steals pool cycles
-        # from integration -- it was the residual reason XYE batch trailed dev.
-        # The live path (_process_one) gates make_thumbnail the same way.
-        if not self.xye_only:
-            def _precompute_thumbnail(frame):
-                frame.integrator = scan._cached_integrator
-                try:
-                    frame.make_thumbnail(global_mask=mask)
-                except Exception as e:
-                    logger.warning('Thumbnail precompute failed for image %s: %s',
-                                   frame.idx, e)
+        # Only compute thumbnails for frames that actually need a stored preview
+        # (PERF-5): skip xye_only entirely (never persisted -- Phase 2 below is
+        # gated off -- and never displayed: batch is silent), and skip 1D-only
+        # (skip_2d) frames whose raw is reloadable from source (the Image Viewer
+        # reloads the raw on demand via the per-frame source pointer).  The
+        # writer (nexus_writer._write_per_frame_metadata) gates on the SAME
+        # frame.can_skip_thumbnail() so a skipped frame is never lazily
+        # re-thumbnailed at save time.  Keep thumbnails for 2D modes and for 1D
+        # frames with no reloadable source (their only preview).
+        _skip_2d = getattr(scan, 'skip_2d', False)
+        thumb_frames = (
+            [] if self.xye_only
+            else [f for f in frames if not f.can_skip_thumbnail(_skip_2d)]
+        )
 
-            if n_workers > 1 and len(frames) > 1:
+        def _precompute_thumbnail(frame):
+            frame.integrator = scan._cached_integrator
+            try:
+                frame.make_thumbnail(global_mask=mask)
+            except Exception as e:
+                logger.warning('Thumbnail precompute failed for image %s: %s',
+                               frame.idx, e)
+
+        if thumb_frames:
+            if n_workers > 1 and len(thumb_frames) > 1:
                 with ThreadPoolExecutor(max_workers=n_workers) as _thumb_pool:
-                    list(_thumb_pool.map(_precompute_thumbnail, frames))
+                    list(_thumb_pool.map(_precompute_thumbnail, thumb_frames))
             else:
-                for frame in frames:
+                for frame in thumb_frames:
                     _precompute_thumbnail(frame)
         with self._xye_lock:
             for frame in frames:

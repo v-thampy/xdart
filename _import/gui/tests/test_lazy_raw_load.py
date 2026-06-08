@@ -541,6 +541,40 @@ class TestFreeRaw:
         np.testing.assert_allclose(a.map_raw, img.astype(np.float32))
 
 
+class TestCanSkipThumbnail:
+    """PERF-5: can_skip_thumbnail gates the 1D-only thumbnail skip — only a
+    1D-only (skip_2d) scan whose raw is losslessly reloadable from source may
+    omit the per-frame 2D thumbnail (the Image Viewer reloads raw on demand).
+    """
+
+    def test_skip_2d_reloadable_can_skip(self, tmp_path):
+        pytest.importorskip("tifffile")
+        from xdart.modules.ewald.frame import LiveFrame
+        _write_tif(tmp_path / "f.tif", shape=(8, 8))
+        a = LiveFrame(idx=0)
+        a.source_file = "f.tif"
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+        # 1D-only + reloadable -> thumbnail is redundant.
+        assert a.can_skip_thumbnail(True) is True
+        # 2D mode keeps the thumbnail even when reloadable.
+        assert a.can_skip_thumbnail(False) is False
+
+    def test_skip_2d_no_source_keeps_thumbnail(self):
+        from xdart.modules.ewald.frame import LiveFrame
+        a = LiveFrame(idx=0)
+        a.source_file = ""  # no source -> not reloadable -> only preview is the thumb
+        assert a.can_skip_thumbnail(True) is False
+
+    def test_skip_2d_missing_source_keeps_thumbnail(self, tmp_path):
+        from xdart.modules.ewald.frame import LiveFrame
+        a = LiveFrame(idx=0)
+        a.source_file = "ghost.tif"  # stamped but not on disk
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+        assert a.can_skip_thumbnail(True) is False
+
+
 class TestIntegrateTriggersLazyLoad:
     """Make sure ``integrate_1d`` / ``integrate_2d`` no longer no-op
     silently when there's a recoverable source.
