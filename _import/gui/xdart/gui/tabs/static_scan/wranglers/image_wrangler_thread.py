@@ -1193,6 +1193,16 @@ class imageThread(wranglerThread):
         if _t_xye > 0.01:
             logger.info('[BATCH] XYE flush: %d frames in %.2fs', len(frames), _t_xye)
 
+        # PERF-3: each frame is now fully consumed for this batch — integrated
+        # (Phase 1), thumbnail precomputed (Phase 1), written to .nxs
+        # (Phase 2), XYE flushed.  scan.frames keeps the frame objects for the
+        # rest of the scan, so without this their ~18 MB raw accumulates batch
+        # over batch.  free_raw releases the raw only when it's losslessly
+        # reloadable from source; a later viewer / reintegration read lazily
+        # reloads (integrate_1d/2d, _lazy_load_raw).
+        for frame in frames:
+            frame.free_raw()
+
         return len(frames)
 
     def _process_one(self, scan, img_file, img_number, img_data, img_meta,
@@ -1359,6 +1369,21 @@ class imageThread(wranglerThread):
             _t_h5_total = time.time() - _t4
             _t_h5_wait = 0.0
             _t_h5_write = _t_h5_total
+
+            # PERF-3: the stashed LiveFrame pins its ~18 MB map_raw for the
+            # whole live scan (scan.frames is never pruned), so a long run at
+            # save interval 1000 would hold ~18 GB.  Compute the thumbnail
+            # eagerly NOW — the v2 writer otherwise makes it lazily from
+            # map_raw at the interval flush (nexus_writer
+            # _write_per_frame_metadata), which after a free would have to
+            # re-read the raw from source.  make_thumbnail is idempotent +
+            # caches on frame.thumbnail, so this just relocates work already
+            # done at flush.  free_raw then drops the raw, but only when it's
+            # losslessly reloadable from source; the display copy (data_2d
+            # above) keeps its own array ref, and XYE flush + reintegration
+            # use int_1d / lazy reload, so nothing downstream blanks.
+            frame.make_thumbnail(global_mask=getattr(scan, 'global_mask', None))
+            frame.free_raw()
 
         # ── XYE buffer (flushed at end of batch by the dispatcher) ──────
         _t5 = time.time()

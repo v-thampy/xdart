@@ -302,6 +302,35 @@ class LiveFrame():
         full = self._resolved_source_path()
         return bool(full) and os.path.exists(full)
 
+    def free_raw(self) -> bool:
+        """PERF-3: drop the ~18 MB ``map_raw``/``bg_raw`` arrays to bound run RAM.
+
+        A live/batch run stashes every frame in ``scan.frames`` (and buffers
+        it for XYE) for the whole scan, so without freeing the raw, peak
+        memory grows ~18 MB per frame (≈18 GB over a long run at save
+        interval 1000).  Once a frame's thumbnail + integrated arrays are
+        computed the raw is no longer needed in memory, so drop it.
+
+        Frees **only** when the raw is losslessly recoverable from the
+        on-disk source (:meth:`_lazy_load_resolvable`) — a later viewer /
+        reintegration read transparently reloads via :meth:`_lazy_load_raw`
+        (see :meth:`integrate_1d`/:meth:`integrate_2d`).  The v2 writer never
+        persists ``map_raw`` (only the thumbnail + a source pointer), so this
+        loses nothing on disk.  Returns ``False`` (a no-op) when the source
+        isn't reloadable, so an in-memory-only frame is never silently lost.
+        Keeps ``thumbnail`` and the integrated arrays
+        (``int_1d``/``int_2d``/``gi_1d``/``gi_2d``) intact — only the raw and
+        its background are released.
+        """
+        if self.map_raw is None and self.bg_raw is None:
+            return False
+        if not self._lazy_load_resolvable():
+            return False
+        with self.frame_lock:
+            self.map_raw = None
+            self.bg_raw = None
+        return True
+
     def _lazy_load_raw(self) -> bool:
         """Best-effort load of ``map_raw`` from the source file on disk.
 

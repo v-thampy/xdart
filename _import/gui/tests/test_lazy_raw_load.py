@@ -459,6 +459,88 @@ def _load_and_return_raw(frame):
     return frame.map_raw, frame._source_root
 
 
+class TestFreeRaw:
+    """PERF-3: ``LiveFrame.free_raw`` drops map_raw/bg_raw to bound run RAM,
+    but only when the raw is losslessly recoverable from the on-disk source.
+    """
+
+    def test_frees_when_source_recoverable(self, tmp_path):
+        pytest.importorskip("tifffile")
+        from xdart.modules.ewald.frame import LiveFrame
+
+        img = _write_tif(tmp_path / "frame_0000.tif", shape=(8, 8), seed=3)
+        a = LiveFrame(idx=0)
+        a.map_raw = img.astype(np.float32)
+        a.bg_raw = np.zeros_like(a.map_raw)
+        a.source_file = "frame_0000.tif"
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+        # Stand-ins for the consumed-products that must survive the free.
+        a.thumbnail = np.ones((4, 4), dtype=np.uint8)
+        a.int_1d = "int_1d_sentinel"
+        a.int_2d = "int_2d_sentinel"
+
+        assert a.free_raw() is True
+        assert a.map_raw is None
+        assert a.bg_raw is None
+        # The consumed products are untouched.
+        assert a.thumbnail is not None
+        assert a.int_1d == "int_1d_sentinel"
+        assert a.int_2d == "int_2d_sentinel"
+
+    def test_noop_when_source_unrecoverable(self, tmp_path):
+        """In-memory-only frame (no on-disk source) must never be freed —
+        there is nothing to reload it from."""
+        from xdart.modules.ewald.frame import LiveFrame
+        a = LiveFrame(idx=0)
+        a.map_raw = np.ones((4, 4), dtype=np.float32) * 7
+        a.bg_raw = np.zeros((4, 4), dtype=np.float32)
+        a.source_file = ""  # no source → not resolvable
+        assert a.free_raw() is False
+        assert a.map_raw is not None
+        assert np.all(a.map_raw == 7)
+
+    def test_noop_when_source_file_missing(self, tmp_path):
+        """source_file stamped but the file isn't on disk → don't free
+        (the raw would be unrecoverable)."""
+        from xdart.modules.ewald.frame import LiveFrame
+        a = LiveFrame(idx=0)
+        a.map_raw = np.ones((4, 4), dtype=np.float32)
+        a.source_file = "ghost.tif"
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+        assert a.free_raw() is False
+        assert a.map_raw is not None
+
+    def test_noop_when_already_empty(self, tmp_path):
+        from xdart.modules.ewald.frame import LiveFrame
+        a = LiveFrame(idx=0)
+        a.map_raw = None
+        a.bg_raw = None
+        a.source_file = str(tmp_path / "whatever.tif")
+        assert a.free_raw() is False
+
+    def test_lazy_reload_recovers_after_free(self, tmp_path):
+        """Round-trip: free then a later read (e.g. reintegration) lazily
+        reloads the identical array from source."""
+        pytest.importorskip("tifffile")
+        from xdart.modules.ewald.frame import LiveFrame
+
+        img = _write_tif(tmp_path / "frame_0000.tif", shape=(10, 12), seed=5)
+        a = LiveFrame(idx=0)
+        a.map_raw = img.astype(np.float32)
+        a.source_file = "frame_0000.tif"
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+
+        assert a.free_raw() is True
+        assert a.map_raw is None
+        # A later consumer triggers lazy reload.
+        assert a._lazy_load_raw() is True
+        assert a.map_raw is not None
+        np.testing.assert_allclose(a.map_raw, img.astype(np.float32))
+
+
 class TestIntegrateTriggersLazyLoad:
     """Make sure ``integrate_1d`` / ``integrate_2d`` no longer no-op
     silently when there's a recoverable source.
