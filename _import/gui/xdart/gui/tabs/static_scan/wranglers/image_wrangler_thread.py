@@ -1136,20 +1136,27 @@ class imageThread(wranglerThread):
         # integration; ~17s of a 651-frame 2D batch, and the reason Int-1D batch
         # was 2x serial).  Fan it out over the same worker count as the
         # integration so batch wall-time matches/beats the old engine.
-        def _precompute_thumbnail(frame):
-            frame.integrator = scan._cached_integrator
-            try:
-                frame.make_thumbnail(global_mask=mask)
-            except Exception as e:
-                logger.warning('Thumbnail precompute failed for image %s: %s',
-                               frame.idx, e)
+        #
+        # Skip entirely in xye_only mode: there the thumbnail is never persisted
+        # (the Phase 2 HDF5 write is gated off below) and never displayed (batch
+        # is silent), so computing it is pure dead work that steals pool cycles
+        # from integration -- it was the residual reason XYE batch trailed dev.
+        # The live path (_process_one) gates make_thumbnail the same way.
+        if not self.xye_only:
+            def _precompute_thumbnail(frame):
+                frame.integrator = scan._cached_integrator
+                try:
+                    frame.make_thumbnail(global_mask=mask)
+                except Exception as e:
+                    logger.warning('Thumbnail precompute failed for image %s: %s',
+                                   frame.idx, e)
 
-        if n_workers > 1 and len(frames) > 1:
-            with ThreadPoolExecutor(max_workers=n_workers) as _thumb_pool:
-                list(_thumb_pool.map(_precompute_thumbnail, frames))
-        else:
-            for frame in frames:
-                _precompute_thumbnail(frame)
+            if n_workers > 1 and len(frames) > 1:
+                with ThreadPoolExecutor(max_workers=n_workers) as _thumb_pool:
+                    list(_thumb_pool.map(_precompute_thumbnail, frames))
+            else:
+                for frame in frames:
+                    _precompute_thumbnail(frame)
         with self._xye_lock:
             for frame in frames:
                 self._xye_buffer.append((frame.idx, frame))
