@@ -737,7 +737,15 @@ def _flat_mask_as_bool(mask: Any, shape: tuple[int, int] | None) -> np.ndarray |
     if isinstance(mask, MaskSpec):
         if shape is None:
             return None
-        return mask.to_bool(shape)
+        try:
+            return mask.to_bool(shape)
+        except ValueError as exc:
+            # A flat-index mask that doesn't fit this image (wrong
+            # detector/calibration, stale mask) makes MaskSpec.to_bool raise;
+            # match the ndarray branch below and ignore it with a warning
+            # rather than letting the ValueError kill the run thread (BUG-2).
+            logger.warning("Ignoring mask: %s", exc)
+            return None
     arr = np.asarray(mask)
     if shape is None:
         if arr.ndim == 2:

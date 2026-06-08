@@ -827,6 +827,18 @@ def test_flat_mask_out_of_bounds_is_ignored(caplog):
     assert any("out of bounds" in r.message for r in caplog.records)
 
 
+def test_maskspec_out_of_bounds_is_ignored(caplog):
+    """BUG-2: a MaskSpec whose flat indices don't fit the image makes
+    MaskSpec.to_bool raise; _flat_mask_as_bool must ignore it (None) rather
+    than let the ValueError tear down the run thread."""
+    shape = (4, 5)  # 20 pixels
+    bad = MaskSpec(np.array([0, 1, 999], dtype=np.int64))  # 999 out of range
+    with caplog.at_level("WARNING"):
+        out = reduction_adapters._flat_mask_as_bool(bad, shape)
+    assert out is None
+    assert any("Ignoring mask" in r.message for r in caplog.records)
+
+
 def test_2d_mask_shape_mismatch_is_ignored():
     shape = (4, 5)
     bad = np.ones((4, 6), dtype=bool)  # wrong width
