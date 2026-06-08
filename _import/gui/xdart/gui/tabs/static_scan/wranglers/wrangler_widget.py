@@ -37,6 +37,11 @@ _THRESHOLD_NAN = np.float32(np.nan)
 # / live modes.  Subclasses can override per-instance via the
 # ``LIVE_SAVE_INTERVAL`` attribute if they want a different rhythm.
 _LIVE_SAVE_INTERVAL = 8
+# 1D-only .nxs writes are small and cheap, so flush far less often: it is the
+# fixed per-save overhead (not per-frame compute) that made long Int-1D scans
+# crawl as the frame count grew.  2D keeps the tight default so peak RAM stays
+# bounded.  (PERF-2)
+_LIVE_SAVE_INTERVAL_1D = 500
 
 
 class _CommandCancelToken:
@@ -174,11 +179,22 @@ class wranglerThread(Qt.QtCore.QThread):
     sigUpdateFile = Qt.QtCore.Signal(str, str, bool, str, bool, bool)
     sigUpdateGI = Qt.QtCore.Signal(bool)
 
-    # Per-class override hook for save cadence — subclasses can set
-    # this to a different integer if they want saves more/less often
-    # than the default 8 frames.  Read inside _maybe_save() / the
-    # subclass's dispatch loop.
-    LIVE_SAVE_INTERVAL = _LIVE_SAVE_INTERVAL
+    # Save cadence (frames between disk flushes), mode-aware: a 1D-only run
+    # (``scan.skip_2d``) flushes every ``_LIVE_SAVE_INTERVAL_1D`` frames; a 2D
+    # run keeps the tight ``_LIVE_SAVE_INTERVAL`` for bounded RAM.  An instance
+    # may still pin a value (e.g. a test) by assigning ``LIVE_SAVE_INTERVAL``.
+    @property
+    def LIVE_SAVE_INTERVAL(self) -> int:
+        override = getattr(self, "_live_save_interval_override", None)
+        if override is not None:
+            return int(override)
+        if getattr(getattr(self, "scan", None), "skip_2d", False):
+            return _LIVE_SAVE_INTERVAL_1D
+        return _LIVE_SAVE_INTERVAL
+
+    @LIVE_SAVE_INTERVAL.setter
+    def LIVE_SAVE_INTERVAL(self, value: int) -> None:
+        self._live_save_interval_override = int(value)
 
     def __init__(self, command_queue, scan_args, fname, file_lock,
                  parent=None):

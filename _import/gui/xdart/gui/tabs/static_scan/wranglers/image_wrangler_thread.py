@@ -218,6 +218,10 @@ _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
 # integration.  Earlier value of 64 made first-batch latency painful on
 # spinning-disk source files (16-frame reads finish ~4× sooner).
 _PENDING_FLUSH_SIZE = 16
+# 1D-only batches carry no multi-MB cake arrays, so a larger pending buffer
+# (fewer, bigger parallel dispatches) is cheaper without the 2D RAM cost.  Kept
+# separate so the 2D-sized buffer is never globally raised.  (PERF-2)
+_PENDING_FLUSH_SIZE_1D = 64
 
 # How many integrated frames to accumulate between v2 _save_to_nexus
 # Live-save cadence and threshold-sentinel constants moved to the
@@ -660,7 +664,11 @@ class imageThread(wranglerThread):
             # sees per-frame updates as soon as each image lands; the
             # disk save still gets batched separately inside
             # _dispatch_batch_serial via _frames_since_save.
-            flush_size = _PENDING_FLUSH_SIZE if self.batch_mode else 1
+            flush_size = (
+                (_PENDING_FLUSH_SIZE_1D if getattr(self.scan, "skip_2d", False)
+                 else _PENDING_FLUSH_SIZE)
+                if self.batch_mode else 1
+            )
             if len(pending) >= flush_size:
                 if self.batch_mode:
                     self.showLabel.emit(
