@@ -204,3 +204,31 @@ def test_nexus_wrangler_compute_source_base():
     assert h._compute_source_base() is None
     root.child("Project").child("project_folder").setValue("/tmp/p")
     assert h._compute_source_base() == os.path.abspath("/tmp/p")
+
+
+def test_writer_rejects_append_with_mismatched_source_base(tmp_path):
+    """P2 #4 (codex): appending to a .nxs written under a DIFFERENT Project
+    Folder (@source_base) must FAIL LOUD -- one scan-level @source_base governs
+    ALL frames' relative paths, so overwriting it on append would silently rebase
+    the earlier frames against the new root."""
+    import nexusformat.nexus as nx
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import _write_per_frame_metadata
+
+    nxs = tmp_path / "scan.nxs"
+    with h5py.File(nxs, "w") as fh:
+        e = fh.create_group("entry")
+        e.attrs["source_base"] = "/root/A"          # written under Project Folder A
+        e.create_group("frames")
+
+    scan = SimpleNamespace(frames=SimpleNamespace(index=[0]),
+                           source_base="/root/B")    # appending under a DIFFERENT root
+    with nx.nxopen(str(nxs), "a") as f:
+        with pytest.raises(ValueError, match="differs"):
+            _write_per_frame_metadata(f, scan, entry="entry")
+
+    # Same root appends fine (no mismatch -> guard passes; the @source_base stays).
+    scan_same = SimpleNamespace(frames=SimpleNamespace(index=[]),  # empty -> early return
+                                source_base="/root/A")
+    with nx.nxopen(str(nxs), "a") as f:
+        _write_per_frame_metadata(f, scan_same, entry="entry")      # must not raise

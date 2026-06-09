@@ -973,8 +973,25 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
     source_base = getattr(scan, "source_base", None) or None
     if source_base:
         source_base = os.path.abspath(os.path.expanduser(str(source_base)))
+        posix_base = Path(source_base).as_posix()
+        # P2 #4 (codex): ONE scan-level @source_base governs ALL frames' relative
+        # source paths.  Appending to a file written under a DIFFERENT root would
+        # silently rebase the EARLIER frames against the new one (wrong path) -->
+        # reject loudly rather than corrupt their resolution.
+        existing = h5f[entry].attrs.get("source_base") if entry in h5f else None
+        if existing is not None:
+            if isinstance(existing, bytes):
+                existing = existing.decode("utf-8", errors="replace")
+            if str(existing) != posix_base:
+                raise ValueError(
+                    f"cannot append to {os.fspath(h5f.filename)!r}: its Project "
+                    f"Folder (@source_base={str(existing)!r}) differs from the "
+                    f"current ({posix_base!r}).  Earlier frames' relative source "
+                    f"paths are stored against the old root; start a NEW output "
+                    f"file for the new Project Folder."
+                )
         try:
-            h5f[entry].attrs["source_base"] = Path(source_base).as_posix()
+            h5f[entry].attrs["source_base"] = posix_base
         except Exception:
             logger.debug("failed to stamp @source_base on %s", entry, exc_info=True)
 
