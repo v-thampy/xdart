@@ -56,6 +56,33 @@ def test_write_source_ref_outside_root_is_absolute(tmp_path):
     assert os.path.isabs(_path_value(fg))                  # out-of-tree -> absolute
 
 
+def test_image_wrangler_project_folder_derives_source_base(tmp_path):
+    """N1 GUI wiring: the image wrangler's Project Folder param drives
+    ``_compute_source_base`` -- the absolute root when set, None when blank
+    (-> the writer stores absolute paths, back-compat)."""
+    from types import SimpleNamespace
+    from pyqtgraph import QtWidgets
+    from pyqtgraph.parametertree import Parameter
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import (
+        imageWrangler, params)
+
+    root = Parameter.create(name='p', type='group', children=params)
+    holder = SimpleNamespace(parameters=root)
+    compute = imageWrangler._compute_source_base.__get__(holder)
+
+    root.child('Project').child('project_folder').setValue('')
+    assert compute() is None
+    root.child('Project').child('project_folder').setValue('   ')   # whitespace
+    assert compute() is None
+
+    folder = str(tmp_path / "proj")
+    root.child('Project').child('project_folder').setValue(folder)
+    assert compute() == os.path.abspath(folder)
+    # And it's session-persisted (so a relaunch restores the portable root).
+    assert any(p[0] == 'project_folder' for p in imageWrangler._SESSION_PARAMS)
+
+
 def test_n1_writer_to_ssrl_reader_roundtrip(tmp_path):
     """End-to-end: a relative pointer written under @source_base resolves back to
     the raw master through the ssrl reader, even with the .nxs in another dir."""

@@ -42,6 +42,16 @@ def_poni_file = ''
 def_img_file = ''
 
 params = [
+    # N1: the portable Project Folder.  Setting it stamps entry/@source_base and
+    # makes each frame's raw source path RELATIVE to it, so the processed .nxs
+    # resolves its raw images after the data moves machines.  Blank -> absolute
+    # paths (back-compat).  (The full progressive-disclosure / folder-change
+    # reset UX is a follow-up; the portable storage is active once a folder is
+    # set.)
+    {'name': 'Project', 'title': 'Project Folder', 'type': 'group', 'children': [
+        {'name': 'project_folder', 'title': 'Folder', 'type': 'str', 'value': ''},
+        NamedActionParameter(name='project_folder_browse', title='Browse...'),
+    ], 'expanded': True},
     {'name': 'Calibration', 'type': 'group', 'children': [
         {'name': 'poni_file', 'title': 'PONI File    ', 'type': 'str', 'value': def_poni_file},
         NamedActionParameter(name='poni_file_browse', title='Browse...'),
@@ -234,6 +244,9 @@ class imageWrangler(wranglerWidget):
         self.layout.addWidget(self.tree)
 
         # Set attributes from Parameter Tree and a couple more
+        # N1: Project Folder (portable @source_base).  Blank -> None (absolute).
+        self.project_folder = self.parameters.child('Project').child('project_folder').value()
+        self.source_base = self._compute_source_base()
         # Calibration
         self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
         self.get_poni_dict()
@@ -297,6 +310,9 @@ class imageWrangler(wranglerWidget):
         self.parameters.sigTreeStateChanged.connect(self.setup)
         self.parameters.sigTreeStateChanged.connect(self._save_to_session)
 
+        self.parameters.child('Project').child('project_folder_browse').sigActivated.connect(
+            self.set_project_folder
+        )
         self.parameters.child('Calibration').child('poni_file_browse').sigActivated.connect(
             self.set_poni_file
         )
@@ -438,6 +454,7 @@ class imageWrangler(wranglerWidget):
     # is_path=True  → only restore if the path exists on disk
     # self_attr     → attribute to sync on restore (None = handled by sigValueChanged)
     _SESSION_PARAMS = [
+        ('project_folder', ('Project', 'project_folder'),            True,  'project_folder'),
         ('poni_file',      ('Calibration', 'poni_file'),             True,  'poni_file'),
         ('inp_type',       ('Signal', 'inp_type'),                   False, 'inp_type'),
         ('img_file',       ('Signal', 'File'),                       True,  'img_file'),
@@ -679,6 +696,13 @@ class imageWrangler(wranglerWidget):
 
         self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
         self.thread.poni = self.poni
+
+        # N1: Project Folder -> @source_base (raw source paths stored RELATIVE to
+        # it -> portable .nxs).  Blank -> None -> absolute paths (back-compat).
+        self.project_folder = (
+            self.parameters.child('Project').child('project_folder').value() or '')
+        self.source_base = self._compute_source_base()
+        self.thread.source_base = self.source_base
 
         # Signal
         self.file_filter = self.parameters.child('Signal').child('Filter').value()
@@ -1210,6 +1234,31 @@ class imageWrangler(wranglerWidget):
             Path(path).mkdir(parents=True, exist_ok=True)
             self.parameters.child('h5_dir').setValue(path)
             self._sync_h5_dir_from_parameters()
+
+    def _compute_source_base(self):
+        """N1: the absolute project root, or None when the Project Folder is
+        blank (-> the writer stores absolute raw paths, back-compat)."""
+        pf = (self.parameters.child('Project').child('project_folder').value() or '').strip()
+        return os.path.abspath(os.path.expanduser(pf)) if pf else None
+
+    def set_project_folder(self):
+        """Browse for the N1 Project Folder.  Setting it makes the processed
+        ``.nxs`` store raw source paths RELATIVE to this root (portable); it also
+        defaults the Save Path to ``<folder>/xdart_processed_data`` when the Save
+        Path is still empty / at its default."""
+        path = QFileDialog().getExistingDirectory(
+            caption='Choose Project Folder',
+            dir='',
+            options=QFileDialog.ShowDirsOnly
+        )
+        if path != '':
+            self.parameters.child('Project').child('project_folder').setValue(path)
+            # Default the output under the project folder if untouched.
+            cur_h5 = (self.parameters.child('h5_dir').value() or '').strip()
+            if not cur_h5 or cur_h5 == get_fname_dir():
+                default_out = os.path.join(path, 'xdart_processed_data')
+                self.parameters.child('h5_dir').setValue(default_out)
+                self._sync_h5_dir_from_parameters()
 
     def set_bg_matching_options(self):
         """Reads image metadata to populate matching parameters

@@ -410,6 +410,9 @@ class imageThread(wranglerThread):
         super().__init__(command_queue, scan_args, fname, file_lock, parent)
 
         self.h5_dir = h5_dir
+        # N1: project root for portable @source_base; set from the wrangler in
+        # setup() (None -> absolute raw paths, back-compat).
+        self.source_base = None
         self.scan_name = scan_name
         self.single_img = single_img
         self.poni = poni
@@ -2323,6 +2326,9 @@ class imageThread(wranglerThread):
                           file_lock=self.file_lock,
                           **self.scan_args)
         scan.skip_2d = self.scan.skip_2d
+        # N1: the project root -> entry/@source_base + relative raw source paths
+        # in the writer (portable .nxs).  None -> absolute paths (back-compat).
+        scan.source_base = getattr(self, "source_base", None)
         # v2 NeXus writer needs a DiffractometerGeometry to derive per-frame
         # rot1/rot2/rot3 and incidence-angle arrays from scan_data.  The
         # default is a two-circle convention using `tth` (detector arm) and
