@@ -71,6 +71,49 @@ def test_run_stitch_collects_images_and_metadata(monkeypatch):
     assert calls["kwargs"]["npt_1d"] == 7
 
 
+def test_run_stitch_runs_real_synthetic_multigeometry():
+    """#8c: drive run_stitch END-TO-END through the REAL pyFAI MultiGeometry
+    engine (not monkeypatched) on a small synthetic detector-angle stack —
+    validating the notebook-stable StitchPlan API on real inputs."""
+    from ssrl_xrd_tools.core.containers import PONI
+
+    shape = (195, 487)                         # Pilatus 100k (small + real -> fast)
+    base_poni = PONI(
+        dist=0.2,
+        poni1=shape[0] * 172e-6 / 2.0,
+        poni2=shape[1] * 172e-6 / 2.0,
+        rot1=0.0, rot2=0.0, rot3=0.0,
+        wavelength=1.0e-10, detector="Pilatus100k",
+    )
+
+    def _ring(seed):
+        rng = np.random.default_rng(seed)
+        ny, nx = shape
+        y, x = np.mgrid[:ny, :nx]
+        r = np.sqrt((y - ny / 2.0) ** 2 + (x - nx / 2.0) ** 2)
+        return (500.0 * np.exp(-((r - 60.0) / 10.0) ** 2)
+                + rng.poisson(3, size=shape)).astype(float)
+
+    # Three frames at increasing detector rot1 (deg) + a monitor counter.
+    frames = [ScanFrame(i, image=_ring(i),
+                        metadata={"rot1": float(5 * i), "I0": float(10 + i)})
+              for i in range(3)]
+    source = MemoryFrameSource(frames, name="stitch")
+
+    result = run_stitch(
+        StitchPlan(base_poni=base_poni, rot1_key="rot1", monitor_key="I0",
+                   mode="1d", npt_1d=200),
+        source,
+    )
+
+    assert result.kind == "stitch"
+    payload = result.payload
+    assert payload.radial.shape == (200,) and payload.intensity.shape == (200,)
+    assert np.isfinite(payload.radial).all()
+    assert np.nanmax(payload.intensity) > 0          # the ring integrates to signal
+    assert result.provenance["frame_indices"] == [0, 1, 2]
+
+
 def test_canonical_scan_exposes_scan_data_for_rsm_consumers():
     scan = Scan(
         "scan",
