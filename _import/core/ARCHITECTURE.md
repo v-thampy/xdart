@@ -16,9 +16,16 @@ The goal is one headless ingestion, reduction, persistence, and result spine in
 - `ReductionSession` is the core reduction primitive: it owns the executor,
   per-thread pyFAI integrators, sink lifecycle, the GI-freeze pre-pass,
   progress, and cancellation for a scan's lifetime, so callers feed chunks
-  without rebuilding CSR-LUTs or reopening sinks. `run_reduction(...)` is the
-  one-shot batch convenience wrapper over it. Live, batch, notebook, XYE, and
-  NeXus workflows differ only by source, sink, executor, and policy.
+  without rebuilding CSR-LUTs or reopening sinks. Two execution modes:
+  `"chunked"` (`process()`) integrates frames in chunks; `"streaming"`
+  (`submit()` + a bounded in-flight window drained by one writer thread,
+  out-of-order completion ok, single-writer sink) is what xdart's GUI runs by
+  default. `run_reduction(..., execution=...)` is the one-shot convenience
+  wrapper over both. `finish()` is **fail-loud**: a sink/write failure re-raises
+  by default (preserving the original exception; `raise_on_failure=False` opts
+  out) so a data-writing run can't silently report success. Live, batch,
+  notebook, XYE, and NeXus workflows differ only by source, sink, executor, and
+  policy.
 - Sinks are the output seam — `MemorySink`, `XYESink`, `NexusSink`, and the
   `CompositeSink` fanout. Re-feeding an already-processed frame index is a
   `replace` (idempotent), not a second write/count.
