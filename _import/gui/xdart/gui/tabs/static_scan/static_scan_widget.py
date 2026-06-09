@@ -469,6 +469,11 @@ class staticWidget(QWidget):
         self.wrangler.sigUpdateGI.connect(self.update_scattering_geometry)
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
+        # Pause/Resume (Phase B): lift the freeze guard once paused (frozen at a
+        # frame boundary), re-engage it just before resuming.  No-op for
+        # wranglers that never emit these (nexus).
+        self.wrangler.sigPaused.connect(self._on_run_paused)
+        self.wrangler.sigResuming.connect(self._on_run_resuming)
         if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'processingModeCombo'):
             def _on_mode_changed(mode_text):
                 # Per-mode integration control enable/dim (C3/C4) — runs for
@@ -541,6 +546,8 @@ class staticWidget(QWidget):
                    self.wrangler.sigUpdateData,
                    self.wrangler.sigUpdateFile,
                    self.wrangler.finished,
+                   self.wrangler.sigPaused,
+                   self.wrangler.sigResuming,
                    self.h5viewer.sigNewFile]
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
             signals.append(self.wrangler.sigViewerModeChanged)
@@ -848,6 +855,20 @@ class staticWidget(QWidget):
     def close(self):
         """Tries a graceful close.
         """
+        # Pause/Resume (Phase B): a PAUSED run blocks the wrangler thread in its
+        # `while command == 'pause'` wait.  Closing the window must break that
+        # wait so run() returns and the QThread isn't "destroyed while running".
+        # Setting command='stop' (the universal run-end signal) exits the pause
+        # wait from any state; bound-wait the thread so teardown is clean.
+        try:
+            w = getattr(self, 'wrangler', None)
+            wt = getattr(w, 'thread', None) if w is not None else None
+            if wt is not None and wt.isRunning():
+                w.command = 'stop'
+                wt.command = 'stop'
+                wt.wait(5000)
+        except Exception:
+            logger.debug("stopping wrangler thread on close failed", exc_info=True)
         # Stop the viewer's long-running background threads BEFORE teardown so
         # the persistent fileHandlerThread / async load worker aren't destroyed
         # while running ("QThread: Destroyed while thread is still running") on
@@ -1014,6 +1035,33 @@ class staticWidget(QWidget):
         # the mode-correct state (run_active is now False).
         self.enable_integration(True)
         self._apply_integration_control_state()
+
+    def _on_run_paused(self):
+        """Pause (Phase B): the run is FROZEN at a frame boundary (the worker has
+        drained the in-flight window + flushed the .nxs and emitted sigPaused).
+        LIFT the disk-read freeze guard so the user can browse ANY frame from
+        disk while paused -- but the run is still active, so keep ``_run_active``
+        True and leave the parameter/integration controls hard-disabled (#72).
+
+        Safe ordering: this runs only AFTER the worker is provably idle (sigPaused
+        is emitted post-drain/flush), so a disk read here can't race a write.
+        ``set_run_writing(False)`` also re-fires the standing frame selection, so
+        a frame skipped during the run now loads from the quiesced file."""
+        if not self._run_active:
+            return                       # not in a run; nothing to lift
+        self.displayframe.set_processing_active(False)
+        self.h5viewer.set_run_writing(False)
+
+    def _on_run_resuming(self):
+        """Resume (Phase B): RE-ENGAGE the freeze guard BEFORE the worker flips
+        the command back to the run state, so a browse read can't overlap the
+        restarted writer.  ``set_run_writing(True)`` also cancels any in-flight
+        browse load on its rising edge.  Runs synchronously (same GUI thread)
+        from the wrangler's sigResuming, ahead of the command flip."""
+        if not self._run_active:
+            return
+        self.h5viewer.set_run_writing(True)
+        self.displayframe.set_processing_active(True)
 
     def update_all(self, idx=None):
         """Updates all data in displays.

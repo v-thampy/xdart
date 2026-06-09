@@ -133,6 +133,9 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
                  "_apply_threshold_inline"):
         setattr(w, meth, MethodType(getattr(wranglerThread, meth), w))
     w._dispatch_batch_serial = MethodType(imageThread._dispatch_batch_serial, w)
+    # Pause: the dispatch/submit loops now call _wait_if_paused() at the top; it
+    # early-returns since this rig's command is never 'pause'.
+    w._wait_if_paused = MethodType(imageThread._wait_if_paused, w)
     w._dispatch_batch_parallel = MethodType(imageThread._dispatch_batch_parallel, w)
     # Frame-shell builder extracted from the parallel/streaming dispatchers.
     w._build_batch_frames = MethodType(imageThread._build_batch_frames, w)
@@ -798,7 +801,8 @@ def test_streaming_batch_xye_matches_chunked(gi_mode_1d):
             w._cancel_token = MethodType(wranglerThread._cancel_token, w)
             w._close_reduction_session = MethodType(
                 wranglerThread._close_reduction_session, w)
-            for meth in ("_dispatch_batch_streaming", "_get_streaming_session"):
+            for meth in ("_dispatch_batch_streaming", "_get_streaming_session",
+                         "_wait_if_paused"):
                 setattr(w, meth, MethodType(getattr(imageThread, meth), w))
         w._dispatch_batch(scan, pending)
         if execution == "streaming":
@@ -1118,7 +1122,7 @@ def test_gi_streaming_multichunk_later_chunk_uses_whole_scan_grid():
         wranglerThread._close_reduction_session, w)
     for meth in ("_dispatch_batch_streaming", "_get_streaming_session",
                  "_gi_freeze_whole_scan_prepass", "_gi_whole_scan_scout_entries",
-                 "_enumerate_scan_files", "_abort_gi_prepass"):
+                 "_enumerate_scan_files", "_abort_gi_prepass", "_wait_if_paused"):
         setattr(w, meth, MethodType(getattr(imageThread, meth), w))
     w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
 

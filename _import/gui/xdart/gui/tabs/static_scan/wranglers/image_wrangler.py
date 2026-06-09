@@ -209,8 +209,10 @@ class imageWrangler(wranglerWidget):
         # rather than the QCheckBox-only ``stateChanged``.
         self.ui.liveCheckBox.toggled.connect(self._on_mode_changed)
         self.ui.batchCheckBox.toggled.connect(self._on_mode_changed)
-        # Live doubles as a start/stop toggle.  Connected AFTER
-        # _on_mode_changed so live_mode is already set when we start.
+        # Phase B: Live is now a pure MODE toggle (it no longer starts/stops a
+        # run — the single Start/Pause/Resume action button does).  _on_live_toggled
+        # just resyncs live_mode (a no-op alongside _on_mode_changed, kept for
+        # clarity).  Connected AFTER _on_mode_changed.
         self.ui.liveCheckBox.toggled.connect(self._on_live_toggled)
         self.ui.processingModeCombo.currentTextChanged.connect(lambda _: self._save_to_session())
         self.ui.liveCheckBox.toggled.connect(lambda _: self._save_to_session())
@@ -411,6 +413,14 @@ class imageWrangler(wranglerWidget):
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
         # self.thread.sigUpdateFrame.connect(self.sigUpdateFrame.emit)
         self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
+        # Pause (Phase B): the worker emits sigPaused once it has drained+flushed
+        # at a frame boundary.  Morph the action button to Resume here AND
+        # re-emit at the wrangler level so the host (staticWidget) can lift the
+        # freeze guard for browsing.  _run_phase tracks the Start/Pause/Resume
+        # state machine (idle | running | paused).
+        self._run_phase = 'idle'
+        self.thread.sigPaused.connect(self._on_paused)
+        self.thread.sigPaused.connect(self.sigPaused.emit)
 
         # Enable/disable buttons initially
         self.ui.stopButton.setEnabled(False)
@@ -865,23 +875,23 @@ class imageWrangler(wranglerWidget):
                 w.setToolTip(tip)
 
     def _on_start_clicked(self):
-        """Start button = an explicit NON-live processing run.
+        """The single action button is a 3-state machine (Phase B):
 
-        The Start button and the Live toggle both funnel into :meth:`start`,
-        and ``live_mode`` only ever tracks the Live toggle's checked state.
-        If Live happened to be left checked, a Start click would silently run
-        in live-watching mode ("Watching for new files...") with the Live
-        button lit.  Force a non-live run here: uncheck Live (without firing
-        its start/stop handler) and clear ``live_mode`` so the wrangler runs
-        once over the existing files and ``enabled(False)`` greys Live out for
-        the duration."""
-        if self.ui.liveCheckBox.isChecked():
-            self.ui.liveCheckBox.blockSignals(True)
-            self.ui.liveCheckBox.setChecked(False)
-            self.ui.liveCheckBox.blockSignals(False)
-        self.live_mode = False
-        self.thread.live_mode = False
-        self.start()
+        * **idle** -> Start a run honoring the Live/Batch MODE toggles
+          (``live_mode``/``batch_mode``, already synced by ``_on_mode_changed``).
+          Live is no longer force-unchecked — it is an honored mode, not a
+          competing action.
+        * **running** -> Pause (freeze at a frame boundary; browse from disk).
+        * **paused** -> Resume.
+
+        Stop (separate red button) remains the terminal action from any state."""
+        phase = getattr(self, '_run_phase', 'idle')
+        if phase == 'running':
+            self.pause()
+        elif phase == 'paused':
+            self._on_resume()
+        else:
+            self.start()
 
     def _inputs_valid(self):
         """Whether the wrangler can start a run.
@@ -896,32 +906,75 @@ class imageWrangler(wranglerWidget):
         return True
 
     def start(self):
-        # Gate both the Start button and the Live toggle (both funnel here):
-        # refuse to run without a valid PONI rather than re-running the stale
-        # previous scan.
+        # Refuse to run without a valid PONI rather than re-running the stale
+        # previous scan.  Honors the Live/Batch mode toggles (no force-off).
         if not self._inputs_valid():
             return
         self.command = 'start'
         self.thread.command = 'start'
         self.ui.stopButton.setEnabled(True)
+        self._set_action_button('running')   # morph green Start -> orange Pause
         self.sigStart.emit()
 
+    def pause(self):
+        """Request a Pause: freeze processing at a frame boundary without
+        tearing down the scan/session (worker's _wait_if_paused handles it).
+        Mirror the command onto self + thread (same delivery as stop())."""
+        self.command = 'pause'
+        self.thread.command = 'pause'
+        # Transient state until the worker confirms via sigPaused -> _on_paused
+        # (which morphs to Resume).  Disabled so a double-click can't race.
+        self._set_action_button('pausing')
+
+    def _on_paused(self):
+        """GUI slot for the worker's sigPaused (run frozen at a frame boundary).
+        The host (staticWidget) lifts the freeze guard off the same signal."""
+        self._set_action_button('paused')    # orange 'Resume'
+
+    def _on_resume(self):
+        """Resume from paused.  Re-engage the freeze guard FIRST (the host's
+        sigResuming slot runs synchronously, same GUI thread), THEN flip the
+        command back to the run state so a browse read can't race the restarted
+        writer."""
+        self.sigResuming.emit()
+        self.command = 'start'
+        self.thread.command = 'start'
+        self._set_action_button('running')   # orange 'Pause'
+
+    def _set_action_button(self, phase):
+        """Morph the single action button (Start/Pause/Resume) by text + an
+        orange-vs-green visual state driven by a dynamic ``runPhase`` Qt property
+        (styled in the dark theme).  ``pausing`` is a transient disabled state."""
+        btn = self.ui.startButton
+        label, prop, enabled = {
+            'idle':    ('Start',    'idle',   True),
+            'running': ('Pause',    'active', True),
+            'pausing': ('Pausing…', 'active', False),
+            'paused':  ('Resume',   'active', True),
+        }.get(phase, ('Start', 'idle', True))
+        self._run_phase = 'idle' if phase == 'idle' else (
+            'paused' if phase == 'paused' else 'running')
+        btn.setText(label)
+        btn.setEnabled(enabled)
+        if btn.property('runPhase') != prop:
+            btn.setProperty('runPhase', prop)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
     def _on_live_toggled(self, checked):
-        """Live button is a start/stop toggle for live acquisition:
-        checking it starts a live run (live_mode is already set by
-        :meth:`_on_mode_changed`, which runs first); unchecking it stops
-        the run.  Fires only on genuine user clicks — the programmatic
-        resets in :meth:`stop` / :meth:`enabled` block the signal."""
-        if checked:
-            self.start()
-        else:
-            self.stop()
+        """Live is a pure MODE toggle now (Phase B): it does NOT start/stop a
+        run — that is the single Start/Pause/Resume action button's job.  It just
+        records live_mode (``_on_mode_changed``, connected first, already does;
+        resync defensively)."""
+        self.live_mode = bool(checked)
+        self.thread.live_mode = bool(checked)
 
     def stop(self):
         self.command = 'stop'
         self.thread.command = 'stop'
         self.ui.stopButton.setEnabled(False)
         self.ui.specLabel.setText('')
+        self._set_action_button('idle')       # morph back to green 'Start'
         # Keep the Live toggle in sync when stopped via the Stop button or
         # programmatically — uncheck it without re-entering stop().  Because
         # the uncheck is done with signals blocked, ``_on_mode_changed`` does
@@ -1361,7 +1414,10 @@ class imageWrangler(wranglerWidget):
             enable: bool, True for enabled False for disabled.
         """
         self.tree.setEnabled(enable)
-        self.ui.startButton.setEnabled(enable)
+        # Phase B: the action button stays ENABLED during a run — it is the
+        # Pause/Resume control now (morphed by _set_action_button), not just
+        # Start.  Only its label/colour changes across the run lifecycle.
+        self.ui.startButton.setEnabled(True)
         # Non-param widgets (live outside the ParameterTree): mode combo, Cores
         # spinbox + label, Advanced button.  Stop is left alone (stays enabled).
         for name in ('processingModeCombo', 'maxCoresSpinBox', 'coresLabel',
@@ -1369,10 +1425,11 @@ class imageWrangler(wranglerWidget):
             w = getattr(self.ui, name, None)
             if w is not None:
                 w.setEnabled(enable)
-        # Live toggle state vs. the run lifecycle:
+        # Live/Batch toggle state vs. the run lifecycle:
         if enable:
-            # Run finished — reset Live to off (no re-trigger) and re-enable
-            # both toggles so the next run can be either live or batch.
+            # Run finished — reset the action button to green 'Start' and
+            # re-enable both mode toggles.  Reset Live to off (no re-trigger).
+            self._set_action_button('idle')
             self.ui.liveCheckBox.blockSignals(True)
             self.ui.liveCheckBox.setChecked(False)
             self.ui.liveCheckBox.blockSignals(False)
@@ -1384,10 +1441,10 @@ class imageWrangler(wranglerWidget):
             # dimming) now that the run lock is lifted.
             self._on_mode_changed()
         else:
-            # Run active — keep Live clickable only for a *live* run (so it
-            # can be toggled off to stop); mode toggles stay locked until the
-            # run finishes.
-            self.ui.liveCheckBox.setEnabled(self.live_mode)
+            # Run active — Live/Batch are pure mode toggles and lock for the
+            # run's duration (the morphing action button + Stop drive it now,
+            # so Live no longer needs to stay clickable to stop a live run).
+            self.ui.liveCheckBox.setEnabled(False)
             self.ui.batchCheckBox.setEnabled(False)
 
     def stylize_ParameterTree(self):

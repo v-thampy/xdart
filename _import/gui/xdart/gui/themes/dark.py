@@ -177,6 +177,30 @@ QPushButton#startButton:disabled {
     border-color: #2d3d34;
 }
 
+/* Phase B: the single action button morphs to ORANGE while a run is active
+   (Pause / Resume), keyed on a dynamic ``runPhase`` property the wrangler sets
+   (idle/unset -> the green rules above; "active" -> orange here).  The attribute
+   selector outranks the plain #startButton rules, and these come later, so the
+   orange state wins while active.  Live/Batch keep their purple :checked styling
+   (those are checkable toggles; startButton is not, so no collision). */
+QPushButton#startButton[runPhase="active"] {
+    background-color: #ffb86c;
+    color: #1a1a1a;
+    font-weight: bold;
+    border: 1px solid #e0a050;
+}
+QPushButton#startButton[runPhase="active"]:hover {
+    background-color: #ffc987;
+}
+QPushButton#startButton[runPhase="active"]:pressed {
+    background-color: #e0a050;
+}
+QPushButton#startButton[runPhase="active"]:disabled {
+    background-color: #5a4a35;
+    color: #6272a4;
+    border-color: #5a4a35;
+}
+
 QPushButton#stopButton {
     background-color: #ff5555;
     color: #1a1a1a;
