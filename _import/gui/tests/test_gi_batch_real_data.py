@@ -998,7 +998,8 @@ def test_gi_streaming_prepass_scouts_whole_scan_extremes():
 
     # (1) The whole-scan metadata sweep finds the two incidence EXTREMES
     #     (th 0.15 = frame 1, th 0.35 = frame 5) and loads their images.
-    entries = w._gi_whole_scan_scout_entries(None)
+    status, entries = w._gi_whole_scan_scout_entries(None)
+    assert status == "freeze"
     assert len(entries) == 2
     nums = sorted(e[1] for e in entries)
     assert nums == [1, 5], f"expected the global extremes (1, 5); got {nums}"
@@ -1027,3 +1028,129 @@ def test_gi_streaming_prepass_scouts_whole_scan_extremes():
     f5_lo, f5_hi = singles[4]
     assert not (c1_lo <= f5_lo + 1e-9 and c1_hi >= f5_hi - 1e-9), \
         "chunk-1-only freeze unexpectedly covers frame 5 -- test can't catch the bug"
+
+
+def test_gi_prepass_fails_closed_on_unestablishable_range():
+    """BLOCKER 1 follow-up: when a multi-file scan's whole-scan incidence range
+    CANNOT be established from metadata (>=2 files but no readable incidence), the
+    pre-pass FAILS CLOSED -- it aborts the run loud (user-visible showLabel +
+    command='stop') rather than silently integrating onto the chunk-1-local grid
+    (the clipping BLOCKER 1 exists to kill).  It also must NOT latch the scan-id
+    on a failure (so a corrected retry can re-run the freeze)."""
+    from types import SimpleNamespace, MethodType
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    scan_name = "Combi4_Angledependence_samz_4p9_03271002"
+    emitted = []
+    w = SimpleNamespace(
+        gi=True, batch_mode=True, batch_execution="streaming",
+        incidence_motor="no_such_motor",      # absent from every frame's metadata
+        img_file=str(TIFF / f"{scan_name}_0001.tif"),
+        img_dir=str(TIFF), scan_name=scan_name, img_ext="tif",
+        meta_ext="txt", meta_dir=str(TIFF), inp_type=None,
+        get_background=lambda *a, **k: 0.0, command="",
+        showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
+    )
+    for m in ("_gi_freeze_whole_scan_prepass", "_gi_whole_scan_scout_entries",
+              "_enumerate_scan_files", "_abort_gi_prepass", "_batch_execution"):
+        setattr(w, m, MethodType(getattr(imageThread, m), w))
+    w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
+
+    # The sweep finds the 5 files but resolves no incidence for any -> "abort".
+    status, entries = w._gi_whole_scan_scout_entries(None)
+    assert status == "abort" and entries == []
+
+    # The orchestrator fails CLOSED: returns False, stops the run, warns loud.
+    proceed = w._gi_freeze_whole_scan_prepass(SimpleNamespace())
+    assert proceed is False
+    assert w.command == "stop"
+    assert emitted and "GI batch aborted" in emitted[-1]
+    # A transient/abort failure is NOT latched in -> no silent chunk-freeze later.
+    assert getattr(w, "_gi_prepass_scan_id", None) is None
+
+
+def test_gi_streaming_multichunk_later_chunk_uses_whole_scan_grid():
+    """BLOCKER 1 TEST GAP: drive the streaming batch dispatcher over TWO chunks
+    where the global-MAX-incidence frame (5, th 0.35) lands in the SECOND chunk
+    (frame 1, th 0.15, is in chunk 1).  The whole-scan pre-pass runs on chunk 1
+    and must freeze the UNION grid into ``scan.bai_1d_args`` so the persistent
+    session integrates every later chunk onto an axis covering frame 5's full
+    extent -- NOT clipped to chunk-1's (frames 1-2) grid, which is the multi-chunk
+    bug.  This exercises the dispatch -> pre-pass -> session WIRING end-to-end; the
+    single-chunk unit test (which calls the scout helper directly) can't, because
+    the helper always sweeps the whole filesystem regardless of chunking."""
+    from types import SimpleNamespace, MethodType
+    from threading import RLock
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        imageThread, gi_1d_output_axis_key)
+
+    scan_name = "Combi4_Angledependence_samz_4p9_03271002"
+    poni = _tiff_poni()
+    raw = [_load_tiff(f"{scan_name}_{i:04d}.tif") for i in range(1, 6)]  # 1..5
+    mask = _tiff_mask(raw[0][0])
+    gi_mode_1d = "q_oop"                 # out-of-plane output: drifts with incidence
+
+    w, captured = _build_batch_thread(poni, mask, gi=True)
+    w.xye_only = True
+    # Source attrs so the whole-scan pre-pass can metadata-sweep the 5-file series.
+    w.img_file = str(TIFF / f"{scan_name}_0001.tif")
+    w.img_dir = str(TIFF)
+    w.scan_name = scan_name
+    w.img_ext = "tif"
+    w.meta_ext = "txt"
+    w.meta_dir = str(TIFF)
+    w.inp_type = None
+    w.incidence_motor = "th"
+    w.get_background = lambda *a, **k: 0.0
+    # Streaming wiring (mirrors test_streaming_batch_xye_matches_chunked).
+    w.batch_execution = "streaming"
+    w.file_lock = RLock()
+    w.sigUpdate = SimpleNamespace(emit=lambda *a: None)
+    w.LIVE_SAVE_INTERVAL = 1000
+    w._streaming_session = None
+    w._streaming_sink = None
+    w._streaming_scan_id = None
+    w._reduction_session = None
+    w._reduction_session_key = None
+    w._cancel_token = MethodType(wranglerThread._cancel_token, w)
+    w._close_reduction_session = MethodType(
+        wranglerThread._close_reduction_session, w)
+    for meth in ("_dispatch_batch_streaming", "_get_streaming_session",
+                 "_gi_freeze_whole_scan_prepass", "_gi_whole_scan_scout_entries",
+                 "_enumerate_scan_files", "_abort_gi_prepass"):
+        setattr(w, meth, MethodType(getattr(imageThread, meth), w))
+    w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
+
+    scan = _make_scan(
+        poni, mask, {"gi_mode_1d": gi_mode_1d, "numpoints": 128},
+        {"gi_mode_2d": "qip_qoop", "npt_rad": 64, "npt_azim": 48}, gi=True)
+    scan.skip_2d = True
+
+    pending = [(str(TIFF / f"{scan_name}_{i + 1:04d}.tif"), i + 1,
+                raw[i][0], raw[i][2], 0.0, 0.0) for i in range(5)]
+    chunk1, chunk2 = pending[:2], pending[2:]   # the global max (frame 5) is in chunk 2
+
+    w._dispatch_batch(scan, chunk1)
+    assert w.command != "stop", "pre-pass aborted unexpectedly on real GI data"
+    w._dispatch_batch(scan, chunk2)
+    w._close_reduction_session()                # finish -> QtNexusSink final flush
+
+    # The pre-pass froze the WHOLE-scan union into scan.bai_1d_args (the session
+    # reads these to build its plan) -- not the chunk-1 grid.
+    okey = gi_1d_output_axis_key(gi_mode_1d)
+    frozen = scan.bai_1d_args.get(okey)
+    union = _freeze_1d_output_range(poni, mask, pending, gi_mode_1d)
+    c1 = _freeze_1d_output_range(poni, mask, chunk1, gi_mode_1d)
+    assert frozen is not None, "pre-pass did not freeze a whole-scan grid"
+    assert frozen == pytest.approx(union), \
+        "pre-pass froze something other than the whole-scan incidence union"
+    assert tuple(frozen) != pytest.approx(tuple(c1)), \
+        "fixture degenerate: whole-scan union == chunk-1 grid (can't catch the bug)"
+
+    # End-to-end: every frame (incl. frame 5 from chunk 2) was integrated onto
+    # the one shared frozen grid.
+    assert set(captured) == {1, 2, 3, 4, 5}
+    np.testing.assert_array_equal(
+        np.asarray(captured[5].int_1d.radial, float),
+        np.asarray(captured[1].int_1d.radial, float))

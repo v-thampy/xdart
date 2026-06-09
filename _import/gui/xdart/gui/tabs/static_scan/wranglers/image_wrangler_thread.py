@@ -1015,7 +1015,7 @@ class imageThread(wranglerThread):
         )
 
     # ── BLOCKER 1: whole-scan GI grid freeze (streaming batch) ──────────────
-    def _gi_freeze_whole_scan_prepass(self, scan) -> None:
+    def _gi_freeze_whole_scan_prepass(self, scan) -> bool:
         """Freeze the GI common q/χ grid from the WHOLE scan's incidence range
         BEFORE the streaming session opens.
 
@@ -1036,44 +1036,102 @@ class imageThread(wranglerThread):
         Batch + streaming + GI only.  True-live keeps ``first_frame`` serial (it
         has no whole scan ahead of time); the chunked batch path already builds
         the full pending up front so its first/last ARE the scan extremes.
-        Runs once per scan (id-guarded).  Eiger single-master (one incidence per
-        master) and fixed/manual incidence collapse to the existing behaviour
-        (no whole-scan scout) -- the grid was never chunk-clipped there.
+        Runs once per scan.  Eiger single-master (one incidence per master) and
+        fixed/manual incidence collapse to the existing behaviour (no whole-scan
+        scout) -- the grid was never chunk-clipped there.
+
+        **Fails CLOSED** (BLOCKER 1 follow-up): a scout exception, or a
+        genuinely-unestablishable global incidence range on a varying-incidence
+        per-file scan, ABORTS the run with a user-visible error rather than
+        silently proceeding on the chunk-1-local grid (the clipping this exists
+        to kill).  The scan-id latch is set only AFTER a successful freeze/skip
+        so a transient failure is never latched in.
+
+        Returns ``True`` when it is safe for the caller to open the session,
+        ``False`` when the run was aborted (caller must not proceed).
         """
         if not (self.gi and self.batch_mode
                 and self._batch_execution() == "streaming"):
-            return
+            return True
         if getattr(self, "_gi_prepass_scan_id", None) == id(scan):
-            return
-        self._gi_prepass_scan_id = id(scan)
+            return True
         try:
-            scouts = self._gi_whole_scan_scout_entries(scan)
+            status, scouts = self._gi_whole_scan_scout_entries(scan)
+        except Exception as exc:
+            # Fail CLOSED: a transient scout failure must NOT silently fall back
+            # to the chunk-1 grid.  Don't latch (no poisoning a retry); stop loud.
+            self._abort_gi_prepass(f"scout pre-pass raised ({exc})")
+            return False
+        if status == "abort":
+            self._abort_gi_prepass(
+                "could not establish the whole-scan incidence range from frame "
+                "metadata")
+            return False
+        if status == "freeze":
+            # These self-skip when the relevant ranges are already set, and
+            # freeze the UNION over the two extreme scouts we hand them (NOT a
+            # chunk).
+            self._freeze_gi_1d_auto_range(scan, scouts)
+            self._freeze_gi_2d_auto_ranges(scan, scouts)
+        # status == "skip": fixed/manual/single-incidence/Eiger -- the session's
+        # own freeze is correct (the grid was never chunk-clipped there).
+        self._gi_prepass_scan_id = id(scan)   # latch only after success
+        return True
+
+    def _abort_gi_prepass(self, reason: str) -> None:
+        """Fail-closed exit from the GI whole-scan freeze: surface a user-visible
+        error and STOP the streaming GI run rather than integrate onto a partial
+        (chunk-1-local) grid.  Do NOT fall back to index first/last -- that is
+        unsafe for non-monotonic scans (first/last != incidence extremes, #70)."""
+        msg = (
+            'GI batch aborted: cannot freeze a whole-scan q/χ grid (' + reason +
+            '). Refusing to integrate onto a partial grid that would clip later '
+            'frames. Set Theta Motor to Manual and enter the incident angle, or '
+            'check the per-frame metadata, then restart.')
+        logger.error(msg)
+        try:
+            self.showLabel.emit(msg)
         except Exception:
-            logger.warning("GI whole-scan scout pre-pass failed; the session's "
-                           "chunk-local freeze will be used", exc_info=True)
-            return
-        if not scouts:
-            return
-        # These self-skip when the relevant ranges are already set, and freeze
-        # the UNION over the two extreme scouts we hand them (NOT a chunk).
-        self._freeze_gi_1d_auto_range(scan, scouts)
-        self._freeze_gi_2d_auto_ranges(scan, scouts)
+            logger.debug("showLabel emit failed for GI prepass abort",
+                         exc_info=True)
+        # Stop the collection loop loudly (mirrors a write-failure stop); the
+        # close path then drains/closes any partially-built session.
+        self.command = 'stop'
 
     def _gi_whole_scan_scout_entries(self, scan):
-        """Return scout entry tuples ``(img_file, img_number, img_data, img_meta,
-        bg_raw, 0.0)`` for the global lowest+highest incidence frames (≤2), or
-        ``[]`` when the whole-scan incidence can't be cheaply enumerated (fixed/
-        manual angle, Eiger/master, or an Image-Directory multi-scan source) --
-        in which case the existing chunk-local freeze is left to handle it."""
+        """Decide how to freeze the whole-scan GI grid and, when needed, gather
+        the scout images.  Returns ``(status, entries)``:
+
+        - ``("skip", [])`` — fixed/manual angle, Eiger/master, Image-Directory,
+          a single-frame scan, or a swept scan with one incidence: the existing
+          chunk-local / session freeze is correct (the grid was never clipped).
+        - ``("freeze", [lo_entry, hi_entry])`` — a varying-incidence per-file
+          scan whose extremes were resolved from readable metadata; ``entries``
+          are ``(img_file, img_number, img_data, img_meta, bg_raw, 0.0)`` for the
+          global lowest+highest incidence frames, with their images loaded.
+        - ``("abort", [])`` — a multi-file scan whose incidence we genuinely
+          cannot establish (fewer than two readable incidences across the whole
+          series).  The caller fails CLOSED.
+
+        Robust to per-frame metadata GAPS: it finds the extremes from the
+        readable frames and only aborts when it can't read enough to establish a
+        global range at all (BLOCKER 1 follow-up)."""
         motor = self.incidence_motor
         try:
             float(motor)        # fixed/manual: one angle for the whole scan
-            return []
+            return "skip", []
         except (TypeError, ValueError):
             pass
         files = self._enumerate_scan_files()
+        if not files:
+            # Can't cheaply per-frame sweep (Eiger single-master is one incidence
+            # per master -> fixed -> the session freeze is correct; a directory /
+            # missing-source host likewise can't be swept).  Not an abort: these
+            # were never chunk-clipped.  (Multi-master varying-incidence Eiger is
+            # a known gap -- RESTRUCTURE-TODO.)
+            return "skip", []
         if len(files) < 2:
-            return []
+            return "skip", []   # single-frame scan: no incidence range to freeze
         resolved = []
         for fname, img_number in files:
             try:
@@ -1081,16 +1139,18 @@ class imageThread(wranglerThread):
                                             meta_dir=self.meta_dir)
                         if self.meta_ext else {})
             except Exception:
-                continue
+                continue            # tolerate a per-frame metadata gap
             ang = self._resolve_incidence_from_meta(meta, motor)
             if ang is not None:
                 resolved.append((ang, fname, img_number, meta))
         if len(resolved) < 2:
-            return []
+            # A multi-file (≥2) scan whose incidence we can't read for at least
+            # two frames: we cannot establish the global range -> fail CLOSED.
+            return "abort", []
         lo = min(resolved, key=lambda r: r[0])
         hi = max(resolved, key=lambda r: r[0])
         if lo[0] == hi[0]:          # no incidence sweep -> chunk grid is fine
-            return []
+            return "skip", []
         entries = []
         for _ang, fname, img_number, meta in (lo, hi):
             data = np.asarray(read_image(fname), dtype=float)
@@ -1098,7 +1158,7 @@ class imageThread(wranglerThread):
             # bg is irrelevant to the frozen AXIS extent (geometry+incidence
             # driven), but pass the real value for parity with the live path.
             entries.append((fname, img_number, data, meta, bg, 0.0))
-        return entries
+        return "freeze", entries
 
     @staticmethod
     def _resolve_incidence_from_meta(meta, motor):
@@ -1268,7 +1328,10 @@ class imageThread(wranglerThread):
         # BLOCKER 1: freeze the GI common grid from the WHOLE scan's incidence
         # range before the session opens (no-op on chunks 2..N via the scan-id
         # guard; no-op for non-GI / fixed-incidence / Eiger-single-master).
-        self._gi_freeze_whole_scan_prepass(scan)
+        # Fails CLOSED: an unestablishable global range aborts the run loud
+        # rather than silently integrate onto the chunk-1 grid.
+        if not self._gi_freeze_whole_scan_prepass(scan):
+            return 0
         frames = self._build_batch_frames(scan, pending)
         if not frames:
             return 0
