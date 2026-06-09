@@ -344,3 +344,36 @@ def test_streaming_drain_noop_before_start_and_for_chunked(monkeypatch):
                                  sink=MemorySink(), execution="streaming", executor=2)
     streaming.drain()          # no-op (stream not started yet)
     streaming.finish()
+
+
+def test_streaming_drain_timeout_and_cancel_bail(monkeypatch):
+    """drain(timeout=) BOUNDS the wait so a hung worker (stalled IO / runaway
+    pyFAI — an uncancellable running future) can't deadlock a GUI pause, and it
+    bails early once the cancel token trips (Stop/close)."""
+    gate = threading.Event()
+
+    def blocking(image, ai, **kw):
+        gate.wait(5)           # never set in the test window -> writer hangs
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocking)
+    token = CancelToken()
+    session = ReductionSession(
+        _plan(), Scan("s", _frames(2), integrator=object()),
+        sink=MemorySink(), execution="streaming", executor=1, cancel_token=token,
+    )
+    session.submit(_frames(2)[0])
+
+    # Worker stuck in integrate -> drain can't complete -> times out (bounded).
+    t0 = time.monotonic()
+    assert session.drain(timeout=0.2) is False
+    assert time.monotonic() - t0 < 2.0          # did NOT hang on the stuck worker
+
+    # Cancel (Stop/close) -> a subsequent drain bails promptly, not after 5 s.
+    token.cancel()
+    t1 = time.monotonic()
+    assert session.drain(timeout=5.0) is False
+    assert time.monotonic() - t1 < 2.0
+
+    gate.set()                                  # release the worker, finish clean
+    session.finish(raise_on_failure=False)
