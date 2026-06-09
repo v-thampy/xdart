@@ -4,6 +4,22 @@ Source-agnostic scan metadata.
 
 Readers (SPEC, NeXus, Tiled) build ``ScanMetadata`` instances; processing code
 consumes them without knowing the data source.
+
+Two metadata models live here, at DIFFERENT granularities — they are
+intentionally distinct, NOT redundant (so there is nothing to "collapse"):
+
+* :class:`ScanMetadata` — the **scan-level** ingestion record: one per scan,
+  carrying energy/wavelength, per-scan-point motor ``angles`` + ``counters``
+  arrays, the UB matrix, sample/scan-type/source provenance, and image paths.
+  Built once by the format readers.
+* :class:`HeterogeneousMetadata` — a **single frame's** ``raw`` + ``numeric``
+  metadata bag (immutable), carried on each :class:`FrameView`/reduced frame.
+
+A scan-level record relates to a per-frame bag by slicing the scan-point arrays
+at a given index; the natural bridge is one-to-many (one ``ScanMetadata`` ->
+N ``HeterogeneousMetadata``), not an alias.  (Resolution of restructure item
+#8b: the two were flagged as candidates to merge, but they model different
+things — kept separate by design.)
 """
 
 from __future__ import annotations
