@@ -7,7 +7,11 @@ single writer/consumer thread.  This sink hydrates the matching ``LiveFrame``
 (registered by the wrangler as it submits), makes/skips the PERF-5 thumbnail,
 stashes it in-memory (``add_frame``), buffers the XYE row, frees the raw
 (PERF-3), and owns the mode-aware save cadence — exactly the old Phase-2 write,
-relocated behind the sink interface so live and batch can share one write path.
+relocated behind the sink interface so batch and a non-batch *reprocess* share
+one write path.  NOTE: true-live *watching* (Phase 3 — the detector-rate file
+watcher) intentionally keeps its own serial ``_process_one`` + direct
+``_save_to_nexus`` write; it's a second, deliberate write path (one frame at a
+time, parallelism moot), not a gap.
 
 Design (per the WS-X1 Phase-2 review notes):
 

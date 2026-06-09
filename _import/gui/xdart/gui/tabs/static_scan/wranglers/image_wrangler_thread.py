@@ -70,7 +70,8 @@ if _BATCH_EXECUTION not in ("chunked", "streaming"):
 # Live (non-batch) execution policy (PERF-4b/WS-X1 #3 — unify live onto the
 # streaming sink).  "streaming" (DEFAULT as of the WS-X1 flip) routes a non-batch
 # *reprocess* (Phase 1/2 collect loop) through the SAME persistent
-# ReductionSession + QtNexusSink as batch — one write path, and the parallel pool
+# ReductionSession + QtNexusSink as batch — batch + reprocess share this write
+# path (true-live keeps its serial one, below) — and the parallel pool
 # pipelines I/O+compute (651-frame 2D reprocess ~30s vs ~60-76s serial; 1D ~21 vs
 # ~27s; the live display is published GUI-side via _published_frames, see
 # QtNexusSink._publish_display).  "serial" is the legacy per-frame _process_one
