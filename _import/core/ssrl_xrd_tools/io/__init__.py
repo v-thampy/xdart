@@ -60,6 +60,8 @@ from ssrl_xrd_tools.io.read import (
     get_raw_frame,
     get_thumbnail,
     open_scan,
+    relative_source_path,
+    resolve_source_master,
 )
 from ssrl_xrd_tools.io.frame_view import (
     FrameViewReader,

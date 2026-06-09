@@ -62,7 +62,10 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
     if kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
         return NexusStackSource(spec.uri, entry=spec.entry or "entry")
     if kind is SourceKind.PROCESSED_NEXUS:
-        return ProcessedNexusSource(spec.uri, entry=spec.entry or "entry")
+        # N1: open_source(nxs, source_root=...) repoints a moved raw tree.
+        return ProcessedNexusSource(
+            spec.uri, entry=spec.entry or "entry",
+            source_root=dict(spec.options).get("source_root"))
     if kind is SourceKind.IMAGE_FILE:
         return ImageFileSource(spec.uri, **dict(spec.options))
     if kind is SourceKind.LIVE:

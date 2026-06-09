@@ -64,9 +64,13 @@ class ProcessedNexusSource(BaseFrameSource):
 
     kind = SourceKind.PROCESSED_NEXUS
 
-    def __init__(self, path: str | Path, *, entry: str = "entry") -> None:
+    def __init__(self, path: str | Path, *, entry: str = "entry",
+                 source_root: str | Path | None = None) -> None:
         self.path = Path(path)
         self.entry = entry
+        # N1: repoint a moved raw tree (overrides the stored @source_base) so
+        # load_frame resolves the full-res master after the data relocates.
+        self.source_root = source_root
         with FrameViewReader(self.path, entry=entry, include_thumbnail=False) as reader:
             labels = reader.labels()
         super().__init__(
@@ -84,21 +88,37 @@ class ProcessedNexusSource(BaseFrameSource):
         )
 
     def read_view(self, index: int, *, include_thumbnail: bool = True) -> FrameView:
-        with FrameViewReader(self.path, entry=self.entry, include_thumbnail=include_thumbnail) as reader:
+        with FrameViewReader(self.path, entry=self.entry,
+                             include_thumbnail=include_thumbnail,
+                             source_root=self.source_root) as reader:
             return reader.read(int(index))
 
     def iter_views(self, *, include_thumbnail: bool = True) -> Iterator[FrameView]:
-        with FrameViewReader(self.path, entry=self.entry, include_thumbnail=include_thumbnail) as reader:
+        with FrameViewReader(self.path, entry=self.entry,
+                             include_thumbnail=include_thumbnail,
+                             source_root=self.source_root) as reader:
             for idx in self.frame_indices:
                 yield reader.read(idx)
 
     def load_frame(self, index: int) -> np.ndarray:
-        view = self.read_view(index, include_thumbnail=True)
-        if view.raw is not None:
-            return np.asarray(view.raw)
-        if view.thumbnail is not None:
-            return np.asarray(view.thumbnail)
-        raise ValueError(f"processed frame {index} has no raw image or thumbnail")
+        """STRICT full-resolution raw load via the per-frame source pointer.
+
+        Resolves the relative ``source/path`` against ``@source_base`` /
+        ``source_root`` (absolute back-compat) and reads the full-res master.
+        A headless analysis consumer (RSM / stitching / fitting) reading a
+        processed ``.nxs`` as a FrameSource must NEVER silently get a downsampled,
+        mask-baked THUMBNAIL in place of the raw — that would analyze preview
+        data.  So ``allow_thumbnail=False``: if the master can't be resolved this
+        raises ``KeyError`` (a clean error), rather than degrading.  The display
+        path keeps the thumbnail fallback via
+        :func:`ssrl_xrd_tools.io.image_source.load_processed_raw_or_thumbnail`.
+        """
+        from ssrl_xrd_tools.io.read import get_raw_frame
+        return np.asarray(
+            get_raw_frame(self.path, int(index), entry=self.entry,
+                          allow_thumbnail=False, source_root=self.source_root),
+            dtype=float,
+        )
 
     def metadata_for(self, index: int) -> Mapping[str, Any]:
         return self.read_view(index, include_thumbnail=False).metadata_raw
