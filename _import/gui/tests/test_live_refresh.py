@@ -3752,6 +3752,42 @@ def test_start_pause_resume_button_state_machine():
     assert host.sigResuming.emitted == [()]    # guard re-engaged before resume
 
 
+def test_stop_during_pausing_ignores_late_sigpaused():
+    """Adversarial-review fix: Stop during the transient 'Pausing…' window must
+    win.  A late sigPaused (queued from the worker) arriving after stop() must
+    NOT flash the button back to orange 'Resume' -- _on_paused drops it because
+    self.command is already 'stop'."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=False, batch=True)
+
+    imageWrangler._on_start_clicked(host)      # running
+    imageWrangler._on_start_clicked(host)      # -> pause ('Pausing…')
+    imageWrangler.stop(host)                   # Stop lands during 'Pausing…'
+    assert host.ui.startButton.text() == "Start"     # morphed back to green
+    assert host._run_phase == "idle"
+
+    imageWrangler._on_paused(host)             # late queued sigPaused arrives
+    assert host.ui.startButton.text() == "Start"     # NOT flashed to 'Resume'
+    assert host._run_phase == "idle"
+
+
+def test_redispatch_during_pausing_is_noop():
+    """Adversarial-review fix: _run_phase keeps 'pausing' distinct, so a stray
+    re-dispatch during the disabled 'Pausing…' window does NOT fire a second
+    pause()/start()."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=False, batch=True)
+    imageWrangler._on_start_clicked(host)      # running
+    imageWrangler._on_start_clicked(host)      # -> pause ('Pausing…')
+    assert host._run_phase == "pausing"
+    host.thread.command = "sentinel"           # detect any spurious command write
+    imageWrangler._on_start_clicked(host)      # re-dispatch while 'pausing'
+    assert host.thread.command == "sentinel"   # no-op: no pause()/start() fired
+    assert host.ui.startButton.text() == "Pausing…"
+
+
 def test_start_without_poni_is_gated():
     """BUG-1: Start/Live must refuse to run without a loaded PONI rather than
     re-running the previous scan with the stale calibration."""

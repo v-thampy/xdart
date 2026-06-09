@@ -29,7 +29,8 @@ def test_enter_pause_streaming_drains_then_flushes_then_signals():
     and sigPaused fires only AFTER both (so the writer is provably idle before
     the GUI reads disk)."""
     calls = []
-    session = SimpleNamespace(drain=lambda: calls.append('drain'))
+    session = SimpleNamespace(
+        drain=lambda timeout=None: (calls.append('drain'), True)[1])
     sink = SimpleNamespace(_flush=lambda *, force=False: calls.append(('flush', force)))
     emitted = []
     w = SimpleNamespace(
@@ -43,6 +44,42 @@ def test_enter_pause_streaming_drains_then_flushes_then_signals():
 
     assert calls == ['drain', ('flush', True)]      # drain strictly before flush
     assert emitted == ['paused']                    # signalled after drain+flush
+
+
+def test_enter_pause_serial_tail_wins_over_open_streaming_session(monkeypatch):
+    """Adversarial-review fix: in the true-live WATCH loop the Phase-2 streaming
+    session is still open but DORMANT, while the serial path accumulates the
+    watch tail (_frames_since_save).  _enter_pause must route on the serial tail
+    FIRST -- flush the .nxs + reset the counter -- not take the streaming branch
+    (which would leave _frames_since_save leaked).  It still drains the dormant
+    session first (a no-op) to keep the writer idle."""
+    monkeypatch.setattr(itmod, '_get_h5pool',
+                        lambda: SimpleNamespace(pause=lambda f: None,
+                                                resume=lambda f: None))
+    order = []
+    session = SimpleNamespace(
+        drain=lambda timeout=None: order.append('drain') or True)
+    sink = SimpleNamespace(_flush=lambda *, force=False: order.append('sink_flush'))
+    scan = SimpleNamespace(data_file='x.nxs',
+                           _save_to_nexus=lambda: order.append('save'))
+    w = SimpleNamespace(
+        _streaming_session=session, _streaming_sink=sink,   # open but dormant
+        _active_scan=scan, xye_only=False, _frames_since_save=4,
+        file_lock=threading.RLock(),
+        _flush_xye_buffer=lambda s: order.append('xye'),
+        sigPaused=SimpleNamespace(emit=lambda: order.append('paused')),
+    )
+    w._enter_pause = MethodType(imageThread._enter_pause, w)
+
+    w._enter_pause()
+
+    # Serial branch ran (drain the dormant session, then SERIAL save+xye), and
+    # the sink streaming flush did NOT (would re-route the watch tail wrongly).
+    assert 'save' in order and 'xye' in order
+    assert 'sink_flush' not in order
+    assert order.index('drain') < order.index('save')   # idle the writer first
+    assert w._frames_since_save == 0                     # counter reset, not leaked
+    assert order[-1] == 'paused'
 
 
 def test_enter_pause_serial_flushes_unsaved_tail(monkeypatch):
@@ -90,7 +127,7 @@ def test_enter_pause_serial_nothing_to_flush_still_signals(monkeypatch):
 def test_enter_pause_signals_even_if_drain_raises():
     """A drain/flush failure must not strand the run: log + still emit sigPaused
     (we've stopped submitting, so the writer is idle and reads are safe)."""
-    def _boom():
+    def _boom(timeout=None):
         raise RuntimeError("writer exploded")
     emitted = []
     w = SimpleNamespace(

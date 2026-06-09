@@ -886,6 +886,8 @@ class imageWrangler(wranglerWidget):
 
         Stop (separate red button) remains the terminal action from any state."""
         phase = getattr(self, '_run_phase', 'idle')
+        if phase == 'pausing':
+            return            # transient (button disabled); ignore stray re-dispatch
         if phase == 'running':
             self.pause()
         elif phase == 'paused':
@@ -929,6 +931,12 @@ class imageWrangler(wranglerWidget):
     def _on_paused(self):
         """GUI slot for the worker's sigPaused (run frozen at a frame boundary).
         The host (staticWidget) lifts the freeze guard off the same signal."""
+        # sigPaused is queued from the worker thread.  If a Stop landed during
+        # the transient 'Pausing…' window (stop() already morphed the button to
+        # green 'idle'), a late sigPaused must NOT flash the button back to orange
+        # 'Resume' — self.command (GUI-thread mirror) is 'stop' by then.
+        if self.command == 'stop':
+            return
         self._set_action_button('paused')    # orange 'Resume'
 
     def _on_resume(self):
@@ -952,8 +960,11 @@ class imageWrangler(wranglerWidget):
             'pausing': ('Pausing…', 'active', False),
             'paused':  ('Resume',   'active', True),
         }.get(phase, ('Start', 'idle', True))
-        self._run_phase = 'idle' if phase == 'idle' else (
-            'paused' if phase == 'paused' else 'running')
+        # Keep the transient 'pausing' distinct (not collapsed into 'running'),
+        # so a re-dispatch during the disabled 'Pausing…' window is an explicit
+        # no-op in _on_start_clicked rather than a redundant second pause().
+        self._run_phase = phase if phase in (
+            'idle', 'running', 'pausing', 'paused') else 'idle'
         btn.setText(label)
         btn.setEnabled(enabled)
         if btn.property('runPhase') != prop:

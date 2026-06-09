@@ -524,6 +524,11 @@ class imageThread(wranglerThread):
         self.img_fnames.clear()
         self.processed.clear()
         self.processed_scans.clear()
+        # Pause: start each run with a fresh serial-flush handle + save counter
+        # so an early pause of THIS run can never flush a prior (stopped) run's
+        # scan via stale state.
+        self._active_scan = None
+        self._frames_since_save = 0
         self._eiger_master_path = None
         self._eiger_frame_idx = 0
         self._eiger_nframes = 0
@@ -1238,35 +1243,53 @@ class imageThread(wranglerThread):
         while self.command == 'pause':
             time.sleep(0.05)
 
+    #: Bound the pause drain so a hung pool worker (stalled IO / runaway pyFAI)
+    #: can't deadlock the pause; the wait also bails early on Stop/close.
+    PAUSE_DRAIN_TIMEOUT = 30.0
+
     def _enter_pause(self) -> None:
         """Quiesce the writer at a frame boundary so a paused user can browse any
         already-processed frame from disk, then signal the GUI to lift the guard.
 
-        Streaming: ``session.drain()`` (non-terminal — drains the in-flight
-        window + the sink keeps the writer thread alive for resume) then flush
-        the sink to .nxs.  Serial true-live: flush the unsaved
-        ``_frames_since_save`` tail via the standard save protocol.  STRICT
-        ordering: the drain/flush MUST complete BEFORE ``sigPaused`` so the
-        writer is provably idle before the GUI reads disk (race-safe).
+        Routing is keyed on the SERIAL tail first: ``_frames_since_save > 0`` is
+        the unambiguous signal that the serial path is the active writer (the
+        true-live watch loop uses ``_process_one`` and increments it; the
+        streaming path never does).  So during Phase-3 live watching — where the
+        Phase-2 streaming session is still open but DORMANT — the serial flush
+        correctly wins and the watch tail (incl. its XYE buffer) is persisted and
+        the counter reset.  Otherwise the streaming branch drains+flushes.
+
+        STRICT ordering: drain/flush MUST complete BEFORE ``sigPaused`` so the
+        writer is provably idle before the GUI reads disk (race-safe).  The drain
+        is bounded (:attr:`PAUSE_DRAIN_TIMEOUT`) + cancel-aware so a stuck worker
+        can't strand the pause or block Stop/close.
         """
         try:
             session = getattr(self, '_streaming_session', None)
             sink = getattr(self, '_streaming_sink', None)
-            if session is not None and sink is not None:
-                session.drain()              # non-terminal: session stays open
-                sink._flush(force=True)      # write drained frames to .nxs
-            else:
-                scan = self._active_scan
-                if (scan is not None and not self.xye_only
-                        and self._frames_since_save > 0):
+            scan = self._active_scan
+            if scan is not None and self._frames_since_save > 0:
+                # Serial path is the active writer (watch loop / serial dispatch).
+                # Drain any open streaming session first (a no-op when nothing is
+                # in-flight) so the writer is idle, then flush the serial tail.
+                if session is not None:
+                    session.drain(timeout=getattr(self, 'PAUSE_DRAIN_TIMEOUT', 30.0))
+                if not self.xye_only:
                     _get_h5pool().pause(scan.data_file)
                     try:
                         with self.file_lock:
                             scan._save_to_nexus()
                     finally:
                         _get_h5pool().resume(scan.data_file)
-                    self._flush_xye_buffer(scan)
-                    self._frames_since_save = 0
+                self._flush_xye_buffer(scan)
+                self._frames_since_save = 0
+            elif session is not None and sink is not None:
+                # Streaming path (batch / reprocess / live Phase 2): drain the
+                # in-flight window (non-terminal — session stays open) + flush.
+                if not session.drain(timeout=getattr(self, 'PAUSE_DRAIN_TIMEOUT', 30.0)):
+                    logger.warning("pause drain timed out (worker not idle); "
+                                   "pausing without a full flush")
+                sink._flush(force=True)
         except Exception:
             # A drain/flush failure must not strand the run; log loudly and
             # still signal the pause (we've stopped submitting, so the writer is
