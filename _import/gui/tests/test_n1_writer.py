@@ -116,3 +116,55 @@ def test_n1_writer_to_ssrl_reader_roundtrip(tmp_path):
         s.create_dataset("frame_index", data=1)
 
     np.testing.assert_allclose(get_raw_frame(nxs, frame=0), raw_arr[1])
+
+
+def test_load_frame_v2_resolves_relative_source_against_source_base(tmp_path):
+    """N1 reload (xdart-internal): a portable .nxs stores source_file RELATIVE to
+    the project root (@source_base), which is NOT the .nxs directory (the default
+    output is <root>/xdart_processed_data).  _load_frame_v2 must resolve the
+    relative source_file against @source_base, not the .nxs dir -- else lazy raw
+    reload / is_reload_only detection silently breaks after a Project-Folder run."""
+    from pathlib import Path
+    from xdart.modules.ewald.frame_series import _load_frame_v2
+
+    root = tmp_path / "proj"
+    raw = root / "raw" / "img_0001.tif"
+    raw.parent.mkdir(parents=True)
+    raw.touch()
+    nxs_dir = root / "xdart_processed_data"      # .nxs lives BELOW the root
+    nxs_dir.mkdir()
+    nxs = nxs_dir / "scan.nxs"
+    with h5py.File(nxs, "w") as f:
+        e = f.create_group("entry")
+        e.attrs["source_base"] = Path(str(root)).as_posix()
+        s = e.create_group("frames/frame_0001/source")
+        s.create_dataset("path", data=np.bytes_(b"raw/img_0001.tif"))
+        s.create_dataset("frame_index", data=0)
+
+    with h5py.File(nxs, "r") as f:
+        # source_root = the .nxs dir (the OLD behavior); @source_base must win.
+        frame = _load_frame_v2(f, 1, static=True, gi=False,
+                               source_root=str(nxs_dir))
+    assert frame._resolved_source_path() == os.path.normpath(str(raw))
+    assert frame.is_reload_only is False         # the raw exists under the root
+
+
+def test_load_frame_v2_absolute_source_back_compat(tmp_path):
+    """Old absolute-path .nxs (no @source_base): the absolute source_file is used
+    as-is regardless of source_root -- back-compat preserved."""
+    from xdart.modules.ewald.frame_series import _load_frame_v2
+
+    raw = tmp_path / "raw" / "img.tif"
+    raw.parent.mkdir(parents=True)
+    raw.touch()
+    nxs = tmp_path / "scan.nxs"
+    with h5py.File(nxs, "w") as f:
+        e = f.create_group("entry")                      # NO source_base
+        s = e.create_group("frames/frame_0002/source")
+        s.create_dataset("path", data=np.bytes_(str(raw).encode()))
+        s.create_dataset("frame_index", data=0)
+    with h5py.File(nxs, "r") as f:
+        frame = _load_frame_v2(f, 2, static=True, gi=False,
+                               source_root=str(tmp_path))
+    assert frame._resolved_source_path() == str(raw)
+    assert frame.is_reload_only is False
