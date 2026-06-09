@@ -120,38 +120,21 @@ def _frame_labels_from_groups(entry) -> list:
     return sorted(labels)
 
 
-def _resolve_source_master(scan_file: Path, src) -> "Path | None":
-    """Resolve a frame's ``source`` group to an existing master path, using
-    the same candidate order as :func:`get_raw_frame`.  Returns None if no
-    candidate exists."""
-    from ssrl_xrd_tools.io.read import _decode
+def _resolve_source_master(scan_file: Path, src, *, source_base=None,
+                           source_root=None) -> "Path | None":
+    """Resolve a frame's ``source`` group to an existing master path.
+
+    Thin wrapper over :func:`ssrl_xrd_tools.io.read.resolve_source_master` (the
+    single N1 resolver) so classification + display agree on precedence
+    (``source_root`` > ``@source_base`` > scan dir) and absolute back-compat."""
+    from ssrl_xrd_tools.io.read import _decode, resolve_source_master
 
     if src is None or "path" not in src:
         return None
     rel = _decode(src["path"][()])
-    if not rel:
-        return None
-    rel_path = Path(str(rel)).expanduser()
-    candidates = []
-    if rel_path.is_absolute():
-        candidates.append(rel_path)
-    candidates.extend([
-        scan_file.parent / rel_path,
-        scan_file.parent / rel_path.name,
-        rel_path,
-    ])
-    seen = set()
-    for cand in candidates:
-        try:
-            resolved = cand.resolve()
-        except OSError:
-            resolved = cand
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        if resolved.exists():
-            return resolved
-    return None
+    return resolve_source_master(
+        rel, scan_file=scan_file, source_base=source_base, source_root=source_root,
+    )
 
 
 # ── public API ────────────────────────────────────────────────────────
@@ -227,6 +210,11 @@ def classify_image_source(path) -> ImageSourceInfo:
 
             has_raw = False
             has_thumbnail = False
+            # N1: the project root the relative source paths point under.
+            from ssrl_xrd_tools.io.read import _decode as _dec
+            source_base = (_dec(entry.attrs["source_base"])
+                           if entry is not None and "source_base" in entry.attrs
+                           else None)
             frames = entry.get("frames") if entry is not None else None
             if frames is not None:
                 for name in frames:
@@ -235,7 +223,8 @@ def classify_image_source(path) -> ImageSourceInfo:
                         continue
                     if not has_thumbnail and fg.get("thumbnail") is not None:
                         has_thumbnail = True
-                    if not has_raw and _resolve_source_master(p, fg.get("source")) is not None:
+                    if not has_raw and _resolve_source_master(
+                            p, fg.get("source"), source_base=source_base) is not None:
                         has_raw = True
                     if has_raw and has_thumbnail:
                         break
@@ -287,20 +276,21 @@ def _read_thumbnail_direct(path, frame) -> "np.ndarray | None":
         return None
 
 
-def load_processed_raw_or_thumbnail(path, frame) -> RawFrameResult:
+def load_processed_raw_or_thumbnail(path, frame, *, source_root=None) -> RawFrameResult:
     """For a processed ``.nxs``: return the full-resolution raw image for a
     frame **label** if the per-frame source master resolves, else the
     dequantized thumbnail, else nothing — recording which in ``source``.
 
     Mirrors (and replaces) the GUI's strict-raw → thumbnail → direct-read
-    fallback chain.
+    fallback chain.  ``source_root`` (N1) repoints relative source paths at a
+    moved data tree (overrides the stored ``@source_base``).
     """
     from ssrl_xrd_tools.io.read import get_raw_frame
 
     frame = int(frame)
     # Strict raw first (no thumbnail) so we know it's genuinely full-res.
     try:
-        img = get_raw_frame(path, frame, allow_thumbnail=False)
+        img = get_raw_frame(path, frame, allow_thumbnail=False, source_root=source_root)
         return RawFrameResult(image=np.asarray(img, dtype=float),
                               source="raw", frame=frame)
     except Exception:
@@ -310,7 +300,7 @@ def load_processed_raw_or_thumbnail(path, frame) -> RawFrameResult:
     # Raw unavailable -> dequantized thumbnail (get_raw_frame returns it when
     # the master is missing and allow_thumbnail is True).
     try:
-        img = get_raw_frame(path, frame, allow_thumbnail=True)
+        img = get_raw_frame(path, frame, allow_thumbnail=True, source_root=source_root)
         return RawFrameResult(image=np.asarray(img, dtype=float),
                               source="thumbnail", frame=frame)
     except Exception:
