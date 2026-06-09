@@ -582,9 +582,13 @@ class Scan:
     integration slices are always read on demand.
     """
 
-    def __init__(self, scan_file: str | Path, *, entry: str = "entry"):
+    def __init__(self, scan_file: str | Path, *, entry: str = "entry",
+                 source_root: str | Path | None = None):
         self.path = Path(scan_file)
         self.entry = entry
+        # N1: repoint a moved raw tree for load_frame/iter_chunks (overrides the
+        # stored @source_base).
+        self.source_root = source_root
         self._metadata_cache: dict | None = None
         self._scan_data_cache: dict[str, np.ndarray] | None = None
 
@@ -639,9 +643,12 @@ class Scan:
         return get_thumbnail(self.path, frame, entry=self.entry)
 
     def load_frame(self, index: int) -> np.ndarray:
-        """Load one raw detector frame through its stored source pointer."""
+        """Load one raw detector frame through its stored source pointer.
+
+        ``source_root`` (N1, from the constructor) repoints a moved raw tree."""
         return get_raw_frame(
             self.path, int(index), entry=self.entry, allow_thumbnail=False,
+            source_root=self.source_root,
         )
 
     def iter_chunks(self, chunk_size: int):
@@ -663,6 +670,11 @@ class Scan:
         return f"Scan({self.path.name!r}, n_frames={len(self)})"
 
 
-def open_scan(scan_file: str | Path, *, entry: str = "entry") -> Scan:
-    """Return a :class:`Scan` handle for ``scan_file`` (notebook sugar)."""
-    return Scan(scan_file, entry=entry)
+def open_scan(scan_file: str | Path, *, entry: str = "entry",
+              source_root: str | Path | None = None) -> Scan:
+    """Return a :class:`Scan` handle for ``scan_file`` (notebook sugar).
+
+    ``source_root`` (N1) repoints relative raw-source paths at a moved data
+    tree for ``Scan.load_frame`` / ``iter_chunks`` (overrides the stored
+    ``@source_base``)."""
+    return Scan(scan_file, entry=entry, source_root=source_root)

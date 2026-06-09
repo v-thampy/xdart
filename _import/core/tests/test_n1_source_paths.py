@@ -157,3 +157,92 @@ def test_get_raw_frame_source_root_overrides_moved_tree(tmp_path):
     # With it, the raw resolves under the new root.
     np.testing.assert_allclose(
         get_raw_frame(nxs, frame=0, source_root=str(moved_root)), raw_arr[0])
+
+
+# ── §3 read sites: FrameView / FrameSource / Scan resolve the portable path ──
+
+def test_read_frame_view_resolves_source_path_via_source_base(tmp_path):
+    """N1 §3: FrameView.source_path is RESOLVED (relative -> absolute master)
+    against @source_base, so FrameView consumers (FrameSource/Scan/RSM/stitch/
+    notebooks) can locate the raw -- not the bare stored relpath."""
+    from ssrl_xrd_tools.io import read_frame_view
+    root = tmp_path / "proj"
+    master = root / "raw" / "m.h5"
+    master.parent.mkdir(parents=True)
+    _write_master(master, np.arange(2 * 2 * 2, dtype=float).reshape(2, 2, 2))
+    nxs = tmp_path / "other" / "scan.nxs"          # .nxs NOT near the raw
+    nxs.parent.mkdir(parents=True)
+    _write_processed(nxs, rel_path="raw/m.h5", source_base=str(root))
+
+    fv = read_frame_view(nxs, 0)
+    assert Path(fv.source_path) == master.resolve()
+
+
+def test_read_frame_view_source_root_override(tmp_path):
+    from ssrl_xrd_tools.io import read_frame_view
+    moved = tmp_path / "moved"
+    master = moved / "raw" / "m.h5"
+    master.parent.mkdir(parents=True)
+    _write_master(master, np.zeros((1, 2, 2)))
+    nxs = tmp_path / "scan.nxs"
+    _write_processed(nxs, rel_path="raw/m.h5", source_base="/old/gone/proj")
+    fv = read_frame_view(nxs, 0, source_root=str(moved))
+    assert Path(fv.source_path) == master.resolve()
+
+
+def test_read_frame_view_unresolved_keeps_stored_string(tmp_path):
+    """When nothing resolves, source_path keeps the stored relpath (provenance
+    preserved, never silently blanked)."""
+    from ssrl_xrd_tools.io import read_frame_view
+    nxs = tmp_path / "scan.nxs"
+    _write_processed(nxs, rel_path="raw/missing.h5", source_base=str(tmp_path))
+    fv = read_frame_view(nxs, 0)
+    assert fv.source_path == "raw/missing.h5"
+
+
+def test_processed_nexus_source_load_frame_returns_full_res_master(tmp_path):
+    """N1 §3 (+ fixes a pre-existing dead branch): ProcessedNexusSource.load_frame
+    resolves the per-frame source pointer and returns the FULL-RES master (not the
+    downsampled thumbnail) when it resolves."""
+    from ssrl_xrd_tools.sources.nexus import ProcessedNexusSource
+    root = tmp_path / "proj"
+    master = root / "raw" / "m.h5"
+    master.parent.mkdir(parents=True)
+    raw = np.arange(2 * 4 * 4, dtype=float).reshape(2, 4, 4)
+    _write_master(master, raw)
+    nxs = tmp_path / "processed" / "scan.nxs"
+    nxs.parent.mkdir(parents=True)
+    _write_processed(nxs, rel_path="raw/m.h5", source_base=str(root), master_frame=1)
+
+    src = ProcessedNexusSource(nxs)
+    img = src.load_frame(0)
+    assert img.shape == (4, 4)                     # full-res, not a thumbnail
+    np.testing.assert_allclose(img, raw[1])
+
+
+def test_processed_nexus_source_source_root_repoints_moved_tree(tmp_path):
+    from ssrl_xrd_tools.sources.nexus import ProcessedNexusSource
+    moved = tmp_path / "moved"
+    master = moved / "raw" / "m.h5"
+    master.parent.mkdir(parents=True)
+    raw = np.arange(4 * 4, dtype=float).reshape(1, 4, 4)
+    _write_master(master, raw)
+    nxs = tmp_path / "scan.nxs"
+    _write_processed(nxs, rel_path="raw/m.h5", source_base="/old/gone", master_frame=0)
+    src = ProcessedNexusSource(nxs, source_root=str(moved))
+    np.testing.assert_allclose(src.load_frame(0), raw[0])
+
+
+def test_open_scan_source_root_load_frame(tmp_path):
+    """N1 §3: open_scan(nxs, source_root=...).load_frame resolves through the
+    moved tree (the notebook sugar override)."""
+    from ssrl_xrd_tools.io import open_scan
+    moved = tmp_path / "moved"
+    master = moved / "raw" / "m.h5"
+    master.parent.mkdir(parents=True)
+    raw = np.arange(4 * 4, dtype=float).reshape(1, 4, 4)
+    _write_master(master, raw)
+    nxs = tmp_path / "scan.nxs"
+    _write_processed(nxs, rel_path="raw/m.h5", source_base="/old/gone", master_frame=0)
+    scan = open_scan(nxs, source_root=str(moved))
+    np.testing.assert_allclose(scan.load_frame(0), raw[0])
