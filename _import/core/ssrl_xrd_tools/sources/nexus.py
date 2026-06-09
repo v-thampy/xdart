@@ -101,16 +101,22 @@ class ProcessedNexusSource(BaseFrameSource):
                 yield reader.read(idx)
 
     def load_frame(self, index: int) -> np.ndarray:
-        # N1: resolve + read the full-resolution raw master via the per-frame
-        # source pointer (relative source/path against @source_base / source_root,
-        # absolute back-compat), falling back to the stored thumbnail.
-        # get_raw_frame owns that resolution + fallback (the FrameViewReader path
-        # never populated FrameView.raw, so the old `view.raw` branch was dead and
-        # this always returned the thumbnail).
+        """STRICT full-resolution raw load via the per-frame source pointer.
+
+        Resolves the relative ``source/path`` against ``@source_base`` /
+        ``source_root`` (absolute back-compat) and reads the full-res master.
+        A headless analysis consumer (RSM / stitching / fitting) reading a
+        processed ``.nxs`` as a FrameSource must NEVER silently get a downsampled,
+        mask-baked THUMBNAIL in place of the raw — that would analyze preview
+        data.  So ``allow_thumbnail=False``: if the master can't be resolved this
+        raises ``KeyError`` (a clean error), rather than degrading.  The display
+        path keeps the thumbnail fallback via
+        :func:`ssrl_xrd_tools.io.image_source.load_processed_raw_or_thumbnail`.
+        """
         from ssrl_xrd_tools.io.read import get_raw_frame
         return np.asarray(
             get_raw_frame(self.path, int(index), entry=self.entry,
-                          allow_thumbnail=True, source_root=self.source_root),
+                          allow_thumbnail=False, source_root=self.source_root),
             dtype=float,
         )
 

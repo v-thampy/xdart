@@ -246,3 +246,35 @@ def test_open_scan_source_root_load_frame(tmp_path):
     _write_processed(nxs, rel_path="raw/m.h5", source_base="/old/gone", master_frame=0)
     scan = open_scan(nxs, source_root=str(moved))
     np.testing.assert_allclose(scan.load_frame(0), raw[0])
+
+
+def test_processed_nexus_source_load_frame_strict_raises_without_master(tmp_path):
+    """P1 #3 (codex): a headless FrameSource consumer must NEVER silently get a
+    downsampled/mask-baked thumbnail in place of the full-res raw.  When the
+    master can't be resolved, ProcessedNexusSource.load_frame RAISES (clean
+    error) -- while the separate DISPLAY API still degrades to the thumbnail."""
+    from ssrl_xrd_tools.sources.nexus import ProcessedNexusSource
+    from ssrl_xrd_tools.io.image_source import load_processed_raw_or_thumbnail
+
+    nxs = tmp_path / "scan.nxs"
+    with h5py.File(nxs, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.create_dataset("intensity", data=np.zeros((1, 5)))
+        g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
+        s = e.create_group("frames/frame_0000/source")
+        s.create_dataset("path", data=np.bytes_(b"/gone/missing_master.h5"))
+        s.create_dataset("frame_index", data=0)
+        th = e.create_dataset("frames/frame_0000/thumbnail",
+                              data=np.ones((4, 4), dtype=np.uint8))
+        th.attrs["vmin"] = 0.0
+        th.attrs["vmax"] = 1.0
+        th.attrs["dtype"] = "uint8"
+
+    src = ProcessedNexusSource(nxs)
+    with pytest.raises(KeyError):              # strict: no silent thumbnail
+        src.load_frame(0)
+
+    # The display path is a SEPARATE API and still degrades to the thumbnail.
+    res = load_processed_raw_or_thumbnail(nxs, 0)
+    assert res.source == "thumbnail"
