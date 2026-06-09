@@ -72,8 +72,13 @@ params = [
         {'name': 'mask_file', 'title': 'Mask File', 'type': 'str', 'value': ''},
         NamedActionParameter(name='mask_file_browse', title='Browse...'),
     ], 'expanded': True, 'visible': False},
-    {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'children': [
-        {'name': 'Grazing', 'type': 'bool', 'value': False},
+    {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'syncExpanded': True,
+     'children': [
+        # UI-1 (#81): the GROUP HEADER is the on/off toggle (expand = on,
+        # collapse = off; syncExpanded mirrors the user's expand into opts).
+        # The bool is the hidden source of truth the rest of the code reads --
+        # a hidden bool can't repaint-uncheck when the tree is disabled (#56).
+        {'name': 'Grazing', 'type': 'bool', 'value': False, 'visible': False},
         {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'list',
          'values': ['th', 'Manual'], 'value': 'th'},
         {'name': 'th_val', 'title': 'Theta', 'type': 'str', 'value': '0.1', 'visible': False},
@@ -91,8 +96,10 @@ params = [
          'values': {u'Q\u1D62\u209A\u2013Q\u2092\u2092\u209A': 'qip_qoop', u'Q-\u03C7': 'q_chi'},
          'value': 'qip_qoop', 'visible': False},
     ], 'expanded': False, 'visible': False},
-    {'name': 'Mask', 'title': 'Intensity Threshold', 'type': 'group', 'children': [
-        {'name': 'Threshold', 'type': 'bool', 'value': False},
+    {'name': 'Mask', 'title': 'Intensity Threshold', 'type': 'group', 'syncExpanded': True,
+     'children': [
+        # UI-1 (#81): group header is the on/off toggle; bool is hidden (see GI).
+        {'name': 'Threshold', 'type': 'bool', 'value': False, 'visible': False},
         {'name': 'min', 'title': 'Min', 'type': 'int', 'value': 0},
         {'name': 'max', 'title': 'Max', 'type': 'int', 'value': 0},
     ], 'expanded': False, 'visible': False},
@@ -202,8 +209,10 @@ class imageWrangler(wranglerWidget):
         # rather than the QCheckBox-only ``stateChanged``.
         self.ui.liveCheckBox.toggled.connect(self._on_mode_changed)
         self.ui.batchCheckBox.toggled.connect(self._on_mode_changed)
-        # Live doubles as a start/stop toggle.  Connected AFTER
-        # _on_mode_changed so live_mode is already set when we start.
+        # Phase B: Live is now a pure MODE toggle (it no longer starts/stops a
+        # run — the single Start/Pause/Resume action button does).  _on_live_toggled
+        # just resyncs live_mode (a no-op alongside _on_mode_changed, kept for
+        # clarity).  Connected AFTER _on_mode_changed.
         self.ui.liveCheckBox.toggled.connect(self._on_live_toggled)
         self.ui.processingModeCombo.currentTextChanged.connect(lambda _: self._save_to_session())
         self.ui.liveCheckBox.toggled.connect(lambda _: self._save_to_session())
@@ -296,6 +305,12 @@ class imageWrangler(wranglerWidget):
         # Wire signals from parameter tree based buttons
         self.parameters.sigTreeStateChanged.connect(self.setup)
         self.parameters.sigTreeStateChanged.connect(self._save_to_session)
+
+        # UI-1 (#81): mirror the GI / Intensity-Threshold group header
+        # expand/collapse into their hidden enabling bool (the toggle).
+        for _grp in self._EXPAND_TOGGLE_GROUPS:
+            self.parameters.child(_grp).sigOptionsChanged.connect(
+                self._sync_group_toggle_from_expand)
 
         self.parameters.child('Calibration').child('poni_file_browse').sigActivated.connect(
             self.set_poni_file
@@ -398,6 +413,14 @@ class imageWrangler(wranglerWidget):
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
         # self.thread.sigUpdateFrame.connect(self.sigUpdateFrame.emit)
         self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
+        # Pause (Phase B): the worker emits sigPaused once it has drained+flushed
+        # at a frame boundary.  Morph the action button to Resume here AND
+        # re-emit at the wrangler level so the host (staticWidget) can lift the
+        # freeze guard for browsing.  _run_phase tracks the Start/Pause/Resume
+        # state machine (idle | running | paused).
+        self._run_phase = 'idle'
+        self.thread.sigPaused.connect(self._on_paused)
+        self.thread.sigPaused.connect(self.sigPaused.emit)
 
         # Enable/disable buttons initially
         self.ui.stopButton.setEnabled(False)
@@ -409,19 +432,24 @@ class imageWrangler(wranglerWidget):
         # instead of folded; collapsed when off.
         self._expand_active_groups()
 
-    def _expand_active_groups(self):
-        """Expand each wrangler group whose enabling param is set.
+    # UI-1 (#81): the GI / Intensity-Threshold groups whose EXPANDED state is the
+    # on/off toggle, mapped to the hidden bool that is their source of truth.
+    _EXPAND_TOGGLE_GROUPS = {'GI': 'Grazing', 'Mask': 'Threshold'}
 
-        The GI / Intensity-Threshold / Background groups default folded.  If
-        Grazing is checked, Threshold is enabled, or a Background source is
-        selected (incl. after a session restore), expand that group via
-        ``setOpts(expanded=True)``; leave it collapsed when off."""
+    def _expand_active_groups(self):
+        """Sync each wrangler group's expanded state to its enabling param.
+
+        For the GI / Intensity-Threshold groups the expanded state IS the
+        on/off toggle (UI-1), so this drives the group expanded == the hidden
+        bool BOTH ways (expand when on, collapse when off) -- e.g. after a
+        session restore.  The Background group only expands-when-on (its toggle
+        is the ``bg_type`` list, not the header)."""
         groups = (
-            ('GI', ('GI', 'Grazing'), lambda v: bool(v)),
-            ('Mask', ('Mask', 'Threshold'), lambda v: bool(v)),
-            ('BG', ('BG', 'bg_type'), lambda v: v not in (None, '', 'None')),
+            ('GI', ('GI', 'Grazing'), lambda v: bool(v), True),
+            ('Mask', ('Mask', 'Threshold'), lambda v: bool(v), True),
+            ('BG', ('BG', 'bg_type'), lambda v: v not in (None, '', 'None'), False),
         )
-        for group_name, child_path, is_on in groups:
+        for group_name, child_path, is_on, collapse_when_off in groups:
             try:
                 group = self.parameters.child(group_name)
                 value = self.parameters.child(*child_path).value()
@@ -429,8 +457,31 @@ class imageWrangler(wranglerWidget):
                 logger.debug("expand-active-group skipped for %s", group_name,
                              exc_info=True)
                 continue
-            if is_on(value):
+            on = is_on(value)
+            if on:
                 group.setOpts(expanded=True)
+            elif collapse_when_off:
+                group.setOpts(expanded=False)
+
+    def _sync_group_toggle_from_expand(self, param, opts):
+        """UI-1 (#81): when the user expands/collapses a header-toggle group
+        (GI / Intensity-Threshold), mirror it into the group's hidden bool so
+        the rest of the wrangler (``setup`` / ``get_args`` / session) sees the
+        on/off state.  ``expanded`` arrives via the group's ``sigOptionsChanged``
+        (``syncExpanded=True`` syncs the user's tree action back into opts)."""
+        if 'expanded' not in opts:
+            return
+        child_name = self._EXPAND_TOGGLE_GROUPS.get(param.name())
+        if child_name is None:
+            return
+        expanded = bool(opts['expanded'])
+        try:
+            bool_param = param.child(child_name)
+        except Exception:
+            return
+        if bool_param.value() != expanded:
+            # Fires sigValueChanged -> sigTreeStateChanged -> setup() reads it.
+            bool_param.setValue(expanded)
 
     # --- Session persistence ---
 
@@ -824,23 +875,25 @@ class imageWrangler(wranglerWidget):
                 w.setToolTip(tip)
 
     def _on_start_clicked(self):
-        """Start button = an explicit NON-live processing run.
+        """The single action button is a 3-state machine (Phase B):
 
-        The Start button and the Live toggle both funnel into :meth:`start`,
-        and ``live_mode`` only ever tracks the Live toggle's checked state.
-        If Live happened to be left checked, a Start click would silently run
-        in live-watching mode ("Watching for new files...") with the Live
-        button lit.  Force a non-live run here: uncheck Live (without firing
-        its start/stop handler) and clear ``live_mode`` so the wrangler runs
-        once over the existing files and ``enabled(False)`` greys Live out for
-        the duration."""
-        if self.ui.liveCheckBox.isChecked():
-            self.ui.liveCheckBox.blockSignals(True)
-            self.ui.liveCheckBox.setChecked(False)
-            self.ui.liveCheckBox.blockSignals(False)
-        self.live_mode = False
-        self.thread.live_mode = False
-        self.start()
+        * **idle** -> Start a run honoring the Live/Batch MODE toggles
+          (``live_mode``/``batch_mode``, already synced by ``_on_mode_changed``).
+          Live is no longer force-unchecked — it is an honored mode, not a
+          competing action.
+        * **running** -> Pause (freeze at a frame boundary; browse from disk).
+        * **paused** -> Resume.
+
+        Stop (separate red button) remains the terminal action from any state."""
+        phase = getattr(self, '_run_phase', 'idle')
+        if phase == 'pausing':
+            return            # transient (button disabled); ignore stray re-dispatch
+        if phase == 'running':
+            self.pause()
+        elif phase == 'paused':
+            self._on_resume()
+        else:
+            self.start()
 
     def _inputs_valid(self):
         """Whether the wrangler can start a run.
@@ -855,32 +908,84 @@ class imageWrangler(wranglerWidget):
         return True
 
     def start(self):
-        # Gate both the Start button and the Live toggle (both funnel here):
-        # refuse to run without a valid PONI rather than re-running the stale
-        # previous scan.
+        # Refuse to run without a valid PONI rather than re-running the stale
+        # previous scan.  Honors the Live/Batch mode toggles (no force-off).
         if not self._inputs_valid():
             return
         self.command = 'start'
         self.thread.command = 'start'
         self.ui.stopButton.setEnabled(True)
+        self._set_action_button('running')   # morph green Start -> orange Pause
         self.sigStart.emit()
 
+    def pause(self):
+        """Request a Pause: freeze processing at a frame boundary without
+        tearing down the scan/session (worker's _wait_if_paused handles it).
+        Mirror the command onto self + thread (same delivery as stop())."""
+        self.command = 'pause'
+        self.thread.command = 'pause'
+        # Transient state until the worker confirms via sigPaused -> _on_paused
+        # (which morphs to Resume).  Disabled so a double-click can't race.
+        self._set_action_button('pausing')
+
+    def _on_paused(self):
+        """GUI slot for the worker's sigPaused (run frozen at a frame boundary).
+        The host (staticWidget) lifts the freeze guard off the same signal."""
+        # sigPaused is queued from the worker thread.  If a Stop landed during
+        # the transient 'Pausing…' window (stop() already morphed the button to
+        # green 'idle'), a late sigPaused must NOT flash the button back to orange
+        # 'Resume' — self.command (GUI-thread mirror) is 'stop' by then.
+        if self.command == 'stop':
+            return
+        self._set_action_button('paused')    # orange 'Resume'
+
+    def _on_resume(self):
+        """Resume from paused.  Re-engage the freeze guard FIRST (the host's
+        sigResuming slot runs synchronously, same GUI thread), THEN flip the
+        command back to the run state so a browse read can't race the restarted
+        writer."""
+        self.sigResuming.emit()
+        self.command = 'start'
+        self.thread.command = 'start'
+        self._set_action_button('running')   # orange 'Pause'
+
+    def _set_action_button(self, phase):
+        """Morph the single action button (Start/Pause/Resume) by text + an
+        orange-vs-green visual state driven by a dynamic ``runPhase`` Qt property
+        (styled in the dark theme).  ``pausing`` is a transient disabled state."""
+        btn = self.ui.startButton
+        label, prop, enabled = {
+            'idle':    ('Start',    'idle',   True),
+            'running': ('Pause',    'active', True),
+            'pausing': ('Pausing…', 'active', False),
+            'paused':  ('Resume',   'active', True),
+        }.get(phase, ('Start', 'idle', True))
+        # Keep the transient 'pausing' distinct (not collapsed into 'running'),
+        # so a re-dispatch during the disabled 'Pausing…' window is an explicit
+        # no-op in _on_start_clicked rather than a redundant second pause().
+        self._run_phase = phase if phase in (
+            'idle', 'running', 'pausing', 'paused') else 'idle'
+        btn.setText(label)
+        btn.setEnabled(enabled)
+        if btn.property('runPhase') != prop:
+            btn.setProperty('runPhase', prop)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
     def _on_live_toggled(self, checked):
-        """Live button is a start/stop toggle for live acquisition:
-        checking it starts a live run (live_mode is already set by
-        :meth:`_on_mode_changed`, which runs first); unchecking it stops
-        the run.  Fires only on genuine user clicks — the programmatic
-        resets in :meth:`stop` / :meth:`enabled` block the signal."""
-        if checked:
-            self.start()
-        else:
-            self.stop()
+        """Live is a pure MODE toggle now (Phase B): it does NOT start/stop a
+        run — that is the single Start/Pause/Resume action button's job.  It just
+        records live_mode (``_on_mode_changed``, connected first, already does;
+        resync defensively)."""
+        self.live_mode = bool(checked)
+        self.thread.live_mode = bool(checked)
 
     def stop(self):
         self.command = 'stop'
         self.thread.command = 'stop'
         self.ui.stopButton.setEnabled(False)
         self.ui.specLabel.setText('')
+        self._set_action_button('idle')       # morph back to green 'Start'
         # Keep the Live toggle in sync when stopped via the Stop button or
         # programmatically — uncheck it without re-entering stop().  Because
         # the uncheck is done with signals blocked, ``_on_mode_changed`` does
@@ -1320,7 +1425,10 @@ class imageWrangler(wranglerWidget):
             enable: bool, True for enabled False for disabled.
         """
         self.tree.setEnabled(enable)
-        self.ui.startButton.setEnabled(enable)
+        # Phase B: the action button stays ENABLED during a run — it is the
+        # Pause/Resume control now (morphed by _set_action_button), not just
+        # Start.  Only its label/colour changes across the run lifecycle.
+        self.ui.startButton.setEnabled(True)
         # Non-param widgets (live outside the ParameterTree): mode combo, Cores
         # spinbox + label, Advanced button.  Stop is left alone (stays enabled).
         for name in ('processingModeCombo', 'maxCoresSpinBox', 'coresLabel',
@@ -1328,10 +1436,11 @@ class imageWrangler(wranglerWidget):
             w = getattr(self.ui, name, None)
             if w is not None:
                 w.setEnabled(enable)
-        # Live toggle state vs. the run lifecycle:
+        # Live/Batch toggle state vs. the run lifecycle:
         if enable:
-            # Run finished — reset Live to off (no re-trigger) and re-enable
-            # both toggles so the next run can be either live or batch.
+            # Run finished — reset the action button to green 'Start' and
+            # re-enable both mode toggles.  Reset Live to off (no re-trigger).
+            self._set_action_button('idle')
             self.ui.liveCheckBox.blockSignals(True)
             self.ui.liveCheckBox.setChecked(False)
             self.ui.liveCheckBox.blockSignals(False)
@@ -1343,10 +1452,10 @@ class imageWrangler(wranglerWidget):
             # dimming) now that the run lock is lifted.
             self._on_mode_changed()
         else:
-            # Run active — keep Live clickable only for a *live* run (so it
-            # can be toggled off to stop); mode toggles stay locked until the
-            # run finishes.
-            self.ui.liveCheckBox.setEnabled(self.live_mode)
+            # Run active — Live/Batch are pure mode toggles and lock for the
+            # run's duration (the morphing action button + Stop drive it now,
+            # so Live no longer needs to stay clickable to stop a live run).
+            self.ui.liveCheckBox.setEnabled(False)
             self.ui.batchCheckBox.setEnabled(False)
 
     def stylize_ParameterTree(self):

@@ -364,6 +364,10 @@ class imageThread(wranglerThread):
         run: Main method, called by start
     """
     showLabel = Qt.QtCore.Signal(str)
+    # Pause: emitted (on the worker thread) AFTER _enter_pause has drained the
+    # in-flight window + flushed the sink to .nxs at a frame boundary -- the GUI
+    # slot then lifts the freeze guard, race-safely (writer is provably quiet).
+    sigPaused = Qt.QtCore.Signal()
 
     def __init__(
             self,
@@ -410,6 +414,9 @@ class imageThread(wranglerThread):
         super().__init__(command_queue, scan_args, fname, file_lock, parent)
 
         self.h5_dir = h5_dir
+        # Pause: the LiveScan currently being processed (a local in
+        # process_scan), stashed so _enter_pause's serial branch can flush it.
+        self._active_scan = None
         self.scan_name = scan_name
         self.single_img = single_img
         self.poni = poni
@@ -517,6 +524,11 @@ class imageThread(wranglerThread):
         self.img_fnames.clear()
         self.processed.clear()
         self.processed_scans.clear()
+        # Pause: start each run with a fresh serial-flush handle + save counter
+        # so an early pause of THIS run can never flush a prior (stopped) run's
+        # scan via stale state.
+        self._active_scan = None
+        self._frames_since_save = 0
         self._eiger_master_path = None
         self._eiger_frame_idx = 0
         self._eiger_nframes = 0
@@ -597,6 +609,7 @@ class imageThread(wranglerThread):
         _t_read_accum = 0.0
 
         while True:
+            self._wait_if_paused()        # freeze here (before reading) if paused
             if self.command == 'stop':
                 break
 
@@ -674,6 +687,7 @@ class imageThread(wranglerThread):
                     )
                     self._frames_since_save = 0
                 scan = self.initialize_scan()
+                self._active_scan = scan      # Pause: serial-flush handle
                 _cached_poni = None
 
             # Rebuild cached AzimuthalIntegrator when poni identity changes
@@ -768,6 +782,9 @@ class imageThread(wranglerThread):
             _poll_growth = 2.0
             poll_s = _poll_min
             while self.command != 'stop':
+                self._wait_if_paused()    # pause/examine/resume a live acquisition
+                if self.command == 'stop':
+                    break                 # Pause -> Stop while watching
                 img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
                 if img_data is None:
                     # Nothing new yet — show watching status and sleep
@@ -784,6 +801,7 @@ class imageThread(wranglerThread):
 
                 if (scan is None) or (scan_name != scan.name):
                     scan = self.initialize_scan()
+                    self._active_scan = scan  # Pause: serial-flush handle
                     _cached_poni = None
 
                 if self.poni is not _cached_poni:
@@ -1226,6 +1244,83 @@ class imageThread(wranglerThread):
             out.append((fname, snumber))
         return out
 
+    # ── Pause / Resume ──────────────────────────────────────────────────────
+    def _wait_if_paused(self) -> None:
+        """Block while a Pause is in effect, WITHOUT tearing down the scan or
+        session.  Pause is a THIRD command state between the run state
+        (``'start'``) and ``'stop'`` (the loops treat everything != 'stop' as go,
+        so 'pause' must be special-cased here).
+
+        On the first entry to pause, :meth:`_enter_pause` brings the file to a
+        frame-boundary idle state and emits ``sigPaused`` so the GUI lifts the
+        freeze guard for browsing; then we spin until ``command`` leaves
+        ``'pause'`` — either ``'start'`` (resume: the caller continues its loop on
+        the same open session) or ``'stop'`` (the caller's existing stop-check
+        breaks next).  Call at the TOP of every processing loop, ABOVE the
+        stop-check, so nothing new is read/submitted while paused.  The
+        ``while`` exits on stop, so this is shutdown-safe (close() sets 'stop').
+        """
+        if self.command != 'pause':
+            return
+        self._enter_pause()
+        while self.command == 'pause':
+            time.sleep(0.05)
+
+    #: Bound the pause drain so a hung pool worker (stalled IO / runaway pyFAI)
+    #: can't deadlock the pause; the wait also bails early on Stop/close.
+    PAUSE_DRAIN_TIMEOUT = 30.0
+
+    def _enter_pause(self) -> None:
+        """Quiesce the writer at a frame boundary so a paused user can browse any
+        already-processed frame from disk, then signal the GUI to lift the guard.
+
+        Routing is keyed on the SERIAL tail first: ``_frames_since_save > 0`` is
+        the unambiguous signal that the serial path is the active writer (the
+        true-live watch loop uses ``_process_one`` and increments it; the
+        streaming path never does).  So during Phase-3 live watching — where the
+        Phase-2 streaming session is still open but DORMANT — the serial flush
+        correctly wins and the watch tail (incl. its XYE buffer) is persisted and
+        the counter reset.  Otherwise the streaming branch drains+flushes.
+
+        STRICT ordering: drain/flush MUST complete BEFORE ``sigPaused`` so the
+        writer is provably idle before the GUI reads disk (race-safe).  The drain
+        is bounded (:attr:`PAUSE_DRAIN_TIMEOUT`) + cancel-aware so a stuck worker
+        can't strand the pause or block Stop/close.
+        """
+        try:
+            session = getattr(self, '_streaming_session', None)
+            sink = getattr(self, '_streaming_sink', None)
+            scan = self._active_scan
+            if scan is not None and self._frames_since_save > 0:
+                # Serial path is the active writer (watch loop / serial dispatch).
+                # Drain any open streaming session first (a no-op when nothing is
+                # in-flight) so the writer is idle, then flush the serial tail.
+                if session is not None:
+                    session.drain(timeout=getattr(self, 'PAUSE_DRAIN_TIMEOUT', 30.0))
+                if not self.xye_only:
+                    _get_h5pool().pause(scan.data_file)
+                    try:
+                        with self.file_lock:
+                            scan._save_to_nexus()
+                    finally:
+                        _get_h5pool().resume(scan.data_file)
+                self._flush_xye_buffer(scan)
+                self._frames_since_save = 0
+            elif session is not None and sink is not None:
+                # Streaming path (batch / reprocess / live Phase 2): drain the
+                # in-flight window (non-terminal — session stays open) + flush.
+                if not session.drain(timeout=getattr(self, 'PAUSE_DRAIN_TIMEOUT', 30.0)):
+                    logger.warning("pause drain timed out (worker not idle); "
+                                   "pausing without a full flush")
+                sink._flush(force=True)
+        except Exception:
+            # A drain/flush failure must not strand the run; log loudly and
+            # still signal the pause (we've stopped submitting, so the writer is
+            # idle and disk reads are safe even if the final flush lagged).
+            logger.error("error draining/flushing on pause", exc_info=True)
+        finally:
+            self.sigPaused.emit()
+
     def _save_due(self, scan, *, force=False):
         """Whether a non-batch v2 save should fire now (persist-before-evict).
 
@@ -1262,6 +1357,7 @@ class imageThread(wranglerThread):
         """
         count = 0
         for item in pending:
+            self._wait_if_paused()        # pause between frames (serial path)
             if self.command == 'stop':
                 break
             # item is (img_file, img_number, img_data, img_meta, bg_raw, t_read)
@@ -1364,6 +1460,7 @@ class imageThread(wranglerThread):
         self.showLabel.emit(f'Streaming {len(frames)} images...')
         count = 0
         for live in frames:
+            self._wait_if_paused()        # pause between frames (streaming path)
             if self.command == 'stop':
                 break
             sink.register(live)

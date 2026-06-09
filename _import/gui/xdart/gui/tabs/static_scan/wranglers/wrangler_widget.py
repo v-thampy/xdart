@@ -100,6 +100,12 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
     sigUpdateGI = Qt.QtCore.Signal(bool)
     finished = Qt.QtCore.Signal()
     started = Qt.QtCore.Signal()
+    # Pause/Resume (Phase B): sigPaused fires once the run is frozen at a frame
+    # boundary (the host then LIFTS the freeze guard for browsing); sigResuming
+    # fires just before resuming (the host RE-ENGAGES the guard FIRST).  Emitted
+    # only by wranglers that support pause (image wrangler); harmless elsewhere.
+    sigPaused = Qt.QtCore.Signal()
+    sigResuming = Qt.QtCore.Signal()
 
     def __init__(self, fname, file_lock, parent=None):
         """fname: str, file path

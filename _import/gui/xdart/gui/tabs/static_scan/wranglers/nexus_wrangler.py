@@ -49,8 +49,13 @@ params = [
         {'name': 'mask_file', 'title': 'Mask File    ', 'type': 'str', 'value': ''},
         NamedActionParameter(name='mask_file_browse', title='Browse...'),
     ], 'expanded': False},
-    {'name': 'GI', 'type': 'group', 'children': [
-        {'name': 'Grazing', 'title': 'Grazing Incidence', 'type': 'bool', 'value': False},
+    {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'syncExpanded': True,
+     'children': [
+        # UI-1 (#81): the GROUP HEADER is the on/off toggle (expand = on,
+        # collapse = off).  The bool is the hidden source of truth (a hidden
+        # bool can't repaint-uncheck when the tree is disabled mid-run, #56).
+        {'name': 'Grazing', 'title': 'Grazing Incidence', 'type': 'bool',
+         'value': False, 'visible': False},
         {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'str', 'value': 'th'},
         {'name': 'th_val', 'title': 'Theta Value', 'type': 'float', 'value': 0.0},
         {'name': 'sample_orientation', 'title': 'Sample Orientation', 'type': 'int',
@@ -217,6 +222,11 @@ class nexusWrangler(wranglerWidget):
             self.browse_h5_dir
         )
 
+        # UI-1 (#81): the GI group header expand/collapse is the on/off toggle;
+        # mirror it into the hidden 'Grazing' bool that setup() reads at start.
+        self.parameters.child('GI').sigOptionsChanged.connect(
+            self._sync_group_toggle_from_expand)
+
         # Setup thread
         self.thread = nexusThread(
             self.command_queue,
@@ -289,6 +299,14 @@ class nexusWrangler(wranglerWidget):
                     "session restore failed for %s: %s", skey, e,
                 )
 
+        # UI-1 (#81): reflect the restored GI on/off into the group's expanded
+        # state (the header is the toggle) -- expand when on, collapse when off.
+        try:
+            gi_on = bool(self.parameters.child('GI').child('Grazing').value())
+            self.parameters.child('GI').setOpts(expanded=gi_on)
+        except Exception:
+            logger.debug("GI expand-restore skipped", exc_info=True)
+
         # Restore PONI
         poni_file = self.parameters.child('Calibration').child('poni_file').value()
         if poni_file and os.path.exists(poni_file):
@@ -313,6 +331,28 @@ class nexusWrangler(wranglerWidget):
             idx = self.processingModeCombo.findText(mode)
             if idx >= 0:
                 self.processingModeCombo.setCurrentIndex(idx)
+
+    # UI-1 (#81): GI group whose EXPANDED state is the on/off toggle, mapped to
+    # the hidden bool that is its source of truth.
+    _EXPAND_TOGGLE_GROUPS = {'GI': 'Grazing'}
+
+    def _sync_group_toggle_from_expand(self, param, opts):
+        """UI-1 (#81): mirror a header-toggle group's expand/collapse into its
+        hidden enabling bool, so ``setup()`` sees the on/off state at run start.
+        ``expanded`` arrives via ``sigOptionsChanged`` (``syncExpanded=True``)."""
+        if 'expanded' not in opts:
+            return
+        child_name = self._EXPAND_TOGGLE_GROUPS.get(param.name())
+        if child_name is None:
+            return
+        expanded = bool(opts['expanded'])
+        try:
+            bool_param = param.child(child_name)
+        except Exception:
+            return
+        if bool_param.value() != expanded:
+            bool_param.setValue(expanded)
+            self._save_to_session()
 
     def _save_to_session(self):
         """Save parameters to session.json."""

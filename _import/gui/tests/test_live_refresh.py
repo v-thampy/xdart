@@ -252,6 +252,29 @@ class _FakeControl:
     def isVisible(self):
         return self._visible
 
+    # Phase B: the morphing action button (Start/Pause/Resume) sets text +
+    # a dynamic 'runPhase' property + repaints via style().unpolish/polish.
+    def setText(self, text):
+        self._text = str(text)
+
+    def text(self):
+        return getattr(self, "_text", "")
+
+    def setProperty(self, key, value):
+        setattr(self, "_prop_" + key, value)
+
+    def property(self, key):
+        return getattr(self, "_prop_" + key, None)
+
+    def style(self):
+        class _S:
+            def unpolish(self, *a):
+                pass
+
+            def polish(self, *a):
+                pass
+        return _S()
+
 
 class _FakeCombo:
     def __init__(self, text):
@@ -2372,8 +2395,12 @@ def test_wrangler_expands_active_groups_on_startup():
         imageWrangler._expand_active_groups, host,
     )
     host._expand_active_groups()
-    assert "expanded" not in gi.opts
-    assert "expanded" not in mask.opts
+    # UI-1 (#81): the GI / Intensity-Threshold groups' EXPANDED state is now the
+    # on/off toggle, so "off" explicitly COLLAPSES them (expanded=False) rather
+    # than leaving the opt unset.  BG still only expands-when-on (its toggle is
+    # the bg_type list, not the header), so it stays untouched when off.
+    assert gi.opts.get("expanded") is False
+    assert mask.opts.get("expanded") is False
     assert "expanded" not in bgg.opts
 
 
@@ -3604,6 +3631,14 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
     host._on_mode_changed = MethodType(imageWrangler._on_mode_changed, host)
     host.start = MethodType(imageWrangler.start, host)
     host._inputs_valid = MethodType(imageWrangler._inputs_valid, host)
+    # Phase B: the action-button morph helper + its state, used by enabled()/
+    # start()/_on_start_clicked.
+    host._run_phase = 'idle'
+    host._set_action_button = MethodType(imageWrangler._set_action_button, host)
+    host._on_start_clicked = MethodType(imageWrangler._on_start_clicked, host)
+    host.pause = MethodType(imageWrangler.pause, host)
+    host._on_paused = MethodType(imageWrangler._on_paused, host)
+    host._on_resume = MethodType(imageWrangler._on_resume, host)
     return host
 
 
@@ -3651,7 +3686,9 @@ def test_wrangler_enabled_reapplies_xye_mode_controls():
     assert host.thread.xye_only is True
 
 
-def test_wrangler_enabled_keeps_normal_live_clickable():
+def test_wrangler_enabled_run_end_reenables_mode_toggles():
+    """Phase B: at run END, both mode toggles re-enable and the action button
+    morphs back to green 'Start' (idle)."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=True, batch=True)
@@ -3663,22 +3700,92 @@ def test_wrangler_enabled_keeps_normal_live_clickable():
     assert host.ui.batchCheckBox.isEnabled() is True
     assert host.ui.frame.isVisible() is True
     assert host._integration_controls_enabled is True
+    # Action button reset to green Start (idle).
+    assert host.ui.startButton.text() == "Start"
+    assert host.ui.startButton.property("runPhase") == "idle"
+    assert host._run_phase == "idle"
 
 
-def test_start_click_forces_non_live_run():
+def test_start_click_honors_live_toggle_and_morphs_to_pause():
+    """Phase B (DECIDED model): Start is the single action button and HONORS the
+    Live MODE toggle (no longer force-unchecks it).  It morphs green Start ->
+    orange Pause and sets _run_phase='running'."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=True, batch=False)
 
     imageWrangler._on_start_clicked(host)
 
-    assert host.ui.liveCheckBox.isChecked() is False
-    assert host.live_mode is False
-    assert host.thread.live_mode is False
+    # Live is honored, NOT force-unchecked.
+    assert host.ui.liveCheckBox.isChecked() is True
     assert host.command == "start"
     assert host.thread.command == "start"
     assert host.ui.stopButton.isEnabled() is True
     assert host.sigStart.emitted == [()]
+    # The action button morphed to orange 'Pause'.
+    assert host.ui.startButton.text() == "Pause"
+    assert host.ui.startButton.property("runPhase") == "active"
+    assert host._run_phase == "running"
+
+
+def test_start_pause_resume_button_state_machine():
+    """Phase B: clicking the single action button cycles Start -> Pause ->
+    Resume -> Pause via _on_start_clicked, mirroring 'pause'/'start' commands."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=False, batch=True)
+    host.sigResuming = _FakeSignal()
+
+    imageWrangler._on_start_clicked(host)      # idle -> start (running, 'Pause')
+    assert host._run_phase == "running" and host.command == "start"
+
+    imageWrangler._on_start_clicked(host)      # running -> pause
+    assert host.command == "pause" and host.thread.command == "pause"
+    assert host.ui.startButton.text() == "Pausing…"   # transient until sigPaused
+
+    imageWrangler._on_paused(host)             # worker confirms paused
+    assert host._run_phase == "paused" and host.ui.startButton.text() == "Resume"
+
+    imageWrangler._on_start_clicked(host)      # paused -> resume
+    assert host.command == "start" and host.thread.command == "start"
+    assert host._run_phase == "running" and host.ui.startButton.text() == "Pause"
+    assert host.sigResuming.emitted == [()]    # guard re-engaged before resume
+
+
+def test_stop_during_pausing_ignores_late_sigpaused():
+    """Adversarial-review fix: Stop during the transient 'Pausing…' window must
+    win.  A late sigPaused (queued from the worker) arriving after stop() must
+    NOT flash the button back to orange 'Resume' -- _on_paused drops it because
+    self.command is already 'stop'."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=False, batch=True)
+
+    imageWrangler._on_start_clicked(host)      # running
+    imageWrangler._on_start_clicked(host)      # -> pause ('Pausing…')
+    imageWrangler.stop(host)                   # Stop lands during 'Pausing…'
+    assert host.ui.startButton.text() == "Start"     # morphed back to green
+    assert host._run_phase == "idle"
+
+    imageWrangler._on_paused(host)             # late queued sigPaused arrives
+    assert host.ui.startButton.text() == "Start"     # NOT flashed to 'Resume'
+    assert host._run_phase == "idle"
+
+
+def test_redispatch_during_pausing_is_noop():
+    """Adversarial-review fix: _run_phase keeps 'pausing' distinct, so a stray
+    re-dispatch during the disabled 'Pausing…' window does NOT fire a second
+    pause()/start()."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=False, batch=True)
+    imageWrangler._on_start_clicked(host)      # running
+    imageWrangler._on_start_clicked(host)      # -> pause ('Pausing…')
+    assert host._run_phase == "pausing"
+    host.thread.command = "sentinel"           # detect any spurious command write
+    imageWrangler._on_start_clicked(host)      # re-dispatch while 'pausing'
+    assert host.thread.command == "sentinel"   # no-op: no pause()/start() fired
+    assert host.ui.startButton.text() == "Pausing…"
 
 
 def test_start_without_poni_is_gated():
@@ -3695,7 +3802,11 @@ def test_start_without_poni_is_gated():
     assert getattr(host, "command", None) != "start"
 
 
-def test_active_live_run_disables_batch_but_keeps_live_clickable():
+def test_active_run_locks_modes_but_keeps_action_button_enabled():
+    """Phase B: during a run the Live/Batch MODE toggles both lock (they no
+    longer start/stop anything), the parameter tree + non-param widgets lock,
+    but the single action button STAYS ENABLED (it is the Pause/Resume control
+    now), and Stop stays enabled."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=True, batch=False)
@@ -3703,8 +3814,8 @@ def test_active_live_run_disables_batch_but_keeps_live_clickable():
 
     imageWrangler.enabled(host, False)
 
-    assert host.ui.startButton.isEnabled() is False
-    assert host.ui.liveCheckBox.isEnabled() is True
+    assert host.ui.startButton.isEnabled() is True   # morphs to Pause/Resume
+    assert host.ui.liveCheckBox.isEnabled() is False
     assert host.ui.batchCheckBox.isEnabled() is False
     assert host.tree.isEnabled() is False
     assert host.ui.processingModeCombo.isEnabled() is False
@@ -3713,7 +3824,7 @@ def test_active_live_run_disables_batch_but_keeps_live_clickable():
     assert host.ui.stopButton.isEnabled() is True    # Stop never disabled
 
 
-def test_active_non_live_run_disables_live_and_batch():
+def test_active_non_live_run_locks_modes_keeps_action_button():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=False, batch=True)
@@ -3721,7 +3832,7 @@ def test_active_non_live_run_disables_live_and_batch():
 
     imageWrangler.enabled(host, False)
 
-    assert host.ui.startButton.isEnabled() is False
+    assert host.ui.startButton.isEnabled() is True   # Pause/Resume control
     assert host.ui.liveCheckBox.isEnabled() is False
     assert host.ui.batchCheckBox.isEnabled() is False
     assert host.tree.isEnabled() is False
