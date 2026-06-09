@@ -256,3 +256,41 @@ def test_close_reduction_session_surfaces_write_failure():
     assert labels and "Save FAILED" in labels[0]                # user-visible
     assert closed == ["first", "second"]                       # second closed despite first raising
     assert w._streaming_session is None and w._reduction_session is None
+
+
+def test_resume_parity_streaming_nxs_matches_unpaused(tmp_path):
+    """Pause spec acceptance (#2): a run PAUSED mid-stream — drain + flush the
+    sink to .nxs at a frame boundary, then resume submitting on the same open
+    session — produces the SAME .nxs as an un-paused run.  Pausing never drops or
+    corrupts a frame.  The pause-time flush is modelled by sink._flush(force=True)
+    partway through (exactly what _enter_pause calls after session.drain())."""
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+
+    N = 12
+
+    def _run(nxs, pause_after=None):
+        scan = LiveScan(data_file=nxs)
+        scan.skip_2d = True
+        sink = QtNexusSink(_FakeHost(batch_mode=True), scan, _minimal_plan(), mask=None)
+        sink.begin(None, None)
+        for i in range(N):
+            sink.register(_live_frame(i))
+            sink.write(_headless(i), _reduction(i))
+            if pause_after is not None and i == pause_after:
+                sink._flush(force=True)        # the pause-time flush at a boundary
+        sink.finish(SimpleNamespace(cancelled=False, n_processed=N))
+        return nxs
+
+    unpaused = _run(str(tmp_path / "unpaused.nxs"))
+    paused = _run(str(tmp_path / "paused.nxs"), pause_after=5)   # "pause" after 6 frames
+
+    ra = LiveScan(data_file=unpaused); ra.load_from_h5()
+    rb = LiveScan(data_file=paused);   rb.load_from_h5()
+    assert list(ra.frames.index) == list(rb.frames.index) == list(range(N))
+    for i in range(N):
+        np.testing.assert_allclose(
+            np.asarray(ra.frames[i].int_1d.intensity),
+            np.asarray(rb.frames[i].int_1d.intensity),
+            err_msg=f"frame {i} differs between paused and un-paused .nxs",
+        )
