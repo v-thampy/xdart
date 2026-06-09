@@ -168,3 +168,39 @@ def test_load_frame_v2_absolute_source_back_compat(tmp_path):
                                source_root=str(tmp_path))
     assert frame._resolved_source_path() == str(raw)
     assert frame.is_reload_only is False
+
+
+def test_nexus_wrangler_thread_initialize_scan_sets_source_base():
+    """N1 (nexus-wrangler portability): nexusThread._initialize_scan stamps
+    scan.source_base from the worker, which the writer reads to store relative
+    raw paths + @source_base.  None -> absolute (back-compat)."""
+    from types import SimpleNamespace, MethodType
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler_thread import nexusThread
+
+    scan = SimpleNamespace(name=None, gi=None, static=None)
+    t = SimpleNamespace(scan=scan, gi=True, source_base="/proj")
+    t._initialize_scan = MethodType(nexusThread._initialize_scan, t)
+    assert t._initialize_scan("s").source_base == "/proj"
+
+    # No source_base on the worker -> None (back-compat, absolute paths).
+    t2 = SimpleNamespace(scan=SimpleNamespace(name=None, gi=None, static=None), gi=False)
+    t2._initialize_scan = MethodType(nexusThread._initialize_scan, t2)
+    assert getattr(t2._initialize_scan("s"), "source_base", "X") is None
+
+
+def test_nexus_wrangler_compute_source_base():
+    """N1: the nexus wrangler derives source_base from its Project Folder param
+    (Project is the first group), mirroring the image wrangler."""
+    from types import SimpleNamespace, MethodType
+    from pyqtgraph import QtWidgets
+    from pyqtgraph.parametertree import Parameter
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler import nexusWrangler, params
+
+    root = Parameter.create(name="p", type="group", children=params)
+    assert root.children()[0].name() == "Project"
+    h = SimpleNamespace(parameters=root)
+    h._compute_source_base = MethodType(nexusWrangler._compute_source_base, h)
+    assert h._compute_source_base() is None
+    root.child("Project").child("project_folder").setValue("/tmp/p")
+    assert h._compute_source_base() == os.path.abspath("/tmp/p")

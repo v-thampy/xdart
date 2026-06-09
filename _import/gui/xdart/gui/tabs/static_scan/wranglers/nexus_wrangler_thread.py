@@ -132,6 +132,9 @@ class nexusThread(wranglerThread):
         self.data_1d = data_1d
         self.data_2d = data_2d
         self.entry = entry
+        # N1: project root for portable @source_base; set from the wrangler in
+        # setup() (None -> absolute raw paths, back-compat).
+        self.source_base = None
 
         self.detector = None
         self.mask = None
@@ -427,6 +430,11 @@ class nexusThread(wranglerThread):
         self.scan.name = scan_name
         self.scan.gi = self.gi
         self.scan.static = True
+        # N1: the project root -> entry/@source_base + relative raw source paths
+        # in the writer (portable .nxs).  None -> absolute paths (back-compat).
+        # The abspath at frame.source_file stays as-is; the writer relativizes it
+        # against source_base at write time.
+        self.scan.source_base = getattr(self, "source_base", None)
         return self.scan
 
     def _frame_meta(self, scan_meta, base_meta, frame_idx):
