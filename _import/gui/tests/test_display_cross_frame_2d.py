@@ -197,3 +197,22 @@ class TestCrossFrame1DHydration:
         ydata, xdata = host.get_frames_int_1d(list(range(N)), rv='average')
         assert ydata is not None, "1D cross-frame returned None (hydration failed)"
         np.testing.assert_allclose(ydata, (N - 1) / 2.0, atol=1e-4)  # mean(0..N-1)
+
+
+def test_int_2d_require_all_distinguishes_partial_from_no_2d(tmp_path):
+    """#6 (Set-Bkg refuse contract): require_all=True returns None when not every
+    selected frame contributes (partial coverage), while the default subset path
+    still returns the covered average -- so setBkg can tell PARTIAL coverage
+    (refuse: a partial average is a wrong background) from a 1D-only scan (no 2D,
+    None on both)."""
+    N = 5
+    scan = _build_scan_on_disk(tmp_path, N)
+
+    host = _make_host(scan, data_2d={})
+    # Every frame hydrates from disk -> require_all=True yields the full average.
+    assert host.get_frames_int_2d(list(range(N)), require_all=True)[0] is not None
+
+    # A selection including a non-existent frame -> partial coverage.
+    host2 = _make_host(scan, data_2d={})
+    assert host2.get_frames_int_2d([0, 1, 999])[0] is not None              # subset average exists
+    assert host2.get_frames_int_2d([0, 1, 999], require_all=True)[0] is None  # not all covered -> None
