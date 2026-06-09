@@ -498,6 +498,12 @@ class imageWrangler(wranglerWidget):
     ]
 
     def _save_to_session(self, *args):
+        # Don't persist the transient half-restored state while a session restore
+        # is in flight (each setValue fires sigTreeStateChanged -> here): it's a
+        # redundant write storm and a crash-corruption window.  The on-disk file
+        # already holds the complete values restore is loading.
+        if getattr(self, '_restoring', False):
+            return
         data = {}
         for key, path, _, _ in self._SESSION_PARAMS:
             try:
@@ -952,8 +958,9 @@ class imageWrangler(wranglerWidget):
 
     # N1: param groups gated behind the Project Folder + PONI (Project itself is
     # always visible).  Calibration appears once a Project Folder is set; the
-    # rest appears once a valid PONI also loads.
+    # rest (groups + the Save-Path row) appears once a valid PONI also loads.
     _DISCLOSURE_REST = ('Signal', 'GI', 'Mask', 'BG')
+    _DISCLOSURE_TOPLEVEL = ('h5_dir', 'h5_dir_browse')     # Save Path row
 
     def _apply_disclosure(self):
         """N1 progressive disclosure (design §2): the tree reveals in stages —
@@ -964,15 +971,18 @@ class imageWrangler(wranglerWidget):
         have_poni = self.poni is not None
         self.parameters.child('Project').show()            # always visible
         cal = self.parameters.child('Calibration')
+
+        def _hide_rest():
+            for name in self._DISCLOSURE_REST + self._DISCLOSURE_TOPLEVEL:
+                self.parameters.child(name).hide()
+
         if not have_root:
             cal.hide()
-            for name in self._DISCLOSURE_REST:
-                self.parameters.child(name).hide()
+            _hide_rest()
             self.ui.specLabel.setText('Choose a Project Folder to begin.')
         elif not have_poni:
             cal.show()
-            for name in self._DISCLOSURE_REST:
-                self.parameters.child(name).hide()
+            _hide_rest()
             self.ui.specLabel.setText('Load a PONI calibration file to begin.')
         else:
             for child in self.parameters.children():
@@ -1327,6 +1337,12 @@ class imageWrangler(wranglerWidget):
             self.thread.source_base = self.source_base
         # Clear the PONI (cascades through get_poni_dict -> _apply_disclosure) and
         # the source paths that were relative to the now-stale old root.
+        # IMPORTANT: get_poni_dict reads the INSTANCE attr self.poni_file, not the
+        # param value, so resync it FIRST -- else the cascade re-loads the stale
+        # PONI (the old path still exists on disk) and _inputs_valid stays True,
+        # letting a Start run the new folder's images against the old calibration
+        # (the BUG-1 this reset exists to prevent).
+        self.poni_file = ''
         self.parameters.child('Calibration').child('poni_file').setValue('')
         for seg in (('Signal', 'File'), ('Signal', 'img_dir'),
                     ('Signal', 'mask_file')):

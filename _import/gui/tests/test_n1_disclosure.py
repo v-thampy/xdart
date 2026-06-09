@@ -35,7 +35,7 @@ class _Lbl:
 def _holder():
     root = Parameter.create(name="p", type="group", children=params)
     h = types.SimpleNamespace(
-        parameters=root, poni=None, thread=None, _restoring=False,
+        parameters=root, poni=None, poni_file="", thread=None, _restoring=False,
         ui=types.SimpleNamespace(specLabel=_Lbl()),
         _sync_h5_dir_from_parameters=lambda: None,
     )
@@ -43,6 +43,7 @@ def _holder():
               "_on_project_folder_changed", "_default_h5_under_project"):
         setattr(h, m, MethodType(getattr(imageWrangler, m), h))
     h._DISCLOSURE_REST = imageWrangler._DISCLOSURE_REST
+    h._DISCLOSURE_TOPLEVEL = imageWrangler._DISCLOSURE_TOPLEVEL
     return h, root
 
 
@@ -53,10 +54,12 @@ def _hidden(root, group):
 def test_disclosure_three_stages(qapp):
     h, root = _holder()
 
-    # Fresh: only Project visible.
+    # Fresh: ONLY Project visible (incl. the Save-Path row hidden).
     h._apply_disclosure()
     assert not _hidden(root, "Project")
     assert _hidden(root, "Calibration") and _hidden(root, "Signal")
+    assert root.child("h5_dir").opts.get("visible") is False
+    assert root.child("h5_dir_browse").opts.get("visible") is False
     assert "Project Folder" in h.ui.specLabel.t
 
     # Folder set, no PONI -> Calibration appears, rest still hidden.
@@ -74,10 +77,12 @@ def test_disclosure_three_stages(qapp):
     assert h.ui.specLabel.t == ""
 
 
-def test_folder_change_resets_dependent_paths(qapp, tmp_path):
+def test_folder_change_resets_dependent_paths_and_clears_stale_poni(qapp, tmp_path):
     h, root = _holder()
-    # Seed a prior folder's config.
+    # Seed a prior folder's config, incl. a "loaded" PONI (instance attr + param).
     root.child("Calibration").child("poni_file").setValue("/old/cal.poni")
+    h.poni_file = "/old/cal.poni"
+    h.poni = object()                              # a loaded calibration
     root.child("Signal").child("File").setValue("/old/img_0001.tif")
     root.child("Signal").child("mask_file").setValue("/old/mask.edf")
 
@@ -86,17 +91,32 @@ def test_folder_change_resets_dependent_paths(qapp, tmp_path):
     h._on_project_folder_changed()
 
     assert root.child("Calibration").child("poni_file").value() == ""
+    # The INSTANCE attr is resynced too (else get_poni_dict reloads the stale PONI
+    # and _inputs_valid stays True -> Start runs the new images vs the old cal).
+    assert h.poni_file == ""
     assert root.child("Signal").child("File").value() == ""
     assert root.child("Signal").child("mask_file").value() == ""
-    # Save Path defaulted under the new folder.
     assert root.child("h5_dir").value() == os.path.join(
         str(tmp_path), "xdart_processed_data")
     assert h.source_base == os.path.abspath(str(tmp_path))
 
 
 def test_folder_change_inert_during_restore(qapp):
+    """Drive the REAL sigValueChanged wiring: while _restoring, the handler's
+    destructive body is short-circuited (poni_file kept); after restore, a
+    genuine folder change clears it."""
     h, root = _holder()
-    h._restoring = True
+    root.child("Project").child("project_folder").sigValueChanged.connect(
+        lambda *a: h._on_project_folder_changed())
     root.child("Calibration").child("poni_file").setValue("/keep/cal.poni")
-    h._on_project_folder_changed()                 # guarded -> no-op
+    h.poni_file = "/keep/cal.poni"
+
+    h._restoring = True
+    root.child("Project").child("project_folder").setValue("/restored/root")
     assert root.child("Calibration").child("poni_file").value() == "/keep/cal.poni"
+    assert h.poni_file == "/keep/cal.poni"          # guard held
+
+    h._restoring = False
+    root.child("Project").child("project_folder").setValue("/new/root")
+    assert root.child("Calibration").child("poni_file").value() == ""   # now reset
+    assert h.poni_file == ""
