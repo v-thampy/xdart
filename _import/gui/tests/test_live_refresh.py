@@ -2372,8 +2372,12 @@ def test_wrangler_expands_active_groups_on_startup():
         imageWrangler._expand_active_groups, host,
     )
     host._expand_active_groups()
-    assert "expanded" not in gi.opts
-    assert "expanded" not in mask.opts
+    # UI-1 (#81): the GI / Intensity-Threshold groups' EXPANDED state is now the
+    # on/off toggle, so "off" explicitly COLLAPSES them (expanded=False) rather
+    # than leaving the opt unset.  BG still only expands-when-on (its toggle is
+    # the bg_type list, not the header), so it stays untouched when off.
+    assert gi.opts.get("expanded") is False
+    assert mask.opts.get("expanded") is False
     assert "expanded" not in bgg.opts
 
 

@@ -72,8 +72,13 @@ params = [
         {'name': 'mask_file', 'title': 'Mask File', 'type': 'str', 'value': ''},
         NamedActionParameter(name='mask_file_browse', title='Browse...'),
     ], 'expanded': True, 'visible': False},
-    {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'children': [
-        {'name': 'Grazing', 'type': 'bool', 'value': False},
+    {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'syncExpanded': True,
+     'children': [
+        # UI-1 (#81): the GROUP HEADER is the on/off toggle (expand = on,
+        # collapse = off; syncExpanded mirrors the user's expand into opts).
+        # The bool is the hidden source of truth the rest of the code reads --
+        # a hidden bool can't repaint-uncheck when the tree is disabled (#56).
+        {'name': 'Grazing', 'type': 'bool', 'value': False, 'visible': False},
         {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'list',
          'values': ['th', 'Manual'], 'value': 'th'},
         {'name': 'th_val', 'title': 'Theta', 'type': 'str', 'value': '0.1', 'visible': False},
@@ -91,8 +96,10 @@ params = [
          'values': {u'Q\u1D62\u209A\u2013Q\u2092\u2092\u209A': 'qip_qoop', u'Q-\u03C7': 'q_chi'},
          'value': 'qip_qoop', 'visible': False},
     ], 'expanded': False, 'visible': False},
-    {'name': 'Mask', 'title': 'Intensity Threshold', 'type': 'group', 'children': [
-        {'name': 'Threshold', 'type': 'bool', 'value': False},
+    {'name': 'Mask', 'title': 'Intensity Threshold', 'type': 'group', 'syncExpanded': True,
+     'children': [
+        # UI-1 (#81): group header is the on/off toggle; bool is hidden (see GI).
+        {'name': 'Threshold', 'type': 'bool', 'value': False, 'visible': False},
         {'name': 'min', 'title': 'Min', 'type': 'int', 'value': 0},
         {'name': 'max', 'title': 'Max', 'type': 'int', 'value': 0},
     ], 'expanded': False, 'visible': False},
@@ -297,6 +304,12 @@ class imageWrangler(wranglerWidget):
         self.parameters.sigTreeStateChanged.connect(self.setup)
         self.parameters.sigTreeStateChanged.connect(self._save_to_session)
 
+        # UI-1 (#81): mirror the GI / Intensity-Threshold group header
+        # expand/collapse into their hidden enabling bool (the toggle).
+        for _grp in self._EXPAND_TOGGLE_GROUPS:
+            self.parameters.child(_grp).sigOptionsChanged.connect(
+                self._sync_group_toggle_from_expand)
+
         self.parameters.child('Calibration').child('poni_file_browse').sigActivated.connect(
             self.set_poni_file
         )
@@ -409,19 +422,24 @@ class imageWrangler(wranglerWidget):
         # instead of folded; collapsed when off.
         self._expand_active_groups()
 
-    def _expand_active_groups(self):
-        """Expand each wrangler group whose enabling param is set.
+    # UI-1 (#81): the GI / Intensity-Threshold groups whose EXPANDED state is the
+    # on/off toggle, mapped to the hidden bool that is their source of truth.
+    _EXPAND_TOGGLE_GROUPS = {'GI': 'Grazing', 'Mask': 'Threshold'}
 
-        The GI / Intensity-Threshold / Background groups default folded.  If
-        Grazing is checked, Threshold is enabled, or a Background source is
-        selected (incl. after a session restore), expand that group via
-        ``setOpts(expanded=True)``; leave it collapsed when off."""
+    def _expand_active_groups(self):
+        """Sync each wrangler group's expanded state to its enabling param.
+
+        For the GI / Intensity-Threshold groups the expanded state IS the
+        on/off toggle (UI-1), so this drives the group expanded == the hidden
+        bool BOTH ways (expand when on, collapse when off) -- e.g. after a
+        session restore.  The Background group only expands-when-on (its toggle
+        is the ``bg_type`` list, not the header)."""
         groups = (
-            ('GI', ('GI', 'Grazing'), lambda v: bool(v)),
-            ('Mask', ('Mask', 'Threshold'), lambda v: bool(v)),
-            ('BG', ('BG', 'bg_type'), lambda v: v not in (None, '', 'None')),
+            ('GI', ('GI', 'Grazing'), lambda v: bool(v), True),
+            ('Mask', ('Mask', 'Threshold'), lambda v: bool(v), True),
+            ('BG', ('BG', 'bg_type'), lambda v: v not in (None, '', 'None'), False),
         )
-        for group_name, child_path, is_on in groups:
+        for group_name, child_path, is_on, collapse_when_off in groups:
             try:
                 group = self.parameters.child(group_name)
                 value = self.parameters.child(*child_path).value()
@@ -429,8 +447,31 @@ class imageWrangler(wranglerWidget):
                 logger.debug("expand-active-group skipped for %s", group_name,
                              exc_info=True)
                 continue
-            if is_on(value):
+            on = is_on(value)
+            if on:
                 group.setOpts(expanded=True)
+            elif collapse_when_off:
+                group.setOpts(expanded=False)
+
+    def _sync_group_toggle_from_expand(self, param, opts):
+        """UI-1 (#81): when the user expands/collapses a header-toggle group
+        (GI / Intensity-Threshold), mirror it into the group's hidden bool so
+        the rest of the wrangler (``setup`` / ``get_args`` / session) sees the
+        on/off state.  ``expanded`` arrives via the group's ``sigOptionsChanged``
+        (``syncExpanded=True`` syncs the user's tree action back into opts)."""
+        if 'expanded' not in opts:
+            return
+        child_name = self._EXPAND_TOGGLE_GROUPS.get(param.name())
+        if child_name is None:
+            return
+        expanded = bool(opts['expanded'])
+        try:
+            bool_param = param.child(child_name)
+        except Exception:
+            return
+        if bool_param.value() != expanded:
+            # Fires sigValueChanged -> sigTreeStateChanged -> setup() reads it.
+            bool_param.setValue(expanded)
 
     # --- Session persistence ---
 
