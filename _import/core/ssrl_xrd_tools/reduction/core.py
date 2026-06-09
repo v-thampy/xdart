@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -1096,6 +1097,52 @@ class ReductionSession:
             finally:
                 self._semaphore.release()
                 self._write_queue.task_done()
+
+    def drain(self, timeout: float | None = None, poll: float = 0.05) -> bool:
+        """Block until every SUBMITTED frame has been written, WITHOUT closing
+        the session (non-terminal — unlike :meth:`finish`).  Returns ``True`` if
+        the writer fully drained, ``False`` if it timed out / was cancelled.
+
+        For ``execution="streaming"`` this waits on the writer queue: the writer
+        thread calls ``task_done()`` for every item (both the per-frame
+        ``finally`` and the sentinel branch in :meth:`_writer_loop`), so this
+        returns once the in-flight window has fully drained and the sink has
+        written each completed frame — yet the writer thread keeps idling on
+        ``_write_queue.get()`` (no sentinel is pushed), so the session stays OPEN
+        and :meth:`submit` works unchanged afterward.
+
+        This is what lets a caller quiesce the writer at a frame boundary (e.g. a
+        GUI Pause: drain, flush the sink to disk, browse, then resume submitting)
+        without the terminal teardown :meth:`finish` performs.  A per-frame
+        failure recorded during the drain still surfaces at the eventual
+        :meth:`finish` (fail-loud preserved).  No-op (returns ``True``) for
+        chunked execution and before the stream starts.
+
+        ``timeout`` BOUNDS the wait: a single in-flight worker that never returns
+        (a stalled detector/NFS read or a runaway pyFAI call — a running
+        ``ThreadPoolExecutor`` future can't be cancelled) would otherwise hang the
+        caller forever.  With ``timeout=None`` (the default, used by terminal
+        teardown) this is the original unbounded ``join()``.  With a timeout it
+        polls ``unfinished_tasks`` under the queue's own condition and ALSO bails
+        early once ``cancel_token`` trips (Stop/close), so a paused-then-stopped
+        run can break out promptly instead of stranding the thread.
+        """
+        if not (self.execution == "streaming" and self._stream_started
+                and self._write_queue is not None):
+            return True
+        q = self._write_queue
+        if timeout is None:
+            q.join()
+            return True
+        deadline = time.monotonic() + timeout
+        while True:
+            with q.all_tasks_done:          # the same condition join() waits on
+                if q.unfinished_tasks == 0:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self.cancel_token.cancelled:
+                    return False
+                q.all_tasks_done.wait(min(poll, remaining))
 
     def finish(self, raise_on_failure: bool = True) -> ReductionResult:
         """Drain, flush the sink, and return the :class:`ReductionResult`.
