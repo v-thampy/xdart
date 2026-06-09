@@ -17,14 +17,30 @@ publish from here without a separate stabilization pass.
 
 - `xdart.modules.sources.LiveScanFrameSource` adapts a `LiveScan` to the ssrl
   `FrameSource` protocol without importing Qt.
-- The wrangler and reintegration threads open one persistent
-  `ssrl_xrd_tools.reduction.ReductionSession` per scan (via
-  `open_live_reduction_session`) and feed polled chunks through
-  `reduce_live_frames(..., session=session)`, so per-thread pyFAI integrators
-  are built once per scan rather than per chunk/frame. This direct
-  session-feeding loop is the chosen WS-X1 endpoint; the earlier dormant
-  `ReductionJob`/`PublicationSink` scaffolding was removed rather than left as a
-  dead seam.
+- **Streaming, sink-driven write is the DEFAULT (WS-X1 endpoint).** The wrangler
+  opens one persistent `ssrl_xrd_tools.reduction.ReductionSession` per scan
+  (`execution="streaming"`, via `open_live_reduction_session`) with an
+  `xdart…QtNexusSink` as its `ReductionSink`. Worker threads integrate frames in
+  parallel; a single writer thread drains completions (out-of-order ok) and owns
+  the `.nxs`/XYE write — so the per-thread pyFAI integrators are built once per
+  scan and I/O pipelines with compute. This is the default for **batch** and for
+  a **non-batch reprocess** (`XDART_LIVE_EXECUTION`/`XDART_BATCH_EXECUTION`,
+  default `streaming`; `serial`/`chunked` kept one cycle as fallbacks). The same
+  engine is exposed headlessly via `run_reduction(execution="streaming")`.
+  - **Live display contract:** the writer/worker threads do ZERO Qt work — they
+    stash the hydrated frame into `host._published_frames` and emit one
+    lightweight `sigUpdate`; the GUI-thread `static_scan_widget.update_data`
+    (coalesced) owns the display caches + the publication the cake renders from.
+  - **Two deliberate write paths:** true-live *watching* (Phase 3, detector-rate,
+    one frame at a time) intentionally keeps the serial `_process_one` + direct
+    `_save_to_nexus` write — parallelism is moot there. So "one write path" means
+    batch + reprocess; true-live is a second, intentional path, not a gap.
+  - **GI common grid:** a batch-streaming run freezes the q/χ grid from the WHOLE
+    scan's incidence range (a cheap metadata pre-pass over the lowest/highest-
+    incidence frames) before the session opens, so multi-chunk angle-dependence
+    scans don't clip later frames to the chunk-1 grid.
+  - **Fail-loud writes:** `ReductionSession.finish()` re-raises a sink/write
+    failure by default; xdart surfaces it (no silent "saved").
 - `display_logic.render_roles_for_state(...)` derives render roles from the
   `DisplayState.layout` descriptor and appends legacy panel roles only for stale
   panel cleanup.
