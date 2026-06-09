@@ -245,10 +245,14 @@ class imageWrangler(wranglerWidget):
 
         # Set attributes from Parameter Tree and a couple more
         # N1: Project Folder (portable @source_base).  Blank -> None (absolute).
+        # _restoring gates the folder-change reset off during session restore.
+        self._restoring = False
         self.project_folder = self.parameters.child('Project').child('project_folder').value()
         self.source_base = self._compute_source_base()
         # Calibration
         self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
+        # Applies the N1 progressive disclosure for the fresh-start state (no
+        # folder -> only Project visible).
         self.get_poni_dict()
 
         # Signal
@@ -312,6 +316,12 @@ class imageWrangler(wranglerWidget):
 
         self.parameters.child('Project').child('project_folder_browse').sigActivated.connect(
             self.set_project_folder
+        )
+        # N1 Decision 2: a folder change (browse OR direct edit) resets the
+        # dependent paths.  Guarded by _restoring so a session restore doesn't
+        # trip it (see _restore_from_session).
+        self.parameters.child('Project').child('project_folder').sigValueChanged.connect(
+            self._on_project_folder_changed
         )
         self.parameters.child('Calibration').child('poni_file_browse').sigActivated.connect(
             self.set_poni_file
@@ -506,36 +516,48 @@ class imageWrangler(wranglerWidget):
 
     def _restore_from_session(self):
         session = load_session()
-        for key, path, is_path, attr in self._SESSION_PARAMS:
-            val = session.get(key)
-            if val is None:
-                continue
-            if is_path and not Path(val).exists():
-                continue
-            try:
-                p = self.parameters
-                for segment in path:
-                    p = p.child(segment)
-                p.setValue(val)
-                if attr is not None:
-                    setattr(self, attr, val)
-            except (AttributeError, KeyError, TypeError, ValueError) as e:
-                logger.debug("Failed to restore session parameter %s: %s", key, e)
-        # Restore processing mode dropdown and checkboxes
-        mode = session.get('processing_mode')
-        if mode:
-            idx = self.ui.processingModeCombo.findText(mode)
-            if idx >= 0:
-                self.ui.processingModeCombo.setCurrentIndex(idx)
-        # Deliberately do NOT restore Live's checked state — it's a
-        # start/stop control, and setChecked(True) would fire its toggled
-        # handler and auto-start a live run on launch.
-        if 'batch_mode' in session:
-            self.ui.batchCheckBox.setChecked(session['batch_mode'])
+        # N1: restoring project_folder fires its sigValueChanged ->
+        # _on_project_folder_changed, which would DESTRUCTIVELY clear the very
+        # poni_file/img_file this loop is about to restore.  Gate it inert for
+        # the duration of the restore.  (A project_folder whose root no longer
+        # exists is is_path-skipped below -> stays blank -> Decision 3 fresh-start
+        # fallback, prompting the user to re-enter the folder.)
+        self._restoring = True
+        try:
+            for key, path, is_path, attr in self._SESSION_PARAMS:
+                val = session.get(key)
+                if val is None:
+                    continue
+                if is_path and not Path(val).exists():
+                    continue
+                try:
+                    p = self.parameters
+                    for segment in path:
+                        p = p.child(segment)
+                    p.setValue(val)
+                    if attr is not None:
+                        setattr(self, attr, val)
+                except (AttributeError, KeyError, TypeError, ValueError) as e:
+                    logger.debug("Failed to restore session parameter %s: %s", key, e)
+            # Restore processing mode dropdown and checkboxes
+            mode = session.get('processing_mode')
+            if mode:
+                idx = self.ui.processingModeCombo.findText(mode)
+                if idx >= 0:
+                    self.ui.processingModeCombo.setCurrentIndex(idx)
+            # Deliberately do NOT restore Live's checked state — it's a
+            # start/stop control, and setChecked(True) would fire its toggled
+            # handler and auto-start a live run on launch.
+            if 'batch_mode' in session:
+                self.ui.batchCheckBox.setChecked(session['batch_mode'])
+        finally:
+            self._restoring = False
         # meta_ext needs None conversion (sigValueChanged fires set_meta_ext automatically)
-        # poni_file needs poni_dict loaded
-        if session.get('poni_file') and Path(session['poni_file']).exists():
-            self.get_poni_dict()
+        # poni_file needs poni_dict loaded; this re-applies the disclosure for the
+        # restored Project-Folder + PONI state (or the fresh-start fallback when
+        # the root was missing/skipped).
+        self.source_base = self._compute_source_base()
+        self.get_poni_dict()
 
     def _sync_h5_dir_from_parameters(self):
         """Sync the Save Path parameter and notify the scans browser on change."""
@@ -928,17 +950,46 @@ class imageWrangler(wranglerWidget):
             self.poni_file = fname
             self._save_to_session()
 
+    # N1: param groups gated behind the Project Folder + PONI (Project itself is
+    # always visible).  Calibration appears once a Project Folder is set; the
+    # rest appears once a valid PONI also loads.
+    _DISCLOSURE_REST = ('Signal', 'GI', 'Mask', 'BG')
+
+    def _apply_disclosure(self):
+        """N1 progressive disclosure (design §2): the tree reveals in stages —
+        Project Folder (always) -> Calibration (once a folder is set) -> the rest
+        (once a folder is set AND a valid PONI loads).  Pure show()/hide() on the
+        groups; orthogonal to the run-lock ``enabled()`` (which only greys)."""
+        have_root = self._compute_source_base() is not None
+        have_poni = self.poni is not None
+        self.parameters.child('Project').show()            # always visible
+        cal = self.parameters.child('Calibration')
+        if not have_root:
+            cal.hide()
+            for name in self._DISCLOSURE_REST:
+                self.parameters.child(name).hide()
+            self.ui.specLabel.setText('Choose a Project Folder to begin.')
+        elif not have_poni:
+            cal.show()
+            for name in self._DISCLOSURE_REST:
+                self.parameters.child(name).hide()
+            self.ui.specLabel.setText('Load a PONI calibration file to begin.')
+        else:
+            for child in self.parameters.children():
+                child.show()                               # reveal everything
+            self.ui.specLabel.setText('')
+
     def get_poni_dict(self):
-        """Load the PONI calibration file and store as a PONI object."""
+        """Load the PONI calibration file and store as a PONI object, then apply
+        the N1 progressive disclosure (reveal the rest only with a Project Folder
+        AND a valid PONI)."""
         if not os.path.exists(self.poni_file):
             # No calibration: clear any stale PONI so the run guard +
-            # _inputs_valid trip, and show a message instead of hiding the whole
-            # tree -- hiding it left the previous scan's PONI live, so a Start
-            # click ran the old scan with the stale calibration (BUG-1).
+            # _inputs_valid trip (hiding it left the previous scan's PONI live, so
+            # a Start click ran the old scan with the stale calibration, BUG-1).
             self.poni = None
             self.thread.poni = None
-            self.ui.specLabel.setText('Load a PONI calibration file to begin.')
-            self.parameters.child('Calibration').show()
+            self._apply_disclosure()
             return
 
         try:
@@ -950,14 +1001,10 @@ class imageWrangler(wranglerWidget):
             logger.warning('Invalid Poni File: %s', self.poni_file)
             self.thread.poni = None
             self.thread.signal_q.put(('message', 'Invalid Poni File'))
+            self._apply_disclosure()
             return
 
-        for child in self.parameters.children():
-            child.show()
-        # A valid PONI is loaded -> clear the "Load a PONI..." prompt so it
-        # doesn't linger after a session-restored calibration (the prompt
-        # should show only when no PONI is loaded).
-        self.ui.specLabel.setText('')
+        self._apply_disclosure()
 
     def set_inp_type(self):
         """Change Parameter Names depending on Input Type
@@ -1241,11 +1288,23 @@ class imageWrangler(wranglerWidget):
         pf = (self.parameters.child('Project').child('project_folder').value() or '').strip()
         return os.path.abspath(os.path.expanduser(pf)) if pf else None
 
+    def _default_h5_under_project(self):
+        """Default the Save Path to ``<project>/xdart_processed_data`` when the
+        user hasn't chosen one (blank or still the app default)."""
+        base = self._compute_source_base()
+        if not base:
+            return
+        cur_h5 = (self.parameters.child('h5_dir').value() or '').strip()
+        if not cur_h5 or cur_h5 == get_fname_dir():
+            self.parameters.child('h5_dir').setValue(
+                os.path.join(base, 'xdart_processed_data'))
+            self._sync_h5_dir_from_parameters()
+
     def set_project_folder(self):
-        """Browse for the N1 Project Folder.  Setting it makes the processed
-        ``.nxs`` store raw source paths RELATIVE to this root (portable); it also
-        defaults the Save Path to ``<folder>/xdart_processed_data`` when the Save
-        Path is still empty / at its default."""
+        """Browse for the N1 Project Folder.  Setting it stores raw source paths
+        RELATIVE to this root (portable .nxs); the value-change handler
+        (:meth:`_on_project_folder_changed`) then resets the dependent
+        (folder-relative) paths + defaults the Save Path."""
         path = QFileDialog().getExistingDirectory(
             caption='Choose Project Folder',
             dir='',
@@ -1253,12 +1312,30 @@ class imageWrangler(wranglerWidget):
         )
         if path != '':
             self.parameters.child('Project').child('project_folder').setValue(path)
-            # Default the output under the project folder if untouched.
-            cur_h5 = (self.parameters.child('h5_dir').value() or '').strip()
-            if not cur_h5 or cur_h5 == get_fname_dir():
-                default_out = os.path.join(path, 'xdart_processed_data')
-                self.parameters.child('h5_dir').setValue(default_out)
-                self._sync_h5_dir_from_parameters()
+
+    def _on_project_folder_changed(self, *args):
+        """N1 Decision 2: a Project Folder change INVALIDATES everything stored
+        relative to the OLD root.  Recompute ``source_base``, clear the PONI +
+        the dependent source paths (which cascades back to the enter-PONI
+        disclosure state via :meth:`get_poni_dict`), and default the Save Path
+        under the new folder.  Inert during a session restore (the ``_restoring``
+        guard) so it doesn't wipe the values the restore is setting."""
+        if getattr(self, '_restoring', False):
+            return
+        self.source_base = self._compute_source_base()
+        if getattr(self, 'thread', None) is not None:
+            self.thread.source_base = self.source_base
+        # Clear the PONI (cascades through get_poni_dict -> _apply_disclosure) and
+        # the source paths that were relative to the now-stale old root.
+        self.parameters.child('Calibration').child('poni_file').setValue('')
+        for seg in (('Signal', 'File'), ('Signal', 'img_dir'),
+                    ('Signal', 'mask_file')):
+            try:
+                self.parameters.child(*seg).setValue('')
+            except (AttributeError, KeyError, TypeError):
+                pass
+        self._default_h5_under_project()
+        self._apply_disclosure()
 
     def set_bg_matching_options(self):
         """Reads image metadata to populate matching parameters
