@@ -152,8 +152,8 @@ class Ui_Form(object):
         self.scale.addItem("")
         self.scale.addItem("")
         self.scale.setObjectName(u"scale")
-        self.scale.setMinimumSize(QSize(80, 0))
-        self.scale.setMaximumSize(QSize(80, 16777215))
+        self.scale.setMinimumSize(QSize(72, 0))
+        self.scale.setMaximumSize(QSize(72, 16777215))
         self.scale.setFocusPolicy(Qt.StrongFocus)
 
         self.horizontalLayout_9.addWidget(self.scale)
@@ -175,8 +175,8 @@ class Ui_Form(object):
         self.cmap.addItem("")
         self.cmap.addItem("")
         self.cmap.setObjectName(u"cmap")
-        self.cmap.setMinimumSize(QSize(80, 0))
-        self.cmap.setMaximumSize(QSize(80, 16777215))
+        self.cmap.setMinimumSize(QSize(72, 0))
+        self.cmap.setMaximumSize(QSize(72, 16777215))
         self.cmap.setFocusPolicy(Qt.StrongFocus)
 
         self.horizontalLayout_9.addWidget(self.cmap)

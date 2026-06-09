@@ -217,3 +217,42 @@ def test_sink_xye_only_writes_xye_no_nxs(tmp_path):
     # XYE rows written; no frames stashed into the scan (.nxs untouched).
     assert sorted(host.xye_written) == list(range(10))
     assert len(scan.frames.index) == 0
+
+
+def test_close_reduction_session_surfaces_write_failure():
+    """BLOCKER 2 (xdart side): a fail-loud finish() at scan close surfaces the
+    write failure (records it, shows a label, stops the run) instead of the old
+    silent debug-swallow — and BOTH session slots are still closed even if the
+    first raises."""
+    from types import MethodType
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+
+    labels, closed = [], []
+
+    def boom_finish():
+        closed.append("first")
+        raise RuntimeError("disk full")
+
+    def ok_finish():
+        closed.append("second")
+
+    w = SimpleNamespace(
+        _reduction_session=SimpleNamespace(finish=boom_finish),   # raises first
+        _reduction_session_key="k",
+        _streaming_session=SimpleNamespace(finish=ok_finish),     # must still close
+        _streaming_sink=object(),
+        _streaming_scan_id=1,
+        _reduction_write_error=None,
+        command="run",
+        showLabel=SimpleNamespace(emit=lambda m: labels.append(m)),
+    )
+    w._close_reduction_session = MethodType(
+        wranglerThread._close_reduction_session, w)
+
+    w._close_reduction_session()
+
+    assert isinstance(w._reduction_write_error, RuntimeError)   # recorded, not swallowed
+    assert w.command == "stop"                                  # run halted
+    assert labels and "Save FAILED" in labels[0]                # user-visible
+    assert closed == ["first", "second"]                       # second closed despite first raising
+    assert w._streaming_session is None and w._reduction_session is None

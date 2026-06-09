@@ -1302,7 +1302,10 @@ class imageThread(wranglerThread):
             )
         finally:
             if close_session:
-                session.finish()
+                # Legacy chunked integration session (write is the separate
+                # _save_to_nexus, not this session's sink) — preserve the
+                # non-raising close; integration errors already re-raise.
+                session.finish(raise_on_failure=False)
         # Precompute thumbnails in PARALLEL.  make_thumbnail is per-frame
         # numpy/scipy on the in-memory map_raw (the session doesn't clear it),
         # so it is thread-safe -- but it was the dominant *serial* cost left in
@@ -1511,7 +1514,9 @@ class imageThread(wranglerThread):
             )
         finally:
             if close_session:
-                session.finish()
+                # Legacy serial live integration session (write is the separate
+                # _save_to_nexus) — preserve the non-raising close.
+                session.finish(raise_on_failure=False)
         # Timing kept for parity with the legacy logging; the
         # standard path now does both 1D + 2D in one call so we
         # bundle the total under _t_1d.

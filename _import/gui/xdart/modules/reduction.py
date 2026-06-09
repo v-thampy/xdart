@@ -446,7 +446,9 @@ def freeze_live_scan_gi_ranges(
     try:
         frozen = session.plan
     finally:
-        session.finish()
+        # Freeze-only session (no write sink) — close for cleanup; a GI scout
+        # failure already surfaces as GIFreezeError, so don't fail-loud here.
+        session.finish(raise_on_failure=False)
     _copy_frozen_gi_ranges_to_live_scan(live_scan, frozen)
     return frozen
 

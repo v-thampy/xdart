@@ -119,8 +119,13 @@ class integratorThread(Qt.QtCore.QThread):
         if session is not None:
             try:
                 session.finish()
-            except Exception:
-                logger.debug("failed to close reintegration session", exc_info=True)
+            except Exception as exc:
+                # BLOCKER 2: finish() is fail-loud now.  Don't silently swallow a
+                # reintegration write failure — log it at ERROR and record it so
+                # the run can't pass as a clean success.
+                self._reduction_write_error = exc
+                logger.error("reintegration session WRITE FAILED on close: %s",
+                             exc, exc_info=True)
 
     def _session_key(self, n_workers: int, plan):
         key = max(1, int(n_workers or 1))

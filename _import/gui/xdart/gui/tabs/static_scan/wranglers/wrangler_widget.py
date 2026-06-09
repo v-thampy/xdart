@@ -263,6 +263,9 @@ class wranglerThread(Qt.QtCore.QThread):
         self._streaming_session = None
         self._streaming_sink = None
         self._streaming_scan_id = None
+        # Set by _close_reduction_session when a streaming write/sink failure
+        # surfaces from finish() — so the run can't report a false "success".
+        self._reduction_write_error = None
 
     def run(self):
         """Main task. Subclasses (e.g. imageThread) override this."""
@@ -315,12 +318,32 @@ class wranglerThread(Qt.QtCore.QThread):
         self._streaming_session = None
         self._streaming_sink = None
         self._streaming_scan_id = None
+        # BLOCKER 2: finish() is fail-loud — a streaming sink/write failure now
+        # RAISES instead of being silently swallowed (the user must not think a
+        # failed write succeeded).  Close BOTH sessions even if the first raises
+        # (wrap each individually + collect), then surface the failure loudly.
+        errors = []
         for sess in (session, streaming):
             if sess is not None:
                 try:
                     sess.finish()
+                except Exception as exc:
+                    errors.append(exc)
+                    logger.error("reduction session WRITE FAILED on close: %s",
+                                 exc, exc_info=True)
+        if errors:
+            self._reduction_write_error = errors[0]
+            msg = (f"Save FAILED — output .nxs may be incomplete: {errors[0]}")
+            show = getattr(self, "showLabel", None)
+            if show is not None:
+                try:
+                    show.emit(msg)
                 except Exception:
-                    logger.debug("failed to close reduction session", exc_info=True)
+                    pass
+            # A failed write is serious — stop the run rather than process
+            # further scans onto a broken output.
+            if getattr(self, "command", None) is not None:
+                self.command = 'stop'
 
     def _resolve_frame_mask(self, scan, img_data):
         """Return a stable per-scan "bad pixel" mask cached on the scan.
