@@ -216,3 +216,60 @@ def test_submit_rejected_in_chunked_mode(monkeypatch):
     with pytest.raises(RuntimeError, match="streaming"):
         session.submit(Frame(0, image=np.zeros((2, 2))))
     session.finish()
+
+
+# ---------------------------------------------------------------------------
+# Fail-loud on sink/write failure (BLOCKER 2)
+# ---------------------------------------------------------------------------
+class _BoomSink:
+    """A sink whose write() always fails — to exercise fail-loud finish()."""
+
+    def begin(self, scan, plan):
+        pass
+
+    def write(self, frame, reduction):
+        raise RuntimeError("disk full")
+
+    def finish(self, result):
+        pass
+
+    def abort(self, result):
+        pass
+
+
+def test_streaming_write_failure_surfaces(monkeypatch):
+    """A streaming sink WRITE failure must SURFACE (fail-loud), never be silently
+    swallowed.  It re-raises the ORIGINAL exception at the earliest point the
+    main thread touches the session after the writer records it — the next
+    submit() (existing guard) or finish() (this fix, for a last-frame failure)."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    session = ReductionSession(
+        _plan(), Scan("boom", _frames(4), integrator=object()),
+        sink=_BoomSink(), execution="streaming", executor=2,
+    )
+    with pytest.raises(RuntimeError, match="disk full"):
+        for fr in _frames(4):
+            session.submit(fr)
+        session.finish()
+    # The failure is recorded (preserved) for inspection, not lost.
+    assert session._failure is not None
+    assert "disk full" in str(session._failure)
+
+
+def test_finish_raise_on_failure_false_returns_failed_result(monkeypatch):
+    """The opt-out escape hatch: a last-frame write failure surfaces only at
+    finish(); raise_on_failure=False returns the failed result (preserved on the
+    session) instead of raising, so a caller can inspect result.failed."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    session = ReductionSession(
+        _plan(), Scan("boom", _frames(1), integrator=object()),
+        sink=_BoomSink(), execution="streaming", executor=2,
+    )
+    # A single frame: its write fails on the writer thread, so the ONLY point
+    # the main thread observes it is finish() (no later submit to surface it).
+    session.submit(_frames(1)[0])
+    result = session.finish(raise_on_failure=False)
+    assert result.failed and "disk full" in (result.error or "")
+    assert session.result is result

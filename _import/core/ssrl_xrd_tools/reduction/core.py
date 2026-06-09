@@ -917,8 +917,15 @@ class ReductionSession:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if exc is not None:
-            self._failure = exc
-        self.finish()
+            # A body exception is already propagating — finish for cleanup but
+            # do NOT raise (that would mask the original exception).
+            self._failure = self._failure or exc
+            self.finish(raise_on_failure=False)
+        else:
+            # Body succeeded; surface a swallowed write/sink failure (fail-loud)
+            # so even a bare ``with ReductionSession(...) as s: s.process()``
+            # can't silently report success on a failed write.
+            self.finish()
 
     @property
     def frames(self) -> dict[int, FrameReduction]:
@@ -1090,8 +1097,21 @@ class ReductionSession:
                 self._semaphore.release()
                 self._write_queue.task_done()
 
-    def finish(self) -> ReductionResult:
+    def finish(self, raise_on_failure: bool = True) -> ReductionResult:
+        """Drain, flush the sink, and return the :class:`ReductionResult`.
+
+        By default this is FAIL-LOUD: if any frame reduction or sink write
+        failed (``self._failure``), ``finish`` re-raises that original exception
+        (preserving its traceback) AFTER the result is built and the sink is
+        aborted/closed — so a data-writing run can never silently report success
+        (the failure info is still available on ``self.result`` / the return
+        value of a ``raise_on_failure=False`` call).  Pass
+        ``raise_on_failure=False`` to inspect ``result.failed`` and tolerate
+        partial failures instead (e.g. cleanup paths that are already handling an
+        exception, or freeze-only sessions with no write sink)."""
         if self._finished and self.result is not None:
+            # Idempotent: a re-call after a raised first finish() returns the
+            # preserved (possibly failed) result rather than re-raising.
             return self.result
 
         if self.execution == "streaming" and self._stream_started:
@@ -1135,6 +1155,11 @@ class ReductionSession:
             self._completed,
             len(self.scan),
         )
+        # Fail-loud (rail 1+3): re-raise the ORIGINAL reduction/sink-write
+        # exception so the real traceback survives (no generic wrapper).  The
+        # result is already stored on self.result (rail 2) for retrieval.
+        if raise_on_failure and self._failure is not None:
+            raise self._failure
         return self.result
 
     def _apply_gi_freeze(self, freeze_policy: str) -> None:
