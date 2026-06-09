@@ -1070,9 +1070,16 @@ class imageThread(wranglerThread):
         if status == "freeze":
             # These self-skip when the relevant ranges are already set, and
             # freeze the UNION over the two extreme scouts we hand them (NOT a
-            # chunk).
-            self._freeze_gi_1d_auto_range(scan, scouts)
-            self._freeze_gi_2d_auto_ranges(scan, scouts)
+            # chunk).  A degenerate scout cake raises GIFreezeError here -- that
+            # must FAIL CLOSED via _abort_gi_prepass, not escape the worker
+            # thread (run() has no except), so catch it (and any freeze error)
+            # the same way the scout exception above is caught.
+            try:
+                self._freeze_gi_1d_auto_range(scan, scouts)
+                self._freeze_gi_2d_auto_ranges(scan, scouts)
+            except Exception as exc:
+                self._abort_gi_prepass(f"whole-scan grid freeze failed ({exc})")
+                return False
         # status == "skip": fixed/manual/single-incidence/Eiger -- the session's
         # own freeze is correct (the grid was never chunk-clipped there).
         self._gi_prepass_scan_id = id(scan)   # latch only after success
@@ -1127,8 +1134,17 @@ class imageThread(wranglerThread):
             # Can't cheaply per-frame sweep (Eiger single-master is one incidence
             # per master -> fixed -> the session freeze is correct; a directory /
             # missing-source host likewise can't be swept).  Not an abort: these
-            # were never chunk-clipped.  (Multi-master varying-incidence Eiger is
-            # a known gap -- RESTRUCTURE-TODO.)
+            # were never chunk-clipped.
+            #
+            # KNOWN FAIL-OPEN GAPS (RESTRUCTURE-TODO) -- both return "skip" here
+            # and let the session freeze from chunk 1, so a *varying-incidence*
+            # scan of these kinds can still clip later frames:
+            #   (a) multi-master Eiger (incidence varies per master), and
+            #   (b) an Image-Directory per-file scan (_enumerate_scan_files
+            #       returns [] for inp_type == 'Image Directory').
+            # Both are uncommon for GI angle-dependence (which is typically an
+            # Image-Series sweep, handled below); fixing them needs a
+            # source-aware whole-scan incidence enumeration.
             return "skip", []
         if len(files) < 2:
             return "skip", []   # single-frame scan: no incidence range to freeze
@@ -1154,9 +1170,16 @@ class imageThread(wranglerThread):
         entries = []
         for _ang, fname, img_number, meta in (lo, hi):
             data = np.asarray(read_image(fname), dtype=float)
-            bg = self.get_background(fname, img_number, meta)
             # bg is irrelevant to the frozen AXIS extent (geometry+incidence
-            # driven), but pass the real value for parity with the live path.
+            # driven), so a failing/missing background must NOT abort an
+            # otherwise-valid GI run -- degrade to 0 for the axis-only scout
+            # rather than let the prepass turn it into a fail-closed stop.
+            try:
+                bg = self.get_background(fname, img_number, meta)
+            except Exception:
+                logger.debug("GI scout background failed for %s; using 0 for the "
+                             "axis-only scout", fname, exc_info=True)
+                bg = 0.0
             entries.append((fname, img_number, data, meta, bg, 0.0))
         return "freeze", entries
 

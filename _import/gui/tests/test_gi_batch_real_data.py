@@ -1069,6 +1069,39 @@ def test_gi_prepass_fails_closed_on_unestablishable_range():
     assert getattr(w, "_gi_prepass_scan_id", None) is None
 
 
+def test_gi_prepass_fails_closed_on_degenerate_scout_freeze():
+    """BLOCKER 1 follow-up: a GIFreezeError raised by the whole-scan FREEZE (a
+    degenerate / all-dummy scout cake) must FAIL CLOSED via _abort_gi_prepass --
+    aborting the run loud -- not escape the worker thread (run() has no except,
+    so an unhandled GIFreezeError would tear down the QThread)."""
+    from types import SimpleNamespace, MethodType
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    from ssrl_xrd_tools.reduction import GIFreezeError
+
+    emitted = []
+    w = SimpleNamespace(
+        gi=True, batch_mode=True, batch_execution="streaming", command="",
+        showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
+    )
+    for m in ("_gi_freeze_whole_scan_prepass", "_abort_gi_prepass", "_batch_execution"):
+        setattr(w, m, MethodType(getattr(imageThread, m), w))
+    # The scout resolves two extremes ("freeze"), but the production freeze hits
+    # a blank scout cake and raises GIFreezeError.
+    w._gi_whole_scan_scout_entries = lambda scan: (
+        "freeze", [("f", 1, None, {}, 0.0, 0.0)])
+
+    def _boom(scan, scouts):
+        raise GIFreezeError("blank GI scout cake")
+    w._freeze_gi_1d_auto_range = _boom
+    w._freeze_gi_2d_auto_ranges = _boom
+
+    proceed = w._gi_freeze_whole_scan_prepass(SimpleNamespace())
+    assert proceed is False                # fail closed, not raised
+    assert w.command == "stop"
+    assert emitted and "GI batch aborted" in emitted[-1]
+    assert getattr(w, "_gi_prepass_scan_id", None) is None   # not latched
+
+
 def test_gi_streaming_multichunk_later_chunk_uses_whole_scan_grid():
     """BLOCKER 1 TEST GAP: drive the streaming batch dispatcher over TWO chunks
     where the global-MAX-incidence frame (5, th 0.35) lands in the SECOND chunk
