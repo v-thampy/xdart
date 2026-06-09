@@ -273,3 +273,22 @@ def test_finish_raise_on_failure_false_returns_failed_result(monkeypatch):
     result = session.finish(raise_on_failure=False)
     assert result.failed and "disk full" in (result.error or "")
     assert session.result is result
+
+
+def test_run_reduction_streaming_matches_chunked(monkeypatch):
+    """#8a: run_reduction(execution="streaming") drives the streaming engine and
+    yields the same per-frame products as the chunked default -- notebook/headless
+    callers get streaming without hand-driving ReductionSession."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    chunked = run_reduction(_plan(), Scan("s", _frames(8), integrator=object()),
+                            executor=2)
+    streaming = run_reduction(_plan(), Scan("s", _frames(8), integrator=object()),
+                              execution="streaming", executor=2)
+    assert chunked.n_processed == streaming.n_processed == 8
+    assert sorted(streaming.frames) == sorted(chunked.frames) == list(range(8))
+    for i in range(8):
+        np.testing.assert_array_equal(
+            np.asarray(streaming.frames[i].result_1d.intensity, float),
+            np.asarray(chunked.frames[i].result_1d.intensity, float),
+        )

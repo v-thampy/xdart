@@ -1339,6 +1339,8 @@ def run_reduction(
     cancel_token: CancelToken | None = None,
     executor: Any | None = None,
     gi_freeze_mode: str | None = None,
+    execution: str = "chunked",
+    inflight_max: int | None = None,
 ) -> ReductionResult:
     """Run a headless reduction job over all frames in ``scan`` or a source.
 
@@ -1376,6 +1378,15 @@ def run_reduction(
         ``plan.extra["gi_freeze_scout_indices"]``) and freezes the missing
         output-axis ranges before the main reduction.  Explicit caller ranges
         are preserved.
+    execution
+        ``"chunked"`` (default) integrates frames in chunks; ``"streaming"``
+        submits each frame to a bounded in-flight window drained by one writer
+        thread (out-of-order completion, single-writer sink) — the same engine
+        xdart's GUI uses by default, exposed here so notebook/headless callers
+        get it without hand-driving :class:`ReductionSession`.
+    inflight_max
+        Streaming only: max frames in flight (defaults to ``2 × workers``).
+        Bounds peak memory for a fast source feeding a slower reduce.
     """
     with ReductionSession(
         plan,
@@ -1387,8 +1398,18 @@ def run_reduction(
         cancel_token=cancel_token,
         executor=executor,
         gi_freeze_mode=gi_freeze_mode,
+        execution=execution,
+        inflight_max=inflight_max,
     ) as session:
-        session.process()
+        if execution == "streaming":
+            # Streaming drains via submit() (process() is rejected); feed every
+            # frame, then finish() joins the writer and flushes.
+            for frame in session.scan:
+                if session.cancel_token.cancelled:
+                    break
+                session.submit(frame)
+        else:
+            session.process()
         return session.finish()
 
 
