@@ -119,6 +119,73 @@ class TestCrossFrame2DHydration:
         np.testing.assert_allclose(result, 2.0, atol=1e-4)   # mean(0..4)
 
 
+class TestHydrationGuardDuringRun:
+    """Freeze fix (path #2): while a run is writing the .nxs, the GUI-thread
+    readers must NOT open the file (the catch_h5py_file retry-storm under
+    file_lock = multi-minute beachball).  They serve cache misses from the
+    writer's resident in-memory frames only and degrade gracefully to "nothing
+    usable" for evicted frames; the disk hydration runs only when idle."""
+
+    @staticmethod
+    def _spy_opens(monkeypatch):
+        import xdart.modules.ewald.frame_series as fs
+        opens = []
+        real = fs.catch
+
+        def spy(fname, mode='r', *a, **k):
+            opens.append(fname)
+            return real(fname, mode, *a, **k)
+        monkeypatch.setattr(fs, 'catch', spy)
+        return opens
+
+    def test_no_disk_read_during_run_2d(self, tmp_path, monkeypatch):
+        opens = self._spy_opens(monkeypatch)
+        N = 30
+        scan = _build_scan_on_disk(tmp_path, N)   # reloaded -> _in_memory empty
+        opens.clear()
+        host = _make_host(scan, data_2d={})
+        host._processing_active = True            # a run is writing the .nxs
+        result, _x, _y = host.get_frames_int_2d(list(range(N)))
+        # No .nxs opened on the calling (GUI) thread, and an all-evicted
+        # selection degrades to "nothing usable" instead of blocking or raising.
+        assert opens == [], f"hydration opened the .nxs during a run: {opens}"
+        assert result is None
+
+    def test_run_serves_resident_skips_evicted_2d(self, tmp_path, monkeypatch):
+        opens = self._spy_opens(monkeypatch)
+        N = 30
+        scan = _build_scan_on_disk(tmp_path, N)
+        scan.frames._in_memory[5] = scan.frames[5]   # make frame 5 resident; 25 stays evicted
+        opens.clear()
+        host = _make_host(scan, data_2d={})
+        host._processing_active = True
+        result, _x, _y = host.get_frames_int_2d([5, 25])
+        assert opens == [], f"served from disk during a run: {opens}"
+        # Resident frame 5 displays; evicted 25 is skipped (NOT read from disk) ->
+        # result is frame 5's value, proving no disk fallback fired.
+        np.testing.assert_allclose(result, 5.0, atol=1e-4)
+
+    def test_run_1d_degrades_gracefully(self, tmp_path, monkeypatch):
+        opens = self._spy_opens(monkeypatch)
+        scan = _build_scan_on_disk(tmp_path, 30)
+        opens.clear()
+        host = _make_host(scan, data_2d={})
+        host._processing_active = True
+        ydata, xdata = host.get_frames_int_1d([10, 20], rv='average')
+        assert opens == []                            # 1D reader also gated
+        assert ydata is None                          # graceful skip, no raise
+
+    def test_idle_still_hydrates_after_run(self, tmp_path):
+        # The guard must NOT break the idle path the f51db68 fix targets
+        # (post-run reload / whole-scan Set-Bkg on a finished file).
+        N = 30
+        scan = _build_scan_on_disk(tmp_path, N)
+        host = _make_host(scan, data_2d={})
+        host._processing_active = False               # idle -> full disk hydration
+        result, _, _ = host.get_frames_int_2d(list(range(N)))
+        np.testing.assert_allclose(result, (N - 1) / 2.0, atol=1e-4)
+
+
 class TestCrossFrame1DHydration:
     def test_int_1d_hydrates_evicted_frames(self, tmp_path):
         # 1D sibling of the same bug (data_1d is also a bounded cache): a 1D
@@ -130,3 +197,22 @@ class TestCrossFrame1DHydration:
         ydata, xdata = host.get_frames_int_1d(list(range(N)), rv='average')
         assert ydata is not None, "1D cross-frame returned None (hydration failed)"
         np.testing.assert_allclose(ydata, (N - 1) / 2.0, atol=1e-4)  # mean(0..N-1)
+
+
+def test_int_2d_require_all_distinguishes_partial_from_no_2d(tmp_path):
+    """#6 (Set-Bkg refuse contract): require_all=True returns None when not every
+    selected frame contributes (partial coverage), while the default subset path
+    still returns the covered average -- so setBkg can tell PARTIAL coverage
+    (refuse: a partial average is a wrong background) from a 1D-only scan (no 2D,
+    None on both)."""
+    N = 5
+    scan = _build_scan_on_disk(tmp_path, N)
+
+    host = _make_host(scan, data_2d={})
+    # Every frame hydrates from disk -> require_all=True yields the full average.
+    assert host.get_frames_int_2d(list(range(N)), require_all=True)[0] is not None
+
+    # A selection including a non-existent frame -> partial coverage.
+    host2 = _make_host(scan, data_2d={})
+    assert host2.get_frames_int_2d([0, 1, 999])[0] is not None              # subset average exists
+    assert host2.get_frames_int_2d([0, 1, 999], require_all=True)[0] is None  # not all covered -> None

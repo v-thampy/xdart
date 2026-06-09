@@ -156,6 +156,20 @@ class DisplayDataMixin:
         frames = getattr(scan, 'frames', None)
         if frames is None:
             return None
+        # While a run is active the wrangler is writing the .nxs.  Opening it
+        # here (frames[idx] -> LiveFrameSeries.__getitem__ -> catch_h5py_file,
+        # which retries the h5py open 100x x 50ms under the writer's file_lock)
+        # would block the GUI thread for ~5s per evicted frame -> multi-minute
+        # freeze over a long scan.  Serve a cache miss from the writer's
+        # already-resident in-memory frames only -- a lock-free single-key dict
+        # read (atomic under the GIL; never marks _persisted, so persist-before-
+        # evict is untouched) -- and skip anything not resident until the run
+        # goes idle.  The full disk hydration below runs only when idle (post-run
+        # reload / whole-scan Set-Bkg on a finished file), where the writer is
+        # not contending and catch_h5py_file opens cleanly.
+        if getattr(self, '_processing_active', False):
+            in_mem = getattr(frames, '_in_memory', None)
+            return in_mem.get(int(idx)) if isinstance(in_mem, dict) else None
         try:
             if int(idx) not in frames.index:
                 return None

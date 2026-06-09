@@ -1537,9 +1537,31 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if self.overall:
                 idxs = sorted(list(self.scan.frames.index))
 
+            # #6: refuse a PARTIAL 2D background rather than silently averaging
+            # only the frames whose int_2d happens to be available — a partial
+            # average is a wrong background, not a smaller one.  require_all=True
+            # returns None when not every selected frame contributes; a None
+            # here is only partial coverage (not a 1D-only scan) if the
+            # subset-average path WOULD have returned something.
+            bkg_2d, _, _ = self.get_frames_int_2d(idxs, require_all=True)
+            if bkg_2d is None and self.get_frames_int_2d(idxs)[0] is not None:
+                logger.error(
+                    "Set Bkg refused: the 2D background covers only part of the "
+                    "selection (some frames' 2D data is unavailable) — a partial "
+                    "average would be a wrong background.")
+                try:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Background not set",
+                        "Some selected frames have no 2D data, so the background "
+                        "would cover only part of the selection.  Background not "
+                        "set — pick a fully-covered selection.")
+                except Exception:
+                    pass
+                return  # button stays 'Set Bkg'; no wrong background applied
+
             self.bkg_1d, _ = self.get_frames_int_1d(idxs, rv='average')
-            self.bkg_2d, _, _ = self.get_frames_int_2d(idxs)
-            self.bkg_map_raw = self.get_frames_map_raw(idxs)
+            self.bkg_2d = bkg_2d
+            self.bkg_map_raw = self.get_frames_map_raw(idxs, require_all=True)
             if self.bkg_map_raw is None:
                 # F5: be honest about a no-op 2D background.  Pre-F5
                 # this silently set bkg=0.: 1D/2D bkg subtraction

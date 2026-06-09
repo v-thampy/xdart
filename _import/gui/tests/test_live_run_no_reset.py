@@ -148,3 +148,71 @@ def test_data_reset_clears_when_not_live():
     assert viewer.frame_ids.cleared is True
     assert viewer._h5pool.closed == ["scan.nxs"]
     assert viewer.new_scan is True
+
+
+# ── Frame-click freeze guard (path #1: data_changed) ───────────────────────
+# Clicking an evicted frame in the Frames list during a run used to call
+# load_frames_data -> _teardown_load_worker.thread.wait(2000) on the GUI thread,
+# re-fired by each writer save's sigUpdate -> multi-minute beachball.  The
+# disk-load branch is now gated on _run_writing (the run-state owner's single
+# flag, parallel to the displayframe's _processing_active reader-side guard).
+
+def _frame_select_viewer(run_writing=False, selected=('5',), cached_2d=()):
+    """Minimal H5Viewer stand-in exercising data_changed's normal/HDF5 branch."""
+    calls = {'load': [], 'sig': 0, 'cancel': 0}
+    items = [SimpleNamespace(text=(lambda s=s: s)) for s in selected]
+    viewer = SimpleNamespace(
+        _run_writing=run_writing,
+        viewer_mode=None,                       # normal/integration mode
+        frame_ids=[],
+        update_2d=True,
+        data_1d={},
+        data_2d={int(i): 'x' for i in cached_2d},
+        scan=SimpleNamespace(frames=SimpleNamespace(index=list(range(100)))),
+        ui=SimpleNamespace(listData=SimpleNamespace(selectedItems=lambda: items)),
+        sigUpdate=SimpleNamespace(emit=lambda: calls.__setitem__('sig', calls['sig'] + 1)),
+    )
+    viewer.load_frames_data = lambda ids, l2d: calls['load'].append((list(ids), l2d))
+    viewer.cancel_pending_loads = lambda: calls.__setitem__('cancel', calls['cancel'] + 1)
+    viewer.data_changed = MethodType(H5Viewer.data_changed, viewer)
+    viewer.set_run_writing = MethodType(H5Viewer.set_run_writing, viewer)
+    return viewer, calls
+
+
+def test_frame_click_during_run_serves_cache_no_disk_load():
+    """Path #1: an evicted-frame click during a run must NOT call
+    load_frames_data (the GUI-thread thread.wait(2000) + sigUpdate churn)."""
+    viewer, calls = _frame_select_viewer(run_writing=True, selected=('5',))
+    viewer.data_changed()
+    assert calls['load'] == []          # no disk load while the writer is active
+    assert calls['sig'] == 1            # selection still refreshes from cache
+
+
+def test_frame_click_when_idle_loads_from_disk():
+    """Outside a run the same evicted selection loads normally (guard is
+    directional — it must not suppress idle / post-run loads)."""
+    viewer, calls = _frame_select_viewer(run_writing=False, selected=('5',))
+    viewer.data_changed()
+    assert calls['load'] == [([5], True)]
+    assert calls['sig'] == 1
+
+
+def test_set_run_writing_cancels_on_start_reloads_on_end():
+    """set_run_writing is the single switch the run-state owner drives: cancel
+    any in-flight load on the rising edge; re-fire the standing selection on the
+    falling edge so a frame skipped during the run loads once the file is idle."""
+    viewer, calls = _frame_select_viewer(run_writing=False, selected=('5',))
+    viewer.set_run_writing(True)
+    assert viewer._run_writing is True
+    assert calls['cancel'] == 1         # stale worker cancelled at run start
+    assert calls['load'] == []          # nothing loaded while writing
+    viewer.set_run_writing(False)
+    assert viewer._run_writing is False
+    assert calls['load'] == [([5], True)]   # falling edge re-loaded the selection
+
+
+def test_set_run_writing_no_reload_without_selection():
+    """No standing selection -> the falling edge is a quiet no-op."""
+    viewer, calls = _frame_select_viewer(run_writing=True, selected=())
+    viewer.set_run_writing(False)
+    assert calls['load'] == []
