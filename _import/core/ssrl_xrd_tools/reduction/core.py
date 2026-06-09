@@ -1097,6 +1097,29 @@ class ReductionSession:
                 self._semaphore.release()
                 self._write_queue.task_done()
 
+    def drain(self) -> None:
+        """Block until every SUBMITTED frame has been written, WITHOUT closing
+        the session (non-terminal — unlike :meth:`finish`).
+
+        For ``execution="streaming"`` this joins the writer queue
+        (``_write_queue.join()``): the writer thread has called ``task_done()``
+        for every item (both the per-frame ``finally`` and the sentinel branch in
+        :meth:`_writer_loop`), so this returns once the in-flight window has fully
+        drained and the sink has written each completed frame — yet the writer
+        thread keeps idling on ``_write_queue.get()`` (no sentinel is pushed), so
+        the session stays OPEN and :meth:`submit` works unchanged afterward.
+
+        This is what lets a caller quiesce the writer at a frame boundary (e.g. a
+        GUI Pause: drain, flush the sink to disk, browse, then resume submitting)
+        without the terminal teardown :meth:`finish` performs.  A per-frame
+        failure recorded during the drain still surfaces at the eventual
+        :meth:`finish` (fail-loud preserved).  No-op for chunked execution
+        (``process`` is already synchronous) and before the stream starts.
+        """
+        if (self.execution == "streaming" and self._stream_started
+                and self._write_queue is not None):
+            self._write_queue.join()
+
     def finish(self, raise_on_failure: bool = True) -> ReductionResult:
         """Drain, flush the sink, and return the :class:`ReductionResult`.
 

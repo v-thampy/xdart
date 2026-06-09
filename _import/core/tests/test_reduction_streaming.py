@@ -292,3 +292,55 @@ def test_run_reduction_streaming_matches_chunked(monkeypatch):
             np.asarray(streaming.frames[i].result_1d.intensity, float),
             np.asarray(chunked.frames[i].result_1d.intensity, float),
         )
+
+
+# ---------------------------------------------------------------------------
+# Non-terminal drain() (Pause) — quiesce the writer at a frame boundary
+# WITHOUT closing the session, so submit() works again on resume.
+# ---------------------------------------------------------------------------
+
+def test_streaming_drain_is_non_terminal(monkeypatch):
+    """drain() writes every submitted-so-far frame but keeps the session OPEN:
+    the writer thread stays alive and submit() works after drain (the GUI Pause
+    primitive)."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    sink = MemorySink()
+    session = ReductionSession(
+        _plan(), Scan("s", _frames(6), integrator=object()),
+        sink=sink, execution="streaming", executor=2,
+    )
+    for fr in _frames(6)[:3]:
+        session.submit(fr)
+    session.drain()
+    # The 3 submitted frames are written; the writer is STILL ALIVE (no sentinel).
+    assert sorted(sink.frames) == [0, 1, 2]
+    assert session._writer_thread is not None and session._writer_thread.is_alive()
+    assert not session._finished
+    # Session still open -> more submits + another drain work (resume).
+    for fr in _frames(6)[3:]:
+        session.submit(fr)
+    session.drain()
+    assert sorted(sink.frames) == [0, 1, 2, 3, 4, 5]
+    # Re-entrant drain with nothing pending returns immediately.
+    session.drain()
+    result = session.finish()
+    assert result.n_processed == 6
+    assert sorted(sink.frames) == list(range(6))
+
+
+def test_streaming_drain_noop_before_start_and_for_chunked(monkeypatch):
+    """drain() is a harmless no-op for chunked execution and before the first
+    submit (no writer thread to join)."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    chunked = ReductionSession(_plan(), Scan("c", _frames(2), integrator=object()),
+                               sink=MemorySink(), executor=2)
+    chunked.drain()            # no-op (chunked)
+    chunked.process(_frames(2))
+    chunked.finish()
+
+    streaming = ReductionSession(_plan(), Scan("s", _frames(2), integrator=object()),
+                                 sink=MemorySink(), execution="streaming", executor=2)
+    streaming.drain()          # no-op (stream not started yet)
+    streaming.finish()
