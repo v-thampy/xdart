@@ -263,6 +263,9 @@ class wranglerThread(Qt.QtCore.QThread):
         self._streaming_session = None
         self._streaming_sink = None
         self._streaming_scan_id = None
+        # BLOCKER 1: id of the scan whose whole-scan GI grid pre-pass has run, so
+        # the freeze happens once per scan (not per chunk).  Reset on scan close.
+        self._gi_prepass_scan_id = None
         # Set by _close_reduction_session when a streaming write/sink failure
         # surfaces from finish() — so the run can't report a false "success".
         self._reduction_write_error = None
@@ -318,6 +321,7 @@ class wranglerThread(Qt.QtCore.QThread):
         self._streaming_session = None
         self._streaming_sink = None
         self._streaming_scan_id = None
+        self._gi_prepass_scan_id = None      # next scan re-runs its own pre-pass
         # BLOCKER 2: finish() is fail-loud — a streaming sink/write failure now
         # RAISES instead of being silently swallowed (the user must not think a
         # failed write succeeded).  Close BOTH sessions even if the first raises

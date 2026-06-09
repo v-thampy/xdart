@@ -157,6 +157,13 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     # #70: the freeze now scouts first+last via these helpers (union of extremes).
     w._scout_pending_frames = MethodType(imageThread._scout_pending_frames, w)
     w._build_scout = MethodType(imageThread._build_scout, w)
+    # BLOCKER 1: the streaming dispatcher runs the whole-scan GI grid pre-pass;
+    # bind it + its helpers.  With no source attrs on this rig, _enumerate_scan_files
+    # returns [] so the pre-pass is a no-op (the chunk-local freeze is unchanged).
+    for _m in ("_gi_freeze_whole_scan_prepass", "_gi_whole_scan_scout_entries",
+               "_enumerate_scan_files"):
+        setattr(w, _m, MethodType(getattr(imageThread, _m), w))
+    w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
     # Spy on the xye flush: snapshot the Phase-1 integrated frames rather
     # than writing xye files (and don't clear the buffer).
     captured = {}
@@ -963,3 +970,60 @@ def test_gi_union_scout_covers_all_frames_not_just_frame0():
     # Sanity that the order test is meaningful: pending[0] differs between the
     # two orders, so an order-dependent (single-scout) freeze WOULD diverge.
     assert singles[0] != pytest.approx(singles[-1])
+
+
+def test_gi_streaming_prepass_scouts_whole_scan_extremes():
+    """BLOCKER 1: the streaming-batch GI pre-pass sweeps the WHOLE scan's
+    metadata (not chunk 1) to find the global lowest+highest incidence frames,
+    loads their images, and freezes the UNION grid -- so a multi-chunk angle-
+    dependence batch can't clip a later, higher-incidence frame to the chunk-1
+    grid.  Explicit contrast (3): a chunk-1-only freeze does NOT cover the
+    global-max frame, which is exactly the bug this fixes.
+    """
+    from types import SimpleNamespace, MethodType
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    scan_name = "Combi4_Angledependence_samz_4p9_03271002"
+    w = SimpleNamespace(
+        incidence_motor="th",
+        img_file=str(TIFF / f"{scan_name}_0001.tif"),
+        img_dir=str(TIFF), scan_name=scan_name, img_ext="tif",
+        meta_ext="txt", meta_dir=str(TIFF), inp_type=None,
+        get_background=lambda *a, **k: 0.0,
+    )
+    w._enumerate_scan_files = MethodType(imageThread._enumerate_scan_files, w)
+    w._gi_whole_scan_scout_entries = MethodType(
+        imageThread._gi_whole_scan_scout_entries, w)
+    w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta  # staticmethod
+
+    # (1) The whole-scan metadata sweep finds the two incidence EXTREMES
+    #     (th 0.15 = frame 1, th 0.35 = frame 5) and loads their images.
+    entries = w._gi_whole_scan_scout_entries(None)
+    assert len(entries) == 2
+    nums = sorted(e[1] for e in entries)
+    assert nums == [1, 5], f"expected the global extremes (1, 5); got {nums}"
+    for e in entries:
+        assert e[2] is not None and np.asarray(e[2]).ndim == 2   # image loaded
+
+    # (2) Those two extremes, handed to the production freeze, bracket EVERY
+    #     frame's q_oop extent (the union the chunk-1 freeze would miss).
+    poni = _tiff_poni()
+    raw = [_load_tiff(f"{scan_name}_{i:04d}.tif") for i in range(1, 6)]
+    mask = _tiff_mask(raw[0][0])
+    extreme_pending = [(e[0], e[1], e[2], e[3], 0.0, 0.0) for e in entries]
+    ulo, uhi = _freeze_1d_output_range(poni, mask, extreme_pending, "q_oop")
+    singles = [_freeze_1d_output_range(
+                   poni, mask,
+                   [(f"f{i}", i + 1, raw[i][0], raw[i][2], 0.0, 0.0)], "q_oop")
+               for i in range(5)]
+    for i, (slo, shi) in enumerate(singles):
+        assert ulo <= slo + 1e-9 and uhi >= shi - 1e-9, \
+            f"prepass union ({ulo},{uhi}) clips frame {i + 1} extent {(slo, shi)}"
+
+    # (3) Contrast (the bug): a chunk-1-only freeze (frames 1-2, th 0.15-0.20)
+    #     does NOT cover the global-max frame 5 (th 0.35).
+    chunk1 = [(f"f{i}", i + 1, raw[i][0], raw[i][2], 0.0, 0.0) for i in (0, 1)]
+    c1_lo, c1_hi = _freeze_1d_output_range(poni, mask, chunk1, "q_oop")
+    f5_lo, f5_hi = singles[4]
+    assert not (c1_lo <= f5_lo + 1e-9 and c1_hi >= f5_hi - 1e-9), \
+        "chunk-1-only freeze unexpectedly covers frame 5 -- test can't catch the bug"

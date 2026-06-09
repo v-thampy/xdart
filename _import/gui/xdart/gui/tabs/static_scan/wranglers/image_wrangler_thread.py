@@ -1013,6 +1013,135 @@ class imageThread(wranglerThread):
             gi_freeze_mode="scout_union" if self.batch_mode else "first_frame",
         )
 
+    # ── BLOCKER 1: whole-scan GI grid freeze (streaming batch) ──────────────
+    def _gi_freeze_whole_scan_prepass(self, scan) -> None:
+        """Freeze the GI common q/χ grid from the WHOLE scan's incidence range
+        BEFORE the streaming session opens.
+
+        The streaming batch session is built from the FIRST chunk only, so its
+        ``scout_union`` would bracket chunk 1's incidence range and clip later,
+        higher-incidence frames (BLOCKER 1).  Here a CHEAP metadata-only sweep
+        finds the global lowest+highest-incidence frames, loads ONLY those two
+        images, and runs the existing whole-scan freeze
+        (:meth:`_freeze_gi_1d_auto_range` / :meth:`_freeze_gi_2d_auto_ranges`,
+        which delegate to ``freeze_live_scan_gi_ranges``) to write the UNION
+        ranges into ``scan.bai_*_args``.  The streaming session then rebuilds its
+        plan with those ranges (``StandardPlanCache`` keys on ``bai_*_args``) and
+        its own per-session freeze early-returns -> the whole batch shares the
+        union grid.  The two scouts are integrated only inside the throwaway
+        freeze session, never submitted to the streaming session -> no double
+        processing.
+
+        Batch + streaming + GI only.  True-live keeps ``first_frame`` serial (it
+        has no whole scan ahead of time); the chunked batch path already builds
+        the full pending up front so its first/last ARE the scan extremes.
+        Runs once per scan (id-guarded).  Eiger single-master (one incidence per
+        master) and fixed/manual incidence collapse to the existing behaviour
+        (no whole-scan scout) -- the grid was never chunk-clipped there.
+        """
+        if not (self.gi and self.batch_mode
+                and self._batch_execution() == "streaming"):
+            return
+        if getattr(self, "_gi_prepass_scan_id", None) == id(scan):
+            return
+        self._gi_prepass_scan_id = id(scan)
+        try:
+            scouts = self._gi_whole_scan_scout_entries(scan)
+        except Exception:
+            logger.warning("GI whole-scan scout pre-pass failed; the session's "
+                           "chunk-local freeze will be used", exc_info=True)
+            return
+        if not scouts:
+            return
+        # These self-skip when the relevant ranges are already set, and freeze
+        # the UNION over the two extreme scouts we hand them (NOT a chunk).
+        self._freeze_gi_1d_auto_range(scan, scouts)
+        self._freeze_gi_2d_auto_ranges(scan, scouts)
+
+    def _gi_whole_scan_scout_entries(self, scan):
+        """Return scout entry tuples ``(img_file, img_number, img_data, img_meta,
+        bg_raw, 0.0)`` for the global lowest+highest incidence frames (≤2), or
+        ``[]`` when the whole-scan incidence can't be cheaply enumerated (fixed/
+        manual angle, Eiger/master, or an Image-Directory multi-scan source) --
+        in which case the existing chunk-local freeze is left to handle it."""
+        motor = self.incidence_motor
+        try:
+            float(motor)        # fixed/manual: one angle for the whole scan
+            return []
+        except (TypeError, ValueError):
+            pass
+        files = self._enumerate_scan_files()
+        if len(files) < 2:
+            return []
+        resolved = []
+        for fname, img_number in files:
+            try:
+                meta = (read_image_metadata(fname, meta_format=self.meta_ext,
+                                            meta_dir=self.meta_dir)
+                        if self.meta_ext else {})
+            except Exception:
+                continue
+            ang = self._resolve_incidence_from_meta(meta, motor)
+            if ang is not None:
+                resolved.append((ang, fname, img_number, meta))
+        if len(resolved) < 2:
+            return []
+        lo = min(resolved, key=lambda r: r[0])
+        hi = max(resolved, key=lambda r: r[0])
+        if lo[0] == hi[0]:          # no incidence sweep -> chunk grid is fine
+            return []
+        entries = []
+        for _ang, fname, img_number, meta in (lo, hi):
+            data = np.asarray(read_image(fname), dtype=float)
+            bg = self.get_background(fname, img_number, meta)
+            # bg is irrelevant to the frozen AXIS extent (geometry+incidence
+            # driven), but pass the real value for parity with the live path.
+            entries.append((fname, img_number, data, meta, bg, 0.0))
+        return entries
+
+    @staticmethod
+    def _resolve_incidence_from_meta(meta, motor):
+        """Case-insensitive lookup of the incidence motor in a frame's metadata
+        -> float, or None if absent/non-numeric (mirrors LiveFrame._get_incident_angle)."""
+        if not isinstance(meta, dict):
+            return None
+        ml = str(motor).lower()
+        for key, val in meta.items():
+            if str(key).lower() == ml:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _enumerate_scan_files(self):
+        """Sorted ``(fname, img_number)`` for a per-file scan series, metadata
+        only (NO image read).  Returns ``[]`` for Eiger/HDF5 masters and
+        Image-Directory sources that can't be cheaply per-frame swept (and,
+        defensively, for any host missing the source attrs)."""
+        img_file = getattr(self, "img_file", None)
+        if not img_file or _is_eiger_master(img_file):
+            return []
+        img_ext = getattr(self, "img_ext", "") or ""
+        if img_ext.lower() in ('h5', 'hdf5', 'nxs'):
+            return []
+        if getattr(self, "inp_type", None) == 'Image Directory':
+            return []
+        scan_name = getattr(self, "scan_name", None)
+        img_dir = getattr(self, "img_dir", None)
+        if not scan_name or not img_dir:
+            return []
+        _series_re = re.compile(
+            rf'^{re.escape(scan_name)}_\d+\.{re.escape(img_ext)}$')
+        paths = [str(p) for p in Path(img_dir).glob(
+                     f'{scan_name}_*.{img_ext}')
+                 if _series_re.match(p.name)]
+        out = []
+        for fname in natural_sort_ints(paths):
+            _sname, snumber = _get_scan_info(fname)
+            out.append((fname, snumber))
+        return out
+
     def _save_due(self, scan, *, force=False):
         """Whether a non-batch v2 save should fire now (persist-before-evict).
 
@@ -1135,6 +1264,10 @@ class imageThread(wranglerThread):
             sample_orientation=self.sample_orientation,
             tilt_angle=self.tilt_angle,
         )
+        # BLOCKER 1: freeze the GI common grid from the WHOLE scan's incidence
+        # range before the session opens (no-op on chunks 2..N via the scan-id
+        # guard; no-op for non-GI / fixed-incidence / Eiger-single-master).
+        self._gi_freeze_whole_scan_prepass(scan)
         frames = self._build_batch_frames(scan, pending)
         if not frames:
             return 0
