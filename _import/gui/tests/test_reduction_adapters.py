@@ -33,6 +33,15 @@ from xdart.modules.reduction import (
 
 
 
+@pytest.fixture(autouse=True)
+def _run_in_tmp(tmp_path, monkeypatch):
+    """LiveScan defaults ``data_file`` to CWD-relative ``<name>.nxs`` and the
+    frame-series persistence then writes it — several tests here construct
+    ``LiveScan("scan", ...)`` without a data_file, littering the repo root
+    with a real scan.nxs on every run.  Run each test from tmp instead."""
+    monkeypatch.chdir(tmp_path)
+
+
 def _poni() -> PONI:
     return PONI(
         dist=0.1,
@@ -286,11 +295,15 @@ def test_scan_from_live_scan_uses_authoritative_reloaded_wavelength() -> None:
     assert scan.wavelength == pytest.approx(1.0)
 
 
-def test_scan_from_live_scan_fills_frame_metadata_from_scan_data() -> None:
+def test_scan_from_live_scan_fills_frame_metadata_from_scan_data(tmp_path) -> None:
     frame = LiveFrame(idx=5, map_raw=np.ones((2, 2)), poni=_poni())
     scan = LiveScan(
         "scan",
         frames=[frame],
+        # data_file pinned to tmp: LiveScan defaults to CWD-relative
+        # "<name>.nxs", and the frame-series persistence then litters the
+        # repo root with a real scan.nxs on every test run.
+        data_file=str(tmp_path / "scan.nxs"),
         scan_data=pd.DataFrame({"i0": [42.0]}, index=[5]),
     )
 

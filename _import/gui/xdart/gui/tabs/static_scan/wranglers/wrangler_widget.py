@@ -342,6 +342,11 @@ class wranglerThread(Qt.QtCore.QThread):
         self.file_lock = file_lock
         self.signal_q = Queue()
         self.command_q = Queue()
+        # RS-2: serializes command TRANSITIONS between the GUI (pause/resume
+        # check-then-set) and the worker's self-stop writes (write-failure
+        # stop, GI freeze abort) — without it a self-stop landing between the
+        # GUI's check and its 'pause' write was silently revived.
+        self.command_lock = threading.Lock()
 
         # ── Shared batch-engine state ────────────────────────────────
         # Subclasses can override any of these before .start() (or
@@ -472,9 +477,16 @@ class wranglerThread(Qt.QtCore.QThread):
                 except Exception:
                     pass
             # A failed write is serious — stop the run rather than process
-            # further scans onto a broken output.
+            # further scans onto a broken output.  Under command_lock so a
+            # concurrent GUI pause() can't overwrite this stop (RS-2).
+            # getattr: tests drive this on duck holders without the lock.
             if getattr(self, "command", None) is not None:
-                self.command = 'stop'
+                _lock = getattr(self, "command_lock", None)
+                if _lock is not None:
+                    with _lock:
+                        self.command = 'stop'
+                else:
+                    self.command = 'stop'
 
     def _resolve_frame_mask(self, scan, img_data):
         """Return a stable per-scan "bad pixel" mask cached on the scan.

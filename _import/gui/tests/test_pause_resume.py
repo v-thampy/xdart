@@ -266,7 +266,8 @@ def _rs2_wrangler(command, thread_command):
     calls = []
     w = SimpleNamespace(
         command=command,
-        thread=SimpleNamespace(command=thread_command),
+        thread=SimpleNamespace(command=thread_command,
+                               command_lock=threading.Lock()),
         _set_action_button=lambda phase: calls.append(('button', phase)),
         sigResuming=SimpleNamespace(emit=lambda: calls.append('resuming')),
     )

@@ -1201,8 +1201,15 @@ class imageThread(wranglerThread):
             logger.debug("showLabel emit failed for GI prepass abort",
                          exc_info=True)
         # Stop the collection loop loudly (mirrors a write-failure stop); the
-        # close path then drains/closes any partially-built session.
-        self.command = 'stop'
+        # close path then drains/closes any partially-built session.  Under
+        # command_lock so a concurrent GUI pause() can't overwrite it (RS-2).
+        # getattr: tests drive this on duck holders without the lock.
+        _lock = getattr(self, "command_lock", None)
+        if _lock is not None:
+            with _lock:
+                self.command = 'stop'
+        else:
+            self.command = 'stop'
 
     def _gi_whole_scan_scout_entries(self, scan):
         """Decide how to freeze the whole-scan GI grid and, when needed, gather

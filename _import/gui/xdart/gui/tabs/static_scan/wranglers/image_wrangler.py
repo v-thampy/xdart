@@ -964,11 +964,13 @@ class imageWrangler(wranglerWidget):
         # RS-2: never overwrite a stop — the worker self-stops by writing
         # thread.command='stop' directly (write-failure stop, GI freeze
         # abort); blindly writing 'pause' here would silently revive a run
-        # that just declared itself dead.
-        if self.command == 'stop' or self.thread.command == 'stop':
-            return
-        self.command = 'pause'
-        self.thread.command = 'pause'
+        # that just declared itself dead.  command_lock makes the
+        # check-then-set atomic against those worker writes.
+        with self.thread.command_lock:
+            if self.command == 'stop' or self.thread.command == 'stop':
+                return
+            self.command = 'pause'
+            self.thread.command = 'pause'
         # Transient state until the worker confirms via sigPaused -> _on_paused
         # (which morphs to Resume).  Disabled so a double-click can't race.
         self._set_action_button('pausing')
@@ -980,7 +982,8 @@ class imageWrangler(wranglerWidget):
         # the transient 'Pausing…' window (stop() already morphed the button to
         # green 'idle'), a late sigPaused must NOT flash the button back to orange
         # 'Resume' — self.command (GUI-thread mirror) is 'stop' by then.
-        if self.command == 'stop':
+        # Also honor a WORKER self-stop (thread.command) for symmetry (RS-2).
+        if self.command == 'stop' or self.thread.command == 'stop':
             return
         self._set_action_button('paused')    # orange 'Resume'
 
@@ -990,11 +993,17 @@ class imageWrangler(wranglerWidget):
         command back to the run state so a browse read can't race the restarted
         writer."""
         # RS-2: a stop that landed while paused must stay a stop (see pause()).
-        if self.command == 'stop' or self.thread.command == 'stop':
-            return
+        with self.thread.command_lock:
+            if self.command == 'stop' or self.thread.command == 'stop':
+                return
+        # Emit OUTSIDE the lock (the host's synchronous sigResuming slot must
+        # not run under it), then flip the command under a fresh check.
         self.sigResuming.emit()
-        self.command = 'start'
-        self.thread.command = 'start'
+        with self.thread.command_lock:
+            if self.command == 'stop' or self.thread.command == 'stop':
+                return
+            self.command = 'start'
+            self.thread.command = 'start'
         self._set_action_button('running')   # orange 'Pause'
 
     def _set_action_button(self, phase):

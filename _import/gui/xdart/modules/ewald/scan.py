@@ -746,12 +746,13 @@ class LiveScan:
         # ── global_mask: persisted under /entry/instrument/detector/mask ─
         # Restored here so the displayframe can overlay it on raw images
         # without depending on the wrangler having loaded the mask file.
+        # Read through the already-open handle (same rationale as the
+        # wavelength restore above — no double-open of a file the caller
+        # holds open in mode 'a').
         try:
-            import h5py
-            with h5py.File(self.data_file, "r") as _f:
-                _det = _f.get("entry/instrument/detector")
-                if _det is not None and "mask" in _det:
-                    self.global_mask = np.asarray(_det["mask"][()], dtype=np.int64)
+            _det = grp.get("entry/instrument/detector")
+            if _det is not None and "mask" in _det:
+                self.global_mask = np.asarray(_det["mask"][()], dtype=np.int64)
         except Exception:
             logger.debug("Failed to read global_mask from %s",
                          self.data_file, exc_info=True)
