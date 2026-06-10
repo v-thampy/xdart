@@ -888,6 +888,12 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
                 if r is not None]
         missing = [int(i) for fr, i, r in zip(frames, indices, results)
                    if r is None]
+        if not kept:
+            # EVERY selected row lacks a result: structural (this output was
+            # never computed for these frames), not the H1 mixed-drop
+            # pathology -- skip silently and leave the cursor alone (a later
+            # reintegrate may fill them in).
+            return None
         if cursor is not None and replace_frame_indices is None:
             cursor.dropped.setdefault(group_path, set()).update(missing)
         logger.warning(
@@ -895,8 +901,6 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
             "writing the remaining %d.", "1d", len(missing), missing[:8],
             "..." if len(missing) > 8 else "", len(kept),
         )
-        if not kept:
-            return None
         frames = [fr for fr, _i, _r in kept]
         indices = [i for _fr, i, _r in kept]
         results = [r for _fr, _i, r in kept]
@@ -935,6 +939,10 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
     """Select the 2D rows that would be written, without mutating disk."""
     if not scan.frames.index:
         return None
+    if getattr(scan, "skip_2d", False):
+        # Int 1D mode: 2D is intentionally not computed -- nothing to select,
+        # and the per-frame no-result warning below would be pure noise.
+        return None
 
     h5f = _h5(f)
     group_path = f"{entry}/integrated_2d"
@@ -956,6 +964,12 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
                 if r is not None]
         missing = [int(i) for fr, i, r in zip(frames, indices, results)
                    if r is None]
+        if not kept:
+            # EVERY selected row lacks a result: structural (this output was
+            # never computed for these frames), not the H1 mixed-drop
+            # pathology -- skip silently and leave the cursor alone (a later
+            # reintegrate may fill them in).
+            return None
         if cursor is not None and replace_frame_indices is None:
             cursor.dropped.setdefault(group_path, set()).update(missing)
         logger.warning(
@@ -963,8 +977,6 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
             "writing the remaining %d.", "2d", len(missing), missing[:8],
             "..." if len(missing) > 8 else "", len(kept),
         )
-        if not kept:
-            return None
         frames = [fr for fr, _i, _r in kept]
         indices = [i for _fr, i, _r in kept]
         results = [r for _fr, _i, r in kept]
