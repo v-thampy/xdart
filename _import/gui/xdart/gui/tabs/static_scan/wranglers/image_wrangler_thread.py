@@ -1607,7 +1607,28 @@ class imageThread(wranglerThread):
                 name = f'{name} #{live.idx}'
             self.showLabel.emit(f'Processing {name}')
             sink.register(live)
-            session.submit(frame_from_live_frame(live))
+            try:
+                session.submit(frame_from_live_frame(live))
+            except BaseException as exc:
+                # submit() re-raises a RECORDED writer/sink failure at its
+                # fail-loud precheck.  Bare, that raise escapes run() (which
+                # has no except) and tears down the QThread, bypassing the
+                # 'Save FAILED' -> stop chain entirely.  Catch it here and
+                # stop the run loudly instead (same treatment the
+                # GIFreezeError path got).
+                msg = f'Save FAILED mid-run: {exc} — stopping the run.'
+                logger.error(msg, exc_info=True)
+                try:
+                    self.showLabel.emit(msg)
+                except Exception:
+                    pass
+                _lock = getattr(self, "command_lock", None)
+                if _lock is not None:
+                    with _lock:
+                        self.command = 'stop'
+                else:
+                    self.command = 'stop'
+                break
             count += 1
         return count
 

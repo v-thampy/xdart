@@ -70,6 +70,12 @@ class NexusWriteCursor:
     groups: dict[str, tuple[int, int | None, tuple]] = field(default_factory=dict)
     metadata: tuple[int, int | None, tuple] | None = None
     instrument: tuple | None = None
+    # H1: labels whose row for a given group is permanently unwritable
+    # (publication-gate-rejected, or lazy-reloaded with no result).  Excluded
+    # from append selection so they aren't re-lazy-loaded inside the open
+    # writer handle and re-skipped (with a warning) on every save.
+    # {group_path: set(labels)}
+    dropped: dict = field(default_factory=dict)
 
 
 def _write_cursor(scan, h5f) -> NexusWriteCursor:
@@ -452,7 +458,9 @@ def _new_frames_for_write(scan, h5f, group_path: str,
         memory_sig = _index_structure_signature(scan.frames.index, existing_n)
         if (cached_n == existing_n and cached_last == disk_last
                 and cached_sig == memory_sig and memory_last == disk_last):
-            new_indices = list(scan.frames.index[existing_n:])
+            _drop = cursor.dropped.get(group_path, ()) if cursor else ()
+            new_indices = [i for i in scan.frames.index[existing_n:]
+                           if int(i) not in _drop]
             return [scan.frames[i] for i in new_indices], existing_n
     # Select frames whose *label* isn't already on disk, not a positional
     # tail slice.  A late/out-of-order frame (e.g. frame 1 arriving after
@@ -471,7 +479,9 @@ def _new_frames_for_write(scan, h5f, group_path: str,
         live_ids = {int(x) for x in scan.frames.index}
         if not on_disk.issubset(live_ids):
             return [], -2
-    new_indices = [i for i in scan.frames.index if int(i) not in on_disk]
+    _drop = cursor.dropped.get(group_path, ()) if cursor else ()
+    new_indices = [i for i in scan.frames.index
+                   if int(i) not in on_disk and int(i) not in _drop]
     new_frames = [scan.frames[i] for i in new_indices]
     return new_frames, existing_n
 
@@ -727,6 +737,10 @@ def _filter_prepared_output(
                 error_details(publication),
             )
             dropped_indices.append(idx)
+            _cur = prepared.get("cursor")
+            if _cur is not None and not prepared.get("is_replace"):
+                _cur.dropped.setdefault(
+                    prepared["group_path"], set()).add(int(idx))
             continue
         kept_frames.append(frame)
         kept_indices.append(idx)
@@ -852,7 +866,28 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
         return
     results = [getattr(fr, "int_1d", None) for fr in frames]
     if any(r is None for r in results):
-        return None
+        # H1: drop result-less rows PER FRAME, never the whole save (a frame
+        # lazy-reloaded after its row was publication-dropped has int_1d=None
+        # forever; the old all-or-nothing skip silently truncated every
+        # LATER frame's write too).  Remember the labels on the cursor so
+        # they aren't re-selected (and re-lazy-loaded inside the open
+        # writer) on every subsequent save.
+        kept = [(fr, i, r) for fr, i, r in zip(frames, indices, results)
+                if r is not None]
+        missing = [int(i) for fr, i, r in zip(frames, indices, results)
+                   if r is None]
+        if cursor is not None and replace_frame_indices is None:
+            cursor.dropped.setdefault(group_path, set()).update(missing)
+        logger.warning(
+            "integrated_%s: skipping %d frame(s) with no result (%s%s); "
+            "writing the remaining %d.", "1d", len(missing), missing[:8],
+            "..." if len(missing) > 8 else "", len(kept),
+        )
+        if not kept:
+            return None
+        frames = [fr for fr, _i, _r in kept]
+        indices = [i for _fr, i, _r in kept]
+        results = [r for _fr, _i, r in kept]
     return {
         "entry": entry,
         "group_path": group_path,
@@ -899,7 +934,28 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
         return
     results = [getattr(fr, "int_2d", None) for fr in frames]
     if any(r is None for r in results):
-        return None
+        # H1: drop result-less rows PER FRAME, never the whole save (a frame
+        # lazy-reloaded after its row was publication-dropped has int_2d=None
+        # forever; the old all-or-nothing skip silently truncated every
+        # LATER frame's write too).  Remember the labels on the cursor so
+        # they aren't re-selected (and re-lazy-loaded inside the open
+        # writer) on every subsequent save.
+        kept = [(fr, i, r) for fr, i, r in zip(frames, indices, results)
+                if r is not None]
+        missing = [int(i) for fr, i, r in zip(frames, indices, results)
+                   if r is None]
+        if cursor is not None and replace_frame_indices is None:
+            cursor.dropped.setdefault(group_path, set()).update(missing)
+        logger.warning(
+            "integrated_%s: skipping %d frame(s) with no result (%s%s); "
+            "writing the remaining %d.", "2d", len(missing), missing[:8],
+            "..." if len(missing) > 8 else "", len(kept),
+        )
+        if not kept:
+            return None
+        frames = [fr for fr, _i, _r in kept]
+        indices = [i for _fr, i, _r in kept]
+        results = [r for _fr, _i, r in kept]
     return {
         "entry": entry,
         "group_path": group_path,
