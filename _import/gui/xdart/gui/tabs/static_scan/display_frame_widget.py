@@ -232,29 +232,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _c.setFixedHeight(_ROW_H)
         displayFrameWidget._fit_button_width(self.ui.setBkg)
         self.ui.setBkg.setFixedHeight(_ROW_H)
-        # The scale/cmap combos move into the Options popup ('Other' row) --
-        # pull them out of the top bar (re-parented when the dialog is
-        # built, same pattern as Offset/Legend).  In their place: one
-        # checkable 'Log' toggle = Linear <-> Log via the scale combo, so
-        # the existing Log path (incl. its negative/small-value shift in
-        # pgImageWidget.update_image) is reused verbatim.
-        for _w in (self.ui.scale, self.ui.cmap):
-            self.ui.horizontalLayout_9.removeWidget(_w)
-            _w.setParent(None)
+        # The SCALE combo moves into the Options popup ('Other' row); the
+        # colormap stays in the bar.  One checkable 'Log' toggle = Linear <->
+        # Log via the scale combo, so the existing Log path (incl. its
+        # negative/small-value shift in pgImageWidget.update_image) is reused
+        # verbatim.  The right cluster is rebuilt in final order (Raw |
+        # colormap | Log, Log at the corner) once the Raw button exists.
+        self.ui.horizontalLayout_9.removeWidget(self.ui.scale)
+        self.ui.scale.setParent(None)
         self._logBtn = QtWidgets.QPushButton('Log')
         self._logBtn.setCheckable(True)
         self._logBtn.setFixedHeight(_ROW_H)
         displayFrameWidget._fit_button_width(self._logBtn)
         self._logBtn.setFocusPolicy(pyQt.StrongFocus)
-        # ~half-inch indent before the Log button, and vertically center the
-        # row's contents (they sat bottom-aligned in the taller frame).
-        self.ui.horizontalLayout_9.insertSpacerItem(
-            0, QtWidgets.QSpacerItem(48, 20,
-                                     QtWidgets.QSizePolicy.Policy.Fixed,
-                                     QtWidgets.QSizePolicy.Policy.Minimum))
-        self.ui.horizontalLayout_9.insertWidget(1, self._logBtn)
-        self.ui.horizontalLayout_9.setAlignment(
-            self._logBtn, pyQt.AlignVCenter)
         _parent_layout = self.ui.frame_6.parentWidget().layout()
         if _parent_layout is not None:
             _parent_layout.setAlignment(self.ui.frame_6, pyQt.AlignVCenter)
@@ -586,19 +576,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.wf_cancel_button = QtWidgets.QPushButton('Cancel')
 
         # Raw image preview button
-        self._showImageBtn = QtWidgets.QPushButton('Raw Image')
+        self._showImageBtn = QtWidgets.QPushButton('Raw')
         self._showImageBtn.setFixedHeight(28)   # match the top-row controls
         displayFrameWidget._fit_button_width(self._showImageBtn)
-        self._showImageBtn.setMinimumSize(QtWidgets.QWidget().minimumSize())
-        self._showImageBtn.setMaximumSize(Qt.QtCore.QSize(90, 16777215))
         self._showImageBtn.setToolTip('Show raw image preview for selected frame')
         self._showImageBtn.setFocusPolicy(pyQt.StrongFocus)
-        self.ui.horizontalLayout_9.addSpacerItem(
-            QtWidgets.QSpacerItem(10, 20, QtWidgets.QSizePolicy.Policy.Fixed,
-                                  QtWidgets.QSizePolicy.Policy.Minimum))
-        self.ui.horizontalLayout_9.addWidget(self._showImageBtn)
-        self.ui.horizontalLayout_9.setAlignment(
-            self._showImageBtn, pyQt.AlignVCenter)
+        # Rebuild the right cluster in its final order: Raw | colormap | Log
+        # (Log at the right corner in every mode).
+        _l9 = self.ui.horizontalLayout_9
+        while _l9.count():
+            _l9.takeAt(0)
+        for _w in (self._showImageBtn, self.ui.cmap, self._logBtn):
+            _l9.addWidget(_w)
+            _l9.setAlignment(_w, pyQt.AlignVCenter)
+        _l9.setSpacing(8)
         self._showImageBtn.clicked.connect(self._show_image_preview)
         self._showImageBtn.setVisible(False)
         self._image_preview_dialog = None

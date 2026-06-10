@@ -375,11 +375,14 @@ class staticWidget(QWidget):
             except Exception:
                 logger.debug("mainSplitter default sizing failed",
                              exc_info=True)
-        # Twice: at 0ms (offscreen/tests) and after the macOS window manager
-        # has settled the real frame size (the 0ms shot fired before the
-        # native resize on mac, so the proportions were redistributed away).
+        # Re-assert on EVERY window resize until the user drags the splitter
+        # -- timers (0ms/400ms) kept losing to late window-manager resizes on
+        # mac, leaving the default hint-based split.
+        self._split_user_moved = False
+        self.ui.mainSplitter.splitterMoved.connect(
+            lambda *_: setattr(self, '_split_user_moved', True))
+        self._apply_default_split = _default_split
         QtCore.QTimer.singleShot(0, _default_split)
-        QtCore.QTimer.singleShot(400, _default_split)
         self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
         if len(self.scan.frames.index) > 0:
             self.integratorTree.update()
@@ -873,6 +876,15 @@ class staticWidget(QWidget):
 
             self.metawidget.update()
             # self.integratorTree.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Keep the default 19/57/24 split through window-manager resizes;
+        # stops the moment the user drags the splitter themselves.
+        if not getattr(self, '_split_user_moved', True):
+            apply = getattr(self, '_apply_default_split', None)
+            if callable(apply):
+                apply()
 
     def close(self):
         """Tries a graceful close.

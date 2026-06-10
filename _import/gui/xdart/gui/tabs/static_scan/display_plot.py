@@ -785,12 +785,12 @@ class DisplayPlotMixin:
         ov.addWidget(self.ui.yOffset, 0, 1)
 
         # ── Other ─────────────────────────────────────────────────
-        # Legend toggle + the scale/colormap combos (moved out of the top
-        # bar; re-parented here by addWidget).
+        # Legend toggle + the scale combo (moved out of the top bar;
+        # re-parented here by addWidget).  The colormap lives in the top
+        # bar next to the Log toggle.
         lg = _section('Other')
         lg.addWidget(self.ui.showLegend, 0, 0)
         lg.addWidget(self.ui.scale, 0, 1)
-        lg.addWidget(self.ui.cmap, 0, 2)
 
         # ── Dialog buttons ────────────────────────────────────────
         btns = QtWidgets.QHBoxLayout()
