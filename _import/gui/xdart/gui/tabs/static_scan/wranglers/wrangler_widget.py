@@ -134,6 +134,124 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         """
         pass
 
+    # ── Group-header toggles (UI-1, #81) ────────────────────────────────
+    # Maps a toggle-group's name (e.g. 'GI') to its hidden enabling bool
+    # child ('Grazing').  _install_group_toggles puts a REAL checkbox on
+    # the group's header row: the checkbox is the on/off control, driving
+    # the hidden bool that stays the source of truth the wrangler reads
+    # (hidden so it can't repaint-uncheck while the tree is disabled
+    # mid-run, #56).  Checking expands the group, unchecking collapses it;
+    # a manual chevron expand just peeks at the options — it does NOT
+    # enable the feature.
+    _GROUP_TOGGLES = {}
+
+    @staticmethod
+    def _toggle_check_state(on):
+        return (Qt.QtCore.Qt.CheckState.Checked if on
+                else Qt.QtCore.Qt.CheckState.Unchecked)
+
+    def _install_group_toggles(self, tree):
+        """Add a checkbox to each _GROUP_TOGGLES group's header item and wire
+        it both ways to the group's hidden enabling bool.  Call once, after
+        ``tree.setParameters`` (the header items must exist)."""
+        self._group_toggle_items = []
+        for grp_name, bool_name in self._GROUP_TOGGLES.items():
+            try:
+                grp = self.parameters.child(grp_name)
+                bool_param = grp.child(bool_name)
+                item = next(iter(grp.items))
+            except Exception:
+                logger.debug("group-toggle install skipped for %s", grp_name,
+                             exc_info=True)
+                continue
+            item.setFlags(item.flags()
+                          | Qt.QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(0, self._toggle_check_state(bool_param.value()))
+            self._group_toggle_items.append((item, grp, bool_param))
+            bool_param.sigValueChanged.connect(self._sync_group_toggle_from_bool)
+            # pyqtgraph's ParameterItem.optsChanged ends with updateFlags(),
+            # which rebuilds the header's flags from the param opts and drops
+            # ItemIsUserCheckable (any setOpts — expanded, visible — strips
+            # the checkbox).  Re-assert it after every opts change; connected
+            # AFTER the item's own optsChanged so it runs post-updateFlags.
+            grp.sigOptionsChanged.connect(self._reassert_group_toggle_flags)
+        if self._group_toggle_items:
+            tree.itemChanged.connect(self._on_group_toggle_item_changed)
+
+    def _reassert_group_toggle_flags(self, _param=None, _opts=None):
+        checkable = Qt.QtCore.Qt.ItemFlag.ItemIsUserCheckable
+        for item, _grp, _bool_param in getattr(self, '_group_toggle_items', ()):
+            if not (item.flags() & checkable):
+                item.setFlags(item.flags() | checkable)
+
+    def _on_group_toggle_item_changed(self, item, column):
+        """User (un)checked a toggle-group header: drive the hidden bool and
+        open/fold the group to match."""
+        if column != 0:
+            return
+        for it, grp, bool_param in getattr(self, '_group_toggle_items', ()):
+            if it is item:
+                on = (item.checkState(0)
+                      == Qt.QtCore.Qt.CheckState.Checked)
+                if bool(bool_param.value()) != on:
+                    bool_param.setValue(on)
+                    save = getattr(self, '_save_to_session', None)
+                    if save is not None:
+                        save()
+                grp.setOpts(expanded=on)
+                return
+
+    def _sync_group_toggle_from_bool(self, param, value):
+        """Programmatic bool change (session restore etc.): reflect it into
+        the header checkbox."""
+        for item, grp, bool_param in getattr(self, '_group_toggle_items', ()):
+            if bool_param is param:
+                state = self._toggle_check_state(bool(value))
+                if item.checkState(0) != state:
+                    item.setCheckState(0, state)
+                return
+
+    # ── Status label (specLabel / statusLabel) ──────────────────────────
+    # A plain QLabel's minimum width is its full text width, so a long
+    # status message (e.g. the live-GI clip advisory, ~180 chars) forces
+    # the WHOLE window to expand horizontally.  Subclasses must route
+    # status text through _set_status_text and call _guard_status_label
+    # once after building their UI.
+
+    def _status_label(self):
+        """The wrangler's status QLabel, whatever the subclass calls it."""
+        label = getattr(self, 'statusLabel', None)
+        if label is not None:
+            return label
+        ui = getattr(self, 'ui', None)
+        return getattr(ui, 'specLabel', None) if ui is not None else None
+
+    def _guard_status_label(self):
+        """Stop the status label from driving the window's minimum width:
+        with an Ignored horizontal policy the label takes whatever width the
+        layout gives it and overlong text clips instead of growing the window."""
+        label = self._status_label()
+        if label is None:
+            return
+        policy = label.sizePolicy()
+        policy.setHorizontalPolicy(Qt.QtWidgets.QSizePolicy.Policy.Ignored)
+        label.setSizePolicy(policy)
+
+    def _set_status_text(self, text):
+        """Set the status label, eliding to the label's current width (the
+        full text goes in the tooltip).  Safe for arbitrarily long thread
+        messages — see _guard_status_label."""
+        label = self._status_label()
+        if label is None:
+            return
+        text = text or ''
+        label.setToolTip(text)
+        if label.isVisible() and label.width() > 0:
+            metrics = Qt.QtGui.QFontMetrics(label.font())
+            text = metrics.elidedText(
+                text, Qt.QtCore.Qt.TextElideMode.ElideRight, label.width() - 4)
+        label.setText(text)
+
     def setup(self):
         """Sets the thread child object. Called by tthetaWidget prior
         to starting thread.

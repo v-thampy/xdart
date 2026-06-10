@@ -58,11 +58,12 @@ params = [
         {'name': 'mask_file', 'title': 'Mask File    ', 'type': 'str', 'value': ''},
         NamedActionParameter(name='mask_file_browse', title='Browse...'),
     ], 'expanded': False},
-    {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group', 'syncExpanded': True,
+    {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group',
      'children': [
-        # UI-1 (#81): the GROUP HEADER is the on/off toggle (expand = on,
-        # collapse = off).  The bool is the hidden source of truth (a hidden
-        # bool can't repaint-uncheck when the tree is disabled mid-run, #56).
+        # UI-1 (#81): the group HEADER carries a real checkbox — the on/off
+        # toggle (see wranglerWidget._install_group_toggles).  The bool is the
+        # hidden source of truth (a hidden bool can't repaint-uncheck when the
+        # tree is disabled mid-run, #56).
         {'name': 'Grazing', 'title': 'Grazing Incidence', 'type': 'bool',
          'value': False, 'visible': False},
         {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'str', 'value': 'th'},
@@ -131,10 +132,13 @@ class nexusWrangler(wranglerWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
 
-        # Status label
+        # Status label.  Long thread messages (missing-dataset errors etc.)
+        # must not force the window wider — elide into the label, full text
+        # in the tooltip (see wranglerWidget._guard_status_label).
         self.statusLabel = QtWidgets.QLabel('Ready')
         layout.addWidget(self.statusLabel)
-        self.showLabel.connect(self.statusLabel.setText)
+        self._guard_status_label()
+        self.showLabel.connect(self._set_status_text)
 
         # Buttons
         btn_layout = QtWidgets.QHBoxLayout()
@@ -237,10 +241,10 @@ class nexusWrangler(wranglerWidget):
             self.browse_h5_dir
         )
 
-        # UI-1 (#81): the GI group header expand/collapse is the on/off toggle;
-        # mirror it into the hidden 'Grazing' bool that setup() reads at start.
-        self.parameters.child('GI').sigOptionsChanged.connect(
-            self._sync_group_toggle_from_expand)
+        # UI-1 (#81): put a real checkbox on the GI group header — the
+        # checkbox is the on/off toggle, driving the hidden 'Grazing' bool
+        # that setup() reads at start (see wranglerWidget._install_group_toggles).
+        self._install_group_toggles(self.tree)
 
         # Setup thread
         self.thread = nexusThread(
@@ -264,7 +268,7 @@ class nexusWrangler(wranglerWidget):
             entry=self.entry,
             parent=self,
         )
-        self.thread.showLabel.connect(self.statusLabel.setText)
+        self.thread.showLabel.connect(self._set_status_text)
         self.thread.sigUpdateFile.connect(self.sigUpdateFile.emit)
         self.thread.finished.connect(self.finished.emit)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
@@ -316,7 +320,8 @@ class nexusWrangler(wranglerWidget):
                 )
 
         # UI-1 (#81): reflect the restored GI on/off into the group's expanded
-        # state (the header is the toggle) -- expand when on, collapse when off.
+        # state (the header checkbox itself is synced via the hidden bool's
+        # sigValueChanged) -- expand when on, collapse when off.
         try:
             gi_on = bool(self.parameters.child('GI').child('Grazing').value())
             self.parameters.child('GI').setOpts(expanded=gi_on)
@@ -348,27 +353,10 @@ class nexusWrangler(wranglerWidget):
             if idx >= 0:
                 self.processingModeCombo.setCurrentIndex(idx)
 
-    # UI-1 (#81): GI group whose EXPANDED state is the on/off toggle, mapped to
-    # the hidden bool that is its source of truth.
-    _EXPAND_TOGGLE_GROUPS = {'GI': 'Grazing'}
-
-    def _sync_group_toggle_from_expand(self, param, opts):
-        """UI-1 (#81): mirror a header-toggle group's expand/collapse into its
-        hidden enabling bool, so ``setup()`` sees the on/off state at run start.
-        ``expanded`` arrives via ``sigOptionsChanged`` (``syncExpanded=True``)."""
-        if 'expanded' not in opts:
-            return
-        child_name = self._EXPAND_TOGGLE_GROUPS.get(param.name())
-        if child_name is None:
-            return
-        expanded = bool(opts['expanded'])
-        try:
-            bool_param = param.child(child_name)
-        except Exception:
-            return
-        if bool_param.value() != expanded:
-            bool_param.setValue(expanded)
-            self._save_to_session()
+    # UI-1 (#81): the GI group carries a header CHECKBOX as its on/off toggle,
+    # mapped to the hidden bool that is its source of truth (see
+    # wranglerWidget._install_group_toggles).
+    _GROUP_TOGGLES = {'GI': 'Grazing'}
 
     def _save_to_session(self):
         """Save parameters to session.json."""
@@ -526,7 +514,7 @@ class nexusWrangler(wranglerWidget):
             entry=self.entry,
             parent=self,
         )
-        self.thread.showLabel.connect(self.statusLabel.setText)
+        self.thread.showLabel.connect(self._set_status_text)
         self.thread.sigUpdateFile.connect(self.sigUpdateFile.emit)
         self.thread.finished.connect(self.finished.emit)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)

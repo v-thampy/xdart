@@ -42,6 +42,9 @@ def _holder():
     for m in ("_compute_source_base", "_apply_disclosure",
               "_on_project_folder_changed", "_default_h5_under_project"):
         setattr(h, m, MethodType(getattr(imageWrangler, m), h))
+    # The real _set_status_text elides into a QLabel; the fake label just
+    # records the text (the disclosure messages are what's under test).
+    h._set_status_text = h.ui.specLabel.setText
     h._DISCLOSURE_REST = imageWrangler._DISCLOSURE_REST
     h._DISCLOSURE_TOPLEVEL = imageWrangler._DISCLOSURE_TOPLEVEL
     return h, root
