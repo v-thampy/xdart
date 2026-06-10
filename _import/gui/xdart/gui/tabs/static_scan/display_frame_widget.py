@@ -196,7 +196,22 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._logBtn.setFixedHeight(_ROW_H)
         displayFrameWidget._fit_button_width(self._logBtn)
         self._logBtn.setFocusPolicy(pyQt.StrongFocus)
-        self.ui.horizontalLayout_9.insertWidget(0, self._logBtn)
+        # ~half-inch indent before the Log button, and vertically center the
+        # row's contents (they sat bottom-aligned in the taller frame).
+        self.ui.horizontalLayout_9.insertSpacerItem(
+            0, QtWidgets.QSpacerItem(48, 20,
+                                     QtWidgets.QSizePolicy.Policy.Fixed,
+                                     QtWidgets.QSizePolicy.Policy.Minimum))
+        self.ui.horizontalLayout_9.insertWidget(1, self._logBtn)
+        self.ui.horizontalLayout_9.setAlignment(
+            self._logBtn, pyQt.AlignVCenter)
+        _parent_layout = self.ui.frame_6.parentWidget().layout()
+        if _parent_layout is not None:
+            _parent_layout.setAlignment(self.ui.frame_6, pyQt.AlignVCenter)
+        # Options now hosts the scale/cmap combos -- it must be reachable
+        # from launch (the generated UI starts it disabled until the first
+        # 1D layout setup enables it).
+        self.ui.wf_options.setEnabled(True)
         self._logBtn.toggled.connect(
             lambda on: self.ui.scale.setCurrentText('Log' if on else 'Linear'))
         # Keep the toggle honest when the combo changes (e.g. Sqrt in the
@@ -536,6 +551,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             QtWidgets.QSpacerItem(10, 20, QtWidgets.QSizePolicy.Policy.Fixed,
                                   QtWidgets.QSizePolicy.Policy.Minimum))
         self.ui.horizontalLayout_9.addWidget(self._showImageBtn)
+        self.ui.horizontalLayout_9.setAlignment(
+            self._showImageBtn, pyQt.AlignVCenter)
         self._showImageBtn.clicked.connect(self._show_image_preview)
         self._showImageBtn.setVisible(False)
         self._image_preview_dialog = None
