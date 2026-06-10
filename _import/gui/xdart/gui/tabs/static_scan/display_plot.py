@@ -748,7 +748,8 @@ class DisplayPlotMixin:
           Step.  Govern which frames map onto the waterfall image and its
           y-axis.
         * **Overlay** — Offset (vertical stacking between curves).
-        * **Legend** — show/hide the curve legend.
+        * **Other** — legend toggle, intensity scale (Linear/Sqrt/Log),
+          and colormap.
         """
         layout = QtWidgets.QVBoxLayout()
         self.wf_dialog.setLayout(layout)
@@ -776,9 +777,13 @@ class DisplayPlotMixin:
         ov.addWidget(QtWidgets.QLabel('Offset'), 0, 0)
         ov.addWidget(self.ui.yOffset, 0, 1)
 
-        # ── Legend ────────────────────────────────────────────────
-        lg = _section('Legend')
+        # ── Other ─────────────────────────────────────────────────
+        # Legend toggle + the scale/colormap combos (moved out of the top
+        # bar; re-parented here by addWidget).
+        lg = _section('Other')
         lg.addWidget(self.ui.showLegend, 0, 0)
+        lg.addWidget(self.ui.scale, 0, 1)
+        lg.addWidget(self.ui.cmap, 0, 2)
 
         # ── Dialog buttons ────────────────────────────────────────
         btns = QtWidgets.QHBoxLayout()

@@ -182,6 +182,30 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _c.setFixedHeight(_ROW_H)
         displayFrameWidget._fit_button_width(self.ui.setBkg)
         self.ui.setBkg.setFixedHeight(_ROW_H)
+        # The scale/cmap combos move into the Options popup ('Other' row) --
+        # pull them out of the top bar (re-parented when the dialog is
+        # built, same pattern as Offset/Legend).  In their place: one
+        # checkable 'Log' toggle = Linear <-> Log via the scale combo, so
+        # the existing Log path (incl. its negative/small-value shift in
+        # pgImageWidget.update_image) is reused verbatim.
+        for _w in (self.ui.scale, self.ui.cmap):
+            self.ui.horizontalLayout_9.removeWidget(_w)
+            _w.setParent(None)
+        self._logBtn = QtWidgets.QPushButton('Log')
+        self._logBtn.setCheckable(True)
+        self._logBtn.setFixedHeight(_ROW_H)
+        displayFrameWidget._fit_button_width(self._logBtn)
+        self._logBtn.setFocusPolicy(pyQt.StrongFocus)
+        self.ui.horizontalLayout_9.insertWidget(0, self._logBtn)
+        self._logBtn.toggled.connect(
+            lambda on: self.ui.scale.setCurrentText('Log' if on else 'Linear'))
+        # Keep the toggle honest when the combo changes (e.g. Sqrt in the
+        # Options popup, or a restored session).
+        def _sync_log_btn(*_a):
+            self._logBtn.blockSignals(True)
+            self._logBtn.setChecked(self.ui.scale.currentText() == 'Log')
+            self._logBtn.blockSignals(False)
+        self.ui.scale.currentIndexChanged.connect(_sync_log_btn)
         self.ui.frame_4.setMinimumSize(Qt.QtCore.QSize(248, 0))
         self.ui.frame_4.setMaximumSize(Qt.QtCore.QSize(248, 16777215))
         self.ui.frame_6.setMinimumSize(Qt.QtCore.QSize(248, 0))
