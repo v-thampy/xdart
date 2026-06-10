@@ -126,7 +126,7 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
         _plan_cache=StandardPlanCache(), _xye_lock=RLock(), _xye_buffer=[],
         _cached_gi_incident_angle=None,
         showLabel=SimpleNamespace(emit=lambda *a: None),
-        _middle_truncate=lambda t: t,
+        _middle_truncate=lambda t, **k: t,
     )
     # Bind the real wranglerThread helpers (these are the integration path).
     for meth in ("_resolve_frame_mask", "_prewarm_frame_mask",
@@ -334,7 +334,7 @@ def _run_live_single(poni, name, img, meta, mask, *, incidence_motor="th",
         sub_label="",
         sigUpdate=SimpleNamespace(emit=lambda *a: None),
         showLabel=SimpleNamespace(emit=lambda *a: None),
-        _middle_truncate=lambda t: t,
+        _middle_truncate=lambda t, **k: t,
     )
     for meth in ("_resolve_frame_mask", "_prewarm_frame_mask",
                  "_apply_threshold_inline"):
