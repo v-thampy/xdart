@@ -99,7 +99,8 @@ def _unit_str(unit: Any) -> str:
     return str(unit[0]) if isinstance(unit, tuple) else str(unit)
 
 
-def _to_result_2d(result: Any, unit_fallback: str) -> IntegrationResult2D:
+def _to_result_2d(result: Any, unit_fallback: str,
+                  azim_unit_fallback: str = "qoop_A^-1") -> IntegrationResult2D:
     """Convert pyFAI grazing-incidence 2D result → ``IntegrationResult2D``.
 
     Handles both pyFAI versions:
@@ -132,7 +133,11 @@ def _to_result_2d(result: Any, unit_fallback: str) -> IntegrationResult2D:
         intensity=intensity,
         sigma=sigma,
         unit=str(ip_unit) if ip_unit is not None else unit_fallback,
-        azimuthal_unit=str(oop_unit) if oop_unit is not None else "qoop_A^-1",
+        # pyFAI 2025.x results carry no ip/oop unit attrs, so the fallback
+        # must match the TRANSFORM: hardcoding qoop here labeled the polar
+        # chi axis "Q_oop (A^-1)" in the GUI (wrong unit AND wrong name).
+        azimuthal_unit=(str(oop_unit) if oop_unit is not None
+                        else azim_unit_fallback),
     )
 
 
@@ -436,7 +441,8 @@ def integrate_gi_polar(
         tilt_angle=tilt,
         **kwargs,
     )
-    return _to_result_2d(result, unit_fallback=f"qtot_{radial_unit}")
+    return _to_result_2d(result, unit_fallback=f"qtot_{radial_unit}",
+                         azim_unit_fallback="chigi_deg")
 
 
 def integrate_gi_exitangles(
@@ -509,7 +515,8 @@ def integrate_gi_exitangles(
         tilt_angle=tilt,
         **kwargs,
     )
-    return _to_result_2d(result, unit_fallback="exit_angle_horz_deg")
+    return _to_result_2d(result, unit_fallback="exit_angle_horz_deg",
+                         azim_unit_fallback="exit_angle_vert_deg")
 
 
 def integrate_gi_polar_1d(

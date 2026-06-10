@@ -2220,6 +2220,12 @@ def _run_gi_2d(
     normalization_factor: float | None,
 ) -> IntegrationResult2D:
     extra = _gi_plan_extra(plan, normalization_factor)
+    # The qip/qoop output ranges ride in plan.extra as x_range/y_range; they
+    # are only meaningful for the QIP_QOOP transform.  Pop them BEFORE
+    # branching so they never leak into pyFAI's polar/exit-angle calls as
+    # unknown kwargs (pyFAI warns 'wrong or deprecated' and IGNORES them).
+    x_range = extra.pop("x_range", plan.radial_range)
+    y_range = extra.pop("y_range", plan.azimuth_range)
     common = dict(
         npt_rad=plan.npt_rad,
         npt_azim=plan.npt_azim,
@@ -2229,13 +2235,19 @@ def _run_gi_2d(
         tilt_angle=gi.tilt_angle,
         sample_orientation=gi.sample_orientation,
     )
+    # GI ignores plan.azimuth_offset (Vivek, Jun 10): the chi offset is a
+    # TRANSMISSION display convention (rotate the cake's chi origin).  In GI
+    # the requested window goes to FiberIntegrator's polar/exit-angle/q-space
+    # grids directly -- shifting it by the transmission offset displaced the
+    # integrated wedge by 90 deg (GUI default) and, for qip_qoop, applied a
+    # chi ANGLE offset to a q-space range.
     if gi.mode_2d is GI2DMode.Q_CHI:
         return integrate_gi_polar(
             image,
             fi,
             unit=plan.unit,
             radial_range=plan.radial_range,
-            azimuth_range=_integration_azimuth_range(plan),
+            azimuth_range=plan.azimuth_range,
             **common,
             **extra,
         )
@@ -2245,12 +2257,10 @@ def _run_gi_2d(
             fi,
             unit=plan.unit,
             radial_range=plan.radial_range,
-            azimuth_range=_integration_azimuth_range(plan),
+            azimuth_range=plan.azimuth_range,
             **common,
             **extra,
         )
-    x_range = extra.pop("x_range", plan.radial_range)
-    y_range = extra.pop("y_range", _integration_azimuth_range(plan))
     return integrate_gi_2d(
         image,
         fi,
