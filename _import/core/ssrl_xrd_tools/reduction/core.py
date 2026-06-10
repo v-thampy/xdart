@@ -1274,11 +1274,20 @@ class ReductionSession:
                     # untouched; the recorded TimeoutError (raised below) is
                     # the loud signal, and the on-disk file keeps whatever was
                     # written.
+                    # Name the actual on-disk location: an atomic-mode
+                    # NexusSink writes into a hidden tmp file that never gets
+                    # promoted on this path — without naming it, "left as-is"
+                    # reads as total loss for a new output file.
+                    data_loc = (getattr(self._sink, "_tmp_path", None)
+                                or getattr(self._sink, "_active_path", None)
+                                or getattr(self._sink, "path", None))
+                    where = (f" Frames written so far are in {data_loc}"
+                             " (un-finalized)." if data_loc else "")
                     warnings.warn(
                         "ReductionSession.finish(): writer join timed out — "
                         "skipping sink finish/abort (writer may still be "
-                        f"writing); on-disk output for {self.scan.name!r} is "
-                        "left as-is.",
+                        f"writing); output for {self.scan.name!r} is left "
+                        f"un-finalized.{where}",
                         RuntimeWarning, stacklevel=2,
                     )
                 elif self._failure is None:
