@@ -151,7 +151,7 @@ class Main(QMainWindow):
         try:
             avail = self.screen().availableGeometry()
             w = int(avail.width() * 0.95)
-            h = int(avail.height() * 0.95)
+            h = int(avail.height() * 0.90)
             self.setGeometry(avail.x() + (avail.width() - w) // 2,
                              avail.y() + (avail.height() - h) // 2, w, h)
         except Exception:
