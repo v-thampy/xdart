@@ -1034,13 +1034,13 @@ def test_gi_streaming_prepass_scouts_whole_scan_extremes():
         "chunk-1-only freeze unexpectedly covers frame 5 -- test can't catch the bug"
 
 
-def test_gi_prepass_fails_closed_on_unestablishable_range():
-    """BLOCKER 1 follow-up: when a multi-file scan's whole-scan incidence range
-    CANNOT be established from metadata (>=2 files but no readable incidence), the
-    pre-pass FAILS CLOSED -- it aborts the run loud (user-visible showLabel +
-    command='stop') rather than silently integrating onto the chunk-1-local grid
-    (the clipping BLOCKER 1 exists to kill).  It also must NOT latch the scan-id
-    on a failure (so a corrected retry can re-run the freeze)."""
+def test_gi_prepass_warns_and_proceeds_on_unestablishable_range():
+    """T0-4 policy: when a multi-file scan's whole-scan incidence range CANNOT
+    be established from metadata (>=2 files but no readable incidence), the
+    pre-pass WARNS (user-visible advisory) and PROCEEDS on the session's own
+    first-chunk freeze -- cropped extreme tails are accepted at the beamline;
+    values inside the grid are exact.  The scan id latches so the advisory
+    fires once per scan."""
     from types import SimpleNamespace, MethodType
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 
@@ -1056,7 +1056,7 @@ def test_gi_prepass_fails_closed_on_unestablishable_range():
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
     for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
-              "_enumerate_scan_files", "_abort_gi_prepass", "_batch_execution"):
+              "_enumerate_scan_files", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze", "_batch_execution"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
     w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
 
@@ -1064,22 +1064,22 @@ def test_gi_prepass_fails_closed_on_unestablishable_range():
     status, entries = w._gi_whole_scan_scout_entries(None)
     assert status == "abort" and entries == []
 
-    # The orchestrator fails CLOSED: returns False, stops the run, warns loud.
-    proceed = w._gi_freeze_whole_scan_prepass(SimpleNamespace())
-    assert proceed is False
-    assert w.command == "stop"
-    assert emitted and "GI batch aborted" in emitted[-1]
-    # A transient/abort failure is NOT latched in -> no silent chunk-freeze later.
-    assert getattr(w, "_gi_prepass_scan_id", None) is None
+    # T0-4: the orchestrator WARNS and PROCEEDS on the first-chunk freeze.
+    scan = SimpleNamespace()
+    proceed = w._gi_freeze_whole_scan_prepass(scan)
+    assert proceed is True
+    assert w.command == ""                       # run not stopped
+    assert emitted and "frozen from the first frames" in emitted[-1]
+    assert w._gi_prepass_scan_id == id(scan)     # latched: one advisory per scan
 
 
-def test_gi_prepass_fails_closed_on_image_directory_source():
-    """#1 (codex residuals): Image-Directory GI batch with a varying incidence motor
-    returns 'unverifiable' (can't sweep the whole scan) and the orchestrator FAILS
-    CLOSED -- aborts loud -- rather than silently integrating chunk 1's grid.
-    This is the simple fail-closed fallback (the routing-to-chunked spec option was
-    rejected because chunked also freezes from per-chunk first/last, so it moves
-    the clip without fixing it)."""
+def test_gi_prepass_warns_and_proceeds_on_image_directory_source():
+    """T0-4 policy: Image-Directory GI batch with a varying incidence motor
+    returns 'unverifiable' (can't sweep the whole scan) and the orchestrator
+    WARNS and PROCEEDS on the first-chunk freeze (cropped extreme tails are
+    accepted at the beamline; values inside the grid are exact) instead of
+    aborting -- the fail-closed posture turned common workflows into hard
+    stops for a tail loss that doesn't matter scientifically."""
     from types import SimpleNamespace, MethodType
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
 
@@ -1094,7 +1094,7 @@ def test_gi_prepass_fails_closed_on_image_directory_source():
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
     for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
-              "_enumerate_scan_files", "_abort_gi_prepass", "_batch_execution"):
+              "_enumerate_scan_files", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze", "_batch_execution"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
     w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
 
@@ -1102,12 +1102,14 @@ def test_gi_prepass_fails_closed_on_image_directory_source():
     status, entries = w._gi_whole_scan_scout_entries(None)
     assert status == "unverifiable" and entries == []
 
-    # Orchestrator fails CLOSED: returns False, stops the run, warns loud.
-    proceed = w._gi_freeze_whole_scan_prepass(SimpleNamespace())
-    assert proceed is False
-    assert w.command == "stop"
-    assert emitted and "GI batch aborted" in emitted[-1]
-    assert getattr(w, "_gi_prepass_scan_id", None) is None
+    # T0-4: orchestrator WARNS and PROCEEDS on the first-chunk freeze.
+    scan = SimpleNamespace()
+    proceed = w._gi_freeze_whole_scan_prepass(scan)
+    assert proceed is True
+    assert w.command == ""
+    assert emitted and "frozen from the first frames" in emitted[-1]
+    assert "Image Directory" in emitted[-1]      # advisory names the source
+    assert w._gi_prepass_scan_id == id(scan)     # latched: one advisory per scan
 
 
 def _pinned_prepass_holder(emitted):
@@ -1123,7 +1125,7 @@ def _pinned_prepass_holder(emitted):
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
     for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned",
-              "_abort_gi_prepass", "_batch_execution"):
+              "_abort_gi_prepass", "_warn_gi_first_chunk_freeze", "_batch_execution"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
 
     def _no_scout(scan):
@@ -1159,9 +1161,11 @@ def test_gi_prepass_skips_scout_when_ranges_fully_pinned():
     assert w._gi_prepass_scan_id == id(scan)     # decided for this scan
 
 
-def test_gi_prepass_still_aborts_when_ranges_partially_pinned():
-    """T0-3 counterpart: ONE missing range key means an auto freeze would still
-    run somewhere, so the unverifiable-source abort must still fire."""
+def test_gi_prepass_warns_when_ranges_partially_pinned():
+    """T0-3/T0-4 counterpart: ONE missing range key means an auto freeze would
+    still run somewhere — the run proceeds (T0-4 warn-and-proceed) but the
+    pinned-ranges short-circuit must NOT silently claim full coverage: the
+    first-chunk-freeze advisory still fires."""
     from types import SimpleNamespace, MethodType
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
     from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
@@ -1182,10 +1186,10 @@ def test_gi_prepass_still_aborts_when_ranges_partially_pinned():
 
     proceed = w._gi_freeze_whole_scan_prepass(scan)
 
-    assert proceed is False
-    assert w.command == "stop"
-    assert emitted and "GI batch aborted" in emitted[-1]
-    assert getattr(w, "_gi_prepass_scan_id", None) is None
+    assert proceed is True
+    assert w.command == ""
+    assert emitted and "frozen from the first frames" in emitted[-1]
+    assert w._gi_prepass_scan_id == id(scan)
 
 
 def test_gi_prepass_fails_closed_on_degenerate_scout_freeze():
@@ -1202,7 +1206,7 @@ def test_gi_prepass_fails_closed_on_degenerate_scout_freeze():
         gi=True, batch_mode=True, batch_execution="streaming", command="",
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
-    for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_abort_gi_prepass", "_batch_execution"):
+    for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze", "_batch_execution"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
     # The scout resolves two extremes ("freeze"), but the production freeze hits
     # a blank scout cake and raises GIFreezeError.
@@ -1270,7 +1274,7 @@ def test_gi_streaming_multichunk_later_chunk_uses_whole_scan_grid():
         wranglerThread._close_reduction_session, w)
     for meth in ("_dispatch_batch_streaming", "_get_streaming_session",
                  "_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
-                 "_enumerate_scan_files", "_abort_gi_prepass", "_wait_if_paused"):
+                 "_enumerate_scan_files", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze", "_wait_if_paused"):
         setattr(w, meth, MethodType(getattr(imageThread, meth), w))
     w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
 

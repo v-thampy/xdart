@@ -1087,15 +1087,20 @@ class imageThread(wranglerThread):
         fixed/manual incidence collapse to the existing behaviour (no whole-scan
         scout) -- the grid was never chunk-clipped there.
 
-        **Fails CLOSED** (BLOCKER 1 follow-up): a scout exception, or a
-        genuinely-unestablishable global incidence range on a varying-incidence
-        per-file scan, ABORTS the run with a user-visible error rather than
-        silently proceeding on the chunk-1-local grid (the clipping this exists
-        to kill).  The scan-id latch is set only AFTER a successful freeze/skip
-        so a transient failure is never latched in.
+        **Policy (T0-4, Vivek 2026-06-09): warn-and-proceed.**  When the
+        whole-scan incidence range cannot be established (unverifiable source,
+        unreadable metadata, scout failure), the run PROCEEDS on the session's
+        own first-chunk freeze with a one-time user-visible advisory, instead
+        of aborting.  Rationale: frames are binned natively onto the common
+        grid (values inside the range are exact — no interpolation), and at
+        the beamline incidence varies too little for the cropped extreme tails
+        to matter; the union sweep is kept where it is free (Image-Series with
+        readable metadata).  The ONLY fail-closed exit left is a freeze that
+        actually errors (e.g. a degenerate scout cake) — proceeding there
+        would integrate onto a broken grid, not a slightly narrow one.
 
-        Returns ``True`` when it is safe for the caller to open the session,
-        ``False`` when the run was aborted (caller must not proceed).
+        Returns ``True`` when the caller may open the session, ``False`` when
+        the run was aborted (freeze error only; caller must not proceed).
         """
         if not (self.gi and self.batch_mode
                 and self._batch_execution() == "streaming"):
@@ -1114,45 +1119,40 @@ class imageThread(wranglerThread):
         try:
             status, scouts = self._gi_whole_scan_scout_entries(scan)
         except Exception as exc:
-            # Fail CLOSED: a transient scout failure must NOT silently fall back
-            # to the chunk-1 grid.  Don't latch (no poisoning a retry); stop loud.
-            self._abort_gi_prepass(f"scout pre-pass raised ({exc})")
-            return False
+            # T0-4 warn-and-proceed: a scout failure means we lose the union
+            # sweep, not correctness — the first-chunk freeze is acceptable.
+            self._warn_gi_first_chunk_freeze(f"scout pre-pass raised ({exc})")
+            self._gi_prepass_scan_id = id(scan)
+            return True
         if status == "abort":
-            self._abort_gi_prepass(
-                "could not establish the whole-scan incidence range from frame "
-                "metadata")
-            return False
+            # Sweep ran but couldn't read enough incidences from metadata.
+            self._warn_gi_first_chunk_freeze(
+                "could not establish the whole-scan incidence range from "
+                "frame metadata")
+            self._gi_prepass_scan_id = id(scan)
+            return True
         if status == "unverifiable":
-            # The source type (Image-Directory or Eiger master with non-fixed
-            # incidence) cannot be cheaply swept for the whole-scan incidence
-            # range.  Rather than silently clip later frames onto the chunk-1
-            # grid, abort the streaming run and tell the user to choose a
-            # source layout/range that can be verified globally.  Do not
-            # recommend the legacy chunked executor here: it freezes the pending
-            # dispatch window, not necessarily the whole scan.
-            # RESTRUCTURE-TODO: proper fix = source-aware whole-scan incidence
-            # enumeration for Image-Directory and multi-master Eiger.
+            # Image-Directory or named-motor Eiger: per-frame incidence can't
+            # be cheaply swept up front (for Eiger it lives in the SPEC
+            # sidecar, per frame).  T0-4 policy: proceed on the first-chunk
+            # freeze with an advisory — values inside the grid are exact; only
+            # extreme-incidence tails beyond it are cropped.
             source = (getattr(self, "inp_type", None) or
                       ("Eiger master" if (getattr(self, "img_file", "") and
                                           _is_eiger_master(getattr(self, "img_file", "")))
                        else "this source"))
-            self._abort_gi_prepass(
-                f"cannot sweep the whole-scan incidence range for '{source}' "
-                f"in streaming GI mode (silent chunk-1 clipping refused). "
-                f"Use an Image-Series source, enter a fixed/manual incident "
-                f"angle (Theta Motor → Manual), or set explicit 1D and 2D "
-                f"output ranges in the integrator panel so no auto grid needs "
-                f"freezing."
-            )
-            return False
+            self._warn_gi_first_chunk_freeze(
+                f"the whole-scan incidence range cannot be swept up front for "
+                f"'{source}'")
+            self._gi_prepass_scan_id = id(scan)
+            return True
         if status == "freeze":
             # These self-skip when the relevant ranges are already set, and
             # freeze the UNION over the two extreme scouts we hand them (NOT a
-            # chunk).  A degenerate scout cake raises GIFreezeError here -- that
-            # must FAIL CLOSED via _abort_gi_prepass, not escape the worker
-            # thread (run() has no except), so catch it (and any freeze error)
-            # the same way the scout exception above is caught.
+            # chunk).  A degenerate scout cake raises GIFreezeError here --
+            # that stays FAIL-CLOSED via _abort_gi_prepass (the freeze ran and
+            # produced a broken grid, not a narrow one) and must not escape
+            # the worker thread (run() has no except).
             try:
                 self._freeze_gi_1d_auto_range(scan, scouts)
                 self._freeze_gi_2d_auto_ranges(scan, scouts)
@@ -1164,11 +1164,31 @@ class imageThread(wranglerThread):
         self._gi_prepass_scan_id = id(scan)   # latch only after success
         return True
 
+    def _warn_gi_first_chunk_freeze(self, reason: str) -> None:
+        """T0-4 warn-and-proceed advisory: the GI output grid will be frozen
+        from the first frames instead of the whole-scan incidence union.
+        Values inside the grid are exact (frames bin natively onto it); only
+        extreme-incidence tails beyond it are cropped — accepted at the
+        beamline (incidence varies too little to matter).  One per scan: the
+        prepass latches the scan id right after this fires."""
+        msg = (
+            'GI: ' + reason + ' — output grid will be frozen from the first '
+            'frames; extreme-incidence tails beyond it are cropped (values '
+            'inside are exact). Set explicit 1D/2D output ranges for full '
+            'coverage.')
+        logger.warning(msg)
+        try:
+            self.showLabel.emit(msg)
+        except Exception:
+            logger.debug("showLabel emit failed for GI first-chunk-freeze "
+                         "advisory", exc_info=True)
+
     def _abort_gi_prepass(self, reason: str) -> None:
-        """Fail-closed exit from the GI whole-scan freeze: surface a user-visible
-        error and STOP the streaming GI run rather than integrate onto a partial
-        (chunk-1-local) grid.  Do NOT fall back to index first/last -- that is
-        unsafe for non-monotonic scans (first/last != incidence extremes, #70)."""
+        """Fail-closed exit for a GI freeze that actually ERRORED (degenerate
+        scout cake etc.): surface a user-visible error and STOP the streaming
+        GI run rather than integrate onto a broken grid.  (Unverifiable /
+        unreadable-metadata cases warn-and-proceed instead — see
+        _warn_gi_first_chunk_freeze.)"""
         msg = (
             'GI batch aborted: cannot freeze a whole-scan q/χ grid (' + reason +
             '). Refusing to integrate onto a partial grid that would clip later '
@@ -1197,7 +1217,8 @@ class imageThread(wranglerThread):
           global lowest+highest incidence frames, with their images loaded.
         - ``("abort", [])`` — a multi-file scan whose incidence we genuinely
           cannot establish (fewer than two readable incidences across the whole
-          series).  The caller fails CLOSED.
+          series).  The caller warns and proceeds on the first-chunk freeze
+          (T0-4 policy; the status name predates it).
 
         Robust to per-frame metadata GAPS: it finds the extremes from the
         readable frames and only aborts when it can't read enough to establish a
@@ -1228,9 +1249,11 @@ class imageThread(wranglerThread):
             #     Eiger is possible: each master a different incidence → same clip
             #     risk; we can't distinguish single- vs multi-master before the run).
             #
-            # For "unverifiable" the caller logs and aborts rather than silently
-            # proceeding on the chunk-1-local grid (RESTRUCTURE-TODO: proper fix is
-            # source-aware whole-scan incidence enumeration for these sources).
+            # For "unverifiable" the caller WARNS and proceeds on the
+            # first-chunk freeze (T0-4 policy: cropped extreme tails are
+            # accepted; values inside the grid are exact).  Source-aware
+            # whole-scan incidence enumeration remains a possible refinement,
+            # demoted from correctness work to nice-to-have.
             img_file = getattr(self, "img_file", None) or ""
             if getattr(self, "inp_type", None) == "Image Directory":
                 # Per-file angle-dependence loaded as a directory: can't sweep.
