@@ -143,3 +143,30 @@ def test_meta_ext_hidden_for_nxs_image_type(qapp):
     h.img_ext = "tif"
     sync()
     assert meta.opts.get("visible", True) is True
+
+
+def test_sync_meta_ext_is_idempotent_no_reemit(qapp):
+    """Jun 10 live-testing regression: pyqtgraph show()/hide() emit
+    sigOptionsChanged UNCONDITIONALLY, and _sync_meta_ext_to_img_ext runs
+    inside setup() (wired to sigTreeStateChanged) — an unconditional emit
+    there is an infinite setup() recursion (RecursionError at app start).
+    A second sync with unchanged state must emit NOTHING."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import params as wparams
+
+    root = Parameter.create(name="p", type="group", children=wparams)
+    h = types.SimpleNamespace(parameters=root, img_ext="tif")
+    sync = MethodType(imageWrangler._sync_meta_ext_to_img_ext, h)
+    meta = root.child("Signal").child("meta_ext")
+
+    sync()                                   # settle to the tif state
+    events = []
+    meta.sigOptionsChanged.connect(lambda *a: events.append(a))
+    sync()                                   # unchanged -> must not emit
+    assert events == []
+
+    h.img_ext = "nxs"
+    sync()                                   # real change -> emits (hide)
+    assert events
+    n = len(events)
+    sync()                                   # unchanged nxs state -> silent
+    assert len(events) == n

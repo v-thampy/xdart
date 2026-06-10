@@ -1296,12 +1296,18 @@ class imageWrangler(wranglerWidget):
         the image type changes back to a sidecar-based format.
         """
         meta_param = self.parameters.child('Signal').child('meta_ext')
+        # setOpts, NOT show()/hide(): pyqtgraph's show/hide emit
+        # sigOptionsChanged UNCONDITIONALLY (even when visible is unchanged),
+        # and this method runs inside setup() which is wired to
+        # sigTreeStateChanged — an unconditional emit here is an infinite
+        # setup() recursion (RecursionError at app start, Jun 10).  setOpts
+        # skips unchanged values, breaking the cycle.
         if (self.img_ext or '').lower() == 'nxs':
             if meta_param.value() != 'None':
                 meta_param.setValue('None')    # fires set_meta_ext
-            meta_param.hide()
+            meta_param.setOpts(visible=False)
         else:
-            meta_param.show()
+            meta_param.setOpts(visible=True)
 
     def exists_meta_file(self, img_file):
         """Checks for existence of meta file for image file"""
