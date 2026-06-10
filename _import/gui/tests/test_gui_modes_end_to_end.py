@@ -1630,3 +1630,14 @@ def test_cake_view_trim_rearms_after_own_trim_but_respects_user_zoom(widget):
     user = vb.viewRange()
     displayFrameWidget._trim_view_to_data(w, img, x, y)
     assert vb.viewRange() == user
+
+
+def test_scale_switch_without_2d_panels_does_not_crash(widget):
+    """Switching Linear/Sqrt/Log re-renders all views; in Int 1D (or before
+    anything is drawn) image_data/binned_data are None and the unpack raised
+    TypeError.  XYE Viewer never routes here, which is why it was immune."""
+    df = widget.displayframe
+    df.image_data = None
+    df.binned_data = None
+    df.update_image_view()          # must no-op, not raise
+    df.update_binned_view()

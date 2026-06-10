@@ -168,6 +168,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
+        # Width polish (Vivek): top-bar controls -5%, freeing room for the
+        # middle panels.  Overrides the generated-UI fixed sizes.
+        self.ui.normChannel.setMinimumSize(Qt.QtCore.QSize(90, 0))
+        self.ui.normChannel.setMaximumSize(Qt.QtCore.QSize(104, 16777215))
+        self.ui.setBkg.setMinimumSize(Qt.QtCore.QSize(85, 0))
+        self.ui.setBkg.setMaximumSize(Qt.QtCore.QSize(95, 16777215))
+        self.ui.scale.setMinimumSize(Qt.QtCore.QSize(68, 0))
+        self.ui.scale.setMaximumSize(Qt.QtCore.QSize(68, 16777215))
+        self.ui.cmap.setMinimumSize(Qt.QtCore.QSize(68, 0))
+        self.ui.cmap.setMaximumSize(Qt.QtCore.QSize(68, 16777215))
+        self.ui.frame_4.setMinimumSize(Qt.QtCore.QSize(248, 0))
+        self.ui.frame_4.setMaximumSize(Qt.QtCore.QSize(248, 16777215))
+        self.ui.frame_6.setMinimumSize(Qt.QtCore.QSize(248, 0))
+        self.ui.frame_6.setMaximumSize(Qt.QtCore.QSize(248, 16777215))
         # Shared reentrant lock guarding data_1d / data_2d.  When created
         # standalone (tests, viewer mode) fall back to a private lock.
         self.data_lock = data_lock if data_lock is not None else threading.RLock()
@@ -483,7 +497,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.wf_cancel_button = QtWidgets.QPushButton('Cancel')
 
         # Raw image preview button
-        self._showImageBtn = QtWidgets.QPushButton('Show Image')
+        self._showImageBtn = QtWidgets.QPushButton('Raw Image')
         self._showImageBtn.setMinimumSize(QtWidgets.QWidget().minimumSize())
         self._showImageBtn.setMaximumSize(Qt.QtCore.QSize(90, 16777215))
         self._showImageBtn.setToolTip('Show raw image preview for selected frame')
@@ -1469,6 +1483,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.update_image_view()
 
     def update_image_view(self):
+        if self.image_data is None:
+            # Int 1D mode (or nothing drawn yet): a scale/cmap switch
+            # re-renders all views, but there is no raw panel content.
+            return
         data, rect = self.image_data
 
         display_data = _downsample_for_display(data, self.image_widget)
@@ -1485,6 +1503,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         displayFrameWidget._set_raw_pixel_axes(self.image_widget)
 
     def update_binned_view(self):
+        if self.binned_data is None:
+            return                      # no cake drawn yet (e.g. Int 1D mode)
         data, rect = self.binned_data
 
         display_data = _downsample_for_display(data, self.binned_widget)
