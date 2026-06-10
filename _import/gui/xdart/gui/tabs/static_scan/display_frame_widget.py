@@ -193,6 +193,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _sp = _f.sizePolicy()
             _sp.setHorizontalPolicy(QtWidgets.QSizePolicy.Policy.Maximum)
             _f.setSizePolicy(_sp)
+        # Borderless boxes (Vivek): no frame lines on the cluster/title
+        # containers or the title label.
+        for _f in (self.ui.frame_top, self.ui.frame_4, self.ui.frame_5,
+                   self.ui.frame_6, self.ui.labelCurrent):
+            try:
+                _f.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+                _f.setLineWidth(0)
+            except Exception:
+                logger.debug("frame border clear failed", exc_info=True)
         # The title takes the stretch: lift labelCurrent's generated 600px
         # maximum (capped the center on wide windows) and let it shrink
         # small; frame_5 (its container) unconstrained likewise.
@@ -1913,15 +1922,21 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.plotUnit.setVisible(False)
             self._set_2d_controls_visible(False)
             # frame_6 is shown so the Linear/Log scale applies to the 1D plot,
-            # but the colormap combo is 2D-only — hide it here.
-            self.ui.cmap.setVisible(False)
+            # but the colormap combo is 2D-only — hide it (no-op when it has
+            # already moved into the Options dialog).
+            if self.ui.cmap.parent() is not None:
+                self.ui.cmap.setVisible(False)
             self.ui.scale.setEnabled(True)
         elif mode in ('image', 'nexus'):
             # Raw image / schema preview need no extra control state beyond the
             # geometry table.  The Linear/Log scale + colormap apply to the raw
             # image, so make sure both are shown/enabled (cmap may have been
             # hidden by a prior XYE-viewer visit).
-            self.ui.cmap.setVisible(True)
+            # cmap lives in the Options dialog now -- setVisible(True) on a
+            # PARENTLESS widget floats it as a top-level window (the stray
+            # 'Default' popup on entering Image Viewer).
+            if self.ui.cmap.parent() is not None:
+                self.ui.cmap.setVisible(True)
             self.ui.cmap.setEnabled(True)
             self.ui.scale.setEnabled(True)
             if mode == 'nexus':
@@ -1934,7 +1949,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.imageUnit.setEnabled(True)
             self.ui.scale.setEnabled(True)
             self.ui.cmap.setEnabled(True)
-            self.ui.cmap.setVisible(True)   # restore if hidden by XYE viewer
+            if self.ui.cmap.parent() is not None:
+                self.ui.cmap.setVisible(True)   # restore if hidden by XYE viewer
             self.ui.plotUnit.setVisible(True)
             self.ui.plotUnit.setEnabled(True)
             self.ui.plotMethod.setEnabled(True)
