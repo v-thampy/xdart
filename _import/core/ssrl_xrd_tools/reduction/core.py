@@ -931,15 +931,19 @@ class ReductionSession:
             initial_incident_angle=self._initial_incident_angle,
         )
         self.integrator_provider_builds = 1
+        # Validate BEFORE acquiring resources: sink.begin() opens an h5 handle
+        # (atomic NexusSink also creates its hidden .tmp) and _coerce_executor
+        # may build an owned pool — a ValueError after those leaks both, with
+        # no abort path that ever cleans the orphaned tmp.
+        if self.execution not in ("chunked", "streaming"):
+            raise ValueError(
+                f"execution must be 'chunked' or 'streaming'; got {self.execution!r}"
+            )
         self._worker, self._owns_worker = _coerce_executor(self.executor)
         self._sink.begin(self.scan, self.plan)
         self._started = True
         _emit(self.progress_cb, self.scan.name, "start", None, 0, len(self.scan))
 
-        if self.execution not in ("chunked", "streaming"):
-            raise ValueError(
-                f"execution must be 'chunked' or 'streaming'; got {self.execution!r}"
-            )
         if self.execution == "streaming":
             self._init_streaming()
 
@@ -1693,6 +1697,21 @@ def _apply_gi_freeze_policy(
         )
         if rng is not None and key == needs_1d:
             out = _replace_integration_1d_range(out, key, rng)
+        elif key == needs_1d:
+            # Mirror the 2D branch's fail-loud: a degenerate scout (blank /
+            # all-masked / collapsed span -> rng None) silently skipped the
+            # 1D freeze, leaving per-frame auto axes that the writer's
+            # uniform-axes validator rejects MID-RUN, frames already on disk
+            # and far from the root cause.
+            raise GIFreezeError(
+                "GI 1D freeze scout produced a degenerate axis range; "
+                "check the incident angle / mask / threshold."
+            )
+    elif needs_1d is not None:
+        raise GIFreezeError(
+            "GI 1D freeze scout produced no usable 1D results; "
+            "check the incident angle / incidence motor."
+        )
     if needs_2d and scout_results_2d:
         from ssrl_xrd_tools.integrate.gid import freeze_common_axes_2d
 

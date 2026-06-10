@@ -100,6 +100,18 @@ class FrameViewReader:
 
     def __enter__(self) -> "FrameViewReader":
         self._h5 = h5py.File(self.path, "r")
+        # Anything raising past this point (missing entry group, duplicate
+        # frame labels, malformed datasets) happens BEFORE the caller's
+        # with-block exists, so __exit__ never runs — close the handle
+        # ourselves or it leaks (and locks the file on Windows).
+        try:
+            return self._enter_inner()
+        except BaseException:
+            self._h5.close()
+            self._h5 = None
+            raise
+
+    def _enter_inner(self) -> "FrameViewReader":
         self._entry = _entry(self._h5, self.entry_name)
         # C1: surface a newer-than-supported schema before any dataset access
         # fails with an opaque KeyError.
