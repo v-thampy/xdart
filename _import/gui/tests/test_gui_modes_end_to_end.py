@@ -1600,3 +1600,33 @@ def test_integrator_panel_session_roundtrip(widget):
     assert tree.ui.radial_low_1D.text() == "0.5"
     assert tree.parameters.child(
         'Default', 'Integrate 1D', 'chi_offset').value() == 45.0
+
+
+def test_cake_view_trim_rearms_after_own_trim_but_respects_user_zoom(widget):
+    """The display trim disables pyqtgraph auto-range via its own setRange, so
+    it must recognize its OWN previous range and re-trim on the next render
+    (axis-kind switches stranded a stale window otherwise) -- while a range
+    the USER set stays untouched."""
+    import numpy as np
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+
+    w = widget.displayframe.binned_widget
+    vb = w.image_plot.getViewBox()
+
+    img = np.zeros((100, 100)); img[10:30, 40:60] = 5.0      # (x, y) block
+    x = np.linspace(0.0, 10.0, 100); y = np.linspace(-180.0, 180.0, 100)
+    displayFrameWidget._trim_view_to_data(w, img, x, y)
+    first = vb.viewRange()
+    assert first[0][1] < 6.0                                 # trimmed in x
+
+    # Same auto-range-off state, new data elsewhere -> must RE-trim.
+    img2 = np.zeros((100, 100)); img2[70:90, 70:90] = 5.0
+    displayFrameWidget._trim_view_to_data(w, img2, x, y)
+    second = vb.viewRange()
+    assert second != first and second[0][0] > 5.0            # followed the data
+
+    # User zoom (a range we did NOT set) -> respected, no trim.
+    vb.setRange(xRange=(2.0, 3.0), yRange=(0.0, 10.0), padding=0)
+    user = vb.viewRange()
+    displayFrameWidget._trim_view_to_data(w, img, x, y)
+    assert vb.viewRange() == user

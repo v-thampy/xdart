@@ -859,7 +859,22 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             vb = widget.image_plot.getViewBox()
             auto = vb.autoRangeEnabled()
             if not (auto[0] or auto[1]):
-                return                      # user zoom in effect
+                # Auto-range is off: either the USER zoomed (respect it) or it
+                # is just OUR previous trim -- setRange() itself disables
+                # auto-range, so without this check the first trim froze the
+                # view forever and an axis-KIND change (e.g. transmission q-chi
+                # -> GI qip-qoop) kept the stale window instead of rescaling.
+                last = getattr(widget, '_cake_trim_view', None)
+                cur = vb.viewRange()
+
+                def _same(a, b):
+                    return all(
+                        abs(p - q) <= 1e-9 + 1e-6 * max(abs(p), abs(q))
+                        for pa, pb in zip(a, b) for p, q in zip(pa, pb)
+                    )
+
+                if last is None or not _same(cur, last):
+                    return                  # genuine user navigation
             has = np.isfinite(image) & (image > 0)
             if not has.any():
                 return
@@ -873,6 +888,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if x_hi > x_lo and y_hi > y_lo:
                 vb.setRange(xRange=(x_lo, x_hi), yRange=(y_lo, y_hi),
                             padding=0.02)
+                # Remember what WE set so the next render can tell our trim
+                # apart from a user zoom.
+                widget._cake_trim_view = [list(r) for r in vb.viewRange()]
         except Exception:
             logger.debug("cake view trim skipped", exc_info=True)
 
