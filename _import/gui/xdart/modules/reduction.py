@@ -167,7 +167,11 @@ def plan_from_live_scan(
     monitor_key_2d = _pop_first(args_2d, ("monitor",), None)
     chi_offset_1d = _pop_first(args_1d, ("chi_offset",), 0.0)
     chi_offset_2d = _pop_first(args_2d, ("chi_offset",), 0.0)
-    if chi_offset_1d:
+    if chi_offset_1d and not bool(getattr(live_scan, "gi", False)):
+        # Transmission-only: the chi offset rotates the standard cake's chi
+        # origin, so the 1D chi-slice is pre-shifted to match.  In GI the
+        # slice goes to FiberIntegrator's own polar convention unshifted --
+        # shifting it displaced the window out of the wedge (zero counts).
         azimuth_range_1d = _offset_range(azimuth_range_1d, float(chi_offset_1d))
     error_model = _pop_first(args_1d, ("error_model",), None)
     error_model_2d = _pop_first(args_2d, ("error_model",), None)
