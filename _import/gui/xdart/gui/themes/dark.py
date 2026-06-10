@@ -57,6 +57,14 @@ QFrame, QGroupBox {
     border: 1px solid #44475a;
     border-radius: 4px;
 }
+/* Display top bar: ONE continuous bar -- the cluster/title containers and
+   the title label are borderless + transparent so only frame_top's panel
+   shows (the buttons inside keep their own styling).  setFrameShape can't
+   override QSS, so the exception lives here. */
+QFrame#frame_4, QFrame#frame_5, QFrame#frame_6, QLabel#labelCurrent {
+    border: none;
+    background: transparent;
+}
 QGroupBox {
     margin-top: 8px;
     padding-top: 8px;
