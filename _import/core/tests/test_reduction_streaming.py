@@ -377,3 +377,91 @@ def test_streaming_drain_timeout_and_cancel_bail(monkeypatch):
 
     gate.set()                                  # release the worker, finish clean
     session.finish(raise_on_failure=False)
+
+
+# ---------------------------------------------------------------------------
+# #2 — cancel-aware submit() under backpressure
+# ---------------------------------------------------------------------------
+
+def test_submit_cancel_aware_under_backpressure(monkeypatch):
+    """#2: submit() must not block indefinitely when the in-flight window is full
+    and a cancel is requested (Stop/Pause).  It polls the cancel token with a
+    bounded acquire so the dispatch loop can proceed to its stop-check promptly."""
+    gate = threading.Event()
+
+    def blocking(image, ai, **kw):
+        gate.wait(5)               # worker stalls -> window fills -> submit blocks
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocking)
+    token = CancelToken()
+    session = ReductionSession(
+        _plan(), Scan("s", _frames(4), integrator=object()),
+        sink=MemorySink(), execution="streaming", executor=1,
+        cancel_token=token, inflight_max=1,   # window=1 so 2nd submit would block
+    )
+    session.submit(_frames(4)[0])   # fills the window
+    # Second submit in a thread; it would block on the semaphore without the fix.
+    done = []
+    t = threading.Thread(target=lambda: (session.submit(_frames(4)[1]),
+                                         done.append(True)))
+    t.start()
+    time.sleep(0.15)             # give it time to block in acquire loop
+    assert not done              # still blocked
+
+    token.cancel()               # cancel → submit should return promptly
+    t.join(timeout=2)
+    assert done == [True]        # returned within the poll interval
+    assert session._cancelled    # marked cancelled, not raised through
+
+    gate.set()
+    session.finish(raise_on_failure=False)
+
+
+# ---------------------------------------------------------------------------
+# #4 — bounded finish() writer join
+# ---------------------------------------------------------------------------
+
+def test_finish_join_timeout_loud_on_stuck_worker(monkeypatch):
+    """#4: finish(join_timeout=) must not hang indefinitely when a worker is
+    stalled.  After the timeout it cancels, marks the result failed, records a
+    TimeoutError, and RETURNS (does not hang) — the caller gets a loud error,
+    not a silent success."""
+    gate = threading.Event()
+
+    def blocking(image, ai, **kw):
+        gate.wait(5)
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocking)
+    session = ReductionSession(
+        _plan(), Scan("s", _frames(1), integrator=object()),
+        sink=MemorySink(), execution="streaming", executor=1,
+    )
+    session.submit(_frames(1)[0])
+
+    t0 = time.monotonic()
+    result = session.finish(raise_on_failure=False, join_timeout=0.3)
+    assert time.monotonic() - t0 < 2.0         # did NOT hang
+    assert result.failed and result.error       # marked failed + recorded error
+    assert "timed out" in result.error.lower() or isinstance(
+        session._failure, TimeoutError)
+
+    gate.set()   # release the worker so the thread can exit cleanly
+
+
+def test_finish_join_timeout_normal_session_still_succeeds(monkeypatch):
+    """A normal (non-stalled) session with join_timeout= still finishes cleanly
+    and still re-raises on result.failed (BLOCKER 2 preserved)."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    sink = MemorySink()
+    session = ReductionSession(
+        _plan(), Scan("s", _frames(4), integrator=object()),
+        sink=sink, execution="streaming", executor=2,
+    )
+    for fr in _frames(4):
+        session.submit(fr)
+    result = session.finish(join_timeout=30.0)   # large timeout, should complete fast
+    assert result.n_processed == 4
+    assert sorted(sink.frames) == list(range(4))

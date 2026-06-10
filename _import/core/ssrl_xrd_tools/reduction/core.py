@@ -14,6 +14,7 @@ import queue
 import threading
 import time
 import uuid
+import warnings
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -1025,7 +1026,15 @@ class ReductionSession:
         self._register_process_frames([frame])
         # Bounded in-flight: blocks the reader so it can't outrun integration
         # (flat peak memory).  Released by the writer thread per frame.
-        self._semaphore.acquire()
+        # Timed-acquire loop: poll the cancel token so Stop/Pause can interrupt
+        # a full in-flight window without waiting for a worker slot to free.
+        # Returns cleanly (no raise) so the caller's stop-check handles it safely
+        # (raising here escapes through run() which has no except, tearing down
+        # the QThread — the same trap the GIFreezeError fix addressed).
+        while not self._semaphore.acquire(timeout=0.1):
+            if self._cancelled or self.cancel_token.cancelled:
+                self._cancelled = True
+                return
         if self._cancelled or self.cancel_token.cancelled:
             self._cancelled = True
             self._semaphore.release()
@@ -1144,7 +1153,8 @@ class ReductionSession:
                     return False
                 q.all_tasks_done.wait(min(poll, remaining))
 
-    def finish(self, raise_on_failure: bool = True) -> ReductionResult:
+    def finish(self, raise_on_failure: bool = True,
+               join_timeout: float | None = None) -> ReductionResult:
         """Drain, flush the sink, and return the :class:`ReductionResult`.
 
         By default this is FAIL-LOUD: if any frame reduction or sink write
@@ -1155,19 +1165,54 @@ class ReductionSession:
         value of a ``raise_on_failure=False`` call).  Pass
         ``raise_on_failure=False`` to inspect ``result.failed`` and tolerate
         partial failures instead (e.g. cleanup paths that are already handling an
-        exception, or freeze-only sessions with no write sink)."""
+        exception, or freeze-only sessions with no write sink).
+
+        ``join_timeout`` bounds the writer-thread join for streaming sessions.
+        ``None`` (default) is unbounded — safe for normal runs where workers
+        complete promptly.  GUI sessions should pass a finite timeout (e.g. 60 s)
+        so a stalled NFS/pyFAI worker can't wedge Stop/close indefinitely; if the
+        join times out, the cancel token is tripped, the result is marked failed,
+        and a ``TimeoutError`` is recorded as the failure."""
         if self._finished and self.result is not None:
             # Idempotent: a re-call after a raised first finish() returns the
             # preserved (possibly failed) result rather than re-raising.
             return self.result
 
+        _writer_timed_out = False
         if self.execution == "streaming" and self._stream_started:
             # No more submits: tell the writer to drain the queue and exit, then
             # join it so only completed frames are flushed (never a torn frame).
             self._write_queue.put(_STREAM_SENTINEL)
             if self._writer_thread is not None:
-                self._writer_thread.join()
-                self._writer_thread = None
+                self._writer_thread.join(timeout=join_timeout)
+                if self._writer_thread.is_alive():
+                    # Writer is still alive after the timeout (a stalled worker
+                    # held the future.result() call and the sentinel hasn't been
+                    # processed).  Cancel any remaining in-flight work via the
+                    # cancel token so the worker unblocks at its next check, and
+                    # flag the result as failed so the caller gets a loud error
+                    # rather than a silent hang.
+                    self.cancel_token.cancel()
+                    self._cancelled = True
+                    if self._failure is None:
+                        self._failure = TimeoutError(
+                            f"ReductionSession.finish(): writer thread did not "
+                            f"exit within {join_timeout}s; a worker may be "
+                            f"stalled (stalled NFS read or runaway pyFAI call). "
+                            f"Session result is incomplete."
+                        )
+                    warnings.warn(
+                        f"ReductionSession.finish(): writer join timed out after "
+                        f"{join_timeout}s; session result is incomplete.",
+                        RuntimeWarning, stacklevel=2,
+                    )
+                    # Do NOT null the thread handle — it is still alive and
+                    # process-scoped; let the interpreter reap it on exit.
+                    # Signal fast-exit to the cleanup below: the pool cannot be
+                    # shut down with wait=True because its futures are still live.
+                    _writer_timed_out = True
+                else:
+                    self._writer_thread = None
 
         self.result = ReductionResult(
             scan_name=self.scan.name,
@@ -1190,7 +1235,10 @@ class ReductionSession:
                         self._sink.finish(self.result)
         finally:
             if self._owns_worker and self._worker is not None:
-                self._worker.shutdown(wait=True, cancel_futures=True)
+                # If the writer join timed out, the pool has stalled futures —
+                # shut down without waiting (don't re-hang here).
+                wait_for_pool = not _writer_timed_out
+                self._worker.shutdown(wait=wait_for_pool, cancel_futures=True)
             self._worker = None
             self._finished = True
 
