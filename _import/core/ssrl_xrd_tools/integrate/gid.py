@@ -425,6 +425,10 @@ def integrate_gi_polar(
     """
     inc, tilt, orient = _effective_gi_params(fi, incident_angle, tilt_angle, sample_orientation)
     radial_unit = "A^-1" if "A^-1" in unit else "nm^-1"
+    if azimuth_range is not None:
+        # pyFAI wraps out-of-domain polar requests instead of clamping.
+        azimuth_range = (max(float(azimuth_range[0]), -180.0),
+                         min(float(azimuth_range[1]), 180.0))
 
     result = fi.integrate2d_polar(
         polar_degrees=True,
@@ -838,10 +842,21 @@ def freeze_common_axes_2d(results, *, gi_mode_2d: str = 'qip_qoop',
         [getattr(r, 'radial', None) for r in results], pad_fraction)
     ry = _padded_union_range(
         [getattr(r, 'azimuthal', None) for r in results], pad_fraction)
+    def _clamp_angle(rng):
+        # pyFAI's polar/exit-angle domain is [-180, 180); a padded scout
+        # range that overflows it (e.g. -183..186 from a full-wedge scout)
+        # gets WRAPPED by pyFAI (-183 -> +177), collapsing the request to a
+        # sliver and producing an all-dummy cake.
+        if rng is None:
+            return None
+        return (max(float(rng[0]), -180.0), min(float(rng[1]), 180.0))
+
+    angle_x = gi_mode_2d == 'exit_angles'
+    angle_y = gi_mode_2d in ('q_chi', 'exit_angles')
     if rx is not None:
-        out[x_key] = rx
+        out[x_key] = _clamp_angle(rx) if angle_x else rx
     if ry is not None:
-        out[y_key] = ry
+        out[y_key] = _clamp_angle(ry) if angle_y else ry
     return out
 
 
