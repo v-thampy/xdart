@@ -4118,3 +4118,26 @@ def test_integration_view_image_applies_mask_and_threshold():
     img2 = displayFrameWidget.integration_view_image(
         thumb, SimpleNamespace(global_mask=None, apply_threshold=False))
     assert np.isfinite(img2).all()
+
+
+def test_xye_viewer_single_click_navigates_directories():
+    """XYE viewer: single click on a directory (or '..') navigates, matching
+    the Image Viewer; single click on a FILE still defers to
+    _scans_selection_changed (multi-select path) and must not double-fire."""
+    calls = []
+    viewer = SimpleNamespace(
+        _suspend_scan_selection_loads=False,
+        viewer_mode="xye",
+        scans_clicked=lambda q: calls.append(("nav", q.text())),
+    )
+
+    H5Viewer._scans_single_clicked(viewer, _FakeItem("subdir/"))
+    H5Viewer._scans_single_clicked(viewer, _FakeItem(".."))
+    H5Viewer._scans_single_clicked(viewer, _FakeItem("data_0001.xye"))
+
+    assert calls == [("nav", "subdir/"), ("nav", "..")]
+
+    # Image viewer unchanged: single click acts on everything.
+    viewer.viewer_mode = "image"
+    H5Viewer._scans_single_clicked(viewer, _FakeItem("img.tiff"))
+    assert calls[-1] == ("nav", "img.tiff")

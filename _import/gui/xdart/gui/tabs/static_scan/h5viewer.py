@@ -1003,12 +1003,22 @@ class H5Viewer(QWidget):
     def _scans_single_clicked(self, q):
         """Handle single click in listScans — only acts in viewer mode.
 
-        XYE mode uses _scans_selection_changed instead to avoid double-firing.
+        XYE mode: FILE loads go through _scans_selection_changed (it fires
+        after the selection settles, so Shift+arrow multi-select works and
+        nothing double-fires) — but single-click NAVIGATION (directories /
+        '..') is handled here so it matches the Image Viewer, which enters
+        folders on a single click.
         """
         if getattr(self, '_suspend_scan_selection_loads', False):
             return
-        if self.viewer_mode is not None and self.viewer_mode != 'xye':
-            self.scans_clicked(q)
+        if self.viewer_mode is None:
+            return
+        if self.viewer_mode == 'xye':
+            text = q.text()
+            if text == '..' or text.endswith('/'):
+                self.scans_clicked(q)
+            return
+        self.scans_clicked(q)
 
     def _scans_current_changed(self, current, previous):
         """Handle arrow-key navigation in listScans (image viewer only).
