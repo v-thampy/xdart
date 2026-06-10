@@ -3402,7 +3402,6 @@ def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index
         "_set_plot_unit_index_silently",
         "_apply_share_axis_state",
         "_set_share_link",
-        "_mirror_cake_xrange",
     ):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
     return host
@@ -3421,10 +3420,9 @@ def test_share_axis_maps_by_unit_not_combo_index():
     # New share contract: NUMERIC one-way mirror (cake -> 1D), not setXLink
     # (which aligns by screen geometry and is bidirectional).
     assert host._share_link_on is True
-    assert host.plot.xrange == (2.0, 6.0)      # adopted the cake's range
-    # XLink engages only after the GEOMETRIC alignment converges (real
-    # widgets); on duck holders it stays unlinked.
-    assert host.plot.link is None
+    # dev semantics: the native (bidirectional, geometry-mapped) XLink is
+    # engaged directly; the 1D frame is untouched.
+    assert host.plot.link is host.binned_widget.image_plot
 
 
 def test_share_axis_disables_when_no_matching_plot_unit():

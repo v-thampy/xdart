@@ -1080,113 +1080,34 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return False
 
     def _set_share_link(self, on: bool) -> None:
-        """One-way NUMERIC x-mirror: cake -> 1D plot.
+        """Share Axis = dev semantics: the native pyqtgraph XLink.
 
-        NOT pyqtgraph's setXLink: that aligns by SCREEN geometry, so panes
-        at different positions/widths show different numeric ranges (glaring
-        once the cake started trimming to its data extent), and the link is
-        bidirectional, so any 1D x-refit dragged the cake.  Here the cake is
-        strictly the master: its sigXRangeChanged drives the 1D's numeric
-        x-range; nothing flows back."""
+        The 1D plot's frame is untouched (its y-axis stays at the left end
+        of its pane); the x-range is GEOMETRY-mapped so the screen columns
+        the two panes share line up vertically, and the link is
+        bidirectional -- zooming either plot moves both.  The only addition
+        over dev: the 1D's continuous x-auto-range is disabled while shared,
+        so render refits never drag the cake (that interaction, exposed by
+        the cake's trim-to-data, was the 'inverted share' regression)."""
         ip = getattr(getattr(self, 'binned_widget', None),
                      'image_plot', None)
-        get_vb = getattr(ip, 'getViewBox', None)
-        vb = get_vb() if callable(get_vb) else None
-        if vb is None:
+        if ip is None or not hasattr(ip, 'getViewBox'):
             return          # duck holders in tests / widget not fully built
         already = getattr(self, '_share_link_on', False)
         if on and not already:
             self._share_link_on = True
+            self.plot.setXLink(ip)
             try:
-                self._share_saved_margins = tuple(
-                    self.plot.layout.getContentsMargins())
+                self.plot.enableAutoRange(x=False, y=True)
+                # Snap NOW: pyqtgraph only syncs a fresh link on the next
+                # master change, so force one initial linkedViewChanged.
+                vbp = self.plot.getViewBox()
+                vbp.linkedViewChanged(ip.getViewBox(), vbp.XAxis)
             except Exception:
-                self._share_saved_margins = None
-            # Immediate numeric adopt for instant feedback, then the
-            # geometric align; once the two viewboxes occupy the SAME screen
-            # span, _align engages setXLink -- at equal spans pyqtgraph's
-            # geometry-mapped link IS an exact numeric lock, and it is
-            # bidirectional (zoom either plot, both follow -- the spec).
-            displayFrameWidget._mirror_cake_xrange(
-                self, vb, vb.viewRange()[0])
-            displayFrameWidget._schedule_align(self)
+                logger.debug("share x-auto disable failed", exc_info=True)
         elif not on and already:
             self._share_link_on = False
             self.plot.setXLink(None)
-            saved = getattr(self, '_share_saved_margins', None)
-            if saved is not None:
-                try:
-                    self.plot.layout.setContentsMargins(*saved)
-                except Exception:
-                    logger.debug("share margin restore failed", exc_info=True)
-
-    def _mirror_cake_xrange(self, _vb, xrange) -> None:
-        """Adopt the cake's numeric x-range on the 1D plot (y stays auto)."""
-        try:
-            self.plot.enableAutoRange(x=False, y=True)
-            self.plot.setXRange(float(xrange[0]), float(xrange[1]),
-                                padding=0)
-        except Exception:
-            logger.debug("share-axis mirror failed", exc_info=True)
-
-    def _schedule_align(self) -> None:
-        if getattr(self, '_align_pending', False):
-            return
-        self._align_pending = True
-
-        def _go():
-            self._align_pending = False
-            displayFrameWidget._align_plot_under_cake(self)
-        Qt.QtCore.QTimer.singleShot(0, _go)
-
-    def _align_plot_under_cake(self) -> None:
-        """Geometric half of Share Axis: pad the 1D plot's layout margins so
-        its viewbox occupies the SAME screen x-span as the cake's -- a Q
-        value on the 1D sits vertically below the same Q on the cake.  The
-        1D shrinks/expands; the cake is never touched.  Converges (no-op
-        within 1px), so re-running on every mirror/resize is safe."""
-        try:
-            if not getattr(self, '_share_link_on', False):
-                return
-            bw = getattr(self, 'binned_widget', None)
-            cake_win = getattr(bw, 'image_win', None)
-            plot_win = getattr(self, 'plot_win', None)
-            if (cake_win is None or plot_win is None
-                    or not cake_win.isVisible() or not plot_win.isVisible()):
-                return
-
-            def _gspan(win, vb):
-                r = vb.sceneBoundingRect()
-                left = win.mapToGlobal(win.mapFromScene(r.topLeft())).x()
-                right = win.mapToGlobal(
-                    win.mapFromScene(r.bottomRight())).x()
-                return float(left), float(right)
-
-            cl, cr = _gspan(cake_win, bw.image_plot.getViewBox())
-            pl, pr = _gspan(plot_win, self.plot.getViewBox())
-            dl, dr = cl - pl, pr - cr
-            if abs(dl) <= 1.0 and abs(dr) <= 1.0:
-                # Converged: spans equal, so the native (bidirectional)
-                # XLink is now an exact numeric lock.  Engage it (idempotent)
-                # and adopt the cake's range through it.
-                self.plot.setXLink(bw.image_plot)
-                self.plot.enableAutoRange(x=False, y=True)
-                return
-            lay = self.plot.layout
-            ml, mt, mr, mb = lay.getContentsMargins()
-            lay.setContentsMargins(max(0.0, ml + dl), mt,
-                                   max(0.0, mr + dr), mb)
-            lay.activate()      # recompute NOW so a follow-up align (or a
-                                # queued one) reads fresh geometry, not stale
-            displayFrameWidget._schedule_align(self)   # converge (<=1px no-op)
-        except Exception:
-            logger.debug("share-axis geometric align failed", exc_info=True)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        # Re-line the shared 1D under the cake after geometry changes.
-        if getattr(self, '_share_link_on', False):
-            displayFrameWidget._schedule_align(self)
 
     def render_display(self, state, payload):
         """Draw the display from ``state`` + ``payload``.  (Named
