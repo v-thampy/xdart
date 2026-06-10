@@ -1099,6 +1099,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.plot.setXLink(None)        # never both mechanisms
             vb.sigXRangeChanged.connect(self._mirror_cake_xrange)
             self._share_link_on = True
+            try:
+                self._share_saved_margins = tuple(
+                    self.plot.layout.getContentsMargins())
+            except Exception:
+                self._share_saved_margins = None
             displayFrameWidget._mirror_cake_xrange(
                 self, vb, vb.viewRange()[0])      # adopt now
         elif not on and already:
@@ -1107,6 +1112,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             except (TypeError, RuntimeError):
                 pass
             self._share_link_on = False
+            saved = getattr(self, '_share_saved_margins', None)
+            if saved is not None:
+                try:
+                    self.plot.layout.setContentsMargins(*saved)
+                except Exception:
+                    logger.debug("share margin restore failed", exc_info=True)
 
     def _mirror_cake_xrange(self, _vb, xrange) -> None:
         """Adopt the cake's numeric x-range on the 1D plot (y stays auto)."""
@@ -1114,8 +1125,67 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.plot.enableAutoRange(x=False, y=True)
             self.plot.setXRange(float(xrange[0]), float(xrange[1]),
                                 padding=0)
+            # Geometric half: line the 1D's axis area up under the cake's
+            # (deferred so tick relabeling from the new range settles first;
+            # coalesced so queued shots can't apply a stale-geometry delta
+            # twice).
+            displayFrameWidget._schedule_align(self)
         except Exception:
             logger.debug("share-axis mirror failed", exc_info=True)
+
+    def _schedule_align(self) -> None:
+        if getattr(self, '_align_pending', False):
+            return
+        self._align_pending = True
+
+        def _go():
+            self._align_pending = False
+            displayFrameWidget._align_plot_under_cake(self)
+        Qt.QtCore.QTimer.singleShot(0, _go)
+
+    def _align_plot_under_cake(self) -> None:
+        """Geometric half of Share Axis: pad the 1D plot's layout margins so
+        its viewbox occupies the SAME screen x-span as the cake's -- a Q
+        value on the 1D sits vertically below the same Q on the cake.  The
+        1D shrinks/expands; the cake is never touched.  Converges (no-op
+        within 1px), so re-running on every mirror/resize is safe."""
+        try:
+            if not getattr(self, '_share_link_on', False):
+                return
+            bw = getattr(self, 'binned_widget', None)
+            cake_win = getattr(bw, 'image_win', None)
+            plot_win = getattr(self, 'plot_win', None)
+            if (cake_win is None or plot_win is None
+                    or not cake_win.isVisible() or not plot_win.isVisible()):
+                return
+
+            def _gspan(win, vb):
+                r = vb.sceneBoundingRect()
+                left = win.mapToGlobal(win.mapFromScene(r.topLeft())).x()
+                right = win.mapToGlobal(
+                    win.mapFromScene(r.bottomRight())).x()
+                return float(left), float(right)
+
+            cl, cr = _gspan(cake_win, bw.image_plot.getViewBox())
+            pl, pr = _gspan(plot_win, self.plot.getViewBox())
+            dl, dr = cl - pl, pr - cr
+            if abs(dl) <= 1.0 and abs(dr) <= 1.0:
+                return
+            lay = self.plot.layout
+            ml, mt, mr, mb = lay.getContentsMargins()
+            lay.setContentsMargins(max(0.0, ml + dl), mt,
+                                   max(0.0, mr + dr), mb)
+            lay.activate()      # recompute NOW so a follow-up align (or a
+                                # queued one) reads fresh geometry, not stale
+            displayFrameWidget._schedule_align(self)   # converge (<=1px no-op)
+        except Exception:
+            logger.debug("share-axis geometric align failed", exc_info=True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Re-line the shared 1D under the cake after geometry changes.
+        if getattr(self, '_share_link_on', False):
+            displayFrameWidget._schedule_align(self)
 
     def render_display(self, state, payload):
         """Draw the display from ``state`` + ``payload``.  (Named
