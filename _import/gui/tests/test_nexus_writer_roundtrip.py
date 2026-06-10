@@ -1283,6 +1283,120 @@ def test_wavelength_prefers_integrator_over_mg_args(tmp_path):
     assert float(src["wavelength_A"].nxdata) == pytest.approx(0.7293)
 
 
+def test_reload_restores_persisted_wavelength_into_mg_args(tmp_path):
+    # G1: reloaded scans have no live integrator.  The loader must restore the
+    # real v2 wavelength stamp so display Q↔2θ conversion does not fall back to
+    # the LiveScan constructor's 1e-10 m sentinel.
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan.mg_args = {"wavelength": 1.0e-10}
+    scan._cached_integrator = SimpleNamespace(wavelength=0.7293e-10)
+
+    path = tmp_path / "wl_reload.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    loaded = LiveScan(name="wl", data_file=str(path))
+    loaded.load_from_h5(replace=True, mode="r")
+
+    assert loaded.mg_args["wavelength"] == pytest.approx(0.7293e-10)
+
+
+def test_reload_clears_stale_persisted_wavelength_when_missing(tmp_path):
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
+
+    with_wl = _DuckSphere([_DuckArch(idx=0)])
+    with_wl._cached_integrator = SimpleNamespace(wavelength=0.7293e-10)
+    path_with_wl = tmp_path / "with_wl.nxs"
+    save_scan_to_nexus(with_wl, path_with_wl, mode="w", finalize=False)
+
+    no_wl = _DuckSphere([_DuckArch(idx=0)])
+    path_no_wl = tmp_path / "no_wl.nxs"
+    save_scan_to_nexus(no_wl, path_no_wl, mode="w", finalize=False)
+
+    loaded = LiveScan(name="wl", data_file=str(path_with_wl))
+    loaded.load_from_h5(replace=True, mode="r")
+    assert loaded.mg_args["wavelength"] == pytest.approx(0.7293e-10)
+
+    loaded.data_file = str(path_no_wl)
+    loaded.load_from_h5(replace=True, mode="r")
+
+    assert getattr(loaded, "_persisted_wavelength_m", None) is None
+    assert loaded.mg_args["wavelength"] == pytest.approx(1.0e-10)
+
+
+def test_reload_restores_wavelength_in_append_mode(tmp_path):
+    # T0-2: Append runs load with replace=False, mode='a' while load_from_h5
+    # holds the file open — the restore must read through the already-open
+    # handle, not a second h5py.File open of the same path.
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan.mg_args = {"wavelength": 1.0e-10}
+    scan._cached_integrator = SimpleNamespace(wavelength=0.7293e-10)
+    path = tmp_path / "wl_append.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    loaded = LiveScan(name="wl", data_file=str(path))
+    loaded.load_from_h5(replace=False, mode="a")
+
+    assert loaded.mg_args["wavelength"] == pytest.approx(0.7293e-10)
+    assert loaded._persisted_wavelength_m == pytest.approx(0.7293e-10)
+
+
+def test_reset_clears_persisted_wavelength(tmp_path):
+    # T0-1: reset() is a data-identity change without a v2 load — the
+    # wavelength restored from the previously loaded file must not survive it
+    # (it short-circuits _get_wavelength ahead of the current file's stamp).
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan._cached_integrator = SimpleNamespace(wavelength=0.7293e-10)
+    path = tmp_path / "wl_reset.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    loaded = LiveScan(name="wl", data_file=str(path))
+    loaded.load_from_h5(replace=True, mode="r")
+    assert loaded._persisted_wavelength_m == pytest.approx(0.7293e-10)
+
+    loaded.reset()
+
+    assert loaded._persisted_wavelength_m is None
+    assert loaded.mg_args["wavelength"] == pytest.approx(1.0e-10)
+
+
+def test_source_base_stamp_failure_fails_save_loudly(tmp_path, monkeypatch):
+    # G2: relative per-frame source paths without entry/@source_base are
+    # misleadingly portable-looking but unresolvable.  The save must fail loudly
+    # if the attr stamp cannot be written.
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    original_setitem = h5py._hl.attrs.AttributeManager.__setitem__
+
+    def fail_source_base(self, name, value):
+        if name == "source_base":
+            raise OSError("attr write blocked")
+        return original_setitem(self, name, value)
+
+    monkeypatch.setattr(h5py._hl.attrs.AttributeManager, "__setitem__",
+                        fail_source_base)
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan.source_base = str(tmp_path)
+
+    with pytest.raises(RuntimeError, match="@source_base"):
+        save_scan_to_nexus(scan, tmp_path / "source_base_fail.nxs",
+                           mode="w", finalize=False)
+
+
 def test_reduction_provenance(written_nxs):
     """/entry/reduction is an NXprocess with program + versions + config."""
     root = nx.nxload(str(written_nxs))

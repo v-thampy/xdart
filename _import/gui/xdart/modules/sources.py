@@ -10,6 +10,7 @@ import numpy as np
 
 from ssrl_xrd_tools.core import FrameGeometry, SourceCapabilities, SourceKind
 from ssrl_xrd_tools.core.scan import Scan, ScanFrame
+from xdart.modules.wavelength import wavelength_m_to_angstrom
 
 
 class LiveScanFrameSource:
@@ -144,11 +145,15 @@ def _first_poni(live_scan: Any, labels: list[int]) -> Any | None:
 
 
 def _wavelength_angstrom(live_scan: Any) -> float | None:
-    try:
-        wavelength_m = float((getattr(live_scan, "mg_args", {}) or {}).get("wavelength", 0))
-    except (TypeError, ValueError):
-        return None
-    return wavelength_m * 1e10 if wavelength_m > 0 else None
+    persisted = wavelength_m_to_angstrom(
+        getattr(live_scan, "_persisted_wavelength_m", None),
+        allow_default_sentinel=True,
+    )
+    if persisted is not None:
+        return persisted
+    return wavelength_m_to_angstrom(
+        (getattr(live_scan, "mg_args", {}) or {}).get("wavelength", None)
+    )
 
 
 def _numeric_motors(scan_data: Any) -> dict[str, np.ndarray]:

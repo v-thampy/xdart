@@ -1035,6 +1035,32 @@ class imageThread(wranglerThread):
             gi_freeze_mode="scout_union" if self.batch_mode else "first_frame",
         )
 
+    def _gi_ranges_fully_pinned(self, scan) -> bool:
+        """True when every GI output range this run would auto-freeze is
+        already explicitly set (T0-3).
+
+        Mirrors the self-skip conditions of :meth:`_freeze_gi_1d_auto_range`
+        (the active 1D mode's output-axis range key is set) and
+        :meth:`_freeze_gi_2d_auto_ranges` (both of the active 2D mode's range
+        keys are set; 2D irrelevant for XYE-only / skip_2d runs).  When all
+        relevant ranges are pinned there is no auto grid to freeze, so the
+        whole-scan scout — and its fail-closed abort on unverifiable sources —
+        is unnecessary.  Conservative: any non-dict args → False (let the
+        normal prepass decide)."""
+        args_1d = getattr(scan, 'bai_1d_args', None)
+        if not isinstance(args_1d, dict):
+            return False
+        key = gi_1d_output_axis_key(args_1d.get('gi_mode_1d', 'q_total'))
+        if args_1d.get(key) is None:
+            return False
+        if self.xye_only or getattr(scan, 'skip_2d', False):
+            return True
+        args_2d = getattr(scan, 'bai_2d_args', None)
+        if not isinstance(args_2d, dict):
+            return False
+        return all(args_2d.get(k) is not None
+                   for k in _gi_2d_range_keys(args_2d))
+
     # ── BLOCKER 1: whole-scan GI grid freeze (streaming batch) ──────────────
     def _gi_freeze_whole_scan_prepass(self, scan) -> bool:
         """Freeze the GI common q/χ grid from the WHOLE scan's incidence range
@@ -1076,6 +1102,15 @@ class imageThread(wranglerThread):
             return True
         if getattr(self, "_gi_prepass_scan_id", None) == id(scan):
             return True
+        if self._gi_ranges_fully_pinned(scan):
+            # T0-3: every GI output range this run would auto-freeze is already
+            # explicitly set — the freeze functions self-skip and the session's
+            # own per-session freeze early-returns, so there is no auto grid to
+            # chunk-clip and no scout sweep is needed.  Without this pre-flight
+            # the "unverifiable" abort below fired even for fully-pinned runs
+            # (and its "set fixed/manual GI ranges" remedy didn't work).
+            self._gi_prepass_scan_id = id(scan)   # latch: decided for this scan
+            return True
         try:
             status, scouts = self._gi_whole_scan_scout_entries(scan)
         except Exception as exc:
@@ -1092,10 +1127,10 @@ class imageThread(wranglerThread):
             # The source type (Image-Directory or Eiger master with non-fixed
             # incidence) cannot be cheaply swept for the whole-scan incidence
             # range.  Rather than silently clip later frames onto the chunk-1
-            # grid, abort the streaming run and tell the user to switch to
-            # XDART_BATCH_EXECUTION=chunked (the chunked executor fully
-            # materializes the pending before freezing, so it's correct for
-            # sources whose files are already all-available).
+            # grid, abort the streaming run and tell the user to choose a
+            # source layout/range that can be verified globally.  Do not
+            # recommend the legacy chunked executor here: it freezes the pending
+            # dispatch window, not necessarily the whole scan.
             # RESTRUCTURE-TODO: proper fix = source-aware whole-scan incidence
             # enumeration for Image-Directory and multi-master Eiger.
             source = (getattr(self, "inp_type", None) or
@@ -1105,8 +1140,10 @@ class imageThread(wranglerThread):
             self._abort_gi_prepass(
                 f"cannot sweep the whole-scan incidence range for '{source}' "
                 f"in streaming GI mode (silent chunk-1 clipping refused). "
-                f"Set XDART_BATCH_EXECUTION=chunked or use an Image-Series source "
-                f"so the whole-scan grid can be verified."
+                f"Use an Image-Series source, enter a fixed/manual incident "
+                f"angle (Theta Motor → Manual), or set explicit 1D and 2D "
+                f"output ranges in the integrator panel so no auto grid needs "
+                f"freezing."
             )
             return False
         if status == "freeze":

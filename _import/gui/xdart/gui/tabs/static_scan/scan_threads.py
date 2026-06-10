@@ -535,6 +535,12 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 # instead of being silently treated as an empty XYE result.
                 self.scan.data_file = self.fname
                 self.scan.name = os.path.split(self.fname)[-1].split('.')[0]
+                # G1/T0-1: the repoint skips load_from_h5, so the wavelength
+                # restored from the PREVIOUS file must not survive the switch.
+                # getattr: tests drive this with duck-typed scan stubs.
+                _clear_wl = getattr(self.scan, '_clear_persisted_wavelength', None)
+                if callable(_clear_wl):
+                    _clear_wl()
             elif getattr(self, 'live_run', False):
                 # Live, non-batch run: the wrangler owns this file and
                 # is feeding the GUI in-memory frames per frame.  A full
@@ -548,6 +554,12 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 # new_scan() already reset the index for this scan.
                 self.scan.data_file = self.fname
                 self.scan.name = os.path.split(self.fname)[-1].split('.')[0]
+                # G1/T0-1: path-only repoint — drop the previous file's
+                # restored wavelength (see _clear_persisted_wavelength).
+                # getattr: tests drive this with duck-typed scan stubs.
+                _clear_wl = getattr(self.scan, '_clear_persisted_wavelength', None)
+                if callable(_clear_wl):
+                    _clear_wl()
             else:
                 # O7: dropped legacy ``save_args={'compression': None}``
                 # passthrough — the v2 writer (save_to_nexus) doesn't

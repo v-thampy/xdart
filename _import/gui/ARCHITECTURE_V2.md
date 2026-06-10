@@ -1,8 +1,8 @@
-# Architecture V2 Spike
+# Architecture V2 Notes
 
 This branch explores xdart as a thin Qt shell around the headless spine in
-`ssrl_xrd_tools`. It is not a release branch: do not merge, tag, bump, push, or
-publish from here without a separate stabilization pass.
+`ssrl_xrd_tools`. Do not tag or publish from here until the prerelease gates in
+the review runbook pass cleanly.
 
 ## Boundary
 

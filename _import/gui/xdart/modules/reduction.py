@@ -30,6 +30,7 @@ from ssrl_xrd_tools.reduction import (
     Scan,
     run_reduction,
 )
+from xdart.modules.wavelength import wavelength_m_to_angstrom
 
 # S4: GI-only scan kwargs that must NOT flow through to the standard
 # pyFAI integrator path.  Derived from :class:`GIMode` (so adding a GIMode
@@ -104,12 +105,14 @@ def scan_from_live_scan(
         frames.append(frame)
     first_frame = live_scan.frames[int(indices[0])] if indices else None
     poni = getattr(first_frame, "poni", None) if first_frame is not None else None
-    wavelength_A = None
-    try:
-        wavelength_m = float((getattr(live_scan, "mg_args", {}) or {}).get("wavelength", 0))
-        wavelength_A = wavelength_m * 1e10 if wavelength_m > 0 else None
-    except (TypeError, ValueError):
-        wavelength_A = None
+    wavelength_A = wavelength_m_to_angstrom(
+        getattr(live_scan, "_persisted_wavelength_m", None),
+        allow_default_sentinel=True,
+    )
+    if wavelength_A is None:
+        wavelength_A = wavelength_m_to_angstrom(
+            (getattr(live_scan, "mg_args", {}) or {}).get("wavelength", None)
+        )
 
     motors = {}
     if scan_data is not None:

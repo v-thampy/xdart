@@ -9,6 +9,7 @@ from types import MethodType, SimpleNamespace
 from threading import RLock
 
 import numpy as np
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -25,6 +26,129 @@ from xdart.gui.tabs.static_scan.display_plot import (
     update_plot_accumulator,
 )
 from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+
+def test_display_wavelength_rejects_default_sentinel(tmp_path):
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={"wavelength": 1.0e-10},
+            data_file=str(tmp_path / "missing.nxs"),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host) is None
+
+
+def test_display_wavelength_accepts_authoritative_one_angstrom_integrator(tmp_path):
+    frame = SimpleNamespace(
+        integrator=SimpleNamespace(wavelength=1.0e-10),
+        poni=None,
+    )
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={"wavelength": 1.0e-10},
+            data_file=str(tmp_path / "missing.nxs"),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host, frame) == pytest.approx(1.0e-10)
+
+
+def test_display_wavelength_accepts_authoritative_one_angstrom_poni(tmp_path):
+    frame = SimpleNamespace(
+        integrator=None,
+        poni=SimpleNamespace(wavelength=1.0e-10),
+    )
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={"wavelength": 1.0e-10},
+            data_file=str(tmp_path / "missing.nxs"),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host, frame) == pytest.approx(1.0e-10)
+
+
+def test_display_wavelength_reads_v2_instrument_source(tmp_path):
+    import h5py
+
+    path = tmp_path / "wl.nxs"
+    with h5py.File(path, "w") as f:
+        src = f.create_group("entry/instrument/source")
+        src.create_dataset("wavelength_A", data=0.7293)
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={"wavelength": 1.0e-10},
+            data_file=str(path),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host) == pytest.approx(0.7293e-10)
+
+
+def test_display_wavelength_prefers_authoritative_reloaded_one_angstrom(tmp_path):
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={"wavelength": 1.0e-10},
+            _persisted_wavelength_m=1.0e-10,
+            data_file=str(tmp_path / "missing.nxs"),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host) == pytest.approx(1.0e-10)
+
+
+def test_display_wavelength_accepts_authoritative_one_angstrom_stamp(tmp_path):
+    import h5py
+
+    path = tmp_path / "wl_one_angstrom.nxs"
+    with h5py.File(path, "w") as f:
+        src = f.create_group("entry/instrument/source")
+        src.create_dataset("wavelength_A", data=1.0)
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={},
+            data_file=str(path),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host) == pytest.approx(1.0e-10)
+
+
+@pytest.mark.parametrize("flags", [
+    {"live_run": True, "no_nxs": False},
+    {"live_run": False, "no_nxs": True},
+])
+def test_live_repoint_clears_stale_persisted_wavelength(tmp_path, flags):
+    """T0-1: the live-run / XYE set_datafile repoint skips load_from_h5, so it
+    must clear the wavelength restored from the PREVIOUS file — otherwise
+    _get_wavelength keeps short-circuiting on file A's λ for every frame of
+    the run now writing file B."""
+    from xdart.modules.ewald.scan import LiveScan
+    from xdart.gui.tabs.static_scan.scan_threads import fileHandlerThread
+
+    # As if file A was previously loaded and its real wavelength restored
+    # (the load-restore path itself is covered in test_nexus_writer_roundtrip).
+    scan = LiveScan("a", data_file=str(tmp_path / "a.nxs"))
+    scan._persisted_wavelength_m = 0.7293e-10
+    scan.mg_args["wavelength"] = 0.7293e-10
+
+    # Repoint to file B through the real fileHandlerThread branch.
+    holder = SimpleNamespace(
+        scan=scan, fname=str(tmp_path / "b.nxs"),
+        file_lock=RLock(),
+        sigNewFile=SimpleNamespace(emit=lambda *_: None),
+        sigUpdate=SimpleNamespace(emit=lambda *_: None),
+        **flags,
+    )
+    MethodType(fileHandlerThread.set_datafile, holder)()
+
+    assert scan.data_file == str(tmp_path / "b.nxs")
+    assert scan._persisted_wavelength_m is None
+    # Display no longer sees file A's λ: mg_args is back to the rejected
+    # sentinel and file B has no stamp -> unknown, never A's value.
+    host = SimpleNamespace(scan=scan)
+    assert DisplayDataMixin._get_wavelength(host) is None
 
 
 class _FakeItem:

@@ -678,16 +678,11 @@ class staticWidget(QWidget):
                             publication_error_details(publication, "2d"),
                         )
                     # ── Bounded cache eviction ────────────────────────
-                    # O4: ``data_1d`` and ``data_2d`` are both bounded
-                    # FixSizeOrderedDicts now (see __init__), so their
-                    # own ``__setitem__`` already enforces the per-dict
-                    # cap.  The previous manual loop here keyed off
-                    # ``data_2d > _FRAME_CACHE_MAX=32`` was dead code:
-                    # FixSizeOrderedDict capped data_2d at 20 long
-                    # before that threshold, while data_1d (then
-                    # unbounded) silently grew without bound.  No
-                    # explicit eviction needed now; downstream cache
-                    # misses fall through to the file_thread lazy load.
+                    # ``data_2d`` is the heavy cache and is bounded by its
+                    # FixSizeOrderedDict cap (see __init__). ``data_1d`` is
+                    # intentionally kept available for plot history and
+                    # overlay/waterfall modes; the publication store handles
+                    # heavier per-frame payload eviction separately.
                     self.publication_store.upsert(publication)
             except Exception:
                 # Cache miss is non-fatal — displayframe will lazy-load
@@ -1148,6 +1143,14 @@ class staticWidget(QWidget):
         # land correctly; this assignment just unblocks the
         # synchronous render path immediately.
         self.scan.name = name
+        # G1/T0-1: a new run is a new data identity — drop the wavelength
+        # restored from whatever file was open before, synchronously (the
+        # async file-thread set_datafile also clears, but frames can render
+        # in the window before it lands).  getattr: tests drive this slot
+        # with duck-typed scan stubs.
+        _clear_wl = getattr(self.scan, '_clear_persisted_wavelength', None)
+        if callable(_clear_wl):
+            _clear_wl()
         self._sync_h5viewer_save_dir(os.path.dirname(fname), refresh=False)
         self.h5viewer.set_file(fname)
         self.scan.gi = gi

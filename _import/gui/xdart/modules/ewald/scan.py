@@ -12,6 +12,10 @@ from .frame_series import LiveFrameSeries
 from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xdart import utils
 from xdart.modules.live_compat import normalize_live_class_names
+from xdart.modules.wavelength import (
+    DEFAULT_WAVELENGTH_SENTINEL_M,
+    wavelength_angstrom_to_m,
+)
 
 
 def _coerce_scan_info(scan_info):
@@ -121,6 +125,11 @@ class LiveScan:
         self.single_img = single_img
         self.series_average = series_average
         self.skip_2d = False
+        # Real wavelength restored from a loaded v2 .nxs (G1).  Authoritative
+        # when set (display/adapters may trust even an exactly-1.0 Å value);
+        # MUST be cleared whenever the scan's data identity changes without a
+        # v2 load -- see _clear_persisted_wavelength.
+        self._persisted_wavelength_m = None
         self._cached_integrator = None
         # PONI used to build ``_cached_integrator`` -- stashed so the
         # reintegration path can pass it to the headless GI session (which
@@ -165,6 +174,19 @@ class LiveScan:
             self.global_mask = None
             self.bai_1d = None
             self.bai_2d = None
+            self._clear_persisted_wavelength()
+
+    def _clear_persisted_wavelength(self):
+        """Drop the wavelength restored from a previously loaded .nxs (G1).
+
+        The persisted value short-circuits ``_get_wavelength`` AHEAD of the
+        current file's own stamp, so it must be cleared at every data-identity
+        change that does not run ``_load_from_nexus_v2`` (``reset()``, the
+        live/XYE ``set_datafile`` repoints, ``new_scan``) -- otherwise a run
+        into file B keeps converting Q↔2θ with file A's wavelength."""
+        self._persisted_wavelength_m = None
+        if isinstance(self.mg_args, dict):
+            self.mg_args["wavelength"] = DEFAULT_WAVELENGTH_SENTINEL_M
 
     def has_reload_only_frames(self) -> bool:
         """Return True iff any frame can't recover its raw image.
@@ -610,6 +632,8 @@ class LiveScan:
         materialisation) and ~tens of ms (frame index + a few KB of
         coords + motor columns).
         """
+        self._clear_persisted_wavelength()
+
         # Prefer the metadata-only loader — it skips the heavy stacks;
         # fall back to the full reader on older builds that lack it.
         try:
@@ -697,6 +721,27 @@ class LiveScan:
             except Exception:
                 logger.debug("Failed to restore geometry from reduction config",
                              exc_info=True)
+
+        # v2 writer stores real calibration wavelength at
+        # /entry/instrument/source/wavelength_A.  Restore it into mg_args so a
+        # reloaded scan can do Q↔2θ display conversion without falling back to
+        # the LiveScan constructor's 1e-10 m placeholder.  Read through the
+        # ALREADY-OPEN handle (``grp``) — the caller holds the file open
+        # (Append loads use mode='a'), so a second ``h5py.File`` open of the
+        # same path is fragile under HDF5 file locking.
+        try:
+            wl_m = wavelength_angstrom_to_m(
+                grp["entry/instrument/source/wavelength_A"][()]
+            )
+            if wl_m is not None:
+                self._persisted_wavelength_m = wl_m
+                self.mg_args["wavelength"] = wl_m
+        except KeyError:
+            logger.debug("No persisted instrument/source wavelength in %s",
+                         self.data_file)
+        except Exception:
+            logger.debug("Failed reading persisted wavelength from %s",
+                         self.data_file, exc_info=True)
 
         # ── global_mask: persisted under /entry/instrument/detector/mask ─
         # Restored here so the displayframe can overlay it on raw images

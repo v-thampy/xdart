@@ -992,8 +992,11 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
                 )
         try:
             h5f[entry].attrs["source_base"] = posix_base
-        except Exception:
-            logger.debug("failed to stamp @source_base on %s", entry, exc_info=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to stamp @source_base={posix_base!r} on {entry!r}; "
+                "relative raw source paths would be unresolvable"
+            ) from exc
 
     # Filter the index *before* touching any frame object.  This is
     # the whole point of the cursor: we never lazy-load a frame we'd

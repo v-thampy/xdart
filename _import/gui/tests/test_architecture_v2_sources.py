@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from ssrl_xrd_tools.core.containers import PONI
 
@@ -28,7 +29,7 @@ def test_live_scan_frame_source_exposes_headless_contract(tmp_path):
             {"i0": [10.0], "sample": ["A"]},
             index=[3],
         ),
-        mg_args={"wavelength": 1e-10},
+        mg_args={"wavelength": 0.7293e-10},
     )
     frame = LiveFrame(
         idx=3,
@@ -41,7 +42,7 @@ def test_live_scan_frame_source_exposes_headless_contract(tmp_path):
     source = LiveScanFrameSource(scan)
 
     assert source.frame_indices == [3]
-    assert source.wavelength == 1.0
+    assert source.wavelength == pytest.approx(0.7293)
     assert np.asarray(source.load_frame(3)).sum() == 6
     assert source.metadata_for(3)["th"] == 0.2
     assert source.metadata_for(3)["i0"] == 10.0
@@ -50,6 +51,34 @@ def test_live_scan_frame_source_exposes_headless_contract(tmp_path):
     assert canonical.name == "scan"
     assert canonical.frame_indices == [3]
     assert canonical.scan_data.loc[3, "sample"] == "A"
+
+
+def test_live_scan_frame_source_rejects_default_wavelength_sentinel(tmp_path):
+    scan = LiveScan(
+        "scan",
+        data_file=str(tmp_path / "scan.nxs"),
+        mg_args={"wavelength": 1e-10},
+    )
+    scan.frames[1] = LiveFrame(idx=1, map_raw=np.ones((2, 2)), poni=_poni())
+
+    source = LiveScanFrameSource(scan)
+
+    assert source.wavelength is None
+    assert source.energy_eV is None
+
+
+def test_live_scan_frame_source_uses_authoritative_reloaded_wavelength(tmp_path):
+    scan = LiveScan(
+        "scan",
+        data_file=str(tmp_path / "scan.nxs"),
+        mg_args={"wavelength": 1e-10},
+    )
+    scan._persisted_wavelength_m = 1e-10
+    scan.frames[1] = LiveFrame(idx=1, map_raw=np.ones((2, 2)), poni=_poni())
+
+    source = LiveScanFrameSource(scan)
+
+    assert source.wavelength == pytest.approx(1.0)
 
 
 def test_plan_from_live_scan_preserves_gi_submodes(tmp_path):

@@ -799,7 +799,7 @@ def test_nexus_viewer_metadata_row_clears_both(widget):
 # cake_image owns the 2D-unit (imageUnit) Q↔2θ conversion, so the cake unit is
 # consistent on every render and the toggle re-renders through the payload.
 
-def _set_int_scan(w, *, n=1, wavelength_m=1.0e-10):
+def _set_int_scan(w, *, n=1, wavelength_m=0.7293e-10):
     """Populate the real widget for an Int 2D scan: data_2d + data_1d +
     publications + a scan stub, selected, in Int 2D mode (non-GI, q-integrated)."""
     import threading

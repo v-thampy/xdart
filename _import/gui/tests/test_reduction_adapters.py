@@ -259,7 +259,7 @@ def test_scan_from_live_scan_uses_scan_frame_names() -> None:
         "scan42",
         frames=[a2, a1],
         scan_data=pd.DataFrame({"th": [1.0, 2.0]}, index=[1, 2]),
-        mg_args={"wavelength": 1e-10},
+        mg_args={"wavelength": 0.7293e-10},
         data_file="scan42.nxs",
     )
 
@@ -268,9 +268,22 @@ def test_scan_from_live_scan_uses_scan_frame_names() -> None:
     assert scan.name == "scan42"
     assert [f.index for f in scan.frames] == [1, 2]
     assert scan.poni == _poni()
-    assert scan.wavelength == 1.0
+    assert scan.wavelength == pytest.approx(0.7293)
     np.testing.assert_allclose(scan.motors["th"], [1.0, 2.0])
     assert scan.output_path.name == "scan42.nxs"
+
+
+def test_scan_from_live_scan_uses_authoritative_reloaded_wavelength() -> None:
+    live = LiveScan(
+        "scan42",
+        frames=[LiveFrame(idx=1, map_raw=np.ones((2, 2)), poni=_poni())],
+        mg_args={"wavelength": 1e-10},
+    )
+    live._persisted_wavelength_m = 1e-10
+
+    scan = scan_from_live_scan(live)
+
+    assert scan.wavelength == pytest.approx(1.0)
 
 
 def test_scan_from_live_scan_fills_frame_metadata_from_scan_data() -> None:

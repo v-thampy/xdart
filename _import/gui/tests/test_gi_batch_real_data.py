@@ -163,7 +163,7 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     # BLOCKER 1: the streaming dispatcher runs the whole-scan GI grid pre-pass;
     # bind it + its helpers.  With no source attrs on this rig, _enumerate_scan_files
     # returns [] so the pre-pass is a no-op (the chunk-local freeze is unchanged).
-    for _m in ("_gi_freeze_whole_scan_prepass", "_gi_whole_scan_scout_entries",
+    for _m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
                "_enumerate_scan_files"):
         setattr(w, _m, MethodType(getattr(imageThread, _m), w))
     w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
@@ -1055,7 +1055,7 @@ def test_gi_prepass_fails_closed_on_unestablishable_range():
         get_background=lambda *a, **k: 0.0, command="",
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
-    for m in ("_gi_freeze_whole_scan_prepass", "_gi_whole_scan_scout_entries",
+    for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
               "_enumerate_scan_files", "_abort_gi_prepass", "_batch_execution"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
     w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
@@ -1093,7 +1093,7 @@ def test_gi_prepass_fails_closed_on_image_directory_source():
         command="",
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
-    for m in ("_gi_freeze_whole_scan_prepass", "_gi_whole_scan_scout_entries",
+    for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
               "_enumerate_scan_files", "_abort_gi_prepass", "_batch_execution"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
     w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
@@ -1104,6 +1104,84 @@ def test_gi_prepass_fails_closed_on_image_directory_source():
 
     # Orchestrator fails CLOSED: returns False, stops the run, warns loud.
     proceed = w._gi_freeze_whole_scan_prepass(SimpleNamespace())
+    assert proceed is False
+    assert w.command == "stop"
+    assert emitted and "GI batch aborted" in emitted[-1]
+    assert getattr(w, "_gi_prepass_scan_id", None) is None
+
+
+def _pinned_prepass_holder(emitted):
+    from types import SimpleNamespace, MethodType
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    w = SimpleNamespace(
+        gi=True, batch_mode=True, batch_execution="streaming",
+        incidence_motor="th", inp_type="Image Directory",
+        img_file="/data/scan_0001.tif", img_dir="/data", scan_name="scan",
+        img_ext="tif", meta_ext="txt", meta_dir="/data",
+        xye_only=False, command="",
+        showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
+    )
+    for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned",
+              "_abort_gi_prepass", "_batch_execution"):
+        setattr(w, m, MethodType(getattr(imageThread, m), w))
+
+    def _no_scout(scan):
+        raise AssertionError(
+            "scout sweep must not run when all GI ranges are pinned")
+    w._gi_whole_scan_scout_entries = _no_scout
+    return w
+
+
+def test_gi_prepass_skips_scout_when_ranges_fully_pinned():
+    """T0-3: with explicit 1D + 2D GI output ranges the freeze functions
+    self-skip, so there is no auto grid to chunk-clip — an 'unverifiable'
+    source (Image-Directory, varying motor) must proceed, not abort, and the
+    whole-scan scout sweep must not even run."""
+    from types import SimpleNamespace
+    from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
+
+    emitted = []
+    w = _pinned_prepass_holder(emitted)
+    key_1d = gi_1d_output_axis_key("q_total")
+    scan = SimpleNamespace(
+        bai_1d_args={"gi_mode_1d": "q_total", key_1d: (0.0, 5.0)},
+        bai_2d_args={"gi_mode_2d": "qip_qoop",
+                     "x_range": (-10.0, 10.0), "y_range": (0.0, 5.0)},
+        skip_2d=False,
+    )
+
+    proceed = w._gi_freeze_whole_scan_prepass(scan)
+
+    assert proceed is True
+    assert w.command == ""                       # no abort
+    assert not emitted
+    assert w._gi_prepass_scan_id == id(scan)     # decided for this scan
+
+
+def test_gi_prepass_still_aborts_when_ranges_partially_pinned():
+    """T0-3 counterpart: ONE missing range key means an auto freeze would still
+    run somewhere, so the unverifiable-source abort must still fire."""
+    from types import SimpleNamespace, MethodType
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
+
+    emitted = []
+    w = _pinned_prepass_holder(emitted)
+    # Restore the real scout path (the holder's raises) + its dependencies:
+    # Image-Directory + non-fixed motor -> "unverifiable".
+    for m in ("_gi_whole_scan_scout_entries", "_enumerate_scan_files"):
+        setattr(w, m, MethodType(getattr(imageThread, m), w))
+    key_1d = gi_1d_output_axis_key("q_total")
+    scan = SimpleNamespace(
+        bai_1d_args={"gi_mode_1d": "q_total", key_1d: (0.0, 5.0)},
+        bai_2d_args={"gi_mode_2d": "qip_qoop",
+                     "x_range": (-10.0, 10.0), "y_range": None},  # one unpinned
+        skip_2d=False,
+    )
+
+    proceed = w._gi_freeze_whole_scan_prepass(scan)
+
     assert proceed is False
     assert w.command == "stop"
     assert emitted and "GI batch aborted" in emitted[-1]
@@ -1124,7 +1202,7 @@ def test_gi_prepass_fails_closed_on_degenerate_scout_freeze():
         gi=True, batch_mode=True, batch_execution="streaming", command="",
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
-    for m in ("_gi_freeze_whole_scan_prepass", "_abort_gi_prepass", "_batch_execution"):
+    for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_abort_gi_prepass", "_batch_execution"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
     # The scout resolves two extremes ("freeze"), but the production freeze hits
     # a blank scout cake and raises GIFreezeError.
@@ -1191,7 +1269,7 @@ def test_gi_streaming_multichunk_later_chunk_uses_whole_scan_grid():
     w._close_reduction_session = MethodType(
         wranglerThread._close_reduction_session, w)
     for meth in ("_dispatch_batch_streaming", "_get_streaming_session",
-                 "_gi_freeze_whole_scan_prepass", "_gi_whole_scan_scout_entries",
+                 "_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
                  "_enumerate_scan_files", "_abort_gi_prepass", "_wait_if_paused"):
         setattr(w, meth, MethodType(getattr(imageThread, meth), w))
     w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta

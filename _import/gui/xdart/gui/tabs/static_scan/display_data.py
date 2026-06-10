@@ -19,6 +19,7 @@ import numpy as np
 from pathlib import Path
 
 from .display_logic import RawSource, choose_raw_source, sentinel_mask
+from xdart.modules.wavelength import normalize_wavelength_m, wavelength_angstrom_to_m
 
 logger = logging.getLogger(__name__)
 
@@ -669,8 +670,8 @@ class DisplayDataMixin:
 
         Tries several sources in order:
         1. ``frame.integrator.wavelength`` (available during live processing)
-        2. ``self.scan.mg_args['wavelength']`` (persisted in NXS)
-        3. The calibration group in the HDF5 file
+        2. ``self.scan.mg_args['wavelength']`` when it is a real value
+        3. ``/entry/instrument/source/wavelength_A`` in the HDF5 file
 
         Returns None if the wavelength cannot be determined.
         """
@@ -678,23 +679,47 @@ class DisplayDataMixin:
         if frame is not None:
             ai = getattr(frame, 'integrator', None)
             wl = getattr(ai, 'wavelength', None) if ai else None
-            if wl and wl > 0:
+            wl = normalize_wavelength_m(wl, allow_default_sentinel=True)
+            if wl is not None:
+                return wl
+            poni = getattr(frame, 'poni', None)
+            wl = normalize_wavelength_m(
+                getattr(poni, 'wavelength', None),
+                allow_default_sentinel=True,
+            )
+            if wl is not None:
                 return wl
 
-        # 2. From scan.mg_args (loaded when NXS is opened)
-        wl = self.scan.mg_args.get('wavelength', None) if hasattr(self.scan, 'mg_args') else None
-        if wl and wl > 0:
+        # 2. From scan.mg_args (loaded when NXS is opened). Reject the
+        # historical 1e-10 m constructor sentinel rather than using it for
+        # Q↔2θ conversion.
+        scan = getattr(self, 'scan', None)
+        persisted_wl = normalize_wavelength_m(
+            getattr(scan, '_persisted_wavelength_m', None),
+            allow_default_sentinel=True,
+        )
+        if persisted_wl is not None:
+            return persisted_wl
+        mg_args = getattr(scan, 'mg_args', None)
+        wl = mg_args.get('wavelength', None) if isinstance(mg_args, dict) else None
+        wl = normalize_wavelength_m(wl)
+        if wl is not None:
             return wl
 
-        # 3. Read from the HDF5 calibration group
+        # 3. Read the writer's actual v2 NeXus wavelength stamp.
+        data_file = getattr(scan, 'data_file', None)
+        if not data_file:
+            return None
         try:
             import h5py
-            with h5py.File(self.scan.data_file, 'r') as f:
-                wl = float(f['entry/calibration/wavelength'][()]) # type: ignore
-                if wl > 0:
+            with h5py.File(data_file, 'r') as f:
+                wl = wavelength_angstrom_to_m(
+                    f['entry/instrument/source/wavelength_A'][()] # type: ignore
+                )
+                if wl is not None:
                     return wl
         except Exception:
-            logger.debug("Failed to read wavelength from HDF5 calibration group in %s", self.scan.data_file, exc_info=True)
+            logger.debug("Failed to read wavelength from HDF5 instrument/source group in %s", data_file, exc_info=True)
 
         return None
 
