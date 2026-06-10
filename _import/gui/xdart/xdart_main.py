@@ -75,7 +75,14 @@ def _ssrl_capabilities_ok():
         from ssrl_xrd_tools.reduction import ReductionSession
         return ("join_timeout" in inspect.signature(
                     ReductionSession.finish).parameters
-                and hasattr(ReductionSession, "drain"))
+                and hasattr(ReductionSession, "drain")
+                # 0.41.0 symbols — without these the probe approves a checkout
+                # that crashes at every session open (open_live_reduction_session
+                # passes retain_products= unguarded).  Keep this list in sync
+                # with the NEWEST load-bearing ssrl APIs xdart calls.
+                and "retain_products" in inspect.signature(
+                    ReductionSession).parameters
+                and hasattr(ReductionSession, "release_products"))
     except Exception:
         return False
 

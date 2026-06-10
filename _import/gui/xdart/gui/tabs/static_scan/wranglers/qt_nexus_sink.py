@@ -172,7 +172,13 @@ class QtNexusSink:
         if live is None and idx in self._scan.frames.index:
             live = self._scan.frames[idx]
         if live is None:
-            return
+            # Fail LOUD (same contract as write()): a re-fed index whose
+            # LiveFrame is in neither the registry nor the scan means the
+            # ORIGINAL write failed — silently returning would drop the
+            # frame's data while the session counts it processed.
+            raise RuntimeError(
+                f"QtNexusSink.replace: no LiveFrame for re-fed index {idx} "
+                f"(original write likely failed)")
         self._hydrate(live, frame, reduction)
         if not self._host.xye_only:
             self._add_frame(live)

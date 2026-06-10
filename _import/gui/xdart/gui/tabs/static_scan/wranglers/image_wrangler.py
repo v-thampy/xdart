@@ -952,6 +952,16 @@ class imageWrangler(wranglerWidget):
         if not self._inputs_valid():
             return
         self.command = 'start'
+        # M2: Stop morphs the button back to green immediately, but the worker
+        # can take seconds to unwind (final flush, bounded writer join).  A
+        # Start click in that window must NOT revive the old run — setting
+        # command='start' un-stops a loop that hasn't observed 'stop' yet,
+        # while thread.start() on a running QThread is a no-op, and setup()
+        # would mutate the LIVE worker's config mid-run.
+        if getattr(self.thread, 'isRunning', lambda: False)():
+            self._set_status_text(
+                'Previous run is still stopping — try again in a moment.')
+            return
         self.thread.command = 'start'
         self.ui.stopButton.setEnabled(True)
         self._set_action_button('running')   # morph green Start -> orange Pause
