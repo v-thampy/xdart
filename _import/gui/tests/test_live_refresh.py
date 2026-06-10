@@ -4066,3 +4066,30 @@ def test_real_wrangler_run_lock_disables_tree_and_keeps_values():
         assert ui.processingModeCombo.isEnabled() is True
         for p, val in bool_before:
             assert p.value() == val, f"{cls.__name__}: bool {p.name()} value changed after restore"
+
+
+def test_integration_view_image_applies_mask_and_threshold():
+    """The Int-1D 'Show Image' preview must show the image AS INTEGRATED:
+    detector/global mask (flat indices) and the run's intensity threshold
+    rendered as NaN, like the worker's _apply_threshold_inline.  (The Image
+    Viewer mode deliberately bypasses this helper.)"""
+    import numpy as np
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+
+    thumb = np.arange(16, dtype=np.float32).reshape(4, 4)
+    scan = SimpleNamespace(
+        global_mask=np.array([0, 5]),          # flat indices
+        apply_threshold=True, threshold_min=2.0, threshold_max=12.0,
+    )
+    img = displayFrameWidget.integration_view_image(thumb, scan)
+
+    assert np.isnan(img.ravel()[0]) and np.isnan(img.ravel()[5])   # mask
+    assert np.isnan(img.ravel()[1])                                # < min
+    assert np.isnan(img.ravel()[15])                               # > max
+    assert img.ravel()[7] == 7.0                                   # in-band kept
+    assert thumb.ravel()[0] == 0.0                                 # input untouched
+
+    # Threshold off, no mask: pass-through (Image Viewer semantics).
+    img2 = displayFrameWidget.integration_view_image(
+        thumb, SimpleNamespace(global_mask=None, apply_threshold=False))
+    assert np.isfinite(img2).all()

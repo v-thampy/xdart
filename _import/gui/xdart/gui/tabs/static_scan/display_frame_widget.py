@@ -1867,6 +1867,33 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     # ── Image preview dialog ──────────────────────────────────────
 
+    @staticmethod
+    def integration_view_image(thumb, scan):
+        """Return the raw image AS THE INTEGRATION SAW IT.
+
+        Applies the detector/global mask and the run's intensity threshold
+        as NaN (pgImageWidget renders NaN transparent), mirroring
+        ``_resolve_frame_mask`` + ``_apply_threshold_inline`` on the worker.
+        The Image Viewer mode deliberately does NOT use this -- it shows the
+        untouched raw image."""
+        img = np.asarray(thumb, dtype=np.float32).copy()
+        gm = getattr(scan, 'global_mask', None)
+        if gm is not None:
+            try:
+                flat = np.asarray(gm).ravel().astype(np.int64)
+                ok = (flat >= 0) & (flat < img.size)
+                img.ravel()[flat[ok]] = np.nan
+            except Exception:
+                logger.debug("preview mask apply failed", exc_info=True)
+        if bool(getattr(scan, 'apply_threshold', False)):
+            try:
+                tmin = float(getattr(scan, 'threshold_min', 0) or 0)
+                tmax = float(getattr(scan, 'threshold_max', 0) or 0)
+                img[(img < tmin) | (img > tmax)] = np.nan
+            except Exception:
+                logger.debug("preview threshold apply failed", exc_info=True)
+        return img
+
     def _show_image_preview(self):
         """Open a popup dialog showing the raw image thumbnail for the
         currently selected frame."""
@@ -1933,11 +1960,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     f'No image data available for frame {idx}.')
             return
 
-        # Display with correct orientation: transpose and flip vertically
-        self._image_preview_widget.setImage(
-            thumb.T[:, ::-1],
-            autoRange=True,
-            autoLevels=True,
-        )
+        # Show the image AS INTEGRATED (mask + threshold as NaN), through the
+        # standard pgImageWidget path so the (2, 98) nanpercentile levels
+        # apply -- the old autoLevels=True kwarg rode into pyqtgraph and
+        # OVERRODE them with min/max, so the Eiger gap values (~4e9) washed
+        # everything else out.
+        img = displayFrameWidget.integration_view_image(
+            thumb, getattr(self, 'scan', None))
+        # Correct orientation: transpose and flip vertically.
+        self._image_preview_widget.setImage(img.T[:, ::-1])
         self._image_preview_dialog.setWindowTitle(
             f'Raw Image Preview \u2014 Frame {idx}')

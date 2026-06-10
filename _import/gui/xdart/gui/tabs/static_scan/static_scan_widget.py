@@ -1182,6 +1182,13 @@ class staticWidget(QWidget):
                                 'mask', None)
         if wrangler_mask is not None:
             self.scan.global_mask = wrangler_mask
+        # Also carry the run's intensity-threshold settings so the raw-image
+        # preview can show the image AS INTEGRATED (mask + threshold).
+        for _attr in ('apply_threshold', 'threshold_min', 'threshold_max'):
+            try:
+                setattr(self.scan, _attr, getattr(self.wrangler, _attr))
+            except Exception:
+                pass
 
         self.integratorTree.get_args('bai_1d')
         self.integratorTree.get_args('bai_2d')
