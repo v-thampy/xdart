@@ -212,7 +212,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.frame_5.setMinimumSize(Qt.QtCore.QSize(0, 0))
             self.ui.frame_5.setMaximumSize(
                 Qt.QtCore.QSize(16777215, 34))
-            _lay = _f.layout()
+            _lay = self.ui.frame_5.layout()
             if _lay is not None:
                 for _i in range(_lay.count()):
                     _cw = _lay.itemAt(_i).widget()
@@ -1185,12 +1185,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def update_views(self):
         """Updates 2D (if flag is selected) and 1D views
         """
-        if not self._updated():
-            return True
-
+        # Refresh the render-style caches BEFORE the no-new-data gate: a Log
+        # toggle / colormap change with nothing loaded yet must still apply
+        # to the FIRST real render (the gate otherwise left self.scale
+        # stale at 'Linear' while the button showed checked).
         self.cmap = self.ui.cmap.currentText()
         self.plotMethod = self.ui.plotMethod.currentText()
         self.scale = self.ui.scale.currentText()
+
+        if not self._updated():
+            return True
 
         if self.viewer_mode is not None:
             # Viewer modes render through the payload path (_draw_image_payload /
@@ -1960,9 +1964,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # geometry table.  The Linear/Log scale + colormap apply to the raw
             # image, so make sure both are shown/enabled (cmap may have been
             # hidden by a prior XYE-viewer visit).
-            # cmap lives in the Options dialog now -- setVisible(True) on a
-            # PARENTLESS widget floats it as a top-level window (the stray
-            # 'Default' popup on entering Image Viewer).
+            # cmap is back in the top bar (always parented), but keep the
+            # guard: setVisible(True) on a PARENTLESS widget floats it as a
+            # top-level window (the stray 'Default' popup bug).
             if self.ui.cmap.parent() is not None:
                 self.ui.cmap.setVisible(True)
             self.ui.cmap.setEnabled(True)

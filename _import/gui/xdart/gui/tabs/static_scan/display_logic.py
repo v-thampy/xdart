@@ -190,8 +190,8 @@ PANEL_LAYOUT = {
     ),
     # XYE Viewer: 1D overlay only; 2D container hidden, middle bar kept
     # (Single/Options/Legend/Clear), process controls hidden.  frame_6 kept so
-    # the Linear/Log scale applies to the 1D plot (cmap is hidden separately —
-    # it's 2D-only).
+    # the Log toggle applies to the 1D plot and the colormap stays available
+    # (the XYE waterfall image uses it).
     Mode.XYE_VIEWER: PanelLayout(
         frame_top_vis=True, twoDWindow_vis=False, imageToolbar_vis=True,
         frame_4_vis=False, frame_6_vis=True, plotToolBar_vis=False,
