@@ -101,6 +101,10 @@ class FrameViewReader:
     def __enter__(self) -> "FrameViewReader":
         self._h5 = h5py.File(self.path, "r")
         self._entry = _entry(self._h5, self.entry_name)
+        # C1: surface a newer-than-supported schema before any dataset access
+        # fails with an opaque KeyError.
+        from ssrl_xrd_tools.io.nexus import warn_if_newer_schema
+        warn_if_newer_schema(self._entry, str(self.path))
         # N1: the project root the relative source paths point under (None on old
         # absolute-path files; harmless there).
         self._source_base = (

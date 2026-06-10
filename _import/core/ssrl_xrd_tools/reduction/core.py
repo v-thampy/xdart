@@ -851,6 +851,16 @@ class ReductionSession:
     # ``None`` → 2× the pool's worker count.  This bounds peak memory and stops
     # the reader starving the pool.
     inflight_max: int | None = None
+    # S2: whether completed FrameReduction objects (including full 2D arrays)
+    # are retained in ``self._products`` for the session's lifetime.  True
+    # (default) preserves the historical contract (``result.frames`` holds
+    # every reduction — what headless run_reduction() callers consume).
+    # False bounds memory for sink-driven runs where the data already lands
+    # on disk per frame: ~1.4 MB/frame of 2D cake → ~14 GB retained on a
+    # 10k-frame scan.  With False, ``result.frames`` is EMPTY — read results
+    # back from the sink's output.  Replace/re-feed detection is tracked
+    # independently (``_seen_idxs``), so A1 idempotency is unaffected.
+    retain_products: bool = True
     scan: Scan = field(init=False)
     result: ReductionResult | None = field(default=None, init=False)
     integrator_provider_builds: int = field(default=0, init=False)
@@ -862,6 +872,7 @@ class ReductionSession:
         default_factory=dict, init=False, repr=False,
     )
     _products: dict[int, FrameReduction] = field(default_factory=dict, init=False, repr=False)
+    _seen_idxs: set[int] = field(default_factory=set, init=False, repr=False)
     _completed: int = field(default=0, init=False, repr=False)
     _cancelled: bool = field(default=False, init=False, repr=False)
     _failure: BaseException | None = field(default=None, init=False, repr=False)
@@ -1118,8 +1129,10 @@ class ReductionSession:
                     continue
                 try:
                     idx = int(frame.index)
-                    replacing = idx in self._products
-                    self._products[idx] = reduction
+                    replacing = idx in self._seen_idxs
+                    self._seen_idxs.add(idx)
+                    if self.retain_products:
+                        self._products[idx] = reduction
                     if replacing:
                         _emit_sink_replace(self._sink, frame, reduction)
                     else:
@@ -1471,8 +1484,10 @@ class ReductionSession:
             # product, re-emit to the sink as a replace where supported, and do
             # not double-count progress -- ``n_processed`` must never exceed the
             # number of distinct frames in the scan.
-            replacing = idx in self._products
-            self._products[idx] = reduction
+            replacing = idx in self._seen_idxs
+            self._seen_idxs.add(idx)
+            if self.retain_products:
+                self._products[idx] = reduction
             if replacing:
                 _emit_sink_replace(self._sink, frame, reduction)
             else:
@@ -2248,6 +2263,11 @@ def _combined_mask(
     return plan_mask | frame_mask
 
 
+# S8: monitor keys already warned about (once per key per process) — a bad
+# monitor means frames are written UN-normalized, which must not be silent.
+_warned_monitor_keys: set[str] = set()
+
+
 def _normalization_for(
     frame: Frame,
     plan: Integration1DPlan | Integration2DPlan,
@@ -2264,9 +2284,20 @@ def _normalization_for(
         try:
             norm = float(value)
         except (TypeError, ValueError):
-            return None
-        if np.isfinite(norm) and norm != 0:
+            norm = None
+        if norm is not None and np.isfinite(norm) and norm != 0:
             return norm
+        # S8: the monitor was configured but unusable — the frame is about to
+        # be written UN-normalized.  Warn once per monitor key (not per frame:
+        # a dead monitor on a 10k-frame scan must not emit 10k warnings).
+        if key not in _warned_monitor_keys:
+            _warned_monitor_keys.add(key)
+            warnings.warn(
+                f"monitor {key!r} is missing/zero/non-finite on frame "
+                f"{frame.index} (value={value!r}); affected frames are "
+                f"written UN-normalized.  (Warned once per monitor key.)",
+                RuntimeWarning, stacklevel=2,
+            )
     return None
 
 

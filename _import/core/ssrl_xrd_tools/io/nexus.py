@@ -31,6 +31,7 @@ Performance features:
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -47,6 +48,28 @@ logger = logging.getLogger(__name__)
 PROCESSED_SCHEMA_NAME = "ssrl_xrd_tools.processed_scan"
 PROCESSED_SCHEMA_VERSION = 2
 _UTF8_DTYPE = h5py.string_dtype(encoding="utf-8")
+
+
+def warn_if_newer_schema(entry_grp, path="") -> None:
+    """C1: warn when a file's ``ssrl_schema_version`` is NEWER than this
+    library supports.
+
+    The writer stamps the version on every file; until now no reader ever
+    looked at it, so a v3 file hit today's readers with opaque downstream
+    KeyErrors or silently missing features.  Absent/old stamps pass silently
+    (back-compat); only a newer stamp warns."""
+    try:
+        ver = int(entry_grp.attrs.get(
+            "ssrl_schema_version", PROCESSED_SCHEMA_VERSION))
+    except (TypeError, ValueError):
+        return
+    if ver > PROCESSED_SCHEMA_VERSION:
+        warnings.warn(
+            f"{path or 'file'} has ssrl_schema_version={ver}, newer than the "
+            f"supported {PROCESSED_SCHEMA_VERSION} — upgrade ssrl_xrd_tools; "
+            f"some datasets/features may be missing or misread.",
+            RuntimeWarning, stacklevel=3,
+        )
 
 # Datasets that are counters/scalers rather than motor angles.
 _DEFAULT_COUNTER_NAMES: frozenset[str] = frozenset(
@@ -737,9 +760,20 @@ def open_nexus_writer(
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
-    file_kwargs: dict[str, Any] = {}
+    # S6: SWMR-write is advertised but not functional — HDF5 forbids object
+    # creation in SWMR-write mode, and this writer creates the integrated
+    # stacks on the FIRST frame append, so enabling it here guaranteed a
+    # failure on the first write.  Refuse loudly until the writer pre-creates
+    # every dataset before flipping swmr_mode.
     if swmr:
-        file_kwargs["libver"] = "latest"
+        raise NotImplementedError(
+            "open_nexus_writer(swmr=True) is not functional: the integrated "
+            "stacks are created on the first frame append, which HDF5 forbids "
+            "in SWMR-write mode.  Open without swmr (readers already tolerate "
+            "concurrent reads via the retrying open helpers)."
+        )
+
+    file_kwargs: dict[str, Any] = {}
 
     mode = "w" if overwrite else "a"
     f = h5py.File(p, mode, **file_kwargs)
@@ -756,9 +790,6 @@ def open_nexus_writer(
     proc = grp.require_group("reduction")
     proc.attrs["NX_class"] = "NXprocess"
     proc.attrs.setdefault("program", "ssrl_xrd_tools")
-
-    if swmr:
-        f.swmr_mode = True
 
     return f
 
@@ -2142,6 +2173,7 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
         if entry not in f:
             raise KeyError(f"No {entry!r} group in {path}")
         e = f[entry]
+        warn_if_newer_schema(e, str(path))
 
         if "1d" in groups and "integrated_1d" in e:
             g1 = e["integrated_1d"]
@@ -2350,6 +2382,7 @@ def read_scan_metadata(
         if entry not in f:
             raise KeyError(f"No {entry!r} group in {path}")
         e = f[entry]
+        warn_if_newer_schema(e, str(path))
 
         # frame_index — try integrated_1d first, then integrated_2d,
         # then per_frame_geometry.  Cheap; no intensity is loaded.
