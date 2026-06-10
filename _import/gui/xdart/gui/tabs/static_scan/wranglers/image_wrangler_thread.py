@@ -1590,12 +1590,22 @@ class imageThread(wranglerThread):
         session, sink = self._get_streaming_session(scan, frames)
         if session is None:
             return 0
-        self.showLabel.emit(f'Streaming {len(frames)} images...')
         count = 0
         for live in frames:
             self._wait_if_paused()        # pause between frames (streaming path)
             if self.command == 'stop':
                 break
+            # Per-frame status (replaces the debug-era 'Streaming N images...'):
+            # 'Processing <name>' for per-file sources, 'Processing <master>
+            # #<frame>' for multi-frame (Eiger) sources.  Filename middle-
+            # truncated to <=30 chars; the #frame suffix stays visible.
+            src = str(getattr(live, 'source_file', '') or '')
+            name = self._middle_truncate(os.path.basename(src), max_len=30)
+            if not name:
+                name = f'frame {live.idx}'
+            elif _raw_lives_in_source(src):
+                name = f'{name} #{live.idx}'
+            self.showLabel.emit(f'Processing {name}')
             sink.register(live)
             session.submit(frame_from_live_frame(live))
             count += 1
