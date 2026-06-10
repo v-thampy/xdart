@@ -1122,14 +1122,15 @@ class imageThread(wranglerThread):
         except Exception as exc:
             # T0-4 warn-and-proceed: a scout failure means we lose the union
             # sweep, not correctness — the first-chunk freeze is acceptable.
-            self._warn_gi_first_chunk_freeze(f"scout pre-pass raised ({exc})")
+            self._warn_gi_first_chunk_freeze(
+                f"scout pre-pass raised ({exc})", scan)
             self._gi_prepass_scan_id = id(scan)
             return True
         if status == "abort":
             # Sweep ran but couldn't read enough incidences from metadata.
             self._warn_gi_first_chunk_freeze(
                 "could not establish the whole-scan incidence range from "
-                "frame metadata")
+                "frame metadata", scan)
             self._gi_prepass_scan_id = id(scan)
             return True
         if status == "unverifiable":
@@ -1144,7 +1145,7 @@ class imageThread(wranglerThread):
                        else "this source"))
             self._warn_gi_first_chunk_freeze(
                 f"the whole-scan incidence range cannot be swept up front for "
-                f"'{source}'")
+                f"'{source}'", scan)
             self._gi_prepass_scan_id = id(scan)
             return True
         if status == "freeze":
@@ -1165,19 +1166,30 @@ class imageThread(wranglerThread):
         self._gi_prepass_scan_id = id(scan)   # latch only after success
         return True
 
-    def _warn_gi_first_chunk_freeze(self, reason: str) -> None:
+    def _warn_gi_first_chunk_freeze(self, reason: str, scan=None) -> None:
         """T0-4 warn-and-proceed advisory: the GI output grid will be frozen
         from the first frames instead of the whole-scan incidence union.
         Values inside the grid are exact (frames bin natively onto it); only
         extreme-incidence tails beyond it are cropped — accepted at the
         beamline (incidence varies too little to matter).  One per scan: the
-        prepass latches the scan id right after this fires."""
+        prepass latches the scan id right after this fires.
+
+        When ``scan`` is given the advisory is also stamped onto it
+        (``gi_freeze_diagnostic``) so the writer persists it in
+        ``/entry/reduction/config`` — the disclosure survives in the output
+        file, not just as a transient GUI label."""
         msg = (
             'GI: ' + reason + ' — output grid will be frozen from the first '
             'frames; extreme-incidence tails beyond it are cropped (values '
             'inside are exact). Set explicit 1D/2D output ranges for full '
             'coverage.')
         logger.warning(msg)
+        if scan is not None:
+            try:
+                scan.gi_freeze_diagnostic = msg
+            except Exception:
+                logger.debug("could not stamp gi_freeze_diagnostic",
+                             exc_info=True)
         try:
             self.showLabel.emit(msg)
         except Exception:
@@ -1566,9 +1578,10 @@ class imageThread(wranglerThread):
         )
         # BLOCKER 1: freeze the GI common grid from the WHOLE scan's incidence
         # range before the session opens (no-op on chunks 2..N via the scan-id
-        # guard; no-op for non-GI / fixed-incidence / Eiger-single-master).
-        # Fails CLOSED: an unestablishable global range aborts the run loud
-        # rather than silently integrate onto the chunk-1 grid.
+        # guard; no-op for non-GI / fixed-incidence sources).  T0-4 policy:
+        # an unverifiable/unestablishable range WARNS and proceeds on the
+        # first-chunk freeze (diagnostic persisted in provenance); only a
+        # freeze that actually errors aborts the run.
         if not self._gi_freeze_whole_scan_prepass(scan):
             return 0
         frames = self._build_batch_frames(scan, pending)

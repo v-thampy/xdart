@@ -81,11 +81,16 @@ class QtNexusSink:
     def write(self, frame, reduction) -> None:
         live = self._registry.pop(int(frame.index), None)
         if live is None:
-            logger.error(
-                "QtNexusSink.write: no LiveFrame registered for index %s",
-                int(frame.index),
+            # Fail LOUD (BLOCKER-2 discipline): silently returning here made
+            # the session count the frame as successfully written while its
+            # data never reached the .nxs or the display.  Raising routes
+            # through the writer loop's failure recording -> finish() reports
+            # the run failed.
+            raise RuntimeError(
+                f"QtNexusSink.write: no LiveFrame registered for index "
+                f"{int(frame.index)} — the wrangler must register() every "
+                f"frame before submitting it"
             )
-            return
         self._hydrate(live, frame, reduction)
         self._stash_and_buffer(live)
         self._published.add(int(live.idx))

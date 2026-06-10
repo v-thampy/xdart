@@ -910,3 +910,37 @@ def test_open_live_reduction_session_retention_policy() -> None:
     streaming_no_sink = open_live_reduction_session(
         [frame], plan, scan_name="s", execution="streaming")
     assert streaming_no_sink.retain_products is True
+
+
+def test_persistent_session_does_not_accumulate_products(monkeypatch) -> None:
+    """S2 (serial flavor): the true-live per-frame path reuses ONE chunked
+    session for the whole watch run; reduce_live_frames must release each
+    call's harvested reductions so the session stays O(chunk), not O(scan)
+    (full 2D arrays otherwise accumulate for hours)."""
+    from xdart.modules.reduction import open_live_reduction_session
+
+    monkeypatch.setattr(
+        reduction_adapters, "run_reduction", None)  # must not be used here
+
+    def _mk(idx):
+        return LiveFrame(idx=idx, map_raw=np.full((2, 2), float(idx + 1)),
+                         poni=_poni())
+
+    plan = ReductionPlan(integration_2d=None)
+    session = open_live_reduction_session([_mk(0)], plan, scan_name="s")
+
+    import ssrl_xrd_tools.reduction.core as ssrl_core
+
+    def _fake_1d(image, ai, **kw):
+        v = float(np.sum(image))
+        return IntegrationResult1D(
+            radial=np.array([0.0, 1.0]),
+            intensity=np.array([v, v + 1.0]), sigma=None, unit="q_A^-1")
+
+    monkeypatch.setattr(ssrl_core, "integrate_1d", _fake_1d)
+
+    for idx in range(3):                       # three per-frame calls
+        out = reduce_live_frames([_mk(idx)], plan, scan_name="s",
+                                 session=session)
+        assert len(out) == 1 and out[0].int_1d is not None
+        assert session.frames == {}            # released after each harvest

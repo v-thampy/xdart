@@ -349,6 +349,16 @@ def reduce_live_frames(
         live_frame.int_2d = reduction.result_2d
         live_frame.map_norm = _frame_norm(headless_frame, active_plan)
         reduced_frames.append(live_frame)
+    if session is not None:
+        # S2 (serial flavor): a PERSISTENT session reused across a long
+        # true-live watch run retains every harvested FrameReduction (full 2D
+        # arrays) in session.frames — release the ones this call just copied
+        # onto the LiveFrames so the session stays O(chunk), not O(scan).
+        # getattr: older ssrl builds lack release_products (capability probe
+        # covers the floor; harmless to skip there).
+        release = getattr(session, "release_products", None)
+        if callable(release):
+            release(int(f.index) for f in headless_frames)
     return reduced_frames
 
 

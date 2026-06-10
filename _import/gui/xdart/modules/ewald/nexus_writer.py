@@ -365,6 +365,12 @@ def _write_reduction(h5f, scan, *, entry: str) -> None:
     }
     if hasattr(scan, "gi_config") and scan.gi_config:
         config["gi_config"] = dict(scan.gi_config)
+    # T0-4 disclosure: when the GI grid was frozen from the first chunk
+    # because the whole-scan incidence range couldn't be verified, persist
+    # the advisory in the output file — not just a transient GUI label.
+    _gi_diag = getattr(scan, "gi_freeze_diagnostic", None)
+    if _gi_diag:
+        config["gi_freeze_diagnostic"] = str(_gi_diag)
 
     # Geometry: stored as a structured subgroup (handled specially in
     # write_provenance), so the convention is human-inspectable in HDF5.

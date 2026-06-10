@@ -1859,3 +1859,20 @@ def test_gi_config_roundtrips_to_reduction_config(tmp_path):
     gi = get_metadata(path)["reduction"]["config"]["gi_config"]
     assert gi["gi_mode_1d"] == "q_oop"
     assert gi["gi_mode_2d"] == "qip_qoop"
+
+
+def test_gi_freeze_diagnostic_persisted_in_provenance(tmp_path):
+    # Codex P2: the T0-4 first-chunk-freeze advisory must survive in the
+    # output file's reduction provenance, not just as a transient GUI label.
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from ssrl_xrd_tools.io.nexus import read_scan_metadata
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan.gi_freeze_diagnostic = (
+        "GI: test reason — output grid will be frozen from the first frames")
+    path = tmp_path / "gi_diag.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    ds = read_scan_metadata(path)
+    config = (ds.attrs.get("reduction") or {}).get("config") or {}
+    assert "frozen from the first frames" in config.get("gi_freeze_diagnostic", "")

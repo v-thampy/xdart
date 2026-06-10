@@ -318,3 +318,19 @@ def test_finish_and_abort_clear_unwritten_registry(tmp_path):
         getattr(sink, teardown)(result=None)
 
         assert sink._registry == {}, f"{teardown}() left frames pinned"
+
+
+def test_write_without_registration_fails_loud(tmp_path):
+    """P1b (codex pre-merge): a registry miss in write() must RAISE — silently
+    returning made the session count the frame as written while its data never
+    reached the .nxs or the display (fail-loud writer contract)."""
+    from types import SimpleNamespace
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+
+    scan = LiveScan(data_file=str(tmp_path / "unregistered.nxs"))
+    sink = QtNexusSink(_FakeHost(batch_mode=True), scan, _minimal_plan(), mask=None)
+    sink.begin(scan, _minimal_plan())
+
+    with pytest.raises(RuntimeError, match="register"):
+        sink.write(SimpleNamespace(index=7), SimpleNamespace())
