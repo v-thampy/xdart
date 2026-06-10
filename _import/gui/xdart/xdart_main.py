@@ -39,6 +39,16 @@ logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
 # warning — OpenCL is optional and the message has no user action.
 logging.getLogger('silx.opencl').setLevel(logging.ERROR)
 
+# pyqtgraph's log-axis tick painter computes 10**range while the histogram
+# axis still holds the previous LINEAR image's extent for one paint after a
+# Log toggle (e.g. Eiger counts ~4e9 -> 10**4e9).  Harmless — the inf is
+# clamped on the next paint — but it logged a RuntimeWarning on every
+# toggle.  Scoped to exactly that message and module.
+import warnings
+warnings.filterwarnings(
+    'ignore', message='overflow encountered in power',
+    category=RuntimeWarning, module=r'pyqtgraph\.graphicsItems\.AxisItem')
+
 logger = logging.getLogger(__name__)
 
 # C4: minimum compatible ssrl_xrd_tools version.  MUST equal the
