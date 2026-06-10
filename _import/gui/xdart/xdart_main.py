@@ -143,15 +143,12 @@ class Main(QMainWindow):
         self.main_widget = tabs.static_scan.staticWidget()
         self.setCentralWidget(self.main_widget)
 
-        self.show()
-        # Size to the screen (was a fixed 1600x920): at 1600 wide the right
+        # Launch MAXIMIZED (was a fixed 1600x920): at 1600 wide the right
         # panel's ~418px minimum content width overshoots its 24% share and
-        # clamps the middle display panels well below their intended 57%.
-        try:
-            avail = self.screen().availableGeometry()
-            self.resize(int(avail.width() * 0.92), int(avail.height() * 0.92))
-        except Exception:
-            self.resize(1600, 920)
+        # clamps the middle display panels below their intended 57%; a 0.92x
+        # screen fraction still read as 'same width as before'.  Maximized
+        # uses the full available screen (minus dock/menu bar).
+        self.showMaximized()
 
     def exit(self):
         try:
