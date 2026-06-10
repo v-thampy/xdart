@@ -1096,22 +1096,23 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return          # duck holders in tests / widget not fully built
         already = getattr(self, '_share_link_on', False)
         if on and not already:
-            self.plot.setXLink(None)        # never both mechanisms
-            vb.sigXRangeChanged.connect(self._mirror_cake_xrange)
             self._share_link_on = True
             try:
                 self._share_saved_margins = tuple(
                     self.plot.layout.getContentsMargins())
             except Exception:
                 self._share_saved_margins = None
+            # Immediate numeric adopt for instant feedback, then the
+            # geometric align; once the two viewboxes occupy the SAME screen
+            # span, _align engages setXLink -- at equal spans pyqtgraph's
+            # geometry-mapped link IS an exact numeric lock, and it is
+            # bidirectional (zoom either plot, both follow -- the spec).
             displayFrameWidget._mirror_cake_xrange(
-                self, vb, vb.viewRange()[0])      # adopt now
+                self, vb, vb.viewRange()[0])
+            displayFrameWidget._schedule_align(self)
         elif not on and already:
-            try:
-                vb.sigXRangeChanged.disconnect(self._mirror_cake_xrange)
-            except (TypeError, RuntimeError):
-                pass
             self._share_link_on = False
+            self.plot.setXLink(None)
             saved = getattr(self, '_share_saved_margins', None)
             if saved is not None:
                 try:
@@ -1125,11 +1126,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.plot.enableAutoRange(x=False, y=True)
             self.plot.setXRange(float(xrange[0]), float(xrange[1]),
                                 padding=0)
-            # Geometric half: line the 1D's axis area up under the cake's
-            # (deferred so tick relabeling from the new range settles first;
-            # coalesced so queued shots can't apply a stale-geometry delta
-            # twice).
-            displayFrameWidget._schedule_align(self)
         except Exception:
             logger.debug("share-axis mirror failed", exc_info=True)
 
@@ -1170,6 +1166,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             pl, pr = _gspan(plot_win, self.plot.getViewBox())
             dl, dr = cl - pl, pr - cr
             if abs(dl) <= 1.0 and abs(dr) <= 1.0:
+                # Converged: spans equal, so the native (bidirectional)
+                # XLink is now an exact numeric lock.  Engage it (idempotent)
+                # and adopt the cake's range through it.
+                self.plot.setXLink(bw.image_plot)
+                self.plot.enableAutoRange(x=False, y=True)
                 return
             lay = self.plot.layout
             ml, mt, mr, mb = lay.getContentsMargins()

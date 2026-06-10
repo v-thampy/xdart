@@ -3420,11 +3420,11 @@ def test_share_axis_maps_by_unit_not_combo_index():
     assert host.ui.shareAxis.isEnabled() is True
     # New share contract: NUMERIC one-way mirror (cake -> 1D), not setXLink
     # (which aligns by screen geometry and is bidirectional).
-    vb = host.binned_widget.image_plot.getViewBox()
     assert host._share_link_on is True
-    assert vb.connected, "cake sigXRangeChanged must drive the 1D"
     assert host.plot.xrange == (2.0, 6.0)      # adopted the cake's range
-    assert host.plot.link is None              # XLink never engaged
+    # XLink engages only after the GEOMETRIC alignment converges (real
+    # widgets); on duck holders it stays unlinked.
+    assert host.plot.link is None
 
 
 def test_share_axis_disables_when_no_matching_plot_unit():
