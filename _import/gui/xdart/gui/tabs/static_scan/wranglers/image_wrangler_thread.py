@@ -132,16 +132,18 @@ def _gi_2d_range_keys(args):
     return 'radial_range', 'azimuth_range'
 
 
-# RESTRUCTURE-TODO(B2): the GI-scout helpers below (_padded_axis_range,
+# The GI-scout cluster below (_padded_axis_range,
 # _result_intensity_all_dummy, _freeze_gi_2d_ranges_from_result,
-# _freeze_gi_1d_range_from_result) plus the scout methods on imageThread
-# (_scout_pending_frames, _build_scout, _freeze_gi_1d_auto_range,
-# _freeze_gi_2d_auto_ranges) are TEST-ONLY.  Production GI common-grid freezing
-# now lives in ssrl_xrd_tools.reduction.ReductionSession; these remain only so
-# the GI live==batch==reload equivalence tests can validate the ssrl freeze
-# against the original xdart scout (the tests bind the methods via MethodType).
-# Relocate this whole cluster to a tests/ helper module together with that test
-# refactor -- it should not sit in a production module.
+# _freeze_gi_1d_range_from_result, and the imageThread methods
+# _scout_pending_frames, _build_scout, _freeze_gi_1d_auto_range,
+# _freeze_gi_2d_auto_ranges) is LIVE PRODUCTION CODE: the streaming GI batch
+# prepass calls _freeze_gi_1d_auto_range/_freeze_gi_2d_auto_ranges in
+# _dispatch_batch_streaming to freeze the whole-scan common grid BEFORE
+# dispatch (do NOT delete it as dead).  ssrl's ReductionSession has its own
+# first-chunk freeze, which serves the serial/chunked paths; the streaming
+# prepass deliberately freezes earlier (whole pending set, not first chunk).
+# The GI live==batch==reload equivalence tests additionally bind these
+# methods via MethodType to validate the ssrl freeze against this scout.
 def _padded_axis_range(axis, pad_fraction=0.02):
     """Return a slightly padded finite range for an integrated axis.
 
