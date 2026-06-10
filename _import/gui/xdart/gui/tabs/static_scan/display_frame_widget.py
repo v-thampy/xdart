@@ -193,6 +193,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _sp = _f.sizePolicy()
             _sp.setHorizontalPolicy(QtWidgets.QSizePolicy.Policy.Maximum)
             _f.setSizePolicy(_sp)
+        # The title takes the stretch: lift labelCurrent's generated 600px
+        # maximum (capped the center on wide windows) and let it shrink
+        # small; frame_5 (its container) unconstrained likewise.
+        self.ui.labelCurrent.setMinimumSize(Qt.QtCore.QSize(0, 0))
+        self.ui.labelCurrent.setMaximumSize(
+            Qt.QtCore.QSize(16777215, 16777215))
+        if hasattr(self.ui, 'frame_5'):
+            self.ui.frame_5.setMinimumSize(Qt.QtCore.QSize(0, 0))
+            self.ui.frame_5.setMaximumSize(
+                Qt.QtCore.QSize(16777215, 34))
             _lay = _f.layout()
             if _lay is not None:
                 for _i in range(_lay.count()):
