@@ -1509,10 +1509,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         new live traces (instead of freezing and clipping a taller peak) until
         the user manually zooms."""
         try:
-            if self.ui.shareAxis.isChecked():
-                # Shared: the cake owns x.  Only refit y, never grab x back
-                # (the bidirectional link would drag the cake to the 1D's
-                # wider data range).
+            if self.viewer_mode is None and self.ui.shareAxis.isChecked():
+                # Shared (processing modes only): the cake owns x.  Only
+                # refit y, never grab x back (the bidirectional link would
+                # drag the cake to the 1D's wider data range).  Viewer modes
+                # must keep full autorange -- a checked-but-hidden Share
+                # Axis froze the XYE viewer at the old cake's x-range.
                 self.plot.enableAutoRange(x=False, y=True)
                 return
             self.plot.autoRange()        # immediate fit (disables auto)
@@ -1950,6 +1952,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if mode == 'xye':
             # The XYE file owns its x-axis, so hide the transform combo; the
             # 2D-only controls (Share Axis, 2D unit, slice) are meaningless.
+            # Unlink the (possibly checked) Share Axis WITHOUT unchecking --
+            # the stale XLink froze the viewer 1D at the old cake's range;
+            # returning to an INT mode re-links via _apply_share_axis_state.
+            displayFrameWidget._set_share_link(self, False)
+            _plot = getattr(self, 'plot', None)   # duck holders in tests
+            if _plot is not None:
+                _plot.enableAutoRange()
             self.ui.plotUnit.setVisible(False)
             self._set_2d_controls_visible(False)
             # frame_6 is shown so the Linear/Log scale applies to the 1D
@@ -2133,6 +2142,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         # Try to get thumbnail from loaded 1D data
         thumb = None
+        full_res = False
         frame = self.data_1d.get(int(idx))
         if frame is not None:
             thumb = getattr(frame, 'thumbnail', None)
@@ -2141,6 +2151,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if thumb is None and int(idx) in self.data_2d:
             d2 = self.data_2d[int(idx)]
             thumb = d2.get('map_raw')
+            full_res = thumb is not None
 
         if thumb is None or (hasattr(thumb, 'size') and thumb.size == 0):
             if show_message:
@@ -2151,11 +2162,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         # Show the image AS INTEGRATED (mask + threshold as NaN), through the
         # standard pgImageWidget path so the (2, 98) nanpercentile levels
-        # apply -- the old autoLevels=True kwarg rode into pyqtgraph and
-        # OVERRODE them with min/max, so the Eiger gap values (~4e9) washed
-        # everything else out.
-        img = displayFrameWidget.integration_view_image(
-            thumb, getattr(self, 'scan', None))
+        # apply.  Mask/threshold only on the FULL-RES map_raw path:
+        # thumbnails are downsampled (<=256px) with the mask already baked
+        # in as NaN, so the full-res flat mask indices would land on
+        # unrelated pixels (speckles), and their values are bg-subtracted /
+        # interpolated -- not the raw counts the worker thresholds.
+        if full_res:
+            img = displayFrameWidget.integration_view_image(
+                thumb, getattr(self, 'scan', None))
+        else:
+            img = np.asarray(thumb, dtype=np.float32)
         # Correct orientation: transpose and flip vertically.
         self._image_preview_widget.setImage(img.T[:, ::-1])
         self._image_preview_dialog.setWindowTitle(

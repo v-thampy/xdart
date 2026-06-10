@@ -814,6 +814,13 @@ class DisplayDataMixin:
                     selected_index = row
             combo.setCurrentIndex(selected_index)
             self._norm_channel_signature = signature
+            # The content-fit width was computed at init from the .ui
+            # placeholder; refit for the real counter names so longer ones
+            # aren't clipped in the closed combo.
+            try:
+                self._fit_combo_width(combo, max_w=170)
+            except Exception:
+                pass
         finally:
             if was_blocked is not None:
                 try:

@@ -24,6 +24,23 @@ def load_session(path=None) -> dict:
         return {}
 
 
+def _json_default(obj):
+    """Coerce numpy scalars/arrays (e.g. bai args in the integrator's
+    Advanced tree) -- json.dumps(np.float64) raises TypeError, and the
+    swallow-all save_session would silently drop the WHOLE write."""
+    try:
+        import numpy as np
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+    except ImportError:
+        pass
+    raise TypeError(f"not JSON serializable: {type(obj).__name__}")
+
+
 def save_session(data: dict, path=None) -> None:
     p = Path(path) if path else Path(_DEFAULT)
     try:
@@ -32,6 +49,6 @@ def save_session(data: dict, path=None) -> None:
             p.parent.mkdir(parents=True, exist_ok=True)
             cur = json.loads(p.read_text()) if p.exists() else {}
             cur.update(data)
-            p.write_text(json.dumps(cur, indent=2))
+            p.write_text(json.dumps(cur, indent=2, default=_json_default))
     except Exception:
         logger.debug("save_session failed", exc_info=True)
