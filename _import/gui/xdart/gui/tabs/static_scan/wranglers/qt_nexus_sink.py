@@ -95,9 +95,34 @@ class QtNexusSink:
         self._stash_and_buffer(live)
         self._published.add(int(live.idx))
         self._publish_display(live)      # live-mode per-frame GUI hand-off (no-op in batch)
+        self._emit_frame_status(live)    # status label tracks COMPLETION
         self._since_save += 1
         if self._due_to_save():
             self._flush()
+
+    def _emit_frame_status(self, live) -> None:
+        """Per-frame status at write/completion time: '<name>' (or
+        '<master> #<frame>' for multi-frame sources), filename middle-
+        truncated to <=30 chars.  Emitted here rather than at submit so the
+        label tracks what the plots show instead of racing ahead of the
+        parallel pipeline."""
+        try:
+            import os
+            from .image_wrangler_thread import _raw_lives_in_source
+            src = str(getattr(live, 'source_file', '') or '')
+            trunc = getattr(self._host, '_middle_truncate', None)
+            name = os.path.basename(src)
+            if callable(trunc):
+                name = trunc(name, max_len=30)
+            if not name:
+                name = f'frame {live.idx}'
+            elif _raw_lives_in_source(src):
+                name = f'{name} #{live.idx}'
+            sig = getattr(self._host, 'showLabel', None)
+            if sig is not None:
+                sig.emit(name)
+        except Exception:
+            logger.debug("frame status emit failed", exc_info=True)
 
     def _publish_display(self, live) -> None:
         """Live-mode per-frame display hand-off.  Mirrors the SERIAL path

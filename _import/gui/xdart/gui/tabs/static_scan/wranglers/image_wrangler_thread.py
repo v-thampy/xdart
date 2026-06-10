@@ -1594,17 +1594,10 @@ class imageThread(wranglerThread):
             self._wait_if_paused()        # pause between frames (streaming path)
             if self.command == 'stop':
                 break
-            # Per-frame status (replaces the debug-era 'Streaming N images...'):
-            # 'Processing <name>' for per-file sources, 'Processing <master>
-            # #<frame>' for multi-frame (Eiger) sources.  Filename middle-
-            # truncated to <=30 chars; the #frame suffix stays visible.
-            src = str(getattr(live, 'source_file', '') or '')
-            name = self._middle_truncate(os.path.basename(src), max_len=30)
-            if not name:
-                name = f'frame {live.idx}'
-            elif _raw_lives_in_source(src):
-                name = f'{name} #{live.idx}'
-            self.showLabel.emit(f'Processing {name}')
+            # Per-frame status is emitted at COMPLETION by the sink
+            # (QtNexusSink._emit_frame_status) so the label tracks what the
+            # plots show -- emitting here at submit time raced frames ahead
+            # of the display in the parallel pipeline.
             sink.register(live)
             try:
                 session.submit(frame_from_live_frame(live))
@@ -1899,10 +1892,10 @@ class imageThread(wranglerThread):
         _ext = Path(img_file).suffix.lower()
         if _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file):
             self.showLabel.emit(
-                f'Processing {self._middle_truncate(fname)} [frame {img_number}]'
+                f'{self._middle_truncate(fname)} [frame {img_number}]'
             )
         else:
-            self.showLabel.emit(f'Processing {self._middle_truncate(fname)}')
+            self.showLabel.emit(self._middle_truncate(fname))
 
         _t1 = time.time()
         # Threshold via dummy sentinel + stable cached mask — see
