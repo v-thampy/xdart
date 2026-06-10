@@ -168,16 +168,32 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
-        # Width polish (Vivek): top-bar controls -5%, freeing room for the
-        # middle panels.  Overrides the generated-UI fixed sizes.
-        self.ui.normChannel.setMinimumSize(Qt.QtCore.QSize(90, 0))
-        self.ui.normChannel.setMaximumSize(Qt.QtCore.QSize(104, 16777215))
-        self.ui.setBkg.setMinimumSize(Qt.QtCore.QSize(85, 0))
-        self.ui.setBkg.setMaximumSize(Qt.QtCore.QSize(95, 16777215))
-        self.ui.scale.setMinimumSize(Qt.QtCore.QSize(68, 0))
-        self.ui.scale.setMaximumSize(Qt.QtCore.QSize(68, 16777215))
-        self.ui.cmap.setMinimumSize(Qt.QtCore.QSize(68, 0))
-        self.ui.cmap.setMaximumSize(Qt.QtCore.QSize(68, 16777215))
+        # Top-bar polish (Vivek): size the controls to their CONTENT instead
+        # of the generated-UI fixed pixel widths (which elided 'Norm Channel'
+        # and needed hand-tuning), and give the whole row ONE height -- combo
+        # boxes and push buttons have different native heights in the macOS
+        # style, which made the row look ragged.
+        _ROW_H = 28
+        for _c in (self.ui.normChannel, self.ui.scale, self.ui.cmap):
+            _c.setSizeAdjustPolicy(
+                QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        for _w in (self.ui.normChannel, self.ui.setBkg, self.ui.scale,
+                   self.ui.cmap):
+            _w.setMinimumWidth(0)
+            _w.setMaximumWidth(16777215)
+            _w.setFixedHeight(_ROW_H)
+        # Free the fixed-width containers so they shrink-wrap their contents
+        # (the freed space goes to the middle panels via the layout stretch).
+        for _f in (self.ui.frame_4, self.ui.frame_6):
+            _f.setMinimumSize(Qt.QtCore.QSize(0, 0))
+            _f.setMaximumSize(Qt.QtCore.QSize(16777215, 16777215))
+        # Center the combo display text to match the push buttons (combos are
+        # left-aligned natively; only an editable combo's line edit can be
+        # aligned, so make it editable-but-read-only and reroute its clicks
+        # to the popup).
+        for _c in (self.ui.normChannel, self.ui.scale, self.ui.cmap,
+                   self.ui.imageUnit, self.ui.plotUnit, self.ui.plotMethod):
+            displayFrameWidget._center_combo(_c)
         self.ui.frame_4.setMinimumSize(Qt.QtCore.QSize(248, 0))
         self.ui.frame_4.setMaximumSize(Qt.QtCore.QSize(248, 16777215))
         self.ui.frame_6.setMinimumSize(Qt.QtCore.QSize(248, 0))
@@ -498,6 +514,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         # Raw image preview button
         self._showImageBtn = QtWidgets.QPushButton('Raw Image')
+        self._showImageBtn.setFixedHeight(28)   # match the top-row controls
         self._showImageBtn.setMinimumSize(QtWidgets.QWidget().minimumSize())
         self._showImageBtn.setMaximumSize(Qt.QtCore.QSize(90, 16777215))
         self._showImageBtn.setToolTip('Show raw image preview for selected frame')
@@ -1904,6 +1921,26 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.labelCurrent.setText(title)
 
     # ── Image preview dialog ──────────────────────────────────────
+
+    @staticmethod
+    def _center_combo(combo):
+        """Center a QComboBox's displayed text (matches the buttons).
+
+        Non-editable combos can't align their text, so: editable + read-only
+        line edit + AlignCenter, with line-edit clicks rerouted to the popup
+        so the combo still behaves like a plain dropdown.  Popup items are
+        centered too."""
+        try:
+            combo.setEditable(True)
+            le = combo.lineEdit()
+            le.setReadOnly(True)
+            le.setAlignment(pyQt.AlignCenter)
+            le.mousePressEvent = lambda _e, c=combo: c.showPopup()
+            for i in range(combo.count()):
+                combo.setItemData(i, pyQt.AlignCenter,
+                                  pyQt.TextAlignmentRole)
+        except Exception:
+            logger.debug("combo centering failed", exc_info=True)
 
     @staticmethod
     def integration_view_image(thumb, scan):
