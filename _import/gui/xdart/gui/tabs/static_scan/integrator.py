@@ -838,7 +838,10 @@ class integratorTree(QtWidgets.QWidget):
 
     def _get_unit_1D(self):
         val = self.ui.unit_1D.currentText()
-        self.scan.bai_1d_args['unit'] = Units_dict[val]
+        if val in Units_dict:
+            self.scan.bai_1d_args['unit'] = Units_dict[val]
+        # else: empty/relabeled combo text (e.g. Share Axis toggled with no
+        # data yet, or GI mode swaps the labels) -- keep the current arg.
         self._validate_ranges()
 
     def _set_unit_1D(self):
@@ -849,7 +852,8 @@ class integratorTree(QtWidgets.QWidget):
 
     def _get_unit_2D(self):
         val = self.ui.unit_2D.currentText()
-        self.scan.bai_2d_args['unit'] = Units_dict[val]
+        if val in Units_dict:
+            self.scan.bai_2d_args['unit'] = Units_dict[val]
         self._validate_ranges()
 
     def _set_unit_2D(self):
