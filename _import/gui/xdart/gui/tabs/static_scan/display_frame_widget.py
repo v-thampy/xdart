@@ -174,9 +174,23 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # macOS).  NOTE: AdjustToContents + editable-centered combos were
         # tried and reverted -- they broke the popups on macOS.
         _ROW_H = 28
+        # Match the bottom (plot-controls) toolbar height: frame_top was
+        # capped at 35 while imageToolbar renders at 40, making the top row
+        # visibly shorter.
+        self.ui.frame_top.setMinimumSize(Qt.QtCore.QSize(0, 40))
+        self.ui.frame_top.setMaximumSize(Qt.QtCore.QSize(16777215, 40))
         for _f in (self.ui.frame_4, self.ui.frame_6):
             _f.setMinimumSize(Qt.QtCore.QSize(0, 0))
             _f.setMaximumSize(Qt.QtCore.QSize(16777215, 16777215))
+        # Center EVERY top-row cell vertically: frame_4 (Norm Channel/Set
+        # Bkg) anchored top while frame_6 (Log/Raw Image) was centered, so
+        # the two clusters sat ~3px apart -- the 'Log looks low' symptom.
+        _top_lay = self.ui.frame_top.layout()
+        if _top_lay is not None:
+            for _i in range(_top_lay.count()):
+                _cw = _top_lay.itemAt(_i).widget()
+                if _cw is not None:
+                    _top_lay.setAlignment(_cw, pyQt.AlignVCenter)
         for _c in (self.ui.normChannel, self.ui.scale, self.ui.cmap):
             displayFrameWidget._fit_combo_width(_c, max_w=130)
             _c.setFixedHeight(_ROW_H)
