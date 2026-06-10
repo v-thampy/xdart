@@ -186,6 +186,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         for _f in (self.ui.frame_4, self.ui.frame_6):
             _f.setMinimumSize(Qt.QtCore.QSize(0, 34))
             _f.setMaximumSize(Qt.QtCore.QSize(16777215, 34))
+            # Horizontal policy Maximum = shrink-wrap: each cluster hugs its
+            # content (instead of splitting the spare width 50/50 with the
+            # other cluster) and can be squeezed below it; the spare space
+            # all goes to the title in the middle.
+            _sp = _f.sizePolicy()
+            _sp.setHorizontalPolicy(QtWidgets.QSizePolicy.Policy.Maximum)
+            _f.setSizePolicy(_sp)
             _lay = _f.layout()
             if _lay is not None:
                 for _i in range(_lay.count()):
