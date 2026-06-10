@@ -823,6 +823,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         display_data = _downsample_for_display(image, widget)
         widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
         widget.setRect(rect)
+        if role is not PanelRole.RAW_2D:
+            # Display-only trim: cut the cake's visible axes to the data's
+            # bounding box.  The STORED grid keeps the full default range
+            # (e.g. GI q-chi integrates chi -180..180 while the physical
+            # wedge is ~+/-90) -- without the trim half the view is empty.
+            displayFrameWidget._trim_view_to_data(widget, image, x, y)
         displayFrameWidget._set_image_widget_colorbar_visible(widget, True)
         # Levels come from pgImageWidget.update_image's nanpercentile autoscale
         # (the (1,99) Linear default), for the Image Viewer exactly as for the
@@ -841,6 +847,34 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         else:
             self.binned_data = (image, rect)
         return True
+
+    @staticmethod
+    def _trim_view_to_data(widget, image, x, y):
+        """Set the view range to the non-dummy data extent (display only).
+
+        Skipped when the user has zoomed (auto-range off) so it never fights
+        manual navigation; with auto-range on it replaces the full-rect
+        autoscale that left e.g. a GI q-chi cake half empty."""
+        try:
+            vb = widget.image_plot.getViewBox()
+            auto = vb.autoRangeEnabled()
+            if not (auto[0] or auto[1]):
+                return                      # user zoom in effect
+            has = np.isfinite(image) & (image > 0)
+            if not has.any():
+                return
+            x_idx = np.where(has.any(axis=1))[0]   # image is (x, y)
+            y_idx = np.where(has.any(axis=0))[0]
+            pad = 2                                # bins of margin
+            x_lo = float(x[max(0, x_idx[0] - pad)])
+            x_hi = float(x[min(len(x) - 1, x_idx[-1] + pad)])
+            y_lo = float(y[max(0, y_idx[0] - pad)])
+            y_hi = float(y[min(len(y) - 1, y_idx[-1] + pad)])
+            if x_hi > x_lo and y_hi > y_lo:
+                vb.setRange(xRange=(x_lo, x_hi), yRange=(y_lo, y_hi),
+                            padding=0.02)
+        except Exception:
+            logger.debug("cake view trim skipped", exc_info=True)
 
     def _current_image_axis_key(self):
         """Canonical key for the current 2D cake x-axis."""

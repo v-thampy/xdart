@@ -622,18 +622,29 @@ class imageThread(wranglerThread):
             _t_read_this = time.time() - _t_r0
             _t_read_accum += _t_read_this
             if img_data is None:
+                if not self.batch_mode and pending:
+                    logger.info('Collected %d image(s) in %.2fs',
+                                len(pending), _t_read_accum)
                 break  # initial glob exhausted — move on to processing
             if img_file is not None:
                 fname = os.path.splitext(os.path.basename(img_file))[0]
                 # When the input is a multi-frame container (HDF5/NeXus/Eiger master),
                 # include the frame index so progress is visible.
                 _ext = Path(img_file).suffix.lower()
-                if _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file):
-                    self.showLabel.emit(
-                        f'Collecting {self._middle_truncate(fname)} [frame {img_number}]'
-                    )
+                _multi = _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file)
+                _label = (f'Collecting {self._middle_truncate(fname)} [frame {img_number}]'
+                          if _multi else
+                          f'Collecting {self._middle_truncate(fname)}')
+                if self.batch_mode:
+                    # Batch: the label is the only progress feedback while the
+                    # whole pending set is read up front.
+                    self.showLabel.emit(_label)
                 else:
-                    self.showLabel.emit(f'Collecting {self._middle_truncate(fname)}')
+                    # Live: frames dispatch as they arrive, so the completion
+                    # status (sink) supersedes this within ms -- showing it
+                    # just flickered.  Keep it greppable at DEBUG; a single
+                    # summary INFO is logged when collection finishes.
+                    logger.debug(_label)
             else:
                 logger.warning('Invalid image file, skipping')
                 continue

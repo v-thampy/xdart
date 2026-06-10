@@ -1092,6 +1092,21 @@ class integratorTree(QtWidgets.QWidget):
         - Single-entry combos ("Radial" / "Q-Chi"), npts_oop_1D hidden
         - Standard Q / 2th / Chi labels
         """
+        # GI ignores the transmission chi offset (the integration uses
+        # FiberIntegrator's own polar convention) -- make the Advanced
+        # panel's chi_offset reflect that instead of showing a live-looking
+        # 90 that does nothing.
+        _gi_now = bool(getattr(self.scan, 'gi', False))
+        for _pars in (self.bai_1d_pars, self.bai_2d_pars):
+            try:
+                _p = _pars.child('chi_offset')
+                _p.setReadonly(_gi_now)
+                _p.setOpts(tip=('Ignored in grazing incidence '
+                                '(transmission-only chi rotation)')
+                           if _gi_now else '')
+            except Exception:
+                pass
+
         try:
             self.ui.axis1D.currentIndexChanged.disconnect(self._update_gi_mode_1d)
         except TypeError:
