@@ -1073,6 +1073,43 @@ def test_gi_prepass_fails_closed_on_unestablishable_range():
     assert getattr(w, "_gi_prepass_scan_id", None) is None
 
 
+def test_gi_prepass_fails_closed_on_image_directory_source():
+    """#1 (codex residuals): Image-Directory GI batch with a varying incidence motor
+    returns 'unverifiable' (can't sweep the whole scan) and the orchestrator FAILS
+    CLOSED -- aborts loud -- rather than silently integrating chunk 1's grid.
+    This is the simple fail-closed fallback (the routing-to-chunked spec option was
+    rejected because chunked also freezes from per-chunk first/last, so it moves
+    the clip without fixing it)."""
+    from types import SimpleNamespace, MethodType
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    emitted = []
+    w = SimpleNamespace(
+        gi=True, batch_mode=True, batch_execution="streaming",
+        incidence_motor="th",          # non-fixed motor (not float-parseable)
+        img_file="/data/scan_0001.tif", inp_type="Image Directory",
+        img_dir="/data", scan_name="scan", img_ext="tif",
+        meta_ext="txt", meta_dir="/data",
+        command="",
+        showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
+    )
+    for m in ("_gi_freeze_whole_scan_prepass", "_gi_whole_scan_scout_entries",
+              "_enumerate_scan_files", "_abort_gi_prepass", "_batch_execution"):
+        setattr(w, m, MethodType(getattr(imageThread, m), w))
+    w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
+
+    # Image-Directory with a non-fixed motor -> "unverifiable" (can't sweep).
+    status, entries = w._gi_whole_scan_scout_entries(None)
+    assert status == "unverifiable" and entries == []
+
+    # Orchestrator fails CLOSED: returns False, stops the run, warns loud.
+    proceed = w._gi_freeze_whole_scan_prepass(SimpleNamespace())
+    assert proceed is False
+    assert w.command == "stop"
+    assert emitted and "GI batch aborted" in emitted[-1]
+    assert getattr(w, "_gi_prepass_scan_id", None) is None
+
+
 def test_gi_prepass_fails_closed_on_degenerate_scout_freeze():
     """BLOCKER 1 follow-up: a GIFreezeError raised by the whole-scan FREEZE (a
     degenerate / all-dummy scout cake) must FAIL CLOSED via _abort_gi_prepass --

@@ -1088,7 +1088,7 @@ def test_wrangler_thread_reuses_reduction_session_by_key():
         def __init__(self):
             self.finished = False
 
-        def finish(self):
+        def finish(self, **kw):    # kw absorbs join_timeout=
             self.finished = True
             return None
 

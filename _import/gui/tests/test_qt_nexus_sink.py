@@ -229,11 +229,11 @@ def test_close_reduction_session_surfaces_write_failure():
 
     labels, closed = [], []
 
-    def boom_finish():
+    def boom_finish(**kw):      # kw absorbs join_timeout=
         closed.append("first")
         raise RuntimeError("disk full")
 
-    def ok_finish():
+    def ok_finish(**kw):
         closed.append("second")
 
     w = SimpleNamespace(

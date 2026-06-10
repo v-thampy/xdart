@@ -1088,6 +1088,27 @@ class imageThread(wranglerThread):
                 "could not establish the whole-scan incidence range from frame "
                 "metadata")
             return False
+        if status == "unverifiable":
+            # The source type (Image-Directory or Eiger master with non-fixed
+            # incidence) cannot be cheaply swept for the whole-scan incidence
+            # range.  Rather than silently clip later frames onto the chunk-1
+            # grid, abort the streaming run and tell the user to switch to
+            # XDART_BATCH_EXECUTION=chunked (the chunked executor fully
+            # materializes the pending before freezing, so it's correct for
+            # sources whose files are already all-available).
+            # RESTRUCTURE-TODO: proper fix = source-aware whole-scan incidence
+            # enumeration for Image-Directory and multi-master Eiger.
+            source = (getattr(self, "inp_type", None) or
+                      ("Eiger master" if (getattr(self, "img_file", "") and
+                                          _is_eiger_master(getattr(self, "img_file", "")))
+                       else "this source"))
+            self._abort_gi_prepass(
+                f"cannot sweep the whole-scan incidence range for '{source}' "
+                f"in streaming GI mode (silent chunk-1 clipping refused). "
+                f"Set XDART_BATCH_EXECUTION=chunked or use an Image-Series source "
+                f"so the whole-scan grid can be verified."
+            )
+            return False
         if status == "freeze":
             # These self-skip when the relevant ranges are already set, and
             # freeze the UNION over the two extreme scouts we hand them (NOT a
@@ -1152,20 +1173,38 @@ class imageThread(wranglerThread):
             pass
         files = self._enumerate_scan_files()
         if not files:
-            # Can't cheaply per-frame sweep (Eiger single-master is one incidence
-            # per master -> fixed -> the session freeze is correct; a directory /
-            # missing-source host likewise can't be swept).  Not an abort: these
-            # were never chunk-clipped.
+            # _enumerate_scan_files() returns [] for sources that can't be cheaply
+            # swept per-frame.  Distinguish the safe cases (skip) from the risky
+            # ones (unverifiable = we can't confirm the whole-scan range, so the
+            # caller must fail closed rather than silently clip later frames):
             #
-            # KNOWN FAIL-OPEN GAPS (RESTRUCTURE-TODO) -- both return "skip" here
-            # and let the session freeze from chunk 1, so a *varying-incidence*
-            # scan of these kinds can still clip later frames:
-            #   (a) multi-master Eiger (incidence varies per master), and
-            #   (b) an Image-Directory per-file scan (_enumerate_scan_files
-            #       returns [] for inp_type == 'Image Directory').
-            # Both are uncommon for GI angle-dependence (which is typically an
-            # Image-Series sweep, handled below); fixing them needs a
-            # source-aware whole-scan incidence enumeration.
+            # SAFE ("skip"):
+            #   - Eiger SINGLE-master (one incidence per master → fixed grid, the
+            #     session's own freeze is correct and was never chunk-clipped).
+            #   - Any scan whose source-host attrs are absent/incomplete (no file
+            #     to check → missing-source host, not a TIFF angle-dependence run).
+            # RISKY ("unverifiable"):
+            #   - Image-Directory per-file GI scan (inp_type == 'Image Directory'):
+            #     a TIFF angle-dependence sweep that _enumerate_scan_files() skips.
+            #     The session WOULD clip later higher-incidence frames.
+            #   - Eiger master when the motor is not fixed/manual (if multi-master
+            #     Eiger is possible: each master a different incidence → same clip
+            #     risk; we can't distinguish single- vs multi-master before the run).
+            #
+            # For "unverifiable" the caller logs and aborts rather than silently
+            # proceeding on the chunk-1-local grid (RESTRUCTURE-TODO: proper fix is
+            # source-aware whole-scan incidence enumeration for these sources).
+            img_file = getattr(self, "img_file", None) or ""
+            if getattr(self, "inp_type", None) == "Image Directory":
+                # Per-file angle-dependence loaded as a directory: can't sweep.
+                return "unverifiable", []
+            if img_file and _is_eiger_master(img_file):
+                # Eiger master: single-master (fixed angle per master) is safe;
+                # multi-master (varying angle) is risky but indistinguishable
+                # here.  Conservatively treat any non-fixed-motor Eiger as
+                # unverifiable so a multi-master angle-dependence can't clip.
+                return "unverifiable", []
+            # Missing source attrs / no img_file: can't be an angle-dependence sweep.
             return "skip", []
         if len(files) < 2:
             return "skip", []   # single-frame scan: no incidence range to freeze

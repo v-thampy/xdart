@@ -336,7 +336,10 @@ class wranglerThread(Qt.QtCore.QThread):
         for sess in (session, streaming):
             if sess is not None:
                 try:
-                    sess.finish()
+                    # #4 (codex): bound the writer-thread join so a stalled
+                    # NFS/pyFAI worker can't wedge Stop/close indefinitely.
+                    # 60 s is a generous ceiling for beamline conditions.
+                    sess.finish(join_timeout=60.0)
                 except Exception as exc:
                     errors.append(exc)
                     logger.error("reduction session WRITE FAILED on close: %s",
