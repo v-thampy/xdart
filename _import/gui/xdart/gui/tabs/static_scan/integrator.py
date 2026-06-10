@@ -461,6 +461,71 @@ class integratorTree(QtWidgets.QWidget):
             self._args_to_params(self.scan.bai_2d_args, self.bai_2d_pars, dim='2D')
         self._connect_inp_signals()
 
+    # ── Session persistence (panel fields + Advanced params) ─────────────
+    _SESSION_UI_FIELDS = (
+        'unit_1D', 'npts_1D', 'npts_oop_1D',
+        'radial_low_1D', 'radial_high_1D', 'azim_low_1D', 'azim_high_1D',
+        'radial_autoRange_1D', 'azim_autoRange_1D',
+        'unit_2D', 'npts_radial_2D', 'npts_azim_2D',
+        'radial_low_2D', 'radial_high_2D', 'azim_low_2D', 'azim_high_2D',
+        'radial_autoRange_2D', 'azim_autoRange_2D',
+        'axis1D', 'axis2D',
+    )
+
+    def session_state(self) -> dict:
+        """JSON-serializable snapshot of the integration panel: units, pts,
+        ranges + Auto flags, GI mode combos, and the Advanced parameter
+        tree.  Saved to session.json on app close; restored at startup."""
+        ui = {}
+        for name in self._SESSION_UI_FIELDS:
+            w = getattr(self.ui, name, None)
+            if w is None:
+                continue
+            if hasattr(w, 'isChecked'):
+                ui[name] = bool(w.isChecked())
+            elif hasattr(w, 'currentIndex'):
+                ui[name] = int(w.currentIndex())
+            elif hasattr(w, 'text'):
+                ui[name] = str(w.text())
+        try:
+            advanced = self.parameters.saveState(filter='user')
+        except Exception:
+            advanced = None
+        return {'ui': ui, 'advanced': advanced}
+
+    def restore_session_state(self, data) -> None:
+        if not isinstance(data, dict):
+            return
+        for name, val in (data.get('ui') or {}).items():
+            w = getattr(self.ui, name, None)
+            if w is None:
+                continue
+            try:
+                if hasattr(w, 'setChecked'):
+                    w.setChecked(bool(val))
+                elif hasattr(w, 'setCurrentIndex'):
+                    w.setCurrentIndex(int(val))
+                elif hasattr(w, 'setText'):
+                    w.setText(str(val))
+            except Exception:
+                logger.debug("integrator restore skipped %s", name,
+                             exc_info=True)
+        advanced = data.get('advanced')
+        if advanced:
+            try:
+                self.parameters.restoreState(
+                    advanced, addChildren=False, removeChildren=False)
+            except Exception:
+                logger.debug("integrator advanced restore failed",
+                             exc_info=True)
+        # Re-derive bai args from the restored fields so the next run uses them.
+        try:
+            self.get_args('bai_1d')
+            self.get_args('bai_2d')
+        except Exception:
+            logger.debug("integrator get_args after restore failed",
+                         exc_info=True)
+
     def get_args(self, key):
         """Updates scan with all parameters held in integrator.
 

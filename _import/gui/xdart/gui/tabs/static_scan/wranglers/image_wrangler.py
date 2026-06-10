@@ -1065,10 +1065,24 @@ class imageWrangler(wranglerWidget):
         self.live_mode = False
         self.thread.live_mode = False
 
+    def _browse_dir(self, current: str = '') -> str:
+        """Start directory for the file dialogs: the current field's folder
+        when it exists, else the Project Folder, else Qt's last-used ('').
+        Without this, browsing for e.g. the PONI after changing the Project
+        Folder opened wherever the previous session left off."""
+        cur = (current or '').strip()
+        if cur:
+            d = cur if os.path.isdir(cur) else os.path.dirname(cur)
+            if d and os.path.isdir(d):
+                return d
+        pf = os.path.expanduser((self.project_folder or '').strip())
+        return pf if pf and os.path.isdir(pf) else ''
+
     def set_poni_file(self):
         """Opens file dialogue and sets the calibration file
         """
         fname, _ = QFileDialog().getOpenFileName(
+            dir=self._browse_dir(self.poni_file),
             filter="PONI (*.poni *.PONI)"
         )
         if fname != '':
@@ -1187,6 +1201,7 @@ class imageWrangler(wranglerWidget):
         """Opens file dialogue and sets the spec data file
         """
         fname, _ = QFileDialog().getOpenFileName(
+            dir=self._browse_dir(self.img_file),
             filter="Images (*.tiff *.tif *.h5 *.hdf5 *.nxs *.raw *.mar3450)"
         )
         if fname != '':
@@ -1197,7 +1212,7 @@ class imageWrangler(wranglerWidget):
         """
         path = QFileDialog().getExistingDirectory(
             caption='Choose Image Directory',
-            dir='',
+            dir=self._browse_dir(self.img_dir),
             options=QFileDialog.ShowDirsOnly
         )
         if path != '':
@@ -1289,7 +1304,7 @@ class imageWrangler(wranglerWidget):
         """
         path = QFileDialog().getExistingDirectory(
             caption='Choose Meta (SPEC) Directory',
-            dir=self.meta_dir or '',
+            dir=self._browse_dir(self.meta_dir),
             options=QFileDialog.ShowDirsOnly,
         )
         if path:
@@ -1372,6 +1387,7 @@ class imageWrangler(wranglerWidget):
         """Opens file dialogue and sets the mask file
         """
         fname, _ = QFileDialog().getOpenFileName(
+            dir=self._browse_dir(self.mask_file),
             filter="EDF (*.edf)"
         )
         if fname != '':
@@ -1406,6 +1422,7 @@ class imageWrangler(wranglerWidget):
         """Opens file dialogue and sets the background file
         """
         fname, _ = QFileDialog().getOpenFileName(
+            dir=self._browse_dir(self.bg_file),
             filter=f"Images (*.{self.img_ext})"
         )
         if fname != '':
@@ -1417,7 +1434,7 @@ class imageWrangler(wranglerWidget):
         """
         path = QFileDialog().getExistingDirectory(
             caption='Choose BG Directory',
-            dir='',
+            dir=self._browse_dir(self.bg_dir),
             options=QFileDialog.ShowDirsOnly
         )
         if path != '':
@@ -1429,7 +1446,7 @@ class imageWrangler(wranglerWidget):
         """
         path = QFileDialog().getExistingDirectory(
             caption='Choose Save Directory',
-            dir='',
+            dir=self._browse_dir(self.h5_dir),
             options=QFileDialog.ShowDirsOnly
         )
         if path != '':
@@ -1462,7 +1479,7 @@ class imageWrangler(wranglerWidget):
         (folder-relative) paths + defaults the Save Path."""
         path = QFileDialog().getExistingDirectory(
             caption='Choose Project Folder',
-            dir='',
+            dir=self._browse_dir(self.project_folder),
             options=QFileDialog.ShowDirsOnly
         )
         if path != '':

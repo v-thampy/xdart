@@ -1572,3 +1572,31 @@ def test_shutdown_threads_stops_file_thread(widget):
     # Idempotent — a second call (and the close() path that also calls it) is safe.
     w.h5viewer.shutdown_threads()
     assert not ft.isRunning()
+
+
+def test_integrator_panel_session_roundtrip(widget):
+    """Session persistence for the integration panel: units/pts/ranges/Auto
+    flags + Advanced params survive a save/restore cycle (saved at app close,
+    restored at startup -- they previously weren't persisted at all)."""
+    tree = widget.integratorTree
+
+    tree.ui.npts_1D.setText("1234")
+    tree.ui.radial_autoRange_1D.setChecked(False)
+    tree.ui.radial_low_1D.setText("0.5")
+    tree.ui.radial_high_1D.setText("4.5")
+    tree.parameters.child('Default', 'Integrate 1D', 'chi_offset').setValue(45.0)
+    state = tree.session_state()
+    import json
+    json.dumps(state)                       # must be JSON-serializable
+
+    # Scramble, then restore.
+    tree.ui.npts_1D.setText("999")
+    tree.ui.radial_autoRange_1D.setChecked(True)
+    tree.parameters.child('Default', 'Integrate 1D', 'chi_offset').setValue(90.0)
+    tree.restore_session_state(state)
+
+    assert tree.ui.npts_1D.text() == "1234"
+    assert tree.ui.radial_autoRange_1D.isChecked() is False
+    assert tree.ui.radial_low_1D.text() == "0.5"
+    assert tree.parameters.child(
+        'Default', 'Integrate 1D', 'chi_offset').value() == 45.0

@@ -366,6 +366,15 @@ class staticWidget(QWidget):
         if len(self.scan.frames.index) > 0:
             self.integratorTree.update()
         self.integratorTree.ui.raw_to_tif.hide()
+        # Restore the integration panel (units/pts/ranges/Auto flags/GI modes
+        # + Advanced params) from the previous session; saved in close().
+        try:
+            from xdart.utils.session import load_session
+            _integ = (load_session() or {}).get('integrator')
+            if _integ:
+                self.integratorTree.restore_session_state(_integ)
+        except Exception:
+            logger.debug("integrator session restore failed", exc_info=True)
 
         # Metadata
         self.metawidget = metadataWidget(self.scan, self.frame,
@@ -850,6 +859,13 @@ class staticWidget(QWidget):
     def close(self):
         """Tries a graceful close.
         """
+        # Persist the integration panel settings (the wrangler tree saves
+        # continuously; the integrator panel saves here at exit).
+        try:
+            from xdart.utils.session import save_session
+            save_session({'integrator': self.integratorTree.session_state()})
+        except Exception:
+            logger.debug("integrator session save failed", exc_info=True)
         # Pause/Resume (Phase B): a PAUSED run blocks the wrangler thread in its
         # `while command == 'pause'` wait.  Closing the window must break that
         # wait so run() returns and the QThread isn't "destroyed while running".
