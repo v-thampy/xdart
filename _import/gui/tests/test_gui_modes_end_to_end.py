@@ -1641,3 +1641,40 @@ def test_scale_switch_without_2d_panels_does_not_crash(widget):
     df.binned_data = None
     df.update_image_view()          # must no-op, not raise
     df.update_binned_view()
+
+
+def test_gi_1d_npts_defaults_and_per_axis_memory(widget):
+    """1-D Pts: fiber axes (Qip/Qoop/Exit) default to 1000/1000, q_total
+    ('Q'/'Chi', plain pyFAI) and standard mode to 2000; a user-chosen value
+    persists per axis across switches.  (Was: stale session text -- e.g.
+    1234 -- landed in whatever axis was active.)"""
+    tree = widget.integratorTree
+    tree._npts_memory_1d = {}          # independent of restored session state
+    tree._npts_key_1d = None
+    tree.scan.gi = True
+    tree.set_image_units()
+
+    labels = [tree.ui.axis1D.itemText(i) for i in range(tree.ui.axis1D.count())]
+    qip_idx = next(i for i, t in enumerate(labels) if "ᵢₚ" in t or "ᵢ" in t)
+
+    tree.ui.axis1D.setCurrentIndex(qip_idx)            # -> q_ip
+    assert tree.ui.npts_1D.text() == "1000"
+    assert tree.ui.npts_oop_1D.text() == "1000"
+
+    tree.ui.npts_1D.setText("800")                     # user override
+    tree.ui.axis1D.setCurrentIndex(0)                  # -> q_total ('Q')
+    assert tree.ui.npts_1D.text() == "2000"
+    tree.ui.axis1D.setCurrentIndex(qip_idx)            # back -> q_ip
+    assert tree.ui.npts_1D.text() == "800"             # remembered
+    assert tree.ui.npts_oop_1D.text() == "1000"
+
+    # Session roundtrip carries the per-axis memory
+    state = tree.session_state()
+    import json
+    json.dumps(state)
+    assert state['npts_1d']['q_ip'][0] == "800"
+
+    tree.scan.gi = False                               # -> standard mode
+    tree.set_image_units()
+    tree._update_gi_mode_1d(tree.ui.axis1D.currentIndex())
+    assert tree.ui.npts_1D.text() == "2000"

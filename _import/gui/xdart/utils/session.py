@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 
@@ -9,12 +10,18 @@ from pathlib import Path
 # manifests as a RecursionError deep in pathlib.  Keep the default as a
 # plain string and build a fresh Path per call instead.
 _DEFAULT = str(Path.home() / '.xdart' / 'session.json')
+
+
+def _default_path() -> str:
+    """Resolved per call: XDART_SESSION_FILE lets tests (and parallel
+    instances) redirect persistence away from the real user session."""
+    return os.environ.get('XDART_SESSION_FILE') or _DEFAULT
 _LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
 
 def load_session(path=None) -> dict:
-    p = Path(path) if path else Path(_DEFAULT)
+    p = Path(path) if path else Path(_default_path())
     try:
         with _LOCK:
             return json.loads(p.read_text()) if p.exists() else {}
@@ -42,7 +49,7 @@ def _json_default(obj):
 
 
 def save_session(data: dict, path=None) -> None:
-    p = Path(path) if path else Path(_DEFAULT)
+    p = Path(path) if path else Path(_default_path())
     try:
         with _LOCK:
             # Inline the read so we don't re-enter load_session under the lock.

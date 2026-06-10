@@ -319,9 +319,11 @@ class integratorTree(QtWidgets.QWidget):
         except TypeError:
             pass
 
-        # Restore npts
+        # Restore npts.  npts_1D deliberately NOT here: the per-axis
+        # memory ('npts_1d' in the integrator session blob) owns it --
+        # restoring raw text put a stale value (e.g. 1234) into whatever
+        # axis happened to be active.
         for key, widget in [
-            ('integ_npts_1D', self.ui.npts_1D),
             ('integ_npts_radial_2D', self.ui.npts_radial_2D),
             ('integ_npts_azim_2D', self.ui.npts_azim_2D),
         ]:
@@ -463,7 +465,7 @@ class integratorTree(QtWidgets.QWidget):
 
     # ── Session persistence (panel fields + Advanced params) ─────────────
     _SESSION_UI_FIELDS = (
-        'unit_1D', 'npts_1D', 'npts_oop_1D',
+        'unit_1D',
         'radial_low_1D', 'radial_high_1D', 'azim_low_1D', 'azim_high_1D',
         'radial_autoRange_1D', 'azim_autoRange_1D',
         'unit_2D', 'npts_radial_2D', 'npts_azim_2D',
@@ -491,7 +493,12 @@ class integratorTree(QtWidgets.QWidget):
             advanced = self.parameters.saveState(filter='user')
         except Exception:
             advanced = None
-        return {'ui': ui, 'advanced': advanced}
+        # Per-axis 1-D Pts memory (stash the live boxes first so the
+        # active axis's values are included).
+        self._stash_npts_1d()
+        npts_mem = {k: list(v) for k, v in
+                    getattr(self, '_npts_memory_1d', {}).items()}
+        return {'ui': ui, 'advanced': advanced, 'npts_1d': npts_mem}
 
     def restore_session_state(self, data) -> None:
         if not isinstance(data, dict):
@@ -517,6 +524,15 @@ class integratorTree(QtWidgets.QWidget):
             except Exception:
                 logger.debug("integrator restore skipped %s", name,
                              exc_info=True)
+        npts_mem = data.get('npts_1d')
+        if isinstance(npts_mem, dict):
+            self._npts_memory_1d = {
+                str(k): (str(v[0]), str(v[1]))
+                for k, v in npts_mem.items()
+                if isinstance(v, (list, tuple)) and len(v) == 2}
+            # Re-apply for the CURRENT axis (forced: clear the key first).
+            self._npts_key_1d = None
+            self._apply_npts_1d_for_mode()
         advanced = data.get('advanced')
         if advanced:
             try:
@@ -1336,14 +1352,58 @@ class integratorTree(QtWidgets.QWidget):
         self._connect_radial_range_2D_signals()
         self._connect_azim_range_2D_signals()
 
+    # 1-D Pts defaults per integration axis: the fiber methods (q_ip /
+    # q_oop / exit_angle) want a balanced (npt_ip, npt_oop) grid; q_total
+    # ('Q'/'Chi') and the standard transmission axes use plain pyFAI
+    # integrate1d, where 2000 is the house default.
+    _NPTS_1D_DEFAULTS = {
+        'q_ip': ('1000', '1000'),
+        'q_oop': ('1000', '1000'),
+        'exit_angle': ('1000', '1000'),
+        'q_total': ('2000', ''),
+        'std': ('2000', ''),
+    }
+
+    def _npts_1d_mode_key(self):
+        if not getattr(self.scan, 'gi', False):
+            return 'std'
+        return self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
+
+    def _stash_npts_1d(self):
+        """Remember the current Pts boxes under the CURRENT axis key, so a
+        user-chosen value survives axis switches."""
+        key = getattr(self, '_npts_key_1d', None)
+        if key is not None:
+            if not hasattr(self, '_npts_memory_1d'):
+                self._npts_memory_1d = {}
+            self._npts_memory_1d[key] = (self.ui.npts_1D.text(),
+                                         self.ui.npts_oop_1D.text())
+
+    def _apply_npts_1d_for_mode(self):
+        """Load the remembered (or default) Pts for the new axis key."""
+        key = self._npts_1d_mode_key()
+        if key == getattr(self, '_npts_key_1d', None):
+            return
+        self._npts_key_1d = key
+        npt, oop = getattr(self, '_npts_memory_1d', {}).get(
+            key, self._NPTS_1D_DEFAULTS.get(key, ('2000', '')))
+        self.ui.npts_1D.setText(npt)
+        if oop:
+            self.ui.npts_oop_1D.setText(oop)
+        elif self.ui.npts_oop_1D.isVisible():
+            # visible-but-unset (q_total with a chi wedge): mirror npt
+            self.ui.npts_oop_1D.setText(npt)
+
     def _update_gi_mode_1d(self, n):
         """Update 1D integration mode from axis1D combo selection.
 
         In GI mode, updates scan.bai_1d_args['gi_mode_1d'] and adjusts
         range / unit labels.  In standard mode, switches between Q and 2θ.
         """
+        self._stash_npts_1d()
         if not self.scan.gi:
             self._update_standard_1d_label(n)
+            self._apply_npts_1d_for_mode()
             return
         mode = GI_MODES_1D[n] if n < len(GI_MODES_1D) else 'q_total'
         self.scan.bai_1d_args['gi_mode_1d'] = mode
@@ -1369,6 +1429,7 @@ class integratorTree(QtWidgets.QWidget):
             else:  # Q
                 self._set_range_defaults_1d(0, 5, -180, 180)
         self._update_npts_oop_visibility_1d()
+        self._apply_npts_1d_for_mode()
 
     def _update_npts_oop_visibility_1d(self):
         """Show/hide the second 1-D Pts box (npts_oop_1D).
