@@ -734,9 +734,12 @@ def open_nexus_writer(
     compression : str or None, optional
         Compression filter.
     swmr : bool, optional
-        Enable single-writer-multiple-reader mode. When True, readers
-        (e.g. the GUI) can open the file while the writer is active.
-        Requires ``libver='latest'``.
+        INTENTIONALLY UNAVAILABLE — raises :class:`NotImplementedError`.
+        SWMR-write requires every dataset to exist before the mode is
+        enabled, but this writer creates the integrated stacks on the
+        first frame append (HDF5 forbids object creation in SWMR-write
+        mode).  Concurrent readers are served instead by the retrying
+        open helpers (``catch_h5py_file``-style); leave ``swmr=False``.
     overwrite : bool, optional
         If True, overwrite existing file.
 
@@ -749,11 +752,11 @@ def open_nexus_writer(
     --------
     ::
 
-        h5 = open_nexus_writer("scan_001.nxs", metadata=meta, swmr=True)
+        h5 = open_nexus_writer("scan_001.nxs", metadata=meta)
         try:
             for i, (r1d, r2d) in enumerate(process_frames(...)):
                 write_nexus_frame(h5, i, result_1d=r1d, result_2d=r2d)
-                h5.flush()  # makes data visible to SWMR readers
+                h5.flush()
         finally:
             h5.close()
     """

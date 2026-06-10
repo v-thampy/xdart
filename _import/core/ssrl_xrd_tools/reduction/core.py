@@ -964,6 +964,20 @@ class ReductionSession:
 
         return self._products
 
+    def release_products(self, indices) -> None:
+        """Drop retained :class:`FrameReduction` objects for *indices*.
+
+        For persistent chunked sessions whose caller harvests each chunk's
+        results from :attr:`frames` (the serial/true-live per-frame pattern):
+        without releasing, a session reused across a long watch run retains
+        every frame's products — the same unbounded growth that
+        ``retain_products=False`` solves for sink-driven streaming.  Replace /
+        re-feed detection is unaffected (``_seen_idxs`` is kept), so a
+        released-then-re-fed index still counts as a replace, not a new
+        completion."""
+        for idx in indices:
+            self._products.pop(int(idx), None)
+
     def process(
         self,
         frames_or_chunk: Iterable[Frame] | tuple[Any, Iterable[int]] | None = None,
@@ -1516,6 +1530,7 @@ def run_reduction(
     gi_freeze_mode: str | None = None,
     execution: str = "chunked",
     inflight_max: int | None = None,
+    retain_products: bool | None = None,
 ) -> ReductionResult:
     """Run a headless reduction job over all frames in ``scan`` or a source.
 
@@ -1562,7 +1577,20 @@ def run_reduction(
     inflight_max
         Streaming only: max frames in flight (defaults to ``2 × workers``).
         Bounds peak memory for a fast source feeding a slower reduce.
+    retain_products
+        Whether ``result.frames`` accumulates every :class:`FrameReduction`
+        (full 2D arrays — ~14 GB on a 10k-frame 2D scan).  ``None`` (default)
+        auto-selects: ``False`` for STREAMING runs into a durable sink (the
+        data lands on disk per frame; read it back from the file), ``True``
+        otherwise (MemorySink / no sink / chunked — ``result.frames`` is the
+        only way to get results back).  Pass an explicit bool to override.
     """
+    if retain_products is None:
+        retain_products = not (
+            execution == "streaming"
+            and sink is not None
+            and not isinstance(sink, MemorySink)
+        )
     with ReductionSession(
         plan,
         scan,
@@ -1575,6 +1603,7 @@ def run_reduction(
         gi_freeze_mode=gi_freeze_mode,
         execution=execution,
         inflight_max=inflight_max,
+        retain_products=retain_products,
     ) as session:
         if execution == "streaming":
             # Streaming drains via submit() (process() is rejected); feed every

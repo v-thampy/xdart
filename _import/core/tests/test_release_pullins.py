@@ -149,3 +149,94 @@ def test_streaming_retain_products_default_unchanged(monkeypatch):
         session.submit(fr)
     result = session.finish()
     assert sorted(result.frames) == [0, 1, 2]   # historical contract intact
+
+
+# ── P1a: run_reduction retention auto-default ───────────────────────────────
+
+class _DuckDurableSink:
+    """Minimal duck sink standing in for a durable (disk) sink."""
+
+    def __init__(self):
+        self.frames = []
+
+    def begin(self, scan, plan):  # noqa: D401
+        pass
+
+    def write(self, frame, reduction):
+        self.frames.append(int(frame.index))
+
+    def finish(self, result):
+        pass
+
+
+def test_run_reduction_streaming_durable_sink_drops_retention(monkeypatch):
+    """P1a: the public headless wrapper must not silently retain every
+    FrameReduction when streaming into a durable sink — notebook users got
+    the unbounded default the GUI path had already fixed."""
+    from ssrl_xrd_tools.reduction import run_reduction
+
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    sink = _DuckDurableSink()
+    result = run_reduction(
+        ReductionPlan(integration_2d=None),
+        Scan("s", _frames(3), integrator=object()),
+        sink, execution="streaming", executor=2,
+    )
+    assert result.frames == {}                # not retained
+    assert result.n_processed == 3
+    assert sorted(sink.frames) == [0, 1, 2]   # data went to the sink
+
+    # Explicit override wins.
+    result = run_reduction(
+        ReductionPlan(integration_2d=None),
+        Scan("s", _frames(2), integrator=object()),
+        _DuckDurableSink(), execution="streaming", executor=1,
+        retain_products=True,
+    )
+    assert sorted(result.frames) == [0, 1]
+
+
+def test_run_reduction_memory_sink_and_chunked_keep_retention(monkeypatch):
+    from ssrl_xrd_tools.reduction import run_reduction
+
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    # MemorySink streaming: result.frames is the only product channel.
+    result = run_reduction(
+        ReductionPlan(integration_2d=None),
+        Scan("s", _frames(2), integrator=object()),
+        MemorySink(), execution="streaming", executor=1,
+    )
+    assert sorted(result.frames) == [0, 1]
+    # Chunked into a durable sink: historical contract intact.
+    result = run_reduction(
+        ReductionPlan(integration_2d=None),
+        Scan("s", _frames(2), integrator=object()),
+        _DuckDurableSink(),
+    )
+    assert sorted(result.frames) == [0, 1]
+
+
+def test_release_products_keeps_replace_semantics(monkeypatch):
+    """S2 (serial flavor): release_products drops retained reductions but
+    keeps _seen_idxs, so a released-then-re-fed index is still a REPLACE
+    (n_processed never double-counts)."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    frames = _frames(2)
+    session = ReductionSession(
+        ReductionPlan(integration_2d=None),
+        Scan("s", frames, integrator=object()),
+        sink=MemorySink(),
+    )
+    session.process(frames)
+    assert sorted(session.frames) == [0, 1]
+
+    session.release_products([0, 1])
+    assert session.frames == {}
+
+    session.process([frames[0]])               # re-feed after release
+    result = session.finish()
+    assert result.n_processed == 2             # replace, not a 3rd completion
+    assert sorted(session.frames) == [0]       # only the re-fed one retained
