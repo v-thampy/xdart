@@ -168,32 +168,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
-        # Top-bar polish (Vivek): size the controls to their CONTENT instead
-        # of the generated-UI fixed pixel widths (which elided 'Norm Channel'
-        # and needed hand-tuning), and give the whole row ONE height -- combo
-        # boxes and push buttons have different native heights in the macOS
-        # style, which made the row look ragged.
+        # Top-bar polish (Vivek): width = text + margin, computed from font
+        # metrics (no hand-tuned pixels, nothing elided), ONE height for the
+        # whole row (combos and buttons have different native heights on
+        # macOS).  NOTE: AdjustToContents + editable-centered combos were
+        # tried and reverted -- they broke the popups on macOS.
         _ROW_H = 28
-        for _c in (self.ui.normChannel, self.ui.scale, self.ui.cmap):
-            _c.setSizeAdjustPolicy(
-                QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
-        for _w in (self.ui.normChannel, self.ui.setBkg, self.ui.scale,
-                   self.ui.cmap):
-            _w.setMinimumWidth(0)
-            _w.setMaximumWidth(16777215)
-            _w.setFixedHeight(_ROW_H)
-        # Free the fixed-width containers so they shrink-wrap their contents
-        # (the freed space goes to the middle panels via the layout stretch).
         for _f in (self.ui.frame_4, self.ui.frame_6):
             _f.setMinimumSize(Qt.QtCore.QSize(0, 0))
             _f.setMaximumSize(Qt.QtCore.QSize(16777215, 16777215))
-        # Center the combo display text to match the push buttons (combos are
-        # left-aligned natively; only an editable combo's line edit can be
-        # aligned, so make it editable-but-read-only and reroute its clicks
-        # to the popup).
-        for _c in (self.ui.normChannel, self.ui.scale, self.ui.cmap,
-                   self.ui.imageUnit, self.ui.plotUnit, self.ui.plotMethod):
-            displayFrameWidget._center_combo(_c)
+        for _c in (self.ui.normChannel, self.ui.scale, self.ui.cmap):
+            displayFrameWidget._fit_combo_width(_c, max_w=130)
+            _c.setFixedHeight(_ROW_H)
+        displayFrameWidget._fit_button_width(self.ui.setBkg)
+        self.ui.setBkg.setFixedHeight(_ROW_H)
         self.ui.frame_4.setMinimumSize(Qt.QtCore.QSize(248, 0))
         self.ui.frame_4.setMaximumSize(Qt.QtCore.QSize(248, 16777215))
         self.ui.frame_6.setMinimumSize(Qt.QtCore.QSize(248, 0))
@@ -515,6 +503,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Raw image preview button
         self._showImageBtn = QtWidgets.QPushButton('Raw Image')
         self._showImageBtn.setFixedHeight(28)   # match the top-row controls
+        displayFrameWidget._fit_button_width(self._showImageBtn)
         self._showImageBtn.setMinimumSize(QtWidgets.QWidget().minimumSize())
         self._showImageBtn.setMaximumSize(Qt.QtCore.QSize(90, 16777215))
         self._showImageBtn.setToolTip('Show raw image preview for selected frame')
@@ -1923,24 +1912,23 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # ── Image preview dialog ──────────────────────────────────────
 
     @staticmethod
-    def _center_combo(combo):
-        """Center a QComboBox's displayed text (matches the buttons).
-
-        Non-editable combos can't align their text, so: editable + read-only
-        line edit + AlignCenter, with line-edit clicks rerouted to the popup
-        so the combo still behaves like a plain dropdown.  Popup items are
-        centered too."""
+    def _fit_combo_width(combo, *, max_w=200, arrow=34):
+        """Fixed width = widest item text + dropdown-arrow allowance."""
         try:
-            combo.setEditable(True)
-            le = combo.lineEdit()
-            le.setReadOnly(True)
-            le.setAlignment(pyQt.AlignCenter)
-            le.mousePressEvent = lambda _e, c=combo: c.showPopup()
-            for i in range(combo.count()):
-                combo.setItemData(i, pyQt.AlignCenter,
-                                  pyQt.TextAlignmentRole)
+            fm = combo.fontMetrics()
+            texts = [combo.itemText(i) for i in range(combo.count())] or ['']
+            w = max(fm.horizontalAdvance(t) for t in texts)
+            combo.setFixedWidth(min(w + arrow, max_w))
         except Exception:
-            logger.debug("combo centering failed", exc_info=True)
+            logger.debug("combo width fit failed", exc_info=True)
+
+    @staticmethod
+    def _fit_button_width(btn, *, pad=26):
+        """Fixed width = label text + padding."""
+        try:
+            btn.setFixedWidth(btn.fontMetrics().horizontalAdvance(btn.text()) + pad)
+        except Exception:
+            logger.debug("button width fit failed", exc_info=True)
 
     @staticmethod
     def integration_view_image(thumb, scan):

@@ -363,13 +363,19 @@ class staticWidget(QWidget):
             data_lock=self.data_lock,
             publication_store=self.publication_store)
         # Default panel proportions: middle (image/plot) panels ~10% wider
-        # than Qt's hint-based split (Vivek).  Relative values; the splitter
-        # normalizes them to the actual window width.
-        try:
-            self.ui.mainSplitter.setSizes([190, 570, 240])
-            self.ui.mainSplitter.setStretchFactor(1, 1)
-        except Exception:
-            logger.debug("mainSplitter default sizing failed", exc_info=True)
+        # than Qt's hint-based split (Vivek).  Applied via singleShot AFTER
+        # the window has real geometry -- setSizes at __init__ ran before the
+        # main window's resize() and got redistributed away.
+        def _default_split():
+            try:
+                total = sum(self.ui.mainSplitter.sizes()) or 1000
+                self.ui.mainSplitter.setSizes(
+                    [int(total * f) for f in (0.19, 0.57, 0.24)])
+                self.ui.mainSplitter.setStretchFactor(1, 1)
+            except Exception:
+                logger.debug("mainSplitter default sizing failed",
+                             exc_info=True)
+        QtCore.QTimer.singleShot(0, _default_split)
         self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
         if len(self.scan.frames.index) > 0:
             self.integratorTree.update()
