@@ -39,7 +39,7 @@ password = pypi-YOUR-TEST-TOKEN-HERE
 
 ## Step 1: Publish ssrl_xrd_tools first
 
-Since xdart depends on `ssrl_xrd_tools>=0.2.0`, you must publish ssrl_xrd_tools first.
+Since xdart depends on `ssrl_xrd_tools>=0.40.0`, you must publish ssrl_xrd_tools first.
 
 ```bash
 cd ~/repos/ssrl_xrd_tools
@@ -56,8 +56,8 @@ python -m build
 ```
 
 This creates two files in `dist/`:
-- `ssrl_xrd_tools-0.2.0.tar.gz` (source distribution)
-- `ssrl_xrd_tools-0.2.0-py3-none-any.whl` (wheel)
+- `ssrl_xrd_tools-0.40.0.tar.gz` (source distribution)
+- `ssrl_xrd_tools-0.40.0-py3-none-any.whl` (wheel)
 
 ### 1b. Test the package locally
 
@@ -65,7 +65,7 @@ This creates two files in `dist/`:
 # Install in a fresh environment to verify
 python -m venv /tmp/test-ssrl
 source /tmp/test-ssrl/bin/activate
-pip install dist/ssrl_xrd_tools-0.2.0-py3-none-any.whl
+pip install dist/ssrl_xrd_tools-0.40.0-py3-none-any.whl
 python -c "import ssrl_xrd_tools; print(ssrl_xrd_tools.__version__)"
 deactivate
 rm -rf /tmp/test-ssrl
@@ -115,7 +115,7 @@ python -m build
 ```bash
 python -m venv /tmp/test-xdart
 source /tmp/test-xdart/bin/activate
-pip install dist/xdart-0.15.0-py3-none-any.whl
+pip install dist/xdart-0.39.0-py3-none-any.whl
 python -c "import xdart; print('OK')"
 xdart  # test the console entry point
 deactivate
@@ -152,7 +152,7 @@ Create `recipes/ssrl_xrd_tools/meta.yaml`:
 
 ```yaml
 {% set name = "ssrl_xrd_tools" %}
-{% set version = "0.2.0" %}
+{% set version = "0.40.0" %}
 
 package:
   name: {{ name|lower }}
@@ -160,7 +160,7 @@ package:
 
 source:
   url: https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
-  # Get sha256 from: pip hash dist/ssrl_xrd_tools-0.2.0.tar.gz
+  # Get sha256 from: pip hash dist/ssrl_xrd_tools-0.40.0.tar.gz
   sha256: REPLACE_WITH_ACTUAL_SHA256
 
 build:
@@ -209,9 +209,9 @@ extra:
 To get the SHA256 hash:
 
 ```bash
-pip hash dist/ssrl_xrd_tools-0.2.0.tar.gz
+pip hash dist/ssrl_xrd_tools-0.40.0.tar.gz
 # Or after uploading to PyPI:
-curl -s https://pypi.org/pypi/ssrl_xrd_tools/0.2.0/json | python -c "import sys,json; d=json.load(sys.stdin); print([f['digests']['sha256'] for f in d['urls'] if f['filename'].endswith('.tar.gz')][0])"
+curl -s https://pypi.org/pypi/ssrl_xrd_tools/0.40.0/json | python -c "import sys,json; d=json.load(sys.stdin); print([f['digests']['sha256'] for f in d['urls'] if f['filename'].endswith('.tar.gz')][0])"
 ```
 
 ### 3b. Create the recipe for xdart
@@ -220,7 +220,7 @@ Create `recipes/xdart/meta.yaml`:
 
 ```yaml
 {% set name = "xdart" %}
-{% set version = "0.15.0" %}
+{% set version = "0.39.0" %}
 
 package:
   name: {{ name|lower }}
@@ -244,7 +244,7 @@ requirements:
     - setuptools >=64
   run:
     - python >=3.10
-    - ssrl_xrd_tools >=0.2.0
+    - ssrl_xrd_tools >=0.40.0
     - numpy
     - scipy
     - h5py

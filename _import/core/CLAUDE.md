@@ -50,7 +50,8 @@ per-frame — orthogonal, not a collapse).
   `hdf5` (codec), `provenance`, `metadata`, `config`.
 - **`io/`** — persistence + readers.
   - `nexus.py` — the stacked v2 writer/reader (`write_integrated_stack`, `read_scan`, the validators
-    above). The single source of truth for the on-disk schema.
+    above). Canonical source for the headless integrated-stack schema; xdart still owns a few
+    GUI/source-reference compatibility fields around that core.
   - `read.py` — convenience readers: `read_scan`-adjacent `get_1d` / `get_2d` / `get_thumbnail` /
     `get_metadata`, `get_raw_frame`, `open_scan` / `Scan`.
   - `frame_view.py` — `read_frame_view` / `iter_frame_views` (per-frame `FrameView` reconstruction;
