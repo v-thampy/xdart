@@ -465,3 +465,160 @@ def test_finish_join_timeout_normal_session_still_succeeds(monkeypatch):
     result = session.finish(join_timeout=30.0)   # large timeout, should complete fast
     assert result.n_processed == 4
     assert sorted(sink.frames) == list(range(4))
+
+
+# ---------------------------------------------------------------------------
+# T0-5/6/7 — destructive-teardown + writer-survival hardening
+# ---------------------------------------------------------------------------
+
+class _SpySink(MemorySink):
+    """MemorySink recording whether finish()/abort() were called."""
+
+    def __init__(self):
+        super().__init__()
+        self.finish_called = False
+        self.abort_called = False
+
+    def finish(self, result):
+        self.finish_called = True
+        return super().finish(result)
+
+    def abort(self, result):
+        self.abort_called = True
+
+
+def test_finish_timeout_does_not_touch_sink_while_writer_alive(monkeypatch):
+    """T0-5: on a writer-join timeout the writer thread is STILL ALIVE and may
+    yet write -- finish() must NOT call sink.finish()/abort() (atomic-mode
+    NexusSink.abort used to unlink the tmp holding every written frame, and
+    closing the h5 handle races the in-flight write)."""
+    gate = threading.Event()
+
+    def blocking(image, ai, **kw):
+        gate.wait(5)
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", blocking)
+    sink = _SpySink()
+    session = ReductionSession(
+        _plan(), Scan("s", _frames(1), integrator=object()),
+        sink=sink, execution="streaming", executor=1,
+    )
+    session.submit(_frames(1)[0])
+
+    with pytest.warns(RuntimeWarning):
+        result = session.finish(raise_on_failure=False, join_timeout=0.3)
+
+    assert result.failed                      # loud failure, not silence
+    assert sink.finish_called is False        # sink left untouched
+    assert sink.abort_called is False
+
+    gate.set()    # release the worker so the thread can exit cleanly
+
+
+def test_nexus_sink_abort_preserves_partial(tmp_path):
+    """T0-6/S7: in atomic mode every frame written so far lives in the tmp
+    file; abort() must preserve it as <output>.partial, never unlink it."""
+    from ssrl_xrd_tools.reduction import NexusSink
+
+    out = tmp_path / "run.nxs"
+    sink = NexusSink(out, overwrite=True)
+    sink.begin(Scan("s", _frames(1), integrator=object()), _plan())
+    assert sink._tmp_path is not None and sink._tmp_path.exists()
+    tmp = sink._tmp_path
+
+    with pytest.warns(RuntimeWarning, match="partial"):
+        sink.abort(result=None)
+
+    partial = tmp_path / "run.nxs.partial"
+    assert partial.exists(), "aborted run's data must be preserved"
+    assert not tmp.exists()
+    assert not out.exists()                   # never half-promoted
+
+
+def test_nexus_sink_finish_failure_preserves_partial(tmp_path, monkeypatch):
+    """T0-6/S7: a finish-time failure (e.g. scan_data upsert) must surface
+    loudly AND leave the written frames recoverable as <output>.partial."""
+    from ssrl_xrd_tools.reduction import NexusSink
+    from ssrl_xrd_tools.reduction.core import Scan as _Scan
+
+    out = tmp_path / "run2.nxs"
+    sink = NexusSink(out, overwrite=True)
+    scan = _Scan("s", _frames(1), integrator=object())
+    sink.begin(scan, _plan())
+
+    def boom(self):
+        raise RuntimeError("scan_data upsert failed")
+
+    monkeypatch.setattr(type(scan), "to_scan_data", boom)
+    with pytest.raises(RuntimeError, match="upsert failed"):
+        with pytest.warns(RuntimeWarning, match="partial"):
+            sink.finish(result=None)
+
+    assert (tmp_path / "run2.nxs.partial").exists()
+    assert not out.exists()
+
+
+def test_writer_loop_survives_raising_progress_callback(monkeypatch):
+    """T0-7/S1: an exception from the post-write progress callback must be
+    RECORDED as the session failure, not allowed to kill the writer thread --
+    a dead writer made submit() spin forever on the in-flight window and
+    finish() join a dead thread and report SUCCESS with frames missing."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+
+    def bad_cb(progress, *a, **k):
+        # Only the post-write emission runs on the writer thread; the 'start'
+        # stage is emitted synchronously from submit() and is out of scope.
+        if getattr(progress, "stage", "") == "write":
+            raise RuntimeError("boom from progress callback")
+
+    frames = _frames(2)
+    session = ReductionSession(
+        _plan(), Scan("s", frames, integrator=object()),
+        sink=MemorySink(), execution="streaming", executor=1,
+        progress_cb=bad_cb,
+    )
+    session.submit(frames[0])
+    assert session.drain(timeout=5)           # writer ALIVE: queue drains
+    assert session._writer_thread.is_alive()
+    # The callback failure was recorded -> the next submit raises it loudly
+    # (fail-loud contract), instead of silently proceeding or deadlocking.
+    deadline = time.monotonic() + 5
+    while session._failure is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert isinstance(session._failure, RuntimeError)
+    with pytest.raises(RuntimeError, match="progress callback"):
+        session.submit(frames[1])
+    result = session.finish(raise_on_failure=False)
+    assert result.failed
+    assert result.n_processed == 1            # the write itself succeeded
+
+
+def test_submit_detects_dead_writer(monkeypatch):
+    """T0-7 belt-and-suspenders: if the writer thread dies anyway, a blocked
+    submit() must detect it, record a failure, and return -- not spin on the
+    in-flight semaphore forever."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    frames = _frames(2)
+    session = ReductionSession(
+        _plan(), Scan("s", frames, integrator=object()),
+        sink=MemorySink(), execution="streaming", executor=1,
+    )
+    session.submit(frames[0])
+    assert session.drain(timeout=5)
+
+    # Simulate a dead writer + a full in-flight window.
+    dead = threading.Thread(target=lambda: None)
+    dead.start(); dead.join()
+    session._writer_thread = dead
+    while session._semaphore.acquire(blocking=False):
+        pass
+
+    t0 = time.monotonic()
+    session.submit(frames[1])                 # returns; previously spun forever
+    assert time.monotonic() - t0 < 5.0
+    assert session._cancelled
+    assert isinstance(session._failure, RuntimeError)
+    assert "writer thread died" in str(session._failure)

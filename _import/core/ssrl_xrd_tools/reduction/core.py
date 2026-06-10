@@ -757,9 +757,10 @@ class NexusSink:
             # integrated frame, before close.  A finish-time single upsert is
             # correct for a batch sink; only the GUI's SWMR live consumers would
             # need scan_data mid-run (they'd require a per-write incremental
-            # upsert).  Any failure here propagates (after the file is closed
-            # below) so a lost condition table is surfaced, not silent — the
-            # integrated stacks written during write() are already intact.
+            # upsert).  Any failure here propagates (after abort() below) so a
+            # lost condition table is surfaced, not silent — and abort()
+            # preserves the frames written so far (atomic mode keeps the tmp
+            # as <output>.partial instead of unlinking it, T0-6/S7).
             scan = self._scan
             if scan is not None:
                 scan_data = scan.to_scan_data()
@@ -783,6 +784,11 @@ class NexusSink:
             self._tmp_path = None
 
     def abort(self, result: ReductionResult) -> None:
+        """Failure teardown.  NEVER destroys written data (T0-6/S7): in atomic
+        mode the tmp file holds every frame written this run, so instead of
+        unlinking it (which converted a finish-time failure into deletion of
+        the whole run) it is preserved as ``<output>.partial`` and a warning
+        names it.  Non-atomic mode writes in place — nothing to move."""
         h5 = self._h5
         tmp_path = self._tmp_path
         self._h5 = None
@@ -794,11 +800,23 @@ class NexusSink:
                 h5.close()
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
-        if tmp_path is not None:
+        if tmp_path is not None and tmp_path.exists():
+            partial = Path(str(self.path) + ".partial")
             try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:  # pragma: no cover - best-effort cleanup
-                pass
+                tmp_path.replace(partial)
+                warnings.warn(
+                    f"NexusSink.abort: run failed — frames written so far are "
+                    f"preserved at {partial} (not a finalized scan file).",
+                    RuntimeWarning, stacklevel=2,
+                )
+            except Exception:  # pragma: no cover - best-effort preservation
+                # Could not even rename: leave the tmp where it is rather
+                # than deleting it.
+                warnings.warn(
+                    f"NexusSink.abort: run failed — could not rename the "
+                    f"partial output; data left at {tmp_path}.",
+                    RuntimeWarning, stacklevel=2,
+                )
 
 
 @dataclass(slots=True)
@@ -1035,6 +1053,18 @@ class ReductionSession:
             if self._cancelled or self.cancel_token.cancelled:
                 self._cancelled = True
                 return
+            if (self._writer_thread is not None
+                    and not self._writer_thread.is_alive()):
+                # T0-7/S1 belt-and-suspenders: the writer died, so no slot
+                # will ever free.  Record the failure and return cleanly
+                # (matching the cancel path — raising here would escape the
+                # caller's run() and tear down the QThread); the NEXT submit
+                # raises the recorded failure at its fail-loud precheck.
+                self._failure = self._failure or RuntimeError(
+                    "ReductionSession writer thread died; run cannot proceed"
+                )
+                self._cancelled = True
+                return
         if self._cancelled or self.cancel_token.cancelled:
             self._cancelled = True
             self._semaphore.release()
@@ -1086,10 +1116,10 @@ class ReductionSession:
                 except BaseException as exc:  # integration failure for one frame
                     self._failure = self._failure or exc
                     continue
-                idx = int(frame.index)
-                replacing = idx in self._products
-                self._products[idx] = reduction
                 try:
+                    idx = int(frame.index)
+                    replacing = idx in self._products
+                    self._products[idx] = reduction
                     if replacing:
                         _emit_sink_replace(self._sink, frame, reduction)
                     else:
@@ -1098,11 +1128,19 @@ class ReductionSession:
                 except BaseException as exc:
                     self._failure = self._failure or exc
                 else:
-                    _emit(self.progress_cb, self.scan.name, "write",
-                          frame.index, self._completed, len(self.scan))
-                    if self.clear_frame_images:
-                        frame.image = None
-                        _clear_source_frame_image(self.source, frame.index)
+                    # T0-7/S1: a progress-callback or image-clear exception
+                    # must be RECORDED, not allowed to escape — an escape
+                    # kills this thread, after which submit() blocks forever
+                    # on the in-flight semaphore and finish() join()s a dead
+                    # thread and reports SUCCESS with frames missing.
+                    try:
+                        _emit(self.progress_cb, self.scan.name, "write",
+                              frame.index, self._completed, len(self.scan))
+                        if self.clear_frame_images:
+                            frame.image = None
+                            _clear_source_frame_image(self.source, frame.index)
+                    except BaseException as exc:
+                        self._failure = self._failure or exc
             finally:
                 self._semaphore.release()
                 self._write_queue.task_done()
@@ -1225,7 +1263,25 @@ class ReductionSession:
         )
         try:
             if self._started:
-                if self._failure is None:
+                if _writer_timed_out:
+                    # T0-5: the writer thread is STILL ALIVE (a stalled worker
+                    # holds it in future.result()) and may yet call
+                    # sink.write() on its h5 handle.  Tearing the sink down
+                    # here would (a) race h5.close() against an in-flight
+                    # write — h5py handles are not thread-safe — and (b) in
+                    # atomic-mode NexusSink, abort() used to unlink the tmp
+                    # file holding every frame written so far.  Leave the sink
+                    # untouched; the recorded TimeoutError (raised below) is
+                    # the loud signal, and the on-disk file keeps whatever was
+                    # written.
+                    warnings.warn(
+                        "ReductionSession.finish(): writer join timed out — "
+                        "skipping sink finish/abort (writer may still be "
+                        f"writing); on-disk output for {self.scan.name!r} is "
+                        "left as-is.",
+                        RuntimeWarning, stacklevel=2,
+                    )
+                elif self._failure is None:
                     self._sink.finish(self.result)
                 else:
                     abort = getattr(self._sink, "abort", None)
