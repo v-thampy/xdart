@@ -738,6 +738,13 @@ class DisplayPlotMixin:
         """
         if self.wf_dialog.layout() is None:
             self.setup_wf_options_widget()
+        elif self.wf_yaxis_widget.count() <= 3 and self.idxs_1d:
+            # Dialog was first built with no trace loaded -- top up the
+            # waterfall y-axis choices with the now-available metadata.
+            frame = self.data_1d.get(self.idxs_1d[0])
+            if frame is not None:
+                self.wf_yaxis_widget.addItems(
+                    list(getattr(frame, 'scan_info', {}) or {}))
 
         self.wf_dialog.show()
 
@@ -792,9 +799,14 @@ class DisplayPlotMixin:
         btns.addWidget(self.wf_cancel_button)
         layout.addLayout(btns)
 
-        frame = self.data_1d[self.idxs_1d[0]]
-        counters = list(frame.scan_info.keys())
-        counters = ['Frame #', 'Time (s)', 'Time (minutes)'] + counters
+        # Options is reachable from launch now (it hosts scale/cmap), so a
+        # trace may not exist yet -- fall back to the built-in counters; the
+        # metadata counters are topped up on later opens (popup_wf_options).
+        counters = ['Frame #', 'Time (s)', 'Time (minutes)']
+        if self.idxs_1d:
+            frame = self.data_1d.get(self.idxs_1d[0])
+            if frame is not None:
+                counters += list(getattr(frame, 'scan_info', {}) or {})
         self.wf_yaxis_widget.addItems(counters)
 
         self.wf_start_widget.setDecimals(0)

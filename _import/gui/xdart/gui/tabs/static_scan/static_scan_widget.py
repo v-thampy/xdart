@@ -375,7 +375,11 @@ class staticWidget(QWidget):
             except Exception:
                 logger.debug("mainSplitter default sizing failed",
                              exc_info=True)
+        # Twice: at 0ms (offscreen/tests) and after the macOS window manager
+        # has settled the real frame size (the 0ms shot fired before the
+        # native resize on mac, so the proportions were redistributed away).
         QtCore.QTimer.singleShot(0, _default_split)
+        QtCore.QTimer.singleShot(400, _default_split)
         self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
         if len(self.scan.frames.index) > 0:
             self.integratorTree.update()
