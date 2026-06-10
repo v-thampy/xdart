@@ -340,8 +340,26 @@ def _load_frame_v2(h5file, idx: int, *, static: bool, gi: bool,
     # re-integration is feasible by checking that the source file
     # exists on disk — if it does, lazy load can recover map_raw;
     # if it doesn't, the GUI guardrail should still fire.
-    if source_root:
-        frame._source_root = source_root
+    #
+    # N1: a portable .nxs stores source_file RELATIVE to the project root
+    # (entry/@source_base), which is NOT necessarily the .nxs directory (the
+    # default output is <root>/xdart_processed_data).  Resolve relative paths
+    # against @source_base when present; fall back to the .nxs dir (source_root)
+    # for old / absolute-path files (an absolute source_file ignores the root).
+    eff_source_root = source_root
+    try:
+        e = h5file.get("entry")
+        if e is not None and "source_base" in e.attrs:
+            sb = e.attrs["source_base"]
+            if isinstance(sb, bytes):
+                sb = sb.decode("utf-8", errors="replace")
+            if sb:
+                eff_source_root = str(sb)
+    except Exception:
+        logger.debug("reading @source_base for frame %d failed", idx,
+                     exc_info=True)
+    if eff_source_root:
+        frame._source_root = eff_source_root
     if frame.source_file and frame._lazy_load_resolvable():
         frame.is_reload_only = False
     else:

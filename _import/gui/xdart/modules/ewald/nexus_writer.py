@@ -966,6 +966,35 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
     output_dir = os.path.dirname(os.path.abspath(h5f.filename))
     existing_frame_keys = set(h5_frames.keys())
 
+    # N1: the project root that per-frame source paths are stored relative to.
+    # Set on the scan by the wrangler (GUI Project Folder); absent -> absolute
+    # paths (back-compat).  Stamp it once on the entry (POSIX) so the readers
+    # can resolve the relative pointers after the data moves machines.
+    source_base = getattr(scan, "source_base", None) or None
+    if source_base:
+        source_base = os.path.abspath(os.path.expanduser(str(source_base)))
+        posix_base = Path(source_base).as_posix()
+        # P2 #4 (codex): ONE scan-level @source_base governs ALL frames' relative
+        # source paths.  Appending to a file written under a DIFFERENT root would
+        # silently rebase the EARLIER frames against the new one (wrong path) -->
+        # reject loudly rather than corrupt their resolution.
+        existing = h5f[entry].attrs.get("source_base") if entry in h5f else None
+        if existing is not None:
+            if isinstance(existing, bytes):
+                existing = existing.decode("utf-8", errors="replace")
+            if str(existing) != posix_base:
+                raise ValueError(
+                    f"cannot append to {os.fspath(h5f.filename)!r}: its Project "
+                    f"Folder (@source_base={str(existing)!r}) differs from the "
+                    f"current ({posix_base!r}).  Earlier frames' relative source "
+                    f"paths are stored against the old root; start a NEW output "
+                    f"file for the new Project Folder."
+                )
+        try:
+            h5f[entry].attrs["source_base"] = posix_base
+        except Exception:
+            logger.debug("failed to stamp @source_base on %s", entry, exc_info=True)
+
     # Filter the index *before* touching any frame object.  This is
     # the whole point of the cursor: we never lazy-load a frame we'd
     # immediately skip.
@@ -1024,7 +1053,8 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
         # frame.map_raw verbatim, which silently dumped 18 MB per
         # Eiger frame into the .nxs.  Don't bring that back.
 
-        _write_source_ref(fg, frame, output_dir=output_dir)
+        _write_source_ref(fg, frame, output_dir=output_dir,
+                          source_base=source_base)
 
         ts = getattr(frame, "timestamp", None)
         if ts is not None:
@@ -1033,7 +1063,8 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
         frames[frame_key] = fg
 
 
-def _write_source_ref(fg, frame, *, output_dir: str | None = None) -> None:
+def _write_source_ref(fg, frame, *, output_dir: str | None = None,
+                      source_base: str | None = None) -> None:
     """Attach an ``NXcollection`` carrying the raw-source pointer.
 
     Writes ``source/path`` and ``source/frame_index`` under the
@@ -1044,10 +1075,20 @@ def _write_source_ref(fg, frame, *, output_dir: str | None = None) -> None:
     image is a single-frame file; for Eiger / multi-frame sources the
     wrangler should set ``source_frame_idx`` to the index *within*
     the source data file).
+
+    N1: when ``source_base`` (the project root) is given, ``path`` is stored
+    RELATIVE to it (POSIX, portable); otherwise it is stored absolute (POSIX,
+    back-compat).  ``relative_source_path`` warns + falls back to absolute for a
+    raw that sits outside the root.  Pair with ``entry/@source_base`` written by
+    the caller.
     """
+    from ssrl_xrd_tools.io.read import relative_source_path
+
     src_path = getattr(frame, "source_file", "") or ""
     if not src_path:
         return
+    # Resolve to an absolute path first (the frame may carry a relative
+    # source_file + a _resolved_source_path() helper, or sit under output_dir).
     if not os.path.isabs(src_path):
         resolved = ""
         if hasattr(frame, "_resolved_source_path"):
@@ -1065,7 +1106,7 @@ def _write_source_ref(fg, frame, *, output_dir: str | None = None) -> None:
     if src_frame_idx is None:
         src_frame_idx = getattr(frame, "idx", 0)
     sub = nx.NXcollection()
-    sub["path"] = nx.NXfield(os.path.abspath(str(src_path)))
+    sub["path"] = nx.NXfield(relative_source_path(src_path, source_base))
     sub["frame_index"] = nx.NXfield(int(src_frame_idx))
     fg["source"] = sub
 

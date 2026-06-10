@@ -36,6 +36,15 @@ from xdart.utils.session import load_session, save_session
 QFileDialog = QtWidgets.QFileDialog
 
 params = [
+    # N1: the portable Project Folder.  Setting it stamps entry/@source_base and
+    # stores each frame's raw source path RELATIVE to it (portable .nxs); blank
+    # -> absolute paths (back-compat).  Mirrors the image wrangler (the fuller
+    # progressive-disclosure UX is image-wrangler only; here it's the portable
+    # field + wiring).
+    {'name': 'Project', 'title': 'Project Folder', 'type': 'group', 'children': [
+        {'name': 'project_folder', 'title': 'Folder', 'type': 'str', 'value': ''},
+        NamedActionParameter(name='project_folder_browse', title='Browse...'),
+    ], 'expanded': True},
     {'name': 'Calibration', 'type': 'group', 'children': [
         {'name': 'poni_file', 'title': 'PONI File    ', 'type': 'str', 'value': ''},
         NamedActionParameter(name='poni_file_browse', title='Browse...'),
@@ -100,6 +109,9 @@ class nexusWrangler(wranglerWidget):
         # Attributes
         self.nexus_file = ''
         self.entry = 'entry'
+        # N1: Project Folder (portable @source_base).  Blank -> None (absolute).
+        self.project_folder = ''
+        self.source_base = None
         self.poni_file = ''
         self.mask_file = ''
         self.h5_dir = get_fname_dir()
@@ -209,6 +221,9 @@ class nexusWrangler(wranglerWidget):
         layout.addWidget(self.tree)
 
         # Connect parameter browse buttons
+        self.parameters.child('Project').child('project_folder_browse').sigActivated.connect(
+            self.browse_project_folder
+        )
         self.parameters.child('Calibration').child('poni_file_browse').sigActivated.connect(
             self.browse_poni
         )
@@ -260,6 +275,7 @@ class nexusWrangler(wranglerWidget):
     # ── Session persistence ──────────────────────────────────────────
 
     _SESSION_PARAMS = [
+        ('project_folder',      ('Project', 'project_folder'),   True,  'project_folder'),
         ('poni_file',           ('Calibration', 'poni_file'),    True,  'poni_file'),
         ('nexus_file',          ('NeXus File', 'nexus_file'),    True,  'nexus_file'),
         ('entry',               ('NeXus File', 'entry'),         False, 'entry'),
@@ -401,6 +417,22 @@ class nexusWrangler(wranglerWidget):
 
     # ── Browse dialogs ───────────────────────────────────────────────
 
+    def _compute_source_base(self):
+        """N1: the absolute project root, or None when the Project Folder is
+        blank (-> the writer stores absolute raw paths, back-compat)."""
+        pf = (self.parameters.child('Project').child('project_folder').value() or '').strip()
+        return os.path.abspath(os.path.expanduser(pf)) if pf else None
+
+    def browse_project_folder(self):
+        """Browse for the N1 Project Folder; setting it makes the processed
+        ``.nxs`` store raw source paths RELATIVE to this root (portable)."""
+        folder = QFileDialog.getExistingDirectory(self, 'Choose Project Folder', '')
+        if folder:
+            self.parameters.child('Project').child('project_folder').setValue(folder)
+            self.project_folder = folder
+            self.source_base = self._compute_source_base()
+            self._save_to_session()
+
     def browse_poni(self):
         poni_file, _ = QFileDialog.getOpenFileName(
             self, 'Select PONI file', '', 'PONI files (*.poni);;All files (*)')
@@ -445,6 +477,9 @@ class nexusWrangler(wranglerWidget):
         self.entry = self.parameters.child('NeXus File').child('entry').value()
         self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
         self.mask_file = self.parameters.child('Signal').child('mask_file').value()
+        # N1: Project Folder -> @source_base (relative raw paths -> portable .nxs).
+        self.project_folder = self.parameters.child('Project').child('project_folder').value()
+        self.source_base = self._compute_source_base()
 
         # Load PONI if needed
         if self.poni_file and os.path.exists(self.poni_file):
@@ -504,6 +539,9 @@ class nexusWrangler(wranglerWidget):
         self.thread.data_1d = self.data_1d
         self.thread.data_2d = self.data_2d
         self.thread.command = self.command
+        # N1: push the project root so the writer stamps @source_base + relative
+        # raw paths (set AFTER the thread recreate above).
+        self.thread.source_base = self.source_base
 
     def start(self):
         self.command = 'start'
