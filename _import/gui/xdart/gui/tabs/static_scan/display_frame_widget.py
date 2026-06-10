@@ -179,9 +179,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # visibly shorter.
         self.ui.frame_top.setMinimumSize(Qt.QtCore.QSize(0, 40))
         self.ui.frame_top.setMaximumSize(Qt.QtCore.QSize(16777215, 40))
+        # Pin BOTH cluster containers to one height (34 inside the 40 row)
+        # so their painted boxes match -- left shrink-wrapped a few px
+        # shorter than right under the mac style.  Children stay 28 and
+        # center inside.
         for _f in (self.ui.frame_4, self.ui.frame_6):
-            _f.setMinimumSize(Qt.QtCore.QSize(0, 0))
-            _f.setMaximumSize(Qt.QtCore.QSize(16777215, 16777215))
+            _f.setMinimumSize(Qt.QtCore.QSize(0, 34))
+            _f.setMaximumSize(Qt.QtCore.QSize(16777215, 34))
+            _lay = _f.layout()
+            if _lay is not None:
+                for _i in range(_lay.count()):
+                    _cw = _lay.itemAt(_i).widget()
+                    if _cw is not None:
+                        _lay.setAlignment(_cw, pyQt.AlignVCenter)
         # Center EVERY top-row cell vertically: frame_4 (Norm Channel/Set
         # Bkg) anchored top while frame_6 (Log/Raw Image) was centered, so
         # the two clusters sat ~3px apart -- the 'Log looks low' symptom.
@@ -235,10 +245,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._logBtn.setChecked(self.ui.scale.currentText() == 'Log')
             self._logBtn.blockSignals(False)
         self.ui.scale.currentIndexChanged.connect(_sync_log_btn)
-        self.ui.frame_4.setMinimumSize(Qt.QtCore.QSize(248, 0))
-        self.ui.frame_4.setMaximumSize(Qt.QtCore.QSize(248, 16777215))
-        self.ui.frame_6.setMinimumSize(Qt.QtCore.QSize(248, 0))
-        self.ui.frame_6.setMaximumSize(Qt.QtCore.QSize(248, 16777215))
         # Shared reentrant lock guarding data_1d / data_2d.  When created
         # standalone (tests, viewer mode) fall back to a private lock.
         self.data_lock = data_lock if data_lock is not None else threading.RLock()
