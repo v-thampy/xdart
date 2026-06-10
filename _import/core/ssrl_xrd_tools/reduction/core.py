@@ -931,6 +931,10 @@ class ReductionSession:
             initial_incident_angle=self._initial_incident_angle,
         )
         self.integrator_provider_builds = 1
+        # S8: the monitor warn-once set is per-process; without this reset a
+        # dead monitor in scan 1 silences the warning for every later scan in
+        # a long GUI session.  Per-session scope = once per run.
+        _warned_monitor_keys.clear()
         # Validate BEFORE acquiring resources: sink.begin() opens an h5 handle
         # (atomic NexusSink also creates its hidden .tmp) and _coerce_executor
         # may build an owned pool — a ValueError after those leaks both, with

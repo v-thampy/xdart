@@ -76,7 +76,13 @@ Integrated2D = namedtuple(
 def _entry(f: h5py.File, entry: str) -> h5py.Group:
     if entry not in f:
         raise KeyError(f"No {entry!r} group in {f.filename}")
-    return f[entry]
+    grp = f[entry]
+    # C1: every convenience reader funnels through here -- warn once per call
+    # when the file is NEWER than this library supports, before dataset access
+    # fails with an opaque KeyError.
+    from ssrl_xrd_tools.io.nexus import warn_if_newer_schema
+    warn_if_newer_schema(grp, str(f.filename))
+    return grp
 
 
 def _decode(v):
