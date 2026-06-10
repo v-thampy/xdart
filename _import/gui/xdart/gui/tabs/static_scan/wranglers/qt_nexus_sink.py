@@ -175,6 +175,11 @@ class QtNexusSink:
 
     def finish(self, result) -> None:
         self._flush(force=True)
+        # T0-8: frames whose reduction failed or was cancelled mid-flight were
+        # never popped by write()/replace() — left in the registry they pin
+        # their LiveFrames (and, since batch worker_process frees raw only on
+        # the success path, their full raw images) for the scan's lifetime.
+        self._registry.clear()
         if getattr(self._host, "batch_mode", False):
             sig = getattr(self._host, "sigUpdate", None)
             if sig is not None:
@@ -187,6 +192,7 @@ class QtNexusSink:
             self._flush(force=True)
         except Exception:
             logger.exception("QtNexusSink.abort flush failed")
+        self._registry.clear()     # T0-8: see finish()
 
     # -- internals --------------------------------------------------------
     def _hydrate(self, live, frame, reduction) -> None:

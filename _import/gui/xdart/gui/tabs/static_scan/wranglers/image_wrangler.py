@@ -961,6 +961,12 @@ class imageWrangler(wranglerWidget):
         """Request a Pause: freeze processing at a frame boundary without
         tearing down the scan/session (worker's _wait_if_paused handles it).
         Mirror the command onto self + thread (same delivery as stop())."""
+        # RS-2: never overwrite a stop — the worker self-stops by writing
+        # thread.command='stop' directly (write-failure stop, GI freeze
+        # abort); blindly writing 'pause' here would silently revive a run
+        # that just declared itself dead.
+        if self.command == 'stop' or self.thread.command == 'stop':
+            return
         self.command = 'pause'
         self.thread.command = 'pause'
         # Transient state until the worker confirms via sigPaused -> _on_paused
@@ -983,6 +989,9 @@ class imageWrangler(wranglerWidget):
         sigResuming slot runs synchronously, same GUI thread), THEN flip the
         command back to the run state so a browse read can't race the restarted
         writer."""
+        # RS-2: a stop that landed while paused must stay a stop (see pause()).
+        if self.command == 'stop' or self.thread.command == 'stop':
+            return
         self.sigResuming.emit()
         self.command = 'start'
         self.thread.command = 'start'

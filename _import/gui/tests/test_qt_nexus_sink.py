@@ -294,3 +294,27 @@ def test_resume_parity_streaming_nxs_matches_unpaused(tmp_path):
             np.asarray(rb.frames[i].int_1d.intensity),
             err_msg=f"frame {i} differs between paused and un-paused .nxs",
         )
+
+
+def test_finish_and_abort_clear_unwritten_registry(tmp_path):
+    """T0-8: frames whose reduction failed/was cancelled mid-flight are never
+    popped by write()/replace() — finish() and abort() must clear the registry
+    so they don't pin LiveFrames (and their raw images) for the scan's life."""
+    from types import SimpleNamespace
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+
+    for teardown in ("finish", "abort"):
+        scan = LiveScan(data_file=str(tmp_path / f"reg_{teardown}.nxs"))
+        scan.skip_2d = True
+        host = _FakeHost(batch_mode=True)
+        sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+        sink.begin(scan, _minimal_plan())
+        # Two in-flight frames that will never reach write() (failed/cancelled).
+        sink.register(SimpleNamespace(idx=0))
+        sink.register(SimpleNamespace(idx=1))
+        assert len(sink._registry) == 2
+
+        getattr(sink, teardown)(result=None)
+
+        assert sink._registry == {}, f"{teardown}() left frames pinned"

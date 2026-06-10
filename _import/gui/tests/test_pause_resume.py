@@ -229,3 +229,87 @@ def test_guard_lift_noop_when_not_in_run():
     staticWidget._on_run_paused(w)
     staticWidget._on_run_resuming(w)
     assert calls == []
+
+
+def test_enter_pause_drain_timeout_skips_flush_but_signals():
+    """RS-1: a drain() timeout means the writer is provably NOT idle — a
+    save/flush from the wrangler thread would violate the single-writer
+    invariant, and resetting the save counter without saving would break
+    persist-before-evict.  Pause still proceeds (sigPaused fires) without
+    touching the file; the tail flushes on resume/finish."""
+    calls, emitted = [], []
+    session = SimpleNamespace(
+        drain=lambda timeout=None: (calls.append('drain'), False)[1])
+    sink = SimpleNamespace(
+        _flush=lambda *, force=False: calls.append(('flush', force)))
+    scan = SimpleNamespace(data_file='x.nxs',
+                           _save_to_nexus=lambda: calls.append('save'))
+    w = SimpleNamespace(
+        _streaming_session=session, _streaming_sink=sink,
+        _active_scan=scan, xye_only=False, _frames_since_save=4,
+        file_lock=threading.RLock(),
+        _flush_xye_buffer=lambda s: calls.append('xye'),
+        sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
+    )
+    w._enter_pause = MethodType(imageThread._enter_pause, w)
+
+    w._enter_pause()
+
+    assert calls == ['drain']            # no save, no sink flush, no xye
+    assert w._frames_since_save == 4     # counter preserved for the next save
+    assert emitted == ['paused']         # the freeze guard still lifts
+
+
+def _rs2_wrangler(command, thread_command):
+    """Light holder driving the real pause()/_on_resume() command logic."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+    calls = []
+    w = SimpleNamespace(
+        command=command,
+        thread=SimpleNamespace(command=thread_command),
+        _set_action_button=lambda phase: calls.append(('button', phase)),
+        sigResuming=SimpleNamespace(emit=lambda: calls.append('resuming')),
+    )
+    w.pause = MethodType(imageWrangler.pause, w)
+    w._on_resume = MethodType(imageWrangler._on_resume, w)
+    return w, calls
+
+
+def test_pause_does_not_overwrite_worker_stop():
+    """RS-2: the worker self-stops by writing thread.command='stop' directly
+    (write-failure stop, GI freeze abort).  A Pause click landing just after
+    must NOT overwrite it — that silently revived a run that had declared
+    itself dead."""
+    w, calls = _rs2_wrangler(command='start', thread_command='stop')
+
+    w.pause()
+
+    assert w.thread.command == 'stop'    # stop preserved
+    assert w.command == 'start'          # GUI mirror untouched (no 'pause')
+    assert calls == []                   # no 'pausing' morph for a dead run
+
+
+def test_resume_does_not_revive_stop():
+    """RS-2: a stop that landed while paused must stay a stop — _on_resume
+    must not re-engage the freeze guard or flip the command back to start."""
+    w, calls = _rs2_wrangler(command='start', thread_command='stop')
+
+    w._on_resume()
+
+    assert w.thread.command == 'stop'
+    assert 'resuming' not in calls       # guard NOT re-engaged for a dead run
+    assert calls == []
+
+
+def test_pause_and_resume_still_work_when_running():
+    """RS-2 control: the normal path is unchanged."""
+    w, calls = _rs2_wrangler(command='start', thread_command='start')
+    w.pause()
+    assert w.thread.command == 'pause' and w.command == 'pause'
+    assert ('button', 'pausing') in calls
+
+    w2, calls2 = _rs2_wrangler(command='pause', thread_command='pause')
+    w2._on_resume()
+    assert w2.thread.command == 'start' and w2.command == 'start'
+    assert calls2[0] == 'resuming'       # guard re-engaged FIRST
+    assert ('button', 'running') in calls2
