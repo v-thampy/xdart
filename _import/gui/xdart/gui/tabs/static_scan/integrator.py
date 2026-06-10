@@ -504,7 +504,14 @@ class integratorTree(QtWidgets.QWidget):
                 if hasattr(w, 'setChecked'):
                     w.setChecked(bool(val))
                 elif hasattr(w, 'setCurrentIndex'):
-                    w.setCurrentIndex(int(val))
+                    # Clamp: a saved index can exceed the combo's CURRENT
+                    # item count (e.g. saved in GI mode, restored in
+                    # standard mode) -- setCurrentIndex(-1/out-of-range)
+                    # leaves currentText empty, which poisoned
+                    # _get_unit_1D (KeyError: '').
+                    _idx = int(val)
+                    if 0 <= _idx < w.count():
+                        w.setCurrentIndex(_idx)
                 elif hasattr(w, 'setText'):
                     w.setText(str(val))
             except Exception:
