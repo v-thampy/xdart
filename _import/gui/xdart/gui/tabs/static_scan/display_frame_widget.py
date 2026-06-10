@@ -1073,7 +1073,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if was_checked:
             self._set_plot_unit_index_silently(target_idx)
             self.ui.plotUnit.setEnabled(False)
+            # The CAKE is the master.  pyqtgraph x-links are bidirectional,
+            # and the 1D plot's continuous auto-range refits to its own
+            # (wider) data on every render, dragging the cake with it -- the
+            # inverted behavior.  While shared: 1D x-auto OFF, adopt the
+            # cake's current range, keep y auto so peaks still fit.
             self.plot.setXLink(self.binned_widget.image_plot)
+            try:
+                self.plot.enableAutoRange(x=False, y=True)
+                cake_x = (self.binned_widget.image_plot
+                          .getViewBox().viewRange()[0])
+                self.plot.setXRange(*cake_x, padding=0)
+            except Exception:
+                logger.debug("share-axis adopt cake range failed",
+                             exc_info=True)
             return True
         self.plot.setXLink(None)
         self.ui.plotUnit.setEnabled(True)
@@ -1450,6 +1463,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             try:
                 # Immediate fit, then re-arm continuous tracking (see
                 # _autorange_plot_view for why the order matters).
+                self.plot.setXLink(None)
                 self.plot.autoRange()
                 self.plot.enableAutoRange()
             except Exception:
@@ -1475,6 +1489,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         new live traces (instead of freezing and clipping a taller peak) until
         the user manually zooms."""
         try:
+            if self.ui.shareAxis.isChecked():
+                # Shared: the cake owns x.  Only refit y, never grab x back
+                # (the bidirectional link would drag the cake to the 1D's
+                # wider data range).
+                self.plot.enableAutoRange(x=False, y=True)
+                return
             self.plot.autoRange()        # immediate fit (disables auto)
             self.plot.enableAutoRange()  # re-arm continuous tracking
         except Exception:
