@@ -1912,11 +1912,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # 2D-only controls (Share Axis, 2D unit, slice) are meaningless.
             self.ui.plotUnit.setVisible(False)
             self._set_2d_controls_visible(False)
-            # frame_6 is shown so the Linear/Log scale applies to the 1D plot,
-            # but the colormap combo is 2D-only — hide it (no-op when it has
-            # already moved into the Options dialog).
+            # frame_6 is shown so the Linear/Log scale applies to the 1D
+            # plot; the colormap stays too (Vivek) — the XYE waterfall image
+            # uses it, and Int 1D (XYE) processing mode shows it as well.
             if self.ui.cmap.parent() is not None:
-                self.ui.cmap.setVisible(False)
+                self.ui.cmap.setVisible(True)
+            self.ui.cmap.setEnabled(True)
             self.ui.scale.setEnabled(True)
         elif mode in ('image', 'nexus'):
             # Raw image / schema preview need no extra control state beyond the

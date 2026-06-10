@@ -375,14 +375,18 @@ class staticWidget(QWidget):
             except Exception:
                 logger.debug("mainSplitter default sizing failed",
                              exc_info=True)
-        # Re-assert on EVERY window resize until the user drags the splitter
-        # -- timers (0ms/400ms) kept losing to late window-manager resizes on
-        # mac, leaving the default hint-based split.
-        self._split_user_moved = False
-        self.ui.mainSplitter.splitterMoved.connect(
-            lambda *_: setattr(self, '_split_user_moved', True))
+        # Re-assert through every resize for the first 3s after launch, then
+        # never touch it again.  Timers lost to late window-manager resizes,
+        # and gating on splitterMoved was unreliable (Qt can emit it from its
+        # own redistribution during a native resize, which read as a user
+        # drag and disabled the hook).  Time-gating is dumb but bulletproof:
+        # no user drags the splitter within 3s of launch.
+        import time as _time
+        self._split_until = _time.monotonic() + 3.0
         self._apply_default_split = _default_split
         QtCore.QTimer.singleShot(0, _default_split)
+        QtCore.QTimer.singleShot(1000, _default_split)
+        QtCore.QTimer.singleShot(2500, _default_split)
         self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
         if len(self.scan.frames.index) > 0:
             self.integratorTree.update()
@@ -879,9 +883,11 @@ class staticWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Keep the default 19/57/24 split through window-manager resizes;
-        # stops the moment the user drags the splitter themselves.
-        if not getattr(self, '_split_user_moved', True):
+        # Keep the default 19/57/24 split through the launch-time window-
+        # manager resize storm (first 3s); afterwards the splitter is the
+        # user's.
+        import time as _time
+        if _time.monotonic() < getattr(self, '_split_until', 0):
             apply = getattr(self, '_apply_default_split', None)
             if callable(apply):
                 apply()
