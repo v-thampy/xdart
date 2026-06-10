@@ -123,3 +123,23 @@ def test_folder_change_inert_during_restore(qapp):
     root.child("Project").child("project_folder").setValue("/new/root")
     assert root.child("Calibration").child("poni_file").value() == ""   # now reset
     assert h.poni_file == ""
+
+
+def test_meta_ext_hidden_for_nxs_image_type(qapp):
+    """Scan taxonomy (Vivek, Jun 2026): a .nxs embeds its own metadata, so the
+    Meta File field is irrelevant for nxs and must be HIDDEN (it was
+    previously only made readonly)."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import params as wparams
+
+    root = Parameter.create(name="p", type="group", children=wparams)
+    h = types.SimpleNamespace(parameters=root, img_ext="nxs")
+    sync = MethodType(imageWrangler._sync_meta_ext_to_img_ext, h)
+
+    sync()
+    meta = root.child("Signal").child("meta_ext")
+    assert meta.opts.get("visible") is False
+    assert meta.value() == "None"
+
+    h.img_ext = "tif"
+    sync()
+    assert meta.opts.get("visible", True) is True

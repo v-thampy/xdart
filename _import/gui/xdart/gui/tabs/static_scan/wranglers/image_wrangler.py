@@ -1287,19 +1287,21 @@ class imageWrangler(wranglerWidget):
             self.meta_dir = path
 
     def _sync_meta_ext_to_img_ext(self):
-        """Force meta_ext='None' and lock it when the image type is NeXus.
+        """Force meta_ext='None' and HIDE it when the image type is NeXus.
 
         NeXus/.nxs files embed their own metadata (motors, counters, energy)
-        inside the HDF5 tree, so no sidecar file is needed.  The parameter is
-        made readonly while img_ext == 'nxs' and re-enabled otherwise.
+        inside the HDF5 tree, so no sidecar file is needed — per the scan
+        taxonomy the Meta File field is irrelevant for nxs and should not be
+        shown at all (it was previously just made readonly).  Re-shown when
+        the image type changes back to a sidecar-based format.
         """
         meta_param = self.parameters.child('Signal').child('meta_ext')
         if (self.img_ext or '').lower() == 'nxs':
             if meta_param.value() != 'None':
                 meta_param.setValue('None')    # fires set_meta_ext
-            meta_param.setReadonly(True)
+            meta_param.hide()
         else:
-            meta_param.setReadonly(False)
+            meta_param.show()
 
     def exists_meta_file(self, img_file):
         """Checks for existence of meta file for image file"""

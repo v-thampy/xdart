@@ -602,8 +602,9 @@ class imageThread(wranglerThread):
         is_eiger = _is_eiger_master(self.img_file) if self.img_file else False
         # One-time visibility into which execution path this run takes (so the
         # XDART_BATCH_EXECUTION / XDART_LIVE_EXECUTION flags are observable).
-        logger.info('Execution policy: batch_mode=%s  batch=%s  live=%s',
-                    self.batch_mode, self._batch_execution(), self._live_execution())
+        # DEBUG: developer diagnostics, not run output.
+        logger.debug('Execution policy: batch_mode=%s  batch=%s  live=%s',
+                     self.batch_mode, self._batch_execution(), self._live_execution())
 
         # ── Phase 1 & 2: collect then process all existing images ─────────────
         pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]

@@ -399,6 +399,14 @@ def open_live_reduction_session(
         gi_freeze_mode=gi_freeze_mode,
         execution=execution,
         inflight_max=inflight_max,
+        # S2: streaming sink-driven sessions (the GUI batch/live path) consume
+        # results through the sink (QtNexusSink hydrates LiveFrames + writes
+        # the .nxs per frame) and never read result.frames — retaining every
+        # FrameReduction (full 2D arrays) for the session's life was ~14 GB
+        # on a 10k-frame 2D batch.  Chunked sessions KEEP retention: their
+        # callers read results back via reduce_live_frames(session=...) →
+        # session.frames (serial live, reintegration, GI scouts).
+        retain_products=not (execution == "streaming" and sink is not None),
     )
 
 

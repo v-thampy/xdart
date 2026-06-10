@@ -1354,36 +1354,36 @@ def _write_instrument(f, scan, *, entry: str) -> None:
     # ── source (NXsource) ─────────────────────────────────────────
     # Provenance fix: ``scan.mg_args`` defaults to {'wavelength': 1e-10}
     # (= 1.0 Å) and is never updated from the PONI, so it was being
-    # persisted verbatim as wavelength_A=1.0.  Prefer the wavelength baked
-    # into the integrator built from the PONI (the real value, in metres);
-    # fall back to mg_args only when no integrator is available.  Mirrors
-    # the display-side lookup in display_data._get_wavelength.
-    wavelength = None
-    ai = getattr(scan, "_cached_integrator", None)
-    ai_wl = getattr(ai, "wavelength", None) if ai is not None else None
-    try:
-        if ai_wl is not None and float(ai_wl) > 0:
-            wavelength = float(ai_wl)
-    except (TypeError, ValueError):
-        wavelength = None
+    # persisted verbatim as wavelength_A=1.0.  Order (T1-4: same helpers +
+    # semantics as the display-side display_data._get_wavelength):
+    #   1. the integrator built from the PONI (authoritative; 1.0 Å allowed);
+    #   2. a wavelength restored from a previously loaded v2 file
+    #      (_persisted_wavelength_m — authoritative; covers save-as of a
+    #      reloaded scan whose real wavelength is exactly 1.0 Å);
+    #   3. mg_args, REJECTING the constructor's 1e-10 m sentinel.
+    # When nothing real is available, skip the stamp (a bogus wavelength_A
+    # silently corrupts any downstream Q↔2θ).  DEBUG, not WARNING: the
+    # initial empty-file save at run start legitimately predates the
+    # integrator, so a warning here is routine noise (the per-run saves
+    # that follow stamp the real value).
+    from xdart.modules.wavelength import normalize_wavelength_m
+    wavelength = normalize_wavelength_m(
+        getattr(getattr(scan, "_cached_integrator", None), "wavelength", None),
+        allow_default_sentinel=True,
+    )
     if wavelength is None:
-        # Fall back to mg_args, but NEVER persist the constructor's 1e-10 m
-        # (1.0 Å) sentinel — that's exactly the misleading value the
-        # integrator-first logic exists to avoid.  Skip (and warn) rather
-        # than write a wrong wavelength; a bogus wavelength_A silently
-        # corrupts any downstream Q↔2θ.
+        wavelength = normalize_wavelength_m(
+            getattr(scan, "_persisted_wavelength_m", None),
+            allow_default_sentinel=True,
+        )
+    if wavelength is None:
         mg_wl = scan.mg_args.get("wavelength") if scan.mg_args else None
-        try:
-            mg_wl = float(mg_wl) if mg_wl is not None else None
-        except (TypeError, ValueError):
-            mg_wl = None
-        if mg_wl is not None and mg_wl > 0 and abs(mg_wl - 1e-10) > 1e-14:
-            wavelength = mg_wl
-        elif mg_wl is not None:
-            logger.warning(
+        wavelength = normalize_wavelength_m(mg_wl)
+        if wavelength is None and mg_wl is not None:
+            logger.debug(
                 "Skipping source/wavelength_A: the only candidate is the "
-                "mg_args default sentinel (%g m = %.3g A) and no integrator "
-                "wavelength is available.", mg_wl, mg_wl * 1e10,
+                "mg_args default sentinel / invalid value (%r) and no "
+                "integrator or persisted wavelength is available.", mg_wl,
             )
     if wavelength is not None:
         if "source" in instr:

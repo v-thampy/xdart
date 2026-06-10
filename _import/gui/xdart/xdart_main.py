@@ -35,8 +35,75 @@ logging.basicConfig(
 # Suppress pyFAI INFO logs (e.g. "No sensor configuration provided").
 logging.getLogger('pyFAI').setLevel(logging.WARNING)
 logging.getLogger('pyFAI.gui.matplotlib').setLevel(logging.ERROR)
+# Suppress silx's "pyOpenCL has been imported but can't be used here"
+# warning — OpenCL is optional and the message has no user action.
+logging.getLogger('silx.opencl').setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
+
+# C4: minimum compatible ssrl_xrd_tools version.  MUST equal the
+# ``ssrl_xrd_tools>=`` floor in pyproject.toml (tests/test_min_ssrl_version.py
+# asserts they match).  The pip floor only protects pip installs — the
+# documented dev workflow is an editable install from a sibling clone, which
+# bypasses it entirely; this runtime guard turns "crashes on the first write"
+# into a clear startup error.
+MIN_SSRL_VERSION = "0.41.0"
+
+
+def _version_tuple(v):
+    """Lenient (major, minor, patch) for X.Y.Z-style strings."""
+    parts = []
+    for tok in str(v).split(".")[:3]:
+        digits = ""
+        for ch in tok:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits or 0))
+    return tuple(parts + [0] * (3 - len(parts)))
+
+
+def _ssrl_capabilities_ok():
+    """Probe the load-bearing symbols xdart hard-requires.  Used to tolerate a
+    STALE editable-install version stamp (metadata only refreshes on
+    ``pip install -e``, not on ``git pull``) when the code is actually new
+    enough."""
+    try:
+        import inspect
+        from ssrl_xrd_tools.io.read import relative_source_path  # noqa: F401
+        from ssrl_xrd_tools.reduction import ReductionSession
+        return ("join_timeout" in inspect.signature(
+                    ReductionSession.finish).parameters
+                and hasattr(ReductionSession, "drain"))
+    except Exception:
+        return False
+
+
+def check_ssrl_version():
+    """Fail loudly at startup on an incompatible ssrl_xrd_tools install."""
+    try:
+        import ssrl_xrd_tools
+        have = getattr(ssrl_xrd_tools, "__version__", "0.0.0")
+    except ImportError as exc:
+        raise SystemExit(
+            f"xdart requires ssrl_xrd_tools>={MIN_SSRL_VERSION} "
+            f"(import failed: {exc})")
+    if _version_tuple(have) >= _version_tuple(MIN_SSRL_VERSION):
+        return
+    if _ssrl_capabilities_ok():
+        # The code has everything we need; only the metadata stamp is old
+        # (editable install not re-installed since the version bump).
+        logger.warning(
+            "ssrl_xrd_tools reports %s (< required %s) but provides all "
+            "required APIs — the editable install's version stamp is likely "
+            "stale; re-run 'pip install -e ../ssrl_xrd_tools' to refresh it.",
+            have, MIN_SSRL_VERSION)
+        return
+    raise SystemExit(
+        f"xdart requires ssrl_xrd_tools>={MIN_SSRL_VERSION}, found {have}. "
+        f"Editable installs bypass the pip floor — update and reinstall the "
+        f"sibling ssrl_xrd_tools checkout.")
 
 # Qt imports
 from typing import TYPE_CHECKING, Any
@@ -92,6 +159,7 @@ class Main(QMainWindow):
 
 
 def main():
+    check_ssrl_version()
     app = QtWidgets.QApplication(sys.argv)
     # N8: apply dark theme before any widget construction so
     # pyqtgraph plot backgrounds are set in time (pyqtgraph

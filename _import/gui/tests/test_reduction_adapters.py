@@ -885,3 +885,28 @@ def test_valid_flat_mask_still_applied():
     assert out.shape == shape
     assert out.ravel()[0] and out.ravel()[5]
     assert out.sum() == 2
+
+
+def test_open_live_reduction_session_retention_policy() -> None:
+    """S2: streaming sink-driven sessions disable product retention (the sink
+    owns the per-frame data; retaining every FrameReduction was ~14 GB on a
+    10k-frame 2D batch).  Chunked sessions KEEP retention — their callers
+    read results back via reduce_live_frames(session=...) -> session.frames
+    (serial live, reintegration, GI scouts)."""
+    from ssrl_xrd_tools.reduction import MemorySink
+    from xdart.modules.reduction import open_live_reduction_session
+
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    plan = ReductionPlan(integration_2d=None)
+
+    streaming = open_live_reduction_session(
+        [frame], plan, scan_name="s", sink=MemorySink(), execution="streaming")
+    assert streaming.retain_products is False
+
+    chunked = open_live_reduction_session([frame], plan, scan_name="s")
+    assert chunked.retain_products is True
+
+    # Streaming WITHOUT a sink has no other way to hand results back: retain.
+    streaming_no_sink = open_live_reduction_session(
+        [frame], plan, scan_name="s", execution="streaming")
+    assert streaming_no_sink.retain_products is True
