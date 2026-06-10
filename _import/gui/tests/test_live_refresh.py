@@ -3335,15 +3335,34 @@ class _FakePlot:
     def __init__(self):
         self.link = None
         self.autorange = 0
+        self.xrange = None
 
     def setXLink(self, link):
         self.link = link
 
-    def enableAutoRange(self):
+    def enableAutoRange(self, **kwargs):
         self.autorange += 1
 
     def autoRange(self):
         self.autorange += 1
+
+    def setXRange(self, lo, hi, padding=0):
+        self.xrange = (lo, hi)
+
+
+class _FakeCakeVB:
+    """ViewBox stand-in for the share-axis numeric mirror: records signal
+    connections and serves a fixed x-range."""
+    def __init__(self, xrange=(2.0, 6.0)):
+        self._xrange = list(xrange)
+        self.connected = []
+        self.sigXRangeChanged = SimpleNamespace(
+            connect=self.connected.append,
+            disconnect=self.connected.remove,
+        )
+
+    def viewRange(self):
+        return [list(self._xrange), [0.0, 1.0]]
 
 
 def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index=0):
@@ -3356,7 +3375,6 @@ def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index
         image_unit.addItem(item)
     image_unit.setCurrentIndex(image_index)
     share = _FakeControl(checked=True)
-    target = object()
     host = SimpleNamespace(
         scan=SimpleNamespace(
             gi=gi,
@@ -3369,7 +3387,8 @@ def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index
             shareAxis=share,
         ),
         plot=_FakePlot(),
-        binned_widget=SimpleNamespace(image_plot=target),
+        binned_widget=SimpleNamespace(image_plot=SimpleNamespace(
+            getViewBox=lambda _vb=_FakeCakeVB(): _vb)),
         _plot_axis_info=[
             {"source": "1d_2d", "axis": "radial"},
             {"source": "1d_2d", "axis": "radial"},
@@ -3382,6 +3401,8 @@ def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index
         "_share_axis_plot_index",
         "_set_plot_unit_index_silently",
         "_apply_share_axis_state",
+        "_set_share_link",
+        "_mirror_cake_xrange",
     ):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
     return host
@@ -3397,7 +3418,13 @@ def test_share_axis_maps_by_unit_not_combo_index():
     assert host.ui.plotUnit.currentText().startswith("2")
     assert host.ui.plotUnit._enabled is False
     assert host.ui.shareAxis.isEnabled() is True
-    assert host.plot.link is host.binned_widget.image_plot
+    # New share contract: NUMERIC one-way mirror (cake -> 1D), not setXLink
+    # (which aligns by screen geometry and is bidirectional).
+    vb = host.binned_widget.image_plot.getViewBox()
+    assert host._share_link_on is True
+    assert vb.connected, "cake sigXRangeChanged must drive the 1D"
+    assert host.plot.xrange == (2.0, 6.0)      # adopted the cake's range
+    assert host.plot.link is None              # XLink never engaged
 
 
 def test_share_axis_disables_when_no_matching_plot_unit():

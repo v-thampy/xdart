@@ -1067,30 +1067,55 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if not can_share:
             if was_checked:
                 self.ui.shareAxis.setChecked(False)
-            self.plot.setXLink(None)
+            displayFrameWidget._set_share_link(self, False)
             self.ui.plotUnit.setEnabled(True)
             return False
         if was_checked:
             self._set_plot_unit_index_silently(target_idx)
             self.ui.plotUnit.setEnabled(False)
-            # The CAKE is the master.  pyqtgraph x-links are bidirectional,
-            # and the 1D plot's continuous auto-range refits to its own
-            # (wider) data on every render, dragging the cake with it -- the
-            # inverted behavior.  While shared: 1D x-auto OFF, adopt the
-            # cake's current range, keep y auto so peaks still fit.
-            self.plot.setXLink(self.binned_widget.image_plot)
-            try:
-                self.plot.enableAutoRange(x=False, y=True)
-                cake_x = (self.binned_widget.image_plot
-                          .getViewBox().viewRange()[0])
-                self.plot.setXRange(*cake_x, padding=0)
-            except Exception:
-                logger.debug("share-axis adopt cake range failed",
-                             exc_info=True)
+            displayFrameWidget._set_share_link(self, True)
             return True
-        self.plot.setXLink(None)
+        displayFrameWidget._set_share_link(self, False)
         self.ui.plotUnit.setEnabled(True)
         return False
+
+    def _set_share_link(self, on: bool) -> None:
+        """One-way NUMERIC x-mirror: cake -> 1D plot.
+
+        NOT pyqtgraph's setXLink: that aligns by SCREEN geometry, so panes
+        at different positions/widths show different numeric ranges (glaring
+        once the cake started trimming to its data extent), and the link is
+        bidirectional, so any 1D x-refit dragged the cake.  Here the cake is
+        strictly the master: its sigXRangeChanged drives the 1D's numeric
+        x-range; nothing flows back."""
+        ip = getattr(getattr(self, 'binned_widget', None),
+                     'image_plot', None)
+        get_vb = getattr(ip, 'getViewBox', None)
+        vb = get_vb() if callable(get_vb) else None
+        if vb is None:
+            return          # duck holders in tests / widget not fully built
+        already = getattr(self, '_share_link_on', False)
+        if on and not already:
+            self.plot.setXLink(None)        # never both mechanisms
+            vb.sigXRangeChanged.connect(self._mirror_cake_xrange)
+            self._share_link_on = True
+            displayFrameWidget._mirror_cake_xrange(
+                self, vb, vb.viewRange()[0])      # adopt now
+        elif not on and already:
+            try:
+                vb.sigXRangeChanged.disconnect(self._mirror_cake_xrange)
+            except (TypeError, RuntimeError):
+                pass
+            self._share_link_on = False
+
+    def _mirror_cake_xrange(self, _vb, xrange) -> None:
+        """Adopt the cake's numeric x-range on the 1D plot (y stays auto)."""
+        try:
+            self.plot.enableAutoRange(x=False, y=True)
+            self.plot.setXRange(float(xrange[0]), float(xrange[1]),
+                                padding=0)
+        except Exception:
+            logger.debug("share-axis mirror failed", exc_info=True)
 
     def render_display(self, state, payload):
         """Draw the display from ``state`` + ``payload``.  (Named
@@ -1463,7 +1488,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             try:
                 # Immediate fit, then re-arm continuous tracking (see
                 # _autorange_plot_view for why the order matters).
-                self.plot.setXLink(None)
                 self.plot.autoRange()
                 self.plot.enableAutoRange()
             except Exception:
