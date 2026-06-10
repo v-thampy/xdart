@@ -1069,7 +1069,7 @@ def test_gi_prepass_warns_and_proceeds_on_unestablishable_range():
     proceed = w._gi_freeze_whole_scan_prepass(scan)
     assert proceed is True
     assert w.command == ""                       # run not stopped
-    assert emitted and "frozen from the first frames" in emitted[-1]
+    assert emitted and "set from the first frames" in emitted[-1]
     assert w._gi_prepass_scan_id == id(scan)     # latched: one advisory per scan
 
 
@@ -1107,12 +1107,12 @@ def test_gi_prepass_warns_and_proceeds_on_image_directory_source():
     proceed = w._gi_freeze_whole_scan_prepass(scan)
     assert proceed is True
     assert w.command == ""
-    assert emitted and "frozen from the first frames" in emitted[-1]
+    assert emitted and "set from the first frames" in emitted[-1]
     assert "Image Directory" in emitted[-1]      # advisory names the source
     assert w._gi_prepass_scan_id == id(scan)     # latched: one advisory per scan
     # Codex P2: the advisory is stamped on the scan so the writer persists it
     # in /entry/reduction/config -- a durable disclosure, not just a GUI label.
-    assert "frozen from the first frames" in scan.gi_freeze_diagnostic
+    assert "set from the first frames" in scan.gi_freeze_diagnostic
 
 
 def _pinned_prepass_holder(emitted):
@@ -1191,7 +1191,7 @@ def test_gi_prepass_warns_when_ranges_partially_pinned():
 
     assert proceed is True
     assert w.command == ""
-    assert emitted and "frozen from the first frames" in emitted[-1]
+    assert emitted and "set from the first frames" in emitted[-1]
     assert w._gi_prepass_scan_id == id(scan)
 
 

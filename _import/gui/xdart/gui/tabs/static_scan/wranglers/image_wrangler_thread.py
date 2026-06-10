@@ -1179,11 +1179,10 @@ class imageThread(wranglerThread):
         ``/entry/reduction/config`` — the disclosure survives in the output
         file, not just as a transient GUI label."""
         msg = (
-            'GI: ' + reason + ' — output grid will be frozen from the first '
-            'frames; extreme-incidence tails beyond it are cropped (values '
-            'inside are exact). Set explicit 1D/2D output ranges for full '
-            'coverage.')
-        logger.warning(msg)
+            'GI: ' + reason + ' — output grid set from the first frames; '
+            're-integrate with explicit 1D/2D ranges if you need the full '
+            'incidence extent.')
+        logger.info(msg)
         if scan is not None:
             try:
                 scan.gi_freeze_diagnostic = msg

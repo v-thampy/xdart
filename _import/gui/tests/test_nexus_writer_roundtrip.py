@@ -1909,3 +1909,24 @@ def test_one_resultless_frame_does_not_block_later_2d_writes(tmp_path):
     with h5py.File(path, "r") as f:
         idx_2d = sorted(int(x) for x in f["entry/integrated_2d/frame_index"][()])
     assert idx_2d == [0, 2, 3]
+
+
+def test_gi_freeze_diagnostic_persists_on_later_save(tmp_path):
+    # P2 follow-up (codex review): on the REAL path the first save
+    # (initialize_scan) writes provenance BEFORE the prepass stamps the
+    # diagnostic, and the GUI never passes finalize=True -- the cursor-deduped
+    # re-fire must persist it on a later periodic save.
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from ssrl_xrd_tools.io.nexus import read_scan_metadata
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    path = tmp_path / "gi_diag_late.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)   # pre-stamp save
+
+    scan.gi_freeze_diagnostic = "GI: output grid set from the first frames (test)"
+    scan.frames.append(_DuckArch(idx=1))
+    save_scan_to_nexus(scan, path, mode="a", finalize=False)   # periodic save
+
+    ds = read_scan_metadata(path)
+    config = (ds.attrs.get("reduction") or {}).get("config") or {}
+    assert "set from the first frames" in config.get("gi_freeze_diagnostic", "")

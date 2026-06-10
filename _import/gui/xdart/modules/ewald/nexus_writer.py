@@ -284,8 +284,20 @@ def save_scan_to_nexus(
         # reflect whatever parameters the reintegration used (this is
         # the whole reason the user kicked off a re-integration in the
         # first place).
-        if is_replace or finalize or "reduction" not in h5f.get(entry, {}):
+        # P2 (codex): the GI first-chunk-freeze diagnostic is stamped on the
+        # scan AFTER initialize_scan's first save wrote the reduction group,
+        # and the GUI never passes finalize=True -- without this re-fire the
+        # persisted-provenance disclosure never landed on the real path.
+        # Cursor-deduped so steady-state saves stay write-free.
+        _gi_diag = getattr(scan, "gi_freeze_diagnostic", None)
+        _cur = _write_cursor(scan, h5f)
+        _diag_pending = bool(_gi_diag) and getattr(
+            _cur, "gi_diag_written", None) != _gi_diag
+        if (is_replace or finalize or _diag_pending
+                or "reduction" not in h5f.get(entry, {})):
             _write_reduction(h5f, scan, entry=entry)
+            if _gi_diag:
+                _cur.gi_diag_written = _gi_diag
         _t0 = _tick("reduction", _t0)
 
         _commit_integrated_1d(f, prepared_1d)
