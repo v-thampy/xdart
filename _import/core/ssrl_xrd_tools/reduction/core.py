@@ -1173,6 +1173,7 @@ class ReductionSession:
                               frame.index, self._completed, len(self.scan))
                         if self.clear_frame_images:
                             frame.image = None
+                            frame.background = None
                             _clear_source_frame_image(self.source, frame.index)
                     except BaseException as exc:
                         self._failure = self._failure or exc
@@ -1489,40 +1490,58 @@ class ReductionSession:
                     ),
                 ))
 
-        for pos, (frame, reduction_or_future) in enumerate(pending):
-            try:
-                reduction = (
-                    reduction_or_future
-                    if self._worker is None
-                    else reduction_or_future.result()
-                )
-            except _ReductionCancelled:
-                self._cancelled = True
-                _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
-                break
-            idx = int(frame.index)
-            # Re-feeding an already-processed index (reintegrate / replace
-            # re-feed) is a *replace*, not a new completion: overwrite the
-            # product, re-emit to the sink as a replace where supported, and do
-            # not double-count progress -- ``n_processed`` must never exceed the
-            # number of distinct frames in the scan.
-            replacing = idx in self._seen_idxs
-            self._seen_idxs.add(idx)
-            if self.retain_products:
-                self._products[idx] = reduction
-            if replacing:
-                _emit_sink_replace(self._sink, frame, reduction)
-            else:
-                self._sink.write(frame, reduction)
-                self._completed += 1
-            _emit(self.progress_cb, self.scan.name, "write", frame.index, self._completed, len(self.scan))
+        pos = -1
+        try:
+            for pos, (frame, reduction_or_future) in enumerate(pending):
+                try:
+                    reduction = (
+                        reduction_or_future
+                        if self._worker is None
+                        else reduction_or_future.result()
+                    )
+                except _ReductionCancelled:
+                    self._cancelled = True
+                    _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
+                    break
+                idx = int(frame.index)
+                # Re-feeding an already-processed index (reintegrate / replace
+                # re-feed) is a *replace*, not a new completion: overwrite the
+                # product, re-emit to the sink as a replace where supported, and do
+                # not double-count progress -- ``n_processed`` must never exceed the
+                # number of distinct frames in the scan.
+                replacing = idx in self._seen_idxs
+                self._seen_idxs.add(idx)
+                if self.retain_products:
+                    self._products[idx] = reduction
+                if replacing:
+                    _emit_sink_replace(self._sink, frame, reduction)
+                else:
+                    self._sink.write(frame, reduction)
+                    self._completed += 1
+                _emit(self.progress_cb, self.scan.name, "write", frame.index, self._completed, len(self.scan))
+                if self.clear_frame_images:
+                    frame.image = None
+                    frame.background = None
+                    _clear_source_frame_image(self.source, frame.index)
+                if self.cancel_token.cancelled:
+                    self._cancelled = True
+                    _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
+                    break
+        except BaseException:
+            # An arbitrary error (a worker raise out of future.result(), or a
+            # sink.write failure) previously exited the loop WITHOUT cancelling
+            # the tail futures or releasing the chunk's image refs -- a
+            # persistent GUI session then held them until close.  Cancel and
+            # release, then re-raise the original error.
+            _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
             if self.clear_frame_images:
-                frame.image = None
-                _clear_source_frame_image(self.source, frame.index)
-            if self.cancel_token.cancelled:
-                self._cancelled = True
-                _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
-                break
+                for _frame, _ in pending:
+                    try:
+                        _frame.image = None
+                        _frame.background = None
+                    except Exception:
+                        pass
+            raise
 
 
 def run_reduction(
