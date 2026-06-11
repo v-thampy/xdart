@@ -365,12 +365,20 @@ def resolve_source_master(
         candidates.append(rel_path)
     else:
         scan_dir = Path(scan_file).parent
-        for root in (source_root, source_base, scan_dir):
+        # ``scan_dir.parent`` (N1 cross-OS, deep-review S9): an xdart-processed
+        # ``.nxs`` lives in ``<root>/xdart_processed_data/`` and its relative
+        # ``source/path`` is relative to ``<root>``.  When the stored
+        # ``@source_base`` is a FOREIGN absolute path (e.g. a macOS root opened
+        # on Windows) it won't exist locally, and ``scan_dir`` is one level too
+        # deep -- so the project root derived from the .nxs location resolves a
+        # co-moved tree with no explicit ``source_root``.
+        for root in (source_root, source_base, scan_dir, scan_dir.parent):
             if root:
                 candidates.append(Path(root).expanduser() / rel_path)
-        # Moved/flattened tree: the raw next to the .nxs or directly under an
-        # explicit root, addressed by basename.
+        # Moved/flattened tree: the raw next to the .nxs, under the .nxs's
+        # project root, or directly under an explicit root, by basename.
         candidates.append(scan_dir / rel_path.name)
+        candidates.append(scan_dir.parent / rel_path.name)
         if source_root:
             candidates.append(Path(source_root).expanduser() / rel_path.name)
         candidates.append(rel_path)          # cwd-relative, last resort
