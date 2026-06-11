@@ -1930,3 +1930,81 @@ def test_gi_freeze_diagnostic_persists_on_later_save(tmp_path):
     ds = read_scan_metadata(path)
     config = (ds.attrs.get("reduction") or {}).get("config") or {}
     assert "set from the first frames" in config.get("gi_freeze_diagnostic", "")
+
+
+# ---------------------------------------------------------------------------
+# Pre-ship sweep regressions: cursor.dropped vs the replace recovery path
+# ---------------------------------------------------------------------------
+
+def _all_dummy_2d(frame):
+    """Make a frame's 2D result publication-invalid (all-dummy cake)."""
+    frame.int_2d.intensity = np.full_like(frame.int_2d.intensity, -1.0)
+
+
+def test_replace_recovers_group_that_was_never_created(tmp_path):
+    """If EVERY row of integrated_2d was publication-rejected during the run
+    (group never created on disk; all labels in cursor.dropped), a later
+    reintegrate-all replace save with now-valid results must WRITE the group.
+    The stale dropped bookkeeping previously excluded every recomputed frame
+    on the append fallback (`group_path in h5f` is False for a group that
+    never existed) -- the designed recovery path silently wrote nothing."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "recover.nxs"
+
+    for fr in frames:
+        _all_dummy_2d(fr)
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    with h5py.File(path, "r") as f:
+        assert "entry/integrated_2d" not in f          # all rows rejected
+    assert scan._nexus_write_cursor.dropped            # drops recorded
+
+    # Reintegration fixed the cakes; replace-all must write them.
+    for i, fr in enumerate(frames):
+        rng = np.random.default_rng(100 + i)
+        fr.int_2d.intensity = rng.random(fr.int_2d.intensity.shape).astype(
+            np.float32)
+    save_scan_to_nexus(scan, path, mode="a", finalize=False,
+                       replace_frame_indices=[0, 1, 2])
+    with h5py.File(path, "r") as f:
+        assert "entry/integrated_2d" in f
+        assert f["entry/integrated_2d/intensity"].shape[0] == 3
+
+
+def test_replace_with_shape_change_survives_one_publication_drop(tmp_path):
+    """Replace mode + changed row shape + ONE publication-rejected frame must
+    not abort the whole-scan save: the rejected frame's stale on-disk row is
+    dropped first, then validation sees a covered batch.  (Previously
+    _require_batch_covers_existing raised over the uncovered stale row and
+    NOTHING was persisted.)"""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "shape_change.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    # Reintegrate everything at a different npt; frame 1 comes out invalid.
+    new_nq = N_Q + 7
+    for i in range(3):
+        fresh = _DuckArch(idx=i, nq=new_nq, seed=50)
+        frames[i].int_1d = fresh.int_1d
+        frames[i].int_2d = fresh.int_2d
+    scan.bai_1d_args["numpoints"] = new_nq
+    scan.bai_2d_args["npt_rad"] = new_nq
+    _all_dummy_2d(frames[1])
+
+    save_scan_to_nexus(scan, path, mode="a", finalize=False,
+                       replace_frame_indices=[0, 1, 2])
+    with h5py.File(path, "r") as f:
+        # 1D (all valid): full new-shape stack
+        assert f["entry/integrated_1d/intensity"].shape == (3, new_nq)
+        # 2D: frame 1 dropped per frame, frames 0+2 written at the new
+        # shape (rows stored (nchi, nq) -- nq is the trailing axis)
+        i2d = f["entry/integrated_2d"]
+        assert i2d["intensity"].shape == (2, N_CHI, new_nq)
+        assert sorted(int(x) for x in i2d["frame_index"][()]) == [0, 2]

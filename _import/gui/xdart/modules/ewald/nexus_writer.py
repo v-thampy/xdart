@@ -276,8 +276,17 @@ def save_scan_to_nexus(
         prepared_1d, prepared_2d = _filter_prepared_frame_publications(
             prepared_1d, prepared_2d,
         )
-        _validate_prepared_integrated(h5f.require_group(entry), prepared_1d, prepared_2d)
+        # Drop the publication-rejected replace rows from disk BEFORE the
+        # uniform-stack validation: with a changed row shape/axis the
+        # coverage check (_require_batch_covers_existing) would otherwise
+        # see the rejected frame's STALE row still on disk, uncovered by
+        # the incoming batch, and abort the WHOLE reintegration save over
+        # one per-frame drop -- violating the publication-gate contract
+        # (reject per frame, never abort whole-scan).  The dropped rows are
+        # publication-invalid; removing them is correct even if a later
+        # validation step still fails.
         _drop_filtered_replace_rows(h5f, prepared_1d, prepared_2d)
+        _validate_prepared_integrated(h5f.require_group(entry), prepared_1d, prepared_2d)
 
         # 2. Provenance — append mode: only on first save or finalize.
         # Replace mode: always rewrite so the persisted ``bai_*_args``
@@ -534,6 +543,19 @@ def _select_frames_to_write(scan, h5f, group_path, replace_frame_indices,
     mismatch against the existing stack can require an explicit full rewrite.
     """
     all_ids = list(scan.frames.index)
+
+    # A replace save (reintegration) supplies FRESH results for its frames:
+    # clear their stale ``dropped`` bookkeeping up front.  Without this, a
+    # group whose every row was publication-rejected during the run (group
+    # never created on disk) fell through ``group_path in h5f`` into the
+    # append branch below, where the dropped set silently excluded every
+    # recomputed frame -- the designed recovery path wrote nothing.  A row
+    # that is STILL invalid after recomputation is re-dropped by the
+    # publication gate in this same save.
+    if replace_frame_indices is not None and cursor is not None:
+        stale = cursor.dropped.get(group_path)
+        if stale:
+            stale.difference_update(int(i) for i in replace_frame_indices)
 
     def _all_frames():
         return [scan.frames[i] for i in all_ids], list(all_ids)
