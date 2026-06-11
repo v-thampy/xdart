@@ -363,6 +363,12 @@ def reduce_live_frames(
         release = getattr(session, "release_products", None)
         if callable(release):
             release(int(f.index) for f in headless_frames)
+    # Same PERF-3 reasoning for the SINK-LESS paths (true-live serial,
+    # reintegration, GI scouts): the session's registered Frames pin the raw
+    # arrays; results are already copied onto the LiveFrames above, so drop
+    # the session-side references now.
+    for headless_frame in headless_frames:
+        headless_frame.image = None
     return reduced_frames
 
 
@@ -421,6 +427,14 @@ def open_live_reduction_session(
         # callers read results back via reduce_live_frames(session=...) →
         # session.frames (serial live, reintegration, GI scouts).
         retain_products=not (execution == "streaming" and sink is not None),
+        # PERF-3 completion (pre-ship sweep): _register_process_frames keeps
+        # every submitted Frame on session.scan for the session's life, and
+        # Frame.image references the SAME array as LiveFrame.map_raw -- so
+        # freeing the LiveFrame side (free_raw) never released the raw
+        # (~18 MB/frame Eiger) while the session-side reference lived on.
+        # The writer loop nulls frame.image post-write with this flag; any
+        # later consumer reloads from the source path via Frame.load_image.
+        clear_frame_images=True,
     )
 
 
