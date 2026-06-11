@@ -607,6 +607,19 @@ class staticWidget(QWidget):
         if not path:
             return
         path = os.path.abspath(os.path.expanduser(str(path)))
+        # If the processed-data dir doesn't exist yet (fresh project, no run
+        # has created it), browse the nearest existing ancestor -- typically
+        # the project folder -- instead of an empty nonexistent path.  Once
+        # the first run creates xdart_processed_data, the next save-path
+        # signal re-points the browser at it.
+        probe = path
+        while probe and not os.path.isdir(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        if probe and os.path.isdir(probe):
+            path = probe
         self.dirname = path
         self.h5viewer.dirname = path
         if refresh:

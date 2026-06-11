@@ -1045,6 +1045,13 @@ def test_save_path_sync_updates_scans_browser(tmp_path):
 
     staticWidget._sync_h5viewer_save_dir(host, tmp_path / "next", refresh=False)
 
+    # New contract: a save dir that doesn't exist yet (fresh project, no run
+    # has created it) falls back to the nearest existing ancestor so the
+    # browser shows real contents instead of an empty nonexistent path.
+    assert host.dirname == str(tmp_path)
+
+    (tmp_path / "next").mkdir()
+    staticWidget._sync_h5viewer_save_dir(host, tmp_path / "next", refresh=False)
     assert host.dirname == str(tmp_path / "next")
     assert host.h5viewer.dirname == str(tmp_path / "next")
     assert calls == ["update_scans"]

@@ -1131,6 +1131,11 @@ class imageWrangler(wranglerWidget):
         elif not have_poni:
             cal.show()
             _hide_rest()
+            # Save Path stays visible alongside Calibration (Vivek): the
+            # processed-data location is project-level, decided before the
+            # PONI -- and the scans browser already follows it.
+            for name in self._DISCLOSURE_TOPLEVEL:
+                self.parameters.child(name).show()
             imageWrangler._safe_status_text(
                 self,
                 'Load a PONI calibration file to begin.',
@@ -1512,6 +1517,11 @@ class imageWrangler(wranglerWidget):
                 self.parameters.child(*seg).setValue('')
             except (AttributeError, KeyError, TypeError):
                 pass
+        # The Save Path is project-relative too: clear it so the default
+        # helper re-points it under the NEW folder (its keep-user-value
+        # guard otherwise retains the OLD project's path on a switch, and
+        # the scans browser never followed).
+        self.parameters.child('h5_dir').setValue('')
         self._default_h5_under_project()
         self._apply_disclosure()
 
