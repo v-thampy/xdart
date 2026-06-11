@@ -127,6 +127,22 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         apply_seaborn_plot_style(self.image_plot, grid=False)
         self.imageItem = pgXDImageItem(raw=self.raw)
         self.image_plot.addItem(self.imageItem)
+        # TEMP DIAGNOSTIC (first-load axis-scale bug): catch viewbox range
+        # explosions that never pass through setRect (autorange over a
+        # foreign item, external setRange, ...).
+        def _range_watch(_vb, ranges):
+            try:
+                (x0, x1), (y0, y1) = ranges
+                if abs(x1 - x0) > 1e5 or abs(y1 - y0) > 1e5:
+                    import traceback
+                    logger.warning(
+                        "viewbox range EXPLODED: x=(%.3g,%.3g) y=(%.3g,%.3g) "
+                        "image=%s\n%s", x0, x1, y0, y1,
+                        getattr(self.displayed_image, 'shape', None),
+                        "".join(traceback.format_stack()[-10:-1]))
+            except Exception:
+                pass
+        self.imageViewBox.sigRangeChanged.connect(_range_watch)
 
         # Make Label Item for showing position
         self.make_pos_label()
@@ -150,7 +166,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         self.raw_image = image[()]
         self.update_image(scale, cmap, **kwargs)
         if rect is not None:
-            self.imageItem.setRect(rect)
+            self.setRect(rect)      # through the diagnostic funnel
 
     def setRect(self, rect):
         # TEMP DIAGNOSTIC (raw-panel axis-scale bug, Jun 2026): a reloaded
