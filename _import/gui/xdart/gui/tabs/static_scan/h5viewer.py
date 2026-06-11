@@ -1001,17 +1001,15 @@ class H5Viewer(QWidget):
         self.sigThreadFinished.emit()
     
     def _scans_single_clicked(self, q):
-        """Handle single click in listScans — only acts in viewer mode.
+        """Handle single click in listScans — uniform across ALL modes.
 
-        XYE mode: FILE loads go through _scans_selection_changed (it fires
-        after the selection settles, so Shift+arrow multi-select works and
-        nothing double-fires) — but single-click NAVIGATION (directories /
-        '..') is handled here so it matches the Image Viewer, which enters
-        folders on a single click.
+        Single click navigates folders and loads files everywhere (Vivek):
+        the Image/NeXus viewers and the normal Int 1D/2D modes act directly;
+        XYE mode routes FILE loads through _scans_selection_changed (it
+        fires after the selection settles, so Shift+arrow multi-select works
+        and nothing double-fires) and handles only NAVIGATION here.
         """
         if getattr(self, '_suspend_scan_selection_loads', False):
-            return
-        if self.viewer_mode is None:
             return
         if self.viewer_mode == 'xye':
             text = q.text()
@@ -1033,7 +1031,7 @@ class H5Viewer(QWidget):
         """
         if getattr(self, '_suspend_scan_selection_loads', False):
             return
-        if current is None or self.viewer_mode is None:
+        if current is None:
             return
         # XYE mode: handled by _scans_selection_changed
         if self.viewer_mode == 'xye':
@@ -1042,6 +1040,9 @@ class H5Viewer(QWidget):
         # Skip directories and ".." — don't auto-navigate on arrow keys
         if item_text == '..' or item_text.endswith('/'):
             return
+        # Uniform across modes (Vivek): arrow keys load .nxs in the normal
+        # Int 1D/2D modes exactly like the viewers (the file-handler queue
+        # serializes the loads).
         self.scans_clicked(current)
 
     def _scans_selection_changed(self):

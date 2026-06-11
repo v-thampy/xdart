@@ -745,12 +745,15 @@ class imageWrangler(wranglerWidget):
 
         # Gray out integration controls in viewer mode
         self._set_integration_controls_enabled(not is_viewer)
-        # Image/XYE viewers are file-inspection modes.  Disable the processing
-        # parameter tree itself so masks/background/calibration state cannot be
-        # edited or accidentally interpreted as viewer state.  The mode combo
-        # lives outside this tree, so the user can still switch back.
+        # Image/XYE viewers are file-inspection modes: the PROCESSING groups
+        # (Calibration/Signal/BG/Mask/GI, handled per-group above) are
+        # disabled so masks/background/calibration cannot be edited there --
+        # but the tree itself stays enabled so Project Folder and Save Path
+        # remain usable (they drive the file browser, which is exactly what
+        # viewer modes are for).  The run-lock still disables the whole tree
+        # during runs.
         try:
-            self.tree.setEnabled(not is_file_viewer)
+            self.tree.setEnabled(True)
         except AttributeError:
             pass
         # Hide start/stop in viewer mode
@@ -766,7 +769,7 @@ class imageWrangler(wranglerWidget):
 
     def _set_integration_controls_enabled(self, enabled, *, include_gi=True):
         """Enable or disable parameter tree groups related to integration."""
-        group_names = ['Calibration', 'BG', 'Mask']
+        group_names = ['Calibration', 'Signal', 'BG', 'Mask']
         if include_gi:
             group_names.append('GI')
         for group_name in group_names:
@@ -781,12 +784,9 @@ class imageWrangler(wranglerWidget):
                 self.parameters.child('Signal').child(child_name).setOpts(enabled=enabled)
             except (AttributeError, KeyError) as e:
                 logger.debug("Failed to set enabled state for Signal.%s: %s", child_name, e)
-        # Disable save path
-        try:
-            self.parameters.child('h5_dir').setOpts(enabled=enabled)
-            self.parameters.child('h5_dir_browse').setOpts(enabled=enabled)
-        except (AttributeError, KeyError) as e:
-            logger.debug("Failed to set enabled state for h5_dir parameters: %s", e)
+        # Save Path deliberately NOT touched here: it drives the scans
+        # browser, which viewer modes rely on; the run-lock (enabled())
+        # disables the whole tree during runs.
 
     def setup(self):
         """Sets up the child thread, syncs all parameters.

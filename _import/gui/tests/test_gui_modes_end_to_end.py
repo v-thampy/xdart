@@ -1116,10 +1116,16 @@ def test_int1d_xye_keeps_wrangler_inputs_enabled(widget):
     w._on_viewer_mode_changed("xye")
     assert tree.isEnabled() is True
 
-    # XYE Viewer: a file browser — inputs disabled.
+    # XYE Viewer: a file browser — the TREE stays enabled (Project Folder /
+    # Save Path drive the browser) while the processing groups disable.
     _set_mode("XYE Viewer")
     w._on_viewer_mode_changed("xye")
-    assert tree.isEnabled() is False
+    assert tree.isEnabled() is True
+    # (Per-group disables are the WRANGLER's _on_mode_changed job -- covered
+    # by test_file_viewer_mode_disables_processing_tree_but_not_mode_combo;
+    # this helper drives the widget-side handler with combo signals blocked.)
+    assert w.wrangler.parameters.child('h5_dir').opts.get(
+        'enabled', True) is True
 
 
 # ── C3 / C4: per-mode integration control enable/dim ───────────────────────

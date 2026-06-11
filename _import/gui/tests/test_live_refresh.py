@@ -2027,7 +2027,9 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
     assert "autoload" not in calls
     assert widget.h5viewer._suspend_scan_selection_loads is False
     assert list_scans._signals_blocked is False
-    assert widget.wrangler.tree.isEnabled() is False
+    # New policy: the tree stays ENABLED in viewers (Project Folder / Save
+    # Path drive the file browser); processing groups disable per-group.
+    assert widget.wrangler.tree.isEnabled() is True
     assert widget.displayframe._viewer_is_xdart is False
 
 
@@ -2058,8 +2060,11 @@ def test_viewer_mode_tree_disable_only_for_file_viewers():
         local_path="/tmp/xdart-out",
     )
 
+    # New policy: the tree stays enabled in EVERY viewer mode -- Project
+    # Folder / Save Path remain usable; processing groups disable per-group
+    # on the wrangler side.
     staticWidget._on_viewer_mode_changed(widget, "xye")
-    assert widget.wrangler.tree.isEnabled() is False
+    assert widget.wrangler.tree.isEnabled() is True
 
     staticWidget._on_viewer_mode_changed(widget, "nexus")
     assert widget.wrangler.tree.isEnabled() is True
@@ -3818,7 +3823,7 @@ def test_wrangler_enabled_reapplies_viewer_mode_controls():
         assert host.ui.frame.isVisible() is False
         assert host._integration_controls_enabled is False
         assert host.thread.live_mode is False
-        assert host.tree.isEnabled() is (mode == "NeXus Viewer")
+        assert host.tree.isEnabled() is True   # Project/Save Path stay usable
 
 
 def test_file_viewer_mode_disables_processing_tree_but_not_mode_combo():
@@ -3829,7 +3834,10 @@ def test_file_viewer_mode_disables_processing_tree_but_not_mode_combo():
 
         imageWrangler._on_mode_changed(host)
 
-        assert host.tree.isEnabled() is False
+        # Tree stays enabled (Project Folder / Save Path usable); the
+        # processing groups are disabled per-group instead.
+        assert host.tree.isEnabled() is True
+        assert host._integration_controls_enabled is False
         assert host.ui.processingModeCombo.currentText() == mode
 
 

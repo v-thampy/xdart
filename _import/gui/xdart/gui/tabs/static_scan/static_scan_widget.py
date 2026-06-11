@@ -1531,11 +1531,10 @@ class staticWidget(QWidget):
                     mode_text = self.wrangler.ui.processingModeCombo.currentText()
                 except Exception:
                     mode_text = ''
-                viewer_processing = (
-                    mode_text in ('Image Viewer', 'XYE Viewer')
-                    if mode_text else is_file_viewer
-                )
-                tree.setEnabled(not viewer_processing)
+                # Tree stays enabled in viewers: processing groups are
+                # disabled per-group by the wrangler, while Project Folder /
+                # Save Path remain usable (they drive the file browser).
+                tree.setEnabled(True)
             # Per-mode integration control enable/dim (C3/C4): disable the 1-D/2-D
             # integration panels in viewers, keep Calibrate / Make Mask enabled.
             self._apply_integration_control_state()
