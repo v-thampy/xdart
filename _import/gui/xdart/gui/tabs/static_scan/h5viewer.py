@@ -1976,25 +1976,31 @@ class H5Viewer(QWidget):
                 continue
         return None
 
-    def set_file(self, fname):
+    def set_file(self, fname, *, internal=False):
         """Changes the data file.
 
         args:
             fname: str, absolute path for data file
+            internal: True for the app's own wiring (new_scan pointing the
+                file thread at the run's output file) -- bypasses the
+                user-interaction guards below.
         """
-        # Run guard (the uniform single-click/arrow loading made this
-        # reachable mid-run): repointing/reloading the shared scan during an
-        # ACTIVE run desyncs the live scan identity (live branch) or reloads
-        # a half-written file (batch).  data_changed has the same guard.
-        if getattr(self, '_run_writing', False):
-            logger.info("set_file ignored during active run: %s", fname)
-            return
-        # Same-file dedupe: a fresh single click fires currentItemChanged
-        # (press) AND itemClicked (release), both routed here -- without
-        # this the .nxs loaded twice per click (three times on a
-        # double-click).  Use Refresh to force a reload of the same file.
-        if fname and fname == getattr(self.file_thread, 'fname', None):
-            return
+        if not internal:
+            # Run guard (the uniform single-click/arrow loading made this
+            # reachable mid-run): repointing/reloading the shared scan during
+            # an ACTIVE run desyncs the live scan identity (live branch) or
+            # reloads a half-written file (batch).  data_changed has the
+            # same guard.  new_scan's own per-scan repoint passes
+            # internal=True.
+            if getattr(self, '_run_writing', False):
+                logger.debug("set_file ignored during active run: %s", fname)
+                return
+            # Same-file dedupe: a fresh single click fires currentItemChanged
+            # (press) AND itemClicked (release), both routed here -- without
+            # this the .nxs loaded twice per click (three times on a
+            # double-click).  Use Refresh to force a reload of the same file.
+            if fname and fname == getattr(self.file_thread, 'fname', None):
+                return
         if fname != '':
             try:
                 # with self.file_lock:

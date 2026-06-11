@@ -1242,7 +1242,7 @@ class staticWidget(QWidget):
         if callable(_clear_wl):
             _clear_wl()
         self._sync_h5viewer_save_dir(os.path.dirname(fname), refresh=False)
-        self.h5viewer.set_file(fname)
+        self.h5viewer.set_file(fname, internal=True)   # run's own wiring
         self.scan.gi = gi
         self.scan.incidence_motor = incidence_motor
         self.scan.single_img = single_img
