@@ -1685,3 +1685,32 @@ def test_gi_1d_npts_defaults_and_per_axis_memory(widget):
     tree.set_image_units()
     tree._update_gi_mode_1d(tree.ui.axis1D.currentIndex())
     assert tree.ui.npts_1D.text() == "2000"
+
+
+def test_gi_entry_forces_q_unit(widget):
+    """Switching to GI with 2th selected in standard mode must force the
+    unit (combo AND bai args) back to Q -- GI has no 2th option, and the
+    retained '2th_deg' integrated GI under a Q-labelled axis (wrong
+    results, user-reported)."""
+    tree = widget.integratorTree
+    tree._npts_memory_1d = {}
+    tree._npts_key_1d = None
+
+    tree.scan.gi = False
+    tree.set_image_units()
+    tree.ui.unit_1D.setCurrentIndex(1)                 # 2th
+    tree.ui.unit_2D.setCurrentIndex(1)
+    assert tree.scan.bai_1d_args['unit'] == '2th_deg'
+    assert tree.scan.bai_2d_args['unit'] == '2th_deg'
+
+    tree.scan.gi = True
+    tree.set_image_units()
+    assert tree.ui.unit_1D.currentIndex() == 0          # forced to Q
+    assert tree.ui.unit_2D.currentIndex() == 0
+    assert tree.scan.bai_1d_args['unit'] == 'q_A^-1'
+    assert tree.scan.bai_2d_args['unit'] == 'q_A^-1'
+
+    # Back to standard: both units remain valid choices there.
+    tree.scan.gi = False
+    tree.set_image_units()
+    assert tree.scan.bai_1d_args['unit'] == 'q_A^-1'    # stays Q, no surprise

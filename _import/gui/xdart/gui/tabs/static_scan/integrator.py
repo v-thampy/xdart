@@ -1248,6 +1248,16 @@ class integratorTree(QtWidgets.QWidget):
             # clobbered the fiber-axis 1000 default at every new_scan and
             # poisoned the per-axis memory via the trailing stash.
             self.ui.label_npts_1D.setText("Pts")
+            # GI has no 2th option: a unit retained from standard mode
+            # (combo + bai args) integrated GI with unit='2th_deg' under a
+            # Q-labelled axis -- silently wrong results.  Force Q on entry;
+            # the trailing _update_gi_mode_* calls then re-derive labels and
+            # range defaults from the Q unit.
+            for _combo, _args in ((self.ui.unit_1D, self.scan.bai_1d_args),
+                                  (self.ui.unit_2D, self.scan.bai_2d_args)):
+                if _combo.currentIndex() != 0:
+                    _combo.setCurrentIndex(0)   # Q (fires _get_unit_*)
+                _args['unit'] = 'q_A^-1'        # belt-and-braces arg sync
             # Sync axis combos to current scan.bai_args GI mode
             gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
             gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
