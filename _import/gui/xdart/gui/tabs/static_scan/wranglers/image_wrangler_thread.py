@@ -838,6 +838,10 @@ class imageThread(wranglerThread):
                 self._process_one(scan, img_file, img_number, img_data, img_meta, bg_raw)
                 files_processed += 1
                 self._frames_since_save += 1
+                if self.xye_only:
+                    # No .nxs save in this mode -- drain the XYE buffer per
+                    # frame so output appears as the watch processes files.
+                    self._flush_xye_buffer(scan)
                 if self._save_due(scan):
                     _get_h5pool().pause(scan.data_file)
                     try:
@@ -850,6 +854,8 @@ class imageThread(wranglerThread):
 
         # Final flush on exit (live-watch tail or stop request) so the
         # last few frames aren't lost.
+        if scan is not None and self.xye_only:
+            self._flush_xye_buffer(scan)
         if (scan is not None and not self.xye_only
                 and self._frames_since_save > 0):
             _get_h5pool().pause(scan.data_file)
@@ -1527,6 +1533,13 @@ class imageThread(wranglerThread):
                 self._frames_since_save, _t_save, _t_xye,
             )
             self._frames_since_save = 0
+        elif self.xye_only:
+            # Int 1D (XYE) on the serial fallback: there is no .nxs save to
+            # ride on (_save_due is always False in this mode), so drain the
+            # XYE buffer per dispatch -- without this the serial path wrote
+            # ZERO output, silently.  (The default streaming path flushes
+            # via QtNexusSink._flush.)
+            self._flush_xye_buffer(scan)
         return count
 
     def _build_batch_frames(self, scan, pending):

@@ -314,3 +314,33 @@ def test_pause_and_resume_still_work_when_running():
     assert w2.thread.command == 'start' and w2.command == 'start'
     assert calls2[0] == 'resuming'       # guard re-engaged FIRST
     assert ('button', 'running') in calls2
+
+
+def test_serial_dispatch_drains_xye_buffer_without_nxs_save():
+    """Int 1D (XYE) on the serial fallback (XDART_LIVE_EXECUTION=serial) has
+    no .nxs save to ride on (_save_due is always False with xye_only), so the
+    dispatch itself must drain the XYE buffer -- it previously never did,
+    and the documented fallback path silently wrote ZERO output."""
+    from types import MethodType, SimpleNamespace
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
+        imageThread)
+
+    flushed = []
+    w = SimpleNamespace(
+        xye_only=True,
+        _frames_since_save=0,
+        _wait_if_paused=lambda: None,
+        _save_due=lambda scan, force=False: False,
+        _flush_xye_buffer=lambda scan, **k: flushed.append(scan),
+    )
+    w._dispatch_batch_serial = MethodType(
+        imageThread._dispatch_batch_serial, w)
+    scan = object()
+    w._dispatch_batch_serial(scan, [])
+    assert flushed == [scan]
+
+    # Non-XYE mode with no save due: no flush (unchanged behavior).
+    flushed.clear()
+    w.xye_only = False
+    w._dispatch_batch_serial(scan, [])
+    assert flushed == []
