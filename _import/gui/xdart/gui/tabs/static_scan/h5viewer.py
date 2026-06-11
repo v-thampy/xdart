@@ -1882,6 +1882,12 @@ class H5Viewer(QWidget):
                             generation=store.generation,
                         )
                     )
+            # Bound the full-res raws (Image Viewer browsing loaded ~18 MB
+            # per file with no ceiling; the LRU keeps the intended ~8).
+            # getattr: tests drive this on duck holders.
+            _trim = getattr(self, '_remember_hydrated_raw', None)
+            if _trim is not None:
+                _trim(int(frame_id))
             logger.debug(
                 'Image Viewer loaded processed frame %s from %s via %s: '
                 'shape=%s finite=%d',
@@ -1937,6 +1943,11 @@ class H5Viewer(QWidget):
                         generation=store.generation,
                     )
                 )
+        # Bound the full-res raws (Image Viewer browsing loaded ~18 MB per
+        # file with no ceiling; the LRU keeps the intended ~8).
+        _trim = getattr(self, '_remember_hydrated_raw', None)
+        if _trim is not None:
+            _trim(int(frame_id))
         logger.debug(
             'Image Viewer loaded frame %s from %s: shape=%s finite=%d '
             'min=%s max=%s',

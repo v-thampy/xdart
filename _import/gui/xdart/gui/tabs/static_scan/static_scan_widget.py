@@ -1310,6 +1310,28 @@ class staticWidget(QWidget):
                     self.scan.scan_data = pd.DataFrame()
             except AttributeError:
                 pass
+            # Multi-scan live runs: data_1d NEVER evicts (max=0), so without
+            # a per-swap purge every prior scan's 1D entries accumulate for
+            # the whole run (multi-GB at the 10k-frame target) -- the
+            # FixSizeOrderedDict-eviction rationale in the no-clear comment
+            # above only holds for data_2d.  Keep ONLY the currently
+            # rendered frame(s) so the previous image still lingers until
+            # this scan's first frame lands (the documented no-blank UX).
+            keep = set()
+            try:
+                df = self.displayframe
+                for lst in (df.idxs, df.idxs_1d, df.idxs_2d):
+                    keep.update(int(i) for i in (lst or ()))
+            except Exception:
+                pass
+            try:
+                with self.data_lock:
+                    for cache in (self.data_1d, self.data_2d):
+                        for k in [k for k in list(cache.keys())
+                                  if int(k) not in keep]:
+                            cache.pop(k, None)
+            except Exception:
+                logger.debug("live-swap cache purge skipped", exc_info=True)
 
         self.displayframe.set_axes()
         # self.displayframe.auto_last = True

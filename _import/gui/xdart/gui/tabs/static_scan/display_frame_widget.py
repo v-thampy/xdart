@@ -2178,11 +2178,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if frame is not None:
             thumb = getattr(frame, 'thumbnail', None)
 
-        # Fall back to 2D data dict
-        if thumb is None and int(idx) in self.data_2d:
-            d2 = self.data_2d[int(idx)]
-            thumb = d2.get('map_raw')
-            full_res = thumb is not None
+        # Fall back to 2D data dict.  Snapshot under data_lock: a concurrent
+        # eviction between an `in` check and the read raised KeyError on the
+        # GUI thread.
+        if thumb is None:
+            with self.data_lock:
+                d2 = self.data_2d.get(int(idx))
+            if d2 is not None:
+                thumb = d2.get('map_raw')
+                full_res = thumb is not None
 
         if thumb is None or (hasattr(thumb, 'size') and thumb.size == 0):
             if show_message:

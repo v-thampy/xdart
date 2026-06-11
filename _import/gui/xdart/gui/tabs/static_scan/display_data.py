@@ -972,8 +972,9 @@ class DisplayDataMixin:
         if self.viewer_mode == 'image' and len(self.idxs_2d) > 0:
             try:
                 import fabio
-                raw = np.asarray(
-                    self.data_2d[self.idxs_2d[0]]['map_raw'], dtype=np.float32)
+                with self.data_lock:
+                    _d2 = self.data_2d.get(self.idxs_2d[0]) or {}
+                raw = np.asarray(_d2.get('map_raw'), dtype=np.float32)
                 tif_path = os.path.join(directory, f'{base_name}_npy.tif')
                 fabio.tifimage.TifImage(data=raw).write(tif_path)
                 logger.info("Saved pyFAI-compatible TIFF: %s", tif_path)

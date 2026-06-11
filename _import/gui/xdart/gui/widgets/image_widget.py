@@ -157,6 +157,14 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
 
     def update_image(self, scale='Linear', cmap='viridis', **kwargs):
         self.displayed_image = np.asarray(np.copy(self.raw_image), dtype=float)
+        # All-NaN / empty images poison every nanpercentile below (RuntimeWarning
+        # + NaN levels -> pyqtgraph autoscale weirdness).  Higher layers normally
+        # block these, but the widget guards itself: show the raw image with no
+        # explicit levels and bail.
+        if (self.displayed_image.size == 0
+                or not np.isfinite(self.displayed_image).any()):
+            self.imageItem.setImage(self.displayed_image)
+            return
 
         cmap = 'viridis' if cmap == 'Default' else cmap
         cm = pg.colormap.getFromMatplotlib(cmap)  # prepare a linear color map
