@@ -129,7 +129,7 @@ params = [
         {'name': 'norm_channel', 'title': 'Normalize', 'type': 'list', 'values': ['bstop'], 'value': 'bstop',
          'visible': False},
     ], 'expanded': False, 'visible': False},
-    {'name': 'h5_dir', 'title': 'Save Path', 'type': 'str', 'value': get_fname_dir(), 'enabled': False},
+    {'name': 'h5_dir', 'title': 'Save Path', 'type': 'str', 'value': get_fname_dir(), 'enabled': True},
     NamedActionParameter(name='h5_dir_browse', title='Browse...', visible=False),
 ]
 
@@ -601,8 +601,33 @@ class imageWrangler(wranglerWidget):
         self.get_poni_dict()
 
     def _sync_h5_dir_from_parameters(self):
-        """Sync the Save Path parameter and notify the scans browser on change."""
+        """Sync the Save Path parameter and notify the scans browser on change.
+
+        Containment rule (Vivek): with a Project Folder set, the Save Path
+        must live INSIDE it (the .nxs stores source paths relative to the
+        project root, so processed data outside the project breaks the N1
+        portability story).  A typed/browsed path outside reverts to the
+        default ``<project>/xdart_processed_data`` with a status message
+        (the setValue re-enters this method via the tree-change cascade and
+        passes validation on the second pass).
+        """
         path = self.parameters.child('h5_dir').value()
+        base = self._compute_source_base()
+        if path and base:
+            _abs = os.path.abspath(os.path.expanduser(str(path)))
+            try:
+                inside = os.path.commonpath([_abs, base]) == base
+            except ValueError:          # different drives (Windows)
+                inside = False
+            if not inside:
+                imageWrangler._safe_status_text(
+                    self,
+                    'Save Path must be inside the Project Folder — reset '
+                    'to xdart_processed_data.',
+                )
+                self.parameters.child('h5_dir').setValue(
+                    os.path.join(base, 'xdart_processed_data'))
+                return
         old_path = getattr(self, 'h5_dir', None)
         self.h5_dir = path
         if path and path != old_path:
