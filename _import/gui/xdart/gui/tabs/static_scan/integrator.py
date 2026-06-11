@@ -1233,6 +1233,10 @@ class integratorTree(QtWidgets.QWidget):
             self.ui.label_azim_2D.setText(f"{Chi} ({Deg})")
             self.ui.label_to2_2.setText("to")
             self.ui.label_to1_2.setText("to")
+            # Restore the 2th unit choice a GI visit removed.
+            for _combo in (self.ui.unit_1D, self.ui.unit_2D):
+                if _combo.count() < 2:
+                    _combo.addItem(_translate("Form", Units[1]))
             # Update radial labels + range defaults for current unit
             self._update_standard_1d_label(self.ui.axis1D.currentIndex())
             self._update_standard_2d_label(self.ui.axis2D.currentIndex())
@@ -1258,6 +1262,10 @@ class integratorTree(QtWidgets.QWidget):
                 if _combo.currentIndex() != 0:
                     _combo.setCurrentIndex(0)   # Q (fires _get_unit_*)
                 _args['unit'] = 'q_A^-1'        # belt-and-braces arg sync
+                # GI offers no 2th at all -- remove the item (restored by
+                # the standard branch on the way back).
+                while _combo.count() > 1:
+                    _combo.removeItem(_combo.count() - 1)
             # Sync axis combos to current scan.bai_args GI mode
             gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
             gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')

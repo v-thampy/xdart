@@ -1709,8 +1709,12 @@ def test_gi_entry_forces_q_unit(widget):
     assert tree.ui.unit_2D.currentIndex() == 0
     assert tree.scan.bai_1d_args['unit'] == 'q_A^-1'
     assert tree.scan.bai_2d_args['unit'] == 'q_A^-1'
+    assert tree.ui.unit_1D.count() == 1                 # 2th removed in GI
+    assert tree.ui.unit_2D.count() == 1
 
-    # Back to standard: both units remain valid choices there.
+    # Back to standard: both units restored as valid choices.
     tree.scan.gi = False
     tree.set_image_units()
     assert tree.scan.bai_1d_args['unit'] == 'q_A^-1'    # stays Q, no surprise
+    assert tree.ui.unit_1D.count() == 2                 # 2th is back
+    assert tree.ui.unit_2D.count() == 2
