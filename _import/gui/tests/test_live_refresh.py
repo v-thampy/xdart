@@ -987,7 +987,7 @@ def test_live_new_scan_invalidates_publication_store():
             scan_name="old",
             auto_last=False,
             latest_idx=9,
-            set_file=lambda fname: None,
+            set_file=lambda fname, **k: None,
             update_scans=lambda: None,
             update=lambda: None,
         ),
