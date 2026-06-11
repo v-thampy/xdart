@@ -6,7 +6,10 @@
 # Standard library imports
 
 # Other imports
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
 from matplotlib import cm
 
 # This module imports
@@ -150,6 +153,23 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             self.imageItem.setRect(rect)
 
     def setRect(self, rect):
+        # TEMP DIAGNOSTIC (raw-panel axis-scale bug, Jun 2026): a reloaded
+        # .nxs sometimes renders with axes in the millions on the first
+        # load.  Log every geometry set; scream with a stack when the rect
+        # is wildly out of scale with the displayed image.
+        try:
+            img_shape = getattr(self.displayed_image, 'shape', None)
+            logger.info("setRect: rect=(%.0f,%.0f,%.0f,%.0f) image=%s",
+                        rect.x(), rect.y(), rect.width(), rect.height(),
+                        img_shape)
+            if rect.width() > 1e5 or rect.height() > 1e5:
+                import traceback
+                logger.warning(
+                    "setRect: SUSPICIOUS rect %sx%s for image %s\n%s",
+                    rect.width(), rect.height(), img_shape,
+                    "".join(traceback.format_stack()[-8:-1]))
+        except Exception:
+            pass
         self.imageItem.setRect(rect)
 
     def update_image(self, scale='Linear', cmap='viridis', **kwargs):
