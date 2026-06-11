@@ -1102,7 +1102,16 @@ class ReductionSession:
             self._cancelled = True
             self._semaphore.release()
             return
-        future = self._worker.submit(self._stream_reduce, frame, image)
+        try:
+            future = self._worker.submit(self._stream_reduce, frame, image)
+        except BaseException as exc:
+            # Pool/interpreter-level dispatch failure: the in-flight permit
+            # acquired above must be returned, else later submits deadlock
+            # on a semaphore that can never refill.  Record fail-loud.
+            self._semaphore.release()
+            self._failure = self._failure or exc
+            self._cancelled = True
+            raise
         self._submitted += 1
         self._write_queue.put((frame, future))
 
@@ -1145,9 +1154,15 @@ class ReductionSession:
                     reduction = future.result()
                 except _ReductionCancelled:
                     self._cancelled = True
+                    if self.clear_frame_images:
+                        frame.image = None
+                        frame.background = None
                     continue
                 except BaseException as exc:  # integration failure for one frame
                     self._failure = self._failure or exc
+                    if self.clear_frame_images:
+                        frame.image = None
+                        frame.background = None
                     continue
                 try:
                     idx = int(frame.index)

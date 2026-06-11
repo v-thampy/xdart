@@ -780,7 +780,17 @@ def open_nexus_writer(
 
     mode = "w" if overwrite else "a"
     f = h5py.File(p, mode, **file_kwargs)
+    try:
+        return _open_nexus_writer_body(f, entry, metadata, compression)
+    except BaseException:
+        # Close-on-construction-failure (same guard as FrameViewReader /
+        # open_nexus_image_stack): a header/metadata error otherwise orphans
+        # the open handle -- which LOCKS the file on Windows.
+        f.close()
+        raise
 
+
+def _open_nexus_writer_body(f, entry, metadata, compression):
     ck = _comp_kwargs(compression)
 
     grp = f.require_group(entry)
