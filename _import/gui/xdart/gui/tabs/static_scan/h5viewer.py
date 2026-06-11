@@ -1982,6 +1982,19 @@ class H5Viewer(QWidget):
         args:
             fname: str, absolute path for data file
         """
+        # Run guard (the uniform single-click/arrow loading made this
+        # reachable mid-run): repointing/reloading the shared scan during an
+        # ACTIVE run desyncs the live scan identity (live branch) or reloads
+        # a half-written file (batch).  data_changed has the same guard.
+        if getattr(self, '_run_writing', False):
+            logger.info("set_file ignored during active run: %s", fname)
+            return
+        # Same-file dedupe: a fresh single click fires currentItemChanged
+        # (press) AND itemClicked (release), both routed here -- without
+        # this the .nxs loaded twice per click (three times on a
+        # double-click).  Use Refresh to force a reload of the same file.
+        if fname and fname == getattr(self.file_thread, 'fname', None):
+            return
         if fname != '':
             try:
                 # with self.file_lock:
@@ -2169,6 +2182,12 @@ class H5Viewer(QWidget):
             self.data_2d.clear()
             _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
+        # Re-arm the raw self-heal: frame indices restart per scan, so a
+        # stale negative-cache entry from the previous file suppressed
+        # hydration for the SAME idx of the new one.
+        df = getattr(self, 'displayframe', None)
+        if df is not None:
+            df._raw_resolve_failed = set()
         self.new_scan = True
 
     def open_folder(self):

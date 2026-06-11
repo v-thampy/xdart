@@ -210,6 +210,8 @@ class DisplayDataMixin:
             frame_1d, frame_2d = snapshot.get(int(idx), (None, {}))
             raw = frame_2d.get('map_raw')
             bg = frame_2d.get('bg_raw', 0)
+            if bg is None:                  # LRU eviction nulls bg_raw
+                bg = 0
             # Try thumbnail from data_2d, then fall back to data_1d
             thumb = frame_2d.get('thumbnail')
             if thumb is None and frame_1d is not None:
@@ -246,7 +248,13 @@ class DisplayDataMixin:
                             logger.debug("lazy raw reload failed for %s", idx,
                                          exc_info=True)
                     raw = getattr(lf, 'map_raw', None)
+                    # free_raw() nulls bg_raw and _lazy_load_raw restores
+                    # only map_raw -- the attribute EXISTS with value None,
+                    # so the getattr default never applies; raw - None
+                    # raised TypeError on the GUI thread (delta review).
                     bg = getattr(lf, 'bg_raw', 0)
+                    if bg is None:
+                        bg = 0
                     if thumb is None:
                         thumb = getattr(lf, 'thumbnail', None)
                     if frame_1d is None:
@@ -258,9 +266,22 @@ class DisplayDataMixin:
                     # free_raw is a no-op when the source isn't reloadable.
                     lf.free_raw()
                 if raw is None:
-                    if _failed is None:
-                        _failed = self._raw_resolve_failed = set()
-                    _failed.add(int(idx))
+                    # Mark only GENUINE resolve failures.  During a run the
+                    # hydrate helper serves in-memory frames only (a miss is
+                    # transient), and an idx not yet in the scan index is a
+                    # load race -- marking those suppressed the post-run
+                    # self-heal permanently (delta review).
+                    transient = getattr(self, '_processing_active', False)
+                    if not transient:
+                        try:
+                            transient = int(idx) not in getattr(
+                                self.scan.frames, 'index', ())
+                        except Exception:
+                            transient = True
+                    if not transient:
+                        if _failed is None:
+                            _failed = self._raw_resolve_failed = set()
+                        _failed.add(int(idx))
             # Stage 1: the raw-vs-thumbnail-vs-none decision is the pure
             # ``choose_raw_source`` (unit-tested headlessly).  want_raw is
             # always True here — this path never refuses full raw data.
@@ -298,7 +319,7 @@ class DisplayDataMixin:
                         thumb_data, scan_info)
                     ctr += 1
                     sources.add('thumbnail')
-            except ValueError as e:
+            except (ValueError, TypeError) as e:
                 logger.debug(
                     "get_frames_map_raw skipped frame %s due to shape "
                     "mismatch: %s", idx, e,

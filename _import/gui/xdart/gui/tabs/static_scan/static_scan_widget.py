@@ -354,6 +354,8 @@ class staticWidget(QWidget):
                                                parent=self.ui.middleFrame,
                                                data_lock=self.data_lock,
                                                publication_store=self.publication_store)
+        # Back-ref so h5viewer.data_reset can re-arm display-side caches.
+        self.h5viewer.displayframe = self.displayframe
         self.ui.middleFrame.setLayout(self.displayframe.ui.layout)
 
         # IntegratorTree
@@ -1330,6 +1332,9 @@ class staticWidget(QWidget):
                         for k in [k for k in list(cache.keys())
                                   if int(k) not in keep]:
                             cache.pop(k, None)
+                # Frame indices restart per scan: re-arm the raw self-heal
+                # negative cache alongside the purge.
+                self.displayframe._raw_resolve_failed = set()
             except Exception:
                 logger.debug("live-swap cache purge skipped", exc_info=True)
 
