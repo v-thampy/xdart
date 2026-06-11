@@ -933,13 +933,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Int 2D raw/cake panels.  The wrangler Intensity Threshold is an
         # integration mask parameter, NOT a colour scale, so it must not set
         # display levels here (coupling it to vmin/vmax washed the image out).
-        widget.image_plot.setLabel(
-            "bottom", payload.axis_x.label, units=pretty_unit(payload.axis_x.unit),
-        )
-        widget.image_plot.setLabel(
-            "left", payload.axis_y.label, units=pretty_unit(payload.axis_y.unit),
-        )
+        if role is not PanelRole.RAW_2D:
+            widget.image_plot.setLabel(
+                "bottom", payload.axis_x.label, units=pretty_unit(payload.axis_x.unit),
+            )
+            widget.image_plot.setLabel(
+                "left", payload.axis_y.label, units=pretty_unit(payload.axis_y.unit),
+            )
         if role is PanelRole.RAW_2D:
+            # No setLabel-with-units for the raw panel: passing units engages
+            # pyqtgraph's auto-SI-prefix machinery, whose stale
+            # autoSIPrefixScale multiplied the TICK LABELS (x1000 -> the
+            # 0..2.5e6 'Pixels' axes / label flicker on reloaded files)
+            # while the actual view range and hover stayed pixel-correct.
             displayFrameWidget._set_raw_pixel_axes(widget)
             self.image_data = (image, rect)
         else:
@@ -1680,6 +1686,23 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     axis.enableAutoSIPrefix(False)
                 if hasattr(axis, 'setScale'):
                     axis.setScale(1.0)
+                # pg 0.14: tick strings multiply by autoSIPrefixScale even
+                # with units removed, and updateAutoSIPrefix recomputes it
+                # from whatever the CURRENT (possibly transient) range is --
+                # a stale milli-prefix scale rendered pixel ticks x1000.
+                # Clear it explicitly and force a repaint of the axis.
+                if hasattr(axis, 'autoSIPrefixScale'):
+                    axis.autoSIPrefixScale = 1.0
+                if hasattr(axis, 'labelUnitPrefix'):
+                    axis.labelUnitPrefix = ''
+                axis.picture = None
+                axis.update()
+                logger.info(
+                    "raw axis %s: range=%s scale=%s siScale=%s logMode=%s",
+                    axis_name, getattr(axis, 'range', None),
+                    getattr(axis, 'scale', None),
+                    getattr(axis, 'autoSIPrefixScale', None),
+                    getattr(axis, 'logMode', None))
             except Exception:
                 logger.debug("raw pixel axis scale update failed", exc_info=True)
 
