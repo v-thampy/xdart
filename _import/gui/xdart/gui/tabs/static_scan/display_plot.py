@@ -439,8 +439,13 @@ class DisplayPlotMixin:
         if (len(self.frame_ids) == 0) or (len(self.data_1d) == 0 and not using_publication):
             return
 
-        # Clear curves
-        [curve.clear() for curve in self.curves]
+        # Clear curves.  removeItem, not curve.clear(): PlotDataItem.clear()
+        # only blanks the data and leaves the item (plus its child curve +
+        # scatter items) registered on the PlotItem/ViewBox -- they
+        # accumulated per render, growing the scene and making autorange's
+        # childrenBounds() sweep quadratically slower over a long run.
+        for curve in self.curves:
+            self.plot.removeItem(curve)
         self.curves.clear()
 
         self.plotMethod = self.ui.plotMethod.currentText()

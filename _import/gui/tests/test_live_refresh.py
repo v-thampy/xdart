@@ -618,6 +618,7 @@ def _display_host():
     wf_widget = _FakeImageWidget()
     label = _FakeLabel()
     curve = _FakeCurve()
+    removed = []
     legend = _FakeLegend()
     host = SimpleNamespace(
         image_data=(np.ones((3, 3)), None),
@@ -629,6 +630,8 @@ def _display_host():
         binned_widget=binned_widget,
         wf_widget=wf_widget,
         curves=[curve],
+        plot=SimpleNamespace(removeItem=removed.append),
+        _removed_curves=removed,
         legend=legend,
         ui=SimpleNamespace(labelCurrent=label),
     )
@@ -654,7 +657,9 @@ def test_clear_display_state_resets_visible_and_cached_state():
     assert host.frame_names == []
     assert host.overlaid_idxs == []
     assert host.curves == []
-    assert curve.cleared is True
+    # New contract: curves are REMOVED from the plot (removeItem), not just
+    # data-cleared -- PlotDataItem.clear() left items accumulating.
+    assert host._removed_curves == [curve]
     assert legend.cleared is True
     assert label.text == "XYE Viewer"
     assert image_widget.images == []

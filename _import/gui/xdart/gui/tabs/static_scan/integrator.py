@@ -1243,12 +1243,10 @@ class integratorTree(QtWidgets.QWidget):
             self.ui.axis2D.clear()
             for label in GI_LABELS_2D:
                 self.ui.axis2D.addItem(_translate("Form", label))
-            # GI default: 2000 Pts.  The second Pts box (npts_oop_1D) shows
-            # conditionally — see _update_npts_oop_visibility_1d, which is
-            # called below via _update_gi_mode_1d.
-            if (not self.ui.npts_1D.text()
-                    or self.ui.npts_1D.text() in ("1000", "3000")):
-                self.ui.npts_1D.setText("2000")
+            # 1-D Pts defaults are owned by _apply_npts_1d_for_mode (per-axis
+            # memory) -- the legacy force-to-2000 snippet that lived here
+            # clobbered the fiber-axis 1000 default at every new_scan and
+            # poisoned the per-axis memory via the trailing stash.
             self.ui.label_npts_1D.setText("Pts")
             # Sync axis combos to current scan.bai_args GI mode
             gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')

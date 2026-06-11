@@ -1674,6 +1674,13 @@ def test_gi_1d_npts_defaults_and_per_axis_memory(widget):
     json.dumps(state)
     assert state['npts_1d']['q_ip'][0] == "800"
 
+    # new_scan re-runs set_image_units: it must NOT clobber the fiber-axis
+    # value (the legacy force-to-2000 snippet did exactly that and poisoned
+    # the per-axis memory via the trailing stash).
+    tree.set_image_units()
+    assert tree.ui.npts_1D.text() == "800"
+    assert tree._npts_memory_1d.get('q_ip', ('800',))[0] == "800"
+
     tree.scan.gi = False                               # -> standard mode
     tree.set_image_units()
     tree._update_gi_mode_1d(tree.ui.axis1D.currentIndex())

@@ -1872,8 +1872,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """Remove all 1D curves and reset cached plot state."""
         try:
             self.clear_overlay()
+            # removeItem, not curve.clear() -- see update_plot_view: clear()
+            # leaves the items registered on the plot and they accumulate.
             for curve in self.curves:
-                curve.clear()
+                self.plot.removeItem(curve)
             self.curves.clear()
             if getattr(self, 'legend', None) is not None:
                 self.legend.clear()
