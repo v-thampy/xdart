@@ -1888,6 +1888,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     def clear_display_state(self, title=None):
         """Blank all rendered panels and cached display data."""
+        self._raw_resolve_failed = set()   # re-arm the raw hydrate retries
         self.clear_image_view()
         self.clear_binned_view()
         self.clear_plot_view()

@@ -214,13 +214,30 @@ class DisplayDataMixin:
             thumb = frame_2d.get('thumbnail')
             if thumb is None and frame_1d is not None:
                 thumb = getattr(frame_1d, 'thumbnail', None)
-            if raw is None and thumb is None:
-                # data_2d cache miss (frame outside the bounded 20-deep window):
-                # hydrate from disk so a selection larger than the cache (e.g.
-                # Set-Bkg over the whole scan) averages ALL selected frames, not
-                # just the cached subset.  map_raw isn't in the .nxs, so reload
-                # it from source; thumbnail is the fallback when source is gone.
-                lf = self._hydrate_frame_from_disk(int(idx))
+            # Hydrate from disk when full-res raw is missing.  Two cases:
+            # (a) total cache miss (no thumbnail either) -- the original
+            #     Set-Bkg-over-the-whole-scan path; any selection size.
+            # (b) thumbnail present but raw missing, SINGLE-frame selection
+            #     without an explicit thumbnail preference: the load worker
+            #     publishes the thumbnail preview first and a raw
+            #     replace-chunk second -- if that second chunk failed
+            #     (source unresolvable on this machine) or was dropped
+            #     (generation gate), the panel previously stranded on the
+            #     thumbnail forever.  Multi-frame averages keep thumbnails
+            #     (no N x 18 MB loads); a per-index negative cache (cleared
+            #     with the display caches) keeps unresolvable sources from
+            #     re-attempting a file open on every render.
+            _hydrate = getattr(self, '_hydrate_frame_from_disk', None)
+            _failed = getattr(self, '_raw_resolve_failed', None)
+            _want_hydrate = (
+                raw is None
+                and _hydrate is not None
+                and not (_failed and int(idx) in _failed)
+                and (thumb is None
+                     or (not prefer_thumbnail and len(idxs) == 1))
+            )
+            if _want_hydrate:
+                lf = _hydrate(int(idx))
                 if lf is not None:
                     if getattr(lf, 'map_raw', None) is None:
                         try:
@@ -240,6 +257,10 @@ class DisplayDataMixin:
                     # local ``raw`` ref keeps it alive for the accumulate below;
                     # free_raw is a no-op when the source isn't reloadable.
                     lf.free_raw()
+                if raw is None:
+                    if _failed is None:
+                        _failed = self._raw_resolve_failed = set()
+                    _failed.add(int(idx))
             # Stage 1: the raw-vs-thumbnail-vs-none decision is the pure
             # ``choose_raw_source`` (unit-tested headlessly).  want_raw is
             # always True here — this path never refuses full raw data.
