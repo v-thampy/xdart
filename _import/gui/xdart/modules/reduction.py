@@ -369,6 +369,7 @@ def reduce_live_frames(
     # the session-side references now.
     for headless_frame in headless_frames:
         headless_frame.image = None
+        headless_frame.background = None   # full bg images pin like raws
     return reduced_frames
 
 

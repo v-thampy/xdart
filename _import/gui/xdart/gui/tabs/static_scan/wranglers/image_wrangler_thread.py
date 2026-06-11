@@ -1854,6 +1854,25 @@ class imageThread(wranglerThread):
             return 0
 
         # ── Phase 2: serial HDF5 batch write ─────────────────────────────────
+        try:
+            # Class-qualified: test rigs bind _dispatch_batch_parallel onto
+            # duck holders that don't carry the helper.
+            imageThread._dispatch_batch_parallel_phase2(
+                self, scan, frames, gi, th_mtr, series_average)
+        finally:
+            # PERF-3, in a finally (codex): if the batch save RAISED, the
+            # frames sit unsaved in scan.frames (persist-before-evict pins
+            # them) -- without this, a failed 64-frame chunk also pinned
+            # ~18 MB/frame of raw.  free_raw only drops raws losslessly
+            # reloadable from source, so freeing on the error path is safe.
+            for frame in frames:
+                frame.free_raw()
+        return len(frames)
+
+    def _dispatch_batch_parallel_phase2(self, scan, frames, gi, th_mtr,
+                                        series_average):
+        """Phase 2 of the chunked dispatcher: serial .nxs write + XYE flush.
+        Split out so the caller can guarantee raw cleanup in a finally."""
         if not self.xye_only:
             self.showLabel.emit(f'Writing {len(frames)} frames to HDF5...')
             _t_phase2 = time.time()
@@ -1889,17 +1908,8 @@ class imageThread(wranglerThread):
         if _t_xye > 0.01:
             logger.info('[BATCH] XYE flush: %d frames in %.2fs', len(frames), _t_xye)
 
-        # PERF-3: each frame is now fully consumed for this batch — integrated
-        # (Phase 1), thumbnail precomputed (Phase 1), written to .nxs
-        # (Phase 2), XYE flushed.  scan.frames keeps the frame objects for the
-        # rest of the scan, so without this their ~18 MB raw accumulates batch
-        # over batch.  free_raw releases the raw only when it's losslessly
-        # reloadable from source; a later viewer / reintegration read lazily
-        # reloads (integrate_1d/2d, _lazy_load_raw).
-        for frame in frames:
-            frame.free_raw()
-
-        return len(frames)
+        # (PERF-3 free_raw moved to the caller's finally so it also runs
+        # when the save raises.)
 
     def _process_one(self, scan, img_file, img_number, img_data, img_meta,
                      bg_raw, t_read=0.0):

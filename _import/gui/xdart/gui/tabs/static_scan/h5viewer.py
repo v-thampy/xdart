@@ -2370,6 +2370,8 @@ class H5Viewer(QWidget):
             payload = self.data_2d.get(stale)
             if payload is not None:
                 payload["map_raw"] = None
+                if "bg_raw" in payload:
+                    payload["bg_raw"] = None   # full bg images pin like raws
         self._raw_cache_order = order
 
     def _clear_raw_cache(self) -> None:
