@@ -397,6 +397,9 @@ def resolve_source_master(
     return None
 
 
+_OUTSIDE_ROOT_WARNED: set = set()    # (source_dir, root) pairs already warned
+
+
 def relative_source_path(src, root=None) -> str:
     """N1 WRITE-side counterpart of :func:`resolve_source_master`: the portable
     string to store in ``source/path``.
@@ -417,6 +420,13 @@ def relative_source_path(src, root=None) -> str:
             inside = False
         if inside:
             return Path(os.path.relpath(src_abs, root_abs)).as_posix()
+        # Warn ONCE per (source directory, root): every frame of a scan
+        # shares the source dir (one Eiger master / one TIFF series dir),
+        # so the per-frame call otherwise repeated this for the whole scan.
+        _key = (os.path.dirname(src_abs), root_abs)
+        if _key in _OUTSIDE_ROOT_WARNED:
+            return Path(src_abs).as_posix()
+        _OUTSIDE_ROOT_WARNED.add(_key)
         logger.warning("source %s is outside the project root %s; storing an "
                        "absolute (non-portable) path", src_abs, root_abs)
     return Path(src_abs).as_posix()
