@@ -1686,23 +1686,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     axis.enableAutoSIPrefix(False)
                 if hasattr(axis, 'setScale'):
                     axis.setScale(1.0)
-                # pg 0.14: tick strings multiply by autoSIPrefixScale even
-                # with units removed, and updateAutoSIPrefix recomputes it
-                # from whatever the CURRENT (possibly transient) range is --
-                # a stale milli-prefix scale rendered pixel ticks x1000.
-                # Clear it explicitly and force a repaint of the axis.
+                # pg 0.14: tick strings multiply by autoSIPrefixScale, and
+                # updateAutoSIPrefix recomputes it from whatever the CURRENT
+                # range is.  Verified live (Jun 2026): at label time the
+                # axis still held the transient pre-autorange range
+                # (+/-0.615), siScale(0.615) -> milli prefix -> pixel ticks
+                # rendered x1000 (the 0..2.5e6 'Pixels' axes).  Clear the
+                # stale scale explicitly and force an axis repaint.
                 if hasattr(axis, 'autoSIPrefixScale'):
                     axis.autoSIPrefixScale = 1.0
                 if hasattr(axis, 'labelUnitPrefix'):
                     axis.labelUnitPrefix = ''
                 axis.picture = None
                 axis.update()
-                logger.info(
-                    "raw axis %s: range=%s scale=%s siScale=%s logMode=%s",
-                    axis_name, getattr(axis, 'range', None),
-                    getattr(axis, 'scale', None),
-                    getattr(axis, 'autoSIPrefixScale', None),
-                    getattr(axis, 'logMode', None))
             except Exception:
                 logger.debug("raw pixel axis scale update failed", exc_info=True)
 
