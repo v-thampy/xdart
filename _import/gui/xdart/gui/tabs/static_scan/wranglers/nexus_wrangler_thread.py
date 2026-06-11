@@ -376,8 +376,19 @@ class nexusThread(wranglerThread):
                 # (the inherited ``_save_to_disk`` is also a no-op
                 # under xye_only, but we short-circuit here too so
                 # the chunk loop reads clean).
-                if (not self.xye_only
-                        and frames_since_save >= self.LIVE_SAVE_INTERVAL):
+                _due = frames_since_save >= self.LIVE_SAVE_INTERVAL
+                if not _due and not self.xye_only and frames_since_save > 0:
+                    # Cap-aware bound (mirrors imageThread._save_due): the
+                    # 1D interval is 1000, but stash() cannot evict unsaved
+                    # frames -- without this, up to 1000 frames each pinning
+                    # an ~18 MB raw chunk view accumulated between saves.
+                    _cap = getattr(scan.frames, "_in_memory_cap", 64)
+                    _counter = getattr(scan.frames,
+                                       "unsaved_in_memory_count", None)
+                    _unsaved = (_counter() if callable(_counter)
+                                else frames_since_save)
+                    _due = _unsaved >= max(1, _cap - 8)
+                if not self.xye_only and _due:
                     self._save_to_disk(scan)
                     frames_since_save = 0
 
@@ -509,12 +520,17 @@ class nexusThread(wranglerThread):
         # In-memory accumulate only — the chunked flush at the end of
         # the dispatch loop (and the final ``save_to_nexus(finalize=True)``
         # at the bottom of ``run()``) handle persistence.
-        scan.add_frame(
-            frame=frame, calculate=False, update=True,
-            get_sd=True, set_mg=False, static=True, gi=self.gi,
-            th_mtr=self.incidence_motor, series_average=False,
-            batch_save=True,
-        )
+        # xye_only: SKIP the series stash (mirrors imageThread).  Both saves
+        # are gated off in this mode, so mark_persisted never runs and
+        # stash() could never evict — every frame's raw (a view pinning the
+        # whole bulk read chunk) accumulated for the entire run.
+        if not self.xye_only:
+            scan.add_frame(
+                frame=frame, calculate=False, update=True,
+                get_sd=True, set_mg=False, static=True, gi=self.gi,
+                th_mtr=self.incidence_motor, series_average=False,
+                batch_save=True,
+            )
         # Publish for the GUI's update_data slot to consume.  Single
         # write site for the dict round-trip.
         self._published_frames[frame.idx] = frame

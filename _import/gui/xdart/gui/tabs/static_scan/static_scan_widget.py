@@ -913,9 +913,32 @@ class staticWidget(QWidget):
             if wt is not None and wt.isRunning():
                 w.command = 'stop'
                 wt.command = 'stop'
-                wt.wait(5000)
+                # The run() finally performs the end-of-run session finish
+                # (writer join up to 60s) + final .nxs flush -- 5s routinely
+                # lost that race and Qt aborted on the still-running thread,
+                # killing the very flush that protects the data.  30s covers
+                # everything but a wedged NFS write.
+                if not wt.wait(30000):
+                    logger.warning("wrangler thread still finishing at "
+                                   "close after 30s; final flush may be "
+                                   "incomplete")
         except Exception:
             logger.debug("stopping wrangler thread on close failed", exc_info=True)
+        # Reintegration thread: request a between-batches stop and wait --
+        # close() never touched it, so a multi-minute reintegrate-all
+        # running at close was destroyed mid-loop (Qt6 qFatal) with its
+        # cached reduction session never finished.
+        try:
+            it = getattr(getattr(self, 'integratorTree', None),
+                         'integrator_thread', None)
+            if it is not None and it.isRunning():
+                it.stop_requested = True
+                if not it.wait(15000):
+                    logger.warning("integrator thread still running at "
+                                   "close after 15s")
+        except Exception:
+            logger.debug("stopping integrator thread on close failed",
+                         exc_info=True)
         # Stop the viewer's long-running background threads BEFORE teardown so
         # the persistent fileHandlerThread / async load worker aren't destroyed
         # while running ("QThread: Destroyed while thread is still running") on

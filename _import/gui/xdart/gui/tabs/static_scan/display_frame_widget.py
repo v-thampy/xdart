@@ -1982,6 +1982,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self.ui.cmap.setVisible(True)
             self.ui.cmap.setEnabled(True)
             self.ui.scale.setEnabled(True)
+            # Same stale-share unlink as the xye branch: the NeXus viewer
+            # renders 1-D dataset previews into self.plot, which a checked
+            # Share Axis left x-linked to the hidden cake with x-auto off --
+            # previews froze at the old cake's range (and panning them
+            # dragged the hidden cake, breaking the trim re-arm check).
+            displayFrameWidget._set_share_link(self, False)
+            _plot = getattr(self, 'plot', None)
+            if _plot is not None:
+                _plot.enableAutoRange()
             if mode == 'nexus':
                 self._set_equal_primary_panel_heights()
         else:

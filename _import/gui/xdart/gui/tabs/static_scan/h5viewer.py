@@ -1088,7 +1088,13 @@ class H5Viewer(QWidget):
         if getattr(self, '_suspend_scan_selection_loads', False):
             return
         try:
-            item_text = q.data(0)
+            try:
+                item_text = q.data(0)
+            except RuntimeError:
+                # Double-click after single-click navigation: the first click
+                # rebuilt listScans, so the second event can deliver an item
+                # whose C++ object is already deleted.  Nothing to act on.
+                return
 
             # Navigation: ".." or folder
             if item_text == '..':

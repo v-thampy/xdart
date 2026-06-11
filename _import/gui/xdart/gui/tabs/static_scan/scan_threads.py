@@ -89,6 +89,10 @@ class integratorThread(Qt.QtCore.QThread):
         self._plan_cache = StandardPlanCache()
         self._reduction_session = None
         self._reduction_session_key = None
+        # Cooperative stop for the (potentially minutes-long) batched
+        # reintegrate loop; set by staticWidget.close().  Checked between
+        # batches only -- a batch in flight finishes.
+        self.stop_requested = False
 
     def run(self):
         """Calls self.method. Catches exception where method does
@@ -347,6 +351,12 @@ class integratorThread(Qt.QtCore.QThread):
         _RE_BATCH = max(8, 32 * n_workers)
 
         for i in range(0, len(indices), _RE_BATCH):
+            if self.stop_requested:
+                logger.warning(
+                    "%s reintegration stopped at frame %s/%s (app close); "
+                    "recomputed frames are NOT saved.", label,
+                    i, len(indices))
+                return
             chunk_idxs = indices[i:i + _RE_BATCH]
             # LiveFrameSeries.__getitem__ does the lazy v2 load + sets
             # source refs / _source_root for the L1 raw loader.
@@ -517,11 +527,17 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 self.sigTaskStarted.emit()
                 method = getattr(self, method_name)
                 method()
-            except KeyError as e:
-                logger.error("Task %s failed with KeyError: %s", method_name, e, exc_info=True)
+            except Exception as e:
+                # The loop must survive ANY task failure: this thread is
+                # created once and never restarted, so a single OSError
+                # (locked/corrupt/NFS file) escaping here used to kill file
+                # loading for the rest of the session, silently.
+                logger.error("Task %s failed: %s", method_name, e,
+                             exc_info=True)
                 traceback.print_exc()
-            self.running = False
-            self.sigTaskDone.emit(method_name)
+            finally:
+                self.running = False
+                self.sigTaskDone.emit(method_name)
     
     def set_datafile(self):
         with self.file_lock:

@@ -492,7 +492,18 @@ class nexusWrangler(wranglerWidget):
         self.gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
         self.gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
 
-        # Recreate thread with current params
+        # Recreate thread with current params.  Release the PREVIOUS one
+        # first: it is parented to this widget, so without deleteLater every
+        # run start accumulated one dormant QThread (plus its signal
+        # connections and _published_frames remnants) for the app's life.
+        _old = getattr(self, 'thread', None)
+        if _old is not None and not (hasattr(_old, 'isRunning')
+                                     and _old.isRunning()):
+            try:
+                _old.setParent(None)
+                _old.deleteLater()
+            except Exception:
+                logger.debug("old nexusThread release failed", exc_info=True)
         self.thread = nexusThread(
             self.command_queue,
             self.scan_args,
