@@ -620,13 +620,26 @@ class imageWrangler(wranglerWidget):
             except ValueError:          # different drives (Windows)
                 inside = False
             if not inside:
+                # REJECT (Vivek): restore the previous valid value when there
+                # is one, else the default.  Note the .nxs never embeds raw
+                # data -- sources are stored as references -- the issue with
+                # an outside path is purely that the output leaves the
+                # portable project tree.
+                prev = (getattr(self, 'h5_dir', '') or '').strip()
+                try:
+                    prev_ok = bool(prev) and os.path.commonpath(
+                        [os.path.abspath(os.path.expanduser(prev)), base]
+                    ) == base
+                except ValueError:
+                    prev_ok = False
+                fallback = (prev if prev_ok
+                            else os.path.join(base, 'xdart_processed_data'))
                 imageWrangler._safe_status_text(
                     self,
-                    'Save Path must be inside the Project Folder — reset '
-                    'to xdart_processed_data.',
+                    'Save Path rejected: must be inside the Project Folder. '
+                    f'Kept {os.path.basename(fallback) or fallback}.',
                 )
-                self.parameters.child('h5_dir').setValue(
-                    os.path.join(base, 'xdart_processed_data'))
+                self.parameters.child('h5_dir').setValue(fallback)
                 return
         old_path = getattr(self, 'h5_dir', None)
         self.h5_dir = path
