@@ -260,15 +260,26 @@ def axis_from_unit(unit: str | None, values: Any | None = None, *, label: str | 
 
 
 def two_d_kind_from_units(x_unit: str | None, y_unit: str | None) -> TwoDKind:
-    """Infer 2D axis identity from units when an explicit kind is absent."""
+    """Infer 2D axis identity from units when an explicit kind is absent.
+
+    GI matching is deliberately lenient (substring) because existing
+    processed files carry several unit spellings — canonical
+    ``qip_A^-1``/``qoop_A^-1`` and ``exit_angle_horz_deg``/
+    ``exit_angle_vert_deg``, but also legacy xdart ``horiz_exit``/
+    ``vert_exit``.  Misclassifying a GI map as Q_CHI sends its qip axis
+    through the q→2θ conversion downstream (arcsin out of range →
+    collapsed/blank cake), so leniency is the safe direction.  This is
+    the ONE classifier — xdart's display layer maps these kinds to its
+    legacy strings at the display edge.
+    """
 
     x = (x_unit or "").lower()
     y = (y_unit or "").lower()
-    if x.startswith("qip") and y.startswith("qoop"):
+    if "qip" in x or "qip" in y or "qoop" in x or "qoop" in y:
         return TwoDKind.QIP_QOOP
     if x.startswith("qtot") and y.startswith("chigi"):
         return TwoDKind.QTOT_CHIGI
-    if x.startswith("exit_angle") or y.startswith("exit_angle"):
+    if "exit" in x or "exit" in y:
         return TwoDKind.EXIT_ANGLES
     return TwoDKind.Q_CHI
 

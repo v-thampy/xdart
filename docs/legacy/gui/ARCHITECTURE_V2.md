@@ -15,8 +15,12 @@ the review runbook pass cleanly.
 
 ## New Seams
 
-- `xdart.modules.sources.LiveScanFrameSource` adapts a `LiveScan` to the ssrl
-  `FrameSource` protocol without importing Qt.
+- `xdart.modules.reduction.frame_from_live_frame` / `scan_from_live_scan`
+  adapt a `LiveFrame`/`LiveScan` to the headless core contracts
+  (`xrd_tools.core.scan`) without importing Qt — the single LiveScan->core
+  adapter (the duplicate `LiveScanFrameSource` was removed in the monorepo
+  migration; the core `Scan` itself satisfies the chunk-iteration boundary
+  RSM/stitching consume).
 - **Streaming, sink-driven write is the DEFAULT (WS-X1 endpoint).** The wrangler
   opens one persistent `ssrl_xrd_tools.reduction.ReductionSession` per scan
   (`execution="streaming"`, via `open_live_reduction_session`) with an

@@ -16,15 +16,16 @@ from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
+# NOTE: keep this module import-light (no h5py/fabio/pyFAI/Qt): it is part
+# of the Qt-free core-contracts surface that pure display-logic / CI
+# environments import.  Heavy readers (e.g. xrd_tools.io.image.read_image)
+# are imported inside the methods that need them.
 from xrd_tools.core.containers import PONI
 from xrd_tools.core.metadata import (
     HeterogeneousMetadata,
     ScanMetadata,
     numeric_metadata,
 )
-from xrd_tools.io.image import read_image
-
-
 ImageLoader = Callable[["ScanFrame"], np.ndarray]
 
 
@@ -192,6 +193,8 @@ class ScanFrame:
             with open_nexus_image_stack(path) as stack:
                 self.image = np.asarray(stack[int(self.source_frame_index)])
         else:
+            from xrd_tools.io.image import read_image
+
             self.image = np.asarray(read_image(path))
         return self.image
 

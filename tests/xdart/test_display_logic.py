@@ -665,7 +665,12 @@ def test_display_logic_imports_no_heavy_deps():
     deliberate: importing the package runs its ``__init__`` chain, which
     pulls in Qt/pyFAI/h5py regardless of this module.  The guardrail
     (§9) is about *display_logic.py's own* imports — keep it pure so CI
-    runs it anywhere, no Qt/pyFAI install needed."""
+    runs it anywhere, no Qt/pyFAI install needed.
+
+    ``xrd_tools.core`` is ALLOWED (6d): it is the Qt-free contracts
+    surface and is import-light by design (its h5py codec re-exports are
+    lazy) — this test still asserts none of the forbidden modules get
+    pulled through it."""
     forbidden = ('PySide6', 'PySide2', 'PyQt5', 'PyQt6',
                  'pyqtgraph', 'h5py', 'pyFAI', 'fabio')
     code = textwrap.dedent(f"""

@@ -40,6 +40,13 @@ from enum import Enum
 
 import numpy as np  # allowed: the purity guard forbids only Qt/pyqtgraph/h5py/pyFAI/fabio
 
+# The Qt-free core contracts are likewise allowed (import-light by
+# design): the purity guard asserts this pulls no Qt/pyqtgraph/h5py/
+# pyFAI/fabio.
+from xrd_tools.core.frame_view import (
+    two_d_kind_from_units as _core_kind,
+)
+
 __all__ = [
     "Mode",
     "RawSource",
@@ -497,6 +504,17 @@ def pretty_unit(unit):
     return symbol if symbol else unit
 
 
+#: TwoDKind -> the display layer's legacy kind strings.  GI polar
+#: (QTOT_CHIGI) renders like a standard cake (q-like radial vs chi-like
+#: azimuthal axis), so it maps to 'standard' — the pre-enum behavior.
+_TWO_D_KIND_TO_LEGACY = {
+    "q_chi": "standard",
+    "qtot_chigi": "standard",
+    "qip_qoop": "qip_qoop",
+    "exit_angles": "exit_angles",
+}
+
+
 def two_d_kind_from_units(unit, azimuthal_unit):
     """Classify a 2D integration result's axis identity from its unit strings.
 
@@ -507,20 +525,17 @@ def two_d_kind_from_units(unit, azimuthal_unit):
     treat a qip/qoop map as a standard q/χ cake — and, worse, run the qip
     axis through the q→2θ conversion (arcsin of out-of-range values →
     collapsed/blank cake).  Reconstructing the kind from the units lets
-    qip/qoop round-trip through the display.  This is the minimal version
-    of the ``TwoDKind`` seam from the data-source unification plan.
+    qip/qoop round-trip through the display.
 
-    Returns one of ``'qip_qoop'``, ``'exit_angles'``, or ``'standard'``
-    (q/χ, the back-compatible default — GI polar q/χ is indistinguishable
-    from a standard cake by units alone and is treated as standard here).
+    The classification itself is the core ``TwoDKind`` seam
+    (:func:`xrd_tools.core.frame_view.two_d_kind_from_units` — Qt-free,
+    allowed by the purity guard); this wrapper maps the enum to the
+    display layer's legacy strings ``'qip_qoop'`` / ``'exit_angles'`` /
+    ``'standard'`` (q/χ — the back-compatible default, which also covers
+    GI polar q/χ).
     """
-    u = str(unit or "").lower()
-    au = str(azimuthal_unit or "").lower()
-    if "qip" in u or "qip" in au or "qoop" in u or "qoop" in au:
-        return "qip_qoop"
-    if "exit" in u or "exit" in au:
-        return "exit_angles"
-    return "standard"
+    return _TWO_D_KIND_TO_LEGACY[_core_kind(str(unit or ""),
+                                            str(azimuthal_unit or "")).value]
 
 
 def is_gi_2d_units(unit, azimuthal_unit):
