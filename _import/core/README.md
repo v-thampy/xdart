@@ -111,16 +111,16 @@ footprint stays modest for batch / pipeline / CI use cases.
 | `[rsm]`      | `rsm.*` — Ang2Q, Gridder3D, VTK export                        | xrayutilities, pyevtk                                   |
 | `[gui]`      | `gui.widgets.*` — Jupyter UI on top of plotly                 | ipywidgets, anywidget, ipyfilechooser                   |
 | `[notebook]` | self-contained Jupyter environment                            | ipykernel, jupyterlab                                   |
-| `[napari]`   | napari 3D viewer for RSM volumes                              | napari                                                  |
 | `[tiled]`    | Tiled client for Bluesky-collected data                       | tiled[client]                                           |
 | `[vtk]`      | back-compat alias for `pyevtk` (now also in `[rsm]`)          | pyevtk                                                  |
-| `[all]`      | everything except dev                                         | `ssrl_xrd_tools[fitting,rsm,gui,notebook,napari,tiled]` |
+| `[all]`      | everything except dev                                         | `ssrl_xrd_tools[fitting,rsm,gui,notebook,tiled]`        |
 | `[dev]`      | test / build / release                                        | pytest, build, twine                                    |
 
-Extras compose: `uv pip install "ssrl_xrd_tools[fitting,rsm,gui,napari]"`
-gives you the full interactive notebook stack plus napari viewing
-without the heavy `[notebook]` jupyterlab install (assumes you have
-your own Jupyter environment already).
+Extras compose: `uv pip install "ssrl_xrd_tools[fitting,rsm,gui]"`
+gives you the full interactive notebook stack without the heavy
+`[notebook]` jupyterlab install (assumes you have your own Jupyter
+environment already).  A `[napari]` extra for the RSM 3D viewer will be
+added when that viewer is wired up (the module is currently a stub).
 
 ### Updating
 
@@ -492,7 +492,6 @@ Summary:
 | `[rsm]`      | reciprocal-space mapping via `rsm.*` (xrayutilities, pyevtk)            |
 | `[gui]`      | Jupyter notebook widgets on top of plotly (ipywidgets, anywidget, ipyfilechooser) |
 | `[notebook]` | self-contained Jupyter environment (ipykernel, jupyterlab)              |
-| `[napari]`   | napari 3D viewer for RSM volumes                                        |
 | `[tiled]`    | Tiled client for Bluesky-collected runs                                 |
 | `[vtk]`      | back-compat alias for `pyevtk` (now also in `[rsm]`)                    |
 | `[all]`      | everything except dev                                                    |

@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import logging
 from collections import namedtuple
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable, Sequence
 
 import h5py
@@ -76,11 +76,26 @@ Integrated2D = namedtuple(
 def _entry(f: h5py.File, entry: str) -> h5py.Group:
     if entry not in f:
         raise KeyError(f"No {entry!r} group in {f.filename}")
-    return f[entry]
+    grp = f[entry]
+    # C1: every convenience reader funnels through here -- warn once per call
+    # when the file is NEWER than this library supports, before dataset access
+    # fails with an opaque KeyError.
+    from ssrl_xrd_tools.io.nexus import warn_if_newer_schema
+    warn_if_newer_schema(grp, str(f.filename))
+    return grp
 
 
 def _decode(v):
     return v.decode("utf-8") if isinstance(v, (bytes, np.bytes_)) else v
+
+
+def _dataset_values(ds: h5py.Dataset) -> np.ndarray:
+    if h5py.check_string_dtype(ds.dtype) is not None:
+        return np.asarray(ds.asstr()[()])
+    arr = np.asarray(ds[()])
+    if arr.dtype.kind == "S":
+        return arr.astype(str)
+    return arr
 
 
 def _frame_index(grp: h5py.Group, prefer: str | None = None) -> np.ndarray:
@@ -146,11 +161,11 @@ def _scan_data_for_frames(
         for key, item in sd.items():
             if key == "frame_index" or not isinstance(item, h5py.Dataset):
                 continue
-            try:
-                arr = np.asarray(item[()], dtype=float)
-            except (TypeError, ValueError):
-                continue
-            aligned = np.full((len(frames),) + arr.shape[1:], np.nan, dtype=float)
+            arr = _dataset_values(item)
+            if arr.dtype.kind in {"O", "U", "S"}:
+                aligned = np.full((len(frames),) + arr.shape[1:], "", dtype=object)
+            else:
+                aligned = np.full((len(frames),) + arr.shape[1:], np.nan, dtype=float)
             for dst, src in enumerate(rows):
                 if src >= 0:
                     aligned[dst] = arr[src]
@@ -311,12 +326,119 @@ def _dequantize_thumbnail(ds: h5py.Dataset) -> np.ndarray:
     return vmin + (arr / scale) * (vmax - vmin)
 
 
+def resolve_source_master(
+    stored_path,
+    *,
+    scan_file: str | Path,
+    source_base: str | None = None,
+    source_root: str | Path | None = None,
+) -> "Path | None":
+    """Resolve a stored frame ``source/path`` to an EXISTING raw master (N1).
+
+    The stored path may be **absolute** (old files, or a raw browsed OUTSIDE
+    the project root -> used as-is) or **relative** (the portable form: a POSIX
+    relpath against a project root).  Relative paths are joined against each
+    root in PRECEDENCE order and the first existing candidate wins:
+
+        explicit ``source_root``  >  the file's stored ``@source_base``  >  the
+        scan file's own directory.
+
+    POSIX-stored relatives convert cross-OS via :class:`PurePosixPath`.  A few
+    basename fallbacks (raw sitting next to the ``.nxs`` / directly under a
+    root) keep moved/flattened trees loading.  Returns ``None`` if nothing
+    exists -- callers fall back to the stored thumbnail.
+
+    This is the single source of N1 path resolution; every reader
+    (``get_raw_frame``, ``image_source``, the frame-view reader) routes through
+    it so they agree on precedence + back-compat.
+    """
+    if not stored_path:
+        return None
+    raw = str(stored_path)
+    rel_path = Path(raw).expanduser()
+    if not rel_path.is_absolute() and "\\" not in raw:
+        # POSIX-stored relative -> native (identity on POSIX).
+        rel_path = Path(PurePosixPath(raw))
+
+    candidates: list[Path] = []
+    if rel_path.is_absolute():
+        candidates.append(rel_path)
+    else:
+        scan_dir = Path(scan_file).parent
+        # ``scan_dir.parent`` (N1 cross-OS, deep-review S9): an xdart-processed
+        # ``.nxs`` lives in ``<root>/xdart_processed_data/`` and its relative
+        # ``source/path`` is relative to ``<root>``.  When the stored
+        # ``@source_base`` is a FOREIGN absolute path (e.g. a macOS root opened
+        # on Windows) it won't exist locally, and ``scan_dir`` is one level too
+        # deep -- so the project root derived from the .nxs location resolves a
+        # co-moved tree with no explicit ``source_root``.
+        for root in (source_root, source_base, scan_dir, scan_dir.parent):
+            if root:
+                candidates.append(Path(root).expanduser() / rel_path)
+        # Moved/flattened tree: the raw next to the .nxs, under the .nxs's
+        # project root, or directly under an explicit root, by basename.
+        candidates.append(scan_dir / rel_path.name)
+        candidates.append(scan_dir.parent / rel_path.name)
+        if source_root:
+            candidates.append(Path(source_root).expanduser() / rel_path.name)
+        candidates.append(rel_path)          # cwd-relative, last resort
+
+    seen: set[Path] = set()
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+        except OSError:
+            resolved = cand
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved
+    return None
+
+
+_OUTSIDE_ROOT_WARNED: set = set()    # (source_dir, root) pairs already warned
+
+
+def relative_source_path(src, root=None) -> str:
+    """N1 WRITE-side counterpart of :func:`resolve_source_master`: the portable
+    string to store in ``source/path``.
+
+    When ``src`` is INSIDE ``root`` (the project folder), return the **POSIX
+    relpath** against it (depth-robust + cross-OS).  When ``src`` is OUTSIDE the
+    root, or no root is given, return the **absolute POSIX path** -- and warn for
+    the outside-root case (out-of-tree raw is loadable but not portable).  Pair
+    this with ``@source_base = root`` written on the entry.
+    """
+    import os
+    src_abs = os.path.abspath(os.path.expanduser(str(src)))
+    if root:
+        root_abs = os.path.abspath(os.path.expanduser(str(root)))
+        try:
+            inside = os.path.commonpath([src_abs, root_abs]) == root_abs
+        except ValueError:          # different drives (Windows) -> not inside
+            inside = False
+        if inside:
+            return Path(os.path.relpath(src_abs, root_abs)).as_posix()
+        # Warn ONCE per (source directory, root): every frame of a scan
+        # shares the source dir (one Eiger master / one TIFF series dir),
+        # so the per-frame call otherwise repeated this for the whole scan.
+        _key = (os.path.dirname(src_abs), root_abs)
+        if _key in _OUTSIDE_ROOT_WARNED:
+            return Path(src_abs).as_posix()
+        _OUTSIDE_ROOT_WARNED.add(_key)
+        logger.warning("source %s is outside the project root %s; storing an "
+                       "absolute (non-portable) path", src_abs, root_abs)
+    return Path(src_abs).as_posix()
+
+
 def get_raw_frame(
     scan_file: str | Path,
     frame: int,
     *,
     entry: str = "entry",
     allow_thumbnail: bool = True,
+    source_root: str | Path | None = None,
 ) -> np.ndarray:
     """Return the raw detector image for one ``frame`` of a processed scan.
 
@@ -324,11 +446,16 @@ def get_raw_frame(
     images — but each frame carries a *source pointer*
     (``frames/frame_NNNN/source/{path,frame_index}``) back to the original
     detector master plus a quantized *thumbnail*.  This resolves the source
-    pointer (``path`` is relative to the scan file's directory) and reads the
-    full-resolution raw image from the master via
-    :func:`ssrl_xrd_tools.io.image.read_image`.  If the master can't be
-    located or read, it falls back to the stored thumbnail (dequantized to
-    its original intensity range) unless ``allow_thumbnail=False``.
+    pointer via :func:`resolve_source_master` (N1: a relative ``path`` joins
+    against ``source_root`` > the file's ``@source_base`` > the scan file's
+    directory; an absolute ``path`` is used as-is) and reads the full-resolution
+    raw image via :func:`ssrl_xrd_tools.io.image.read_image`.  If the master
+    can't be located or read, it falls back to the stored thumbnail
+    (dequantized) unless ``allow_thumbnail=False``.
+
+    ``source_root`` (N1) repoints relative source paths at a moved data tree,
+    overriding the stored ``@source_base`` — pass it when the raw was relocated
+    after processing.
 
     ``frame`` is the frame **label** (the ``frame_index`` value), matching
     the other ``get_*`` readers.  Raises ``KeyError`` when neither a usable
@@ -343,6 +470,9 @@ def get_raw_frame(
 
     with h5py.File(scan_file, "r") as f:
         e = _entry(f, entry)
+        # N1: the project root the relative source paths were written against
+        # (None for old absolute-path files; harmless there).
+        source_base = _decode(e.attrs["source_base"]) if "source_base" in e.attrs else None
         fg = e.get(f"frames/frame_{int(frame):04d}")
         if fg is None:
             raise KeyError(f"No frame group for frame {frame} in {scan_file}")
@@ -351,28 +481,10 @@ def get_raw_frame(
             rel = _decode(src["path"][()])
             if "frame_index" in src:
                 src_frame_idx = int(np.asarray(src["frame_index"][()]).ravel()[0])
-            if rel:
-                rel_path = Path(str(rel)).expanduser()
-                candidates = []
-                if rel_path.is_absolute():
-                    candidates.append(rel_path)
-                candidates.extend([
-                    scan_file.parent / rel_path,
-                    scan_file.parent / rel_path.name,
-                    rel_path,
-                ])
-                seen: set[Path] = set()
-                for cand in candidates:
-                    try:
-                        resolved = cand.resolve()
-                    except OSError:
-                        resolved = cand
-                    if resolved in seen:
-                        continue
-                    seen.add(resolved)
-                    if resolved.exists():
-                        master = resolved
-                        break
+            master = resolve_source_master(
+                rel, scan_file=scan_file,
+                source_base=source_base, source_root=source_root,
+            )
         thumb_ds = fg.get("thumbnail")
         if thumb_ds is not None:
             thumb = _dequantize_thumbnail(thumb_ds)
@@ -494,9 +606,13 @@ class Scan:
     integration slices are always read on demand.
     """
 
-    def __init__(self, scan_file: str | Path, *, entry: str = "entry"):
+    def __init__(self, scan_file: str | Path, *, entry: str = "entry",
+                 source_root: str | Path | None = None):
         self.path = Path(scan_file)
         self.entry = entry
+        # N1: repoint a moved raw tree for load_frame/iter_chunks (overrides the
+        # stored @source_base).
+        self.source_root = source_root
         self._metadata_cache: dict | None = None
         self._scan_data_cache: dict[str, np.ndarray] | None = None
 
@@ -551,9 +667,12 @@ class Scan:
         return get_thumbnail(self.path, frame, entry=self.entry)
 
     def load_frame(self, index: int) -> np.ndarray:
-        """Load one raw detector frame through its stored source pointer."""
+        """Load one raw detector frame through its stored source pointer.
+
+        ``source_root`` (N1, from the constructor) repoints a moved raw tree."""
         return get_raw_frame(
             self.path, int(index), entry=self.entry, allow_thumbnail=False,
+            source_root=self.source_root,
         )
 
     def iter_chunks(self, chunk_size: int):
@@ -575,6 +694,11 @@ class Scan:
         return f"Scan({self.path.name!r}, n_frames={len(self)})"
 
 
-def open_scan(scan_file: str | Path, *, entry: str = "entry") -> Scan:
-    """Return a :class:`Scan` handle for ``scan_file`` (notebook sugar)."""
-    return Scan(scan_file, entry=entry)
+def open_scan(scan_file: str | Path, *, entry: str = "entry",
+              source_root: str | Path | None = None) -> Scan:
+    """Return a :class:`Scan` handle for ``scan_file`` (notebook sugar).
+
+    ``source_root`` (N1) repoints relative raw-source paths at a moved data
+    tree for ``Scan.load_frame`` / ``iter_chunks`` (overrides the stored
+    ``@source_base``)."""
+    return Scan(scan_file, entry=entry, source_root=source_root)

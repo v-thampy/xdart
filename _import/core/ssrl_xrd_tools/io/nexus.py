@@ -31,6 +31,7 @@ Performance features:
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -43,6 +44,32 @@ from ssrl_xrd_tools.core.metadata import ScanMetadata
 from ssrl_xrd_tools.transforms import energy_to_wavelength
 
 logger = logging.getLogger(__name__)
+
+PROCESSED_SCHEMA_NAME = "ssrl_xrd_tools.processed_scan"
+PROCESSED_SCHEMA_VERSION = 2
+_UTF8_DTYPE = h5py.string_dtype(encoding="utf-8")
+
+
+def warn_if_newer_schema(entry_grp, path="") -> None:
+    """C1: warn when a file's ``ssrl_schema_version`` is NEWER than this
+    library supports.
+
+    The writer stamps the version on every file; until now no reader ever
+    looked at it, so a v3 file hit today's readers with opaque downstream
+    KeyErrors or silently missing features.  Absent/old stamps pass silently
+    (back-compat); only a newer stamp warns."""
+    try:
+        ver = int(entry_grp.attrs.get(
+            "ssrl_schema_version", PROCESSED_SCHEMA_VERSION))
+    except (TypeError, ValueError):
+        return
+    if ver > PROCESSED_SCHEMA_VERSION:
+        warnings.warn(
+            f"{path or 'file'} has ssrl_schema_version={ver}, newer than the "
+            f"supported {PROCESSED_SCHEMA_VERSION} — upgrade ssrl_xrd_tools; "
+            f"some datasets/features may be missing or misread.",
+            RuntimeWarning, stacklevel=3,
+        )
 
 # Datasets that are counters/scalers rather than motor angles.
 _DEFAULT_COUNTER_NAMES: frozenset[str] = frozenset(
@@ -622,6 +649,7 @@ def write_nexus(
     with h5py.File(p, mode) as f:
         grp = f.require_group(entry)
         grp.attrs["NX_class"] = "NXentry"
+        _stamp_processed_schema(grp)
 
         if sorted_1d:
             validate_integrated_stack_write(
@@ -706,9 +734,12 @@ def open_nexus_writer(
     compression : str or None, optional
         Compression filter.
     swmr : bool, optional
-        Enable single-writer-multiple-reader mode. When True, readers
-        (e.g. the GUI) can open the file while the writer is active.
-        Requires ``libver='latest'``.
+        INTENTIONALLY UNAVAILABLE — raises :class:`NotImplementedError`.
+        SWMR-write requires every dataset to exist before the mode is
+        enabled, but this writer creates the integrated stacks on the
+        first frame append (HDF5 forbids object creation in SWMR-write
+        mode).  Concurrent readers are served instead by the retrying
+        open helpers (``catch_h5py_file``-style); leave ``swmr=False``.
     overwrite : bool, optional
         If True, overwrite existing file.
 
@@ -721,28 +752,50 @@ def open_nexus_writer(
     --------
     ::
 
-        h5 = open_nexus_writer("scan_001.nxs", metadata=meta, swmr=True)
+        h5 = open_nexus_writer("scan_001.nxs", metadata=meta)
         try:
             for i, (r1d, r2d) in enumerate(process_frames(...)):
                 write_nexus_frame(h5, i, result_1d=r1d, result_2d=r2d)
-                h5.flush()  # makes data visible to SWMR readers
+                h5.flush()
         finally:
             h5.close()
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
-    file_kwargs: dict[str, Any] = {}
+    # S6: SWMR-write is advertised but not functional — HDF5 forbids object
+    # creation in SWMR-write mode, and this writer creates the integrated
+    # stacks on the FIRST frame append, so enabling it here guaranteed a
+    # failure on the first write.  Refuse loudly until the writer pre-creates
+    # every dataset before flipping swmr_mode.
     if swmr:
-        file_kwargs["libver"] = "latest"
+        raise NotImplementedError(
+            "open_nexus_writer(swmr=True) is not functional: the integrated "
+            "stacks are created on the first frame append, which HDF5 forbids "
+            "in SWMR-write mode.  Open without swmr (readers already tolerate "
+            "concurrent reads via the retrying open helpers)."
+        )
+
+    file_kwargs: dict[str, Any] = {}
 
     mode = "w" if overwrite else "a"
     f = h5py.File(p, mode, **file_kwargs)
+    try:
+        return _open_nexus_writer_body(f, entry, metadata, compression)
+    except BaseException:
+        # Close-on-construction-failure (same guard as FrameViewReader /
+        # open_nexus_image_stack): a header/metadata error otherwise orphans
+        # the open handle -- which LOCKS the file on Windows.
+        f.close()
+        raise
 
+
+def _open_nexus_writer_body(f, entry, metadata, compression):
     ck = _comp_kwargs(compression)
 
     grp = f.require_group(entry)
     grp.attrs["NX_class"] = "NXentry"
+    _stamp_processed_schema(grp)
 
     if metadata is not None:
         _write_metadata(grp, metadata, ck)
@@ -750,9 +803,6 @@ def open_nexus_writer(
     proc = grp.require_group("reduction")
     proc.attrs["NX_class"] = "NXprocess"
     proc.attrs.setdefault("program", "ssrl_xrd_tools")
-
-    if swmr:
-        f.swmr_mode = True
 
     return f
 
@@ -1574,8 +1624,8 @@ def write_scan_metadata(
     compression: str | None = None,
 ) -> None:
     """Persist the **full** per-frame scan metadata table under
-    ``/entry/scan_data`` (NXcollection: ``frame_index`` + one float
-    dataset per column).
+    ``/entry/scan_data`` (NXcollection: ``frame_index`` + one typed dataset
+    per column).
 
     The ``positioners`` group only carries the geometry-referenced motors;
     this stores the complete ``scan_data`` DataFrame — every counter and
@@ -1585,7 +1635,9 @@ def write_scan_metadata(
     these columns as per-frame variables (preferred over positioners, which
     they then read only for any motor not already present here).
 
-    Non-numeric columns are skipped (the table is stored as float32).
+    Numeric columns are stored as float32. Non-numeric columns are stored as
+    UTF-8 variable-length strings so notebook/headless readers preserve
+    labels, modes, source file names, operator notes, and similar context.
     """
     if scan_data is None or len(scan_data) == 0 or not len(scan_data.columns):
         if "scan_data" in entry_grp:
@@ -1609,11 +1661,16 @@ def write_scan_metadata(
         chunks=(64,),
     )
     for col in scan_data.columns:
-        try:
-            arr = np.asarray(scan_data[col].values, dtype=np.float32)
-        except (TypeError, ValueError):
-            continue  # non-numeric column — not representable in the table
-        g.create_dataset(str(col), data=arr, maxshape=(None,), chunks=(64,), **ck)
+        arr, create_kwargs, attrs = _scan_data_column_payload(scan_data[col].values)
+        ds = g.create_dataset(
+            str(col),
+            data=arr,
+            maxshape=(None,),
+            chunks=(64,),
+            **create_kwargs,
+            **({} if attrs["ssrl_dtype"] == "string" else ck),
+        )
+        ds.attrs.update(attrs)
 
 
 def _upsert_indexed_group(
@@ -1687,6 +1744,42 @@ def _strictly_increasing(labels: Sequence[int]) -> bool:
     return all(a < b for a, b in zip(labels, labels[1:]))
 
 
+def _stamp_processed_schema(entry_grp: h5py.Group) -> None:
+    entry_grp.attrs["ssrl_schema"] = PROCESSED_SCHEMA_NAME
+    entry_grp.attrs["ssrl_schema_version"] = PROCESSED_SCHEMA_VERSION
+
+
+def _stringify_scan_value(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if np.asarray(value).shape == () and isinstance(float(value), float):
+            if not np.isfinite(float(value)):
+                return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _scan_data_column_payload(values: Any) -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:
+    try:
+        arr = np.asarray(values, dtype=np.float32)
+    except (TypeError, ValueError):
+        arr = np.asarray([_stringify_scan_value(v) for v in values], dtype=object)
+        return arr, {"dtype": _UTF8_DTYPE}, {
+            "ssrl_dtype": "string",
+            "description": "Per-frame scan metadata column",
+            "missing_value": "",
+            "encoding": "utf-8",
+        }
+    return arr, {}, {
+        "ssrl_dtype": "float32",
+        "description": "Per-frame scan metadata column",
+    }
+
+
 def upsert_scan_metadata(
     entry_grp: h5py.Group,
     scan_data,
@@ -1697,17 +1790,20 @@ def upsert_scan_metadata(
         return
     scan_data, fis = _reindex_scan_data_to_frames(scan_data, frame_indices)
     values: dict[str, np.ndarray] = {}
+    attrs_by_col: dict[str, dict[str, Any]] = {}
     for col in scan_data.columns:
-        try:
-            values[str(col)] = np.asarray(scan_data[col].values, dtype=np.float32)
-        except (TypeError, ValueError):
-            continue
+        arr, _create_kwargs, attrs = _scan_data_column_payload(scan_data[col].values)
+        values[str(col)] = arr
+        attrs_by_col[str(col)] = attrs
     if not values:
         return
     if "scan_data" not in entry_grp:
         write_scan_metadata(entry_grp, scan_data, fis)
         return
     _upsert_indexed_group(entry_grp["scan_data"], frame_indices=fis, values=values)
+    for col, attrs in attrs_by_col.items():
+        if col in entry_grp["scan_data"]:
+            entry_grp["scan_data"][col].attrs.update(attrs)
 
 
 def upsert_per_frame_geometry(
@@ -1861,7 +1957,10 @@ def _read_scan_data_group(e, add_frame_var, data_vars, coords) -> set:
         if perm is None:
             return arr
         arr = np.asarray(arr)
-        out = np.full((len(perm),) + arr.shape[1:], np.nan, dtype=float)
+        if arr.dtype.kind in {"O", "U", "S"}:
+            out = np.full((len(perm),) + arr.shape[1:], "", dtype=object)
+        else:
+            out = np.full((len(perm),) + arr.shape[1:], np.nan, dtype=float)
         for i, src in enumerate(perm):
             if src >= 0:
                 out[i] = arr[src]
@@ -1879,7 +1978,7 @@ def _read_scan_data_group(e, add_frame_var, data_vars, coords) -> set:
         if k == "frame_index" or not isinstance(item, h5py.Dataset):
             continue
         name = f"meta_{k}" if (k in {"q", "chi", "frame"} or k in data_vars) else k
-        add_frame_var(name, _aligned(item[()]))
+        add_frame_var(name, _aligned(_dataset_to_native_array(item)))
         # Only suppress the positioner fallback for this key if the column
         # was actually accepted — ``add_frame_var`` skips length-mismatched
         # columns, and a valid same-named NXpositioner should still load.
@@ -2048,6 +2147,15 @@ def _v2_decode_str(v):
     return v.decode("utf-8") if isinstance(v, bytes) else v
 
 
+def _dataset_to_native_array(ds: h5py.Dataset) -> np.ndarray:
+    if h5py.check_string_dtype(ds.dtype) is not None:
+        return np.asarray(ds.asstr()[()])
+    arr = np.asarray(ds[()])
+    if arr.dtype.kind == "S":
+        return arr.astype(str)
+    return arr
+
+
 def _read_positioners(grp: h5py.Group) -> dict[str, np.ndarray]:
     """Read NXpositioner children of an NXcollection into a dict (v2)."""
     out: dict[str, np.ndarray] = {}
@@ -2078,6 +2186,7 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
         if entry not in f:
             raise KeyError(f"No {entry!r} group in {path}")
         e = f[entry]
+        warn_if_newer_schema(e, str(path))
 
         if "1d" in groups and "integrated_1d" in e:
             g1 = e["integrated_1d"]
@@ -2286,6 +2395,7 @@ def read_scan_metadata(
         if entry not in f:
             raise KeyError(f"No {entry!r} group in {path}")
         e = f[entry]
+        warn_if_newer_schema(e, str(path))
 
         # frame_index — try integrated_1d first, then integrated_2d,
         # then per_frame_geometry.  Cheap; no intensity is loaded.
@@ -2471,6 +2581,8 @@ def read_stitched(
 
 
 __all__ = [
+    "PROCESSED_SCHEMA_NAME",
+    "PROCESSED_SCHEMA_VERSION",
     # v1 (legacy beamline files)
     "find_nexus_image_dataset",
     "NexusImageStack",

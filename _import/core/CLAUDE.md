@@ -4,6 +4,23 @@ The headless XRD reduction + I/O library. **xdart (the Qt GUI) is the consumer**
 `ssrl_xrd_tools>=` in its `pyproject.toml`. Anything that does not need Qt belongs here, not in
 xdart ("keep xdart thin"). This package must import **no Qt/pyqtgraph**.
 
+## North star + Architecture V2 (Jun 2026)
+Long-term goals (full roadmap: `review/roadmap_2026-06-10.md`): **(1) headless-first ssrl APIs** — this
+package is fully usable with no GUI; **(2) thin xdart** over it; **(3) robustness** (fail-loud writes,
+strict schema, live≡batch≡reload spine); **(4) performance** (streaming, parallel, bounded memory);
+**(5) expandability** (clean `FrameSource` / `ReductionPlan` / `ReductionSink` seams).
+
+**Architecture V2 — merged to `refactor/architecture-v2` (Jun 2026), not yet released.** Realized here:
+one streaming `reduction.ReductionSession` spine (parallel workers + single writer thread, bounded
+in-flight, **fail-loud `finish()`** — a failed write raises, never silently succeeds), source abstraction
+(`sources/` + `open_source(spec)`), sink-driven writes (`ReductionSink`; xdart injects its Qt sink so ssrl
+never imports xdart), and **N1 portable raw paths** (`io.read.relative_source_path` + `entry/@source_base`
+resolution, with a `source_root=` override; precedence override > `@source_base` > `.nxs` dir). Staging on
+`architecture-v2`; pending live testing → `dev` → coordinated release (**ssrl first**). Next-cycle items
+(chunked-executor retirement, RSM real tests + energy sentinel, FIFO-writer perf) are in the roadmap;
+metadata models stay **separate by design** (`ScanMetadata` scan-level vs `HeterogeneousMetadata`
+per-frame — orthogonal, not a collapse).
+
 ## Environment & tests
 - Env: `conda activate xrd_edit` (shared with xdart; has pyFAI/h5py/numpy). Editable install.
 - Tests: `python -m pytest tests/` (verbose by default). Fixtures are synthetic (see
@@ -33,7 +50,8 @@ xdart ("keep xdart thin"). This package must import **no Qt/pyqtgraph**.
   `hdf5` (codec), `provenance`, `metadata`, `config`.
 - **`io/`** — persistence + readers.
   - `nexus.py` — the stacked v2 writer/reader (`write_integrated_stack`, `read_scan`, the validators
-    above). The single source of truth for the on-disk schema.
+    above). Canonical source for the headless integrated-stack schema; xdart still owns a few
+    GUI/source-reference compatibility fields around that core.
   - `read.py` — convenience readers: `read_scan`-adjacent `get_1d` / `get_2d` / `get_thumbnail` /
     `get_metadata`, `get_raw_frame`, `open_scan` / `Scan`.
   - `frame_view.py` — `read_frame_view` / `iter_frame_views` (per-frame `FrameView` reconstruction;

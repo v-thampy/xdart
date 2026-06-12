@@ -7,9 +7,13 @@ the GUI chooses a :class:`ReductionPlan`, supplies a :class:`Scan`, and lets
 
 from ssrl_xrd_tools.reduction.core import (
     CancelToken,
+    CompositeSink,
     Frame,
     FrameSource,
     FrameReduction,
+    GI1DMode,
+    GI2DMode,
+    GIFreezeError,
     GIMode,
     Integration1DPlan,
     Integration2DPlan,
@@ -19,16 +23,22 @@ from ssrl_xrd_tools.reduction.core import (
     ReductionPlan,
     ReductionProgress,
     ReductionResult,
+    ReductionSession,
     ReductionSink,
     Scan,
+    XYESink,
     run_reduction,
 )
 
 __all__ = [
     "CancelToken",
+    "CompositeSink",
     "Frame",
     "FrameSource",
     "FrameReduction",
+    "GI1DMode",
+    "GI2DMode",
+    "GIFreezeError",
     "GIMode",
     "Integration1DPlan",
     "Integration2DPlan",
@@ -38,7 +48,9 @@ __all__ = [
     "ReductionPlan",
     "ReductionProgress",
     "ReductionResult",
+    "ReductionSession",
     "ReductionSink",
     "Scan",
+    "XYESink",
     "run_reduction",
 ]

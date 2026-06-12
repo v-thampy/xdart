@@ -44,6 +44,15 @@ def _dataset_unit(group: h5py.Group | None, name: str) -> str | None:
     return _decode(group[name].attrs.get("units"))
 
 
+def _dataset_values(ds: h5py.Dataset) -> np.ndarray:
+    if h5py.check_string_dtype(ds.dtype) is not None:
+        return np.asarray(ds.asstr()[()])
+    arr = np.asarray(ds[()])
+    if arr.dtype.kind == "S":
+        return arr.astype(str)
+    return arr
+
+
 class FrameViewReader:
     """Reusable reader for many :class:`FrameView` records from one scan.
 
@@ -60,10 +69,16 @@ class FrameViewReader:
         *,
         entry: str = "entry",
         include_thumbnail: bool = True,
+        source_root: str | Path | None = None,
     ) -> None:
         self.path = Path(scan_file)
         self.entry_name = entry
         self.include_thumbnail = bool(include_thumbnail)
+        # N1: repoint a moved raw tree (overrides the stored @source_base); the
+        # project root the relative source paths were written against is read
+        # from the file in __enter__.
+        self.source_root = source_root
+        self._source_base: str | None = None
         self._h5: h5py.File | None = None
         self._entry: h5py.Group | None = None
         self._g1: h5py.Group | None = None
@@ -85,7 +100,28 @@ class FrameViewReader:
 
     def __enter__(self) -> "FrameViewReader":
         self._h5 = h5py.File(self.path, "r")
+        # Anything raising past this point (missing entry group, duplicate
+        # frame labels, malformed datasets) happens BEFORE the caller's
+        # with-block exists, so __exit__ never runs — close the handle
+        # ourselves or it leaks (and locks the file on Windows).
+        try:
+            return self._enter_inner()
+        except BaseException:
+            self._h5.close()
+            self._h5 = None
+            raise
+
+    def _enter_inner(self) -> "FrameViewReader":
         self._entry = _entry(self._h5, self.entry_name)
+        # C1: surface a newer-than-supported schema before any dataset access
+        # fails with an opaque KeyError.
+        from ssrl_xrd_tools.io.nexus import warn_if_newer_schema
+        warn_if_newer_schema(self._entry, str(self.path))
+        # N1: the project root the relative source paths point under (None on old
+        # absolute-path files; harmless there).
+        self._source_base = (
+            _decode(self._entry.attrs["source_base"])
+            if "source_base" in self._entry.attrs else None)
         self._g1 = self._entry.get("integrated_1d")
         self._g2 = self._entry.get("integrated_2d")
         self._geom = self._entry.get("per_frame_geometry")
@@ -152,7 +188,7 @@ class FrameViewReader:
                 if key == "frame_index" or not isinstance(item, h5py.Dataset):
                     continue
                 try:
-                    cols[str(key)] = np.asarray(item[()])
+                    cols[str(key)] = _dataset_values(item)
                 except (TypeError, ValueError):
                     continue
             self._scan_data_columns = cols
@@ -163,7 +199,8 @@ class FrameViewReader:
             except (IndexError, TypeError):
                 continue
             if np.asarray(value).shape == ():
-                out[key] = np.asarray(value).item()
+                scalar = np.asarray(value).item()
+                out[key] = _decode(scalar)
         return out
 
     def _geometry_for_frame(self, frame: int) -> FrameGeometry | None:
@@ -207,7 +244,18 @@ class FrameViewReader:
         path = None
         source_idx = None
         if "path" in src:
-            path = str(_decode(src["path"][()]))
+            stored = str(_decode(src["path"][()]))
+            # N1: resolve the (relative) stored path to an absolute master so
+            # FrameView consumers (FrameSource/Scan/notebooks/RSM/stitch) can
+            # locate the raw after the data moves.  Precedence source_root >
+            # @source_base > scan dir; absolute paths used as-is (back-compat).
+            # Fall back to the stored string when nothing resolves, so the
+            # field is never silently blanked (provenance preserved).
+            from ssrl_xrd_tools.io.read import resolve_source_master
+            resolved = resolve_source_master(
+                stored, scan_file=self.path,
+                source_base=self._source_base, source_root=self.source_root)
+            path = str(resolved) if resolved is not None else stored
         if "frame_index" in src:
             source_idx = int(np.asarray(src["frame_index"][()]).ravel()[0])
         return path, source_idx
@@ -262,15 +310,18 @@ def read_frame_view(
     *,
     entry: str = "entry",
     include_thumbnail: bool = True,
+    source_root: str | Path | None = None,
 ) -> FrameView:
     """Read one processed frame as a canonical :class:`FrameView`.
 
     This slices individual datasets lazily; it does not materialise a full
-    ``(n_frames, chi, q)`` stack.
+    ``(n_frames, chi, q)`` stack.  ``source_root`` (N1) repoints a moved raw
+    tree so ``FrameView.source_path`` resolves to the relocated master.
     """
 
     with FrameViewReader(
         scan_file, entry=entry, include_thumbnail=include_thumbnail,
+        source_root=source_root,
     ) as reader:
         return reader.read(int(frame))
 
@@ -281,17 +332,20 @@ def iter_frame_views(
     *,
     entry: str = "entry",
     include_thumbnail: bool = True,
+    source_root: str | Path | None = None,
 ):
     """Yield :class:`FrameView` objects one at a time from a single open reader.
 
     Streams frame-by-frame so RSM / stitching / fitting can consume a long
     scan without materialising every view first.  The HDF5 file stays open
     for the life of the generator and is closed when it is exhausted (or
-    closed early via ``GeneratorExit``).
+    closed early via ``GeneratorExit``).  ``source_root`` (N1) repoints a moved
+    raw tree for the resolved ``FrameView.source_path``.
     """
 
     with FrameViewReader(
         scan_file, entry=entry, include_thumbnail=include_thumbnail,
+        source_root=source_root,
     ) as reader:
         labels = reader.labels() if frames is None else frames
         for frame in labels:
@@ -304,6 +358,7 @@ def read_frame_views(
     *,
     entry: str = "entry",
     include_thumbnail: bool = True,
+    source_root: str | Path | None = None,
 ) -> tuple[FrameView, ...]:
     """Read selected frame labels using one HDF5 open (eager).
 
@@ -314,5 +369,6 @@ def read_frame_views(
     return tuple(
         iter_frame_views(
             scan_file, frames, entry=entry, include_thumbnail=include_thumbnail,
+            source_root=source_root,
         )
     )

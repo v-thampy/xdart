@@ -474,3 +474,44 @@ def test_dup_label_write_preserves_existing_metadata(tmp_path):
         assert "scan_data" in e and "per_frame_geometry" in e
         assert e["scan_data/i0"][()].tolist() == sd_before
         assert e["per_frame_geometry/frame_index"][()].tolist() == geo_before
+
+
+def test_scan_data_string_columns_survive_roundtrip(tmp_path):
+    """A4: non-numeric (string) scan_data columns must survive write->read
+    intact, aligned to frame labels, with numeric columns unchanged (the
+    `keith_I=0V` drop).  Exercises BOTH writers (full write_scan_metadata +
+    incremental upsert) and BOTH readers (xarray read_scan_metadata + dict
+    _scan_data_for_frames)."""
+    import pandas as pd
+    from ssrl_xrd_tools.io.nexus import (
+        write_scan_metadata, upsert_scan_metadata, read_scan_metadata,
+    )
+    from ssrl_xrd_tools.io.read import _scan_data_for_frames
+
+    fis = [0, 1, 2]
+    sd = pd.DataFrame(
+        {"i0": [1.0, 2.0, 3.0], "keith_I": ["0V", "1V", "2V"],
+         "temp": [300.0, 301.0, 302.0]}, index=fis)
+
+    # full writer + both readers
+    p = tmp_path / "full.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry"); e.attrs["NX_class"] = "NXentry"
+        write_scan_metadata(e, sd, fis)
+    ds = read_scan_metadata(p)
+    assert list(np.asarray(ds["keith_I"].values)) == ["0V", "1V", "2V"]
+    np.testing.assert_allclose(ds["i0"].values, [1.0, 2.0, 3.0], rtol=1e-5)
+    dct = _scan_data_for_frames(p, fis)
+    assert list(dct["keith_I"]) == ["0V", "1V", "2V"]
+
+    # incremental upsert (create, then append a row) keeps the string column
+    p2 = tmp_path / "upsert.nxs"
+    with h5py.File(p2, "w") as f:
+        e = f.create_group("entry"); e.attrs["NX_class"] = "NXentry"
+        upsert_scan_metadata(e, sd.iloc[:2], [0, 1])
+        upsert_scan_metadata(
+            e, pd.DataFrame({"i0": [3.0], "keith_I": ["2V"], "temp": [302.0]},
+                            index=[2]), [2])
+    ds2 = read_scan_metadata(p2)
+    assert list(np.asarray(ds2["keith_I"].values)) == ["0V", "1V", "2V"]
+    np.testing.assert_allclose(ds2["i0"].values, [1.0, 2.0, 3.0], rtol=1e-5)

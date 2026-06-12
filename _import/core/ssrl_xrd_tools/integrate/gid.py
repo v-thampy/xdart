@@ -99,7 +99,8 @@ def _unit_str(unit: Any) -> str:
     return str(unit[0]) if isinstance(unit, tuple) else str(unit)
 
 
-def _to_result_2d(result: Any, unit_fallback: str) -> IntegrationResult2D:
+def _to_result_2d(result: Any, unit_fallback: str,
+                  azim_unit_fallback: str = "qoop_A^-1") -> IntegrationResult2D:
     """Convert pyFAI grazing-incidence 2D result → ``IntegrationResult2D``.
 
     Handles both pyFAI versions:
@@ -132,7 +133,11 @@ def _to_result_2d(result: Any, unit_fallback: str) -> IntegrationResult2D:
         intensity=intensity,
         sigma=sigma,
         unit=str(ip_unit) if ip_unit is not None else unit_fallback,
-        azimuthal_unit=str(oop_unit) if oop_unit is not None else "qoop_A^-1",
+        # pyFAI 2025.x results carry no ip/oop unit attrs, so the fallback
+        # must match the TRANSFORM: hardcoding qoop here labeled the polar
+        # chi axis "Q_oop (A^-1)" in the GUI (wrong unit AND wrong name).
+        azimuthal_unit=(str(oop_unit) if oop_unit is not None
+                        else azim_unit_fallback),
     )
 
 
@@ -420,6 +425,10 @@ def integrate_gi_polar(
     """
     inc, tilt, orient = _effective_gi_params(fi, incident_angle, tilt_angle, sample_orientation)
     radial_unit = "A^-1" if "A^-1" in unit else "nm^-1"
+    if azimuth_range is not None:
+        # pyFAI wraps out-of-domain polar requests instead of clamping.
+        azimuth_range = (max(float(azimuth_range[0]), -180.0),
+                         min(float(azimuth_range[1]), 180.0))
 
     result = fi.integrate2d_polar(
         polar_degrees=True,
@@ -436,7 +445,8 @@ def integrate_gi_polar(
         tilt_angle=tilt,
         **kwargs,
     )
-    return _to_result_2d(result, unit_fallback=f"qtot_{radial_unit}")
+    return _to_result_2d(result, unit_fallback=f"qtot_{radial_unit}",
+                         azim_unit_fallback="chigi_deg")
 
 
 def integrate_gi_exitangles(
@@ -509,7 +519,8 @@ def integrate_gi_exitangles(
         tilt_angle=tilt,
         **kwargs,
     )
-    return _to_result_2d(result, unit_fallback="exit_angle_horz_deg")
+    return _to_result_2d(result, unit_fallback="exit_angle_horz_deg",
+                         azim_unit_fallback="exit_angle_vert_deg")
 
 
 def integrate_gi_polar_1d(
@@ -831,10 +842,21 @@ def freeze_common_axes_2d(results, *, gi_mode_2d: str = 'qip_qoop',
         [getattr(r, 'radial', None) for r in results], pad_fraction)
     ry = _padded_union_range(
         [getattr(r, 'azimuthal', None) for r in results], pad_fraction)
+    def _clamp_angle(rng):
+        # pyFAI's polar/exit-angle domain is [-180, 180); a padded scout
+        # range that overflows it (e.g. -183..186 from a full-wedge scout)
+        # gets WRAPPED by pyFAI (-183 -> +177), collapsing the request to a
+        # sliver and producing an all-dummy cake.
+        if rng is None:
+            return None
+        return (max(float(rng[0]), -180.0), min(float(rng[1]), 180.0))
+
+    angle_x = gi_mode_2d == 'exit_angles'
+    angle_y = gi_mode_2d in ('q_chi', 'exit_angles')
     if rx is not None:
-        out[x_key] = rx
+        out[x_key] = _clamp_angle(rx) if angle_x else rx
     if ry is not None:
-        out[y_key] = ry
+        out[y_key] = _clamp_angle(ry) if angle_y else ry
     return out
 
 

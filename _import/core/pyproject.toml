@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssrl_xrd_tools"
-version = "0.40.0"
+version = "0.41.0"
 description = "SSRL X-ray diffraction data processing and visualization tools"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
@@ -36,7 +36,9 @@ dependencies = [
     "nexusformat",
     "fabio",
     "silx",
-    "pyFAI>=2025.3,<2026",
+    # pyFAI 2025.12 currently breaks parts of the xdart/pyFAI app stack;
+    # keep ssrl_xrd_tools aligned with xdart until that upstream issue clears.
+    "pyFAI>=2025.3,<2025.12",
     "joblib",
     "natsort",
     # Plotting libraries (used by viz.mpl / viz.plotly — viz/__init__.py
