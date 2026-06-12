@@ -37,6 +37,7 @@ from xrd_tools.core.containers import (
     IntegrationResult2D,
     PONI,
 )
+from xrd_tools.core.filters import compile_filter
 from xrd_tools.core.frame_view import (
     Axis,
     FrameGeometry as ViewFrameGeometry,
@@ -125,6 +126,7 @@ __all__ = [
     "SourceKind",
     "SourceSpec",
     "coerce_source_kind",
+    "compile_filter",
     "numeric_metadata",
     # HDF5 codec
     "arr_to_h5",

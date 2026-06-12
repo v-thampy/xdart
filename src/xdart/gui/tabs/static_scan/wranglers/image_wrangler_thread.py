@@ -23,6 +23,28 @@ from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
+# F1: shared boolean Filter grammar (unordered AND, '|'/OR, -term/NOT) —
+# one compiled predicate replaces the old filter-encoded globs at all
+# three sites (Image Directory, Eiger _master.h5 queue, BG Match).
+from xrd_tools.core.filters import compile_filter as _compile_name_filter
+
+_warned_bad_filters: set[str] = set()
+
+
+def _name_filter(expr):
+    """Compiled Filter predicate; a malformed expression warns once per
+    expression and falls back to match-all (the run continues un-filtered
+    rather than aborting mid-scan)."""
+    try:
+        return _compile_name_filter(expr)
+    except ValueError as exc:
+        key = str(expr)
+        if key not in _warned_bad_filters:
+            _warned_bad_filters.add(key)
+            logger.warning("Invalid Filter expression %r (%s); matching all names",
+                           expr, exc)
+        return lambda name: True
+
 # pyFAI / fabio / h5py
 import fabio
 import h5py
@@ -2204,13 +2226,13 @@ class imageThread(wranglerThread):
 
     def _eiger_refill_master_queue(self):
         """Glob for *_master.h5 files not yet processed (Image Directory mode)."""
-        filters = '*' + '*'.join(f for f in self.file_filter.split()) + '*'
-        filters = filters if filters != '**' else '*'
-        pattern = f'{filters}_master.h5'
-        if self.include_subdir:
-            master_files = sorted(Path(self.img_dir).rglob(pattern))
-        else:
-            master_files = sorted(Path(self.img_dir).glob(pattern))
+        match = _name_filter(self.file_filter)
+        pattern = '*_master.h5'
+        candidates = (Path(self.img_dir).rglob(pattern) if self.include_subdir
+                      else Path(self.img_dir).glob(pattern))
+        master_files = sorted(
+            p for p in candidates if match(p.name[:-len('_master.h5')])
+        )
         queued = set(self._eiger_master_queue)
         for mf in master_files:
             mf_str = str(mf)
@@ -2544,12 +2566,13 @@ class imageThread(wranglerThread):
                 ]
             else:
                 first_img = ''
-                filters = '*' + '*'.join(f for f in self.file_filter.split()) + '*'
-                filters = filters if filters != '**' else '*'
-                if self.include_subdir:
-                    self.img_fnames = Path(self.img_dir).rglob(f'{filters}.{self.img_ext}')
-                else:
-                    self.img_fnames = Path(self.img_dir).glob(f'{filters}.{self.img_ext}')
+                match = _name_filter(self.file_filter)
+                suffix = f'.{self.img_ext}'
+                candidates = (Path(self.img_dir).rglob(f'*{suffix}')
+                              if self.include_subdir
+                              else Path(self.img_dir).glob(f'*{suffix}'))
+                self.img_fnames = (p for p in candidates
+                                   if match(p.name[:-len(suffix)]))
 
             self.img_fnames = [str(f) for f in self.img_fnames if
                                (str(f) >= first_img) and (str(f) not in self.processed)]
@@ -2742,11 +2765,12 @@ class imageThread(wranglerThread):
                 bg_file_filter = 'bg' if not self.bg_file_filter else self.bg_file_filter
                 if self.bg_match_fname:
                     bg_file_filter = f'{self.scan_name} {bg_file_filter}'
-                filters = '*' + '*'.join(f for f in bg_file_filter.split()) + '*'
-                filters = filters if filters != '**' else '*'
-
-                meta_files = sorted(glob.glob(os.path.join(
-                    self.img_dir, f'{filters}.{self.meta_ext}')))
+                match = _name_filter(bg_file_filter)
+                suffix = f'.{self.meta_ext}'
+                meta_files = sorted(
+                    f for f in glob.glob(os.path.join(self.img_dir, f'*{suffix}'))
+                    if match(os.path.basename(f)[:-len(suffix)])
+                )
 
                 for meta_file in meta_files:
                     bg_file = f'{os.path.splitext(meta_file)[0]}.{self.img_ext}'
