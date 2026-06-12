@@ -230,6 +230,9 @@ class Scan:
     metadata: ScanMetadata | None = None
     energy: float | None = None
     wavelength: float | None = None
+    # Diffractometer angle mapping (``DiffractometerGeometry``): when set,
+    # NexusSink derives /entry/per_frame_geometry from scan_data at finish.
+    geometry: Any | None = None
     motors: dict[str, np.ndarray] = field(default_factory=dict)
     output_path: Path | str | None = None
     sample_name: str = ""

@@ -722,7 +722,10 @@ def test_nexus_sink_flush_policy(
             energy=12.398,
             wavelength=1.0,
         ),
-        NexusSink("scan.nxs", overwrite=True, flush_every=2, atomic=False),
+        # complete_record=False: FakeH5 only mocks flush/close, and this test
+        # is about flush cadence, not the per-frame record.
+        NexusSink("scan.nxs", overwrite=True, flush_every=2, atomic=False,
+                  complete_record=False),
     )
 
     assert result.n_processed == 3

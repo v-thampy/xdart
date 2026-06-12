@@ -106,18 +106,30 @@ def _write_master(path, raw):
         f.create_dataset("entry/data/data", data=raw)
 
 
-def _write_processed(nxs, *, rel_path, source_base=None, frame_label=0,
-                     master_frame=1):
+def _write_processed(nxs, *, source_path, source_base=None, frame_label=0,
+                     master_frame=1, thumbnail=None):
+    """Minimal processed file built with the REAL record primitives
+    (stamp_source_base / write_frame_record), so these tests exercise the
+    same write path as NexusSink and the GUI writer.  Only the
+    ``integrated_1d`` frame->row map is a hand stub (it is reader plumbing,
+    not part of the N1 record; the full real path is covered end-to-end by
+    test_complete_record_roundtrip)."""
+    from xrd_tools.io.nexus_record import (
+        ensure_frames_container,
+        stamp_source_base,
+        write_frame_record,
+    )
     with h5py.File(nxs, "w") as f:
         e = f.create_group("entry")
-        if source_base is not None:
-            e.attrs["source_base"] = source_base
+        norm_base = stamp_source_base(e, source_base)
         g = e.create_group("integrated_1d")
         g.create_dataset("intensity", data=np.zeros((1, 5)))
         g.create_dataset("frame_index", data=np.array([frame_label], dtype=np.int64))
-        s = e.create_group(f"frames/frame_{frame_label:04d}/source")
-        s.create_dataset("path", data=np.bytes_(str(rel_path).encode()))
-        s.create_dataset("frame_index", data=master_frame)
+        write_frame_record(
+            ensure_frames_container(e), f"frame_{frame_label:04d}",
+            thumbnail=thumbnail, source_path=source_path,
+            source_frame_index=master_frame, source_base=norm_base,
+        )
 
 
 def test_get_raw_frame_resolves_relative_via_source_base(tmp_path):
@@ -131,9 +143,11 @@ def test_get_raw_frame_resolves_relative_via_source_base(tmp_path):
 
     nxs = tmp_path / "processed" / "scan.nxs"
     nxs.parent.mkdir(parents=True)
-    rel = relative_source_path(master, root)                 # "raw/m.h5"
-    assert rel == "raw/m.h5"
-    _write_processed(nxs, rel_path=rel, source_base=str(root))
+    _write_processed(nxs, source_path=master, source_base=str(root))
+    with h5py.File(nxs, "r") as f:                 # stored RELATIVE = portable
+        stored = f["entry/frames/frame_0000/source/path"][()]
+        assert (stored.decode() if isinstance(stored, bytes) else str(stored)) \
+            == "raw/m.h5"
 
     np.testing.assert_allclose(get_raw_frame(nxs, frame=0), raw_arr[1])
 
@@ -148,7 +162,7 @@ def test_get_raw_frame_source_root_overrides_moved_tree(tmp_path):
     _write_master(master, raw_arr)
 
     nxs = tmp_path / "scan.nxs"
-    _write_processed(nxs, rel_path="raw/m.h5",
+    _write_processed(nxs, source_path="/original/gone/proj/raw/m.h5",
                      source_base="/original/gone/proj", master_frame=0)
 
     # Without the override the stale base can't resolve -> thumbnail/KeyError.
@@ -172,7 +186,7 @@ def test_read_frame_view_resolves_source_path_via_source_base(tmp_path):
     _write_master(master, np.arange(2 * 2 * 2, dtype=float).reshape(2, 2, 2))
     nxs = tmp_path / "other" / "scan.nxs"          # .nxs NOT near the raw
     nxs.parent.mkdir(parents=True)
-    _write_processed(nxs, rel_path="raw/m.h5", source_base=str(root))
+    _write_processed(nxs, source_path=master, source_base=str(root))
 
     fv = read_frame_view(nxs, 0)
     assert Path(fv.source_path) == master.resolve()
@@ -185,7 +199,8 @@ def test_read_frame_view_source_root_override(tmp_path):
     master.parent.mkdir(parents=True)
     _write_master(master, np.zeros((1, 2, 2)))
     nxs = tmp_path / "scan.nxs"
-    _write_processed(nxs, rel_path="raw/m.h5", source_base="/old/gone/proj")
+    _write_processed(nxs, source_path="/old/gone/proj/raw/m.h5",
+                     source_base="/old/gone/proj")
     fv = read_frame_view(nxs, 0, source_root=str(moved))
     assert Path(fv.source_path) == master.resolve()
 
@@ -195,7 +210,8 @@ def test_read_frame_view_unresolved_keeps_stored_string(tmp_path):
     preserved, never silently blanked)."""
     from xrd_tools.io import read_frame_view
     nxs = tmp_path / "scan.nxs"
-    _write_processed(nxs, rel_path="raw/missing.h5", source_base=str(tmp_path))
+    _write_processed(nxs, source_path=tmp_path / "raw" / "missing.h5",
+                     source_base=str(tmp_path))
     fv = read_frame_view(nxs, 0)
     assert fv.source_path == "raw/missing.h5"
 
@@ -212,7 +228,8 @@ def test_processed_nexus_source_load_frame_returns_full_res_master(tmp_path):
     _write_master(master, raw)
     nxs = tmp_path / "processed" / "scan.nxs"
     nxs.parent.mkdir(parents=True)
-    _write_processed(nxs, rel_path="raw/m.h5", source_base=str(root), master_frame=1)
+    _write_processed(nxs, source_path=master, source_base=str(root),
+                     master_frame=1)
 
     src = ProcessedNexusSource(nxs)
     img = src.load_frame(0)
@@ -228,7 +245,8 @@ def test_processed_nexus_source_source_root_repoints_moved_tree(tmp_path):
     raw = np.arange(4 * 4, dtype=float).reshape(1, 4, 4)
     _write_master(master, raw)
     nxs = tmp_path / "scan.nxs"
-    _write_processed(nxs, rel_path="raw/m.h5", source_base="/old/gone", master_frame=0)
+    _write_processed(nxs, source_path="/old/gone/raw/m.h5",
+                     source_base="/old/gone", master_frame=0)
     src = ProcessedNexusSource(nxs, source_root=str(moved))
     np.testing.assert_allclose(src.load_frame(0), raw[0])
 
@@ -243,7 +261,8 @@ def test_open_scan_source_root_load_frame(tmp_path):
     raw = np.arange(4 * 4, dtype=float).reshape(1, 4, 4)
     _write_master(master, raw)
     nxs = tmp_path / "scan.nxs"
-    _write_processed(nxs, rel_path="raw/m.h5", source_base="/old/gone", master_frame=0)
+    _write_processed(nxs, source_path="/old/gone/raw/m.h5",
+                     source_base="/old/gone", master_frame=0)
     scan = open_scan(nxs, source_root=str(moved))
     np.testing.assert_allclose(scan.load_frame(0), raw[0])
 
@@ -257,19 +276,8 @@ def test_processed_nexus_source_load_frame_strict_raises_without_master(tmp_path
     from xrd_tools.io.image_source import load_processed_raw_or_thumbnail
 
     nxs = tmp_path / "scan.nxs"
-    with h5py.File(nxs, "w") as f:
-        e = f.create_group("entry")
-        g = e.create_group("integrated_1d")
-        g.create_dataset("intensity", data=np.zeros((1, 5)))
-        g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
-        s = e.create_group("frames/frame_0000/source")
-        s.create_dataset("path", data=np.bytes_(b"/gone/missing_master.h5"))
-        s.create_dataset("frame_index", data=0)
-        th = e.create_dataset("frames/frame_0000/thumbnail",
-                              data=np.ones((4, 4), dtype=np.uint8))
-        th.attrs["vmin"] = 0.0
-        th.attrs["vmax"] = 1.0
-        th.attrs["dtype"] = "uint8"
+    _write_processed(nxs, source_path="/gone/missing_master.h5",
+                     master_frame=0, thumbnail=np.ones((4, 4)))
 
     src = ProcessedNexusSource(nxs)
     with pytest.raises(KeyError):              # strict: no silent thumbnail

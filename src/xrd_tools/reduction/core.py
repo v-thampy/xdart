@@ -685,7 +685,18 @@ class XYESink:
 
 @dataclass(slots=True)
 class NexusSink:
-    """Frame-by-frame NeXus sink backed by ``xrd_tools.io.nexus``."""
+    """Frame-by-frame NeXus sink backed by ``xrd_tools.io.nexus``.
+
+    Writes the **complete v2 record** (6a): besides the integrated stacks
+    and scan metadata, every frame gets its per-frame record group
+    (raw-source pointer + optional thumbnail) via
+    :mod:`xrd_tools.io.nexus_record`, ``@source_base`` is stamped when a
+    project root is given, and per-frame geometry is derived at finish when
+    the scan carries a geometry mapping.  A purely headless run therefore
+    produces a file that ``get_raw_frame`` / ``read_frame_view`` resolve
+    exactly like a GUI-written one (N1-portable when ``source_base`` is
+    set).  Set ``complete_record=False`` for the minimal pre-6a output.
+    """
 
     path: Path | str
     entry: str = "entry"
@@ -694,6 +705,11 @@ class NexusSink:
     swmr: bool = False
     flush_every: int | None = 16
     atomic: bool | None = None
+    complete_record: bool = True
+    source_base: Path | str | None = None
+    write_thumbnails: bool = True
+    thumbnail_max: int = 256
+    _norm_source_base: str | None = field(default=None, init=False, repr=False)
     _h5: Any | None = field(default=None, init=False, repr=False)
     _n_written: int = field(default=0, init=False, repr=False)
     _scan: "Scan | None" = field(default=None, init=False, repr=False)
@@ -732,6 +748,12 @@ class NexusSink:
             swmr=self.swmr,
             overwrite=True if use_atomic else self.overwrite,
         )
+        self._norm_source_base = None
+        if self.complete_record and self.source_base:
+            from xrd_tools.io.nexus_record import stamp_source_base
+            self._norm_source_base = stamp_source_base(
+                self._h5[self.entry], self.source_base
+            )
 
     def write(self, frame: Frame, reduction: FrameReduction) -> None:
         if self._h5 is None:
@@ -744,9 +766,39 @@ class NexusSink:
             entry=self.entry,
             compression=self.compression,
         )
+        if self.complete_record:
+            self._write_frame_record(frame)
         self._n_written += 1
         if self.flush_every is not None and self._n_written % self.flush_every == 0:
             self._h5.flush()
+
+    def _write_frame_record(self, frame: Frame) -> None:
+        """Per-frame source pointer + thumbnail (complete-record mode)."""
+        from xrd_tools.io.nexus_record import (
+            ensure_frames_container, make_thumbnail_array, write_frame_record,
+        )
+
+        thumb = None
+        if self.write_thumbnails and frame.image is not None:
+            img = np.asarray(frame.image, dtype=np.float32)
+            bg = frame.background
+            if bg is not None:
+                bg_arr = np.asarray(bg, dtype=np.float32)
+                if bg_arr.shape == () or bg_arr.shape == img.shape:
+                    img = img - bg_arr
+            thumb = make_thumbnail_array(img, max_size=self.thumbnail_max)
+        write_frame_record(
+            ensure_frames_container(self._h5[self.entry]),
+            f"frame_{int(frame.index):04d}",
+            thumbnail=thumb,
+            source_path=(str(frame.source_path)
+                         if frame.source_path is not None else None),
+            source_frame_index=(int(frame.source_frame_index)
+                                if frame.source_frame_index is not None
+                                else 0),
+            timestamp=frame.metadata.get("timestamp"),
+            source_base=self._norm_source_base,
+        )
 
     def finish(self, result: ReductionResult) -> None:
         if self._h5 is None:
@@ -768,6 +820,14 @@ class NexusSink:
                     upsert_scan_metadata(
                         self._h5[self.entry], scan_data, scan.frame_indices,
                     )
+                if self.complete_record:
+                    geom = scan.geometry
+                    if geom is not None and scan_data is not None:
+                        from xrd_tools.io.nexus import write_per_frame_geometry
+                        write_per_frame_geometry(
+                            self._h5[self.entry], scan_data,
+                            list(scan.frame_indices), geom,
+                        )
             self._h5.flush()
             self._h5.close()
             self._h5 = None
