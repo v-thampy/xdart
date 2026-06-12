@@ -51,77 +51,6 @@ warnings.filterwarnings(
 
 logger = logging.getLogger(__name__)
 
-# C4: minimum compatible xrd_tools version.  MUST equal the
-# ``xrd_tools>=`` floor in pyproject.toml (tests/test_min_ssrl_version.py
-# asserts they match).  The pip floor only protects pip installs — the
-# documented dev workflow is an editable install from a sibling clone, which
-# bypasses it entirely; this runtime guard turns "crashes on the first write"
-# into a clear startup error.
-MIN_SSRL_VERSION = "0.41.0"
-
-
-def _version_tuple(v):
-    """Lenient (major, minor, patch) for X.Y.Z-style strings."""
-    parts = []
-    for tok in str(v).split(".")[:3]:
-        digits = ""
-        for ch in tok:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        parts.append(int(digits or 0))
-    return tuple(parts + [0] * (3 - len(parts)))
-
-
-def _ssrl_capabilities_ok():
-    """Probe the load-bearing symbols xdart hard-requires.  Used to tolerate a
-    STALE editable-install version stamp (metadata only refreshes on
-    ``pip install -e``, not on ``git pull``) when the code is actually new
-    enough."""
-    try:
-        import inspect
-        from xrd_tools.io.read import relative_source_path  # noqa: F401
-        from xrd_tools.reduction import ReductionSession
-        return ("join_timeout" in inspect.signature(
-                    ReductionSession.finish).parameters
-                and hasattr(ReductionSession, "drain")
-                # 0.41.0 symbols — without these the probe approves a checkout
-                # that crashes at every session open (open_live_reduction_session
-                # passes retain_products= unguarded).  Keep this list in sync
-                # with the NEWEST load-bearing ssrl APIs xdart calls.
-                and "retain_products" in inspect.signature(
-                    ReductionSession).parameters
-                and hasattr(ReductionSession, "release_products"))
-    except Exception:
-        return False
-
-
-def check_ssrl_version():
-    """Fail loudly at startup on an incompatible xrd_tools install."""
-    try:
-        import xrd_tools
-        have = getattr(xrd_tools, "__version__", "0.0.0")
-    except ImportError as exc:
-        raise SystemExit(
-            f"xdart requires xrd_tools>={MIN_SSRL_VERSION} "
-            f"(import failed: {exc})")
-    if _version_tuple(have) >= _version_tuple(MIN_SSRL_VERSION):
-        return
-    if _ssrl_capabilities_ok():
-        # The code has everything we need; only the metadata stamp is old
-        # (editable install not re-installed since the version bump).
-        logger.warning(
-            "xrd_tools reports %s (< required %s) but provides all "
-            "required APIs — the editable install's version stamp is likely "
-            "stale; re-run 'pip install -e ../xrd_tools' to refresh it.",
-            have, MIN_SSRL_VERSION)
-        return
-    raise SystemExit(
-        f"xdart requires xrd_tools>={MIN_SSRL_VERSION}, found {have}. "
-        f"Editable installs bypass the pip floor — update and reinstall the "
-        f"sibling xrd_tools checkout.")
-
 # Qt imports
 from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
@@ -187,7 +116,6 @@ class Main(QMainWindow):
 
 
 def run():
-    check_ssrl_version()
     app = QtWidgets.QApplication(sys.argv)
     # N8: apply dark theme before any widget construction so
     # pyqtgraph plot backgrounds are set in time (pyqtgraph

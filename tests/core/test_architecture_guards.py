@@ -8,8 +8,9 @@ import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
-PACKAGE = ROOT / "xrd_tools"
+ROOT = Path(__file__).resolve().parents[2]
+PACKAGE = ROOT / "src" / "xrd_tools"
+SRC = ROOT / "src"
 
 
 def _python_files():
@@ -68,3 +69,30 @@ def test_headless_contract_imports_do_not_pull_gui_modules():
         if name.startswith(forbidden_roots)
     )
     assert forbidden == []
+
+
+def test_first_party_never_imports_the_shim():
+    """Nothing under src/ may import ssrl_xrd_tools -- the shim exists for
+    USER code only."""
+    offenders: list[str] = []
+    for path in SRC.rglob("*.py"):
+        if "__pycache__" in path.parts or path.parent.name == "ssrl_xrd_tools":
+            continue
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(a.name.split(".")[0] == "ssrl_xrd_tools"
+                       for a in node.names):
+                    offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+            elif isinstance(node, ast.ImportFrom):
+                if (node.module or "").split(".")[0] == "ssrl_xrd_tools":
+                    offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+    assert offenders == []
+
+
+def test_core_capability_imports():
+    """The load-bearing core symbols the GUI (and users) rely on."""
+    from xrd_tools.io.read import relative_source_path, resolve_source_master  # noqa: F401
+    from xrd_tools.io.frame_view import read_frame_view, iter_frame_views  # noqa: F401
+    from xrd_tools.reduction import ReductionSession, run_reduction  # noqa: F401
+    from xrd_tools.core.frame_view import FrameView, assert_frameview_equivalent  # noqa: F401
