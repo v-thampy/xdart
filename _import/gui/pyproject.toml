@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xdart"
+version = "0.40.0"
+description = "A pyFAI-based GUI for X-ray diffraction data reduction and visualization"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Vivek Thampy", email = "vthampy@stanford.edu"},
+]
+keywords = ["xrd", "diffraction", "pyFAI", "SSRL", "synchrotron", "GUI"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+dependencies = [
+    "ssrl_xrd_tools>=0.41.0",
+    "numpy",
+    "scipy",
+    "h5py",
+    "hdf5plugin",
+    "nexusformat",
+    "fabio",
+    "silx",
+    # silx.gui.plot pulls qtawesome at import time for its plot
+    # toolbar icons, but silx doesn't list it in install_requires.
+    # pyFAI-calib2 and pyFAI.app.drawmask both go through that
+    # import path, so on a clean Windows env without qtawesome
+    # they fail to launch with ModuleNotFoundError: 'qtawesome'.
+    # Pin it explicitly here so users get it transitively.
+    "qtawesome",
+    # pyFAI 2025.12 ships a broken pyFAI-calib2 on Windows (silx.gui
+    # import path / qt plugin issue); cap to <2025.12 until that's
+    # fixed upstream.  Confirmed 2025.3-2025.11 work.
+    "pyFAI>=2025.3,<2025.12",
+    "xrayutilities",
+    "PySide6>=6.5",
+    "pyqtgraph>=0.13.7",
+    "pandas",
+    "lmfit",
+    "pyyaml",
+    "matplotlib",
+    "joblib",
+    "natsort",
+    "imagecodecs",
+    "imageio",
+    "ipykernel",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "build",
+    "twine",
+]
+
+[project.scripts]
+xdart = "xdart.xdart_main:main"
+
+[project.urls]
+Homepage = "https://github.com/v-thampy/xdart"
+Repository = "https://github.com/v-thampy/xdart"
+Issues = "https://github.com/v-thampy/xdart/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["xdart*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "display_logic: pure, Qt-free display-decision tests (no Qt/pyFAI/h5py needed). Run with `pytest -m display_logic`.",
+    "gui: end-to-end tests that build real Qt widgets (need QT_QPA_PLATFORM=offscreen). Run/skip with `pytest -m gui` / `-m 'not gui'`.",
+]
+filterwarnings = [
+    # Upstream noise from pyFAI 2025/2026 — uses the deprecated
+    # `numpy.ndarray.strides` setter (NumPy 2.4 deprecation).  Not
+    # actionable in xdart; pyFAI will need to switch to
+    # `np.lib.stride_tricks.as_strided`.  Drop this filter once pyFAI
+    # has a release that doesn't trigger it.
+    "ignore:Setting the strides on a NumPy array has been deprecated:DeprecationWarning:pyFAI",
+]

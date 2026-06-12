@@ -1,0 +1,191 @@
+# -*- coding: utf-8 -*-
+"""
+@author: walroth
+"""
+
+# Standard library imports
+import os
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Other imports
+import numpy as np
+import pandas as pd
+from pyFAI.units import Unit
+
+# Qt imports
+import pyqtgraph as pg
+from pyqtgraph import Qt
+from pyqtgraph.Point import Point
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+from pyqtgraph.parametertree.ParameterItem import ParameterItem
+from pyqtgraph.parametertree.Parameter import Parameter
+
+# This module imports
+from ..gui_utils import XdartDecoder, XdartEncoder
+
+class defaultWidget(Qt.QtWidgets.QWidget):
+    """Pop up window for displaying default values for a parameterTree.
+    
+    attributes:
+        layout: QGridLayout, widget layout
+        openButton: QPushButton, opens default file
+        parameters: pyqtgraph Parameters
+        saveButton: QPushButton, saves to json file
+        tree: pyqtgraph ParameterTree
+    
+    methods:
+        load_defaults: Loads in a json file with defaults
+        param_to_valdict: Prepares parameters for saving by converting
+            them to dictionary
+        save_defaults: Saves the default values to json file
+        set_all_defaults: Makes the current values the default values
+        set_defaults: Sets the default values using a provided dict
+        set_parameters: Sets the list of parameters
+    """
+    sigSetUserDefaults = Qt.QtCore.Signal()
+
+    def __init__(self, parameters=None, parent=None):
+        """parameters: dict, parameters to use
+        """
+        super().__init__(parent)
+        self.parameters = {}
+        self.tree = pg.parametertree.ParameterTree()
+        if parameters is not None:
+            self.set_parameters(parameters)
+        self.layout = Qt.QtWidgets.QGridLayout(self)
+        self.setLayout(self.layout)
+        self.layout.addWidget(self.tree, 0, 0, 1, 2)
+        self.saveButton = Qt.QtWidgets.QPushButton()
+        self.saveButton.clicked.connect(self.save_defaults)
+        self.saveButton.setText("Save")
+        self.layout.addWidget(self.saveButton, 1, 0)
+        self.openButton = Qt.QtWidgets.QPushButton()
+        self.openButton.clicked.connect(self.load_defaults)
+        self.openButton.setText("Open")
+        self.layout.addWidget(self.openButton, 1, 1)
+    
+    def set_parameters(self, parameters):
+        """Sets the current parameters to the provided parameters.
+        
+        parameters: pyqtgraph Parameter, parameters to set
+        """
+        self.parameters = {}
+        self.tree.clear()
+        for param in parameters:
+            self.parameters[param.name()] = param
+            self.tree.addParameters(param)
+    
+    def param_to_valdict(self, param):
+        """Converts parameters to dictionary
+        
+        args:
+            param: pyqtgraph Parameter, value to be converted
+        
+        returns:
+            valdict: dictionary of parameter values
+        """
+        valdict = {}
+        # Recurse on any parent (not just 'group'-typed params), and only
+        # read a value from leaves that actually have one.  Action / button
+        # params (e.g. the 'Browse...' NamedActionParameters) and other
+        # valueless leaves have no 'value' key, so ``param.value()`` raises
+        # "No Value has been set" — which used to crash config save AND the
+        # save-on-exit / restore-last-config path.
+        if param.hasChildren():
+            valdict[param.name()] = {}
+            for child in param.children():
+                valdict[param.name()].update(self.param_to_valdict(child))
+        elif param.hasValue():
+            try:
+                valdict[param.name()] = param.value()
+            except Exception:
+                pass  # valueless leaf — nothing to persist
+        return valdict
+
+    def set_defaults(self, param, valdict):
+        """Sets the defaults of the parameters to the provided valdict
+        values.
+        
+        args:
+            param: pyqtgraph Parameter, value whose default will be set
+            valdict: dict, values to be set as defaults.
+        """
+        # Mirror param_to_valdict: recurse on any parent, set values only on
+        # leaves that have one and that were persisted.  Keeps load symmetric
+        # with save and tolerant of valueless / action params.
+        if param.hasChildren():
+            sub = valdict.get(param.name())
+            if isinstance(sub, dict):
+                for child in param.children():
+                    self.set_defaults(child, sub)
+        elif param.hasValue() and param.name() in valdict:
+            try:
+                param.setDefault(valdict[param.name()])
+                param.setValue(valdict[param.name()])
+            except Exception:
+                logger.debug(
+                    "set_defaults: could not restore %s", param.name(),
+                    exc_info=True,
+                )
+    
+    def save_defaults(self, checked=False, fname=None):
+        """Opens a QFileDialog and saves the current values as json
+        file.
+
+        Parameters
+        ----------
+        fname : str, path to file to save defaults
+        """
+        emit = False
+        if fname is None:
+            fname, _ = Qt.QtWidgets.QFileDialog().getSaveFileName(filter="*.json")
+            emit = True
+        self.set_all_defaults()
+        jdict = {}
+        for key, param in self.parameters.items():
+            jdict[key] = self.param_to_valdict(param)
+
+        if fname != "":
+            # Ensure the parent directory exists (the config dir, or any path
+            # the user picked) so the write can't FileNotFoundError.
+            parent = os.path.dirname(fname)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(fname, 'w') as f:
+                json.dump(jdict, f, cls=XdartEncoder)
+        if emit:
+            self.sigSetUserDefaults.emit()
+    
+    def load_defaults(self, checked=False, fname=None):
+        """Opens a QFileDialog and loads values from json file.
+
+        Parameters
+        ----------
+        checked : bool, used by QAction triggered signal
+        fname : str, path to file to load
+        """
+        emit = False
+        if fname is None:
+            fname, _ = Qt.QtWidgets.QFileDialog().getOpenFileName(filter="*.json")
+            emit = True
+        if fname != "":
+            with open(fname, 'r') as f:
+                valdict = json.load(f, cls=XdartDecoder)
+            for key, param in self.parameters.items():
+                try:
+                    self.set_defaults(param, valdict[key])
+                except KeyError:
+                    print(f"Key Error in load_default, key: {key}")
+        if emit:
+            self.sigSetUserDefaults.emit()
+    
+    def set_all_defaults(self):
+        """Sets the current values to be the default values for all
+        parameters
+        """
+        for key, param in self.parameters.items():
+            valdict = self.param_to_valdict(param)
+            self.set_defaults(param, valdict)
