@@ -112,8 +112,8 @@ sink record + byte-compat gate), 6b schema-as-code starter, 6c API renames
 (list above), 6d single LiveScan→core adapter + single TwoDKind classifier
 (+ import-light `xrd_tools.core`), 6e cleanups + S8 + D6 + D5 + F1.
 
-Deferred (tracked in the maintainer's review notes,
-`CC_preship_sweep_deferred_jun2026.md` — not part of this repo):
+Deferred (tracked in
+`docs/design/CC_preship_sweep_deferred_jun2026.md`):
 D1 re-integrate RAM rework (re-expose the buttons with a replace-aware
 sink), D2 thumbnail LRU + lazy reload (analyzed Jun 2026; lands with the
 publication-store migration), F2 outside-project Save Path consent design,

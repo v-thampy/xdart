@@ -10,14 +10,23 @@ histories — `git log --follow` works); see `MIGRATION.md`.  The
 `xrd_tools` modules.
 
 ## North star
-Roadmap: `~/repos/review/roadmap_2026-06-10.md`.  (1) **headless-first
-APIs** — `xrd_tools` fully usable with no GUI; (2) **thin xdart** over it;
-(3) **robustness** (fail-loud writes, strict schema, live≡batch≡reload
-spine); (4) **performance** (streaming, parallel, bounded memory);
+Roadmap: `docs/design/roadmap_2026-06-10.md`; layer map:
+`docs/ARCHITECTURE.md`.  (1) **headless-first APIs** — `xrd_tools` fully
+usable with no GUI; (2) **thin xdart** over it; (3) **robustness**
+(fail-loud writes, strict schema, live≡batch≡reload spine);
+(4) **performance** (streaming, parallel, bounded memory);
 (5) **expandability** (clean `FrameSource`/`ReductionPlan`/`ReductionSink`
-seams).  Post-1.0 priority: F3 ROI statistics, then the deferred items in
-`~/repos/review/CC_preship_sweep_deferred_jun2026.md` (D1 reintegrate, D2
-thumbnail LRU, F2/F4 save-path + embed-raw designs, F5 Set Bkg everywhere).
+seams).
+
+**Current cycle (pre-v1):** execute
+`docs/design/CC_greenfield_implementation_plan_2026-06-12.md` — Phase 0
+docs-into-repo (done), 1 contract tests + release script + policies,
+2 schema derivation, 3 one store (X1), 4 session layer, 5 FrameRecord +
+strictness.  v1 ships after Phase 5; then features: F3 ROI statistics
+first, then D1 reintegrate, F4, F5 — all tracked in
+`docs/design/CC_preship_sweep_deferred_jun2026.md` (**the canonical
+deferred-items register lives IN-REPO now**; the old
+`~/repos/review/` copy is a tombstone).
 
 ## Environment & tests
 - Dev venv: `~/.venvs/xrd-tools-dev` (editable install, all extras).  The

@@ -1,3 +1,5 @@
+> **HISTORICAL:** pre-architecture-v2 plan (2026 Q2); kept for provenance — the stitching work it describes has partially landed; see docs/design/roadmap_2026-06-10.md for current status.
+
 # Nexus + Stitching Refactor — Branch Plan & TODO Spec
 
 **Status:** Ready to start. This document is the complete specification; a fresh

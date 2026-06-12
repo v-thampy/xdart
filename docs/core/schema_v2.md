@@ -1,5 +1,12 @@
 # Processed Scan NeXus Schema v2
 
+> **Source of truth:** `src/xrd_tools/io/schema.py` (schema-as-code: the
+> `SCHEMA` object — attribute keys, row-aligned dataset sets, axis names,
+> capability attrs), pinned by `tests/core/test_schema_as_code.py` and the
+> byte-compat gate `tests/core/test_v2_record_compat.py`.  Versioning
+> policy: `docs/decisions/0002-schema-version-and-capability-attrs.md`.
+> This page is a prose overview only.
+
 Architecture-v2 keeps the processed scan layout stable while adding explicit
 schema stamps and lossless per-frame metadata.
 

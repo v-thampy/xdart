@@ -1,3 +1,5 @@
+> **HISTORICAL:** design note from the two-repo era; review against the current display-layer seams (docs/ARCHITECTURE.md) before acting on it.
+
 # Stitching architecture — design doc
 
 Status: **draft for discussion** (May 2026)
