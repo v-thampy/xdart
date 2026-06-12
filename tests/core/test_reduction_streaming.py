@@ -221,20 +221,13 @@ def test_submit_rejected_in_chunked_mode(monkeypatch):
 # ---------------------------------------------------------------------------
 # Fail-loud on sink/write failure (BLOCKER 2)
 # ---------------------------------------------------------------------------
-class _BoomSink:
-    """A sink whose write() always fails — to exercise fail-loud finish()."""
+from tests.core.contracts import BoomSink as _ContractBoomSink
 
-    def begin(self, scan, plan):
-        pass
 
-    def write(self, frame, reduction):
-        raise RuntimeError("disk full")
-
-    def finish(self, result):
-        pass
-
-    def abort(self, result):
-        pass
+def _BoomSink():
+    """write() always fails — exercise fail-loud finish().  (Shared double
+    from tests.core.contracts; message kept for the match= asserts.)"""
+    return _ContractBoomSink(boom_on="write", message="disk full")
 
 
 def test_streaming_write_failure_surfaces(monkeypatch):

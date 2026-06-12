@@ -631,6 +631,23 @@ class ProcessedScan:
         return [int(frame) for frame in self.frames]
 
     @property
+    def capabilities(self):
+        """FrameSource capability advertisement (completes the duck
+        contract the RSM/stitch boundary consumes — pinned by the
+        contract tests)."""
+        from xrd_tools.core.scan import SourceCapabilities
+
+        return SourceCapabilities(
+            is_streaming=False,
+            supports_random_access=True,
+            supports_chunks=True,
+            has_metadata=True,
+            has_geometry=True,
+            has_raw_references=True,
+            has_thumbnails=True,
+        )
+
+    @property
     def metadata(self) -> dict:
         if self._metadata_cache is None:
             self._metadata_cache = get_metadata(self.path, entry=self.entry)
