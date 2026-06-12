@@ -799,7 +799,7 @@ def test_nexus_viewer_metadata_row_clears_both(widget):
 # cake_image owns the 2D-unit (imageUnit) Q↔2θ conversion, so the cake unit is
 # consistent on every render and the toggle re-renders through the payload.
 
-def _set_int_scan(w, *, n=1, wavelength_m=1.0e-10):
+def _set_int_scan(w, *, n=1, wavelength_m=0.7293e-10):
     """Populate the real widget for an Int 2D scan: data_2d + data_1d +
     publications + a scan stub, selected, in Int 2D mode (non-GI, q-integrated)."""
     import threading
@@ -1116,10 +1116,16 @@ def test_int1d_xye_keeps_wrangler_inputs_enabled(widget):
     w._on_viewer_mode_changed("xye")
     assert tree.isEnabled() is True
 
-    # XYE Viewer: a file browser — inputs disabled.
+    # XYE Viewer: a file browser — the TREE stays enabled (Project Folder /
+    # Save Path drive the browser) while the processing groups disable.
     _set_mode("XYE Viewer")
     w._on_viewer_mode_changed("xye")
-    assert tree.isEnabled() is False
+    assert tree.isEnabled() is True
+    # (Per-group disables are the WRANGLER's _on_mode_changed job -- covered
+    # by test_file_viewer_mode_disables_processing_tree_but_not_mode_combo;
+    # this helper drives the widget-side handler with combo signals blocked.)
+    assert w.wrangler.parameters.child('h5_dir').opts.get(
+        'enabled', True) is True
 
 
 # ── C3 / C4: per-mode integration control enable/dim ───────────────────────
@@ -1572,3 +1578,149 @@ def test_shutdown_threads_stops_file_thread(widget):
     # Idempotent — a second call (and the close() path that also calls it) is safe.
     w.h5viewer.shutdown_threads()
     assert not ft.isRunning()
+
+
+def test_integrator_panel_session_roundtrip(widget):
+    """Session persistence for the integration panel: units/pts/ranges/Auto
+    flags + Advanced params survive a save/restore cycle (saved at app close,
+    restored at startup -- they previously weren't persisted at all)."""
+    tree = widget.integratorTree
+
+    tree.ui.npts_1D.setText("1234")
+    tree.ui.radial_autoRange_1D.setChecked(False)
+    tree.ui.radial_low_1D.setText("0.5")
+    tree.ui.radial_high_1D.setText("4.5")
+    tree.parameters.child('Default', 'Integrate 1D', 'chi_offset').setValue(45.0)
+    state = tree.session_state()
+    import json
+    json.dumps(state)                       # must be JSON-serializable
+
+    # Scramble, then restore.
+    tree.ui.npts_1D.setText("999")
+    tree.ui.radial_autoRange_1D.setChecked(True)
+    tree.parameters.child('Default', 'Integrate 1D', 'chi_offset').setValue(90.0)
+    tree.restore_session_state(state)
+
+    assert tree.ui.npts_1D.text() == "1234"
+    assert tree.ui.radial_autoRange_1D.isChecked() is False
+    assert tree.ui.radial_low_1D.text() == "0.5"
+    assert tree.parameters.child(
+        'Default', 'Integrate 1D', 'chi_offset').value() == 45.0
+
+
+def test_cake_view_trim_rearms_after_own_trim_but_respects_user_zoom(widget):
+    """The display trim disables pyqtgraph auto-range via its own setRange, so
+    it must recognize its OWN previous range and re-trim on the next render
+    (axis-kind switches stranded a stale window otherwise) -- while a range
+    the USER set stays untouched."""
+    import numpy as np
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+
+    w = widget.displayframe.binned_widget
+    vb = w.image_plot.getViewBox()
+
+    img = np.zeros((100, 100)); img[10:30, 40:60] = 5.0      # (x, y) block
+    x = np.linspace(0.0, 10.0, 100); y = np.linspace(-180.0, 180.0, 100)
+    displayFrameWidget._trim_view_to_data(w, img, x, y)
+    first = vb.viewRange()
+    assert first[0][1] < 6.0                                 # trimmed in x
+
+    # Same auto-range-off state, new data elsewhere -> must RE-trim.
+    img2 = np.zeros((100, 100)); img2[70:90, 70:90] = 5.0
+    displayFrameWidget._trim_view_to_data(w, img2, x, y)
+    second = vb.viewRange()
+    assert second != first and second[0][0] > 5.0            # followed the data
+
+    # User zoom (a range we did NOT set) -> respected, no trim.
+    vb.setRange(xRange=(2.0, 3.0), yRange=(0.0, 10.0), padding=0)
+    user = vb.viewRange()
+    displayFrameWidget._trim_view_to_data(w, img, x, y)
+    assert vb.viewRange() == user
+
+
+def test_scale_switch_without_2d_panels_does_not_crash(widget):
+    """Switching Linear/Sqrt/Log re-renders all views; in Int 1D (or before
+    anything is drawn) image_data/binned_data are None and the unpack raised
+    TypeError.  XYE Viewer never routes here, which is why it was immune."""
+    df = widget.displayframe
+    df.image_data = None
+    df.binned_data = None
+    df.update_image_view()          # must no-op, not raise
+    df.update_binned_view()
+
+
+def test_gi_1d_npts_defaults_and_per_axis_memory(widget):
+    """1-D Pts: fiber axes (Qip/Qoop/Exit) default to 1000/1000, q_total
+    ('Q'/'Chi', plain pyFAI) and standard mode to 2000; a user-chosen value
+    persists per axis across switches.  (Was: stale session text -- e.g.
+    1234 -- landed in whatever axis was active.)"""
+    tree = widget.integratorTree
+    tree._npts_memory_1d = {}          # independent of restored session state
+    tree._npts_key_1d = None
+    tree.scan.gi = True
+    tree.set_image_units()
+
+    labels = [tree.ui.axis1D.itemText(i) for i in range(tree.ui.axis1D.count())]
+    qip_idx = next(i for i, t in enumerate(labels) if "ᵢₚ" in t or "ᵢ" in t)
+
+    tree.ui.axis1D.setCurrentIndex(qip_idx)            # -> q_ip
+    assert tree.ui.npts_1D.text() == "1000"
+    assert tree.ui.npts_oop_1D.text() == "1000"
+
+    tree.ui.npts_1D.setText("800")                     # user override
+    tree.ui.axis1D.setCurrentIndex(0)                  # -> q_total ('Q')
+    assert tree.ui.npts_1D.text() == "2000"
+    tree.ui.axis1D.setCurrentIndex(qip_idx)            # back -> q_ip
+    assert tree.ui.npts_1D.text() == "800"             # remembered
+    assert tree.ui.npts_oop_1D.text() == "1000"
+
+    # Session roundtrip carries the per-axis memory
+    state = tree.session_state()
+    import json
+    json.dumps(state)
+    assert state['npts_1d']['q_ip'][0] == "800"
+
+    # new_scan re-runs set_image_units: it must NOT clobber the fiber-axis
+    # value (the legacy force-to-2000 snippet did exactly that and poisoned
+    # the per-axis memory via the trailing stash).
+    tree.set_image_units()
+    assert tree.ui.npts_1D.text() == "800"
+    assert tree._npts_memory_1d.get('q_ip', ('800',))[0] == "800"
+
+    tree.scan.gi = False                               # -> standard mode
+    tree.set_image_units()
+    tree._update_gi_mode_1d(tree.ui.axis1D.currentIndex())
+    assert tree.ui.npts_1D.text() == "2000"
+
+
+def test_gi_entry_forces_q_unit(widget):
+    """Switching to GI with 2th selected in standard mode must force the
+    unit (combo AND bai args) back to Q -- GI has no 2th option, and the
+    retained '2th_deg' integrated GI under a Q-labelled axis (wrong
+    results, user-reported)."""
+    tree = widget.integratorTree
+    tree._npts_memory_1d = {}
+    tree._npts_key_1d = None
+
+    tree.scan.gi = False
+    tree.set_image_units()
+    tree.ui.unit_1D.setCurrentIndex(1)                 # 2th
+    tree.ui.unit_2D.setCurrentIndex(1)
+    assert tree.scan.bai_1d_args['unit'] == '2th_deg'
+    assert tree.scan.bai_2d_args['unit'] == '2th_deg'
+
+    tree.scan.gi = True
+    tree.set_image_units()
+    assert tree.ui.unit_1D.currentIndex() == 0          # forced to Q
+    assert tree.ui.unit_2D.currentIndex() == 0
+    assert tree.scan.bai_1d_args['unit'] == 'q_A^-1'
+    assert tree.scan.bai_2d_args['unit'] == 'q_A^-1'
+    assert tree.ui.unit_1D.count() == 1                 # 2th removed in GI
+    assert tree.ui.unit_2D.count() == 1
+
+    # Back to standard: both units restored as valid choices.
+    tree.scan.gi = False
+    tree.set_image_units()
+    assert tree.scan.bai_1d_args['unit'] == 'q_A^-1'    # stays Q, no surprise
+    assert tree.ui.unit_1D.count() == 2                 # 2th is back
+    assert tree.ui.unit_2D.count() == 2

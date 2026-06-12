@@ -36,6 +36,15 @@ from xdart.utils.session import load_session, save_session
 QFileDialog = QtWidgets.QFileDialog
 
 params = [
+    # N1: the portable Project Folder.  Setting it stamps entry/@source_base and
+    # stores each frame's raw source path RELATIVE to it (portable .nxs); blank
+    # -> absolute paths (back-compat).  Mirrors the image wrangler (the fuller
+    # progressive-disclosure UX is image-wrangler only; here it's the portable
+    # field + wiring).
+    {'name': 'Project', 'title': 'Project Folder', 'type': 'group', 'children': [
+        {'name': 'project_folder', 'title': 'Folder', 'type': 'str', 'value': ''},
+        NamedActionParameter(name='project_folder_browse', title='Browse...'),
+    ], 'expanded': True},
     {'name': 'Calibration', 'type': 'group', 'children': [
         {'name': 'poni_file', 'title': 'PONI File    ', 'type': 'str', 'value': ''},
         NamedActionParameter(name='poni_file_browse', title='Browse...'),
@@ -49,8 +58,14 @@ params = [
         {'name': 'mask_file', 'title': 'Mask File    ', 'type': 'str', 'value': ''},
         NamedActionParameter(name='mask_file_browse', title='Browse...'),
     ], 'expanded': False},
-    {'name': 'GI', 'type': 'group', 'children': [
-        {'name': 'Grazing', 'title': 'Grazing Incidence', 'type': 'bool', 'value': False},
+    {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group',
+     'children': [
+        # UI-1 (#81): the group HEADER carries a real checkbox — the on/off
+        # toggle (see wranglerWidget._install_group_toggles).  The bool is the
+        # hidden source of truth (a hidden bool can't repaint-uncheck when the
+        # tree is disabled mid-run, #56).
+        {'name': 'Grazing', 'title': 'Grazing Incidence', 'type': 'bool',
+         'value': False, 'visible': False},
         {'name': 'th_motor', 'title': 'Theta Motor', 'type': 'str', 'value': 'th'},
         {'name': 'th_val', 'title': 'Theta Value', 'type': 'float', 'value': 0.0},
         {'name': 'sample_orientation', 'title': 'Sample Orientation', 'type': 'int',
@@ -95,6 +110,9 @@ class nexusWrangler(wranglerWidget):
         # Attributes
         self.nexus_file = ''
         self.entry = 'entry'
+        # N1: Project Folder (portable @source_base).  Blank -> None (absolute).
+        self.project_folder = ''
+        self.source_base = None
         self.poni_file = ''
         self.mask_file = ''
         self.h5_dir = get_fname_dir()
@@ -114,10 +132,13 @@ class nexusWrangler(wranglerWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
 
-        # Status label
+        # Status label.  Long thread messages (missing-dataset errors etc.)
+        # must not force the window wider — elide into the label, full text
+        # in the tooltip (see wranglerWidget._guard_status_label).
         self.statusLabel = QtWidgets.QLabel('Ready')
         layout.addWidget(self.statusLabel)
-        self.showLabel.connect(self.statusLabel.setText)
+        self._guard_status_label()
+        self.showLabel.connect(self._set_status_text)
 
         # Buttons
         btn_layout = QtWidgets.QHBoxLayout()
@@ -188,9 +209,25 @@ class nexusWrangler(wranglerWidget):
             name='nexus_wrangler', type='group', children=params
         )
         self.tree.setParameters(self.parameters, showTop=False)
+        # Match the image wrangler's tree styling so the group headers (and
+        # their expand/collapse arrows) are legible against the Dracula theme
+        # -- the nexus tree previously had no styling at all (UI-4).
+        self.tree.setStyleSheet("""
+        QTreeView::item:has-children {
+            background-color: #44475a;
+            color: #f8f8f2;
+        }
+        QTreeView::item:has-children:disabled {
+            background-color: #3a3d4d;
+            color: #6272a4;
+        }
+            """)
         layout.addWidget(self.tree)
 
         # Connect parameter browse buttons
+        self.parameters.child('Project').child('project_folder_browse').sigActivated.connect(
+            self.browse_project_folder
+        )
         self.parameters.child('Calibration').child('poni_file_browse').sigActivated.connect(
             self.browse_poni
         )
@@ -203,6 +240,11 @@ class nexusWrangler(wranglerWidget):
         self.parameters.child('Output').child('h5_dir_browse').sigActivated.connect(
             self.browse_h5_dir
         )
+
+        # UI-1 (#81): put a real checkbox on the GI group header — the
+        # checkbox is the on/off toggle, driving the hidden 'Grazing' bool
+        # that setup() reads at start (see wranglerWidget._install_group_toggles).
+        self._install_group_toggles(self.tree)
 
         # Setup thread
         self.thread = nexusThread(
@@ -226,7 +268,7 @@ class nexusWrangler(wranglerWidget):
             entry=self.entry,
             parent=self,
         )
-        self.thread.showLabel.connect(self.statusLabel.setText)
+        self.thread.showLabel.connect(self._set_status_text)
         self.thread.sigUpdateFile.connect(self.sigUpdateFile.emit)
         self.thread.finished.connect(self.finished.emit)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
@@ -237,6 +279,7 @@ class nexusWrangler(wranglerWidget):
     # ── Session persistence ──────────────────────────────────────────
 
     _SESSION_PARAMS = [
+        ('project_folder',      ('Project', 'project_folder'),   True,  'project_folder'),
         ('poni_file',           ('Calibration', 'poni_file'),    True,  'poni_file'),
         ('nexus_file',          ('NeXus File', 'nexus_file'),    True,  'nexus_file'),
         ('entry',               ('NeXus File', 'entry'),         False, 'entry'),
@@ -276,6 +319,15 @@ class nexusWrangler(wranglerWidget):
                     "session restore failed for %s: %s", skey, e,
                 )
 
+        # UI-1 (#81): reflect the restored GI on/off into the group's expanded
+        # state (the header checkbox itself is synced via the hidden bool's
+        # sigValueChanged) -- expand when on, collapse when off.
+        try:
+            gi_on = bool(self.parameters.child('GI').child('Grazing').value())
+            self.parameters.child('GI').setOpts(expanded=gi_on)
+        except Exception:
+            logger.debug("GI expand-restore skipped", exc_info=True)
+
         # Restore PONI
         poni_file = self.parameters.child('Calibration').child('poni_file').value()
         if poni_file and os.path.exists(poni_file):
@@ -300,6 +352,11 @@ class nexusWrangler(wranglerWidget):
             idx = self.processingModeCombo.findText(mode)
             if idx >= 0:
                 self.processingModeCombo.setCurrentIndex(idx)
+
+    # UI-1 (#81): the GI group carries a header CHECKBOX as its on/off toggle,
+    # mapped to the hidden bool that is its source of truth (see
+    # wranglerWidget._install_group_toggles).
+    _GROUP_TOGGLES = {'GI': 'Grazing'}
 
     def _save_to_session(self):
         """Save parameters to session.json."""
@@ -348,6 +405,22 @@ class nexusWrangler(wranglerWidget):
 
     # ── Browse dialogs ───────────────────────────────────────────────
 
+    def _compute_source_base(self):
+        """N1: the absolute project root, or None when the Project Folder is
+        blank (-> the writer stores absolute raw paths, back-compat)."""
+        pf = (self.parameters.child('Project').child('project_folder').value() or '').strip()
+        return os.path.abspath(os.path.expanduser(pf)) if pf else None
+
+    def browse_project_folder(self):
+        """Browse for the N1 Project Folder; setting it makes the processed
+        ``.nxs`` store raw source paths RELATIVE to this root (portable)."""
+        folder = QFileDialog.getExistingDirectory(self, 'Choose Project Folder', '')
+        if folder:
+            self.parameters.child('Project').child('project_folder').setValue(folder)
+            self.project_folder = folder
+            self.source_base = self._compute_source_base()
+            self._save_to_session()
+
     def browse_poni(self):
         poni_file, _ = QFileDialog.getOpenFileName(
             self, 'Select PONI file', '', 'PONI files (*.poni);;All files (*)')
@@ -392,6 +465,9 @@ class nexusWrangler(wranglerWidget):
         self.entry = self.parameters.child('NeXus File').child('entry').value()
         self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
         self.mask_file = self.parameters.child('Signal').child('mask_file').value()
+        # N1: Project Folder -> @source_base (relative raw paths -> portable .nxs).
+        self.project_folder = self.parameters.child('Project').child('project_folder').value()
+        self.source_base = self._compute_source_base()
 
         # Load PONI if needed
         if self.poni_file and os.path.exists(self.poni_file):
@@ -416,7 +492,18 @@ class nexusWrangler(wranglerWidget):
         self.gi_mode_1d = self.scan.bai_1d_args.get('gi_mode_1d', 'q_total')
         self.gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
 
-        # Recreate thread with current params
+        # Recreate thread with current params.  Release the PREVIOUS one
+        # first: it is parented to this widget, so without deleteLater every
+        # run start accumulated one dormant QThread (plus its signal
+        # connections and _published_frames remnants) for the app's life.
+        _old = getattr(self, 'thread', None)
+        if _old is not None and not (hasattr(_old, 'isRunning')
+                                     and _old.isRunning()):
+            try:
+                _old.setParent(None)
+                _old.deleteLater()
+            except Exception:
+                logger.debug("old nexusThread release failed", exc_info=True)
         self.thread = nexusThread(
             self.command_queue,
             self.scan_args,
@@ -438,7 +525,7 @@ class nexusWrangler(wranglerWidget):
             entry=self.entry,
             parent=self,
         )
-        self.thread.showLabel.connect(self.statusLabel.setText)
+        self.thread.showLabel.connect(self._set_status_text)
         self.thread.sigUpdateFile.connect(self.sigUpdateFile.emit)
         self.thread.finished.connect(self.finished.emit)
         self.thread.sigUpdate.connect(self.sigUpdateData.emit)
@@ -451,6 +538,9 @@ class nexusWrangler(wranglerWidget):
         self.thread.data_1d = self.data_1d
         self.thread.data_2d = self.data_2d
         self.thread.command = self.command
+        # N1: push the project root so the writer stamps @source_base + relative
+        # raw paths (set AFTER the thread recreate above).
+        self.thread.source_base = self.source_base
 
     def start(self):
         self.command = 'start'

@@ -308,20 +308,25 @@ class staticWidget(QWidget):
         self.frame_ids = []
         self.frames = OrderedDict()
         self.publication_store = PublicationStore()
-        # O4: both 1D and 2D caches are bounded with the same cap.
-        # Pre-O4 ``data_1d`` was an unbounded OrderedDict while
-        # ``data_2d`` was FixSizeOrderedDict(max=20), and the manual
-        # eviction loop keyed off ``len(data_2d) > 32`` could never
-        # fire because data_2d auto-capped at 20.  Net effect: data_1d
-        # grew without bound on long live runs (a frame's int_1d copy
-        # is small but ~10k frames still added up).  Same cap on both
-        # keeps the two snapshots roughly in sync — they're separate
-        # dicts (the snapshots they hold are different sizes, so a
-        # single shared store would lose typing precision), but
-        # FixSizeOrderedDict's farthest-from-new-key eviction policy
-        # converges on roughly the same active window.
-        self.data_1d = FixSizeOrderedDict(max=_FRAME_CACHE_MAX)
-        self.data_2d = FixSizeOrderedDict(max=20)
+        # Live-browse caches.  Both reset per scan (data_reset /
+        # scan_threads new-file clear), so neither accumulates across scans.
+        #
+        # 1D: UNBOUNDED (max=0).  A 1D snapshot (int_1d copy, include_2d=False)
+        # is tiny (~tens of KB), so keeping every frame of the current scan
+        # resident lets the user scroll back to ANY 1D frame DURING a live run
+        # straight from RAM — no disk read, so it never trips the
+        # writer-active freeze guard.  Even ~10k frames is only a few hundred
+        # MB, freed at scan end.
+        #
+        # 2D: bounded at 40.  Unlike 1D, each data_2d entry carries the full
+        # ``map_raw`` detector image (~18 MB) plus the cake, so the cap is a
+        # memory ceiling (~40 x 18 MB ≈ 0.7 GB), not a correctness limit.
+        # 40 covers the recent-frame 2D live-browse window for most scans;
+        # raising it is a straight RAM tradeoff.  Older-than-window 2D frames
+        # are available after the run (or while Paused), not mid-run (the
+        # writer-active freeze guard refuses to read the file being appended).
+        self.data_1d = FixSizeOrderedDict(max=0)
+        self.data_2d = FixSizeOrderedDict(max=40)
 
     def _init_ui(self):
         """Set up the main UI form and detector dialog."""
@@ -349,6 +354,8 @@ class staticWidget(QWidget):
                                                parent=self.ui.middleFrame,
                                                data_lock=self.data_lock,
                                                publication_store=self.publication_store)
+        # Back-ref so h5viewer.data_reset can re-arm display-side caches.
+        self.h5viewer.displayframe = self.displayframe
         self.ui.middleFrame.setLayout(self.displayframe.ui.layout)
 
         # IntegratorTree
@@ -357,10 +364,44 @@ class staticWidget(QWidget):
             self.frames, self.frame_ids, self.data_1d, self.data_2d,
             data_lock=self.data_lock,
             publication_store=self.publication_store)
+        # Default panel proportions: middle (image/plot) panels ~10% wider
+        # than Qt's hint-based split (Vivek).  Applied via singleShot AFTER
+        # the window has real geometry -- setSizes at __init__ ran before the
+        # main window's resize() and got redistributed away.
+        def _default_split():
+            try:
+                total = sum(self.ui.mainSplitter.sizes()) or 1000
+                self.ui.mainSplitter.setSizes(
+                    [int(total * f) for f in (0.19, 0.57, 0.24)])
+                self.ui.mainSplitter.setStretchFactor(1, 1)
+            except Exception:
+                logger.debug("mainSplitter default sizing failed",
+                             exc_info=True)
+        # Re-assert through every resize for the first 3s after launch, then
+        # never touch it again.  Timers lost to late window-manager resizes,
+        # and gating on splitterMoved was unreliable (Qt can emit it from its
+        # own redistribution during a native resize, which read as a user
+        # drag and disabled the hook).  Time-gating is dumb but bulletproof:
+        # no user drags the splitter within 3s of launch.
+        import time as _time
+        self._split_until = _time.monotonic() + 3.0
+        self._apply_default_split = _default_split
+        QtCore.QTimer.singleShot(0, _default_split)
+        QtCore.QTimer.singleShot(1000, _default_split)
+        QtCore.QTimer.singleShot(2500, _default_split)
         self.ui.integratorFrame.setLayout(self.integratorTree.ui.verticalLayout)
         if len(self.scan.frames.index) > 0:
             self.integratorTree.update()
         self.integratorTree.ui.raw_to_tif.hide()
+        # Restore the integration panel (units/pts/ranges/Auto flags/GI modes
+        # + Advanced params) from the previous session; saved in close().
+        try:
+            from xdart.utils.session import load_session
+            _integ = (load_session() or {}).get('integrator')
+            if _integ:
+                self.integratorTree.restore_session_state(_integ)
+        except Exception:
+            logger.debug("integrator session restore failed", exc_info=True)
 
         # Metadata
         self.metawidget = metadataWidget(self.scan, self.frame,
@@ -464,6 +505,11 @@ class staticWidget(QWidget):
         self.wrangler.sigUpdateGI.connect(self.update_scattering_geometry)
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
+        # Pause/Resume (Phase B): lift the freeze guard once paused (frozen at a
+        # frame boundary), re-engage it just before resuming.  No-op for
+        # wranglers that never emit these (nexus).
+        self.wrangler.sigPaused.connect(self._on_run_paused)
+        self.wrangler.sigResuming.connect(self._on_run_resuming)
         if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'processingModeCombo'):
             def _on_mode_changed(mode_text):
                 # Per-mode integration control enable/dim (C3/C4) — runs for
@@ -536,6 +582,8 @@ class staticWidget(QWidget):
                    self.wrangler.sigUpdateData,
                    self.wrangler.sigUpdateFile,
                    self.wrangler.finished,
+                   self.wrangler.sigPaused,
+                   self.wrangler.sigResuming,
                    self.h5viewer.sigNewFile]
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
             signals.append(self.wrangler.sigViewerModeChanged)
@@ -561,6 +609,19 @@ class staticWidget(QWidget):
         if not path:
             return
         path = os.path.abspath(os.path.expanduser(str(path)))
+        # If the processed-data dir doesn't exist yet (fresh project, no run
+        # has created it), browse the nearest existing ancestor -- typically
+        # the project folder -- instead of an empty nonexistent path.  Once
+        # the first run creates xdart_processed_data, the next save-path
+        # signal re-points the browser at it.
+        probe = path
+        while probe and not os.path.isdir(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        if probe and os.path.isdir(probe):
+            path = probe
         self.dirname = path
         self.h5viewer.dirname = path
         if refresh:
@@ -666,16 +727,11 @@ class staticWidget(QWidget):
                             publication_error_details(publication, "2d"),
                         )
                     # ── Bounded cache eviction ────────────────────────
-                    # O4: ``data_1d`` and ``data_2d`` are both bounded
-                    # FixSizeOrderedDicts now (see __init__), so their
-                    # own ``__setitem__`` already enforces the per-dict
-                    # cap.  The previous manual loop here keyed off
-                    # ``data_2d > _FRAME_CACHE_MAX=32`` was dead code:
-                    # FixSizeOrderedDict capped data_2d at 20 long
-                    # before that threshold, while data_1d (then
-                    # unbounded) silently grew without bound.  No
-                    # explicit eviction needed now; downstream cache
-                    # misses fall through to the file_thread lazy load.
+                    # ``data_2d`` is the heavy cache and is bounded by its
+                    # FixSizeOrderedDict cap (see __init__). ``data_1d`` is
+                    # intentionally kept available for plot history and
+                    # overlay/waterfall modes; the publication store handles
+                    # heavier per-frame payload eviction separately.
                     self.publication_store.upsert(publication)
             except Exception:
                 # Cache miss is non-fatal — displayframe will lazy-load
@@ -692,17 +748,15 @@ class staticWidget(QWidget):
             info = getattr(frame, "scan_info", None)
             if info:
                 import pandas as pd
-                from xdart.modules.ewald.scan import _numeric_scan_info
-                # Keep only numeric-coercible fields — a single non-numeric
-                # value (sample name, "24.4C" temperature, timestamp) would
-                # otherwise make pd.Series(..., dtype="float64") raise and
-                # silently skip the whole row, leaving scan_data empty and
-                # the metadata panel blank in non-batch.  Mirrors
-                # LiveScan.add_frame's _numeric_scan_info filter.
-                numeric_info = _numeric_scan_info(info)
-                if numeric_info:
+                from xdart.modules.ewald.scan import _coerce_scan_info
+                # Keep metadata heterogeneous (numeric coerced, non-numeric kept
+                # as strings) so non-numeric provenance survives to the writer.
+                # No forced float64 dtype -- pandas infers per column.  Mirrors
+                # LiveScan.add_frame (N2).
+                coerced_info = _coerce_scan_info(info)
+                if coerced_info:
                     try:
-                        ser = pd.Series(numeric_info, dtype="float64")
+                        ser = pd.Series(coerced_info)
                         with self.scan.scan_lock:
                             sd = self.scan.scan_data
                             if list(sd.columns):
@@ -717,7 +771,7 @@ class staticWidget(QWidget):
                                     sd.sort_index(inplace=True)
                             else:
                                 self.scan.scan_data = pd.DataFrame(
-                                    numeric_info, index=[idx], dtype="float64")
+                                    [coerced_info], index=[idx])
                     except (ValueError, TypeError):
                         logger.debug("scan_data update skipped for idx=%s", idx,
                                      exc_info=True)
@@ -842,9 +896,64 @@ class staticWidget(QWidget):
             self.metawidget.update()
             # self.integratorTree.update()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Keep the default 19/57/24 split through the launch-time window-
+        # manager resize storm (first 3s); afterwards the splitter is the
+        # user's.
+        import time as _time
+        if _time.monotonic() < getattr(self, '_split_until', 0):
+            apply = getattr(self, '_apply_default_split', None)
+            if callable(apply):
+                apply()
+
     def close(self):
         """Tries a graceful close.
         """
+        # Persist the integration panel settings (the wrangler tree saves
+        # continuously; the integrator panel saves here at exit).
+        try:
+            from xdart.utils.session import save_session
+            save_session({'integrator': self.integratorTree.session_state()})
+        except Exception:
+            logger.debug("integrator session save failed", exc_info=True)
+        # Pause/Resume (Phase B): a PAUSED run blocks the wrangler thread in its
+        # `while command == 'pause'` wait.  Closing the window must break that
+        # wait so run() returns and the QThread isn't "destroyed while running".
+        # Setting command='stop' (the universal run-end signal) exits the pause
+        # wait from any state; bound-wait the thread so teardown is clean.
+        try:
+            w = getattr(self, 'wrangler', None)
+            wt = getattr(w, 'thread', None) if w is not None else None
+            if wt is not None and wt.isRunning():
+                w.command = 'stop'
+                wt.command = 'stop'
+                # The run() finally performs the end-of-run session finish
+                # (writer join up to 60s) + final .nxs flush -- 5s routinely
+                # lost that race and Qt aborted on the still-running thread,
+                # killing the very flush that protects the data.  30s covers
+                # everything but a wedged NFS write.
+                if not wt.wait(30000):
+                    logger.warning("wrangler thread still finishing at "
+                                   "close after 30s; final flush may be "
+                                   "incomplete")
+        except Exception:
+            logger.debug("stopping wrangler thread on close failed", exc_info=True)
+        # Reintegration thread: request a between-batches stop and wait --
+        # close() never touched it, so a multi-minute reintegrate-all
+        # running at close was destroyed mid-loop (Qt6 qFatal) with its
+        # cached reduction session never finished.
+        try:
+            it = getattr(getattr(self, 'integratorTree', None),
+                         'integrator_thread', None)
+            if it is not None and it.isRunning():
+                it.stop_requested = True
+                if not it.wait(15000):
+                    logger.warning("integrator thread still running at "
+                                   "close after 15s")
+        except Exception:
+            logger.debug("stopping integrator thread on close failed",
+                         exc_info=True)
         # Stop the viewer's long-running background threads BEFORE teardown so
         # the persistent fileHandlerThread / async load worker aren't destroyed
         # while running ("QThread: Destroyed while thread is still running") on
@@ -969,6 +1078,12 @@ class staticWidget(QWidget):
             return
         self._run_active = True
         self.displayframe.set_processing_active(True)
+        # Same run-state, pushed to the h5viewer so the frame-selection disk-load
+        # guard (data_changed) and the reader-side hydration guard
+        # (_processing_active, just set above) share one source of truth and can't
+        # drift across live/batch/reintegrate (the GUI must not read the .nxs the
+        # writer is churning — that's the frame-click freeze).
+        self.h5viewer.set_run_writing(True)
         self._apply_integration_control_state()   # run_active=True → disable
         # The Advanced 1D/2D parameter dialogs also feed bai_*_args (their
         # sigUpdateArgs → get_args mutates scan.bai_1d/2d_args), so a dialog left
@@ -997,10 +1112,41 @@ class staticWidget(QWidget):
             return
         self._run_active = False
         self.displayframe.set_processing_active(False)
+        # File is idle again: clear the disk-load guard.  set_run_writing(False)
+        # also re-fires the standing frame selection so any frame skipped during
+        # the run (evicted + disk-load suppressed) loads now from the idle file.
+        self.h5viewer.set_run_writing(False)
         # Re-enable the tree (restores the auto-range field gating) then overlay
         # the mode-correct state (run_active is now False).
         self.enable_integration(True)
         self._apply_integration_control_state()
+
+    def _on_run_paused(self):
+        """Pause (Phase B): the run is FROZEN at a frame boundary (the worker has
+        drained the in-flight window + flushed the .nxs and emitted sigPaused).
+        LIFT the disk-read freeze guard so the user can browse ANY frame from
+        disk while paused -- but the run is still active, so keep ``_run_active``
+        True and leave the parameter/integration controls hard-disabled (#72).
+
+        Safe ordering: this runs only AFTER the worker is provably idle (sigPaused
+        is emitted post-drain/flush), so a disk read here can't race a write.
+        ``set_run_writing(False)`` also re-fires the standing frame selection, so
+        a frame skipped during the run now loads from the quiesced file."""
+        if not self._run_active:
+            return                       # not in a run; nothing to lift
+        self.displayframe.set_processing_active(False)
+        self.h5viewer.set_run_writing(False)
+
+    def _on_run_resuming(self):
+        """Resume (Phase B): RE-ENGAGE the freeze guard BEFORE the worker flips
+        the command back to the run state, so a browse read can't overlap the
+        restarted writer.  ``set_run_writing(True)`` also cancels any in-flight
+        browse load on its rising edge.  Runs synchronously (same GUI thread)
+        from the wrangler's sigResuming, ahead of the command flip."""
+        if not self._run_active:
+            return
+        self.h5viewer.set_run_writing(True)
+        self.displayframe.set_processing_active(True)
 
     def update_all(self, idx=None):
         """Updates all data in displays.
@@ -1087,8 +1233,16 @@ class staticWidget(QWidget):
         # land correctly; this assignment just unblocks the
         # synchronous render path immediately.
         self.scan.name = name
+        # G1/T0-1: a new run is a new data identity — drop the wavelength
+        # restored from whatever file was open before, synchronously (the
+        # async file-thread set_datafile also clears, but frames can render
+        # in the window before it lands).  getattr: tests drive this slot
+        # with duck-typed scan stubs.
+        _clear_wl = getattr(self.scan, '_clear_persisted_wavelength', None)
+        if callable(_clear_wl):
+            _clear_wl()
         self._sync_h5viewer_save_dir(os.path.dirname(fname), refresh=False)
-        self.h5viewer.set_file(fname)
+        self.h5viewer.set_file(fname, internal=True)   # run's own wiring
         self.scan.gi = gi
         self.scan.incidence_motor = incidence_motor
         self.scan.single_img = single_img
@@ -1102,6 +1256,13 @@ class staticWidget(QWidget):
                                 'mask', None)
         if wrangler_mask is not None:
             self.scan.global_mask = wrangler_mask
+        # Also carry the run's intensity-threshold settings so the raw-image
+        # preview can show the image AS INTEGRATED (mask + threshold).
+        for _attr in ('apply_threshold', 'threshold_min', 'threshold_max'):
+            try:
+                setattr(self.scan, _attr, getattr(self.wrangler, _attr))
+            except Exception:
+                pass
 
         self.integratorTree.get_args('bai_1d')
         self.integratorTree.get_args('bai_2d')
@@ -1151,6 +1312,31 @@ class staticWidget(QWidget):
                     self.scan.scan_data = pd.DataFrame()
             except AttributeError:
                 pass
+            # Multi-scan live runs: data_1d NEVER evicts (max=0), so without
+            # a per-swap purge every prior scan's 1D entries accumulate for
+            # the whole run (multi-GB at the 10k-frame target) -- the
+            # FixSizeOrderedDict-eviction rationale in the no-clear comment
+            # above only holds for data_2d.  Keep ONLY the currently
+            # rendered frame(s) so the previous image still lingers until
+            # this scan's first frame lands (the documented no-blank UX).
+            keep = set()
+            try:
+                df = self.displayframe
+                for lst in (df.idxs, df.idxs_1d, df.idxs_2d):
+                    keep.update(int(i) for i in (lst or ()))
+            except Exception:
+                pass
+            try:
+                with self.data_lock:
+                    for cache in (self.data_1d, self.data_2d):
+                        for k in [k for k in list(cache.keys())
+                                  if int(k) not in keep]:
+                            cache.pop(k, None)
+                # Frame indices restart per scan: re-arm the raw self-heal
+                # negative cache alongside the purge.
+                self.displayframe._raw_resolve_failed = set()
+            except Exception:
+                logger.debug("live-swap cache purge skipped", exc_info=True)
 
         self.displayframe.set_axes()
         # self.displayframe.auto_last = True
@@ -1372,11 +1558,10 @@ class staticWidget(QWidget):
                     mode_text = self.wrangler.ui.processingModeCombo.currentText()
                 except Exception:
                     mode_text = ''
-                viewer_processing = (
-                    mode_text in ('Image Viewer', 'XYE Viewer')
-                    if mode_text else is_file_viewer
-                )
-                tree.setEnabled(not viewer_processing)
+                # Tree stays enabled in viewers: processing groups are
+                # disabled per-group by the wrangler, while Project Folder /
+                # Save Path remain usable (they drive the file browser).
+                tree.setEnabled(True)
             # Per-mode integration control enable/dim (C3/C4): disable the 1-D/2-D
             # integration panels in viewers, keep Calibrate / Make Mask enabled.
             self._apply_integration_control_state()
@@ -1419,6 +1604,8 @@ class staticWidget(QWidget):
                 self.h5viewer.enter_viewer_mode_cleanup()
             else:
                 self.h5viewer.cancel_pending_loads()
+                if hasattr(self, 'scan') and hasattr(self.scan, 'global_mask'):
+                    self.scan.global_mask = None
                 self.displayframe.clear_display_state()
             # Refresh scan list to show/hide appropriate file types
             self.h5viewer.update_scans()

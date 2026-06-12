@@ -19,6 +19,7 @@ import numpy as np
 from pathlib import Path
 
 from .display_logic import RawSource, choose_raw_source, sentinel_mask
+from xdart.modules.wavelength import normalize_wavelength_m, wavelength_angstrom_to_m
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,21 @@ def _norm_alias_key(name):
 
 def _norm_display_label(alias):
     return 'Monitor' if alias == 'Monitor' else alias
+
+
+def _axes_close(a, b, *, rtol=1e-5, atol=1e-8):
+    """Whether two 2D-cake axis arrays describe the SAME grid.
+
+    The cross-frame cake reducer sums element-wise, so frames must share one
+    q/chi grid.  Comparison is by value (same tolerance the stacked writer's
+    uniform-axes check uses), not just shape — two different-integration-param
+    cakes can share a shape while describing different grids.
+    """
+    if a is None or b is None:
+        return a is None and b is None
+    a = np.asarray(a)
+    b = np.asarray(b)
+    return a.shape == b.shape and np.allclose(a, b, rtol=rtol, atol=atol)
 
 
 def available_norm_channels(scan_data_keys):
@@ -124,6 +140,45 @@ class DisplayDataMixin:
                 for idx in idxs
             }
 
+    def _hydrate_frame_from_disk(self, idx):
+        """Lazy-load a frame from the scan for a ``data_2d`` cache miss.
+
+        ``data_2d`` is a bounded window (``FixSizeOrderedDict(max=20)``), so a
+        cross-frame 2D selection larger than the window would otherwise drop the
+        evicted frames silently.  This pulls the missing frame from the in-memory
+        series (``scan.frames`` — itself a 64-deep cache that lazy-reloads from
+        the ``.nxs``), giving its ``int_2d`` (cake, read from the stacked
+        ``integrated_2d``) and ``thumbnail``.  ``map_raw`` is NOT in the ``.nxs``;
+        callers that need it call ``_lazy_load_raw`` on the returned frame.
+        Returns the ``LiveFrame`` or ``None`` (never raises — a missing/corrupt
+        frame is just excluded from the selection).
+        """
+        scan = getattr(self, 'scan', None)
+        frames = getattr(scan, 'frames', None)
+        if frames is None:
+            return None
+        # While a run is active the wrangler is writing the .nxs.  Opening it
+        # here (frames[idx] -> LiveFrameSeries.__getitem__ -> catch_h5py_file,
+        # which retries the h5py open 100x x 50ms under the writer's file_lock)
+        # would block the GUI thread for ~5s per evicted frame -> multi-minute
+        # freeze over a long scan.  Serve a cache miss from the writer's
+        # already-resident in-memory frames only -- a lock-free single-key dict
+        # read (atomic under the GIL; never marks _persisted, so persist-before-
+        # evict is untouched) -- and skip anything not resident until the run
+        # goes idle.  The full disk hydration below runs only when idle (post-run
+        # reload / whole-scan Set-Bkg on a finished file), where the writer is
+        # not contending and catch_h5py_file opens cleanly.
+        if getattr(self, '_processing_active', False):
+            in_mem = getattr(frames, '_in_memory', None)
+            return in_mem.get(int(idx)) if isinstance(in_mem, dict) else None
+        try:
+            if int(idx) not in frames.index:
+                return None
+            return frames[int(idx)]
+        except (KeyError, RuntimeError, OSError, ValueError, TypeError):
+            logger.debug("hydrate frame %s from disk failed", idx, exc_info=True)
+            return None
+
     # ── Raw 2D data access ────────────────────────────────────────
 
     def get_frames_map_raw(self, idxs=None, *, prefer_thumbnail=False,
@@ -155,10 +210,78 @@ class DisplayDataMixin:
             frame_1d, frame_2d = snapshot.get(int(idx), (None, {}))
             raw = frame_2d.get('map_raw')
             bg = frame_2d.get('bg_raw', 0)
+            if bg is None:                  # LRU eviction nulls bg_raw
+                bg = 0
             # Try thumbnail from data_2d, then fall back to data_1d
             thumb = frame_2d.get('thumbnail')
             if thumb is None and frame_1d is not None:
                 thumb = getattr(frame_1d, 'thumbnail', None)
+            # Hydrate from disk when full-res raw is missing.  Two cases:
+            # (a) total cache miss (no thumbnail either) -- the original
+            #     Set-Bkg-over-the-whole-scan path; any selection size.
+            # (b) thumbnail present but raw missing, SINGLE-frame selection
+            #     without an explicit thumbnail preference: the load worker
+            #     publishes the thumbnail preview first and a raw
+            #     replace-chunk second -- if that second chunk failed
+            #     (source unresolvable on this machine) or was dropped
+            #     (generation gate), the panel previously stranded on the
+            #     thumbnail forever.  Multi-frame averages keep thumbnails
+            #     (no N x 18 MB loads); a per-index negative cache (cleared
+            #     with the display caches) keeps unresolvable sources from
+            #     re-attempting a file open on every render.
+            _hydrate = getattr(self, '_hydrate_frame_from_disk', None)
+            _failed = getattr(self, '_raw_resolve_failed', None)
+            _want_hydrate = (
+                raw is None
+                and _hydrate is not None
+                and not (_failed and int(idx) in _failed)
+                and (thumb is None
+                     or (not prefer_thumbnail and len(idxs) == 1))
+            )
+            if _want_hydrate:
+                lf = _hydrate(int(idx))
+                if lf is not None:
+                    if getattr(lf, 'map_raw', None) is None:
+                        try:
+                            lf._lazy_load_raw()
+                        except Exception:
+                            logger.debug("lazy raw reload failed for %s", idx,
+                                         exc_info=True)
+                    raw = getattr(lf, 'map_raw', None)
+                    # free_raw() nulls bg_raw and _lazy_load_raw restores
+                    # only map_raw -- the attribute EXISTS with value None,
+                    # so the getattr default never applies; raw - None
+                    # raised TypeError on the GUI thread (delta review).
+                    bg = getattr(lf, 'bg_raw', 0)
+                    if bg is None:
+                        bg = 0
+                    if thumb is None:
+                        thumb = getattr(lf, 'thumbnail', None)
+                    if frame_1d is None:
+                        frame_1d = lf
+                    # Don't leave the lazily-loaded ~18 MB raw pinned on the
+                    # shared in-memory frame (it would re-inflate the 64-deep
+                    # cache and defeat the wrangler's free_raw discipline).  The
+                    # local ``raw`` ref keeps it alive for the accumulate below;
+                    # free_raw is a no-op when the source isn't reloadable.
+                    lf.free_raw()
+                if raw is None:
+                    # Mark only GENUINE resolve failures.  During a run the
+                    # hydrate helper serves in-memory frames only (a miss is
+                    # transient), and an idx not yet in the scan index is a
+                    # load race -- marking those suppressed the post-run
+                    # self-heal permanently (delta review).
+                    transient = getattr(self, '_processing_active', False)
+                    if not transient:
+                        try:
+                            transient = int(idx) not in getattr(
+                                self.scan.frames, 'index', ())
+                        except Exception:
+                            transient = True
+                    if not transient:
+                        if _failed is None:
+                            _failed = self._raw_resolve_failed = set()
+                        _failed.add(int(idx))
             # Stage 1: the raw-vs-thumbnail-vs-none decision is the pure
             # ``choose_raw_source`` (unit-tested headlessly).  want_raw is
             # always True here — this path never refuses full raw data.
@@ -196,7 +319,7 @@ class DisplayDataMixin:
                         thumb_data, scan_info)
                     ctr += 1
                     sources.add('thumbnail')
-            except ValueError as e:
+            except (ValueError, TypeError) as e:
                 logger.debug(
                     "get_frames_map_raw skipped frame %s due to shape "
                     "mismatch: %s", idx, e,
@@ -257,23 +380,53 @@ class DisplayDataMixin:
 
         intensity = None
         xdata = ydata = None
+        ref_radial = ref_azimuthal = None
         ctr = 0
         for idx in idxs:
             frame_1d, frame_2d = snapshot.get(int(idx), (None, None))
             if frame_2d is None or frame_2d.get('int_2d') is None:
-                continue
+                # data_2d cache miss (frame outside the bounded 20-deep window):
+                # hydrate the cake from the on-disk integrated_2d stack so a
+                # selection larger than the cache averages ALL selected frames,
+                # not just the cached subset (the silent-partial bug).
+                lf = self._hydrate_frame_from_disk(int(idx))
+                if lf is None or getattr(lf, 'int_2d', None) is None:
+                    continue
+                frame_1d = lf
+                frame_2d = {
+                    'int_2d': lf.int_2d,
+                    'gi_2d': getattr(lf, 'gi_2d', {}) or {},
+                }
+            ir2d = frame_2d['int_2d']
             _gi2d = frame_2d.get('gi_2d', {})
             try:
-                _i = self.get_int_2d(frame_2d['int_2d'], frame_1d, gi_2d=_gi2d)
+                _i = self.get_int_2d(ir2d, frame_1d, gi_2d=_gi2d)
             except (ValueError, AttributeError, TypeError):
                 continue
             if _i.ndim != 2:
                 continue
+            radial = np.asarray(getattr(ir2d, 'radial', None), dtype=float)
+            azimuthal = np.asarray(getattr(ir2d, 'azimuthal', None), dtype=float)
             if intensity is None:
                 intensity = np.asarray(_i, dtype=float)
-                xdata, ydata = self.get_xydata(
-                    frame_2d['int_2d'], gi_2d=_gi2d, frame=frame_1d)
+                ref_radial, ref_azimuthal = radial, azimuthal
+                try:
+                    xdata, ydata = self.get_xydata(ir2d, gi_2d=_gi2d, frame=frame_1d)
+                except (ValueError, AttributeError, TypeError):
+                    xdata, ydata = radial, azimuthal
             else:
+                # Axis-identity guard: the reducer sums element-wise, so every
+                # frame must share ONE q/chi grid.  Compare the cake's own
+                # radial/azimuthal (not the display-converted axes).  The writer
+                # enforces within-scan uniform 2D axes; this makes that explicit
+                # and future-proofs cross-source sums (stitch/RSM) — a frame on
+                # a different grid is excluded, never silently misaligned.
+                if not (_axes_close(radial, ref_radial)
+                        and _axes_close(azimuthal, ref_azimuthal)):
+                    logger.warning(
+                        "get_frames_int_2d: frame %s cake grid differs from the "
+                        "selection grid; excluded from the average.", idx)
+                    continue
                 try:
                     intensity = intensity + _i
                 except (ValueError, AttributeError, TypeError):
@@ -313,7 +466,13 @@ class DisplayDataMixin:
             else:
                 norm_fac = len(self.scan.frames.index)
                 if self.normChannel:
-                    norm = self.scan.scan_data[self.normChannel].sum()
+                    # scan_data may now carry non-numeric columns (N2); a
+                    # non-numeric norm channel degrades to no normalization
+                    # rather than crashing on a string ``.sum()``.
+                    try:
+                        norm = float(self.scan.scan_data[self.normChannel].sum())
+                    except (TypeError, ValueError):
+                        norm = 0.0
                     if norm > 0:
                         norm_fac = norm
                 intensity /= norm_fac
@@ -335,9 +494,21 @@ class DisplayDataMixin:
         ys: list = []
         for idx in idxs:
             frame_1d = self.data_1d.get(int(idx), None)
-            if frame_1d is None:
-                continue
             frame_2d = self.data_2d.get(int(idx), None)
+            if frame_1d is None:
+                # data_1d cache miss (selection larger than the bounded window):
+                # hydrate from disk so a 1D sum/average / Set-Bkg over the whole
+                # scan covers ALL selected frames — matching the 2D/raw path, so
+                # one Set-Bkg op's 1D and 2D backgrounds represent the same set.
+                lf = self._hydrate_frame_from_disk(int(idx))
+                if lf is None or getattr(lf, 'int_1d', None) is None:
+                    continue
+                frame_1d = lf
+                if frame_2d is None:
+                    frame_2d = {
+                        'int_2d': getattr(lf, 'int_2d', None),
+                        'gi_2d': getattr(lf, 'gi_2d', {}) or {},
+                    }
             x, y = self.get_int_1d(frame_1d, frame_2d, idx)
             if x is None or y is None:
                 continue
@@ -541,8 +712,8 @@ class DisplayDataMixin:
 
         Tries several sources in order:
         1. ``frame.integrator.wavelength`` (available during live processing)
-        2. ``self.scan.mg_args['wavelength']`` (persisted in NXS)
-        3. The calibration group in the HDF5 file
+        2. ``self.scan.mg_args['wavelength']`` when it is a real value
+        3. ``/entry/instrument/source/wavelength_A`` in the HDF5 file
 
         Returns None if the wavelength cannot be determined.
         """
@@ -550,23 +721,47 @@ class DisplayDataMixin:
         if frame is not None:
             ai = getattr(frame, 'integrator', None)
             wl = getattr(ai, 'wavelength', None) if ai else None
-            if wl and wl > 0:
+            wl = normalize_wavelength_m(wl, allow_default_sentinel=True)
+            if wl is not None:
+                return wl
+            poni = getattr(frame, 'poni', None)
+            wl = normalize_wavelength_m(
+                getattr(poni, 'wavelength', None),
+                allow_default_sentinel=True,
+            )
+            if wl is not None:
                 return wl
 
-        # 2. From scan.mg_args (loaded when NXS is opened)
-        wl = self.scan.mg_args.get('wavelength', None) if hasattr(self.scan, 'mg_args') else None
-        if wl and wl > 0:
+        # 2. From scan.mg_args (loaded when NXS is opened). Reject the
+        # historical 1e-10 m constructor sentinel rather than using it for
+        # Q↔2θ conversion.
+        scan = getattr(self, 'scan', None)
+        persisted_wl = normalize_wavelength_m(
+            getattr(scan, '_persisted_wavelength_m', None),
+            allow_default_sentinel=True,
+        )
+        if persisted_wl is not None:
+            return persisted_wl
+        mg_args = getattr(scan, 'mg_args', None)
+        wl = mg_args.get('wavelength', None) if isinstance(mg_args, dict) else None
+        wl = normalize_wavelength_m(wl)
+        if wl is not None:
             return wl
 
-        # 3. Read from the HDF5 calibration group
+        # 3. Read the writer's actual v2 NeXus wavelength stamp.
+        data_file = getattr(scan, 'data_file', None)
+        if not data_file:
+            return None
         try:
             import h5py
-            with h5py.File(self.scan.data_file, 'r') as f:
-                wl = float(f['entry/calibration/wavelength'][()]) # type: ignore
-                if wl > 0:
+            with h5py.File(data_file, 'r') as f:
+                wl = wavelength_angstrom_to_m(
+                    f['entry/instrument/source/wavelength_A'][()] # type: ignore
+                )
+                if wl is not None:
                     return wl
         except Exception:
-            logger.debug("Failed to read wavelength from HDF5 calibration group in %s", self.scan.data_file, exc_info=True)
+            logger.debug("Failed to read wavelength from HDF5 instrument/source group in %s", data_file, exc_info=True)
 
         return None
 
@@ -661,6 +856,13 @@ class DisplayDataMixin:
                     selected_index = row
             combo.setCurrentIndex(selected_index)
             self._norm_channel_signature = signature
+            # The content-fit width was computed at init from the .ui
+            # placeholder; refit for the real counter names so longer ones
+            # aren't clipped in the closed combo.
+            try:
+                self._fit_combo_width(combo, max_w=170)
+            except Exception:
+                pass
         finally:
             if was_blocked is not None:
                 try:
@@ -791,8 +993,9 @@ class DisplayDataMixin:
         if self.viewer_mode == 'image' and len(self.idxs_2d) > 0:
             try:
                 import fabio
-                raw = np.asarray(
-                    self.data_2d[self.idxs_2d[0]]['map_raw'], dtype=np.float32)
+                with self.data_lock:
+                    _d2 = self.data_2d.get(self.idxs_2d[0]) or {}
+                raw = np.asarray(_d2.get('map_raw'), dtype=np.float32)
                 tif_path = os.path.join(directory, f'{base_name}_npy.tif')
                 fabio.tifimage.TifImage(data=raw).write(tif_path)
                 logger.info("Saved pyFAI-compatible TIFF: %s", tif_path)

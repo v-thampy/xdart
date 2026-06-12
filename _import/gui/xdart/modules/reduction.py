@@ -9,7 +9,6 @@ headless reduction work should cross into ``ssrl_xrd_tools`` as ``Frame`` /
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Any
@@ -27,9 +26,11 @@ from ssrl_xrd_tools.reduction import (
     Integration2DPlan,
     MaskSpec,
     ReductionPlan,
+    ReductionSession,
     Scan,
     run_reduction,
 )
+from xdart.modules.wavelength import wavelength_m_to_angstrom
 
 # S4: GI-only scan kwargs that must NOT flow through to the standard
 # pyFAI integrator path.  Derived from :class:`GIMode` (so adding a GIMode
@@ -104,12 +105,14 @@ def scan_from_live_scan(
         frames.append(frame)
     first_frame = live_scan.frames[int(indices[0])] if indices else None
     poni = getattr(first_frame, "poni", None) if first_frame is not None else None
-    wavelength_A = None
-    try:
-        wavelength_m = float((getattr(live_scan, "mg_args", {}) or {}).get("wavelength", 0))
-        wavelength_A = wavelength_m * 1e10 if wavelength_m > 0 else None
-    except (TypeError, ValueError):
-        wavelength_A = None
+    wavelength_A = wavelength_m_to_angstrom(
+        getattr(live_scan, "_persisted_wavelength_m", None),
+        allow_default_sentinel=True,
+    )
+    if wavelength_A is None:
+        wavelength_A = wavelength_m_to_angstrom(
+            (getattr(live_scan, "mg_args", {}) or {}).get("wavelength", None)
+        )
 
     motors = {}
     if scan_data is not None:
@@ -164,7 +167,11 @@ def plan_from_live_scan(
     monitor_key_2d = _pop_first(args_2d, ("monitor",), None)
     chi_offset_1d = _pop_first(args_1d, ("chi_offset",), 0.0)
     chi_offset_2d = _pop_first(args_2d, ("chi_offset",), 0.0)
-    if chi_offset_1d:
+    if chi_offset_1d and not bool(getattr(live_scan, "gi", False)):
+        # Transmission-only: the chi offset rotates the standard cake's chi
+        # origin, so the 1D chi-slice is pre-shifted to match.  In GI the
+        # slice goes to FiberIntegrator's own polar convention unshifted --
+        # shifting it displaced the window out of the wedge (zero counts).
         azimuth_range_1d = _offset_range(azimuth_range_1d, float(chi_offset_1d))
     error_model = _pop_first(args_1d, ("error_model",), None)
     error_model_2d = _pop_first(args_2d, ("error_model",), None)
@@ -174,6 +181,11 @@ def plan_from_live_scan(
     _pop_first(args_2d, ("normalization_factor",), None)
 
     is_gi = bool(getattr(live_scan, "gi", False))
+    gi_mode_1d = _pop_first(args_1d, ("gi_mode_1d",), "q_total")
+    gi_mode_2d = _pop_first(args_2d, ("gi_mode_2d",), "qip_qoop")
+    npt_oop = _pop_first(args_1d, ("npt_oop",), None)
+    if npt_oop is None:
+        npt_oop = _pop_first(args_2d, ("npt_oop",), None)
     gi_method = _pop_first(args_1d, ("gi_method_1d",), None)
     if gi_method is None:
         gi_method = _pop_first(args_2d, ("gi_method_2d",), "no")
@@ -183,9 +195,16 @@ def plan_from_live_scan(
         _strip_nonstandard_args(args_2d)
     if is_gi and gi_incident_angle is None:
         gi_incident_angle = getattr(live_scan, "_cached_fiber_integrator_angle", None)
-    if is_gi and gi_incident_angle is None:
+    incidence_motor = getattr(live_scan, "incidence_motor", None)
+    if is_gi and gi_incident_angle is None and incidence_motor is not None:
+        try:
+            gi_incident_angle = float(incidence_motor)
+            incidence_motor = None
+        except (TypeError, ValueError):
+            pass
+    if is_gi and gi_incident_angle is None and not incidence_motor:
         raise ValueError(
-            "Cannot build a GI ReductionPlan without gi_incident_angle."
+            "Cannot build a GI ReductionPlan without gi_incident_angle or incidence_motor."
         )
 
     mask_shape = None
@@ -198,19 +217,25 @@ def plan_from_live_scan(
 
     gi_mode = (
         GIMode(
-            incident_angle=float(gi_incident_angle),
+            incident_angle=(float(gi_incident_angle) if gi_incident_angle is not None else None),
+            incidence_motor=str(incidence_motor) if incidence_motor else None,
             tilt_angle=float(getattr(live_scan, "tilt_angle", 0.0) or 0.0),
             sample_orientation=int(getattr(live_scan, "sample_orientation", 1) or 1),
             method=str(gi_method),
+            mode_1d=str(gi_mode_1d),
+            mode_2d=str(gi_mode_2d),
+            npt_oop=(int(npt_oop) if npt_oop is not None else None),
         )
         if is_gi else None
     )
+    unit_1d = _gi_1d_unit_default(unit_1d, str(gi_mode_1d), is_gi=is_gi)
+    unit_2d = _gi_2d_unit_default(unit_2d, str(gi_mode_2d), is_gi=is_gi)
 
     return ReductionPlan(
         integration_1d=(
             Integration1DPlan(
                 npt=npt_1d,
-                unit=str(unit_1d or "q_A^-1"),
+                unit=unit_1d,
                 method=method_1d,
                 radial_range=radial_range,
                 azimuth_range=azimuth_range_1d,
@@ -225,7 +250,7 @@ def plan_from_live_scan(
             Integration2DPlan(
                 npt_rad=npt_rad_2d,
                 npt_azim=npt_azim_2d,
-                unit=str(unit_2d or "q_A^-1"),
+                unit=unit_2d,
                 method=method_2d,
                 radial_range=radial_range_2d,
                 azimuth_range=azimuth_range_2d,
@@ -256,8 +281,6 @@ def reduce_live_frame(
     ``int_1d`` / ``int_2d`` so existing xdart display and writer code can
     continue to operate while the computation crosses the new Scan/Frame API.
     """
-    if getattr(live_frame, "gi", False):
-        raise ValueError("reduce_live_frame currently handles non-GI frames only.")
     frame = frame_from_live_frame(live_frame)
     plan = _plan_with_mask_for_live_frame(plan, global_mask, live_frame)
     scan = Scan(
@@ -272,6 +295,238 @@ def reduce_live_frame(
     live_frame.int_2d = reduction.result_2d
     live_frame.map_norm = _frame_norm(frame, plan)
     return live_frame
+
+
+def reduce_live_frames(
+    live_frames: Iterable[Any],
+    plan: ReductionPlan,
+    *,
+    scan_name: str = "scan",
+    global_mask: Any = None,
+    integrator: Any = None,
+    poni: Any = None,
+    executor: Any = None,
+    session: ReductionSession | None = None,
+    cancel_token: Any = None,
+    chunk_size: int | None = None,
+    gi_freeze_mode: str | None = None,
+) -> list[Any]:
+    """Reduce a batch of ``LiveFrame`` objects through one headless run."""
+
+    frames = list(live_frames)
+    if not frames:
+        return []
+    headless_frames = [frame_from_live_frame(frame) for frame in frames]
+    if session is None:
+        # Only the one-shot path needs its own Scan + masked plan; a supplied
+        # session already owns both (it was opened from the first chunk), so
+        # building them here would be throwaway work.
+        plan = _plan_with_mask_for_live_frame(plan, global_mask, frames[0])
+        scan = Scan(
+            name=scan_name,
+            frames=headless_frames,
+            poni=poni if poni is not None else getattr(frames[0], "poni", None),
+            integrator=integrator if integrator is not None else getattr(frames[0], "integrator", None),
+        )
+        result = run_reduction(
+            plan,
+            scan,
+            executor=executor,
+            cancel_token=cancel_token,
+            chunk_size=chunk_size or (len(frames) if executor is not None else 1),
+            gi_freeze_mode=gi_freeze_mode,
+        )
+        result_frames = result.frames
+        active_plan = plan
+    else:
+        session.process(headless_frames)
+        result_frames = session.frames
+        active_plan = session.plan
+    by_index = {int(frame.idx): frame for frame in frames}
+    reduced_frames = []
+    for headless_frame in headless_frames:
+        live_frame = by_index[int(headless_frame.index)]
+        reduction = result_frames.get(int(headless_frame.index))
+        if reduction is None:
+            continue
+        live_frame.int_1d = reduction.result_1d
+        live_frame.int_2d = reduction.result_2d
+        live_frame.map_norm = _frame_norm(headless_frame, active_plan)
+        reduced_frames.append(live_frame)
+    if session is not None:
+        # S2 (serial flavor): a PERSISTENT session reused across a long
+        # true-live watch run retains every harvested FrameReduction (full 2D
+        # arrays) in session.frames — release the ones this call just copied
+        # onto the LiveFrames so the session stays O(chunk), not O(scan).
+        # getattr: older ssrl builds lack release_products (capability probe
+        # covers the floor; harmless to skip there).
+        release = getattr(session, "release_products", None)
+        if callable(release):
+            release(int(f.index) for f in headless_frames)
+    # Same PERF-3 reasoning for the SINK-LESS paths (true-live serial,
+    # reintegration, GI scouts): the session's registered Frames pin the raw
+    # arrays; results are already copied onto the LiveFrames above, so drop
+    # the session-side references now.
+    for headless_frame in headless_frames:
+        headless_frame.image = None
+        headless_frame.background = None   # full bg images pin like raws
+    return reduced_frames
+
+
+def open_live_reduction_session(
+    live_frames: Iterable[Any],
+    plan: ReductionPlan,
+    *,
+    scan_name: str = "scan",
+    global_mask: Any = None,
+    integrator: Any = None,
+    poni: Any = None,
+    executor: Any = None,
+    cancel_token: Any = None,
+    chunk_size: int | None = None,
+    gi_freeze_mode: str | None = None,
+    sink: Any = None,
+    execution: str = "chunked",
+    inflight_max: int | None = None,
+) -> ReductionSession:
+    """Open a persistent headless reducer for xdart live-frame chunks.
+
+    The returned session owns the worker pool and per-thread pyFAI
+    integrators.  Callers feed subsequent chunks with
+    :func:`reduce_live_frames(..., session=session)` (chunked) or
+    ``session.submit(frame)`` (``execution="streaming"``) and close it at the
+    end of the scan/run.  Pass a ``sink`` (e.g. xdart's ``QtNexusSink``) to have
+    the session drive the write itself instead of copying results back.
+    """
+
+    frames = list(live_frames)
+    if not frames:
+        raise ValueError("cannot open a reduction session without frames")
+    plan = _plan_with_mask_for_live_frame(plan, global_mask, frames[0])
+    headless_frames = [frame_from_live_frame(frame) for frame in frames]
+    scan = Scan(
+        name=scan_name,
+        frames=headless_frames,
+        poni=poni if poni is not None else getattr(frames[0], "poni", None),
+        integrator=integrator if integrator is not None else getattr(frames[0], "integrator", None),
+    )
+    return ReductionSession(
+        plan,
+        scan,
+        sink=sink,
+        executor=executor,
+        cancel_token=cancel_token,
+        chunk_size=chunk_size or (len(frames) if executor is not None else 1),
+        gi_freeze_mode=gi_freeze_mode,
+        execution=execution,
+        inflight_max=inflight_max,
+        # S2: streaming sink-driven sessions (the GUI batch/live path) consume
+        # results through the sink (QtNexusSink hydrates LiveFrames + writes
+        # the .nxs per frame) and never read result.frames — retaining every
+        # FrameReduction (full 2D arrays) for the session's life was ~14 GB
+        # on a 10k-frame 2D batch.  Chunked sessions KEEP retention: their
+        # callers read results back via reduce_live_frames(session=...) →
+        # session.frames (serial live, reintegration, GI scouts).
+        retain_products=not (execution == "streaming" and sink is not None),
+        # PERF-3 completion (pre-ship sweep): _register_process_frames keeps
+        # every submitted Frame on session.scan for the session's life, and
+        # Frame.image references the SAME array as LiveFrame.map_raw -- so
+        # freeing the LiveFrame side (free_raw) never released the raw
+        # (~18 MB/frame Eiger) while the session-side reference lived on.
+        # The writer loop nulls frame.image post-write with this flag; any
+        # later consumer reloads from the source path via Frame.load_image.
+        clear_frame_images=True,
+    )
+
+
+def freeze_live_scan_gi_ranges(
+    live_scan: Any,
+    live_frames: Iterable[Any],
+    *,
+    scan_name: str = "scan",
+    global_mask: Any = None,
+    integrator: Any = None,
+    poni: Any = None,
+    integrate_1d: bool = True,
+    integrate_2d: bool = True,
+    gi_freeze_mode: str = "scout_union",
+) -> ReductionPlan:
+    """Freeze missing GI output ranges through the headless reducer.
+
+    This is the xdart boundary adapter for the old GI scout step.  The actual
+    scout integrations and common-grid calculation live in
+    :class:`ssrl_xrd_tools.reduction.ReductionSession`; xdart only mirrors the
+    frozen plan ranges back into ``bai_1d_args`` / ``bai_2d_args`` so the
+    existing writer and display state stay coherent.
+    """
+
+    frames = list(live_frames)
+    if not frames:
+        return plan_from_live_scan(
+            live_scan,
+            integrate_1d=integrate_1d,
+            integrate_2d=integrate_2d,
+        )
+    plan = plan_from_live_scan(
+        live_scan,
+        integrate_1d=integrate_1d,
+        integrate_2d=integrate_2d,
+    )
+    session = open_live_reduction_session(
+        frames,
+        plan,
+        scan_name=scan_name,
+        global_mask=global_mask,
+        integrator=integrator,
+        poni=poni,
+        executor=None,
+        chunk_size=len(frames),
+        gi_freeze_mode=gi_freeze_mode,
+    )
+    try:
+        frozen = session.plan
+    finally:
+        # Freeze-only session (no write sink) — close for cleanup; a GI scout
+        # failure already surfaces as GIFreezeError, so don't fail-loud here.
+        session.finish(raise_on_failure=False)
+    _copy_frozen_gi_ranges_to_live_scan(live_scan, frozen)
+    return frozen
+
+
+def _copy_frozen_gi_ranges_to_live_scan(
+    live_scan: Any,
+    plan: ReductionPlan,
+) -> None:
+    if plan.gi is None:
+        return
+    if plan.integration_1d is not None:
+        args_1d = getattr(live_scan, "bai_1d_args", None)
+        if isinstance(args_1d, dict):
+            from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
+
+            key = gi_1d_output_axis_key(plan.gi.mode_1d.value)
+            value = getattr(plan.integration_1d, key, None)
+            if value is not None and args_1d.get(key) is None:
+                args_1d[key] = tuple(map(float, value))
+
+    if plan.integration_2d is not None:
+        args_2d = getattr(live_scan, "bai_2d_args", None)
+        if not isinstance(args_2d, dict):
+            return
+        p2d = plan.integration_2d
+        if plan.gi.mode_2d.value == "qip_qoop":
+            ranges = {
+                "x_range": p2d.extra.get("x_range"),
+                "y_range": p2d.extra.get("y_range"),
+            }
+        else:
+            ranges = {
+                "radial_range": p2d.radial_range,
+                "azimuth_range": p2d.azimuth_range,
+            }
+        for key, value in ranges.items():
+            if value is not None and args_2d.get(key) is None:
+                args_2d[key] = tuple(map(float, value))
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +587,10 @@ def _plan_signature(
         id(live_scan),
         bool(integrate_1d),
         bool(integrate_2d),
+        bool(getattr(live_scan, "gi", False)),
+        repr(getattr(live_scan, "incidence_motor", None)),
+        repr(getattr(live_scan, "tilt_angle", None)),
+        repr(getattr(live_scan, "sample_orientation", None)),
         _items(getattr(live_scan, "bai_1d_args", {})),
         _items(getattr(live_scan, "bai_2d_args", {})),
         mask_sig,
@@ -345,9 +604,9 @@ class StandardPlanCache:
     lifetime of a scan; the cached plan is rebuilt only when one of the
     scan settings ``_plan_signature`` covers actually changes.
 
-    Returns ``None`` for GI scans so callers can drop straight into the
-    legacy fiber-integrator path without an "is GI" check at every call
-    site (the per-dispatch helper below already does that).
+    GI scans now get real headless plans too; callers may still pass
+    ``None`` explicitly to the dispatch helper as an escape hatch for a
+    known-legacy site, but the cache no longer forces that fork.
     """
 
     __slots__ = ("_plan", "_key", "_mask_obj", "_mask_sig")
@@ -384,8 +643,6 @@ class StandardPlanCache:
         integrate_1d: bool = True,
         integrate_2d: bool = True,
     ) -> ReductionPlan | None:
-        if getattr(live_scan, "gi", False):
-            return None
         mask_sig = self._mask_sig_for(getattr(live_scan, "global_mask", None))
         key = _plan_signature(
             live_scan, integrate_1d, integrate_2d, mask_sig=mask_sig,
@@ -406,56 +663,54 @@ class StandardPlanCache:
         self._mask_sig = None
 
 
-def dispatch_live_frame_reduction(
-    live_frame: Any,
+def sync_live_scan_gi_settings(
     live_scan: Any,
     *,
-    standard_plan: ReductionPlan | None,
-    integrator: Any,
-    global_mask: Any,
-    legacy_gi: Callable[[], None],
+    incidence_motor: Any = None,
+    sample_orientation: Any = None,
+    tilt_angle: Any = None,
 ) -> None:
-    """Run reduction for one live frame via the right path (standard or GI).
+    """Mirror wrangler-thread GI settings onto a live scan before planning."""
 
-    Single dispatch point shared by all wrangler workers so the
-    ``if self.gi: <legacy>; else: reduce_live_frame(...)`` fork lives
-    in exactly one place.
-
-    Parameters
-    ----------
-    live_frame, live_scan
-        The live frame to reduce and its parent live scan.
-    standard_plan
-        ``ReductionPlan`` for the non-GI path; pass ``None`` to force
-        the legacy callback (matches what
-        :meth:`StandardPlanCache.get` returns for GI scans).
-    integrator
-        Pre-built pyFAI integrator for the worker (typically borrowed
-        from an :class:`IntegratorPool`).
-    global_mask
-        Scan-level mask passed through unchanged.
-    legacy_gi
-        Zero-arg callback that runs the GI fiber-integrator path.
-        Invoked when ``standard_plan`` is ``None`` or
-        ``live_frame.gi`` is ``True``.  Caller is responsible for borrowing
-        the right fiber integrator inside this callback.
-    """
-    if standard_plan is None or getattr(live_frame, "gi", False):
-        legacy_gi()
+    if not bool(getattr(live_scan, "gi", False)):
         return
-    reduce_live_frame(
-        live_frame,
-        standard_plan,
-        scan_name=str(getattr(live_scan, "name", "scan")),
-        global_mask=global_mask,
-        integrator=integrator,
-    )
+    if incidence_motor is not None:
+        live_scan.incidence_motor = incidence_motor
+        live_scan.th_mtr = incidence_motor
+    if sample_orientation is not None:
+        live_scan.sample_orientation = sample_orientation
+    if tilt_angle is not None:
+        live_scan.tilt_angle = tilt_angle
 
 
 def _source_path(frame: Any) -> Path | None:
     resolver = getattr(frame, "_resolved_source_path", None)
     path = resolver() if callable(resolver) else getattr(frame, "source_file", "")
     return Path(path) if path else None
+
+
+def _incidence_available(live_scan: Any, incidence_motor: Any) -> bool:
+    if incidence_motor is None:
+        return False
+    try:
+        float(incidence_motor)
+        return True
+    except (TypeError, ValueError):
+        pass
+    key = str(incidence_motor).lower()
+    scan_data = getattr(live_scan, "scan_data", None)
+    if scan_data is not None and hasattr(scan_data, "columns"):
+        if any(str(col).lower() == key for col in scan_data.columns):
+            return True
+    frames = getattr(live_scan, "frames", None)
+    for idx in list(getattr(frames, "index", []) or []):
+        try:
+            info = getattr(frames[int(idx)], "scan_info", {}) or {}
+        except Exception:
+            continue
+        if any(str(candidate).lower() == key for candidate in info):
+            return True
+    return False
 
 
 def _scan_data_row(scan_data: Any, idx: int) -> dict[str, Any]:
@@ -532,7 +787,15 @@ def _flat_mask_as_bool(mask: Any, shape: tuple[int, int] | None) -> np.ndarray |
     if isinstance(mask, MaskSpec):
         if shape is None:
             return None
-        return mask.to_bool(shape)
+        try:
+            return mask.to_bool(shape)
+        except ValueError as exc:
+            # A flat-index mask that doesn't fit this image (wrong
+            # detector/calibration, stale mask) makes MaskSpec.to_bool raise;
+            # match the ndarray branch below and ignore it with a warning
+            # rather than letting the ValueError kill the run thread (BUG-2).
+            logger.warning("Ignoring mask: %s", exc)
+            return None
     arr = np.asarray(mask)
     if shape is None:
         if arr.ndim == 2:
@@ -608,11 +871,33 @@ def _offset_range(
     return float(value[0]) - offset, float(value[1]) - offset
 
 
+def _gi_1d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
+    if not is_gi:
+        return str(unit or "q_A^-1")
+    if mode == "q_ip":
+        return "qip_A^-1"
+    if mode == "q_oop":
+        return "qoop_A^-1"
+    return str(unit or "q_A^-1")
+
+
+def _gi_2d_unit_default(unit: Any, mode: str, *, is_gi: bool) -> str:
+    text = str(unit or "").strip()
+    if not is_gi:
+        return text or "q_A^-1"
+    if mode == "qip_qoop":
+        return text if text.startswith("qip_") else "qip_A^-1"
+    return text or "q_A^-1"
+
+
 __all__ = [
     "StandardPlanCache",
-    "dispatch_live_frame_reduction",
     "frame_from_live_frame",
     "scan_from_live_scan",
     "plan_from_live_scan",
     "reduce_live_frame",
+    "reduce_live_frames",
+    "open_live_reduction_session",
+    "freeze_live_scan_gi_ranges",
+    "sync_live_scan_gi_settings",
 ]

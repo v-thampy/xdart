@@ -6,8 +6,6 @@
 # Standard library imports
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
 from queue import Queue
 import threading
 import traceback
@@ -39,6 +37,29 @@ _THRESHOLD_NAN = np.float32(np.nan)
 # / live modes.  Subclasses can override per-instance via the
 # ``LIVE_SAVE_INTERVAL`` attribute if they want a different rhythm.
 _LIVE_SAVE_INTERVAL = 8
+# 1D-only .nxs writes are small and cheap, so flush far less often: it is the
+# fixed per-save overhead (not per-frame compute) that made long Int-1D scans
+# crawl as the frame count grew.  2D keeps the tight default so peak RAM stays
+# bounded.  (PERF-2)
+# This is now an UPPER bound on save spacing, not the effective cadence: the
+# persist-before-evict fix (LiveFrameSeries._persisted + mark_persisted, and the
+# _save_due cap bound in imageWranglerThread) guarantees a save fires before the
+# unsaved in-memory set reaches _in_memory_cap, so no frame's int_1d is ever
+# evicted before it's written — the high interval is safe on scans longer than
+# the cap.  Effective cadence is therefore min(this, cap-margin).  See
+# review/CC_data_loss_save_vs_evict_jun2026.md.
+_LIVE_SAVE_INTERVAL_1D = 1000
+
+
+class _CommandCancelToken:
+    """Duck-typed ssrl CancelToken bound to a wrangler thread command."""
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    @property
+    def cancelled(self):
+        return getattr(self._owner, 'command', None) == 'stop'
 
 
 class wranglerWidget(Qt.QtWidgets.QWidget):
@@ -79,6 +100,12 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
     sigUpdateGI = Qt.QtCore.Signal(bool)
     finished = Qt.QtCore.Signal()
     started = Qt.QtCore.Signal()
+    # Pause/Resume (Phase B): sigPaused fires once the run is frozen at a frame
+    # boundary (the host then LIFTS the freeze guard for browsing); sigResuming
+    # fires just before resuming (the host RE-ENGAGES the guard FIRST).  Emitted
+    # only by wranglers that support pause (image wrangler); harmless elsewhere.
+    sigPaused = Qt.QtCore.Signal()
+    sigResuming = Qt.QtCore.Signal()
 
     def __init__(self, fname, file_lock, parent=None):
         """fname: str, file path
@@ -107,56 +134,123 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         """
         pass
 
-    def _set_parameter_readonly(self, param, readonly):
-        """Recursively set the pyqtgraph Parameter read-only state, used to lock
-        the whole wrangler tree during a run while keeping the tree widget
-        itself enabled.
+    # ── Group-header toggles (UI-1, #81) ────────────────────────────────
+    # Maps a toggle-group's name (e.g. 'GI') to its hidden enabling bool
+    # child ('Grazing').  _install_group_toggles puts a REAL checkbox on
+    # the group's header row: the checkbox is the on/off control, driving
+    # the hidden bool that stays the source of truth the wrangler reads
+    # (hidden so it can't repaint-uncheck while the tree is disabled
+    # mid-run, #56).  Checking expands the group, unchecking collapses it;
+    # a manual chevron expand just peeks at the options — it does NOT
+    # enable the feature.
+    _GROUP_TOGGLES = {}
 
-        Skips ``bool`` params: pyqtgraph renders a *readonly* checkbox as
-        UNCHECKED regardless of its value (cosmetic) — the GI 'Grazing' box flip
-        regression (#56).  The value is unaffected and the run uses the
-        setup-time snapshot, so leaving the checkbox interactive is harmless and
-        it keeps showing its real state.
+    @staticmethod
+    def _toggle_check_state(on):
+        return (Qt.QtCore.Qt.CheckState.Checked if on
+                else Qt.QtCore.Qt.CheckState.Unchecked)
 
-        ``readonly`` does NOT lock every param type: pyqtgraph ignores it for
-        list/combo params and for action (Browse) params (which have no editable
-        value).  So leaf non-bool params are ALSO disabled via ``enabled`` — a
-        leaf's enabled state doesn't propagate, so its bool siblings are safe.
-        GROUP params get ``readonly`` only and are NEVER disabled: ``enabled=
-        False`` on a group propagates to its bool descendants and repaints them
-        unchecked.  (NamedActionParameter reports ``type`` None; the leaf-disable
-        covers it regardless of type.)
-        """
-        ptype = param.opts.get('type') if hasattr(param, 'opts') else None
-        try:
-            children = param.children()
-        except AttributeError:
-            children = ()
-        if ptype != 'bool':
+    def _install_group_toggles(self, tree):
+        """Add a checkbox to each _GROUP_TOGGLES group's header item and wire
+        it both ways to the group's hidden enabling bool.  Call once, after
+        ``tree.setParameters`` (the header items must exist)."""
+        self._group_toggle_items = []
+        for grp_name, bool_name in self._GROUP_TOGGLES.items():
             try:
-                param.setOpts(readonly=readonly)
-            except (AttributeError, TypeError):
-                pass
-            # Leaf (no children) non-bool param: disable it too, so list/combo
-            # and action params (which ignore readonly) are actually locked.
-            # Never disable a group (would repaint bool descendants — #56).
-            if not children:
-                try:
-                    param.setOpts(enabled=not readonly)
-                except (AttributeError, TypeError):
-                    pass
-        for child in children:
-            self._set_parameter_readonly(child, readonly)
+                grp = self.parameters.child(grp_name)
+                bool_param = grp.child(bool_name)
+                item = next(iter(grp.items))
+            except Exception:
+                logger.debug("group-toggle install skipped for %s", grp_name,
+                             exc_info=True)
+                continue
+            item.setFlags(item.flags()
+                          | Qt.QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(0, self._toggle_check_state(bool_param.value()))
+            self._group_toggle_items.append((item, grp, bool_param))
+            bool_param.sigValueChanged.connect(self._sync_group_toggle_from_bool)
+            # pyqtgraph's ParameterItem.optsChanged ends with updateFlags(),
+            # which rebuilds the header's flags from the param opts and drops
+            # ItemIsUserCheckable (any setOpts — expanded, visible — strips
+            # the checkbox).  Re-assert it after every opts change; connected
+            # AFTER the item's own optsChanged so it runs post-updateFlags.
+            grp.sigOptionsChanged.connect(self._reassert_group_toggle_flags)
+        if self._group_toggle_items:
+            tree.itemChanged.connect(self._on_group_toggle_item_changed)
 
-    def _set_tree_readonly(self, readonly):
-        """Lock (``readonly=True``) or unlock the entire wrangler parameter tree
-        in one call — skip-bool, see :meth:`_set_parameter_readonly`.  Disables
-        every processing param (Calibration, Signal, GI, Threshold, Background,
-        save path, Cores-as-param, …) during a run without disabling the tree
-        widget (which would repaint the bool checkboxes)."""
-        params = getattr(self, 'parameters', None)
-        if params is not None:
-            self._set_parameter_readonly(params, readonly)
+    def _reassert_group_toggle_flags(self, _param=None, _opts=None):
+        checkable = Qt.QtCore.Qt.ItemFlag.ItemIsUserCheckable
+        for item, _grp, _bool_param in getattr(self, '_group_toggle_items', ()):
+            if not (item.flags() & checkable):
+                item.setFlags(item.flags() | checkable)
+
+    def _on_group_toggle_item_changed(self, item, column):
+        """User (un)checked a toggle-group header: drive the hidden bool and
+        open/fold the group to match."""
+        if column != 0:
+            return
+        for it, grp, bool_param in getattr(self, '_group_toggle_items', ()):
+            if it is item:
+                on = (item.checkState(0)
+                      == Qt.QtCore.Qt.CheckState.Checked)
+                if bool(bool_param.value()) != on:
+                    bool_param.setValue(on)
+                    save = getattr(self, '_save_to_session', None)
+                    if save is not None:
+                        save()
+                grp.setOpts(expanded=on)
+                return
+
+    def _sync_group_toggle_from_bool(self, param, value):
+        """Programmatic bool change (session restore etc.): reflect it into
+        the header checkbox."""
+        for item, grp, bool_param in getattr(self, '_group_toggle_items', ()):
+            if bool_param is param:
+                state = self._toggle_check_state(bool(value))
+                if item.checkState(0) != state:
+                    item.setCheckState(0, state)
+                return
+
+    # ── Status label (specLabel / statusLabel) ──────────────────────────
+    # A plain QLabel's minimum width is its full text width, so a long
+    # status message (e.g. the live-GI clip advisory, ~180 chars) forces
+    # the WHOLE window to expand horizontally.  Subclasses must route
+    # status text through _set_status_text and call _guard_status_label
+    # once after building their UI.
+
+    def _status_label(self):
+        """The wrangler's status QLabel, whatever the subclass calls it."""
+        label = getattr(self, 'statusLabel', None)
+        if label is not None:
+            return label
+        ui = getattr(self, 'ui', None)
+        return getattr(ui, 'specLabel', None) if ui is not None else None
+
+    def _guard_status_label(self):
+        """Stop the status label from driving the window's minimum width:
+        with an Ignored horizontal policy the label takes whatever width the
+        layout gives it and overlong text clips instead of growing the window."""
+        label = self._status_label()
+        if label is None:
+            return
+        policy = label.sizePolicy()
+        policy.setHorizontalPolicy(Qt.QtWidgets.QSizePolicy.Policy.Ignored)
+        label.setSizePolicy(policy)
+
+    def _set_status_text(self, text):
+        """Set the status label, eliding to the label's current width (the
+        full text goes in the tooltip).  Safe for arbitrarily long thread
+        messages — see _guard_status_label."""
+        label = self._status_label()
+        if label is None:
+            return
+        text = text or ''
+        label.setToolTip(text)
+        if label.isVisible() and label.width() > 0:
+            metrics = Qt.QtGui.QFontMetrics(label.font())
+            text = metrics.elidedText(
+                text, Qt.QtCore.Qt.TextElideMode.ElideRight, label.width() - 4)
+        label.setText(text)
 
     def setup(self):
         """Sets the thread child object. Called by tthetaWidget prior
@@ -216,11 +310,22 @@ class wranglerThread(Qt.QtCore.QThread):
     sigUpdateFile = Qt.QtCore.Signal(str, str, bool, str, bool, bool)
     sigUpdateGI = Qt.QtCore.Signal(bool)
 
-    # Per-class override hook for save cadence — subclasses can set
-    # this to a different integer if they want saves more/less often
-    # than the default 8 frames.  Read inside _maybe_save() / the
-    # subclass's dispatch loop.
-    LIVE_SAVE_INTERVAL = _LIVE_SAVE_INTERVAL
+    # Save cadence (frames between disk flushes), mode-aware: a 1D-only run
+    # (``scan.skip_2d``) flushes every ``_LIVE_SAVE_INTERVAL_1D`` frames; a 2D
+    # run keeps the tight ``_LIVE_SAVE_INTERVAL`` for bounded RAM.  An instance
+    # may still pin a value (e.g. a test) by assigning ``LIVE_SAVE_INTERVAL``.
+    @property
+    def LIVE_SAVE_INTERVAL(self) -> int:
+        override = getattr(self, "_live_save_interval_override", None)
+        if override is not None:
+            return int(override)
+        if getattr(getattr(self, "scan", None), "skip_2d", False):
+            return _LIVE_SAVE_INTERVAL_1D
+        return _LIVE_SAVE_INTERVAL
+
+    @LIVE_SAVE_INTERVAL.setter
+    def LIVE_SAVE_INTERVAL(self, value: int) -> None:
+        self._live_save_interval_override = int(value)
 
     def __init__(self, command_queue, scan_args, fname, file_lock,
                  parent=None):
@@ -237,6 +342,11 @@ class wranglerThread(Qt.QtCore.QThread):
         self.file_lock = file_lock
         self.signal_q = Queue()
         self.command_q = Queue()
+        # RS-2: serializes command TRANSITIONS between the GUI (pause/resume
+        # check-then-set) and the worker's self-stop writes (write-failure
+        # stop, GI freeze abort) — without it a self-stop landing between the
+        # GUI's check and its 'pause' write was silently revived.
+        self.command_lock = threading.Lock()
 
         # ── Shared batch-engine state ────────────────────────────────
         # Subclasses can override any of these before .start() (or
@@ -273,63 +383,110 @@ class wranglerThread(Qt.QtCore.QThread):
         self.batch_mode = False
         self.xye_only = False
         self.max_cores = 1
-
-        # ── P5: persistent ThreadPoolExecutor ───────────────────────
-        # Re-used across every ``_parallel_integrate`` call instead of
-        # being recreated per chunk.  Lazy-created on first use, and
-        # recreated only if the requested worker count changes between
-        # calls (the wrangler GUI lets the user retune ``max_cores``
-        # mid-scan via the parameter tree).  Pre-fix this created a
-        # fresh pool every 16-frame SPEC batch; the overhead is small
-        # per chunk but adds up on long fast scans and on slow CPUs
-        # where pool start-up dominates the chunk's CPU budget.
-        self._executor: ThreadPoolExecutor | None = None
-        self._executor_workers: int = 0
-
-    def _get_executor(self, n_workers: int) -> ThreadPoolExecutor:
-        """Return the persistent executor, (re)creating it if needed.
-
-        Recreates only if the requested ``n_workers`` differs from the
-        currently-cached value — so a stable scan reuses one pool for
-        every chunk.
-        """
-        n_workers = max(1, int(n_workers))
-        if self._executor is None or self._executor_workers != n_workers:
-            self._shutdown_executor()
-            self._executor = ThreadPoolExecutor(max_workers=n_workers)
-            self._executor_workers = n_workers
-        return self._executor
-
-    def _shutdown_executor(self) -> None:
-        """Tear down the persistent executor if one is held.
-
-        Called automatically by :meth:`_get_executor` when the worker
-        count changes, and again by the destructor.  Subclasses that
-        want to be tidy at end-of-scan may call this explicitly from
-        their ``run()`` ``finally`` blocks, but it's not required —
-        the pool will be cleaned up at QThread destruction either way.
-        """
-        if self._executor is not None:
-            try:
-                self._executor.shutdown(wait=True, cancel_futures=True)
-            except TypeError:  # pragma: no cover  - py < 3.9
-                self._executor.shutdown(wait=True)
-            self._executor = None
-            self._executor_workers = 0
-
-    def __del__(self) -> None:  # pragma: no cover — destructor timing
-        # Belt-and-braces cleanup so the worker threads exit when the
-        # wrangler widget is destroyed.  Safe to call repeatedly.
-        try:
-            self._shutdown_executor()
-        except Exception:
-            pass
+        self._reduction_session = None
+        self._reduction_session_key = None
+        # Streaming (PERF-4b) session + its QtNexusSink, kept on dedicated slots
+        # because one persistent session spans the WHOLE scan (the chunked cache
+        # keys on per-chunk n_workers, which varies).  Finished at scan end by
+        # _close_reduction_session.
+        self._streaming_session = None
+        self._streaming_sink = None
+        self._streaming_scan_id = None
+        # BLOCKER 1: id of the scan whose whole-scan GI grid pre-pass has run, so
+        # the freeze happens once per scan (not per chunk).  Reset on scan close.
+        self._gi_prepass_scan_id = None
+        # Set by _close_reduction_session when a streaming write/sink failure
+        # surfaces from finish() — so the run can't report a false "success".
+        self._reduction_write_error = None
 
     def run(self):
         """Main task. Subclasses (e.g. imageThread) override this."""
         pass
 
     # ── Shared batch helpers ────────────────────────────────────────
+
+    def _cancel_token(self):
+        return _CommandCancelToken(self)
+
+    def _get_reduction_session(self, key, factory):
+        """Return the persistent headless reduction session for *key*.
+
+        The session owns the executor and per-thread pyFAI integrators for the
+        scan/run lifetime.  The caller supplies a key that includes scan identity
+        and execution policy; changing either closes the old session and opens a
+        fresh one from the provided factory.
+        """
+        if self._reduction_session is not None and self._reduction_session_key == key:
+            return self._reduction_session
+
+        self._close_reduction_session()
+        self._reduction_session = factory()
+        self._reduction_session_key = key
+        return self._reduction_session
+
+    def _reduction_session_key_for(self, scan, plan, n_workers):
+        try:
+            n_workers = int(n_workers or 1)
+        except (TypeError, ValueError):
+            n_workers = 1
+        return (
+            id(scan),
+            str(getattr(scan, "name", "scan")),
+            str(getattr(scan, "data_file", "")),
+            max(1, n_workers),
+            bool(getattr(scan, "gi", False)),
+            bool(getattr(scan, "skip_2d", False)),
+            id(plan),
+        )
+
+    def _close_reduction_session(self):
+        session = self._reduction_session
+        self._reduction_session = None
+        self._reduction_session_key = None
+        # The streaming session's finish() drains the writer thread + does the
+        # final QtNexusSink flush (save + XYE + end-of-run signal), so closing
+        # it here is the streaming batch's end-of-scan write.
+        streaming = self._streaming_session
+        self._streaming_session = None
+        self._streaming_sink = None
+        self._streaming_scan_id = None
+        self._gi_prepass_scan_id = None      # next scan re-runs its own pre-pass
+        # BLOCKER 2: finish() is fail-loud — a streaming sink/write failure now
+        # RAISES instead of being silently swallowed (the user must not think a
+        # failed write succeeded).  Close BOTH sessions even if the first raises
+        # (wrap each individually + collect), then surface the failure loudly.
+        errors = []
+        for sess in (session, streaming):
+            if sess is not None:
+                try:
+                    # #4 (codex): bound the writer-thread join so a stalled
+                    # NFS/pyFAI worker can't wedge Stop/close indefinitely.
+                    # 60 s is a generous ceiling for beamline conditions.
+                    sess.finish(join_timeout=60.0)
+                except Exception as exc:
+                    errors.append(exc)
+                    logger.error("reduction session WRITE FAILED on close: %s",
+                                 exc, exc_info=True)
+        if errors:
+            self._reduction_write_error = errors[0]
+            msg = (f"Save FAILED — output .nxs may be incomplete: {errors[0]}")
+            show = getattr(self, "showLabel", None)
+            if show is not None:
+                try:
+                    show.emit(msg)
+                except Exception:
+                    pass
+            # A failed write is serious — stop the run rather than process
+            # further scans onto a broken output.  Under command_lock so a
+            # concurrent GUI pause() can't overwrite this stop (RS-2).
+            # getattr: tests drive this on duck holders without the lock.
+            if getattr(self, "command", None) is not None:
+                _lock = getattr(self, "command_lock", None)
+                if _lock is not None:
+                    with _lock:
+                        self.command = 'stop'
+                else:
+                    self.command = 'stop'
 
     def _resolve_frame_mask(self, scan, img_data):
         """Return a stable per-scan "bad pixel" mask cached on the scan.
@@ -366,64 +523,6 @@ class wranglerThread(Qt.QtCore.QThread):
                 cached = None
             scan._cached_data_mask = cached
         return cached
-
-    @staticmethod
-    @contextmanager
-    def _borrow_fiber_integrator(scan, fiber_pool, frame,
-                                 *, angle_tol: float = 1e-4):
-        """H2 fiber-integrator borrow.
-
-        Yields a :class:`FiberIntegrator` for this frame's incidence
-        angle, with the following preference order:
-
-        1. **Borrow from pool** when the angle matches the prewarmed
-           cache (within ``angle_tol`` degrees) — workers get their
-           own deepcopy, no CSR-buffer races.  Most common path for
-           sin²ψ / fixed-ω scans.
-        2. **Build worker-local** when angle differs — slower
-           ``promote("FiberIntegrator")`` call but only on
-           ω-varying scans, and only for frames that drift.  No
-           shared state, so thread-safe by construction.
-        3. **Yield None** when GI isn't enabled at all — the frame
-           integrators ignore the ``fiber_integrator`` kwarg in
-           that case.
-
-        Yielded values that came from the pool are returned to the
-        pool on context exit (pool members are reused by subsequent
-        frames).  Worker-local fi instances become garbage at exit.
-        """
-        # Local import: ssrl_xrd_tools.integrate.gid pulls pyFAI; we
-        # don't want to drag that into every test that constructs a
-        # wranglerThread for unrelated reasons.
-        gi = bool(getattr(frame, "gi", False))
-        if not gi:
-            yield None
-            return
-        cached_angle = getattr(scan, "_cached_fiber_integrator_angle", None)
-        # gi is True here (returned early otherwise), so an unresolved
-        # incidence is a real configuration error — re-raise it so the
-        # worker's integration fails fast instead of silently building a
-        # degenerate 0° fiber integrator (blank cake).  The wrangler
-        # surfaces "set Manual theta".
-        try:
-            frame_angle = frame._get_incident_angle()
-        except (AttributeError, ValueError):
-            frame_angle = None
-        if (fiber_pool is not None and cached_angle is not None
-                and frame_angle is not None
-                and abs(frame_angle - cached_angle) < angle_tol):
-            with fiber_pool.borrow() as fi:
-                yield fi
-        else:
-            from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
-            fi = create_fiber_integrator(
-                frame._poni_from_integrator(),
-                incident_angle=frame_angle if frame_angle is not None else 0.0,
-                tilt_angle=frame.tilt_angle,
-                sample_orientation=frame.sample_orientation,
-                angle_unit="deg",
-            )
-            yield fi
 
     def _prewarm_frame_mask(self, scan, img_data) -> None:
         """Populate ``scan._cached_data_mask`` on the main thread.
@@ -543,71 +642,3 @@ class wranglerThread(Qt.QtCore.QThread):
                 scan._save_to_nexus()
         finally:
             _get_h5pool().resume(scan.data_file)
-
-    def _parallel_integrate(self, items, integrate_fn, n_workers,
-                             *, label="integration"):
-        """Run ``integrate_fn`` over ``items`` in a ThreadPoolExecutor.
-
-        Shared dispatch primitive used by both SPEC batch and NeXus
-        chunked workers.  Each wrangler still owns its own per-item
-        ``integrate_fn`` (signatures differ) and its own post-publish
-        / save / xye logic.
-
-        Behavior:
-          * Submits one future per item up-front, then waits.
-          * F2 cancel-fast: on Stop, calls
-            ``pool.shutdown(wait=True, cancel_futures=True)`` so
-            queued-but-not-running futures are dropped immediately.
-            ``integrate_fn`` should ALSO check ``self.command``
-            early so already-running workers can bail before the
-            expensive 2D integration starts; pre-F2 the user could
-            wait up to one full chunk after pressing Stop, because
-            running workers kept going to completion.
-          * Per-item exceptions are logged at error level and the
-            corresponding frame is dropped from the result list.
-          * Returns frames in idx-sorted order so on-disk
-            frame_index stays monotonic.
-
-        Returns a ``list[LiveFrame]`` with ``None`` entries elided.
-
-        P5: uses the persistent :attr:`_executor` instead of creating a
-        fresh ``ThreadPoolExecutor`` per call.  Stop-mid-chunk cancels
-        only the queued futures of THIS chunk (not the whole pool); the
-        executor stays alive for the next chunk.
-        """
-        if not items:
-            return []
-
-        completed: list = []
-        pool = self._get_executor(n_workers)
-        futures = [pool.submit(integrate_fn, item) for item in items]
-        try:
-            for fut in as_completed(futures):
-                if self.command == 'stop':
-                    # Cancel everything still queued; let in-flight
-                    # workers finish (Python doesn't pre-empt threads,
-                    # but the integrate_fn's own stop checks will
-                    # short-circuit before they hit pyFAI).
-                    for f in futures:
-                        f.cancel()
-                    break
-                try:
-                    frame = fut.result()
-                except Exception as e:
-                    logger.error(
-                        '[%s] worker raised: %s', label, e, exc_info=True,
-                    )
-                    continue
-                if frame is None:
-                    continue
-                completed.append(frame)
-        finally:
-            # On Stop, drain any remaining futures we cancelled above so
-            # they don't leak into the next chunk's wait set.  No pool
-            # shutdown — the executor persists for the next chunk.
-            for f in futures:
-                if not f.done():
-                    f.cancel()
-
-        completed.sort(key=lambda a: getattr(a, 'idx', 0) or 0)
-        return completed

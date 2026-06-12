@@ -159,7 +159,7 @@ class _DuckSphere:
     """Minimal duck-typed LiveScan."""
 
     def __init__(self, frames, *, scan_data=None, geometry=None,
-                 global_mask=None, gi=False):
+                 global_mask=None, gi=False, skip_2d=False):
         self.frames = _DuckArches(frames)
         self.scan_data = scan_data if scan_data is not None else pd.DataFrame()
         self.bai_1d_args = {"numpoints": N_Q}
@@ -168,6 +168,7 @@ class _DuckSphere:
         self.geometry = geometry
         self.global_mask = global_mask
         self.gi = gi
+        self.skip_2d = skip_2d
         self.stitched_1d = None
         self.stitched_2d = None
         # Stitching writes only happen with finalize=True; not exercised here.
@@ -456,6 +457,71 @@ def test_publication_validation_filters_bad_1d_without_blocking_2d(tmp_path):
         np.testing.assert_array_equal(
             f["entry/integrated_2d/frame_index"][()], [0, 1],
         )
+
+
+class _DuckArchReloadable1D(_DuckArch):
+    """1D-only frame whose raw is reloadable from source (PERF-5).
+
+    Carries no precomputed thumbnail and reports it can be skipped, mirroring
+    a real ``LiveFrame`` in a ``skip_2d`` scan whose source master resolves.
+    """
+
+    def __init__(self, idx, **kw):
+        super().__init__(idx, **kw)
+        self.thumbnail = None
+
+    def can_skip_thumbnail(self, skip_2d):
+        return bool(skip_2d)
+
+    def make_thumbnail(self, global_mask=None):  # must never be called when skipped
+        raise AssertionError(
+            "make_thumbnail called for a frame whose thumbnail should be skipped"
+        )
+
+
+def test_thumbnail_skipped_for_reloadable_1d_frames(tmp_path):
+    """PERF-5: a 1D-only (skip_2d) scan whose frames are reloadable from source
+    writes NO per-frame thumbnail (and never lazily computes one), but still
+    writes the source ref so the Image Viewer can reload the raw on demand."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    frames = [_DuckArchReloadable1D(idx=i) for i in range(2)]
+    scan = _DuckSphere(frames, skip_2d=True)
+
+    path = tmp_path / "skip2d_no_thumb.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    root = nx.nxload(str(path))
+    for i in range(2):
+        sub = root[f"entry/frames/frame_{i:04d}"]
+        # No thumbnail dataset (the make_thumbnail AssertionError also guards
+        # against a lazy save-time recompute).
+        assert "thumbnail" not in sub
+        # But the source ref is present so the viewer reloads raw on demand.
+        assert "source" in sub
+        assert "path" in sub["source"]
+        assert "frame_index" in sub["source"]
+
+
+def test_thumbnail_kept_for_2d_scan_even_if_reloadable(tmp_path):
+    """PERF-5 guard: a 2D scan (skip_2d=False) keeps the thumbnail even when the
+    frame would otherwise be reloadable — it is the 2D preview."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    frames = [_DuckArchReloadable1D(idx=i) for i in range(2)]
+    # thumbnail is None and make_thumbnail raises, so the writer must NOT try to
+    # make one — for a 2D scan can_skip_thumbnail(False) is False, so the writer
+    # would call make_thumbnail.  Give it a thumbnail so the 2D path persists it.
+    for fr in frames:
+        fr.thumbnail = np.random.default_rng(0).random((16, 16), dtype=np.float32)
+    scan = _DuckSphere(frames, skip_2d=False)
+
+    path = tmp_path / "twod_keeps_thumb.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    root = nx.nxload(str(path))
+    for i in range(2):
+        assert "thumbnail" in root[f"entry/frames/frame_{i:04d}"]
 
 
 def test_frames_group_and_thumbnails(written_nxs):
@@ -1217,6 +1283,120 @@ def test_wavelength_prefers_integrator_over_mg_args(tmp_path):
     assert float(src["wavelength_A"].nxdata) == pytest.approx(0.7293)
 
 
+def test_reload_restores_persisted_wavelength_into_mg_args(tmp_path):
+    # G1: reloaded scans have no live integrator.  The loader must restore the
+    # real v2 wavelength stamp so display Q↔2θ conversion does not fall back to
+    # the LiveScan constructor's 1e-10 m sentinel.
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan.mg_args = {"wavelength": 1.0e-10}
+    scan._cached_integrator = SimpleNamespace(wavelength=0.7293e-10)
+
+    path = tmp_path / "wl_reload.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    loaded = LiveScan(name="wl", data_file=str(path))
+    loaded.load_from_h5(replace=True, mode="r")
+
+    assert loaded.mg_args["wavelength"] == pytest.approx(0.7293e-10)
+
+
+def test_reload_clears_stale_persisted_wavelength_when_missing(tmp_path):
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
+
+    with_wl = _DuckSphere([_DuckArch(idx=0)])
+    with_wl._cached_integrator = SimpleNamespace(wavelength=0.7293e-10)
+    path_with_wl = tmp_path / "with_wl.nxs"
+    save_scan_to_nexus(with_wl, path_with_wl, mode="w", finalize=False)
+
+    no_wl = _DuckSphere([_DuckArch(idx=0)])
+    path_no_wl = tmp_path / "no_wl.nxs"
+    save_scan_to_nexus(no_wl, path_no_wl, mode="w", finalize=False)
+
+    loaded = LiveScan(name="wl", data_file=str(path_with_wl))
+    loaded.load_from_h5(replace=True, mode="r")
+    assert loaded.mg_args["wavelength"] == pytest.approx(0.7293e-10)
+
+    loaded.data_file = str(path_no_wl)
+    loaded.load_from_h5(replace=True, mode="r")
+
+    assert getattr(loaded, "_persisted_wavelength_m", None) is None
+    assert loaded.mg_args["wavelength"] == pytest.approx(1.0e-10)
+
+
+def test_reload_restores_wavelength_in_append_mode(tmp_path):
+    # T0-2: Append runs load with replace=False, mode='a' while load_from_h5
+    # holds the file open — the restore must read through the already-open
+    # handle, not a second h5py.File open of the same path.
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan.mg_args = {"wavelength": 1.0e-10}
+    scan._cached_integrator = SimpleNamespace(wavelength=0.7293e-10)
+    path = tmp_path / "wl_append.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    loaded = LiveScan(name="wl", data_file=str(path))
+    loaded.load_from_h5(replace=False, mode="a")
+
+    assert loaded.mg_args["wavelength"] == pytest.approx(0.7293e-10)
+    assert loaded._persisted_wavelength_m == pytest.approx(0.7293e-10)
+
+
+def test_reset_clears_persisted_wavelength(tmp_path):
+    # T0-1: reset() is a data-identity change without a v2 load — the
+    # wavelength restored from the previously loaded file must not survive it
+    # (it short-circuits _get_wavelength ahead of the current file's stamp).
+    from types import SimpleNamespace
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan._cached_integrator = SimpleNamespace(wavelength=0.7293e-10)
+    path = tmp_path / "wl_reset.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    loaded = LiveScan(name="wl", data_file=str(path))
+    loaded.load_from_h5(replace=True, mode="r")
+    assert loaded._persisted_wavelength_m == pytest.approx(0.7293e-10)
+
+    loaded.reset()
+
+    assert loaded._persisted_wavelength_m is None
+    assert loaded.mg_args["wavelength"] == pytest.approx(1.0e-10)
+
+
+def test_source_base_stamp_failure_fails_save_loudly(tmp_path, monkeypatch):
+    # G2: relative per-frame source paths without entry/@source_base are
+    # misleadingly portable-looking but unresolvable.  The save must fail loudly
+    # if the attr stamp cannot be written.
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    original_setitem = h5py._hl.attrs.AttributeManager.__setitem__
+
+    def fail_source_base(self, name, value):
+        if name == "source_base":
+            raise OSError("attr write blocked")
+        return original_setitem(self, name, value)
+
+    monkeypatch.setattr(h5py._hl.attrs.AttributeManager, "__setitem__",
+                        fail_source_base)
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan.source_base = str(tmp_path)
+
+    with pytest.raises(RuntimeError, match="@source_base"):
+        save_scan_to_nexus(scan, tmp_path / "source_base_fail.nxs",
+                           mode="w", finalize=False)
+
+
 def test_reduction_provenance(written_nxs):
     """/entry/reduction is an NXprocess with program + versions + config."""
     root = nx.nxload(str(written_nxs))
@@ -1604,17 +1784,227 @@ def test_scan_data_survives_save_then_load_from_h5(tmp_path):
     assert "i0" in sd.columns
 
 
-def test_numeric_scan_info_drops_non_numeric_keeps_motors():
-    """Regression: a non-numeric metadata field (comment/name/date) must not
-    blank scan_data.  _numeric_scan_info keeps numeric motors (incl. the GI
-    'th' incidence motor) and drops only the non-coercible fields, instead of
-    pd.Series(dtype='float64') failing wholesale."""
-    from xdart.modules.ewald.scan import _numeric_scan_info
+def test_coerce_scan_info_keeps_non_numeric_columns():
+    """N2: heterogeneous per-frame metadata survives ingestion.
+
+    ``_coerce_scan_info`` keeps every field -- numbers (and numeric strings,
+    since SPEC stores numbers as text) coerced to float, genuinely non-numeric
+    values kept as strings -- instead of dropping the whole column, so the
+    writer can persist it (numeric -> float32, non-numeric -> vlen string)."""
+    from xdart.modules.ewald.scan import _coerce_scan_info
     info = {"th": 0.2, "i0": 1.0e6, "tth": 12.5,
-            "UserComment": "hello", "date": "2026-03-27", "scan": "Combi4"}
-    out = _numeric_scan_info(info)
-    assert out == {"th": 0.2, "i0": 1.0e6, "tth": 12.5}
-    # numeric strings still coerce (SPEC metas often store numbers as text)
-    assert _numeric_scan_info({"th": "0.30"}) == {"th": 0.30}
-    # all-numeric input is unchanged (the historical working case)
-    assert _numeric_scan_info({"th": 0.1, "i0": 5.0}) == {"th": 0.1, "i0": 5.0}
+            "keith_I": "0V", "sample": "Combi4", "date": "2026-03-27"}
+    assert _coerce_scan_info(info) == {
+        "th": 0.2, "i0": 1.0e6, "tth": 12.5,
+        "keith_I": "0V", "sample": "Combi4", "date": "2026-03-27",
+    }
+    # numeric strings still coerce to float (motors / monitors stay numeric)
+    assert _coerce_scan_info({"th": "0.30"}) == {"th": 0.30}
+    # the assembled scan_data keeps the string column heterogeneous (no float64)
+    sd = pd.DataFrame([_coerce_scan_info({"th": 0.2, "keith_I": "0V"})], index=[0])
+    sd.loc[1] = pd.Series(_coerce_scan_info({"th": 0.3, "keith_I": "1V"}))
+    assert list(sd["keith_I"]) == ["0V", "1V"]
+    assert sd["th"].tolist() == [0.2, 0.3]
+
+
+def test_heterogeneous_scan_data_roundtrips_to_nexus(tmp_path):
+    """N2 gate: a mixed numeric+string scan_data table round-trips -- the
+    string column persists as a vlen UTF-8 column (``ssrl_dtype='string'``)
+    and numeric columns are unchanged."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from ssrl_xrd_tools.io.read import get_metadata
+
+    sd = pd.DataFrame(
+        {"i0": [100.0, 101.0, 102.0], "keith_I": ["0V", "1V", "2V"]},
+        index=[0, 1, 2],
+    )
+    scan = _DuckSphere([_DuckArch(idx=i) for i in range(3)], scan_data=sd)
+    path = tmp_path / "hetero_scan_data.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=True)
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_allclose(f["entry/scan_data/i0"][()], [100.0, 101.0, 102.0])
+        ki = f["entry/scan_data/keith_I"]
+        assert ki.attrs["ssrl_dtype"] == "string"
+        assert list(ki.asstr()[()]) == ["0V", "1V", "2V"]
+
+    meta = get_metadata(path)
+    assert list(np.asarray(meta["scan_data"]["keith_I"]).astype(str)) == ["0V", "1V", "2V"]
+    np.testing.assert_allclose(
+        np.asarray(meta["scan_data"]["i0"], dtype=float), [100.0, 101.0, 102.0],
+    )
+
+
+def test_gi_config_roundtrips_to_reduction_config(tmp_path):
+    """N3: the GI output mode persists as a first-class
+    /entry/reduction/config/gi_config field, recoverable on read without
+    sniffing the q-unit string."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    scan = _DuckSphere(
+        [_DuckArch(idx=i) for i in range(2)],
+        scan_data=pd.DataFrame({"i0": [1.0, 2.0]}, index=[0, 1]),
+        gi=True,
+    )
+    scan.gi_config = {"gi_mode_1d": "q_oop", "gi_mode_2d": "qip_qoop",
+                      "incidence_motor": "th", "tilt_angle": 0.0,
+                      "sample_orientation": 1}
+    path = tmp_path / "gi_config.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=True)
+
+    # read_scan's metadata recovers it as a parsed, first-class field.
+    from ssrl_xrd_tools.io.read import get_metadata
+    gi = get_metadata(path)["reduction"]["config"]["gi_config"]
+    assert gi["gi_mode_1d"] == "q_oop"
+    assert gi["gi_mode_2d"] == "qip_qoop"
+
+
+def test_gi_freeze_diagnostic_persisted_in_provenance(tmp_path):
+    # Codex P2: the T0-4 first-chunk-freeze advisory must survive in the
+    # output file's reduction provenance, not just as a transient GUI label.
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from ssrl_xrd_tools.io.nexus import read_scan_metadata
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    scan.gi_freeze_diagnostic = (
+        "GI: test reason — output grid will be frozen from the first frames")
+    path = tmp_path / "gi_diag.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    ds = read_scan_metadata(path)
+    config = (ds.attrs.get("reduction") or {}).get("config") or {}
+    assert "frozen from the first frames" in config.get("gi_freeze_diagnostic", "")
+
+
+def test_one_resultless_frame_does_not_block_later_2d_writes(tmp_path):
+    """H1 (fresh-eyes review): a frame whose int_2d is missing (publication-
+    dropped row lazy-reloaded as None, reload-only frame, ...) must be skipped
+    PER FRAME — the old all-or-nothing check silently skipped the ENTIRE 2D
+    write for that save and every save after it (1D complete, 2D truncated,
+    no error).  The dropped label is remembered on the write cursor so later
+    saves don't re-select (and re-lazy-load) it."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    scan = _DuckSphere([_DuckArch(idx=i) for i in range(3)])
+    scan.frames[1].int_2d = None                       # the bad frame
+
+    path = tmp_path / "h1.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        idx_2d = sorted(int(x) for x in f["entry/integrated_2d/frame_index"][()])
+        idx_1d = sorted(int(x) for x in f["entry/integrated_1d/frame_index"][()])
+    assert idx_2d == [0, 2], "valid frames' 2D rows must still be written"
+    assert idx_1d == [0, 1, 2], "1D unaffected (filtered independently)"
+    cursor = scan._nexus_write_cursor
+    assert 1 in cursor.dropped.get("entry/integrated_2d", set())
+
+    # Later frames + a second save: the dropped label is NOT re-selected,
+    # new frames write normally.
+    scan.frames.append(_DuckArch(idx=3))
+    save_scan_to_nexus(scan, path, mode="a", finalize=False)
+    with h5py.File(path, "r") as f:
+        idx_2d = sorted(int(x) for x in f["entry/integrated_2d/frame_index"][()])
+    assert idx_2d == [0, 2, 3]
+
+
+def test_gi_freeze_diagnostic_persists_on_later_save(tmp_path):
+    # P2 follow-up (codex review): on the REAL path the first save
+    # (initialize_scan) writes provenance BEFORE the prepass stamps the
+    # diagnostic, and the GUI never passes finalize=True -- the cursor-deduped
+    # re-fire must persist it on a later periodic save.
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from ssrl_xrd_tools.io.nexus import read_scan_metadata
+
+    scan = _DuckSphere([_DuckArch(idx=0)])
+    path = tmp_path / "gi_diag_late.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)   # pre-stamp save
+
+    scan.gi_freeze_diagnostic = "GI: output grid set from the first frames (test)"
+    scan.frames.append(_DuckArch(idx=1))
+    save_scan_to_nexus(scan, path, mode="a", finalize=False)   # periodic save
+
+    ds = read_scan_metadata(path)
+    config = (ds.attrs.get("reduction") or {}).get("config") or {}
+    assert "set from the first frames" in config.get("gi_freeze_diagnostic", "")
+
+
+# ---------------------------------------------------------------------------
+# Pre-ship sweep regressions: cursor.dropped vs the replace recovery path
+# ---------------------------------------------------------------------------
+
+def _all_dummy_2d(frame):
+    """Make a frame's 2D result publication-invalid (all-dummy cake)."""
+    frame.int_2d.intensity = np.full_like(frame.int_2d.intensity, -1.0)
+
+
+def test_replace_recovers_group_that_was_never_created(tmp_path):
+    """If EVERY row of integrated_2d was publication-rejected during the run
+    (group never created on disk; all labels in cursor.dropped), a later
+    reintegrate-all replace save with now-valid results must WRITE the group.
+    The stale dropped bookkeeping previously excluded every recomputed frame
+    on the append fallback (`group_path in h5f` is False for a group that
+    never existed) -- the designed recovery path silently wrote nothing."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "recover.nxs"
+
+    for fr in frames:
+        _all_dummy_2d(fr)
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    with h5py.File(path, "r") as f:
+        assert "entry/integrated_2d" not in f          # all rows rejected
+    assert scan._nexus_write_cursor.dropped            # drops recorded
+
+    # Reintegration fixed the cakes; replace-all must write them.
+    for i, fr in enumerate(frames):
+        rng = np.random.default_rng(100 + i)
+        fr.int_2d.intensity = rng.random(fr.int_2d.intensity.shape).astype(
+            np.float32)
+    save_scan_to_nexus(scan, path, mode="a", finalize=False,
+                       replace_frame_indices=[0, 1, 2])
+    with h5py.File(path, "r") as f:
+        assert "entry/integrated_2d" in f
+        assert f["entry/integrated_2d/intensity"].shape[0] == 3
+
+
+def test_replace_with_shape_change_survives_one_publication_drop(tmp_path):
+    """Replace mode + changed row shape + ONE publication-rejected frame must
+    not abort the whole-scan save: the rejected frame's stale on-disk row is
+    dropped first, then validation sees a covered batch.  (Previously
+    _require_batch_covers_existing raised over the uncovered stale row and
+    NOTHING was persisted.)"""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "shape_change.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    # Reintegrate everything at a different npt; frame 1 comes out invalid.
+    new_nq = N_Q + 7
+    for i in range(3):
+        fresh = _DuckArch(idx=i, nq=new_nq, seed=50)
+        frames[i].int_1d = fresh.int_1d
+        frames[i].int_2d = fresh.int_2d
+    scan.bai_1d_args["numpoints"] = new_nq
+    scan.bai_2d_args["npt_rad"] = new_nq
+    _all_dummy_2d(frames[1])
+
+    save_scan_to_nexus(scan, path, mode="a", finalize=False,
+                       replace_frame_indices=[0, 1, 2])
+    with h5py.File(path, "r") as f:
+        # 1D (all valid): full new-shape stack
+        assert f["entry/integrated_1d/intensity"].shape == (3, new_nq)
+        # 2D: frame 1 dropped per frame, frames 0+2 written at the new
+        # shape (rows stored (nchi, nq) -- nq is the trailing axis)
+        i2d = f["entry/integrated_2d"]
+        assert i2d["intensity"].shape == (2, N_CHI, new_nq)
+        assert sorted(int(x) for x in i2d["frame_index"][()]) == [0, 2]

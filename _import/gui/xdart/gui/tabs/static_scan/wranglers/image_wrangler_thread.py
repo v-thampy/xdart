@@ -19,13 +19,7 @@ import glob
 import numpy as np
 from pathlib import Path
 from collections import deque
-
-# Per-worker pyFAI integrator pool — required for correct parallel
-# batch mode.  pyFAI's AzimuthalIntegrator isn't thread-safe across
-# different inputs on a shared instance, so each worker borrows its
-# own integrator copy from a per-scan pool.  See module docstring of
-# xdart.utils.integrator_pool for the full story.
-from xdart.utils.integrator_pool import ensure_integrator_pool
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +32,9 @@ from pyqtgraph import Qt
 
 # Project imports
 from xdart.modules.live import LiveFrame, LiveScan, IncidenceAngleUnresolved
-from ssrl_xrd_tools.integrate.gid import (
-    create_fiber_integrator,
-    freeze_common_axes_2d,
-    freeze_common_axis,
-    gi_1d_output_axis_key,
-)
+from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
+from ssrl_xrd_tools.reduction import GIFreezeError
 from ssrl_xrd_tools.io.image import read_image, count_frames
 from ssrl_xrd_tools.io.export import write_xye
 from ssrl_xrd_tools.io.nexus import find_nexus_image_dataset
@@ -52,10 +42,48 @@ from ssrl_xrd_tools.io.metadata import read_image_metadata
 from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
+    freeze_live_scan_gi_ranges,
+    frame_from_live_frame,
+    open_live_reduction_session,
     StandardPlanCache,
-    dispatch_live_frame_reduction,
+    reduce_live_frames,
+    sync_live_scan_gi_settings,
 )
+from .qt_nexus_sink import QtNexusSink
 from .wrangler_widget import wranglerThread
+
+# Batch execution policy (PERF-4b/WS-X1).  "streaming" (default) routes the
+# batch through one persistent ReductionSession + QtNexusSink (submit-per-frame,
+# single writer thread, thumbnail parallelized in the worker) — proven on the
+# 651-frame Eiger scan at 8 cores to be byte-identical to and >= the old chunked
+# path (2D 32.6s vs 38.8s, XYE 23.7s vs 25.4s, 1D ~equal).  "chunked" is the old
+# read-chunk -> integrate -> Phase-2-write path, kept one cycle as a fallback.
+#
+# Override without editing code: set XDART_BATCH_EXECUTION=chunked (or
+# =streaming) in the environment before launching xdart.  Read once at import.
+_BATCH_EXECUTION = os.environ.get("XDART_BATCH_EXECUTION", "streaming").strip().lower()
+if _BATCH_EXECUTION not in ("chunked", "streaming"):
+    logger.warning("XDART_BATCH_EXECUTION=%r is not 'chunked' or 'streaming'; "
+                   "using 'streaming'.", _BATCH_EXECUTION)
+    _BATCH_EXECUTION = "streaming"
+
+# Live (non-batch) execution policy (PERF-4b/WS-X1 #3 — unify live onto the
+# streaming sink).  "streaming" (DEFAULT as of the WS-X1 flip) routes a non-batch
+# *reprocess* (Phase 1/2 collect loop) through the SAME persistent
+# ReductionSession + QtNexusSink as batch — batch + reprocess share this write
+# path (true-live keeps its serial one, below) — and the parallel pool
+# pipelines I/O+compute (651-frame 2D reprocess ~30s vs ~60-76s serial; 1D ~21 vs
+# ~27s; the live display is published GUI-side via _published_frames, see
+# QtNexusSink._publish_display).  "serial" is the legacy per-frame _process_one
+# reprocess path, kept one cycle as a fallback (XDART_LIVE_EXECUTION=serial).
+# NOTE: the true-live *watch* (Phase 3, detector-rate, in-order one-at-a-time)
+# always uses _process_one regardless of this flag — streaming's parallelism is
+# moot there, and it stays the proven path.
+_LIVE_EXECUTION = os.environ.get("XDART_LIVE_EXECUTION", "streaming").strip().lower()
+if _LIVE_EXECUTION not in ("serial", "streaming"):
+    logger.warning("XDART_LIVE_EXECUTION=%r is not 'serial' or 'streaming'; "
+                   "using 'streaming'.", _LIVE_EXECUTION)
+    _LIVE_EXECUTION = "streaming"
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +132,18 @@ def _gi_2d_range_keys(args):
     return 'radial_range', 'azimuth_range'
 
 
+# The GI-scout cluster below (_padded_axis_range,
+# _result_intensity_all_dummy, _freeze_gi_2d_ranges_from_result,
+# _freeze_gi_1d_range_from_result, and the imageThread methods
+# _scout_pending_frames, _build_scout, _freeze_gi_1d_auto_range,
+# _freeze_gi_2d_auto_ranges) is LIVE PRODUCTION CODE: the streaming GI batch
+# prepass calls _freeze_gi_1d_auto_range/_freeze_gi_2d_auto_ranges in
+# _dispatch_batch_streaming to freeze the whole-scan common grid BEFORE
+# dispatch (do NOT delete it as dead).  ssrl's ReductionSession has its own
+# first-chunk freeze, which serves the serial/chunked paths; the streaming
+# prepass deliberately freezes earlier (whole pending set, not first chunk).
+# The GI live==batch==reload equivalence tests additionally bind these
+# methods via MethodType to validate the ssrl freeze against this scout.
 def _padded_axis_range(axis, pad_fraction=0.02):
     """Return a slightly padded finite range for an integrated axis.
 
@@ -203,19 +243,26 @@ _INT_PATTERN = re.compile(r'(\d+)')
 _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
 
 # Maximum number of frames to accumulate in the pending list before
-# dispatching a partial batch.  Keeps peak memory bounded when the input
-# contains thousands of frames in a single file (e.g. Bluesky .nxs with
-# a 1000-frame Eiger stack at 2167x2070 int32 ~= 18 GB if collected in
-# one go).  Larger values amortise ThreadPoolExecutor startup and the
-# end-of-batch scan._save_to_nexus flush across more frames, so raise
-# this when RAM allows.
+# dispatching a partial batch.  This is the batch *chunk* size: read N →
+# integrate N across workers → thumbnails → serial HDF5 write → repeat.
+# Each barrier (read/integrate/write phase boundary) leaves cores idle, so
+# fewer, bigger chunks amortise the ThreadPoolExecutor dispatch + the
+# end-of-batch scan._save_to_nexus flush over more frames (PERF-4a).
 #
-# 16 frames of a 2167x2070 int32 Eiger image is ~300 MB of peak buffer
-# — fits comfortably on a slow-disk laptop while still giving the user
-# visible per-batch UI refreshes every ~25 s at typical 1.5 s/frame
-# integration.  Earlier value of 64 made first-batch latency painful on
-# spinning-disk source files (16-frame reads finish ~4× sooner).
-_PENDING_FLUSH_SIZE = 16
+# Peak buffer per batch ≈ flush_size × ~18 MB (one 2167x2070 int32 Eiger
+# frame), plus the 2D cake per frame.  PERF-3 frees each frame's raw at
+# end-of-batch, so this peak is now bounded to ONE chunk regardless of scan
+# length (pre-PERF-3 the stash pinned raw for every frame for the whole
+# scan), which is what makes raising the chunk size safe.  64 frames ≈
+# ~1.5 GB peak — fine on a workstation; dial back toward 16 only on a
+# RAM-starved / spinning-disk laptop (smaller reads finish sooner, so
+# first-batch latency is lower).
+_PENDING_FLUSH_SIZE = 64
+# 1D-only batches carry no multi-MB cake arrays, so a larger pending buffer
+# (fewer, bigger parallel dispatches) is cheaper without the 2D RAM cost.  Kept
+# separate so the 2D-sized buffer is never globally raised.  256 × ~18 MB ≈
+# ~4.6 GB peak (PERF-3 bounds it to one chunk).  (PERF-2 / PERF-4a)
+_PENDING_FLUSH_SIZE_1D = 256
 
 # How many integrated frames to accumulate between v2 _save_to_nexus
 # Live-save cadence and threshold-sentinel constants moved to the
@@ -319,6 +366,10 @@ class imageThread(wranglerThread):
         run: Main method, called by start
     """
     showLabel = Qt.QtCore.Signal(str)
+    # Pause: emitted (on the worker thread) AFTER _enter_pause has drained the
+    # in-flight window + flushed the sink to .nxs at a frame boundary -- the GUI
+    # slot then lifts the freeze guard, race-safely (writer is provably quiet).
+    sigPaused = Qt.QtCore.Signal()
 
     def __init__(
             self,
@@ -365,6 +416,12 @@ class imageThread(wranglerThread):
         super().__init__(command_queue, scan_args, fname, file_lock, parent)
 
         self.h5_dir = h5_dir
+        # Pause: the LiveScan currently being processed (a local in
+        # process_scan), stashed so _enter_pause's serial branch can flush it.
+        self._active_scan = None
+        # N1: project root for portable @source_base; set from the wrangler in
+        # setup() (None -> absolute raw paths, back-compat).
+        self.source_base = None
         self.scan_name = scan_name
         self.single_img = single_img
         self.poni = poni
@@ -472,6 +529,11 @@ class imageThread(wranglerThread):
         self.img_fnames.clear()
         self.processed.clear()
         self.processed_scans.clear()
+        # Pause: start each run with a fresh serial-flush handle + save counter
+        # so an early pause of THIS run can never flush a prior (stopped) run's
+        # scan via stale state.
+        self._active_scan = None
+        self._frames_since_save = 0
         self._eiger_master_path = None
         self._eiger_frame_idx = 0
         self._eiger_nframes = 0
@@ -506,6 +568,7 @@ class imageThread(wranglerThread):
         try:
             self.process_scan()
         finally:
+            self._close_reduction_session()
             # Stop background prefetcher from the main thread BEFORE closing the
             # master handle.  _eiger_close_master() is called from inside the
             # prefetch worker when switching masters, so triggering a stop from
@@ -513,11 +576,6 @@ class imageThread(wranglerThread):
             # prefetcher.
             self._prefetch_stop_prior()
             self._eiger_close_master()  # ensure Eiger handle is released
-            # Reclaim the persistent integration pool at end of run instead of
-            # leaking its worker threads until QThread.__del__ (which can also
-            # block the finalizer if a worker is wedged in pyFAI).  The pool is
-            # reused per-chunk WITHIN a run; recreated on the next run.
-            self._shutdown_executor()
         logger.info('Total Time: %.2fs', time.time() - t0)
         # Final echo so the user can copy the output path straight from
         # the terminal without scrolling back to the per-scan banner.
@@ -544,6 +602,11 @@ class imageThread(wranglerThread):
         files_processed = 0
         _cached_poni = None
         is_eiger = _is_eiger_master(self.img_file) if self.img_file else False
+        # One-time visibility into which execution path this run takes (so the
+        # XDART_BATCH_EXECUTION / XDART_LIVE_EXECUTION flags are observable).
+        # DEBUG: developer diagnostics, not run output.
+        logger.debug('Execution policy: batch_mode=%s  batch=%s  live=%s',
+                     self.batch_mode, self._batch_execution(), self._live_execution())
 
         # ── Phase 1 & 2: collect then process all existing images ─────────────
         pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]
@@ -552,6 +615,7 @@ class imageThread(wranglerThread):
         _t_read_accum = 0.0
 
         while True:
+            self._wait_if_paused()        # freeze here (before reading) if paused
             if self.command == 'stop':
                 break
 
@@ -560,18 +624,29 @@ class imageThread(wranglerThread):
             _t_read_this = time.time() - _t_r0
             _t_read_accum += _t_read_this
             if img_data is None:
+                if not self.batch_mode and pending:
+                    logger.info('Collected %d image(s) in %.2fs',
+                                len(pending), _t_read_accum)
                 break  # initial glob exhausted — move on to processing
             if img_file is not None:
                 fname = os.path.splitext(os.path.basename(img_file))[0]
                 # When the input is a multi-frame container (HDF5/NeXus/Eiger master),
                 # include the frame index so progress is visible.
                 _ext = Path(img_file).suffix.lower()
-                if _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file):
-                    self.showLabel.emit(
-                        f'Collecting {self._middle_truncate(fname)} [frame {img_number}]'
-                    )
+                _multi = _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file)
+                _label = (f'Collecting {self._middle_truncate(fname)} [frame {img_number}]'
+                          if _multi else
+                          f'Collecting {self._middle_truncate(fname)}')
+                if self.batch_mode:
+                    # Batch: the label is the only progress feedback while the
+                    # whole pending set is read up front.
+                    self.showLabel.emit(_label)
                 else:
-                    self.showLabel.emit(f'Collecting {self._middle_truncate(fname)}')
+                    # Live: frames dispatch as they arrive, so the completion
+                    # status (sink) supersedes this within ms -- showing it
+                    # just flickered.  Keep it greppable at DEBUG; a single
+                    # summary INFO is logged when collection finishes.
+                    logger.debug(_label)
             else:
                 logger.warning('Invalid image file, skipping')
                 continue
@@ -629,11 +704,13 @@ class imageThread(wranglerThread):
                     )
                     self._frames_since_save = 0
                 scan = self.initialize_scan()
+                self._active_scan = scan      # Pause: serial-flush handle
                 _cached_poni = None
 
             # Rebuild cached AzimuthalIntegrator when poni identity changes
             if self.poni is not _cached_poni:
                 scan._cached_integrator = poni_to_integrator(self.poni)
+                scan._cached_poni = self.poni
                 scan._cached_fiber_integrator = None
                 _cached_poni = self.poni
                 self._cached_gi_incident_angle = None
@@ -655,13 +732,17 @@ class imageThread(wranglerThread):
                 break
 
             # ── Dispatch cadence ────────────────────────────────────────────
-            # Batch mode keeps the 16-frame pending buffer so the
-            # ThreadPoolExecutor can integrate them in parallel.
-            # Live (non-batch) mode dispatches immediately so the GUI
-            # sees per-frame updates as soon as each image lands; the
-            # disk save still gets batched separately inside
+            # Batch mode accumulates a pending buffer (_PENDING_FLUSH_SIZE /
+            # _PENDING_FLUSH_SIZE_1D) so the headless reduction spine can
+            # integrate them in parallel.  Live (non-batch) mode dispatches
+            # immediately so the GUI sees per-frame updates as soon as each
+            # image lands; the disk save still gets batched separately inside
             # _dispatch_batch_serial via _frames_since_save.
-            flush_size = _PENDING_FLUSH_SIZE if self.batch_mode else 1
+            flush_size = (
+                (_PENDING_FLUSH_SIZE_1D if getattr(self.scan, "skip_2d", False)
+                 else _PENDING_FLUSH_SIZE)
+                if self.batch_mode else 1
+            )
             if len(pending) >= flush_size:
                 if self.batch_mode:
                     self.showLabel.emit(
@@ -718,6 +799,9 @@ class imageThread(wranglerThread):
             _poll_growth = 2.0
             poll_s = _poll_min
             while self.command != 'stop':
+                self._wait_if_paused()    # pause/examine/resume a live acquisition
+                if self.command == 'stop':
+                    break                 # Pause -> Stop while watching
                 img_file, scan_name, img_number, img_data, img_meta = self.get_next_image()
                 if img_data is None:
                     # Nothing new yet — show watching status and sleep
@@ -734,10 +818,12 @@ class imageThread(wranglerThread):
 
                 if (scan is None) or (scan_name != scan.name):
                     scan = self.initialize_scan()
+                    self._active_scan = scan  # Pause: serial-flush handle
                     _cached_poni = None
 
                 if self.poni is not _cached_poni:
                     scan._cached_integrator = poni_to_integrator(self.poni)
+                    scan._cached_poni = self.poni
                     scan._cached_fiber_integrator = None
                     _cached_poni = self.poni
                     self._cached_gi_incident_angle = None
@@ -752,7 +838,11 @@ class imageThread(wranglerThread):
                 self._process_one(scan, img_file, img_number, img_data, img_meta, bg_raw)
                 files_processed += 1
                 self._frames_since_save += 1
-                if self._frames_since_save >= self.LIVE_SAVE_INTERVAL and not self.xye_only:
+                if self.xye_only:
+                    # No .nxs save in this mode -- drain the XYE buffer per
+                    # frame so output appears as the watch processes files.
+                    self._flush_xye_buffer(scan)
+                if self._save_due(scan):
                     _get_h5pool().pause(scan.data_file)
                     try:
                         with self.file_lock:
@@ -764,6 +854,8 @@ class imageThread(wranglerThread):
 
         # Final flush on exit (live-watch tail or stop request) so the
         # last few frames aren't lost.
+        if scan is not None and self.xye_only:
+            self._flush_xye_buffer(scan)
         if (scan is not None and not self.xye_only
                 and self._frames_since_save > 0):
             _get_h5pool().pause(scan.data_file)
@@ -789,12 +881,27 @@ class imageThread(wranglerThread):
         parallel path always saves at end of batch by construction
         (the whole point of batch mode is one big save per dispatch).
         """
-        self._freeze_gi_1d_auto_range(scan, pending)
-        self._freeze_gi_2d_auto_ranges(scan, pending)
         self._maybe_warn_live_gi_clip()
         if self.batch_mode and len(pending) > 1:
+            if self._batch_execution() == "streaming":
+                return self._dispatch_batch_streaming(scan, pending)
             return self._dispatch_batch_parallel(scan, pending)
+        # Live (non-batch): #3 routes it through the SAME streaming session +
+        # QtNexusSink (which does the per-frame display publish for live), behind
+        # the live flag; the proven per-frame _process_one path is the default.
+        if self._live_execution() == "streaming":
+            return self._dispatch_batch_streaming(scan, pending)
         return self._dispatch_batch_serial(scan, pending, force_save=force_save)
+
+    def _batch_execution(self) -> str:
+        """Active batch execution policy ('chunked' | 'streaming').  Instance
+        override (``self.batch_execution``) wins over the module default."""
+        return getattr(self, "batch_execution", None) or _BATCH_EXECUTION
+
+    def _live_execution(self) -> str:
+        """Active live (non-batch) execution policy ('serial' | 'streaming').
+        Instance override (``self.live_execution``) wins over the module default."""
+        return getattr(self, "live_execution", None) or _LIVE_EXECUTION
 
     def _maybe_warn_live_gi_clip(self) -> None:
         """One-time advisory for live GI runs (#75).
@@ -827,6 +934,566 @@ class imageThread(wranglerThread):
     # in May 2026 — both imageThread and nexusThread inherit them now.
     # See xdart/gui/tabs/static_scan/wranglers/wrangler_widget.py.
 
+    # RESTRUCTURE-TODO(B2): _scout_pending_frames / _build_scout /
+    # _freeze_gi_1d_auto_range / _freeze_gi_2d_auto_ranges are test-only scout
+    # fixtures (see the cluster note near _padded_axis_range) -- relocate to a
+    # tests/ helper module with the GI-equivalence test refactor.
+    def _scout_pending_frames(self, pending):
+        """Return bounded representative pending entries for freeze tests.
+
+        Production no longer calls this pre-pass; GI common-grid freezing is
+        driven by :class:`ssrl_xrd_tools.reduction.ReductionSession` when the
+        reduction session opens.  The method remains as a compatibility fixture
+        for real-data tests that inspect scout selection directly.
+        """
+        if len(pending) <= 1:
+            return list(pending)
+        motor = self.incidence_motor
+        try:
+            float(motor)
+            return [pending[0]]
+        except (TypeError, ValueError):
+            pass
+        resolved = []
+        any_unresolved = False
+        for i, entry in enumerate(pending):
+            meta = entry[3] or {}
+            try:
+                resolved.append((i, float(meta.get(motor))))
+            except (TypeError, ValueError):
+                any_unresolved = True
+        idxs = set()
+        if resolved:
+            idxs.add(min(resolved, key=lambda item: item[1])[0])
+            idxs.add(max(resolved, key=lambda item: item[1])[0])
+        if any_unresolved or not resolved:
+            idxs.update((0, len(pending) - 1))
+        return [pending[i] for i in sorted(idxs)]
+
+    def _build_scout(self, scan, entry):
+        """Build a temporary ``LiveFrame`` for the headless freeze adapter."""
+        img_file, img_number, img_data, img_meta, bg_raw, _ = entry
+        img_data = self._apply_threshold_inline(img_data)
+        frame_mask = self._resolve_frame_mask(scan, img_data)
+        scratch = LiveFrame(
+            img_number, img_data, poni=self.poni,
+            scan_info=img_meta, static=True, gi=True,
+            th_mtr=self.incidence_motor, bg_raw=bg_raw,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
+            series_average=self.series_average,
+            integrator=scan._cached_integrator,
+            mask=frame_mask,
+        )
+        if img_file:
+            scratch.source_file = os.path.abspath(str(img_file))
+        if _raw_lives_in_source(img_file):
+            scratch.source_frame_idx = int(img_number) - 1
+        else:
+            scratch.source_frame_idx = 0
+        scratch._get_incident_angle()
+        return scratch
+
+    def _freeze_gi_1d_auto_range(self, scan, pending) -> None:
+        """Compatibility wrapper for tests; delegates freeze to ssrl."""
+        if not self.gi or not pending:
+            return
+        args = getattr(scan, 'bai_1d_args', None)
+        if not isinstance(args, dict):
+            return
+        key = gi_1d_output_axis_key(args.get('gi_mode_1d', 'q_total'))
+        if args.get(key) is not None:
+            return
+        sync_live_scan_gi_settings(
+            scan,
+            incidence_motor=self.incidence_motor,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
+        )
+        scouts = [self._build_scout(scan, entry)
+                  for entry in self._scout_pending_frames(pending)]
+        freeze_live_scan_gi_ranges(
+            scan,
+            scouts,
+            scan_name=str(getattr(scan, "name", "scan")),
+            global_mask=self.mask,
+            integrator=getattr(scan, "_cached_integrator", None),
+            poni=self.poni,
+            integrate_1d=True,
+            integrate_2d=False,
+            gi_freeze_mode="scout_union" if self.batch_mode else "first_frame",
+        )
+
+    def _freeze_gi_2d_auto_ranges(self, scan, pending) -> None:
+        """Compatibility wrapper for tests; delegates freeze to ssrl."""
+        if (not self.gi or self.xye_only or getattr(scan, 'skip_2d', False)
+                or not pending):
+            return
+        args = getattr(scan, 'bai_2d_args', None)
+        if not isinstance(args, dict):
+            return
+        keys = _gi_2d_range_keys(args)
+        if all(args.get(key) is not None for key in keys):
+            return
+        sync_live_scan_gi_settings(
+            scan,
+            incidence_motor=self.incidence_motor,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
+        )
+        scouts = [self._build_scout(scan, entry)
+                  for entry in self._scout_pending_frames(pending)]
+        freeze_live_scan_gi_ranges(
+            scan,
+            scouts,
+            scan_name=str(getattr(scan, "name", "scan")),
+            global_mask=self.mask,
+            integrator=getattr(scan, "_cached_integrator", None),
+            poni=self.poni,
+            integrate_1d=False,
+            integrate_2d=True,
+            gi_freeze_mode="scout_union" if self.batch_mode else "first_frame",
+        )
+
+    def _gi_ranges_fully_pinned(self, scan) -> bool:
+        """True when every GI output range this run would auto-freeze is
+        already explicitly set (T0-3).
+
+        Mirrors the self-skip conditions of :meth:`_freeze_gi_1d_auto_range`
+        (the active 1D mode's output-axis range key is set) and
+        :meth:`_freeze_gi_2d_auto_ranges` (both of the active 2D mode's range
+        keys are set; 2D irrelevant for XYE-only / skip_2d runs).  When all
+        relevant ranges are pinned there is no auto grid to freeze, so the
+        whole-scan scout — and its fail-closed abort on unverifiable sources —
+        is unnecessary.  Conservative: any non-dict args → False (let the
+        normal prepass decide)."""
+        args_1d = getattr(scan, 'bai_1d_args', None)
+        if not isinstance(args_1d, dict):
+            return False
+        key = gi_1d_output_axis_key(args_1d.get('gi_mode_1d', 'q_total'))
+        if args_1d.get(key) is None:
+            return False
+        if self.xye_only or getattr(scan, 'skip_2d', False):
+            return True
+        args_2d = getattr(scan, 'bai_2d_args', None)
+        if not isinstance(args_2d, dict):
+            return False
+        return all(args_2d.get(k) is not None
+                   for k in _gi_2d_range_keys(args_2d))
+
+    # ── BLOCKER 1: whole-scan GI grid freeze (streaming batch) ──────────────
+    def _gi_freeze_whole_scan_prepass(self, scan) -> bool:
+        """Freeze the GI common q/χ grid from the WHOLE scan's incidence range
+        BEFORE the streaming session opens.
+
+        The streaming batch session is built from the FIRST chunk only, so its
+        ``scout_union`` would bracket chunk 1's incidence range and clip later,
+        higher-incidence frames (BLOCKER 1).  Here a CHEAP metadata-only sweep
+        finds the global lowest+highest-incidence frames, loads ONLY those two
+        images, and runs the existing whole-scan freeze
+        (:meth:`_freeze_gi_1d_auto_range` / :meth:`_freeze_gi_2d_auto_ranges`,
+        which delegate to ``freeze_live_scan_gi_ranges``) to write the UNION
+        ranges into ``scan.bai_*_args``.  The streaming session then rebuilds its
+        plan with those ranges (``StandardPlanCache`` keys on ``bai_*_args``) and
+        its own per-session freeze early-returns -> the whole batch shares the
+        union grid.  The two scouts are integrated only inside the throwaway
+        freeze session, never submitted to the streaming session -> no double
+        processing.
+
+        Batch + streaming + GI only.  True-live keeps ``first_frame`` serial (it
+        has no whole scan ahead of time); the chunked batch path already builds
+        the full pending up front so its first/last ARE the scan extremes.
+        Runs once per scan.  Eiger single-master (one incidence per master) and
+        fixed/manual incidence collapse to the existing behaviour (no whole-scan
+        scout) -- the grid was never chunk-clipped there.
+
+        **Policy (T0-4, Vivek 2026-06-09): warn-and-proceed.**  When the
+        whole-scan incidence range cannot be established (unverifiable source,
+        unreadable metadata, scout failure), the run PROCEEDS on the session's
+        own first-chunk freeze with a one-time user-visible advisory, instead
+        of aborting.  Rationale: frames are binned natively onto the common
+        grid (values inside the range are exact — no interpolation), and at
+        the beamline incidence varies too little for the cropped extreme tails
+        to matter; the union sweep is kept where it is free (Image-Series with
+        readable metadata).  The ONLY fail-closed exit left is a freeze that
+        actually errors (e.g. a degenerate scout cake) — proceeding there
+        would integrate onto a broken grid, not a slightly narrow one.
+
+        Returns ``True`` when the caller may open the session, ``False`` when
+        the run was aborted (freeze error only; caller must not proceed).
+        """
+        if not (self.gi and self.batch_mode
+                and self._batch_execution() == "streaming"):
+            return True
+        if getattr(self, "_gi_prepass_scan_id", None) == id(scan):
+            return True
+        if self._gi_ranges_fully_pinned(scan):
+            # T0-3: every GI output range this run would auto-freeze is already
+            # explicitly set — the freeze functions self-skip and the session's
+            # own per-session freeze early-returns, so there is no auto grid to
+            # chunk-clip and no scout sweep is needed.  Without this pre-flight
+            # the "unverifiable" abort below fired even for fully-pinned runs
+            # (and its "set fixed/manual GI ranges" remedy didn't work).
+            self._gi_prepass_scan_id = id(scan)   # latch: decided for this scan
+            return True
+        try:
+            status, scouts = self._gi_whole_scan_scout_entries(scan)
+        except Exception as exc:
+            # T0-4 warn-and-proceed: a scout failure means we lose the union
+            # sweep, not correctness — the first-chunk freeze is acceptable.
+            self._warn_gi_first_chunk_freeze(
+                f"scout pre-pass raised ({exc})", scan)
+            self._gi_prepass_scan_id = id(scan)
+            return True
+        if status == "abort":
+            # Sweep ran but couldn't read enough incidences from metadata.
+            self._warn_gi_first_chunk_freeze(
+                "could not establish the whole-scan incidence range from "
+                "frame metadata", scan)
+            self._gi_prepass_scan_id = id(scan)
+            return True
+        if status == "unverifiable":
+            # Image-Directory or named-motor Eiger: per-frame incidence can't
+            # be cheaply swept up front (for Eiger it lives in the SPEC
+            # sidecar, per frame).  T0-4 policy: proceed on the first-chunk
+            # freeze with an advisory — values inside the grid are exact; only
+            # extreme-incidence tails beyond it are cropped.
+            source = (getattr(self, "inp_type", None) or
+                      ("Eiger master" if (getattr(self, "img_file", "") and
+                                          _is_eiger_master(getattr(self, "img_file", "")))
+                       else "this source"))
+            self._warn_gi_first_chunk_freeze(
+                f"the whole-scan incidence range cannot be swept up front for "
+                f"'{source}'", scan)
+            self._gi_prepass_scan_id = id(scan)
+            return True
+        if status == "freeze":
+            # These self-skip when the relevant ranges are already set, and
+            # freeze the UNION over the two extreme scouts we hand them (NOT a
+            # chunk).  A degenerate scout cake raises GIFreezeError here --
+            # that stays FAIL-CLOSED via _abort_gi_prepass (the freeze ran and
+            # produced a broken grid, not a narrow one) and must not escape
+            # the worker thread (run() has no except).
+            try:
+                self._freeze_gi_1d_auto_range(scan, scouts)
+                self._freeze_gi_2d_auto_ranges(scan, scouts)
+            except Exception as exc:
+                self._abort_gi_prepass(f"whole-scan grid freeze failed ({exc})")
+                return False
+        # status == "skip": fixed/manual/single-incidence/Eiger -- the session's
+        # own freeze is correct (the grid was never chunk-clipped there).
+        self._gi_prepass_scan_id = id(scan)   # latch only after success
+        return True
+
+    def _warn_gi_first_chunk_freeze(self, reason: str, scan=None) -> None:
+        """T0-4 warn-and-proceed advisory: the GI output grid will be frozen
+        from the first frames instead of the whole-scan incidence union.
+        Values inside the grid are exact (frames bin natively onto it); only
+        extreme-incidence tails beyond it are cropped — accepted at the
+        beamline (incidence varies too little to matter).  One per scan: the
+        prepass latches the scan id right after this fires.
+
+        When ``scan`` is given the advisory is also stamped onto it
+        (``gi_freeze_diagnostic``) so the writer persists it in
+        ``/entry/reduction/config`` — the disclosure survives in the output
+        file, not just as a transient GUI label."""
+        msg = (
+            'GI: ' + reason + ' — output grid set from the first frames; '
+            're-integrate with explicit 1D/2D ranges if you need the full '
+            'incidence extent.')
+        logger.info(msg)
+        if scan is not None:
+            try:
+                scan.gi_freeze_diagnostic = msg
+            except Exception:
+                logger.debug("could not stamp gi_freeze_diagnostic",
+                             exc_info=True)
+        try:
+            self.showLabel.emit(msg)
+        except Exception:
+            logger.debug("showLabel emit failed for GI first-chunk-freeze "
+                         "advisory", exc_info=True)
+
+    def _abort_gi_prepass(self, reason: str) -> None:
+        """Fail-closed exit for a GI freeze that actually ERRORED (degenerate
+        scout cake etc.): surface a user-visible error and STOP the streaming
+        GI run rather than integrate onto a broken grid.  (Unverifiable /
+        unreadable-metadata cases warn-and-proceed instead — see
+        _warn_gi_first_chunk_freeze.)"""
+        msg = (
+            'GI batch aborted: cannot freeze a whole-scan q/χ grid (' + reason +
+            '). Refusing to integrate onto a partial grid that would clip later '
+            'frames. Set Theta Motor to Manual and enter the incident angle, or '
+            'check the per-frame metadata, then restart.')
+        logger.error(msg)
+        try:
+            self.showLabel.emit(msg)
+        except Exception:
+            logger.debug("showLabel emit failed for GI prepass abort",
+                         exc_info=True)
+        # Stop the collection loop loudly (mirrors a write-failure stop); the
+        # close path then drains/closes any partially-built session.  Under
+        # command_lock so a concurrent GUI pause() can't overwrite it (RS-2).
+        # getattr: tests drive this on duck holders without the lock.
+        _lock = getattr(self, "command_lock", None)
+        if _lock is not None:
+            with _lock:
+                self.command = 'stop'
+        else:
+            self.command = 'stop'
+
+    def _gi_whole_scan_scout_entries(self, scan):
+        """Decide how to freeze the whole-scan GI grid and, when needed, gather
+        the scout images.  Returns ``(status, entries)``:
+
+        - ``("skip", [])`` — fixed/manual angle, Eiger/master, Image-Directory,
+          a single-frame scan, or a swept scan with one incidence: the existing
+          chunk-local / session freeze is correct (the grid was never clipped).
+        - ``("freeze", [lo_entry, hi_entry])`` — a varying-incidence per-file
+          scan whose extremes were resolved from readable metadata; ``entries``
+          are ``(img_file, img_number, img_data, img_meta, bg_raw, 0.0)`` for the
+          global lowest+highest incidence frames, with their images loaded.
+        - ``("abort", [])`` — a multi-file scan whose incidence we genuinely
+          cannot establish (fewer than two readable incidences across the whole
+          series).  The caller warns and proceeds on the first-chunk freeze
+          (T0-4 policy; the status name predates it).
+
+        Robust to per-frame metadata GAPS: it finds the extremes from the
+        readable frames and only aborts when it can't read enough to establish a
+        global range at all (BLOCKER 1 follow-up)."""
+        motor = self.incidence_motor
+        try:
+            float(motor)        # fixed/manual: one angle for the whole scan
+            return "skip", []
+        except (TypeError, ValueError):
+            pass
+        files = self._enumerate_scan_files()
+        if not files:
+            # _enumerate_scan_files() returns [] for sources that can't be cheaply
+            # swept per-frame.  Distinguish the safe cases (skip) from the risky
+            # ones (unverifiable = we can't confirm the whole-scan range, so the
+            # caller must fail closed rather than silently clip later frames):
+            #
+            # SAFE ("skip"):
+            #   - Eiger SINGLE-master (one incidence per master → fixed grid, the
+            #     session's own freeze is correct and was never chunk-clipped).
+            #   - Any scan whose source-host attrs are absent/incomplete (no file
+            #     to check → missing-source host, not a TIFF angle-dependence run).
+            # RISKY ("unverifiable"):
+            #   - Image-Directory per-file GI scan (inp_type == 'Image Directory'):
+            #     a TIFF angle-dependence sweep that _enumerate_scan_files() skips.
+            #     The session WOULD clip later higher-incidence frames.
+            #   - Eiger master when the motor is not fixed/manual (if multi-master
+            #     Eiger is possible: each master a different incidence → same clip
+            #     risk; we can't distinguish single- vs multi-master before the run).
+            #
+            # For "unverifiable" the caller WARNS and proceeds on the
+            # first-chunk freeze (T0-4 policy: cropped extreme tails are
+            # accepted; values inside the grid are exact).  Source-aware
+            # whole-scan incidence enumeration remains a possible refinement,
+            # demoted from correctness work to nice-to-have.
+            img_file = getattr(self, "img_file", None) or ""
+            if getattr(self, "inp_type", None) == "Image Directory":
+                # Per-file angle-dependence loaded as a directory: can't sweep.
+                return "unverifiable", []
+            if img_file and _is_eiger_master(img_file):
+                # Eiger master: single-master (fixed angle per master) is safe;
+                # multi-master (varying angle) is risky but indistinguishable
+                # here.  Conservatively treat any non-fixed-motor Eiger as
+                # unverifiable so a multi-master angle-dependence can't clip.
+                return "unverifiable", []
+            # Missing source attrs / no img_file: can't be an angle-dependence sweep.
+            return "skip", []
+        if len(files) < 2:
+            return "skip", []   # single-frame scan: no incidence range to freeze
+        resolved = []
+        for fname, img_number in files:
+            try:
+                meta = (read_image_metadata(fname, meta_format=self.meta_ext,
+                                            meta_dir=self.meta_dir)
+                        if self.meta_ext else {})
+            except Exception:
+                continue            # tolerate a per-frame metadata gap
+            ang = self._resolve_incidence_from_meta(meta, motor)
+            if ang is not None:
+                resolved.append((ang, fname, img_number, meta))
+        if len(resolved) < 2:
+            # A multi-file (≥2) scan whose incidence we can't read for at least
+            # two frames: we cannot establish the global range -> fail CLOSED.
+            return "abort", []
+        lo = min(resolved, key=lambda r: r[0])
+        hi = max(resolved, key=lambda r: r[0])
+        if lo[0] == hi[0]:          # no incidence sweep -> chunk grid is fine
+            return "skip", []
+        entries = []
+        for _ang, fname, img_number, meta in (lo, hi):
+            data = np.asarray(read_image(fname), dtype=float)
+            # bg is irrelevant to the frozen AXIS extent (geometry+incidence
+            # driven), so a failing/missing background must NOT abort an
+            # otherwise-valid GI run -- degrade to 0 for the axis-only scout
+            # rather than let the prepass turn it into a fail-closed stop.
+            try:
+                bg = self.get_background(fname, img_number, meta)
+            except Exception:
+                logger.debug("GI scout background failed for %s; using 0 for the "
+                             "axis-only scout", fname, exc_info=True)
+                bg = 0.0
+            entries.append((fname, img_number, data, meta, bg, 0.0))
+        return "freeze", entries
+
+    @staticmethod
+    def _resolve_incidence_from_meta(meta, motor):
+        """Case-insensitive lookup of the incidence motor in a frame's metadata
+        -> float, or None if absent/non-numeric (mirrors LiveFrame._get_incident_angle)."""
+        if not isinstance(meta, dict):
+            return None
+        ml = str(motor).lower()
+        for key, val in meta.items():
+            if str(key).lower() == ml:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _enumerate_scan_files(self):
+        """Sorted ``(fname, img_number)`` for a per-file scan series, metadata
+        only (NO image read).  Returns ``[]`` for Eiger/HDF5 masters and
+        Image-Directory sources that can't be cheaply per-frame swept (and,
+        defensively, for any host missing the source attrs)."""
+        img_file = getattr(self, "img_file", None)
+        if not img_file or _is_eiger_master(img_file):
+            return []
+        img_ext = getattr(self, "img_ext", "") or ""
+        if img_ext.lower() in ('h5', 'hdf5', 'nxs'):
+            return []
+        if getattr(self, "inp_type", None) == 'Image Directory':
+            return []
+        scan_name = getattr(self, "scan_name", None)
+        img_dir = getattr(self, "img_dir", None)
+        if not scan_name or not img_dir:
+            return []
+        _series_re = re.compile(
+            rf'^{re.escape(scan_name)}_\d+\.{re.escape(img_ext)}$')
+        paths = [str(p) for p in Path(img_dir).glob(
+                     f'{scan_name}_*.{img_ext}')
+                 if _series_re.match(p.name)]
+        out = []
+        for fname in natural_sort_ints(paths):
+            _sname, snumber = _get_scan_info(fname)
+            out.append((fname, snumber))
+        return out
+
+    # ── Pause / Resume ──────────────────────────────────────────────────────
+    def _wait_if_paused(self) -> None:
+        """Block while a Pause is in effect, WITHOUT tearing down the scan or
+        session.  Pause is a THIRD command state between the run state
+        (``'start'``) and ``'stop'`` (the loops treat everything != 'stop' as go,
+        so 'pause' must be special-cased here).
+
+        On the first entry to pause, :meth:`_enter_pause` brings the file to a
+        frame-boundary idle state and emits ``sigPaused`` so the GUI lifts the
+        freeze guard for browsing; then we spin until ``command`` leaves
+        ``'pause'`` — either ``'start'`` (resume: the caller continues its loop on
+        the same open session) or ``'stop'`` (the caller's existing stop-check
+        breaks next).  Call at the TOP of every processing loop, ABOVE the
+        stop-check, so nothing new is read/submitted while paused.  The
+        ``while`` exits on stop, so this is shutdown-safe (close() sets 'stop').
+        """
+        if self.command != 'pause':
+            return
+        self._enter_pause()
+        while self.command == 'pause':
+            time.sleep(0.05)
+
+    #: Bound the pause drain so a hung pool worker (stalled IO / runaway pyFAI)
+    #: can't deadlock the pause; the wait also bails early on Stop/close.
+    PAUSE_DRAIN_TIMEOUT = 30.0
+
+    def _enter_pause(self) -> None:
+        """Quiesce the writer at a frame boundary so a paused user can browse any
+        already-processed frame from disk, then signal the GUI to lift the guard.
+
+        Routing is keyed on the SERIAL tail first: ``_frames_since_save > 0`` is
+        the unambiguous signal that the serial path is the active writer (the
+        true-live watch loop uses ``_process_one`` and increments it; the
+        streaming path never does).  So during Phase-3 live watching — where the
+        Phase-2 streaming session is still open but DORMANT — the serial flush
+        correctly wins and the watch tail (incl. its XYE buffer) is persisted and
+        the counter reset.  Otherwise the streaming branch drains+flushes.
+
+        STRICT ordering: drain/flush MUST complete BEFORE ``sigPaused`` so the
+        writer is provably idle before the GUI reads disk (race-safe).  The drain
+        is bounded (:attr:`PAUSE_DRAIN_TIMEOUT`) + cancel-aware so a stuck worker
+        can't strand the pause or block Stop/close.
+        """
+        try:
+            session = getattr(self, '_streaming_session', None)
+            sink = getattr(self, '_streaming_sink', None)
+            scan = self._active_scan
+            # Drain any open streaming session first (a no-op when nothing is
+            # in-flight) so the writer is provably idle before we touch the
+            # file from THIS thread.
+            drained = True
+            if session is not None:
+                drained = session.drain(
+                    timeout=getattr(self, 'PAUSE_DRAIN_TIMEOUT', 30.0))
+            if not drained:
+                # RS-1: the writer is provably NOT idle (a stalled worker) — a
+                # save/flush from this thread would race the writer's own
+                # write()→_flush() (single-writer invariant), and resetting the
+                # save counter without saving would break persist-before-evict.
+                # Pause still proceeds (submits have stopped); the tail flushes
+                # on resume/finish.
+                logger.warning("pause drain timed out (worker not idle); "
+                               "pausing without a flush")
+            elif scan is not None and self._frames_since_save > 0:
+                # Serial path is the active writer (watch loop / serial
+                # dispatch): flush the serial tail.
+                if not self.xye_only:
+                    _get_h5pool().pause(scan.data_file)
+                    try:
+                        with self.file_lock:
+                            scan._save_to_nexus()
+                    finally:
+                        _get_h5pool().resume(scan.data_file)
+                self._flush_xye_buffer(scan)
+                self._frames_since_save = 0
+            elif session is not None and sink is not None:
+                # Streaming path (batch / reprocess / live Phase 2): in-flight
+                # window drained (non-terminal — session stays open) + flush.
+                sink._flush(force=True)
+        except Exception:
+            # A drain/flush failure must not strand the run; log loudly and
+            # still signal the pause (we've stopped submitting, so the writer is
+            # idle and disk reads are safe even if the final flush lagged).
+            logger.error("error draining/flushing on pause", exc_info=True)
+        finally:
+            self.sigPaused.emit()
+
+    def _save_due(self, scan, *, force=False):
+        """Whether a non-batch v2 save should fire now (persist-before-evict).
+
+        A save is due when forced (final flush), when ``LIVE_SAVE_INTERVAL``
+        frames have accumulated since the last save, OR when the *unsaved*
+        in-memory frame set is about to reach the frame-cache cap
+        (``LiveFrameSeries._in_memory_cap``).  The cap bound is the data-loss
+        fix: the writer reads int_1d/int_2d straight off the in-memory frames,
+        and ``stash`` refuses to evict unsaved ones — so we must save before
+        the unsaved set fills the cache, else it would grow unbounded.  Net:
+        ``LIVE_SAVE_INTERVAL`` is an UPPER bound on save spacing; the cap is a
+        HARD bound, so the high interval is safe even on scans longer than the
+        cap.  Never saves in xye_only mode (no .nxs target).
+        """
+        if self.xye_only or self._frames_since_save <= 0:
+            return False
+        if force or self._frames_since_save >= self.LIVE_SAVE_INTERVAL:
+            return True
+        cap = getattr(scan.frames, "_in_memory_cap", 64)
+        counter = getattr(scan.frames, "unsaved_in_memory_count", None)
+        unsaved = counter() if callable(counter) else self._frames_since_save
+        return unsaved >= max(1, cap - 8)
+
     def _dispatch_batch_serial(self, scan, pending, *, force_save=False):
         """Sequential dispatch (live mode or single-image batches).
 
@@ -840,6 +1507,7 @@ class imageThread(wranglerThread):
         """
         count = 0
         for item in pending:
+            self._wait_if_paused()        # pause between frames (serial path)
             if self.command == 'stop':
                 break
             # item is (img_file, img_number, img_data, img_meta, bg_raw, t_read)
@@ -848,11 +1516,7 @@ class imageThread(wranglerThread):
 
         self._frames_since_save += count
 
-        should_save = (
-            not self.xye_only
-            and (force_save or self._frames_since_save >= self.LIVE_SAVE_INTERVAL)
-        )
-        if should_save and self._frames_since_save > 0:
+        if self._save_due(scan, force=force_save):
             _t_save0 = time.time()
             _get_h5pool().pause(scan.data_file)
             try:
@@ -869,321 +1533,186 @@ class imageThread(wranglerThread):
                 self._frames_since_save, _t_save, _t_xye,
             )
             self._frames_since_save = 0
+        elif self.xye_only:
+            # Int 1D (XYE) on the serial fallback: there is no .nxs save to
+            # ride on (_save_due is always False in this mode), so drain the
+            # XYE buffer per dispatch -- without this the serial path wrote
+            # ZERO output, silently.  (The default streaming path flushes
+            # via QtNexusSink._flush.)
+            self._flush_xye_buffer(scan)
         return count
 
-    def _prewarm_fiber_integrator_spec(self, scan, pending_entry) -> None:
-        """Build ``scan._cached_fiber_integrator`` from the first
-        pending frame.
+    def _build_batch_frames(self, scan, pending):
+        """Build the LiveFrame shells for a batch chunk (shared by the chunked
+        and streaming dispatchers).  Stamps source refs + skip_map_raw."""
+        skip_2d = scan.skip_2d
+        gi = self.gi
+        th_mtr = self.incidence_motor
+        sample_orientation = self.sample_orientation
+        tilt_angle = self.tilt_angle
+        series_average = self.series_average
+        frames = []
+        for img_file, img_number, img_data, img_meta, bg_raw, _t_read in pending:
+            if self.command == 'stop':
+                break
+            img_data = self._apply_threshold_inline(img_data)
+            frame_mask = self._resolve_frame_mask(scan, img_data)
+            frame = LiveFrame(
+                img_number, img_data, poni=self.poni,
+                scan_info=img_meta, static=True, gi=gi,
+                th_mtr=th_mtr, bg_raw=bg_raw,
+                sample_orientation=sample_orientation,
+                tilt_angle=tilt_angle,
+                series_average=series_average,
+                integrator=scan._cached_integrator,
+                mask=frame_mask,
+            )
+            if img_file:
+                frame.source_file = os.path.abspath(str(img_file))
+            else:
+                frame.source_file = ""
+            if _raw_lives_in_source(img_file):
+                frame.source_frame_idx = int(img_number) - 1
+            else:
+                frame.source_frame_idx = 0
+            frame.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
+            frames.append(frame)
+        return frames
 
-        O5: mirrors :meth:`nexusThread._prewarm_fiber_integrator` —
-        builds a throw-away frame from the first frame, computes its
-        incidence angle, and seeds the fiber integrator on the
-        scan.  After this call ``_dispatch_batch_parallel`` can
-        build a fiber pool so every worker borrows a deep-copied
-        instance instead of constructing a fresh one per frame.
+    def _dispatch_batch_streaming(self, scan, pending):
+        """Stream a batch chunk through a persistent ReductionSession +
+        QtNexusSink (PERF-4b/WS-X1).
 
-        Pre-O5 the parallel batch path left ``_cached_fiber_integrator``
-        unset, ``fiber_pool`` came back None, and each worker built
-        its own fiber integrator per frame (~250 ms first-call CSR
-        LUT cost per worker per frame).  Costly for GI scans with
-        many cores.
-
-        ``pending_entry`` is one tuple from ``pending``:
-        ``(img_file, img_number, img_data, img_meta, bg_raw, t_read)``.
+        One session spans the whole scan: it owns the worker pool + the single
+        writer thread, and ``QtNexusSink`` owns the .nxs/XYE write.  Each frame
+        is registered + submitted the instant it's built; the per-scan
+        ``_close_reduction_session`` ``finish()`` drains the writer and does the
+        final flush.  Behind the execution flag; chunked is the default.
         """
-        if not self.gi:
-            return
-        if scan._cached_fiber_integrator is not None:
-            return
-        img_file, img_number, img_data, img_meta, bg_raw, _ = pending_entry
-        # Build a scratch frame identical in shape to what
-        # ``_process_one`` constructs so the angle math agrees.
-        scratch = LiveFrame(
-            img_number, img_data, poni=self.poni,
-            scan_info=img_meta, static=True, gi=True,
-            th_mtr=self.incidence_motor,
+        if getattr(scan, "_cached_integrator", None) is None:
+            logger.info('[STREAM] no cached integrator yet — first frame falls '
+                        'back to serial (streaming engages from the next frame)')
+            return self._dispatch_batch_serial(scan, pending)
+        if getattr(scan, '_cached_data_mask', None) is None and pending:
+            self._prewarm_frame_mask(scan, pending[0][2])
+        sync_live_scan_gi_settings(
+            scan,
+            incidence_motor=self.incidence_motor,
             sample_orientation=self.sample_orientation,
             tilt_angle=self.tilt_angle,
-            series_average=self.series_average,
-            integrator=scan._cached_integrator,
         )
-        try:
-            incident_angle = scratch._get_incident_angle()
-        except IncidenceAngleUnresolved as exc:
-            # No resolvable incidence — skip prewarm.  Per-frame integration
-            # raises the same way and surfaces "set Manual theta"; we don't
-            # want to seed a degenerate 0° fiber integrator on the scan.
-            logger.warning('GI fiber-integrator prewarm skipped: %s', exc)
-            return
-        scan._cached_fiber_integrator = create_fiber_integrator(
-            scratch._poni_from_integrator(),
-            incident_angle=incident_angle,
-            tilt_angle=scratch.tilt_angle,
-            sample_orientation=self.sample_orientation,
-            angle_unit="deg",
-        )
-        # The per-frame angle-drift check in ``_integrate_one``
-        # compares against this cached value; if a later frame's
-        # incidence angle differs, that worker falls back to a
-        # locally-built fiber integrator at the right angle.
-        self._cached_gi_incident_angle = incident_angle
-        # Q3: ``_borrow_fiber_integrator`` (the shared helper used
-        # by parallel workers) looks the angle up on the *scan*,
-        # not on the wrangler instance, because it doesn't have a
-        # handle to the wrangler.  The NeXus prewarm sets the
-        # scan attribute too; pre-Q3 the SPEC prewarm only set
-        # the wrangler attribute, so the borrow helper always saw
-        # cached_angle=None and built worker-local FiberIntegrators
-        # per frame — defeating the pool we just constructed.
-        scan._cached_fiber_integrator_angle = incident_angle
-
-    def _scout_pending_frames(self, pending):
-        """Pending entries to scout for the common-grid freeze (#70): the
-        lowest- and highest-incidence frames, whose output extents bracket a
-        monotonic scan, so the unioned range covers the interior.
-
-        Picks by per-frame incidence from metadata when resolvable (handles a
-        descending / unsorted scan).  Robust to *partial* metadata: it scouts the
-        min/max of whatever incidences ARE resolvable, and additionally includes
-        the positional first + last frames whenever any incidence is unresolved
-        (so a frame whose angle we couldn't read still gets bracketed if it's an
-        end).  A numeric (Manual) incidence is identical for every frame, so one
-        scout suffices.  Bounded to ≤4 integrations — never the whole scan.
-        Adding extra scouts is always safe: the freeze takes the UNION, which can
-        only widen the range, never clip.
-        """
-        if len(pending) <= 1:
-            return list(pending)
-        motor = self.incidence_motor
-        try:
-            float(motor)          # Manual numeric incidence → all frames equal
-            return [pending[0]]
-        except (TypeError, ValueError):
-            pass
-        resolved = []             # (index, incidence) for readable frames
-        any_unresolved = False
-        for i, entry in enumerate(pending):
-            meta = entry[3] or {}
+        # BLOCKER 1: freeze the GI common grid from the WHOLE scan's incidence
+        # range before the session opens (no-op on chunks 2..N via the scan-id
+        # guard; no-op for non-GI / fixed-incidence sources).  T0-4 policy:
+        # an unverifiable/unestablishable range WARNS and proceeds on the
+        # first-chunk freeze (diagnostic persisted in provenance); only a
+        # freeze that actually errors aborts the run.
+        if not self._gi_freeze_whole_scan_prepass(scan):
+            return 0
+        frames = self._build_batch_frames(scan, pending)
+        if not frames:
+            return 0
+        session, sink = self._get_streaming_session(scan, frames)
+        if session is None:
+            return 0
+        count = 0
+        for live in frames:
+            self._wait_if_paused()        # pause between frames (streaming path)
+            if self.command == 'stop':
+                break
+            # Per-frame status is emitted at COMPLETION by the sink
+            # (QtNexusSink._emit_frame_status) so the label tracks what the
+            # plots show -- emitting here at submit time raced frames ahead
+            # of the display in the parallel pipeline.
+            sink.register(live)
             try:
-                resolved.append((i, float(meta.get(motor))))
-            except (TypeError, ValueError):
-                any_unresolved = True
-        idxs = set()
-        if resolved:
-            idxs.add(min(resolved, key=lambda t: t[1])[0])   # lowest incidence
-            idxs.add(max(resolved, key=lambda t: t[1])[0])   # highest incidence
-        if any_unresolved or not resolved:
-            # Partial/no metadata: add the positional ends as a safety net so
-            # frames whose incidence we couldn't read are still bracketed.
-            idxs.update((0, len(pending) - 1))
-        return [pending[i] for i in sorted(idxs)]
+                session.submit(frame_from_live_frame(live))
+            except BaseException as exc:
+                # submit() re-raises a RECORDED writer/sink failure at its
+                # fail-loud precheck.  Bare, that raise escapes run() (which
+                # has no except) and tears down the QThread, bypassing the
+                # 'Save FAILED' -> stop chain entirely.  Catch it here and
+                # stop the run loudly instead (same treatment the
+                # GIFreezeError path got).
+                msg = f'Save FAILED mid-run: {exc} — stopping the run.'
+                logger.error(msg, exc_info=True)
+                try:
+                    self.showLabel.emit(msg)
+                except Exception:
+                    pass
+                _lock = getattr(self, "command_lock", None)
+                if _lock is not None:
+                    with _lock:
+                        self.command = 'stop'
+                else:
+                    self.command = 'stop'
+                break
+            count += 1
+        return count
 
-    def _build_scout(self, scan, entry):
-        """Build + return ``(scratch_frame, fiber_integrator, incident_angle)``
-        for one scout ``entry``; the caller runs ``integrate_1d``/``integrate_2d``
-        on the frame.  Raises ``IncidenceAngleUnresolved`` if the incidence can't
-        be resolved (caller surfaces the "set Manual theta" message)."""
-        img_file, img_number, img_data, img_meta, bg_raw, _ = entry
-        img_data = self._apply_threshold_inline(img_data)
-        frame_mask = self._resolve_frame_mask(scan, img_data)
-        scratch = LiveFrame(
-            img_number, img_data, poni=self.poni,
-            scan_info=img_meta, static=True, gi=True,
-            th_mtr=self.incidence_motor, bg_raw=bg_raw,
-            sample_orientation=self.sample_orientation,
-            tilt_angle=self.tilt_angle,
-            series_average=self.series_average,
-            integrator=scan._cached_integrator,
-            mask=frame_mask,
-        )
-        incident_angle = scratch._get_incident_angle()
-        fi = create_fiber_integrator(
-            scratch._poni_from_integrator(),
-            incident_angle=incident_angle,
-            tilt_angle=scratch.tilt_angle,
-            sample_orientation=self.sample_orientation,
-            angle_unit="deg",
-        )
-        return scratch, fi, incident_angle
-
-    def _freeze_gi_1d_auto_range(self, scan, pending) -> None:
-        """Freeze the GI 1D auto output-axis range once per scan before
-        integration so every frame shares one common grid.
-
-        Scouts the lowest- AND highest-incidence frames (#70) and freezes the
-        padded UNION of their output extents via
-        :func:`ssrl_xrd_tools.integrate.gid.freeze_common_axis`.  A single
-        (frame-0) scout could clip later frames across a wide incidence span
-        (the accessible q_oop / exit-angle range shifts per frame); the union of
-        the incidence extremes covers the interior.
-
-        Runs for Int 1D (XYE) too (``xye_only``).  In the .nxs paths this is what
-        lets the stacked writer's uniform-axis validator accept the batch; in
-        ``xye_only`` mode NO .nxs is written, but the freeze still makes the
-        per-frame ``.xye`` files share one x-grid.  See ``_gi_1d_output_range_key``
-        for which arg controls the output axis per mode; an explicit user-set
-        range is honored (early return).
-
-        Scope: the union spans the whole scan only in BATCH mode, where every
-        frame is available up front.  In live mode ``pending`` is one frame at a
-        time, so the range is frozen from the FIRST live frame and reused (the
-        key is set, so later frames early-return) — a wide-incidence *live* scan
-        can still clip.  Batch is the publication path that feeds the stacked
-        writer; live is the interactive preview path.
-        """
-        if not self.gi or not pending:
-            return
-        args = getattr(scan, 'bai_1d_args', None)
-        if not isinstance(args, dict):
-            return
-        gi_mode_1d = args.get('gi_mode_1d', 'q_total')
-        if args.get(gi_1d_output_axis_key(gi_mode_1d)) is not None:
-            return
-
-        scouts = self._scout_pending_frames(pending)
-        results = []
+    def _get_streaming_session(self, scan, frames):
+        """Build (once per scan) or return the persistent streaming session +
+        its ``QtNexusSink``.  Returns ``(None, None)`` if the GI freeze scout
+        fails (the batch is skipped with an advisory, as in the chunked path)."""
+        if (self._streaming_session is not None
+                and self._streaming_scan_id == id(scan)):
+            return self._streaming_session, self._streaming_sink
+        if self._streaming_session is not None:   # a different scan started
+            self._close_reduction_session()
+        standard_plan = self._plan_cache.get(scan, integrate_2d=not scan.skip_2d)
+        n_workers = max(1, self.max_cores)
+        executor = n_workers if n_workers > 1 else None
+        cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
+        # Batch brackets all frames (scout_union over first+last of the chunk);
+        # live has no last frame at session open, so it freezes from the first
+        # frame only (matches the legacy _process_one live path + the #75 advisory).
+        _default_freeze = ("scout_union" if self.batch_mode else "first_frame") \
+            if self.gi else None
+        gi_freeze_mode = getattr(self, "gi_freeze_mode", _default_freeze)
+        sink = QtNexusSink(self, scan, standard_plan, mask=self.mask)
         try:
-            for entry in scouts:
-                scratch, fi, _inc = self._build_scout(scan, entry)
-                scratch.integrate_1d(
-                    global_mask=self.mask, fiber_integrator=fi, **dict(args))
-                result = getattr(scratch, 'int_1d', None)
-                if result is not None:
-                    results.append(result)
-        except IncidenceAngleUnresolved as exc:
+            session = open_live_reduction_session(
+                frames,
+                standard_plan,
+                scan_name=str(getattr(scan, "name", "scan")),
+                global_mask=self.mask,
+                integrator=scan._cached_integrator,
+                poni=self.poni,
+                executor=executor,
+                cancel_token=cancel_token,
+                gi_freeze_mode=gi_freeze_mode,
+                sink=sink,
+                execution="streaming",
+            )
+        except GIFreezeError as exc:
             self.showLabel.emit(
-                'GI 1D needs an incidence angle: set Theta Motor to Manual '
-                'and enter the angle.'
+                'GI 2D scout frame is blank or the grid is degenerate: set '
+                'Theta Motor to Manual and enter the incident angle, or check '
+                'the mask / threshold.'
             )
-            logger.warning('GI 1D auto-range scout skipped: %s', exc)
-            return
-        except Exception:
-            # Range left unfrozen → per-frame auto-range, which the stacked
-            # writer may then reject; warn (not debug) so it's visible.
-            logger.warning(
-                'GI 1D auto-range scout failed; continuing with current range',
-                exc_info=True,
-            )
-            return
-        if not results:
-            return
-        key, rng = freeze_common_axis(results, gi_mode_1d=gi_mode_1d)
-        if rng is not None:
-            args[key] = rng
-            logger.debug(
-                'GI 1D auto output range frozen from %d scout(s) (mode=%s): '
-                '%s=%s', len(results), gi_mode_1d, key, rng,
-            )
-
-    def _freeze_gi_2d_auto_ranges(self, scan, pending) -> None:
-        """Freeze GI 2D auto ranges once per scan before integration.
-
-        pyFAI's GI auto-range is per-frame, so an angle-dependence scan returns
-        each frame on a different qip/qoop or q/chi grid, which the stacked NeXus
-        writer correctly rejects.  Scouts the lowest- AND highest-incidence
-        frames (#70) and freezes the padded UNION of their extents via
-        :func:`ssrl_xrd_tools.integrate.gid.freeze_common_axes_2d`, so the common
-        grid covers every frame's accessible range (a single frame-0 scout could
-        clip later frames across a wide incidence span).  An explicit user-set
-        range is honored (only missing keys are frozen).
-        """
-        if (not self.gi or self.xye_only or getattr(scan, 'skip_2d', False)
-                or not pending):
-            return
-        args = getattr(scan, 'bai_2d_args', None)
-        if not isinstance(args, dict):
-            return
-        gi_mode_2d = args.get('gi_mode_2d', 'qip_qoop')
-        keys = _gi_2d_range_keys(args)
-        if all(args.get(key) is not None for key in keys):
-            return
-
-        scouts = self._scout_pending_frames(pending)
-        results = []
-        last_inc = None
-        try:
-            for entry in scouts:
-                scratch, fi, last_inc = self._build_scout(scan, entry)
-                scratch.integrate_2d(
-                    global_mask=self.mask, fiber_integrator=fi, **dict(args))
-                result = getattr(scratch, 'int_2d', None)
-                if result is None:
-                    continue
-                if _result_intensity_all_dummy(result):
-                    # Blank scout (almost always a degenerate incidence) — skip
-                    # it; if EVERY scout is blank we surface the fix below.
-                    logger.warning(
-                        'GI 2D scout frame %s all-dummy at incidence %g°; '
-                        'skipped', entry[1], last_inc,
-                    )
-                    continue
-                results.append(result)
-        except IncidenceAngleUnresolved as exc:
-            self.showLabel.emit(
-                'GI 2D needs an incidence angle: set Theta Motor to Manual '
-                'and enter the angle.'
-            )
-            logger.warning('GI 2D auto-range scout skipped: %s', exc)
-            return
-        except Exception:
-            # Ranges left unfrozen → per-frame auto-range, which the stacked
-            # writer may then reject; warn (not debug) so it's visible.
-            logger.warning(
-                'GI 2D auto-range scout failed; continuing with current ranges',
-                exc_info=True,
-            )
-            return
-        if not results:
-            # Every scout came back blank — freezing off it would propagate an
-            # empty cake to the whole scan; surface the fix, leave unfrozen.
-            self.showLabel.emit(
-                'GI 2D scout frame is blank (no signal); check the incidence '
-                'angle / Theta Motor.'
-            )
-            return
-        frozen = freeze_common_axes_2d(results, gi_mode_2d=gi_mode_2d)
-        for key, rng in frozen.items():
-            if args.get(key) is None:
-                args[key] = rng
-        if frozen:
-            logger.debug(
-                'GI 2D auto ranges frozen from %d scout(s): %s',
-                len(results), frozen,
-            )
-        # A still-None key after a successful scout means the union grid was
-        # degenerate (collapsed axis) — surface it rather than letting per-frame
-        # auto-range produce a non-uniform stack the writer will reject.
-        if any(args.get(key) is None for key in keys):
-            self.showLabel.emit(
-                'GI 2D scout produced a degenerate grid (incidence '
-                f'{last_inc:g}°). Set Theta Motor to Manual and '
-                'enter the incidence angle.'
-            )
-            logger.warning(
-                'GI 2D scout grid degenerate at incidence %g°; ranges left '
-                'unfrozen', last_inc,
-            )
+            logger.warning('GI freeze scout failed for streaming batch: %s', exc)
+            self._streaming_session = None
+            self._streaming_sink = None
+            self._streaming_scan_id = None
+            return None, None
+        self._streaming_session = session
+        self._streaming_sink = sink
+        self._streaming_scan_id = id(scan)
+        return session, sink
 
     def _dispatch_batch_parallel(self, scan, pending):
-        """Parallel batch processing using ThreadPoolExecutor.
+        """Batch processing through the headless reduction executor.
 
         Phase 1 — Parallel integration:
-            Each worker creates a LiveFrame, runs integrate_1d / integrate_2d,
-            and writes xye/csv.  pyFAI's Cython integration releases the GIL,
-            so threads get true parallelism for the CPU-heavy part.
+            Build LiveFrame shells, then let ssrl_xrd_tools.run_reduction own
+            the per-frame ThreadPoolExecutor work.
 
         Phase 2 — Serial HDF5 write:
             All completed frames are written to HDF5 under a single file_lock
             acquisition.  Skipped entirely in xye_only mode.
         """
         n_workers = min(self.max_cores, len(pending))
-        # Per-scan pool of N integrator copies — required because
-        # pyFAI's AzimuthalIntegrator isn't thread-safe across workers
-        # with different inputs.  See xdart.utils.integrator_pool.
-        integrator_pool = ensure_integrator_pool(
-            scan, '_cached_integrator', n_workers,
-        )
-        if integrator_pool is None:
+        if getattr(scan, "_cached_integrator", None) is None:
             # No cached integrator yet — fall back to serial dispatch
             # (the source integrator gets built on the first call).
             return self._dispatch_batch_serial(scan, pending)
@@ -1194,144 +1723,129 @@ class imageThread(wranglerThread):
         if (getattr(scan, '_cached_data_mask', None) is None
                 and pending):
             self._prewarm_frame_mask(scan, pending[0][2])
-        # GI batch builds a FRESH fiber integrator per frame at that
-        # frame's own resolved incidence angle — no prewarm, no pool.
-        #
-        # The pooled/prewarmed fiber integrator was seeded from frame 0's
-        # incidence and reused for frames whose angle matched within tol;
-        # on an angle-dependence scan (ω varies per frame) that silently
-        # integrated later frames at the wrong incidence, collapsing the
-        # qoop axis (the batch GI cake bug).  The pool gave ~no benefit
-        # for angle-dependence scans anyway (every frame's angle differs,
-        # so every frame rebuilt regardless).  An angle-keyed fiber pool
-        # is left as a later optimization.
-        #
-        # ``fiber_pool=None`` makes ``_borrow_fiber_integrator`` build a
-        # fresh integrator from ``frame._get_incident_angle()`` for every
-        # frame (and raise IncidenceAngleUnresolved → frame skipped +
-        # "set Manual theta" — never a degenerate 0°).
-        fiber_pool = None
         skip_2d = scan.skip_2d
-        bai_1d_args = dict(scan.bai_1d_args)
-        bai_2d_args = dict(scan.bai_2d_args)
         mask = self.mask
         gi = self.gi
-        standard_plan = self._plan_cache.get(scan, integrate_2d=not skip_2d)
         th_mtr = self.incidence_motor
         sample_orientation = self.sample_orientation
         tilt_angle = self.tilt_angle
+        sync_live_scan_gi_settings(
+            scan,
+            incidence_motor=th_mtr,
+            sample_orientation=sample_orientation,
+            tilt_angle=tilt_angle,
+        )
+        standard_plan = self._plan_cache.get(scan, integrate_2d=not skip_2d)
         series_average = self.series_average
 
-        def _integrate_one(img_file, img_number, img_data, img_meta, bg_raw,
-                           t_read=0.0):
-            """Pure integration + xye write — no shared mutable state.
+        frames = self._build_batch_frames(scan, pending)
 
-            ``t_read`` is accepted for tuple-shape compatibility with
-            _process_one but isn't surfaced — parallel batch mode logs
-            its read times via the per-batch [FLUSH] line.
+        # ── Phase 1: headless parallel integration ───────────────────────────
+        self.showLabel.emit(f'Integrating {len(frames)} images ({n_workers} workers)...')
+        _t_phase1 = time.time()
+        executor = n_workers if n_workers > 1 else None
+        cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
+        gi_freeze_mode = getattr(
+            self,
+            "gi_freeze_mode",
+            "scout_union" if self.gi else None,
+        )
 
-            F2 cancel-fast: returns ``None`` immediately when Stop
-            has been requested, so already-running workers exit
-            before they hit pyFAI (the expensive part).
-            """
-            if self.command == 'stop':
-                return None
-            _t0 = time.time()
-            # Threshold filtering: replace out-of-band pixels with the
-            # dummy sentinel in a fresh float32 copy.  The frame mask
-            # stays stable (cached from frame 1) so pyFAI's CSR engine
-            # cache survives across frames.
-            img_data = self._apply_threshold_inline(img_data)
-            frame_mask = self._resolve_frame_mask(scan, img_data)
+        def _session_factory():
+            return open_live_reduction_session(
+                frames,
+                standard_plan,
+                scan_name=str(getattr(scan, "name", "scan")),
+                global_mask=mask,
+                integrator=scan._cached_integrator,
+                poni=self.poni,
+                executor=executor,
+                cancel_token=cancel_token,
+                chunk_size=len(frames) if frames else 1,
+                gi_freeze_mode=gi_freeze_mode,
+            )
 
-            # Borrow a private integrator for the duration of this
-            # frame's integration.  When the worker exits the `with`
-            # block the integrator returns to the pool for the next
-            # frame to grab.  Each integrator is touched by at most
-            # one worker at a time — that's what makes parallel
-            # batch correct vs the old shared-instance code path.
-            with integrator_pool.borrow() as ai:
-                frame = LiveFrame(
-                    img_number, img_data, poni=self.poni,
-                    scan_info=img_meta, static=True, gi=gi,
-                    th_mtr=th_mtr, bg_raw=bg_raw,
-                    sample_orientation=sample_orientation,
-                    tilt_angle=tilt_angle,
-                    series_average=series_average,
-                    integrator=ai,
-                    mask=frame_mask,
+        session_getter = getattr(self, "_get_reduction_session", None)
+        close_session = not callable(session_getter)
+        try:
+            if close_session:
+                session = _session_factory()
+            else:
+                session = session_getter(
+                    self._reduction_session_key_for(scan, standard_plan, n_workers),
+                    _session_factory,
                 )
+        except GIFreezeError as exc:
+            # The GI freeze pre-pass scouts the grid when the session is built;
+            # a blank/degenerate scout raises here.  Surface the fix and skip
+            # this batch rather than aborting the run with an opaque traceback.
+            self.showLabel.emit(
+                'GI 2D scout frame is blank or the grid is degenerate: set '
+                'Theta Motor to Manual and enter the incident angle, or check '
+                'the mask / threshold.'
+            )
+            logger.warning('GI freeze scout failed for batch: %s', exc)
+            return 0
+        try:
+            frames = reduce_live_frames(
+                frames,
+                standard_plan,
+                scan_name=str(getattr(scan, "name", "scan")),
+                global_mask=mask,
+                integrator=scan._cached_integrator,
+                poni=self.poni,
+                session=session,
+                cancel_token=cancel_token,
+                chunk_size=len(frames) if frames else 1,
+                gi_freeze_mode=gi_freeze_mode,
+            )
+        finally:
+            if close_session:
+                # Legacy chunked integration session (write is the separate
+                # _save_to_nexus, not this session's sink) — preserve the
+                # non-raising close; integration errors already re-raise.
+                session.finish(raise_on_failure=False)
+        # Precompute thumbnails in PARALLEL.  make_thumbnail is per-frame
+        # numpy/scipy on the in-memory map_raw (the session doesn't clear it),
+        # so it is thread-safe -- but it was the dominant *serial* cost left in
+        # the batch path (~0.03s/frame, run on the main thread after the parallel
+        # integration; ~17s of a 651-frame 2D batch, and the reason Int-1D batch
+        # was 2x serial).  Fan it out over the same worker count as the
+        # integration so batch wall-time matches/beats the old engine.
+        #
+        # Only compute thumbnails for frames that actually need a stored preview
+        # (PERF-5): skip xye_only entirely (never persisted -- Phase 2 below is
+        # gated off -- and never displayed: batch is silent), and skip 1D-only
+        # (skip_2d) frames whose raw is reloadable from source (the Image Viewer
+        # reloads the raw on demand via the per-frame source pointer).  The
+        # writer (nexus_writer._write_per_frame_metadata) gates on the SAME
+        # frame.can_skip_thumbnail() so a skipped frame is never lazily
+        # re-thumbnailed at save time.  Keep thumbnails for 2D modes and for 1D
+        # frames with no reloadable source (their only preview).
+        _skip_2d = getattr(scan, 'skip_2d', False)
+        thumb_frames = (
+            [] if self.xye_only
+            else [f for f in frames if not f.can_skip_thumbnail(_skip_2d)]
+        )
 
-                # H2 + S3 unified dispatch.  When ``standard_plan`` is
-                # None (GI scan) we run the fiber-integrator path
-                # inside the legacy_gi closure; otherwise the headless
-                # ``reduce_live_frame`` handles it.
-                def _legacy_gi_for_frame() -> None:
-                    with self._borrow_fiber_integrator(
-                        scan, fiber_pool, frame,
-                    ) as _fi:
-                        frame.integrate_1d(
-                            global_mask=mask,
-                            fiber_integrator=_fi,
-                            **bai_1d_args,
-                        )
-                        if not skip_2d:
-                            frame.integrate_2d(
-                                global_mask=mask,
-                                fiber_integrator=_fi,
-                                **bai_2d_args,
-                            )
-
-                dispatch_live_frame_reduction(
-                    frame, scan,
-                    standard_plan=standard_plan,
-                    integrator=ai,
-                    global_mask=mask,
-                    legacy_gi=_legacy_gi_for_frame,
-                )
-
-            # Detach the pool integrator from this frame — once the
-            # `with` block exited, the next worker can borrow this
-            # same instance and start mutating it.  Replace with the
-            # scan's source integrator (which the pool never hands
-            # out, so it's safe to share with non-parallel consumers).
+        def _precompute_thumbnail(frame):
             frame.integrator = scan._cached_integrator
-
-            # Precompute the raw-image thumbnail here, in parallel with
-            # other workers' integrations, rather than on the serial Phase 2
-            # writer thread.  scipy.ndimage.zoom and numpy subtract release
-            # the GIL for their C code, so this overlaps cleanly.
             try:
                 frame.make_thumbnail(global_mask=mask)
             except Exception as e:
                 logger.warning('Thumbnail precompute failed for image %s: %s',
-                               img_number, e)
+                               frame.idx, e)
 
-            # Buffer the XYE write — flushed at end of batch by the
-            # serial dispatcher.  Keeps the worker thread cheap and
-            # groups disk traffic so it doesn't interleave with the
-            # next batch's integration.
-            with self._xye_lock:
-                self._xye_buffer.append((img_number, frame))
-
-            _elapsed = time.time() - _t0
-            fname = os.path.splitext(os.path.basename(img_file))[0]
-            logger.info('[PARALLEL] image_%04d (%s): %.2fs', img_number, fname[-30:], _elapsed)
-            return frame
-
-        # ── Phase 1: parallel integration ────────────────────────────────────
-        # Shared base helper handles ThreadPoolExecutor wiring,
-        # stop-flag honoring, per-worker exception logging, and
-        # idx-sort.  Both SPEC batch and NeXus chunked dispatch now
-        # share this primitive.
-        self.showLabel.emit(f'Integrating {len(pending)} images ({n_workers} workers)...')
-        _t_phase1 = time.time()
-        frames = self._parallel_integrate(
-            pending,
-            lambda item: _integrate_one(*item),
-            n_workers,
-            label='BATCH',
-        )
+        if thumb_frames:
+            if n_workers > 1 and len(thumb_frames) > 1:
+                with ThreadPoolExecutor(max_workers=n_workers) as _thumb_pool:
+                    list(_thumb_pool.map(_precompute_thumbnail, thumb_frames))
+            else:
+                for frame in thumb_frames:
+                    _precompute_thumbnail(frame)
+        with self._xye_lock:
+            for frame in frames:
+                self._xye_buffer.append((frame.idx, frame))
         _t_phase1 = time.time() - _t_phase1
         logger.info('[BATCH] Phase 1 (parallel integration): %d frames in %.2fs',
                     len(frames), _t_phase1)
@@ -1340,43 +1854,34 @@ class imageThread(wranglerThread):
             return 0
 
         # ── Phase 2: serial HDF5 batch write ─────────────────────────────────
+        try:
+            # Class-qualified: test rigs bind _dispatch_batch_parallel onto
+            # duck holders that don't carry the helper.
+            imageThread._dispatch_batch_parallel_phase2(
+                self, scan, frames, gi, th_mtr, series_average)
+        finally:
+            # PERF-3, in a finally (codex): if the batch save RAISED, the
+            # frames sit unsaved in scan.frames (persist-before-evict pins
+            # them) -- without this, a failed 64-frame chunk also pinned
+            # ~18 MB/frame of raw.  free_raw only drops raws losslessly
+            # reloadable from source, so freeing on the error path is safe.
+            for frame in frames:
+                frame.free_raw()
+        return len(frames)
+
+    def _dispatch_batch_parallel_phase2(self, scan, frames, gi, th_mtr,
+                                        series_average):
+        """Phase 2 of the chunked dispatcher: serial .nxs write + XYE flush.
+        Split out so the caller can guarantee raw cleanup in a finally."""
         if not self.xye_only:
             self.showLabel.emit(f'Writing {len(frames)} frames to HDF5...')
             _t_phase2 = time.time()
-            # img_number → img_file lookup for NeXus provenance.  Keyed
-            # on frame.idx (== img_number) so the lookup matches the
-            # frame-only result list returned by _parallel_integrate.
-            _img_files = {item[1]: item[0] for item in pending}
             _get_h5pool().pause(scan.data_file)
             try:
                 with self.file_lock:
                     # Phase 2a: in-memory accumulation only (batch_save=True
                     # makes add_frame a pure in-memory op; no file I/O).
                     for frame in frames:
-                        img_number = frame.idx
-                        img_file = _img_files.get(img_number, '')
-                        if img_file:
-                            frame.source_file = os.path.abspath(str(img_file))
-                        else:
-                            frame.source_file = ""
-                        # source_frame_idx is the *per-source-file*
-                        # 0-based frame offset, which lazy raw load
-                        # passes to NexusImageStack(source_file)[idx].
-                        # • Single-frame sources (TIF/EDF/CBF/…) →
-                        #   source IS the frame; idx is always 0.
-                        # • Multi-frame sources (Eiger / NeXus master)
-                        #   → use img_number-1, since
-                        #   ``_get_next_eiger_frame_sync`` emits
-                        #   ``img_number = frame_idx + 1`` (1-based).
-                        # Pre-C1 this was hardcoded to 0, so any
-                        # reload + lazy raw read on Eiger always
-                        # returned frame 0 — silently wrong.
-                        if _raw_lives_in_source(img_file):
-                            frame.source_frame_idx = int(img_number) - 1
-                        else:
-                            frame.source_frame_idx = 0
-                        frame.skip_map_raw = skip_2d or _raw_lives_in_source(img_file)
-
                         scan.add_frame(
                             frame=frame, calculate=False, update=True,
                             get_sd=True, set_mg=False, static=True, gi=gi,
@@ -1403,7 +1908,8 @@ class imageThread(wranglerThread):
         if _t_xye > 0.01:
             logger.info('[BATCH] XYE flush: %d frames in %.2fs', len(frames), _t_xye)
 
-        return len(frames)
+        # (PERF-3 free_raw moved to the caller's finally so it also runs
+        # when the save raises.)
 
     def _process_one(self, scan, img_file, img_number, img_data, img_meta,
                      bg_raw, t_read=0.0):
@@ -1422,10 +1928,10 @@ class imageThread(wranglerThread):
         _ext = Path(img_file).suffix.lower()
         if _ext in ('.h5', '.hdf5', '.nxs') or _is_eiger_master(img_file):
             self.showLabel.emit(
-                f'Processing {self._middle_truncate(fname)} [frame {img_number}]'
+                f'{self._middle_truncate(fname)} [frame {img_number}]'
             )
         else:
-            self.showLabel.emit(f'Processing {self._middle_truncate(fname)}')
+            self.showLabel.emit(self._middle_truncate(fname))
 
         _t1 = time.time()
         # Threshold via dummy sentinel + stable cached mask — see
@@ -1447,7 +1953,7 @@ class imageThread(wranglerThread):
 
         if self.gi:
             try:
-                _incident_angle = frame._get_incident_angle()
+                frame._get_incident_angle()
             except IncidenceAngleUnresolved as exc:
                 # Refuse to integrate GI at a degenerate 0°.  Surface the
                 # fix and skip the frame rather than emit a blank cake.
@@ -1457,41 +1963,69 @@ class imageThread(wranglerThread):
                 )
                 logger.warning('Skipping GI frame %s: %s', img_file, exc)
                 return
-            if (scan._cached_fiber_integrator is None
-                    or _incident_angle != self._cached_gi_incident_angle):
-                scan._cached_fiber_integrator = create_fiber_integrator(
-                    frame._poni_from_integrator(),
-                    incident_angle=_incident_angle,
-                    tilt_angle=frame.tilt_angle,
-                    sample_orientation=self.sample_orientation,
-                    angle_unit="deg",
-                )
-                self._cached_gi_incident_angle = _incident_angle
 
         _t2 = time.time()
-
-        def _legacy_gi_for_single() -> None:
-            frame.integrate_1d(
-                global_mask=self.mask,
-                fiber_integrator=scan._cached_fiber_integrator,
-                **scan.bai_1d_args,
-            )
-            if not scan.skip_2d:
-                frame.integrate_2d(
-                    global_mask=self.mask,
-                    fiber_integrator=scan._cached_fiber_integrator,
-                    **scan.bai_2d_args,
-                )
-
-        dispatch_live_frame_reduction(
-            frame, scan,
-            standard_plan=self._plan_cache.get(
-                scan, integrate_2d=not scan.skip_2d,
-            ),
-            integrator=scan._cached_integrator,
-            global_mask=self.mask,
-            legacy_gi=_legacy_gi_for_single,
+        sync_live_scan_gi_settings(
+            scan,
+            incidence_motor=self.incidence_motor,
+            sample_orientation=self.sample_orientation,
+            tilt_angle=self.tilt_angle,
         )
+
+        plan = self._plan_cache.get(scan, integrate_2d=not scan.skip_2d)
+        cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
+
+        def _session_factory():
+            return open_live_reduction_session(
+                [frame],
+                plan,
+                scan_name=str(getattr(scan, "name", "scan")),
+                global_mask=self.mask,
+                integrator=scan._cached_integrator,
+                poni=self.poni,
+                cancel_token=cancel_token,
+                chunk_size=1,
+                gi_freeze_mode="first_frame" if self.gi else None,
+            )
+
+        session_getter = getattr(self, "_get_reduction_session", None)
+        close_session = not callable(session_getter)
+        try:
+            if close_session:
+                session = _session_factory()
+            else:
+                session = session_getter(
+                    self._reduction_session_key_for(scan, plan, 1),
+                    _session_factory,
+                )
+        except GIFreezeError as exc:
+            # Blank/degenerate GI scout (raised while building the session).
+            # Mirror the IncidenceAngleUnresolved guidance and skip the frame.
+            self.showLabel.emit(
+                'GI 2D scout frame is blank or the grid is degenerate: set '
+                'Theta Motor to Manual and enter the incident angle, or check '
+                'the mask / threshold.'
+            )
+            logger.warning('GI freeze scout failed for frame: %s', exc)
+            return
+        try:
+            reduce_live_frames(
+                [frame],
+                plan,
+                scan_name=str(getattr(scan, "name", "scan")),
+                global_mask=self.mask,
+                integrator=scan._cached_integrator,
+                poni=self.poni,
+                session=session,
+                cancel_token=cancel_token,
+                chunk_size=1,
+                gi_freeze_mode="first_frame" if self.gi else None,
+            )
+        finally:
+            if close_session:
+                # Legacy serial live integration session (write is the separate
+                # _save_to_nexus) — preserve the non-raising close.
+                session.finish(raise_on_failure=False)
         # Timing kept for parity with the legacy logging; the
         # standard path now does both 1D + 2D in one call so we
         # bundle the total under _t_1d.
@@ -1543,6 +2077,18 @@ class imageThread(wranglerThread):
             _t_h5_total = time.time() - _t4
             _t_h5_wait = 0.0
             _t_h5_write = _t_h5_total
+
+            # NOTE: no PERF-3 raw-free here.  This is the live/non-batch path,
+            # where the display copy above (data_2d[idx]['map_raw']) keeps its
+            # own ref to the raw for the whole scan — so freeing frame.map_raw
+            # would NOT release memory (data_2d still pins it), it would only
+            # cost an eager per-frame make_thumbnail (~7-15 ms each on the hot
+            # loop) to keep the interval-flush thumbnail writer from reloading.
+            # Net: pure regression on the lean 1D stream for zero RAM win.  The
+            # raw-free lives only in the batch path (_dispatch_batch_parallel),
+            # where data_2d is not populated so the free actually frees and the
+            # thumbnail is already precomputed across workers.  Live-mode RAM is
+            # bounded by the display-cache lifecycle, not by PERF-3.
 
         # ── XYE buffer (flushed at end of batch by the dispatcher) ──────
         _t5 = time.time()
@@ -2089,6 +2635,9 @@ class imageThread(wranglerThread):
                           file_lock=self.file_lock,
                           **self.scan_args)
         scan.skip_2d = self.scan.skip_2d
+        # N1: the project root -> entry/@source_base + relative raw source paths
+        # in the writer (portable .nxs).  None -> absolute paths (back-compat).
+        scan.source_base = getattr(self, "source_base", None)
         # v2 NeXus writer needs a DiffractometerGeometry to derive per-frame
         # rot1/rot2/rot3 and incidence-angle arrays from scan_data.  The
         # default is a two-circle convention using `tth` (detector arm) and

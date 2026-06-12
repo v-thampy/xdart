@@ -14,11 +14,8 @@ Performance shape (post-P3A refactor 2026-05-13):
   single (N, H, W) logical view across either a single 3D dataset or
   an Eiger master's sibling ``data_NNNNNN`` external links — chunked
   reads cross file boundaries seamlessly.
-* **Parallel integration** — within each chunk, integration is
-  dispatched to a ``ThreadPoolExecutor`` backed by a per-scan
-  :class:`IntegratorPool` (one pyFAI integrator per worker — pyFAI's
-  CSR engine isn't thread-safe with different inputs on a shared
-  instance; see xdart.utils.integrator_pool).
+* **Parallel integration** — within each chunk, xdart builds frame shells and
+  delegates the worker pool to ``ssrl_xrd_tools.reduction.run_reduction``.
 * **Periodic saves** — disk writes are batched every
   ``_LIVE_SAVE_INTERVAL`` frames so the v2 NeXus writer's per-flush
   cost amortises across the scan.  Skipped entirely under
@@ -29,9 +26,8 @@ Performance shape (post-P3A refactor 2026-05-13):
   groups disk traffic so it doesn't interleave with the next chunk's
   integration.  Per-frame XYE export happens in **every** mode
   (Int 1D + 2D, Int 1D, Int 1D (XYE)).
-* **GI mode safe** — the fiber integrator is cached on the scan
-  **before** the parallel section starts (using frame 0 to compute
-  the incident angle), so workers only read it.
+* **GI mode safe** — incident-angle resolution and fiber-integrator ownership
+  live inside the headless reduction spine.
 * **1D-only mode** — set ``scan.skip_2d = True`` to bypass 2D
   integration entirely (faster on large detectors).  Set
   ``self.xye_only = True`` (in addition) to also bypass the .nxs
@@ -52,17 +48,18 @@ import numpy as np
 from pyqtgraph import Qt
 
 # Project imports
-from xdart.modules.live import LiveFrame, IncidenceAngleUnresolved
-from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
+from xdart.modules.live import LiveFrame
 from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
+from ssrl_xrd_tools.reduction import GIFreezeError
 from ssrl_xrd_tools.io.nexus import open_nexus_image_stack, read_nexus
 from ssrl_xrd_tools.io.image import read_image
 from ssrl_xrd_tools.io.export import write_xye
 from xdart.utils.h5pool import get_pool as _get_h5pool
-from xdart.utils.integrator_pool import ensure_integrator_pool
 from xdart.modules.reduction import (
+    open_live_reduction_session,
     StandardPlanCache,
-    dispatch_live_frame_reduction,
+    reduce_live_frames,
+    sync_live_scan_gi_settings,
 )
 from .wrangler_widget import wranglerThread
 
@@ -89,8 +86,8 @@ class nexusThread(wranglerThread):
     """Thread for processing NeXus/HDF5 image stacks.
 
     Reads an image dataset from a NeXus file, integrates each frame
-    via a parallel ``ThreadPoolExecutor``, and emits ``sigUpdate``
-    after each one.
+    through the headless reduction spine, and emits ``sigUpdate`` after
+    each one.
 
     signals:
         showLabel: str, status text for the UI label
@@ -135,6 +132,9 @@ class nexusThread(wranglerThread):
         self.data_1d = data_1d
         self.data_2d = data_2d
         self.entry = entry
+        # N1: project root for portable @source_base; set from the wrangler in
+        # setup() (None -> absolute raw paths, back-compat).
+        self.source_base = None
 
         self.detector = None
         self.mask = None
@@ -157,13 +157,11 @@ class nexusThread(wranglerThread):
     # ── Main entry point ─────────────────────────────────────────────────
 
     def run(self):
-        """QThread entry: run the integration body, always reclaiming the
-        integration pool — even on an exception-aborted run — so worker threads
-        don't outlive the run (matches imageThread.run()'s finally)."""
+        """QThread entry: run the integration body."""
         try:
             self._run_impl()
         finally:
-            self._shutdown_executor()
+            self._close_reduction_session()
 
     def _run_impl(self):
         """Read frames from a NeXus file and integrate them in parallel."""
@@ -204,6 +202,7 @@ class nexusThread(wranglerThread):
         scan_name = Path(self.nexus_file).stem
         scan = self._initialize_scan(scan_name)
         scan._cached_integrator = poni_to_integrator(self.poni)
+        scan._cached_poni = self.poni
         scan._cached_fiber_integrator = None
 
         # Notify the GUI that a new scan is being processed.
@@ -233,16 +232,6 @@ class nexusThread(wranglerThread):
                 + (f' ({n_segments} data files)' if n_segments > 1 else '')
             )
 
-            # ── Pre-warm GI fiber integrator BEFORE the parallel
-            # section.  pyFAI's fiber integrator (like the standard
-            # AzimuthalIntegrator) isn't safe to construct concurrently
-            # against the shared scan attribute — and we want every
-            # worker to see the same prebuilt instance.  Use frame 0
-            # to compute the incident angle.
-            if self.gi and scan._cached_fiber_integrator is None:
-                first_frame = np.asarray(ds[0], dtype=np.float32)
-                self._prewarm_fiber_integrator(scan, first_frame, base_meta)
-
             # F3: prewarm the stable bad-pixel mask cache on the main
             # thread before any worker runs.  Without this, the first
             # N workers all race to compute and write
@@ -253,35 +242,17 @@ class nexusThread(wranglerThread):
                 self._prewarm_frame_mask(scan, first_frame)
 
             n_workers = min(self.max_cores, nframes)
-            # Per-scan integrator pool.  Built lazily on first parallel
-            # batch; reused across all subsequent chunks so the
-            # ~250 ms first-call CSR LUT cost is paid once per worker.
-            integrator_pool = ensure_integrator_pool(
-                scan, '_cached_integrator', n_workers,
-            )
-            # H2: pyFAI FiberIntegrator inherits from
-            # AzimuthalIntegrator and shares the CSR-scratch-buffer
-            # mutation pattern.  Same fix as IntegratorPool — one
-            # deepcopy per worker, borrowed via context manager.
-            # Built only when GI is enabled and the prewarm seeded
-            # _cached_fiber_integrator; otherwise stays None and
-            # the worker uses its own per-frame fiber integrator.
-            fiber_pool = (
-                ensure_integrator_pool(
-                    scan, '_cached_fiber_integrator', n_workers,
-                    pool_attr='_cached_fiber_integrator_pool',
-                )
-                if self.gi else None
-            )
             # C1: cached per-scan plan — rebuilt only when scan
             # integration settings or mask change between chunks.
+            sync_live_scan_gi_settings(
+                scan,
+                incidence_motor=self.incidence_motor,
+                sample_orientation=self.sample_orientation,
+                tilt_angle=self.tilt_angle,
+            )
             standard_plan = self._plan_cache.get(
                 scan, integrate_2d=not scan.skip_2d,
             )
-            # If the GUI is single-core (max_cores=1) integrator_pool
-            # still exists with one member; the worker borrows it like
-            # everyone else.  Cleaner than branching on n_workers==1.
-
             frames_since_save = 0
             for chunk_start in range(0, nframes, _READ_CHUNK):
                 if self.command == 'stop':
@@ -295,35 +266,72 @@ class nexusThread(wranglerThread):
                                    dtype=np.float32)
                 _t_read = time.time() - _t_read
 
-                # Build per-frame work items.
-                items = []
+                # Build per-frame live shells.  The headless reducer owns the
+                # worker pool; xdart keeps source provenance and later GUI
+                # publication.
+                frames = []
                 for i, frame_idx in enumerate(range(chunk_start, chunk_end)):
-                    items.append((
+                    frames.append(self._build_frame(
+                        scan,
                         frame_idx,
                         block[i],
                         self._frame_meta(scan_meta, base_meta, frame_idx),
                     ))
 
-                # ── Parallel integration ────────────────────────────
-                # Shared base helper (_parallel_integrate) handles the
-                # ThreadPoolExecutor + error-collection + idx-sort.
-                # Each worker borrows its own integrator from the pool,
-                # so pyFAI's CSR LUT cache stays valid across
-                # concurrent calls.
+                # ── Headless parallel integration ───────────────────
                 self.showLabel.emit(
                     f'Integrating frames {chunk_start+1}-{chunk_end}'
                     f'/{nframes} ({n_workers} workers)'
                 )
                 _t_phase1 = time.time()
-                frames = self._parallel_integrate(
-                    items,
-                    lambda item: self._integrate_one(
-                        scan, integrator_pool, fiber_pool, standard_plan, *item,
-                    ),
-                    n_workers,
-                    label='NEXUS',
+                executor = n_workers if n_workers > 1 else None
+                try:
+                    session = self._get_reduction_session(
+                        self._reduction_session_key_for(scan, standard_plan, n_workers),
+                        lambda: open_live_reduction_session(
+                            frames,
+                            standard_plan,
+                            scan_name=str(getattr(scan, "name", "scan")),
+                            global_mask=self.mask,
+                            integrator=scan._cached_integrator,
+                            poni=self.poni,
+                            executor=executor,
+                            cancel_token=self._cancel_token(),
+                            chunk_size=len(frames) if frames else 1,
+                            gi_freeze_mode="scout_union" if self.gi else None,
+                        ),
+                    )
+                except GIFreezeError as exc:
+                    # GI freeze scout (run when the session is built) found a
+                    # blank/degenerate grid.  The whole scan shares the GI
+                    # geometry, so retrying later chunks won't help -- surface
+                    # the fix and stop.
+                    self.showLabel.emit(
+                        'GI 2D scout frame is blank or the grid is degenerate: '
+                        'set Theta Motor to Manual and enter the incident '
+                        'angle, or check the mask / threshold.'
+                    )
+                    logger.warning('GI freeze scout failed: %s', exc)
+                    break
+                frames = reduce_live_frames(
+                    frames,
+                    standard_plan,
+                    scan_name=str(getattr(scan, "name", "scan")),
+                    global_mask=self.mask,
+                    integrator=scan._cached_integrator,
+                    poni=self.poni,
+                    session=session,
+                    cancel_token=self._cancel_token(),
+                    chunk_size=len(frames) if frames else 1,
+                    gi_freeze_mode="scout_union" if self.gi else None,
                 )
                 _t_phase1 = time.time() - _t_phase1
+
+                for frame in frames:
+                    if frame is None:
+                        continue
+                    with self._xye_lock:
+                        self._xye_buffer.append((frame.idx, frame))
 
                 # ── Serial accumulation into the scan ─────────────
                 # scan.add_frame / data_1d / data_2d mutations and
@@ -344,10 +352,9 @@ class nexusThread(wranglerThread):
                 # bound on long scans.  Inherited ``_flush_xye_buffer``
                 # is a no-op when the buffer is empty (e.g. on Int 2D
                 # mode would be — but we always populate it).
-                # P3: pass the set of frame.idx values that survived
-                # ``_parallel_integrate`` so a Stop-aborted batch
-                # doesn't leave orphan XYE files for frames that
-                # never landed in .nxs.
+                # P3: pass the set of frame.idx values that survived the
+                # headless reduction call so a Stop-aborted batch doesn't
+                # leave orphan XYE files for frames that never landed in .nxs.
                 _t_xye = time.time()
                 published_idxs = {a.idx for a in frames if a is not None}
                 self._flush_xye_buffer(scan, published_idxs=published_idxs)
@@ -369,8 +376,19 @@ class nexusThread(wranglerThread):
                 # (the inherited ``_save_to_disk`` is also a no-op
                 # under xye_only, but we short-circuit here too so
                 # the chunk loop reads clean).
-                if (not self.xye_only
-                        and frames_since_save >= self.LIVE_SAVE_INTERVAL):
+                _due = frames_since_save >= self.LIVE_SAVE_INTERVAL
+                if not _due and not self.xye_only and frames_since_save > 0:
+                    # Cap-aware bound (mirrors imageThread._save_due): the
+                    # 1D interval is 1000, but stash() cannot evict unsaved
+                    # frames -- without this, up to 1000 frames each pinning
+                    # an ~18 MB raw chunk view accumulated between saves.
+                    _cap = getattr(scan.frames, "_in_memory_cap", 64)
+                    _counter = getattr(scan.frames,
+                                       "unsaved_in_memory_count", None)
+                    _unsaved = (_counter() if callable(_counter)
+                                else frames_since_save)
+                    _due = _unsaved >= max(1, _cap - 8)
+                if not self.xye_only and _due:
                     self._save_to_disk(scan)
                     frames_since_save = 0
 
@@ -423,6 +441,11 @@ class nexusThread(wranglerThread):
         self.scan.name = scan_name
         self.scan.gi = self.gi
         self.scan.static = True
+        # N1: the project root -> entry/@source_base + relative raw source paths
+        # in the writer (portable .nxs).  None -> absolute paths (back-compat).
+        # The abspath at frame.source_file stays as-is; the writer relativizes it
+        # against source_base at write time.
+        self.scan.source_base = getattr(self, "source_base", None)
         return self.scan
 
     def _frame_meta(self, scan_meta, base_meta, frame_idx):
@@ -452,117 +475,19 @@ class nexusThread(wranglerThread):
             )
         return meta
 
-    def _prewarm_fiber_integrator(self, scan, first_frame, base_meta):
-        """Build ``scan._cached_fiber_integrator`` from frame 0.
-
-        We need this *before* the parallel section starts so workers
-        can read the cached instance instead of racing to create one.
-        Same pattern as imageThread.
-        """
-        # Construct a throw-away frame just to compute the incidence
-        # angle from frame 0 + base metadata.  The frame isn't kept.
-        scratch = LiveFrame(
-            0, first_frame, poni=self.poni,
-            scan_info=base_meta, static=True, gi=self.gi,
+    def _build_frame(self, scan, frame_idx, img_data, img_meta):
+        """Build a LiveFrame shell for the headless reducer."""
+        frame_mask = self._resolve_frame_mask(scan, img_data)
+        frame = LiveFrame(
+            frame_idx, img_data, poni=self.poni,
+            scan_info=img_meta, static=True, gi=self.gi,
             th_mtr=self.incidence_motor,
             sample_orientation=self.sample_orientation,
             tilt_angle=self.tilt_angle,
             series_average=False,
             integrator=scan._cached_integrator,
+            mask=frame_mask,
         )
-        try:
-            incident_angle = scratch._get_incident_angle()
-        except IncidenceAngleUnresolved as exc:
-            # No resolvable incidence — skip prewarm and surface the fix.
-            # Per-frame integration raises the same way; don't seed a
-            # degenerate 0° fiber integrator on the scan.
-            self.showLabel.emit(
-                'GI needs an incidence angle: set Theta Motor to Manual '
-                'and enter the angle.'
-            )
-            logger.warning('GI fiber-integrator prewarm skipped: %s', exc)
-            return
-        scan._cached_fiber_integrator = create_fiber_integrator(
-            scratch._poni_from_integrator(),
-            incident_angle=incident_angle,
-            tilt_angle=scratch.tilt_angle,
-            sample_orientation=self.sample_orientation,
-            angle_unit="deg",
-        )
-        # Cache the angle so the parallel workers in :meth:`_integrate_one`
-        # can detect drift on ω-varying scans and fall back to a
-        # worker-local fiber integrator at the correct angle.  Same
-        # pattern as imageThread.
-        scan._cached_fiber_integrator_angle = incident_angle
-
-    def _integrate_one(self, scan, integrator_pool, fiber_pool, standard_plan,
-                       frame_idx, img_data, img_meta):
-        """Pure integration in a worker thread; returns the frame.
-
-        Borrows an integrator from the pool, integrates 1D/2D, and
-        detaches the pool's instance from the frame before returning
-        so the next worker can borrow it safely.  All shared-scan
-        mutation (data_1d / data_2d / add_frame / sigUpdate) happens
-        on the main thread in :meth:`_publish`, not here.
-
-        F2 cancel-fast: returns ``None`` immediately when Stop has
-        been requested, so the user doesn't wait for pyFAI to
-        finish the current frame after pressing Stop.
-        """
-        if self.command == 'stop':
-            return None
-        _t0 = time.time()
-        # Stable bad-pixel mask cached on the scan across frames so
-        # pyFAI's CSR cache stays valid.  Helper now lives on the
-        # wranglerThread base class — same impl as imageThread uses.
-        frame_mask = self._resolve_frame_mask(scan, img_data)
-
-        # Borrow a private integrator — pyFAI isn't thread-safe with
-        # different inputs on a shared instance.
-        with integrator_pool.borrow() as ai:
-            frame = LiveFrame(
-                frame_idx, img_data, poni=self.poni,
-                scan_info=img_meta, static=True, gi=self.gi,
-                th_mtr=self.incidence_motor,
-                sample_orientation=self.sample_orientation,
-                tilt_angle=self.tilt_angle,
-                series_average=False,
-                integrator=ai,
-                mask=frame_mask,
-            )
-
-            # S3: unified dispatch — GI fiber-integrator path lives in
-            # the closure so the GI fiber-integrator pool stays local
-            # to the worker.  Non-GI dispatches to the headless API.
-            def _legacy_gi_for_frame() -> None:
-                with self._borrow_fiber_integrator(
-                    scan, fiber_pool, frame,
-                ) as fi:
-                    frame.integrate_1d(
-                        global_mask=self.mask,
-                        fiber_integrator=fi,
-                        **scan.bai_1d_args,
-                    )
-                    if not scan.skip_2d:
-                        frame.integrate_2d(
-                            global_mask=self.mask,
-                            fiber_integrator=fi,
-                            **scan.bai_2d_args,
-                        )
-
-            dispatch_live_frame_reduction(
-                frame, scan,
-                standard_plan=standard_plan,
-                integrator=ai,
-                global_mask=self.mask,
-                legacy_gi=_legacy_gi_for_frame,
-            )
-
-        # Detach the pool integrator from the frame — once the `with`
-        # exits, another worker can borrow this same instance.  The
-        # scan's source integrator is safe to share with non-pool
-        # consumers (GUI display, etc.).
-        frame.integrator = scan._cached_integrator
 
         # Set source file reference for the v2 NeXus per-frame group.
         # The source_frame_idx is the *global* frame index across all
@@ -576,20 +501,6 @@ class nexusThread(wranglerThread):
         # them in the output .nxs.
         frame.skip_map_raw = True
 
-        # Buffer the XYE write — flushed at end of each chunk by the
-        # main loop.  Mirrors the imageThread pattern; keeps the worker
-        # thread cheap and groups disk traffic so it doesn't interleave
-        # with the next chunk's integration.  The flush itself respects
-        # ``xye_only`` mode (see ``_flush_xye_buffer``); the buffer is
-        # populated unconditionally because we always want per-frame
-        # XYE files in Int 1D / Int 1D + 2D / Int 1D (XYE) modes.
-        with self._xye_lock:
-            self._xye_buffer.append((frame_idx, frame))
-
-        logger.debug(
-            '[NEXUS] frame_%04d integrated in %.3fs',
-            frame_idx, time.time() - _t0,
-        )
         return frame
 
     def _publish(self, scan, frame):
@@ -609,12 +520,17 @@ class nexusThread(wranglerThread):
         # In-memory accumulate only — the chunked flush at the end of
         # the dispatch loop (and the final ``save_to_nexus(finalize=True)``
         # at the bottom of ``run()``) handle persistence.
-        scan.add_frame(
-            frame=frame, calculate=False, update=True,
-            get_sd=True, set_mg=False, static=True, gi=self.gi,
-            th_mtr=self.incidence_motor, series_average=False,
-            batch_save=True,
-        )
+        # xye_only: SKIP the series stash (mirrors imageThread).  Both saves
+        # are gated off in this mode, so mark_persisted never runs and
+        # stash() could never evict — every frame's raw (a view pinning the
+        # whole bulk read chunk) accumulated for the entire run.
+        if not self.xye_only:
+            scan.add_frame(
+                frame=frame, calculate=False, update=True,
+                get_sd=True, set_mg=False, static=True, gi=self.gi,
+                th_mtr=self.incidence_motor, series_average=False,
+                batch_save=True,
+            )
         # Publish for the GUI's update_data slot to consume.  Single
         # write site for the dict round-trip.
         self._published_frames[frame.idx] = frame

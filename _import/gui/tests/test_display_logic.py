@@ -80,6 +80,21 @@ def test_xye_unit_from_filename():
     assert dl.x_axis_for_unit('unknown') == ('x', '')
 
 
+def test_pretty_unit():
+    """Display-layer prettify: raw pyFAI tokens -> symbols; unknown/empty pass
+    through unchanged (the stored/headless unit stays canonical)."""
+    assert dl.pretty_unit('q_A^-1') == dl._AA_INV       # Å⁻¹
+    assert dl.pretty_unit('qip_A^-1') == dl._AA_INV
+    assert dl.pretty_unit('qoop_A^-1') == dl._AA_INV
+    assert dl.pretty_unit('2th_deg') == dl._DEG          # °
+    assert dl.pretty_unit('chi_deg') == dl._DEG
+    assert dl.pretty_unit('r_mm') == 'mm'
+    # unknown / empty / None pass through unchanged
+    assert dl.pretty_unit('counts') == 'counts'
+    assert dl.pretty_unit('') == ''
+    assert dl.pretty_unit(None) is None
+
+
 def test_xye_prefix_unit_roundtrip():
     """Writer prefix <-> reader unit must be consistent, and every recovered
     unit must resolve to a real axis label (not plain 'x')."""
@@ -580,6 +595,40 @@ def test_render_plan_draws_present_clears_absent():
     assert plan.drop is False
     assert plan.draw == (dl.PanelRole.PLOT_1D,)
     assert set(plan.clear) == {dl.PanelRole.RAW_2D, dl.PanelRole.CAKE_2D}
+
+
+def test_render_roles_follow_layout_but_keep_legacy_cleanup():
+    # The descriptor order is primary, but absent legacy panels are still
+    # managed so stale content from a prior mode is blanked.
+    state = _make_display_state(
+        panels=(
+            (dl.PanelKey(dl.PanelRole.RAW_2D), dl.PanelPlan(visible=True, has_data=True)),
+        ),
+        layout=((dl.PanelKey(dl.PanelRole.RAW_2D),),),
+    )
+    assert dl.render_roles_for_state(state) == (
+        dl.PanelRole.RAW_2D,
+        dl.PanelRole.PLOT_1D,
+        dl.PanelRole.CAKE_2D,
+    )
+
+
+def test_render_plan_includes_extension_roles_from_layout():
+    # RSM/Stitch/Fit roles are not tied to the legacy three-panel tuple: the
+    # render decision sees roles from the layout descriptor.  The Qt widget
+    # still needs concrete delegates before those roles become visible panels.
+    slice_key = dl.PanelKey(dl.PanelRole.SLICE_2D, "HK")
+    proj_key = dl.PanelKey(dl.PanelRole.PROJ_1D, "H")
+    state = _make_display_state(
+        panels=(
+            (slice_key, dl.PanelPlan(visible=True, has_data=True)),
+            (proj_key, dl.PanelPlan(visible=True, has_data=True)),
+        ),
+        layout=((slice_key,), (proj_key,)),
+    )
+    plan = dl.render_plan(state, dl.build_payload(state))
+    assert plan.draw[:2] == (dl.PanelRole.SLICE_2D, dl.PanelRole.PROJ_1D)
+    assert set(plan.clear) == {dl.PanelRole.PLOT_1D, dl.PanelRole.RAW_2D, dl.PanelRole.CAKE_2D}
 
 
 def test_render_plan_empty_and_error_clear_everything():

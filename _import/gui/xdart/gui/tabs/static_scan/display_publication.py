@@ -222,7 +222,8 @@ class PublicationDisplayAdapter:
             data = sentinel_mask(data)
             if data.ndim != 2:
                 continue
-            bg = getattr(publication.raw_ref, "bg_raw", 0)
+            raw_ref = getattr(publication, "raw_ref", None)
+            bg = getattr(raw_ref, "bg_raw", getattr(raw_ref, "background", 0))
             if source is RawSource.RAW:
                 data = self._apply_detector_mask(data, publication)
                 data = self._subtract_if_shape_matches(data, bg, "raw frame background")
@@ -444,6 +445,8 @@ class PublicationDisplayAdapter:
             data = publication.view.raw
             if data is None:
                 data = getattr(publication.raw_ref, "map_raw", None)
+            if data is None:
+                data = getattr(publication.raw_ref, "image", None)
             if data is not None:
                 return data, RawSource.RAW
 
@@ -527,7 +530,10 @@ class PublicationDisplayAdapter:
     def _has_full_raw(publication) -> bool:
         if publication.view.raw is not None:
             return True
-        return getattr(publication.raw_ref, "map_raw", None) is not None
+        return (
+            getattr(publication.raw_ref, "map_raw", None) is not None
+            or getattr(publication.raw_ref, "image", None) is not None
+        )
 
     @classmethod
     def _has_raw(cls, publication) -> bool:

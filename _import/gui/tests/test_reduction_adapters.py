@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 from threading import RLock
 from types import SimpleNamespace
 
@@ -22,14 +23,23 @@ from xdart.modules.live import LiveFrame, LiveFrameSeries, LiveScan
 from xdart.modules.live_compat import normalize_live_class_names
 import xdart.modules.reduction as reduction_adapters
 from xdart.modules.reduction import (
-    dispatch_live_frame_reduction,
     frame_from_live_frame,
     plan_from_live_scan,
     reduce_live_frame,
+    reduce_live_frames,
     scan_from_live_scan,
 )
 
 
+
+
+@pytest.fixture(autouse=True)
+def _run_in_tmp(tmp_path, monkeypatch):
+    """LiveScan defaults ``data_file`` to CWD-relative ``<name>.nxs`` and the
+    frame-series persistence then writes it — several tests here construct
+    ``LiveScan("scan", ...)`` without a data_file, littering the repo root
+    with a real scan.nxs on every run.  Run each test from tmp instead."""
+    monkeypatch.chdir(tmp_path)
 
 
 def _poni() -> PONI:
@@ -63,24 +73,6 @@ def _r2d() -> IntegrationResult2D:
 
 class _FakeIntegrator:
     pass
-
-
-class _BorrowPool:
-    class _Borrowed:
-        def __init__(self, ai):
-            self.ai = ai
-
-        def __enter__(self):
-            return self.ai
-
-        def __exit__(self, *args):
-            return False
-
-    def __init__(self):
-        self.ai = _FakeIntegrator()
-
-    def borrow(self):
-        return self._Borrowed(self.ai)
 
 
 def test_legacy_ewald_aliases_are_dropped() -> None:
@@ -276,7 +268,7 @@ def test_scan_from_live_scan_uses_scan_frame_names() -> None:
         "scan42",
         frames=[a2, a1],
         scan_data=pd.DataFrame({"th": [1.0, 2.0]}, index=[1, 2]),
-        mg_args={"wavelength": 1e-10},
+        mg_args={"wavelength": 0.7293e-10},
         data_file="scan42.nxs",
     )
 
@@ -285,16 +277,33 @@ def test_scan_from_live_scan_uses_scan_frame_names() -> None:
     assert scan.name == "scan42"
     assert [f.index for f in scan.frames] == [1, 2]
     assert scan.poni == _poni()
-    assert scan.wavelength == 1.0
+    assert scan.wavelength == pytest.approx(0.7293)
     np.testing.assert_allclose(scan.motors["th"], [1.0, 2.0])
     assert scan.output_path.name == "scan42.nxs"
 
 
-def test_scan_from_live_scan_fills_frame_metadata_from_scan_data() -> None:
+def test_scan_from_live_scan_uses_authoritative_reloaded_wavelength() -> None:
+    live = LiveScan(
+        "scan42",
+        frames=[LiveFrame(idx=1, map_raw=np.ones((2, 2)), poni=_poni())],
+        mg_args={"wavelength": 1e-10},
+    )
+    live._persisted_wavelength_m = 1e-10
+
+    scan = scan_from_live_scan(live)
+
+    assert scan.wavelength == pytest.approx(1.0)
+
+
+def test_scan_from_live_scan_fills_frame_metadata_from_scan_data(tmp_path) -> None:
     frame = LiveFrame(idx=5, map_raw=np.ones((2, 2)), poni=_poni())
     scan = LiveScan(
         "scan",
         frames=[frame],
+        # data_file pinned to tmp: LiveScan defaults to CWD-relative
+        # "<name>.nxs", and the frame-series persistence then litters the
+        # repo root with a real scan.nxs on every test run.
+        data_file=str(tmp_path / "scan.nxs"),
         scan_data=pd.DataFrame({"i0": [42.0]}, index=[5]),
     )
 
@@ -358,9 +367,13 @@ def test_plan_from_live_scan_maps_integration_settings() -> None:
     )
 
 
-def test_plan_from_gi_scan_requires_incident_angle() -> None:
-    scan = LiveScan("scan", frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)))],
-                         gi=True)
+def test_plan_from_gi_scan_requires_incident_angle_or_motor() -> None:
+    scan = LiveScan(
+        "scan",
+        frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)))],
+        gi=True,
+        incidence_motor="",
+    )
 
     try:
         plan_from_live_scan(scan)
@@ -368,6 +381,40 @@ def test_plan_from_gi_scan_requires_incident_angle() -> None:
         assert "gi_incident_angle" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected missing GI angle to fail")
+
+
+def test_plan_from_gi_scan_maps_manual_numeric_incidence() -> None:
+    scan = LiveScan(
+        "scan",
+        frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)))],
+        gi=True,
+        incidence_motor="3.0",
+    )
+
+    plan = plan_from_live_scan(scan)
+
+    assert plan.gi is not None
+    assert plan.gi.incident_angle == 3.0
+    assert plan.gi.incidence_motor is None
+    assert plan.integration_1d.unit == "q_A^-1"
+    assert plan.integration_2d.unit == "qip_A^-1"
+
+
+def test_standard_plan_cache_returns_headless_plan_for_gi_scan() -> None:
+    from xdart.modules.reduction import StandardPlanCache
+
+    scan = LiveScan(
+        "scan",
+        frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)), scan_info={"th": 0.2})],
+        gi=True,
+        incidence_motor="th",
+    )
+
+    plan = StandardPlanCache().get(scan)
+
+    assert plan is not None
+    assert plan.gi is not None
+    assert plan.gi.incidence_motor == "th"
 
 
 def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
@@ -419,6 +466,85 @@ def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
     assert frame.map_norm == 33.0
 
 
+def test_reduce_live_frames_uses_one_headless_batch(monkeypatch) -> None:
+    frames = [
+        LiveFrame(idx=1, map_raw=np.ones((2, 2)), poni=_poni(), scan_info={"i0": 2.0}),
+        LiveFrame(idx=2, map_raw=np.full((2, 2), 2.0), poni=_poni(), scan_info={"i0": 4.0}),
+    ]
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(monitor_key="i0"),
+        integration_2d=Integration2DPlan(),
+    )
+    calls = []
+
+    def fake_run_reduction(plan_arg, scan_arg, **kwargs):
+        calls.append((plan_arg, scan_arg, kwargs))
+        return ReductionResult(
+            scan_name=scan_arg.name,
+            frames={
+                frame.index: FrameReduction(
+                    frame.index,
+                    result_1d=_r1d(),
+                    result_2d=_r2d(),
+                )
+                for frame in scan_arg.frames
+            },
+            n_processed=len(scan_arg.frames),
+        )
+
+    monkeypatch.setattr(reduction_adapters, "run_reduction", fake_run_reduction)
+
+    out = reduce_live_frames(
+        frames,
+        plan,
+        scan_name="scan",
+        global_mask=np.array([0]),
+        integrator="ai",
+        executor=2,
+    )
+
+    assert out == frames
+    assert len(calls) == 1
+    assert calls[0][1].name == "scan"
+    assert [frame.index for frame in calls[0][1].frames] == [1, 2]
+    assert calls[0][2]["executor"] == 2
+    assert calls[0][2]["chunk_size"] == 2
+    assert frames[0].int_1d is not None
+    assert frames[1].int_2d is not None
+    assert frames[0].map_norm == 2.0
+    assert frames[1].map_norm == 4.0
+
+
+def test_reduce_live_frames_skips_missing_results(monkeypatch) -> None:
+    frames = [
+        LiveFrame(idx=1, map_raw=np.ones((2, 2)), poni=_poni()),
+        LiveFrame(idx=2, map_raw=np.full((2, 2), 2.0), poni=_poni()),
+    ]
+    plan = ReductionPlan(integration_1d=Integration1DPlan(), integration_2d=None)
+
+    def fake_run_reduction(plan_arg, scan_arg, **kwargs):
+        return ReductionResult(
+            scan_name=scan_arg.name,
+            frames={
+                1: FrameReduction(
+                    1,
+                    result_1d=_r1d(),
+                    result_2d=None,
+                )
+            },
+            n_processed=1,
+            cancelled=True,
+        )
+
+    monkeypatch.setattr(reduction_adapters, "run_reduction", fake_run_reduction)
+
+    out = reduce_live_frames(frames, plan, scan_name="scan")
+
+    assert out == [frames[0]]
+    assert frames[0].int_1d is not None
+    assert frames[1].int_1d is None
+
+
 def test_mask_conversion_ignores_incompatible_mask() -> None:
     """A matching mask is applied; a shape-incompatible mask is ignored
     (plan.mask is None) with a warning rather than raising — reducing
@@ -460,21 +586,8 @@ def test_flat_global_mask_is_preserved_until_shape_is_known() -> None:
     )
 
 
-def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> None:
+def test_nexus_worker_builds_headless_frame_shell() -> None:
     from xdart.gui.tabs.static_scan.wranglers import nexus_wrangler_thread
-
-    calls = []
-
-    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
-        calls.append((frame.idx, plan, scan_name, global_mask, integrator))
-        frame.int_1d = _r1d()
-        frame.int_2d = _r2d()
-        return frame
-
-    # dispatch_live_frame_reduction calls reduce_live_frame from its defining
-    # module (xdart.modules.reduction).  Patch the canonical name; the
-    # symbol is no longer re-imported into the wrangler-thread modules.
-    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
 
     scan = SimpleNamespace(
         name="scan",
@@ -498,25 +611,22 @@ def test_nexus_worker_standard_path_calls_headless_reduction(monkeypatch) -> Non
     )
     worker._resolve_frame_mask = lambda _scan, _img: np.array([0])
 
-    frame = nexus_wrangler_thread.nexusThread._integrate_one(
+    frame = nexus_wrangler_thread.nexusThread._build_frame(
         worker,
         scan,
-        _BorrowPool(),
-        None,
-        ReductionPlan(
-            integration_1d=Integration1DPlan(),
-            integration_2d=Integration2DPlan(),
-        ),
         5,
         np.ones((2, 2)),
         {"i0": 1.0},
     )
 
     assert frame.idx == 5
-    assert frame.int_1d is not None
-    assert frame.int_2d is not None
-    assert calls and calls[0][0] == 5
-    assert worker._xye_buffer[0][0] == 5
+    assert frame.int_1d is None
+    assert frame.int_2d is None
+    assert frame.source_file.endswith("scan.nxs")
+    assert frame.source_frame_idx == 5
+    assert frame.skip_map_raw is True
+    np.testing.assert_array_equal(frame.mask, np.array([0]))
+    assert worker._xye_buffer == []
 
 
 def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> None:
@@ -524,13 +634,14 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
 
     calls = []
 
-    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
-        calls.append((frame.idx, plan, scan_name, global_mask, integrator))
-        frame.int_1d = _r1d()
-        frame.int_2d = _r2d()
-        return frame
+    def fake_reduce_frames(frames, plan, **kwargs):
+        calls.append((frames[0].idx, plan, kwargs))
+        for frame in frames:
+            frame.int_1d = _r1d()
+            frame.int_2d = _r2d()
+        return list(frames)
 
-    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
+    monkeypatch.setattr(image_wrangler_thread, "reduce_live_frames", fake_reduce_frames)
 
     class _Signal:
         def emit(self, *args):
@@ -563,6 +674,9 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
         _xye_lock=RLock(),
         _xye_buffer=[],
         _plan_cache=StandardPlanCache(),
+        _reduction_session_key_for=lambda *_args: ("scan", 1),
+        _get_reduction_session=lambda _key, _factory: object(),
+        _cancel_token=lambda: None,
     )
 
     image_wrangler_thread.imageThread._process_one(
@@ -576,26 +690,25 @@ def test_spec_sequential_standard_path_calls_headless_reduction(monkeypatch) -> 
     )
 
     assert calls and calls[0][0] == 1
+    assert calls[0][2]["scan_name"] == "scan"
     assert worker._xye_buffer[0][0] == 1
 
 
 def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None:
+    from xdart.gui.tabs.static_scan import scan_threads
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
     from xdart.modules.frame_publication import PublicationStore
 
     calls = []
 
-    def fake_run_reduction(plan_arg, scan_arg):
-        calls.append((plan_arg, scan_arg))
-        return ReductionResult(
-            scan_name=scan_arg.name,
-            frames={
-                0: FrameReduction(0, result_1d=_r1d(), result_2d=None),
-            },
-            n_processed=1,
-        )
+    def fake_reduce_frames(frames, plan, **kwargs):
+        calls.append((plan, list(frames), kwargs))
+        for frame in frames:
+            frame.int_1d = _r1d()
+            frame.int_2d = None
+        return list(frames)
 
-    monkeypatch.setattr(reduction_adapters, "run_reduction", fake_run_reduction)
+    monkeypatch.setattr(scan_threads, "reduce_live_frames", fake_reduce_frames)
 
     frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
     scan = LiveScan(
@@ -622,6 +735,7 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
 
     assert calls
     assert calls[0][0].integration_1d.monitor_key == "i0"
+    assert calls[0][2]["scan_name"] == "scan"
     assert data_1d[0].int_1d is not None
     pub = store.get(0)
     assert pub is not None
@@ -629,18 +743,20 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
 
 
 def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
+    from xdart.gui.tabs.static_scan import scan_threads
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
     from xdart.modules.frame_publication import PublicationStore
 
     calls = []
 
-    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
+    def fake_reduce_frames(frames, plan, **kwargs):
         calls.append(plan)
-        frame.int_1d = _r1d()
-        frame.int_2d = _r2d()
-        return frame
+        for frame in frames:
+            frame.int_1d = _r1d()
+            frame.int_2d = _r2d()
+        return list(frames)
 
-    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
+    monkeypatch.setattr(scan_threads, "reduce_live_frames", fake_reduce_frames)
 
     frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
     scan = LiveScan("scan", frames=[frame])
@@ -677,21 +793,23 @@ def test_reintegrate_all_refreshes_publication_store(monkeypatch) -> None:
     # PublicationStore so the cake (payload path is preferred) shows the NEW
     # pixels, not the pre-reintegrate ones.  fake_reduce makes the 2D shape
     # depend on bai_2d_args['npt_rad'] so a changed arg is observable.
+    from xdart.gui.tabs.static_scan import scan_threads
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
     from xdart.modules.frame_publication import PublicationStore
 
-    def fake_reduce(frame, plan, *, scan_name, global_mask, integrator):
+    def fake_reduce_frames(frames, plan, **kwargs):
         npt = int(scan.bai_2d_args.get("npt_rad", 10))
-        frame.int_1d = _r1d()
-        frame.int_2d = IntegrationResult2D(
-            radial=np.linspace(0.0, 1.0, npt),
-            azimuthal=np.linspace(-90.0, 90.0, 3),
-            intensity=np.ones((npt, 3)),
-            unit="q_A^-1", azimuthal_unit="chi_deg",
-        )
-        return frame
+        for frame in frames:
+            frame.int_1d = _r1d()
+            frame.int_2d = IntegrationResult2D(
+                radial=np.linspace(0.0, 1.0, npt),
+                azimuthal=np.linspace(-90.0, 90.0, 3),
+                intensity=np.ones((npt, 3)),
+                unit="q_A^-1", azimuthal_unit="chi_deg",
+            )
+        return list(frames)
 
-    monkeypatch.setattr(reduction_adapters, "reduce_live_frame", fake_reduce)
+    monkeypatch.setattr(scan_threads, "reduce_live_frames", fake_reduce_frames)
 
     frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
     scan = LiveScan("scan", frames=[frame])
@@ -735,6 +853,18 @@ def test_flat_mask_out_of_bounds_is_ignored(caplog):
     assert any("out of bounds" in r.message for r in caplog.records)
 
 
+def test_maskspec_out_of_bounds_is_ignored(caplog):
+    """BUG-2: a MaskSpec whose flat indices don't fit the image makes
+    MaskSpec.to_bool raise; _flat_mask_as_bool must ignore it (None) rather
+    than let the ValueError tear down the run thread."""
+    shape = (4, 5)  # 20 pixels
+    bad = MaskSpec(np.array([0, 1, 999], dtype=np.int64))  # 999 out of range
+    with caplog.at_level("WARNING"):
+        out = reduction_adapters._flat_mask_as_bool(bad, shape)
+    assert out is None
+    assert any("Ignoring mask" in r.message for r in caplog.records)
+
+
 def test_2d_mask_shape_mismatch_is_ignored():
     shape = (4, 5)
     bad = np.ones((4, 6), dtype=bool)  # wrong width
@@ -755,3 +885,62 @@ def test_valid_flat_mask_still_applied():
     assert out.shape == shape
     assert out.ravel()[0] and out.ravel()[5]
     assert out.sum() == 2
+
+
+def test_open_live_reduction_session_retention_policy() -> None:
+    """S2: streaming sink-driven sessions disable product retention (the sink
+    owns the per-frame data; retaining every FrameReduction was ~14 GB on a
+    10k-frame 2D batch).  Chunked sessions KEEP retention — their callers
+    read results back via reduce_live_frames(session=...) -> session.frames
+    (serial live, reintegration, GI scouts)."""
+    from ssrl_xrd_tools.reduction import MemorySink
+    from xdart.modules.reduction import open_live_reduction_session
+
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    plan = ReductionPlan(integration_2d=None)
+
+    streaming = open_live_reduction_session(
+        [frame], plan, scan_name="s", sink=MemorySink(), execution="streaming")
+    assert streaming.retain_products is False
+
+    chunked = open_live_reduction_session([frame], plan, scan_name="s")
+    assert chunked.retain_products is True
+
+    # Streaming WITHOUT a sink has no other way to hand results back: retain.
+    streaming_no_sink = open_live_reduction_session(
+        [frame], plan, scan_name="s", execution="streaming")
+    assert streaming_no_sink.retain_products is True
+
+
+def test_persistent_session_does_not_accumulate_products(monkeypatch) -> None:
+    """S2 (serial flavor): the true-live per-frame path reuses ONE chunked
+    session for the whole watch run; reduce_live_frames must release each
+    call's harvested reductions so the session stays O(chunk), not O(scan)
+    (full 2D arrays otherwise accumulate for hours)."""
+    from xdart.modules.reduction import open_live_reduction_session
+
+    monkeypatch.setattr(
+        reduction_adapters, "run_reduction", None)  # must not be used here
+
+    def _mk(idx):
+        return LiveFrame(idx=idx, map_raw=np.full((2, 2), float(idx + 1)),
+                         poni=_poni())
+
+    plan = ReductionPlan(integration_2d=None)
+    session = open_live_reduction_session([_mk(0)], plan, scan_name="s")
+
+    import ssrl_xrd_tools.reduction.core as ssrl_core
+
+    def _fake_1d(image, ai, **kw):
+        v = float(np.sum(image))
+        return IntegrationResult1D(
+            radial=np.array([0.0, 1.0]),
+            intensity=np.array([v, v + 1.0]), sigma=None, unit="q_A^-1")
+
+    monkeypatch.setattr(ssrl_core, "integrate_1d", _fake_1d)
+
+    for idx in range(3):                       # three per-frame calls
+        out = reduce_live_frames([_mk(idx)], plan, scan_name="s",
+                                 session=session)
+        assert len(out) == 1 and out[0].int_1d is not None
+        assert session.frames == {}            # released after each harvest

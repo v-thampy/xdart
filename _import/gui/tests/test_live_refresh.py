@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+from queue import Queue
 from types import MethodType, SimpleNamespace
 from threading import RLock
 
 import numpy as np
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -24,6 +26,129 @@ from xdart.gui.tabs.static_scan.display_plot import (
     update_plot_accumulator,
 )
 from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+
+def test_display_wavelength_rejects_default_sentinel(tmp_path):
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={"wavelength": 1.0e-10},
+            data_file=str(tmp_path / "missing.nxs"),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host) is None
+
+
+def test_display_wavelength_accepts_authoritative_one_angstrom_integrator(tmp_path):
+    frame = SimpleNamespace(
+        integrator=SimpleNamespace(wavelength=1.0e-10),
+        poni=None,
+    )
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={"wavelength": 1.0e-10},
+            data_file=str(tmp_path / "missing.nxs"),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host, frame) == pytest.approx(1.0e-10)
+
+
+def test_display_wavelength_accepts_authoritative_one_angstrom_poni(tmp_path):
+    frame = SimpleNamespace(
+        integrator=None,
+        poni=SimpleNamespace(wavelength=1.0e-10),
+    )
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={"wavelength": 1.0e-10},
+            data_file=str(tmp_path / "missing.nxs"),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host, frame) == pytest.approx(1.0e-10)
+
+
+def test_display_wavelength_reads_v2_instrument_source(tmp_path):
+    import h5py
+
+    path = tmp_path / "wl.nxs"
+    with h5py.File(path, "w") as f:
+        src = f.create_group("entry/instrument/source")
+        src.create_dataset("wavelength_A", data=0.7293)
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={"wavelength": 1.0e-10},
+            data_file=str(path),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host) == pytest.approx(0.7293e-10)
+
+
+def test_display_wavelength_prefers_authoritative_reloaded_one_angstrom(tmp_path):
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={"wavelength": 1.0e-10},
+            _persisted_wavelength_m=1.0e-10,
+            data_file=str(tmp_path / "missing.nxs"),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host) == pytest.approx(1.0e-10)
+
+
+def test_display_wavelength_accepts_authoritative_one_angstrom_stamp(tmp_path):
+    import h5py
+
+    path = tmp_path / "wl_one_angstrom.nxs"
+    with h5py.File(path, "w") as f:
+        src = f.create_group("entry/instrument/source")
+        src.create_dataset("wavelength_A", data=1.0)
+    host = SimpleNamespace(
+        scan=SimpleNamespace(
+            mg_args={},
+            data_file=str(path),
+        )
+    )
+
+    assert DisplayDataMixin._get_wavelength(host) == pytest.approx(1.0e-10)
+
+
+@pytest.mark.parametrize("flags", [
+    {"live_run": True, "no_nxs": False},
+    {"live_run": False, "no_nxs": True},
+])
+def test_live_repoint_clears_stale_persisted_wavelength(tmp_path, flags):
+    """T0-1: the live-run / XYE set_datafile repoint skips load_from_h5, so it
+    must clear the wavelength restored from the PREVIOUS file — otherwise
+    _get_wavelength keeps short-circuiting on file A's λ for every frame of
+    the run now writing file B."""
+    from xdart.modules.ewald.scan import LiveScan
+    from xdart.gui.tabs.static_scan.scan_threads import fileHandlerThread
+
+    # As if file A was previously loaded and its real wavelength restored
+    # (the load-restore path itself is covered in test_nexus_writer_roundtrip).
+    scan = LiveScan("a", data_file=str(tmp_path / "a.nxs"))
+    scan._persisted_wavelength_m = 0.7293e-10
+    scan.mg_args["wavelength"] = 0.7293e-10
+
+    # Repoint to file B through the real fileHandlerThread branch.
+    holder = SimpleNamespace(
+        scan=scan, fname=str(tmp_path / "b.nxs"),
+        file_lock=RLock(),
+        sigNewFile=SimpleNamespace(emit=lambda *_: None),
+        sigUpdate=SimpleNamespace(emit=lambda *_: None),
+        **flags,
+    )
+    MethodType(fileHandlerThread.set_datafile, holder)()
+
+    assert scan.data_file == str(tmp_path / "b.nxs")
+    assert scan._persisted_wavelength_m is None
+    # Display no longer sees file A's λ: mg_args is back to the rejected
+    # sentinel and file B has no stamp -> unknown, never A's value.
+    host = SimpleNamespace(scan=scan)
+    assert DisplayDataMixin._get_wavelength(host) is None
 
 
 class _FakeItem:
@@ -251,6 +376,29 @@ class _FakeControl:
     def isVisible(self):
         return self._visible
 
+    # Phase B: the morphing action button (Start/Pause/Resume) sets text +
+    # a dynamic 'runPhase' property + repaints via style().unpolish/polish.
+    def setText(self, text):
+        self._text = str(text)
+
+    def text(self):
+        return getattr(self, "_text", "")
+
+    def setProperty(self, key, value):
+        setattr(self, "_prop_" + key, value)
+
+    def property(self, key):
+        return getattr(self, "_prop_" + key, None)
+
+    def style(self):
+        class _S:
+            def unpolish(self, *a):
+                pass
+
+            def polish(self, *a):
+                pass
+        return _S()
+
 
 class _FakeCombo:
     def __init__(self, text):
@@ -470,6 +618,7 @@ def _display_host():
     wf_widget = _FakeImageWidget()
     label = _FakeLabel()
     curve = _FakeCurve()
+    removed = []
     legend = _FakeLegend()
     host = SimpleNamespace(
         image_data=(np.ones((3, 3)), None),
@@ -481,6 +630,8 @@ def _display_host():
         binned_widget=binned_widget,
         wf_widget=wf_widget,
         curves=[curve],
+        plot=SimpleNamespace(removeItem=removed.append),
+        _removed_curves=removed,
         legend=legend,
         ui=SimpleNamespace(labelCurrent=label),
     )
@@ -506,7 +657,9 @@ def test_clear_display_state_resets_visible_and_cached_state():
     assert host.frame_names == []
     assert host.overlaid_idxs == []
     assert host.curves == []
-    assert curve.cleared is True
+    # New contract: curves are REMOVED from the plot (removeItem), not just
+    # data-cleared -- PlotDataItem.clear() left items accumulating.
+    assert host._removed_curves == [curve]
     assert legend.cleared is True
     assert label.text == "XYE Viewer"
     assert image_widget.images == []
@@ -732,30 +885,6 @@ def test_select_last_scan_entry_picks_last_file_row():
     assert host2.select_last_scan_entry() == -1
 
 
-def test_gi_readonly_skips_bool_so_grazing_stays_checked():
-    # Regression: making the GI group readonly during a run set readonly on
-    # the Grazing bool, which pyqtgraph renders UNCHECKED (cosmetic).  The
-    # readonly toggle must skip bool params so Grazing keeps its real state;
-    # non-bool params (th_motor) still become readonly.
-    from PySide6 import QtWidgets
-    from pyqtgraph.parametertree import Parameter
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
-
-    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    p = Parameter.create(name="GI", type="group", children=[
-        {"name": "Grazing", "type": "bool", "value": True},
-        {"name": "th_motor", "type": "list", "values": ["th", "Manual"], "value": "th"},
-    ])
-    host = SimpleNamespace()
-    host._set_parameter_readonly = MethodType(
-        imageWrangler._set_parameter_readonly, host)
-
-    host._set_parameter_readonly(p, True)
-    assert p.child("Grazing").value() is True            # value preserved
-    assert not p.child("Grazing").opts.get("readonly")   # bool NOT made readonly
-    assert p.child("th_motor").opts.get("readonly") is True   # non-bool is
-
-
 def test_metadata_panel_populates_when_layout_reparented():
     # Regression: the host installs only metadataWidget.layout into its
     # metaFrame, so the metadataWidget QWidget itself is never shown and
@@ -858,7 +987,7 @@ def test_live_new_scan_invalidates_publication_store():
             scan_name="old",
             auto_last=False,
             latest_idx=9,
-            set_file=lambda fname: None,
+            set_file=lambda fname, **k: None,
             update_scans=lambda: None,
             update=lambda: None,
         ),
@@ -916,6 +1045,13 @@ def test_save_path_sync_updates_scans_browser(tmp_path):
 
     staticWidget._sync_h5viewer_save_dir(host, tmp_path / "next", refresh=False)
 
+    # New contract: a save dir that doesn't exist yet (fresh project, no run
+    # has created it) falls back to the nearest existing ancestor so the
+    # browser shows real contents instead of an empty nonexistent path.
+    assert host.dirname == str(tmp_path)
+
+    (tmp_path / "next").mkdir()
+    staticWidget._sync_h5viewer_save_dir(host, tmp_path / "next", refresh=False)
     assert host.dirname == str(tmp_path / "next")
     assert host.h5viewer.dirname == str(tmp_path / "next")
     assert calls == ["update_scans"]
@@ -1066,26 +1202,44 @@ def test_live_gi_clip_warning_fires_once_in_live_gi_only():
     assert labels == []
 
 
-def test_wrangler_executor_shutdown_contract():
-    """The persistent integration pool must be reclaimable: _get_executor builds
-    it, _shutdown_executor tears it down and is idempotent.  run()'s finally
-    calls _shutdown_executor so worker threads don't leak past a run (verified
-    by reading run(); exercised end-to-end by a real GUI run)."""
+def test_wrangler_thread_no_longer_owns_integration_executor():
+    """The GUI wrangler base should not keep an integration executor.
+
+    Batch parallelism is owned by ssrl_xrd_tools.reduction.run_reduction now;
+    keeping a second GUI-side executor makes shutdown and cancellation harder
+    to reason about.
+    """
     from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
-    host = SimpleNamespace(_executor=None, _executor_workers=0)
-    host._get_executor = MethodType(wranglerThread._get_executor, host)
-    host._shutdown_executor = MethodType(wranglerThread._shutdown_executor, host)
 
-    ex = host._get_executor(2)
-    assert host._executor is ex and host._executor_workers == 2
-    # Same worker count → same pool reused (the P5 within-run optimization).
-    assert host._get_executor(2) is ex
+    assert not hasattr(wranglerThread, "_get_executor")
+    assert not hasattr(wranglerThread, "_shutdown_executor")
+    assert not hasattr(wranglerThread, "_parallel_integrate")
 
-    host._shutdown_executor()
-    assert host._executor is None and host._executor_workers == 0
-    # Idempotent — safe to call again (run() finally + __del__ both call it).
-    host._shutdown_executor()
-    assert host._executor is None
+
+def test_wrangler_thread_reuses_reduction_session_by_key():
+    """Reducer sessions persist across chunks but reset when policy changes."""
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+
+    class _Session:
+        def __init__(self):
+            self.finished = False
+
+        def finish(self, **kw):    # kw absorbs join_timeout=
+            self.finished = True
+            return None
+
+    thread = wranglerThread(Queue(), {}, "scan.nxs", None)
+    first = thread._get_reduction_session(("scan", 4), _Session)
+    second = thread._get_reduction_session(("scan", 4), _Session)
+    third = thread._get_reduction_session(("scan", 2), _Session)
+
+    try:
+        assert first is second
+        assert third is not first
+        assert first.finished
+        assert not third.finished
+    finally:
+        thread._close_reduction_session()
 
 
 def _scout_host(motor):
@@ -1873,7 +2027,9 @@ def test_viewer_mode_change_blocks_scan_list_autoload():
     assert "autoload" not in calls
     assert widget.h5viewer._suspend_scan_selection_loads is False
     assert list_scans._signals_blocked is False
-    assert widget.wrangler.tree.isEnabled() is False
+    # New policy: the tree stays ENABLED in viewers (Project Folder / Save
+    # Path drive the file browser); processing groups disable per-group.
+    assert widget.wrangler.tree.isEnabled() is True
     assert widget.displayframe._viewer_is_xdart is False
 
 
@@ -1904,14 +2060,52 @@ def test_viewer_mode_tree_disable_only_for_file_viewers():
         local_path="/tmp/xdart-out",
     )
 
+    # New policy: the tree stays enabled in EVERY viewer mode -- Project
+    # Folder / Save Path remain usable; processing groups disable per-group
+    # on the wrangler side.
     staticWidget._on_viewer_mode_changed(widget, "xye")
-    assert widget.wrangler.tree.isEnabled() is False
+    assert widget.wrangler.tree.isEnabled() is True
 
     staticWidget._on_viewer_mode_changed(widget, "nexus")
     assert widget.wrangler.tree.isEnabled() is True
 
     staticWidget._on_viewer_mode_changed(widget, "")
     assert widget.wrangler.tree.isEnabled() is True
+
+
+def test_leaving_viewer_mode_clears_stale_global_mask():
+    calls = []
+    list_scans = _FakeListWidget(["scan.nxs"])
+    widget = SimpleNamespace(
+        wrangler=SimpleNamespace(h5_dir="/tmp/xdart-out", tree=_FakeControl()),
+        _apply_integration_control_state=lambda: None,
+        h5viewer=SimpleNamespace(
+            ui=SimpleNamespace(listScans=list_scans),
+            actionNewFile=_FakeAction(),
+            actionSaveDataAs=_FakeAction(),
+            dirname="/tmp/xdart-out",
+            viewer_mode="image",
+            _suspend_scan_selection_loads=False,
+            _apply_frames_panel_width=lambda mode: calls.append(("width", mode)),
+            enter_viewer_mode_cleanup=lambda: calls.append("cleanup"),
+            cancel_pending_loads=lambda: calls.append("cancel"),
+            update_scans=lambda: calls.append("update_scans"),
+        ),
+        displayframe=SimpleNamespace(
+            _wrangler=None,
+            set_viewer_display_mode=lambda mode: calls.append(("display", mode)),
+            clear_display_state=lambda: calls.append("clear_display"),
+        ),
+        scan=SimpleNamespace(global_mask=np.ones((2, 2), dtype=bool)),
+        _sync_h5viewer_save_dir=lambda path, *, refresh=True: None,
+        local_path="/tmp/xdart-out",
+    )
+
+    staticWidget._on_viewer_mode_changed(widget, "")
+
+    assert "cancel" in calls
+    assert "clear_display" in calls
+    assert widget.scan.global_mask is None
 
 
 def test_load_frames_data_skips_missing_placeholder_file(tmp_path):
@@ -2342,8 +2536,12 @@ def test_wrangler_expands_active_groups_on_startup():
         imageWrangler._expand_active_groups, host,
     )
     host._expand_active_groups()
-    assert "expanded" not in gi.opts
-    assert "expanded" not in mask.opts
+    # UI-1 (#81): the GI / Intensity-Threshold groups' EXPANDED state is now the
+    # on/off toggle, so "off" explicitly COLLAPSES them (expanded=False) rather
+    # than leaving the opt unset.  BG still only expands-when-on (its toggle is
+    # the bg_type list, not the header), so it stays untouched when off.
+    assert gi.opts.get("expanded") is False
+    assert mask.opts.get("expanded") is False
     assert "expanded" not in bgg.opts
 
 
@@ -3154,15 +3352,34 @@ class _FakePlot:
     def __init__(self):
         self.link = None
         self.autorange = 0
+        self.xrange = None
 
     def setXLink(self, link):
         self.link = link
 
-    def enableAutoRange(self):
+    def enableAutoRange(self, **kwargs):
         self.autorange += 1
 
     def autoRange(self):
         self.autorange += 1
+
+    def setXRange(self, lo, hi, padding=0):
+        self.xrange = (lo, hi)
+
+
+class _FakeCakeVB:
+    """ViewBox stand-in for the share-axis numeric mirror: records signal
+    connections and serves a fixed x-range."""
+    def __init__(self, xrange=(2.0, 6.0)):
+        self._xrange = list(xrange)
+        self.connected = []
+        self.sigXRangeChanged = SimpleNamespace(
+            connect=self.connected.append,
+            disconnect=self.connected.remove,
+        )
+
+    def viewRange(self):
+        return [list(self._xrange), [0.0, 1.0]]
 
 
 def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index=0):
@@ -3175,7 +3392,6 @@ def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index
         image_unit.addItem(item)
     image_unit.setCurrentIndex(image_index)
     share = _FakeControl(checked=True)
-    target = object()
     host = SimpleNamespace(
         scan=SimpleNamespace(
             gi=gi,
@@ -3188,7 +3404,8 @@ def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index
             shareAxis=share,
         ),
         plot=_FakePlot(),
-        binned_widget=SimpleNamespace(image_plot=target),
+        binned_widget=SimpleNamespace(image_plot=SimpleNamespace(
+            getViewBox=lambda _vb=_FakeCakeVB(): _vb)),
         _plot_axis_info=[
             {"source": "1d_2d", "axis": "radial"},
             {"source": "1d_2d", "axis": "radial"},
@@ -3201,6 +3418,7 @@ def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index
         "_share_axis_plot_index",
         "_set_plot_unit_index_silently",
         "_apply_share_axis_state",
+        "_set_share_link",
     ):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
     return host
@@ -3216,6 +3434,11 @@ def test_share_axis_maps_by_unit_not_combo_index():
     assert host.ui.plotUnit.currentText().startswith("2")
     assert host.ui.plotUnit._enabled is False
     assert host.ui.shareAxis.isEnabled() is True
+    # New share contract: NUMERIC one-way mirror (cake -> 1D), not setXLink
+    # (which aligns by screen geometry and is bidirectional).
+    assert host._share_link_on is True
+    # dev semantics: the native (bidirectional, geometry-mapped) XLink is
+    # engaged directly; the 1D frame is untouched.
     assert host.plot.link is host.binned_widget.image_plot
 
 
@@ -3436,6 +3659,8 @@ def test_overall_preview_requires_all_requested_frames_when_strict():
         normalize=lambda arr, _info: arr,
     )
     host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
+    host._hydrate_frame_from_disk = MethodType(
+        DisplayDataMixin._hydrate_frame_from_disk, host)
 
     data = DisplayDataMixin.get_frames_map_raw(
         host, [1, 2], prefer_thumbnail=True, require_all=True,
@@ -3462,6 +3687,8 @@ def test_overall_2d_requires_all_requested_frames_when_strict():
         ),
     )
     host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
+    host._hydrate_frame_from_disk = MethodType(
+        DisplayDataMixin._hydrate_frame_from_disk, host)
 
     intensity, xdata, ydata = DisplayDataMixin.get_frames_int_2d(
         host, [1, 2], require_all=True,
@@ -3544,16 +3771,21 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
         startButton=_FakeControl(),
         stopButton=_FakeControl(),
         frame=_FakeControl(),
+        specLabel=SimpleNamespace(setText=lambda *a, **k: None),
     )
     integration_calls = []
     host = SimpleNamespace(
         ui=ui,
         tree=_FakeControl(),
+        # A loaded PONI by default so the start() input-gate (BUG-1) passes;
+        # tests that exercise the gate set ``host.poni = None`` explicitly.
+        poni=object(),
         live_mode=live,
         batch_mode=batch,
         xye_only=False,
         scan=SimpleNamespace(skip_2d=None),
-        thread=SimpleNamespace(batch_mode=None, xye_only=None, live_mode=None),
+        thread=SimpleNamespace(batch_mode=None, xye_only=None, live_mode=None,
+                               command=None, command_lock=RLock()),
         sigViewerModeChanged=_FakeSignal(),
         sigStart=_FakeSignal(),
         sender=lambda: None,
@@ -3562,17 +3794,18 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
             integration_calls.append((enabled, kwargs)),
             setattr(host, "_integration_controls_enabled", enabled),
         ),
-        _set_gi_controls_readonly=lambda readonly: setattr(
-            host, "_gi_readonly", readonly,
-        ),
-        # #72: enabled() now locks the whole tree via _set_tree_readonly; record
-        # the requested state instead of walking a real ParameterTree.
-        _set_tree_readonly=lambda readonly: setattr(
-            host, "_tree_readonly", readonly,
-        ),
     )
     host._on_mode_changed = MethodType(imageWrangler._on_mode_changed, host)
     host.start = MethodType(imageWrangler.start, host)
+    host._inputs_valid = MethodType(imageWrangler._inputs_valid, host)
+    # Phase B: the action-button morph helper + its state, used by enabled()/
+    # start()/_on_start_clicked.
+    host._run_phase = 'idle'
+    host._set_action_button = MethodType(imageWrangler._set_action_button, host)
+    host._on_start_clicked = MethodType(imageWrangler._on_start_clicked, host)
+    host.pause = MethodType(imageWrangler.pause, host)
+    host._on_paused = MethodType(imageWrangler._on_paused, host)
+    host._on_resume = MethodType(imageWrangler._on_resume, host)
     return host
 
 
@@ -3590,7 +3823,7 @@ def test_wrangler_enabled_reapplies_viewer_mode_controls():
         assert host.ui.frame.isVisible() is False
         assert host._integration_controls_enabled is False
         assert host.thread.live_mode is False
-        assert host.tree.isEnabled() is (mode == "NeXus Viewer")
+        assert host.tree.isEnabled() is True   # Project/Save Path stay usable
 
 
 def test_file_viewer_mode_disables_processing_tree_but_not_mode_combo():
@@ -3601,7 +3834,10 @@ def test_file_viewer_mode_disables_processing_tree_but_not_mode_combo():
 
         imageWrangler._on_mode_changed(host)
 
-        assert host.tree.isEnabled() is False
+        # Tree stays enabled (Project Folder / Save Path usable); the
+        # processing groups are disabled per-group instead.
+        assert host.tree.isEnabled() is True
+        assert host._integration_controls_enabled is False
         assert host.ui.processingModeCombo.currentText() == mode
 
 
@@ -3620,7 +3856,9 @@ def test_wrangler_enabled_reapplies_xye_mode_controls():
     assert host.thread.xye_only is True
 
 
-def test_wrangler_enabled_keeps_normal_live_clickable():
+def test_wrangler_enabled_run_end_reenables_mode_toggles():
+    """Phase B: at run END, both mode toggles re-enable and the action button
+    morphs back to green 'Start' (idle)."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=True, batch=True)
@@ -3632,25 +3870,113 @@ def test_wrangler_enabled_keeps_normal_live_clickable():
     assert host.ui.batchCheckBox.isEnabled() is True
     assert host.ui.frame.isVisible() is True
     assert host._integration_controls_enabled is True
+    # Action button reset to green Start (idle).
+    assert host.ui.startButton.text() == "Start"
+    assert host.ui.startButton.property("runPhase") == "idle"
+    assert host._run_phase == "idle"
 
 
-def test_start_click_forces_non_live_run():
+def test_start_click_honors_live_toggle_and_morphs_to_pause():
+    """Phase B (DECIDED model): Start is the single action button and HONORS the
+    Live MODE toggle (no longer force-unchecks it).  It morphs green Start ->
+    orange Pause and sets _run_phase='running'."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=True, batch=False)
 
     imageWrangler._on_start_clicked(host)
 
-    assert host.ui.liveCheckBox.isChecked() is False
-    assert host.live_mode is False
-    assert host.thread.live_mode is False
+    # Live is honored, NOT force-unchecked.
+    assert host.ui.liveCheckBox.isChecked() is True
     assert host.command == "start"
     assert host.thread.command == "start"
     assert host.ui.stopButton.isEnabled() is True
     assert host.sigStart.emitted == [()]
+    # The action button morphed to orange 'Pause'.
+    assert host.ui.startButton.text() == "Pause"
+    assert host.ui.startButton.property("runPhase") == "active"
+    assert host._run_phase == "running"
 
 
-def test_active_live_run_disables_batch_but_keeps_live_clickable():
+def test_start_pause_resume_button_state_machine():
+    """Phase B: clicking the single action button cycles Start -> Pause ->
+    Resume -> Pause via _on_start_clicked, mirroring 'pause'/'start' commands."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=False, batch=True)
+    host.sigResuming = _FakeSignal()
+
+    imageWrangler._on_start_clicked(host)      # idle -> start (running, 'Pause')
+    assert host._run_phase == "running" and host.command == "start"
+
+    imageWrangler._on_start_clicked(host)      # running -> pause
+    assert host.command == "pause" and host.thread.command == "pause"
+    assert host.ui.startButton.text() == "Pausing…"   # transient until sigPaused
+
+    imageWrangler._on_paused(host)             # worker confirms paused
+    assert host._run_phase == "paused" and host.ui.startButton.text() == "Resume"
+
+    imageWrangler._on_start_clicked(host)      # paused -> resume
+    assert host.command == "start" and host.thread.command == "start"
+    assert host._run_phase == "running" and host.ui.startButton.text() == "Pause"
+    assert host.sigResuming.emitted == [()]    # guard re-engaged before resume
+
+
+def test_stop_during_pausing_ignores_late_sigpaused():
+    """Adversarial-review fix: Stop during the transient 'Pausing…' window must
+    win.  A late sigPaused (queued from the worker) arriving after stop() must
+    NOT flash the button back to orange 'Resume' -- _on_paused drops it because
+    self.command is already 'stop'."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=False, batch=True)
+
+    imageWrangler._on_start_clicked(host)      # running
+    imageWrangler._on_start_clicked(host)      # -> pause ('Pausing…')
+    imageWrangler.stop(host)                   # Stop lands during 'Pausing…'
+    assert host.ui.startButton.text() == "Start"     # morphed back to green
+    assert host._run_phase == "idle"
+
+    imageWrangler._on_paused(host)             # late queued sigPaused arrives
+    assert host.ui.startButton.text() == "Start"     # NOT flashed to 'Resume'
+    assert host._run_phase == "idle"
+
+
+def test_redispatch_during_pausing_is_noop():
+    """Adversarial-review fix: _run_phase keeps 'pausing' distinct, so a stray
+    re-dispatch during the disabled 'Pausing…' window does NOT fire a second
+    pause()/start()."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=False, batch=True)
+    imageWrangler._on_start_clicked(host)      # running
+    imageWrangler._on_start_clicked(host)      # -> pause ('Pausing…')
+    assert host._run_phase == "pausing"
+    host.thread.command = "sentinel"           # detect any spurious command write
+    imageWrangler._on_start_clicked(host)      # re-dispatch while 'pausing'
+    assert host.thread.command == "sentinel"   # no-op: no pause()/start() fired
+    assert host.ui.startButton.text() == "Pausing…"
+
+
+def test_start_without_poni_is_gated():
+    """BUG-1: Start/Live must refuse to run without a loaded PONI rather than
+    re-running the previous scan with the stale calibration."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
+
+    host = _wrangler_host("Int 2D", live=False, batch=False)
+    host.poni = None  # no calibration loaded
+
+    imageWrangler.start(host)
+
+    assert host.sigStart.emitted == []          # did not start
+    assert getattr(host, "command", None) != "start"
+
+
+def test_active_run_locks_modes_but_keeps_action_button_enabled():
+    """Phase B: during a run the Live/Batch MODE toggles both lock (they no
+    longer start/stop anything), the parameter tree + non-param widgets lock,
+    but the single action button STAYS ENABLED (it is the Pause/Resume control
+    now), and Stop stays enabled."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=True, batch=False)
@@ -3658,10 +3984,9 @@ def test_active_live_run_disables_batch_but_keeps_live_clickable():
 
     imageWrangler.enabled(host, False)
 
-    assert host.ui.startButton.isEnabled() is False
-    assert host.ui.liveCheckBox.isEnabled() is True
+    assert host.ui.startButton.isEnabled() is True   # morphs to Pause/Resume
+    assert host.ui.liveCheckBox.isEnabled() is False
     assert host.ui.batchCheckBox.isEnabled() is False
-    # #72: the whole tree is hard-disabled and the non-param widgets disabled.
     assert host.tree.isEnabled() is False
     assert host.ui.processingModeCombo.isEnabled() is False
     assert host.ui.maxCoresSpinBox.isEnabled() is False
@@ -3669,7 +3994,7 @@ def test_active_live_run_disables_batch_but_keeps_live_clickable():
     assert host.ui.stopButton.isEnabled() is True    # Stop never disabled
 
 
-def test_active_non_live_run_disables_live_and_batch():
+def test_active_non_live_run_locks_modes_keeps_action_button():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=False, batch=True)
@@ -3677,66 +4002,20 @@ def test_active_non_live_run_disables_live_and_batch():
 
     imageWrangler.enabled(host, False)
 
-    assert host.ui.startButton.isEnabled() is False
+    assert host.ui.startButton.isEnabled() is True   # Pause/Resume control
     assert host.ui.liveCheckBox.isEnabled() is False
     assert host.ui.batchCheckBox.isEnabled() is False
     assert host.tree.isEnabled() is False
 
 
-def test_active_run_hard_disables_parameter_tree():
+def test_active_run_disables_parameter_tree():
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
 
     host = _wrangler_host("Int 2D", live=False, batch=False)
 
     imageWrangler.enabled(host, False)
 
-    # #72 (revised): the whole tree is hard-disabled during a run (greyed +
-    # non-interactive), matching the integration panel.  A disabled pyqtgraph
-    # bool checkbox may repaint unchecked (#56) — accepted over a panel that
-    # still looks active ("minimize complexity").
     assert host.tree.isEnabled() is False
-
-
-def test_set_parameter_readonly_skips_bools_disables_actions():
-    """The whole-tree run lock (#72) on a REAL ParameterTree must: make value
-    params read-only, DISABLE action (Browse) params, and SKIP bool params —
-    disabling a pyqtgraph bool repaints it unchecked (the #56 Grazing
-    regression).  Bool VALUES must be preserved throughout."""
-    from PySide6 import QtWidgets
-    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    from pyqtgraph.parametertree import Parameter
-    from xdart.gui.gui_utils import NamedActionParameter
-    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerWidget
-
-    params = Parameter.create(name='root', type='group', children=[
-        {'name': 'grp', 'type': 'group', 'children': [
-            {'name': 'val', 'type': 'str', 'value': 'x'},
-            {'name': 'flag', 'type': 'bool', 'value': True},
-            # list/combo params ignore readonly in pyqtgraph — must be disabled.
-            {'name': 'pick', 'type': 'list', 'values': ['a', 'b'], 'value': 'a'},
-            NamedActionParameter(name='browse', title='Browse...'),
-        ]},
-    ])
-    host = SimpleNamespace()
-    host._set_parameter_readonly = MethodType(
-        wranglerWidget._set_parameter_readonly, host)
-
-    host._set_parameter_readonly(params, True)            # lock (run active)
-    grp = params.child('grp')
-    assert grp.child('val').opts.get('enabled') is False       # value leaf disabled
-    assert grp.child('pick').opts.get('enabled') is False      # list leaf disabled
-    assert grp.child('browse').opts.get('enabled') is False    # action disabled
-    assert grp.opts.get('enabled') is not False                # GROUP never disabled (#56)
-    assert grp.child('flag').opts.get('readonly') is not True  # bool SKIPPED
-    assert grp.child('flag').opts.get('enabled') is not False  # bool not disabled
-    assert grp.child('flag').value() is True                   # value preserved
-    assert grp.child('pick').value() == 'a'                    # list value preserved
-
-    host._set_parameter_readonly(params, False)           # unlock (run finished)
-    assert grp.child('val').opts.get('enabled') is True
-    assert grp.child('pick').opts.get('enabled') is True
-    assert grp.child('browse').opts.get('enabled') is True
-    assert grp.child('flag').value() is True
 
 
 def test_wrangler_enabled_restore_unlocks_tree_and_nonparam_widgets():
@@ -3767,10 +4046,8 @@ def test_nexus_wrangler_enabled_locks_whole_panel_keeps_stop():
         coresLabel=_FakeControl(),
         tree=_FakeControl(),
     )
-    host._set_tree_readonly = lambda readonly: setattr(host, "_tree_readonly", readonly)
-
     nexusWrangler.enabled(host, False)                    # run active
-    assert host.tree.isEnabled() is False                # whole tree hard-disabled
+    assert host.tree.isEnabled() is False
     assert host.startButton.isEnabled() is False
     assert host.processingModeCombo.isEnabled() is False
     assert host.maxCoresSpinBox.isEnabled() is False
@@ -3802,16 +4079,10 @@ def _build_real_wrangler(cls):
     return cls("test", threading.Condition(), scan, {}, {})
 
 
-def test_real_wrangler_run_lock_covers_whole_tree():
+def test_real_wrangler_run_lock_disables_tree_and_keeps_values():
     """End-to-end on REAL wrangler instances (not injected hosts): enabled(False)
-    HARD-disables the entire real ParameterTree widget (greyed + non-interactive,
-    matching the integration panel) and the non-param widgets, while keeping Stop
-    enabled; enabled(True) restores it.  The whole-tree lock is the widget disable
-    itself, not per-param readonly opts — so we assert tree.isEnabled() flips, not
-    per-param state.  A disabled pyqtgraph bool checkbox may repaint unchecked
-    during the run (#56), but its *value* is preserved (and restored on re-enable);
-    that accepted cosmetic was chosen over the read-only approach, which left the
-    panel looking active.  Covers both wranglers (image .ui + nexus direct attrs)."""
+    disables the processing tree and non-param widgets while keeping Stop
+    enabled.  Parameter values must survive the disabled run state."""
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler import imageWrangler
     from xdart.gui.tabs.static_scan.wranglers.nexus_wrangler import nexusWrangler
 
@@ -3826,11 +4097,11 @@ def test_real_wrangler_run_lock_covers_whole_tree():
 
         # ── run active ─────────────────────────────────────────────────────────
         w.enabled(False)
-        assert w.tree.isEnabled() is False         # whole tree hard-disabled
+        assert w.tree.isEnabled() is False
         assert ui.stopButton.isEnabled() is True   # Stop never disabled
         assert ui.processingModeCombo.isEnabled() is False
         assert ui.maxCoresSpinBox.isEnabled() is False
-        # Param *values* survive the lock (the #56 checkbox repaint is cosmetic only).
+        # Param *values* survive the lock.
         for p, val in bool_before:
             assert p.value() == val, f"{cls.__name__}: bool {p.name()} value changed by lock"
 
@@ -3840,3 +4111,53 @@ def test_real_wrangler_run_lock_covers_whole_tree():
         assert ui.processingModeCombo.isEnabled() is True
         for p, val in bool_before:
             assert p.value() == val, f"{cls.__name__}: bool {p.name()} value changed after restore"
+
+
+def test_integration_view_image_applies_mask_and_threshold():
+    """The Int-1D 'Show Image' preview must show the image AS INTEGRATED:
+    detector/global mask (flat indices) and the run's intensity threshold
+    rendered as NaN, like the worker's _apply_threshold_inline.  (The Image
+    Viewer mode deliberately bypasses this helper.)"""
+    import numpy as np
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+
+    thumb = np.arange(16, dtype=np.float32).reshape(4, 4)
+    scan = SimpleNamespace(
+        global_mask=np.array([0, 5]),          # flat indices
+        apply_threshold=True, threshold_min=2.0, threshold_max=12.0,
+    )
+    img = displayFrameWidget.integration_view_image(thumb, scan)
+
+    assert np.isnan(img.ravel()[0]) and np.isnan(img.ravel()[5])   # mask
+    assert np.isnan(img.ravel()[1])                                # < min
+    assert np.isnan(img.ravel()[15])                               # > max
+    assert img.ravel()[7] == 7.0                                   # in-band kept
+    assert thumb.ravel()[0] == 0.0                                 # input untouched
+
+    # Threshold off, no mask: pass-through (Image Viewer semantics).
+    img2 = displayFrameWidget.integration_view_image(
+        thumb, SimpleNamespace(global_mask=None, apply_threshold=False))
+    assert np.isfinite(img2).all()
+
+
+def test_xye_viewer_single_click_navigates_directories():
+    """XYE viewer: single click on a directory (or '..') navigates, matching
+    the Image Viewer; single click on a FILE still defers to
+    _scans_selection_changed (multi-select path) and must not double-fire."""
+    calls = []
+    viewer = SimpleNamespace(
+        _suspend_scan_selection_loads=False,
+        viewer_mode="xye",
+        scans_clicked=lambda q: calls.append(("nav", q.text())),
+    )
+
+    H5Viewer._scans_single_clicked(viewer, _FakeItem("subdir/"))
+    H5Viewer._scans_single_clicked(viewer, _FakeItem(".."))
+    H5Viewer._scans_single_clicked(viewer, _FakeItem("data_0001.xye"))
+
+    assert calls == [("nav", "subdir/"), ("nav", "..")]
+
+    # Image viewer unchanged: single click acts on everything.
+    viewer.viewer_mode = "image"
+    H5Viewer._scans_single_clicked(viewer, _FakeItem("img.tiff"))
+    assert calls[-1] == ("nav", "img.tiff")

@@ -53,7 +53,7 @@ from .display_logic import (
     build_payload, render_plan, controller_for, ImagePayload,
     empty_display_state, PANEL_LAYOUT,
     resolve_selection, resolve_render_ids,
-    default_plot_unit,
+    default_plot_unit, pretty_unit,
 )
 from .display_controllers import register_default_controllers
 
@@ -168,6 +168,99 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
+        # Top-bar polish (Vivek): width = text + margin, computed from font
+        # metrics (no hand-tuned pixels, nothing elided), ONE height for the
+        # whole row (combos and buttons have different native heights on
+        # macOS).  NOTE: AdjustToContents + editable-centered combos were
+        # tried and reverted -- they broke the popups on macOS.
+        _ROW_H = 28
+        # Match the bottom (plot-controls) toolbar height: frame_top was
+        # capped at 35 while imageToolbar renders at 40, making the top row
+        # visibly shorter.
+        self.ui.frame_top.setMinimumSize(Qt.QtCore.QSize(0, 40))
+        self.ui.frame_top.setMaximumSize(Qt.QtCore.QSize(16777215, 40))
+        # Pin BOTH cluster containers to one height (34 inside the 40 row)
+        # so their painted boxes match -- left shrink-wrapped a few px
+        # shorter than right under the mac style.  Children stay 28 and
+        # center inside.
+        for _f in (self.ui.frame_4, self.ui.frame_6):
+            _f.setMinimumSize(Qt.QtCore.QSize(0, 34))
+            _f.setMaximumSize(Qt.QtCore.QSize(16777215, 34))
+            # Horizontal policy Maximum = shrink-wrap: each cluster hugs its
+            # content (instead of splitting the spare width 50/50 with the
+            # other cluster) and can be squeezed below it; the spare space
+            # all goes to the title in the middle.
+            _sp = _f.sizePolicy()
+            _sp.setHorizontalPolicy(QtWidgets.QSizePolicy.Policy.Maximum)
+            _f.setSizePolicy(_sp)
+        # Borderless boxes (Vivek): no frame lines on the cluster/title
+        # containers or the title label.
+        for _f in (self.ui.frame_top, self.ui.frame_4, self.ui.frame_5,
+                   self.ui.frame_6, self.ui.labelCurrent):
+            try:
+                _f.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+                _f.setLineWidth(0)
+            except Exception:
+                logger.debug("frame border clear failed", exc_info=True)
+        # The title takes the stretch: lift labelCurrent's generated 600px
+        # maximum (capped the center on wide windows) and let it shrink
+        # small; frame_5 (its container) unconstrained likewise.
+        self.ui.labelCurrent.setMinimumSize(Qt.QtCore.QSize(0, 0))
+        self.ui.labelCurrent.setMaximumSize(
+            Qt.QtCore.QSize(16777215, 16777215))
+        if hasattr(self.ui, 'frame_5'):
+            self.ui.frame_5.setMinimumSize(Qt.QtCore.QSize(0, 0))
+            self.ui.frame_5.setMaximumSize(
+                Qt.QtCore.QSize(16777215, 34))
+            _lay = self.ui.frame_5.layout()
+            if _lay is not None:
+                for _i in range(_lay.count()):
+                    _cw = _lay.itemAt(_i).widget()
+                    if _cw is not None:
+                        _lay.setAlignment(_cw, pyQt.AlignVCenter)
+        # Center EVERY top-row cell vertically: frame_4 (Norm Channel/Set
+        # Bkg) anchored top while frame_6 (Log/Raw Image) was centered, so
+        # the two clusters sat ~3px apart -- the 'Log looks low' symptom.
+        _top_lay = self.ui.frame_top.layout()
+        if _top_lay is not None:
+            for _i in range(_top_lay.count()):
+                _cw = _top_lay.itemAt(_i).widget()
+                if _cw is not None:
+                    _top_lay.setAlignment(_cw, pyQt.AlignVCenter)
+        for _c in (self.ui.normChannel, self.ui.scale, self.ui.cmap):
+            displayFrameWidget._fit_combo_width(_c, max_w=130)
+            _c.setFixedHeight(_ROW_H)
+        displayFrameWidget._fit_button_width(self.ui.setBkg)
+        self.ui.setBkg.setFixedHeight(_ROW_H)
+        # The SCALE combo moves into the Options popup ('Other' row); the
+        # colormap stays in the bar.  One checkable 'Log' toggle = Linear <->
+        # Log via the scale combo, so the existing Log path (incl. its
+        # negative/small-value shift in pgImageWidget.update_image) is reused
+        # verbatim.  The right cluster is rebuilt in final order (Raw |
+        # colormap | Log, Log at the corner) once the Raw button exists.
+        self.ui.horizontalLayout_9.removeWidget(self.ui.scale)
+        self.ui.scale.setParent(None)
+        self._logBtn = QtWidgets.QPushButton('Log')
+        self._logBtn.setCheckable(True)
+        self._logBtn.setFixedHeight(_ROW_H)
+        displayFrameWidget._fit_button_width(self._logBtn)
+        self._logBtn.setFocusPolicy(pyQt.StrongFocus)
+        _parent_layout = self.ui.frame_6.parentWidget().layout()
+        if _parent_layout is not None:
+            _parent_layout.setAlignment(self.ui.frame_6, pyQt.AlignVCenter)
+        # Options now hosts the scale/cmap combos -- it must be reachable
+        # from launch (the generated UI starts it disabled until the first
+        # 1D layout setup enables it).
+        self.ui.wf_options.setEnabled(True)
+        self._logBtn.toggled.connect(
+            lambda on: self.ui.scale.setCurrentText('Log' if on else 'Linear'))
+        # Keep the toggle honest when the combo changes (e.g. Sqrt in the
+        # Options popup, or a restored session).
+        def _sync_log_btn(*_a):
+            self._logBtn.blockSignals(True)
+            self._logBtn.setChecked(self.ui.scale.currentText() == 'Log')
+            self._logBtn.blockSignals(False)
+        self.ui.scale.currentIndexChanged.connect(_sync_log_btn)
         # Shared reentrant lock guarding data_1d / data_2d.  When created
         # standalone (tests, viewer mode) fall back to a private lock.
         self.data_lock = data_lock if data_lock is not None else threading.RLock()
@@ -483,15 +576,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.wf_cancel_button = QtWidgets.QPushButton('Cancel')
 
         # Raw image preview button
-        self._showImageBtn = QtWidgets.QPushButton('Show Image')
-        self._showImageBtn.setMinimumSize(QtWidgets.QWidget().minimumSize())
-        self._showImageBtn.setMaximumSize(Qt.QtCore.QSize(90, 16777215))
+        self._showImageBtn = QtWidgets.QPushButton('Raw')
+        self._showImageBtn.setFixedHeight(28)   # match the top-row controls
+        displayFrameWidget._fit_button_width(self._showImageBtn)
         self._showImageBtn.setToolTip('Show raw image preview for selected frame')
         self._showImageBtn.setFocusPolicy(pyQt.StrongFocus)
-        self.ui.horizontalLayout_9.addSpacerItem(
-            QtWidgets.QSpacerItem(10, 20, QtWidgets.QSizePolicy.Policy.Fixed,
-                                  QtWidgets.QSizePolicy.Policy.Minimum))
-        self.ui.horizontalLayout_9.addWidget(self._showImageBtn)
+        # Rebuild the right cluster in its final order: Raw | colormap | Log
+        # (Log at the right corner in every mode).
+        _l9 = self.ui.horizontalLayout_9
+        while _l9.count():
+            _l9.takeAt(0)
+        for _w in (self._showImageBtn, self.ui.cmap, self._logBtn):
+            _l9.addWidget(_w)
+            _l9.setAlignment(_w, pyQt.AlignVCenter)
+        _l9.setSpacing(8)
         self._showImageBtn.clicked.connect(self._show_image_preview)
         self._showImageBtn.setVisible(False)
         self._image_preview_dialog = None
@@ -823,24 +921,82 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         display_data = _downsample_for_display(image, widget)
         widget.setImage(display_data, scale=self.scale, cmap=self.cmap)
         widget.setRect(rect)
+        if role is not PanelRole.RAW_2D:
+            # Display-only trim: cut the cake's visible axes to the data's
+            # bounding box.  The STORED grid keeps the full default range
+            # (e.g. GI q-chi integrates chi -180..180 while the physical
+            # wedge is ~+/-90) -- without the trim half the view is empty.
+            displayFrameWidget._trim_view_to_data(widget, image, x, y)
         displayFrameWidget._set_image_widget_colorbar_visible(widget, True)
         # Levels come from pgImageWidget.update_image's nanpercentile autoscale
         # (the (1,99) Linear default), for the Image Viewer exactly as for the
         # Int 2D raw/cake panels.  The wrangler Intensity Threshold is an
         # integration mask parameter, NOT a colour scale, so it must not set
         # display levels here (coupling it to vmin/vmax washed the image out).
-        widget.image_plot.setLabel(
-            "bottom", payload.axis_x.label, units=payload.axis_x.unit,
-        )
-        widget.image_plot.setLabel(
-            "left", payload.axis_y.label, units=payload.axis_y.unit,
-        )
+        if role is not PanelRole.RAW_2D:
+            widget.image_plot.setLabel(
+                "bottom", payload.axis_x.label, units=pretty_unit(payload.axis_x.unit),
+            )
+            widget.image_plot.setLabel(
+                "left", payload.axis_y.label, units=pretty_unit(payload.axis_y.unit),
+            )
         if role is PanelRole.RAW_2D:
+            # No setLabel-with-units for the raw panel: passing units engages
+            # pyqtgraph's auto-SI-prefix machinery, whose stale
+            # autoSIPrefixScale multiplied the TICK LABELS (x1000 -> the
+            # 0..2.5e6 'Pixels' axes / label flicker on reloaded files)
+            # while the actual view range and hover stayed pixel-correct.
             displayFrameWidget._set_raw_pixel_axes(widget)
             self.image_data = (image, rect)
         else:
             self.binned_data = (image, rect)
         return True
+
+    @staticmethod
+    def _trim_view_to_data(widget, image, x, y):
+        """Set the view range to the non-dummy data extent (display only).
+
+        Skipped when the user has zoomed (auto-range off) so it never fights
+        manual navigation; with auto-range on it replaces the full-rect
+        autoscale that left e.g. a GI q-chi cake half empty."""
+        try:
+            vb = widget.image_plot.getViewBox()
+            auto = vb.autoRangeEnabled()
+            if not (auto[0] or auto[1]):
+                # Auto-range is off: either the USER zoomed (respect it) or it
+                # is just OUR previous trim -- setRange() itself disables
+                # auto-range, so without this check the first trim froze the
+                # view forever and an axis-KIND change (e.g. transmission q-chi
+                # -> GI qip-qoop) kept the stale window instead of rescaling.
+                last = getattr(widget, '_cake_trim_view', None)
+                cur = vb.viewRange()
+
+                def _same(a, b):
+                    return all(
+                        abs(p - q) <= 1e-9 + 1e-6 * max(abs(p), abs(q))
+                        for pa, pb in zip(a, b) for p, q in zip(pa, pb)
+                    )
+
+                if last is None or not _same(cur, last):
+                    return                  # genuine user navigation
+            has = np.isfinite(image) & (image > 0)
+            if not has.any():
+                return
+            x_idx = np.where(has.any(axis=1))[0]   # image is (x, y)
+            y_idx = np.where(has.any(axis=0))[0]
+            pad = 2                                # bins of margin
+            x_lo = float(x[max(0, x_idx[0] - pad)])
+            x_hi = float(x[min(len(x) - 1, x_idx[-1] + pad)])
+            y_lo = float(y[max(0, y_idx[0] - pad)])
+            y_hi = float(y[min(len(y) - 1, y_idx[-1] + pad)])
+            if x_hi > x_lo and y_hi > y_lo:
+                vb.setRange(xRange=(x_lo, x_hi), yRange=(y_lo, y_hi),
+                            padding=0.02)
+                # Remember what WE set so the next render can tell our trim
+                # apart from a user zoom.
+                widget._cake_trim_view = [list(r) for r in vb.viewRange()]
+        except Exception:
+            logger.debug("cake view trim skipped", exc_info=True)
 
     def _current_image_axis_key(self):
         """Canonical key for the current 2D cake x-axis."""
@@ -917,17 +1073,47 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if not can_share:
             if was_checked:
                 self.ui.shareAxis.setChecked(False)
-            self.plot.setXLink(None)
+            displayFrameWidget._set_share_link(self, False)
             self.ui.plotUnit.setEnabled(True)
             return False
         if was_checked:
             self._set_plot_unit_index_silently(target_idx)
             self.ui.plotUnit.setEnabled(False)
-            self.plot.setXLink(self.binned_widget.image_plot)
+            displayFrameWidget._set_share_link(self, True)
             return True
-        self.plot.setXLink(None)
+        displayFrameWidget._set_share_link(self, False)
         self.ui.plotUnit.setEnabled(True)
         return False
+
+    def _set_share_link(self, on: bool) -> None:
+        """Share Axis = dev semantics: the native pyqtgraph XLink.
+
+        The 1D plot's frame is untouched (its y-axis stays at the left end
+        of its pane); the x-range is GEOMETRY-mapped so the screen columns
+        the two panes share line up vertically, and the link is
+        bidirectional -- zooming either plot moves both.  The only addition
+        over dev: the 1D's continuous x-auto-range is disabled while shared,
+        so render refits never drag the cake (that interaction, exposed by
+        the cake's trim-to-data, was the 'inverted share' regression)."""
+        ip = getattr(getattr(self, 'binned_widget', None),
+                     'image_plot', None)
+        if ip is None or not hasattr(ip, 'getViewBox'):
+            return          # duck holders in tests / widget not fully built
+        already = getattr(self, '_share_link_on', False)
+        if on and not already:
+            self._share_link_on = True
+            self.plot.setXLink(ip)
+            try:
+                self.plot.enableAutoRange(x=False, y=True)
+                # Snap NOW: pyqtgraph only syncs a fresh link on the next
+                # master change, so force one initial linkedViewChanged.
+                vbp = self.plot.getViewBox()
+                vbp.linkedViewChanged(ip.getViewBox(), vbp.XAxis)
+            except Exception:
+                logger.debug("share x-auto disable failed", exc_info=True)
+        elif not on and already:
+            self._share_link_on = False
+            self.plot.setXLink(None)
 
     def render_display(self, state, payload):
         """Draw the display from ``state`` + ``payload``.  (Named
@@ -1005,12 +1191,16 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def update_views(self):
         """Updates 2D (if flag is selected) and 1D views
         """
-        if not self._updated():
-            return True
-
+        # Refresh the render-style caches BEFORE the no-new-data gate: a Log
+        # toggle / colormap change with nothing loaded yet must still apply
+        # to the FIRST real render (the gate otherwise left self.scale
+        # stale at 'Linear' while the button showed checked).
         self.cmap = self.ui.cmap.currentText()
         self.plotMethod = self.ui.plotMethod.currentText()
         self.scale = self.ui.scale.currentText()
+
+        if not self._updated():
+            return True
 
         if self.viewer_mode is not None:
             # Viewer modes render through the payload path (_draw_image_payload /
@@ -1097,6 +1287,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # restores them.
         if skip != self._was_skip_2d:
             self.set_axes()
+            # On a 1D-only -> 2D transition the 2D panel was collapsed; the
+            # viewer-mode path re-equalizes the primary panels but the
+            # update_views path did not, leaving the 2D panel contracted
+            # (UI-3).  Re-split the primary panels 50/50, on the transition
+            # only (not every render).
+            if not skip:
+                self._set_equal_primary_panel_heights()
             self._was_skip_2d = skip
 
     # ── Axis configuration ────────────────────────────────────────
@@ -1318,6 +1515,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         new live traces (instead of freezing and clipping a taller peak) until
         the user manually zooms."""
         try:
+            if self.viewer_mode is None and self.ui.shareAxis.isChecked():
+                # Shared (processing modes only): the cake owns x.  Only
+                # refit y, never grab x back (the bidirectional link would
+                # drag the cake to the 1D's wider data range).  Viewer modes
+                # must keep full autorange -- a checked-but-hidden Share
+                # Axis froze the XYE viewer at the old cake's x-range.
+                self.plot.enableAutoRange(x=False, y=True)
+                return
             self.plot.autoRange()        # immediate fit (disables auto)
             self.plot.enableAutoRange()  # re-arm continuous tracking
         except Exception:
@@ -1410,6 +1615,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.update_image_view()
 
     def update_image_view(self):
+        if self.image_data is None:
+            # Int 1D mode (or nothing drawn yet): a scale/cmap switch
+            # re-renders all views, but there is no raw panel content.
+            return
         data, rect = self.image_data
 
         display_data = _downsample_for_display(data, self.image_widget)
@@ -1426,6 +1635,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         displayFrameWidget._set_raw_pixel_axes(self.image_widget)
 
     def update_binned_view(self):
+        if self.binned_data is None:
+            return                      # no cake drawn yet (e.g. Int 1D mode)
         data, rect = self.binned_data
 
         display_data = _downsample_for_display(data, self.binned_widget)
@@ -1447,8 +1658,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _xu2 = x_units_2D[imageUnit] if imageUnit < len(x_units_2D) else x_units_2D[0]
             _yl2 = y_labels_2D[imageUnit] if imageUnit < len(y_labels_2D) else y_labels_2D[0]
             _yu2 = y_units_2D[imageUnit] if imageUnit < len(y_units_2D) else y_units_2D[0]
-        self.binned_widget.image_plot.setLabel("bottom", _xl2, units=_xu2)
-        self.binned_widget.image_plot.setLabel("left", _yl2, units=_yu2)
+        self.binned_widget.image_plot.setLabel("bottom", _xl2, units=pretty_unit(_xu2))
+        self.binned_widget.image_plot.setLabel("left", _yl2, units=pretty_unit(_yu2))
 
         self.show_slice_overlay()
         return data
@@ -1475,6 +1686,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     axis.enableAutoSIPrefix(False)
                 if hasattr(axis, 'setScale'):
                     axis.setScale(1.0)
+                # pg 0.14: tick strings multiply by autoSIPrefixScale, and
+                # updateAutoSIPrefix recomputes it from whatever the CURRENT
+                # range is.  Verified live (Jun 2026): at label time the
+                # axis still held the transient pre-autorange range
+                # (+/-0.615), siScale(0.615) -> milli prefix -> pixel ticks
+                # rendered x1000 (the 0..2.5e6 'Pixels' axes).  Clear the
+                # stale scale explicitly and force an axis repaint.
+                if hasattr(axis, 'autoSIPrefixScale'):
+                    axis.autoSIPrefixScale = 1.0
+                if hasattr(axis, 'labelUnitPrefix'):
+                    axis.labelUnitPrefix = ''
+                axis.picture = None
+                axis.update()
             except Exception:
                 logger.debug("raw pixel axis scale update failed", exc_info=True)
 
@@ -1484,7 +1708,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # Sets title text
         label = self.scan.name
         if len(label) > 40:
-            label = f'{label[:10]}.....{label[-30:]}'
+            label = f'{label[:18]}...{label[-18:]}'
 
         if (self.overall or self.scan.single_img) and (len(self.frame_ids) > 1):
             self.ui.labelCurrent.setText(label)
@@ -1504,8 +1728,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def normUpdate(self):
         """Update plots if norm channel exists"""
         self.normChannel = self.get_normChannel()
-        if self.normChannel and (self.scan.scan_data[self.normChannel].sum() == 0.):
-            self.normChannel = None
+        if self.normChannel:
+            # scan_data may now carry non-numeric columns (N2): treat a
+            # non-numeric / zero norm channel as "no normalization".
+            try:
+                norm_sum = float(self.scan.scan_data[self.normChannel].sum())
+            except (TypeError, ValueError):
+                norm_sum = 0.0
+            if norm_sum == 0.:
+                self.normChannel = None
         # Clear stale plot_data so update_plot() rebuilds all overlay curves
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.frame_names = []
@@ -1523,9 +1754,31 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if self.overall:
                 idxs = sorted(list(self.scan.frames.index))
 
+            # #6: refuse a PARTIAL 2D background rather than silently averaging
+            # only the frames whose int_2d happens to be available — a partial
+            # average is a wrong background, not a smaller one.  require_all=True
+            # returns None when not every selected frame contributes; a None
+            # here is only partial coverage (not a 1D-only scan) if the
+            # subset-average path WOULD have returned something.
+            bkg_2d, _, _ = self.get_frames_int_2d(idxs, require_all=True)
+            if bkg_2d is None and self.get_frames_int_2d(idxs)[0] is not None:
+                logger.error(
+                    "Set Bkg refused: the 2D background covers only part of the "
+                    "selection (some frames' 2D data is unavailable) — a partial "
+                    "average would be a wrong background.")
+                try:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Background not set",
+                        "Some selected frames have no 2D data, so the background "
+                        "would cover only part of the selection.  Background not "
+                        "set — pick a fully-covered selection.")
+                except Exception:
+                    pass
+                return  # button stays 'Set Bkg'; no wrong background applied
+
             self.bkg_1d, _ = self.get_frames_int_1d(idxs, rv='average')
-            self.bkg_2d, _, _ = self.get_frames_int_2d(idxs)
-            self.bkg_map_raw = self.get_frames_map_raw(idxs)
+            self.bkg_2d = bkg_2d
+            self.bkg_map_raw = self.get_frames_map_raw(idxs, require_all=True)
             if self.bkg_map_raw is None:
                 # F5: be honest about a no-op 2D background.  Pre-F5
                 # this silently set bkg=0.: 1D/2D bkg subtraction
@@ -1638,8 +1891,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """Remove all 1D curves and reset cached plot state."""
         try:
             self.clear_overlay()
+            # removeItem, not curve.clear() -- see update_plot_view: clear()
+            # leaves the items registered on the plot and they accumulate.
             for curve in self.curves:
-                curve.clear()
+                self.plot.removeItem(curve)
             self.curves.clear()
             if getattr(self, 'legend', None) is not None:
                 self.legend.clear()
@@ -1652,6 +1907,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     def clear_display_state(self, title=None):
         """Blank all rendered panels and cached display data."""
+        self._raw_resolve_failed = set()   # re-arm the raw hydrate retries
         self.clear_image_view()
         self.clear_binned_view()
         self.clear_plot_view()
@@ -1718,20 +1974,43 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if mode == 'xye':
             # The XYE file owns its x-axis, so hide the transform combo; the
             # 2D-only controls (Share Axis, 2D unit, slice) are meaningless.
+            # Unlink the (possibly checked) Share Axis WITHOUT unchecking --
+            # the stale XLink froze the viewer 1D at the old cake's range;
+            # returning to an INT mode re-links via _apply_share_axis_state.
+            displayFrameWidget._set_share_link(self, False)
+            _plot = getattr(self, 'plot', None)   # duck holders in tests
+            if _plot is not None:
+                _plot.enableAutoRange()
             self.ui.plotUnit.setVisible(False)
             self._set_2d_controls_visible(False)
-            # frame_6 is shown so the Linear/Log scale applies to the 1D plot,
-            # but the colormap combo is 2D-only — hide it here.
-            self.ui.cmap.setVisible(False)
+            # frame_6 is shown so the Linear/Log scale applies to the 1D
+            # plot; the colormap stays too (Vivek) — the XYE waterfall image
+            # uses it, and Int 1D (XYE) processing mode shows it as well.
+            if self.ui.cmap.parent() is not None:
+                self.ui.cmap.setVisible(True)
+            self.ui.cmap.setEnabled(True)
             self.ui.scale.setEnabled(True)
         elif mode in ('image', 'nexus'):
             # Raw image / schema preview need no extra control state beyond the
             # geometry table.  The Linear/Log scale + colormap apply to the raw
             # image, so make sure both are shown/enabled (cmap may have been
             # hidden by a prior XYE-viewer visit).
-            self.ui.cmap.setVisible(True)
+            # cmap is back in the top bar (always parented), but keep the
+            # guard: setVisible(True) on a PARENTLESS widget floats it as a
+            # top-level window (the stray 'Default' popup bug).
+            if self.ui.cmap.parent() is not None:
+                self.ui.cmap.setVisible(True)
             self.ui.cmap.setEnabled(True)
             self.ui.scale.setEnabled(True)
+            # Same stale-share unlink as the xye branch: the NeXus viewer
+            # renders 1-D dataset previews into self.plot, which a checked
+            # Share Axis left x-linked to the hidden cake with x-auto off --
+            # previews froze at the old cake's range (and panning them
+            # dragged the hidden cake, breaking the trim re-arm check).
+            displayFrameWidget._set_share_link(self, False)
+            _plot = getattr(self, 'plot', None)
+            if _plot is not None:
+                _plot.enableAutoRange()
             if mode == 'nexus':
                 self._set_equal_primary_panel_heights()
         else:
@@ -1742,7 +2021,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.imageUnit.setEnabled(True)
             self.ui.scale.setEnabled(True)
             self.ui.cmap.setEnabled(True)
-            self.ui.cmap.setVisible(True)   # restore if hidden by XYE viewer
+            if self.ui.cmap.parent() is not None:
+                self.ui.cmap.setVisible(True)   # restore if hidden by XYE viewer
             self.ui.plotUnit.setVisible(True)
             self.ui.plotUnit.setEnabled(True)
             self.ui.plotMethod.setEnabled(True)
@@ -1797,6 +2077,52 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     # ── Image preview dialog ──────────────────────────────────────
 
+    @staticmethod
+    def _fit_combo_width(combo, *, max_w=200, arrow=34):
+        """Fixed width = widest item text + dropdown-arrow allowance."""
+        try:
+            fm = combo.fontMetrics()
+            texts = [combo.itemText(i) for i in range(combo.count())] or ['']
+            w = max(fm.horizontalAdvance(t) for t in texts)
+            combo.setFixedWidth(min(w + arrow, max_w))
+        except Exception:
+            logger.debug("combo width fit failed", exc_info=True)
+
+    @staticmethod
+    def _fit_button_width(btn, *, pad=26):
+        """Fixed width = label text + padding."""
+        try:
+            btn.setFixedWidth(btn.fontMetrics().horizontalAdvance(btn.text()) + pad)
+        except Exception:
+            logger.debug("button width fit failed", exc_info=True)
+
+    @staticmethod
+    def integration_view_image(thumb, scan):
+        """Return the raw image AS THE INTEGRATION SAW IT.
+
+        Applies the detector/global mask and the run's intensity threshold
+        as NaN (pgImageWidget renders NaN transparent), mirroring
+        ``_resolve_frame_mask`` + ``_apply_threshold_inline`` on the worker.
+        The Image Viewer mode deliberately does NOT use this -- it shows the
+        untouched raw image."""
+        img = np.asarray(thumb, dtype=np.float32).copy()
+        gm = getattr(scan, 'global_mask', None)
+        if gm is not None:
+            try:
+                flat = np.asarray(gm).ravel().astype(np.int64)
+                ok = (flat >= 0) & (flat < img.size)
+                img.ravel()[flat[ok]] = np.nan
+            except Exception:
+                logger.debug("preview mask apply failed", exc_info=True)
+        if bool(getattr(scan, 'apply_threshold', False)):
+            try:
+                tmin = float(getattr(scan, 'threshold_min', 0) or 0)
+                tmax = float(getattr(scan, 'threshold_max', 0) or 0)
+                img[(img < tmin) | (img > tmax)] = np.nan
+            except Exception:
+                logger.debug("preview threshold apply failed", exc_info=True)
+        return img
+
     def _show_image_preview(self):
         """Open a popup dialog showing the raw image thumbnail for the
         currently selected frame."""
@@ -1847,14 +2173,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         # Try to get thumbnail from loaded 1D data
         thumb = None
+        full_res = False
         frame = self.data_1d.get(int(idx))
         if frame is not None:
             thumb = getattr(frame, 'thumbnail', None)
 
-        # Fall back to 2D data dict
-        if thumb is None and int(idx) in self.data_2d:
-            d2 = self.data_2d[int(idx)]
-            thumb = d2.get('map_raw')
+        # Fall back to 2D data dict.  Snapshot under data_lock: a concurrent
+        # eviction between an `in` check and the read raised KeyError on the
+        # GUI thread.
+        if thumb is None:
+            with self.data_lock:
+                d2 = self.data_2d.get(int(idx))
+            if d2 is not None:
+                thumb = d2.get('map_raw')
+                full_res = thumb is not None
 
         if thumb is None or (hasattr(thumb, 'size') and thumb.size == 0):
             if show_message:
@@ -1863,11 +2195,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     f'No image data available for frame {idx}.')
             return
 
-        # Display with correct orientation: transpose and flip vertically
-        self._image_preview_widget.setImage(
-            thumb.T[:, ::-1],
-            autoRange=True,
-            autoLevels=True,
-        )
+        # Show the image AS INTEGRATED (mask + threshold as NaN), through the
+        # standard pgImageWidget path so the (2, 98) nanpercentile levels
+        # apply.  Mask/threshold only on the FULL-RES map_raw path:
+        # thumbnails are downsampled (<=256px) with the mask already baked
+        # in as NaN, so the full-res flat mask indices would land on
+        # unrelated pixels (speckles), and their values are bg-subtracted /
+        # interpolated -- not the raw counts the worker thresholds.
+        if full_res:
+            img = displayFrameWidget.integration_view_image(
+                thumb, getattr(self, 'scan', None))
+        else:
+            img = np.asarray(thumb, dtype=np.float32)
+        # Correct orientation: transpose and flip vertically.
+        self._image_preview_widget.setImage(img.T[:, ::-1])
         self._image_preview_dialog.setWindowTitle(
             f'Raw Image Preview \u2014 Frame {idx}')

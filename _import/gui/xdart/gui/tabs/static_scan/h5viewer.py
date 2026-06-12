@@ -420,6 +420,14 @@ class H5Viewer(QWidget):
         # so the per-frame in-memory caches the live display depends on
         # aren't wiped mid-run.  Toggled by static_scan_widget.
         self.live_run_active = False
+        # True while ANY run (live / batch / reintegrate) is writing the .nxs.
+        # Set by the task-#68 run-state owner (static_scan_widget._enter/_exit_
+        # run_state) alongside the displayframe's _processing_active, so the
+        # frame-selection disk-load guard (data_changed) and the reader-side
+        # hydration guard (display_data._hydrate_frame_from_disk) share one
+        # source of truth and can't drift.  Distinct from live_run_active, which
+        # is live-only and also drives data_reset / the file-thread repoint.
+        self._run_writing = False
         self._displayed_list_count = 0
         self._displayed_last_label = None
 
@@ -948,13 +956,28 @@ class H5Viewer(QWidget):
         if previous_loc > self.ui.listData.count() - 1:
             previous_loc = self.ui.listData.count() - 1
 
-        if len(previous_sel) < 2:
-            self.ui.listData.setCurrentRow(previous_loc)
-        else:
+        # Restore the prior selection by frame TEXT (id), not row index.  Under
+        # streaming the pool completes frames out of order, so the list above is
+        # re-sorted on (nearly) every coalesce tick; a saved row index then
+        # points at a DIFFERENT frame, so a single-frame click would jump to a
+        # stale neighbour and get re-clobbered each tick (the "shows 47 while 52
+        # is selected" bug).  Text lookup is immune to reordering — this is what
+        # the multi-select branch always did; the single-select branch used to
+        # use the fragile row index.  Fall back to the row only when nothing was
+        # selected (or the selected frame no longer exists).
+        if previous_sel:
+            current_item = None
             for text in previous_sel:
-                matched = self.ui.listData.findItems(text, QtCore.Qt.MatchExactly)
-                for item in matched:
+                for item in self.ui.listData.findItems(text, QtCore.Qt.MatchExactly):
                     item.setSelected(True)
+                    if current_item is None:
+                        current_item = item
+            if current_item is not None:
+                self.ui.listData.setCurrentItem(current_item)
+            else:
+                self.ui.listData.setCurrentRow(previous_loc)
+        else:
+            self.ui.listData.setCurrentRow(previous_loc)
 
         self.ui.listData.blockSignals(False)
         _emit_changed()
@@ -978,14 +1001,22 @@ class H5Viewer(QWidget):
         self.sigThreadFinished.emit()
     
     def _scans_single_clicked(self, q):
-        """Handle single click in listScans — only acts in viewer mode.
+        """Handle single click in listScans — uniform across ALL modes.
 
-        XYE mode uses _scans_selection_changed instead to avoid double-firing.
+        Single click navigates folders and loads files everywhere (Vivek):
+        the Image/NeXus viewers and the normal Int 1D/2D modes act directly;
+        XYE mode routes FILE loads through _scans_selection_changed (it
+        fires after the selection settles, so Shift+arrow multi-select works
+        and nothing double-fires) and handles only NAVIGATION here.
         """
         if getattr(self, '_suspend_scan_selection_loads', False):
             return
-        if self.viewer_mode is not None and self.viewer_mode != 'xye':
-            self.scans_clicked(q)
+        if self.viewer_mode == 'xye':
+            text = q.text()
+            if text == '..' or text.endswith('/'):
+                self.scans_clicked(q)
+            return
+        self.scans_clicked(q)
 
     def _scans_current_changed(self, current, previous):
         """Handle arrow-key navigation in listScans (image viewer only).
@@ -1000,7 +1031,7 @@ class H5Viewer(QWidget):
         """
         if getattr(self, '_suspend_scan_selection_loads', False):
             return
-        if current is None or self.viewer_mode is None:
+        if current is None:
             return
         # XYE mode: handled by _scans_selection_changed
         if self.viewer_mode == 'xye':
@@ -1009,6 +1040,9 @@ class H5Viewer(QWidget):
         # Skip directories and ".." — don't auto-navigate on arrow keys
         if item_text == '..' or item_text.endswith('/'):
             return
+        # Uniform across modes (Vivek): arrow keys load .nxs in the normal
+        # Int 1D/2D modes exactly like the viewers (the file-handler queue
+        # serializes the loads).
         self.scans_clicked(current)
 
     def _scans_selection_changed(self):
@@ -1055,7 +1089,13 @@ class H5Viewer(QWidget):
         if getattr(self, '_suspend_scan_selection_loads', False):
             return
         try:
-            item_text = q.data(0)
+            try:
+                item_text = q.data(0)
+            except RuntimeError:
+                # Double-click after single-click navigation: the first click
+                # rebuilt listScans, so the second event can deliver an item
+                # whose C++ object is already deleted.  Nothing to act on.
+                return
 
             # Navigation: ".." or folder
             if item_text == '..':
@@ -1842,6 +1882,12 @@ class H5Viewer(QWidget):
                             generation=store.generation,
                         )
                     )
+            # Bound the full-res raws (Image Viewer browsing loaded ~18 MB
+            # per file with no ceiling; the LRU keeps the intended ~8).
+            # getattr: tests drive this on duck holders.
+            _trim = getattr(self, '_remember_hydrated_raw', None)
+            if _trim is not None:
+                _trim(int(frame_id))
             logger.debug(
                 'Image Viewer loaded processed frame %s from %s via %s: '
                 'shape=%s finite=%d',
@@ -1897,6 +1943,11 @@ class H5Viewer(QWidget):
                         generation=store.generation,
                     )
                 )
+        # Bound the full-res raws (Image Viewer browsing loaded ~18 MB per
+        # file with no ceiling; the LRU keeps the intended ~8).
+        _trim = getattr(self, '_remember_hydrated_raw', None)
+        if _trim is not None:
+            _trim(int(frame_id))
         logger.debug(
             'Image Viewer loaded frame %s from %s: shape=%s finite=%d '
             'min=%s max=%s',
@@ -1925,12 +1976,31 @@ class H5Viewer(QWidget):
                 continue
         return None
 
-    def set_file(self, fname):
+    def set_file(self, fname, *, internal=False):
         """Changes the data file.
 
         args:
             fname: str, absolute path for data file
+            internal: True for the app's own wiring (new_scan pointing the
+                file thread at the run's output file) -- bypasses the
+                user-interaction guards below.
         """
+        if not internal:
+            # Run guard (the uniform single-click/arrow loading made this
+            # reachable mid-run): repointing/reloading the shared scan during
+            # an ACTIVE run desyncs the live scan identity (live branch) or
+            # reloads a half-written file (batch).  data_changed has the
+            # same guard.  new_scan's own per-scan repoint passes
+            # internal=True.
+            if getattr(self, '_run_writing', False):
+                logger.debug("set_file ignored during active run: %s", fname)
+                return
+            # Same-file dedupe: a fresh single click fires currentItemChanged
+            # (press) AND itemClicked (release), both routed here -- without
+            # this the .nxs loaded twice per click (three times on a
+            # double-click).  Use Refresh to force a reload of the same file.
+            if fname and fname == getattr(self.file_thread, 'fname', None):
+                return
         if fname != '':
             try:
                 # with self.file_lock:
@@ -1951,6 +2021,24 @@ class H5Viewer(QWidget):
             except Exception:
                 logger.exception("Failed to set file: %s", fname)
                 return
+
+    def set_run_writing(self, active):
+        """Single switch (driven by the run-state owner ``_enter``/``_exit_run_
+        state``) telling frame selection NOT to read the ``.nxs`` while a run is
+        writing it.  On rising edge, cancel any in-flight load so a stale worker
+        isn't left churning against the now-active writer; on falling edge,
+        re-fire the standing selection so any frame that was skipped (evicted +
+        disk-load suppressed during the run) loads now that the file is idle.
+        """
+        active = bool(active)
+        was = self._run_writing
+        self._run_writing = active
+        if active and not was:
+            self.cancel_pending_loads()
+        elif was and not active and self.ui.listData.selectedItems():
+            # File is idle again — load whatever the user has selected (the
+            # disk-load guard in data_changed is now open).
+            self.data_changed()
 
     def data_changed(self, show_all=False):
         """Connected to itemSelectionChanged signal of listData.
@@ -2051,8 +2139,24 @@ class H5Viewer(QWidget):
         # need to be loaded from disk.
         frame_ids = [i for i in int_idxs if i not in idxs_memory]
 
-        if len(frame_ids) > 0:
+        # While ANY run is writing the .nxs, reading it here contends on
+        # file_lock/h5pool with the writer and, worse, drags the GUI thread into
+        # load_frames_data -> _teardown_load_worker's thread.wait(2000) on every
+        # writer save (each save re-fires sigUpdate -> re-fires this load) -> a
+        # multi-minute beachball that only clears at run end.  Serve frame
+        # selection from the in-memory caches only while a run is active
+        # (``_run_writing`` is set by the task-#68 run-state owner alongside the
+        # displayframe's ``_processing_active`` that gates the reader-side
+        # hydration, so the two guards can't drift across live/batch/reintegrate).
+        # Cached frames display instantly; evicted frames repaint when the run
+        # ends (set_run_writing(False) re-fires this handler).
+        if frame_ids and not getattr(self, '_run_writing', False):
             self.load_frames_data(frame_ids, load_2d)
+        elif frame_ids:
+            logger.debug(
+                "Run active: skipping disk load of %d evicted frame(s) %s; "
+                "serving cache only until the run ends", len(frame_ids), frame_ids,
+            )
 
         self.sigUpdate.emit()
 
@@ -2084,6 +2188,12 @@ class H5Viewer(QWidget):
             self.data_2d.clear()
             _clear_publication_store_for(self)
             _clear_raw_cache_for(self)
+        # Re-arm the raw self-heal: frame indices restart per scan, so a
+        # stale negative-cache entry from the previous file suppressed
+        # hydration for the SAME idx of the new one.
+        df = getattr(self, 'displayframe', None)
+        if df is not None:
+            df._raw_resolve_failed = set()
         self.new_scan = True
 
     def open_folder(self):
@@ -2297,6 +2407,8 @@ class H5Viewer(QWidget):
             payload = self.data_2d.get(stale)
             if payload is not None:
                 payload["map_raw"] = None
+                if "bg_raw" in payload:
+                    payload["bg_raw"] = None   # full bg images pin like raws
         self._raw_cache_order = order
 
     def _clear_raw_cache(self) -> None:

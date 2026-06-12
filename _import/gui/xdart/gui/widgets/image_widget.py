@@ -6,7 +6,10 @@
 # Standard library imports
 
 # Other imports
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
 from matplotlib import cm
 
 # This module imports
@@ -147,13 +150,21 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         self.raw_image = image[()]
         self.update_image(scale, cmap, **kwargs)
         if rect is not None:
-            self.imageItem.setRect(rect)
+            self.setRect(rect)      # through the diagnostic funnel
 
     def setRect(self, rect):
         self.imageItem.setRect(rect)
 
     def update_image(self, scale='Linear', cmap='viridis', **kwargs):
         self.displayed_image = np.asarray(np.copy(self.raw_image), dtype=float)
+        # All-NaN / empty images poison every nanpercentile below (RuntimeWarning
+        # + NaN levels -> pyqtgraph autoscale weirdness).  Higher layers normally
+        # block these, but the widget guards itself: show the raw image with no
+        # explicit levels and bail.
+        if (self.displayed_image.size == 0
+                or not np.isfinite(self.displayed_image).any()):
+            self.imageItem.setImage(self.displayed_image)
+            return
 
         cmap = 'viridis' if cmap == 'Default' else cmap
         cm = pg.colormap.getFromMatplotlib(cmap)  # prepare a linear color map

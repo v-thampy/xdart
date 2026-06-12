@@ -70,6 +70,12 @@ class NexusWriteCursor:
     groups: dict[str, tuple[int, int | None, tuple]] = field(default_factory=dict)
     metadata: tuple[int, int | None, tuple] | None = None
     instrument: tuple | None = None
+    # H1: labels whose row for a given group is permanently unwritable
+    # (publication-gate-rejected, or lazy-reloaded with no result).  Excluded
+    # from append selection so they aren't re-lazy-loaded inside the open
+    # writer handle and re-skipped (with a warning) on every save.
+    # {group_path: set(labels)}
+    dropped: dict = field(default_factory=dict)
 
 
 def _write_cursor(scan, h5f) -> NexusWriteCursor:
@@ -270,16 +276,37 @@ def save_scan_to_nexus(
         prepared_1d, prepared_2d = _filter_prepared_frame_publications(
             prepared_1d, prepared_2d,
         )
-        _validate_prepared_integrated(h5f.require_group(entry), prepared_1d, prepared_2d)
+        # Drop the publication-rejected replace rows from disk BEFORE the
+        # uniform-stack validation: with a changed row shape/axis the
+        # coverage check (_require_batch_covers_existing) would otherwise
+        # see the rejected frame's STALE row still on disk, uncovered by
+        # the incoming batch, and abort the WHOLE reintegration save over
+        # one per-frame drop -- violating the publication-gate contract
+        # (reject per frame, never abort whole-scan).  The dropped rows are
+        # publication-invalid; removing them is correct even if a later
+        # validation step still fails.
         _drop_filtered_replace_rows(h5f, prepared_1d, prepared_2d)
+        _validate_prepared_integrated(h5f.require_group(entry), prepared_1d, prepared_2d)
 
         # 2. Provenance — append mode: only on first save or finalize.
         # Replace mode: always rewrite so the persisted ``bai_*_args``
         # reflect whatever parameters the reintegration used (this is
         # the whole reason the user kicked off a re-integration in the
         # first place).
-        if is_replace or finalize or "reduction" not in h5f.get(entry, {}):
+        # P2 (codex): the GI first-chunk-freeze diagnostic is stamped on the
+        # scan AFTER initialize_scan's first save wrote the reduction group,
+        # and the GUI never passes finalize=True -- without this re-fire the
+        # persisted-provenance disclosure never landed on the real path.
+        # Cursor-deduped so steady-state saves stay write-free.
+        _gi_diag = getattr(scan, "gi_freeze_diagnostic", None)
+        _cur = _write_cursor(scan, h5f)
+        _diag_pending = bool(_gi_diag) and getattr(
+            _cur, "gi_diag_written", None) != _gi_diag
+        if (is_replace or finalize or _diag_pending
+                or "reduction" not in h5f.get(entry, {})):
             _write_reduction(h5f, scan, entry=entry)
+            if _gi_diag:
+                _cur.gi_diag_written = _gi_diag
         _t0 = _tick("reduction", _t0)
 
         _commit_integrated_1d(f, prepared_1d)
@@ -365,6 +392,12 @@ def _write_reduction(h5f, scan, *, entry: str) -> None:
     }
     if hasattr(scan, "gi_config") and scan.gi_config:
         config["gi_config"] = dict(scan.gi_config)
+    # T0-4 disclosure: when the GI grid was frozen from the first chunk
+    # because the whole-scan incidence range couldn't be verified, persist
+    # the advisory in the output file — not just a transient GUI label.
+    _gi_diag = getattr(scan, "gi_freeze_diagnostic", None)
+    if _gi_diag:
+        config["gi_freeze_diagnostic"] = str(_gi_diag)
 
     # Geometry: stored as a structured subgroup (handled specially in
     # write_provenance), so the convention is human-inspectable in HDF5.
@@ -446,7 +479,9 @@ def _new_frames_for_write(scan, h5f, group_path: str,
         memory_sig = _index_structure_signature(scan.frames.index, existing_n)
         if (cached_n == existing_n and cached_last == disk_last
                 and cached_sig == memory_sig and memory_last == disk_last):
-            new_indices = list(scan.frames.index[existing_n:])
+            _drop = cursor.dropped.get(group_path, ()) if cursor else ()
+            new_indices = [i for i in scan.frames.index[existing_n:]
+                           if int(i) not in _drop]
             return [scan.frames[i] for i in new_indices], existing_n
     # Select frames whose *label* isn't already on disk, not a positional
     # tail slice.  A late/out-of-order frame (e.g. frame 1 arriving after
@@ -465,7 +500,9 @@ def _new_frames_for_write(scan, h5f, group_path: str,
         live_ids = {int(x) for x in scan.frames.index}
         if not on_disk.issubset(live_ids):
             return [], -2
-    new_indices = [i for i in scan.frames.index if int(i) not in on_disk]
+    _drop = cursor.dropped.get(group_path, ()) if cursor else ()
+    new_indices = [i for i in scan.frames.index
+                   if int(i) not in on_disk and int(i) not in _drop]
     new_frames = [scan.frames[i] for i in new_indices]
     return new_frames, existing_n
 
@@ -506,6 +543,19 @@ def _select_frames_to_write(scan, h5f, group_path, replace_frame_indices,
     mismatch against the existing stack can require an explicit full rewrite.
     """
     all_ids = list(scan.frames.index)
+
+    # A replace save (reintegration) supplies FRESH results for its frames:
+    # clear their stale ``dropped`` bookkeeping up front.  Without this, a
+    # group whose every row was publication-rejected during the run (group
+    # never created on disk) fell through ``group_path in h5f`` into the
+    # append branch below, where the dropped set silently excluded every
+    # recomputed frame -- the designed recovery path wrote nothing.  A row
+    # that is STILL invalid after recomputation is re-dropped by the
+    # publication gate in this same save.
+    if replace_frame_indices is not None and cursor is not None:
+        stale = cursor.dropped.get(group_path)
+        if stale:
+            stale.difference_update(int(i) for i in replace_frame_indices)
 
     def _all_frames():
         return [scan.frames[i] for i in all_ids], list(all_ids)
@@ -721,6 +771,10 @@ def _filter_prepared_output(
                 error_details(publication),
             )
             dropped_indices.append(idx)
+            _cur = prepared.get("cursor")
+            if _cur is not None and not prepared.get("is_replace"):
+                _cur.dropped.setdefault(
+                    prepared["group_path"], set()).add(int(idx))
             continue
         kept_frames.append(frame)
         kept_indices.append(idx)
@@ -846,7 +900,32 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
         return
     results = [getattr(fr, "int_1d", None) for fr in frames]
     if any(r is None for r in results):
-        return None
+        # H1: drop result-less rows PER FRAME, never the whole save (a frame
+        # lazy-reloaded after its row was publication-dropped has int_1d=None
+        # forever; the old all-or-nothing skip silently truncated every
+        # LATER frame's write too).  Remember the labels on the cursor so
+        # they aren't re-selected (and re-lazy-loaded inside the open
+        # writer) on every subsequent save.
+        kept = [(fr, i, r) for fr, i, r in zip(frames, indices, results)
+                if r is not None]
+        missing = [int(i) for fr, i, r in zip(frames, indices, results)
+                   if r is None]
+        if not kept:
+            # EVERY selected row lacks a result: structural (this output was
+            # never computed for these frames), not the H1 mixed-drop
+            # pathology -- skip silently and leave the cursor alone (a later
+            # reintegrate may fill them in).
+            return None
+        if cursor is not None and replace_frame_indices is None:
+            cursor.dropped.setdefault(group_path, set()).update(missing)
+        logger.warning(
+            "integrated_%s: skipping %d frame(s) with no result (%s%s); "
+            "writing the remaining %d.", "1d", len(missing), missing[:8],
+            "..." if len(missing) > 8 else "", len(kept),
+        )
+        frames = [fr for fr, _i, _r in kept]
+        indices = [i for _fr, i, _r in kept]
+        results = [r for _fr, _i, r in kept]
     return {
         "entry": entry,
         "group_path": group_path,
@@ -882,6 +961,10 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
     """Select the 2D rows that would be written, without mutating disk."""
     if not scan.frames.index:
         return None
+    if getattr(scan, "skip_2d", False):
+        # Int 1D mode: 2D is intentionally not computed -- nothing to select,
+        # and the per-frame no-result warning below would be pure noise.
+        return None
 
     h5f = _h5(f)
     group_path = f"{entry}/integrated_2d"
@@ -893,7 +976,32 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
         return
     results = [getattr(fr, "int_2d", None) for fr in frames]
     if any(r is None for r in results):
-        return None
+        # H1: drop result-less rows PER FRAME, never the whole save (a frame
+        # lazy-reloaded after its row was publication-dropped has int_2d=None
+        # forever; the old all-or-nothing skip silently truncated every
+        # LATER frame's write too).  Remember the labels on the cursor so
+        # they aren't re-selected (and re-lazy-loaded inside the open
+        # writer) on every subsequent save.
+        kept = [(fr, i, r) for fr, i, r in zip(frames, indices, results)
+                if r is not None]
+        missing = [int(i) for fr, i, r in zip(frames, indices, results)
+                   if r is None]
+        if not kept:
+            # EVERY selected row lacks a result: structural (this output was
+            # never computed for these frames), not the H1 mixed-drop
+            # pathology -- skip silently and leave the cursor alone (a later
+            # reintegrate may fill them in).
+            return None
+        if cursor is not None and replace_frame_indices is None:
+            cursor.dropped.setdefault(group_path, set()).update(missing)
+        logger.warning(
+            "integrated_%s: skipping %d frame(s) with no result (%s%s); "
+            "writing the remaining %d.", "2d", len(missing), missing[:8],
+            "..." if len(missing) > 8 else "", len(kept),
+        )
+        frames = [fr for fr, _i, _r in kept]
+        indices = [i for _fr, i, _r in kept]
+        results = [r for _fr, _i, r in kept]
     return {
         "entry": entry,
         "group_path": group_path,
@@ -966,6 +1074,38 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
     output_dir = os.path.dirname(os.path.abspath(h5f.filename))
     existing_frame_keys = set(h5_frames.keys())
 
+    # N1: the project root that per-frame source paths are stored relative to.
+    # Set on the scan by the wrangler (GUI Project Folder); absent -> absolute
+    # paths (back-compat).  Stamp it once on the entry (POSIX) so the readers
+    # can resolve the relative pointers after the data moves machines.
+    source_base = getattr(scan, "source_base", None) or None
+    if source_base:
+        source_base = os.path.abspath(os.path.expanduser(str(source_base)))
+        posix_base = Path(source_base).as_posix()
+        # P2 #4 (codex): ONE scan-level @source_base governs ALL frames' relative
+        # source paths.  Appending to a file written under a DIFFERENT root would
+        # silently rebase the EARLIER frames against the new one (wrong path) -->
+        # reject loudly rather than corrupt their resolution.
+        existing = h5f[entry].attrs.get("source_base") if entry in h5f else None
+        if existing is not None:
+            if isinstance(existing, bytes):
+                existing = existing.decode("utf-8", errors="replace")
+            if str(existing) != posix_base:
+                raise ValueError(
+                    f"cannot append to {os.fspath(h5f.filename)!r}: its Project "
+                    f"Folder (@source_base={str(existing)!r}) differs from the "
+                    f"current ({posix_base!r}).  Earlier frames' relative source "
+                    f"paths are stored against the old root; start a NEW output "
+                    f"file for the new Project Folder."
+                )
+        try:
+            h5f[entry].attrs["source_base"] = posix_base
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to stamp @source_base={posix_base!r} on {entry!r}; "
+                "relative raw source paths would be unresolvable"
+            ) from exc
+
     # Filter the index *before* touching any frame object.  This is
     # the whole point of the cursor: we never lazy-load a frame we'd
     # immediately skip.
@@ -984,7 +1124,22 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
         fg = nx.NXcollection()
 
         thumb = getattr(frame, "thumbnail", None)
-        if thumb is None and hasattr(frame, "make_thumbnail"):
+        # PERF-5: for 1D-only (skip_2d) frames whose raw is reloadable from
+        # source, don't generate a thumbnail at save time -- the Image Viewer
+        # reloads the raw on demand via the per-frame source pointer written
+        # just below (load_processed_raw_or_thumbnail tries the source master
+        # before any stored thumbnail).  This avoids both the make_thumbnail
+        # cost and, after a raw-free, a source reload purely to build a
+        # preview.  Matches the batch precompute's frame.can_skip_thumbnail()
+        # gate so a precompute-skipped frame is never re-thumbnailed here.  A
+        # thumbnail already present (a 2D frame, or a prior reintegration) is
+        # still persisted.
+        _can_skip_thumb = (
+            thumb is None
+            and hasattr(frame, "can_skip_thumbnail")
+            and frame.can_skip_thumbnail(getattr(scan, "skip_2d", False))
+        )
+        if thumb is None and not _can_skip_thumb and hasattr(frame, "make_thumbnail"):
             try:
                 frame.make_thumbnail(global_mask=getattr(scan, "global_mask", None))
                 thumb = getattr(frame, "thumbnail", None)
@@ -1009,7 +1164,8 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
         # frame.map_raw verbatim, which silently dumped 18 MB per
         # Eiger frame into the .nxs.  Don't bring that back.
 
-        _write_source_ref(fg, frame, output_dir=output_dir)
+        _write_source_ref(fg, frame, output_dir=output_dir,
+                          source_base=source_base)
 
         ts = getattr(frame, "timestamp", None)
         if ts is not None:
@@ -1018,7 +1174,8 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
         frames[frame_key] = fg
 
 
-def _write_source_ref(fg, frame, *, output_dir: str | None = None) -> None:
+def _write_source_ref(fg, frame, *, output_dir: str | None = None,
+                      source_base: str | None = None) -> None:
     """Attach an ``NXcollection`` carrying the raw-source pointer.
 
     Writes ``source/path`` and ``source/frame_index`` under the
@@ -1029,10 +1186,20 @@ def _write_source_ref(fg, frame, *, output_dir: str | None = None) -> None:
     image is a single-frame file; for Eiger / multi-frame sources the
     wrangler should set ``source_frame_idx`` to the index *within*
     the source data file).
+
+    N1: when ``source_base`` (the project root) is given, ``path`` is stored
+    RELATIVE to it (POSIX, portable); otherwise it is stored absolute (POSIX,
+    back-compat).  ``relative_source_path`` warns + falls back to absolute for a
+    raw that sits outside the root.  Pair with ``entry/@source_base`` written by
+    the caller.
     """
+    from ssrl_xrd_tools.io.read import relative_source_path
+
     src_path = getattr(frame, "source_file", "") or ""
     if not src_path:
         return
+    # Resolve to an absolute path first (the frame may carry a relative
+    # source_file + a _resolved_source_path() helper, or sit under output_dir).
     if not os.path.isabs(src_path):
         resolved = ""
         if hasattr(frame, "_resolved_source_path"):
@@ -1050,7 +1217,7 @@ def _write_source_ref(fg, frame, *, output_dir: str | None = None) -> None:
     if src_frame_idx is None:
         src_frame_idx = getattr(frame, "idx", 0)
     sub = nx.NXcollection()
-    sub["path"] = nx.NXfield(os.path.abspath(str(src_path)))
+    sub["path"] = nx.NXfield(relative_source_path(src_path, source_base))
     sub["frame_index"] = nx.NXfield(int(src_frame_idx))
     fg["source"] = sub
 
@@ -1295,36 +1462,36 @@ def _write_instrument(f, scan, *, entry: str) -> None:
     # ── source (NXsource) ─────────────────────────────────────────
     # Provenance fix: ``scan.mg_args`` defaults to {'wavelength': 1e-10}
     # (= 1.0 Å) and is never updated from the PONI, so it was being
-    # persisted verbatim as wavelength_A=1.0.  Prefer the wavelength baked
-    # into the integrator built from the PONI (the real value, in metres);
-    # fall back to mg_args only when no integrator is available.  Mirrors
-    # the display-side lookup in display_data._get_wavelength.
-    wavelength = None
-    ai = getattr(scan, "_cached_integrator", None)
-    ai_wl = getattr(ai, "wavelength", None) if ai is not None else None
-    try:
-        if ai_wl is not None and float(ai_wl) > 0:
-            wavelength = float(ai_wl)
-    except (TypeError, ValueError):
-        wavelength = None
+    # persisted verbatim as wavelength_A=1.0.  Order (T1-4: same helpers +
+    # semantics as the display-side display_data._get_wavelength):
+    #   1. the integrator built from the PONI (authoritative; 1.0 Å allowed);
+    #   2. a wavelength restored from a previously loaded v2 file
+    #      (_persisted_wavelength_m — authoritative; covers save-as of a
+    #      reloaded scan whose real wavelength is exactly 1.0 Å);
+    #   3. mg_args, REJECTING the constructor's 1e-10 m sentinel.
+    # When nothing real is available, skip the stamp (a bogus wavelength_A
+    # silently corrupts any downstream Q↔2θ).  DEBUG, not WARNING: the
+    # initial empty-file save at run start legitimately predates the
+    # integrator, so a warning here is routine noise (the per-run saves
+    # that follow stamp the real value).
+    from xdart.modules.wavelength import normalize_wavelength_m
+    wavelength = normalize_wavelength_m(
+        getattr(getattr(scan, "_cached_integrator", None), "wavelength", None),
+        allow_default_sentinel=True,
+    )
     if wavelength is None:
-        # Fall back to mg_args, but NEVER persist the constructor's 1e-10 m
-        # (1.0 Å) sentinel — that's exactly the misleading value the
-        # integrator-first logic exists to avoid.  Skip (and warn) rather
-        # than write a wrong wavelength; a bogus wavelength_A silently
-        # corrupts any downstream Q↔2θ.
+        wavelength = normalize_wavelength_m(
+            getattr(scan, "_persisted_wavelength_m", None),
+            allow_default_sentinel=True,
+        )
+    if wavelength is None:
         mg_wl = scan.mg_args.get("wavelength") if scan.mg_args else None
-        try:
-            mg_wl = float(mg_wl) if mg_wl is not None else None
-        except (TypeError, ValueError):
-            mg_wl = None
-        if mg_wl is not None and mg_wl > 0 and abs(mg_wl - 1e-10) > 1e-14:
-            wavelength = mg_wl
-        elif mg_wl is not None:
-            logger.warning(
+        wavelength = normalize_wavelength_m(mg_wl)
+        if wavelength is None and mg_wl is not None:
+            logger.debug(
                 "Skipping source/wavelength_A: the only candidate is the "
-                "mg_args default sentinel (%g m = %.3g A) and no integrator "
-                "wavelength is available.", mg_wl, mg_wl * 1e10,
+                "mg_args default sentinel / invalid value (%r) and no "
+                "integrator or persisted wavelength is available.", mg_wl,
             )
     if wavelength is not None:
         if "source" in instr:

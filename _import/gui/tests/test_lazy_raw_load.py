@@ -380,7 +380,7 @@ class TestReloadOnlyFlagWiring:
 class TestPicklingPreservesLazyLoadCapability:
     """F8 / L1 follow-up.
 
-    The scan_threads.bai_*_all reintegrate path sends frames into
+    Older reintegration paths and external callers may send frames into
     a ProcessPoolExecutor.  Arches reloaded from v2 .nxs lack
     ``map_raw`` and depend on ``_source_root`` + ``source_file`` to
     lazy-load it.  The review flagged a suspicion that ``_source_root``
@@ -420,7 +420,8 @@ class TestPicklingPreservesLazyLoadCapability:
     def test_subprocess_can_lazy_load_via_pickled_frame(self, tmp_path):
         """End-to-end: spawn a real subprocess, pickle an frame into
         it, ask it to lazy-load, get the loaded array back.  This is
-        what scan_threads.bai_*_all does under the hood.
+        now a compatibility check for callers that still use process
+        pools outside the main GUI reduction spine.
         """
         pytest.importorskip("tifffile")
         from xdart.modules.ewald.frame import LiveFrame
@@ -434,13 +435,14 @@ class TestPicklingPreservesLazyLoadCapability:
         a.source_frame_idx = 0
         a._source_root = str(tmp_path)
 
-        # Use a ProcessPoolExecutor to mirror the real reintegrate
-        # path (scan_threads._reintegrate_all uses ProcessPoolExecutor).
         from concurrent.futures import ProcessPoolExecutor
 
-        with ProcessPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_load_and_return_raw, a)
-            result_arr, result_root = future.result()
+        try:
+            with ProcessPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_load_and_return_raw, a)
+                result_arr, result_root = future.result()
+        except (NotImplementedError, PermissionError) as exc:
+            pytest.skip(f"process pools are unavailable in this environment: {exc}")
 
         # Lazy load succeeded inside the subprocess.
         assert result_arr is not None
@@ -455,6 +457,122 @@ def _load_and_return_raw(frame):
     pickling to work."""
     frame._lazy_load_raw()
     return frame.map_raw, frame._source_root
+
+
+class TestFreeRaw:
+    """PERF-3: ``LiveFrame.free_raw`` drops map_raw/bg_raw to bound run RAM,
+    but only when the raw is losslessly recoverable from the on-disk source.
+    """
+
+    def test_frees_when_source_recoverable(self, tmp_path):
+        pytest.importorskip("tifffile")
+        from xdart.modules.ewald.frame import LiveFrame
+
+        img = _write_tif(tmp_path / "frame_0000.tif", shape=(8, 8), seed=3)
+        a = LiveFrame(idx=0)
+        a.map_raw = img.astype(np.float32)
+        a.bg_raw = np.zeros_like(a.map_raw)
+        a.source_file = "frame_0000.tif"
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+        # Stand-ins for the consumed-products that must survive the free.
+        a.thumbnail = np.ones((4, 4), dtype=np.uint8)
+        a.int_1d = "int_1d_sentinel"
+        a.int_2d = "int_2d_sentinel"
+
+        assert a.free_raw() is True
+        assert a.map_raw is None
+        assert a.bg_raw is None
+        # The consumed products are untouched.
+        assert a.thumbnail is not None
+        assert a.int_1d == "int_1d_sentinel"
+        assert a.int_2d == "int_2d_sentinel"
+
+    def test_noop_when_source_unrecoverable(self, tmp_path):
+        """In-memory-only frame (no on-disk source) must never be freed —
+        there is nothing to reload it from."""
+        from xdart.modules.ewald.frame import LiveFrame
+        a = LiveFrame(idx=0)
+        a.map_raw = np.ones((4, 4), dtype=np.float32) * 7
+        a.bg_raw = np.zeros((4, 4), dtype=np.float32)
+        a.source_file = ""  # no source → not resolvable
+        assert a.free_raw() is False
+        assert a.map_raw is not None
+        assert np.all(a.map_raw == 7)
+
+    def test_noop_when_source_file_missing(self, tmp_path):
+        """source_file stamped but the file isn't on disk → don't free
+        (the raw would be unrecoverable)."""
+        from xdart.modules.ewald.frame import LiveFrame
+        a = LiveFrame(idx=0)
+        a.map_raw = np.ones((4, 4), dtype=np.float32)
+        a.source_file = "ghost.tif"
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+        assert a.free_raw() is False
+        assert a.map_raw is not None
+
+    def test_noop_when_already_empty(self, tmp_path):
+        from xdart.modules.ewald.frame import LiveFrame
+        a = LiveFrame(idx=0)
+        a.map_raw = None
+        a.bg_raw = None
+        a.source_file = str(tmp_path / "whatever.tif")
+        assert a.free_raw() is False
+
+    def test_lazy_reload_recovers_after_free(self, tmp_path):
+        """Round-trip: free then a later read (e.g. reintegration) lazily
+        reloads the identical array from source."""
+        pytest.importorskip("tifffile")
+        from xdart.modules.ewald.frame import LiveFrame
+
+        img = _write_tif(tmp_path / "frame_0000.tif", shape=(10, 12), seed=5)
+        a = LiveFrame(idx=0)
+        a.map_raw = img.astype(np.float32)
+        a.source_file = "frame_0000.tif"
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+
+        assert a.free_raw() is True
+        assert a.map_raw is None
+        # A later consumer triggers lazy reload.
+        assert a._lazy_load_raw() is True
+        assert a.map_raw is not None
+        np.testing.assert_allclose(a.map_raw, img.astype(np.float32))
+
+
+class TestCanSkipThumbnail:
+    """PERF-5: can_skip_thumbnail gates the 1D-only thumbnail skip — only a
+    1D-only (skip_2d) scan whose raw is losslessly reloadable from source may
+    omit the per-frame 2D thumbnail (the Image Viewer reloads raw on demand).
+    """
+
+    def test_skip_2d_reloadable_can_skip(self, tmp_path):
+        pytest.importorskip("tifffile")
+        from xdart.modules.ewald.frame import LiveFrame
+        _write_tif(tmp_path / "f.tif", shape=(8, 8))
+        a = LiveFrame(idx=0)
+        a.source_file = "f.tif"
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+        # 1D-only + reloadable -> thumbnail is redundant.
+        assert a.can_skip_thumbnail(True) is True
+        # 2D mode keeps the thumbnail even when reloadable.
+        assert a.can_skip_thumbnail(False) is False
+
+    def test_skip_2d_no_source_keeps_thumbnail(self):
+        from xdart.modules.ewald.frame import LiveFrame
+        a = LiveFrame(idx=0)
+        a.source_file = ""  # no source -> not reloadable -> only preview is the thumb
+        assert a.can_skip_thumbnail(True) is False
+
+    def test_skip_2d_missing_source_keeps_thumbnail(self, tmp_path):
+        from xdart.modules.ewald.frame import LiveFrame
+        a = LiveFrame(idx=0)
+        a.source_file = "ghost.tif"  # stamped but not on disk
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+        assert a.can_skip_thumbnail(True) is False
 
 
 class TestIntegrateTriggersLazyLoad:

@@ -12,22 +12,30 @@ from .frame_series import LiveFrameSeries
 from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xdart import utils
 from xdart.modules.live_compat import normalize_live_class_names
+from xdart.modules.wavelength import (
+    DEFAULT_WAVELENGTH_SENTINEL_M,
+    wavelength_angstrom_to_m,
+)
 
 
-def _numeric_scan_info(scan_info):
-    """Return ``scan_info`` keeping only numeric-coercible values (as floats).
+def _coerce_scan_info(scan_info):
+    """Return ``scan_info`` with numeric-looking values coerced to float and
+    genuinely non-numeric values (tags, status, comments, timestamps) kept as
+    strings.  Every key is preserved.
 
-    Metadata dicts can carry non-numeric fields (comments, sample names,
-    timestamps); they are dropped here so a single one doesn't break the
-    float64 ``scan_data`` table.  Numeric motors — including the GI ``th``
-    incidence motor and monitor counts — are preserved.
+    The numeric-vs-string decision for each *column* belongs at the NeXus
+    writer (numeric -> float32, non-numeric -> vlen UTF-8 string), not here:
+    dropping a whole column because one value won't parse silently loses
+    provenance (N2 -- e.g. a SPEC counter reported as ``"0V"``).  Numeric
+    strings (SPEC often stores numbers as text) still coerce, so motors --
+    including the GI ``th`` incidence motor and monitor counts -- stay numeric.
     """
     out = {}
     for key, value in scan_info.items():
         try:
             out[key] = float(value)
         except (TypeError, ValueError):
-            continue
+            out[key] = value if isinstance(value, str) else str(value)
     return out
 
 
@@ -117,7 +125,16 @@ class LiveScan:
         self.single_img = single_img
         self.series_average = series_average
         self.skip_2d = False
+        # Real wavelength restored from a loaded v2 .nxs (G1).  Authoritative
+        # when set (display/adapters may trust even an exactly-1.0 Å value);
+        # MUST be cleared whenever the scan's data identity changes without a
+        # v2 load -- see _clear_persisted_wavelength.
+        self._persisted_wavelength_m = None
         self._cached_integrator = None
+        # PONI used to build ``_cached_integrator`` -- stashed so the
+        # reintegration path can pass it to the headless GI session (which
+        # requires ``scan.poni`` to build the fiber integrator).
+        self._cached_poni = None
         self._cached_fiber_integrator = None
 
         if frames:
@@ -157,6 +174,19 @@ class LiveScan:
             self.global_mask = None
             self.bai_1d = None
             self.bai_2d = None
+            self._clear_persisted_wavelength()
+
+    def _clear_persisted_wavelength(self):
+        """Drop the wavelength restored from a previously loaded .nxs (G1).
+
+        The persisted value short-circuits ``_get_wavelength`` AHEAD of the
+        current file's own stamp, so it must be cleared at every data-identity
+        change that does not run ``_load_from_nexus_v2`` (``reset()``, the
+        live/XYE ``set_datafile`` repoints, ``new_scan``) -- otherwise a run
+        into file B keeps converting Q↔2θ with file A's wavelength."""
+        self._persisted_wavelength_m = None
+        if isinstance(self.mg_args, dict):
+            self.mg_args["wavelength"] = DEFAULT_WAVELENGTH_SENTINEL_M
 
     def has_reload_only_frames(self) -> bool:
         """Return True iff any frame can't recover its raw image.
@@ -378,16 +408,15 @@ class LiveScan:
             self.frames.stash(frame)
 
             if frame.scan_info and get_sd:
-                # Keep only numeric-coercible fields.  A single non-numeric
-                # value (e.g. a comment / sample-name / date that a metadata
-                # reader includes) must NOT nuke the whole scan_data table:
-                # ``pd.Series(scan_info, dtype='float64')`` raises wholesale on
-                # any non-float, which silently emptied scan_data for every
-                # frame — blanking the metadata panel and (since the GI
-                # incidence ``th`` lives here) collapsing the GI-2D geometry.
-                numeric_info = _numeric_scan_info(frame.scan_info)
-                if numeric_info:
-                    ser = pd.Series(numeric_info, dtype='float64')
+                # Keep every metadata field heterogeneous (numeric coerced to
+                # float, non-numeric kept as strings) so non-numeric provenance
+                # (sample tag, status, "0V" counter) survives to the writer,
+                # which persists numeric columns as float32 and non-numeric as
+                # vlen UTF-8 strings (N2).  No forced float64 dtype: pandas
+                # infers per column.
+                coerced_info = _coerce_scan_info(frame.scan_info)
+                if coerced_info:
+                    ser = pd.Series(coerced_info)
                     if list(self.scan_data.columns):
                         try:
                             self.scan_data.loc[frame.idx] = ser
@@ -399,16 +428,16 @@ class LiveScan:
                             sidx = self.scan_data.index
                             if len(sidx) >= 2 and sidx[-1] < sidx[-2]:
                                 self.scan_data.sort_index(inplace=True)
-                        except ValueError:
+                        except (ValueError, TypeError):
                             logger.debug(
                                 'scan_data column mismatch for frame %s '
                                 '(have %s, got %s)',
                                 frame.idx, list(self.scan_data.columns),
-                                list(numeric_info),
+                                list(coerced_info),
                             )
                     else:
                         self.scan_data = pd.DataFrame(
-                            numeric_info, index=[frame.idx], dtype='float64'
+                            [coerced_info], index=[frame.idx]
                         )
 
             if update:
@@ -501,6 +530,15 @@ class LiveScan:
                 entry=entry, finalize=finalize,
                 replace_frame_indices=replace_frame_indices,
             )
+            # Persist-before-evict (data-loss guard): every frame now in the
+            # index is written to disk, so the in-memory cache may evict them.
+            # Until this mark, ``LiveFrameSeries.stash`` refuses to drop them
+            # (their int_1d/int_2d live only on the in-memory LiveFrame). Only
+            # reached on a successful save — a raising writer leaves the frames
+            # unmarked (and therefore un-evictable).
+            mark = getattr(self.frames, "mark_persisted", None)
+            if callable(mark):
+                mark(list(self.frames.index))
 
     def load_from_h5(self, replace=True, mode='r', *args, **kwargs):
         """Load scan state from a v2 NeXus file.
@@ -594,6 +632,8 @@ class LiveScan:
         materialisation) and ~tens of ms (frame index + a few KB of
         coords + motor columns).
         """
+        self._clear_persisted_wavelength()
+
         # Prefer the metadata-only loader — it skips the heavy stacks;
         # fall back to the full reader on older builds that lack it.
         try:
@@ -682,15 +722,37 @@ class LiveScan:
                 logger.debug("Failed to restore geometry from reduction config",
                              exc_info=True)
 
+        # v2 writer stores real calibration wavelength at
+        # /entry/instrument/source/wavelength_A.  Restore it into mg_args so a
+        # reloaded scan can do Q↔2θ display conversion without falling back to
+        # the LiveScan constructor's 1e-10 m placeholder.  Read through the
+        # ALREADY-OPEN handle (``grp``) — the caller holds the file open
+        # (Append loads use mode='a'), so a second ``h5py.File`` open of the
+        # same path is fragile under HDF5 file locking.
+        try:
+            wl_m = wavelength_angstrom_to_m(
+                grp["entry/instrument/source/wavelength_A"][()]
+            )
+            if wl_m is not None:
+                self._persisted_wavelength_m = wl_m
+                self.mg_args["wavelength"] = wl_m
+        except KeyError:
+            logger.debug("No persisted instrument/source wavelength in %s",
+                         self.data_file)
+        except Exception:
+            logger.debug("Failed reading persisted wavelength from %s",
+                         self.data_file, exc_info=True)
+
         # ── global_mask: persisted under /entry/instrument/detector/mask ─
         # Restored here so the displayframe can overlay it on raw images
         # without depending on the wrangler having loaded the mask file.
+        # Read through the already-open handle (same rationale as the
+        # wavelength restore above — no double-open of a file the caller
+        # holds open in mode 'a').
         try:
-            import h5py
-            with h5py.File(self.data_file, "r") as _f:
-                _det = _f.get("entry/instrument/detector")
-                if _det is not None and "mask" in _det:
-                    self.global_mask = np.asarray(_det["mask"][()], dtype=np.int64)
+            _det = grp.get("entry/instrument/detector")
+            if _det is not None and "mask" in _det:
+                self.global_mask = np.asarray(_det["mask"][()], dtype=np.int64)
         except Exception:
             logger.debug("Failed to read global_mask from %s",
                          self.data_file, exc_info=True)

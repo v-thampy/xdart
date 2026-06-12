@@ -8,17 +8,15 @@ import logging
 import os
 from queue import Queue
 from threading import Condition, RLock
-# M2 dropped ProcessPoolExecutor; ThreadPoolExecutor + as_completed
-# are imported locally in _reintegrate_all to keep the top-of-file
-# imports tight.
 import traceback
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 from xdart.modules.reduction import (
+    open_live_reduction_session,
     StandardPlanCache,
-    dispatch_live_frame_reduction,
+    reduce_live_frames,
 )
 
 # Qt imports
@@ -31,10 +29,9 @@ from xdart.utils import catch_h5py_file as catch
 
 
 # M2: _reintegrate_frame (the module-level pickle-safe worker for the
-# pre-M2 ProcessPoolExecutor reintegrate path) removed.  The new
-# _reintegrate_all uses ThreadPoolExecutor + an inline closure
-# instead — no pickling, no IPC, GIL released by pyFAI's Cython
-# integration during the call.
+# pre-M2 ProcessPoolExecutor reintegrate path) removed.  Architecture-v2
+# routes reintegration through ssrl_xrd_tools.reduction.run_reduction so
+# xdart no longer owns a second per-frame integration engine here.
 
 
 class integratorThread(Qt.QtCore.QThread):
@@ -90,6 +87,12 @@ class integratorThread(Qt.QtCore.QThread):
         self.mg_2d_args = {}
         # C1: cached standard ReductionPlan per scan.
         self._plan_cache = StandardPlanCache()
+        self._reduction_session = None
+        self._reduction_session_key = None
+        # Cooperative stop for the (potentially minutes-long) batched
+        # reintegrate loop; set by staticWidget.close().  Checked between
+        # batches only -- a batch in flight finishes.
+        self.stop_requested = False
 
     def run(self):
         """Calls self.method. Catches exception where method does
@@ -102,6 +105,42 @@ class integratorThread(Qt.QtCore.QThread):
             except KeyError as e:
                 logger.error("Method %s failed with KeyError: %s", self.method, e, exc_info=True)
                 traceback.print_exc()
+            finally:
+                self._close_reduction_session()
+
+    def _get_reduction_session(self, key, factory):
+        if self._reduction_session is not None and self._reduction_session_key == key:
+            return self._reduction_session
+        self._close_reduction_session()
+        self._reduction_session = factory()
+        self._reduction_session_key = key
+        return self._reduction_session
+
+    def _close_reduction_session(self):
+        session = self._reduction_session
+        self._reduction_session = None
+        self._reduction_session_key = None
+        if session is not None:
+            try:
+                session.finish()
+            except Exception as exc:
+                # BLOCKER 2: finish() is fail-loud now.  Don't silently swallow a
+                # reintegration write failure — log it at ERROR and record it so
+                # the run can't pass as a clean success.
+                self._reduction_write_error = exc
+                logger.error("reintegration session WRITE FAILED on close: %s",
+                             exc, exc_info=True)
+
+    def _session_key(self, n_workers: int, plan):
+        key = max(1, int(n_workers or 1))
+        return (
+            id(self.scan),
+            str(getattr(self.scan, "name", "scan")),
+            key,
+            bool(getattr(self.scan, "gi", False)),
+            bool(getattr(self.scan, "skip_2d", False)),
+            id(plan),
+        )
 
     def _upsert_publication_for_frame(self, frame) -> None:
         """Refresh the publication snapshot for one reintegrated frame."""
@@ -122,6 +161,65 @@ class integratorThread(Qt.QtCore.QThread):
                 "reintegrate publication upsert failed for frame %s",
                 getattr(frame, "idx", "?"), exc_info=True,
             )
+
+    def _prepare_frame_for_headless_reduction(self, frame):
+        if self.scan.static:
+            frame.static = True
+        if self.scan.gi:
+            frame.gi = True
+        if getattr(self.scan, "_cached_integrator", None) is not None:
+            frame.integrator = self.scan._cached_integrator
+        return frame
+
+    def _reduce_reintegration_batch(self, frames, plan, *, n_workers: int = 1):
+        frames = [
+            self._prepare_frame_for_headless_reduction(frame)
+            for frame in frames
+        ]
+        if not frames:
+            return []
+        is_gi = bool(getattr(self.scan, "gi", False))
+        # GI reduction builds a fiber integrator from a PONI; the headless
+        # session raises ``ValueError("GI reduction requires scan.poni.")`` if
+        # neither the scan nor a frame carries one.  Pass the PONI the wrangler
+        # stashed alongside the cached integrator, and guard the no-calibration
+        # case with a clear message instead of letting an unhandled raise tear
+        # down the reintegration thread.
+        poni = getattr(self.scan, "_cached_poni", None)
+        if is_gi and poni is None and getattr(frames[0], "poni", None) is None:
+            logger.error(
+                "GI reintegration needs a loaded PONI/calibration; none is "
+                "available on the scan. Load the calibration and retry."
+            )
+            return []
+        n_workers = n_workers if len(frames) > 1 else 1
+        executor = n_workers if n_workers > 1 else None
+        gi_freeze_mode = "scout_union" if is_gi else None
+        session = self._get_reduction_session(
+            self._session_key(n_workers, plan),
+            lambda: open_live_reduction_session(
+                frames,
+                plan,
+                scan_name=str(getattr(self.scan, "name", "scan")),
+                global_mask=getattr(self.scan, "global_mask", None),
+                integrator=getattr(self.scan, "_cached_integrator", None),
+                poni=poni,
+                executor=executor,
+                chunk_size=max(1, min(n_workers, len(frames))),
+                gi_freeze_mode=gi_freeze_mode,
+            ),
+        )
+        return reduce_live_frames(
+            frames,
+            plan,
+            scan_name=str(getattr(self.scan, "name", "scan")),
+            global_mask=getattr(self.scan, "global_mask", None),
+            integrator=getattr(self.scan, "_cached_integrator", None),
+            poni=poni,
+            session=session,
+            chunk_size=max(1, min(n_workers, len(frames))),
+            gi_freeze_mode=gi_freeze_mode,
+        )
 
     def _publish_reintegrated_display(
         self,
@@ -161,10 +259,9 @@ class integratorThread(Qt.QtCore.QThread):
     def _reintegrate_all(self, *, do_2d: bool) -> None:
         """Shared GUI-button reintegration body for 1D and 2D paths.
 
-        M2 rewrite: switched from ``ProcessPoolExecutor`` over an
+        Architecture-v2 rewrite: switched from ``ProcessPoolExecutor`` over an
         eagerly-materialised frame list to **batched lazy iteration +
-        ThreadPoolExecutor + IntegratorPool** — the same primitive
-        the wranglers use.
+        ssrl_xrd_tools.reduction.run_reduction**.
 
         Why the change.  Pre-M2 the path was:
             all_frames = list(self.scan.frames)
@@ -182,14 +279,13 @@ class integratorThread(Qt.QtCore.QThread):
         * Peak RAM holds the full list of N frames in the parent,
           defeating the ``_in_memory_cap=64`` eviction policy.
 
-        After M2:
+        Now:
         * Iterate the index in batches of ``_RE_BATCH`` (default
           ``32 * n_workers``); each batch is lazy-loaded just before
           dispatch and goes out of scope after publish.
-        * ``IntegratorPool`` borrows + worker-thread integration — no
-          pickling cost, GIL released by pyFAI's Cython path.
-        * Stop is honoured between batches (and inside workers,
-          inherited from the wranglers' pattern).
+        * ``run_reduction`` owns worker-thread integration and private
+          integrator copies — xdart only publishes results.
+        * Stop is honoured between batches.
         """
         with self.data_lock:
             if do_2d:
@@ -249,139 +345,57 @@ class integratorThread(Qt.QtCore.QThread):
             self.scan, integrate_2d=do_2d,
         )
 
-        # IntegratorPool: one deep-copied pyFAI integrator per worker.
-        # If scan._cached_integrator is None (scan fresh-from-load
-        # without a wrangler having attached an integrator), the pool
-        # comes back None and we fall back to the serial path.
-        from xdart.utils.integrator_pool import ensure_integrator_pool
-        from concurrent.futures import ThreadPoolExecutor
-
-        integrator_pool = ensure_integrator_pool(
-            self.scan, '_cached_integrator', n_workers,
-        )
-
-        # Same per-worker pattern for the GI fiber integrator (H2).
-        # Only relevant when scan.gi is set AND a fiber integrator
-        # has been pre-built; otherwise None and the integrate calls
-        # treat the fiber arg as a no-op.
-        fiber_pool = None
-        if (self.scan.gi
-                and getattr(self.scan, '_cached_fiber_integrator', None)
-                is not None):
-            fiber_pool = ensure_integrator_pool(
-                self.scan, '_cached_fiber_integrator', n_workers,
-                pool_attr='_cached_fiber_integrator_pool',
-            )
-
-        # P2: re-use the wrangler base class's angle-aware borrow.
-        # The plain ``fiber_pool.borrow()`` below was unconditionally
-        # handing out the prewarmed (frame-0) FiberIntegrator to every
-        # worker.  For ω-varying GI scans (e.g. sin²ψ sweeps) the
-        # per-frame incidence angle drifts and the prewarmed instance
-        # silently integrates every frame at frame-0 geometry —
-        # silently wrong.  The helper falls back to a worker-local
-        # fiber integrator built at the right angle when the
-        # per-frame angle differs from ``_cached_fiber_integrator_angle``.
-        from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import (
-            wranglerThread,
-        )
-        _borrow_fi = wranglerThread._borrow_fiber_integrator
-
-        def _worker(frame):
-            """Re-integrate one frame on a thread.  Borrows a private
-            integrator from the pool to avoid pyFAI's CSR scratch
-            buffer races; same fix as IntegratorPool in the wranglers.
-            """
-            if self.scan.static:
-                frame.static = True
-            if self.scan.gi:
-                frame.gi = True
-            if integrator_pool is not None:
-                with integrator_pool.borrow() as ai:
-                    frame.integrator = ai
-
-                    def _legacy_gi_for_frame() -> None:
-                        # P2: angle-aware fiber borrow — pool hit when the
-                        # frame's incidence angle matches the cached
-                        # prewarm angle (most scans), worker-local build
-                        # otherwise.
-                        with _borrow_fi(self.scan, fiber_pool, frame) as fi:
-                            frame.integrate_1d(
-                                fiber_integrator=fi,
-                                **self.scan.bai_1d_args,
-                            )
-                            if do_2d:
-                                frame.integrate_2d(
-                                    fiber_integrator=fi,
-                                    **self.scan.bai_2d_args,
-                                )
-
-                    dispatch_live_frame_reduction(
-                        frame, self.scan,
-                        standard_plan=standard_plan,
-                        integrator=ai,
-                        global_mask=self.scan.global_mask,
-                        legacy_gi=_legacy_gi_for_frame,
-                    )
-                    # Detach pool integrator before the next worker
-                    # borrows the same instance.
-                    frame.integrator = self.scan._cached_integrator
-            else:
-                # Fallback: no integrator pool — still go through the
-                # shared dispatch helper so the GI vs standard logic
-                # stays in one place.
-                def _legacy_gi_serial() -> None:
-                    if do_2d:
-                        frame.integrate_2d(**self.scan.bai_2d_args)
-                    else:
-                        frame.integrate_1d(**self.scan.bai_1d_args)
-
-                dispatch_live_frame_reduction(
-                    frame, self.scan,
-                    standard_plan=standard_plan,
-                    integrator=frame.integrator,
-                    global_mask=self.scan.global_mask,
-                    legacy_gi=_legacy_gi_serial,
-                )
-            return frame
-
         # Batched dispatch: lazy-load each batch right before
         # submitting it, publish results, then drop the batch's
         # frames so RAM stays bounded.
         _RE_BATCH = max(8, 32 * n_workers)
 
-        if max_cores > 1 and len(indices) > 1 and integrator_pool is not None:
-            for i in range(0, len(indices), _RE_BATCH):
-                chunk_idxs = indices[i:i + _RE_BATCH]
-                # LiveFrameSeries.__getitem__ does the lazy v2 load + sets
-                # source refs / _source_root for the L1 raw loader.
-                frames = [self.scan.frames[idx] for idx in chunk_idxs]
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    futures = {
-                        pool.submit(_worker, frame): frame.idx
-                        for frame in frames
-                    }
-                    from concurrent.futures import as_completed
-                    for fut in as_completed(futures):
-                        try:
-                            _publish(fut.result())
-                        except Exception as e:
-                            frame_idx = futures[fut]
-                            logger.error(
-                                "%s integration failed for frame %s: %s",
-                                label, frame_idx, e, exc_info=True,
+        for i in range(0, len(indices), _RE_BATCH):
+            if self.stop_requested:
+                logger.warning(
+                    "%s reintegration stopped at frame %s/%s (app close); "
+                    "recomputed frames are NOT saved.", label,
+                    i, len(indices))
+                return
+            chunk_idxs = indices[i:i + _RE_BATCH]
+            # LiveFrameSeries.__getitem__ does the lazy v2 load + sets
+            # source refs / _source_root for the L1 raw loader.
+            frames = [self.scan.frames[idx] for idx in chunk_idxs]
+            try:
+                reduced_frames = self._reduce_reintegration_batch(
+                    frames,
+                    standard_plan,
+                    n_workers=n_workers,
+                )
+            except Exception as exc:
+                logger.error(
+                    "%s batch reintegration failed for frames %s-%s: %s; "
+                    "retrying frame-by-frame",
+                    label, chunk_idxs[0], chunk_idxs[-1], exc,
+                    exc_info=True,
+                )
+                reduced_frames = []
+                for frame in frames:
+                    try:
+                        reduced_frames.extend(
+                            self._reduce_reintegration_batch(
+                                [frame],
+                                standard_plan,
+                                n_workers=1,
                             )
-                            self.update.emit(frame_idx)
-                # ``frames`` goes out of scope at the end of the
-                # iteration, so the FIFO _in_memory_cap eviction
-                # can free those frames before the next chunk loads.
-        else:
-            # Serial fallback (max_cores=1, single frame, or no
-            # integrator pool available).  Still lazy-loaded one
-            # at a time so we don't materialise the full list.
-            for idx in indices:
-                frame = self.scan.frames[idx]
-                _publish(_worker(frame))
+                        )
+                    except Exception as frame_exc:
+                        logger.error(
+                            "%s integration failed for frame %s: %s",
+                            label, getattr(frame, "idx", None), frame_exc,
+                            exc_info=True,
+                        )
+                        self.update.emit(getattr(frame, "idx", -1))
+            for frame in reduced_frames:
+                _publish(frame)
+            # ``frames`` goes out of scope at the end of the iteration, so
+            # the FIFO _in_memory_cap eviction can free old frames before
+            # the next chunk loads.
 
         # Persist recomputed int_* rows back to disk via the v2
         # replace-frames path.  The save re-writes /entry/reduction
@@ -423,16 +437,7 @@ class integratorThread(Qt.QtCore.QThread):
         for idx in idxs:
             frame = self.scan.frames[int(idx)]
 
-            def _legacy_gi_2d(frame=frame) -> None:
-                frame.integrate_2d(**self.scan.bai_2d_args)
-
-            dispatch_live_frame_reduction(
-                frame, self.scan,
-                standard_plan=plan,
-                integrator=frame.integrator,
-                global_mask=self.scan.global_mask,
-                legacy_gi=_legacy_gi_2d,
-            )
+            self._reduce_reintegration_batch([frame], plan, n_workers=1)
             self._publish_reintegrated_display(
                 frame,
                 include_2d=True,
@@ -450,16 +455,7 @@ class integratorThread(Qt.QtCore.QThread):
         for idx in idxs:
             frame = self.scan.frames[int(idx)]
 
-            def _legacy_gi_1d(frame=frame) -> None:
-                frame.integrate_1d(**self.scan.bai_1d_args)
-
-            dispatch_live_frame_reduction(
-                frame, self.scan,
-                standard_plan=plan,
-                integrator=frame.integrator,
-                global_mask=self.scan.global_mask,
-                legacy_gi=_legacy_gi_1d,
-            )
+            self._reduce_reintegration_batch([frame], plan, n_workers=1)
             self._publish_reintegrated_display(
                 frame,
                 include_2d=False,
@@ -531,11 +527,17 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 self.sigTaskStarted.emit()
                 method = getattr(self, method_name)
                 method()
-            except KeyError as e:
-                logger.error("Task %s failed with KeyError: %s", method_name, e, exc_info=True)
+            except Exception as e:
+                # The loop must survive ANY task failure: this thread is
+                # created once and never restarted, so a single OSError
+                # (locked/corrupt/NFS file) escaping here used to kill file
+                # loading for the rest of the session, silently.
+                logger.error("Task %s failed: %s", method_name, e,
+                             exc_info=True)
                 traceback.print_exc()
-            self.running = False
-            self.sigTaskDone.emit(method_name)
+            finally:
+                self.running = False
+                self.sigTaskDone.emit(method_name)
     
     def set_datafile(self):
         with self.file_lock:
@@ -549,6 +551,12 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 # instead of being silently treated as an empty XYE result.
                 self.scan.data_file = self.fname
                 self.scan.name = os.path.split(self.fname)[-1].split('.')[0]
+                # G1/T0-1: the repoint skips load_from_h5, so the wavelength
+                # restored from the PREVIOUS file must not survive the switch.
+                # getattr: tests drive this with duck-typed scan stubs.
+                _clear_wl = getattr(self.scan, '_clear_persisted_wavelength', None)
+                if callable(_clear_wl):
+                    _clear_wl()
             elif getattr(self, 'live_run', False):
                 # Live, non-batch run: the wrangler owns this file and
                 # is feeding the GUI in-memory frames per frame.  A full
@@ -562,6 +570,12 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 # new_scan() already reset the index for this scan.
                 self.scan.data_file = self.fname
                 self.scan.name = os.path.split(self.fname)[-1].split('.')[0]
+                # G1/T0-1: path-only repoint — drop the previous file's
+                # restored wavelength (see _clear_persisted_wavelength).
+                # getattr: tests drive this with duck-typed scan stubs.
+                _clear_wl = getattr(self.scan, '_clear_persisted_wavelength', None)
+                if callable(_clear_wl):
+                    _clear_wl()
             else:
                 # O7: dropped legacy ``save_args={'compression': None}``
                 # passthrough — the v2 writer (save_to_nexus) doesn't

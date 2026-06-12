@@ -302,6 +302,54 @@ class LiveFrame():
         full = self._resolved_source_path()
         return bool(full) and os.path.exists(full)
 
+    def free_raw(self) -> bool:
+        """PERF-3: drop the ~18 MB ``map_raw``/``bg_raw`` arrays to bound run RAM.
+
+        A live/batch run stashes every frame in ``scan.frames`` (and buffers
+        it for XYE) for the whole scan, so without freeing the raw, peak
+        memory grows ~18 MB per frame (≈18 GB over a long run at save
+        interval 1000).  Once a frame's thumbnail + integrated arrays are
+        computed the raw is no longer needed in memory, so drop it.
+
+        Frees **only** when the raw is losslessly recoverable from the
+        on-disk source (:meth:`_lazy_load_resolvable`) — a later viewer /
+        reintegration read transparently reloads via :meth:`_lazy_load_raw`
+        (see :meth:`integrate_1d`/:meth:`integrate_2d`).  The v2 writer never
+        persists ``map_raw`` (only the thumbnail + a source pointer), so this
+        loses nothing on disk.  Returns ``False`` (a no-op) when the source
+        isn't reloadable, so an in-memory-only frame is never silently lost.
+        Keeps ``thumbnail`` and the integrated arrays
+        (``int_1d``/``int_2d``/``gi_1d``/``gi_2d``) intact — only the raw and
+        its background are released.
+        """
+        if self.map_raw is None and self.bg_raw is None:
+            return False
+        if not self._lazy_load_resolvable():
+            return False
+        with self.frame_lock:
+            self.map_raw = None
+            self.bg_raw = None
+        return True
+
+    def can_skip_thumbnail(self, skip_2d: bool) -> bool:
+        """True when the per-frame 2D thumbnail can be omitted for this frame.
+
+        PERF-5: for a 1D-only scan (``skip_2d``) whose raw is losslessly
+        reloadable from source (:meth:`_lazy_load_resolvable`), the 2D
+        thumbnail preview is redundant — the Image Viewer reloads the raw on
+        demand via the per-frame source pointer
+        (``ssrl_xrd_tools.io.load_processed_raw_or_thumbnail`` tries the source
+        master *before* any stored thumbnail).  Skipping generation + storage
+        avoids the per-frame ``make_thumbnail`` cost (the dominant residual
+        cost of the lean 1D stream).  2D modes, and 1D frames with no
+        reloadable source, keep the thumbnail as their only preview — this
+        returns ``False`` for them.  The batch precompute
+        (``image_wrangler_thread._dispatch_batch_parallel``) and the writer
+        (``nexus_writer._write_per_frame_metadata``) gate on this identically,
+        so a skipped frame is never lazily re-thumbnailed at save time.
+        """
+        return bool(skip_2d) and self._lazy_load_resolvable()
+
     def _lazy_load_raw(self) -> bool:
         """Best-effort load of ``map_raw`` from the source file on disk.
 

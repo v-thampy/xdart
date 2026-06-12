@@ -1,5 +1,18 @@
 # xdart — working notes for Claude Code
 
+## North star + Architecture V2 (Jun 2026)
+Long-term goals (full roadmap: `review/roadmap_2026-06-10.md`): headless-first ssrl APIs, **thin xdart**
+over them, robustness, performance, expandability.
+
+**Architecture V2 — merged to `refactor/architecture-v2` (Jun 2026), not yet released.** xdart now drives
+the ssrl streaming reduction spine through a Qt `QtNexusSink` (**one write path**, fail-loud); live + batch
+both stream by default (live 2D ~27.5 s vs 59–76 s serial; true-live stays serial by design). Also: the
+Pause/Resume rework (Live/Batch are pure **mode toggles**, single **Start** morphs green→orange Pause/Resume,
+Live stays purple) + UI-1 group-header toggles, and **N1 portable Project-Folder / relative-path** storage.
+Staging on `architecture-v2`; pending live testing (Stabilization C + B3/B4) → `dev` → coordinated release.
+**At release, bump the `ssrl_xrd_tools>=` floor** to the version that adds `relative_source_path` — xdart's
+writer hard-imports it, so old-ssrl + new-xdart crashes on every write.
+
 ## Environment & tests
 - Env: `conda activate xrd_edit` (has Qt + pyFAI). Always activate before running tests/GUI.
 - Tests: `python -m pytest tests/` (full; needs Qt/pyFAI, runs offscreen via `QT_QPA_PLATFORM=offscreen`).

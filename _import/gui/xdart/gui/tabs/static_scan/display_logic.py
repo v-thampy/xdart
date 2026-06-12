@@ -59,6 +59,7 @@ __all__ = [
     "build_payload",
     "empty_display_state",
     "render_plan",
+    "render_roles_for_state",
     "register_controller",
     "controller_for",
     "resolve_selection",
@@ -66,6 +67,7 @@ __all__ = [
     "choose_raw_source",
     "apply_mask_for",
     "x_axis_for_unit",
+    "pretty_unit",
     "xye_unit_from_filename",
     "xye_prefix_for_unit",
     "default_plot_unit",
@@ -188,8 +190,8 @@ PANEL_LAYOUT = {
     ),
     # XYE Viewer: 1D overlay only; 2D container hidden, middle bar kept
     # (Single/Options/Legend/Clear), process controls hidden.  frame_6 kept so
-    # the Linear/Log scale applies to the 1D plot (cmap is hidden separately —
-    # it's 2D-only).
+    # the Log toggle applies to the 1D plot and the colormap stays available
+    # (the XYE waterfall image uses it).
     Mode.XYE_VIEWER: PanelLayout(
         frame_top_vis=True, twoDWindow_vis=False, imageToolbar_vis=True,
         frame_4_vis=False, frame_6_vis=True, plotToolBar_vis=False,
@@ -471,6 +473,8 @@ _X_AXIS_TABLE = {
     'qip_A^-1': ('Q_ip', _AA_INV),
     'qoop_A^-1': ('Q_oop', _AA_INV),
     'exit_angle_deg': ('Exit Angle', _DEG),
+    'exit_angle': ('Exit Angle', _DEG),
+    'r_mm': ('r', 'mm'),
 }
 
 
@@ -479,6 +483,18 @@ def x_axis_for_unit(unit):
     used by both normal mode and the XYE viewer.  ``'unknown'`` (and any
     unrecognised unit) → ``('x', '')`` — never an assumed 2θ."""
     return _X_AXIS_TABLE.get(unit, ('x', ''))
+
+
+def pretty_unit(unit):
+    """Display symbol for a unit string (``'q_A^-1'`` -> ``Å⁻¹``, ``'2th_deg'``
+    -> ``°``, ...).  Unrecognised/empty units pass through unchanged.  This is
+    display-only -- the stored/headless unit stays the canonical pyFAI token
+    (N3-units, done at the display layer so the NeXus ``units`` attr and the
+    FrameView equivalence contract are untouched)."""
+    if not unit:
+        return unit
+    symbol = _X_AXIS_TABLE.get(unit, (None, None))[1]
+    return symbol if symbol else unit
 
 
 def two_d_kind_from_units(unit, azimuthal_unit):
@@ -837,11 +853,50 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
 
 # ── Stage 3: payload assembly + render plan (the testable render core) ─
 
-# The panel roles the integration renderer manages.  render iterates these,
-# drawing the ones the state wants and clearing the rest — so a role left
-# over from a previous mode/selection is always blanked (kills mode-switch
-# staleness), without render branching on mode.
-_RENDER_ROLES = (PanelRole.PLOT_1D, PanelRole.RAW_2D, PanelRole.CAKE_2D)
+# The legacy panel roles the current Qt widget knows how to clear/draw.  The
+# render decision is descriptor-first now (see ``render_roles_for_state``), but
+# these remain as the cleanup fallback so switching from a 2D mode into a
+# plot-only/viewer mode still blanks stale raw/cake panels.
+_LEGACY_RENDER_ROLES = (PanelRole.PLOT_1D, PanelRole.RAW_2D, PanelRole.CAKE_2D)
+# Compatibility alias for old tests/imports.  Do not extend this tuple for new
+# modules; put new panel roles in DisplayState.layout instead.
+_RENDER_ROLES = _LEGACY_RENDER_ROLES
+
+
+def _role_from_panel_key(key):
+    return getattr(key, "role", key)
+
+
+def render_roles_for_state(state):
+    """Return the panel-role order managed for ``state``.
+
+    The state layout is the primary contract: a future RSM/Stitch/Fit mode can
+    add roles by adding panel keys to ``DisplayState.layout``.  The current Qt
+    widget still has hard-coded delegates for the legacy integration roles, so
+    those roles are appended as cleanup fallbacks when absent from the layout.
+
+    RESTRUCTURE-TODO(WS-X2): promote RenderPlan from role-level draw/clear to
+    PanelKey-level draw/clear once the widget has draw delegates for repeated
+    roles such as RSM SLICE_2D/PROJ_1D panels.  Role-level planning is enough
+    for the current non-repeating integration/viewer panels.
+    """
+    ordered = []
+    rows = getattr(state, "layout", ()) or ()
+    if rows:
+        keys = [key for row in rows for key in row]
+    else:
+        keys = [key for key, _plan in (getattr(state, "panels", ()) or ())]
+
+    for key in keys:
+        role = _role_from_panel_key(key)
+        if isinstance(role, PanelRole) and role not in ordered:
+            ordered.append(role)
+
+    for role in _LEGACY_RENDER_ROLES:
+        if role not in ordered:
+            ordered.append(role)
+
+    return tuple(ordered)
 
 
 def empty_display_state(mode, generation, *, title=""):
@@ -928,7 +983,7 @@ def render_plan(state, payload):
                           draw=(), clear=())
     ready = state.load_status is LoadStatus.READY
     draw, clear = [], []
-    for role in _RENDER_ROLES:
+    for role in render_roles_for_state(state):
         plan = state.panel(role)
         if ready and plan is not None and plan.has_data:
             draw.append(role)

@@ -22,7 +22,7 @@ from .display_constants import (
     AA_inv, Th, Chi, Deg,
     x_labels_1D, x_units_1D,
 )
-from .display_logic import plan_overlay, OverlayAction
+from .display_logic import plan_overlay, OverlayAction, pretty_unit
 
 logger = logging.getLogger(__name__)
 
@@ -419,15 +419,15 @@ class DisplayPlotMixin:
         if getattr(self, 'viewer_mode', None) == 'xye':
             axis = getattr(self, '_viewer_x_axis_label', None)
             if axis is not None:
-                return axis
+                return axis[0], pretty_unit(axis[1])
         axis = getattr(self, '_payload_x_axis_label', None)
         if axis is not None:
-            return axis
+            return axis[0], pretty_unit(axis[1])
 
         plot_text = self.ui.plotUnit.currentText()
         m = re.match(r'^(.+?)\s*\((.+)\)$', plot_text)
         if m:
-            return m.group(1).strip(), m.group(2).strip()
+            return m.group(1).strip(), pretty_unit(m.group(2).strip())
         return plot_text, ''
 
     # ── 1D plot view rendering ────────────────────────────────────
@@ -439,8 +439,13 @@ class DisplayPlotMixin:
         if (len(self.frame_ids) == 0) or (len(self.data_1d) == 0 and not using_publication):
             return
 
-        # Clear curves
-        [curve.clear() for curve in self.curves]
+        # Clear curves.  removeItem, not curve.clear(): PlotDataItem.clear()
+        # only blanks the data and leaves the item (plus its child curve +
+        # scatter items) registered on the PlotItem/ViewBox -- they
+        # accumulated per render, growing the scene and making autorange's
+        # childrenBounds() sweep quadratically slower over a long run.
+        for curve in self.curves:
+            self.plot.removeItem(curve)
         self.curves.clear()
 
         self.plotMethod = self.ui.plotMethod.currentText()
@@ -738,6 +743,13 @@ class DisplayPlotMixin:
         """
         if self.wf_dialog.layout() is None:
             self.setup_wf_options_widget()
+        elif self.wf_yaxis_widget.count() <= 3 and self.idxs_1d:
+            # Dialog was first built with no trace loaded -- top up the
+            # waterfall y-axis choices with the now-available metadata.
+            frame = self.data_1d.get(self.idxs_1d[0])
+            if frame is not None:
+                self.wf_yaxis_widget.addItems(
+                    list(getattr(frame, 'scan_info', {}) or {}))
 
         self.wf_dialog.show()
 
@@ -748,7 +760,8 @@ class DisplayPlotMixin:
           Step.  Govern which frames map onto the waterfall image and its
           y-axis.
         * **Overlay** — Offset (vertical stacking between curves).
-        * **Legend** — show/hide the curve legend.
+        * **Other** — legend toggle, intensity scale (Linear/Sqrt/Log),
+          and colormap.
         """
         layout = QtWidgets.QVBoxLayout()
         self.wf_dialog.setLayout(layout)
@@ -776,9 +789,13 @@ class DisplayPlotMixin:
         ov.addWidget(QtWidgets.QLabel('Offset'), 0, 0)
         ov.addWidget(self.ui.yOffset, 0, 1)
 
-        # ── Legend ────────────────────────────────────────────────
-        lg = _section('Legend')
+        # ── Other ─────────────────────────────────────────────────
+        # Legend toggle + the scale combo (moved out of the top bar;
+        # re-parented here by addWidget).  The colormap lives in the top
+        # bar next to the Log toggle.
+        lg = _section('Other')
         lg.addWidget(self.ui.showLegend, 0, 0)
+        lg.addWidget(self.ui.scale, 0, 1)
 
         # ── Dialog buttons ────────────────────────────────────────
         btns = QtWidgets.QHBoxLayout()
@@ -787,9 +804,14 @@ class DisplayPlotMixin:
         btns.addWidget(self.wf_cancel_button)
         layout.addLayout(btns)
 
-        frame = self.data_1d[self.idxs_1d[0]]
-        counters = list(frame.scan_info.keys())
-        counters = ['Frame #', 'Time (s)', 'Time (minutes)'] + counters
+        # Options is reachable from launch now (it hosts scale/cmap), so a
+        # trace may not exist yet -- fall back to the built-in counters; the
+        # metadata counters are topped up on later opens (popup_wf_options).
+        counters = ['Frame #', 'Time (s)', 'Time (minutes)']
+        if self.idxs_1d:
+            frame = self.data_1d.get(self.idxs_1d[0])
+            if frame is not None:
+                counters += list(getattr(frame, 'scan_info', {}) or {})
         self.wf_yaxis_widget.addItems(counters)
 
         self.wf_start_widget.setDecimals(0)
