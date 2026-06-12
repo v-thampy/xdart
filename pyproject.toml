@@ -62,7 +62,7 @@ gui = [
 ]
 notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "jupyterlab"]
 all = ["xrd-tools[fitting,rsm,gui,notebook]"]
-dev = ["pytest", "pytest-timeout", "build", "twine"]
+dev = ["pytest", "pytest-timeout", "build", "twine", "tifffile"]  # tifffile: test fixtures write TIFFs
 
 [project.scripts]
 xdart = "xdart.xdart_main:main"

@@ -1,0 +1,24 @@
+name: Nightly
+on:
+  schedule:
+    - cron: "17 9 * * *"   # 09:17 UTC daily
+  workflow_dispatch:
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0
+      - run: pip install -e ".[gui,dev,fitting,rsm]"
+      - run: pytest tests/core -q --timeout=600
+      - env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest tests/xdart -q --timeout=900
+      # The GI live==batch==reload equivalence spine needs the real
+      # detector test data; runs on self-hosted/local checkouts where
+      # XDART_TEST_DATA points at it.  Kept here as a reminder job step:
+      # the data is not in the repo, so CI skips it by design.

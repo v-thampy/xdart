@@ -1,0 +1,39 @@
+name: PR
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -e ".[dev,fitting,rsm]"
+      - run: pytest tests/core -q -m "not slow" --timeout=300
+
+  architecture-guards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/core/test_architecture_guards.py tests/core/test_ssrl_shim.py -q --timeout=120
+
+  xdart-offscreen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0
+      - run: pip install -e ".[gui,dev,fitting,rsm]"
+      - env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest tests/xdart -q --timeout=600
