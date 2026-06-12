@@ -334,3 +334,159 @@ def test_write_without_registration_fails_loud(tmp_path):
 
     with pytest.raises(RuntimeError, match="register"):
         sink.write(SimpleNamespace(index=7), SimpleNamespace())
+
+
+# ---------------------------------------------------------------------------
+# Phase 1a — streaming conformance under a REAL session (thread discipline,
+# replace semantics, abort flush, persist-before-evict threshold)
+# ---------------------------------------------------------------------------
+
+def _spy_session_drive(host, scan, lives, monkeypatch, *, executor=3):
+    """Drive QtNexusSink through a real streaming ReductionSession wrapped
+    in the thread-tracking spy from tests.core.contracts."""
+    from tests.core.contracts import ThreadSpySink
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+    from xrd_tools.reduction import Frame, ReductionSession, Scan
+    import xrd_tools.reduction.core as reduction_core
+
+    monkeypatch.setattr(
+        reduction_core, "integrate_1d",
+        lambda image, ai, **kw: _r1d(float(np.sum(image))),
+    )
+    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    for lv in lives:
+        sink.register(lv)
+    spy = ThreadSpySink(inner=sink)
+    frames = [Frame(int(lv.idx), image=np.full((4, 4), int(lv.idx) + 1.0))
+              for lv in lives]
+    session = ReductionSession(
+        _minimal_plan(), Scan("s", frames, integrator=object()),
+        sink=spy, execution="streaming", executor=executor,
+    )
+    for fr in frames:
+        session.submit(fr)
+    session.finish()
+    return spy, sink
+
+
+def test_qt_sink_worker_process_runs_on_pool_workers(tmp_path, monkeypatch):
+    """The PERF-5 thumbnail work fans out on POOL workers (never the writer
+    thread, never the caller) while write() stays on the one writer thread —
+    the discipline the .nxs single-writer design depends on, exercised
+    through a real parallel session for the first time."""
+    from xdart.modules.ewald import LiveScan
+
+    scan = LiveScan(data_file=str(tmp_path / "wp.nxs"))
+    scan.skip_2d = False                  # thumbnails must NOT be skipped
+    host = _FakeHost(batch_mode=True)
+    lives = [_live_frame(i) for i in range(8)]
+    spy, sink = _spy_session_drive(host, scan, lives, monkeypatch)
+
+    writer = spy.threads_for("write")
+    workers = spy.threads_for("worker_process")
+    assert len(writer) == 1
+    assert workers and not (workers & writer)
+    assert threading.get_ident() not in writer
+    # the worker_process work product is real: every frame got its thumbnail
+    for lv in lives:
+        assert lv.thumbnail is not None, f"frame {lv.idx} missing thumbnail"
+    assert sink._registry == {}
+
+
+def test_qt_sink_replace_upserts_without_recounting(tmp_path):
+    """replace() (re-fed index): hydrates + upserts the in-memory frame but
+    does NOT advance the new-frame save counter and does NOT re-buffer the
+    XYE row — the original write already did both."""
+    from types import SimpleNamespace
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+    from xrd_tools.reduction.core import FrameReduction
+
+    scan = LiveScan(data_file=str(tmp_path / "replace.nxs"))
+    scan.skip_2d = True
+    host = _FakeHost(batch_mode=True, live_save_interval=1000)
+    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink.begin(scan, _minimal_plan())
+    for i in range(3):
+        live = _live_frame(i)
+        sink.register(live)
+        sink.write(_headless(i), _reduction(i))
+
+    counter_before = sink._since_save
+    with host._xye_lock:
+        xye_before = len(host._xye_buffer)
+
+    sink.replace(_headless(1), FrameReduction(frame_index=1,
+                                              result_1d=_r1d(99.0)))
+
+    assert float(scan.frames[1].int_1d.intensity[0]) == 99.0   # upserted
+    assert sink._since_save == counter_before                  # not recounted
+    with host._xye_lock:
+        assert len(host._xye_buffer) == xye_before             # not re-buffered
+
+    sink.finish(SimpleNamespace(cancelled=False, n_processed=3))
+
+
+def test_qt_sink_abort_flushes_completed_frames(tmp_path):
+    """abort(): completed frames are flushed to the .nxs (never deleted —
+    the sink writes into the live file, not a temp), registry cleared."""
+    from types import SimpleNamespace
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+
+    nxs = str(tmp_path / "abort.nxs")
+    scan = LiveScan(data_file=nxs)
+    scan.skip_2d = True
+    host = _FakeHost(batch_mode=True, live_save_interval=1000)
+    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink.begin(scan, _minimal_plan())
+    for i in range(2):
+        live = _live_frame(i)
+        sink.register(live)
+        sink.write(_headless(i), _reduction(i))
+    sink.register(SimpleNamespace(idx=2))      # in-flight, never written
+
+    sink.abort(SimpleNamespace(cancelled=True, n_processed=2))
+
+    assert sink._registry == {}
+    reloaded = LiveScan(data_file=nxs)
+    reloaded.load_from_h5()
+    assert sorted(int(i) for i in reloaded.frames.index) == [0, 1]
+    assert reloaded.frames[0].int_1d is not None
+
+
+def test_qt_sink_persist_before_evict_threshold(tmp_path, monkeypatch):
+    """The save cadence fires BEFORE LiveFrameSeries could evict an unsaved
+    frame: with cap C, the flush threshold is C - 8 (the margin), so the
+    Nth unsaved in-memory frame can never reach the eviction boundary."""
+    from types import SimpleNamespace
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+
+    scan = LiveScan(data_file=str(tmp_path / "evict.nxs"))
+    scan.skip_2d = True
+    scan.frames._in_memory_cap = 12            # threshold = 12 - 8 = 4
+    host = _FakeHost(batch_mode=True, live_save_interval=1000)
+    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+
+    saves = []
+    orig_save = scan._save_to_nexus
+    monkeypatch.setattr(scan, "_save_to_nexus",
+                        lambda *a, **k: (saves.append(sink._since_save),
+                                         orig_save(*a, **k))[1])
+
+    sink.begin(scan, _minimal_plan())
+    for i in range(3):                          # below threshold: no save
+        live = _live_frame(i)
+        sink.register(live)
+        sink.write(_headless(i), _reduction(i))
+    assert saves == []
+
+    live = _live_frame(3)                       # 4th write crosses threshold
+    sink.register(live)
+    sink.write(_headless(3), _reduction(3))
+    assert len(saves) == 1
+    assert saves[0] == 4                        # fired AT the margin, not past
+    assert sink._since_save == 0                # counter reset by the flush
+
+    sink.finish(SimpleNamespace(cancelled=False, n_processed=4))
