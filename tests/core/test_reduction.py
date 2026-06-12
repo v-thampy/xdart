@@ -410,6 +410,66 @@ def test_run_reduction_uses_independent_1d_2d_settings(
     np.testing.assert_allclose(result.frames[0].result_2d.azimuthal, [85.0, 95.0])
 
 
+def test_chunked_error_clear_waits_for_running_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D6: a sink.write failure must not leave a racing tail worker's raw
+    pinned.  cancel() cannot stop a future that is already RUNNING, and that
+    worker assigns ``frame.image`` (via ``load_image``) — with a naive
+    immediate clear in the error handler, the assignment lands AFTER the
+    clear and the raw stays pinned until session close.  The clear must be
+    ordered after the running tail has resolved."""
+    import contextlib
+    import time as _time
+
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+
+    tail_started = threading.Event()
+    write_failed = threading.Event()
+
+    def _blocking_loader(frame: Frame) -> np.ndarray:
+        # Runs in the WORKER inside load_image, immediately before the
+        # ``frame.image = ...`` assignment: park until the error handler is
+        # running so the re-pin lands after a naive clear.
+        tail_started.set()
+        write_failed.wait(5)
+        _time.sleep(0.1)
+        return np.ones((1, 1))
+
+    class _FailingSink:
+        def begin(self, scan, plan):
+            pass
+
+        def write(self, frame, reduction):
+            tail_started.wait(5)           # the tail worker is mid-load
+            write_failed.set()
+            raise RuntimeError("boom")
+
+        def finish(self, result):
+            pass
+
+    frames = [Frame(index=0, image=np.zeros((1, 1))),
+              Frame(index=1, loader=_blocking_loader)]
+    session = ReductionSession(
+        ReductionPlan(integration_2d=None),
+        Scan("d6", frames, integrator=object()),
+        sink=_FailingSink(), executor=2, chunk_size=2,
+        clear_frame_images=True,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            session.process(frames)
+    finally:
+        with contextlib.suppress(BaseException):
+            session.finish()
+    # finish() shut the owned pool down, so the tail assignment (if any)
+    # has happened by now.  Ordered clear => nothing stays pinned.
+    for fr in frames:
+        assert fr.image is None
+        assert fr.background is None
+
+
 def test_run_reduction_cancellation_and_clear_images(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

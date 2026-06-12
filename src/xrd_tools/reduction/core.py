@@ -1344,6 +1344,14 @@ class ReductionSession:
             # release, then re-raise the original error.
             _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
             if self.clear_frame_images:
+                # D6: cancel() cannot stop a future that is already RUNNING;
+                # that worker re-pins frame.image (top of _reduce_frame)
+                # AFTER an immediate clear, leaving the raw held until
+                # session close.  Order the clear AFTER the running tail has
+                # finished -- pyFAI integrations terminate, and the
+                # cancelled-before-start futures resolve instantly, so this
+                # wait is bounded by the in-flight tail of one chunk.
+                _wait_pending_futures(pending[pos + 1:], worker=self._worker)
                 for _frame, _ in pending:
                     try:
                         _frame.image = None
@@ -1755,6 +1763,27 @@ def _cancel_pending_futures(pending: list[tuple[Frame, Any]], *, worker: Any | N
         cancel = getattr(candidate, "cancel", None)
         if callable(cancel):
             cancel()
+
+
+def _wait_pending_futures(pending: list[tuple[Frame, Any]], *, worker: Any | None) -> None:
+    """Block until every pending future has resolved (done or cancelled).
+
+    Error-path companion to :func:`_cancel_pending_futures` (D6): callers
+    that are about to release the pending frames' image refs must first wait
+    out the already-running tail, or a still-running ``_reduce_frame``
+    re-pins ``frame.image`` after the clear.  Exceptions/cancellations are
+    swallowed here -- the caller is re-raising the original error.
+    """
+    if worker is None:
+        return
+    for _frame, candidate in pending:
+        result = getattr(candidate, "result", None)
+        if not callable(result):
+            continue
+        try:
+            result()
+        except BaseException:
+            pass
 
 
 def _reduce_frame(
