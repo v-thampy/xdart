@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xrd-tools"
+version = "1.0.0"
+description = "SSRL X-ray diffraction toolkit: headless reduction core (xrd_tools) + Qt GUI (xdart)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Vivek Thampy", email = "vthampy@stanford.edu"},
+]
+keywords = ["xrd", "diffraction", "pyFAI", "SSRL", "synchrotron", "GUI"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+# Slim base: heavy analysis deps stay in extras (pymatgen drags
+# sympy/spglib/monty; xrayutilities is compiled).  Lazy imports give the
+# friendly "pip install xrd-tools[fitting]" error instead.
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",            # core/scan.py + reduction/core.py import it directly
+    "xarray",
+    "h5py",
+    "nexusformat",
+    "fabio",
+    "silx",              # io.spec / io.metadata SPEC parsing
+    # pyFAI 2025.12 ships a broken pyFAI-calib2 on Windows (silx.gui import
+    # path / qt plugin issue); cap to <2025.12 until fixed upstream.
+    # Confirmed 2025.3-2025.11 work.
+    "pyFAI>=2025.3,<2025.12",
+    "joblib",
+    "natsort",
+    "matplotlib",        # viz.mpl (consider lazy viz import later)
+    "plotly",            # viz.plotly (same)
+]
+
+[project.optional-dependencies]
+fitting = ["lmfit", "pymatgen"]
+rsm = ["xrayutilities", "pyevtk"]
+gui = [
+    "PySide6>=6.5",
+    "pyqtgraph>=0.13.7",
+    "hdf5plugin",
+    # silx.gui.plot pulls qtawesome at import time (pyFAI-calib2 /
+    # drawmask path) but silx doesn't declare it.
+    "qtawesome",
+    "imagecodecs",
+    "imageio",
+    "pyyaml",
+]
+notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "jupyterlab"]
+all = ["xrd-tools[fitting,rsm,gui,notebook]"]
+dev = ["pytest", "pytest-timeout", "build", "twine"]
+
+[project.scripts]
+xdart = "xdart.xdart_main:main"
+
+[project.urls]
+Homepage = "https://github.com/v-thampy/xrd-tools"
+Repository = "https://github.com/v-thampy/xrd-tools"
+Issues = "https://github.com/v-thampy/xrd-tools/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["xrd_tools*", "xdart*", "ssrl_xrd_tools*"]
+
+[tool.setuptools.package-data]
+xdart = ["**/*.ui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "display_logic: pure, Qt-free display-decision tests (no Qt/pyFAI/h5py needed). Run with `pytest -m display_logic`.",
+    "gui: end-to-end tests that build real Qt widgets (need QT_QPA_PLATFORM=offscreen). Run/skip with `pytest -m gui` / `-m 'not gui'`.",
+]
+filterwarnings = [
+    # Upstream pyFAI 2025/2026 noise: deprecated ndarray.strides setter
+    # (NumPy 2.4 deprecation).  Not actionable here.
+    "ignore:Setting the strides on a NumPy array has been deprecated:DeprecationWarning:pyFAI",
+]
