@@ -33,11 +33,12 @@ import pytest
 import xdart.gui.tabs.static_scan.display_logic as dl
 
 # Absolute path to the module under test, derived from this test's
-# location (tests/ is a sibling of xdart/) so the purity guard need not
+# location (tests/xdart is two levels below the repo root; the module
+# lives under src/) so the purity guard need not
 # import the xdart package at all.
 _DISPLAY_LOGIC_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "xdart", "gui", "tabs", "static_scan", "display_logic.py",
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "src", "xdart", "gui", "tabs", "static_scan", "display_logic.py",
 )
 
 pytestmark = pytest.mark.display_logic

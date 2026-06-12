@@ -302,7 +302,7 @@ class TestReloadOnlyFlagWiring:
         from xdart.modules.ewald.frame_series import _load_frame_v2
 
         # Test fixture pieces inlined to keep this file standalone.
-        from tests.test_nexus_writer_roundtrip import (
+        from tests.xdart.test_nexus_writer_roundtrip import (
             _DuckArch, _DuckSphere, N_Q,
         )
 
@@ -331,7 +331,7 @@ class TestReloadOnlyFlagWiring:
     def test_is_reload_only_true_when_source_missing(self, tmp_path):
         from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
         from xdart.modules.ewald.frame_series import _load_frame_v2
-        from tests.test_nexus_writer_roundtrip import (
+        from tests.xdart.test_nexus_writer_roundtrip import (
             _DuckArch, _DuckSphere,
         )
 
@@ -356,7 +356,7 @@ class TestReloadOnlyFlagWiring:
         R2's source-ref schema landed) — guardrail must still fire."""
         from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
         from xdart.modules.ewald.frame_series import _load_frame_v2
-        from tests.test_nexus_writer_roundtrip import (
+        from tests.xdart.test_nexus_writer_roundtrip import (
             _DuckArch, _DuckSphere,
         )
 
