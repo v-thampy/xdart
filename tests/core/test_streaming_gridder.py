@@ -1,4 +1,4 @@
-"""Tests for the streaming RSM gridder (ssrl_xrd_tools.rsm.gridding).
+"""Tests for the streaming RSM gridder (xrd_tools.rsm.gridding).
 
 Covers:
 
@@ -19,22 +19,22 @@ from typing import Any
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.geometry import (
+from xrd_tools.core.geometry import (
     DetectorHeader,
     DiffractometerConfig,
     PixelQMap,
 )
 # Import directly from submodules to avoid the rsm/__init__.py chain pulling
 # in pipeline → io.spec → silx (silx is not in the test sandbox).
-from ssrl_xrd_tools.rsm import gridding as gridding_module
-from ssrl_xrd_tools.rsm.gridding import (
+from xrd_tools.rsm import gridding as gridding_module
+from xrd_tools.rsm.gridding import (
     StreamingGridder,
     StreamingScan,
     _corner_pixel_q,
     grid_img_data_streaming,
     grid_scans_streaming,
 )
-from ssrl_xrd_tools.rsm.volume import RSMVolume
+from xrd_tools.rsm.volume import RSMVolume
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +186,7 @@ class TestCornerPixelQ:
         class _TrackerHXRD:
             Ang2Q = _Tracker()
 
-        from ssrl_xrd_tools.core.geometry import diffractometer as diff_module
+        from xrd_tools.core.geometry import diffractometer as diff_module
 
         original = DiffractometerConfig.make_hxrd
         try:

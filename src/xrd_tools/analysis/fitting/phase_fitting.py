@@ -29,8 +29,8 @@ Background handling is split into two layers:
 
 Example
 -------
->>> from ssrl_xrd_tools.analysis.phase import PhaseModel
->>> from ssrl_xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
+>>> from xrd_tools.analysis.phase import PhaseModel
+>>> from xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
 >>>
 >>> ortho = PhaseModel.from_cif("HfO2_ortho.cif", name="Ortho")
 >>> mono  = PhaseModel.from_cif("HfO2_mono.cif",  name="Mono")
@@ -70,8 +70,8 @@ from lmfit.models import (
     SplineModel,
 )
 
-from ssrl_xrd_tools.analysis.fitting.background import snip_1d, chebyshev_background
-from ssrl_xrd_tools.analysis.fitting.models import (
+from xrd_tools.analysis.fitting.background import snip_1d, chebyshev_background
+from xrd_tools.analysis.fitting.models import (
     ChebyshevModel,
     LorentzianSquaredModel,
 )
@@ -880,7 +880,7 @@ def _make_fit_background_model(
 
     * ``"polynomial{N}"`` / ``"poly{N}"`` — lmfit ``PolynomialModel`` of degree N
       (degree 1 → linear, 2 → quadratic, up to 7 supported by lmfit).
-    * ``"chebyshev{N}"`` / ``"cheb{N}"`` — :class:`~ssrl_xrd_tools.analysis.fitting.models.ChebyshevModel`
+    * ``"chebyshev{N}"`` / ``"cheb{N}"`` — :class:`~xrd_tools.analysis.fitting.models.ChebyshevModel`
       of degree N on the given ``x_range``.
     * ``"spline{N}"`` — lmfit :class:`SplineModel` with ``N`` interior
       knots evenly distributed across ``x_range``.  ``N`` must be ≥ 2.
@@ -1111,7 +1111,7 @@ class PhaseFitter:
     ----------
     x, y : array-like
         1D data (q in Å⁻¹, intensity).  ``x`` may also be an
-        :class:`~ssrl_xrd_tools.core.containers.IntegrationResult1D`; the
+        :class:`~xrd_tools.core.containers.IntegrationResult1D`; the
         other fields are picked up automatically in that case.
     sigma : array-like or None
         Per-point uncertainties (used as weights = 1/sigma if provided).
@@ -1155,7 +1155,7 @@ class PhaseFitter:
         The prefit baseline.  Same shape as ``y``.  Legacy attribute — old
         code reads ``fitter.background`` for plotting.
     phases : list
-        Registered :class:`~ssrl_xrd_tools.analysis.phase.PhaseModel` objects.
+        Registered :class:`~xrd_tools.analysis.phase.PhaseModel` objects.
     composite : lmfit.Model
         The composite model built by :meth:`build_model`; ``None`` until a
         phase has been added and either :meth:`build_parameters` or
@@ -1185,7 +1185,7 @@ class PhaseFitter:
         snip_width: int | None = None,
     ):
         # Accept IntegrationResult1D transparently
-        from ssrl_xrd_tools.core.containers import IntegrationResult1D
+        from xrd_tools.core.containers import IntegrationResult1D
         if isinstance(x, IntegrationResult1D):
             res = x
             x, y = res.radial, res.intensity
@@ -1323,7 +1323,7 @@ class PhaseFitter:
         q_range: tuple[float, float] | None = None,
         min_intensity: float = 0.5,
     ) -> None:
-        """Register a :class:`~ssrl_xrd_tools.analysis.phase.PhaseModel`.
+        """Register a :class:`~xrd_tools.analysis.phase.PhaseModel`.
 
         Parameters
         ----------

@@ -1,5 +1,5 @@
 """
-Shared pytest fixtures for the ssrl_xrd_tools test suite.
+Shared pytest fixtures for the xrd_tools test suite.
 
 Notes
 -----
@@ -15,8 +15,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.containers import PONI
-from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, save_poni
+from xrd_tools.core.containers import PONI
+from xrd_tools.integrate.calibration import poni_to_integrator, save_poni
 
 # ---------------------------------------------------------------------------
 # Module-level constants

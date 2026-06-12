@@ -1,4 +1,4 @@
-"""Headless sanity check for the ssrl_xrd_tools ingest -> reduce -> persist ->
+"""Headless sanity check for the xrd_tools ingest -> reduce -> persist ->
 read-back spine.
 
 This runs the whole path with **no Qt / GUI imports**, proving the analysis
@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ssrl_xrd_tools.reduction import (
+from xrd_tools.reduction import (
     Frame,
     Integration1DPlan,
     Integration2DPlan,
@@ -40,8 +40,8 @@ from ssrl_xrd_tools.reduction import (
     XYESink,
     run_reduction,
 )
-from ssrl_xrd_tools.io.read import get_1d, get_2d, get_metadata, get_thumbnail
-from ssrl_xrd_tools.io.nexus import read_scan
+from xrd_tools.io.read import get_1d, get_2d, get_metadata, get_thumbnail
+from xrd_tools.io.nexus import read_scan
 
 N_FRAMES = 5
 SHAPE = (64, 64)

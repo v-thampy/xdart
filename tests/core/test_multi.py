@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.integrate.multi."""
+"""Tests for xrd_tools.integrate.multi."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 from pyFAI.detectors import Detector
 
-from ssrl_xrd_tools.core.containers import PONI, IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.integrate.multi import (
+from xrd_tools.core.containers import PONI, IntegrationResult1D, IntegrationResult2D
+from xrd_tools.integrate.multi import (
     create_multigeometry_integrators,
     stitch_1d,
     stitch_2d,
@@ -222,7 +222,7 @@ def test_stitch_2d_normalization_mismatched_length(poni_fixture):
 def test_stitch_images_routes_and_handles_rot2(monkeypatch):
     """stitch_images dispatches mode->stitch_1d/2d, builds integrators from
     rot1/rot2, and treats all-zero rot2 as a pure rot1 scan."""
-    import ssrl_xrd_tools.integrate.multi as multi
+    import xrd_tools.integrate.multi as multi
 
     monkeypatch.setattr(
         multi, "create_multigeometry_integrators",
@@ -255,7 +255,7 @@ def test_stitch_images_rejects_count_mismatch():
     """stitch_images must reject images != angles before MultiGeometry."""
     imgs = [np.zeros((3, 3)), np.zeros((3, 3)), np.zeros((3, 3))]
     poni = PONI(dist=0.1, poni1=0.01, poni2=0.02, wavelength=1e-10, detector="Detector")
-    from ssrl_xrd_tools.integrate.multi import stitch_images
+    from xrd_tools.integrate.multi import stitch_images
     with pytest.raises(ValueError, match="images != "):
         stitch_images(imgs, poni, [10.0, 20.0])  # 3 images, 2 angles
 
@@ -263,7 +263,7 @@ def test_stitch_images_rejects_count_mismatch():
 def test_stitch_images_accepts_single_2d_ndarray(monkeypatch):
     """A bare (H, W) ndarray is one image, not H images — the count guard
     must not reject it (P2 regression: len(2D ndarray) == H was wrong)."""
-    import ssrl_xrd_tools.integrate.multi as multi
+    import xrd_tools.integrate.multi as multi
 
     monkeypatch.setattr(
         multi, "create_multigeometry_integrators",
@@ -281,7 +281,7 @@ def test_stitch_images_accepts_single_2d_ndarray(monkeypatch):
 
 def test_prepare_images_rejects_bad_normalization():
     """Zero / non-finite normalization values fail early (no divide-by-zero)."""
-    from ssrl_xrd_tools.integrate.multi import _prepare_images
+    from xrd_tools.integrate.multi import _prepare_images
     imgs = [np.ones((2, 2)), np.ones((2, 2))]
     with pytest.raises(ValueError, match="zero"):
         _prepare_images(imgs, [1.0, 0.0])

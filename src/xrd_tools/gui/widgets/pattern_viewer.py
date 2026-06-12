@@ -107,7 +107,7 @@ class PatternViewer:
     # ---- public API ----
     def set_patterns(self, patterns: list[Any]) -> None:
         """Set patterns from a list of (q, I, label) tuples or IntegrationResult1D."""
-        from ssrl_xrd_tools.core.containers import IntegrationResult1D
+        from xrd_tools.core.containers import IntegrationResult1D
 
         self._patterns = []
         for i, p in enumerate(patterns):

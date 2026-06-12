@@ -8,8 +8,8 @@ from typing import Any
 
 import numpy as np
 
-from ssrl_xrd_tools.core.scan import Scan, ScanFrame, SourceCapabilities, SourceKind
-from ssrl_xrd_tools.sources.base import BaseFrameSource
+from xrd_tools.core.scan import Scan, ScanFrame, SourceCapabilities, SourceKind
+from xrd_tools.sources.base import BaseFrameSource
 
 
 class MemoryFrameSource(BaseFrameSource):

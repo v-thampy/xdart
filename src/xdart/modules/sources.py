@@ -8,8 +8,8 @@ from typing import Any
 
 import numpy as np
 
-from ssrl_xrd_tools.core import FrameGeometry, SourceCapabilities, SourceKind
-from ssrl_xrd_tools.core.scan import Scan, ScanFrame
+from xrd_tools.core import FrameGeometry, SourceCapabilities, SourceKind
+from xrd_tools.core.scan import Scan, ScanFrame
 from xdart.modules.wavelength import wavelength_m_to_angstrom
 
 

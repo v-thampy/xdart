@@ -2,7 +2,7 @@
 
 The intent of this module is to give GUIs and notebooks one small, stable
 surface for common reduction jobs while keeping the numerical work in
-``ssrl_xrd_tools.integrate``.  xdart should eventually build these objects
+``xrd_tools.integrate``.  xdart should eventually build these objects
 from its UI state and display the returned results, rather than owning
 integration loops itself.
 """
@@ -24,22 +24,22 @@ from typing import TYPE_CHECKING, Any, Iterator, Protocol, runtime_checkable
 
 import numpy as np
 
-from ssrl_xrd_tools.core.containers import (
+from xrd_tools.core.containers import (
     IntegrationResult1D,
     IntegrationResult2D,
     PONI,
 )
-from ssrl_xrd_tools.core.metadata import ScanMetadata
-from ssrl_xrd_tools.core.scan import (
+from xrd_tools.core.metadata import ScanMetadata
+from xrd_tools.core.scan import (
     FrameSource as CoreFrameSource,
     ImageLoader,
     MaskSpec as CoreMaskSpec,
     Scan as CoreScan,
     ScanFrame,
 )
-from ssrl_xrd_tools.io.export import write_xye
-from ssrl_xrd_tools.io.image import read_image
-from ssrl_xrd_tools.io.nexus import (
+from xrd_tools.io.export import write_xye
+from xrd_tools.io.image import read_image
+from xrd_tools.io.nexus import (
     open_nexus_image_stack,
     open_nexus_writer,
     upsert_scan_metadata,
@@ -63,13 +63,13 @@ class GIFreezeError(ValueError):
 
 
 def poni_to_integrator(*args: Any, **kwargs: Any) -> Any:
-    from ssrl_xrd_tools.integrate.calibration import poni_to_integrator as _impl
+    from xrd_tools.integrate.calibration import poni_to_integrator as _impl
 
     return _impl(*args, **kwargs)
 
 
 def poni_to_fiber_integrator(*args: Any, **kwargs: Any) -> Any:
-    from ssrl_xrd_tools.integrate.calibration import (
+    from xrd_tools.integrate.calibration import (
         poni_to_fiber_integrator as _impl,
     )
 
@@ -77,49 +77,49 @@ def poni_to_fiber_integrator(*args: Any, **kwargs: Any) -> Any:
 
 
 def integrate_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
-    from ssrl_xrd_tools.integrate.single import integrate_1d as _impl
+    from xrd_tools.integrate.single import integrate_1d as _impl
 
     return _impl(*args, **kwargs)
 
 
 def integrate_2d(*args: Any, **kwargs: Any) -> IntegrationResult2D:
-    from ssrl_xrd_tools.integrate.single import integrate_2d as _impl
+    from xrd_tools.integrate.single import integrate_2d as _impl
 
     return _impl(*args, **kwargs)
 
 
 def integrate_gi_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
-    from ssrl_xrd_tools.integrate.gid import integrate_gi_1d as _impl
+    from xrd_tools.integrate.gid import integrate_gi_1d as _impl
 
     return _impl(*args, **kwargs)
 
 
 def integrate_gi_2d(*args: Any, **kwargs: Any) -> IntegrationResult2D:
-    from ssrl_xrd_tools.integrate.gid import integrate_gi_2d as _impl
+    from xrd_tools.integrate.gid import integrate_gi_2d as _impl
 
     return _impl(*args, **kwargs)
 
 
 def integrate_gi_exitangles(*args: Any, **kwargs: Any) -> IntegrationResult2D:
-    from ssrl_xrd_tools.integrate.gid import integrate_gi_exitangles as _impl
+    from xrd_tools.integrate.gid import integrate_gi_exitangles as _impl
 
     return _impl(*args, **kwargs)
 
 
 def integrate_gi_exitangles_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
-    from ssrl_xrd_tools.integrate.gid import integrate_gi_exitangles_1d as _impl
+    from xrd_tools.integrate.gid import integrate_gi_exitangles_1d as _impl
 
     return _impl(*args, **kwargs)
 
 
 def integrate_gi_polar(*args: Any, **kwargs: Any) -> IntegrationResult2D:
-    from ssrl_xrd_tools.integrate.gid import integrate_gi_polar as _impl
+    from xrd_tools.integrate.gid import integrate_gi_polar as _impl
 
     return _impl(*args, **kwargs)
 
 
 def integrate_gi_polar_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
-    from ssrl_xrd_tools.integrate.gid import integrate_gi_polar_1d as _impl
+    from xrd_tools.integrate.gid import integrate_gi_polar_1d as _impl
 
     return _impl(*args, **kwargs)
 
@@ -405,7 +405,7 @@ class Scan:
 
 # Architecture-v2 canonical aliases.  The legacy definitions above remain
 # temporarily as an internal migration cushion; public reduction imports now
-# resolve to the headless core contracts in ``ssrl_xrd_tools.core.scan``.
+# resolve to the headless core contracts in ``xrd_tools.core.scan``.
 Frame = ScanFrame
 MaskSpec = CoreMaskSpec
 FrameSource = CoreFrameSource
@@ -685,7 +685,7 @@ class XYESink:
 
 @dataclass(slots=True)
 class NexusSink:
-    """Frame-by-frame NeXus sink backed by ``ssrl_xrd_tools.io.nexus``."""
+    """Frame-by-frame NeXus sink backed by ``xrd_tools.io.nexus``."""
 
     path: Path | str
     entry: str = "entry"
@@ -1727,7 +1727,7 @@ def _apply_gi_freeze_policy(
 
     out = plan
     if needs_1d is not None and scout_results_1d:
-        from ssrl_xrd_tools.integrate.gid import freeze_common_axis
+        from xrd_tools.integrate.gid import freeze_common_axis
 
         key, rng = freeze_common_axis(
             scout_results_1d,
@@ -1751,7 +1751,7 @@ def _apply_gi_freeze_policy(
             "check the incident angle / incidence motor."
         )
     if needs_2d and scout_results_2d:
-        from ssrl_xrd_tools.integrate.gid import freeze_common_axes_2d
+        from xrd_tools.integrate.gid import freeze_common_axes_2d
 
         ranges = freeze_common_axes_2d(
             scout_results_2d,
@@ -1811,7 +1811,7 @@ def _gi_freeze_scout_indices(
 def _gi_1d_freeze_key(plan: ReductionPlan) -> str | None:
     if plan.gi is None or plan.integration_1d is None:
         return None
-    from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
+    from xrd_tools.integrate.gid import gi_1d_output_axis_key
 
     key = gi_1d_output_axis_key(plan.gi.mode_1d.value)
     return key if getattr(plan.integration_1d, key) is None else None

@@ -1,8 +1,8 @@
-"""Geometry primitives for ssrl_xrd_tools.
+"""Geometry primitives for xrd_tools.
 
 This package replaces the previous flat ``core/geometry.py`` module.
 All historical public names continue to resolve through this package's
-``__init__`` so ``from ssrl_xrd_tools.core.geometry import X`` keeps
+``__init__`` so ``from xrd_tools.core.geometry import X`` keeps
 working unchanged:
 
 - :class:`DiffractometerConfig` — xrayutilities-side config for building
@@ -12,17 +12,17 @@ working unchanged:
 - :class:`AngleMapping`, :data:`Convention` — building blocks for the above.
 
 Per-pixel q-space mapping for RSM lives alongside in
-:mod:`ssrl_xrd_tools.core.geometry.pixel_q` (added 2026-05).
+:mod:`xrd_tools.core.geometry.pixel_q` (added 2026-05).
 """
 from __future__ import annotations
 
-from ssrl_xrd_tools.core.geometry.diffractometer import (
+from xrd_tools.core.geometry.diffractometer import (
     AngleMapping,
     Convention,
     DiffractometerConfig,
     DiffractometerGeometry,
 )
-from ssrl_xrd_tools.core.geometry.pixel_q import (
+from xrd_tools.core.geometry.pixel_q import (
     DetectorHeader,
     PixelQMap,
 )

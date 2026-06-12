@@ -8,7 +8,7 @@ maintainer use only.
     python examples/notebooks/_build_notebooks.py
 
 All cell content has been cross-checked against the actual
-``ssrl_xrd_tools`` public API (signatures + return-types) at build time
+``xrd_tools`` public API (signatures + return-types) at build time
 on 2026-05-17.  When the underlying API changes, edit the cell blocks
 below + re-run this script.
 """
@@ -76,7 +76,7 @@ NB_BATCH_INTEGRATION = [
     md("""# Batch 1D / 2D Azimuthal Integration
 
 Walk through the canonical batch-integration workflow in
-`ssrl_xrd_tools`:
+`xrd_tools`:
 
 1. Load a pyFAI **PONI** calibration and a detector **mask**.
 2. Iterate a directory of detector images and call
@@ -94,8 +94,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from natsort import natsorted
 
-from ssrl_xrd_tools.io import read_image, load_mask, write_nexus
-from ssrl_xrd_tools.integrate import (
+from xrd_tools.io import read_image, load_mask, write_nexus
+from xrd_tools.integrate import (
     load_poni,
     integrate_1d,
     integrate_2d,
@@ -212,7 +212,7 @@ NB_STITCHING = [
 When the detector is scanned across multiple angular positions to
 extend the q-range coverage, each frame has its own diffraction
 geometry.  pyFAI's `MultiGeometry` machinery rebins all the frames
-into one common pattern; `ssrl_xrd_tools.integrate.multi` wraps this
+into one common pattern; `xrd_tools.integrate.multi` wraps this
 in two convenience functions:
 
 * `stitch_1d(images, integrators, ...)` — combined 1D pattern.
@@ -231,8 +231,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from natsort import natsorted
 
-from ssrl_xrd_tools.io import read_image, load_mask
-from ssrl_xrd_tools.integrate import (
+from xrd_tools.io import read_image, load_mask
+from xrd_tools.integrate import (
     load_poni,
     create_multigeometry_integrators,
     stitch_1d,
@@ -354,7 +354,7 @@ plt.show()"""),
   you have per-frame monitor counts and want intensities in
   monitor-normalised units.
 - For very large stacks where `images` doesn't fit in memory, the
-  `StreamingGridder` machinery in `ssrl_xrd_tools.rsm.gridding` shows
+  `StreamingGridder` machinery in `xrd_tools.rsm.gridding` shows
   the per-chunk pattern (RSM use case, but the chunking pattern
   generalises).
 """),
@@ -368,7 +368,7 @@ plt.show()"""),
 NB_PHASE_PEAK = [
     md("""# Phase Fitting + Structure-Agnostic Peak Fitting (Single Pattern)
 
-Two complementary fitting modes in `ssrl_xrd_tools.analysis.fitting`:
+Two complementary fitting modes in `xrd_tools.analysis.fitting`:
 
 | Mode                    | Function                | When you'd use it                             |
 | ----------------------- | ----------------------- | --------------------------------------------- |
@@ -386,8 +386,8 @@ notebook fits the **same pattern** with both and compares results.
 import numpy as np
 import matplotlib.pyplot as plt
 
-from ssrl_xrd_tools.analysis.phase import PhaseModel
-from ssrl_xrd_tools.analysis.fitting import (
+from xrd_tools.analysis.phase import PhaseModel
+from xrd_tools.analysis.fitting import (
     PhaseFitter,
     fit_peaks,
     extract_peaks,
@@ -541,7 +541,7 @@ NB_BATCH_PHASE = [
 
 Run `PhaseFitter` over a *sequence* of integrated patterns using the
 `FitConfig` + `fit_sequence` + `FitResultStore` pipeline in
-`ssrl_xrd_tools.analysis.fitting.batch`.
+`xrd_tools.analysis.fitting.batch`.
 
 This is the headless equivalent of xdart's `BatchPhaseFitViewer`.
 The result is a `pandas.DataFrame` with one row per pattern, ready
@@ -555,8 +555,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from ssrl_xrd_tools.analysis.phase import PhaseModel
-from ssrl_xrd_tools.analysis.fitting import FitConfig, fit_sequence"""),
+from xrd_tools.analysis.phase import PhaseModel
+from xrd_tools.analysis.fitting import FitConfig, fit_sequence"""),
     md("""## ✏️ Configuration
 
 **Edit the cell below**, then run the rest of the notebook top-to-bottom."""),
@@ -723,11 +723,11 @@ Or, one-call: `sin2psi_analysis(...)` does all four steps.
 import numpy as np
 import matplotlib.pyplot as plt
 
-from ssrl_xrd_tools.io.image import read_image, load_mask
-from ssrl_xrd_tools.io.metadata import read_txt_metadata
-from ssrl_xrd_tools.integrate import load_poni, integrate_gi_polar
-from ssrl_xrd_tools.integrate.calibration import poni_to_fiber_integrator
-from ssrl_xrd_tools.analysis.strain import (
+from xrd_tools.io.image import read_image, load_mask
+from xrd_tools.io.metadata import read_txt_metadata
+from xrd_tools.integrate import load_poni, integrate_gi_polar
+from xrd_tools.integrate.calibration import poni_to_fiber_integrator
+from xrd_tools.analysis.strain import (
     extract_chi_sectors,
     fit_peak_vs_psi,
     sin2psi_regression,
@@ -902,7 +902,7 @@ print(f'one-call stress = {one_shot.stress}'
 NB_REDUCTION_PIPELINE = [
     md("""# Headless Reduction Pipeline
 
-The canonical headless reduction workflow in `ssrl_xrd_tools.reduction`:
+The canonical headless reduction workflow in `xrd_tools.reduction`:
 
 1. Wrap your data in a **`Scan`** of **`Frame`** objects (one per
    detector image, with optional lazy loading).
@@ -926,9 +926,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from natsort import natsorted
 
-from ssrl_xrd_tools.io import load_mask, read_image
-from ssrl_xrd_tools.integrate import load_poni
-from ssrl_xrd_tools.reduction import (
+from xrd_tools.io import load_mask, read_image
+from xrd_tools.integrate import load_poni
+from xrd_tools.reduction import (
     CancelToken,
     Frame,
     GIMode,
@@ -1136,7 +1136,7 @@ Once a scan has been reduced (by the xdart GUI, by notebook 01, or by
 the headless pipeline in notebook 06) the results live in a v2 NeXus
 `.nxs` file.  This notebook shows the **simplest possible way** to pull
 1D and 2D integrated patterns back out for plotting or analysis, using
-the `get_*` convenience readers in `ssrl_xrd_tools.io`.
+the `get_*` convenience readers in `xrd_tools.io`.
 
 A processed file is a **scan**: a stack of integrated **frames**.  Each
 reader takes a `frame` label (the value stored in the file, e.g. 1-based
@@ -1151,7 +1151,7 @@ get arrays I can plot" the helpers below are all you need."""),
 import numpy as np
 import matplotlib.pyplot as plt
 
-from ssrl_xrd_tools.io import (
+from xrd_tools.io import (
     get_frames,
     get_metadata,
     get_1d,
@@ -1279,7 +1279,7 @@ print('first-frame 1D intensity shape:', first.intensity.shape)
   `r.intensity` into notebook **03 — Phase + peak fitting**.
 - For the full `xarray.Dataset` (lazy per-frame access over very large
   scans), use `read_scan_metadata` / `read_scan` from
-  `ssrl_xrd_tools.io`.
+  `xrd_tools.io`.
 """),
 ]
 

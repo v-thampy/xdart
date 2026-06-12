@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.analysis import (
+from xrd_tools.analysis import (
     AnalysisResult,
     PeakFitPlan,
     RSMPlan,
@@ -16,10 +16,10 @@ from ssrl_xrd_tools.analysis import (
     run_sin2psi,
     run_stitch,
 )
-import ssrl_xrd_tools.analysis.plans as plan_mod
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.core.scan import Scan, ScanFrame
-from ssrl_xrd_tools.sources import MemoryFrameSource
+import xrd_tools.analysis.plans as plan_mod
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.core.scan import Scan, ScanFrame
+from xrd_tools.sources import MemoryFrameSource
 
 
 def _r1d(value: float = 1.0) -> IntegrationResult1D:
@@ -75,7 +75,7 @@ def test_run_stitch_runs_real_synthetic_multigeometry():
     """#8c: drive run_stitch END-TO-END through the REAL pyFAI MultiGeometry
     engine (not monkeypatched) on a small synthetic detector-angle stack —
     validating the notebook-stable StitchPlan API on real inputs."""
-    from ssrl_xrd_tools.core.containers import PONI
+    from xrd_tools.core.containers import PONI
 
     shape = (195, 487)                         # Pilatus 100k (small + real -> fast)
     base_poni = PONI(

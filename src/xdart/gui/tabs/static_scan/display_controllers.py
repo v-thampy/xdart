@@ -16,7 +16,7 @@ Design rules (plan §3 / §8):
 - **Viewer controllers never consult ``scan.frames`` or the integration-unit
   combo** — their selection is *viewer* frame ids.
 - The :class:`ImageViewerController` owns image-source classification and
-  loading, delegated to the headless ``ssrl_xrd_tools.io`` API
+  loading, delegated to the headless ``xrd_tools.io`` API
   (``classify_image_source`` / ``load_image_frame`` /
   ``load_processed_raw_or_thumbnail``) — xdart never opens HDF5 to guess.
 """
@@ -188,7 +188,7 @@ class ImageViewerController(_BaseController):
     def classify(path):
         """Classify an image file (raw master / processed-xdart /
         thumbnail-only / unknown) via the ssrl boundary."""
-        from ssrl_xrd_tools.io import classify_image_source
+        from xrd_tools.io import classify_image_source
         return classify_image_source(path)
 
     @staticmethod
@@ -196,14 +196,14 @@ class ImageViewerController(_BaseController):
         """Resolve a processed-``.nxs`` frame to raw (via its source pointer)
         or its dequantized thumbnail; returns a ``RawFrameResult`` recording
         which it returned (so a flat mask is never re-applied to a thumbnail)."""
-        from ssrl_xrd_tools.io import load_processed_raw_or_thumbnail
+        from xrd_tools.io import load_processed_raw_or_thumbnail
         return load_processed_raw_or_thumbnail(path, frame_label)
 
     @staticmethod
     def load_raw_frame(path, frame_idx):
         """Load a genuine raw detector frame (master / tiff / eiger) by
         0-based index."""
-        from ssrl_xrd_tools.io import load_image_frame
+        from xrd_tools.io import load_image_frame
         return load_image_frame(path, frame_idx)
 
     # ── raw-preview payload (Stage 4/5 step 2) ─────────────────────────
@@ -323,7 +323,7 @@ class XYEViewerController(_BaseController):
 class NexusViewerController(_BaseController):
     """Read-only NeXus schema viewer.
 
-    The actual HDF5 walking lives in ``ssrl_xrd_tools.io.inspect_nexus``.
+    The actual HDF5 walking lives in ``xrd_tools.io.inspect_nexus``.
     This controller consumes the row preview published by ``H5Viewer``:
     1D previews draw as plots, 2D previews draw as bounded images, and
     metadata-only rows intentionally clear both panels.

@@ -22,14 +22,14 @@ detector_file_sizes = {
 }
 
 # ---------------------------------------------------------------------------
-# I/O helpers — re-exported from ssrl_xrd_tools
+# I/O helpers — re-exported from xrd_tools
 # ---------------------------------------------------------------------------
-from ssrl_xrd_tools.io.export import write_xye  # noqa: E402, F401
+from xrd_tools.io.export import write_xye  # noqa: E402, F401
 
 # ---------------------------------------------------------------------------
-# HDF5 codec — imported from ssrl_xrd_tools.core.hdf5
+# HDF5 codec — imported from xrd_tools.core.hdf5
 # ---------------------------------------------------------------------------
-from ssrl_xrd_tools.core.hdf5 import (  # noqa: E402
+from xrd_tools.core.hdf5 import (  # noqa: E402
     check_encoded,
     soft_list_eval,
     catch_h5py_file,
@@ -184,7 +184,7 @@ def match_img_detector(img_file, poni):
     ----------
     img_file : str | Path
         Path to the candidate image file.
-    poni : ssrl_xrd_tools.core.containers.PONI
+    poni : xrd_tools.core.containers.PONI
         Calibration object whose ``detector`` field is the pyFAI detector name.
     """
     if poni is None:
@@ -198,7 +198,7 @@ def match_img_detector(img_file, poni):
 def get_img_meta(img_file, meta_ext, spec_path=None, rv='all'):
     """Get image meta data from pdi/txt files for different beamlines.
 
-    Delegates to ssrl_xrd_tools.io.metadata.read_image_metadata.
+    Delegates to xrd_tools.io.metadata.read_image_metadata.
 
     Args:
         img_file (str): Image file for which meta data is required
@@ -209,7 +209,7 @@ def get_img_meta(img_file, meta_ext, spec_path=None, rv='all'):
     Returns:
         [dict]: Dictionary with all the meta data
     """
-    from ssrl_xrd_tools.io.metadata import read_image_metadata
+    from xrd_tools.io.metadata import read_image_metadata
     fmt = 'spec' if (meta_ext or '').upper() == 'SPEC' else (meta_ext or 'txt')
     return read_image_metadata(img_file, meta_format=fmt)
 

@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.core (containers and metadata)."""
+"""Tests for xrd_tools.core (containers and metadata)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.containers import PONI, IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.core.metadata import ScanMetadata
+from xrd_tools.core.containers import PONI, IntegrationResult1D, IntegrationResult2D
+from xrd_tools.core.metadata import ScanMetadata
 
 
 # ---------------------------------------------------------------------------

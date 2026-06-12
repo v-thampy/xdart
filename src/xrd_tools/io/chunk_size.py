@@ -15,7 +15,7 @@ sensible chunk size clamped to a configurable ``[min, max]`` range.
 Callers like xdart's wrangler can replace hard-coded values (16 SPEC
 frames, 8 RSM frames) with::
 
-    from ssrl_xrd_tools.io import adaptive_chunk_size
+    from xrd_tools.io import adaptive_chunk_size
 
     chunk = adaptive_chunk_size(
         detector_shape=(514, 1030),

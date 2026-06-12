@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D
+from xrd_tools.core.containers import IntegrationResult1D
 
 
 def snip_1d(y: np.ndarray, snip_width: int = 20) -> np.ndarray:

@@ -6,9 +6,9 @@ displayable 2D image for a frame?*  It folds together the
 ``_is_xdart_processed`` guess and the raw-master-vs-thumbnail fallback
 chain that previously lived (and broke) inside the GUI.
 
-Three entry points, built on the existing :mod:`ssrl_xrd_tools.io.read`
+Three entry points, built on the existing :mod:`xrd_tools.io.read`
 primitives (:func:`get_raw_frame`, :func:`get_thumbnail`) and
-:func:`ssrl_xrd_tools.io.image.read_image`:
+:func:`xrd_tools.io.image.read_image`:
 
 * :func:`classify_image_source` — what is this file? (raw detector master /
   processed-xdart / thumbnail-only / unknown), its frame labels, and whether
@@ -124,10 +124,10 @@ def _resolve_source_master(scan_file: Path, src, *, source_base=None,
                            source_root=None) -> "Path | None":
     """Resolve a frame's ``source`` group to an existing master path.
 
-    Thin wrapper over :func:`ssrl_xrd_tools.io.read.resolve_source_master` (the
+    Thin wrapper over :func:`xrd_tools.io.read.resolve_source_master` (the
     single N1 resolver) so classification + display agree on precedence
     (``source_root`` > ``@source_base`` > scan dir) and absolute back-compat."""
-    from ssrl_xrd_tools.io.read import _decode, resolve_source_master
+    from xrd_tools.io.read import _decode, resolve_source_master
 
     if src is None or "path" not in src:
         return None
@@ -149,7 +149,7 @@ def classify_image_source(path) -> ImageSourceInfo:
     raw detector dataset; UNKNOWN when it can't be read or classified.
     """
     import h5py
-    from ssrl_xrd_tools.io.image import count_frames, _is_eiger_master
+    from xrd_tools.io.image import count_frames, _is_eiger_master
 
     p = Path(path)
 
@@ -211,7 +211,7 @@ def classify_image_source(path) -> ImageSourceInfo:
             has_raw = False
             has_thumbnail = False
             # N1: the project root the relative source paths point under.
-            from ssrl_xrd_tools.io.read import _decode as _dec
+            from xrd_tools.io.read import _decode as _dec
             source_base = (_dec(entry.attrs["source_base"])
                            if entry is not None and "source_base" in entry.attrs
                            else None)
@@ -253,8 +253,8 @@ def classify_image_source(path) -> ImageSourceInfo:
 
 def load_image_frame(path, frame) -> np.ndarray:
     """Load a genuine raw detector frame (master / tiff / eiger) by 0-based
-    index via :func:`ssrl_xrd_tools.io.image.read_image`."""
-    from ssrl_xrd_tools.io.image import read_image
+    index via :func:`xrd_tools.io.image.read_image`."""
+    from xrd_tools.io.image import read_image
     return np.asarray(read_image(Path(path), frame=int(frame)), dtype=float)
 
 
@@ -263,7 +263,7 @@ def _read_thumbnail_direct(path, frame) -> "np.ndarray | None":
     last-resort belt-and-suspenders if :func:`get_raw_frame` itself errors
     (not just a clean 'no master' fallthrough)."""
     import h5py
-    from ssrl_xrd_tools.io.read import _dequantize_thumbnail
+    from xrd_tools.io.read import _dequantize_thumbnail
     try:
         with h5py.File(Path(path), "r") as f:
             key = f"entry/frames/frame_{int(frame):04d}/thumbnail"
@@ -285,7 +285,7 @@ def load_processed_raw_or_thumbnail(path, frame, *, source_root=None) -> RawFram
     fallback chain.  ``source_root`` (N1) repoints relative source paths at a
     moved data tree (overrides the stored ``@source_base``).
     """
-    from ssrl_xrd_tools.io.read import get_raw_frame
+    from xrd_tools.io.read import get_raw_frame
 
     frame = int(frame)
     # Strict raw first (no thumbnail) so we know it's genuinely full-res.

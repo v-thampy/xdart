@@ -26,7 +26,7 @@ from pyqtgraph.Qt import QtWidgets, QtCore
 from pyqtgraph.parametertree import ParameterTree, Parameter
 
 # Project imports
-from ssrl_xrd_tools.core.containers import PONI
+from xrd_tools.core.containers import PONI
 from .wrangler_widget import wranglerWidget
 from .nexus_wrangler_thread import nexusThread
 from ....gui_utils import NamedActionParameter

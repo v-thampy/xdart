@@ -2,10 +2,10 @@
 
 This package is the public boundary intended for applications such as xdart:
 the GUI chooses a :class:`ReductionPlan`, supplies a :class:`Scan`, and lets
-``ssrl_xrd_tools`` own the reduction work.
+``xrd_tools`` own the reduction work.
 """
 
-from ssrl_xrd_tools.reduction.core import (
+from xrd_tools.reduction.core import (
     CancelToken,
     CompositeSink,
     Frame,

@@ -97,7 +97,7 @@ def normalize_stack(
     Normalize each image in a stack by its corresponding monitor count.
 
     This is the standard pre-processing step before multi-geometry stitching
-    (:func:`~ssrl_xrd_tools.integrate.multi.stitch_1d`): each image may have
+    (:func:`~xrd_tools.integrate.multi.stitch_1d`): each image may have
     been measured with a different beam flux, so dividing by the per-image
     monitor count and multiplying by a common ``reference`` places all images
     on the same intensity scale.

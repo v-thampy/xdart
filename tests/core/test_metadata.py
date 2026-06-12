@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.io.metadata."""
+"""Tests for xrd_tools.io.metadata."""
 from __future__ import annotations
 
 import time
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ssrl_xrd_tools.io.metadata import (
+from xrd_tools.io.metadata import (
     _extract_scan_info,
     _find_sidecar,
     _parse_kv_pairs,

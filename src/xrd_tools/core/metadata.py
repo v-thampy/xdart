@@ -1,4 +1,4 @@
-# ssrl_xrd_tools/core/metadata.py
+# xrd_tools/core/metadata.py
 """
 Source-agnostic scan metadata.
 

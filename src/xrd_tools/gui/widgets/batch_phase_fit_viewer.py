@@ -7,7 +7,7 @@ and re-renders the last fit for that pattern (if available).
 
 Example
 -------
->>> from ssrl_xrd_tools.gui.widgets import BatchPhaseFitViewer
+>>> from xrd_tools.gui.widgets import BatchPhaseFitViewer
 >>> viewer = BatchPhaseFitViewer(patterns, phases, labels=labels)
 >>> viewer.widget
 """
@@ -90,7 +90,7 @@ class BatchPhaseFitViewer:
         self._fit_background_template = fit_background_template
 
         # ------ Import the inner viewer class lazily ------
-        from ssrl_xrd_tools.gui.widgets.phase_fit_viewer import PhaseFitViewer
+        from xrd_tools.gui.widgets.phase_fit_viewer import PhaseFitViewer
         self._PhaseFitViewer = PhaseFitViewer
 
         # ------ Per-pattern state ------
@@ -223,7 +223,7 @@ class BatchPhaseFitViewer:
 
     def get_config(self) -> "FitConfig":
         """Snapshot the current viewer widget state as a :class:`FitConfig`."""
-        from ssrl_xrd_tools.analysis.fitting.batch import FitConfig
+        from xrd_tools.analysis.fitting.batch import FitConfig
         init_kw, fit_kw = self._viewer.get_fitter_kwargs()
         return FitConfig(
             init_kw=init_kw,
@@ -282,7 +282,7 @@ class BatchPhaseFitViewer:
         sequential = bool(self._sequential.value)
         prev_params = None
 
-        from ssrl_xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
+        from xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
 
         selected_phases = [
             p for p in self._phases
@@ -437,7 +437,7 @@ class BatchPhaseFitViewer:
         if not indices:
             return
 
-        from ssrl_xrd_tools.gui.widgets.phase_fit_viewer import _PHASE_COLORS
+        from xrd_tools.gui.widgets.phase_fit_viewer import _PHASE_COLORS
         fig.data = []  # clear existing traces
         for j, (name, fracs) in enumerate(frac_data.items()):
             color = _PHASE_COLORS[j % len(_PHASE_COLORS)]
@@ -490,7 +490,7 @@ class BatchPhaseFitViewer:
 
     def load_config(self, path: str | Path) -> None:
         """Load a :class:`FitConfig` from JSON and apply to the viewer."""
-        from ssrl_xrd_tools.analysis.fitting.batch import FitConfig
+        from xrd_tools.analysis.fitting.batch import FitConfig
         config = FitConfig.load(path)
         self.set_config(config)
         self._batch_status.value = f"Config loaded from <code>{path}</code>"
@@ -501,7 +501,7 @@ class BatchPhaseFitViewer:
 
     def to_result_store(self) -> "FitResultStore":
         """Export all fitted results as a :class:`FitResultStore`."""
-        from ssrl_xrd_tools.analysis.fitting.batch import FitResultStore
+        from xrd_tools.analysis.fitting.batch import FitResultStore
         store = FitResultStore()
         for i, entry in enumerate(self._results):
             if entry is None:

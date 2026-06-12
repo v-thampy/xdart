@@ -15,7 +15,7 @@ import h5py
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.io import (
+from xrd_tools.io import (
     Integrated1D,
     Integrated2D,
     Scan,
@@ -172,7 +172,7 @@ def test_get_metadata_positioners_vs_scan_data_split(tmp_path):
     ``scan_data`` — so normalization/geometry consumers of positioners
     aren't polluted with counters."""
     import pandas as pd
-    from ssrl_xrd_tools.io import write_scan_metadata, get_metadata
+    from xrd_tools.io import write_scan_metadata, get_metadata
 
     p = tmp_path / "split.nxs"
     sd = pd.DataFrame(
@@ -205,7 +205,7 @@ def test_mismatched_positioner_length_is_skipped_not_fatal(tmp_path):
     """A per-frame column whose length != frame count (malformed/partial
     file, e.g. 4 integrated frames but 2 'th' positions) must be skipped
     with a warning, not crash the whole reader."""
-    from ssrl_xrd_tools.io.nexus import read_scan, read_scan_metadata
+    from xrd_tools.io.nexus import read_scan, read_scan_metadata
 
     p = tmp_path / "mismatch.nxs"
     with h5py.File(p, "w") as f:
@@ -234,8 +234,8 @@ def test_mismatched_positioner_length_is_skipped_not_fatal(tmp_path):
 def test_legacy_read_sphere_names_are_gone():
     """The transitional read_sphere* aliases were removed in the rename
     release — only read_scan / read_scan_metadata exist now."""
-    import ssrl_xrd_tools.io.nexus as nexus_io
-    import ssrl_xrd_tools.io as io_pkg
+    import xrd_tools.io.nexus as nexus_io
+    import xrd_tools.io as io_pkg
 
     for legacy in ("read_sphere", "read_sphere_metadata"):
         assert not hasattr(nexus_io, legacy), f"{legacy} should be removed"
@@ -291,7 +291,7 @@ def test_scan_sugar(scan_file):
 def test_get_raw_frame_resolves_source_pointer(tmp_path):
     """A processed file points each frame back to the detector master via
     ``frames/frame_NNNN/source``; get_raw_frame loads the full-res raw."""
-    from ssrl_xrd_tools.io import get_raw_frame
+    from xrd_tools.io import get_raw_frame
 
     # synthetic raw master (.h5) in the same dir, two frames
     master = tmp_path / "scan_master.h5"
@@ -316,7 +316,7 @@ def test_get_raw_frame_resolves_source_pointer(tmp_path):
 
 
 def test_get_raw_frame_resolves_absolute_source_pointer(tmp_path):
-    from ssrl_xrd_tools.io import get_raw_frame
+    from xrd_tools.io import get_raw_frame
 
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
@@ -341,7 +341,7 @@ def test_get_raw_frame_resolves_absolute_source_pointer(tmp_path):
 
 
 def test_get_raw_frame_resolves_sibling_basename_when_old_path_is_stale(tmp_path):
-    from ssrl_xrd_tools.io import get_raw_frame
+    from xrd_tools.io import get_raw_frame
 
     processed_dir = tmp_path / "processed"
     processed_dir.mkdir()
@@ -366,7 +366,7 @@ def test_get_raw_frame_resolves_sibling_basename_when_old_path_is_stale(tmp_path
 def test_get_raw_frame_falls_back_to_thumbnail(tmp_path):
     """When the source master is missing, get_raw_frame returns the stored
     thumbnail, dequantized to its original intensity range."""
-    from ssrl_xrd_tools.io import get_raw_frame
+    from xrd_tools.io import get_raw_frame
 
     nxs = tmp_path / "scan.nxs"
     with h5py.File(nxs, "w") as f:
@@ -392,7 +392,7 @@ def test_get_raw_frame_falls_back_to_thumbnail(tmp_path):
 
 def test_open_scan_strict_raw_does_not_use_thumbnail(tmp_path):
     import pytest
-    from ssrl_xrd_tools.io import get_raw_frame, open_scan
+    from xrd_tools.io import get_raw_frame, open_scan
 
     nxs = tmp_path / "scan.nxs"
     with h5py.File(nxs, "w") as f:
@@ -415,7 +415,7 @@ def test_open_scan_strict_raw_does_not_use_thumbnail(tmp_path):
 
 
 def test_open_scan_frame_source_uses_union_labels_and_scan_data(tmp_path):
-    from ssrl_xrd_tools.io import open_scan
+    from xrd_tools.io import open_scan
 
     nxs = tmp_path / "mixed_outputs.nxs"
     with h5py.File(nxs, "w") as f:
@@ -441,7 +441,7 @@ def test_open_scan_frame_source_uses_union_labels_and_scan_data(tmp_path):
 def test_read_image_rejects_processed_file(tmp_path):
     """read_image must not mis-read a processed scan's integrated_1d as a
     raw detector image — it raises pointing at get_raw_frame instead."""
-    from ssrl_xrd_tools.io.image import read_image
+    from xrd_tools.io.image import read_image
 
     nxs = tmp_path / "processed.nxs"
     with h5py.File(nxs, "w") as f:
@@ -453,7 +453,7 @@ def test_read_image_rejects_processed_file(tmp_path):
     with pytest.raises(ValueError, match="processed xdart"):
         read_image(nxs, frame=0)
 
-    from ssrl_xrd_tools.io.image import read_image_stack
+    from xrd_tools.io.image import read_image_stack
     with pytest.raises(ValueError, match="processed xdart"):
         read_image_stack(nxs)
 
@@ -467,7 +467,7 @@ def test_scan_metadata_full_table_round_trips(tmp_path):
     motors), and read_scan surfaces them as per-frame vars — so a reload
     restores the whole metadata table, not just the incidence motor."""
     import pandas as pd
-    from ssrl_xrd_tools.io import write_scan_metadata, read_scan, read_scan_metadata
+    from xrd_tools.io import write_scan_metadata, read_scan, read_scan_metadata
 
     p = tmp_path / "meta.nxs"
     sd = pd.DataFrame(
@@ -497,7 +497,7 @@ def test_scan_metadata_dedupes_positioners(tmp_path):
     """When a motor is in both /entry/scan_data and a positioners group,
     read_scan loads it once (from scan_data) — no duplicate sample_*/th."""
     import pandas as pd
-    from ssrl_xrd_tools.io import write_scan_metadata, read_scan
+    from xrd_tools.io import write_scan_metadata, read_scan
 
     p = tmp_path / "dedup.nxs"
     sd = pd.DataFrame({"th": [0.1, 0.2], "i0": [1e6, 2e6]}, index=[0, 1])
@@ -524,7 +524,7 @@ def test_stale_scan_data_column_falls_back_to_positioner(tmp_path):
     is rejected on read — a valid same-named NXpositioner must still load
     (the rejected key shouldn't suppress the positioner fallback)."""
     import h5py
-    from ssrl_xrd_tools.io import write_scan_metadata, read_scan
+    from xrd_tools.io import write_scan_metadata, read_scan
 
     p = tmp_path / "stale.nxs"
     with h5py.File(p, "w") as f:
@@ -558,7 +558,7 @@ def test_scan_data_aligned_by_label_not_position(tmp_path):
     frames [0, 2] with scan_data stored in a different label order must
     still get each frame's own metadata, not a positional mismatch."""
     import h5py
-    from ssrl_xrd_tools.io import read_scan
+    from xrd_tools.io import read_scan
 
     p = tmp_path / "reorder.nxs"
     with h5py.File(p, "w") as f:
@@ -582,7 +582,7 @@ def test_scan_data_aligned_by_label_not_position(tmp_path):
 
 def test_partial_thumbnails_use_independent_frame_coordinate(tmp_path):
     import h5py
-    from ssrl_xrd_tools.io import read_scan
+    from xrd_tools.io import read_scan
 
     p = tmp_path / "partial_thumbnails.nxs"
     with h5py.File(p, "w") as f:
@@ -602,7 +602,7 @@ def test_partial_thumbnails_use_independent_frame_coordinate(tmp_path):
 def test_scan_data_duplicate_labels_rejected(tmp_path):
     import h5py
     import pytest
-    from ssrl_xrd_tools.io import read_scan
+    from xrd_tools.io import read_scan
 
     p = tmp_path / "duplicate_metadata.nxs"
     with h5py.File(p, "w") as f:

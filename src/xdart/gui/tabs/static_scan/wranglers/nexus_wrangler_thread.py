@@ -10,12 +10,12 @@ Performance shape (post-P3A refactor 2026-05-13):
 * **Bulk HDF5 reads** — frames are read in ``_READ_CHUNK``-sized
   slices (``ds[a:b]``), so HDF5 chunk decompression happens once per
   N frames rather than N times for the same chunk.  Reads go through
-  :class:`ssrl_xrd_tools.io.nexus.NexusImageStack`, which exposes a
+  :class:`xrd_tools.io.nexus.NexusImageStack`, which exposes a
   single (N, H, W) logical view across either a single 3D dataset or
   an Eiger master's sibling ``data_NNNNNN`` external links — chunked
   reads cross file boundaries seamlessly.
 * **Parallel integration** — within each chunk, xdart builds frame shells and
-  delegates the worker pool to ``ssrl_xrd_tools.reduction.run_reduction``.
+  delegates the worker pool to ``xrd_tools.reduction.run_reduction``.
 * **Periodic saves** — disk writes are batched every
   ``_LIVE_SAVE_INTERVAL`` frames so the v2 NeXus writer's per-flush
   cost amortises across the scan.  Skipped entirely under
@@ -49,11 +49,11 @@ from pyqtgraph import Qt
 
 # Project imports
 from xdart.modules.live import LiveFrame
-from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
-from ssrl_xrd_tools.reduction import GIFreezeError
-from ssrl_xrd_tools.io.nexus import open_nexus_image_stack, read_nexus
-from ssrl_xrd_tools.io.image import read_image
-from ssrl_xrd_tools.io.export import write_xye
+from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
+from xrd_tools.reduction import GIFreezeError
+from xrd_tools.io.nexus import open_nexus_image_stack, read_nexus
+from xrd_tools.io.image import read_image
+from xrd_tools.io.export import write_xye
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
     open_live_reduction_session,

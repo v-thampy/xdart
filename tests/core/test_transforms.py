@@ -1,11 +1,11 @@
-"""Tests for ssrl_xrd_tools.transforms unit conversion functions."""
+"""Tests for xrd_tools.transforms unit conversion functions."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.transforms import (
+from xrd_tools.transforms import (
     HC_KEV_ANGSTROM,
     d_to_q,
     energy_to_wavelength,

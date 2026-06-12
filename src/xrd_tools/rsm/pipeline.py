@@ -8,8 +8,8 @@ from typing import Any, Iterable, Iterator, Protocol
 
 import numpy as np
 
-from ssrl_xrd_tools.core.geometry import PixelQMap
-from ssrl_xrd_tools.io.image import (
+from xrd_tools.core.geometry import PixelQMap
+from xrd_tools.io.image import (
     read_image,
     read_image_stack,
     read_images_parallel,
@@ -17,13 +17,13 @@ from ssrl_xrd_tools.io.image import (
     get_detector_mask,
     apply_rotation,
 )
-from ssrl_xrd_tools.io.spec import (
+from xrd_tools.io.spec import (
     get_scan_path_info,
     get_energy_and_UB,
     get_angles,
 )
-from ssrl_xrd_tools.rsm.volume import RSMVolume
-from ssrl_xrd_tools.rsm.gridding import (
+from xrd_tools.rsm.volume import RSMVolume
+from xrd_tools.rsm.gridding import (
     StreamingGridder,
     grid_img_data,
     grid_img_data_streaming,
@@ -58,7 +58,7 @@ class ScanInfo:
     h5_path: Path | None = None
 
 
-from ssrl_xrd_tools.core.config import ExperimentConfig
+from xrd_tools.core.config import ExperimentConfig
 
 
 def load_images(
@@ -271,7 +271,7 @@ def process_scan(
 # doesn't need it); pass it in via ``UB=``.  When the schema grows a
 # ``/entry/sample/UB`` field we'll auto-resolve it the same way as energy.
 #
-# To avoid a circular import (ssrl_xrd_tools is below xdart in the stack)
+# To avoid a circular import (xrd_tools is below xdart in the stack)
 # the scan is duck-typed against the protocol below.
 
 

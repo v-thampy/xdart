@@ -11,9 +11,9 @@ import h5py
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
-from ssrl_xrd_tools.core.provenance import write_provenance
-from ssrl_xrd_tools.io.nexus import read_scan, read_stitched
+from xrd_tools.core.geometry import DiffractometerGeometry
+from xrd_tools.core.provenance import write_provenance
+from xrd_tools.io.nexus import read_scan, read_stitched
 
 
 N_FRAMES = 5
@@ -338,7 +338,7 @@ def test_read_scan_separate_dim_when_labels_differ(tmp_path):
 def test_read_scan_metadata_surfaces_frame_2d_on_mismatch(tmp_path):
     """The lightweight metadata path mirrors read_scan: divergent 2D labels
     appear on a frame_2d coord (so get_metadata doesn't disagree)."""
-    from ssrl_xrd_tools.io.nexus import read_scan_metadata
+    from xrd_tools.io.nexus import read_scan_metadata
     p = tmp_path / "meta_mismatch.nxs"
     _write_1d2d(p, [0, 1, 2], [10, 11, 12])
     ds = read_scan_metadata(p)
@@ -353,7 +353,7 @@ def test_write_positioners_and_geometry_roundtrip(tmp_path):
     """ssrl write_positioners + write_per_frame_geometry round-trip through
     read_scan_metadata, aligned to gapped frame ids."""
     import pandas as pd
-    from ssrl_xrd_tools.io.nexus import (
+    from xrd_tools.io.nexus import (
         write_positioners, write_per_frame_geometry, read_scan_metadata,
     )
     geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
@@ -381,7 +381,7 @@ def test_write_positioners_reindexes_out_of_order(tmp_path):
     """scan_data rows in a different order than frame_indices must be aligned,
     not attached positionally (mirrors the stitch fix)."""
     import pandas as pd
-    from ssrl_xrd_tools.io.nexus import write_positioners, read_scan_metadata
+    from xrd_tools.io.nexus import write_positioners, read_scan_metadata
     geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
     fis = [0, 1, 2]
     # scan_data rows are in REVERSE order vs fis
@@ -401,7 +401,7 @@ def test_write_positioners_reindexes_out_of_order(tmp_path):
 
 def test_replacement_metadata_writers_clear_empty_authoritative_state(tmp_path):
     import pandas as pd
-    from ssrl_xrd_tools.io.nexus import (
+    from xrd_tools.io.nexus import (
         write_per_frame_geometry,
         write_positioners,
         write_scan_metadata,
@@ -427,7 +427,7 @@ def test_replacement_metadata_writers_clear_empty_authoritative_state(tmp_path):
 def test_write_scan_metadata_rejects_duplicate_labels(tmp_path):
     import pandas as pd
     import pytest
-    from ssrl_xrd_tools.io.nexus import write_scan_metadata
+    from xrd_tools.io.nexus import write_scan_metadata
 
     p = tmp_path / "duplicate_metadata_write.nxs"
     with h5py.File(p, "w") as f:
@@ -447,7 +447,7 @@ def test_dup_label_write_preserves_existing_metadata(tmp_path):
     survives the failed call instead of being lost (delete-then-raise)."""
     import pandas as pd
     import pytest
-    from ssrl_xrd_tools.io.nexus import (
+    from xrd_tools.io.nexus import (
         write_per_frame_geometry,
         write_scan_metadata,
     )
@@ -483,10 +483,10 @@ def test_scan_data_string_columns_survive_roundtrip(tmp_path):
     incremental upsert) and BOTH readers (xarray read_scan_metadata + dict
     _scan_data_for_frames)."""
     import pandas as pd
-    from ssrl_xrd_tools.io.nexus import (
+    from xrd_tools.io.nexus import (
         write_scan_metadata, upsert_scan_metadata, read_scan_metadata,
     )
-    from ssrl_xrd_tools.io.read import _scan_data_for_frames
+    from xrd_tools.io.read import _scan_data_for_frames
 
     fis = [0, 1, 2]
     sd = pd.DataFrame(

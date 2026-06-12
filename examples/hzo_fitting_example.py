@@ -4,8 +4,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Import the new Phase Analysis tools
-from ssrl_xrd_tools.analysis.phase import PhaseModel
-from ssrl_xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
+from xrd_tools.analysis.phase import PhaseModel
+from xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
 
 def main():
     # -----------------------------------------------------------------

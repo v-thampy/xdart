@@ -1,4 +1,4 @@
-# ssrl_xrd_tools/integrate/gid.py
+# xrd_tools/integrate/gid.py
 """
 Grazing-incidence X-ray diffraction (GIXRD) integration via
 ``pyFAI.integrator.fiber.FiberIntegrator``.
@@ -40,8 +40,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ssrl_xrd_tools.core.containers import PONI, IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.integrate.calibration import poni_to_integrator
+from xrd_tools.core.containers import PONI, IntegrationResult1D, IntegrationResult2D
+from xrd_tools.integrate.calibration import poni_to_integrator
 
 if TYPE_CHECKING:
     from pyFAI.integrator.fiber import FiberIntegrator

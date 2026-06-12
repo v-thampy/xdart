@@ -12,7 +12,7 @@ import h5py
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.io import (
+from xrd_tools.io import (
     ImageSourceKind,
     classify_image_source,
     load_image_frame,
@@ -188,7 +188,7 @@ def test_load_processed_direct_thumbnail_when_get_raw_frame_errors(
     # Belt-and-suspenders: if get_raw_frame itself errors outright (not a
     # clean no-master fallthrough), a stored thumbnail is still read directly.
     nxs, thumb = thumbnail_only
-    import ssrl_xrd_tools.io.read as read_mod
+    import xrd_tools.io.read as read_mod
 
     def boom(*a, **k):
         raise RuntimeError("get_raw_frame is broken")

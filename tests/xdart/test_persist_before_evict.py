@@ -21,7 +21,7 @@ import pytest
 
 
 def _result_1d(idx, nq=16):
-    from ssrl_xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.containers import IntegrationResult1D
     return IntegrationResult1D(
         radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
         intensity=np.full(nq, float(idx + 1), dtype=np.float32),

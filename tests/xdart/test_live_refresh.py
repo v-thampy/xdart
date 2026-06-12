@@ -920,7 +920,7 @@ def test_metadata_panel_accepts_store_mapping_proxy():
     import pandas as pd
     from PySide6 import QtWidgets
     from PySide6.QtCore import QModelIndex
-    from ssrl_xrd_tools.core import FrameView
+    from xrd_tools.core import FrameView
     from xdart.gui.tabs.static_scan.metadata import metadataWidget
     from xdart.modules.frame_publication import (
         PublicationStore,
@@ -1205,7 +1205,7 @@ def test_live_gi_clip_warning_fires_once_in_live_gi_only():
 def test_wrangler_thread_no_longer_owns_integration_executor():
     """The GUI wrangler base should not keep an integration executor.
 
-    Batch parallelism is owned by ssrl_xrd_tools.reduction.run_reduction now;
+    Batch parallelism is owned by xrd_tools.reduction.run_reduction now;
     keeping a second GUI-side executor makes shutdown and cancellation harder
     to reason about.
     """
@@ -1291,7 +1291,7 @@ def test_scout_manual_numeric_incidence_single_frame():
 
 
 def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
-    from ssrl_xrd_tools.core import IntegrationResult1D, IntegrationResult2D
+    from xrd_tools.core import IntegrationResult1D, IntegrationResult2D
     from xdart.modules.frame_publication import PublicationStore
 
     viewer = SimpleNamespace(
@@ -1343,7 +1343,7 @@ def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
 
 
 def test_absorb_chunk_skips_invalid_2d_cache_but_keeps_1d_publication(caplog):
-    from ssrl_xrd_tools.core import IntegrationResult1D, IntegrationResult2D
+    from xrd_tools.core import IntegrationResult1D, IntegrationResult2D
     from xdart.modules.frame_publication import (
         PublicationStore,
         publication_has_2d_errors,
@@ -1717,7 +1717,7 @@ def test_render_display_uses_publication_plot_payload_when_present():
 
 
 def test_publication_plot_fallback_uses_legacy_draw_for_derived_axes_and_slice():
-    from ssrl_xrd_tools.core import Axis, FrameView
+    from xrd_tools.core import Axis, FrameView
     from xdart.gui.tabs.static_scan.display_publication import PublicationDisplayAdapter
     from xdart.modules.frame_publication import (
         PublicationStore,
@@ -2206,7 +2206,7 @@ def test_scan_selection_handlers_ignore_suspended_loads():
 
 def test_reduction_only_nxs_not_loaded_as_generic_image(tmp_path):
     import h5py
-    from ssrl_xrd_tools.io import ImageSourceKind
+    from xrd_tools.io import ImageSourceKind
 
     path = tmp_path / "old_processed.nxs"
     with h5py.File(path, "w") as f:
@@ -2286,7 +2286,7 @@ def test_reduction_group_raw_nexus_loads_as_generic_image(tmp_path):
 def test_processed_xdart_markers_still_short_circuit_image_loader(tmp_path):
     import h5py
     import numpy as np
-    from ssrl_xrd_tools.io import ImageSourceKind
+    from xrd_tools.io import ImageSourceKind
     from xdart.gui.tabs.static_scan.display_controllers import (
         ImageViewerController,
     )
@@ -2932,7 +2932,7 @@ def test_display_preview_preserves_nan_masks_but_collapses_infinities():
 
 def test_real_eiger_preview_masks_sentinels_for_display():
     from pathlib import Path
-    from ssrl_xrd_tools.io.image import read_image
+    from xrd_tools.io.image import read_image
     from xdart.gui.tabs.static_scan.display_constants import _downsample_for_display
 
     path = Path("/Users/vthampy/repos/test_data/eiger/Eiger_B_ctrl_test__2000mdeg_scan001_master.h5")

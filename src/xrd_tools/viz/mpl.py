@@ -17,7 +17,7 @@ Examples
 Simple 1D overlay in a notebook::
 
     import matplotlib.pyplot as plt
-    from ssrl_xrd_tools.viz.mpl import plot_1d
+    from xrd_tools.viz.mpl import plot_1d
 
     fig, ax = plt.subplots()
     plot_1d(ax, q, I, yerr=sigma, label='raw',
@@ -27,7 +27,7 @@ Simple 1D overlay in a notebook::
 
 2D detector image with an attached colorbar::
 
-    from ssrl_xrd_tools.viz.mpl import plot_image
+    from xrd_tools.viz.mpl import plot_image
 
     fig, ax = plt.subplots()
     im, cb = plot_image(ax, img, cb_label='Counts',
@@ -232,7 +232,7 @@ def plot_scan_1d(
     """Plot one or many 1-D patterns from a NeXus reader :class:`xr.Dataset`.
 
     Works on the canonical Dataset shape returned by
-    :func:`ssrl_xrd_tools.io.nexus.read_scan` (either schema).
+    :func:`xrd_tools.io.nexus.read_scan` (either schema).
     """
     if "intensity_1d" not in ds.data_vars or "q" not in ds.coords:
         raise ValueError("Dataset missing 'intensity_1d' or 'q' coord")

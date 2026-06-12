@@ -11,22 +11,22 @@ import h5py
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D
-from ssrl_xrd_tools.io.frame_view import FrameViewReader
-from ssrl_xrd_tools.io.nexus import (
+from xrd_tools.core.containers import IntegrationResult1D
+from xrd_tools.io.frame_view import FrameViewReader
+from xrd_tools.io.nexus import (
     PROCESSED_SCHEMA_VERSION,
     open_nexus_writer,
     read_scan,
     read_scan_metadata,
 )
-from ssrl_xrd_tools.reduction import (
+from xrd_tools.reduction import (
     Frame,
     MemorySink,
     ReductionPlan,
     ReductionSession,
     Scan,
 )
-import ssrl_xrd_tools.reduction.core as reduction_core
+import xrd_tools.reduction.core as reduction_core
 
 
 # ── C1: reader-side schema-version check ────────────────────────────────────
@@ -173,7 +173,7 @@ def test_run_reduction_streaming_durable_sink_drops_retention(monkeypatch):
     """P1a: the public headless wrapper must not silently retain every
     FrameReduction when streaming into a durable sink — notebook users got
     the unbounded default the GUI path had already fixed."""
-    from ssrl_xrd_tools.reduction import run_reduction
+    from xrd_tools.reduction import run_reduction
 
     monkeypatch.setattr(reduction_core, "integrate_1d",
                         lambda image, ai, **kw: _r1d(float(np.sum(image))))
@@ -198,7 +198,7 @@ def test_run_reduction_streaming_durable_sink_drops_retention(monkeypatch):
 
 
 def test_run_reduction_memory_sink_and_chunked_keep_retention(monkeypatch):
-    from ssrl_xrd_tools.reduction import run_reduction
+    from xrd_tools.reduction import run_reduction
 
     monkeypatch.setattr(reduction_core, "integrate_1d",
                         lambda image, ai, **kw: _r1d(float(np.sum(image))))

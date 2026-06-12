@@ -1,9 +1,9 @@
-from ssrl_xrd_tools.io.metadata import (
+from xrd_tools.io.metadata import (
     read_image_metadata,
     read_pdi_metadata,
     read_txt_metadata,
 )
-from ssrl_xrd_tools.io.image import (
+from xrd_tools.io.image import (
     load_mask,
     read_image,
     read_image_stack,
@@ -17,19 +17,19 @@ from ssrl_xrd_tools.io.image import (
     count_frames,
     SUPPORTED_EXTS,
 )
-from ssrl_xrd_tools.io.spec import (
+from xrd_tools.io.spec import (
     get_scan_path_info,
     get_energy_and_UB,
     get_spec_scan_type,
     get_from_spec_file,
     get_angles,
 )
-from ssrl_xrd_tools.io.export import (
+from xrd_tools.io.export import (
     read_xye,
     write_h5,
     write_xye,
 )
-from ssrl_xrd_tools.io.nexus import (
+from xrd_tools.io.nexus import (
     find_nexus_image_dataset,
     list_entries,
     open_nexus_writer,
@@ -49,7 +49,7 @@ from ssrl_xrd_tools.io.nexus import (
     write_scan_metadata,
     write_stitched,
 )
-from ssrl_xrd_tools.io.read import (
+from xrd_tools.io.read import (
     Integrated1D,
     Integrated2D,
     Scan,
@@ -63,13 +63,13 @@ from ssrl_xrd_tools.io.read import (
     relative_source_path,
     resolve_source_master,
 )
-from ssrl_xrd_tools.io.frame_view import (
+from xrd_tools.io.frame_view import (
     FrameViewReader,
     iter_frame_views,
     read_frame_view,
     read_frame_views,
 )
-from ssrl_xrd_tools.io.nexus_inspect import (
+from xrd_tools.io.nexus_inspect import (
     NexusAxisSummary,
     NexusDatasetData,
     NexusDatasetPreview,
@@ -81,8 +81,8 @@ from ssrl_xrd_tools.io.nexus_inspect import (
     preview_nexus_dataset,
     read_nexus_dataset,
 )
-from ssrl_xrd_tools.io.chunk_size import adaptive_chunk_size
-from ssrl_xrd_tools.io.image_source import (
+from xrd_tools.io.chunk_size import adaptive_chunk_size
+from xrd_tools.io.image_source import (
     ImageSourceInfo,
     ImageSourceKind,
     RawFrameResult,
@@ -92,7 +92,7 @@ from ssrl_xrd_tools.io.image_source import (
 )
 
 try:
-    from ssrl_xrd_tools.io.tiled import (
+    from xrd_tools.io.tiled import (
         connect_tiled,
         list_scans,
         read_tiled_run,

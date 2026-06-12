@@ -2,7 +2,7 @@
 
 These classes carry GUI/runtime state such as locks, caches, lazy-load
 provenance, and accumulated results.  They are intentionally distinct from
-the pure headless ``ssrl_xrd_tools.reduction.Frame`` and ``Scan`` objects.
+the pure headless ``xrd_tools.reduction.Frame`` and ``Scan`` objects.
 """
 
 from xdart.modules.ewald.frame import LiveFrame, IncidenceAngleUnresolved

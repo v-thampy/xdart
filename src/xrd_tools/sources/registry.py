@@ -6,11 +6,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ssrl_xrd_tools.core.scan import FrameSource, SourceKind, SourceSpec, coerce_source_kind
-from ssrl_xrd_tools.io.image_source import ImageSourceKind, classify_image_source
-from ssrl_xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
-from ssrl_xrd_tools.sources.memory import LiveFrameSource, MemoryFrameSource
-from ssrl_xrd_tools.sources.nexus import NexusStackSource, ProcessedNexusSource
+from xrd_tools.core.scan import FrameSource, SourceKind, SourceSpec, coerce_source_kind
+from xrd_tools.io.image_source import ImageSourceKind, classify_image_source
+from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
+from xrd_tools.sources.memory import LiveFrameSource, MemoryFrameSource
+from xrd_tools.sources.nexus import NexusStackSource, ProcessedNexusSource
 
 
 SourceFactory = Callable[[SourceSpec], FrameSource]

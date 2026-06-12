@@ -19,13 +19,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ssrl_xrd_tools.core.geometry import (
+from xrd_tools.core.geometry import (
     DetectorHeader,
     DiffractometerConfig,
     PixelQMap,
 )
-from ssrl_xrd_tools.rsm import gridding as gridding_module
-from ssrl_xrd_tools.rsm.pipeline import (
+from xrd_tools.rsm import gridding as gridding_module
+from xrd_tools.rsm.pipeline import (
     ScanInput,
     _angles_for_indices,
     _energy_from_scan,
@@ -377,7 +377,7 @@ class TestProcessScanFromSphere:
             chunk_size=2,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),  # skip scout
         )
-        from ssrl_xrd_tools.rsm.volume import RSMVolume
+        from xrd_tools.rsm.volume import RSMVolume
         assert isinstance(vol, RSMVolume)
         assert vol.shape == (4, 4, 4)
 
@@ -469,7 +469,7 @@ class TestProcessScanFromSphere:
         captured: list[list[np.ndarray]] = []
 
         # Spy on _FakeAng2Q.area to capture the per-chunk angle arrays
-        from ssrl_xrd_tools.core.geometry import pixel_q as pixel_q_module
+        from xrd_tools.core.geometry import pixel_q as pixel_q_module
 
         original_pixel_q = PixelQMap.pixel_q
 

@@ -1,7 +1,7 @@
 """Qt-free frame publication contract for xdart displays.
 
 ``FramePublication`` is the GUI-side envelope around
-``ssrl_xrd_tools.core.FrameView``.  It is deliberately separate from
+``xrd_tools.core.FrameView``.  It is deliberately separate from
 ``LiveFrame``: live frames carry locks, caches, lazy loaders, and mutable
 runtime state, while publications are snapshots the display can validate and
 store without reaching back through widget state.
@@ -16,7 +16,7 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
-from ssrl_xrd_tools.core import (
+from xrd_tools.core import (
     FrameView,
     TwoDKind,
     numeric_metadata,
@@ -268,7 +268,7 @@ def publication_from_nexus_frame(
 ) -> FramePublication:
     """Read a saved processed frame and publish it through the same contract."""
 
-    from ssrl_xrd_tools.io import read_frame_view
+    from xrd_tools.io import read_frame_view
 
     view = read_frame_view(
         scan_file,

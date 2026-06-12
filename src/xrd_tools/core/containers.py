@@ -1,4 +1,4 @@
-# ssrl_xrd_tools/core/containers.py
+# xrd_tools/core/containers.py
 """
 Shared data containers for calibration and azimuthal integration results.
 """

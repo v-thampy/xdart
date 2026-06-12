@@ -2,7 +2,7 @@
 Synthetic 1D XRD pattern generator for ML training and fit validation.
 
 The forward model is deliberately kept consistent with
-:mod:`ssrl_xrd_tools.analysis.fitting.phase_fitting`: it uses the same
+:mod:`xrd_tools.analysis.fitting.phase_fitting`: it uses the same
 reciprocal metric tensor, the same March-Dollase texture correction, and
 the same area-normalised pseudo-Voigt convention.  Anything trained on
 these synthetic patterns will therefore live in the same parameter space
@@ -61,7 +61,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from ssrl_xrd_tools.analysis.fitting.phase_fitting import (
+from xrd_tools.analysis.fitting.phase_fitting import (
     _GAUSS_FWHM_FACTOR,
     _march_dollase,
     _metric_tensor,

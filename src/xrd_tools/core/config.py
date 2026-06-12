@@ -1,4 +1,4 @@
-# ssrl_xrd_tools/core/config.py
+# xrd_tools/core/config.py
 """JSON-loadable experiment configuration bundle.
 
 Holds the per-experiment knobs (paths, detector geometry, diffractometer
@@ -12,14 +12,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from ssrl_xrd_tools.core.geometry import (
+from xrd_tools.core.geometry import (
     DetectorHeader,
     DiffractometerConfig,
     PixelQMap,
 )
 
 if TYPE_CHECKING:
-    from ssrl_xrd_tools.rsm.pipeline import ScanInfo
+    from xrd_tools.rsm.pipeline import ScanInfo
 
 
 def _default_header() -> DetectorHeader:
@@ -125,7 +125,7 @@ class ExperimentConfig:
 
     def build_scans(self, scan_dict: dict[str, dict[str, Any]]) -> dict[str, Any]:
         """Build ``{scan_name: ScanInfo}`` from a nested scan description."""
-        from ssrl_xrd_tools.rsm.pipeline import ScanInfo  # noqa: PLC0415
+        from xrd_tools.rsm.pipeline import ScanInfo  # noqa: PLC0415
 
         scans: dict[str, ScanInfo] = {}
         for sample, sdict in scan_dict.items():
@@ -143,8 +143,8 @@ class ExperimentConfig:
         return scans
 
     def process(self, *args: Any, **kwargs: Any) -> Any:
-        """Delegate to :func:`ssrl_xrd_tools.rsm.pipeline.process_scan`."""
-        from ssrl_xrd_tools.rsm.pipeline import process_scan  # noqa: PLC0415
+        """Delegate to :func:`xrd_tools.rsm.pipeline.process_scan`."""
+        from xrd_tools.rsm.pipeline import process_scan  # noqa: PLC0415
 
         # Pull defaults from config that aren't supplied.
         kwargs.setdefault("bins", self.bins)

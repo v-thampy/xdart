@@ -8,14 +8,14 @@ etc.).  The helpers never mutate their inputs.
 Helpers
 -------
 plot_pattern_fit
-    Interactive view of a multi-phase :class:`~ssrl_xrd_tools.analysis.fitting.phase_fitting.PhaseFitter`
+    Interactive view of a multi-phase :class:`~xrd_tools.analysis.fitting.phase_fitting.PhaseFitter`
     fit — data, total model, per-phase contributions, amorphous peak,
     background, and residuals.
 plot_phase_fractions
     Bar / grouped-bar view of phase fractions across a set of fits
     (e.g. a composition series).
 plot_peak_fit
-    Individual-peak fit overlay from :class:`~ssrl_xrd_tools.analysis.fitting.fit.PeakFitResult1D`
+    Individual-peak fit overlay from :class:`~xrd_tools.analysis.fitting.fit.PeakFitResult1D`
     with per-peak components broken out.
 
 The helpers import ``plotly`` lazily so simply importing the ``viz``
@@ -43,7 +43,7 @@ def _import_go():
         import plotly.graph_objects as go
     except ImportError as exc:  # pragma: no cover
         raise ImportError(
-            "plotly is required for ssrl_xrd_tools.viz.plotly. "
+            "plotly is required for xrd_tools.viz.plotly. "
             "Install with `conda install -c conda-forge plotly`."
         ) from exc
     return go
@@ -312,7 +312,7 @@ def plot_peak_fit(
     x, y : ndarray
         The fitted data (used for the points trace).
     peak_result : PeakFitResult1D
-        The result returned by :func:`ssrl_xrd_tools.analysis.fitting.fit.fit_peaks`.
+        The result returned by :func:`xrd_tools.analysis.fitting.fit.fit_peaks`.
     show_components : bool
         If True (default), draw each peak component individually in
         addition to the total fit.

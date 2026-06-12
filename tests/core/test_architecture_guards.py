@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGE = ROOT / "ssrl_xrd_tools"
+PACKAGE = ROOT / "xrd_tools"
 
 
 def _python_files():
@@ -37,21 +37,21 @@ def test_ssrl_tree_does_not_import_xdart():
 def test_headless_contract_imports_do_not_pull_gui_modules():
     before = set(sys.modules)
     for name in (
-        "ssrl_xrd_tools",
-        "ssrl_xrd_tools.analysis.plans",
-        "ssrl_xrd_tools.core",
-        "ssrl_xrd_tools.core.frame_view",
-        "ssrl_xrd_tools.core.metadata",
-        "ssrl_xrd_tools.core.scan",
-        "ssrl_xrd_tools.reduction",
-        "ssrl_xrd_tools.io.nexus",
-        "ssrl_xrd_tools.io.nexus_inspect",
-        "ssrl_xrd_tools.sources",
-        "ssrl_xrd_tools.sources.base",
-        "ssrl_xrd_tools.sources.image",
-        "ssrl_xrd_tools.sources.memory",
-        "ssrl_xrd_tools.sources.nexus",
-        "ssrl_xrd_tools.sources.registry",
+        "xrd_tools",
+        "xrd_tools.analysis.plans",
+        "xrd_tools.core",
+        "xrd_tools.core.frame_view",
+        "xrd_tools.core.metadata",
+        "xrd_tools.core.scan",
+        "xrd_tools.reduction",
+        "xrd_tools.io.nexus",
+        "xrd_tools.io.nexus_inspect",
+        "xrd_tools.sources",
+        "xrd_tools.sources.base",
+        "xrd_tools.sources.image",
+        "xrd_tools.sources.memory",
+        "xrd_tools.sources.nexus",
+        "xrd_tools.sources.registry",
     ):
         importlib.import_module(name)
     loaded = set(sys.modules) - before

@@ -803,7 +803,7 @@ def _set_int_scan(w, *, n=1, wavelength_m=0.7293e-10):
     """Populate the real widget for an Int 2D scan: data_2d + data_1d +
     publications + a scan stub, selected, in Int 2D mode (non-GI, q-integrated)."""
     import threading
-    from ssrl_xrd_tools.core import IntegrationResult1D, IntegrationResult2D
+    from xrd_tools.core import IntegrationResult1D, IntegrationResult2D
     from xdart.modules.frame_publication import publication_from_live_frame
     df = w.displayframe
     q = np.linspace(0.5, 3.0, 5)

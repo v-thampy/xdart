@@ -7,11 +7,11 @@ per-frame angle arrays to per-pixel ``(qx, qy, qz)`` arrays.
 
 This is the *per-pixel* geometry layer.  The *per-frame, scalar* layer
 (motor → pyFAI rotation / GI incidence) lives in
-:mod:`ssrl_xrd_tools.core.geometry.diffractometer`.
+:mod:`xrd_tools.core.geometry.diffractometer`.
 
 Typical usage::
 
-    from ssrl_xrd_tools.core.geometry import (
+    from xrd_tools.core.geometry import (
         DiffractometerConfig, DetectorHeader, PixelQMap,
     )
 
@@ -35,7 +35,7 @@ from typing import Any
 
 import numpy as np
 
-from ssrl_xrd_tools.core.geometry.diffractometer import DiffractometerConfig
+from xrd_tools.core.geometry.diffractometer import DiffractometerConfig
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +139,7 @@ class DetectorHeader:
         poni : PONI (or compatible)
             Anything exposing ``dist``, ``poni1``, ``poni2`` (in metres)
             and optionally ``detector`` (a pyFAI detector name).  The
-            :class:`ssrl_xrd_tools.core.containers.PONI` dataclass fits.
+            :class:`xrd_tools.core.containers.PONI` dataclass fits.
         pixel1, pixel2 : float, optional
             Detector pixel pitch in **metres**.  Required if neither
             ``detector`` nor ``poni.detector`` resolves via pyFAI's
@@ -232,7 +232,7 @@ class PixelQMap:
     The mapper is intentionally pure geometry: it knows nothing about
     data sources (SPEC files, NeXus scans, image files).  Pulling
     angles + energy from a v2 NeXus scan and feeding them in lives in
-    :mod:`ssrl_xrd_tools.rsm.pipeline`.
+    :mod:`xrd_tools.rsm.pipeline`.
     """
 
     diff_config: DiffractometerConfig

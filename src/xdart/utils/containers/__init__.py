@@ -1,7 +1,7 @@
 """
-xdart container types — thin re-export from ssrl_xrd_tools.
+xdart container types — thin re-export from xrd_tools.
 """
-from ssrl_xrd_tools.core.containers import (
+from xrd_tools.core.containers import (
     PONI,
     IntegrationResult1D,
     IntegrationResult2D,

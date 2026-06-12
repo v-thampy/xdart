@@ -12,8 +12,8 @@ from typing import Any
 
 import numpy as np
 
-from ssrl_xrd_tools.core.metadata import ScanMetadata
-from ssrl_xrd_tools.transforms import energy_to_wavelength
+from xrd_tools.core.metadata import ScanMetadata
+from xrd_tools.transforms import energy_to_wavelength
 
 logger = logging.getLogger(__name__)
 

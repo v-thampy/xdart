@@ -8,52 +8,52 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D, PONI
-from ssrl_xrd_tools.core.scan import FrameSource
-from ssrl_xrd_tools.sources import ensure_frame_source
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D, PONI
+from xrd_tools.core.scan import FrameSource
+from xrd_tools.sources import ensure_frame_source
 
 if TYPE_CHECKING:
-    from ssrl_xrd_tools.analysis.fitting import FitConfig, PhaseFitter
+    from xrd_tools.analysis.fitting import FitConfig, PhaseFitter
 
 
 def _default_fit_config():
-    from ssrl_xrd_tools.analysis.fitting import FitConfig
+    from xrd_tools.analysis.fitting import FitConfig
 
     return FitConfig()
 
 
 def stitch_images(*args: Any, **kwargs: Any) -> Any:
-    from ssrl_xrd_tools.integrate.multi import stitch_images as _impl
+    from xrd_tools.integrate.multi import stitch_images as _impl
 
     return _impl(*args, **kwargs)
 
 
 def process_scan_from_nexus(*args: Any, **kwargs: Any) -> Any:
-    from ssrl_xrd_tools.rsm.pipeline import process_scan_from_nexus as _impl
+    from xrd_tools.rsm.pipeline import process_scan_from_nexus as _impl
 
     return _impl(*args, **kwargs)
 
 
 def grid_scans_streaming(*args: Any, **kwargs: Any) -> Any:
-    from ssrl_xrd_tools.rsm.pipeline import grid_scans_streaming as _impl
+    from xrd_tools.rsm.pipeline import grid_scans_streaming as _impl
 
     return _impl(*args, **kwargs)
 
 
 def fit_peaks(*args: Any, **kwargs: Any) -> Any:
-    from ssrl_xrd_tools.analysis.fitting import fit_peaks as _impl
+    from xrd_tools.analysis.fitting import fit_peaks as _impl
 
     return _impl(*args, **kwargs)
 
 
 def fit_sequence(*args: Any, **kwargs: Any) -> Any:
-    from ssrl_xrd_tools.analysis.fitting import fit_sequence as _impl
+    from xrd_tools.analysis.fitting import fit_sequence as _impl
 
     return _impl(*args, **kwargs)
 
 
 def sin2psi_analysis(*args: Any, **kwargs: Any) -> Any:
-    from ssrl_xrd_tools.analysis.strain import sin2psi_analysis as _impl
+    from xrd_tools.analysis.strain import sin2psi_analysis as _impl
 
     return _impl(*args, **kwargs)
 
@@ -191,7 +191,7 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
     """Run the streaming RSM pipeline for one source or a list of sources."""
 
     if isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
-        from ssrl_xrd_tools.rsm.pipeline import ScanInput
+        from xrd_tools.rsm.pipeline import ScanInput
 
         inputs = [
             ScanInput(scan=ensure_frame_source(scan), energy=plan.energy, UB=plan.UB, roi=plan.roi)
@@ -344,7 +344,7 @@ def make_phase_fitter(
 ) -> PhaseFitter:
     """Convenience factory that accepts either an IntegrationResult1D or arrays."""
 
-    from ssrl_xrd_tools.analysis.fitting import PhaseFitter
+    from xrd_tools.analysis.fitting import PhaseFitter
 
     if isinstance(result, IntegrationResult1D):
         return PhaseFitter(result.radial, result.intensity, result.sigma, **kwargs)

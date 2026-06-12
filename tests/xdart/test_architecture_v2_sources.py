@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ssrl_xrd_tools.core.containers import PONI
+from xrd_tools.core.containers import PONI
 
 from xdart.modules.live import LiveFrame, LiveScan
 from xdart.modules.reduction import plan_from_live_scan

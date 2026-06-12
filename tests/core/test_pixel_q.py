@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.core.geometry.pixel_q.
+"""Tests for xrd_tools.core.geometry.pixel_q.
 
 Covers the per-pixel q-space mapping primitives added for the post-0.37
 RSM track:
@@ -16,7 +16,7 @@ import json
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.geometry import (
+from xrd_tools.core.geometry import (
     DetectorHeader,
     DiffractometerConfig,
     PixelQMap,
@@ -112,7 +112,7 @@ class TestDetectorHeader:
 # ---------------------------------------------------------------------------
 
 class _FakePoni:
-    """Stand-in for ssrl_xrd_tools.core.containers.PONI (SI units)."""
+    """Stand-in for xrd_tools.core.containers.PONI (SI units)."""
     def __init__(
         self,
         dist: float = 0.830,        # 830 mm

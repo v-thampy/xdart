@@ -16,7 +16,7 @@ from typing import Any, Mapping
 import h5py
 import numpy as np
 
-from ssrl_xrd_tools.core import TwoDKind, two_d_kind_from_units
+from xrd_tools.core import TwoDKind, two_d_kind_from_units
 
 
 def _readonly(value: Mapping[str, Any] | None) -> Mapping[str, Any]:

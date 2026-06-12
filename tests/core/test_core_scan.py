@@ -5,8 +5,8 @@ import pytest
 
 
 def test_reduction_reexports_core_scan_contracts():
-    from ssrl_xrd_tools.core.scan import FrameSource, MaskSpec, Scan, ScanFrame
-    from ssrl_xrd_tools.reduction import (
+    from xrd_tools.core.scan import FrameSource, MaskSpec, Scan, ScanFrame
+    from xrd_tools.reduction import (
         Frame as ReductionFrame,
         FrameSource as ReductionFrameSource,
         MaskSpec as ReductionMaskSpec,
@@ -20,7 +20,7 @@ def test_reduction_reexports_core_scan_contracts():
 
 
 def test_scan_frame_preserves_heterogeneous_metadata_with_numeric_view():
-    from ssrl_xrd_tools.core.scan import ScanFrame
+    from xrd_tools.core.scan import ScanFrame
 
     frame = ScanFrame(
         index=5,
@@ -35,7 +35,7 @@ def test_scan_frame_preserves_heterogeneous_metadata_with_numeric_view():
 
 
 def test_canonical_scan_is_frame_source_and_preserves_strings_in_scan_data():
-    from ssrl_xrd_tools.core.scan import FrameSource, Scan, ScanFrame
+    from xrd_tools.core.scan import FrameSource, Scan, ScanFrame
 
     scan = Scan(
         "mixed",
@@ -56,7 +56,7 @@ def test_canonical_scan_is_frame_source_and_preserves_strings_in_scan_data():
 
 
 def test_canonical_scan_rejects_duplicate_indices():
-    from ssrl_xrd_tools.core.scan import Scan, ScanFrame
+    from xrd_tools.core.scan import Scan, ScanFrame
 
     with pytest.raises(ValueError, match="duplicate frame indices"):
         Scan("dupes", [ScanFrame(1, image=np.zeros((1, 1))), ScanFrame(1, image=np.ones((1, 1)))])

@@ -14,14 +14,14 @@ import numpy as np
 
 from scipy.ndimage import zoom as ndimage_zoom
 
-from ssrl_xrd_tools.core.containers import (
+from xrd_tools.core.containers import (
     PONI,
     IntegrationResult1D,
     IntegrationResult2D,
 )
-from ssrl_xrd_tools.integrate.calibration import poni_to_integrator
-from ssrl_xrd_tools.integrate.single import integrate_1d, integrate_2d
-from ssrl_xrd_tools.integrate.gid import (
+from xrd_tools.integrate.calibration import poni_to_integrator
+from xrd_tools.integrate.single import integrate_1d, integrate_2d
+from xrd_tools.integrate.gid import (
     create_fiber_integrator,
     integrate_gi_1d,
     integrate_gi_2d,
@@ -255,7 +255,7 @@ class LiveFrame():
         return poni_to_integrator(self.poni)
 
     def _poni_from_integrator(self):
-        """Return an ssrl_xrd_tools PONI derived from self.integrator's current geometry."""
+        """Return an xrd_tools PONI derived from self.integrator's current geometry."""
         ai = self.integrator
         det = getattr(ai, 'detector', None)
         det_name = getattr(det, 'name', '') or ''
@@ -338,7 +338,7 @@ class LiveFrame():
         reloadable from source (:meth:`_lazy_load_resolvable`), the 2D
         thumbnail preview is redundant — the Image Viewer reloads the raw on
         demand via the per-frame source pointer
-        (``ssrl_xrd_tools.io.load_processed_raw_or_thumbnail`` tries the source
+        (``xrd_tools.io.load_processed_raw_or_thumbnail`` tries the source
         master *before* any stored thumbnail).  Skipping generation + storage
         avoids the per-frame ``make_thumbnail`` cost (the dominant residual
         cost of the lean 1D stream).  2D modes, and 1D frames with no
@@ -356,7 +356,7 @@ class LiveFrame():
         Dispatches by source-file extension:
 
         * ``.h5`` / ``.nxs`` / ``.hdf5`` →
-          :class:`ssrl_xrd_tools.io.nexus.NexusImageStack` indexed by
+          :class:`xrd_tools.io.nexus.NexusImageStack` indexed by
           ``source_frame_idx`` (the wrangler stamped the global stack
           offset, so this works for both single-dataset and Eiger
           multi-link masters).
@@ -391,7 +391,7 @@ class LiveFrame():
         fidx = int(fidx)
         try:
             if ext in (".h5", ".nxs", ".hdf5"):
-                from ssrl_xrd_tools.io.nexus import open_nexus_image_stack
+                from xrd_tools.io.nexus import open_nexus_image_stack
                 with open_nexus_image_stack(full) as stack:
                     self.map_raw = np.asarray(
                         stack[fidx], dtype=np.float32,
@@ -401,7 +401,7 @@ class LiveFrame():
                 # non-HDF5 sources too (e.g. multi-frame TIFF /
                 # CBF stacks).  Single-frame files use frame=0
                 # and ignore the kwarg, so this is safe.
-                from ssrl_xrd_tools.io.image import read_image
+                from xrd_tools.io.image import read_image
                 self.map_raw = np.asarray(
                     read_image(full, frame=fidx), dtype=np.float32,
                 )

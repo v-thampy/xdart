@@ -263,7 +263,7 @@ def _load_frame_v2(h5file, idx: int, *, static: bool, gi: bool,
     Falls back to a minimal frame (just ``idx`` set) if any section is
     missing — callers should still get a usable object.
     """
-    from ssrl_xrd_tools.core.containers import (
+    from xrd_tools.core.containers import (
         IntegrationResult1D, IntegrationResult2D,
     )
 

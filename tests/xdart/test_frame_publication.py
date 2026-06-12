@@ -4,13 +4,13 @@ import numpy as np
 import pytest
 import h5py
 
-from ssrl_xrd_tools.core import (
+from xrd_tools.core import (
     IntegrationResult1D,
     IntegrationResult2D,
     TwoDKind,
     assert_frameview_equivalent,
 )
-from ssrl_xrd_tools.io.nexus import write_integrated_stack
+from xrd_tools.io.nexus import write_integrated_stack
 
 from xdart.modules.frame_publication import (
     PublicationStore,

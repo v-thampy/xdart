@@ -16,7 +16,7 @@ import yaml
 
 import h5py
 
-from ssrl_xrd_tools.core import hdf5 as codec
+from xrd_tools.core import hdf5 as codec
 
 
 @pytest.fixture()

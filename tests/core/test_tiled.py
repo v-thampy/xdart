@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.io.tiled (mocked — tiled is optional)."""
+"""Tests for xrd_tools.io.tiled (mocked — tiled is optional)."""
 
 from __future__ import annotations
 
@@ -6,18 +6,18 @@ import numpy as np
 import pytest
 from unittest.mock import MagicMock
 
-import ssrl_xrd_tools.io.tiled as tiled_mod
-from ssrl_xrd_tools.core.metadata import ScanMetadata
+import xrd_tools.io.tiled as tiled_mod
+from xrd_tools.core.metadata import ScanMetadata
 
 try:
-    from ssrl_xrd_tools.io.tiled import (
+    from xrd_tools.io.tiled import (
         connect_tiled,
         list_scans,
         read_tiled_run,
         _HAS_TILED,
     )
 except ImportError:
-    # Module-level guard: only happens if ssrl_xrd_tools itself can't be imported.
+    # Module-level guard: only happens if xrd_tools itself can't be imported.
     _HAS_TILED = False
     pytestmark = pytest.mark.skip(reason="tiled module not available")
 

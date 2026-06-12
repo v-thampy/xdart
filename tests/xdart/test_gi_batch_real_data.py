@@ -62,7 +62,7 @@ def _gi_2d_range_keys(gi_mode_2d):
 
 def _load_tiff(name):
     import fabio
-    from ssrl_xrd_tools.io.metadata import read_image_metadata
+    from xrd_tools.io.metadata import read_image_metadata
     p = TIFF / name
     meta = read_image_metadata(str(p), meta_format="txt")
     img = fabio.open(str(p)).data.astype(np.float32)
@@ -70,7 +70,7 @@ def _load_tiff(name):
 
 
 def _tiff_poni():
-    from ssrl_xrd_tools.core.containers import PONI
+    from xrd_tools.core.containers import PONI
     return PONI.from_poni_file(str(TIFF / _TIFF_PONI))
 
 
@@ -89,7 +89,7 @@ def _load_tiff_frame0():
 def _integrate_direct(poni, img, mask, incidence, bai_2d_args, sample_orientation=4):
     """Reference: integrate one frame at its OWN incidence, as the serial
     path does (fresh fiber integrator per frame)."""
-    from ssrl_xrd_tools.integrate.gid import create_fiber_integrator, integrate_gi_2d
+    from xrd_tools.integrate.gid import create_fiber_integrator, integrate_gi_2d
     fi = create_fiber_integrator(poni, incident_angle=incidence,
                                  sample_orientation=sample_orientation,
                                  angle_unit="deg")
@@ -180,7 +180,7 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
 
 def _make_scan(poni, mask, bai_1d_args, bai_2d_args, *, gi=True):
     from types import SimpleNamespace
-    from ssrl_xrd_tools.integrate.calibration import poni_to_integrator
+    from xrd_tools.integrate.calibration import poni_to_integrator
     return SimpleNamespace(
         name="equivalence_scan",
         gi=gi,
@@ -301,7 +301,7 @@ def _run_live_single(poni, name, img, meta, mask, *, incidence_motor="th",
 
     from types import SimpleNamespace, MethodType
     from threading import Condition, RLock
-    from ssrl_xrd_tools.integrate.calibration import poni_to_integrator
+    from xrd_tools.integrate.calibration import poni_to_integrator
     from xdart.modules.reduction import StandardPlanCache
     from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
@@ -361,8 +361,8 @@ def _canonicalize_thumbnail(frame, mask):
 
 
 def _write_publication_reload(path, frame, thumb_record=None):
-    from ssrl_xrd_tools.core import numeric_metadata
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.core import numeric_metadata
+    from xrd_tools.io.nexus import write_integrated_stack
     from xdart.modules.frame_publication import publication_from_nexus_frame
 
     with h5py.File(path, "w") as h5:
@@ -408,7 +408,7 @@ def _assert_live_batch_reload_equivalent(tmp_path, *, gi,
     (:func:`_frozen_gi_bai_args`) so live and batch share one grid — exactly
     what ``_dispatch_batch`` does before either dispatch path runs.
     """
-    from ssrl_xrd_tools.core import assert_frameview_equivalent
+    from xrd_tools.core import assert_frameview_equivalent
     from xdart.modules.frame_publication import publication_from_live_frame
 
     poni = _tiff_poni()
@@ -508,7 +508,7 @@ def test_batch_parallel_eiger_cake_nondegenerate_manual_incidence():
     # The batch must still produce a non-degenerate cake (not all-dummy,
     # not collapsed).
     import h5py
-    from ssrl_xrd_tools.core.containers import PONI
+    from xrd_tools.core.containers import PONI
 
     poni_path = next(EIGER.glob("LaB6_detxn26*eta3.poni"), None)
     if poni_path is None:
@@ -548,7 +548,7 @@ def test_gi_qip_qoop_publication_live_batch_reload_equivalence(tmp_path):
 def test_eiger_incidence_unresolved_without_metadata():
     # eiger masters have empty metadata -> 'th' motor can't resolve ->
     # must raise, not silently integrate at 0°.
-    from ssrl_xrd_tools.io.metadata import read_image_metadata
+    from xrd_tools.io.metadata import read_image_metadata
     from xdart.modules.live import LiveFrame, IncidenceAngleUnresolved
 
     master = next(EIGER.glob("*_master.h5"))
@@ -560,7 +560,7 @@ def test_eiger_incidence_unresolved_without_metadata():
 
 
 def test_tiff_frozen_gi_2d_range_matches_nonbatch_and_is_nondegenerate():
-    from ssrl_xrd_tools.integrate.gid import (
+    from xrd_tools.integrate.gid import (
         create_fiber_integrator, integrate_gi_2d,
     )
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
@@ -633,7 +633,7 @@ def test_gi_submode_multiframe_stack_writes_uniform(tmp_path, gi_mode_1d,
     (incl. the ``azimuth_range`` key fix for q_oop / exit_angle): the freeze
     must produce one common grid, which the ssrl writer validators accept.
     """
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_integrated_stack
 
     poni = _tiff_poni()
     raw = [_load_tiff(n) for n in _TIFF_FRAMES]
@@ -684,7 +684,7 @@ def test_gi_submode_unfrozen_multiframe_stack_rejected(tmp_path, gi_mode_1d,
     exit_angle) and q_total drifts on the 2D axis — so the matrix above is not
     vacuously green.
     """
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_integrated_stack
 
     poni = _tiff_poni()
     raw = [_load_tiff(n) for n in _TIFF_FRAMES]
@@ -844,8 +844,8 @@ def test_gi_freeze_covers_last_frame_extent():
     highest-incidence scout frames.  The tested span does not clip, so per the
     task this is documented rather than applied.
     """
-    from ssrl_xrd_tools.integrate.calibration import poni_to_integrator
-    from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
+    from xrd_tools.integrate.calibration import poni_to_integrator
+    from xrd_tools.integrate.gid import create_fiber_integrator
     from xdart.modules.live import LiveFrame
 
     poni = _tiff_poni()
@@ -1144,7 +1144,7 @@ def test_gi_prepass_skips_scout_when_ranges_fully_pinned():
     source (Image-Directory, varying motor) must proceed, not abort, and the
     whole-scan scout sweep must not even run."""
     from types import SimpleNamespace
-    from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
+    from xrd_tools.integrate.gid import gi_1d_output_axis_key
 
     emitted = []
     w = _pinned_prepass_holder(emitted)
@@ -1171,7 +1171,7 @@ def test_gi_prepass_warns_when_ranges_partially_pinned():
     first-chunk-freeze advisory still fires."""
     from types import SimpleNamespace, MethodType
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-    from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
+    from xrd_tools.integrate.gid import gi_1d_output_axis_key
 
     emitted = []
     w = _pinned_prepass_holder(emitted)
@@ -1202,7 +1202,7 @@ def test_gi_prepass_fails_closed_on_degenerate_scout_freeze():
     so an unhandled GIFreezeError would tear down the QThread)."""
     from types import SimpleNamespace, MethodType
     from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-    from ssrl_xrd_tools.reduction import GIFreezeError
+    from xrd_tools.reduction import GIFreezeError
 
     emitted = []
     w = SimpleNamespace(

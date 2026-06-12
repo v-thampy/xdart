@@ -280,7 +280,7 @@ def fit_sequence(
     FitResultStore
     """
     import time
-    from ssrl_xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
+    from xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
 
     store = FitResultStore()
     n = len(patterns)
@@ -376,12 +376,12 @@ def fit_nexus(
 ) -> "FitResultStore":
     """Fit every 1-D pattern in an xdart NeXus file (v1 or v2 schema).
 
-    Reads via :func:`ssrl_xrd_tools.io.nexus.read_scan`, which
+    Reads via :func:`xrd_tools.io.nexus.read_scan`, which
     auto-detects schema version — works on both pre-0.37 and 0.37+
     files.  Replaces per-frame ``h5py.File`` round-trips with a single
     load.
     """
-    from ssrl_xrd_tools.io.nexus import read_scan
+    from xrd_tools.io.nexus import read_scan
 
     ds = read_scan(path, entry=entry, groups=("1d",))
 

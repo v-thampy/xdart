@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """``QtNexusSink`` — xdart's v2 ``.nxs`` write as a ssrl ``ReductionSink``.
 
-The streaming :class:`ssrl_xrd_tools.reduction.ReductionSession` feeds completed
+The streaming :class:`xrd_tools.reduction.ReductionSession` feeds completed
 ``FrameReduction``s (by frame index, out-of-order ok) to :meth:`write` on its
 single writer/consumer thread.  This sink hydrates the matching ``LiveFrame``
 (registered by the wrangler as it submits), makes/skips the PERF-5 thumbnail,

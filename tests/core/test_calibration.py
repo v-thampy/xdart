@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.integrate.calibration."""
+"""Tests for xrd_tools.integrate.calibration."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 
-from ssrl_xrd_tools.core.containers import PONI
-from ssrl_xrd_tools.integrate.calibration import (
+from xrd_tools.core.containers import PONI
+from xrd_tools.integrate.calibration import (
     get_detector,
     get_detector_mask,
     load_poni,
@@ -254,13 +254,13 @@ class TestPoniToFiberIntegratorFallback:
         Simulate an environment without FiberIntegrator by patching
         create_fiber_integrator to raise ImportError.
         """
-        import ssrl_xrd_tools.integrate.calibration as cal_mod
+        import xrd_tools.integrate.calibration as cal_mod
 
         def _fake_create(*args, **kwargs):
             raise ImportError("FiberIntegrator not available (simulated)")
 
         monkeypatch.setattr(
-            "ssrl_xrd_tools.integrate.gid.create_fiber_integrator",
+            "xrd_tools.integrate.gid.create_fiber_integrator",
             _fake_create,
         )
         with pytest.raises(ImportError, match="FiberIntegrator"):

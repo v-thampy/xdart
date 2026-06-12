@@ -1,12 +1,12 @@
-"""Tests for ssrl_xrd_tools.integrate.single."""
+"""Tests for xrd_tools.integrate.single."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.integrate.single import integrate_1d, integrate_2d, integrate_scan
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.integrate.single import integrate_1d, integrate_2d, integrate_scan
 
 
 @pytest.mark.slow

@@ -1,4 +1,4 @@
-# ssrl_xrd_tools/integrate/batch.py
+# xrd_tools/integrate/batch.py
 """
 Batch processing of detector scans and live directory watching for beamline
 data reduction.
@@ -29,15 +29,15 @@ from typing import TYPE_CHECKING, Any, Callable
 import h5py
 import numpy as np
 
-from ssrl_xrd_tools.io.export import write_h5
-from ssrl_xrd_tools.io.image import (
+from xrd_tools.io.export import write_h5
+from xrd_tools.io.image import (
     SUPPORTED_EXTS,
     find_image_files,
     get_detector_mask,
     read_image,
     read_image_stack,
 )
-from ssrl_xrd_tools.integrate.single import integrate_1d, integrate_2d
+from xrd_tools.integrate.single import integrate_1d, integrate_2d
 
 if TYPE_CHECKING:
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator

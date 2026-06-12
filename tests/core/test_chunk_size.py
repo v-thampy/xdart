@@ -1,10 +1,10 @@
-"""Tests for ssrl_xrd_tools.io.chunk_size.adaptive_chunk_size."""
+"""Tests for xrd_tools.io.chunk_size.adaptive_chunk_size."""
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.io.chunk_size import (
+from xrd_tools.io.chunk_size import (
     DEFAULT_MAX_FRAMES,
     DEFAULT_MIN_FRAMES,
     adaptive_chunk_size,
@@ -98,6 +98,6 @@ class TestAdaptiveChunkSize:
             adaptive_chunk_size((100, 100), min_frames=10, max_frames=5)
 
     def test_re_export_from_io_package(self):
-        """``from ssrl_xrd_tools.io import adaptive_chunk_size`` works."""
-        from ssrl_xrd_tools.io import adaptive_chunk_size as ac
+        """``from xrd_tools.io import adaptive_chunk_size`` works."""
+        from xrd_tools.io import adaptive_chunk_size as ac
         assert ac is adaptive_chunk_size

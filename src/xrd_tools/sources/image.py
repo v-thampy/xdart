@@ -9,10 +9,10 @@ from typing import Any
 
 import numpy as np
 
-from ssrl_xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind, SourceSpec
-from ssrl_xrd_tools.io.image import count_frames, find_image_files, read_image
-from ssrl_xrd_tools.io.metadata import read_image_metadata
-from ssrl_xrd_tools.sources.base import BaseFrameSource
+from xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind, SourceSpec
+from xrd_tools.io.image import count_frames, find_image_files, read_image
+from xrd_tools.io.metadata import read_image_metadata
+from xrd_tools.sources.base import BaseFrameSource
 
 
 class ImageFileSource(BaseFrameSource):

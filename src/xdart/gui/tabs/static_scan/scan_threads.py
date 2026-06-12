@@ -30,7 +30,7 @@ from xdart.utils import catch_h5py_file as catch
 
 # M2: _reintegrate_frame (the module-level pickle-safe worker for the
 # pre-M2 ProcessPoolExecutor reintegrate path) removed.  Architecture-v2
-# routes reintegration through ssrl_xrd_tools.reduction.run_reduction so
+# routes reintegration through xrd_tools.reduction.run_reduction so
 # xdart no longer owns a second per-frame integration engine here.
 
 
@@ -261,7 +261,7 @@ class integratorThread(Qt.QtCore.QThread):
 
         Architecture-v2 rewrite: switched from ``ProcessPoolExecutor`` over an
         eagerly-materialised frame list to **batched lazy iteration +
-        ssrl_xrd_tools.reduction.run_reduction**.
+        xrd_tools.reduction.run_reduction**.
 
         Why the change.  Pre-M2 the path was:
             all_frames = list(self.scan.frames)

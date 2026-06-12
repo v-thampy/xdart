@@ -12,7 +12,7 @@ import pytest
 
 
 def _r1d(value, nq=16):
-    from ssrl_xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.containers import IntegrationResult1D
     return IntegrationResult1D(
         radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
         intensity=np.full(nq, float(value), dtype=np.float32),
@@ -22,7 +22,7 @@ def _r1d(value, nq=16):
 
 
 def _r2d(value, nq=16, nchi=6):
-    from ssrl_xrd_tools.core.containers import IntegrationResult2D
+    from xrd_tools.core.containers import IntegrationResult2D
     return IntegrationResult2D(
         radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
         azimuthal=np.linspace(-180, 180, nchi, endpoint=False).astype(np.float32),
@@ -31,7 +31,7 @@ def _r2d(value, nq=16, nchi=6):
 
 
 def _reduction(idx, *, with_2d=False):
-    from ssrl_xrd_tools.reduction.core import FrameReduction
+    from xrd_tools.reduction.core import FrameReduction
     return FrameReduction(frame_index=idx, result_1d=_r1d(idx + 1),
                           result_2d=_r2d(idx + 1) if with_2d else None)
 
@@ -85,7 +85,7 @@ class _FakeHost:
 
 
 def _minimal_plan():
-    from ssrl_xrd_tools.reduction import ReductionPlan
+    from xrd_tools.reduction import ReductionPlan
     return ReductionPlan(integration_2d=None)
 
 

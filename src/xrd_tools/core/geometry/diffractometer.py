@@ -13,7 +13,7 @@ Two unrelated geometry containers live here:
   psic-halpha, custom).
 
 These are the *per-frame, scalar* geometry primitives.  Per-pixel q-space
-mapping for RSM lives in :mod:`ssrl_xrd_tools.core.geometry.pixel_q`.
+mapping for RSM lives in :mod:`xrd_tools.core.geometry.pixel_q`.
 """
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ class DiffractometerConfig:
         """Build an ``xu.HXRD`` instance at the given energy.
 
         ``xrayutilities`` is imported lazily inside this method so that
-        importing :mod:`ssrl_xrd_tools.core` never triggers the xu
+        importing :mod:`xrd_tools.core` never triggers the xu
         import (it is still a declared dependency and must be installed
         before calling this method).
         """

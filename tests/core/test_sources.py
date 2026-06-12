@@ -6,8 +6,8 @@ import pytest
 
 
 def test_memory_source_round_trips_to_scan():
-    from ssrl_xrd_tools.core.scan import ScanFrame
-    from ssrl_xrd_tools.sources import MemoryFrameSource
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.sources import MemoryFrameSource
 
     source = MemoryFrameSource([
         ScanFrame(3, image=np.full((2, 2), 3), metadata={"tag": "c"}),
@@ -22,7 +22,7 @@ def test_memory_source_round_trips_to_scan():
 
 
 def test_live_source_append_and_duplicate_guard():
-    from ssrl_xrd_tools.sources import LiveFrameSource
+    from xrd_tools.sources import LiveFrameSource
 
     source = LiveFrameSource()
     source.append(np.ones((2, 2)), index=10, metadata={"i0": 5})
@@ -33,7 +33,7 @@ def test_live_source_append_and_duplicate_guard():
 
 
 def test_nexus_stack_source_loads_chunks(tmp_path):
-    from ssrl_xrd_tools.sources import NexusStackSource, open_source
+    from xrd_tools.sources import NexusStackSource, open_source
 
     path = tmp_path / "raw_stack.nxs"
     data = np.arange(3 * 2 * 4, dtype=np.float32).reshape(3, 2, 4)
@@ -56,7 +56,7 @@ def test_nexus_stack_source_loads_chunks(tmp_path):
 
 def test_image_file_source_uses_existing_reader(tmp_path):
     tifffile = pytest.importorskip("tifffile")
-    from ssrl_xrd_tools.sources import ImageFileSource, open_source
+    from xrd_tools.sources import ImageFileSource, open_source
 
     path = tmp_path / "frame.tif"
     image = np.arange(12, dtype=np.uint16).reshape(3, 4)
@@ -69,7 +69,7 @@ def test_image_file_source_uses_existing_reader(tmp_path):
 
 
 def test_tiff_series_from_directory_uses_natural_order_and_pattern(tmp_path):
-    from ssrl_xrd_tools.sources import TiffSeriesSource
+    from xrd_tools.sources import TiffSeriesSource
 
     for name in (
         "scan_1.tif",
@@ -94,7 +94,7 @@ def test_tiff_series_from_directory_uses_natural_order_and_pattern(tmp_path):
 
 
 def test_processed_nexus_source_reads_frame_views(tmp_path):
-    from ssrl_xrd_tools.sources import ProcessedNexusSource, open_source
+    from xrd_tools.sources import ProcessedNexusSource, open_source
 
     path = tmp_path / "processed.nxs"
     with h5py.File(path, "w") as h5:

@@ -9,7 +9,7 @@ entry point is :func:`save_scan_to_nexus`, called from
 ``integrated_1d``/``integrated_2d`` groups, the ``stitched_*`` groups,
 the motor ``positioners``, and ``per_frame_geometry`` is owned by the
 shared, headless-reusable primitives in
-:mod:`ssrl_xrd_tools.io.nexus` (``write_integrated_stack``,
+:mod:`xrd_tools.io.nexus` (``write_integrated_stack``,
 ``write_stitched``, ``write_positioners``, ``write_per_frame_geometry``).
 This module is now a thin GUI-side adapter: it gathers the LiveScan's
 in-memory state (frames, scan_data, geometry, PONI, thumbnails), decides
@@ -35,7 +35,7 @@ Key invariants of the v2 schema:
    via the :class:`DiffractometerGeometry` config blob stored in
    ``/entry/reduction/config/geometry/``.
 6. Provenance (NXprocess) is written via
-   :func:`ssrl_xrd_tools.core.provenance.write_provenance` — versions
+   :func:`xrd_tools.core.provenance.write_provenance` — versions
    are pulled from ``importlib.metadata`` and never hard-coded.
 """
 
@@ -54,7 +54,7 @@ import nexusformat.nexus as nx
 import numpy as np
 
 if TYPE_CHECKING:  # pragma: no cover
-    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    from xrd_tools.core.geometry import DiffractometerGeometry
 
     from xdart.modules.live import LiveScan
 
@@ -114,7 +114,7 @@ def _array_digest(arr) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# File-opening helper — mirrors ssrl_xrd_tools.core.hdf5.catch_h5py_file
+# File-opening helper — mirrors xrd_tools.core.hdf5.catch_h5py_file
 # semantics (NFS retry on transient OSError) but goes through
 # ``nx.nxopen`` so the returned object is an ``NXroot`` view rather
 # than a raw h5py.File.  Underlying h5py.File still reachable via
@@ -127,7 +127,7 @@ def _open_with_retry(path: Union[str, "Path"], mode: str,
 
     Beamline NFS mounts sometimes briefly refuse to open a file while
     another process is still releasing its lock.  Retry the same way
-    ``ssrl_xrd_tools.core.hdf5.catch_h5py_file`` does so the writer
+    ``xrd_tools.core.hdf5.catch_h5py_file`` does so the writer
     behaves identically to the previous code path.
 
     ``nx.nxopen`` accepts the same mode strings as ``h5py.File``
@@ -151,7 +151,7 @@ def _h5(f) -> h5py.File:
     :func:`_open_with_retry`.
 
     The stacked-write / positioner / geometry / stitched primitives in
-    ``ssrl_xrd_tools.io.nexus`` operate on a raw :class:`h5py.Group`, so
+    ``xrd_tools.io.nexus`` operate on a raw :class:`h5py.Group`, so
     every section that delegates to them grabs the live h5py file here
     and passes ``h5f.require_group(entry)``.  Only ``_ensure_nxentry``
     and the per-frame thumbnail writer still go through nexusformat.
@@ -260,7 +260,7 @@ def save_scan_to_nexus(
         cursor = _write_cursor(scan, h5f)
 
         # 1. Stacked integrated_1d and integrated_2d (delegated to
-        #    ssrl_xrd_tools.io.nexus.write_integrated_stack).  Select and
+        #    xrd_tools.io.nexus.write_integrated_stack).  Select and
         # validate both outputs before either is written so a 2D mismatch
         # cannot leave 1D one frame ahead — or even refresh provenance.
         prepared_1d = _prepare_integrated_1d(
@@ -383,8 +383,8 @@ def _ensure_nxentry(f, entry: str) -> None:
 
 
 def _write_reduction(h5f, scan, *, entry: str) -> None:
-    """Write /entry/reduction/ via ssrl_xrd_tools provenance."""
-    from ssrl_xrd_tools.core.provenance import write_provenance
+    """Write /entry/reduction/ via xrd_tools provenance."""
+    from xrd_tools.core.provenance import write_provenance
 
     config: dict[str, Any] = {
         "bai_1d_args": dict(scan.bai_1d_args),
@@ -688,7 +688,7 @@ def _axis_signatures_equal(left, right) -> bool:
 
 def _validate_prepared_integrated(entry_grp, prepared_1d, prepared_2d) -> None:
     """Preflight every selected output before committing either one."""
-    from ssrl_xrd_tools.io.nexus import validate_integrated_stack_write
+    from xrd_tools.io.nexus import validate_integrated_stack_write
     if prepared_1d is not None and prepared_1d["results"]:
         validate_integrated_stack_write(
             entry_grp,
@@ -941,7 +941,7 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
 def _commit_integrated_1d(f, prepared) -> None:
     if prepared is None or not prepared["results"]:
         return
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_integrated_stack
     h5f = _h5(f)
     write_integrated_stack(
         h5f.require_group(prepared["entry"]),
@@ -1017,7 +1017,7 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
 def _commit_integrated_2d(f, prepared) -> None:
     if prepared is None or not prepared["results"]:
         return
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_integrated_stack
     h5f = _h5(f)
     write_integrated_stack(
         h5f.require_group(prepared["entry"]),
@@ -1193,7 +1193,7 @@ def _write_source_ref(fg, frame, *, output_dir: str | None = None,
     raw that sits outside the root.  Pair with ``entry/@source_base`` written by
     the caller.
     """
-    from ssrl_xrd_tools.io.read import relative_source_path
+    from xrd_tools.io.read import relative_source_path
 
     src_path = getattr(frame, "source_file", "") or ""
     if not src_path:
@@ -1281,7 +1281,7 @@ def _write_incremental_metadata(f, scan, *, entry: str,
         return
     rows = scan_data.reindex(tail_ids)
     geom = getattr(scan, "geometry", None)
-    from ssrl_xrd_tools.io.nexus import (
+    from xrd_tools.io.nexus import (
         upsert_per_frame_geometry,
         upsert_positioners,
         upsert_scan_metadata,
@@ -1310,12 +1310,12 @@ def _write_positioners(f, scan, *, entry: str) -> None:
     """Write motor positioners under ``NXsample`` / ``NXdetector``.
 
     Delegates the layout to
-    :func:`ssrl_xrd_tools.io.nexus.write_positioners`, which reindexes
+    :func:`xrd_tools.io.nexus.write_positioners`, which reindexes
     ``scan_data`` to the integrated-frame set (so the per-frame
     dimension matches ``integrated_1d``/``2d``) and splits sample- vs
     detector-axis motors via the geometry.  No geometry → no-op.
     """
-    from ssrl_xrd_tools.io.nexus import write_positioners as _wp
+    from xrd_tools.io.nexus import write_positioners as _wp
 
     scan_data = getattr(scan, "scan_data", None)
     geom = getattr(scan, "geometry", None)
@@ -1325,14 +1325,14 @@ def _write_positioners(f, scan, *, entry: str) -> None:
 
 def _write_scan_metadata(f, scan, *, entry: str) -> None:
     """Persist the full per-frame scan metadata table (delegates to
-    :func:`ssrl_xrd_tools.io.nexus.write_scan_metadata`).
+    :func:`xrd_tools.io.nexus.write_scan_metadata`).
 
     Unlike positioners (geometry motors only), this stores every column the
     wrangler recorded in ``scan.scan_data`` so a reload restores the same
     metadata the live in-memory scan had — fixes the metadata panel showing
     only the incidence motor after a batch run reloads from disk.
     """
-    from ssrl_xrd_tools.io.nexus import write_scan_metadata as _wsm
+    from xrd_tools.io.nexus import write_scan_metadata as _wsm
 
     scan_data = getattr(scan, "scan_data", None)
     frame_index = list(getattr(getattr(scan, "frames", None), "index", []) or [])
@@ -1343,14 +1343,14 @@ def _write_per_frame_geometry(f, scan, *, entry: str) -> None:
     """Write derived per-frame pyFAI rotations + incidence angle.
 
     Delegates to
-    :func:`ssrl_xrd_tools.io.nexus.write_per_frame_geometry`, which
+    :func:`xrd_tools.io.nexus.write_per_frame_geometry`, which
     reindexes ``scan_data`` to the frame set, derives rot1/2/3 +
     incident_angle via ``geometry.derive_per_frame``, and labels the
     rows with the actual frame ids (so a downstream join-by-frame_index
     lines up with ``integrated_1d``).  No geometry / no usable motor
     columns → no-op.
     """
-    from ssrl_xrd_tools.io.nexus import write_per_frame_geometry as _wg
+    from xrd_tools.io.nexus import write_per_frame_geometry as _wg
 
     scan_data = getattr(scan, "scan_data", None)
     geom = getattr(scan, "geometry", None)
@@ -1395,7 +1395,7 @@ def _representative_poni(scan):
         from xdart.utils.containers import PONI  # type: ignore
     except Exception:  # pragma: no cover
         try:
-            from ssrl_xrd_tools.integrate.calibration import PONI  # type: ignore
+            from xrd_tools.integrate.calibration import PONI  # type: ignore
         except Exception:
             return None
     return PONI(
@@ -1537,7 +1537,7 @@ def _write_instrument(f, scan, *, entry: str) -> None:
 def _write_stitched(f, scan, *, entry: str) -> None:
     """Write stitched 1D / 2D outputs via the shared primitive.
 
-    Delegates to :func:`ssrl_xrd_tools.io.nexus.write_stitched` (the
+    Delegates to :func:`xrd_tools.io.nexus.write_stitched` (the
     symmetric counterpart to ``read_stitched``).  Only invoked when
     ``finalize=True`` (typically end-of-scan).
 
@@ -1545,7 +1545,7 @@ def _write_stitched(f, scan, *, entry: str) -> None:
     stored **as-is** ``(n_q, n_chi)`` with dims ``(q, chi)`` — unlike
     the per-frame ``integrated_2d`` stack ``(frame, chi, q)``.
     """
-    from ssrl_xrd_tools.io.nexus import write_stitched as _ws
+    from xrd_tools.io.nexus import write_stitched as _ws
 
     s1 = getattr(scan, "stitched_1d", None)
     s2 = getattr(scan, "stitched_2d", None)

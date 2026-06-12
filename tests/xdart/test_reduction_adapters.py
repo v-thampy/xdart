@@ -1,4 +1,4 @@
-"""Tests for xdart's boundary into ssrl_xrd_tools.reduction."""
+"""Tests for xdart's boundary into xrd_tools.reduction."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ import pytest
 from threading import RLock
 from types import SimpleNamespace
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.core.containers import PONI
-from ssrl_xrd_tools.reduction import (
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.core.containers import PONI
+from xrd_tools.reduction import (
     FrameReduction,
     Integration1DPlan,
     Integration2DPlan,
@@ -128,7 +128,7 @@ def test_live_scan_loader_normalizes_legacy_reduction_provenance(
     monkeypatch,
     tmp_path,
 ) -> None:
-    import ssrl_xrd_tools.io.nexus as nexus_io
+    import xrd_tools.io.nexus as nexus_io
 
     fake_ds = SimpleNamespace(
         attrs={
@@ -154,7 +154,7 @@ def test_live_scan_loader_normalizes_legacy_reduction_provenance(
 
 
 def test_live_scan_loader_uses_union_of_1d_and_2d_labels(monkeypatch, tmp_path) -> None:
-    import ssrl_xrd_tools.io.nexus as nexus_io
+    import xrd_tools.io.nexus as nexus_io
 
     class _FakeDataset:
         attrs = {"reduction": {}}
@@ -178,7 +178,7 @@ def test_live_scan_loader_uses_union_of_1d_and_2d_labels(monkeypatch, tmp_path) 
 
 
 def test_live_scan_loader_reindexes_metadata_to_union_labels(monkeypatch, tmp_path) -> None:
-    import ssrl_xrd_tools.io.nexus as nexus_io
+    import xrd_tools.io.nexus as nexus_io
 
     class _Var:
         def __init__(self, values, dims):
@@ -893,7 +893,7 @@ def test_open_live_reduction_session_retention_policy() -> None:
     10k-frame 2D batch).  Chunked sessions KEEP retention — their callers
     read results back via reduce_live_frames(session=...) -> session.frames
     (serial live, reintegration, GI scouts)."""
-    from ssrl_xrd_tools.reduction import MemorySink
+    from xrd_tools.reduction import MemorySink
     from xdart.modules.reduction import open_live_reduction_session
 
     frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
@@ -929,7 +929,7 @@ def test_persistent_session_does_not_accumulate_products(monkeypatch) -> None:
     plan = ReductionPlan(integration_2d=None)
     session = open_live_reduction_session([_mk(0)], plan, scan_name="s")
 
-    import ssrl_xrd_tools.reduction.core as ssrl_core
+    import xrd_tools.reduction.core as ssrl_core
 
     def _fake_1d(image, ai, **kw):
         v = float(np.sum(image))

@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.rsm import (
+from xrd_tools.rsm import (
     DetectorHeader,
     DiffractometerConfig,
     ExperimentConfig,
@@ -40,7 +40,7 @@ except ImportError:
     _HAS_XU = False
 
 try:
-    from ssrl_xrd_tools.rsm import volume as volume_module
+    from xrd_tools.rsm import volume as volume_module
 
     _HAS_VTK = bool(volume_module._VTK_AVAILABLE)
 except Exception:
@@ -218,7 +218,7 @@ class TestExtract2dSlice:
 
 class TestSaveVtk:
     def test_save_vtk_not_available(self, rsm_volume: RSMVolume, monkeypatch: pytest.MonkeyPatch) -> None:
-        from ssrl_xrd_tools.rsm import volume as volume_module
+        from xrd_tools.rsm import volume as volume_module
 
         monkeypatch.setattr(volume_module, "_VTK_AVAILABLE", False)
         monkeypatch.setattr(volume_module, "gridToVTK", None)
@@ -277,7 +277,7 @@ class TestGridImgData:
             def __call__(self, qx, qy, qz, img):
                 self.data = np.full(self.data.shape, float(np.nanmean(img)))
 
-        import ssrl_xrd_tools.rsm.gridding as gridding_module
+        import xrd_tools.rsm.gridding as gridding_module
 
         monkeypatch.setattr(gridding_module.xu, "Gridder3D", _FakeGridder3D)
         monkeypatch.setattr(DiffractometerConfig, "make_hxrd", lambda self, energy: _FakeHXRD())
@@ -333,7 +333,7 @@ class TestGridImgData:
             def __call__(self, qx, qy, qz, img):
                 self.data = np.full(self.data.shape, float(np.nanmean(img)))
 
-        import ssrl_xrd_tools.rsm.gridding as gridding_module
+        import xrd_tools.rsm.gridding as gridding_module
 
         monkeypatch.setattr(gridding_module.xu, "Gridder3D", _FakeGridder3D)
         monkeypatch.setattr(DiffractometerConfig, "make_hxrd", lambda self, energy: _FakeHXRD())
@@ -488,7 +488,7 @@ class TestProcessScanData:
     def test_p3_streaming_default_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """P3 regression: process_scan_data defaults streaming=True so
         the public SPEC/HDF5 path inherits the memory-bounded gridder."""
-        from ssrl_xrd_tools.rsm import pipeline as pipeline_module
+        from xrd_tools.rsm import pipeline as pipeline_module
 
         calls: list[str] = []
 
@@ -552,7 +552,7 @@ class TestProcessScan:
 
     def test_p3_chunk_size_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``chunk_size=`` on process_scan must reach grid_img_data_streaming."""
-        from ssrl_xrd_tools.rsm import pipeline as pipeline_module
+        from xrd_tools.rsm import pipeline as pipeline_module
 
         captured: dict[str, Any] = {}
 

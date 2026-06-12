@@ -3,7 +3,7 @@
 These exercise the LiveScan-specific logic ``run_stitch`` owns — frame-id
 alignment of scan_data, normalization, skip-of-frames-without-raw, and the
 fail-clearly-on-NaN guards — *without* pyFAI: the actual MultiGeometry
-integration (``ssrl_xrd_tools.integrate.multi.stitch_images``) is
+integration (``xrd_tools.integrate.multi.stitch_images``) is
 monkeypatched to capture the gathered images/angles.
 """
 
@@ -78,7 +78,7 @@ def _patch_stitch_images(monkeypatch):
         return f"RESULT_{kw.get('mode')}"
 
     monkeypatch.setattr(
-        "ssrl_xrd_tools.integrate.multi.stitch_images", _fake,
+        "xrd_tools.integrate.multi.stitch_images", _fake,
     )
     return captured
 

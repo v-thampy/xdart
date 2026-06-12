@@ -1,9 +1,9 @@
 """
-ssrl_xrd_tools/core/hdf5.py
+xrd_tools/core/hdf5.py
 ----------------------------
 Type-aware HDF5 serialization codec.
 
-Extracted from xdart/_utils.py so that both ssrl_xrd_tools and the xdart GUI
+Extracted from xdart/_utils.py so that both xrd_tools and the xdart GUI
 can share the same on-disk format.
 
 Public API

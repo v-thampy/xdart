@@ -467,14 +467,14 @@ New method on the wrangler (or a helper module):
 
 ```python
 def _run_stitch(self, mode: Literal["1d", "2d"]) -> None:
-    """Batch-only stitch using pyFAI MultiGeometry via ssrl_xrd_tools.
+    """Batch-only stitch using pyFAI MultiGeometry via xrd_tools.
 
     1. Ensure all frames have been loaded (blocking; not live).
     2. Pull base_poni, per-frame images, per-frame masks, per-frame
        normalization (i0/i1 columns if configured).
     3. Use self._sphere.geometry (DiffractometerGeometry) to derive
        rot1/rot2/rot3 arrays.
-    4. Call ssrl_xrd_tools.integrate.multi.create_multigeometry_integrators
+    4. Call xrd_tools.integrate.multi.create_multigeometry_integrators
        with rot1_angles (degrees — the raw motor values) and optionally
        rot2_angles.
     5. Call stitch_1d(...) or stitch_2d(...) with the image stack.
@@ -592,7 +592,7 @@ Canonical version targets to record: `xdart`, `ssrl_xrd_tools`, `pyFAI`,
 Currently per-frame h5py loops are the bottleneck. Replace with:
 
 ```python
-from ssrl_xrd_tools.io.nexus import read_sphere
+from xrd_tools.io.nexus import read_sphere
 
 def fit_scan(path: str, phases: list[Phase], ...) -> xr.Dataset:
     ds = read_sphere(path, groups=("1d",))
@@ -664,7 +664,7 @@ After publishing, spot-check the curl install produces:
 
 ```python
 import xdart, ssrl_xrd_tools
-print(xdart.__version__, ssrl_xrd_tools.__version__)
+print(xdart.__version__, xrd_tools.__version__)
 # 0.36.0 0.36.0
 ```
 

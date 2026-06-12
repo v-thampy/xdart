@@ -21,7 +21,7 @@ unresolved/degenerate incidence into a silent blank cake.
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.containers import IntegrationResult2D
+from xrd_tools.core.containers import IntegrationResult2D
 from xdart.modules.live import LiveFrame, IncidenceAngleUnresolved
 from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import (
     _padded_axis_range,

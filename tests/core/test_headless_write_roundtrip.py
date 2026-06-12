@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.io.nexus import (
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.io.nexus import (
     open_nexus_writer,
     read_scan,
     write_nexus,
@@ -103,7 +103,7 @@ def test_write_integrated_stack_bulk_then_incremental(tmp_path):
     """The shared stacked-write primitive: bulk-create on first save, then
     incremental upsert (re-saving a label replaces, new labels append)."""
     import h5py
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_integrated_stack
 
     p = tmp_path / "stack.nxs"
     with h5py.File(p, "w") as f:
@@ -138,7 +138,7 @@ def test_write_integrated_stack_bulk_then_incremental(tmp_path):
 
 def test_monotonic_append_fast_path_falls_back_after_late_frame(tmp_path):
     import h5py
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_integrated_stack
 
     p = tmp_path / "late_frame.nxs"
     with h5py.File(p, "w") as f:
@@ -156,7 +156,7 @@ def test_write_stitched_roundtrips_through_read_stitched(tmp_path):
     """write_stitched ↔ read_stitched: stitched_2d is (q, chi) as-is (NOT
     transposed like integrated_2d)."""
     import h5py
-    from ssrl_xrd_tools.io.nexus import write_stitched, read_stitched
+    from xrd_tools.io.nexus import write_stitched, read_stitched
 
     p = tmp_path / "stitched.nxs"
     s1 = _r1d(0)                       # (N_Q,)
@@ -181,7 +181,7 @@ def test_write_integrated_stack_shape_change_rewrites(tmp_path):
     """Reintegration at a different npt (C3): the group is rewritten with the
     new row size + refreshed q axis, not a slice-assign that would raise."""
     import h5py
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_integrated_stack
 
     p = tmp_path / "reint.nxs"
     with h5py.File(p, "w") as f:
@@ -208,7 +208,7 @@ def test_write_integrated_stack_partial_shape_change_raises(tmp_path):
     every on-disk frame must raise, not silently drop the omitted rows."""
     import h5py
     import pytest
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_integrated_stack
 
     p = tmp_path / "partial_reint.nxs"
     with h5py.File(p, "w") as f:
@@ -233,7 +233,7 @@ def test_write_integrated_stack_partial_shape_change_raises(tmp_path):
 def test_write_integrated_stack_rejects_duplicate_labels(tmp_path):
     import h5py
     import pytest
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_integrated_stack
     p = tmp_path / "dup.nxs"
     with h5py.File(p, "w") as f:
         e = f.create_group("entry")
@@ -298,8 +298,8 @@ def test_nexus_sink_roundtrips_through_read_scan(tmp_path):
     """The NexusSink itself (begin/write/finish) → read_scan."""
     import pytest
     pytest.importorskip("pyFAI")  # reduction pkg import chain needs it
-    from ssrl_xrd_tools.reduction import NexusSink
-    from ssrl_xrd_tools.reduction.core import FrameReduction, Frame, Scan
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.reduction.core import FrameReduction, Frame, Scan
 
     p = tmp_path / "sink.nxs"
     sink = NexusSink(path=p, overwrite=True)
@@ -324,7 +324,7 @@ def test_write_integrated_stack_axis_change_same_bincount_rewrites(tmp_path):
     axis (q_A^-1 → 2th_deg) must refresh the stored q axis + units, not
     just the intensity rows."""
     import h5py
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_integrated_stack
 
     p = tmp_path / "axis_change.nxs"
     q = np.linspace(0.5, 5.0, N_Q)
@@ -352,7 +352,7 @@ def test_write_integrated_stack_sigma_stays_row_aligned(tmp_path):
     (NaN-padded when that frame has no sigma) so intensity never outgrows
     sigma — which would make read_scan raise on the shape mismatch."""
     import h5py
-    from ssrl_xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus import write_integrated_stack
 
     p = tmp_path / "sigma_align.nxs"
     with h5py.File(p, "w") as f:

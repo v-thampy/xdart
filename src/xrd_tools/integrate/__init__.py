@@ -1,12 +1,12 @@
 """
 Azimuthal integration, GID, calibration, and batch processing.
 """
-from ssrl_xrd_tools.integrate.batch import (
+from xrd_tools.integrate.batch import (
     DirectoryWatcher,
     process_scan,
     process_series,
 )
-from ssrl_xrd_tools.integrate.gid import (
+from xrd_tools.integrate.gid import (
     create_fiber_integrator,
     integrate_gi_1d,
     integrate_gi_2d,
@@ -15,17 +15,17 @@ from ssrl_xrd_tools.integrate.gid import (
     integrate_gi_polar,
     integrate_gi_polar_1d,
 )
-from ssrl_xrd_tools.integrate.multi import (
+from xrd_tools.integrate.multi import (
     create_multigeometry_integrators,
     stitch_1d,
     stitch_2d,
 )
-from ssrl_xrd_tools.integrate.single import (
+from xrd_tools.integrate.single import (
     integrate_1d,
     integrate_2d,
     integrate_scan,
 )
-from ssrl_xrd_tools.integrate.calibration import (
+from xrd_tools.integrate.calibration import (
     get_detector,
     get_detector_mask,
     load_poni,

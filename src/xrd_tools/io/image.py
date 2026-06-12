@@ -1,6 +1,6 @@
-# ssrl_xrd_tools/io/image.py
+# xrd_tools/io/image.py
 """
-Detector-agnostic image I/O for ssrl_xrd_tools.
+Detector-agnostic image I/O for xrd_tools.
 
 Handles: EDF, TIFF, CBF, MarCCD, raw binary, Eiger HDF5, NeXus (.nxs).
 All reads go through fabio so format detection is automatic.
@@ -534,7 +534,7 @@ def _find_hdf5_image_dataset(f: h5py.File) -> h5py.Dataset:
     # search below would return ``integrated_1d`` (shape (N, n_q)) and the
     # caller would display an integrated-pattern stack as if it were an
     # image.  Raw frames for such a file live in the original detector
-    # master; use ``ssrl_xrd_tools.io.read.get_raw_frame`` (it resolves the
+    # master; use ``xrd_tools.io.read.get_raw_frame`` (it resolves the
     # per-frame source pointer) instead.
     if any(p in f for p in ("entry/integrated_1d", "entry/integrated_2d")):
         raise ValueError(

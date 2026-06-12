@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.core.provenance.
+"""Tests for xrd_tools.core.provenance.
 
 Covers the NXprocess writer/reader pair used by the v2 NeXus schema
 (``/entry/reduction/``).  Tests are written against a fresh h5py file
@@ -13,7 +13,7 @@ import h5py
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.provenance import (
+from xrd_tools.core.provenance import (
     CANONICAL_PACKAGES,
     capture_versions,
     read_provenance,

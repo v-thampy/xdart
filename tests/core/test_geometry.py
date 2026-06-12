@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.core.geometry.
+"""Tests for xrd_tools.core.geometry.
 
 Covers the new flexible diffractometer geometry primitives used by the
 xdart 0.37+ v2 NeXus writer:
@@ -19,7 +19,7 @@ import json
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.geometry import (
+from xrd_tools.core.geometry import (
     AngleMapping,
     DiffractometerGeometry,
 )

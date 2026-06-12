@@ -13,8 +13,8 @@ import time
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D
-from ssrl_xrd_tools.reduction import (
+from xrd_tools.core.containers import IntegrationResult1D
+from xrd_tools.reduction import (
     CancelToken,
     Frame,
     MemorySink,
@@ -23,7 +23,7 @@ from ssrl_xrd_tools.reduction import (
     ReductionSession,
     run_reduction,
 )
-import ssrl_xrd_tools.reduction.core as reduction_core
+import xrd_tools.reduction.core as reduction_core
 
 
 def _r1d(value: float) -> IntegrationResult1D:
@@ -519,7 +519,7 @@ def test_finish_timeout_does_not_touch_sink_while_writer_alive(monkeypatch):
 def test_nexus_sink_abort_preserves_partial(tmp_path):
     """T0-6/S7: in atomic mode every frame written so far lives in the tmp
     file; abort() must preserve it as <output>.partial, never unlink it."""
-    from ssrl_xrd_tools.reduction import NexusSink
+    from xrd_tools.reduction import NexusSink
 
     out = tmp_path / "run.nxs"
     sink = NexusSink(out, overwrite=True)
@@ -539,8 +539,8 @@ def test_nexus_sink_abort_preserves_partial(tmp_path):
 def test_nexus_sink_finish_failure_preserves_partial(tmp_path, monkeypatch):
     """T0-6/S7: a finish-time failure (e.g. scan_data upsert) must surface
     loudly AND leave the written frames recoverable as <output>.partial."""
-    from ssrl_xrd_tools.reduction import NexusSink
-    from ssrl_xrd_tools.reduction.core import Scan as _Scan
+    from xrd_tools.reduction import NexusSink
+    from xrd_tools.reduction.core import Scan as _Scan
 
     out = tmp_path / "run2.nxs"
     sink = NexusSink(out, overwrite=True)

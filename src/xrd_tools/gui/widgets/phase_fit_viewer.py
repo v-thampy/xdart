@@ -21,8 +21,8 @@ Controls exposed
 
 Example
 -------
->>> from ssrl_xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
->>> from ssrl_xrd_tools.gui.widgets import PhaseFitViewer
+>>> from xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
+>>> from xrd_tools.gui.widgets import PhaseFitViewer
 >>>
 >>> viewer = PhaseFitViewer(pattern=result_1d, phases=[ortho, mono, tetra, tin])
 >>> viewer.widget    # display in the notebook
@@ -478,7 +478,7 @@ class PhaseFitViewer:
     @staticmethod
     def _unpack_pattern(pattern: Any):
         """Accept IntegrationResult1D or (q, I[, sigma]) tuples."""
-        from ssrl_xrd_tools.core.containers import IntegrationResult1D
+        from xrd_tools.core.containers import IntegrationResult1D
         if isinstance(pattern, IntegrationResult1D):
             return pattern.radial, pattern.intensity, pattern.sigma
         if isinstance(pattern, tuple):
@@ -744,7 +744,7 @@ class PhaseFitViewer:
         if not force and self._prefit_cache is not None:
             return self._prefit_cache
 
-        from ssrl_xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
+        from xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
 
         init_kw, _ = self._build_fitter_kwargs()
         init_kw = {k: v for k, v in init_kw.items()
@@ -821,7 +821,7 @@ class PhaseFitViewer:
         self._fit_button.icon = ""
 
         # Imported lazily so the widget module doesn't pay the cost at import.
-        from ssrl_xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
+        from xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
 
         selected = self._selected_phase_names()
         try:

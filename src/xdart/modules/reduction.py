@@ -2,7 +2,7 @@
 
 This module is the migration boundary for the thin-GUI refactor.  The rest of
 xdart may still import the transitional ``Ewald*`` aliases for now, but new
-headless reduction work should cross into ``ssrl_xrd_tools`` as ``Frame`` /
+headless reduction work should cross into ``xrd_tools`` as ``Frame`` /
 ``Scan`` / ``ReductionPlan`` objects.
 """
 
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 from dataclasses import fields as _dc_fields
 
-from ssrl_xrd_tools.reduction import (
+from xrd_tools.reduction import (
     Frame,
     GIMode,
     Integration1DPlan,
@@ -56,7 +56,7 @@ def frame_from_live_frame(
     include_image: bool = True,
     include_background: bool = True,
 ) -> Frame:
-    """Build an ``ssrl_xrd_tools.reduction.Frame`` from a ``LiveFrame``."""
+    """Build an ``xrd_tools.reduction.Frame`` from a ``LiveFrame``."""
     image = getattr(live_frame, "map_raw", None) if include_image else None
     source_path = _source_path(live_frame)
     mask = _live_frame_mask_as_bool(live_frame)
@@ -83,7 +83,7 @@ def scan_from_live_scan(
     include_images: bool = True,
     include_backgrounds: bool | None = None,
 ) -> Scan:
-    """Build an ``ssrl_xrd_tools.reduction.Scan`` from a ``LiveScan``."""
+    """Build an ``xrd_tools.reduction.Scan`` from a ``LiveScan``."""
     if include_backgrounds is None:
         include_backgrounds = include_images
     indices = list(frame_indices) if frame_indices is not None else list(live_scan.frames.index)
@@ -275,7 +275,7 @@ def reduce_live_frame(
     global_mask: Any = None,
     integrator: Any = None,
 ) -> Any:
-    """Reduce one ``LiveFrame`` through ``ssrl_xrd_tools.reduction``.
+    """Reduce one ``LiveFrame`` through ``xrd_tools.reduction``.
 
     The returned object is the same ``live_frame`` instance, populated with
     ``int_1d`` / ``int_2d`` so existing xdart display and writer code can
@@ -455,7 +455,7 @@ def freeze_live_scan_gi_ranges(
 
     This is the xdart boundary adapter for the old GI scout step.  The actual
     scout integrations and common-grid calculation live in
-    :class:`ssrl_xrd_tools.reduction.ReductionSession`; xdart only mirrors the
+    :class:`xrd_tools.reduction.ReductionSession`; xdart only mirrors the
     frozen plan ranges back into ``bai_1d_args`` / ``bai_2d_args`` so the
     existing writer and display state stay coherent.
     """
@@ -502,7 +502,7 @@ def _copy_frozen_gi_ranges_to_live_scan(
     if plan.integration_1d is not None:
         args_1d = getattr(live_scan, "bai_1d_args", None)
         if isinstance(args_1d, dict):
-            from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
+            from xrd_tools.integrate.gid import gi_1d_output_axis_key
 
             key = gi_1d_output_axis_key(plan.gi.mode_1d.value)
             value = getattr(plan.integration_1d, key, None)

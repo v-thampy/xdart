@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from scipy.signal import find_peaks
-from ssrl_xrd_tools.core.containers import IntegrationResult1D
+from xrd_tools.core.containers import IntegrationResult1D
 
 
 def extract_peaks(

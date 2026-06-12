@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.integrate.batch."""
+"""Tests for xrd_tools.integrate.batch."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import pytest
 from pyFAI.detectors import Detector
 from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 
-from ssrl_xrd_tools.integrate.batch import DirectoryWatcher, process_scan, process_series
+from xrd_tools.integrate.batch import DirectoryWatcher, process_scan, process_series
 
 
 def _make_small_ai(poni_fixture) -> AzimuthalIntegrator:

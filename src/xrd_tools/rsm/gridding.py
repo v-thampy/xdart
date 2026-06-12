@@ -26,8 +26,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
-from ssrl_xrd_tools.core.geometry import DetectorHeader, PixelQMap
-from ssrl_xrd_tools.rsm.volume import RSMVolume
+from xrd_tools.core.geometry import DetectorHeader, PixelQMap
+from xrd_tools.rsm.volume import RSMVolume
 
 # xrayutilities is required for any real gridding call; the try/except
 # lets the module import in environments where xu isn't installed (e.g.

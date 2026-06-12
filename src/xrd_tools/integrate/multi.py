@@ -1,4 +1,4 @@
-# ssrl_xrd_tools/integrate/multi.py
+# xrd_tools/integrate/multi.py
 """
 Multi-image stitching via pyFAI MultiGeometry.
 
@@ -17,12 +17,12 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ssrl_xrd_tools.core.containers import (
+from xrd_tools.core.containers import (
     PONI,
     IntegrationResult1D,
     IntegrationResult2D,
 )
-from ssrl_xrd_tools.integrate.calibration import poni_to_integrator
+from xrd_tools.integrate.calibration import poni_to_integrator
 
 if TYPE_CHECKING:
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator

@@ -8,7 +8,7 @@ from typing import Iterable
 import h5py
 import numpy as np
 
-from ssrl_xrd_tools.core.frame_view import (
+from xrd_tools.core.frame_view import (
     Axis,
     FrameGeometry,
     FrameView,
@@ -17,7 +17,7 @@ from ssrl_xrd_tools.core.frame_view import (
     numeric_metadata,
     two_d_kind_from_units,
 )
-from ssrl_xrd_tools.io.read import _decode, _dequantize_thumbnail, _entry
+from xrd_tools.io.read import _decode, _dequantize_thumbnail, _entry
 
 
 def _decode_kind(value, x_unit: str | None, y_unit: str | None) -> TwoDKind:
@@ -115,7 +115,7 @@ class FrameViewReader:
         self._entry = _entry(self._h5, self.entry_name)
         # C1: surface a newer-than-supported schema before any dataset access
         # fails with an opaque KeyError.
-        from ssrl_xrd_tools.io.nexus import warn_if_newer_schema
+        from xrd_tools.io.nexus import warn_if_newer_schema
         warn_if_newer_schema(self._entry, str(self.path))
         # N1: the project root the relative source paths point under (None on old
         # absolute-path files; harmless there).
@@ -251,7 +251,7 @@ class FrameViewReader:
             # @source_base > scan dir; absolute paths used as-is (back-compat).
             # Fall back to the stored string when nothing resolves, so the
             # field is never silently blanked (provenance preserved).
-            from ssrl_xrd_tools.io.read import resolve_source_master
+            from xrd_tools.io.read import resolve_source_master
             resolved = resolve_source_master(
                 stored, scan_file=self.path,
                 source_base=self._source_base, source_root=self.source_root)

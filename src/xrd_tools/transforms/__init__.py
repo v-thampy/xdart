@@ -1,5 +1,5 @@
 """
-Unit conversion helpers used throughout ``ssrl_xrd_tools``.
+Unit conversion helpers used throughout ``xrd_tools``.
 
 Implemented here:
 - ``q_to_tth`` / ``tth_to_q``

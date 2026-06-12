@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 from .frame import LiveFrame
 from .frame_series import LiveFrameSeries
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xdart import utils
 from xdart.modules.live_compat import normalize_live_class_names
 from xdart.modules.wavelength import (
@@ -118,7 +118,7 @@ class LiveScan:
         self.incidence_motor = incidence_motor
         # Flexible diffractometer geometry — used by the v2 NeXus writer
         # to derive per-frame pyFAI rotations + incidence-angle arrays.
-        self.geometry = geometry            # ssrl_xrd_tools.core.geometry.DiffractometerGeometry
+        self.geometry = geometry            # xrd_tools.core.geometry.DiffractometerGeometry
         # Optional stitched-output containers (populated by run_stitch).
         self.stitched_1d = None
         self.stitched_2d = None
@@ -609,7 +609,7 @@ class LiveScan:
         """
         if self.geometry is not None:
             return self.geometry
-        from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+        from xrd_tools.core.geometry import DiffractometerGeometry
         self.geometry = DiffractometerGeometry.two_circle(
             tth="tth", th=self.incidence_motor or "th",
         )
@@ -637,9 +637,9 @@ class LiveScan:
         # Prefer the metadata-only loader — it skips the heavy stacks;
         # fall back to the full reader on older builds that lack it.
         try:
-            from ssrl_xrd_tools.io.nexus import read_scan_metadata as _read
+            from xrd_tools.io.nexus import read_scan_metadata as _read
         except ImportError:
-            from ssrl_xrd_tools.io.nexus import read_scan as _read
+            from xrd_tools.io.nexus import read_scan as _read
 
         try:
             ds = _read(self.data_file)
@@ -710,7 +710,7 @@ class LiveScan:
         geom_cfg = config.get("geometry")
         if isinstance(geom_cfg, dict) and geom_cfg.get("mapping_json"):
             try:
-                from ssrl_xrd_tools.core.geometry import (
+                from xrd_tools.core.geometry import (
                     DiffractometerGeometry,
                 )
                 mj = geom_cfg["mapping_json"]

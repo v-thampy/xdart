@@ -15,8 +15,8 @@ from __future__ import annotations
 
 def _not_implemented(*_args, **_kwargs):
     raise NotImplementedError(
-        "Texture analysis is not yet implemented in ssrl_xrd_tools. "
-        "See ssrl_xrd_tools/analysis/texture.py for the planned API."
+        "Texture analysis is not yet implemented in xrd_tools. "
+        "See xrd_tools/analysis/texture.py for the planned API."
     )
 
 

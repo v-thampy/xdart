@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from ssrl_xrd_tools.core.scan import (
+from xrd_tools.core.scan import (
     FrameSource,
     Scan,
     ScanFrame,

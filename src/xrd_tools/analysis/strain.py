@@ -30,8 +30,8 @@ from typing import Any
 import numpy as np
 from scipy.stats import linregress
 
-from ssrl_xrd_tools.analysis.fitting.fit import fit_peaks
-from ssrl_xrd_tools.core.containers import IntegrationResult2D
+from xrd_tools.analysis.fitting.fit import fit_peaks
+from xrd_tools.core.containers import IntegrationResult2D
 
 logger = logging.getLogger(__name__)
 

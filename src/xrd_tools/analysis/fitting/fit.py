@@ -31,7 +31,7 @@ from lmfit.models import (
     PolynomialModel,
 )
 
-from ssrl_xrd_tools.analysis.fitting.models import (
+from xrd_tools.analysis.fitting.models import (
     lorentzian_squared,
     LorentzianSquaredModel,
     Gaussian2DModel,

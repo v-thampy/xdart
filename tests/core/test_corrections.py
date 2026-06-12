@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.corrections."""
+"""Tests for xrd_tools.corrections."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import pytest
 from pyFAI.detectors import Detector
 from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 
-from ssrl_xrd_tools.corrections import (
+from xrd_tools.corrections import (
     apply_flatfield,
     apply_mask,
     apply_threshold,

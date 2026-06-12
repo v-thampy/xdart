@@ -8,11 +8,11 @@ from typing import Any
 
 import numpy as np
 
-from ssrl_xrd_tools.core.frame_view import FrameView
-from ssrl_xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind, SourceSpec
-from ssrl_xrd_tools.io.frame_view import FrameViewReader
-from ssrl_xrd_tools.io.nexus import open_nexus_image_stack
-from ssrl_xrd_tools.sources.base import BaseFrameSource
+from xrd_tools.core.frame_view import FrameView
+from xrd_tools.core.scan import ScanFrame, SourceCapabilities, SourceKind, SourceSpec
+from xrd_tools.io.frame_view import FrameViewReader
+from xrd_tools.io.nexus import open_nexus_image_stack
+from xrd_tools.sources.base import BaseFrameSource
 
 
 class NexusStackSource(BaseFrameSource):
@@ -111,9 +111,9 @@ class ProcessedNexusSource(BaseFrameSource):
         data.  So ``allow_thumbnail=False``: if the master can't be resolved this
         raises ``KeyError`` (a clean error), rather than degrading.  The display
         path keeps the thumbnail fallback via
-        :func:`ssrl_xrd_tools.io.image_source.load_processed_raw_or_thumbnail`.
+        :func:`xrd_tools.io.image_source.load_processed_raw_or_thumbnail`.
         """
-        from ssrl_xrd_tools.io.read import get_raw_frame
+        from xrd_tools.io.read import get_raw_frame
         return np.asarray(
             get_raw_frame(self.path, int(index), entry=self.entry,
                           allow_thumbnail=False, source_root=self.source_root),

@@ -15,16 +15,16 @@ logger = logging.getLogger(__name__)
 import re
 import numpy as np
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.io.export import read_xye
-from ssrl_xrd_tools.io.image import read_image, count_frames
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.io.export import read_xye
+from xrd_tools.io.image import read_image, count_frames
 from xdart.utils.session import load_session, save_session
 from .ui.h5viewerUI import Ui_Form
 from xdart.modules.live import LiveFrame
 from .scan_threads import fileHandlerThread
 from .display_logic import xye_unit_from_filename
 from .display_controllers import ImageViewerController
-from ssrl_xrd_tools.io import ImageSourceKind
+from xrd_tools.io import ImageSourceKind
 from xdart.modules.frame_publication import (
     PublicationStore,
     publication_error_details,
@@ -1213,7 +1213,7 @@ class H5Viewer(QWidget):
 
     def _load_nexus_file(self, fpath):
         """Inspect a NeXus/HDF5 file without loading large arrays."""
-        from ssrl_xrd_tools.io import inspect_nexus
+        from xrd_tools.io import inspect_nexus
 
         with self.data_lock:
             self.data_1d.clear()
@@ -1306,7 +1306,7 @@ class H5Viewer(QWidget):
         frame.scan_info = info
 
     def _load_nexus_preview_payload(self, viewer_path, info):
-        from ssrl_xrd_tools.io import preview_nexus_dataset, read_nexus_dataset
+        from xrd_tools.io import preview_nexus_dataset, read_nexus_dataset
 
         dataset_path = info["dataset_path"]
         shape = tuple(info.get("_shape") or ())
@@ -1468,7 +1468,7 @@ class H5Viewer(QWidget):
         if not axis_path:
             return np.arange(length, dtype=float), label, unit
         try:
-            from ssrl_xrd_tools.io import read_nexus_dataset
+            from xrd_tools.io import read_nexus_dataset
             selection = axis_selection if axis_selection is not None else np.s_[:]
             axis = read_nexus_dataset(viewer_path, axis_path, selection=selection)
             values = np.asarray(axis.data, dtype=float).ravel()

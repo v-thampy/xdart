@@ -23,8 +23,8 @@ import numpy as np
 import pytest
 import h5py
 
-from ssrl_xrd_tools.core.containers import IntegrationResult2D
-from ssrl_xrd_tools.io.nexus import write_integrated_stack
+from xrd_tools.core.containers import IntegrationResult2D
+from xrd_tools.io.nexus import write_integrated_stack
 from xdart.modules.ewald.frame_series import _load_frame_v2
 from xdart.gui.tabs.static_scan.display_logic import (
     two_d_kind_from_units, is_gi_2d_units,

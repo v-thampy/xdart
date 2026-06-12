@@ -15,7 +15,7 @@ import h5py
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.io import (
+from xrd_tools.io import (
     get_raw_frame,
     relative_source_path,
     resolve_source_master,
@@ -165,7 +165,7 @@ def test_read_frame_view_resolves_source_path_via_source_base(tmp_path):
     """N1 §3: FrameView.source_path is RESOLVED (relative -> absolute master)
     against @source_base, so FrameView consumers (FrameSource/Scan/RSM/stitch/
     notebooks) can locate the raw -- not the bare stored relpath."""
-    from ssrl_xrd_tools.io import read_frame_view
+    from xrd_tools.io import read_frame_view
     root = tmp_path / "proj"
     master = root / "raw" / "m.h5"
     master.parent.mkdir(parents=True)
@@ -179,7 +179,7 @@ def test_read_frame_view_resolves_source_path_via_source_base(tmp_path):
 
 
 def test_read_frame_view_source_root_override(tmp_path):
-    from ssrl_xrd_tools.io import read_frame_view
+    from xrd_tools.io import read_frame_view
     moved = tmp_path / "moved"
     master = moved / "raw" / "m.h5"
     master.parent.mkdir(parents=True)
@@ -193,7 +193,7 @@ def test_read_frame_view_source_root_override(tmp_path):
 def test_read_frame_view_unresolved_keeps_stored_string(tmp_path):
     """When nothing resolves, source_path keeps the stored relpath (provenance
     preserved, never silently blanked)."""
-    from ssrl_xrd_tools.io import read_frame_view
+    from xrd_tools.io import read_frame_view
     nxs = tmp_path / "scan.nxs"
     _write_processed(nxs, rel_path="raw/missing.h5", source_base=str(tmp_path))
     fv = read_frame_view(nxs, 0)
@@ -204,7 +204,7 @@ def test_processed_nexus_source_load_frame_returns_full_res_master(tmp_path):
     """N1 §3 (+ fixes a pre-existing dead branch): ProcessedNexusSource.load_frame
     resolves the per-frame source pointer and returns the FULL-RES master (not the
     downsampled thumbnail) when it resolves."""
-    from ssrl_xrd_tools.sources.nexus import ProcessedNexusSource
+    from xrd_tools.sources.nexus import ProcessedNexusSource
     root = tmp_path / "proj"
     master = root / "raw" / "m.h5"
     master.parent.mkdir(parents=True)
@@ -221,7 +221,7 @@ def test_processed_nexus_source_load_frame_returns_full_res_master(tmp_path):
 
 
 def test_processed_nexus_source_source_root_repoints_moved_tree(tmp_path):
-    from ssrl_xrd_tools.sources.nexus import ProcessedNexusSource
+    from xrd_tools.sources.nexus import ProcessedNexusSource
     moved = tmp_path / "moved"
     master = moved / "raw" / "m.h5"
     master.parent.mkdir(parents=True)
@@ -236,7 +236,7 @@ def test_processed_nexus_source_source_root_repoints_moved_tree(tmp_path):
 def test_open_scan_source_root_load_frame(tmp_path):
     """N1 §3: open_scan(nxs, source_root=...).load_frame resolves through the
     moved tree (the notebook sugar override)."""
-    from ssrl_xrd_tools.io import open_scan
+    from xrd_tools.io import open_scan
     moved = tmp_path / "moved"
     master = moved / "raw" / "m.h5"
     master.parent.mkdir(parents=True)
@@ -253,8 +253,8 @@ def test_processed_nexus_source_load_frame_strict_raises_without_master(tmp_path
     downsampled/mask-baked thumbnail in place of the full-res raw.  When the
     master can't be resolved, ProcessedNexusSource.load_frame RAISES (clean
     error) -- while the separate DISPLAY API still degrades to the thumbnail."""
-    from ssrl_xrd_tools.sources.nexus import ProcessedNexusSource
-    from ssrl_xrd_tools.io.image_source import load_processed_raw_or_thumbnail
+    from xrd_tools.sources.nexus import ProcessedNexusSource
+    from xrd_tools.io.image_source import load_processed_raw_or_thumbnail
 
     nxs = tmp_path / "scan.nxs"
     with h5py.File(nxs, "w") as f:

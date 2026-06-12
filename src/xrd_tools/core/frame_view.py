@@ -14,7 +14,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from ssrl_xrd_tools.core.metadata import numeric_metadata
+from xrd_tools.core.metadata import numeric_metadata
 
 
 class TwoDKind(str, Enum):

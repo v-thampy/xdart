@@ -3,13 +3,13 @@ from __future__ import annotations
 import h5py
 import numpy as np
 
-from ssrl_xrd_tools.core import IntegrationResult1D, IntegrationResult2D, TwoDKind
-from ssrl_xrd_tools.io import (
+from xrd_tools.core import IntegrationResult1D, IntegrationResult2D, TwoDKind
+from xrd_tools.io import (
     inspect_nexus,
     preview_nexus_dataset,
     read_nexus_dataset,
 )
-from ssrl_xrd_tools.io.nexus import write_integrated_stack
+from xrd_tools.io.nexus import write_integrated_stack
 
 
 def _r1d() -> IntegrationResult1D:

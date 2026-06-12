@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.io.export."""
+"""Tests for xrd_tools.io.export."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.io.export import write_h5, write_xye
+from xrd_tools.io.export import write_h5, write_xye
 
 
 def test_write_xye(tmp_path):

@@ -86,7 +86,7 @@ def test_image_wrangler_project_folder_derives_source_base(tmp_path):
 def test_n1_writer_to_ssrl_reader_roundtrip(tmp_path):
     """End-to-end: a relative pointer written under @source_base resolves back to
     the raw master through the ssrl reader, even with the .nxs in another dir."""
-    from ssrl_xrd_tools.io import get_raw_frame
+    from xrd_tools.io import get_raw_frame
 
     root = tmp_path / "proj"
     raw_arr = np.arange(2 * 4 * 4, dtype=float).reshape(2, 4, 4)

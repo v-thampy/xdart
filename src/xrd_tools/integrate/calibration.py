@@ -1,5 +1,5 @@
 """
-Calibration helpers bridging ``ssrl_xrd_tools`` containers and pyFAI.
+Calibration helpers bridging ``xrd_tools`` containers and pyFAI.
 """
 
 from __future__ import annotations
@@ -13,8 +13,8 @@ import pyFAI
 from pyFAI.detectors import detector_factory
 from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 
-from ssrl_xrd_tools.core.containers import PONI
-from ssrl_xrd_tools.io.image import get_detector_mask as _get_detector_mask
+from xrd_tools.core.containers import PONI
+from xrd_tools.io.image import get_detector_mask as _get_detector_mask
 
 if TYPE_CHECKING:
     from pyFAI.detectors import Detector
@@ -193,7 +193,7 @@ def poni_to_fiber_integrator(
     Convert a project ``PONI`` dataclass to a pyFAI FiberIntegrator.
 
     This is a convenience re-export of
-    :func:`~ssrl_xrd_tools.integrate.gid.create_fiber_integrator`.
+    :func:`~xrd_tools.integrate.gid.create_fiber_integrator`.
     The ``gid`` version caches incident/tilt angles on the instance so that
     the ``integrate_gi_*`` helpers can re-inject them on every call (pyFAI
     resets its internal cache after each integration).
@@ -224,7 +224,7 @@ def poni_to_fiber_integrator(
     ImportError
         If the installed pyFAI version does not support FiberIntegrator.
     """
-    from ssrl_xrd_tools.integrate.gid import create_fiber_integrator
+    from xrd_tools.integrate.gid import create_fiber_integrator
 
     return create_fiber_integrator(
         poni,

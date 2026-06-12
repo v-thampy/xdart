@@ -1,7 +1,7 @@
 """Batch stitching helper for the v2 ``LiveScan`` (xdart 0.37+).
 
 Thin orchestration layer over
-:mod:`ssrl_xrd_tools.integrate.multi` (which exports
+:mod:`xrd_tools.integrate.multi` (which exports
 ``create_multigeometry_integrators``, ``stitch_1d``, ``stitch_2d``).
 
 The wrangler calls :func:`run_stitch` once all frames are loaded.
@@ -90,7 +90,7 @@ def run_stitch(
     if scan.geometry is None:
         raise RuntimeError(
             "LiveScan.geometry is unset — set it before stitching "
-            "(use ssrl_xrd_tools.core.geometry.DiffractometerGeometry)."
+            "(use xrd_tools.core.geometry.DiffractometerGeometry)."
         )
     frames = list(scan.frames)
     if not frames:
@@ -298,12 +298,12 @@ def run_stitch(
                 'alignment. Drop those frames or provide the motor positions.'
             )
 
-        # The integrator-build + 1D/2D dispatch lives in ssrl_xrd_tools now
+        # The integrator-build + 1D/2D dispatch lives in xrd_tools now
         # (keep-xdart-thin): this function's job is the LiveScan-specific
         # gathering above; the stitch orchestration is shared headless code.
         # Pass the image *list* straight through (stitch_images accepts a
         # list) to avoid an extra full np.stack copy of every frame.
-        from ssrl_xrd_tools.integrate.multi import stitch_images
+        from xrd_tools.integrate.multi import stitch_images
 
         result = stitch_images(
             images,

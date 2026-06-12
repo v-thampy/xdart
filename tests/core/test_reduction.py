@@ -9,8 +9,8 @@ import h5py
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.reduction import (
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.reduction import (
     CancelToken,
     Frame,
     GIMode,
@@ -24,7 +24,7 @@ from ssrl_xrd_tools.reduction import (
     ReductionSession,
     run_reduction,
 )
-import ssrl_xrd_tools.reduction.core as reduction_core
+import xrd_tools.reduction.core as reduction_core
 
 
 def _r1d(value: float, *, unit: str = "q_A^-1") -> IntegrationResult1D:
@@ -68,7 +68,7 @@ def test_scan_sorts_frames_and_synthesizes_metadata() -> None:
 
 
 def test_scan_frame_source_iterates_bounded_chunks() -> None:
-    from ssrl_xrd_tools.reduction import FrameSource
+    from xrd_tools.reduction import FrameSource
 
     scan = Scan(
         "source",
@@ -736,9 +736,9 @@ def test_nexus_sink_flush_policy(
 
 
 def test_existing_notebook_import_surface_still_imports() -> None:
-    from ssrl_xrd_tools.analysis.fitting import FitConfig, PhaseFitter, fit_peaks
-    from ssrl_xrd_tools.analysis.strain import sin2psi_analysis
-    from ssrl_xrd_tools.integrate import (
+    from xrd_tools.analysis.fitting import FitConfig, PhaseFitter, fit_peaks
+    from xrd_tools.analysis.strain import sin2psi_analysis
+    from xrd_tools.integrate import (
         create_multigeometry_integrators,
         integrate_1d,
         integrate_2d,
@@ -800,7 +800,7 @@ def test_scan_to_scan_data_empty_scan() -> None:
 
 
 def test_nexussink_persists_scan_data_roundtrip(tmp_path: Path) -> None:
-    from ssrl_xrd_tools.io.read import get_metadata
+    from xrd_tools.io.read import get_metadata
 
     path = tmp_path / "scan_conditions.nxs"
     scan = Scan(

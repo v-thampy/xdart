@@ -4,15 +4,15 @@ import h5py
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core import (
+from xrd_tools.core import (
     FrameView,
     IntegrationResult1D,
     IntegrationResult2D,
     TwoDKind,
     assert_frameview_equivalent,
 )
-from ssrl_xrd_tools.io import read_frame_view, read_frame_views, iter_frame_views
-from ssrl_xrd_tools.io.nexus import read_scan, write_integrated_stack
+from xrd_tools.io import read_frame_view, read_frame_views, iter_frame_views
+from xrd_tools.io.nexus import read_scan, write_integrated_stack
 
 
 def _r1d(scale: float = 1.0) -> IntegrationResult1D:
@@ -163,7 +163,7 @@ def test_frame_view_reader_caches_scan_data_columns_per_open(tmp_path):
     # P2 #4 (perf): scan_data columns are read ONCE per open and sliced per
     # row, not re-read full for every (frame, column) — O(N^2) before.
     # Values must stay correct per frame.
-    from ssrl_xrd_tools.io.frame_view import FrameViewReader
+    from xrd_tools.io.frame_view import FrameViewReader
 
     path = tmp_path / "cache_cols.nxs"
     with h5py.File(path, "w") as f:

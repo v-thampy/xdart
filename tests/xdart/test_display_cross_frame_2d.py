@@ -19,7 +19,7 @@ import pytest
 
 
 def _ir1d(val, nq=8):
-    from ssrl_xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.core.containers import IntegrationResult1D
     return IntegrationResult1D(
         radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
         intensity=np.full(nq, float(val), dtype=np.float32),
@@ -27,7 +27,7 @@ def _ir1d(val, nq=8):
 
 
 def _ir2d(val, *, nq=8, nchi=6, rad=None):
-    from ssrl_xrd_tools.core.containers import IntegrationResult2D
+    from xrd_tools.core.containers import IntegrationResult2D
     if rad is None:
         rad = np.linspace(0.5, 5.0, nq, dtype=np.float32)
     return IntegrationResult2D(

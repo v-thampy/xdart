@@ -3,10 +3,10 @@
 Architecture-v2 keeps the processed scan layout stable while adding explicit
 schema stamps and lossless per-frame metadata.
 
-The root entry group written by `ssrl_xrd_tools.io.nexus` carries:
+The root entry group written by `xrd_tools.io.nexus` carries:
 
 - `NX_class = "NXentry"`
-- `ssrl_schema = "ssrl_xrd_tools.processed_scan"`
+- `ssrl_schema = "xrd_tools.processed_scan"`
 - `ssrl_schema_version = 2`
 
 The main processed groups remain:

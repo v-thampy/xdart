@@ -6,7 +6,7 @@ Covers both source types the wranglers stamp into v2 files:
 
 * **TIF source** — single-frame TIFFs from the SPEC wrangler.
 * **NeXus source** — single dataset or multi-link Eiger master, via
-  :class:`ssrl_xrd_tools.io.nexus.NexusImageStack`.
+  :class:`xrd_tools.io.nexus.NexusImageStack`.
 
 Tests exercise the lazy-load path directly (no full pyFAI
 integration) so they stay fast and don't need a real PONI.  The
@@ -40,7 +40,7 @@ def _write_eiger_master(tmp_path, n_files=2, frames_per_file=3,
                        shape=(6, 8), seed=0):
     """Build an Eiger-style master with sibling external links.
 
-    Same construction as the ssrl_xrd_tools test fixture — duplicated
+    Same construction as the xrd_tools test fixture — duplicated
     here so this test file doesn't import the ssrl test-suite helpers.
     Returns (master_path, full_expected_stack).
     """

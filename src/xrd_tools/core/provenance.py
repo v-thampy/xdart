@@ -14,7 +14,7 @@ here is:
         host      = (str, optional)
         versions/                               (NXcollection)
             xdart          (str)
-            ssrl_xrd_tools (str)
+            xrd_tools (str)
             pyFAI          (str)
             h5py           (str)
             numpy          (str)
@@ -28,7 +28,7 @@ here is:
             meta_file       str
 
 Versions are pulled via :mod:`importlib.metadata` — **never hard-coded**.
-This is the reason both ``xdart`` and ``ssrl_xrd_tools`` use the
+This is the reason both ``xdart`` and ``xrd_tools`` use the
 ``__version__ = importlib.metadata.version(...)`` pattern in their
 package ``__init__``.
 """
@@ -49,8 +49,7 @@ if TYPE_CHECKING:  # pragma: no cover
 # Canonical list of packages whose versions we record on every write.
 # Order is preserved in the written `versions/` group for readability.
 CANONICAL_PACKAGES: tuple[str, ...] = (
-    "xdart",
-    "ssrl_xrd_tools",
+    "xrd-tools",
     "pyFAI",
     "h5py",
     "numpy",

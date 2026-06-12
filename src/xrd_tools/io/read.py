@@ -6,7 +6,7 @@ metadata out of a scan file with a single function call and no xarray
 knowledge required — the intent is "open a file, get arrays I can plot."
 
 For the full :class:`xarray.Dataset` (every frame, every motor column,
-provenance) use :func:`ssrl_xrd_tools.io.read_scan` /
+provenance) use :func:`xrd_tools.io.read_scan` /
 :func:`read_scan_metadata`.  These ``get_*`` helpers sit on top of the
 same v2 layout but slice **one frame at a time straight from h5py**, so
 ``get_2d(scan, frame=k)`` does not materialise the full
@@ -22,7 +22,7 @@ frame stacked.  Use :func:`get_frames` to see which labels exist.
 
 Examples
 --------
->>> from ssrl_xrd_tools.io import get_1d, get_2d, get_frames, open_scan
+>>> from xrd_tools.io import get_1d, get_2d, get_frames, open_scan
 >>> get_frames("scan_42.nxs")
 array([1, 2, 3, 4, 5])
 >>> r = get_1d("scan_42.nxs", frame=3)
@@ -80,7 +80,7 @@ def _entry(f: h5py.File, entry: str) -> h5py.Group:
     # C1: every convenience reader funnels through here -- warn once per call
     # when the file is NEWER than this library supports, before dataset access
     # fails with an opaque KeyError.
-    from ssrl_xrd_tools.io.nexus import warn_if_newer_schema
+    from xrd_tools.io.nexus import warn_if_newer_schema
     warn_if_newer_schema(grp, str(f.filename))
     return grp
 
@@ -449,7 +449,7 @@ def get_raw_frame(
     pointer via :func:`resolve_source_master` (N1: a relative ``path`` joins
     against ``source_root`` > the file's ``@source_base`` > the scan file's
     directory; an absolute ``path`` is used as-is) and reads the full-resolution
-    raw image via :func:`ssrl_xrd_tools.io.image.read_image`.  If the master
+    raw image via :func:`xrd_tools.io.image.read_image`.  If the master
     can't be located or read, it falls back to the stored thumbnail
     (dequantized) unless ``allow_thumbnail=False``.
 
@@ -461,7 +461,7 @@ def get_raw_frame(
     the other ``get_*`` readers.  Raises ``KeyError`` when neither a usable
     source pointer nor a thumbnail is present.
     """
-    from ssrl_xrd_tools.io.image import read_image
+    from xrd_tools.io.image import read_image
 
     scan_file = Path(scan_file)
     master: Path | None = None
@@ -526,7 +526,7 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
     """
     # Reuse the canonical metadata-only reader for axes / positioners /
     # provenance, then add the instrument/sample scalars it doesn't carry.
-    from ssrl_xrd_tools.io.nexus import (
+    from xrd_tools.io.nexus import (
         read_scan_metadata,
         _read_positioners,
         _read_energy,

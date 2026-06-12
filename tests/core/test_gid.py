@@ -1,12 +1,12 @@
-"""Tests for ssrl_xrd_tools.integrate.gid."""
+"""Tests for xrd_tools.integrate.gid."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.integrate.gid import (
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.integrate.gid import (
     create_fiber_integrator,
     freeze_common_axes_2d,
     freeze_common_axis,

@@ -147,7 +147,7 @@ geometry layer needs almost no new code — the presets are essentially done.**
 ### 2.5 Source enumeration (new) — `StitchSource`
 
 A thin interface so xdart doesn't reimplement scan-listing per format.
-Each backend wraps readers that mostly already exist in `ssrl_xrd_tools.io`.
+Each backend wraps readers that mostly already exist in `xrd_tools.io`.
 
 ```python
 class StitchSource(Protocol):

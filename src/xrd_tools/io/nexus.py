@@ -38,14 +38,14 @@ from typing import Any, Sequence
 import h5py
 import numpy as np
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.core.frame_view import two_d_kind_from_units
-from ssrl_xrd_tools.core.metadata import ScanMetadata
-from ssrl_xrd_tools.transforms import energy_to_wavelength
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.core.frame_view import two_d_kind_from_units
+from xrd_tools.core.metadata import ScanMetadata
+from xrd_tools.transforms import energy_to_wavelength
 
 logger = logging.getLogger(__name__)
 
-PROCESSED_SCHEMA_NAME = "ssrl_xrd_tools.processed_scan"
+PROCESSED_SCHEMA_NAME = "xrd_tools.processed_scan"
 PROCESSED_SCHEMA_VERSION = 2
 _UTF8_DTYPE = h5py.string_dtype(encoding="utf-8")
 
@@ -66,7 +66,7 @@ def warn_if_newer_schema(entry_grp, path="") -> None:
     if ver > PROCESSED_SCHEMA_VERSION:
         warnings.warn(
             f"{path or 'file'} has ssrl_schema_version={ver}, newer than the "
-            f"supported {PROCESSED_SCHEMA_VERSION} — upgrade ssrl_xrd_tools; "
+            f"supported {PROCESSED_SCHEMA_VERSION} — upgrade xrd_tools; "
             f"some datasets/features may be missing or misread.",
             RuntimeWarning, stacklevel=3,
         )
@@ -669,6 +669,9 @@ def write_nexus(
 
         proc = grp.require_group("reduction")
         proc.attrs["NX_class"] = "NXprocess"
+        # Persisted-format literal: files have always stamped this program
+        # name; keep it stable across the monorepo rename (readers and the
+        # 6a byte-compat gate rely on unchanged output).
         proc.attrs.setdefault("program", "ssrl_xrd_tools")
 
         # Stacked v2 layout (read_scan-compatible).  Iterate in ascending
@@ -802,6 +805,9 @@ def _open_nexus_writer_body(f, entry, metadata, compression):
 
     proc = grp.require_group("reduction")
     proc.attrs["NX_class"] = "NXprocess"
+    # Persisted-format literal: files have always stamped this program
+    # name; keep it stable across the monorepo rename (readers and the
+    # 6a byte-compat gate rely on unchanged output).
     proc.attrs.setdefault("program", "ssrl_xrd_tools")
 
     return f
@@ -2175,7 +2181,7 @@ def _read_scan_v2(path: Path, entry: str, groups: tuple[str, ...],
     """v2-schema reader.  Body of public ``read_scan``."""
     import xarray as xr
 
-    from ssrl_xrd_tools.core.provenance import read_provenance
+    from xrd_tools.core.provenance import read_provenance
 
     data_vars: dict[str, tuple] = {}
     coords: dict[str, np.ndarray] = {}
@@ -2384,7 +2390,7 @@ def read_scan_metadata(
     — opening a 10k-frame Eiger scan goes from ~seconds to ~tens of ms.
     """
     import xarray as xr
-    from ssrl_xrd_tools.core.provenance import read_provenance
+    from xrd_tools.core.provenance import read_provenance
 
     path = Path(path)
     data_vars: dict[str, tuple] = {}

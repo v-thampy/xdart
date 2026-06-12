@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.io.nexus — reader and writer."""
+"""Tests for xrd_tools.io.nexus — reader and writer."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import h5py
 
-from ssrl_xrd_tools.io.nexus import (
+from xrd_tools.io.nexus import (
     NexusImageStack,
     _require_uniform_axes_1d,
     _require_uniform_axes_2d,
@@ -20,8 +20,8 @@ from ssrl_xrd_tools.io.nexus import (
     write_nexus,
     write_nexus_frame,
 )
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.core.metadata import ScanMetadata
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.core.metadata import ScanMetadata
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +596,7 @@ class TestWriteNexus:
         with h5py.File(p, "r") as f:
             assert "reduction" in f["entry"]
             assert f["entry/reduction"].attrs["NX_class"] == "NXprocess"
-            assert f["entry/reduction"].attrs["program"] == "ssrl_xrd_tools"
+            assert f["entry/reduction"].attrs["program"] == "xrd_tools"
 
     def test_overwrite(self, tmp_path, result_1d):
         p = tmp_path / "over.h5"

@@ -32,13 +32,13 @@ from pyqtgraph import Qt
 
 # Project imports
 from xdart.modules.live import LiveFrame, LiveScan, IncidenceAngleUnresolved
-from ssrl_xrd_tools.integrate.gid import gi_1d_output_axis_key
-from ssrl_xrd_tools.integrate.calibration import poni_to_integrator, get_detector
-from ssrl_xrd_tools.reduction import GIFreezeError
-from ssrl_xrd_tools.io.image import read_image, count_frames
-from ssrl_xrd_tools.io.export import write_xye
-from ssrl_xrd_tools.io.nexus import find_nexus_image_dataset
-from ssrl_xrd_tools.io.metadata import read_image_metadata
+from xrd_tools.integrate.gid import gi_1d_output_axis_key
+from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
+from xrd_tools.reduction import GIFreezeError
+from xrd_tools.io.image import read_image, count_frames
+from xrd_tools.io.export import write_xye
+from xrd_tools.io.nexus import find_nexus_image_dataset
+from xrd_tools.io.metadata import read_image_metadata
 from xdart.utils import get_series_avg
 from xdart.utils.h5pool import get_pool as _get_h5pool
 from xdart.modules.reduction import (
@@ -213,7 +213,7 @@ def _gi_1d_output_range_key(gi_mode_1d):
     """Which integration range param controls the 1D *output* axis for a GI mode.
 
     Thin delegate to the canonical ssrl mapping
-    (:func:`ssrl_xrd_tools.integrate.gid.gi_1d_output_axis_key`): ``azimuth_range``
+    (:func:`xrd_tools.integrate.gid.gi_1d_output_axis_key`): ``azimuth_range``
     for q_oop/exit_angle (out-of-plane output), else ``radial_range``.  Freezing
     the wrong key leaves the output axis auto-ranging per incidence → a
     non-uniform stack the writer rejects."""
@@ -434,7 +434,7 @@ class imageThread(wranglerThread):
         self.meta_ext = meta_ext
         # Optional explicit SPEC search dir.  Set by the wrangler
         # widget (set_meta_dir / setup) — None / '' falls back to
-        # the ssrl_xrd_tools default heuristic.  Threaded through
+        # the xrd_tools default heuristic.  Threaded through
         # to every read_image_metadata call below.
         self.meta_dir = None
         self.file_filter = file_filter
@@ -942,7 +942,7 @@ class imageThread(wranglerThread):
         """Return bounded representative pending entries for freeze tests.
 
         Production no longer calls this pre-pass; GI common-grid freezing is
-        driven by :class:`ssrl_xrd_tools.reduction.ReductionSession` when the
+        driven by :class:`xrd_tools.reduction.ReductionSession` when the
         reduction session opens.  The method remains as a compatibility fixture
         for real-data tests that inspect scout selection directly.
         """
@@ -1704,7 +1704,7 @@ class imageThread(wranglerThread):
         """Batch processing through the headless reduction executor.
 
         Phase 1 — Parallel integration:
-            Build LiveFrame shells, then let ssrl_xrd_tools.run_reduction own
+            Build LiveFrame shells, then let xrd_tools.run_reduction own
             the per-frame ThreadPoolExecutor work.
 
         Phase 2 — Serial HDF5 write:

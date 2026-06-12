@@ -4,9 +4,9 @@ import h5py
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from ssrl_xrd_tools.core.scan import FrameGeometry
-from ssrl_xrd_tools.reduction import (
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.core.scan import FrameGeometry
+from xrd_tools.reduction import (
     Frame,
     GI1DMode,
     GI2DMode,
@@ -20,13 +20,13 @@ from ssrl_xrd_tools.reduction import (
     XYESink,
     run_reduction,
 )
-from ssrl_xrd_tools.io.frame_view import read_frame_view
-from ssrl_xrd_tools.io.nexus import (
+from xrd_tools.io.frame_view import read_frame_view
+from xrd_tools.io.nexus import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
 )
-from ssrl_xrd_tools.sources import MemoryFrameSource
-import ssrl_xrd_tools.reduction.core as reduction_core
+from xrd_tools.sources import MemoryFrameSource
+import xrd_tools.reduction.core as reduction_core
 
 
 def _r1d(value: float) -> IntegrationResult1D:

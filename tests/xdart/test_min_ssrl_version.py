@@ -15,10 +15,10 @@ def _pyproject_floor() -> str:
     data = tomllib.loads(
         (pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text())
     for dep in data["project"]["dependencies"]:
-        m = re.match(r"ssrl_xrd_tools\s*>=\s*([0-9][0-9.]*)", dep)
+        m = re.match(r"xrd_tools\s*>=\s*([0-9][0-9.]*)", dep)
         if m:
             return m.group(1)
-    raise AssertionError("no ssrl_xrd_tools floor in pyproject.toml")
+    raise AssertionError("no xrd_tools floor in pyproject.toml")
 
 
 def test_min_version_matches_pyproject_floor():

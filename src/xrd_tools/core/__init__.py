@@ -1,19 +1,19 @@
-"""Headless core contracts and containers for ``ssrl_xrd_tools``.
+"""Headless core contracts and containers for ``xrd_tools``.
 
 The public ``core`` namespace intentionally exposes one canonical input-side
-``FrameGeometry`` from :mod:`ssrl_xrd_tools.core.scan`.  The display/round-trip
+``FrameGeometry`` from :mod:`xrd_tools.core.scan`.  The display/round-trip
 geometry type used by :class:`FrameView` remains available as
 ``ViewFrameGeometry`` so callers never depend on import-order shadowing.
 """
 
 from __future__ import annotations
 
-from ssrl_xrd_tools.core.containers import (
+from xrd_tools.core.containers import (
     IntegrationResult1D,
     IntegrationResult2D,
     PONI,
 )
-from ssrl_xrd_tools.core.frame_view import (
+from xrd_tools.core.frame_view import (
     Axis,
     FrameGeometry as ViewFrameGeometry,
     FrameView,
@@ -22,7 +22,7 @@ from ssrl_xrd_tools.core.frame_view import (
     axis_from_unit,
     two_d_kind_from_units,
 )
-from ssrl_xrd_tools.core.hdf5 import (
+from xrd_tools.core.hdf5 import (
     arr_to_h5,
     attributes_to_h5,
     catch_h5py_file,
@@ -42,12 +42,12 @@ from ssrl_xrd_tools.core.hdf5 import (
     soft_list_eval,
     str_to_h5,
 )
-from ssrl_xrd_tools.core.metadata import (
+from xrd_tools.core.metadata import (
     HeterogeneousMetadata,
     ScanMetadata,
     numeric_metadata,
 )
-from ssrl_xrd_tools.core.scan import (
+from xrd_tools.core.scan import (
     Frame,
     FrameGeometry,
     FrameSource,

@@ -1,11 +1,11 @@
-"""Tests for ssrl_xrd_tools.analysis.strain (sin²ψ analysis)."""
+"""Tests for xrd_tools.analysis.strain (sin²ψ analysis)."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.analysis.strain import (
+from xrd_tools.analysis.strain import (
     ChiSector,
     PeakFitResult,
     Sin2PsiResult,
@@ -14,7 +14,7 @@ from ssrl_xrd_tools.analysis.strain import (
     sin2psi_regression,
     sin2psi_analysis,
 )
-from ssrl_xrd_tools.core.containers import IntegrationResult2D
+from xrd_tools.core.containers import IntegrationResult2D
 
 
 # ---------------------------------------------------------------------------

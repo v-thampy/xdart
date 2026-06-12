@@ -251,7 +251,7 @@ def written_nxs_with_geometry(tmp_path):
     bare ``written_nxs`` fixture doesn't touch.
     """
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
-    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    from xrd_tools.core.geometry import DiffractometerGeometry
 
     geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
 
@@ -941,7 +941,7 @@ def test_scan_data_grows_on_incremental_saves(tmp_path):
     frame count across per-frame saves — not freeze at the first save's
     length (live mode never passes finalize=True)."""
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
-    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    from xrd_tools.core.geometry import DiffractometerGeometry
     import h5py
 
     geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
@@ -1112,7 +1112,7 @@ def test_write_cursor_fast_path_reads_only_tail_labels():
 
 
 def test_same_scan_metadata_cursor_appends_new_tail(tmp_path):
-    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    from xrd_tools.core.geometry import DiffractometerGeometry
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     import h5py
 
@@ -1141,7 +1141,7 @@ def test_same_scan_metadata_cursor_appends_new_tail(tmp_path):
 
 
 def test_resume_missing_metadata_groups_rebuilds_full_history(tmp_path):
-    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    from xrd_tools.core.geometry import DiffractometerGeometry
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     import h5py
 
@@ -1636,7 +1636,7 @@ def test_scan_data_index_aligns_with_gapped_frame_ids(tmp_path):
     """
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     from xdart.modules.ewald.scan import LiveScan
-    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    from xrd_tools.core.geometry import DiffractometerGeometry
 
     gapped = [10, 12, 17, 22]
     geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
@@ -1717,7 +1717,7 @@ def test_positioners_align_to_frame_count_when_metadata_partial(tmp_path):
     """
     import h5py
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
-    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    from xrd_tools.core.geometry import DiffractometerGeometry
 
     geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
     frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]  # 4 integrated frames
@@ -1754,7 +1754,7 @@ def test_scan_data_survives_save_then_load_from_h5(tmp_path):
     """
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
     from xdart.modules.ewald.scan import LiveScan
-    from ssrl_xrd_tools.core.geometry import DiffractometerGeometry
+    from xrd_tools.core.geometry import DiffractometerGeometry
 
     geom = DiffractometerGeometry.two_circle(tth="tth", th="th")
     scan_data = pd.DataFrame({
@@ -1813,7 +1813,7 @@ def test_heterogeneous_scan_data_roundtrips_to_nexus(tmp_path):
     and numeric columns are unchanged."""
     import h5py
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
-    from ssrl_xrd_tools.io.read import get_metadata
+    from xrd_tools.io.read import get_metadata
 
     sd = pd.DataFrame(
         {"i0": [100.0, 101.0, 102.0], "keith_I": ["0V", "1V", "2V"]},
@@ -1855,7 +1855,7 @@ def test_gi_config_roundtrips_to_reduction_config(tmp_path):
     save_scan_to_nexus(scan, path, mode="w", finalize=True)
 
     # read_scan's metadata recovers it as a parsed, first-class field.
-    from ssrl_xrd_tools.io.read import get_metadata
+    from xrd_tools.io.read import get_metadata
     gi = get_metadata(path)["reduction"]["config"]["gi_config"]
     assert gi["gi_mode_1d"] == "q_oop"
     assert gi["gi_mode_2d"] == "qip_qoop"
@@ -1865,7 +1865,7 @@ def test_gi_freeze_diagnostic_persisted_in_provenance(tmp_path):
     # Codex P2: the T0-4 first-chunk-freeze advisory must survive in the
     # output file's reduction provenance, not just as a transient GUI label.
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
-    from ssrl_xrd_tools.io.nexus import read_scan_metadata
+    from xrd_tools.io.nexus import read_scan_metadata
 
     scan = _DuckSphere([_DuckArch(idx=0)])
     scan.gi_freeze_diagnostic = (
@@ -1917,7 +1917,7 @@ def test_gi_freeze_diagnostic_persists_on_later_save(tmp_path):
     # diagnostic, and the GUI never passes finalize=True -- the cursor-deduped
     # re-fire must persist it on a later periodic save.
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
-    from ssrl_xrd_tools.io.nexus import read_scan_metadata
+    from xrd_tools.io.nexus import read_scan_metadata
 
     scan = _DuckSphere([_DuckArch(idx=0)])
     path = tmp_path / "gi_diag_late.nxs"

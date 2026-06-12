@@ -1,4 +1,4 @@
-"""Tests for ssrl_xrd_tools.analysis.fitting.phase_fitting.
+"""Tests for xrd_tools.analysis.fitting.phase_fitting.
 
 Uses synthetic two-phase data (FCC Au + FCC Cu) generated from known
 lattice parameters and pseudo-Voigt profiles.  The fitter should recover
@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from ssrl_xrd_tools.analysis.fitting.phase_fitting import (
+from xrd_tools.analysis.fitting.phase_fitting import (
     PhaseFitter,
     MultiPhaseResult,
     _metric_tensor,
@@ -17,8 +17,8 @@ from ssrl_xrd_tools.analysis.fitting.phase_fitting import (
     _pseudo_voigt,
     _caglioti_sigma,
 )
-from ssrl_xrd_tools.analysis.fitting.background import snip_1d
-from ssrl_xrd_tools.analysis.phase import PhaseModel, PeakData
+from xrd_tools.analysis.fitting.background import snip_1d
+from xrd_tools.analysis.phase import PhaseModel, PeakData
 
 
 # ---------------------------------------------------------------------------

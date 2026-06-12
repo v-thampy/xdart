@@ -1,4 +1,4 @@
-# ssrl_xrd_tools/integrate/single.py
+# xrd_tools/integrate/single.py
 """
 Single-image and scan-level azimuthal integration via pyFAI.
 """
@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 
 if TYPE_CHECKING:
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
