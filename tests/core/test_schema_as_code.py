@@ -85,3 +85,45 @@ def test_drop_integrated_rows_slices_only_schema_row_set(tmp_path):
         assert g["sigma"].shape == (2, 5)
         assert g["q"].shape == (5,)              # shared axis untouched
         assert g["not_per_frame"].shape == (3,)  # not declared -> not sliced
+
+
+# ── 2a: full DatasetSpec declarations ────────────────────────────────────────
+
+def test_dataset_specs_agree_with_legacy_row_sets():
+    """The per-dataset declarations and the legacy fast sets must say the
+    same thing — one source of truth, two views."""
+    for gname, g in SCHEMA.groups.items():
+        declared_rows = {n for n, d in g.datasets.items() if d.row_aligned}
+        assert declared_rows == set(g.row_aligned), gname
+        # every axis is declared, non-row, role="axis"
+        for ax in g.axes:
+            spec = g.datasets[ax]
+            assert spec.role == "axis" and not spec.row_aligned, (gname, ax)
+
+
+def test_dataset_spec_facts_are_frozen():
+    """Persisted facts: names, dtypes, required-ness of the integrated
+    stacks.  Changing any of these breaks files already on disk."""
+    g1 = SCHEMA.groups["integrated_1d"].datasets
+    g2 = SCHEMA.groups["integrated_2d"].datasets
+    assert set(g1) == {"intensity", "q", "frame_index", "sigma"}
+    assert set(g2) == {"intensity", "q", "chi", "frame_index", "sigma"}
+    for g in (g1, g2):
+        assert g["intensity"].dtype == "float32" and g["intensity"].compressed
+        assert g["frame_index"].dtype == "int64"
+        assert not g["sigma"].required          # optional on disk
+        assert g["sigma"].compressed
+    assert g1["q"].units_from == "radial_unit"
+    assert g2["chi"].units_from == "azimuthal_unit"
+    geo = SCHEMA.groups["per_frame_geometry"].datasets
+    assert geo["incident_angle"].units_from == "deg"
+    assert all(geo[k].units_from == "rad" for k in ("rot1", "rot2", "rot3"))
+
+
+def test_group_nx_attrs_declared():
+    assert SCHEMA.groups["integrated_1d"].nx_attrs["axes"] == (
+        "frame_index", "q")
+    assert SCHEMA.groups["integrated_2d"].nx_attrs["axes"] == (
+        "frame_index", "chi", "q")
+    assert SCHEMA.groups["per_frame_geometry"].nx_attrs["NX_class"] == (
+        "NXcollection")
