@@ -186,7 +186,7 @@ class Main(QMainWindow):
             logger.exception("Error opening file")
 
 
-def main():
+def run():
     check_ssrl_version()
     app = QtWidgets.QApplication(sys.argv)
     # N8: apply dark theme before any widget construction so
@@ -202,5 +202,8 @@ def main():
     app.exec()
 
 
+main = run   # back-compat alias
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run())
