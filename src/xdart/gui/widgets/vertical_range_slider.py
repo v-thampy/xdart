@@ -43,6 +43,5 @@ if __name__ == '__main__':
     app = QtGui.QApplication(sys.argv)
     test = Test()
     test.show()
-    print("at exec")
     app.exec()
 

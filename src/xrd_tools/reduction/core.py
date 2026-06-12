@@ -660,6 +660,12 @@ class ReductionSession:
     _plan_masks: dict[tuple[int, int], np.ndarray | None] = field(
         default_factory=dict, init=False, repr=False,
     )
+    # S8: per-SCAN monitor warn-once state (shared with pool workers like
+    # _plan_masks; set.add is GIL-atomic).  Session-owned so a dead monitor
+    # warns again on the next scan and concurrent sessions don't cross-talk.
+    _warned_monitor_keys: set[str] = field(
+        default_factory=set, init=False, repr=False,
+    )
     _products: dict[int, FrameReduction] = field(default_factory=dict, init=False, repr=False)
     _seen_idxs: set[int] = field(default_factory=set, init=False, repr=False)
     _completed: int = field(default=0, init=False, repr=False)
@@ -720,10 +726,6 @@ class ReductionSession:
             initial_incident_angle=self._initial_incident_angle,
         )
         self.integrator_provider_builds = 1
-        # S8: the monitor warn-once set is per-process; without this reset a
-        # dead monitor in scan 1 silences the warning for every later scan in
-        # a long GUI session.  Per-session scope = once per run.
-        _warned_monitor_keys.clear()
         # Validate BEFORE acquiring resources: sink.begin() opens an h5 handle
         # (atomic NexusSink also creates its hidden .tmp) and _coerce_executor
         # may build an owned pool — a ValueError after those leaks both, with
@@ -914,7 +916,7 @@ class ReductionSession:
         """
         reduction = _reduce_frame(
             frame, image, self.plan, self._integrators, self._plan_masks,
-            self.cancel_token,
+            self.cancel_token, self._warned_monitor_keys,
         )
         worker_process = getattr(self._sink, "worker_process", None)
         if callable(worker_process):
@@ -1171,6 +1173,7 @@ class ReductionSession:
             freeze_policy=freeze_policy,
             fi=None,
             initial_incident_angle=self._initial_incident_angle,
+            warned_monitor_keys=self._warned_monitor_keys,
         )
         self._gi_freeze_applied = True
 
@@ -1269,6 +1272,7 @@ class ReductionSession:
                         self._integrators,
                         self._plan_masks,
                         cancel_token=self.cancel_token,
+                        warned_monitor_keys=self._warned_monitor_keys,
                     )
                 except _ReductionCancelled:
                     self._cancelled = True
@@ -1291,6 +1295,7 @@ class ReductionSession:
                         # recomputes the identical array, so sharing is safe.
                         self._plan_masks,
                         self.cancel_token,
+                        self._warned_monitor_keys,
                     ),
                 ))
 
@@ -1469,6 +1474,7 @@ def _apply_gi_freeze_policy(
     freeze_policy: str | None,
     fi: Any,
     initial_incident_angle: float | None,
+    warned_monitor_keys: set[str] | None = None,
 ) -> ReductionPlan:
     """Return a copy of *plan* with missing GI output ranges frozen.
 
@@ -1504,7 +1510,8 @@ def _apply_gi_freeze_policy(
     for idx in scout_indices:
         frame = scan._frame_by_index[int(idx)]
         was_empty = frame.image is None
-        reduction = _reduce_frame(frame, None, plan, scout_integrators, masks)
+        reduction = _reduce_frame(frame, None, plan, scout_integrators, masks,
+                                  warned_monitor_keys=warned_monitor_keys)
         if reduction.result_1d is not None:
             scout_results_1d.append(reduction.result_1d)
         if reduction.result_2d is not None:
@@ -1757,6 +1764,7 @@ def _reduce_frame(
     integrators: _ReductionIntegratorProvider,
     plan_masks: dict[tuple[int, int], np.ndarray | None],
     cancel_token: CancelToken | None = None,
+    warned_monitor_keys: set[str] | None = None,
 ) -> FrameReduction:
     if cancel_token is not None and cancel_token.cancelled:
         raise _ReductionCancelled
@@ -1789,7 +1797,8 @@ def _reduce_frame(
                 plan.gi,
                 mask=mask,
                 incident_angle=incident_angle,
-                normalization_factor=_normalization_for(frame, plan.integration_1d),
+                normalization_factor=_normalization_for(
+                    frame, plan.integration_1d, warned_monitor_keys),
             )
             if plan.integration_1d is not None else None
         )
@@ -1801,7 +1810,8 @@ def _reduce_frame(
                 plan.gi,
                 mask=mask,
                 incident_angle=incident_angle,
-                normalization_factor=_normalization_for(frame, plan.integration_2d),
+                normalization_factor=_normalization_for(
+                    frame, plan.integration_2d, warned_monitor_keys),
             )
             if plan.integration_2d is not None else None
         )
@@ -1819,7 +1829,8 @@ def _reduce_frame(
                 azimuth_range=plan.integration_1d.azimuth_range,
                 error_model=plan.integration_1d.error_model,
                 polarization_factor=plan.integration_1d.polarization_factor,
-                normalization_factor=_normalization_for(frame, plan.integration_1d),
+                normalization_factor=_normalization_for(
+                    frame, plan.integration_1d, warned_monitor_keys),
                 **plan.integration_1d.extra,
             )
             if plan.integration_1d is not None else None
@@ -1837,7 +1848,8 @@ def _reduce_frame(
                 azimuth_range=_integration_azimuth_range(plan.integration_2d),
                 error_model=plan.integration_2d.error_model,
                 polarization_factor=plan.integration_2d.polarization_factor,
-                normalization_factor=_normalization_for(frame, plan.integration_2d),
+                normalization_factor=_normalization_for(
+                    frame, plan.integration_2d, warned_monitor_keys),
                 **plan.integration_2d.extra,
             )
             if plan.integration_2d is not None else None
@@ -2148,14 +2160,17 @@ def _combined_mask(
     return plan_mask | frame_mask
 
 
-# S8: monitor keys already warned about (once per key per process) — a bad
-# monitor means frames are written UN-normalized, which must not be silent.
+# S8: fallback warn-state for direct (sessionless) calls.  Sessions own
+# their per-scan set — see ReductionSession._warned_monitor_keys — so a dead
+# monitor warns once per SCAN, not once per process.  A bad monitor means
+# frames are written UN-normalized, which must not be silent.
 _warned_monitor_keys: set[str] = set()
 
 
 def _normalization_for(
     frame: Frame,
     plan: Integration1DPlan | Integration2DPlan,
+    warned_keys: set[str] | None = None,
 ) -> float | None:
     if frame.normalization_factor is not None:
         return float(frame.normalization_factor)
@@ -2173,14 +2188,19 @@ def _normalization_for(
         if norm is not None and np.isfinite(norm) and norm != 0:
             return norm
         # S8: the monitor was configured but unusable — the frame is about to
-        # be written UN-normalized.  Warn once per monitor key (not per frame:
-        # a dead monitor on a 10k-frame scan must not emit 10k warnings).
-        if key not in _warned_monitor_keys:
-            _warned_monitor_keys.add(key)
+        # be written UN-normalized.  Warn once per monitor key per scan (not
+        # per frame: a dead monitor on a 10k-frame scan must not emit 10k
+        # warnings; per scan, not per process: the next scan's dead monitor
+        # must not be silenced by this one's).  set.add is GIL-atomic; a
+        # racing double-warn from two workers is harmless.
+        warned = _warned_monitor_keys if warned_keys is None else warned_keys
+        if key not in warned:
+            warned.add(key)
             warnings.warn(
                 f"monitor {key!r} is missing/zero/non-finite on frame "
                 f"{frame.index} (value={value!r}); affected frames are "
-                f"written UN-normalized.  (Warned once per monitor key.)",
+                f"written UN-normalized.  (Warned once per monitor key "
+                f"per scan.)",
                 RuntimeWarning, stacklevel=2,
             )
     return None

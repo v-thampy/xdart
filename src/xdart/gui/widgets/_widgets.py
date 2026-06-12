@@ -178,7 +178,7 @@ class defaultWidget(Qt.QtWidgets.QWidget):
                 try:
                     self.set_defaults(param, valdict[key])
                 except KeyError:
-                    print(f"Key Error in load_default, key: {key}")
+                    logger.warning("load_default: no saved defaults for key %r", key)
         if emit:
             self.sigSetUserDefaults.emit()
     

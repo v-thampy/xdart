@@ -118,6 +118,33 @@ def test_missing_monitor_warns_once_per_key():
         assert reduction_core._normalization_for(Frame(1), plan) is None
 
 
+def test_dead_monitor_warns_again_on_a_new_scan(monkeypatch):
+    """S8 granularity (6e): the warn-once state is per SCAN (session-owned),
+    so a dead monitor on scan 2 is NOT silenced by scan 1's warning — and a
+    second frame within the SAME scan stays silent."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    plan = ReductionPlan(integration_2d=None)
+    plan.integration_1d.monitor_key = "mon_s8_per_scan"
+
+    def _run(name):
+        session = ReductionSession(
+            plan, Scan(name, _frames(2), integrator=object()),
+            sink=MemorySink(), execution="streaming",
+        )
+        for fr in session.scan.frames:
+            session.submit(fr)
+        return session
+
+    with pytest.warns(RuntimeWarning, match="UN-normalized") as rec:
+        _run("scan-1").finish()
+    assert len([w for w in rec if "mon_s8_per_scan" in str(w.message)]) == 1
+
+    # Same dead monitor, NEW scan: warns again (per-scan, not per-process).
+    with pytest.warns(RuntimeWarning, match="UN-normalized"):
+        _run("scan-2").finish()
+
+
 def test_zero_monitor_warns_and_valid_monitor_does_not():
     plan = SimpleNamespace(monitor_key="mon_s8_zero")
     with pytest.warns(RuntimeWarning, match="UN-normalized"):

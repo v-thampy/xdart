@@ -4,10 +4,13 @@
 """
 
 # Standard library imports
+import logging
 import traceback
 
 # Other imports
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 #Qt Imports
 from PySide6 import QtWidgets
@@ -106,7 +109,9 @@ class MaskWidget(QtWidgets.QWidget):
                 index = int(self.ui.frameList.currentText())
                 self._send_and_set(index)
             except ValueError:
-                print("Invalid index encountered while trying to emit local mask.")
+                logger.warning(
+                    "Invalid index encountered while trying to emit local mask."
+                )
 
     def _send_and_set(self, index):
         self.newMask.emit(index, self.mask)

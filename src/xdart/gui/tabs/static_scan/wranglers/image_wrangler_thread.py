@@ -934,17 +934,21 @@ class imageThread(wranglerThread):
     # in May 2026 — both imageThread and nexusThread inherit them now.
     # See xdart/gui/tabs/static_scan/wranglers/wrangler_widget.py.
 
-    # RESTRUCTURE-TODO(B2): _scout_pending_frames / _build_scout /
-    # _freeze_gi_1d_auto_range / _freeze_gi_2d_auto_ranges are test-only scout
-    # fixtures (see the cluster note near _padded_axis_range) -- relocate to a
-    # tests/ helper module with the GI-equivalence test refactor.
+    # GI-scout cluster: LIVE PRODUCTION CODE (see the authoritative cluster
+    # note near _padded_axis_range).  _freeze_gi_1d_auto_range /
+    # _freeze_gi_2d_auto_ranges run in the streaming batch prepass
+    # (_dispatch_batch_streaming); _scout_pending_frames / _build_scout are
+    # their selection/build helpers, also exercised directly by the
+    # GI-equivalence tests.
     def _scout_pending_frames(self, pending):
-        """Return bounded representative pending entries for freeze tests.
+        """Return bounded representative pending entries for the GI freeze.
 
-        Production no longer calls this pre-pass; GI common-grid freezing is
-        driven by :class:`xrd_tools.reduction.ReductionSession` when the
-        reduction session opens.  The method remains as a compatibility fixture
-        for real-data tests that inspect scout selection directly.
+        Selection helper for :meth:`_freeze_gi_1d_auto_range` /
+        :meth:`_freeze_gi_2d_auto_ranges` (the streaming batch prepass —
+        live production code; see the cluster note near
+        ``_padded_axis_range``).  ssrl's ReductionSession has its own
+        first-chunk freeze for the serial/chunked paths.  Real-data tests
+        also inspect this selection directly.
         """
         if len(pending) <= 1:
             return list(pending)
