@@ -41,12 +41,22 @@ import numpy as np
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.frame_view import two_d_kind_from_units
 from xrd_tools.core.metadata import ScanMetadata
+# Layout facts (stamp attrs, version, capability attrs) are declared once in
+# xrd_tools.io.schema; this module is a consumer.  PROCESSED_SCHEMA_NAME /
+# _VERSION stay importable from here (public API since the C1 pull-ins).
+from xrd_tools.io.schema import (
+    DTYPE_ATTR,
+    MONOTONIC_ATTR,
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
+    SCHEMA,
+    SCHEMA_NAME_ATTR,
+    SCHEMA_VERSION_ATTR,
+)
 from xrd_tools.transforms import energy_to_wavelength
 
 logger = logging.getLogger(__name__)
 
-PROCESSED_SCHEMA_NAME = "xrd_tools.processed_scan"
-PROCESSED_SCHEMA_VERSION = 2
 _UTF8_DTYPE = h5py.string_dtype(encoding="utf-8")
 
 
@@ -60,7 +70,7 @@ def warn_if_newer_schema(entry_grp, path="") -> None:
     (back-compat); only a newer stamp warns."""
     try:
         ver = int(entry_grp.attrs.get(
-            "ssrl_schema_version", PROCESSED_SCHEMA_VERSION))
+            SCHEMA_VERSION_ATTR, PROCESSED_SCHEMA_VERSION))
     except (TypeError, ValueError):
         return
     if ver > PROCESSED_SCHEMA_VERSION:
@@ -939,7 +949,7 @@ def _append_stacked_1d(
         qd.attrs["units"] = r.unit
         g.create_dataset("frame_index", data=np.asarray([idx], dtype=np.int64),
                          maxshape=(None,), chunks=(64,))
-        g.attrs["_frame_index_strictly_increasing"] = True
+        g.attrs[MONOTONIC_ATTR] = True
         if r.sigma is not None:
             g.create_dataset("sigma", data=np.asarray(r.sigma, dtype=np.float32)[None, :],
                              maxshape=(None, n_q), chunks=(1, n_q), **comp_kwargs)
@@ -965,7 +975,7 @@ def _append_stacked_1d(
         )
     fi = g["frame_index"]
     n = di.shape[0]
-    monotonic = bool(g.attrs.get("_frame_index_strictly_increasing", False))
+    monotonic = bool(g.attrs.get(MONOTONIC_ATTR, False))
     last_idx = int(fi[n - 1]) if n else None
     match = (
         np.empty(0, dtype=int)
@@ -981,7 +991,7 @@ def _append_stacked_1d(
     di[n] = intensity
     fi.resize(n + 1, axis=0)
     fi[n] = idx
-    g.attrs["_frame_index_strictly_increasing"] = (
+    g.attrs[MONOTONIC_ATTR] = (
         monotonic and (last_idx is None or idx > last_idx)
     )
     _append_sigma_row(g, n, (None if r.sigma is None
@@ -1089,7 +1099,7 @@ def _append_stacked_2d(
         cd.attrs["units"] = r.azimuthal_unit
         g.create_dataset("frame_index", data=np.asarray([idx], dtype=np.int64),
                          maxshape=(None,), chunks=(64,))
-        g.attrs["_frame_index_strictly_increasing"] = True
+        g.attrs[MONOTONIC_ATTR] = True
         if r.sigma is not None:
             g.create_dataset("sigma",
                              data=np.asarray(r.sigma, dtype=np.float32).T[None],
@@ -1115,7 +1125,7 @@ def _append_stacked_2d(
         )
     fi = g["frame_index"]
     n = di.shape[0]
-    monotonic = bool(g.attrs.get("_frame_index_strictly_increasing", False))
+    monotonic = bool(g.attrs.get(MONOTONIC_ATTR, False))
     last_idx = int(fi[n - 1]) if n else None
     match = (
         np.empty(0, dtype=int)
@@ -1131,7 +1141,7 @@ def _append_stacked_2d(
     di[n] = intensity
     fi.resize(n + 1, axis=0)
     fi[n] = idx
-    g.attrs["_frame_index_strictly_increasing"] = (
+    g.attrs[MONOTONIC_ATTR] = (
         monotonic and (last_idx is None or idx > last_idx)
     )
     _append_sigma_row(g, n, (None if r.sigma is None
@@ -1183,32 +1193,34 @@ def _axes_match_1d(g, r0) -> bool:
     Lets a same-bin-count reintegration upsert in place (axes unchanged)
     vs. rebuild (e.g. q_A^-1→2th_deg, or a different radial range at the
     same npt).  Missing q dataset → treated as a match."""
-    if "q" not in g:
+    (q_name,) = SCHEMA.groups["integrated_1d"].axes
+    if q_name not in g:
         return True
-    q = np.asarray(g["q"][()])
+    q = np.asarray(g[q_name][()])
     new_q = np.asarray(r0.radial, np.float32)
     if q.shape != new_q.shape or not np.allclose(q, new_q, rtol=1e-5, atol=1e-8):
         return False
-    return _v2_decode_str(g["q"].attrs.get("units", "")) == (r0.unit or "")
+    return _v2_decode_str(g[q_name].attrs.get("units", "")) == (r0.unit or "")
 
 
 def _axes_match_2d(g, r0) -> bool:
     """True if the on-disk integrated_2d q + chi axes + units match ``r0``."""
+    q_name, chi_name = SCHEMA.groups["integrated_2d"].axes
     new_q = np.asarray(r0.radial, np.float32)
     new_chi = np.asarray(r0.azimuthal, np.float32)
-    if "q" in g:
-        q = np.asarray(g["q"][()])
+    if q_name in g:
+        q = np.asarray(g[q_name][()])
         if q.shape != new_q.shape or not np.allclose(q, new_q, rtol=1e-5, atol=1e-8):
             return False
-        if _v2_decode_str(g["q"].attrs.get("units", "")) != (r0.unit or ""):
+        if _v2_decode_str(g[q_name].attrs.get("units", "")) != (r0.unit or ""):
             return False
-    if "chi" in g:
-        chi = np.asarray(g["chi"][()])
+    if chi_name in g:
+        chi = np.asarray(g[chi_name][()])
         if chi.shape != new_chi.shape or not np.allclose(
             chi, new_chi, rtol=1e-5, atol=1e-8
         ):
             return False
-        if _v2_decode_str(g["chi"].attrs.get("units", "")) != (
+        if _v2_decode_str(g[chi_name].attrs.get("units", "")) != (
             getattr(r0, "azimuthal_unit", "") or ""
         ):
             return False
@@ -1327,7 +1339,7 @@ def write_integrated_stack(
         qd.attrs["units"] = r0.unit
         g.create_dataset("frame_index", data=np.asarray(fis, np.int64),
                          maxshape=(None,), chunks=(64,))
-        g.attrs["_frame_index_strictly_increasing"] = bool(
+        g.attrs[MONOTONIC_ATTR] = bool(
             len(fis) < 2 or np.all(np.diff(fis) > 0)
         )
         # Write sigma if ANY frame has it (NaN-pad the frames that don't) —
@@ -1362,7 +1374,7 @@ def write_integrated_stack(
         cd.attrs["units"] = r0.azimuthal_unit
         g.create_dataset("frame_index", data=np.asarray(fis, np.int64),
                          maxshape=(None,), chunks=(64,))
-        g.attrs["_frame_index_strictly_increasing"] = bool(
+        g.attrs[MONOTONIC_ATTR] = bool(
             len(fis) < 2 or np.all(np.diff(fis) > 0)
         )
         # Sigma if ANY frame has it (NaN-pad the rest) — see _bulk_create_1d.
@@ -1523,7 +1535,7 @@ def write_positioners(
         parent.attrs["NX_class"] = nx_class
         coll = parent.create_group("positioners")
         coll.attrs["NX_class"] = "NXcollection"
-        coll.attrs["_frame_index_strictly_increasing"] = bool(
+        coll.attrs[MONOTONIC_ATTR] = bool(
             len(fis) < 2 or np.all(np.diff(fis) > 0)
         )
         coll.create_dataset(
@@ -1607,7 +1619,7 @@ def write_per_frame_geometry(
     ck = _comp_kwargs(compression)
     g = entry_grp.create_group("per_frame_geometry")
     g.attrs["NX_class"] = "NXcollection"
-    g.attrs["_frame_index_strictly_increasing"] = bool(
+    g.attrs[MONOTONIC_ATTR] = bool(
         len(frame_idx_arr) < 2 or np.all(np.diff(frame_idx_arr) > 0)
     )
     g.create_dataset("frame_index", data=frame_idx_arr, maxshape=(None,), chunks=(64,))
@@ -1657,7 +1669,7 @@ def write_scan_metadata(
     ck = _comp_kwargs(compression)
     g = entry_grp.create_group("scan_data")
     g.attrs["NX_class"] = "NXcollection"
-    g.attrs["_frame_index_strictly_increasing"] = bool(
+    g.attrs[MONOTONIC_ATTR] = bool(
         len(fis) < 2 or np.all(np.diff(fis) > 0)
     )
     g.create_dataset(
@@ -1674,7 +1686,7 @@ def write_scan_metadata(
             maxshape=(None,),
             chunks=(64,),
             **create_kwargs,
-            **({} if attrs["ssrl_dtype"] == "string" else ck),
+            **({} if attrs[DTYPE_ATTR] == "string" else ck),
         )
         ds.attrs.update(attrs)
 
@@ -1713,7 +1725,7 @@ def _upsert_indexed_group(
             raise ValueError(f"{group.name}/{col} is not appendable")
     n = int(labels_ds.shape[0])
     last_label = int(labels_ds[n - 1]) if n else None
-    monotonic = bool(group.attrs.get("_frame_index_strictly_increasing", False))
+    monotonic = bool(group.attrs.get(MONOTONIC_ATTR, False))
     if (fis and monotonic and _strictly_increasing(fis)
             and (last_label is None or fis[0] > last_label)):
         labels_ds.resize((n + len(fis),))
@@ -1741,7 +1753,7 @@ def _upsert_indexed_group(
         else:
             for col, arr in values.items():
                 group[col][row] = arr[label_pos]
-    group.attrs["_frame_index_strictly_increasing"] = bool(
+    group.attrs[MONOTONIC_ATTR] = bool(
         _strictly_increasing(list(row_of))
     )
 
@@ -1751,8 +1763,8 @@ def _strictly_increasing(labels: Sequence[int]) -> bool:
 
 
 def _stamp_processed_schema(entry_grp: h5py.Group) -> None:
-    entry_grp.attrs["ssrl_schema"] = PROCESSED_SCHEMA_NAME
-    entry_grp.attrs["ssrl_schema_version"] = PROCESSED_SCHEMA_VERSION
+    entry_grp.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+    entry_grp.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
 
 
 def _stringify_scan_value(value: Any) -> str:
@@ -1775,13 +1787,13 @@ def _scan_data_column_payload(values: Any) -> tuple[np.ndarray, dict[str, Any], 
     except (TypeError, ValueError):
         arr = np.asarray([_stringify_scan_value(v) for v in values], dtype=object)
         return arr, {"dtype": _UTF8_DTYPE}, {
-            "ssrl_dtype": "string",
+            DTYPE_ATTR: "string",
             "description": "Per-frame scan metadata column",
             "missing_value": "",
             "encoding": "utf-8",
         }
     return arr, {}, {
-        "ssrl_dtype": "float32",
+        DTYPE_ATTR: "float32",
         "description": "Per-frame scan metadata column",
     }
 
@@ -1891,7 +1903,7 @@ def upsert_positioners(
                 raise ValueError(f"{ds.name} is not appendable")
         n = int(labels_ds.shape[0])
         last_label = int(labels_ds[n - 1]) if n else None
-        monotonic = bool(coll.attrs.get("_frame_index_strictly_increasing", False))
+        monotonic = bool(coll.attrs.get(MONOTONIC_ATTR, False))
         if (fis and monotonic and _strictly_increasing(fis)
                 and (last_label is None or fis[0] > last_label)):
             labels_ds.resize((n + len(fis),))
@@ -1919,7 +1931,7 @@ def upsert_positioners(
             else:
                 for name, arr in values.items():
                     flat[name][row] = arr[pos]
-        coll.attrs["_frame_index_strictly_increasing"] = bool(
+        coll.attrs[MONOTONIC_ATTR] = bool(
             _strictly_increasing(list(row_of))
         )
 

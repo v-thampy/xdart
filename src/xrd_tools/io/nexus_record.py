@@ -34,6 +34,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+from xrd_tools.io.schema import INTEGRATED_ROW_ALIGNED, SOURCE_BASE_ATTR
+
 logger = logging.getLogger(__name__)
 
 #: default maximum thumbnail edge, matches the GUI's preview budget
@@ -132,7 +134,7 @@ def stamp_source_base(entry_grp: h5py.Group, source_base) -> str | None:
         return None
     base = os.path.abspath(os.path.expanduser(str(source_base)))
     posix_base = Path(base).as_posix()
-    existing = entry_grp.attrs.get("source_base")
+    existing = entry_grp.attrs.get(SOURCE_BASE_ATTR)
     if existing is not None:
         if isinstance(existing, bytes):
             existing = existing.decode("utf-8", errors="replace")
@@ -145,7 +147,7 @@ def stamp_source_base(entry_grp: h5py.Group, source_base) -> str | None:
                 f"file for the new Project Folder."
             )
     try:
-        entry_grp.attrs["source_base"] = posix_base
+        entry_grp.attrs[SOURCE_BASE_ATTR] = posix_base
     except Exception as exc:
         raise RuntimeError(
             f"failed to stamp @source_base={posix_base!r} on "
@@ -250,9 +252,8 @@ def drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
         if not isinstance(obj, h5py.Dataset):
             continue
         data = obj[()]
-        row_aligned = data.shape[:1] == labels.shape and key in {
-            "frame_index", "intensity", "sigma",
-        }
+        row_aligned = (data.shape[:1] == labels.shape
+                       and key in INTEGRATED_ROW_ALIGNED)
         if row_aligned:
             data = data[keep_mask]
         datasets.append((

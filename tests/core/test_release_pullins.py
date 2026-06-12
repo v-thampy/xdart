@@ -51,6 +51,40 @@ def test_newer_schema_warns_in_all_readers(tmp_path):
             pass
 
 
+def test_newer_schema_warns_in_convenience_readers(tmp_path):
+    """6b: get_frames/get_1d/get_2d/get_thumbnail funnel through the C1
+    check too (file built with the real writers, then stamped newer)."""
+    from xrd_tools.core.containers import IntegrationResult2D
+    from xrd_tools.io import (
+        get_1d, get_2d, get_frames, get_thumbnail, write_integrated_stack,
+    )
+    from xrd_tools.io.nexus_record import (
+        ensure_frames_container, write_frame_record,
+    )
+
+    p = tmp_path / "newer.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        write_integrated_stack(
+            e, frame_indices=[0],
+            results_1d=[IntegrationResult1D(
+                radial=np.linspace(0.1, 1.0, 5), intensity=np.ones(5),
+                sigma=None, unit="q_A^-1")],
+            results_2d=[IntegrationResult2D(
+                radial=np.linspace(0.1, 1.0, 4),
+                azimuthal=np.linspace(-90.0, 90.0, 3),
+                intensity=np.ones((4, 3)), unit="q_A^-1")],
+        )
+        write_frame_record(ensure_frames_container(e), "frame_0000",
+                           thumbnail=np.ones((4, 4)))
+        e.attrs["ssrl_schema_version"] = PROCESSED_SCHEMA_VERSION + 1
+
+    for reader in (lambda: get_frames(p), lambda: get_1d(p, 0),
+                   lambda: get_2d(p, 0), lambda: get_thumbnail(p, 0)):
+        with pytest.warns(RuntimeWarning, match="newer"):
+            reader()
+
+
 @pytest.mark.parametrize("version", [None, PROCESSED_SCHEMA_VERSION, 1])
 def test_current_or_older_schema_is_silent(tmp_path, version):
     p = _entry_file(tmp_path, version)

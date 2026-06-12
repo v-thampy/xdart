@@ -29,6 +29,10 @@ from xrd_tools.io.export import (
     write_h5,
     write_xye,
 )
+from xrd_tools.io.schema import (
+    PROCESSED_SCHEMA_VERSION,
+    SCHEMA,
+)
 from xrd_tools.io.nexus import (
     find_nexus_image_dataset,
     list_entries,
