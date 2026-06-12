@@ -40,6 +40,7 @@ dependencies = [
     # path / qt plugin issue); cap to <2025.12 until fixed upstream.
     # Confirmed 2025.3-2025.11 work.
     "pyFAI>=2025.3,<2025.12",
+    "pyyaml",            # core/hdf5.py imports yaml directly
     "joblib",
     "natsort",
     "matplotlib",        # viz.mpl (consider lazy viz import later)
@@ -58,7 +59,6 @@ gui = [
     "qtawesome",
     "imagecodecs",
     "imageio",
-    "pyyaml",
 ]
 notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "jupyterlab"]
 all = ["xrd-tools[fitting,rsm,gui,notebook]"]
