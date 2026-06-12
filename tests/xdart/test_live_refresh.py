@@ -3734,28 +3734,89 @@ def test_thumbnail_image_update_skips_full_detector_flat_mask():
     assert np.isfinite(host.image_data[0]).all()
 
 
+class _AttrDict(dict):
+    """data_2d stand-in that, like FixSizeOrderedDict, can carry the shared
+    hydrated-raw order attribute (plain dicts cannot)."""
+
+
+def _hydrated_order(data_2d):
+    return list(getattr(data_2d, "_hydrated_raw_order", []))
+
+
 def test_hydrated_raw_cache_evicts_only_full_resolution_payload():
     viewer = SimpleNamespace(
-        _raw_cache_order=[],
+        data_lock=RLock(),
         _raw_cache_limit=2,
-        data_2d={
+        data_2d=_AttrDict({
             idx: {"map_raw": np.full((4, 4), idx), "thumbnail": np.ones((2, 2))}
             for idx in (1, 2, 3)
-        },
+        }),
     )
     viewer._remember_hydrated_raw = MethodType(H5Viewer._remember_hydrated_raw, viewer)
     for idx in (1, 2, 3):
         viewer._remember_hydrated_raw(idx)
-    assert viewer._raw_cache_order == [2, 3]
+    assert _hydrated_order(viewer.data_2d) == [2, 3]
     assert viewer.data_2d[1]["map_raw"] is None
     assert viewer.data_2d[1]["thumbnail"] is not None
 
 
 def test_hydrated_raw_cache_reset_clears_order():
-    viewer = SimpleNamespace(_raw_cache_order=[1, 2, 3])
+    data_2d = _AttrDict()
+    data_2d._hydrated_raw_order = [1, 2, 3]
+    viewer = SimpleNamespace(_raw_cache_order=[1, 2, 3], data_2d=data_2d)
     viewer._clear_raw_cache = MethodType(H5Viewer._clear_raw_cache, viewer)
     viewer._clear_raw_cache()
     assert viewer._raw_cache_order == []
+    assert _hydrated_order(data_2d) == []
+
+
+def test_hydrated_raw_lru_is_shared_with_thread_insert_paths():
+    """D5: the reintegrate-publish and full-reload worker paths trim the
+    SAME LRU as the GUI — order state rides on the shared data_2d object."""
+    from xdart.gui.tabs.static_scan.hydrated_raw import remember_hydrated_raw
+
+    data_2d = _AttrDict()
+    # GUI hydrates 1..2, then a worker path hydrates 3..4 (limit 3): the
+    # worker's inserts must evict the GUI's oldest, not pile up past the cap.
+    for idx in (1, 2):
+        data_2d[idx] = {"map_raw": np.full((2, 2), idx)}
+        remember_hydrated_raw(data_2d, idx, limit=3)
+    for idx in (3, 4):
+        data_2d[idx] = {"map_raw": np.full((2, 2), idx)}
+        remember_hydrated_raw(data_2d, idx, limit=3)
+    assert _hydrated_order(data_2d) == [2, 3, 4]
+    assert data_2d[1]["map_raw"] is None
+    hydrated = [i for i in (1, 2, 3, 4) if data_2d[i]["map_raw"] is not None]
+    assert hydrated == [2, 3, 4]
+
+
+def test_reintegrate_publish_trims_shared_hydrated_lru():
+    """The integratorThread display publish trims the shared LRU."""
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+
+    data_2d = _AttrDict({
+        idx: {"map_raw": np.full((2, 2), idx)} for idx in range(8)
+    })
+    data_2d._hydrated_raw_order = list(range(8))
+    host = SimpleNamespace(
+        data_lock=RLock(),
+        data_1d={},
+        data_2d=data_2d,
+        _upsert_publication_for_frame=lambda frame: None,
+        update=SimpleNamespace(emit=lambda idx: None),
+    )
+    frame = SimpleNamespace(
+        idx=8, map_raw=np.full((2, 2), 8), bg_raw=None, mask=None,
+        int_2d=None, gi_2d={},
+        copy_for_display=lambda include_2d: {"int_1d": None},
+    )
+    integratorThread._publish_reintegrated_display(
+        host, frame, include_2d=True,
+    )
+    # default limit 8: inserting the 9th hydrated frame evicts the oldest
+    assert data_2d[0]["map_raw"] is None
+    assert data_2d[8]["map_raw"] is not None
+    assert len(_hydrated_order(data_2d)) == 8
 
 
 def _wrangler_host(mode_text, *, live=False, batch=False):

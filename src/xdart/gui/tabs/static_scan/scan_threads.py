@@ -24,6 +24,7 @@ from pyqtgraph import Qt
 
 # This module imports
 from xdart.utils import catch_h5py_file as catch
+from .hydrated_raw import remember_hydrated_raw
 
 
 
@@ -239,6 +240,10 @@ class integratorThread(Qt.QtCore.QThread):
                     'int_2d': frame.int_2d,
                     'gi_2d': frame.gi_2d,
                 }
+                if frame.map_raw is not None:
+                    # D5: thread-side inserts trim the SAME hydrated-raw
+                    # LRU the GUI uses (state rides on the shared data_2d).
+                    remember_hydrated_raw(self.data_2d, idx)
             if refresh_1d:
                 self.data_1d[idx] = frame.copy_for_display(
                     include_2d=False,
@@ -631,6 +636,10 @@ class fileHandlerThread(Qt.QtCore.QThread):
                         'gi_2d': getattr(frame, 'gi_2d', {}),
                         'thumbnail': getattr(frame, 'thumbnail', None),
                     }
+                    if getattr(frame, 'map_raw', None) is not None:
+                        # D5: trim the shared hydrated-raw LRU on the
+                        # worker insert path too.
+                        remember_hydrated_raw(self.data_2d, int(idx))
         self.sigUpdate.emit()
 
     def save_data_as(self):

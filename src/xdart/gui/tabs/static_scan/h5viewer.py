@@ -21,6 +21,11 @@ from xrd_tools.io.image import read_image, count_frames
 from xdart.utils.session import load_session, save_session
 from .ui.h5viewerUI import Ui_Form
 from xdart.modules.live import LiveFrame
+from .hydrated_raw import (
+    HYDRATED_RAW_LIMIT,
+    clear_hydrated_raw,
+    remember_hydrated_raw,
+)
 from .scan_threads import fileHandlerThread
 from .display_logic import xye_unit_from_filename
 from .display_controllers import ImageViewerController
@@ -60,7 +65,10 @@ QItemSelectionModel = QtCore.QItemSelectionModel
 
 def _clear_raw_cache_for(viewer) -> None:
     """Reset hydrated-raw LRU state on real and lightweight test viewers."""
-    viewer._raw_cache_order = []
+    viewer._raw_cache_order = []        # legacy per-viewer state (pre-D5)
+    data_2d = getattr(viewer, "data_2d", None)
+    if data_2d is not None:
+        clear_hydrated_raw(data_2d)
 
 
 def _clear_publication_store_for(viewer) -> None:
@@ -2396,20 +2404,17 @@ class H5Viewer(QWidget):
             logger.debug("absorb_chunk skipped frame %s: %s", idx, e)
 
     def _remember_hydrated_raw(self, idx: int) -> None:
-        """Retain a bounded LRU of full detector arrays in ``data_2d``."""
-        order = getattr(self, "_raw_cache_order", [])
-        if idx in order:
-            order.remove(idx)
-        order.append(idx)
-        limit = max(1, int(getattr(self, "_raw_cache_limit", 8)))
-        while len(order) > limit:
-            stale = order.pop(0)
-            payload = self.data_2d.get(stale)
-            if payload is not None:
-                payload["map_raw"] = None
-                if "bg_raw" in payload:
-                    payload["bg_raw"] = None   # full bg images pin like raws
-        self._raw_cache_order = order
+        """Retain a bounded LRU of full detector arrays in ``data_2d``.
+
+        D5: the LRU state lives WITH the shared ``data_2d`` (see
+        ``hydrated_raw.py``) so the worker-thread insert paths trim the
+        same cache; this method adds the lock the helper requires
+        (re-entrant — callers already inside ``data_lock`` are fine).
+        """
+        limit = max(1, int(getattr(self, "_raw_cache_limit",
+                                   HYDRATED_RAW_LIMIT)))
+        with self.data_lock:
+            remember_hydrated_raw(self.data_2d, idx, limit=limit)
 
     def _clear_raw_cache(self) -> None:
         """Reset the hydrated-raw LRU after data_2d is cleared."""
