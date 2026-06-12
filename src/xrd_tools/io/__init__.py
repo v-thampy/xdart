@@ -56,7 +56,8 @@ from xrd_tools.io.nexus import (
 from xrd_tools.io.read import (
     Integrated1D,
     Integrated2D,
-    Scan,
+    ProcessedScan,
+    Scan,  # deprecated alias for ProcessedScan (S5 rename)
     get_1d,
     get_2d,
     get_frames,

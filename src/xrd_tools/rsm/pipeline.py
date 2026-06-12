@@ -466,7 +466,7 @@ def process_scan_from_nexus(
     ----------
     scan : FrameSource scan (duck-typed)
         Must expose chunk iteration plus per-frame motor metadata. xdart
-        ``LiveScan`` and ``io.read.Scan`` both satisfy this boundary.
+        ``LiveScan`` and ``io.read.ProcessedScan`` both satisfy this boundary.
     mapper : PixelQMap
         Diffractometer convention + detector header.
     diff_motors : sequence of str

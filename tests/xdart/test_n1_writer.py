@@ -2,23 +2,39 @@
 ``source/path`` RELATIVE to the project root when ``scan.source_base`` is set,
 so the file is portable; absolute (back-compat) when no root is set.
 
-Unit-level on ``_write_source_ref`` (the relativization), plus an end-to-end
-round-trip: write a relative pointer + ``@source_base`` and resolve the raw back
-through the ssrl reader.
+Unit-level on the production seam — xdart's ``_resolved_frame_source`` /
+``_frame_source_index`` (LiveFrame attribute extraction) feeding the core
+``write_frame_source_ref`` (the relativization, moved to
+``xrd_tools.io.nexus_record`` in the 6a monorepo refactor) — plus an
+end-to-end round-trip: write a relative pointer + ``@source_base`` and
+resolve the raw back through the reader.
 """
 import os
 from types import SimpleNamespace
 
 import h5py
 import numpy as np
-import nexusformat.nexus as nx
 import pytest
 
-from xdart.modules.ewald.nexus_writer import _write_source_ref
+from xdart.modules.ewald.nexus_writer import (
+    _frame_source_index,
+    _resolved_frame_source,
+)
+from xrd_tools.io.nexus_record import write_frame_source_ref
 
 
-def _path_value(fg):
-    return str(fg["source"]["path"].nxvalue)
+def _write_ref(tmp_path, frame, source_base):
+    """Drive the production write path for one frame's source pointer."""
+    p = tmp_path / "ref.nxs"
+    with h5py.File(p, "w") as f:
+        fg = f.create_group("entry/frames/frame_0000")
+        write_frame_source_ref(
+            fg, _resolved_frame_source(frame, None),
+            _frame_source_index(frame), source_base=source_base,
+        )
+        path = fg["source/path"][()]
+        return (path.decode() if isinstance(path, bytes) else str(path),
+                int(fg["source/frame_index"][()]))
 
 
 def test_write_source_ref_relative_under_source_base(tmp_path):
@@ -27,10 +43,9 @@ def test_write_source_ref_relative_under_source_base(tmp_path):
     raw.parent.mkdir(parents=True)
     raw.touch()
     frame = SimpleNamespace(source_file=str(raw), source_frame_idx=0, idx=1)
-    fg = nx.NXcollection()
-    _write_source_ref(fg, frame, source_base=str(root))
-    assert _path_value(fg) == "raw/scan/img_0001.tif"     # POSIX relpath
-    assert int(fg["source"]["frame_index"].nxvalue) == 0
+    path, fi = _write_ref(tmp_path, frame, str(root))
+    assert path == "raw/scan/img_0001.tif"                 # POSIX relpath
+    assert fi == 0
 
 
 def test_write_source_ref_absolute_without_source_base(tmp_path):
@@ -38,10 +53,9 @@ def test_write_source_ref_absolute_without_source_base(tmp_path):
     raw.parent.mkdir(parents=True)
     raw.touch()
     frame = SimpleNamespace(source_file=str(raw), source_frame_idx=0, idx=2)
-    fg = nx.NXcollection()
-    _write_source_ref(fg, frame, source_base=None)         # back-compat
-    assert os.path.isabs(_path_value(fg))
-    assert _path_value(fg).endswith("raw/img.tif")
+    path, _ = _write_ref(tmp_path, frame, None)            # back-compat
+    assert os.path.isabs(path)
+    assert path.endswith("raw/img.tif")
 
 
 def test_write_source_ref_outside_root_is_absolute(tmp_path):
@@ -51,9 +65,8 @@ def test_write_source_ref_outside_root_is_absolute(tmp_path):
     raw.parent.mkdir(parents=True)
     raw.touch()
     frame = SimpleNamespace(source_file=str(raw), source_frame_idx=0, idx=3)
-    fg = nx.NXcollection()
-    _write_source_ref(fg, frame, source_base=str(root))
-    assert os.path.isabs(_path_value(fg))                  # out-of-tree -> absolute
+    path, _ = _write_ref(tmp_path, frame, str(root))
+    assert os.path.isabs(path)                             # out-of-tree -> absolute
 
 
 def test_image_wrangler_project_folder_derives_source_base(tmp_path):
@@ -95,25 +108,29 @@ def test_n1_writer_to_ssrl_reader_roundtrip(tmp_path):
     with h5py.File(master, "w") as f:
         f.create_dataset("entry/data/data", data=raw_arr)
 
-    # Build the per-frame source pointer with the production writer helper.
+    # Build the record with the production primitives end-to-end.
+    from xrd_tools.io.nexus_record import (
+        ensure_frames_container, stamp_source_base, write_frame_record,
+    )
     frame = SimpleNamespace(source_file=str(master), source_frame_idx=1, idx=0)
-    fg = nx.NXcollection()
-    _write_source_ref(fg, frame, source_base=str(root))
-    rel = _path_value(fg)
-    assert rel == "raw/m.h5"
 
     nxs = tmp_path / "processed" / "scan.nxs"
     nxs.parent.mkdir(parents=True)
     with h5py.File(nxs, "w") as f:
         e = f.create_group("entry")
-        from pathlib import Path
-        e.attrs["source_base"] = Path(str(root)).as_posix()
+        base = stamp_source_base(e, str(root))
         g = e.create_group("integrated_1d")
         g.create_dataset("intensity", data=np.zeros((1, 5)))
         g.create_dataset("frame_index", data=np.array([0], dtype=np.int64))
-        s = e.create_group("frames/frame_0000/source")
-        s.create_dataset("path", data=np.bytes_(rel.encode()))
-        s.create_dataset("frame_index", data=1)
+        write_frame_record(
+            ensure_frames_container(e), "frame_0000",
+            source_path=_resolved_frame_source(frame, None),
+            source_frame_index=_frame_source_index(frame),
+            source_base=base,
+        )
+        stored = e["frames/frame_0000/source/path"][()]
+        assert (stored.decode() if isinstance(stored, bytes)
+                else str(stored)) == "raw/m.h5"
 
     np.testing.assert_allclose(get_raw_frame(nxs, frame=0), raw_arr[1])
 

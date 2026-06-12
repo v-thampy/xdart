@@ -57,6 +57,7 @@ __all__ = [
     "get_raw_frame",
     "get_metadata",
     "open_scan",
+    "ProcessedScan",
     "Scan",
 ]
 
@@ -513,8 +514,9 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
     """Return a flat dict of scan-level metadata (no heavy intensity arrays).
 
     Keys: ``frames``, ``n_frames``, ``has_1d``, ``has_2d``, ``q``, ``q_2d``,
-    ``chi`` (axes, when present), ``sample_name``, ``energy_keV``,
-    ``wavelength_A``, ``ub_matrix`` (or ``None``), ``positioners`` (dict of
+    ``chi`` (axes, when present), ``sample_name``, ``energy_keV`` and
+    ``wavelength_A`` (``None`` when not recorded — never NaN, #78),
+    ``ub_matrix`` (or ``None``), ``positioners`` (dict of
     per-frame **geometry-motor** arrays only), ``scan_data`` (dict of *all*
     per-frame columns — motors AND counters), and ``reduction`` (provenance).
 
@@ -555,14 +557,18 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
                         "instrument/detector/positioners"):
             if path_in in e:
                 positioners.update(_read_positioners(e[path_in]))
+        # #78: the io.read boundary reports "absent" as None, never NaN —
+        # the internal nexus readers keep their NaN sentinel.
         energy = _read_energy(e)
+        wavelength = _read_wavelength(e, energy)
         meta = {
             "frames": np.asarray(ds["frame"].values) if "frame" in ds.coords else np.array([]),
             "has_1d": "integrated_1d" in e,
             "has_2d": "integrated_2d" in e,
             "sample_name": _read_sample_name(e),
-            "energy_keV": energy,
-            "wavelength_A": _read_wavelength(e, energy),
+            "energy_keV": float(energy) if np.isfinite(energy) else None,
+            "wavelength_A": (float(wavelength) if np.isfinite(wavelength)
+                             else None),
             "ub_matrix": _read_ub_matrix(e),
         }
     meta["n_frames"] = int(meta["frames"].size)
@@ -597,7 +603,7 @@ def _slice_stack(dset: h5py.Dataset, positions: np.ndarray, single: bool) -> np.
 # object-style sugar
 # ---------------------------------------------------------------------------
 
-class Scan:
+class ProcessedScan:
     """Lightweight handle to a processed scan file.
 
     Thin sugar over the module-level ``get_*`` functions so notebook code
@@ -691,14 +697,20 @@ class Scan:
             return 0
 
     def __repr__(self) -> str:
-        return f"Scan({self.path.name!r}, n_frames={len(self)})"
+        return f"ProcessedScan({self.path.name!r}, n_frames={len(self)})"
+
+
+# Deprecated alias (S5 rename, monorepo 1.0): prefer ProcessedScan — the bare
+# name collides with the reduction-input Scan in xrd_tools.reduction.
+Scan = ProcessedScan
 
 
 def open_scan(scan_file: str | Path, *, entry: str = "entry",
-              source_root: str | Path | None = None) -> Scan:
-    """Return a :class:`Scan` handle for ``scan_file`` (notebook sugar).
+              source_root: str | Path | None = None) -> ProcessedScan:
+    """Return a :class:`ProcessedScan` handle for ``scan_file`` (notebook
+    sugar).
 
     ``source_root`` (N1) repoints relative raw-source paths at a moved data
-    tree for ``Scan.load_frame`` / ``iter_chunks`` (overrides the stored
-    ``@source_base``)."""
-    return Scan(scan_file, entry=entry, source_root=source_root)
+    tree for ``ProcessedScan.load_frame`` / ``iter_chunks`` (overrides the
+    stored ``@source_base``)."""
+    return ProcessedScan(scan_file, entry=entry, source_root=source_root)
