@@ -1,0 +1,41 @@
+name: ssrl_xrd_tools
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  # Core scientific stack
+  - numpy
+  - scipy
+  - xarray
+  - h5py
+  - nexusformat
+  - matplotlib
+  - natsort
+  - joblib
+  # XRD / crystallography
+  - pyFAI>=2025.3,<2026
+  - fabio
+  - silx
+  - xrayutilities
+  - pymatgen
+  # Fitting
+  - lmfit
+  - emcee
+  # Jupyter + widgets
+  - jupyterlab
+  - ipykernel
+  - ipywidgets
+  - ipyfilechooser
+  # Plotting / dashboards
+  - panel
+  - holoviews
+  - bokeh
+  - jupyter_bokeh
+  - plotly
+  - anywidget
+  # napari intentionally omitted until the RSM 3D viewer is wired up
+  # VTK export
+  - pyevtk
+  # Dev
+  - pytest
+  - pip

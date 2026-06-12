@@ -1,0 +1,834 @@
+"""Tests for the scan/frame headless reduction API."""
+
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pytest
+
+from ssrl_xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from ssrl_xrd_tools.reduction import (
+    CancelToken,
+    Frame,
+    GIMode,
+    Integration1DPlan,
+    Integration2DPlan,
+    MaskSpec,
+    MemorySink,
+    NexusSink,
+    ReductionPlan,
+    Scan,
+    ReductionSession,
+    run_reduction,
+)
+import ssrl_xrd_tools.reduction.core as reduction_core
+
+
+def _r1d(value: float, *, unit: str = "q_A^-1") -> IntegrationResult1D:
+    return IntegrationResult1D(
+        radial=np.array([0.0, 1.0]),
+        intensity=np.array([value, value + 1.0]),
+        sigma=None,
+        unit=unit,
+    )
+
+
+def _r2d(value: float, *, unit: str = "q_A^-1") -> IntegrationResult2D:
+    return IntegrationResult2D(
+        radial=np.array([0.0, 1.0]),
+        azimuthal=np.array([-1.0, 1.0]),
+        intensity=np.full((2, 2), value),
+        sigma=None,
+        unit=unit,
+    )
+
+
+def test_scan_sorts_frames_and_synthesizes_metadata() -> None:
+    scan = Scan(
+        name="sample_scan1",
+        frames=[
+            Frame(index=2, image=np.zeros((2, 2)), metadata={"I0": 20}),
+            Frame(index=1, image=np.zeros((2, 2)), metadata={"I0": 10}),
+        ],
+        energy=12.398,
+        wavelength=1.0,
+        motors={"tth": [0.0, 1.0]},
+        sample_name="sample",
+    )
+
+    assert [f.index for f in scan.frames] == [1, 2]
+    meta = scan.to_metadata()
+    assert meta is not None
+    assert meta.scan_id == "sample_scan1"
+    np.testing.assert_allclose(meta.counters["i0"], [10, 20])
+    np.testing.assert_allclose(meta.angles["tth"], [0.0, 1.0])
+
+
+def test_scan_frame_source_iterates_bounded_chunks() -> None:
+    from ssrl_xrd_tools.reduction import FrameSource
+
+    scan = Scan(
+        "source",
+        [Frame(2, image=np.full((2, 2), 2.0)),
+         Frame(0, image=np.zeros((2, 2))),
+         Frame(1, image=np.ones((2, 2)))],
+    )
+    assert isinstance(scan, FrameSource)
+    chunks = list(scan.iter_chunks(2))
+    assert [indices for _, indices in chunks] == [[0, 1], [2]]
+    np.testing.assert_array_equal(chunks[0][0][:, 0, 0], [0.0, 1.0])
+
+
+def test_scan_frame_source_clears_images_loaded_by_chunks() -> None:
+    calls: list[int] = []
+
+    def _loader(frame: Frame) -> np.ndarray:
+        calls.append(frame.index)
+        return np.full((2, 2), frame.index)
+
+    preloaded = Frame(0, image=np.zeros((2, 2)))
+    lazy = [Frame(1, loader=_loader), Frame(2, loader=_loader)]
+    scan = Scan("bounded", [preloaded, *lazy])
+
+    chunks = list(scan.iter_chunks(1))
+    assert [indices for _, indices in chunks] == [[0], [1], [2]]
+    assert calls == [1, 2]
+    assert preloaded.image is not None
+    assert lazy[0].image is None
+    assert lazy[1].image is None
+
+
+def test_frame_loads_with_custom_loader_once() -> None:
+    calls: list[int] = []
+
+    def _loader(frame: Frame) -> np.ndarray:
+        calls.append(frame.index)
+        return np.full((2, 2), frame.index)
+
+    frame = Frame(index=3, loader=_loader)
+
+    np.testing.assert_array_equal(frame.load_image(), np.full((2, 2), 3))
+    np.testing.assert_array_equal(frame.load_image(), np.full((2, 2), 3))
+    assert calls == [3]
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        (
+            {"integration_1d": None, "integration_2d": None},
+            "integration_1d",
+        ),
+    ],
+)
+def test_reduction_plan_validation(kwargs: dict, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        ReductionPlan(**kwargs)
+
+
+def test_run_reduction_chunk_size_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    # chunk_size is a run_reduction kwarg now, not a plan field.
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kwargs: _r1d(1.0))
+    scan = Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object())
+    with pytest.raises(ValueError, match="chunk_size"):
+        run_reduction(ReductionPlan(), scan, chunk_size=0)
+
+
+def test_run_reduction_uses_frame_source_iter_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(float(image[0, 0])),
+    )
+
+    class ChunkSource:
+        name = "chunked"
+        frame_indices = [10, 11, 12]
+        integrator = object()
+        output_path = None
+
+        def __init__(self):
+            self.loaded: list[int] = []
+            self.chunks: list[int] = []
+
+        def load_frame(self, index):
+            self.loaded.append(int(index))
+            raise AssertionError("run_reduction should use iter_chunks pixels")
+
+        def frame_for(self, index):
+            return Frame(
+                int(index),
+                loader=lambda frame: self.load_frame(frame.index),
+            )
+
+        def iter_chunks(self, chunk_size):
+            self.chunks.append(int(chunk_size))
+            yield np.stack([np.full((2, 2), 10.0), np.full((2, 2), 11.0)]), [10, 11]
+            yield np.stack([np.full((2, 2), 12.0)]), [12]
+
+        def to_scan(self, **kwargs):
+            return Scan(
+                self.name,
+                [self.frame_for(i) for i in self.frame_indices],
+                integrator=self.integrator,
+            )
+
+    source = ChunkSource()
+    result = run_reduction(ReductionPlan(), source, chunk_size=2)
+
+    assert source.chunks == [2]
+    assert source.loaded == []
+    assert result.n_processed == 3
+    assert [result.frames[i].result_1d.intensity[0] for i in (10, 11, 12)] == [
+        10.0,
+        11.0,
+        12.0,
+    ]
+
+
+def test_run_reduction_executor_matches_serial(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(float(np.sum(image))),
+    )
+    frames_serial = [Frame(i, image=np.full((2, 2), i, dtype=float)) for i in range(5)]
+    frames_parallel = [Frame(i, image=np.full((2, 2), i, dtype=float)) for i in range(5)]
+    plan = ReductionPlan(integration_2d=None)
+
+    serial = run_reduction(plan, Scan("serial", frames_serial, integrator=object()))
+
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+    worker_thread_ids: set[int] = set()
+    call_count = 0
+
+    def fake_parallel_1d(image, ai, **kwargs):
+        nonlocal call_count
+        with lock:
+            worker_thread_ids.add(threading.get_ident())
+            call_number = call_count
+            call_count += 1
+        if call_number < 2:
+            barrier.wait(timeout=5)
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", fake_parallel_1d)
+    parallel = run_reduction(
+        plan,
+        Scan("parallel", frames_parallel, integrator=object()),
+        executor=2,
+        chunk_size=5,
+    )
+
+    assert list(serial.frames) == list(parallel.frames)
+    for idx in serial.frames:
+        np.testing.assert_allclose(
+            parallel.frames[idx].result_1d.intensity,
+            serial.frames[idx].result_1d.intensity,
+        )
+    assert len(worker_thread_ids) >= 2
+
+
+def test_integration_plan_validation() -> None:
+    with pytest.raises(ValueError, match="npt"):
+        Integration1DPlan(npt=0)
+    with pytest.raises(ValueError, match="npt_rad"):
+        Integration2DPlan(npt_rad=0)
+
+
+def test_gi_mode_is_a_sum_type() -> None:
+    # GIMode bundles the GI-only parameters into one optional field on
+    # ReductionPlan; the type system rules out "gi=False, incident_angle=2.5".
+    gi = GIMode(incident_angle=2.5)
+    assert gi.incident_angle == 2.5
+    assert gi.tilt_angle == 0.0
+    plan = ReductionPlan(gi=gi)
+    assert plan.gi is gi
+    # GIMode is frozen — can't mutate after construction
+    with pytest.raises(Exception):
+        gi.incident_angle = 5.0  # type: ignore[misc]
+
+
+def test_run_reduction_1d_2d_mask_threshold_norm_and_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    def fake_1d(image, ai, **kwargs):
+        calls.append({"kind": "1d", "image": image.copy(), **kwargs})
+        return _r1d(float(np.nansum(image)), unit=kwargs["unit"])
+
+    def fake_2d(image, ai, **kwargs):
+        calls.append({"kind": "2d", "image": image.copy(), **kwargs})
+        return _r2d(float(np.nanmean(image)), unit=kwargs["unit"])
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", fake_1d)
+    monkeypatch.setattr(reduction_core, "integrate_2d", fake_2d)
+
+    events = []
+    scan = Scan(
+        name="scan",
+        frames=[
+            Frame(
+                index=0,
+                image=np.array([[1.0, 2.0], [100.0, -5.0]]),
+                background=np.ones((2, 2)),
+                mask=np.array([[False, True], [False, False]]),
+            )
+        ],
+        integrator=object(),
+    )
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(
+            npt=5,
+            unit="2th_deg",
+            method="BBox",
+        ),
+        integration_2d=Integration2DPlan(
+            npt_rad=6,
+            npt_azim=7,
+            unit="q_A^-1",
+            method="csr",
+        ),
+        mask=np.array([[False, False], [True, False]]),
+        threshold_min=0.0,
+        threshold_max=50.0,
+    )
+    scan.frames[0].normalization_factor = 9.0
+
+    result = run_reduction(plan, scan, chunk_size=1, progress_cb=events.append)
+
+    assert result.n_processed == 1
+    assert result.frames[0].result_1d is not None
+    assert result.frames[0].result_2d is not None
+    assert [e.stage for e in events] == [
+        "start", "chunk", "load", "integrate", "write", "finish"
+    ]
+    assert calls[0]["npt"] == 5
+    assert calls[0]["method"] == "BBox"
+    assert calls[0]["normalization_factor"] == 9.0
+    np.testing.assert_array_equal(
+        calls[0]["mask"],
+        np.array([[False, True], [True, False]]),
+    )
+    assert not np.isnan(calls[0]["image"][0, 1])  # mask passed separately
+    assert calls[0]["image"][0, 0] == 0.0  # background subtracted
+    assert np.isnan(calls[0]["image"][1, 0])  # threshold_max
+    assert np.isnan(calls[0]["image"][1, 1])  # threshold_min
+    assert calls[1]["npt_rad"] == 6
+    assert calls[1]["npt_azim"] == 7
+
+
+def test_run_reduction_resolves_flat_mask_spec_after_image_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    def fake_1d(image, ai, **kwargs):
+        calls.append(kwargs)
+        return _r1d(1.0)
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", fake_1d)
+
+    result = run_reduction(
+        ReductionPlan(mask=MaskSpec(np.array([0, 3]))),
+        Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object()),
+    )
+
+    assert result.n_processed == 1
+    np.testing.assert_array_equal(
+        calls[0]["mask"],
+        np.array([[True, False], [False, True]]),
+    )
+
+
+def test_run_reduction_uses_independent_1d_2d_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    def fake_1d(image, ai, **kwargs):
+        calls.append({"kind": "1d", **kwargs})
+        return _r1d(1.0)
+
+    def fake_2d(image, ai, **kwargs):
+        calls.append({"kind": "2d", **kwargs})
+        return IntegrationResult2D(
+            radial=np.array([0.0, 1.0]),
+            azimuthal=np.array([-5.0, 5.0]),
+            intensity=np.ones((2, 2)),
+            unit=kwargs["unit"],
+        )
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", fake_1d)
+    monkeypatch.setattr(reduction_core, "integrate_2d", fake_2d)
+
+    result = run_reduction(
+        ReductionPlan(
+            integration_1d=Integration1DPlan(
+                npt=11,
+                unit="q_A^-1",
+                method="csr",
+                radial_range=(1.0, 2.0),
+                azimuth_range=(-30.0, 30.0),
+                monitor_key="i0",
+            ),
+            integration_2d=Integration2DPlan(
+                npt_rad=12,
+                npt_azim=13,
+                unit="2th_deg",
+                method="BBox",
+                radial_range=(10.0, 20.0),
+                azimuth_range=(80.0, 100.0),
+                azimuth_offset=90.0,
+                monitor_key="i1",
+            ),
+        ),
+        Scan(
+            "scan",
+            [Frame(0, image=np.ones((2, 2)), metadata={"I0": 25.0, "i1": 50.0})],
+            integrator=object(),
+        ),
+    )
+
+    assert calls[0]["normalization_factor"] == 25.0
+    assert calls[0]["npt"] == 11
+    assert calls[0]["unit"] == "q_A^-1"
+    assert calls[0]["radial_range"] == (1.0, 2.0)
+    assert calls[0]["azimuth_range"] == (-30.0, 30.0)
+    assert calls[1]["normalization_factor"] == 50.0
+    assert calls[1]["npt_rad"] == 12
+    assert calls[1]["npt_azim"] == 13
+    assert calls[1]["unit"] == "2th_deg"
+    assert calls[1]["radial_range"] == (10.0, 20.0)
+    assert calls[1]["azimuth_range"] == (-10.0, 10.0)
+    np.testing.assert_allclose(result.frames[0].result_2d.azimuthal, [85.0, 95.0])
+
+
+def test_run_reduction_cancellation_and_clear_images(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = CancelToken()
+    seen: list[int] = []
+
+    def fake_1d(image, ai, **kwargs):
+        seen.append(int(image[0, 0]))
+        token.cancel()
+        return _r1d(float(image[0, 0]))
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", fake_1d)
+    scan = Scan(
+        name="scan",
+        frames=[
+            Frame(index=0, image=np.zeros((1, 1))),
+            Frame(index=1, image=np.ones((1, 1))),
+        ],
+        integrator=object(),
+    )
+
+    result = run_reduction(
+        ReductionPlan(),
+        scan,
+        chunk_size=2,
+        clear_frame_images=True,
+        cancel_token=token,
+    )
+
+    assert result.cancelled
+    assert result.n_processed == 1
+    assert seen == [0]
+    assert scan.frames[0].image is None
+    assert scan.frames[1].image is not None
+
+
+def test_reduction_session_reuses_thread_integrators_across_process_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build_thread_ids: list[int] = []
+    integrate_lock = threading.Lock()
+    integrate_barrier = threading.Barrier(2)
+    integrate_calls = 0
+
+    def fake_poni_to_integrator(poni):
+        build_thread_ids.append(threading.get_ident())
+        return object()
+
+    def fake_1d(image, ai, **kwargs):
+        nonlocal integrate_calls
+        with integrate_lock:
+            call_number = integrate_calls
+            integrate_calls += 1
+        if call_number < 2:
+            integrate_barrier.wait(timeout=5)
+        return _r1d(float(np.sum(image)))
+
+    monkeypatch.setattr(reduction_core, "poni_to_integrator", fake_poni_to_integrator)
+    monkeypatch.setattr(reduction_core, "integrate_1d", fake_1d)
+    plan = ReductionPlan(integration_2d=None)
+    poni = object()
+    frames = [Frame(i, image=np.full((2, 2), i, dtype=float)) for i in range(4)]
+    # Match the GUI/live path: the session opens on the first chunk, then later
+    # chunks arrive as explicit Frame objects without rebuilding resources.
+    scan = Scan(
+        "scan",
+        [Frame(0, image=np.zeros((2, 2))), Frame(1, image=np.ones((2, 2)))],
+        poni=poni,
+    )
+
+    with ReductionSession(plan, scan, executor=2, chunk_size=2) as session:
+        session.process(frames[:2])
+        session.process(frames[2:])
+        result = session.finish()
+
+    assert result.n_processed == 4
+    assert session.scan.frame_indices == [0, 1, 2, 3]
+    assert session.integrator_provider_builds == 1
+    assert len(build_thread_ids) == 2
+    assert len(set(build_thread_ids)) == 2
+
+
+def test_reduction_session_parallel_shares_plan_mask_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parallel batch reuses the persistent plan-mask cache (PERF-1).
+
+    Before the fix the worker submit passed a fresh ``{}`` per frame, so the
+    plan's bool mask was re-expanded once per frame; now the session's shared
+    cache is passed, so the expansion happens ~once per detector shape (at most
+    once per concurrent worker), not once per frame.
+    """
+
+    expansions: list[str] = []
+    real_as_bool = reduction_core._as_bool_mask
+    lock = threading.Lock()
+
+    def counting_as_bool(mask, name, *, image_shape=None):
+        if name == "ReductionPlan.mask":
+            with lock:
+                expansions.append(name)
+        return real_as_bool(mask, name, image_shape=image_shape)
+
+    monkeypatch.setattr(reduction_core, "_as_bool_mask", counting_as_bool)
+    monkeypatch.setattr(
+        reduction_core, "integrate_1d", lambda image, ai, **kwargs: _r1d(1.0)
+    )
+
+    n_frames, n_workers = 12, 2
+    plan = ReductionPlan(
+        integration_2d=None,
+        mask=MaskSpec(np.zeros(4, dtype=int)),  # flat mask for a 2x2 image
+    )
+    frames = [Frame(i, image=np.ones((2, 2))) for i in range(n_frames)]
+    scan = Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object())
+
+    with ReductionSession(
+        plan, scan, executor=n_workers, chunk_size=n_frames
+    ) as session:
+        session.process(frames)
+        result = session.finish()
+
+    assert result.n_processed == n_frames
+    # Expanded at most once per concurrent worker -- crucially not once per
+    # frame (12), which was the pre-fix cost.
+    assert 0 < len(expansions) <= n_workers
+
+
+def test_reduction_session_replace_refed_index_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-feeding an already-processed index is a replace, not a new frame.
+
+    Reintegrate / replace re-feeds must not double-count progress
+    (``n_processed`` stays at the number of distinct indices) and must not
+    double-``write`` the sink -- the re-feed routes to the sink's ``replace``
+    hook when it has one.
+    """
+
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(float(np.sum(image))),
+    )
+
+    class RecordingSink:
+        def __init__(self) -> None:
+            self.writes: list[int] = []
+            self.replaces: list[int] = []
+            self.frames: dict[int, object] = {}
+
+        def begin(self, scan, plan) -> None:
+            self.writes.clear()
+            self.replaces.clear()
+            self.frames.clear()
+
+        def write(self, frame, reduction) -> None:
+            self.writes.append(int(frame.index))
+            self.frames[int(frame.index)] = reduction
+
+        def replace(self, frame, reduction) -> None:
+            self.replaces.append(int(frame.index))
+            self.frames[int(frame.index)] = reduction
+
+        def finish(self, result) -> None:
+            return None
+
+    plan = ReductionPlan(integration_2d=None)
+    sink = RecordingSink()
+    scan = Scan("scan", [Frame(0, image=np.zeros((2, 2)))], integrator=object())
+
+    with ReductionSession(plan, scan, sink=sink) as session:
+        session.process([Frame(0, image=np.zeros((2, 2)))])
+        session.process([Frame(1, image=np.ones((2, 2)))])
+        # Re-feed index 0 (reintegrate / replace) with a different image.
+        session.process([Frame(0, image=np.full((2, 2), 5.0))])
+        result = session.finish()
+
+    # Progress counts distinct indices {0, 1}, not the three feeds.
+    assert result.n_processed == 2
+    assert session.scan.frame_indices == [0, 1]
+    # One logical first-write per index; the re-feed went to replace.
+    assert sorted(sink.writes) == [0, 1]
+    assert sink.replaces == [0]
+    # The replaced product reflects the latest re-fed image (sum 4*5 = 20).
+    np.testing.assert_allclose(session.frames[0].result_1d.intensity[0], 20.0)
+
+
+def test_memory_sink_can_be_supplied(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kwargs: _r1d(1.0))
+    sink = MemorySink()
+    result = run_reduction(
+        ReductionPlan(),
+        Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object()),
+        sink,
+    )
+
+    assert result.frames[0] is sink.frames[0]
+
+
+def test_nexus_sink_writes_frame_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kwargs: _r1d(3.0))
+    out = tmp_path / "scan.nxs"
+    scan = Scan(
+        "scan",
+        [Frame(0, image=np.ones((2, 2)))],
+        integrator=object(),
+        energy=12.398,
+        wavelength=1.0,
+    )
+
+    result = run_reduction(ReductionPlan(), scan, NexusSink(out, overwrite=True))
+
+    assert result.output_path == out
+    with h5py.File(out, "r") as h5:
+        # Stacked read_scan-compatible layout: (n_frames, n_q).
+        assert "entry/integrated_1d/intensity" in h5
+        assert list(h5["entry/integrated_1d/frame_index"][()]) == [0]
+        np.testing.assert_allclose(
+            h5["entry/integrated_1d/intensity"][0],
+            [3.0, 4.0],
+        )
+
+
+def test_nexus_sink_atomic_overwrite_preserves_target_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_1d",
+        lambda image, ai, **kwargs: _r1d(3.0),
+    )
+
+    def fail_write(*args, **kwargs):
+        raise RuntimeError("simulated write failure")
+
+    monkeypatch.setattr(reduction_core, "write_nexus_frame", fail_write)
+    out = tmp_path / "scan.nxs"
+    original = b"old complete file"
+    out.write_bytes(original)
+
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        run_reduction(
+            ReductionPlan(),
+            Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object()),
+            NexusSink(out, overwrite=True),
+        )
+
+    assert out.read_bytes() == original
+    assert not list(tmp_path.glob(".scan.nxs.*.tmp"))
+
+
+def test_reduction_validation_for_shapes_and_duplicate_frames() -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        Scan(
+            "scan",
+            [Frame(0, image=np.ones((2, 2))), Frame(0, image=np.ones((2, 2)))],
+        )
+
+    scan = Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object())
+    with pytest.raises(ValueError, match="mask shape"):
+        run_reduction(ReductionPlan(mask=np.ones((3, 3), dtype=bool)), scan)
+
+    scan = Scan(
+        "scan",
+        [Frame(0, image=np.ones((2, 2)), background=np.ones((3, 3)))],
+        integrator=object(),
+    )
+    with pytest.raises(ValueError, match="background shape"):
+        run_reduction(ReductionPlan(), scan)
+
+    scan = Scan("scan", [Frame(0)], integrator=object())
+    with pytest.raises(ValueError, match="no image"):
+        run_reduction(ReductionPlan(), scan)
+
+
+def test_nexus_sink_flush_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kwargs: _r1d(float(image[0, 0])))
+    calls = []
+
+    class FakeH5:
+        def flush(self):
+            calls.append("flush")
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(reduction_core, "open_nexus_writer", lambda *a, **k: FakeH5())
+    monkeypatch.setattr(reduction_core, "write_nexus_frame", lambda *a, **k: None)
+
+    result = run_reduction(
+        ReductionPlan(),
+        Scan(
+            "scan",
+            [
+                Frame(0, image=np.zeros((2, 2))),
+                Frame(1, image=np.ones((2, 2))),
+                Frame(2, image=np.full((2, 2), 2.0)),
+            ],
+            integrator=object(),
+            energy=12.398,
+            wavelength=1.0,
+        ),
+        NexusSink("scan.nxs", overwrite=True, flush_every=2, atomic=False),
+    )
+
+    assert result.n_processed == 3
+    assert calls == ["flush", "flush", "close"]  # frame 2, finish, close
+
+    with pytest.raises(ValueError, match="flush_every"):
+        NexusSink("scan.nxs", flush_every=0).begin(
+            Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object()),
+            ReductionPlan(),
+        )
+
+
+def test_existing_notebook_import_surface_still_imports() -> None:
+    from ssrl_xrd_tools.analysis.fitting import FitConfig, PhaseFitter, fit_peaks
+    from ssrl_xrd_tools.analysis.strain import sin2psi_analysis
+    from ssrl_xrd_tools.integrate import (
+        create_multigeometry_integrators,
+        integrate_1d,
+        integrate_2d,
+        stitch_1d,
+        stitch_2d,
+    )
+
+    assert integrate_1d
+    assert integrate_2d
+    assert create_multigeometry_integrators
+    assert stitch_1d
+    assert stitch_2d
+    assert PhaseFitter
+    assert fit_peaks
+    assert FitConfig
+    assert sin2psi_analysis
+
+
+# ---------------------------------------------------------------------------
+# scan_data persistence (#nexussink_scan_data — core provenance)
+# ---------------------------------------------------------------------------
+
+def test_scan_to_scan_data_assembles_per_frame_table() -> None:
+    import math
+
+    import pandas as pd
+
+    scan = Scan(
+        name="conditions",
+        frames=[
+            # frame 0 has tag (string) but no stress; frame 1 has stress but no tag
+            Frame(index=0, image=np.zeros((2, 2)),
+                  metadata={"temperature": 300.0, "tag": "a"}),
+            Frame(index=1, image=np.zeros((2, 2)),
+                  metadata={"temperature": 310.0, "stress": 5.0}),
+        ],
+        motors={"th": np.array([0.1, 0.2])},
+    )
+    df = scan.to_scan_data()
+
+    assert list(df.index) == [0, 1]
+    assert {"temperature", "tag", "stress", "th"} <= set(df.columns)
+    # union of frame metadata, aligned per frame
+    assert df.loc[0, "temperature"] == 300.0
+    assert df.loc[1, "temperature"] == 310.0
+    # per-frame motor array folded in
+    assert df.loc[0, "th"] == 0.1 and df.loc[1, "th"] == 0.2
+    # keys missing on a frame → NaN/None
+    assert pd.isna(df.loc[0, "stress"])
+    assert pd.isna(df.loc[1, "tag"])
+    # column order is metadata-first-seen then motors
+    assert list(df.columns)[:3] == ["temperature", "tag", "stress"]
+
+
+def test_scan_to_scan_data_empty_scan() -> None:
+    df = Scan(name="empty", frames=[]).to_scan_data()
+    assert len(df) == 0
+    assert list(df.columns) == []
+
+
+def test_nexussink_persists_scan_data_roundtrip(tmp_path: Path) -> None:
+    from ssrl_xrd_tools.io.read import get_metadata
+
+    path = tmp_path / "scan_conditions.nxs"
+    scan = Scan(
+        name="ramp",
+        frames=[
+            Frame(index=1, image=np.zeros((2, 2)),
+                  metadata={"temperature": 300.0, "stress": 2.0, "th": 0.15}),
+            Frame(index=2, image=np.zeros((2, 2)),
+                  metadata={"temperature": 305.0, "stress": 4.0, "th": 0.25}),
+            Frame(index=3, image=np.zeros((2, 2)),
+                  metadata={"temperature": 310.0, "stress": 6.0, "th": 0.35}),
+        ],
+    )
+    sink = NexusSink(path)
+    sink.begin(scan, ReductionPlan())
+    for frame in scan.frames:
+        sink.write(
+            frame,
+            reduction_core.FrameReduction(
+                frame_index=frame.index, result_1d=_r1d(float(frame.index)),
+            ),
+        )
+    sink.finish(reduction_core.ReductionResult("ramp", {}, len(scan)))
+
+    meta = get_metadata(path)
+    sd = meta["scan_data"]
+    assert {"temperature", "stress", "th"} <= set(sd)
+    # per-frame condition columns round-trip, aligned to frame indices 1,2,3
+    np.testing.assert_allclose(sd["temperature"], [300.0, 305.0, 310.0])
+    np.testing.assert_allclose(sd["stress"], [2.0, 4.0, 6.0])
+    np.testing.assert_allclose(sd["th"], [0.15, 0.25, 0.35])
