@@ -1080,12 +1080,15 @@ class integratorTree(QtWidgets.QWidget):
             if len(self.scan.frames.index) > 0:
                 self.integrator_thread.method = 'bai_2d_all'
         # N3: same data_lock discipline as bai_1d above.
+        from .hydrated_raw import clear_hydrated_raw
         data_lock = getattr(self.integrator_thread, 'data_lock', None)
         if data_lock is not None:
             with data_lock:
                 self.data_2d.clear()
+                clear_hydrated_raw(self.data_2d)
         else:
             self.data_2d.clear()
+            clear_hydrated_raw(self.data_2d)
         self.setEnabled(False)
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()

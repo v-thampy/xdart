@@ -56,6 +56,14 @@ def test_scan_from_live_scan_exposes_headless_contract(tmp_path):
     assert headless.metadata["th"] == 0.2
     assert headless.metadata["i0"] == 10.0
     assert headless.metadata["sample"] == "A"   # string column survives
+    # ... and does NOT nuke the numeric motor columns alongside it (the
+    # coercion is per column, not all-or-nothing)
+    assert canonical.motors["i0"].tolist() == [10.0]
+    assert "sample" not in canonical.motors
+    # scan_data round-trips at the Scan level too (frame metadata union)
+    table = canonical.to_scan_data()
+    assert table.loc[3, "sample"] == "A"
+    assert float(table.loc[3, "i0"]) == 10.0
     # the core Scan is directly chunk-iterable (the RSM/stitch boundary)
     chunks = list(canonical.iter_chunks(8))
     assert len(chunks) == 1 and chunks[0][1] == [3]
@@ -82,6 +90,19 @@ def test_scan_from_live_scan_uses_authoritative_reloaded_wavelength(tmp_path):
     scan.frames[1] = LiveFrame(idx=1, map_raw=np.ones((2, 2)), poni=_poni())
 
     assert scan_from_live_scan(scan).wavelength == pytest.approx(1.0)
+
+
+def test_scan_from_live_scan_carries_geometry(tmp_path):
+    """Scan.geometry passthrough: a headless NexusSink derives
+    /entry/per_frame_geometry at finish only if the adapter maps it."""
+    from xrd_tools.core.geometry.diffractometer import DiffractometerGeometry
+
+    geom = DiffractometerGeometry.two_circle()
+    scan = LiveScan("scan", data_file=str(tmp_path / "scan.nxs"))
+    scan.geometry = geom
+    scan.frames[0] = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+
+    assert scan_from_live_scan(scan).geometry is geom
 
 
 def test_plan_from_live_scan_preserves_gi_submodes(tmp_path):

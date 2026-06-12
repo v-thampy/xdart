@@ -85,7 +85,10 @@ class GroupSchema:
     """Declarative description of one entry-level group."""
 
     name: str
-    #: shared (non-row) axis dataset names, in storage order.
+    #: shared (non-row) axis DATASET NAMES, (radial, azimuthal) order.
+    #: NOTE: not the intensity storage order — integrated_2d intensity rows
+    #: are stored (chi, q) = (azimuthal, radial); see the 2D-orientation
+    #: convention in CLAUDE.md before consuming axes positionally.
     axes: tuple[str, ...] = ()
     #: datasets with a per-frame leading dimension.
     row_aligned: frozenset = frozenset()

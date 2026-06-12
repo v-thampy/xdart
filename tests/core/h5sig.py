@@ -19,6 +19,13 @@ VOLATILE_LEAVES = {
     # per-run environment noise: the output tmp path, write clock, and the
     # (absolute, env-dependent) project root -- presence still asserted
     "file_name", "file_time", "source_base",
+    # environment builds, not record content: the root attrs nexusformat
+    # stamps from the running libhdf5/h5py/nexusformat, and the
+    # reduction-group program version (importlib metadata of the active
+    # install).  Hashing these pinned the TEST MACHINE into the fixture —
+    # the gate failed under any other env (e.g. the shipped conda env) and
+    # on every h5py upgrade.  Presence is still asserted.
+    "HDF5_Version", "h5py_version", "creator_version", "version",
 }
 VOLATILE_PARENTS = ("versions",)   # /entry/reduction/versions/* values
 

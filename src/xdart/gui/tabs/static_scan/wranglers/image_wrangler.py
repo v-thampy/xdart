@@ -1285,14 +1285,20 @@ class imageWrangler(wranglerWidget):
             self.include_subdir = self.parameters.child('Signal').child('include_subdir').value()
             self._sync_meta_ext_to_img_ext()
 
-            filters = '*' + '*'.join(f for f in self.file_filter.split()) + '*'
-            filters = filters if filters != '**' else '*'
+            # F1: same compiled Filter grammar as the worker's directory
+            # glob — the seed image must be selected by the same rule as
+            # the frames the run will process.  Match the NAME (minus
+            # extension), like the worker sites, not the full path.
+            from .image_wrangler_thread import _name_filter
+            match = _name_filter(self.file_filter)
+            suffix = f'.{self.img_ext}'
 
             file_found = False
             for idx, (subdir, dirs, files) in enumerate(os.walk(self.img_dir)):
                 for file in files:
                     fname = os.path.join(subdir, file)
-                    if fnmatch.fnmatch(fname, f'{filters}.{self.img_ext}'):
+                    if (file.lower().endswith(suffix.lower())
+                            and match(file[:-len(suffix)])):
                         if match_img_detector(fname, self.poni):
                             if self.meta_ext:
                                 if self.exists_meta_file(fname):

@@ -84,6 +84,7 @@ testpaths = ["tests"]
 markers = [
     "display_logic: pure, Qt-free display-decision tests (no Qt/pyFAI/h5py needed). Run with `pytest -m display_logic`.",
     "gui: end-to-end tests that build real Qt widgets (need QT_QPA_PLATFORM=offscreen). Run/skip with `pytest -m gui` / `-m 'not gui'`.",
+    "slow: heavy/full-size detector cases. Skip with `pytest -m 'not slow'`.",
 ]
 filterwarnings = [
     # Upstream pyFAI 2025/2026 noise: deprecated ndarray.strides setter

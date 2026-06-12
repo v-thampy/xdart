@@ -114,21 +114,26 @@ def scan_from_live_scan(
             (getattr(live_scan, "mg_args", {}) or {}).get("wavelength", None)
         )
 
+    # Per-COLUMN numeric coercion: one string column (sample name, file
+    # path — common in scan_data) must skip itself, not nuke every numeric
+    # motor column with it.
     motors = {}
-    if scan_data is not None:
-        try:
-            motors = {
-                str(col): np.asarray(scan_data[col].values, dtype=float)
-                for col in scan_data.columns
-            }
-        except Exception:
-            motors = {}
+    if scan_data is not None and hasattr(scan_data, "columns"):
+        for col in scan_data.columns:
+            try:
+                motors[str(col)] = np.asarray(scan_data[col].values,
+                                              dtype=float)
+            except (TypeError, ValueError):
+                continue
 
     return Scan(
         name=str(getattr(live_scan, "name", "scan")),
         frames=frames,
         poni=poni,
         wavelength=wavelength_A,
+        # so a headless NexusSink derives /entry/per_frame_geometry at
+        # finish, matching what the GUI writer produces for the same scan
+        geometry=getattr(live_scan, "geometry", None),
         motors=motors,
         output_path=getattr(live_scan, "data_file", None),
         extra={"source": "xdart.LiveScan"},

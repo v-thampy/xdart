@@ -417,10 +417,16 @@ def _write_reduction(h5f, scan, *, entry: str) -> None:
     if hasattr(scan, "meta_file") and scan.meta_file:
         inputs["meta_file"] = str(scan.meta_file)
 
+    from xdart import __version__ as _xdart_version
+
     write_provenance(
         h5f,
         entry=entry,
         program="xdart",
+        # explicit: the dist is "xrd-tools" now, so write_provenance's
+        # importlib lookup of "xdart" would silently record '' (or a stale
+        # legacy install's version).
+        program_version=_xdart_version,
         config=config,
         inputs=inputs or None,
     )

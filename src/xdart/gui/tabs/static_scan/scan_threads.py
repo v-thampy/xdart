@@ -24,7 +24,7 @@ from pyqtgraph import Qt
 
 # This module imports
 from xdart.utils import catch_h5py_file as catch
-from .hydrated_raw import remember_hydrated_raw
+from .hydrated_raw import clear_hydrated_raw, remember_hydrated_raw
 
 
 
@@ -295,6 +295,7 @@ class integratorThread(Qt.QtCore.QThread):
         with self.data_lock:
             if do_2d:
                 self.data_2d.clear()
+                clear_hydrated_raw(self.data_2d)
             else:
                 self.data_1d.clear()
         # Drop stale publications and bump the store generation so any

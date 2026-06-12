@@ -76,7 +76,8 @@ pre-migration reference signature.  Two additive notes:
    boolean grammar: space-separated terms are an **unordered** AND
    (`abc def` now also matches `def_abc`; the old glob `*abc*def*` was
    order-sensitive), `|`/`OR` for union, leading `-term`/`NOT` for
-   exclusion.  Single-term filters behave exactly as before.
+   exclusion.  Single-term filters behave exactly as before; a
+   malformed expression warns and matches NOTHING until corrected.
 2. **`get_metadata` energy sentinel (#78):** `energy_keV` / `wavelength_A`
    are `None` when not recorded — never NaN.  `ProcessedScan.energy*`
    hints now match reality.
@@ -98,6 +99,11 @@ pre-migration reference signature.  Two additive notes:
 7. **Hydrated-raw display LRU (D5)** is shared across all writers (GUI +
    worker threads), capping full-resolution `map_raw` payloads in `data_2d`
    regardless of which thread hydrated them.
+8. **Provenance version stamps** follow the new distribution:
+   `xdart.__version__` and `entry/reduction/version` report the
+   `xrd-tools` version (a clean two-repo-era install recorded the old
+   `xdart` dist version; a monorepo install without this fix recorded
+   `''`/`0.0.0+unknown`).
 
 ## Stage-6 redesign items: done vs deferred
 
@@ -106,7 +112,8 @@ sink record + byte-compat gate), 6b schema-as-code starter, 6c API renames
 (list above), 6d single LiveScan→core adapter + single TwoDKind classifier
 (+ import-light `xrd_tools.core`), 6e cleanups + S8 + D6 + D5 + F1.
 
-Deferred (tracked in `review/CC_preship_sweep_deferred_jun2026.md`):
+Deferred (tracked in the maintainer's review notes,
+`CC_preship_sweep_deferred_jun2026.md` — not part of this repo):
 D1 re-integrate RAM rework (re-expose the buttons with a replace-aware
 sink), D2 thumbnail LRU + lazy reload (analyzed Jun 2026; lands with the
 publication-store migration), F2 outside-project Save Path consent design,

@@ -33,17 +33,19 @@ _warned_bad_filters: set[str] = set()
 
 def _name_filter(expr):
     """Compiled Filter predicate; a malformed expression warns once per
-    expression and falls back to match-all (the run continues un-filtered
-    rather than aborting mid-scan)."""
+    expression and falls back to matching NOTHING.  Conservative on
+    purpose: the old filter-encoded glob also matched nothing on garbage
+    input, and a match-all fallback would process every file in the
+    directory (or pick an arbitrary background at the BG Match site)."""
     try:
         return _compile_name_filter(expr)
     except ValueError as exc:
         key = str(expr)
         if key not in _warned_bad_filters:
             _warned_bad_filters.add(key)
-            logger.warning("Invalid Filter expression %r (%s); matching all names",
-                           expr, exc)
-        return lambda name: True
+            logger.warning("Invalid Filter expression %r (%s); matching "
+                           "NO names until it is corrected", expr, exc)
+        return lambda name: False
 
 # pyFAI / fabio / h5py
 import fabio
@@ -2763,9 +2765,15 @@ class imageThread(wranglerThread):
         else:
             if self.bg_dir and (self.bg_match_fname or self.bg_matching_par):
                 bg_file_filter = 'bg' if not self.bg_file_filter else self.bg_file_filter
-                if self.bg_match_fname:
-                    bg_file_filter = f'{self.scan_name} {bg_file_filter}'
                 match = _name_filter(bg_file_filter)
+                if self.bg_match_fname:
+                    # scan_name is DATA, not filter grammar: a name starting
+                    # with '-' or containing '|'/'OR' must stay a literal
+                    # substring requirement, so conjoin it outside the
+                    # compiled expression.
+                    scan_term = str(self.scan_name).lower()
+                    match = (lambda name, _m=match, _t=scan_term:
+                             _t in str(name).lower() and _m(name))
                 suffix = f'.{self.meta_ext}'
                 meta_files = sorted(
                     f for f in glob.glob(os.path.join(self.img_dir, f'*{suffix}'))
