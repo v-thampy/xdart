@@ -16,6 +16,9 @@ import numpy as np
 #: present, just not by value)
 VOLATILE_LEAVES = {
     "date", "timestamp", "hostname", "python", "platform",
+    # per-run environment noise: the output tmp path, write clock, and the
+    # (absolute, env-dependent) project root -- presence still asserted
+    "file_name", "file_time", "source_base",
 }
 VOLATILE_PARENTS = ("versions",)   # /entry/reduction/versions/* values
 
@@ -56,7 +59,9 @@ def h5_content_signature(path) -> dict:
             sig[name] = entry
         f.visititems(visit)
         sig["/"] = {"kind": "group",
-                    "attrs": {k: _digest(f.attrs[k]) for k in sorted(f.attrs)}}
+                    "attrs": {k: ("<volatile>" if _is_volatile("/", k)
+                                  else _digest(f.attrs[k]))
+                              for k in sorted(f.attrs)}}
     return sig
 
 

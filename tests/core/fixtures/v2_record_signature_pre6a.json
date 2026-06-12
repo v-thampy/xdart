@@ -4,8 +4,8 @@
    "HDF5_Version": "f22abd6773ab2328",
    "creator": "6331f34146883a32",
    "creator_version": "31186721be50d103",
-   "file_name": "bc136b71afb8114d",
-   "file_time": "6503ee34619296fb",
+   "file_name": "<volatile>",
+   "file_time": "<volatile>",
    "h5py_version": "a7c8371a5a7b55d0"
   },
   "kind": "group"
@@ -14,7 +14,7 @@
   "attrs": {
    "NX_class": "672a7eb0757166d4",
    "default": "fd16e25311dc5fef",
-   "source_base": "c7f5ce2ffdae7b05"
+   "source_base": "<volatile>"
   },
   "kind": "group"
  },

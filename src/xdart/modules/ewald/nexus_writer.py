@@ -813,74 +813,9 @@ def _drop_filtered_replace_rows(h5f, *prepared_outputs) -> None:
 
 
 def _drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
-    """Remove stale rows from an existing integrated_* stack by frame label."""
-    if group_path not in h5f or "frame_index" not in h5f[group_path]:
-        return
-    group = h5f[group_path]
-    labels = np.asarray(group["frame_index"][()], dtype=np.int64)
-    drop = {int(idx) for idx in frame_indices}
-    keep_mask = np.asarray([int(label) not in drop for label in labels], dtype=bool)
-    if bool(np.all(keep_mask)):
-        return
-
-    parent_path, name = group_path.rsplit("/", 1)
-    parent = h5f[parent_path]
-    if not bool(np.any(keep_mask)):
-        del parent[name]
-        return
-
-    group_attrs = dict(group.attrs.items())
-    datasets = []
-    for key, obj in group.items():
-        if not isinstance(obj, h5py.Dataset):
-            continue
-        data = obj[()]
-        row_aligned = data.shape[:1] == labels.shape and key in {
-            "frame_index", "intensity", "sigma",
-        }
-        if row_aligned:
-            data = data[keep_mask]
-        datasets.append((
-            key,
-            data,
-            dict(obj.attrs.items()),
-            obj.compression,
-            obj.compression_opts,
-            obj.shuffle,
-            obj.fletcher32,
-            row_aligned,
-            obj.chunks,
-        ))
-
-    del parent[name]
-    new_group = parent.create_group(name)
-    for key, value in group_attrs.items():
-        new_group.attrs[key] = value
-    for (
-        key,
-        data,
-        attrs,
-        compression,
-        compression_opts,
-        shuffle,
-        fletcher32,
-        row_aligned,
-        chunks,
-    ) in datasets:
-        kwargs = {}
-        if row_aligned:
-            kwargs["maxshape"] = (None,) + tuple(np.asarray(data).shape[1:])
-            if chunks is not None:
-                kwargs["chunks"] = chunks
-        if compression is not None:
-            kwargs["compression"] = compression
-            if compression_opts is not None:
-                kwargs["compression_opts"] = compression_opts
-            kwargs["shuffle"] = shuffle
-            kwargs["fletcher32"] = fletcher32
-        ds = new_group.create_dataset(key, data=data, **kwargs)
-        for attr_key, value in attrs.items():
-            ds.attrs[attr_key] = value
+    """Row surgery moved to the core (6a): xrd_tools.io.nexus_record."""
+    from xrd_tools.io.nexus_record import drop_integrated_rows
+    drop_integrated_rows(h5f, group_path, frame_indices)
 
 
 def _prepare_integrated_1d(f, scan, *, entry: str,
@@ -1057,54 +992,25 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
     if not scan.frames.index:
         return
 
-    # The top-level /entry/frames container needs to exist as an
-    # NXcollection.  Re-creating it would clobber per-frame groups
-    # written by previous batches, so we create-if-missing instead of
-    # del-and-replace.
-    frames_path = f"{entry}/frames"
-    if frames_path not in f:
-        f[frames_path] = nx.NXcollection()
-    frames = f[frames_path]
+    # Core primitives own the record writes (6a: xrd_tools.io.nexus_record);
+    # this function keeps only the GUI-side concerns: the append cursor
+    # (skip already-written keys), LiveFrame thumbnail generation/skip
+    # policy, and LiveFrame source-path resolution.
+    from xrd_tools.io.nexus_record import (
+        ensure_frames_container, stamp_source_base, write_frame_record,
+    )
 
-    # Use the underlying h5py group for the existence check.  nx's
-    # in-memory tree may not have refreshed since the last save, but
-    # h5py reads off the open file directly — authoritative.
     h5f = _h5(f)
-    h5_frames = h5f[frames_path]
+    h5_frames = ensure_frames_container(h5f.require_group(entry))
     output_dir = os.path.dirname(os.path.abspath(h5f.filename))
     existing_frame_keys = set(h5_frames.keys())
 
-    # N1: the project root that per-frame source paths are stored relative to.
-    # Set on the scan by the wrangler (GUI Project Folder); absent -> absolute
-    # paths (back-compat).  Stamp it once on the entry (POSIX) so the readers
-    # can resolve the relative pointers after the data moves machines.
-    source_base = getattr(scan, "source_base", None) or None
-    if source_base:
-        source_base = os.path.abspath(os.path.expanduser(str(source_base)))
-        posix_base = Path(source_base).as_posix()
-        # P2 #4 (codex): ONE scan-level @source_base governs ALL frames' relative
-        # source paths.  Appending to a file written under a DIFFERENT root would
-        # silently rebase the EARLIER frames against the new one (wrong path) -->
-        # reject loudly rather than corrupt their resolution.
-        existing = h5f[entry].attrs.get("source_base") if entry in h5f else None
-        if existing is not None:
-            if isinstance(existing, bytes):
-                existing = existing.decode("utf-8", errors="replace")
-            if str(existing) != posix_base:
-                raise ValueError(
-                    f"cannot append to {os.fspath(h5f.filename)!r}: its Project "
-                    f"Folder (@source_base={str(existing)!r}) differs from the "
-                    f"current ({posix_base!r}).  Earlier frames' relative source "
-                    f"paths are stored against the old root; start a NEW output "
-                    f"file for the new Project Folder."
-                )
-        try:
-            h5f[entry].attrs["source_base"] = posix_base
-        except Exception as exc:
-            raise RuntimeError(
-                f"failed to stamp @source_base={posix_base!r} on {entry!r}; "
-                "relative raw source paths would be unresolvable"
-            ) from exc
+    # N1: the project root that per-frame source paths are stored relative
+    # to (GUI Project Folder); absent -> absolute paths (back-compat).
+    # stamp_source_base rejects an append under a DIFFERENT root (P2 #4).
+    source_base = stamp_source_base(
+        h5f[entry], getattr(scan, "source_base", None) or None
+    )
 
     # Filter the index *before* touching any frame object.  This is
     # the whole point of the cursor: we never lazy-load a frame we'd
@@ -1119,9 +1025,6 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
     for idx in new_indices:
         frame = scan.frames[idx]
         frame_key = f"frame_{idx:04d}"
-
-        # Build a fresh per-frame NXcollection for new frames.
-        fg = nx.NXcollection()
 
         thumb = getattr(frame, "thumbnail", None)
         # PERF-5: for 1D-only (skip_2d) frames whose raw is reloadable from
@@ -1148,58 +1051,24 @@ def _write_per_frame_metadata(f, scan, *, entry: str) -> None:
                     "Failed to generate thumbnail for frame %s", idx,
                     exc_info=True,
                 )
-        if thumb is not None:
-            arr, lut = _quantize_thumbnail(thumb)
-            # ``dtype`` collides with NXfield's reserved kwarg (which
-            # sets the array dtype) — pass attrs as a dict so the
-            # *attribute* named "dtype" goes through.
-            fg["thumbnail"] = nx.NXfield(
-                arr,
-                attrs={"vmin": lut[0], "vmax": lut[1], "dtype": lut[2]},
-            )
-
-        # NOTE: per the v2 schema (module docstring §2), per-frame
-        # groups carry *only* metadata + thumbnail — never the full
-        # raw image.  An earlier version of this helper wrote
-        # frame.map_raw verbatim, which silently dumped 18 MB per
-        # Eiger frame into the .nxs.  Don't bring that back.
-
-        _write_source_ref(fg, frame, output_dir=output_dir,
-                          source_base=source_base)
-
-        ts = getattr(frame, "timestamp", None)
-        if ts is not None:
-            fg["timestamp"] = nx.NXfield(str(ts))
-
-        frames[frame_key] = fg
+        write_frame_record(
+            h5_frames, frame_key,
+            thumbnail=thumb,
+            source_path=_resolved_frame_source(frame, output_dir),
+            source_frame_index=_frame_source_index(frame),
+            timestamp=getattr(frame, "timestamp", None),
+            source_base=source_base,
+        )
 
 
-def _write_source_ref(fg, frame, *, output_dir: str | None = None,
-                      source_base: str | None = None) -> None:
-    """Attach an ``NXcollection`` carrying the raw-source pointer.
-
-    Writes ``source/path`` and ``source/frame_index`` under the
-    per-frame group ``fg`` when the frame has a non-empty
-    ``source_file`` attribute.  ``frame_index`` defaults to the
-    frame's own ``idx`` when the frame doesn't carry an explicit
-    ``source_frame_idx`` (typical for the image wrangler, where each
-    image is a single-frame file; for Eiger / multi-frame sources the
-    wrangler should set ``source_frame_idx`` to the index *within*
-    the source data file).
-
-    N1: when ``source_base`` (the project root) is given, ``path`` is stored
-    RELATIVE to it (POSIX, portable); otherwise it is stored absolute (POSIX,
-    back-compat).  ``relative_source_path`` warns + falls back to absolute for a
-    raw that sits outside the root.  Pair with ``entry/@source_base`` written by
-    the caller.
-    """
-    from xrd_tools.io.read import relative_source_path
-
+def _resolved_frame_source(frame, output_dir: str | None) -> str:
+    """LiveFrame-side source-path resolution (the record WRITE is the core's
+    ``write_frame_source_ref``): absolute paths pass through; relative ones
+    resolve via the frame's ``_resolved_source_path`` helper or against the
+    output directory."""
     src_path = getattr(frame, "source_file", "") or ""
     if not src_path:
-        return
-    # Resolve to an absolute path first (the frame may carry a relative
-    # source_file + a _resolved_source_path() helper, or sit under output_dir).
+        return ""
     if not os.path.isabs(src_path):
         resolved = ""
         if hasattr(frame, "_resolved_source_path"):
@@ -1213,13 +1082,14 @@ def _write_source_ref(fg, frame, *, output_dir: str | None = None,
             src_path = os.path.join(output_dir, src_path)
         else:
             src_path = os.path.abspath(src_path)
-    src_frame_idx = getattr(frame, "source_frame_idx", None)
-    if src_frame_idx is None:
-        src_frame_idx = getattr(frame, "idx", 0)
-    sub = nx.NXcollection()
-    sub["path"] = nx.NXfield(relative_source_path(src_path, source_base))
-    sub["frame_index"] = nx.NXfield(int(src_frame_idx))
-    fg["source"] = sub
+    return src_path
+
+
+def _frame_source_index(frame) -> int:
+    idx = getattr(frame, "source_frame_idx", None)
+    if idx is None:
+        idx = getattr(frame, "idx", 0)
+    return int(idx)
 
 
 def _metadata_tail_ids(scan, h5f, entry: str,
@@ -1558,31 +1428,10 @@ def _write_stitched(f, scan, *, entry: str) -> None:
 # Low-level utilities
 # ---------------------------------------------------------------------------
 
-def _quantize_thumbnail(
-    arr: np.ndarray,
-    dtype: str = "uint8",
-) -> tuple[np.ndarray, tuple[float, float, str]]:
-    """Linear-quantize a 2-D thumbnail array to uint8 or uint16.
-
-    Returns the quantized array + the LUT triple ``(vmin, vmax, dtype)``
-    for storage as attributes so viewers can invert.
-    """
-    finite = np.isfinite(arr)
-    if not finite.any():
-        # All NaN/inf — produce a flat zero thumbnail
-        quant = np.zeros(arr.shape, dtype=np.uint8 if dtype == "uint8" else np.uint16)
-        return quant, (0.0, 1.0, dtype)
-    vmin, vmax = np.percentile(arr[finite], [1, 99])
-    if vmax <= vmin:
-        vmax = vmin + 1e-12
-    # Replace NaN/inf (typically from masked pixels) with 0 BEFORE the
-    # clip so they don't propagate through (arr - vmin) / range → NaN →
-    # (NaN * 255).astype(uint8) which raises "invalid value in cast".
-    arr_clean = np.where(finite, arr, vmin)
-    norm = np.clip((arr_clean - vmin) / (vmax - vmin), 0, 1)
-    if dtype == "uint16":
-        return (norm * 65535).astype(np.uint16), (float(vmin), float(vmax), "uint16")
-    return (norm * 255).astype(np.uint8), (float(vmin), float(vmax), "uint8")
+def _quantize_thumbnail(arr, dtype: str = "uint8"):
+    """Moved to the core (6a): xrd_tools.io.nexus_record.quantize_thumbnail."""
+    from xrd_tools.io.nexus_record import quantize_thumbnail
+    return quantize_thumbnail(arr, dtype=dtype)
 
 
 __all__ = ["NexusWriteCursor", "save_scan_to_nexus"]
