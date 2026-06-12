@@ -46,6 +46,7 @@ from .display_frame_widget import displayFrameWidget
 from .integrator import integratorTree
 from .metadata import metadataWidget
 from .wranglers import imageWrangler, nexusWrangler, wranglerWidget
+from xdart.utils.throttle import Coalescer
 from xdart.utils._utils import FixSizeOrderedDict, get_fname_dir, get_img_data
 
 QWidget = QtWidgets.QWidget
@@ -479,10 +480,12 @@ class staticWidget(QWidget):
         # processes images faster than the GUI can render, only the most
         # recent update is rendered after a short quiet period (200 ms).
         self._pending_update_idx = None
-        self._update_timer = QtCore.QTimer(self)
-        self._update_timer.setSingleShot(True)
-        self._update_timer.setInterval(200)  # ms
-        self._update_timer.timeout.connect(self._flush_pending_update)
+        # Per-frame display refresh: THROTTLE (not debounce) — a steady
+        # live stream must still paint every ~200 ms; the latest index
+        # wins via _pending_update_idx (the shared coalescing idiom,
+        # xdart.utils.throttle).
+        self._update_timer = Coalescer(200, mode="throttle", parent=self)
+        self._update_timer.triggered.connect(self._flush_pending_update)
 
     def set_wrangler(self, qint):
         """Sets the wrangler based on the selected item in the dropdown.
@@ -650,8 +653,7 @@ class staticWidget(QWidget):
         if idx == -1:
             # Batch mode finished — just refresh the display
             self._pending_update_idx = -1
-            if not self._update_timer.isActive():
-                self._update_timer.start()
+            self._update_timer.trigger()
             return
 
         # Per-frame mid-scan refresh.  Append idx to scan.frames.index
@@ -791,15 +793,13 @@ class staticWidget(QWidget):
 
         # Record the latest index and start the coalescing timer if it
         # isn't already running.  Throttle, not debounce: during a fast
-        # scan burst (frame inter-arrival < timer interval) we want the
-        # display to refresh every ~200 ms, not only after the burst
-        # settles.  Debounce semantics (.start() unconditionally
-        # restarting the countdown) made the display freeze on whatever
-        # the last completed flush rendered until the scan finished —
-        # visible as "plots only update at end of scan."
+        # scan burst (frame inter-arrival < timer interval) the display
+        # must still refresh every ~200 ms, not only after the burst
+        # settles (debounce here froze plots until end-of-scan).  The
+        # Coalescer is constructed mode="throttle", so trigger() keeps
+        # the pending fire instead of restarting the countdown.
         self._pending_update_idx = idx
-        if not self._update_timer.isActive():
-            self._update_timer.start()
+        self._update_timer.trigger()
 
     def _flush_pending_update(self):
         """Render the most recently received wrangler update.

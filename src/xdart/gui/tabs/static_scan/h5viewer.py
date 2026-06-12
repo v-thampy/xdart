@@ -21,6 +21,7 @@ from xrd_tools.io.image import read_image, count_frames
 from xdart.utils.session import load_session, save_session
 from .ui.h5viewerUI import Ui_Form
 from xdart.modules.live import LiveFrame
+from xdart.utils.throttle import Coalescer
 from .hydrated_raw import (
     HYDRATED_RAW_LIMIT,
     clear_hydrated_raw,
@@ -645,10 +646,12 @@ class H5Viewer(QWidget):
         # single emit ~100 ms after the last chunk lands — and the
         # worker-finished slot forces a final emit so the last
         # paint always reflects the full selection.
-        self._update_coalesce_timer = Qt.QtCore.QTimer(self)
-        self._update_coalesce_timer.setSingleShot(True)
-        self._update_coalesce_timer.setInterval(100)  # ms
-        self._update_coalesce_timer.timeout.connect(self.sigUpdate.emit)
+        # O6: one debounced emit per chunk burst (the shared coalescing
+        # idiom — see xdart.utils.throttle for the throttle-vs-debounce
+        # contract; _on_load_worker_finished force-flushes the tail).
+        self._update_coalesce_timer = Coalescer(100, mode="debounce",
+                                                parent=self)
+        self._update_coalesce_timer.triggered.connect(self.sigUpdate.emit)
         
     def load_starting_defaults(self):
         default_path = os.path.join(utils.get_config_dir(), "last_defaults.json")

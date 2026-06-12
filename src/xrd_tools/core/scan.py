@@ -224,7 +224,14 @@ class FrameSource(Protocol):
 
 @dataclass(slots=True)
 class Scan:
-    """Ordered set of frames with scan-level reduction context."""
+    """Ordered set of frames with scan-level reduction context.
+
+    THE REDUCTION INPUT: what you hand to ``run_reduction`` /
+    ``ReductionSession`` (frames + integrator/poni/geometry/motors).
+    Not to be confused with :class:`xrd_tools.io.read.ProcessedScan`,
+    the read-side handle to an already-processed ``.nxs`` file — see
+    the name-resolution note in CLAUDE.md.
+    """
 
     name: str
     frames: list[ScanFrame]

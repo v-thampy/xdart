@@ -606,10 +606,15 @@ def _slice_stack(dset: h5py.Dataset, positions: np.ndarray, single: bool) -> np.
 class ProcessedScan:
     """Lightweight handle to a processed scan file.
 
-    Thin sugar over the module-level ``get_*`` functions so notebook code
-    can read ``scan.get_1d(3)`` instead of repeating the path.  Holds no
-    open file handle and caches only lightweight metadata; image and
-    integration slices are always read on demand.
+    THE READ-SIDE handle: thin sugar over the module-level ``get_*``
+    functions so notebook code can read ``scan.get_1d(3)`` instead of
+    repeating the path.  Holds no open file handle and caches only
+    lightweight metadata; image and integration slices are always read
+    on demand.  Satisfies the :class:`~xrd_tools.core.scan.FrameSource`
+    contract (contract-pinned), so it also feeds RSM/stitching/
+    reduction directly.  Not to be confused with
+    :class:`xrd_tools.core.scan.Scan`, the reduction INPUT — see the
+    name-resolution note in CLAUDE.md.
     """
 
     def __init__(self, scan_file: str | Path, *, entry: str = "entry",

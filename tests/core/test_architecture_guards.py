@@ -96,3 +96,20 @@ def test_core_capability_imports():
     from xrd_tools.io.frame_view import read_frame_view, iter_frame_views  # noqa: F401
     from xrd_tools.reduction import ReductionSession, run_reduction  # noqa: F401
     from xrd_tools.core.frame_view import FrameView, assert_frameview_equivalent  # noqa: F401
+
+
+def test_wavelength_sentinel_stays_in_xdart():
+    """Policy (greenfield D7): the 1.0 Å default-wavelength sentinel is an
+    xdart-internal acquisition artifact.  The ONLY crossing point into the
+    headless world is xdart's adapter calling the explicit
+    ``allow_default_sentinel`` helpers — xrd_tools itself must never
+    reference the sentinel API (None is the only missing-value sentinel
+    at headless API boundaries)."""
+    offenders = []
+    for path in PACKAGE.rglob("*.py"):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for needle in ("allow_default_sentinel",
+                       "DEFAULT_WAVELENGTH_SENTINEL"):
+            if needle in text:
+                offenders.append(f"{path.relative_to(ROOT)}: {needle}")
+    assert offenders == []

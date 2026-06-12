@@ -73,6 +73,16 @@ deferred-items register lives IN-REPO now**; the old
   never abort a whole-scan save.  Carry `metadata_raw` + `metadata_numeric`.
 - When fixing a bug, label it **regression** vs **pre-existing**.
 
+## Name resolution (the two Scans, and Live*)
+- `xrd_tools.core.scan.Scan` — the reduction INPUT (frames + context);
+  `xrd_tools.io.read.ProcessedScan` — the read-side handle to a processed
+  `.nxs` (alias `io.read.Scan` is deprecated).  Both satisfy
+  `FrameSource`.
+- `LiveFrame`/`LiveScan` are xdart's mutable acquisition-side objects;
+  public imports go through the `xdart.modules.live` facade (the
+  `modules/ewald/` path is the historical in-package home — do not
+  rename it; the facade is the API).
+
 ## Package map — `src/xrd_tools/`
 - **`core/`** — pure contracts, import-light.  `containers` (`PONI`,
   `IntegrationResult1D/2D`), `frame_view` (`Axis`, `TwoDKind`, `FrameView`,
