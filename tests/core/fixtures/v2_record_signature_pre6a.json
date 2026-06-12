@@ -1,0 +1,462 @@
+{
+ "/": {
+  "attrs": {
+   "HDF5_Version": "f22abd6773ab2328",
+   "creator": "6331f34146883a32",
+   "creator_version": "31186721be50d103",
+   "file_name": "bc136b71afb8114d",
+   "file_time": "6503ee34619296fb",
+   "h5py_version": "a7c8371a5a7b55d0"
+  },
+  "kind": "group"
+ },
+ "entry": {
+  "attrs": {
+   "NX_class": "672a7eb0757166d4",
+   "default": "fd16e25311dc5fef",
+   "source_base": "c7f5ce2ffdae7b05"
+  },
+  "kind": "group"
+ },
+ "entry/frames": {
+  "attrs": {
+   "NX_class": "874b39c28ff5892b"
+  },
+  "kind": "group"
+ },
+ "entry/frames/frame_0000": {
+  "attrs": {
+   "NX_class": "874b39c28ff5892b"
+  },
+  "kind": "group"
+ },
+ "entry/frames/frame_0000/source": {
+  "attrs": {
+   "NX_class": "874b39c28ff5892b"
+  },
+  "kind": "group"
+ },
+ "entry/frames/frame_0000/source/frame_index": {
+  "attrs": {},
+  "dtype": "int64",
+  "kind": "dataset",
+  "shape": [],
+  "value": "af5570f5a1810b7a"
+ },
+ "entry/frames/frame_0000/source/path": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "2c89472dbe5e27b8"
+ },
+ "entry/frames/frame_0000/thumbnail": {
+  "attrs": {
+   "dtype": "86768c6a5f7b7aad",
+   "vmax": "e813a4d5118962f7",
+   "vmin": "4940eeb364bd6079"
+  },
+  "dtype": "uint8",
+  "kind": "dataset",
+  "shape": [
+   32,
+   30
+  ],
+  "value": "28a31be520f96a35"
+ },
+ "entry/frames/frame_0001": {
+  "attrs": {
+   "NX_class": "874b39c28ff5892b"
+  },
+  "kind": "group"
+ },
+ "entry/frames/frame_0001/source": {
+  "attrs": {
+   "NX_class": "874b39c28ff5892b"
+  },
+  "kind": "group"
+ },
+ "entry/frames/frame_0001/source/frame_index": {
+  "attrs": {},
+  "dtype": "int64",
+  "kind": "dataset",
+  "shape": [],
+  "value": "af5570f5a1810b7a"
+ },
+ "entry/frames/frame_0001/source/path": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "37a5d93895678b5e"
+ },
+ "entry/frames/frame_0001/thumbnail": {
+  "attrs": {
+   "dtype": "86768c6a5f7b7aad",
+   "vmax": "3b7ecd21e834871e",
+   "vmin": "777e00243be2052f"
+  },
+  "dtype": "uint8",
+  "kind": "dataset",
+  "shape": [
+   32,
+   30
+  ],
+  "value": "510607174f3cf3d9"
+ },
+ "entry/frames/frame_0002": {
+  "attrs": {
+   "NX_class": "874b39c28ff5892b"
+  },
+  "kind": "group"
+ },
+ "entry/frames/frame_0002/source": {
+  "attrs": {
+   "NX_class": "874b39c28ff5892b"
+  },
+  "kind": "group"
+ },
+ "entry/frames/frame_0002/source/frame_index": {
+  "attrs": {},
+  "dtype": "int64",
+  "kind": "dataset",
+  "shape": [],
+  "value": "af5570f5a1810b7a"
+ },
+ "entry/frames/frame_0002/source/path": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "370f0c120886a727"
+ },
+ "entry/frames/frame_0002/thumbnail": {
+  "attrs": {
+   "dtype": "86768c6a5f7b7aad",
+   "vmax": "f7d1d1ac2d1c6982",
+   "vmin": "9ef56932ab92571b"
+  },
+  "dtype": "uint8",
+  "kind": "dataset",
+  "shape": [
+   32,
+   30
+  ],
+  "value": "7603c4a7e9b71527"
+ },
+ "entry/instrument": {
+  "attrs": {
+   "NX_class": "debb21de47e4cd5c"
+  },
+  "kind": "group"
+ },
+ "entry/instrument/detector": {
+  "attrs": {
+   "NX_class": "0f8866dbe9157dc8"
+  },
+  "kind": "group"
+ },
+ "entry/instrument/detector/dist": {
+  "attrs": {},
+  "dtype": "float64",
+  "kind": "dataset",
+  "shape": [],
+  "value": "45d2b662d9d490ae"
+ },
+ "entry/instrument/detector/mask": {
+  "attrs": {
+   "description": "33a39e73b7fc72ba"
+  },
+  "dtype": "int64",
+  "kind": "dataset",
+  "shape": [
+   3
+  ],
+  "value": "b727be35ffed3c78"
+ },
+ "entry/instrument/detector/poni1": {
+  "attrs": {},
+  "dtype": "float64",
+  "kind": "dataset",
+  "shape": [],
+  "value": "7f925b2036e92fe2"
+ },
+ "entry/instrument/detector/poni2": {
+  "attrs": {},
+  "dtype": "float64",
+  "kind": "dataset",
+  "shape": [],
+  "value": "7f925b2036e92fe2"
+ },
+ "entry/instrument/detector/rot1": {
+  "attrs": {},
+  "dtype": "float64",
+  "kind": "dataset",
+  "shape": [],
+  "value": "af5570f5a1810b7a"
+ },
+ "entry/instrument/detector/rot2": {
+  "attrs": {},
+  "dtype": "float64",
+  "kind": "dataset",
+  "shape": [],
+  "value": "af5570f5a1810b7a"
+ },
+ "entry/instrument/detector/rot3": {
+  "attrs": {},
+  "dtype": "float64",
+  "kind": "dataset",
+  "shape": [],
+  "value": "af5570f5a1810b7a"
+ },
+ "entry/integrated_1d": {
+  "attrs": {
+   "NX_class": "2ad9a930766abd87",
+   "_frame_index_strictly_increasing": "4bf5122f344554c5",
+   "axes": "14ef264109ad8604",
+   "signal": "d0854ad1c7e25944"
+  },
+  "kind": "group"
+ },
+ "entry/integrated_1d/frame_index": {
+  "attrs": {},
+  "dtype": "int64",
+  "kind": "dataset",
+  "shape": [
+   3
+  ],
+  "value": "ab25350e3e65efeb"
+ },
+ "entry/integrated_1d/intensity": {
+  "attrs": {},
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   3,
+   32
+  ],
+  "value": "0d88d7d369bc39b1"
+ },
+ "entry/integrated_1d/q": {
+  "attrs": {
+   "units": "d6687e4288dea7ed"
+  },
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   32
+  ],
+  "value": "9a88eb695b581dc8"
+ },
+ "entry/integrated_1d/sigma": {
+  "attrs": {},
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   3,
+   32
+  ],
+  "value": "6881b325f54677e6"
+ },
+ "entry/integrated_2d": {
+  "attrs": {
+   "NX_class": "2ad9a930766abd87",
+   "_frame_index_strictly_increasing": "4bf5122f344554c5",
+   "axes": "d79dfbaeff94fdab",
+   "signal": "d0854ad1c7e25944",
+   "two_d_kind": "1edb78caacf6f0d5"
+  },
+  "kind": "group"
+ },
+ "entry/integrated_2d/chi": {
+  "attrs": {
+   "units": "f8b61df211696e11"
+  },
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   16
+  ],
+  "value": "5943219f206e8491"
+ },
+ "entry/integrated_2d/frame_index": {
+  "attrs": {},
+  "dtype": "int64",
+  "kind": "dataset",
+  "shape": [
+   3
+  ],
+  "value": "ab25350e3e65efeb"
+ },
+ "entry/integrated_2d/intensity": {
+  "attrs": {},
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   3,
+   16,
+   32
+  ],
+  "value": "064eef5266c21f81"
+ },
+ "entry/integrated_2d/q": {
+  "attrs": {
+   "units": "d6687e4288dea7ed"
+  },
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   32
+  ],
+  "value": "9a88eb695b581dc8"
+ },
+ "entry/reduction": {
+  "attrs": {
+   "NX_class": "b8186fc624c1e2c6"
+  },
+  "kind": "group"
+ },
+ "entry/reduction/config": {
+  "attrs": {
+   "NX_class": "874b39c28ff5892b"
+  },
+  "kind": "group"
+ },
+ "entry/reduction/config/bai_1d_args": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "45c0f42842b99e7b"
+ },
+ "entry/reduction/config/bai_2d_args": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "626ce8741f9d7337"
+ },
+ "entry/reduction/date": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "<volatile>"
+ },
+ "entry/reduction/host": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "3a4fcc4ef74cac31"
+ },
+ "entry/reduction/platform": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "<volatile>"
+ },
+ "entry/reduction/program": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "8e757d6608dc01ed"
+ },
+ "entry/reduction/version": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "6e340b9cffb37a98"
+ },
+ "entry/reduction/versions": {
+  "attrs": {
+   "NX_class": "<volatile>"
+  },
+  "kind": "group"
+ },
+ "entry/reduction/versions/h5py": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "<volatile>"
+ },
+ "entry/reduction/versions/numpy": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "<volatile>"
+ },
+ "entry/reduction/versions/pyFAI": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "<volatile>"
+ },
+ "entry/reduction/versions/pymatgen": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "<volatile>"
+ },
+ "entry/reduction/versions/python": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "<volatile>"
+ },
+ "entry/reduction/versions/xrd-tools": {
+  "attrs": {},
+  "dtype": "object",
+  "kind": "dataset",
+  "shape": [],
+  "value": "<volatile>"
+ },
+ "entry/scan_data": {
+  "attrs": {
+   "NX_class": "874b39c28ff5892b",
+   "_frame_index_strictly_increasing": "4bf5122f344554c5"
+  },
+  "kind": "group"
+ },
+ "entry/scan_data/frame_index": {
+  "attrs": {},
+  "dtype": "int64",
+  "kind": "dataset",
+  "shape": [
+   3
+  ],
+  "value": "ab25350e3e65efeb"
+ },
+ "entry/scan_data/i0": {
+  "attrs": {
+   "description": "1095af6a8c21eb13",
+   "ssrl_dtype": "6a937d727b77c219"
+  },
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   3
+  ],
+  "value": "c2ae2ef0ecfd9459"
+ },
+ "entry/scan_data/tth": {
+  "attrs": {
+   "description": "1095af6a8c21eb13",
+   "ssrl_dtype": "6a937d727b77c219"
+  },
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   3
+  ],
+  "value": "b04783b5731f8446"
+ }
+}
