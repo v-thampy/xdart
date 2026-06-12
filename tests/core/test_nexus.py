@@ -596,7 +596,9 @@ class TestWriteNexus:
         with h5py.File(p, "r") as f:
             assert "reduction" in f["entry"]
             assert f["entry/reduction"].attrs["NX_class"] == "NXprocess"
-            assert f["entry/reduction"].attrs["program"] == "xrd_tools"
+            # Persisted-format literal: stays "ssrl_xrd_tools" across the
+            # monorepo rename (stable on-disk output).
+            assert f["entry/reduction"].attrs["program"] == "ssrl_xrd_tools"
 
     def test_overwrite(self, tmp_path, result_1d):
         p = tmp_path / "over.h5"

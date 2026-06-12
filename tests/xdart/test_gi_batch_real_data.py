@@ -20,7 +20,7 @@ import h5py
 import numpy as np
 import pytest
 
-_DEFAULT_DATA = Path(__file__).resolve().parents[2] / "test_data"
+_DEFAULT_DATA = Path(__file__).resolve().parents[3] / "test_data"
 DATA = Path(os.environ.get("XDART_TEST_DATA", _DEFAULT_DATA))
 TIFF = DATA / "Tiff"
 EIGER = DATA / "eiger"

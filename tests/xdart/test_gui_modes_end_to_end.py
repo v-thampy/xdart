@@ -28,7 +28,7 @@ import pytest
 pytestmark = pytest.mark.gui
 
 _DATA = Path(os.environ.get("XDART_TEST_DATA",
-                            Path(__file__).resolve().parents[2] / "test_data"))
+                            Path(__file__).resolve().parents[3] / "test_data"))
 
 
 @pytest.fixture(scope="module")
