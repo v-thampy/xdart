@@ -270,11 +270,34 @@ def _xye_plot_payload(widget, state):
     with widget.data_lock:
         frames = {i: widget.data_1d.get(i) for i in render_ids}
 
+    store = getattr(widget, "publication_store", None)
+
+    def _frame_data(idx):
+        """(radial, intensity, source_file) — publication first (X1),
+        legacy data_1d frame as the fallback while the dict exists."""
+        if store is not None:
+            pub = store.get(idx)
+            if (pub is not None and pub.view.intensity_1d is not None
+                    and pub.view.axis_1d is not None
+                    and pub.view.axis_1d.values is not None):
+                src = str(pub.metadata_raw.get('source_file', '') or '')
+                return (np.asarray(pub.view.axis_1d.values, dtype=float),
+                        np.asarray(pub.view.intensity_1d, dtype=float),
+                        src)
+        fr = frames.get(idx)
+        int_1d = getattr(fr, 'int_1d', None) if fr is not None else None
+        if int_1d is None:
+            return None
+        sinfo = getattr(fr, 'scan_info', None) or {}
+        return (np.asarray(int_1d.radial, dtype=float),
+                np.asarray(int_1d.intensity, dtype=float),
+                str(sinfo.get('source_file', '') or ''))
+
+    data = {i: _frame_data(i) for i in render_ids}
+
     # X-axis label from the first selected file's prefix (not a transform combo).
-    first = frames.get(render_ids[0])
-    source_name = ''
-    if first is not None and getattr(first, 'scan_info', None):
-        source_name = first.scan_info.get('source_file', '') or ''
+    first = data.get(render_ids[0])
+    source_name = first[2] if first is not None else ''
     first_unit = xye_unit_from_filename(source_name)
     xlabel, xunits = x_axis_for_unit(first_unit)
 
@@ -283,10 +306,8 @@ def _xye_plot_payload(widget, state):
     if len(render_ids) > 1:
         units = set()
         for i in render_ids:
-            fr = frames.get(i)
-            sinfo = getattr(fr, 'scan_info', None) if fr is not None else None
-            src = sinfo.get('source_file', '') if sinfo else ''
-            u = xye_unit_from_filename(src)
+            d = data.get(i)
+            u = xye_unit_from_filename(d[2] if d is not None else '')
             if u != 'unknown':
                 units.add(u)
         if len(units) > 1:
@@ -296,22 +317,19 @@ def _xye_plot_payload(widget, state):
                 'incompatible axes.', sorted(units), first_unit,
             )
 
-    first_int = getattr(first, 'int_1d', None) if first is not None else None
-    if first_int is None:
+    if first is None:
         return None
 
     traces = []
     for i in render_ids:
-        fr = frames.get(i)
-        int_1d = getattr(fr, 'int_1d', None) if fr is not None else None
-        if int_1d is None:
+        d = data.get(i)
+        if d is None:
             continue
-        sinfo = getattr(fr, 'scan_info', None) or {}
-        fname = sinfo.get('source_file', f'xye_{i}')
+        radial, intensity, src = d
         traces.append(Trace(
-            os.path.basename(fname),
-            np.asarray(int_1d.radial, dtype=float),
-            np.asarray(int_1d.intensity, dtype=float),
+            os.path.basename(src or f'xye_{i}'),
+            radial,
+            intensity,
         ))
     if not traces:
         return None
