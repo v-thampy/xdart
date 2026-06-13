@@ -1288,6 +1288,38 @@ def validate_integrated_stack_write(
     return fis
 
 
+_NP_DTYPES = {"float32": np.float32, "int64": np.int64}
+
+
+def _create_group_from_schema(entry_grp: h5py.Group, group_name: str) -> h5py.Group:
+    """2b: create + stamp a group from its SCHEMA declaration.  Static NX
+    attrs only — runtime-valued attrs (two_d_kind, the monotonic flag) are
+    stamped by the caller."""
+    spec = SCHEMA.groups[group_name]
+    g = entry_grp.create_group(group_name)
+    for key, value in spec.nx_attrs.items():
+        g.attrs[key] = list(value) if isinstance(value, tuple) else value
+    return g
+
+
+def _schema_dataset(g: h5py.Group, group_name: str, name: str, data,
+                    *, ck: dict, row_chunk: tuple | None = None) -> h5py.Dataset:
+    """2b: create one dataset per its DatasetSpec — dtype, compression and
+    chunk strategy derive from the schema; SHAPES are runtime (row_chunk
+    carries the rows/frame chunk tuple for row-aligned stacks)."""
+    spec = SCHEMA.groups[group_name].datasets[name]
+    data = np.asarray(data, _NP_DTYPES[spec.dtype])
+    kwargs = {}
+    if spec.chunk_style == "labels":
+        kwargs.update(maxshape=(None,), chunks=(64,))
+    elif spec.chunk_style in ("rows", "frame"):
+        assert row_chunk is not None, (group_name, name)
+        kwargs.update(maxshape=(None,) + data.shape[1:], chunks=row_chunk)
+    if spec.compressed:
+        kwargs.update(ck)
+    return g.create_dataset(spec.name, data=data, **kwargs)
+
+
 def write_integrated_stack(
     entry_grp: h5py.Group,
     *,
@@ -1323,22 +1355,20 @@ def write_integrated_stack(
     ck = _comp_kwargs(compression)
 
     def _bulk_create_1d():
+        # 2b: names/dtypes/chunk-strategy/compression derive from SCHEMA;
+        # only the runtime shapes and values are computed here.
         r0 = results_1d[0]
         n_q = np.asarray(r0.intensity).shape[0]
         rows = max(1, min(len(fis), 32))
-        g = entry_grp.create_group("integrated_1d")
-        g.attrs["NX_class"] = "NXdata"
-        g.attrs["signal"] = "intensity"
-        g.attrs["axes"] = ["frame_index", "q"]
-        g.create_dataset(
-            "intensity",
-            data=np.stack([np.asarray(r.intensity, np.float32) for r in results_1d]),
-            maxshape=(None, n_q), chunks=(rows, n_q), **ck,
+        g = _create_group_from_schema(entry_grp, "integrated_1d")
+        _schema_dataset(
+            g, "integrated_1d", "intensity",
+            np.stack([np.asarray(r.intensity, np.float32) for r in results_1d]),
+            ck=ck, row_chunk=(rows, n_q),
         )
-        qd = g.create_dataset("q", data=np.asarray(r0.radial, np.float32))
-        qd.attrs["units"] = r0.unit
-        g.create_dataset("frame_index", data=np.asarray(fis, np.int64),
-                         maxshape=(None,), chunks=(64,))
+        qd = _schema_dataset(g, "integrated_1d", "q", r0.radial, ck=ck)
+        qd.attrs["units"] = r0.unit            # units_from="radial_unit"
+        _schema_dataset(g, "integrated_1d", "frame_index", fis, ck=ck)
         g.attrs[MONOTONIC_ATTR] = bool(
             len(fis) < 2 or np.all(np.diff(fis) > 0)
         )
@@ -1350,30 +1380,28 @@ def write_integrated_stack(
                  else np.full(n_q, np.nan, np.float32))
                 for r in results_1d
             ])
-            g.create_dataset("sigma", data=sig,
-                             maxshape=(None, n_q), chunks=(rows, n_q), **ck)
+            _schema_dataset(g, "integrated_1d", "sigma", sig,
+                            ck=ck, row_chunk=(rows, n_q))
 
     def _bulk_create_2d():
+        # 2b: schema-derived like _bulk_create_1d; two_d_kind and the
+        # monotonic flag are runtime-valued capability attrs.
         r0 = results_2d[0]
         stacked = np.stack(
             [np.asarray(r.intensity, np.float32).T for r in results_2d]
         )  # (N, n_chi, n_q)
         n_chi, n_q = stacked.shape[1], stacked.shape[2]
-        g = entry_grp.create_group("integrated_2d")
-        g.attrs["NX_class"] = "NXdata"
-        g.attrs["signal"] = "intensity"
-        g.attrs["axes"] = ["frame_index", "chi", "q"]
+        g = _create_group_from_schema(entry_grp, "integrated_2d")
         g.attrs["two_d_kind"] = two_d_kind_from_units(
             r0.unit, r0.azimuthal_unit
         ).value
-        g.create_dataset("intensity", data=stacked,
-                         maxshape=(None, n_chi, n_q), chunks=(1, n_chi, n_q), **ck)
-        qd = g.create_dataset("q", data=np.asarray(r0.radial, np.float32))
-        qd.attrs["units"] = r0.unit
-        cd = g.create_dataset("chi", data=np.asarray(r0.azimuthal, np.float32))
-        cd.attrs["units"] = r0.azimuthal_unit
-        g.create_dataset("frame_index", data=np.asarray(fis, np.int64),
-                         maxshape=(None,), chunks=(64,))
+        _schema_dataset(g, "integrated_2d", "intensity", stacked,
+                        ck=ck, row_chunk=(1, n_chi, n_q))
+        qd = _schema_dataset(g, "integrated_2d", "q", r0.radial, ck=ck)
+        qd.attrs["units"] = r0.unit            # units_from="radial_unit"
+        cd = _schema_dataset(g, "integrated_2d", "chi", r0.azimuthal, ck=ck)
+        cd.attrs["units"] = r0.azimuthal_unit  # units_from="azimuthal_unit"
+        _schema_dataset(g, "integrated_2d", "frame_index", fis, ck=ck)
         g.attrs[MONOTONIC_ATTR] = bool(
             len(fis) < 2 or np.all(np.diff(fis) > 0)
         )
@@ -1384,9 +1412,8 @@ def write_integrated_stack(
                  else np.full((n_chi, n_q), np.nan, np.float32))
                 for r in results_2d
             ])
-            g.create_dataset("sigma", data=sig,
-                             maxshape=(None, n_chi, n_q),
-                             chunks=(1, n_chi, n_q), **ck)
+            _schema_dataset(g, "integrated_2d", "sigma", sig,
+                            ck=ck, row_chunk=(1, n_chi, n_q))
 
     if results_1d is not None and len(results_1d):
         if len(results_1d) != len(fis):
@@ -1617,21 +1644,24 @@ def write_per_frame_geometry(
 
     frame_idx_arr = np.asarray(fis if fis else range(len(scan_data)), dtype=np.int64)
     ck = _comp_kwargs(compression)
-    g = entry_grp.create_group("per_frame_geometry")
-    g.attrs["NX_class"] = "NXcollection"
+    g = _create_group_from_schema(entry_grp, "per_frame_geometry")
     g.attrs[MONOTONIC_ATTR] = bool(
         len(frame_idx_arr) < 2 or np.all(np.diff(frame_idx_arr) > 0)
     )
-    g.create_dataset("frame_index", data=frame_idx_arr, maxshape=(None,), chunks=(64,))
+    _schema_dataset(g, "per_frame_geometry", "frame_index", frame_idx_arr,
+                    ck=ck)
+    geo_specs = SCHEMA.groups["per_frame_geometry"].datasets
     for key, arr in derived.items():
-        ds = g.create_dataset(
-            key,
-            data=np.asarray(arr, dtype=np.float32),
-            maxshape=(None,),
-            chunks=(64,),
-            **ck,
-        )
-        ds.attrs["units"] = "deg" if key == "incident_angle" else "rad"
+        spec = geo_specs.get(key)
+        if spec is not None:
+            ds = _schema_dataset(g, "per_frame_geometry", key, arr, ck=ck)
+            ds.attrs["units"] = spec.units_from
+        else:
+            # future derive_per_frame outputs not yet declared: identical
+            # legacy fallback (float32, compressed, rad)
+            ds = g.create_dataset(key, data=np.asarray(arr, dtype=np.float32),
+                                  maxshape=(None,), chunks=(64,), **ck)
+            ds.attrs["units"] = "rad"
 
 
 def write_scan_metadata(

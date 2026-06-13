@@ -138,18 +138,20 @@ def _integrated_datasets(axes: tuple[str, ...]) -> "Mapping[str, DatasetSpec]":
 _GEOMETRY_DATASETS: "Mapping[str, DatasetSpec]" = MappingProxyType({
     "frame_index": DatasetSpec("frame_index", "int64", "row_label",
                                row_aligned=True, chunk_style="labels"),
+    # the derived angle series ARE compressed (unlike the label column)
     "rot1": DatasetSpec("rot1", "float32", "signal", row_aligned=True,
-                        required=False, chunk_style="labels",
-                        units_from="rad"),
+                        required=False, compressed=True,
+                        chunk_style="labels", units_from="rad"),
     "rot2": DatasetSpec("rot2", "float32", "signal", row_aligned=True,
-                        required=False, chunk_style="labels",
-                        units_from="rad"),
+                        required=False, compressed=True,
+                        chunk_style="labels", units_from="rad"),
     "rot3": DatasetSpec("rot3", "float32", "signal", row_aligned=True,
-                        required=False, chunk_style="labels",
-                        units_from="rad"),
+                        required=False, compressed=True,
+                        chunk_style="labels", units_from="rad"),
     "incident_angle": DatasetSpec("incident_angle", "float32", "signal",
                                   row_aligned=True, required=False,
-                                  chunk_style="labels", units_from="deg"),
+                                  compressed=True, chunk_style="labels",
+                                  units_from="deg"),
 })
 
 
