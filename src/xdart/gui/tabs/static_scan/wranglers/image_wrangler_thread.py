@@ -1433,6 +1433,12 @@ class imageThread(wranglerThread):
         self._enter_pause()
         while self.command == 'pause':
             time.sleep(0.05)
+        # Resume (or stop): clear the session's paused flag (4a) so the next
+        # adapter.submit() isn't rejected.  No-op without an adapter / when
+        # not paused / finished; harmless on the stop path.
+        adapter = getattr(self, '_scan_session_adapter', None)
+        if adapter is not None:
+            adapter.resume()
 
     #: Bound the pause drain so a hung pool worker (stalled IO / runaway pyFAI)
     #: can't deadlock the pause; the wait also bails early on Stop/close.
@@ -1456,16 +1462,21 @@ class imageThread(wranglerThread):
         can't strand the pause or block Stop/close.
         """
         try:
+            adapter = getattr(self, '_scan_session_adapter', None)
             session = getattr(self, '_streaming_session', None)
             sink = getattr(self, '_streaming_sink', None)
             scan = self._active_scan
-            # Drain any open streaming session first (a no-op when nothing is
-            # in-flight) so the writer is provably idle before we touch the
-            # file from THIS thread.
+            timeout = getattr(self, 'PAUSE_DRAIN_TIMEOUT', 30.0)
+            # Quiesce any open streaming session first (a no-op when nothing
+            # is in-flight) so the writer is provably idle before we touch the
+            # file from THIS thread.  4c-1: route through the adapter, which
+            # delegates to ReductionSession.pause (sets is_paused + drains);
+            # _wait_if_paused calls adapter.resume() when the pause ends.
             drained = True
-            if session is not None:
-                drained = session.drain(
-                    timeout=getattr(self, 'PAUSE_DRAIN_TIMEOUT', 30.0))
+            if adapter is not None:
+                drained = adapter.quiesce(timeout=timeout)
+            elif session is not None:
+                drained = session.drain(timeout=timeout)
             if not drained:
                 # RS-1: the writer is provably NOT idle (a stalled worker) — a
                 # save/flush from this thread would race the writer's own
@@ -1487,10 +1498,13 @@ class imageThread(wranglerThread):
                         _get_h5pool().resume(scan.data_file)
                 self._flush_xye_buffer(scan)
                 self._frames_since_save = 0
-            elif session is not None and sink is not None:
+            elif adapter is not None:
                 # Streaming path (batch / reprocess / live Phase 2): in-flight
-                # window drained (non-terminal — session stays open) + flush.
-                sink._flush(force=True)
+                # window drained (non-terminal — session stays open) + flush
+                # via the adapter (h5pool bracket stays in QtNexusSink._flush).
+                adapter.flush()
+            elif session is not None and sink is not None:
+                sink._flush(force=True)        # defensive (no adapter built)
         except Exception:
             # A drain/flush failure must not strand the run; log loudly and
             # still signal the pause (we've stopped submitting, so the writer is
@@ -1649,6 +1663,7 @@ class imageThread(wranglerThread):
         session, sink = self._get_streaming_session(scan, frames)
         if session is None:
             return 0
+        adapter = self._scan_session_adapter
         count = 0
         for live in frames:
             self._wait_if_paused()        # pause between frames (streaming path)
@@ -1658,28 +1673,12 @@ class imageThread(wranglerThread):
             # (QtNexusSink._emit_frame_status) so the label tracks what the
             # plots show -- emitting here at submit time raced frames ahead
             # of the display in the parallel pipeline.
-            sink.register(live)
-            try:
-                session.submit(frame_from_live_frame(live))
-            except BaseException as exc:
-                # submit() re-raises a RECORDED writer/sink failure at its
-                # fail-loud precheck.  Bare, that raise escapes run() (which
-                # has no except) and tears down the QThread, bypassing the
-                # 'Save FAILED' -> stop chain entirely.  Catch it here and
-                # stop the run loudly instead (same treatment the
-                # GIFreezeError path got).
-                msg = f'Save FAILED mid-run: {exc} — stopping the run.'
-                logger.error(msg, exc_info=True)
-                try:
-                    self.showLabel.emit(msg)
-                except Exception:
-                    pass
-                _lock = getattr(self, "command_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        self.command = 'stop'
-                else:
-                    self.command = 'stop'
+            #
+            # 4c-1: register+submit + the stop-on-write-failure translation
+            # (which must NOT raise out of run(), or it tears down the
+            # QThread) live in the adapter; it returns False on failure
+            # after setting command='stop'.
+            if not adapter.submit(live):
                 break
             count += 1
         return count
@@ -1728,10 +1727,16 @@ class imageThread(wranglerThread):
             self._streaming_session = None
             self._streaming_sink = None
             self._streaming_scan_id = None
+            self._scan_session_adapter = None
             return None, None
         self._streaming_session = session
         self._streaming_sink = sink
         self._streaming_scan_id = id(scan)
+        # 4c-1: the per-frame submit + pause quiesce/flush route through one
+        # adapter (it owns the stop-on-write-failure translation + delegates
+        # quiesce to ReductionSession.pause).
+        from .scan_session import ScanSessionAdapter
+        self._scan_session_adapter = ScanSessionAdapter(self, scan, session, sink)
         return session, sink
 
     def _dispatch_batch_parallel(self, scan, pending):

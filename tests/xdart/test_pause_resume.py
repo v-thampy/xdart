@@ -344,3 +344,101 @@ def test_serial_dispatch_drains_xye_buffer_without_nxs_save():
     w.xye_only = False
     w._dispatch_batch_serial(scan, [])
     assert flushed == []
+
+
+# ── 4c-1: _enter_pause / _wait_if_paused route through ScanSessionAdapter ────
+
+class _SpyAdapter:
+    """Records quiesce/flush/resume; the production pause path (4c-1)."""
+    def __init__(self, drained=True):
+        self._drained = drained
+        self.calls = []
+        self._paused = False
+
+    def quiesce(self, timeout=None):
+        self.calls.append(('quiesce', timeout))
+        self._paused = self._drained
+        return self._drained
+
+    def flush(self):
+        self.calls.append('flush')
+
+    def resume(self):
+        self.calls.append('resume')
+        self._paused = False
+
+    @property
+    def is_paused(self):
+        return self._paused
+
+
+def test_enter_pause_streaming_routes_through_adapter():
+    """With an adapter present (production streaming), _enter_pause quiesces
+    via the adapter (session.pause: flag+drain) then flushes via the adapter,
+    BEFORE sigPaused — the legacy bare session.drain/sink._flush are bypassed."""
+    adapter = _SpyAdapter()
+    emitted = []
+    # legacy session/sink present too, but the adapter must win and they must
+    # NOT be touched.
+    session = SimpleNamespace(drain=lambda timeout=None: emitted.append('LEGACY_drain') or True)
+    sink = SimpleNamespace(_flush=lambda *, force=False: emitted.append('LEGACY_flush'))
+    w = SimpleNamespace(
+        _scan_session_adapter=adapter,
+        _streaming_session=session, _streaming_sink=sink,
+        _active_scan=None, xye_only=False, _frames_since_save=0,
+        sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
+    )
+    w._enter_pause = MethodType(imageThread._enter_pause, w)
+    w._enter_pause()
+
+    assert adapter.calls == [('quiesce', 30.0), 'flush']   # quiesce before flush
+    assert 'LEGACY_drain' not in emitted and 'LEGACY_flush' not in emitted
+    assert emitted == ['paused']
+
+
+def test_enter_pause_serial_tail_wins_with_adapter_present(monkeypatch):
+    """The serial-tail routing survives the adapter: in live-watch the adapter
+    (dormant streaming session) is quiesced, but the SERIAL flush wins and the
+    adapter's sink flush is NOT called (would mis-route the watch tail)."""
+    monkeypatch.setattr(itmod, '_get_h5pool',
+                        lambda: SimpleNamespace(pause=lambda f: None,
+                                                resume=lambda f: None))
+    adapter = _SpyAdapter()
+    order = []
+    scan = SimpleNamespace(data_file='x.nxs',
+                           _save_to_nexus=lambda: order.append('save'))
+    w = SimpleNamespace(
+        _scan_session_adapter=adapter,
+        _streaming_session=SimpleNamespace(), _streaming_sink=SimpleNamespace(),
+        _active_scan=scan, xye_only=False, _frames_since_save=4,
+        file_lock=threading.RLock(),
+        _flush_xye_buffer=lambda s: order.append('xye'),
+        sigPaused=SimpleNamespace(emit=lambda: order.append('paused')),
+    )
+    w._enter_pause = MethodType(imageThread._enter_pause, w)
+    w._enter_pause()
+
+    assert adapter.calls == [('quiesce', 30.0)]      # quiesced, but NOT flushed
+    assert 'flush' not in adapter.calls
+    assert 'save' in order and 'xye' in order
+    assert w._frames_since_save == 0
+    assert order[-1] == 'paused'
+
+
+def test_wait_if_paused_resumes_adapter_on_exit():
+    """On leaving the pause spin (resume), _wait_if_paused clears the session
+    pause flag via adapter.resume() so the next submit isn't rejected (4a)."""
+    adapter = _SpyAdapter()
+    w = SimpleNamespace(command='pause', _scan_session_adapter=adapter)
+    w._enter_pause = lambda: adapter.calls.append('enter')
+    w._wait_if_paused = MethodType(imageThread._wait_if_paused, w)
+
+    done = []
+    t = threading.Thread(target=lambda: (w._wait_if_paused(), done.append(True)))
+    t.start()
+    time.sleep(0.1)
+    assert 'resume' not in adapter.calls      # not resumed while still paused
+    w.command = 'start'
+    t.join(timeout=2)
+    assert done == [True]
+    assert adapter.calls[-1] == 'resume'      # resumed on exit

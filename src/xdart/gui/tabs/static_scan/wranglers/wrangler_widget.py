@@ -450,6 +450,7 @@ class wranglerThread(Qt.QtCore.QThread):
         self._streaming_session = None
         self._streaming_sink = None
         self._streaming_scan_id = None
+        self._scan_session_adapter = None        # 4c-1: adapter dies with the session
         self._gi_prepass_scan_id = None      # next scan re-runs its own pre-pass
         # BLOCKER 2: finish() is fail-loud — a streaming sink/write failure now
         # RAISES instead of being silently swallowed (the user must not think a
