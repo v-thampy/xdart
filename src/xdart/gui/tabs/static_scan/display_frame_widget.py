@@ -53,7 +53,7 @@ from .display_logic import (
     build_payload, render_plan, controller_for, ImagePayload,
     empty_display_state, PANEL_LAYOUT,
     resolve_selection, resolve_render_ids,
-    default_plot_unit, pretty_unit,
+    default_plot_unit, pretty_unit, sentinel_mask,
 )
 from .display_controllers import register_default_controllers
 
@@ -1577,6 +1577,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 frame_2d = self.data_2d.get(self.idxs_2d[0])
             mask = frame_2d['mask'] if frame_2d is not None else None
         data = np.asarray(data, dtype=float)
+
+        # Mask detector sentinels (uint16 65535 / uint32 ceiling) to NaN, for
+        # PARITY with the payload path (display_publication.raw_image, which
+        # already calls sentinel_mask).  The legacy update_image path — which the
+        # live Int-raw panel uses (the cake reads the store; the raw panel does
+        # not) — previously skipped this, so a TIFF whose invalid pixels sit at
+        # the uint16 ceiling rendered them as bright bands/speckle instead of
+        # masked.  No-op when no sentinels are present (the <1e-4 fraction guard).
+        data = sentinel_mask(data)
 
         # Apply detector + global mask only to full-resolution raw data.
         # Thumbnails already bake the mask into the preview before

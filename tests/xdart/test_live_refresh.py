@@ -720,6 +720,36 @@ def test_update_image_blanks_during_run_when_flag_off():
     assert cleared == [True]
 
 
+def test_update_image_masks_uint16_sentinels_in_legacy_path():
+    """Regression: the live Int-raw panel uses the LEGACY update_image path (the
+    cake reads the store; the raw panel does not).  That path must mask the
+    uint16-ceiling (65535) detector sentinels to NaN — for parity with the
+    payload path (display_publication.raw_image) — or a TIFF whose invalid
+    pixels sit at the ceiling renders them as bright bands/speckle."""
+    from threading import RLock
+
+    raw = np.full((100, 100), 500.0)
+    raw[10:20, :] = 65535.0          # a masked band of uint16 sentinels (1000 px)
+    captured = []
+    host = SimpleNamespace(
+        PERSIST_2D_DURING_PROCESSING=True, _processing_active=False,
+        _image_levels_override=None, overall=False, frame_ids=[0],
+        idxs_2d=[0], data_lock=RLock(), data_2d={0: {'mask': None}},
+        bkg_map_raw=0.0, scan=SimpleNamespace(global_mask=None),
+        get_frames_map_raw=lambda *a, **k: (raw, 'raw'),
+    )
+    host.clear_image_view = lambda: captured.append('cleared')
+    host.update_image_view = lambda: captured.append(host.image_data)
+    host.update_image = MethodType(displayFrameWidget.update_image, host)
+
+    host.update_image()
+
+    assert captured and captured[0] != 'cleared'
+    shown = captured[0][0]                       # (data, rect) -> the drawn data
+    assert np.isnan(shown).sum() == 1000         # all 65535 sentinels masked
+    assert np.isfinite(shown).any()              # real pixels survive
+
+
 def test_draw_delegate_cake_persists_during_run():
     # CAKE_2D: a None cake payload normally returns clear_binned_view (blank);
     # during a run it returns None so render skips the panel (keep last).
