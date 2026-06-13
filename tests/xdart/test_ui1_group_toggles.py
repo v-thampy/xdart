@@ -117,12 +117,16 @@ def test_manual_expand_peeks_without_enabling(qapp, wrangler_cls, params_list):
         b = grp.child(bool_name)
         item = next(iter(grp.items))
 
+        # Robust to either default (mask_sentinel defaults ON): peeking must not
+        # CHANGE the enable state, in either direction.
+        before = bool(b.value())
+        want = Checked if before else Unchecked
         tree.itemExpandedEvent(item)       # the user opens the chevron
-        assert b.value() is False, \
-            f"peeking into {grp_name} must not enable {bool_name}"
-        assert item.checkState(0) == Unchecked
+        assert bool(b.value()) is before, \
+            f"peeking into {grp_name} must not change {bool_name}"
+        assert item.checkState(0) == want
         tree.itemCollapsedEvent(item)
-        assert b.value() is False
+        assert bool(b.value()) is before
 
 
 @pytest.mark.parametrize("wrangler_cls, params_list", [
@@ -140,6 +144,10 @@ def test_programmatic_bool_change_updates_checkbox(qapp, wrangler_cls,
         b = grp.child(bool_name)
         item = next(iter(grp.items))
 
+        # Normalize to OFF first so the ON transition is a real change that
+        # emits sigValueChanged (mask_sentinel defaults ON, so setValue(True)
+        # would otherwise be a no-op).
+        b.setValue(False)
         b.setValue(True)
         assert item.checkState(0) == Checked
         assert grp.opts.get('expanded') is True

@@ -113,14 +113,19 @@ params = [
         {'name': 'Threshold', 'type': 'bool', 'value': False, 'visible': False},
         {'name': 'min', 'title': 'Min', 'type': 'int', 'value': 0},
         {'name': 'max', 'title': 'Max', 'type': 'int', 'value': 0},
-        # Auto-mask the uint16 detector ceiling (65535) as a saturated/dead
-        # sentinel.  Independent of the Min/Max band (which is the group's
-        # header checkbox): ON by default preserves the long-standing
-        # behaviour, OFF lets a genuinely-saturated Bragg peak at 65535 be
-        # seen + integrated.  Non-finite + the uint32 ceiling stay always
-        # masked regardless (those are unambiguous invalids).
-        {'name': 'mask_sentinel', 'title': 'Mask saturated (65535)',
-         'type': 'bool', 'value': True},
+    ], 'expanded': False, 'visible': False},
+    # Auto-mask the uint16 detector ceiling (65535) as a saturated/dead
+    # sentinel.  Its OWN UI-1 header-checkbox group (a checkbox on the left,
+    # like Intensity Threshold) — independent of the Min/Max band.  ON by
+    # default preserves the long-standing behaviour; OFF lets a genuinely-
+    # saturated Bragg peak at the ceiling be seen + integrated.  Non-finite +
+    # the uint32 ceiling stay always masked (unambiguous invalids).  The bool
+    # is hidden; the group header checkbox is the toggle (see
+    # wranglerWidget._install_group_toggles).
+    {'name': 'MaskSat', 'title': 'Mask Saturated', 'type': 'group',
+     'children': [
+        {'name': 'mask_sentinel', 'type': 'bool', 'value': True,
+         'visible': False},
     ], 'expanded': False, 'visible': False},
     {'name': 'BG', 'title': 'Background', 'type': 'group', 'children': [
         {'name': 'bg_type', 'title': '', 'type': 'list',
@@ -302,7 +307,7 @@ class imageWrangler(wranglerWidget):
         self.apply_threshold = self.parameters.child('Mask').child('Threshold').value()
         self.threshold_min = self.parameters.child('Mask').child('min').value()
         self.threshold_max = self.parameters.child('Mask').child('max').value()
-        self.mask_sentinel = self.parameters.child('Mask').child('mask_sentinel').value()
+        self.mask_sentinel = self.parameters.child('MaskSat').child('mask_sentinel').value()
 
         # Write Mode
         self.write_mode = self.parameters.child('Signal').child('write_mode').value()
@@ -475,7 +480,8 @@ class imageWrangler(wranglerWidget):
     # UI-1 (#81): the GI / Intensity-Threshold groups carry a header CHECKBOX
     # as their on/off toggle, mapped to the hidden bool that is their source
     # of truth (see wranglerWidget._install_group_toggles).
-    _GROUP_TOGGLES = {'GI': 'Grazing', 'Mask': 'Threshold'}
+    _GROUP_TOGGLES = {'GI': 'Grazing', 'Mask': 'Threshold',
+                      'MaskSat': 'mask_sentinel'}
 
     def _expand_active_groups(self):
         """Sync each wrangler group's expanded state to its enabling param.
@@ -488,6 +494,7 @@ class imageWrangler(wranglerWidget):
         groups = (
             ('GI', ('GI', 'Grazing'), lambda v: bool(v), True),
             ('Mask', ('Mask', 'Threshold'), lambda v: bool(v), True),
+            ('MaskSat', ('MaskSat', 'mask_sentinel'), lambda v: bool(v), True),
             ('BG', ('BG', 'bg_type'), lambda v: v not in (None, '', 'None'), False),
         )
         for group_name, child_path, is_on, collapse_when_off in groups:
@@ -540,7 +547,7 @@ class imageWrangler(wranglerWidget):
         ('apply_threshold', ('Mask', 'Threshold'),                   False, 'apply_threshold'),
         ('threshold_min',  ('Mask', 'min'),                          False, 'threshold_min'),
         ('threshold_max',  ('Mask', 'max'),                          False, 'threshold_max'),
-        ('mask_sentinel',  ('Mask', 'mask_sentinel'),                False, 'mask_sentinel'),
+        ('mask_sentinel',  ('MaskSat', 'mask_sentinel'),             False, 'mask_sentinel'),
         ('h5_dir',         ('h5_dir',),                              True,  'h5_dir'),
     ]
 
@@ -781,7 +788,7 @@ class imageWrangler(wranglerWidget):
 
     def _set_integration_controls_enabled(self, enabled, *, include_gi=True):
         """Enable or disable parameter tree groups related to integration."""
-        group_names = ['Calibration', 'Signal', 'BG', 'Mask']
+        group_names = ['Calibration', 'Signal', 'BG', 'Mask', 'MaskSat']
         if include_gi:
             group_names.append('GI')
         for group_name in group_names:
@@ -855,7 +862,7 @@ class imageWrangler(wranglerWidget):
         self.thread.threshold_min = self.threshold_min
         self.threshold_max = self.parameters.child('Mask').child('max').value()
         self.thread.threshold_max = self.threshold_max
-        self.mask_sentinel = self.parameters.child('Mask').child('mask_sentinel').value()
+        self.mask_sentinel = self.parameters.child('MaskSat').child('mask_sentinel').value()
         self.thread.mask_sentinel = self.mask_sentinel
 
         # Write Mode
@@ -1145,7 +1152,7 @@ class imageWrangler(wranglerWidget):
     # N1: param groups gated behind the Project Folder + PONI (Project itself is
     # always visible).  Calibration appears once a Project Folder is set; the
     # rest (groups + the Save-Path row) appears once a valid PONI also loads.
-    _DISCLOSURE_REST = ('Signal', 'GI', 'Mask', 'BG')
+    _DISCLOSURE_REST = ('Signal', 'GI', 'Mask', 'MaskSat', 'BG')
     _DISCLOSURE_TOPLEVEL = ('h5_dir', 'h5_dir_browse')     # Save Path row
 
     @staticmethod

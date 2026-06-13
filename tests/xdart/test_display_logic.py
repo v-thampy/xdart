@@ -165,6 +165,37 @@ def test_sentinel_mask_uint16_is_opt_in():
 
 
 @pytest.mark.display_logic
+def test_integer_saturation_ceiling_from_dtype():
+    """The saturation ceiling is learned from the raw integer dtype's iinfo.max,
+    with a safe 65535 fallback once the dtype is lost to float."""
+    np = pytest.importorskip("numpy")
+    assert dl.integer_saturation_ceiling(np.zeros(4, dtype=np.uint16)) == 65535.0
+    assert dl.integer_saturation_ceiling(np.zeros(4, dtype=np.uint8)) == 255.0
+    assert dl.integer_saturation_ceiling(np.zeros(4, dtype=np.uint32)) == 4294967295.0
+    assert dl.integer_saturation_ceiling(np.zeros(4, dtype=np.int16)) == 32767.0
+    assert dl.integer_saturation_ceiling(np.zeros(4, dtype=float)) == 65535.0
+
+
+@pytest.mark.display_logic
+def test_sentinel_mask_uses_dtype_ceiling_for_8bit():
+    """An 8-bit frame saturates at 255, not 65535 — sentinel_mask derives that
+    from the dtype so a uint8 dead block is masked while 65535 is irrelevant."""
+    np = pytest.importorskip("numpy")
+    arr = np.full(10000, 50, dtype=np.uint8)
+    arr[:2000] = 255                            # 20% at the uint8 ceiling
+    out = dl.sentinel_mask(arr)                 # ceiling derived from uint8 dtype
+    assert np.isnan(out[:2000]).all()           # 255 masked
+    assert out[5000] == 50.0
+    # OFF leaves the 255 band intact
+    assert not np.isnan(dl.sentinel_mask(arr, mask_saturation=False)[:2000]).any()
+    # explicit ceiling override (caller already converted to float)
+    farr = arr.astype(float)
+    assert np.isnan(dl.sentinel_mask(farr, ceiling=255.0)[:2000]).all()
+    # without the override a float uint8-valued frame is NOT masked (255 != 65535)
+    assert not np.isnan(dl.sentinel_mask(farr)[:2000]).any()
+
+
+@pytest.mark.display_logic
 def test_convert_2d_radial_q_to_2theta_and_back():
     np = pytest.importorskip("numpy")
     lam_A = 1.0

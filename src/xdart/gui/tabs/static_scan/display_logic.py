@@ -624,29 +624,61 @@ def plan_overlay(method, unit_changed, has_existing, new_ids, prev_overlaid_ids)
     return OverlayAction.REPLACE, new_ids
 
 
-def sentinel_mask(arr, mask_saturation=True):
+_UINT32_CEILING = 4294967295.0   # uint32 max — the Eiger dead/hot dummy
+
+
+def integer_saturation_ceiling(arr):
+    """The saturation ceiling implied by an integer array's dtype
+    (``np.iinfo(dtype).max`` — 65535 for uint16, 255 for uint8, 4095 never
+    because numpy has no 12-bit type, etc.), learned from the detector bit
+    depth rather than assuming 16-bit.
+
+    Returns ``65535.0`` as the fallback when ``arr`` is already float — the
+    original integer dtype was lost upstream (e.g. after a threshold/bg
+    conversion).  The fallback is SAFE: ``== 65535`` simply won't match the
+    values of a non-16-bit frame, so it never wrongly masks.  Capture the
+    ceiling from the RAW frame (before any float conversion) to get the exact
+    value for 8/32-bit detectors.
+    """
+    a = np.asarray(arr)
+    if np.issubdtype(a.dtype, np.integer):
+        return float(np.iinfo(a.dtype).max)
+    return 65535.0
+
+
+def sentinel_mask(arr, mask_saturation=True, ceiling=None):
     """Return a float copy of ``arr`` with detector sentinels masked to NaN.
 
     Always masks the UNAMBIGUOUS invalids: non-finite values and the uint32
     dead/hot-pixel ceiling (4294967295, e.g. from Eiger masters) — neither can
     be a real photon count.
 
-    The uint16 ceiling (65535) is AMBIGUOUS — it is both the max real count and
-    a common overflow/invalid sentinel — so masking it is OPT-IN via
-    ``mask_saturation`` (the "Mask saturated (65535)" wrangler toggle, default
-    ON).  When enabled and enough pixels sit exactly at the ceiling (the >1e-4
-    fraction guard, so a few genuinely-saturated pixels are NOT masked) those
-    pixels become NaN so autoscale uses the real image range.  When disabled a
-    real saturated Bragg peak at 65535 is left intact (the raw display relies on
-    a robust percentile level-clamp to avoid blowing out — it never hides it).
+    The detector SATURATION ceiling (uint16 65535, or whatever ``iinfo.max``
+    the raw dtype implies — see :func:`integer_saturation_ceiling`) is
+    AMBIGUOUS: it is both the max real count and a common overflow/invalid
+    sentinel — so masking it is OPT-IN via ``mask_saturation`` (the "Mask
+    Saturated" wrangler toggle, default ON).  ``ceiling`` overrides the
+    dtype-derived value (callers that already converted to float pass the
+    ceiling captured from the raw dtype).  When enabled and enough pixels sit
+    exactly at the ceiling (the >1e-4 fraction guard, so a few genuinely-
+    saturated pixels are NOT masked) those pixels become NaN so autoscale uses
+    the real image range.  When disabled a real saturated Bragg peak is left
+    intact (the raw display relies on a robust percentile level-clamp to avoid
+    blowing out — it never hides it).
     """
-    a = np.asarray(arr, dtype=float)
-    bad = ~np.isfinite(a) | (a >= 4294967295.0)
+    orig = np.asarray(arr)
+    a = orig.astype(float)
+    bad = ~np.isfinite(a) | (a >= _UINT32_CEILING)
     if mask_saturation and a.size and np.isfinite(a).any():
-        finite = np.isfinite(a)
-        sentinel16 = finite & (a == 65535.0)
-        if sentinel16.any() and sentinel16.sum() / a.size > 1e-4:
-            bad |= sentinel16
+        if ceiling is None:
+            ceiling = integer_saturation_ceiling(orig)
+        # The uint32 ceiling is the always-on dead sentinel handled above; only
+        # the lower integer ceilings (uint16=65535, uint8=255, ...) are the
+        # ambiguous saturation gated by mask_saturation.
+        if ceiling is not None and float(ceiling) < _UINT32_CEILING:
+            sat = np.isfinite(a) & (a == float(ceiling))
+            if sat.any() and sat.sum() / a.size > 1e-4:
+                bad |= sat
     if bad.any():
         a = a.copy()
         a[bad] = np.nan

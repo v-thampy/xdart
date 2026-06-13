@@ -53,7 +53,7 @@ from .display_logic import (
     build_payload, render_plan, controller_for, ImagePayload,
     empty_display_state, PANEL_LAYOUT,
     resolve_selection, resolve_render_ids,
-    default_plot_unit, pretty_unit, sentinel_mask,
+    default_plot_unit, pretty_unit, sentinel_mask, integer_saturation_ceiling,
 )
 from .display_controllers import register_default_controllers
 
@@ -1576,18 +1576,24 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             with self.data_lock:
                 frame_2d = self.data_2d.get(self.idxs_2d[0])
             mask = frame_2d['mask'] if frame_2d is not None else None
+        # Capture the saturation ceiling from the RAW integer dtype (iinfo.max)
+        # BEFORE the float conversion loses it — the display then learns the
+        # ceiling from the detector bit depth rather than assuming 16-bit.
+        _sat_ceiling = integer_saturation_ceiling(data)
         data = np.asarray(data, dtype=float)
 
-        # Mask detector sentinels (uint16 65535 / uint32 ceiling) to NaN, for
-        # PARITY with the payload path (display_publication.raw_image, which
+        # Mask detector sentinels (saturation ceiling / uint32 ceiling) to NaN,
+        # for PARITY with the payload path (display_publication.raw_image, which
         # already calls sentinel_mask).  The legacy update_image path — which the
         # live Int-raw panel uses (the cake reads the store; the raw panel does
         # not) — previously skipped this, so a TIFF whose invalid pixels sit at
-        # the uint16 ceiling rendered them as bright bands/speckle instead of
-        # masked.  No-op when no sentinels are present (the <1e-4 fraction guard).
+        # the ceiling rendered them as bright bands/speckle instead of masked.
+        # Gated by the "Mask Saturated" toggle; no-op when no sentinels are
+        # present (the <1e-4 fraction guard).
         data = sentinel_mask(
             data,
             mask_saturation=bool(getattr(self.scan, 'mask_sentinel', True)),
+            ceiling=_sat_ceiling,
         )
 
         # Apply detector + global mask only to full-resolution raw data.

@@ -537,26 +537,29 @@ class wranglerThread(Qt.QtCore.QThread):
         cached = getattr(scan, '_cached_data_mask', None)
         if cached is None:
             try:
-                flat = np.asarray(img_data, dtype=float).flatten()
+                arr0 = np.asarray(img_data)
+                flat = arr0.astype(float).flatten()
                 # Negatives + the uint32 dead/hot ceiling (Eiger masters) are
                 # always invalid.
                 bad = (flat < 0) | (flat >= 4294967295.0)
-                # uint16 ceiling (65535): a detector SENTINEL (dead module) only
-                # when MANY pixels sit exactly there — parity with the display's
-                # display_logic.sentinel_mask + its >1e-4 fraction guard, so a
-                # few legitimately-saturated pixels are NOT masked.  Without this
-                # the invalid uint16-ceiling pixels integrate into a huge spurious
-                # high-Q spike (and widen the GI cake axis) while the raw panel
-                # already hides them — an asymmetry the user hit when no explicit
-                # mask file was applied.  OPT-IN via the "Mask saturated (65535)"
-                # toggle (default ON) so a genuinely-saturated Bragg peak at the
-                # ceiling can be integrated when the user turns it off.  The gate
-                # is a per-scan constant, so the mask is still computed-once and
-                # cached — pyFAI's CSR mask-CRC stays stable frame-to-frame.
+                # Detector SATURATION ceiling — the uint16 65535, or whatever
+                # ``iinfo.max`` the RAW integer dtype implies (derived from the
+                # bit depth via integer_saturation_ceiling, captured here before
+                # the float conversion).  A dead module only when MANY pixels sit
+                # exactly there (the >1e-4 fraction guard, parity with the
+                # display's sentinel_mask), so a few genuinely-saturated pixels
+                # are NOT masked.  OPT-IN via the "Mask Saturated" toggle
+                # (default ON) so a genuinely-saturated Bragg peak at the ceiling
+                # can be integrated when the user turns it off.  The gate is a
+                # per-scan constant → mask still computed-once and cached, so
+                # pyFAI's CSR mask-CRC stays stable frame-to-frame.
                 if getattr(self, 'mask_sentinel', True):
-                    ceil16 = (flat == 65535.0)
-                    if ceil16.any() and ceil16.sum() / flat.size > 1e-4:
-                        bad |= ceil16
+                    from ..display_logic import integer_saturation_ceiling
+                    ceiling = integer_saturation_ceiling(arr0)
+                    if ceiling < 4294967295.0:   # uint32 already always-on above
+                        sat = (flat == float(ceiling))
+                        if sat.any() and sat.sum() / flat.size > 1e-4:
+                            bad |= sat
                 cached = np.arange(flat.size)[bad]
             except (AttributeError, TypeError, ValueError) as e:
                 logger.debug("frame-mask compute failed: %s", e)

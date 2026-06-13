@@ -51,6 +51,16 @@ def test_resolve_frame_mask_toggle_off_keeps_saturation_masks_invalids():
     assert not m[50, 50]             # real pixels untouched
 
 
+def test_resolve_frame_mask_ceiling_from_dtype():
+    """The integration ceiling is derived from the raw integer dtype: an 8-bit
+    frame's dead band sits at 255, not 65535, and is masked (toggle ON)."""
+    img = np.full((100, 100), 50, dtype=np.uint8)
+    img[10:20, :] = 255              # 10% at the uint8 ceiling
+    m = _resolve(img)
+    assert m[10:20, :].all()         # uint8 ceiling masked via dtype derivation
+    assert not m[50, 50]
+
+
 def test_resolve_frame_mask_keeps_sparse_saturation():
     """A handful of legitimately-saturated pixels (< 1e-4 of the frame) are NOT
     treated as sentinels — the same fraction-guard the display uses."""
