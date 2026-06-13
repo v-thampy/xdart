@@ -136,19 +136,37 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     # Pause: the dispatch/submit loops now call _wait_if_paused() at the top; it
     # early-returns since this rig's command is never 'pause'.
     w._wait_if_paused = MethodType(imageThread._wait_if_paused, w)
-    w._dispatch_batch_parallel = MethodType(imageThread._dispatch_batch_parallel, w)
-    # Frame-shell builder extracted from the parallel/streaming dispatchers.
+    # Frame-shell builder extracted from the streaming dispatcher.
     w._build_batch_frames = MethodType(imageThread._build_batch_frames, w)
     # The real freeze+dispatch orchestrator (freezes, then routes to the
-    # parallel/serial dispatcher) — used to exercise the Int-1D-XYE path where
-    # the 2D freeze self-skips on xye_only.
+    # streaming dispatcher) — used to exercise the Int-1D-XYE path where the 2D
+    # freeze self-skips on xye_only.
     w._dispatch_batch = MethodType(imageThread._dispatch_batch, w)
-    # Batch execution-policy selector (chunked vs streaming) used by _dispatch_batch.
+    # Batch execution-policy selector used by _dispatch_batch.
     w._batch_execution = MethodType(imageThread._batch_execution, w)
-    # This rig drives the CHUNKED dispatcher directly; pin the policy so it is
-    # unaffected by the module default (now "streaming").  The streaming path is
-    # covered by test_streaming_batch_xye_matches_chunked, which overrides this.
-    w.batch_execution = "chunked"
+    # 4e: the rig drives the PRODUCTION streaming path (one write path).  Wire the
+    # persistent ReductionSession + QtNexusSink so _dispatch_batch routes here and
+    # router-driven tests (xye-only uniform-grid, multichunk) get a real session.
+    # batch_execution is left UNSET so _batch_execution() resolves to the module
+    # default ("streaming"); gi_freeze_mode is left UNSET so the production scout
+    # freeze runs (the freeze is itself under test) — _run_batch_streaming sets it
+    # None only when it passes a pre-determined grid.
+    w.file_lock = RLock()
+    w.command_lock = RLock()
+    w.sigUpdate = SimpleNamespace(emit=lambda *a: None)
+    w.LIVE_SAVE_INTERVAL = 1000
+    w._streaming_session = None
+    w._streaming_sink = None
+    w._streaming_scan_id = None
+    w._scan_session_adapter = None
+    w._reduction_session = None
+    w._reduction_session_key = None
+    w._gi_prepass_scan_id = None
+    w._cancel_token = MethodType(wranglerThread._cancel_token, w)
+    w._close_reduction_session = MethodType(
+        wranglerThread._close_reduction_session, w)
+    for _sm in ("_dispatch_batch_streaming", "_get_streaming_session"):
+        setattr(w, _sm, MethodType(getattr(imageThread, _sm), w))
     # _dispatch_batch calls this one-time live-GI clip advisory (#75); bind it so
     # the double doesn't AttributeError.  No-op here (batch_mode=True → early
     # return), so the GI matrix assertions are unaffected.
@@ -192,6 +210,11 @@ def _make_scan(poni, mask, bai_1d_args, bai_2d_args, *, gi=True):
         _cached_fiber_integrator=None,
         _cached_fiber_integrator_angle=None,
         _cached_data_mask=None,
+        # QtNexusSink._due_to_save reads scan.frames._in_memory_cap for the
+        # persist-before-evict bound; the streaming writer thread hits it on
+        # EVERY frame, so the rig must carry it or the writer dies mid-run (a
+        # crash a single-frame test silently swallows via abort()'s force-flush).
+        frames=SimpleNamespace(_in_memory_cap=64),
     )
 
 
@@ -241,58 +264,6 @@ def _frozen_gi_bai_args(poni, img, meta, mask, *, gi_mode_1d, gi_mode_2d,
     return dict(scan.bai_1d_args), dict(scan.bai_2d_args)
 
 
-def _run_batch_parallel(poni, pending_data, mask, *, incidence_motor="th",
-                        sample_orientation=4, gi=True,
-                        gi_mode_1d="q_total", gi_mode_2d="qip_qoop",
-                        bai_1d_args=None, bai_2d_args=None, freeze=False):
-    """Drive the REAL imageThread._dispatch_batch_parallel on real frames.
-
-    ``pending_data`` is a list of ``(name, img, scan_info)``.
-    xye_only=True skips the Phase-2 HDF5 write but Phase-1 still integrates
-    2D (skip_2d=False) and buffers each integrated frame into _xye_buffer.
-    Returns {img_number: LiveFrame}.
-
-    ``gi_mode_1d`` / ``gi_mode_2d`` pick the GI sub-modes when the bai args are
-    defaulted.  With ``freeze=False`` (default) every frame auto-ranges at its
-    OWN incidence — the per-frame path the fiber-pool used to break, and the
-    one that proves the un-frozen stack is non-uniform.  With ``freeze=True``
-    the real scout freeze runs first (frame 0), locking one common grid for the
-    whole batch — exactly what ``_dispatch_batch`` does before dispatching.
-    """
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-
-    if bai_1d_args is None:
-        bai_1d_args = _default_bai_1d(gi, gi_mode_1d)
-    if bai_2d_args is None:
-        bai_2d_args = _default_bai_2d(gi, gi_mode_2d)
-
-    w, captured = _build_batch_thread(
-        poni, mask, incidence_motor=incidence_motor,
-        sample_orientation=sample_orientation, gi=gi,
-    )
-    scan = _make_scan(poni, mask, bai_1d_args, bai_2d_args, gi=gi)
-
-    # bg_raw=0 (no background) — matches _integrate_direct, which uses the
-    # raw image; the real get_background returns 0 when no bg is configured.
-    pending = [(name, i + 1, img, info, 0.0, 0.0)
-               for i, (name, img, info) in enumerate(pending_data)]
-    if freeze:
-        # Mirror _dispatch_batch: freeze before dispatch.  The 2D freeze skips
-        # on xye_only, so drop it for the freeze call only, then restore.
-        prev_xye_only = w.xye_only
-        w.xye_only = False
-        w._freeze_gi_1d_auto_range(scan, pending)
-        w._freeze_gi_2d_auto_ranges(scan, pending)
-        w.xye_only = prev_xye_only
-    else:
-        # Production freezes GI through ReductionSession by default.  This
-        # explicit test hook exercises the old unfrozen drift path so the writer
-        # validator remains proven load-bearing.
-        w.gi_freeze_mode = None
-    imageThread._dispatch_batch_parallel(w, scan, pending)
-    return captured
-
-
 def _run_batch_streaming(poni, pending_data, mask, *, incidence_motor="th",
                          sample_orientation=4, gi=True,
                          gi_mode_1d="q_total", gi_mode_2d="qip_qoop",
@@ -312,42 +283,22 @@ def _run_batch_streaming(poni, pending_data, mask, *, incidence_motor="th",
     isolates the integrate+write path, not the freeze — the identical contract
     the chunked leg uses (``freeze=False`` -> ``gi_freeze_mode=None``).
     """
-    from types import SimpleNamespace, MethodType
-    from threading import RLock
-    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-
     if bai_1d_args is None:
         bai_1d_args = _default_bai_1d(gi, gi_mode_1d)
     if bai_2d_args is None:
         bai_2d_args = _default_bai_2d(gi, gi_mode_2d)
 
+    # _build_batch_thread now wires the full streaming session (one write path);
+    # this runner only pins gi_freeze_mode=None so the session uses the args it is
+    # GIVEN as-is — frozen args -> one uniform grid, unfrozen (None-range) args ->
+    # per-frame auto-range drift — isolating the integrate+write path from the
+    # freeze (the identical contract the retired chunked freeze=False leg used).
     w, captured = _build_batch_thread(
         poni, mask, incidence_motor=incidence_motor,
         sample_orientation=sample_orientation, gi=gi,
     )
+    w.gi_freeze_mode = None
     scan = _make_scan(poni, mask, bai_1d_args, bai_2d_args, gi=gi)
-
-    # Streaming-session wiring (mirrors test_streaming_batch_xye_matches_chunked).
-    w.batch_execution = "streaming"
-    w.gi_freeze_mode = None              # use the passed-in pre-frozen grid
-    w.file_lock = RLock()
-    w.command_lock = RLock()             # adapter's stop-on-failure path (no-op here)
-    w.sigUpdate = SimpleNamespace(emit=lambda *a: None)
-    w.LIVE_SAVE_INTERVAL = 1000
-    w._streaming_session = None
-    w._streaming_sink = None
-    w._streaming_scan_id = None
-    w._scan_session_adapter = None
-    w._reduction_session = None
-    w._reduction_session_key = None
-    w._gi_prepass_scan_id = None
-    w._cancel_token = MethodType(wranglerThread._cancel_token, w)
-    w._close_reduction_session = MethodType(
-        wranglerThread._close_reduction_session, w)
-    for meth in ("_dispatch_batch_streaming", "_get_streaming_session",
-                 "_wait_if_paused"):
-        setattr(w, meth, MethodType(getattr(imageThread, meth), w))
 
     pending = [(name, i + 1, img, info, 0.0, 0.0)
                for i, (name, img, info) in enumerate(pending_data)]
@@ -503,25 +454,17 @@ def _assert_live_batch_reload_equivalent(tmp_path, *, gi,
         poni, _TIFF_FRAMES[0], img, meta, mask,
         gi=gi, bai_1d_args=bai_1d, bai_2d_args=bai_2d,
     )
-    batch = _run_batch_parallel(
-        poni, [(_TIFF_FRAMES[0], img, meta)], mask,
-        gi=gi, bai_1d_args=bai_1d, bai_2d_args=bai_2d,
-    )[1]
-    # The PRODUCTION batch leg: streaming (ReductionSession + QtNexusSink) is
-    # the shipping default, so the spine must gate on IT — not only the
-    # soon-to-be-retired chunked dispatcher.  Kept alongside the chunked leg
-    # during the 4e transition; the chunked leg is dropped when its dispatcher
-    # is deleted.
+    # The batch leg is the PRODUCTION streaming path (ReductionSession +
+    # QtNexusSink) — the shipping default.  The chunked dispatcher it used to run
+    # through was retired in 4e; streaming is now the sole batch reference.
     batch_stream = _run_batch_streaming(
         poni, [(_TIFF_FRAMES[0], img, meta)], mask,
         gi=gi, bai_1d_args=bai_1d, bai_2d_args=bai_2d,
     )[1]
 
     thumb_live = _canonicalize_thumbnail(live, mask)
-    _canonicalize_thumbnail(batch, mask)
     _canonicalize_thumbnail(batch_stream, mask)
     pub_live = publication_from_live_frame(live)
-    pub_batch = publication_from_live_frame(batch)
     pub_batch_stream = publication_from_live_frame(batch_stream)
     fname = (f"equiv_gi_{gi_mode_1d}_{gi_mode_2d}.nxs" if gi
              else "equiv_standard.nxs")
@@ -531,7 +474,6 @@ def _assert_live_batch_reload_equivalent(tmp_path, *, gi,
         thumb_live,
     )
 
-    assert_frameview_equivalent(pub_live.view, pub_batch.view)
     assert_frameview_equivalent(pub_live.view, pub_batch_stream.view)
     assert_frameview_equivalent(pub_live.view, pub_reload.view)
 
@@ -554,7 +496,11 @@ def test_batch_parallel_tiff_cakes_nondegenerate_and_match_serial():
 
     pending_data = [(name, frames[i][0], frames[i][2])
                     for i, name in enumerate(_TIFF_FRAMES)]
-    out = _run_batch_parallel(poni, pending_data, mask)
+    # Streaming with default (unfrozen, None-range) GI args + gi_freeze_mode=None
+    # => each frame auto-ranges at its OWN incidence, exactly the per-frame path
+    # the retired chunked freeze=False leg drove.  The assertions below are
+    # therefore unchanged.
+    out = _run_batch_streaming(poni, pending_data, mask)
     assert set(out) == {1, 2}
 
     for num, (img, th, _meta) in zip((1, 2), frames):
@@ -594,7 +540,7 @@ def test_batch_parallel_eiger_cake_nondegenerate_manual_incidence():
         img = np.asarray(f["entry/data/data"][0], dtype=np.float32)
     mask = (img < 0).astype(np.int8)
 
-    out = _run_batch_parallel(
+    out = _run_batch_streaming(
         poni, [(data_h5.name, img, {})], mask,
         incidence_motor="3.0",   # Manual incidence (deg)
     )
@@ -730,7 +676,8 @@ def test_gi_submode_multiframe_stack_writes_uniform(tmp_path, gi_mode_1d,
             f"{gi_mode_2d}: 2D range {k} not frozen/degenerate: {r2}"
 
     pending = [(_TIFF_FRAMES[i], raw[i][0], raw[i][2]) for i in range(2)]
-    out = _run_batch_parallel(
+    # PRE-FROZEN args -> streaming locks ONE common grid for both frames.
+    out = _run_batch_streaming(
         poni, pending, mask, gi=True,
         bai_1d_args=bai_1d, bai_2d_args=bai_2d,
     )
@@ -766,14 +713,17 @@ def test_gi_submode_unfrozen_multiframe_stack_rejected(tmp_path, gi_mode_1d,
     mask = _tiff_mask(raw[0][0])
 
     # No freeze: ranges defaulted to None → each frame auto-ranges at its own
-    # incidence (the pre-fix per-frame path).
+    # incidence (the pre-fix per-frame path).  _run_batch_streaming pins
+    # gi_freeze_mode=None, so with None-range args the session does NOT freeze a
+    # common grid and the per-frame axes drift exactly as the old unfrozen path —
+    # which the stacked writer must still reject.
     bai_1d = {"gi_mode_1d": gi_mode_1d, "numpoints": 128}
     bai_2d = {"gi_mode_2d": gi_mode_2d, "npt_rad": 64, "npt_azim": 48}
 
     pending = [(_TIFF_FRAMES[i], raw[i][0], raw[i][2]) for i in range(2)]
-    out = _run_batch_parallel(
+    out = _run_batch_streaming(
         poni, pending, mask, gi=True,
-        bai_1d_args=bai_1d, bai_2d_args=bai_2d, freeze=False,
+        bai_1d_args=bai_1d, bai_2d_args=bai_2d,
     )
     assert set(out) == {1, 2}
 
@@ -805,9 +755,13 @@ def test_gi_submode_publication_live_batch_reload_equivalence(
 def test_gi_submode_xye_only_uniform_xgrid(gi_mode_1d):
     """Int 1D (XYE) batch: per-frame .xye outputs must share ONE x-grid across
     incidences.  This path writes no .nxs (xye_only skips Phase-2), so the 1D
-    scout freeze — which runs even on xye_only — is what keeps the per-frame q
-    axis from drifting.  We drive the real ``_dispatch_batch`` orchestrator so
-    the 2D freeze self-skips (xye_only) exactly as in production.
+    scout freeze is what keeps the per-frame q axis from drifting.
+
+    In production the xdart whole-scan prepass freezes ``scan.bai_1d_args`` from
+    the real source files before the streaming session opens; this rig has no
+    source files (the prepass self-skips), so we run the SAME 1D freeze
+    explicitly first — then drive the real streaming ``_dispatch_batch`` (the 2D
+    freeze self-skips on xye_only) and confirm the frozen grid holds per-frame.
     """
     poni = _tiff_poni()
     raw = [_load_tiff(n) for n in _TIFF_FRAMES]
@@ -824,7 +778,9 @@ def test_gi_submode_xye_only_uniform_xgrid(gi_mode_1d):
     scan.skip_2d = True            # Int 1D mode doesn't compute/write the cake
     pending = [(_TIFF_FRAMES[i], i + 1, raw[i][0], raw[i][2], 0.0, 0.0)
                for i in range(2)]
-    w._dispatch_batch(scan, pending)   # freezes 1D (runs) + 2D (skips), dispatches
+    w._freeze_gi_1d_auto_range(scan, pending)   # the prepass's 1D freeze, explicit
+    w._dispatch_batch(scan, pending)            # streaming; session honours the grid
+    w._close_reduction_session()                # finish -> QtNexusSink final flush
 
     assert set(captured) == {1, 2}
     r0 = np.asarray(captured[1].int_1d.radial, float)
@@ -836,68 +792,15 @@ def test_gi_submode_xye_only_uniform_xgrid(gi_mode_1d):
         f"{gi_mode_1d}: per-frame xye x-grid drifted across incidences"
 
 
-@pytest.mark.parametrize("gi_mode_1d", GI_MODES_1D)
-def test_streaming_batch_xye_matches_chunked(gi_mode_1d):
-    """PERF-4b/WS-X1: the streaming batch path (ReductionSession +
-    QtNexusSink, submit-per-frame + single writer thread) produces the SAME
-    per-frame 1D results as the chunked path, byte-for-byte — the equivalence
-    that lets the streaming default flip once perf is proven."""
-    from types import SimpleNamespace, MethodType
-    from threading import RLock
-    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
-    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
-
-    poni = _tiff_poni()
-    raw = [_load_tiff(n) for n in _TIFF_FRAMES]
-    mask = _tiff_mask(raw[0][0])
-
-    def _run(execution):
-        w, captured = _build_batch_thread(poni, mask, gi=True)
-        w.xye_only = True
-        scan = _make_scan(
-            poni, mask,
-            {"gi_mode_1d": gi_mode_1d, "numpoints": 128},
-            {"gi_mode_2d": "qip_qoop", "npt_rad": 64, "npt_azim": 48},
-            gi=True,
-        )
-        scan.skip_2d = True
-        pending = [(_TIFF_FRAMES[i], i + 1, raw[i][0], raw[i][2], 0.0, 0.0)
-                   for i in range(2)]
-        if execution == "streaming":
-            w.batch_execution = "streaming"
-            w.file_lock = RLock()
-            w.sigUpdate = SimpleNamespace(emit=lambda *a: None)
-            w.LIVE_SAVE_INTERVAL = 1000
-            w._streaming_session = None
-            w._streaming_sink = None
-            w._streaming_scan_id = None
-            w._reduction_session = None
-            w._reduction_session_key = None
-            w._cancel_token = MethodType(wranglerThread._cancel_token, w)
-            w._close_reduction_session = MethodType(
-                wranglerThread._close_reduction_session, w)
-            for meth in ("_dispatch_batch_streaming", "_get_streaming_session",
-                         "_wait_if_paused"):
-                setattr(w, meth, MethodType(getattr(imageThread, meth), w))
-        w._dispatch_batch(scan, pending)
-        if execution == "streaming":
-            w._close_reduction_session()    # finish -> QtNexusSink final flush
-        return captured
-
-    chunked = _run("chunked")
-    streaming = _run("streaming")
-
-    assert set(streaming) == set(chunked) == {1, 2}
-    for k in (1, 2):
-        np.testing.assert_array_equal(
-            np.asarray(streaming[k].int_1d.radial, float),
-            np.asarray(chunked[k].int_1d.radial, float),
-        )
-        np.testing.assert_allclose(
-            np.asarray(streaming[k].int_1d.intensity, float),
-            np.asarray(chunked[k].int_1d.intensity, float),
-            rtol=0, atol=0,
-        )
+# NOTE (4e): the old ``test_streaming_batch_xye_matches_chunked`` byte-equality
+# test was retired with the chunked dispatcher.  Streaming per-frame 1D/2D
+# correctness is now the spine's job — ``_assert_live_batch_reload_equivalent``
+# proves live(serial) ≡ streaming ≡ reload for every GI sub-mode — and the
+# per-frame-own-incidence integration is locked by
+# ``test_batch_parallel_tiff_cakes_nondegenerate_and_match_serial`` (now on
+# streaming).  A streaming-vs-single-frame-serial check is NOT equivalent: a
+# multi-frame streaming batch derives its common output grid differently from a
+# lone serial frame, so the grids legitimately differ.
 
 
 def test_gi_freeze_covers_last_frame_extent():
