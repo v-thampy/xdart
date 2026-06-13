@@ -262,7 +262,7 @@ def test_resume_parity_streaming_nxs_matches_unpaused(tmp_path):
     """Pause spec acceptance (#2): a run PAUSED mid-stream — drain + flush the
     sink to .nxs at a frame boundary, then resume submitting on the same open
     session — produces the SAME .nxs as an un-paused run.  Pausing never drops or
-    corrupts a frame.  The pause-time flush is modelled by sink._flush(force=True)
+    corrupts a frame.  The pause-time flush is modelled by sink.flush(force=True)
     partway through (exactly what _enter_pause calls after session.drain())."""
     from xdart.modules.ewald import LiveScan
     from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
@@ -278,7 +278,7 @@ def test_resume_parity_streaming_nxs_matches_unpaused(tmp_path):
             sink.register(_live_frame(i))
             sink.write(_headless(i), _reduction(i))
             if pause_after is not None and i == pause_after:
-                sink._flush(force=True)        # the pause-time flush at a boundary
+                sink.flush(force=True)        # the pause-time flush at a boundary
         sink.finish(SimpleNamespace(cancelled=False, n_processed=N))
         return nxs
 

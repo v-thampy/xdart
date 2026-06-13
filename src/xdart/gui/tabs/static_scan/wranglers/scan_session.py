@@ -13,9 +13,14 @@ It strictly DELEGATES quiesce to ``ReductionSession.pause`` (4a) — it never
 reimplements drain — and never writes the sink itself (the session's single
 writer thread does), preserving the HDF5 single-writer invariant.
 
-In Phase 4f this becomes a thin bridge over the public
-``xrd_tools.session.ScanSession``; today it wraps the ReductionSession
-directly so 4c is offscreen-gatable without the public API yet existing.
+**Status (4f):** the public ``xrd_tools.session.ScanSession`` now EXISTS
+(4f-headless, offscreen-proven).  This adapter does NOT yet wrap it — the
+4f-BRIDGE step (rewire over the public session, register a
+QueuedConnection-marshalled ``on_frame_completed``, map ``on_state_change`` →
+``sigPaused``/``sigResuming``) touches the live acquisition path and is gated
+on the manual live checkpoint.  So today it still wraps the streaming
+``ReductionSession`` directly.  "public ScanSession exists" ≠ "xdart is thin"
+until that bridge lands.
 """
 from __future__ import annotations
 
@@ -84,8 +89,24 @@ class ScanSessionAdapter:
                     self._host.command = 'stop'
             else:
                 self._host.command = 'stop'
+            self._unregister(live)
             return False
-        return bool(accepted)
+        if not accepted:
+            # Dropped (cancelled / writer-dead mid-wait): the session never
+            # registered or counted it, so roll back the sink registration too
+            # rather than leave it pinned until finish().
+            self._unregister(live)
+            return False
+        return True
+
+    def _unregister(self, live) -> None:
+        unreg = getattr(self._sink, "unregister", None)
+        if callable(unreg):
+            try:
+                unreg(int(live.idx))
+            except Exception:
+                logger.debug("sink.unregister failed for %s",
+                             getattr(live, "idx", "?"), exc_info=True)
 
     # -- pause: quiesce (drain + flag) is SEPARATE from flush, so the
     #    wrangler's serial-vs-streaming routing in _enter_pause is preserved
@@ -97,9 +118,9 @@ class ScanSessionAdapter:
 
     def flush(self) -> None:
         """Force the sink's incremental flush (streaming pause/finish).  The
-        h5pool bracket lives inside QtNexusSink._flush, on the writer
+        h5pool bracket lives inside the public QtNexusSink.flush, on the writer
         thread — unmoved."""
-        self._sink._flush(force=True)
+        self._sink.flush(force=True)
 
     def resume(self) -> None:
         """Re-allow submit() after a pause (delegates to

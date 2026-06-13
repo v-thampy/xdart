@@ -75,6 +75,13 @@ class QtNexusSink:
         submit, so :meth:`write` can hydrate it.  Popped once written."""
         self._registry[int(live_frame.idx)] = live_frame
 
+    def unregister(self, index) -> None:
+        """Drop a registration for a frame that was registered but NOT accepted
+        by the session (``submit`` returned False — cancelled mid-wait).  Keeps
+        the bounded register map from pinning a LiveFrame the writer will never
+        pop.  Idempotent."""
+        self._registry.pop(int(index), None)
+
     # -- ReductionSink protocol -------------------------------------------
     def begin(self, scan, plan) -> None:
         self._since_save = 0
@@ -100,7 +107,7 @@ class QtNexusSink:
         self._emit_frame_status(live)    # status label tracks COMPLETION
         self._since_save += 1
         if self._due_to_save():
-            self._flush()
+            self.flush()
 
     def _emit_frame_status(self, live) -> None:
         """Per-frame status at write/completion time: '<name>' (or
@@ -212,7 +219,7 @@ class QtNexusSink:
         live.free_raw()
 
     def finish(self, result) -> None:
-        self._flush(force=True)
+        self.flush(force=True)
         # T0-8: frames whose reduction failed or was cancelled mid-flight were
         # never popped by write()/replace() — left in the registry they pin
         # their LiveFrames (and, since batch worker_process frees raw only on
@@ -227,7 +234,7 @@ class QtNexusSink:
         # Flush whatever completed + release locks; never delete — we write into
         # the live .nxs incrementally, not a temp file.
         try:
-            self._flush(force=True)
+            self.flush(force=True)
         except Exception:
             logger.exception("QtNexusSink.abort flush failed")
         self._registry.clear()     # T0-8: see finish()
@@ -280,7 +287,13 @@ class QtNexusSink:
                              margin=_SAVE_BEFORE_EVICT_MARGIN)
         return policy.should_flush(frames_since_flush=self._since_save)
 
-    def _flush(self, *, force=False) -> None:
+    def flush(self, *, force=False) -> None:
+        """Persist buffered output: h5pool-bracketed ``_save_to_nexus`` (skipped
+        in xye_only) + the XYE row drain.  Public part of the ReductionSink
+        contract (ADR-0004 §4); the WHEN (cadence) is the caller's FlushPolicy,
+        the WHAT lives here on the single writer thread.  ``force`` flushes any
+        pending rows immediately; a no-op when nothing is pending and not
+        forced."""
         if self._since_save <= 0 and not force:
             return
         if not self._host.xye_only:

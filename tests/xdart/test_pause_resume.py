@@ -31,7 +31,7 @@ def test_enter_pause_streaming_drains_then_flushes_then_signals():
     calls = []
     session = SimpleNamespace(
         drain=lambda timeout=None: (calls.append('drain'), True)[1])
-    sink = SimpleNamespace(_flush=lambda *, force=False: calls.append(('flush', force)))
+    sink = SimpleNamespace(flush=lambda *, force=False: calls.append(('flush', force)))
     emitted = []
     w = SimpleNamespace(
         _streaming_session=session, _streaming_sink=sink,
@@ -59,7 +59,7 @@ def test_enter_pause_serial_tail_wins_over_open_streaming_session(monkeypatch):
     order = []
     session = SimpleNamespace(
         drain=lambda timeout=None: order.append('drain') or True)
-    sink = SimpleNamespace(_flush=lambda *, force=False: order.append('sink_flush'))
+    sink = SimpleNamespace(flush=lambda *, force=False: order.append('sink_flush'))
     scan = SimpleNamespace(data_file='x.nxs',
                            _save_to_nexus=lambda: order.append('save'))
     w = SimpleNamespace(
@@ -132,7 +132,7 @@ def test_enter_pause_signals_even_if_drain_raises():
     emitted = []
     w = SimpleNamespace(
         _streaming_session=SimpleNamespace(drain=_boom),
-        _streaming_sink=SimpleNamespace(_flush=lambda *, force=False: None),
+        _streaming_sink=SimpleNamespace(flush=lambda *, force=False: None),
         _active_scan=None, xye_only=False, _frames_since_save=0,
         sigPaused=SimpleNamespace(emit=lambda: emitted.append('paused')),
     )
@@ -241,7 +241,7 @@ def test_enter_pause_drain_timeout_skips_flush_but_signals():
     session = SimpleNamespace(
         drain=lambda timeout=None: (calls.append('drain'), False)[1])
     sink = SimpleNamespace(
-        _flush=lambda *, force=False: calls.append(('flush', force)))
+        flush=lambda *, force=False: calls.append(('flush', force)))
     scan = SimpleNamespace(data_file='x.nxs',
                            _save_to_nexus=lambda: calls.append('save'))
     w = SimpleNamespace(
@@ -375,13 +375,13 @@ class _SpyAdapter:
 def test_enter_pause_streaming_routes_through_adapter():
     """With an adapter present (production streaming), _enter_pause quiesces
     via the adapter (session.pause: flag+drain) then flushes via the adapter,
-    BEFORE sigPaused — the legacy bare session.drain/sink._flush are bypassed."""
+    BEFORE sigPaused — the legacy bare session.drain/sink.flush are bypassed."""
     adapter = _SpyAdapter()
     emitted = []
     # legacy session/sink present too, but the adapter must win and they must
     # NOT be touched.
     session = SimpleNamespace(drain=lambda timeout=None: emitted.append('LEGACY_drain') or True)
-    sink = SimpleNamespace(_flush=lambda *, force=False: emitted.append('LEGACY_flush'))
+    sink = SimpleNamespace(flush=lambda *, force=False: emitted.append('LEGACY_flush'))
     w = SimpleNamespace(
         _scan_session_adapter=adapter,
         _streaming_session=session, _streaming_sink=sink,

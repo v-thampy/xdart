@@ -1466,7 +1466,7 @@ class imageThread(wranglerThread):
             if not drained:
                 # RS-1: the writer is provably NOT idle (a stalled worker) — a
                 # save/flush from this thread would race the writer's own
-                # write()→_flush() (single-writer invariant), and resetting the
+                # write()→flush() (single-writer invariant), and resetting the
                 # save counter without saving would break persist-before-evict.
                 # Pause still proceeds (submits have stopped); the tail flushes
                 # on resume/finish.
@@ -1487,10 +1487,10 @@ class imageThread(wranglerThread):
             elif adapter is not None:
                 # Streaming path (batch / reprocess / live Phase 2): in-flight
                 # window drained (non-terminal — session stays open) + flush
-                # via the adapter (h5pool bracket stays in QtNexusSink._flush).
+                # via the adapter (h5pool bracket stays in QtNexusSink.flush).
                 adapter.flush()
             elif session is not None and sink is not None:
-                sink._flush(force=True)        # defensive (no adapter built)
+                sink.flush(force=True)         # defensive (no adapter built)
         except Exception:
             # A drain/flush failure must not strand the run; log loudly and
             # still signal the pause (we've stopped submitting, so the writer is
@@ -1572,7 +1572,7 @@ class imageThread(wranglerThread):
             # ride on (_save_due is always False in this mode), so drain the
             # XYE buffer per dispatch -- without this the serial path wrote
             # ZERO output, silently.  (The default streaming path flushes
-            # via QtNexusSink._flush.)
+            # via QtNexusSink.flush.)
             self._flush_xye_buffer(scan)
         return count
 

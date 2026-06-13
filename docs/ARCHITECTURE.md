@@ -14,9 +14,13 @@ xrd_tools  (pure compute + schema + I/O: core / io / reduction /
 ```
 
 \* the session layer is the in-flight piece (Phase 4 of
-`design/CC_greenfield_implementation_plan_2026-06-12.md`); today
-`reduction.ReductionSession` + xdart's `QtNexusSink` realize about
-two-thirds of it.
+`design/CC_greenfield_implementation_plan_2026-06-12.md`).  The headless
+**`xrd_tools.session.ScanSession`** now EXISTS (4f-headless: commands in /
+immutable `FrameEvent` out; ADR-0003/0004) and `reduction.ReductionSession`
+is its streaming engine.  What remains: the **4f-bridge** — rewiring xdart's
+`ScanSessionAdapter` over the public session so the GUI is a pure event→signal
+view (gated on live testing), plus moving the GI whole-scan freeze into core.
+So "public ScanSession exists" ≠ "xdart is thin" yet — the bridge is the line.
 
 ## North star
 

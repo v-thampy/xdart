@@ -37,11 +37,16 @@ class _DuckSink:
     def __init__(self, boom=False):
         self.boom = boom
         self.registered, self.written, self.flushes = [], [], 0
+        self.unregistered = []
         self._reg = {}
 
     def register(self, live):
         self._reg[int(live.idx)] = live
         self.registered.append(int(live.idx))
+
+    def unregister(self, index):
+        self._reg.pop(int(index), None)
+        self.unregistered.append(int(index))
 
     def begin(self, scan, plan):
         pass
@@ -57,7 +62,7 @@ class _DuckSink:
     def abort(self, result):
         pass
 
-    def _flush(self, *, force=False):
+    def flush(self, *, force=False):
         self.flushes += 1
 
 
@@ -125,6 +130,21 @@ def test_adapter_submit_failure_stops_without_raising(monkeypatch):
             break
     assert stopped
     assert host.command == 'stop'
+    session.finish(raise_on_failure=False)
+
+
+def test_adapter_unregisters_a_dropped_frame(monkeypatch):
+    """A frame the session DROPS (submit returns False because the session was
+    cancelled mid-submit) is rolled back out of the sink registration rather
+    than left pinned until finish() (review #4 / codex pre-bridge cleanup)."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    sink = _DuckSink()
+    adapter, session, _ = _adapter(sink)
+    session.cancel_token.cancel()                # the next submit is dropped
+    assert adapter.submit(_live(0)) is False     # dropped, no raise
+    assert 0 in sink.registered                  # it WAS registered first...
+    assert 0 in sink.unregistered                # ...then rolled back
     session.finish(raise_on_failure=False)
 
 
