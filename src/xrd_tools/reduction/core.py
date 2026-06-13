@@ -19,6 +19,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from types import MappingProxyType
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Protocol, runtime_checkable
 
@@ -1586,14 +1587,20 @@ class PrepareDiagnostics:
       - ``"unverifiable"`` — the whole-scan extent could NOT be established (the
         source can't be cheaply swept, or ``<2`` readable incidences): the caller
         WARNS and proceeds on the chunk/first-frame freeze (T0-4 policy).
-    ``scout_refs`` carries the resolved metadata for the extreme frames so a
-    caller loads them with a plain ``read_image`` instead of re-enumerating.
+
+    ``scout_metadata`` carries the resolved (read-only) metadata of the extreme
+    frames as provenance — it is NOT a loadable source ref.  To LOAD a scout
+    image, use ``scout_indices`` against the same source:
+    ``source.frame_for(idx)`` (a lazy ``ScanFrame`` with ``source_path`` /
+    ``source_frame_index`` / loader) or ``source.load_frame(idx)`` — no
+    re-enumeration needed (the source you passed to ``prepare_gi_freeze`` is the
+    loader).  Deeply immutable so a consumer can't mutate the provenance.
     """
 
     status: str
     reason: str = ""
     scout_indices: tuple[int, ...] = ()
-    scout_refs: tuple[dict, ...] = ()
+    scout_metadata: tuple[MappingProxyType, ...] = ()
 
 
 def _resolve_incidence(meta: Any, motor: Any) -> float | None:
@@ -1703,13 +1710,13 @@ def prepare_gi_freeze(
         }.get(status, "")
         return plan, PrepareDiagnostics(status, reason=reason)
     indices = tuple(int(idx) for idx, _meta in extremes)
-    refs = tuple(dict(meta) for _idx, meta in extremes)
+    meta = tuple(MappingProxyType(dict(m)) for _idx, m in extremes)
     new_extra = {**plan.extra, "gi_freeze_scout_indices": list(indices)}
     return replace(plan, extra=new_extra), PrepareDiagnostics(
         "frozen",
         reason=f"scout extremes pinned to frames {indices}",
         scout_indices=indices,
-        scout_refs=refs,
+        scout_metadata=meta,
     )
 
 

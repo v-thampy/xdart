@@ -317,17 +317,30 @@ class ScanSession:
         return self._session.scan
 
     # -- events out --------------------------------------------------------
-    def on_frame_completed(self, cb: Callable[[FrameEvent], None]) -> None:
-        with self._lock:
-            self._frame_cbs.append(cb)
+    # Each registration returns an UNSUBSCRIBE callable so a notebook / the Qt
+    # bridge / a remote client can detach without tearing down the session
+    # (append-only listeners would otherwise leak across re-subscribes).  The
+    # handle is idempotent — calling it twice is a no-op.
+    def on_frame_completed(self, cb: Callable[[FrameEvent], None]) -> Callable[[], None]:
+        return self._subscribe(self._frame_cbs, cb)
 
-    def on_progress(self, cb: Callable[[ProgressEvent], None]) -> None:
-        with self._lock:
-            self._progress_cbs.append(cb)
+    def on_progress(self, cb: Callable[[ProgressEvent], None]) -> Callable[[], None]:
+        return self._subscribe(self._progress_cbs, cb)
 
-    def on_state_change(self, cb: Callable[[StateChangeEvent], None]) -> None:
+    def on_state_change(self, cb: Callable[[StateChangeEvent], None]) -> Callable[[], None]:
+        return self._subscribe(self._state_cbs, cb)
+
+    def _subscribe(self, registry: list, cb: Callable) -> Callable[[], None]:
         with self._lock:
-            self._state_cbs.append(cb)
+            registry.append(cb)
+
+        def _unsubscribe() -> None:
+            with self._lock:
+                try:
+                    registry.remove(cb)
+                except ValueError:
+                    pass            # already removed / never present — idempotent
+        return _unsubscribe
 
     # -- internals ---------------------------------------------------------
     def _on_completed(self, frame: Frame, reduction: Any) -> None:

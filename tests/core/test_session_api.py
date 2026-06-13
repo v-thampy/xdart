@@ -399,6 +399,26 @@ def test_finish_with_no_frames_fires_no_completions():
     assert sess.frames_completed == 0
 
 
+def test_event_registration_returns_idempotent_unsubscribe():
+    """on_*() returns an unsubscribe handle so a bridge/notebook can detach
+    without tearing down the session; calling it twice is a no-op."""
+    seen: list[int] = []
+    sess = _standard_session(4)
+    off = sess.on_frame_completed(lambda e: seen.append(e.frame_index))
+    sess.start()
+    sess.submit(_frames(4)[0])
+    sess.pause(timeout=10)              # drain -> the first completion fires
+    n_before = len(seen)
+    assert n_before == 1
+    off()                               # detach
+    off()                               # idempotent: second call must not raise
+    sess.resume()
+    for fr in _frames(4)[1:]:
+        sess.submit(fr)
+    sess.finish()
+    assert len(seen) == n_before        # no further events after unsubscribe
+
+
 def test_double_finish_is_idempotent_no_extra_state_event():
     """finish() is idempotent and does not re-emit a state-change on the second
     call (so a bridge tearing down on running->finished can't double-fire)."""

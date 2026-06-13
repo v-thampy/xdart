@@ -47,7 +47,10 @@ def test_prepare_pins_value_extremes_not_positional():
     assert diag.status == "frozen"
     assert diag.scout_indices == (1, 5)                 # (lo_idx, hi_idx)
     assert plan2.extra["gi_freeze_scout_indices"] == [1, 5]
-    assert len(diag.scout_refs) == 2 and diag.scout_refs[0]["th"] == 0.15
+    assert len(diag.scout_metadata) == 2 and diag.scout_metadata[0]["th"] == 0.15
+    # provenance is read-only (deeply immutable, not just a frozen dataclass)
+    with __import__("pytest").raises(TypeError):
+        diag.scout_metadata[0]["th"] = 9.9
 
 
 def test_prepare_extremes_are_order_independent():

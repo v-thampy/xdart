@@ -289,3 +289,34 @@ because the `_frame_source_for` factory is new behavior on the live batch path. 
 proves not worth it, Step 1 leaves a clean, tested core API and no xdart change to revert.
 **At release, the `ssrl_xrd_tools>=` floor must already cover this once Step 1 lands** (the
 writer hard-imports core; see CLAUDE.md).
+
+## Amendment (post-STEP-1, from the round-2 reviews)
+
+Two clarifications applied to the as-built STEP 1, and the STEP-2 gate is strengthened:
+
+1. **`scout_refs` → `scout_metadata`, deeply immutable** (codex P2/P3). The field was
+   mislabelled "source refs" but only ever held the extreme frames' metadata; it is renamed for
+   honesty and each entry is now a `MappingProxyType` (the same "looks-immutable-but-mutable"
+   class as the `FrameEvent` array bug). It is PROVENANCE, not a loadable ref: to load a scout
+   image use `scout_indices` against the same source — `source.frame_for(idx)` (a lazy
+   `ScanFrame` carrying `source_path`/`source_frame_index`/loader) or `source.load_frame(idx)`.
+   The source you pass to `prepare_gi_freeze` IS the loader, so STEP 2 does not re-enumerate.
+
+2. **STEP-2 acceptance gate (the factory is the dominant, currently-invisible risk).** The
+   equivalence spine is index-set-INVARIANT (it hands both legs the same pre-frozen grid, so it
+   cannot catch a wrong scout index), and the `Combi4` fixture is contiguous 1-based
+   (`frame_index == file_number`), which MASKS the index-space divergence of residual-risk-3.
+   So STEP 2 must NOT rely on the spine; its gate is:
+   - **`_frame_source_for(scan)` uses the anchored `^{scan_name}_\d+\.{ext}$` regex**, NOT
+     `TiffSeriesSource.from_directory`'s unanchored `fnmatch` glob (which would ingest neighbour
+     files like `{scan}_again_0001.tif` → wrong extremes → silent clip). Add a strict
+     scan-series factory/option.
+   - **Re-point the four targeted scout tests at the real factory path** (not headless
+     `prepare_gi_freeze`): especially the `nums == [1, 5]` extremes assertion, the `"abort"`→
+     new-status case, the Image-Directory advisory, and the fully-pinned skip.
+   - **Add a non-contiguous / non-1-based fixture** so the frame-index-vs-file-number divergence
+     is actually exercised (the `Combi4` fixture cannot).
+   - Load the two `scout_indices` inside an `except Exception` (keep the broad catch — a scout
+     read / PONI / mask error must not escape the worker thread).
+   Codex's sequencing stands: tighten the shape (done, #1) → strict factory + neighbour-file
+   tests → THEN delete the xdart prepass. Do not let the two coexisting prepasses linger.
