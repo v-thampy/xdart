@@ -1080,6 +1080,16 @@ class ReductionSession:
         """True iff paused and not yet finished."""
         return self._paused and not self._finished
 
+    @property
+    def is_running(self) -> bool:
+        """True iff the session is active — begun (the sink is open) and not
+        finished/cancelled.  ``_started`` is set at construction for both
+        execution modes, so this reads as running across chunked and
+        streaming runs (the GUI run-state seam, Phase 4d)."""
+        return (self._started
+                and not (self._finished or self._cancelled
+                         or self.cancel_token.cancelled))
+
     def finish(self, raise_on_failure: bool = True,
                join_timeout: float | None = None) -> ReductionResult:
         """Drain, flush the sink, and return the :class:`ReductionResult`.

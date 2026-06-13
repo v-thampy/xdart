@@ -719,3 +719,27 @@ def test_pause_is_noop_when_finished_or_cancelled(monkeypatch):
     assert s2.pause() is True
     assert not s2.is_paused                          # cancelled is never paused
     s2.finish(raise_on_failure=False)
+
+
+def test_is_running_lifecycle(monkeypatch):
+    """is_running (Phase 4d): True from construction (sink open) until finish;
+    False after finish and on a cancelled session."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    s = ReductionSession(_plan(), Scan("r", _frames(2), integrator=object()),
+                         sink=MemorySink(), execution="streaming", executor=2)
+    assert s.is_running
+    for fr in _frames(2):
+        s.submit(fr)
+    assert s.is_running                          # still running mid-stream
+    s.finish()
+    assert not s.is_running                      # finished
+
+    token = CancelToken()
+    s2 = ReductionSession(_plan(), Scan("c", _frames(1), integrator=object()),
+                          sink=MemorySink(), execution="streaming", executor=2,
+                          cancel_token=token)
+    assert s2.is_running
+    token.cancel()
+    assert not s2.is_running                     # cancelled
+    s2.finish(raise_on_failure=False)
