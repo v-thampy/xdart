@@ -55,6 +55,18 @@ class BaseFrameSource(ABC):
     def metadata_for(self, index: int) -> Mapping[str, Any]:
         return {}
 
+    def scan_manifest(self) -> list[tuple[int, Mapping[str, Any]]] | None:
+        """Cheap METADATA-ONLY pass: ``(frame_index, metadata)`` for every frame
+        (ADR-0006).  MUST NOT load detector images.  Returns ``None`` when the
+        whole-scan metadata cannot be cheaply enumerated — distinct from a real
+        empty scan ``[]`` — so a caller treats ``None`` as "unverifiable extent,
+        warn-and-proceed."  The default is gated on the ``has_scan_manifest``
+        capability; a source flips it True only when ``metadata_for`` is cheap +
+        image-free for every frame."""
+        if not self._capabilities.has_scan_manifest:
+            return None
+        return [(idx, dict(self.metadata_for(idx))) for idx in self.frame_indices]
+
     def frame_for(self, index: int) -> ScanFrame:
         return ScanFrame(
             index=int(index),

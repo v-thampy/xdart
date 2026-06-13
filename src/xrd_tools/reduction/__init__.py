@@ -21,6 +21,7 @@ from xrd_tools.reduction.core import (
     MaskSpec,
     MemorySink,
     NexusSink,
+    PrepareDiagnostics,
     ReductionPlan,
     ReductionProgress,
     ReductionResult,
@@ -28,6 +29,7 @@ from xrd_tools.reduction.core import (
     ReductionSink,
     Scan,
     XYESink,
+    prepare_gi_freeze,
     run_reduction,
 )
 
@@ -47,6 +49,7 @@ __all__ = [
     "MaskSpec",
     "MemorySink",
     "NexusSink",
+    "PrepareDiagnostics",
     "ReductionPlan",
     "ReductionProgress",
     "ReductionResult",
@@ -54,5 +57,6 @@ __all__ = [
     "ReductionSink",
     "Scan",
     "XYESink",
+    "prepare_gi_freeze",
     "run_reduction",
 ]

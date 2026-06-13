@@ -264,6 +264,25 @@ def check_source_contract(source_factory: Callable[[], Any],
         f"iter_chunks must cover frame_indices in order; got {seen}"
     )
 
+    # scan_manifest() contract (ADR-0006): gated on the has_scan_manifest
+    # capability.  When advertised it returns (frame_index, metadata) for every
+    # frame, in frame_indices order; when not, it returns None (NOT []) so a
+    # caller distinguishes "can't enumerate" from "empty scan".
+    manifest_fn = getattr(source, "scan_manifest", None)
+    if manifest_fn is not None:
+        manifest = manifest_fn()
+        if getattr(source.capabilities, "has_scan_manifest", False):
+            assert manifest is not None, "has_scan_manifest=True but manifest is None"
+            assert [int(i) for i, _m in manifest] == expected_indices, (
+                "scan_manifest() indices must equal frame_indices, in order"
+            )
+            for _i, meta in manifest:
+                assert hasattr(meta, "keys"), "manifest metadata must be a mapping"
+        else:
+            assert manifest is None, (
+                "scan_manifest() must return None when has_scan_manifest=False"
+            )
+
 
 __all__ = [
     "BoomSink",

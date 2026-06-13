@@ -49,6 +49,11 @@ class SourceCapabilities:
     has_geometry: bool = False
     has_raw_references: bool = False
     has_thumbnails: bool = False
+    # scan_manifest() yields whole-scan per-frame metadata CHEAPLY (no image
+    # reads) — lets a headless prepare() pass scout the scan's full extent (e.g.
+    # the GI incidence range) without xdart enumerating files.  Default False ⇒
+    # scan_manifest() returns None ⇒ "unverifiable, warn-and-proceed" (ADR-0006).
+    has_scan_manifest: bool = False
 
 
 class SourceKind(str, Enum):

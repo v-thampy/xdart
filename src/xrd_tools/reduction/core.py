@@ -1573,6 +1573,146 @@ def _normalize_gi_freeze_mode(mode: str | None) -> str | None:
     return value.replace("-", "_")
 
 
+@dataclass(frozen=True, slots=True)
+class PrepareDiagnostics:
+    """Outcome of the whole-scan GI prepare pass (ADR-0006).
+
+    ``status``:
+      - ``"frozen"`` — scout indices pinned into ``plan.extra``; the downstream
+        freeze (``ReductionSession(..., gi_freeze_mode="scout_union")`` or
+        xdart's adapter) unions over them.
+      - ``"skip"`` — nothing to do: non-GI plan, GI ranges already pinned, fixed/
+        manual incidence, ``<2`` frames, or a single distinct incidence.
+      - ``"unverifiable"`` — the whole-scan extent could NOT be established (the
+        source can't be cheaply swept, or ``<2`` readable incidences): the caller
+        WARNS and proceeds on the chunk/first-frame freeze (T0-4 policy).
+    ``scout_refs`` carries the resolved metadata for the extreme frames so a
+    caller loads them with a plain ``read_image`` instead of re-enumerating.
+    """
+
+    status: str
+    reason: str = ""
+    scout_indices: tuple[int, ...] = ()
+    scout_refs: tuple[dict, ...] = ()
+
+
+def _resolve_incidence(meta: Any, motor: Any) -> float | None:
+    """Case-insensitive lookup of the incidence motor in a frame's metadata →
+    float, or None if absent/non-numeric.  Verbatim port of xdart's
+    ``_resolve_incidence_from_meta`` so the headless extremes match the GUI's."""
+    if not isinstance(meta, dict):
+        return None
+    ml = str(motor).lower()
+    for key, val in meta.items():
+        if str(key).lower() == ml:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _scan_manifest(source: Any):
+    """Probe the optional ``FrameSource.scan_manifest()`` capability (the
+    Protocol is name-only ``runtime_checkable``, so a ``getattr`` probe lets a
+    ``Scan`` / duck source without the method work).  Returns ``None`` on any
+    failure — the caller treats that as 'unverifiable'."""
+    fn = getattr(source, "scan_manifest", None)
+    if not callable(fn):
+        return None
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
+def _incidence_extremes(manifest: Any, motor: Any):
+    """The image-free half of xdart's ``_gi_whole_scan_scout_entries``: from a
+    ``[(frame_index, metadata), ...]`` manifest, decide the global GI scout.
+
+    Returns ``(status, extremes)``:
+      - ``("skip", [])`` — fixed/manual angle, ``<2`` frames, or one distinct
+        incidence (the chunk/session freeze was never clipped);
+      - ``("unverifiable", [])`` — no manifest, or ``<2`` readable incidences
+        (cannot establish a global range → warn-and-proceed);
+      - ``("found", [(lo_idx, lo_meta), (hi_idx, hi_meta)])`` — a real sweep; the
+        extremes are chosen BY RESOLVED INCIDENCE VALUE, never positionally.
+    """
+    try:
+        float(motor)            # fixed/manual: one angle for the whole scan
+        return "skip", []
+    except (TypeError, ValueError):
+        pass
+    if manifest is None:
+        return "unverifiable", []
+    if len(manifest) < 2:
+        return "skip", []       # single-frame scan: no incidence range
+    resolved = []
+    for idx, meta in manifest:
+        ang = _resolve_incidence(meta, motor)
+        if ang is not None:
+            resolved.append((ang, int(idx), meta))
+    if len(resolved) < 2:
+        # ≥2 frames but we can't read incidence for two of them: cannot
+        # establish the global range → fail to 'unverifiable' (warn-and-proceed).
+        return "unverifiable", []
+    lo = min(resolved, key=lambda r: r[0])
+    hi = max(resolved, key=lambda r: r[0])
+    if lo[0] == hi[0]:          # no incidence sweep → chunk grid is fine
+        return "skip", []
+    return "found", [(lo[1], lo[2]), (hi[1], hi[2])]
+
+
+def prepare_gi_freeze(
+    source: Any,
+    plan: ReductionPlan,
+    *,
+    incidence_motor: Any = None,
+) -> tuple[ReductionPlan, PrepareDiagnostics]:
+    """Whole-scan GI prepass (ADR-0006): scout *source*'s full metadata extent
+    and return a COPY of *plan* with ``extra["gi_freeze_scout_indices"]`` pinned
+    to the GLOBAL incidence extremes, plus a :class:`PrepareDiagnostics`.
+
+    Computes WHICH FRAMES only — it never loads detector images and never
+    integrates.  Hand the returned plan to the freeze step
+    (``ReductionSession(plan2, source, gi_freeze_mode="scout_union")``, or xdart's
+    ``freeze_live_scan_gi_ranges``) and the existing ``_apply_gi_freeze_policy``
+    unions those pinned frames instead of chunk-1's first/last — the fix for the
+    codex-P1 chunk-clip.  GI-only; non-GI plans pass through with ``"skip"``.
+    Never raises for an unenumerable source.
+
+    ``incidence_motor`` defaults to ``plan.gi.incidence_motor``.
+    """
+    if plan.gi is None:
+        return plan, PrepareDiagnostics("skip", reason="non-GI plan")
+    # Already-pinned ranges: the freeze is a no-op, so don't even enumerate
+    # (preserves the T0-3 silent skip).
+    if _gi_1d_freeze_key(plan) is None and not _gi_2d_freeze_keys(plan):
+        return plan, PrepareDiagnostics(
+            "skip", reason="GI output ranges already pinned")
+    motor = incidence_motor
+    if motor is None:
+        motor = getattr(plan.gi, "incidence_motor", None)
+    manifest = _scan_manifest(source)
+    status, extremes = _incidence_extremes(manifest, motor)
+    if status != "found":
+        reason = {
+            "skip": "fixed/single incidence or <2 frames",
+            "unverifiable": "whole-scan incidence extent could not be "
+                            "established — warn and proceed on the chunk freeze",
+        }.get(status, "")
+        return plan, PrepareDiagnostics(status, reason=reason)
+    indices = tuple(int(idx) for idx, _meta in extremes)
+    refs = tuple(dict(meta) for _idx, meta in extremes)
+    new_extra = {**plan.extra, "gi_freeze_scout_indices": list(indices)}
+    return replace(plan, extra=new_extra), PrepareDiagnostics(
+        "frozen",
+        reason=f"scout extremes pinned to frames {indices}",
+        scout_indices=indices,
+        scout_refs=refs,
+    )
+
+
 def _apply_gi_freeze_policy(
     plan: ReductionPlan,
     scan: Scan,

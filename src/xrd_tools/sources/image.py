@@ -27,12 +27,14 @@ class ImageFileSource(BaseFrameSource):
         detector_shape: tuple[int, int] | None = None,
         detector: str | tuple[int, int] | None = None,
         metadata_format: str | None = None,
+        meta_dir: str | Path | None = None,
         frame_indices: Sequence[int] | None = None,
     ) -> None:
         self.path = Path(path)
         self.detector_shape = detector_shape
         self.detector = detector
         self.metadata_format = metadata_format
+        self.meta_dir = meta_dir
         if frame_indices is None:
             try:
                 n = int(count_frames(self.path))
@@ -47,6 +49,9 @@ class ImageFileSource(BaseFrameSource):
                 supports_random_access=True,
                 supports_chunks=True,
                 has_metadata=metadata_format is not None,
+                # cheap, image-free metadata ⇒ a headless prepare() can sweep
+                # the whole-scan extent (ADR-0006).
+                has_scan_manifest=metadata_format is not None,
                 has_raw_references=True,
             ),
         )
@@ -64,7 +69,8 @@ class ImageFileSource(BaseFrameSource):
     def metadata_for(self, index: int) -> Mapping[str, Any]:
         if self.metadata_format is None:
             return {}
-        return read_image_metadata(self.path, self.metadata_format)
+        return read_image_metadata(self.path, self.metadata_format,
+                                   meta_dir=self.meta_dir)
 
     def frame_for(self, index: int) -> ScanFrame:
         return ScanFrame(
@@ -88,9 +94,11 @@ class TiffSeriesSource(BaseFrameSource):
         *,
         name: str | None = None,
         metadata_format: str | None = "txt",
+        meta_dir: str | Path | None = None,
     ) -> None:
         self.files = [Path(p) for p in files]
         self.metadata_format = metadata_format
+        self.meta_dir = meta_dir
         self._path_by_index = {
             int(index): path
             for index, path in zip(range(1, len(self.files) + 1), self.files)
@@ -103,6 +111,9 @@ class TiffSeriesSource(BaseFrameSource):
                 supports_random_access=True,
                 supports_chunks=True,
                 has_metadata=metadata_format is not None,
+                # per-file sidecar metadata is cheap + image-free ⇒ a headless
+                # prepare() can sweep the whole-scan incidence extent (ADR-0006).
+                has_scan_manifest=metadata_format is not None,
                 has_raw_references=True,
             ),
         )
@@ -114,12 +125,13 @@ class TiffSeriesSource(BaseFrameSource):
         *,
         pattern: str = "*.tif*",
         metadata_format: str | None = "txt",
+        meta_dir: str | Path | None = None,
     ) -> "TiffSeriesSource":
         files = [
             path for path in find_image_files(directory)
             if fnmatch.fnmatch(path.name, pattern)
         ]
-        return cls(files, metadata_format=metadata_format)
+        return cls(files, metadata_format=metadata_format, meta_dir=meta_dir)
 
     def _path_for(self, index: int) -> Path:
         try:
@@ -133,7 +145,8 @@ class TiffSeriesSource(BaseFrameSource):
     def metadata_for(self, index: int) -> Mapping[str, Any]:
         if self.metadata_format is None:
             return {}
-        return read_image_metadata(self._path_for(index), self.metadata_format)
+        return read_image_metadata(self._path_for(index), self.metadata_format,
+                                   meta_dir=self.meta_dir)
 
     def frame_for(self, index: int) -> ScanFrame:
         path = self._path_for(index)
