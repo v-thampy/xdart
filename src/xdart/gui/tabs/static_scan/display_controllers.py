@@ -60,25 +60,33 @@ __all__ = [
 
 
 def _data_snapshot(widget):
-    """Snapshot loaded keys + per-frame raw/thumbnail availability under the
-    data lock (a short, single-pass critical section)."""
+    """Snapshot loaded keys + per-frame raw/thumbnail availability.
+
+    X1 (Phase 3a): the PublicationStore is the primary source; the legacy
+    dict caches fill gaps while they still exist.  Availability flags are
+    OR-merged per frame — the old dict-overwrite let a LIGHTWEIGHT
+    publication (payload evicted) downgrade ``has_raw`` for a frame whose
+    full array was still hydrated in ``data_2d``.
+    """
+    store = getattr(widget, "publication_store", None)
+    loaded_1d, loaded_2d, raw_avail = set(), set(), {}
+    if store is not None:
+        pub_1d, pub_2d, pub_raw = publication_availability(store)
+        loaded_1d |= pub_1d
+        loaded_2d |= pub_2d
+        raw_avail.update(pub_raw)
     with widget.data_lock:
-        loaded_1d = set(widget.data_1d.keys())
-        loaded_2d = set(widget.data_2d.keys())
-        raw_avail = {
-            int(k): {
-                'has_raw': v.get('map_raw') is not None,
-                'has_thumbnail': v.get('thumbnail') is not None,
-            }
-            for k, v in widget.data_2d.items()
-            if isinstance(v, dict)
-        }
-        store = getattr(widget, "publication_store", None)
-        if store is not None:
-            pub_1d, pub_2d, pub_raw = publication_availability(store)
-            loaded_1d.update(pub_1d)
-            loaded_2d.update(pub_2d)
-            raw_avail.update(pub_raw)
+        loaded_1d |= set(widget.data_1d.keys())
+        loaded_2d |= set(widget.data_2d.keys())
+        for k, v in widget.data_2d.items():
+            if not isinstance(v, dict):
+                continue
+            entry = raw_avail.setdefault(
+                int(k), {'has_raw': False, 'has_thumbnail': False})
+            entry['has_raw'] = bool(entry.get('has_raw')) or (
+                v.get('map_raw') is not None)
+            entry['has_thumbnail'] = bool(entry.get('has_thumbnail')) or (
+                v.get('thumbnail') is not None)
     return loaded_1d, loaded_2d, raw_avail
 
 
@@ -106,13 +114,23 @@ def _image_viewer_raw_payload(widget, state):
     if not state.render_ids:
         return None
     idx = int(state.render_ids[0])
-    with widget.data_lock:
-        frame_2d = widget.data_2d.get(idx)
-    if frame_2d is None:
-        return None
-    raw = frame_2d.get('map_raw')
+    # X1 (Phase 3a): the publication is the primary render source; the
+    # legacy data_2d mirror fills the gap while it still exists.
+    raw = None
+    store = getattr(widget, "publication_store", None)
+    if store is not None:
+        publication = store.get(idx)
+        if publication is not None:
+            raw = publication.view.raw
+            if raw is None:
+                raw = publication.view.thumbnail
     if raw is None:
-        raw = frame_2d.get('thumbnail')
+        with widget.data_lock:
+            frame_2d = widget.data_2d.get(idx)
+        if frame_2d is not None:
+            raw = frame_2d.get('map_raw')
+            if raw is None:
+                raw = frame_2d.get('thumbnail')
     if raw is None:
         return None
     if getattr(widget, '_viewer_is_xdart', False):
