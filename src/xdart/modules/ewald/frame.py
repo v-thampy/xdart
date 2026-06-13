@@ -75,12 +75,19 @@ def _make_thumbnail(image, mask_idx=None, global_mask=None, max_size=_THUMBNAIL_
     if arr.ndim != 2:
         return None
 
-    # Apply masks as NaN before downsampling
+    # Apply masks as NaN before downsampling.  Normalize each mask to FLAT
+    # INDICES first: a 2-D boolean image-mask becomes flatnonzero (the same
+    # indices), a 1-D array is already flat indices.  Without this a mixed pair
+    # (e.g. a flat per-frame mask + a 2-D boolean global mask) failed to
+    # concatenate — the dimension-mismatch the sentinel-mask change surfaced.
     all_mask = []
-    if mask_idx is not None and len(mask_idx) > 0:
-        all_mask.append(np.asarray(mask_idx, dtype=int))
-    if global_mask is not None and len(global_mask) > 0:
-        all_mask.append(np.asarray(global_mask, dtype=int))
+    for _m in (mask_idx, global_mask):
+        if _m is None:
+            continue
+        _a = np.asarray(_m)
+        _a = np.flatnonzero(_a) if _a.ndim >= 2 else np.asarray(_a, dtype=int)
+        if _a.size:
+            all_mask.append(_a)
     if all_mask:
         flat_mask = np.unique(np.concatenate(all_mask))
         flat_mask = flat_mask[flat_mask < arr.size]  # safety bound

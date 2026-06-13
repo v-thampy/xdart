@@ -533,9 +533,22 @@ class wranglerThread(Qt.QtCore.QThread):
         cached = getattr(scan, '_cached_data_mask', None)
         if cached is None:
             try:
-                cached = np.arange(img_data.size)[
-                    np.asarray(img_data).flatten() < 0
-                ]
+                flat = np.asarray(img_data, dtype=float).flatten()
+                # Negatives + the uint32 dead/hot ceiling (Eiger masters) are
+                # always invalid.
+                bad = (flat < 0) | (flat >= 4294967295.0)
+                # uint16 ceiling (65535): a detector SENTINEL (dead module) only
+                # when MANY pixels sit exactly there — parity with the display's
+                # display_logic.sentinel_mask + its >1e-4 fraction guard, so a
+                # few legitimately-saturated pixels are NOT masked.  Without this
+                # the invalid uint16-ceiling pixels integrate into a huge spurious
+                # high-Q spike (and widen the GI cake axis) while the raw panel
+                # already hides them — an asymmetry the user hit when no explicit
+                # mask file was applied.
+                ceil16 = (flat == 65535.0)
+                if ceil16.any() and ceil16.sum() / flat.size > 1e-4:
+                    bad |= ceil16
+                cached = np.arange(flat.size)[bad]
             except (AttributeError, TypeError, ValueError) as e:
                 logger.debug("frame-mask compute failed: %s", e)
                 cached = None
