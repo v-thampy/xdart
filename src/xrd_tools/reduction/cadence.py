@@ -54,7 +54,17 @@ class FlushPolicy:
         (the pure-headless path, and the streaming sink which tracks only
         its own counter) falls back to ``frames_since_flush`` for the
         pressure branch.
+
+        ``force`` means **force-if-pending**, NOT "always flush": it bypasses
+        the interval and pressure gates so any pending frames are saved at
+        once (end-of-batch / pause / Stop), but with nothing pending
+        (``frames_since_flush <= 0``) there is nothing to save and the answer
+        is still ``False`` — a flush of an empty buffer is a no-op the caller
+        need not perform.  The empty-buffer short-circuit therefore precedes
+        the ``force`` check by design (codex P3: the name is narrower than it
+        looks — this is the deliberate, test-pinned contract).
         """
+        # nothing pending -> nothing to flush, even under force (see docstring)
         if frames_since_flush <= 0:
             return False
         if force:
