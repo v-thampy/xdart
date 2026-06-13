@@ -615,3 +615,107 @@ def test_submit_detects_dead_writer(monkeypatch):
     assert session._cancelled
     assert isinstance(session._failure, RuntimeError)
     assert "writer thread died" in str(session._failure)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4a — pause / resume / is_paused
+# ---------------------------------------------------------------------------
+
+def test_pause_quiesces_writer_and_rejects_submit(monkeypatch):
+    """pause() drains the in-flight window (writer provably idle), flips
+    is_paused, and rejects further submits until resume()."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    sink = MemorySink()
+    session = ReductionSession(
+        _plan(), Scan("p", _frames(6), integrator=object()),
+        sink=sink, execution="streaming", executor=2,
+    )
+    for fr in _frames(3):
+        session.submit(fr)
+
+    assert session.pause(timeout=10) is True       # fully quiesced
+    assert session.is_paused
+    assert sorted(sink.frames) == [0, 1, 2]        # everything written
+
+    with pytest.raises(RuntimeError, match="paused"):
+        session.submit(_frames(1)[0])
+
+    session.resume()
+    assert not session.is_paused
+    for fr in _frames(6)[3:]:                        # continue the same session
+        session.submit(fr)
+    result = session.finish()
+    assert result.n_processed == 6
+    assert sorted(sink.frames) == [0, 1, 2, 3, 4, 5]
+
+
+def test_pause_resume_matches_uninterrupted_baseline(monkeypatch):
+    """A paused-then-resumed run yields byte-identical products to one that
+    never paused (pause is a quiesce, not a data operation)."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+
+    base = MemorySink()
+    s0 = ReductionSession(_plan(), Scan("base", _frames(8), integrator=object()),
+                          sink=base, execution="streaming", executor=2)
+    for fr in _frames(8):
+        s0.submit(fr)
+    s0.finish()
+
+    paused = MemorySink()
+    s1 = ReductionSession(_plan(), Scan("paused", _frames(8), integrator=object()),
+                          sink=paused, execution="streaming", executor=2)
+    for fr in _frames(8)[:4]:
+        s1.submit(fr)
+    assert s1.pause(timeout=10)
+    s1.resume()
+    for fr in _frames(8)[4:]:
+        s1.submit(fr)
+    s1.finish()
+
+    assert sorted(base.frames) == sorted(paused.frames)
+    for idx in base.frames:
+        np.testing.assert_array_equal(
+            base.frames[idx].result_1d.intensity,
+            paused.frames[idx].result_1d.intensity,
+        )
+
+
+def test_process_rejected_while_paused(monkeypatch):
+    """Chunked process() also refuses while paused (uniform contract for the
+    GUI run-state model); resume() re-allows it."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    session = ReductionSession(_plan(), Scan("c", _frames(2), integrator=object()),
+                              sink=MemorySink(), execution="chunked")
+    assert session.pause() is True                  # no in-flight window: flag only
+    assert session.is_paused
+    with pytest.raises(RuntimeError, match="paused"):
+        session.process()
+    session.resume()
+    session.process()
+    assert session.finish().n_processed == 2
+
+
+def test_pause_is_noop_when_finished_or_cancelled(monkeypatch):
+    """pause() after finish() / on a cancelled session is a no-op returning
+    True, and a cancelled session is never marked paused."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    s = ReductionSession(_plan(), Scan("f", _frames(2), integrator=object()),
+                         sink=MemorySink(), execution="streaming", executor=2)
+    for fr in _frames(2):
+        s.submit(fr)
+    s.finish()
+    assert s.pause() is True
+    assert not s.is_paused                          # finished dominates
+
+    token = CancelToken()
+    s2 = ReductionSession(_plan(), Scan("x", _frames(2), integrator=object()),
+                          sink=MemorySink(), execution="streaming", executor=2,
+                          cancel_token=token)
+    token.cancel()
+    assert s2.pause() is True
+    assert not s2.is_paused                          # cancelled is never paused
+    s2.finish(raise_on_failure=False)

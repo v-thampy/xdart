@@ -687,6 +687,11 @@ class ReductionSession:
     _stream_started: bool = field(default=False, init=False, repr=False)
     _submitted: int = field(default=0, init=False, repr=False)
     _writer_ident: int | None = field(default=None, init=False, repr=False)
+    # Phase 4a: cooperative pause.  pause() quiesces the writer at a frame
+    # boundary and rejects further submit()/process() until resume().
+    # pause/resume/submit are called from ONE orchestrating thread (drain's
+    # contract); pause is never concurrent with submit.
+    _paused: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.chunk_size <= 0:
@@ -796,6 +801,10 @@ class ReductionSession:
             )
         if self._finished:
             raise RuntimeError("ReductionSession.process called after finish().")
+        if self._paused:
+            raise RuntimeError(
+                "ReductionSession.process called while paused; call resume() first"
+            )
         if self._cancelled or self.cancel_token.cancelled:
             self._cancelled = True
             return
@@ -862,6 +871,10 @@ class ReductionSession:
             raise RuntimeError("ReductionSession.submit called after finish().")
         if self._failure is not None:
             raise self._failure
+        if self._paused:
+            raise RuntimeError(
+                "ReductionSession.submit called while paused; call resume() first"
+            )
         if self._cancelled or self.cancel_token.cancelled:
             self._cancelled = True
             return
@@ -1032,6 +1045,40 @@ class ReductionSession:
                 if remaining <= 0 or self.cancel_token.cancelled:
                     return False
                 q.all_tasks_done.wait(min(poll, remaining))
+
+    def pause(self, timeout: float | None = None) -> bool:
+        """Quiesce the writer at a frame boundary; reject submits until resume.
+
+        Phase 4a — the pause-safe guarantee the GUI's ``_enter_pause`` hand-
+        rolls today: sets :attr:`is_paused`, then :meth:`drain`\\ s the in-flight
+        window so the single writer thread is provably idle (streaming).  The
+        caller may then flush its sink / browse without racing a write.
+
+        Returns whether the writer fully quiesced within ``timeout`` (``True``),
+        or timed out / was cancelled (``False`` — unflushed frames remain and
+        flush on :meth:`resume`/:meth:`finish`; RS-1 tolerance preserved).
+        Idempotent; a no-op returning ``True`` once finished or cancelled (a
+        cancelled session is never marked paused).  Chunked execution has no
+        in-flight window, so this only sets the flag (drain is a no-op).
+
+        Called from the SAME thread as :meth:`submit` (cooperative; never
+        concurrent with it)."""
+        if self._finished or self._cancelled or self.cancel_token.cancelled:
+            return True
+        self._paused = True
+        return self.drain(timeout=timeout)
+
+    def resume(self) -> None:
+        """Re-allow :meth:`submit` / :meth:`process` after :meth:`pause`.
+
+        No-op if not paused or already finished."""
+        if not self._finished:
+            self._paused = False
+
+    @property
+    def is_paused(self) -> bool:
+        """True iff paused and not yet finished."""
+        return self._paused and not self._finished
 
     def finish(self, raise_on_failure: bool = True,
                join_timeout: float | None = None) -> ReductionResult:
