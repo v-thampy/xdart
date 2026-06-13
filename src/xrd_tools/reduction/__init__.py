@@ -5,6 +5,7 @@ the GUI chooses a :class:`ReductionPlan`, supplies a :class:`Scan`, and lets
 ``xrd_tools`` own the reduction work.
 """
 
+from xrd_tools.reduction.cadence import FlushPolicy
 from xrd_tools.reduction.core import (
     CancelToken,
     CompositeSink,
@@ -33,6 +34,7 @@ from xrd_tools.reduction.core import (
 __all__ = [
     "CancelToken",
     "CompositeSink",
+    "FlushPolicy",
     "Frame",
     "FrameSource",
     "FrameReduction",

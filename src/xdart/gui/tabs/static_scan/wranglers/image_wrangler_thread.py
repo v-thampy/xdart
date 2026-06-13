@@ -58,7 +58,7 @@ from pyqtgraph import Qt
 from xdart.modules.live import LiveFrame, LiveScan, IncidenceAngleUnresolved
 from xrd_tools.integrate.gid import gi_1d_output_axis_key
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
-from xrd_tools.reduction import GIFreezeError
+from xrd_tools.reduction import FlushPolicy, GIFreezeError
 from xrd_tools.io.image import read_image, count_frames
 from xrd_tools.io.export import write_xye
 from xrd_tools.io.nexus import find_nexus_image_dataset
@@ -1513,14 +1513,20 @@ class imageThread(wranglerThread):
         HARD bound, so the high interval is safe even on scans longer than the
         cap.  Never saves in xye_only mode (no .nxs target).
         """
-        if self.xye_only or self._frames_since_save <= 0:
+        if self.xye_only:
             return False
-        if force or self._frames_since_save >= self.LIVE_SAVE_INTERVAL:
-            return True
+        # Phase 4b-3: the same headless FlushPolicy the streaming sink uses
+        # (kills the predicate divergence).  Serial owns the LIVE unsaved
+        # count, so it passes it through; the cap−margin pressure bound (the
+        # data-loss fix) and the LIVE_SAVE_INTERVAL upper bound are both the
+        # policy's now.  margin defaults to 8 (the canonical value, == the
+        # sink's _SAVE_BEFORE_EVICT_MARGIN).
         cap = getattr(scan.frames, "_in_memory_cap", 64)
         counter = getattr(scan.frames, "unsaved_in_memory_count", None)
-        unsaved = counter() if callable(counter) else self._frames_since_save
-        return unsaved >= max(1, cap - 8)
+        unsaved = counter() if callable(counter) else None
+        policy = FlushPolicy(interval=self.LIVE_SAVE_INTERVAL, cap=cap)
+        return policy.should_flush(frames_since_flush=self._frames_since_save,
+                                   unsaved_in_memory=unsaved, force=force)
 
     def _dispatch_batch_serial(self, scan, pending, *, force_save=False):
         """Sequential dispatch (live mode or single-image batches).

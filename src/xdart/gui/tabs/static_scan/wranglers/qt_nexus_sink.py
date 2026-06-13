@@ -33,6 +33,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from xrd_tools.reduction import FlushPolicy
+
 logger = logging.getLogger(__name__)
 
 # Margin below the in-memory frame cache cap at which the sink forces a save,
@@ -262,14 +264,21 @@ class QtNexusSink:
             self._host._xye_buffer.append((live.idx, live))
 
     def _due_to_save(self) -> bool:
-        if self._since_save <= 0:
-            return False
+        # Phase 4b-2: delegate the cadence DECISION to the shared headless
+        # FlushPolicy (the flush ACTION + h5pool bracket stay below, on the
+        # writer thread).  The streaming sink tracks only its own counter,
+        # so it passes unsaved_in_memory=None (the pressure branch then uses
+        # _since_save — exactly the prior predicate).  In batch mode there is
+        # no frame-count interval (only the eviction-pressure bound), so the
+        # interval is set to the cap to disable that branch; in live mode it
+        # is LIVE_SAVE_INTERVAL (clamped by the cap−margin pressure bound via
+        # should_flush's min semantics).
         cap = getattr(self._scan.frames, "_in_memory_cap", 64)
-        threshold = max(1, cap - _SAVE_BEFORE_EVICT_MARGIN)
-        # In live (non-batch) mode the display save cadence can be tighter.
-        if not getattr(self._host, "batch_mode", True):
-            threshold = min(threshold, self._host.LIVE_SAVE_INTERVAL)
-        return self._since_save >= threshold
+        interval = (cap if getattr(self._host, "batch_mode", True)
+                    else self._host.LIVE_SAVE_INTERVAL)
+        policy = FlushPolicy(interval=interval, cap=cap,
+                             margin=_SAVE_BEFORE_EVICT_MARGIN)
+        return policy.should_flush(frames_since_flush=self._since_save)
 
     def _flush(self, *, force=False) -> None:
         if self._since_save <= 0 and not force:
