@@ -1057,6 +1057,73 @@ def test_live_new_scan_invalidates_publication_store():
     assert scan.scan_data.empty
 
 
+def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask):
+    """A minimal staticWidget host for driving ``new_scan`` and observing how
+    ``scan.global_mask`` is synced from the wrangler thread's current mask."""
+    import pandas as pd
+    from xdart.modules.frame_publication import PublicationStore
+
+    scan = SimpleNamespace(
+        name="old",
+        gi=False,
+        incidence_motor="th",
+        single_img=False,
+        series_average=False,
+        global_mask=initial_global_mask,
+        scan_lock=RLock(),
+        frames=SimpleNamespace(index=[1], _in_memory={1: object()}),
+        scan_data=pd.DataFrame({"old": [1.0]}, index=[1]),
+    )
+    host = SimpleNamespace(
+        scan=scan,
+        h5viewer=SimpleNamespace(
+            dirname="", live_run_active=True, scan_name="old",
+            auto_last=False, latest_idx=9,
+            set_file=lambda fname, **k: None,
+            update_scans=lambda: None, update=lambda: None,
+        ),
+        wrangler=SimpleNamespace(thread=SimpleNamespace(mask=wrangler_mask)),
+        integratorTree=SimpleNamespace(
+            get_args=lambda name: None, set_image_units=lambda: None,
+        ),
+        _update_timer=SimpleNamespace(stop=lambda: None),
+        _flush_pending_update=lambda: None,
+        frames={1: object()},
+        frame_ids=["1"],
+        publication_store=PublicationStore(),
+        displayframe=SimpleNamespace(set_axes=lambda: None),
+        metawidget=SimpleNamespace(update=lambda: None),
+    )
+    host._sync_h5viewer_save_dir = MethodType(
+        staticWidget._sync_h5viewer_save_dir, host,
+    )
+    return host, scan
+
+
+def test_new_scan_clears_stale_global_mask_when_mask_file_removed():
+    """Regression: removing the Mask File (so the wrangler rebuilds
+    ``thread.mask = None``) must CLEAR the previous run's ``scan.global_mask``,
+    not leave it stale — otherwise the dropped mask keeps rendering on the raw
+    image (and in the cake payload path) on the next run."""
+    stale = np.array([0, 1, 2, 3], dtype=int)   # a previous run's mask.edf
+    host, scan = _new_scan_host_with_wrangler_mask(
+        wrangler_mask=None, initial_global_mask=stale,
+    )
+    staticWidget.new_scan(host, "new", "/tmp/new.nxs", False, "th", False, False)
+    assert scan.global_mask is None
+
+
+def test_new_scan_propagates_wrangler_mask_when_present():
+    """Companion: a mask IS drawn — ``thread.mask`` (flat indices) propagates to
+    ``scan.global_mask`` so the overlay shows (the original v2 regression fix)."""
+    mask_idx = np.array([5, 6, 7], dtype=int)
+    host, scan = _new_scan_host_with_wrangler_mask(
+        wrangler_mask=mask_idx, initial_global_mask=None,
+    )
+    staticWidget.new_scan(host, "new", "/tmp/new.nxs", False, "th", False, False)
+    np.testing.assert_array_equal(scan.global_mask, mask_idx)
+
+
 def test_save_path_sync_updates_scans_browser(tmp_path):
     calls = []
     host = SimpleNamespace(

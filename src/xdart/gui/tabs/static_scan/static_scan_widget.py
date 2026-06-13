@@ -1276,10 +1276,18 @@ class staticWidget(QWidget):
         # displayframe can overlay it on the raw image.  Without this,
         # self.scan.global_mask stays None after a scan and no mask
         # overlay is drawn (regression introduced by the v2 refactor).
-        wrangler_mask = getattr(getattr(self.wrangler, 'thread', None),
-                                'mask', None)
-        if wrangler_mask is not None:
-            self.scan.global_mask = wrangler_mask
+        # Sync to the wrangler thread's CURRENT mask — including ``None``.
+        # ``setup()`` rebuilds ``thread.mask`` every run from (detector mask |
+        # Mask File); with no detector mask and the Mask File cleared it is
+        # ``None``.  The old ``if ... is not None`` guard only ever SET the
+        # mask, so removing the Mask File left the previous run's mask stale on
+        # ``scan.global_mask`` and it kept rendering on the raw image (and in
+        # the cake payload path).  Assign unconditionally so removal clears it;
+        # only skip when there is no wrangler thread at all (test stubs / pre-
+        # run), where the mask state is genuinely unknown.
+        _wthread = getattr(self.wrangler, 'thread', None)
+        if _wthread is not None:
+            self.scan.global_mask = getattr(_wthread, 'mask', None)
         # Also carry the run's intensity-threshold settings so the raw-image
         # preview can show the image AS INTEGRATED (mask + threshold).
         for _attr in ('apply_threshold', 'threshold_min', 'threshold_max'):
