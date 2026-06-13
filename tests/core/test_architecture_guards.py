@@ -45,6 +45,8 @@ def test_headless_contract_imports_do_not_pull_gui_modules():
         "xrd_tools.core.metadata",
         "xrd_tools.core.scan",
         "xrd_tools.reduction",
+        "xrd_tools.session",
+        "xrd_tools.session.scan_session",
         "xrd_tools.io.nexus",
         "xrd_tools.io.nexus_inspect",
         "xrd_tools.sources",

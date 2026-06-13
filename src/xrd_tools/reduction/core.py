@@ -298,7 +298,25 @@ class ReductionResult:
 
 
 class ReductionSink(Protocol):
-    """Destination for frame reduction products."""
+    """Destination for frame reduction products.
+
+    Required hooks: ``begin`` (once, before the first write), ``write`` (once per
+    frame index, on the single writer thread), ``finish`` (once, after the last
+    write).  The engine also PROBES these OPTIONAL hooks by ``getattr`` and calls
+    them when present — implement only the ones a sink needs:
+
+    * ``replace(frame, reduction)`` — re-fed index (reintegration); falls back to
+      ``write`` when absent.
+    * ``abort(result)`` — finalize on a failed/cancelled run instead of
+      ``finish``.
+    * ``worker_process(frame, reduction)`` — per-frame prep run on the POOL
+      worker thread (NOT the writer), e.g. a thumbnail; lets expensive per-frame
+      work fan out instead of serializing on the writer.
+    * ``flush(*, force=False)`` — force pending buffered output to its backing
+      store (pause / end-of-run).  The save *cadence* (when to call it) is the
+      caller's policy (e.g. xdart's ``FlushPolicy``), not the sink's — see
+      ADR-0004 §4.
+    """
 
     def begin(self, scan: Scan, plan: ReductionPlan) -> None: ...
     def write(self, frame: Frame, reduction: FrameReduction) -> None: ...

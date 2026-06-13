@@ -1,0 +1,350 @@
+# -*- coding: utf-8 -*-
+"""The headless :class:`ScanSession` + its immutable event types.
+
+``ScanSession`` wraps a streaming ``ReductionSession`` and a ``ReductionSink``.
+The user's sink is wrapped in an internal event-emitting decorator
+(:class:`_EventSink`) that forwards every hook the engine probes
+(``begin``/``write``/``replace``/``finish``/``abort``/``worker_process``/
+``flush``) and, after each ``write``/``replace``, fires ``on_frame_completed``
+on the session's single writer thread — preserving the HDF5 single-writer
+invariant (ADR-0004 §1).
+
+Threading (ADR-0004): ``on_frame_completed`` and the completion-side
+``on_progress`` fire on the WRITER thread; ``on_state_change`` and the
+submit-side ``on_progress`` fire on the caller thread.  A callback that raises
+is caught + logged — a listener can never kill the writer (the T0-7/S1
+false-success trap).  A Qt bridge marshals ``on_frame_completed`` via a
+``QueuedConnection``.
+
+This module is Qt-free (numpy only via the result containers).  Save *cadence*
+(FlushPolicy / persist-before-evict) is deliberately NOT here — it is an
+xdart-adapter concern (ADR-0004 §4); the session only exposes ``flush`` as a
+contract pass-through to the sink.
+"""
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
+
+import numpy as np
+
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.reduction import (
+    Frame,
+    ReductionPlan,
+    ReductionResult,
+    ReductionSession,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ── immutable events ────────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class FrameEvent:
+    """One frame finished reducing (ADR-0003: single-result + the mode it was
+    computed under).  Immutable; built from the engine's ``FrameReduction``."""
+
+    frame_index: int
+    mode_key: Any                      # GI (mode_1d, mode_2d) value tuple, or None
+    result_1d: IntegrationResult1D | None
+    result_2d: IntegrationResult2D | None
+    metadata: Mapping[str, Any]
+    generation: int                    # caller-owned stale-render stamp (ADR-0004 §2)
+    timestamp: float                   # wall-clock completion (time.time())
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressEvent:
+    """Absolute (not delta) progress counts; may fire from two threads, so
+    consumers treat it as idempotent."""
+
+    submitted: int
+    completed: int
+    total: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class StateChangeEvent:
+    """Run-state transition (fires on the caller thread)."""
+
+    is_running: bool
+    is_paused: bool
+
+
+# ── internal sink decorator ───────────────────────────────────────────────────
+
+class _EventSink:
+    """Wrap the user's sink: forward every probed hook, and after each
+    ``write``/``replace`` fire the completion callback on the writer thread.
+
+    Forwarding the *optional* hooks (``replace``/``abort``/``worker_process``/
+    ``flush``) is essential — defining them unconditionally would otherwise make
+    the engine treat a plain sink as replace/abort-capable, or (if omitted)
+    disable the parallel ``worker_process`` thumbnail path.  Each forwards to the
+    inner sink only when the inner sink actually provides it.
+    """
+
+    def __init__(self, inner, on_completed: Callable[[Frame, Any], None]) -> None:
+        self._inner = inner
+        self._on_completed = on_completed
+
+    def begin(self, scan, plan) -> None:
+        if self._inner is not None:
+            self._inner.begin(scan, plan)
+
+    def write(self, frame, reduction) -> None:
+        if self._inner is not None:
+            self._inner.write(frame, reduction)
+        self._on_completed(frame, reduction)
+
+    def replace(self, frame, reduction) -> None:
+        inner_replace = getattr(self._inner, "replace", None)
+        if callable(inner_replace):
+            inner_replace(frame, reduction)
+        elif self._inner is not None:
+            # No replace hook → the engine would have called write(); match it.
+            self._inner.write(frame, reduction)
+        self._on_completed(frame, reduction)
+
+    def finish(self, result) -> None:
+        if self._inner is not None:
+            self._inner.finish(result)
+
+    def abort(self, result) -> None:
+        inner_abort = getattr(self._inner, "abort", None)
+        if callable(inner_abort):
+            inner_abort(result)
+
+    def worker_process(self, frame, reduction) -> None:
+        wp = getattr(self._inner, "worker_process", None)
+        if callable(wp):
+            wp(frame, reduction)
+
+    def flush(self, *, force: bool = False) -> None:
+        f = getattr(self._inner, "flush", None)
+        if callable(f):
+            f(force=force)
+            return
+        # Interim: the xdart QtNexusSink still exposes the historical private
+        # `_flush`; honour it until the bridge renames it (ADR-0004 §4).
+        _f = getattr(self._inner, "_flush", None)
+        if callable(_f):
+            _f(force=force)
+
+
+def _mode_key_from_plan(plan: ReductionPlan):
+    """The GI sub-mode key (``(mode_1d, mode_2d)`` values) a result was computed
+    under, or ``None`` for a standard scan — ADR-0003's per-completion mode tag."""
+    gi = getattr(plan, "gi", None)
+    if gi is None:
+        return None
+    m1 = getattr(gi, "mode_1d", None)
+    m2 = getattr(gi, "mode_2d", None)
+    return (getattr(m1, "value", m1), getattr(m2, "value", m2))
+
+
+# ── the session ───────────────────────────────────────────────────────────────
+
+class ScanSession:
+    """Drive a streaming scan reduction by commands in / events out.
+
+    Construction arms the underlying streaming ``ReductionSession`` (its writer
+    thread starts + ``sink.begin`` runs), so :meth:`start` is an idempotent
+    confirmation.  Feed frames with :meth:`submit`; consume results by
+    registering :meth:`on_frame_completed`.  Always :meth:`finish` (or use it as
+    a context manager) to drain the writer + finalize the sink.
+    """
+
+    def __init__(
+        self,
+        plan: ReductionPlan,
+        source: Any,
+        sink: Any = None,
+        *,
+        executor: Any | None = None,
+        inflight_max: int | None = None,
+        gi_freeze_mode: str | None = None,
+        cancel_token: Any | None = None,
+    ) -> None:
+        self._lock = threading.RLock()
+        self._frame_cbs: list[Callable[[FrameEvent], None]] = []
+        self._progress_cbs: list[Callable[[ProgressEvent], None]] = []
+        self._state_cbs: list[Callable[[StateChangeEvent], None]] = []
+        self._submitted = 0
+        self._completed = 0
+        self._generation = 0
+        self._mode_key = _mode_key_from_plan(plan)
+        self._user_sink = sink
+        event_sink = _EventSink(sink, self._on_completed)
+        # Streaming + retain_products=False: per-frame results are delivered via
+        # events (and persisted by a durable sink), so the session does not also
+        # hoard every FrameReduction (the S2 ~14 GB-on-10k-frames trap).
+        self._session = ReductionSession(
+            plan,
+            source,
+            event_sink,
+            execution="streaming",
+            executor=executor,
+            inflight_max=inflight_max,
+            gi_freeze_mode=gi_freeze_mode,
+            cancel_token=cancel_token,
+            retain_products=False,
+        )
+        self._event_sink = event_sink
+
+    # -- context manager ---------------------------------------------------
+    def __enter__(self) -> "ScanSession":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # Mirror ReductionSession.__exit__: never raise a fresh failure during an
+        # exception unwind; surface the run failure only on a clean exit.
+        self.finish(raise_on_failure=exc_type is None)
+
+    # -- commands in -------------------------------------------------------
+    def start(self) -> None:
+        """Idempotent: the writer is armed at construction; emit the initial
+        running state once."""
+        self._emit_state()
+
+    def submit(self, frame: Frame, image: np.ndarray | None = None) -> bool:
+        """Feed one frame.  Returns the underlying session's accepted/dropped
+        bool (False = cancelled / writer-dead mid-wait; see
+        ``ReductionSession.submit``).  Advances submitted-progress only when
+        accepted."""
+        accepted = self._session.submit(frame, image)
+        if accepted:
+            with self._lock:
+                self._submitted += 1
+            self._emit_progress()
+        return accepted
+
+    def pause(self, timeout: float | None = None) -> bool:
+        """Quiesce the writer at a frame boundary (delegates to
+        ``ReductionSession.pause``).  Returns whether it fully drained."""
+        drained = self._session.pause(timeout=timeout)
+        self._emit_state()
+        return drained
+
+    def resume(self) -> None:
+        self._session.resume()
+        self._emit_state()
+
+    def stop(self) -> None:
+        """Cooperative cancel (sets the cancel token); the writer stops at the
+        next boundary.  Call :meth:`finish` to drain + finalize."""
+        self._session.cancel_token.cancel()
+        self._emit_state()
+
+    def finish(self, *, raise_on_failure: bool = True,
+               join_timeout: float | None = None) -> ReductionResult:
+        """Drain the writer, finalize the sink, return the result."""
+        result = self._session.finish(
+            raise_on_failure=raise_on_failure, join_timeout=join_timeout)
+        self._emit_state()
+        return result
+
+    def flush(self, *, force: bool = False) -> None:
+        """Contract pass-through to the sink's optional ``flush`` hook (ADR-0004
+        §4).  No-op for a sink without one."""
+        self._event_sink.flush(force=force)
+
+    def set_generation(self, generation: int) -> None:
+        """Set the stale-render stamp put on subsequent events (ADR-0004 §2).
+        Caller-owned; the session never auto-advances it (esp. not on
+        pause/resume)."""
+        with self._lock:
+            self._generation = int(generation)
+
+    # -- state out ---------------------------------------------------------
+    @property
+    def is_running(self) -> bool:
+        return self._session.is_running
+
+    @property
+    def is_paused(self) -> bool:
+        return self._session.is_paused
+
+    @property
+    def frames_submitted(self) -> int:
+        with self._lock:
+            return self._submitted
+
+    @property
+    def frames_completed(self) -> int:
+        with self._lock:
+            return self._completed
+
+    @property
+    def scan(self):
+        """The underlying session's scan (frame inventory / context)."""
+        return self._session.scan
+
+    # -- events out --------------------------------------------------------
+    def on_frame_completed(self, cb: Callable[[FrameEvent], None]) -> None:
+        with self._lock:
+            self._frame_cbs.append(cb)
+
+    def on_progress(self, cb: Callable[[ProgressEvent], None]) -> None:
+        with self._lock:
+            self._progress_cbs.append(cb)
+
+    def on_state_change(self, cb: Callable[[StateChangeEvent], None]) -> None:
+        with self._lock:
+            self._state_cbs.append(cb)
+
+    # -- internals ---------------------------------------------------------
+    def _on_completed(self, frame: Frame, reduction: Any) -> None:
+        """Writer-thread completion hook (called by _EventSink after the sink
+        write).  Builds the immutable FrameEvent + advances completion progress.
+        A listener exception is caught — it must never escape the writer loop."""
+        with self._lock:
+            self._completed += 1
+            generation = self._generation
+            cbs = tuple(self._frame_cbs)
+        event = FrameEvent(
+            frame_index=int(getattr(reduction, "frame_index", getattr(frame, "index", -1))),
+            mode_key=self._mode_key,
+            result_1d=getattr(reduction, "result_1d", None),
+            result_2d=getattr(reduction, "result_2d", None),
+            metadata=dict(getattr(reduction, "metadata", {}) or {}),
+            generation=generation,
+            timestamp=time.time(),
+        )
+        for cb in cbs:
+            try:
+                cb(event)
+            except Exception:
+                logger.exception("ScanSession.on_frame_completed listener raised")
+        self._emit_progress()
+
+    def _emit_progress(self) -> None:
+        with self._lock:
+            submitted, completed = self._submitted, self._completed
+            cbs = tuple(self._progress_cbs)
+        try:
+            total = len(self._session.scan)
+        except Exception:
+            total = None
+        event = ProgressEvent(submitted=submitted, completed=completed, total=total)
+        for cb in cbs:
+            try:
+                cb(event)
+            except Exception:
+                logger.exception("ScanSession.on_progress listener raised")
+
+    def _emit_state(self) -> None:
+        event = StateChangeEvent(is_running=self.is_running, is_paused=self.is_paused)
+        with self._lock:
+            cbs = tuple(self._state_cbs)
+        for cb in cbs:
+            try:
+                cb(event)
+            except Exception:
+                logger.exception("ScanSession.on_state_change listener raised")
