@@ -605,11 +605,20 @@ class imageWrangler(wranglerWidget):
                 idx = self.ui.processingModeCombo.findText(mode)
                 if idx >= 0:
                     self.ui.processingModeCombo.setCurrentIndex(idx)
+            else:
+                # Fresh start (no saved session): default to Int 2D so the cake
+                # + raw panels are shown without the user switching modes.
+                idx = self.ui.processingModeCombo.findText('Int 2D')
+                if idx >= 0:
+                    self.ui.processingModeCombo.setCurrentIndex(idx)
             # Deliberately do NOT restore Live's checked state — it's a
             # start/stop control, and setChecked(True) would fire its toggled
             # handler and auto-start a live run on launch.
             if 'batch_mode' in session:
                 self.ui.batchCheckBox.setChecked(session['batch_mode'])
+            else:
+                # Fresh start: default to non-Batch (live per-frame display).
+                self.ui.batchCheckBox.setChecked(False)
         finally:
             self._restoring = False
         # meta_ext needs None conversion (sigValueChanged fires set_meta_ext automatically)

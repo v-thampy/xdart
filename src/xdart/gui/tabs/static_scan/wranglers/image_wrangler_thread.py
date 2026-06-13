@@ -162,15 +162,21 @@ def _gi_2d_range_keys(args):
 # The GI live==batch==reload equivalence tests additionally bind these
 # methods via MethodType to validate the ssrl freeze against this scout.
 def _padded_axis_range(axis, pad_fraction=0.02):
-    """Return a slightly padded finite range for an integrated axis.
+    """Return a small coverage margin around an integrated axis' finite extent.
+
+    The 2% margin is load-bearing: a fresh per-frame integration can land a few
+    bins beyond a scout's auto-range extent (binning discretization), and
+    without it the frozen range would CLIP that real data.  The empty bins the
+    margin creates beyond the real data should be NaN-filled (not a spurious
+    dummy) so they are not plotted — see the NaN-empty follow-up.
 
     Returns ``None`` when the axis is missing, has no finite samples, or is
     *collapsed* (span <= 0 — every finite value identical).  A collapsed
     axis means the scout integration was degenerate (e.g. GI at a 0°
-    incidence); freezing a padded tiny range from it would clamp every
-    subsequent frame onto that collapsed grid and blank the whole scan.
-    Returning ``None`` leaves the range unfrozen so the caller can surface
-    the problem instead of silently squashing the output.
+    incidence); freezing a tiny range from it would clamp every subsequent
+    frame onto that collapsed grid and blank the whole scan.  Returning
+    ``None`` leaves the range unfrozen so the caller can surface the problem
+    instead of silently squashing the output.
     """
     if axis is None:
         return None

@@ -804,7 +804,15 @@ def freeze_common_axis(results, *, gi_mode_1d: str | None = None,
         The GI 1D mode; selects the output arg key (see
         :func:`gi_1d_output_axis_key`).
     pad_fraction
-        Fractional padding applied to the unioned span (default 2%).
+        Small fractional margin on the unioned span (default 2%).  It is
+        load-bearing for COVERAGE: a fresh per-frame integration can land a few
+        bins beyond the scout's auto-range extent (binning discretization), and
+        without the margin the frozen range would CLIP that real data (see
+        tests/.../test_gi_freeze_covers_last_frame_extent).  The margin makes
+        empty bins beyond the real data; those should be filled with NaN (not a
+        spurious dummy) so they are not plotted — see the q_total floor below
+        and the NaN-empty follow-up.  For ``q_total`` the low margin is clamped
+        to 0 (a magnitude can't be negative).
 
     Returns
     -------
@@ -819,6 +827,15 @@ def freeze_common_axis(results, *, gi_mode_1d: str | None = None,
     key = gi_1d_output_axis_key(gi_mode_1d)
     rng = _padded_union_range(
         [getattr(r, 'radial', None) for r in results], pad_fraction)
+    # q_total is a MAGNITUDE (>= 0).  The symmetric pad_fraction must not push
+    # its lower bound below 0 — a negative frozen radial_range makes pyFAI bin
+    # empty q < 0 cells that integrate to a spurious flat dummy line at low Q
+    # (visible as points at negative Q in the 1D plot).  q_ip (signed in-plane)
+    # and q_oop (this codebase allows a signed out-of-plane scout) are left
+    # alone; ``None`` defaults to q_total.  Mirrors _clamp_angle in
+    # freeze_common_axes_2d (which keeps angular ranges within [-180, 180]).
+    if rng is not None and gi_mode_1d in (None, 'q_total'):
+        rng = (max(0.0, float(rng[0])), float(rng[1]))
     return key, rng
 
 

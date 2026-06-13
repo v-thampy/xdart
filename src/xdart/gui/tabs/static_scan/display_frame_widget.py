@@ -1170,6 +1170,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     raise
                 logger.debug("render: viewer draw of %s failed", role, exc_info=True)
 
+        # Keep the 1D x-axis off unphysical negative Q/2theta (auto-range
+        # padding only; the data itself is >= 0 — see _floor_plot_xaxis).
+        # getattr: the render_display unit-tests bind this method onto a
+        # SimpleNamespace holder that doesn't define the display-polish helpers.
+        _floor = getattr(self, '_floor_plot_xaxis', None)
+        if _floor is not None:
+            _floor()
+
         # 2D title + image-preview popup (normal mode; viewer draw methods
         # set their own title).  Skip on a non-READY (EMPTY/ERROR) state —
         # there is no current frame to label or preview, and ``update_2d_label``
@@ -1527,6 +1535,28 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.plot.enableAutoRange()  # re-arm continuous tracking
         except Exception:
             logger.debug("1D autoscale on unit change failed", exc_info=True)
+        self._floor_plot_xaxis()
+
+    def _floor_plot_xaxis(self):
+        """Stop the 1D auto-range from padding into an UNPHYSICAL negative
+        x-region (pyFAI returns Q/2theta/q_total >= 0; autoRange pads ~5-10%
+        left of the data, which dips below 0).
+
+        Data-driven so it stays correct for the signed GI in-plane q (q_ip CAN
+        be negative): floor the view's ``xMin`` at 0 only when the plotted data
+        is non-negative, and release the floor otherwise.  ``setLimits`` is a
+        sticky constraint that ``autoRange``/``enableAutoRange`` respect, so the
+        floor survives continuous live re-ranging until the data goes negative.
+        """
+        try:
+            vb = self.plot.getViewBox()
+            xb = vb.childrenBounds()[0]   # data x-bounds [min, max] or None
+            if xb is not None and xb[0] is not None and xb[0] >= -1e-9:
+                vb.setLimits(xMin=0.0)
+            else:
+                vb.setLimits(xMin=None)
+        except Exception:
+            logger.debug("1D x-axis floor failed", exc_info=True)
 
     # ── 2D image rendering ────────────────────────────────────────
 

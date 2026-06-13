@@ -155,8 +155,30 @@ def test_freeze_common_axis_single_scout_pads():
                                   gi_mode_1d="q_total", pad_fraction=0.02)
     assert key == "radial_range"
     lo, hi = rng
-    assert lo == pytest.approx(-0.2, abs=1e-9)   # 0 - 2% of span(10)
+    # q_total is a magnitude: the low pad (0 - 2% of span) is clamped at 0 so
+    # the frozen range never requests empty negative-q bins.  The high pad is
+    # unaffected.
+    assert lo == pytest.approx(0.0, abs=1e-9)
     assert hi == pytest.approx(10.2, abs=1e-9)
+
+
+def test_freeze_common_axis_qtotal_floor_at_zero():
+    """Regression: q_total's symmetric pad must not push the frozen lower bound
+    below 0 (negative-q bins integrate to a spurious flat dummy line — the
+    'data points at negative Q' artifact).  q_ip (signed) is NOT floored."""
+    # span 0.002..5.88 like the real GI data: 2% pad would give lo ~= -0.116.
+    scout = _r1d(np.linspace(0.002, 5.88, 2000))
+    _, (lo, hi) = freeze_common_axis(scout, gi_mode_1d="q_total",
+                                     pad_fraction=0.02)
+    assert lo == 0.0                     # floored, not negative
+    assert hi > 5.88                     # high pad preserved
+    # default (None) behaves as q_total
+    _, (lo_none, _hi) = freeze_common_axis(scout, pad_fraction=0.02)
+    assert lo_none == 0.0
+    # q_ip is a signed projection — its negative pad is preserved
+    _, (lo_ip, _h) = freeze_common_axis(_r1d(np.linspace(0.0, 5.0, 100)),
+                                        gi_mode_1d="q_ip", pad_fraction=0.02)
+    assert lo_ip < 0.0
 
 
 def test_freeze_common_axis_union_covers_both_drifted_scouts():
