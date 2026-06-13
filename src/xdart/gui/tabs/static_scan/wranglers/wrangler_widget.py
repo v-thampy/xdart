@@ -392,6 +392,11 @@ class wranglerThread(Qt.QtCore.QThread):
         self._streaming_session = None
         self._streaming_sink = None
         self._streaming_scan_id = None
+        # 4c-1/4d: the streaming register/submit/pause seam (created in
+        # _get_streaming_session, dies in _close_reduction_session).  Initialised
+        # here so the `scan_session` property + GUI run-state reads never hit an
+        # AttributeError before the first streaming session opens.
+        self._scan_session_adapter = None
         # BLOCKER 1: id of the scan whose whole-scan GI grid pre-pass has run, so
         # the freeze happens once per scan (not per chunk).  Reset on scan close.
         self._gi_prepass_scan_id = None
@@ -488,6 +493,18 @@ class wranglerThread(Qt.QtCore.QThread):
                         self.command = 'stop'
                 else:
                     self.command = 'stop'
+
+    @property
+    def scan_session(self):
+        """The active streaming session seam (``ScanSessionAdapter``) or None.
+
+        4d: the single read-only accessor the GUI consults for run-state
+        (``is_running`` / ``is_paused``) instead of poking the private adapter
+        slot, and the seam 4f's public ``xrd_tools.session.ScanSession`` bridge
+        hangs off.  None when no streaming session is open (true-live watch and
+        the reintegrate-via-integratorThread path have no adapter — callers fall
+        back to their own run-state cache)."""
+        return self._scan_session_adapter
 
     def _resolve_frame_mask(self, scan, img_data):
         """Return a stable per-scan "bad pixel" mask cached on the scan.

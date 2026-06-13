@@ -1046,7 +1046,15 @@ class staticWidget(QWidget):
             mode_text = ''
         is_viewer = mode_text in ('Image Viewer', 'XYE Viewer', 'NeXus Viewer')
         is_1d_only = mode_text in ('Int 1D', 'Int 1D (XYE)')
-        run_active = getattr(self, '_run_active', False)
+        # 4d: the streaming session is the authoritative run-state when present,
+        # but `_run_active` remains the cache that covers the windows the session
+        # can't: the start→first-frame gap (the adapter opens on the first frame)
+        # and the reintegrate-via-integratorThread path (no adapter at all).  OR
+        # them so controls can only ever be *more* disabled mid-run, never wrongly
+        # re-enabled before `_exit_run_state` re-asserts the mode-correct state.
+        # (The disk-read-guard timing stays on sigPaused/sigResuming — R7 — never
+        # on these reads.)
+        run_active = bool(getattr(self, '_run_active', False)) or self._session_run_active()
         ui = itree.ui
         # 2-D integration panel: only in Int 2D, and never during a run.
         frame2d = getattr(ui, 'frame2D', None)
@@ -1062,6 +1070,22 @@ class staticWidget(QWidget):
             btn = getattr(ui, name, None)
             if btn is not None:
                 btn.setEnabled(not run_active)
+
+    def _session_run_active(self):
+        """4d: True iff a streaming session is open AND reports it is running.
+
+        Reads the wrangler's ``scan_session`` seam (the ``ScanSessionAdapter``),
+        never the private slot.  Returns False when no session is open (so the
+        OR with ``_run_active`` falls through to the cache) — robustly guarded so
+        a duck/partial wrangler in a test never raises here."""
+        wrangler = getattr(self, 'wrangler', None)
+        session = getattr(wrangler, 'scan_session', None) if wrangler else None
+        if session is None:
+            return False
+        try:
+            return bool(session.is_running)
+        except Exception:
+            return False
 
     def _enter_run_state(self):
         """Single owner of run START (task #68): mark a wrangler/integrator run

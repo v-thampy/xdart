@@ -442,3 +442,76 @@ def test_wait_if_paused_resumes_adapter_on_exit():
     t.join(timeout=2)
     assert done == [True]
     assert adapter.calls[-1] == 'resume'      # resumed on exit
+
+
+# ── 4d: run-state reads the session seam; pause must not bump generation ─────
+
+def test_scan_session_property_exposes_adapter():
+    """4d: `wrangler.scan_session` is the single read-only accessor for the
+    streaming adapter — None before a session opens, the adapter once set.  The
+    GUI reads run-state through this, never the private slot."""
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+    w = SimpleNamespace(_scan_session_adapter=None)
+    assert wranglerThread.scan_session.fget(w) is None
+    sentinel = object()
+    w._scan_session_adapter = sentinel
+    assert wranglerThread.scan_session.fget(w) is sentinel
+
+
+def test_session_run_active_or_logic():
+    """4d: `_session_run_active` reads `wrangler.scan_session.is_running` when a
+    session is open, returns False otherwise (so the OR with `_run_active` falls
+    through to the cache), and never raises on a partial/duck wrangler."""
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    f = staticWidget._session_run_active
+
+    # no wrangler / no session -> False (cache governs)
+    assert f(SimpleNamespace(wrangler=None)) is False
+    assert f(SimpleNamespace(wrangler=SimpleNamespace(scan_session=None))) is False
+    # open session reports its state through
+    assert f(SimpleNamespace(wrangler=SimpleNamespace(
+        scan_session=SimpleNamespace(is_running=True)))) is True
+    assert f(SimpleNamespace(wrangler=SimpleNamespace(
+        scan_session=SimpleNamespace(is_running=False)))) is False
+
+    # a raising `is_running` is swallowed (never crashes the control-state apply)
+    class _Boom:
+        @property
+        def is_running(self):
+            raise RuntimeError("boom")
+    assert f(SimpleNamespace(wrangler=SimpleNamespace(scan_session=_Boom()))) is False
+
+
+def test_pause_resume_does_not_bump_display_generation():
+    """4d (R-generation): a pause/resume cycle changes neither the selection nor
+    the mode, so it MUST NOT bump `display_generation` (which gates stale-render
+    drops).  The pause display side-effect is `set_processing_active` (a pure
+    bool flip) + a same-selection re-fire (sig unchanged -> no bump).  A real
+    selection change still bumps — proving the guard is sensitive, not inert."""
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+    host = SimpleNamespace(display_generation=7, _last_selection_sig=None,
+                           idxs=[3], overall=False)
+    host._bump_display_generation = MethodType(
+        displayFrameWidget._bump_display_generation, host)
+    host._note_selection_generation = MethodType(
+        displayFrameWidget._note_selection_generation, host)
+    host.set_processing_active = MethodType(
+        displayFrameWidget.set_processing_active, host)
+
+    host._note_selection_generation()            # records baseline sig, no bump
+    g0 = host.display_generation
+    assert g0 == 7
+
+    # pause: freeze the display, lift later — neither toggles generation
+    host.set_processing_active(False)
+    host.set_processing_active(True)
+    assert host.display_generation == g0
+
+    # resume re-fires the SAME standing selection -> sig unchanged -> no bump
+    host._note_selection_generation()
+    assert host.display_generation == g0
+
+    # sensitivity: a genuine selection change DOES bump
+    host.idxs = [4]
+    host._note_selection_generation()
+    assert host.display_generation == g0 + 1
