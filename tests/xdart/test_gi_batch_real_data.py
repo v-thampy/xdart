@@ -107,9 +107,10 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     helpers + an xye-flush spy.  Returns ``(w, captured)`` where ``captured``
     is the ``{img_number: LiveFrame}`` dict the spy fills at flush time.
 
-    This is the shared rig behind both :func:`_run_batch_parallel` (drives
-    ``_dispatch_batch_parallel``) and :func:`_frozen_gi_bai_args` (drives the
-    scout freeze) so the freeze sees the same thread state as a real batch.
+    This is the shared rig behind both :func:`_run_batch_streaming` (drives the
+    streaming ``_dispatch_batch_streaming``) and :func:`_frozen_gi_bai_args`
+    (drives the scout freeze) so the freeze sees the same thread state as a real
+    batch.
     """
     from types import SimpleNamespace, MethodType
     from threading import RLock
@@ -142,15 +143,13 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     # streaming dispatcher) — used to exercise the Int-1D-XYE path where the 2D
     # freeze self-skips on xye_only.
     w._dispatch_batch = MethodType(imageThread._dispatch_batch, w)
-    # Batch execution-policy selector used by _dispatch_batch.
-    w._batch_execution = MethodType(imageThread._batch_execution, w)
-    # 4e: the rig drives the PRODUCTION streaming path (one write path).  Wire the
+    # 4e: the rig drives the PRODUCTION streaming path (one write path — the
+    # chunked dispatcher + its batch-execution selector are gone).  Wire the
     # persistent ReductionSession + QtNexusSink so _dispatch_batch routes here and
     # router-driven tests (xye-only uniform-grid, multichunk) get a real session.
-    # batch_execution is left UNSET so _batch_execution() resolves to the module
-    # default ("streaming"); gi_freeze_mode is left UNSET so the production scout
-    # freeze runs (the freeze is itself under test) — _run_batch_streaming sets it
-    # None only when it passes a pre-determined grid.
+    # gi_freeze_mode is left UNSET so the production scout freeze runs (the freeze
+    # is itself under test) — _run_batch_streaming sets it None only when it passes
+    # a pre-determined grid.
     w.file_lock = RLock()
     w.command_lock = RLock()
     w.sigUpdate = SimpleNamespace(emit=lambda *a: None)
@@ -1034,7 +1033,7 @@ def test_gi_prepass_warns_and_proceeds_on_unestablishable_range():
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
     for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
-              "_enumerate_scan_files", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze", "_batch_execution"):
+              "_enumerate_scan_files", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
     w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
 
@@ -1072,7 +1071,7 @@ def test_gi_prepass_warns_and_proceeds_on_image_directory_source():
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
     for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
-              "_enumerate_scan_files", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze", "_batch_execution"):
+              "_enumerate_scan_files", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
     w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
 
@@ -1106,7 +1105,7 @@ def _pinned_prepass_holder(emitted):
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
     for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned",
-              "_abort_gi_prepass", "_warn_gi_first_chunk_freeze", "_batch_execution"):
+              "_abort_gi_prepass", "_warn_gi_first_chunk_freeze"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
 
     def _no_scout(scan):
@@ -1187,7 +1186,7 @@ def test_gi_prepass_fails_closed_on_degenerate_scout_freeze():
         gi=True, batch_mode=True, batch_execution="streaming", command="",
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
-    for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze", "_batch_execution"):
+    for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
     # The scout resolves two extremes ("freeze"), but the production freeze hits
     # a blank scout cake and raises GIFreezeError.

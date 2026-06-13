@@ -344,7 +344,7 @@ class LiveFrame():
         cost of the lean 1D stream).  2D modes, and 1D frames with no
         reloadable source, keep the thumbnail as their only preview — this
         returns ``False`` for them.  The batch precompute
-        (``image_wrangler_thread._dispatch_batch_parallel``) and the writer
+        (``QtNexusSink.worker_process``) and the writer
         (``nexus_writer._write_per_frame_metadata``) gate on this identically,
         so a skipped frame is never lazily re-thumbnailed at save time.
         """

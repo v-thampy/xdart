@@ -76,20 +76,13 @@ from xdart.modules.reduction import (
 from .qt_nexus_sink import QtNexusSink
 from .wrangler_widget import wranglerThread
 
-# Batch execution policy (PERF-4b/WS-X1).  "streaming" (default) routes the
-# batch through one persistent ReductionSession + QtNexusSink (submit-per-frame,
-# single writer thread, thumbnail parallelized in the worker) — proven on the
-# 651-frame Eiger scan at 8 cores to be byte-identical to and >= the old chunked
-# path (2D 32.6s vs 38.8s, XYE 23.7s vs 25.4s, 1D ~equal).  "chunked" is the old
-# read-chunk -> integrate -> Phase-2-write path, kept one cycle as a fallback.
-#
-# Override without editing code: set XDART_BATCH_EXECUTION=chunked (or
-# =streaming) in the environment before launching xdart.  Read once at import.
-_BATCH_EXECUTION = os.environ.get("XDART_BATCH_EXECUTION", "streaming").strip().lower()
-if _BATCH_EXECUTION not in ("chunked", "streaming"):
-    logger.warning("XDART_BATCH_EXECUTION=%r is not 'chunked' or 'streaming'; "
-                   "using 'streaming'.", _BATCH_EXECUTION)
-    _BATCH_EXECUTION = "streaming"
+# Batch execution policy (PERF-4b/WS-X1).  Batch ALWAYS streams now: one
+# persistent ReductionSession + QtNexusSink (submit-per-frame, single writer
+# thread, thumbnail parallelized in the worker) — proven on the 651-frame Eiger
+# scan at 8 cores to be byte-identical to and >= the old chunked path (2D 32.6s
+# vs 38.8s, XYE 23.7s vs 25.4s, 1D ~equal).  4e retired the old read-chunk ->
+# integrate -> Phase-2-write "chunked" dispatcher and its XDART_BATCH_EXECUTION
+# escape hatch: there is one batch write path.
 
 # Live (non-batch) execution policy (PERF-4b/WS-X1 #3 — unify live onto the
 # streaming sink).  "streaming" (DEFAULT as of the WS-X1 flip) routes a non-batch
@@ -627,10 +620,10 @@ class imageThread(wranglerThread):
         _cached_poni = None
         is_eiger = _is_eiger_master(self.img_file) if self.img_file else False
         # One-time visibility into which execution path this run takes (so the
-        # XDART_BATCH_EXECUTION / XDART_LIVE_EXECUTION flags are observable).
+        # XDART_LIVE_EXECUTION flag is observable).  Batch always streams now.
         # DEBUG: developer diagnostics, not run output.
-        logger.debug('Execution policy: batch_mode=%s  batch=%s  live=%s',
-                     self.batch_mode, self._batch_execution(), self._live_execution())
+        logger.debug('Execution policy: batch_mode=%s  batch=streaming  live=%s',
+                     self.batch_mode, self._live_execution())
 
         # ── Phase 1 & 2: collect then process all existing images ─────────────
         pending = []  # [(img_file, img_number, img_data, img_meta, bg_raw)]
@@ -907,20 +900,14 @@ class imageThread(wranglerThread):
         """
         self._maybe_warn_live_gi_clip()
         if self.batch_mode and len(pending) > 1:
-            if self._batch_execution() == "streaming":
-                return self._dispatch_batch_streaming(scan, pending)
-            return self._dispatch_batch_parallel(scan, pending)
+            # 4e: batch is one write path — always the streaming session.
+            return self._dispatch_batch_streaming(scan, pending)
         # Live (non-batch): #3 routes it through the SAME streaming session +
         # QtNexusSink (which does the per-frame display publish for live), behind
         # the live flag; the proven per-frame _process_one path is the default.
         if self._live_execution() == "streaming":
             return self._dispatch_batch_streaming(scan, pending)
         return self._dispatch_batch_serial(scan, pending, force_save=force_save)
-
-    def _batch_execution(self) -> str:
-        """Active batch execution policy ('chunked' | 'streaming').  Instance
-        override (``self.batch_execution``) wins over the module default."""
-        return getattr(self, "batch_execution", None) or _BATCH_EXECUTION
 
     def _live_execution(self) -> str:
         """Active live (non-batch) execution policy ('serial' | 'streaming').
@@ -1150,8 +1137,7 @@ class imageThread(wranglerThread):
         Returns ``True`` when the caller may open the session, ``False`` when
         the run was aborted (freeze error only; caller must not proceed).
         """
-        if not (self.gi and self.batch_mode
-                and self._batch_execution() == "streaming"):
+        if not (self.gi and self.batch_mode):
             return True
         if getattr(self, "_gi_prepass_scan_id", None) == id(scan):
             return True
@@ -1739,217 +1725,6 @@ class imageThread(wranglerThread):
         self._scan_session_adapter = ScanSessionAdapter(self, scan, session, sink)
         return session, sink
 
-    def _dispatch_batch_parallel(self, scan, pending):
-        """Batch processing through the headless reduction executor.
-
-        Phase 1 — Parallel integration:
-            Build LiveFrame shells, then let xrd_tools.run_reduction own
-            the per-frame ThreadPoolExecutor work.
-
-        Phase 2 — Serial HDF5 write:
-            All completed frames are written to HDF5 under a single file_lock
-            acquisition.  Skipped entirely in xye_only mode.
-        """
-        n_workers = min(self.max_cores, len(pending))
-        if getattr(scan, "_cached_integrator", None) is None:
-            # No cached integrator yet — fall back to serial dispatch
-            # (the source integrator gets built on the first call).
-            return self._dispatch_batch_serial(scan, pending)
-        # F3: prewarm the bad-pixel mask on the main thread before
-        # any worker reads it, so cache initialization isn't racy.
-        # ``pending`` tuple shape: (img_file, img_number, img_data,
-        # img_meta, bg_raw, t_read) — index 2 is the image.
-        if (getattr(scan, '_cached_data_mask', None) is None
-                and pending):
-            self._prewarm_frame_mask(scan, pending[0][2])
-        skip_2d = scan.skip_2d
-        mask = self.mask
-        gi = self.gi
-        th_mtr = self.incidence_motor
-        sample_orientation = self.sample_orientation
-        tilt_angle = self.tilt_angle
-        sync_live_scan_gi_settings(
-            scan,
-            incidence_motor=th_mtr,
-            sample_orientation=sample_orientation,
-            tilt_angle=tilt_angle,
-        )
-        standard_plan = self._plan_cache.get(scan, integrate_2d=not skip_2d)
-        series_average = self.series_average
-
-        frames = self._build_batch_frames(scan, pending)
-
-        # ── Phase 1: headless parallel integration ───────────────────────────
-        self.showLabel.emit(f'Integrating {len(frames)} images ({n_workers} workers)...')
-        _t_phase1 = time.time()
-        executor = n_workers if n_workers > 1 else None
-        cancel_token = self._cancel_token() if hasattr(self, "_cancel_token") else None
-        gi_freeze_mode = getattr(
-            self,
-            "gi_freeze_mode",
-            "scout_union" if self.gi else None,
-        )
-
-        def _session_factory():
-            return open_live_reduction_session(
-                frames,
-                standard_plan,
-                scan_name=str(getattr(scan, "name", "scan")),
-                global_mask=mask,
-                integrator=scan._cached_integrator,
-                poni=self.poni,
-                executor=executor,
-                cancel_token=cancel_token,
-                chunk_size=len(frames) if frames else 1,
-                gi_freeze_mode=gi_freeze_mode,
-            )
-
-        session_getter = getattr(self, "_get_reduction_session", None)
-        close_session = not callable(session_getter)
-        try:
-            if close_session:
-                session = _session_factory()
-            else:
-                session = session_getter(
-                    self._reduction_session_key_for(scan, standard_plan, n_workers),
-                    _session_factory,
-                )
-        except GIFreezeError as exc:
-            # The GI freeze pre-pass scouts the grid when the session is built;
-            # a blank/degenerate scout raises here.  Surface the fix and skip
-            # this batch rather than aborting the run with an opaque traceback.
-            self.showLabel.emit(
-                'GI 2D scout frame is blank or the grid is degenerate: set '
-                'Theta Motor to Manual and enter the incident angle, or check '
-                'the mask / threshold.'
-            )
-            logger.warning('GI freeze scout failed for batch: %s', exc)
-            return 0
-        try:
-            frames = reduce_live_frames(
-                frames,
-                standard_plan,
-                scan_name=str(getattr(scan, "name", "scan")),
-                global_mask=mask,
-                integrator=scan._cached_integrator,
-                poni=self.poni,
-                session=session,
-                cancel_token=cancel_token,
-                chunk_size=len(frames) if frames else 1,
-                gi_freeze_mode=gi_freeze_mode,
-            )
-        finally:
-            if close_session:
-                # Legacy chunked integration session (write is the separate
-                # _save_to_nexus, not this session's sink) — preserve the
-                # non-raising close; integration errors already re-raise.
-                session.finish(raise_on_failure=False)
-        # Precompute thumbnails in PARALLEL.  make_thumbnail is per-frame
-        # numpy/scipy on the in-memory map_raw (the session doesn't clear it),
-        # so it is thread-safe -- but it was the dominant *serial* cost left in
-        # the batch path (~0.03s/frame, run on the main thread after the parallel
-        # integration; ~17s of a 651-frame 2D batch, and the reason Int-1D batch
-        # was 2x serial).  Fan it out over the same worker count as the
-        # integration so batch wall-time matches/beats the old engine.
-        #
-        # Only compute thumbnails for frames that actually need a stored preview
-        # (PERF-5): skip xye_only entirely (never persisted -- Phase 2 below is
-        # gated off -- and never displayed: batch is silent), and skip 1D-only
-        # (skip_2d) frames whose raw is reloadable from source (the Image Viewer
-        # reloads the raw on demand via the per-frame source pointer).  The
-        # writer (nexus_writer._write_per_frame_metadata) gates on the SAME
-        # frame.can_skip_thumbnail() so a skipped frame is never lazily
-        # re-thumbnailed at save time.  Keep thumbnails for 2D modes and for 1D
-        # frames with no reloadable source (their only preview).
-        _skip_2d = getattr(scan, 'skip_2d', False)
-        thumb_frames = (
-            [] if self.xye_only
-            else [f for f in frames if not f.can_skip_thumbnail(_skip_2d)]
-        )
-
-        def _precompute_thumbnail(frame):
-            frame.integrator = scan._cached_integrator
-            try:
-                frame.make_thumbnail(global_mask=mask)
-            except Exception as e:
-                logger.warning('Thumbnail precompute failed for image %s: %s',
-                               frame.idx, e)
-
-        if thumb_frames:
-            if n_workers > 1 and len(thumb_frames) > 1:
-                with ThreadPoolExecutor(max_workers=n_workers) as _thumb_pool:
-                    list(_thumb_pool.map(_precompute_thumbnail, thumb_frames))
-            else:
-                for frame in thumb_frames:
-                    _precompute_thumbnail(frame)
-        with self._xye_lock:
-            for frame in frames:
-                self._xye_buffer.append((frame.idx, frame))
-        _t_phase1 = time.time() - _t_phase1
-        logger.info('[BATCH] Phase 1 (parallel integration): %d frames in %.2fs',
-                    len(frames), _t_phase1)
-
-        if not frames:
-            return 0
-
-        # ── Phase 2: serial HDF5 batch write ─────────────────────────────────
-        try:
-            # Class-qualified: test rigs bind _dispatch_batch_parallel onto
-            # duck holders that don't carry the helper.
-            imageThread._dispatch_batch_parallel_phase2(
-                self, scan, frames, gi, th_mtr, series_average)
-        finally:
-            # PERF-3, in a finally (codex): if the batch save RAISED, the
-            # frames sit unsaved in scan.frames (persist-before-evict pins
-            # them) -- without this, a failed 64-frame chunk also pinned
-            # ~18 MB/frame of raw.  free_raw only drops raws losslessly
-            # reloadable from source, so freeing on the error path is safe.
-            for frame in frames:
-                frame.free_raw()
-        return len(frames)
-
-    def _dispatch_batch_parallel_phase2(self, scan, frames, gi, th_mtr,
-                                        series_average):
-        """Phase 2 of the chunked dispatcher: serial .nxs write + XYE flush.
-        Split out so the caller can guarantee raw cleanup in a finally."""
-        if not self.xye_only:
-            self.showLabel.emit(f'Writing {len(frames)} frames to HDF5...')
-            _t_phase2 = time.time()
-            _get_h5pool().pause(scan.data_file)
-            try:
-                with self.file_lock:
-                    # Phase 2a: in-memory accumulation only (batch_save=True
-                    # makes add_frame a pure in-memory op; no file I/O).
-                    for frame in frames:
-                        scan.add_frame(
-                            frame=frame, calculate=False, update=True,
-                            get_sd=True, set_mg=False, static=True, gi=gi,
-                            th_mtr=th_mtr, series_average=series_average,
-                            batch_save=True,
-                        )
-                    # Phase 2b: single batch flush — one slice-assign per
-                    # stacked dataset for all frames in this batch.
-                    # The writer owns its file handle now.
-                    scan._save_to_nexus()
-            finally:
-                _get_h5pool().resume(scan.data_file)
-            _t_phase2 = time.time() - _t_phase2
-            logger.info('[BATCH] Phase 2 (HDF5 write): %d frames in %.2fs', len(frames), _t_phase2)
-
-        # Flush buffered XYE writes for this batch.  P3: pass the
-        # set of frame.idx values that actually landed in .nxs so
-        # in-flight workers from a Stop'd batch don't leave orphan
-        # XYE files for frames that were never published.
-        _t_xye = time.time()
-        published_idxs = {a.idx for a in frames}
-        self._flush_xye_buffer(scan, published_idxs=published_idxs)
-        _t_xye = time.time() - _t_xye
-        if _t_xye > 0.01:
-            logger.info('[BATCH] XYE flush: %d frames in %.2fs', len(frames), _t_xye)
-
-        # (PERF-3 free_raw moved to the caller's finally so it also runs
-        # when the save raises.)
-
     def _process_one(self, scan, img_file, img_number, img_data, img_meta,
                      bg_raw, t_read=0.0):
         """Integrate one image sequentially and save. Includes timing instrumentation.
@@ -2094,9 +1869,9 @@ class imageThread(wranglerThread):
             else:
                 frame.source_file = ""
             # source_frame_idx: per-source-file 0-based frame offset.
-            # See the matching block in ``_dispatch_batch_parallel``
-            # for the full rationale.  Eiger / HDF5 masters get
-            # ``img_number - 1``; everything else stays at 0.
+            # See the matching block in ``_build_batch_frames`` (the streaming
+            # dispatcher's frame-shell builder) for the full rationale.  Eiger /
+            # HDF5 masters get ``img_number - 1``; everything else stays at 0.
             if _raw_lives_in_source(img_file):
                 frame.source_frame_idx = int(img_number) - 1
             else:
@@ -2124,7 +1899,7 @@ class imageThread(wranglerThread):
             # cost an eager per-frame make_thumbnail (~7-15 ms each on the hot
             # loop) to keep the interval-flush thumbnail writer from reloading.
             # Net: pure regression on the lean 1D stream for zero RAM win.  The
-            # raw-free lives only in the batch path (_dispatch_batch_parallel),
+            # raw-free lives only in the batch path (QtNexusSink.worker_process),
             # where data_2d is not populated so the free actually frees and the
             # thumbnail is already precomputed across workers.  Live-mode RAM is
             # bounded by the display-cache lifecycle, not by PERF-3.
