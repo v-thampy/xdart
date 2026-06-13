@@ -431,15 +431,33 @@ Acceptance: each produces a correct `.nxs`, and the spine equivalence holds on t
 - **`PublicationStore` / validation envelope into core.** Stays an xdart GUI layer ON the events
   (gap-inventory: intrinsically Qt-coupled). Phase 5's `FrameRecord` collapse is where the
   publication record and the frame event converge.
-- **`LiveFrameSeries` eviction into headless core.** The in-memory cache is an xdart display
-  concern; the *invariant* (persist-before-evict) is reused via `FlushPolicy`, but the
-  implementation stays in xdart. A future headless live monitor would reuse the policy, not the
-  series.
+- **`LiveFrameSeries` eviction into headless core.** **UPDATED by ADR-0005:** the authoritative
+  `FrameRecord` store (bounded, persist-before-evict, disk-hydration) moves INTO the session in
+  Phase 5 — it does NOT stay in xdart. `FlushPolicy` + the eviction bound follow the store into
+  the session (refining ADR-0004 §4); only the h5pool bracket + Qt marshaling + display-only
+  projections (thumbnails, raw window) stay GUI-side. A future headless live monitor reuses the
+  store, not just the policy.
 - **D1 (re-integrate re-expose, replace-aware sink + its RAM fix).** Per the deferred doc, ships
   TOGETHER through the session machinery as the FIRST post-v1 feature-queue item — it does not
   block Phase 5 and Phase 5 does not block it.
 - **`ewald/` → `live/` path rename.** Decision 2: path stays; optional ride-along only if 4c/4f
   move those files anyway.
+
+### Phase-5 acceptance criteria (record now, so they aren't afterthoughts)
+- **Store ownership = session** (ADR-0005): Phase 5 builds the bounded `FrameRecord` store in
+  `xrd_tools.session` and collapses `data_1d`/`data_2d`/`LiveFrameSeries`/`PublicationStore` into
+  it (authoritative) + GUI projections (derived) — the one-store move in ONE step on the ADR-0003
+  record shape.
+- **MULTI-MODE reload equivalence (reviewer note 2 — NEW gate):** the multi-result persistence
+  path (per-mode `results_1d`/`results_2d` maps written + read back) is brand new in Phase 5, and
+  the spine today only exercises the single active mode. Phase 5 MUST add a spine case: **store ≥2
+  GI sub-modes for a frame → reload → assert each mode comes back byte-identical** (per `(frame,
+  mode)`, per ADR-0003). Without it the most schema-touching change of the cycle ships without the
+  equivalence gate that protects everything else.
+- **Two types, not one (reviewer push-back):** keep a transient reduction *handle* (the
+  `LiveFrame` successor: integration scratch, lazy raw, fiber-cache) that PRODUCES the immutable
+  `FrameRecord` (the event payload = sink unit = reader return). Do not merge them into a
+  god-object that is both the value and the working buffer.
 
 ---
 
