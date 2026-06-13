@@ -32,6 +32,42 @@ from pyqtgraph import getConfigOption
 QFileDialog = QtWidgets.QFileDialog
 
 
+# Detector ceilings that can dominate autoscale: the uint16 max (65535, a
+# saturated/overflow value) and the uint32 dead/hot sentinel.  When the
+# "Mask saturated" toggle is OFF these stay finite in the image, so excluding
+# them from the level POPULATION (never from the data) keeps a saturated block
+# from dragging the upper colour level up to the ceiling.
+_UINT16_CEIL = 65535.0
+_UINT32_CEIL = 4294967295.0
+
+
+def _ceiling_safe_levels(displayed, raw, pct):
+    """Robust ``nanpercentile`` levels for ``displayed``, excluding exact
+    detector-ceiling pixels from the percentile population.
+
+    The ceiling mask is taken from the UNTRANSFORMED ``raw`` (``displayed`` may
+    already be log/sqrt-transformed in place by the caller), so the test is
+    always against original counts.  Pixels are never modified — a saturated
+    65535 pixel still renders at the top of the colormap; only the autoscale
+    population drops it.  Falls back to the full finite population when every
+    finite pixel sits at the ceiling (an all-/mostly-saturated frame), avoiding
+    NaN levels and the 'autoscale to data min/max' regression.
+    """
+    disp = np.asarray(displayed, dtype=float)
+    finite = np.isfinite(disp)
+    if not finite.any():
+        return (0.0, 1.0)
+    pop_mask = finite
+    raw_a = np.asarray(raw, dtype=float)
+    if raw_a.shape == disp.shape:
+        ceiling = np.isfinite(raw_a) & (
+            (raw_a == _UINT16_CEIL) | (raw_a >= _UINT32_CEIL))
+        if ceiling.any() and (finite & ~ceiling).any():
+            pop_mask = finite & ~ceiling
+    lo, hi = np.nanpercentile(disp[pop_mask], pct)
+    return (float(lo), float(hi))
+
+
 class XDImageWidget(Qt.QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -176,7 +212,8 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
                 self.displayed_image -= (min_val - 1)
             self.displayed_image = np.log10(self.displayed_image)
 
-            levels = np.nanpercentile(self.displayed_image, (0.1, 99.9))
+            levels = _ceiling_safe_levels(self.displayed_image, self.raw_image,
+                                          (0.1, 99.9))
             self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
 
             self.histogram.axis.setLogMode(True)
@@ -189,14 +226,19 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             else:
                 self.displayed_image = np.sqrt(self.displayed_image)
 
-            levels = np.nanpercentile(self.displayed_image, (0.5, 99.9))
+            levels = _ceiling_safe_levels(self.displayed_image, self.raw_image,
+                                          (0.5, 99.9))
             self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
 
         else:
             # Linear autoscale: clip the top/bottom a bit harder than the old
             # (1, 99) so saturated tiff pixels don't wash the image out (R2-4).
             # Shared by the raw / cake / waterfall panels.  Log/Sqrt unchanged.
-            levels = np.nanpercentile(self.displayed_image, (2, 98))
+            # _ceiling_safe_levels additionally drops exact detector-ceiling
+            # (65535 / uint32) pixels from the percentile population so an
+            # unmasked saturated block (toggle OFF) can't blow out the scale.
+            levels = _ceiling_safe_levels(self.displayed_image, self.raw_image,
+                                          (2, 98))
             self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
 
             self.histogram.axis.setLogMode(False)
@@ -324,7 +366,8 @@ class pmeshImageWidget(Qt.QtWidgets.QWidget):
                 self.displayed_image -= (min_val - 1)
             self.displayed_image = np.log10(self.displayed_image)
 
-            levels = np.nanpercentile(self.displayed_image, (0.1, 99.9))
+            levels = _ceiling_safe_levels(self.displayed_image, self.raw_image,
+                                          (0.1, 99.9))
             self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
 
             # self.histogram.axis.setLogMode(True)
@@ -337,11 +380,13 @@ class pmeshImageWidget(Qt.QtWidgets.QWidget):
             else:
                 self.displayed_image = np.sqrt(self.displayed_image)
 
-            levels = np.nanpercentile(self.displayed_image, (0.5, 99.9))
+            levels = _ceiling_safe_levels(self.displayed_image, self.raw_image,
+                                          (0.5, 99.9))
             self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
 
         else:
-            levels = np.nanpercentile(self.displayed_image, (1, 99))
+            levels = _ceiling_safe_levels(self.displayed_image, self.raw_image,
+                                          (1, 99))
             self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
 
             # self.histogram.axis.setLogMode(False)

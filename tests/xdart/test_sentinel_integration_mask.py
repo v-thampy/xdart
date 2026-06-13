@@ -13,8 +13,8 @@ from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
 from xdart.modules.ewald.frame import _make_thumbnail
 
 
-def _resolve(img):
-    w = SimpleNamespace()
+def _resolve(img, mask_sentinel=True):
+    w = SimpleNamespace(mask_sentinel=mask_sentinel)
     w._resolve_frame_mask = MethodType(wranglerThread._resolve_frame_mask, w)
     scan = SimpleNamespace(_cached_data_mask=None)
     idx = w._resolve_frame_mask(scan, img)
@@ -25,12 +25,29 @@ def _resolve(img):
 
 
 def test_resolve_frame_mask_excludes_uint16_sentinels():
+    """With the 'Mask saturated' toggle ON (default), the uint16 ceiling band
+    is masked from integration."""
     img = np.full((100, 100), 500.0)
     img[10:20, :] = 65535.0          # a 1000-px dead-module sentinel band (10%)
     img[0, 0] = -1.0                 # a negative bad pixel
     m = _resolve(img)
     assert m[10:20, :].all()         # the uint16 sentinel band is masked
     assert m[0, 0]                   # negatives still masked
+    assert not m[50, 50]             # real pixels untouched
+
+
+def test_resolve_frame_mask_toggle_off_keeps_saturation_masks_invalids():
+    """With the toggle OFF, the uint16 ceiling (65535) is NOT masked — a real
+    saturated Bragg peak survives into the integration — while the UNAMBIGUOUS
+    invalids (negatives, the uint32 ceiling) are still masked always."""
+    img = np.full((100, 100), 500.0)
+    img[10:20, :] = 65535.0          # would be a 10% sentinel band when ON
+    img[0, 0] = -1.0                 # negative bad pixel (always invalid)
+    img[0, 1] = 4294967295.0         # uint32 ceiling (always invalid)
+    m = _resolve(img, mask_sentinel=False)
+    assert not m[10:20, :].any()     # 65535 NOT masked when the toggle is off
+    assert m[0, 0]                   # negatives still masked
+    assert m[0, 1]                   # uint32 ceiling still masked
     assert not m[50, 50]             # real pixels untouched
 
 

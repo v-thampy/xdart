@@ -624,18 +624,25 @@ def plan_overlay(method, unit_changed, has_existing, new_ids, prev_overlaid_ids)
     return OverlayAction.REPLACE, new_ids
 
 
-def sentinel_mask(arr):
+def sentinel_mask(arr, mask_saturation=True):
     """Return a float copy of ``arr`` with detector sentinels masked to NaN.
 
-    Masks non-finite values and the uint32 dead/hot-pixel ceiling
-    (4294967295, e.g. from Eiger masters).  Some 16-bit readers preserve
-    invalid pixels at the uint16 ceiling (65535); when enough pixels sit
-    exactly there, that ceiling is treated as a display sentinel too, so
-    autoscale uses the real image range instead of rendering nearly black.
+    Always masks the UNAMBIGUOUS invalids: non-finite values and the uint32
+    dead/hot-pixel ceiling (4294967295, e.g. from Eiger masters) — neither can
+    be a real photon count.
+
+    The uint16 ceiling (65535) is AMBIGUOUS — it is both the max real count and
+    a common overflow/invalid sentinel — so masking it is OPT-IN via
+    ``mask_saturation`` (the "Mask saturated (65535)" wrangler toggle, default
+    ON).  When enabled and enough pixels sit exactly at the ceiling (the >1e-4
+    fraction guard, so a few genuinely-saturated pixels are NOT masked) those
+    pixels become NaN so autoscale uses the real image range.  When disabled a
+    real saturated Bragg peak at 65535 is left intact (the raw display relies on
+    a robust percentile level-clamp to avoid blowing out — it never hides it).
     """
     a = np.asarray(arr, dtype=float)
     bad = ~np.isfinite(a) | (a >= 4294967295.0)
-    if a.size and np.isfinite(a).any():
+    if mask_saturation and a.size and np.isfinite(a).any():
         finite = np.isfinite(a)
         sentinel16 = finite & (a == 65535.0)
         if sentinel16.any() and sentinel16.sum() / a.size > 1e-4:

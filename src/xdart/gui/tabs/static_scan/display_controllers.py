@@ -134,7 +134,10 @@ def _image_viewer_raw_payload(widget, state):
     if raw is None:
         return None
     if getattr(widget, '_viewer_is_xdart', False):
-        data = sentinel_mask(raw)               # preserve baked NaN mask
+        # Image Viewer is raw-file inspection — never value-mask saturation
+        # (baked xdart files already store NaN for true sentinels); the uint16
+        # ceiling is left intact and the level-clamp keeps it from blowing out.
+        data = sentinel_mask(raw, mask_saturation=False)
     else:
         data = standalone_viewer_image(raw)     # fill sentinels, no mask
     data = np.asarray(data, dtype=float)

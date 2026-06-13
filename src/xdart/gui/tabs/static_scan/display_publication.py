@@ -219,7 +219,13 @@ class PublicationDisplayAdapter:
             data, source = self._raw_array(publication, panel.source)
             if data is None:
                 continue
-            data = sentinel_mask(data)
+            # uint16-65535 masking is opt-in via the wrangler "Mask saturated"
+            # toggle carried on the scan (default ON); non-finite + uint32 are
+            # always masked.
+            _scan = getattr(self._widget, "scan", None)
+            data = sentinel_mask(
+                data, mask_saturation=bool(getattr(_scan, "mask_sentinel", True)),
+            )
             if data.ndim != 2:
                 continue
             raw_ref = getattr(publication, "raw_ref", None)

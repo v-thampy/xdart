@@ -141,6 +141,30 @@ def test_sentinel_mask_sets_nan():
 
 
 @pytest.mark.display_logic
+def test_sentinel_mask_uint16_is_opt_in():
+    """The uint16 ceiling (65535) is masked only when ``mask_saturation`` is
+    True (the 'Mask saturated' toggle, default ON).  With it OFF a saturated
+    65535 pixel survives, while non-finite + the uint32 ceiling stay masked."""
+    np = pytest.importorskip("numpy")
+    arr = np.full(10000, 100.0)
+    arr[:2000] = 65535.0                       # 20% at the uint16 ceiling
+    arr[2000] = np.inf                         # always invalid
+    arr[2001] = 4294967295.0                   # uint32 ceiling, always invalid
+
+    on = dl.sentinel_mask(arr, mask_saturation=True)
+    assert np.isnan(on[:2000]).all()           # 65535 masked when ON (default)
+
+    off = dl.sentinel_mask(arr, mask_saturation=False)
+    assert not np.isnan(off[:2000]).any()      # 65535 NOT masked when OFF
+    assert math.isnan(off[2000])               # non-finite still masked
+    assert math.isnan(off[2001])               # uint32 ceiling still masked
+    assert off[5000] == 100.0                  # real values untouched
+
+    # default keeps the long-standing behaviour (ON)
+    assert np.isnan(dl.sentinel_mask(arr)[:2000]).all()
+
+
+@pytest.mark.display_logic
 def test_convert_2d_radial_q_to_2theta_and_back():
     np = pytest.importorskip("numpy")
     lam_A = 1.0

@@ -1290,7 +1290,10 @@ class staticWidget(QWidget):
             self.scan.global_mask = getattr(_wthread, 'mask', None)
         # Also carry the run's intensity-threshold settings so the raw-image
         # preview can show the image AS INTEGRATED (mask + threshold).
-        for _attr in ('apply_threshold', 'threshold_min', 'threshold_max'):
+        # mask_sentinel gates the always-on uint16-65535 saturation mask on the
+        # display the same way it gates it in the integration.
+        for _attr in ('apply_threshold', 'threshold_min', 'threshold_max',
+                      'mask_sentinel'):
             try:
                 setattr(self.scan, _attr, getattr(self.wrangler, _attr))
             except Exception:

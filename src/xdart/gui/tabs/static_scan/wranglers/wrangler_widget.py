@@ -373,6 +373,10 @@ class wranglerThread(Qt.QtCore.QThread):
         self.apply_threshold = False
         self.threshold_min = 0
         self.threshold_max = 0
+        # Auto-mask the uint16 ceiling (65535) as a saturated/dead sentinel.
+        # ON by default = the long-standing behaviour; wranglers that expose
+        # the Intensity-Threshold UI override this from the param tree.
+        self.mask_sentinel = True
 
         # Sub-label appended to log lines (e.g. "[Subtracted bg.tif]"
         # for SPEC bg-subtraction mode).  Empty string = no append.
@@ -544,10 +548,15 @@ class wranglerThread(Qt.QtCore.QThread):
                 # the invalid uint16-ceiling pixels integrate into a huge spurious
                 # high-Q spike (and widen the GI cake axis) while the raw panel
                 # already hides them — an asymmetry the user hit when no explicit
-                # mask file was applied.
-                ceil16 = (flat == 65535.0)
-                if ceil16.any() and ceil16.sum() / flat.size > 1e-4:
-                    bad |= ceil16
+                # mask file was applied.  OPT-IN via the "Mask saturated (65535)"
+                # toggle (default ON) so a genuinely-saturated Bragg peak at the
+                # ceiling can be integrated when the user turns it off.  The gate
+                # is a per-scan constant, so the mask is still computed-once and
+                # cached — pyFAI's CSR mask-CRC stays stable frame-to-frame.
+                if getattr(self, 'mask_sentinel', True):
+                    ceil16 = (flat == 65535.0)
+                    if ceil16.any() and ceil16.sum() / flat.size > 1e-4:
+                        bad |= ceil16
                 cached = np.arange(flat.size)[bad]
             except (AttributeError, TypeError, ValueError) as e:
                 logger.debug("frame-mask compute failed: %s", e)

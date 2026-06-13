@@ -108,13 +108,15 @@ class DisplayDataMixin:
     """
 
     @staticmethod
-    def _sanitize_display_image(data):
+    def _sanitize_display_image(data, mask_saturation=True):
         """Return a float image with detector sentinels masked to NaN.
 
         Thin wrapper over the pure :func:`display_logic.sentinel_mask`
         (Stage 1 extraction); the masking logic is unit-tested headlessly.
+        ``mask_saturation`` gates the (opt-in) uint16-65535 masking; non-finite
+        + the uint32 ceiling are always masked.
         """
-        return sentinel_mask(data)
+        return sentinel_mask(data, mask_saturation=mask_saturation)
 
     def _snapshot_data(self, idxs):
         """Return a small {idx: (frame_1d, frame_2d_dict)} dict for
@@ -206,6 +208,10 @@ class DisplayDataMixin:
             self, '_sanitize_display_image',
             DisplayDataMixin._sanitize_display_image,
         )
+        # uint16-65535 saturation masking is opt-in via the wrangler's
+        # "Mask saturated" toggle (carried onto the scan); default ON.
+        _mask_sat = bool(getattr(getattr(self, 'scan', None),
+                                 'mask_sentinel', True))
         for nn, idx in enumerate(idxs):
             frame_1d, frame_2d = snapshot.get(int(idx), (None, {}))
             raw = frame_2d.get('map_raw')
@@ -308,13 +314,13 @@ class DisplayDataMixin:
             try:
                 scan_info = frame_1d.scan_info if frame_1d is not None else {}
                 if raw is not None:
-                    raw_data = sanitize(raw)
+                    raw_data = sanitize(raw, mask_saturation=_mask_sat)
                     intensity += self.normalize(raw_data - bg, scan_info)
                     ctr += 1
                     sources.add(source or 'raw')
                 elif thumb is not None:
                     # Use thumbnail as fallback when raw isn't stored
-                    thumb_data = sanitize(thumb)
+                    thumb_data = sanitize(thumb, mask_saturation=_mask_sat)
                     intensity += self.normalize(
                         thumb_data, scan_info)
                     ctr += 1

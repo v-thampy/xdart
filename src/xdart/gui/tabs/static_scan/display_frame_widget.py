@@ -1585,7 +1585,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # not) — previously skipped this, so a TIFF whose invalid pixels sit at
         # the uint16 ceiling rendered them as bright bands/speckle instead of
         # masked.  No-op when no sentinels are present (the <1e-4 fraction guard).
-        data = sentinel_mask(data)
+        data = sentinel_mask(
+            data,
+            mask_saturation=bool(getattr(self.scan, 'mask_sentinel', True)),
+        )
 
         # Apply detector + global mask only to full-resolution raw data.
         # Thumbnails already bake the mask into the preview before
