@@ -856,14 +856,26 @@ class ReductionSession:
         self._writer_thread.start()
         self._stream_started = True
 
-    def submit(self, frame: Frame, image: np.ndarray | None = None) -> None:
+    def submit(self, frame: Frame, image: np.ndarray | None = None) -> bool:
         """Stream one frame into the pool immediately (execution="streaming").
 
         Blocks when ``inflight_max`` frames are already in flight (bounded
         memory), then dispatches integration to the persistent pool and hands
         the ``(frame, future)`` to the single writer thread, which writes it to
         the sink by frame index once it completes.  Out-of-order completion is
-        fine — the sink/writer is index-addressed.  A no-op once cancelled.
+        fine — the sink/writer is index-addressed.
+
+        Returns ``True`` when the frame was ACCEPTED (registered in the scan
+        inventory, dispatched to the pool, and handed to the writer); ``False``
+        when it was DROPPED without being submitted because the session was
+        cancelled, or the writer died, while waiting for a worker slot.  A
+        dropped frame is NOT registered and does NOT advance ``frames_submitted``
+        — so a Stop racing a ``submit`` can't leave a phantom frame the caller
+        believes was processed (the accepted-vs-cancelled state leak).  The drop
+        paths RETURN (never raise) so they don't escape the caller's ``run()``
+        loop and tear the QThread down (the GIFreezeError trap); caller-contract
+        violations (after ``finish()``, after a recorded failure, while paused)
+        still RAISE.
         """
         if self.execution != "streaming":
             raise RuntimeError("submit() requires execution='streaming'")
@@ -877,10 +889,12 @@ class ReductionSession:
             )
         if self._cancelled or self.cancel_token.cancelled:
             self._cancelled = True
-            return
-        self._register_process_frames([frame])
+            return False
         # Bounded in-flight: blocks the reader so it can't outrun integration
-        # (flat peak memory).  Released by the writer thread per frame.
+        # (flat peak memory).  Released by the writer thread per frame.  The
+        # permit is acquired BEFORE the frame is registered/dispatched, so a
+        # frame dropped while waiting on a full window (cancel / writer-death)
+        # never enters the scan inventory and is never counted as submitted.
         # Timed-acquire loop: poll the cancel token so Stop/Pause can interrupt
         # a full in-flight window without waiting for a worker slot to free.
         # Returns cleanly (no raise) so the caller's stop-check handles it safely
@@ -889,7 +903,7 @@ class ReductionSession:
         while not self._semaphore.acquire(timeout=0.1):
             if self._cancelled or self.cancel_token.cancelled:
                 self._cancelled = True
-                return
+                return False
             if (self._writer_thread is not None
                     and not self._writer_thread.is_alive()):
                 # T0-7/S1 belt-and-suspenders: the writer died, so no slot
@@ -901,11 +915,15 @@ class ReductionSession:
                     "ReductionSession writer thread died; run cannot proceed"
                 )
                 self._cancelled = True
-                return
+                return False
         if self._cancelled or self.cancel_token.cancelled:
             self._cancelled = True
             self._semaphore.release()
-            return
+            return False
+        # Permit held and not cancelled: NOW it is safe to register the frame in
+        # the scan inventory and dispatch it — every registered/counted frame
+        # from here on is genuinely in flight.
+        self._register_process_frames([frame])
         try:
             future = self._worker.submit(self._stream_reduce, frame, image)
         except BaseException as exc:
@@ -918,6 +936,7 @@ class ReductionSession:
             raise
         self._submitted += 1
         self._write_queue.put((frame, future))
+        return True
 
     def _stream_reduce(self, frame: Frame, image: np.ndarray | None):
         """Worker-thread task: integrate, then run the sink's per-frame
@@ -1508,11 +1527,15 @@ def run_reduction(
     ) as session:
         if execution == "streaming":
             # Streaming drains via submit() (process() is rejected); feed every
-            # frame, then finish() joins the writer and flushes.
+            # frame, then finish() joins the writer and flushes.  submit()
+            # returns False when it drops a frame (cancel / writer-death mid-
+            # wait) — stop feeding promptly rather than spin the remaining frames
+            # against a cancelled session.
             for frame in session.scan:
                 if session.cancel_token.cancelled:
                     break
-                session.submit(frame)
+                if not session.submit(frame):
+                    break
         else:
             session.process()
         return session.finish()

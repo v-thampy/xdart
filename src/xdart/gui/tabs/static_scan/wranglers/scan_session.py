@@ -52,15 +52,25 @@ class ScanSessionAdapter:
 
     # -- streaming write path --------------------------------------------
     def submit(self, live) -> bool:
-        """Register the LiveFrame with the sink, then submit it to the
-        session.  Returns True on success.  On a RECORDED writer/sink
-        failure (re-raised at submit()'s fail-loud precheck), set the host
-        command to 'stop' and return False — NEVER raise, which would
-        escape the wrangler run() loop and tear down the QThread (the same
-        trap the GIFreezeError fix addressed)."""
+        """Register the LiveFrame with the sink, then submit it to the session.
+
+        Returns True when the session ACCEPTED the frame (it will be written).
+        Returns False — never raising — in two cases the wrangler loop must
+        treat as "stop feeding":
+
+        * a RECORDED writer/sink failure (re-raised at ``submit()``'s fail-loud
+          precheck): set the host command to 'stop' and return False.  Raising
+          would escape the wrangler ``run()`` loop and tear down the QThread
+          (the GIFreezeError trap);
+        * the session DROPPED the frame (``submit`` returned False because it was
+          cancelled / the writer died mid-wait): the frame was never registered
+          in the session inventory nor counted submitted, so we just stop
+          feeding.  The dangling sink registration is cleared by the session's
+          ``finish()`` (``_registry.clear`` / T0-8) at end-of-run.
+        """
         self._sink.register(live)
         try:
-            self._session.submit(frame_from_live_frame(live))
+            accepted = self._session.submit(frame_from_live_frame(live))
         except BaseException as exc:
             msg = f'Save FAILED mid-run: {exc} — stopping the run.'
             logger.error(msg, exc_info=True)
@@ -75,7 +85,7 @@ class ScanSessionAdapter:
             else:
                 self._host.command = 'stop'
             return False
-        return True
+        return bool(accepted)
 
     # -- pause: quiesce (drain + flag) is SEPARATE from flush, so the
     #    wrangler's serial-vs-streaming routing in _enter_pause is preserved

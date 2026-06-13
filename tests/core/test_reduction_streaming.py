@@ -743,3 +743,31 @@ def test_is_running_lifecycle(monkeypatch):
     token.cancel()
     assert not s2.is_running                     # cancelled
     s2.finish(raise_on_failure=False)
+
+
+def test_submit_returns_bool_and_drops_cleanly_on_cancel(monkeypatch):
+    """submit() returns True for an accepted frame and False for one dropped
+    because the session was cancelled — and a dropped frame is NEITHER
+    registered in the scan inventory NOR counted as submitted.  This is the
+    accepted-vs-cancelled fix: a Stop racing a submit must not leave a phantom
+    frame the caller believes was processed."""
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    token = CancelToken()
+    s = ReductionSession(_plan(), Scan("s", _frames(2), integrator=object()),
+                         sink=MemorySink(), execution="streaming", executor=2,
+                         cancel_token=token)
+    # A fresh later frame is accepted -> registered + counted.
+    assert s.submit(Frame(2, image=np.full((2, 2), 2.0))) is True
+    submitted_after_accept = s._submitted
+    inventory_after_accept = len(s.scan.frames)
+    assert 2 in s.scan._frame_by_index
+
+    # Cancel, then submit another fresh frame: dropped (False, no raise), and it
+    # leaves NO trace in the inventory or the submitted counter.
+    token.cancel()
+    assert s.submit(Frame(99, image=np.full((2, 2), 9.0))) is False
+    assert s._submitted == submitted_after_accept
+    assert len(s.scan.frames) == inventory_after_accept
+    assert 99 not in s.scan._frame_by_index
+    s.finish(raise_on_failure=False)
