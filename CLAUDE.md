@@ -19,11 +19,21 @@ usable with no GUI; (2) **thin xdart** over it; (3) **robustness**
 seams).
 
 **Current cycle (pre-v1):** execute
-`docs/design/CC_greenfield_implementation_plan_2026-06-12.md` — Phase 0
-docs-into-repo (done), 1 contract tests + release script + policies,
-2 schema derivation, 3 one store (X1), 4 session layer, 5 FrameRecord +
-strictness.  v1 ships after Phase 5; then features: F3 ROI statistics
-first, then D1 reintegrate, F4, F5 — all tracked in
+`docs/design/CC_greenfield_implementation_plan_2026-06-12.md`.  DONE:
+Phase 0 (docs), 1 (contract tests + release script + policies),
+2 (schema derivation + capability registry), 3 store-first reads + the
+D2 thumbnail tier (PublicationStore is the primary display source),
+4a (`ReductionSession.pause/resume/is_paused`).  **Phase 4 detail +
+sequencing: `docs/design/phase4_scansession_design.md`** (the
+authoritative ScanSession plan — `FlushPolicy` decision seam, the
+4b-1→4f stages, the constraint ledger).  Re-sequenced: full
+`data_1d`/`data_2d` DELETION (X1's "sole contract") defers to Phase 5's
+FrameRecord — GI sub-mode switching needs the per-mode dict only the
+live frame carries, so publications stay single-result and the dicts
+remain as mirrors until then.  4b-1→4d are offscreen-gatable; **4e/4f
+need a manual live checkpoint** (real QThread teardown + pause/disk
+races).  v1 ships after Phase 5; then features: F3 ROI first, then D1
+reintegrate, F4, F5 — all tracked in
 `docs/design/CC_preship_sweep_deferred_jun2026.md` (**the canonical
 deferred-items register lives IN-REPO now**; the old
 `~/repos/review/` copy is a tombstone).
