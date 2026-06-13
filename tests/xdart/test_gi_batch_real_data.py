@@ -293,6 +293,69 @@ def _run_batch_parallel(poni, pending_data, mask, *, incidence_motor="th",
     return captured
 
 
+def _run_batch_streaming(poni, pending_data, mask, *, incidence_motor="th",
+                         sample_orientation=4, gi=True,
+                         gi_mode_1d="q_total", gi_mode_2d="qip_qoop",
+                         bai_1d_args=None, bai_2d_args=None):
+    """Drive the REAL streaming dispatch — ``ReductionSession`` + ``QtNexusSink``
+    via ``_dispatch_batch_streaming`` — on real frames.
+
+    This is the PRODUCTION batch path (``batch_execution='streaming'`` is the
+    module default), so the equivalence spine gates on the path that actually
+    ships, not on the soon-to-be-retired chunked dispatcher.  Returns the same
+    ``{img_number: LiveFrame}`` shape as :func:`_run_batch_parallel`, captured
+    by the shared xye-flush spy (the sink hydrates int_1d + int_2d onto the
+    registered LiveFrame and buffers ``(idx, live)`` before the final flush).
+
+    The bai args are passed in PRE-FROZEN (by ``_frozen_gi_bai_args``) and
+    ``gi_freeze_mode=None`` so the session uses that exact grid: the comparison
+    isolates the integrate+write path, not the freeze — the identical contract
+    the chunked leg uses (``freeze=False`` -> ``gi_freeze_mode=None``).
+    """
+    from types import SimpleNamespace, MethodType
+    from threading import RLock
+    from xdart.gui.tabs.static_scan.wranglers.wrangler_widget import wranglerThread
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    if bai_1d_args is None:
+        bai_1d_args = _default_bai_1d(gi, gi_mode_1d)
+    if bai_2d_args is None:
+        bai_2d_args = _default_bai_2d(gi, gi_mode_2d)
+
+    w, captured = _build_batch_thread(
+        poni, mask, incidence_motor=incidence_motor,
+        sample_orientation=sample_orientation, gi=gi,
+    )
+    scan = _make_scan(poni, mask, bai_1d_args, bai_2d_args, gi=gi)
+
+    # Streaming-session wiring (mirrors test_streaming_batch_xye_matches_chunked).
+    w.batch_execution = "streaming"
+    w.gi_freeze_mode = None              # use the passed-in pre-frozen grid
+    w.file_lock = RLock()
+    w.command_lock = RLock()             # adapter's stop-on-failure path (no-op here)
+    w.sigUpdate = SimpleNamespace(emit=lambda *a: None)
+    w.LIVE_SAVE_INTERVAL = 1000
+    w._streaming_session = None
+    w._streaming_sink = None
+    w._streaming_scan_id = None
+    w._scan_session_adapter = None
+    w._reduction_session = None
+    w._reduction_session_key = None
+    w._gi_prepass_scan_id = None
+    w._cancel_token = MethodType(wranglerThread._cancel_token, w)
+    w._close_reduction_session = MethodType(
+        wranglerThread._close_reduction_session, w)
+    for meth in ("_dispatch_batch_streaming", "_get_streaming_session",
+                 "_wait_if_paused"):
+        setattr(w, meth, MethodType(getattr(imageThread, meth), w))
+
+    pending = [(name, i + 1, img, info, 0.0, 0.0)
+               for i, (name, img, info) in enumerate(pending_data)]
+    w._dispatch_batch_streaming(scan, pending)
+    w._close_reduction_session()    # finish() -> QtNexusSink final flush -> spy
+    return captured
+
+
 def _run_live_single(poni, name, img, meta, mask, *, incidence_motor="th",
                      sample_orientation=4, gi=True,
                      gi_mode_1d="q_total", gi_mode_2d="qip_qoop",
@@ -444,11 +507,22 @@ def _assert_live_batch_reload_equivalent(tmp_path, *, gi,
         poni, [(_TIFF_FRAMES[0], img, meta)], mask,
         gi=gi, bai_1d_args=bai_1d, bai_2d_args=bai_2d,
     )[1]
+    # The PRODUCTION batch leg: streaming (ReductionSession + QtNexusSink) is
+    # the shipping default, so the spine must gate on IT — not only the
+    # soon-to-be-retired chunked dispatcher.  Kept alongside the chunked leg
+    # during the 4e transition; the chunked leg is dropped when its dispatcher
+    # is deleted.
+    batch_stream = _run_batch_streaming(
+        poni, [(_TIFF_FRAMES[0], img, meta)], mask,
+        gi=gi, bai_1d_args=bai_1d, bai_2d_args=bai_2d,
+    )[1]
 
     thumb_live = _canonicalize_thumbnail(live, mask)
     _canonicalize_thumbnail(batch, mask)
+    _canonicalize_thumbnail(batch_stream, mask)
     pub_live = publication_from_live_frame(live)
     pub_batch = publication_from_live_frame(batch)
+    pub_batch_stream = publication_from_live_frame(batch_stream)
     fname = (f"equiv_gi_{gi_mode_1d}_{gi_mode_2d}.nxs" if gi
              else "equiv_standard.nxs")
     pub_reload = _write_publication_reload(
@@ -458,6 +532,7 @@ def _assert_live_batch_reload_equivalent(tmp_path, *, gi,
     )
 
     assert_frameview_equivalent(pub_live.view, pub_batch.view)
+    assert_frameview_equivalent(pub_live.view, pub_batch_stream.view)
     assert_frameview_equivalent(pub_live.view, pub_reload.view)
 
 
