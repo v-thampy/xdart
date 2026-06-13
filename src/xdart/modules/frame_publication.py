@@ -301,8 +301,39 @@ def _publication_has_heavy_payload(publication: FramePublication) -> bool:
     )
 
 
+def _semilight_publication(publication: FramePublication) -> FramePublication:
+    """Tier-1 eviction (D2): drop the heavy arrays but KEEP the thumbnail.
+
+    A ~256 KB thumbnail per frame keeps scroll-back instantly paintable
+    (the Image Viewer falls back to ``view.thumbnail``) while the full
+    payload rehydrates in the background; thumbnails have their own,
+    much larger bound (tier 2)."""
+    view = publication.view
+    thumb_view = FrameView(
+        label=view.label,
+        two_d_kind=view.two_d_kind,
+        thumbnail=view.thumbnail,
+        mask_baked=view.mask_baked,
+        metadata_raw=view.metadata_raw,
+        metadata_numeric=view.metadata_numeric,
+        incident_angle=view.incident_angle,
+        geometry=view.geometry,
+        source_path=view.source_path,
+        source_frame_index=view.source_frame_index,
+        extra=view.extra,
+    )
+    return replace(
+        publication,
+        view=thumb_view,
+        raw_ref=None,
+        raw_status="thumbnail" if view.thumbnail is not None else "evicted",
+        metadata_raw=view.metadata_raw,
+        metadata_numeric=view.metadata_numeric,
+    )
+
+
 def _lightweight_publication(publication: FramePublication) -> FramePublication:
-    """Return a metadata/diagnostics-only copy without display-heavy arrays."""
+    """Tier-2 eviction: metadata/diagnostics-only (no arrays at all)."""
     view = publication.view
     light_view = FrameView(
         label=view.label,
@@ -340,17 +371,28 @@ class PublicationStore:
         *,
         max_items: int | None = None,
         max_heavy_items: int | None = 64,
+        max_thumbnail_items: int | None = 512,
     ) -> None:
         if max_items is not None and max_items < 1:
             raise ValueError("max_items must be positive or None")
         if max_heavy_items is not None and max_heavy_items < 0:
             raise ValueError("max_heavy_items must be non-negative or None")
+        if max_thumbnail_items is not None and max_thumbnail_items < 0:
+            raise ValueError("max_thumbnail_items must be non-negative or None")
         self._lock = RLock()
         self._generation = 0
         self._max_items = max_items
         self._max_heavy_items = max_heavy_items
+        self._max_thumbnail_items = max_thumbnail_items
         self._items: dict[int | str, FramePublication] = {}
         self._heavy_labels: list[int | str] = []
+        self._thumb_labels: list[int | str] = []
+        # D2: optional rehydration source (label -> FramePublication|None).
+        # A SYNCHRONOUS loader — register a cheap one, or call
+        # get_or_hydrate from a background worker (never blocking h5py
+        # reads on the GUI thread; the thumbnail tier keeps scroll-back
+        # paintable meanwhile).
+        self._hydrator = None
 
     @property
     def generation(self) -> int:
@@ -362,6 +404,33 @@ class PublicationStore:
             self._generation += 1
             self._items.clear()
             self._heavy_labels.clear()
+            self._thumb_labels.clear()
+
+    def set_hydrator(self, hydrator) -> None:
+        """Register the rehydration source for :meth:`get_or_hydrate`."""
+        with self._lock:
+            self._hydrator = hydrator
+
+    def get_or_hydrate(self, label: int | str) -> FramePublication | None:
+        """Return the publication, rehydrating an evicted payload via the
+        registered hydrator (synchronous — call from a background worker
+        for disk-backed hydrators)."""
+        with self._lock:
+            publication = self._items.get(label)
+            hydrator = self._hydrator
+        if publication is not None and (
+                _publication_has_heavy_payload(publication)
+                or publication.raw_status not in ("evicted", "thumbnail")):
+            return publication
+        if hydrator is None:
+            return publication
+        try:
+            fresh = hydrator(label)
+        except Exception:
+            return publication
+        if fresh is None:
+            return publication
+        return self.upsert(fresh)
 
     def upsert(self, publication: FramePublication) -> FramePublication:
         with self._lock:
@@ -371,9 +440,12 @@ class PublicationStore:
             if label in self._items:
                 self._items.pop(label)
                 self._drop_heavy_label_locked(label)
+                self._drop_thumb_label_locked(label)
             self._items[publication.label] = publication
             if _publication_has_heavy_payload(publication):
                 self._heavy_labels.append(label)
+            if publication.view.thumbnail is not None:
+                self._thumb_labels.append(label)
             self._enforce_bounds_locked()
             return publication
 
@@ -403,21 +475,38 @@ class PublicationStore:
         except ValueError:
             pass
 
+    def _drop_thumb_label_locked(self, label: int | str) -> None:
+        try:
+            self._thumb_labels.remove(label)
+        except ValueError:
+            pass
+
     def _enforce_bounds_locked(self) -> None:
         if self._max_items is not None:
             while len(self._items) > self._max_items:
                 label = next(iter(self._items))
                 self._items.pop(label, None)
                 self._drop_heavy_label_locked(label)
+                self._drop_thumb_label_locked(label)
 
-        if self._max_heavy_items is None:
-            return
-        while len(self._heavy_labels) > self._max_heavy_items:
-            label = self._heavy_labels.pop(0)
-            publication = self._items.get(label)
-            if publication is None:
-                continue
-            self._items[label] = _lightweight_publication(publication)
+        # tier 1 (D2): over the heavy bound -> drop arrays, KEEP thumbnail
+        if self._max_heavy_items is not None:
+            while len(self._heavy_labels) > self._max_heavy_items:
+                label = self._heavy_labels.pop(0)
+                publication = self._items.get(label)
+                if publication is None:
+                    continue
+                self._items[label] = _semilight_publication(publication)
+
+        # tier 2: thumbnails have their own, larger bound
+        if self._max_thumbnail_items is not None:
+            while len(self._thumb_labels) > self._max_thumbnail_items:
+                label = self._thumb_labels.pop(0)
+                publication = self._items.get(label)
+                if publication is None:
+                    continue
+                self._items[label] = _lightweight_publication(publication)
+                self._drop_heavy_label_locked(label)
 
 
 __all__ = [

@@ -126,6 +126,10 @@ def test_publication_store_is_generation_aware():
 
 
 def test_publication_store_bounds_heavy_payloads_but_keeps_metadata():
+    """D2 two-tier eviction: over the heavy bound, the full arrays drop
+    but the THUMBNAIL survives (tier 1) so scroll-back stays paintable;
+    raw_status honestly reports 'thumbnail' (or 'evicted' if the frame
+    never had one)."""
     store = PublicationStore(max_heavy_items=2)
     for idx in (1, 2, 3):
         store.upsert(publication_from_live_frame(DuckFrame(idx=idx)))
@@ -134,15 +138,57 @@ def test_publication_store_bounds_heavy_payloads_but_keeps_metadata():
     evicted = store.get(1)
     assert evicted is not None
     assert evicted.raw_ref is None
-    assert evicted.raw_status == "evicted"
     assert not evicted.view.has_1d
     assert not evicted.view.has_2d
-    assert evicted.view.thumbnail is None
+    if evicted.view.thumbnail is not None:        # tier 1: thumbnail kept
+        assert evicted.raw_status == "thumbnail"
+    else:
+        assert evicted.raw_status == "evicted"
     assert evicted.metadata_numeric["monitor"] == 100.0
     assert evicted.diagnostics.ok
 
     assert store.get(2).view.has_2d
     assert store.get(3).view.has_2d
+
+
+def test_publication_store_thumbnail_tier_has_its_own_bound():
+    """Tier 2: thumbnails outlive the heavy bound but have their own
+    (larger) bound; past it the publication drops to metadata-only."""
+    store = PublicationStore(max_heavy_items=1, max_thumbnail_items=2)
+    for idx in (1, 2, 3):
+        store.upsert(publication_from_live_frame(DuckFrame(idx=idx)))
+
+    first = store.get(1)
+    assert first.view.thumbnail is None           # tier 2 evicted
+    assert first.raw_status == "evicted"
+    assert first.metadata_numeric["monitor"] == 100.0   # metadata kept
+    second = store.get(2)
+    assert second.view.thumbnail is not None      # tier 1 only
+    assert not second.view.has_2d
+
+
+def test_get_or_hydrate_uses_registered_hydrator():
+    store = PublicationStore(max_heavy_items=0, max_thumbnail_items=0)
+    store.upsert(publication_from_live_frame(DuckFrame(idx=5)))
+    assert not store.get(5).view.has_1d           # fully evicted
+
+    calls = []
+
+    def hydrator(label):
+        calls.append(label)
+        return publication_from_live_frame(DuckFrame(idx=int(label)))
+
+    store.set_hydrator(hydrator)
+    fresh = store.get_or_hydrate(5)
+    assert calls == [5]
+    assert fresh.view.has_1d                      # rehydrated + upserted
+    # a hydrated publication short-circuits (bounds permitting)
+    store2 = PublicationStore()
+    store2.set_hydrator(hydrator)
+    store2.upsert(publication_from_live_frame(DuckFrame(idx=6)))
+    calls.clear()
+    assert store2.get_or_hydrate(6).view.has_1d
+    assert calls == []                            # no needless reload
 
 
 def test_publication_store_can_bound_total_items():
