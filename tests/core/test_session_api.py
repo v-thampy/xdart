@@ -267,3 +267,149 @@ def test_event_sink_wrapper_preserves_single_writer_contract():
     wp_threads = spy.threads_for("worker_process")
     assert wp_threads and not (wp_threads & writer_threads)
     assert sorted(spy.frames_for("worker_process")) == [0, 1, 2, 3]
+
+
+# ── adversarial-audit hardening (the event contract must be tamper-evident +
+#    thread-pinned before the xdart bridge builds on it) ───────────────────────
+
+def test_frame_event_result_arrays_are_read_only():
+    """FATAL fix: the event's result arrays are the SAME ndarrays the sink
+    stored, so they must be read-only — else a listener could retroactively
+    corrupt already-persisted/cached data."""
+    sink = MemorySink()
+    sess = _standard_session(3)
+    # rebuild with our own sink so we can inspect what it stored
+    sess = ScanSession(ReductionPlan(integration_2d=None),
+                       Scan("ro", _frames(3), integrator=object()),
+                       sink=sink, executor=2)
+    events: list[FrameEvent] = []
+    sess.on_frame_completed(events.append)
+    sess.start()
+    for fr in _frames(3):
+        sess.submit(fr)
+    sess.finish()
+
+    assert events
+    e = events[0]
+    with pytest.raises(ValueError):
+        e.result_1d.intensity[0] = 999.0          # read-only enforced
+    with pytest.raises(ValueError):
+        e.result_1d.radial[0] = 999.0
+    # the sink stored the SAME object, so it is protected too
+    assert sink.frames[e.frame_index].result_1d.intensity[0] != 999.0
+
+
+def test_frame_event_metadata_is_read_only():
+    """metadata is a read-only mapping, so a listener can't corrupt the view
+    other listeners (or the bridge) see for the same frame."""
+    sess = _standard_session(1)
+    events: list[FrameEvent] = []
+    sess.on_frame_completed(events.append)
+    sess.start()
+    sess.submit(_frames(1)[0])
+    sess.finish()
+    assert events
+    with pytest.raises(TypeError):                # MappingProxyType
+        events[0].metadata["poison"] = True
+
+
+def test_flush_delegates_to_public_then_private_then_noop():
+    """ScanSession.flush() (via the event-sink wrapper) prefers the sink's public
+    `flush`, falls back to the historical private `_flush` (the QtNexusSink shim),
+    and is a silent no-op for a sink with neither (ADR-0004 §4)."""
+    from xrd_tools.session.scan_session import _EventSink
+    from types import SimpleNamespace
+
+    calls = []
+    pub = SimpleNamespace(flush=lambda *, force=False: calls.append(("pub", force)))
+    _EventSink(pub, lambda f, r: None).flush(force=True)
+    assert calls == [("pub", True)]
+
+    calls.clear()
+    priv = SimpleNamespace(_flush=lambda *, force=False: calls.append(("priv", force)))
+    _EventSink(priv, lambda f, r: None).flush(force=True)
+    assert calls == [("priv", True)]
+
+    neither = SimpleNamespace()                   # no flush, no _flush
+    _EventSink(neither, lambda f, r: None).flush()   # must not raise
+
+
+def test_submit_raises_after_finish_and_while_paused():
+    """Caller-contract violations stay LOUD: submit() after finish() or while
+    paused RAISES (not a False 'dropped' return) — mirrors ReductionSession."""
+    sess = _standard_session(3)
+    sess.start()
+    sess.submit(_frames(3)[0])
+    sess.finish()
+    with pytest.raises(RuntimeError, match="after finish"):
+        sess.submit(_frames(3)[1])
+
+    sess2 = _standard_session(3)
+    sess2.start()
+    sess2.submit(_frames(3)[0])
+    assert sess2.pause(timeout=10) is True
+    with pytest.raises(RuntimeError, match="paused"):
+        sess2.submit(_frames(3)[1])
+    sess2.resume()
+    sess2.finish()
+
+
+def test_progress_fires_from_both_caller_and_writer_threads():
+    """ADR-0004 §1: on_progress fires on the caller thread (submit side) AND the
+    writer thread (completion side) — the dual-thread guarantee the bridge's
+    QueuedConnection design assumes."""
+    main = threading.get_ident()
+    idents: list[int] = []
+    sess = _standard_session(4)
+    sess.on_progress(lambda p: idents.append(threading.get_ident()))
+    sess.start()
+    for fr in _frames(4):
+        sess.submit(fr)
+    sess.finish()
+    assert any(i == main for i in idents)         # submit-side (caller)
+    assert any(i != main for i in idents)         # completion-side (writer)
+
+
+def test_state_change_always_fires_on_caller_thread():
+    """ADR-0004 §1: on_state_change fires on the orchestrating (caller) thread —
+    the bridge maps it straight to sigPaused/sigResuming WITHOUT QueuedConnection."""
+    main = threading.get_ident()
+    idents: list[int] = []
+    sess = _standard_session(2)
+    sess.on_state_change(lambda s: idents.append(threading.get_ident()))
+    sess.start()
+    sess.submit(_frames(2)[0])
+    assert sess.pause(timeout=10) is True
+    sess.resume()
+    sess.submit(_frames(2)[1])
+    sess.finish()
+    assert idents and all(i == main for i in idents)
+
+
+def test_finish_with_no_frames_fires_no_completions():
+    """Completions fire ONLY after a real write/replace — finishing an empty
+    (or cancelled) run must emit zero on_frame_completed events, or the bridge
+    would publish a frame that was never written."""
+    events: list[FrameEvent] = []
+    sess = _standard_session(2)
+    sess.on_frame_completed(events.append)
+    sess.start()
+    sess.finish()                                  # no submit
+    assert events == []
+    assert sess.frames_completed == 0
+
+
+def test_double_finish_is_idempotent_no_extra_state_event():
+    """finish() is idempotent and does not re-emit a state-change on the second
+    call (so a bridge tearing down on running->finished can't double-fire)."""
+    states: list[StateChangeEvent] = []
+    sess = _standard_session(2)
+    sess.on_state_change(states.append)
+    sess.start()
+    for fr in _frames(2):
+        sess.submit(fr)
+    r1 = sess.finish()
+    n_after_first = len(states)
+    r2 = sess.finish()                             # idempotent
+    assert r2 is r1 or r2 == r1
+    assert len(states) == n_after_first            # no extra state event

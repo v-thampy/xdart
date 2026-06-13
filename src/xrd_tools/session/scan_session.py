@@ -27,6 +27,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 import numpy as np
@@ -148,6 +149,26 @@ def _mode_key_from_plan(plan: ReductionPlan):
     return (getattr(m1, "value", m1), getattr(m2, "value", m2))
 
 
+def _freeze_result_arrays(result):
+    """Mark a result's ndarray fields read-only IN PLACE (zero-copy) so a
+    FrameEvent listener cannot retroactively corrupt the shared, already-written
+    arrays (the completion fires AFTER the sink's write, and the event holds the
+    SAME ndarray objects the sink stored — a listener writing into them would
+    poison persisted/cached data).  This makes the "immutable event" contract
+    real without the deep-copy that would defeat retain_products=False.  Returns
+    the same object.  Defensive: skips anything not a writeable ndarray."""
+    if result is None:
+        return result
+    for attr in ("radial", "azimuthal", "intensity", "sigma"):
+        arr = getattr(result, attr, None)
+        if isinstance(arr, np.ndarray) and arr.flags.writeable:
+            try:
+                arr.flags.writeable = False
+            except (ValueError, AttributeError):
+                pass  # a view that doesn't own its data / can't toggle — leave it
+    return result
+
+
 # ── the session ───────────────────────────────────────────────────────────────
 
 class ScanSession:
@@ -214,10 +235,14 @@ class ScanSession:
         self._emit_state()
 
     def submit(self, frame: Frame, image: np.ndarray | None = None) -> bool:
-        """Feed one frame.  Returns the underlying session's accepted/dropped
-        bool (False = cancelled / writer-dead mid-wait; see
-        ``ReductionSession.submit``).  Advances submitted-progress only when
-        accepted."""
+        """Feed one frame.
+
+        Returns True when accepted, False when DROPPED (cancelled / writer-dead
+        while waiting on a full in-flight window).  CALLER-CONTRACT VIOLATIONS
+        RAISE rather than return False (mirroring ``ReductionSession.submit``):
+        calling submit() after :meth:`finish`, or while paused, raises
+        ``RuntimeError`` — these are misuse, kept loud on purpose, not a normal
+        "dropped" outcome.  Advances submitted-progress only when accepted."""
         accepted = self._session.submit(frame, image)
         if accepted:
             with self._lock:
@@ -244,10 +269,15 @@ class ScanSession:
 
     def finish(self, *, raise_on_failure: bool = True,
                join_timeout: float | None = None) -> ReductionResult:
-        """Drain the writer, finalize the sink, return the result."""
+        """Drain the writer, finalize the sink, return the result.  Idempotent:
+        a second finish() returns the same result and does NOT re-emit a
+        state-change event (so a bridge that tears down on the running→finished
+        transition can't double-fire)."""
+        was_running = self.is_running
         result = self._session.finish(
             raise_on_failure=raise_on_failure, join_timeout=join_timeout)
-        self._emit_state()
+        if was_running:          # only on the real running -> finished transition
+            self._emit_state()
         return result
 
     def flush(self, *, force: bool = False) -> None:
@@ -311,9 +341,13 @@ class ScanSession:
         event = FrameEvent(
             frame_index=int(getattr(reduction, "frame_index", getattr(frame, "index", -1))),
             mode_key=self._mode_key,
-            result_1d=getattr(reduction, "result_1d", None),
-            result_2d=getattr(reduction, "result_2d", None),
-            metadata=dict(getattr(reduction, "metadata", {}) or {}),
+            # Freeze the shared result arrays read-only + the metadata into a
+            # read-only view, so a listener can't retroactively corrupt the
+            # already-written/cached data (the event is the bridge's sole data
+            # contract — it must be tamper-evident).  Both are zero-copy.
+            result_1d=_freeze_result_arrays(getattr(reduction, "result_1d", None)),
+            result_2d=_freeze_result_arrays(getattr(reduction, "result_2d", None)),
+            metadata=MappingProxyType(dict(getattr(reduction, "metadata", {}) or {})),
             generation=generation,
             timestamp=time.time(),
         )
