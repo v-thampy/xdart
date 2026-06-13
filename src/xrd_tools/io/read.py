@@ -45,6 +45,11 @@ from typing import Iterable, Sequence
 import h5py
 import numpy as np
 
+# 2c: the convenience readers consume the declared layout — group and
+# dataset names come from the schema, so writer/reader drift is
+# impossible by construction.
+from xrd_tools.io.schema import SCHEMA
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -241,16 +246,19 @@ def get_1d(
         is ``(n_q,)`` for a single frame, else ``(n_frames, n_q)``.
         ``sigma`` is ``None`` when the file stored no error estimate.
     """
+    spec = SCHEMA.groups["integrated_1d"]
+    (q_name,) = spec.axes
     with h5py.File(Path(scan_file), "r") as f:
         e = _entry(f, entry)
-        if "integrated_1d" not in e:
-            raise KeyError(f"{scan_file} has no integrated_1d group")
-        g = e["integrated_1d"]
+        if spec.name not in e:
+            raise KeyError(f"{scan_file} has no {spec.name} group")
+        g = e[spec.name]
         positions, frames, single = _resolve_positions(
-            _frame_index(e, prefer="integrated_1d"), frame)
+            _frame_index(e, prefer=spec.name), frame)
 
-        q = np.asarray(g["q"][()])
-        q_unit = _decode(g["q"].attrs.get("units")) if "units" in g["q"].attrs else None
+        q = np.asarray(g[q_name][()])
+        q_unit = (_decode(g[q_name].attrs.get("units"))
+                  if "units" in g[q_name].attrs else None)
         intensity = _slice_stack(g["intensity"], positions, single)
         sigma = (
             _slice_stack(g["sigma"], positions, single) if "sigma" in g else None
@@ -273,19 +281,23 @@ def get_2d(
         ``intensity`` is ``(n_chi, n_q)`` for a single frame, else
         ``(n_frames, n_chi, n_q)``.
     """
+    spec = SCHEMA.groups["integrated_2d"]
+    q_name, chi_name = spec.axes
     with h5py.File(Path(scan_file), "r") as f:
         e = _entry(f, entry)
-        if "integrated_2d" not in e:
-            raise KeyError(f"{scan_file} has no integrated_2d group")
-        g = e["integrated_2d"]
+        if spec.name not in e:
+            raise KeyError(f"{scan_file} has no {spec.name} group")
+        g = e[spec.name]
         positions, frames, single = _resolve_positions(
-            _frame_index(e, prefer="integrated_2d"), frame)
+            _frame_index(e, prefer=spec.name), frame)
 
-        q = np.asarray(g["q"][()])
-        chi = np.asarray(g["chi"][()])
-        q_unit = _decode(g["q"].attrs.get("units")) if "units" in g["q"].attrs else None
+        q = np.asarray(g[q_name][()])
+        chi = np.asarray(g[chi_name][()])
+        q_unit = (_decode(g[q_name].attrs.get("units"))
+                  if "units" in g[q_name].attrs else None)
         chi_unit = (
-            _decode(g["chi"].attrs.get("units")) if "units" in g["chi"].attrs else None
+            _decode(g[chi_name].attrs.get("units"))
+            if "units" in g[chi_name].attrs else None
         )
         intensity = _slice_stack(g["intensity"], positions, single)
     return Integrated2D(
@@ -319,10 +331,13 @@ def _dequantize_thumbnail(ds: h5py.Dataset) -> np.ndarray:
     Thumbnails are stored as ``clip((x-vmin)/(vmax-vmin),0,1)*scale`` (scale
     255 for uint8, 65535 for uint16) with ``vmin``/``vmax``/``dtype`` attrs.
     """
+    from xrd_tools.io.schema import THUMBNAIL_LUT_ATTRS
+
+    vmin_key, vmax_key, dtype_key = THUMBNAIL_LUT_ATTRS
     arr = np.asarray(ds[()], dtype=float)
-    vmin = float(ds.attrs.get("vmin", 0.0))
-    vmax = float(ds.attrs.get("vmax", 1.0))
-    dt = _decode(ds.attrs.get("dtype", "uint8"))
+    vmin = float(ds.attrs.get(vmin_key, 0.0))
+    vmax = float(ds.attrs.get(vmax_key, 1.0))
+    dt = _decode(ds.attrs.get(dtype_key, "uint8"))
     scale = 65535.0 if str(dt) == "uint16" else 255.0
     return vmin + (arr / scale) * (vmax - vmin)
 
@@ -561,6 +576,8 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
         # the internal nexus readers keep their NaN sentinel.
         energy = _read_energy(e)
         wavelength = _read_wavelength(e, energy)
+        from xrd_tools.io.schema import detect_capabilities
+        capabilities = sorted(detect_capabilities(e))
         meta = {
             "frames": np.asarray(ds["frame"].values) if "frame" in ds.coords else np.array([]),
             "has_1d": "integrated_1d" in e,
@@ -570,6 +587,9 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
             "wavelength_A": (float(wavelength) if np.isfinite(wavelength)
                              else None),
             "ub_matrix": _read_ub_matrix(e),
+            # 2f: which optional v2 features this file carries
+            # (feature-detected per the schema capability registry)
+            "capabilities": capabilities,
         }
     meta["n_frames"] = int(meta["frames"].size)
     # When 1D and 2D were reduced over different frame labels, read_scan_metadata

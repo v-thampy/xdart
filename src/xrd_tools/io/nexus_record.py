@@ -34,7 +34,11 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from xrd_tools.io.schema import INTEGRATED_ROW_ALIGNED, SOURCE_BASE_ATTR
+from xrd_tools.io.schema import (
+    INTEGRATED_ROW_ALIGNED,
+    SOURCE_BASE_ATTR,
+    THUMBNAIL_LUT_ATTRS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,9 +182,8 @@ def write_thumbnail(frame_grp: h5py.Group, thumbnail,
     """Quantize + store ``thumbnail`` with its inversion LUT attributes."""
     arr, lut = quantize_thumbnail(np.asarray(thumbnail), dtype=dtype)
     ds = frame_grp.create_dataset("thumbnail", data=arr)
-    ds.attrs["vmin"] = lut[0]
-    ds.attrs["vmax"] = lut[1]
-    ds.attrs["dtype"] = lut[2]
+    for key, value in zip(THUMBNAIL_LUT_ATTRS, lut):
+        ds.attrs[key] = value
 
 
 def write_frame_source_ref(frame_grp: h5py.Group, source_path,

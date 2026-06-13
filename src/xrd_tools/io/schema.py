@@ -20,7 +20,11 @@ from types import MappingProxyType
 from typing import Mapping
 
 __all__ = [
+    "CAPABILITIES",
+    "CapabilityAttr",
     "DatasetSpec",
+    "detect_capabilities",
+    "is_known_schema_name",
     "SCHEMA_NAME_ATTR",
     "SCHEMA_VERSION_ATTR",
     "DTYPE_ATTR",
@@ -56,8 +60,29 @@ MONOTONIC_ATTR = "_frame_index_strictly_increasing"
 #: entry attr: POSIX project root that relative ``source/path`` pointers
 #: resolve against (the N1 portability contract).
 SOURCE_BASE_ATTR = "source_base"
-#: thumbnail dataset attrs storing the quantization LUT for inversion.
+#: thumbnail dataset attrs storing the quantization LUT for inversion
+#: (consumed by nexus_record.write_thumbnail and read._dequantize_thumbnail).
 THUMBNAIL_LUT_ATTRS = ("vmin", "vmax", "dtype")
+
+
+@dataclass(frozen=True)
+class CapabilityAttr:
+    """One optional v2 feature, feature-detected by PRESENCE (ADR-0002).
+
+    The integer schema version never moves for additive features; a
+    reader uses a capability iff its marker is present AND the registry
+    knows it.  ``marker`` is the on-disk name; ``kind`` says what to look
+    for at ``location`` (relative to the entry group)."""
+
+    marker: str
+    location: str                 # "" = the entry group itself
+    kind: str                     # "attr" | "group" | "dataset"
+    meaning: str
+    introduced: int = 2
+
+
+#: the optional features of the v2 record (additive-only; never remove).
+CAPABILITIES: "Mapping[str, CapabilityAttr]" = None  # set below GroupSchema
 
 # ── schema identity ──────────────────────────────────────────────────────────
 
@@ -229,6 +254,55 @@ class ProcessedScanSchema:
     def is_row_aligned(self, group: str, name: str) -> bool:
         ds = self.get_dataset(group, name)
         return bool(ds is not None and ds.row_aligned)
+
+
+CAPABILITIES = MappingProxyType({
+    "source_base": CapabilityAttr(
+        SOURCE_BASE_ATTR, "", "attr",
+        "N1 portability: relative source/path pointers resolve against "
+        "this POSIX project root"),
+    "frames_record": CapabilityAttr(
+        "frames", "", "group",
+        "per-frame record groups (thumbnails, source refs, timestamps)"),
+    "per_frame_geometry": CapabilityAttr(
+        "per_frame_geometry", "", "group",
+        "derived diffractometer rotations + incident angle per frame"),
+    "sigma_1d": CapabilityAttr(
+        "sigma", "integrated_1d", "dataset", "1D error estimates"),
+    "sigma_2d": CapabilityAttr(
+        "sigma", "integrated_2d", "dataset", "2D error estimates"),
+    "two_d_kind": CapabilityAttr(
+        "two_d_kind", "integrated_2d", "attr",
+        "explicit GI axis identity (else inferred from units)"),
+})
+
+
+def detect_capabilities(entry_grp) -> set[str]:
+    """Feature-detect the optional v2 capabilities present in an open
+    entry group (h5py).  Unknown on-disk extras are ignored; unknown
+    registry entries simply absent — additive evolution by construction.
+    """
+    found: set[str] = set()
+    for name, cap in CAPABILITIES.items():
+        node = entry_grp
+        if cap.location:
+            if cap.location not in entry_grp:
+                continue
+            node = entry_grp[cap.location]
+        if cap.kind == "attr":
+            if cap.marker in node.attrs:
+                found.add(name)
+        elif cap.marker in node:
+            found.add(name)
+    return found
+
+
+def is_known_schema_name(value) -> bool:
+    """True if an ``ssrl_schema`` value names this schema (current or any
+    accepted historical spelling)."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return str(value) in ACCEPTED_SCHEMA_NAMES
 
 
 #: the singleton consumers import.

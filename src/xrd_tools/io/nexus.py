@@ -1320,6 +1320,45 @@ def _schema_dataset(g: h5py.Group, group_name: str, name: str, data,
     return g.create_dataset(spec.name, data=data, **kwargs)
 
 
+def validate_group_against_schema(group: h5py.Group,
+                                  group_name: str) -> list[str]:
+    """2d: check an on-disk group against its SCHEMA declaration.
+
+    Returns a list of problem strings (empty = conformant).  Checks the
+    DECLARED facts only: required datasets present, dtypes match, no
+    row-aligned dataset disagrees with the row-label length, axes are
+    1-D.  Presence of EXTRA datasets is allowed (additive-only format).
+    This complements — never replaces — the strict write-time validators.
+    """
+    spec = SCHEMA.groups[group_name]
+    problems: list[str] = []
+    for name, ds_spec in spec.datasets.items():
+        if name not in group:
+            if ds_spec.required:
+                problems.append(f"{group_name}/{name}: required, missing")
+            continue
+        node = group[name]
+        if not isinstance(node, h5py.Dataset):
+            problems.append(f"{group_name}/{name}: not a dataset")
+            continue
+        if node.dtype != np.dtype(_NP_DTYPES[ds_spec.dtype]):
+            problems.append(
+                f"{group_name}/{name}: dtype {node.dtype} != {ds_spec.dtype}"
+            )
+        if ds_spec.role == "axis" and node.ndim != 1:
+            problems.append(f"{group_name}/{name}: axis must be 1-D")
+    label = spec.datasets.get("frame_index")
+    if label is not None and label.name in group:
+        n = group[label.name].shape[0]
+        for name, ds_spec in spec.datasets.items():
+            if ds_spec.row_aligned and name in group and                     group[name].shape[0] != n:
+                problems.append(
+                    f"{group_name}/{name}: row count {group[name].shape[0]} "
+                    f"!= frame_index length {n}"
+                )
+    return problems
+
+
 def write_integrated_stack(
     entry_grp: h5py.Group,
     *,
@@ -2631,6 +2670,7 @@ def read_stitched(
 __all__ = [
     "PROCESSED_SCHEMA_NAME",
     "PROCESSED_SCHEMA_VERSION",
+    "validate_group_against_schema",
     # v1 (legacy beamline files)
     "find_nexus_image_dataset",
     "NexusImageStack",
