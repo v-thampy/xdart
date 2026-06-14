@@ -13,14 +13,21 @@ It strictly DELEGATES quiesce to ``ReductionSession.pause`` (4a) — it never
 reimplements drain — and never writes the sink itself (the session's single
 writer thread does), preserving the HDF5 single-writer invariant.
 
-**Status (4f):** the public ``xrd_tools.session.ScanSession`` now EXISTS
-(4f-headless, offscreen-proven).  This adapter does NOT yet wrap it — the
-4f-BRIDGE step (rewire over the public session, register a
-QueuedConnection-marshalled ``on_frame_completed``, map ``on_state_change`` →
-``sigPaused``/``sigResuming``) touches the live acquisition path and is gated
-on the manual live checkpoint.  So today it still wraps the streaming
-``ReductionSession`` directly.  "public ScanSession exists" ≠ "xdart is thin"
-until that bridge lands.
+**Status (4f-bridge, landed):** this adapter now wraps the PUBLIC
+``xrd_tools.session.ScanSession`` (built by ``open_live_scan_session``), not a
+raw ``ReductionSession`` — xdart is thin over the headless session.  ``submit``
+→ ``ScanSession.submit`` (bool), ``quiesce`` → ``ScanSession.pause`` (drain +
+flag), ``resume`` → ``ScanSession.resume``, ``is_paused``/``is_running`` are its
+properties.  The GI streaming matrix + the live≡batch≡reload equivalence spine
++ byte-compat all stay green through it.
+
+The live DISPLAY still flows GUI-side through ``QtNexusSink`` (the session
+forwards every sink hook via its internal ``_EventSink``).  Routing display
+through the session's ``on_frame_completed`` event channel
+(QueuedConnection-marshalled, lossy subscriber) + mapping ``on_state_change`` →
+``sigPaused``/``sigResuming`` is the OPTIONAL Part B, deferred behind a manual
+live checkpoint; the architectural "thin over the public session" goal is met
+without it.
 """
 from __future__ import annotations
 

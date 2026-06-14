@@ -378,6 +378,73 @@ def reduce_live_frames(
     return reduced_frames
 
 
+def _build_live_scan_and_plan(
+    live_frames: Iterable[Any],
+    plan: ReductionPlan,
+    *,
+    scan_name: str = "scan",
+    global_mask: Any = None,
+    integrator: Any = None,
+    poni: Any = None,
+) -> tuple[Scan, ReductionPlan, int]:
+    """Shared construction for the live session openers: materialize the live
+    frames into a headless :class:`Scan` and fold the global mask into the plan.
+    Returns ``(scan, plan, n_frames)``."""
+    frames = list(live_frames)
+    if not frames:
+        raise ValueError("cannot open a session without frames")
+    plan = _plan_with_mask_for_live_frame(plan, global_mask, frames[0])
+    headless_frames = [frame_from_live_frame(frame) for frame in frames]
+    scan = Scan(
+        name=scan_name,
+        frames=headless_frames,
+        poni=poni if poni is not None else getattr(frames[0], "poni", None),
+        integrator=(integrator if integrator is not None
+                    else getattr(frames[0], "integrator", None)),
+    )
+    return scan, plan, len(frames)
+
+
+def open_live_scan_session(
+    live_frames: Iterable[Any],
+    plan: ReductionPlan,
+    *,
+    scan_name: str = "scan",
+    global_mask: Any = None,
+    integrator: Any = None,
+    poni: Any = None,
+    executor: Any = None,
+    cancel_token: Any = None,
+    gi_freeze_mode: str | None = None,
+    sink: Any = None,
+    inflight_max: int | None = None,
+):
+    """Open a public :class:`xrd_tools.session.ScanSession` over xdart live
+    frames (4f-bridge).
+
+    Same Scan/plan construction as :func:`open_live_reduction_session`, but
+    returns the headless commands-in / events-out ``ScanSession`` (which builds
+    + arms its own streaming ``ReductionSession`` internally) instead of a raw
+    ``ReductionSession``.  Streaming-only — the GUI live/batch write path.
+    ``clear_frame_images=True`` preserves xdart's PERF-3 raw-nulling.
+    """
+    from xrd_tools.session import ScanSession
+
+    scan, plan, _n = _build_live_scan_and_plan(
+        live_frames, plan, scan_name=scan_name, global_mask=global_mask,
+        integrator=integrator, poni=poni)
+    return ScanSession(
+        plan,
+        scan,
+        sink=sink,
+        executor=executor,
+        inflight_max=inflight_max,
+        gi_freeze_mode=gi_freeze_mode,
+        cancel_token=cancel_token,
+        clear_frame_images=True,
+    )
+
+
 def open_live_reduction_session(
     live_frames: Iterable[Any],
     plan: ReductionPlan,
@@ -404,24 +471,16 @@ def open_live_reduction_session(
     the session drive the write itself instead of copying results back.
     """
 
-    frames = list(live_frames)
-    if not frames:
-        raise ValueError("cannot open a reduction session without frames")
-    plan = _plan_with_mask_for_live_frame(plan, global_mask, frames[0])
-    headless_frames = [frame_from_live_frame(frame) for frame in frames]
-    scan = Scan(
-        name=scan_name,
-        frames=headless_frames,
-        poni=poni if poni is not None else getattr(frames[0], "poni", None),
-        integrator=integrator if integrator is not None else getattr(frames[0], "integrator", None),
-    )
+    scan, plan, n_frames = _build_live_scan_and_plan(
+        live_frames, plan, scan_name=scan_name, global_mask=global_mask,
+        integrator=integrator, poni=poni)
     return ReductionSession(
         plan,
         scan,
         sink=sink,
         executor=executor,
         cancel_token=cancel_token,
-        chunk_size=chunk_size or (len(frames) if executor is not None else 1),
+        chunk_size=chunk_size or (n_frames if executor is not None else 1),
         gi_freeze_mode=gi_freeze_mode,
         execution=execution,
         inflight_max=inflight_max,
@@ -903,6 +962,7 @@ __all__ = [
     "reduce_live_frame",
     "reduce_live_frames",
     "open_live_reduction_session",
+    "open_live_scan_session",
     "freeze_live_scan_gi_ranges",
     "sync_live_scan_gi_settings",
 ]

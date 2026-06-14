@@ -77,6 +77,7 @@ from xdart.modules.reduction import (
     freeze_live_scan_gi_ranges,
     frame_from_live_frame,
     open_live_reduction_session,
+    open_live_scan_session,
     StandardPlanCache,
     reduce_live_frames,
     sync_live_scan_gi_settings,
@@ -1490,7 +1491,13 @@ class imageThread(wranglerThread):
             if adapter is not None:
                 drained = adapter.quiesce(timeout=timeout)
             elif session is not None:
-                drained = session.drain(timeout=timeout)
+                # Defensive no-adapter fallback (unreachable on the streaming
+                # path — _get_streaming_session always builds the adapter).
+                # Prefer the ReductionSession drain(); a bare public ScanSession
+                # only exposes pause() (drain + flag).
+                quiesce = (getattr(session, 'drain', None)
+                           or getattr(session, 'pause', None))
+                drained = quiesce(timeout=timeout) if quiesce is not None else True
             if not drained:
                 # RS-1: the writer is provably NOT idle (a stalled worker) — a
                 # save/flush from this thread would race the writer's own
@@ -1718,7 +1725,14 @@ class imageThread(wranglerThread):
         gi_freeze_mode = getattr(self, "gi_freeze_mode", _default_freeze)
         sink = QtNexusSink(self, scan, standard_plan, mask=self.mask)
         try:
-            session = open_live_reduction_session(
+            # 4f-bridge: drive the streaming write path through the PUBLIC
+            # xrd_tools.session.ScanSession (commands in / events out), not a raw
+            # ReductionSession — xdart is now thin over the headless session.
+            # It builds + arms its own streaming ReductionSession internally;
+            # clear_frame_images=True preserves the PERF-3 raw-nulling, and the
+            # QtNexusSink still drives the per-frame display publish (the session
+            # forwards every sink hook via its internal _EventSink).
+            session = open_live_scan_session(
                 frames,
                 standard_plan,
                 scan_name=str(getattr(scan, "name", "scan")),
@@ -1729,7 +1743,6 @@ class imageThread(wranglerThread):
                 cancel_token=cancel_token,
                 gi_freeze_mode=gi_freeze_mode,
                 sink=sink,
-                execution="streaming",
             )
         except GIFreezeError as exc:
             self.showLabel.emit(

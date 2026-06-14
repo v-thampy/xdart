@@ -191,6 +191,7 @@ class ScanSession:
         inflight_max: int | None = None,
         gi_freeze_mode: str | None = None,
         cancel_token: Any | None = None,
+        clear_frame_images: bool = False,
     ) -> None:
         self._lock = threading.RLock()
         self._frame_cbs: list[Callable[[FrameEvent], None]] = []
@@ -215,6 +216,11 @@ class ScanSession:
             gi_freeze_mode=gi_freeze_mode,
             cancel_token=cancel_token,
             retain_products=False,
+            # The writer nulls frame.image after each write so the source-array
+            # reference doesn't pin ~18 MB/frame for the session's life (xdart's
+            # PERF-3); a later consumer reloads via Frame.load_image.  Default
+            # off — a notebook caller keeping the source frames opts in.
+            clear_frame_images=clear_frame_images,
         )
         self._event_sink = event_sink
 

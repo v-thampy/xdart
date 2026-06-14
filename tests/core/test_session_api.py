@@ -433,3 +433,29 @@ def test_double_finish_is_idempotent_no_extra_state_event():
     r2 = sess.finish()                             # idempotent
     assert r2 is r1 or r2 == r1
     assert len(states) == n_after_first            # no extra state event
+
+
+# ── 4f-bridge: clear_frame_images pass-through (xdart PERF-3 raw-nulling) ─────
+def test_clear_frame_images_true_nulls_source_images_after_write():
+    """ScanSession threads clear_frame_images to its inner ReductionSession, so
+    the writer nulls frame.image post-write (the xdart streaming path passes
+    True via open_live_scan_session to release ~18 MB/frame)."""
+    frames = _frames(3)
+    sess = ScanSession(ReductionPlan(integration_2d=None),
+                       Scan("s", frames, integrator=object()),
+                       sink=MemorySink(), executor=2, clear_frame_images=True)
+    for fr in frames:
+        sess.submit(fr)
+    sess.finish()
+    assert all(fr.image is None for fr in frames)
+
+
+def test_clear_frame_images_default_keeps_images():
+    frames = _frames(3)
+    sess = ScanSession(ReductionPlan(integration_2d=None),
+                       Scan("s", frames, integrator=object()),
+                       sink=MemorySink(), executor=2)        # default False
+    for fr in frames:
+        sess.submit(fr)
+    sess.finish()
+    assert all(fr.image is not None for fr in frames)
