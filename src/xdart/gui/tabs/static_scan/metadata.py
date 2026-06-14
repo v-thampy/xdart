@@ -150,10 +150,18 @@ class metadataWidget(Qt.QtWidgets.QWidget):
         ):
             self.tableview.setModel(DFTableModel(self._selected_scan_data(sd).transpose()))
             return
-        # No whole-scan table — fall back to the selected frame's info.
+        # No whole-scan table — fall back to the selected frame's info.  The
+        # publication store is the source for every mode now (live integration
+        # AND the Image/XYE/NeXus viewers all upsert their selected-row metadata);
+        # the legacy frame path stays only for store-less callers (some tests).
         publication = self._resolve_selected_publication()
         if publication is not None and publication.metadata_raw:
-            data = pd.DataFrame(dict(publication.metadata_raw), index=[publication.label])
+            visible_info = {
+                key: value
+                for key, value in publication.metadata_raw.items()
+                if not str(key).startswith("_")        # hide internal keys (parity
+            }                                          # with the frame path)
+            data = pd.DataFrame(visible_info, index=[publication.label])
             self.tableview.setModel(DFTableModel(data.transpose()))
             return
         selected = self._resolve_selected_frame()

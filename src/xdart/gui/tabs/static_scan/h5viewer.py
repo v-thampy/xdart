@@ -34,9 +34,11 @@ from xrd_tools.io import ImageSourceKind
 from xdart.modules.frame_publication import (
     PublicationStore,
     publication_error_details,
+    publication_from_frame_view,
     publication_from_live_frame,
     publication_has_2d_errors,
 )
+from xrd_tools.core import FrameView, numeric_metadata
 from ...widgets import defaultWidget
 from xdart import utils
 from xdart.utils import catch_h5py_file as catch
@@ -1149,6 +1151,27 @@ class H5Viewer(QWidget):
 
     # ── Viewer mode loaders ───────────────────────────────────────────────
 
+    def _upsert_viewer_row_publication(self, label, scan_info) -> None:
+        """Phase 3c: mirror a viewer-mode row's METADATA (only) into the shared
+        publication store, so the metadata panel reads it store-first like every
+        other mode.  Metadata-only (no 1D/2D arrays) keeps the integration
+        display path from ever rendering a browser row; the row itself stays in
+        ``data_1d`` for the viewer controller's own plotting/inspection."""
+        store = getattr(self, "publication_store", None)
+        if store is None:
+            return
+        try:
+            info = dict(scan_info or {})
+            view = FrameView.from_results(
+                label=label, metadata_raw=info,
+                metadata_numeric=numeric_metadata(info))
+            store.upsert(publication_from_frame_view(
+                view, generation=store.generation,
+                source_identity=str(info.get("source_file", label))))
+        except Exception:
+            logger.debug("viewer-row publication upsert failed for %s", label,
+                         exc_info=True)
+
     def _load_xye_files(self):
         """Load all selected xye files from listScans for overlay.
 
@@ -1195,6 +1218,9 @@ class H5Viewer(QWidget):
 
             with self.data_lock:
                 self.data_1d[idx] = frame
+            _upsert = getattr(self, '_upsert_viewer_row_publication', None)
+            if _upsert is not None:
+                _upsert(idx, frame.scan_info)
             self.frame_ids.append(str(idx))
             idx += 1
 
@@ -1251,6 +1277,7 @@ class H5Viewer(QWidget):
         self._viewer_nexus_path = fpath
         self._viewer_nexus_summary = summary
 
+        nexus_rows = []
         with self.data_lock:
             for row_id, (label, info) in enumerate(rows, start=1):
                 scan_info = dict(info)
@@ -1259,6 +1286,14 @@ class H5Viewer(QWidget):
                     idx=row_id,
                     scan_info=scan_info,
                 )
+                nexus_rows.append((row_id, scan_info))
+        # Phase 3c: mirror each row's metadata into the publication store so the
+        # metadata panel reads it store-first (the _ViewerRow stays in data_1d
+        # for the NeXus inspector controller).
+        _upsert = getattr(self, '_upsert_viewer_row_publication', None)
+        if _upsert is not None:
+            for row_id, scan_info in nexus_rows:
+                _upsert(row_id, scan_info)
 
         was_blocked = self.ui.listData.blockSignals(True)
         try:
@@ -1315,6 +1350,10 @@ class H5Viewer(QWidget):
             frame.nexus_preview_payload = payload
             info.update(preview_info)
         frame.scan_info = info
+        # Phase 3c: refresh the store mirror with the preview-enriched metadata.
+        _upsert = getattr(self, '_upsert_viewer_row_publication', None)
+        if _upsert is not None:
+            _upsert(row_id, info)
 
     def _load_nexus_preview_payload(self, viewer_path, info):
         from xrd_tools.io import preview_nexus_dataset, read_nexus_dataset
