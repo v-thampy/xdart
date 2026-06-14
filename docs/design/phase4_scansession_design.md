@@ -136,26 +136,37 @@ Two objects: the **headless** `xrd_tools.session.ScanSession` (4f) and the **xda
 
 ### 2.1 Headless `xrd_tools.session.ScanSession` (4f)
 
-Wraps a `ReductionSession(execution="streaming")` + a `ReductionSink`; owns a `FlushPolicy`.
-No Qt, no `PublicationStore`, no `LiveFrameSeries`, no h5pool.
+Constructs + arms a streaming `ReductionSession` over (`plan`, `source`, `sink`); commands in /
+immutable events out. The save cadence (`FlushPolicy` / persist-before-evict) is deliberately
+**NOT** owned here — it is an **adapter** concern (the GUI owns flush timing; `flush()` is a
+contract pass-through). No Qt, no `PublicationStore`, no `LiveFrameSeries`, no h5pool. **(As-built
+signatures — verified against `src/xrd_tools/session/scan_session.py`.)**
 
 ```python
 class ScanSession:
-    def __init__(self, reduction_session: ReductionSession, *,
-                 flush_policy: FlushPolicy | None = None) -> None: ...
+    def __init__(self, plan: ReductionPlan, source: Any, sink: Any = None, *,
+                 executor: Any | None = None, inflight_max: int | None = None,
+                 gi_freeze_mode: str | None = None,
+                 cancel_token: Any | None = None) -> None: ...
+                 # arms the streaming ReductionSession at construction
+                 # (writer thread starts + sink.begin runs)
 
     # commands in
-    def start(self) -> None: ...                       # idempotent; arms the writer
-    def submit(self, frame: Frame, image: np.ndarray | None = None) -> None: ...
+    def start(self) -> None: ...                       # idempotent; writer already armed
+    def submit(self, frame: Frame, image: np.ndarray | None = None) -> bool: ...
+                 # True=accepted, False=DROPPED (cancelled/writer-dead); contract
+                 # violations (post-finish, while paused) RAISE
     def pause(self, timeout: float | None = None) -> bool: ...   # delegates to ReductionSession.pause
     def resume(self) -> None: ...
     def stop(self) -> None: ...                        # cooperative cancel (sets cancel_token)
     def finish(self, *, raise_on_failure: bool = True,
                join_timeout: float | None = None) -> ReductionResult: ...
+    def flush(self, *, force: bool = False) -> None: ...   # cadence pass-through (adapter owns timing)
+    def set_generation(self, generation: int) -> None: ...  # caller-owned stale-render stamp
 
     # state out (read-only properties)
     @property
-    def is_running(self) -> bool: ...                  # _stream_started and not (_finished or _cancelled)
+    def is_running(self) -> bool: ...
     @property
     def is_paused(self) -> bool: ...                   # delegates to ReductionSession.is_paused
     @property
@@ -163,21 +174,22 @@ class ScanSession:
     @property
     def frames_completed(self) -> int: ...
 
-    # events out (plain callbacks; no Qt)
-    def on_frame_completed(self, cb: Callable[[FrameEvent], None]) -> None: ...
-    def on_progress(self, cb: Callable[[ProgressEvent], None]) -> None: ...
-    def on_state_change(self, cb: Callable[[StateChangeEvent], None]) -> None: ...
+    # events out (plain callbacks; no Qt); each returns an unsubscribe handle
+    def on_frame_completed(self, cb: Callable[[FrameEvent], None]) -> Callable[[], None]: ...
+    def on_progress(self, cb: Callable[[ProgressEvent], None]) -> Callable[[], None]: ...
+    def on_state_change(self, cb: Callable[[StateChangeEvent], None]) -> Callable[[], None]: ...
 ```
 
 ```python
 @dataclass(frozen=True, slots=True)
 class FrameEvent:                      # built from the existing immutable FrameReduction
     frame_index: int
+    mode_key: Any                      # GI (mode_1d, mode_2d) value tuple, or None (single-result)
     result_1d: IntegrationResult1D | None
     result_2d: IntegrationResult2D | None
-    metadata: Mapping[str, Any]        # read-only view of FrameReduction.metadata
-    generation: int                    # display generation stamp (param-change only; never pause/resume)
-    timestamp: float                   # wall-clock completion
+    metadata: Mapping[str, Any]        # read-only (MappingProxyType) view of FrameReduction.metadata
+    generation: int                    # caller-owned stale-render stamp (param-change only; never pause/resume)
+    timestamp: float                   # wall-clock completion (time.time())
 
 @dataclass(frozen=True, slots=True)
 class StateChangeEvent:
