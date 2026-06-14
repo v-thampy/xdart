@@ -536,9 +536,12 @@ class wranglerThread(Qt.QtCore.QThread):
         """
         cached = getattr(scan, '_cached_data_mask', None)
         if cached is None:
+            sat_fired = 0           # R3-A: how many saturation pixels were cut
+            frame_size = 0
             try:
                 arr0 = np.asarray(img_data)
                 flat = arr0.astype(float).flatten()
+                frame_size = flat.size
                 # Negatives + the uint32 dead/hot ceiling (Eiger masters) are
                 # always invalid.
                 bad = (flat < 0) | (flat >= 4294967295.0)
@@ -561,14 +564,48 @@ class wranglerThread(Qt.QtCore.QThread):
                     # Returns all-False for the uint32 ceiling (already always-on
                     # above) and below the >1e-4 fraction guard, so a few
                     # genuinely-saturated pixels are not masked.
-                    bad |= saturation_pixels(
+                    sat = saturation_pixels(
                         flat, ceiling=integer_saturation_ceiling(arr0))
+                    sat_fired = int(sat.sum())
+                    bad |= sat
                 cached = np.arange(flat.size)[bad]
             except (AttributeError, TypeError, ValueError) as e:
                 logger.debug("frame-mask compute failed: %s", e)
                 cached = None
             scan._cached_data_mask = cached
+            # R3-A: the saturation mask is a default-ON behaviour change to the
+            # INTEGRATION — surface it once per scan (this branch runs once;
+            # later frames hit the cache).  OUTSIDE the try + guarded so the
+            # advisory can never null the computed mask, and bare test holders
+            # without the helper just skip it.
+            if sat_fired:
+                warn = getattr(self, '_warn_saturation_masked', None)
+                if warn is not None:
+                    warn(sat_fired, frame_size)
         return cached
+
+    def _warn_saturation_masked(self, n_pixels: int, frame_size: int) -> None:
+        """R3-A: one-time advisory that the 'Mask Saturated' policy actually
+        excluded a detector-ceiling block from the INTEGRATION this run.
+
+        The saturation mask is default-ON and changes integrated intensities,
+        so a silent fire hides a real data effect.  Logged loud + surfaced in
+        the GUI status line when a ``showLabel`` signal is present (absent on
+        the bare test holders, so this no-ops there).  Called from the
+        once-per-scan mask compute, so it fires once per run, not per frame.
+        """
+        pct = (100.0 * n_pixels / frame_size) if frame_size else 0.0
+        msg = (f"Mask Saturated: {n_pixels} detector-ceiling pixel(s) "
+               f"({pct:.2f}% of the frame) excluded from integration — a "
+               f"dead/overflowed module. Untick 'Mask Saturated' to keep them.")
+        logger.warning(msg)
+        emit = getattr(getattr(self, 'showLabel', None), 'emit', None)
+        if emit is not None:
+            try:
+                emit(msg)
+            except Exception:
+                logger.debug("showLabel emit failed for saturation advisory",
+                             exc_info=True)
 
     def _prewarm_frame_mask(self, scan, img_data) -> None:
         """Populate ``scan._cached_data_mask`` on the main thread.
