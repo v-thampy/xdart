@@ -20,7 +20,17 @@ _LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
 
+def _is_fresh() -> bool:
+    """``xdart -f`` starts a FRESH session: ignore any saved state on load and
+    persist nothing on save (ephemeral), so the user's real saved session is
+    neither read nor clobbered.  Only affects the DEFAULT path — an explicit
+    ``path=`` (or ``-n NAME`` redirect) is honoured as given."""
+    return bool(os.environ.get('XDART_SESSION_FRESH'))
+
+
 def load_session(path=None) -> dict:
+    if path is None and _is_fresh():
+        return {}
     p = Path(path) if path else Path(_default_path())
     try:
         with _LOCK:
@@ -49,6 +59,8 @@ def _json_default(obj):
 
 
 def save_session(data: dict, path=None) -> None:
+    if path is None and _is_fresh():
+        return   # ephemeral fresh session: never write the default file
     p = Path(path) if path else Path(_default_path())
     try:
         with _LOCK:

@@ -115,8 +115,44 @@ class Main(QMainWindow):
             logger.exception("Error opening file")
 
 
+def _apply_cli_session_args(argv):
+    """Parse ``-f``/``-n`` and point the session system at the right file via
+    env vars BEFORE any widget loads its session.  Returns the argv (minus the
+    consumed flags) to hand to Qt.
+
+    ``xdart -f``      → fresh session (load nothing, persist nothing).
+    ``xdart -n NAME`` → named saved session (NAME under ~/.xdart; the ``.json``
+                        extension is forced if the user omits it).
+    """
+    import argparse
+    from pathlib import Path
+    parser = argparse.ArgumentParser(
+        prog='xdart', description='xdart — SSRL XRD reduction GUI')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '-f', '--fresh', action='store_true',
+        help='start a fresh session (does not load or modify your saved session)')
+    group.add_argument(
+        '-n', '--session', metavar='NAME',
+        help='start from a named saved session (NAME under ~/.xdart; '
+             '.json is appended if omitted)')
+    args, rest = parser.parse_known_args(argv[1:])
+    if args.fresh:
+        os.environ['XDART_SESSION_FRESH'] = '1'
+    elif args.session:
+        name = args.session
+        if not name.lower().endswith('.json'):
+            name += '.json'                  # force the .json extension
+        p = Path(name)
+        if not p.is_absolute() and p.parent == Path('.'):
+            p = Path.home() / '.xdart' / name   # bare name -> ~/.xdart/
+        os.environ['XDART_SESSION_FILE'] = str(p)
+    return [argv[0], *rest]
+
+
 def run():
-    app = QtWidgets.QApplication(sys.argv)
+    argv = _apply_cli_session_args(sys.argv)
+    app = QtWidgets.QApplication(argv)
     # N8: apply dark theme before any widget construction so
     # pyqtgraph plot backgrounds are set in time (pyqtgraph
     # snapshots the config at widget creation).

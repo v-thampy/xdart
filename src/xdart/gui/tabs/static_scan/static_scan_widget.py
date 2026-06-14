@@ -372,8 +372,11 @@ class staticWidget(QWidget):
         def _default_split():
             try:
                 total = sum(self.ui.mainSplitter.sizes()) or 1000
+                # Right (integration/wrangler) column reduced ~15% (0.24 ->
+                # 0.204; it was too wide on startup, esp. on Windows); the
+                # freed width goes to the middle display panels (Vivek).
                 self.ui.mainSplitter.setSizes(
-                    [int(total * f) for f in (0.19, 0.57, 0.24)])
+                    [int(total * f) for f in (0.19, 0.606, 0.204)])
                 self.ui.mainSplitter.setStretchFactor(1, 1)
             except Exception:
                 logger.debug("mainSplitter default sizing failed",
