@@ -58,6 +58,10 @@ def _make(params_list, group_toggles):
     (imageWrangler, image_params,
      {'GI': ('Grazing', 'Grazing Incidence'),
       'Mask': ('Threshold', 'Intensity Threshold')}),
+    # NOTE: MaskSat is intentionally NOT listed here — this case asserts a
+    # default-OFF start state, but mask_sentinel defaults ON.  The default-
+    # agnostic peek/programmatic tests below + test_nexus_mask_saturated_wiring
+    # cover the nexus MaskSat toggle (R3-B).
     (nexusWrangler, nexus_params,
      {'GI': ('Grazing', 'Grazing Incidence')}),
 ])
@@ -178,3 +182,24 @@ def test_image_expand_active_groups_collapses_when_off(qapp):
     run()
     assert root.child('GI').opts.get('expanded') is True
     assert root.child('Mask').opts.get('expanded') is False
+
+
+def test_nexus_mask_saturated_wiring_present():
+    """R3-B: NeXus scans can opt out of detector-saturation masking.  The
+    MaskSat group, its header-toggle binding, and its session persistence must
+    all be present so the opt-out survives a save/restore and reaches the
+    reduction thread (setup() pushes ``self.mask_sentinel`` ->
+    ``self.thread.mask_sentinel``, read by the shared ``_resolve_frame_mask``).
+    Before this fix NeXus inherited the base default mask_sentinel=True with no
+    UI to flip it."""
+    masksat = next((g for g in nexus_params if g.get('name') == 'MaskSat'), None)
+    assert masksat is not None, "nexus params lost the MaskSat group"
+    bool_child = next(c for c in masksat['children']
+                      if c['name'] == 'mask_sentinel')
+    # hidden bool, ON by default — preserves the long-standing behaviour; the
+    # header checkbox (UI-1) is the visible control.
+    assert bool_child['value'] is True and bool_child['visible'] is False
+    assert nexusWrangler._GROUP_TOGGLES.get('MaskSat') == 'mask_sentinel'
+    # session round-trips the opt-out + syncs the attr setup() reads.
+    assert ('mask_sentinel', ('MaskSat', 'mask_sentinel'), False,
+            'mask_sentinel') in nexusWrangler._SESSION_PARAMS

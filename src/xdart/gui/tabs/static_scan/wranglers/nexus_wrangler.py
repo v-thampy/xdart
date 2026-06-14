@@ -58,6 +58,18 @@ params = [
         {'name': 'mask_file', 'title': 'Mask File    ', 'type': 'str', 'value': ''},
         NamedActionParameter(name='mask_file_browse', title='Browse...'),
     ], 'expanded': False},
+    # R3-B: detector-saturation masking opt-out for NeXus sources too.  Same
+    # UI-1 header-checkbox pattern as GI/the image wrangler's MaskSat: the group
+    # header carries a real checkbox (see wranglerWidget._install_group_toggles);
+    # the hidden bool is the source of truth.  ON by default preserves the
+    # long-standing behaviour; OFF lets a genuinely-saturated module at the
+    # integer ceiling be integrated.  Without this, NeXus scans were forced
+    # mask_sentinel=True with no way to opt out.
+    {'name': 'MaskSat', 'title': 'Mask Saturated', 'type': 'group',
+     'children': [
+        {'name': 'mask_sentinel', 'type': 'bool', 'value': True,
+         'visible': False},
+    ], 'expanded': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group',
      'children': [
         # UI-1 (#81): the group HEADER carries a real checkbox — the on/off
@@ -290,6 +302,7 @@ class nexusWrangler(wranglerWidget):
         ('tilt_angle',          ('GI', 'tilt_angle'),            False, 'tilt_angle'),
         ('gi_mode_1d',          ('GI', 'gi_mode_1d'),            False, 'gi_mode_1d'),
         ('gi_mode_2d',          ('GI', 'gi_mode_2d'),            False, 'gi_mode_2d'),
+        ('mask_sentinel',       ('MaskSat', 'mask_sentinel'),    False, 'mask_sentinel'),
     ]
 
     def _restore_from_session(self):
@@ -356,7 +369,7 @@ class nexusWrangler(wranglerWidget):
     # UI-1 (#81): the GI group carries a header CHECKBOX as its on/off toggle,
     # mapped to the hidden bool that is its source of truth (see
     # wranglerWidget._install_group_toggles).
-    _GROUP_TOGGLES = {'GI': 'Grazing'}
+    _GROUP_TOGGLES = {'GI': 'Grazing', 'MaskSat': 'mask_sentinel'}
 
     def _save_to_session(self):
         """Save parameters to session.json."""
@@ -465,6 +478,8 @@ class nexusWrangler(wranglerWidget):
         self.entry = self.parameters.child('NeXus File').child('entry').value()
         self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
         self.mask_file = self.parameters.child('Signal').child('mask_file').value()
+        # R3-B: detector-saturation masking opt-out (default ON).
+        self.mask_sentinel = self.parameters.child('MaskSat').child('mask_sentinel').value()
         # N1: Project Folder -> @source_base (relative raw paths -> portable .nxs).
         self.project_folder = self.parameters.child('Project').child('project_folder').value()
         self.source_base = self._compute_source_base()
@@ -538,6 +553,9 @@ class nexusWrangler(wranglerWidget):
         self.thread.data_1d = self.data_1d
         self.thread.data_2d = self.data_2d
         self.thread.command = self.command
+        # R3-B: the freshly-recreated thread defaults mask_sentinel=True; push
+        # the UI's value so the NeXus opt-out actually reaches _resolve_frame_mask.
+        self.thread.mask_sentinel = self.mask_sentinel
         # N1: push the project root so the writer stamps @source_base + relative
         # raw paths (set AFTER the thread recreate above).
         self.thread.source_base = self.source_base

@@ -112,8 +112,9 @@ pre-migration reference signature.  Two additive notes:
    dead/overflowed block is).  This is a behavior change for uint16 detectors
    that emit 65535 as an overflow sentinel: their integrated patterns no longer
    carry that contamination by default.  Saturated counts are clipped/unreliable
-   anyway, but if you need them included, untick **Mask Saturated** in the
-   Intensity-Threshold area.  Non-finite and the uint32 ceiling (Eiger dummy)
+   anyway, but if you need them included, untick the **Mask Saturated** group
+   header checkbox — available for both image-series and NeXus sources (R3-B).
+   Non-finite and the uint32 ceiling (Eiger dummy)
    stay always-masked; negatives are masked on the RAW frame before background
    subtraction only.  Applied identically across live/batch/reload (one
    `_resolve_frame_mask`, spine-verified).
