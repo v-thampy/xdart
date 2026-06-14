@@ -1546,9 +1546,16 @@ class staticWidget(QWidget):
                 if self.h5viewer.dirname != generated_dir:
                     self.h5viewer.dirname = generated_dir
                     self.h5viewer.update_scans()
-                # Inform H5Viewer to load the file and set the flag to auto-select its last point
+                # Inform H5Viewer to load the file and set the flag to auto-select its last point.
+                # internal=True: this is the app's own post-run wiring, not a user click —
+                # the live run already pointed file_thread.fname at this same output file
+                # (new_scan, set_file internal=True), so a non-internal call would hit the
+                # same-file dedupe and silently skip the end-of-batch reload + select-last
+                # (the "last frame doesn't show after batch" regression).  The run has ended
+                # (_exit_run_state + live_run_active=False above), so bypassing the run guard
+                # is safe.
                 self.h5viewer._auto_select_last_on_finish = True
-                self.h5viewer.set_file(generated_file)
+                self.h5viewer.set_file(generated_file, internal=True)
 
         # Append-mode feedback: a NON-batch run that processed 0 new frames
         # (Append over an already-complete scan/directory) displayed nothing
@@ -1565,7 +1572,10 @@ class staticWidget(QWidget):
                     self.h5viewer.dirname = existing_dir
                     self.h5viewer.update_scans()
                 self.h5viewer._auto_select_last_on_finish = True
-                self.h5viewer.set_file(existing_file)
+                # internal=True for the same reason as the batch branch: force the
+                # reload past the same-file dedupe (the run wired file_thread.fname
+                # to this file) so the last-frame select-last actually fires.
+                self.h5viewer.set_file(existing_file, internal=True)
 
         # The scan-matches branch delegates to integrator_thread_finished() to
         # run the post-integration UI enable + exit the run-state.  Skip it when
