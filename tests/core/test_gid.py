@@ -162,6 +162,22 @@ def test_freeze_common_axis_single_scout_pads():
     assert hi == pytest.approx(10.2, abs=1e-9)
 
 
+def test_nan_empty_1d_marks_zero_count_bins():
+    """Empty bins (pyFAI count==0 — the GI-freeze coverage pad, or masked gaps)
+    become NaN so they're not plotted/aggregated as a spurious 0/flat line;
+    real bins are untouched; missing count is a safe pass-through."""
+    from types import SimpleNamespace
+    from xrd_tools.integrate.gid import _nan_empty_1d
+    res = SimpleNamespace(intensity=np.array([0.0, 5.0, 0.0, 3.0]),
+                          count=np.array([0, 10, 0, 7]))
+    out = _nan_empty_1d(res)
+    assert np.isnan(out[0]) and np.isnan(out[2])    # empty -> NaN
+    assert out[1] == 5.0 and out[3] == 3.0          # real data kept
+    # defensive: no per-bin count exposed -> unchanged
+    res2 = SimpleNamespace(intensity=np.array([1.0, 2.0]), count=None)
+    np.testing.assert_array_equal(_nan_empty_1d(res2), [1.0, 2.0])
+
+
 def test_freeze_common_axis_qtotal_floor_at_zero():
     """Regression: q_total's symmetric pad must not push the frozen lower bound
     below 0 (negative-q bins integrate to a spurious flat dummy line — the

@@ -208,6 +208,27 @@ def create_fiber_integrator(
     return fi
 
 
+def _nan_empty_1d(result):
+    """Return a 1D result's intensity with EMPTY bins set to NaN.
+
+    pyFAI fills bins with no contributing pixels (``count == 0``) with 0, so a
+    frozen output range wider than the data (the GI-freeze coverage pad) — and
+    any fully-masked gap — would plot/aggregate as a spurious flat 0/dummy line
+    (the points-at-negative-Q artifact).  NaN-marking those bins keeps them out
+    of the plot; the aggregations are NaN-aware (nanmean/nansum) and the
+    equivalence spine compares with equal_nan.  Defensive: if no per-bin
+    ``count`` is exposed (some fiber methods), the intensity is returned
+    unchanged.
+    """
+    intensity = np.asarray(result.intensity, dtype=float)
+    count = getattr(result, "count", None)
+    if count is not None:
+        count = np.asarray(count)
+        if count.shape == intensity.shape:
+            intensity = np.where(count == 0, np.nan, intensity)
+    return intensity
+
+
 def integrate_gi_1d(
     image: np.ndarray,
     fi: FiberIntegrator,
@@ -291,7 +312,7 @@ def integrate_gi_1d(
         radial = result.radial
     return IntegrationResult1D(
         radial=np.asarray(radial, dtype=float),
-        intensity=np.asarray(result.intensity, dtype=float),
+        intensity=_nan_empty_1d(result),
         sigma=np.asarray(sigma, dtype=float) if sigma is not None else None,
         unit=_unit_str(result.unit),
     )
@@ -612,7 +633,7 @@ def integrate_gi_polar_1d(
         sigma = result.sigma if result.sigma is not None else None
         return IntegrationResult1D(
             radial=np.asarray(result.radial, dtype=float),
-            intensity=np.asarray(result.intensity, dtype=float),
+            intensity=_nan_empty_1d(result),
             sigma=np.asarray(sigma, dtype=float) if sigma is not None else None,
             unit=_unit_str(result.unit) if result.unit is not None else std_unit,
         )
@@ -640,7 +661,7 @@ def integrate_gi_polar_1d(
         radial = result.radial
     return IntegrationResult1D(
         radial=np.asarray(radial, dtype=float),
-        intensity=np.asarray(result.intensity, dtype=float),
+        intensity=_nan_empty_1d(result),
         sigma=np.asarray(sigma, dtype=float) if sigma is not None else None,
         unit=_unit_str(result.unit),
     )
@@ -718,7 +739,7 @@ def integrate_gi_exitangles_1d(
         radial = result.radial
     return IntegrationResult1D(
         radial=np.asarray(radial, dtype=float),
-        intensity=np.asarray(result.intensity, dtype=float),
+        intensity=_nan_empty_1d(result),
         sigma=np.asarray(sigma, dtype=float) if sigma is not None else None,
         unit=_unit_str(result.unit),
     )
