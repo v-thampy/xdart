@@ -44,14 +44,18 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
         self._store = store
         self._cond = Condition()
         self._queue: deque = deque()
+        self._newest_gen = -1        # highest generation ever requested (P3)
         self._stop = False
 
     def request(self, label, generation: int) -> None:
         """Enqueue a hydration request (non-blocking; returns immediately)."""
+        generation = int(generation)
         with self._cond:
             if self._stop:
                 return
-            self._queue.append((label, int(generation)))
+            if generation > self._newest_gen:
+                self._newest_gen = generation
+            self._queue.append((label, generation))
             self._cond.notify()
 
     def run(self) -> None:
@@ -62,6 +66,12 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 if self._stop:
                     return
                 label, generation = self._queue.popleft()
+                newest = self._newest_gen
+            if generation < newest:
+                # P3 coalesce: a newer selection/mode superseded this request,
+                # so don't even hit disk for a frame the user already scrolled
+                # past — the GUI would drop the result anyway.
+                continue
             try:
                 publication = self._store.get_or_hydrate(label)
             except Exception:
@@ -69,14 +79,20 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                              exc_info=True)
                 publication = None
             if publication is not None:
-                # The GUI handler drops this if generation != the live
-                # display_generation (selection/mode moved on).
+                # The GUI handler still re-checks generation == the live
+                # display_generation (a change that landed during the read).
                 self.sigHydrated.emit(label, generation)
 
-    def stop(self, timeout_ms: int = 2000) -> None:
-        """Signal the loop to exit and join (idempotent)."""
+    def stop(self, timeout_ms: int = 5000) -> bool:
+        """Signal the loop to exit and join (idempotent).
+
+        Returns ``True`` iff the thread actually stopped within ``timeout_ms``.
+        A ``False`` return means an in-flight disk read is still running (bounded
+        by ``catch_h5py_file``'s retry cap) — the caller MUST keep the handle so
+        the QThread object isn't destroyed while its thread runs (P1)."""
         with self._cond:
             self._stop = True
             self._cond.notify_all()
         if self.isRunning():
-            self.wait(timeout_ms)
+            return bool(self.wait(timeout_ms))
+        return True

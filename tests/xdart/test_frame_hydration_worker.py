@@ -42,8 +42,36 @@ def test_worker_hydrates_off_the_calling_thread_and_echoes_generation(qapp):
         assert emitted == [(7, 3)]                 # label + generation echoed
         assert seen["thread"] != caller_thread     # the read ran OFF the caller
     finally:
-        worker.stop()
+        stopped = worker.stop()
+    assert stopped is True                         # P1: stop reports success
     assert not worker.isRunning()
+
+
+def test_worker_coalesces_superseded_generation(qapp):
+    """P3: a request whose generation is older than the newest one queued is
+    skipped WITHOUT hitting disk — the user already scrolled past it."""
+    reads = []
+    done = threading.Event()
+
+    class FakeStore:
+        def get_or_hydrate(self, label):
+            reads.append(label)
+            if label == 2:
+                done.set()
+            return {"label": label}
+
+    worker = FrameHydrationWorker(FakeStore())
+    # Enqueue BOTH before starting the loop: gen-1 is superseded by gen-2.
+    worker.request(1, 1)
+    worker.request(2, 2)
+    worker.start()
+    try:
+        assert done.wait(5.0)
+        time.sleep(0.1)                            # let a (wrong) gen-1 read happen
+    finally:
+        worker.stop()
+    assert 2 in reads
+    assert 1 not in reads, f"superseded gen-1 read should be skipped; got {reads}"
 
 
 def test_worker_does_not_emit_when_hydrate_yields_none(qapp):

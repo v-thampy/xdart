@@ -713,14 +713,32 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                          exc_info=True)
 
     def stop_hydration_worker(self) -> None:
-        """Stop + join the background worker (idempotent; call at teardown)."""
+        """Stop + join the background worker (idempotent; call at teardown).
+
+        P1: disconnect the signal first so a late cross-thread emit can't
+        re-enter a half-torn-down widget; and only release the handle once the
+        thread has actually stopped — if a slow ``.nxs`` read is still in flight
+        we KEEP the handle (and log) rather than let the QThread object be
+        destroyed while its thread runs ('QThread: Destroyed while running')."""
         worker = self._hydration_worker
-        self._hydration_worker = None
-        if worker is not None:
-            try:
-                worker.stop()
-            except Exception:
-                logger.debug("hydration worker stop failed", exc_info=True)
+        if worker is None:
+            return
+        try:
+            worker.sigHydrated.disconnect(self._on_frame_hydrated)
+        except Exception:
+            pass
+        stopped = True
+        try:
+            stopped = worker.stop()
+        except Exception:
+            logger.debug("hydration worker stop failed", exc_info=True)
+            stopped = False
+        if stopped:
+            self._hydration_worker = None
+        else:
+            logger.warning("frame-hydration worker did not stop within timeout; "
+                           "keeping the handle so the QThread isn't destroyed "
+                           "while its read is still in flight")
 
     def _note_selection_generation(self):
         """Bump the generation when the *effective* selection changes.
