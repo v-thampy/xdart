@@ -659,6 +659,9 @@ class staticWidget(QWidget):
             self._update_timer.trigger()
             return
 
+        # A real frame was processed this run (Append-mode feedback gate).
+        self._run_saw_frame = True
+
         # Per-frame mid-scan refresh.  Append idx to scan.frames.index
         # and bypass the file_thread.load_frame disk read by pulling the
         # freshly-integrated frame directly out of the wrangler's in-memory
@@ -1104,6 +1107,11 @@ class staticWidget(QWidget):
         if self._run_active:
             return
         self._run_active = True
+        # Append-mode feedback: track whether THIS run displayed any frame, so a
+        # run that processes 0 new frames (Append over an already-complete scan)
+        # can still show the scan's last frame at the end (visual confirmation
+        # that something happened).  Reset per run start.
+        self._run_saw_frame = False
         self.displayframe.set_processing_active(True)
         # Same run-state, pushed to the h5viewer so the frame-selection disk-load
         # guard (data_changed) and the reader-side hydration guard
@@ -1520,6 +1528,23 @@ class staticWidget(QWidget):
                 # Inform H5Viewer to load the file and set the flag to auto-select its last point
                 self.h5viewer._auto_select_last_on_finish = True
                 self.h5viewer.set_file(generated_file)
+
+        # Append-mode feedback: a NON-batch run that processed 0 new frames
+        # (Append over an already-complete scan/directory) displayed nothing
+        # live.  Load the existing scan file and auto-select its LAST frame so
+        # the user gets visual confirmation the run actually ran.  Batch already
+        # auto-loads + selects-last above; XYE-only has no .nxs to load.
+        if (not is_batch and not is_xye_only
+                and not getattr(self, '_run_saw_frame', True)):
+            existing_file = (getattr(self.wrangler.thread, 'fname', None)
+                             or getattr(self.wrangler, 'fname', None))
+            if existing_file and os.path.exists(existing_file):
+                existing_dir = os.path.dirname(existing_file)
+                if self.h5viewer.dirname != existing_dir:
+                    self.h5viewer.dirname = existing_dir
+                    self.h5viewer.update_scans()
+                self.h5viewer._auto_select_last_on_finish = True
+                self.h5viewer.set_file(existing_file)
 
         # The scan-matches branch delegates to integrator_thread_finished() to
         # run the post-integration UI enable + exit the run-state.  Skip it when

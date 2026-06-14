@@ -1564,6 +1564,57 @@ def test_wrangler_finish_while_reintegrate_running_keeps_controls_locked(widget,
     assert not any(_proc_controls(w).values()), "controls re-enabled mid-reintegrate"
 
 
+def _stub_wrangler_finish_collaborators(w, monkeypatch, nxs):
+    monkeypatch.setattr(w.wrangler.thread, 'batch_mode', False, raising=False)
+    monkeypatch.setattr(w.wrangler.thread, 'xye_only', False, raising=False)
+    monkeypatch.setattr(w.wrangler.thread, 'fname', str(nxs), raising=False)
+    monkeypatch.setattr(w.integratorTree.integrator_thread, 'isRunning', lambda: False)
+    monkeypatch.setattr(w, '_flush_pending_update', lambda: None)
+    monkeypatch.setattr(w.wrangler, 'stop', lambda: None)
+    monkeypatch.setattr(w, 'integrator_thread_finished', lambda: None)
+    w.h5viewer.dirname = str(nxs.parent)         # skip the update_scans branch
+    loaded = []
+    monkeypatch.setattr(w.h5viewer, 'set_file',
+                        lambda f, **k: loaded.append(f))
+    return loaded
+
+
+def test_wrangler_finished_append_zero_new_frames_shows_last_frame(
+        widget, monkeypatch, tmp_path):
+    """Append-mode feedback: a NON-batch run that processed 0 new frames still
+    loads the existing scan file and auto-selects its LAST frame, so the user
+    sees that the run ran."""
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    w._enter_run_state()                         # resets _run_saw_frame=False
+    assert w._run_saw_frame is False
+    nxs = tmp_path / "scan.nxs"
+    nxs.write_text("x")
+    loaded = _stub_wrangler_finish_collaborators(w, monkeypatch, nxs)
+
+    w.wrangler_finished()
+
+    assert loaded == [str(nxs)]                  # existing scan reloaded
+    assert w.h5viewer._auto_select_last_on_finish is True
+
+
+def test_wrangler_finished_with_frames_does_not_reload(
+        widget, monkeypatch, tmp_path):
+    """When frames WERE shown live, the run must NOT reload from disk — the live
+    display stands (no redundant disk read / cursor jump)."""
+    w = widget
+    _set_processing_mode(w, 'Int 2D')
+    w._enter_run_state()
+    w._run_saw_frame = True                      # frames displayed live
+    nxs = tmp_path / "scan.nxs"
+    nxs.write_text("x")
+    loaded = _stub_wrangler_finish_collaborators(w, monkeypatch, nxs)
+
+    w.wrangler_finished()
+
+    assert loaded == []                          # no append-feedback reload
+
+
 def test_shutdown_threads_stops_file_thread(widget):
     """Production teardown must stop the persistent fileHandlerThread so it is
     not 'destroyed while running' on tab/app close.  Idempotent."""
