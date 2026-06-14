@@ -685,7 +685,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _ensure_hydration_worker(self):
         if self._hydration_worker is None and self.publication_store is not None:
             from .frame_hydration_worker import FrameHydrationWorker
-            worker = FrameHydrationWorker(self.publication_store, parent=self)
+            # parent=None (NOT self): a QThread parented to the widget is
+            # C++-deleted when the widget is destroyed even if its thread is
+            # still running ('QThread: Destroyed while running').  With no Qt
+            # parent the Python handle (kept by stop_hydration_worker on a slow
+            # read) is the sole owner, so the thread is never force-deleted mid
+            # read (codex P1).
+            worker = FrameHydrationWorker(self.publication_store, parent=None)
             worker.sigHydrated.connect(self._on_frame_hydrated)
             worker.start()
             self._hydration_worker = worker

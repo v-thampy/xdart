@@ -83,7 +83,7 @@ class FrameHydrationWorker(Qt.QtCore.QThread):
                 # display_generation (a change that landed during the read).
                 self.sigHydrated.emit(label, generation)
 
-    def stop(self, timeout_ms: int = 5000) -> bool:
+    def stop(self, timeout_ms: int = 8000) -> bool:
         """Signal the loop to exit and join (idempotent).
 
         Returns ``True`` iff the thread actually stopped within ``timeout_ms``.

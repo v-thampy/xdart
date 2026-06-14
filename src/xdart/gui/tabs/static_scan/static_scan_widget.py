@@ -1505,7 +1505,12 @@ class staticWidget(QWidget):
         # finishes first the reintegrate's frames still need the controls
         # locked — only exit the shared run-state when the integrator run is
         # also done; its finished handler exits it otherwise.
-        if not self.integratorTree.integrator_thread.isRunning():
+        # Capture once: a concurrent reintegrate-all that is still WRITING means
+        # we must neither exit the shared run-state (controls stay locked) nor
+        # force a reload of a possibly half-written file (review finding — the
+        # internal=True auto-loads below bypass the _run_writing guard).
+        _reintegrate_running = self.integratorTree.integrator_thread.isRunning()
+        if not _reintegrate_running:
             self._exit_run_state()
 
         # Flush any pending coalesced update so the final frame is shown.
@@ -1530,7 +1535,7 @@ class staticWidget(QWidget):
         is_batch = getattr(self.wrangler.thread, 'batch_mode', False)
         is_xye_only = getattr(self.wrangler.thread, 'xye_only', False)
 
-        if is_batch and not is_xye_only:
+        if is_batch and not is_xye_only and not _reintegrate_running:
             # Prefer the thread's fname — it's the source of truth for
             # where data was actually written. The widget-level
             # wrangler.fname is set in setup() before the thread runs
@@ -1562,7 +1567,7 @@ class staticWidget(QWidget):
         # live.  Load the existing scan file and auto-select its LAST frame so
         # the user gets visual confirmation the run actually ran.  Batch already
         # auto-loads + selects-last above; XYE-only has no .nxs to load.
-        if (not is_batch and not is_xye_only
+        if (not is_batch and not is_xye_only and not _reintegrate_running
                 and not getattr(self, '_run_saw_frame', True)):
             existing_file = (getattr(self.wrangler.thread, 'fname', None)
                              or getattr(self.wrangler, 'fname', None))

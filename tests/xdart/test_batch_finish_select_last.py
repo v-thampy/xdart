@@ -9,7 +9,8 @@ from types import SimpleNamespace, MethodType
 from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
 
 
-def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False):
+def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
+                 reintegrate_running=False):
     nxs = tmp_path / "scan.nxs"
     nxs.write_bytes(b"")                         # os.path.exists -> True
     calls = []
@@ -29,7 +30,8 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False):
     )
     host = SimpleNamespace(
         integratorTree=SimpleNamespace(
-            integrator_thread=SimpleNamespace(isRunning=lambda: False)),
+            integrator_thread=SimpleNamespace(
+                isRunning=lambda: reintegrate_running)),
         _exit_run_state=lambda: None,
         _update_timer=SimpleNamespace(stop=lambda: None),
         _flush_pending_update=lambda: None,
@@ -63,3 +65,13 @@ def test_nonbatch_run_that_saw_frames_does_not_reload(tmp_path):
     host, h5viewer, nxs, calls = _finish_host(tmp_path, batch=False, saw_frame=True)
     host.wrangler_finished()
     assert calls == [], f"a frames-seen run must not reload; got {calls}"
+
+
+def test_batch_finish_skips_reload_while_reintegrate_running(tmp_path):
+    """Overlap guard (review finding): if a reintegrate-all is still WRITING at
+    batch finish, the forced internal=True reload must NOT fire — it could read a
+    half-written .nxs.  The reintegrate's own completion refreshes the display."""
+    host, h5viewer, nxs, calls = _finish_host(
+        tmp_path, batch=True, saw_frame=True, reintegrate_running=True)
+    host.wrangler_finished()
+    assert calls == [], f"must not reload while a reintegrate writes; got {calls}"
