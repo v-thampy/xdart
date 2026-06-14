@@ -46,6 +46,11 @@ import numpy as np  # allowed: the purity guard forbids only Qt/pyqtgraph/h5py/p
 from xrd_tools.core.frame_view import (
     two_d_kind_from_units as _core_kind,
 )
+from xrd_tools.core.invalid import (
+    UINT32_CEILING as _UINT32_CEILING,
+    integer_saturation_ceiling as _core_saturation_ceiling,
+    saturation_pixels as _saturation_pixels,
+)
 
 __all__ = [
     "Mode",
@@ -624,26 +629,19 @@ def plan_overlay(method, unit_changed, has_existing, new_ids, prev_overlaid_ids)
     return OverlayAction.REPLACE, new_ids
 
 
-_UINT32_CEILING = 4294967295.0   # uint32 max — the Eiger dead/hot dummy
-
-
 def integer_saturation_ceiling(arr):
-    """The saturation ceiling implied by an integer array's dtype
-    (``np.iinfo(dtype).max`` — 65535 for uint16, 255 for uint8, 4095 never
-    because numpy has no 12-bit type, etc.), learned from the detector bit
-    depth rather than assuming 16-bit.
-
-    Returns ``65535.0`` as the fallback when ``arr`` is already float — the
-    original integer dtype was lost upstream (e.g. after a threshold/bg
-    conversion).  The fallback is SAFE: ``== 65535`` simply won't match the
-    values of a non-16-bit frame, so it never wrongly masks.  Capture the
-    ceiling from the RAW frame (before any float conversion) to get the exact
-    value for 8/32-bit detectors.
+    """GUI wrapper over :func:`xrd_tools.core.invalid.integer_saturation_ceiling`:
+    the dtype-derived ceiling (``np.iinfo(dtype).max`` — 65535 for uint16, 255
+    for uint8, learned from the detector bit depth, never assumed 16-bit),
+    falling back to ``65535.0`` when ``arr`` is already float (the integer dtype
+    was lost upstream).  The 65535 fallback is the legacy GUI policy and stays
+    in xdart — core returns ``None`` there and never hardcodes 65535.  The
+    fallback is SAFE: ``== 65535`` won't match a non-16-bit frame's values.
+    Capture the ceiling from the RAW frame (before any float conversion) to get
+    the exact value for 8/32-bit detectors.
     """
-    a = np.asarray(arr)
-    if np.issubdtype(a.dtype, np.integer):
-        return float(np.iinfo(a.dtype).max)
-    return 65535.0
+    ceiling = _core_saturation_ceiling(arr)
+    return ceiling if ceiling is not None else 65535.0
 
 
 def sentinel_mask(arr, mask_saturation=True, ceiling=None):
@@ -659,12 +657,12 @@ def sentinel_mask(arr, mask_saturation=True, ceiling=None):
     sentinel — so masking it is OPT-IN via ``mask_saturation`` (the "Mask
     Saturated" wrangler toggle, default ON).  ``ceiling`` overrides the
     dtype-derived value (callers that already converted to float pass the
-    ceiling captured from the raw dtype).  When enabled and enough pixels sit
-    exactly at the ceiling (the >1e-4 fraction guard, so a few genuinely-
-    saturated pixels are NOT masked) those pixels become NaN so autoscale uses
-    the real image range.  When disabled a real saturated Bragg peak is left
-    intact (the raw display relies on a robust percentile level-clamp to avoid
-    blowing out — it never hides it).
+    ceiling captured from the raw dtype).  The fraction-guarded saturation
+    policy itself lives in :func:`xrd_tools.core.invalid.saturation_pixels`
+    (R3-C — shared with the integration path); here it only feeds the NaN fill
+    so the raw-display autoscale uses the real image range.  When disabled a
+    real saturated Bragg peak is left intact (the raw display relies on a robust
+    percentile level-clamp to avoid blowing out — it never hides it).
     """
     orig = np.asarray(arr)
     a = orig.astype(float)
@@ -672,13 +670,7 @@ def sentinel_mask(arr, mask_saturation=True, ceiling=None):
     if mask_saturation and a.size and np.isfinite(a).any():
         if ceiling is None:
             ceiling = integer_saturation_ceiling(orig)
-        # The uint32 ceiling is the always-on dead sentinel handled above; only
-        # the lower integer ceilings (uint16=65535, uint8=255, ...) are the
-        # ambiguous saturation gated by mask_saturation.
-        if ceiling is not None and float(ceiling) < _UINT32_CEILING:
-            sat = np.isfinite(a) & (a == float(ceiling))
-            if sat.any() and sat.sum() / a.size > 1e-4:
-                bad |= sat
+        bad |= _saturation_pixels(a, ceiling=ceiling)
     if bad.any():
         a = a.copy()
         a[bad] = np.nan

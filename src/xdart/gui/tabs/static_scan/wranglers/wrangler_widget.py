@@ -555,11 +555,14 @@ class wranglerThread(Qt.QtCore.QThread):
                 # pyFAI's CSR mask-CRC stays stable frame-to-frame.
                 if getattr(self, 'mask_sentinel', True):
                     from ..display_logic import integer_saturation_ceiling
-                    ceiling = integer_saturation_ceiling(arr0)
-                    if ceiling < 4294967295.0:   # uint32 already always-on above
-                        sat = (flat == float(ceiling))
-                        if sat.any() and sat.sum() / flat.size > 1e-4:
-                            bad |= sat
+                    from xrd_tools.core.invalid import saturation_pixels
+                    # Fraction-guarded ceiling exclusion — the SAME headless
+                    # policy the display uses (R3-C: xrd_tools.core.invalid).
+                    # Returns all-False for the uint32 ceiling (already always-on
+                    # above) and below the >1e-4 fraction guard, so a few
+                    # genuinely-saturated pixels are not masked.
+                    bad |= saturation_pixels(
+                        flat, ceiling=integer_saturation_ceiling(arr0))
                 cached = np.arange(flat.size)[bad]
             except (AttributeError, TypeError, ValueError) as e:
                 logger.debug("frame-mask compute failed: %s", e)

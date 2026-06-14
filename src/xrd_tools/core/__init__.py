@@ -38,6 +38,11 @@ from xrd_tools.core.containers import (
     PONI,
 )
 from xrd_tools.core.filters import compile_filter
+from xrd_tools.core.invalid import (
+    UINT32_CEILING,
+    integer_saturation_ceiling,
+    saturation_pixels,
+)
 from xrd_tools.core.frame_view import (
     Axis,
     FrameGeometry as ViewFrameGeometry,
@@ -128,6 +133,10 @@ __all__ = [
     "coerce_source_kind",
     "compile_filter",
     "numeric_metadata",
+    # detector invalid-pixel policy (R3-C)
+    "UINT32_CEILING",
+    "integer_saturation_ceiling",
+    "saturation_pixels",
     # HDF5 codec
     "arr_to_h5",
     "attributes_to_h5",

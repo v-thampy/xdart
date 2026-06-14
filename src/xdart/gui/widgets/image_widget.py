@@ -32,13 +32,20 @@ from pyqtgraph import getConfigOption
 QFileDialog = QtWidgets.QFileDialog
 
 
-# Detector ceilings that can dominate autoscale: the uint16 max (65535, a
-# saturated/overflow value) and the uint32 dead/hot sentinel.  When the
-# "Mask saturated" toggle is OFF these stay finite in the image, so excluding
-# them from the level POPULATION (never from the data) keeps a saturated block
-# from dragging the upper colour level up to the ceiling.
-_UINT16_CEIL = 65535.0
-_UINT32_CEIL = 4294967295.0
+# Detector ceilings that can dominate autoscale: the detector SATURATION
+# ceiling (np.iinfo(dtype).max — 65535 for uint16, derived from the raw dtype,
+# R3-D) and the uint32 dead/hot sentinel.  When the "Mask Saturated" toggle is
+# OFF these stay finite in the image, so excluding them from the level
+# POPULATION (never from the data) keeps a saturated block from dragging the
+# upper colour level up to the ceiling.
+from xrd_tools.core.invalid import (
+    UINT32_CEILING as _UINT32_CEIL,
+    integer_saturation_ceiling as _integer_saturation_ceiling,
+)
+
+#: legacy GUI fallback when the raw integer dtype was lost upstream (float
+#: frame); core never hardcodes 65535.
+_DEFAULT_SAT_CEIL = 65535.0
 
 
 def _ceiling_safe_levels(displayed, raw, pct):
@@ -47,21 +54,28 @@ def _ceiling_safe_levels(displayed, raw, pct):
 
     The ceiling mask is taken from the UNTRANSFORMED ``raw`` (``displayed`` may
     already be log/sqrt-transformed in place by the caller), so the test is
-    always against original counts.  Pixels are never modified — a saturated
-    65535 pixel still renders at the top of the colormap; only the autoscale
-    population drops it.  Falls back to the full finite population when every
-    finite pixel sits at the ceiling (an all-/mostly-saturated frame), avoiding
-    NaN levels and the 'autoscale to data min/max' regression.
+    always against original counts.  The saturation ceiling is DERIVED from the
+    raw integer dtype (R3-D — consistent with the integration path) rather than
+    hardcoding 65535; a float ``raw`` whose dtype was lost upstream falls back
+    to 65535.  Pixels are never modified — a saturated ceiling pixel still
+    renders at the top of the colormap; only the autoscale population drops it.
+    Falls back to the full finite population when every finite pixel sits at the
+    ceiling (an all-/mostly-saturated frame), avoiding NaN levels and the
+    'autoscale to data min/max' regression.
     """
     disp = np.asarray(displayed, dtype=float)
     finite = np.isfinite(disp)
     if not finite.any():
         return (0.0, 1.0)
     pop_mask = finite
-    raw_a = np.asarray(raw, dtype=float)
+    raw_arr = np.asarray(raw)
+    sat_ceil = _integer_saturation_ceiling(raw_arr)
+    if sat_ceil is None:
+        sat_ceil = _DEFAULT_SAT_CEIL
+    raw_a = raw_arr.astype(float)
     if raw_a.shape == disp.shape:
         ceiling = np.isfinite(raw_a) & (
-            (raw_a == _UINT16_CEIL) | (raw_a >= _UINT32_CEIL))
+            (raw_a == sat_ceil) | (raw_a >= _UINT32_CEIL))
         if ceiling.any() and (finite & ~ceiling).any():
             pop_mask = finite & ~ceiling
     lo, hi = np.nanpercentile(disp[pop_mask], pct)

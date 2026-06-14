@@ -59,3 +59,28 @@ def test_all_nonfinite_returns_unit_range():
     out = _ceiling_safe_levels(np.full((4, 4), np.nan), np.full((4, 4), np.nan),
                                (2, 98))
     assert out == (0.0, 1.0)
+
+
+def test_ceiling_derived_from_integer_dtype_not_hardcoded():
+    """R3-D: the saturation ceiling is taken from the raw INTEGER dtype, not a
+    hardcoded 65535.  A uint8 frame's 255 ceiling must be excluded from the
+    autoscale population (the old hardcoded ==65535 missed it and let the 255
+    block blow out the scale)."""
+    raw8 = np.full((100, 100), 10, dtype=np.uint8)
+    raw8[:28, :] = 255                      # 28% at the uint8 ceiling
+    _, hi = _ceiling_safe_levels(raw8.astype(float), raw8, (2, 98))
+    assert hi < 200.0                       # driven by the ~10 background, not 255
+    # uint16 integer dtype still derives 65535 (same value, now dtype-driven).
+    raw16 = np.full((100, 100), 100, dtype=np.uint16)
+    raw16[:28, :] = 65535
+    _, hi16 = _ceiling_safe_levels(raw16.astype(float), raw16, (2, 98))
+    assert hi16 < 1000.0
+
+
+def test_float_raw_falls_back_to_65535_ceiling():
+    """When the integer dtype was lost upstream (float raw), the legacy 65535
+    GUI fallback still excludes a 65535 block — behaviour preserved."""
+    raw = np.full((100, 100), 100.0)        # float — dtype-derived ceiling is None
+    raw[:28, :] = 65535.0
+    _, hi = _ceiling_safe_levels(raw, raw, (2, 98))
+    assert hi < 1000.0
