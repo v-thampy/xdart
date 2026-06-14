@@ -14,7 +14,8 @@ from types import SimpleNamespace
 import numpy as np
 
 from xrd_tools.core.containers import IntegrationResult1D
-from xrd_tools.reduction import Frame, ReductionPlan, ReductionSession, Scan
+from xrd_tools.reduction import Frame, ReductionPlan, Scan
+from xrd_tools.session import ScanSession
 import xrd_tools.reduction.core as reduction_core
 from xdart.gui.tabs.static_scan.wranglers.scan_session import ScanSessionAdapter
 
@@ -67,14 +68,18 @@ class _DuckSink:
 
 
 def _adapter(sink, *, host=None, n_workers=2):
-    session = ReductionSession(
-        ReductionPlan(integration_2d=None),
-        Scan("a", [Frame(0, image=np.zeros((2, 2)))], integrator=object()),
-        sink=sink, execution="streaming", executor=n_workers,
+    # codex P2: drive the adapter through the PUBLIC xrd_tools.session.ScanSession
+    # (the production object after the 4f-bridge), not a bare ReductionSession,
+    # so wrapper-specific behaviour (_EventSink hook forwarding, submit()->bool,
+    # flush contract, pause/resume) is exercised by the contract tests.
+    scan = Scan("a", [Frame(0, image=np.zeros((2, 2)))], integrator=object())
+    session = ScanSession(
+        ReductionPlan(integration_2d=None), scan,
+        sink=sink, executor=n_workers,
     )
     host = host or SimpleNamespace(showLabel=SimpleNamespace(emit=lambda m: None),
                                    command_lock=threading.RLock(), command='start')
-    return ScanSessionAdapter(host, session.scan, session, sink), session, host
+    return ScanSessionAdapter(host, scan, session, sink), session, host
 
 
 def test_adapter_submits_all_frames(monkeypatch):
@@ -141,7 +146,7 @@ def test_adapter_unregisters_a_dropped_frame(monkeypatch):
                         lambda image, ai, **kw: _r1d(float(np.sum(image))))
     sink = _DuckSink()
     adapter, session, _ = _adapter(sink)
-    session.cancel_token.cancel()                # the next submit is dropped
+    session.stop()                               # cooperative cancel -> next submit dropped
     assert adapter.submit(_live(0)) is False     # dropped, no raise
     assert 0 in sink.registered                  # it WAS registered first...
     assert 0 in sink.unregistered                # ...then rolled back

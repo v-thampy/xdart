@@ -124,10 +124,12 @@ class ScanSessionAdapter:
         return self._session.pause(timeout=timeout)
 
     def flush(self) -> None:
-        """Force the sink's incremental flush (streaming pause/finish).  The
-        h5pool bracket lives inside the public QtNexusSink.flush, on the writer
-        thread — unmoved."""
-        self._sink.flush(force=True)
+        """Force an incremental flush through the PUBLIC ``ScanSession.flush``
+        contract (codex P3): session → ``_EventSink`` → ``QtNexusSink.flush``,
+        whose h5pool bracket runs on the writer thread — unmoved.  Routing
+        through the session (not ``self._sink`` directly) keeps xdart thin over
+        the public session API."""
+        self._session.flush(force=True)
 
     def resume(self) -> None:
         """Re-allow submit() after a pause (delegates to
