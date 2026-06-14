@@ -115,6 +115,10 @@ class PrepareDiagnostics:
     status: str                            # "frozen" | "skip" | "unverifiable"
     reason: str = ""
     scout_indices: tuple[int, ...] = ()
+    # NOTE: the field below was RENAMED `scout_refs` -> `scout_metadata` and made
+    # deeply immutable in the round-2 review fix (see the "Corrections" entry at
+    # the end of this ADR).  The sketch in this section is the original proposal;
+    # the shipped code uses `scout_metadata: tuple[MappingProxyType, ...]`.
     scout_refs: tuple[Mapping[str, Any], ...] = ()  # resolved source refs for the
                                                     # extremes (path/file-number/meta),
                                                     # so the caller's loader is a plain

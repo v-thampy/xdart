@@ -104,6 +104,23 @@ pre-migration reference signature.  Two additive notes:
    `xrd-tools` version (a clean two-repo-era install recorded the old
    `xdart` dist version; a monorepo install without this fix recorded
    `''`/`0.0.0+unknown`).
+9. **Detector-saturation masking ("Mask Saturated", default ON).** Pixels at
+   the integer detector ceiling (`np.iinfo(dtype).max` — 65535 for uint16,
+   derived from the raw dtype) are masked from BOTH the raw display and the
+   INTEGRATION, when at least `1e-4` of the frame sits exactly at the ceiling
+   (so a handful of legitimately-saturated Bragg pixels are NOT masked — only a
+   dead/overflowed block is).  This is a behavior change for uint16 detectors
+   that emit 65535 as an overflow sentinel: their integrated patterns no longer
+   carry that contamination by default.  Saturated counts are clipped/unreliable
+   anyway, but if you need them included, untick **Mask Saturated** in the
+   Intensity-Threshold area.  Non-finite and the uint32 ceiling (Eiger dummy)
+   stay always-masked; negatives are masked on the RAW frame before background
+   subtraction only.  Applied identically across live/batch/reload (one
+   `_resolve_frame_mask`, spine-verified).
+10. **GI 1D empty bins are NaN** (not 0).  The GI output-axis freeze keeps a
+   small coverage pad; the empty bins it (or a masked gap) creates are now
+   NaN-filled — so they don't plot/aggregate as a spurious flat line at the
+   low/high edge.  Aggregations are NaN-aware (`nanmean`/`nansum`).
 
 ## Stage-6 redesign items: done vs deferred
 
