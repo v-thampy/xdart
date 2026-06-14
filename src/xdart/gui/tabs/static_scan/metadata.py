@@ -79,8 +79,11 @@ class metadataWidget(Qt.QtWidgets.QWidget):
             sel_int = sel
 
         with self.data_lock:
-            if self.data_1d is not None and sel_int in self.data_1d:
-                return self.data_1d[sel_int]
+            # Phase 3c: the publication store (consulted FIRST in update()) is
+            # the metadata source for every mode now — live integration AND the
+            # Image/XYE/NeXus viewers all mirror their selected-row metadata into
+            # it.  This frame fallback reads only the in-memory ``frames`` browse
+            # cache; the ``data_1d`` mirror is no longer consulted here.
             if sel_int in self.frames:
                 return self.frames[sel_int]
         # Fallback to the placeholder if it's been populated for this

@@ -2796,11 +2796,19 @@ def test_metadata_panel_nexus_viewer_uses_selected_row_not_scan_table():
     from PySide6.QtCore import QModelIndex
     from xdart.gui.tabs.static_scan.metadata import metadataWidget
 
+    from xdart.modules.frame_publication import (
+        PublicationStore, publication_from_frame_view)
+    from xrd_tools.core import FrameView, numeric_metadata
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    frame = SimpleNamespace(
-        idx=3,
-        scan_info={"kind": "dataset", "path": "/entry/data", "_attrs": {"hidden": True}},
-    )
+    # Phase 3c: the NeXus viewer mirrors the selected row's metadata into the
+    # publication store; the metadata panel reads it store-first.
+    info = {"kind": "dataset", "path": "/entry/data", "_attrs": {"hidden": True}}
+    store = PublicationStore()
+    store.upsert(publication_from_frame_view(
+        FrameView.from_results(
+            label=3, metadata_raw=info, metadata_numeric=numeric_metadata(info)),
+        generation=store.generation))
     scan = SimpleNamespace(
         scan_data=pd.DataFrame({"stale_scan_value": [1.0]}, index=[3]),
     )
@@ -2809,7 +2817,7 @@ def test_metadata_panel_nexus_viewer_uses_selected_row_not_scan_table():
         None,
         ["3"],
         {},
-        data_1d={3: frame},
+        publication_store=store,
         data_lock=RLock(),
     )
     mw.viewer_mode = "nexus"
