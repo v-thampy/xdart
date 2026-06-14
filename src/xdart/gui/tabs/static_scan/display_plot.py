@@ -535,6 +535,26 @@ class DisplayPlotMixin:
 
     # ── Waterfall rendering ───────────────────────────────────────
 
+    def _frame_scan_info(self, idx):
+        """Phase 3c: a frame's metadata (``scan_info``), store-first.
+
+        Reads the publication's ``metadata_raw`` (the store holds every frame's
+        1D publication in its unbounded light tier, so a whole-scan waterfall is
+        covered), falling back to the in-memory ``frames`` browse cache then the
+        legacy ``data_1d`` mirror.  Returns ``{}`` when nothing is found."""
+        idx = int(idx)
+        store = getattr(self, 'publication_store', None)
+        if store is not None:
+            pub = store.get(idx)
+            if pub is not None and pub.metadata_raw:
+                return pub.metadata_raw
+        frames = getattr(self, 'frames', None)
+        fr = frames.get(idx) if hasattr(frames, 'get') else None
+        if fr is None:
+            d1 = getattr(self, 'data_1d', None)
+            fr = d1.get(idx) if hasattr(d1, 'get') else None
+        return getattr(fr, 'scan_info', None) or {}
+
     def _wf_y_axis(self, n_rows: int):
         """Compute the waterfall y-axis array.
 
@@ -562,19 +582,19 @@ class DisplayPlotMixin:
         try:
             if self.wf_yaxis == 'Time (s)':
                 s_ydata = np.asarray(
-                    [self.data_1d[idx].scan_info['epoch']
+                    [self._frame_scan_info(idx)['epoch']
                      for idx in self.idxs]
                 )
                 s_ydata -= s_ydata.min()
             elif self.wf_yaxis == 'Time (minutes)':
                 s_ydata = np.asarray(
-                    [self.data_1d[idx].scan_info['epoch']
+                    [self._frame_scan_info(idx)['epoch']
                      for idx in self.idxs]
                 ) / 60.
                 s_ydata -= s_ydata.min()
             else:
                 s_ydata = np.asarray(
-                    [self.data_1d[idx].scan_info[self.wf_yaxis]
+                    [self._frame_scan_info(idx)[self.wf_yaxis]
                      for idx in self.idxs]
                 )
             return s_ydata[self.wf_start:self.wf_stop:self.wf_step]
@@ -746,10 +766,9 @@ class DisplayPlotMixin:
         elif self.wf_yaxis_widget.count() <= 3 and self.idxs_1d:
             # Dialog was first built with no trace loaded -- top up the
             # waterfall y-axis choices with the now-available metadata.
-            frame = self.data_1d.get(self.idxs_1d[0])
-            if frame is not None:
-                self.wf_yaxis_widget.addItems(
-                    list(getattr(frame, 'scan_info', {}) or {}))
+            info = self._frame_scan_info(self.idxs_1d[0])
+            if info:
+                self.wf_yaxis_widget.addItems(list(info))
 
         self.wf_dialog.show()
 
@@ -809,9 +828,7 @@ class DisplayPlotMixin:
         # metadata counters are topped up on later opens (popup_wf_options).
         counters = ['Frame #', 'Time (s)', 'Time (minutes)']
         if self.idxs_1d:
-            frame = self.data_1d.get(self.idxs_1d[0])
-            if frame is not None:
-                counters += list(getattr(frame, 'scan_info', {}) or {})
+            counters += list(self._frame_scan_info(self.idxs_1d[0]))
         self.wf_yaxis_widget.addItems(counters)
 
         self.wf_start_widget.setDecimals(0)
@@ -985,11 +1002,16 @@ class DisplayPlotMixin:
             wid = self.ui.slice_width.value()
             _range = np.array([cen - wid, cen + wid])
 
-            try:
-                frame_for_wl = self.data_1d[self.idxs_1d[0]]
-            except (IndexError, KeyError):
+            # Phase 3c: wavelength is a scan constant, so source the frame for
+            # _get_wavelength from the in-memory frames cache (not data_1d); it
+            # falls back to the scan-level / NeXus wavelength when the frame
+            # isn't resident, so no per-frame data_1d entry is needed.
+            if not self.idxs_1d:
                 self.update_plot()
                 return
+            frames = getattr(self, 'frames', None)
+            frame_for_wl = (frames.get(self.idxs_1d[0])
+                            if hasattr(frames, 'get') else None)
             wavelength = self._get_wavelength(frame_for_wl)
             if wavelength is None or wavelength <= 0:
                 self.update_plot()
