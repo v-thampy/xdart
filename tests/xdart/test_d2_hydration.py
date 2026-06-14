@@ -1,0 +1,103 @@
+# -*- coding: utf-8 -*-
+"""Greenfield Phase 3 / D2: the displayFrameWidget rehydration source + the
+request plumbing that feeds the background FrameHydrationWorker.
+
+The worker thread itself is covered by test_frame_hydration_worker.py; here we
+test, headlessly, that (a) _rehydrate_publication turns an evicted disk frame
+into a heavy publication, (b) the shared store rehydrates through it, and (c)
+the GUI render path only queues a background request when async hydration was
+explicitly enabled (off in headless tests -> synchronous reads preserved)."""
+from types import SimpleNamespace, MethodType
+
+import numpy as np
+
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xdart.gui.tabs.static_scan.display_data import DisplayDataMixin
+from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+from xdart.modules.frame_publication import PublicationStore
+
+
+class _DuckFrame:
+    """Minimal LiveFrame-like accepted by publication_from_live_frame."""
+
+    def __init__(self, idx=1):
+        self.idx = idx
+        self.gi = False
+        self.scan_info = {"th": 0.25, "monitor": 100.0}
+        self.source_file = "raw_0001.tif"
+        self.source_frame_idx = 0
+        self.map_raw = np.arange(16, dtype=float).reshape(4, 4)
+        self.thumbnail = np.arange(4, dtype=float).reshape(2, 2)
+        self.int_1d = IntegrationResult1D(
+            radial=np.linspace(0.5, 3.0, 6),
+            intensity=np.linspace(10.0, 20.0, 6),
+            sigma=np.ones(6), unit="q_A^-1")
+        self.int_2d = IntegrationResult2D(
+            radial=np.linspace(0.5, 3.0, 4),
+            azimuthal=np.linspace(-90.0, 90.0, 3),
+            intensity=np.ones((4, 3)), unit="q_A^-1", azimuthal_unit="chi_deg")
+
+    def _get_incident_angle(self):
+        return float(self.scan_info["th"])
+
+
+def _hydrator_holder(disk_frame, store=None):
+    h = SimpleNamespace(publication_store=store or PublicationStore())
+    h._hydrate_frame_from_disk = lambda idx, **kw: disk_frame
+    h._rehydrate_publication = MethodType(
+        DisplayDataMixin._rehydrate_publication, h)
+    return h
+
+
+def test_rehydrate_publication_builds_heavy_from_disk():
+    h = _hydrator_holder(_DuckFrame(idx=3))
+    pub = h._rehydrate_publication(3)
+    assert pub is not None
+    assert pub.view.intensity_1d is not None
+    assert pub.view.intensity_2d is not None
+    assert pub.view.raw is not None           # include_raw=True
+
+
+def test_rehydrate_returns_none_on_disk_miss():
+    h = _hydrator_holder(None)                # disk read found nothing
+    assert h._rehydrate_publication(9) is None
+
+
+def test_store_get_or_hydrate_uses_registered_rehydrator():
+    store = PublicationStore()
+    h = _hydrator_holder(_DuckFrame(idx=7), store=store)
+    store.set_hydrator(h._rehydrate_publication)
+    # nothing resident for 7 -> the store pulls it through the rehydrator
+    pub = store.get_or_hydrate(7)
+    assert pub is not None and pub.view.intensity_2d is not None
+    # and now it is resident (a second call needs no hydration)
+    assert store.get(7) is not None
+
+
+def test_request_frame_hydration_respects_enabled_flag():
+    calls = []
+    fake_worker = SimpleNamespace(request=lambda label, gen: calls.append((label, gen)))
+    h = SimpleNamespace(_async_hydration_enabled=False, display_generation=5)
+    h._ensure_hydration_worker = lambda: fake_worker
+    h._request_frame_hydration = MethodType(
+        displayFrameWidget._request_frame_hydration, h)
+
+    h._request_frame_hydration(3)
+    assert calls == []                        # disabled -> no background work
+
+    h._async_hydration_enabled = True
+    h._request_frame_hydration(3)
+    assert calls == [(3, 5)]                  # enabled -> queued with generation
+
+
+def test_on_frame_hydrated_drops_stale_generation():
+    rendered = []
+    h = SimpleNamespace(display_generation=7)
+    h.update = lambda: rendered.append(True)
+    h._on_frame_hydrated = MethodType(
+        displayFrameWidget._on_frame_hydrated, h)
+
+    h._on_frame_hydrated(4, 6)                 # stale (gen 6 != 7) -> dropped
+    assert rendered == []
+    h._on_frame_hydrated(4, 7)                 # current -> re-render
+    assert rendered == [True]

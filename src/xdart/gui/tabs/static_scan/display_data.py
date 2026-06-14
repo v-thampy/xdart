@@ -142,7 +142,7 @@ class DisplayDataMixin:
                 for idx in idxs
             }
 
-    def _hydrate_frame_from_disk(self, idx):
+    def _hydrate_frame_from_disk(self, idx, *, allow_blocking_read=True):
         """Lazy-load a frame from the scan for a ``data_2d`` cache miss.
 
         ``data_2d`` is a bounded window (``FixSizeOrderedDict(max=20)``), so a
@@ -173,12 +173,61 @@ class DisplayDataMixin:
         if getattr(self, '_processing_active', False):
             in_mem = getattr(frames, '_in_memory', None)
             return in_mem.get(int(idx)) if isinstance(in_mem, dict) else None
+        if not allow_blocking_read:
+            # D2 (greenfield Phase 3): the GUI render thread must NOT open the
+            # .nxs here — that synchronous catch_h5py_file open is the ~5 s
+            # scroll-back / Set-Bkg freeze.  Serve only a resident in-memory
+            # frame; an evicted frame is rehydrated OFF-thread by the
+            # FrameHydrationWorker (which calls this with the default
+            # allow_blocking_read=True), and the panel repaints on completion.
+            in_mem = getattr(frames, '_in_memory', None)
+            return in_mem.get(int(idx)) if isinstance(in_mem, dict) else None
         try:
             if int(idx) not in frames.index:
                 return None
             return frames[int(idx)]
         except (KeyError, RuntimeError, OSError, ValueError, TypeError):
             logger.debug("hydrate frame %s from disk failed", idx, exc_info=True)
+            return None
+
+    def _rehydrate_publication(self, label):
+        """D2 hydrator for the shared :class:`PublicationStore` (greenfield
+        Phase 3): read an evicted frame from ``scan.frames`` / the ``.nxs`` and
+        build a heavy :class:`FramePublication` (cake + full raw).
+
+        Registered via ``store.set_hydrator`` and invoked by
+        ``store.get_or_hydrate`` — from the BACKGROUND
+        :class:`FrameHydrationWorker` thread, NEVER the GUI thread (the ``.nxs``
+        open is the ~5 s scroll-back / Set-Bkg freeze this whole machinery
+        exists to move off the GUI thread).  Returns ``None`` on a miss (the
+        store keeps whatever lighter/thumbnail-tier publication it had).  During
+        an active run ``_hydrate_frame_from_disk`` serves only the writer's
+        resident in-memory frames (lock-free), so this never contends with the
+        live writer for the file.
+        """
+        try:
+            lf = self._hydrate_frame_from_disk(int(label))
+        except Exception:
+            logger.debug("rehydrate: disk read failed for %s", label,
+                         exc_info=True)
+            return None
+        if lf is None:
+            return None
+        if getattr(lf, 'map_raw', None) is None:
+            try:
+                lf._lazy_load_raw()
+            except Exception:
+                logger.debug("rehydrate: lazy raw failed for %s", label,
+                             exc_info=True)
+        store = getattr(self, 'publication_store', None)
+        generation = store.generation if store is not None else 0
+        try:
+            from xdart.modules.frame_publication import publication_from_live_frame
+            return publication_from_live_frame(
+                lf, generation=generation, include_raw=True)
+        except Exception:
+            logger.debug("rehydrate: publication build failed for %s", label,
+                         exc_info=True)
             return None
 
     # ── Raw 2D data access ────────────────────────────────────────
@@ -245,7 +294,15 @@ class DisplayDataMixin:
                      or (not prefer_thumbnail and len(idxs) == 1))
             )
             if _want_hydrate:
-                lf = _hydrate(int(idx))
+                # D2: when async hydration is enabled (live app), never block the
+                # GUI thread on the .nxs open — serve a resident frame only and
+                # queue the evicted one for the background worker (the panel keeps
+                # its thumbnail and repaints on completion).  Headless/sync: full
+                # blocking read as before.
+                _async = getattr(self, '_async_hydration_enabled', False)
+                lf = _hydrate(int(idx), allow_blocking_read=not _async)
+                if lf is None and _async:
+                    self._request_frame_hydration(int(idx))
                 if lf is not None:
                     if getattr(lf, 'map_raw', None) is None:
                         try:

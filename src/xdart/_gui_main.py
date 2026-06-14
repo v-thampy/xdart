@@ -81,6 +81,14 @@ class Main(QMainWindow):
         # The widget chooses its own scratch directory via get_fname_dir().
         self.main_widget = tabs.static_scan.staticWidget()
         self.setCentralWidget(self.main_widget)
+        # D2 (greenfield Phase 3): in the live app, rehydrate evicted frames off
+        # the GUI thread so scroll-back no longer freezes on a ~5 s .nxs open.
+        # Done here (not in widget construction) so headless widget tests keep
+        # their synchronous reads.
+        try:
+            self.main_widget.enable_async_hydration()
+        except Exception:
+            pass
 
         # Default size: 90% of the available screen, centered (was a fixed
         # 1600x920, whose width clamped the middle display panels below

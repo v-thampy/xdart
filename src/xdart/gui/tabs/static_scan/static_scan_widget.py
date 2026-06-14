@@ -913,6 +913,18 @@ class staticWidget(QWidget):
             if callable(apply):
                 apply()
 
+    def enable_async_hydration(self):
+        """Turn on off-GUI-thread rehydration of evicted frames (D2, greenfield
+        Phase 3).  Called by the live app entry (``_gui_main``) — NOT during
+        construction — so headless widget tests keep the synchronous blocking
+        reads their assertions expect.  Idempotent + defensive."""
+        try:
+            df = getattr(self, 'displayframe', None)
+            if df is not None and hasattr(df, 'enable_async_hydration'):
+                df.enable_async_hydration()
+        except Exception:
+            logger.debug("enable_async_hydration failed", exc_info=True)
+
     def close(self):
         """Tries a graceful close.
         """
@@ -970,6 +982,15 @@ class staticWidget(QWidget):
                 h5v.shutdown_threads()
         except Exception:
             logger.debug("background-thread shutdown on close failed",
+                         exc_info=True)
+        # D2 (greenfield Phase 3): stop the off-thread frame-hydration worker
+        # before teardown (same "destroyed while running" guard as above).
+        try:
+            df = getattr(self, 'displayframe', None)
+            if df is not None and hasattr(df, 'stop_hydration_worker'):
+                df.stop_hydration_worker()
+        except Exception:
+            logger.debug("hydration-worker shutdown on close failed",
                          exc_info=True)
         del self.scan
         del self.displayframe.scan

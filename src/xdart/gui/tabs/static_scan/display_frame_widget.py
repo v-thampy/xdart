@@ -426,6 +426,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # scan/file load — so a worker result computed against an old
         # generation can be dropped (full enforcement lands in Stage 5).
         self.display_generation = 0
+        # D2 (greenfield Phase 3): off-GUI-thread rehydration of evicted frames.
+        # The store reads an evicted frame's heavy payload through THIS widget's
+        # disk reader; the background worker calls it off the GUI thread.  Async
+        # is OFF by default (synchronous blocking reads — preserves the headless
+        # test behaviour); the live app turns it on via enable_async_hydration().
+        self._hydration_worker = None
+        self._async_hydration_enabled = False
+        if self.publication_store is not None:
+            try:
+                self.publication_store.set_hydrator(self._rehydrate_publication)
+            except Exception:
+                logger.debug("set_hydrator failed", exc_info=True)
         # True once an empty/no-data update has blanked all panels; reset
         # when a data render draws.  Lets update() no-op on repeated empty
         # updates instead of re-clearing every time.
@@ -658,6 +670,57 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         enforcement: Stage 5)."""
         self.display_generation += 1
         return self.display_generation
+
+    # ── D2: off-GUI-thread frame hydration (greenfield Phase 3) ──────────────
+    def enable_async_hydration(self) -> None:
+        """Turn on background rehydration of evicted frames (live app only).
+
+        Headless tests leave this OFF so the render path keeps its synchronous
+        blocking reads (their assertions expect data on the first render); the
+        live app calls this once so scroll-back / Set-Bkg no longer freeze the
+        GUI thread on a ~5 s ``.nxs`` open."""
+        self._async_hydration_enabled = True
+        self._ensure_hydration_worker()
+
+    def _ensure_hydration_worker(self):
+        if self._hydration_worker is None and self.publication_store is not None:
+            from .frame_hydration_worker import FrameHydrationWorker
+            worker = FrameHydrationWorker(self.publication_store, parent=self)
+            worker.sigHydrated.connect(self._on_frame_hydrated)
+            worker.start()
+            self._hydration_worker = worker
+        return self._hydration_worker
+
+    def _request_frame_hydration(self, label) -> None:
+        """Queue a background rehydration for an evicted frame (no-op unless the
+        live app enabled async hydration)."""
+        if not self._async_hydration_enabled:
+            return
+        worker = self._ensure_hydration_worker()
+        if worker is not None:
+            worker.request(label, self.display_generation)
+
+    def _on_frame_hydrated(self, label, generation) -> None:
+        """A background hydration finished: the heavy payload is now resident in
+        the store.  Drop a stale result (the selection/mode moved on), else
+        re-render so the panel upgrades from its thumbnail to the full frame."""
+        if int(generation) != self.display_generation:
+            return
+        try:
+            self.update()
+        except Exception:
+            logger.debug("re-render after hydration failed for %s", label,
+                         exc_info=True)
+
+    def stop_hydration_worker(self) -> None:
+        """Stop + join the background worker (idempotent; call at teardown)."""
+        worker = self._hydration_worker
+        self._hydration_worker = None
+        if worker is not None:
+            try:
+                worker.stop()
+            except Exception:
+                logger.debug("hydration worker stop failed", exc_info=True)
 
     def _note_selection_generation(self):
         """Bump the generation when the *effective* selection changes.
