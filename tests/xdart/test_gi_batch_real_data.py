@@ -181,9 +181,8 @@ def _build_batch_thread(poni, mask, *, incidence_motor="th",
     # bind it + its helpers.  With no source attrs on this rig, _enumerate_scan_files
     # returns [] so the pre-pass is a no-op (the chunk-local freeze is unchanged).
     for _m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
-               "_enumerate_scan_files"):
+               "_frame_source_for", "_enumerate_scan_files"):
         setattr(w, _m, MethodType(getattr(imageThread, _m), w))
-    w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
     # Spy on the xye flush: snapshot the Phase-1 integrated frames rather
     # than writing xye files (and don't clear the buffer).
     captured = {}
@@ -973,9 +972,9 @@ def test_gi_streaming_prepass_scouts_whole_scan_extremes():
         get_background=lambda *a, **k: 0.0,
     )
     w._enumerate_scan_files = MethodType(imageThread._enumerate_scan_files, w)
+    w._frame_source_for = MethodType(imageThread._frame_source_for, w)
     w._gi_whole_scan_scout_entries = MethodType(
         imageThread._gi_whole_scan_scout_entries, w)
-    w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta  # staticmethod
 
     # (1) The whole-scan metadata sweep finds the two incidence EXTREMES
     #     (th 0.15 = frame 1, th 0.35 = frame 5) and loads their images.
@@ -1011,6 +1010,87 @@ def test_gi_streaming_prepass_scouts_whole_scan_extremes():
         "chunk-1-only freeze unexpectedly covers frame 5 -- test can't catch the bug"
 
 
+def test_frame_source_for_rejects_neighbour_files(tmp_path):
+    r"""ADR-0006 STEP 2: the strict factory anchors on ``^{scan}_\d+\.{ext}$``
+    (NOT ``TiffSeriesSource.from_directory``).  Neighbour scans, background
+    frames, and non-numeric / wrong-extension siblings sharing the folder must
+    be EXCLUDED so the headless manifest sweeps only THIS scan's frames -- a
+    directory sweep would scoop them up and skew the incidence extremes."""
+    from types import SimpleNamespace, MethodType
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+    from xrd_tools.sources.image import TiffSeriesSource
+
+    keep = ["scan_0001.tif", "scan_0002.tif", "scan_0010.tif"]  # natural-int order
+    decoys = [
+        "scan_bg.tif",          # no numeric suffix
+        "scan_0001_dark.tif",   # suffix is not pure digits
+        "otherscan_0001.tif",   # different scan stem
+        "scan_0003.txt",        # wrong extension
+        "scan.tif",             # bare stem, no _<n>
+    ]
+    for name in keep + decoys:
+        (tmp_path / name).touch()
+
+    w = SimpleNamespace(
+        single_img=False, inp_type=None,
+        img_file=str(tmp_path / "scan_0001.tif"),
+        img_dir=str(tmp_path), scan_name="scan", img_ext="tif",
+        meta_ext="txt", meta_dir=str(tmp_path),
+    )
+    for m in ("_frame_source_for", "_enumerate_scan_files"):
+        setattr(w, m, MethodType(getattr(imageThread, m), w))
+
+    source = w._frame_source_for(None)
+    assert isinstance(source, TiffSeriesSource)
+    got = [Path(p).name for p in source.files]
+    assert got == keep, f"strict factory admitted neighbour files: {got}"
+
+
+def test_gi_prepass_scout_indices_map_back_to_noncontiguous_files(tmp_path):
+    """Codex gate: a :class:`TiffSeriesSource` labels frames by POSITION
+    (1..N) in the strict file list, so ``prepare_gi_freeze`` returns POSITIONAL
+    scout indices.  With NON-contiguous, non-1-based on-disk numbering
+    (recon_0003 / 0007 / 0012) the scout entries must carry the REAL on-disk
+    img_numbers (3, 12), not the positional source indices (1, 3).  The
+    contiguous Combi4 fixture (index == number) can't catch this confusion on
+    its own, so the equivalence spine alone is a paper gate for the factory."""
+    import shutil
+    from types import SimpleNamespace, MethodType
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    src_scan = "Combi4_Angledependence_samz_4p9_03271002"
+    # th 0.15 (global LO), 0.25 (mid), 0.35 (global HI), renumbered apart.
+    renames = [("0001", "0003"), ("0003", "0007"), ("0005", "0012")]
+    for src_n, dst_n in renames:
+        shutil.copy(TIFF / f"{src_scan}_{src_n}.tif", tmp_path / f"recon_{dst_n}.tif")
+        shutil.copy(TIFF / f"{src_scan}_{src_n}.txt", tmp_path / f"recon_{dst_n}.txt")
+
+    w = SimpleNamespace(
+        incidence_motor="th", single_img=False, inp_type=None,
+        img_file=str(tmp_path / "recon_0003.tif"),
+        img_dir=str(tmp_path), scan_name="recon", img_ext="tif",
+        meta_ext="txt", meta_dir=str(tmp_path),
+        get_background=lambda *a, **k: 0.0,
+    )
+    for m in ("_frame_source_for", "_enumerate_scan_files",
+              "_gi_whole_scan_scout_entries"):
+        setattr(w, m, MethodType(getattr(imageThread, m), w))
+
+    status, entries = w._gi_whole_scan_scout_entries(None)
+    assert status == "freeze"
+    assert len(entries) == 2
+    nums = sorted(e[1] for e in entries)
+    assert nums == [3, 12], (
+        "scout entries must carry the REAL on-disk img_numbers (3, 12), not the "
+        f"positional source indices (1, 3); got {nums}")
+    by_num = {e[1]: e for e in entries}
+    # each scout loaded its 2D image and kept the matching incidence metadata
+    assert np.asarray(by_num[3][2]).ndim == 2
+    assert np.asarray(by_num[12][2]).ndim == 2
+    assert float(by_num[3][3]["th"]) == 0.15    # lo scout == recon_0003
+    assert float(by_num[12][3]["th"]) == 0.35   # hi scout == recon_0012
+
+
 def test_gi_prepass_warns_and_proceeds_on_unestablishable_range():
     """T0-4 policy: when a multi-file scan's whole-scan incidence range CANNOT
     be established from metadata (>=2 files but no readable incidence), the
@@ -1033,9 +1113,9 @@ def test_gi_prepass_warns_and_proceeds_on_unestablishable_range():
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
     for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
-              "_enumerate_scan_files", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze"):
+              "_frame_source_for", "_enumerate_scan_files", "_abort_gi_prepass",
+              "_warn_gi_first_chunk_freeze"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
-    w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
 
     # The sweep finds the 5 files but resolves no incidence for any -> "abort".
     status, entries = w._gi_whole_scan_scout_entries(None)
@@ -1071,9 +1151,9 @@ def test_gi_prepass_warns_and_proceeds_on_image_directory_source():
         showLabel=SimpleNamespace(emit=lambda m: emitted.append(m)),
     )
     for m in ("_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
-              "_enumerate_scan_files", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze"):
+              "_frame_source_for", "_enumerate_scan_files", "_abort_gi_prepass",
+              "_warn_gi_first_chunk_freeze"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
-    w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
 
     # Image-Directory with a non-fixed motor -> "unverifiable" (can't sweep).
     status, entries = w._gi_whole_scan_scout_entries(None)
@@ -1154,7 +1234,7 @@ def test_gi_prepass_warns_when_ranges_partially_pinned():
     w = _pinned_prepass_holder(emitted)
     # Restore the real scout path (the holder's raises) + its dependencies:
     # Image-Directory + non-fixed motor -> "unverifiable".
-    for m in ("_gi_whole_scan_scout_entries", "_enumerate_scan_files"):
+    for m in ("_gi_whole_scan_scout_entries", "_frame_source_for", "_enumerate_scan_files"):
         setattr(w, m, MethodType(getattr(imageThread, m), w))
     key_1d = gi_1d_output_axis_key("q_total")
     scan = SimpleNamespace(
@@ -1254,9 +1334,9 @@ def test_gi_streaming_multichunk_later_chunk_uses_whole_scan_grid():
         wranglerThread._close_reduction_session, w)
     for meth in ("_dispatch_batch_streaming", "_get_streaming_session",
                  "_gi_freeze_whole_scan_prepass", "_gi_ranges_fully_pinned", "_gi_whole_scan_scout_entries",
-                 "_enumerate_scan_files", "_abort_gi_prepass", "_warn_gi_first_chunk_freeze", "_wait_if_paused"):
+                 "_frame_source_for", "_enumerate_scan_files", "_abort_gi_prepass",
+                 "_warn_gi_first_chunk_freeze", "_wait_if_paused"):
         setattr(w, meth, MethodType(getattr(imageThread, meth), w))
-    w._resolve_incidence_from_meta = imageThread._resolve_incidence_from_meta
 
     scan = _make_scan(
         poni, mask, {"gi_mode_1d": gi_mode_1d, "numpoints": 128},

@@ -58,7 +58,15 @@ from pyqtgraph import Qt
 from xdart.modules.live import LiveFrame, LiveScan, IncidenceAngleUnresolved
 from xrd_tools.integrate.gid import gi_1d_output_axis_key
 from xrd_tools.integrate.calibration import poni_to_integrator, get_detector
-from xrd_tools.reduction import FlushPolicy, GIFreezeError
+from xrd_tools.reduction import (
+    FlushPolicy,
+    GIFreezeError,
+    GIMode,
+    Integration1DPlan,
+    ReductionPlan,
+    prepare_gi_freeze,
+)
+from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.io.image import read_image, count_frames
 from xrd_tools.io.export import write_xye
 from xrd_tools.io.nexus import find_nexus_image_dataset
@@ -1262,96 +1270,125 @@ class imageThread(wranglerThread):
         else:
             self.command = 'stop'
 
+    def _frame_source_for(self, scan):
+        r"""Build a core :class:`FrameSource` over this scan's per-file image
+        series for the headless GI freeze prepass (ADR-0006 STEP 2).
+
+        Returns:
+          - :class:`ImageFileSource` for a single detector file (``single_img``);
+          - :class:`TiffSeriesSource` over the STRICT ``^{scan}_\d+\.{ext}$`` file
+            list from :meth:`_enumerate_scan_files` (NOT ``from_directory`` — a
+            directory sweep would scoop up neighbour scans / background frames
+            that the anchored regex deliberately excludes);
+          - ``None`` for Eiger/HDF5 masters and Image-Directory sources that
+            cannot be cheaply per-frame swept (the caller maps ``None`` to the
+            old empty-``_enumerate_scan_files`` skip-vs-unverifiable split).
+
+        The manifest metadata format is ``self.meta_ext`` so the headless sweep
+        reads the EXACT sidecars the GUI does; a falsy meta_ext ⇒ no manifest ⇒
+        the source's ``has_scan_manifest`` capability is False ⇒
+        ``prepare_gi_freeze`` reports 'unverifiable' (warn-and-proceed)."""
+        img_file = getattr(self, "img_file", None)
+        if not img_file or _is_eiger_master(img_file):
+            return None
+        img_ext = getattr(self, "img_ext", "") or ""
+        if img_ext.lower() in ('h5', 'hdf5', 'nxs'):
+            return None
+        if getattr(self, "inp_type", None) == 'Image Directory':
+            return None
+        meta_fmt = getattr(self, "meta_ext", None) or None
+        meta_dir = getattr(self, "meta_dir", None)
+        if getattr(self, "single_img", False):
+            return ImageFileSource(
+                img_file, metadata_format=meta_fmt, meta_dir=meta_dir)
+        files = self._enumerate_scan_files()
+        if not files:
+            return None
+        return TiffSeriesSource(
+            [fname for fname, _num in files],
+            metadata_format=meta_fmt, meta_dir=meta_dir)
+
     def _gi_whole_scan_scout_entries(self, scan):
         """Decide how to freeze the whole-scan GI grid and, when needed, gather
         the scout images.  Returns ``(status, entries)``:
 
-        - ``("skip", [])`` — fixed/manual angle, Eiger/master, Image-Directory,
-          a single-frame scan, or a swept scan with one incidence: the existing
-          chunk-local / session freeze is correct (the grid was never clipped).
+        - ``("skip", [])`` — fixed/manual angle, Eiger/master, a single-frame
+          scan, or a swept scan with one incidence: the existing chunk-local /
+          session freeze is correct (the grid was never clipped).
         - ``("freeze", [lo_entry, hi_entry])`` — a varying-incidence per-file
-          scan whose extremes were resolved from readable metadata; ``entries``
-          are ``(img_file, img_number, img_data, img_meta, bg_raw, 0.0)`` for the
-          global lowest+highest incidence frames, with their images loaded.
+          scan whose global incidence extremes were discovered by core; the
+          ``entries`` are ``(img_file, img_number, img_data, img_meta, bg_raw,
+          0.0)`` for the lowest+highest incidence frames, images loaded.
+        - ``("unverifiable", [])`` — a source that can't be cheaply swept up
+          front (Image-Directory, or a possibly-multi-master Eiger): the caller
+          warns and proceeds on the first-chunk freeze (T0-4 policy).
         - ``("abort", [])`` — a multi-file scan whose incidence we genuinely
           cannot establish (fewer than two readable incidences across the whole
-          series).  The caller warns and proceeds on the first-chunk freeze
-          (T0-4 policy; the status name predates it).
+          series).  The caller also warns and proceeds (T0-4; name predates it).
 
-        Robust to per-frame metadata GAPS: it finds the extremes from the
-        readable frames and only aborts when it can't read enough to establish a
-        global range at all (BLOCKER 1 follow-up)."""
+        ADR-0006 STEP 2: the whole-scan incidence DISCOVERY now lives in
+        ``xrd_tools.reduction.prepare_gi_freeze`` (image-free, never raises) over
+        a core :class:`FrameSource`; xdart keeps only the scout LOAD + the freeze
+        invocation (which can't move to core: chunk 1 can't see the last frame).
+        """
         motor = self.incidence_motor
         try:
             float(motor)        # fixed/manual: one angle for the whole scan
             return "skip", []
         except (TypeError, ValueError):
             pass
-        files = self._enumerate_scan_files()
-        if not files:
-            # _enumerate_scan_files() returns [] for sources that can't be cheaply
-            # swept per-frame.  Distinguish the safe cases (skip) from the risky
-            # ones (unverifiable = we can't confirm the whole-scan range, so the
-            # caller must fail closed rather than silently clip later frames):
-            #
-            # SAFE ("skip"):
-            #   - Eiger SINGLE-master (one incidence per master → fixed grid, the
-            #     session's own freeze is correct and was never chunk-clipped).
-            #   - Any scan whose source-host attrs are absent/incomplete (no file
-            #     to check → missing-source host, not a TIFF angle-dependence run).
-            # RISKY ("unverifiable"):
-            #   - Image-Directory per-file GI scan (inp_type == 'Image Directory'):
-            #     a TIFF angle-dependence sweep that _enumerate_scan_files() skips.
-            #     The session WOULD clip later higher-incidence frames.
-            #   - Eiger master when the motor is not fixed/manual (if multi-master
-            #     Eiger is possible: each master a different incidence → same clip
-            #     risk; we can't distinguish single- vs multi-master before the run).
-            #
-            # For "unverifiable" the caller WARNS and proceeds on the
-            # first-chunk freeze (T0-4 policy: cropped extreme tails are
-            # accepted; values inside the grid are exact).  Source-aware
-            # whole-scan incidence enumeration remains a possible refinement,
-            # demoted from correctness work to nice-to-have.
+        source = self._frame_source_for(scan)
+        if source is None:
+            # _frame_source_for() returns None for sources that can't be cheaply
+            # swept per-frame.  Preserve the old skip-vs-unverifiable split:
+            #   RISKY ("unverifiable", warn-and-proceed): Image-Directory per-file
+            #     GI sweep, or a (possibly multi-master) Eiger master with a
+            #     non-fixed motor — the session WOULD clip later frames.
+            #   SAFE ("skip"): missing source attrs / no img_file — not an angle
+            #     dependence sweep at all (so the grid was never chunk-clipped).
             img_file = getattr(self, "img_file", None) or ""
             if getattr(self, "inp_type", None) == "Image Directory":
-                # Per-file angle-dependence loaded as a directory: can't sweep.
                 return "unverifiable", []
             if img_file and _is_eiger_master(img_file):
-                # Eiger master: single-master (fixed angle per master) is safe;
-                # multi-master (varying angle) is risky but indistinguishable
-                # here.  Conservatively treat any non-fixed-motor Eiger as
-                # unverifiable so a multi-master angle-dependence can't clip.
                 return "unverifiable", []
-            # Missing source attrs / no img_file: can't be an angle-dependence sweep.
             return "skip", []
-        if len(files) < 2:
-            return "skip", []   # single-frame scan: no incidence range to freeze
-        resolved = []
-        for fname, img_number in files:
-            try:
-                meta = (read_image_metadata(fname, meta_format=self.meta_ext,
-                                            meta_dir=self.meta_dir)
-                        if self.meta_ext else {})
-            except Exception:
-                continue            # tolerate a per-frame metadata gap
-            ang = self._resolve_incidence_from_meta(meta, motor)
-            if ang is not None:
-                resolved.append((ang, fname, img_number, meta))
-        if len(resolved) < 2:
-            # A multi-file (≥2) scan whose incidence we can't read for at least
-            # two frames: we cannot establish the global range -> fail CLOSED.
+        # Headless whole-scan incidence DISCOVERY (ADR-0006): core sweeps the
+        # source's metadata-only manifest and pins the global incidence extremes
+        # into plan.extra["gi_freeze_scout_indices"].  The minimal GI plan is a
+        # vehicle: a non-None gi with an unpinned 1D output range so discovery
+        # isn't short-circuited (whether THIS run needs a freeze at all is the
+        # caller's _gi_ranges_fully_pinned decision, not this method's).  The
+        # real incidence motor is passed explicitly.
+        plan = ReductionPlan(
+            integration_1d=Integration1DPlan(),  # radial_range None => freeze
+            gi=GIMode(incidence_motor=str(motor)),
+        )
+        plan2, diag = prepare_gi_freeze(source, plan, incidence_motor=motor)
+        if diag.status == "skip":
+            # fixed/single incidence, <2 frames, or one distinct incidence.
+            return "skip", []
+        if diag.status == "unverifiable":
+            # >=2 frames but <2 readable incidences (or no manifest): we cannot
+            # establish the global range -> warn-and-proceed (old "abort").
             return "abort", []
-        lo = min(resolved, key=lambda r: r[0])
-        hi = max(resolved, key=lambda r: r[0])
-        if lo[0] == hi[0]:          # no incidence sweep -> chunk grid is fine
-            return "skip", []
+        # diag.status == "frozen": load the extreme scouts BY INDEX against the
+        # SAME source prepare_gi_freeze swept.  A TiffSeriesSource labels frames
+        # by POSITION (1..N) in the strict file list, so the scout indices are
+        # positional -- mapping each back through the source recovers the real
+        # on-disk file + its scan img_number (non-contiguous / non-1-based
+        # filenames stay correct; the contiguous Combi4 fixture would not catch
+        # a positional/number confusion on its own).
+        indices = plan2.extra.get("gi_freeze_scout_indices") or []
         entries = []
-        for _ang, fname, img_number, meta in (lo, hi):
-            data = np.asarray(read_image(fname), dtype=float)
+        for idx in indices:
+            frame = source.frame_for(int(idx))
+            fname = str(frame.source_path) if frame.source_path else ""
+            meta = dict(frame.metadata)
+            data = np.asarray(source.load_frame(int(idx)), dtype=float)
+            _sname, img_number = _get_scan_info(fname)
             # bg is irrelevant to the frozen AXIS extent (geometry+incidence
             # driven), so a failing/missing background must NOT abort an
-            # otherwise-valid GI run -- degrade to 0 for the axis-only scout
-            # rather than let the prepass turn it into a fail-closed stop.
+            # otherwise-valid GI run -- degrade to 0 for the axis-only scout.
             try:
                 bg = self.get_background(fname, img_number, meta)
             except Exception:
@@ -1360,21 +1397,6 @@ class imageThread(wranglerThread):
                 bg = 0.0
             entries.append((fname, img_number, data, meta, bg, 0.0))
         return "freeze", entries
-
-    @staticmethod
-    def _resolve_incidence_from_meta(meta, motor):
-        """Case-insensitive lookup of the incidence motor in a frame's metadata
-        -> float, or None if absent/non-numeric (mirrors LiveFrame._get_incident_angle)."""
-        if not isinstance(meta, dict):
-            return None
-        ml = str(motor).lower()
-        for key, val in meta.items():
-            if str(key).lower() == ml:
-                try:
-                    return float(val)
-                except (TypeError, ValueError):
-                    return None
-        return None
 
     def _enumerate_scan_files(self):
         """Sorted ``(fname, img_number)`` for a per-file scan series, metadata
