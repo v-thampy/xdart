@@ -1007,7 +1007,8 @@ from xrd_tools.core import FrameView, assert_framerecord_equivalent  # noqa: E40
 from xdart.modules.frame_publication import _publication_has_heavy_payload  # noqa: E402
 
 
-def _mode_pub(label, *, mode_1d=None, mode_2d=None, scale=1.0, generation=0):
+def _mode_pub(label, *, mode_1d=None, mode_2d=None, scale=1.0, generation=0,
+              source_identity=None):
     r1 = r2 = None
     if mode_1d is not None:
         r1 = IntegrationResult1D(
@@ -1022,7 +1023,9 @@ def _mode_pub(label, *, mode_1d=None, mode_2d=None, scale=1.0, generation=0):
         thumbnail=np.zeros((2, 2), dtype=float), metadata_raw={"monitor": 1.0})
     rec = FrameRecord.from_view(
         view, mode_1d=mode_1d or DEFAULT_MODE_KEY, mode_2d=mode_2d or DEFAULT_MODE_KEY)
-    return publication_from_frame_view(view, record=rec, generation=generation)
+    return publication_from_frame_view(
+        view, record=rec, generation=generation,
+        source_identity=source_identity if source_identity is not None else str(label))
 
 
 def test_accumulation_same_frame_merges_modes_view_is_latest():
@@ -1085,13 +1088,29 @@ def test_accumulation_post_clear_does_not_merge():
     assert store.get(0).generation == store.generation
 
 
-def test_accumulation_stale_incoming_generation_still_merges_within_scan():
+def test_accumulation_stale_incoming_generation_does_not_merge():
+    # Hardening (codex): a STALE incoming generation for a frame already present
+    # must NOT splice into the accumulated record (it is from a pre-clear epoch);
+    # fall back to plain replace.
     store = PublicationStore()
-    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation))
-    # an incoming with an OLD stamp but the frame is still present (no clear)
-    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation - 5))
-    assert set(store.get(0).record.modes_1d) == {"q_total", "q_ip"}
+    store.clear()                                        # bump to generation 1
+    assert store.generation == 1
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=1))
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=0))  # stale stamp
+    rec = store.get(0).record
+    assert rec.modes_1d == ("q_ip",)                    # no stale merge
     assert store.get(0).generation == store.generation  # coerced up
+
+
+def test_accumulation_different_source_identity_does_not_merge():
+    # Hardening (codex): a label reused across scans/files (different non-empty
+    # source_identity) after a missed clear must NOT accumulate into one record.
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation,
+                           source_identity="scanA"))
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation,
+                           source_identity="scanB"))
+    assert store.get(0).record.modes_1d == ("q_ip",)    # plain replace, no merge
 
 
 def test_accumulation_first_upsert_is_plain_replace_additive():

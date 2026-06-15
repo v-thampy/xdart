@@ -523,6 +523,16 @@ def _merge_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRecord:
     return acc
 
 
+def _same_source(a: FramePublication, b: FramePublication) -> bool:
+    """True unless both publications carry a *different*, non-empty
+    ``source_identity`` — cheap insurance against a frame label reused across
+    scans/files (e.g. labels restarting at 1) after a missed ``clear()``: such a
+    collision must NOT accumulate into one record."""
+    sa = a.source_identity
+    sb = b.source_identity
+    return not (sa and sb and sa != sb)
+
+
 class PublicationStore:
     """Small generation-aware store for frame publications.
 
@@ -600,19 +610,29 @@ class PublicationStore:
 
     def upsert(self, publication: FramePublication) -> FramePublication:
         with self._lock:
-            if publication.generation != self._generation:
+            incoming_generation = publication.generation
+            if incoming_generation != self._generation:
                 publication = replace(publication, generation=self._generation)
             label = publication.label
             existing = self._items.get(label)
             if existing is not None:
-                # Fork B: same frame within the SAME generation -> accumulate
-                # the incoming record's modes into the existing record so the
-                # store carries every GI mode computed for this frame.  The
-                # stored .view stays the latest incoming active projection, so
-                # display consumers (publication.view.*) are unchanged.  A
-                # generation mismatch (a stale entry that escaped a clear())
-                # falls through to plain replace — today's behavior.
-                if existing.generation == self._generation:
+                # Fork B accumulation, hardened (codex review): merge the
+                # incoming record's modes into the existing record ONLY for a
+                # same-epoch, same-source re-upsert of a frame already present —
+                # so the store carries every GI mode computed for this frame and
+                # the stored .view stays the latest active projection (display
+                # consumers unchanged).  A STALE incoming generation (queued
+                # before a clear()/generation bump) or a DIFFERENT non-empty
+                # source_identity (a label reused across scans/files after a
+                # missed clear) must NOT splice into the accumulated record —
+                # fall through to the plain wholesale replace (pre-accumulation
+                # behavior), so old-epoch / foreign data can never contaminate a
+                # multi-mode record.
+                if (
+                    incoming_generation == self._generation
+                    and existing.generation == self._generation
+                    and _same_source(existing, publication)
+                ):
                     publication = replace(
                         publication,
                         record=_merge_records(existing.record, publication.record),
