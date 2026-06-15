@@ -1913,7 +1913,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
             self.bkg_1d, _ = self.get_frames_int_1d(idxs, rv='average')
             self.bkg_2d = bkg_2d
-            self.bkg_map_raw = self.get_frames_map_raw(idxs, require_all=True)
+            # Set-Bkg is a one-shot user action on an idle scan: block-and-read
+            # an evicted frame's raw from disk rather than defer to the async
+            # worker (which would leave it out -> require_all None -> a silent
+            # bkg_map_raw = 0 over the whole 2D map).
+            self.bkg_map_raw = self.get_frames_map_raw(
+                idxs, require_all=True, allow_blocking_read=True)
             if self.bkg_map_raw is None:
                 # F5: be honest about a no-op 2D background.  Pre-F5
                 # this silently set bkg=0.: 1D/2D bkg subtraction

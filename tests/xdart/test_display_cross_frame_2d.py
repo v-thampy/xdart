@@ -216,3 +216,54 @@ def test_int_2d_require_all_distinguishes_partial_from_no_2d(tmp_path):
     host2 = _make_host(scan, data_2d={})
     assert host2.get_frames_int_2d([0, 1, 999])[0] is not None              # subset average exists
     assert host2.get_frames_int_2d([0, 1, 999], require_all=True)[0] is None  # not all covered -> None
+
+
+class TestSetBkgRawBlockingRead:
+    """Set-Bkg whole-scan raw aggregation must block-and-read an evicted frame
+    rather than serve the async path (which returns nothing for an evicted frame
+    -> require_all=True None -> a silent bkg_map_raw = 0)."""
+
+    @staticmethod
+    def _host_async_with_evicted():
+        # frame 0 resident (raw=ones); frame 1 EVICTED (only a blocking disk
+        # read finds it).  No thumbnails -> the hydrate branch fires.
+        host = _make_host(
+            scan=SimpleNamespace(frames=SimpleNamespace(index=[0, 1]),
+                                 mask_sentinel=False),
+            data_2d={0: {'map_raw': np.ones((4, 4)), 'bg_raw': 0}})
+        host._async_hydration_enabled = True
+        host._processing_active = False
+        host.normalize = lambda data, info: data
+        calls = []
+        evicted = SimpleNamespace(map_raw=np.full((4, 4), 3.0), bg_raw=0,
+                                  thumbnail=None, scan_info={},
+                                  free_raw=lambda: None)
+
+        def fake_hydrate(idx, *, allow_blocking_read=True):
+            calls.append((int(idx), allow_blocking_read))
+            if int(idx) == 1 and allow_blocking_read:
+                return evicted
+            return None
+
+        host._hydrate_frame_from_disk = fake_hydrate
+        host._request_frame_hydration = lambda idx: None
+        return host, calls
+
+    def test_setbkg_blocks_and_reads_evicted_frame(self):
+        host, calls = self._host_async_with_evicted()
+        data = host.get_frames_map_raw([0, 1], require_all=True,
+                                       allow_blocking_read=True)
+        assert (1, True) in calls               # forced a blocking read
+        assert data is not None                  # both frames covered...
+        np.testing.assert_allclose(data, 2.0, atol=1e-6)  # (ones + threes)/2
+
+    def test_default_render_path_stays_async_nonblocking(self):
+        # Regression guard: without the override the live render path must NOT
+        # block on the evicted frame -> require_all None + a background request.
+        host, calls = self._host_async_with_evicted()
+        queued = []
+        host._request_frame_hydration = lambda idx: queued.append(int(idx))
+        out = host.get_frames_map_raw([0, 1], require_all=True)   # no override
+        assert (1, False) in calls               # served the async helper
+        assert queued == [1]                      # evicted frame queued off-thread
+        assert out is None                        # async path can't complete inline

@@ -233,12 +233,19 @@ class DisplayDataMixin:
     # ── Raw 2D data access ────────────────────────────────────────
 
     def get_frames_map_raw(self, idxs=None, *, prefer_thumbnail=False,
-                           return_source=False, require_all=False):
+                           return_source=False, require_all=False,
+                           allow_blocking_read=None):
         """Return 2D frame data for multiple frames (averaged).
 
         Falls back to the stored thumbnail when full-resolution raw data
         is not available (e.g. when loading from NeXus files that only
         store integration results + thumbnails).
+
+        ``allow_blocking_read=True`` forces a synchronous disk read for evicted
+        frames — for one-shot user aggregations (e.g. Set-Bkg over the whole
+        scan) that must not silently miss an evicted frame and fall back to
+        background=0.  ``None`` (default) keeps the per-render async-gated
+        behaviour: non-blocking in the live app, blocking headless.
 
         M3: takes a single snapshot of the requested idxs under
         ``data_lock`` and then iterates the snapshot lock-free, so
@@ -300,8 +307,10 @@ class DisplayDataMixin:
                 # its thumbnail and repaints on completion).  Headless/sync: full
                 # blocking read as before.
                 _async = getattr(self, '_async_hydration_enabled', False)
-                lf = _hydrate(int(idx), allow_blocking_read=not _async)
-                if lf is None and _async:
+                _block = (not _async) if allow_blocking_read is None \
+                    else bool(allow_blocking_read)
+                lf = _hydrate(int(idx), allow_blocking_read=_block)
+                if lf is None and not _block and _async:
                     self._request_frame_hydration(int(idx))
                 if lf is not None:
                     if getattr(lf, 'map_raw', None) is None:
