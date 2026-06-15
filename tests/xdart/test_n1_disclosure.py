@@ -170,3 +170,35 @@ def test_sync_meta_ext_is_idempotent_no_reemit(qapp):
     n = len(events)
     sync()                                   # unchanged nxs state -> silent
     assert len(events) == n
+
+
+def test_viewer_modes_hide_all_processing_groups(qapp):
+    """Image/XYE viewer modes hide every processing group, leaving only Project
+    Folder + Save Path — even when a folder + PONI are set (which would normally
+    reveal everything via progressive disclosure)."""
+    for vm in ("image", "xye"):
+        h, root = _holder()
+        h.viewer_mode = vm
+        root.child("Project").child("project_folder").setValue("/tmp")
+        h.poni = object()                          # would normally reveal all
+        h._apply_disclosure()
+        assert not _hidden(root, "Project"), vm    # Project Folder: visible
+        assert root.child("h5_dir").opts.get("visible") is not False, vm        # Save Path
+        assert root.child("h5_dir_browse").opts.get("visible") is not False, vm
+        for g in ("Calibration",) + imageWrangler._DISCLOSURE_REST:  # Signal/GI/Mask/MaskSat/BG
+            assert _hidden(root, g), (vm, g)
+
+
+def test_leaving_viewer_mode_restores_disclosure(qapp):
+    """Switching back from a viewer mode to a processing mode restores the
+    normal Project->Calibration->rest disclosure (folder + PONI set -> all)."""
+    h, root = _holder()
+    root.child("Project").child("project_folder").setValue("/tmp")
+    h.poni = object()
+    h.viewer_mode = "image"
+    h._apply_disclosure()
+    assert _hidden(root, "Signal")                 # hidden in viewer mode
+    h.viewer_mode = None                           # back to a processing mode
+    h._apply_disclosure()
+    for g in ("Project", "Calibration", "Signal", "GI", "Mask", "BG"):
+        assert not _hidden(root, g), g             # full disclosure restored

@@ -3955,6 +3955,9 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
         sigViewerModeChanged=_FakeSignal(),
         sigStart=_FakeSignal(),
         sender=lambda: None,
+        # _on_mode_changed now refreshes wrangler disclosure; this lightweight
+        # host has no N1 'Project' param group, so _apply_disclosure no-ops.
+        parameters=SimpleNamespace(names=[]),
         _integration_calls=integration_calls,
         _set_integration_controls_enabled=lambda enabled, **kwargs: (
             integration_calls.append((enabled, kwargs)),
@@ -3962,6 +3965,7 @@ def _wrangler_host(mode_text, *, live=False, batch=False):
         ),
     )
     host._on_mode_changed = MethodType(imageWrangler._on_mode_changed, host)
+    host._apply_disclosure = MethodType(imageWrangler._apply_disclosure, host)
     host.start = MethodType(imageWrangler.start, host)
     host._inputs_valid = MethodType(imageWrangler._inputs_valid, host)
     # Phase B: the action-button morph helper + its state, used by enabled()/

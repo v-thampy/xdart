@@ -773,6 +773,10 @@ class imageWrangler(wranglerWidget):
 
         # Gray out integration controls in viewer mode
         self._set_integration_controls_enabled(not is_viewer)
+        # Apply the per-mode param visibility: image/xye viewers HIDE all
+        # processing groups (leaving Project Folder + Save Path); any other mode
+        # restores the normal Project->Calibration->rest progressive disclosure.
+        self._apply_disclosure()
         # Image/XYE viewers are file-inspection modes: the PROCESSING groups
         # (Calibration/Signal/BG/Mask/GI, handled per-group above) are
         # disabled so masks/background/calibration cannot be edited there --
@@ -1180,6 +1184,27 @@ class imageWrangler(wranglerWidget):
         Project Folder (always) -> Calibration (once a folder is set) -> the rest
         (once a folder is set AND a valid PONI loads).  Pure show()/hide() on the
         groups; orthogonal to the run-lock ``enabled()`` (which only greys)."""
+        # Defensive: some lightweight/duck wranglers (and GUI test harnesses)
+        # don't build the full disclosure param tree.  _on_mode_changed now calls
+        # this, so guard against a tree without the 'Project' group (nothing to
+        # disclose there) rather than KeyError.
+        if 'Project' not in self.parameters.names:
+            return
+        # Image/XYE viewer modes are pure file-inspection: hide every processing
+        # group, leaving only Project Folder + Save Path (the file-browser
+        # drivers).  Centralized HERE because _apply_disclosure is re-invoked on
+        # every Project-Folder / PONI change and its else-branch re-shows every
+        # child, so a check placed only in _on_mode_changed would be silently
+        # undone by the next folder/PONI event.
+        if getattr(self, 'viewer_mode', None) in ('image', 'xye'):
+            self.parameters.child('Project').show()          # Project Folder: keep
+            self.parameters.child('Calibration').hide()
+            for name in self._DISCLOSURE_REST:               # Signal/GI/Mask/MaskSat/BG
+                self.parameters.child(name).hide()
+            for name in self._DISCLOSURE_TOPLEVEL:           # Save Path row: keep
+                self.parameters.child(name).show()
+            imageWrangler._safe_status_text(self, '')
+            return
         have_root = self._compute_source_base() is not None
         have_poni = self.poni is not None
         self.parameters.child('Project').show()            # always visible
