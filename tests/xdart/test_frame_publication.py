@@ -815,3 +815,185 @@ def test_eviction_thins_the_record(tmp_path):
     rec = evicted.record
     for mv in (*rec.results_1d.values(), *rec.results_2d.values()):
         assert mv.intensity_1d is None and mv.intensity_2d is None
+
+
+# ===================================================================== #
+# Step 4: integration_plot_payload (full 1D parity, NOT yet wired) + #69
+# ===================================================================== #
+
+from types import SimpleNamespace  # noqa: E402
+
+
+def _int_widget(*, plot_unit_text="q (Å⁻¹)", source="1d", axis="radial",
+                slice_on=False, center=0.0, width=1.0, wavelength_m=1e-10, gi=False):
+    ui = SimpleNamespace(
+        plotUnit=SimpleNamespace(currentIndex=lambda: 0,
+                                 currentText=lambda: plot_unit_text),
+        slice=SimpleNamespace(isChecked=lambda: slice_on),
+        slice_center=SimpleNamespace(value=lambda: center),
+        slice_width=SimpleNamespace(value=lambda: width),
+    )
+    return SimpleNamespace(
+        scan=SimpleNamespace(name="scan", gi=gi),
+        _plot_axis_info=[{"source": source, "slice_axis": None, "axis": axis}],
+        ui=ui,
+        normalize=lambda data, md: np.asarray(data, dtype=float)
+        / ((md or {}).get("monitor", 1.0) or 1.0),
+        _get_wavelength=lambda ref: wavelength_m,
+    )
+
+
+def _int_state(store, *, mode=Mode.INT_1D, method="Single", ids, gi=False,
+               plot_unit="q_A^-1"):
+    loaded_1d, loaded_2d, raw_avail = publication_availability(store)
+    return compute_display_state(
+        mode=mode, selected_ids=tuple(ids), all_frame_index=list(ids),
+        loaded_1d_keys=loaded_1d, loaded_2d_keys=loaded_2d, gi=gi,
+        plot_unit=plot_unit, method=method, unit_changed=False,
+        prev_overlaid_ids=(), raw_availability=raw_avail, titles={},
+        generation=store.generation,
+    )
+
+
+def _adapter(store, widget):
+    return PublicationDisplayAdapter(store, widget=widget)
+
+
+def test_integration_payload_native_single():
+    frame = DuckFrame(idx=1)
+    frame.scan_info = {"monitor": 2.0}
+    store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
+    state = _int_state(store, ids=(1,))
+    payload = _adapter(store, _int_widget(plot_unit_text="q (Å⁻¹)")
+                       ).integration_plot_payload(state)
+    assert payload is not None and len(payload.traces) == 1
+    np.testing.assert_allclose(payload.traces[0].x, frame.int_1d.radial)
+    np.testing.assert_allclose(payload.traces[0].y, frame.int_1d.intensity / 2.0)
+
+
+def test_integration_payload_q_to_2theta_conversion():
+    frame = DuckFrame(idx=2)
+    frame.scan_info = {"monitor": 1.0}
+    store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
+    state = _int_state(store, ids=(2,))
+    w = _int_widget(plot_unit_text="2θ (°)", wavelength_m=1e-10)  # 1 Å
+    payload = _adapter(store, w).integration_plot_payload(state)
+    lam_A = 1.0
+    q = np.asarray(frame.int_1d.radial)
+    expected = 2 * np.degrees(np.arcsin(np.clip(q * lam_A / (4 * np.pi), -1, 1)))
+    np.testing.assert_allclose(payload.traces[0].x, expected, rtol=1e-5)
+    assert "2" in payload.axis_x.label or "th" in payload.axis_x.unit.lower()
+
+
+def test_integration_payload_no_wavelength_keeps_native_axis():
+    frame = DuckFrame(idx=3)
+    store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
+    state = _int_state(store, ids=(3,))
+    w = _int_widget(plot_unit_text="2θ (°)", wavelength_m=None)
+    payload = _adapter(store, w).integration_plot_payload(state)
+    # no wavelength -> no conversion AND native (Q) axis kept (honest)
+    np.testing.assert_allclose(payload.traces[0].x, frame.int_1d.radial)
+    assert "q" in payload.axis_x.unit.lower() or payload.axis_x.label == "Q"
+
+
+def test_integration_payload_gi_axis_verbatim():
+    frame = DuckFrame(idx=4, gi=True)
+    frame.int_1d = IntegrationResult1D(
+        radial=np.linspace(-5.0, 5.0, 6), intensity=np.arange(6.0),
+        sigma=None, unit="qip_A^-1",
+    )
+    store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
+    state = _int_state(store, ids=(4,), gi=True)
+    w = _int_widget(plot_unit_text="2θ (°)", gi=True)
+    payload = _adapter(store, w).integration_plot_payload(state)
+    assert payload is not None                       # GI no longer rejected
+    np.testing.assert_allclose(payload.traces[0].x, frame.int_1d.radial)  # verbatim
+
+
+def test_integration_payload_2d_slice_radial_transpose_guard():
+    frame = DuckFrame(idx=5)
+    frame.scan_info = {"monitor": 1.0}
+    # intensity[radial, azimuthal] = radial index (independent of azimuthal)
+    inten = np.tile(np.arange(4.0).reshape(4, 1), (1, 3))
+    frame.int_2d = IntegrationResult2D(
+        radial=np.linspace(0.5, 3.0, 4), azimuthal=np.linspace(-90.0, 90.0, 3),
+        intensity=inten, unit="q_A^-1", azimuthal_unit="chi_deg",
+    )
+    store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
+    state = _int_state(store, mode=Mode.INT_2D, ids=(5,))
+    w = _int_widget(source="2d", axis="radial")
+    payload = _adapter(store, w).integration_plot_payload(state)
+    assert payload is not None
+    # reduce over azimuthal -> per-radial value == radial index (the transpose
+    # is correct; a wrong reduce-axis would average to a constant)
+    np.testing.assert_allclose(payload.traces[0].y, np.arange(4.0))
+    np.testing.assert_allclose(payload.traces[0].x, frame.int_2d.radial)
+
+
+def test_integration_payload_2d_slice_window_and_label():
+    frame = DuckFrame(idx=6)
+    frame.scan_info = {"monitor": 1.0}
+    # intensity[radial, azimuthal] = azimuthal index; azimuthal = [0,1,2,3]
+    inten = np.tile(np.arange(4.0).reshape(1, 4), (4, 1))
+    frame.int_2d = IntegrationResult2D(
+        radial=np.linspace(0.5, 3.0, 4), azimuthal=np.array([0.0, 1.0, 2.0, 3.0]),
+        intensity=inten, unit="q_A^-1", azimuthal_unit="chi_deg",
+    )
+    store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
+    state = _int_state(store, mode=Mode.INT_2D, ids=(6,))
+    # window center=0.5 width=0.6 -> azimuthal {0,1} selected -> mean 0.5
+    w = _int_widget(source="2d", axis="radial", slice_on=True, center=0.5, width=0.6)
+    payload = _adapter(store, w).integration_plot_payload(state)
+    np.testing.assert_allclose(payload.traces[0].y, np.full(4, 0.5))
+    assert "[" in payload.traces[0].label and "±" in payload.traces[0].label
+
+
+def test_integration_payload_azimuthal_axis():
+    frame = DuckFrame(idx=7)
+    frame.scan_info = {"monitor": 1.0}
+    inten = np.tile(np.arange(3.0).reshape(1, 3), (4, 1))  # [radial,azim]=azim
+    frame.int_2d = IntegrationResult2D(
+        radial=np.linspace(0.5, 3.0, 4), azimuthal=np.linspace(-90.0, 90.0, 3),
+        intensity=inten, unit="q_A^-1", azimuthal_unit="chi_deg",
+    )
+    store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
+    state = _int_state(store, mode=Mode.INT_2D, ids=(7,))
+    w = _int_widget(source="2d", axis="azimuthal")
+    payload = _adapter(store, w).integration_plot_payload(state)
+    np.testing.assert_allclose(payload.traces[0].x, frame.int_2d.azimuthal)
+    np.testing.assert_allclose(payload.traces[0].y, np.arange(3.0))
+
+
+def test_integration_payload_overlay_waterfall_return_none():
+    frame = DuckFrame(idx=8)
+    store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
+    for method in ("Overlay", "Waterfall"):
+        state = _int_state(store, ids=(8,), method=method)
+        assert _adapter(store, _int_widget()).integration_plot_payload(state) is None
+
+
+def test_plot_payload_still_returns_none_for_int_modes():
+    # Step 4 must NOT flip line 374: the wired plot_payload still defers INT to legacy.
+    frame = DuckFrame(idx=9)
+    store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
+    state = _int_state(store, ids=(9,))
+    assert _adapter(store, _int_widget()).plot_payload(state) is None
+
+
+def test_integration_payload_gi_q_total_converts_to_2theta():
+    # q_total is a |q| magnitude -> Bragg-convertible to 2θ exactly like a
+    # standard scan, even with scan.gi True (unit-based guard, not the gi flag:
+    # qtot_A^-1 is not is_gi_2d_units; qip/qoop/exit are).
+    frame = DuckFrame(idx=10, gi=True)
+    frame.scan_info = {"monitor": 1.0}
+    frame.int_1d = IntegrationResult1D(
+        radial=np.linspace(0.5, 3.0, 6), intensity=np.arange(6.0),
+        sigma=None, unit="qtot_A^-1",
+    )
+    store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
+    state = _int_state(store, ids=(10,), gi=True)
+    w = _int_widget(plot_unit_text="2θ (°)", gi=True, wavelength_m=1e-10)
+    payload = _adapter(store, w).integration_plot_payload(state)
+    q = np.asarray(frame.int_1d.radial)
+    expected = 2 * np.degrees(np.arcsin(np.clip(q * 1.0 / (4 * np.pi), -1, 1)))
+    np.testing.assert_allclose(payload.traces[0].x, expected, rtol=1e-5)

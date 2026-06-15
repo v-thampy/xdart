@@ -945,6 +945,38 @@ def render_roles_for_state(state):
     return tuple(ordered)
 
 
+def render_keys_for_state(state):
+    """Return the PanelKey order managed for ``state`` — the #69 / WS-X2
+    promotion of :func:`render_roles_for_state` from role-level to PanelKey-level.
+
+    Unlike the role version this does NOT dedupe by role, so a repeated-role
+    layout (a future RSM/Stitch viewer's multiple ``SLICE_2D``/``PROJ_1D``
+    panels) keeps every instance.  Legacy roles absent from the layout are
+    appended as singleton ``PanelKey(role)`` cleanup fallbacks, exactly mirroring
+    :func:`render_roles_for_state`.  For the current one-panel-per-role
+    integration/viewer view every key is a singleton, so this is 1:1 with the
+    role list (behaviour-preserving); the renderer still consumes the role-level
+    ``RenderPlan.draw``/``clear`` until the widget grows repeated-role delegates
+    (layer-(b), deferred)."""
+    ordered: list = []
+    rows = getattr(state, "layout", ()) or ()
+    if rows:
+        keys = [key for row in rows for key in row]
+    else:
+        keys = [key for key, _plan in (getattr(state, "panels", ()) or ())]
+
+    for key in keys:
+        if isinstance(_role_from_panel_key(key), PanelRole) and key not in ordered:
+            ordered.append(key)
+
+    present_roles = {_role_from_panel_key(k) for k in ordered}
+    for role in _LEGACY_RENDER_ROLES:
+        if role not in present_roles:
+            ordered.append(PanelKey(role))
+
+    return tuple(ordered)
+
+
 def empty_display_state(mode, generation, *, title=""):
     """A panel-less :class:`DisplayState` with ``EMPTY`` status.
 
@@ -1014,6 +1046,12 @@ class RenderPlan:
     title: str
     draw: tuple                      # roles to draw (present, has_data, READY)
     clear: tuple                     # roles to blank (absent / no data / EMPTY / ERROR)
+    # #69 / WS-X2: PanelKey-level draw/clear (no role dedupe), so repeated-role
+    # layouts (RSM/Stitch) are expressible.  For the current one-panel-per-role
+    # view these mirror draw/clear 1:1 by role; the renderer still consumes the
+    # role-level draw/clear until the widget grows repeated-role delegates.
+    draw_keys: tuple = ()
+    clear_keys: tuple = ()
 
 
 def render_plan(state, payload):
@@ -1035,5 +1073,17 @@ def render_plan(state, payload):
             draw.append(role)
         else:
             clear.append(role)
+    # #69 / WS-X2: the same decision at PanelKey granularity (no role dedupe).
+    # For the current view these mirror draw/clear 1:1 by role; for a
+    # repeated-role layout they carry every instance.  Additive — the renderer
+    # still reads draw/clear today.
+    draw_keys, clear_keys = [], []
+    for key in render_keys_for_state(state):
+        plan = state.panel(key)
+        if ready and plan is not None and plan.has_data:
+            draw_keys.append(key)
+        else:
+            clear_keys.append(key)
     return RenderPlan(drop=False, error_message=state.error_message,
-                      title=state.title, draw=tuple(draw), clear=tuple(clear))
+                      title=state.title, draw=tuple(draw), clear=tuple(clear),
+                      draw_keys=tuple(draw_keys), clear_keys=tuple(clear_keys))

@@ -409,6 +409,171 @@ class PublicationDisplayAdapter:
             return None
         return PlotPayload(axis_x=axis, traces=tuple(traces))
 
+    # ----------------------------------------------------------------- #
+    # Step 4: full-parity integration 1D payload (NOT wired into
+    # plot_payload yet — Step 5 flips the line-374 short-circuit).  Built
+    # and unit-tested standalone so the live integration draw stays on
+    # update_plot until the live GUI checkpoint.
+    # ----------------------------------------------------------------- #
+    def integration_plot_payload(self, state):
+        """Build the INT_1D/INT_2D 1D :class:`PlotPayload` for the active-mode
+        ``.view`` at legacy parity: native readout, GI verbatim axis, on-the-fly
+        Q↔2θ, and 2D-slice-derived 1D projection.
+
+        Returns ``None`` for Overlay/Waterfall (their cross-render history /
+        waterfall-y state is not owned by the payload yet — a later step), and
+        when no usable 1D trace can be built.  This method is intentionally NOT
+        called by :meth:`plot_payload`/``build_payload`` yet."""
+        if state.method in ("Overlay", "Waterfall"):
+            return None
+        widget = self._widget
+        axis_info = _current_axis_info(widget)
+        source = axis_info.get("source", "1d")
+        needs_2d = (source == "2d") or (
+            source == "1d_2d" and _slice_enabled(widget)
+        )
+
+        traces = []
+        axis = None
+        ref_x = None
+        for label in state.render_ids:
+            publication = self._items.get(_label_key(label))
+            if publication is None:
+                continue
+            view = publication.view
+            if not needs_2d:
+                if not view.has_1d or publication_has_1d_errors(publication):
+                    continue
+                x = np.asarray(view.axis_1d.values, dtype=float)
+                y = np.asarray(view.intensity_1d, dtype=float)
+                if x.shape != y.shape:
+                    continue
+                y = self._normalize(y, publication.metadata_raw)
+                x, conv_axis = self._apply_plot_unit_1d(
+                    x, str(getattr(view.axis_1d, "unit", "") or ""), publication)
+                this_axis = (conv_axis if conv_axis is not None
+                             else _axis_for_publication(view.axis_1d))
+            else:
+                projected = self._slice_1d_from_2d(view, publication, axis_info)
+                if projected is None:
+                    continue
+                x, y, this_axis = projected
+            if ref_x is None:
+                ref_x = x
+                axis = this_axis
+            elif x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
+                y = np.interp(ref_x, x, y)
+                x = ref_x
+            traces.append(
+                Trace(label=self._integration_trace_label(publication, axis_info),
+                      x=x, y=y))
+
+        if not traces or axis is None:
+            return None
+        return PlotPayload(axis_x=axis, traces=tuple(traces))
+
+    def _apply_plot_unit_1d(self, x_values, data_unit, ref_publication):
+        """1D analog of :meth:`_apply_image_unit_2d`: on-the-fly Q↔2θ for the
+        ``plotUnit`` selector.  Returns ``(values, axis)`` — the converted
+        values + the target :class:`Axis` when a conversion actually fires, else
+        ``(x_values, None)`` (caller keeps the native axis).  GI reciprocal-space
+        axes pass through verbatim; no wavelength ⇒ no conversion (and the native
+        axis is kept, so the label never lies about un-converted values)."""
+        widget = self._widget
+        if widget is None or x_values is None:
+            return x_values, None
+        # Guard by UNIT, not the scan.gi flag: q_total (a |q| magnitude,
+        # ``qtot_A^-1``/``q_A^-1``) IS Bragg-convertible to 2θ exactly like a
+        # standard scan (legacy get_xdata converts it), while the signed/angle
+        # GI axes (qip/qoop/exit) are not — is_gi_2d_units flags only the latter.
+        if is_gi_2d_units(data_unit, ""):
+            return x_values, None
+        try:
+            plot_label = widget.ui.plotUnit.currentText()
+        except Exception:
+            return x_values, None
+        want_tth = Th in plot_label
+        want_q = AA_inv in plot_label
+        have_tth = "2th" in (data_unit or "")
+        if not ((want_tth and not have_tth) or (want_q and have_tth)):
+            return x_values, None
+        try:
+            wavelength_m = widget._get_wavelength(
+                getattr(ref_publication, "raw_ref", None))
+        except Exception:
+            wavelength_m = None
+        if not wavelength_m or wavelength_m <= 0:
+            return x_values, None
+        new_values = convert_2d_radial(
+            x_values, data_unit=data_unit,
+            want_tth=want_tth, want_q=want_q, wavelength_m=wavelength_m,
+        )
+        idx = 1 if want_tth else 0
+        return new_values, Axis(label=x_labels_2D[idx], unit=x_units_2D[idx])
+
+    def _slice_1d_from_2d(self, view, publication, axis_info):
+        """Project a 1D curve from the active-mode 2D cake (the legacy
+        ``get_int_1d`` 2D path), reducing over the slice axis.
+
+        FrameView stores ``intensity_2d`` as ``(axis_2d_y=azimuthal,
+        axis_2d_x=radial)`` whereas the legacy ``IntegrationResult2D.intensity``
+        was ``(radial, azimuthal)`` — so the reduce-axis is FLIPPED here.  Only
+        the radial display axis gets the Q↔2θ conversion (never χ)."""
+        if not view.has_2d or publication_has_2d_errors(publication):
+            return None
+        intensity = np.asarray(view.intensity_2d, dtype=float)
+        if intensity.ndim != 2:
+            return None
+        axis_type = axis_info.get("axis", "radial")
+        if axis_type == "azimuthal":
+            x_axis = view.axis_2d_y                       # χ / azimuthal
+            slice_vals = getattr(view.axis_2d_x, "values", None)
+            reduce_axis = 1                              # reduce over radial (FrameView axis 1)
+            convert = False
+        else:                                            # 'radial' (or fallback)
+            x_axis = view.axis_2d_x                       # radial
+            slice_vals = getattr(view.axis_2d_y, "values", None)
+            reduce_axis = 0                              # reduce over azimuthal (FrameView axis 0)
+            convert = True
+        x = np.asarray(getattr(x_axis, "values", None), dtype=float)
+        inds: Any = slice(None)
+        if _slice_enabled(self._widget) and slice_vals is not None:
+            slice_vals = np.asarray(slice_vals, dtype=float)
+            try:
+                center = float(self._widget.ui.slice_center.value())
+                width = float(self._widget.ui.slice_width.value())
+            except Exception:
+                center = width = None
+            if center is not None and width is not None and slice_vals.size:
+                inds = (center - width <= slice_vals) & (slice_vals <= center + width)
+        if reduce_axis == 0:
+            y = np.nanmean(intensity[inds, :], axis=0)
+        else:
+            y = np.nanmean(intensity[:, inds], axis=1)
+        y = self._normalize(y, publication.metadata_raw)
+        this_axis = None
+        if convert:
+            x, this_axis = self._apply_plot_unit_1d(
+                x, str(getattr(x_axis, "unit", "") or ""), publication)
+        if this_axis is None:
+            this_axis = _axis_for_publication(x_axis)
+        if x.shape[0] != y.shape[0]:
+            return None
+        return x, y, this_axis
+
+    def _integration_trace_label(self, publication, axis_info) -> str:
+        """Trace name with the legacy slice-range suffix when slicing a 2D
+        projection (``build_plot_names`` parity)."""
+        name = _trace_name(publication, self._widget)
+        if _slice_enabled(self._widget) and axis_info.get("source") in ("2d", "1d_2d"):
+            try:
+                c = float(self._widget.ui.slice_center.value())
+                w = float(self._widget.ui.slice_width.value())
+                name = f"{name} [{c:g}±{w:g}]"
+            except Exception:
+                pass
+        return name
+
     def _can_use_native_1d_axis(self, state) -> bool:
         widget = self._widget
         if widget is None:

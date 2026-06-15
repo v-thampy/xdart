@@ -746,3 +746,50 @@ def test_display_logic_imports_no_heavy_deps():
         f"display_logic pulled in forbidden modules: {proc.stdout.strip()}\n"
         f"{proc.stderr.strip()}"
     )
+
+
+# ── #69 / WS-X2: PanelKey-level render planning (additive, behavior-preserving) ──
+
+def test_render_keys_for_state_keeps_repeated_role_instances():
+    slices = [dl.PanelKey(dl.PanelRole.SLICE_2D, i) for i in ("HK", "HL", "KL")]
+    projs = [dl.PanelKey(dl.PanelRole.PROJ_1D, i) for i in ("H", "K", "L")]
+    panels = tuple((k, dl.PanelPlan(visible=True, has_data=True))
+                   for k in (*slices, *projs))
+    state = _make_display_state(panels=panels, layout=(tuple(slices), tuple(projs)))
+    keys = dl.render_keys_for_state(state)
+    # every repeated instance survives (no role collapse) ...
+    for k in (*slices, *projs):
+        assert k in keys
+    # ... while the role version still collapses to 2 roles
+    assert dl.render_roles_for_state(state)[:2] == (
+        dl.PanelRole.SLICE_2D, dl.PanelRole.PROJ_1D,
+    )
+    # absent legacy roles are appended as singleton cleanup keys
+    assert dl.PanelKey(dl.PanelRole.PLOT_1D) in keys
+
+
+def test_render_plan_draw_keys_mirror_draw_for_singleton_view():
+    state = dl.compute_display_state(**_base_state_kwargs(
+        mode=dl.Mode.INT_1D, selected_ids=(0,), all_frame_index=[0],
+        loaded_1d_keys={0}, loaded_2d_keys={0}))
+    plan = dl.render_plan(state, dl.build_payload(state))
+    # behavior-preserving: keys are 1:1 by role with the role-level draw/clear
+    assert plan.draw_keys == (dl.PanelKey(dl.PanelRole.PLOT_1D),)
+    assert set(plan.clear_keys) == {
+        dl.PanelKey(dl.PanelRole.RAW_2D), dl.PanelKey(dl.PanelRole.CAKE_2D),
+    }
+    assert tuple(k.role for k in plan.draw_keys) == plan.draw
+    assert tuple(k.role for k in plan.clear_keys) == plan.clear
+
+
+def test_render_plan_draw_keys_carry_all_rsm_instances():
+    slices = [dl.PanelKey(dl.PanelRole.SLICE_2D, i) for i in ("HK", "HL", "KL")]
+    projs = [dl.PanelKey(dl.PanelRole.PROJ_1D, i) for i in ("H", "K", "L")]
+    panels = tuple((k, dl.PanelPlan(visible=True, has_data=True))
+                   for k in (*slices, *projs))
+    state = _make_display_state(panels=panels, layout=(tuple(slices), tuple(projs)))
+    plan = dl.render_plan(state, dl.build_payload(state))
+    for k in (*slices, *projs):
+        assert k in plan.draw_keys           # every instance drawn (key-level)
+    # role-level draw still collapses (what the renderer consumes today)
+    assert plan.draw[:2] == (dl.PanelRole.SLICE_2D, dl.PanelRole.PROJ_1D)
