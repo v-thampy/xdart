@@ -1757,6 +1757,24 @@ def _render_host():
     return host, calls, dl
 
 
+def test_clear_binned_view_drops_stale_slice_overlay():
+    # P3 (Step-5 review): a blanked cake must not keep a floating slice-band ROI.
+    # The flip moved the band re-attach to the cake renderer (_draw_image_payload),
+    # so clearing the cake must clear the band too.
+    from unittest.mock import MagicMock
+    calls = []
+    host = SimpleNamespace(
+        binned_widget=MagicMock(),
+        binned_data=("img", "rect"),
+        _clear_image_widget=lambda w: calls.append("clear_img"),
+        clear_slice_overlay=lambda: calls.append("clear_overlay"),
+    )
+    host.clear_binned_view = MethodType(displayFrameWidget.clear_binned_view, host)
+    host.clear_binned_view()
+    assert host.binned_data is None
+    assert "clear_overlay" in calls
+
+
 def test_render_display_int2d_draws_all_panels():
     host, calls, dl = _render_host()
     state = dl.compute_display_state(
@@ -1813,7 +1831,11 @@ def test_render_display_uses_publication_plot_payload_when_present():
     np.testing.assert_allclose(host.plot_data[1], [[1.0, 2.0, 3.0]])
 
 
-def test_publication_plot_fallback_uses_legacy_draw_for_derived_axes_and_slice():
+def test_publication_plot_native_uses_payload_derived_falls_back():
+    # Step 5 FLIP: native INT 1D draws through the publication payload
+    # (update_plot_view).  A 2D-derived axis / slice on a 1D-ONLY frame can't
+    # build a 2D projection (no intensity_2d), so the payload returns None and
+    # render_display falls back to the legacy update_plot.
     from xrd_tools.core import Axis, FrameView
     from xdart.gui.tabs.static_scan.display_publication import PublicationDisplayAdapter
     from xdart.modules.frame_publication import (
@@ -1830,6 +1852,17 @@ def test_publication_plot_fallback_uses_legacy_draw_for_derived_axes_and_slice()
             "axis": "radial",
         }]
         host.normalize = lambda data, metadata: data
+        # The publication 1D draw funnels into update_plot_view; give the host
+        # the state it reads/writes (Step-5 flip).
+        host.bkg_1d = None
+        host.plot_data = [np.zeros(0), np.zeros(0)]
+        host.plot_data_range = [[0, 0], [0, 0]]
+        host.frame_names = []
+        host.overlaid_idxs = []
+        host._payload_x_axis_label = None
+        host._payload_y_axis_label = None
+        host._using_publication_plot_payload = False
+        host.update_plot_view = lambda: calls.append("payload_plot")
         host.ui.plotUnit.currentIndex.return_value = 0
         host.ui.plotUnit.currentText.return_value = "Q (Å⁻¹)"
         host.ui.slice.isChecked.return_value = sliced
@@ -1863,7 +1896,14 @@ def test_publication_plot_fallback_uses_legacy_draw_for_derived_axes_and_slice()
         host.render_display(state, payload)
         return calls, payload
 
-    for source, sliced in (("1d", False), ("2d", False), ("1d_2d", True)):
+    # Native 1D -> the publication payload draws it.
+    calls, payload = render_with_axis("1d", False)
+    assert payload.plot is not None
+    assert "payload_plot" in calls
+    assert "draw_plot" not in calls
+
+    # 2D-derived axis / slice on a 1D-only frame -> payload can't build -> legacy.
+    for source, sliced in (("2d", False), ("1d_2d", True)):
         calls, payload = render_with_axis(source, sliced)
         assert payload.plot is None
         assert "draw_plot" in calls

@@ -858,6 +858,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         state = self._live_display_state()
         ctrl = controller_for(state.mode)
+        # Share Axis silently re-points the plotUnit combo at the cake's x-axis.
+        # Post Step-5 flip the integration 1D draw reads that combo when it builds
+        # the payload, so sync it BEFORE build_payload — otherwise a single Share
+        # Axis toggle would draw the 1D in the stale unit (render_display also
+        # applies it, idempotent, for direct callers).  getattr: bare holders.
+        if state.mode in (Mode.INT_1D, Mode.INT_2D):
+            _ass = getattr(self, '_apply_share_axis_state', None)
+            if _ass is not None:
+                _ass()
         payload = ctrl.build_payload(self, state)  # store=None ⇒ delegate draws
         result = self.render_display(state, payload)
         self._display_blanked = False
@@ -977,6 +986,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.update_plot_view()
         finally:
             self._using_publication_plot_payload = False
+        # Honor a pending autorange (unit change, mode switch -> data_changed):
+        # the legacy 1D draw consumed _plot_autorange_requested in
+        # draw_plot_state; the payload path bypasses it, so consume it here.
+        if getattr(self, '_plot_autorange_requested', False):
+            self._plot_autorange_requested = False
+            _ar = getattr(self, '_autorange_plot_view', None)
+            if _ar is not None:
+                _ar()
         return True
 
     def _draw_image_payload(self, role, payload, state=None):
@@ -1037,6 +1054,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.image_data = (image, rect)
         else:
             self.binned_data = (image, rect)
+            # Re-attach the slice-band ROI on the cake.  Legacy update_binned_view
+            # did this at its tail (line ~1799); the Step-3 cake-payload flip
+            # dropped it and it survived only as a side effect of the legacy
+            # update_plot->get_int_1d 1D draw.  Step 5 routes the 1D draw through
+            # the pure payload (no show_slice_overlay), so the cake renderer must
+            # own the re-attach.  show_slice_overlay self-guards (clears + returns
+            # unless slicing a 2D-derived axis).  getattr: render_display unit
+            # tests bind _draw_image_payload onto a holder without it.
+            _sso = getattr(self, 'show_slice_overlay', None)
+            if _sso is not None:
+                _sso()
         return True
 
     @staticmethod
@@ -2024,6 +2052,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         try:
             self.binned_data = None
             self._clear_image_widget(self.binned_widget)
+            # A blanked cake must not keep a stale slice-band ROI floating over
+            # the empty panel.  Pre Step-5 the legacy get_int_1d re-attached the
+            # band every sliced 1D draw; now the cake renderer owns it
+            # (_draw_image_payload), so a cleared cake must drop it.
+            # clear_slice_overlay self-guards on overlay=None.
+            _cso = getattr(self, 'clear_slice_overlay', None)
+            if _cso is not None:
+                _cso()
         except Exception:
             logger.debug("clear_binned_view failed", exc_info=True)
 

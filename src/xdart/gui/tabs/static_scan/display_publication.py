@@ -368,11 +368,14 @@ class PublicationDisplayAdapter:
         return Axis(label=x_labels_2D[idx], unit=x_units_2D[idx], values=new_values)
 
     def plot_payload(self, state):
-        # INT 1D analysis plots are intentionally update_plot-canonical.  This
-        # scan-mode adapter supplies raw/cake payloads only; viewer plot
-        # payloads are built by their dedicated controllers.
+        # Step 5 FLIP: the integration 1D plot now draws from the publication
+        # record's active .view (see integration_plot_payload).  Single/Sum/
+        # Average flow through it (Sum/Average collapse at render in
+        # update_1d_view); Overlay/Waterfall + the 2D-slice/converted-axis
+        # fallbacks return None there, so render_display falls back to the
+        # legacy update_plot for those.
         if state.mode in (Mode.INT_1D, Mode.INT_2D):
-            return None
+            return self.integration_plot_payload(state)
         # Overlay/Waterfall still use the legacy accumulator until the
         # publication payload owns overlay history explicitly.
         if state.method in ("Overlay", "Waterfall"):
@@ -410,10 +413,10 @@ class PublicationDisplayAdapter:
         return PlotPayload(axis_x=axis, traces=tuple(traces))
 
     # ----------------------------------------------------------------- #
-    # Step 4: full-parity integration 1D payload (NOT wired into
-    # plot_payload yet — Step 5 flips the line-374 short-circuit).  Built
-    # and unit-tested standalone so the live integration draw stays on
-    # update_plot until the live GUI checkpoint.
+    # Full-parity integration 1D payload.  Step 5 WIRED this into
+    # plot_payload (above) for INT_1D/INT_2D; Overlay/Waterfall + the
+    # converted-axis-without-wavelength / 2D-slice cases return None here
+    # and stay on the legacy update_plot via render_display's fallback.
     # ----------------------------------------------------------------- #
     def integration_plot_payload(self, state):
         """Build the INT_1D/INT_2D 1D :class:`PlotPayload` for the active-mode
@@ -432,6 +435,19 @@ class PublicationDisplayAdapter:
         needs_2d = (source == "2d") or (
             source == "1d_2d" and _slice_enabled(widget)
         )
+
+        # Eviction parity (Step 5): render_ids = (selected | overall-all) ∩ loaded,
+        # so render_ids ⊊ selected_ids means some intended frame's arrays are not
+        # resident in the bounded store (evicted by max_heavy_items, or not yet
+        # loaded).  Defer the WHOLE draw to the legacy update_plot, which hydrates
+        # every selected frame from disk (display_data.get_frames_int_1d) —
+        # otherwise a whole-scan Sum/Average/Overall would SILENTLY drop the
+        # evicted frames.  selected_ids holds the full intended set for both the
+        # overall (= all_frame_index) and explicit-selection cases
+        # (resolve_selection); eviction is all-or-nothing per publication, so a
+        # resident (loaded) frame always carries both its 1D and 2D arrays.
+        if set(state.render_ids) != {int(i) for i in state.selected_ids}:
+            return None
 
         traces = []
         axis = None
@@ -569,7 +585,9 @@ class PublicationDisplayAdapter:
             try:
                 c = float(self._widget.ui.slice_center.value())
                 w = float(self._widget.ui.slice_width.value())
-                name = f"{name} [{c:g}±{w:g}]"
+                # Match the legacy build_plot_names / _loaded_1d_overlay_labels
+                # suffix EXACTLY: one decimal, U+00B1 (e.g. " [0.0±10.0]").
+                name = f"{name} [{c:.1f}±{w:.1f}]"
             except Exception:
                 pass
         return name

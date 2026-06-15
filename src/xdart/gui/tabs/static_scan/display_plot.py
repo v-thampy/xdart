@@ -251,6 +251,13 @@ class DisplayPlotMixin:
     def update_plot(self):
         """Updates data in plot frame
         """
+        # Legacy path owns its axis label from the plotUnit combo.  After the
+        # Step-5 flip a payload render may have stashed _payload_x/y_axis_label
+        # (read first by _current_plot_axis_label / update_1d_view); clear it so
+        # a control-driven legacy redraw (plotUnit/slice still wired to
+        # update_plot) doesn't show the stale payload label.
+        self._payload_x_axis_label = None
+        self._payload_y_axis_label = None
         if (self.scan.name == 'null_main') or (len(self.frame_ids) == 0):
             data = (np.arange(100), np.arange(100))
             return data

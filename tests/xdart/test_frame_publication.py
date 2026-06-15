@@ -286,7 +286,14 @@ def test_publication_display_adapter_exposes_availability_and_int_plot_fallback(
     )
     payload = PublicationDisplayAdapter(store, widget=_Widget()).plot_payload(state)
 
-    assert payload is None
+    # Step 5 FLIP: INT 1D now flows through the payload (was None pre-flip ->
+    # legacy update_plot).  Data is already 2theta (2th_deg) and the request is
+    # 2θ, so the native axis is used verbatim (no conversion); monitor-normalized.
+    assert payload is not None
+    np.testing.assert_allclose(payload.traces[0].x, np.linspace(10.0, 20.0, 4))
+    np.testing.assert_allclose(
+        payload.traces[0].y, np.array([10.0, 20.0, 30.0, 40.0]) / 100.0)
+    assert (payload.axis_x.label, payload.axis_x.unit) == ("2θ", "°")
 
 
 def test_publication_display_adapter_builds_raw_and_cake_image_payloads():
@@ -455,7 +462,11 @@ def test_gi_cake_axis_unit_is_angstrom_not_raw_key():
     assert cake.axis_y.values.shape == (3,)
 
 
-def test_publication_display_adapter_falls_back_for_non_native_plot_modes():
+def test_plot_payload_delegates_to_integration_after_step5_flip():
+    # Step 5 FLIP: plot_payload now delegates INT_1D/INT_2D to
+    # integration_plot_payload.  The cases that PRE-flip fell back to the legacy
+    # update_plot (2D-slice source, GI verbatim, Q<->2theta request) now return
+    # a payload through plot_payload itself (== integration_plot_payload).
     frame = DuckFrame(idx=10)
     store = PublicationStore()
     store.upsert(publication_from_live_frame(frame))
@@ -492,18 +503,27 @@ def test_publication_display_adapter_falls_back_for_non_native_plot_modes():
             "normalize": staticmethod(lambda data, metadata: data),
         })()
 
+    # native single: plot_payload returns a payload identical to the builder
+    native = PublicationDisplayAdapter(store, widget=widget())
+    p_native = native.plot_payload(state)
+    direct = native.integration_plot_payload(state)
+    assert p_native is not None and direct is not None
+    np.testing.assert_allclose(p_native.traces[0].x, direct.traces[0].x)
+    np.testing.assert_allclose(p_native.traces[0].y, direct.traces[0].y)
+    # 2D-slice / GI verbatim / 2theta-request: all now return a payload
+    # (previously None -> legacy update_plot fallback).
     assert PublicationDisplayAdapter(
         store, widget=widget(source="2d"),
-    ).plot_payload(state) is None
+    ).plot_payload(state) is not None
     assert PublicationDisplayAdapter(
         store, widget=widget(source="1d_2d", sliced=True),
-    ).plot_payload(state) is None
+    ).plot_payload(state) is not None
     assert PublicationDisplayAdapter(
         store, widget=widget(gi=True),
-    ).plot_payload(state) is None
+    ).plot_payload(state) is not None
     assert PublicationDisplayAdapter(
         store, widget=widget(text="2θ (°)"),
-    ).plot_payload(state) is None
+    ).plot_payload(state) is not None
 
 
 def _cake_widget(monitor_norm=True):
@@ -972,12 +992,73 @@ def test_integration_payload_overlay_waterfall_return_none():
         assert _adapter(store, _int_widget()).integration_plot_payload(state) is None
 
 
-def test_plot_payload_still_returns_none_for_int_modes():
-    # Step 4 must NOT flip line 374: the wired plot_payload still defers INT to legacy.
+def test_plot_payload_defers_overlay_waterfall_to_legacy_after_flip():
+    # Step 5 FLIP: plot_payload returns a payload for Single (delegating to
+    # integration_plot_payload) but still returns None for Overlay/Waterfall so
+    # render_display falls back to the legacy update_plot accumulator.
     frame = DuckFrame(idx=9)
     store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
-    state = _int_state(store, ids=(9,))
-    assert _adapter(store, _int_widget()).plot_payload(state) is None
+    adapter = _adapter(store, _int_widget())
+    assert adapter.plot_payload(_int_state(store, ids=(9,), method="Single")) is not None
+    for method in ("Overlay", "Waterfall"):
+        assert adapter.plot_payload(
+            _int_state(store, ids=(9,), method=method)) is None
+
+
+def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():
+    # Sum/Average go through the payload (NOT None): integration_plot_payload
+    # emits one Trace per frame (un-reduced), exactly like legacy
+    # get_frames_int_1d(rv='all'); the Sum/Average collapse happens at render in
+    # update_1d_view (nanmean/nansum over the stacked rows).  So the payload
+    # carries N traces and is non-None for Sum/Average.
+    store = PublicationStore()
+    for i in (0, 1, 2):
+        f = DuckFrame(idx=i)
+        f.scan_info = {"monitor": 1.0}
+        f.int_1d = IntegrationResult1D(
+            radial=np.linspace(0.5, 3.0, 6),
+            intensity=np.full(6, float(i + 1)), sigma=None, unit="q_A^-1")
+        store.upsert(publication_from_live_frame(f))
+    adapter = _adapter(store, _int_widget())
+    for method in ("Sum", "Average"):
+        payload = adapter.plot_payload(
+            _int_state(store, ids=(0, 1, 2), method=method))
+        assert payload is not None
+        assert len(payload.traces) == 3                       # un-reduced
+        # all traces share the radial grid (collapse-ready)
+        for tr in payload.traces:
+            np.testing.assert_allclose(tr.x, payload.traces[0].x)
+        # the render-level collapse would yield nanmean/nansum of [1,2,3]
+        stack = np.vstack([tr.y for tr in payload.traces])
+        np.testing.assert_allclose(np.nanmean(stack, 0), np.full(6, 2.0))
+        np.testing.assert_allclose(np.nansum(stack, 0), np.full(6, 6.0))
+
+
+def test_plot_payload_falls_back_when_a_selected_frame_is_evicted():
+    # P1 (Step-5 review): the bounded store evicts older frames' 1D arrays
+    # (max_heavy_items).  A whole-scan Sum/Average/Overall must NOT silently drop
+    # them — integration_plot_payload returns None so the legacy update_plot
+    # (which hydrates every selected frame from disk) owns the full selection.
+    store = PublicationStore(max_heavy_items=1)
+    for i in (0, 1, 2):
+        f = DuckFrame(idx=i)
+        f.scan_info = {"monitor": 1.0}
+        f.int_1d = IntegrationResult1D(
+            radial=np.linspace(0.5, 3.0, 6),
+            intensity=np.full(6, float(i + 1)), sigma=None, unit="q_A^-1")
+        store.upsert(publication_from_live_frame(f))
+    # frames 0,1 were thinned to the thumbnail tier (no 1D); 2 stays resident.
+    assert not store.get(0).view.has_1d
+    assert store.get(2).view.has_1d
+    adapter = _adapter(store, _int_widget())
+    # a selection that includes an evicted frame -> fall back to legacy (None)
+    for method in ("Average", "Sum", "Single"):
+        assert adapter.integration_plot_payload(
+            _int_state(store, ids=(0, 1, 2), method=method)) is None
+        assert adapter.plot_payload(
+            _int_state(store, ids=(0, 1, 2), method=method)) is None
+    # an all-resident selection still builds the payload (the flip applies).
+    assert adapter.plot_payload(_int_state(store, ids=(2,), method="Single")) is not None
 
 
 def test_integration_payload_gi_q_total_converts_to_2theta():
