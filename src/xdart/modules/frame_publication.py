@@ -534,18 +534,25 @@ def _merge_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRecord:
 
 
 def _same_source_id(sa, sb) -> bool:
-    """True unless the two source identities are a *different*, non-empty BASENAME.
+    """True unless the two source identities are genuinely DIFFERENT files.
 
-    Compared on ``os.path.basename`` so the SAME physical frame matches across
-    the abspath/relpath spellings it gets on different code paths — a live frame
-    carries an absolute ``source_file`` while a disk-reloaded frame carries the
-    relative ``source/path``, and a naive string compare would wrongly treat
-    them as different sources and skip a legitimate same-frame accumulation.
-    Still rejects a genuinely different file (a label reused across scans after a
-    missed ``clear()``)."""
-    na = os.path.basename(sa or "")
-    nb = os.path.basename(sb or "")
-    return not (na and nb and na != nb)
+    The SAME physical frame gets different spellings on different code paths — a
+    live frame carries an absolute ``source_file`` while a disk-reloaded frame
+    carries the relative ``source/path`` — so an exact string compare would
+    wrongly skip a legitimate same-frame accumulation.  Compared by PATH-COMPONENT
+    SUFFIX: equal after ``normpath``, or the shorter path's components are a tail
+    of the longer's (abs vs rel of the same file).  Unlike a bare-basename
+    compare this still REJECTS two different directories that share a filename
+    (e.g. ``run1/frame_0001.tif`` vs ``run2/frame_0001.tif``).  An empty
+    identity on either side is treated as a wildcard (can't tell -> allow)."""
+    if not sa or not sb:
+        return True
+    na, nb = os.path.normpath(sa), os.path.normpath(sb)
+    if na == nb:
+        return True
+    pa, pb = na.split(os.sep), nb.split(os.sep)
+    short, long_ = (pa, pb) if len(pa) <= len(pb) else (pb, pa)
+    return long_[-len(short):] == short
 
 
 def _same_source(a: FramePublication, b: FramePublication) -> bool:
@@ -631,6 +638,17 @@ class PublicationStore:
             self._items.clear()
             self._heavy_labels.clear()
             self._thumb_labels.clear()
+
+    def end_reintegrate(self) -> None:
+        """Drop any carry-over NOT consumed during the pass.
+
+        ``upsert`` pops a carry-over entry only when its frame is republished, so
+        a reintegrate that stopped early or skipped a failed frame would otherwise
+        leave stale records pinned — and a later scroll-back rehydration of such a
+        frame would merge that stale record.  The reintegrate wrappers call this
+        in a ``finally`` so it runs on stop/exception too.  Idempotent."""
+        with self._lock:
+            self._carryover.clear()
 
     def set_hydrator(self, hydrator) -> None:
         """Register the rehydration source for :meth:`get_or_hydrate`."""

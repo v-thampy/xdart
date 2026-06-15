@@ -1220,3 +1220,42 @@ def test_carryover_merges_across_abspath_relpath_source():
     store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation,
                            source_identity="recon_0001.tif"))             # reload relpath
     assert set(store.get(0).record.modes_1d) == {"q_total", "q_ip"}       # accumulated
+
+
+def test_one_d_reintegrate_preserves_prior_2d_mode():
+    # Footgun guard (review): a 1D-only reintegrate must NOT drop the 2D mode
+    # accumulated in the original run.  begin_reintegrate carries the full record;
+    # the 1D-only re-upsert merges the new 1D mode while the carried 2D survives.
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", mode_2d="qip_qoop",
+                           generation=store.generation))
+    store.begin_reintegrate()                       # a 1D Integrate pass
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation))  # 1D-only
+    rec = store.get(0).record
+    assert set(rec.modes_1d) == {"q_total", "q_ip"}    # 1D accumulated
+    assert rec.modes_2d == ("qip_qoop",)               # 2D PRESERVED (not dropped)
+
+
+def test_end_reintegrate_drops_unconsumed_carryover():
+    # P1 (codex): a stopped/skipped reintegrate must not leave stale carry-over
+    # that a later rehydration/upsert would merge.
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation))
+    store.upsert(_mode_pub(1, mode_1d="q_total", generation=store.generation))
+    store.begin_reintegrate()                       # carries 0 and 1
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation))  # only 0 republished
+    store.end_reintegrate()                         # pass ended; frame 1 was skipped
+    store.upsert(_mode_pub(1, mode_1d="q_oop", generation=store.generation))  # later (re)hydrate
+    assert store.get(1).record.modes_1d == ("q_oop",)            # no stale q_total merged
+    assert set(store.get(0).record.modes_1d) == {"q_total", "q_ip"}  # 0 accumulated normally
+
+
+def test_same_source_id_suffix_match_rejects_different_dir():
+    # P2 (codex): suffix-match by path components, not bare basename — abs/rel of
+    # the SAME file merges; two different directories sharing a filename do NOT.
+    from xdart.modules.frame_publication import _same_source_id
+    assert _same_source_id("/data/run1/frame_0001.tif", "frame_0001.tif")        # abs vs bare rel
+    assert _same_source_id("/data/run1/frame_0001.tif", "run1/frame_0001.tif")   # abs vs rel+dir
+    assert not _same_source_id("run1/frame_0001.tif", "run2/frame_0001.tif")     # different dirs
+    assert not _same_source_id("/data/run1/frame_0001.tif", "/data/run2/frame_0001.tif")
+    assert _same_source_id("", "frame_0001.tif")                                 # empty -> wildcard

@@ -263,15 +263,28 @@ class integratorThread(Qt.QtCore.QThread):
         self._upsert_publication_for_frame(frame)
         self.update.emit(idx)
 
+    def _end_reintegrate_carryover(self) -> None:
+        """Drop any publication carry-over not consumed by the reintegrate pass
+        (Step 6 / codex P1) — so a stopped/failed pass can't leave stale records
+        that a later scroll-back rehydration would merge.  In a ``finally``."""
+        if self.publication_store is not None:
+            self.publication_store.end_reintegrate()
+
     def bai_2d_all(self):
         """Integrates all frames 2d.  Thin wrapper over _reintegrate_all."""
         if getattr(self.scan, 'skip_2d', False):
             return
-        self._reintegrate_all(do_2d=True)
+        try:
+            self._reintegrate_all(do_2d=True)
+        finally:
+            self._end_reintegrate_carryover()
 
     def bai_1d_all(self):
         """Integrates all frames 1d.  Thin wrapper over _reintegrate_all."""
-        self._reintegrate_all(do_2d=False)
+        try:
+            self._reintegrate_all(do_2d=False)
+        finally:
+            self._end_reintegrate_carryover()
 
     def _reintegrate_all(self, *, do_2d: bool) -> None:
         """Shared GUI-button reintegration body for 1D and 2D paths.
