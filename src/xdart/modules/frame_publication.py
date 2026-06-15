@@ -9,6 +9,7 @@ store without reaching back through widget state.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, replace
 from threading import RLock
 from types import MappingProxyType
@@ -240,12 +241,21 @@ def publication_error_details(publication: FramePublication, output: str) -> str
 def _record_from_live_frame(frame, view, metadata_raw, incident_angle,
                             active_mode_1d, active_mode_2d) -> FrameRecord:
     """Build the multi-result :class:`FrameRecord` from a live frame's per-mode
-    GI dicts.  Non-GI frames (empty ``gi_1d``/``gi_2d``) collapse to a single
-    ``DEFAULT_MODE_KEY`` record equivalent to ``view``."""
+    GI dicts.
+
+    Non-GI frames (and the v2 reduce path, which sets only ``int_1d``/``int_2d``
+    and leaves ``gi_1d``/``gi_2d`` empty) collapse to a single-mode record from
+    ``view`` — keyed under the passed ``active_mode_*`` when given (so a GI scan's
+    record carries the real mode, e.g. ``q_total``, not ``DEFAULT_MODE_KEY``),
+    else ``DEFAULT_MODE_KEY`` (behaviour-preserving for non-GI callers)."""
     gi_1d = getattr(frame, "gi_1d", None) or {}
     gi_2d = getattr(frame, "gi_2d", None) or {}
     if not gi_1d and not gi_2d:
-        return FrameRecord.from_view(view)
+        return FrameRecord.from_view(
+            view,
+            mode_1d=active_mode_1d or DEFAULT_MODE_KEY,
+            mode_2d=active_mode_2d or DEFAULT_MODE_KEY,
+        )
 
     label = view.label
     common = dict(
@@ -523,14 +533,23 @@ def _merge_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRecord:
     return acc
 
 
+def _same_source_id(sa, sb) -> bool:
+    """True unless the two source identities are a *different*, non-empty BASENAME.
+
+    Compared on ``os.path.basename`` so the SAME physical frame matches across
+    the abspath/relpath spellings it gets on different code paths — a live frame
+    carries an absolute ``source_file`` while a disk-reloaded frame carries the
+    relative ``source/path``, and a naive string compare would wrongly treat
+    them as different sources and skip a legitimate same-frame accumulation.
+    Still rejects a genuinely different file (a label reused across scans after a
+    missed ``clear()``)."""
+    na = os.path.basename(sa or "")
+    nb = os.path.basename(sb or "")
+    return not (na and nb and na != nb)
+
+
 def _same_source(a: FramePublication, b: FramePublication) -> bool:
-    """True unless both publications carry a *different*, non-empty
-    ``source_identity`` — cheap insurance against a frame label reused across
-    scans/files (e.g. labels restarting at 1) after a missed ``clear()``: such a
-    collision must NOT accumulate into one record."""
-    sa = a.source_identity
-    sb = b.source_identity
-    return not (sa and sb and sa != sb)
+    return _same_source_id(a.source_identity, b.source_identity)
 
 
 class PublicationStore:
@@ -569,6 +588,13 @@ class PublicationStore:
         # reads on the GUI thread; the thumbnail tier keeps scroll-back
         # paintable meanwhile).
         self._hydrator = None
+        # Step 6: prior-pass (record, source_identity) carried across a same-scan
+        # reintegrate so a re-upsert MERGES the recomputed mode into the frame's
+        # accumulated record (begin_reintegrate populates it; upsert consumes per
+        # label).  Only the record + source are carried — NOT the full
+        # publication — so the heavy raw_ref (the frame holding map_raw) is not
+        # pinned for the duration of the pass.
+        self._carryover: dict[int | str, tuple] = {}
 
     @property
     def generation(self) -> int:
@@ -576,7 +602,31 @@ class PublicationStore:
             return self._generation
 
     def clear(self) -> None:
+        """Full reset (a scan boundary): empty everything + bump generation."""
         with self._lock:
+            self._generation += 1
+            self._items.clear()
+            self._heavy_labels.clear()
+            self._thumb_labels.clear()
+            self._carryover.clear()
+
+    def begin_reintegrate(self) -> None:
+        """Reset for a SAME-SCAN reintegrate pass (Step 6).
+
+        Empties ``_items`` and bumps the generation exactly like :meth:`clear`,
+        so the mid-pass display is byte-identical to today (a partial Overall
+        view blanks, a single frame re-renders fresh as it is republished).  But
+        each frame's prior publication is CARRIED OVER, so when that frame is
+        re-upserted this pass, :meth:`upsert` merges the recomputed mode into its
+        accumulated record (the prior GI modes survive instead of being wiped).
+        Eviction is respected: an evicted frame carries a thinned record, so its
+        dropped modes are not resurrected (they rehydrate from disk)."""
+        with self._lock:
+            self._carryover = {
+                label: (pub.record, pub.source_identity)
+                for label, pub in self._items.items()
+                if pub.record is not None
+            }
             self._generation += 1
             self._items.clear()
             self._heavy_labels.clear()
@@ -642,6 +692,20 @@ class PublicationStore:
                 self._items.pop(label)
                 self._drop_heavy_label_locked(label)
                 self._drop_thumb_label_locked(label)
+            else:
+                # Step 6: first re-upsert of this frame in a reintegrate pass —
+                # merge the recomputed mode into the record carried over from the
+                # previous pass (begin_reintegrate), so the frame's accumulated
+                # GI modes survive.  Source-guarded like the in-store merge; the
+                # carried entry is consumed (popped) so it merges only once.
+                carried = self._carryover.pop(label, None)
+                if carried is not None:
+                    carried_record, carried_source = carried
+                    if _same_source_id(carried_source, publication.source_identity):
+                        publication = replace(
+                            publication,
+                            record=_merge_records(carried_record, publication.record),
+                        )
             self._items[publication.label] = publication
             if _publication_has_heavy_payload(publication):
                 self._heavy_labels.append(label)

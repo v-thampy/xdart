@@ -151,10 +151,22 @@ class integratorThread(Qt.QtCore.QThread):
             from xdart.modules.frame_publication import (
                 publication_from_live_frame,
             )
+            # Step 6: key the record under the real GI mode (canonical
+            # bai_*_args values) so successive Integrate passes at different
+            # modes ACCUMULATE into one record instead of colliding under
+            # DEFAULT_MODE_KEY (the v2 reducer leaves frame.gi_* empty).  Non-GI
+            # -> None -> DEFAULT (unchanged).  .view is unaffected.
+            _is_gi = bool(getattr(self.scan, "gi", False))
             self.publication_store.upsert(
                 publication_from_live_frame(
                     frame,
                     generation=self.publication_store.generation,
+                    active_mode_1d=(
+                        self.scan.bai_1d_args.get("gi_mode_1d", "q_total")
+                        if _is_gi else None),
+                    active_mode_2d=(
+                        self.scan.bai_2d_args.get("gi_mode_2d", "qip_qoop")
+                        if _is_gi else None),
                 )
             )
         except Exception:
@@ -298,11 +310,16 @@ class integratorThread(Qt.QtCore.QThread):
                 clear_hydrated_raw(self.data_2d)
             else:
                 self.data_1d.clear()
-        # Drop stale publications and bump the store generation so any
-        # in-flight generation-checked subscribers reject pre-reintegration
-        # chunks.  Every frame is republished below via ``_publish``.
+        # Step 6: reset for a same-scan reintegrate.  begin_reintegrate empties
+        # _items + bumps the generation exactly like clear() (so the mid-pass
+        # display is unchanged: a partial Overall view blanks, a single frame
+        # re-renders fresh as it is republished, and stale generation-checked
+        # chunks are still rejected), but CARRIES OVER each frame's record so the
+        # per-frame re-upsert below merges the recomputed GI mode into its
+        # accumulated modes instead of wiping them.  (The legacy data_1d/data_2d
+        # caches are still cleared above for the legacy 1D draw path.)
         if self.publication_store is not None:
-            self.publication_store.clear()
+            self.publication_store.begin_reintegrate()
         with self.scan.scan_lock:
             if do_2d:
                 self.scan.bai_2d = None

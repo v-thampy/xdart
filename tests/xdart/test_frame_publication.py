@@ -1131,3 +1131,92 @@ def test_accumulation_first_upsert_is_plain_replace_additive():
     store.upsert(pub)
     assert_framerecord_equivalent(store.get(0).record, pub.record)
     assert_frameview_equivalent(store.get(0).view, pub.view)
+
+
+# ===================================================================== #
+# Step 6 activation: key the record under the real GI mode + carry records
+# across a same-scan reintegrate so accumulation is REAL in production.
+# ===================================================================== #
+
+def test_record_keys_under_passed_active_mode_when_gi_dicts_empty():
+    # The v2 reducer leaves gi_1d/gi_2d empty; the active_mode_* hint must key
+    # the single-mode record under the REAL mode, not DEFAULT.
+    rec = publication_from_live_frame(
+        DuckFrame(idx=1, gi=True),
+        active_mode_1d="q_oop", active_mode_2d="q_chi").record
+    assert rec.modes_1d == ("q_oop",)
+    assert rec.modes_2d == ("q_chi",)
+    assert rec.active_mode_1d == "q_oop" and rec.active_mode_2d == "q_chi"
+
+
+def test_record_stays_default_when_no_active_mode_passed():
+    rec = publication_from_live_frame(DuckFrame(idx=1, gi=True)).record
+    assert rec.active_mode_1d == DEFAULT_MODE_KEY
+    assert rec.active_mode_2d == DEFAULT_MODE_KEY
+
+
+def test_view_unchanged_by_active_mode_keying():
+    f = DuckFrame(idx=2, gi=True)
+    base = publication_from_live_frame(f)
+    keyed = publication_from_live_frame(f, active_mode_1d="q_ip", active_mode_2d="q_chi")
+    assert_frameview_equivalent(base.view, keyed.view)   # display surface unchanged
+
+
+def test_begin_reintegrate_empties_like_clear_but_accumulates():
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation))
+    g0 = store.generation
+    store.begin_reintegrate()
+    assert store.generation == g0 + 1          # bumped like clear (display unchanged)
+    assert store.get(0) is None                # _items emptied (mid-pass blank/build)
+    # re-upsert frame 0 at q_ip this pass -> merges with the carried q_total
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation))
+    rec = store.get(0).record
+    assert set(rec.modes_1d) == {"q_total", "q_ip"}   # ACCUMULATED across the pass
+    assert rec.active_mode_1d == "q_ip"
+
+
+def test_begin_reintegrate_accumulates_across_three_passes():
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation))
+    store.begin_reintegrate()
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation))
+    store.begin_reintegrate()
+    store.upsert(_mode_pub(0, mode_1d="q_oop", generation=store.generation))
+    assert set(store.get(0).record.modes_1d) == {"q_total", "q_ip", "q_oop"}
+
+
+def test_begin_reintegrate_evicted_carryover_does_not_resurrect():
+    # An evicted (thinned) frame carries a thinned record; the re-upsert does
+    # NOT bring back its dropped modes (they rehydrate from disk instead).
+    store = PublicationStore(max_heavy_items=1, max_thumbnail_items=1)
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation))
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation))
+    for idx in (1, 2, 3):                       # push frame 0 past the heavy bound
+        store.upsert(_mode_pub(idx, mode_1d="q_total", generation=store.generation))
+    store.begin_reintegrate()
+    store.upsert(_mode_pub(0, mode_1d="q_oop", generation=store.generation))
+    assert store.get(0).record.modes_1d == ("q_oop",)   # no resurrection of evicted modes
+
+
+def test_clear_drops_carryover():
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation))
+    store.begin_reintegrate()                  # carries frame 0
+    store.clear()                              # a full reset must drop the carry-over
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation))
+    assert store.get(0).record.modes_1d == ("q_ip",)    # no resurrection after clear
+
+
+def test_carryover_merges_across_abspath_relpath_source():
+    # P2 regression (review): a live frame's source_identity is an ABSPATH while
+    # the reintegrate reload uses the RELPATH of the same file; basename-
+    # normalized _same_source must treat them as the SAME source so the live
+    # mode is NOT dropped on the next Integrate.
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation,
+                           source_identity="/data/run1/recon_0001.tif"))  # live abspath
+    store.begin_reintegrate()
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation,
+                           source_identity="recon_0001.tif"))             # reload relpath
+    assert set(store.get(0).record.modes_1d) == {"q_total", "q_ip"}       # accumulated

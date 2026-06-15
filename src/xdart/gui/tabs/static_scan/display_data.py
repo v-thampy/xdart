@@ -223,8 +223,20 @@ class DisplayDataMixin:
         generation = store.generation if store is not None else 0
         try:
             from xdart.modules.frame_publication import publication_from_live_frame
+            # Step 6: key the rehydrated record under the real GI mode (same as
+            # the live/reintegrate upsert sites) so an evicted-then-rehydrated
+            # frame's record is consistent with the rest.  .view is unaffected.
+            _scan = getattr(self, "scan", None)
+            _is_gi = bool(getattr(_scan, "gi", False))
             return publication_from_live_frame(
-                lf, generation=generation, include_raw=True)
+                lf, generation=generation, include_raw=True,
+                active_mode_1d=(
+                    _scan.bai_1d_args.get("gi_mode_1d", "q_total")
+                    if _is_gi else None),
+                active_mode_2d=(
+                    _scan.bai_2d_args.get("gi_mode_2d", "qip_qoop")
+                    if _is_gi else None),
+            )
         except Exception:
             logger.debug("rehydrate: publication build failed for %s", label,
                          exc_info=True)

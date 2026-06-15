@@ -703,9 +703,20 @@ class staticWidget(QWidget):
                 global_mask = getattr(published, "mask", None)
                 if global_mask is not None:
                     self.scan.global_mask = global_mask
+                # Step 6: key the live record under the real GI mode so a later
+                # reintegrate at the same mode folds onto it (instead of the live
+                # record sitting under DEFAULT and the reintegrate under the real
+                # mode, leaving two un-mergeable entries).  .view is unaffected.
+                _is_gi = bool(getattr(self.scan, "gi", False))
                 publication = publication_from_live_frame(
                     frame,
                     generation=self.publication_store.generation,
+                    active_mode_1d=(
+                        self.scan.bai_1d_args.get("gi_mode_1d", "q_total")
+                        if _is_gi else None),
+                    active_mode_2d=(
+                        self.scan.bai_2d_args.get("gi_mode_2d", "qip_qoop")
+                        if _is_gi else None),
                 )
                 with self.h5viewer.data_lock:
                     # 1D copy (no map_raw / 2D payload) — small object
