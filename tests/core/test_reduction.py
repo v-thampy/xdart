@@ -895,3 +895,74 @@ def test_nexussink_persists_scan_data_roundtrip(tmp_path: Path) -> None:
     np.testing.assert_allclose(sd["temperature"], [300.0, 305.0, 310.0])
     np.testing.assert_allclose(sd["stress"], [2.0, 4.0, 6.0])
     np.testing.assert_allclose(sd["th"], [0.15, 0.25, 0.35])
+
+
+def test_reduction_saturation_mask_gated_by_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3-C: plan.mask_saturation=True masks a saturated module (fraction-guarded);
+    default (False) leaves the headless mask unchanged.  A frame with ONLY sparse
+    ceiling pixels (genuine Bragg saturation) is NOT masked."""
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        reduction_core, "integrate_1d",
+        lambda image, ai, **kw: (calls.append(kw),
+                                 _r1d(1.0, unit=kw.get("unit", "q_A^-1")))[1])
+
+    def _run(img, mask_saturation):
+        calls.clear()
+        run_reduction(
+            ReductionPlan(
+                integration_1d=Integration1DPlan(npt=5, unit="q_A^-1", method="BBox"),
+                mask_saturation=mask_saturation),
+            Scan(name="sat", frames=[Frame(index=0, image=img.copy())],
+                 integrator=object()),
+            chunk_size=1,
+        )
+        return calls[0]["mask"]
+
+    img = np.zeros((100, 100), dtype=np.uint16)
+    img[:5, :] = 65535          # dead/overflowed module: 500/10000 = 5% > 1e-4
+
+    assert _run(img, False) is None                      # OFF (default): no-op
+    mask_on = _run(img, True)
+    assert mask_on is not None
+    assert mask_on[:5, :].all() and mask_on.sum() == 500  # module excluded
+
+    # A single genuinely-saturated Bragg pixel (<= 1e-4) is preserved.
+    sparse = np.zeros((100, 100), dtype=np.uint16)
+    sparse[50, 50] = 65535
+    assert _run(sparse, True) is None
+
+
+def test_reduction_saturation_ceiling_dtype_derived_not_hardcoded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ceiling follows the integer dtype (uint8 -> 255), never assumes 65535;
+    a float frame (ceiling None) is a no-op even with the flag on."""
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        reduction_core, "integrate_1d",
+        lambda image, ai, **kw: (calls.append(kw),
+                                 _r1d(1.0, unit=kw.get("unit", "q_A^-1")))[1])
+
+    def _run(img):
+        calls.clear()
+        run_reduction(
+            ReductionPlan(
+                integration_1d=Integration1DPlan(npt=5, unit="q_A^-1", method="BBox"),
+                mask_saturation=True),
+            Scan(name="x", frames=[Frame(index=0, image=img.copy())],
+                 integrator=object()),
+            chunk_size=1,
+        )
+        return calls[0]["mask"]
+
+    u8 = np.zeros((100, 100), dtype=np.uint8)
+    u8[:5, :] = 255             # uint8 ceiling is 255, not 65535
+    m = _run(u8)
+    assert m is not None and m[:5, :].all() and m.sum() == 500
+
+    f = np.zeros((100, 100), dtype=float)
+    f[:5, :] = 65535.0          # float -> integer dtype lost -> ceiling None -> no-op
+    assert _run(f) is None

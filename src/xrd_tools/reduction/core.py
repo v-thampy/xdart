@@ -254,6 +254,14 @@ class ReductionPlan:
     mask: np.ndarray | MaskSpec | None = None
     threshold_min: float | None = None
     threshold_max: float | None = None
+    # R3-C: opt-in detector-saturation masking in the HEADLESS reduction path.
+    # When True, _reduce_frame excludes the dtype-derived saturation ceiling
+    # (np.iinfo(dtype).max, e.g. uint16 65535) using the same fraction-guarded
+    # policy as the GUI (xrd_tools.core.invalid.saturation_pixels): masked only
+    # when a whole module sits at the ceiling (>1e-4 of the frame), never a few
+    # genuinely-saturated Bragg pixels.  Default False is behavior-preserving;
+    # core never hardcodes 65535 (a float-dtype frame -> ceiling None -> no-op).
+    mask_saturation: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -2044,7 +2052,8 @@ def _reduce_frame(
         raise _ReductionCancelled
     if raw_image is not None:
         frame.image = np.asarray(raw_image)
-    image = np.asarray(frame.load_image(), dtype=float)
+    raw_image_arr = np.asarray(frame.load_image())  # pre-float: integer dtype for the saturation ceiling
+    image = raw_image_arr.astype(float)
     if cancel_token is not None and cancel_token.cancelled:
         raise _ReductionCancelled
     if image.ndim != 2:
@@ -2059,6 +2068,7 @@ def _reduce_frame(
         plan_masks,
     )
     mask = _combined_mask(plan_mask, frame.mask, image.shape)
+    mask = _apply_saturation_mask(mask, raw_image_arr, plan)
 
     if plan.gi is not None:
         fi = integrators.fiber()
@@ -2432,6 +2442,27 @@ def _combined_mask(
     if frame_mask is None:
         return plan_mask
     return plan_mask | frame_mask
+
+
+def _apply_saturation_mask(mask, raw_image, plan):
+    """R3-C: OR the fraction-guarded detector-saturation mask into ``mask``.
+
+    No-op unless ``plan.mask_saturation`` is set.  The ceiling is derived from
+    the RAW integer dtype (uint16 -> 65535, uint8 -> 255), read from the
+    pre-float ``raw_image`` — core never hardcodes 65535, so a float-dtype frame
+    (ceiling None) yields an all-False mask and this stays a no-op.  Mirrors the
+    GUI policy (saturation_pixels' >1e-4 fraction guard) so live/GUI and headless
+    masks agree when both opt in.  ``raw_image`` (original detector counts) is
+    used deliberately — thresholding-to-NaN / background subtraction would
+    corrupt the exact-ceiling equality test."""
+    if not plan.mask_saturation:
+        return mask
+    from xrd_tools.core.invalid import integer_saturation_ceiling, saturation_pixels
+
+    sat = saturation_pixels(raw_image, ceiling=integer_saturation_ceiling(raw_image))
+    if not sat.any():
+        return mask
+    return sat if mask is None else (mask | sat)
 
 
 # S8: fallback warn-state for direct (sessionless) calls.  Sessions own
