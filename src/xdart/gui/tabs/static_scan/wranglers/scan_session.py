@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
-"""``ScanSessionAdapter`` — xdart's bridge over a streaming ReductionSession.
+"""``ScanSessionAdapter`` — xdart's thin bridge over the public
+``xrd_tools.session.ScanSession`` (4f-bridge; see the Status block below).
 
 Phase 4c-1: the per-frame register+submit, the pause quiesce, and the
 sink flush that were inlined in ``imageWranglerThread`` move behind one
-object that wraps a streaming ``ReductionSession`` + its ``QtNexusSink``.
+object that wraps the public ``ScanSession`` (built by ``open_live_scan_session``,
+which arms the streaming ``ReductionSession`` internally) + its ``QtNexusSink``.
 It owns the three irreducibly-xdart concerns the headless session can't:
 the LiveFrame→Frame submit, the Qt-side stop-on-write-failure translation
 (never raise into the wrangler ``run()`` loop — that tears down the
-QThread), and the h5pool-bracketed sink flush.
+QThread), and the h5pool-bracketed sink flush (routed through
+``ScanSession.flush``).
 
-It strictly DELEGATES quiesce to ``ReductionSession.pause`` (4a) — it never
+It strictly DELEGATES quiesce to ``ScanSession.pause`` (4a) — it never
 reimplements drain — and never writes the sink itself (the session's single
 writer thread does), preserving the HDF5 single-writer invariant.
 

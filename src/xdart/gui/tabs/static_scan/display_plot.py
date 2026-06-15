@@ -571,10 +571,10 @@ class DisplayPlotMixin:
           ``scan_info['epoch']`` minus its own minimum (relative).
         * anything else → ``scan_info[wf_yaxis]`` directly.
 
-        For everything but ``'Frame #'`` we lift the values from
-        ``self.data_1d[idx].scan_info`` for every idx in
-        ``self.idxs``, then slice with the same wf_start/wf_step the
-        data uses.
+        For everything but ``'Frame #'`` we lift the values from each frame's
+        metadata via :meth:`_frame_scan_info` (store-first; Phase 3c) for every
+        idx in ``self.idxs``, then slice with the same wf_start/wf_step the data
+        uses.
         """
         if self.wf_yaxis == 'Frame #':
             return np.asarray(np.arange(n_rows) + self.wf_start + 1,
