@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 import warnings
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import h5py
 import numpy as np
@@ -45,13 +45,17 @@ from xrd_tools.core.metadata import ScanMetadata
 # xrd_tools.io.schema; this module is a consumer.  PROCESSED_SCHEMA_NAME /
 # _VERSION stay importable from here (public API since the C1 pull-ins).
 from xrd_tools.io.schema import (
+    DEFAULT_MODE_KEY,
     DTYPE_ATTR,
     MONOTONIC_ATTR,
+    MULTI_RESULT_MODES_ATTR,
+    PRIMARY_MODE_ATTR,
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
     SCHEMA,
     SCHEMA_NAME_ATTR,
     SCHEMA_VERSION_ATTR,
+    mode_subgroup_name,
 )
 from xrd_tools.transforms import energy_to_wavelength
 
@@ -1291,12 +1295,20 @@ def validate_integrated_stack_write(
 _NP_DTYPES = {"float32": np.float32, "int64": np.int64}
 
 
-def _create_group_from_schema(entry_grp: h5py.Group, group_name: str) -> h5py.Group:
+def _create_group_from_schema(
+    entry_grp: h5py.Group, group_name: str, *, disk_name: str | None = None
+) -> h5py.Group:
     """2b: create + stamp a group from its SCHEMA declaration.  Static NX
     attrs only — runtime-valued attrs (two_d_kind, the monotonic flag) are
-    stamped by the caller."""
+    stamped by the caller.
+
+    ``group_name`` selects the SCHEMA spec (datasets + nx_attrs); ``disk_name``
+    overrides the on-disk child name so a nested per-mode subgroup (e.g.
+    ``q_oop`` under ``integrated_1d``) is created with the SAME NXdata contract
+    as its parent group.  ``disk_name=None`` ⇒ the canonical name ⇒ the
+    existing top-level write is byte-identical."""
     spec = SCHEMA.groups[group_name]
-    g = entry_grp.create_group(group_name)
+    g = entry_grp.create_group(disk_name or group_name)
     for key, value in spec.nx_attrs.items():
         g.attrs[key] = list(value) if isinstance(value, tuple) else value
     return g
@@ -1359,16 +1371,50 @@ def validate_group_against_schema(group: h5py.Group,
     return problems
 
 
+def _stamp_mode_attrs(entry_grp, group_name, primary_mode, extra_modes) -> None:
+    """Stamp the per-scan multi-result mode attrs on a top-level integrated
+    group.  No-op for a ``DEFAULT_MODE_KEY`` / ``None`` primary (a standard or
+    unnamed scan ⇒ byte-identical, no new attrs).  A named GI primary records
+    ``primary_mode`` + ``multi_result_modes = [primary, *extras]`` — primary
+    FIRST, stored as an order-preserving h5py vlen-string array (never a set;
+    the reader and ``modes_*()[0] == primary`` depend on the order)."""
+    if primary_mode is None or primary_mode == DEFAULT_MODE_KEY:
+        return
+    g = entry_grp.get(group_name)
+    if g is None:
+        return
+    g.attrs[PRIMARY_MODE_ATTR] = primary_mode
+    g.attrs[MULTI_RESULT_MODES_ATTR] = [primary_mode, *(extra_modes or {})]
+
+
 def write_integrated_stack(
     entry_grp: h5py.Group,
     *,
     frame_indices: Sequence[int],
     results_1d: Sequence[IntegrationResult1D] | None = None,
     results_2d: Sequence[IntegrationResult2D] | None = None,
+    extra_modes_1d: "Mapping[str, Sequence[IntegrationResult1D]] | None" = None,
+    extra_modes_2d: "Mapping[str, Sequence[IntegrationResult2D]] | None" = None,
+    primary_mode_1d: str | None = None,
+    primary_mode_2d: str | None = None,
     compression: str | None = None,
 ) -> None:
     """Write/extend the stacked ``integrated_1d`` / ``integrated_2d`` NXdata
     groups from aligned lists of IntegrationResult + their frame labels.
+
+    Multi-result GI (ADR-0003): ``results_1d``/``results_2d`` are the PRIMARY
+    mode → the top-level group (meaning unchanged); ``extra_modes_*`` maps each
+    NON-primary GI ``mode_key`` to its aligned results list → a nested
+    ``integrated_<dim>/<mode>/`` NXdata subgroup (same contract as the parent).
+    ``primary_mode_*`` names the per-scan top-level slot: when it is a named GI
+    mode the group is stamped with ``primary_mode`` + ``multi_result_modes``
+    (primary first); a ``DEFAULT_MODE_KEY``/``None`` primary stamps nothing, so
+    a standard (non-GI) scan stays byte-identical.  Each group — top-level and
+    every nested child — is validated independently by the frozen uniform-axes
+    validators; nested children never affect top-level validation.
+
+    First-save only for nested modes in this revision: a nested per-mode re-save
+    raises ``NotImplementedError`` (the streaming/upsert wiring is a later step).
 
     The canonical stacked-write primitive — the headless path and
     (eventually, #18) the xdart GUI writer both target this so a single
@@ -1393,44 +1439,46 @@ def write_integrated_stack(
     )
     ck = _comp_kwargs(compression)
 
-    def _bulk_create_1d():
+    def _bulk_create_1d(parent, results, fis_, *, disk_name=None):
         # 2b: names/dtypes/chunk-strategy/compression derive from SCHEMA;
-        # only the runtime shapes and values are computed here.
-        r0 = results_1d[0]
+        # only the runtime shapes and values are computed here.  ``parent`` +
+        # ``disk_name`` let the SAME body write either the top-level group
+        # (disk_name=None ⇒ byte-identical) or a nested per-mode subgroup.
+        r0 = results[0]
         n_q = np.asarray(r0.intensity).shape[0]
-        rows = max(1, min(len(fis), 32))
-        g = _create_group_from_schema(entry_grp, "integrated_1d")
+        rows = max(1, min(len(fis_), 32))
+        g = _create_group_from_schema(parent, "integrated_1d", disk_name=disk_name)
         _schema_dataset(
             g, "integrated_1d", "intensity",
-            np.stack([np.asarray(r.intensity, np.float32) for r in results_1d]),
+            np.stack([np.asarray(r.intensity, np.float32) for r in results]),
             ck=ck, row_chunk=(rows, n_q),
         )
         qd = _schema_dataset(g, "integrated_1d", "q", r0.radial, ck=ck)
         qd.attrs["units"] = r0.unit            # units_from="radial_unit"
-        _schema_dataset(g, "integrated_1d", "frame_index", fis, ck=ck)
+        _schema_dataset(g, "integrated_1d", "frame_index", fis_, ck=ck)
         g.attrs[MONOTONIC_ATTR] = bool(
-            len(fis) < 2 or np.all(np.diff(fis) > 0)
+            len(fis_) < 2 or np.all(np.diff(fis_) > 0)
         )
         # Write sigma if ANY frame has it (NaN-pad the frames that don't) —
         # an all-or-nothing test silently dropped sigma for a mixed batch.
-        if any(r.sigma is not None for r in results_1d):
+        if any(r.sigma is not None for r in results):
             sig = np.stack([
                 (np.asarray(r.sigma, np.float32) if r.sigma is not None
                  else np.full(n_q, np.nan, np.float32))
-                for r in results_1d
+                for r in results
             ])
             _schema_dataset(g, "integrated_1d", "sigma", sig,
                             ck=ck, row_chunk=(rows, n_q))
 
-    def _bulk_create_2d():
+    def _bulk_create_2d(parent, results, fis_, *, disk_name=None):
         # 2b: schema-derived like _bulk_create_1d; two_d_kind and the
         # monotonic flag are runtime-valued capability attrs.
-        r0 = results_2d[0]
+        r0 = results[0]
         stacked = np.stack(
-            [np.asarray(r.intensity, np.float32).T for r in results_2d]
+            [np.asarray(r.intensity, np.float32).T for r in results]
         )  # (N, n_chi, n_q)
         n_chi, n_q = stacked.shape[1], stacked.shape[2]
-        g = _create_group_from_schema(entry_grp, "integrated_2d")
+        g = _create_group_from_schema(parent, "integrated_2d", disk_name=disk_name)
         g.attrs["two_d_kind"] = two_d_kind_from_units(
             r0.unit, r0.azimuthal_unit
         ).value
@@ -1440,16 +1488,16 @@ def write_integrated_stack(
         qd.attrs["units"] = r0.unit            # units_from="radial_unit"
         cd = _schema_dataset(g, "integrated_2d", "chi", r0.azimuthal, ck=ck)
         cd.attrs["units"] = r0.azimuthal_unit  # units_from="azimuthal_unit"
-        _schema_dataset(g, "integrated_2d", "frame_index", fis, ck=ck)
+        _schema_dataset(g, "integrated_2d", "frame_index", fis_, ck=ck)
         g.attrs[MONOTONIC_ATTR] = bool(
-            len(fis) < 2 or np.all(np.diff(fis) > 0)
+            len(fis_) < 2 or np.all(np.diff(fis_) > 0)
         )
         # Sigma if ANY frame has it (NaN-pad the rest) — see _bulk_create_1d.
-        if any(r.sigma is not None for r in results_2d):
+        if any(r.sigma is not None for r in results):
             sig = np.stack([
                 (np.asarray(r.sigma, np.float32).T if r.sigma is not None
                  else np.full((n_chi, n_q), np.nan, np.float32))
-                for r in results_2d
+                for r in results
             ])
             _schema_dataset(g, "integrated_2d", "sigma", sig,
                             ck=ck, row_chunk=(1, n_chi, n_q))
@@ -1477,7 +1525,7 @@ def write_integrated_stack(
             del entry_grp["integrated_1d"]
             g = None
         if g is None:
-            _bulk_create_1d()
+            _bulk_create_1d(entry_grp, results_1d, fis)
         else:
             for fi, r in zip(fis, results_1d):
                 _append_stacked_1d(entry_grp, fi, r, ck)
@@ -1498,10 +1546,173 @@ def write_integrated_stack(
             del entry_grp["integrated_2d"]
             g = None
         if g is None:
-            _bulk_create_2d()
+            _bulk_create_2d(entry_grp, results_2d, fis)
         else:
             for fi, r in zip(fis, results_2d):
                 _append_stacked_2d(entry_grp, fi, r, ck)
+
+    # ── nested per-mode GI subgroups (ADR-0003) ─────────────────────────────
+    # Each non-primary mode is its own NXdata child of the top-level group,
+    # validated INDEPENDENTLY by the frozen uniform-axes validators (a child's
+    # axis grid legitimately differs from the primary's).  First-save only.
+    if extra_modes_1d:
+        parent = entry_grp.get("integrated_1d")
+        if parent is None:
+            raise ValueError(
+                "extra_modes_1d requires results_1d (the primary 1D mode at "
+                "the top-level group)"
+            )
+        if primary_mode_1d is None or primary_mode_1d == DEFAULT_MODE_KEY:
+            raise ValueError(
+                "extra_modes_1d requires a named primary_mode_1d so the file "
+                "records its multi-mode capability (got "
+                f"{primary_mode_1d!r})"
+            )
+        if primary_mode_1d in extra_modes_1d:
+            raise ValueError(
+                f"primary_mode_1d {primary_mode_1d!r} must not also appear in "
+                "extra_modes_1d (the primary lives at the top-level group, not "
+                "a subgroup)"
+            )
+        for mode_key, results in extra_modes_1d.items():
+            sub = mode_subgroup_name(mode_key)  # canonical; raises on default/unknown
+            if not results or len(results) != len(fis):
+                raise ValueError(
+                    f"extra_modes_1d[{mode_key!r}] length must match frame_indices"
+                )
+            _require_uniform_axes_1d(results)
+            if sub in parent:
+                raise NotImplementedError(
+                    "nested per-mode re-save is a later step; Step 1 writes "
+                    "first-save only"
+                )
+            _bulk_create_1d(parent, results, fis, disk_name=sub)
+
+    if extra_modes_2d:
+        parent = entry_grp.get("integrated_2d")
+        if parent is None:
+            raise ValueError(
+                "extra_modes_2d requires results_2d (the primary 2D mode at "
+                "the top-level group)"
+            )
+        if primary_mode_2d is None or primary_mode_2d == DEFAULT_MODE_KEY:
+            raise ValueError(
+                "extra_modes_2d requires a named primary_mode_2d so the file "
+                "records its multi-mode capability (got "
+                f"{primary_mode_2d!r})"
+            )
+        if primary_mode_2d in extra_modes_2d:
+            raise ValueError(
+                f"primary_mode_2d {primary_mode_2d!r} must not also appear in "
+                "extra_modes_2d (the primary lives at the top-level group, not "
+                "a subgroup)"
+            )
+        for mode_key, results in extra_modes_2d.items():
+            sub = mode_subgroup_name(mode_key)
+            if not results or len(results) != len(fis):
+                raise ValueError(
+                    f"extra_modes_2d[{mode_key!r}] length must match frame_indices"
+                )
+            _require_uniform_axes_2d(results)
+            if sub in parent:
+                raise NotImplementedError(
+                    "nested per-mode re-save is a later step; Step 1 writes "
+                    "first-save only"
+                )
+            _bulk_create_2d(parent, results, fis, disk_name=sub)
+
+    # Stamp the per-scan mode attrs LAST, per dimension (no-op for a DEFAULT/
+    # unnamed primary ⇒ standard scans stay byte-identical).
+    _stamp_mode_attrs(entry_grp, "integrated_1d", primary_mode_1d, extra_modes_1d)
+    _stamp_mode_attrs(entry_grp, "integrated_2d", primary_mode_2d, extra_modes_2d)
+
+
+def write_frame_records(entry_grp: h5py.Group, records, *, compression=None) -> None:
+    """Persist a stack of multi-result :class:`FrameRecord`s through the single
+    stacked-write path (the ergonomic seam over :func:`write_integrated_stack`).
+
+    All records must agree on their per-dimension active mode (= the per-scan
+    primary); a diverging active mode is a caller bug → raise.  Each record's
+    active-mode view goes to the top-level group; every other ``mode_key`` →
+    its nested ``integrated_<dim>/<mode>/`` subgroup.  ONE
+    ``write_integrated_stack`` call.
+
+    Byte-compat collapse: a standard stack (every record carries only the
+    ``DEFAULT_MODE_KEY`` mode) passes ``primary_mode_*=DEFAULT_MODE_KEY`` +
+    no ``extra_modes_*`` ⇒ the legacy path ⇒ no new attr/group ⇒ byte-identical.
+    A single NAMED GI mode persists ``primary_mode`` (additive on GI files only)
+    so the active mode round-trips.
+    """
+    from xrd_tools.core.frame_view import view_to_result_1d, view_to_result_2d
+
+    records = list(records)
+    fis = [int(r.label) for r in records]
+
+    prim_1d = {r.active_mode_1d for r in records if r.results_1d}
+    prim_2d = {r.active_mode_2d for r in records if r.results_2d}
+    if len(prim_1d) > 1 or len(prim_2d) > 1:
+        raise ValueError(
+            f"FrameRecords disagree on active mode (1D={sorted(prim_1d)}, "
+            f"2D={sorted(prim_2d)}); one scan = one primary per dimension"
+        )
+    primary_1d = next(iter(prim_1d), DEFAULT_MODE_KEY)
+    primary_2d = next(iter(prim_2d), DEFAULT_MODE_KEY)
+
+    # The stacked writer needs one aligned row per frame.  Partial /
+    # per-frame-varying mode sets (some frames have a dimension, others don't,
+    # or a record omits the agreed primary) aren't supported yet; fail with a
+    # precise message rather than a downstream length-mismatch.
+    has_1d = [bool(r.results_1d) for r in records]
+    has_2d = [bool(r.results_2d) for r in records]
+    if any(has_1d) and not all(has_1d):
+        miss = [r.label for r, h in zip(records, has_1d) if not h]
+        raise ValueError(
+            f"frames {miss} have no 1D results while others do; per-frame-"
+            "varying mode sets are not yet supported"
+        )
+    if any(has_2d) and not all(has_2d):
+        miss = [r.label for r, h in zip(records, has_2d) if not h]
+        raise ValueError(
+            f"frames {miss} have no 2D results while others do; per-frame-"
+            "varying mode sets are not yet supported"
+        )
+    for r in records:  # defensive: every record carries the agreed primary
+        if r.results_1d and primary_1d not in r.results_1d:
+            raise ValueError(f"frame {r.label} lacks the primary 1D mode {primary_1d!r}")
+        if r.results_2d and primary_2d not in r.results_2d:
+            raise ValueError(f"frame {r.label} lacks the primary 2D mode {primary_2d!r}")
+
+    top_1d: list = []
+    extra_1d: dict = {}
+    for r in records:
+        for mode, view in r.results_1d.items():
+            res = view_to_result_1d(view)
+            if mode == primary_1d:
+                top_1d.append(res)
+            else:
+                extra_1d.setdefault(mode, []).append(res)
+
+    top_2d: list = []
+    extra_2d: dict = {}
+    for r in records:
+        for mode, view in r.results_2d.items():
+            res = view_to_result_2d(view)
+            if mode == primary_2d:
+                top_2d.append(res)
+            else:
+                extra_2d.setdefault(mode, []).append(res)
+
+    write_integrated_stack(
+        entry_grp,
+        frame_indices=fis,
+        results_1d=top_1d or None,
+        results_2d=top_2d or None,
+        extra_modes_1d=extra_1d or None,
+        extra_modes_2d=extra_2d or None,
+        primary_mode_1d=primary_1d,
+        primary_mode_2d=primary_2d,
+        compression=compression,
+    )
 
 
 def write_stitched(

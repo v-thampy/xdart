@@ -1,0 +1,196 @@
+{
+ "/": {
+  "attrs": {},
+  "kind": "group"
+ },
+ "entry": {
+  "attrs": {},
+  "kind": "group"
+ },
+ "entry/integrated_1d": {
+  "attrs": {
+   "NX_class": "2ad9a930766abd87",
+   "_frame_index_strictly_increasing": "4bf5122f344554c5",
+   "axes": "14ef264109ad8604",
+   "multi_result_modes": "d4bd9b290ce67eb2",
+   "primary_mode": "5e5eed01459ed76f",
+   "signal": "d0854ad1c7e25944"
+  },
+  "kind": "group"
+ },
+ "entry/integrated_1d/frame_index": {
+  "attrs": {},
+  "dtype": "int64",
+  "kind": "dataset",
+  "shape": [
+   3
+  ],
+  "value": "ab25350e3e65efeb"
+ },
+ "entry/integrated_1d/intensity": {
+  "attrs": {},
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   3,
+   5
+  ],
+  "value": "1c865810ab66345c"
+ },
+ "entry/integrated_1d/q": {
+  "attrs": {
+   "units": "d6687e4288dea7ed"
+  },
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   5
+  ],
+  "value": "2f8ab24a4097ce9c"
+ },
+ "entry/integrated_1d/q_oop": {
+  "attrs": {
+   "NX_class": "2ad9a930766abd87",
+   "_frame_index_strictly_increasing": "4bf5122f344554c5",
+   "axes": "14ef264109ad8604",
+   "signal": "d0854ad1c7e25944"
+  },
+  "kind": "group"
+ },
+ "entry/integrated_1d/q_oop/frame_index": {
+  "attrs": {},
+  "dtype": "int64",
+  "kind": "dataset",
+  "shape": [
+   3
+  ],
+  "value": "ab25350e3e65efeb"
+ },
+ "entry/integrated_1d/q_oop/intensity": {
+  "attrs": {},
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   3,
+   7
+  ],
+  "value": "a944c9eb9a7c286a"
+ },
+ "entry/integrated_1d/q_oop/q": {
+  "attrs": {
+   "units": "fedcaab9ff14ecb3"
+  },
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   7
+  ],
+  "value": "6a32d853f1bc1386"
+ },
+ "entry/integrated_2d": {
+  "attrs": {
+   "NX_class": "2ad9a930766abd87",
+   "_frame_index_strictly_increasing": "4bf5122f344554c5",
+   "axes": "d79dfbaeff94fdab",
+   "multi_result_modes": "45766c82a79e5c69",
+   "primary_mode": "de7284f7c07bb012",
+   "signal": "d0854ad1c7e25944",
+   "two_d_kind": "de7284f7c07bb012"
+  },
+  "kind": "group"
+ },
+ "entry/integrated_2d/chi": {
+  "attrs": {
+   "units": "fedcaab9ff14ecb3"
+  },
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   3
+  ],
+  "value": "e3f6e33972cfb3a2"
+ },
+ "entry/integrated_2d/frame_index": {
+  "attrs": {},
+  "dtype": "int64",
+  "kind": "dataset",
+  "shape": [
+   3
+  ],
+  "value": "ab25350e3e65efeb"
+ },
+ "entry/integrated_2d/intensity": {
+  "attrs": {},
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   3,
+   3,
+   5
+  ],
+  "value": "21cf3bf2be451b53"
+ },
+ "entry/integrated_2d/q": {
+  "attrs": {
+   "units": "2fd38ff8cf91bd07"
+  },
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   5
+  ],
+  "value": "8c17b853da997047"
+ },
+ "entry/integrated_2d/q_chi": {
+  "attrs": {
+   "NX_class": "2ad9a930766abd87",
+   "_frame_index_strictly_increasing": "4bf5122f344554c5",
+   "axes": "d79dfbaeff94fdab",
+   "signal": "d0854ad1c7e25944",
+   "two_d_kind": "1edb78caacf6f0d5"
+  },
+  "kind": "group"
+ },
+ "entry/integrated_2d/q_chi/chi": {
+  "attrs": {
+   "units": "f33afdc158cf0f75"
+  },
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   4
+  ],
+  "value": "406479452dd909bb"
+ },
+ "entry/integrated_2d/q_chi/frame_index": {
+  "attrs": {},
+  "dtype": "int64",
+  "kind": "dataset",
+  "shape": [
+   3
+  ],
+  "value": "ab25350e3e65efeb"
+ },
+ "entry/integrated_2d/q_chi/intensity": {
+  "attrs": {},
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   3,
+   4,
+   5
+  ],
+  "value": "b2fcc79baaec442f"
+ },
+ "entry/integrated_2d/q_chi/q": {
+  "attrs": {
+   "units": "d6687e4288dea7ed"
+  },
+  "dtype": "float32",
+  "kind": "dataset",
+  "shape": [
+   5
+  ],
+  "value": "8c17b853da997047"
+ }
+}

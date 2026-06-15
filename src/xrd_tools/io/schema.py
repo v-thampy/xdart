@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
 
+from xrd_tools.core.frame_view import DEFAULT_MODE_KEY  # "default"; the top-level slot
+
 __all__ = [
     "CAPABILITIES",
     "CapabilityAttr",
@@ -29,6 +31,15 @@ __all__ = [
     "SCHEMA_VERSION_ATTR",
     "DTYPE_ATTR",
     "MONOTONIC_ATTR",
+    "PRIMARY_MODE_ATTR",
+    "MULTI_RESULT_MODES_ATTR",
+    "GI_MODE_KEYS_1D",
+    "GI_MODE_KEYS_2D",
+    "MODE_SUBGROUP_NAMES",
+    "mode_subgroup_name",
+    "subgroup_mode_key",
+    "resolve_mode_path",
+    "DEFAULT_MODE_KEY",
     "SOURCE_BASE_ATTR",
     "THUMBNAIL_LUT_ATTRS",
     "PROCESSED_SCHEMA_NAME",
@@ -57,6 +68,14 @@ DTYPE_ATTR = "ssrl_dtype"
 #: group attr: frame_index is strictly increasing → readers may binary-search
 #: / fast-append instead of scanning all labels.
 MONOTONIC_ATTR = "_frame_index_strictly_increasing"
+#: integrated_1d/2d scan-level attr: the mode_key whose result occupies the
+#: TOP-LEVEL slot (per-scan, self-describing reader pointer).  Absent ⇒ a
+#: standard/old single-result file whose top-level slot is DEFAULT_MODE_KEY.
+PRIMARY_MODE_ATTR = "primary_mode"
+#: integrated_1d/2d scan-level attr: ORDERED list[str] of EVERY persisted
+#: mode_key for that dimension (primary FIRST).  Presence is the capability
+#: marker for a mode-aware file; a single named GI mode lists just ``[primary]``.
+MULTI_RESULT_MODES_ATTR = "multi_result_modes"
 #: entry attr: POSIX project root that relative ``source/path`` pointers
 #: resolve against (the N1 portability contract).
 SOURCE_BASE_ATTR = "source_base"
@@ -104,6 +123,57 @@ PROCESSED_SCHEMA_VERSION = 2
 #: (``drop_integrated_rows``) and grown by the appenders.  Axis datasets
 #: (``q``/``chi``) are shared across rows and are NOT in this set.
 INTEGRATED_ROW_ALIGNED = frozenset({"frame_index", "intensity", "sigma"})
+
+# ── multi-result GI mode keys (the per-mode nested-subgroup layout) ──────────
+#: Canonical on-disk GI mode_keys == ``GI1DMode.value`` / ``GI2DMode.value``
+#: (reduction/core.py:193-204) == the FrameEvent.mode_key vocabulary.  Hardcoded
+#: HERE (not imported) so ``io`` never imports ``reduction`` (which imports io →
+#: cycle) and on-disk names are never derived from GUI labels — the
+#: ``frame.gi_1d`` / ``gi_2d`` dict keys (``qtotal``/``polar``/``gi2d``…) are
+#: GUI/legacy spellings and MUST NOT reach disk.  Frozen forever.
+GI_MODE_KEYS_1D = frozenset({"q_total", "q_ip", "q_oop", "exit_angle"})
+GI_MODE_KEYS_2D = frozenset({"qip_qoop", "q_chi", "exit_angles"})
+
+#: mode_key → on-disk NXdata subgroup name.  Identity for GI keys (the enum
+#: values are valid HDF5 names) but declared explicitly so the on-disk name is
+#: canonical-by-declaration, decoupled from any future enum/label respelling.
+#: DEFAULT_MODE_KEY is intentionally absent: the primary/default slot is the
+#: top-level group, never a subgroup.
+MODE_SUBGROUP_NAMES: "Mapping[str, str]" = MappingProxyType(
+    {k: k for k in (GI_MODE_KEYS_1D | GI_MODE_KEYS_2D)}
+)
+_SUBGROUP_TO_MODE: "Mapping[str, str]" = MappingProxyType(
+    {v: k for k, v in MODE_SUBGROUP_NAMES.items()}
+)
+
+
+def mode_subgroup_name(mode_key: str) -> str:
+    """On-disk subgroup name for a NON-primary GI ``mode_key``.
+
+    Fail-loud: ``DEFAULT_MODE_KEY`` has no subgroup (it is the top-level slot)
+    and an unknown key raises (callers must use a registered GI mode_key)."""
+    if mode_key == DEFAULT_MODE_KEY:
+        raise ValueError(
+            "DEFAULT_MODE_KEY has no subgroup (it lives at the top-level group)"
+        )
+    try:
+        return MODE_SUBGROUP_NAMES[mode_key]
+    except KeyError:
+        raise ValueError(f"unknown GI mode_key: {mode_key!r}") from None
+
+
+def subgroup_mode_key(subgroup_name: str) -> "str | None":
+    """Inverse: on-disk child-group name → mode_key, or ``None`` if it is not a
+    registered GI subgroup (so an unknown on-disk child never becomes a phantom
+    mode)."""
+    return _SUBGROUP_TO_MODE.get(subgroup_name)
+
+
+def resolve_mode_path(group_name: str, mode_key: str, primary_mode: str) -> str:
+    """Reader rule: ``mode == primary ? top-level : <group>/<subgroup>``."""
+    if mode_key == primary_mode or mode_key == DEFAULT_MODE_KEY:
+        return group_name
+    return f"{group_name}/{mode_subgroup_name(mode_key)}"
 
 
 @dataclass(frozen=True)
@@ -274,6 +344,14 @@ CAPABILITIES = MappingProxyType({
     "two_d_kind": CapabilityAttr(
         "two_d_kind", "integrated_2d", "attr",
         "explicit GI axis identity (else inferred from units)"),
+    "multi_result_1d": CapabilityAttr(
+        MULTI_RESULT_MODES_ATTR, "integrated_1d", "attr",
+        "per-GI-mode results: the primary at integrated_1d, others under "
+        "integrated_1d/<mode>/ nested NXdata subgroups"),
+    "multi_result_2d": CapabilityAttr(
+        MULTI_RESULT_MODES_ATTR, "integrated_2d", "attr",
+        "per-GI-mode results: the primary at integrated_2d, others under "
+        "integrated_2d/<mode>/ nested NXdata subgroups"),
 })
 
 

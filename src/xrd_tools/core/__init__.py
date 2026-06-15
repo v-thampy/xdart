@@ -54,6 +54,8 @@ from xrd_tools.core.frame_view import (
     assert_frameview_equivalent,
     axis_from_unit,
     two_d_kind_from_units,
+    view_to_result_1d,
+    view_to_result_2d,
 )
 from xrd_tools.core.metadata import (
     HeterogeneousMetadata,
@@ -126,6 +128,8 @@ __all__ = [
     "assert_frameview_equivalent",
     "axis_from_unit",
     "two_d_kind_from_units",
+    "view_to_result_1d",
+    "view_to_result_2d",
     "ScanMetadata",
     "Frame",
     "FrameSource",

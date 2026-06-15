@@ -228,6 +228,49 @@ class FrameView:
         )
 
 
+def view_to_result_1d(view: "FrameView"):
+    """Inverse of :meth:`FrameView.from_results`' 1D leg.
+
+    Returns an :class:`IntegrationResult1D` reconstructed from the view's 1D
+    axis + intensity (the round-trip the per-mode NeXus writer consumes), or
+    ``None`` when the view carries no 1D data.
+    """
+    if (view.axis_1d is None or view.intensity_1d is None
+            or view.axis_1d.values is None):
+        return None
+    from xrd_tools.core.containers import IntegrationResult1D
+
+    return IntegrationResult1D(
+        radial=np.asarray(view.axis_1d.values),
+        intensity=np.asarray(view.intensity_1d),
+        sigma=None if view.sigma_1d is None else np.asarray(view.sigma_1d),
+        unit=view.axis_1d.unit or "",
+    )
+
+
+def view_to_result_2d(view: "FrameView"):
+    """Inverse of :meth:`FrameView.from_results`' 2D leg.
+
+    ``FrameView.intensity_2d`` is stored ``(ny, nx) = (axis_2d_y, axis_2d_x)``
+    while ``IntegrationResult2D.intensity`` is ``(radial, azimuthal) =
+    (axis_2d_x, axis_2d_y)``, so the intensity/sigma are transposed back (the
+    exact inverse of ``from_results``' ``.T``).  ``None`` when no 2D data.
+    """
+    if (view.axis_2d_x is None or view.axis_2d_y is None or view.intensity_2d is None
+            or view.axis_2d_x.values is None or view.axis_2d_y.values is None):
+        return None
+    from xrd_tools.core.containers import IntegrationResult2D
+
+    return IntegrationResult2D(
+        radial=np.asarray(view.axis_2d_x.values),
+        azimuthal=np.asarray(view.axis_2d_y.values),
+        intensity=np.asarray(view.intensity_2d).T,
+        sigma=None if view.sigma_2d is None else np.asarray(view.sigma_2d).T,
+        unit=view.axis_2d_x.unit or "",
+        azimuthal_unit=view.axis_2d_y.unit or "",
+    )
+
+
 _UNIT_LABELS = {
     "q_A^-1": "Q",
     "q_nm^-1": "Q",
