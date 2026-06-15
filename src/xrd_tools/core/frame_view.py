@@ -7,7 +7,7 @@ without depending on xdart's live objects or Qt state.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -349,3 +349,261 @@ def assert_frameview_equivalent(
         rtol=rtol,
         atol=atol,
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-result records (ADR-0003 / ADR-0005)
+# ---------------------------------------------------------------------------
+
+DEFAULT_MODE_KEY = "default"
+"""Reserved mode key for the active/top-level (non-GI single-result) slot.
+
+A standard (non-GI) scan carries exactly one result per dimension under this
+trivial key, which is also the slot persisted at the canonical top-level
+``integrated_1d`` / ``integrated_2d`` NeXus group.  GI sub-modes use canonical
+keys (``q_total``/``q_ip``/``q_oop``/``exit_angle`` for 1D, etc.); the
+``mode_key -> on-disk subgroup name`` mapping will be established canonically in
+:mod:`xrd_tools.io.schema` (Step 1) and is never derived from GUI label strings.
+"""
+
+
+def _view_1d_only(view: FrameView) -> FrameView:
+    """Project ``view`` to a dimension-pure 1D view (2D fields dropped)."""
+    return replace(
+        view,
+        axis_2d_x=None,
+        axis_2d_y=None,
+        intensity_2d=None,
+        sigma_2d=None,
+        two_d_kind=TwoDKind.Q_CHI,
+    )
+
+
+def _view_2d_only(view: FrameView) -> FrameView:
+    """Project ``view`` to a dimension-pure 2D view (1D fields dropped)."""
+    return replace(view, axis_1d=None, intensity_1d=None, sigma_1d=None)
+
+
+def _merge_views(v1: FrameView | None, v2: FrameView | None) -> FrameView:
+    """Merge a 1D-bearing and a 2D-bearing view into one display view.
+
+    Shared per-frame fields (raw/thumbnail/metadata/geometry/source) are
+    taken from the 1D view when present, falling back to the 2D view.  The two
+    are the same frame, so they carry identical shared fields; the array fields
+    use a None-check and the mapping fields use a presence (truthiness) check —
+    "v1 wins when it has the field" — which only matters in the degenerate case
+    where the two ever disagree (not expected).  The single-sided branches
+    project to a dimension-pure view so the result never leaks the missing
+    dimension even if an impure view is passed in directly.
+    """
+    if v1 is None:
+        if v2 is None:
+            raise ValueError("cannot project an empty FrameRecord")
+        return _view_2d_only(v2)
+    if v2 is None:
+        return _view_1d_only(v1)
+    return FrameView(
+        label=v1.label,
+        axis_1d=v1.axis_1d,
+        intensity_1d=v1.intensity_1d,
+        sigma_1d=v1.sigma_1d,
+        axis_2d_x=v2.axis_2d_x,
+        axis_2d_y=v2.axis_2d_y,
+        intensity_2d=v2.intensity_2d,
+        sigma_2d=v2.sigma_2d,
+        two_d_kind=v2.two_d_kind,
+        raw=v1.raw if v1.raw is not None else v2.raw,
+        thumbnail=v1.thumbnail if v1.thumbnail is not None else v2.thumbnail,
+        mask_baked=bool(v1.mask_baked or v2.mask_baked),
+        metadata_raw=v1.metadata_raw if v1.metadata_raw else v2.metadata_raw,
+        metadata_numeric=v1.metadata_numeric if v1.metadata_numeric else v2.metadata_numeric,
+        incident_angle=(
+            v1.incident_angle if v1.incident_angle is not None else v2.incident_angle
+        ),
+        geometry=v1.geometry if v1.geometry is not None else v2.geometry,
+        source_path=v1.source_path if v1.source_path is not None else v2.source_path,
+        source_frame_index=(
+            v1.source_frame_index
+            if v1.source_frame_index is not None
+            else v2.source_frame_index
+        ),
+        extra=v1.extra if v1.extra else v2.extra,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FrameRecord:
+    """The multi-result record for one frame (ADR-0003).
+
+    A reduction *completion* is single-result; a frame *record* is the union
+    of every integration mode computed for that frame over its lifetime.  The
+    1D and 2D sub-mode selections are independent (separate GUI combos), so
+    results are kept in two per-dimension maps keyed by mode, each with its
+    own active key.  Every stored value is a dimension-pure :class:`FrameView`
+    (1D entries carry no 2D arrays and vice versa), so the equivalence atom
+    :func:`assert_frameview_equivalent` applies per ``(frame, mode)`` unchanged.
+
+    This type is intentionally GUI-free: the publication verdict / diagnostics
+    are a thin xdart wrapper *over* a record, never fields of it.
+    """
+
+    label: int | str
+    results_1d: Mapping[str, FrameView] = field(default_factory=dict)
+    results_2d: Mapping[str, FrameView] = field(default_factory=dict)
+    active_mode_1d: str = DEFAULT_MODE_KEY
+    active_mode_2d: str = DEFAULT_MODE_KEY
+
+    def __post_init__(self) -> None:
+        for dim, results in (("results_1d", self.results_1d), ("results_2d", self.results_2d)):
+            for mode, view in results.items():
+                if not isinstance(view, FrameView):
+                    raise TypeError(
+                        f"{dim}[{mode!r}] must be a FrameView, got {type(view).__name__}"
+                    )
+        # Enforce dimension purity structurally: a 1D entry never carries 2D
+        # arrays and vice versa, regardless of how the record was built (incl.
+        # the direct-construction reload path).  _view_*_only is idempotent, so
+        # already-pure entries (from from_view / with_result_*) cost one shallow
+        # replace each.
+        object.__setattr__(
+            self,
+            "results_1d",
+            MappingProxyType({k: _view_1d_only(v) for k, v in self.results_1d.items()}),
+        )
+        object.__setattr__(
+            self,
+            "results_2d",
+            MappingProxyType({k: _view_2d_only(v) for k, v in self.results_2d.items()}),
+        )
+        if self.results_1d and self.active_mode_1d not in self.results_1d:
+            raise ValueError(
+                f"active_mode_1d {self.active_mode_1d!r} not in "
+                f"results_1d {sorted(self.results_1d)!r}"
+            )
+        if self.results_2d and self.active_mode_2d not in self.results_2d:
+            raise ValueError(
+                f"active_mode_2d {self.active_mode_2d!r} not in "
+                f"results_2d {sorted(self.results_2d)!r}"
+            )
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.results_1d and not self.results_2d
+
+    @property
+    def modes_1d(self) -> tuple[str, ...]:
+        return tuple(self.results_1d)
+
+    @property
+    def modes_2d(self) -> tuple[str, ...]:
+        return tuple(self.results_2d)
+
+    def has_mode_1d(self, mode: str) -> bool:
+        return mode in self.results_1d
+
+    def has_mode_2d(self, mode: str) -> bool:
+        return mode in self.results_2d
+
+    def view_1d(self, mode: str | None = None) -> FrameView | None:
+        return self.results_1d.get(mode if mode is not None else self.active_mode_1d)
+
+    def view_2d(self, mode: str | None = None) -> FrameView | None:
+        return self.results_2d.get(mode if mode is not None else self.active_mode_2d)
+
+    def project(self, mode_1d: str | None = None, mode_2d: str | None = None) -> FrameView:
+        """Merge the selected (default: active) 1D + 2D modes into one view."""
+        return _merge_views(self.view_1d(mode_1d), self.view_2d(mode_2d))
+
+    def active_view(self) -> FrameView:
+        """The display view for the currently active 1D + 2D modes."""
+        return self.project()
+
+    def with_result_1d(
+        self, mode: str, view: FrameView, *, make_active: bool = True
+    ) -> "FrameRecord":
+        """Return a new record with ``view`` upserted under 1D ``mode``."""
+        results = dict(self.results_1d)
+        results[mode] = view  # constructor enforces dimension purity
+        return replace(
+            self,
+            results_1d=results,
+            active_mode_1d=mode if make_active else self.active_mode_1d,
+        )
+
+    def with_result_2d(
+        self, mode: str, view: FrameView, *, make_active: bool = True
+    ) -> "FrameRecord":
+        """Return a new record with ``view`` upserted under 2D ``mode``."""
+        results = dict(self.results_2d)
+        results[mode] = view  # constructor enforces dimension purity
+        return replace(
+            self,
+            results_2d=results,
+            active_mode_2d=mode if make_active else self.active_mode_2d,
+        )
+
+    @classmethod
+    def from_view(
+        cls,
+        view: FrameView,
+        *,
+        mode_1d: str = DEFAULT_MODE_KEY,
+        mode_2d: str = DEFAULT_MODE_KEY,
+    ) -> "FrameRecord":
+        """Build a single-mode record from one combined :class:`FrameView`.
+
+        The bridge from today's single-result world: the view's 1D and 2D
+        payloads become the sole entries of the per-dimension maps under the
+        given keys (defaulting to :data:`DEFAULT_MODE_KEY`).
+        """
+        results_1d: dict[str, FrameView] = {}
+        results_2d: dict[str, FrameView] = {}
+        if view.has_1d:
+            results_1d[mode_1d] = view  # constructor enforces dimension purity
+        if view.has_2d:
+            results_2d[mode_2d] = view  # constructor enforces dimension purity
+        return cls(
+            label=view.label,
+            results_1d=results_1d,
+            results_2d=results_2d,
+            active_mode_1d=mode_1d if view.has_1d else DEFAULT_MODE_KEY,
+            active_mode_2d=mode_2d if view.has_2d else DEFAULT_MODE_KEY,
+        )
+
+
+def assert_framerecord_equivalent(
+    a: FrameRecord,
+    b: FrameRecord,
+    *,
+    rtol: float = 1e-5,
+    atol: float = 1e-8,
+) -> None:
+    """Assert two records carry equivalent results for every mode.
+
+    The multi-mode equivalence gate (ADR-0005): same label, same active
+    keys, same mode sets, and each stored ``(frame, mode)`` view equivalent
+    by :func:`assert_frameview_equivalent`.
+    """
+    if a.label != b.label:
+        raise AssertionError(f"label differs: {a.label!r} != {b.label!r}")
+    if a.active_mode_1d != b.active_mode_1d:
+        raise AssertionError(
+            f"active_mode_1d differs: {a.active_mode_1d!r} != {b.active_mode_1d!r}"
+        )
+    if a.active_mode_2d != b.active_mode_2d:
+        raise AssertionError(
+            f"active_mode_2d differs: {a.active_mode_2d!r} != {b.active_mode_2d!r}"
+        )
+    for dim, ra, rb in (
+        ("results_1d", a.results_1d, b.results_1d),
+        ("results_2d", a.results_2d, b.results_2d),
+    ):
+        if set(ra) != set(rb):
+            raise AssertionError(
+                f"{dim} mode sets differ: {sorted(ra)!r} != {sorted(rb)!r}"
+            )
+        for mode in ra:
+            try:
+                assert_frameview_equivalent(ra[mode], rb[mode], rtol=rtol, atol=atol)
+            except AssertionError as exc:
+                raise AssertionError(f"{dim}[{mode!r}]: {exc}") from exc
