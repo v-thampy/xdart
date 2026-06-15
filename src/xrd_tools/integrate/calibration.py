@@ -9,15 +9,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pyFAI
-from pyFAI.detectors import detector_factory
-from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 
 from xrd_tools.core.containers import PONI
 from xrd_tools.io.image import get_detector_mask as _get_detector_mask
 
+# pyFAI is imported LAZILY (inside the functions that use it) — never at module
+# level.  pyFAI loads a Qt binding at import (PyQt5 by default when QT_API is
+# unset), so an eager import here would let merely importing this module pin the
+# wrong Qt binding in a notebook/headless process.  xrd_tools is headless-first;
+# the concrete integrator/detector are pulled in only when actually building one.
 if TYPE_CHECKING:
     from pyFAI.detectors import Detector
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
     from pyFAI.integrator.fiber import FiberIntegrator
 
 logger = logging.getLogger(__name__)
@@ -118,6 +121,7 @@ def poni_to_integrator(poni: PONI) -> AzimuthalIntegrator:
     AzimuthalIntegrator
         Configured pyFAI azimuthal integrator.
     """
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator
     # 'Detector' is pyFAI's generic base-class name — treat it as unspecified.
     _det_name = poni.detector or ""
     detector = get_detector(_det_name) if _det_name and _det_name.lower() != "detector" else None
@@ -153,7 +157,7 @@ def get_detector(name: str | Detector) -> Detector:
     ValueError
         If the detector name string is not recognized by pyFAI.
     """
-    from pyFAI.detectors import Detector as _Detector
+    from pyFAI.detectors import Detector as _Detector, detector_factory
     if isinstance(name, _Detector):
         return name
     try:
