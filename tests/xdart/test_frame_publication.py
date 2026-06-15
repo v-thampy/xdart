@@ -683,3 +683,135 @@ def test_image_viewer_controller_owns_raw_preview_not_the_adapter():
     assert np.nanmax(img) == 65535.0
     np.testing.assert_allclose(np.sort(img.ravel()), [1, 3, 4, 65535])
     assert payload.raw_image.axis_x.unit == "Pixels"
+
+
+# ===================================================================== #
+# Step 3: FrameRecord-backed publications (ADR-0003)
+# ===================================================================== #
+
+from xrd_tools.core import (  # noqa: E402
+    DEFAULT_MODE_KEY,
+    FrameRecord,
+)
+from xdart.modules.frame_publication import (  # noqa: E402
+    legacy_to_canonical_1d,
+    legacy_to_canonical_2d,
+    publication_from_frame_view,
+)
+from xrd_tools.io.nexus import write_frame_records  # noqa: E402
+
+
+def _gi_multimode_frame(idx=7):
+    """A GI frame with two computed 1D modes and two 2D modes; the active
+    results (int_1d/int_2d) ARE the q_total / qip_qoop entries (identity)."""
+    f = DuckFrame(idx=idx, gi=True)
+    qip = IntegrationResult1D(
+        radial=np.linspace(-5.0, 5.0, 8), intensity=np.arange(8.0),
+        sigma=None, unit="qip_A^-1",
+    )
+    f.gi_1d = {"qtotal": f.int_1d, "qip": qip}
+    qchi = IntegrationResult2D(
+        radial=np.linspace(0.5, 3.0, 5), azimuthal=np.linspace(-90.0, 90.0, 4),
+        intensity=np.ones((5, 4)), unit="q_A^-1", azimuthal_unit="chi_deg",
+    )
+    f.gi_2d = {"gi2d": f.int_2d, "polar": qchi}
+    return f
+
+
+def test_live_publication_carries_record_and_view_is_active_projection():
+    pub = publication_from_live_frame(DuckFrame(idx=3))      # non-GI
+    assert pub.record is not None
+    assert pub.record.modes_1d == (DEFAULT_MODE_KEY,)
+    assert pub.record.modes_2d == (DEFAULT_MODE_KEY,)
+    assert_frameview_equivalent(pub.view, pub.record.active_view())
+
+
+def test_non_gi_record_is_single_default_mode():
+    rec = publication_from_live_frame(DuckFrame(idx=4)).record
+    assert len(rec.results_1d) == 1 and len(rec.results_2d) == 1
+    assert rec.active_mode_1d == DEFAULT_MODE_KEY
+    assert rec.active_mode_2d == DEFAULT_MODE_KEY
+
+
+def test_live_gi_record_carries_all_modes_under_canonical_keys():
+    pub = publication_from_live_frame(_gi_multimode_frame())
+    rec = pub.record
+    assert set(rec.modes_1d) == {"q_total", "q_ip"}
+    assert set(rec.modes_2d) == {"qip_qoop", "q_chi"}
+    # active inferred from int_1d/int_2d identity
+    assert rec.active_mode_1d == "q_total"
+    assert rec.active_mode_2d == "qip_qoop"
+    # .view is the active projection and matches the record's active view
+    assert_frameview_equivalent(pub.view, rec.active_view())
+    # the non-active modes are real, distinct results
+    assert rec.view_1d("q_ip").intensity_1d.shape[0] == 8
+
+
+def test_active_mode_identity_overrides_a_stale_hint():
+    # passing a hint that disagrees with int_1d must NOT diverge .view/record:
+    # identity (int_1d == q_total entry) wins.
+    pub = publication_from_live_frame(
+        _gi_multimode_frame(), active_mode_1d="q_ip", active_mode_2d="q_chi",
+    )
+    assert pub.record.active_mode_1d == "q_total"   # identity, not the hint
+    assert pub.record.active_mode_2d == "qip_qoop"
+    assert_frameview_equivalent(pub.view, pub.record.active_view())
+
+
+@pytest.mark.display_logic
+def test_legacy_to_canonical_mode_map_is_dimension_scoped():
+    assert legacy_to_canonical_1d("qtotal") == "q_total"
+    assert legacy_to_canonical_1d("qip") == "q_ip"
+    assert legacy_to_canonical_1d("qoop") == "q_oop"
+    assert legacy_to_canonical_1d("exit") == "exit_angle"
+    assert legacy_to_canonical_2d("gi2d") == "qip_qoop"
+    assert legacy_to_canonical_2d("polar") == "q_chi"          # 2D polar -> q_chi
+    assert legacy_to_canonical_2d("exit2d") == "exit_angles"   # the coercer-gap key
+    # already-canonical keys pass through
+    assert legacy_to_canonical_1d("q_total") == "q_total"
+
+
+def test_exit_angle_2d_mode_does_not_raise():
+    f = DuckFrame(idx=9, gi=True)
+    exit2d = IntegrationResult2D(
+        radial=np.linspace(0.0, 5.0, 4), azimuthal=np.linspace(0.0, 90.0, 3),
+        intensity=np.ones((4, 3)),
+        unit="exit_angle_horz_deg", azimuthal_unit="exit_angle_vert_deg",
+    )
+    f.int_2d = exit2d
+    f.gi_2d = {"exit2d": exit2d}
+    rec = publication_from_live_frame(f).record
+    assert rec.modes_2d == ("exit_angles",)
+    assert rec.active_mode_2d == "exit_angles"
+
+
+def test_reload_publication_carries_record(tmp_path):
+    """publication_from_nexus_frame reads every persisted mode into the record."""
+    recs = []
+    for fi in range(2):
+        f = _gi_multimode_frame(idx=fi)
+        recs.append(publication_from_live_frame(f).record)
+    p = str(tmp_path / "mm.nxs")
+    with h5py.File(p, "w") as fh:
+        write_frame_records(fh.create_group("entry"), recs)
+    pub = publication_from_nexus_frame(p, 0)
+    assert pub.record is not None
+    assert set(pub.record.modes_1d) == {"q_total", "q_ip"}
+    assert set(pub.record.modes_2d) == {"qip_qoop", "q_chi"}
+    assert_frameview_equivalent(pub.view, pub.record.active_view())
+
+
+def test_eviction_thins_the_record(tmp_path):
+    """Tier-1/2 eviction must drop the record's non-active mode arrays, not just
+    the active .view (else record-backed publications leak past max_heavy_items)."""
+    store = PublicationStore(max_heavy_items=1, max_thumbnail_items=1)
+    for idx in range(4):
+        store.upsert(publication_from_live_frame(_gi_multimode_frame(idx=idx)))
+    # oldest frames are evicted; their record must hold no heavy arrays
+    from xdart.modules.frame_publication import _publication_has_heavy_payload
+    evicted = store.get(0)
+    assert evicted is not None
+    assert not _publication_has_heavy_payload(evicted)
+    rec = evicted.record
+    for mv in (*rec.results_1d.values(), *rec.results_2d.values()):
+        assert mv.intensity_1d is None and mv.intensity_2d is None

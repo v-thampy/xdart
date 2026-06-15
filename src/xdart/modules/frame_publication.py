@@ -17,10 +17,58 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 
 from xrd_tools.core import (
+    DEFAULT_MODE_KEY,
+    FrameRecord,
     FrameView,
     TwoDKind,
     numeric_metadata,
 )
+
+
+# Legacy GUI dict keys (``frame.gi_1d`` / ``frame.gi_2d``, written by
+# ``ewald.frame``) -> canonical on-disk mode_keys (== GI*Mode.value, the same
+# vocabulary the io layer + FrameEvent use).  DIMENSION-SCOPED: ``polar`` means
+# q_total in a 1D context but q_chi in a 2D context, so the two maps must stay
+# separate — never flatten them.  These legacy spellings are GUI-side and never
+# reach disk; the canonical keys do.  ``exit2d`` is handled here because the ssrl
+# GI2D mode coercer has no alias for that literal 2D key.
+_LEGACY_TO_CANONICAL_1D = {
+    "qtotal": "q_total", "qip": "q_ip", "qoop": "q_oop", "exit": "exit_angle",
+}
+_LEGACY_TO_CANONICAL_2D = {
+    "gi2d": "qip_qoop", "polar": "q_chi", "exit2d": "exit_angles",
+}
+
+
+def legacy_to_canonical_1d(key: str) -> str:
+    """Map a ``frame.gi_1d`` dict key to its canonical 1D mode_key (passthrough
+    if already canonical)."""
+    return _LEGACY_TO_CANONICAL_1D.get(key, key)
+
+
+def legacy_to_canonical_2d(key: str) -> str:
+    """Map a ``frame.gi_2d`` dict key to its canonical 2D mode_key (passthrough
+    if already canonical)."""
+    return _LEGACY_TO_CANONICAL_2D.get(key, key)
+
+
+def _resolve_active_mode(passed, modes, active_result):
+    """The canonical active mode_key for a per-dimension mode map.
+
+    Identity is authoritative: the publication's ``.view`` is built from
+    ``int_1d``/``int_2d``, so the record's active mode MUST be the one whose
+    result IS that object (the live integrator assigns the same result to
+    ``gi_*[key]`` and ``int_*``) — otherwise ``record.active_view()`` would
+    diverge from ``.view``.  The explicit ``passed`` key is only a fallback hint
+    for when there is no active result to match (then the first computed mode,
+    else ``DEFAULT_MODE_KEY``)."""
+    if active_result is not None:
+        for mode, result in modes.items():
+            if result is active_result:
+                return mode
+    if passed is not None and passed in modes:
+        return passed
+    return next(iter(modes), DEFAULT_MODE_KEY)
 
 
 def _readonly_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -86,9 +134,18 @@ class PublicationDiagnostics:
 
 @dataclass(frozen=True, slots=True)
 class FramePublication:
-    """Display publication snapshot for one frame."""
+    """Display publication snapshot for one frame.
+
+    ``view`` is the ACTIVE-mode projection — the display surface every consumer
+    reads (always supplied by the builders, so the 30+ ``publication.view.*``
+    consumers and the ``slots=True`` layout are untouched).  ``record`` is the
+    multi-result backing (every GI mode computed for this frame, ADR-0003), a
+    verdict-free :class:`FrameRecord`; when omitted it defaults to the
+    single-mode ``FrameRecord.from_view(view)``.
+    """
 
     view: FrameView
+    record: FrameRecord | None = None
     source_identity: str = ""
     generation: int = 0
     raw_ref: Any | None = None
@@ -98,6 +155,8 @@ class FramePublication:
     diagnostics: PublicationDiagnostics = field(default_factory=PublicationDiagnostics)
 
     def __post_init__(self) -> None:
+        if self.record is None:
+            object.__setattr__(self, "record", FrameRecord.from_view(self.view))
         raw = self.metadata_raw or self.view.metadata_raw
         numeric = self.metadata_numeric or self.view.metadata_numeric or numeric_metadata(raw)
         object.__setattr__(self, "metadata_raw", _readonly_mapping(raw))
@@ -178,6 +237,49 @@ def publication_error_details(publication: FramePublication, output: str) -> str
     return "; ".join(errors)
 
 
+def _record_from_live_frame(frame, view, metadata_raw, incident_angle,
+                            active_mode_1d, active_mode_2d) -> FrameRecord:
+    """Build the multi-result :class:`FrameRecord` from a live frame's per-mode
+    GI dicts.  Non-GI frames (empty ``gi_1d``/``gi_2d``) collapse to a single
+    ``DEFAULT_MODE_KEY`` record equivalent to ``view``."""
+    gi_1d = getattr(frame, "gi_1d", None) or {}
+    gi_2d = getattr(frame, "gi_2d", None) or {}
+    if not gi_1d and not gi_2d:
+        return FrameRecord.from_view(view)
+
+    label = view.label
+    common = dict(
+        metadata_raw=metadata_raw,
+        metadata_numeric=numeric_metadata(metadata_raw),
+        incident_angle=incident_angle,
+        source_path=getattr(frame, "source_file", None) or None,
+        source_frame_index=getattr(frame, "source_frame_idx", None),
+    )
+    thumbnail = getattr(frame, "thumbnail", None)
+    modes_1d = {legacy_to_canonical_1d(k): r for k, r in gi_1d.items()}
+    modes_2d = {legacy_to_canonical_2d(k): r for k, r in gi_2d.items()}
+    results_1d = {
+        m: FrameView.from_results(label=label, result_1d=r, **common)
+        for m, r in modes_1d.items()
+    }
+    results_2d = {
+        m: FrameView.from_results(
+            label=label, result_2d=r,
+            thumbnail=thumbnail, mask_baked=thumbnail is not None, **common,
+        )
+        for m, r in modes_2d.items()
+    }
+    am1 = _resolve_active_mode(active_mode_1d, modes_1d, getattr(frame, "int_1d", None))
+    am2 = _resolve_active_mode(active_mode_2d, modes_2d, getattr(frame, "int_2d", None))
+    return FrameRecord(
+        label=label,
+        results_1d=results_1d,
+        results_2d=results_2d,
+        active_mode_1d=am1 if results_1d else DEFAULT_MODE_KEY,
+        active_mode_2d=am2 if results_2d else DEFAULT_MODE_KEY,
+    )
+
+
 def publication_from_live_frame(
     frame: Any,
     *,
@@ -185,8 +287,14 @@ def publication_from_live_frame(
     source_identity: str | None = None,
     include_raw: bool = False,
     validate: bool = True,
+    active_mode_1d: str | None = None,
+    active_mode_2d: str | None = None,
 ) -> FramePublication:
-    """Adapt a current xdart ``LiveFrame``-like object into a publication."""
+    """Adapt a current xdart ``LiveFrame``-like object into a publication.
+
+    Carries every computed GI mode in ``publication.record`` (ADR-0003); the
+    active mode is the explicit ``active_mode_*`` if given, else inferred from
+    which ``gi_*`` entry IS ``int_*`` (identity).  ``view`` is unchanged."""
 
     metadata_raw = dict(getattr(frame, "scan_info", None) or {})
     result_2d = getattr(frame, "int_2d", None)
@@ -210,8 +318,12 @@ def publication_from_live_frame(
         source_path=getattr(frame, "source_file", None) or None,
         source_frame_index=getattr(frame, "source_frame_idx", None),
     )
+    record = _record_from_live_frame(
+        frame, view, metadata_raw, incident_angle, active_mode_1d, active_mode_2d,
+    )
     publication = FramePublication(
         view=view,
+        record=record,
         source_identity=(
             source_identity
             if source_identity is not None
@@ -232,16 +344,21 @@ def publication_from_live_frame(
 def publication_from_frame_view(
     view: FrameView,
     *,
+    record: FrameRecord | None = None,
     generation: int = 0,
     source_identity: str = "",
     raw_ref: Any | None = None,
     raw_status: str = "unknown",
     validate: bool = True,
 ) -> FramePublication:
-    """Wrap a headless :class:`FrameView` in the xdart publication envelope."""
+    """Wrap a headless :class:`FrameView` in the xdart publication envelope.
+
+    ``record`` carries every persisted GI mode (from the mode-aware reader);
+    when omitted it is the single-mode ``FrameRecord.from_view(view)``."""
 
     publication = FramePublication(
         view=view,
+        record=record if record is not None else FrameRecord.from_view(view),
         source_identity=source_identity or str(view.source_path or view.label),
         generation=generation,
         raw_ref=raw_ref,
@@ -268,16 +385,18 @@ def publication_from_nexus_frame(
 ) -> FramePublication:
     """Read a saved processed frame and publish it through the same contract."""
 
-    from xrd_tools.io import read_frame_view
+    from xrd_tools.io import read_frame_record
 
-    view = read_frame_view(
+    record = read_frame_record(
         scan_file,
         frame,
         entry=entry,
         include_thumbnail=include_thumbnail,
     )
+    view = record.active_view()
     return publication_from_frame_view(
         view,
+        record=record,
         generation=generation,
         source_identity=str(scan_file),
         raw_status=("thumbnail" if view.thumbnail is not None else "missing"),
@@ -285,20 +404,32 @@ def publication_from_nexus_frame(
     )
 
 
-def _publication_has_heavy_payload(publication: FramePublication) -> bool:
-    view = publication.view
+def _view_has_heavy_arrays(view: FrameView) -> bool:
     return any(
         value is not None
         for value in (
-            view.intensity_1d,
-            view.sigma_1d,
-            view.intensity_2d,
-            view.sigma_2d,
-            view.raw,
-            view.thumbnail,
-            publication.raw_ref,
+            view.intensity_1d, view.sigma_1d,
+            view.intensity_2d, view.sigma_2d,
+            view.raw, view.thumbnail,
         )
     )
+
+
+def _publication_has_heavy_payload(publication: FramePublication) -> bool:
+    if publication.raw_ref is not None:
+        return True
+    if _view_has_heavy_arrays(publication.view):
+        return True
+    # Record-aware: a multi-result record holds the NON-active modes' arrays,
+    # invisible to the active .view — they must count toward the heavy bound so
+    # eviction actually frees them (and is triggered) rather than letting a
+    # record-backed publication defeat max_heavy_items.
+    record = publication.record
+    if record is not None:
+        for mode_view in (*record.results_1d.values(), *record.results_2d.values()):
+            if _view_has_heavy_arrays(mode_view):
+                return True
+    return False
 
 
 def _semilight_publication(publication: FramePublication) -> FramePublication:
@@ -325,6 +456,11 @@ def _semilight_publication(publication: FramePublication) -> FramePublication:
     return replace(
         publication,
         view=thumb_view,
+        # Thin the record too, else the non-active modes' arrays survive
+        # eviction (view-record drift + memory leak).  The active thumbnail
+        # slot is all an evicted publication retains; full per-mode data
+        # rehydrates from disk via read_frame_record.
+        record=FrameRecord.from_view(thumb_view),
         raw_ref=None,
         raw_status="thumbnail" if view.thumbnail is not None else "evicted",
         metadata_raw=view.metadata_raw,
@@ -350,6 +486,7 @@ def _lightweight_publication(publication: FramePublication) -> FramePublication:
     return replace(
         publication,
         view=light_view,
+        record=FrameRecord.from_view(light_view),  # no arrays linger in the record
         raw_ref=None,
         raw_status="evicted",
         metadata_raw=view.metadata_raw,
@@ -513,6 +650,8 @@ __all__ = [
     "FramePublication",
     "PublicationDiagnostics",
     "PublicationStore",
+    "legacy_to_canonical_1d",
+    "legacy_to_canonical_2d",
     "publication_from_frame_view",
     "publication_from_live_frame",
     "publication_from_nexus_frame",
