@@ -1930,6 +1930,7 @@ class PhaseFitter:
         pk_scale_range: tuple[float, float] = (0.0, 10.0),
         q_range: tuple[float, float] | None = None,
         width_model: str | None = None,
+        nan_policy: str = "omit",
         **fit_kwargs: Any,
     ) -> MultiPhaseResult:
         """Run the multi-phase fit.
@@ -1952,9 +1953,13 @@ class PhaseFitter:
             is restricted.  The mask used is stored on
             ``self.fit_mask`` for callers (e.g. the Panel viewer) that
             want to visualise which points participated.
+        nan_policy : str
+            lmfit NaN handling, default ``'omit'`` (drop NaN data/weight
+            points so masked/dummy bins in an integrated pattern don't crash
+            the fit).  ``'raise'`` restores lmfit's strict default.
         **fit_kwargs :
             Extra keyword args for :meth:`lmfit.Model.fit` (e.g.
-            ``max_nfev``, ``scale_covar``, ``nan_policy``).
+            ``max_nfev``, ``scale_covar``).
         """
         if self.composite is None:
             self.build_model()
@@ -1995,7 +2000,8 @@ class PhaseFitter:
 
         lm_result = self.composite.fit(
             y_fit_slice, params=params, x=x_fit,
-            method=method, weights=weights, **fit_kwargs,
+            method=method, weights=weights,
+            nan_policy=nan_policy, **fit_kwargs,
         )
         return MultiPhaseResult(lm_result, self)
 

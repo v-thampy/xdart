@@ -255,6 +255,48 @@ class TestPhaseFitter:
         fracs = result.phase_fractions()
         np.testing.assert_allclose(sum(fracs.values()), 1.0, atol=1e-10)
 
+    def test_fit_with_nans_succeeds(self, q_axis, au_phase, cu_phase):
+        """NaNs in the data must be ignored, not crash the fit (CARRYOVER 3).
+
+        lmfit's default nan_policy is 'raise', so a plain .fit() over data with
+        NaN raised ValueError("NaN values detected ...").  PhaseFitter.fit now
+        defaults to nan_policy='omit'."""
+        y = _synthetic_pattern(
+            q_axis, [au_phase, cu_phase], scales=[80.0, 20.0], sigma=0.015,
+            fraction=0.5, q_shift=0.0, noise_level=0.1, bg_level=2.0,
+        )
+        y_nan = y.copy()
+        y_nan[[100, 500, 1500]] = np.nan        # scattered dummy/masked points
+        fitter = PhaseFitter(q_axis, y_nan)
+        fitter.add_phase(au_phase)
+        fitter.add_phase(cu_phase)
+        result = fitter.fit(caglioti=False)     # no nan_policy override
+        assert result.success
+        assert result.phase_scale(0) > result.phase_scale(1)
+        assert np.isfinite(result.lmfit_result.redchi)
+
+    def test_nan_policy_omit_is_noop_for_clean_data(self, q_axis, au_phase, cu_phase):
+        """The new default must not change results when data has no NaNs."""
+        y = _synthetic_pattern(
+            q_axis, [au_phase, cu_phase], scales=[80.0, 20.0], sigma=0.015,
+            fraction=0.5, q_shift=0.0, noise_level=0.1, bg_level=2.0,
+        )
+
+        def _fit(nan_policy):
+            f = PhaseFitter(q_axis, y)
+            f.add_phase(au_phase)
+            f.add_phase(cu_phase)
+            return f.fit(caglioti=False, nan_policy=nan_policy)
+
+        r_omit = _fit("omit")
+        r_raise = _fit("raise")                 # also proves the override binds
+        assert r_omit.success and r_raise.success
+        np.testing.assert_allclose(
+            r_omit.lmfit_result.redchi, r_raise.lmfit_result.redchi, rtol=0, atol=0)
+        np.testing.assert_allclose(
+            [r_omit.phase_scale(0), r_omit.phase_scale(1)],
+            [r_raise.phase_scale(0), r_raise.phase_scale(1)], rtol=0, atol=0)
+
     def test_fit_recovers_q_shift(self, q_axis, au_phase):
         """Applied Q-shift should be recovered."""
         true_shift = 0.01
