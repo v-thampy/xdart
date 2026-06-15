@@ -997,3 +997,107 @@ def test_integration_payload_gi_q_total_converts_to_2theta():
     q = np.asarray(frame.int_1d.radial)
     expected = 2 * np.degrees(np.arcsin(np.clip(q * 1.0 / (4 * np.pi), -1, 1)))
     np.testing.assert_allclose(payload.traces[0].x, expected, rtol=1e-5)
+
+
+# ===================================================================== #
+# Fork B: PublicationStore accumulates per-mode records (ADR-0003/0005)
+# ===================================================================== #
+
+from xrd_tools.core import FrameView, assert_framerecord_equivalent  # noqa: E402
+from xdart.modules.frame_publication import _publication_has_heavy_payload  # noqa: E402
+
+
+def _mode_pub(label, *, mode_1d=None, mode_2d=None, scale=1.0, generation=0):
+    r1 = r2 = None
+    if mode_1d is not None:
+        r1 = IntegrationResult1D(
+            radial=np.linspace(1.0, 2.0, 5), intensity=np.arange(5.0) * scale + 1,
+            sigma=None, unit="q_A^-1")
+    if mode_2d is not None:
+        r2 = IntegrationResult2D(
+            radial=np.linspace(1.0, 2.0, 4), azimuthal=np.linspace(0.0, 1.0, 3),
+            intensity=np.ones((4, 3)) * scale, unit="q_A^-1", azimuthal_unit="chi_deg")
+    view = FrameView.from_results(
+        label=label, result_1d=r1, result_2d=r2,
+        thumbnail=np.zeros((2, 2), dtype=float), metadata_raw={"monitor": 1.0})
+    rec = FrameRecord.from_view(
+        view, mode_1d=mode_1d or DEFAULT_MODE_KEY, mode_2d=mode_2d or DEFAULT_MODE_KEY)
+    return publication_from_frame_view(view, record=rec, generation=generation)
+
+
+def test_accumulation_same_frame_merges_modes_view_is_latest():
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", scale=1.0, generation=store.generation))
+    b = _mode_pub(0, mode_1d="q_ip", scale=9.0, generation=store.generation)
+    store.upsert(b)
+    rec = store.get(0).record
+    assert set(rec.modes_1d) == {"q_total", "q_ip"}     # accumulated
+    assert rec.active_mode_1d == "q_ip"                  # incoming active wins
+    assert_frameview_equivalent(store.get(0).view, b.view)  # .view stays latest
+
+
+def test_accumulation_cross_dimension():
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation))
+    store.upsert(_mode_pub(0, mode_2d="qip_qoop", generation=store.generation))
+    rec = store.get(0).record
+    assert set(rec.modes_1d) == {"q_total"}             # 1D mode survived
+    assert set(rec.modes_2d) == {"qip_qoop"}            # 2D mode added
+
+
+def test_accumulation_same_mode_overwrites_no_dup():
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", scale=1.0, generation=store.generation))
+    store.upsert(_mode_pub(0, mode_1d="q_total", scale=5.0, generation=store.generation))
+    rec = store.get(0).record
+    assert rec.modes_1d == ("q_total",)                 # no duplicate
+    np.testing.assert_allclose(
+        rec.view_1d("q_total").intensity_1d, np.arange(5.0) * 5.0 + 1)  # latest value
+
+
+def test_accumulation_different_frames_independent():
+    store = PublicationStore()
+    store.upsert(_mode_pub(1, mode_1d="q_total", generation=store.generation))
+    store.upsert(_mode_pub(2, mode_1d="q_ip", generation=store.generation))
+    assert store.get(1).record.modes_1d == ("q_total",)
+    assert store.get(2).record.modes_1d == ("q_ip",)
+
+
+def test_accumulation_respects_heavy_bound():
+    store = PublicationStore(max_heavy_items=1, max_thumbnail_items=1)
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation))
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation))  # 2-mode record
+    for idx in (1, 2, 3):
+        store.upsert(_mode_pub(idx, mode_1d="q_total", generation=store.generation))
+    evicted = store.get(0)
+    assert not _publication_has_heavy_payload(evicted)   # thinned past the bound
+    for mv in (*evicted.record.results_1d.values(), *evicted.record.results_2d.values()):
+        assert mv.intensity_1d is None and mv.intensity_2d is None
+
+
+def test_accumulation_post_clear_does_not_merge():
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation))
+    store.clear()                                        # scan/reintegrate boundary
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=0))  # stale generation stamp
+    rec = store.get(0).record
+    assert rec.modes_1d == ("q_ip",)                    # no merge across the clear
+    assert store.get(0).generation == store.generation
+
+
+def test_accumulation_stale_incoming_generation_still_merges_within_scan():
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation))
+    # an incoming with an OLD stamp but the frame is still present (no clear)
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation - 5))
+    assert set(store.get(0).record.modes_1d) == {"q_total", "q_ip"}
+    assert store.get(0).generation == store.generation  # coerced up
+
+
+def test_accumulation_first_upsert_is_plain_replace_additive():
+    # behavior-preservation: a fresh label is stored verbatim (today's REPLACE).
+    store = PublicationStore()
+    pub = _mode_pub(0, mode_1d="q_total", generation=store.generation)
+    store.upsert(pub)
+    assert_framerecord_equivalent(store.get(0).record, pub.record)
+    assert_frameview_equivalent(store.get(0).view, pub.view)

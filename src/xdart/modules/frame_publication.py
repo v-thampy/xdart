@@ -494,6 +494,35 @@ def _lightweight_publication(publication: FramePublication) -> FramePublication:
     )
 
 
+def _merge_records(existing: FrameRecord, incoming: FrameRecord) -> FrameRecord:
+    """Accumulate the incoming record's modes into the existing one (ADR-0003
+    fork B): the store keeps ONE FrameRecord per frame that grows as GI modes
+    are recomputed.
+
+    Each incoming 1D/2D mode is folded in via ``with_result_1d/2d`` (immutable
+    upsert-by-key — an incoming mode already present is overwritten with the
+    fresher view).  The INCOMING active modes win (the merged ``active_mode_1d/2d``
+    equal the incoming ones), and the caller keeps the publication's ``.view``
+    unchanged, so display consumers (which read ``.view`` today) are unaffected.
+
+    NOTE the merged record may be a SUPERSET of ``.view``: for a same-dimension
+    re-publish ``record.active_view()`` equals ``.view``, but a cross-dimension
+    accumulation (e.g. a 1D-only publish then a 2D-only publish for one frame)
+    leaves ``.view`` as the latest single projection while ``record.active_view()``
+    carries BOTH dimensions — that richer union is the whole point (the record is
+    what a future multi-mode consumer reads; ``.view`` is the current display
+    surface).  An incoming record with empty result maps folds as a no-op.
+    """
+    acc = existing
+    for mode, view in incoming.results_1d.items():
+        acc = acc.with_result_1d(
+            mode, view, make_active=(mode == incoming.active_mode_1d))
+    for mode, view in incoming.results_2d.items():
+        acc = acc.with_result_2d(
+            mode, view, make_active=(mode == incoming.active_mode_2d))
+    return acc
+
+
 class PublicationStore:
     """Small generation-aware store for frame publications.
 
@@ -574,7 +603,20 @@ class PublicationStore:
             if publication.generation != self._generation:
                 publication = replace(publication, generation=self._generation)
             label = publication.label
-            if label in self._items:
+            existing = self._items.get(label)
+            if existing is not None:
+                # Fork B: same frame within the SAME generation -> accumulate
+                # the incoming record's modes into the existing record so the
+                # store carries every GI mode computed for this frame.  The
+                # stored .view stays the latest incoming active projection, so
+                # display consumers (publication.view.*) are unchanged.  A
+                # generation mismatch (a stale entry that escaped a clear())
+                # falls through to plain replace — today's behavior.
+                if existing.generation == self._generation:
+                    publication = replace(
+                        publication,
+                        record=_merge_records(existing.record, publication.record),
+                    )
                 self._items.pop(label)
                 self._drop_heavy_label_locked(label)
                 self._drop_thumb_label_locked(label)
