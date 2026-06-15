@@ -1088,18 +1088,29 @@ def test_accumulation_post_clear_does_not_merge():
     assert store.get(0).generation == store.generation
 
 
-def test_accumulation_stale_incoming_generation_does_not_merge():
-    # Hardening (codex): a STALE incoming generation for a frame already present
-    # must NOT splice into the accumulated record (it is from a pre-clear epoch);
-    # fall back to plain replace.
+def test_accumulation_stale_incoming_generation_is_dropped():
+    # Hardening (codex follow-up): a STALE incoming generation for a frame
+    # already present is from a superseded epoch — DROP it (keep the current
+    # entry), so old-scan data can neither splice into nor replace the live frame.
     store = PublicationStore()
     store.clear()                                        # bump to generation 1
     assert store.generation == 1
     store.upsert(_mode_pub(0, mode_1d="q_total", generation=1))
-    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=0))  # stale stamp
+    returned = store.upsert(_mode_pub(0, mode_1d="q_ip", generation=0))  # stale
     rec = store.get(0).record
-    assert rec.modes_1d == ("q_ip",)                    # no stale merge
-    assert store.get(0).generation == store.generation  # coerced up
+    assert rec.modes_1d == ("q_total",)                 # stale incoming dropped
+    assert returned is store.get(0)                     # upsert returned the kept entry
+
+
+def test_accumulation_stale_incoming_for_new_label_is_stored():
+    # A stale incoming for a NEW label (no existing entry) is still stored
+    # (coerced up) — legacy/sessionless callers rely on this.
+    store = PublicationStore()
+    store.clear()                                        # generation 1
+    store.upsert(_mode_pub(5, mode_1d="q_total", generation=0))  # stale, new label
+    assert store.get(5) is not None
+    assert store.get(5).record.modes_1d == ("q_total",)
+    assert store.get(5).generation == store.generation  # coerced up
 
 
 def test_accumulation_different_source_identity_does_not_merge():

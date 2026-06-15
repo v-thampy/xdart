@@ -611,27 +611,29 @@ class PublicationStore:
     def upsert(self, publication: FramePublication) -> FramePublication:
         with self._lock:
             incoming_generation = publication.generation
-            if incoming_generation != self._generation:
-                publication = replace(publication, generation=self._generation)
             label = publication.label
             existing = self._items.get(label)
+            # A STALE incoming (queued before a clear()/generation bump) for a
+            # frame ALREADY present is from a superseded epoch — DROP it and keep
+            # the current entry, so old-scan data can neither replace nor splice
+            # into the live frame (codex follow-up review).  Rehydration stamps
+            # the CURRENT store generation (display_data._rehydrate_publication),
+            # so it is never seen as stale.  A stale incoming for a NEW label is
+            # still stored below, for legacy/sessionless callers.
+            if existing is not None and incoming_generation != self._generation:
+                return existing
+            if incoming_generation != self._generation:
+                publication = replace(publication, generation=self._generation)
             if existing is not None:
-                # Fork B accumulation, hardened (codex review): merge the
-                # incoming record's modes into the existing record ONLY for a
-                # same-epoch, same-source re-upsert of a frame already present —
-                # so the store carries every GI mode computed for this frame and
-                # the stored .view stays the latest active projection (display
-                # consumers unchanged).  A STALE incoming generation (queued
-                # before a clear()/generation bump) or a DIFFERENT non-empty
-                # source_identity (a label reused across scans/files after a
-                # missed clear) must NOT splice into the accumulated record —
-                # fall through to the plain wholesale replace (pre-accumulation
-                # behavior), so old-epoch / foreign data can never contaminate a
-                # multi-mode record.
-                if (
-                    incoming_generation == self._generation
-                    and existing.generation == self._generation
-                    and _same_source(existing, publication)
+                # Fork B accumulation, hardened: same-epoch (guaranteed here) +
+                # same-source -> merge the incoming record's modes into the
+                # existing record, so the store carries every GI mode computed
+                # for this frame and the stored .view stays the latest active
+                # projection (display consumers unchanged).  A DIFFERENT
+                # non-empty source_identity (a label reused within one epoch)
+                # must NOT splice -> plain wholesale replace.
+                if existing.generation == self._generation and _same_source(
+                    existing, publication
                 ):
                     publication = replace(
                         publication,
