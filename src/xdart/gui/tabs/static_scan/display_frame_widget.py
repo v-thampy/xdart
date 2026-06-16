@@ -1902,15 +1902,21 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     self.clear_image_view()
                 return
 
-            # Apply Mask — O8: snapshot under data_lock so a
-            # concurrent writer (integrator publish, fileHandlerThread
-            # load) can't evict ``self.idxs_2d[0]`` between the
-            # ``in`` check and the value read.  ``.get(...)`` returns
-            # None for an evicted key; falling back to None mask is
-            # the same as having no mask, so render continues.
-            with self.data_lock:
-                frame_2d = self.data_2d.get(self.idxs_2d[0])
-            mask = frame_2d['mask'] if frame_2d is not None else None
+            # Apply Mask — store first (A3/A4).  The bounded mirror remains a
+            # transition fallback, but normal scan display should not need it to
+            # know the current frame's detector mask.
+            frame_2d = None
+            try:
+                pub = self._publication_from_store_for_display(
+                    self.idxs_2d[0], allow_blocking_read=False)
+                if pub is not None:
+                    _frame_1d, frame_2d = self._publication_legacy_parts(pub)
+            except Exception:
+                logger.debug("store mask lookup failed", exc_info=True)
+            if not frame_2d:
+                with self.data_lock:
+                    frame_2d = self.data_2d.get(self.idxs_2d[0])
+            mask = frame_2d.get('mask') if frame_2d is not None else None
         # Capture the saturation ceiling from the RAW integer dtype (iinfo.max)
         # BEFORE the float conversion loses it — the display then learns the
         # ceiling from the detector bit depth rather than assuming 16-bit.
@@ -2549,12 +2555,35 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if idx is None:
             return
 
-        # Try to get thumbnail from loaded 1D data
+        # Try the publication store first.  The old data_1d/data_2d mirrors are
+        # still used by viewer modes, but integration previews should survive
+        # once Role-A mirror writes are gone.
         thumb = None
         full_res = False
-        frame = self.data_1d.get(int(idx))
-        if frame is not None:
-            thumb = getattr(frame, 'thumbnail', None)
+        try:
+            pub = self._publication_from_store_for_display(
+                int(idx), allow_blocking_read=False)
+            if pub is not None:
+                view = getattr(pub, 'view', None)
+                thumb = getattr(view, 'thumbnail', None)
+                if thumb is None:
+                    thumb = getattr(view, 'raw', None)
+                    full_res = thumb is not None
+                if thumb is None:
+                    raw_ref = getattr(pub, 'raw_ref', None)
+                    thumb = getattr(raw_ref, 'thumbnail', None)
+                if thumb is None:
+                    raw_ref = getattr(pub, 'raw_ref', None)
+                    thumb = getattr(raw_ref, 'map_raw', None)
+                    full_res = thumb is not None
+        except Exception:
+            logger.debug("store image-preview lookup failed", exc_info=True)
+
+        if thumb is None:
+            with self.data_lock:
+                frame = self.data_1d.get(int(idx))
+            if frame is not None:
+                thumb = getattr(frame, 'thumbnail', None)
 
         # Fall back to 2D data dict.  Snapshot under data_lock: a concurrent
         # eviction between an `in` check and the read raised KeyError on the

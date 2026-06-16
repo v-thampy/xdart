@@ -443,7 +443,21 @@ class DisplayPlotMixin:
         """Updates 1D view of data in plot frame
         """
         using_publication = getattr(self, '_using_publication_plot_payload', False)
-        if (len(self.frame_ids) == 0) or (len(self.data_1d) == 0 and not using_publication):
+        store = getattr(self, 'publication_store', None)
+        has_store_rows = False
+        if store is not None:
+            try:
+                has_store_rows = len(store) > 0
+            except Exception:
+                has_store_rows = False
+        if (
+            len(self.frame_ids) == 0
+            or (
+                len(self.data_1d) == 0
+                and not using_publication
+                and not has_store_rows
+            )
+        ):
             return
 
         # Clear curves.  removeItem, not curve.clear(): PlotDataItem.clear()
