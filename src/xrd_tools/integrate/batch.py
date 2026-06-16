@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -32,10 +32,10 @@ import numpy as np
 from xrd_tools.io.export import write_h5
 from xrd_tools.io.image import (
     SUPPORTED_EXTS,
+    count_frames,
     find_image_files,
     get_detector_mask,
     read_image,
-    read_image_stack,
 )
 from xrd_tools.integrate.single import integrate_1d, integrate_2d
 
@@ -64,46 +64,20 @@ def _frame_done(h5_path: Path, frame_idx: int) -> bool:
         return False
 
 
-def _nframes_hdf5(path: Path) -> int | None:
-    """Return number of frames in an HDF5 master file, or None on error."""
-    try:
-        with h5py.File(path, "r") as f:
-            for candidate in (
-                "/entry/data/data",
-                "/entry/instrument/detector/data",
-                "/data",
-            ):
-                if candidate in f:
-                    ds = f[candidate]
-                    return 1 if ds.ndim == 2 else ds.shape[0]
-            # fallback: largest dataset
-            found: dict[str, h5py.Dataset] = {}
-            f.visititems(
-                lambda name, obj: found.update({name: obj})
-                if isinstance(obj, h5py.Dataset)
-                else None
-            )
-            if not found:
-                return None
-            ds = max(found.values(), key=lambda d: d.size)
-            return 1 if ds.ndim == 2 else ds.shape[0]
-    except Exception as exc:
-        logger.warning("Could not determine frame count for %s: %s", path, exc)
-        return None
-
-
-def _collect_frames(
+def _frame_iterator(
     scan_path: Path,
     detector: str,
     mask: np.ndarray | None,
     threshold: float,
     rotation: int,
-) -> tuple[list[tuple[np.ndarray, int]], np.ndarray | None]:
+) -> tuple[Iterable[tuple[Path | None, int]], np.ndarray | None, int]:
     """
-    Return ``[(image_array, frame_idx), ...]`` and the effective mask.
+    Return lightweight frame descriptors, the effective mask, and frame count.
 
     Handles both HDF5 master files (all frames from the stack) and image
-    directories (one file per frame).
+    directories (one file per frame).  The descriptors deliberately do not
+    contain image arrays so ``process_scan`` can read/integrate/release one
+    frame at a time.
     """
     det_mask = get_detector_mask(detector) if detector else None
     combined_mask: np.ndarray | None
@@ -116,24 +90,17 @@ def _collect_frames(
 
     ext = scan_path.suffix.lower()
     if ext in {".h5", ".hdf5"} and scan_path.is_file():
-        stack = read_image_stack(
-            scan_path, mask=combined_mask, threshold=threshold, rotation=rotation
-        )
-        if stack.ndim == 2:
-            stack = stack[np.newaxis]
-        return [(stack[i], i) for i in range(stack.shape[0])], combined_mask
+        n_frames = count_frames(scan_path)
+        if n_frames <= 0:
+            return (), combined_mask, 0
+        return ((scan_path, i) for i in range(n_frames)), combined_mask, n_frames
 
     if scan_path.is_dir():
         img_files = find_image_files(scan_path)
-        frames = []
-        for idx, p in enumerate(img_files):
-            img = read_image(p, mask=combined_mask, threshold=threshold, rotation=rotation)
-            frames.append((img, idx))
-        return frames, combined_mask
+        return tuple((p, idx) for idx, p in enumerate(img_files)), combined_mask, len(img_files)
 
     # single image file
-    img = read_image(scan_path, mask=combined_mask, threshold=threshold, rotation=rotation)
-    return [(img, 0)], combined_mask
+    return ((scan_path, 0),), combined_mask, 1
 
 
 # ---------------------------------------------------------------------------
@@ -220,26 +187,39 @@ def process_scan(
     out_path = _as_path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    frames, effective_mask = _collect_frames(
+    frames, effective_mask, n_total = _frame_iterator(
         scan_path, detector, mask, threshold, rotation
     )
-    if not frames:
+    if n_total <= 0:
         logger.warning("No frames found in %s", scan_path)
         return out_path.resolve()
 
-    n_total = len(frames)
     n_skipped = n_done = 0
     extra_1d = {**kwargs, **(kwargs_1d or {})}
     extra_2d = {**kwargs, **(kwargs_2d or {})}
 
     logger.info("Processing %s: %d frames → %s", scan_path.name, n_total, out_path)
 
-    for img, idx in frames:
+    for frame_path, idx in frames:
         if not reprocess and _frame_done(out_path, idx):
             n_skipped += 1
             continue
 
         try:
+            read_path = frame_path or scan_path
+            source_frame = (
+                idx
+                if read_path == scan_path
+                and scan_path.suffix.lower() in {".h5", ".hdf5"}
+                else 0
+            )
+            img = read_image(
+                read_path,
+                frame=source_frame,
+                mask=effective_mask,
+                threshold=threshold,
+                rotation=rotation,
+            )
             call_1d = dict(
                 npt=npt,
                 unit=unit,

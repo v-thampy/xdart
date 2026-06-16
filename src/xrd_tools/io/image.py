@@ -242,6 +242,17 @@ def read_image_stack(
     path = Path(path)
     ext = path.suffix.lower()
 
+    if reduce in {"mean", "sum"}:
+        if ext in {".h5", ".hdf5", ".nxs"} and not _is_eiger_master(path):
+            _reject_if_processed_xdart(path)
+        return _reduce_image_stack(
+            path,
+            mask=mask,
+            threshold=threshold,
+            rotation=rotation,
+            reduce=reduce,
+        )
+
     if ext in {".h5", ".hdf5", ".nxs"} and not _is_eiger_master(path):
         _reject_if_processed_xdart(path)
         # Non-Eiger HDF5 / NeXus — try fabio first, fall back to h5py
@@ -262,11 +273,51 @@ def read_image_stack(
 
     arr = apply_rotation(arr, rotation)
 
-    if reduce == 'mean':
-        return np.nanmean(arr, axis=0)
-    if reduce == 'sum':
-        return np.nansum(arr, axis=0)
     return arr
+
+
+def _reduce_image_stack(
+    path: Path,
+    *,
+    mask: np.ndarray | None,
+    threshold: float | None,
+    rotation: int,
+    reduce: str,
+) -> np.ndarray:
+    """Fold a multi-frame image file without materializing the full stack."""
+    n_frames = count_frames(path)
+    if n_frames <= 0:
+        raise ValueError(f"Could not determine frame count for {path}")
+
+    total: np.ndarray | None = None
+    counts: np.ndarray | None = None
+    for frame_idx in range(n_frames):
+        frame = read_image(
+            path,
+            frame=frame_idx,
+            mask=mask,
+            threshold=threshold,
+            rotation=rotation,
+        )
+        if total is None:
+            total = np.zeros_like(frame, dtype=float)
+            if reduce == "mean":
+                counts = np.zeros(frame.shape, dtype=np.int64)
+        valid = ~np.isnan(frame)
+        total[valid] += frame[valid]
+        if counts is not None:
+            counts[valid] += 1
+
+    if total is None:
+        return np.empty((0, 0), dtype=float)
+    if reduce == "sum":
+        return total
+
+    assert counts is not None
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = total / counts
+    mean[counts == 0] = np.nan
+    return mean
 
 
 def read_images_parallel(

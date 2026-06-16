@@ -456,6 +456,43 @@ def test_read_image_rejects_processed_file(tmp_path):
     from xrd_tools.io.image import read_image_stack
     with pytest.raises(ValueError, match="processed xdart"):
         read_image_stack(nxs)
+    with pytest.raises(ValueError, match="processed xdart"):
+        read_image_stack(nxs, reduce="mean")
+
+
+def test_read_image_stack_reduces_hdf5_without_stack_materialization(
+    monkeypatch, tmp_path
+):
+    from xrd_tools.io import image as image_mod
+    from xrd_tools.io.image import read_image_stack
+
+    h5_path = tmp_path / "raw_stack.h5"
+    stack = np.array(
+        [
+            [[1.0, np.nan], [3.0, 4.0]],
+            [[2.0, np.nan], [5.0, 6.0]],
+            [[np.inf, np.nan], [7.0, np.nan]],
+        ],
+        dtype=np.float32,
+    )
+    with h5py.File(h5_path, "w") as h5:
+        h5.create_dataset("entry/data/data", data=stack)
+
+    def fail_stack(*args, **kwargs):
+        raise AssertionError("read_image_stack(reduce=...) must fold by frame")
+
+    monkeypatch.setattr(image_mod, "_read_hdf5_stack", fail_stack)
+
+    np.testing.assert_allclose(
+        read_image_stack(h5_path, reduce="sum"),
+        np.nansum(stack, axis=0),
+    )
+    expected_mean = np.array([[np.inf, np.nan], [5.0, 5.0]], dtype=np.float32)
+    np.testing.assert_allclose(
+        read_image_stack(h5_path, reduce="mean"),
+        expected_mean,
+        equal_nan=True,
+    )
 
 
 # ---------------------------------------------------------------------------

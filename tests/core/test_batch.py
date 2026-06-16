@@ -179,6 +179,53 @@ def test_process_scan_splits_dimension_specific_kwargs(
     assert "only_1d" not in seen["2d"]
 
 
+def test_process_scan_hdf5_iterates_without_stack_materialization(
+    monkeypatch, tmp_path
+):
+    h5_path = tmp_path / "scan.h5"
+    raw = np.arange(3 * 4 * 5, dtype=np.float32).reshape(3, 4, 5)
+    with h5py.File(h5_path, "w") as h5:
+        h5.create_dataset("entry/data/data", data=raw)
+
+    seen_means: list[float] = []
+
+    def fail_stack(*args, **kwargs):
+        raise AssertionError("process_scan must not read the whole HDF5 stack")
+
+    def fake_1d(image, ai, **kwargs):
+        seen_means.append(float(np.nanmean(image)))
+        return IntegrationResult1D(
+            radial=np.array([0.0, 1.0]),
+            intensity=np.array([1.0, 2.0]),
+            unit="q_A^-1",
+        )
+
+    def fake_2d(image, ai, **kwargs):
+        return IntegrationResult2D(
+            radial=np.array([0.0, 1.0]),
+            azimuthal=np.array([-1.0, 1.0]),
+            intensity=np.ones((2, 2)),
+            unit="q_A^-1",
+        )
+
+    import xrd_tools.io.image as image_mod
+
+    monkeypatch.setattr(image_mod, "_read_hdf5_stack", fail_stack)
+    monkeypatch.setattr(batch_module, "integrate_1d", fake_1d)
+    monkeypatch.setattr(batch_module, "integrate_2d", fake_2d)
+
+    process_scan(
+        h5_path,
+        object(),
+        tmp_path / "streamed.h5",
+        npt=2,
+        npt_rad=2,
+        npt_azim=2,
+    )
+
+    np.testing.assert_allclose(seen_means, [float(frame.mean()) for frame in raw])
+
+
 def test_process_series(poni_fixture, tmp_path):
     """Process two scan directories and verify two outputs are produced."""
     scan1 = tmp_path / "scan1"
