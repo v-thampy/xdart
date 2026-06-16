@@ -86,6 +86,42 @@ def test_heavy_eviction_waits_until_frame_is_persisted():
     assert store.get(1).view_1d("q_total").metadata_raw["sample"] == "A"
 
 
+def test_new_unsaved_mode_does_not_inherit_label_persistence():
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(_record(label=1, mode="q_total"), persisted=True)
+    assert store.is_persisted(1)
+
+    store.upsert(_record(label=1, mode="q_ip", scale=2.0), persisted=False)
+    assert not store.is_persisted(1)
+
+    store.upsert(_record(label=2, source="/data/scan_0002.tif"), persisted=True)
+
+    assert store.has_heavy_payload(1)
+    assert not store.has_heavy_payload(2)
+    rec = store.get(1)
+    assert rec is not None
+    assert set(rec.modes_1d) == {"q_total", "q_ip"}
+    np.testing.assert_allclose(rec.view_1d("q_ip").intensity_1d, [20.0, 40.0, 60.0])
+
+
+def test_mark_persisted_marks_all_current_modes_for_eviction():
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(_record(label=1, mode="q_total"), persisted=True)
+    store.upsert(_record(label=1, mode="q_ip", scale=2.0), persisted=False)
+
+    store.mark_persisted(1)
+    assert store.is_persisted(1)
+
+    store.upsert(_record(label=2, source="/data/scan_0002.tif"), persisted=True)
+
+    assert not store.has_heavy_payload(1)
+    assert store.has_heavy_payload(2)
+    rec = store.get(1)
+    assert rec is not None
+    assert rec.view_1d("q_total").intensity_1d is None
+    assert rec.view_1d("q_ip").intensity_1d is None
+
+
 def test_get_or_hydrate_restores_thinned_record():
     store = FrameRecordStore(max_heavy_items=1)
     store.upsert(_record(label=1), persisted=True)

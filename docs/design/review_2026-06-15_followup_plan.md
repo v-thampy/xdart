@@ -45,6 +45,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | Wave 5/D2 hardening — non-blocking integration hydration | this checkpoint | ✅ normal display renders now queue missing 1D/2D integration hydration through the background worker when async hydration is enabled; explicit background-setting reads still opt into blocking full-coverage reads |
 | Phase B foundation — headless `FrameRecordStore` | this checkpoint | ✅ `xrd_tools.session` now exposes a Qt-free, bounded, persist-before-evict `FrameRecordStore`; `ScanSession` can optionally populate it from completed frame events and can opt into marking completed writes persisted for durable sinks. This is dormant for xdart until the live-gated store→session projection flip |
 | Phase B hardening — source-aware hydration | this checkpoint | ✅ thinned headless records now learn a real source identity when hydrated from disk and replace, rather than merge, if the hydrator returns a conflicting source |
+| Phase B hardening — mode-aware persist-before-evict | this checkpoint | ✅ headless `FrameRecordStore` now tracks persisted state per 1D/2D result mode, so a newly computed unsaved GI/submode result cannot inherit an older mode's persisted label and be evicted before it is written |
 | GI-AGG e2e render gate | this checkpoint | ✅ real `displayFrameWidget.update()` now has an offscreen regression proving Overall Average over >64 frames uses the disk-backed aggregate when store-heavy rows are evicted and legacy mirrors are empty |
 | I4 partial — avoid full index materialization for Single/Auto-Last | this checkpoint | ✅ normal one-frame display updates carry only the scan length into the display-decision layer; the full scan index is copied only for true Overall selections |
 | Live-refresh test-double drift | this checkpoint | ✅ full `test_live_refresh.py` is green again after updating duck-host fixtures for the new hydration policy and `require_all` keyword |
@@ -97,7 +98,9 @@ passed the focused live-run, batch-finish, shutdown, placeholder-load, and `_abs
 hydration policy slice (`9 passed`). The Phase B foundation passed the headless store/session/record slice
 (`46 passed`) before any xdart live-path wiring, plus architecture/release guards and xdart publication
 coverage (`130 passed` for the expanded focused gate). The source-aware hydration hardening passed the
-headless store/session/record slice (`48 passed`). The GI-AGG real-render gap is closed by
+headless store/session/record slice (`48 passed`). The mode-aware persist-before-evict hardening adds
+coverage for the mixed persisted/unsaved mode sequence that would otherwise evict a newly computed mode
+under a previously persisted label. The GI-AGG real-render gap is closed by
 `tests/xdart/test_aggregation_wiring.py::test_real_widget_overall_aggregate_uses_disk_when_store_evicted`.
 The I4 scan-index materialization slice passed the display/publication/aggregate focused set
 (`125 passed / 28 warnings`) and includes a fake-index regression proving Single renders do not iterate

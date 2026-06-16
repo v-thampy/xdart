@@ -17,23 +17,44 @@ from types import MappingProxyType
 
 from xrd_tools.core import FrameRecord, FrameView
 
+_ModeKey = tuple[str, str]
+
 
 def _record_views(record: FrameRecord) -> tuple[FrameView, ...]:
     return tuple(record.results_1d.values()) + tuple(record.results_2d.values())
 
 
+def _view_has_heavy_payload(view: FrameView) -> bool:
+    return (
+        view.intensity_1d is not None
+        or view.sigma_1d is not None
+        or view.intensity_2d is not None
+        or view.sigma_2d is not None
+        or view.raw is not None
+        or view.thumbnail is not None
+    )
+
+
+def _record_mode_keys(record: FrameRecord) -> set[_ModeKey]:
+    keys: set[_ModeKey] = set()
+    keys.update(("1d", mode) for mode in record.results_1d)
+    keys.update(("2d", mode) for mode in record.results_2d)
+    return keys
+
+
+def _heavy_mode_keys(record: FrameRecord) -> set[_ModeKey]:
+    keys: set[_ModeKey] = set()
+    for mode, view in record.results_1d.items():
+        if _view_has_heavy_payload(view):
+            keys.add(("1d", mode))
+    for mode, view in record.results_2d.items():
+        if _view_has_heavy_payload(view):
+            keys.add(("2d", mode))
+    return keys
+
+
 def _has_heavy_payload(record: FrameRecord) -> bool:
-    for view in _record_views(record):
-        if (
-            view.intensity_1d is not None
-            or view.sigma_1d is not None
-            or view.intensity_2d is not None
-            or view.sigma_2d is not None
-            or view.raw is not None
-            or view.thumbnail is not None
-        ):
-            return True
-    return False
+    return bool(_heavy_mode_keys(record))
 
 
 def _thin_view(view: FrameView) -> FrameView:
@@ -103,10 +124,11 @@ def _same_source_id(a: str, b: str) -> bool:
 class FrameRecordStore:
     """Thread-safe, bounded store for one scan's :class:`FrameRecord` objects.
 
-    Heavy arrays are evicted only after the caller marks the frame persisted,
-    unless ``require_persisted_for_eviction=False`` is requested.  This preserves
-    the important "persist before evict" invariant while still bounding memory
-    during long scans once durable sinks have flushed frames.
+    Heavy arrays are evicted only after every heavy result mode on that frame is
+    marked persisted, unless ``require_persisted_for_eviction=False`` is
+    requested.  This preserves the important "persist before evict" invariant
+    while still bounding memory during long scans once durable sinks have
+    flushed frames.
     """
 
     def __init__(
@@ -123,7 +145,7 @@ class FrameRecordStore:
         self._lock = RLock()
         self._records: dict[int | str, FrameRecord] = {}
         self._source_ids: dict[int | str, str] = {}
-        self._persisted: set[int | str] = set()
+        self._persisted_modes: dict[int | str, set[_ModeKey]] = {}
         self._heavy_labels: list[int | str] = []
         self._max_items = max_items
         self._max_heavy_items = max_heavy_items
@@ -134,7 +156,7 @@ class FrameRecordStore:
         with self._lock:
             self._records.clear()
             self._source_ids.clear()
-            self._persisted.clear()
+            self._persisted_modes.clear()
             self._heavy_labels.clear()
 
     def set_hydrator(
@@ -161,19 +183,28 @@ class FrameRecordStore:
             else _source_identity_from_record(record)
         )
         label = record.label
+        incoming_mode_keys = _record_mode_keys(record)
         with self._lock:
             existing = self._records.get(label)
             if existing is not None and _same_source_id(self._source_ids.get(label, ""), source_id):
                 record = _merge_records(existing, record)
+                persisted_modes = set(self._persisted_modes.get(label, set()))
+                persisted_modes.difference_update(incoming_mode_keys)
             elif existing is not None:
-                self._persisted.discard(label)
+                persisted_modes = set()
+            else:
+                persisted_modes = set()
 
             self._records.pop(label, None)
             self._drop_heavy_label_locked(label)
             self._records[label] = record
             self._source_ids[label] = source_id
             if persisted:
-                self._persisted.add(label)
+                persisted_modes.update(incoming_mode_keys)
+            if persisted_modes:
+                self._persisted_modes[label] = persisted_modes
+            else:
+                self._persisted_modes.pop(label, None)
             if _has_heavy_payload(record):
                 self._heavy_labels.append(label)
             self._enforce_bounds_locked()
@@ -188,7 +219,13 @@ class FrameRecordStore:
             except TypeError:
                 iterable = (labels,)  # type: ignore[assignment]
         with self._lock:
-            self._persisted.update(iterable)
+            for label in iterable:
+                record = self._records.get(label)
+                if record is None:
+                    continue
+                self._persisted_modes.setdefault(label, set()).update(
+                    _record_mode_keys(record)
+                )
             self._enforce_bounds_locked()
 
     def get(self, label: int | str) -> FrameRecord | None:
@@ -229,7 +266,7 @@ class FrameRecordStore:
 
     def is_persisted(self, label: int | str) -> bool:
         with self._lock:
-            return label in self._persisted
+            return self._label_persisted_locked(label)
 
     def has_heavy_payload(self, label: int | str) -> bool:
         with self._lock:
@@ -260,9 +297,30 @@ class FrameRecordStore:
 
     def _find_evictable_heavy_label_locked(self) -> int | str | None:
         for label in self._heavy_labels:
-            if not self._require_persisted_for_eviction or label in self._persisted:
+            if (
+                not self._require_persisted_for_eviction
+                or self._label_heavy_payload_persisted_locked(label)
+            ):
                 return label
         return None
+
+    def _label_persisted_locked(self, label: int | str) -> bool:
+        record = self._records.get(label)
+        if record is None:
+            return False
+        mode_keys = _record_mode_keys(record)
+        return bool(mode_keys) and mode_keys.issubset(
+            self._persisted_modes.get(label, set())
+        )
+
+    def _label_heavy_payload_persisted_locked(self, label: int | str) -> bool:
+        record = self._records.get(label)
+        if record is None:
+            return False
+        heavy_keys = _heavy_mode_keys(record)
+        return bool(heavy_keys) and heavy_keys.issubset(
+            self._persisted_modes.get(label, set())
+        )
 
     def _enforce_bounds_locked(self) -> None:
         if self._max_heavy_items is not None:
@@ -282,7 +340,7 @@ class FrameRecordStore:
                         candidate
                         for candidate in self._records
                         if not self._require_persisted_for_eviction
-                        or candidate in self._persisted
+                        or self._label_persisted_locked(candidate)
                     ),
                     None,
                 )
@@ -290,7 +348,7 @@ class FrameRecordStore:
                     break
                 self._records.pop(label, None)
                 self._source_ids.pop(label, None)
-                self._persisted.discard(label)
+                self._persisted_modes.pop(label, None)
                 self._drop_heavy_label_locked(label)
 
 
