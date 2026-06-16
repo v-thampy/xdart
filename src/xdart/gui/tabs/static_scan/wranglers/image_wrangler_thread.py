@@ -521,6 +521,7 @@ class imageThread(wranglerThread):
         self._eiger_h5_handle = None     # persistent h5py.File for Eiger reads
         self._eiger_h5_dataset = None    # dataset reference inside the open file
         self._eiger_fabio_handle = None  # persistent fabio.EigerImage fallback
+        self._eiger_metadata_cache = {}  # master metadata is stable across frames
         # Background prefetch state (populated on demand)
         self._prefetch_queue = None      # queue.Queue of frame tuples or None sentinel
         self._prefetch_thread = None     # threading.Thread running the reader
@@ -579,6 +580,7 @@ class imageThread(wranglerThread):
         self._eiger_nframes = 0
         self._eiger_master_queue.clear()
         self._eiger_done_masters.clear()
+        self._eiger_metadata_cache.clear()
         self._prefetch_stop_prior()     # tear down any lingering prefetcher
         self._prefetch_queue = None
         self._prefetch_thread = None
@@ -2121,6 +2123,21 @@ class imageThread(wranglerThread):
                 logger.debug("Failed to close h5py handle: %s", e)
             self._eiger_h5_handle = None
 
+    def _read_eiger_metadata(self, master_path):
+        """Read per-master metadata once, returning a per-frame copy."""
+        if not self.meta_ext:
+            return {}
+        key = (
+            os.path.abspath(str(master_path)),
+            str(self.meta_ext),
+            os.path.abspath(str(self.meta_dir)) if self.meta_dir else '',
+        )
+        if key not in self._eiger_metadata_cache:
+            self._eiger_metadata_cache[key] = read_image_metadata(
+                master_path, meta_format=self.meta_ext, meta_dir=self.meta_dir,
+            )
+        return dict(self._eiger_metadata_cache[key])
+
     def _eiger_refill_master_queue(self):
         """Glob for *_master.h5 files not yet processed (Image Directory mode)."""
         match = _name_filter(self.file_filter)
@@ -2249,9 +2266,7 @@ class imageThread(wranglerThread):
                     end = min(start + _PREFETCH_READ_CHUNK, self._eiger_nframes)
                     _t_blk = time.time()
                     try:
-                        block = np.asarray(
-                            self._eiger_h5_dataset[start:end], dtype='int32'
-                        )
+                        block = np.asarray(self._eiger_h5_dataset[start:end])
                     except Exception as e:
                         logger.warning(
                             'Bulk read failed (start=%d end=%d): %s; '
@@ -2273,9 +2288,7 @@ class imageThread(wranglerThread):
                             start, end - 1, _t_blk,
                         )
 
-                    meta = (read_image_metadata(self._eiger_master_path,
-                                                meta_format=self.meta_ext, meta_dir=self.meta_dir)
-                            if self.meta_ext else {})
+                    meta = self._read_eiger_metadata(self._eiger_master_path)
                     master_stem = Path(self._eiger_master_path).stem
                     scan_name = (master_stem[:-7]
                                  if master_stem.endswith('_master')
@@ -2413,20 +2426,20 @@ class imageThread(wranglerThread):
                 # Primary: persistent fabio handle
                 _raw = (self._eiger_fabio_handle.data if frame_idx == 0
                         else self._eiger_fabio_handle.get_frame(frame_idx).data)
-                img_data = np.asarray(_raw, dtype='int32')
+                img_data = np.asarray(_raw)
             elif self._eiger_h5_dataset is not None:
                 # Fallback: h5py dataset
-                img_data = np.asarray(self._eiger_h5_dataset[frame_idx], dtype='int32')
+                img_data = np.asarray(self._eiger_h5_dataset[frame_idx])
             else:
                 # Should not happen, but safety net
                 with fabio.open(self._eiger_master_path) as _img:
                     _raw = _img.data if frame_idx == 0 else _img.get_frame(frame_idx).data
-                img_data = np.asarray(_raw, dtype='int32')
+                img_data = np.asarray(_raw)
         except Exception as e:
             logger.error('Error reading frame %d from %s: %s', frame_idx, self._eiger_master_path, e)
             img_data = None
 
-        meta = read_image_metadata(self._eiger_master_path, meta_format=self.meta_ext, meta_dir=self.meta_dir) if self.meta_ext else {}
+        meta = self._read_eiger_metadata(self._eiger_master_path)
 
         master_stem = Path(self._eiger_master_path).stem
         scan_name = master_stem[:-7] if master_stem.endswith('_master') else master_stem
