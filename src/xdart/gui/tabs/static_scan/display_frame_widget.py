@@ -441,6 +441,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # OFF => computed synchronously inline so headless renders see it at once.
         self._aggregation_worker = None
         self._agg_cache: dict = {}
+        self._agg_pending: set = set()
         if self.publication_store is not None:
             try:
                 self.publication_store.set_hydrator(self._rehydrate_publication)
@@ -688,6 +689,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         stamped with an older generation is stale and may be dropped (full
         enforcement: Stage 5)."""
         self.display_generation += 1
+        self._agg_pending.clear()
         return self.display_generation
 
     # ── D2: off-GUI-thread frame hydration (greenfield Phase 3) ──────────────
@@ -807,7 +809,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return cached[1]
         if getattr(self, "_async_hydration_enabled", False):
             worker = self._ensure_aggregation_worker()
-            if worker is not None:
+            pending_key = (key, generation)
+            if worker is not None and pending_key not in self._agg_pending:
+                self._agg_pending.add(pending_key)
                 worker.request(key, generation, scan, dim, method, norm_channel)
             return None                  # not ready this render
         # Headless / synchronous: compute inline so the first render has it.
@@ -819,13 +823,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         except Exception:
             logger.debug("inline aggregation failed for %s", key, exc_info=True)
             result = None
-        self._agg_cache[key] = (generation, result)
+        if result is not None:
+            self._agg_cache[key] = (generation, result)
         return result
 
     def _on_aggregated(self, key, generation, result) -> None:
         """A background aggregate finished: cache it (on the GUI thread) and
         re-render, unless a newer generation has superseded it."""
+        self._agg_pending.discard((key, int(generation)))
         if int(generation) != self.display_generation:
+            return
+        if result is None:
+            # None means "not ready / unavailable for this attempt", not a
+            # terminal empty aggregate.  Do not cache it or self-trigger a
+            # repaint loop; the next scan/display update will retry.
             return
         self._agg_cache[key] = (generation, result)
         try:

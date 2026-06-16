@@ -573,10 +573,11 @@ def _same_source_id(sa, sb) -> bool:
     SUFFIX: equal after ``normpath``, or the shorter path's components are a tail
     of the longer's (abs vs rel of the same file).  Unlike a bare-basename
     compare this still REJECTS two different directories that share a filename
-    (e.g. ``run1/frame_0001.tif`` vs ``run2/frame_0001.tif``).  An empty
-    identity on either side is treated as a wildcard (can't tell -> allow)."""
+    (e.g. ``run1/frame_0001.tif`` vs ``run2/frame_0001.tif``).  Missing source
+    IDs merge only when BOTH sides are missing; one missing + one known source is
+    not enough evidence to splice records."""
     if not sa or not sb:
-        return True
+        return not sa and not sb
     na, nb = os.path.normpath(sa), os.path.normpath(sb)
     if na == nb:
         return True

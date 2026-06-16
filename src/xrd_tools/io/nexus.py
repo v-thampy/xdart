@@ -640,8 +640,9 @@ def write_nexus(
     entry : str, optional
         NXentry group name (default ``"entry"``).
     compression : str or None, optional
-        HDF5 compression filter. ``"lzf"`` (default) is fast for live use;
-        ``"gzip"`` gives better compression for archival. None disables
+        HDF5 compression filter. ``"lzf"`` (default) is fast where safe; on
+        ARM64 macOS it is mapped to fast gzip to avoid known h5py/HDF5 bus
+        errors. ``"gzip"`` gives better compression for archival. None disables
         compression.
     overwrite : bool, optional
         If True, overwrite existing file. If False (default), append/update.

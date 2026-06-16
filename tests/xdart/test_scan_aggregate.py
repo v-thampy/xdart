@@ -176,6 +176,30 @@ def test_whole_scan_1d_norm_channel_reads_scan_data_and_tail(tmp_path):
     np.testing.assert_allclose(raw.intensity, np.mean(np.arange(1, N + 1)))
 
 
+def test_whole_scan_1d_norm_channel_is_case_and_alias_insensitive(tmp_path):
+    scan = _split_scan(tmp_path, with_2d=False)
+    for requested in ("I0", "i0"):
+        avg = whole_scan_aggregate_1d(scan, method="average", norm_channel=requested)
+        np.testing.assert_allclose(avg.intensity, 1.0)
+        s = whole_scan_aggregate_1d(scan, method="sum", norm_channel=requested)
+        np.testing.assert_allclose(s.intensity, float(N))
+
+    # Monitor aliases should also resolve through the same helper for both the
+    # on-disk prefix and the in-memory tail.
+    for fr in scan.frames._in_memory.values():
+        fr.scan_info = dict(fr.scan_info)
+        fr.scan_info["Monitor"] = fr.scan_info.pop("i0")
+    import h5py
+    with h5py.File(scan.data_file, "a") as f:
+        sd = f["entry/scan_data"]
+        values = sd["i0"][()]
+        del sd["i0"]
+        sd.create_dataset("Mon", data=values)
+
+    avg = whole_scan_aggregate_1d(scan, method="average", norm_channel="monitor")
+    np.testing.assert_allclose(avg.intensity, 1.0)
+
+
 def test_whole_scan_defers_when_nothing_on_disk(tmp_path):
     from xdart.modules.ewald import LiveScan
     scan = LiveScan(data_file=str(tmp_path / "fresh.nxs"))

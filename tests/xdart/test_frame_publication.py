@@ -1325,6 +1325,17 @@ def test_accumulation_different_source_identity_does_not_merge():
     assert store.get(0).record.modes_1d == ("q_ip",)    # plain replace, no merge
 
 
+def test_accumulation_missing_source_identity_does_not_merge_known_source():
+    # Unknown+unknown remains a transition fallback, but unknown+known is not
+    # enough evidence to splice records for a reused label.
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation,
+                           source_identity=""))
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation,
+                           source_identity="scanA"))
+    assert store.get(0).record.modes_1d == ("q_ip",)
+
+
 def test_accumulation_first_upsert_is_plain_replace_additive():
     # behavior-preservation: a fresh label is stored verbatim (today's REPLACE).
     store = PublicationStore()
@@ -1423,6 +1434,16 @@ def test_carryover_merges_across_abspath_relpath_source():
     assert set(store.get(0).record.modes_1d) == {"q_total", "q_ip"}       # accumulated
 
 
+def test_carryover_missing_source_identity_does_not_merge_known_source():
+    store = PublicationStore()
+    store.upsert(_mode_pub(0, mode_1d="q_total", generation=store.generation,
+                           source_identity="/data/run1/recon_0001.tif"))
+    store.begin_reintegrate()
+    store.upsert(_mode_pub(0, mode_1d="q_ip", generation=store.generation,
+                           source_identity=""))
+    assert store.get(0).record.modes_1d == ("q_ip",)
+
+
 def test_one_d_reintegrate_preserves_prior_2d_mode():
     # Footgun guard (review): a 1D-only reintegrate must NOT drop the 2D mode
     # accumulated in the original run.  begin_reintegrate carries the full record;
@@ -1459,4 +1480,5 @@ def test_same_source_id_suffix_match_rejects_different_dir():
     assert _same_source_id("/data/run1/frame_0001.tif", "run1/frame_0001.tif")   # abs vs rel+dir
     assert not _same_source_id("run1/frame_0001.tif", "run2/frame_0001.tif")     # different dirs
     assert not _same_source_id("/data/run1/frame_0001.tif", "/data/run2/frame_0001.tif")
-    assert _same_source_id("", "frame_0001.tif")                                 # empty -> wildcard
+    assert not _same_source_id("", "frame_0001.tif")                             # known beats unknown
+    assert _same_source_id("", "")                                               # transition unknown+unknown

@@ -32,6 +32,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | Batch-final crash hardening | `33c518f` | ✅ first real batch flush now uses the writer's atomic replace path instead of mutating the skeleton `.nxs` in place; flat detector masks apply by direct flat assignment instead of GUI-thread `concat/unique/unravel` |
 | Review follow-up — 2D Sum aggregate + startup guard | `4b3564c` | ✅ evicted Overall `Sum` cakes now call the `sum` aggregate instead of silently rendering an average; `update_scattering_geometry` no longer raises if the GI signal fires before `self.scan` exists |
 | Native bus-error fix — avoid LZF stack writes on ARM64 macOS | `61073ef` | ✅ reverses GUI integrated-stack LZF compression and adds the same ARM64 macOS LZF→gzip guard to the shared NeXus writer helper; this mirrors the earlier `ssrl_xrd_tools` `9ff8bf0` bus-error mitigation |
+| Fresh review follow-up — aggregate retry, source IDs, norm aliases, docs | this checkpoint | ✅ async Overall aggregate `None` is retryable rather than cached as final; known-vs-missing source IDs no longer merge records; whole-scan norm channels resolve case/alias-insensitively; stale LZF/payload docs refreshed |
 
 **Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_gui_modes_end_to_end.py`,
@@ -49,7 +50,9 @@ The Sum-aggregate/startup-guard follow-up passed `tests/xdart/test_aggregation_w
 `tests/core/test_nexus.py::TestWriteNexus::test_compression_lzf_guard_maps_arm_macos_to_fast_gzip`,
 `tests/core/test_headless_write_roundtrip.py::test_write_integrated_stack_bulk_then_incremental`,
 `tests/xdart/test_nexus_writer_roundtrip.py`, and `tests/xdart/test_qt_nexus_sink.py`
-(`81 passed`).
+(`81 passed`). The fresh review follow-up passed
+`tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_scan_aggregate.py`,
+`tests/xdart/test_frame_publication.py`, and the two LZF guard tests (`91 passed`).
 
 **Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is
 a safer pre-live-checkpoint boundary: publication-store-first display, bounded mirrors, and tests for the
@@ -83,13 +86,39 @@ renderer/data-source flip.
 | Share Axis #2 + cake current-frame | `5c59077` | ✅ verified (P3: no test for the new multi-frame Single-Overlay cake path) |
 | N2 batch submit-per-read (rec. A) | — | ⏳ queued — after Phase A+B (`fix_batch_dispatch_overlap_jun2026.md`) |
 | **Wave 5 — A3/A4** (`data_1d`/`data_2d` retirement) | `26eb7d4` + `9fb96bb` partial | ◑ offscreen prep landed; final Role-A deletion remains live-gated |
+| **GI-AGG** GI >512-frame live Overall truncation (P2) + Overall e2e test gap | — | ⏳ OPEN — `9fb96bb`'s `data_1d` cap (512) now exposes it; **non-GI is safe** (store-residency routes to the disk aggregate). Fix belongs with the GI displayed-mode instant-switch work; detail in §0.2 |
 
 **Residual P3 follow-ups (none blocking):** multi-frame Single-Overlay cake test (Share Axis commit);
 optional extra numeric-equivalence assertion in the combine_grids test. The former N3/N4/C1/QW1 P3s
 listed here are closed by `322b11e` / `4e5433b`.
 
-**Still ahead:** finish Wave 5 (A3/A4 live-gated Role-A mirror retirement), I4 (post-Wave-5), N2
-(batch rec. A, after Phase A+B), the residual P3 nits above, and Phase B (out of scope — see below).
+**Still ahead:** finish Wave 5 (A3/A4 live-gated Role-A mirror retirement), the **GI-AGG** P2 (GI >512
+live Overall truncation + its e2e test gap — §0.2), I4 (post-Wave-5), N2 (batch rec. A, after Phase A+B),
+the residual P3 nits above, and Phase B (out of scope — see below).
+
+### 0.2 Newly tracked (2026-06-16): GI >512-frame live Overall truncation (P2) + Overall e2e test gap
+
+Surfaced by the per-commit verification of `9fb96bb` (bounding `data_1d` `0 → 512`). **Non-GI scans are
+safe:** whole-scan Sum/Average/Overall routes on publication-**STORE** residency (heavy cap **64**, not
+the 512 `data_1d` cap) → the on-disk `io.aggregate` disk⊕tail path, never the bounded dict. **But
+`_whole_scan_aggregate` returns `None` for GI scans** (GI displayed-mode resolution is deferred to the
+instant-switch step), so a **GI scan > 512 frames during a live run** falls through to the legacy
+`get_frames_int_1d`, which now reads the *capped* `data_1d` and, mid-run, serves only resident frames —
+**silently truncating** the Overall Sum/Average. The old unbounded `data_1d (max=0)` masked this; the 512
+cap moved the truncation threshold from ∞ to 512.
+
+- **Severity P2** — a documented Phase-5 / GI deferral, but a *new* live truncation that did not exist
+  before `9fb96bb` (so worth tracking explicitly, not silently inheriting).
+- **Fix (belongs with the GI displayed-mode instant-switch work):** serve a GI whole-scan Overall from the
+  primary on-disk stack — or refuse + annotate for a non-primary partial stack — but **never truncate** via
+  the capped mirror. Land this with, or before, the Wave-5 Role-A deletion (else GI Overall loses even its
+  truncating fallback).
+- **Test gap:** add an end-to-end test that drives the **real `displayFrameWidget.update()`** in Overall
+  Sum/Average at **N > the store's `max_heavy_items` (64)** with frames absent from **both** the store and
+  `data_1d`, asserting the rendered trace equals the full-scan aggregate. It would fail if the routing ever
+  reverted to reading the bounded `data_1d`. (The existing `test_aggregation_wiring` tests stub
+  `_whole_scan_aggregate` or leave the store fully populated, so they do not exercise the eviction→disk
+  path through the real render.)
 
 > **(SUPERSEDED by §0 above — the items below have since landed; the table in this note is the earlier
 > pre-implementation grounding snapshot, kept for history.)**
@@ -538,6 +567,10 @@ refs), not the whole thing:
 ### Traps
 - Deleting Role-B (viewer modes) — classify before deleting; the original design understated Role-B.
 - Deleting `data_1d` before the >64 aggregation + scroll-back tests are green (re-opens Round-12).
+- **GI Overall truncation (GI-AGG, §0.2):** a GI scan >512 frames *already* truncates a live Overall
+  Sum/Average via the capped `data_1d` (non-GI is safe). Restoring full GI coverage (GI instant-switch)
+  must land with — or before — deleting the Role-A mirror, or GI Overall loses its only (currently
+  truncating) fallback entirely.
 - Shipping the A3/A4 live checkpoint without C5's regression test — the read-during-write path is
   lock-protected (already serialized via `scan.file_lock`) but currently **unproven by any test**; land the
   C5 test first so the concurrent path A3/A4 leans on is covered. (The old "skipping C5 races the writer"

@@ -567,8 +567,8 @@ class PublicationDisplayAdapter:
 
         Returns ``None`` for Overlay/Waterfall (their cross-render history /
         waterfall-y state is not owned by the payload yet — a later step), and
-        when no usable 1D trace can be built.  This method is intentionally NOT
-        called by :meth:`plot_payload`/``build_payload`` yet."""
+        when no usable 1D trace can be built.  ``plot_payload`` calls this for
+        integration modes and lets the legacy renderer handle ``None`` fallbacks."""
         if state.method in ("Overlay", "Waterfall"):
             return None
         widget = self._widget

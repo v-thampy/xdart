@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 from typing import Mapping
 
 import numpy as np
@@ -61,6 +62,45 @@ def _norm_mode(mode) -> str:
         return DEFAULT_MODE_KEY
     text = str(mode).strip()
     return text if text else DEFAULT_MODE_KEY
+
+
+def _norm_channel_alias(name):
+    text = str(name or "").strip()
+    lower = text.lower()
+    if lower in {"sec", "second", "seconds"}:
+        return "sec"
+    if lower in {"monitor", "mon"}:
+        return "Monitor"
+    match = re.fullmatch(r"i(\d+)", lower)
+    if match:
+        return f"i{int(match.group(1))}"
+    return None
+
+
+def _resolve_norm_key(keys, requested):
+    """Return the actual metadata key matching a requested norm channel.
+
+    Mirrors the GUI combo behavior: exact keys win, then case-insensitive
+    matches, then canonical aliases such as I0/i0, mon/Monitor, sec/SECOND.
+    """
+    if not requested:
+        return None
+    keys = list(keys or ())
+    requested_text = str(requested)
+    for key in keys:
+        if key == requested:
+            return key
+    requested_lower = requested_text.lower()
+    for key in keys:
+        if str(key).lower() == requested_lower:
+            return key
+    requested_alias = _norm_channel_alias(requested)
+    if requested_alias is None:
+        return None
+    for key in keys:
+        if _norm_channel_alias(key) == requested_alias:
+            return key
+    return None
 
 
 def mode_aggregation_allowed(displayed_mode, primary_mode) -> bool:
@@ -153,7 +193,9 @@ def _build_norm_map(data_file, norm_channel, tail_items):
     except (KeyError, OSError):
         disk_labels = []
     if disk_labels:
-        col = _scan_data_for_frames(data_file, disk_labels).get(str(norm_channel))
+        scan_data = _scan_data_for_frames(data_file, disk_labels)
+        actual_key = _resolve_norm_key(scan_data.keys(), norm_channel)
+        col = scan_data.get(actual_key) if actual_key is not None else None
         if col is not None:
             for lbl, value in zip(disk_labels, np.asarray(col).ravel()):
                 try:
@@ -164,9 +206,10 @@ def _build_norm_map(data_file, norm_channel, tail_items):
                     out[int(lbl)] = v
     for label, fr in tail_items:
         info = getattr(fr, "scan_info", None) or {}
-        if norm_channel in info:
+        actual_key = _resolve_norm_key(info.keys(), norm_channel)
+        if actual_key is not None:
             try:
-                v = float(info[norm_channel])
+                v = float(info[actual_key])
             except (TypeError, ValueError):
                 continue
             if v > 0:

@@ -91,6 +91,38 @@ def test_widget_whole_scan_aggregate_caches_per_generation(tmp_path):
     assert key in duck._agg_cache and duck._agg_cache[key][0] == duck.display_generation
 
 
+def test_widget_async_aggregate_none_is_retryable(tmp_path):
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+    scan, _, _ = _split_scan_2d(tmp_path, n=12)
+    calls = []
+
+    class FakeWorker:
+        def request(self, *args):
+            calls.append(args)
+
+    duck = _duck_widget(
+        scan,
+        _async_hydration_enabled=True,
+        _agg_pending=set(),
+    )
+    duck._ensure_aggregation_worker = lambda: FakeWorker()
+
+    assert _call_whole_scan_aggregate(duck, dim="2d", method="average") is None
+    assert len(calls) == 1
+    # Re-render before the worker replies must not enqueue the same work again.
+    assert _call_whole_scan_aggregate(duck, dim="2d", method="average") is None
+    assert len(calls) == 1
+
+    key = ("2d", "average", None)
+    displayFrameWidget._on_aggregated(duck, key, duck.display_generation, None)
+    assert key not in duck._agg_cache
+
+    # A later scan/display update at the same generation can retry; the earlier
+    # None was "not ready", not a terminal empty aggregate.
+    assert _call_whole_scan_aggregate(duck, dim="2d", method="average") is None
+    assert len(calls) == 2
+
+
 def test_widget_whole_scan_aggregate_defers_for_gi(tmp_path):
     scan, _, _ = _split_scan_2d(tmp_path, n=12)
     scan.gi = True                               # non-primary mode resolution = Step 6
