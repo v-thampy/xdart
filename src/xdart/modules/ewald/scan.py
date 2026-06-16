@@ -9,7 +9,6 @@ logger = logging.getLogger(__name__)
 
 from .frame import LiveFrame
 from .frame_series import LiveFrameSeries
-from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xdart import utils
 from xdart.modules.live_compat import normalize_live_class_names
 from xdart.modules.wavelength import (
@@ -156,9 +155,6 @@ class LiveScan:
         self.bai_2d_args = bai_2d_args
         self.scan_lock = Condition(_PyRLock())
 
-        self.bai_1d: IntegrationResult1D | None = None
-        self.bai_2d: IntegrationResult2D | None = None
-
         # G2: ``overall_raw`` was a sum-of-raw-frames accumulator
         # consumed only by display_data.get_scan_map_raw (now
         # deleted).  Drifted from disk under R1 replace-frames and
@@ -172,8 +168,6 @@ class LiveScan:
             self.frames = LiveFrameSeries(self.data_file, self.file_lock,
                                           static=self.static, gi=self.gi)
             self.global_mask = None
-            self.bai_1d = None
-            self.bai_2d = None
             self._clear_persisted_wavelength()
 
     def _clear_persisted_wavelength(self):
@@ -362,7 +356,7 @@ class LiveScan:
         """Adds a new frame to the scan.
 
         In-memory state (``frames.index``, ``scan_data``,
-        ``bai_1d``/``bai_2d`` accumulators) is always updated.
+        persisted scan state is always updated.
         Persistence policy:
 
         * ``batch_save=True`` — skip the per-frame ``_save_to_nexus`` call;
@@ -440,11 +434,6 @@ class LiveScan:
                             [coerced_info], index=[frame.idx]
                         )
 
-            if update:
-                self._accumulate_bai_1d(frame)
-                if not self.skip_2d:
-                    self._accumulate_bai_2d(frame)
-
             # G2: ``self.overall_raw += (frame.map_raw - frame.bg_raw)``
             # removed.  The accumulator's only consumer was
             # ``display_data.get_scan_map_raw``; the Overall view
@@ -458,32 +447,6 @@ class LiveScan:
             # any ``h5file`` argument (kept for signature compatibility).
             if not batch_save:
                 self._save_to_nexus()
-
-    def _accumulate_bai_1d(self, frame):
-        """In-memory running sum of 1D integration results (no HDF5 write)."""
-        with self.scan_lock:
-            if frame.int_1d is None:
-                return
-            try:
-                if self.bai_1d is None:
-                    self.bai_1d = frame.int_1d
-                else:
-                    self.bai_1d = self.bai_1d + frame.int_1d
-            except (ValueError, AttributeError):
-                self.bai_1d = frame.int_1d
-
-    def _accumulate_bai_2d(self, frame):
-        """In-memory running sum of 2D integration results (no HDF5 write)."""
-        with self.scan_lock:
-            if frame.int_2d is None:
-                return
-            try:
-                if self.bai_2d is None:
-                    self.bai_2d = frame.int_2d
-                else:
-                    self.bai_2d = self.bai_2d + frame.int_2d
-            except (ValueError, AttributeError):
-                self.bai_2d = frame.int_2d
 
     # ------------------------------------------------------------------
     # v2 NeXus persistence

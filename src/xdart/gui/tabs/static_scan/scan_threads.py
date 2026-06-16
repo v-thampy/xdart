@@ -333,12 +333,6 @@ class integratorThread(Qt.QtCore.QThread):
         # caches are still cleared above for the legacy 1D draw path.)
         if self.publication_store is not None:
             self.publication_store.begin_reintegrate()
-        with self.scan.scan_lock:
-            if do_2d:
-                self.scan.bai_2d = None
-            else:
-                self.scan.bai_1d = None
-
         max_cores = getattr(self.scan, 'max_cores', 1)
         indices = list(self.scan.frames.index)
         if not indices:
@@ -351,15 +345,11 @@ class integratorThread(Qt.QtCore.QThread):
             mutation that other threads (the wrangler thread, the
             GUI's LiveFrameSeries.__getitem__) can race against.  Hold
             ``scan_lock`` while we do it.  The lock is short — just
-            the dict assignment + the bai accumulator — and the
-            accumulator path itself already takes scan_lock
-            internally, so we don't deadlock by nesting (Condition
-            is reentrant).
+            the dict assignment.
             """
             with self.scan.scan_lock:
                 self.scan.frames[frame.idx] = frame
             if do_2d:
-                self.scan._accumulate_bai_2d(frame)
                 # A standard 2D reintegrate also refreshes 1D so linked
                 # viewers do not keep stale cached curves.
                 self._publish_reintegrated_display(
@@ -368,7 +358,6 @@ class integratorThread(Qt.QtCore.QThread):
                     refresh_1d=True,
                 )
             else:
-                self.scan._accumulate_bai_1d(frame)
                 self._publish_reintegrated_display(
                     frame,
                     include_2d=False,

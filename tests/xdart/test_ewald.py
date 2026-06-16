@@ -135,6 +135,16 @@ def make_scan(calib_path, poni_file, stepsize, user, image_path, spec_path,
     return scan
 
 
+def _sum_results(frames, attr):
+    total = None
+    for frame in frames:
+        result = getattr(frame, attr, None)
+        if result is None:
+            continue
+        total = result if total is None else total + result
+    return total
+
+
 @unittest.skipUnless(_TEST_DATA_DIR.exists(), _SKIP_REASON)
 class TestLiveScan(unittest.TestCase):
     def setUp(self):
@@ -168,21 +178,23 @@ class TestLiveScan(unittest.TestCase):
     
     #@unittest.skip("Known to pass")
     def test_1d(self):
+        summed = _sum_results(self.scan.frames, "int_1d")
         self.assertTrue(np.isclose(self.true_1d_ttheta, 
-                                   self.scan.bai_1d.ttheta).all())
+                                   summed.ttheta).all())
         self.assertTrue(np.isclose(self.true_1d_norm, 
-                                   self.scan.bai_1d.norm.full(),
+                                   summed.norm.full(),
                                    rtol=1e-3, atol=1e-4).all())
     
     #@unittest.skip("Known to pass")
     def test_2d(self):
+        summed = _sum_results(self.scan.frames, "int_2d")
         self.assertTrue(np.isclose(self.true_2d_ttheta, 
-                                   self.scan.bai_2d.ttheta).all())
+                                   summed.ttheta).all())
         self.assertTrue(np.isclose(self.true_2d_norm, 
-                                   self.scan.bai_2d.norm.full(),
+                                   summed.norm.full(),
                                    rtol=1e-3, atol=1e-4).all())
         self.assertTrue(np.isclose(self.true_2d_chi, 
-                                   self.scan.bai_2d.chi).all())
+                                   summed.chi).all())
     
     def test_save(self):
         self.scan.save_to_nexus(replace=True)
@@ -191,9 +203,9 @@ class TestLiveScan(unittest.TestCase):
     def test_bai(self):
         # F6 removed scan.by_arch_integrate_1d / by_arch_integrate_2d
         # (unreachable from the GUI; only this test exercised it).
-        # The equivalent through the supported API is per-frame
-        # integrate_1d followed by accumulation via add_frame's
-        # internal _accumulate_bai_1d.  We rebuild that here so the
+        # The equivalent through the supported API is per-frame integrate_1d
+        # followed by a local aggregate in the test.  This keeps the
+        # production LiveScan free of a full-scan running-sum slab while the
         # assertion against true_1d_norm still validates the
         # integration result.
         from xdart.modules.ewald.frame import LiveFrame  # noqa: F401
@@ -201,14 +213,12 @@ class TestLiveScan(unittest.TestCase):
                     unit=units.TTH_DEG, correctSolidAngle=False,
                     method='csr')
         self.scan.bai_1d_args = args.copy()
-        with self.scan.scan_lock:
-            self.scan.bai_1d = None
-            for frame in self.scan.frames:
-                frame.integrate_1d(global_mask=self.scan.global_mask, **args)
-                self.scan._accumulate_bai_1d(frame)
+        for frame in self.scan.frames:
+            frame.integrate_1d(global_mask=self.scan.global_mask, **args)
+        summed = _sum_results(self.scan.frames, "int_1d")
         self.assertEqual(self.scan.bai_1d_args['method'], 'csr')
         self.assertTrue(np.isclose(self.true_1d_norm,
-                                   self.scan.bai_1d.norm.full(),
+                                   summed.norm.full(),
                                    rtol=1e-3, atol=1e-4).all())
 
 
@@ -224,4 +234,3 @@ if __name__ == '__main__':
     #         spec_name = "LaB6_2",
     #         scan_number = 1
     #     )
-
