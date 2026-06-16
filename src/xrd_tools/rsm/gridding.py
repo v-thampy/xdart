@@ -198,7 +198,8 @@ class StreamingGridder:
 
     Bounds must be set before the first :meth:`add` call, either via
     :meth:`set_bounds` (user supplies q ranges) or :meth:`scout` (compute
-    q at the 4 detector corners across a list of scans).
+    q on a 3×3 virtual-detector grid — corners, edge midpoints, and centre —
+    across a list of scans; C1).
 
     Memory ceiling (per chunk): ``chunk_size × H × W × (4 arrays × 8 bytes)``
     plus the gridder's bin buffer of ``bins[0] × bins[1] × bins[2] × 8``.

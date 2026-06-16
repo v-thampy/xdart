@@ -281,8 +281,8 @@ _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
 # fewer, bigger chunks amortise the ThreadPoolExecutor dispatch + the
 # end-of-batch scan._save_to_nexus flush over more frames (PERF-4a).
 #
-# Peak buffer per batch ≈ flush_size × ~18 MB (one 2167x2070 int32 Eiger
-# frame), plus the 2D cake per frame.  PERF-3 frees each frame's raw at
+# Peak buffer per batch ≈ flush_size × ~9 MB (one 2167x2070 uint16 Eiger
+# frame, read in native dtype — QW3), plus the 2D cake per frame.  PERF-3 frees each frame's raw at
 # end-of-batch, so this peak is now bounded to ONE chunk regardless of scan
 # length (pre-PERF-3 the stash pinned raw for every frame for the whole
 # scan), which is what makes raising the chunk size safe.  64 frames ≈

@@ -355,8 +355,8 @@ class LiveScan:
                  h5file=None, batch_save=False, **kwargs):
         """Adds a new frame to the scan.
 
-        In-memory state (``frames.index``, ``scan_data``,
-        persisted scan state is always updated.
+        In-memory state (``frames.index``, ``scan_data``) and the persisted
+        scan state are always updated.
         Persistence policy:
 
         * ``batch_save=True`` — skip the per-frame ``_save_to_nexus`` call;
