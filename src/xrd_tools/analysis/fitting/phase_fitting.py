@@ -582,6 +582,12 @@ def _make_phase_eval(
     use_fixed = fixed_q is not None
     if use_fixed:
         fixed_q = np.asarray(fixed_q, dtype=float)
+        if texture == "march_dollase":
+            raise ValueError(
+                "March-Dollase texture requires a structure-backed phase with "
+                "a real lattice metric; fixed-q/structure-less phases cannot "
+                "derive a physical texture correction."
+            )
 
     wm = _resolve_width_model(width_model, caglioti)
 
@@ -2013,4 +2019,3 @@ class PhaseFitter:
         txt = result.summary()
         print(txt)
         return txt
-

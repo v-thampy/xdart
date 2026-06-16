@@ -6,19 +6,26 @@ the input parameters within tolerance.
 """
 from __future__ import annotations
 
+import importlib.util
+
 import numpy as np
 import pytest
 
-from xrd_tools.analysis.fitting.phase_fitting import (
-    PhaseFitter,
-    MultiPhaseResult,
-    _metric_tensor,
-    _q_from_hkl,
-    _pseudo_voigt,
-    _caglioti_sigma,
-)
 from xrd_tools.analysis.fitting.background import snip_1d
 from xrd_tools.analysis.phase import PhaseModel, PeakData
+
+_HAS_LMFIT = importlib.util.find_spec("lmfit") is not None
+pytestmark = pytest.mark.skipif(not _HAS_LMFIT, reason="requires lmfit")
+
+if _HAS_LMFIT:
+    from xrd_tools.analysis.fitting.phase_fitting import (
+        PhaseFitter,
+        MultiPhaseResult,
+        _metric_tensor,
+        _q_from_hkl,
+        _pseudo_voigt,
+        _caglioti_sigma,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +227,33 @@ class TestPhaseFitter:
         params = fitter.build_parameters(caglioti=False)
         assert "p0_sigma" in params
         assert "p0_U" not in params
+
+    def test_march_dollase_refuses_structureless_fixed_q(
+        self, q_axis, two_phase_data, au_phase,
+    ):
+        fitter = PhaseFitter(q_axis, two_phase_data)
+        fitter.add_phase(au_phase)
+        with pytest.raises(ValueError, match="structure-backed phase"):
+            fitter.build_parameters(texture="march_dollase")
+
+    def test_march_dollase_allowed_with_lattice_metric(self, q_axis, two_phase_data):
+        class _Lattice:
+            a = 4.0782
+            b = 4.0782
+            c = 4.0782
+            alpha = 90.0
+            beta = 90.0
+            gamma = 90.0
+
+        class _Structure:
+            lattice = _Lattice()
+
+        phase = _make_fcc_phase("Au-structured", a=4.0782)
+        phase.structure = _Structure()
+        fitter = PhaseFitter(q_axis, two_phase_data)
+        fitter.add_phase(phase)
+        params = fitter.build_parameters(texture="march_dollase")
+        assert "p0_march_r" in params
 
     def test_eval_model(self, q_axis, two_phase_data, au_phase, cu_phase):
         fitter = PhaseFitter(q_axis, two_phase_data)
