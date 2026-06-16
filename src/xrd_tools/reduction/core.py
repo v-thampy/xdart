@@ -727,6 +727,33 @@ class ReductionSession:
     # pause/resume/submit are called from ONE orchestrating thread (drain's
     # contract); pause is never concurrent with submit.
     _paused: bool = field(default=False, init=False, repr=False)
+    _state_lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False,
+    )
+
+    def _mark_cancelled(self) -> None:
+        with self._state_lock:
+            self._cancelled = True
+
+    def _record_failure(self, exc: BaseException) -> None:
+        with self._state_lock:
+            if self._failure is None:
+                self._failure = exc
+
+    def _current_failure(self) -> BaseException | None:
+        with self._state_lock:
+            return self._failure
+
+    def _is_cancelled(self) -> bool:
+        with self._state_lock:
+            return self._cancelled or self.cancel_token.cancelled
+
+    def _terminal_state(self) -> tuple[bool, BaseException | None]:
+        with self._state_lock:
+            return (
+                self._cancelled or self.cancel_token.cancelled,
+                self._failure,
+            )
 
     def __post_init__(self) -> None:
         if self.chunk_size <= 0:
@@ -789,7 +816,7 @@ class ReductionSession:
         if exc is not None:
             # A body exception is already propagating — finish for cleanup but
             # do NOT raise (that would mask the original exception).
-            self._failure = self._failure or exc
+            self._record_failure(exc)
             self.finish(raise_on_failure=False)
         else:
             # Body succeeded; surface a swallowed write/sink failure (fail-loud)
@@ -840,8 +867,8 @@ class ReductionSession:
             raise RuntimeError(
                 "ReductionSession.process called while paused; call resume() first"
             )
-        if self._cancelled or self.cancel_token.cancelled:
-            self._cancelled = True
+        if self._is_cancelled():
+            self._mark_cancelled()
             return
 
         try:
@@ -850,7 +877,7 @@ class ReductionSession:
                     self.source, self.scan, self.chunk_size,
                 ):
                     self._process_chunk(chunk, chunk_images)
-                    if self._cancelled:
+                    if self._is_cancelled():
                         break
                 return
 
@@ -858,7 +885,7 @@ class ReductionSession:
             self._register_process_frames(chunk)
             self._process_chunk(chunk, chunk_images)
         except BaseException as exc:
-            self._failure = exc
+            self._record_failure(exc)
             raise
 
     def _init_streaming(self) -> None:
@@ -916,14 +943,15 @@ class ReductionSession:
             raise RuntimeError("submit() requires execution='streaming'")
         if self._finished:
             raise RuntimeError("ReductionSession.submit called after finish().")
-        if self._failure is not None:
-            raise self._failure
+        failure = self._current_failure()
+        if failure is not None:
+            raise failure
         if self._paused:
             raise RuntimeError(
                 "ReductionSession.submit called while paused; call resume() first"
             )
-        if self._cancelled or self.cancel_token.cancelled:
-            self._cancelled = True
+        if self._is_cancelled():
+            self._mark_cancelled()
             return False
         # Bounded in-flight: blocks the reader so it can't outrun integration
         # (flat peak memory).  Released by the writer thread per frame.  The
@@ -936,8 +964,8 @@ class ReductionSession:
         # (raising here escapes through run() which has no except, tearing down
         # the QThread — the same trap the GIFreezeError fix addressed).
         while not self._semaphore.acquire(timeout=0.1):
-            if self._cancelled or self.cancel_token.cancelled:
-                self._cancelled = True
+            if self._is_cancelled():
+                self._mark_cancelled()
                 return False
             if (self._writer_thread is not None
                     and not self._writer_thread.is_alive()):
@@ -946,13 +974,13 @@ class ReductionSession:
                 # (matching the cancel path — raising here would escape the
                 # caller's run() and tear down the QThread); the NEXT submit
                 # raises the recorded failure at its fail-loud precheck.
-                self._failure = self._failure or RuntimeError(
+                self._record_failure(RuntimeError(
                     "ReductionSession writer thread died; run cannot proceed"
-                )
-                self._cancelled = True
+                ))
+                self._mark_cancelled()
                 return False
-        if self._cancelled or self.cancel_token.cancelled:
-            self._cancelled = True
+        if self._is_cancelled():
+            self._mark_cancelled()
             self._semaphore.release()
             return False
         # Permit held and not cancelled: NOW it is safe to register the frame in
@@ -966,8 +994,8 @@ class ReductionSession:
             # acquired above must be returned, else later submits deadlock
             # on a semaphore that can never refill.  Record fail-loud.
             self._semaphore.release()
-            self._failure = self._failure or exc
-            self._cancelled = True
+            self._record_failure(exc)
+            self._mark_cancelled()
             raise
         self._submitted += 1
         self._write_queue.put((frame, future))
@@ -1016,13 +1044,13 @@ class ReductionSession:
                 try:
                     reduction = future.result()
                 except _ReductionCancelled:
-                    self._cancelled = True
+                    self._mark_cancelled()
                     if self.clear_frame_images:
                         frame.image = None
                         frame.background = None
                     continue
                 except BaseException as exc:  # integration failure for one frame
-                    self._failure = self._failure or exc
+                    self._record_failure(exc)
                     if self.clear_frame_images:
                         frame.image = None
                         frame.background = None
@@ -1039,7 +1067,7 @@ class ReductionSession:
                         self._sink.write(frame, reduction)
                         self._completed += 1
                 except BaseException as exc:
-                    self._failure = self._failure or exc
+                    self._record_failure(exc)
                 else:
                     # T0-7/S1: a progress-callback or image-clear exception
                     # must be RECORDED, not allowed to escape — an escape
@@ -1054,7 +1082,7 @@ class ReductionSession:
                             frame.background = None
                             _clear_source_frame_image(self.source, frame.index)
                     except BaseException as exc:
-                        self._failure = self._failure or exc
+                        self._record_failure(exc)
             finally:
                 self._semaphore.release()
                 self._write_queue.task_done()
@@ -1122,7 +1150,7 @@ class ReductionSession:
 
         Called from the SAME thread as :meth:`submit` (cooperative; never
         concurrent with it)."""
-        if self._finished or self._cancelled or self.cancel_token.cancelled:
+        if self._finished or self._is_cancelled():
             return True
         self._paused = True
         return self.drain(timeout=timeout)
@@ -1146,8 +1174,7 @@ class ReductionSession:
         execution modes, so this reads as running across chunked and
         streaming runs (the GUI run-state seam, Phase 4d)."""
         return (self._started
-                and not (self._finished or self._cancelled
-                         or self.cancel_token.cancelled))
+                and not (self._finished or self._is_cancelled()))
 
     def finish(self, raise_on_failure: bool = True,
                join_timeout: float | None = None) -> ReductionResult:
@@ -1189,14 +1216,13 @@ class ReductionSession:
                     # flag the result as failed so the caller gets a loud error
                     # rather than a silent hang.
                     self.cancel_token.cancel()
-                    self._cancelled = True
-                    if self._failure is None:
-                        self._failure = TimeoutError(
+                    self._mark_cancelled()
+                    self._record_failure(TimeoutError(
                             f"ReductionSession.finish(): writer thread did not "
                             f"exit within {join_timeout}s; a worker may be "
                             f"stalled (stalled NFS read or runaway pyFAI call). "
                             f"Session result is incomplete."
-                        )
+                    ))
                     warnings.warn(
                         f"ReductionSession.finish(): writer join timed out after "
                         f"{join_timeout}s; session result is incomplete.",
@@ -1210,14 +1236,15 @@ class ReductionSession:
                 else:
                     self._writer_thread = None
 
+        cancelled, failure = self._terminal_state()
         self.result = ReductionResult(
             scan_name=self.scan.name,
             frames=self._products,
             n_processed=self._completed,
-            cancelled=self._cancelled or self.cancel_token.cancelled,
+            cancelled=cancelled,
             output_path=self._output_path,
-            failed=self._failure is not None,
-            error=None if self._failure is None else str(self._failure),
+            failed=failure is not None,
+            error=None if failure is None else str(failure),
         )
         try:
             if self._started:
@@ -1248,7 +1275,7 @@ class ReductionSession:
                         f"un-finalized.{where}",
                         RuntimeWarning, stacklevel=2,
                     )
-                elif self._failure is None:
+                elif failure is None:
                     self._sink.finish(self.result)
                 else:
                     abort = getattr(self._sink, "abort", None)
@@ -1276,8 +1303,9 @@ class ReductionSession:
         # Fail-loud (rail 1+3): re-raise the ORIGINAL reduction/sink-write
         # exception so the real traceback survives (no generic wrapper).  The
         # result is already stored on self.result (rail 2) for retrieval.
-        if raise_on_failure and self._failure is not None:
-            raise self._failure
+        failure = self._current_failure()
+        if raise_on_failure and failure is not None:
+            raise failure
         return self.result
 
     def _apply_gi_freeze(self, freeze_policy: str) -> None:
@@ -1375,7 +1403,7 @@ class ReductionSession:
         pending: list[tuple[Frame, Any]] = []
         for frame, raw_image in zip(chunk, chunk_images):
             if self.cancel_token.cancelled:
-                self._cancelled = True
+                self._mark_cancelled()
                 break
             _emit(self.progress_cb, self.scan.name, "load", frame.index, self._completed, len(self.scan))
             _emit(self.progress_cb, self.scan.name, "integrate", frame.index, self._completed, len(self.scan))
@@ -1392,7 +1420,7 @@ class ReductionSession:
                         warned_monitor_keys=self._warned_monitor_keys,
                     )
                 except _ReductionCancelled:
-                    self._cancelled = True
+                    self._mark_cancelled()
                     break
                 pending.append((frame, reduction))
             else:
@@ -1427,7 +1455,7 @@ class ReductionSession:
                         else reduction_or_future.result()
                     )
                 except _ReductionCancelled:
-                    self._cancelled = True
+                    self._mark_cancelled()
                     _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
                     break
                 idx = int(frame.index)
@@ -1451,7 +1479,7 @@ class ReductionSession:
                     frame.background = None
                     _clear_source_frame_image(self.source, frame.index)
                 if self.cancel_token.cancelled:
-                    self._cancelled = True
+                    self._mark_cancelled()
                     _cancel_pending_futures(pending[pos + 1:], worker=self._worker)
                     break
         except BaseException:
