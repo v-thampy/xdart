@@ -32,6 +32,7 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from xrd_tools.core import DEFAULT_MODE_KEY, FrameRecord, FrameView
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.reduction import (
     Frame,
@@ -39,6 +40,7 @@ from xrd_tools.reduction import (
     ReductionResult,
     ReductionSession,
 )
+from .frame_record_store import FrameRecordStore
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +151,13 @@ def _mode_key_from_plan(plan: ReductionPlan):
     return (getattr(m1, "value", m1), getattr(m2, "value", m2))
 
 
+def _dimension_modes(mode_key: Any) -> tuple[str, str]:
+    if isinstance(mode_key, tuple) and len(mode_key) == 2:
+        m1, m2 = mode_key
+        return str(m1 or DEFAULT_MODE_KEY), str(m2 or DEFAULT_MODE_KEY)
+    return DEFAULT_MODE_KEY, DEFAULT_MODE_KEY
+
+
 def _freeze_result_arrays(result):
     """Mark a result's ndarray fields read-only IN PLACE (zero-copy) so a
     FrameEvent listener cannot retroactively corrupt the shared, already-written
@@ -192,6 +201,7 @@ class ScanSession:
         gi_freeze_mode: str | None = None,
         cancel_token: Any | None = None,
         clear_frame_images: bool = False,
+        record_store: FrameRecordStore | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._frame_cbs: list[Callable[[FrameEvent], None]] = []
@@ -201,6 +211,7 @@ class ScanSession:
         self._completed = 0
         self._generation = 0
         self._mode_key = _mode_key_from_plan(plan)
+        self._record_store = record_store
         self._user_sink = sink
         event_sink = _EventSink(sink, self._on_completed)
         # Streaming + retain_products=False: per-frame results are delivered via
@@ -370,12 +381,35 @@ class ScanSession:
             generation=generation,
             timestamp=time.time(),
         )
+        self._upsert_record_store(frame, event)
         for cb in cbs:
             try:
                 cb(event)
             except Exception:
                 logger.exception("ScanSession.on_frame_completed listener raised")
         self._emit_progress()
+
+    def _upsert_record_store(self, frame: Frame, event: FrameEvent) -> None:
+        if self._record_store is None:
+            return
+        mode_1d, mode_2d = _dimension_modes(event.mode_key)
+        try:
+            view = FrameView.from_results(
+                label=event.frame_index,
+                result_1d=event.result_1d,
+                result_2d=event.result_2d,
+                metadata_raw=event.metadata,
+                metadata_numeric=getattr(frame, "metadata_numeric", None),
+                incident_angle=getattr(getattr(frame, "geometry", None), "incident_angle", None),
+                source_path=getattr(frame, "source_path", None),
+                source_frame_index=getattr(frame, "source_frame_index", None),
+            )
+            self._record_store.upsert(
+                FrameRecord.from_view(view, mode_1d=mode_1d, mode_2d=mode_2d),
+                source_identity=getattr(frame, "source_identity", None),
+            )
+        except Exception:
+            logger.exception("ScanSession record_store upsert failed")
 
     def _emit_progress(self) -> None:
         with self._lock:

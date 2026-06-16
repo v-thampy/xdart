@@ -19,10 +19,12 @@ from .scan_session import (
     ScanSession,
     StateChangeEvent,
 )
+from .frame_record_store import FrameRecordStore
 
 __all__ = [
     "ScanSession",
     "FrameEvent",
+    "FrameRecordStore",
     "ProgressEvent",
     "StateChangeEvent",
 ]

@@ -33,6 +33,7 @@ from xrd_tools.reduction import (
 import xrd_tools.reduction.core as reduction_core
 from xrd_tools.session import (
     FrameEvent,
+    FrameRecordStore,
     ProgressEvent,
     ScanSession,
     StateChangeEvent,
@@ -459,3 +460,26 @@ def test_clear_frame_images_default_keeps_images():
         sess.submit(fr)
     sess.finish()
     assert all(fr.image is not None for fr in frames)
+
+
+def test_optional_record_store_receives_completed_frame_records():
+    store = FrameRecordStore(max_heavy_items=None)
+    frames = _frames(2)
+    frames[0].source_path = "/tmp/source.tif"
+    frames[0].source_frame_index = 0
+    sess = ScanSession(
+        ReductionPlan(integration_2d=None),
+        Scan("s", frames, integrator=object()),
+        sink=MemorySink(),
+        executor=2,
+        record_store=store,
+    )
+    for fr in frames:
+        sess.submit(fr)
+    sess.finish()
+
+    rec = store.get(0)
+    assert rec is not None
+    assert rec.modes_1d == ("default",)
+    np.testing.assert_allclose(rec.view_1d().intensity_1d, [0.0, 1.0])
+    assert store.source_identity(0) == "/tmp/source.tif#0"

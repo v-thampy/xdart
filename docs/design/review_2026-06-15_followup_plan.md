@@ -43,6 +43,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | Wave 5 A4 prep — scan reads stop trusting stale mirrors | this checkpoint | ✅ normal Int 1D/2D snapshots, readiness, and Single/Sum/Average fallback paths treat missing store rows as missing and hydrate from disk when possible; without disk they blank/defer instead of drawing stale or subset mirror data. Viewer modes still use their Role-B file-row arrays |
 | Wave 5 A4 prep — remove dead file-thread mirror loader | this checkpoint | ✅ `fileHandlerThread` no longer exposes the unqueued `load_frame`/`load_frames` tasks that could repopulate scan-mode mirrors behind the publication store; the long-lived file thread remains for `set_datafile` and `save_data_as` |
 | Wave 5/D2 hardening — non-blocking integration hydration | this checkpoint | ✅ normal display renders now queue missing 1D/2D integration hydration through the background worker when async hydration is enabled; explicit background-setting reads still opt into blocking full-coverage reads |
+| Phase B foundation — headless `FrameRecordStore` | this checkpoint | ✅ `xrd_tools.session` now exposes a Qt-free, bounded, persist-before-evict `FrameRecordStore`; `ScanSession` can optionally populate it from completed frame events. This is dormant for xdart until the live-gated store→session projection flip |
 
 **Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_gui_modes_end_to_end.py`,
@@ -89,7 +90,9 @@ store/display suite (`91 passed`). The scan-read cleanup passed the focused stal
 the broader display/publication/aggregate suite (`194 passed`). The dead file-thread mirror-loader cleanup
 passed the focused live-run, batch-finish, shutdown, placeholder-load, and `_absorb_chunk` slice
 (`17 passed`). The non-blocking integration hydration hardening passed the focused D2/raw/integration
-hydration policy slice (`9 passed`).
+hydration policy slice (`9 passed`). The Phase B foundation passed the headless store/session/record slice
+(`45 passed`) before any xdart live-path wiring, plus architecture/release guards and xdart publication
+coverage (`130 passed` for the expanded focused gate).
 
 **Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is
 a safer pre-live-checkpoint boundary: publication-store-first display, bounded mirrors, and tests for the
