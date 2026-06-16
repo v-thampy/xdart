@@ -142,7 +142,8 @@ listed here are closed by `322b11e` / `4e5433b`.
 
 **Still ahead:** finish Wave 5 (A3/A4 live-gated Role-A mirror retirement), I4 (post-Wave-5),
 the remaining live checkpoint for N2's real batch silence/equivalence/perf, the residual P3 nits
-above, and Phase B (out of scope — see below).
+above, and the Phase B projection flip (the headless foundation has started; xdart projection remains
+live-gated).
 
 ### 0.2 Resolved primary-mode GI Overall truncation (2026-06-16) + remaining non-primary-mode note
 
@@ -211,13 +212,13 @@ after Wave 4. It is greenfield-plan work (not a pure review finding), included p
 request; it intersects review items §2.D (ordering gate), D2 (thumbnail copies), D5 (hydrated-raw LRU).
 It is **live-gated**, so it is structured as offscreen prep + a live-checkpoint handback.
 
-## Out of scope (owned elsewhere — do NOT touch in this plan)
-- **Phase B = ADR-0005 store→session relocation**: the headless `FrameRecord` store in
-  `xrd_tools.session` (7a), cadence/eviction into the session (7c), and `PublicationStore`-as-projection
-  + shared-metadata (D3). Per the terminal agent's **DECOUPLING UPDATE** in
-  `design_store_session_steps7_8_jun2026.md`, this is explicitly **separate from `data_1d` retirement and
-  NOT required for it** — it is the bigger/riskier "thin xdart" move, gated behind the A→B go/defer
-  checkpoint. So D3 metadata-sharing belongs to Phase B, **not** A3/A4.
+## Out of scope for the live-gated A3/A4 deletion (owned by Phase B)
+- **Phase B = ADR-0005 store→session projection/ownership flip**: the headless `FrameRecordStore`
+  foundation in `xrd_tools.session` has landed, but cadence/eviction into the session (7c),
+  `PublicationStore`-as-projection, and shared metadata (D3) remain a separate, live-gated ownership move.
+  Per the **DECOUPLING UPDATE** in `design_store_session_steps7_8_jun2026.md`, this is explicitly
+  **separate from `data_1d` retirement and NOT required for it** — it is the bigger/riskier "thin xdart"
+  move. So D3 metadata-sharing belongs to Phase B, **not** A3/A4.
 - **Share Axis vertical-alignment bug (#2)** — **now FIXED in HEAD `f47790f`** (align-then-lock revert);
   was listed here as open WIP — it is done. Only a live *visual* confirmation remains (cake/1D x-axes line
   up vertically under zoom), which is part of the maintainer's cake-and-axis live pass, not this plan.
@@ -542,25 +543,25 @@ It is **live-gated**, so it is structured as offscreen prep + a live-checkpoint 
 ## Wave 5 — A3/A4: retire Role-A `data_1d`/`data_2d` (greenfield 8a/8b) — LIVE-GATED, L
 
 **Authoritative spec:** the **DECOUPLING UPDATE** in
-`docs/design/design_store_session_steps7_8_jun2026.md` (currently uncommitted working-tree edit) — read it
+`docs/design/design_store_session_steps7_8_jun2026.md` — read it
 first; it supersedes the original "7+8 coupled" framing. This is **Phase A's finale**, NOT the
-session-store relocation (that is Phase B, out of scope).
+session-store projection flip (that is Phase B and remains live-gated).
 
 **What this is / isn't.** A3/A4 deletes the legacy *scan-integration cache* (`data_1d` unbounded,
 `data_2d` cap-40) so the publication payload + the on-disk aggregate are the sole 1D/2D integration
 source. It does **not** build the headless `FrameRecord` store or make `PublicationStore` a projection —
-that is Phase B (7a/7c/D3). The capability A3/A4 depends on already shipped in Phase A.
+the headless store foundation has since landed, but xdart projection is Phase B (7c/D3). The capability
+A3/A4 depends on already shipped in Phase A.
 
 **Prerequisites (landed — re-verify green before starting):**
 - A1 (`io.aggregate` + the xdart `scan_aggregate`/`AggregationWorker` wiring) — whole-scan Sum/Average
   now comes from disk⊕tail, so it no longer needs `data_1d` as the unbounded backstop. ✅
 - A2 (`get_or_hydrate` rehydrates tier-1 thumbnail-only frames) — scroll-back to an evicted frame
   rehydrates from disk; this is what makes deleting the unbounded `data_1d` safe. ✅
-- **C5 (already landed — NOT a blocker):** the off-thread aggregate read is already coordinated with the
-  writer via the shared `scan.file_lock` (re-verified at HEAD — see the revised C5). No file-lock work is
-  needed before the flip. The only C5 residual is its regression test, which **should be green before the
-  A3/A4 live checkpoint** since A3/A4 leans harder on the concurrent read path — but it does not gate the
-  offscreen prep.
+- **C5 (landed and tested — NOT a blocker):** the off-thread aggregate read is coordinated with the
+  writer via the shared `scan.file_lock` and covered by
+  `tests/xdart/test_scan_aggregate.py::test_whole_scan_aggregate_waits_for_shared_file_lock`. No file-lock
+  work is needed before the flip.
 
 ### The central discipline — classify EVERY site before touching it
 `data_1d`/`data_2d` serve **two roles**; the deletion surface is only Role-A (≈ a third of the 226 raw
@@ -621,15 +622,14 @@ refs), not the whole thing:
 - **GI Overall mode switching (GI-AGG, §0.2):** primary-mode GI Overall is now served from the complete
   disk⊕tail aggregate. Non-primary GI modes must remain explicit miss/annotate/reintegrate cases; do not
   reintroduce a fallback that aggregates a bounded resident subset.
-- Shipping the A3/A4 live checkpoint without C5's regression test — the read-during-write path is
-  lock-protected (already serialized via `scan.file_lock`) but currently **unproven by any test**; land the
-  C5 test first so the concurrent path A3/A4 leans on is covered. (The old "skipping C5 races the writer"
-  trap is obsolete — the lock is in place.)
+- Reworking aggregate reads without keeping C5's regression test green — the read-during-write path is
+  lock-protected and test-covered now. The old "skipping C5 races the writer" trap is obsolete, but the
+  regression should remain part of the A3/A4 checkpoint.
 - Removing `copy_for_display`/`hydrated_raw` before the raw panel + thumbnail are confirmed sourcing from
   the store.
 
-**Effort:** L. **Depends on:** A1 ✅, A2 ✅; C5's file_lock coordination already landed (only its test is
-owed, before the live checkpoint). Phase B (7a/7c/D3) NOT required and NOT in scope.
+**Effort:** L. **Depends on:** A1 ✅, A2 ✅; C5's file_lock coordination + regression test ✅. Phase B
+projection (7c/D3) NOT required and NOT in scope for the A3/A4 deletion.
 
 **Latest offscreen gate (Wave 5 A4 lazy-load writer cleanup):**
 - `test_absorb_chunk_*` + stale/cancel stress: `5 passed`.
@@ -641,10 +641,8 @@ owed, before the live checkpoint). Phase B (7a/7c/D3) NOT required and NOT in sc
 - **Biggest single win for the notebook audience is N1** (small change, scored P2) — it makes the default
   headless path stop being serial.
 - **C5's premise turned out stale** (re-verified at HEAD `f47790f`): the off-thread aggregate read is
-  already serialized against the writer via the shared `scan.file_lock`, so it is **not** a new risk and
-  **not** a hard prerequisite for Wave 5. Its only residual is a regression test for the read-during-write
-  path, which should be green before the A3/A4 live checkpoint. (This was the biggest correction to the
-  original plan — it was written before the `af4a220`/`940b896` commits added the lock wrapping.)
+  already serialized against the writer via the shared `scan.file_lock`, and the read-during-write
+  regression is now covered. It is **not** a new risk and **not** a hard prerequisite for Wave 5.
 - **Several still-open review findings the original plan had dropped are now folded in:** N5 (streaming
   session retains every `Frame` — potentially the biggest headless-memory win, measure first), C6 (RSM
   `combine_grids` dense meshgrid), I5 (viewer raw-pin leak, Role-B/independent), QW6 (prefetch metadata
