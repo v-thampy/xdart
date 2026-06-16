@@ -89,8 +89,8 @@ def _data_snapshot(widget, *, labels=None, include_legacy=True):
     still opt into the legacy dict caches because they are row/file browsers
     rather than scan-display publications.  Normal Int 1D/2D modes do NOT
     OR-merge those mirrors into readiness anymore: doing so hid store eviction
-    from the render decision and kept the old unbounded ``data_1d`` mirror as an
-    implicit source of truth.
+    from the render decision and kept the old ``data_1d`` mirror as an implicit
+    source of truth.
     """
     store = getattr(widget, "publication_store", None)
     loaded_1d, loaded_2d, raw_avail = set(), set(), {}

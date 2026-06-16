@@ -895,6 +895,48 @@ def test_int2d_cake_clears_without_publication(widget):
     assert df.binned_data is None                   # cake blanked, not stale
 
 
+def test_int_scan_resolves_loaded_rows_from_publication_store(widget):
+    # Phase A: the old data_1d/data_2d mirrors are bounded recent-row caches.
+    # A frame still resident in PublicationStore must look loaded even when the
+    # legacy mirrors have evicted it, otherwise the update gate would falsely
+    # blank a valid scan frame.
+    w = widget
+    df = _set_int_scan(w, n=2)
+    with w.data_lock:
+        w.data_1d.clear()
+        w.data_2d.clear()
+
+    w.frame_ids[:] = ["0", "1"]
+    df.frame_ids = ["0", "1"]
+    df.get_idxs()
+
+    assert df.idxs_1d == [0, 1]
+    assert df.idxs_2d == [0, 1]
+
+    df.update()
+
+    assert len(df.curves) == 2
+    assert df.binned_data is not None
+
+
+def test_scan_mode_1d_mirror_is_bounded_but_viewer_rows_are_not(widget):
+    from xdart.gui.tabs.static_scan.static_scan_widget import _DISPLAY_1D_CACHE_MAX
+
+    w = widget
+    assert getattr(w.data_1d, "_max", None) == _DISPLAY_1D_CACHE_MAX
+
+    for i in range(_DISPLAY_1D_CACHE_MAX + 2):
+        w.data_1d[i] = SimpleNamespace(idx=i)
+    assert len(w.data_1d) == _DISPLAY_1D_CACHE_MAX
+    assert 0 not in w.data_1d
+
+    w._on_viewer_mode_changed("xye")
+    assert getattr(w.data_1d, "_max", None) == 0
+
+    w._on_viewer_mode_changed("")
+    assert getattr(w.data_1d, "_max", None) == _DISPLAY_1D_CACHE_MAX
+
+
 # ── INT 1D plot characterization before update_plot cleanup ────────────────
 #
 # The normal INT plot is update_plot-canonical.  These tests lock the computed

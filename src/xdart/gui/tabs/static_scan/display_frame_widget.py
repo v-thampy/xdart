@@ -663,6 +663,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 # release before doing list-comprehension work.
                 data_1d_keys = set(self.data_1d.keys())
                 data_2d_keys = set(self.data_2d.keys())
+            store = getattr(self, 'publication_store', None)
+            if store is not None:
+                try:
+                    from .display_publication import publication_availability
+                    pub_1d, pub_2d, _raw = publication_availability(
+                        store, labels=ids)
+                    data_1d_keys |= set(pub_1d)
+                    data_2d_keys |= set(pub_2d)
+                except Exception:
+                    logger.debug("publication availability lookup failed",
+                                 exc_info=True)
 
         self.idxs = list(ids)
         # ``ids`` is already the effective set (all-or-selected), so intersect

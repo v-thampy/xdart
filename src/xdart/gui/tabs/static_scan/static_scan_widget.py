@@ -16,13 +16,11 @@ import pyFAI
 
 logger = logging.getLogger(__name__)
 
-# Bound the in-memory frame cache so a 1000-frame Eiger scan doesn't
-# pile up ~30 GB of map_raw arrays in h5viewer.data_2d.  When we add a
-# new entry, evict the oldest non-current frame; user-scrolling back to
-# old frames will lazy-load them from disk again via file_thread.
-# Keep large enough that recent frames + the auto-last selection don't
-# thrash; small enough that peak memory stays sane.
-_FRAME_CACHE_MAX = 32
+# Transitional live-display mirrors.  The publication store is the normal scan
+# display source now; these dicts remain as recent-row caches for legacy
+# fallback paths and viewer modes.
+_DISPLAY_1D_CACHE_MAX = 512
+_DISPLAY_2D_CACHE_MAX = 40
 
 # Qt imports
 from typing import TYPE_CHECKING, Any
@@ -309,25 +307,38 @@ class staticWidget(QWidget):
         self.frame_ids = []
         self.frames = OrderedDict()
         self.publication_store = PublicationStore()
-        # Live-browse caches.  Both reset per scan (data_reset /
-        # scan_threads new-file clear), so neither accumulates across scans.
+        # Live-browse caches.  Both reset at scan/viewer boundaries and are no
+        # longer authoritative for normal Int 1D/2D readiness; the
+        # PublicationStore is.  The 1D mirror is capped in scan mode to prevent
+        # long live runs from accumulating every old IntegrationResult copy.
+        # Viewer modes temporarily lift the 1D cap because data_1d is their row
+        # table for XYE/NeXus previews, not the scan-display mirror.
         #
-        # 1D: UNBOUNDED (max=0).  A 1D snapshot (int_1d copy, include_2d=False)
-        # is tiny (~tens of KB), so keeping every frame of the current scan
-        # resident lets the user scroll back to ANY 1D frame DURING a live run
-        # straight from RAM — no disk read, so it never trips the
-        # writer-active freeze guard.  Even ~10k frames is only a few hundred
-        # MB, freed at scan end.
-        #
-        # 2D: bounded at 40.  Unlike 1D, each data_2d entry carries the full
+        # 2D: bounded at 40.  Each data_2d entry carries the full
         # ``map_raw`` detector image (~18 MB) plus the cake, so the cap is a
         # memory ceiling (~40 x 18 MB ≈ 0.7 GB), not a correctness limit.
         # 40 covers the recent-frame 2D live-browse window for most scans;
         # raising it is a straight RAM tradeoff.  Older-than-window 2D frames
         # are available after the run (or while Paused), not mid-run (the
         # writer-active freeze guard refuses to read the file being appended).
-        self.data_1d = FixSizeOrderedDict(max=0)
-        self.data_2d = FixSizeOrderedDict(max=40)
+        self.data_1d = FixSizeOrderedDict(max=_DISPLAY_1D_CACHE_MAX)
+        self.data_2d = FixSizeOrderedDict(max=_DISPLAY_2D_CACHE_MAX)
+
+    def _set_1d_cache_limit(self, limit: int | None) -> None:
+        """Switch the transitional 1D mirror between scan and viewer policy."""
+        cache = getattr(self, "data_1d", None)
+        if cache is None:
+            return
+        max_value = 0 if limit is None else int(limit)
+        if hasattr(cache, "_max"):
+            cache._max = max_value
+        elif hasattr(cache, "max"):
+            cache.max = max_value
+        else:
+            return
+        if max_value > 0:
+            while len(cache) > max_value:
+                cache.popitem(False)
 
     def _init_ui(self):
         """Set up the main UI form and detector dialog."""
@@ -756,11 +767,9 @@ class staticWidget(QWidget):
                             publication_error_details(publication, "2d"),
                         )
                     # ── Bounded cache eviction ────────────────────────
-                    # ``data_2d`` is the heavy cache and is bounded by its
-                    # FixSizeOrderedDict cap (see __init__). ``data_1d`` is
-                    # intentionally kept available for plot history and
-                    # overlay/waterfall modes; the publication store handles
-                    # heavier per-frame payload eviction separately.
+                    # ``data_1d``/``data_2d`` are recent-row mirrors only; the
+                    # publication store is the authoritative scan-display
+                    # source and handles full-scan aggregate fallbacks.
                     self.publication_store.upsert(publication)
             except Exception:
                 # Cache miss is non-fatal — displayframe will lazy-load
@@ -1402,13 +1411,10 @@ class staticWidget(QWidget):
                     self.scan.scan_data = pd.DataFrame()
             except AttributeError:
                 pass
-            # Multi-scan live runs: data_1d NEVER evicts (max=0), so without
-            # a per-swap purge every prior scan's 1D entries accumulate for
-            # the whole run (multi-GB at the 10k-frame target) -- the
-            # FixSizeOrderedDict-eviction rationale in the no-clear comment
-            # above only holds for data_2d.  Keep ONLY the currently
-            # rendered frame(s) so the previous image still lingers until
-            # this scan's first frame lands (the documented no-blank UX).
+            # Multi-scan live runs: keep only the currently rendered frame(s)
+            # from the outgoing scan so the previous image can linger until the
+            # first new frame lands without dragging the recent-row mirrors
+            # across scan boundaries.
             keep = set()
             try:
                 df = self.displayframe
@@ -1666,6 +1672,10 @@ class staticWidget(QWidget):
         self.h5viewer._suspend_scan_selection_loads = True
         try:
             self.h5viewer.viewer_mode = viewer_mode
+            set_cache_limit = getattr(self, "_set_1d_cache_limit", None)
+            if callable(set_cache_limit):
+                set_cache_limit(
+                    None if is_viewer else _DISPLAY_1D_CACHE_MAX)
             tree = getattr(self.wrangler, 'tree', None)
             if tree is not None:
                 # Only the actual file-Viewer *processing* modes disable the
