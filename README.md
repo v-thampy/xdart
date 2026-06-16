@@ -19,6 +19,24 @@ uv tool install "xrd-tools[gui]"      # isolated GUI install
 Extras: `[gui]` PySide6/pyqtgraph + GUI deps, `[fitting]` pymatgen/lmfit,
 `[rsm]` reciprocal-space mapping, `[dev]` test/build tooling.
 
+### Performance: install the HDF5 stack from conda-forge
+
+Compressed detector data — Eiger `_master.h5` files use bitshuffle+LZ4 — is
+decompressed by the native HDF5 filter libraries, and that read is a large part
+of processing time.  The pure-pip `h5py` / `hdf5plugin` wheels bundle a generic
+(non-SIMD) filter build that decompresses Eiger frames noticeably slower
+(~1.7× on Apple Silicon in our tests, e.g. a 651-frame Int-1D scan 25 s → 19 s).
+For best performance, install the HDF5 stack from **conda-forge** rather than
+pip:
+
+```bash
+conda install -c conda-forge h5py hdf5plugin fabio hdf5 blosc c-blosc2 lz4-c
+```
+
+This only affects raw-frame read speed — pyFAI integration and the writer are
+unchanged.  A pure-pip install works correctly, just slower on compressed
+detector data.
+
 ## Headless quick start
 
 ```python
