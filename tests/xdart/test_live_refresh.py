@@ -3195,7 +3195,8 @@ def _plot_host(method="Overlay"):
         update_plot_view=lambda: None,
     )
 
-    def get_frames_int_1d(idxs=None, rv="all"):
+    def get_frames_int_1d(idxs=None, rv="all", *, require_all=False,
+                          allow_blocking_read=None):
         ids = list(host.idxs_1d if idxs is None else idxs)
         x = np.array([0.0, 1.0]) + host.ui.plotUnit.currentIndex() * 10.0
         rows = np.vstack([
@@ -3371,7 +3372,7 @@ def test_overlay_append_skips_empty_incoming_grid_without_crash():
     assert host.plot_data[1].shape == (1, 2)
 
     # Frame 2 comes back with an empty x grid.
-    host.get_frames_int_1d = lambda idxs=None, rv="all": (
+    host.get_frames_int_1d = lambda idxs=None, rv="all", *, require_all=False, allow_blocking_read=None: (
         np.zeros((1, 0)), np.zeros(0))
     host.idxs = [2]
     host.idxs_1d = [2]
@@ -3891,6 +3892,7 @@ def test_overall_2d_requires_all_requested_frames_when_strict():
         get_xydata=lambda int_2d, gi_2d=None, frame=None: (
             int_2d.radial, int_2d.azimuthal,
         ),
+        _display_hydration_should_block=lambda allow_blocking_read=None: True,
     )
     host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
     host._hydrate_frame_from_disk = MethodType(

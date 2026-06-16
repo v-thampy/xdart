@@ -47,6 +47,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | Phase B hardening — source-aware hydration | this checkpoint | ✅ thinned headless records now learn a real source identity when hydrated from disk and replace, rather than merge, if the hydrator returns a conflicting source |
 | GI-AGG e2e render gate | this checkpoint | ✅ real `displayFrameWidget.update()` now has an offscreen regression proving Overall Average over >64 frames uses the disk-backed aggregate when store-heavy rows are evicted and legacy mirrors are empty |
 | I4 partial — avoid full index materialization for Single/Auto-Last | this checkpoint | ✅ normal one-frame display updates carry only the scan length into the display-decision layer; the full scan index is copied only for true Overall selections |
+| Live-refresh test-double drift | this checkpoint | ✅ full `test_live_refresh.py` is green again after updating duck-host fixtures for the new hydration policy and `require_all` keyword |
 
 **Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_gui_modes_end_to_end.py`,
@@ -100,7 +101,8 @@ headless store/session/record slice (`48 passed`). The GI-AGG real-render gap is
 `tests/xdart/test_aggregation_wiring.py::test_real_widget_overall_aggregate_uses_disk_when_store_evicted`.
 The I4 scan-index materialization slice passed the display/publication/aggregate focused set
 (`125 passed / 28 warnings`) and includes a fake-index regression proving Single renders do not iterate
-the full scan index while Overall still does.
+the full scan index while Overall still does. The live-refresh test-double fix passed
+`tests/xdart/test_live_refresh.py` (`145 passed / 1 skipped / 12 warnings`).
 
 **Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is
 a safer pre-live-checkpoint boundary: publication-store-first display, bounded mirrors, and tests for the
