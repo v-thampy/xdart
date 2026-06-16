@@ -9,6 +9,7 @@ the existing ``DisplayPayload`` shapes used by the static-scan renderer.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -311,7 +312,11 @@ class PublicationDisplayAdapter:
         for label in state.selected_ids:
             pub = self._items.get(_label_key(label))
             if pub is None or not pub.view.has_2d or publication_has_2d_errors(pub):
-                return None
+                # Evicted past the heavy bound: a whole-scan (Overall) cake is
+                # served from the on-disk aggregate (Step 7b) instead of blanking;
+                # an explicit subset with an evicted frame still blanks (the
+                # aggregate is whole-scan only).  None => blank, never wrong-subset.
+                return self._aggregate_cake_payload(state)
 
         accum = None
         count = 0
@@ -407,6 +412,51 @@ class PublicationDisplayAdapter:
         )
         idx = 1 if want_tth else 0
         return Axis(label=x_labels_2D[idx], unit=x_units_2D[idx], values=new_values)
+
+    def _aggregate_cake_payload(self, state):
+        """Whole-scan (Overall) cake from the on-disk aggregate (Step 7b) when
+        frames are evicted past the heavy store bound — the §2.C blank, filled.
+
+        Returns ``None`` (blank) for a non-Overall selection, a GI / non-primary
+        mode, or until the off-thread aggregate is ready (it re-renders on
+        completion).  Axes come from a resident frame's view when one exists (the
+        frozen common grid makes them identical, and it carries the imageUnit
+        Q↔2θ toggle); else they are built from the aggregate's own q/χ."""
+        if not getattr(state, "overall", False):
+            return None
+        widget = self._widget
+        if widget is None or not hasattr(widget, "_whole_scan_aggregate"):
+            return None
+        agg = widget._whole_scan_aggregate(dim="2d", method="average")
+        if agg is None or agg.intensity is None:
+            return None
+        image = np.asarray(agg.intensity, dtype=float)   # (n_chi, n_q) — cake orient
+        if image.ndim != 2:
+            return None
+        ref_view = ref_publication = None
+        for label in state.render_ids:
+            pub = self._items.get(_label_key(label))
+            if (pub is not None and pub.view.has_2d
+                    and not publication_has_2d_errors(pub)):
+                ref_view, ref_publication = pub.view, pub
+                break
+        if ref_view is not None:
+            axis_x = _image_axis_for_publication(ref_view.axis_2d_x, fallback_label="x")
+            axis_y = _image_axis_for_publication(ref_view.axis_2d_y, fallback_label="y")
+            axis_x = self._apply_image_unit_2d(axis_x, ref_view, ref_publication)
+        else:
+            axis_x = _image_axis_for_publication(
+                SimpleNamespace(unit=agg.q_unit, label="Q", values=agg.q),
+                fallback_label="Q")
+            axis_y = _image_axis_for_publication(
+                SimpleNamespace(unit=agg.chi_unit, label="χ", values=agg.chi),
+                fallback_label="χ")
+        background = getattr(widget, "bkg_2d", 0)
+        background = self._cake_background_for_image(background, image)
+        image = self._subtract_if_shape_matches(image, background, "2D-image background")
+        if image.size == 0 or not np.isfinite(image).any():
+            return None
+        return ImagePayload(image=image, axis_x=axis_x, axis_y=axis_y)
 
     def plot_payload(self, state):
         # Step 5 FLIP: the integration 1D plot now draws from the publication

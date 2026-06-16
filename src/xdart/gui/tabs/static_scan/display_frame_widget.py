@@ -433,6 +433,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # test behaviour); the live app turns it on via enable_async_hydration().
         self._hydration_worker = None
         self._async_hydration_enabled = False
+        # Step 7b: off-GUI-thread whole-scan aggregation (Sum/Average over a scan
+        # longer than the bounded store).  The worker computes from the on-disk
+        # stack ⊕ in-memory tail; results are cached per (dim, method, channel)
+        # with the generation they were computed under (stale ones are dropped).
+        # Shares the async on/off flag with hydration (enable_async_hydration);
+        # OFF => computed synchronously inline so headless renders see it at once.
+        self._aggregation_worker = None
+        self._agg_cache: dict = {}
         if self.publication_store is not None:
             try:
                 self.publication_store.set_hydrator(self._rehydrate_publication)
@@ -743,6 +751,97 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._hydration_worker = None
         else:
             logger.warning("frame-hydration worker did not stop within timeout; "
+                           "keeping the handle so the QThread isn't destroyed "
+                           "while its read is still in flight")
+
+    # ── Step 7b: off-GUI-thread whole-scan aggregation ───────────────────────
+    def _ensure_aggregation_worker(self):
+        if self._aggregation_worker is None:
+            from .aggregation_worker import AggregationWorker
+            # parent=None for the same reason as the hydration worker: keep the
+            # Python handle the sole owner so the QThread is never C++-deleted
+            # while a chunked read is still in flight.
+            worker = AggregationWorker(parent=None)
+            worker.sigAggregated.connect(self._on_aggregated)
+            worker.start()
+            self._aggregation_worker = worker
+        return self._aggregation_worker
+
+    def _whole_scan_aggregate(self, *, dim, method):
+        """Return the whole-scan Sum/Average for the current Overall selection as
+        an ``Aggregated1D``/``Aggregated2D``, or ``None`` when it isn't available
+        this render (defer to the resident-store / legacy path).
+
+        Primary-mode-scoped (ADR-0003): only served for a non-GI scan, where the
+        displayed mode IS the primary on-disk stack.  A GI scan's displayed mode
+        may be a non-primary sub-mode whose on-disk stack is partial, so it is
+        deferred here (GI mode resolution lands with the instant-switch step).
+        Async (live): dispatch to the worker and return None now (re-render on
+        completion).  Sync (headless): compute inline."""
+        from xdart.modules.scan_aggregate import mode_aggregation_allowed
+        scan = getattr(self, "scan", None)
+        if scan is None or getattr(scan, "gi", False):
+            return None
+        if not mode_aggregation_allowed(None, None):     # non-GI: primary==primary
+            return None
+        norm_channel = None
+        try:
+            norm_channel = self.get_normChannel() or None
+        except Exception:
+            norm_channel = None
+        generation = self.display_generation
+        key = (dim, method, norm_channel)
+        cached = self._agg_cache.get(key)
+        if cached is not None and cached[0] == generation:
+            return cached[1]
+        if getattr(self, "_async_hydration_enabled", False):
+            worker = self._ensure_aggregation_worker()
+            if worker is not None:
+                worker.request(key, generation, scan, dim, method, norm_channel)
+            return None                  # not ready this render
+        # Headless / synchronous: compute inline so the first render has it.
+        from xdart.modules.scan_aggregate import (
+            whole_scan_aggregate_1d, whole_scan_aggregate_2d)
+        fn = whole_scan_aggregate_2d if dim == "2d" else whole_scan_aggregate_1d
+        try:
+            result = fn(scan, method=method, norm_channel=norm_channel)
+        except Exception:
+            logger.debug("inline aggregation failed for %s", key, exc_info=True)
+            result = None
+        self._agg_cache[key] = (generation, result)
+        return result
+
+    def _on_aggregated(self, key, generation, result) -> None:
+        """A background aggregate finished: cache it (on the GUI thread) and
+        re-render, unless a newer generation has superseded it."""
+        if int(generation) != self.display_generation:
+            return
+        self._agg_cache[key] = (generation, result)
+        try:
+            self.update()
+        except Exception:
+            logger.debug("re-render after aggregation failed for %s", key,
+                         exc_info=True)
+
+    def stop_aggregation_worker(self) -> None:
+        """Stop + join the aggregation worker (idempotent; teardown)."""
+        worker = self._aggregation_worker
+        if worker is None:
+            return
+        try:
+            worker.sigAggregated.disconnect(self._on_aggregated)
+        except Exception:
+            pass
+        stopped = True
+        try:
+            stopped = worker.stop()
+        except Exception:
+            logger.debug("aggregation worker stop failed", exc_info=True)
+            stopped = False
+        if stopped:
+            self._aggregation_worker = None
+        else:
+            logger.warning("aggregation worker did not stop within timeout; "
                            "keeping the handle so the QThread isn't destroyed "
                            "while its read is still in flight")
 

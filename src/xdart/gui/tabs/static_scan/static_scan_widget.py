@@ -1000,6 +1000,8 @@ class staticWidget(QWidget):
             df = getattr(self, 'displayframe', None)
             if df is not None and hasattr(df, 'stop_hydration_worker'):
                 df.stop_hydration_worker()
+            if df is not None and hasattr(df, 'stop_aggregation_worker'):
+                df.stop_aggregation_worker()
         except Exception:
             logger.debug("hydration-worker shutdown on close failed",
                          exc_info=True)

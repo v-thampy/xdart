@@ -1,0 +1,182 @@
+# -*- coding: utf-8 -*-
+"""Wiring of the whole-scan aggregate into the live display (Step 7b A1b-2c).
+
+The user-reported bug: a live Int 2D Overall cake goes BLANK on Stop for a scan
+longer than the bounded store (>64 frames) — §2.C correctly refuses to average a
+wrong (store-resident-only) subset, but nothing filled that blank.  These tests
+lock the fill: the widget computes the whole-scan aggregate (disk ⊕ tail) and the
+cake adapter routes the §2.C blank to it instead of returning None.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+NQ, NCHI = 6, 4
+
+
+def _split_scan_2d(tmp_path, *, n=30, cap=8):
+    """A REAL LiveScan with a 2D stack, longer than the in-memory cap so the
+    store can't hold it all (frames are flushed to disk; values 1..n)."""
+    from xdart.modules.ewald import LiveScan
+    from xdart.modules.ewald.frame import LiveFrame
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+    q = np.linspace(0.5, 3.0, NQ, dtype=np.float32)
+    chi = np.linspace(-90.0, 90.0, NCHI, dtype=np.float32)
+    scan = LiveScan(data_file=str(tmp_path / "cake.nxs"))
+    scan.skip_2d = False
+    scan.frames._in_memory_cap = cap
+
+    def mk(i):
+        fr = LiveFrame(idx=i)
+        fr.int_1d = IntegrationResult1D(
+            radial=q, intensity=np.full(NQ, float(i + 1), np.float32),
+            sigma=np.ones(NQ, np.float32), unit="q_A^-1")
+        fr.int_2d = IntegrationResult2D(            # (radial, azimuthal)=(nq, nchi)
+            radial=q, azimuthal=chi,
+            intensity=np.full((NQ, NCHI), float(i + 1), np.float32),
+            unit="q_A^-1", azimuthal_unit="chi_deg")
+        fr.scan_info = {"i0": float(i + 1)}
+        fr.source_file = ""
+        fr.source_frame_idx = 0
+        fr.skip_map_raw = True
+        return fr
+
+    for i in range(n):
+        scan.add_frame(frame=mk(i), calculate=False, update=True,
+                       get_sd=True, batch_save=True)
+        if (i + 1) % 10 == 0:
+            scan._save_to_nexus()
+    scan._save_to_nexus()
+    return scan, q, chi
+
+
+# ── widget method: _whole_scan_aggregate ──────────────────────────────────────
+# Called unbound with a duck ``self`` — the method only reads scan /
+# display_generation / _agg_cache / get_normChannel / _async_hydration_enabled,
+# so the sync path needs no QApplication.
+
+def _duck_widget(scan, **over):
+    from types import SimpleNamespace
+    d = SimpleNamespace(scan=scan, display_generation=1, _agg_cache={},
+                        _async_hydration_enabled=False,
+                        get_normChannel=lambda: None)
+    for k, v in over.items():
+        setattr(d, k, v)
+    return d
+
+
+def _call_whole_scan_aggregate(duck, **kw):
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+    return displayFrameWidget._whole_scan_aggregate(duck, **kw)
+
+
+def test_widget_whole_scan_aggregate_2d_sync(tmp_path):
+    scan, q, chi = _split_scan_2d(tmp_path, n=30)
+    duck = _duck_widget(scan)
+    agg = _call_whole_scan_aggregate(duck, dim="2d", method="average")
+    assert agg is not None
+    assert agg.intensity.shape == (NCHI, NQ)     # disk/get_2d convention
+    np.testing.assert_allclose(agg.intensity, np.mean(np.arange(1, 31)))   # 15.5
+
+
+def test_widget_whole_scan_aggregate_caches_per_generation(tmp_path):
+    scan, _, _ = _split_scan_2d(tmp_path, n=12)
+    duck = _duck_widget(scan)
+    _call_whole_scan_aggregate(duck, dim="2d", method="average")
+    key = ("2d", "average", None)
+    assert key in duck._agg_cache and duck._agg_cache[key][0] == duck.display_generation
+
+
+def test_widget_whole_scan_aggregate_defers_for_gi(tmp_path):
+    scan, _, _ = _split_scan_2d(tmp_path, n=12)
+    scan.gi = True                               # non-primary mode resolution = Step 6
+    duck = _duck_widget(scan)
+    assert _call_whole_scan_aggregate(duck, dim="2d", method="average") is None
+
+
+# ── adapter routing: cake_image -> _aggregate_cake_payload ─────────────────────
+
+def _fake_state(*, overall, selected_ids, render_ids=()):
+    return SimpleNamespace(
+        overall=overall,
+        selected_ids=tuple(selected_ids),
+        render_ids=tuple(render_ids),
+        panel=lambda role: SimpleNamespace(has_data=True, source=None),
+    )
+
+
+def test_cake_image_routes_eviction_to_aggregate():
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xrd_tools.io import Aggregated2D
+    q = np.linspace(0.5, 3.0, NQ)
+    chi = np.linspace(-90.0, 90.0, NCHI)
+    agg = Aggregated2D(q=q, chi=chi,
+                       intensity=np.full((NCHI, NQ), 15.5),
+                       q_unit="q_A^-1", chi_unit="chi_deg", n_frames=30)
+    calls = []
+    widget = SimpleNamespace(
+        bkg_2d=0,
+        _whole_scan_aggregate=lambda *, dim, method: calls.append((dim, method)) or agg,
+    )
+    adapter = PublicationDisplayAdapter(store=None, widget=widget)
+    # Overall selection with an evicted frame (label 0 not in the empty store).
+    state = _fake_state(overall=True, selected_ids=(0,), render_ids=())
+    payload = adapter.cake_image(state)
+    assert payload is not None                    # filled, not blanked
+    assert payload.image.shape == (NCHI, NQ)
+    np.testing.assert_allclose(payload.image, 15.5)
+    assert calls == [("2d", "average")]           # routed to the aggregate
+
+
+def test_cake_image_blanks_non_overall_eviction():
+    # A non-Overall (explicit subset) selection with an evicted frame must still
+    # blank — the aggregate is whole-scan only, not an arbitrary subset.
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    widget = SimpleNamespace(
+        bkg_2d=0,
+        _whole_scan_aggregate=lambda *, dim, method: pytest.fail(
+            "must not aggregate a non-Overall subset"),
+    )
+    adapter = PublicationDisplayAdapter(store=None, widget=widget)
+    state = _fake_state(overall=False, selected_ids=(0, 1), render_ids=())
+    assert adapter.cake_image(state) is None
+
+
+# ── off-GUI-thread worker ──────────────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def qapp():
+    from pyqtgraph.Qt import QtWidgets
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    yield app
+
+
+def test_aggregation_worker_computes_off_thread(qapp, tmp_path):
+    import threading
+    from pyqtgraph import Qt
+    from xdart.gui.tabs.static_scan.aggregation_worker import AggregationWorker
+    _DIRECT = Qt.QtCore.Qt.ConnectionType.DirectConnection
+    scan, _, _ = _split_scan_2d(tmp_path, n=12)
+    caller = threading.get_ident()
+    got, done = [], threading.Event()
+    worker = AggregationWorker()
+    # DirectConnection -> the slot runs ON the worker thread, so no event loop.
+    worker.sigAggregated.connect(
+        lambda key, gen, res: (got.append((key, gen, res, threading.get_ident())),
+                               done.set()), _DIRECT)
+    worker.start()
+    try:
+        worker.request(("2d", "average", None), 7, scan, "2d", "average", None)
+        assert done.wait(10.0), "worker never emitted sigAggregated"
+    finally:
+        worker.stop()
+    key, gen, res, ran_on = got[0]
+    assert gen == 7 and res is not None
+    assert ran_on != caller                       # computed OFF the caller thread
+    np.testing.assert_allclose(res.intensity, np.mean(np.arange(1, 13)))   # 6.5
