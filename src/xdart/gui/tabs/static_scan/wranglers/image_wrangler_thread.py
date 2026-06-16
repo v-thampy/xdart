@@ -111,17 +111,6 @@ if _LIVE_EXECUTION not in ("serial", "streaming"):
                    "using 'streaming'.", _LIVE_EXECUTION)
     _LIVE_EXECUTION = "streaming"
 
-# PERF (read-bound Int 1D): Eiger ``_master.h5`` files default to fabio, which
-# reads frame-by-frame (~24-30 ms/frame) -> the prefetcher's fast bulk path
-# (``dset[start:end]``, one decompress per N frames) never engages.  Opt in to
-# the h5py BULK read for .h5/.hdf5 masters (fabio still the fallback when h5py
-# can't locate the 3D image dataset).  Validate on real Eiger data before making
-# it the default: confirm the data is identical to the fabio read AND faster
-# ([PERF-SUMMARY] prefetch_io > 0, collect_read drops).
-_EIGER_H5_BULK = os.environ.get("XDART_EIGER_H5_BULK", "").strip().lower() in (
-    "1", "true", "yes", "on",
-)
-
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -2082,9 +2071,7 @@ class imageThread(wranglerThread):
         ext = Path(master_path).suffix.lower()
         is_nexus = ext == '.nxs'
 
-        # fabio is the robust default for Eiger masters; XDART_EIGER_H5_BULK opts
-        # into the h5py BULK path (falls back to fabio if h5py finds no dataset).
-        if not is_nexus and not _EIGER_H5_BULK:
+        if not is_nexus:
             try:
                 # Primary: fabio (handles all Eiger layouts)
                 self._eiger_fabio_handle = fabio.open(master_path)
@@ -2094,23 +2081,12 @@ class imageThread(wranglerThread):
                 logger.debug("Failed to open %s with fabio: %s, trying h5py", master_path, e)
                 self._eiger_fabio_handle = None
 
-        # h5py path (primary for .nxs and for XDART_EIGER_H5_BULK; fallback for
-        # .h5/.hdf5 master files when fabio failed).
+        # h5py path (primary for .nxs, fallback for .h5/.hdf5 master files)
         try:
             ds_path = find_nexus_image_dataset(master_path)
             if ds_path is None:
                 logger.warning('Could not find 3D image dataset in %s', master_path)
                 self._eiger_close_master()
-                if not is_nexus:
-                    # h5py couldn't locate the dataset (e.g. an Eiger layout only
-                    # fabio parses) -> fall back to the robust per-frame fabio read.
-                    try:
-                        self._eiger_fabio_handle = fabio.open(master_path)
-                        self._eiger_nframes = self._eiger_fabio_handle.nframes
-                        return
-                    except (IOError, OSError) as e:
-                        logger.debug("fabio fallback failed for %s: %s", master_path, e)
-                        self._eiger_fabio_handle = None
                 self._eiger_nframes = 0
                 return
             self._eiger_h5_handle = h5py.File(master_path, 'r')
