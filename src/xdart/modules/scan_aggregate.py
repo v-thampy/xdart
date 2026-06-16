@@ -42,6 +42,8 @@ import numpy as np
 
 from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
 from xrd_tools.io import aggregate as _agg
+from xrd_tools.io import get_frames
+from xrd_tools.io.read import _scan_data_for_frames
 
 __all__ = [
     "whole_scan_aggregate_1d",
@@ -107,9 +109,9 @@ def _stack_uniform(rows, labels):
     return keep_labels, np.stack(keep_rows, axis=0)
 
 
-def _tail_1d(scan):
+def _tail_stack_1d(tail_items):
     labels, rows = [], []
-    for label, fr in _unflushed_tail(scan):
+    for label, fr in tail_items:
         result = getattr(fr, "int_1d", None)
         intensity = getattr(result, "intensity", None)
         if intensity is None:
@@ -119,9 +121,9 @@ def _tail_1d(scan):
     return _stack_uniform(rows, labels)
 
 
-def _tail_2d(scan):
+def _tail_stack_2d(tail_items):
     labels, rows = [], []
-    for label, fr in _unflushed_tail(scan):
+    for label, fr in tail_items:
         result = getattr(fr, "int_2d", None)
         intensity = getattr(result, "intensity", None)
         if intensity is None:
@@ -134,6 +136,44 @@ def _tail_2d(scan):
     return _stack_uniform(rows, labels)
 
 
+def _build_norm_map(data_file, norm_channel, tail_items):
+    """Build the per-frame ``{label: divisor}`` normalization map (review §2.B).
+
+    Mirrors ``display_data.normalize`` exactly: divide a frame by
+    ``scan_data[norm_channel]`` only when that value is ``> 0``; a missing or
+    non-positive value leaves the frame un-normalized (divisor 1.0, i.e. omitted
+    from the map).  The on-disk values are read aligned-by-label from the file's
+    own ``scan_data`` (alignment correct by construction); the unflushed tail
+    reads each frame's ``scan_info``.  Returns ``None`` when no channel is set."""
+    if not norm_channel:
+        return None
+    out: dict[int, float] = {}
+    try:
+        disk_labels = [int(x) for x in get_frames(data_file, union=True)]
+    except (KeyError, OSError):
+        disk_labels = []
+    if disk_labels:
+        col = _scan_data_for_frames(data_file, disk_labels).get(str(norm_channel))
+        if col is not None:
+            for lbl, value in zip(disk_labels, np.asarray(col).ravel()):
+                try:
+                    v = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if v > 0:
+                    out[int(lbl)] = v
+    for label, fr in tail_items:
+        info = getattr(fr, "scan_info", None) or {}
+        if norm_channel in info:
+            try:
+                v = float(info[norm_channel])
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                out[int(label)] = v
+    return out or None
+
+
 def _file_lock(scan):
     lock = getattr(scan, "file_lock", None)
     if lock is None:
@@ -142,37 +182,46 @@ def _file_lock(scan):
 
 
 def whole_scan_aggregate_1d(scan, *, method="average", norm: Mapping | None = None,
-                            chunk_size: int = _agg._DEFAULT_CHUNK):
+                            norm_channel=None, chunk_size: int = _agg._DEFAULT_CHUNK):
     """Whole-scan 1D aggregate (primary on-disk stack ⊕ unflushed tail), or
     ``None`` when nothing is on disk yet (defer to the resident-store path).
 
     Reads under the scan's ``file_lock`` so a concurrent live write does not tear
-    the read.  ``method`` is ``"sum"``/``"average"``; ``norm`` normalizes each
-    frame before reducing (see module docstring).  Caller must have confirmed the
-    displayed mode is primary (:func:`mode_aggregation_allowed`)."""
+    the read.  ``method`` is ``"sum"``/``"average"``.  Normalization (review
+    §2.B): pass ``norm_channel`` to divide each frame by its ``scan_data`` value
+    before reducing (the map is built alignment-safe from the file + tail), or an
+    explicit ``norm={label: divisor}`` map (wins over ``norm_channel``).  Caller
+    must have confirmed the displayed mode is primary
+    (:func:`mode_aggregation_allowed`)."""
     data_file = getattr(scan, "data_file", None)
     if not data_file or not os.path.exists(data_file):
         return None
-    tail = _tail_1d(scan)
+    tail_items = _unflushed_tail(scan)
+    tail = _tail_stack_1d(tail_items)
     with _file_lock(scan):
         try:
+            norm_map = norm if norm is not None else _build_norm_map(
+                data_file, norm_channel, tail_items)
             return _agg.aggregate_1d(data_file, method=method, extra=tail,
-                                     norm=norm, chunk_size=chunk_size)
+                                     norm=norm_map, chunk_size=chunk_size)
         except KeyError:
             return None                  # no integrated_1d on disk yet -> defer
 
 
 def whole_scan_aggregate_2d(scan, *, method="average", norm: Mapping | None = None,
-                            chunk_size: int = _agg._DEFAULT_CHUNK):
+                            norm_channel=None, chunk_size: int = _agg._DEFAULT_CHUNK):
     """Whole-scan 2D (cake) aggregate in the ``(n_chi, n_q)`` disk convention, or
     ``None`` when nothing is on disk yet.  See :func:`whole_scan_aggregate_1d`."""
     data_file = getattr(scan, "data_file", None)
     if not data_file or not os.path.exists(data_file):
         return None
-    tail = _tail_2d(scan)
+    tail_items = _unflushed_tail(scan)
+    tail = _tail_stack_2d(tail_items)
     with _file_lock(scan):
         try:
+            norm_map = norm if norm is not None else _build_norm_map(
+                data_file, norm_channel, tail_items)
             return _agg.aggregate_2d(data_file, method=method, extra=tail,
-                                     norm=norm, chunk_size=chunk_size)
+                                     norm=norm_map, chunk_size=chunk_size)
         except KeyError:
             return None                  # no integrated_2d on disk yet -> defer
