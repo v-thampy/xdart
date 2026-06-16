@@ -1923,19 +1923,11 @@ class imageThread(wranglerThread):
         _t_2d = 0.0
 
         # ── GUI data (skip in batch mode — no one is looking) ────────────
+        # Wave 5: live scan display is published through _published_frames and
+        # consumed by static_scan_widget.update_data into PublicationStore.  Do
+        # not mirror scan-mode rows into data_1d/data_2d here; those dicts are
+        # now viewer-mode / transition-only state.
         _t_h5_total = _t_h5_wait = _t_h5_write = 0.0
-        if not self.batch_mode:
-            self.data_1d[int(img_number)] = frame.copy_for_display(
-                include_2d=False,
-            )
-            self.data_2d[int(img_number)] = {
-                'map_raw': frame.map_raw,
-                'bg_raw': frame.bg_raw,
-                'mask': frame.mask,
-                'int_2d': frame.int_2d,
-                'gi_2d': frame.gi_2d,
-                'thumbnail': None,
-            }
 
         # ── In-memory accumulation (no disk I/O — batch flush handles that) ──
         if not self.xye_only:
@@ -1968,17 +1960,11 @@ class imageThread(wranglerThread):
             _t_h5_wait = 0.0
             _t_h5_write = _t_h5_total
 
-            # NOTE: no PERF-3 raw-free here.  This is the live/non-batch path,
-            # where the display copy above (data_2d[idx]['map_raw']) keeps its
-            # own ref to the raw for the whole scan — so freeing frame.map_raw
-            # would NOT release memory (data_2d still pins it), it would only
-            # cost an eager per-frame make_thumbnail (~7-15 ms each on the hot
-            # loop) to keep the interval-flush thumbnail writer from reloading.
-            # Net: pure regression on the lean 1D stream for zero RAM win.  The
-            # raw-free lives only in the batch path (QtNexusSink.worker_process),
-            # where data_2d is not populated so the free actually frees and the
-            # thumbnail is already precomputed across workers.  Live-mode RAM is
-            # bounded by the display-cache lifecycle, not by PERF-3.
+            # NOTE: no PERF-3 raw-free here.  This live/non-batch path hands the
+            # frame to the GUI publication store; freeing map_raw before that
+            # hand-off would force thumbnail/raw rehydration on the hot path.
+            # Batch still frees raw in QtNexusSink.worker_process after its
+            # publication payload has been prepared.
 
         # ── XYE buffer (flushed at end of batch by the dispatcher) ──────
         _t5 = time.time()

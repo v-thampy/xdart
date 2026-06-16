@@ -739,38 +739,15 @@ class staticWidget(QWidget):
                         self.scan.bai_2d_args.get("gi_mode_2d", "qip_qoop")
                         if _is_gi else None),
                 )
-                with self.h5viewer.data_lock:
-                    # 1D copy (no map_raw / 2D payload) — small object
-                    self.h5viewer.data_1d[int(idx)] = frame.copy_for_display(
-                        include_2d=False,
+                skip_2d = getattr(self.scan, "skip_2d", False)
+                has_2d_errors = publication_has_2d_errors(publication)
+                if not skip_2d and has_2d_errors:
+                    logger.warning(
+                        "Skipping frame %s 2D publication: %s",
+                        idx,
+                        publication_error_details(publication, "2d"),
                     )
-                    # 2D payload as a dict matching what file_thread.load_frames
-                    # produces (see scan_threads.load_frames).  Keys are what
-                    # displayframe.get_frames_map_raw / get_frames_int_2d
-                    # look for.
-                    skip_2d = getattr(self.scan, "skip_2d", False)
-                    has_2d_errors = publication_has_2d_errors(publication)
-                    if not skip_2d and not has_2d_errors:
-                        self.h5viewer.data_2d[int(idx)] = {
-                            "map_raw": getattr(frame, "map_raw", None),
-                            "bg_raw": getattr(frame, "bg_raw", 0),
-                            "mask": getattr(frame, "mask", None),
-                            "int_2d": getattr(frame, "int_2d", None),
-                            "gi_2d": getattr(frame, "gi_2d", {}),
-                            "thumbnail": getattr(frame, "thumbnail", None),
-                        }
-                    elif not skip_2d and has_2d_errors:
-                        self.h5viewer.data_2d.pop(int(idx), None)
-                        logger.warning(
-                            "Skipping frame %s 2D display cache: %s",
-                            idx,
-                            publication_error_details(publication, "2d"),
-                        )
-                    # ── Bounded cache eviction ────────────────────────
-                    # ``data_1d``/``data_2d`` are recent-row mirrors only; the
-                    # publication store is the authoritative scan-display
-                    # source and handles full-scan aggregate fallbacks.
-                    self.publication_store.upsert(publication)
+                self.publication_store.upsert(publication)
             except Exception:
                 # Cache miss is non-fatal — displayframe will lazy-load
                 # from disk via file_thread.load_frame as fallback.
@@ -1379,12 +1356,10 @@ class staticWidget(QWidget):
 
         # Clear frame index lists (fast; rebuilt by h5viewer.update_data)
         # but DO NOT clear ``data_1d`` / ``data_2d``.  Pre-fix this
-        # blanked the display the instant a new scan started and the
-        # FixSizeOrderedDict eviction would have handled the memory
-        # bound anyway as new frames came in.  Leaving the data dicts
-        # alone lets the previous scan's last-rendered frame linger
-        # visibly until the new scan's first frame replaces it on
-        # the next ``_flush_pending_update`` tick.
+        # blanked the display the instant a new scan started.  Leaving these
+        # transition/viewer dicts alone lets the previous scan's last-rendered
+        # frame linger visibly until the new scan's first publication replaces
+        # it on the next ``_flush_pending_update`` tick.
         self.frames.clear()
         self.frame_ids.clear()
         self.publication_store.clear()
@@ -1393,10 +1368,10 @@ class staticWidget(QWidget):
         # no longer reloads frames from disk (it would clobber the live
         # in-memory index — see fileHandlerThread.set_datafile).  So reset
         # the new scan's frame index synchronously here: drop the previous
-        # scan's indices + cached frames so per-frame sigUpdate appends
-        # build this scan up from empty.  The data_1d / data_2d snapshots
-        # are intentionally left populated so the prior frame lingers on
-        # screen until this scan's first frame replaces it.
+        # scan's indices + cached frames so per-frame sigUpdate appends build
+        # this scan up from empty.  Transition/viewer snapshots are
+        # intentionally left populated so the prior frame lingers on screen
+        # until this scan's first publication replaces it.
         if self.h5viewer.live_run_active:
             try:
                 import pandas as pd

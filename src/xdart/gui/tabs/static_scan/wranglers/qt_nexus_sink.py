@@ -140,9 +140,9 @@ class QtNexusSink:
         — they only stash the fully-hydrated ``LiveFrame`` into the host's
         ``_published_frames`` map and emit a lightweight queued ``sigUpdate``.
         The GUI thread's ``static_scan_widget.update_data`` consumer (coalesced
-        by the ~200 ms timer) then does ALL the display work: ``copy_for_display``,
-        the ``data_1d`` / ``data_2d`` mirrors, ``publication_store.upsert`` (the
-        cake's ONLY render source), and ``scan_data`` accumulation — going through
+        by the ~200 ms timer) then does ALL the display work:
+        ``publication_store.upsert`` (the cake's ONLY render source) and
+        ``scan_data`` accumulation — going through
         the same auto-follow-vs-manual-selection arbitration as serial.
 
         This is the single-source-of-truth live-display contract every other live
@@ -194,9 +194,8 @@ class QtNexusSink:
                 logger.warning("QtNexusSink thumbnail failed for %s: %s",
                                getattr(live, "idx", "?"), e)
         # PERF-3: free the raw in BATCH mode only.  In live (non-batch) mode the
-        # display needs map_raw (the 2D raw panel + the bounded data_2d window
-        # read it), so keep it — live RAM is already bounded by data_2d (max 20)
-        # + _in_memory (cap 64).
+        # display reads map_raw through the publication's raw_ref, so keep it.
+        # PublicationStore bounds old raw_refs via tiered eviction.
         if getattr(self._host, "batch_mode", True):
             live.free_raw()
 

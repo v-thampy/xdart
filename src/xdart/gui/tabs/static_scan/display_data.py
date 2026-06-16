@@ -260,10 +260,14 @@ class DisplayDataMixin:
         """
         snapshot = {}
         missing = []
+        publication_lookup = getattr(
+            self, "_publication_from_store_for_display", None)
         for idx in idxs:
             key = int(idx)
-            publication = self._publication_from_store_for_display(
-                key, allow_blocking_read=allow_blocking_read)
+            publication = None
+            if publication_lookup is not None:
+                publication = publication_lookup(
+                    key, allow_blocking_read=allow_blocking_read)
             if publication is None:
                 missing.append(key)
                 continue

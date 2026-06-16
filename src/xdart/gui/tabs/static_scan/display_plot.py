@@ -228,7 +228,15 @@ class DisplayPlotMixin:
                 slice_suffix = f' [{center:.1f}\u00b1{width:.1f}]'
         except Exception:
             slice_suffix = ''
-        snapshot = self._snapshot_data(idxs) if hasattr(self, "_snapshot_data") else {}
+        if hasattr(self, "_snapshot_data"):
+            snapshot = self._snapshot_data(idxs)
+        else:
+            data_1d = getattr(self, "data_1d", {}) or {}
+            data_2d = getattr(self, "data_2d", {}) or {}
+            snapshot = {
+                int(idx): (data_1d.get(int(idx)), data_2d.get(int(idx), {}))
+                for idx in idxs
+            }
         for idx in idxs:
             idx = int(idx)
             frame_1d, frame_2d = snapshot.get(idx, (None, None))

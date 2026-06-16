@@ -738,10 +738,11 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
     assert calls
     assert calls[0][0].integration_1d.monitor_key == "i0"
     assert calls[0][2]["scan_name"] == "scan"
-    assert data_1d[0].int_1d is not None
+    assert frame.int_1d is not None
+    assert data_1d == {}
     pub = store.get(0)
     assert pub is not None
-    np.testing.assert_allclose(pub.view.intensity_1d, data_1d[0].int_1d.intensity)
+    np.testing.assert_allclose(pub.view.intensity_1d, frame.int_1d.intensity)
 
 
 def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
@@ -782,12 +783,14 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
     assert calls
     assert calls[0].integration_1d is not None
     assert calls[0].integration_2d is not None
-    assert data_1d[0].int_1d is not None
-    assert data_2d[0]["int_2d"] is not None
+    assert frame.int_1d is not None
+    assert frame.int_2d is not None
+    assert data_1d == {}
+    assert data_2d == {}
     pub = store.get(0)
     assert pub is not None
-    np.testing.assert_allclose(pub.view.intensity_1d, data_1d[0].int_1d.intensity)
-    np.testing.assert_allclose(pub.view.intensity_2d, data_2d[0]["int_2d"].intensity.T)
+    np.testing.assert_allclose(pub.view.intensity_1d, frame.int_1d.intensity)
+    np.testing.assert_allclose(pub.view.intensity_2d, frame.int_2d.intensity.T)
 
 
 def test_reintegrate_all_refreshes_publication_store(monkeypatch) -> None:

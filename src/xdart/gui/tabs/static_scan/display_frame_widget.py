@@ -689,7 +689,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         stamped with an older generation is stale and may be dropped (full
         enforcement: Stage 5)."""
         self.display_generation += 1
-        self._agg_pending.clear()
+        pending = getattr(self, "_agg_pending", None)
+        if pending is not None:
+            pending.clear()
         return self.display_generation
 
     # ── D2: off-GUI-thread frame hydration (greenfield Phase 3) ──────────────

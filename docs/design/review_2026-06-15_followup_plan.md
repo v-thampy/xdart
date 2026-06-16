@@ -38,6 +38,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | I4 partial — reduce 2D render copies | this checkpoint | ✅ 2D cake aggregation accumulates in-place and `get_int_2d(normalize=False)` returns a source view for slice/projection readers instead of copying the full cake |
 | N2 batch submit-per-read | this checkpoint | ✅ batch no longer waits for the old 64/256-frame pending buffer before feeding the persistent streaming session; submit cadence is per-frame while `QtNexusSink`/`FlushPolicy` keep persistence batched |
 | GI-AGG primary-mode aggregate + batch log quieting | this checkpoint | ✅ GI Overall Sum/Average may now use the complete primary on-disk stack when the displayed mode matches persisted `gi_config`; non-primary GI modes still defer/refuse rather than falling back to bounded mirrors; per-frame batch submit no longer emits an INFO dispatch line for every frame |
+| Wave 5 A4 prep — stop scan-mode mirror writers | this checkpoint | ✅ live hand-off, serial wrangler processing, and GUI reintegration now publish scan-display rows through `PublicationStore` only; Role-B viewer arrays remain untouched |
 
 **Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_gui_modes_end_to_end.py`,
@@ -77,6 +78,9 @@ The GI-AGG primary-mode fix passed `tests/xdart/test_aggregation_wiring.py`,
 `tests/xdart/test_nexus_writer_roundtrip.py::test_gi_config_roundtrips_to_reduction_config`
 (`93 passed` across the focused slices). The full live≡batch≡reload and byte-compat gates remain
 the live-checkpoint gate for the submit-cadence behavior change.
+The Wave 5 writer-stop prep passed the focused publication/display/live-refresh suite
+(`228 passed / 1 skipped`) plus reintegration, hydration, store-reader, and aggregate tests
+(`56 passed`).
 
 **Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is
 a safer pre-live-checkpoint boundary: publication-store-first display, bounded mirrors, and tests for the
@@ -109,7 +113,7 @@ renderer/data-source flip.
 | C6 RSM combine_grids streaming | `3216eb3` (bundled) | ✅ verified bit-exact |
 | Share Axis #2 + cake current-frame | `5c59077` | ✅ verified (P3: no test for the new multi-frame Single-Overlay cake path) |
 | N2 batch submit-per-read (rec. A) | this checkpoint | ✅ implemented in the image batch collect loop; live checkpoint still required to verify real batch silence/equivalence/perf |
-| **Wave 5 — A3/A4** (`data_1d`/`data_2d` retirement) | `26eb7d4` + `9fb96bb` partial | ◑ offscreen prep landed; final Role-A deletion remains live-gated |
+| **Wave 5 — A3/A4** (`data_1d`/`data_2d` retirement) | `26eb7d4` + `9fb96bb` partial + this checkpoint | ◑ offscreen prep landed; scan-mode writers now publish through `PublicationStore`; final Role-A dict deletion remains live-gated |
 | **GI-AGG** GI >512-frame live Overall truncation (P2) + Overall e2e test gap | this checkpoint | ✅ primary displayed GI mode now routes to disk⊕tail aggregate; non-primary GI modes still defer/refuse instead of truncating. A fuller mode-switch UX remains with A3/A4/instant-switch, but the silent primary-mode truncation path is closed; detail in §0.2 |
 
 **Residual P3 follow-ups (none blocking):** multi-frame Single-Overlay cake test (Share Axis commit);
@@ -571,7 +575,10 @@ refs), not the whole thing:
    remaining Role-A window is bounded by the store, never by `data_1d(max=0)`.
 
 ### A4 — delete (greenfield 8b)
-4. Stop the Role-A writers (the `copy_for_display` inserts). `copy_for_display` is also the **D2**
+4. Stop the Role-A writers (the `copy_for_display` inserts). **Status:** scan-mode live hand-off,
+   serial wrangler processing, and GUI reintegration now publish to `PublicationStore` without
+   refilling the old mirrors; Role-B viewer inserts are intentionally untouched. `copy_for_display`
+   is also the **D2**
    thumbnail-copy source — if it has no Role-B consumer left, deleting it closes **D2** (the ≤256² float32
    thumbnail per 1D entry). Confirm the raw preview/thumbnail now sources from the store/payload first.
 5. Delete the Role-A `data_1d`/`data_2d` dicts + `hydrated_raw.py`; keep Role-B (h5viewer viewer arrays +

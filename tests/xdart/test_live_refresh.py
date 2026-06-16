@@ -3993,20 +3993,22 @@ def test_hydrated_raw_lru_is_shared_with_thread_insert_paths():
     assert hydrated == [2, 3, 4]
 
 
-def test_reintegrate_publish_trims_shared_hydrated_lru():
-    """The integratorThread display publish trims the shared LRU."""
+def test_reintegrate_publish_updates_publication_store_not_legacy_raw_mirror():
+    """Reintegration publishes through the store, not the old data_2d mirror."""
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
 
     data_2d = _AttrDict({
         idx: {"map_raw": np.full((2, 2), idx)} for idx in range(8)
     })
     data_2d._hydrated_raw_order = list(range(8))
+    upserts = []
+    updates = []
     host = SimpleNamespace(
         data_lock=RLock(),
         data_1d={},
         data_2d=data_2d,
-        _upsert_publication_for_frame=lambda frame: None,
-        update=SimpleNamespace(emit=lambda idx: None),
+        _upsert_publication_for_frame=lambda frame: upserts.append(frame.idx),
+        update=SimpleNamespace(emit=lambda idx: updates.append(idx)),
     )
     frame = SimpleNamespace(
         idx=8, map_raw=np.full((2, 2), 8), bg_raw=None, mask=None,
@@ -4016,9 +4018,10 @@ def test_reintegrate_publish_trims_shared_hydrated_lru():
     integratorThread._publish_reintegrated_display(
         host, frame, include_2d=True,
     )
-    # default limit 8: inserting the 9th hydrated frame evicts the oldest
-    assert data_2d[0]["map_raw"] is None
-    assert data_2d[8]["map_raw"] is not None
+    assert upserts == [8]
+    assert updates == [8]
+    assert 8 not in data_2d
+    assert data_2d[0]["map_raw"] is not None
     assert len(_hydrated_order(data_2d)) == 8
 
 

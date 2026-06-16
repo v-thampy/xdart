@@ -76,9 +76,8 @@ class integratorThread(Qt.QtCore.QThread):
         self.data_1d = data_1d
         self.data_2d = data_2d
         # Shared PublicationStore (same instance as H5Viewer / displayframe).
-        # Reintegration must refresh it alongside data_1d/data_2d, else the
-        # cake panel (payload path is preferred) keeps showing
-        # pre-reintegration pixels.
+        # Reintegration refreshes this store directly; the old data_1d/data_2d
+        # dicts are no longer scan-display mirrors.
         self.publication_store = publication_store
         # Shared reentrant lock guarding data_1d / data_2d access.  Falls
         # back to a private lock when constructed without one.
@@ -248,27 +247,15 @@ class integratorThread(Qt.QtCore.QThread):
         include_2d: bool,
         refresh_1d: bool = True,
     ) -> None:
-        """Refresh legacy display caches and the publication store together."""
-        idx = int(frame.idx)
-        with self.data_lock:
-            if include_2d:
-                self.data_2d[idx] = {
-                    'map_raw': frame.map_raw,
-                    'bg_raw': frame.bg_raw,
-                    'mask': frame.mask,
-                    'int_2d': frame.int_2d,
-                    'gi_2d': frame.gi_2d,
-                }
-                if frame.map_raw is not None:
-                    # D5: thread-side inserts trim the SAME hydrated-raw
-                    # LRU the GUI uses (state rides on the shared data_2d).
-                    remember_hydrated_raw(self.data_2d, idx)
-            if refresh_1d:
-                self.data_1d[idx] = frame.copy_for_display(
-                    include_2d=False,
-                )
+        """Refresh the publication store for one reintegrated frame.
+
+        Wave 5: normal scan-display data no longer gets mirrored into
+        ``data_1d``/``data_2d`` here.  The legacy render helpers adapt from the
+        publication store, while the old dicts remain reserved for viewer-mode
+        rows and transition-only fallback.
+        """
         self._upsert_publication_for_frame(frame)
-        self.update.emit(idx)
+        self.update.emit(int(frame.idx))
 
     def _end_reintegrate_carryover(self) -> None:
         """Drop any publication carry-over not consumed by the reintegrate pass
@@ -336,8 +323,8 @@ class integratorThread(Qt.QtCore.QThread):
         # re-renders fresh as it is republished, and stale generation-checked
         # chunks are still rejected), but CARRIES OVER each frame's record so the
         # per-frame re-upsert below merges the recomputed GI mode into its
-        # accumulated modes instead of wiping them.  (The legacy data_1d/data_2d
-        # caches are still cleared above for the legacy 1D draw path.)
+        # accumulated modes instead of wiping them.  The legacy dicts are still
+        # cleared above so any transition fallback cannot show stale rows.
         if self.publication_store is not None:
             self.publication_store.begin_reintegrate()
         max_cores = getattr(self.scan, 'max_cores', 1)
