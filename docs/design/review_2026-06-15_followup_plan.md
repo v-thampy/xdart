@@ -44,6 +44,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | Wave 5 A4 prep — remove dead file-thread mirror loader | this checkpoint | ✅ `fileHandlerThread` no longer exposes the unqueued `load_frame`/`load_frames` tasks that could repopulate scan-mode mirrors behind the publication store; the long-lived file thread remains for `set_datafile` and `save_data_as` |
 | Wave 5/D2 hardening — non-blocking integration hydration | this checkpoint | ✅ normal display renders now queue missing 1D/2D integration hydration through the background worker when async hydration is enabled; explicit background-setting reads still opt into blocking full-coverage reads |
 | Phase B foundation — headless `FrameRecordStore` | this checkpoint | ✅ `xrd_tools.session` now exposes a Qt-free, bounded, persist-before-evict `FrameRecordStore`; `ScanSession` can optionally populate it from completed frame events and can opt into marking completed writes persisted for durable sinks. This is dormant for xdart until the live-gated store→session projection flip |
+| Phase B hardening — source-aware hydration | this checkpoint | ✅ thinned headless records now learn a real source identity when hydrated from disk and replace, rather than merge, if the hydrator returns a conflicting source |
 | GI-AGG e2e render gate | this checkpoint | ✅ real `displayFrameWidget.update()` now has an offscreen regression proving Overall Average over >64 frames uses the disk-backed aggregate when store-heavy rows are evicted and legacy mirrors are empty |
 
 **Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
@@ -93,7 +94,8 @@ passed the focused live-run, batch-finish, shutdown, placeholder-load, and `_abs
 (`17 passed`). The non-blocking integration hydration hardening passed the focused D2/raw/integration
 hydration policy slice (`9 passed`). The Phase B foundation passed the headless store/session/record slice
 (`46 passed`) before any xdart live-path wiring, plus architecture/release guards and xdart publication
-coverage (`130 passed` for the expanded focused gate). The GI-AGG real-render gap is closed by
+coverage (`130 passed` for the expanded focused gate). The source-aware hydration hardening passed the
+headless store/session/record slice (`48 passed`). The GI-AGG real-render gap is closed by
 `tests/xdart/test_aggregation_wiring.py::test_real_widget_overall_aggregate_uses_disk_when_store_evicted`.
 
 **Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is

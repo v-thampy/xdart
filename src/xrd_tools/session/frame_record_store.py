@@ -214,9 +214,16 @@ class FrameRecordStore:
         fresh = hydrator(label)
         if fresh is None:
             return record
+        current_source_identity = self.source_identity(label)
+        fresh_source_identity = _source_identity_from_record(fresh)
+        source_identity = (
+            current_source_identity
+            if current_source_identity and not fresh_source_identity
+            else None
+        )
         return self.upsert(
             fresh,
-            source_identity=self.source_identity(label),
+            source_identity=source_identity,
             persisted=self.is_persisted(label),
         )
 

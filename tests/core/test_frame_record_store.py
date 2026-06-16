@@ -108,6 +108,38 @@ def test_get_or_hydrate_restores_thinned_record():
     np.testing.assert_allclose(rec.view_1d("q_total").intensity_1d, [50.0, 100.0, 150.0])
 
 
+def test_get_or_hydrate_learns_source_identity_when_thinned_record_had_none():
+    store = FrameRecordStore(max_heavy_items=0, require_persisted_for_eviction=False)
+    store.upsert(_record(label=1, source=None, source_frame=None))
+    assert store.source_identity(1) == ""
+    assert not store.has_heavy_payload(1)
+
+    def hydrate(label):
+        return _record(label=label, source="/data/scan_0001.tif", source_frame=12)
+
+    store.set_hydrator(hydrate)
+    rec = store.get_or_hydrate(1)
+
+    assert rec is not None
+    assert store.source_identity(1) == "/data/scan_0001.tif#12"
+
+
+def test_get_or_hydrate_replaces_when_hydrator_returns_conflicting_source():
+    store = FrameRecordStore(max_heavy_items=0, require_persisted_for_eviction=False)
+    store.upsert(_record(label=1, mode="q_total", source="/data/a.tif"))
+    assert store.source_identity(1) == "/data/a.tif#0"
+
+    def hydrate(label):
+        return _record(label=label, mode="q_ip", source="/data/b.tif", scale=4.0)
+
+    store.set_hydrator(hydrate)
+    rec = store.get_or_hydrate(1)
+
+    assert rec is not None
+    assert rec.modes_1d == ("q_ip",)
+    assert store.source_identity(1) == "/data/b.tif#0"
+
+
 def test_snapshot_is_read_only_copy():
     store = FrameRecordStore(max_heavy_items=None)
     store.upsert(_record(label=1))
