@@ -448,7 +448,17 @@ class staticWidget(QWidget):
         # in integrator_thread_finished via _exit_run_state.
         self.integratorTree.integrator_thread.started.connect(self._enter_run_state)
         self.integratorTree.integrator_thread.update.connect(self.integrator_thread_update)
+        self.integratorTree.integrator_thread.writeError.connect(
+            self._show_reintegration_write_error)
         self.integratorTree.integrator_thread.finished.connect(self.integrator_thread_finished)
+
+    def _show_reintegration_write_error(self, message: str) -> None:
+        """Surface reintegration save failures in the same status area as runs."""
+        try:
+            self.wrangler.showLabel.emit(message)
+        except Exception:
+            logger.debug("could not surface reintegration write failure",
+                         exc_info=True)
 
     def _init_wranglers(self):
         """Initialize the wrangler stack and select the default wrangler."""

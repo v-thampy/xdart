@@ -840,6 +840,39 @@ def test_reintegrate_all_refreshes_publication_store(monkeypatch) -> None:
     assert pub2.view.intensity_2d.shape == (3, 5)
 
 
+def test_reintegrate_close_surfaces_write_failure() -> None:
+    from types import SimpleNamespace
+
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+    from xdart.modules.ewald import LiveScan
+
+    def boom_finish():
+        raise RuntimeError("disk full")
+
+    thread = integratorThread(
+        LiveScan("scan"),
+        None,
+        None,
+        None,
+        [],
+        {},
+        {},
+    )
+    messages: list[str] = []
+    thread.writeError.connect(messages.append)
+    thread._reduction_session = SimpleNamespace(finish=boom_finish)
+    thread._reduction_session_key = "scan"
+
+    thread._close_reduction_session()
+
+    assert isinstance(thread._reduction_write_error, RuntimeError)
+    assert messages
+    assert "Reintegration save FAILED" in messages[0]
+    assert "disk full" in messages[0]
+    assert thread._reduction_session is None
+    assert thread._reduction_session_key is None
+
+
 # ---------------------------------------------------------------------------
 # Mask-incompatibility handling: a mask that doesn't fit the image is ignored
 # (returns None) with a warning, not a hard error that aborts the scan.

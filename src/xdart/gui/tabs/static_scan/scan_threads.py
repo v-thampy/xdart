@@ -62,6 +62,7 @@ class integratorThread(Qt.QtCore.QThread):
         update: empty, tells parent when new data is ready.
     """
     update = Qt.QtCore.Signal(int)
+    writeError = Qt.QtCore.Signal(str)
 
     def __init__(self, scan, frame, file_lock,
                  frames, frame_ids, data_1d, data_2d,
@@ -129,8 +130,14 @@ class integratorThread(Qt.QtCore.QThread):
                 # reintegration write failure — log it at ERROR and record it so
                 # the run can't pass as a clean success.
                 self._reduction_write_error = exc
+                msg = f"Reintegration save FAILED — output .nxs may be incomplete: {exc}"
                 logger.error("reintegration session WRITE FAILED on close: %s",
                              exc, exc_info=True)
+                try:
+                    self.writeError.emit(msg)
+                except Exception:
+                    logger.debug("reintegration writeError emit failed",
+                                 exc_info=True)
 
     def _session_key(self, n_workers: int, plan):
         key = max(1, int(n_workers or 1))
