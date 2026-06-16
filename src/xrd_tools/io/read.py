@@ -477,50 +477,123 @@ def get_raw_frame(
     the other ``get_*`` readers.  Raises ``KeyError`` when neither a usable
     source pointer nor a thumbnail is present.
     """
-    from xrd_tools.io.image import read_image
-
     scan_file = Path(scan_file)
+    with h5py.File(scan_file, "r") as f:
+        master, src_frame_idx, thumb = _raw_frame_parts_from_entry(
+            scan_file,
+            _entry(f, entry),
+            int(frame),
+            source_root=source_root,
+        )
+    return _raw_frame_or_thumbnail(
+        scan_file,
+        int(frame),
+        master,
+        src_frame_idx,
+        thumb,
+        allow_thumbnail=allow_thumbnail,
+    )
+
+
+def _raw_frame_from_entry(
+    scan_file: Path,
+    entry_group: h5py.Group,
+    frame: int,
+    *,
+    allow_thumbnail: bool = True,
+    source_root: str | Path | None = None,
+) -> np.ndarray:
+    """Internal open-file version of :func:`get_raw_frame`.
+
+    ``ProcessedScan.iter_chunks`` uses this to avoid reopening the processed
+    NeXus file for every frame while preserving the public reader behavior.
+    """
+    master, src_frame_idx, thumb = _raw_frame_parts_from_entry(
+        scan_file,
+        entry_group,
+        frame,
+        source_root=source_root,
+    )
+    return _raw_frame_or_thumbnail(
+        scan_file,
+        frame,
+        master,
+        src_frame_idx,
+        thumb,
+        allow_thumbnail=allow_thumbnail,
+    )
+
+
+def _raw_frame_parts_from_entry(
+    scan_file: Path,
+    entry_group: h5py.Group,
+    frame: int,
+    *,
+    source_root: str | Path | None = None,
+) -> tuple[Path | None, int, np.ndarray | None]:
+    """Resolve one processed frame's raw source pointer and thumbnail."""
+
+    source_base = (
+        _decode(entry_group.attrs["source_base"])
+        if "source_base" in entry_group.attrs
+        else None
+    )
+    fg = entry_group.get(f"frames/frame_{int(frame):04d}")
+    if fg is None:
+        raise KeyError(f"No frame group for frame {frame} in {scan_file}")
+
     master: Path | None = None
     src_frame_idx = 0
-    thumb: np.ndarray | None = None
+    src = fg.get("source")
+    if src is not None and "path" in src:
+        rel = _decode(src["path"][()])
+        if "frame_index" in src:
+            src_frame_idx = int(np.asarray(src["frame_index"][()]).ravel()[0])
+        master = resolve_source_master(
+            rel,
+            scan_file=scan_file,
+            source_base=source_base,
+            source_root=source_root,
+        )
 
-    with h5py.File(scan_file, "r") as f:
-        e = _entry(f, entry)
-        # N1: the project root the relative source paths were written against
-        # (None for old absolute-path files; harmless there).
-        source_base = _decode(e.attrs["source_base"]) if "source_base" in e.attrs else None
-        fg = e.get(f"frames/frame_{int(frame):04d}")
-        if fg is None:
-            raise KeyError(f"No frame group for frame {frame} in {scan_file}")
-        src = fg.get("source")
-        if src is not None and "path" in src:
-            rel = _decode(src["path"][()])
-            if "frame_index" in src:
-                src_frame_idx = int(np.asarray(src["frame_index"][()]).ravel()[0])
-            master = resolve_source_master(
-                rel, scan_file=scan_file,
-                source_base=source_base, source_root=source_root,
-            )
-        thumb_ds = fg.get("thumbnail")
-        if thumb_ds is not None:
-            thumb = _dequantize_thumbnail(thumb_ds)
+    thumb: np.ndarray | None = None
+    thumb_ds = fg.get("thumbnail")
+    if thumb_ds is not None:
+        thumb = _dequantize_thumbnail(thumb_ds)
+
+    return master, src_frame_idx, thumb
+
+
+def _raw_frame_or_thumbnail(
+    scan_file: Path,
+    frame: int,
+    master: Path | None,
+    src_frame_idx: int,
+    thumb: np.ndarray | None,
+    *,
+    allow_thumbnail: bool = True,
+) -> np.ndarray:
+    from xrd_tools.io.image import read_image
 
     if master is not None:
         try:
             return np.asarray(read_image(master, frame=src_frame_idx), dtype=float)
         except Exception:
-            logger.debug("get_raw_frame: failed reading master %s frame %d; "
-                         "%s thumbnail", master, src_frame_idx,
-                         "falling back to" if allow_thumbnail else "not falling back to",
-                         exc_info=True)
+            logger.debug(
+                "get_raw_frame: failed reading master %s frame %d; %s thumbnail",
+                master,
+                src_frame_idx,
+                "falling back to" if allow_thumbnail else "not falling back to",
+                exc_info=True,
+            )
     if allow_thumbnail and thumb is not None:
         return thumb
     raise KeyError(
         f"frame {frame}: source master file not found/readable"
         + (
             f" and no thumbnail stored in {scan_file}"
-            if allow_thumbnail else
-            "; thumbnail fallback disabled for strict raw loading"
+            if allow_thumbnail
+            else "; thumbnail fallback disabled for strict raw loading"
         )
     )
 
@@ -654,10 +727,13 @@ class ProcessedScan:
         self.source_root = source_root
         self._metadata_cache: dict | None = None
         self._scan_data_cache: dict[str, np.ndarray] | None = None
+        self._frames_cache: np.ndarray | None = None
 
     @property
     def frames(self) -> np.ndarray:
-        return get_frames(self.path, entry=self.entry, union=True)
+        if self._frames_cache is None:
+            self._frames_cache = get_frames(self.path, entry=self.entry, union=True)
+        return np.array(self._frames_cache, copy=True)
 
     @property
     def frame_indices(self) -> list[int]:
@@ -711,6 +787,7 @@ class ProcessedScan:
         """Discard the lightweight cache and read the latest file metadata."""
         self._metadata_cache = None
         self._scan_data_cache = None
+        self._frames_cache = None
         return self.metadata
 
     def get_1d(self, frame=None) -> Integrated1D:
@@ -736,9 +813,20 @@ class ProcessedScan:
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0; got {chunk_size}")
         indices = self.frame_indices
-        for start in range(0, len(indices), chunk_size):
-            chunk_indices = indices[start:start + chunk_size]
-            yield np.stack([self.load_frame(idx) for idx in chunk_indices]), chunk_indices
+        with h5py.File(self.path, "r") as f:
+            entry_group = _entry(f, self.entry)
+            for start in range(0, len(indices), chunk_size):
+                chunk_indices = indices[start:start + chunk_size]
+                yield np.stack([
+                    _raw_frame_from_entry(
+                        self.path,
+                        entry_group,
+                        idx,
+                        allow_thumbnail=False,
+                        source_root=self.source_root,
+                    )
+                    for idx in chunk_indices
+                ]), chunk_indices
 
     def __len__(self) -> int:
         try:

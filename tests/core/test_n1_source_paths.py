@@ -267,6 +267,51 @@ def test_open_scan_source_root_load_frame(tmp_path):
     np.testing.assert_allclose(scan.load_frame(0), raw[0])
 
 
+def test_open_scan_iter_chunks_reuses_processed_file_handle(tmp_path, monkeypatch):
+    from xrd_tools.io import open_scan
+    import xrd_tools.io.read as read_mod
+
+    root = tmp_path / "project"
+    master = root / "raw" / "m.h5"
+    master.parent.mkdir(parents=True)
+    raw = np.arange(3 * 4 * 4, dtype=float).reshape(3, 4, 4)
+    _write_master(master, raw)
+    nxs = tmp_path / "processed" / "scan.nxs"
+    nxs.parent.mkdir(parents=True)
+
+    with h5py.File(nxs, "w") as f:
+        e = f.create_group("entry")
+        e.attrs["source_base"] = str(root)
+        g = e.create_group("integrated_1d")
+        g.create_dataset("intensity", data=np.zeros((3, 5)))
+        g.create_dataset("frame_index", data=np.array([0, 1, 2], dtype=np.int64))
+        frames = e.create_group("frames")
+        for idx in range(3):
+            fg = frames.create_group(f"frame_{idx:04d}")
+            src = fg.create_group("source")
+            src.create_dataset("path", data=np.bytes_("raw/m.h5"))
+            src.create_dataset("frame_index", data=idx)
+
+    scan = open_scan(nxs)
+    assert scan.frame_indices == [0, 1, 2]  # warm the small frame-index cache
+    opens = []
+    real_file = read_mod.h5py.File
+
+    def counted_file(path, *args, **kwargs):
+        if Path(path) == nxs:
+            opens.append(Path(path))
+        return real_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(read_mod.h5py, "File", counted_file)
+
+    chunks = list(scan.iter_chunks(2))
+
+    assert len(opens) == 1
+    assert [labels for _images, labels in chunks] == [[0, 1], [2]]
+    np.testing.assert_allclose(chunks[0][0], raw[:2])
+    np.testing.assert_allclose(chunks[1][0], raw[2:])
+
+
 def test_processed_nexus_source_load_frame_strict_raises_without_master(tmp_path):
     """P1 #3 (codex): a headless FrameSource consumer must NEVER silently get a
     downsampled/mask-baked thumbnail in place of the full-res raw.  When the
