@@ -12,6 +12,9 @@ primary-mode-scoped refusal predicate.
 
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pytest
 
@@ -88,6 +91,64 @@ def test_whole_scan_2d_covers_all_and_uses_disk_orientation(tmp_path):
     assert avg is not None and avg.n_frames == N
     assert avg.intensity.shape == (NCHI, NQ)          # disk/get_2d (n_chi, n_q)
     np.testing.assert_allclose(avg.intensity, np.mean(np.arange(1, N + 1)))
+
+
+@pytest.mark.parametrize("dim, func, with_2d", [
+    ("1d", whole_scan_aggregate_1d, False),
+    ("2d", whole_scan_aggregate_2d, True),
+])
+def test_whole_scan_aggregate_waits_for_shared_file_lock(
+    tmp_path, dim, func, with_2d,
+):
+    scan = _split_scan(tmp_path, with_2d=with_2d)
+    result = {}
+    error = {}
+
+    scan.file_lock.acquire()
+    try:
+        def _read():
+            try:
+                result["value"] = func(scan, method="average")
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                error["exc"] = exc
+
+        thread = threading.Thread(target=_read, name=f"aggregate-{dim}")
+        thread.start()
+        time.sleep(0.1)
+        assert thread.is_alive()
+        assert result == {}
+        assert error == {}
+    finally:
+        scan.file_lock.release()
+
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    assert error == {}
+    assert result["value"] is not None
+    assert result["value"].n_frames == N
+
+
+def test_whole_scan_aggregate_dedups_tail_flushed_after_snapshot(
+    tmp_path, monkeypatch,
+):
+    # Simulates the interleave where _unflushed_tail snapshots label 50, then
+    # the writer flushes it before aggregate_1d reads the file.  The wrapper
+    # must rely on xrd_tools.io.aggregate's label dedupe and count that label
+    # once, not disk+tail.
+    from xdart.modules import scan_aggregate as scan_aggregate_mod
+
+    scan = _split_scan(tmp_path, with_2d=False)
+    overlap = _frame(50, with_2d=False)
+    overlap.int_1d.intensity = np.full(NQ, 7.0, np.float32)
+    monkeypatch.setattr(
+        scan_aggregate_mod, "_unflushed_tail", lambda _scan: [(50, overlap)],
+    )
+
+    summed = scan_aggregate_mod.whole_scan_aggregate_1d(scan, method="sum")
+
+    assert summed.n_frames == 90
+    disk_prefix_sum = float(np.sum(np.arange(1, 91)))
+    np.testing.assert_allclose(summed.intensity, disk_prefix_sum - 51.0 + 7.0)
 
 
 def test_whole_scan_1d_normalizes_before_reducing(tmp_path):
