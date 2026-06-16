@@ -948,6 +948,44 @@ def test_int_plot_native_update_plot_state(widget, method, frame_ids):
     assert state["curves"] == (1 if method in ("Sum", "Average") else len(expected_ids))
 
 
+@pytest.mark.parametrize("method, expected", [("Average", 2.0), ("Sum", 6.0)])
+def test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames(widget, method, expected):
+    # P1 end-to-end (codex/other-claude review): past max_heavy_items the bounded
+    # store evicts old frames while the UNBOUNDED data_1d keeps them, so render_ids
+    # (the store|data_1d OR-merge) still lists them.  A whole-scan Sum/Average must
+    # aggregate ALL frames via the legacy fallback, not just the store-resident
+    # subset.  Frames carry int_1d intensity 1,2,3 -> Average==2.0 / Sum==6.0; the
+    # bug returned the last resident frame (3.0).  Models the two-cache production
+    # state the shipped unit test missed.
+    from xdart.modules.frame_publication import _semilight_publication
+    w = widget
+    df = _set_int_scan(w, n=3)
+    # Evict frames 0,1 from the STORE (drop their 1D arrays) but leave data_1d
+    # intact -- exactly the state production reaches once the heavy bound is hit.
+    store = df.publication_store
+    with store._lock:
+        for i in (0, 1):
+            store._items[i] = _semilight_publication(store._items[i])
+    assert not store.get(0).view.has_1d and not store.get(1).view.has_1d
+    assert df.data_1d[0].int_1d is not None       # data_1d still holds every frame
+
+    df.ui.plotMethod.setCurrentText(method)
+    df.ui.plotUnit.setCurrentIndex(0)             # native Q
+    w.frame_ids[:] = ["0", "1", "2"]
+    df.frame_ids = ["0", "1", "2"]
+    df.idxs_1d = [0, 1, 2]
+    df.idxs_2d = [0, 1, 2]
+
+    df.update()
+
+    # One collapsed curve (not a waterfall), equal to the aggregate over ALL three
+    # frames -- proving the payload fell back to the legacy update_plot, which read
+    # the full selection from data_1d.
+    assert len(df.curves) == 1
+    _cx, cy = df.curves[0].getData()
+    np.testing.assert_allclose(np.asarray(cy, dtype=float), np.full(5, expected))
+
+
 @pytest.mark.parametrize("method", ["Overlay", "Waterfall"])
 def test_int_plot_accumulating_modes_characterize_update_plot_state(widget, method):
     # Overlay/Waterfall are intentionally update_plot-live today because they

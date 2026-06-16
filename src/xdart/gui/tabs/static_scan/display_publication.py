@@ -436,17 +436,20 @@ class PublicationDisplayAdapter:
             source == "1d_2d" and _slice_enabled(widget)
         )
 
-        # Eviction parity (Step 5): render_ids = (selected | overall-all) ∩ loaded,
-        # so render_ids ⊊ selected_ids means some intended frame's arrays are not
-        # resident in the bounded store (evicted by max_heavy_items, or not yet
-        # loaded).  Defer the WHOLE draw to the legacy update_plot, which hydrates
-        # every selected frame from disk (display_data.get_frames_int_1d) —
-        # otherwise a whole-scan Sum/Average/Overall would SILENTLY drop the
-        # evicted frames.  selected_ids holds the full intended set for both the
-        # overall (= all_frame_index) and explicit-selection cases
-        # (resolve_selection); eviction is all-or-nothing per publication, so a
-        # resident (loaded) frame always carries both its 1D and 2D arrays.
-        if set(state.render_ids) != {int(i) for i in state.selected_ids}:
+        # Eviction parity (Step 5, codex/other-claude P1): defer the WHOLE draw to
+        # the legacy update_plot (which hydrates every selected frame from disk via
+        # get_frames_int_1d) when ANY intended frame is not resident in the
+        # publication STORE — otherwise a whole-scan Sum/Average/Overall would
+        # SILENTLY drop the evicted frames.  Gate on the STORE-ONLY residency
+        # (available_1d_keys/available_2d_keys, built from this adapter's store
+        # snapshot), NOT state.render_ids: render_ids OR-merges the store with the
+        # UNBOUNDED legacy data_1d (display_controllers._data_snapshot), so on a
+        # >max_heavy_items scan it still lists evicted frames and masks the
+        # eviction.  selected_ids holds the full intended set for both overall
+        # (= all_frame_index) and explicit selections (resolve_selection).
+        selected = {int(i) for i in state.selected_ids}
+        resident = self.available_2d_keys() if needs_2d else self.available_1d_keys()
+        if not selected <= resident:
             return None
 
         traces = []
