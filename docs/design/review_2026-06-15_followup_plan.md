@@ -33,6 +33,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | Review follow-up — 2D Sum aggregate + startup guard | `4b3564c` | ✅ evicted Overall `Sum` cakes now call the `sum` aggregate instead of silently rendering an average; `update_scattering_geometry` no longer raises if the GI signal fires before `self.scan` exists |
 | Native bus-error fix — avoid LZF stack writes on ARM64 macOS | `61073ef` | ✅ reverses GUI integrated-stack LZF compression and adds the same ARM64 macOS LZF→gzip guard to the shared NeXus writer helper; this mirrors the earlier `ssrl_xrd_tools` `9ff8bf0` bus-error mitigation |
 | Fresh review follow-up — aggregate retry, source IDs, norm aliases, docs | this checkpoint | ✅ async Overall aggregate `None` is retryable rather than cached as final; known-vs-missing source IDs no longer merge records; whole-scan norm channels resolve case/alias-insensitively; stale LZF/payload docs refreshed |
+| Wave 5 A3/A4 prep — store-first legacy render reads | this checkpoint | ✅ normal Int 1D/2D legacy draw helpers now prefer `PublicationStore`/`FrameRecord` rows and fall back to the bounded mirrors only for thinned/semilight transition rows; explicit store-backed display test added |
 
 **Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_gui_modes_end_to_end.py`,
@@ -53,6 +54,10 @@ The Sum-aggregate/startup-guard follow-up passed `tests/xdart/test_aggregation_w
 (`81 passed`). The fresh review follow-up passed
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_scan_aggregate.py`,
 `tests/xdart/test_frame_publication.py`, and the two LZF guard tests (`91 passed`).
+The Wave 5 store-first bridge passed `tests/xdart/test_display_cross_frame_2d.py`,
+`tests/xdart/test_frame_publication.py`,
+`tests/xdart/test_gui_modes_end_to_end.py::test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames`,
+and `tests/xdart/test_scan_aggregate.py` (`95 passed`).
 
 **Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is
 a safer pre-live-checkpoint boundary: publication-store-first display, bounded mirrors, and tests for the

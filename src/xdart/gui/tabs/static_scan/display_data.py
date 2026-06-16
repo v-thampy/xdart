@@ -17,9 +17,11 @@ import time
 
 import numpy as np
 from pathlib import Path
+from types import SimpleNamespace
 
 from .display_logic import RawSource, choose_raw_source, sentinel_mask
 from xdart.modules.wavelength import normalize_wavelength_m, wavelength_angstrom_to_m
+from xrd_tools.core import view_to_result_1d, view_to_result_2d
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +120,130 @@ class DisplayDataMixin:
         """
         return sentinel_mask(data, mask_saturation=mask_saturation)
 
-    def _snapshot_data(self, idxs):
+    def _publication_from_store_for_display(self, idx, *, allow_blocking_read=None):
+        """Return the scan-display publication for ``idx`` when available.
+
+        Viewer modes keep using their row/file-browser caches.  Normal Int 1D/2D
+        display paths should prefer the bounded publication store, falling back
+        to the legacy mirrors only while the A3/A4 retirement is in progress.
+        """
+        if getattr(self, "viewer_mode", None) is not None:
+            return None
+        store = getattr(self, "publication_store", None)
+        if store is None:
+            return None
+        try:
+            key = int(idx)
+        except (TypeError, ValueError):
+            key = idx
+        async_enabled = bool(getattr(self, "_async_hydration_enabled", False))
+        should_block = (
+            (not async_enabled)
+            if allow_blocking_read is None
+            else bool(allow_blocking_read)
+        )
+        if should_block:
+            return store.get_or_hydrate(key)
+        publication = store.get(key)
+        if publication is None:
+            return None
+        # Do not synchronously open the NeXus file from the GUI thread.  Queue
+        # full-payload hydration when the selected publication has been thinned.
+        if getattr(publication, "raw_status", None) in ("evicted", "thumbnail"):
+            request = getattr(self, "_request_frame_hydration", None)
+            if request is not None:
+                try:
+                    request(int(key))
+                except Exception:
+                    logger.debug(
+                        "publication hydration request failed for %s",
+                        key,
+                        exc_info=True,
+                    )
+        return publication
+
+    def _selected_publication_views(self, publication):
+        """Return the current 1D/2D mode views from a publication record."""
+        record = getattr(publication, "record", None)
+        if record is None:
+            view = publication.view
+            return (view if view.has_1d else None, view if view.has_2d else None)
+
+        scan = getattr(self, "scan", None)
+        is_gi = bool(getattr(scan, "gi", False))
+        mode_1d = mode_2d = None
+        if is_gi:
+            mode_1d = getattr(scan, "bai_1d_args", {}).get("gi_mode_1d", "q_total")
+            mode_2d = getattr(scan, "bai_2d_args", {}).get("gi_mode_2d", "qip_qoop")
+        if is_gi:
+            view_1d = record.view_1d(mode_1d)
+            view_2d = record.view_2d(mode_2d)
+        else:
+            view_1d = record.view_1d()
+            view_2d = record.view_2d()
+        return view_1d, view_2d
+
+    @staticmethod
+    def _first_present(*values):
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
+    def _publication_legacy_parts(self, publication):
+        """Adapt a :class:`FramePublication` into the legacy display shapes.
+
+        The old renderer expects a LiveFrame-ish 1D object plus a 2D dict.  This
+        keeps the renderer stable while changing only the data source.
+        """
+        view_1d, view_2d = self._selected_publication_views(publication)
+        merged_view = getattr(publication, "view", None)
+        raw_ref = getattr(publication, "raw_ref", None)
+        metadata = dict(
+            getattr(publication, "metadata_raw", None)
+            or getattr(merged_view, "metadata_raw", None)
+            or {}
+        )
+
+        int_1d = view_to_result_1d(view_1d) if view_1d is not None else None
+        int_2d = view_to_result_2d(view_2d) if view_2d is not None else None
+        thumbnail = self._first_present(
+            getattr(view_2d, "thumbnail", None),
+            getattr(view_1d, "thumbnail", None),
+            getattr(merged_view, "thumbnail", None),
+            getattr(raw_ref, "thumbnail", None),
+        )
+        raw = self._first_present(
+            getattr(merged_view, "raw", None),
+            getattr(view_2d, "raw", None),
+            getattr(view_1d, "raw", None),
+            getattr(raw_ref, "map_raw", None),
+            getattr(raw_ref, "image", None),
+        )
+        frame_1d = None
+        if int_1d is not None or thumbnail is not None or raw_ref is not None:
+            frame_1d = SimpleNamespace(
+                idx=publication.label,
+                int_1d=int_1d,
+                scan_info=metadata,
+                thumbnail=thumbnail,
+                map_raw=raw,
+                integrator=getattr(raw_ref, "integrator", None),
+                poni=getattr(raw_ref, "poni", None),
+            )
+        frame_2d = {
+            "map_raw": raw,
+            "bg_raw": getattr(raw_ref, "bg_raw", 0) if raw_ref is not None else 0,
+            "mask": getattr(raw_ref, "mask", None) if raw_ref is not None else None,
+            "int_2d": int_2d,
+            "gi_2d": {},
+            "thumbnail": thumbnail,
+        }
+        if int_2d is None and raw is None and thumbnail is None:
+            frame_2d = {}
+        return frame_1d, frame_2d
+
+    def _snapshot_data(self, idxs, *, allow_blocking_read=None):
         """Return a small {idx: (frame_1d, frame_2d_dict)} dict for
         the requested ``idxs``, sampled atomically under
         ``self.data_lock``.
@@ -133,14 +258,24 @@ class DisplayDataMixin:
         Missing frames are silently omitted from the result — the
         caller is expected to handle partial data anyway.
         """
-        with self.data_lock:
-            return {
-                int(idx): (
-                    self.data_1d.get(int(idx)),
-                    self.data_2d.get(int(idx), {}),
-                )
-                for idx in idxs
-            }
+        snapshot = {}
+        missing = []
+        for idx in idxs:
+            key = int(idx)
+            publication = self._publication_from_store_for_display(
+                key, allow_blocking_read=allow_blocking_read)
+            if publication is None:
+                missing.append(key)
+                continue
+            snapshot[key] = self._publication_legacy_parts(publication)
+        if missing:
+            with self.data_lock:
+                for key in missing:
+                    snapshot[key] = (
+                        self.data_1d.get(key),
+                        self.data_2d.get(key, {}),
+                    )
+        return snapshot
 
     def _hydrate_frame_from_disk(self, idx, *, allow_blocking_read=True):
         """Lazy-load a frame from the scan for a ``data_2d`` cache miss.
@@ -268,7 +403,7 @@ class DisplayDataMixin:
             idxs = self.idxs_2d
         idxs = list(idxs)
 
-        snapshot = self._snapshot_data(idxs)
+        snapshot = self._snapshot_data(idxs, allow_blocking_read=allow_blocking_read)
 
         intensity, ctr = 0., 0
         sources = set()
@@ -569,6 +704,8 @@ class DisplayDataMixin:
         """Return 1D data for multiple frames"""
         if idxs is None:
             idxs = self.idxs_1d
+        idxs = list(idxs)
+        snapshot = self._snapshot_data(idxs)
 
         # Collect rows then stack once.  The previous code re-allocated a
         # growing array with np.vstack on every iteration — O(N^2) over the
@@ -577,9 +714,26 @@ class DisplayDataMixin:
         xdata = None
         ys: list = []
         for idx in idxs:
-            frame_1d = self.data_1d.get(int(idx), None)
-            frame_2d = self.data_2d.get(int(idx), None)
-            if frame_1d is None:
+            frame_1d, frame_2d = snapshot.get(int(idx), (None, None))
+            if frame_1d is None or getattr(frame_1d, 'int_1d', None) is None:
+                # A3/A4 bridge: the publication store is now the preferred
+                # display source, but while the legacy mirrors still exist they
+                # remain the fallback for thinned/semilight publications.  This
+                # is what keeps Sum/Average over an evicted store row from
+                # silently aggregating only the resident subset before the final
+                # Role-A mirror deletion lands.
+                with self.data_lock:
+                    legacy_1d = self.data_1d.get(int(idx))
+                    legacy_2d = self.data_2d.get(int(idx), frame_2d or {})
+                if (
+                    legacy_1d is not None
+                    and getattr(legacy_1d, 'int_1d', None) is not None
+                ):
+                    frame_1d = legacy_1d
+                    frame_2d = legacy_2d
+                else:
+                    frame_1d = None
+            if frame_1d is None or getattr(frame_1d, 'int_1d', None) is None:
                 # data_1d cache miss (selection larger than the bounded window):
                 # hydrate from disk so a 1D sum/average / Set-Bkg over the whole
                 # scan covers ALL selected frames — matching the 2D/raw path, so
@@ -643,7 +797,7 @@ class DisplayDataMixin:
             return xdata, ydata
 
         # --- 2D path: project from 2D map ---
-        if frame_2d is None:
+        if frame_2d is None or frame_2d.get('int_2d') is None:
             return None, None
 
         intensity = self.get_int_2d(frame_2d['int_2d'], frame, normalize=False,

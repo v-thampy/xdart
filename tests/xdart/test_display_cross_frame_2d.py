@@ -51,6 +51,9 @@ def _make_host(scan, data_2d, data_1d=None):
         normChannel=SimpleNamespace(currentData=lambda: None, currentText=lambda: ""),
         plotUnit=SimpleNamespace(currentIndex=lambda: 0, currentText=lambda: ""),
         slice=SimpleNamespace(isChecked=lambda: False))
+    h.viewer_mode = None
+    h.publication_store = None
+    h._async_hydration_enabled = False
     return h
 
 
@@ -76,6 +79,47 @@ def _build_scan_on_disk(tmp_path, N, nq=8, nchi=6):
 
 
 class TestCrossFrame2DHydration:
+    def test_store_backed_scan_reads_do_not_need_legacy_mirrors(self):
+        from xdart.modules.frame_publication import (
+            PublicationStore,
+            publication_from_live_frame,
+        )
+
+        scan = SimpleNamespace(
+            frames=SimpleNamespace(index=[0, 1]),
+            mask_sentinel=False,
+            gi=False,
+            bai_1d_args={},
+            bai_2d_args={},
+        )
+        store = PublicationStore(max_heavy_items=None)
+        for idx, value in enumerate((1.0, 2.0)):
+            frame = SimpleNamespace(
+                idx=idx,
+                int_1d=_ir1d(value, nq=4),
+                int_2d=_ir2d(value, nq=4, nchi=3),
+                map_raw=np.full((3, 4), value * 10.0),
+                bg_raw=0,
+                mask=None,
+                gi_2d={},
+                thumbnail=None,
+                scan_info={},
+                source_file=f"frame_{idx}.tif",
+                source_frame_idx=idx,
+            )
+            store.upsert(publication_from_live_frame(frame, include_raw=True))
+        host = _make_host(scan, data_2d={}, data_1d={})
+        host.publication_store = store
+
+        raw = host.get_frames_map_raw([0, 1], require_all=True)
+        cake, _x, _y = host.get_frames_int_2d([0, 1], require_all=True)
+        curve, x = host.get_frames_int_1d([0, 1], rv="average")
+
+        np.testing.assert_allclose(raw, 15.0)
+        np.testing.assert_allclose(cake, 1.5)
+        np.testing.assert_allclose(curve, 1.5)
+        np.testing.assert_allclose(x, _ir1d(0, nq=4).radial)
+
     def test_int_2d_hydrates_evicted_frames(self, tmp_path):
         N = 30
         scan = _build_scan_on_disk(tmp_path, N)
