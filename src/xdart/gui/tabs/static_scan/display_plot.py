@@ -155,7 +155,15 @@ class DisplayPlotMixin:
         Preserves the legacy fallback: when the selected axis needs 2D data
         but only 1D data is available, disable slicing and retry on plain 1D.
         """
-        ydata, xdata = self.get_frames_int_1d()
+        method = self.ui.plotMethod.currentText()
+        store_complete_required = (
+            getattr(self, "viewer_mode", None) is None
+            and getattr(self, "publication_store", None) is not None
+            and method in ("Single", "Sum", "Average")
+        )
+        idxs = self.idxs if store_complete_required else None
+        ydata, xdata = self.get_frames_int_1d(
+            idxs, require_all=store_complete_required)
         if xdata is not None and ydata is not None:
             return ydata, xdata
 
@@ -169,7 +177,8 @@ class DisplayPlotMixin:
 
         # Fall back: disable slice, retry with plain 1D.
         self.ui.slice.setChecked(False)
-        return self.get_frames_int_1d()
+        return self.get_frames_int_1d(
+            idxs, require_all=store_complete_required)
 
     def build_plot_names(self):
         """Return current trace names, including slice-range suffixes."""

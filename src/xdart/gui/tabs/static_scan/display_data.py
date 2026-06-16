@@ -260,6 +260,10 @@ class DisplayDataMixin:
         """
         snapshot = {}
         missing = []
+        scan_store_active = (
+            getattr(self, "viewer_mode", None) is None
+            and getattr(self, "publication_store", None) is not None
+        )
         publication_lookup = getattr(
             self, "_publication_from_store_for_display", None)
         for idx in idxs:
@@ -272,7 +276,7 @@ class DisplayDataMixin:
                 missing.append(key)
                 continue
             snapshot[key] = self._publication_legacy_parts(publication)
-        if missing:
+        if missing and not scan_store_active:
             with self.data_lock:
                 for key in missing:
                     snapshot[key] = (
@@ -708,7 +712,7 @@ class DisplayDataMixin:
 
     # ── 1D integration data access ────────────────────────────────
 
-    def get_frames_int_1d(self, idxs=None, rv='all'):
+    def get_frames_int_1d(self, idxs=None, rv='all', *, require_all=False):
         """Return 1D data for multiple frames"""
         if idxs is None:
             idxs = self.idxs_1d
@@ -724,28 +728,11 @@ class DisplayDataMixin:
         for idx in idxs:
             frame_1d, frame_2d = snapshot.get(int(idx), (None, None))
             if frame_1d is None or getattr(frame_1d, 'int_1d', None) is None:
-                # A3/A4 bridge: the publication store is now the preferred
-                # display source, but while the legacy mirrors still exist they
-                # remain the fallback for thinned/semilight publications.  This
-                # is what keeps Sum/Average over an evicted store row from
-                # silently aggregating only the resident subset before the final
-                # Role-A mirror deletion lands.
-                with self.data_lock:
-                    legacy_1d = self.data_1d.get(int(idx))
-                    legacy_2d = self.data_2d.get(int(idx), frame_2d or {})
-                if (
-                    legacy_1d is not None
-                    and getattr(legacy_1d, 'int_1d', None) is not None
-                ):
-                    frame_1d = legacy_1d
-                    frame_2d = legacy_2d
-                else:
-                    frame_1d = None
-            if frame_1d is None or getattr(frame_1d, 'int_1d', None) is None:
-                # data_1d cache miss (selection larger than the bounded window):
-                # hydrate from disk so a 1D sum/average / Set-Bkg over the whole
-                # scan covers ALL selected frames — matching the 2D/raw path, so
-                # one Set-Bkg op's 1D and 2D backgrounds represent the same set.
+                # Publication-store miss (or no store on a lightweight test
+                # host): hydrate from disk so a 1D sum/average / Set-Bkg over
+                # the whole scan covers ALL selected frames.  Do not fall back
+                # to the legacy mirrors in normal scan mode; those are no
+                # longer authoritative and may contain stale rows.
                 lf = self._hydrate_frame_from_disk(int(idx))
                 if lf is None or getattr(lf, 'int_1d', None) is None:
                     continue
@@ -761,6 +748,9 @@ class DisplayDataMixin:
             if xdata is None:
                 xdata = x
             ys.append(y)
+
+        if require_all and len(ys) != len(idxs):
+            return None, None
 
         if not ys:
             return None, None

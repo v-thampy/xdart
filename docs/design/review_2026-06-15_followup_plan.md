@@ -39,6 +39,8 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | N2 batch submit-per-read | this checkpoint | ✅ batch no longer waits for the old 64/256-frame pending buffer before feeding the persistent streaming session; submit cadence is per-frame while `QtNexusSink`/`FlushPolicy` keep persistence batched |
 | GI-AGG primary-mode aggregate + batch log quieting | this checkpoint | ✅ GI Overall Sum/Average may now use the complete primary on-disk stack when the displayed mode matches persisted `gi_config`; non-primary GI modes still defer/refuse rather than falling back to bounded mirrors; per-frame batch submit no longer emits an INFO dispatch line for every frame |
 | Wave 5 A4 prep — stop scan-mode mirror writers | this checkpoint | ✅ live hand-off, serial wrangler processing, and GUI reintegration now publish scan-display rows through `PublicationStore` only; Role-B viewer arrays remain untouched |
+| Wave 5 A4 prep — lazy loads publish through store | this checkpoint | ✅ processed-scan lazy loading now upserts `FramePublication` rows into `PublicationStore` and clears stale scan-mode mirror rows for those labels; invalid 2D rows keep their valid 1D publication without reintroducing `data_1d`/`data_2d` as display authorities |
+| Wave 5 A4 prep — scan reads stop trusting stale mirrors | this checkpoint | ✅ normal Int 1D/2D snapshots, readiness, and Single/Sum/Average fallback paths treat missing store rows as missing and hydrate from disk when possible; without disk they blank/defer instead of drawing stale or subset mirror data. Viewer modes still use their Role-B file-row arrays |
 
 **Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_gui_modes_end_to_end.py`,
@@ -80,7 +82,9 @@ The GI-AGG primary-mode fix passed `tests/xdart/test_aggregation_wiring.py`,
 the live-checkpoint gate for the submit-cadence behavior change.
 The Wave 5 writer-stop prep passed the focused publication/display/live-refresh suite
 (`228 passed / 1 skipped`) plus reintegration, hydration, store-reader, and aggregate tests
-(`56 passed`).
+(`56 passed`). The lazy-load writer cleanup passed focused `_absorb_chunk` coverage (`5 passed`) and the
+store/display suite (`91 passed`). The scan-read cleanup passed the focused stale-mirror invariants and
+the broader display/publication/aggregate suite (`194 passed`).
 
 **Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is
 a safer pre-live-checkpoint boundary: publication-store-first display, bounded mirrors, and tests for the
@@ -113,7 +117,7 @@ renderer/data-source flip.
 | C6 RSM combine_grids streaming | `3216eb3` (bundled) | ✅ verified bit-exact |
 | Share Axis #2 + cake current-frame | `5c59077` | ✅ verified (P3: no test for the new multi-frame Single-Overlay cake path) |
 | N2 batch submit-per-read (rec. A) | this checkpoint | ✅ implemented in the image batch collect loop; live checkpoint still required to verify real batch silence/equivalence/perf |
-| **Wave 5 — A3/A4** (`data_1d`/`data_2d` retirement) | `26eb7d4` + `9fb96bb` partial + this checkpoint | ◑ offscreen prep landed; scan-mode writers now publish through `PublicationStore`; final Role-A dict deletion remains live-gated |
+| **Wave 5 — A3/A4** (`data_1d`/`data_2d` retirement) | `26eb7d4` + `9fb96bb` partial + this checkpoint | ◑ offscreen prep landed; scan-mode writers and processed-scan lazy loads now publish through `PublicationStore`; normal Int scan read paths no longer trust stale mirrors when a store is present. Final physical Role-A dict deletion remains live-gated |
 | **GI-AGG** GI >512-frame live Overall truncation (P2) + Overall e2e test gap | this checkpoint | ✅ primary displayed GI mode now routes to disk⊕tail aggregate; non-primary GI modes still defer/refuse instead of truncating. A fuller mode-switch UX remains with A3/A4/instant-switch, but the silent primary-mode truncation path is closed; detail in §0.2 |
 
 **Residual P3 follow-ups (none blocking):** multi-frame Single-Overlay cake test (Share Axis commit);

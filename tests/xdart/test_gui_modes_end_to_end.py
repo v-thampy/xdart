@@ -990,24 +990,25 @@ def test_int_plot_native_update_plot_state(widget, method, frame_ids):
     assert state["curves"] == (1 if method in ("Sum", "Average") else len(expected_ids))
 
 
-@pytest.mark.parametrize("method, expected", [("Average", 2.0), ("Sum", 6.0)])
-def test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames(widget, method, expected):
-    # Stub-scan fallback gate: when the bounded store evicts old frames but no
+@pytest.mark.parametrize("method", ["Average", "Sum"])
+def test_evicted_whole_scan_aggregate_without_disk_blanks_not_subset(widget, method):
+    # Final Role-A cleanup: when the bounded store evicts old frames but no
     # on-disk aggregate exists (this fixture has no data_file), Sum/Average must
-    # still cover ALL selected frames via the remaining legacy fallback, not just
-    # the store-resident subset.  The production long-scan path is covered by
-    # test_aggregation_wiring.py and routes through _whole_scan_aggregate.
+    # NOT fall back to stale data_1d rows or the one store-resident row.  The
+    # production long-scan path is covered by test_aggregation_wiring.py and
+    # routes through _whole_scan_aggregate; this stub-scan path blanks/defer.
     from xdart.modules.frame_publication import _semilight_publication
     w = widget
     df = _set_int_scan(w, n=3)
     # Evict frames 0,1 from the STORE (drop their 1D arrays) but leave data_1d
-    # intact -- exactly the state production reaches once the heavy bound is hit.
+    # intact.  data_1d is now a transitional/viewer mirror, not an integration
+    # display authority.
     store = df.publication_store
     with store._lock:
         for i in (0, 1):
             store._items[i] = _semilight_publication(store._items[i])
     assert not store.get(0).view.has_1d and not store.get(1).view.has_1d
-    assert df.data_1d[0].int_1d is not None       # data_1d still holds every frame
+    assert df.data_1d[0].int_1d is not None       # stale mirror still has it
 
     df.ui.plotMethod.setCurrentText(method)
     df.ui.plotUnit.setCurrentIndex(0)             # native Q
@@ -1018,11 +1019,11 @@ def test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames(widget, m
 
     df.update()
 
-    # One collapsed curve (not a waterfall), equal to the aggregate over ALL
-    # three frames via the no-data-file fallback.
-    assert len(df.curves) == 1
-    _cx, cy = df.curves[0].getData()
-    np.testing.assert_allclose(np.asarray(cy, dtype=float), np.full(5, expected))
+    # No wrong subset curve from frame 2 and no stale mirror aggregate.
+    assert len(df.curves) == 0
+    assert df.plot_data is not None
+    assert np.size(df.plot_data[0]) == 0
+    assert np.size(df.plot_data[1]) == 0
 
 
 def test_evicted_overall_cake_blanks_not_subset(widget):
@@ -1125,13 +1126,14 @@ def test_int_plot_slice_characterizes_update_plot_state(widget):
     assert chi_index >= 0
     df.ui.plotUnit.setCurrentIndex(chi_index)
     df._on_plotUnit_changed()
+    w.frame_ids[:] = ["0"]
+    df.frame_ids = ["0"]
+    df.idxs = [0]
+    df.idxs_1d = [0]
+    df.idxs_2d = [0]
     df.ui.slice.setChecked(True)
     df.ui.slice_center.setValue(0)
     df.ui.slice_width.setValue(10)
-    w.frame_ids[:] = ["0"]
-    df.frame_ids = ["0"]
-    df.idxs_1d = [0]
-    df.idxs_2d = [0]
 
     df.update()
 

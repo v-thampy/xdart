@@ -660,12 +660,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     except ValueError:
                         return
 
-                # Snapshot current dict keys while the lock is held, then
-                # release before doing list-comprehension work.
-                data_1d_keys = set(self.data_1d.keys())
-                data_2d_keys = set(self.data_2d.keys())
             store = getattr(self, 'publication_store', None)
             if store is not None:
+                data_1d_keys = set()
+                data_2d_keys = set()
                 try:
                     from .display_publication import publication_availability
                     pub_1d, pub_2d, _raw = publication_availability(
@@ -675,6 +673,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 except Exception:
                     logger.debug("publication availability lookup failed",
                                  exc_info=True)
+            else:
+                with self.data_lock:
+                    # Legacy/test-host path only: normal scan display no longer
+                    # treats these mirrors as loaded when a publication store is
+                    # present.
+                    data_1d_keys = set(self.data_1d.keys())
+                    data_2d_keys = set(self.data_2d.keys())
 
         self.idxs = list(ids)
         # ``ids`` is already the effective set (all-or-selected), so intersect
@@ -1002,8 +1007,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # truly nothing to show.
             if getattr(self, "_display_blanked", False):
                 return True
-            with self.data_lock:
-                has_cached = bool(self.data_1d) or bool(self.data_2d)
+            scan_store_active = (
+                getattr(self, "viewer_mode", None) is None
+                and getattr(self, "publication_store", None) is not None
+            )
+            if scan_store_active:
+                # Normal scan mode now treats PublicationStore as the
+                # authoritative display source.  Old data_1d/data_2d mirrors
+                # may still exist as transitional/viewer storage, but they must
+                # not keep stale plots/cakes alive when the store says the
+                # selected scan rows are missing.
+                has_cached = False
+            else:
+                with self.data_lock:
+                    has_cached = bool(self.data_1d) or bool(self.data_2d)
             # Panel-consistency: while a run is active, keep the current display
             # instead of blanking when there's nothing new to draw.  A silent
             # batch run populates the GUI caches only at the end, so without this

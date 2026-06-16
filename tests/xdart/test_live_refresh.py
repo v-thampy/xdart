@@ -3788,6 +3788,37 @@ def test_map_raw_masks_eiger_sentinel_before_display_average():
     assert data[1, 0] == 4.0
 
 
+def test_scan_snapshot_ignores_legacy_mirror_when_store_is_active():
+    from xdart.modules.frame_publication import PublicationStore
+
+    stale = SimpleNamespace(scan_info={}, int_1d=object())
+    host = SimpleNamespace(
+        viewer_mode=None,
+        publication_store=PublicationStore(),
+        data_lock=RLock(),
+        data_1d={1: stale},
+        data_2d={1: {"int_2d": object()}},
+    )
+    host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
+
+    assert host._snapshot_data([1]) == {}
+
+
+def test_viewer_snapshot_keeps_legacy_file_rows():
+    stale = SimpleNamespace(scan_info={}, int_1d=object())
+    two_d = {"map_raw": np.ones((2, 2))}
+    host = SimpleNamespace(
+        viewer_mode="image",
+        publication_store=None,
+        data_lock=RLock(),
+        data_1d={1: stale},
+        data_2d={1: two_d},
+    )
+    host._snapshot_data = MethodType(DisplayDataMixin._snapshot_data, host)
+
+    assert host._snapshot_data([1]) == {1: (stale, two_d)}
+
+
 def test_normal_raw_display_all_sentinel_image_clears_safely():
     calls = []
     host = SimpleNamespace(
