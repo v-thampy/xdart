@@ -866,7 +866,7 @@ class LiveFrame():
         with self.frame_lock:
             self.scan_info = new_data
 
-    def make_thumbnail(self, global_mask=None):
+    def make_thumbnail(self, global_mask=None, corrected_image=None):
         """Compute and cache a downsampled (map_raw - bg_raw) preview.
 
         Stores the result on ``self.thumbnail``; :meth:`save_to_nexus`
@@ -879,8 +879,17 @@ class LiveFrame():
             Flat indices of detector-level masked pixels, typically
             ``LiveScan.global_mask`` / wrangler ``self.mask``.  Masked
             pixels become NaN in the thumbnail before downsampling.
+        corrected_image : array-like or None
+            Optional already background-subtracted image.  Streaming reduction
+            workers provide this so thumbnail generation does not repeat a
+            full-frame subtraction.
         """
         if self.thumbnail is not None:
+            return
+        if corrected_image is not None:
+            self.thumbnail = _make_thumbnail(
+                corrected_image, mask_idx=self.mask, global_mask=global_mask,
+            )
             return
         if self.map_raw is None:
             # F5: try L1 lazy load before giving up.  Lets thumbnail

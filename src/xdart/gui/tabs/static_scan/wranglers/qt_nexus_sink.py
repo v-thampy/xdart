@@ -186,7 +186,10 @@ class QtNexusSink:
         )
         if not skip:
             try:
-                live.make_thumbnail(global_mask=self._mask)
+                live.make_thumbnail(
+                    global_mask=self._mask,
+                    corrected_image=getattr(reduction, "corrected_image", None),
+                )
             except Exception as e:
                 logger.warning("QtNexusSink thumbnail failed for %s: %s",
                                getattr(live, "idx", "?"), e)

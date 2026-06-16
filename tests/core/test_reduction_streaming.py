@@ -107,6 +107,34 @@ def test_streaming_output_matches_chunked(monkeypatch):
         )
 
 
+def test_worker_process_gets_transient_corrected_image(monkeypatch):
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+
+    class ThumbnailSink(MemorySink):
+        def __init__(self):
+            super().__init__()
+            self.corrected_seen: list[np.ndarray] = []
+
+        def worker_process(self, frame, reduction):
+            assert reduction.corrected_image is not None
+            self.corrected_seen.append(reduction.corrected_image.copy())
+
+    frame = Frame(0, image=np.arange(4, dtype=np.uint16).reshape(2, 2))
+    frame.background = np.ones((2, 2), dtype=np.float32)
+    sink = ThumbnailSink()
+
+    _stream(_plan(), [frame], sink, executor=1)
+
+    assert len(sink.corrected_seen) == 1
+    assert sink.corrected_seen[0].dtype == np.float32
+    np.testing.assert_allclose(
+        sink.corrected_seen[0],
+        np.asarray(frame.image, dtype=np.float32) - 1.0,
+    )
+    assert sink.frames[0].corrected_image is None
+
+
 def test_run_reduction_defaults_to_streaming_for_durable_sink(monkeypatch):
     monkeypatch.setattr(reduction_core, "integrate_1d",
                         lambda image, ai, **kw: _r1d(float(np.sum(image))))

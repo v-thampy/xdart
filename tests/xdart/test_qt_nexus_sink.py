@@ -170,6 +170,33 @@ def test_worker_process_makes_thumbnail_off_the_writer(tmp_path):
     assert live.thumbnail is not None          # made on the worker, not the writer
 
 
+def test_worker_process_uses_core_corrected_image_for_thumbnail(tmp_path):
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+    from xdart.modules.ewald import LiveScan
+
+    scan = LiveScan(data_file=str(tmp_path / "s.nxs"))
+    scan.skip_2d = False
+    sink = QtNexusSink(_FakeHost(batch_mode=True), scan, _minimal_plan(), mask=None)
+    sink.begin(None, None)
+    live = _live_frame(0)
+    reduction = _reduction(0)
+    reduction.corrected_image = np.full((8, 8), 7.0, dtype=np.float32)
+    seen = {}
+
+    def fake_thumbnail(*, global_mask=None, corrected_image=None):
+        seen["global_mask"] = global_mask
+        seen["corrected_image"] = corrected_image
+        live.thumbnail = np.zeros((2, 2), dtype=np.float32)
+
+    live.make_thumbnail = fake_thumbnail
+    sink.register(live)
+    sink.worker_process(_headless(0), reduction)
+
+    assert live.thumbnail is not None
+    assert seen["global_mask"] is None
+    np.testing.assert_array_equal(seen["corrected_image"], reduction.corrected_image)
+
+
 def test_live_mode_hands_off_via_published_frames(tmp_path):
     """#3 (display contract): in live (non-batch) mode the sink does the
     single-source-of-truth hand-off the serial path uses — it stashes the

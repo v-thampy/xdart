@@ -279,6 +279,11 @@ class FrameReduction:
     result_1d: IntegrationResult1D | None = None
     result_2d: IntegrationResult2D | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    corrected_image: np.ndarray | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(slots=True)
@@ -973,13 +978,17 @@ class ReductionSession:
         does the index-addressed HDF5 write.  Cancellation/errors propagate
         through the future to the writer loop unchanged.
         """
+        worker_process = getattr(self._sink, "worker_process", None)
         reduction = _reduce_frame(
             frame, image, self.plan, self._integrators, self._plan_masks,
             self.cancel_token, self._warned_monitor_keys,
+            include_corrected_image=callable(worker_process),
         )
-        worker_process = getattr(self._sink, "worker_process", None)
-        if callable(worker_process):
-            worker_process(frame, reduction)
+        try:
+            if callable(worker_process):
+                worker_process(frame, reduction)
+        finally:
+            reduction.corrected_image = None
         return reduction
 
     def _writer_loop(self) -> None:
@@ -2054,6 +2063,8 @@ def _reduce_frame(
     plan_masks: dict[tuple[int, int], np.ndarray | None],
     cancel_token: CancelToken | None = None,
     warned_monitor_keys: set[str] | None = None,
+    *,
+    include_corrected_image: bool = False,
 ) -> FrameReduction:
     if cancel_token is not None and cancel_token.cancelled:
         raise _ReductionCancelled
@@ -2066,6 +2077,11 @@ def _reduce_frame(
     if image.ndim != 2:
         raise ValueError(f"Frame {frame.index} image must be 2D; got shape {image.shape}")
     _validate_frame_inputs(frame, image.shape)
+    corrected_image = (
+        _thumbnail_corrected_image(raw_image_arr, frame.background)
+        if include_corrected_image
+        else None
+    )
     image = _apply_thresholds(image, plan)
     image = _subtract_background(image, frame.background)
     plan_mask = _cached_mask_for_shape(
@@ -2153,7 +2169,22 @@ def _reduce_frame(
         result_1d=r1d,
         result_2d=r2d,
         metadata=dict(frame.metadata),
+        corrected_image=corrected_image,
     )
+
+
+def _thumbnail_corrected_image(
+    raw_image: np.ndarray,
+    background: np.ndarray | float | None,
+) -> np.ndarray:
+    """Return a float32 raw-minus-background image for transient thumbnails."""
+    raw = np.asarray(raw_image)
+    if background is None:
+        return np.array(raw, dtype=np.float32, copy=True)
+    bg = np.asarray(background, dtype=np.float32)
+    if bg.ndim == 0 and float(bg) == 0.0:
+        return np.array(raw, dtype=np.float32, copy=True)
+    return np.asarray(raw, dtype=np.float32) - bg
 
 
 def _apply_thresholds(image: np.ndarray, plan: ReductionPlan) -> np.ndarray:
