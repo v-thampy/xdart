@@ -134,6 +134,31 @@ def test_cake_image_routes_eviction_to_aggregate():
     assert calls == [("2d", "average")]           # routed to the aggregate
 
 
+def test_cake_image_routes_sum_eviction_to_sum_aggregate():
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xrd_tools.io import Aggregated2D
+    q = np.linspace(0.5, 3.0, NQ)
+    chi = np.linspace(-90.0, 90.0, NCHI)
+    agg = Aggregated2D(q=q, chi=chi,
+                       intensity=np.full((NCHI, NQ), 31.0),
+                       q_unit="q_A^-1", chi_unit="chi_deg", n_frames=30)
+    calls = []
+    widget = SimpleNamespace(
+        bkg_2d=0,
+        _whole_scan_aggregate=lambda *, dim, method: calls.append((dim, method)) or agg,
+    )
+    adapter = PublicationDisplayAdapter(store=None, widget=widget)
+    state = _fake_state(
+        overall=True, selected_ids=(0,), render_ids=(), method="Sum")
+
+    payload = adapter.cake_image(state)
+
+    assert payload is not None
+    np.testing.assert_allclose(payload.image, 31.0)
+    assert calls == [("2d", "sum")]
+
+
 def test_plot_payload_routes_overall_eviction_to_1d_aggregate():
     from xdart.gui.tabs.static_scan.display_publication import (
         PublicationDisplayAdapter)

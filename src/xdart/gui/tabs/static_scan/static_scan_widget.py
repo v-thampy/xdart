@@ -1454,7 +1454,9 @@ class staticWidget(QWidget):
         args:
             gi: bool, flag for determining if in Grazing incidence
         """
-        self.scan.gi = gi
+        scan = getattr(self, "scan", None)
+        if scan is not None:
+            scan.gi = gi
         # Update the integration-panel options now (the next run integrates in
         # the new geometry).  Do NOT rebuild the *display* axis combos here (C1):
         # the displayed plot is still the old-mode data, so switching the

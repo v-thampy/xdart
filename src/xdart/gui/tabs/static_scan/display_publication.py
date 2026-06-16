@@ -442,7 +442,8 @@ class PublicationDisplayAdapter:
         widget = self._widget
         if widget is None or not hasattr(widget, "_whole_scan_aggregate"):
             return None
-        agg = widget._whole_scan_aggregate(dim="2d", method="average")
+        method = "sum" if state.method == "Sum" else "average"
+        agg = widget._whole_scan_aggregate(dim="2d", method=method)
         if agg is None or agg.intensity is None:
             return None
         image = np.asarray(agg.intensity, dtype=float)   # (n_chi, n_q) — cake orient
