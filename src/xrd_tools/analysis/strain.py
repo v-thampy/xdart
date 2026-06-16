@@ -30,7 +30,6 @@ from typing import Any
 import numpy as np
 from scipy.stats import linregress
 
-from xrd_tools.analysis.fitting.fit import fit_peaks
 from xrd_tools.core.containers import IntegrationResult2D
 
 logger = logging.getLogger(__name__)
@@ -215,6 +214,8 @@ def fit_peak_vs_psi(
     list of PeakFitResult
         One entry per sector where the fit converged.  Sorted by ψ.
     """
+    from xrd_tools.analysis.fitting import fit_peaks
+
     results: list[PeakFitResult] = []
     for sector in sectors:
         q = sector.q

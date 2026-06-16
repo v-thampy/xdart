@@ -16,8 +16,9 @@ import logging
 from copy import deepcopy
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
+import h5py
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -126,7 +127,8 @@ class FitResultStore:
     phase fractions vs. sequence index or composition.
     """
 
-    def __init__(self):
+    def __init__(self, *, keep_results: bool = True):
+        self.keep_results = bool(keep_results)
         self._entries: list[dict[str, Any]] = []
 
     def __len__(self) -> int:
@@ -149,6 +151,7 @@ class FitResultStore:
         label: str = "",
         elapsed: float = 0.0,
         params_snapshot: Any | None = None,
+        keep_result: bool | None = None,
     ) -> None:
         """Record a single fit result.
 
@@ -165,25 +168,48 @@ class FitResultStore:
         params_snapshot : lmfit.Parameters or None
             Deep copy of the fitted parameters, useful for seeding the
             next pattern in sequential mode.  If *None* the store takes
-            a copy from ``result.params``.
+            a copy from ``result.params`` when full results are retained.
+        keep_result : bool or None
+            Override this store's ``keep_results`` setting for one append.
         """
-        if params_snapshot is None:
+        keep = self.keep_results if keep_result is None else bool(keep_result)
+        if params_snapshot is None and keep:
             params_snapshot = deepcopy(result.params)
+        phase_fractions = result.phase_fractions()
+        phase_names = [getattr(ph, "name", f"phase_{i}")
+                       for i, ph in enumerate(result.fitter.phases)]
+        lattice = {
+            name: result.lattice_params(i)
+            for i, name in enumerate(phase_names)
+        }
+        widths = {
+            name: result.width_params(i)
+            for i, name in enumerate(phase_names)
+        }
+        params_values = {
+            key: float(param.value) if hasattr(param, "value") else param
+            for key, param in getattr(result, "params", {}).items()
+        }
         self._entries.append({
             "index": index,
             "label": label,
-            "result": result,
+            "result": result if keep else None,
             "elapsed": elapsed,
             "params": params_snapshot,
             "success": result.success,
             "redchi": result.redchi,
-            "phase_fractions": result.phase_fractions(),
+            "phase_fractions": phase_fractions,
+            "phase_names": phase_names,
+            "lattice_params": lattice,
+            "width_params": widths,
+            "q_shift": getattr(result, "q_shift", 0.0),
+            "params_values": params_values,
         })
 
     @property
     def results(self) -> list[Any]:
         """List of MultiPhaseResult objects."""
-        return [e["result"] for e in self._entries]
+        return [e["result"] for e in self._entries if e["result"] is not None]
 
     def to_dataframe(self):
         """Export to a pandas DataFrame.
@@ -208,10 +234,9 @@ class FitResultStore:
             for phase_name, frac in e["phase_fractions"].items():
                 row[f"frac_{phase_name}"] = frac
             # Lattice params per phase
-            result = e["result"]
-            for i, ph in enumerate(result.fitter.phases):
-                for k, v in result.lattice_params(i).items():
-                    row[f"{ph.name}_{k}"] = v
+            for phase_name, params in e.get("lattice_params", {}).items():
+                for k, v in params.items():
+                    row[f"{phase_name}_{k}"] = v
             rows.append(row)
         return pd.DataFrame(rows)
 
@@ -231,13 +256,20 @@ class FitResultStore:
         return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# fit_sequence — batch + optional sequential seeding
-# ---------------------------------------------------------------------------
+def _resolve_keep_results(
+    keep_results: bool | str,
+    n_patterns: int,
+    lightweight_threshold: int,
+) -> bool:
+    if keep_results == "auto":
+        return n_patterns <= lightweight_threshold
+    return bool(keep_results)
 
-def fit_sequence(
-    patterns: Sequence[tuple[np.ndarray, np.ndarray]
-                        | tuple[np.ndarray, np.ndarray, np.ndarray | None]],
+
+def _fit_patterns(
+    patterns: Iterable[tuple[np.ndarray, np.ndarray]
+                       | tuple[np.ndarray, np.ndarray, np.ndarray | None]],
+    n_patterns: int,
     phases: list[Any],
     config: FitConfig,
     *,
@@ -247,43 +279,13 @@ def fit_sequence(
     fit_background_template: np.ndarray
                              | tuple[np.ndarray, np.ndarray]
                              | None = None,
+    keep_results: bool = True,
 ) -> FitResultStore:
-    """Fit a sequence of patterns and return a :class:`FitResultStore`.
-
-    Parameters
-    ----------
-    patterns : list of (q, y) or (q, y, sigma)
-        Each element is one diffraction pattern.
-    phases : list of PhaseModel
-        The full set of phases.  ``config.phase_names`` selects which
-        ones to include in the fit.
-    config : FitConfig
-        Shared init / fit kwargs (see :class:`FitConfig`).
-    sequential : bool
-        If *True*, the fitted ``Parameters`` from pattern *N* are used
-        as the starting guess for pattern *N+1*.  This is useful for
-        continuous composition series where neighbouring patterns are
-        similar.
-    labels : list of str or None
-        Optional per-pattern labels (e.g. composition tags).
-    progress_callback : callable or None
-        ``progress_callback(i, n, result)`` called after each fit.
-    fit_background_template : ndarray or (x_ref, y_ref), optional
-        Reference spectrum for a scaled-template background (e.g. a
-        substrate measurement).  If supplied, it's injected into every
-        fitter's ``init_kw`` and ``fit_background`` defaults to
-        ``"template"``.  Kept out of :class:`FitConfig` because ndarrays
-        don't round-trip through JSON.
-
-    Returns
-    -------
-    FitResultStore
-    """
     import time
     from xrd_tools.analysis.fitting.phase_fitting import PhaseFitter
 
-    store = FitResultStore()
-    n = len(patterns)
+    store = FitResultStore(keep_results=keep_results)
+    n = n_patterns
     if labels is None:
         labels = [str(i) for i in range(n)]
 
@@ -358,6 +360,78 @@ def fit_sequence(
 
 
 # ---------------------------------------------------------------------------
+# fit_sequence — batch + optional sequential seeding
+# ---------------------------------------------------------------------------
+
+def fit_sequence(
+    patterns: Sequence[tuple[np.ndarray, np.ndarray]
+                        | tuple[np.ndarray, np.ndarray, np.ndarray | None]],
+    phases: list[Any],
+    config: FitConfig,
+    *,
+    sequential: bool = False,
+    labels: Sequence[str] | None = None,
+    progress_callback=None,
+    fit_background_template: np.ndarray
+                             | tuple[np.ndarray, np.ndarray]
+                             | None = None,
+    keep_results: bool | str = "auto",
+    lightweight_threshold: int = 64,
+) -> FitResultStore:
+    """Fit a sequence of patterns and return a :class:`FitResultStore`.
+
+    Parameters
+    ----------
+    patterns : list of (q, y) or (q, y, sigma)
+        Each element is one diffraction pattern.
+    phases : list of PhaseModel
+        The full set of phases.  ``config.phase_names`` selects which
+        ones to include in the fit.
+    config : FitConfig
+        Shared init / fit kwargs (see :class:`FitConfig`).
+    sequential : bool
+        If *True*, the fitted ``Parameters`` from pattern *N* are used
+        as the starting guess for pattern *N+1*.  This is useful for
+        continuous composition series where neighbouring patterns are
+        similar.
+    labels : list of str or None
+        Optional per-pattern labels (e.g. composition tags).
+    progress_callback : callable or None
+        ``progress_callback(i, n, result)`` called after each fit.
+    fit_background_template : ndarray or (x_ref, y_ref), optional
+        Reference spectrum for a scaled-template background (e.g. a
+        substrate measurement).  If supplied, it's injected into every
+        fitter's ``init_kw`` and ``fit_background`` defaults to
+        ``"template"``.  Kept out of :class:`FitConfig` because ndarrays
+        don't round-trip through JSON.
+    keep_results : bool or "auto", optional
+        Whether to retain the heavy ``MultiPhaseResult``/``PhaseFitter``
+        object for every pattern.  ``"auto"`` keeps full objects for small
+        sequences and stores summaries only above ``lightweight_threshold``.
+    lightweight_threshold : int, optional
+        Maximum sequence length for ``keep_results="auto"``.
+
+    Returns
+    -------
+    FitResultStore
+    """
+    n = len(patterns)
+    return _fit_patterns(
+        patterns,
+        n,
+        phases,
+        config,
+        sequential=sequential,
+        labels=labels,
+        progress_callback=progress_callback,
+        fit_background_template=fit_background_template,
+        keep_results=_resolve_keep_results(
+            keep_results, n, lightweight_threshold,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # NeXus convenience entry point  (xdart 0.37+ schema)
 # ---------------------------------------------------------------------------
 
@@ -373,18 +447,110 @@ def fit_nexus(
                              | tuple[np.ndarray, np.ndarray]
                              | None = None,
     label_motor: str | None = None,
+    keep_results: bool | str = False,
+    lightweight_threshold: int = 64,
 ) -> "FitResultStore":
     """Fit every 1-D pattern in an xdart NeXus file (v1 or v2 schema).
 
-    Reads via :func:`xrd_tools.io.nexus.read_scan`, which
-    auto-detects schema version — works on both pre-0.37 and 0.37+
-    files.  Replaces per-frame ``h5py.File`` round-trips with a single
-    load.
+    Streams directly from ``/{entry}/integrated_1d`` so whole-scan fits do
+    not need to materialize the full ``(n_frames, n_q)`` stack.
     """
+    path = Path(path)
+    labels: list[str] | None
+    with h5py.File(path, "r") as h5:
+        if entry not in h5:
+            raise KeyError(f"{path} has no {entry!r} entry")
+        e = h5[entry]
+        if "integrated_1d" not in e:
+            return _fit_nexus_via_read_scan(
+                path,
+                phases,
+                config,
+                entry=entry,
+                sequential=sequential,
+                progress_callback=progress_callback,
+                fit_background_template=fit_background_template,
+                label_motor=label_motor,
+                keep_results=keep_results,
+                lightweight_threshold=lightweight_threshold,
+            )
+        g = e["integrated_1d"]
+        if "intensity" not in g or "q" not in g:
+            return _fit_nexus_via_read_scan(
+                path,
+                phases,
+                config,
+                entry=entry,
+                sequential=sequential,
+                progress_callback=progress_callback,
+                fit_background_template=fit_background_template,
+                label_motor=label_motor,
+                keep_results=keep_results,
+                lightweight_threshold=lightweight_threshold,
+            )
+        n = int(g["intensity"].shape[0])
+        if "frame_index" in g:
+            frame_labels = [str(v) for v in np.asarray(g["frame_index"][()])]
+        else:
+            frame_labels = [str(i) for i in range(n)]
+
+    if label_motor is not None:
+        from xrd_tools.io.nexus import read_scan_metadata
+
+        ds_meta = read_scan_metadata(path, entry=entry)
+        if label_motor in ds_meta.data_vars:
+            motor_labels = [str(v) for v in ds_meta[label_motor].values]
+            labels = motor_labels if len(motor_labels) == n else frame_labels
+        else:
+            labels = frame_labels
+    else:
+        labels = frame_labels
+
+    def _patterns():
+        with h5py.File(path, "r") as h5:
+            g = h5[entry]["integrated_1d"]
+            q = np.asarray(g["q"][()], dtype=float)
+            intensity = g["intensity"]
+            sigma = g.get("sigma")
+            for i in range(n):
+                y = np.asarray(intensity[i], dtype=float)
+                if sigma is not None:
+                    yield q, y, np.asarray(sigma[i], dtype=float)
+                else:
+                    yield q, y
+
+    return _fit_patterns(
+        _patterns(),
+        n,
+        phases,
+        config,
+        sequential=sequential,
+        labels=labels,
+        progress_callback=progress_callback,
+        fit_background_template=fit_background_template,
+        keep_results=_resolve_keep_results(
+            keep_results, n, lightweight_threshold,
+        ),
+    )
+
+
+def _fit_nexus_via_read_scan(
+    path: Path,
+    phases: list[Any],
+    config: FitConfig,
+    *,
+    entry: str,
+    sequential: bool,
+    progress_callback,
+    fit_background_template: np.ndarray | tuple[np.ndarray, np.ndarray] | None,
+    label_motor: str | None,
+    keep_results: bool | str,
+    lightweight_threshold: int,
+) -> FitResultStore:
+    """Compatibility fallback for legacy files not shaped like v2 stacks."""
     from xrd_tools.io.nexus import read_scan
 
     ds = read_scan(path, entry=entry, groups=("1d",))
-
     if "intensity_1d" not in ds.data_vars:
         raise ValueError(
             f"{path}:{entry} has no /integrated_1d data — nothing to fit"
@@ -397,14 +563,14 @@ def fit_nexus(
         if "sigma_1d" in ds.data_vars
         else None
     )
-
     n = intensity.shape[0]
-    patterns: list[tuple] = []
-    for i in range(n):
-        if sigma_arr is not None:
-            patterns.append((q, intensity[i], sigma_arr[i]))
-        else:
-            patterns.append((q, intensity[i]))
+
+    def _patterns():
+        for i in range(n):
+            if sigma_arr is not None:
+                yield q, intensity[i], sigma_arr[i]
+            else:
+                yield q, intensity[i]
 
     if label_motor is not None and label_motor in ds.data_vars:
         labels: list[str] | None = [str(v) for v in ds[label_motor].values]
@@ -413,12 +579,16 @@ def fit_nexus(
     else:
         labels = None
 
-    return fit_sequence(
-        patterns,
+    return _fit_patterns(
+        _patterns(),
+        n,
         phases,
         config,
         sequential=sequential,
         labels=labels,
         progress_callback=progress_callback,
         fit_background_template=fit_background_template,
+        keep_results=_resolve_keep_results(
+            keep_results, n, lightweight_threshold,
+        ),
     )
