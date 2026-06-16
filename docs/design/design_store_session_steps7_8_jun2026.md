@@ -111,3 +111,34 @@ plans — no rework. Step 9 (strictness/sentinel, offscreen-gatable) comes after
 Net effect on the sequence: 7b aggregation reads the PRIMARY mode's complete on-disk stack only; the W
 write-wiring still lands (durable multi-mode for instant-switch-after-reload) but is no longer on the
 aggregation critical path. Everything else in the sub-step sequence stands.
+
+## DECOUPLING UPDATE (2026-06-15, after grounding) — supersedes the "7+8 coupled" framing above
+**Correction:** the earlier claim "Step 8 can't land without Step 7's session store" is WRONG. Grounding
+showed the aggregation capability ALREADY EXISTS — `io.read.get_1d/2d(frame=None)` returns the full
+`(n_frames, n_q)` stack in one read, and persist-before-evict is real (`LiveFrameSeries._persisted` =
+on-disk boundary; in-memory tail = `_in_memory` − `_persisted`). So "on-disk flushed prefix ⊕ in-memory
+unflushed tail" is buildable on existing primitives WITHOUT a new headless session store. The two efforts
+are SEPARABLE:
+
+- **Phase A — `data_1d` retirement (the correctness goal + greenfield "done" test). Low risk, existing
+  primitives.** Steps: (1) **7b aggregation-from-disk** (stacked read ⊕ in-memory tail; aggregate in
+  label space, reconcile the stored `(n_chi,n_q)` vs display `(q,chi)` transpose, coordinate the
+  off-thread read with `file_lock`); (2) **fix `get_or_hydrate` thumbnail-as-heavy** rehydration FIRST
+  (prerequisite — tier-1 semilight never rehydrates; `data_1d` unbounded masks it today; deleting
+  `data_1d` exposes it on scroll-back); (3) **retarget Role-A reads** to the store — NOTE `data_1d/data_2d`
+  serve TWO roles: **Role-A** = scan-integration cache (TIFF export, raw-panel mask, image preview,
+  `_data_snapshot` availability) → retarget+delete; **Role-B** = viewer-mode arrays (Image/XYE/NeXus) →
+  KEEP (the doc's earlier "keep `_ViewerRows`" understated this); (4) **8a** flip scan-1D draw to
+  payload-only; (5) **8b** delete Role-A `data_1d/data_2d`, keep Role-B.
+- **Phase B — ADR-0005 store→session relocation (7a + 7c). The architectural "thin xdart" move; biggest/
+  riskiest headless change; NOT required to retire `data_1d`.** Build the authoritative `FrameRecord`
+  store in `xrd_tools.session`, make `PublicationStore` a projection, move cadence/eviction (FlushPolicy)
+  into the session.
+
+**Sequencing decision (Vivek, leaning option 3):** do **Phase A now** (no-regret; all options start here),
+then **continue into Phase B this cycle**, with an explicit **go/defer checkpoint at the A→B boundary**
+(weigh the YAGNI case: B is the foundation for ROI/stitching, so building it WITH the first feature could
+design it against real needs — ADR-0006 lesson). Phase A is independently gated + live-validated before B
+starts, and is independently shippable, so 3 degrades cleanly to "ship A, defer B" (= option 1) if B
+proves gnarly. Option 2 (coupled, 7a-first) is OBSOLETE — it front-loads the risky store for no reason.
+Each phase: spine + byte-compat green per step; A's 8a/scroll-back and all of B are live-checkpointed.
