@@ -290,6 +290,29 @@ class QtNexusSink:
                              margin=_SAVE_BEFORE_EVICT_MARGIN)
         return policy.should_flush(frames_since_flush=self._since_save)
 
+    def _needs_atomic_first_batch_flush(self) -> bool:
+        """Return True for the first real batch write after the skeleton file.
+
+        ``initialize_scan`` creates a browseable .nxs skeleton before the
+        streaming session has any reduced rows.  The final batch flush is often
+        the first time integrated stacks are written, so use the writer's
+        atomic ``mode="w"`` path for that transition instead of mutating the
+        skeleton in place while the GUI may also be browsing the file.
+        """
+        if not getattr(self._host, "batch_mode", False):
+            return False
+        frames = getattr(self._scan, "frames", None)
+        if frames is None or not getattr(frames, "index", ()):
+            return False
+
+        lock = getattr(frames, "_cache_lock", None)
+        if lock is None:
+            persisted = set(getattr(frames, "_persisted", set()))
+        else:
+            with lock:
+                persisted = set(getattr(frames, "_persisted", set()))
+        return not persisted
+
     def flush(self, *, force=False) -> None:
         """Persist buffered output: h5pool-bracketed ``_save_to_nexus`` (skipped
         in xye_only) + the XYE row drain.  Public part of the ReductionSink
@@ -304,7 +327,8 @@ class QtNexusSink:
             _get_h5pool().pause(self._scan.data_file)
             try:
                 with self._host.file_lock:
-                    self._scan._save_to_nexus()   # also calls mark_persisted
+                    mode = "w" if self._needs_atomic_first_batch_flush() else "a"
+                    self._scan._save_to_nexus(mode=mode)   # also calls mark_persisted
             finally:
                 _get_h5pool().resume(self._scan.data_file)
         self._host._flush_xye_buffer(

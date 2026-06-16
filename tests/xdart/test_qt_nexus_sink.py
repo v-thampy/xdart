@@ -130,6 +130,81 @@ def test_sink_writes_all_frames_to_nxs_and_pops_register(tmp_path):
     assert host._signals == [-1]
 
 
+def test_first_forced_batch_flush_replaces_skeleton_atomically(tmp_path, monkeypatch):
+    """The first real batch save after initialize_scan's skeleton file should
+    use the writer's atomic ``mode='w'`` path.  This avoids growing integrated
+    stacks in place while the GUI may already be browsing the skeleton."""
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+    import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as iwt
+
+    class _Pool:
+        def pause(self, path):
+            pass
+
+        def resume(self, path):
+            pass
+
+    monkeypatch.setattr(iwt, "_get_h5pool", lambda: _Pool())
+
+    scan = LiveScan(data_file=str(tmp_path / "scan.nxs"))
+    scan.skip_2d = True
+    host = _FakeHost(batch_mode=True)
+    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink.begin(scan, _minimal_plan())
+    for i in range(3):
+        live = _live_frame(i)
+        sink.register(live)
+        sink.write(_headless(i), _reduction(i))
+
+    modes = []
+
+    def fake_save(*, mode="a", **kwargs):
+        modes.append(mode)
+        scan.frames.mark_persisted(scan.frames.index)
+
+    monkeypatch.setattr(scan, "_save_to_nexus", fake_save)
+    sink.flush(force=True)
+
+    assert modes == ["w"]
+
+
+def test_forced_batch_flush_appends_after_frames_are_persisted(tmp_path, monkeypatch):
+    from xdart.modules.ewald import LiveScan
+    from xdart.gui.tabs.static_scan.wranglers.qt_nexus_sink import QtNexusSink
+    import xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread as iwt
+
+    class _Pool:
+        def pause(self, path):
+            pass
+
+        def resume(self, path):
+            pass
+
+    monkeypatch.setattr(iwt, "_get_h5pool", lambda: _Pool())
+
+    scan = LiveScan(data_file=str(tmp_path / "scan.nxs"))
+    scan.skip_2d = True
+    host = _FakeHost(batch_mode=True)
+    sink = QtNexusSink(host, scan, _minimal_plan(), mask=None)
+    sink.begin(scan, _minimal_plan())
+    live = _live_frame(0)
+    sink.register(live)
+    sink.write(_headless(0), _reduction(0))
+    scan.frames.mark_persisted(scan.frames.index)
+
+    modes = []
+
+    def fake_save(*, mode="a", **kwargs):
+        modes.append(mode)
+        scan.frames.mark_persisted(scan.frames.index)
+
+    monkeypatch.setattr(scan, "_save_to_nexus", fake_save)
+    sink.flush(force=True)
+
+    assert modes == ["a"]
+
+
 def test_sink_persist_before_evict_no_unsaved_eviction(tmp_path):
     """The streaming sink must flush before _in_memory evicts an unsaved frame —
     so even with N > cap and a high interval, reload has every frame."""
@@ -499,7 +574,8 @@ def test_qt_sink_persist_before_evict_threshold(tmp_path, monkeypatch):
     saves = []
     orig_save = scan._save_to_nexus
     monkeypatch.setattr(scan, "_save_to_nexus",
-                        lambda *a, **k: (saves.append(sink._since_save),
+                        lambda *a, **k: (saves.append((sink._since_save,
+                                                       k.get("mode", "a"))),
                                          orig_save(*a, **k))[1])
 
     sink.begin(scan, _minimal_plan())
@@ -513,7 +589,7 @@ def test_qt_sink_persist_before_evict_threshold(tmp_path, monkeypatch):
     sink.register(live)
     sink.write(_headless(3), _reduction(3))
     assert len(saves) == 1
-    assert saves[0] == 4                        # fired AT the margin, not past
+    assert saves[0] == (4, "w")                 # first save is atomic
     assert sink._since_save == 0                # counter reset by the flush
 
     sink.finish(SimpleNamespace(cancelled=False, n_processed=4))

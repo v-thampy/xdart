@@ -167,6 +167,37 @@ def test_publication_store_thumbnail_tier_has_its_own_bound():
     assert not second.view.has_2d
 
 
+def test_detector_flat_masks_apply_without_unique(monkeypatch):
+    """Large detector flat-index masks should not sort/unique on the GUI thread.
+
+    Duplicate flat indices are harmless to assign more than once, and direct
+    flat assignment avoids the expensive concatenate/unique/unravel path that
+    showed up in the crash stack during a batch-final display refresh.
+    """
+    from types import SimpleNamespace
+    import xdart.gui.tabs.static_scan.display_publication as display_publication
+
+    def fail_unique(*args, **kwargs):
+        raise AssertionError("np.unique should not be used for flat masks")
+
+    monkeypatch.setattr(display_publication.np, "unique", fail_unique)
+
+    widget = SimpleNamespace(
+        scan=SimpleNamespace(global_mask=np.array([1, 4, 4, 9999]))
+    )
+    publication = SimpleNamespace(
+        raw_ref=SimpleNamespace(mask=np.array([0, 5, 5, -1]))
+    )
+    adapter = PublicationDisplayAdapter(store=None, widget=widget)
+    data = np.arange(6.0).reshape(2, 3)
+
+    masked = adapter._apply_detector_mask(data, publication)
+
+    assert np.isnan(masked.reshape(-1)[[0, 1, 4, 5]]).all()
+    assert masked[0, 2] == data[0, 2]
+    assert np.isfinite(data).all()                # input is copied first
+
+
 def test_get_or_hydrate_uses_registered_hydrator():
     store = PublicationStore(max_heavy_items=0, max_thumbnail_items=0)
     store.upsert(publication_from_live_frame(DuckFrame(idx=5)))

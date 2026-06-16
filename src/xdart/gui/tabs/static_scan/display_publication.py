@@ -810,7 +810,7 @@ class PublicationDisplayAdapter:
             masks.append(global_mask)
         if not masks:
             return data
-        flat_masks = []
+        flat_data = data.reshape(-1)
         for mask in masks:
             try:
                 arr = np.asarray(mask)
@@ -825,14 +825,14 @@ class PublicationDisplayAdapter:
                     data[arr] = np.nan
                 continue
             try:
-                flat_masks.append(np.asarray(arr, dtype=int).ravel())
+                flat = np.asarray(arr, dtype=np.intp).ravel()
             except (TypeError, ValueError):
                 continue
-        if flat_masks:
-            flat = np.unique(np.concatenate(flat_masks))
             flat = flat[(flat >= 0) & (flat < data.size)]
             if flat.size:
-                data[np.unravel_index(flat, data.shape)] = np.nan
+                # Duplicate indices are harmless; direct flat assignment avoids
+                # a GUI-thread concatenate/unique/unravel pass on large masks.
+                flat_data[flat] = np.nan
         return data
 
     @staticmethod
