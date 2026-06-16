@@ -361,6 +361,15 @@ def test_integrated_2d_nxdata(written_nxs):
     assert g["chi"].attrs.get("units") in ("deg", "rad")
 
 
+def test_gui_integrated_stacks_use_fast_compression(written_nxs):
+    import h5py
+
+    with h5py.File(written_nxs, "r") as f:
+        assert f["entry/integrated_1d/intensity"].compression == "lzf"
+        assert f["entry/integrated_1d/sigma"].compression == "lzf"
+        assert f["entry/integrated_2d/intensity"].compression == "lzf"
+
+
 def test_gi_nonuniform_stacked_2d_writer_stays_strict(tmp_path):
     """GI 2D outputs still need one shared axis before stacked writing."""
     from xdart.modules.ewald.nexus_writer import save_scan_to_nexus

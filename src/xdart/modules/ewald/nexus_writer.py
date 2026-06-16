@@ -61,6 +61,8 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+INTEGRATED_STACK_COMPRESSION = "lzf"
+
 
 @dataclass
 class NexusWriteCursor:
@@ -888,6 +890,7 @@ def _commit_integrated_1d(f, prepared) -> None:
         h5f.require_group(prepared["entry"]),
         frame_indices=prepared["indices"],
         results_1d=prepared["results"],
+        compression=INTEGRATED_STACK_COMPRESSION,
     )
     _refresh_group_cursor(
         prepared["cursor"], h5f, prepared["group_path"], prepared["scan_index"],
@@ -964,6 +967,7 @@ def _commit_integrated_2d(f, prepared) -> None:
         h5f.require_group(prepared["entry"]),
         frame_indices=prepared["indices"],
         results_2d=prepared["results"],
+        compression=INTEGRATED_STACK_COMPRESSION,
     )
     _refresh_group_cursor(
         prepared["cursor"], h5f, prepared["group_path"], prepared["scan_index"],
