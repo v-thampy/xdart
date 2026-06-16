@@ -442,6 +442,36 @@ def _publication_has_heavy_payload(publication: FramePublication) -> bool:
     return False
 
 
+def _view_has_data_arrays(view: FrameView) -> bool:
+    """True if the view carries real DATA arrays (1D/2D intensity or raw) — the
+    thumbnail does NOT count.  Distinct from _view_has_heavy_arrays (which counts
+    the thumbnail, for the eviction bound): a tier-1 (semilight) view keeps only
+    the thumbnail, so it has no data and should rehydrate."""
+    return any(
+        value is not None
+        for value in (view.intensity_1d, view.intensity_2d, view.raw)
+    )
+
+
+def _publication_has_full_payload(publication: FramePublication) -> bool:
+    """True if the publication has its data payload (so there is nothing to
+    rehydrate): a live raw_ref, real data arrays in the active view, or any
+    per-mode record view with data arrays.  Used by get_or_hydrate INSTEAD of
+    _publication_has_heavy_payload — the latter counts the thumbnail as heavy, so
+    a tier-1 (thumbnail-only) publication wrongly looked 'already loaded' and
+    never rehydrated."""
+    if publication.raw_ref is not None:
+        return True
+    if _view_has_data_arrays(publication.view):
+        return True
+    record = publication.record
+    if record is not None:
+        for mode_view in (*record.results_1d.values(), *record.results_2d.values()):
+            if _view_has_data_arrays(mode_view):
+                return True
+    return False
+
+
 def _semilight_publication(publication: FramePublication) -> FramePublication:
     """Tier-1 eviction (D2): drop the heavy arrays but KEEP the thumbnail.
 
@@ -662,8 +692,12 @@ class PublicationStore:
         with self._lock:
             publication = self._items.get(label)
             hydrator = self._hydrator
+        # Rehydrate when the payload is GONE (tier-1 thumbnail-only or tier-2
+        # evicted), keyed on real DATA arrays — NOT _publication_has_heavy_payload,
+        # which counts the thumbnail as heavy and so wrongly short-circuited a
+        # tier-1 (semilight) frame, leaving it stuck on the thumbnail forever.
         if publication is not None and (
-                _publication_has_heavy_payload(publication)
+                _publication_has_full_payload(publication)
                 or publication.raw_status not in ("evicted", "thumbnail")):
             return publication
         if hydrator is None:

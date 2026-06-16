@@ -191,6 +191,31 @@ def test_get_or_hydrate_uses_registered_hydrator():
     assert calls == []                            # no needless reload
 
 
+def test_get_or_hydrate_rehydrates_tier1_thumbnail():
+    # TIER-1 eviction (A2 fix): the payload (1D/2D/raw) is dropped but the
+    # thumbnail is KEPT (semilight, raw_status="thumbnail").  get_or_hydrate MUST
+    # rehydrate it.  Regression: the old guard counted the thumbnail as "heavy"
+    # (_publication_has_heavy_payload) and short-circuited, so a tier-1 frame was
+    # stuck on its thumbnail forever — the bug data_1d masked until Step 8b.
+    store = PublicationStore(max_heavy_items=0, max_thumbnail_items=8)
+    store.upsert(publication_from_live_frame(DuckFrame(idx=7)))
+    pub = store.get(7)
+    assert not pub.view.has_1d                     # payload evicted...
+    assert pub.view.thumbnail is not None          # ...but thumbnail kept (tier-1)
+    assert pub.raw_status == "thumbnail"
+
+    calls = []
+
+    def hydrator(label):
+        calls.append(label)
+        return publication_from_live_frame(DuckFrame(idx=int(label)))
+
+    store.set_hydrator(hydrator)
+    fresh = store.get_or_hydrate(7)
+    assert calls == [7]                            # tier-1 NOW rehydrates
+    assert fresh.view.has_1d
+
+
 def test_publication_store_can_bound_total_items():
     store = PublicationStore(max_items=2, max_heavy_items=None)
     for idx in (1, 2, 3):
