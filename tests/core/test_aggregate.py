@@ -8,6 +8,7 @@ on-disk ⊕ in-memory-tail combine (deduped by label), and NaN handling.
 
 from __future__ import annotations
 
+import os
 import warnings
 
 import h5py
@@ -107,3 +108,87 @@ def test_aggregate_average_does_not_warn_on_all_nan(scan_file):
 def test_aggregate_rejects_bad_method(scan_file):
     with pytest.raises(ValueError):
         aggregate_1d(scan_file, method="median")
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 13, 100, 1000])
+def test_aggregate_chunk_size_invariant(scan_file, chunk_size):
+    # The streaming nansum/nancount fold must give the SAME answer regardless of
+    # chunk size — chunk boundaries falling mid-stack must not change coverage
+    # (the §2.A bounded-read gate: never get_*(frame=None) the whole stack).
+    avg = aggregate_1d(scan_file, method="average", chunk_size=chunk_size)
+    assert avg.n_frames == N_FRAMES
+    np.testing.assert_allclose(avg.intensity[1:], 50.5)
+    s = aggregate_1d(scan_file, method="sum", chunk_size=chunk_size)
+    np.testing.assert_allclose(s.intensity[1:], 5050.0)
+    a2 = aggregate_2d(scan_file, method="average", chunk_size=chunk_size)
+    assert a2.n_frames == N_FRAMES
+    np.testing.assert_allclose(a2.intensity, 50.5)
+
+
+def test_aggregate_normalizes_each_frame_before_reducing():
+    # §2.B: the legacy display divides each frame by its normChannel BEFORE
+    # collapsing; a naive disk-stacked nansum/nanmean is silently wrong with
+    # normalization on.  norm={label: divisor} must divide per-row pre-reduce.
+    n, nq = 20, 4
+    intensity = np.tile((np.arange(n) + 1.0)[:, None], (1, nq)).astype(np.float32)
+    labels = np.arange(1, n + 1, dtype=np.int32)
+    p = _write_1d_only(intensity, labels)
+    # divisor == the frame's own value -> every normalized row is 1.0 exactly.
+    norm = {int(lbl): float(lbl) for lbl in labels}
+    avg = aggregate_1d(p, method="average", norm=norm)
+    np.testing.assert_allclose(avg.intensity, 1.0)
+    s = aggregate_1d(p, method="sum", norm=norm)
+    np.testing.assert_allclose(s.intensity, float(n))
+    # parity with the explicit "normalize each row, then reduce" reference.
+    ref = np.nanmean(intensity / np.array(list(norm.values()))[:, None], axis=0)
+    np.testing.assert_allclose(aggregate_1d(p, method="average", norm=norm).intensity, ref)
+    # a label missing from norm divides by 1.0 (un-normalized), not dropped.
+    partial = {1: 1.0}
+    s_partial = aggregate_1d(p, method="sum", norm=partial)
+    np.testing.assert_allclose(s_partial.intensity, 1.0 + np.sum(np.arange(2, n + 1)))
+
+
+def test_aggregate_average_uses_per_bin_finite_count():
+    # Average must divide each bin by the number of FINITE contributors, not N
+    # (a nanmean-of-chunk-means would be wrong when NaN counts differ per chunk).
+    n, nq = 10, 2
+    intensity = np.tile((np.arange(n) + 1.0)[:, None], (1, nq)).astype(np.float32)
+    intensity[0:5, 1] = np.nan                    # bin 1 finite only for frames 5..9
+    labels = np.arange(1, n + 1, dtype=np.int32)
+    p = _write_1d_only(intensity, labels)
+    avg = aggregate_1d(p, method="average", chunk_size=3)   # chunk crosses the NaN edge
+    np.testing.assert_allclose(avg.intensity[0], 5.5)        # mean(1..10)
+    np.testing.assert_allclose(avg.intensity[1], 8.0)        # mean(6..10), not mean/10
+    s = aggregate_1d(p, method="sum", chunk_size=3)
+    np.testing.assert_allclose(s.intensity[1], 40.0)         # 6+7+8+9+10
+
+
+def test_aggregate_post_divide_nonfinite_is_treated_as_missing():
+    # A zero/missing-monitor frame divides to inf/NaN; it must be dropped from
+    # the fold (treated as missing), never poison the whole-bin aggregate.
+    n, nq = 4, 2
+    intensity = np.tile((np.arange(n) + 1.0)[:, None], (1, nq)).astype(np.float32)
+    labels = np.arange(1, n + 1, dtype=np.int32)
+    p = _write_1d_only(intensity, labels)
+    norm = {1: 0.0, 2: 1.0, 3: 1.0, 4: 1.0}       # frame 1 has a zero monitor
+    s = aggregate_1d(p, method="sum", norm=norm)
+    assert np.isfinite(s.intensity).all()
+    np.testing.assert_allclose(s.intensity, 2.0 + 3.0 + 4.0)   # frame 1 dropped
+    avg = aggregate_1d(p, method="average", norm=norm)
+    np.testing.assert_allclose(avg.intensity, 3.0)             # mean(2,3,4)
+
+
+def _write_1d_only(intensity, labels):
+    """Write a minimal 1D-only processed file under a unique tmp path."""
+    import tempfile
+    q = np.linspace(0.5, 5.0, intensity.shape[1]).astype(np.float32)
+    fd, name = tempfile.mkstemp(suffix=".nxs")
+    os.close(fd)
+    with h5py.File(name, "w") as f:
+        e = f.create_group("entry")
+        e.attrs["NX_class"] = "NXentry"
+        g1 = e.create_group("integrated_1d")
+        g1.create_dataset("intensity", data=np.asarray(intensity, dtype=np.float32))
+        qd = g1.create_dataset("q", data=q); qd.attrs["units"] = "1/angstrom"
+        g1.create_dataset("frame_index", data=np.asarray(labels, dtype=np.int32))
+    return name

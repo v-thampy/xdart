@@ -608,14 +608,22 @@ def get_metadata(scan_file: str | Path, *, entry: str = "entry") -> dict:
 def _slice_stack(dset: h5py.Dataset, positions: np.ndarray, single: bool) -> np.ndarray:
     """Read ``positions`` rows from a stacked dataset, dropping the frame
     axis when a single frame was requested."""
-    # h5py fancy indexing needs strictly increasing indices; frame_index is
-    # already sorted in v2 files, but sort defensively for arbitrary input.
-    order = np.argsort(positions, kind="stable")
-    out = np.asarray(dset[positions[order]])
-    # restore caller-requested order
-    inv = np.empty_like(order)
-    inv[order] = np.arange(len(order))
-    out = out[inv]
+    positions = np.asarray(positions)
+    # h5py fancy indexing needs strictly increasing indices.  When the request
+    # is already strictly increasing (the common case: frame=None gives a
+    # contiguous arange, and v2 frame_index is sorted) read directly — the
+    # argsort + inverse-gather below is an identity that, unconditional, costs a
+    # full extra copy of the WHOLE stack (~1.9 GB transient for a 651-frame 2D
+    # cake at frame=None).  Only reorder for genuinely unsorted/duplicate input.
+    if positions.size > 1 and not np.all(np.diff(positions) > 0):
+        order = np.argsort(positions, kind="stable")
+        out = np.asarray(dset[positions[order]])
+        # restore caller-requested order
+        inv = np.empty_like(order)
+        inv[order] = np.arange(len(order))
+        out = out[inv]
+    else:
+        out = np.asarray(dset[positions])
     return out[0] if single else out
 
 
