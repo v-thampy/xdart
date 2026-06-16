@@ -230,8 +230,9 @@ def test_frame_from_live_frame_maps_simple_fields(tmp_path) -> None:
 
     assert frame.index == 4
     np.testing.assert_array_equal(frame.image, np.arange(4).reshape(2, 2))
+    assert isinstance(frame.mask, MaskSpec)
     np.testing.assert_array_equal(
-        frame.mask,
+        frame.mask.to_bool((2, 2)),
         np.array([[False, True], [False, True]]),
     )
     assert frame.metadata["th"] == 1.2
@@ -436,8 +437,9 @@ def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
         assert scan_arg.name == "scan"
         assert scan_arg.integrator == "ai"
         np.testing.assert_array_equal(scan_arg.frames[0].background, np.ones((2, 2)))
+        assert isinstance(scan_arg.frames[0].mask, MaskSpec)
         np.testing.assert_array_equal(
-            scan_arg.frames[0].mask,
+            scan_arg.frames[0].mask.to_bool((2, 2)),
             np.array([[True, False], [False, False]]),
         )
         np.testing.assert_array_equal(

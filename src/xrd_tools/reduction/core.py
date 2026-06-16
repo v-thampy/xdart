@@ -692,6 +692,9 @@ class ReductionSession:
     _plan_masks: dict[tuple[int, int], np.ndarray | None] = field(
         default_factory=dict, init=False, repr=False,
     )
+    _frame_masks: dict[tuple[int, tuple[int, int]], tuple[Any, np.ndarray | None]] = field(
+        default_factory=dict, init=False, repr=False,
+    )
     # S8: per-SCAN monitor warn-once state (shared with pool workers like
     # _plan_masks; set.add is GIL-atomic).  Session-owned so a dead monitor
     # warns again on the next scan and concurrent sessions don't cross-talk.
@@ -981,6 +984,7 @@ class ReductionSession:
         worker_process = getattr(self._sink, "worker_process", None)
         reduction = _reduce_frame(
             frame, image, self.plan, self._integrators, self._plan_masks,
+            self._frame_masks,
             self.cancel_token, self._warned_monitor_keys,
             include_corrected_image=callable(worker_process),
         )
@@ -1383,6 +1387,7 @@ class ReductionSession:
                         self.plan,
                         self._integrators,
                         self._plan_masks,
+                        self._frame_masks,
                         cancel_token=self.cancel_token,
                         warned_monitor_keys=self._warned_monitor_keys,
                     )
@@ -1406,6 +1411,7 @@ class ReductionSession:
                         # is atomic under the GIL and a concurrent first-write
                         # recomputes the identical array, so sharing is safe.
                         self._plan_masks,
+                        self._frame_masks,
                         self.cancel_token,
                         self._warned_monitor_keys,
                     ),
@@ -2061,6 +2067,7 @@ def _reduce_frame(
     plan: ReductionPlan,
     integrators: _ReductionIntegratorProvider,
     plan_masks: dict[tuple[int, int], np.ndarray | None],
+    frame_masks: dict[tuple[int, tuple[int, int]], tuple[Any, np.ndarray | None]] | None = None,
     cancel_token: CancelToken | None = None,
     warned_monitor_keys: set[str] | None = None,
     *,
@@ -2076,7 +2083,7 @@ def _reduce_frame(
         raise _ReductionCancelled
     if image.ndim != 2:
         raise ValueError(f"Frame {frame.index} image must be 2D; got shape {image.shape}")
-    _validate_frame_inputs(frame, image.shape)
+    _validate_frame_inputs(frame, image.shape, frame_masks)
     corrected_image = (
         _thumbnail_corrected_image(raw_image_arr, frame.background)
         if include_corrected_image
@@ -2090,7 +2097,7 @@ def _reduce_frame(
         "ReductionPlan.mask",
         plan_masks,
     )
-    mask = _combined_mask(plan_mask, frame.mask, image.shape)
+    mask = _combined_mask(plan_mask, frame.mask, image.shape, frame_masks)
     mask = _apply_saturation_mask(mask, raw_image_arr, plan)
 
     if plan.gi is not None:
@@ -2466,8 +2473,13 @@ def _combined_mask(
     plan_mask: np.ndarray | None,
     frame_mask: np.ndarray | MaskSpec | None,
     image_shape: tuple[int, int],
+    frame_mask_cache: dict[tuple[int, tuple[int, int]], tuple[Any, np.ndarray | None]] | None = None,
 ) -> np.ndarray | None:
-    frame_mask = _as_bool_mask(frame_mask, "Frame.mask", image_shape=image_shape)
+    frame_mask = _cached_frame_mask_for_shape(
+        frame_mask,
+        image_shape,
+        frame_mask_cache,
+    )
     if plan_mask is not None and plan_mask.shape != image_shape:
         raise ValueError(
             f"ReductionPlan.mask shape {plan_mask.shape} does not match "
@@ -2482,6 +2494,25 @@ def _combined_mask(
     if frame_mask is None:
         return plan_mask
     return plan_mask | frame_mask
+
+
+def _cached_frame_mask_for_shape(
+    mask: np.ndarray | MaskSpec | None,
+    image_shape: tuple[int, int],
+    cache: dict[tuple[int, tuple[int, int]], tuple[Any, np.ndarray | None]] | None,
+) -> np.ndarray | None:
+    if mask is None:
+        return None
+    if not isinstance(mask, MaskSpec) or cache is None:
+        return _as_bool_mask(mask, "Frame.mask", image_shape=image_shape)
+    owner = mask.values
+    key = (id(owner), image_shape)
+    cached = cache.get(key)
+    if cached is not None and cached[0] is owner:
+        return cached[1]
+    resolved = _as_bool_mask(mask, "Frame.mask", image_shape=image_shape)
+    cache[key] = (owner, resolved)
+    return resolved
 
 
 def _apply_saturation_mask(mask, raw_image, plan):
@@ -2551,7 +2582,11 @@ def _normalization_for(
     return None
 
 
-def _validate_frame_inputs(frame: Frame, image_shape: tuple[int, int]) -> None:
+def _validate_frame_inputs(
+    frame: Frame,
+    image_shape: tuple[int, int],
+    frame_mask_cache: dict[tuple[int, tuple[int, int]], tuple[Any, np.ndarray | None]] | None = None,
+) -> None:
     if frame.background is not None:
         bg = np.asarray(frame.background)
         if bg.ndim > 0 and bg.shape != image_shape:
@@ -2560,7 +2595,11 @@ def _validate_frame_inputs(frame: Frame, image_shape: tuple[int, int]) -> None:
                 f"match image shape {image_shape}"
             )
     if frame.mask is not None:
-        mask = _as_bool_mask(frame.mask, "Frame.mask", image_shape=image_shape)
+        mask = _cached_frame_mask_for_shape(
+            frame.mask,
+            image_shape,
+            frame_mask_cache,
+        )
         if mask.shape != image_shape:
             raise ValueError(
                 f"Frame {frame.index} mask shape {mask.shape} does not "

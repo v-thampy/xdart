@@ -598,6 +598,45 @@ def test_reduction_session_parallel_shares_plan_mask_cache(
     assert 0 < len(expansions) <= n_workers
 
 
+def test_reduction_session_parallel_shares_frame_mask_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expansions: list[str] = []
+    real_as_bool = reduction_core._as_bool_mask
+    lock = threading.Lock()
+
+    def counting_as_bool(mask, name, *, image_shape=None):
+        if name == "Frame.mask":
+            with lock:
+                expansions.append(name)
+        return real_as_bool(mask, name, image_shape=image_shape)
+
+    monkeypatch.setattr(reduction_core, "_as_bool_mask", counting_as_bool)
+    monkeypatch.setattr(
+        reduction_core, "integrate_1d", lambda image, ai, **kwargs: _r1d(1.0)
+    )
+
+    n_frames, n_workers = 12, 2
+    shared_mask = np.array([0, 3], dtype=np.int64)
+    frames = [
+        Frame(i, image=np.ones((2, 2)), mask=MaskSpec(shared_mask))
+        for i in range(n_frames)
+    ]
+    scan = Scan("scan", [Frame(0, image=np.ones((2, 2)))], integrator=object())
+
+    with ReductionSession(
+        ReductionPlan(integration_2d=None),
+        scan,
+        executor=n_workers,
+        chunk_size=n_frames,
+    ) as session:
+        session.process(frames)
+        result = session.finish()
+
+    assert result.n_processed == n_frames
+    assert 0 < len(expansions) <= n_workers
+
+
 def test_reduction_session_replace_refed_index_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

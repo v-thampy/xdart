@@ -59,7 +59,7 @@ def frame_from_live_frame(
     """Build an ``xrd_tools.reduction.Frame`` from a ``LiveFrame``."""
     image = getattr(live_frame, "map_raw", None) if include_image else None
     source_path = _source_path(live_frame)
-    mask = _live_frame_mask_as_bool(live_frame)
+    mask = _live_frame_mask_for_frame(live_frame)
     metadata = dict(getattr(live_frame, "scan_info", {}) or {})
     bg_raw = getattr(live_frame, "bg_raw", None) if include_background else None
     if bg_raw is not None and np.ndim(bg_raw) == 0:
@@ -829,11 +829,48 @@ def _plan_with_mask_for_live_frame(
     return replace(plan, mask=plan_mask | gmask)
 
 
-def _live_frame_mask_as_bool(live_frame: Any) -> np.ndarray | None:
+def _live_frame_mask_for_frame(live_frame: Any) -> np.ndarray | MaskSpec | None:
     mask = getattr(live_frame, "mask", None)
     image = getattr(live_frame, "map_raw", None)
     shape = getattr(image, "shape", None)
-    return _mask_for_plan(mask, shape)
+    return _mask_for_frame(mask, shape)
+
+
+def _mask_for_frame(mask: Any, shape: tuple[int, int] | None) -> np.ndarray | MaskSpec | None:
+    if mask is None:
+        return None
+    if isinstance(mask, MaskSpec):
+        if shape is None:
+            return mask
+        try:
+            mask.to_bool(shape)
+        except ValueError as exc:
+            logger.warning("Ignoring mask: %s", exc)
+            return None
+        return mask
+    arr = np.asarray(mask)
+    if arr.ndim == 1:
+        if shape is None:
+            return MaskSpec(arr)
+        n_pixels = int(np.prod(shape))
+        if arr.dtype == bool:
+            if arr.size != n_pixels:
+                logger.warning(
+                    "Ignoring boolean mask: length %d does not match image shape %s.",
+                    arr.size, shape,
+                )
+                return None
+            return MaskSpec(arr)
+        flat = np.asarray(arr, dtype=int).ravel()
+        if flat.size and (flat.min() < 0 or flat.max() >= n_pixels):
+            logger.warning(
+                "Ignoring mask: flat indices out of bounds for image shape %s "
+                "(index range [%d, %d], image has %d pixels).",
+                shape, int(flat.min()), int(flat.max()), n_pixels,
+            )
+            return None
+        return MaskSpec(arr)
+    return _flat_mask_as_bool(mask, shape)
 
 
 def _mask_for_plan(mask: Any, shape: tuple[int, int] | None) -> np.ndarray | MaskSpec | None:
