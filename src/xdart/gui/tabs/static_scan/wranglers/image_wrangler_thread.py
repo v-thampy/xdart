@@ -303,13 +303,21 @@ _PENDING_FLUSH_SIZE_1D = 256
 # ``_THRESHOLD_NAN`` (re-imported here for back-compat with old SPEC
 # wrangler scans that may pickle/unpickle constants by name).
 
-# Number of frames the background prefetch worker is allowed to read
-# ahead of the main collect loop.  Kept small: too large and the prefetcher
-# contends with the h5py writer for disk I/O (source .nxs and output HDF5
-# usually share a spindle), and 18 MB/frame stacks up memory pressure that
-# slows the write phase.  The main speedup for reads comes from the bulk
-# read path below, not from growing this queue.
-_PREFETCH_QUEUE_SIZE = 4
+# Number of frames the background prefetch worker may read ahead of the main
+# collect loop (the prefetch queue's maxsize).  This is the read‖reduce OVERLAP
+# budget: the collect loop blocks on dispatch (reduce+write backpressure) for
+# seconds per chunk, and the prefetcher can only run ahead this many frames
+# before its queue fills and it stalls — so a tiny value makes collect_read and
+# dispatch ADDITIVE instead of overlapped ([PERF-SUMMARY], 2026-06-15: Eiger 1D
+# read is decompression-bound ~24 ms/frame, single-thread prefetch floor ~16 s,
+# but additive gives ~25 s).  Trade-off: 18 MB/frame, so a large queue costs RAM
+# and can contend with the writer.  Env-tunable for perf experiments; default 4
+# preserves the prior behaviour.  (The bulk-read path is a dead end for per-frame
+# -compressed Eiger data — it does NOT amortize decompression.)
+try:
+    _PREFETCH_QUEUE_SIZE = max(1, int(os.environ.get("XDART_PREFETCH_QUEUE_SIZE", "4")))
+except (TypeError, ValueError):
+    _PREFETCH_QUEUE_SIZE = 4
 
 # How many frames the prefetcher reads from HDF5 in a single slice.  HDF5
 # chunks are typically sized so that one decompression produces multiple
