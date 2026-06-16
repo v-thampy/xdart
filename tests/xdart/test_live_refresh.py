@@ -4429,3 +4429,88 @@ def test_xye_viewer_single_click_navigates_directories():
     viewer.viewer_mode = "image"
     H5Viewer._scans_single_clicked(viewer, _FakeItem("img.tiff"))
     assert calls[-1] == ("nav", "img.tiff")
+
+
+def test_batch_process_scan_dispatches_each_frame_as_read():
+    """Batch should feed the persistent streaming session per frame, not wait
+    for the old 64/256-frame pending buffer.  The sink still batches writes and
+    batch mode still refreshes the GUI only once at the end; this locks the
+    read||reduce overlap fix at the collection-loop boundary."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    queue = [
+        ("/tmp/scan_0001.tif", "scan", 1, np.ones((2, 2)), {"i0": 1.0}),
+        ("/tmp/scan_0002.tif", "scan", 2, np.ones((2, 2)), {"i0": 2.0}),
+        ("/tmp/scan_0003.tif", "scan", 3, np.ones((2, 2)), {"i0": 3.0}),
+    ]
+    dispatched = []
+    final_updates = []
+
+    def next_image():
+        if queue:
+            return queue.pop(0)
+        return None, None, None, None, None
+
+    def make_scan():
+        return SimpleNamespace(
+            name="scan",
+            frames=SimpleNamespace(index=[]),
+            skip_2d=False,
+            data_file="/tmp/out.nxs",
+        )
+
+    host = SimpleNamespace(
+        command="start",
+        batch_mode=True,
+        live_mode=False,
+        single_img=False,
+        xye_only=False,
+        img_file="/tmp/scan_0001.tif",
+        poni=None,
+        scan_name="scan",
+        _frames_since_save=0,
+        _active_scan=None,
+        _perf=None,
+        _live_execution=lambda: "serial",
+        showLabel=SimpleNamespace(emit=lambda *_: None),
+        sigUpdate=SimpleNamespace(emit=lambda value: final_updates.append(value)),
+        _wait_if_paused=lambda: None,
+        get_next_image=next_image,
+        _middle_truncate=lambda text, max_len=40: text,
+        initialize_scan=make_scan,
+        get_background=lambda *_: 0.0,
+        _flush_xye_buffer=lambda *_args, **_kw: None,
+    )
+
+    def dispatch(scan, pending, *, force_save=False):
+        dispatched.append((tuple(item[1] for item in pending), bool(force_save)))
+        return len(pending)
+
+    host._dispatch_batch = dispatch
+
+    MethodType(imageThread.process_scan, host)()
+
+    assert dispatched == [((1,), False), ((2,), False), ((3,), False)]
+    assert final_updates == [-1]
+
+
+def test_batch_single_frame_still_routes_to_streaming_when_live_policy_serial():
+    """N2 submits one-frame pending chunks.  Batch must still use the streaming
+    dispatcher even if the live-mode fallback env is serial; otherwise the new
+    cadence would silently revert batch to the old serial path."""
+    from xdart.gui.tabs.static_scan.wranglers.image_wrangler_thread import imageThread
+
+    calls = []
+    host = SimpleNamespace(
+        batch_mode=True,
+        _maybe_warn_live_gi_clip=lambda: None,
+        _dispatch_batch_streaming=lambda scan, pending: calls.append(
+            ("streaming", tuple(item[1] for item in pending))) or len(pending),
+        _dispatch_batch_serial=lambda scan, pending, force_save=False: calls.append(
+            ("serial", tuple(item[1] for item in pending))) or len(pending),
+        _live_execution=lambda: "serial",
+    )
+    pending = [("/tmp/scan_0001.tif", 1, np.ones((2, 2)), {}, 0.0, 0.0)]
+
+    assert MethodType(imageThread._dispatch_batch, host)(object(), pending) == 1
+    assert calls == [("streaming", (1,))]

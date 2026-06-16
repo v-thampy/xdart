@@ -1,8 +1,9 @@
 # Fix: restore read‖reduce overlap in xdart Batch (recommendation A) — 2026-06-15
 
-**Status:** queued, do AFTER Phase A+B of the store→session work (`design_store_session_steps7_8_jun2026.md`);
-folds into the "collapse dispatch paths" goal. **Gate:** live≡batch≡reload spine + byte-compat + a live
-checkpoint. **Baseline to beat:** `docs/perf_baseline_2026-06-15.md`.
+**Status:** implementation landed in the GUI collection loop: batch now submits each frame to the persistent
+streaming session as soon as the frame is read. The sink/`FlushPolicy` still controls disk flush cadence, so
+submit cadence and save cadence are separated. **Remaining gate:** live≡batch≡reload spine + byte-compat + a
+live checkpoint. **Baseline to beat:** `docs/perf_baseline_2026-06-15.md`.
 
 ## Symptom
 xdart **Batch** is ~50% slower than **Live** for the same scan (651-frame Eiger): 1D 28.3s vs 18.9s; 2D
@@ -15,9 +16,9 @@ vs 35.1 ms/fr Batch. The gap is entirely **lost read‖reduce overlap**: `read` 
 reduction.
 
 Three-part interaction in `image_wrangler_thread.py`:
-1. **Batch accumulates before dispatching.** The collect loop reads `_PENDING_FLUSH_SIZE` frames
-   (64 for 2D, 256 for 1D; ~`:292`/`:821`) into a pending list before handing the batch to the reduction
-   session. Live sets flush_size = 1 and dispatches every frame immediately.
+1. **Original cause: batch accumulated before dispatching.** The collect loop used to read 64/256 frames into a
+   pending list before handing the batch to the reduction session. Live already dispatched every frame
+   immediately. This has now been changed so batch also submits each frame immediately.
 2. **The prefetch queue is only 4 deep** (`XDART_PREFETCH_QUEUE_SIZE = 4`, `~:318`, pushed one-at-a-time
    `~:2289`) → the background Eiger prefetcher can only run ~4 frames ahead before it stalls on a full
    queue.
@@ -31,11 +32,10 @@ handing the already-decoded array to the worker pool, so the workers never decod
 single-thread decode ceiling regardless of this fix.)
 
 ## The fix (recommendation A)
-In `_dispatch_batch_streaming`, **submit each frame the instant it is read** instead of accumulating
-`_PENDING_FLUSH_SIZE` frames first. The reduction session is already persistent and bounded by
-`inflight_max`, so pre-accumulating buys nothing — it only destroys the read‖reduce overlap. This
-restores live-like overlap AND unifies batch+live onto one submit path (the "collapse dispatch paths"
-direction).
+In the batch collect loop, **submit each frame the instant it is read** instead of accumulating a large
+pending buffer first. The reduction session is already persistent and bounded by `inflight_max`, so
+pre-accumulating buys nothing — it only destroys the read‖reduce overlap. This restores live-like overlap
+AND unifies batch+live onto one submit path (the "collapse dispatch paths" direction).
 
 ## Caveats — MUST hold (these are the traps)
 1. **Preserve the batch-silent invariant.** Per-frame *submit* (into the reduction pipeline) must NOT
@@ -43,9 +43,8 @@ direction).
    end-of-run refresh — that is a recorded design decision and a perf feature. Don't let per-frame submit
    re-enable per-frame GUI updates in batch.
 2. **Decouple submit-cadence from save-cadence.** Submit per-frame, but KEEP the save/flush cadence
-   (`FlushPolicy` / persist-before-evict; the 256/64 save batching). Do NOT turn "stop accumulating before
-   dispatch" into "save every frame." They are two different knobs that `_PENDING_FLUSH_SIZE` currently
-   conflates — separate them.
+   (`FlushPolicy` / persist-before-evict). Do NOT turn "stop accumulating before dispatch" into "save every
+   frame." The landed code separates these knobs.
 3. **GI batch still freezes the whole-scan grid first.** The per-frame submit must run AFTER the GI
    whole-scan freeze/scout (the frozen grid is set before dispatch); don't reorder so a per-frame submit
    pre-empts the freeze.

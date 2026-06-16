@@ -36,6 +36,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | Wave 5 A3/A4 prep — store-first legacy render reads | this checkpoint | ✅ normal Int 1D/2D legacy draw helpers now prefer `PublicationStore`/`FrameRecord` rows and fall back to the bounded mirrors only for thinned/semilight transition rows; explicit store-backed display test added |
 | Wave 5 A3/A4 prep — store-first preview/mask lookups | this checkpoint | ✅ raw-panel mask lookup and image preview now consult the publication store before the transition mirrors; legacy plot drawing no longer refuses to draw just because `data_1d` is empty when the store has rows |
 | I4 partial — reduce 2D render copies | this checkpoint | ✅ 2D cake aggregation accumulates in-place and `get_int_2d(normalize=False)` returns a source view for slice/projection readers instead of copying the full cake |
+| N2 batch submit-per-read | this checkpoint | ✅ batch no longer waits for the old 64/256-frame pending buffer before feeding the persistent streaming session; submit cadence is per-frame while `QtNexusSink`/`FlushPolicy` keep persistence batched |
 
 **Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_gui_modes_end_to_end.py`,
@@ -67,6 +68,9 @@ and `tests/xdart/test_frame_publication.py` (`84 passed`).
 The I4 copy-reduction slice passed `tests/xdart/test_display_cross_frame_2d.py`,
 `tests/xdart/test_gui_modes_end_to_end.py::test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames`,
 and `tests/xdart/test_frame_publication.py` (`81 passed`).
+The N2 submit-cadence slice passed the focused collection-loop regression
+`tests/xdart/test_live_refresh.py::test_batch_process_scan_dispatches_each_frame_as_read`; the full
+live≡batch≡reload and byte-compat gates remain the live-checkpoint gate for this behavior change.
 
 **Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is
 a safer pre-live-checkpoint boundary: publication-store-first display, bounded mirrors, and tests for the
@@ -98,7 +102,7 @@ renderer/data-source flip.
 | C5 off-thread aggregate file-lock | `cb01b13` (+ wiring) | ✅ verified — reads under `scan.file_lock` + regression test |
 | C6 RSM combine_grids streaming | `3216eb3` (bundled) | ✅ verified bit-exact |
 | Share Axis #2 + cake current-frame | `5c59077` | ✅ verified (P3: no test for the new multi-frame Single-Overlay cake path) |
-| N2 batch submit-per-read (rec. A) | — | ⏳ queued — after Phase A+B (`fix_batch_dispatch_overlap_jun2026.md`) |
+| N2 batch submit-per-read (rec. A) | this checkpoint | ✅ implemented in the image batch collect loop; live checkpoint still required to verify real batch silence/equivalence/perf |
 | **Wave 5 — A3/A4** (`data_1d`/`data_2d` retirement) | `26eb7d4` + `9fb96bb` partial | ◑ offscreen prep landed; final Role-A deletion remains live-gated |
 | **GI-AGG** GI >512-frame live Overall truncation (P2) + Overall e2e test gap | — | ⏳ OPEN — `9fb96bb`'s `data_1d` cap (512) now exposes it; **non-GI is safe** (store-residency routes to the disk aggregate). Fix belongs with the GI displayed-mode instant-switch work; detail in §0.2 |
 

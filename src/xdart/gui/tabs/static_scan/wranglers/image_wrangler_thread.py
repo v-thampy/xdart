@@ -274,28 +274,6 @@ def _freeze_gi_1d_range_from_result(args, result, gi_mode_1d=None):
 _INT_PATTERN = re.compile(r'(\d+)')
 _FLOAT_PATTERN = re.compile(r'[+-]?([0-9]+(?:[.][0-9]*)?|[.][0-9]+)')
 
-# Maximum number of frames to accumulate in the pending list before
-# dispatching a partial batch.  This is the batch *chunk* size: read N →
-# integrate N across workers → thumbnails → serial HDF5 write → repeat.
-# Each barrier (read/integrate/write phase boundary) leaves cores idle, so
-# fewer, bigger chunks amortise the ThreadPoolExecutor dispatch + the
-# end-of-batch scan._save_to_nexus flush over more frames (PERF-4a).
-#
-# Peak buffer per batch ≈ flush_size × ~9 MB (one 2167x2070 uint16 Eiger
-# frame, read in native dtype — QW3), plus the 2D cake per frame.  PERF-3 frees each frame's raw at
-# end-of-batch, so this peak is now bounded to ONE chunk regardless of scan
-# length (pre-PERF-3 the stash pinned raw for every frame for the whole
-# scan), which is what makes raising the chunk size safe.  64 frames ≈
-# ~1.5 GB peak — fine on a workstation; dial back toward 16 only on a
-# RAM-starved / spinning-disk laptop (smaller reads finish sooner, so
-# first-batch latency is lower).
-_PENDING_FLUSH_SIZE = 64
-# 1D-only batches carry no multi-MB cake arrays, so a larger pending buffer
-# (fewer, bigger parallel dispatches) is cheaper without the 2D RAM cost.  Kept
-# separate so the 2D-sized buffer is never globally raised.  256 × ~18 MB ≈
-# ~4.6 GB peak (PERF-3 bounds it to one chunk).  (PERF-2 / PERF-4a)
-_PENDING_FLUSH_SIZE_1D = 256
-
 # How many integrated frames to accumulate between v2 _save_to_nexus
 # Live-save cadence and threshold-sentinel constants moved to the
 # wranglerThread base class (wrangler_widget.py) in May 2026 — refer
@@ -813,22 +791,17 @@ class imageThread(wranglerThread):
             if self.single_img and not is_eiger:
                 break
 
-            # ── Dispatch cadence ────────────────────────────────────────────
-            # Batch mode accumulates a pending buffer (_PENDING_FLUSH_SIZE /
-            # _PENDING_FLUSH_SIZE_1D) so the headless reduction spine can
-            # integrate them in parallel.  Live (non-batch) mode dispatches
-            # immediately so the GUI sees per-frame updates as soon as each
-            # image lands; the disk save still gets batched separately inside
-            # _dispatch_batch_serial via _frames_since_save.
-            flush_size = (
-                (_PENDING_FLUSH_SIZE_1D if getattr(self.scan, "skip_2d", False)
-                 else _PENDING_FLUSH_SIZE)
-                if self.batch_mode else 1
-            )
+            # ── Submit cadence ──────────────────────────────────────────────
+            # Streaming batch owns its own in-flight bound and save cadence, so
+            # the old "read 64/256 frames before dispatch" buffer only destroyed
+            # read||reduce overlap.  Submit every frame as soon as it is read;
+            # QtNexusSink/FlushPolicy still batch persistence, and batch remains
+            # display-silent until the final sigUpdate(-1).
+            flush_size = 1
             if len(pending) >= flush_size:
                 if self.batch_mode:
                     self.showLabel.emit(
-                        f'Integrating {len(pending)} frames (partial batch)...'
+                        f'Integrating {len(pending)} frame(s)...'
                     )
                 _t_disp = time.time()
                 files_processed += self._dispatch_batch(scan, pending)
@@ -976,7 +949,7 @@ class imageThread(wranglerThread):
         (the whole point of batch mode is one big save per dispatch).
         """
         self._maybe_warn_live_gi_clip()
-        if self.batch_mode and len(pending) > 1:
+        if self.batch_mode:
             # 4e: batch is one write path — always the streaming session.
             return self._dispatch_batch_streaming(scan, pending)
         # Live (non-batch): #3 routes it through the SAME streaming session +
