@@ -8,6 +8,8 @@ import h5py
 
 from xrd_tools.io.nexus import (
     NexusImageStack,
+    _comp_kwargs,
+    _lzf_unsafe_on_this_platform,
     _require_uniform_axes_1d,
     _require_uniform_axes_2d,
     find_nexus_image_dataset,
@@ -621,10 +623,23 @@ class TestWriteNexus:
         with h5py.File(p, "r") as f:
             assert f["entry/integrated_1d/intensity"].compression is None
 
-    def test_compression_lzf(self, tmp_path, result_1d):
+    def test_compression_lzf_uses_safe_filter(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "lzf.h5", results_1d={0: result_1d}, compression="lzf")
         with h5py.File(p, "r") as f:
-            assert f["entry/integrated_1d/intensity"].compression == "lzf"
+            expected = "gzip" if _lzf_unsafe_on_this_platform() else "lzf"
+            assert f["entry/integrated_1d/intensity"].compression == expected
+
+    def test_compression_lzf_guard_maps_arm_macos_to_fast_gzip(self, monkeypatch):
+        import xrd_tools.io.nexus as nexus
+
+        monkeypatch.setattr(nexus.sys, "platform", "darwin")
+        monkeypatch.setattr(nexus.platform, "machine", lambda: "arm64")
+
+        assert _comp_kwargs("lzf") == {
+            "compression": "gzip",
+            "compression_opts": 1,
+            "shuffle": True,
+        }
 
     def test_compression_gzip(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "gz.h5", results_1d={0: result_1d}, compression="gzip")

@@ -61,7 +61,10 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-INTEGRATED_STACK_COMPRESSION = "lzf"
+# Do not use lzf here. Several macOS/ARM64 h5py/HDF5 builds can bus-error
+# inside create_dataset with lzf on large integrated stacks. The GUI writer is
+# latency-sensitive, so prefer uncompressed chunked stacks over gzip.
+INTEGRATED_STACK_COMPRESSION = None
 
 
 @dataclass

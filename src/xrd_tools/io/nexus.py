@@ -25,12 +25,15 @@ Performance features:
 - Optional SWMR mode for live beamline reduction (GUI reads while processing
   writes)
 - Single file open/close per scan via ``write_nexus_frame`` for hot loops
-- LZF compression by default (fast, suitable for live use)
+- LZF compression by default where safe; ARM64 macOS h5py/HDF5 builds are
+  guarded by mapping LZF requests to fast gzip to avoid native bus errors.
 """
 
 from __future__ import annotations
 
 import logging
+import platform
+import sys
 import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -873,10 +876,20 @@ def _comp_kwargs(compression: str | None) -> dict[str, Any]:
     """Build h5py dataset kwargs for a given compression filter."""
     if compression is None:
         return {}
+    if compression == "lzf" and _lzf_unsafe_on_this_platform():
+        return {"compression": "gzip", "compression_opts": 1, "shuffle": True}
     ck: dict[str, Any] = {"compression": compression}
     if compression == "gzip":
         ck["shuffle"] = True
     return ck
+
+
+def _lzf_unsafe_on_this_platform() -> bool:
+    """Return True for the h5py/HDF5 platform class known to bus-error on lzf."""
+    return sys.platform == "darwin" and platform.machine().lower() in {
+        "arm64",
+        "aarch64",
+    }
 
 
 # ---------------------------------------------------------------------------

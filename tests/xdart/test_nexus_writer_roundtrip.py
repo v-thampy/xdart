@@ -361,13 +361,13 @@ def test_integrated_2d_nxdata(written_nxs):
     assert g["chi"].attrs.get("units") in ("deg", "rad")
 
 
-def test_gui_integrated_stacks_use_fast_compression(written_nxs):
+def test_gui_integrated_stacks_avoid_lzf_compression(written_nxs):
     import h5py
 
     with h5py.File(written_nxs, "r") as f:
-        assert f["entry/integrated_1d/intensity"].compression == "lzf"
-        assert f["entry/integrated_1d/sigma"].compression == "lzf"
-        assert f["entry/integrated_2d/intensity"].compression == "lzf"
+        assert f["entry/integrated_1d/intensity"].compression is None
+        assert f["entry/integrated_1d/sigma"].compression is None
+        assert f["entry/integrated_2d/intensity"].compression is None
 
 
 def test_gi_nonuniform_stacked_2d_writer_stays_strict(tmp_path):
