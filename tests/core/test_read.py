@@ -495,6 +495,43 @@ def test_read_image_stack_reduces_hdf5_without_stack_materialization(
     )
 
 
+def test_read_image_stack_reduces_fabio_files_without_stack_materialization(
+    monkeypatch, tmp_path
+):
+    from xrd_tools.io import image as image_mod
+    from xrd_tools.io.image import read_image_stack
+
+    image_path = tmp_path / "raw_stack.tif"
+    calls = []
+    frames = [
+        np.array([[1.0, np.nan], [3.0, 4.0]], dtype=np.float32),
+        np.array([[2.0, np.nan], [5.0, 6.0]], dtype=np.float32),
+        np.array([[np.inf, np.nan], [7.0, np.nan]], dtype=np.float32),
+    ]
+
+    def fail_stack(*args, **kwargs):
+        raise AssertionError("read_image_stack(reduce=...) must fold by frame")
+
+    def fake_count(path):
+        assert path == image_path
+        return len(frames)
+
+    def fake_read(path, frame=0, **kwargs):
+        assert path == image_path
+        calls.append(frame)
+        return frames[frame]
+
+    monkeypatch.setattr(image_mod, "_read_fabio_stack", fail_stack)
+    monkeypatch.setattr(image_mod, "count_frames", fake_count)
+    monkeypatch.setattr(image_mod, "read_image", fake_read)
+
+    np.testing.assert_allclose(
+        read_image_stack(image_path, reduce="sum"),
+        np.nansum(np.stack(frames), axis=0),
+    )
+    assert calls == [0, 1, 2]
+
+
 # ---------------------------------------------------------------------------
 # write_scan_metadata: full per-frame metadata survives a read-back
 # ---------------------------------------------------------------------------
