@@ -134,6 +134,36 @@ def test_cake_image_routes_eviction_to_aggregate():
     assert calls == [("2d", "average")]           # routed to the aggregate
 
 
+def test_plot_payload_routes_overall_eviction_to_1d_aggregate():
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xrd_tools.io import Aggregated1D
+    q = np.linspace(0.5, 3.0, NQ)
+    agg = Aggregated1D(
+        q=q,
+        intensity=np.full(NQ, 15.5),
+        q_unit="q_A^-1",
+        n_frames=30,
+    )
+    calls = []
+    widget = SimpleNamespace(
+        scan=SimpleNamespace(name="scan"),
+        _whole_scan_aggregate=lambda *, dim, method: calls.append((dim, method)) or agg,
+        ui=SimpleNamespace(
+            plotUnit=SimpleNamespace(currentIndex=lambda: 0, currentText=lambda: "Q (Å⁻¹)"),
+            slice=SimpleNamespace(isChecked=lambda: False),
+        ),
+    )
+    adapter = PublicationDisplayAdapter(store=None, widget=widget)
+    state = _fake_state(overall=True, selected_ids=(0,), render_ids=(), method="Average")
+    payload = adapter.integration_plot_payload(state)
+    assert payload is not None
+    assert calls == [("1d", "average")]
+    assert len(payload.traces) == 1
+    np.testing.assert_allclose(payload.traces[0].x, q)
+    np.testing.assert_allclose(payload.traces[0].y, 15.5)
+
+
 def test_cake_image_blanks_non_overall_eviction():
     # A non-Overall (explicit subset) selection with an evicted frame must still
     # blank — the aggregate is whole-scan only, not an arbitrary subset.

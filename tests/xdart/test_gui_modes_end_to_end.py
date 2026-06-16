@@ -950,13 +950,11 @@ def test_int_plot_native_update_plot_state(widget, method, frame_ids):
 
 @pytest.mark.parametrize("method, expected", [("Average", 2.0), ("Sum", 6.0)])
 def test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames(widget, method, expected):
-    # P1 end-to-end (codex/other-claude review): past max_heavy_items the bounded
-    # store evicts old frames while the UNBOUNDED data_1d keeps them, so render_ids
-    # (the store|data_1d OR-merge) still lists them.  A whole-scan Sum/Average must
-    # aggregate ALL frames via the legacy fallback, not just the store-resident
-    # subset.  Frames carry int_1d intensity 1,2,3 -> Average==2.0 / Sum==6.0; the
-    # bug returned the last resident frame (3.0).  Models the two-cache production
-    # state the shipped unit test missed.
+    # Stub-scan fallback gate: when the bounded store evicts old frames but no
+    # on-disk aggregate exists (this fixture has no data_file), Sum/Average must
+    # still cover ALL selected frames via the remaining legacy fallback, not just
+    # the store-resident subset.  The production long-scan path is covered by
+    # test_aggregation_wiring.py and routes through _whole_scan_aggregate.
     from xdart.modules.frame_publication import _semilight_publication
     w = widget
     df = _set_int_scan(w, n=3)
@@ -978,9 +976,8 @@ def test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames(widget, m
 
     df.update()
 
-    # One collapsed curve (not a waterfall), equal to the aggregate over ALL three
-    # frames -- proving the payload fell back to the legacy update_plot, which read
-    # the full selection from data_1d.
+    # One collapsed curve (not a waterfall), equal to the aggregate over ALL
+    # three frames via the no-data-file fallback.
     assert len(df.curves) == 1
     _cx, cy = df.curves[0].getData()
     np.testing.assert_allclose(np.asarray(cy, dtype=float), np.full(5, expected))

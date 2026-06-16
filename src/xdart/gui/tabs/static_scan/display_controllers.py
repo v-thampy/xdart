@@ -82,14 +82,15 @@ def _candidate_labels(mode, selected_ids, all_frame_index):
     return tuple(selected_ids)
 
 
-def _data_snapshot(widget, *, labels=None):
+def _data_snapshot(widget, *, labels=None, include_legacy=True):
     """Snapshot loaded keys + per-frame raw/thumbnail availability.
 
-    X1 (Phase 3a): the PublicationStore is the primary source; the legacy
-    dict caches fill gaps while they still exist.  Availability flags are
-    OR-merged per frame — the old dict-overwrite let a LIGHTWEIGHT
-    publication (payload evicted) downgrade ``has_raw`` for a frame whose
-    full array was still hydrated in ``data_2d``.
+    X1 (Phase 3a): the PublicationStore is the primary source.  Viewer modes
+    still opt into the legacy dict caches because they are row/file browsers
+    rather than scan-display publications.  Normal Int 1D/2D modes do NOT
+    OR-merge those mirrors into readiness anymore: doing so hid store eviction
+    from the render decision and kept the old unbounded ``data_1d`` mirror as an
+    implicit source of truth.
     """
     store = getattr(widget, "publication_store", None)
     loaded_1d, loaded_2d, raw_avail = set(), set(), {}
@@ -98,6 +99,9 @@ def _data_snapshot(widget, *, labels=None):
         loaded_1d |= pub_1d
         loaded_2d |= pub_2d
         raw_avail.update(pub_raw)
+    if not include_legacy:
+        return loaded_1d, loaded_2d, raw_avail
+
     label_filter = None if labels is None else {_label_key(label) for label in labels}
     with widget.data_lock:
         if label_filter is None:
@@ -195,7 +199,14 @@ class _BaseController:
         all_index, gi = self._all_frame_index(widget)
         selected_ids = list(widget.frame_ids)
         labels = _candidate_labels(mode, selected_ids, all_index)
-        loaded_1d, loaded_2d, raw_avail = _data_snapshot(widget, labels=labels)
+        store = getattr(widget, "publication_store", None)
+        loaded_1d, loaded_2d, raw_avail = _data_snapshot(
+            widget,
+            labels=labels,
+            include_legacy=(
+                store is None or mode not in (Mode.INT_1D, Mode.INT_2D)
+            ),
+        )
         return compute_display_state(
             mode=mode,
             selected_ids=selected_ids,

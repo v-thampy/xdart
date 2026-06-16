@@ -1119,12 +1119,11 @@ def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():
 
 def test_plot_payload_falls_back_when_store_evicted_even_if_render_ids_lists_it():
     # P1 (codex/other-claude review): the bounded store evicts older frames' 1D
-    # arrays (max_heavy_items), but render_ids OR-merges the store with the
-    # UNBOUNDED legacy data_1d (display_controllers._data_snapshot), so render_ids
-    # can still LIST a store-evicted frame — a render_ids gate would wrongly pass.
-    # The store-only available_1d_keys() gate must fall back to legacy update_plot
-    # (which hydrates the full selection from disk); otherwise a whole-scan
-    # Sum/Average/Overall silently drops the evicted frames.
+    # arrays (max_heavy_items).  Even if a caller hands in a state whose
+    # render_ids still list those labels, plot_payload must check the store
+    # itself and refuse to collapse a resident-only subset.  In production,
+    # Overall Sum/Average is filled by the on-disk aggregate; this low-level
+    # test keeps the store-only guard locked.
     store = PublicationStore(max_heavy_items=1)
     for i in (0, 1, 2):
         f = DuckFrame(idx=i)
@@ -1136,9 +1135,8 @@ def test_plot_payload_falls_back_when_store_evicted_even_if_render_ids_lists_it(
     assert not store.get(0).view.has_1d          # 0,1 thinned out of the store
     assert store.get(2).view.has_1d              # 2 stays resident
     adapter = _adapter(store, _int_widget())
-    # Build the state as PRODUCTION does: loaded keys include the evicted frames
-    # (the unbounded data_1d backstop), so render_ids == selected_ids — the
-    # render_ids gate would PASS, but the store can't serve 0,1.
+    # Build the state as a stale/legacy caller might: render_ids == selected_ids,
+    # but the store can't serve 0,1.
     for method in ("Average", "Sum", "Single"):
         state = compute_display_state(
             mode=Mode.INT_1D, selected_ids=(0, 1, 2), all_frame_index=[0, 1, 2],
@@ -1146,7 +1144,7 @@ def test_plot_payload_falls_back_when_store_evicted_even_if_render_ids_lists_it(
             plot_unit="q_A^-1", method=method, unit_changed=False,
             prev_overlaid_ids=(), raw_availability={}, titles={},
             generation=store.generation)
-        assert set(state.render_ids) == {0, 1, 2}   # OR-merge masks the eviction
+        assert set(state.render_ids) == {0, 1, 2}   # stale state masks eviction
         assert adapter.plot_payload(state) is None  # store-only gate -> fall back
     # an all-resident selection still builds the payload (the flip applies).
     assert adapter.plot_payload(_int_state(store, ids=(2,), method="Single")) is not None

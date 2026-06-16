@@ -318,8 +318,7 @@ class PublicationDisplayAdapter:
         display_ids = _display_ids_for_2d(state)
 
         # Eviction guard.  For Sum/Average the cake aggregates the WHOLE intended
-        # set, so check store residency against selected_ids (render_ids OR-merges
-        # the bounded legacy data_2d and would mask eviction) and serve the on-disk
+        # set, so check store residency against selected_ids and serve the on-disk
         # aggregate (Step 7b) when a frame is evicted — else blank, never average a
         # wrong subset (review_2026-06-15 §2.C).  For Single/Overlay/Waterfall the
         # cake shows only the current frame, so guard just that one (None => blank;
@@ -474,6 +473,41 @@ class PublicationDisplayAdapter:
             return None
         return ImagePayload(image=image, axis_x=axis_x, axis_y=axis_y)
 
+    def _aggregate_plot_payload(self, state):
+        """Whole-scan 1D Sum/Average from the on-disk aggregate (Step 7b).
+
+        This is the 1D counterpart to :meth:`_aggregate_cake_payload`: when an
+        Overall Sum/Average selection is larger than the bounded heavy store,
+        the display must aggregate the complete primary on-disk stack plus the
+        unflushed tail, never the resident subset and never the legacy
+        unbounded ``data_1d`` mirror.  The widget owns async dispatch/caching via
+        ``_whole_scan_aggregate``; ``None`` means "not ready this render".
+        """
+        if getattr(state, "method", None) not in ("Sum", "Average"):
+            return None
+        if not getattr(state, "overall", False):
+            return None
+        widget = self._widget
+        if widget is None or not hasattr(widget, "_whole_scan_aggregate"):
+            return None
+        method = "sum" if state.method == "Sum" else "average"
+        agg = widget._whole_scan_aggregate(dim="1d", method=method)
+        if agg is None or agg.intensity is None:
+            return None
+        x = np.asarray(agg.q, dtype=float)
+        y = np.asarray(agg.intensity, dtype=float)
+        if x.shape != y.shape or x.size == 0 or not np.isfinite(y).any():
+            return None
+        axis = _axis_for_publication(
+            SimpleNamespace(unit=agg.q_unit, label="Q", values=x)
+        )
+        scan = getattr(widget, "scan", None)
+        scan_name = getattr(scan, "name", "") or "scan"
+        return PlotPayload(
+            axis_x=axis,
+            traces=(Trace(label=f"{state.method} [{scan_name}]", x=x, y=y),),
+        )
+
     def plot_payload(self, state):
         # Step 5 FLIP: the integration 1D plot now draws from the publication
         # record's active .view (see integration_plot_payload).  Single/Sum/
@@ -543,27 +577,25 @@ class PublicationDisplayAdapter:
             source == "1d_2d" and _slice_enabled(widget)
         )
 
-        # Eviction parity (Step 5, codex/other-claude P1): defer the WHOLE draw to
-        # the legacy update_plot (which hydrates every selected frame from disk via
-        # get_frames_int_1d) when ANY intended frame is not resident in the
-        # publication STORE — otherwise a whole-scan Sum/Average/Overall would
-        # SILENTLY drop the evicted frames.  Check STORE-ONLY residency per selected
-        # frame, NOT state.render_ids: render_ids OR-merges the store with the
-        # UNBOUNDED legacy data_1d (display_controllers._data_snapshot), so on a
-        # >max_heavy_items scan it still lists evicted frames and masks the
-        # eviction.  selected_ids holds the full intended set for both overall
-        # (= all_frame_index) and explicit selections (resolve_selection).  Done
-        # per selected frame (O(selection)) rather than building the whole store's
-        # available-key set (O(store)) so a single-frame live render stays O(1).
+        # Eviction parity (Step 7b): when any intended 1D frame is not resident
+        # in the publication STORE, Overall Sum/Average should use the complete
+        # on-disk aggregate.  Other non-resident selections return None so the
+        # remaining legacy fallback/hydration path can handle explicit subsets
+        # without silently dropping frames.  selected_ids holds the full intended
+        # set for both overall (= all_frame_index) and explicit selections.
         for label in state.selected_ids:
             pub = self._items.get(_label_key(label))
             if pub is None:
-                return None
+                aggregate = (
+                    self._aggregate_plot_payload(state) if not needs_2d else None
+                )
+                return aggregate
             if needs_2d:
                 if not pub.view.has_2d or publication_has_2d_errors(pub):
                     return None
             elif not pub.view.has_1d or publication_has_1d_errors(pub):
-                return None
+                aggregate = self._aggregate_plot_payload(state)
+                return aggregate
 
         traces = []
         axis = None

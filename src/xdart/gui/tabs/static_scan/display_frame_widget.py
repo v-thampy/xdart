@@ -907,7 +907,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         if (len(self.frame_ids) == 0) or (self.scan.name == 'null_main'):
             return False
-        if (len(self.data_1d) == 0) or (len(self.idxs_1d) == 0):
+
+        if len(self.idxs_1d) == 0:
+            return False
+
+        store = getattr(self, 'publication_store', None)
+        if store is not None:
+            try:
+                if any(store.get(int(idx)) is not None for idx in self.idxs_1d):
+                    return True
+            except Exception:
+                logger.debug("publication-store readiness check failed",
+                             exc_info=True)
+
+        if len(self.data_1d) == 0:
             return False
 
         return True
