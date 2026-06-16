@@ -22,7 +22,7 @@ from .display_constants import (
     AA_inv, Th, Chi, Deg,
     x_labels_1D, x_units_1D,
 )
-from .display_logic import plan_overlay, OverlayAction, pretty_unit
+from .display_logic import plan_overlay, OverlayAction, pretty_unit, nanmean_slice
 
 logger = logging.getLogger(__name__)
 
@@ -541,7 +541,12 @@ class DisplayPlotMixin:
             self.setup_curves()
             s_ydata = ydata
             if self.plotMethod == 'Average':
-                s_ydata = np.nanmean(s_ydata, 0)
+                # nanmean_slice suppresses "Mean of empty slice" when a column is
+                # all-NaN across the selected frames (GI empty bins) — the NaN gap
+                # is kept, just not warned.  (Sum's nansum doesn't warn.)
+                reduced = nanmean_slice(s_ydata, 0)
+                if reduced is not None:
+                    s_ydata = reduced
             elif self.plotMethod == 'Sum':
                 s_ydata = np.nansum(s_ydata, 0)
 

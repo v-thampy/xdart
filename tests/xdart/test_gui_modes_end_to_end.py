@@ -986,6 +986,40 @@ def test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames(widget, m
     np.testing.assert_allclose(np.asarray(cy, dtype=float), np.full(5, expected))
 
 
+def test_average_all_nan_column_does_not_warn(widget):
+    # Vivek: Average/Sum over GI frames with an all-NaN q-bin (empty/padded bins)
+    # warned "Mean of empty slice" at the update_1d_view collapse.  The collapse
+    # must use nanmean_slice (no warning; the NaN gap is kept).
+    import warnings as _w
+    from xrd_tools.core import IntegrationResult1D
+    from xdart.modules.frame_publication import publication_from_live_frame
+    w = widget
+    df = _set_int_scan(w, n=3)
+    q = np.linspace(0.5, 3.0, 5)
+    w.publication_store.clear()
+    with w.data_lock:
+        for i in range(3):
+            inten = np.ones_like(q) + i
+            inten[2] = np.nan                       # q-bin 2 all-NaN across frames
+            f = w.data_1d[i]
+            f.int_1d = IntegrationResult1D(
+                radial=q, intensity=inten, sigma=np.ones_like(q), unit="q_A^-1")
+            w.publication_store.upsert(publication_from_live_frame(f))
+    df.ui.plotMethod.setCurrentText("Average")
+    df.ui.plotUnit.setCurrentIndex(0)
+    w.frame_ids[:] = ["0", "1", "2"]
+    df.frame_ids = ["0", "1", "2"]
+    df.idxs_1d = [0, 1, 2]
+    df.idxs_2d = [0, 1, 2]
+    with _w.catch_warnings():
+        _w.filterwarnings("error", message="Mean of empty slice")
+        df.update()
+    _cx, cy = df.curves[0].getData()
+    cy = np.asarray(cy, dtype=float)
+    assert np.isnan(cy[2])                           # empty bin stays a gap
+    np.testing.assert_allclose(cy[[0, 1, 3, 4]], 2.0)  # others = mean(1,2,3)
+
+
 @pytest.mark.parametrize("method", ["Overlay", "Waterfall"])
 def test_int_plot_accumulating_modes_characterize_update_plot_state(widget, method):
     # Overlay/Waterfall are intentionally update_plot-live today because they
