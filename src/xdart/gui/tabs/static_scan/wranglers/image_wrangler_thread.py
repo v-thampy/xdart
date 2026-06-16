@@ -576,6 +576,21 @@ class imageThread(wranglerThread):
         self._prefetch_thread = None
         self._prefetch_stop_evt = None
         self._prefetch_error = None
+        # Per-run perf accumulators -> [PERF-SUMMARY] at end of run.  Breaks the
+        # worker time into consumer read(queue-wait)/integrate/write + the actual
+        # background prefetch I/O, so ONE run shows the bottleneck (read vs
+        # integrate vs write) without bisecting.  Written by _process_one (main
+        # thread) and _prefetch_worker (bg thread) on disjoint keys.
+        self._perf = {
+            # collect/flush level (runs for BOTH the streaming and serial paths):
+            'collect_read': 0.0,      # main-thread queue-wait on the prefetcher
+            'dispatch': 0.0,          # _dispatch_batch: reduce + write for the chunk
+            'dispatch_frames': 0,
+            'prefetch_io': 0.0,       # actual background HDF5 block I/O
+            'prefetch_frames': 0,
+            # serial-path per-frame breakdown (only populated by _process_one):
+            'frame': 0.0, '1d': 0.0, '2d': 0.0, 'h5': 0.0, 'csv': 0.0, 'n': 0,
+        }
         self.detector = get_detector(self.poni.detector) if self.poni.detector else None
         self.sub_label = ''
         det_mask = self.detector.mask if self.detector is not None else None  # pyFAI .mask property
@@ -609,6 +624,31 @@ class imageThread(wranglerThread):
             self._prefetch_stop_prior()
             self._eiger_close_master()  # ensure Eiger handle is released
         logger.info('Total Time: %.2fs', time.time() - t0)
+        _perf = getattr(self, '_perf', None)
+        if _perf and (_perf['dispatch_frames'] or _perf['prefetch_frames'] or _perf['n']):
+            _df = max(_perf['dispatch_frames'], 1)
+            _pf = max(_perf['prefetch_frames'], 1)
+            # collect_read = main-thread queue-wait on the prefetcher; dispatch =
+            # reduce+write per chunk; prefetch_io = real background HDF5 block I/O.
+            # If collect_read ~= prefetch_io the bottleneck is raw read; if dispatch
+            # dominates it's reduce/write.
+            logger.info(
+                '[PERF-SUMMARY] dispatch_frames=%d | collect_read(queue-wait)=%.2fs '
+                'dispatch(reduce+write)=%.2fs | prefetch_io=%.2fs (%d frames, %.1f ms/frame)'
+                ' | per-frame ms: read=%.1f dispatch=%.1f',
+                _perf['dispatch_frames'], _perf['collect_read'], _perf['dispatch'],
+                _perf['prefetch_io'], _perf['prefetch_frames'],
+                _perf['prefetch_io'] / _pf * 1e3,
+                _perf['collect_read'] / _df * 1e3, _perf['dispatch'] / _df * 1e3,
+            )
+            if _perf['n']:   # serial path only: per-frame integrate/write split
+                _n = _perf['n']
+                logger.info(
+                    '[PERF-SUMMARY serial] %d frames: frame_init=%.2fs int_1d=%.2fs '
+                    'int_2d=%.2fs h5_write=%.2fs csv=%.2fs',
+                    _n, _perf['frame'], _perf['1d'], _perf['2d'], _perf['h5'],
+                    _perf['csv'],
+                )
         # Final echo so the user can copy the output path straight from
         # the terminal without scrolling back to the per-scan banner.
         # Trailing newline gives a visual gap before the next scan's
@@ -782,10 +822,16 @@ class imageThread(wranglerThread):
                     )
                 _t_disp = time.time()
                 files_processed += self._dispatch_batch(scan, pending)
+                _disp_dt = time.time() - _t_disp
+                _perf = getattr(self, '_perf', None)
+                if _perf is not None:
+                    _perf['collect_read'] += _t_read_accum
+                    _perf['dispatch'] += _disp_dt
+                    _perf['dispatch_frames'] += len(pending)
                 if self.batch_mode or _t_read_accum >= 0.5:
                     logger.info(
                         '[FLUSH] %d frames  read=%.2fs  dispatch=%.2fs',
-                        len(pending), _t_read_accum, time.time() - _t_disp,
+                        len(pending), _t_read_accum, _disp_dt,
                     )
                 pending = []
                 _t_read_accum = 0.0
@@ -797,9 +843,15 @@ class imageThread(wranglerThread):
             files_processed += self._dispatch_batch(
                 scan, pending, force_save=True,
             )
+            _disp_dt = time.time() - _t_disp
+            _perf = getattr(self, '_perf', None)
+            if _perf is not None:
+                _perf['collect_read'] += _t_read_accum
+                _perf['dispatch'] += _disp_dt
+                _perf['dispatch_frames'] += len(pending)
             logger.info(
                 '[FLUSH-FINAL] %d frames  read=%.2fs  dispatch=%.2fs',
-                len(pending), _t_read_accum, time.time() - _t_disp,
+                len(pending), _t_read_accum, _disp_dt,
             )
         elif (scan is not None and not self.xye_only
               and self._frames_since_save > 0 and self.command != 'stop'):
@@ -1952,6 +2004,14 @@ class imageThread(wranglerThread):
         _t_csv = time.time() - _t5
 
         _t_total = t_read + _t_frame + _t_1d + _t_2d + _t_h5_total + _t_csv
+        _perf = getattr(self, '_perf', None)
+        if _perf is not None:
+            _perf['frame'] += _t_frame
+            _perf['1d'] += _t_1d
+            _perf['2d'] += _t_2d
+            _perf['h5'] += _t_h5_total
+            _perf['csv'] += _t_csv
+            _perf['n'] += 1
         # Merged per-frame line: timing + the user-facing "processed
         # <file>" annotation.  3-decimal precision so sub-10ms
         # components (in-memory add_frame, XYE buffer append) don't
@@ -2192,6 +2252,10 @@ class imageThread(wranglerThread):
                         )
                         break  # outer loop will resume with sync reader
                     _t_blk = time.time() - _t_blk
+                    _perf = getattr(self, '_perf', None)
+                    if _perf is not None:
+                        _perf['prefetch_io'] += _t_blk
+                        _perf['prefetch_frames'] += (end - start)
                     # If a bulk read takes >50ms it can fight with the
                     # consumer for memory bandwidth — log so we can
                     # correlate against [TIMING] spikes on the consumer.
