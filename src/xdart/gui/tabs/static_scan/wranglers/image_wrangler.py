@@ -7,6 +7,7 @@
 import logging
 import os
 import fnmatch
+import time
 import numpy as np
 from pathlib import Path
 
@@ -289,6 +290,7 @@ class imageWrangler(wranglerWidget):
         self.img_dir = self.parameters.child('Signal').child('img_dir').value()
         self.include_subdir = self.parameters.child('Signal').child('include_subdir').value()
         self.img_ext = self.parameters.child('Signal').child('img_ext').value()
+        self._img_dir_probe_cache = (None, None, 0.0)
         self.single_img = True if self.inp_type == 'Single Image' else False
         self.file_filter = self.parameters.child('Signal').child('Filter').value()
         self.series_average = self.parameters.child('Signal').child('series_average').value()
@@ -1317,6 +1319,49 @@ class imageWrangler(wranglerWidget):
             self.parameters.child('Signal').child('img_dir').setValue(path)
         self.img_dir = path
 
+    def _find_image_directory_seed(self, match, suffix):
+        """Return the first usable image-directory frame with a short cache.
+
+        ``setup()`` is connected to the whole parameter tree, so one user edit
+        can call this several times in a burst. Re-walking a large image
+        directory on every signal blocks the GUI; this cache coalesces only that
+        burst (sub-second TTL) and still rescans on later Start/setup calls.
+        """
+        key = (
+            self.img_dir,
+            suffix.lower(),
+            bool(self.include_subdir),
+            self.file_filter,
+            self.meta_ext,
+            self.meta_dir,
+            self.poni_file,
+        )
+        now = time.monotonic()
+        cached_key, cached_value, cached_at = self._img_dir_probe_cache
+        if cached_key == key and (now - cached_at) <= 0.5:
+            return cached_value
+
+        found = None
+        for _idx, (subdir, _dirs, files) in enumerate(os.walk(self.img_dir)):
+            for file in files:
+                fname = os.path.join(subdir, file)
+                if not (
+                    file.lower().endswith(suffix.lower())
+                    and match(file[:-len(suffix)])
+                ):
+                    continue
+                if not match_img_detector(fname, self.poni):
+                    continue
+                if self.meta_ext and not self.exists_meta_file(fname):
+                    continue
+                found = fname
+                break
+            if found is not None or (not self.include_subdir):
+                break
+
+        self._img_dir_probe_cache = (key, found, now)
+        return found
+
     def get_img_fname(self):
         """Sets file name based on chosen options
         """
@@ -1346,28 +1391,12 @@ class imageWrangler(wranglerWidget):
             match = _name_filter(self.file_filter)
             suffix = f'.{self.img_ext}'
 
-            file_found = False
-            for idx, (subdir, dirs, files) in enumerate(os.walk(self.img_dir)):
-                for file in files:
-                    fname = os.path.join(subdir, file)
-                    if (file.lower().endswith(suffix.lower())
-                            and match(file[:-len(suffix)])):
-                        if match_img_detector(fname, self.poni):
-                            if self.meta_ext:
-                                if self.exists_meta_file(fname):
-                                    self.img_file = fname
-                                    file_found = True
-                                    break
-                                else:
-                                    continue
-                            else:
-                                self.img_file = fname
-                                # Auto-detect metadata sidecar if not set
-                                if not self.meta_ext:
-                                    self.detect_meta_ext(fname)
-                                break
-                if file_found or (not self.include_subdir):
-                    break
+            fname = self._find_image_directory_seed(match, suffix)
+            if fname:
+                self.img_file = fname
+                # Auto-detect metadata sidecar if not set
+                if not self.meta_ext:
+                    self.detect_meta_ext(fname)
 
         if ((self.img_file != old_fname)
                 or (self.img_file and (len(self.scan_parameters) < 1))):
