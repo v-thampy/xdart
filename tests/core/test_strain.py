@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import numpy as np
 import pytest
 
@@ -15,6 +17,9 @@ from xrd_tools.analysis.strain import (
     sin2psi_analysis,
 )
 from xrd_tools.core.containers import IntegrationResult2D
+
+
+_HAS_LMFIT = importlib.util.find_spec("lmfit") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +113,7 @@ class TestExtractChiSectors:
 # ---------------------------------------------------------------------------
 
 class TestFitPeakVsPsi:
+    @pytest.mark.skipif(not _HAS_LMFIT, reason="requires lmfit")
     def test_fits_converge(self):
         result2d = _make_synthetic_polar_map(noise_level=2.0)
         sectors = extract_chi_sectors(result2d, n_sectors=8, chi_width=8.0)
@@ -133,6 +139,7 @@ class TestFitPeakVsPsi:
 # ---------------------------------------------------------------------------
 
 class TestSin2PsiRegression:
+    @pytest.mark.skipif(not _HAS_LMFIT, reason="requires lmfit")
     def test_recovers_slope(self):
         """The regression should recover the injected d vs sin²ψ slope."""
         known_slope = 0.02
@@ -163,6 +170,7 @@ class TestSin2PsiRegression:
 # ---------------------------------------------------------------------------
 
 class TestSin2PsiAnalysis:
+    @pytest.mark.skipif(not _HAS_LMFIT, reason="requires lmfit")
     def test_end_to_end(self):
         result2d = _make_synthetic_polar_map(slope=0.015, noise_level=1.0)
         reg = sin2psi_analysis(

@@ -821,9 +821,9 @@ class IntegrationResult2D:
     def __post_init__(self) -> None:
         self.radial = np.asarray(self.radial, dtype=float)
         self.azimuthal = np.asarray(self.azimuthal, dtype=float)
-        self.intensity = np.asarray(self.intensity, dtype=np.float32)
+        self.intensity = np.asarray(self.intensity, dtype=float)
         if self.sigma is not None:
-            self.sigma = np.asarray(self.sigma, dtype=np.float32)
+            self.sigma = np.asarray(self.sigma, dtype=float)
         if self.intensity.ndim != 2:
             raise ValueError("intensity must be a 2D array")
         nr, naz = len(self.radial), len(self.azimuthal)

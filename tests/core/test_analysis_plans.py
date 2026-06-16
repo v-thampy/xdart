@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 
 import numpy as np
@@ -20,6 +21,9 @@ import xrd_tools.analysis.plans as plan_mod
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.scan import Scan, ScanFrame
 from xrd_tools.sources import MemoryFrameSource
+
+
+_HAS_LMFIT = importlib.util.find_spec("lmfit") is not None
 
 
 def _r1d(value: float = 1.0) -> IntegrationResult1D:
@@ -169,6 +173,7 @@ def test_peak_fit_plan_and_result_envelope_are_json_safe(monkeypatch):
     assert data["provenance"]["plan"]["fit_kwargs"]["method"] == "leastsq"
 
 
+@pytest.mark.skipif(not _HAS_LMFIT, reason="requires lmfit")
 def test_peak_fit_plan_runs_real_synthetic_peak():
     x = np.linspace(0.0, 3.0, 301)
     y = 2.0 + 0.2 * x + 50.0 * np.exp(-0.5 * ((x - 1.25) / 0.08) ** 2)
@@ -192,6 +197,7 @@ def test_peak_fit_plan_runs_real_synthetic_peak():
     assert result.payload.peak_centers[0] == pytest.approx(1.25, abs=0.01)
 
 
+@pytest.mark.skipif(not _HAS_LMFIT, reason="requires lmfit")
 def test_sin2psi_plan_runs_real_synthetic_map():
     q = np.linspace(1.75, 2.25, 241)
     chi = np.linspace(-60.0, 60.0, 25)
