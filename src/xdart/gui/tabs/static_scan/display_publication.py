@@ -298,6 +298,21 @@ class PublicationDisplayAdapter:
         if panel is None or not panel.has_data:
             return None
 
+        # §2.C Overall eviction parity (review_2026-06-15): mirror the 1D guard
+        # in integration_plot_payload.  The cake must NOT silently average only
+        # the store-resident subset when the intended set (selected_ids) includes
+        # an evicted frame.  render_ids OR-merges the store with the bounded
+        # legacy data_2d, so it cannot reveal eviction; check STORE-ONLY
+        # residency per selected frame.  CAKE_2D has no legacy fallback (a None
+        # payload blanks the panel via clear_binned_view), so this is the
+        # "blank, do not average-wrong" the review asks for — correct until the
+        # on-disk 2D aggregation (Step 7b) fills a >max_heavy Overall cake.  Do
+        # NOT relax this guard.
+        for label in state.selected_ids:
+            pub = self._items.get(_label_key(label))
+            if pub is None or not pub.view.has_2d or publication_has_2d_errors(pub):
+                return None
+
         accum = None
         count = 0
         axis_x = axis_y = None

@@ -986,6 +986,28 @@ def test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames(widget, m
     np.testing.assert_allclose(np.asarray(cy, dtype=float), np.full(5, expected))
 
 
+def test_evicted_overall_cake_blanks_not_subset(widget):
+    # §2.C (review_2026-06-15, P1): a 2D Overall cake must NOT silently average
+    # only the store-resident subset when an intended frame was evicted.  Unlike
+    # the 1D plot (which falls back to the unbounded data_1d), CAKE_2D has no
+    # legacy fallback — a None payload BLANKS — so the honest behavior past the
+    # heavy bound is to blank until on-disk 2D aggregation lands, never to draw a
+    # wrong subset average.
+    from xdart.modules.frame_publication import _semilight_publication
+    w = widget
+    df = _set_int_scan(w, n=3)            # all 3 selected -> Overall
+    df.update()
+    assert df.binned_data is not None     # all resident -> cake drawn
+    store = df.publication_store
+    with store._lock:                     # evict ONE intended frame from the store
+        store._items[0] = _semilight_publication(store._items[0])
+    assert not store.get(0).view.has_2d
+
+    df.update()
+
+    assert df.binned_data is None         # blanked, not a 2-frame subset average
+
+
 def test_average_all_nan_column_does_not_warn(widget):
     # Vivek: Average/Sum over GI frames with an all-NaN q-bin (empty/padded bins)
     # warned "Mean of empty slice" at the update_1d_view collapse.  The collapse
