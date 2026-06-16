@@ -1,4 +1,6 @@
 > **HISTORICAL:** pre-architecture-v2 plan (2026 Q2); kept for provenance — the stitching work it describes has partially landed; see docs/design/roadmap_2026-06-10.md for current status.
+>
+> **SUPERSEDED (2026-06-14) for the stitching design by [`docs/design/design_stitching_jun2026.md`](../design/design_stitching_jun2026.md).** The NeXus-schema portions of this plan have landed (see `io/schema.py`, `io/nexus.py`); the stitching portions are re-specified against the monorepo / arch-v2 in the new doc. Kept for provenance only.
 
 # Nexus + Stitching Refactor — Branch Plan & TODO Spec
 
