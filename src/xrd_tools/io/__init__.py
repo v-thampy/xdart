@@ -69,6 +69,12 @@ from xrd_tools.io.read import (
     relative_source_path,
     resolve_source_master,
 )
+from xrd_tools.io.aggregate import (
+    Aggregated1D,
+    Aggregated2D,
+    aggregate_1d,
+    aggregate_2d,
+)
 from xrd_tools.io.frame_view import (
     FrameViewReader,
     iter_frame_records,
