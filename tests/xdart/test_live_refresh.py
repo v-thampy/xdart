@@ -3605,14 +3605,12 @@ def test_share_axis_maps_by_unit_not_combo_index():
     assert host.ui.plotUnit.currentText().startswith("2")
     assert host.ui.plotUnit._enabled is False
     assert host.ui.shareAxis.isEnabled() is True
-    # Restored align-then-lock contract (f93cb78): on click the 1D adopts the
-    # cake's numeric x-range for instant feedback, then a deferred geometric
-    # align pads the 1D margins until the spans match and only THEN engages the
-    # (bidirectional, geometry-mapped) XLink.  On a duck host the deferred align
-    # never runs, so the range is adopted but the link stays detached.
+    # Share contract: a pure geometry x-RANGE mirror (cake -> 1D) that freezes the
+    # 1D y-axis and scales only the x-extent; the align is deferred (needs real
+    # widget geometry) and the native XLink is never engaged (it would force EQUAL
+    # ranges = misaligned columns).  On a duck host the deferred align never runs.
     assert host._share_link_on is True
-    assert host.plot.xrange == (2.0, 6.0)      # adopted the cake's range
-    assert host.plot.link is None              # XLink deferred to geometric convergence
+    assert host.plot.link is None
 
 
 def test_share_axis_disables_when_no_matching_plot_unit():

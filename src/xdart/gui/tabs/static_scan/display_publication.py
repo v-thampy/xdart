@@ -183,6 +183,19 @@ def _label_keys(labels) -> tuple:
     return tuple(keys)
 
 
+def _display_ids_for_2d(state) -> tuple:
+    """Frames the 2D cake / raw panel should render (Vivek's contract).
+
+    Only Sum/Average AGGREGATE the whole selection; Single/Overlay/Waterfall show
+    just the CURRENT (latest-selected) frame — lighter, and the cake/raw track the
+    selected frame instead of an average.  ``render_ids`` is sorted ascending, so
+    ``[-1]`` is the latest (the live Auto-Last frame, or the single browsed frame)."""
+    ids = tuple(state.render_ids)
+    if getattr(state, "method", None) in ("Sum", "Average"):
+        return ids
+    return ids[-1:]
+
+
 class PublicationDisplayAdapter:
     """Resolve display payload fragments from a publication snapshot."""
 
@@ -239,7 +252,8 @@ class PublicationDisplayAdapter:
 
         accum = None
         count = 0
-        for label in state.render_ids:
+        display_ids = _display_ids_for_2d(state)   # current frame, or all for Sum/Average
+        for label in display_ids:
             publication = self._items.get(_label_key(label))
             if publication is None:
                 continue
@@ -271,7 +285,7 @@ class PublicationDisplayAdapter:
 
         if accum is None or count == 0:
             return None
-        if state.overall and count != len(state.render_ids):
+        if state.overall and count != len(display_ids):
             return None
 
         image = accum / count
@@ -299,23 +313,22 @@ class PublicationDisplayAdapter:
         if panel is None or not panel.has_data:
             return None
 
-        # §2.C Overall eviction parity (review_2026-06-15): mirror the 1D guard
-        # in integration_plot_payload.  The cake must NOT silently average only
-        # the store-resident subset when the intended set (selected_ids) includes
-        # an evicted frame.  render_ids OR-merges the store with the bounded
-        # legacy data_2d, so it cannot reveal eviction; check STORE-ONLY
-        # residency per selected frame.  CAKE_2D has no legacy fallback (a None
-        # payload blanks the panel via clear_binned_view), so this is the
-        # "blank, do not average-wrong" the review asks for — correct until the
-        # on-disk 2D aggregation (Step 7b) fills a >max_heavy Overall cake.  Do
-        # NOT relax this guard.
-        for label in state.selected_ids:
+        # The cake renders the CURRENT frame for Single/Overlay/Waterfall and the
+        # aggregate only for Sum/Average (Vivek's contract, _display_ids_for_2d).
+        display_ids = _display_ids_for_2d(state)
+
+        # Eviction guard.  For Sum/Average the cake aggregates the WHOLE intended
+        # set, so check store residency against selected_ids (render_ids OR-merges
+        # the bounded legacy data_2d and would mask eviction) and serve the on-disk
+        # aggregate (Step 7b) when a frame is evicted — else blank, never average a
+        # wrong subset (review_2026-06-15 §2.C).  For Single/Overlay/Waterfall the
+        # cake shows only the current frame, so guard just that one (None => blank;
+        # the hydration worker rehydrates an evicted current frame and re-renders).
+        guard_ids = (state.selected_ids
+                     if state.method in ("Sum", "Average") else display_ids)
+        for label in guard_ids:
             pub = self._items.get(_label_key(label))
             if pub is None or not pub.view.has_2d or publication_has_2d_errors(pub):
-                # Evicted past the heavy bound: a whole-scan (Overall) cake is
-                # served from the on-disk aggregate (Step 7b) instead of blanking;
-                # an explicit subset with an evicted frame still blanks (the
-                # aggregate is whole-scan only).  None => blank, never wrong-subset.
                 return self._aggregate_cake_payload(state)
 
         accum = None
@@ -323,7 +336,7 @@ class PublicationDisplayAdapter:
         axis_x = axis_y = None
         ref_view = None
         ref_publication = None
-        for label in state.render_ids:
+        for label in display_ids:
             publication = self._items.get(_label_key(label))
             if (
                 publication is None
@@ -355,7 +368,7 @@ class PublicationDisplayAdapter:
 
         if accum is None or count == 0 or axis_x is None or axis_y is None:
             return None
-        if state.overall and count != len(state.render_ids):
+        if state.overall and count != len(display_ids):
             return None
 
         image = accum / count
@@ -417,11 +430,14 @@ class PublicationDisplayAdapter:
         """Whole-scan (Overall) cake from the on-disk aggregate (Step 7b) when
         frames are evicted past the heavy store bound — the §2.C blank, filled.
 
-        Returns ``None`` (blank) for a non-Overall selection, a GI / non-primary
-        mode, or until the off-thread aggregate is ready (it re-renders on
-        completion).  Axes come from a resident frame's view when one exists (the
-        frozen common grid makes them identical, and it carries the imageUnit
-        Q↔2θ toggle); else they are built from the aggregate's own q/χ."""
+        Returns ``None`` (blank) for a non-Overall selection, a non-Sum/Average
+        method (Single/Overlay/Waterfall show the current frame, never the
+        aggregate), a GI / non-primary mode, or until the off-thread aggregate is
+        ready (it re-renders on completion).  Axes come from a resident frame's
+        view when one exists (the frozen common grid makes them identical, and it
+        carries the imageUnit Q↔2θ toggle); else from the aggregate's own q/χ."""
+        if getattr(state, "method", None) not in ("Sum", "Average"):
+            return None
         if not getattr(state, "overall", False):
             return None
         widget = self._widget

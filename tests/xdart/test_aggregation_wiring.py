@@ -100,9 +100,10 @@ def test_widget_whole_scan_aggregate_defers_for_gi(tmp_path):
 
 # ── adapter routing: cake_image -> _aggregate_cake_payload ─────────────────────
 
-def _fake_state(*, overall, selected_ids, render_ids=()):
+def _fake_state(*, overall, selected_ids, render_ids=(), method="Average"):
     return SimpleNamespace(
         overall=overall,
+        method=method,
         selected_ids=tuple(selected_ids),
         render_ids=tuple(render_ids),
         panel=lambda role: SimpleNamespace(has_data=True, source=None),

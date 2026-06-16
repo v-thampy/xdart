@@ -987,17 +987,19 @@ def test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames(widget, m
 
 
 def test_evicted_overall_cake_blanks_not_subset(widget):
-    # §2.C (review_2026-06-15, P1): a 2D Overall cake must NOT silently average
-    # only the store-resident subset when an intended frame was evicted.  Unlike
-    # the 1D plot (which falls back to the unbounded data_1d), CAKE_2D has no
-    # legacy fallback — a None payload BLANKS — so the honest behavior past the
-    # heavy bound is to blank until on-disk 2D aggregation lands, never to draw a
-    # wrong subset average.
+    # §2.C (review_2026-06-15, P1): an Average/Sum Overall cake must NOT silently
+    # average only the store-resident subset when an intended frame was evicted.
+    # CAKE_2D has no legacy fallback — a None payload BLANKS — and the on-disk
+    # aggregate is unavailable here (stub scan, no data_file), so it blanks rather
+    # than draw a wrong subset average.  (Overlay/Single show the current frame,
+    # not the aggregate — that path is exercised elsewhere; this is the Average
+    # path where the §2.C guard + aggregate fallback apply.)
     from xdart.modules.frame_publication import _semilight_publication
     w = widget
     df = _set_int_scan(w, n=3)            # all 3 selected -> Overall
+    df.ui.plotMethod.setCurrentText("Average")   # aggregate path (not current-frame)
     df.update()
-    assert df.binned_data is not None     # all resident -> cake drawn
+    assert df.binned_data is not None     # all resident -> cake drawn (average)
     store = df.publication_store
     with store._lock:                     # evict ONE intended frame from the store
         store._items[0] = _semilight_publication(store._items[0])

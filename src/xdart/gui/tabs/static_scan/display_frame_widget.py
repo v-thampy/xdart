@@ -1300,21 +1300,21 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return False
 
     def _set_share_link(self, on: bool) -> None:
-        """Share Axis: align the 1D under the cake on click, THEN lock (f93cb78).
+        """Share Axis: FREEZE the 1D y-axis and scale the 1D x-EXTENT so the shared
+        Q columns line up under the cake (the cake is never touched).
 
-        On first click the cake is NOT touched: the 1D adopts the cake's numeric
-        x-range (which is already in the cake's x-axis unit — _apply_share_axis_state
-        re-points plotUnit) for instant feedback, then the 1D's layout margins are
-        padded until its viewbox occupies the SAME screen x-span as the cake's, so a
-        Q value on the 1D sits vertically below the same Q on the cake.  Once the
-        spans are equal the native pyqtgraph XLink is engaged — at equal spans the
-        geometry-mapped link IS an exact numeric lock, bidirectional (zoom either,
-        both follow).  The 1D's continuous x-auto-range is held off while shared so
-        render refits never drag the cake; margins restore on unshare.
-
-        NOTE: this is the restored align-then-lock (commit f93cb78); 4055654 had
-        reverted it to a bare XLink, which links the DATA range but not the screen
-        geometry, so the panes scaled together but didn't line up vertically."""
+        Per Vivek's spec the 1D's y-axis must NOT move.  Earlier fixes
+        (e29c070/f93cb78) padded the 1D's layout margins to match screen spans,
+        which shifted the y-axis to the middle of the pane (the regression Vivek
+        flagged); 4055654's bare XLink links the DATA range but not the screen
+        geometry cross-widget, so the panes never lined up.  Instead we set the 1D's
+        x-RANGE geometrically: the 1D pane is wider and its y-axis sits further left
+        than the cake's plot area (which is pushed right by the cake's y-axis +
+        colorbar), so the 1D simply shows a WIDER range -- extending to negative Q on
+        the left -- and a Q on the 1D sits directly below the same Q on the cake with
+        the y-axis frozen in place.  The align runs deferred (the layout must settle
+        first), re-runs on resize, and re-runs whenever the cake's x-range changes
+        (zoom/pan) so the columns stay aligned -- the cake drives the 1D."""
         ip = getattr(getattr(self, 'binned_widget', None),
                      'image_plot', None)
         get_vb = getattr(ip, 'getViewBox', None)
@@ -1324,35 +1324,32 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         already = getattr(self, '_share_link_on', False)
         if on and not already:
             self._share_link_on = True
-            try:
-                self._share_saved_margins = tuple(
-                    self.plot.layout.getContentsMargins())
-            except Exception:
-                self._share_saved_margins = None
-            # Immediate numeric adopt for instant feedback, then the geometric
-            # align; once the two viewboxes occupy the SAME screen span, _align
-            # engages setXLink (an exact, bidirectional numeric lock at equal spans).
-            displayFrameWidget._mirror_cake_xrange(
-                self, vb, vb.viewRange()[0])
+            # Track the cake's x-range so a zoom/pan re-aligns the 1D.  getattr
+            # so duck holders (which don't bind the slot) just skip the connect.
+            handler = getattr(self, '_on_cake_xrange_changed', None)
+            if handler is not None:
+                self._share_cake_handler = handler   # stable ref for disconnect
+                try:
+                    vb.sigXRangeChanged.connect(handler)
+                except Exception:
+                    logger.debug("share-axis connect failed", exc_info=True)
             displayFrameWidget._schedule_align(self)
         elif not on and already:
             self._share_link_on = False
-            self.plot.setXLink(None)
-            saved = getattr(self, '_share_saved_margins', None)
-            if saved is not None:
+            handler = getattr(self, '_share_cake_handler', None)
+            if handler is not None:
                 try:
-                    self.plot.layout.setContentsMargins(*saved)
-                except Exception:
-                    logger.debug("share margin restore failed", exc_info=True)
+                    vb.sigXRangeChanged.disconnect(handler)
+                except (TypeError, RuntimeError):
+                    pass
+                self._share_cake_handler = None
+            # Detach; _on_share_axis_toggled re-arms the 1D's own autorange.
+            self.plot.setXLink(None)
 
-    def _mirror_cake_xrange(self, _vb, xrange) -> None:
-        """Adopt the cake's numeric x-range on the 1D plot (y stays auto)."""
-        try:
-            self.plot.enableAutoRange(x=False, y=True)
-            self.plot.setXRange(float(xrange[0]), float(xrange[1]),
-                                padding=0)
-        except Exception:
-            logger.debug("share-axis mirror failed", exc_info=True)
+    def _on_cake_xrange_changed(self, *args) -> None:
+        """Re-align the 1D under the cake whenever the cake's x-range changes."""
+        if getattr(self, '_share_link_on', False):
+            displayFrameWidget._schedule_align(self)
 
     def _schedule_align(self) -> None:
         if getattr(self, '_align_pending', False):
@@ -1365,11 +1362,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         Qt.QtCore.QTimer.singleShot(0, _go)
 
     def _align_plot_under_cake(self) -> None:
-        """Geometric half of Share Axis: pad the 1D plot's layout margins so
-        its viewbox occupies the SAME screen x-span as the cake's -- a Q
-        value on the 1D sits vertically below the same Q on the cake.  The
-        1D shrinks/expands; the cake is never touched.  Converges (no-op
-        within 1px), so re-running on every mirror/resize is safe."""
+        """Set the 1D plot's x-RANGE so the shared Q values land at the same screen
+        columns as the cake, WITHOUT moving the 1D's y-axis (no margin changes).
+
+        The cake maps data->screen over its viewbox span [cx0, cx1] showing range
+        [cq0, cq1]; we set the 1D's range so its data->screen map coincides over the
+        1D's own (wider, further-left) span [px0, px1].  The 1D y-axis is frozen
+        (x-auto off, y-auto on); the cake is never touched.  Idempotent + convergent,
+        so re-running on every cake range change / resize is safe."""
         try:
             if not getattr(self, '_share_link_on', False):
                 return
@@ -1379,6 +1379,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if (cake_win is None or plot_win is None
                     or not cake_win.isVisible() or not plot_win.isVisible()):
                 return
+            cvb = bw.image_plot.getViewBox()
+            pvb = self.plot.getViewBox()
 
             def _gspan(win, vb):
                 r = vb.sceneBoundingRect()
@@ -1387,23 +1389,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     win.mapFromScene(r.bottomRight())).x()
                 return float(left), float(right)
 
-            cl, cr = _gspan(cake_win, bw.image_plot.getViewBox())
-            pl, pr = _gspan(plot_win, self.plot.getViewBox())
-            dl, dr = cl - pl, pr - cr
-            if abs(dl) <= 1.0 and abs(dr) <= 1.0:
-                # Converged: spans equal, so the native (bidirectional)
-                # XLink is now an exact numeric lock.  Engage it (idempotent)
-                # and adopt the cake's range through it.
-                self.plot.setXLink(bw.image_plot)
-                self.plot.enableAutoRange(x=False, y=True)
+            cx0, cx1 = _gspan(cake_win, cvb)
+            px0, px1 = _gspan(plot_win, pvb)
+            if (cx1 - cx0) <= 1.0 or (px1 - px0) <= 1.0:
                 return
-            lay = self.plot.layout
-            ml, mt, mr, mb = lay.getContentsMargins()
-            lay.setContentsMargins(max(0.0, ml + dl), mt,
-                                   max(0.0, mr + dr), mb)
-            lay.activate()      # recompute NOW so a follow-up align (or a
-                                # queued one) reads fresh geometry, not stale
-            displayFrameWidget._schedule_align(self)   # converge (<=1px no-op)
+            xr = cvb.viewRange()[0]
+            cq0, cq1 = float(xr[0]), float(xr[1])
+            scale = (cq1 - cq0) / (cx1 - cx0)        # data units per screen pixel
+            pq0 = cq0 - (cx0 - px0) * scale          # 1D extends left (often negative Q)
+            pq1 = cq0 + (px1 - cx0) * scale          # ...and a touch past the cake on the right
+            self.plot.enableAutoRange(x=False, y=True)   # freeze x (we set it); keep y auto
+            self.plot.setXRange(pq0, pq1, padding=0)     # extends into negative Q (no floor now)
         except Exception:
             logger.debug("share-axis geometric align failed", exc_info=True)
 
@@ -1468,13 +1464,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     raise
                 logger.debug("render: viewer draw of %s failed", role, exc_info=True)
 
-        # Keep the 1D x-axis off unphysical negative Q/2theta (auto-range
-        # padding only; the data itself is >= 0 — see _floor_plot_xaxis).
-        # getattr: the render_display unit-tests bind this method onto a
-        # SimpleNamespace holder that doesn't define the display-polish helpers.
-        _floor = getattr(self, '_floor_plot_xaxis', None)
-        if _floor is not None:
-            _floor()
+        # (Removed _floor_plot_xaxis: it floored the 1D x-axis at 0 to hide the
+        # spurious negative-Q flat line from ZERO-filled GI-pad bins.  Those empty
+        # bins are now NaN (gid._nan_empty_1d, 165fb7b) so they aren't plotted and
+        # autoRange ignores them; the floor is obsolete AND it clamped the Share
+        # Axis geometry alignment, which legitimately extends into negative Q.)
 
         # 2D title + image-preview popup (normal mode; viewer draw methods
         # set their own title).  Skip on a non-READY (EMPTY/ERROR) state —
@@ -1833,28 +1827,6 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.plot.enableAutoRange()  # re-arm continuous tracking
         except Exception:
             logger.debug("1D autoscale on unit change failed", exc_info=True)
-        self._floor_plot_xaxis()
-
-    def _floor_plot_xaxis(self):
-        """Stop the 1D auto-range from padding into an UNPHYSICAL negative
-        x-region (pyFAI returns Q/2theta/q_total >= 0; autoRange pads ~5-10%
-        left of the data, which dips below 0).
-
-        Data-driven so it stays correct for the signed GI in-plane q (q_ip CAN
-        be negative): floor the view's ``xMin`` at 0 only when the plotted data
-        is non-negative, and release the floor otherwise.  ``setLimits`` is a
-        sticky constraint that ``autoRange``/``enableAutoRange`` respect, so the
-        floor survives continuous live re-ranging until the data goes negative.
-        """
-        try:
-            vb = self.plot.getViewBox()
-            xb = vb.childrenBounds()[0]   # data x-bounds [min, max] or None
-            if xb is not None and xb[0] is not None and xb[0] >= -1e-9:
-                vb.setLimits(xMin=0.0)
-            else:
-                vb.setLimits(xMin=None)
-        except Exception:
-            logger.debug("1D x-axis floor failed", exc_info=True)
 
     # ── 2D image rendering ────────────────────────────────────────
 
@@ -2055,6 +2027,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         label = self.scan.name
         if len(label) > 40:
             label = f'{label[:18]}...{label[-18:]}'
+
+        # Single/Overlay/Waterfall: the cake + raw show the CURRENT (latest-
+        # selected) frame (see _display_ids_for_2d), so the title shows that
+        # frame's number -- not the bare name / "[Average]".  Only Sum/Average
+        # show the aggregate (handled by the chain below).  single_img scans have
+        # no per-frame index, so they keep the bare-name title.
+        method = getattr(self, 'plotMethod', '') or ''
+        if method not in ('Sum', 'Average') and not self.scan.single_img:
+            idxs = getattr(self, 'idxs_2d', None) or getattr(self, 'idxs_1d', None) or []
+            if idxs:
+                self.ui.labelCurrent.setText(f'{label}_{idxs[-1]}')
+                return
 
         if (self.overall or self.scan.single_img) and (len(self.frame_ids) > 1):
             self.ui.labelCurrent.setText(label)
