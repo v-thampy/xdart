@@ -79,6 +79,16 @@ def _build_scan_on_disk(tmp_path, N, nq=8, nchi=6):
 
 
 class TestCrossFrame2DHydration:
+    def test_get_int_2d_no_normalize_returns_source_view(self):
+        scan = SimpleNamespace(frames=SimpleNamespace(index=[0]))
+        host = _make_host(scan, data_2d={})
+        result = _ir2d(4.0, nq=4, nchi=3)
+
+        data = host.get_int_2d(result, normalize=False)
+
+        assert np.shares_memory(data, result.intensity)
+        np.testing.assert_allclose(data, result.intensity)
+
     def test_store_backed_scan_reads_do_not_need_legacy_mirrors(self):
         from xdart.modules.frame_publication import (
             PublicationStore,

@@ -647,7 +647,7 @@ class DisplayDataMixin:
                         "selection grid; excluded from the average.", idx)
                     continue
                 try:
-                    intensity = intensity + _i
+                    intensity += _i
                 except (ValueError, AttributeError, TypeError):
                     continue
             ctr += 1
@@ -658,7 +658,7 @@ class DisplayDataMixin:
         if intensity is None or ctr == 0:
             return None, None, None
 
-        intensity = intensity / ctr
+        intensity /= ctr
         return intensity, xdata, ydata
 
     # G2: get_scan_int_2d was deleted.  It read scan.bai_2d, an
@@ -676,8 +676,12 @@ class DisplayDataMixin:
         if int_2d is None:
             return np.zeros((1, 1))
         # int_2d is always the correct result (GI or standard)
-        intensity_2d = int_2d.intensity
-        intensity = np.asarray(intensity_2d.copy(), dtype=float)
+        intensity_2d = np.asarray(int_2d.intensity)
+        intensity = (
+            intensity_2d.astype(float, copy=True)
+            if normalize
+            else intensity_2d
+        )
 
         if normalize:
             if frame_1d is not None:

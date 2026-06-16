@@ -35,6 +35,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | Fresh review follow-up — aggregate retry, source IDs, norm aliases, docs | this checkpoint | ✅ async Overall aggregate `None` is retryable rather than cached as final; known-vs-missing source IDs no longer merge records; whole-scan norm channels resolve case/alias-insensitively; stale LZF/payload docs refreshed |
 | Wave 5 A3/A4 prep — store-first legacy render reads | this checkpoint | ✅ normal Int 1D/2D legacy draw helpers now prefer `PublicationStore`/`FrameRecord` rows and fall back to the bounded mirrors only for thinned/semilight transition rows; explicit store-backed display test added |
 | Wave 5 A3/A4 prep — store-first preview/mask lookups | this checkpoint | ✅ raw-panel mask lookup and image preview now consult the publication store before the transition mirrors; legacy plot drawing no longer refuses to draw just because `data_1d` is empty when the store has rows |
+| I4 partial — reduce 2D render copies | this checkpoint | ✅ 2D cake aggregation accumulates in-place and `get_int_2d(normalize=False)` returns a source view for slice/projection readers instead of copying the full cake |
 
 **Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_gui_modes_end_to_end.py`,
@@ -63,6 +64,9 @@ The preview/mask follow-up passed `tests/xdart/test_display_cross_frame_2d.py`,
 `tests/xdart/test_gui_modes_end_to_end.py::test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames`,
 `tests/xdart/test_gui_modes_end_to_end.py::test_int_plot_native_update_plot_state`,
 and `tests/xdart/test_frame_publication.py` (`84 passed`).
+The I4 copy-reduction slice passed `tests/xdart/test_display_cross_frame_2d.py`,
+`tests/xdart/test_gui_modes_end_to_end.py::test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames`,
+and `tests/xdart/test_frame_publication.py` (`81 passed`).
 
 **Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is
 a safer pre-live-checkpoint boundary: publication-store-first display, bounded mirrors, and tests for the
