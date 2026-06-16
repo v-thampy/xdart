@@ -1429,6 +1429,8 @@ def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
     publication = viewer.publication_store.get(3)
     assert publication is not None
     assert publication.view.has_1d
+    assert viewer.data_1d == {}
+    assert viewer.data_2d == {}
 
     frame = _Frame()
     frame.idx = 4
@@ -1437,6 +1439,8 @@ def test_absorb_chunk_populates_publication_store_for_1d_and_2d():
     assert publication is not None
     assert publication.view.has_1d
     assert publication.view.has_2d
+    assert viewer.data_1d == {}
+    assert viewer.data_2d == {}
 
 
 def test_absorb_chunk_skips_invalid_2d_cache_but_keeps_1d_publication(caplog):
@@ -1490,13 +1494,13 @@ def test_absorb_chunk_skips_invalid_2d_cache_but_keeps_1d_publication(caplog):
 
     viewer._absorb_chunk(8, 12, _Frame(), True)
 
-    assert 12 in viewer.data_1d
+    assert 12 not in viewer.data_1d
     assert 12 not in viewer.data_2d
     publication = viewer.publication_store.get(12)
     assert publication is not None
     assert publication.view.has_1d
     assert publication_has_2d_errors(publication)
-    assert "Skipping frame 12 2D display cache" in caplog.text
+    assert "Skipping frame 12 2D publication" in caplog.text
 
 
 def test_gi_common_grid_freeze_yields_uniform_axes():

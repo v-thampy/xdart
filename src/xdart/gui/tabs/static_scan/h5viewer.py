@@ -2394,8 +2394,8 @@ class H5Viewer(QWidget):
 
     def _absorb_chunk(self, generation, idx, frame, load_2d) -> None:
         """Slot for ``_LoadFramesWorker.chunkLoaded``.  Runs on the
-        GUI thread; writes the loaded frame into the viewer dicts
-        under ``data_lock`` and emits ``sigUpdate`` so the display
+        GUI thread; publishes the loaded scan frame into
+        ``publication_store`` and emits ``sigUpdate`` so the display
         repaints incrementally.
 
         N1: drops the chunk silently when its ``generation`` no
@@ -2405,8 +2405,8 @@ class H5Viewer(QWidget):
         was mid-emit when the cancel was issued.  Queued Qt
         signals don't get clobbered by ``deleteLater``; they
         arrive on the GUI thread after the cancel.  Without this
-        check those stale frames would land in ``data_1d`` /
-        ``data_2d`` and pollute the current selection.
+        check those stale frames would land in the publication store
+        and pollute the current selection.
         """
         if generation != self._load_generation:
             logger.debug(
@@ -2421,13 +2421,28 @@ class H5Viewer(QWidget):
                 frame,
                 generation=(store.generation if store is not None else 0),
             )
+            frame_idx = int(idx)
+            has_2d_error = publication_has_2d_errors(publication)
+            if load_2d and has_2d_error:
+                logger.warning(
+                    "Skipping frame %s 2D publication: %s",
+                    idx,
+                    publication_error_details(publication, "2d"),
+                )
             with self.data_lock:
-                if not load_2d:
-                    self.data_1d[int(idx)] = frame.copy_for_display(include_2d=False)
+                if store is not None:
+                    # Scan display now reads through PublicationStore.  Drop
+                    # any stale legacy mirror rows for this frame so fallback
+                    # paths cannot accidentally see an older payload.
+                    self.data_1d.pop(frame_idx, None)
+                    self.data_2d.pop(frame_idx, None)
+                    store.upsert(publication)
+                elif not load_2d:
+                    self.data_1d[frame_idx] = frame.copy_for_display(include_2d=False)
                 else:
-                    self.data_1d[int(idx)] = frame.copy_for_display(include_2d=False)
-                    if not publication_has_2d_errors(publication):
-                        self.data_2d[int(idx)] = {
+                    self.data_1d[frame_idx] = frame.copy_for_display(include_2d=False)
+                    if not has_2d_error:
+                        self.data_2d[frame_idx] = {
                             'map_raw': frame.map_raw,
                             'bg_raw': frame.bg_raw,
                             'mask': frame.mask,
@@ -2436,16 +2451,9 @@ class H5Viewer(QWidget):
                             'thumbnail': frame.thumbnail,
                         }
                         if frame.map_raw is not None:
-                            self._remember_hydrated_raw(int(idx))
+                            self._remember_hydrated_raw(frame_idx)
                     else:
-                        self.data_2d.pop(int(idx), None)
-                        logger.warning(
-                            "Skipping frame %s 2D display cache: %s",
-                            idx,
-                            publication_error_details(publication, "2d"),
-                        )
-                if store is not None:
-                    store.upsert(publication)
+                        self.data_2d.pop(frame_idx, None)
             # O6: coalesce display updates while a chunk burst is
             # streaming in.  Schedule (or restart) a debounced emit
             # rather than firing once per chunk.  ``_on_load_worker_finished``

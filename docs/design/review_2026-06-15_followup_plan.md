@@ -550,9 +550,9 @@ that is Phase B (7a/7c/D3). The capability A3/A4 depends on already shipped in P
 refs), not the whole thing:
 - **Role-A — scan-integration cache (RETARGET → DELETE):** the integration-mode 1D/2D display, whole-scan
   Sum/Average/Overall, the raw-2D panel `map_raw`, TIFF export, the raw-panel mask, the image preview, and
-  `_snapshot_data`/availability. Writers: `frame.copy_for_display(...)` inserts at
-  `scan_threads.py:248-262` & `:660-662`, `static_scan_widget.py:723-733`,
-  `image_wrangler_thread.py:1953-1956`; the dict decls at `static_scan_widget.py:329-330`. Consumers:
+  `_snapshot_data`/availability. The scan-mode live handoff, serial wrangler processing, GUI reintegration,
+  and processed-scan lazy-load paths now publish through `PublicationStore` and do not refill the old
+  mirrors. Remaining work is consumer/fallback cleanup plus any genuinely dead legacy thread path. Consumers:
   `display_data.get_frames_*`/`_snapshot_data`, `display_controllers` (`map_raw` source ~133),
   `display_plot`, `metadata`, export.
 - **Role-B — viewer-mode arrays (KEEP):** Image/XYE/NeXus viewer plotting in `h5viewer.py` (the
@@ -576,8 +576,9 @@ refs), not the whole thing:
 
 ### A4 — delete (greenfield 8b)
 4. Stop the Role-A writers (the `copy_for_display` inserts). **Status:** scan-mode live hand-off,
-   serial wrangler processing, and GUI reintegration now publish to `PublicationStore` without
-   refilling the old mirrors; Role-B viewer inserts are intentionally untouched. `copy_for_display`
+   serial wrangler processing, GUI reintegration, and processed-scan lazy-load now publish to
+   `PublicationStore` without refilling the old mirrors; stale mirror rows for lazy-loaded scan frames are
+   actively cleared. Role-B viewer inserts are intentionally untouched. `copy_for_display`
    is also the **D2**
    thumbnail-copy source — if it has no Role-B consumer left, deleting it closes **D2** (the ≤256² float32
    thumbnail per 1D entry). Confirm the raw preview/thumbnail now sources from the store/payload first.
@@ -612,6 +613,10 @@ refs), not the whole thing:
 
 **Effort:** L. **Depends on:** A1 ✅, A2 ✅; C5's file_lock coordination already landed (only its test is
 owed, before the live checkpoint). Phase B (7a/7c/D3) NOT required and NOT in scope.
+
+**Latest offscreen gate (Wave 5 A4 lazy-load writer cleanup):**
+- `test_absorb_chunk_*` + stale/cancel stress: `5 passed`.
+- Display/store/live run focused suite: `91 passed`.
 
 ---
 
