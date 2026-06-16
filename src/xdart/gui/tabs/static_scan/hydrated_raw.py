@@ -32,10 +32,21 @@ HYDRATED_RAW_LIMIT = 8
 _ORDER_ATTR = "_hydrated_raw_order"
 
 
-def remember_hydrated_raw(data_2d, idx, limit: int = HYDRATED_RAW_LIMIT) -> None:
+def remember_hydrated_raw(
+    data_2d,
+    idx,
+    limit: int = HYDRATED_RAW_LIMIT,
+    *,
+    keep=(),
+) -> list[int]:
     """Mark ``idx`` most-recently hydrated; evict past ``limit``.
 
     Caller must hold the ``data_lock`` guarding ``data_2d``.
+
+    Returns the evicted labels so callers that mirror raw payloads in a
+    parallel cache (notably the Image Viewer rows) can release those too.
+    ``keep`` protects currently displayed labels even if the order is over
+    the nominal limit.
     """
     order = getattr(data_2d, _ORDER_ATTR, None)
     if order is None:
@@ -43,19 +54,27 @@ def remember_hydrated_raw(data_2d, idx, limit: int = HYDRATED_RAW_LIMIT) -> None
         try:
             setattr(data_2d, _ORDER_ATTR, order)
         except AttributeError:
-            return                      # plain dict (headless) — no shared cap
+            return []                   # plain dict (headless) — no shared cap
     idx = int(idx)
     if idx in order:
         order.remove(idx)
     order.append(idx)
     limit = max(1, int(limit))
+    keep_set = {int(k) for k in keep}
+    evicted = []
     while len(order) > limit:
-        stale = order.pop(0)
+        stale = next((candidate for candidate in order
+                      if candidate not in keep_set), None)
+        if stale is None:
+            break
+        order.remove(stale)
         payload = data_2d.get(stale)
         if payload is not None:
             payload["map_raw"] = None
             if "bg_raw" in payload:
                 payload["bg_raw"] = None   # full bg images pin like raws
+        evicted.append(stale)
+    return evicted
 
 
 def clear_hydrated_raw(data_2d) -> None:

@@ -3931,6 +3931,38 @@ def test_hydrated_raw_cache_evicts_only_full_resolution_payload():
     assert viewer.data_2d[1]["thumbnail"] is not None
 
 
+def test_image_viewer_raw_cache_evicts_reloadable_unselected_rows():
+    viewer = SimpleNamespace(
+        data_lock=RLock(),
+        _raw_cache_limit=2,
+        viewer_mode="image",
+        frame_ids=[],
+        data_1d={},
+        data_2d=_AttrDict(),
+    )
+    viewer._remember_hydrated_raw = MethodType(H5Viewer._remember_hydrated_raw, viewer)
+
+    for idx in (1, 2, 3, 4):
+        viewer.frame_ids = [str(idx)]
+        viewer.data_1d[idx] = SimpleNamespace(map_raw=np.full((2, 2), idx))
+        viewer.data_2d[idx] = {"map_raw": np.full((2, 2), idx)}
+        viewer._remember_hydrated_raw(idx)
+
+    assert sorted(viewer.data_1d) == [3, 4]
+    assert sorted(viewer.data_2d) == [3, 4]
+    assert _hydrated_order(viewer.data_2d) == [3, 4]
+
+    # If the user has an older row selected while a newer one hydrates, keep
+    # the selected image resident and evict the oldest unselected row instead.
+    viewer.frame_ids = ["3"]
+    viewer.data_1d[5] = SimpleNamespace(map_raw=np.full((2, 2), 5))
+    viewer.data_2d[5] = {"map_raw": np.full((2, 2), 5)}
+    viewer._remember_hydrated_raw(5)
+    assert sorted(viewer.data_1d) == [3, 5]
+    assert sorted(viewer.data_2d) == [3, 5]
+    assert _hydrated_order(viewer.data_2d) == [3, 5]
+
+
 def test_hydrated_raw_cache_reset_clears_order():
     data_2d = _AttrDict()
     data_2d._hydrated_raw_order = [1, 2, 3]

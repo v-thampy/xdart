@@ -1904,6 +1904,7 @@ class H5Viewer(QWidget):
                 return False
             img_data = np.asarray(res.image, dtype=float)
             thumb_data = img_data if res.source == 'thumbnail' else None
+            scan_info = {'source_file': os.path.basename(fpath)}
             with self.data_lock:
                 self.data_2d[int(frame_id)] = {
                     'map_raw': img_data,
@@ -1913,23 +1914,28 @@ class H5Viewer(QWidget):
                     'gi_2d': {},
                     'thumbnail': thumb_data,
                 }
-                frame = LiveFrame(
-                    idx=frame_id,
-                    map_raw=img_data,
-                    static=True,
-                    gi=False,
-                    scan_info={'source_file': os.path.basename(fpath)},
-                )
-                frame.thumbnail = thumb_data
-                frame.source_file = fpath
-                frame.source_frame_idx = frame_id
+                frame = _ViewerRow(idx=int(frame_id), scan_info=scan_info)
                 self.data_1d[int(frame_id)] = frame
                 store = getattr(self, "publication_store", None)
                 if store is not None:
+                    view = FrameView(
+                        label=int(frame_id),
+                        thumbnail=thumb_data,
+                        mask_baked=thumb_data is not None,
+                        metadata_raw=scan_info,
+                        metadata_numeric=numeric_metadata(scan_info),
+                        source_path=fpath,
+                        source_frame_index=frame_id,
+                    )
                     store.upsert(
-                        publication_from_live_frame(
-                            frame,
+                        publication_from_frame_view(
+                            view,
                             generation=store.generation,
+                            source_identity=str(fpath),
+                            raw_status=(
+                                "thumbnail"
+                                if thumb_data is not None else "evicted"
+                            ),
                         )
                     )
             # Bound the full-res raws (Image Viewer browsing loaded ~18 MB
@@ -1966,6 +1972,7 @@ class H5Viewer(QWidget):
                 return False
 
         with self.data_lock:
+            scan_info = {'source_file': os.path.basename(fpath)}
             self.data_2d[int(frame_id)] = {
                 'map_raw': img_data,
                 'bg_raw': np.zeros_like(img_data),
@@ -1974,23 +1981,26 @@ class H5Viewer(QWidget):
                 'gi_2d': {},
                 'thumbnail': None,
             }
-            # Minimal data_1d entry so display doesn't crash
-            frame = LiveFrame(
-                idx=frame_id,
-                map_raw=img_data,
-                static=True,
-                gi=False,
-                scan_info={'source_file': os.path.basename(fpath)},
-            )
-            frame.source_file = fpath
-            frame.source_frame_idx = frame_idx
+            # Lightweight row marker.  The raw pixels live in data_2d and are
+            # reloadable from _viewer_image_path, so never park them in
+            # data_1d/raw_ref.
+            frame = _ViewerRow(idx=int(frame_id), scan_info=scan_info)
             self.data_1d[int(frame_id)] = frame
             store = getattr(self, "publication_store", None)
             if store is not None:
+                view = FrameView(
+                    label=int(frame_id),
+                    metadata_raw=scan_info,
+                    metadata_numeric=numeric_metadata(scan_info),
+                    source_path=fpath,
+                    source_frame_index=frame_idx,
+                )
                 store.upsert(
-                    publication_from_live_frame(
-                        frame,
+                    publication_from_frame_view(
+                        view,
                         generation=store.generation,
+                        source_identity=str(fpath),
+                        raw_status="evicted",
                     )
                 )
         # Bound the full-res raws (Image Viewer browsing loaded ~18 MB per
@@ -2456,7 +2466,32 @@ class H5Viewer(QWidget):
         limit = max(1, int(getattr(self, "_raw_cache_limit",
                                    HYDRATED_RAW_LIMIT)))
         with self.data_lock:
-            remember_hydrated_raw(self.data_2d, idx, limit=limit)
+            keep = ()
+            if getattr(self, "viewer_mode", None) == "image":
+                keep = tuple(
+                    int(label) for label in getattr(self, "frame_ids", ())
+                    if str(label).lstrip("-").isdigit()
+                )
+            evicted = remember_hydrated_raw(
+                self.data_2d, idx, limit=limit, keep=keep,
+            )
+            if getattr(self, "viewer_mode", None) == "image":
+                keep_set = set(keep)
+                for stale in evicted:
+                    if stale in keep_set:
+                        continue
+                    self.data_2d.pop(stale, None)
+                    self.data_1d.pop(stale, None)
+            else:
+                data_1d = getattr(self, "data_1d", None)
+                if data_1d is None:
+                    return
+                for stale in evicted:
+                    frame = data_1d.get(stale)
+                    if frame is not None and hasattr(frame, "map_raw"):
+                        frame.map_raw = None
+                        if hasattr(frame, "bg_raw"):
+                            frame.bg_raw = None
 
     def _clear_raw_cache(self) -> None:
         """Reset the hydrated-raw LRU after data_2d is cleared."""
