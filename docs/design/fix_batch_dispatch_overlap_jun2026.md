@@ -68,6 +68,8 @@ start until the batch dispatches). Use it only to lock the diagnosis if desired;
 As of the N1 follow-up, **headless `run_reduction(..., sink=NexusSink/XYESink/...)` auto-selects the
 streaming `ReductionSession` path by default**. Memory/no-sink callers still default to chunked because
 `result.frames` is their product channel; durable sinks write the product externally and can stream safely.
+That same default durable-streaming path also drops each frame's raw/background image after the sink write,
+so the session keeps frame order/source metadata without pinning a full raw stack in memory.
 
 That headless streaming path calls `session.submit(frame)` with **no image**, and each worker reads+decodes
 its own frame lazily via `frame.load_image()` inside `_reduce_frame` (`core.py ~:2055`). So reads

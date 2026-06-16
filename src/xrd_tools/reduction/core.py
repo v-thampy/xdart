@@ -1470,7 +1470,7 @@ def run_reduction(
     sink: ReductionSink | Iterable[ReductionSink] | None = None,
     *,
     chunk_size: int = 1,
-    clear_frame_images: bool = False,
+    clear_frame_images: bool | None = None,
     progress_cb: ProgressCallback | None = None,
     cancel_token: CancelToken | None = None,
     executor: Any | None = None,
@@ -1497,8 +1497,10 @@ def run_reduction(
         ``"chunk"`` progress event over more frames but don't change
         the per-frame compute path.  Default 1.
     clear_frame_images
-        Set each frame's cached image to ``None`` after writing to the
-        sink.  Cheap memory bound for long lazy-loaded scans.
+        Set each frame's cached image/background to ``None`` after writing to
+        the sink.  ``None`` (default) auto-selects ``True`` for streaming
+        durable-sink runs and ``False`` otherwise.  Cheap memory bound for
+        long lazy-loaded scans.
     progress_cb
         Called as ``cb(ReductionProgress)`` after every stage.
     cancel_token
@@ -1539,6 +1541,8 @@ def run_reduction(
     durable_sink = not _sink_is_memory_only(sink_obj)
     if execution is None:
         execution = "streaming" if durable_sink else "chunked"
+    if clear_frame_images is None:
+        clear_frame_images = execution == "streaming" and durable_sink
     if retain_products is None:
         retain_products = not (execution == "streaming" and durable_sink)
     with ReductionSession(

@@ -112,9 +112,11 @@ def test_run_reduction_defaults_to_streaming_for_durable_sink(monkeypatch):
                         lambda image, ai, **kw: _r1d(float(np.sum(image))))
     main_thread = threading.get_ident()
     sink = _ThreadSpyDurableSink()
+    frames = _frames(4)
+    frames[0].background = np.ones((2, 2))
 
     result = run_reduction(
-        _plan(), Scan("durable", _frames(4), integrator=object()), sink=sink,
+        _plan(), Scan("durable", frames, integrator=object()), sink=sink,
     )
 
     assert sorted(sink.frames) == [0, 1, 2, 3]
@@ -122,6 +124,8 @@ def test_run_reduction_defaults_to_streaming_for_durable_sink(monkeypatch):
     assert result.frames == {}
     assert sink.write_threads
     assert all(thread != main_thread for thread in sink.write_threads)
+    assert all(frame.image is None for frame in frames)
+    assert frames[0].background is None
 
 
 def test_run_reduction_memory_sink_default_stays_chunked(monkeypatch):

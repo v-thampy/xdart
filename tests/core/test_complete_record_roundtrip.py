@@ -60,6 +60,8 @@ def small_ai():
 def test_headless_run_writes_complete_portable_record(project, tmp_path,
                                                       small_ai):
     root, frames = project
+    expected_raw_1 = np.asarray(frames[1].image).copy()
+    expected_raw_2 = np.asarray(frames[2].image).copy()
     out = root / "processed" / "scan.nxs"
     plan = ReductionPlan(
         integration_1d=Integration1DPlan(npt=50),
@@ -97,7 +99,8 @@ def test_headless_run_writes_complete_portable_record(project, tmp_path,
     from xrd_tools.io import get_raw_frame
     from xrd_tools.io.frame_view import read_frame_view
     raw = get_raw_frame(out, 1)
-    np.testing.assert_allclose(np.asarray(raw), np.asarray(frames[1].image))
+    np.testing.assert_allclose(np.asarray(raw), expected_raw_1)
+    assert frames[1].image is None
     fv = read_frame_view(out, 1)
     assert fv.thumbnail is not None
     assert fv.intensity_1d is not None and fv.intensity_1d.shape == (50,)
@@ -112,4 +115,4 @@ def test_headless_run_writes_complete_portable_record(project, tmp_path,
     shutil.move(str(root), str(moved))
     moved_out = moved / "processed" / "scan.nxs"
     raw2 = get_raw_frame(moved_out, 2)
-    np.testing.assert_allclose(np.asarray(raw2), np.asarray(frames[2].image))
+    np.testing.assert_allclose(np.asarray(raw2), expected_raw_2)
