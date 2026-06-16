@@ -1,6 +1,6 @@
 import h5py
 import threading
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 
 # Module-level singleton — import and use this from anywhere that needs
@@ -23,13 +23,19 @@ class H5FilePool:
     ``pause(path)`` before opening a file for writing and ``resume(path)``
     after closing it.  While paused, ``get(path)`` will **not** reopen the
     file, returning ``None`` instead.
+
+    ``pause``/``resume`` are **refcounted** (a Counter, not a plain flag): with
+    the 7+8 flush fan-out, two writers can hold the same file paused at once, so
+    a path stays paused until *every* pause has been matched by a resume.  A
+    plain set would let the first resume reopen the file mid-write of the second
+    writer.
     """
 
     def __init__(self, max_open=5):
         self._files = OrderedDict()  # {path_str: h5py.File}
         self._max = max_open
         self._lock = threading.Lock()
-        self._paused = set()  # paths that should not be (re)opened
+        self._paused = Counter()  # {path_str: pause depth} — refcounted
 
     def get(self, path):
         """Return open read-only file handle, or *None* if the path is paused.
@@ -38,7 +44,7 @@ class H5FilePool:
         """
         key = str(path)
         with self._lock:
-            if key in self._paused:
+            if self._paused[key]:        # Counter: 0 (falsey) for an unpaused key
                 return None
             if key in self._files:
                 self._files.move_to_end(key)
@@ -69,11 +75,12 @@ class H5FilePool:
     def pause(self, path):
         """Close the read handle *and* prevent ``get()`` from reopening it.
 
-        Call this before opening a file for writing.
+        Call this before opening a file for writing.  Refcounted: nested/
+        concurrent pauses stack and each must be matched by a ``resume``.
         """
         key = str(path)
         with self._lock:
-            self._paused.add(key)
+            self._paused[key] += 1
             if key in self._files:
                 try:
                     self._files.pop(key).close()
@@ -81,10 +88,15 @@ class H5FilePool:
                     pass
 
     def resume(self, path):
-        """Allow ``get()`` to open the file again after a write is done."""
+        """Drop one pause; allow ``get()`` to reopen only once ALL pauses for
+        this path have been resumed (refcount hits zero)."""
         key = str(path)
         with self._lock:
-            self._paused.discard(key)
+            depth = self._paused.get(key, 0)
+            if depth <= 1:
+                self._paused.pop(key, None)   # last (or unbalanced) resume
+            else:
+                self._paused[key] = depth - 1
 
     def close_all(self):
         with self._lock:
