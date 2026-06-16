@@ -10,10 +10,19 @@ see [`MIGRATION.md`](MIGRATION.md).
 
 ## Install
 
+**xdart (the GUI)** — the common install:
+
 ```bash
-pip install xrd-tools                 # headless core — no Qt anywhere
-pip install "xrd-tools[gui]"          # + the xdart GUI
+pip install "xrd-tools[gui]"          # the xdart GUI + reduction core
 uv tool install "xrd-tools[gui]"      # isolated GUI install
+```
+
+then launch with `xdart`.
+
+**Headless core only** (no Qt anywhere, `import xrd_tools`):
+
+```bash
+pip install xrd-tools
 ```
 
 Extras: `[gui]` PySide6/pyqtgraph + GUI deps, `[fitting]` pymatgen/lmfit,
