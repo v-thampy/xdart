@@ -14,16 +14,58 @@ adversarial verification pass (**20/21 commits clean; the 1 flagged item is a P3
 code defect**). No P0/P1/P2 issues and **no guardrail violations** (byte-compat, equivalence spine, strict
 validators, precision, single-writer thread-safety all intact).
 
+### 0.1 Codex follow-up landing status (2026-06-16, HEAD `61073ef`)
+
+After the `d034500` checkpoint, the remaining offscreen-safe pieces of this plan were taken one step
+further. The deliberately live-gated A3/A4 deletion was **not** forced; instead the scan display was
+moved toward the publication store while keeping bounded mirrors as a fallback until the live checkpoint.
+
+| Item | Commit | Status |
+|---|---|---|
+| A3/A4 prep — scan display prefers `PublicationStore` | `26eb7d4` | ✅ scan display no longer OR-merges legacy mirrors into readiness when a publication store is present; Overall aggregate payload can use the on-disk whole-scan aggregate path for evicted rows |
+| A3/A4 prep — bound scan-mode mirrors | `9fb96bb` | ✅ `data_1d` and `data_2d` are bounded recent-row mirrors in normal scan modes; viewer modes still keep their Role-B rows unbounded so Image/XYE/NeXus viewer behaviour is not collapsed accidentally |
+| QW1 cosmetic leftovers | `4e5433b` | ✅ legacy `update=` argument documented as accepted-but-ignored; stale `add_frame` wording cleaned up |
+| N4 P3 threshold-boundary coverage | `4e5433b` | ✅ `_resolve_keep_results("auto")` boundary test added |
+| C1 stale RSM scout wording | `4e5433b` | ✅ scout docstring updated from corner-only wording to detector-edge scout wording |
+| N3 weak streaming-regression guard | `322b11e` | ✅ Fabio-style `read_image_stack(..., reduce=...)` now has a test proving the stack reader is not materialized |
+| Review/design/perf notes | `cb8f1a2` | ✅ June 15 review, follow-up plan, and perf baseline committed |
+| Batch-final crash hardening | `33c518f` | ✅ first real batch flush now uses the writer's atomic replace path instead of mutating the skeleton `.nxs` in place; flat detector masks apply by direct flat assignment instead of GUI-thread `concat/unique/unravel` |
+| Review follow-up — 2D Sum aggregate + startup guard | `4b3564c` | ✅ evicted Overall `Sum` cakes now call the `sum` aggregate instead of silently rendering an average; `update_scattering_geometry` no longer raises if the GI signal fires before `self.scan` exists |
+| Native bus-error fix — avoid LZF stack writes on ARM64 macOS | `61073ef` | ✅ reverses GUI integrated-stack LZF compression and adds the same ARM64 macOS LZF→gzip guard to the shared NeXus writer helper; this mirrors the earlier `ssrl_xrd_tools` `9ff8bf0` bus-error mitigation |
+
+**Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
+`tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_gui_modes_end_to_end.py`,
+`tests/xdart/test_live_refresh.py`, `tests/xdart/test_display_cross_frame_2d.py`,
+`tests/xdart/test_scan_aggregate.py`, `tests/core/test_read.py`,
+`tests/core/test_phase_fitting_batch.py`, and `tests/core/test_rsm.py` passed in `xrd_test`
+(394 passed / 7 skipped for the broader targeted pass). The crash follow-up additionally passed
+`tests/xdart/test_qt_nexus_sink.py` + `tests/xdart/test_frame_publication.py` (79 passed) and the
+writer/live-refresh slice `tests/xdart/test_nexus_writer_roundtrip.py`,
+`tests/xdart/test_cadence_unified.py`, `tests/xdart/test_live_refresh.py` (317 passed / 1 skipped).
+The Sum-aggregate/startup-guard follow-up passed `tests/xdart/test_aggregation_wiring.py` +
+`tests/xdart/test_frame_publication.py` (71 passed) and the focused GUI aggregate slice
+(`16 passed / 151 deselected`). The native bus-error fix passed
+`tests/core/test_nexus.py::TestWriteNexus::test_compression_lzf_uses_safe_filter`,
+`tests/core/test_nexus.py::TestWriteNexus::test_compression_lzf_guard_maps_arm_macos_to_fast_gzip`,
+`tests/core/test_headless_write_roundtrip.py::test_write_integrated_stack_bulk_then_incremental`,
+`tests/xdart/test_nexus_writer_roundtrip.py`, and `tests/xdart/test_qt_nexus_sink.py`
+(`81 passed`).
+
+**Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is
+a safer pre-live-checkpoint boundary: publication-store-first display, bounded mirrors, and tests for the
+disk/tail aggregate path, but the legacy mirrors are still present until the live GUI verifies the next
+renderer/data-source flip.
+
 | Item | Commit | Status |
 |---|---|---|
 | QW1 bai accumulators | `151b516` | ✅ verified (cosmetic: dead `update=` param + garbled docstring `scan.py:358`) |
-| QW2 GUI stack compression | `beb5a00` | ✅ verified — byte-compat pin stayed green |
+| QW2 GUI stack compression | `beb5a00` → `61073ef` | ⊘ CLOSED-REVERSED — LZF stack compression reintroduced the known ARM64 macOS h5py/HDF5 bus-error class; GUI writer is intentionally uncompressed, while explicit headless LZF requests are guarded to fast gzip on affected platforms |
 | QW3 Eiger native dtype | `1641cd6` | ✅ verified — also *fixes* a latent uint16 saturation-ceiling bug |
 | QW4 batch kwargs split + QW5 zero-bg skip | `613feca` | ✅ verified |
 | QW6 prefetch metadata cache | `1641cd6` (bundled) | ✅ verified |
 | N1 stream durable reductions by default | `a9866cb` + `fcff59e` | ✅ verified |
-| N3 stream whole-stack loaders | `0a9aa52` | ✅ code correct — **weak streaming-regression test (P3)** |
-| N4 lightweight phase fits | `c9d6348` | ✅ verified (P3: add `_resolve_keep_results` threshold test) |
+| N3 stream whole-stack loaders | `0a9aa52` + `322b11e` | ✅ code correct + Fabio/HDF5 streaming-regression guards |
+| N4 lightweight phase fits | `c9d6348` + `4e5433b` | ✅ verified + auto-retention boundary test |
 | N5 streaming session retains every Frame | `fcff59e` (partial) | ◑ images released; light Frame-shell residual is **by-design** — revisit only if 10k-frame metadata RAM shows up |
 | **M1 float32 2D payload** | `d0c2996`→`d034500` | ⊘ **CLOSED-DECLINED** — float32 tried, reverted (strain/peak-fit precision). The transient float64 cake (`single.py:181`/`multi.py:212`) was never the change site; on-disk already downcasts to float32, so **no clean win remains**. Not "pending." |
 | M2 reuse corrected images for thumbnails | `3d5b8b4` | ✅ verified |
@@ -32,7 +74,7 @@ validators, precision, single-writer thread-safety all intact).
 | I3 lazy flat frame masks | `84e1f6b` | ✅ verified |
 | I5 bound image-viewer raw cache | `b070ac4` | ✅ verified |
 | I4 Overall double-pass/double-copy | — | ⏳ OPEN — sequence after Wave 5 (unchanged) |
-| C1 broaden RSM scout | `3216eb3` | ✅ verified bit-exact (P3: stale "4 corners" docstring `gridding.py:201`) |
+| C1 broaden RSM scout | `3216eb3` + `4e5433b` | ✅ verified bit-exact; stale scout wording fixed |
 | C2 reject texture for fixed-q | `6098074` | ✅ verified |
 | C3 surface reintegration save failures | `74038ae` | ✅ verified |
 | C4 guard session state flags | `b4e9990` | ✅ verified |
@@ -40,15 +82,14 @@ validators, precision, single-writer thread-safety all intact).
 | C6 RSM combine_grids streaming | `3216eb3` (bundled) | ✅ verified bit-exact |
 | Share Axis #2 + cake current-frame | `5c59077` | ✅ verified (P3: no test for the new multi-frame Single-Overlay cake path) |
 | N2 batch submit-per-read (rec. A) | — | ⏳ queued — after Phase A+B (`fix_batch_dispatch_overlap_jun2026.md`) |
-| **Wave 5 — A3/A4** (`data_1d`/`data_2d` retirement) | — | ⏳ not started — live-gated; the C5 prerequisite is now satisfied |
+| **Wave 5 — A3/A4** (`data_1d`/`data_2d` retirement) | `26eb7d4` + `9fb96bb` partial | ◑ offscreen prep landed; final Role-A deletion remains live-gated |
 
-**Residual P3 follow-ups (none blocking):** N3 streaming-regression test guard (patch `_read_fabio_stack`
-too, or assert per-frame read count); N4 threshold-boundary test; C1 stale docstring + a numeric-equivalence
-assertion in the combine_grids test; a multi-frame Single-Overlay cake test (Share Axis commit); QW1
-cosmetic leftovers (dead `update=` param, garbled `add_frame` docstring).
+**Residual P3 follow-ups (none blocking):** multi-frame Single-Overlay cake test (Share Axis commit);
+optional extra numeric-equivalence assertion in the combine_grids test. The former N3/N4/C1/QW1 P3s
+listed here are closed by `322b11e` / `4e5433b`.
 
-**Still ahead:** Wave 5 (A3/A4), I4 (post-Wave-5), N2 (batch rec. A, after Phase A+B), the P3 nits above,
-and Phase B (out of scope — see below).
+**Still ahead:** finish Wave 5 (A3/A4 live-gated Role-A mirror retirement), I4 (post-Wave-5), N2
+(batch rec. A, after Phase A+B), the residual P3 nits above, and Phase B (out of scope — see below).
 
 > **(SUPERSEDED by §0 above — the items below have since landed; the table in this note is the earlier
 > pre-implementation grounding snapshot, kept for history.)**
@@ -144,18 +185,19 @@ It is **live-gated**, so it is structured as offscreen prep + a live-checkpoint 
   unrelated and used everywhere.
 - **Gate:** `pytest tests/xdart/test_ewald.py` + offscreen xdart suite green; spine green.
 
-### QW2 — Compress the GUI writer's integrated 1D/2D stacks (P2 perf, S — byte-compat caveat)
+### QW2 — Compress the GUI writer's integrated 1D/2D stacks (CLOSED-REVERSED)
 - **Where:** `src/xdart/modules/ewald/nexus_writer.py` `_commit_integrated_1d` (~882-891) /
   `_commit_integrated_2d` (~958-967) omit the `compression` arg; the headless `NexusSink` writes `lzf`.
-- **Problem:** GUI-written files are larger and slower to reload than headless-written ones.
-- **Fix:** pass the same compression the headless sink uses (derive from `SCHEMA` if a per-dataset
-  `compression` lives there, else `lzf`) so both writers agree.
-- **CAVEAT (do this first):** changing the stored compression filter **changes on-disk bytes**. Run
-  `tests/core/test_v2_record_compat.py` BEFORE and AFTER. If the pinned signature was captured from the
-  uncompressed GUI output, the gate will fail — **stop and confirm with the maintainer** whether the pin
-  should be re-baselined (it is an additive storage detail, but the pin is the source of truth). Do not
-  edit the pin unilaterally.
-- **Gate:** byte-compat gate + spine + a roundtrip read test.
+- **Original problem:** GUI-written files were larger and slower to reload than headless-written ones.
+- **Resolution:** do **not** make the GUI writer use LZF. `beb5a00` did so and later reproduced the
+  same native ARM64 macOS h5py/HDF5 bus-error class previously fixed in `ssrl_xrd_tools` commit
+  `9ff8bf0`. `61073ef` intentionally returns the GUI writer to uncompressed chunked stacks and adds an
+  ARM64 macOS LZF→gzip guard in the shared NeXus writer helper for explicit headless LZF requests.
+- **Trade-off:** GUI output is larger than LZF-compressed output, but final batch flush avoids the
+  known native crash path and avoids gzip CPU cost on the latency-sensitive GUI save path. If file size
+  becomes a release blocker later, evaluate an opt-in gzip policy with real batch timing and crash tests;
+  do not re-enable GUI LZF on ARM64 macOS.
+- **Gate used:** focused writer tests plus live GUI retry of the previously crashing batch path.
 
 ### QW3 — Eiger prefetch: read native dtype, stop widening to int32 (P1 memory, S)
 - **Where:** `src/xdart/gui/tabs/static_scan/wranglers/image_wrangler_thread.py` bulk read (~2253,
