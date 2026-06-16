@@ -9,7 +9,7 @@ Covers:
   the single-shot path within binning tolerance, scout-pass bounds.
 * :func:`grid_scans_streaming` multi-scan accumulation.
 * :func:`_corner_pixel_q` tiny-detector trick: cch'/pwidth' produce a
-  2×2 grid that lands on the original detector's corners.
+  3×3 grid that lands on the original detector's corners and edge midpoints.
 """
 from __future__ import annotations
 
@@ -163,15 +163,15 @@ def _default_mapper(Nch1: int = 64, Nch2: int = 64) -> PixelQMap:
 # ---------------------------------------------------------------------------
 
 class TestCornerPixelQ:
-    """The tiny-detector trick must reduce calls to Nch=2 for both axes."""
+    """The tiny-detector trick must reduce calls to a tiny edge scout."""
 
-    def test_uses_2x2_virtual_detector(self, patched_xu) -> None:
+    def test_uses_3x3_virtual_detector(self, patched_xu) -> None:
         mapper = _default_mapper(Nch1=514, Nch2=1030)
         angles = [np.array([0.0, 0.1, 0.2])]
         qx, qy, qz = _corner_pixel_q(mapper, angles, energy=12000.0)
-        assert qx.shape == (3, 2, 2)
-        assert qy.shape == (3, 2, 2)
-        assert qz.shape == (3, 2, 2)
+        assert qx.shape == (3, 3, 3)
+        assert qy.shape == (3, 3, 3)
+        assert qz.shape == (3, 3, 3)
 
     def test_cch_and_pwidth_scale(self, patched_xu) -> None:
         """Verify the tiny-detector header math directly via init_area kwargs."""
@@ -193,15 +193,48 @@ class TestCornerPixelQ:
             DiffractometerConfig.make_hxrd = lambda self, energy: _TrackerHXRD()  # type: ignore[method-assign]
             mapper = _default_mapper(Nch1=514, Nch2=1030)
             _corner_pixel_q(mapper, [np.array([0.0])], energy=12000.0)
-            # cch' = cch / (N - 1), pwidth' = pwidth * (N - 1)
-            assert captured["Nch1"] == 2
-            assert captured["Nch2"] == 2
-            assert captured["cch1"] == pytest.approx(257.0 / 513)
-            assert captured["cch2"] == pytest.approx(515.0 / 1029)
-            assert captured["pwidth1"] == pytest.approx(0.075 * 513)
-            assert captured["pwidth2"] == pytest.approx(0.075 * 1029)
+            # cch' = cch / ((N - 1) / 2), pwidth' = pwidth * ((N - 1) / 2)
+            assert captured["Nch1"] == 3
+            assert captured["Nch2"] == 3
+            assert captured["cch1"] == pytest.approx(257.0 / (513 / 2))
+            assert captured["cch2"] == pytest.approx(515.0 / (1029 / 2))
+            assert captured["pwidth1"] == pytest.approx(0.075 * (513 / 2))
+            assert captured["pwidth2"] == pytest.approx(0.075 * (1029 / 2))
         finally:
             DiffractometerConfig.make_hxrd = original  # type: ignore[method-assign]
+
+    def test_scout_includes_edge_midpoints(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _MidpointPeak(_FakeAng2Q):
+            def area(self, *args: Any, **kwargs: Any):
+                n = len(np.atleast_1d(args[0]))
+                n1 = self.init_kwargs["Nch1"]
+                n2 = self.init_kwargs["Nch2"]
+                row = np.arange(n1, dtype=float).reshape(1, n1, 1)
+                col = np.arange(n2, dtype=float).reshape(1, 1, n2)
+                # Corners are 0, edge midpoints/center include the peak at 10.
+                qx2 = 10.0 - 10.0 * np.abs(row - 1.0)
+                qy2 = 20.0 - 20.0 * np.abs(col - 1.0)
+                qz2 = qx2 + qy2
+                return (
+                    np.broadcast_to(qx2, (n, n1, n2)).astype(float, copy=True),
+                    np.broadcast_to(qy2, (n, n1, n2)).astype(float, copy=True),
+                    np.broadcast_to(qz2, (n, n1, n2)).astype(float, copy=True),
+                )
+
+        class _MidpointPeakHXRD:
+            Ang2Q = _MidpointPeak()
+
+        monkeypatch.setattr(
+            DiffractometerConfig, "make_hxrd",
+            lambda self, energy: _MidpointPeakHXRD(),
+        )
+        mapper = _default_mapper(Nch1=9, Nch2=9)
+        qx, qy, qz = _corner_pixel_q(mapper, [np.array([0.0])], energy=12000.0)
+
+        assert qx.shape == (1, 3, 3)
+        assert float(np.nanmax(qx)) == pytest.approx(10.0)
+        assert float(np.nanmax(qy)) == pytest.approx(20.0)
+        assert float(np.nanmax(qz)) == pytest.approx(30.0)
 
     def test_rejects_tiny_detector(self, patched_xu) -> None:
         mapper = _default_mapper(Nch1=1, Nch2=64)

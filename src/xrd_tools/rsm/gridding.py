@@ -134,14 +134,16 @@ def _corner_pixel_q(
     roi: tuple[int, int, int, int] | None = None,
     image_shape: tuple[int, ...] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute ``(qx, qy, qz)`` at the four detector corners for each frame.
+    """Compute a tiny edge scout of ``(qx, qy, qz)`` for each frame.
 
-    Cheap scout used to determine grid bounds without materialising the
-    full per-pixel q arrays.  Uses a virtual ``2 × 2`` detector with
-    ``cch'`` and ``pwidth'`` adjusted so the two virtual pixels along
-    each axis land on the original detector's first and last pixels.
+    Cheap scout used to determine grid bounds without materialising the full
+    per-pixel q arrays.  Uses a virtual ``3 × 3`` detector where possible
+    (falling back to ``2`` along any two-pixel axis), with ``cch'`` and
+    ``pwidth'`` adjusted so virtual pixels land on the original detector's
+    first, middle, and last pixels.  The old corner-only scout could under-bound
+    curved detector mappings whose extrema sit on an edge midpoint.
 
-    Returns three arrays of shape ``(N_frame, 2, 2)``.
+    Returns three arrays of shape ``(N_frame, n_sample_1, n_sample_2)``.
     """
     h = mapper.header
     if roi is not None:
@@ -154,14 +156,18 @@ def _corner_pixel_q(
         )
 
     n1, n2 = h.Nch1, h.Nch2
+    s1 = 3 if n1 > 2 else 2
+    s2 = 3 if n2 > 2 else 2
+    scale1 = (n1 - 1) / (s1 - 1)
+    scale2 = (n2 - 1) / (s2 - 1)
     tiny = DetectorHeader(
-        cch1=h.cch1 / (n1 - 1),
-        cch2=h.cch2 / (n2 - 1),
-        pwidth1=h.pwidth1 * (n1 - 1),
-        pwidth2=h.pwidth2 * (n2 - 1),
+        cch1=h.cch1 / scale1,
+        cch2=h.cch2 / scale2,
+        pwidth1=h.pwidth1 * scale1,
+        pwidth2=h.pwidth2 * scale2,
         distance=h.distance,
-        Nch1=2,
-        Nch2=2,
+        Nch1=s1,
+        Nch2=s2,
     )
     tiny_mapper = PixelQMap(mapper.diff_config, tiny)
     return tiny_mapper.pixel_q(angles, energy, UB=UB)
@@ -592,8 +598,16 @@ def combine_grids(
     h, k, l = get_common_grid(volumes, bins)
     combined = np.zeros((len(h), len(k), len(l)), dtype=float)
 
-    H, K, L = np.meshgrid(h, k, l, indexing="ij")
-    pts = np.column_stack((H.ravel(), K.ravel(), L.ravel()))
+    # Avoid materialising three dense ``(H, K, L)`` coordinate volumes.  A
+    # realistic grid can make those temporaries hundreds of MB before the
+    # interpolated output even exists.  Interpolate one H-slab at a time from a
+    # reusable 2-D K/L point template.
+    kl_size = len(k) * len(l)
+    k_col = np.repeat(k, len(l))
+    l_col = np.tile(l, len(k))
+    pts = np.empty((kl_size, 3), dtype=float)
+    pts[:, 1] = k_col
+    pts[:, 2] = l_col
 
     for vol in volumes:
         vals = np.nan_to_num(vol.intensity, nan=0.0)
@@ -603,6 +617,8 @@ def combine_grids(
             bounds_error=False,
             fill_value=0.0,
         )
-        combined += rgi(pts).reshape(H.shape)
+        for i, h_value in enumerate(h):
+            pts[:, 0] = h_value
+            combined[i] += rgi(pts).reshape(len(k), len(l))
 
     return RSMVolume(h=h, k=k, l=l, intensity=combined)

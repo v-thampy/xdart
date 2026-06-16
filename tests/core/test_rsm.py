@@ -383,6 +383,24 @@ class TestCombineGrids:
         assert isinstance(out, RSMVolume)
         assert out.shape == (8, 9, 10)
 
+    def test_combine_grids_does_not_build_dense_coordinate_mesh(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        v = RSMVolume(
+            h=np.linspace(-1, 1, 3),
+            k=np.linspace(-1, 1, 4),
+            l=np.linspace(-1, 1, 5),
+            intensity=np.ones((3, 4, 5), dtype=float),
+        )
+
+        def _forbidden_meshgrid(*args, **kwargs):
+            raise AssertionError("combine_grids should not build dense meshgrids")
+
+        monkeypatch.setattr(np, "meshgrid", _forbidden_meshgrid)
+        out = combine_grids([v], bins=(4, 5, 6))
+        assert out.shape == (4, 5, 6)
+        np.testing.assert_allclose(out.intensity, 1.0)
+
     def test_empty_list(self) -> None:
         with pytest.raises(ValueError):
             combine_grids([], bins=(5, 5, 5))
