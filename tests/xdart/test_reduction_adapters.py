@@ -873,6 +873,28 @@ def test_reintegrate_close_surfaces_write_failure() -> None:
     assert thread._reduction_session_key is None
 
 
+def test_show_reintegration_write_error_forwards_to_wrangler_status() -> None:
+    # C3 end-to-end (audit gap): the integratorThread.writeError signal is wired
+    # to staticWidget._show_reintegration_write_error, which must forward the
+    # message to the wrangler's showLabel status channel.  Exercised via a duck
+    # self so no real QWidget is needed.
+    from types import SimpleNamespace
+
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    shown: list[str] = []
+    duck = SimpleNamespace(
+        wrangler=SimpleNamespace(showLabel=SimpleNamespace(emit=shown.append)))
+    staticWidget._show_reintegration_write_error(
+        duck, "Reintegration save FAILED — output .nxs may be incomplete: disk full")
+    assert shown == [
+        "Reintegration save FAILED — output .nxs may be incomplete: disk full"]
+
+    # A missing/odd wrangler must be swallowed (status is best-effort), not raise.
+    staticWidget._show_reintegration_write_error(
+        SimpleNamespace(wrangler=None), "ignored")
+
+
 # ---------------------------------------------------------------------------
 # Mask-incompatibility handling: a mask that doesn't fit the image is ignored
 # (returns None) with a warning, not a hard error that aborts the scan.
