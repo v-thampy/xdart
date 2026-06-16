@@ -466,8 +466,17 @@ class DisplayPlotMixin:
             self.ui.yOffset.setEnabled(True)
 
         n_curves = len(self.plot_data[1])
-        # Only switch to WF plot if more than three curves. Definitely switch if more than 15!
-        if (self.plotMethod == 'Waterfall' and n_curves > 3) or n_curves > 15:
+        # Auto-switch to a waterfall only when MANY separate curves would be drawn
+        # — Overlay/Waterfall, or a Single multi-selection.  Sum/Average COLLAPSE
+        # to one curve in update_1d_view (nanmean/nansum over the stacked rows), so
+        # they must NEVER auto-waterfall however many rows are stacked (the payload
+        # path emits one un-reduced trace per frame, so n_curves is the frame
+        # count, not the drawn-curve count).
+        auto_wf = (
+            (self.plotMethod == 'Waterfall' and n_curves > 3)
+            or (self.plotMethod not in ('Sum', 'Average') and n_curves > 15)
+        )
+        if auto_wf:
             self.update_wf()
         else:
             self.update_1d_view()
@@ -479,6 +488,13 @@ class DisplayPlotMixin:
 
         xdata_, ydata_ = self.plot_data
         s_xdata, ydata = xdata_.copy(), ydata_.copy()
+
+        # Nothing to draw (e.g. an all-evicted / all-empty GI selection): clear and
+        # bail BEFORE the scale math + the Sum/Average nanmean/nansum, which would
+        # otherwise warn "Mean of empty slice" on a zero-row stack.
+        if np.size(ydata) == 0:
+            self.setup_curves()
+            return s_xdata, ydata
 
         int_label = 'I'
         if self.normChannel:

@@ -438,7 +438,8 @@ def test_cake_image_gi_ignores_imageunit_toggle():
 
 def test_gi_cake_axis_unit_is_angstrom_not_raw_key():
     # D1: the GI Q_ip/Q_oop cake axes show the unit Å⁻¹, not the raw integration
-    # key qip_A^-1 / qoop_A^-1.  The *label* (Q_ip/Q_oop) is unchanged.
+    # key qip_A^-1 / qoop_A^-1.  The label uses an HTML <sub> subscript (rendered
+    # by pyqtgraph setLabel).
     from xdart.gui.tabs.static_scan.display_constants import AA_inv
     frame = DuckFrame(idx=14)
     frame.int_2d = IntegrationResult2D(
@@ -456,8 +457,8 @@ def test_gi_cake_axis_unit_is_angstrom_not_raw_key():
     cake = PublicationDisplayAdapter(store, widget=_Widget()).cake_image(
         _cake_state(store, 14))
     assert cake is not None
-    assert cake.axis_x.label == "Q_ip" and cake.axis_x.unit == AA_inv
-    assert cake.axis_y.label == "Q_oop" and cake.axis_y.unit == AA_inv
+    assert cake.axis_x.label == "Q<sub>ip</sub>" and cake.axis_x.unit == AA_inv
+    assert cake.axis_y.label == "Q<sub>oop</sub>" and cake.axis_y.unit == AA_inv
     assert cake.axis_x.values.shape == (4,)
     assert cake.axis_y.values.shape == (3,)
 
@@ -1034,11 +1035,14 @@ def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():
         np.testing.assert_allclose(np.nansum(stack, 0), np.full(6, 6.0))
 
 
-def test_plot_payload_falls_back_when_a_selected_frame_is_evicted():
-    # P1 (Step-5 review): the bounded store evicts older frames' 1D arrays
-    # (max_heavy_items).  A whole-scan Sum/Average/Overall must NOT silently drop
-    # them — integration_plot_payload returns None so the legacy update_plot
-    # (which hydrates every selected frame from disk) owns the full selection.
+def test_plot_payload_falls_back_when_store_evicted_even_if_render_ids_lists_it():
+    # P1 (codex/other-claude review): the bounded store evicts older frames' 1D
+    # arrays (max_heavy_items), but render_ids OR-merges the store with the
+    # UNBOUNDED legacy data_1d (display_controllers._data_snapshot), so render_ids
+    # can still LIST a store-evicted frame — a render_ids gate would wrongly pass.
+    # The store-only available_1d_keys() gate must fall back to legacy update_plot
+    # (which hydrates the full selection from disk); otherwise a whole-scan
+    # Sum/Average/Overall silently drops the evicted frames.
     store = PublicationStore(max_heavy_items=1)
     for i in (0, 1, 2):
         f = DuckFrame(idx=i)
@@ -1047,16 +1051,21 @@ def test_plot_payload_falls_back_when_a_selected_frame_is_evicted():
             radial=np.linspace(0.5, 3.0, 6),
             intensity=np.full(6, float(i + 1)), sigma=None, unit="q_A^-1")
         store.upsert(publication_from_live_frame(f))
-    # frames 0,1 were thinned to the thumbnail tier (no 1D); 2 stays resident.
-    assert not store.get(0).view.has_1d
-    assert store.get(2).view.has_1d
+    assert not store.get(0).view.has_1d          # 0,1 thinned out of the store
+    assert store.get(2).view.has_1d              # 2 stays resident
     adapter = _adapter(store, _int_widget())
-    # a selection that includes an evicted frame -> fall back to legacy (None)
+    # Build the state as PRODUCTION does: loaded keys include the evicted frames
+    # (the unbounded data_1d backstop), so render_ids == selected_ids — the
+    # render_ids gate would PASS, but the store can't serve 0,1.
     for method in ("Average", "Sum", "Single"):
-        assert adapter.integration_plot_payload(
-            _int_state(store, ids=(0, 1, 2), method=method)) is None
-        assert adapter.plot_payload(
-            _int_state(store, ids=(0, 1, 2), method=method)) is None
+        state = compute_display_state(
+            mode=Mode.INT_1D, selected_ids=(0, 1, 2), all_frame_index=[0, 1, 2],
+            loaded_1d_keys={0, 1, 2}, loaded_2d_keys={0, 1, 2}, gi=False,
+            plot_unit="q_A^-1", method=method, unit_changed=False,
+            prev_overlaid_ids=(), raw_availability={}, titles={},
+            generation=store.generation)
+        assert set(state.render_ids) == {0, 1, 2}   # OR-merge masks the eviction
+        assert adapter.plot_payload(state) is None  # store-only gate -> fall back
     # an all-resident selection still builds the payload (the flip applies).
     assert adapter.plot_payload(_int_state(store, ids=(2,), method="Single")) is not None
 

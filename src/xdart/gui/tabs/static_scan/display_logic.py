@@ -482,8 +482,10 @@ _X_AXIS_TABLE = {
     'q_A^-1': ('Q', _AA_INV),
     '2th_deg': (f"2{_TH}", _DEG),
     'chi_deg': (_CHI, _DEG),
-    'qip_A^-1': ('Q_ip', _AA_INV),
-    'qoop_A^-1': ('Q_oop', _AA_INV),
+    # HTML <sub> renders as a real subscript in pyqtgraph's setLabel (the only
+    # consumer of these labels — state.x_label is unused, combos use gi_plotUnits).
+    'qip_A^-1': ('Q<sub>ip</sub>', _AA_INV),
+    'qoop_A^-1': ('Q<sub>oop</sub>', _AA_INV),
     'exit_angle_deg': ('Exit Angle', _DEG),
     'exit_angle': ('Exit Angle', _DEG),
     'r_mm': ('r', 'mm'),

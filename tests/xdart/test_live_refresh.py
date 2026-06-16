@@ -1757,6 +1757,32 @@ def _render_host():
     return host, calls, dl
 
 
+def test_update_plot_view_sum_average_never_auto_waterfalls():
+    # Bug (Vivek): Sum/Average of >15 frames rendered a WATERFALL instead of the
+    # collapsed curve.  update_plot_view auto-switches to a waterfall on n_curves>15
+    # (or Waterfall>3), but Sum/Average collapse to ONE curve in update_1d_view, so
+    # they must never auto-waterfall however many rows are stacked.
+    from unittest.mock import MagicMock
+    cases = (("Average", "1d"), ("Sum", "1d"), ("Overlay", "wf"), ("Single", "wf"))
+    n = 20
+    for method, expect in cases:
+        calls = []
+        host = SimpleNamespace(
+            _using_publication_plot_payload=True,
+            frame_ids=["0"], data_1d={}, curves=[], plot=MagicMock(),
+            frame_names=["f"] * n,
+            plot_data=[np.arange(5), np.ones((n, 5))],
+            ui=SimpleNamespace(
+                plotMethod=SimpleNamespace(currentText=lambda m=method: m),
+                yOffset=MagicMock()),
+            update_wf=lambda: calls.append("wf"),
+            update_1d_view=lambda: calls.append("1d"),
+        )
+        host.update_plot_view = MethodType(displayFrameWidget.update_plot_view, host)
+        host.update_plot_view()
+        assert calls == [expect], f"{method} (n={n}) -> {calls}, expected {expect}"
+
+
 def test_clear_binned_view_drops_stale_slice_overlay():
     # P3 (Step-5 review): a blanked cake must not keep a floating slice-band ROI.
     # The flip moved the band re-attach to the cake renderer (_draw_image_payload),
