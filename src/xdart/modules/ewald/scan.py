@@ -356,7 +356,8 @@ class LiveScan:
         """Adds a new frame to the scan.
 
         In-memory state (``frames.index``, ``scan_data``) and the persisted
-        scan state are always updated.
+        scan state are always updated.  The legacy ``update`` argument is
+        accepted for old call sites but no longer changes this behaviour.
         Persistence policy:
 
         * ``batch_save=True`` — skip the per-frame ``_save_to_nexus`` call;

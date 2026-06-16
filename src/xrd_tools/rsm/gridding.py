@@ -258,7 +258,7 @@ class StreamingGridder:
         roi: tuple[int, int, int, int] | None = None,
         pad: float = 0.0,
     ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
-        """Compute corner q for each scan and call :meth:`set_bounds` with the union.
+        """Scout detector-edge q for each scan and set the union bounds.
 
         Parameters
         ----------

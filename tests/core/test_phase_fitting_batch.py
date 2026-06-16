@@ -106,3 +106,10 @@ def test_fit_nexus_streams_rows_without_full_read(monkeypatch, tmp_path):
 
     assert len(store) == 1
     assert store[0]["result"] is None
+
+
+def test_resolve_keep_results_auto_threshold_boundary():
+    assert batch_mod._resolve_keep_results("auto", 10, 10) is True
+    assert batch_mod._resolve_keep_results("auto", 11, 10) is False
+    assert batch_mod._resolve_keep_results(True, 999, 0) is True
+    assert batch_mod._resolve_keep_results(False, 0, 999) is False
