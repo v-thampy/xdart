@@ -157,6 +157,8 @@ def process_scan(
     rotation: int = 0,
     reprocess: bool = False,
     progress_cb: Callable[[int, int], None] | None = None,
+    kwargs_1d: dict[str, Any] | None = None,
+    kwargs_2d: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> Path:
     """
@@ -202,8 +204,12 @@ def process_scan(
         Image rotation in degrees (multiple of 90).
     reprocess : bool, optional
         If ``True``, overwrite existing frame groups in the output HDF5.
+    kwargs_1d, kwargs_2d
+        Extra keyword arguments forwarded only to :func:`integrate_1d` or
+        :func:`integrate_2d`, respectively.
     **kwargs
-        Forwarded to both :func:`integrate_1d` and :func:`integrate_2d`.
+        Backward-compatible shared keyword arguments forwarded to both
+        :func:`integrate_1d` and :func:`integrate_2d`.
 
     Returns
     -------
@@ -223,6 +229,8 @@ def process_scan(
 
     n_total = len(frames)
     n_skipped = n_done = 0
+    extra_1d = {**kwargs, **(kwargs_1d or {})}
+    extra_2d = {**kwargs, **(kwargs_2d or {})}
 
     logger.info("Processing %s: %d frames → %s", scan_path.name, n_total, out_path)
 
@@ -232,18 +240,17 @@ def process_scan(
             continue
 
         try:
-            r1d = integrate_1d(
-                img, ai,
+            call_1d = dict(
                 npt=npt,
                 unit=unit,
                 method=method,
                 mask=effective_mask,
                 radial_range=radial_range,
                 azimuth_range=azimuth_range,
-                **kwargs,
             )
-            r2d = integrate_2d(
-                img, ai,
+            call_1d.update(extra_1d)
+            r1d = integrate_1d(img, ai, **call_1d)
+            call_2d = dict(
                 npt_rad=npt_rad,
                 npt_azim=npt_azim,
                 unit=unit,
@@ -251,8 +258,9 @@ def process_scan(
                 mask=effective_mask,
                 radial_range=radial_range,
                 azimuth_range=azimuth_range,
-                **kwargs,
             )
+            call_2d.update(extra_2d)
+            r2d = integrate_2d(img, ai, **call_2d)
         except Exception as exc:
             logger.error(
                 "Integration failed for %s frame %d: %s", scan_path.name, idx, exc

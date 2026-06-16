@@ -752,6 +752,12 @@ def test_reduction_validation_for_shapes_and_duplicate_frames() -> None:
         run_reduction(ReductionPlan(), scan)
 
 
+def test_zero_scalar_background_is_noop_without_allocation() -> None:
+    image = np.ones((3, 3), dtype=np.uint16)
+
+    assert reduction_core._subtract_background(image, 0.0) is image
+
+
 def test_nexus_sink_flush_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

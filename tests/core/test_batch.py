@@ -12,6 +12,8 @@ import pytest
 from pyFAI.detectors import Detector
 from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 
+from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+import xrd_tools.integrate.batch as batch_module
 from xrd_tools.integrate.batch import DirectoryWatcher, process_scan, process_series
 
 
@@ -125,6 +127,56 @@ def test_process_scan_skip_existing(ai_fixture, poni_fixture, tmp_path):
 
     with h5py.File(out_h5, "r") as h5:
         assert set(h5.keys()) == {"0", "1", "2"}
+
+
+def test_process_scan_splits_dimension_specific_kwargs(
+    monkeypatch, poni_fixture, tmp_path
+):
+    scan_dir = tmp_path / "images"
+    _write_edf_scan(scan_dir, n_frames=1, seed=7)
+    ai = _make_small_ai(poni_fixture)
+    seen: dict[str, dict] = {}
+
+    def fake_1d(image, ai, **kwargs):
+        seen["1d"] = dict(kwargs)
+        return IntegrationResult1D(
+            radial=np.array([0.0, 1.0]),
+            intensity=np.array([1.0, 2.0]),
+            unit="q_A^-1",
+        )
+
+    def fake_2d(image, ai, **kwargs):
+        seen["2d"] = dict(kwargs)
+        return IntegrationResult2D(
+            radial=np.array([0.0, 1.0]),
+            azimuthal=np.array([-1.0, 1.0]),
+            intensity=np.ones((2, 2)),
+            unit="q_A^-1",
+        )
+
+    monkeypatch.setattr(batch_module, "integrate_1d", fake_1d)
+    monkeypatch.setattr(batch_module, "integrate_2d", fake_2d)
+
+    process_scan(
+        scan_dir,
+        ai,
+        tmp_path / "split_kwargs.h5",
+        npt=2,
+        npt_rad=2,
+        npt_azim=2,
+        shared=True,
+        kwargs_1d={"only_1d": "one"},
+        kwargs_2d={"npt_azim": 9, "only_2d": "two"},
+    )
+
+    assert seen["1d"]["shared"] is True
+    assert seen["1d"]["only_1d"] == "one"
+    assert "only_2d" not in seen["1d"]
+    assert "npt_azim" not in seen["1d"]
+    assert seen["2d"]["shared"] is True
+    assert seen["2d"]["only_2d"] == "two"
+    assert seen["2d"]["npt_azim"] == 9
+    assert "only_1d" not in seen["2d"]
 
 
 def test_process_series(poni_fixture, tmp_path):

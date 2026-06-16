@@ -2169,6 +2169,8 @@ def _subtract_background(
     if background is None:
         return image
     bg = np.asarray(background, dtype=float)
+    if bg.shape == () and float(bg) == 0.0:
+        return image
     if bg.ndim > 0 and bg.shape != image.shape:
         raise ValueError(
             f"background shape {bg.shape} does not match image shape {image.shape}"
