@@ -296,6 +296,63 @@ def test_publication_display_adapter_exposes_availability_and_int_plot_fallback(
     assert (payload.axis_x.label, payload.axis_x.unit) == ("2θ", "°")
 
 
+def test_publication_display_selected_labels_avoid_full_store_snapshot():
+    class NoSnapshotStore(PublicationStore):
+        def snapshot(self):  # pragma: no cover - exercised by failure
+            raise AssertionError("selected-label display path copied full store")
+
+    store = NoSnapshotStore()
+    for idx in (1, 2, 3):
+        store.upsert(publication_from_live_frame(DuckFrame(idx=idx)))
+
+    loaded_1d, loaded_2d, raw_avail = publication_availability(
+        store, labels=(2,))
+
+    assert loaded_1d == {2}
+    assert loaded_2d == {2}
+    assert set(raw_avail) == {2}
+
+    state = compute_display_state(
+        mode=Mode.INT_1D,
+        selected_ids=(2,),
+        all_frame_index=[1, 2, 3],
+        loaded_1d_keys=loaded_1d,
+        loaded_2d_keys=loaded_2d,
+        gi=False,
+        plot_unit="q_A^-1",
+        method="Single",
+        unit_changed=False,
+        prev_overlaid_ids=(),
+        raw_availability=raw_avail,
+        titles={},
+        generation=store.generation,
+    )
+
+    class _Widget:
+        scan = type("Scan", (), {"name": "scan", "gi": False})()
+        _plot_axis_info = [{"source": "1d", "slice_axis": None, "axis": None}]
+        ui = type("UI", (), {
+            "plotUnit": type("PlotUnit", (), {
+                "currentIndex": staticmethod(lambda: 0),
+                "currentText": staticmethod(lambda: "Q (Å⁻¹)"),
+            })(),
+            "slice": type("Slice", (), {
+                "isChecked": staticmethod(lambda: False),
+            })(),
+        })()
+
+        def normalize(self, data, metadata):
+            return np.asarray(data, dtype=float)
+
+    payload = PublicationDisplayAdapter(
+        store, widget=_Widget(), labels=state.selected_ids,
+    ).plot_payload(state)
+
+    assert payload is not None
+    assert len(payload.traces) == 1
+    assert payload.traces[0].label == "scan_2"
+
+
 def test_publication_display_adapter_builds_raw_and_cake_image_payloads():
     frame = DuckFrame(idx=11)
     frame.scan_info = {"monitor": 10.0}

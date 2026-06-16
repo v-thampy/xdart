@@ -59,7 +59,30 @@ __all__ = [
 ]
 
 
-def _data_snapshot(widget):
+def _label_key(label):
+    try:
+        return int(label)
+    except (TypeError, ValueError):
+        return label
+
+
+def _candidate_labels(mode, selected_ids, all_frame_index):
+    """Labels whose availability can affect this render.
+
+    Most live updates draw Auto Last / Single and only need the selected frame.
+    Whole-scan selections still ask for the whole scan so Sum/Average/Overall
+    keep their full-coverage safety checks.
+    """
+    if mode in (Mode.INT_1D, Mode.INT_2D):
+        try:
+            if len(selected_ids) == len(all_frame_index) and len(all_frame_index) > 1:
+                return tuple(all_frame_index)
+        except TypeError:
+            pass
+    return tuple(selected_ids)
+
+
+def _data_snapshot(widget, *, labels=None):
     """Snapshot loaded keys + per-frame raw/thumbnail availability.
 
     X1 (Phase 3a): the PublicationStore is the primary source; the legacy
@@ -71,14 +94,25 @@ def _data_snapshot(widget):
     store = getattr(widget, "publication_store", None)
     loaded_1d, loaded_2d, raw_avail = set(), set(), {}
     if store is not None:
-        pub_1d, pub_2d, pub_raw = publication_availability(store)
+        pub_1d, pub_2d, pub_raw = publication_availability(store, labels=labels)
         loaded_1d |= pub_1d
         loaded_2d |= pub_2d
         raw_avail.update(pub_raw)
+    label_filter = None if labels is None else {_label_key(label) for label in labels}
     with widget.data_lock:
-        loaded_1d |= set(widget.data_1d.keys())
-        loaded_2d |= set(widget.data_2d.keys())
-        for k, v in widget.data_2d.items():
+        if label_filter is None:
+            data_1d_keys = set(widget.data_1d.keys())
+            data_2d_items = tuple(widget.data_2d.items())
+        else:
+            data_1d_keys = {key for key in label_filter if key in widget.data_1d}
+            data_2d_items = tuple(
+                (key, widget.data_2d[key])
+                for key in label_filter
+                if key in widget.data_2d
+            )
+        loaded_1d |= data_1d_keys
+        loaded_2d |= {key for key, _value in data_2d_items}
+        for k, v in data_2d_items:
             if not isinstance(v, dict):
                 continue
             entry = raw_avail.setdefault(
@@ -159,10 +193,12 @@ class _BaseController:
 
     def compute_state(self, widget, mode):
         all_index, gi = self._all_frame_index(widget)
-        loaded_1d, loaded_2d, raw_avail = _data_snapshot(widget)
+        selected_ids = list(widget.frame_ids)
+        labels = _candidate_labels(mode, selected_ids, all_index)
+        loaded_1d, loaded_2d, raw_avail = _data_snapshot(widget, labels=labels)
         return compute_display_state(
             mode=mode,
-            selected_ids=list(widget.frame_ids),
+            selected_ids=selected_ids,
             all_frame_index=all_index,
             loaded_1d_keys=loaded_1d,
             loaded_2d_keys=loaded_2d,
@@ -178,9 +214,10 @@ class _BaseController:
 
     def build_payload(self, widget, state):
         store = getattr(widget, "publication_store", None)
+        labels = tuple(dict.fromkeys((*state.selected_ids, *state.render_ids)))
         adapter = (
             None if store is None
-            else PublicationDisplayAdapter(store, widget=widget)
+            else PublicationDisplayAdapter(store, widget=widget, labels=labels)
         )
         return build_payload(state, adapter)
 

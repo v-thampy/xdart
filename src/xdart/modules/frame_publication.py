@@ -740,6 +740,22 @@ class PublicationStore:
         with self._lock:
             return self._items.get(label)
 
+    def get_many(
+        self, labels: Iterable[int | str]
+    ) -> dict[int | str, FramePublication]:
+        """Return stored publications for ``labels`` under one lock.
+
+        Display code uses this for the common selected-frame render path.  It
+        avoids copying the full publication store on every frame update while
+        preserving the existing immutable-publication contract.
+        """
+        with self._lock:
+            return {
+                label: publication
+                for label in labels
+                if (publication := self._items.get(label)) is not None
+            }
+
     def labels(self) -> tuple[int | str, ...]:
         with self._lock:
             return tuple(self._items)

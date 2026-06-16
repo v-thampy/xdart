@@ -168,12 +168,37 @@ def _canonical_axis_unit(axis) -> str:
     return unit
 
 
+def _label_keys(labels) -> tuple:
+    if labels is None:
+        return ()
+    seen = set()
+    keys = []
+    for label in labels:
+        key = _label_key(label)
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return tuple(keys)
+
+
 class PublicationDisplayAdapter:
     """Resolve display payload fragments from a publication snapshot."""
 
-    def __init__(self, store, *, widget=None):
+    def __init__(self, store, *, widget=None, labels=None):
         self._widget = widget
-        self._items = {} if store is None else dict(store.snapshot())
+        if store is None:
+            self._items = {}
+        elif labels is None:
+            self._items = dict(store.snapshot())
+        elif hasattr(store, "get_many"):
+            self._items = store.get_many(_label_keys(labels))
+        else:
+            self._items = {
+                label: publication
+                for label in _label_keys(labels)
+                if (publication := store.get(label)) is not None
+            }
 
     def available_1d_keys(self) -> set:
         return {
@@ -743,10 +768,10 @@ class PublicationDisplayAdapter:
         return cls._has_full_raw(publication) or cls._has_thumbnail(publication)
 
 
-def publication_availability(store) -> tuple[set, set, dict]:
+def publication_availability(store, *, labels=None) -> tuple[set, set, dict]:
     """Return loaded-1D keys, loaded-2D/raw keys, and raw availability."""
 
-    adapter = PublicationDisplayAdapter(store)
+    adapter = PublicationDisplayAdapter(store, labels=labels)
     return (
         adapter.available_1d_keys(),
         adapter.available_2d_keys(),
