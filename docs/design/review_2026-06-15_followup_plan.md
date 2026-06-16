@@ -44,6 +44,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | Wave 5 A4 prep — remove dead file-thread mirror loader | this checkpoint | ✅ `fileHandlerThread` no longer exposes the unqueued `load_frame`/`load_frames` tasks that could repopulate scan-mode mirrors behind the publication store; the long-lived file thread remains for `set_datafile` and `save_data_as` |
 | Wave 5/D2 hardening — non-blocking integration hydration | this checkpoint | ✅ normal display renders now queue missing 1D/2D integration hydration through the background worker when async hydration is enabled; explicit background-setting reads still opt into blocking full-coverage reads |
 | Phase B foundation — headless `FrameRecordStore` | this checkpoint | ✅ `xrd_tools.session` now exposes a Qt-free, bounded, persist-before-evict `FrameRecordStore`; `ScanSession` can optionally populate it from completed frame events. This is dormant for xdart until the live-gated store→session projection flip |
+| GI-AGG e2e render gate | this checkpoint | ✅ real `displayFrameWidget.update()` now has an offscreen regression proving Overall Average over >64 frames uses the disk-backed aggregate when store-heavy rows are evicted and legacy mirrors are empty |
 
 **Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_gui_modes_end_to_end.py`,
@@ -92,7 +93,8 @@ passed the focused live-run, batch-finish, shutdown, placeholder-load, and `_abs
 (`17 passed`). The non-blocking integration hydration hardening passed the focused D2/raw/integration
 hydration policy slice (`9 passed`). The Phase B foundation passed the headless store/session/record slice
 (`45 passed`) before any xdart live-path wiring, plus architecture/release guards and xdart publication
-coverage (`130 passed` for the expanded focused gate).
+coverage (`130 passed` for the expanded focused gate). The GI-AGG real-render gap is closed by
+`tests/xdart/test_aggregation_wiring.py::test_real_widget_overall_aggregate_uses_disk_when_store_evicted`.
 
 **Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is
 a safer pre-live-checkpoint boundary: publication-store-first display, bounded mirrors, and tests for the
@@ -155,12 +157,9 @@ serve only resident frames — **silently truncating** the Overall Sum/Average. 
 - **Remaining UX work:** A3/A4/instant-switch should make non-primary GI mode misses explicit
   (disable/annotate/reintegrate-on-miss). The important invariant is already set: a non-primary partial
   stack is never accepted as a whole-scan aggregate.
-- **Test gap:** add an end-to-end test that drives the **real `displayFrameWidget.update()`** in Overall
-  Sum/Average at **N > the store's `max_heavy_items` (64)** with frames absent from **both** the store and
-  `data_1d`, asserting the rendered trace equals the full-scan aggregate. It would fail if the routing ever
-  reverted to reading the bounded `data_1d`. (The existing `test_aggregation_wiring` tests stub
-  `_whole_scan_aggregate` or leave the store fully populated, so they do not exercise the eviction→disk
-  path through the real render.)
+- **Test gate closed:** `test_real_widget_overall_aggregate_uses_disk_when_store_evicted`
+  drives the real `displayFrameWidget.update()` path at N=70 with store-heavy rows evicted and
+  `data_1d`/`data_2d` empty, asserting both cake and plot render the full disk-backed aggregate.
 
 > **(SUPERSEDED by §0 above — the items below have since landed; the table in this note is the earlier
 > pre-implementation grounding snapshot, kept for history.)**

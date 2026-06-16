@@ -143,6 +143,94 @@ def test_widget_whole_scan_aggregate_defers_for_nonprimary_gi(tmp_path):
     assert _call_whole_scan_aggregate(duck, dim="2d", method="average") is None
 
 
+@pytest.fixture
+def widget(qapp):
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+    w = staticWidget()
+    try:
+        yield w
+    finally:
+        try:
+            h5v = w.h5viewer
+            h5v.cancel_pending_loads()
+            ft = getattr(h5v, "file_thread", None)
+            if ft is not None:
+                ft.queue.put(None)
+                ft.wait(2000)
+            pool = getattr(h5v, "_h5pool", None)
+            if pool is not None:
+                pool.close_all()
+        except Exception:
+            pass
+        try:
+            w.close()
+        except Exception:
+            pass
+        qapp.processEvents()
+
+
+@pytest.mark.gui
+def test_real_widget_overall_aggregate_uses_disk_when_store_evicted(
+    widget, tmp_path
+):
+    # §0.2 e2e gap: drive the real displayFrameWidget.update() path with more
+    # frames than PublicationStore keeps heavy.  Old mirrors are empty, so the
+    # only correct result is the disk-backed whole-scan aggregate, not a resident
+    # subset and not a blank.
+    from xdart.modules.frame_publication import publication_from_frame_view
+    from xrd_tools.core import FrameView
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+
+    n = 70
+    scan, q, chi = _split_scan_2d(tmp_path, n=n, cap=8)
+    w = widget
+    df = w.displayframe
+    df.scan = scan
+    df.viewer_mode = None
+    df._async_hydration_enabled = False
+    df.ui.plotMethod.setCurrentText("Average")
+    df.ui.plotUnit.setCurrentIndex(0)
+
+    with w.data_lock:
+        w.data_1d.clear()
+        w.data_2d.clear()
+    w.publication_store.clear()
+    for i in range(n):
+        r1 = IntegrationResult1D(
+            radial=q,
+            intensity=np.full(q.shape, float(i + 1), dtype=np.float32),
+            sigma=None,
+            unit="q_A^-1",
+        )
+        r2 = IntegrationResult2D(
+            radial=q,
+            azimuthal=chi,
+            intensity=np.full((q.size, chi.size), float(i + 1), dtype=np.float32),
+            unit="q_A^-1",
+            azimuthal_unit="chi_deg",
+        )
+        view = FrameView.from_results(label=i, result_1d=r1, result_2d=r2)
+        w.publication_store.upsert(publication_from_frame_view(view))
+
+    assert len(w.publication_store.labels()) == n
+    assert sum(
+        1
+        for i in range(n)
+        if (pub := w.publication_store.get(i)) is not None and pub.view.has_1d
+    ) < n
+
+    w.frame_ids[:] = [str(i) for i in range(n)]
+    df.frame_ids = list(w.frame_ids)
+    df.update()
+
+    expected = np.mean(np.arange(1, n + 1))
+    assert df.binned_data is not None
+    np.testing.assert_allclose(df.binned_data[0], expected)
+    x, y = df.plot_data
+    np.testing.assert_allclose(x, q)
+    np.testing.assert_allclose(np.asarray(y), expected)
+
+
 # ── adapter routing: cake_image -> _aggregate_cake_payload ─────────────────────
 
 def _fake_state(*, overall, selected_ids, render_ids=(), method="Average"):
