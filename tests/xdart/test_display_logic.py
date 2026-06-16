@@ -27,10 +27,13 @@ import os
 import subprocess
 import sys
 import textwrap
+from threading import RLock
+from types import SimpleNamespace
 
 import pytest
 
 import xdart.gui.tabs.static_scan.display_logic as dl
+from xdart.gui.tabs.static_scan.display_controllers import ScanDisplayController
 
 # Absolute path to the module under test, derived from this test's
 # location (tests/xdart is two levels below the repo root; the module
@@ -588,6 +591,88 @@ def test_controller_registry_register_and_lookup():
             dl.register_controller(fresh_mode, prev)   # restore the real one
         else:
             dl._CONTROLLER_REGISTRY.pop(fresh_mode, None)
+
+
+class _PlotMethod:
+    def currentText(self):
+        return "Single"
+
+
+class _IndexThatMustNotIterate:
+    def __init__(self, count):
+        self.count = count
+
+    def __len__(self):
+        return self.count
+
+    def __iter__(self):
+        raise AssertionError("single-frame render should not iterate full scan index")
+
+
+class _CountingIndex:
+    def __init__(self, labels):
+        self.labels = tuple(labels)
+        self.iterations = 0
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __iter__(self):
+        self.iterations += 1
+        return iter(self.labels)
+
+
+def _controller_widget(index, *, frame_ids, data_1d=None, data_2d=None):
+    return SimpleNamespace(
+        scan=SimpleNamespace(
+            scan_lock=RLock(),
+            frames=SimpleNamespace(index=index),
+            gi=False,
+        ),
+        frame_ids=list(frame_ids),
+        publication_store=None,
+        data_lock=RLock(),
+        data_1d={} if data_1d is None else data_1d,
+        data_2d={} if data_2d is None else data_2d,
+        ui=SimpleNamespace(plotMethod=_PlotMethod()),
+        overlaid_idxs=(),
+        display_generation=0,
+    )
+
+
+def test_scan_controller_does_not_copy_full_index_for_single_frame_render():
+    """I4: Auto-last/Single updates only need the scan length, not every label.
+
+    A long scan used to copy/convert the whole frame index on every render
+    tick.  This fake index fails if iterated; the single-frame path should
+    still resolve readiness from the selected label.
+    """
+    widget = _controller_widget(
+        _IndexThatMustNotIterate(10_000),
+        frame_ids=[5],
+        data_1d={5: object()},
+    )
+
+    state = ScanDisplayController().compute_state(widget, dl.Mode.INT_1D)
+
+    assert state.overall is False
+    assert state.render_ids == (5,)
+    assert state.load_status is dl.LoadStatus.READY
+
+
+def test_scan_controller_materializes_full_index_for_overall_render():
+    index = _CountingIndex([0, 1, 2])
+    widget = _controller_widget(
+        index,
+        frame_ids=[0, 1, 2],
+        data_1d={0: object(), 1: object(), 2: object()},
+    )
+
+    state = ScanDisplayController().compute_state(widget, dl.Mode.INT_1D)
+
+    assert index.iterations == 1
+    assert state.overall is True
+    assert state.render_ids == (0, 1, 2)
 
 
 # ── Stage 3: build_payload + render_plan (the testable render core) ───

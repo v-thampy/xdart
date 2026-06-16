@@ -82,6 +82,26 @@ def _candidate_labels(mode, selected_ids, all_frame_index):
     return tuple(selected_ids)
 
 
+class _FrameIndexCount:
+    """Length-only scan-index view for non-Overall renders.
+
+    ``compute_display_state`` only needs the full frame labels when the current
+    selection covers the whole scan.  Auto-last/Single live renders only need
+    ``len(all_frame_index)`` to prove they are *not* Overall.  Carrying a
+    length-only object avoids copying thousands of labels on every timer tick
+    while still making accidental iteration obvious during tests.
+    """
+
+    def __init__(self, count):
+        self._count = int(count)
+
+    def __len__(self):
+        return self._count
+
+    def __iter__(self):
+        raise RuntimeError("frame labels were requested from a count-only index")
+
+
 def _data_snapshot(widget, *, labels=None, include_legacy=True):
     """Snapshot loaded keys + per-frame raw/thumbnail availability.
 
@@ -198,6 +218,10 @@ class _BaseController:
     def compute_state(self, widget, mode):
         all_index, gi = self._all_frame_index(widget)
         selected_ids = list(widget.frame_ids)
+        return self._compute_state_from_inputs(
+            widget, mode, selected_ids=selected_ids, all_index=all_index, gi=gi)
+
+    def _compute_state_from_inputs(self, widget, mode, *, selected_ids, all_index, gi):
         labels = _candidate_labels(mode, selected_ids, all_index)
         store = getattr(widget, "publication_store", None)
         loaded_1d, loaded_2d, raw_avail = _data_snapshot(
@@ -237,12 +261,27 @@ class ScanDisplayController(_BaseController):
     """Int 1D / Int 2D — the integration view.  Reads the scan frame index
     so an Overall selection aggregates the whole scan."""
 
-    def _all_frame_index(self, widget):
-        import numpy as np
+    def _frame_index_count(self, widget):
         with widget.scan.scan_lock:
-            all_index = list(np.asarray(widget.scan.frames.index, dtype=int))
+            count = len(widget.scan.frames.index)
+        gi = bool(getattr(widget.scan, 'gi', False))
+        return count, gi
+
+    def _all_frame_index(self, widget):
+        with widget.scan.scan_lock:
+            all_index = [int(i) for i in widget.scan.frames.index]
         gi = bool(getattr(widget.scan, 'gi', False))
         return all_index, gi
+
+    def compute_state(self, widget, mode):
+        selected_ids = list(widget.frame_ids)
+        count, gi = self._frame_index_count(widget)
+        if mode in (Mode.INT_1D, Mode.INT_2D) and len(selected_ids) == count and count > 1:
+            all_index, gi = self._all_frame_index(widget)
+        else:
+            all_index = _FrameIndexCount(count)
+        return self._compute_state_from_inputs(
+            widget, mode, selected_ids=selected_ids, all_index=all_index, gi=gi)
 
 
 class ImageViewerController(_BaseController):

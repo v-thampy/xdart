@@ -46,6 +46,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | Phase B foundation — headless `FrameRecordStore` | this checkpoint | ✅ `xrd_tools.session` now exposes a Qt-free, bounded, persist-before-evict `FrameRecordStore`; `ScanSession` can optionally populate it from completed frame events and can opt into marking completed writes persisted for durable sinks. This is dormant for xdart until the live-gated store→session projection flip |
 | Phase B hardening — source-aware hydration | this checkpoint | ✅ thinned headless records now learn a real source identity when hydrated from disk and replace, rather than merge, if the hydrator returns a conflicting source |
 | GI-AGG e2e render gate | this checkpoint | ✅ real `displayFrameWidget.update()` now has an offscreen regression proving Overall Average over >64 frames uses the disk-backed aggregate when store-heavy rows are evicted and legacy mirrors are empty |
+| I4 partial — avoid full index materialization for Single/Auto-Last | this checkpoint | ✅ normal one-frame display updates carry only the scan length into the display-decision layer; the full scan index is copied only for true Overall selections |
 
 **Focused verification after the follow-up:** `tests/xdart/test_frame_publication.py`,
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_gui_modes_end_to_end.py`,
@@ -97,6 +98,9 @@ hydration policy slice (`9 passed`). The Phase B foundation passed the headless 
 coverage (`130 passed` for the expanded focused gate). The source-aware hydration hardening passed the
 headless store/session/record slice (`48 passed`). The GI-AGG real-render gap is closed by
 `tests/xdart/test_aggregation_wiring.py::test_real_widget_overall_aggregate_uses_disk_when_store_evicted`.
+The I4 scan-index materialization slice passed the display/publication/aggregate focused set
+(`125 passed / 28 warnings`) and includes a fake-index regression proving Single renders do not iterate
+the full scan index while Overall still does.
 
 **Still live-gated:** full A3/A4 deletion of Role-A `data_1d`/`data_2d` mirrors. The current state is
 a safer pre-live-checkpoint boundary: publication-store-first display, bounded mirrors, and tests for the
@@ -120,7 +124,7 @@ renderer/data-source flip.
 | I2 cache image-dir seed scans | `2f8d05e` | ✅ verified |
 | I3 lazy flat frame masks | `84e1f6b` | ✅ verified |
 | I5 bound image-viewer raw cache | `b070ac4` | ✅ verified |
-| I4 Overall double-pass/double-copy | — | ⏳ OPEN — sequence after Wave 5 (unchanged) |
+| I4 Overall double-pass/double-copy | this checkpoint partial | ◑ single/auto-last index materialization fixed; remaining Overall aggregate double-pass/copy work stays post-Wave-5 |
 | C1 broaden RSM scout | `3216eb3` + `4e5433b` | ✅ verified bit-exact; stale scout wording fixed |
 | C2 reject texture for fixed-q | `6098074` | ✅ verified |
 | C3 surface reintegration save failures | `74038ae` | ✅ verified |
