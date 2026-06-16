@@ -449,7 +449,7 @@ It is **live-gated**, so it is structured as offscreen prep + a live-checkpoint 
 
 ## Wave 4 — Correctness P2s
 
-### C5 — (REVISED — mostly landed; residual is a test) Off-thread aggregate read vs the live writer's file lock (P2 concurrency, S)
+### C5 — DONE: off-thread aggregate read vs the live writer's file lock (P2 concurrency, S)
 - **STATUS — the original premise is STALE; re-verified against HEAD `f47790f`.** The off-thread
   aggregate read **is already serialized against the writer.** `whole_scan_aggregate_1d/2d`
   (`src/xdart/modules/scan_aggregate.py` ~201/220) wraps the read in `with _file_lock(scan):`, which
@@ -457,21 +457,19 @@ It is **live-gated**, so it is structured as offscreen prep + a live-checkpoint 
   ~511), unified because the wrangler creates `LiveScan(..., file_lock=self.file_lock)`
   (`image_wrangler_thread.py` ~2563, the "J2" unification). The torn-read correctness gap is **closed**.
   This is **no longer a hard prerequisite for Wave 5** — ignore the "do C5 first" gating below.
-- **What's left (the only residual) — lock the behavior with a test** (none currently exercises
-  read-during-write):
-  1. Concurrency test: aggregate (1D **and** 2D) while a writer thread holds/append-cycles the file under
-     the shared lock — assert no exception and a correct result (never the silent `result=None` fallback).
-  2. Boundary test for the one genuine race nuance: `_unflushed_tail` snapshots the in-memory tail
-     *before* acquiring `file_lock`, so a frame can flush+evict between snapshot and read. `io.aggregate`
-     already dedups disk-vs-tail **by label** (verified Round-26), so it's handled, not a torn read — but
-     drive exactly that interleave (snapshot tail → flush+evict that label → read) and assert the frame is
-     counted **exactly once**.
+- **Regression tests now landed:** `tests/xdart/test_scan_aggregate.py` exercises both pieces that were
+  previously listed as residual:
+  1. `test_whole_scan_aggregate_waits_for_shared_file_lock` runs 1D and 2D aggregate calls while the
+     shared `scan.file_lock` is held, proving the reader waits instead of racing a writer.
+  2. `test_whole_scan_aggregate_dedups_tail_flushed_after_snapshot` simulates the snapshot→flush interleave
+     and asserts the overlapping frame is counted exactly once by label.
 - **Do NOT "fix" it two tempting-but-wrong ways:** (a) SWMR — the headless writer's SWMR is
   advertised-but-non-functional (`io/nexus.py` ~783) and the xdart writer has none; the `file_lock`
   discipline is the real mechanism and it's already in place. (b) An `H5FilePool` pause/resume bracket —
   unnecessary (same lock, fully serialized) unless a test proves the lock insufficient (it isn't).
-- **Gate:** the two tests above green. No separate live checkpoint needed for C5 (the shared lock
-  guarantees it); the read path is re-exercised under the Wave-5 A3/A4 live checkpoint regardless.
+- **Gate:** `tests/xdart/test_scan_aggregate.py` green. No separate live checkpoint needed for C5 (the
+  shared lock guarantees it); the read path is re-exercised under the Wave-5 A3/A4 live checkpoint
+  regardless.
 
 ### C1 — RSM corner-only scout can under-bound the q grid (P2, S)
 - **Where:** `src/xrd_tools/rsm/gridding.py` `_corner_pixel_q` (~128).
@@ -500,23 +498,25 @@ It is **live-gated**, so it is structured as offscreen prep + a live-checkpoint 
 - **Gate:** `pytest tests/core/test_phase_fitting.py` + a case asserting texture on a structure-less
   phase is refused/correct.
 
-### C3 — Surface reintegration write failure instead of swallowing it (P2, S)
+### C3 — DONE: surface reintegration write failure instead of swallowing it (P2, S)
 - **Where:** `src/xdart/gui/tabs/static_scan/scan_threads.py` `_close_reduction_session` (~120-133) sets
   `self._reduction_write_error = exc` — a flag that is never read.
 - **Problem:** a reintegration write failure on `finish()` is silently lost; the user believes the save
   succeeded.
-- **Fix:** surface the recorded error (status label / error signal), mirroring how the streaming run path
-  reports write failures.
-- **Gate:** a test that injects a write failure on `finish()` and asserts it reaches the user-facing
-  channel.
+- **Fix landed:** `integratorThread._close_reduction_session` now logs the failure, records it in
+  `_reduction_write_error`, and emits `writeError`; `static_scan_widget` wires that signal into the
+  user-facing status/error channel.
+- **Gate:** `tests/xdart/test_reduction_adapters.py::test_reintegrate_close_surfaces_write_failure`
+  and `tests/xdart/test_reduction_adapters.py::test_show_reintegration_write_error_forwards_to_wrangler_status`.
 
-### C4 — Guard the streaming `_failure`/`_cancelled` cross-thread flag reads (P2, S)
+### C4 — DONE: guard the streaming `_failure`/`_cancelled` cross-thread flag reads (P2, S)
 - **Where:** `src/xrd_tools/reduction/core.py` — the writer thread sets `self._failure`/`self._cancelled`
   (~1012) read by the `submit()` thread without a barrier/lock.
 - **Problem:** low-probability stale read on a relaxed-memory platform (benign on CPython today).
-- **Fix:** read/write these under the session's existing lock (cheap), or document the CPython-GIL
-  assumption explicitly if a lock is deemed unnecessary.
-- **Gate:** contract tests (`tests/core/test_contracts.py`) + the streaming/abort tests.
+- **Fix landed:** streaming state is now read/written through `_state_lock` helpers
+  (`_mark_cancelled`, `_record_failure`, `_current_failure`, `_is_cancelled`, `_state_snapshot`).
+- **Gate:** `tests/core/test_contracts.py`, `tests/core/test_reduction_streaming.py`, and the streaming
+  abort/write-failure tests.
 
 ---
 
