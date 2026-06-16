@@ -24,7 +24,7 @@ from pyqtgraph import Qt
 
 # This module imports
 from xdart.utils import catch_h5py_file as catch
-from .hydrated_raw import clear_hydrated_raw, remember_hydrated_raw
+from .hydrated_raw import clear_hydrated_raw
 
 
 
@@ -616,45 +616,6 @@ class fileHandlerThread(Qt.QtCore.QThread):
                                          set_mg=False)
             except KeyError as e:
                 logger.debug("Failed to load scan data from HDF5: %s", e)
-
-    def load_frame(self):
-        """Load a single frame via the v2 lazy loader (LiveFrameSeries.__getitem__)."""
-        try:
-            self.frame = self.scan.frames[self.frame.idx]
-        except KeyError as e:
-            logger.debug("load_frame: %s", e)
-        self.sigUpdate.emit()
-
-    def load_frames(self):
-        """Populate data_1d/data_2d caches by lazy-loading frames via v2.
-
-        LiveFrameSeries.__getitem__ now reads from the stacked
-        ``entry/integrated_1d`` / ``integrated_2d`` arrays and the
-        per-frame ``frames/frame_NNNN/thumbnail`` group.  No v1 frame
-        groups touched.
-        """
-        for idx in self.frame_ids:
-            try:
-                frame = self.scan.frames[int(idx)]
-            except (KeyError, IndexError) as e:
-                logger.debug("Data missing for frame %s: %s", idx, e)
-                continue
-            with self.data_lock:
-                self.data_1d[int(idx)] = frame.copy_for_display(include_2d=False)
-                if self.update_2d:
-                    self.data_2d[int(idx)] = {
-                        'map_raw': getattr(frame, 'map_raw', None),
-                        'bg_raw': getattr(frame, 'bg_raw', 0),
-                        'mask': getattr(frame, 'mask', None),
-                        'int_2d': getattr(frame, 'int_2d', None),
-                        'gi_2d': getattr(frame, 'gi_2d', {}),
-                        'thumbnail': getattr(frame, 'thumbnail', None),
-                    }
-                    if getattr(frame, 'map_raw', None) is not None:
-                        # D5: trim the shared hydrated-raw LRU on the
-                        # worker insert path too.
-                        remember_hydrated_raw(self.data_2d, int(idx))
-        self.sigUpdate.emit()
 
     def save_data_as(self):
         if self.new_fname is not None and self.new_fname != "":

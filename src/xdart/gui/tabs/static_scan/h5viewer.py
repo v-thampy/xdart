@@ -1005,12 +1005,11 @@ class H5Viewer(QWidget):
         self.data_changed(show_all=True)
 
     def thread_finished(self, task):
-        if task != "load_frame":
-            self.update()
-            if getattr(self, '_auto_select_last_on_finish', False):
-                self._auto_select_last_on_finish = False
-                if self.ui.listData.count() > 0:
-                    self.set_current_frame(self.ui.listData.count() - 1)
+        self.update()
+        if getattr(self, '_auto_select_last_on_finish', False):
+            self._auto_select_last_on_finish = False
+            if self.ui.listData.count() > 0:
+                self.set_current_frame(self.ui.listData.count() - 1)
         self.sigThreadFinished.emit()
     
     def _scans_single_clicked(self, q):
