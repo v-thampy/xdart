@@ -188,6 +188,11 @@ class ScanSession:
     confirmation.  Feed frames with :meth:`submit`; consume results by
     registering :meth:`on_frame_completed`.  Always :meth:`finish` (or use it as
     a context manager) to drain the writer + finalize the sink.
+
+    ``record_store`` is optional and dormant for existing callers.  When supplied,
+    completed frame records are upserted after the sink write.  Set
+    ``record_store_persisted_on_write=True`` only for sinks whose write hook is
+    durable enough that old heavy arrays may be evicted.
     """
 
     def __init__(
@@ -202,6 +207,7 @@ class ScanSession:
         cancel_token: Any | None = None,
         clear_frame_images: bool = False,
         record_store: FrameRecordStore | None = None,
+        record_store_persisted_on_write: bool = False,
     ) -> None:
         self._lock = threading.RLock()
         self._frame_cbs: list[Callable[[FrameEvent], None]] = []
@@ -212,6 +218,7 @@ class ScanSession:
         self._generation = 0
         self._mode_key = _mode_key_from_plan(plan)
         self._record_store = record_store
+        self._record_store_persisted_on_write = bool(record_store_persisted_on_write)
         self._user_sink = sink
         event_sink = _EventSink(sink, self._on_completed)
         # Streaming + retain_products=False: per-frame results are delivered via
@@ -407,6 +414,7 @@ class ScanSession:
             self._record_store.upsert(
                 FrameRecord.from_view(view, mode_1d=mode_1d, mode_2d=mode_2d),
                 source_identity=getattr(frame, "source_identity", None),
+                persisted=self._record_store_persisted_on_write,
             )
         except Exception:
             logger.exception("ScanSession record_store upsert failed")

@@ -483,3 +483,23 @@ def test_optional_record_store_receives_completed_frame_records():
     assert rec.modes_1d == ("default",)
     np.testing.assert_allclose(rec.view_1d().intensity_1d, [0.0, 1.0])
     assert store.source_identity(0) == "/tmp/source.tif#0"
+
+
+def test_optional_record_store_can_mark_completed_writes_persisted_for_eviction():
+    store = FrameRecordStore(max_heavy_items=1)
+    frames = _frames(2)
+    sess = ScanSession(
+        ReductionPlan(integration_2d=None),
+        Scan("s", frames, integrator=object()),
+        sink=MemorySink(),
+        executor=2,
+        record_store=store,
+        record_store_persisted_on_write=True,
+    )
+    for fr in frames:
+        sess.submit(fr)
+    sess.finish()
+
+    assert store.get(0) is not None and store.get(1) is not None
+    assert not store.has_heavy_payload(0)
+    assert store.has_heavy_payload(1)
