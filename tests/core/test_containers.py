@@ -497,6 +497,20 @@ class TestIntegrationResult2DNew:
     def test_slots_no_dict(self, r2d_q):
         assert not hasattr(r2d_q, "__dict__")
 
+    def test_payload_arrays_are_float32(self):
+        r = IntegrationResult2D(
+            radial=np.arange(3, dtype=np.float64),
+            azimuthal=np.arange(4, dtype=np.float64),
+            intensity=np.ones((3, 4), dtype=np.float64),
+            sigma=np.ones((3, 4), dtype=np.float64),
+        )
+
+        assert r.radial.dtype == np.float64
+        assert r.azimuthal.dtype == np.float64
+        assert r.intensity.dtype == np.float32
+        assert r.sigma is not None
+        assert r.sigma.dtype == np.float32
+
     # ------------------------------------------------------------------
     # to_unit (radial)
     # ------------------------------------------------------------------
