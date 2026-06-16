@@ -55,6 +55,35 @@ def _stream(plan, frames, sink, **kw):
     return session, session.finish()
 
 
+class _ThreadSpyDurableSink:
+    """Sink that behaves like a durable output channel for execution tests."""
+
+    def __init__(self):
+        self.write_threads: list[int] = []
+        self.frames: dict[int, object] = {}
+
+    def begin(self, scan, plan):
+        self.write_threads.clear()
+        self.frames.clear()
+
+    def write(self, frame, reduction):
+        self.write_threads.append(threading.get_ident())
+        self.frames[int(frame.index)] = reduction
+
+    def finish(self, result):
+        return None
+
+
+class _ThreadSpyMemorySink(MemorySink):
+    def __init__(self):
+        super().__init__()
+        self.write_threads: list[int] = []
+
+    def write(self, frame, reduction):
+        self.write_threads.append(threading.get_ident())
+        super().write(frame, reduction)
+
+
 # ---------------------------------------------------------------------------
 # Equivalence with the chunked oracle
 # ---------------------------------------------------------------------------
@@ -76,6 +105,56 @@ def test_streaming_output_matches_chunked(monkeypatch):
             sink.frames[idx].result_1d.intensity,
             chunked.frames[idx].result_1d.intensity,
         )
+
+
+def test_run_reduction_defaults_to_streaming_for_durable_sink(monkeypatch):
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    main_thread = threading.get_ident()
+    sink = _ThreadSpyDurableSink()
+
+    result = run_reduction(
+        _plan(), Scan("durable", _frames(4), integrator=object()), sink=sink,
+    )
+
+    assert sorted(sink.frames) == [0, 1, 2, 3]
+    assert result.n_processed == 4
+    assert result.frames == {}
+    assert sink.write_threads
+    assert all(thread != main_thread for thread in sink.write_threads)
+
+
+def test_run_reduction_memory_sink_default_stays_chunked(monkeypatch):
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    main_thread = threading.get_ident()
+    sink = _ThreadSpyMemorySink()
+
+    result = run_reduction(
+        _plan(), Scan("memory", _frames(3), integrator=object()), sink=sink,
+    )
+
+    assert sorted(sink.frames) == [0, 1, 2]
+    assert sorted(result.frames) == [0, 1, 2]
+    assert sink.write_threads == [main_thread, main_thread, main_thread]
+
+
+def test_run_reduction_explicit_chunked_overrides_durable_default(monkeypatch):
+    monkeypatch.setattr(reduction_core, "integrate_1d",
+                        lambda image, ai, **kw: _r1d(float(np.sum(image))))
+    main_thread = threading.get_ident()
+    sink = _ThreadSpyDurableSink()
+
+    result = run_reduction(
+        _plan(),
+        Scan("durable", _frames(2), integrator=object()),
+        sink=sink,
+        execution="chunked",
+    )
+
+    assert sorted(sink.frames) == [0, 1]
+    assert sorted(result.frames) == [0, 1]
+    assert sink.write_threads == [main_thread, main_thread]
 
 
 def test_streaming_correct_under_scrambled_completion(monkeypatch):

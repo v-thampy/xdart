@@ -280,7 +280,7 @@ def test_run_reduction_memory_sink_and_chunked_keep_retention(monkeypatch):
     result = run_reduction(
         ReductionPlan(integration_2d=None),
         Scan("s", _frames(2), integrator=object()),
-        _DuckDurableSink(),
+        _DuckDurableSink(), execution="chunked",
     )
     assert sorted(result.frames) == [0, 1]
 

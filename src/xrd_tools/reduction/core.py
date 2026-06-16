@@ -1475,7 +1475,7 @@ def run_reduction(
     cancel_token: CancelToken | None = None,
     executor: Any | None = None,
     gi_freeze_mode: str | None = None,
-    execution: str = "chunked",
+    execution: str | None = None,
     inflight_max: int | None = None,
     retain_products: bool | None = None,
 ) -> ReductionResult:
@@ -1516,11 +1516,14 @@ def run_reduction(
         output-axis ranges before the main reduction.  Explicit caller ranges
         are preserved.
     execution
-        ``"chunked"`` (default) integrates frames in chunks; ``"streaming"``
-        submits each frame to a bounded in-flight window drained by one writer
-        thread (out-of-order completion, single-writer sink) — the same engine
-        xdart's GUI uses by default, exposed here so notebook/headless callers
-        get it without hand-driving :class:`ReductionSession`.
+        ``None`` (default) auto-selects ``"streaming"`` for durable sinks such
+        as :class:`NexusSink` / :class:`XYESink`, and ``"chunked"`` for
+        in-memory/no-sink calls.  Pass ``"chunked"`` or ``"streaming"``
+        explicitly to override.  Streaming submits each frame to a bounded
+        in-flight window drained by one writer thread (out-of-order completion,
+        single-writer sink) — the same engine xdart's GUI uses by default,
+        exposed here so notebook/headless callers get it without hand-driving
+        :class:`ReductionSession`.
     inflight_max
         Streaming only: max frames in flight (defaults to ``2 × workers``).
         Bounds peak memory for a fast source feeding a slower reduce.
@@ -1532,16 +1535,16 @@ def run_reduction(
         otherwise (MemorySink / no sink / chunked — ``result.frames`` is the
         only way to get results back).  Pass an explicit bool to override.
     """
+    sink_obj = _coerce_sink(sink)
+    durable_sink = not _sink_is_memory_only(sink_obj)
+    if execution is None:
+        execution = "streaming" if durable_sink else "chunked"
     if retain_products is None:
-        retain_products = not (
-            execution == "streaming"
-            and sink is not None
-            and not isinstance(sink, MemorySink)
-        )
+        retain_products = not (execution == "streaming" and durable_sink)
     with ReductionSession(
         plan,
         scan,
-        sink,
+        sink_obj,
         chunk_size=chunk_size,
         clear_frame_images=clear_frame_images,
         progress_cb=progress_cb,
@@ -2578,6 +2581,15 @@ def _sink_path(sink: ReductionSink) -> Path | None:
                 return path
     path = getattr(sink, "path", None)
     return path if isinstance(path, Path) else None
+
+
+def _sink_is_memory_only(sink: ReductionSink) -> bool:
+    """Whether a sink leaves ``ReductionResult.frames`` as the only product."""
+    if isinstance(sink, MemorySink):
+        return True
+    if isinstance(sink, CompositeSink):
+        return all(_sink_is_memory_only(child) for child in sink.sinks)
+    return False
 
 
 def _iter_reduction_chunks(
