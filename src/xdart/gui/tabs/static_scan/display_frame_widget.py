@@ -2177,8 +2177,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # returns None when not every selected frame contributes; a None
             # here is only partial coverage (not a 1D-only scan) if the
             # subset-average path WOULD have returned something.
-            bkg_2d, _, _ = self.get_frames_int_2d(idxs, require_all=True)
-            if bkg_2d is None and self.get_frames_int_2d(idxs)[0] is not None:
+            bkg_2d, _, _ = self.get_frames_int_2d(
+                idxs, require_all=True, allow_blocking_read=True)
+            if (
+                bkg_2d is None
+                and self.get_frames_int_2d(
+                    idxs, allow_blocking_read=True)[0] is not None
+            ):
                 logger.error(
                     "Set Bkg refused: the 2D background covers only part of the "
                     "selection (some frames' 2D data is unavailable) — a partial "
@@ -2193,7 +2198,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     pass
                 return  # button stays 'Set Bkg'; no wrong background applied
 
-            self.bkg_1d, _ = self.get_frames_int_1d(idxs, rv='average')
+            self.bkg_1d, _ = self.get_frames_int_1d(
+                idxs, rv='average', allow_blocking_read=True)
             self.bkg_2d = bkg_2d
             # Set-Bkg is a one-shot user action on an idle scan: block-and-read
             # an evicted frame's raw from disk rather than defer to the async

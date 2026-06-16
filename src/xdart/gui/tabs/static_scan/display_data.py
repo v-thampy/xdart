@@ -146,6 +146,16 @@ class DisplayDataMixin:
             return store.get_or_hydrate(key)
         publication = store.get(key)
         if publication is None:
+            request = getattr(self, "_request_frame_hydration", None)
+            if request is not None:
+                try:
+                    request(int(key))
+                except Exception:
+                    logger.debug(
+                        "publication hydration request failed for %s",
+                        key,
+                        exc_info=True,
+                    )
             return None
         # Do not synchronously open the NeXus file from the GUI thread.  Queue
         # full-payload hydration when the selected publication has been thinned.
@@ -161,6 +171,25 @@ class DisplayDataMixin:
                         exc_info=True,
                     )
         return publication
+
+    def _display_hydration_should_block(self, allow_blocking_read=None) -> bool:
+        """Whether a display fallback may synchronously hydrate from disk."""
+        async_enabled = bool(getattr(self, "_async_hydration_enabled", False))
+        return (
+            (not async_enabled)
+            if allow_blocking_read is None
+            else bool(allow_blocking_read)
+        )
+
+    def _request_missing_publication(self, idx) -> None:
+        request = getattr(self, "_request_frame_hydration", None)
+        if request is None:
+            return
+        try:
+            request(int(idx))
+        except Exception:
+            logger.debug("publication hydration request failed for %s", idx,
+                         exc_info=True)
 
     def _selected_publication_views(self, publication):
         """Return the current 1D/2D mode views from a publication record."""
@@ -581,7 +610,8 @@ class DisplayDataMixin:
 
     # ── 2D integration data access ────────────────────────────────
 
-    def get_frames_int_2d(self, idxs=None, *, require_all=False):
+    def get_frames_int_2d(self, idxs=None, *, require_all=False,
+                          allow_blocking_read=None):
         """Return 2D frame data for multiple frames (averaged).
 
         Mirrors :meth:`get_frames_map_raw` / :meth:`get_frames_int_1d`:
@@ -603,7 +633,10 @@ class DisplayDataMixin:
         if not idxs:
             return None, None, None
 
-        snapshot = self._snapshot_data(idxs)
+        snapshot = self._snapshot_data(
+            idxs, allow_blocking_read=allow_blocking_read)
+        should_block = self._display_hydration_should_block(
+            allow_blocking_read)
 
         intensity = None
         xdata = ydata = None
@@ -616,8 +649,11 @@ class DisplayDataMixin:
                 # hydrate the cake from the on-disk integrated_2d stack so a
                 # selection larger than the cache averages ALL selected frames,
                 # not just the cached subset (the silent-partial bug).
-                lf = self._hydrate_frame_from_disk(int(idx))
+                lf = self._hydrate_frame_from_disk(
+                    int(idx), allow_blocking_read=should_block)
                 if lf is None or getattr(lf, 'int_2d', None) is None:
+                    if not should_block:
+                        self._request_missing_publication(int(idx))
                     continue
                 frame_1d = lf
                 frame_2d = {
@@ -712,12 +748,16 @@ class DisplayDataMixin:
 
     # ── 1D integration data access ────────────────────────────────
 
-    def get_frames_int_1d(self, idxs=None, rv='all', *, require_all=False):
+    def get_frames_int_1d(self, idxs=None, rv='all', *, require_all=False,
+                          allow_blocking_read=None):
         """Return 1D data for multiple frames"""
         if idxs is None:
             idxs = self.idxs_1d
         idxs = list(idxs)
-        snapshot = self._snapshot_data(idxs)
+        snapshot = self._snapshot_data(
+            idxs, allow_blocking_read=allow_blocking_read)
+        should_block = self._display_hydration_should_block(
+            allow_blocking_read)
 
         # Collect rows then stack once.  The previous code re-allocated a
         # growing array with np.vstack on every iteration — O(N^2) over the
@@ -733,8 +773,11 @@ class DisplayDataMixin:
                 # the whole scan covers ALL selected frames.  Do not fall back
                 # to the legacy mirrors in normal scan mode; those are no
                 # longer authoritative and may contain stale rows.
-                lf = self._hydrate_frame_from_disk(int(idx))
+                lf = self._hydrate_frame_from_disk(
+                    int(idx), allow_blocking_read=should_block)
                 if lf is None or getattr(lf, 'int_1d', None) is None:
+                    if not should_block:
+                        self._request_missing_publication(int(idx))
                     continue
                 frame_1d = lf
                 if frame_2d is None:

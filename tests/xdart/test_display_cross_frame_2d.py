@@ -321,3 +321,64 @@ class TestSetBkgRawBlockingRead:
         assert (1, False) in calls               # served the async helper
         assert queued == [1]                      # evicted frame queued off-thread
         assert out is None                        # async path can't complete inline
+
+
+class TestIntegrationHydrationBlockingPolicy:
+    """Integration display reads follow the same slow-computer rule as raw:
+    render paths queue missing frames, explicit background operations may block."""
+
+    @staticmethod
+    def _host_async_with_evicted_integration():
+        host = _make_host(
+            scan=SimpleNamespace(frames=SimpleNamespace(index=[0, 1]),
+                                 mask_sentinel=False),
+            data_2d={},
+            data_1d={},
+        )
+        host._async_hydration_enabled = True
+        host._processing_active = False
+        host.normalize = lambda data, info: data
+        calls = []
+        queued = []
+
+        def fake_hydrate(idx, *, allow_blocking_read=True):
+            calls.append((int(idx), allow_blocking_read))
+            if allow_blocking_read:
+                return SimpleNamespace(
+                    int_1d=_ir1d(int(idx) + 1, nq=4),
+                    int_2d=_ir2d(int(idx) + 1, nq=4, nchi=3),
+                    gi_2d={},
+                    scan_info={},
+                )
+            return None
+
+        host._hydrate_frame_from_disk = fake_hydrate
+        host._request_frame_hydration = lambda idx: queued.append(int(idx))
+        return host, calls, queued
+
+    def test_default_integration_render_path_queues_instead_of_blocking(self):
+        host, calls, queued = self._host_async_with_evicted_integration()
+
+        cake, _x, _y = host.get_frames_int_2d([0, 1], require_all=True)
+        ydata, xdata = host.get_frames_int_1d([0, 1], require_all=True)
+
+        assert cake is None
+        assert ydata is None and xdata is None
+        assert calls == [(0, False), (1, False), (0, False), (1, False)]
+        assert queued == [0, 1, 0, 1]
+
+    def test_explicit_blocking_integration_read_covers_evicted_frames(self):
+        host, calls, queued = self._host_async_with_evicted_integration()
+
+        cake, _x, _y = host.get_frames_int_2d(
+            [0, 1], require_all=True, allow_blocking_read=True)
+        ydata, xdata = host.get_frames_int_1d(
+            [0, 1], require_all=True, allow_blocking_read=True)
+
+        assert cake is not None
+        assert ydata is not None and xdata is not None
+        np.testing.assert_allclose(cake, 1.5, atol=1e-6)
+        np.testing.assert_allclose(ydata, [[1.0] * 4, [2.0] * 4], atol=1e-6)
+        np.testing.assert_allclose(np.nanmean(ydata, axis=0), 1.5, atol=1e-6)
+        assert calls == [(0, True), (1, True), (0, True), (1, True)]
+        assert queued == []
