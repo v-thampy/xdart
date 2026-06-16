@@ -30,6 +30,7 @@ from .display_logic import (
     x_axis_for_unit,
     convert_2d_radial,
     is_gi_2d_units,
+    nanmean_slice,
 )
 from .display_constants import AA_inv, Deg, Th, x_labels_2D, x_units_2D
 
@@ -440,17 +441,23 @@ class PublicationDisplayAdapter:
         # the legacy update_plot (which hydrates every selected frame from disk via
         # get_frames_int_1d) when ANY intended frame is not resident in the
         # publication STORE — otherwise a whole-scan Sum/Average/Overall would
-        # SILENTLY drop the evicted frames.  Gate on the STORE-ONLY residency
-        # (available_1d_keys/available_2d_keys, built from this adapter's store
-        # snapshot), NOT state.render_ids: render_ids OR-merges the store with the
+        # SILENTLY drop the evicted frames.  Check STORE-ONLY residency per selected
+        # frame, NOT state.render_ids: render_ids OR-merges the store with the
         # UNBOUNDED legacy data_1d (display_controllers._data_snapshot), so on a
         # >max_heavy_items scan it still lists evicted frames and masks the
         # eviction.  selected_ids holds the full intended set for both overall
-        # (= all_frame_index) and explicit selections (resolve_selection).
-        selected = {int(i) for i in state.selected_ids}
-        resident = self.available_2d_keys() if needs_2d else self.available_1d_keys()
-        if not selected <= resident:
-            return None
+        # (= all_frame_index) and explicit selections (resolve_selection).  Done
+        # per selected frame (O(selection)) rather than building the whole store's
+        # available-key set (O(store)) so a single-frame live render stays O(1).
+        for label in state.selected_ids:
+            pub = self._items.get(_label_key(label))
+            if pub is None:
+                return None
+            if needs_2d:
+                if not pub.view.has_2d or publication_has_2d_errors(pub):
+                    return None
+            elif not pub.view.has_1d or publication_has_1d_errors(pub):
+                return None
 
         traces = []
         axis = None
@@ -565,10 +572,14 @@ class PublicationDisplayAdapter:
                 center = width = None
             if center is not None and width is not None and slice_vals.size:
                 inds = (center - width <= slice_vals) & (slice_vals <= center + width)
+        # nanmean_slice: None when the slice selects 0 bins, and no
+        # "Mean of empty slice" warning on an all-NaN column (GI empty bins).
         if reduce_axis == 0:
-            y = np.nanmean(intensity[inds, :], axis=0)
+            y = nanmean_slice(intensity[inds, :], 0)
         else:
-            y = np.nanmean(intensity[:, inds], axis=1)
+            y = nanmean_slice(intensity[:, inds], 1)
+        if y is None:
+            return None
         y = self._normalize(y, publication.metadata_raw)
         this_axis = None
         if convert:

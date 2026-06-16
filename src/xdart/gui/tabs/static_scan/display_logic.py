@@ -35,6 +35,7 @@ them.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from enum import Enum
 
@@ -497,6 +498,20 @@ def x_axis_for_unit(unit):
     used by both normal mode and the XYE viewer.  ``'unknown'`` (and any
     unrecognised unit) → ``('x', '')`` — never an assumed 2θ."""
     return _X_AXIS_TABLE.get(unit, ('x', ''))
+
+
+def nanmean_slice(arr, axis):
+    """``np.nanmean`` over ``axis`` for a 2D->1D slice projection that (a) returns
+    ``None`` when the reduce axis is empty (no bins selected) and (b) never emits
+    the "Mean of empty slice" RuntimeWarning on an all-NaN column (GI empty/padded
+    bins legitimately reduce to a NaN gap — kept, not plotted).  Used by both the
+    publication slice path and the legacy get_int_1d 2D path so neither warns."""
+    arr = np.asarray(arr, dtype=float)
+    if arr.ndim <= axis or arr.shape[axis] == 0:
+        return None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return np.nanmean(arr, axis=axis)
 
 
 def pretty_unit(unit):

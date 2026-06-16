@@ -686,12 +686,20 @@ class DisplayDataMixin:
             _range = [center - width, center + width]
             _inds = (_range[0] <= slice_data) & (slice_data <= _range[1])
 
+        # nanmean_slice never warns "Mean of empty slice" on an all-NaN column
+        # (GI empty bins); a 0-bin slice -> None -> keep the array contract with an
+        # all-NaN curve of the surviving-axis length.
+        from .display_logic import nanmean_slice
         if reduce_axis == 0:
             # Reducing over radial (axis 0): _inds filters radial rows
-            ydata = np.nanmean(intensity[_inds, :], axis=0)
+            ydata = nanmean_slice(intensity[_inds, :], 0)
+            if ydata is None:
+                ydata = np.full(intensity.shape[1], np.nan)
         else:
             # Reducing over azimuthal (axis 1): _inds filters azimuthal cols
-            ydata = np.nanmean(intensity[:, _inds], axis=1)
+            ydata = nanmean_slice(intensity[:, _inds], 1)
+            if ydata is None:
+                ydata = np.full(intensity.shape[0], np.nan)
 
         self.show_slice_overlay()
 

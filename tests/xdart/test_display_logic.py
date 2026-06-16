@@ -793,3 +793,19 @@ def test_render_plan_draw_keys_carry_all_rsm_instances():
         assert k in plan.draw_keys           # every instance drawn (key-level)
     # role-level draw still collapses (what the renderer consumes today)
     assert plan.draw[:2] == (dl.PanelRole.SLICE_2D, dl.PanelRole.PROJ_1D)
+
+
+def test_nanmean_slice_guards_empty_and_all_nan():
+    # codex P2: the 2D->1D slice projection must not emit "Mean of empty slice"
+    # on a 0-bin slice or an all-NaN column (GI empty bins).
+    import warnings as _w
+    import numpy as _np
+    a = _np.array([[1.0, 2.0], [3.0, 4.0]])
+    _np.testing.assert_allclose(dl.nanmean_slice(a, 0), [2.0, 3.0])   # normal mean
+    assert dl.nanmean_slice(a[0:0, :], 0) is None                     # 0-bin -> None
+    # all-NaN column -> NaN (gap), NOT a warning
+    nan_col = _np.array([[_np.nan, 1.0], [_np.nan, 3.0]])
+    with _w.catch_warnings():
+        _w.simplefilter("error", RuntimeWarning)     # a "Mean of empty slice" would raise
+        out = dl.nanmean_slice(nan_col, 0)
+    assert _np.isnan(out[0]) and out[1] == 2.0
