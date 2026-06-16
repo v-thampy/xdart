@@ -1869,6 +1869,12 @@ def test_gi_config_roundtrips_to_reduction_config(tmp_path):
     assert gi["gi_mode_1d"] == "q_oop"
     assert gi["gi_mode_2d"] == "qip_qoop"
 
+    from xdart.modules.ewald.scan import LiveScan
+    loaded = LiveScan(name="gi", data_file=str(path))
+    loaded.load_from_h5()
+    assert loaded.gi_config["gi_mode_1d"] == "q_oop"
+    assert loaded.gi_config["gi_mode_2d"] == "qip_qoop"
+
 
 def test_gi_freeze_diagnostic_persisted_in_provenance(tmp_path):
     # Codex P2: the T0-4 first-chunk-freeze advisory must survive in the

@@ -670,6 +670,8 @@ class LiveScan:
             self.bai_1d_args = dict(config["bai_1d_args"])
         if isinstance(config.get("bai_2d_args"), dict):
             self.bai_2d_args = dict(config["bai_2d_args"])
+        if isinstance(config.get("gi_config"), dict):
+            self.gi_config = dict(config["gi_config"])
         # geometry config → DiffractometerGeometry instance
         geom_cfg = config.get("geometry")
         if isinstance(geom_cfg, dict) and geom_cfg.get("mapping_json"):

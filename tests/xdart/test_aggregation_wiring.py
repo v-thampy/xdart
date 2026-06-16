@@ -123,9 +123,22 @@ def test_widget_async_aggregate_none_is_retryable(tmp_path):
     assert len(calls) == 2
 
 
-def test_widget_whole_scan_aggregate_defers_for_gi(tmp_path):
+def test_widget_whole_scan_aggregate_allows_primary_gi(tmp_path):
     scan, _, _ = _split_scan_2d(tmp_path, n=12)
-    scan.gi = True                               # non-primary mode resolution = Step 6
+    scan.gi = True
+    scan.bai_2d_args = {"gi_mode_2d": "qip_qoop"}
+    scan.gi_config = {"gi_mode_2d": "qip_qoop"}
+    duck = _duck_widget(scan)
+    agg = _call_whole_scan_aggregate(duck, dim="2d", method="average")
+    assert agg is not None
+    np.testing.assert_allclose(agg.intensity, np.mean(np.arange(1, 13)))
+
+
+def test_widget_whole_scan_aggregate_defers_for_nonprimary_gi(tmp_path):
+    scan, _, _ = _split_scan_2d(tmp_path, n=12)
+    scan.gi = True
+    scan.bai_2d_args = {"gi_mode_2d": "q_chi"}          # currently displayed
+    scan.gi_config = {"gi_mode_2d": "qip_qoop"}         # primary on disk
     duck = _duck_widget(scan)
     assert _call_whole_scan_aggregate(duck, dim="2d", method="average") is None
 
@@ -191,6 +204,26 @@ def test_cake_image_routes_sum_eviction_to_sum_aggregate():
     assert calls == [("2d", "sum")]
 
 
+def test_cake_image_blocks_nonprimary_gi_instead_of_falling_back():
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+
+    widget = SimpleNamespace(
+        bkg_2d=0,
+        scan=SimpleNamespace(),
+        _aggregate_display_is_primary=lambda _scan, _dim: False,
+        _whole_scan_aggregate=lambda *, dim, method: pytest.fail(
+            "non-primary GI aggregate must not read a partial stack"),
+    )
+    adapter = PublicationDisplayAdapter(store=None, widget=widget)
+    state = _fake_state(overall=True, selected_ids=(0,), render_ids=())
+
+    payload = adapter.cake_image(state)
+
+    assert payload is not None
+    assert payload.image.size == 0
+
+
 def test_plot_payload_routes_overall_eviction_to_1d_aggregate():
     from xdart.gui.tabs.static_scan.display_publication import (
         PublicationDisplayAdapter)
@@ -219,6 +252,25 @@ def test_plot_payload_routes_overall_eviction_to_1d_aggregate():
     assert len(payload.traces) == 1
     np.testing.assert_allclose(payload.traces[0].x, q)
     np.testing.assert_allclose(payload.traces[0].y, 15.5)
+
+
+def test_plot_payload_blocks_nonprimary_gi_instead_of_falling_back():
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+
+    widget = SimpleNamespace(
+        scan=SimpleNamespace(name="scan"),
+        _aggregate_display_is_primary=lambda _scan, _dim: False,
+        _whole_scan_aggregate=lambda *, dim, method: pytest.fail(
+            "non-primary GI aggregate must not read a partial stack"),
+    )
+    adapter = PublicationDisplayAdapter(store=None, widget=widget)
+    state = _fake_state(overall=True, selected_ids=(0,), render_ids=(), method="Average")
+
+    payload = adapter.integration_plot_payload(state)
+
+    assert payload is not None
+    assert payload.traces == ()
 
 
 def test_cake_image_blanks_non_overall_eviction():

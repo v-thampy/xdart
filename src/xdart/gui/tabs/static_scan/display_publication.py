@@ -425,6 +425,17 @@ class PublicationDisplayAdapter:
         idx = 1 if want_tth else 0
         return Axis(label=x_labels_2D[idx], unit=x_units_2D[idx], values=new_values)
 
+    def _aggregate_display_is_primary(self, dim: str) -> bool:
+        widget = self._widget
+        scan = getattr(widget, "scan", None)
+        gate = getattr(widget, "_aggregate_display_is_primary", None)
+        if scan is None or gate is None:
+            return True
+        try:
+            return bool(gate(scan, dim))
+        except Exception:
+            return False
+
     def _aggregate_cake_payload(self, state):
         """Whole-scan (Overall) cake from the on-disk aggregate (Step 7b) when
         frames are evicted past the heavy store bound — the §2.C blank, filled.
@@ -442,6 +453,8 @@ class PublicationDisplayAdapter:
         widget = self._widget
         if widget is None or not hasattr(widget, "_whole_scan_aggregate"):
             return None
+        if not self._aggregate_display_is_primary("2d"):
+            return ImagePayload(image=np.empty((0, 0), dtype=float))
         method = "sum" if state.method == "Sum" else "average"
         agg = widget._whole_scan_aggregate(dim="2d", method=method)
         if agg is None or agg.intensity is None:
@@ -491,6 +504,8 @@ class PublicationDisplayAdapter:
         widget = self._widget
         if widget is None or not hasattr(widget, "_whole_scan_aggregate"):
             return None
+        if not self._aggregate_display_is_primary("1d"):
+            return PlotPayload(axis_x=Axis(label="", unit=""), traces=())
         method = "sum" if state.method == "Sum" else "average"
         agg = widget._whole_scan_aggregate(dim="1d", method=method)
         if agg is None or agg.intensity is None:

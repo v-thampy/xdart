@@ -780,22 +780,49 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._aggregation_worker = worker
         return self._aggregation_worker
 
+    def _aggregate_display_is_primary(self, scan, dim: str) -> bool:
+        """True when the displayed mode is the top-level persisted stack.
+
+        Whole-scan aggregates read the primary on-disk stack.  For GI scans that
+        is safe only when the current display mode matches the persisted
+        ``gi_config`` mode; otherwise a non-primary mode may be partial/lazy and
+        must not fall back to a bounded resident subset.
+        """
+        from xdart.modules.scan_aggregate import mode_aggregation_allowed
+
+        if not getattr(scan, "gi", False):
+            return mode_aggregation_allowed(None, None)
+
+        gi_config = getattr(scan, "gi_config", None) or {}
+        if dim == "1d":
+            displayed = getattr(scan, "bai_1d_args", {}).get(
+                "gi_mode_1d", "q_total")
+            primary = gi_config.get("gi_mode_1d", displayed)
+        else:
+            displayed = getattr(scan, "bai_2d_args", {}).get(
+                "gi_mode_2d", "qip_qoop")
+            primary = gi_config.get("gi_mode_2d", displayed)
+        return mode_aggregation_allowed(displayed, primary)
+
     def _whole_scan_aggregate(self, *, dim, method):
         """Return the whole-scan Sum/Average for the current Overall selection as
         an ``Aggregated1D``/``Aggregated2D``, or ``None`` when it isn't available
         this render (defer to the resident-store / legacy path).
 
-        Primary-mode-scoped (ADR-0003): only served for a non-GI scan, where the
-        displayed mode IS the primary on-disk stack.  A GI scan's displayed mode
-        may be a non-primary sub-mode whose on-disk stack is partial, so it is
-        deferred here (GI mode resolution lands with the instant-switch step).
+        Primary-mode-scoped (ADR-0003): only served when the displayed mode IS
+        the primary on-disk stack.  For GI, the persisted ``scan.gi_config``
+        records that primary mode; non-primary modes defer rather than silently
+        aggregating a partial stack or a bounded in-memory subset.
         Async (live): dispatch to the worker and return None now (re-render on
         completion).  Sync (headless): compute inline."""
-        from xdart.modules.scan_aggregate import mode_aggregation_allowed
         scan = getattr(self, "scan", None)
-        if scan is None or getattr(scan, "gi", False):
+        if scan is None:
             return None
-        if not mode_aggregation_allowed(None, None):     # non-GI: primary==primary
+        gate = getattr(self, "_aggregate_display_is_primary", None)
+        if gate is None:  # unbound duck-widget tests call this method directly
+            gate = displayFrameWidget._aggregate_display_is_primary.__get__(
+                self, type(self))
+        if not gate(scan, str(dim)):
             return None
         norm_channel = None
         try:

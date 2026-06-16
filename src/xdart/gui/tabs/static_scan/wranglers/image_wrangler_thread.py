@@ -811,9 +811,9 @@ class imageThread(wranglerThread):
                     _perf['collect_read'] += _t_read_accum
                     _perf['dispatch'] += _disp_dt
                     _perf['dispatch_frames'] += len(pending)
-                if self.batch_mode or _t_read_accum >= 0.5:
+                if _t_read_accum >= 0.5 or _disp_dt >= 0.5:
                     logger.info(
-                        '[FLUSH] %d frames  read=%.2fs  dispatch=%.2fs',
+                        '[DISPATCH] %d frames  read=%.2fs  dispatch=%.2fs',
                         len(pending), _t_read_accum, _disp_dt,
                     )
                 pending = []
