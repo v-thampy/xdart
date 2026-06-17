@@ -1926,13 +1926,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.slice_width.setEnabled(active)
 
     def _on_share_axis_toggled(self, checked):
-        """Rescale the 1D plot to its own data when Share Axis is turned off.
+        """Rescale the active bottom panel to its own data when Share Axis is off.
 
-        While shared, the 1D plot's x-axis is XLinked to the 2D cake; the
-        ``update`` slot calls ``setXLink(None)`` on uncheck but pyqtgraph
-        leaves the view frozen at the cake's range, so the user sees a
-        stuck axis.  Re-enable autoRange so it fits the 1D curve."""
-        if not checked:
+        While shared, ``_align_plot_under_cake`` pins the bottom plot's x-range
+        (x-auto off) geometrically so its Q columns line up under the cake; on
+        uncheck ``_set_share_link`` detaches but leaves the view frozen at that
+        range, so re-arm ``autoRange`` on the active bottom plot (waterfall or 1D
+        line) to refit its own data.  Processing-mode only — Share Axis is hidden
+        in viewer modes, and the only programmatic uncheck is INT-gated."""
+        if not checked and getattr(self, "viewer_mode", None) is None:
             # Rescale the ACTIVE bottom panel back to its own data.  Earlier this
             # only refit self.plot (the 1D line); when the bottom panel is the
             # waterfall image, _align had frozen its x at the shared cake range
