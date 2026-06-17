@@ -61,14 +61,32 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-# Single converged compression policy (see xrd_tools.io.nexus._comp_kwargs):
-# gzip+shuffle.  gzip (DEFLATE) is in every HDF5 build, always readable with a
-# stock h5py (no hdf5plugin on the reader), and -- unlike lzf -- has no
-# ARM64-macOS bus error.  This replaces the former ``None`` (uncompressed): the
-# GUI writer is latency-sensitive, but the integrated stacks are small relative
-# to the raw frames and gzip level-1+shuffle adds negligible write time while
-# restoring on-disk compression for every platform.  Never use lzf.
-INTEGRATED_STACK_COMPRESSION = "gzip"
+# Compression for the GUI writer's integrated 1D/2D stacks.  Default gzip+shuffle:
+# DEFLATE is in every HDF5 build, readable with a stock h5py (no hdf5plugin on the
+# reader), and -- unlike lzf -- has no ARM64-macOS bus error.  On the live
+# streaming pipeline its write cost is overlapped (negligible wall-clock) and it
+# gives ~-50% on disk.  Never use lzf.
+#
+# Overridable per-run via the XDART_INTEGRATED_COMPRESSION env var, read ONCE at
+# import -- set it in the shell BEFORE launching xdart to A/B compression:
+#     XDART_INTEGRATED_COMPRESSION=none   -> uncompressed (fastest writes, big files)
+#     XDART_INTEGRATED_COMPRESSION=gzip   -> gzip+shuffle (default; unset == gzip)
+def _resolve_integrated_compression() -> "str | None":
+    raw = os.environ.get("XDART_INTEGRATED_COMPRESSION")
+    if raw is None:
+        return "gzip"
+    val = raw.strip()
+    if val.lower() in ("", "none", "off", "0", "false", "no"):
+        return None
+    return val
+
+
+INTEGRATED_STACK_COMPRESSION = _resolve_integrated_compression()
+if INTEGRATED_STACK_COMPRESSION != "gzip":
+    logger.info(
+        "Integrated-stack compression = %r (XDART_INTEGRATED_COMPRESSION override)",
+        INTEGRATED_STACK_COMPRESSION,
+    )
 
 
 @dataclass

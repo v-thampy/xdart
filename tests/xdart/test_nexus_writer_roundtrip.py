@@ -1294,6 +1294,20 @@ def test_no_detector_shape_writes_no_dataset(written_nxs):
         assert "detector_shape" not in f["entry/instrument/detector"]
 
 
+def test_integrated_compression_env_override(monkeypatch):
+    """XDART_INTEGRATED_COMPRESSION lets the user A/B the integrated-stack
+    compression from the shell before launching xdart (default gzip; read once
+    at import)."""
+    from xdart.modules.ewald import nexus_writer as nw
+    monkeypatch.delenv("XDART_INTEGRATED_COMPRESSION", raising=False)
+    assert nw._resolve_integrated_compression() == "gzip"          # unset -> default
+    for off in ("none", "None", "OFF", "0", "false", "no", "", "  none  "):
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", off)
+        assert nw._resolve_integrated_compression() is None, off
+    monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "gzip")
+    assert nw._resolve_integrated_compression() == "gzip"
+
+
 def test_instrument_groups(written_nxs):
     """Instrument tree: NXinstrument/NXdetector with mask + PONI scalars."""
     root = nx.nxload(str(written_nxs))
