@@ -2366,6 +2366,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.plot_data_range = [[0, 0], [0, 0]]
         self.frame_names = []
         self.overlaid_idxs = []
+        # Forget which scan the (now empty) accumulator belonged to, so the next
+        # render re-stamps it for the current scan.
+        self._overlay_scan_key = None
 
     # ── Panel clears (safety net for empty selections) ────────────
     # When a render path has no data for the current selection it must

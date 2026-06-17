@@ -3392,6 +3392,40 @@ def test_overlay_unit_switch_rebuilds_all_accumulated_curves():
     np.testing.assert_array_equal(host.plot_data[0], np.array([10.0, 11.0]))
 
 
+def test_overlay_new_scan_resets_accumulator_not_stale_or_appended():
+    # REGRESSION (this session): processing a NEW scan in Overlay/Waterfall mode
+    # must RESET the accumulator to the new scan's frames -- not show the previous
+    # scan's stale curves (the new scan's ids are a SUBSET of the old, so the
+    # end-of-scan catch-up SKIP wrongly fired) and not append across scans (a new
+    # scan may have different integration params / GI / axis).  update_plot
+    # self-heals on a scan-identity change.  Consistent for <15 and >15 frames
+    # (the reset is method-gated, independent of the auto-waterfall threshold).
+    host = _plot_host("Overlay")
+    host.scan.data_file = "scanA.nxs"
+    for idx in (1, 2, 3):
+        host.idxs = [idx]
+        host.idxs_1d = [idx]
+        host.update_plot()
+    assert host.overlaid_idxs == [1, 2, 3]
+    assert host._overlay_scan_key == "scanA.nxs"
+
+    # New scan: different file, ids that are a SUBSET of the previous scan's.
+    host.scan.data_file = "scanB.nxs"
+    host.idxs = [1]
+    host.idxs_1d = [1]
+    host.update_plot()
+
+    assert host._overlay_scan_key == "scanB.nxs"
+    assert host.overlaid_idxs == [1]                 # reset (not stale [1,2,3], not appended)
+    assert np.atleast_2d(host.plot_data[1]).shape[0] == 1
+
+    # Same-scan render still APPENDS within the scan (reset is scan-boundary only).
+    host.idxs = [2]
+    host.idxs_1d = [2]
+    host.update_plot()
+    assert host.overlaid_idxs == [1, 2]
+
+
 def test_waterfall_unit_switch_rebuilds_all_accumulated_curves():
     host = _plot_host("Waterfall")
     for idx in (1, 2, 3):

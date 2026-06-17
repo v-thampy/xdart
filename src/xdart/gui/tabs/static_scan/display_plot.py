@@ -402,6 +402,28 @@ class DisplayPlotMixin:
         # already in plot_data from live accumulation, so a reload (empty
         # accumulator) still falls through to read from disk once.
         method = self.ui.plotMethod.currentText()
+        # NEW-SCAN BOUNDARY RESET: the Overlay/Waterfall accumulator is stamped
+        # with the scan it was built from.  When the current scan differs, drop it
+        # so the new scan plots FRESH -- a new scan may use different integration
+        # params / GI / a different axis, so appending across scans would mix
+        # incompatible data (Vivek-confirmed: reset, don't append).  Self-heals any
+        # scan-swap path that didn't route through new_scan's clear_overlay, and is
+        # consistent for <15 (curves) and >15 (waterfall).  Same-scan renders
+        # (incl. the in-scan end-of-scan catch-up skip below) are untouched.
+        _scan_key = getattr(self.scan, "data_file", None) or getattr(
+            self.scan, "name", None)
+        if (method in ("Overlay", "Waterfall")
+                and getattr(self, "overlaid_idxs", None)
+                and getattr(self, "_overlay_scan_key", None) not in (None, _scan_key)):
+            # New-scan boundary: drop the stale accumulator.  Inline (clear_overlay
+            # is a displayFrameWidget method; update_plot is a shared mixin method
+            # also exercised by duck-host tests).  plot_data_range is recomputed by
+            # compute_plot_range on the next draw.
+            self.plot_data = [np.zeros(0), np.zeros(0)]
+            self.frame_names = []
+            self.overlaid_idxs = []
+        self._overlay_scan_key = _scan_key
+
         if (method in ("Overlay", "Waterfall")
                 and getattr(self, "overlaid_idxs", None)
                 and self.ui.plotUnit.currentIndex()

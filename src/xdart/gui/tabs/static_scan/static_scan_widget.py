@@ -724,6 +724,28 @@ class staticWidget(QWidget):
                 global_mask = getattr(published, "mask", None)
                 if global_mask is not None:
                     self.scan.global_mask = global_mask
+                    # Fold the pyFAI detector gap mask into the live frame's OWN
+                    # mask too.  The END-OF-SCAN full-res raw panel renders the
+                    # frame's mask (not just scan.global_mask), and the live frame
+                    # mask is only ``map_raw < 0`` -- which misses the 0-valued
+                    # inter-module gaps -- so without this the last frame's gaps
+                    # show as 0 (dark) until the user re-selects a frame and gets
+                    # the NaN-baked thumbnail.  Both are flat indices into the same
+                    # detector image; _apply_detector_mask / update_image bound by
+                    # data.size so any out-of-range index is ignored safely.
+                    try:
+                        import numpy as _np
+                        _gm = _np.asarray(global_mask).ravel()
+                        _fm = getattr(frame, "mask", None)
+                        if _fm is None or _np.size(_fm) == 0:
+                            frame.mask = _gm
+                        else:
+                            frame.mask = _np.union1d(
+                                _np.asarray(_fm).ravel(), _gm)
+                    except Exception:
+                        logger.debug(
+                            "merging detector gap mask into the live frame failed",
+                            exc_info=True)
                 # Step 6: key the live record under the real GI mode so a later
                 # reintegrate at the same mode folds onto it (instead of the live
                 # record sitting under DEFAULT and the reintegrate under the real
@@ -1363,6 +1385,16 @@ class staticWidget(QWidget):
         self.frames.clear()
         self.frame_ids.clear()
         self.publication_store.clear()
+        # Reset the Overlay/Waterfall accumulator at the scan boundary so a new
+        # scan (or a reprocess of the same scan) plots FRESH.  A new scan may use
+        # different integration params / GI / axis, so appending its traces across
+        # scans would mix incompatible data -- reset is the consistent, correct
+        # choice (same for <15 curves and >15 waterfall).  update_plot also
+        # self-heals on a scan-key change for any path that bypasses here.
+        try:
+            self.displayframe.clear_overlay()
+        except Exception:
+            logger.debug("clear_overlay on new scan failed", exc_info=True)
 
         # During a live (non-batch) run the async file-thread set_datafile
         # no longer reloads frames from disk (it would clobber the live
