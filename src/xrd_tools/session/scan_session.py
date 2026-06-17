@@ -191,8 +191,13 @@ class ScanSession:
 
     ``record_store`` is optional and dormant for existing callers.  When supplied,
     completed frame records are upserted after the sink write.  Set
-    ``record_store_persisted_on_write=True`` only for sinks whose write hook is
-    durable enough that old heavy arrays may be evicted.
+    ``record_store_persisted_on_write=True`` ONLY for sinks whose ``write`` hook is
+    itself durable (the frame is on disk when ``write`` returns).  Do NOT set it
+    for a buffering sink — notably xdart's ``QtNexusSink``, whose ``write`` only
+    stashes in memory and whose durable boundary is a separate ``flush``: marking
+    persisted-on-write there would let heavy arrays be evicted before they are
+    written (persist-before-evict violation).  Such a caller must instead call
+    ``record_store.mark_persisted(labels)`` from its flush completion.
     """
 
     def __init__(
