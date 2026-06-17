@@ -164,28 +164,39 @@ class DisplayPlotMixin:
         method = self.ui.plotMethod.currentText()
         accumulating = method in ("Overlay", "Waterfall")
         idle = not getattr(self, "_processing_active", False)
-        store_complete_required = (
-            getattr(self, "viewer_mode", None) is None
-            and getattr(self, "publication_store", None) is not None
-            and (
-                method in ("Single", "Sum", "Average")
-                or (accumulating and idle)
-            )
-        )
-        # Overlay/Waterfall are accumulating displays.  During live processing
-        # use only the resident tail and append it to the existing accumulator;
-        # older rows stay in plot_data.  When idle/reloaded, require the full
-        # selection and allow blocking hydration so a whole-scan waterfall does
-        # not truncate at the heavy-publication cap.
         if accumulating:
-            idxs = self.idxs if idle else self.idxs_1d
+            # Overlay/Waterfall accumulate into plot_data / overlaid_idxs.  Fetch
+            # ONLY the frames not already accumulated -- NEVER block-read the whole
+            # scan's 1D from disk on the GUI thread.  That was the end-of-scan
+            # HARD FREEZE: the reduction finishes ahead of the display, the mode
+            # flips live->idle, and at catch-up (e.g. 648 of 651 rows already
+            # accumulated) the old code re-read ALL 651 frames from disk with
+            # require_all -> a multi-second GUI-thread read that, when the last
+            # frames aren't all readable yet, returns None and is retried every
+            # tick (autorange / aggregate worker / flush) -> never recovers.
+            # A fresh RELOAD has an empty accumulator, so it still reads the full
+            # selection (once).  Block from disk only when idle; during live, skip
+            # evicted frames -- they arrive via the next append.  require_all is
+            # False so a partial read appends what it can instead of blanking.
+            selection = [int(i) for i in (self.idxs if idle else self.idxs_1d)]
+            have = {int(i) for i in (getattr(self, "overlaid_idxs", []) or [])}
+            missing = [i for i in selection if i not in have]
+            idxs = missing if (have and missing) else selection
+            require_all = False
+            allow_blocking = True if idle else None
         else:
+            store_complete_required = (
+                getattr(self, "viewer_mode", None) is None
+                and getattr(self, "publication_store", None) is not None
+                and method in ("Single", "Sum", "Average")
+            )
             idxs = self.idxs if store_complete_required else None
+            require_all = store_complete_required
+            allow_blocking = None
         self._plot_row_ids = list(self.idxs_1d if idxs is None else idxs)
-        allow_blocking = True if (accumulating and idle) else None
         ydata, xdata = self.get_frames_int_1d(
             idxs,
-            require_all=store_complete_required,
+            require_all=require_all,
             allow_blocking_read=allow_blocking,
         )
         if xdata is not None and ydata is not None:
@@ -203,7 +214,7 @@ class DisplayPlotMixin:
         self.ui.slice.setChecked(False)
         return self.get_frames_int_1d(
             idxs,
-            require_all=store_complete_required,
+            require_all=require_all,
             allow_blocking_read=allow_blocking,
         )
 

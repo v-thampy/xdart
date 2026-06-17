@@ -425,6 +425,47 @@ def test_idle_overlay_redraw_does_not_reread_when_accumulator_covers_selection(
     assert calls == []                             # redrew from the accumulator; no disk re-read
 
 
+@pytest.mark.gui
+def test_catchup_overlay_reads_only_missing_not_whole_scan(widget, tmp_path):
+    # HARD-FREEZE regression (froze at frame 648 of 651): at end-of-scan catch-up
+    # the accumulator already holds most frames; the few not-yet-shown frames must
+    # be fetched WITHOUT re-reading the whole scan's 1D from disk on the GUI
+    # thread (the multi-second blocking read that repeated and never recovered).
+    # Assert the fetch covers ONLY the missing frames, never all N.
+    n = 70
+    scan, q, chi = _split_scan_2d(tmp_path, n=n, cap=8)
+    w = widget
+    df = w.displayframe
+    df.scan = scan
+    df.viewer_mode = None
+    df._async_hydration_enabled = False
+    df.ui.plotMethod.setCurrentText("Waterfall")
+    df.ui.plotUnit.setCurrentIndex(0)
+    _evict_overall_store(w, q, chi, n)                    # store populated + thinned past cap
+    # Accumulator already holds all but the last 3 frames (live catch-up state).
+    df.plot_data = [q.astype(float),
+                    (np.arange(n - 3, dtype=float)[:, None] * np.ones(q.size))]
+    df.frame_names = [f"{scan.name}_{i}" for i in range(n - 3)]
+    df.overlaid_idxs = list(range(n - 3))
+    df._last_plot_unit = df.ui.plotUnit.currentIndex()   # unit stable: APPEND, not REBUILD
+    df.frame_ids = [str(i) for i in range(n)]
+    df._processing_active = False                          # idle: scan ended
+
+    reads = []
+    orig = df.get_frames_int_1d
+    df.get_frames_int_1d = (
+        lambda idxs=None, **k: (
+            reads.append(len(list(idxs)) if idxs is not None else -1),
+            orig(idxs, **k))[1])
+    try:
+        df.update()
+    finally:
+        df.get_frames_int_1d = orig
+    assert reads, "expected a fetch of the missing frames"
+    assert max(reads) <= 3, f"fetched {max(reads)} frames; must read only the missing few"
+    assert max(reads) < n, "must NOT re-read the whole scan from disk"
+
+
 # ── adapter routing: cake_image -> _aggregate_cake_payload ─────────────────────
 
 def _fake_state(*, overall, selected_ids, render_ids=(), method="Average"):

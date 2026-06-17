@@ -804,6 +804,7 @@ def _empty_update_host(processing, persist=True):
         render_display=lambda state, payload: rendered.append("render"),
     )
     host.update = MethodType(displayFrameWidget.update, host)
+    host._update_impl = MethodType(displayFrameWidget._update_impl, host)
     return host, rendered
 
 
@@ -1615,7 +1616,7 @@ def _update_smoke_host():
                  '_draw_delegate', '_clear_delegate', '_payload_for_role',
                  '_draw_payload',
                  'render_display',
-                 '_updated', 'update'):
+                 '_updated', 'update', '_update_impl'):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
     return host, calls, dl
 
@@ -3154,6 +3155,7 @@ def test_update_renders_blank_on_empty_no_data_instead_of_leaving_stale():
     host._clear_delegate = MethodType(displayFrameWidget._clear_delegate, host)
     host.render_display = MethodType(displayFrameWidget.render_display, host)
     host.update = MethodType(displayFrameWidget.update, host)
+    host._update_impl = MethodType(displayFrameWidget._update_impl, host)
 
     assert host.update() is True
     assert set(calls) == {"plot", "image", "cake"}   # every panel blanked

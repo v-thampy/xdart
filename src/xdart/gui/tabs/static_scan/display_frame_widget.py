@@ -988,6 +988,23 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         return True
 
     def update(self):
+        """Re-entrancy-guarded panel update.
+
+        Drops a RE-ENTRANT call (a signal — aggregate-worker completion,
+        autorange — firing while a render is already on the stack): the in-flight
+        render already reflects the current state, and genuinely-new state lands
+        on the next event-loop-driven update.  Defense-in-depth so a pathological
+        render chain can never starve the event loop into a hard freeze.
+        """
+        if getattr(self, "_in_update", False):
+            return True
+        self._in_update = True
+        try:
+            return self._update_impl()
+        finally:
+            self._in_update = False
+
+    def _update_impl(self):
         """Update the image and plot panels for the current selection.
 
         Mode-agnostic: snapshot one :class:`DisplayState` (via the mode
