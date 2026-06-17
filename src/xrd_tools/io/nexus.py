@@ -32,8 +32,6 @@ Performance features:
 from __future__ import annotations
 
 import logging
-import platform
-import sys
 import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -617,7 +615,7 @@ def write_nexus(
     results_1d: dict[int | str, IntegrationResult1D] | None = None,
     results_2d: dict[int | str, IntegrationResult2D] | None = None,
     entry: str = "entry",
-    compression: str | None = "lzf",
+    compression: str | None = "gzip",
     overwrite: bool = False,
 ) -> Path:
     """
@@ -733,7 +731,7 @@ def open_nexus_writer(
     path: Path | str,
     metadata: ScanMetadata | None = None,
     entry: str = "entry",
-    compression: str | None = "lzf",
+    compression: str | None = "gzip",
     swmr: bool = False,
     overwrite: bool = False,
 ) -> h5py.File:
@@ -837,7 +835,7 @@ def write_nexus_frame(
     result_1d: IntegrationResult1D | None = None,
     result_2d: IntegrationResult2D | None = None,
     entry: str = "entry",
-    compression: str | None = "lzf",
+    compression: str | None = "gzip",
 ) -> None:
     """
     Write a single frame's results to an already-open NeXus file.
@@ -874,23 +872,29 @@ def write_nexus_frame(
 # ---------------------------------------------------------------------------
 
 def _comp_kwargs(compression: str | None) -> dict[str, Any]:
-    """Build h5py dataset kwargs for a given compression filter."""
+    """Build h5py dataset kwargs for a given compression filter.
+
+    gzip (DEFLATE) is the single portable filter and the project default: it is
+    part of every HDF5 build, always readable with a stock h5py (no hdf5plugin
+    on the *reader*), and has no ARM64-macOS native-filter bus error.  ``"lzf"``
+    is accepted only as a backward-compatible alias and normalized to
+    gzip+shuffle on EVERY platform -- lzf ships with h5py (not HDF5 core) and
+    bus-errors on some ARM64-macOS builds, so we never actually emit it (this
+    retires the former darwin/arm64 special-case).  All of these are lossless,
+    so the byte-compat signature -- which digests DECOMPRESSED values -- is
+    invariant under the filter choice.  ``None`` stores uncompressed.
+
+    An explicit filter other than ``gzip``/``lzf`` (e.g. an ``hdf5plugin``
+    codec) is honored verbatim: the caller has knowingly opted out of the
+    portable default and accepts that the reader must register that plugin.
+    """
     if compression is None:
         return {}
-    if compression == "lzf" and _lzf_unsafe_on_this_platform():
+    if compression in ("gzip", "lzf"):
+        # level 1 = fastest gzip; shuffle markedly improves the ratio on the
+        # smooth integrated-intensity arrays.  One policy on every platform.
         return {"compression": "gzip", "compression_opts": 1, "shuffle": True}
-    ck: dict[str, Any] = {"compression": compression}
-    if compression == "gzip":
-        ck["shuffle"] = True
-    return ck
-
-
-def _lzf_unsafe_on_this_platform() -> bool:
-    """Return True for the h5py/HDF5 platform class known to bus-error on lzf."""
-    return sys.platform == "darwin" and platform.machine().lower() in {
-        "arm64",
-        "aarch64",
-    }
+    return {"compression": compression}
 
 
 # ---------------------------------------------------------------------------

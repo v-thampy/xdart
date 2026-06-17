@@ -665,7 +665,7 @@ class IntegrationResult1D:
     # HDF5 I/O
     # ------------------------------------------------------------------
 
-    def to_hdf5(self, grp: h5py.Group, compression: str = "lzf") -> None:
+    def to_hdf5(self, grp: h5py.Group, compression: str = "gzip") -> None:
         """
         Write to an HDF5 group.
 
@@ -1166,7 +1166,7 @@ class IntegrationResult2D:
     # HDF5 I/O
     # ------------------------------------------------------------------
 
-    def to_hdf5(self, grp: h5py.Group, compression: str = "lzf") -> None:
+    def to_hdf5(self, grp: h5py.Group, compression: str = "gzip") -> None:
         """
         Write to an HDF5 group.
 

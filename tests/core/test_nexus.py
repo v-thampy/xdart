@@ -9,7 +9,6 @@ import h5py
 from xrd_tools.io.nexus import (
     NexusImageStack,
     _comp_kwargs,
-    _lzf_unsafe_on_this_platform,
     _require_uniform_axes_1d,
     _require_uniform_axes_2d,
     find_nexus_image_dataset,
@@ -623,28 +622,28 @@ class TestWriteNexus:
         with h5py.File(p, "r") as f:
             assert f["entry/integrated_1d/intensity"].compression is None
 
-    def test_compression_lzf_uses_safe_filter(self, tmp_path, result_1d):
+    def test_compression_lzf_is_aliased_to_portable_gzip(self, tmp_path, result_1d):
+        # Converged policy: lzf is never emitted (h5py-only filter, ARM64-macOS
+        # bus error) -- it is a backward-compatible alias for gzip on EVERY
+        # platform, so the written file is always gzip and stock-h5py readable.
         p = write_nexus(tmp_path / "lzf.h5", results_1d={0: result_1d}, compression="lzf")
         with h5py.File(p, "r") as f:
-            expected = "gzip" if _lzf_unsafe_on_this_platform() else "lzf"
-            assert f["entry/integrated_1d/intensity"].compression == expected
+            assert f["entry/integrated_1d/intensity"].compression == "gzip"
 
-    def test_compression_lzf_guard_maps_arm_macos_to_fast_gzip(self, monkeypatch):
-        import xrd_tools.io.nexus as nexus
-
-        monkeypatch.setattr(nexus.sys, "platform", "darwin")
-        monkeypatch.setattr(nexus.platform, "machine", lambda: "arm64")
-
-        assert _comp_kwargs("lzf") == {
-            "compression": "gzip",
-            "compression_opts": 1,
-            "shuffle": True,
-        }
+    def test_comp_kwargs_single_policy_gzip_shuffle(self):
+        # gzip and lzf both resolve to the one portable policy (gzip + shuffle +
+        # fast level 1) on all platforms; None means uncompressed.
+        expected = {"compression": "gzip", "compression_opts": 1, "shuffle": True}
+        assert _comp_kwargs("gzip") == expected
+        assert _comp_kwargs("lzf") == expected
+        assert _comp_kwargs(None) == {}
 
     def test_compression_gzip(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "gz.h5", results_1d={0: result_1d}, compression="gzip")
         with h5py.File(p, "r") as f:
-            assert f["entry/integrated_1d/intensity"].compression == "gzip"
+            ds = f["entry/integrated_1d/intensity"]
+            assert ds.compression == "gzip"
+            assert ds.shuffle is True            # shuffle filter engaged (better ratio)
 
     def test_custom_entry_name(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "e.h5", results_1d={0: result_1d}, entry="scan_1")

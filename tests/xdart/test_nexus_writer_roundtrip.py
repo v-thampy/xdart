@@ -361,13 +361,20 @@ def test_integrated_2d_nxdata(written_nxs):
     assert g["chi"].attrs.get("units") in ("deg", "rad")
 
 
-def test_gui_integrated_stacks_avoid_lzf_compression(written_nxs):
+def test_gui_integrated_stacks_use_portable_gzip_never_lzf(written_nxs):
+    # Converged policy: the GUI writer compresses with portable gzip+shuffle
+    # (was uncompressed None) and NEVER emits lzf (h5py-only filter, ARM64-macOS
+    # bus error).  gzip is in every HDF5 build and stock-h5py readable, so the
+    # frozen .nxs stays self-contained for notebooks/other tools.
     import h5py
 
     with h5py.File(written_nxs, "r") as f:
-        assert f["entry/integrated_1d/intensity"].compression is None
-        assert f["entry/integrated_1d/sigma"].compression is None
-        assert f["entry/integrated_2d/intensity"].compression is None
+        for path in ("entry/integrated_1d/intensity",
+                     "entry/integrated_1d/sigma",
+                     "entry/integrated_2d/intensity"):
+            ds = f[path]
+            assert ds.compression == "gzip", path
+            assert ds.shuffle is True, path
 
 
 def test_gi_nonuniform_stacked_2d_writer_stays_strict(tmp_path):

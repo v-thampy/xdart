@@ -61,10 +61,14 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-# Do not use lzf here. Several macOS/ARM64 h5py/HDF5 builds can bus-error
-# inside create_dataset with lzf on large integrated stacks. The GUI writer is
-# latency-sensitive, so prefer uncompressed chunked stacks over gzip.
-INTEGRATED_STACK_COMPRESSION = None
+# Single converged compression policy (see xrd_tools.io.nexus._comp_kwargs):
+# gzip+shuffle.  gzip (DEFLATE) is in every HDF5 build, always readable with a
+# stock h5py (no hdf5plugin on the reader), and -- unlike lzf -- has no
+# ARM64-macOS bus error.  This replaces the former ``None`` (uncompressed): the
+# GUI writer is latency-sensitive, but the integrated stacks are small relative
+# to the raw frames and gzip level-1+shuffle adds negligible write time while
+# restoring on-disk compression for every platform.  Never use lzf.
+INTEGRATED_STACK_COMPRESSION = "gzip"
 
 
 @dataclass

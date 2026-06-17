@@ -365,7 +365,7 @@ def attributes_to_h5(obj, grp: h5py.Group, lst_attr: list | None = None,
 
 
 def data_to_h5(data, grp: h5py.Group, key: str, encoder: str = "yaml",
-               compression: str = "lzf") -> None:
+               compression: str = "gzip") -> None:
     """Type-aware dispatcher: save *data* to ``grp[key]``.
 
     Dispatches to the appropriate typed writer based on

@@ -463,7 +463,7 @@ class NexusSink:
 
     path: Path | str
     entry: str = "entry"
-    compression: str | None = "lzf"
+    compression: str | None = "gzip"
     overwrite: bool = False
     flush_every: int | None = 16
     atomic: bool | None = None
