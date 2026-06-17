@@ -2253,6 +2253,7 @@ class H5Viewer(QWidget):
         df = getattr(self, 'displayframe', None)
         if df is not None:
             df._raw_resolve_failed = set()
+            df._raw_full_shape = None       # new file -> possibly a new detector size
         self.new_scan = True
 
     def open_folder(self):

@@ -894,3 +894,59 @@ def test_nanmean_slice_guards_empty_and_all_nan():
         _w.simplefilter("error", RuntimeWarning)     # a "Mean of empty slice" would raise
         out = dl.nanmean_slice(nan_col, 0)
     assert _np.isnan(out[0]) and out[1] == 2.0
+
+
+# ── detector gap-mask helpers (raw-panel payload unification) ──────────────────
+# Detector module gaps are 0-valued pixels (NOT sentinels); they become NaN only
+# via the detector mask.  These pure helpers let the legacy update_image path and
+# the publication raw_image builder mask gaps identically — full-res applies the
+# flat indices directly, thumbnails remap them through the downsample ratio.
+
+def test_combine_flat_masks_unions_dedupes_and_bounds():
+    import numpy as np
+    a = np.array([5, 7, 7], dtype=int)
+    b2d = np.zeros((4, 4), dtype=bool)
+    b2d[0, 1] = True                                       # flat index 1
+    out = dl.combine_flat_masks(a, b2d, None, size=16)
+    assert out.tolist() == [1, 5, 7]                       # unioned, deduped, sorted
+    assert dl.combine_flat_masks(np.array([3, 99]), size=16).tolist() == [3]  # bound
+    assert dl.combine_flat_masks(None, None) is None
+    assert dl.combine_flat_masks(np.array([], dtype=int)) is None
+
+
+def test_nan_gaps_in_thumbnail_maps_full_res_indices_to_thumbnail():
+    import numpy as np
+    # full-res rows 48-51 of a 100x100 detector -> thumbnail rows 24-25 of 50x50
+    rows = np.arange(100 * 100) // 100
+    gap = np.flatnonzero((rows >= 48) & (rows <= 51))
+    data = np.ones((50, 50), dtype=float)
+    out = dl.nan_gaps_in_thumbnail(data, gap, (100, 100))
+    assert out is data                                     # mutates in place
+    assert np.isnan(data[24:26, :]).all()                  # gap band -> NaN
+    assert not np.isnan(data[:24, :]).any()                # nothing else touched
+    assert not np.isnan(data[26:, :]).any()
+
+
+def test_nan_gaps_in_thumbnail_noops_without_shape_or_indices():
+    import numpy as np
+    # No full_shape -> cannot map -> never apply flat indices directly (that would
+    # corrupt unrelated thumbnail pixels).
+    d1 = np.ones((50, 50), dtype=float)
+    assert not np.isnan(dl.nan_gaps_in_thumbnail(d1, np.array([4805]), None)).any()
+    d2 = np.ones((50, 50), dtype=float)
+    assert not np.isnan(dl.nan_gaps_in_thumbnail(d2, None, (100, 100))).any()
+
+
+def test_image_and_plot_payload_carry_new_fields_and_freeze():
+    import numpy as np
+    import dataclasses
+    import pytest as _pt
+    ip = dl.ImagePayload(image=np.ones((2, 2)))
+    assert ip.gap_mask_indices is None and ip.raw_full_shape is None
+    ip2 = dl.ImagePayload(image=np.ones((2, 2)),
+                          gap_mask_indices=np.array([1]), raw_full_shape=(4, 4))
+    assert ip2.raw_full_shape == (4, 4)
+    pp = dl.PlotPayload(axis_x=dl.Axis("x", ""))
+    assert pp.overlaid_ids is None and pp.plot_history is None
+    with _pt.raises(dataclasses.FrozenInstanceError):
+        ip.raw_full_shape = (1, 1)                          # frozen invariant preserved

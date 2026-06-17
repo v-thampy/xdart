@@ -1438,6 +1438,7 @@ class staticWidget(QWidget):
                 # Frame indices restart per scan: re-arm the raw self-heal
                 # negative cache alongside the purge.
                 self.displayframe._raw_resolve_failed = set()
+                self.displayframe._raw_full_shape = None
             except Exception:
                 logger.debug("live-swap cache purge skipped", exc_info=True)
 

@@ -797,6 +797,47 @@ def test_nan_thumbnail_gaps_noop_without_gap_mask():
     assert not np.isnan(data).any()
 
 
+def test_raw_image_payload_bakes_thumbnail_gaps():
+    # The raw panel renders the current frame as a thumbnail (Single/Overlay/
+    # Waterfall).  Detector module gaps (0-valued, not sentinels) must render as
+    # NaN even when the thumbnail was generated without them -- raw_image bakes
+    # the gap mask into the downsampled image + carries the metadata, so the
+    # payload path masks gaps identically to the legacy update_image path (the
+    # structural fix for the Overlay end-of-scan gap bug, ready for the live-
+    # gated panel flip).
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xdart.gui.tabs.static_scan.display_logic import RawSource
+    rows = np.arange(100 * 100) // 100
+    gap_flat = np.flatnonzero((rows >= 48) & (rows <= 51))   # full-res gap band
+    thumb = np.ones((50, 50), dtype=float)                   # unbaked: no NaN gaps
+    pub = SimpleNamespace(
+        view=SimpleNamespace(thumbnail=thumb),
+        raw_ref=SimpleNamespace(mask=None, bg_raw=0, thumbnail=thumb),
+        metadata_raw={},
+    )
+    store = SimpleNamespace(snapshot=lambda: {0: pub})
+    widget = SimpleNamespace(
+        scan=SimpleNamespace(global_mask=gap_flat, mask_sentinel=True),
+        _raw_full_shape=(100, 100),
+        bkg_map_raw=0,
+    )
+    adapter = PublicationDisplayAdapter(store, widget=widget)
+    state = SimpleNamespace(
+        overall=False, method="Single", selected_ids=(0,), render_ids=(0,),
+        panel=lambda role: SimpleNamespace(has_data=True, source=RawSource.THUMBNAIL),
+    )
+    payload = adapter.raw_image(state)
+    assert payload is not None
+    assert payload.raw_full_shape == (100, 100)
+    assert payload.gap_mask_indices is not None
+    # gaps baked to NaN at the mapped thumbnail rows (24-25; the [::-1,:] flip
+    # swaps rows 24<->25 so the masked band stays at 24-25).
+    assert np.isnan(payload.image[24:26, :]).all()
+    assert np.isfinite(payload.image[:24, :]).all()
+    assert np.isfinite(payload.image[26:, :]).all()
+
+
 def test_get_frames_map_raw_caches_full_res_shape():
     # A resident full-res raw teaches the widget the detector shape so a later
     # thumbnail-only render can map the flat gap mask into thumbnail coordinates.
@@ -820,3 +861,16 @@ def test_get_frames_map_raw_caches_full_res_shape():
     assert getattr(host, "_raw_full_shape", None) is None
     host.get_frames_map_raw([0])
     assert host._raw_full_shape == (100, 100)
+
+
+@pytest.mark.gui
+def test_clear_display_state_resets_raw_full_shape(widget):
+    # Regression (adversarial review P1): the cached detector shape used to map
+    # the gap mask into thumbnail coordinates must NOT survive a scan/file change
+    # -- a stale shape from a different-size detector would NaN the wrong
+    # thumbnail pixels.  clear_display_state re-arms it alongside the other
+    # per-scan display caches.
+    df = widget.displayframe
+    df._raw_full_shape = (512, 512)
+    df.clear_display_state()
+    assert df._raw_full_shape is None

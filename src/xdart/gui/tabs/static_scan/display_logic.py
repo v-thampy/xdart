@@ -311,18 +311,99 @@ class Trace:
 
 @dataclass(frozen=True)
 class PlotPayload:
-    """Resolved content of a 1D plot panel: an x-axis plus layered traces."""
+    """Resolved content of a 1D plot panel: an x-axis plus layered traces.
+
+    ``overlaid_ids`` / ``plot_history`` are the (optional) accumulation state for
+    the Overlay/Waterfall 1D modes, carried so the *payload* owns the accumulator
+    instead of the widget once those modes are routed through the payload path
+    (the renderer flip is live-gated — see the publish-direct plan).  They stay
+    ``None`` for the stateless Single/Sum/Average payloads, preserving the
+    frozen-dataclass invariant (keep any value immutable: a tuple of ids, a
+    ``MappingProxyType`` history).
+    """
     axis_x: Axis
     traces: tuple = ()   # tuple[Trace, ...]
     axis_y: "Axis | None" = None
+    overlaid_ids: "tuple | None" = None      # frame ids accumulated (Overlay/Waterfall)
+    plot_history: "object | None" = None     # immutable accumulator view
 
 
 @dataclass(frozen=True)
 class ImagePayload:
-    """Resolved content of a 2D image panel."""
+    """Resolved content of a 2D image panel.
+
+    ``gap_mask_indices`` / ``raw_full_shape`` are informational metadata for the
+    raw detector panel: the flat detector-gap indices (into the full-resolution
+    ``raw_full_shape``) that the builder masked to NaN.  Detector module gaps are
+    0-valued pixels — NOT sentinels — so ``sentinel_mask`` never masks them; they
+    are masked via the detector mask, and the builder bakes them into ``image``
+    for both the full-res and the thumbnail source (the latter via
+    :func:`nan_gaps_in_thumbnail`).  The fields let a consumer know where the
+    gaps are without re-deriving them; they stay ``None`` for cake/viewer images.
+    """
     image: "np.ndarray"
     axis_x: Axis = Axis("x", "")
     axis_y: Axis = Axis("y", "")
+    gap_mask_indices: "np.ndarray | None" = None
+    raw_full_shape: "tuple | None" = None
+
+
+def combine_flat_masks(*masks, size=None):
+    """Union detector-mask specs into one sorted flat-index array.
+
+    Each spec may be ``None``, a 2-D boolean image-mask (-> ``flatnonzero``), or
+    a 1-D flat-index array.  Returns ``None`` when nothing masks.  When ``size``
+    is given, indices are bounded to ``[0, size)``.  Pure/Qt-free — shared by the
+    legacy raw-render path and the publication raw payload so both derive the
+    detector gap mask identically.
+    """
+    parts = []
+    for m in masks:
+        if m is None:
+            continue
+        arr = np.asarray(m)
+        if arr.size == 0:
+            continue
+        arr = (np.flatnonzero(arr) if arr.ndim >= 2
+               else np.asarray(arr, dtype=np.int64).ravel())
+        if arr.size:
+            parts.append(arr)
+    if not parts:
+        return None
+    flat = np.unique(np.concatenate(parts))
+    if size is not None:
+        flat = flat[(flat >= 0) & (flat < size)]
+    return flat if flat.size else None
+
+
+def nan_gaps_in_thumbnail(data, gap_indices, full_shape):
+    """NaN the detector-gap pixels in a downsampled thumbnail, in place.
+
+    ``gap_indices`` are flat indices into the full-resolution ``full_shape``
+    detector; map each to its thumbnail pixel via the per-axis downsample ratio
+    and set it to NaN.  No-op (returns ``data`` unchanged) when the shape or
+    indices are unusable — it never applies full-res flat indices directly to a
+    smaller thumbnail (that would corrupt unrelated pixels).  Pure/Qt-free, so
+    both the legacy ``update_image`` thumbnail path and the publication
+    ``raw_image`` builder mask gaps identically.
+    """
+    if data is None or getattr(data, "ndim", 0) != 2 or full_shape is None:
+        return data
+    if gap_indices is None or np.size(gap_indices) == 0:
+        return data
+    H, W = int(full_shape[0]), int(full_shape[1])
+    if H <= 0 or W <= 0:
+        return data
+    flat = np.asarray(gap_indices, dtype=np.int64).ravel()
+    flat = flat[(flat >= 0) & (flat < H * W)]
+    if flat.size == 0:
+        return data
+    h, w = data.shape
+    rows, cols = np.unravel_index(flat, (H, W))
+    tr = np.clip((rows * h) // H, 0, h - 1)
+    tc = np.clip((cols * w) // W, 0, w - 1)
+    data[tr, tc] = np.nan
+    return data
 
 
 @dataclass(frozen=True)

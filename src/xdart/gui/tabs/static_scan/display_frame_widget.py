@@ -54,6 +54,7 @@ from .display_logic import (
     empty_display_state, PANEL_LAYOUT,
     resolve_selection, resolve_render_ids,
     default_plot_unit, pretty_unit, sentinel_mask, integer_saturation_ceiling,
+    combine_flat_masks, nan_gaps_in_thumbnail,
 )
 from .display_controllers import register_default_controllers
 
@@ -2053,32 +2054,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         Tactical bridge: the publication/payload unification folds this
         thumbnail-vs-full-res masking divergence into one display contract.
+        The flat-index union + downsample-coordinate mapping live in the
+        Qt-free ``display_logic`` (``combine_flat_masks`` / ``nan_gaps_in_thumbnail``)
+        so the legacy path here and the publication ``raw_image`` builder mask
+        gaps identically.
         """
-        if data is None or getattr(data, 'ndim', 0) != 2:
-            return
         full_shape = getattr(self, '_raw_full_shape', None)
-        if full_shape is None:
-            return
-        parts = []
-        gap = getattr(self.scan, 'global_mask', None)
-        if gap is not None and np.size(gap):
-            parts.append(np.asarray(gap, dtype=np.int64).ravel())
-        if frame_mask is not None and np.size(frame_mask):
-            parts.append(np.asarray(frame_mask, dtype=np.int64).ravel())
-        if not parts:
-            return
-        H, W = int(full_shape[0]), int(full_shape[1])
-        if H <= 0 or W <= 0:
-            return
-        flat = np.unique(np.concatenate(parts))
-        flat = flat[(flat >= 0) & (flat < H * W)]
-        if flat.size == 0:
-            return
-        h, w = data.shape
-        rows, cols = np.unravel_index(flat, (H, W))
-        tr = np.clip((rows * h) // H, 0, h - 1)
-        tc = np.clip((cols * w) // W, 0, w - 1)
-        data[tr, tc] = np.nan
+        gap = combine_flat_masks(getattr(self.scan, 'global_mask', None), frame_mask)
+        nan_gaps_in_thumbnail(data, gap, full_shape)
 
     def update_image(self):
         """Updates image plotted in image frame.
@@ -2521,6 +2504,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def clear_display_state(self, title=None):
         """Blank all rendered panels and cached display data."""
         self._raw_resolve_failed = set()   # re-arm the raw hydrate retries
+        self._raw_full_shape = None        # detector shape is per-scan (sizes vary)
         self.clear_image_view()
         self.clear_binned_view()
         self.clear_plot_view()
