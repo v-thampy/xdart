@@ -508,6 +508,64 @@ def test_unit_switch_rebuild_never_blocks_gui_thread(widget, tmp_path):
         f"GUI-thread blocking read on unit switch: {blocking}")
 
 
+@pytest.mark.gui
+def test_overlay_qtth_unit_switch_transforms_x_without_reread(widget, tmp_path):
+    # FREEZE + INCOMPLETENESS regression (Q->2θ on a big overlay/waterfall): the
+    # accumulated intensities are unit-invariant, so a display-unit switch
+    # re-expresses ONLY the shared x-axis from what is already accumulated -- NO
+    # disk re-read (instant, no freeze) and COMPLETE (no cap-store backfill race
+    # that previously left the waterfall half-filled).
+    import numpy as _np
+    n = 20
+    scan, q, _chi = _split_scan_2d(tmp_path, n=n, cap=8)
+    scan._persisted_wavelength_m = 1.5e-10                # real λ for the transform
+    w = widget
+    df = w.displayframe
+    df.scan = scan
+    df.viewer_mode = None
+    df.ui.plotMethod.setCurrentText("Waterfall")
+    df.ui.plotUnit.clear()
+    df.ui.plotUnit.addItems(["Q (Å⁻¹)", "2θ (°)"])
+    df._plot_axis_info = [{"source": "1d_2d", "axis": "radial"},
+                          {"source": "1d_2d", "axis": "radial"}]
+    df.ui.slice.setChecked(False)
+    qgrid = q.astype(float)
+    yrows = (np.arange(n, dtype=float)[:, None] * np.ones(qgrid.size))
+    df.plot_data = [qgrid.copy(), yrows.copy()]
+    df.frame_names = [f"{scan.name}_{i}" for i in range(n)]
+    df.overlaid_idxs = list(range(n))
+    df.ui.plotUnit.setCurrentIndex(1)                     # switch Q -> 2θ
+
+    reads = []
+    orig = df.get_frames_int_1d
+    df.get_frames_int_1d = lambda *a, **k: (reads.append(1), orig(*a, **k))[1]
+    try:
+        ok = df._reexpress_overlay_unit(0, 1)            # prev=Q, new=2θ
+    finally:
+        df.get_frames_int_1d = orig
+
+    assert ok is True                                     # transformed in place
+    assert reads == []                                   # no disk re-read at all
+    expected = 2 * _np.degrees(_np.arcsin(
+        _np.clip(qgrid * 1.5 / (4 * _np.pi), -1, 1)))
+    np.testing.assert_allclose(df.plot_data[0], expected)            # exact Q->2θ
+    np.testing.assert_allclose(np.asarray(df.plot_data[1]), yrows)   # y untouched
+
+    # NEGATIVE: a χ (source '2d') axis is NOT a pure x-transform -> defer to re-read.
+    df._plot_axis_info = [{"source": "1d_2d", "axis": "radial"},
+                          {"source": "2d", "axis": "azimuthal"}]
+    assert df._reexpress_overlay_unit(0, 1) is False
+
+    # NEGATIVE: no wavelength + family change would mislabel -> defer to re-read.
+    df._plot_axis_info = [{"source": "1d_2d", "axis": "radial"},
+                          {"source": "1d_2d", "axis": "radial"}]
+    scan._persisted_wavelength_m = None
+    scan.mg_args = {}
+    scan.data_file = ""
+    df.plot_data = [qgrid.copy(), yrows.copy()]
+    assert df._reexpress_overlay_unit(0, 1) is False
+
+
 # ── adapter routing: cake_image -> _aggregate_cake_payload ─────────────────────
 
 def _fake_state(*, overall, selected_ids, render_ids=(), method="Average"):

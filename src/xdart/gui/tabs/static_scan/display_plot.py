@@ -252,6 +252,70 @@ class DisplayPlotMixin:
             ydata = ydata[np.newaxis, :]
         return ydata
 
+    def _reexpress_overlay_unit(self, prev_unit_idx, new_unit_idx):
+        """Re-express the accumulated Overlay/Waterfall x-axis in the new plotUnit
+        WITHOUT re-reading from disk, for a pure 1D radial display-unit toggle
+        (Q<->2θ): the accumulated intensity is unit-invariant, so only the shared
+        x-axis transforms.
+
+        Returns True on success (``self.plot_data[0]`` replaced; the y rows,
+        ``frame_names`` and ``overlaid_idxs`` are untouched), False on any guard
+        miss — the caller then falls back to the non-blocking re-read.  This is
+        what makes a Q<->2θ switch instant + COMPLETE: no re-read happens, so there
+        is no cap-store backfill race (the cause of the half-filled waterfall).
+
+        Reuses :meth:`get_xdata` (the single blessed Q<->2θ + wavelength path) via a
+        stub frame that carries the existing grid in its OLD unit, so the
+        conversion matches the per-frame readout exactly — no formula drift."""
+        try:
+            from types import SimpleNamespace
+            from .display_constants import Th
+            pd = getattr(self, "plot_data", None)
+            if (not pd or len(pd) != 2
+                    or np.size(pd[0]) == 0 or np.size(pd[1]) == 0):
+                return False
+            old_x = np.asarray(pd[0], dtype=float)
+            y = _as_plot_rows(pd[1])
+            if y.ndim != 2 or old_x.shape[0] != y.shape[1]:
+                return False                  # single-shared-grid invariant broken
+            info = getattr(self, "_plot_axis_info", None)
+            try:
+                sliced = bool(self.ui.slice.isChecked())
+            except Exception:
+                sliced = False
+
+            def pure_radial(idx):
+                if not info or not (0 <= idx < len(info)):
+                    return False
+                src = (info[idx] or {}).get("source")
+                # χ is source '2d'; a sliced 1d_2d axis projects from the cake --
+                # neither is a unit-invariant 1D readout.
+                return not ((src == '2d') or (src == '1d_2d' and sliced))
+
+            if not (pure_radial(prev_unit_idx) and pure_radial(new_unit_idx)):
+                return False
+            old_label = self.ui.plotUnit.itemText(prev_unit_idx)
+            new_label = self.ui.plotUnit.currentText()
+            old_unit = '2th_deg' if Th in old_label else 'q_A^-1'
+            stub = SimpleNamespace(
+                int_1d=SimpleNamespace(radial=old_x, unit=old_unit))
+            new_x = self.get_xdata(stub)
+            if new_x is None:
+                return False
+            new_x = np.asarray(new_x, dtype=float)
+            if new_x.shape[0] != y.shape[1] or not np.all(np.isfinite(new_x)):
+                return False
+            # Family changed but get_xdata returned the grid unconverted (no
+            # wavelength) -> would mislabel the axis; defer to the re-read path.
+            if (Th in old_label) != (Th in new_label) and np.allclose(new_x, old_x):
+                return False
+            self.plot_data = [new_x, pd[1]]
+            return True
+        except Exception:
+            logger.debug("overlay unit re-express failed; falling back to re-read",
+                         exc_info=True)
+            return False
+
     def compute_plot_range(self, xdata, ydata):
         """Update ``plot_data_range`` for non-empty plot arrays."""
         if xdata.size == 0 or ydata.size == 0:
@@ -369,7 +433,8 @@ class DisplayPlotMixin:
         # don't need to narrow ydata here.
 
         current_plot_unit = self.ui.plotUnit.currentIndex()
-        unit_changed = current_plot_unit != self._last_plot_unit
+        prev_plot_unit = self._last_plot_unit
+        unit_changed = current_plot_unit != prev_plot_unit
         self._last_plot_unit = current_plot_unit
 
         # In Overlay/Waterfall: accumulate new frames, skip duplicates.
@@ -388,54 +453,61 @@ class DisplayPlotMixin:
         )
 
         if overlay_action is OverlayAction.REBUILD:
-            rebuild_idxs = list(self.overlaid_idxs)
-            # Re-express the accumulated rows in the NEW unit WITHOUT block-reading
-            # the whole scan from disk on the GUI thread.  That synchronous read
-            # was the Q<->2θ unit-switch HARD FREEZE: re-reading all evicted frames
-            # took seconds and locked the GUI.  allow_blocking_read=None routes
-            # through the async path -- with the live app's async hydration on
-            # (enabled at startup) this reads only resident rows now and the
-            # FrameHydrationWorker backfills the evicted ones off-thread, each
-            # completion re-rendering (progressive fill, no freeze).  Headless
-            # tests (async OFF) still block-read the full set for determinism.
-            # require_all=False so a partial read is applied + progressively
-            # completed, not discarded.
-            y_new, x_new = self.get_frames_int_1d(
-                rebuild_idxs,
-                require_all=False,
-                allow_blocking_read=None,
-            )
-            if x_new is not None and y_new is not None:
-                y_new = self.apply_plot_background(y_new)
-                kept = rebuild_idxs[:_as_plot_rows(y_new).shape[0]]
-                kept_names = self.build_plot_names(kept)
-                self.plot_data, self.frame_names, self.overlaid_idxs = (
-                    update_plot_accumulator(
-                        self.plot_data,
-                        self.frame_names,
-                        self.overlaid_idxs,
-                        x_new,
-                        y_new,
-                        kept_names,
-                        kept,
-                        current_method,
-                        unit_changed,
-                    )
-                )
+            if self._reexpress_overlay_unit(prev_plot_unit, current_plot_unit):
+                # Pure Q<->2θ display-unit toggle: the accumulated intensities are
+                # unit-invariant, so re-express ONLY the shared x-axis in place --
+                # NO disk re-read at all.  This is what fixes the unit-switch
+                # incompleteness: the prior non-blocking re-read raced the cap-64
+                # store (frames hydrated then evicted before being appended), so
+                # the waterfall came back half-filled.  y / frame_names /
+                # overlaid_idxs are untouched.
+                pass
             else:
-                self.plot_data, self.frame_names, self.overlaid_idxs = (
-                    update_plot_accumulator(
-                        self.plot_data,
-                        self.frame_names,
-                        self.overlaid_idxs,
-                        xdata,
-                        ydata,
-                        frame_names,
-                        row_ids,
-                        current_method,
-                        unit_changed,
-                    )
+                rebuild_idxs = list(self.overlaid_idxs)
+                # Fallback (non-pure-radial change, no resident frame, missing
+                # wavelength): re-express by re-reading, but WITHOUT block-reading
+                # the whole scan on the GUI thread (the unit-switch freeze).
+                # allow_blocking_read=None routes through the async path -- with
+                # the live app's async hydration on (enabled at startup) this reads
+                # resident rows now and the FrameHydrationWorker backfills the rest
+                # off-thread.  Headless tests (async OFF) still block-read for
+                # determinism.  require_all=False so a partial read is applied.
+                y_new, x_new = self.get_frames_int_1d(
+                    rebuild_idxs,
+                    require_all=False,
+                    allow_blocking_read=None,
                 )
+                if x_new is not None and y_new is not None:
+                    y_new = self.apply_plot_background(y_new)
+                    kept = rebuild_idxs[:_as_plot_rows(y_new).shape[0]]
+                    kept_names = self.build_plot_names(kept)
+                    self.plot_data, self.frame_names, self.overlaid_idxs = (
+                        update_plot_accumulator(
+                            self.plot_data,
+                            self.frame_names,
+                            self.overlaid_idxs,
+                            x_new,
+                            y_new,
+                            kept_names,
+                            kept,
+                            current_method,
+                            unit_changed,
+                        )
+                    )
+                else:
+                    self.plot_data, self.frame_names, self.overlaid_idxs = (
+                        update_plot_accumulator(
+                            self.plot_data,
+                            self.frame_names,
+                            self.overlaid_idxs,
+                            xdata,
+                            ydata,
+                            frame_names,
+                            row_ids,
+                            current_method,
+                            unit_changed,
+                        )
+                    )
         elif overlay_action is OverlayAction.APPEND:
             self.plot_data, self.frame_names, self.overlaid_idxs = (
                 update_plot_accumulator(

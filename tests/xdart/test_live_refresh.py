@@ -3227,6 +3227,7 @@ def _plot_host(method="Overlay"):
         "_loaded_1d_overlay_labels",
         "_waterfall_active",
         "_uniform_waterfall_grid",
+        "_reexpress_overlay_unit",
         "update_plot",
     ):
         setattr(host, name, MethodType(getattr(DisplayPlotMixin, name), host))
