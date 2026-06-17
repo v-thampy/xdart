@@ -4144,6 +4144,12 @@ def test_map_raw_reports_thumbnail_source():
 
 
 def test_thumbnail_image_update_skips_full_detector_flat_mask():
+    # The thumbnail path must NEVER apply full-resolution flat detector indices
+    # directly to the smaller thumbnail (they point at unrelated pixels).  When
+    # the full-res shape isn't known the gap mask cannot be mapped into thumbnail
+    # coordinates, so it is skipped — leaving the preview untouched rather than
+    # corrupting it.  (The mapped, masked case is covered in test_aggregation_
+    # wiring::test_nan_thumbnail_gaps_masks_downsampled_gap_rows.)
     calls = []
     host = SimpleNamespace(
         overall=False,
@@ -4153,9 +4159,12 @@ def test_thumbnail_image_update_skips_full_detector_flat_mask():
         data_2d={1: {"mask": np.array([0], dtype=int)}},
         scan=SimpleNamespace(global_mask=np.array([1], dtype=int)),
         bkg_map_raw=0,
+        # no _raw_full_shape -> the gap mask can't be mapped -> skipped
         get_frames_map_raw=lambda **kwargs: (np.ones((2, 2)), "thumbnail"),
         update_image_view=lambda: calls.append("updated"),
     )
+    host._nan_thumbnail_gaps = MethodType(
+        displayFrameWidget._nan_thumbnail_gaps, host)
 
     displayFrameWidget.update_image(host)
 

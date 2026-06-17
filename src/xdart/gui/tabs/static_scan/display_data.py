@@ -455,6 +455,14 @@ class DisplayDataMixin:
         for nn, idx in enumerate(idxs):
             frame_1d, frame_2d = snapshot.get(int(idx), (None, {}))
             raw = frame_2d.get('map_raw')
+            # Cache the full-resolution detector shape from any resident raw so
+            # the thumbnail render path can map the flat detector gap mask into
+            # thumbnail coordinates.  update_image re-masks gaps when a frame's
+            # thumbnail was generated without the bake (e.g. the last frame
+            # persisted at end-of-scan), where it would otherwise show the
+            # 0-valued module gaps as dark instead of NaN.
+            if raw is not None and getattr(raw, 'ndim', 0) == 2:
+                self._raw_full_shape = tuple(raw.shape)
             bg = frame_2d.get('bg_raw', 0)
             if bg is None:                  # LRU eviction nulls bg_raw
                 bg = 0
@@ -504,6 +512,8 @@ class DisplayDataMixin:
                             logger.debug("lazy raw reload failed for %s", idx,
                                          exc_info=True)
                     raw = getattr(lf, 'map_raw', None)
+                    if raw is not None and getattr(raw, 'ndim', 0) == 2:
+                        self._raw_full_shape = tuple(raw.shape)
                     # free_raw() nulls bg_raw and _lazy_load_raw restores
                     # only map_raw -- the attribute EXISTS with value None,
                     # so the getattr default never applies; raw - None

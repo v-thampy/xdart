@@ -2036,6 +2036,50 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     # ── 2D image rendering ────────────────────────────────────────
 
+    def _nan_thumbnail_gaps(self, data, frame_mask=None):
+        """NaN the detector gap pixels in a downsampled thumbnail in place.
+
+        The detector mask (``scan.global_mask`` + any per-frame ``frame_mask``)
+        is stored as flat indices into the *full-resolution* detector shape.
+        The full-res path applies it directly, but the thumbnail path normally
+        relies on the mask being baked into the preview at creation.  A frame
+        whose thumbnail was generated without the bake — notably the last frame
+        persisted at end-of-scan — then shows the 0-valued module gaps as dark
+        instead of NaN.  Map the flat indices into the thumbnail's smaller shape
+        via the cached full-res shape (``_raw_full_shape``, set by
+        ``get_frames_map_raw`` whenever a resident raw is seen) and set those
+        pixels to NaN, so the raw panel masks gaps consistently with the
+        full-res path.  No-op when the shape isn't known or there is no gap mask.
+
+        Tactical bridge: the publication/payload unification folds this
+        thumbnail-vs-full-res masking divergence into one display contract.
+        """
+        if data is None or getattr(data, 'ndim', 0) != 2:
+            return
+        full_shape = getattr(self, '_raw_full_shape', None)
+        if full_shape is None:
+            return
+        parts = []
+        gap = getattr(self.scan, 'global_mask', None)
+        if gap is not None and np.size(gap):
+            parts.append(np.asarray(gap, dtype=np.int64).ravel())
+        if frame_mask is not None and np.size(frame_mask):
+            parts.append(np.asarray(frame_mask, dtype=np.int64).ravel())
+        if not parts:
+            return
+        H, W = int(full_shape[0]), int(full_shape[1])
+        if H <= 0 or W <= 0:
+            return
+        flat = np.unique(np.concatenate(parts))
+        flat = flat[(flat >= 0) & (flat < H * W)]
+        if flat.size == 0:
+            return
+        h, w = data.shape
+        rows, cols = np.unravel_index(flat, (H, W))
+        tr = np.clip((rows * h) // H, 0, h - 1)
+        tc = np.clip((cols * w) // W, 0, w - 1)
+        data[tr, tc] = np.nan
+
     def update_image(self):
         """Updates image plotted in image frame.
 
@@ -2108,9 +2152,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             ceiling=_sat_ceiling,
         )
 
-        # Apply detector + global mask only to full-resolution raw data.
-        # Thumbnails already bake the mask into the preview before
-        # downsampling; flat detector indices point at unrelated pixels there.
+        # Apply the detector + global mask.  Full-resolution raw uses the flat
+        # detector indices directly.  Thumbnails normally bake the mask in at
+        # creation, but a frame whose thumbnail was generated without it (e.g.
+        # the last frame persisted at end-of-scan) shows the 0-valued module
+        # gaps as dark; re-apply the gap mask in thumbnail coordinates so both
+        # paths mask gaps identically.
         if raw_source == 'raw':
             global_mask = (
                 self.scan.global_mask if self.scan.global_mask is not None else []
@@ -2120,6 +2167,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if len(mask) > 0 and mask.max() < data.size:
                 mask = np.unravel_index(mask, data.shape)
                 data[mask] = np.nan
+        elif raw_source is not None:
+            self._nan_thumbnail_gaps(data, mask)
 
         # Subtract background
         bkg = np.asarray(self.bkg_map_raw)
