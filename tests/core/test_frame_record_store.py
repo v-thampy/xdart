@@ -228,3 +228,37 @@ def test_max_items_evicts_persisted_records_not_unpersisted():
     store2.upsert(_record(label=1, source="/d/1.tif"), persisted=False)
     store2.upsert(_record(label=2, source="/d/2.tif"), persisted=False)
     assert len(store2) == 2
+
+
+def test_concurrent_upsert_mark_hydrate_is_thread_safe():
+    # The RLock is the store's headline safety feature; exercise it under
+    # contention (upsert / mark_persisted / get_or_hydrate / snapshot from many
+    # threads).  Assert no exception, no deadlock, and the bounds hold.
+    import threading
+
+    store = FrameRecordStore(max_heavy_items=8, max_items=20)
+    store.set_hydrator(lambda label: _record(label=label, scale=3.0))
+    errors: list[BaseException] = []
+
+    def worker(base):
+        try:
+            for i in range(base, base + 80):
+                lbl = i % 20
+                store.upsert(_record(label=lbl, source=f"/d/{lbl}.tif"),
+                             persisted=(i % 2 == 0))
+                store.mark_persisted(lbl)
+                store.get_or_hydrate(lbl)
+                store.snapshot()
+        except BaseException as exc:                 # pragma: no cover - diagnostic
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(b,))
+               for b in (0, 100, 200, 300)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15.0)
+
+    assert not errors, errors
+    assert not any(t.is_alive() for t in threads)   # no deadlock
+    assert len(store) <= 20                          # max_items bound held
