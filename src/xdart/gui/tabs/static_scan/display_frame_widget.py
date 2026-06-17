@@ -1121,7 +1121,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if role is PanelRole.RAW_2D:
             if mode in (Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER):
                 return self.clear_image_view
-            return self.update_image
+            # Item-2 flip: the Int raw panel now renders SOLELY from the
+            # raw_image payload (gap-masking + detector_shape live there),
+            # mirroring CAKE_2D -- a None raw payload normally blanks the panel
+            # (no legacy update_image fallback).  Panel-consistency: while a run
+            # is active, return None so render skips this panel (keep last) like
+            # the 1D plot + cake.  update_image is retained as dead-but-rollback-
+            # able code (its gap-mask logic is duplicated in the raw_image builder).
+            if (getattr(self, 'PERSIST_2D_DURING_PROCESSING', True)
+                    and getattr(self, '_processing_active', False)):
+                return None
+            return self.clear_image_view
         if role is PanelRole.PLOT_1D:
             if mode in (Mode.XYE_VIEWER, Mode.NEXUS_VIEWER):
                 return self.clear_plot_view

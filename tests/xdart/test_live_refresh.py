@@ -774,6 +774,37 @@ def test_draw_delegate_cake_persists_during_run():
     assert host._draw_delegate(PanelRole.CAKE_2D, Mode.INT_2D) is host.clear_binned_view
 
 
+def test_draw_delegate_raw_uses_payload_not_legacy_update_image():
+    # Item-2 flip: RAW_2D no longer falls back to legacy update_image -- it
+    # renders solely from the raw_image payload, mirroring CAKE_2D (None during
+    # a run = keep-last; clear_image_view idle).  Image/NeXus viewer modes still
+    # clear (no integration raw).
+    from xdart.gui.tabs.static_scan.display_logic import Mode, PanelRole
+
+    host = SimpleNamespace(
+        PERSIST_2D_DURING_PROCESSING=True,
+        _processing_active=False,
+        clear_image_view=lambda: None,
+        update_image=lambda: None,
+    )
+    host._draw_delegate = MethodType(displayFrameWidget._draw_delegate, host)
+
+    # Idle Int -> blanks (NOT the legacy update_image).
+    d = host._draw_delegate(PanelRole.RAW_2D, Mode.INT_2D)
+    assert d is host.clear_image_view
+    assert d is not host.update_image
+    # Running -> keep last (None delegate -> render skips this panel).
+    host._processing_active = True
+    assert host._draw_delegate(PanelRole.RAW_2D, Mode.INT_2D) is None
+    # Revert switch off -> blanks even during a run.
+    host.PERSIST_2D_DURING_PROCESSING = False
+    assert (host._draw_delegate(PanelRole.RAW_2D, Mode.INT_2D)
+            is host.clear_image_view)
+    # Image Viewer still clears (no integration raw).
+    assert (host._draw_delegate(PanelRole.RAW_2D, Mode.IMAGE_VIEWER)
+            is host.clear_image_view)
+
+
 def test_set_processing_active_sets_flag():
     host = SimpleNamespace(_processing_active=False)
     host.set_processing_active = MethodType(
@@ -1638,12 +1669,12 @@ def _update_smoke_host():
 def test_update_render_smoke_int_collapse_and_mode_switches():
     host, calls, dl = _update_smoke_host()
 
-    # Int-2D: raw + plot via the legacy delegates; the CAKE_2D panel is
-    # payload-only now (no update_binned) and this host has no publication_store,
-    # so the cake payload is None and CAKE_2D blanks.
+    # Int-2D: the 1D plot draws via the legacy delegate; RAW_2D and CAKE_2D are
+    # both payload-only now (item-2 flip), and this host has no publication_store,
+    # so their payloads are None and both 2D panels blank.
     host.update()
-    assert "draw_plot" in calls and "draw_image" in calls
-    assert "clear_binned" in calls
+    assert "draw_plot" in calls
+    assert "clear_image" in calls and "clear_binned" in calls
     assert "label_2d" in calls
 
     # Int-1D (skip_2d): 1D-only — plot drawn, the two 2D panels cleared.
@@ -1713,20 +1744,21 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     host.viewer_mode = None
     host._bump_display_generation()
     host.update()
-    assert {"draw_plot", "draw_image"} <= set(calls)   # raw + plot legacy
-    assert "clear_binned" in calls                     # cake payload-only, no pub
+    assert "draw_plot" in calls                        # 1D plot legacy delegate
+    # RAW_2D + CAKE_2D are payload-only; no publication_store -> both 2D blank.
+    assert "clear_image" in calls and "clear_binned" in calls
 
 
 def test_update_render_smoke_gi_scan_propagates_and_dispatches():
     # A GI scan still renders through the same path; gi flag propagates into
-    # the state and the raw/plot dispatch is unchanged.  CAKE_2D is payload-only
-    # (no publication_store on this host -> the cake blanks).
+    # the state.  RAW_2D + CAKE_2D are payload-only (item-2 flip); no
+    # publication_store on this host -> both 2D panels blank; the 1D plot draws.
     host, calls, dl = _update_smoke_host()
     host.scan.gi = True
     host.update()
     assert host._live_display_state().gi is True
-    assert {"draw_plot", "draw_image"} <= set(calls)
-    assert "clear_binned" in calls
+    assert "draw_plot" in calls
+    assert "clear_image" in calls and "clear_binned" in calls
 
 
 def test_update_render_smoke_stale_generation_is_dropped():
