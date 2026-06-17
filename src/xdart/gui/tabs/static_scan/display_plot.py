@@ -183,7 +183,14 @@ class DisplayPlotMixin:
             missing = [i for i in selection if i not in have]
             idxs = missing if (have and missing) else selection
             require_all = False
-            allow_blocking = True if idle else None
+            # NEVER block-read on the GUI thread for an accumulating display.
+            # allow_blocking_read=None routes through the async path: in the live
+            # app (async hydration on) this reads only resident rows now and the
+            # FrameHydrationWorker backfills the rest off-thread (no freeze on a
+            # unit switch / reload / catch-up where the whole accumulator is the
+            # selection); headless tests (async off) still block-read so their
+            # first render has the data.
+            allow_blocking = None
         else:
             store_complete_required = (
                 getattr(self, "viewer_mode", None) is None
@@ -382,11 +389,21 @@ class DisplayPlotMixin:
 
         if overlay_action is OverlayAction.REBUILD:
             rebuild_idxs = list(self.overlaid_idxs)
-            idle = not getattr(self, "_processing_active", False)
+            # Re-express the accumulated rows in the NEW unit WITHOUT block-reading
+            # the whole scan from disk on the GUI thread.  That synchronous read
+            # was the Q<->2θ unit-switch HARD FREEZE: re-reading all evicted frames
+            # took seconds and locked the GUI.  allow_blocking_read=None routes
+            # through the async path -- with the live app's async hydration on
+            # (enabled at startup) this reads only resident rows now and the
+            # FrameHydrationWorker backfills the evicted ones off-thread, each
+            # completion re-rendering (progressive fill, no freeze).  Headless
+            # tests (async OFF) still block-read the full set for determinism.
+            # require_all=False so a partial read is applied + progressively
+            # completed, not discarded.
             y_new, x_new = self.get_frames_int_1d(
                 rebuild_idxs,
-                require_all=idle,
-                allow_blocking_read=True if idle else None,
+                require_all=False,
+                allow_blocking_read=None,
             )
             if x_new is not None and y_new is not None:
                 y_new = self.apply_plot_background(y_new)

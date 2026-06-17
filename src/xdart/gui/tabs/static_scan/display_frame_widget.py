@@ -737,14 +737,45 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _on_frame_hydrated(self, label, generation) -> None:
         """A background hydration finished: the heavy payload is now resident in
         the store.  Drop a stale result (the selection/mode moved on), else
-        re-render so the panel upgrades from its thumbnail to the full frame."""
+        re-render so the panel upgrades from its thumbnail to the full frame.
+
+        THROTTLED: a unit-switch REBUILD backfills hundreds of evicted frames,
+        firing this once per frame.  Render immediately when we haven't rendered
+        recently (sparse scroll-back hydration stays instant), but coalesce a
+        burst into one render per ~120 ms so the progressive fill stays smooth
+        instead of O(N) renders (the data is already resident, so the short
+        trailing delay is invisible)."""
         if int(generation) != self.display_generation:
             return
-        try:
-            self.update()
-        except Exception:
-            logger.debug("re-render after hydration failed for %s", label,
-                         exc_info=True)
+        import time
+        now = time.monotonic()
+        last = getattr(self, "_last_hydration_render", 0.0)
+        self._pending_hydration_render = True
+        if now - last >= 0.12:
+            self._last_hydration_render = now
+            self._pending_hydration_render = False
+            try:
+                self.update()
+            except Exception:
+                logger.debug("re-render after hydration failed for %s", label,
+                             exc_info=True)
+            return
+        # Inside the throttle window: coalesce into one trailing render.
+        if getattr(self, "_hydration_render_scheduled", False):
+            return
+        self._hydration_render_scheduled = True
+
+        def _go():
+            self._hydration_render_scheduled = False
+            if not getattr(self, "_pending_hydration_render", False):
+                return
+            self._pending_hydration_render = False
+            self._last_hydration_render = time.monotonic()
+            try:
+                self.update()
+            except Exception:
+                logger.debug("re-render after hydration failed", exc_info=True)
+        Qt.QtCore.QTimer.singleShot(120, _go)
 
     def stop_hydration_worker(self) -> None:
         """Stop + join the background worker (idempotent; call at teardown).

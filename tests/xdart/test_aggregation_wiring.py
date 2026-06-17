@@ -466,6 +466,48 @@ def test_catchup_overlay_reads_only_missing_not_whole_scan(widget, tmp_path):
     assert max(reads) < n, "must NOT re-read the whole scan from disk"
 
 
+@pytest.mark.gui
+def test_unit_switch_rebuild_never_blocks_gui_thread(widget, tmp_path):
+    # HARD-FREEZE regression (Q->2θ unit switch): re-expressing the accumulated
+    # waterfall in a new unit triggers update_plot's REBUILD (plus the collect
+    # before it).  Neither may pass allow_blocking_read=True (a synchronous
+    # whole-scan disk read on the GUI thread that locked the UI for seconds);
+    # they route through the async path (None) so the live app reads resident now
+    # and the FrameHydrationWorker backfills the rest off-thread.
+    n = 70
+    scan, q, chi = _split_scan_2d(tmp_path, n=n, cap=8)
+    w = widget
+    df = w.displayframe
+    df.scan = scan
+    df.viewer_mode = None
+    df.ui.plotMethod.setCurrentText("Waterfall")
+    df.ui.plotUnit.setCurrentIndex(0)
+    _evict_overall_store(w, q, chi, n)
+    df.frame_ids = [str(i) for i in range(n)]
+    df.overlaid_idxs = list(range(n))                 # full accumulator (worst case)
+    df.plot_data = [q.astype(float),
+                    (np.arange(n, dtype=float)[:, None] * np.ones(q.size))]
+    df.frame_names = [f"{scan.name}_{i}" for i in range(n)]
+    df._processing_active = False                      # idle (scan ended)
+    df._last_plot_unit = -999                          # force unit_changed -> REBUILD
+
+    blocking = []
+    orig = df.get_frames_int_1d
+
+    def spy(idxs=None, rv="all", *, require_all=False, allow_blocking_read=None):
+        blocking.append(allow_blocking_read)
+        return orig(idxs, rv, require_all=require_all,
+                    allow_blocking_read=allow_blocking_read)
+    df.get_frames_int_1d = spy
+    try:
+        df.update_plot()
+    finally:
+        df.get_frames_int_1d = orig
+    assert blocking, "expected a fetch during the unit-switch rebuild"
+    assert all(b is not True for b in blocking), (
+        f"GUI-thread blocking read on unit switch: {blocking}")
+
+
 # ── adapter routing: cake_image -> _aggregate_cake_payload ─────────────────────
 
 def _fake_state(*, overall, selected_ids, render_ids=(), method="Average"):
