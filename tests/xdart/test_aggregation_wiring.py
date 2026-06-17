@@ -300,7 +300,9 @@ def test_real_widget_gi_primary_mode_serves_disk_aggregate(widget, tmp_path):
     df.update()
 
     expected = np.mean(np.arange(1, n + 1))
-    assert df.binned_data is not None
+    # binned_data inits to (None, None); assert the cake datum is actually drawn,
+    # not merely that the tuple exists.
+    assert df.binned_data is not None and df.binned_data[0] is not None
     np.testing.assert_allclose(df.binned_data[0], expected)
     x, y = df.plot_data
     np.testing.assert_allclose(np.asarray(y), expected)
@@ -356,7 +358,17 @@ def test_real_widget_setbkg_hydrates_evicted_subset_from_disk(widget, tmp_path):
     df._async_hydration_enabled = False
 
     _evict_overall_store(w, q, chi, n)            # clears mirrors + thins the store
-    subset = [10, 20, 30]                          # NON-Overall: 3 specific frames
+    # NON-Overall subset of the FIFO tier-1-EVICTED labels (the store thins oldest
+    # first), so setBkg's get_frames_int_2d/1d MUST hydrate them from disk — not
+    # serve them resident.  Lock that precondition: if the eviction policy ever
+    # changes so these rows stay resident, fail loudly here instead of letting the
+    # test silently go vacuous (the adversarial-review finding).
+    subset = [0, 1, 2]
+    for i in subset:
+        p = w.publication_store.get(i)
+        assert p is not None and not p.view.has_2d and not p.view.has_1d, (
+            f"precondition: frame {i} must be heavy-evicted so setBkg hydrates "
+            f"from disk (store cap >= n would make this test vacuous)")
     df.frame_ids = [str(i) for i in subset]
     df.overall = False
     df.idxs = list(subset)
@@ -364,8 +376,8 @@ def test_real_widget_setbkg_hydrates_evicted_subset_from_disk(widget, tmp_path):
 
     df.setBkg()
 
-    expected = float(np.mean([i + 1 for i in subset]))   # mean(11, 21, 31) = 21.0
-    assert df.bkg_2d is not None                  # full-coverage hydrate, not refused
+    expected = float(np.mean([i + 1 for i in subset]))   # mean(1, 2, 3) = 2.0
+    assert df.bkg_2d is not None                  # full-coverage disk hydrate, not refused
     np.testing.assert_allclose(df.bkg_2d, expected)
     assert df.bkg_1d is not None
     np.testing.assert_allclose(np.asarray(df.bkg_1d), expected)
