@@ -244,6 +244,133 @@ def test_real_widget_overall_aggregate_uses_disk_when_store_evicted(
     np.testing.assert_allclose(np.asarray(y), expected)
 
 
+def _evict_overall_store(w, q, chi, n):
+    """Clear the legacy mirrors + store, then upsert ``n`` Overall frame
+    publications whose heavy rows the bounded store thins — so a subsequent
+    Overall render can only be satisfied from the on-disk whole-scan aggregate.
+    Returns after pointing ``w.frame_ids`` at the full range."""
+    from xdart.modules.frame_publication import publication_from_frame_view
+    from xrd_tools.core import FrameView
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+
+    with w.data_lock:
+        w.data_1d.clear()
+        w.data_2d.clear()
+    w.publication_store.clear()
+    for i in range(n):
+        r1 = IntegrationResult1D(
+            radial=q, intensity=np.full(q.shape, float(i + 1), dtype=np.float32),
+            sigma=None, unit="q_A^-1")
+        r2 = IntegrationResult2D(
+            radial=q, azimuthal=chi,
+            intensity=np.full((q.size, chi.size), float(i + 1), dtype=np.float32),
+            unit="q_A^-1", azimuthal_unit="chi_deg")
+        view = FrameView.from_results(label=i, result_1d=r1, result_2d=r2)
+        w.publication_store.upsert(publication_from_frame_view(view))
+    # Eviction actually happened: not every row still carries its heavy 1D payload.
+    assert sum(1 for i in range(n)
+               if (p := w.publication_store.get(i)) is not None
+               and p.view.has_1d) < n
+    w.frame_ids[:] = [str(i) for i in range(n)]
+
+
+@pytest.mark.gui
+def test_real_widget_gi_primary_mode_serves_disk_aggregate(widget, tmp_path):
+    # A-3a (GI render-through PAIR — primary half): a GI scan whose DISPLAYED
+    # 1D/2D modes match the primary modes recorded in gi_config serves the Overall
+    # cake + 1D from the disk-tail whole-scan aggregate (store heavy rows evicted,
+    # legacy mirrors empty) through the REAL df.update() — not just the unbound
+    # _whole_scan_aggregate gate (test_widget_whole_scan_aggregate_allows_primary_gi).
+    n = 70
+    scan, q, chi = _split_scan_2d(tmp_path, n=n, cap=8)
+    scan.gi = True
+    scan.bai_1d_args = {"gi_mode_1d": "q_total"}
+    scan.bai_2d_args = {"gi_mode_2d": "qip_qoop"}
+    scan.gi_config = {"gi_mode_1d": "q_total", "gi_mode_2d": "qip_qoop"}  # == displayed
+    w = widget
+    df = w.displayframe
+    df.scan = scan
+    df.viewer_mode = None
+    df._async_hydration_enabled = False
+    df.ui.plotMethod.setCurrentText("Average")
+    df.ui.plotUnit.setCurrentIndex(0)
+
+    _evict_overall_store(w, q, chi, n)
+    df.frame_ids = list(w.frame_ids)
+    df.update()
+
+    expected = np.mean(np.arange(1, n + 1))
+    assert df.binned_data is not None
+    np.testing.assert_allclose(df.binned_data[0], expected)
+    x, y = df.plot_data
+    np.testing.assert_allclose(np.asarray(y), expected)
+
+
+@pytest.mark.gui
+def test_real_widget_gi_nonprimary_mode_blanks_instead_of_partial(widget, tmp_path):
+    # A-3b (GI render-through PAIR — non-primary half): a GI scan whose displayed
+    # 2D mode does NOT match the primary mode in gi_config must BLANK the Overall
+    # cake (and the 1D, whose gi_mode_1d is unrecorded -> fail-closed) rather than
+    # render a wrong/partial aggregate from a bounded resident subset.  Drives the
+    # REAL df.update(); the adapter-level analogue is
+    # test_cake_image_blocks_nonprimary_gi_instead_of_falling_back.
+    n = 70
+    scan, q, chi = _split_scan_2d(tmp_path, n=n, cap=8)
+    scan.gi = True
+    scan.bai_2d_args = {"gi_mode_2d": "q_chi"}          # displayed (non-primary)
+    scan.gi_config = {"gi_mode_2d": "qip_qoop"}         # primary on disk (mismatch)
+    w = widget
+    df = w.displayframe
+    df.scan = scan
+    df.viewer_mode = None
+    df._async_hydration_enabled = False
+    df.ui.plotMethod.setCurrentText("Average")
+    df.ui.plotUnit.setCurrentIndex(0)
+
+    _evict_overall_store(w, q, chi, n)
+    df.frame_ids = list(w.frame_ids)
+    df.update()
+
+    # Non-primary GI Overall: no wrong/partial aggregate is rendered.
+    assert df.binned_data is None
+    _x, y = df.plot_data
+    assert np.asarray(y).size == 0
+
+
+@pytest.mark.gui
+def test_real_widget_setbkg_hydrates_evicted_subset_from_disk(widget, tmp_path):
+    # A-1: per-frame disk hydration of a NON-Overall subset whose rows are evicted
+    # from the store (legacy mirrors empty).  get_frames_int_2d/1d feed ONLY
+    # Set-Bkg (display_data.py), so Set-Bkg is the real consumer of that hydration
+    # path — drive the REAL displayFrameWidget.setBkg() and prove the 1D/2D
+    # background is hydrated from disk (the correct subset average), not refused as
+    # partial-coverage and not left blank.  (The mixin-level analogue is
+    # test_display_cross_frame_2d.py; the normal subset *display* deliberately
+    # blanks a subset aggregate — test_cake_image_blanks_non_overall_eviction.)
+    n = 70
+    scan, q, chi = _split_scan_2d(tmp_path, n=n, cap=8)
+    w = widget
+    df = w.displayframe
+    df.scan = scan
+    df.viewer_mode = None
+    df._async_hydration_enabled = False
+
+    _evict_overall_store(w, q, chi, n)            # clears mirrors + thins the store
+    subset = [10, 20, 30]                          # NON-Overall: 3 specific frames
+    df.frame_ids = [str(i) for i in subset]
+    df.overall = False
+    df.idxs = list(subset)
+    df.ui.setBkg.setText("Set Bkg")
+
+    df.setBkg()
+
+    expected = float(np.mean([i + 1 for i in subset]))   # mean(11, 21, 31) = 21.0
+    assert df.bkg_2d is not None                  # full-coverage hydrate, not refused
+    np.testing.assert_allclose(df.bkg_2d, expected)
+    assert df.bkg_1d is not None
+    np.testing.assert_allclose(np.asarray(df.bkg_1d), expected)
+
+
 # ── adapter routing: cake_image -> _aggregate_cake_payload ─────────────────────
 
 def _fake_state(*, overall, selected_ids, render_ids=(), method="Average"):
