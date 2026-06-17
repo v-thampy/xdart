@@ -143,6 +143,19 @@ def test_widget_whole_scan_aggregate_defers_for_nonprimary_gi(tmp_path):
     assert _call_whole_scan_aggregate(duck, dim="2d", method="average") is None
 
 
+def test_widget_whole_scan_aggregate_defers_for_gi_without_gi_config(tmp_path):
+    # FAIL-CLOSED: a GI scan whose gi_config does not record the primary mode
+    # (e.g. an older-format .nxs reloaded) must DEFER the whole-scan aggregate,
+    # not default primary=displayed (which would always pass the gate and defeat
+    # the anti-truncation protection when the user switches GI mode).
+    scan, _, _ = _split_scan_2d(tmp_path, n=12)
+    scan.gi = True
+    scan.bai_2d_args = {"gi_mode_2d": "q_chi"}
+    scan.gi_config = {}                                  # no recorded primary mode
+    duck = _duck_widget(scan)
+    assert _call_whole_scan_aggregate(duck, dim="2d", method="average") is None
+
+
 @pytest.fixture
 def widget(qapp):
     from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget

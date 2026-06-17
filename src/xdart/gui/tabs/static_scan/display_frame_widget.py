@@ -801,15 +801,21 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return mode_aggregation_allowed(None, None)
 
         gi_config = getattr(scan, "gi_config", None) or {}
+        key = "gi_mode_1d" if dim == "1d" else "gi_mode_2d"
+        # FAIL CLOSED: a GI scan whose gi_config does not record the primary mode
+        # (e.g. a .nxs written before gi_config existed, reloaded) must NOT serve a
+        # whole-scan aggregate.  Defaulting primary=displayed would make the gate
+        # ALWAYS pass, defeating the anti-truncation protection the moment the user
+        # switches to a non-primary GI mode — so defer (blank) instead.
+        if key not in gi_config:
+            return False
         if dim == "1d":
             displayed = getattr(scan, "bai_1d_args", {}).get(
                 "gi_mode_1d", "q_total")
-            primary = gi_config.get("gi_mode_1d", displayed)
         else:
             displayed = getattr(scan, "bai_2d_args", {}).get(
                 "gi_mode_2d", "qip_qoop")
-            primary = gi_config.get("gi_mode_2d", displayed)
-        return mode_aggregation_allowed(displayed, primary)
+        return mode_aggregation_allowed(displayed, gi_config[key])
 
     def _whole_scan_aggregate(self, *, dim, method):
         """Return the whole-scan Sum/Average for the current Overall selection as
