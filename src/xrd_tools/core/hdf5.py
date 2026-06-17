@@ -216,9 +216,19 @@ def arr_to_h5(data, grp: h5py.Group, key: str, compression) -> None:
     grp[key].attrs["encoded"] = "arr"
 
 
+def _portable_compression(compression):
+    """Normalize a filter to the portable policy: ``lzf`` -> ``gzip`` on EVERY
+    platform.  lzf is h5py-only and bus-errors on some ARM64-macOS builds; gzip
+    is in every HDF5 build and stock-h5py readable.  Mirrors
+    ``xrd_tools.io.nexus._comp_kwargs`` / ``containers._h5_replace`` so these
+    pandas-table create_dataset paths never emit lzf either (no core->io import)."""
+    return "gzip" if compression == "lzf" else compression
+
+
 def series_to_h5(data: pd.Series, grp: h5py.Group, key: str,
                  compression) -> None:
     """Store a :class:`pandas.Series` in a labelled HDF5 group."""
+    compression = _portable_compression(compression)
     if key in grp:
         if check_encoded(grp[key], "Series"):
             new_grp = grp[key]
@@ -239,6 +249,7 @@ def series_to_h5(data: pd.Series, grp: h5py.Group, key: str,
 def dataframe_to_h5(data: pd.DataFrame, grp: h5py.Group, key: str,
                     compression) -> None:
     """Store a :class:`pandas.DataFrame` in a labelled HDF5 group."""
+    compression = _portable_compression(compression)
     if key in grp:
         if check_encoded(grp[key], "DataFrame"):
             new_grp = grp[key]
@@ -263,6 +274,7 @@ def dataframe_to_h5(data: pd.DataFrame, grp: h5py.Group, key: str,
 
 def index_to_h5(index, key: str, grp: h5py.Group, compression) -> None:
     """Store a :class:`pandas.Index` (or column labels) inside *grp*."""
+    compression = _portable_compression(compression)
     if key in grp:
         if grp[key].shape == (0,):
             del grp[key]
@@ -384,7 +396,8 @@ def data_to_h5(data, grp: h5py.Group, key: str, encoder: str = "yaml",
         Fallback encoder for unknown types: ``'yaml'`` (default) or
         ``'json'``.
     compression:
-        HDF5 compression filter (e.g. ``'lzf'``, ``'gzip'``).
+        HDF5 compression filter (default ``'gzip'``; ``'lzf'`` is normalized to
+        gzip on every platform — see :func:`_portable_compression`).
     """
     if data is None:
         none_to_h5(grp, key)

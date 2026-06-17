@@ -143,3 +143,35 @@ class TestSafety:
                 codec.h5_to_data(f["x"])
         import os
         assert not os.path.exists("/tmp/xrd_pwn_yaml")
+
+
+class TestPortableCompression:
+    """The pandas-table writers never emit lzf (ARM64-macOS bus-error filter):
+    an ``lzf`` request is normalized to gzip on every platform, matching the
+    converged ``_comp_kwargs`` / containers policy."""
+
+    def test_series_lzf_request_is_written_as_gzip(self, tmp_h5):
+        s = pd.Series(np.arange(32, dtype=np.float64), name="vals")
+        with h5py.File(tmp_h5, "w") as f:
+            codec.series_to_h5(s, f, "s", compression="lzf")
+        with h5py.File(tmp_h5, "r") as f:
+            assert f["s/data"].compression == "gzip"        # never lzf
+            assert f["s/index"].compression == "gzip"
+        # value still round-trips
+        with h5py.File(tmp_h5, "r") as f:
+            out = codec.h5_to_data(f["s"])
+        np.testing.assert_allclose(np.asarray(out), np.arange(32))
+
+    def test_dataframe_lzf_request_is_written_as_gzip(self, tmp_h5):
+        df = pd.DataFrame(np.arange(12, dtype=np.float64).reshape(4, 3))
+        with h5py.File(tmp_h5, "w") as f:
+            codec.dataframe_to_h5(df, f, "d", compression="lzf")
+        with h5py.File(tmp_h5, "r") as f:
+            assert f["d/data"].compression == "gzip"
+
+    def test_data_to_h5_default_is_gzip(self, tmp_h5):
+        s = pd.Series(np.arange(16, dtype=np.float64), name="v")
+        with h5py.File(tmp_h5, "w") as f:
+            codec.data_to_h5(s, f, "s")                      # default compression
+        with h5py.File(tmp_h5, "r") as f:
+            assert f["s/data"].compression == "gzip"

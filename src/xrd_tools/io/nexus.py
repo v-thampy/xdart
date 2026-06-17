@@ -25,8 +25,10 @@ Performance features:
 - Optional SWMR mode for live beamline reduction (GUI reads while processing
   writes)
 - Single file open/close per scan via ``write_nexus_frame`` for hot loops
-- LZF compression by default where safe; ARM64 macOS h5py/HDF5 builds are
-  guarded by mapping LZF requests to fast gzip to avoid native bus errors.
+- gzip+shuffle compression by default: portable (in every HDF5 build, stock-h5py
+  readable with no plugin, no ARM64-macOS native bus error). ``lzf`` is accepted
+  only as a backward-compat alias and normalized to gzip on EVERY platform; it is
+  never emitted.
 """
 
 from __future__ import annotations
@@ -638,10 +640,11 @@ def write_nexus(
     entry : str, optional
         NXentry group name (default ``"entry"``).
     compression : str or None, optional
-        HDF5 compression filter. ``"lzf"`` (default) is fast where safe; on
-        ARM64 macOS it is mapped to fast gzip to avoid known h5py/HDF5 bus
-        errors. ``"gzip"`` gives better compression for archival. None disables
-        compression.
+        HDF5 compression filter. ``"gzip"`` (default) is the portable policy
+        (gzip+shuffle, ``compression_opts=1``): in every HDF5 build, stock-h5py
+        readable, no ARM64-macOS bus error. ``"lzf"`` is accepted only as a
+        backward-compat alias and normalized to gzip on every platform (never
+        emitted). ``None`` disables compression.
     overwrite : bool, optional
         If True, overwrite existing file. If False (default), append/update.
 

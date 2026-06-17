@@ -677,7 +677,8 @@ class IntegrationResult1D:
         grp : h5py.Group
             Destination group.
         compression : str, optional
-            HDF5 compression filter (default ``"lzf"``).
+            HDF5 compression filter (default ``"gzip"``; ``"lzf"`` is a
+            backward-compat alias normalized to gzip on every platform).
         """
         ck = {"compression": compression} if compression else {}
         _h5_replace(grp, "radial", self.radial, **ck)
@@ -1179,7 +1180,8 @@ class IntegrationResult2D:
         grp : h5py.Group
             Destination group.
         compression : str, optional
-            HDF5 compression filter (default ``"lzf"``).
+            HDF5 compression filter (default ``"gzip"``; ``"lzf"`` is a
+            backward-compat alias normalized to gzip on every platform).
         """
         ck = {"compression": compression} if compression else {}
         _h5_replace(grp, "radial", self.radial, **ck)
