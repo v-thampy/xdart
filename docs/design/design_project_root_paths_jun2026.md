@@ -67,7 +67,7 @@ For a non-persistent source (Tiled), the raw path won't resolve off-site, so the
 raw**. Add a writer/sink flag **"store full raw" vs "store source ref"**:
 - **Default off; auto-on for non-persistent sources** (Tiled). Optionally expose it for filesystem too as
   a general **"self-contained `.nxs`"** option (archiving).
-- It's a **big** size hit (e.g. 651×18 MB ≈ 12 GB) → opt-in and **compressed** (writer already uses lzf).
+- It's a **big** size hit (e.g. 651×18 MB ≈ 12 GB) → opt-in and **compressed** (writer uses the portable gzip+shuffle policy; an `lzf` request is aliased to gzip).
 - **Generalize the existing raw-storage path** (`skip_map_raw=False` already stores `map_raw` per frame)
   rather than inventing a new schema; the reader's `load_image` reads embedded raw when present, else the
   source ref. This is a **sink option**, so a headless notebook gets it too.

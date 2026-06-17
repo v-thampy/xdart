@@ -31,7 +31,7 @@ moved toward the publication store while keeping bounded mirrors as a fallback u
 | Review/design/perf notes | `cb8f1a2` | ✅ June 15 review, follow-up plan, and perf baseline committed |
 | Batch-final crash hardening | `33c518f` | ✅ first real batch flush now uses the writer's atomic replace path instead of mutating the skeleton `.nxs` in place; flat detector masks apply by direct flat assignment instead of GUI-thread `concat/unique/unravel` |
 | Review follow-up — 2D Sum aggregate + startup guard | `4b3564c` | ✅ evicted Overall `Sum` cakes now call the `sum` aggregate instead of silently rendering an average; `update_scattering_geometry` no longer raises if the GI signal fires before `self.scan` exists |
-| Native bus-error fix — avoid LZF stack writes on ARM64 macOS | `61073ef` | ✅ reverses GUI integrated-stack LZF compression and adds the same ARM64 macOS LZF→gzip guard to the shared NeXus writer helper; this mirrors the earlier `ssrl_xrd_tools` `9ff8bf0` bus-error mitigation |
+| Native bus-error fix — avoid LZF stack writes on ARM64 macOS | `61073ef` → superseded by `91c9d37` | ✅ first removed GUI integrated-stack LZF + added an ARM64-only LZF→gzip guard; **`91c9d37` then converged ALL compression onto a single portable policy**: `_comp_kwargs` maps both `gzip` and `lzf` → gzip+shuffle+`opts=1` on EVERY platform, the darwin/arm64-only `_lzf_unsafe_on_this_platform` helper was DELETED, and the GUI writer `INTEGRATED_STACK_COMPRESSION` went `None`→`"gzip"`. lzf is never emitted (h5py-only filter, ARM64-macOS bus error) so it survives only as a backward-compat alias; written files are always stock-h5py readable |
 | Fresh review follow-up — aggregate retry, source IDs, norm aliases, docs | this checkpoint | ✅ async Overall aggregate `None` is retryable rather than cached as final; known-vs-missing source IDs no longer merge records; whole-scan norm channels resolve case/alias-insensitively; stale LZF/payload docs refreshed |
 | Wave 5 A3/A4 prep — store-first legacy render reads | this checkpoint | ✅ normal Int 1D/2D legacy draw helpers now prefer `PublicationStore`/`FrameRecord` rows and fall back to the bounded mirrors only for thinned/semilight transition rows; explicit store-backed display test added |
 | Wave 5 A3/A4 prep — store-first preview/mask lookups | this checkpoint | ✅ raw-panel mask lookup and image preview now consult the publication store before the transition mirrors; legacy plot drawing no longer refuses to draw just because `data_1d` is empty when the store has rows |
@@ -62,13 +62,14 @@ writer/live-refresh slice `tests/xdart/test_nexus_writer_roundtrip.py`,
 The Sum-aggregate/startup-guard follow-up passed `tests/xdart/test_aggregation_wiring.py` +
 `tests/xdart/test_frame_publication.py` (71 passed) and the focused GUI aggregate slice
 (`16 passed / 151 deselected`). The native bus-error fix passed
-`tests/core/test_nexus.py::TestWriteNexus::test_compression_lzf_uses_safe_filter`,
-`tests/core/test_nexus.py::TestWriteNexus::test_compression_lzf_guard_maps_arm_macos_to_fast_gzip`,
+`tests/core/test_nexus.py::TestWriteNexus::test_compression_lzf_is_aliased_to_portable_gzip`,
+`tests/core/test_nexus.py::TestWriteNexus::test_comp_kwargs_single_policy_gzip_shuffle`,
 `tests/core/test_headless_write_roundtrip.py::test_write_integrated_stack_bulk_then_incremental`,
 `tests/xdart/test_nexus_writer_roundtrip.py`, and `tests/xdart/test_qt_nexus_sink.py`
 (`81 passed`). The fresh review follow-up passed
 `tests/xdart/test_aggregation_wiring.py`, `tests/xdart/test_scan_aggregate.py`,
-`tests/xdart/test_frame_publication.py`, and the two LZF guard tests (`91 passed`).
+`tests/xdart/test_frame_publication.py`, and the two compression-policy tests
+(`test_compression_lzf_is_aliased_to_portable_gzip` + `test_comp_kwargs_single_policy_gzip_shuffle`) (`91 passed`).
 The Wave 5 store-first bridge passed `tests/xdart/test_display_cross_frame_2d.py`,
 `tests/xdart/test_frame_publication.py`,
 `tests/xdart/test_gui_modes_end_to_end.py::test_evicted_whole_scan_aggregate_falls_back_and_covers_all_frames`,
@@ -115,7 +116,7 @@ renderer/data-source flip.
 | Item | Commit | Status |
 |---|---|---|
 | QW1 bai accumulators | `151b516` | ✅ verified (cosmetic: dead `update=` param + garbled docstring `scan.py:358`) |
-| QW2 GUI stack compression | `beb5a00` → `61073ef` | ⊘ CLOSED-REVERSED — LZF stack compression reintroduced the known ARM64 macOS h5py/HDF5 bus-error class; GUI writer is intentionally uncompressed, while explicit headless LZF requests are guarded to fast gzip on affected platforms |
+| QW2 GUI stack compression | `beb5a00` → `61073ef` → `91c9d37` | ✅ RESOLVED — the GUI writer now compresses its 1D/2D stacks (`INTEGRATED_STACK_COMPRESSION = "gzip"`); compression is converged onto a single portable gzip+shuffle+`opts=1` policy on EVERY platform (lzf is a backward-compat alias, never emitted), so there is no ARM64-macOS bus-error path and no platform special-casing |
 | QW3 Eiger native dtype | `1641cd6` | ✅ verified — also *fixes* a latent uint16 saturation-ceiling bug |
 | QW4 batch kwargs split + QW5 zero-bg skip | `613feca` | ✅ verified |
 | QW6 prefetch metadata cache | `1641cd6` (bundled) | ✅ verified |
@@ -126,7 +127,7 @@ renderer/data-source flip.
 | **M1 float32 2D payload** | `d0c2996`→`d034500` | ⊘ **CLOSED-DECLINED** — float32 tried, reverted (strain/peak-fit precision). The transient float64 cake (`single.py:181`/`multi.py:212`) was never the change site; on-disk already downcasts to float32, so **no clean win remains**. Not "pending." |
 | M2 reuse corrected images for thumbnails | `3d5b8b4` | ✅ verified |
 | I1 cache ProcessedScan indices | `0e44748` | ✅ verified |
-| I2 cache image-dir seed scans | `2f8d05e` | ✅ verified |
+| I2 cache image-dir seed scans | `2f8d05e` | ✅ verified — **dir-walk sub-part only**; the h5viewer off-thread-viewer-reads sub-part (I2(a)) is NOT started, see §I2 disambiguation |
 | I3 lazy flat frame masks | `84e1f6b` | ✅ verified |
 | I5 bound image-viewer raw cache | `b070ac4` | ✅ verified |
 | I4 Overall double-pass/double-copy | this checkpoint partial | ◑ single/auto-last index materialization fixed; remaining Overall aggregate double-pass/copy work stays post-Wave-5 |
@@ -267,19 +268,26 @@ It is **live-gated**, so it is structured as offscreen prep + a live-checkpoint 
   unrelated and used everywhere.
 - **Gate:** `pytest tests/xdart/test_ewald.py` + offscreen xdart suite green; spine green.
 
-### QW2 — Compress the GUI writer's integrated 1D/2D stacks (CLOSED-REVERSED)
-- **Where:** `src/xdart/modules/ewald/nexus_writer.py` `_commit_integrated_1d` (~882-891) /
-  `_commit_integrated_2d` (~958-967) omit the `compression` arg; the headless `NexusSink` writes `lzf`.
-- **Original problem:** GUI-written files were larger and slower to reload than headless-written ones.
-- **Resolution:** do **not** make the GUI writer use LZF. `beb5a00` did so and later reproduced the
-  same native ARM64 macOS h5py/HDF5 bus-error class previously fixed in `ssrl_xrd_tools` commit
-  `9ff8bf0`. `61073ef` intentionally returns the GUI writer to uncompressed chunked stacks and adds an
-  ARM64 macOS LZF→gzip guard in the shared NeXus writer helper for explicit headless LZF requests.
-- **Trade-off:** GUI output is larger than LZF-compressed output, but final batch flush avoids the
-  known native crash path and avoids gzip CPU cost on the latency-sensitive GUI save path. If file size
-  becomes a release blocker later, evaluate an opt-in gzip policy with real batch timing and crash tests;
-  do not re-enable GUI LZF on ARM64 macOS.
-- **Gate used:** focused writer tests plus live GUI retry of the previously crashing batch path.
+### QW2 — Compress the GUI writer's integrated 1D/2D stacks (RESOLVED in `91c9d37`)
+- **Where:** `src/xdart/modules/ewald/nexus_writer.py` `_commit_integrated_1d` / `_commit_integrated_2d`
+  pass `compression=INTEGRATED_STACK_COMPRESSION`, which is now `"gzip"`; the headless `NexusSink`
+  default is also `"gzip"`. Both flow through `xrd_tools.io.nexus._comp_kwargs`.
+- **Original problem:** GUI-written files were larger and slower to reload than headless-written ones;
+  a first attempt to share `lzf` (`beb5a00`) reproduced the ARM64-macOS h5py/HDF5 bus-error class
+  (previously fixed in `ssrl_xrd_tools` `9ff8bf0`), so `61073ef` reverted the GUI writer to uncompressed
+  and added an ARM64-only LZF→gzip guard.
+- **Resolution:** `91c9d37` converges ALL HDF5 compression onto one portable policy — `_comp_kwargs`
+  maps both `gzip` and `lzf` to gzip+shuffle+`compression_opts=1` on EVERY platform; the darwin/arm64-only
+  `_lzf_unsafe_on_this_platform` helper was deleted. The GUI writer's `INTEGRATED_STACK_COMPRESSION` is
+  now `"gzip"` (was `None`), so GUI and headless sinks write identical compressed bytes. lzf is never
+  emitted (h5py-only filter, ARM64-macOS bus error); it survives only as a backward-compatible alias, so
+  files stay stock-h5py readable with no platform guard and no hdf5plugin on the reader.
+- **Trade-off:** gzip level-1+shuffle adds negligible write time on the small integrated stacks and
+  restores on-disk compression everywhere; lossless, so the byte-compat signature (decompressed-value
+  digests) is invariant. No remaining ARM64-macOS caution — no lzf is ever written.
+- **Gate used:** `tests/core/test_nexus.py` (`test_compression_lzf_is_aliased_to_portable_gzip`,
+  `test_comp_kwargs_single_policy_gzip_shuffle`, `test_compression_gzip`) +
+  `tests/xdart/test_nexus_writer_roundtrip.py::test_gui_integrated_stacks_use_portable_gzip_never_lzf`.
 
 ### QW3 — Eiger prefetch: read native dtype, stop widening to int32 (P1 memory, S)
 - **Where:** `src/xdart/gui/tabs/static_scan/wranglers/image_wrangler_thread.py` bulk read (~2253,
@@ -428,14 +436,30 @@ It is **live-gated**, so it is structured as offscreen prep + a live-checkpoint 
   asserting one open per `iter_chunks`.
 
 ### I2 — Move blocking HDF5/detector reads off the GUI thread (P2 perf, M)
-- **Where:** `src/xdart/gui/tabs/static_scan/h5viewer.py` NeXus + Image viewer reads on every selection
-  change (~2156); `wranglers/image_wrangler.py` `os.walk` + per-file `os.stat` on every parameter-tree
-  change in Image Directory mode (~343).
-- **Fix:** route viewer reads through the existing hydration-worker pattern (generation-stamped, like
-  `FrameHydrationWorker`/the new `AggregationWorker`); debounce the directory walk (reuse the throttle
-  utility) and cache `stat` results.
+- **⚠️ Naming disambiguation (2026-06-16):** this I2 has TWO independent sub-parts, and they are NOT
+  both done. The ✅ "I2 cache image-dir seed scans" verified-table row (`2f8d05e`, above) is ONLY the
+  **directory-walk** sub-part — a burst cache around the Image-Directory-mode `os.walk` probe
+  (`image_wrangler.py`, `_find_image_directory_seed`/`_img_dir_probe_cache`, test
+  `tests/xdart/test_image_wrangler_dir_cache.py`). The **h5viewer off-thread viewer reads** sub-part
+  below (I2(a)) is **NOT started** — do not read the ✅ as covering it.
+- **Where (I2(a), STILL OPEN):** `src/xdart/gui/tabs/static_scan/h5viewer.py` runs the NeXus + Image
+  viewer reads INLINE on the GUI thread on every selection change: `_load_nexus_file` → `inspect_nexus`;
+  `_load_nexus_preview_payload` → `read_nexus_dataset`/`preview_nexus_dataset`;
+  `_load_image_file`/`_load_single_frame` → `classify_image_source` + `count_frames` +
+  `read_image`/`load_processed_frame` (reached from `scans_clicked` and `data_changed`). The existing
+  `_LoadFramesWorker` offload is gated to NORMAL scan mode and reads `self.scan.data_file`, never the
+  viewer's browsed file — the image/xye/nexus branches of `data_changed` return BEFORE the worker.
+- **Where (dir-walk, DONE `2f8d05e`):** `wranglers/image_wrangler.py` `os.walk` debounce in Image
+  Directory mode.
+- **Fix (I2(a)):** route the three viewer read entry points through the established generation-stamped
+  worker pattern (`_LoadFramesWorker`/`FrameHydrationWorker`/`AggregationWorker` idiom): emit a
+  generation-checked `chunkLoaded`-style signal back to the GUI thread that populates the viewer payload,
+  then `sigUpdate`.
 - **Caveat:** off-thread reads MUST be generation-checked (drop stale results on mode/selection change),
-  exactly like the existing workers.
+  exactly like `_absorb_chunk`'s generation guard.
+- **Status/scope:** I2(a) is a meaningful GUI-threading change whose payoff (scrub responsiveness on
+  large files) needs LIVE verification, so it is tracked as its own item, NOT part of the A+B+D doc
+  reconciliation. Schedule separately.
 - **Gate:** display/viewer tests; a manual GUI check that scrubbing stays responsive.
 
 ### I3 — Avoid materializing a full per-frame boolean mask on the submit path (P2 memory, M)
