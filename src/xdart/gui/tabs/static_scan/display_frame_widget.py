@@ -1933,14 +1933,24 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         leaves the view frozen at the cake's range, so the user sees a
         stuck axis.  Re-enable autoRange so it fits the 1D curve."""
         if not checked:
-            try:
-                # Immediate fit, then re-arm continuous tracking (see
-                # _autorange_plot_view for why the order matters).
-                self.plot.autoRange()
-                self.plot.enableAutoRange()
-            except Exception:
-                logger.debug("1D autoscale on Share Axis off failed",
-                             exc_info=True)
+            # Rescale the ACTIVE bottom panel back to its own data.  Earlier this
+            # only refit self.plot (the 1D line); when the bottom panel is the
+            # waterfall image, _align had frozen its x at the shared cake range
+            # (x-auto off), so un-sharing left it stuck (Vivek-reported).  Refit
+            # the 1D line AND the waterfall (whichever is the visible bottom plot)
+            # so both come back to their own extent.  Order matters: autoRange()
+            # internally disables auto, so re-arm with enableAutoRange() after.
+            plots = [self.plot]
+            ab = self._active_bottom_plot()
+            if ab is not None and ab is not self.plot:
+                plots.append(ab)
+            for _p in plots:
+                try:
+                    _p.autoRange()          # immediate fit (disables auto)
+                    _p.enableAutoRange()    # re-arm continuous tracking
+                except Exception:
+                    logger.debug("autoscale on Share Axis off failed",
+                                 exc_info=True)
 
         # Update slice range label
         self._set_slice_range()

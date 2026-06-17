@@ -3783,6 +3783,41 @@ def test_share_axis_targets_waterfall_plot_when_waterfall_is_active():
     assert host.wf_widget.image_plot.link is None
 
 
+def test_unshare_rescales_active_waterfall_not_just_the_1d_line():
+    # Vivek-reported: un-checking Share Axis didn't scale the WATERFALL back to
+    # its own extent — _on_share_axis_toggled only refit self.plot (the hidden
+    # 1D line), leaving the waterfall frozen at the cake range that _align had
+    # pinned (x-auto off).  Un-share must refit the ACTIVE bottom plot.
+    host = _share_axis_host()
+    host.plotMethod = "Waterfall"
+    host.plot_data = [np.array([0.0, 1.0]), np.ones((4, 2))]
+    host._set_slice_range = lambda *a, **k: None
+    host._on_share_axis_toggled = MethodType(
+        displayFrameWidget._on_share_axis_toggled, host)
+
+    assert host._active_bottom_plot() is host.wf_widget.image_plot
+    host._on_share_axis_toggled(False)
+
+    # both autoRange() and enableAutoRange() fire on the waterfall (each bumps
+    # the counter) AND on the 1D line, so neither stays stuck.
+    assert host.wf_widget.image_plot.autorange >= 2
+    assert host.plot.autorange >= 2
+
+
+def test_unshare_rescales_1d_line_when_no_waterfall():
+    # Non-waterfall: the active bottom plot IS self.plot, so it is refit once
+    # (no double-autoRange from the de-dupe).
+    host = _share_axis_host()
+    host.plotMethod = "Single"
+    host._set_slice_range = lambda *a, **k: None
+    host._on_share_axis_toggled = MethodType(
+        displayFrameWidget._on_share_axis_toggled, host)
+
+    assert host._active_bottom_plot() is host.plot
+    host._on_share_axis_toggled(False)
+    assert host.plot.autorange == 2          # autoRange + enableAutoRange, once
+
+
 def test_processed_image_viewer_falls_back_to_thumbnail(tmp_path):
     # Stage 5: a processed .nxs whose source master is missing loads the
     # dequantized thumbnail (via the ssrl boundary), stored as a thumbnail
