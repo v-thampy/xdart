@@ -1468,14 +1468,22 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             displayFrameWidget._schedule_align(self)
 
     def _schedule_align(self) -> None:
-        if getattr(self, '_align_pending', False):
-            return
-        self._align_pending = True
+        # DEBOUNCED (freeze fix): each call supersedes the previous pending align
+        # and defers ~50 ms.  A burst of schedules (the setup_*_layout hooks +
+        # resizeEvent that an align's own setXRange can re-trigger) collapses to a
+        # SINGLE align after the burst settles, instead of running one align per
+        # event-loop tick — which, with a hundreds-of-frame waterfall repainting
+        # each time, froze the GUI.  The convergence guard in _align_plot_under_cake
+        # then makes that one align a no-op once the panes are aligned, so it
+        # terminates; the 50 ms gap keeps the event loop responsive meanwhile.
+        seq = getattr(self, '_align_seq', 0) + 1
+        self._align_seq = seq
 
         def _go():
-            self._align_pending = False
+            if seq != getattr(self, '_align_seq', 0):
+                return                       # superseded by a later schedule
             displayFrameWidget._align_plot_under_cake(self)
-        Qt.QtCore.QTimer.singleShot(0, _go)
+        Qt.QtCore.QTimer.singleShot(50, _go)
 
     def _align_plot_under_cake(self) -> None:
         """Set the 1D plot's x-RANGE so the shared Q values land at the same screen
@@ -1516,6 +1524,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             scale = (cq1 - cq0) / (cx1 - cx0)        # data units per screen pixel
             pq0 = cq0 - (cx0 - px0) * scale          # 1D extends left (often negative Q)
             pq1 = cq0 + (px1 - cx0) * scale          # ...and a touch past the cake on the right
+            # CONVERGENCE GUARD (freeze fix): only setXRange when the bottom plot
+            # is not already aligned (within ~0.5% of the span).  setXRange
+            # triggers a relayout/repaint that re-schedules _align (via the
+            # setup_*_layout hooks + resizeEvent); without this guard that is an
+            # UNBOUNDED align cascade, and with a hundreds-of-frame waterfall
+            # ImageItem repainting each iteration it FREEZES the GUI.  Once the
+            # range matches the computed target the next _align is a no-op, so the
+            # cascade terminates in 1-2 ticks.
+            span = pq1 - pq0
+            if span > 0:
+                cur0, cur1 = (float(v) for v in pvb.viewRange()[0])
+                tol = 0.005 * span
+                if abs(cur0 - pq0) <= tol and abs(cur1 - pq1) <= tol:
+                    return
             bottom_plot.enableAutoRange(x=False, y=True)   # freeze x; keep y auto
             bottom_plot.setXRange(pq0, pq1, padding=0)     # extends left if needed
         except Exception:

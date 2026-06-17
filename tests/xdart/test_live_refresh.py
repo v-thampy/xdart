@@ -3697,6 +3697,75 @@ def test_share_axis_disables_when_no_matching_plot_unit():
     assert host.plot.link is None
 
 
+def _align_host(bottom_xrange):
+    """Duck host for _align_plot_under_cake with controllable screen spans + the
+    bottom plot's current x-range (identity scene->global maps, so the rect edge
+    x-values ARE the screen spans)."""
+    from types import SimpleNamespace, MethodType
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+
+    class _Pt:
+        def __init__(self, x): self._x = x
+        def x(self): return self._x
+
+    class _Rect:
+        def __init__(self, lo, hi): self._lo = _Pt(lo); self._hi = _Pt(hi)
+        def topLeft(self): return self._lo
+        def bottomRight(self): return self._hi
+
+    class _Win:
+        def isVisible(self): return True
+        def mapFromScene(self, pt): return pt
+        def mapToGlobal(self, pt): return pt
+
+    class _VB:
+        def __init__(self, rect, xr): self._rect = rect; self._xr = list(xr)
+        def sceneBoundingRect(self): return self._rect
+        def viewRange(self): return [list(self._xr), [0.0, 1.0]]
+
+    class _Plot:
+        def __init__(self, vb): self._vb = vb; self.setx_calls = []
+        def getViewBox(self): return self._vb
+        def enableAutoRange(self, **kw): pass
+        def setXRange(self, lo, hi, padding=0): self.setx_calls.append((lo, hi))
+
+    cake_plot = _Plot(_VB(_Rect(886.0, 1149.0), (0.889, 8.626)))   # cx0,cx1 / cake range
+    bottom_plot = _Plot(_VB(_Rect(473.0, 1217.0), bottom_xrange))  # px0,px1 / current range
+    host = SimpleNamespace(
+        _share_link_on=True,
+        binned_widget=SimpleNamespace(image_win=_Win(), image_plot=cake_plot),
+    )
+    host._active_bottom_window = lambda: _Win()
+    host._active_bottom_plot = lambda: bottom_plot
+    host._align_plot_under_cake = MethodType(
+        displayFrameWidget._align_plot_under_cake, host)
+    # the geometry target the align should converge to
+    scale = (8.626 - 0.889) / (1149.0 - 886.0)
+    target = (0.889 - (886.0 - 473.0) * scale, 0.889 + (1217.0 - 886.0) * scale)
+    return host, bottom_plot, target
+
+
+def test_align_skips_setxrange_when_already_aligned():
+    # FREEZE regression: _align must NOT re-setXRange when the bottom plot is
+    # already at the geometry target — otherwise setXRange -> relayout -> a
+    # re-scheduled align is an unbounded cascade that, with a hundreds-of-frame
+    # waterfall repainting each iteration, freezes the GUI.
+    _, _, target = _align_host(bottom_xrange=(0.0, 1.0))       # compute the target
+    host, bottom_plot, _ = _align_host(bottom_xrange=target)   # bottom already aligned
+    host._align_plot_under_cake()
+    assert bottom_plot.setx_calls == []                        # no-op -> cascade can't run
+
+
+def test_align_sets_geometry_xrange_when_not_aligned():
+    # The aligned x-range extends into negative Q (y-axis frozen, x-extent scaled).
+    host, bottom_plot, target = _align_host(bottom_xrange=(0.889, 8.626))
+    host._align_plot_under_cake()
+    assert len(bottom_plot.setx_calls) == 1
+    lo, hi = bottom_plot.setx_calls[0]
+    assert abs(lo - target[0]) < 1e-6 and abs(hi - target[1]) < 1e-6
+    assert lo < 0
+
+
 def test_share_axis_targets_waterfall_plot_when_waterfall_is_active():
     host = _share_axis_host()
     host.plotMethod = "Waterfall"
