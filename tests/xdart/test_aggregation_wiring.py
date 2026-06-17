@@ -383,6 +383,48 @@ def test_real_widget_setbkg_hydrates_evicted_subset_from_disk(widget, tmp_path):
     np.testing.assert_allclose(np.asarray(df.bkg_1d), expected)
 
 
+@pytest.mark.gui
+def test_idle_overlay_redraw_does_not_reread_when_accumulator_covers_selection(
+    widget, tmp_path
+):
+    # HARD-FREEZE regression: at end-of-scan the mode flips live->idle, so an
+    # Overlay/Waterfall whose accumulator ALREADY holds every selected frame must
+    # just REDRAW — never re-collect.  Re-collecting on the idle path block-reads
+    # the whole scan's 1D from disk on the GUI thread (~1 s for a 651-frame scan
+    # past the store cap) on EVERY refresh, which (repeated by autorange / the
+    # aggregate worker / the final flush) saturates the GUI thread into a total
+    # freeze.  Assert update_plot() issues NO get_frames_int_1d fetch here.
+    n = 30
+    scan, q, _chi = _split_scan_2d(tmp_path, n=n, cap=8)
+    w = widget
+    df = w.displayframe
+    df.scan = scan
+    df.viewer_mode = None
+    df._async_hydration_enabled = False
+    df.ui.plotMethod.setCurrentText("Waterfall")
+    df.ui.plotUnit.setCurrentIndex(0)
+    # Simulate live having already accumulated all n rows into the waterfall.
+    df.plot_data = [q.astype(float),
+                    (np.arange(n, dtype=float)[:, None] * np.ones(q.size))]
+    df.frame_names = [f"{scan.name}_{i}" for i in range(n)]
+    df.overlaid_idxs = list(range(n))
+    df.frame_ids = [str(i) for i in range(n)]
+    df.idxs = list(range(n))
+    df.idxs_1d = list(range(n))
+    df._last_plot_unit = df.ui.plotUnit.currentIndex()
+    df._processing_active = False                  # idle: scan ended
+
+    calls = []
+    orig = df.get_frames_int_1d
+    df.get_frames_int_1d = (
+        lambda *a, **k: (calls.append(1), orig(*a, **k))[1])
+    try:
+        df.update_plot()
+    finally:
+        df.get_frames_int_1d = orig
+    assert calls == []                             # redrew from the accumulator; no disk re-read
+
+
 # ── adapter routing: cake_image -> _aggregate_cake_payload ─────────────────────
 
 def _fake_state(*, overall, selected_ids, render_ids=(), method="Average"):

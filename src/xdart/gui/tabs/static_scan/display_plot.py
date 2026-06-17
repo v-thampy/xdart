@@ -309,6 +309,26 @@ class DisplayPlotMixin:
             data = (np.arange(100), np.arange(100))
             return data
 
+        # FREEZE FIX (live Overlay/Waterfall, end-of-scan): when the accumulator
+        # already covers every selected frame in the CURRENT unit, just redraw —
+        # do NOT re-collect.  Otherwise an idle re-render (the scan ends ->
+        # _processing_active=False -> collect_plot_rows takes the blocking branch)
+        # block-reads the WHOLE scan's 1D from disk on the GUI thread (~1 s for a
+        # 651-frame scan whose heavy rows were evicted past the store cap) on
+        # EVERY refresh — repeated by autorange / the aggregate worker / the final
+        # flush, it saturates the GUI thread into a hard freeze.  The rows are
+        # already in plot_data from live accumulation, so a reload (empty
+        # accumulator) still falls through to read from disk once.
+        method = self.ui.plotMethod.currentText()
+        if (method in ("Overlay", "Waterfall")
+                and getattr(self, "overlaid_idxs", None)
+                and self.ui.plotUnit.currentIndex()
+                == getattr(self, "_last_plot_unit", -1)):
+            sel = {int(i) for i in self.idxs_1d}
+            if sel and sel <= {int(i) for i in self.overlaid_idxs}:
+                self.draw_plot_state()
+                return
+
         # Get 1D data for all frames
         ydata, xdata = self.collect_plot_rows()
         if xdata is None or ydata is None:
