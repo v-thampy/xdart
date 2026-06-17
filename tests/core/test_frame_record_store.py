@@ -186,3 +186,45 @@ def test_snapshot_is_read_only_copy():
     except TypeError:
         pass
     assert store.labels() == (1,)
+
+
+def test_get_or_hydrate_does_not_persist_extra_unsaved_mode():
+    # P2 regression: a hydrator that returns the persisted disk mode PLUS an
+    # extra freshly-computed (unsaved) mode must NOT mark the extra mode
+    # persisted — else it could be heavy-evicted before it is written (the
+    # 748fcac persist-before-evict bug, re-introduced via get_or_hydrate).
+    store = FrameRecordStore(max_heavy_items=1)
+    store.upsert(_record(label=1, mode="q_total"), persisted=True)
+    store.upsert(_record(label=2, source="/data/scan_0002.tif"), persisted=True)
+    assert not store.has_heavy_payload(1)            # thinned (fully persisted)
+
+    def hydrate(label):
+        rec = FrameRecord.from_view(_view(label), mode_1d="q_total")  # on-disk mode
+        return rec.with_result_1d("q_ip", _view(label, scale=2.0))   # extra unsaved
+
+    store.set_hydrator(hydrate)
+    rec = store.get_or_hydrate(1)
+    assert set(rec.modes_1d) == {"q_total", "q_ip"}
+    assert not store.is_persisted(1)                 # q_ip unsaved -> not fully persisted
+
+    # Heavy pressure must thin the fully-persisted frame, NOT label 1 (q_ip unsaved).
+    store.upsert(_record(label=3, source="/data/scan_0003.tif"), persisted=True)
+    assert store.has_heavy_payload(1)
+    assert store.get(1).view_1d("q_ip").intensity_1d is not None
+
+
+def test_max_items_evicts_persisted_records_not_unpersisted():
+    # max_items full-record eviction (audit gap): evicts a PERSISTED record, never
+    # an unpersisted one (persist-before-evict also gates whole-record eviction).
+    store = FrameRecordStore(max_items=2, max_heavy_items=None)
+    store.upsert(_record(label=1, source="/d/1.tif"), persisted=True)
+    store.upsert(_record(label=2, source="/d/2.tif"), persisted=False)
+    store.upsert(_record(label=3, source="/d/3.tif"), persisted=True)
+    assert len(store) == 2
+    assert set(store.labels()) == {2, 3}            # persisted 1 evicted; unpersisted 2 kept
+
+    # All-unpersisted past the cap: nothing is evictable, so the store keeps both.
+    store2 = FrameRecordStore(max_items=1, max_heavy_items=None)
+    store2.upsert(_record(label=1, source="/d/1.tif"), persisted=False)
+    store2.upsert(_record(label=2, source="/d/2.tif"), persisted=False)
+    assert len(store2) == 2

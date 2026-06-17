@@ -176,6 +176,7 @@ class FrameRecordStore:
         *,
         source_identity: str | None = None,
         persisted: bool = False,
+        persisted_modes: Iterable[_ModeKey] | None = None,
     ) -> FrameRecord:
         source_id = (
             str(source_identity)
@@ -188,21 +189,27 @@ class FrameRecordStore:
             existing = self._records.get(label)
             if existing is not None and _same_source_id(self._source_ids.get(label, ""), source_id):
                 record = _merge_records(existing, record)
-                persisted_modes = set(self._persisted_modes.get(label, set()))
-                persisted_modes.difference_update(incoming_mode_keys)
-            elif existing is not None:
-                persisted_modes = set()
+                persisted_set = set(self._persisted_modes.get(label, set()))
+                persisted_set.difference_update(incoming_mode_keys)
             else:
-                persisted_modes = set()
+                persisted_set = set()
 
             self._records.pop(label, None)
             self._drop_heavy_label_locked(label)
             self._records[label] = record
             self._source_ids[label] = source_id
-            if persisted:
-                persisted_modes.update(incoming_mode_keys)
-            if persisted_modes:
-                self._persisted_modes[label] = persisted_modes
+            # Per-mode persistence (``persisted_modes``) takes precedence over the
+            # blanket ``persisted`` flag: ``get_or_hydrate`` uses it so a hydrator
+            # that returns an EXTRA freshly-computed (unsaved) mode does NOT get
+            # that mode marked persisted — which would let it be evicted before it
+            # is written (the persist-before-evict bug 748fcac fixed).
+            if persisted_modes is not None:
+                valid = _record_mode_keys(record)
+                persisted_set.update(key for key in persisted_modes if key in valid)
+            elif persisted:
+                persisted_set.update(incoming_mode_keys)
+            if persisted_set:
+                self._persisted_modes[label] = persisted_set
             else:
                 self._persisted_modes.pop(label, None)
             if _has_heavy_payload(record):
@@ -246,6 +253,12 @@ class FrameRecordStore:
             if record is None or _has_heavy_payload(record):
                 return record
             hydrator = self._hydrator
+            # Capture the per-mode persisted set BEFORE hydration: only these
+            # modes stay persisted afterward.  A hydrator that returns an EXTRA
+            # freshly-computed mode (e.g. a lazy non-primary GI mode not on disk)
+            # must NOT inherit persisted status — else it could be thinned before
+            # it is written (persist-before-evict, the 748fcac bug).
+            prev_persisted = set(self._persisted_modes.get(label, set()))
         if hydrator is None:
             return record
         fresh = hydrator(label)
@@ -261,7 +274,7 @@ class FrameRecordStore:
         return self.upsert(
             fresh,
             source_identity=source_identity,
-            persisted=self.is_persisted(label),
+            persisted_modes=prev_persisted,
         )
 
     def is_persisted(self, label: int | str) -> bool:
