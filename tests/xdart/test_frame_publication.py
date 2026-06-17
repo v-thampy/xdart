@@ -21,7 +21,11 @@ from xdart.modules.frame_publication import (
     publication_has_2d_errors,
     validate_publication,
 )
-from xdart.gui.tabs.static_scan.display_logic import Mode, compute_display_state
+from xdart.gui.tabs.static_scan.display_logic import (
+    Mode,
+    compute_display_state,
+    resample_cake_to_unit,
+)
 from xdart.gui.tabs.static_scan.display_publication import (
     PublicationDisplayAdapter,
     publication_availability,
@@ -507,17 +511,136 @@ def test_cake_image_applies_imageunit_q_to_2theta_conversion():
     assert cake_q is not None
     np.testing.assert_allclose(cake_q.axis_x.values, frame.int_2d.radial)
 
-    # "2θ-χ": radial converted q -> 2θ and relabelled to degrees.
+    # "2θ-χ": the Q-uniform cake is resampled onto a 2θ-uniform grid, then
+    # relabelled to degrees.  The endpoints match the converted Q range, but
+    # interior values are uniformly spaced in display coordinates; otherwise a
+    # linear ImageItem rect would draw peaks at the wrong 2θ positions.
     cake_tth = PublicationDisplayAdapter(
         store, widget=_Widget(f"2{Th}-{Chi}")).cake_image(state)
     assert cake_tth is not None
     assert cake_tth.axis_x.unit == "°"        # degrees
     q = np.asarray(frame.int_2d.radial, dtype=float)
     lam_A = lam_m * 1e10
-    expected = 2 * np.degrees(np.arcsin(np.clip(q * lam_A / (4 * np.pi), -1, 1)))
+    converted = 2 * np.degrees(np.arcsin(np.clip(q * lam_A / (4 * np.pi), -1, 1)))
+    expected = np.linspace(converted[0], converted[-1], q.size)
     np.testing.assert_allclose(cake_tth.axis_x.values, expected)
     # The cake image data itself is unchanged by the axis toggle.
     np.testing.assert_allclose(cake_tth.image, frame.int_2d.intensity.T)
+
+
+def test_cake_image_resamples_q_to_2theta_peak_position():
+    from xdart.gui.tabs.static_scan.display_constants import Chi, Th
+
+    frame = DuckFrame(idx=14)
+    q = np.linspace(1.0, 8.0, 401)
+    chi = np.linspace(-5.0, 5.0, 7)
+    q_peak = 4.65
+    peak_col = int(np.argmin(np.abs(q - q_peak)))
+    intensity = np.zeros((q.size, chi.size), dtype=float)
+    intensity[peak_col, :] = 1.0
+    frame.int_1d = IntegrationResult1D(
+        radial=q,
+        intensity=intensity.sum(axis=1),
+        unit="q_A^-1",
+    )
+    frame.int_2d = IntegrationResult2D(
+        radial=q,
+        azimuthal=chi,
+        intensity=intensity,
+        unit="q_A^-1",
+        azimuthal_unit="chi_deg",
+    )
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+    wavelength_m = 0.7293188143129427e-10
+
+    class _Combo:
+        def currentText(self):
+            return f"2{Th}-{Chi}"
+
+    class _Widget:
+        scan = type("Scan", (), {"name": "scan", "gi": False, "global_mask": None})()
+        bkg_2d = 0
+        ui = type("UI", (), {"imageUnit": _Combo()})()
+
+        def normalize(self, data, metadata):
+            return np.asarray(data, dtype=float)
+
+        def _get_wavelength(self, frame=None):
+            return wavelength_m
+
+    payload = PublicationDisplayAdapter(store, widget=_Widget()).cake_image(
+        _cake_state(store, 14))
+    assert payload is not None
+    column_signal = np.nansum(payload.image, axis=0)
+    displayed_peak = payload.axis_x.values[int(np.nanargmax(column_signal))]
+    expected = 2 * np.degrees(
+        np.arcsin(np.clip(q[peak_col] * wavelength_m * 1e10 / (4 * np.pi), -1, 1))
+    )
+    bin_width = abs(payload.axis_x.values[1] - payload.axis_x.values[0])
+    assert abs(displayed_peak - expected) <= bin_width
+
+    endpoint_linear = (
+        payload.axis_x.values[0]
+        + (peak_col + 0.5)
+        * (payload.axis_x.values[-1] - payload.axis_x.values[0])
+        / q.size
+    )
+    assert abs(endpoint_linear - expected) > 5 * bin_width
+
+
+def test_cake_image_no_wavelength_keeps_native_q_axis():
+    from xdart.gui.tabs.static_scan.display_constants import Chi, Th
+
+    frame = DuckFrame(idx=15)
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(frame))
+
+    class _Combo:
+        def currentText(self):
+            return f"2{Th}-{Chi}"
+
+    class _Widget:
+        scan = type("Scan", (), {"name": "scan", "gi": False, "global_mask": None})()
+        bkg_2d = 0
+        ui = type("UI", (), {"imageUnit": _Combo()})()
+
+        def normalize(self, data, metadata):
+            return np.asarray(data, dtype=float)
+
+        def _get_wavelength(self, frame=None):
+            return None
+
+    payload = PublicationDisplayAdapter(store, widget=_Widget()).cake_image(
+        _cake_state(store, 15))
+    assert payload is not None
+    assert payload.axis_x.label == "Q"
+    assert "⁻¹" in payload.axis_x.unit
+    np.testing.assert_allclose(payload.axis_x.values, frame.int_2d.radial)
+
+
+def test_resample_cake_to_unit_preserves_nan_radial_gap():
+    q = np.linspace(1.0, 8.0, 101)
+    image = np.ones((4, q.size), dtype=float)
+    gap = 50
+    image[:, gap] = np.nan
+    wavelength_m = 0.7293188143129427e-10
+
+    resampled, tth = resample_cake_to_unit(
+        image,
+        q,
+        data_unit="q_A^-1",
+        want_tth=True,
+        want_q=False,
+        wavelength_m=wavelength_m,
+        axis=1,
+    )
+
+    gap_tth = 2 * np.degrees(
+        np.arcsin(np.clip(q[gap] * wavelength_m * 1e10 / (4 * np.pi), -1, 1))
+    )
+    display_gap = int(np.argmin(np.abs(tth - gap_tth)))
+    assert np.isnan(resampled[:, display_gap]).all()
 
 
 def test_cake_image_gi_ignores_imageunit_toggle():

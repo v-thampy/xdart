@@ -641,6 +641,8 @@ class DisplayDataMixin:
         intensity = None
         xdata = ydata = None
         ref_radial = ref_azimuthal = None
+        ref_unit = ref_azimuthal_unit = ""
+        ref_frame = None
         ctr = 0
         for idx in idxs:
             frame_1d, frame_2d = snapshot.get(int(idx), (None, None))
@@ -673,6 +675,9 @@ class DisplayDataMixin:
             if intensity is None:
                 intensity = np.asarray(_i, dtype=float)
                 ref_radial, ref_azimuthal = radial, azimuthal
+                ref_unit = str(getattr(ir2d, 'unit', '') or '')
+                ref_azimuthal_unit = str(getattr(ir2d, 'azimuthal_unit', '') or '')
+                ref_frame = frame_1d
                 try:
                     xdata, ydata = self.get_xydata(ir2d, gi_2d=_gi2d, frame=frame_1d)
                 except (ValueError, AttributeError, TypeError):
@@ -703,6 +708,26 @@ class DisplayDataMixin:
             return None, None, None
 
         intensity /= ctr
+        try:
+            from .display_constants import AA_inv, Th
+            from .display_logic import is_gi_2d_units, resample_cake_to_unit
+            image_label = self.ui.imageUnit.currentText()
+            if (
+                ref_radial is not None
+                and not getattr(self.scan, 'gi', False)
+                and not is_gi_2d_units(ref_unit, ref_azimuthal_unit)
+            ):
+                intensity, xdata = resample_cake_to_unit(
+                    intensity,
+                    ref_radial,
+                    data_unit=ref_unit or 'q_A^-1',
+                    want_tth=(Th in image_label),
+                    want_q=(AA_inv in image_label),
+                    wavelength_m=self._get_wavelength(ref_frame),
+                    axis=0,
+                )
+        except Exception:
+            logger.debug("2D radial display resampling failed", exc_info=True)
         return intensity, xdata, ydata
 
     # G2: get_scan_int_2d was deleted.  It read scan.bai_2d, an

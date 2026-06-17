@@ -3185,6 +3185,8 @@ def _plot_host(method="Overlay"):
         bkg_1d=None,
         _last_plot_unit=-1,
         _plot_axis_info=[],
+        _processing_active=False,
+        publication_store=None,
         ui=SimpleNamespace(
             plotUnit=unit,
             plotMethod=method_combo,
@@ -3221,6 +3223,8 @@ def _plot_host(method="Overlay"):
         "compute_plot_range",
         "draw_plot_state",
         "_loaded_1d_overlay_labels",
+        "_waterfall_active",
+        "_uniform_waterfall_grid",
         "update_plot",
     ):
         setattr(host, name, MethodType(getattr(DisplayPlotMixin, name), host))
@@ -3244,6 +3248,59 @@ def test_update_plot_accumulator_replaces_for_single_sum_average():
     np.testing.assert_allclose(out[1], [[1.0, 2.0], [3.0, 4.0]])
     assert names == ["scan_1", "scan_2"]
     assert ids == [1, 2]
+
+
+def test_overlay_live_tail_rows_keep_matching_tail_labels_after_store_cap():
+    """Overlay/Waterfall live accumulation must append the resident tail.
+
+    The selection may contain every processed frame while ``idxs_1d`` contains
+    only the heavy-store resident tail.  Names and ids must both come from that
+    tail; otherwise rows after the store cap get paired with old labels and the
+    accumulator stops growing.
+    """
+    host = _plot_host("Overlay")
+    host._processing_active = True
+    host.idxs = list(range(1, 101))
+    host.idxs_1d = list(range(37, 101))
+    host.data_1d = {idx: object() for idx in host.idxs_1d}
+    host.plot_data = [
+        np.array([0.0, 1.0]),
+        np.vstack([np.array([float(i), float(i) + 0.5]) for i in range(1, 37)]),
+    ]
+    host.frame_names = [f"scan_{i}" for i in range(1, 37)]
+    host.overlaid_idxs = list(range(1, 37))
+    host._last_plot_unit = 0
+
+    host.update_plot()
+
+    assert host.overlaid_idxs == list(range(1, 101))
+    assert host.frame_names[-1] == "scan_100"
+    assert host.plot_data[1].shape[0] == 100
+    np.testing.assert_allclose(host.plot_data[1][-1], [100.0, 100.5])
+
+
+def test_waterfall_grid_resamples_nonuniform_x_without_moving_peak():
+    q = np.linspace(1.0, 8.0, 301)
+    wavelength_m = 0.7293188143129427e-10
+    tth = 2 * np.degrees(
+        np.arcsin(np.clip(q * wavelength_m * 1e10 / (4 * np.pi), -1, 1))
+    )
+    peak = int(np.argmin(np.abs(q - 6.7)))
+    data = np.zeros((5, q.size), dtype=float)
+    data[:, peak] = 1.0
+
+    x_uniform, data_uniform = DisplayPlotMixin._uniform_waterfall_grid(tth, data)
+
+    col = int(np.nanargmax(np.nansum(data_uniform, axis=0)))
+    bin_width = abs(x_uniform[1] - x_uniform[0])
+    assert abs(x_uniform[col] - tth[peak]) <= bin_width
+    endpoint_linear = (
+        x_uniform[0]
+        + (peak + 0.5)
+        * (x_uniform[-1] - x_uniform[0])
+        / q.size
+    )
+    assert abs(endpoint_linear - tth[peak]) > 2 * bin_width
 
 
 def test_update_plot_accumulator_appends_skips_duplicates_and_merges_grids():
@@ -3580,6 +3637,9 @@ def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index
             shareAxis=share,
         ),
         plot=_FakePlot(),
+        wf_widget=SimpleNamespace(image_plot=_FakePlot(), image_win=SimpleNamespace()),
+        plot_data=[np.array([0.0, 1.0]), np.ones((1, 2))],
+        plotMethod="Single",
         binned_widget=SimpleNamespace(image_plot=SimpleNamespace(
             getViewBox=lambda _vb=_FakeCakeVB(): _vb)),
         _plot_axis_info=[
@@ -3595,8 +3655,11 @@ def _share_axis_host(*, gi=False, plot_items=None, image_items=None, image_index
         "_set_plot_unit_index_silently",
         "_apply_share_axis_state",
         "_set_share_link",
+        "_active_bottom_plot",
+        "_active_bottom_window",
     ):
         setattr(host, name, MethodType(getattr(displayFrameWidget, name), host))
+    host._waterfall_active = MethodType(DisplayPlotMixin._waterfall_active, host)
     return host
 
 
@@ -3632,6 +3695,23 @@ def test_share_axis_disables_when_no_matching_plot_unit():
     assert host.ui.shareAxis.isChecked() is False
     assert host.ui.plotUnit._enabled is True
     assert host.plot.link is None
+
+
+def test_share_axis_targets_waterfall_plot_when_waterfall_is_active():
+    host = _share_axis_host()
+    host.plotMethod = "Waterfall"
+    host.plot_data = [np.array([0.0, 1.0]), np.ones((4, 2))]
+
+    assert host._waterfall_active() is True
+    assert host._active_bottom_plot() is host.wf_widget.image_plot
+    assert host._active_bottom_window() is host.wf_widget.image_win
+
+    host._share_link_on = True
+    host.plot.link = "old"
+    host.wf_widget.image_plot.link = "old"
+    displayFrameWidget._set_share_link(host, False)
+    assert host.plot.link is None
+    assert host.wf_widget.image_plot.link is None
 
 
 def test_processed_image_viewer_falls_back_to_thumbnail(tmp_path):

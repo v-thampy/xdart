@@ -1200,6 +1200,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         image = data.T
         x = _axis_values(payload.axis_x, image.shape[0])
         y = _axis_values(payload.axis_y, image.shape[1])
+        # get_rect is affine.  Any nonlinear unit toggle (Q <-> 2θ) must have
+        # already resampled the image onto a uniform displayed grid before this
+        # point; otherwise interior peaks draw at the wrong coordinate.
         rect = get_rect(x, y)
         widget = self.image_widget if role is PanelRole.RAW_2D else self.binned_widget
         display_data = _downsample_for_display(image, widget)
@@ -1380,6 +1383,30 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.plotUnit.setEnabled(True)
         return False
 
+    def _active_bottom_plot(self):
+        """Return the visible bottom plot: waterfall image plot or line plot."""
+        try:
+            if self._waterfall_active():
+                wf = getattr(self, 'wf_widget', None)
+                plot = getattr(wf, 'image_plot', None)
+                if plot is not None:
+                    return plot
+        except Exception:
+            logger.debug("active bottom plot lookup failed", exc_info=True)
+        return getattr(self, 'plot', None)
+
+    def _active_bottom_window(self):
+        """Return the GraphicsLayoutWidget holding the visible bottom plot."""
+        try:
+            if self._waterfall_active():
+                wf = getattr(self, 'wf_widget', None)
+                win = getattr(wf, 'image_win', None)
+                if win is not None:
+                    return win
+        except Exception:
+            logger.debug("active bottom window lookup failed", exc_info=True)
+        return getattr(self, 'plot_win', None)
+
     def _set_share_link(self, on: bool) -> None:
         """Share Axis: FREEZE the 1D y-axis and scale the 1D x-EXTENT so the shared
         Q columns line up under the cake (the cake is never touched).
@@ -1425,7 +1452,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     pass
                 self._share_cake_handler = None
             # Detach; _on_share_axis_toggled re-arms the 1D's own autorange.
-            self.plot.setXLink(None)
+            for plot in (
+                getattr(self, 'plot', None),
+                getattr(getattr(self, 'wf_widget', None), 'image_plot', None),
+            ):
+                try:
+                    if plot is not None:
+                        plot.setXLink(None)
+                except Exception:
+                    logger.debug("share-axis unlink failed", exc_info=True)
 
     def _on_cake_xrange_changed(self, *args) -> None:
         """Re-align the 1D under the cake whenever the cake's x-range changes."""
@@ -1456,12 +1491,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 return
             bw = getattr(self, 'binned_widget', None)
             cake_win = getattr(bw, 'image_win', None)
-            plot_win = getattr(self, 'plot_win', None)
+            plot_win = self._active_bottom_window()
+            bottom_plot = self._active_bottom_plot()
             if (cake_win is None or plot_win is None
+                    or bottom_plot is None
                     or not cake_win.isVisible() or not plot_win.isVisible()):
                 return
             cvb = bw.image_plot.getViewBox()
-            pvb = self.plot.getViewBox()
+            pvb = bottom_plot.getViewBox()
 
             def _gspan(win, vb):
                 r = vb.sceneBoundingRect()
@@ -1479,8 +1516,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             scale = (cq1 - cq0) / (cx1 - cx0)        # data units per screen pixel
             pq0 = cq0 - (cx0 - px0) * scale          # 1D extends left (often negative Q)
             pq1 = cq0 + (px1 - cx0) * scale          # ...and a touch past the cake on the right
-            self.plot.enableAutoRange(x=False, y=True)   # freeze x (we set it); keep y auto
-            self.plot.setXRange(pq0, pq1, padding=0)     # extends into negative Q (no floor now)
+            bottom_plot.enableAutoRange(x=False, y=True)   # freeze x; keep y auto
+            bottom_plot.setXRange(pq0, pq1, padding=0)     # extends left if needed
         except Exception:
             logger.debug("share-axis geometric align failed", exc_info=True)
 

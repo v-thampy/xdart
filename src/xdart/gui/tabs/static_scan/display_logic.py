@@ -88,6 +88,8 @@ __all__ = [
     "sentinel_mask",
     "standalone_viewer_image",
     "convert_2d_radial",
+    "resample_image_axis_to_uniform",
+    "resample_cake_to_unit",
     "gi_axes_uniform",
     "compute_display_state",
 ]
@@ -736,6 +738,168 @@ def convert_2d_radial(radial, *, data_unit, want_tth, want_q, wavelength_m):
     if want_q and have_tth:
         return (4 * np.pi / lam_A) * np.sin(np.radians(radial / 2))
     return radial
+
+
+_CAKE_RESAMPLE_MIN_COVERAGE = 1.0
+
+
+def _interp_image_axis_at(image, source_axis, target_source_axis, *, axis=-1):
+    """NaN-aware interpolation of an image-like array along one axis."""
+    img = np.asarray(image, dtype=float)
+    source_axis = np.asarray(source_axis, dtype=float)
+    target_source_axis = np.asarray(target_source_axis, dtype=float)
+    if img.ndim == 0 or source_axis.ndim != 1:
+        return img
+
+    axis = int(axis)
+    if axis < 0:
+        axis += img.ndim
+    if (
+        axis < 0
+        or axis >= img.ndim
+        or img.shape[axis] != source_axis.size
+        or source_axis.size < 2
+    ):
+        return img
+
+    order = np.argsort(source_axis)
+    xp = source_axis[order]
+    valid_xp = np.isfinite(xp)
+    if valid_xp.sum() < 2:
+        return np.full(
+            img.shape[:axis] + (target_source_axis.size,) + img.shape[axis + 1:],
+            np.nan,
+            dtype=float,
+        )
+    xp = xp[valid_xp]
+    ordered_valid = order[valid_xp]
+
+    moved = np.moveaxis(img, axis, -1)
+    flat = moved.reshape(-1, moved.shape[-1])
+    out = np.empty((flat.shape[0], target_source_axis.size), dtype=float)
+    for i, row in enumerate(flat):
+        row = row[ordered_valid]
+        finite = np.isfinite(row)
+        if not finite.any():
+            out[i] = np.nan
+            continue
+        filled = np.where(finite, row, 0.0)
+        num = np.interp(target_source_axis, xp, filled, left=np.nan, right=np.nan)
+        cov = np.interp(
+            target_source_axis,
+            xp,
+            finite.astype(float),
+            left=0.0,
+            right=0.0,
+        )
+        with np.errstate(invalid="ignore", divide="ignore"):
+            values = num / np.where(cov > 0, cov, 1.0)
+        out[i] = np.where(cov >= _CAKE_RESAMPLE_MIN_COVERAGE, values, np.nan)
+    out = out.reshape(moved.shape[:-1] + (target_source_axis.size,))
+    return np.moveaxis(out, -1, axis)
+
+
+def resample_image_axis_to_uniform(image, source_axis, *, axis=-1):
+    """Resample image-like data onto a grid uniform in ``source_axis`` units.
+
+    This is display-only glue for pyqtgraph ``ImageItem`` renderers: the image
+    is placed through one affine rectangle, so non-uniform x coordinates must be
+    made uniform before the image is drawn.  NaN gaps are preserved through a
+    strict coverage gate instead of being smeared by interpolation.
+    """
+    img = np.asarray(image, dtype=float)
+    source_axis = np.asarray(source_axis, dtype=float)
+    if img.ndim == 0 or source_axis.ndim != 1 or source_axis.size < 2:
+        return img, source_axis
+    finite = np.isfinite(source_axis)
+    if finite.sum() < 2:
+        return img, source_axis
+    target_axis = np.linspace(
+        float(np.nanmin(source_axis[finite])),
+        float(np.nanmax(source_axis[finite])),
+        source_axis.size,
+    )
+    if np.allclose(source_axis, target_axis, rtol=1e-12, atol=1e-12,
+                   equal_nan=True):
+        return img, source_axis
+    return _interp_image_axis_at(
+        img,
+        source_axis,
+        target_axis,
+        axis=axis,
+    ), target_axis
+
+
+def resample_cake_to_unit(
+        image, radial, *, data_unit, want_tth, want_q, wavelength_m,
+        axis=-1):
+    """Convert a cake radial axis and resample image columns/rows onto it.
+
+    ``ImageItem`` renders images through one affine rectangle, so a non-linear
+    display conversion such as uniform-Q -> 2θ cannot be represented by merely
+    changing tick values.  Re-sample along the radial image axis to a uniform
+    target grid in the requested display unit; otherwise peaks move relative to
+    1D curves even though the axis labels look correct.
+
+    Returns ``(image, radial)``.  If no unit conversion is requested or the
+    wavelength is unknown, both are returned unchanged apart from float array
+    coercion.
+    """
+    img = np.asarray(image, dtype=float)
+    radial = np.asarray(radial, dtype=float)
+    if img.ndim == 0 or radial.ndim != 1 or radial.size < 2:
+        return img, radial
+    data_unit = str(data_unit or "")
+    have_tth = "2th" in data_unit
+    converts = (want_tth and not have_tth) or (want_q and have_tth)
+    if not converts or not wavelength_m or wavelength_m <= 0:
+        return img, radial
+
+    target_native = convert_2d_radial(
+        radial,
+        data_unit=data_unit,
+        want_tth=want_tth,
+        want_q=want_q,
+        wavelength_m=wavelength_m,
+    )
+    target_native = np.asarray(target_native, dtype=float)
+    if target_native.shape != radial.shape:
+        return img, radial
+    if np.allclose(target_native, radial, rtol=1e-12, atol=1e-12, equal_nan=True):
+        return img, radial
+    finite_axis = np.isfinite(radial) & np.isfinite(target_native)
+    if finite_axis.sum() < 2:
+        return img, target_native
+
+    axis = int(axis)
+    if axis < 0:
+        axis += img.ndim
+    if axis < 0 or axis >= img.ndim or img.shape[axis] != radial.size:
+        return img, target_native
+
+    target_u = np.linspace(
+        float(np.nanmin(target_native[finite_axis])),
+        float(np.nanmax(target_native[finite_axis])),
+        radial.size,
+    )
+    target_data_unit = "2th_deg" if want_tth else "q_A^-1"
+    source_at = convert_2d_radial(
+        target_u,
+        data_unit=target_data_unit,
+        want_tth=have_tth,
+        want_q=not have_tth,
+        wavelength_m=wavelength_m,
+    )
+    source_at = np.asarray(source_at, dtype=float)
+    if not np.isfinite(source_at).any():
+        return img, target_u
+
+    return _interp_image_axis_at(
+        img,
+        radial,
+        source_at,
+        axis=axis,
+    ), target_u
 
 
 def gi_axes_uniform(axes_per_frame, *, rtol=1e-5, atol=1e-8):

@@ -22,7 +22,13 @@ from .display_constants import (
     AA_inv, Th, Chi, Deg,
     x_labels_1D, x_units_1D,
 )
-from .display_logic import plan_overlay, OverlayAction, pretty_unit, nanmean_slice
+from .display_logic import (
+    plan_overlay,
+    OverlayAction,
+    pretty_unit,
+    nanmean_slice,
+    resample_image_axis_to_uniform,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -156,14 +162,32 @@ class DisplayPlotMixin:
         but only 1D data is available, disable slicing and retry on plain 1D.
         """
         method = self.ui.plotMethod.currentText()
+        accumulating = method in ("Overlay", "Waterfall")
+        idle = not getattr(self, "_processing_active", False)
         store_complete_required = (
             getattr(self, "viewer_mode", None) is None
             and getattr(self, "publication_store", None) is not None
-            and method in ("Single", "Sum", "Average")
+            and (
+                method in ("Single", "Sum", "Average")
+                or (accumulating and idle)
+            )
         )
-        idxs = self.idxs if store_complete_required else None
+        # Overlay/Waterfall are accumulating displays.  During live processing
+        # use only the resident tail and append it to the existing accumulator;
+        # older rows stay in plot_data.  When idle/reloaded, require the full
+        # selection and allow blocking hydration so a whole-scan waterfall does
+        # not truncate at the heavy-publication cap.
+        if accumulating:
+            idxs = self.idxs if idle else self.idxs_1d
+        else:
+            idxs = self.idxs if store_complete_required else None
+        self._plot_row_ids = list(self.idxs_1d if idxs is None else idxs)
+        allow_blocking = True if (accumulating and idle) else None
         ydata, xdata = self.get_frames_int_1d(
-            idxs, require_all=store_complete_required)
+            idxs,
+            require_all=store_complete_required,
+            allow_blocking_read=allow_blocking,
+        )
         if xdata is not None and ydata is not None:
             return ydata, xdata
 
@@ -178,14 +202,20 @@ class DisplayPlotMixin:
         # Fall back: disable slice, retry with plain 1D.
         self.ui.slice.setChecked(False)
         return self.get_frames_int_1d(
-            idxs, require_all=store_complete_required)
+            idxs,
+            require_all=store_complete_required,
+            allow_blocking_read=allow_blocking,
+        )
 
-    def build_plot_names(self):
+    def build_plot_names(self, idxs=None):
         """Return current trace names, including slice-range suffixes."""
+        if idxs is None:
+            idxs = self.idxs
+        idxs = list(idxs)
         if self.scan.series_average:
             frame_names = [self.scan.name]
         else:
-            frame_names = [f'{self.scan.name}_{i}' for i in self.idxs]
+            frame_names = [f'{self.scan.name}_{i}' for i in idxs]
 
         # When slicing is active, include slice parameters in frame names
         # so the same image with different slice ranges can be overlaid.
@@ -285,7 +315,10 @@ class DisplayPlotMixin:
             self.clear_plot_view()
             return
 
-        frame_names = self.build_plot_names()
+        row_ids = list(getattr(self, "_plot_row_ids", self.idxs_1d))
+        row_count = _as_plot_rows(ydata).shape[0]
+        row_ids = row_ids[:row_count]
+        frame_names = self.build_plot_names(row_ids)
 
         # Subtract background
         ydata = self.apply_plot_background(ydata)
@@ -318,12 +351,16 @@ class DisplayPlotMixin:
 
         if overlay_action is OverlayAction.REBUILD:
             rebuild_idxs = list(self.overlaid_idxs)
-            y_new, x_new = self.get_frames_int_1d(rebuild_idxs)
+            idle = not getattr(self, "_processing_active", False)
+            y_new, x_new = self.get_frames_int_1d(
+                rebuild_idxs,
+                require_all=idle,
+                allow_blocking_read=True if idle else None,
+            )
             if x_new is not None and y_new is not None:
                 y_new = self.apply_plot_background(y_new)
-                kept, kept_names = self._loaded_1d_overlay_labels(
-                    rebuild_idxs, max_rows=y_new.shape[0],
-                )
+                kept = rebuild_idxs[:_as_plot_rows(y_new).shape[0]]
+                kept_names = self.build_plot_names(kept)
                 self.plot_data, self.frame_names, self.overlaid_idxs = (
                     update_plot_accumulator(
                         self.plot_data,
@@ -346,7 +383,7 @@ class DisplayPlotMixin:
                         xdata,
                         ydata,
                         frame_names,
-                        self.idxs_1d,
+                        row_ids,
                         current_method,
                         unit_changed,
                     )
@@ -360,7 +397,7 @@ class DisplayPlotMixin:
                     xdata,
                     ydata,
                     frame_names,
-                    self.idxs_1d,
+                    row_ids,
                     current_method,
                     unit_changed,
                 )
@@ -375,7 +412,7 @@ class DisplayPlotMixin:
                     xdata,
                     ydata,
                     frame_names,
-                    self.idxs_1d,
+                    row_ids,
                     current_method,
                     unit_changed,
                 )
@@ -503,9 +540,14 @@ class DisplayPlotMixin:
         # they must NEVER auto-waterfall however many rows are stacked (the payload
         # path emits one un-reduced trace per frame, so n_curves is the frame
         # count, not the drawn-curve count).
+        waterfall_active = getattr(self, '_waterfall_active', None)
         auto_wf = (
-            (self.plotMethod == 'Waterfall' and n_curves > 3)
-            or (self.plotMethod not in ('Sum', 'Average') and n_curves > 15)
+            waterfall_active()
+            if callable(waterfall_active)
+            else (
+                (self.plotMethod == 'Waterfall' and n_curves > 3)
+                or (self.plotMethod not in ('Sum', 'Average') and n_curves > 15)
+            )
         )
         if auto_wf:
             self.update_wf()
@@ -594,6 +636,27 @@ class DisplayPlotMixin:
 
     # ── Waterfall rendering ───────────────────────────────────────
 
+    def _waterfall_active(self):
+        """Whether the bottom panel is currently rendered by ``wf_widget``."""
+        try:
+            n_curves = len(self.plot_data[1])
+        except Exception:
+            n_curves = 0
+        return (
+            (self.plotMethod == 'Waterfall' and n_curves > 3)
+            or (self.plotMethod not in ('Sum', 'Average') and n_curves > 15)
+        )
+
+    @staticmethod
+    def _uniform_waterfall_grid(xdata, data):
+        """Return waterfall rows on an x grid compatible with ImageItem."""
+        xdata = np.asarray(xdata, dtype=float)
+        data = np.asarray(data, dtype=float)
+        if data.ndim != 2 or xdata.shape != (data.shape[1],):
+            return xdata, data
+        data, xdata = resample_image_axis_to_uniform(data, xdata, axis=1)
+        return xdata, data
+
     def _frame_scan_info(self, idx):
         """Phase 3c: a frame's metadata (``scan_info``), store-first.
 
@@ -670,6 +733,7 @@ class DisplayPlotMixin:
         xdata_, data_ = self.plot_data
         s_xdata, data = xdata_.copy(), data_.copy()
         data = data[self.wf_start:self.wf_stop:self.wf_step, :]
+        s_xdata, data = self._uniform_waterfall_grid(s_xdata, data)
 
         s_ydata = self._wf_y_axis(data.shape[0])
         if s_ydata is None:
@@ -693,6 +757,7 @@ class DisplayPlotMixin:
         xdata_, data_ = self.plot_data
         s_xdata, data = xdata_.copy(), data_.copy()
         data = data[self.wf_start:self.wf_stop:self.wf_step, :]
+        s_xdata, data = self._uniform_waterfall_grid(s_xdata, data)
 
         x_max, x_min = np.max(s_xdata), np.min(s_xdata)
         x_step = (x_max - x_min)/len(s_xdata)
@@ -784,6 +849,8 @@ class DisplayPlotMixin:
         """
         self.wf_widget.setParent(None)
         self.plot_layout.addWidget(self.plot_win)
+        if getattr(self, '_share_link_on', False):
+            self._schedule_align()
 
         # Options is always reachable now — it holds Legend + Overlay Offset
         # (the waterfall y-axis/start/step inside grey out when not in a
@@ -800,15 +867,21 @@ class DisplayPlotMixin:
         if self.plotMethod == 'Waterfall':
             self.plot_win.setParent(None)
             self.plot_layout.addWidget(self.wf_widget)
+            if getattr(self, '_share_link_on', False):
+                self._schedule_align()
         else:
             self.wf_widget.setParent(None)
             self.plot_layout.addWidget(self.plot_win)
+            if getattr(self, '_share_link_on', False):
+                self._schedule_align()
 
     def setup_wf_layout(self):
         """Setup the layout for WF plot
         """
         self.plot_win.setParent(None)
         self.plot_layout.addWidget(self.wf_widget)
+        if getattr(self, '_share_link_on', False):
+            self._schedule_align()
 
         self.ui.wf_options.setEnabled(True)
         self.wf_yaxis_widget.setEnabled(True)
