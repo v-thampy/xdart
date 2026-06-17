@@ -321,8 +321,11 @@ class PublicationDisplayAdapter:
         # masks gaps identically to the full-res path and the legacy update_image
         # thumbnail path.  No-op for full-res (shape matches) or unknown shape.
         image = np.asarray(image, dtype=float)
-        full_shape = getattr(self._widget, "_raw_full_shape", None)
         _scan = getattr(self._widget, "scan", None)
+        # Authoritative full-res shape from the scan (persisted in the .nxs);
+        # falls back to the live widget cache, then None.
+        full_shape = (getattr(_scan, "detector_shape", None)
+                      or getattr(self._widget, "_raw_full_shape", None))
         gap_indices = combine_flat_masks(
             getattr(_scan, "global_mask", None),
             *mask_parts,

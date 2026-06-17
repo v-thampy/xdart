@@ -2059,9 +2059,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         so the legacy path here and the publication ``raw_image`` builder mask
         gaps identically.
         """
-        full_shape = getattr(self, '_raw_full_shape', None)
-        gap = combine_flat_masks(
-            getattr(getattr(self, 'scan', None), 'global_mask', None), frame_mask)
+        _scan = getattr(self, 'scan', None)
+        # Authoritative full-res shape from the scan (persisted in the .nxs);
+        # falls back to the live widget cache, then None (no-op).
+        full_shape = (getattr(_scan, 'detector_shape', None)
+                      or getattr(self, '_raw_full_shape', None))
+        gap = combine_flat_masks(getattr(_scan, 'global_mask', None), frame_mask)
         nan_gaps_in_thumbnail(data, gap, full_shape)
 
     def update_image(self):

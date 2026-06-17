@@ -159,7 +159,7 @@ class _DuckSphere:
     """Minimal duck-typed LiveScan."""
 
     def __init__(self, frames, *, scan_data=None, geometry=None,
-                 global_mask=None, gi=False, skip_2d=False):
+                 global_mask=None, detector_shape=None, gi=False, skip_2d=False):
         self.frames = _DuckArches(frames)
         self.scan_data = scan_data if scan_data is not None else pd.DataFrame()
         self.bai_1d_args = {"numpoints": N_Q}
@@ -167,6 +167,7 @@ class _DuckSphere:
         self.mg_args = {"wavelength": 1.0e-10}
         self.geometry = geometry
         self.global_mask = global_mask
+        self.detector_shape = detector_shape
         self.gi = gi
         self.skip_2d = skip_2d
         self.stitched_1d = None
@@ -1238,6 +1239,40 @@ def test_instrument_mask_rewrites_when_live_mask_changes(tmp_path):
 
     with h5py.File(path, "r") as f:
         np.testing.assert_array_equal(f["entry/instrument/detector/mask"][()], [7, 8, 9])
+
+
+def test_detector_shape_persisted_and_reloads(tmp_path):
+    """detector_shape (full-res raw shape) round-trips: written as an NXdetector
+    child and restored onto scan.detector_shape by the reader.  Lets a reloaded
+    thumbnail-only scan map the detector gap mask into thumbnail coordinates
+    without a resident full-res frame (codex P2 / cold-reload edge)."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
+    import h5py
+
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    scan = _DuckSphere(frames, global_mask=np.array([0, 7, 64], dtype=np.int64),
+                       detector_shape=(2167, 2070))
+    path = tmp_path / "dshape.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    # persisted as a plain NXdetector child (external readers ignore it)
+    with h5py.File(path, "r") as f:
+        assert (f["entry/instrument/detector/detector_shape"][()].tolist()
+                == [2167, 2070])
+
+    # restored onto a real LiveScan by the reader
+    rescan = LiveScan(data_file=str(path))
+    rescan.load_from_h5()
+    assert rescan.detector_shape == (2167, 2070)
+
+
+def test_no_detector_shape_writes_no_dataset(written_nxs):
+    """Additive / byte-compat: a scan without detector_shape writes NO such
+    dataset (so existing files + the byte-compat fixtures are unchanged)."""
+    import h5py
+    with h5py.File(str(written_nxs), "r") as f:
+        assert "detector_shape" not in f["entry/instrument/detector"]
 
 
 def test_instrument_groups(written_nxs):

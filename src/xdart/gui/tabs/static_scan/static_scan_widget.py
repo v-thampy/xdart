@@ -1351,6 +1351,9 @@ class staticWidget(QWidget):
         _wthread = getattr(self.wrangler, 'thread', None)
         if _wthread is not None:
             self.scan.global_mask = getattr(_wthread, 'mask', None)
+            # Carry the full-res detector shape too, so the display can map the
+            # gap mask into thumbnail coords without a resident full-res frame.
+            self.scan.detector_shape = getattr(_wthread, 'detector_shape', None)
         # Also carry the run's intensity-threshold settings so the raw-image
         # preview can show the image AS INTEGRATED (mask + threshold).
         # mask_sentinel gates the always-on uint16-65535 saturation mask on the

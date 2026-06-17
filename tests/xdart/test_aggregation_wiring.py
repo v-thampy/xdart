@@ -838,6 +838,53 @@ def test_raw_image_payload_bakes_thumbnail_gaps():
     assert np.isfinite(payload.image[26:, :]).all()
 
 
+def test_raw_image_uses_scan_detector_shape_without_widget_cache():
+    # Cold reload into Overlay: no full-res frame seen this session (widget has
+    # NO _raw_full_shape), but the scan carries detector_shape persisted in the
+    # .nxs.  raw_image must mask the gaps from scan.detector_shape -- the codex-P2
+    # fix for the cold-reload dark-gap edge.
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xdart.gui.tabs.static_scan.display_logic import RawSource
+    gap_flat = _gap_mask_flat(100, 100, 48, 51)
+    thumb = np.ones((50, 50), dtype=float)
+    pub = SimpleNamespace(
+        view=SimpleNamespace(thumbnail=thumb),
+        raw_ref=SimpleNamespace(mask=None, bg_raw=0, thumbnail=thumb),
+        metadata_raw={},
+    )
+    store = SimpleNamespace(snapshot=lambda: {0: pub})
+    widget = SimpleNamespace(            # NOTE: no _raw_full_shape attr
+        scan=SimpleNamespace(global_mask=gap_flat, mask_sentinel=True,
+                             detector_shape=(100, 100)),
+        bkg_map_raw=0,
+    )
+    adapter = PublicationDisplayAdapter(store, widget=widget)
+    state = SimpleNamespace(
+        overall=False, method="Single", selected_ids=(0,), render_ids=(0,),
+        panel=lambda role: SimpleNamespace(has_data=True, source=RawSource.THUMBNAIL),
+    )
+    payload = adapter.raw_image(state)
+    assert payload is not None and payload.raw_full_shape == (100, 100)
+    assert np.isnan(payload.image[24:26, :]).all()
+
+
+def test_nan_thumbnail_gaps_prefers_scan_detector_shape():
+    # The widget helper sources the full-res shape from scan.detector_shape when
+    # the live widget cache (_raw_full_shape) is absent.
+    from types import MethodType
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+    host = SimpleNamespace(          # NOTE: no _raw_full_shape attr
+        scan=SimpleNamespace(global_mask=_gap_mask_flat(100, 100, 48, 51),
+                             detector_shape=(100, 100)))
+    host._nan_thumbnail_gaps = MethodType(
+        displayFrameWidget._nan_thumbnail_gaps, host)
+    data = np.ones((50, 50), dtype=float)
+    host._nan_thumbnail_gaps(data)
+    assert np.isnan(data[24:26, :]).all()
+    assert not np.isnan(data[:24, :]).any()
+
+
 def test_get_frames_map_raw_caches_full_res_shape():
     # A resident full-res raw teaches the widget the detector shape so a later
     # thumbnail-only render can map the flat gap mask into thumbnail coordinates.

@@ -1058,9 +1058,10 @@ def test_live_new_scan_invalidates_publication_store():
     assert scan.scan_data.empty
 
 
-def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask):
+def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask,
+                                      wrangler_detector_shape=None):
     """A minimal staticWidget host for driving ``new_scan`` and observing how
-    ``scan.global_mask`` is synced from the wrangler thread's current mask."""
+    ``scan.global_mask`` / ``scan.detector_shape`` sync from the wrangler thread."""
     import pandas as pd
     from xdart.modules.frame_publication import PublicationStore
 
@@ -1083,7 +1084,8 @@ def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask):
             set_file=lambda fname, **k: None,
             update_scans=lambda: None, update=lambda: None,
         ),
-        wrangler=SimpleNamespace(thread=SimpleNamespace(mask=wrangler_mask)),
+        wrangler=SimpleNamespace(thread=SimpleNamespace(
+            mask=wrangler_mask, detector_shape=wrangler_detector_shape)),
         integratorTree=SimpleNamespace(
             get_args=lambda name: None, set_image_units=lambda: None,
         ),
@@ -1123,6 +1125,18 @@ def test_new_scan_propagates_wrangler_mask_when_present():
     )
     staticWidget.new_scan(host, "new", "/tmp/new.nxs", False, "th", False, False)
     np.testing.assert_array_equal(scan.global_mask, mask_idx)
+
+
+def test_new_scan_propagates_wrangler_detector_shape():
+    """The full-res detector shape syncs from the wrangler thread onto the scan
+    (alongside global_mask) so the display can map the gap mask without a
+    resident full-res frame."""
+    host, scan = _new_scan_host_with_wrangler_mask(
+        wrangler_mask=np.array([5, 6, 7], dtype=int), initial_global_mask=None,
+        wrangler_detector_shape=(2167, 2070),
+    )
+    staticWidget.new_scan(host, "new", "/tmp/new.nxs", False, "th", False, False)
+    assert scan.detector_shape == (2167, 2070)
 
 
 def test_save_path_sync_updates_scans_browser(tmp_path):

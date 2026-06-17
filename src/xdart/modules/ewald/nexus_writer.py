@@ -1420,6 +1420,22 @@ def _write_instrument(f, scan, *, entry: str) -> None:
         ds = det.create_dataset("mask", data=arr)
         ds.attrs["description"] = "flat pixel indices, shape (N,)"
 
+    # Full-resolution detector (raw image) shape (H, W) — the shape the flat
+    # mask indices index into.  Persisted so a reloaded thumbnail-only scan can
+    # map the detector gap mask into thumbnail coordinates without a resident
+    # full-res frame.  Additive (NXdetector extra field; external readers ignore
+    # it); old files lacking it fall back to the live widget shape cache.
+    dshape = getattr(scan, "detector_shape", None)
+    if "detector_shape" in det:
+        del det["detector_shape"]
+    if dshape is not None:
+        try:
+            sds = det.create_dataset(
+                "detector_shape", data=np.asarray(dshape, dtype=np.int64))
+            sds.attrs["description"] = "full-resolution detector (raw) shape (H, W)"
+        except (TypeError, ValueError):
+            logger.debug("could not persist detector_shape %r", dshape)
+
 
 def _write_stitched(f, scan, *, entry: str) -> None:
     """Write stitched 1D / 2D outputs via the shared primitive.
