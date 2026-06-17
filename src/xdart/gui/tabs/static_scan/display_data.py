@@ -708,26 +708,13 @@ class DisplayDataMixin:
             return None, None, None
 
         intensity /= ctr
-        try:
-            from .display_constants import AA_inv, Th
-            from .display_logic import is_gi_2d_units, resample_cake_to_unit
-            image_label = self.ui.imageUnit.currentText()
-            if (
-                ref_radial is not None
-                and not getattr(self.scan, 'gi', False)
-                and not is_gi_2d_units(ref_unit, ref_azimuthal_unit)
-            ):
-                intensity, xdata = resample_cake_to_unit(
-                    intensity,
-                    ref_radial,
-                    data_unit=ref_unit or 'q_A^-1',
-                    want_tth=(Th in image_label),
-                    want_q=(AA_inv in image_label),
-                    wavelength_m=self._get_wavelength(ref_frame),
-                    axis=0,
-                )
-        except Exception:
-            logger.debug("2D radial display resampling failed", exc_info=True)
+        # get_frames_int_2d feeds ONLY Set-Bkg (display_frame_widget.setBkg); the
+        # cake DISPLAY draws from the payload and resamples Q<->2theta there.  So
+        # return the NATIVE-grid intensity: resampling the background onto the
+        # display grid (as 9034302 briefly did here) makes it bin-MISALIGNED with
+        # the native cakes it is later subtracted from whenever a 2D background is
+        # captured under a non-default imageUnit (the cake DISPLAY resamples the
+        # difference afterward, so doing it here too is both wrong and redundant).
         return intensity, xdata, ydata
 
     # G2: get_scan_int_2d was deleted.  It read scan.bai_2d, an
