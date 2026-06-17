@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import h5py
 
+import xrd_tools.io.nexus as _nexus_io
 from xrd_tools.io.nexus import (
     NexusImageStack,
     _comp_kwargs,
@@ -17,6 +18,7 @@ from xrd_tools.io.nexus import (
     open_nexus_writer,
     read_nexus,
     read_scan_metadata,
+    resolve_stack_compression,
     write_integrated_stack,
     write_nexus,
     write_nexus_frame,
@@ -637,6 +639,81 @@ class TestWriteNexus:
         assert _comp_kwargs("gzip") == expected
         assert _comp_kwargs("lzf") == expected
         assert _comp_kwargs(None) == {}
+
+    def test_comp_kwargs_lz4_returns_hdf5plugin_codec_when_safe(self, monkeypatch):
+        # On a machine where native filters are safe, "lz4" emits hdf5plugin's
+        # LZ4 (filter 32004) -- the reader then needs hdf5plugin too.
+        hdf5plugin = pytest.importorskip("hdf5plugin")
+        monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: False)
+        kw = _comp_kwargs("lz4")
+        assert kw == dict(hdf5plugin.LZ4())
+        assert kw["compression"] == 32004
+
+    def test_comp_kwargs_lz4_falls_back_to_gzip_when_native_unsafe(self, monkeypatch):
+        # Defensive: even if asked for lz4 on ARM64-macOS / no-plugin, never emit
+        # an unreadable filter -- degrade to the portable gzip+shuffle policy.
+        monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: True)
+        assert _comp_kwargs("lz4") == {
+            "compression": "gzip",
+            "compression_opts": 1,
+            "shuffle": True,
+        }
+
+
+class TestResolveStackCompression:
+    """XDART_INTEGRATED_COMPRESSION is resolved identically for the GUI writer
+    and the headless reduction (one source of truth), so a shell override applies
+    to both.  Falsey -> None; gzip/lzf -> portable gzip; lz4 -> native filter on
+    safe machines, gzip elsewhere; anything else honored verbatim."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_env(self, monkeypatch):
+        monkeypatch.delenv("XDART_INTEGRATED_COMPRESSION", raising=False)
+
+    def test_unset_defaults_to_gzip(self):
+        assert resolve_stack_compression() == "gzip"
+
+    def test_unset_honors_explicit_default(self):
+        assert resolve_stack_compression(default=None) is None
+
+    @pytest.mark.parametrize(
+        "val", ["none", "off", "0", "false", "no", "", "NONE", "  none  "]
+    )
+    def test_falsey_values_disable_compression(self, monkeypatch, val):
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", val)
+        assert resolve_stack_compression() is None
+
+    @pytest.mark.parametrize("val", ["gzip", "GZIP", "lzf", "  gzip  "])
+    def test_gzip_and_lzf_alias_to_portable_gzip(self, monkeypatch, val):
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", val)
+        assert resolve_stack_compression() == "gzip"
+
+    def test_lz4_selected_when_native_filters_safe(self, monkeypatch):
+        monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: False)
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "lz4")
+        assert resolve_stack_compression() == "lz4"
+
+    def test_lz4_falls_back_to_gzip_when_native_unsafe(self, monkeypatch):
+        monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: True)
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "lz4")
+        assert resolve_stack_compression() == "gzip"
+
+    def test_unknown_filter_is_honored_verbatim(self, monkeypatch):
+        # An explicit opt-out of the portable default (caller owns reader setup).
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "blosc")
+        assert resolve_stack_compression() == "blosc"
+
+    def test_lz4_round_trips_when_natively_supported(self, tmp_path, result_1d):
+        # Real write+read of an lz4 stack -- skipped on ARM64-macOS / no-plugin
+        # where the native filter is (deliberately) unavailable.
+        pytest.importorskip("hdf5plugin")
+        if _nexus_io._native_filter_unsafe():
+            pytest.skip("native lz4 filter unavailable here (ARM64-macOS / no plugin)")
+        p = write_nexus(tmp_path / "lz4.h5", results_1d={0: result_1d}, compression="lz4")
+        with h5py.File(p, "r") as f:
+            ds = f["entry/integrated_1d/intensity"]
+            assert ds.compression == 32004
+            np.testing.assert_array_equal(ds[0], result_1d.intensity)
 
     def test_compression_gzip(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "gz.h5", results_1d={0: result_1d}, compression="gzip")

@@ -34,12 +34,24 @@ Performance features:
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import h5py
 import numpy as np
+
+# Best-effort: register hdf5plugin's HDF5 dynamic filters (lz4 etc.) for both
+# writing AND reading.  gzip (the portable default) needs no plugin; lz4 needs it
+# on the reader too, so importing here lets a headless reader round-trip an
+# lz4-compressed stack when hdf5plugin is installed.  Absent -> lz4 unavailable
+# (resolve_stack_compression / _comp_kwargs fall back to gzip).
+try:
+    import hdf5plugin  # noqa: F401  (registers HDF5 dynamic filters)
+    _HAS_HDF5PLUGIN = True
+except Exception:
+    _HAS_HDF5PLUGIN = False
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.frame_view import two_d_kind_from_units
@@ -874,6 +886,54 @@ def write_nexus_frame(
 # Private helpers — compression
 # ---------------------------------------------------------------------------
 
+_GZIP_KWARGS = {"compression": "gzip", "compression_opts": 1, "shuffle": True}
+
+
+def _native_filter_unsafe() -> bool:
+    """True when hdf5plugin native filters (lz4, ...) must NOT be used: on
+    ARM64-macOS (where they can bus-error, like the retired lzf) or when
+    hdf5plugin is unavailable.  Callers fall back to gzip+shuffle."""
+    import platform
+    import sys
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        return True
+    return not _HAS_HDF5PLUGIN
+
+
+def resolve_stack_compression(default: "str | None" = "gzip") -> "str | None":
+    """Resolve the integrated-stack compression filter, overridable for BOTH the
+    GUI and the headless reduction via the ``XDART_INTEGRATED_COMPRESSION`` env var
+    (read per call -- set it in the shell before launching xdart, or before a
+    headless run).  Case-insensitive values:
+
+    * ``none`` / ``off`` / ``0`` / ``false`` / ``no`` / empty -> ``None`` (uncompressed)
+    * ``gzip`` (``lzf`` is an alias) -> portable gzip+shuffle (the default)
+    * ``lz4`` -> fast hdf5plugin LZ4 for NON-ARM machines (the reader needs
+      hdf5plugin); falls back to gzip on ARM64-macOS or when hdf5plugin is absent
+    * any other value -> honored verbatim (an explicit hdf5plugin codec)
+
+    An unset env var uses ``default`` (gzip).  Headless callers that pass an
+    explicit ``compression=`` to the sink/writer bypass this entirely.
+    """
+    raw = os.environ.get("XDART_INTEGRATED_COMPRESSION")
+    val = raw if raw is not None else default
+    if val is None:
+        return None
+    v = str(val).strip().lower()
+    if v in ("", "none", "off", "0", "false", "no"):
+        return None
+    if v in ("gzip", "lzf"):
+        return "gzip"
+    if v == "lz4":
+        if _native_filter_unsafe():
+            logger.warning(
+                "integrated-stack compression 'lz4' is unavailable here "
+                "(ARM64-macOS or hdf5plugin missing); using gzip+shuffle")
+            return "gzip"
+        return "lz4"
+    return val
+
+
 def _comp_kwargs(compression: str | None) -> dict[str, Any]:
     """Build h5py dataset kwargs for a given compression filter.
 
@@ -896,7 +956,15 @@ def _comp_kwargs(compression: str | None) -> dict[str, Any]:
     if compression in ("gzip", "lzf"):
         # level 1 = fastest gzip; shuffle markedly improves the ratio on the
         # smooth integrated-intensity arrays.  One policy on every platform.
-        return {"compression": "gzip", "compression_opts": 1, "shuffle": True}
+        return dict(_GZIP_KWARGS)
+    if compression == "lz4":
+        # hdf5plugin LZ4 (filter 32004): fast, but the READER needs hdf5plugin.
+        # Defensive guard (resolve_stack_compression already screens ARM / missing
+        # plugin) so we never emit lz4 where it can't be read back here.
+        if _native_filter_unsafe():
+            logger.warning("lz4 compression unavailable here; using gzip+shuffle")
+            return dict(_GZIP_KWARGS)
+        return dict(hdf5plugin.LZ4())
     return {"compression": compression}
 
 

@@ -33,6 +33,10 @@ dependencies = [
     "pandas",            # core/scan.py + reduction/core.py import it directly
     "xarray",
     "h5py",
+    # Registers HDF5 dynamic filters (bitshuffle/lz4): needed by the HEADLESS
+    # reader to load Dectris Eiger data and to read/write lz4-compressed
+    # integrated stacks.  Lightweight, so kept in the base deps (not just GUI).
+    "hdf5plugin",
     "nexusformat",
     "fabio",
     "silx",              # io.spec / io.metadata SPEC parsing
@@ -53,7 +57,6 @@ rsm = ["xrayutilities", "pyevtk"]
 gui = [
     "PySide6>=6.5",
     "pyqtgraph>=0.13.7",
-    "hdf5plugin",
     # silx.gui.plot pulls qtawesome at import time (pyFAI-calib2 /
     # drawmask path) but silx doesn't declare it.
     "qtawesome",

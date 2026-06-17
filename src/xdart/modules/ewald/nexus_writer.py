@@ -53,6 +53,8 @@ import h5py
 import nexusformat.nexus as nx
 import numpy as np
 
+from xrd_tools.io.nexus import resolve_stack_compression
+
 if TYPE_CHECKING:  # pragma: no cover
     from xrd_tools.core.geometry import DiffractometerGeometry
 
@@ -61,30 +63,21 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-# Compression for the GUI writer's integrated 1D/2D stacks.  Default gzip+shuffle:
-# DEFLATE is in every HDF5 build, readable with a stock h5py (no hdf5plugin on the
-# reader), and -- unlike lzf -- has no ARM64-macOS bus error.  On the live
-# streaming pipeline its write cost is overlapped (negligible wall-clock) and it
-# gives ~-50% on disk.  Never use lzf.
-#
-# Overridable per-run via the XDART_INTEGRATED_COMPRESSION env var, read ONCE at
-# import -- set it in the shell BEFORE launching xdart to A/B compression:
-#     XDART_INTEGRATED_COMPRESSION=none   -> uncompressed (fastest writes, big files)
-#     XDART_INTEGRATED_COMPRESSION=gzip   -> gzip+shuffle (default; unset == gzip)
-def _resolve_integrated_compression() -> "str | None":
-    raw = os.environ.get("XDART_INTEGRATED_COMPRESSION")
-    if raw is None:
-        return "gzip"
-    val = raw.strip()
-    if val.lower() in ("", "none", "off", "0", "false", "no"):
-        return None
-    return val
-
-
+# Compression for the GUI writer's integrated 1D/2D stacks.  Resolved by the
+# shared core helper (xrd_tools.io.nexus.resolve_stack_compression) so the GUI
+# writer and the headless reduction honor the SAME XDART_INTEGRATED_COMPRESSION
+# env var (read ONCE at import; set it in the shell BEFORE launching xdart):
+#     none -> uncompressed (fastest writes, biggest files)
+#     gzip -> gzip+shuffle (default; unset == gzip; portable, ~-50% on disk)
+#     lz4  -> fast hdf5plugin LZ4 on NON-ARM (reader needs hdf5plugin; ARM->gzip)
+# gzip/lzf both map to portable gzip+shuffle; never emit raw lzf (ARM64-macOS bus
+# error).  On the live streaming pipeline the write cost is overlapped
+# (negligible wall-clock).  _resolve_integrated_compression kept as a thin alias.
+_resolve_integrated_compression = resolve_stack_compression
 INTEGRATED_STACK_COMPRESSION = _resolve_integrated_compression()
 if INTEGRATED_STACK_COMPRESSION != "gzip":
     logger.info(
-        "Integrated-stack compression = %r (XDART_INTEGRATED_COMPRESSION override)",
+        "Integrated-stack compression = %r (XDART_INTEGRATED_COMPRESSION)",
         INTEGRATED_STACK_COMPRESSION,
     )
 

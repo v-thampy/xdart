@@ -43,6 +43,7 @@ from xrd_tools.io.image import read_image
 from xrd_tools.io.nexus import (
     open_nexus_image_stack,
     open_nexus_writer,
+    resolve_stack_compression,
     upsert_scan_metadata,
     write_nexus_frame,
 )
@@ -463,7 +464,9 @@ class NexusSink:
 
     path: Path | str
     entry: str = "entry"
-    compression: str | None = "gzip"
+    # Default honors XDART_INTEGRATED_COMPRESSION (gzip when unset) so a headless
+    # run picks up the same override as the GUI; pass compression= to bypass.
+    compression: str | None = field(default_factory=resolve_stack_compression)
     overwrite: bool = False
     flush_every: int | None = 16
     atomic: bool | None = None

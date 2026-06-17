@@ -620,6 +620,24 @@ def test_finish_timeout_does_not_touch_sink_while_writer_alive(monkeypatch):
     gate.set()    # release the worker so the thread can exit cleanly
 
 
+def test_nexus_sink_compression_default_honors_env(tmp_path, monkeypatch):
+    """The headless sink's DEFAULT compression is resolved from the same
+    XDART_INTEGRATED_COMPRESSION override the GUI writer uses (one source of
+    truth), so a shell override applies to a headless reduction too.  An explicit
+    compression= kwarg always bypasses the env."""
+    from xrd_tools.reduction import NexusSink
+
+    monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "none")
+    assert NexusSink(tmp_path / "a.nxs", overwrite=True).compression is None
+
+    monkeypatch.delenv("XDART_INTEGRATED_COMPRESSION", raising=False)
+    assert NexusSink(tmp_path / "b.nxs", overwrite=True).compression == "gzip"
+
+    monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "none")
+    explicit = NexusSink(tmp_path / "c.nxs", overwrite=True, compression="gzip")
+    assert explicit.compression == "gzip"
+
+
 def test_nexus_sink_abort_preserves_partial(tmp_path):
     """T0-6/S7: in atomic mode every frame written so far lives in the tmp
     file; abort() must preserve it as <output>.partial, never unlink it."""
