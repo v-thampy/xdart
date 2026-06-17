@@ -2060,7 +2060,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         gaps identically.
         """
         full_shape = getattr(self, '_raw_full_shape', None)
-        gap = combine_flat_masks(getattr(self.scan, 'global_mask', None), frame_mask)
+        gap = combine_flat_masks(
+            getattr(getattr(self, 'scan', None), 'global_mask', None), frame_mask)
         nan_gaps_in_thumbnail(data, gap, full_shape)
 
     def update_image(self):
