@@ -610,11 +610,20 @@ class imageThread(wranglerThread):
             except Exception as e:
                 logger.warning('Could not load mask file %s: %s', self.mask_file, e)
         self.mask = np.flatnonzero(det_mask) if det_mask is not None else None
-        # The shape the flat ``self.mask`` indices index into (== the raw image
-        # shape) — carried onto the scan + persisted so a reloaded thumbnail-only
-        # scan can map the detector gap mask into thumbnail coordinates.  A
-        # mismatched Mask File was rejected above, so this is the true frame shape.
-        self.detector_shape = tuple(det_mask.shape) if det_mask is not None else None
+        # The full-res raw frame shape (H, W) the flat mask indices index into —
+        # carried onto the scan + persisted so a reloaded thumbnail-only scan can
+        # map the detector gap mask into thumbnail coordinates.  Prefer det_mask's
+        # shape (a mismatched Mask File was rejected above, so it's the true frame
+        # shape); otherwise capture the detector geometry shape even with NO mask
+        # (future per-frame masks / cold reloads), per review.
+        if det_mask is not None:
+            self.detector_shape = tuple(det_mask.shape)
+        elif self.detector is not None:
+            _gs = (getattr(self.detector, "shape", None)
+                   or getattr(self.detector, "max_shape", None))
+            self.detector_shape = tuple(_gs) if _gs is not None else None
+        else:
+            self.detector_shape = None
         self._cached_gi_incident_angle = None
 
         # Sync GI mode selections from image_wrangler into scan.bai_*_args

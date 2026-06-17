@@ -1314,6 +1314,7 @@ def _instrument_signature(scan) -> tuple:
         None if wavelength is None else float(wavelength),
         poni_sig,
         _array_digest(getattr(scan, "global_mask", None)),
+        _array_digest(getattr(scan, "detector_shape", None)),
     )
 
 

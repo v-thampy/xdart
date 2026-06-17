@@ -165,7 +165,8 @@ class LiveScan:
         # ``global_mask`` indices index into.  Persisted to the .nxs so a reloaded
         # thumbnail-only scan can map the detector gap mask into thumbnail
         # coordinates without needing a resident full-res frame this session.
-        self.detector_shape = tuple(detector_shape) if detector_shape else None
+        self.detector_shape = (
+            tuple(detector_shape) if detector_shape is not None else None)
 
     def reset(self):
         """Resets all held data objects to blank state."""

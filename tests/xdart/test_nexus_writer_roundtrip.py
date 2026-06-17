@@ -1241,6 +1241,25 @@ def test_instrument_mask_rewrites_when_live_mask_changes(tmp_path):
         np.testing.assert_array_equal(f["entry/instrument/detector/mask"][()], [7, 8, 9])
 
 
+def test_instrument_detector_shape_rewrites_when_live_shape_changes(tmp_path):
+    """Regression (review P2): detector_shape is part of the instrument
+    fingerprint, so changing ONLY the shape on a later append re-writes the
+    instrument group instead of leaving a stale value on disk."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    path = tmp_path / "dshape_dirty.nxs"
+    scan = _DuckSphere([_DuckArch(idx=0)], detector_shape=(100, 100))
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    scan.detector_shape = (200, 250)            # ONLY the shape changes
+    scan.frames.append(_DuckArch(idx=1))
+    save_scan_to_nexus(scan, path, mode="a", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        assert (f["entry/instrument/detector/detector_shape"][()].tolist()
+                == [200, 250])
+
+
 def test_detector_shape_persisted_and_reloads(tmp_path):
     """detector_shape (full-res raw shape) round-trips: written as an NXdetector
     child and restored onto scan.detector_shape by the reader.  Lets a reloaded

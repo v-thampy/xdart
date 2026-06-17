@@ -4186,6 +4186,31 @@ def test_thumbnail_image_update_skips_full_detector_flat_mask():
     assert np.isfinite(host.image_data[0]).all()
 
 
+def test_full_res_raw_masks_in_range_indices_despite_out_of_range():
+    # Regression (review P3): the legacy full-res raw branch bounds each flat
+    # index (combine_flat_masks size=data.size) instead of the old all-or-nothing
+    # max()<size guard -- so an out-of-range index can't suppress masking the
+    # in-range gaps (identical to the payload path).
+    calls = []
+    host = SimpleNamespace(
+        overall=False,
+        frame_ids=[1],
+        idxs_2d=[1],
+        data_lock=RLock(),
+        data_2d={1: {"mask": np.array([0], dtype=int)}},        # in-range
+        scan=SimpleNamespace(global_mask=np.array([3, 999], dtype=int)),  # 3 in, 999 OOB
+        bkg_map_raw=0,
+        get_frames_map_raw=lambda **kwargs: (np.ones((2, 2)), "raw"),
+        update_image_view=lambda: calls.append("updated"),
+    )
+
+    displayFrameWidget.update_image(host)
+
+    assert calls == ["updated"]
+    # flat 0 + 3 are in-range -> 2 NaN; 999 dropped (not a crash, not skip-all).
+    assert np.isnan(host.image_data[0]).sum() == 2
+
+
 class _AttrDict(dict):
     """data_2d stand-in that, like FixSizeOrderedDict, can carry the shared
     hydrated-raw order attribute (plain dicts cannot)."""

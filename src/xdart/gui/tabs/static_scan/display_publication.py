@@ -323,9 +323,11 @@ class PublicationDisplayAdapter:
         image = np.asarray(image, dtype=float)
         _scan = getattr(self._widget, "scan", None)
         # Authoritative full-res shape from the scan (persisted in the .nxs);
-        # falls back to the live widget cache, then None.
-        full_shape = (getattr(_scan, "detector_shape", None)
-                      or getattr(self._widget, "_raw_full_shape", None))
+        # falls back to the live widget cache, then None.  Explicit is-None
+        # checks (not truthiness) so a stray ndarray can't raise.
+        full_shape = getattr(_scan, "detector_shape", None)
+        if full_shape is None:
+            full_shape = getattr(self._widget, "_raw_full_shape", None)
         gap_indices = combine_flat_masks(
             getattr(_scan, "global_mask", None),
             *mask_parts,

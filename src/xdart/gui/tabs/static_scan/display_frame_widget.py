@@ -2061,9 +2061,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """
         _scan = getattr(self, 'scan', None)
         # Authoritative full-res shape from the scan (persisted in the .nxs);
-        # falls back to the live widget cache, then None (no-op).
-        full_shape = (getattr(_scan, 'detector_shape', None)
-                      or getattr(self, '_raw_full_shape', None))
+        # falls back to the live widget cache, then None (no-op).  Explicit
+        # is-None checks (not truthiness) so a stray ndarray can't raise.
+        full_shape = getattr(_scan, 'detector_shape', None)
+        if full_shape is None:
+            full_shape = getattr(self, '_raw_full_shape', None)
         gap = combine_flat_masks(getattr(_scan, 'global_mask', None), frame_mask)
         nan_gaps_in_thumbnail(data, gap, full_shape)
 
@@ -2146,14 +2148,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # gaps as dark; re-apply the gap mask in thumbnail coordinates so both
         # paths mask gaps identically.
         if raw_source == 'raw':
-            global_mask = (
-                self.scan.global_mask if self.scan.global_mask is not None else []
-            )
-            mask = mask if mask is not None else []
-            mask = np.asarray(np.unique(np.append(mask, global_mask)), dtype=int)
-            if len(mask) > 0 and mask.max() < data.size:
-                mask = np.unravel_index(mask, data.shape)
-                data[mask] = np.nan
+            # Bound each flat index to data.size (combine_flat_masks) rather than
+            # the old all-or-nothing max()<size guard, so an out-of-range index
+            # can't suppress masking the in-range gaps -- identical to the
+            # payload path's masking.
+            _gap = combine_flat_masks(
+                mask, getattr(getattr(self, 'scan', None), 'global_mask', None),
+                size=data.size)
+            if _gap is not None:
+                data[np.unravel_index(_gap, data.shape)] = np.nan
         elif raw_source is not None:
             self._nan_thumbnail_gaps(data, mask)
 
