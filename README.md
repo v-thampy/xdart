@@ -3,11 +3,6 @@
 <!-- After the repo is pushed, point the badge at the real org/name:
 [![PR checks](https://github.com/<org>/xrd-tools/actions/workflows/pr.yml/badge.svg)](https://github.com/<org>/xrd-tools/actions/workflows/pr.yml) -->
 
-SSRL X-ray diffraction toolkit: a **headless reduction core** (`xrd_tools`)
-and the **xdart Qt GUI** (`xdart`) in one distribution.  Formerly the
-`ssrl_xrd_tools` and `xdart` repositories — merged with full histories;
-see [`MIGRATION.md`](MIGRATION.md).
-
 ## Install
 
 **xdart (the GUI)** — the common install:
@@ -27,6 +22,11 @@ pip install xrd-tools
 
 Extras: `[gui]` PySide6/pyqtgraph + GUI deps, `[fitting]` pymatgen/lmfit,
 `[rsm]` reciprocal-space mapping, `[dev]` test/build tooling.
+
+SSRL X-ray diffraction toolkit: a **headless reduction core** (`xrd_tools`)
+and the **xdart Qt GUI** (`xdart`) in one distribution.  Formerly the
+`ssrl_xrd_tools` and `xdart` repositories — merged with full histories;
+see [`MIGRATION.md`](MIGRATION.md).
 
 ### Performance: install the HDF5 stack from conda-forge
 
