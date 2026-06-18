@@ -560,6 +560,12 @@ class imageThread(wranglerThread):
         self._eiger_master_queue.clear()
         self._eiger_done_masters.clear()
         self._eiger_metadata_cache.clear()
+        # Start each run with an empty producer->consumer display slot so a frame
+        # the GUI never popped (a missed/raced consume, or a frame published after
+        # the final flush) can't leak a whole LiveFrame (~18 MB raw) into the next
+        # run.  Safe to clear here: the prior run's consumer is done and this run
+        # hasn't published yet.
+        self._published_frames.clear()
         self._prefetch_stop_prior()     # tear down any lingering prefetcher
         self._prefetch_queue = None
         self._prefetch_thread = None

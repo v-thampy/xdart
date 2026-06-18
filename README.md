@@ -46,6 +46,23 @@ This only affects raw-frame read speed — pyFAI integration and the writer are
 unchanged.  A pure-pip install works correctly, just slower on compressed
 detector data.
 
+### Output compression (lz4 default — reading `.nxs` outside xrd-tools)
+
+xdart writes the integrated 1D/2D stacks with **lz4+shuffle** by default (fast,
+hdf5plugin filter 32004; ~gzip-class size).  **Reading those `.nxs` files requires
+`hdf5plugin`** — a base dependency, so any xrd-tools/xdart environment reads them
+fine.  To read them with **stock h5py elsewhere** (a collaborator's plain notebook,
+a third-party tool, long-term archival) either install `hdf5plugin`, or write
+portable files by setting the compression before launch:
+
+```bash
+XDART_INTEGRATED_COMPRESSION=gzip xdart   # gzip+shuffle — readable by any stock h5py
+XDART_INTEGRATED_COMPRESSION=none xdart   # uncompressed
+```
+
+(Detector module gaps and decompressed values are identical either way; only the
+on-disk filter changes.)
+
 ## Headless quick start
 
 ```python
