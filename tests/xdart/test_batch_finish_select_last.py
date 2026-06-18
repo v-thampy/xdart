@@ -28,6 +28,7 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
         # `else: wrangler.enabled(True)` path (no integrator_thread_finished).
         scan_name="other", enabled=lambda e: None,
     )
+    loaded = []          # records post-live scan.frames populate (load_frame_index_only)
     host = SimpleNamespace(
         integratorTree=SimpleNamespace(
             integrator_thread=SimpleNamespace(
@@ -36,10 +37,18 @@ def _finish_host(tmp_path, *, batch, saw_frame, xye_only=False,
         _update_timer=SimpleNamespace(stop=lambda: None),
         _flush_pending_update=lambda: None,
         thread_state_changed=lambda: None,
+        _apply_integration_control_state=lambda: None,
         h5viewer=h5viewer, wrangler=wrangler,
-        scan=SimpleNamespace(name="scanA", data_file=str(nxs)),
+        # frames.index empty == the post-live state (streaming wrote the .nxs but
+        # never populated scan.frames); load_frame_index_only is the populate hook.
+        scan=SimpleNamespace(
+            name="scanA", data_file=str(nxs),
+            frames=SimpleNamespace(index=[]),
+            load_frame_index_only=lambda f: (loaded.append(f), 0)[1],
+        ),
         _run_saw_frame=saw_frame,
     )
+    host._loaded_paths = loaded
     host.wrangler_finished = MethodType(staticWidget.wrangler_finished, host)
     return host, h5viewer, str(nxs), calls
 
@@ -61,10 +70,14 @@ def test_append_zero_frame_finish_forces_internal_reload(tmp_path):
 
 
 def test_nonbatch_run_that_saw_frames_does_not_reload(tmp_path):
-    # a normal live run that already displayed frames must NOT reload at finish
+    # a normal live run that already displayed frames must NOT do a display reload
+    # (set_file) at finish — but it DOES do the lightweight scan.frames populate so
+    # the Reintegrate buttons work post-live.
     host, h5viewer, nxs, calls = _finish_host(tmp_path, batch=False, saw_frame=True)
     host.wrangler_finished()
-    assert calls == [], f"a frames-seen run must not reload; got {calls}"
+    assert calls == [], f"a frames-seen run must not display-reload; got {calls}"
+    assert host._loaded_paths == [nxs], \
+        f"post-live should populate scan.frames once from the .nxs; got {host._loaded_paths}"
 
 
 def test_batch_finish_skips_reload_while_reintegrate_running(tmp_path):

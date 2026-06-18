@@ -1342,8 +1342,10 @@ def test_reintegrate_row_present_and_advanced_rehomed(widget):
 
 
 def test_reintegrate_enable_state(widget):
-    """Reintegrate needs a processed scan with reachable raw; Reintegrate 2D
-    also needs a 2-D scan (disabled for skip_2d / Int-1D); viewers disable all."""
+    """Reintegrate / Advanced track the integration panels: enabled in any
+    non-viewer Int mode; Reintegrate 2D follows frame2D (off in Int-1D-only
+    modes); viewers disable all.  Enable does NOT depend on scan.frames / raw
+    reachability — bai_1d/bai_2d enforce those at CLICK time."""
     w = widget
     iu = w.integratorTree.ui
     combo = w.wrangler.ui.processingModeCombo
@@ -1355,42 +1357,33 @@ def test_reintegrate_enable_state(widget):
         combo.blockSignals(True)
         combo.setCurrentIndex(i)
         combo.blockSignals(False)
+        w._apply_integration_control_state()
 
-    # Processed 2-D scan, raw reachable → both Reintegrate + Advanced enabled.
+    # Int 2D → Reintegrate 1D/2D + Advanced all enabled (mirrors frame1D/frame2D).
     _mode("Int 2D")
-    w.scan = _fake_processed_scan(raw_reachable=True, skip_2d=False)
-    w._apply_integration_control_state()
     assert iu.reintegrate1D.isEnabled()
     assert iu.reintegrate2D.isEnabled()
     assert iu.advanced_int.isEnabled()
+    # And frame2D agrees (same flag) — the buttons mirror the panel.
+    assert iu.reintegrate2D.isEnabled() == iu.frame2D.isEnabled()
 
-    # skip_2d (1D-only scan) → Reintegrate 2D disabled, 1D still enabled.
-    w.scan = _fake_processed_scan(raw_reachable=True, skip_2d=True)
-    w._apply_integration_control_state()
-    assert iu.reintegrate1D.isEnabled()
-    assert not iu.reintegrate2D.isEnabled()
-
-    # Int 1D mode → Reintegrate 2D disabled (no cake), 1D enabled.
+    # Int 1D → Reintegrate 2D disabled (no cake), 1D + Advanced still enabled.
     _mode("Int 1D")
-    w.scan = _fake_processed_scan(raw_reachable=True, skip_2d=False)
-    w._apply_integration_control_state()
     assert iu.reintegrate1D.isEnabled()
     assert not iu.reintegrate2D.isEnabled()
+    assert iu.advanced_int.isEnabled()
+    assert iu.reintegrate2D.isEnabled() == iu.frame2D.isEnabled()
 
-    # Raw source moved/deleted (reload-only) → both Reintegrate disabled.
-    _mode("Int 2D")
-    w.scan = _fake_processed_scan(raw_reachable=False)
-    w._apply_integration_control_state()
-    assert not iu.reintegrate1D.isEnabled()
-    assert not iu.reintegrate2D.isEnabled()
-
-    # Viewer mode → everything in the row disabled.
+    # Viewer → whole row disabled (like the integration panels).
     _mode("XYE Viewer")
-    w.scan = _fake_processed_scan(raw_reachable=True)
-    w._apply_integration_control_state()
     assert not iu.reintegrate1D.isEnabled()
     assert not iu.reintegrate2D.isEnabled()
     assert not iu.advanced_int.isEnabled()
+
+    # Back to Int 2D → re-enabled.
+    _mode("Int 2D")
+    assert iu.reintegrate1D.isEnabled() and iu.reintegrate2D.isEnabled()
+    assert iu.advanced_int.isEnabled()
 
 
 def test_reintegrate_buttons_wired_to_bai(widget):
@@ -1412,33 +1405,64 @@ def test_reintegrate_buttons_wired_to_bai(widget):
     assert started == ["bai_2d_all"]
 
 
-def test_reintegrate_no_raw_probe_during_run(widget):
-    """Regression (crash 2026-06-18): _apply_integration_control_state must NOT
-    probe scan.has_reload_only_frames() while a run is active.  On an empty
-    in-memory cache that probe opens the .nxs READ-ONLY via h5py, colliding with
-    the streaming writer's r+ open (OSError: file already open for read-only) and
-    aborting the scan.  The row is disabled mid-run regardless, so it must reach
-    that state WITHOUT touching the file."""
+def test_reintegrate_no_processed_data_pops_message_not_thread(widget, monkeypatch):
+    """The buttons mirror the panels, so they're clickable with no scan loaded
+    (and in directory mode with no processed .nxs).  Clicking then surfaces a
+    'nothing to re-integrate' message and must NOT start the integrator thread."""
+    from types import SimpleNamespace
+    from pyqtgraph.Qt import QtWidgets as _qtw
+    w = widget
+    it = w.integratorTree
+    iu = it.ui
+    started, msgs = [], []
+    it.integrator_thread.isRunning = lambda: False
+    it.integrator_thread.start = lambda: started.append("start")
+    it.scan = SimpleNamespace(frames=SimpleNamespace(index=[]))   # no processed data
+    monkeypatch.setattr(_qtw.QMessageBox, "information",
+                        lambda *a, **k: msgs.append(a))
+
+    iu.reintegrate1D.clicked.emit()
+    iu.reintegrate2D.clicked.emit()
+    assert started == []                 # blocked — thread never started
+    assert len(msgs) == 2                # a message popped for each click
+
+
+def test_reintegrate_apply_never_probes_raw(widget):
+    """Regression (crash 2026-06-18): _apply_integration_control_state must NEVER
+    call scan.has_reload_only_frames() — neither during a run (the probe opens the
+    .nxs READ-ONLY, colliding with the streaming writer's r+ open → aborted scan)
+    nor when idle (it false-disabled freshly written scans).  Reachability is
+    enforced only at bai_1d/bai_2d CLICK time.  A scan whose probe RAISES proves
+    the enable-state never touches it; the buttons still reach the right state."""
     from types import SimpleNamespace
     w = widget
     iu = w.integratorTree.ui
+    combo = w.wrangler.ui.processingModeCombo
 
     def _boom():
-        raise AssertionError("must not probe raw reachability during a run")
+        raise AssertionError("_apply must never probe raw reachability")
 
     w.scan = SimpleNamespace(
-        name="running_scan", skip_2d=False,
+        name="probe_test", skip_2d=False,
         frames=SimpleNamespace(index=[0, 1, 2]),
         has_reload_only_frames=_boom,
     )
-    w._run_active = True
-    try:
-        w._apply_integration_control_state()   # must neither raise nor probe
-    finally:
-        w._run_active = False
-    assert not iu.reintegrate1D.isEnabled()
-    assert not iu.reintegrate2D.isEnabled()
-    assert not iu.advanced_int.isEnabled()
+
+    # _apply must complete in EVERY run-state + mode without invoking the probe;
+    # the _boom scan raises if it ever is.  (Per-mode/run button states are
+    # covered by test_reintegrate_enable_state.)
+    for mode in ("Int 2D", "Int 1D", "XYE Viewer"):
+        j = combo.findText(mode)
+        if j >= 0:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(j)
+            combo.blockSignals(False)
+        for active in (True, False):
+            w._run_active = active
+            try:
+                w._apply_integration_control_state()   # must not raise (no probe)
+            finally:
+                w._run_active = False
 
 
 def test_cake_radial_entry_converts_q_to_2theta(widget):

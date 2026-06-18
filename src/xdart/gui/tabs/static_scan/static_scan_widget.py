@@ -1198,48 +1198,24 @@ class staticWidget(QWidget):
             if btn is not None:
                 btn.setEnabled(not run_active)
 
-        # Reintegrate row.  Reintegrate needs a PROCESSED scan whose raw frames are
-        # still REACHABLE (it re-reads raw from disk); enabled only outside a run,
-        # in a non-viewer Int mode.  Reintegrate 2D additionally needs a 2-D scan
-        # (disabled for Int-1D / skip_2d).  Advanced is a settings dialog — it just
-        # needs to be in an Int mode (the param trees self-lock during a run).
+        # Reintegrate / Advanced row tracks the SAME enable as the integration
+        # panels above: available in any non-viewer Int mode, never during a run.
+        # Reintegrate 2D follows frame2D exactly — also disabled in Int-1D-only
+        # modes (no cake to reintegrate).  We do NOT gate on scan.frames or
+        # raw-reachability: bai_1d/bai_2d no-op on an empty scan and pop a clear
+        # message when raw is unreachable (R3), and probing here opened the .nxs
+        # read-only — the mid-run writer crash.  So enable mirrors the panels;
+        # "is there anything to reintegrate / is the raw reachable" is enforced
+        # (with feedback) only when the user actually clicks.
         reint1d = getattr(ui, 'reintegrate1D', None)
+        if reint1d is not None:
+            reint1d.setEnabled(not is_viewer and not run_active)
         reint2d = getattr(ui, 'reintegrate2D', None)
+        if reint2d is not None:
+            reint2d.setEnabled(not is_viewer and not is_1d_only and not run_active)
         adv = getattr(ui, 'advanced_int', None)
-        if is_viewer or run_active:
-            # Whole row disabled in viewers and during a run.  CRITICAL: do NOT
-            # probe scan.has_reload_only_frames() in these states — on an empty
-            # in-memory cache it opens the .nxs READ-ONLY via h5py, which collides
-            # with the streaming writer's r+ open mid-run (OSError: file already
-            # open for read-only) and aborts the scan.  The reachability probe is
-            # only needed when a button could actually be clicked (idle + Int mode),
-            # which is also the only time the .nxs is not held by the writer.
-            for btn in (reint1d, reint2d, adv):
-                if btn is not None:
-                    btn.setEnabled(False)
-        else:
-            scan = getattr(self, 'scan', None)
-            has_frames = raw_reachable = skip_2d = False
-            if scan is not None:
-                try:
-                    has_frames = len(scan.frames.index) > 0
-                except Exception:
-                    has_frames = False
-                try:
-                    # Same "raw is gone" predicate the bai_1d/bai_2d guards use (R3)
-                    # — so the button's enabled state matches whether a click would
-                    # actually do anything.  Safe here: no run is active, so the
-                    # writer isn't holding the .nxs.
-                    raw_reachable = has_frames and not scan.has_reload_only_frames()
-                except Exception:
-                    raw_reachable = has_frames  # don't over-disable on a probe error
-                skip_2d = bool(getattr(scan, 'skip_2d', False))
-            if reint1d is not None:
-                reint1d.setEnabled(raw_reachable)
-            if reint2d is not None:
-                reint2d.setEnabled(raw_reachable and not is_1d_only and not skip_2d)
-            if adv is not None:
-                adv.setEnabled(True)
+        if adv is not None:
+            adv.setEnabled(not is_viewer and not run_active)
 
     def _session_run_active(self):
         """4d: True iff a streaming session is open AND reports it is running.
@@ -1748,20 +1724,22 @@ class staticWidget(QWidget):
         # batch already gets this via its end-of-batch reload above.  Skip when a
         # reintegrate is still running (don't repoint frames mid-reintegrate) or
         # when the run saw 0 frames (the append-feedback branch already reloaded).
+        _frames_index = getattr(getattr(self.scan, 'frames', None), 'index', None)
         if (not is_batch and not is_xye_only and not _reintegrate_running
                 and getattr(self, '_run_saw_frame', True)
-                and not self.scan.frames.index):
+                and _frames_index is not None and len(_frames_index) == 0):
             written = (getattr(self.wrangler.thread, 'fname', None)
                        or getattr(self.wrangler, 'fname', None))
             if written and os.path.exists(written):
                 try:
                     n = self.scan.load_frame_index_only(written)
-                    logger.debug(
-                        "post-live: indexed %d frames for reintegrate", n)
+                    logger.info(
+                        "post-live: indexed %d frame(s) from %s for reintegrate",
+                        n, os.path.basename(written))
+                    self._apply_integration_control_state()
                 except Exception:
-                    logger.debug("post-live frame-index populate failed",
-                                 exc_info=True)
-                self._apply_integration_control_state()
+                    logger.warning("post-live frame-index populate failed",
+                                   exc_info=True)
 
         # The scan-matches branch delegates to integrator_thread_finished() to
         # run the post-integration UI enable + exit the run-state.  Skip it when

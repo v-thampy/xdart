@@ -1066,6 +1066,8 @@ class integratorTree(QtWidgets.QWidget):
     def bai_1d(self, q):
         """Uses the integrator_thread attribute to call bai_1d
         """
+        if self._block_if_no_frames('1D'):
+            return
         if self._block_if_reload_only_frames('1D'):
             return
         with self.integrator_thread.lock:
@@ -1088,6 +1090,8 @@ class integratorTree(QtWidgets.QWidget):
     def bai_2d(self, q):
         """Uses the integrator_thread attribute to call bai_2d
         """
+        if self._block_if_no_frames('2D'):
+            return
         if self._block_if_reload_only_frames('2D'):
             return
         with self.integrator_thread.lock:
@@ -1106,6 +1110,40 @@ class integratorTree(QtWidgets.QWidget):
         self.setEnabled(False)
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()
+
+    def _block_if_no_frames(self, dim_label: str) -> bool:
+        """Abort re-integration with a status message when the scan has no
+        processed frames to re-integrate.
+
+        The Reintegrate buttons mirror the integration panels' enabled state
+        (any non-viewer Int mode), so they're clickable even before a scan has
+        been run/loaded — and in Image-Directory mode where the selected entry
+        may have no corresponding processed ``.nxs`` yet.  Rather than gate the
+        buttons on per-selection file probes (fragile, and the probe opens the
+        .nxs), we let the click surface a clear message when there's nothing to
+        do.  Returns True iff the action was blocked.
+        """
+        try:
+            has_frames = len(self.scan.frames.index) > 0
+        except (AttributeError, RuntimeError, TypeError) as e:
+            logger.debug("frame-count check errored, not blocking: %s", e)
+            has_frames = True       # don't block on an unexpected scan shape
+        if has_frames:
+            return False
+        try:
+            from pyqtgraph.Qt import QtWidgets
+            QtWidgets.QMessageBox.information(
+                self,
+                f'Nothing to re-integrate ({dim_label})',
+                'No processed data was found for this scan to re-integrate.\n\n'
+                'Run a scan, or load a processed .nxs file, then try again.',
+            )
+        except (ImportError, RuntimeError) as e:
+            logger.warning(
+                'Re-integrate %s blocked — no processed frames (no QMessageBox: %s)',
+                dim_label, e,
+            )
+        return True
 
     def _block_if_reload_only_frames(self, dim_label: str) -> bool:
         """R3 guardrail.  Abort re-integration with a status message when
