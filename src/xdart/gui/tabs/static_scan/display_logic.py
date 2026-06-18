@@ -1115,11 +1115,18 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     ready = load_status is LoadStatus.READY
 
     # 2D-raw panel: the raw-vs-thumbnail-vs-none decision (mask only on full
-    # raw — §8 invariant).  Overall aggregation prefers thumbnails, matching
-    # update_image's prefer_thumbnail path.
+    # raw — §8 invariant).  Only the multi-frame Sum/Average AGGREGATION prefers
+    # thumbnails (matching update_image's prefer_thumbnail path + _display_ids_for_2d,
+    # which aggregates the whole set only for Sum/Average).  Single/Overlay/Waterfall
+    # render just the LATEST 2D frame (render_2d[-1]), so probe THAT frame's
+    # availability and keep full-res RAW.  A bare ``overall`` + ``render_2d[0]`` made
+    # Overlay/Waterfall (overall=True once Auto-Last selects every frame) render the
+    # latest frame's THUMBNAIL even though its full-res raw is resident.
     if ready and render_2d:
-        avail = _availability(raw_availability, render_2d[0])
-        prefer_thumb = overall and len(render_2d) > 1
+        aggregating = method in ("Sum", "Average")
+        probe = render_2d[0] if aggregating else render_2d[-1]
+        avail = _availability(raw_availability, probe)
+        prefer_thumb = aggregating and overall and len(render_2d) > 1
         raw_src = choose_raw_source(
             bool(avail.get('has_raw')), bool(avail.get('has_thumbnail')),
             prefer_thumbnail=prefer_thumb, want_raw=True)
