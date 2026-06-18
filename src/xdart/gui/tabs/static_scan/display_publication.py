@@ -27,6 +27,8 @@ from .display_logic import (
     PlotPayload,
     RawSource,
     Trace,
+    combine_flat_masks,
+    nan_gaps_in_thumbnail,
     sentinel_mask,
     x_axis_for_unit,
     convert_2d_radial,
@@ -253,6 +255,7 @@ class PublicationDisplayAdapter:
 
         accum = None
         count = 0
+        mask_parts = []   # per-frame detector masks, for the thumbnail gap re-bake
         display_ids = _display_ids_for_2d(state)   # current frame, or all for Sum/Average
         for label in display_ids:
             publication = self._items.get(_label_key(label))
@@ -270,7 +273,19 @@ class PublicationDisplayAdapter:
             )
             if data.ndim != 2:
                 continue
+            # Cache the full-resolution detector shape from any resident full
+            # raw so a thumbnail-only render can map the flat gap mask into
+            # thumbnail coordinates (parity with get_frames_map_raw and the
+            # legacy update_image thumbnail path).
+            if source is RawSource.RAW and self._widget is not None:
+                try:
+                    self._widget._raw_full_shape = tuple(data.shape)
+                except Exception:
+                    pass
             raw_ref = getattr(publication, "raw_ref", None)
+            _frame_mask = getattr(raw_ref, "mask", None)
+            if _frame_mask is not None:
+                mask_parts.append(_frame_mask)
             bg = getattr(raw_ref, "bg_raw", getattr(raw_ref, "background", 0))
             if source is RawSource.RAW:
                 data = self._apply_detector_mask(data, publication)
@@ -298,15 +313,41 @@ class PublicationDisplayAdapter:
         if image.size == 0 or not np.isfinite(image).any():
             return None
 
+        # Detector module gaps are 0-valued (NOT sentinels), so sentinel_mask
+        # never masks them.  _apply_detector_mask NaN'd them on the full-res path
+        # above; the thumbnail source skips it, so bake the gap mask into a
+        # downsampled image here -- mapping the flat detector indices into
+        # thumbnail coordinates via the cached full-res shape -- so this payload
+        # masks gaps identically to the full-res path and the legacy update_image
+        # thumbnail path.  No-op for full-res (shape matches) or unknown shape.
+        image = np.asarray(image, dtype=float)
+        _scan = getattr(self._widget, "scan", None)
+        # Authoritative full-res shape from the scan (persisted in the .nxs);
+        # falls back to the live widget cache, then None.  Explicit is-None
+        # checks (not truthiness) so a stray ndarray can't raise.
+        full_shape = getattr(_scan, "detector_shape", None)
+        if full_shape is None:
+            full_shape = getattr(self._widget, "_raw_full_shape", None)
+        gap_indices = combine_flat_masks(
+            getattr(_scan, "global_mask", None),
+            *mask_parts,
+            size=(int(full_shape[0]) * int(full_shape[1]))
+            if full_shape is not None else None,
+        )
+        if full_shape is not None and tuple(image.shape) != tuple(full_shape):
+            nan_gaps_in_thumbnail(image, gap_indices, full_shape)
+
         # Legacy raw rendering flipped the detector rows after transposing
         # for pyqtgraph.  ImagePayload itself is row/column oriented, and
         # display_frame_widget transposes every ImagePayload, so pre-flip
         # here to preserve the visible detector orientation exactly.
-        image = np.asarray(image, dtype=float)[::-1, :]
+        image = image[::-1, :]
         return ImagePayload(
             image=image,
             axis_x=Axis("x", "Pixels", values=np.arange(image.shape[1])),
             axis_y=Axis("y", "Pixels", values=np.arange(image.shape[0])),
+            gap_mask_indices=gap_indices,
+            raw_full_shape=tuple(full_shape) if full_shape is not None else None,
         )
 
     def cake_image(self, state):

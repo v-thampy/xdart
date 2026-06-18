@@ -196,7 +196,40 @@ serve only resident frames — **silently truncating** the Overall Sum/Average. 
 > | N1 | OPEN (highest notebook value) | I5 *(added)* | OPEN |
 > | N3 | OPEN | C1, C2, C3, C4 | OPEN |
 > | C5 | **DONE bar a test** | C6 *(added)* | OPEN |
-> | I4 *(added)* | OPEN — **post-Wave-5** | A3/A4 | not started (live-gated) |
+> | I4 *(added)* | OPEN — **post-Wave-5** | A3/A4 | A3 raw-panel flip STAGED (live-gated); rest open |
+
+### 0.3 `display-payload-unification` branch (2026-06-17) — gap-mask fix + detector_shape + Wave-5 A3 raw-panel flip
+A focused branch off `main @ a443447` (NOT merged; awaiting the maintainer live session). 6 commits, full
+suite green per step, each adversarially reviewed (codex + Claude rounds). Closes the live Overlay
+end-of-scan dark-gaps bug and **advances Wave 5 A3** (the raw-2D `map_raw` retarget).
+- `e04ceff` + `00ecd17` — detector module gaps (0-valued, NOT sentinels) now render NaN on BOTH the legacy
+  `update_image` thumbnail path and the publication `raw_image` payload path (shared Qt-free
+  `combine_flat_masks`/`nan_gaps_in_thumbnail`; `ImagePayload` gains `gap_mask_indices`/`raw_full_shape`).
+- `c92dc5a` + `f03df3f` — **persist the full-res detector shape in the `.nxs`** (`NXdetector/detector_shape`,
+  additive/written-only-when-present → byte-compat fixtures unchanged, no regen; reader restores
+  `scan.detector_shape`; consumers prefer it over the live widget cache). Removes the widget-memory
+  dependency → fixes the cold reload-into-Overlay edge. Also extended the custom-Mask-File shape validation
+  to no-built-in-mask detectors (Rayonix-type) and added `detector_shape` to `_instrument_signature`.
+- `40694dc` — **Wave-5 A3 raw-panel flip (item 2):** `_draw_delegate(RAW_2D)` no longer falls back to legacy
+  `update_image`; the Int raw panel renders SOLELY from the `raw_image` payload, mirroring CAKE_2D.
+  `update_image` retained as dead-but-rollback-able. **LIVE-GATED** (orientation/levels/keep-last verified
+  equivalent offscreen; needs a GUI eyeball).
+
+**Deferred items agreed to SHIP WITH this release (v1.0) — carry, do not drop:**
+- **Mask-File validation behavior note (release note):** a mismatched custom Mask File on a detector with NO
+  built-in mask is now *rejected* (was applied unchecked) — correct (a wrong-shape mask can't index the
+  frame), but a user-visible behavior change.
+- **Per-render thumbnail gap-map cache (codex P3, perf):** cache the mapped thumbnail gap coords by
+  `(full_shape, thumbnail_shape, mask_digest)`. Negligible for Eiger today; do if large-mask render lags.
+- **GUI/headless writer convergence (P3):** the headless `io/nexus` writer does not emit `detector_shape`
+  (GUI-writer only). Converge only if the headless/notebook path needs gap-masking on reload.
+- **Payload array metadata immutability (codex P3):** make `ImagePayload`/`PlotPayload` array fields
+  read-only when payloads become the SOLE display contract (A4) — not partially now (the `image` field is
+  already mutable; partial is inconsistent).
+
+**Remaining A3/A4 after this branch (still LIVE-GATED):** the Overlay/Waterfall **1D** flip to payload-only
+(scan-1D still has the `update_plot` fallback), and the **A4 deletion** of Role-A `data_1d`/`data_2d`
+(+ `hydrated_raw.py`) once the >64 aggregation + scroll-back tests stay green without the backstop.
 
 ## Scope guardrails (apply to EVERY item — do not violate)
 - **No `git push` / publish / tag** — maintainer only. Commit per item with the relevant suite green.
@@ -268,7 +301,22 @@ It is **live-gated**, so it is structured as offscreen prep + a live-checkpoint 
   unrelated and used everywhere.
 - **Gate:** `pytest tests/xdart/test_ewald.py` + offscreen xdart suite green; spine green.
 
-### QW2 — Compress the GUI writer's integrated 1D/2D stacks (RESOLVED in `91c9d37`)
+### QW2 — Compress the GUI writer's integrated 1D/2D stacks (RESOLVED in `91c9d37`; default changed to lz4 Jun-17)
+> **UPDATE (Jun-17 2026):** the DEFAULT integrated-stack filter is now **lz4+shuffle**
+> (hdf5plugin filter 32004), with **gzip+shuffle as the portable fallback** (used automatically
+> when hdf5plugin is unavailable, or via `XDART_INTEGRATED_COMPRESSION=gzip`). The single
+> resolver `xrd_tools.io.nexus.resolve_stack_compression` (shared by the GUI writer + headless
+> `NexusSink`) defaults to `"lz4"`; `_comp_kwargs("lz4")` emits `hdf5plugin.LZ4()+shuffle`.
+> The arm64-macOS guard was **relaxed to lzf only** — a write+read spot-check confirmed lz4
+> round-trips on arm64-macOS (the bus error was h5py's *bundled LZF*, a different filter; xdart
+> already decodes lz4 there for every Eiger frame). `hdf5plugin` is now a **base dependency**.
+> **Caveat (supersedes the "no hdf5plugin on the reader" line below):** lz4-compressed stacks
+> require hdf5plugin to read *outside xrd-tools* (a one-time warning is logged on lz4 write);
+> set `XDART_INTEGRATED_COMPRESSION=gzip` for stock-h5py-portable files. byte-compat is
+> unaffected (the signature digests decompressed values, filter-invariant). The drop/replace
+> row-surgery path (`drop_integrated_rows`) now preserves plugin filters when rebuilding a group.
+
+
 - **Where:** `src/xdart/modules/ewald/nexus_writer.py` `_commit_integrated_1d` / `_commit_integrated_2d`
   pass `compression=INTEGRATED_STACK_COMPRESSION`, which is now `"gzip"`; the headless `NexusSink`
   default is also `"gzip"`. Both flow through `xrd_tools.io.nexus._comp_kwargs`.

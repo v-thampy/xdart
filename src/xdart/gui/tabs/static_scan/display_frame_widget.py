@@ -54,6 +54,7 @@ from .display_logic import (
     empty_display_state, PANEL_LAYOUT,
     resolve_selection, resolve_render_ids,
     default_plot_unit, pretty_unit, sentinel_mask, integer_saturation_ceiling,
+    combine_flat_masks, nan_gaps_in_thumbnail,
 )
 from .display_controllers import register_default_controllers
 
@@ -115,6 +116,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # H5Viewer) use this to switch listData selection mode so accumulating
     # plot methods don't require shift/ctrl multi-select.
     sigPlotMethodChanged = Qt.QtCore.Signal(str)
+
+    # Emitted when the user clicks Clear while in a viewer mode.  The host
+    # (staticWidget) clears the H5Viewer file-list selection so the cleared plot,
+    # the selection and the title all agree -- the displayframe owns the title but
+    # not the list selection.
+    sigCleared = Qt.QtCore.Signal()
 
     # Feature flag: during a processing run, keep the last-rendered 2D panels
     # (raw image + cake) on screen instead of blanking them when the in-flight
@@ -547,12 +554,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.cmap.currentIndexChanged.connect(self.update_views)
         # shareAxis / showLegend / slice are checkable QPushButtons now —
         # use ``toggled`` (bool) rather than the QCheckBox-only stateChanged.
-        self.ui.shareAxis.toggled.connect(self.update)
-        # On *unchecking* Share Axis, release the x-link and rescale the 1D
-        # plot to its own data (update() relinks/unlinks but leaves the
-        # range frozen at the cake's).  Connected after update so the unlink
-        # has already happened.
-        self.ui.shareAxis.toggled.connect(self._on_share_axis_toggled)
+        # Share Axis runs a synchronous, geometry-heavy render + relink; during a
+        # live scan that momentarily freezes the GUI while the writer keeps
+        # emitting per-frame display events (the named stall).  _on_share_axis_changed
+        # DEFERS that work to the next event-loop pass ONLY while processing, so the
+        # click returns immediately; idle (incl. headless tests) stays synchronous.
+        self.ui.shareAxis.toggled.connect(self._on_share_axis_changed)
 
         # 2D image controls — the Q-χ / 2θ-χ toggle re-renders through the
         # payload path (cake_image owns the on-the-fly Q↔2θ conversion now), so
@@ -1120,7 +1127,17 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if role is PanelRole.RAW_2D:
             if mode in (Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER):
                 return self.clear_image_view
-            return self.update_image
+            # Item-2 flip: the Int raw panel now renders SOLELY from the
+            # raw_image payload (gap-masking + detector_shape live there),
+            # mirroring CAKE_2D -- a None raw payload normally blanks the panel
+            # (no legacy update_image fallback).  Panel-consistency: while a run
+            # is active, return None so render skips this panel (keep last) like
+            # the 1D plot + cake.  update_image is retained as dead-but-rollback-
+            # able code (its gap-mask logic is duplicated in the raw_image builder).
+            if (getattr(self, 'PERSIST_2D_DURING_PROCESSING', True)
+                    and getattr(self, '_processing_active', False)):
+                return None
+            return self.clear_image_view
         if role is PanelRole.PLOT_1D:
             if mode in (Mode.XYE_VIEWER, Mode.NEXUS_VIEWER):
                 return self.clear_plot_view
@@ -1926,6 +1943,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             )
         self.ui.plotUnit.blockSignals(False)
         self.ui.imageUnit.blockSignals(False)
+        # Re-baseline the Overlay/Waterfall unit-change tracker to the freshly
+        # rebuilt combo so a PROGRAMMATIC combo rebuild never registers as a
+        # spurious user unit change on the next overlay render.  That stale
+        # _last_plot_unit was the trigger that sent a live overlay down the
+        # REBUILD partial-read path and collapsed/re-stacked the waterfall.
+        self._last_plot_unit = self.ui.plotUnit.currentIndex()
 
         # Update slice enable/disable for current selection
         self._on_plotUnit_changed()
@@ -1972,6 +1995,27 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         active = self.ui.slice.isEnabled() and self.ui.slice.isChecked()
         self.ui.slice_center.setEnabled(active)
         self.ui.slice_width.setEnabled(active)
+
+    def _on_share_axis_changed(self, checked):
+        """Apply a Share Axis toggle: the full render + relink + the bottom-panel
+        rescale, in that order.
+
+        While a scan is PROCESSING the writer thread emits a per-frame display
+        signal, so running the synchronous render inline froze the GUI and let the
+        events queue into a burst (the 'Share Axis is slow + frames race ahead'
+        report).  Defer the work to the next event-loop pass during processing so
+        the click returns immediately; when idle (including headless tests, which
+        have no running event loop) run it synchronously so behavior is unchanged.
+        The render is idempotent, so deferring only changes WHEN it runs."""
+        if getattr(self, "_processing_active", False):
+            Qt.QtCore.QTimer.singleShot(
+                0, lambda c=bool(checked): self._apply_share_axis_change(c))
+        else:
+            self._apply_share_axis_change(checked)
+
+    def _apply_share_axis_change(self, checked):
+        self.update()
+        self._on_share_axis_toggled(checked)
 
     def _on_share_axis_toggled(self, checked):
         """Rescale the active bottom panel to its own data when Share Axis is off.
@@ -2035,6 +2079,38 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             logger.debug("1D autoscale on unit change failed", exc_info=True)
 
     # ── 2D image rendering ────────────────────────────────────────
+
+    def _nan_thumbnail_gaps(self, data, frame_mask=None):
+        """NaN the detector gap pixels in a downsampled thumbnail in place.
+
+        The detector mask (``scan.global_mask`` + any per-frame ``frame_mask``)
+        is stored as flat indices into the *full-resolution* detector shape.
+        The full-res path applies it directly, but the thumbnail path normally
+        relies on the mask being baked into the preview at creation.  A frame
+        whose thumbnail was generated without the bake — notably the last frame
+        persisted at end-of-scan — then shows the 0-valued module gaps as dark
+        instead of NaN.  Map the flat indices into the thumbnail's smaller shape
+        via the cached full-res shape (``_raw_full_shape``, set by
+        ``get_frames_map_raw`` whenever a resident raw is seen) and set those
+        pixels to NaN, so the raw panel masks gaps consistently with the
+        full-res path.  No-op when the shape isn't known or there is no gap mask.
+
+        Tactical bridge: the publication/payload unification folds this
+        thumbnail-vs-full-res masking divergence into one display contract.
+        The flat-index union + downsample-coordinate mapping live in the
+        Qt-free ``display_logic`` (``combine_flat_masks`` / ``nan_gaps_in_thumbnail``)
+        so the legacy path here and the publication ``raw_image`` builder mask
+        gaps identically.
+        """
+        _scan = getattr(self, 'scan', None)
+        # Authoritative full-res shape from the scan (persisted in the .nxs);
+        # falls back to the live widget cache, then None (no-op).  Explicit
+        # is-None checks (not truthiness) so a stray ndarray can't raise.
+        full_shape = getattr(_scan, 'detector_shape', None)
+        if full_shape is None:
+            full_shape = getattr(self, '_raw_full_shape', None)
+        gap = combine_flat_masks(getattr(_scan, 'global_mask', None), frame_mask)
+        nan_gaps_in_thumbnail(data, gap, full_shape)
 
     def update_image(self):
         """Updates image plotted in image frame.
@@ -2108,18 +2184,24 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             ceiling=_sat_ceiling,
         )
 
-        # Apply detector + global mask only to full-resolution raw data.
-        # Thumbnails already bake the mask into the preview before
-        # downsampling; flat detector indices point at unrelated pixels there.
+        # Apply the detector + global mask.  Full-resolution raw uses the flat
+        # detector indices directly.  Thumbnails normally bake the mask in at
+        # creation, but a frame whose thumbnail was generated without it (e.g.
+        # the last frame persisted at end-of-scan) shows the 0-valued module
+        # gaps as dark; re-apply the gap mask in thumbnail coordinates so both
+        # paths mask gaps identically.
         if raw_source == 'raw':
-            global_mask = (
-                self.scan.global_mask if self.scan.global_mask is not None else []
-            )
-            mask = mask if mask is not None else []
-            mask = np.asarray(np.unique(np.append(mask, global_mask)), dtype=int)
-            if len(mask) > 0 and mask.max() < data.size:
-                mask = np.unravel_index(mask, data.shape)
-                data[mask] = np.nan
+            # Bound each flat index to data.size (combine_flat_masks) rather than
+            # the old all-or-nothing max()<size guard, so an out-of-range index
+            # can't suppress masking the in-range gaps -- identical to the
+            # payload path's masking.
+            _gap = combine_flat_masks(
+                mask, getattr(getattr(self, 'scan', None), 'global_mask', None),
+                size=data.size)
+            if _gap is not None:
+                data[np.unravel_index(_gap, data.shape)] = np.nan
+        elif raw_source is not None:
+            self._nan_thumbnail_gaps(data, mask)
 
         # Subtract background
         bkg = np.asarray(self.bkg_map_raw)
@@ -2472,6 +2554,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def clear_display_state(self, title=None):
         """Blank all rendered panels and cached display data."""
         self._raw_resolve_failed = set()   # re-arm the raw hydrate retries
+        self._raw_full_shape = None        # detector shape is per-scan (sizes vary)
         self.clear_image_view()
         self.clear_binned_view()
         self.clear_plot_view()
@@ -2487,6 +2570,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         data isn't available yet — so the 2D panels persist like the 1D plot.
         """
         self._processing_active = bool(active)
+        # Reset the waterfall-repaint throttle at every run boundary so the next
+        # update_wf always repaints in full -- in particular the end-of-scan flush
+        # (run just ended -> active False) must show the COMPLETE stack even if the
+        # last in-scan repaint was throttled.
+        self._wf_last_draw_t = 0.0
 
     def set_viewer_display_mode(self, mode):
         """Configure display panels for viewer modes.
@@ -2589,6 +2677,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self.ui.cmap.setVisible(True)   # restore if hidden by XYE viewer
             self.ui.plotUnit.setVisible(True)
             self.ui.plotUnit.setEnabled(True)
+            # Re-baseline the Overlay/Waterfall unit tracker on the return to a
+            # processing mode: a viewer round-trip leaves plotUnit hidden/rebuilt
+            # and never updated _last_plot_unit, which then read as a spurious unit
+            # change and sent the next live overlay down the REBUILD partial-read
+            # collapse.  Sync it to the now-restored combo so only a genuine user
+            # unit toggle registers.
+            self._last_plot_unit = self.ui.plotUnit.currentIndex()
             self.ui.plotMethod.setEnabled(True)
             # Slice enable/disable depends on which axis is selected
             self._on_plotUnit_changed()
@@ -2610,6 +2705,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return f'{name[:head]}...{name[-tail:]}'
         return name
 
+    def _viewer_default_title(self):
+        """The pristine title for the current viewer mode (no selection)."""
+        return {
+            'image': 'Image Viewer',
+            'xye': 'XYE Viewer',
+            'nexus': 'NeXus Viewer',
+        }.get(getattr(self, 'viewer_mode', None), 'Viewer')
+
     def _set_viewer_title(self, idxs):
         """Set the title label in viewer modes from the selected frame's
         source file: plain filename for single-image formats (tiff/raw/xye),
@@ -2618,7 +2721,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         ``(+k more)`` suffix."""
         idxs = list(idxs) if idxs else []
         if not idxs:
-            self.ui.labelCurrent.setText('Image Viewer')
+            self.ui.labelCurrent.setText(self._viewer_default_title())
             return
         idx0 = idxs[0]
         src = ''

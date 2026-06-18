@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import h5py
 
+import xrd_tools.io.nexus as _nexus_io
 from xrd_tools.io.nexus import (
     NexusImageStack,
     _comp_kwargs,
@@ -17,6 +18,7 @@ from xrd_tools.io.nexus import (
     open_nexus_writer,
     read_nexus,
     read_scan_metadata,
+    resolve_stack_compression,
     write_integrated_stack,
     write_nexus,
     write_nexus_frame,
@@ -637,6 +639,92 @@ class TestWriteNexus:
         assert _comp_kwargs("gzip") == expected
         assert _comp_kwargs("lzf") == expected
         assert _comp_kwargs(None) == {}
+
+    def test_comp_kwargs_lz4_returns_hdf5plugin_codec_when_safe(self, monkeypatch):
+        # On a machine where the lz4 plugin is available, "lz4" emits hdf5plugin's
+        # LZ4 (filter 32004) + the HDF5 shuffle filter -- the reader needs hdf5plugin.
+        hdf5plugin = pytest.importorskip("hdf5plugin")
+        monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: False)
+        kw = _comp_kwargs("lz4")
+        assert kw == dict(shuffle=True, **hdf5plugin.LZ4())
+        assert kw["compression"] == 32004
+        assert kw["shuffle"] is True
+
+    def test_comp_kwargs_lz4_falls_back_to_gzip_when_native_unsafe(self, monkeypatch):
+        # Defensive: even if asked for lz4 on ARM64-macOS / no-plugin, never emit
+        # an unreadable filter -- degrade to the portable gzip+shuffle policy.
+        monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: True)
+        assert _comp_kwargs("lz4") == {
+            "compression": "gzip",
+            "compression_opts": 1,
+            "shuffle": True,
+        }
+
+
+class TestResolveStackCompression:
+    """XDART_INTEGRATED_COMPRESSION is resolved identically for the GUI writer
+    and the headless reduction (one source of truth), so a shell override applies
+    to both.  Falsey -> None; lz4 (the DEFAULT) -> hdf5plugin LZ4 when available
+    else gzip; gzip/lzf -> portable gzip; anything unrecognized -> gzip + warn."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_env(self, monkeypatch):
+        monkeypatch.delenv("XDART_INTEGRATED_COMPRESSION", raising=False)
+
+    def test_unset_defaults_to_lz4_when_plugin_available(self, monkeypatch):
+        monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: False)
+        assert resolve_stack_compression() == "lz4"
+
+    def test_unset_falls_back_to_gzip_without_plugin(self, monkeypatch):
+        monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: True)
+        assert resolve_stack_compression() == "gzip"
+
+    def test_unset_honors_explicit_default(self):
+        assert resolve_stack_compression(default=None) is None
+
+    @pytest.mark.parametrize(
+        "val", ["none", "off", "0", "false", "no", "", "NONE", "  none  "]
+    )
+    def test_falsey_values_disable_compression(self, monkeypatch, val):
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", val)
+        assert resolve_stack_compression() is None
+
+    @pytest.mark.parametrize("val", ["gzip", "GZIP", "lzf", "  gzip  "])
+    def test_gzip_and_lzf_alias_to_portable_gzip(self, monkeypatch, val):
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", val)
+        assert resolve_stack_compression() == "gzip"
+
+    def test_lz4_selected_when_native_filters_safe(self, monkeypatch):
+        monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: False)
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "lz4")
+        assert resolve_stack_compression() == "lz4"
+
+    def test_lz4_falls_back_to_gzip_when_native_unsafe(self, monkeypatch):
+        monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: True)
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "lz4")
+        assert resolve_stack_compression() == "gzip"
+
+    def test_unknown_filter_falls_back_to_gzip(self, monkeypatch):
+        # A typo'd / unknown codec must NOT be honored verbatim (that crashes
+        # every write at create_dataset) -- degrade loudly to the portable gzip.
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "blosc")
+        assert resolve_stack_compression() == "gzip"
+
+    def test_lz4_round_trips_when_natively_supported(self, tmp_path, result_1d):
+        # Real write+read of an lz4 stack -- runs wherever hdf5plugin is importable
+        # (incl. arm64-macOS: the old bus error was h5py's bundled LZF, not LZ4).
+        pytest.importorskip("hdf5plugin")
+        if _nexus_io._native_filter_unsafe():
+            pytest.skip("hdf5plugin not importable here")
+        p = write_nexus(tmp_path / "lz4.h5", results_1d={0: result_1d}, compression="lz4")
+        with h5py.File(p, "r") as f:
+            ds = f["entry/integrated_1d/intensity"]
+            # h5py reports plugin filters as 'unknown'; the LZ4 filter id 32004 is
+            # in the filter pipeline (it does NOT show up as ds.compression).
+            assert "32004" in dict(ds._filters)   # hdf5plugin LZ4 engaged
+            assert ds.shuffle is True             # shuffle filter engaged
+            # lz4 is lossless; the only diff is the float64->float32 store dtype.
+            np.testing.assert_allclose(ds[0], result_1d.intensity, rtol=1e-6)
 
     def test_compression_gzip(self, tmp_path, result_1d):
         p = write_nexus(tmp_path / "gz.h5", results_1d={0: result_1d}, compression="gzip")

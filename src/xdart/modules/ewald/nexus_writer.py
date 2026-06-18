@@ -53,6 +53,8 @@ import h5py
 import nexusformat.nexus as nx
 import numpy as np
 
+from xrd_tools.io.nexus import resolve_stack_compression
+
 if TYPE_CHECKING:  # pragma: no cover
     from xrd_tools.core.geometry import DiffractometerGeometry
 
@@ -61,14 +63,21 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-# Single converged compression policy (see xrd_tools.io.nexus._comp_kwargs):
-# gzip+shuffle.  gzip (DEFLATE) is in every HDF5 build, always readable with a
-# stock h5py (no hdf5plugin on the reader), and -- unlike lzf -- has no
-# ARM64-macOS bus error.  This replaces the former ``None`` (uncompressed): the
-# GUI writer is latency-sensitive, but the integrated stacks are small relative
-# to the raw frames and gzip level-1+shuffle adds negligible write time while
-# restoring on-disk compression for every platform.  Never use lzf.
-INTEGRATED_STACK_COMPRESSION = "gzip"
+# Compression for the GUI writer's integrated 1D/2D stacks.  Resolved by the
+# shared core helper (xrd_tools.io.nexus.resolve_stack_compression) so the GUI
+# writer and the headless reduction honor the SAME XDART_INTEGRATED_COMPRESSION
+# env var (read ONCE at import; set it in the shell BEFORE launching xdart):
+#     lz4  -> hdf5plugin LZ4+shuffle (DEFAULT; fast, reader needs hdf5plugin which
+#             is a base dep; falls back to gzip only if hdf5plugin is missing)
+#     gzip -> gzip+shuffle (portable; stock-h5py readable, no hdf5plugin needed)
+#     none -> uncompressed (biggest files)
+# gzip/lzf both map to portable gzip+shuffle; raw lzf is never emitted (ARM64-macOS
+# bus error).  lz4 round-trips on arm64-macOS (verified); the old bus error was
+# h5py's bundled LZF, not hdf5plugin's LZ4.  On the live streaming pipeline the
+# write cost is overlapped.  _resolve_integrated_compression kept as a thin alias.
+_resolve_integrated_compression = resolve_stack_compression
+INTEGRATED_STACK_COMPRESSION = _resolve_integrated_compression()
+logger.info("Integrated-stack compression = %r", INTEGRATED_STACK_COMPRESSION)
 
 
 @dataclass
@@ -1314,6 +1323,7 @@ def _instrument_signature(scan) -> tuple:
         None if wavelength is None else float(wavelength),
         poni_sig,
         _array_digest(getattr(scan, "global_mask", None)),
+        _array_digest(getattr(scan, "detector_shape", None)),
     )
 
 
@@ -1419,6 +1429,22 @@ def _write_instrument(f, scan, *, entry: str) -> None:
     if arr is not None and arr.size > 0:
         ds = det.create_dataset("mask", data=arr)
         ds.attrs["description"] = "flat pixel indices, shape (N,)"
+
+    # Full-resolution detector (raw image) shape (H, W) — the shape the flat
+    # mask indices index into.  Persisted so a reloaded thumbnail-only scan can
+    # map the detector gap mask into thumbnail coordinates without a resident
+    # full-res frame.  Additive (NXdetector extra field; external readers ignore
+    # it); old files lacking it fall back to the live widget shape cache.
+    dshape = getattr(scan, "detector_shape", None)
+    if "detector_shape" in det:
+        del det["detector_shape"]
+    if dshape is not None:
+        try:
+            sds = det.create_dataset(
+                "detector_shape", data=np.asarray(dshape, dtype=np.int64))
+            sds.attrs["description"] = "full-resolution detector (raw) shape (H, W)"
+        except (TypeError, ValueError):
+            logger.debug("could not persist detector_shape %r", dshape)
 
 
 def _write_stitched(f, scan, *, entry: str) -> None:

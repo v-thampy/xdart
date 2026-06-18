@@ -34,12 +34,24 @@ Performance features:
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import h5py
 import numpy as np
+
+# Best-effort: register hdf5plugin's HDF5 dynamic filters (lz4 etc.) for both
+# writing AND reading.  gzip (the portable default) needs no plugin; lz4 needs it
+# on the reader too, so importing here lets a headless reader round-trip an
+# lz4-compressed stack when hdf5plugin is installed.  Absent -> lz4 unavailable
+# (resolve_stack_compression / _comp_kwargs fall back to gzip).
+try:
+    import hdf5plugin  # noqa: F401  (registers HDF5 dynamic filters)
+    _HAS_HDF5PLUGIN = True
+except Exception:
+    _HAS_HDF5PLUGIN = False
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.core.frame_view import two_d_kind_from_units
@@ -874,29 +886,110 @@ def write_nexus_frame(
 # Private helpers — compression
 # ---------------------------------------------------------------------------
 
+_GZIP_KWARGS = {"compression": "gzip", "compression_opts": 1, "shuffle": True}
+
+
+def _native_filter_unsafe() -> bool:
+    """True when the hdf5plugin LZ4 filter must NOT be used -- i.e. hdf5plugin is
+    not importable (it is needed on BOTH the writer and the reader).
+
+    There is NO platform guard: the former ARM64-macOS bus error was specific to
+    h5py's BUNDLED LZF filter (a separate C implementation), NOT the hdf5plugin
+    LZ4 filter.  A write+read spot-check on arm64-macOS (h5py 3.16 / hdf5 1.14)
+    confirms LZ4 (filter 32004) round-trips cleanly there, and xdart already
+    DECODES lz4 on arm64-macOS every time it opens a Dectris Eiger file -- so the
+    only real requirement is plugin availability.  Callers fall back to
+    gzip+shuffle when this is True."""
+    return not _HAS_HDF5PLUGIN
+
+
+_lz4_default_warned = False
+
+
+def resolve_stack_compression(default: "str | None" = "lz4") -> "str | None":
+    """Resolve the integrated-stack compression filter, overridable for BOTH the
+    GUI and the headless reduction via the ``XDART_INTEGRATED_COMPRESSION`` env var
+    (read per call -- set it in the shell before launching xdart, or before a
+    headless run).  Case-insensitive values:
+
+    * ``none`` / ``off`` / ``0`` / ``false`` / ``no`` / empty -> ``None`` (uncompressed)
+    * ``lz4`` -> fast hdf5plugin LZ4+shuffle (THE DEFAULT): fast writes, gzip-class
+      ratio; the reader needs hdf5plugin (a base dep of xrd-tools).  Falls back to
+      gzip only when hdf5plugin is not importable.
+    * ``gzip`` (``lzf`` is an alias) -> portable gzip+shuffle (no hdf5plugin needed
+      on the reader; the right choice for stock-h5py interoperability)
+    * any UNRECOGNIZED value -> warn + fall back to gzip (a typo'd codec must not
+      crash every integrated-stack write at ``create_dataset``)
+
+    An unset env var uses ``default`` (lz4).  Headless callers that pass an
+    explicit ``compression=`` to the sink/writer bypass this entirely.
+    """
+    raw = os.environ.get("XDART_INTEGRATED_COMPRESSION")
+    val = raw if raw is not None else default
+    if val is None:
+        return None
+    v = str(val).strip().lower()
+    if v in ("", "none", "off", "0", "false", "no"):
+        return None
+    if v in ("gzip", "lzf"):
+        return "gzip"
+    if v == "lz4":
+        if _native_filter_unsafe():
+            logger.warning(
+                "integrated-stack compression 'lz4' is unavailable here "
+                "(hdf5plugin not importable); using gzip+shuffle instead")
+            return "gzip"
+        global _lz4_default_warned
+        if not _lz4_default_warned:
+            _lz4_default_warned = True
+            logger.warning(
+                "integrated stacks are lz4-compressed (fast; reader needs "
+                "hdf5plugin, a base dep of xrd-tools).  Reading them OUTSIDE "
+                "xrd-tools requires hdf5plugin; set XDART_INTEGRATED_COMPRESSION="
+                "gzip for stock-h5py-portable files, or =none to disable.")
+        return "lz4"
+    # Unrecognized / typo'd value: degrade LOUDLY to the portable default rather
+    # than honor it verbatim -- a verbatim unknown filter crashes every write at
+    # create_dataset (ValueError: Compression filter "X" is unavailable), and the
+    # env var is a documented A/B knob where a typo is plausible.
+    logger.warning(
+        "unrecognized XDART_INTEGRATED_COMPRESSION=%r; using gzip+shuffle "
+        "(valid: none, lz4, gzip)", val)
+    return "gzip"
+
+
 def _comp_kwargs(compression: str | None) -> dict[str, Any]:
     """Build h5py dataset kwargs for a given compression filter.
 
-    gzip (DEFLATE) is the single portable filter and the project default: it is
-    part of every HDF5 build, always readable with a stock h5py (no hdf5plugin
-    on the *reader*), and has no ARM64-macOS native-filter bus error.  ``"lzf"``
-    is accepted only as a backward-compatible alias and normalized to
-    gzip+shuffle on EVERY platform -- lzf ships with h5py (not HDF5 core) and
-    bus-errors on some ARM64-macOS builds, so we never actually emit it (this
-    retires the former darwin/arm64 special-case).  All of these are lossless,
-    so the byte-compat signature -- which digests DECOMPRESSED values -- is
-    invariant under the filter choice.  ``None`` stores uncompressed.
+    ``"lz4"`` is the project default: hdf5plugin's LZ4 (filter 32004) + shuffle --
+    fast writes with a gzip-class ratio on the smooth integrated arrays.  The
+    READER needs hdf5plugin (a base dep of xrd-tools); it round-trips on every
+    platform including arm64-macOS (the old bus error was h5py's bundled LZF, a
+    different filter).  ``"gzip"`` (DEFLATE) is the portable fallback: part of
+    every HDF5 build, readable with a stock h5py (no hdf5plugin on the reader);
+    ``"lzf"`` is a backward-compatible alias normalized to gzip+shuffle and is
+    NEVER emitted (h5py-only filter, ARM64-macOS bus error).  All of these are
+    lossless, so the byte-compat signature -- which digests DECOMPRESSED values --
+    is invariant under the filter choice.  ``None`` stores uncompressed.
 
-    An explicit filter other than ``gzip``/``lzf`` (e.g. an ``hdf5plugin``
-    codec) is honored verbatim: the caller has knowingly opted out of the
-    portable default and accepts that the reader must register that plugin.
+    Any value the resolver couldn't map (it degrades unknowns to gzip) is treated
+    here as a last-resort verbatim filter so a deliberate caller-supplied codec
+    still works; the resolver already shields the env path from typos.
     """
     if compression is None:
         return {}
     if compression in ("gzip", "lzf"):
         # level 1 = fastest gzip; shuffle markedly improves the ratio on the
         # smooth integrated-intensity arrays.  One policy on every platform.
-        return {"compression": "gzip", "compression_opts": 1, "shuffle": True}
+        return dict(_GZIP_KWARGS)
+    if compression == "lz4":
+        # hdf5plugin LZ4 (filter 32004) + HDF5 shuffle: fast, gzip-class ratio.
+        # The READER needs hdf5plugin.  Defensive fallback to gzip when the plugin
+        # is missing so we never emit a filter that can't be read back here.
+        if _native_filter_unsafe():
+            logger.warning("lz4 compression unavailable here; using gzip+shuffle")
+            return dict(_GZIP_KWARGS)
+        return dict(shuffle=True, **hdf5plugin.LZ4())
     return {"compression": compression}
 
 

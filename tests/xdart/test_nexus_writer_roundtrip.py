@@ -159,7 +159,7 @@ class _DuckSphere:
     """Minimal duck-typed LiveScan."""
 
     def __init__(self, frames, *, scan_data=None, geometry=None,
-                 global_mask=None, gi=False, skip_2d=False):
+                 global_mask=None, detector_shape=None, gi=False, skip_2d=False):
         self.frames = _DuckArches(frames)
         self.scan_data = scan_data if scan_data is not None else pd.DataFrame()
         self.bai_1d_args = {"numpoints": N_Q}
@@ -167,6 +167,7 @@ class _DuckSphere:
         self.mg_args = {"wavelength": 1.0e-10}
         self.geometry = geometry
         self.global_mask = global_mask
+        self.detector_shape = detector_shape
         self.gi = gi
         self.skip_2d = skip_2d
         self.stitched_1d = None
@@ -361,20 +362,25 @@ def test_integrated_2d_nxdata(written_nxs):
     assert g["chi"].attrs.get("units") in ("deg", "rad")
 
 
-def test_gui_integrated_stacks_use_portable_gzip_never_lzf(written_nxs):
-    # Converged policy: the GUI writer compresses with portable gzip+shuffle
-    # (was uncompressed None) and NEVER emits lzf (h5py-only filter, ARM64-macOS
-    # bus error).  gzip is in every HDF5 build and stock-h5py readable, so the
-    # frozen .nxs stays self-contained for notebooks/other tools.
+def test_gui_integrated_stacks_use_configured_filter_never_lzf(written_nxs):
+    # The GUI writer compresses its stacks with the resolved default -- lz4+shuffle
+    # (hdf5plugin filter 32004) when available, else portable gzip+shuffle -- and
+    # NEVER emits raw lzf (h5py-only filter, ARM64-macOS bus error).
     import h5py
+    from xdart.modules.ewald.nexus_writer import INTEGRATED_STACK_COMPRESSION
 
     with h5py.File(written_nxs, "r") as f:
         for path in ("entry/integrated_1d/intensity",
                      "entry/integrated_1d/sigma",
                      "entry/integrated_2d/intensity"):
             ds = f[path]
-            assert ds.compression == "gzip", path
+            filters = dict(ds._filters)
+            assert "lzf" not in filters, (path, filters)     # never raw lzf
             assert ds.shuffle is True, path
+            if INTEGRATED_STACK_COMPRESSION == "lz4":
+                assert "32004" in filters, (path, filters)   # hdf5plugin LZ4
+            else:
+                assert ds.compression == "gzip", (path, ds.compression)
 
 
 def test_gi_nonuniform_stacked_2d_writer_stays_strict(tmp_path):
@@ -1238,6 +1244,75 @@ def test_instrument_mask_rewrites_when_live_mask_changes(tmp_path):
 
     with h5py.File(path, "r") as f:
         np.testing.assert_array_equal(f["entry/instrument/detector/mask"][()], [7, 8, 9])
+
+
+def test_instrument_detector_shape_rewrites_when_live_shape_changes(tmp_path):
+    """Regression (review P2): detector_shape is part of the instrument
+    fingerprint, so changing ONLY the shape on a later append re-writes the
+    instrument group instead of leaving a stale value on disk."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    import h5py
+
+    path = tmp_path / "dshape_dirty.nxs"
+    scan = _DuckSphere([_DuckArch(idx=0)], detector_shape=(100, 100))
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    scan.detector_shape = (200, 250)            # ONLY the shape changes
+    scan.frames.append(_DuckArch(idx=1))
+    save_scan_to_nexus(scan, path, mode="a", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        assert (f["entry/instrument/detector/detector_shape"][()].tolist()
+                == [200, 250])
+
+
+def test_detector_shape_persisted_and_reloads(tmp_path):
+    """detector_shape (full-res raw shape) round-trips: written as an NXdetector
+    child and restored onto scan.detector_shape by the reader.  Lets a reloaded
+    thumbnail-only scan map the detector gap mask into thumbnail coordinates
+    without a resident full-res frame (codex P2 / cold-reload edge)."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald.scan import LiveScan
+    import h5py
+
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    scan = _DuckSphere(frames, global_mask=np.array([0, 7, 64], dtype=np.int64),
+                       detector_shape=(2167, 2070))
+    path = tmp_path / "dshape.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    # persisted as a plain NXdetector child (external readers ignore it)
+    with h5py.File(path, "r") as f:
+        assert (f["entry/instrument/detector/detector_shape"][()].tolist()
+                == [2167, 2070])
+
+    # restored onto a real LiveScan by the reader
+    rescan = LiveScan(data_file=str(path))
+    rescan.load_from_h5()
+    assert rescan.detector_shape == (2167, 2070)
+
+
+def test_no_detector_shape_writes_no_dataset(written_nxs):
+    """Additive / byte-compat: a scan without detector_shape writes NO such
+    dataset (so existing files + the byte-compat fixtures are unchanged)."""
+    import h5py
+    with h5py.File(str(written_nxs), "r") as f:
+        assert "detector_shape" not in f["entry/instrument/detector"]
+
+
+def test_integrated_compression_env_override(monkeypatch):
+    """XDART_INTEGRATED_COMPRESSION lets the user A/B the integrated-stack
+    compression from the shell before launching xdart (default lz4 when hdf5plugin
+    is available, else gzip; read once at import)."""
+    from xdart.modules.ewald import nexus_writer as nw
+    monkeypatch.delenv("XDART_INTEGRATED_COMPRESSION", raising=False)
+    assert nw._resolve_integrated_compression() in ("lz4", "gzip")  # unset -> default
+    for off in ("none", "None", "OFF", "0", "false", "no", "", "  none  "):
+        monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", off)
+        assert nw._resolve_integrated_compression() is None, off
+    monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "gzip")
+    assert nw._resolve_integrated_compression() == "gzip"
+    monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "blosc")     # unknown -> gzip
+    assert nw._resolve_integrated_compression() == "gzip"
 
 
 def test_instrument_groups(written_nxs):

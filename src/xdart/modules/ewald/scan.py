@@ -65,6 +65,7 @@ class LiveScan:
                  series_average=False,
                  single_img=False,
                  global_mask=None,
+                 detector_shape=None,
                  file_lock=None,
                  **_unused,
                  ):
@@ -160,6 +161,12 @@ class LiveScan:
         # deleted).  Drifted from disk under R1 replace-frames and
         # was never repopulated on v2 reload.
         self.global_mask = global_mask
+        # Full-resolution detector (raw image) shape (H, W) — the shape the flat
+        # ``global_mask`` indices index into.  Persisted to the .nxs so a reloaded
+        # thumbnail-only scan can map the detector gap mask into thumbnail
+        # coordinates without needing a resident full-res frame this session.
+        self.detector_shape = (
+            tuple(detector_shape) if detector_shape is not None else None)
 
     def reset(self):
         """Resets all held data objects to blank state."""
@@ -168,6 +175,7 @@ class LiveScan:
             self.frames = LiveFrameSeries(self.data_file, self.file_lock,
                                           static=self.static, gi=self.gi)
             self.global_mask = None
+            self.detector_shape = None
             self._clear_persisted_wavelength()
 
     def _clear_persisted_wavelength(self):
@@ -719,6 +727,13 @@ class LiveScan:
             _det = grp.get("entry/instrument/detector")
             if _det is not None and "mask" in _det:
                 self.global_mask = np.asarray(_det["mask"][()], dtype=np.int64)
+            # Full-res detector shape (H, W) the flat mask indices index into —
+            # lets the display map the gap mask onto a reloaded thumbnail without
+            # a resident full-res frame.  Absent in old files (falls back).
+            if _det is not None and "detector_shape" in _det:
+                _ds = np.asarray(_det["detector_shape"][()]).ravel()
+                if _ds.size >= 2:
+                    self.detector_shape = (int(_ds[0]), int(_ds[1]))
         except Exception:
             logger.debug("Failed to read global_mask from %s",
                          self.data_file, exc_info=True)

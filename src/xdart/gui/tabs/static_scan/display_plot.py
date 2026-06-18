@@ -24,6 +24,7 @@ from .display_constants import (
 )
 from .display_logic import (
     plan_overlay,
+    overlay_read_failure_action,
     OverlayAction,
     pretty_unit,
     nanmean_slice,
@@ -79,6 +80,20 @@ def update_plot_accumulator(
     )
 
     if overlay_action is OverlayAction.REBUILD:
+        # Monotonicity invariant: a REBUILD RE-EXPRESSES the accumulated frames in
+        # a new unit -- it must reproduce the EXACT prior id set, never change it.
+        # A REBUILD whose incoming ids differ from the accumulator is a CORRUPT
+        # re-read: a spurious unit_changed sent us down the re-read fallback, and
+        # the cap-store had evicted older frames, so the non-blocking re-read came
+        # back partial/holey and prefix-MISLABELED (e.g. resident frames 37..100
+        # shown as scan_1..scan_64).  Reject it and KEEP the prior accumulator
+        # rather than shrink+relabel the visible stack (the intermittent
+        # collapse-and-restack regression).  Legitimate resets (Clear / new scan /
+        # mode switch) go through clear_overlay -> prev ids empty -> plan_overlay
+        # returns REPLACE (not REBUILD), so they never reach this guard.  A genuine
+        # same-unit-count Q<->2theta re-express reproduces the id set and passes.
+        if set(int(i) for i in new_ids) != set(ids):
+            return list(prev_plot_data), list(names), list(ids)
         return [new_x, new_y], list(new_names), [int(i) for i in new_ids]
 
     if overlay_action is not OverlayAction.APPEND:
@@ -436,7 +451,20 @@ class DisplayPlotMixin:
         # Get 1D data for all frames
         ydata, xdata = self.collect_plot_rows()
         if xdata is None or ydata is None:
-            self.clear_plot_view()
+            # Append-only invariant: a failed/partial INCREMENTAL read must never
+            # wipe an existing Overlay/Waterfall accumulator -- the missing frames
+            # are in flight (being written, or evicted past the store cap and
+            # awaiting async hydration) and arrive on a later tick.  Clearing here
+            # was the regression where a slow GUI (e.g. Share Axis) let the
+            # reduction race ahead, the non-blocking read of the newest frames
+            # returned None, and the whole stack collapsed to ~0 and re-stacked as
+            # it caught up.  PRESERVE keeps the accumulator and redraws it.
+            if overlay_read_failure_action(
+                method, bool(getattr(self, "overlaid_idxs", None))
+            ) == "preserve":
+                self.draw_plot_state()
+            else:
+                self.clear_plot_view()
             return
 
         row_ids = list(getattr(self, "_plot_row_ids", self.idxs_1d))
@@ -836,30 +864,39 @@ class DisplayPlotMixin:
         * anything else → ``scan_info[wf_yaxis]`` directly.
 
         For everything but ``'Frame #'`` we lift the values from each frame's
-        metadata via :meth:`_frame_scan_info` (store-first; Phase 3c) for every
-        idx in ``self.idxs``, then slice with the same wf_start/wf_step the data
-        uses.
+        metadata via :meth:`_frame_scan_info` (store-first; Phase 3c) for the
+        ACTUAL accumulated row ids, then slice with the same wf_start/wf_step the
+        data uses.  The waterfall image rows come from the accumulator
+        (``overlaid_idxs``), which after a preserved partial read or
+        non-contiguous accumulation need NOT equal ``self.idxs`` -- so building the
+        y-axis from ``self.idxs`` could drift the metadata values off the rendered
+        rows.  Use ``overlaid_idxs`` (it is maintained row-for-row with
+        ``plot_data``), falling back to ``_plot_row_ids`` / ``self.idxs``.
         """
         if self.wf_yaxis == 'Frame #':
             return np.asarray(np.arange(n_rows) + self.wf_start + 1,
                               dtype=float)
+        row_ids = (getattr(self, 'overlaid_idxs', None)
+                   or getattr(self, '_plot_row_ids', None)
+                   or self.idxs)
+        row_ids = [int(i) for i in row_ids]
         try:
             if self.wf_yaxis == 'Time (s)':
                 s_ydata = np.asarray(
                     [self._frame_scan_info(idx)['epoch']
-                     for idx in self.idxs]
+                     for idx in row_ids]
                 )
                 s_ydata -= s_ydata.min()
             elif self.wf_yaxis == 'Time (minutes)':
                 s_ydata = np.asarray(
                     [self._frame_scan_info(idx)['epoch']
-                     for idx in self.idxs]
+                     for idx in row_ids]
                 ) / 60.
                 s_ydata -= s_ydata.min()
             else:
                 s_ydata = np.asarray(
                     [self._frame_scan_info(idx)[self.wf_yaxis]
-                     for idx in self.idxs]
+                     for idx in row_ids]
                 )
             return s_ydata[self.wf_start:self.wf_stop:self.wf_step]
         except KeyError as e:
@@ -870,6 +907,22 @@ class DisplayPlotMixin:
     def update_wf(self):
         """Updates data in 1D plot Frame
         """
+        # Throttle the expensive full-image waterfall REPAINT during a live scan.
+        # The waterfall image grows O(N x M), and setImage re-copies + re-levels
+        # (nanpercentile) + re-uploads the WHOLE stack every call -- the dominant
+        # per-flush GUI-thread cost on a long scan (confirmed: gzip's slower frame
+        # arrival makes the per-flush waterfall smaller -> smoother).  The
+        # accumulator (plot_data) still grows every flush; we just repaint the
+        # image at most ~2/sec while processing, so interaction stays responsive.
+        # Idle (end-of-scan / user actions) always repaints so the final state is
+        # complete and clicks feel instant.
+        if getattr(self, "_processing_active", False):
+            import time as _t
+            now = _t.perf_counter()
+            if now - getattr(self, "_wf_last_draw_t", 0.0) < 0.5:
+                return
+            self._wf_last_draw_t = now
+
         self.setup_wf_layout()
 
         xdata_, data_ = self.plot_data
@@ -979,6 +1032,19 @@ class DisplayPlotMixin:
         self.plot.clear()
         # Re-add legend (plot.clear() removes it)
         self.legend = self.plot.addLegend()
+        # In a viewer mode the plotted curves ARE the file-list selection, so
+        # Clear must reset to the pristine viewer state: reset the title (the
+        # displayframe owns labelCurrent) and ask the host to drop the list
+        # selection via sigCleared -- otherwise the cleared plot disagrees with a
+        # stale selection + title that still names the old frames.  In integration
+        # mode Clear only drops the accumulated overlay and KEEPS the selection so
+        # it can be rebuilt, so this is scoped to viewer modes.
+        if getattr(self, "viewer_mode", None) is not None:
+            if hasattr(self, "_viewer_default_title"):
+                self.ui.labelCurrent.setText(self._viewer_default_title())
+            sig = getattr(self, "sigCleared", None)
+            if sig is not None:
+                sig.emit()
 
     def update_legend(self):
         if not self.ui.showLegend.isChecked():

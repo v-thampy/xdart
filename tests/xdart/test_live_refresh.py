@@ -555,6 +555,7 @@ def test_flush_pending_update_owns_single_repaint():
     calls = []
     widget = SimpleNamespace(
         _pending_update_idx=5,
+        _drain_pending_frames=lambda: calls.append(("drain", {})),
         h5viewer=SimpleNamespace(
             auto_last=True,
             frame_ids=[],
@@ -571,6 +572,9 @@ def test_flush_pending_update_owns_single_repaint():
     )
 
     staticWidget._flush_pending_update(widget)
+
+    assert calls[0] == ("drain", {})       # heavy build/upsert batched first
+    calls.pop(0)
 
     assert widget._pending_update_idx is None
     assert calls == [
@@ -589,6 +593,7 @@ def test_flush_pending_update_feeds_overlay_all_pending_frames():
 
     widget = SimpleNamespace(
         _pending_update_idx=5,
+        _drain_pending_frames=lambda: None,
         scan=SimpleNamespace(scan_lock=RLock(), frames=SimpleNamespace(index=[1, 2, 3, 4, 5])),
         h5viewer=SimpleNamespace(
             auto_last=True,
@@ -610,6 +615,207 @@ def test_flush_pending_update_feeds_overlay_all_pending_frames():
         ("latest_frame", {"emit_update": False}),
         ("data_changed", True, ("1", "2", "3", "4", "5")),
     ]
+
+
+def test_update_data_stashes_frame_without_building_per_frame():
+    """#3 (whole-scan freeze fix): per-frame update_data only STASHES the frame
+    (cheap pop) + advances the cursor + triggers the timer.  It must NOT build or
+    upsert the publication on the GUI thread -- that heavy work, run per frame,
+    flooded the event loop (esp. with fast lz4 writes) and froze the GUI for the
+    whole scan.  The build/upsert is batched in _drain_pending_frames at the flush."""
+    upserts = []
+    fake_frame = object()
+    host = SimpleNamespace(
+        _run_saw_frame=False,
+        _pending_frames={},
+        _pending_update_idx=None,
+        scan=SimpleNamespace(scan_lock=RLock(),
+                             frames=SimpleNamespace(index=[])),
+        wrangler=SimpleNamespace(
+            thread=SimpleNamespace(_published_frames={7: fake_frame})),
+        h5viewer=SimpleNamespace(latest_idx=None),
+        publication_store=SimpleNamespace(
+            upsert=lambda p: upserts.append(p), generation=0),
+        _update_timer=SimpleNamespace(trigger=lambda: None),
+    )
+
+    staticWidget.update_data(host, 7)
+
+    assert host._pending_frames == {7: fake_frame}        # stashed for the flush
+    assert upserts == []                                  # NOT built per frame
+    assert host.wrangler.thread._published_frames == {}   # drained the wrangler slot
+    assert host.h5viewer.latest_idx == 7                  # cursor advanced
+    assert host._pending_update_idx == 7
+    assert 7 in host.scan.frames.index                    # index appended (cheap)
+
+
+def test_drain_pending_frames_builds_store_and_scan_data():
+    """#3: _drain_pending_frames builds + upserts a publication for EVERY stashed
+    frame (the batched heavy work) and rebuilds scan_data as one DataFrame from the
+    accumulated rows -- not the O(N^2) per-frame `sd.loc[idx] = ser` enlargement."""
+    import pandas as pd
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+    from xdart.modules.frame_publication import PublicationStore
+
+    def _ir1d(v, nq=6):
+        return IntegrationResult1D(
+            radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
+            intensity=np.full(nq, float(v), dtype=np.float32),
+            sigma=np.ones(nq, dtype=np.float32), unit="q_A^-1")
+
+    def _ir2d(v, nq=6, nchi=4):
+        return IntegrationResult2D(
+            radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
+            azimuthal=np.linspace(-180, 180, nchi, endpoint=False).astype(np.float32),
+            intensity=np.full((nq, nchi), float(v), dtype=np.float32),
+            sigma=None, unit="q_A^-1")
+
+    frames = {
+        idx: SimpleNamespace(
+            idx=idx, int_1d=_ir1d(idx + 1), int_2d=_ir2d(idx + 1),
+            map_raw=np.full((3, 4), float(idx)), mask=None, gi=False,
+            gi_2d={}, thumbnail=None, bg_raw=0,
+            scan_info={"temp": float(idx) * 10.0},
+            source_file=f"f_{idx}.tif", source_frame_idx=idx)
+        for idx in (0, 1, 2)
+    }
+    store = PublicationStore(max_heavy_items=None)
+    host = SimpleNamespace(
+        _pending_frames=dict(frames),
+        _scan_info_rows={},
+        wrangler=SimpleNamespace(thread=SimpleNamespace(mask=None)),
+        scan=SimpleNamespace(scan_lock=RLock(), gi=False, skip_2d=False,
+                             global_mask=None, bai_1d_args={}, bai_2d_args={},
+                             scan_data=pd.DataFrame()),
+        publication_store=store,
+    )
+
+    staticWidget._drain_pending_frames(host)
+
+    assert host._pending_frames == {}                     # drained
+    assert len(store) == 3                                # all built + upserted
+    assert list(host.scan.scan_data.index) == [0, 1, 2]
+    assert list(host.scan.scan_data["temp"]) == [0.0, 10.0, 20.0]
+
+
+def test_update_plot_preserves_overlay_accumulator_on_failed_read():
+    """Append-only invariant (regression guard): when the incremental read returns
+    no data and an Overlay/Waterfall accumulator already exists, update_plot must
+    PRESERVE it (redraw) and NEVER clear_plot_view -- clearing wiped the whole
+    stack, which is what made a slow live scan (e.g. Share Axis) collapse the
+    waterfall to ~0 and repopulate + re-stack frames as it caught up."""
+    calls = []
+    host = SimpleNamespace(
+        scan=SimpleNamespace(name="scanA", data_file="scanA"),
+        frame_ids=[0, 1, 2, 3],
+        overlaid_idxs=[0, 1, 2],
+        idxs_1d=[3],                       # a new 'missing' frame -> the
+                                           # already-covered early-return is skipped
+        _overlay_scan_key="scanA",         # same scan -> no boundary reset
+        _last_plot_unit=0,
+        _payload_x_axis_label="stale",
+        _payload_y_axis_label="stale",
+        plot_data=[np.arange(3), np.ones((3, 3))],
+        frame_names=["scanA_0", "scanA_1", "scanA_2"],
+        ui=SimpleNamespace(
+            plotMethod=_FakeCombo("Overlay"),
+            plotUnit=_FakeIndexedCombo("Q", index=0),
+        ),
+        collect_plot_rows=lambda: (None, None),    # failed/empty incremental read
+        draw_plot_state=lambda: calls.append("draw"),
+        clear_plot_view=lambda: calls.append("clear"),
+    )
+    host.update_plot = MethodType(DisplayPlotMixin.update_plot, host)
+
+    host.update_plot()
+
+    assert "clear" not in calls                # never wipe an existing accumulator
+    assert "draw" in calls                     # redraw what we already have
+    assert host.overlaid_idxs == [0, 1, 2]     # untouched -> monotonic
+
+
+def test_update_plot_clears_when_no_overlay_accumulator_and_read_fails():
+    """The genuine empty case (fresh reload, nothing accumulated yet) still
+    clears -- the preserve guard is scoped to a non-empty accumulator."""
+    calls = []
+    host = SimpleNamespace(
+        scan=SimpleNamespace(name="scanA", data_file="scanA"),
+        frame_ids=[0, 1, 2, 3],
+        overlaid_idxs=[],                  # nothing accumulated yet
+        idxs_1d=[0, 1, 2, 3],
+        _overlay_scan_key="scanA",
+        _last_plot_unit=0,
+        _payload_x_axis_label=None,
+        _payload_y_axis_label=None,
+        plot_data=[np.zeros(0), np.zeros(0)],
+        frame_names=[],
+        ui=SimpleNamespace(
+            plotMethod=_FakeCombo("Overlay"),
+            plotUnit=_FakeIndexedCombo("Q", index=0),
+        ),
+        collect_plot_rows=lambda: (None, None),
+        draw_plot_state=lambda: calls.append("draw"),
+        clear_plot_view=lambda: calls.append("clear"),
+    )
+    host.update_plot = MethodType(DisplayPlotMixin.update_plot, host)
+
+    host.update_plot()
+
+    assert "clear" in calls
+    assert "draw" not in calls
+
+
+def test_accumulator_rejects_rebuild_that_shrinks_id_set():
+    """The intermittent collapse-and-restack regression: a spurious unit_changed
+    sent a live Overlay/Waterfall down the REBUILD re-read fallback, and a
+    cap-store eviction made the non-blocking re-read PARTIAL, so the REBUILD branch
+    truncated + prefix-mislabeled the accumulator (100 -> 64; resident tail shown
+    as scan_0..scan_63), then APPEND re-grew it (the re-stack).  The monotonicity
+    guard rejects any REBUILD whose id SET differs from the accumulator and keeps
+    the prior stack."""
+    x = np.linspace(0, 5, 10)
+    prev_ids = list(range(100))
+    prev_rows = np.ones((100, 10))
+    prev_names = [f"scan_{i}" for i in prev_ids]
+
+    # Cap-store evicted the head: the re-read returned only 64 resident rows, which
+    # the fallback prefix-labels scan_0..scan_63 (the mislabel) -> a shrunk id set.
+    kept_ids = list(range(64))
+    new_rows = np.full((64, 10), 2.0)
+    new_names = [f"scan_{i}" for i in kept_ids]
+
+    pd, names, ids = update_plot_accumulator(
+        [x, prev_rows], prev_names, prev_ids,
+        x, new_rows, new_names, kept_ids,
+        method="Waterfall", unit_changed=True,
+    )
+
+    assert ids == prev_ids                                 # id set preserved
+    assert names == prev_names                             # labels preserved
+    assert np.asarray(pd[1]).shape[0] == 100               # full stack kept
+    np.testing.assert_array_equal(np.asarray(pd[1]), prev_rows)
+
+
+def test_accumulator_rebuild_reexpresses_when_id_set_matches():
+    """A LEGITIMATE unit re-express (every frame resident) reproduces the exact id
+    set, so the guard passes and the REBUILD swaps in the new-unit x for all rows
+    (this is the instant Q<->2theta re-express that must still work)."""
+    old_x = np.linspace(0, 5, 10)
+    new_x = np.linspace(1, 6, 10)                          # re-expressed axis
+    ids = list(range(100))
+    prev_rows = np.ones((100, 10))
+    new_rows = np.full((100, 10), 3.0)
+    names = [f"scan_{i}" for i in ids]
+
+    pd, out_names, out_ids = update_plot_accumulator(
+        [old_x, prev_rows], names, ids,
+        new_x, new_rows, names, ids,
+        method="Waterfall", unit_changed=True,
+    )
+
+    assert out_ids == ids
+    np.testing.assert_array_equal(np.asarray(pd[0]), new_x)   # x re-expressed
+    np.testing.assert_array_equal(np.asarray(pd[1]), new_rows)
 
 
 def _display_host():
@@ -671,6 +877,92 @@ def test_clear_display_state_resets_visible_and_cached_state():
     assert image_widget.raw_image.size == 0
     assert binned_widget.raw_image.size == 0
     assert wf_widget.raw_image.size == 0
+
+
+def _clear_1d_host(viewer_mode):
+    emitted = []
+    label = _FakeLabel()
+    host = SimpleNamespace(
+        viewer_mode=viewer_mode,
+        frame_names=['f0', 'f1'],
+        frame_ids=['0', '1'],
+        plot_data=[np.arange(3), np.ones((2, 3))],
+        plot_data_range=[[0, 3], [0, 1]],
+        overlaid_idxs=[0, 1],
+        legend=_FakeLegend(),
+        ui=SimpleNamespace(labelCurrent=label),
+        plot=SimpleNamespace(clear=lambda: None, addLegend=lambda: _FakeLegend()),
+        setup_1d_layout=lambda: None,
+        sigCleared=SimpleNamespace(emit=lambda: emitted.append(True)),
+    )
+    host.clear_overlay = MethodType(displayFrameWidget.clear_overlay, host)
+    host._viewer_default_title = MethodType(
+        displayFrameWidget._viewer_default_title, host)
+    host.clear_1D = MethodType(DisplayPlotMixin.clear_1D, host)
+    return host, label, emitted
+
+
+def test_clear_1d_in_viewer_mode_resets_title_and_emits_cleared():
+    """Viewer-mode Clear resets to the pristine viewer state: title back to the
+    mode default ('XYE Viewer') + sigCleared emitted so the host drops the
+    file-list selection -- otherwise the cleared plot disagrees with a stale
+    selection + title that still names the old frames."""
+    host, label, emitted = _clear_1d_host('xye')
+
+    host.clear_1D()
+
+    assert label.text == 'XYE Viewer'
+    assert emitted == [True]
+    assert host.overlaid_idxs == []        # accumulator still cleared
+
+
+def test_clear_1d_in_integration_mode_keeps_title_and_emits_nothing():
+    """Integration-mode Clear (viewer_mode None) drops the overlay but must NOT
+    emit sigCleared or touch the title -- the selection is kept so the overlay can
+    be rebuilt."""
+    host, label, emitted = _clear_1d_host(None)
+    label.setText('eiger_scan_42')
+
+    host.clear_1D()
+
+    assert emitted == []                   # no viewer-clear signal
+    assert label.text == 'eiger_scan_42'   # title untouched
+    assert host.overlaid_idxs == []        # overlay still cleared
+
+
+def test_share_axis_defers_render_only_while_processing(monkeypatch):
+    """Share Axis defers its synchronous render to the event loop WHILE a scan is
+    processing (so the click doesn't freeze the GUI as the writer floods per-frame
+    display events), but runs it inline when idle (so the normal path + headless
+    tests, which have no running event loop, are unchanged)."""
+    from xdart.gui.tabs.static_scan import display_frame_widget as dfw
+    scheduled = []
+    monkeypatch.setattr(dfw.Qt.QtCore.QTimer, "singleShot",
+                        lambda ms, cb: scheduled.append(cb))
+    calls = []
+    host = SimpleNamespace(
+        _processing_active=False,
+        update=lambda: calls.append("update"),
+        _on_share_axis_toggled=lambda c: calls.append(("toggled", c)),
+    )
+    host._apply_share_axis_change = MethodType(
+        displayFrameWidget._apply_share_axis_change, host)
+    host._on_share_axis_changed = MethodType(
+        displayFrameWidget._on_share_axis_changed, host)
+
+    # Idle -> synchronous render (no deferral).
+    host._on_share_axis_changed(True)
+    assert calls == ["update", ("toggled", True)]
+    assert scheduled == []
+
+    # Processing -> deferred: nothing runs until the event loop fires the callback.
+    calls.clear()
+    host._processing_active = True
+    host._on_share_axis_changed(False)
+    assert calls == []
+    assert len(scheduled) == 1
+    scheduled[0]()                      # simulate the event-loop pass
+    assert calls == ["update", ("toggled", False)]
 
 
 def _persist_image_host(processing, persist=True, data=None):
@@ -772,6 +1064,37 @@ def test_draw_delegate_cake_persists_during_run():
     # Revert switch off -> blanks even during a run.
     host.PERSIST_2D_DURING_PROCESSING = False
     assert host._draw_delegate(PanelRole.CAKE_2D, Mode.INT_2D) is host.clear_binned_view
+
+
+def test_draw_delegate_raw_uses_payload_not_legacy_update_image():
+    # Item-2 flip: RAW_2D no longer falls back to legacy update_image -- it
+    # renders solely from the raw_image payload, mirroring CAKE_2D (None during
+    # a run = keep-last; clear_image_view idle).  Image/NeXus viewer modes still
+    # clear (no integration raw).
+    from xdart.gui.tabs.static_scan.display_logic import Mode, PanelRole
+
+    host = SimpleNamespace(
+        PERSIST_2D_DURING_PROCESSING=True,
+        _processing_active=False,
+        clear_image_view=lambda: None,
+        update_image=lambda: None,
+    )
+    host._draw_delegate = MethodType(displayFrameWidget._draw_delegate, host)
+
+    # Idle Int -> blanks (NOT the legacy update_image).
+    d = host._draw_delegate(PanelRole.RAW_2D, Mode.INT_2D)
+    assert d is host.clear_image_view
+    assert d is not host.update_image
+    # Running -> keep last (None delegate -> render skips this panel).
+    host._processing_active = True
+    assert host._draw_delegate(PanelRole.RAW_2D, Mode.INT_2D) is None
+    # Revert switch off -> blanks even during a run.
+    host.PERSIST_2D_DURING_PROCESSING = False
+    assert (host._draw_delegate(PanelRole.RAW_2D, Mode.INT_2D)
+            is host.clear_image_view)
+    # Image Viewer still clears (no integration raw).
+    assert (host._draw_delegate(PanelRole.RAW_2D, Mode.IMAGE_VIEWER)
+            is host.clear_image_view)
 
 
 def test_set_processing_active_sets_flag():
@@ -1058,9 +1381,10 @@ def test_live_new_scan_invalidates_publication_store():
     assert scan.scan_data.empty
 
 
-def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask):
+def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask,
+                                      wrangler_detector_shape=None):
     """A minimal staticWidget host for driving ``new_scan`` and observing how
-    ``scan.global_mask`` is synced from the wrangler thread's current mask."""
+    ``scan.global_mask`` / ``scan.detector_shape`` sync from the wrangler thread."""
     import pandas as pd
     from xdart.modules.frame_publication import PublicationStore
 
@@ -1083,7 +1407,8 @@ def _new_scan_host_with_wrangler_mask(wrangler_mask, initial_global_mask):
             set_file=lambda fname, **k: None,
             update_scans=lambda: None, update=lambda: None,
         ),
-        wrangler=SimpleNamespace(thread=SimpleNamespace(mask=wrangler_mask)),
+        wrangler=SimpleNamespace(thread=SimpleNamespace(
+            mask=wrangler_mask, detector_shape=wrangler_detector_shape)),
         integratorTree=SimpleNamespace(
             get_args=lambda name: None, set_image_units=lambda: None,
         ),
@@ -1123,6 +1448,18 @@ def test_new_scan_propagates_wrangler_mask_when_present():
     )
     staticWidget.new_scan(host, "new", "/tmp/new.nxs", False, "th", False, False)
     np.testing.assert_array_equal(scan.global_mask, mask_idx)
+
+
+def test_new_scan_propagates_wrangler_detector_shape():
+    """The full-res detector shape syncs from the wrangler thread onto the scan
+    (alongside global_mask) so the display can map the gap mask without a
+    resident full-res frame."""
+    host, scan = _new_scan_host_with_wrangler_mask(
+        wrangler_mask=np.array([5, 6, 7], dtype=int), initial_global_mask=None,
+        wrangler_detector_shape=(2167, 2070),
+    )
+    staticWidget.new_scan(host, "new", "/tmp/new.nxs", False, "th", False, False)
+    assert scan.detector_shape == (2167, 2070)
 
 
 def test_save_path_sync_updates_scans_browser(tmp_path):
@@ -1624,12 +1961,12 @@ def _update_smoke_host():
 def test_update_render_smoke_int_collapse_and_mode_switches():
     host, calls, dl = _update_smoke_host()
 
-    # Int-2D: raw + plot via the legacy delegates; the CAKE_2D panel is
-    # payload-only now (no update_binned) and this host has no publication_store,
-    # so the cake payload is None and CAKE_2D blanks.
+    # Int-2D: the 1D plot draws via the legacy delegate; RAW_2D and CAKE_2D are
+    # both payload-only now (item-2 flip), and this host has no publication_store,
+    # so their payloads are None and both 2D panels blank.
     host.update()
-    assert "draw_plot" in calls and "draw_image" in calls
-    assert "clear_binned" in calls
+    assert "draw_plot" in calls
+    assert "clear_image" in calls and "clear_binned" in calls
     assert "label_2d" in calls
 
     # Int-1D (skip_2d): 1D-only — plot drawn, the two 2D panels cleared.
@@ -1699,20 +2036,21 @@ def test_update_render_smoke_int_collapse_and_mode_switches():
     host.viewer_mode = None
     host._bump_display_generation()
     host.update()
-    assert {"draw_plot", "draw_image"} <= set(calls)   # raw + plot legacy
-    assert "clear_binned" in calls                     # cake payload-only, no pub
+    assert "draw_plot" in calls                        # 1D plot legacy delegate
+    # RAW_2D + CAKE_2D are payload-only; no publication_store -> both 2D blank.
+    assert "clear_image" in calls and "clear_binned" in calls
 
 
 def test_update_render_smoke_gi_scan_propagates_and_dispatches():
     # A GI scan still renders through the same path; gi flag propagates into
-    # the state and the raw/plot dispatch is unchanged.  CAKE_2D is payload-only
-    # (no publication_store on this host -> the cake blanks).
+    # the state.  RAW_2D + CAKE_2D are payload-only (item-2 flip); no
+    # publication_store on this host -> both 2D panels blank; the 1D plot draws.
     host, calls, dl = _update_smoke_host()
     host.scan.gi = True
     host.update()
     assert host._live_display_state().gi is True
-    assert {"draw_plot", "draw_image"} <= set(calls)
-    assert "clear_binned" in calls
+    assert "draw_plot" in calls
+    assert "clear_image" in calls and "clear_binned" in calls
 
 
 def test_update_render_smoke_stale_generation_is_dropped():
@@ -4144,6 +4482,12 @@ def test_map_raw_reports_thumbnail_source():
 
 
 def test_thumbnail_image_update_skips_full_detector_flat_mask():
+    # The thumbnail path must NEVER apply full-resolution flat detector indices
+    # directly to the smaller thumbnail (they point at unrelated pixels).  When
+    # the full-res shape isn't known the gap mask cannot be mapped into thumbnail
+    # coordinates, so it is skipped — leaving the preview untouched rather than
+    # corrupting it.  (The mapped, masked case is covered in test_aggregation_
+    # wiring::test_nan_thumbnail_gaps_masks_downsampled_gap_rows.)
     calls = []
     host = SimpleNamespace(
         overall=False,
@@ -4153,14 +4497,42 @@ def test_thumbnail_image_update_skips_full_detector_flat_mask():
         data_2d={1: {"mask": np.array([0], dtype=int)}},
         scan=SimpleNamespace(global_mask=np.array([1], dtype=int)),
         bkg_map_raw=0,
+        # no _raw_full_shape -> the gap mask can't be mapped -> skipped
         get_frames_map_raw=lambda **kwargs: (np.ones((2, 2)), "thumbnail"),
+        update_image_view=lambda: calls.append("updated"),
+    )
+    host._nan_thumbnail_gaps = MethodType(
+        displayFrameWidget._nan_thumbnail_gaps, host)
+
+    displayFrameWidget.update_image(host)
+
+    assert calls == ["updated"]
+    assert np.isfinite(host.image_data[0]).all()
+
+
+def test_full_res_raw_masks_in_range_indices_despite_out_of_range():
+    # Regression (review P3): the legacy full-res raw branch bounds each flat
+    # index (combine_flat_masks size=data.size) instead of the old all-or-nothing
+    # max()<size guard -- so an out-of-range index can't suppress masking the
+    # in-range gaps (identical to the payload path).
+    calls = []
+    host = SimpleNamespace(
+        overall=False,
+        frame_ids=[1],
+        idxs_2d=[1],
+        data_lock=RLock(),
+        data_2d={1: {"mask": np.array([0], dtype=int)}},        # in-range
+        scan=SimpleNamespace(global_mask=np.array([3, 999], dtype=int)),  # 3 in, 999 OOB
+        bkg_map_raw=0,
+        get_frames_map_raw=lambda **kwargs: (np.ones((2, 2)), "raw"),
         update_image_view=lambda: calls.append("updated"),
     )
 
     displayFrameWidget.update_image(host)
 
     assert calls == ["updated"]
-    assert np.isfinite(host.image_data[0]).all()
+    # flat 0 + 3 are in-range -> 2 NaN; 999 dropped (not a crash, not skip-all).
+    assert np.isnan(host.image_data[0]).sum() == 2
 
 
 class _AttrDict(dict):
