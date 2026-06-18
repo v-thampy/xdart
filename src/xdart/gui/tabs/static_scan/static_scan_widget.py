@@ -737,15 +737,27 @@ class staticWidget(QWidget):
                     # the NaN-baked thumbnail.  Both are flat indices into the same
                     # detector image; _apply_detector_mask / update_image bound by
                     # data.size so any out-of-range index is ignored safely.
+                    # Perf: the gap mask is identical every frame, so sort it ONCE
+                    # (cached) and fold each frame's small own-mask in via setdiff,
+                    # instead of np.union1d re-sorting the whole large gap mask on
+                    # EVERY frame (an O(M log M) per-frame GUI-thread tax on an
+                    # Eiger).  Consumers use frame.mask as flat-index membership, so
+                    # the result need not be globally sorted.
                     try:
                         import numpy as _np
-                        _gm = _np.asarray(global_mask).ravel()
+                        g = getattr(self, "_live_gap_mask_sorted", None)
+                        if (g is None or getattr(self, "_live_gap_mask_src", None)
+                                is not global_mask):
+                            g = _np.unique(_np.asarray(global_mask).ravel())
+                            self._live_gap_mask_sorted = g
+                            self._live_gap_mask_src = global_mask
                         _fm = getattr(frame, "mask", None)
                         if _fm is None or _np.size(_fm) == 0:
-                            frame.mask = _gm
+                            frame.mask = g
                         else:
-                            frame.mask = _np.union1d(
-                                _np.asarray(_fm).ravel(), _gm)
+                            extra = _np.setdiff1d(_np.asarray(_fm).ravel(), g)
+                            frame.mask = (g if extra.size == 0
+                                          else _np.concatenate([g, extra]))
                     except Exception:
                         logger.debug(
                             "merging detector gap mask into the live frame failed",

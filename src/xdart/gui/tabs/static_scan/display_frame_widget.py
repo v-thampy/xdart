@@ -554,12 +554,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.cmap.currentIndexChanged.connect(self.update_views)
         # shareAxis / showLegend / slice are checkable QPushButtons now —
         # use ``toggled`` (bool) rather than the QCheckBox-only stateChanged.
-        self.ui.shareAxis.toggled.connect(self.update)
-        # On *unchecking* Share Axis, release the x-link and rescale the 1D
-        # plot to its own data (update() relinks/unlinks but leaves the
-        # range frozen at the cake's).  Connected after update so the unlink
-        # has already happened.
-        self.ui.shareAxis.toggled.connect(self._on_share_axis_toggled)
+        # Share Axis runs a synchronous, geometry-heavy render + relink; during a
+        # live scan that momentarily freezes the GUI while the writer keeps
+        # emitting per-frame display events (the named stall).  _on_share_axis_changed
+        # DEFERS that work to the next event-loop pass ONLY while processing, so the
+        # click returns immediately; idle (incl. headless tests) stays synchronous.
+        self.ui.shareAxis.toggled.connect(self._on_share_axis_changed)
 
         # 2D image controls — the Q-χ / 2θ-χ toggle re-renders through the
         # payload path (cake_image owns the on-the-fly Q↔2θ conversion now), so
@@ -1995,6 +1995,27 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         active = self.ui.slice.isEnabled() and self.ui.slice.isChecked()
         self.ui.slice_center.setEnabled(active)
         self.ui.slice_width.setEnabled(active)
+
+    def _on_share_axis_changed(self, checked):
+        """Apply a Share Axis toggle: the full render + relink + the bottom-panel
+        rescale, in that order.
+
+        While a scan is PROCESSING the writer thread emits a per-frame display
+        signal, so running the synchronous render inline froze the GUI and let the
+        events queue into a burst (the 'Share Axis is slow + frames race ahead'
+        report).  Defer the work to the next event-loop pass during processing so
+        the click returns immediately; when idle (including headless tests, which
+        have no running event loop) run it synchronously so behavior is unchanged.
+        The render is idempotent, so deferring only changes WHEN it runs."""
+        if getattr(self, "_processing_active", False):
+            Qt.QtCore.QTimer.singleShot(
+                0, lambda c=bool(checked): self._apply_share_axis_change(c))
+        else:
+            self._apply_share_axis_change(checked)
+
+    def _apply_share_axis_change(self, checked):
+        self.update()
+        self._on_share_axis_toggled(checked)
 
     def _on_share_axis_toggled(self, checked):
         """Rescale the active bottom panel to its own data when Share Axis is off.

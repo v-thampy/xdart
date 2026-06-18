@@ -844,6 +844,41 @@ def test_clear_1d_in_integration_mode_keeps_title_and_emits_nothing():
     assert host.overlaid_idxs == []        # overlay still cleared
 
 
+def test_share_axis_defers_render_only_while_processing(monkeypatch):
+    """Share Axis defers its synchronous render to the event loop WHILE a scan is
+    processing (so the click doesn't freeze the GUI as the writer floods per-frame
+    display events), but runs it inline when idle (so the normal path + headless
+    tests, which have no running event loop, are unchanged)."""
+    from xdart.gui.tabs.static_scan import display_frame_widget as dfw
+    scheduled = []
+    monkeypatch.setattr(dfw.Qt.QtCore.QTimer, "singleShot",
+                        lambda ms, cb: scheduled.append(cb))
+    calls = []
+    host = SimpleNamespace(
+        _processing_active=False,
+        update=lambda: calls.append("update"),
+        _on_share_axis_toggled=lambda c: calls.append(("toggled", c)),
+    )
+    host._apply_share_axis_change = MethodType(
+        displayFrameWidget._apply_share_axis_change, host)
+    host._on_share_axis_changed = MethodType(
+        displayFrameWidget._on_share_axis_changed, host)
+
+    # Idle -> synchronous render (no deferral).
+    host._on_share_axis_changed(True)
+    assert calls == ["update", ("toggled", True)]
+    assert scheduled == []
+
+    # Processing -> deferred: nothing runs until the event loop fires the callback.
+    calls.clear()
+    host._processing_active = True
+    host._on_share_axis_changed(False)
+    assert calls == []
+    assert len(scheduled) == 1
+    scheduled[0]()                      # simulate the event-loop pass
+    assert calls == ["update", ("toggled", False)]
+
+
 def _persist_image_host(processing, persist=True, data=None):
     """Minimal host to exercise update_image's blank-vs-keep-last decision."""
     image_widget = _FakeImageWidget()
