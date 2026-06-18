@@ -1229,17 +1229,20 @@ def test_integration_payload_overlay_waterfall_return_none():
         assert _adapter(store, _int_widget()).integration_plot_payload(state) is None
 
 
-def test_plot_payload_defers_overlay_waterfall_to_legacy_after_flip():
-    # Step 5 FLIP: plot_payload returns a payload for Single (delegating to
-    # integration_plot_payload) but still returns None for Overlay/Waterfall so
-    # render_display falls back to the legacy update_plot accumulator.
+def test_plot_payload_routes_overlay_waterfall_through_accumulator_after_flip():
+    # Flip stage 3: plot_payload returns a payload for Single (via
+    # integration_plot_payload) AND for Overlay/Waterfall (via the payload-owned
+    # WaterfallHistory accumulator) -- the latter was previously None, deferring to
+    # the legacy update_plot.  The Overlay/Waterfall payload carries plot_history.
     frame = DuckFrame(idx=9)
     store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
     adapter = _adapter(store, _int_widget())
-    assert adapter.plot_payload(_int_state(store, ids=(9,), method="Single")) is not None
+    single = adapter.plot_payload(_int_state(store, ids=(9,), method="Single"))
+    assert single is not None and single.plot_history is None
     for method in ("Overlay", "Waterfall"):
-        assert adapter.plot_payload(
-            _int_state(store, ids=(9,), method=method)) is None
+        payload = adapter.plot_payload(_int_state(store, ids=(9,), method=method))
+        assert payload is not None
+        assert payload.plot_history is not None and payload.overlaid_ids == (9,)
 
 
 def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():

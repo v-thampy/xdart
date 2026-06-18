@@ -1217,7 +1217,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         self.plot_data = [ref_x, ydata]
         self.frame_names = names
-        self.overlaid_idxs = list(state.render_ids)
+        # Flip stage 3: an Overlay/Waterfall payload carries the FULL accumulator
+        # (overlaid_ids = every captured frame, which may exceed this render's
+        # render_ids after eviction), and the waterfall y-axis (_wf_y_axis) keys off
+        # self.overlaid_idxs -- so prefer it.  Single/Sum/Average payloads leave
+        # overlaid_ids empty, so those keep the per-render selection.
+        overlaid = getattr(payload_value, "overlaid_ids", None)
+        self.overlaid_idxs = list(overlaid) if overlaid else list(state.render_ids)
+        # Carry the immutable accumulator back onto the widget so the NEXT render
+        # appends onto it (the payload-owned successor to the legacy mutable triple).
+        # Only Overlay/Waterfall payloads supply a history; others leave it alone.
+        history = getattr(payload_value, "plot_history", None)
+        if history is not None:
+            self._waterfall_history = history
         axis = payload_value.axis_x
         self._payload_x_axis_label = (axis.label, axis.unit)
         # XYE labels its bottom axis from the file prefix; _current_plot_axis_label

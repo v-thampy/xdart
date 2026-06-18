@@ -332,26 +332,38 @@ class PlotPayload:
 
 @dataclass(frozen=True)
 class WaterfallHistory:
-    """Immutable, generation-stamped Overlay/Waterfall accumulator carried IN the
-    payload (``PlotPayload.plot_history``) -- the payload-owned successor to the
-    legacy mutable widget triple (``plot_data`` / ``frame_names`` / ``overlaid_idxs``).
+    """Immutable Overlay/Waterfall accumulator carried IN the payload
+    (``PlotPayload.plot_history``) -- the payload-owned successor to the legacy
+    mutable widget triple (``plot_data`` / ``frame_names`` / ``overlaid_idxs``).
 
     Carrying it in the payload (rather than rebuilding from the publication store
     each render) is the keystone of the flip: the store evicts heavy frames past a
     cap, so a per-render rebuild from the store would re-introduce the cap-truncation
     regression.  The accumulator instead retains every row it has captured.
 
+    ``reset_key`` is the accumulation IDENTITY (scan + 1D/2D source) -- the ONLY
+    reset trigger.  It is deliberately NOT the display generation: the display
+    generation bumps on every effective-selection change, and live auto-last GROWS
+    the selection every tick, so keying the reset on it would reset the accumulator
+    each tick and rebuild from only the resident (un-evicted) frames -- the exact
+    cap-truncation this design exists to prevent.  Scan/source changes change the
+    key (reset); selection growth and a Q<->2theta unit toggle do not (append /
+    relabel in place).
+
     All rows live on ONE shared sample grid (``x``); the adapter interpolates each
     incoming frame onto it before accumulating.  ``rows[k]`` is frame ``ids[k]`` /
     ``names[k]`` -- maintained row-for-row.  ``unit`` is the radial unit the grid is
     currently labelled in (a Q<->2theta toggle relabels ``x`` in place, since the
     intensities are unit-invariant)."""
-    generation: int
+    reset_key: "object"      # accumulation identity (scan, source); reset on change
     unit: str
     x: "np.ndarray"          # shared radial sample grid (1-D, in `unit`)
     rows: "np.ndarray"       # (n, len(x)) stacked intensities; row order == ids
     ids: tuple               # captured frame ids, in row order
     names: tuple             # captured frame names, in row order
+    label: str = ""          # x-axis label for `unit` (carried, not re-derived:
+    #                          the display unit doesn't always round-trip through
+    #                          x_axis_for_unit, e.g. the 2θ conversion's symbol)
 
     @property
     def count(self) -> int:
@@ -373,19 +385,27 @@ def _dedup_first(ids, names, rows):
     return ki, kn, kr
 
 
-def accumulate_waterfall(history, *, generation, unit, x, rows, ids, names):
-    """Pure, append-only, generation-keyed Overlay/Waterfall accumulator (the
+def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names, label=""):
+    """Pure, append-only Overlay/Waterfall accumulator keyed on ``reset_key`` (the
     payload-owned successor to ``update_plot_accumulator`` + the widget triple).
 
-    Append-only WITHIN a generation: a partial / out-of-order / re-delivered read
-    can only ADD frames not yet captured -- it never shrinks the stack or re-stacks
-    a frame (the collapse/restack class, structurally precluded).  A generation bump
-    (mode / effective-selection / scan change) is the ONLY reset.
+    Append-only WITHIN one ``reset_key``: a partial / out-of-order / re-delivered
+    read can only ADD frames not yet captured -- it never shrinks the stack or
+    re-stacks a frame (the collapse/restack class, structurally precluded).  A
+    ``reset_key`` change (a new scan, or a 1D<->2D-slice source change -- NOT a mere
+    selection change) is the ONLY reset.
 
-    A plotUnit Q<->2theta toggle does NOT bump the generation, so ``unit`` changes
-    while ``generation`` does not: the accumulated rows are unit-invariant, so we
+    Crucially the key is NOT the display generation: that bumps on every
+    effective-selection change, and live auto-last grows the selection each tick, so
+    keying on it would reset every tick and rebuild from only the un-evicted frames
+    -- the cap-truncation this accumulator exists to prevent.  Selection growth
+    therefore APPENDS (same key), retaining rows for frames since evicted past the
+    store cap.
+
+    A plotUnit Q<->2theta toggle does NOT change ``reset_key``, so ``unit`` changes
+    while ``reset_key`` does not: the accumulated rows are unit-invariant, so we
     RELABEL the grid to the incoming (new-unit) ``x`` in place -- no re-read, no loss
-    of frames evicted past the store cap -- keeping every captured row.
+    of evicted frames -- keeping every captured row.
 
     ``x`` / ``rows`` / ``ids`` / ``names`` are the incoming frames, already on the
     one shared grid (the adapter interpolated them).  Returns the next
@@ -396,17 +416,17 @@ def accumulate_waterfall(history, *, generation, unit, x, rows, ids, names):
     ids = [int(i) for i in ids]
     names = list(names)
 
-    # RESET: fresh generation (mode/selection/scan change), no prior history, or an
+    # RESET: new accumulation identity (scan/source change), no prior history, or an
     # empty incoming grid (nothing to anchor on -- keep the incoming as-is).
-    if history is None or history.generation != generation or x.size == 0:
+    if history is None or history.reset_key != reset_key or x.size == 0:
         ki, kn, kr = _dedup_first(ids, names, rows)
         return WaterfallHistory(
-            generation=generation, unit=unit, x=x,
+            reset_key=reset_key, unit=unit, label=label, x=x,
             rows=(np.asarray(kr, dtype=float) if kr
                   else np.empty((0, x.size), dtype=float)),
             ids=tuple(ki), names=tuple(kn))
 
-    # Same generation: keep the accumulated rows; relabel the grid on a unit toggle
+    # Same identity: keep the accumulated rows; relabel the grid on a unit toggle
     # (incoming x is the same sample grid in the new unit), then append new ids.
     base_x = (x if history.unit != unit and x.size == history.x.size
               else history.x)
@@ -436,7 +456,7 @@ def accumulate_waterfall(history, *, generation, unit, x, rows, ids, names):
         new_rows = base_rows
 
     return WaterfallHistory(
-        generation=generation, unit=unit, x=base_x, rows=new_rows,
+        reset_key=reset_key, unit=unit, label=label, x=base_x, rows=new_rows,
         ids=tuple(out_ids), names=tuple(out_names))
 
 
