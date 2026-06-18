@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+from xrd_tools.integrate.gid import _nan_empty_2d  # shared count==0 -> NaN helper
 
 if TYPE_CHECKING:
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
@@ -177,10 +178,15 @@ def integrate_2d(
         error_model=error_model,
         **extra,
     )
-    # pyFAI intensity shape is (npt_azim, npt_rad); transpose to (npt_rad, npt_azim)
-    intensity = np.asarray(result.intensity, dtype=float).T
+    # pyFAI intensity shape is (npt_azim, npt_rad); transpose to (npt_rad, npt_azim).
+    # NaN-mask empty (count==0) bins BEFORE the transpose (arr must match
+    # result.count's pyFAI orientation) so the q-chi->1D projection and the 2D
+    # Overall aggregate skip no-coverage gaps/corners (CSR fills them with 0);
+    # genuine zero-count bins (count>0) are preserved.  Mirrors the GI
+    # _to_result_2d fix; keyed on COUNT, never on the intensity value.
+    intensity = _nan_empty_2d(result.intensity, result).T
     sigma = (
-        np.asarray(result.sigma, dtype=float).T
+        _nan_empty_2d(result.sigma, result).T
         if result.sigma is not None
         else None
     )
