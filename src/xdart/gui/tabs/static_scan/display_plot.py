@@ -907,6 +907,22 @@ class DisplayPlotMixin:
     def update_wf(self):
         """Updates data in 1D plot Frame
         """
+        # Throttle the expensive full-image waterfall REPAINT during a live scan.
+        # The waterfall image grows O(N x M), and setImage re-copies + re-levels
+        # (nanpercentile) + re-uploads the WHOLE stack every call -- the dominant
+        # per-flush GUI-thread cost on a long scan (confirmed: gzip's slower frame
+        # arrival makes the per-flush waterfall smaller -> smoother).  The
+        # accumulator (plot_data) still grows every flush; we just repaint the
+        # image at most ~2/sec while processing, so interaction stays responsive.
+        # Idle (end-of-scan / user actions) always repaints so the final state is
+        # complete and clicks feel instant.
+        if getattr(self, "_processing_active", False):
+            import time as _t
+            now = _t.perf_counter()
+            if now - getattr(self, "_wf_last_draw_t", 0.0) < 0.5:
+                return
+            self._wf_last_draw_t = now
+
         self.setup_wf_layout()
 
         xdata_, data_ = self.plot_data

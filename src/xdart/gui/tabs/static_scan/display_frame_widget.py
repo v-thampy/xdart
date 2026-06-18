@@ -2570,6 +2570,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         data isn't available yet — so the 2D panels persist like the 1D plot.
         """
         self._processing_active = bool(active)
+        # Reset the waterfall-repaint throttle at every run boundary so the next
+        # update_wf always repaints in full -- in particular the end-of-scan flush
+        # (run just ended -> active False) must show the COMPLETE stack even if the
+        # last in-scan repaint was throttled.
+        self._wf_last_draw_t = 0.0
 
     def set_viewer_display_mode(self, mode):
         """Configure display panels for viewer modes.

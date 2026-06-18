@@ -880,14 +880,23 @@ class staticWidget(QWidget):
         if self._pending_update_idx is None:
             return
         self._pending_update_idx = None
+        # Optional per-flush profiling: set XDART_PERF=1 in the shell to log the
+        # drain / list-widget / render split at INFO so the dominant GUI-thread leg
+        # is measured, not guessed.
+        import os as _os
+        import time as _t
+        _perf = bool(_os.environ.get("XDART_PERF"))
+        _t0 = _t.perf_counter() if _perf else 0.0
         # Build + store publications + scan_data for every frame stashed since the
         # last flush (the coalesced heavy work, off the per-frame GUI event loop).
         self._drain_pending_frames()
+        _t1 = _t.perf_counter() if _perf else 0.0
         # Heavy list-widget refresh first — auto-last cursor needs the
         # list to contain the new index before it can select it.
         self.h5viewer.update_data(emit_update=False)
         if self.h5viewer.auto_last:
             self.latest_frame(emit_update=False)
+        _t2 = _t.perf_counter() if _perf else 0.0
 
         method = ""
         try:
@@ -906,9 +915,17 @@ class staticWidget(QWidget):
             if selected:
                 self.h5viewer.frame_ids[:] = selected
                 self.h5viewer.data_changed(show_all=True)
-                return
+            else:
+                self.h5viewer.data_changed()
+        else:
+            self.h5viewer.data_changed()  # → sigUpdate → set_data → metawidget.update()
 
-        self.h5viewer.data_changed()  # → sigUpdate → set_data → metawidget.update()
+        if _perf:
+            _t3 = _t.perf_counter()
+            logger.info(
+                "[PERF] flush: drain=%.0fms list=%.0fms render=%.0fms total=%.0fms",
+                (_t1 - _t0) * 1000, (_t2 - _t1) * 1000,
+                (_t3 - _t2) * 1000, (_t3 - _t0) * 1000)
 
     def disable_auto_last(self, q):
         """
