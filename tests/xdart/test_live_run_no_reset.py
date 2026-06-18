@@ -41,6 +41,8 @@ def _fake_scan():
         data_file="old.nxs",
         name="old",
         skip_2d=False,
+        # The lazy frame series carries its OWN data_file (captured at build).
+        frames=SimpleNamespace(data_file="old.nxs"),
     )
     scan.set_datafile = lambda fname: calls.append(fname)
     return scan, calls
@@ -71,6 +73,10 @@ def test_set_datafile_live_run_repoints_without_reload():
     assert calls == []  # no disk reload
     assert scan.data_file == "/data/scan_42.nxs"
     assert scan.name == "scan_42"
+    # Crash regression (2026-06-18): the lazy frame series' data_file must be
+    # repointed too — else a post-run Reintegrate that falls to disk for an
+    # evicted frame opens the stale init-time default.nxs (FileNotFoundError).
+    assert scan.frames.data_file == "/data/scan_42.nxs"
 
 
 def test_set_datafile_non_live_reloads_from_disk():
@@ -95,6 +101,7 @@ def test_set_datafile_no_nxs_repoints_without_load():
     assert calls == []                       # no load/create attempted
     assert scan.data_file == "/data/scan_42.nxs"
     assert scan.name == "scan_42"
+    assert scan.frames.data_file == "/data/scan_42.nxs"   # frame series repointed too
 
 
 def _reset_viewer(live_run_active):

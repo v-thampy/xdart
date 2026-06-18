@@ -605,6 +605,18 @@ class fileHandlerThread(Qt.QtCore.QThread):
                 # but that workaround is unnecessary now that the caller
                 # doesn't supply the dead kwarg in the first place.
                 self.scan.set_datafile(self.fname)
+            # Invariant: the lazy frame series must read from the SAME file as the
+            # scan.  The path-only branches above (no_nxs / live_run) repoint
+            # scan.data_file but leave scan.frames as the init-time series whose
+            # data_file is still the default .nxs.  So a later disk fallback — e.g.
+            # a Reintegrate reading a frame that was evicted from the in-memory
+            # cache — opens the wrong/missing file and FileNotFoundErrors (the live
+            # reintegrate crash, 2026-06-18).  Repoint the existing series' data_file
+            # in place rather than rebuilding it (which would discard the live
+            # in-memory frames); a no-op for the else branch (already rebuilt to fname).
+            _frames = getattr(self.scan, 'frames', None)
+            if _frames is not None and hasattr(_frames, 'data_file'):
+                _frames.data_file = self.fname
             self.scan.skip_2d = skip_2d  # preserve checkbox state across load
         self.sigNewFile.emit(self.fname)
         self.sigUpdate.emit()
