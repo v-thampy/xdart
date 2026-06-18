@@ -740,6 +740,57 @@ def test_clear_display_state_resets_visible_and_cached_state():
     assert wf_widget.raw_image.size == 0
 
 
+def _clear_1d_host(viewer_mode):
+    emitted = []
+    label = _FakeLabel()
+    host = SimpleNamespace(
+        viewer_mode=viewer_mode,
+        frame_names=['f0', 'f1'],
+        frame_ids=['0', '1'],
+        plot_data=[np.arange(3), np.ones((2, 3))],
+        plot_data_range=[[0, 3], [0, 1]],
+        overlaid_idxs=[0, 1],
+        legend=_FakeLegend(),
+        ui=SimpleNamespace(labelCurrent=label),
+        plot=SimpleNamespace(clear=lambda: None, addLegend=lambda: _FakeLegend()),
+        setup_1d_layout=lambda: None,
+        sigCleared=SimpleNamespace(emit=lambda: emitted.append(True)),
+    )
+    host.clear_overlay = MethodType(displayFrameWidget.clear_overlay, host)
+    host._viewer_default_title = MethodType(
+        displayFrameWidget._viewer_default_title, host)
+    host.clear_1D = MethodType(DisplayPlotMixin.clear_1D, host)
+    return host, label, emitted
+
+
+def test_clear_1d_in_viewer_mode_resets_title_and_emits_cleared():
+    """Viewer-mode Clear resets to the pristine viewer state: title back to the
+    mode default ('XYE Viewer') + sigCleared emitted so the host drops the
+    file-list selection -- otherwise the cleared plot disagrees with a stale
+    selection + title that still names the old frames."""
+    host, label, emitted = _clear_1d_host('xye')
+
+    host.clear_1D()
+
+    assert label.text == 'XYE Viewer'
+    assert emitted == [True]
+    assert host.overlaid_idxs == []        # accumulator still cleared
+
+
+def test_clear_1d_in_integration_mode_keeps_title_and_emits_nothing():
+    """Integration-mode Clear (viewer_mode None) drops the overlay but must NOT
+    emit sigCleared or touch the title -- the selection is kept so the overlay can
+    be rebuilt."""
+    host, label, emitted = _clear_1d_host(None)
+    label.setText('eiger_scan_42')
+
+    host.clear_1D()
+
+    assert emitted == []                   # no viewer-clear signal
+    assert label.text == 'eiger_scan_42'   # title untouched
+    assert host.overlaid_idxs == []        # overlay still cleared
+
+
 def _persist_image_host(processing, persist=True, data=None):
     """Minimal host to exercise update_image's blank-vs-keep-last decision."""
     image_widget = _FakeImageWidget()

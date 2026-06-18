@@ -117,6 +117,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     # plot methods don't require shift/ctrl multi-select.
     sigPlotMethodChanged = Qt.QtCore.Signal(str)
 
+    # Emitted when the user clicks Clear while in a viewer mode.  The host
+    # (staticWidget) clears the H5Viewer file-list selection so the cleared plot,
+    # the selection and the title all agree -- the displayframe owns the title but
+    # not the list selection.
+    sigCleared = Qt.QtCore.Signal()
+
     # Feature flag: during a processing run, keep the last-rendered 2D panels
     # (raw image + cake) on screen instead of blanking them when the in-flight
     # frame's 2D data isn't available yet — so the 2D panels persist exactly
@@ -2660,6 +2666,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             return f'{name[:head]}...{name[-tail:]}'
         return name
 
+    def _viewer_default_title(self):
+        """The pristine title for the current viewer mode (no selection)."""
+        return {
+            'image': 'Image Viewer',
+            'xye': 'XYE Viewer',
+            'nexus': 'NeXus Viewer',
+        }.get(getattr(self, 'viewer_mode', None), 'Viewer')
+
     def _set_viewer_title(self, idxs):
         """Set the title label in viewer modes from the selected frame's
         source file: plain filename for single-image formats (tiff/raw/xye),
@@ -2668,7 +2682,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         ``(+k more)`` suffix."""
         idxs = list(idxs) if idxs else []
         if not idxs:
-            self.ui.labelCurrent.setText('Image Viewer')
+            self.ui.labelCurrent.setText(self._viewer_default_title())
             return
         idx0 = idxs[0]
         src = ''

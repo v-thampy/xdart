@@ -993,6 +993,19 @@ class DisplayPlotMixin:
         self.plot.clear()
         # Re-add legend (plot.clear() removes it)
         self.legend = self.plot.addLegend()
+        # In a viewer mode the plotted curves ARE the file-list selection, so
+        # Clear must reset to the pristine viewer state: reset the title (the
+        # displayframe owns labelCurrent) and ask the host to drop the list
+        # selection via sigCleared -- otherwise the cleared plot disagrees with a
+        # stale selection + title that still names the old frames.  In integration
+        # mode Clear only drops the accumulated overlay and KEEPS the selection so
+        # it can be rebuilt, so this is scoped to viewer modes.
+        if getattr(self, "viewer_mode", None) is not None:
+            if hasattr(self, "_viewer_default_title"):
+                self.ui.labelCurrent.setText(self._viewer_default_title())
+            sig = getattr(self, "sigCleared", None)
+            if sig is not None:
+                sig.emit()
 
     def update_legend(self):
         if not self.ui.showLegend.isChecked():

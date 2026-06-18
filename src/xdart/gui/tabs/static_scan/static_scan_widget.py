@@ -450,6 +450,10 @@ class staticWidget(QWidget):
         # Initialize once with the current plot method.
         self.h5viewer.set_data_selection_mode(
             self.displayframe.ui.plotMethod.currentText())
+        # Viewer-mode Clear: also drop the file-list selection so the cleared
+        # plot, the selection and the title agree (the displayframe reset the
+        # title; the selection lives on the H5Viewer).
+        self.displayframe.sigCleared.connect(self._on_display_cleared)
 
         # Integrator signals
         self.integratorTree.integrator_thread.started.connect(self.thread_state_changed)
@@ -897,6 +901,19 @@ class staticWidget(QWidget):
         q : Qt.QtWidgets.QListWidgetItem
         """
         self.h5viewer.auto_last = True
+
+    def _on_display_cleared(self):
+        """Viewer-mode Clear: drop the H5Viewer file-list selection so the
+        cleared plot, the (now empty) selection and the title all agree.
+
+        ``data_changed`` clears ``frame_ids`` and then early-returns on the empty
+        selection (no re-render), so this won't repaint or restore a stale title.
+        """
+        try:
+            self.h5viewer.ui.listData.clearSelection()
+        except Exception:
+            logger.debug("clear listData selection on display Clear failed",
+                         exc_info=True)
 
     def set_data(self):
         """Connected to h5viewer, sets the data in displayframe based
