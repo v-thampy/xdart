@@ -630,8 +630,9 @@ def test_nexus_sink_compression_default_honors_env(tmp_path, monkeypatch):
     monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "none")
     assert NexusSink(tmp_path / "a.nxs", overwrite=True).compression is None
 
+    # Unset -> the resolved default: lz4 when hdf5plugin is importable, else gzip.
     monkeypatch.delenv("XDART_INTEGRATED_COMPRESSION", raising=False)
-    assert NexusSink(tmp_path / "b.nxs", overwrite=True).compression == "gzip"
+    assert NexusSink(tmp_path / "b.nxs", overwrite=True).compression in ("lz4", "gzip")
 
     monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "none")
     explicit = NexusSink(tmp_path / "c.nxs", overwrite=True, compression="gzip")

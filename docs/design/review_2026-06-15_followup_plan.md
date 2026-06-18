@@ -301,7 +301,22 @@ It is **live-gated**, so it is structured as offscreen prep + a live-checkpoint 
   unrelated and used everywhere.
 - **Gate:** `pytest tests/xdart/test_ewald.py` + offscreen xdart suite green; spine green.
 
-### QW2 — Compress the GUI writer's integrated 1D/2D stacks (RESOLVED in `91c9d37`)
+### QW2 — Compress the GUI writer's integrated 1D/2D stacks (RESOLVED in `91c9d37`; default changed to lz4 Jun-17)
+> **UPDATE (Jun-17 2026):** the DEFAULT integrated-stack filter is now **lz4+shuffle**
+> (hdf5plugin filter 32004), with **gzip+shuffle as the portable fallback** (used automatically
+> when hdf5plugin is unavailable, or via `XDART_INTEGRATED_COMPRESSION=gzip`). The single
+> resolver `xrd_tools.io.nexus.resolve_stack_compression` (shared by the GUI writer + headless
+> `NexusSink`) defaults to `"lz4"`; `_comp_kwargs("lz4")` emits `hdf5plugin.LZ4()+shuffle`.
+> The arm64-macOS guard was **relaxed to lzf only** — a write+read spot-check confirmed lz4
+> round-trips on arm64-macOS (the bus error was h5py's *bundled LZF*, a different filter; xdart
+> already decodes lz4 there for every Eiger frame). `hdf5plugin` is now a **base dependency**.
+> **Caveat (supersedes the "no hdf5plugin on the reader" line below):** lz4-compressed stacks
+> require hdf5plugin to read *outside xrd-tools* (a one-time warning is logged on lz4 write);
+> set `XDART_INTEGRATED_COMPRESSION=gzip` for stock-h5py-portable files. byte-compat is
+> unaffected (the signature digests decompressed values, filter-invariant). The drop/replace
+> row-surgery path (`drop_integrated_rows`) now preserves plugin filters when rebuilding a group.
+
+
 - **Where:** `src/xdart/modules/ewald/nexus_writer.py` `_commit_integrated_1d` / `_commit_integrated_2d`
   pass `compression=INTEGRATED_STACK_COMPRESSION`, which is now `"gzip"`; the headless `NexusSink`
   default is also `"gzip"`. Both flow through `xrd_tools.io.nexus._comp_kwargs`.

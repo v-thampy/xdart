@@ -229,6 +229,36 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
 # Integrated-stack row surgery
 # ---------------------------------------------------------------------------
 
+def _recreate_filter_kwargs(obj) -> dict:
+    """``create_dataset`` kwargs that reproduce ``obj``'s filter pipeline.
+
+    h5py's high-level ``.compression`` reports an hdf5plugin codec (e.g. LZ4,
+    filter id 32004) as the string ``'unknown'`` with no ``compression_opts`` --
+    replaying that crashes ``create_dataset``.  So inspect the filter ids directly
+    and re-apply the known codecs: LZ4 -> hdf5plugin LZ4 (gzip if the plugin is
+    missing), gzip/lzf -> portable gzip (never re-emit raw lzf).  ``shuffle`` /
+    ``fletcher32`` carry through.  An unrecognized filter degrades to uncompressed
+    rather than crash."""
+    filters = dict(getattr(obj, "_filters", {}) or {})
+    kw: dict = {}
+    if "32004" in filters:                       # hdf5plugin LZ4
+        try:
+            import hdf5plugin
+            kw.update(hdf5plugin.LZ4())
+        except Exception:
+            kw["compression"] = "gzip"
+            kw["compression_opts"] = 1
+    elif obj.compression in ("gzip", "lzf"):     # never re-emit raw lzf
+        kw["compression"] = "gzip"
+        kw["compression_opts"] = obj.compression_opts or 1
+    if kw:                                        # a compressor is present
+        if obj.shuffle:
+            kw["shuffle"] = True
+        if obj.fletcher32:
+            kw["fletcher32"] = True
+    return kw
+
+
 def drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
     """Remove stale rows from an existing ``integrated_*`` stack by frame
     label (rebuilds the group preserving compression/chunking/attrs)."""
@@ -260,28 +290,25 @@ def drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
         if row_aligned:
             data = data[keep_mask]
         datasets.append((
-            key, data, dict(obj.attrs.items()), obj.compression,
-            obj.compression_opts, obj.shuffle, obj.fletcher32,
-            row_aligned, obj.chunks,
+            key, data, dict(obj.attrs.items()),
+            _recreate_filter_kwargs(obj), row_aligned, obj.chunks,
         ))
 
     del parent[name]
     new_group = parent.create_group(name)
     for key, value in group_attrs.items():
         new_group.attrs[key] = value
-    for (key, data, attrs, compression, compression_opts, shuffle,
-         fletcher32, row_aligned, chunks) in datasets:
+    for (key, data, attrs, filter_kwargs, row_aligned, chunks) in datasets:
         kwargs = {}
         if row_aligned:
             kwargs["maxshape"] = (None,) + tuple(np.asarray(data).shape[1:])
             if chunks is not None:
                 kwargs["chunks"] = chunks
-        if compression is not None:
-            kwargs["compression"] = compression
-            if compression_opts is not None:
-                kwargs["compression_opts"] = compression_opts
-            kwargs["shuffle"] = shuffle
-            kwargs["fletcher32"] = fletcher32
+        kwargs.update(filter_kwargs)
+        # A filter requires chunking; restore the source chunks if the recreate
+        # path above didn't already set them (non-row-aligned filtered datasets).
+        if filter_kwargs and "chunks" not in kwargs and chunks is not None:
+            kwargs["chunks"] = chunks
         ds = new_group.create_dataset(key, data=data, **kwargs)
         for attr_key, value in attrs.items():
             ds.attrs[attr_key] = value

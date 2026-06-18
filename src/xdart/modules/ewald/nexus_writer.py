@@ -67,19 +67,17 @@ logger = logging.getLogger(__name__)
 # shared core helper (xrd_tools.io.nexus.resolve_stack_compression) so the GUI
 # writer and the headless reduction honor the SAME XDART_INTEGRATED_COMPRESSION
 # env var (read ONCE at import; set it in the shell BEFORE launching xdart):
-#     none -> uncompressed (fastest writes, biggest files)
-#     gzip -> gzip+shuffle (default; unset == gzip; portable, ~-50% on disk)
-#     lz4  -> fast hdf5plugin LZ4 on NON-ARM (reader needs hdf5plugin; ARM->gzip)
-# gzip/lzf both map to portable gzip+shuffle; never emit raw lzf (ARM64-macOS bus
-# error).  On the live streaming pipeline the write cost is overlapped
-# (negligible wall-clock).  _resolve_integrated_compression kept as a thin alias.
+#     lz4  -> hdf5plugin LZ4+shuffle (DEFAULT; fast, reader needs hdf5plugin which
+#             is a base dep; falls back to gzip only if hdf5plugin is missing)
+#     gzip -> gzip+shuffle (portable; stock-h5py readable, no hdf5plugin needed)
+#     none -> uncompressed (biggest files)
+# gzip/lzf both map to portable gzip+shuffle; raw lzf is never emitted (ARM64-macOS
+# bus error).  lz4 round-trips on arm64-macOS (verified); the old bus error was
+# h5py's bundled LZF, not hdf5plugin's LZ4.  On the live streaming pipeline the
+# write cost is overlapped.  _resolve_integrated_compression kept as a thin alias.
 _resolve_integrated_compression = resolve_stack_compression
 INTEGRATED_STACK_COMPRESSION = _resolve_integrated_compression()
-if INTEGRATED_STACK_COMPRESSION != "gzip":
-    logger.info(
-        "Integrated-stack compression = %r (XDART_INTEGRATED_COMPRESSION)",
-        INTEGRATED_STACK_COMPRESSION,
-    )
+logger.info("Integrated-stack compression = %r", INTEGRATED_STACK_COMPRESSION)
 
 
 @dataclass

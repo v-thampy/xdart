@@ -362,20 +362,25 @@ def test_integrated_2d_nxdata(written_nxs):
     assert g["chi"].attrs.get("units") in ("deg", "rad")
 
 
-def test_gui_integrated_stacks_use_portable_gzip_never_lzf(written_nxs):
-    # Converged policy: the GUI writer compresses with portable gzip+shuffle
-    # (was uncompressed None) and NEVER emits lzf (h5py-only filter, ARM64-macOS
-    # bus error).  gzip is in every HDF5 build and stock-h5py readable, so the
-    # frozen .nxs stays self-contained for notebooks/other tools.
+def test_gui_integrated_stacks_use_configured_filter_never_lzf(written_nxs):
+    # The GUI writer compresses its stacks with the resolved default -- lz4+shuffle
+    # (hdf5plugin filter 32004) when available, else portable gzip+shuffle -- and
+    # NEVER emits raw lzf (h5py-only filter, ARM64-macOS bus error).
     import h5py
+    from xdart.modules.ewald.nexus_writer import INTEGRATED_STACK_COMPRESSION
 
     with h5py.File(written_nxs, "r") as f:
         for path in ("entry/integrated_1d/intensity",
                      "entry/integrated_1d/sigma",
                      "entry/integrated_2d/intensity"):
             ds = f[path]
-            assert ds.compression == "gzip", path
+            filters = dict(ds._filters)
+            assert "lzf" not in filters, (path, filters)     # never raw lzf
             assert ds.shuffle is True, path
+            if INTEGRATED_STACK_COMPRESSION == "lz4":
+                assert "32004" in filters, (path, filters)   # hdf5plugin LZ4
+            else:
+                assert ds.compression == "gzip", (path, ds.compression)
 
 
 def test_gi_nonuniform_stacked_2d_writer_stays_strict(tmp_path):
@@ -1296,15 +1301,17 @@ def test_no_detector_shape_writes_no_dataset(written_nxs):
 
 def test_integrated_compression_env_override(monkeypatch):
     """XDART_INTEGRATED_COMPRESSION lets the user A/B the integrated-stack
-    compression from the shell before launching xdart (default gzip; read once
-    at import)."""
+    compression from the shell before launching xdart (default lz4 when hdf5plugin
+    is available, else gzip; read once at import)."""
     from xdart.modules.ewald import nexus_writer as nw
     monkeypatch.delenv("XDART_INTEGRATED_COMPRESSION", raising=False)
-    assert nw._resolve_integrated_compression() == "gzip"          # unset -> default
+    assert nw._resolve_integrated_compression() in ("lz4", "gzip")  # unset -> default
     for off in ("none", "None", "OFF", "0", "false", "no", "", "  none  "):
         monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", off)
         assert nw._resolve_integrated_compression() is None, off
     monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "gzip")
+    assert nw._resolve_integrated_compression() == "gzip"
+    monkeypatch.setenv("XDART_INTEGRATED_COMPRESSION", "blosc")     # unknown -> gzip
     assert nw._resolve_integrated_compression() == "gzip"
 
 
