@@ -20,7 +20,7 @@ from xrd_tools.core.containers import (
     IntegrationResult2D,
 )
 from xrd_tools.integrate.calibration import poni_to_integrator
-from xrd_tools.integrate.single import integrate_1d, integrate_2d
+from xrd_tools.integrate.single import integrate_1d, integrate_2d, integrate_radial
 from xrd_tools.integrate.gid import (
     create_fiber_integrator,
     integrate_gi_1d,
@@ -608,15 +608,33 @@ class LiveFrame():
                     _az = std_kwargs['azimuth_range']
                     std_kwargs['azimuth_range'] = (_az[0] - chi_offset, _az[1] - chi_offset)
                 
-                result = integrate_1d(
-                    (self.map_raw - self.bg_raw) / self.map_norm,
-                    self.integrator,
-                    npt=numpoints,
-                    unit=str(unit),
-                    radial_range=radial_range,
-                    mask=self.get_mask(global_mask),
-                    **std_kwargs,
-                )
+                if str(unit) == 'chi_deg':
+                    # Azimuthal profile (I vs chi): the OUTPUT axis is chi; the
+                    # range field is the q BAND to integrate over (always Q, per
+                    # the design).  npt = chi output bins; the q sampling defaults
+                    # in the wrapper.  integrate_radial does not accept error_model
+                    # / variance, so drop them from the forwarded kwargs.
+                    chi_kwargs = {k: v for k, v in std_kwargs.items()
+                                  if k not in ('error_model', 'variance')}
+                    result = integrate_radial(
+                        (self.map_raw - self.bg_raw) / self.map_norm,
+                        self.integrator,
+                        npt=numpoints,
+                        radial_unit='q_A^-1',
+                        radial_range=radial_range,
+                        mask=self.get_mask(global_mask),
+                        **chi_kwargs,
+                    )
+                else:
+                    result = integrate_1d(
+                        (self.map_raw - self.bg_raw) / self.map_norm,
+                        self.integrator,
+                        npt=numpoints,
+                        unit=str(unit),
+                        radial_range=radial_range,
+                        mask=self.get_mask(global_mask),
+                        **std_kwargs,
+                    )
                 self.int_1d = result
             else:
                 _gi_valid = {

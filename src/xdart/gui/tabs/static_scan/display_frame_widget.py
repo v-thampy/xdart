@@ -1928,37 +1928,47 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if gi_mode_1d == 'q_total' and '2th' in unit_1d:
                 target_plot_idx = 1
         else:
-            # Standard mode: Q, 2θ from 1D but can also slice via 2D chi;
-            # χ purely from 2D
-            for label in plotUnits[:2]:
-                self.ui.plotUnit.addItem(_translate("Form", label))
+            unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
+            if 'chi' in unit_1d:
+                # Native azimuthal profile (I vs χ via integrate_radial): the 1D
+                # result IS I(χ), so show it DIRECTLY (source='1d').  This is the
+                # pooled quantity -- NOT the source='2d' cake-row χ slice (a
+                # mean-of-means).  Q/2θ don't apply here (the 1D axis is the
+                # azimuth, not radial); the 2D cake, if present, still renders via
+                # imageUnit below.
+                self.ui.plotUnit.addItem(_translate("Form", f"{Chi} ({Deg})"))
                 self._plot_axis_info.append({
-                    'source': '1d_2d',
-                    'slice_axis': f'{Chi} ({Deg})',
-                    'axis': 'radial',
+                    'source': '1d', 'slice_axis': None, 'axis': None,
                 })
-            # χ is derived from 2D (Int 2D only — no cake to slice in Int 1D)
-            if not skip:
-                self.ui.plotUnit.addItem(_translate("Form", plotUnits[2]))
-                self._plot_axis_info.append({
-                    'source': '2d',
-                    'slice_axis': None,  # determined dynamically by imageUnit
-                    'axis': 'azimuthal',
-                })
+                target_plot_idx = 0
+            else:
+                # Standard mode: Q, 2θ from 1D but can also slice via 2D chi;
+                # χ purely from 2D
+                for label in plotUnits[:2]:
+                    self.ui.plotUnit.addItem(_translate("Form", label))
+                    self._plot_axis_info.append({
+                        'source': '1d_2d',
+                        'slice_axis': f'{Chi} ({Deg})',
+                        'axis': 'radial',
+                    })
+                # χ is derived from 2D (Int 2D only — no cake to slice in Int 1D)
+                if not skip:
+                    self.ui.plotUnit.addItem(_translate("Form", plotUnits[2]))
+                    self._plot_axis_info.append({
+                        'source': '2d',
+                        'slice_axis': None,  # determined dynamically by imageUnit
+                        'axis': 'azimuthal',
+                    })
+                # Default the plot unit to the entry matching the 1D integration
+                # unit (so a 2θ integration opens on a 2θ axis).
+                canon_1d = '2th_deg' if '2th' in unit_1d else 'q_A^-1'
+                target_plot_idx = default_plot_unit(
+                    canon_1d, ('q_A^-1', '2th_deg'))
 
             for label in imageUnits:
                 self.ui.imageUnit.addItem(_translate("Form", label))
             self.ui.plotUnit.setEnabled(True)
             self.ui.imageUnit.setEnabled(True)
-            # Default the plot unit to the entry matching the 1D integration
-            # unit (so a 2θ integration opens on a 2θ axis).  Standard combo
-            # order is (Q, 2θ, χ); normalise the pyFAI unit to canonical then
-            # route the index choice through the pure default_plot_unit.
-            unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
-            canon_1d = ('2th_deg' if '2th' in unit_1d
-                        else 'chi_deg' if 'chi' in unit_1d else 'q_A^-1')
-            target_plot_idx = default_plot_unit(
-                canon_1d, ('q_A^-1', '2th_deg', 'chi_deg'))
 
         if self.ui.plotUnit.count() > 0:
             self.ui.plotUnit.setCurrentIndex(

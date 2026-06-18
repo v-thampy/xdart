@@ -42,12 +42,14 @@ QFileDialog = QtWidgets.QFileDialog
 AA_inv = u'\u212B\u207B\u00B9'
 Th = u'\u03B8'
 Deg = u'\u00B0'
-Units = [f"Q ({AA_inv})", f"2{Th} ({Deg})"]
-Units_dict = {Units[0]: 'q_A^-1', Units[1]: '2th_deg'}
-# Units_dict_inv = {'q_A^-1': Units[0], '2th_deg': Units[1]}
-Units_dict_inv = {'q_A^-1': 0, '2th_deg': 1}
-
 Chi = u'\u03C7'
+# Int-1D radial-unit choices.  The third, chi (azimuthal profile / I vs chi), is a
+# 1D-ONLY mode: the OUTPUT axis is chi while the range field is the q band integrated
+# over (see frame.integrate_1d's chi_deg branch).  The 2D combo (unit_2D) keeps only
+# Q / 2theta.
+Units = [f"Q ({AA_inv})", f"2{Th} ({Deg})", f"{Chi} ({Deg})"]
+Units_dict = {Units[0]: 'q_A^-1', Units[1]: '2th_deg', Units[2]: 'chi_deg'}
+Units_dict_inv = {'q_A^-1': 0, '2th_deg': 1, 'chi_deg': 2}
 
 GI_MODES_1D = ['q_total', 'q_ip', 'q_oop', 'exit_angle']
 GI_LABELS_1D = ["Q", "Q\u1D62\u209A", "Q\u2092\u2092\u209A", "Exit"]
@@ -149,6 +151,11 @@ class integratorTree(QtWidgets.QWidget):
         _translate = QtCore.QCoreApplication.translate
         self.ui.unit_1D.setItemText(0, _translate("Form", Units[0]))
         self.ui.unit_1D.setItemText(1, _translate("Form", Units[1]))
+        # The .ui declares two unit items; add the third (chi, azimuthal profile)
+        # for the 1D combo only.  Idempotent across re-inits.
+        if self.ui.unit_1D.count() < 3:
+            self.ui.unit_1D.addItem("")
+        self.ui.unit_1D.setItemText(2, _translate("Form", Units[2]))
         self.ui.label_azim_1D.setText(f"{Chi} ({Deg})")
 
         self.ui.unit_2D.setItemText(0, _translate("Form", Units[0]))
