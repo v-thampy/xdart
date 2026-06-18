@@ -82,6 +82,32 @@ def test_integrate_2d_transpose_convention(ai_fixture, synthetic_image):
 
 
 @pytest.mark.slow
+def test_integrate_2d_nan_fills_empty_bins_not_real_zeros(ai_fixture, synthetic_image):
+    """The standard q-χ cake NaN-masks empty (count==0) bins -- uncovered corners
+    / masked gaps that CSR fills with 0 -- so they don't average into the cake→1D
+    projection or the 2D aggregate, while GENUINE zero-signal bins (count>0,
+    intensity 0) are PRESERVED.  Keyed on count, never on the value; mirrors the
+    GI _to_result_2d fix."""
+    # (1) Real zeros preserved: an all-zero image -> every COVERED bin (count>0)
+    # reads 0 and must stay 0, never NaN.  (If value==0 were nulled, the finite
+    # set would be empty and the size check would fail.)
+    zeros = np.zeros_like(synthetic_image)
+    rz = integrate_2d(zeros, ai_fixture, npt_rad=200, npt_azim=100,
+                      unit="q_A^-1", correctSolidAngle=False)
+    finite = rz.intensity[np.isfinite(rz.intensity)]
+    assert finite.size > 0
+    np.testing.assert_array_equal(finite, 0.0)
+    # (2) Empty bins NaN'd: a real cake has uncovered q-χ corners (count==0) -> NaN,
+    # not the CSR 0-fill that would drag the χ-projection.  (Also proves count is
+    # exposed for method='csr' -- else the fix would be a no-op and no NaN appear.)
+    res = integrate_2d(synthetic_image, ai_fixture, npt_rad=200, npt_azim=100,
+                       unit="q_A^-1", correctSolidAngle=False)
+    assert np.isnan(res.intensity).any()
+    finite_res = res.intensity[np.isfinite(res.intensity)]
+    assert finite_res.min() >= -1e-9            # no surviving 0/dummy drag below 0
+
+
+@pytest.mark.slow
 def test_integrate_scan_sum(ai_fixture, synthetic_image):
     images = np.stack([synthetic_image] * 3, axis=0)
 
