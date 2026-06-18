@@ -555,6 +555,7 @@ def test_flush_pending_update_owns_single_repaint():
     calls = []
     widget = SimpleNamespace(
         _pending_update_idx=5,
+        _drain_pending_frames=lambda: calls.append(("drain", {})),
         h5viewer=SimpleNamespace(
             auto_last=True,
             frame_ids=[],
@@ -571,6 +572,9 @@ def test_flush_pending_update_owns_single_repaint():
     )
 
     staticWidget._flush_pending_update(widget)
+
+    assert calls[0] == ("drain", {})       # heavy build/upsert batched first
+    calls.pop(0)
 
     assert widget._pending_update_idx is None
     assert calls == [
@@ -589,6 +593,7 @@ def test_flush_pending_update_feeds_overlay_all_pending_frames():
 
     widget = SimpleNamespace(
         _pending_update_idx=5,
+        _drain_pending_frames=lambda: None,
         scan=SimpleNamespace(scan_lock=RLock(), frames=SimpleNamespace(index=[1, 2, 3, 4, 5])),
         h5viewer=SimpleNamespace(
             auto_last=True,
@@ -610,6 +615,87 @@ def test_flush_pending_update_feeds_overlay_all_pending_frames():
         ("latest_frame", {"emit_update": False}),
         ("data_changed", True, ("1", "2", "3", "4", "5")),
     ]
+
+
+def test_update_data_stashes_frame_without_building_per_frame():
+    """#3 (whole-scan freeze fix): per-frame update_data only STASHES the frame
+    (cheap pop) + advances the cursor + triggers the timer.  It must NOT build or
+    upsert the publication on the GUI thread -- that heavy work, run per frame,
+    flooded the event loop (esp. with fast lz4 writes) and froze the GUI for the
+    whole scan.  The build/upsert is batched in _drain_pending_frames at the flush."""
+    upserts = []
+    fake_frame = object()
+    host = SimpleNamespace(
+        _run_saw_frame=False,
+        _pending_frames={},
+        _pending_update_idx=None,
+        scan=SimpleNamespace(scan_lock=RLock(),
+                             frames=SimpleNamespace(index=[])),
+        wrangler=SimpleNamespace(
+            thread=SimpleNamespace(_published_frames={7: fake_frame})),
+        h5viewer=SimpleNamespace(latest_idx=None),
+        publication_store=SimpleNamespace(
+            upsert=lambda p: upserts.append(p), generation=0),
+        _update_timer=SimpleNamespace(trigger=lambda: None),
+    )
+
+    staticWidget.update_data(host, 7)
+
+    assert host._pending_frames == {7: fake_frame}        # stashed for the flush
+    assert upserts == []                                  # NOT built per frame
+    assert host.wrangler.thread._published_frames == {}   # drained the wrangler slot
+    assert host.h5viewer.latest_idx == 7                  # cursor advanced
+    assert host._pending_update_idx == 7
+    assert 7 in host.scan.frames.index                    # index appended (cheap)
+
+
+def test_drain_pending_frames_builds_store_and_scan_data():
+    """#3: _drain_pending_frames builds + upserts a publication for EVERY stashed
+    frame (the batched heavy work) and rebuilds scan_data as one DataFrame from the
+    accumulated rows -- not the O(N^2) per-frame `sd.loc[idx] = ser` enlargement."""
+    import pandas as pd
+    from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
+    from xdart.modules.frame_publication import PublicationStore
+
+    def _ir1d(v, nq=6):
+        return IntegrationResult1D(
+            radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
+            intensity=np.full(nq, float(v), dtype=np.float32),
+            sigma=np.ones(nq, dtype=np.float32), unit="q_A^-1")
+
+    def _ir2d(v, nq=6, nchi=4):
+        return IntegrationResult2D(
+            radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
+            azimuthal=np.linspace(-180, 180, nchi, endpoint=False).astype(np.float32),
+            intensity=np.full((nq, nchi), float(v), dtype=np.float32),
+            sigma=None, unit="q_A^-1")
+
+    frames = {
+        idx: SimpleNamespace(
+            idx=idx, int_1d=_ir1d(idx + 1), int_2d=_ir2d(idx + 1),
+            map_raw=np.full((3, 4), float(idx)), mask=None, gi=False,
+            gi_2d={}, thumbnail=None, bg_raw=0,
+            scan_info={"temp": float(idx) * 10.0},
+            source_file=f"f_{idx}.tif", source_frame_idx=idx)
+        for idx in (0, 1, 2)
+    }
+    store = PublicationStore(max_heavy_items=None)
+    host = SimpleNamespace(
+        _pending_frames=dict(frames),
+        _scan_info_rows={},
+        wrangler=SimpleNamespace(thread=SimpleNamespace(mask=None)),
+        scan=SimpleNamespace(scan_lock=RLock(), gi=False, skip_2d=False,
+                             global_mask=None, bai_1d_args={}, bai_2d_args={},
+                             scan_data=pd.DataFrame()),
+        publication_store=store,
+    )
+
+    staticWidget._drain_pending_frames(host)
+
+    assert host._pending_frames == {}                     # drained
+    assert len(store) == 3                                # all built + upserted
+    assert list(host.scan.scan_data.index) == [0, 1, 2]
+    assert list(host.scan.scan_data["temp"]) == [0.0, 10.0, 20.0]
 
 
 def test_update_plot_preserves_overlay_accumulator_on_failed_read():

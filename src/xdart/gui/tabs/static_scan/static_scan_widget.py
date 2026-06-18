@@ -514,6 +514,16 @@ class staticWidget(QWidget):
         # xdart.utils.throttle).
         self._update_timer = Coalescer(200, mode="throttle", parent=self)
         self._update_timer.triggered.connect(self._flush_pending_update)
+        # Per-frame work is COALESCED off the GUI event loop: update_data only
+        # POPs the freshly-integrated frame (cheap) into _pending_frames; the
+        # heavy build/upsert/scan_data runs once per ~200 ms flush over ALL frames
+        # stashed since the last flush.  Running it per frame on the GUI thread
+        # flooded the event loop (esp. once lz4 removed gzip's accidental
+        # write-throttle) and froze the GUI for the whole scan.  _scan_info_rows
+        # accumulates metadata rows so scan_data is rebuilt as one DataFrame per
+        # flush instead of an O(N^2) per-frame `sd.loc[idx] = ser` enlargement.
+        self._pending_frames = {}
+        self._scan_info_rows = {}
 
     def set_wrangler(self, qint):
         """Sets the wrangler based on the selected item in the dropdown.
@@ -717,117 +727,18 @@ class staticWidget(QWidget):
             # frames may briefly be None or replaced during set_datafile.
             pass
 
-        # Consume the published frame from the wrangler thread.
+        # Per-frame: POP the freshly-integrated frame from the wrangler's slot
+        # (cheap -- just moves the reference) and stash it for the coalesced flush.
+        # The heavy build/upsert/scan_data used to run HERE on the GUI thread for
+        # EVERY frame; once lz4 removed gzip's accidental write-throttle that
+        # flooded the event loop and froze the GUI for the whole scan.  Now
+        # _drain_pending_frames does it at ~5/sec over all stashed frames.  Pop
+        # drains the wrangler slot so frames can't leak there.
         published = getattr(self.wrangler, "thread", None)
         if published is not None:
             frame = getattr(published, "_published_frames", {}).pop(idx, None)
-        else:
-            frame = None
-        if frame is not None:
-            try:
-                global_mask = getattr(published, "mask", None)
-                if global_mask is not None:
-                    self.scan.global_mask = global_mask
-                    # Fold the pyFAI detector gap mask into the live frame's OWN
-                    # mask too.  The END-OF-SCAN full-res raw panel renders the
-                    # frame's mask (not just scan.global_mask), and the live frame
-                    # mask is only ``map_raw < 0`` -- which misses the 0-valued
-                    # inter-module gaps -- so without this the last frame's gaps
-                    # show as 0 (dark) until the user re-selects a frame and gets
-                    # the NaN-baked thumbnail.  Both are flat indices into the same
-                    # detector image; _apply_detector_mask / update_image bound by
-                    # data.size so any out-of-range index is ignored safely.
-                    # Perf: the gap mask is identical every frame, so sort it ONCE
-                    # (cached) and fold each frame's small own-mask in via setdiff,
-                    # instead of np.union1d re-sorting the whole large gap mask on
-                    # EVERY frame (an O(M log M) per-frame GUI-thread tax on an
-                    # Eiger).  Consumers use frame.mask as flat-index membership, so
-                    # the result need not be globally sorted.
-                    try:
-                        import numpy as _np
-                        g = getattr(self, "_live_gap_mask_sorted", None)
-                        if (g is None or getattr(self, "_live_gap_mask_src", None)
-                                is not global_mask):
-                            g = _np.unique(_np.asarray(global_mask).ravel())
-                            self._live_gap_mask_sorted = g
-                            self._live_gap_mask_src = global_mask
-                        _fm = getattr(frame, "mask", None)
-                        if _fm is None or _np.size(_fm) == 0:
-                            frame.mask = g
-                        else:
-                            extra = _np.setdiff1d(_np.asarray(_fm).ravel(), g)
-                            frame.mask = (g if extra.size == 0
-                                          else _np.concatenate([g, extra]))
-                    except Exception:
-                        logger.debug(
-                            "merging detector gap mask into the live frame failed",
-                            exc_info=True)
-                # Step 6: key the live record under the real GI mode so a later
-                # reintegrate at the same mode folds onto it (instead of the live
-                # record sitting under DEFAULT and the reintegrate under the real
-                # mode, leaving two un-mergeable entries).  .view is unaffected.
-                _is_gi = bool(getattr(self.scan, "gi", False))
-                publication = publication_from_live_frame(
-                    frame,
-                    generation=self.publication_store.generation,
-                    active_mode_1d=(
-                        self.scan.bai_1d_args.get("gi_mode_1d", "q_total")
-                        if _is_gi else None),
-                    active_mode_2d=(
-                        self.scan.bai_2d_args.get("gi_mode_2d", "qip_qoop")
-                        if _is_gi else None),
-                )
-                skip_2d = getattr(self.scan, "skip_2d", False)
-                has_2d_errors = publication_has_2d_errors(publication)
-                if not skip_2d and has_2d_errors:
-                    logger.warning(
-                        "Skipping frame %s 2D publication: %s",
-                        idx,
-                        publication_error_details(publication, "2d"),
-                    )
-                self.publication_store.upsert(publication)
-            except Exception:
-                # Cache miss is non-fatal — displayframe will lazy-load
-                # from disk via file_thread.load_frame as fallback.
-                logger.debug("In-memory frame hand-off failed for idx=%s",
-                             idx, exc_info=True)
-
-            # Mirror add_frame's scan_data accumulation: the live hand-off
-            # bypasses scan.add_frame, so without this the GUI scan's
-            # scan_data stays empty in non-batch and the metadata panel can
-            # only fall back to the single selected frame.  Build the
-            # whole-scan table here so it shows every frame (as it did
-            # before the live fast-path).
-            info = getattr(frame, "scan_info", None)
-            if info:
-                import pandas as pd
-                from xdart.modules.ewald.scan import _coerce_scan_info
-                # Keep metadata heterogeneous (numeric coerced, non-numeric kept
-                # as strings) so non-numeric provenance survives to the writer.
-                # No forced float64 dtype -- pandas infers per column.  Mirrors
-                # LiveScan.add_frame (N2).
-                coerced_info = _coerce_scan_info(info)
-                if coerced_info:
-                    try:
-                        ser = pd.Series(coerced_info)
-                        with self.scan.scan_lock:
-                            sd = self.scan.scan_data
-                            if list(sd.columns):
-                                sd.loc[idx] = ser
-                                # In-order fast path: frames usually arrive in
-                                # ascending order, so the row just appended is
-                                # already last — skip the O(N log N) sort_index
-                                # on every frame.  Only an out-of-order insert
-                                # (rare: reload/replace) pays for the sort.
-                                index = sd.index
-                                if len(index) >= 2 and index[-1] < index[-2]:
-                                    sd.sort_index(inplace=True)
-                            else:
-                                self.scan.scan_data = pd.DataFrame(
-                                    [coerced_info], index=[idx])
-                    except (ValueError, TypeError):
-                        logger.debug("scan_data update skipped for idx=%s", idx,
-                                     exc_info=True)
+            if frame is not None:
+                self._pending_frames[idx] = frame
 
         # P4: per-frame the *only* thing we do is remember the latest
         # idx + restart the coalescing timer.  The heavy list-widget
@@ -852,6 +763,104 @@ class staticWidget(QWidget):
         self._pending_update_idx = idx
         self._update_timer.trigger()
 
+    def _drain_pending_frames(self):
+        """Build + store publications and refresh scan_data for every frame
+        stashed since the last flush.
+
+        This is the heavy per-frame work (mask fold + publication build +
+        validation + store upsert + scan_data row) moved OFF the per-event GUI
+        path and batched here at ~5/sec, so GUI smoothness no longer tracks the
+        frame/write rate (the whole-scan freeze, worsened when lz4 removed gzip's
+        accidental write-throttle).  Display-only: the writer persists
+        independently, so deferring this never loses data or touches
+        persist-before-evict; the builds are stamped with the store's current
+        generation (a mode switch bumps it and forces a rebuild anyway)."""
+        pending = self._pending_frames
+        if not pending:
+            return
+        self._pending_frames = {}
+        import time as _time
+        import numpy as _np
+        t0 = _time.perf_counter()
+
+        published = getattr(self.wrangler, "thread", None)
+        global_mask = getattr(published, "mask", None) if published is not None else None
+        g = None
+        if global_mask is not None:
+            self.scan.global_mask = global_mask
+            # Sort the (invariant) detector gap mask ONCE per scan; reused for the
+            # per-frame fold below (np.union1d re-sorted the whole mask per frame).
+            g = getattr(self, "_live_gap_mask_sorted", None)
+            if g is None or getattr(self, "_live_gap_mask_src", None) is not global_mask:
+                g = _np.unique(_np.asarray(global_mask).ravel())
+                self._live_gap_mask_sorted = g
+                self._live_gap_mask_src = global_mask
+
+        _is_gi = bool(getattr(self.scan, "gi", False))
+        skip_2d = getattr(self.scan, "skip_2d", False)
+        active_1d = (self.scan.bai_1d_args.get("gi_mode_1d", "q_total")
+                     if _is_gi else None)
+        active_2d = (self.scan.bai_2d_args.get("gi_mode_2d", "qip_qoop")
+                     if _is_gi else None)
+        from xdart.modules.ewald.scan import _coerce_scan_info
+
+        new_rows = False
+        for idx in sorted(pending):
+            frame = pending[idx]
+            try:
+                # Fold the detector gap mask into the frame's OWN mask (the
+                # end-of-scan full-res raw panel renders frame.mask; the live mask
+                # is only map_raw<0 and misses the 0-valued module gaps).  Cached
+                # sorted-global + setdiff fold; membership-only, need not be sorted.
+                if g is not None:
+                    _fm = getattr(frame, "mask", None)
+                    if _fm is None or _np.size(_fm) == 0:
+                        frame.mask = g
+                    else:
+                        extra = _np.setdiff1d(_np.asarray(_fm).ravel(), g)
+                        frame.mask = (g if extra.size == 0
+                                      else _np.concatenate([g, extra]))
+                # Step 6: key the live record under the real GI mode so a later
+                # reintegrate at the same mode folds onto it.  .view is unaffected.
+                publication = publication_from_live_frame(
+                    frame,
+                    generation=self.publication_store.generation,
+                    active_mode_1d=active_1d,
+                    active_mode_2d=active_2d,
+                )
+                if not skip_2d and publication_has_2d_errors(publication):
+                    logger.warning(
+                        "Skipping frame %s 2D publication: %s", idx,
+                        publication_error_details(publication, "2d"))
+                self.publication_store.upsert(publication)
+            except Exception:
+                # Non-fatal — displayframe lazy-loads from disk as fallback.
+                logger.debug("In-memory frame hand-off failed for idx=%s", idx,
+                             exc_info=True)
+            # Accumulate the scan_data row (numeric coerced, non-numeric kept).
+            info = getattr(frame, "scan_info", None)
+            if info:
+                coerced = _coerce_scan_info(info)
+                if coerced:
+                    self._scan_info_rows[int(idx)] = coerced
+                    new_rows = True
+
+        # Rebuild scan_data as ONE DataFrame from the accumulated rows -- O(N) per
+        # flush, not the O(N^2) per-frame `sd.loc[idx] = ser` enlargement.  Mirrors
+        # LiveScan.add_frame (heterogeneous dtypes; pandas infers per column).
+        if new_rows:
+            import pandas as pd
+            try:
+                df = pd.DataFrame.from_dict(self._scan_info_rows, orient="index")
+                df.sort_index(inplace=True)
+                with self.scan.scan_lock:
+                    self.scan.scan_data = df
+            except (ValueError, TypeError):
+                logger.debug("scan_data rebuild skipped", exc_info=True)
+
+        logger.debug("[PERF] drained %d frame(s) in %.1f ms",
+                     len(pending), (_time.perf_counter() - t0) * 1000)
+
     def _flush_pending_update(self):
         """Render the most recently received wrangler update.
 
@@ -871,6 +880,9 @@ class staticWidget(QWidget):
         if self._pending_update_idx is None:
             return
         self._pending_update_idx = None
+        # Build + store publications + scan_data for every frame stashed since the
+        # last flush (the coalesced heavy work, off the per-frame GUI event loop).
+        self._drain_pending_frames()
         # Heavy list-widget refresh first — auto-last cursor needs the
         # list to contain the new index before it can select it.
         self.h5viewer.update_data(emit_update=False)
@@ -1417,6 +1429,10 @@ class staticWidget(QWidget):
         self.frames.clear()
         self.frame_ids.clear()
         self.publication_store.clear()
+        # Drop any frames stashed-but-not-yet-drained + the scan_data row cache
+        # from the previous scan so the new scan's coalesced flush starts clean.
+        self._pending_frames = {}
+        self._scan_info_rows = {}
         # Reset the Overlay/Waterfall accumulator at the scan boundary so a new
         # scan (or a reprocess of the same scan) plots FRESH.  A new scan may use
         # different integration params / GI / axis, so appending its traces across
