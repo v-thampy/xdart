@@ -108,6 +108,40 @@ def test_integrate_2d_nan_fills_empty_bins_not_real_zeros(ai_fixture, synthetic_
 
 
 @pytest.mark.slow
+def test_integrate_radial_returns_pooled_chi_profile(ai_fixture, synthetic_image):
+    # Azimuthal profile mode (I vs χ over a q band): a chi_deg ±180° axis, and the
+    # POOLED quantity -- it must differ from an unweighted cake-row mean-of-means
+    # projection (the whole point of using integrate_radial, not a cake collapse).
+    from xrd_tools.integrate.single import integrate_radial
+    res = integrate_radial(synthetic_image, ai_fixture, npt=180, npt_rad=500,
+                           radial_unit="q_A^-1", radial_range=(0.5, 5.0),
+                           correctSolidAngle=False)
+    assert res.unit == "chi_deg"
+    assert res.radial.shape == (180,)
+    assert res.radial.min() >= -180.0 - 1e-6 and res.radial.max() <= 180.0 + 1e-6
+    assert np.isfinite(res.intensity).any()
+
+    # Pooled (count-weighted) vs cake-row nanmean (mean-of-means): they differ.
+    cake = integrate_2d(synthetic_image, ai_fixture, npt_rad=500, npt_azim=180,
+                        unit="q_A^-1", radial_range=(0.5, 5.0),
+                        correctSolidAngle=False)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        proj = np.nanmean(cake.intensity, axis=0)      # I(χ) cake-row projection
+    both = np.isfinite(res.intensity) & np.isfinite(proj)
+    assert both.sum() > 0
+    assert not np.allclose(res.intensity[both], proj[both], rtol=1e-3)
+
+    # A narrower q band gives a different profile (the band is integrated over).
+    res2 = integrate_radial(synthetic_image, ai_fixture, npt=180, npt_rad=500,
+                            radial_unit="q_A^-1", radial_range=(1.0, 2.0),
+                            correctSolidAngle=False)
+    b2 = np.isfinite(res.intensity) & np.isfinite(res2.intensity)
+    assert not np.allclose(res.intensity[b2], res2.intensity[b2], rtol=1e-3)
+
+
+@pytest.mark.slow
 def test_integrate_scan_sum(ai_fixture, synthetic_image):
     images = np.stack([synthetic_image] * 3, axis=0)
 
