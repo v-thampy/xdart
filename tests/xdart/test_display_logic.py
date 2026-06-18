@@ -145,6 +145,85 @@ def test_overlay_read_failure_clears_for_non_accumulating_methods():
         assert dl.overlay_read_failure_action(method, has_accumulator=True) == 'clear'
 
 
+def test_accumulate_waterfall_builds_and_appends_monotonically():
+    np = pytest.importorskip("numpy")
+    x = np.array([0.0, 1.0, 2.0])
+    h = dl.accumulate_waterfall(None, generation=1, unit="q", x=x,
+                                rows=np.array([[1.0, 1.0, 1.0]]), ids=[0], names=["s0"])
+    assert h.count == 1 and h.ids == (0,) and h.unit == "q"
+    h = dl.accumulate_waterfall(h, generation=1, unit="q", x=x,
+                                rows=np.array([[2.0, 2.0, 2.0]]), ids=[1], names=["s1"])
+    assert h.ids == (0, 1) and h.rows.shape == (2, 3)
+    np.testing.assert_array_equal(h.rows[0], [1, 1, 1])
+    np.testing.assert_array_equal(h.rows[1], [2, 2, 2])
+
+
+def test_accumulate_waterfall_partial_read_never_shrinks_or_restacks():
+    # Append-only within a generation: a failed/partial/re-delivered read can only
+    # ADD frames it hasn't captured -- never shrink the stack or re-stack a frame
+    # (the collapse/restack class, precluded by construction).
+    np = pytest.importorskip("numpy")
+    x = np.array([0.0, 1.0, 2.0])
+    h = None
+    for i in range(5):
+        h = dl.accumulate_waterfall(h, generation=1, unit="q", x=x,
+                                    rows=np.full((1, 3), float(i)), ids=[i], names=[f"s{i}"])
+    assert h.count == 5
+    h2 = dl.accumulate_waterfall(h, generation=1, unit="q", x=x,   # re-deliver an old id
+                                 rows=np.full((1, 3), 1.0), ids=[1], names=["s1"])
+    assert h2.ids == (0, 1, 2, 3, 4) and h2.rows.shape == (5, 3)
+
+
+def test_accumulate_waterfall_generation_bump_resets():
+    np = pytest.importorskip("numpy")
+    x = np.array([0.0, 1.0, 2.0])
+    h = dl.accumulate_waterfall(None, generation=1, unit="q", x=x,
+                                rows=np.ones((1, 3)), ids=[7], names=["s7"])
+    h = dl.accumulate_waterfall(h, generation=2, unit="q", x=x,    # new generation
+                                rows=np.full((1, 3), 9.0), ids=[0], names=["s0"])
+    assert h.generation == 2 and h.ids == (0,) and h.count == 1
+    np.testing.assert_array_equal(h.rows[0], [9, 9, 9])
+
+
+def test_accumulate_waterfall_unit_toggle_relabels_grid_keeps_rows():
+    # A Q<->2theta toggle does NOT bump the generation: the rows are unit-invariant,
+    # so the grid is RELABELLED in place (incoming x in the new unit) and every
+    # captured row is kept -- no re-read, no loss.
+    np = pytest.importorskip("numpy")
+    xq = np.array([1.0, 2.0, 3.0])
+    h = None
+    for i in range(3):
+        h = dl.accumulate_waterfall(h, generation=1, unit="q_A^-1", x=xq,
+                                    rows=np.full((1, 3), float(i)), ids=[i], names=[f"s{i}"])
+    xtth = np.array([5.0, 10.0, 15.0])     # the same samples re-expressed in 2theta
+    h2 = dl.accumulate_waterfall(
+        h, generation=1, unit="2th_deg", x=xtth,
+        rows=np.vstack([np.full(3, float(i)) for i in range(3)]),
+        ids=[0, 1, 2], names=["s0", "s1", "s2"])
+    assert h2.count == 3 and h2.unit == "2th_deg"
+    np.testing.assert_array_equal(h2.x, xtth)              # grid relabelled in place
+    np.testing.assert_array_equal(h2.rows[0], [0, 0, 0])   # rows unchanged
+    np.testing.assert_array_equal(h2.rows[2], [2, 2, 2])
+
+
+def test_accumulate_waterfall_unit_toggle_with_evicted_frames_keeps_full_stack():
+    # Unit toggle where only the resident tail comes in (older frames evicted past
+    # the store cap): the accumulator keeps the FULL stack and relabels the grid.
+    np = pytest.importorskip("numpy")
+    xq = np.array([1.0, 2.0, 3.0])
+    h = None
+    for i in range(4):
+        h = dl.accumulate_waterfall(h, generation=1, unit="q_A^-1", x=xq,
+                                    rows=np.full((1, 3), float(i)), ids=[i], names=[f"s{i}"])
+    xtth = np.array([5.0, 10.0, 15.0])
+    h2 = dl.accumulate_waterfall(
+        h, generation=1, unit="2th_deg", x=xtth,
+        rows=np.vstack([np.full(3, 2.0), np.full(3, 3.0)]),
+        ids=[2, 3], names=["s2", "s3"])
+    assert h2.count == 4                                   # nothing lost
+    np.testing.assert_array_equal(h2.x, xtth)
+
+
 def test_gi_axes_uniform_detects_mismatch():
     q = [0.0, 1.0, 2.0]
     assert dl.gi_axes_uniform([(q, q), (q, q)]) is True

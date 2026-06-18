@@ -64,6 +64,8 @@ __all__ = [
     "Axis",
     "Trace",
     "PlotPayload",
+    "WaterfallHistory",
+    "accumulate_waterfall",
     "ImagePayload",
     "ResultsView",
     "DisplayState",
@@ -326,6 +328,116 @@ class PlotPayload:
     axis_y: "Axis | None" = None
     overlaid_ids: "tuple | None" = None      # frame ids accumulated (Overlay/Waterfall)
     plot_history: "object | None" = None     # immutable accumulator view
+
+
+@dataclass(frozen=True)
+class WaterfallHistory:
+    """Immutable, generation-stamped Overlay/Waterfall accumulator carried IN the
+    payload (``PlotPayload.plot_history``) -- the payload-owned successor to the
+    legacy mutable widget triple (``plot_data`` / ``frame_names`` / ``overlaid_idxs``).
+
+    Carrying it in the payload (rather than rebuilding from the publication store
+    each render) is the keystone of the flip: the store evicts heavy frames past a
+    cap, so a per-render rebuild from the store would re-introduce the cap-truncation
+    regression.  The accumulator instead retains every row it has captured.
+
+    All rows live on ONE shared sample grid (``x``); the adapter interpolates each
+    incoming frame onto it before accumulating.  ``rows[k]`` is frame ``ids[k]`` /
+    ``names[k]`` -- maintained row-for-row.  ``unit`` is the radial unit the grid is
+    currently labelled in (a Q<->2theta toggle relabels ``x`` in place, since the
+    intensities are unit-invariant)."""
+    generation: int
+    unit: str
+    x: "np.ndarray"          # shared radial sample grid (1-D, in `unit`)
+    rows: "np.ndarray"       # (n, len(x)) stacked intensities; row order == ids
+    ids: tuple               # captured frame ids, in row order
+    names: tuple             # captured frame names, in row order
+
+    @property
+    def count(self) -> int:
+        return len(self.ids)
+
+
+def _dedup_first(ids, names, rows):
+    """Keep the FIRST occurrence of each id (arrival order)."""
+    seen = set()
+    ki, kn, kr = [], [], []
+    for i, n, r in zip(ids, names, rows):
+        ii = int(i)
+        if ii in seen:
+            continue
+        seen.add(ii)
+        ki.append(ii)
+        kn.append(n)
+        kr.append(r)
+    return ki, kn, kr
+
+
+def accumulate_waterfall(history, *, generation, unit, x, rows, ids, names):
+    """Pure, append-only, generation-keyed Overlay/Waterfall accumulator (the
+    payload-owned successor to ``update_plot_accumulator`` + the widget triple).
+
+    Append-only WITHIN a generation: a partial / out-of-order / re-delivered read
+    can only ADD frames not yet captured -- it never shrinks the stack or re-stacks
+    a frame (the collapse/restack class, structurally precluded).  A generation bump
+    (mode / effective-selection / scan change) is the ONLY reset.
+
+    A plotUnit Q<->2theta toggle does NOT bump the generation, so ``unit`` changes
+    while ``generation`` does not: the accumulated rows are unit-invariant, so we
+    RELABEL the grid to the incoming (new-unit) ``x`` in place -- no re-read, no loss
+    of frames evicted past the store cap -- keeping every captured row.
+
+    ``x`` / ``rows`` / ``ids`` / ``names`` are the incoming frames, already on the
+    one shared grid (the adapter interpolated them).  Returns the next
+    :class:`WaterfallHistory`.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    rows = np.atleast_2d(np.asarray(rows, dtype=float))
+    ids = [int(i) for i in ids]
+    names = list(names)
+
+    # RESET: fresh generation (mode/selection/scan change), no prior history, or an
+    # empty incoming grid (nothing to anchor on -- keep the incoming as-is).
+    if history is None or history.generation != generation or x.size == 0:
+        ki, kn, kr = _dedup_first(ids, names, rows)
+        return WaterfallHistory(
+            generation=generation, unit=unit, x=x,
+            rows=(np.asarray(kr, dtype=float) if kr
+                  else np.empty((0, x.size), dtype=float)),
+            ids=tuple(ki), names=tuple(kn))
+
+    # Same generation: keep the accumulated rows; relabel the grid on a unit toggle
+    # (incoming x is the same sample grid in the new unit), then append new ids.
+    base_x = (x if history.unit != unit and x.size == history.x.size
+              else history.x)
+    base_rows = history.rows
+    out_ids = list(history.ids)
+    out_names = list(history.names)
+    have = set(history.ids)
+
+    add = []
+    for i, n, r in zip(ids, names, rows):
+        if i in have:
+            continue
+        have.add(i)
+        out_ids.append(i)
+        out_names.append(n)
+        # The incoming row is on the shared grid already; reinterp defensively only
+        # if the grid sample-count differs (e.g. a mid-generation Npts hiccup).
+        r = np.asarray(r, dtype=float)
+        if r.size != base_x.size and x.size == r.size and x.size > 0:
+            r = np.interp(base_x, x, r)
+        add.append(r)
+
+    if add:
+        add = np.atleast_2d(np.asarray(add, dtype=float))
+        new_rows = (np.vstack([base_rows, add]) if base_rows.size else add)
+    else:
+        new_rows = base_rows
+
+    return WaterfallHistory(
+        generation=generation, unit=unit, x=base_x, rows=new_rows,
+        ids=tuple(out_ids), names=tuple(out_names))
 
 
 @dataclass(frozen=True)
