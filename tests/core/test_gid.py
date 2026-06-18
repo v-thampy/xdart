@@ -178,6 +178,75 @@ def test_nan_empty_1d_marks_zero_count_bins():
     np.testing.assert_array_equal(_nan_empty_1d(res2), [1.0, 2.0])
 
 
+def test_nan_empty_2d_marks_zero_count_bins():
+    """2D analog of the 1D guarantee: empty (count==0) bins -> NaN, but a GENUINE
+    zero-photon bin (count>0, value 0) is PRESERVED -- keyed on count, not value,
+    so the missing-wedge dummy (-1) is masked while real zeros survive."""
+    from types import SimpleNamespace
+    from xrd_tools.integrate.gid import _nan_empty_2d
+    intensity = np.array([[0.0, 5.0, -1.0],
+                          [2.0, 0.0, -1.0]])    # the -1 column is the empty wedge
+    count = np.array([[3, 2, 0],
+                      [1, 4, 0]])               # only the last column has count==0
+    res = SimpleNamespace(intensity=intensity, count=count)
+    out = _nan_empty_2d(res.intensity, res)
+    assert np.isnan(out[:, 2]).all()            # empty wedge -> NaN (no dummy)
+    assert out[0, 0] == 0.0 and out[1, 1] == 0.0   # genuine zeros (count>0) kept
+    assert out[0, 1] == 5.0 and out[1, 0] == 2.0
+    # defensive: no shape-matching count -> unchanged
+    res2 = SimpleNamespace(intensity=np.array([[1.0, 2.0]]), count=None)
+    np.testing.assert_array_equal(_nan_empty_2d(res2.intensity, res2), [[1.0, 2.0]])
+
+
+def test_to_result_2d_nan_fills_empty_bins_in_intensity_and_sigma():
+    """_to_result_2d masks empty bins in BOTH intensity and sigma, in the
+    transposed (npt_ip, npt_oop) orientation, while preserving genuine zeros."""
+    from types import SimpleNamespace
+    from xrd_tools.integrate.gid import _to_result_2d
+    # pyFAI orientation (npt_oop, npt_ip) = (2, 3); _to_result_2d transposes -> (3, 2)
+    intensity = np.array([[0.0, 5.0, -1.0],
+                          [2.0, 0.0, 7.0]])
+    sigma = np.array([[0.1, 0.2, -1.0],
+                      [0.3, 0.4, 0.5]])
+    count = np.array([[4, 2, 0],
+                      [1, 3, 6]])
+    res = SimpleNamespace(intensity=intensity, sigma=sigma, count=count,
+                          radial=np.arange(3.0), azimuthal=np.arange(2.0),
+                          inplane=None, outofplane=None, ip_unit=None, oop_unit=None)
+    out = _to_result_2d(res, unit_fallback="qip_A^-1")
+    assert out.intensity.shape == (3, 2)            # transposed
+    assert np.isnan(out.intensity[2, 0])            # (oop=0, ip=2) empty -> NaN
+    assert out.intensity[0, 0] == 0.0               # genuine zero (count 4) preserved
+    assert out.intensity[1, 1] == 0.0               # genuine zero (count 3) preserved
+    assert np.isnan(out.sigma[2, 0])                # sigma empty bin -> NaN too
+    assert out.sigma[0, 0] == 0.1
+
+
+@pytest.mark.slow
+def test_gi_2d_cake_empty_bins_are_nan_not_dummy(poni_fixture, synthetic_image):
+    """Regression (the reported bug): the live GI 2D cake marks empty wedge/gap
+    bins NaN, not the pyFAI dummy (-1 under method='no').  So projecting the cake
+    to 1D via nanmean is never dragged negative by the missing wedge -- the cause
+    of the negative/depressed GI Q-projected profile."""
+    fi = create_fiber_integrator(poni_fixture, incident_angle=0.2)
+    result = integrate_gi_polar(synthetic_image, fi, npt_rad=200, npt_azim=100)
+    cake = np.asarray(result.intensity, dtype=float)
+    assert np.isnan(cake).any()                     # the empty wedge became NaN
+    # the synthetic image is non-negative -> no real bin is < 0; if the dummy -1
+    # had survived (the bug), the finite minimum would be ~-1.
+    finite = cake[np.isfinite(cake)]
+    assert finite.min() >= -1e-9
+    # the cake->1D projection (nanmean over the oop axis) stays non-negative
+    # (an all-NaN wedge column yields NaN -> warns; production uses the
+    # warning-suppressing nanmean_slice, so silence it here):
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        proj = np.nanmean(cake, axis=1)
+    proj = proj[np.isfinite(proj)]
+    assert proj.min() >= -1e-9
+
+
 def test_freeze_common_axis_qtotal_floor_at_zero():
     """Regression: q_total's symmetric pad must not push the frozen lower bound
     below 0 (negative-q bins integrate to a spurious flat dummy line — the

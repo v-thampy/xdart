@@ -112,10 +112,12 @@ def _to_result_2d(result: Any, unit_fallback: str,
         ``.inplane`` / ``.outofplane`` attributes — the renamed aliases
         for the same two axes.
     """
-    # pyFAI shape: (npt_oop, npt_ip) → transpose to (npt_ip, npt_oop)
-    intensity = np.asarray(result.intensity, dtype=float).T
+    # pyFAI shape: (npt_oop, npt_ip) → transpose to (npt_ip, npt_oop).
+    # NaN-mask empty bins BEFORE the transpose, while intensity/sigma are still
+    # in pyFAI orientation (matching result.count) — see _nan_empty_2d.
+    intensity = _nan_empty_2d(result.intensity, result).T
     sigma = (
-        np.asarray(result.sigma, dtype=float).T
+        _nan_empty_2d(result.sigma, result).T
         if result.sigma is not None
         else None
     )
@@ -227,6 +229,30 @@ def _nan_empty_1d(result):
         if count.shape == intensity.shape:
             intensity = np.where(count == 0, np.nan, intensity)
     return intensity
+
+
+def _nan_empty_2d(arr, result):
+    """2D analog of :func:`_nan_empty_1d`: return ``arr`` with EMPTY bins
+    (``result.count == 0``) set to NaN.
+
+    The GI 2D cake never got the 1D path's empty-bin treatment, so the missing
+    wedge / masked detector gaps — which pyFAI fills with the dummy (``-1`` under
+    method ``'no'``, the live path; ``0`` under split methods) — averaged into the
+    cake→1D projection (``nanmean`` treats ``-1`` as real data) and the 2D Overall
+    aggregate, dragging the projected profile spuriously negative/depressed across
+    the gap columns.  Keyed on COUNT, not value, so genuine zero-photon bins
+    (``count > 0``, intensity ``0``) are PRESERVED and the split-method ``0``/dummy
+    fills are caught too.  ``arr`` must be in pyFAI orientation (same shape as
+    ``result.count``) — call this BEFORE the ``(npt_oop, npt_ip)→(npt_ip, npt_oop)``
+    transpose.  Defensive: unchanged if no shape-matching per-bin count is exposed.
+    """
+    arr = np.asarray(arr, dtype=float)
+    count = getattr(result, "count", None)
+    if count is not None:
+        count = np.asarray(count)
+        if count.shape == arr.shape:
+            arr = np.where(count == 0, np.nan, arr)
+    return arr
 
 
 def integrate_gi_1d(
