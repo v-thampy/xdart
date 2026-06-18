@@ -237,8 +237,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         for _c in (self.ui.normChannel, self.ui.scale, self.ui.cmap):
             displayFrameWidget._fit_combo_width(_c, max_w=130)
             _c.setFixedHeight(_ROW_H)
-        # +7% width so the wider 'Clear BG' label isn't clipped (Vivek).
-        displayFrameWidget._fit_button_width(self.ui.setBkg, scale=1.07)
+        # Widen the BG button (+7%, then another +10% = x1.177) so the 'Clear BG'
+        # label has comfortable room (Vivek).
+        displayFrameWidget._fit_button_width(self.ui.setBkg, scale=1.177)
         self.ui.setBkg.setFixedHeight(_ROW_H)
         # The SCALE combo moves into the Options popup ('Other' row); the
         # colormap stays in the bar.  One checkable 'Log' toggle = Linear <->
