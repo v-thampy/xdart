@@ -1222,6 +1222,7 @@ class integratorTree(QtWidgets.QWidget):
             self.ui.axis1D.clear()
             self.ui.axis1D.addItem(_translate("Form", Units[0]))   # Q (Å⁻¹)
             self.ui.axis1D.addItem(_translate("Form", Units[1]))   # 2θ (°)
+            self.ui.axis1D.addItem(_translate("Form", Units[2]))   # χ (°) azimuthal profile
             self.ui.axis2D.clear()
             self.ui.axis2D.addItem(_translate("Form", f"Q-{Chi}"))
             self.ui.axis2D.addItem(_translate("Form", f"2{Th}-{Chi}"))
@@ -1247,6 +1248,10 @@ class integratorTree(QtWidgets.QWidget):
             for _combo in (self.ui.unit_1D, self.ui.unit_2D):
                 if _combo.count() < 2:
                     _combo.addItem(_translate("Form", Units[1]))
+            # The 1D combo also offers chi (azimuthal profile, 1D-only); a GI visit
+            # trimmed it to <=2 items, so restore the third here too.
+            if self.ui.unit_1D.count() < 3:
+                self.ui.unit_1D.addItem(_translate("Form", Units[2]))
             # Update radial labels + range defaults for current unit
             self._update_standard_1d_label(self.ui.axis1D.currentIndex())
             self._update_standard_2d_label(self.ui.axis2D.currentIndex())
@@ -1520,6 +1525,12 @@ class integratorTree(QtWidgets.QWidget):
             unit = '2th_deg'
             label = f"2{Th} ({Deg})"
             self._set_range_defaults_1d(0, 90, -180, 180)
+        elif n == 2:  # χ (azimuthal profile): OUTPUT axis is χ, but the editable
+            # radial-range field is the q BAND integrated over (always Q), so the
+            # range label stays Q and the band defaults to a Q range.
+            unit = 'chi_deg'
+            label = f"Q ({AA_inv})"
+            self._set_range_defaults_1d(0, 5, -180, 180)
         else:  # Q
             unit = 'q_A^-1'
             label = f"Q ({AA_inv})"

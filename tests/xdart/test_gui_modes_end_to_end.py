@@ -1910,5 +1910,5 @@ def test_gi_entry_forces_q_unit(widget):
     tree.scan.gi = False
     tree.set_image_units()
     assert tree.scan.bai_1d_args['unit'] == 'q_A^-1'    # stays Q, no surprise
-    assert tree.ui.unit_1D.count() == 2                 # 2th is back
-    assert tree.ui.unit_2D.count() == 2
+    assert tree.ui.unit_1D.count() == 3                 # 2θ + χ (azimuthal) back
+    assert tree.ui.unit_2D.count() == 2                 # 2D has no χ profile
