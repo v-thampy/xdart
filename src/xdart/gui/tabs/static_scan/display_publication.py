@@ -331,7 +331,8 @@ class PublicationDisplayAdapter:
         gap_indices = combine_flat_masks(
             getattr(_scan, "global_mask", None),
             *mask_parts,
-            size=(int(full_shape[0]) * int(full_shape[1])) if full_shape else None,
+            size=(int(full_shape[0]) * int(full_shape[1]))
+            if full_shape is not None else None,
         )
         if full_shape is not None and tuple(image.shape) != tuple(full_shape):
             nan_gaps_in_thumbnail(image, gap_indices, full_shape)

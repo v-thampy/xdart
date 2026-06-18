@@ -864,30 +864,39 @@ class DisplayPlotMixin:
         * anything else → ``scan_info[wf_yaxis]`` directly.
 
         For everything but ``'Frame #'`` we lift the values from each frame's
-        metadata via :meth:`_frame_scan_info` (store-first; Phase 3c) for every
-        idx in ``self.idxs``, then slice with the same wf_start/wf_step the data
-        uses.
+        metadata via :meth:`_frame_scan_info` (store-first; Phase 3c) for the
+        ACTUAL accumulated row ids, then slice with the same wf_start/wf_step the
+        data uses.  The waterfall image rows come from the accumulator
+        (``overlaid_idxs``), which after a preserved partial read or
+        non-contiguous accumulation need NOT equal ``self.idxs`` -- so building the
+        y-axis from ``self.idxs`` could drift the metadata values off the rendered
+        rows.  Use ``overlaid_idxs`` (it is maintained row-for-row with
+        ``plot_data``), falling back to ``_plot_row_ids`` / ``self.idxs``.
         """
         if self.wf_yaxis == 'Frame #':
             return np.asarray(np.arange(n_rows) + self.wf_start + 1,
                               dtype=float)
+        row_ids = (getattr(self, 'overlaid_idxs', None)
+                   or getattr(self, '_plot_row_ids', None)
+                   or self.idxs)
+        row_ids = [int(i) for i in row_ids]
         try:
             if self.wf_yaxis == 'Time (s)':
                 s_ydata = np.asarray(
                     [self._frame_scan_info(idx)['epoch']
-                     for idx in self.idxs]
+                     for idx in row_ids]
                 )
                 s_ydata -= s_ydata.min()
             elif self.wf_yaxis == 'Time (minutes)':
                 s_ydata = np.asarray(
                     [self._frame_scan_info(idx)['epoch']
-                     for idx in self.idxs]
+                     for idx in row_ids]
                 ) / 60.
                 s_ydata -= s_ydata.min()
             else:
                 s_ydata = np.asarray(
                     [self._frame_scan_info(idx)[self.wf_yaxis]
-                     for idx in self.idxs]
+                     for idx in row_ids]
                 )
             return s_ydata[self.wf_start:self.wf_stop:self.wf_step]
         except KeyError as e:
