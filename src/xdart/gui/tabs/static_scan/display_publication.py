@@ -342,10 +342,23 @@ class PublicationDisplayAdapter:
         # display_frame_widget transposes every ImagePayload, so pre-flip
         # here to preserve the visible detector orientation exactly.
         image = image[::-1, :]
+        # Universal raw-display policy: a downsampled thumbnail is the usual source,
+        # so label its Pixels axes with the TRUE detector extent (full_shape =
+        # (rows=y, cols=x)) rather than the thumbnail's own size -- otherwise the
+        # panel reads 0..256 instead of the real 0..2070 / 0..2167.  get_rect uses
+        # the axis min/max, so spanning [0, full-1] across the thumbnail's pixels
+        # stretches it to the correct dimensions.  Full-res (image.shape ==
+        # full_shape) and the no-detector-shape fallback both reduce to arange.
+        rows, cols = (int(full_shape[0]), int(full_shape[1])) \
+            if full_shape is not None else image.shape
+        ax = (np.linspace(0.0, cols - 1, image.shape[1])
+              if image.shape[1] > 1 else np.arange(image.shape[1], dtype=float))
+        ay = (np.linspace(0.0, rows - 1, image.shape[0])
+              if image.shape[0] > 1 else np.arange(image.shape[0], dtype=float))
         return ImagePayload(
             image=image,
-            axis_x=Axis("x", "Pixels", values=np.arange(image.shape[1])),
-            axis_y=Axis("y", "Pixels", values=np.arange(image.shape[0])),
+            axis_x=Axis("x", "Pixels", values=ax),
+            axis_y=Axis("y", "Pixels", values=ay),
             gap_mask_indices=gap_indices,
             raw_full_shape=tuple(full_shape) if full_shape is not None else None,
         )

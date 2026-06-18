@@ -869,6 +869,39 @@ def test_raw_image_uses_scan_detector_shape_without_widget_cache():
     assert np.isnan(payload.image[24:26, :]).all()
 
 
+def test_raw_image_thumbnail_axes_span_true_detector_extent():
+    # Universal raw-display policy: a downsampled thumbnail is rect-scaled to the
+    # TRUE detector dimensions, so its Pixels axes read 0..(full-1), NOT the
+    # thumbnail's own 0..49 (the wrong-dimensions bug Vivek caught in Overlay).
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xdart.gui.tabs.static_scan.display_logic import RawSource
+    thumb = np.ones((50, 50), dtype=float)
+    pub = SimpleNamespace(
+        view=SimpleNamespace(thumbnail=thumb),
+        raw_ref=SimpleNamespace(mask=None, bg_raw=0, thumbnail=thumb),
+        metadata_raw={},
+    )
+    store = SimpleNamespace(snapshot=lambda: {0: pub})
+    widget = SimpleNamespace(
+        scan=SimpleNamespace(global_mask=None, mask_sentinel=True,
+                             detector_shape=(100, 120)),   # rows=100, cols=120
+        bkg_map_raw=0,
+    )
+    adapter = PublicationDisplayAdapter(store, widget=widget)
+    state = SimpleNamespace(
+        overall=False, method="Single", selected_ids=(0,), render_ids=(0,),
+        panel=lambda role: SimpleNamespace(has_data=True, source=RawSource.THUMBNAIL),
+    )
+    payload = adapter.raw_image(state)
+    assert payload is not None
+    # axis_x -> columns (true 120), axis_y -> rows (true 100); the 50x50 thumbnail's
+    # axes span the FULL detector extent (still 50 pixel samples each).
+    assert payload.axis_x.values[0] == 0.0 and payload.axis_x.values[-1] == 119.0
+    assert payload.axis_y.values[0] == 0.0 and payload.axis_y.values[-1] == 99.0
+    assert len(payload.axis_x.values) == 50 and len(payload.axis_y.values) == 50
+
+
 def test_nan_thumbnail_gaps_prefers_scan_detector_shape():
     # The widget helper sources the full-res shape from scan.detector_shape when
     # the live widget cache (_raw_full_shape) is absent.

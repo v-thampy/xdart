@@ -1115,21 +1115,21 @@ def compute_display_state(*, mode, selected_ids, all_frame_index, loaded_1d_keys
     ready = load_status is LoadStatus.READY
 
     # 2D-raw panel: the raw-vs-thumbnail-vs-none decision (mask only on full
-    # raw — §8 invariant).  Only the multi-frame Sum/Average AGGREGATION prefers
-    # thumbnails (matching update_image's prefer_thumbnail path + _display_ids_for_2d,
-    # which aggregates the whole set only for Sum/Average).  Single/Overlay/Waterfall
-    # render just the LATEST 2D frame (render_2d[-1]), so probe THAT frame's
-    # availability and keep full-res RAW.  A bare ``overall`` + ``render_2d[0]`` made
-    # Overlay/Waterfall (overall=True once Auto-Last selects every frame) render the
-    # latest frame's THUMBNAIL even though its full-res raw is resident.
+    # raw — §8 invariant).  UNIVERSAL raw-display policy: the Int 2D raw panel is
+    # display-only, so ALWAYS prefer the (cheap, ~70x smaller) thumbnail and fall
+    # back to full-res RAW ONLY when no thumbnail exists (e.g. a no-.nxs run).  This
+    # is the single consistent policy across Single/Overlay/Waterfall/Sum/Average,
+    # and it keeps the live raw repaint cheap (thumbnail copy/levels/upload instead
+    # of the full detector).  raw_image rect-scales the thumbnail to the true
+    # detector extent, so the displayed dimensions stay correct.  Probe the
+    # displayed frame (the latest for the single-frame views; the first for the
+    # Sum/Average aggregation) so the full-res fallback keys off the right frame.
     if ready and render_2d:
-        aggregating = method in ("Sum", "Average")
-        probe = render_2d[0] if aggregating else render_2d[-1]
+        probe = render_2d[0] if method in ("Sum", "Average") else render_2d[-1]
         avail = _availability(raw_availability, probe)
-        prefer_thumb = aggregating and overall and len(render_2d) > 1
         raw_src = choose_raw_source(
             bool(avail.get('has_raw')), bool(avail.get('has_thumbnail')),
-            prefer_thumbnail=prefer_thumb, want_raw=True)
+            prefer_thumbnail=True, want_raw=True)
     else:
         raw_src = RawSource.NONE
 

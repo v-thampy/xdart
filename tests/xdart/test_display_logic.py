@@ -322,39 +322,39 @@ def test_mode_switch_bumps_generation_and_clears_title():
     assert xye.title == 'iq_scan_0001.xye'
 
 
-def test_overlay_overall_renders_latest_full_res_raw_not_thumbnail():
-    # Regression: Overlay/Waterfall auto-last selects ALL frames -> overall=True,
-    # but it renders only the LATEST 2D frame (render_2d[-1]).  The raw panel must
-    # use THAT frame's FULL-RES raw, not a thumbnail -- an EARLIER frame whose raw
-    # was evicted (only thumbnail resident) must not force the latest into thumbnail
-    # dimensions.  (Pre-fix: probe render_2d[0] + bare `overall` -> THUMBNAIL.)
-    raw_avail = {
-        0: dict(has_raw=False, has_thumbnail=True),   # earliest: raw evicted
-        1: dict(has_raw=True, has_thumbnail=True),
-        2: dict(has_raw=True, has_thumbnail=True),    # latest: full-res resident
-    }
-    for method in ("Overlay", "Waterfall", "Single"):
-        state = dl.compute_display_state(**_base_state_kwargs(
-            mode=dl.Mode.INT_2D, method=method,
-            selected_ids=(0, 1, 2), all_frame_index=[0, 1, 2],
-            loaded_1d_keys={0, 1, 2}, loaded_2d_keys={0, 1, 2},
-            raw_availability=raw_avail,
-        ))
-        assert state.panel(dl.PanelRole.RAW_2D).source is dl.RawSource.RAW, method
-
-
-def test_sum_average_overall_still_prefers_thumbnail_for_aggregation():
-    # Unchanged: Sum/Average AGGREGATE the whole overall selection, so they keep
-    # the prefer-thumbnail fast path (the only multi-frame raw aggregation).
+def test_raw_panel_prefers_thumbnail_universally():
+    # Universal raw-display policy: the Int 2D raw panel is display-only, so EVERY
+    # method prefers the (cheap) thumbnail when one exists -- Single/Overlay/
+    # Waterfall AND the Sum/Average aggregation.  raw_image rect-scales it to the
+    # true detector extent, so the displayed dimensions stay correct.  Thumbnails
+    # are pre-baked, so the full-detector mask is NOT applied (apply_mask False).
     raw_avail = {i: dict(has_raw=True, has_thumbnail=True) for i in (0, 1, 2)}
-    for method in ("Sum", "Average"):
+    for method in ("Single", "Overlay", "Waterfall", "Sum", "Average"):
         state = dl.compute_display_state(**_base_state_kwargs(
             mode=dl.Mode.INT_2D, method=method,
             selected_ids=(0, 1, 2), all_frame_index=[0, 1, 2],
             loaded_1d_keys={0, 1, 2}, loaded_2d_keys={0, 1, 2},
             raw_availability=raw_avail,
         ))
-        assert state.panel(dl.PanelRole.RAW_2D).source is dl.RawSource.THUMBNAIL, method
+        panel = state.panel(dl.PanelRole.RAW_2D)
+        assert panel.source is dl.RawSource.THUMBNAIL, method
+        assert panel.apply_mask is False, method
+
+
+def test_raw_panel_falls_back_to_full_res_only_when_no_thumbnail():
+    # Full-res RAW is the FALLBACK, used only when no thumbnail exists (e.g. a
+    # no-.nxs run) -- then the full-detector mask DOES apply (apply_mask True).
+    raw_avail = {i: dict(has_raw=True, has_thumbnail=False) for i in (0, 1, 2)}
+    for method in ("Single", "Overlay", "Sum"):
+        state = dl.compute_display_state(**_base_state_kwargs(
+            mode=dl.Mode.INT_2D, method=method,
+            selected_ids=(0, 1, 2), all_frame_index=[0, 1, 2],
+            loaded_1d_keys={0, 1, 2}, loaded_2d_keys={0, 1, 2},
+            raw_availability=raw_avail,
+        ))
+        panel = state.panel(dl.PanelRole.RAW_2D)
+        assert panel.source is dl.RawSource.RAW, method
+        assert panel.apply_mask is True, method
 
 
 def test_image_viewer_does_not_depend_on_scan_frames():
