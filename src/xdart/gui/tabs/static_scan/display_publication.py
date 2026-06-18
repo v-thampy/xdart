@@ -27,6 +27,7 @@ from .display_logic import (
     PlotPayload,
     RawSource,
     Trace,
+    accumulate_waterfall,
     combine_flat_masks,
     nan_gaps_in_thumbnail,
     sentinel_mask,
@@ -724,6 +725,82 @@ class PublicationDisplayAdapter:
         if not traces or axis is None:
             return None
         return PlotPayload(axis_x=axis, traces=tuple(traces))
+
+    # ----------------------------------------------------------------- #
+    # Overlay/Waterfall payload (flip stage 2): the accumulator is carried IN the
+    # payload (PlotPayload.plot_history), NOT rebuilt from the store each render --
+    # the store evicts past its cap, so a per-render rebuild would re-introduce the
+    # cap-truncation regression.  This builds the resident 1D frames onto a shared
+    # ref grid (mirroring integration_plot_payload) and ACCUMULATES them into the
+    # generation-keyed WaterfallHistory.  NOT yet wired into plot_payload's return
+    # (legacy update_plot still renders) -- stage 4 flips the delegate.  The widget
+    # owns the prior history (read here, stored back by the renderer at stage 3/4).
+    # ----------------------------------------------------------------- #
+    def _overlay_waterfall_payload(self, state):
+        """Accumulate the resident 1D frames into the generation-keyed
+        WaterfallHistory and return a PlotPayload carrying it.  Preserves the
+        legacy invariants: a render with no resident 1D frames PRESERVES the prior
+        accumulator (never wipes -- the failed-read invariant); a generation bump
+        resets it; a plotUnit Q<->2theta toggle relabels the grid in place (handled
+        in accumulate_waterfall).  Returns ``None`` only when there is nothing to
+        show and no prior accumulator."""
+        widget = self._widget
+        prior = getattr(widget, "_waterfall_history", None)
+
+        ref_x = None
+        axis = None
+        ids, names, rows = [], [], []
+        for label in state.render_ids:
+            pub = self._items.get(_label_key(label))
+            if pub is None or not pub.view.has_1d or publication_has_1d_errors(pub):
+                continue
+            view = pub.view
+            x = np.asarray(view.axis_1d.values, dtype=float)
+            y = np.asarray(view.intensity_1d, dtype=float)
+            if x.shape != y.shape:
+                continue
+            y = self._normalize(y, pub.metadata_raw)
+            x, conv_axis = self._apply_plot_unit_1d(
+                x, str(getattr(view.axis_1d, "unit", "") or ""), pub)
+            this_axis = (conv_axis if conv_axis is not None
+                         else _axis_for_publication(view.axis_1d))
+            if ref_x is None:
+                ref_x = x
+                axis = this_axis
+            elif x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
+                y = np.interp(ref_x, x, y)
+                x = ref_x
+            ids.append(int(label))
+            names.append(_trace_name(pub, widget))
+            rows.append(y)
+
+        if ref_x is None:
+            # No resident 1D frame this render: PRESERVE the prior accumulator (the
+            # append-only / failed-read invariant) -- never wipe it.  Re-emit its
+            # payload when it belongs to the current generation, else nothing.
+            if (prior is not None and prior.generation == state.generation
+                    and prior.count):
+                return self._history_to_payload(prior)
+            return None
+
+        unit = str(getattr(axis, "unit", "") or "")
+        history = accumulate_waterfall(
+            prior, generation=state.generation, unit=unit,
+            x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names)
+        return self._history_to_payload(history)
+
+    def _history_to_payload(self, history):
+        """Project a :class:`WaterfallHistory` into a :class:`PlotPayload` -- one
+        layered :class:`Trace` per accumulated frame, plus the carried accumulator
+        (``overlaid_ids`` / ``plot_history``) so the renderer + the next render
+        read it back."""
+        label, _sym = x_axis_for_unit(history.unit)
+        axis = Axis(label, history.unit)
+        traces = tuple(
+            Trace(label=history.names[k], x=history.x, y=history.rows[k])
+            for k in range(history.count))
+        return PlotPayload(axis_x=axis, traces=traces,
+                           overlaid_ids=tuple(history.ids), plot_history=history)
 
     def _apply_plot_unit_1d(self, x_values, data_unit, ref_publication):
         """1D analog of :meth:`_apply_image_unit_2d`: on-the-fly Q↔2θ for the

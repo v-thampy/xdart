@@ -411,6 +411,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.frames = frames
         self.frame_names = []
         self.overlaid_idxs = []
+        # Flip stage 2: the payload-carried Overlay/Waterfall accumulator
+        # (generation-keyed WaterfallHistory). Lives alongside the legacy triple
+        # until the render path delegates to it (stage 3/4); reset at the same
+        # accumulator-lifecycle sites (new_scan, clear_overlay).
+        self._waterfall_history = None
         self.data_1d = data_1d
         self.data_2d = data_2d
         self.bkg_1d = 0.
@@ -2365,6 +2370,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.frame_names = []
         self.overlaid_idxs = []
+        self._waterfall_history = None
         self.update()
 
     def setBkg(self):
@@ -2448,6 +2454,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.plot_data_range = [[0, 0], [0, 0]]
         self.frame_names = []
         self.overlaid_idxs = []
+        self._waterfall_history = None
         # Forget which scan the (now empty) accumulator belonged to, so the next
         # render re-stamps it for the current scan.
         self._overlay_scan_key = None
