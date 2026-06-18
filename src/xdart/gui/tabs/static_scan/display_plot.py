@@ -80,6 +80,20 @@ def update_plot_accumulator(
     )
 
     if overlay_action is OverlayAction.REBUILD:
+        # Monotonicity invariant: a REBUILD RE-EXPRESSES the accumulated frames in
+        # a new unit -- it must reproduce the EXACT prior id set, never change it.
+        # A REBUILD whose incoming ids differ from the accumulator is a CORRUPT
+        # re-read: a spurious unit_changed sent us down the re-read fallback, and
+        # the cap-store had evicted older frames, so the non-blocking re-read came
+        # back partial/holey and prefix-MISLABELED (e.g. resident frames 37..100
+        # shown as scan_1..scan_64).  Reject it and KEEP the prior accumulator
+        # rather than shrink+relabel the visible stack (the intermittent
+        # collapse-and-restack regression).  Legitimate resets (Clear / new scan /
+        # mode switch) go through clear_overlay -> prev ids empty -> plan_overlay
+        # returns REPLACE (not REBUILD), so they never reach this guard.  A genuine
+        # same-unit-count Q<->2theta re-express reproduces the id set and passes.
+        if set(int(i) for i in new_ids) != set(ids):
+            return list(prev_plot_data), list(names), list(ids)
         return [new_x, new_y], list(new_names), [int(i) for i in new_ids]
 
     if overlay_action is not OverlayAction.APPEND:

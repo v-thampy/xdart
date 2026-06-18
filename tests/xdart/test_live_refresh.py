@@ -679,6 +679,59 @@ def test_update_plot_clears_when_no_overlay_accumulator_and_read_fails():
     assert "draw" not in calls
 
 
+def test_accumulator_rejects_rebuild_that_shrinks_id_set():
+    """The intermittent collapse-and-restack regression: a spurious unit_changed
+    sent a live Overlay/Waterfall down the REBUILD re-read fallback, and a
+    cap-store eviction made the non-blocking re-read PARTIAL, so the REBUILD branch
+    truncated + prefix-mislabeled the accumulator (100 -> 64; resident tail shown
+    as scan_0..scan_63), then APPEND re-grew it (the re-stack).  The monotonicity
+    guard rejects any REBUILD whose id SET differs from the accumulator and keeps
+    the prior stack."""
+    x = np.linspace(0, 5, 10)
+    prev_ids = list(range(100))
+    prev_rows = np.ones((100, 10))
+    prev_names = [f"scan_{i}" for i in prev_ids]
+
+    # Cap-store evicted the head: the re-read returned only 64 resident rows, which
+    # the fallback prefix-labels scan_0..scan_63 (the mislabel) -> a shrunk id set.
+    kept_ids = list(range(64))
+    new_rows = np.full((64, 10), 2.0)
+    new_names = [f"scan_{i}" for i in kept_ids]
+
+    pd, names, ids = update_plot_accumulator(
+        [x, prev_rows], prev_names, prev_ids,
+        x, new_rows, new_names, kept_ids,
+        method="Waterfall", unit_changed=True,
+    )
+
+    assert ids == prev_ids                                 # id set preserved
+    assert names == prev_names                             # labels preserved
+    assert np.asarray(pd[1]).shape[0] == 100               # full stack kept
+    np.testing.assert_array_equal(np.asarray(pd[1]), prev_rows)
+
+
+def test_accumulator_rebuild_reexpresses_when_id_set_matches():
+    """A LEGITIMATE unit re-express (every frame resident) reproduces the exact id
+    set, so the guard passes and the REBUILD swaps in the new-unit x for all rows
+    (this is the instant Q<->2theta re-express that must still work)."""
+    old_x = np.linspace(0, 5, 10)
+    new_x = np.linspace(1, 6, 10)                          # re-expressed axis
+    ids = list(range(100))
+    prev_rows = np.ones((100, 10))
+    new_rows = np.full((100, 10), 3.0)
+    names = [f"scan_{i}" for i in ids]
+
+    pd, out_names, out_ids = update_plot_accumulator(
+        [old_x, prev_rows], names, ids,
+        new_x, new_rows, names, ids,
+        method="Waterfall", unit_changed=True,
+    )
+
+    assert out_ids == ids
+    np.testing.assert_array_equal(np.asarray(pd[0]), new_x)   # x re-expressed
+    np.testing.assert_array_equal(np.asarray(pd[1]), new_rows)
+
+
 def _display_host():
     image_widget = _FakeImageWidget()
     binned_widget = _FakeImageWidget()

@@ -1943,6 +1943,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             )
         self.ui.plotUnit.blockSignals(False)
         self.ui.imageUnit.blockSignals(False)
+        # Re-baseline the Overlay/Waterfall unit-change tracker to the freshly
+        # rebuilt combo so a PROGRAMMATIC combo rebuild never registers as a
+        # spurious user unit change on the next overlay render.  That stale
+        # _last_plot_unit was the trigger that sent a live overlay down the
+        # REBUILD partial-read path and collapsed/re-stacked the waterfall.
+        self._last_plot_unit = self.ui.plotUnit.currentIndex()
 
         # Update slice enable/disable for current selection
         self._on_plotUnit_changed()
@@ -2645,6 +2651,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self.ui.cmap.setVisible(True)   # restore if hidden by XYE viewer
             self.ui.plotUnit.setVisible(True)
             self.ui.plotUnit.setEnabled(True)
+            # Re-baseline the Overlay/Waterfall unit tracker on the return to a
+            # processing mode: a viewer round-trip leaves plotUnit hidden/rebuilt
+            # and never updated _last_plot_unit, which then read as a spurious unit
+            # change and sent the next live overlay down the REBUILD partial-read
+            # collapse.  Sync it to the now-restored combo so only a genuine user
+            # unit toggle registers.
+            self._last_plot_unit = self.ui.plotUnit.currentIndex()
             self.ui.plotMethod.setEnabled(True)
             # Slice enable/disable depends on which axis is selected
             self._on_plotUnit_changed()
