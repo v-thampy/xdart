@@ -131,7 +131,7 @@ INTEGRATED_ROW_ALIGNED = frozenset({"frame_index", "intensity", "sigma"})
 #: cycle) and on-disk names are never derived from GUI labels — the
 #: ``frame.gi_1d`` / ``gi_2d`` dict keys (``qtotal``/``polar``/``gi2d``…) are
 #: GUI/legacy spellings and MUST NOT reach disk.  Frozen forever.
-GI_MODE_KEYS_1D = frozenset({"q_total", "q_ip", "q_oop", "exit_angle"})
+GI_MODE_KEYS_1D = frozenset({"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi"})
 GI_MODE_KEYS_2D = frozenset({"qip_qoop", "q_chi", "exit_angles"})
 
 #: mode_key → on-disk NXdata subgroup name.  Identity for GI keys (the enum

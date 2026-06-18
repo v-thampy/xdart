@@ -880,6 +880,24 @@ class DisplayDataMixin:
         if axis_type == 'radial':
             # Display along radial, slice along azimuthal
             xdata = radial
+            # Convert the cake's radial axis to the SELECTED plotUnit (Q<->2θ) so a
+            # 2D-DERIVED radial entry returns the right unit regardless of the
+            # cake's integration unit — e.g. the chi-integration mode's "2θ" cake
+            # entry must return degrees even when the cake was integrated in Q (and
+            # the standard-mode sliced "2θ" entry likewise).  Standard mode only;
+            # GI reciprocal axes are verbatim (convert_2d_radial is a no-op for GI
+            # and when the wavelength is unknown / the units already match).
+            if not getattr(self.scan, 'gi', False):
+                from .display_logic import convert_2d_radial
+                from .display_constants import AA_inv, Th
+                plot_label = self.ui.plotUnit.currentText()
+                xdata = convert_2d_radial(
+                    xdata,
+                    data_unit=getattr(_i2d, 'unit', 'q_A^-1'),
+                    want_tth=(Th in plot_label),
+                    want_q=(AA_inv in plot_label),
+                    wavelength_m=self._get_wavelength(frame),
+                )
             slice_data = azimuthal
             # mean over azimuthal (axis 1) → 1D along radial
             reduce_axis = 1

@@ -82,6 +82,8 @@ def _axis_key_from_label(label):
         return 'exit_angle_deg'
     if '2th' in lower or f'2{Th}' in text:
         return '2th_deg'
+    if (Chi in text or 'chi' in lower) and 'gi' in lower:
+        return 'chigi_deg'
     if Chi in text or 'chi' in lower:
         return 'chi_deg'
     if 'q' in lower or AA_inv in text:
@@ -1930,16 +1932,30 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         else:
             unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
             if 'chi' in unit_1d:
-                # Native azimuthal profile (I vs χ via integrate_radial): the 1D
-                # result IS I(χ), so show it DIRECTLY (source='1d').  This is the
-                # pooled quantity -- NOT the source='2d' cake-row χ slice (a
-                # mean-of-means).  Q/2θ don't apply here (the 1D axis is the
-                # azimuth, not radial); the 2D cake, if present, still renders via
-                # imageUnit below.
+                # Azimuthal-integration mode (I vs χ via integrate_radial).  The
+                # native 1D result IS I(χ), so χ is the default plot axis.  It is
+                # source='1d_2d': the bare readout is the pooled I(χ), but the
+                # user can also restrict it to a Q band by ticking X Range
+                # (slicing the cake along its RADIAL axis).  Q and 2θ are derived
+                # from the 2D cake (source='2d', Int 2D only) by slicing along χ.
+                # This makes χ-mode symmetric with Q-mode -- Q/2θ projections, the
+                # slice range, and Share Axis all behave the same way (the only
+                # difference is which axis is the native 1D result).
                 self.ui.plotUnit.addItem(_translate("Form", f"{Chi} ({Deg})"))
                 self._plot_axis_info.append({
-                    'source': '1d', 'slice_axis': None, 'axis': None,
+                    # slice_axis=None: resolved dynamically in _set_slice_range to
+                    # the cake's radial axis (Q or 2θ per imageUnit toggle).
+                    'source': '1d_2d', 'slice_axis': None, 'axis': 'azimuthal',
                 })
+                # Q / 2θ radial profiles from the cake (Int 2D only; slice along χ)
+                if not skip:
+                    for label in plotUnits[:2]:
+                        self.ui.plotUnit.addItem(_translate("Form", label))
+                        self._plot_axis_info.append({
+                            'source': '2d',
+                            'slice_axis': f'{Chi} ({Deg})',
+                            'axis': 'radial',
+                        })
                 target_plot_idx = 0
             else:
                 # Standard mode: Q, 2θ from 1D but can also slice via 2D chi;

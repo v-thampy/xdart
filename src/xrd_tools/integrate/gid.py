@@ -693,6 +693,74 @@ def integrate_gi_polar_1d(
     )
 
 
+def integrate_gi_azimuthal_1d(
+    image: np.ndarray,
+    fi: FiberIntegrator,
+    npt: int = 500,
+    npt_q: int = 1000,
+    method: str = "no",
+    mask: np.ndarray | None = None,
+    radial_range: tuple[float, float] | None = None,    # q_total band
+    azimuth_range: tuple[float, float] | None = None,   # optional χ_GI clip
+    incident_angle: float | None = None,
+    tilt_angle: float | None = None,
+    sample_orientation: int | None = None,
+    **kwargs: Any,
+) -> IntegrationResult1D:
+    """GI azimuthal profile: pooled **I vs χ_GI** (= arctan(q_oop/q_ip),
+    ``chigi_deg``) over a q_total band.
+
+    The GI analog of :func:`xrd_tools.integrate.single.integrate_radial`.  Uses
+    ``FiberIntegrator.integrate1d_polar(radial_integration=True)`` -- the flag that
+    flips the polar output from I(q_total) to I(χ_GI).  Note the parameter
+    inversion (``unit_ip``=q_total, ``unit_oop``=χ_GI): the **output χ bins** =
+    ``npt_oop``, the **q sampling** = ``npt_ip``, the **q band** = ``ip_range``, and
+    an optional χ clip = ``oop_range``.  Empty (``count == 0``) χ bins -> NaN (the
+    missing wedge leaves real gaps; keep genuine zeros).  No fast path -- the
+    azimuthal output always needs the 2D-rebin-then-pool polar path.
+
+    Parameters
+    ----------
+    npt : int
+        χ_GI output bins (the azimuthal axis, ``chigi_deg``).
+    npt_q : int
+        q_total sampling across the integrated band.
+    radial_range : (float, float) or None
+        ``(qmin, qmax)`` q_total band to integrate over (Å⁻¹).
+    azimuth_range : (float, float) or None
+        Optional χ_GI clip (degrees).
+    """
+    inc, tilt, orient = _effective_gi_params(
+        fi, incident_angle, tilt_angle, sample_orientation)
+    result = fi.integrate1d_polar(
+        data=image,
+        radial_integration=True,        # -> I vs χ_GI (not I vs q_total)
+        polar_degrees=True,             # ±180° χ_GI axis
+        radial_unit="A^-1",
+        npt_oop=npt,                    # χ_GI output bins
+        npt_ip=npt_q,                   # q_total sampling
+        ip_range=radial_range,          # q_total band integrated over
+        oop_range=azimuth_range,        # optional χ_GI clip
+        sample_orientation=orient,
+        incident_angle=inc,
+        tilt_angle=tilt,
+        method=method,
+        mask=mask,
+        **kwargs,
+    )
+    sigma = result.sigma if result.sigma is not None else None
+    # Use .integrated (not .radial) for fiber results to avoid the pyFAI warning.
+    chi = getattr(result, "integrated", None)
+    if chi is None:
+        chi = result.radial
+    return IntegrationResult1D(
+        radial=np.asarray(chi, dtype=float),
+        intensity=_nan_empty_1d(result),   # count==0 -> NaN (the missing wedge)
+        sigma=np.asarray(sigma, dtype=float) if sigma is not None else None,
+        unit="chigi_deg",
+    )
+
+
 def integrate_gi_exitangles_1d(
     image: np.ndarray,
     fi: FiberIntegrator,
@@ -792,7 +860,11 @@ def gi_1d_output_axis_key(gi_mode_1d: str | None) -> str:
     (oop) output, so:
 
       * ``q_total`` / ``q_ip`` → in-plane output  → ``radial_range``
-      * ``q_oop`` / ``exit_angle`` → out-of-plane output → ``azimuth_range``
+      * ``q_oop`` / ``exit_angle`` / ``chi_gi`` → out-of-plane output → ``azimuth_range``
+
+    ``chi_gi`` (the azimuthal profile, I vs χ_GI) takes its output χ_GI axis from
+    the oop/azimuth grid (``integrate1d_polar(radial_integration=True)`` with the χ
+    bins on ``npt_oop`` / ``oop_range``), so it freezes on ``azimuth_range`` too.
 
     Freezing the wrong key leaves the real output axis auto-ranging per incidence
     angle, so it drifts across an angle scan → a non-uniform stack the writer
@@ -800,7 +872,7 @@ def gi_1d_output_axis_key(gi_mode_1d: str | None) -> str:
     regardless of mode.
     """
     return ('azimuth_range'
-            if gi_mode_1d in ('q_oop', 'exit_angle')
+            if gi_mode_1d in ('q_oop', 'exit_angle', 'chi_gi')
             else 'radial_range')
 
 
@@ -928,6 +1000,7 @@ __all__ = [
     "create_fiber_integrator",
     "integrate_gi_1d",
     "integrate_gi_2d",
+    "integrate_gi_azimuthal_1d",
     "integrate_gi_exitangles",
     "integrate_gi_exitangles_1d",
     "integrate_gi_polar",

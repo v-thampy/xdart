@@ -43,12 +43,13 @@ _TIFF_FRAMES = [
 # (kept local so the parametrize lists don't pull the Qt integrator module
 # at collection time).  Note the singular ``exit_angle`` (1D) vs plural
 # ``exit_angles`` (2D).
-GI_MODES_1D = ["q_total", "q_ip", "q_oop", "exit_angle"]
+GI_MODES_1D = ["q_total", "q_ip", "q_oop", "exit_angle", "chi_gi"]
 GI_MODES_2D = ["qip_qoop", "q_chi", "exit_angles"]
 
 # GI 1D modes whose *output* axis is out-of-plane (frozen on ``azimuth_range``
-# rather than ``radial_range`` — the crux of the per-frame-drift fix).
-_GI_1D_OOP_MODES = ("q_oop", "exit_angle")
+# rather than ``radial_range`` — the crux of the per-frame-drift fix).  chi_gi's
+# output axis is χ_GI (the oop/azimuth grid), so it freezes on azimuth_range too.
+_GI_1D_OOP_MODES = ("q_oop", "exit_angle", "chi_gi")
 
 
 def _gi_1d_output_key(gi_mode_1d):

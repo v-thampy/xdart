@@ -466,6 +466,13 @@ class staticWidget(QWidget):
         self.integratorTree.integrator_thread.writeError.connect(
             self._show_reintegration_write_error)
         self.integratorTree.integrator_thread.finished.connect(self.integrator_thread_finished)
+        # Advanced (re-homed from the wrangler's button onto the integrator's own
+        # Reintegrate row): the single combined 1D+2D advanced-settings dialog.
+        # Wired ONCE here — the integratorTree persists across wrangler swaps, so
+        # there's no per-wrangler connect/disconnect dance to manage.
+        if hasattr(self.integratorTree.ui, 'advanced_int'):
+            self.integratorTree.ui.advanced_int.clicked.connect(
+                self._show_integration_advanced)
 
     def _show_reintegration_write_error(self, message: str) -> None:
         """Surface reintegration save failures in the same status area as runs."""
@@ -589,13 +596,18 @@ class staticWidget(QWidget):
                 QtCore.QTimer.singleShot(0, lambda v=vm: self._on_viewer_mode_changed(v))
         if hasattr(self.wrangler, 'sigSavePathChanged'):
             self.wrangler.sigSavePathChanged.connect(self._sync_h5viewer_save_dir)
-        # Wire the wrangler's Advanced button to show the integratorTree's
-        # existing 1D/2D advanced parameter dialogs in a combined popup.
+        # Advanced is now re-homed onto the integrator's Reintegrate row
+        # (advanced_int, wired once above) so there's exactly ONE Advanced
+        # button.  Hide the wrangler's old advancedButton (kept in the .ui so
+        # existing layouts/refs don't break) rather than wiring it.
         if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'advancedButton'):
-            self.wrangler.ui.advancedButton.clicked.connect(
-                self._show_integration_advanced)
+            self.wrangler.ui.advancedButton.hide()
         self.wrangler.setup()
         self._sync_h5viewer_save_dir(getattr(self.wrangler, 'h5_dir', None))
+        # currentTextChanged (above) only fires on a CHANGE, so seed the control
+        # state once now — otherwise the Reintegrate row would sit at its default
+        # (enabled) until the first mode switch even with no processed scan.
+        self._apply_integration_control_state()
         # E1/E2: modifier-free, plotMethod-aware overlay build for the XYE file
         # list (active only in xye mode).  Mouse presses go to the viewport, key
         # presses to the list widget — install on both.
@@ -630,13 +642,9 @@ class staticWidget(QWidget):
             signals.append(self.wrangler.sigViewerModeChanged)
         if hasattr(self.wrangler, 'sigSavePathChanged'):
             signals.append(self.wrangler.sigSavePathChanged)
-        # Disconnect Advanced button from integration popup
-        if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'advancedButton'):
-            try:
-                self.wrangler.ui.advancedButton.clicked.disconnect(
-                    self._show_integration_advanced)
-            except (TypeError, RuntimeError) as e:
-                logger.debug("Failed to disconnect Advanced button signal: %s", e)
+        # (Advanced is no longer wired to the wrangler button — it lives on the
+        # integrator's persistent advanced_int now, so there's nothing per-wrangler
+        # to disconnect here.)
         for signal in signals:
             try:
                 with warnings.catch_warnings():
@@ -982,13 +990,12 @@ class staticWidget(QWidget):
             #         (self.frame_ids[0] != 'No data') and
             #         (len(self.scan.frames.index) > 0)):
 
-            if not is_viewer:
-                if len(self.frame_ids) == 0:
-                    self.integratorTree.ui.integrate1D.setEnabled(False)
-                    self.integratorTree.ui.integrate2D.setEnabled(False)
-                else:
-                    self.integratorTree.ui.integrate1D.setEnabled(True)
-                    self.integratorTree.ui.integrate2D.setEnabled(True)
+            # Frame availability just changed (a scan finished / was loaded /
+            # cleared), so refresh the integration controls — this is what
+            # toggles the Reintegrate row on once a processed scan exists.
+            # _apply_integration_control_state is the single source of truth
+            # (mode + run-state + frames + reachable-raw + skip_2d).
+            self._apply_integration_control_state()
 
             self.metawidget.update()
             # self.integratorTree.update()
@@ -1190,6 +1197,49 @@ class staticWidget(QWidget):
             btn = getattr(ui, name, None)
             if btn is not None:
                 btn.setEnabled(not run_active)
+
+        # Reintegrate row.  Reintegrate needs a PROCESSED scan whose raw frames are
+        # still REACHABLE (it re-reads raw from disk); enabled only outside a run,
+        # in a non-viewer Int mode.  Reintegrate 2D additionally needs a 2-D scan
+        # (disabled for Int-1D / skip_2d).  Advanced is a settings dialog — it just
+        # needs to be in an Int mode (the param trees self-lock during a run).
+        reint1d = getattr(ui, 'reintegrate1D', None)
+        reint2d = getattr(ui, 'reintegrate2D', None)
+        adv = getattr(ui, 'advanced_int', None)
+        if is_viewer or run_active:
+            # Whole row disabled in viewers and during a run.  CRITICAL: do NOT
+            # probe scan.has_reload_only_frames() in these states — on an empty
+            # in-memory cache it opens the .nxs READ-ONLY via h5py, which collides
+            # with the streaming writer's r+ open mid-run (OSError: file already
+            # open for read-only) and aborts the scan.  The reachability probe is
+            # only needed when a button could actually be clicked (idle + Int mode),
+            # which is also the only time the .nxs is not held by the writer.
+            for btn in (reint1d, reint2d, adv):
+                if btn is not None:
+                    btn.setEnabled(False)
+        else:
+            scan = getattr(self, 'scan', None)
+            has_frames = raw_reachable = skip_2d = False
+            if scan is not None:
+                try:
+                    has_frames = len(scan.frames.index) > 0
+                except Exception:
+                    has_frames = False
+                try:
+                    # Same "raw is gone" predicate the bai_1d/bai_2d guards use (R3)
+                    # — so the button's enabled state matches whether a click would
+                    # actually do anything.  Safe here: no run is active, so the
+                    # writer isn't holding the .nxs.
+                    raw_reachable = has_frames and not scan.has_reload_only_frames()
+                except Exception:
+                    raw_reachable = has_frames  # don't over-disable on a probe error
+                skip_2d = bool(getattr(scan, 'skip_2d', False))
+            if reint1d is not None:
+                reint1d.setEnabled(raw_reachable)
+            if reint2d is not None:
+                reint2d.setEnabled(raw_reachable and not is_1d_only and not skip_2d)
+            if adv is not None:
+                adv.setEnabled(True)
 
     def _session_run_active(self):
         """4d: True iff a streaming session is open AND reports it is running.

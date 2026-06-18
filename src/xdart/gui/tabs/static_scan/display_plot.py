@@ -1267,7 +1267,19 @@ class DisplayPlotMixin:
                 else None)
 
         # Determine the slice axis label
-        if info and info['source'] in ('2d', '1d_2d') and info.get('slice_axis'):
+        if (info and not self.scan.gi
+                and info.get('axis') == 'azimuthal'
+                and info['source'] in ('2d', '1d_2d')):
+            # Displaying χ (azimuthal) in standard mode: slice along the cake's
+            # RADIAL axis, which is Q or 2θ depending on the imageUnit toggle.
+            # Resolved here (not statically in _plot_axis_info) so a Q-χ↔2θ-χ
+            # toggle relabels the slice range.  Covers both the standard-Q χ
+            # entry and the χ-integration mode's native χ entry.
+            if self.ui.imageUnit.currentIndex() == 1:
+                slice_label = f'2{Th} ({Deg})'
+            else:
+                slice_label = f'Q ({AA_inv})'
+        elif info and info['source'] in ('2d', '1d_2d') and info.get('slice_axis'):
             slice_label = info['slice_axis']
         elif info and info['source'] == '1d':
             # 1D axis selected — default slice along Chi for standard mode

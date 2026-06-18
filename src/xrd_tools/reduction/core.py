@@ -126,6 +126,12 @@ def integrate_gi_polar_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
     return _impl(*args, **kwargs)
 
 
+def integrate_gi_azimuthal_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
+    from xrd_tools.integrate.gid import integrate_gi_azimuthal_1d as _impl
+
+    return _impl(*args, **kwargs)
+
+
 @dataclass(slots=True)
 class CancelToken:
     """Small cancellation primitive shared by GUI and headless callers."""
@@ -195,6 +201,7 @@ class GI1DMode(str, Enum):
     Q_IP = "q_ip"
     Q_OOP = "q_oop"
     EXIT_ANGLE = "exit_angle"
+    CHI_GI = "chi_gi"
 
 
 class GI2DMode(str, Enum):
@@ -2280,6 +2287,9 @@ def _coerce_gi_1d_mode(mode: GI1DMode | str) -> GI1DMode:
         "polar": GI1DMode.Q_TOTAL,
         "exit": GI1DMode.EXIT_ANGLE,
         "exit_angle": GI1DMode.EXIT_ANGLE,
+        "chigi": GI1DMode.CHI_GI,
+        "chi_gi": GI1DMode.CHI_GI,
+        "chi": GI1DMode.CHI_GI,
     }
     key = str(mode).strip().lower()
     try:
@@ -2398,6 +2408,17 @@ def _run_gi_1d(
         return integrate_gi_exitangles_1d(
             image,
             fi,
+            **common,
+            **extra,
+        )
+    if gi.mode_1d is GI1DMode.CHI_GI:
+        # Azimuthal profile: I vs χ_GI over a q_total band.  ``common`` passes
+        # npt=plan.npt as the χ_GI output-bin count; the second pts box (npt_oop)
+        # is the q_total sampling across the integrated band.
+        return integrate_gi_azimuthal_1d(
+            image,
+            fi,
+            npt_q=npt_oop,
             **common,
             **extra,
         )

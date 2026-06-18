@@ -25,6 +25,7 @@ from xrd_tools.integrate.gid import (
     create_fiber_integrator,
     integrate_gi_1d,
     integrate_gi_2d,
+    integrate_gi_azimuthal_1d,
     integrate_gi_polar,
     integrate_gi_polar_1d,
     integrate_gi_exitangles_1d,
@@ -701,6 +702,18 @@ class LiveFrame():
                         **gi_kwargs,
                     )
                     self.gi_1d['exit'] = result
+                elif gi_mode_1d == 'chi_gi':
+                    # GI azimuthal profile: I vs χ_GI pooled over a q_total band.
+                    # npt = χ_GI bins (box 1); npt_q = q_total sampling (box 2);
+                    # the radial-range field = q_total band, the azim field = χ clip.
+                    result = integrate_gi_azimuthal_1d(
+                        image_data, fi, npt=numpoints, npt_q=npt_oop,
+                        method=gi_method, mask=mask,
+                        radial_range=radial_range,
+                        azimuth_range=kwargs.get('azimuth_range'),
+                        **gi_kwargs,
+                    )
+                    self.gi_1d['chigi'] = result
                 else:  # 'q_total' (default — polar integration)
                     result = integrate_gi_polar_1d(
                         image_data, fi, npt=numpoints,

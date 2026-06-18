@@ -51,8 +51,8 @@ Units = [f"Q ({AA_inv})", f"2{Th} ({Deg})", f"{Chi} ({Deg})"]
 Units_dict = {Units[0]: 'q_A^-1', Units[1]: '2th_deg', Units[2]: 'chi_deg'}
 Units_dict_inv = {'q_A^-1': 0, '2th_deg': 1, 'chi_deg': 2}
 
-GI_MODES_1D = ['q_total', 'q_ip', 'q_oop', 'exit_angle']
-GI_LABELS_1D = ["Q", "Q\u1D62\u209A", "Q\u2092\u2092\u209A", "Exit"]
+GI_MODES_1D = ['q_total', 'q_ip', 'q_oop', 'exit_angle', 'chi_gi']
+GI_LABELS_1D = ["Q", "Q\u1D62\u209A", "Q\u2092\u2092\u209A", "Exit", f"{Chi}GI"]
 GI_MODES_2D = ['qip_qoop', 'q_chi', 'exit_angles']
 GI_LABELS_2D = [u"Q\u1D62\u209A\u2013Q\u2092\u2092\u209A", f"Q-{Chi}", "Exit"]
 
@@ -186,6 +186,13 @@ class integratorTree(QtWidgets.QWidget):
 
         self.ui.integrate1D.clicked.connect(self.bai_1d)
         self.ui.integrate2D.clicked.connect(self.bai_2d)
+
+        # Resurfaced Reintegrate row (the visible buttons; integrate1D/2D above
+        # are the retained hidden stubs).  Two SEPARATE buttons so re-doing one
+        # output never clobbers the other.  Advanced is re-homed onto advanced_int
+        # in staticWidget (it owns the combined 1D+2D dialog).
+        self.ui.reintegrate1D.clicked.connect(self.bai_1d)
+        self.ui.reintegrate2D.clicked.connect(self.bai_2d)
 
         self.integrator_thread = integratorThread(
             self.scan, self.frame, self.file_lock,
@@ -1391,6 +1398,7 @@ class integratorTree(QtWidgets.QWidget):
         'q_ip': ('1000', '1000'),
         'q_oop': ('1000', '1000'),
         'exit_angle': ('1000', '1000'),
+        'chi_gi': ('500', '1000'),       # (χ_GI output bins, q_total sampling)
         'q_total': ('2000', ''),
         'std': ('2000', ''),
     }
@@ -1450,6 +1458,14 @@ class integratorTree(QtWidgets.QWidget):
             self.ui.gi_radial_label_1D.show()
             self.ui.label_azim_1D.setText(f"Exit ({Deg})")
             self._set_range_defaults_1d(-5, 5, 0, 90)
+        elif mode == 'chi_gi':
+            # GI azimuthal profile: OUTPUT axis is χ_GI; the radial-range field is
+            # the q_total BAND integrated over, the azim field clips χ_GI.
+            self.ui.unit_1D.hide()
+            self.ui.gi_radial_label_1D.setText(f"Q ({AA_inv})")
+            self.ui.gi_radial_label_1D.show()
+            self.ui.label_azim_1D.setText(f"{Chi}GI ({Deg})")
+            self._set_range_defaults_1d(0, 5, -180, 180)
         else:  # q_total (polar)
             self.ui.unit_1D.show()
             self.ui.unit_1D.setEnabled(True)

@@ -1306,6 +1306,171 @@ def test_integration_controls_enabled_per_mode(widget):
     assert iu.frame1D.isEnabled() and iu.frame2D.isEnabled()
 
 
+# ── Reintegrate row (resurfaced buttons) ───────────────────────────────────
+
+def _fake_processed_scan(*, n_frames=3, raw_reachable=True, skip_2d=False):
+    """Minimal stand-in carrying just the attrs the reintegrate enable-state
+    and bai_* guards read: frames.index length, has_reload_only_frames(),
+    skip_2d."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        name="reint_test",
+        frames=SimpleNamespace(index=list(range(n_frames))),
+        has_reload_only_frames=(lambda: not raw_reachable),
+        skip_2d=skip_2d,
+    )
+
+
+def test_reintegrate_row_present_and_advanced_rehomed(widget):
+    """One row of three buttons (Reintegrate 1D | Reintegrate 2D | Advanced)
+    sits directly above Calibrate/Make Mask, and Advanced is re-homed here so
+    there is exactly ONE (the wrangler's old advancedButton is hidden)."""
+    w = widget
+    iu = w.integratorTree.ui
+    assert iu.reintegrate1D.text() == "Reintegrate 1D"
+    assert iu.reintegrate2D.text() == "Reintegrate 2D"
+    assert iu.advanced_int.text() == "Advanced"
+    # The row is inserted immediately above frame_3 (Calibrate / Make Mask).
+    vlay = iu.verticalLayout
+    assert vlay.indexOf(iu.frame_reint) == vlay.indexOf(iu.frame_3) - 1
+    # Exactly one Advanced: the wrangler's old button is explicitly hidden.
+    if hasattr(w.wrangler, "ui") and hasattr(w.wrangler.ui, "advancedButton"):
+        assert w.wrangler.ui.advancedButton.isHidden()
+    # Advanced opens the combined 1D+2D advanced-settings dialog (real wiring).
+    iu.advanced_int.clicked.emit()
+    assert hasattr(w, "_integ_adv_combined_dlg")
+
+
+def test_reintegrate_enable_state(widget):
+    """Reintegrate needs a processed scan with reachable raw; Reintegrate 2D
+    also needs a 2-D scan (disabled for skip_2d / Int-1D); viewers disable all."""
+    w = widget
+    iu = w.integratorTree.ui
+    combo = w.wrangler.ui.processingModeCombo
+
+    def _mode(text):
+        i = combo.findText(text)
+        if i < 0:
+            pytest.skip(f"processing mode {text!r} not available")
+        combo.blockSignals(True)
+        combo.setCurrentIndex(i)
+        combo.blockSignals(False)
+
+    # Processed 2-D scan, raw reachable → both Reintegrate + Advanced enabled.
+    _mode("Int 2D")
+    w.scan = _fake_processed_scan(raw_reachable=True, skip_2d=False)
+    w._apply_integration_control_state()
+    assert iu.reintegrate1D.isEnabled()
+    assert iu.reintegrate2D.isEnabled()
+    assert iu.advanced_int.isEnabled()
+
+    # skip_2d (1D-only scan) → Reintegrate 2D disabled, 1D still enabled.
+    w.scan = _fake_processed_scan(raw_reachable=True, skip_2d=True)
+    w._apply_integration_control_state()
+    assert iu.reintegrate1D.isEnabled()
+    assert not iu.reintegrate2D.isEnabled()
+
+    # Int 1D mode → Reintegrate 2D disabled (no cake), 1D enabled.
+    _mode("Int 1D")
+    w.scan = _fake_processed_scan(raw_reachable=True, skip_2d=False)
+    w._apply_integration_control_state()
+    assert iu.reintegrate1D.isEnabled()
+    assert not iu.reintegrate2D.isEnabled()
+
+    # Raw source moved/deleted (reload-only) → both Reintegrate disabled.
+    _mode("Int 2D")
+    w.scan = _fake_processed_scan(raw_reachable=False)
+    w._apply_integration_control_state()
+    assert not iu.reintegrate1D.isEnabled()
+    assert not iu.reintegrate2D.isEnabled()
+
+    # Viewer mode → everything in the row disabled.
+    _mode("XYE Viewer")
+    w.scan = _fake_processed_scan(raw_reachable=True)
+    w._apply_integration_control_state()
+    assert not iu.reintegrate1D.isEnabled()
+    assert not iu.reintegrate2D.isEnabled()
+    assert not iu.advanced_int.isEnabled()
+
+
+def test_reintegrate_buttons_wired_to_bai(widget):
+    """The new visible buttons drive the same reintegrate path as the retained
+    hidden stubs: Reintegrate 1D → bai_1d, Reintegrate 2D → bai_2d."""
+    w = widget
+    it = w.integratorTree
+    iu = it.ui
+    started = []
+    it.integrator_thread.isRunning = lambda: False
+    it.integrator_thread.start = lambda: started.append(it.integrator_thread.method)
+    it.scan = _fake_processed_scan(raw_reachable=True)
+
+    iu.reintegrate1D.clicked.emit()
+    assert started == ["bai_1d_all"]
+
+    started.clear()
+    iu.reintegrate2D.clicked.emit()
+    assert started == ["bai_2d_all"]
+
+
+def test_reintegrate_no_raw_probe_during_run(widget):
+    """Regression (crash 2026-06-18): _apply_integration_control_state must NOT
+    probe scan.has_reload_only_frames() while a run is active.  On an empty
+    in-memory cache that probe opens the .nxs READ-ONLY via h5py, colliding with
+    the streaming writer's r+ open (OSError: file already open for read-only) and
+    aborting the scan.  The row is disabled mid-run regardless, so it must reach
+    that state WITHOUT touching the file."""
+    from types import SimpleNamespace
+    w = widget
+    iu = w.integratorTree.ui
+
+    def _boom():
+        raise AssertionError("must not probe raw reachability during a run")
+
+    w.scan = SimpleNamespace(
+        name="running_scan", skip_2d=False,
+        frames=SimpleNamespace(index=[0, 1, 2]),
+        has_reload_only_frames=_boom,
+    )
+    w._run_active = True
+    try:
+        w._apply_integration_control_state()   # must neither raise nor probe
+    finally:
+        w._run_active = False
+    assert not iu.reintegrate1D.isEnabled()
+    assert not iu.reintegrate2D.isEnabled()
+    assert not iu.advanced_int.isEnabled()
+
+
+def test_cake_radial_entry_converts_q_to_2theta(widget):
+    """A 2D-DERIVED radial plot entry (get_int_1d's source='2d', axis='radial')
+    must return the SELECTED plotUnit's unit — converting the cake's stored Q
+    radial to 2θ when the entry is labeled 2θ.  Covers the chi-integration mode's
+    Q/2θ cake entries (and the standard sliced-2θ entry); without conversion the
+    '2θ' entry plotted raw Å⁻¹ values under a degree label (review finding)."""
+    w = widget
+    df = _set_int_scan(w, n=1)                 # cake radial = Q, 0.5..3.0 Å⁻¹
+    df.ui.slice.setChecked(False)
+    # A cake-derived radial entry, labeled 2θ.
+    df._plot_axis_info = [{"source": "2d", "slice_axis": "χ (°)", "axis": "radial"}]
+    df.ui.plotUnit.blockSignals(True)
+    df.ui.plotUnit.clear()
+    df.ui.plotUnit.addItem("2θ (°)")
+    df.ui.plotUnit.setCurrentIndex(0)
+    df.ui.plotUnit.blockSignals(False)
+
+    frame, frame_2d = w.data_1d[0], w.data_2d[0]
+    xdata, _ = df.get_int_1d(frame, frame_2d, 0)
+    xdata = np.asarray(xdata, dtype=float)
+    # Q 3.0 Å⁻¹ at λ=0.7293 Å → 2θ ≈ 20°, NOT the raw 3.0; degrees range is sane.
+    assert xdata.max() > 5.0, "2θ entry returned raw Q (no conversion)"
+    assert xdata.max() < 90.0
+
+    # The Q entry returns Q unchanged (no spurious conversion).
+    df.ui.plotUnit.setItemText(0, "Q (Å⁻¹)")
+    xq, _ = df.get_int_1d(frame, frame_2d, 0)
+    assert np.isclose(np.asarray(xq, dtype=float).max(), 3.0, atol=0.2)
+
+
 # ── C1: Grazing toggle defers the DISPLAY combo rebuild until a run ─────────
 
 def test_grazing_toggle_defers_display_combo_rebuild(widget):

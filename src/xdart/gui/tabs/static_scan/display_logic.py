@@ -705,8 +705,14 @@ _X_AXIS_TABLE = {
     # consumer of these labels — state.x_label is unused, combos use gi_plotUnits).
     'qip_A^-1': ('Q<sub>ip</sub>', _AA_INV),
     'qoop_A^-1': ('Q<sub>oop</sub>', _AA_INV),
+    # GI polar (q_chi) radial axis: the total scattering-vector magnitude.  Without
+    # these entries the cake x-axis fell back to the raw ssrl label "Q_total" (a
+    # LITERAL underscore); the <sub> renders the subscript like the χ_GI y-axis.
+    'qtot_A^-1': ('Q<sub>total</sub>', _AA_INV),
+    'qtot_nm^-1': ('Q<sub>total</sub>', 'nm⁻¹'),
     'exit_angle_deg': ('Exit Angle', _DEG),
     'exit_angle': ('Exit Angle', _DEG),
+    'chigi_deg': (f'{_CHI}<sub>GI</sub>', _DEG),
     'r_mm': ('r', 'mm'),
 }
 
