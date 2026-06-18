@@ -195,3 +195,36 @@ class TestLoadFrameIndexOnly:
         scan = LiveScan(data_file=None)
         assert scan.load_frame_index_only(str(tmp_path / "nope.nxs")) == 0
         assert not scan.frames.index
+
+
+def test_reload_probe_resolves_relative_source_against_source_base(tmp_path):
+    """N1 (live regression 2026-06-18): source_file is stored RELATIVE to the
+    project root (entry/@source_base), which is NOT the .nxs dir — the default
+    output dir is <root>/xdart_processed_data.  has_reload_only_frames's probe
+    must resolve against @source_base (like the real lazy load in _load_frame_v2),
+    else it false-reports 'raw gone' and blocks a reintegrable scan."""
+    import os
+    from types import SimpleNamespace
+    import h5py
+    from xdart.modules.ewald import LiveScan
+
+    root = tmp_path / "project"
+    (root / "raw").mkdir(parents=True)
+    (root / "raw" / "img.tif").write_bytes(b"x")        # the raw IS present
+    proc = root / "xdart_processed_data"
+    proc.mkdir()
+    nxs = proc / "scan.nxs"
+    with h5py.File(nxs, "w") as f:
+        e = f.create_group("entry")
+        e.attrs["source_base"] = str(root)              # N1 base = project root
+        src = e.create_group("frames/frame_0000/source")
+        src.create_dataset("path", data="raw/img.tif")  # RELATIVE to @source_base
+
+    scan = LiveScan(data_file=str(nxs))
+    scan.frames = SimpleNamespace(index=[0])            # force the Path-B h5 probe
+
+    # Resolves "raw/img.tif" against @source_base (root) → exists → reachable.
+    assert scan.has_reload_only_frames() is False
+    # The same relpath under the .nxs dir does NOT exist — so resolving against
+    # dirname(.nxs) (the old probe) would have wrongly reported the raw as gone.
+    assert not os.path.exists(os.path.join(str(proc), "raw", "img.tif"))

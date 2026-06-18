@@ -299,6 +299,19 @@ class LiveScan:
         try:
             with _catch(self.data_file, 'r') as f:
                 seen_paths: set = set()
+                # N1: a portable .nxs stores source_file RELATIVE to the project
+                # root (entry/@source_base), which is NOT the .nxs directory (the
+                # default output dir is <root>/xdart_processed_data).  Resolve
+                # relative paths against @source_base when present — EXACTLY as
+                # _load_frame_v2 does for the real lazy load — else this probe
+                # false-reports "raw gone" and blocks a perfectly reintegrable scan.
+                source_base = None
+                e = f.get("entry")
+                if e is not None and "source_base" in e.attrs:
+                    sb = e.attrs["source_base"]
+                    if isinstance(sb, bytes):
+                        sb = sb.decode("utf-8", errors="replace")
+                    source_base = str(sb) if sb else None
                 for idx in probe_ids:
                     grp_path = f"entry/frames/frame_{int(idx):04d}/source"
                     grp = f.get(grp_path)
@@ -311,15 +324,15 @@ class LiveScan:
         except (OSError, KeyError, ValueError, TypeError, AttributeError):
             return True
 
-        # Now verify each distinct source path actually exists.
-        # File-existence checks are cheap relative to the h5 reads
-        # we already paid for above.
-        data_dir = os.path.dirname(self.data_file)
+        # Now verify each distinct source path actually exists.  Relative paths
+        # resolve against @source_base (the project root) when present, else the
+        # .nxs dir (old / absolute-path files); absolute paths are used as-is.
+        rel_base = source_base or os.path.dirname(self.data_file)
         for raw in seen_paths:
             try:
                 full = raw
                 if not os.path.isabs(full):
-                    full = os.path.normpath(os.path.join(data_dir, full))
+                    full = os.path.normpath(os.path.join(rel_base, full))
                 if not os.path.exists(full):
                     return True
             except (OSError, TypeError):
