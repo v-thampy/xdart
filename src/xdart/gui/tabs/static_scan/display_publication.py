@@ -27,6 +27,7 @@ from .display_logic import (
     PlotPayload,
     RawSource,
     Trace,
+    accumulate_waterfall,
     combine_flat_masks,
     nan_gaps_in_thumbnail,
     sentinel_mask,
@@ -290,6 +291,12 @@ class PublicationDisplayAdapter:
             if source is RawSource.RAW:
                 data = self._apply_detector_mask(data, publication)
                 data = self._subtract_if_shape_matches(data, bg, "raw frame background")
+            else:
+                # Thumbnail source: subtract the per-frame background only when its
+                # shape matches (or it is a scalar) -- never resize a possibly
+                # incompatible background onto the thumbnail.
+                data = self._subtract_if_shape_matches(
+                    data, bg, "raw frame background (thumbnail)")
             data = self._normalize(data, publication.metadata_raw)
             if accum is None:
                 accum = data
@@ -305,6 +312,9 @@ class PublicationDisplayAdapter:
             return None
 
         image = accum / count
+        # The user-set raw background (Set BG -> bkg_map_raw): subtract only when
+        # its shape matches the displayed image (or it is a scalar) -- a full-res
+        # background does not subtract from a thumbnail, by design.
         image = self._subtract_if_shape_matches(
             image,
             getattr(self._widget, "bkg_map_raw", 0),
@@ -601,13 +611,27 @@ class PublicationDisplayAdapter:
         # Step 5 FLIP: the integration 1D plot now draws from the publication
         # record's active .view (see integration_plot_payload).  Single/Sum/
         # Average flow through it (Sum/Average collapse at render in
-        # update_1d_view); Overlay/Waterfall + the 2D-slice/converted-axis
-        # fallbacks return None there, so render_display falls back to the
-        # legacy update_plot for those.
+        # update_1d_view); the 2D-slice/converted-axis fallbacks return None
+        # there, so render_display falls back to the legacy update_plot for those.
+        #
+        # Flip stage 3: Overlay/Waterfall now own their cross-render history in the
+        # payload (_overlay_waterfall_payload -> WaterfallHistory), intercepted here
+        # BEFORE the integration route (which returns None for these methods).  The
+        # accumulator survives store eviction because it rides in the payload, not
+        # the store.  The legacy update_plot stays only as the None-payload fallback.
+        if (state.mode in (Mode.INT_1D, Mode.INT_2D)
+                and state.method in ("Overlay", "Waterfall")):
+            return self._overlay_waterfall_payload(state)
         if state.mode in (Mode.INT_1D, Mode.INT_2D):
+            # A non-accumulating method (Single/Sum/Average) drops any overlay
+            # accumulator, so switching back to Overlay/Waterfall starts fresh
+            # (legacy _on_plotMethod_changed reset parity) rather than resurrecting
+            # a stale stack from before the switch.
+            if getattr(self._widget, "_waterfall_history", None) is not None:
+                self._widget._waterfall_history = None
             return self.integration_plot_payload(state)
-        # Overlay/Waterfall still use the legacy accumulator until the
-        # publication payload owns overlay history explicitly.
+        # Overlay/Waterfall outside the integration modes have no payload owner
+        # yet -> legacy fallback.
         if state.method in ("Overlay", "Waterfall"):
             return None
         if not self._can_use_native_1d_axis(state):
@@ -724,6 +748,117 @@ class PublicationDisplayAdapter:
         if not traces or axis is None:
             return None
         return PlotPayload(axis_x=axis, traces=tuple(traces))
+
+    # ----------------------------------------------------------------- #
+    # Overlay/Waterfall payload (flip stage 3 — WIRED into plot_payload): the
+    # accumulator is carried IN the payload (PlotPayload.plot_history), NOT rebuilt
+    # from the store each render -- the store evicts past its cap, so a per-render
+    # rebuild would re-introduce the cap-truncation regression.  This builds the
+    # resident 1D frames onto a shared ref grid (mirroring integration_plot_payload)
+    # and ACCUMULATES them into the generation-keyed WaterfallHistory.  The widget
+    # owns the prior history: read here, stored back by the renderer (_draw_payload)
+    # after a successful draw, so the next render appends onto it.  render_display +
+    # _draw_payload then draw it via the shared update_plot_view (curves/waterfall),
+    # so this is behaviour-preserving vs the legacy update_plot it supersedes.
+    # ----------------------------------------------------------------- #
+    def _overlay_waterfall_payload(self, state):
+        """Accumulate the resident 1D frames into the WaterfallHistory and return a
+        PlotPayload carrying it.  Preserves the legacy invariants: a render with no
+        resident 1D frames PRESERVES the prior accumulator (never wipes -- the
+        failed-read invariant); a scan/source change (``reset_key``) resets it; a
+        plotUnit Q<->2theta toggle relabels the grid in place (handled in
+        accumulate_waterfall).  The accumulator is keyed on a STABLE scan/source
+        identity, NOT state.generation -- the generation bumps every tick as live
+        auto-last grows the selection, so keying on it would reset each tick and
+        rebuild from only the un-evicted frames (cap-truncation).  Returns ``None``
+        only when there is nothing to show and no prior accumulator."""
+        widget = self._widget
+        prior = getattr(widget, "_waterfall_history", None)
+
+        # Full parity with integration_plot_payload's per-frame build: a 2D-slice
+        # source (cake-projected 1D, or an active chi/q slice) builds each row via
+        # _slice_1d_from_2d; otherwise the native 1D view with on-the-fly Q↔2θ.
+        axis_info = _current_axis_info(widget)
+        source = axis_info.get("source", "1d")
+        needs_2d = (source == "2d") or (
+            source == "1d_2d" and _slice_enabled(widget)
+        )
+        # Reset identity: a new scan, or a 1D<->2D-slice source change (which alters
+        # each row's CONTENT), resets the accumulator.  A unit toggle and selection
+        # growth do NOT change it (relabel / append).
+        scan = getattr(widget, "scan", None)
+        scan_id = (getattr(scan, "data_file", None)
+                   or getattr(scan, "name", None)) if scan is not None else None
+        reset_key = (scan_id, bool(needs_2d))
+
+        ref_x = None
+        axis = None
+        ids, names, rows = [], [], []
+        for label in state.render_ids:
+            pub = self._items.get(_label_key(label))
+            if pub is None:
+                continue
+            view = pub.view
+            if not needs_2d:
+                if not view.has_1d or publication_has_1d_errors(pub):
+                    continue
+                x = np.asarray(view.axis_1d.values, dtype=float)
+                y = np.asarray(view.intensity_1d, dtype=float)
+                if x.shape != y.shape:
+                    continue
+                y = self._normalize(y, pub.metadata_raw)
+                x, conv_axis = self._apply_plot_unit_1d(
+                    x, str(getattr(view.axis_1d, "unit", "") or ""), pub)
+                this_axis = (conv_axis if conv_axis is not None
+                             else _axis_for_publication(view.axis_1d))
+            else:
+                if not view.has_2d or publication_has_2d_errors(pub):
+                    continue
+                projected = self._slice_1d_from_2d(view, pub, axis_info)
+                if projected is None:
+                    continue
+                x, y, this_axis = projected
+            if ref_x is None:
+                ref_x = x
+                axis = this_axis
+            elif x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
+                y = np.interp(ref_x, x, y)
+                x = ref_x
+            ids.append(int(label))
+            names.append(_trace_name(pub, widget))
+            rows.append(y)
+
+        if ref_x is None:
+            # No resident 1D frame this render: PRESERVE the prior accumulator (the
+            # append-only / failed-read invariant) -- never wipe it.  Re-emit its
+            # payload when it belongs to the current accumulation identity, else
+            # nothing (a different scan/source must not show stale curves).
+            if (prior is not None and prior.reset_key == reset_key
+                    and prior.count):
+                return self._history_to_payload(prior)
+            return None
+
+        unit = str(getattr(axis, "unit", "") or "")
+        label = str(getattr(axis, "label", "") or "")
+        history = accumulate_waterfall(
+            prior, reset_key=reset_key, unit=unit, label=label,
+            x=ref_x, rows=np.asarray(rows, dtype=float), ids=ids, names=names)
+        return self._history_to_payload(history)
+
+    def _history_to_payload(self, history):
+        """Project a :class:`WaterfallHistory` into a :class:`PlotPayload` -- one
+        layered :class:`Trace` per accumulated frame, plus the carried accumulator
+        (``overlaid_ids`` / ``plot_history``) so the renderer + the next render
+        read it back.  The axis label is the one CARRIED in the history (set from
+        the conversion's Axis), not re-derived from the unit -- the display unit
+        symbol does not always round-trip through x_axis_for_unit (e.g. 2θ)."""
+        label = history.label or x_axis_for_unit(history.unit)[0]
+        axis = Axis(label, history.unit)
+        traces = tuple(
+            Trace(label=history.names[k], x=history.x, y=history.rows[k])
+            for k in range(history.count))
+        return PlotPayload(axis_x=axis, traces=traces,
+                           overlaid_ids=tuple(history.ids), plot_history=history)
 
     def _apply_plot_unit_1d(self, x_values, data_unit, ref_publication):
         """1D analog of :meth:`_apply_image_unit_2d`: on-the-fly Q↔2θ for the
@@ -931,6 +1066,7 @@ class PublicationDisplayAdapter:
         if bg.shape == () or bg.shape == data.shape:
             return data - background
         return data
+
 
     @staticmethod
     def _cake_background_for_image(background, image):

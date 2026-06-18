@@ -64,6 +64,8 @@ __all__ = [
     "Axis",
     "Trace",
     "PlotPayload",
+    "WaterfallHistory",
+    "accumulate_waterfall",
     "ImagePayload",
     "ResultsView",
     "DisplayState",
@@ -196,8 +198,10 @@ PANEL_LAYOUT = {
     # process controls hidden.  frame_6 (scale + cmap) kept so the Linear/Log
     # scale and colormap apply to the raw image.
     Mode.IMAGE_VIEWER: PanelLayout(
+        # frame_4 shown to host the Set BG button (Norm Channel is hidden inside
+        # it at runtime, so only Set BG shows, left-justified where Norm is in Int).
         frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=False,
-        frame_4_vis=False, frame_6_vis=True, plotToolBar_vis=False,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
         show_image_btn_vis=False,
         twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
         plotWindow_h=(0, 0), imageToolbar_h=(40, 40),
@@ -208,8 +212,9 @@ PANEL_LAYOUT = {
     # the Log toggle applies to the 1D plot and the colormap stays available
     # (the XYE waterfall image uses it).
     Mode.XYE_VIEWER: PanelLayout(
+        # frame_4 shown to host the Set BG button (Norm Channel hidden at runtime).
         frame_top_vis=True, twoDWindow_vis=False, imageToolbar_vis=True,
-        frame_4_vis=False, frame_6_vis=True, plotToolBar_vis=False,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
         show_image_btn_vis=False,
         twoDWindow_h=(0, _FULL), imageWindow_h=(80, 85),
         plotWindow_h=(200, _FULL), imageToolbar_h=(40, 40),
@@ -326,6 +331,136 @@ class PlotPayload:
     axis_y: "Axis | None" = None
     overlaid_ids: "tuple | None" = None      # frame ids accumulated (Overlay/Waterfall)
     plot_history: "object | None" = None     # immutable accumulator view
+
+
+@dataclass(frozen=True)
+class WaterfallHistory:
+    """Immutable Overlay/Waterfall accumulator carried IN the payload
+    (``PlotPayload.plot_history``) -- the payload-owned successor to the legacy
+    mutable widget triple (``plot_data`` / ``frame_names`` / ``overlaid_idxs``).
+
+    Carrying it in the payload (rather than rebuilding from the publication store
+    each render) is the keystone of the flip: the store evicts heavy frames past a
+    cap, so a per-render rebuild from the store would re-introduce the cap-truncation
+    regression.  The accumulator instead retains every row it has captured.
+
+    ``reset_key`` is the accumulation IDENTITY (scan + 1D/2D source) -- the ONLY
+    reset trigger.  It is deliberately NOT the display generation: the display
+    generation bumps on every effective-selection change, and live auto-last GROWS
+    the selection every tick, so keying the reset on it would reset the accumulator
+    each tick and rebuild from only the resident (un-evicted) frames -- the exact
+    cap-truncation this design exists to prevent.  Scan/source changes change the
+    key (reset); selection growth and a Q<->2theta unit toggle do not (append /
+    relabel in place).
+
+    All rows live on ONE shared sample grid (``x``); the adapter interpolates each
+    incoming frame onto it before accumulating.  ``rows[k]`` is frame ``ids[k]`` /
+    ``names[k]`` -- maintained row-for-row.  ``unit`` is the radial unit the grid is
+    currently labelled in (a Q<->2theta toggle relabels ``x`` in place, since the
+    intensities are unit-invariant)."""
+    reset_key: "object"      # accumulation identity (scan, source); reset on change
+    unit: str
+    x: "np.ndarray"          # shared radial sample grid (1-D, in `unit`)
+    rows: "np.ndarray"       # (n, len(x)) stacked intensities; row order == ids
+    ids: tuple               # captured frame ids, in row order
+    names: tuple             # captured frame names, in row order
+    label: str = ""          # x-axis label for `unit` (carried, not re-derived:
+    #                          the display unit doesn't always round-trip through
+    #                          x_axis_for_unit, e.g. the 2θ conversion's symbol)
+
+    @property
+    def count(self) -> int:
+        return len(self.ids)
+
+
+def _dedup_first(ids, names, rows):
+    """Keep the FIRST occurrence of each id (arrival order)."""
+    seen = set()
+    ki, kn, kr = [], [], []
+    for i, n, r in zip(ids, names, rows):
+        ii = int(i)
+        if ii in seen:
+            continue
+        seen.add(ii)
+        ki.append(ii)
+        kn.append(n)
+        kr.append(r)
+    return ki, kn, kr
+
+
+def accumulate_waterfall(history, *, reset_key, unit, x, rows, ids, names, label=""):
+    """Pure, append-only Overlay/Waterfall accumulator keyed on ``reset_key`` (the
+    payload-owned successor to ``update_plot_accumulator`` + the widget triple).
+
+    Append-only WITHIN one ``reset_key``: a partial / out-of-order / re-delivered
+    read can only ADD frames not yet captured -- it never shrinks the stack or
+    re-stacks a frame (the collapse/restack class, structurally precluded).  A
+    ``reset_key`` change (a new scan, or a 1D<->2D-slice source change -- NOT a mere
+    selection change) is the ONLY reset.
+
+    Crucially the key is NOT the display generation: that bumps on every
+    effective-selection change, and live auto-last grows the selection each tick, so
+    keying on it would reset every tick and rebuild from only the un-evicted frames
+    -- the cap-truncation this accumulator exists to prevent.  Selection growth
+    therefore APPENDS (same key), retaining rows for frames since evicted past the
+    store cap.
+
+    A plotUnit Q<->2theta toggle does NOT change ``reset_key``, so ``unit`` changes
+    while ``reset_key`` does not: the accumulated rows are unit-invariant, so we
+    RELABEL the grid to the incoming (new-unit) ``x`` in place -- no re-read, no loss
+    of evicted frames -- keeping every captured row.
+
+    ``x`` / ``rows`` / ``ids`` / ``names`` are the incoming frames, already on the
+    one shared grid (the adapter interpolated them).  Returns the next
+    :class:`WaterfallHistory`.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    rows = np.atleast_2d(np.asarray(rows, dtype=float))
+    ids = [int(i) for i in ids]
+    names = list(names)
+
+    # RESET: new accumulation identity (scan/source change), no prior history, or an
+    # empty incoming grid (nothing to anchor on -- keep the incoming as-is).
+    if history is None or history.reset_key != reset_key or x.size == 0:
+        ki, kn, kr = _dedup_first(ids, names, rows)
+        return WaterfallHistory(
+            reset_key=reset_key, unit=unit, label=label, x=x,
+            rows=(np.asarray(kr, dtype=float) if kr
+                  else np.empty((0, x.size), dtype=float)),
+            ids=tuple(ki), names=tuple(kn))
+
+    # Same identity: keep the accumulated rows; relabel the grid on a unit toggle
+    # (incoming x is the same sample grid in the new unit), then append new ids.
+    base_x = (x if history.unit != unit and x.size == history.x.size
+              else history.x)
+    base_rows = history.rows
+    out_ids = list(history.ids)
+    out_names = list(history.names)
+    have = set(history.ids)
+
+    add = []
+    for i, n, r in zip(ids, names, rows):
+        if i in have:
+            continue
+        have.add(i)
+        out_ids.append(i)
+        out_names.append(n)
+        # The incoming row is on the shared grid already; reinterp defensively only
+        # if the grid sample-count differs (e.g. a mid-generation Npts hiccup).
+        r = np.asarray(r, dtype=float)
+        if r.size != base_x.size and x.size == r.size and x.size > 0:
+            r = np.interp(base_x, x, r)
+        add.append(r)
+
+    if add:
+        add = np.atleast_2d(np.asarray(add, dtype=float))
+        new_rows = (np.vstack([base_rows, add]) if base_rows.size else add)
+    else:
+        new_rows = base_rows
+
+    return WaterfallHistory(
+        reset_key=reset_key, unit=unit, label=label, x=base_x, rows=new_rows,
+        ids=tuple(out_ids), names=tuple(out_names))
 
 
 @dataclass(frozen=True)
@@ -570,8 +705,14 @@ _X_AXIS_TABLE = {
     # consumer of these labels — state.x_label is unused, combos use gi_plotUnits).
     'qip_A^-1': ('Q<sub>ip</sub>', _AA_INV),
     'qoop_A^-1': ('Q<sub>oop</sub>', _AA_INV),
+    # GI polar (q_chi) radial axis: the total scattering-vector magnitude.  Without
+    # these entries the cake x-axis fell back to the raw ssrl label "Q_total" (a
+    # LITERAL underscore); the <sub> renders the subscript like the χ_GI y-axis.
+    'qtot_A^-1': ('Q<sub>total</sub>', _AA_INV),
+    'qtot_nm^-1': ('Q<sub>total</sub>', 'nm⁻¹'),
     'exit_angle_deg': ('Exit Angle', _DEG),
     'exit_angle': ('Exit Angle', _DEG),
+    'chigi_deg': (f'{_CHI}<sub>GI</sub>', _DEG),
     'r_mm': ('r', 'mm'),
 }
 

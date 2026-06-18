@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
-from xrd_tools.integrate.gid import _nan_empty_2d  # shared count==0 -> NaN helper
+from xrd_tools.integrate.gid import (  # shared count==0 -> NaN helpers
+    _nan_empty_1d,
+    _nan_empty_2d,
+)
 
 if TYPE_CHECKING:
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
@@ -96,6 +99,65 @@ def integrate_1d(
         intensity=np.asarray(result.intensity, dtype=float),
         sigma=np.asarray(sigma, dtype=float) if sigma is not None else None,
         unit=unit_str,
+    )
+
+
+def integrate_radial(
+    image: np.ndarray,
+    ai: AzimuthalIntegrator,
+    npt: int = 1000,
+    npt_rad: int = 1000,
+    radial_unit: str = "q_A^-1",
+    method: str = "csr",
+    mask: np.ndarray | None = None,
+    radial_range: tuple[float, float] | None = None,
+    polarization_factor: float | None = None,
+    normalization_factor: float | None = None,
+    **kwargs: Any,
+) -> IntegrationResult1D:
+    """Azimuthal profile: pooled **I vs χ** (detector azimuth, ``chi_deg``) over a
+    radial (q or 2θ) band.
+
+    Unlike collapsing the displayed cake (an unweighted mean-of-means of
+    already-normalized cells), pyFAI's ``integrate_radial`` pools signal and
+    normalization across the q band and divides ONCE -- the correct
+    count-weighted I(χ).  Empty (``count == 0``) χ bins become NaN (module
+    gaps / detector edges); genuine zero-count bins are preserved.
+
+    Parameters
+    ----------
+    npt : int
+        Number of χ output bins (the azimuthal axis, ``chi_deg`` ±180°).
+    npt_rad : int
+        Radial sampling across the integrated band.
+    radial_unit : str
+        Unit of ``radial_range`` -- the band integrated over (``"q_A^-1"`` or
+        ``"2th_deg"``).  The OUTPUT axis is always χ (``chi_deg``).
+    radial_range : (float, float) or None
+        ``(min, max)`` q-or-2θ band to integrate over (in ``radial_unit``).
+    """
+    extra: dict[str, Any] = dict(**kwargs)
+    if polarization_factor is not None:
+        extra["polarization_factor"] = polarization_factor
+    if normalization_factor is not None:
+        extra["normalization_factor"] = normalization_factor
+    result = ai.integrate_radial(
+        image,
+        npt,
+        npt_rad=npt_rad,
+        unit="chi_deg",
+        radial_unit=radial_unit,
+        radial_range=radial_range,
+        method=method,
+        mask=mask,
+        **extra,
+    )
+    sigma = getattr(result, "sigma", None)
+    return IntegrationResult1D(
+        radial=np.asarray(result.radial, dtype=float),
+        intensity=_nan_empty_1d(result),   # count==0 -> NaN (keep genuine zeros)
+        sigma=np.asarray(sigma, dtype=float) if sigma is not None else None,
+        unit="chi_deg",
     )
 
 

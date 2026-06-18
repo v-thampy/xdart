@@ -13,6 +13,7 @@ from xrd_tools.integrate.gid import (
     gi_1d_output_axis_key,
     integrate_gi_1d,
     integrate_gi_2d,
+    integrate_gi_azimuthal_1d,
     integrate_gi_exitangles,
     integrate_gi_exitangles_1d,
     integrate_gi_polar,
@@ -124,6 +125,25 @@ def test_integrate_gi_exitangles_1d(poni_fixture, synthetic_image):
     assert result.intensity.shape == (500,)
 
 
+@pytest.mark.slow
+def test_integrate_gi_azimuthal_1d(poni_fixture, synthetic_image):
+    """GI azimuthal profile: I vs χ_GI (chigi_deg) over a q_total band.
+
+    The χ_GI output bins come from ``npt`` (not ``npt_q``, which is the q
+    sampling), the axis is degrees (±180), and the unit is ``chigi_deg``.
+    """
+    fi = create_fiber_integrator(poni_fixture, incident_angle=0.2)
+    result = integrate_gi_azimuthal_1d(
+        synthetic_image, fi, npt=360, npt_q=500, radial_range=(0.5, 5.0))
+
+    assert isinstance(result, IntegrationResult1D)
+    assert result.radial.shape == (360,)        # χ_GI output bins == npt
+    assert result.intensity.shape == (360,)
+    assert result.unit == "chigi_deg"
+    chi = result.radial[np.isfinite(result.radial)]
+    assert chi.min() >= -180.0 and chi.max() <= 180.0
+
+
 # ---------------------------------------------------------------------------
 # Common-grid freeze primitive (pure — no pyFAI, always runs in CI)
 # ---------------------------------------------------------------------------
@@ -148,6 +168,8 @@ def test_gi_1d_output_axis_key_by_mode():
     assert gi_1d_output_axis_key(None) == "radial_range"
     assert gi_1d_output_axis_key("q_oop") == "azimuth_range"
     assert gi_1d_output_axis_key("exit_angle") == "azimuth_range"
+    # chi_gi's output axis is χ_GI (oop/azimuth grid), so it freezes on azimuth.
+    assert gi_1d_output_axis_key("chi_gi") == "azimuth_range"
 
 
 def test_freeze_common_axis_single_scout_pads():

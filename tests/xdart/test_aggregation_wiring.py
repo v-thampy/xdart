@@ -372,7 +372,7 @@ def test_real_widget_setbkg_hydrates_evicted_subset_from_disk(widget, tmp_path):
     df.frame_ids = [str(i) for i in subset]
     df.overall = False
     df.idxs = list(subset)
-    df.ui.setBkg.setText("Set Bkg")
+    df.ui.setBkg.setText("Set BG")
 
     df.setBkg()
 
@@ -432,6 +432,9 @@ def test_catchup_overlay_reads_only_missing_not_whole_scan(widget, tmp_path):
     # be fetched WITHOUT re-reading the whole scan's 1D from disk on the GUI
     # thread (the multi-second blocking read that repeated and never recovered).
     # Assert the fetch covers ONLY the missing frames, never all N.
+    # Post flip-stage-3: live Waterfall renders via the payload accumulator (no disk
+    # re-read at all); this guards the LEGACY update_plot fallback, exercised
+    # directly (it survives until stage 4 retires it).
     n = 70
     scan, q, chi = _split_scan_2d(tmp_path, n=n, cap=8)
     w = widget
@@ -458,7 +461,7 @@ def test_catchup_overlay_reads_only_missing_not_whole_scan(widget, tmp_path):
             reads.append(len(list(idxs)) if idxs is not None else -1),
             orig(idxs, **k))[1])
     try:
-        df.update()
+        df.update_plot()
     finally:
         df.get_frames_int_1d = orig
     assert reads, "expected a fetch of the missing frames"
@@ -694,6 +697,128 @@ def test_plot_payload_blocks_nonprimary_gi_instead_of_falling_back():
 
     assert payload is not None
     assert payload.traces == ()
+
+
+def test_overlay_waterfall_payload_accumulates_in_payload_across_renders():
+    # Flip stage 2/3: the Overlay/Waterfall accumulator is carried IN the payload
+    # (plot_history) and accumulated across renders -- NOT rebuilt from the store
+    # each render (which the cap would truncate).  Verifies: cross-render append;
+    # a render with no resident frames PRESERVES the accumulator; a display
+    # generation bump (selection growth) does NOT reset (the cap-truncation fix);
+    # a scan change DOES reset.
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xdart.modules.frame_publication import (
+        PublicationStore, publication_from_live_frame)
+    from xrd_tools.core.containers import IntegrationResult1D
+
+    def _ir1d(v, nq=5):
+        return IntegrationResult1D(
+            radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
+            intensity=np.full(nq, float(v), dtype=np.float32),
+            sigma=np.ones(nq, dtype=np.float32), unit="q_A^-1")
+
+    store = PublicationStore(max_heavy_items=None)
+    for i in range(3):
+        frame = SimpleNamespace(
+            idx=i, int_1d=_ir1d(i + 1), int_2d=None, map_raw=None, mask=None,
+            gi=False, gi_2d={}, thumbnail=None, bg_raw=0, scan_info={},
+            source_file=f"f{i}.tif", source_frame_idx=i)
+        store.upsert(publication_from_live_frame(frame))
+
+    widget = SimpleNamespace(
+        scan=SimpleNamespace(name="scan", gi=False, bai_1d_args={}, bai_2d_args={}),
+        normChannel=None,
+        _waterfall_history=None,
+        ui=SimpleNamespace(
+            plotUnit=SimpleNamespace(currentText=lambda: "Q (Å⁻¹)",
+                                     currentIndex=lambda: 0),
+            slice=SimpleNamespace(isChecked=lambda: False, isEnabled=lambda: False)),
+    )
+
+    def render(render_ids, generation=1):
+        adapter = PublicationDisplayAdapter(store, widget=widget, labels=render_ids)
+        st = SimpleNamespace(render_ids=tuple(render_ids),
+                             selected_ids=tuple(render_ids),
+                             generation=generation, method="Overlay", overall=True)
+        p = adapter._overlay_waterfall_payload(st)
+        if p is not None:                       # the renderer stores it back
+            widget._waterfall_history = p.plot_history
+        return p
+
+    p1 = render([0, 1])
+    assert p1 is not None and p1.plot_history.ids == (0, 1)
+    assert len(p1.traces) == 2
+    p2 = render([2])
+    assert p2.plot_history.ids == (0, 1, 2)        # accumulated across renders
+    p3 = render([])                               # no resident frames -> preserve
+    assert p3 is not None and p3.plot_history.ids == (0, 1, 2)
+    # A display-generation bump (selection growth) must NOT reset -- the accumulator
+    # is keyed on the scan/source identity, not the generation.
+    p4 = render([0], generation=2)
+    assert p4.plot_history.ids == (0, 1, 2)
+    # A scan change DOES reset the accumulator.
+    widget.scan = SimpleNamespace(name="scan2", gi=False, bai_1d_args={}, bai_2d_args={})
+    p5 = render([0])
+    assert p5.plot_history.ids == (0,)
+
+
+def test_plot_payload_routes_overlay_waterfall_through_accumulator():
+    # Flip stage 3: plot_payload now RETURNS the WaterfallHistory-carrying payload
+    # for Overlay/Waterfall in the integration modes (was None -> legacy update_plot).
+    # Single/Sum/Average keep the integration payload with NO accumulator.
+    from xdart.gui.tabs.static_scan.display_publication import (
+        PublicationDisplayAdapter)
+    from xdart.gui.tabs.static_scan.display_logic import Mode
+    from xdart.modules.frame_publication import (
+        PublicationStore, publication_from_live_frame)
+    from xrd_tools.core.containers import IntegrationResult1D
+
+    def _ir1d(v, nq=5):
+        return IntegrationResult1D(
+            radial=np.linspace(0.5, 5.0, nq, dtype=np.float32),
+            intensity=np.full(nq, float(v), dtype=np.float32),
+            sigma=np.ones(nq, dtype=np.float32), unit="q_A^-1")
+
+    store = PublicationStore(max_heavy_items=None)
+    for i in range(3):
+        frame = SimpleNamespace(
+            idx=i, int_1d=_ir1d(i + 1), int_2d=None, map_raw=None, mask=None,
+            gi=False, gi_2d={}, thumbnail=None, bg_raw=0, scan_info={},
+            source_file=f"f{i}.tif", source_frame_idx=i)
+        store.upsert(publication_from_live_frame(frame))
+
+    widget = SimpleNamespace(
+        scan=SimpleNamespace(name="scan", gi=False, bai_1d_args={}, bai_2d_args={}),
+        normChannel=None, _waterfall_history=None,
+        ui=SimpleNamespace(
+            plotUnit=SimpleNamespace(currentText=lambda: "Q (Å⁻¹)",
+                                     currentIndex=lambda: 0),
+            slice=SimpleNamespace(isChecked=lambda: False, isEnabled=lambda: False)),
+    )
+
+    def state(method, render_ids, generation=1):
+        return SimpleNamespace(
+            mode=Mode.INT_1D, method=method, generation=generation,
+            overall=True, selected_ids=tuple(render_ids),
+            render_ids=tuple(render_ids),
+            panel=lambda role: SimpleNamespace(has_data=True, source=None))
+
+    adapter = PublicationDisplayAdapter(store, widget=widget, labels=(0, 1, 2))
+
+    # Overlay routes to the accumulator and accumulates across renders.
+    p1 = adapter.plot_payload(state("Overlay", [0, 1]))
+    assert p1 is not None and p1.plot_history is not None
+    assert p1.plot_history.ids == (0, 1) and p1.overlaid_ids == (0, 1)
+    widget._waterfall_history = p1.plot_history          # renderer stores it back
+    p2 = adapter.plot_payload(state("Waterfall", [2]))
+    assert p2.plot_history.ids == (0, 1, 2)              # appended, not reset
+
+    # Single/Sum/Average keep the integration payload, NO accumulator carried.
+    widget._waterfall_history = None
+    ps = adapter.plot_payload(state("Single", [0]))
+    assert ps is not None
+    assert ps.plot_history is None and ps.overlaid_ids is None
 
 
 def test_cake_image_blanks_non_overall_eviction():

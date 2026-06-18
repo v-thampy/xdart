@@ -265,6 +265,43 @@ def test_run_reduction_gi_dispatches_polar_and_exit_angle_modes(
     assert calls == ["polar_1d", "polar_2d", "exit_1d", "exit_2d"]
 
 
+def test_run_reduction_gi_dispatches_chi_gi_azimuthal_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """CHI_GI routes to integrate_gi_azimuthal_1d with npt=χ-bins (plan.npt) and
+    npt_q=q-sampling (GIMode.npt_oop) — the same mapping the GUI frame path uses,
+    so live≡batch≡reload χ_GI profiles agree."""
+    captured: dict = {}
+    monkeypatch.setattr(reduction_core, "poni_to_fiber_integrator", lambda *a, **k: object())
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_gi_azimuthal_1d",
+        lambda image, fi, **kwargs: captured.update(kwargs) or _r1d(1.0),
+    )
+    monkeypatch.setattr(
+        reduction_core,
+        "integrate_gi_polar",
+        lambda image, fi, **kwargs: _r2d(2.0),
+    )
+
+    scan = Scan(
+        "gi",
+        [Frame(0, image=np.ones((2, 2)), geometry=FrameGeometry(incident_angle=0.3))],
+        poni=object(),
+    )
+    run_reduction(
+        ReductionPlan(
+            integration_1d=Integration1DPlan(npt=360),
+            integration_2d=Integration2DPlan(),
+            gi=GIMode(mode_1d=GI1DMode.CHI_GI, mode_2d=GI2DMode.Q_CHI, npt_oop=500),
+        ),
+        scan,
+    )
+
+    assert captured["npt"] == 360       # χ_GI output bins (plan.npt)
+    assert captured["npt_q"] == 500     # q_total sampling (GIMode.npt_oop)
+
+
 def test_run_reduction_gi_qip_qoop_coerces_stale_standard_unit(
     monkeypatch: pytest.MonkeyPatch,
 ):

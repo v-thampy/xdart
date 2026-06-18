@@ -436,6 +436,38 @@ class Ui_Form(object):
 
         self.verticalLayout.addWidget(self.frame_3)
 
+        # Reintegrate row: one row of three buttons just ABOVE Calibrate / Make
+        # Mask (frame_3).  Reintegrate 1D / 2D redo a single output from raw
+        # without a full Start (which Overwrites the whole .nxs and would clobber
+        # the other dimension's stack).  Advanced opens the combined 1D+2D
+        # advanced-settings dialog (re-homed from the wrangler's button).
+        self.frame_reint = QFrame(Form)
+        self.frame_reint.setObjectName(u"frame_reint")
+        self.frame_reint.setMaximumSize(QSize(16777215, 50))
+        self.frame_reint.setFrameShape(QFrame.StyledPanel)
+        self.frame_reint.setFrameShadow(QFrame.Raised)
+        self.horizontalLayout_reint = QHBoxLayout(self.frame_reint)
+        self.horizontalLayout_reint.setSpacing(6)
+        self.horizontalLayout_reint.setObjectName(u"horizontalLayout_reint")
+        self.horizontalLayout_reint.setContentsMargins(5, 0, 5, 0)
+        self.reintegrate1D = QPushButton(self.frame_reint)
+        self.reintegrate1D.setObjectName(u"reintegrate1D")
+        self.reintegrate1D.setFont(font2)
+        self.horizontalLayout_reint.addWidget(self.reintegrate1D)
+        self.reintegrate2D = QPushButton(self.frame_reint)
+        self.reintegrate2D.setObjectName(u"reintegrate2D")
+        self.reintegrate2D.setFont(font2)
+        self.horizontalLayout_reint.addWidget(self.reintegrate2D)
+        self.advanced_int = QPushButton(self.frame_reint)
+        self.advanced_int.setObjectName(u"advanced_int")
+        self.advanced_int.setFont(font2)
+        self.horizontalLayout_reint.addWidget(self.advanced_int)
+
+        # Insert by identity so the row always lands directly above frame_3,
+        # independent of how many widgets precede it in verticalLayout.
+        self.verticalLayout.insertWidget(
+            self.verticalLayout.indexOf(self.frame_3), self.frame_reint)
+
 #if QT_CONFIG(shortcut)
         self.label_npts_1D.setBuddy(self.npts_1D)
         self.label_npts_2D.setBuddy(self.npts_radial_2D)
@@ -517,5 +549,8 @@ class Ui_Form(object):
         self.raw_to_tif.setText(QCoreApplication.translate("Form", u"Raw -> Tif", None))
         self.pyfai_calib.setText(QCoreApplication.translate("Form", u"Calibrate", None))
         self.get_mask.setText(QCoreApplication.translate("Form", u"Make Mask", None))
+        self.reintegrate1D.setText(QCoreApplication.translate("Form", u"Reintegrate 1D", None))
+        self.reintegrate2D.setText(QCoreApplication.translate("Form", u"Reintegrate 2D", None))
+        self.advanced_int.setText(QCoreApplication.translate("Form", u"Advanced", None))
     # retranslateUi
 

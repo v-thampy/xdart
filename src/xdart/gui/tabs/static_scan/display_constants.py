@@ -40,6 +40,7 @@ gi_plotUnits = [
     f"{Qip_s} ({AA_inv})",
     f"{Qoop_s} ({AA_inv})",
     f"Exit angle ({Deg})",
+    f"{Chi}GI ({Deg})",   # plain caps: combos can't render HTML <sub>; order == GI_MODES_1D
 ]
 gi_imageUnits = [
     f"{Qip_s}-{Qoop_s}",

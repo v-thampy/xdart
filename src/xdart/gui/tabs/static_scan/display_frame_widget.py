@@ -82,6 +82,8 @@ def _axis_key_from_label(label):
         return 'exit_angle_deg'
     if '2th' in lower or f'2{Th}' in text:
         return '2th_deg'
+    if (Chi in text or 'chi' in lower) and 'gi' in lower:
+        return 'chigi_deg'
     if Chi in text or 'chi' in lower:
         return 'chi_deg'
     if 'q' in lower or AA_inv in text:
@@ -237,7 +239,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         for _c in (self.ui.normChannel, self.ui.scale, self.ui.cmap):
             displayFrameWidget._fit_combo_width(_c, max_w=130)
             _c.setFixedHeight(_ROW_H)
-        displayFrameWidget._fit_button_width(self.ui.setBkg)
+        # Widen the BG button (+7%, then another +10% = x1.177) so the 'Clear BG'
+        # label has comfortable room (Vivek).
+        displayFrameWidget._fit_button_width(self.ui.setBkg, scale=1.177)
         self.ui.setBkg.setFixedHeight(_ROW_H)
         # The SCALE combo moves into the Options popup ('Other' row); the
         # colormap stays in the bar.  One checkable 'Log' toggle = Linear <->
@@ -411,11 +415,20 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.frames = frames
         self.frame_names = []
         self.overlaid_idxs = []
+        # Flip stage 2: the payload-carried Overlay/Waterfall accumulator
+        # (generation-keyed WaterfallHistory). Lives alongside the legacy triple
+        # until the render path delegates to it (stage 3/4); reset at the same
+        # accumulator-lifecycle sites (new_scan, clear_overlay).
+        self._waterfall_history = None
         self.data_1d = data_1d
         self.data_2d = data_2d
         self.bkg_1d = 0.
         self.bkg_2d = 0.
         self.bkg_map_raw = 0.
+        # XYE-viewer background: (x, y) of the averaged background pattern, or None.
+        # The viewer files have per-file grids, so unlike the scan-grid bkg_1d the
+        # XYE bkg carries its own x and is interpolated onto each trace at render.
+        self._bkg_xye = None
         self._norm_channel_map = {}
 
         # Viewer mode: None (normal), 'image', or 'xye'
@@ -1212,7 +1225,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         self.plot_data = [ref_x, ydata]
         self.frame_names = names
-        self.overlaid_idxs = list(state.render_ids)
+        # Flip stage 3: an Overlay/Waterfall payload carries the FULL accumulator
+        # (overlaid_ids = every captured frame, which may exceed this render's
+        # render_ids after eviction), and the waterfall y-axis (_wf_y_axis) keys off
+        # self.overlaid_idxs -- so prefer it.  Single/Sum/Average payloads leave
+        # overlaid_ids empty, so those keep the per-render selection.
+        overlaid = getattr(payload_value, "overlaid_ids", None)
+        self.overlaid_idxs = list(overlaid) if overlaid else list(state.render_ids)
+        # Carry the immutable accumulator back onto the widget so the NEXT render
+        # appends onto it (the payload-owned successor to the legacy mutable triple).
+        # Only Overlay/Waterfall payloads supply a history; others leave it alone.
+        history = getattr(payload_value, "plot_history", None)
+        if history is not None:
+            self._waterfall_history = history
         axis = payload_value.axis_x
         self._payload_x_axis_label = (axis.label, axis.unit)
         # XYE labels its bottom axis from the file prefix; _current_plot_axis_label
@@ -1905,37 +1930,61 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if gi_mode_1d == 'q_total' and '2th' in unit_1d:
                 target_plot_idx = 1
         else:
-            # Standard mode: Q, 2θ from 1D but can also slice via 2D chi;
-            # χ purely from 2D
-            for label in plotUnits[:2]:
-                self.ui.plotUnit.addItem(_translate("Form", label))
+            unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
+            if 'chi' in unit_1d:
+                # Azimuthal-integration mode (I vs χ via integrate_radial).  The
+                # native 1D result IS I(χ), so χ is the default plot axis.  It is
+                # source='1d_2d': the bare readout is the pooled I(χ), but the
+                # user can also restrict it to a Q band by ticking X Range
+                # (slicing the cake along its RADIAL axis).  Q and 2θ are derived
+                # from the 2D cake (source='2d', Int 2D only) by slicing along χ.
+                # This makes χ-mode symmetric with Q-mode -- Q/2θ projections, the
+                # slice range, and Share Axis all behave the same way (the only
+                # difference is which axis is the native 1D result).
+                self.ui.plotUnit.addItem(_translate("Form", f"{Chi} ({Deg})"))
                 self._plot_axis_info.append({
-                    'source': '1d_2d',
-                    'slice_axis': f'{Chi} ({Deg})',
-                    'axis': 'radial',
+                    # slice_axis=None: resolved dynamically in _set_slice_range to
+                    # the cake's radial axis (Q or 2θ per imageUnit toggle).
+                    'source': '1d_2d', 'slice_axis': None, 'axis': 'azimuthal',
                 })
-            # χ is derived from 2D (Int 2D only — no cake to slice in Int 1D)
-            if not skip:
-                self.ui.plotUnit.addItem(_translate("Form", plotUnits[2]))
-                self._plot_axis_info.append({
-                    'source': '2d',
-                    'slice_axis': None,  # determined dynamically by imageUnit
-                    'axis': 'azimuthal',
-                })
+                # Q / 2θ radial profiles from the cake (Int 2D only; slice along χ)
+                if not skip:
+                    for label in plotUnits[:2]:
+                        self.ui.plotUnit.addItem(_translate("Form", label))
+                        self._plot_axis_info.append({
+                            'source': '2d',
+                            'slice_axis': f'{Chi} ({Deg})',
+                            'axis': 'radial',
+                        })
+                target_plot_idx = 0
+            else:
+                # Standard mode: Q, 2θ from 1D but can also slice via 2D chi;
+                # χ purely from 2D
+                for label in plotUnits[:2]:
+                    self.ui.plotUnit.addItem(_translate("Form", label))
+                    self._plot_axis_info.append({
+                        'source': '1d_2d',
+                        'slice_axis': f'{Chi} ({Deg})',
+                        'axis': 'radial',
+                    })
+                # χ is derived from 2D (Int 2D only — no cake to slice in Int 1D)
+                if not skip:
+                    self.ui.plotUnit.addItem(_translate("Form", plotUnits[2]))
+                    self._plot_axis_info.append({
+                        'source': '2d',
+                        'slice_axis': None,  # determined dynamically by imageUnit
+                        'axis': 'azimuthal',
+                    })
+                # Default the plot unit to the entry matching the 1D integration
+                # unit (so a 2θ integration opens on a 2θ axis).
+                canon_1d = '2th_deg' if '2th' in unit_1d else 'q_A^-1'
+                target_plot_idx = default_plot_unit(
+                    canon_1d, ('q_A^-1', '2th_deg'))
 
             for label in imageUnits:
                 self.ui.imageUnit.addItem(_translate("Form", label))
             self.ui.plotUnit.setEnabled(True)
             self.ui.imageUnit.setEnabled(True)
-            # Default the plot unit to the entry matching the 1D integration
-            # unit (so a 2θ integration opens on a 2θ axis).  Standard combo
-            # order is (Q, 2θ, χ); normalise the pyFAI unit to canonical then
-            # route the index choice through the pure default_plot_unit.
-            unit_1d = str(self.scan.bai_1d_args.get('unit', '')).lower()
-            canon_1d = ('2th_deg' if '2th' in unit_1d
-                        else 'chi_deg' if 'chi' in unit_1d else 'q_A^-1')
-            target_plot_idx = default_plot_unit(
-                canon_1d, ('q_A^-1', '2th_deg', 'chi_deg'))
 
         if self.ui.plotUnit.count() > 0:
             self.ui.plotUnit.setCurrentIndex(
@@ -2365,78 +2414,210 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.plot_data = [np.zeros(0), np.zeros(0)]
         self.frame_names = []
         self.overlaid_idxs = []
+        self._waterfall_history = None
         self.update()
+
+    def _clear_bkg(self):
+        """Drop every background (all modes) and reset the button."""
+        self.bkg_1d = 0.
+        self.bkg_2d = 0.
+        self.bkg_map_raw = 0.
+        self._bkg_xye = None
+        self.ui.setBkg.setText('Set BG')
+
+    def _viewer_selection(self):
+        """Selected viewer frame labels (ints).  Mirrors get_idxs' viewer rule:
+        the loaded frame_ids ARE the selection."""
+        ids = self.idxs or self.frame_ids
+        out = []
+        for i in ids:
+            try:
+                out.append(int(i))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _viewer_raw_for(self, label):
+        """The selected viewer frame's raw array (full or thumbnail), sourced like
+        _image_viewer_raw_payload: publication store first, then the data_2d
+        mirror."""
+        store = getattr(self, 'publication_store', None)
+        if store is not None:
+            pub = store.get(label)
+            if pub is not None:
+                raw = pub.view.raw
+                if raw is None:
+                    raw = (getattr(pub.raw_ref, 'thumbnail', None)
+                           if pub.raw_ref is not None else None)
+                if raw is None:
+                    raw = pub.view.thumbnail
+                if raw is not None:
+                    return raw
+        with self.data_lock:
+            frame_2d = self.data_2d.get(label)
+        if frame_2d is not None:
+            raw = frame_2d.get('map_raw')
+            if raw is None:
+                raw = frame_2d.get('thumbnail')
+            return raw
+        return None
+
+    def _set_bkg_image_viewer(self):
+        """Image Viewer Set BG: average the selected raw frame(s) into
+        ``bkg_map_raw`` (resized to the displayed thumbnail at render)."""
+        accum = None
+        count = 0
+        for label in self._viewer_selection():
+            raw = self._viewer_raw_for(label)
+            if raw is None:
+                continue
+            raw = np.asarray(raw, dtype=float)
+            if raw.ndim != 2:
+                continue
+            if accum is None:
+                accum = raw
+            elif accum.shape == raw.shape:
+                accum = accum + raw
+            else:
+                continue
+            count += 1
+        if accum is None or count == 0:
+            return False
+        self.bkg_map_raw = accum / count
+        return True
+
+    def _set_bkg_xye_viewer(self):
+        """XYE Viewer Set BG: average the selected XYE 1D(s) onto the first
+        selection's grid and store ``(x, y)``; subtracted (interpolated) per trace
+        in _xye_plot_payload."""
+        ref_x = None
+        accum = None
+        count = 0
+        for label in self._viewer_selection():
+            xy = self._viewer_xye_for(label)
+            if xy is None:
+                continue
+            x, y = xy
+            if x.shape != y.shape or x.size == 0:
+                continue
+            if ref_x is None:
+                ref_x = x
+            elif x.shape != ref_x.shape or not np.allclose(x, ref_x, equal_nan=True):
+                y = np.interp(ref_x, x, y)
+            accum = y if accum is None else accum + y
+            count += 1
+        if accum is None or count == 0:
+            return False
+        self._bkg_xye = (ref_x, accum / count)
+        return True
+
+    def _viewer_xye_for(self, label):
+        """The selected XYE frame's (x, y), sourced like _xye_plot_payload:
+        publication store first, then the data_1d mirror."""
+        store = getattr(self, 'publication_store', None)
+        if store is not None:
+            pub = store.get(label)
+            if (pub is not None and pub.view.intensity_1d is not None
+                    and pub.view.axis_1d is not None
+                    and pub.view.axis_1d.values is not None):
+                return (np.asarray(pub.view.axis_1d.values, dtype=float),
+                        np.asarray(pub.view.intensity_1d, dtype=float))
+        with self.data_lock:
+            fr = self.data_1d.get(label)
+        int_1d = getattr(fr, 'int_1d', None) if fr is not None else None
+        if int_1d is None:
+            return None
+        return (np.asarray(int_1d.radial, dtype=float),
+                np.asarray(int_1d.intensity, dtype=float))
 
     def setBkg(self):
         """Sets selected points as background.
-        If background is already selected, it unsets it"""
+        If background is already selected, it unsets it.
+
+        Mode-aware: Int 1D/2D averages the selected scan frames' 1D/2D/raw; the
+        Image Viewer averages the selected raw frame(s) into bkg_map_raw; the XYE
+        Viewer averages the selected XYE 1D(s).  The background is cleared on a
+        mode change (set_viewer_display_mode), so each mode is independent."""
         if (len(self.frame_ids) == 0) or (len(self.idxs) == 0):
             return
 
-        if self.ui.setBkg.text() == 'Set Bkg':
-            idxs = self.frame_ids
-            if self.overall:
-                idxs = sorted(list(self.scan.frames.index))
+        if self.ui.setBkg.text() != 'Set BG':
+            self._clear_bkg()
+            self.update()
+            return
 
-            # #6: refuse a PARTIAL 2D background rather than silently averaging
-            # only the frames whose int_2d happens to be available — a partial
-            # average is a wrong background, not a smaller one.  require_all=True
-            # returns None when not every selected frame contributes; a None
-            # here is only partial coverage (not a 1D-only scan) if the
-            # subset-average path WOULD have returned something.
-            bkg_2d, _, _ = self.get_frames_int_2d(
-                idxs, require_all=True, allow_blocking_read=True)
-            if (
-                bkg_2d is None
-                and self.get_frames_int_2d(
-                    idxs, allow_blocking_read=True)[0] is not None
-            ):
-                logger.error(
-                    "Set Bkg refused: the 2D background covers only part of the "
-                    "selection (some frames' 2D data is unavailable) — a partial "
-                    "average would be a wrong background.")
-                try:
-                    QtWidgets.QMessageBox.warning(
-                        self, "Background not set",
-                        "Some selected frames have no 2D data, so the background "
-                        "would cover only part of the selection.  Background not "
-                        "set — pick a fully-covered selection.")
-                except Exception:
-                    pass
-                return  # button stays 'Set Bkg'; no wrong background applied
+        # Viewer modes own their own background sourcing (no scan-frame integration).
+        if self.viewer_mode == 'image':
+            if self._set_bkg_image_viewer():
+                self.ui.setBkg.setText('Clear BG')
+            self.update()
+            return
+        if self.viewer_mode == 'xye':
+            if self._set_bkg_xye_viewer():
+                self.ui.setBkg.setText('Clear BG')
+            self.update()
+            return
+        if self.viewer_mode == 'nexus':
+            return  # no display to subtract a background from
 
-            self.bkg_1d, _ = self.get_frames_int_1d(
-                idxs, rv='average', allow_blocking_read=True)
-            self.bkg_2d = bkg_2d
-            # Set-Bkg is a one-shot user action on an idle scan: block-and-read
-            # an evicted frame's raw from disk rather than defer to the async
-            # worker (which would leave it out -> require_all None -> a silent
-            # bkg_map_raw = 0 over the whole 2D map).
-            self.bkg_map_raw = self.get_frames_map_raw(
-                idxs, require_all=True, allow_blocking_read=True)
-            if self.bkg_map_raw is None:
-                # F5: be honest about a no-op 2D background.  Pre-F5
-                # this silently set bkg=0.: 1D/2D bkg subtraction
-                # would still apply but the user saw "Clear Bkg" on
-                # the button as if 2D was wired up too.  Without
-                # raw frames (e.g. reloaded v2 file without
-                # resolvable source files), there's nothing to
-                # subtract in the 2D map view; log it.
-                logger.warning(
-                    "setBkg: no raw image data available for selected "
-                    "frames; 2D background subtraction inactive "
-                    "(1D / int_2d background still applied).  This "
-                    "usually means the .nxs was reloaded without "
-                    "access to the original source files."
-                )
-                self.bkg_map_raw = 0.
-            self.ui.setBkg.setText('Clear Bkg')
-        else:
-            self.bkg_1d = 0.
-            self.bkg_2d = 0.
+        # Int 1D/2D (viewer_mode is None here -- viewers early-returned above).
+        idxs = self.frame_ids
+        if self.overall:
+            idxs = sorted(list(self.scan.frames.index))
+
+        # #6: refuse a PARTIAL 2D background rather than silently averaging
+        # only the frames whose int_2d happens to be available — a partial
+        # average is a wrong background, not a smaller one.  require_all=True
+        # returns None when not every selected frame contributes; a None
+        # here is only partial coverage (not a 1D-only scan) if the
+        # subset-average path WOULD have returned something.
+        bkg_2d, _, _ = self.get_frames_int_2d(
+            idxs, require_all=True, allow_blocking_read=True)
+        if (
+            bkg_2d is None
+            and self.get_frames_int_2d(
+                idxs, allow_blocking_read=True)[0] is not None
+        ):
+            logger.error(
+                "Set BG refused: the 2D background covers only part of the "
+                "selection (some frames' 2D data is unavailable) — a partial "
+                "average would be a wrong background.")
+            try:
+                QtWidgets.QMessageBox.warning(
+                    self, "Background not set",
+                    "Some selected frames have no 2D data, so the background "
+                    "would cover only part of the selection.  Background not "
+                    "set — pick a fully-covered selection.")
+            except Exception:
+                pass
+            return  # button stays 'Set BG'; no wrong background applied
+
+        self.bkg_1d, _ = self.get_frames_int_1d(
+            idxs, rv='average', allow_blocking_read=True)
+        self.bkg_2d = bkg_2d
+        # Set-Bkg is a one-shot user action on an idle scan: block-and-read
+        # an evicted frame's raw from disk rather than defer to the async
+        # worker (which would leave it out -> require_all None -> a silent
+        # bkg_map_raw = 0 over the whole 2D map).
+        self.bkg_map_raw = self.get_frames_map_raw(
+            idxs, require_all=True, allow_blocking_read=True)
+        if self.bkg_map_raw is None:
+            # F5: be honest about a no-op 2D background.  Pre-F5
+            # this silently set bkg=0.: 1D/2D bkg subtraction
+            # would still apply but the user saw "Clear BG" on
+            # the button as if 2D was wired up too.  Without
+            # raw frames (e.g. reloaded v2 file without
+            # resolvable source files), there's nothing to
+            # subtract in the 2D map view; log it.
+            logger.warning(
+                "setBkg: no raw image data available for selected "
+                "frames; 2D background subtraction inactive "
+                "(1D / int_2d background still applied).  This "
+                "usually means the .nxs was reloaded without "
+                "access to the original source files."
+            )
             self.bkg_map_raw = 0.
-            self.ui.setBkg.setText('Set Bkg')
-
+        self.ui.setBkg.setText('Clear BG')
         self.update()
         return
 
@@ -2448,6 +2629,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.plot_data_range = [[0, 0], [0, 0]]
         self.frame_names = []
         self.overlaid_idxs = []
+        self._waterfall_history = None
         # Forget which scan the (now empty) accumulator belonged to, so the next
         # render re-stamps it for the current scan.
         self._overlay_scan_key = None
@@ -2576,6 +2758,31 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # last in-scan repaint was throttled.
         self._wf_last_draw_t = 0.0
 
+    def _show_viewer_set_bkg(self, show):
+        """Surface ONLY the Set BG button in a viewer mode.
+
+        The Set BG button lives in ``frame_4`` next to Norm Channel, which the
+        layout table hides in viewer modes.  Show ``frame_4`` but keep Norm Channel
+        hidden, so Set BG sits left-justified where Norm Channel is in the Int
+        modes.  ``show=False`` hides it (NeXus has no display to subtract from)."""
+        try:
+            self.ui.normChannel.setVisible(False)
+            self.ui.frame_4.setVisible(bool(show))
+            self.ui.setBkg.setVisible(bool(show))
+            self.ui.setBkg.setEnabled(bool(show))
+            if show:
+                for _lay in (self.ui.frame_4.layout(),
+                             self.ui.setBkg.parentWidget().layout()):
+                    if _lay is not None:
+                        try:
+                            _lay.setContentsMargins(0, 0, 0, 0)
+                            _lay.setAlignment(
+                                self.ui.setBkg, pyQt.AlignLeft | pyQt.AlignVCenter)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
     def set_viewer_display_mode(self, mode):
         """Configure display panels for viewer modes.
 
@@ -2589,6 +2796,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # for the previous mode (the exact failure this guards against).
         if mode != self.viewer_mode:
             self._bump_display_generation()
+            # Background is scoped to the mode it was set in: drop it on a real
+            # mode change so a viewer's background never bleeds into Int (or the
+            # other viewer).  Each mode starts with no background.
+            self._clear_bkg()
         self.viewer_mode = mode
         self._viewer_is_xdart = False
         self._viewer_x_axis_label = None
@@ -2642,6 +2853,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self.ui.cmap.setVisible(True)
             self.ui.cmap.setEnabled(True)
             self.ui.scale.setEnabled(True)
+            self._show_viewer_set_bkg(True)   # Set BG subtracts a background XYE
         elif mode in ('image', 'nexus'):
             # Raw image / schema preview need no extra control state beyond the
             # geometry table.  The Linear/Log scale + colormap apply to the raw
@@ -2663,10 +2875,14 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _plot = getattr(self, 'plot', None)
             if _plot is not None:
                 _plot.enableAutoRange()
+            # Image Viewer: Set BG subtracts a background raw frame; NeXus has no
+            # subtractable display, so its button stays hidden.
+            self._show_viewer_set_bkg(mode == 'image')
             if mode == 'nexus':
                 self._set_equal_primary_panel_heights()
         else:
             # Normal mode — re-enable all process-mode controls.
+            self.ui.normChannel.setVisible(True)   # viewer modes hid it
             self.ui.normChannel.setEnabled(True)
             self.ui.setBkg.setEnabled(True)
             self.ui.shareAxis.setEnabled(True)
@@ -2756,10 +2972,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             logger.debug("combo width fit failed", exc_info=True)
 
     @staticmethod
-    def _fit_button_width(btn, *, pad=26):
-        """Fixed width = label text + padding."""
+    def _fit_button_width(btn, *, pad=26, scale=1.0):
+        """Fixed width = (label text + padding) * scale."""
         try:
-            btn.setFixedWidth(btn.fontMetrics().horizontalAdvance(btn.text()) + pad)
+            w = btn.fontMetrics().horizontalAdvance(btn.text()) + pad
+            btn.setFixedWidth(int(round(w * scale)))
         except Exception:
             logger.debug("button width fit failed", exc_info=True)
 

@@ -455,10 +455,12 @@ def test_publication_display_adapter_builds_raw_and_cake_image_payloads():
 
     # Universal raw-display policy: the raw panel is display-only and renders the
     # (precomputed, ~70x smaller) THUMBNAIL, not the full-res map_raw -- so the
-    # payload is the 2x2 thumbnail, normalized + flipped, NOT the 4x4 detector
-    # image.  (Rect-scaling the thumbnail's axes to the true detector extent is
-    # covered by test_raw_image_thumbnail_axes_span_true_detector_extent.)
-    expected_raw = (np.asarray(frame.thumbnail, dtype=float) / 10.0)[::-1, :]
+    # payload is the 2x2 thumbnail, with the per-frame background (bg_raw=1.0)
+    # subtracted then normalized then flipped (the thumbnail path now honors the
+    # background, like the full-res path).  (Rect-scaling the thumbnail's axes to
+    # the true detector extent is covered by
+    # test_raw_image_thumbnail_axes_span_true_detector_extent.)
+    expected_raw = ((np.asarray(frame.thumbnail, dtype=float) - 1.0) / 10.0)[::-1, :]
     assert raw is not None
     assert raw.image.shape == frame.thumbnail.shape          # thumbnail, not full-res
     np.testing.assert_allclose(raw.image, expected_raw, equal_nan=True)
@@ -926,7 +928,8 @@ def test_image_viewer_controller_owns_raw_preview_not_the_adapter():
         _viewer_is_xdart = False                      # standalone detector file
         data_lock = RLock()
         data_2d = {1: {"map_raw": raw, "thumbnail": None}}
-        # A monitor/background that MUST be ignored by the raw browser.
+        # A monitor (ignored by the raw browser) and a shape-matching Set-Bkg
+        # background (now subtracted -- the viewer Set BG feature).
         bkg_map_raw = np.array([[10.0, 10.0], [10.0, 10.0]])
 
         def normalize(self, data, metadata):
@@ -938,11 +941,11 @@ def test_image_viewer_controller_owns_raw_preview_not_the_adapter():
     assert payload.cake_image is None and payload.plot is None
     assert isinstance(payload.raw_image, ImagePayload)
     img = payload.raw_image.image
-    # Standalone uint16 ceiling kept (not NaN-masked), finite, and NOT divided
-    # by the monitor / background-subtracted.
+    # Standalone uint16 ceiling kept (not NaN-masked) and finite; the 10-count
+    # background IS subtracted (shapes match), the monitor is NOT divided out.
     assert np.isfinite(img).all()
-    assert np.nanmax(img) == 65535.0
-    np.testing.assert_allclose(np.sort(img.ravel()), [1, 3, 4, 65535])
+    assert np.nanmax(img) == 65525.0
+    np.testing.assert_allclose(np.sort(img.ravel()), [-9, -7, -6, 65525])
     assert payload.raw_image.axis_x.unit == "Pixels"
 
 
@@ -1233,17 +1236,20 @@ def test_integration_payload_overlay_waterfall_return_none():
         assert _adapter(store, _int_widget()).integration_plot_payload(state) is None
 
 
-def test_plot_payload_defers_overlay_waterfall_to_legacy_after_flip():
-    # Step 5 FLIP: plot_payload returns a payload for Single (delegating to
-    # integration_plot_payload) but still returns None for Overlay/Waterfall so
-    # render_display falls back to the legacy update_plot accumulator.
+def test_plot_payload_routes_overlay_waterfall_through_accumulator_after_flip():
+    # Flip stage 3: plot_payload returns a payload for Single (via
+    # integration_plot_payload) AND for Overlay/Waterfall (via the payload-owned
+    # WaterfallHistory accumulator) -- the latter was previously None, deferring to
+    # the legacy update_plot.  The Overlay/Waterfall payload carries plot_history.
     frame = DuckFrame(idx=9)
     store = PublicationStore(); store.upsert(publication_from_live_frame(frame))
     adapter = _adapter(store, _int_widget())
-    assert adapter.plot_payload(_int_state(store, ids=(9,), method="Single")) is not None
+    single = adapter.plot_payload(_int_state(store, ids=(9,), method="Single"))
+    assert single is not None and single.plot_history is None
     for method in ("Overlay", "Waterfall"):
-        assert adapter.plot_payload(
-            _int_state(store, ids=(9,), method=method)) is None
+        payload = adapter.plot_payload(_int_state(store, ids=(9,), method=method))
+        assert payload is not None
+        assert payload.plot_history is not None and payload.overlaid_ids == (9,)
 
 
 def test_plot_payload_sum_average_emit_n_traces_collapsed_at_render():

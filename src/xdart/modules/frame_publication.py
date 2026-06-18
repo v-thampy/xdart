@@ -35,6 +35,7 @@ from xrd_tools.core import (
 # GI2D mode coercer has no alias for that literal 2D key.
 _LEGACY_TO_CANONICAL_1D = {
     "qtotal": "q_total", "qip": "q_ip", "qoop": "q_oop", "exit": "exit_angle",
+    "chigi": "chi_gi",
 }
 _LEGACY_TO_CANONICAL_2D = {
     "gi2d": "qip_qoop", "polar": "q_chi", "exit2d": "exit_angles",

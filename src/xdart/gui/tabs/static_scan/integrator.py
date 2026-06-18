@@ -42,15 +42,17 @@ QFileDialog = QtWidgets.QFileDialog
 AA_inv = u'\u212B\u207B\u00B9'
 Th = u'\u03B8'
 Deg = u'\u00B0'
-Units = [f"Q ({AA_inv})", f"2{Th} ({Deg})"]
-Units_dict = {Units[0]: 'q_A^-1', Units[1]: '2th_deg'}
-# Units_dict_inv = {'q_A^-1': Units[0], '2th_deg': Units[1]}
-Units_dict_inv = {'q_A^-1': 0, '2th_deg': 1}
-
 Chi = u'\u03C7'
+# Int-1D radial-unit choices.  The third, chi (azimuthal profile / I vs chi), is a
+# 1D-ONLY mode: the OUTPUT axis is chi while the range field is the q band integrated
+# over (see frame.integrate_1d's chi_deg branch).  The 2D combo (unit_2D) keeps only
+# Q / 2theta.
+Units = [f"Q ({AA_inv})", f"2{Th} ({Deg})", f"{Chi} ({Deg})"]
+Units_dict = {Units[0]: 'q_A^-1', Units[1]: '2th_deg', Units[2]: 'chi_deg'}
+Units_dict_inv = {'q_A^-1': 0, '2th_deg': 1, 'chi_deg': 2}
 
-GI_MODES_1D = ['q_total', 'q_ip', 'q_oop', 'exit_angle']
-GI_LABELS_1D = ["Q", "Q\u1D62\u209A", "Q\u2092\u2092\u209A", "Exit"]
+GI_MODES_1D = ['q_total', 'q_ip', 'q_oop', 'exit_angle', 'chi_gi']
+GI_LABELS_1D = ["Q", "Q\u1D62\u209A", "Q\u2092\u2092\u209A", "Exit", f"{Chi}GI"]
 GI_MODES_2D = ['qip_qoop', 'q_chi', 'exit_angles']
 GI_LABELS_2D = [u"Q\u1D62\u209A\u2013Q\u2092\u2092\u209A", f"Q-{Chi}", "Exit"]
 
@@ -149,6 +151,11 @@ class integratorTree(QtWidgets.QWidget):
         _translate = QtCore.QCoreApplication.translate
         self.ui.unit_1D.setItemText(0, _translate("Form", Units[0]))
         self.ui.unit_1D.setItemText(1, _translate("Form", Units[1]))
+        # The .ui declares two unit items; add the third (chi, azimuthal profile)
+        # for the 1D combo only.  Idempotent across re-inits.
+        if self.ui.unit_1D.count() < 3:
+            self.ui.unit_1D.addItem("")
+        self.ui.unit_1D.setItemText(2, _translate("Form", Units[2]))
         self.ui.label_azim_1D.setText(f"{Chi} ({Deg})")
 
         self.ui.unit_2D.setItemText(0, _translate("Form", Units[0]))
@@ -179,6 +186,13 @@ class integratorTree(QtWidgets.QWidget):
 
         self.ui.integrate1D.clicked.connect(self.bai_1d)
         self.ui.integrate2D.clicked.connect(self.bai_2d)
+
+        # Resurfaced Reintegrate row (the visible buttons; integrate1D/2D above
+        # are the retained hidden stubs).  Two SEPARATE buttons so re-doing one
+        # output never clobbers the other.  Advanced is re-homed onto advanced_int
+        # in staticWidget (it owns the combined 1D+2D dialog).
+        self.ui.reintegrate1D.clicked.connect(self.bai_1d)
+        self.ui.reintegrate2D.clicked.connect(self.bai_2d)
 
         self.integrator_thread = integratorThread(
             self.scan, self.frame, self.file_lock,
@@ -1215,6 +1229,7 @@ class integratorTree(QtWidgets.QWidget):
             self.ui.axis1D.clear()
             self.ui.axis1D.addItem(_translate("Form", Units[0]))   # Q (Å⁻¹)
             self.ui.axis1D.addItem(_translate("Form", Units[1]))   # 2θ (°)
+            self.ui.axis1D.addItem(_translate("Form", Units[2]))   # χ (°) azimuthal profile
             self.ui.axis2D.clear()
             self.ui.axis2D.addItem(_translate("Form", f"Q-{Chi}"))
             self.ui.axis2D.addItem(_translate("Form", f"2{Th}-{Chi}"))
@@ -1240,6 +1255,10 @@ class integratorTree(QtWidgets.QWidget):
             for _combo in (self.ui.unit_1D, self.ui.unit_2D):
                 if _combo.count() < 2:
                     _combo.addItem(_translate("Form", Units[1]))
+            # The 1D combo also offers chi (azimuthal profile, 1D-only); a GI visit
+            # trimmed it to <=2 items, so restore the third here too.
+            if self.ui.unit_1D.count() < 3:
+                self.ui.unit_1D.addItem(_translate("Form", Units[2]))
             # Update radial labels + range defaults for current unit
             self._update_standard_1d_label(self.ui.axis1D.currentIndex())
             self._update_standard_2d_label(self.ui.axis2D.currentIndex())
@@ -1379,6 +1398,7 @@ class integratorTree(QtWidgets.QWidget):
         'q_ip': ('1000', '1000'),
         'q_oop': ('1000', '1000'),
         'exit_angle': ('1000', '1000'),
+        'chi_gi': ('500', '1000'),       # (χ_GI output bins, q_total sampling)
         'q_total': ('2000', ''),
         'std': ('2000', ''),
     }
@@ -1438,6 +1458,14 @@ class integratorTree(QtWidgets.QWidget):
             self.ui.gi_radial_label_1D.show()
             self.ui.label_azim_1D.setText(f"Exit ({Deg})")
             self._set_range_defaults_1d(-5, 5, 0, 90)
+        elif mode == 'chi_gi':
+            # GI azimuthal profile: OUTPUT axis is χ_GI; the radial-range field is
+            # the q_total BAND integrated over, the azim field clips χ_GI.
+            self.ui.unit_1D.hide()
+            self.ui.gi_radial_label_1D.setText(f"Q ({AA_inv})")
+            self.ui.gi_radial_label_1D.show()
+            self.ui.label_azim_1D.setText(f"{Chi}GI ({Deg})")
+            self._set_range_defaults_1d(0, 5, -180, 180)
         else:  # q_total (polar)
             self.ui.unit_1D.show()
             self.ui.unit_1D.setEnabled(True)
@@ -1513,6 +1541,12 @@ class integratorTree(QtWidgets.QWidget):
             unit = '2th_deg'
             label = f"2{Th} ({Deg})"
             self._set_range_defaults_1d(0, 90, -180, 180)
+        elif n == 2:  # χ (azimuthal profile): OUTPUT axis is χ, but the editable
+            # radial-range field is the q BAND integrated over (always Q), so the
+            # range label stays Q and the band defaults to a Q range.
+            unit = 'chi_deg'
+            label = f"Q ({AA_inv})"
+            self._set_range_defaults_1d(0, 5, -180, 180)
         else:  # Q
             unit = 'q_A^-1'
             label = f"Q ({AA_inv})"

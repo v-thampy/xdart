@@ -10,6 +10,7 @@ from xrd_tools.integrate.gid import (
     create_fiber_integrator,
     integrate_gi_1d,
     integrate_gi_2d,
+    integrate_gi_azimuthal_1d,
     integrate_gi_exitangles,
     integrate_gi_exitangles_1d,
     integrate_gi_polar,
@@ -23,6 +24,7 @@ from xrd_tools.integrate.multi import (
 from xrd_tools.integrate.single import (
     integrate_1d,
     integrate_2d,
+    integrate_radial,
     integrate_scan,
 )
 from xrd_tools.integrate.calibration import (
@@ -40,6 +42,7 @@ __all__ = [
     "create_multigeometry_integrators",
     "integrate_gi_1d",
     "integrate_gi_2d",
+    "integrate_gi_azimuthal_1d",
     "integrate_gi_exitangles",
     "integrate_gi_exitangles_1d",
     "integrate_gi_polar",
@@ -47,6 +50,7 @@ __all__ = [
     "get_detector",
     "integrate_1d",
     "integrate_2d",
+    "integrate_radial",
     "integrate_scan",
     "stitch_1d",
     "stitch_2d",

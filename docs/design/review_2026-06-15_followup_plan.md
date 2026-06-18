@@ -231,6 +231,46 @@ end-of-scan dark-gaps bug and **advances Wave 5 A3** (the raw-2D `map_raw` retar
 (scan-1D still has the `update_plot` fallback), and the **A4 deletion** of Role-A `data_1d`/`data_2d`
 (+ `hydrated_raw.py`) once the >64 aggregation + scroll-back tests stay green without the backstop.
 
+### 0.4 `overlay-waterfall-payload-flip` branch (2026-06-17/18) — STEP-5 Overlay/Waterfall flip DONE (stages 1–3); A4 deletion still pending + cake/bg fixes
+
+Branch off `main` (NOT pushed). The Overlay/Waterfall **1D** flip from §0.3's remaining list is now **DONE
+through stage 3** (it renders from the payload-owned accumulator). The A4 deletion is the only flip work left.
+
+**Flip commits (branch, oldest→newest):**
+- `0092ab6` **stage 1** — pure generation-free `WaterfallHistory` + `accumulate_waterfall` in `display_logic.py`
+  (Qt-free, `-m display_logic`). Append-only; reset keyed on a stable `reset_key`.
+- `f67ff9d` **stage 2** — adapter `_overlay_waterfall_payload`/`_history_to_payload` build the accumulator
+  INTO the payload (carries `plot_history`/`overlaid_ids`), not rebuilt from the cap-limited store.
+- `47c3b8e` **stage 3 — WIRED + RENDERING** — `plot_payload` routes Overlay/Waterfall to the accumulator;
+  `_draw_payload` draws via the shared `update_plot_view` + stores the history back; legacy `update_plot`
+  kept ONLY as the None-payload fallback. **Live-confirmed by Vivek (smooth; share-axis + unit toggle OK).**
+  **KEY BUG fixed in review:** the accumulator reset must be keyed on a STABLE scan/source `reset_key`,
+  **NOT** `state.generation` — the generation bumps every tick as live auto-last grows the selection, so
+  keying on it would reset each tick and rebuild from only the un-evicted frames (`intensity_1d` is heavy →
+  tier-1 eviction drops `has_1d`) = the exact cap-truncation the payload accumulator exists to prevent.
+
+**Independent P1/feature commits riding this branch (cake fixes ALSO on `main`: `48ff624`/`509fb5c`/`2ce388d`):**
+- GI + non-GI **2D cake NaN-empty fix** (`_to_result_2d` in `gid.py`, `integrate_2d` in `single.py`): empty
+  (`count==0`) bins → NaN, not the pyFAI dummy/0, so the cake→1D projection + 2D Overall aggregate skip
+  no-coverage gaps. Count-keyed (genuine zeros preserved). Spine + byte-compat green.
+- `7b23f5c` + `ecd1283` **Set BG works in the Image + XYE viewers** (labels now **"Set BG"/"Clear BG"**),
+  button left-justified at the Norm-Channel slot in viewer modes (`PANEL_LAYOUT frame_4_vis=True` + Norm
+  hidden at runtime). Background is **scoped per mode** (cleared on a mode change) and subtracted
+  **shape-match-only** (never resize an incompatible bg → a full-res bg does NOT subtract from a thumbnail).
+
+**▶ RESUME HERE — flip stages 4–5 (LIVE-GATED, the "remaining steps"):** the validated 8-commit plan (from
+the in-session `flip-understand` workflow map) is —
+1. **Phase A** convert the remaining legacy readers to publication-only (`_data_snapshot(include_legacy=False)`,
+   drop the XYE/`_snapshot_data` `data_1d` fallbacks, swap the `len(data_*)==0` blanking gates for store checks).
+2. **Phase B** retire legacy `update_plot` — BLOCKER: it is still the None-payload fallback for
+   Single/Sum/Average, so this needs full PLOT_1D payload coverage (or None→clear) first.
+3. **Phase C/D** delete Role-A `data_1d`/`data_2d` from `staticWidget` + all constructors — workflow risk C1:
+   silent data loss if a wrangler reads back what it wrote; verify no writer/reader pair breaks.
+4. **Phase E** delete `hydrated_raw.py` + the dead `update_image` (zero display-layer callers; raw-panel flip
+   already live-confirmed).
+- DEFER to Phase 5: viewer-mode `data_1d` (NeXus preview). Each phase gates on the equivalence spine; the
+  QThread-teardown / scroll-back / pause-disk races are only catchable in a live session (one checkpoint).
+
 ## Scope guardrails (apply to EVERY item — do not violate)
 - **No `git push` / publish / tag** — maintainer only. Commit per item with the relevant suite green.
 - **Persisted NeXus format is frozen + additive-only.** The byte-compat gate

@@ -20,11 +20,12 @@ from xrd_tools.core.containers import (
     IntegrationResult2D,
 )
 from xrd_tools.integrate.calibration import poni_to_integrator
-from xrd_tools.integrate.single import integrate_1d, integrate_2d
+from xrd_tools.integrate.single import integrate_1d, integrate_2d, integrate_radial
 from xrd_tools.integrate.gid import (
     create_fiber_integrator,
     integrate_gi_1d,
     integrate_gi_2d,
+    integrate_gi_azimuthal_1d,
     integrate_gi_polar,
     integrate_gi_polar_1d,
     integrate_gi_exitangles_1d,
@@ -608,15 +609,33 @@ class LiveFrame():
                     _az = std_kwargs['azimuth_range']
                     std_kwargs['azimuth_range'] = (_az[0] - chi_offset, _az[1] - chi_offset)
                 
-                result = integrate_1d(
-                    (self.map_raw - self.bg_raw) / self.map_norm,
-                    self.integrator,
-                    npt=numpoints,
-                    unit=str(unit),
-                    radial_range=radial_range,
-                    mask=self.get_mask(global_mask),
-                    **std_kwargs,
-                )
+                if str(unit) == 'chi_deg':
+                    # Azimuthal profile (I vs chi): the OUTPUT axis is chi; the
+                    # range field is the q BAND to integrate over (always Q, per
+                    # the design).  npt = chi output bins; the q sampling defaults
+                    # in the wrapper.  integrate_radial does not accept error_model
+                    # / variance, so drop them from the forwarded kwargs.
+                    chi_kwargs = {k: v for k, v in std_kwargs.items()
+                                  if k not in ('error_model', 'variance')}
+                    result = integrate_radial(
+                        (self.map_raw - self.bg_raw) / self.map_norm,
+                        self.integrator,
+                        npt=numpoints,
+                        radial_unit='q_A^-1',
+                        radial_range=radial_range,
+                        mask=self.get_mask(global_mask),
+                        **chi_kwargs,
+                    )
+                else:
+                    result = integrate_1d(
+                        (self.map_raw - self.bg_raw) / self.map_norm,
+                        self.integrator,
+                        npt=numpoints,
+                        unit=str(unit),
+                        radial_range=radial_range,
+                        mask=self.get_mask(global_mask),
+                        **std_kwargs,
+                    )
                 self.int_1d = result
             else:
                 _gi_valid = {
@@ -683,6 +702,18 @@ class LiveFrame():
                         **gi_kwargs,
                     )
                     self.gi_1d['exit'] = result
+                elif gi_mode_1d == 'chi_gi':
+                    # GI azimuthal profile: I vs χ_GI pooled over a q_total band.
+                    # npt = χ_GI bins (box 1); npt_q = q_total sampling (box 2);
+                    # the radial-range field = q_total band, the azim field = χ clip.
+                    result = integrate_gi_azimuthal_1d(
+                        image_data, fi, npt=numpoints, npt_q=npt_oop,
+                        method=gi_method, mask=mask,
+                        radial_range=radial_range,
+                        azimuth_range=kwargs.get('azimuth_range'),
+                        **gi_kwargs,
+                    )
+                    self.gi_1d['chigi'] = result
                 else:  # 'q_total' (default — polar integration)
                     result = integrate_gi_polar_1d(
                         image_data, fi, npt=numpoints,
