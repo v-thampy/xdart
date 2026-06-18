@@ -781,23 +781,22 @@ class staticWidget(QWidget):
         self._pending_frames = {}
         import os as _os
         import time as _time
-        import numpy as _np
         _perf = bool(_os.environ.get("XDART_PERF"))
         t0 = _time.perf_counter()
         _t_mask = _t_build = _t_upsert = _t_scan = 0.0   # per-leg accumulators
 
         published = getattr(self.wrangler, "thread", None)
         global_mask = getattr(published, "mask", None) if published is not None else None
-        g = None
         if global_mask is not None:
+            # Publish the detector gap mask ONCE per drain for the display.  We do
+            # NOT fold it into each frame's own mask any more: the raw panel renders
+            # via the raw_image payload, whose full-res path (_apply_detector_mask)
+            # AND thumbnail gap-bake (combine_flat_masks) both apply scan.global_mask
+            # DIRECTLY -- so the per-frame fold (an O(M log M) setdiff1d over the
+            # large gap mask, EVERY frame) was pure redundant work and the dominant
+            # drain-runaway cost.  frame.mask stays the per-frame map_raw<0; the
+            # display unions scan.global_mask for the gaps.
             self.scan.global_mask = global_mask
-            # Sort the (invariant) detector gap mask ONCE per scan; reused for the
-            # per-frame fold below (np.union1d re-sorted the whole mask per frame).
-            g = getattr(self, "_live_gap_mask_sorted", None)
-            if g is None or getattr(self, "_live_gap_mask_src", None) is not global_mask:
-                g = _np.unique(_np.asarray(global_mask).ravel())
-                self._live_gap_mask_sorted = g
-                self._live_gap_mask_src = global_mask
 
         _is_gi = bool(getattr(self.scan, "gi", False))
         skip_2d = getattr(self.scan, "skip_2d", False)
@@ -811,21 +810,7 @@ class staticWidget(QWidget):
         for idx in sorted(pending):
             frame = pending[idx]
             try:
-                # Fold the detector gap mask into the frame's OWN mask (the
-                # end-of-scan full-res raw panel renders frame.mask; the live mask
-                # is only map_raw<0 and misses the 0-valued module gaps).  Cached
-                # sorted-global + setdiff fold; membership-only, need not be sorted.
                 _ts = _time.perf_counter() if _perf else 0.0
-                if g is not None:
-                    _fm = getattr(frame, "mask", None)
-                    if _fm is None or _np.size(_fm) == 0:
-                        frame.mask = g
-                    else:
-                        extra = _np.setdiff1d(_np.asarray(_fm).ravel(), g)
-                        frame.mask = (g if extra.size == 0
-                                      else _np.concatenate([g, extra]))
-                if _perf:
-                    _t1 = _time.perf_counter(); _t_mask += _t1 - _ts; _ts = _t1
                 # Step 6: key the live record under the real GI mode so a later
                 # reintegrate at the same mode folds onto it.  .view is unaffected.
                 publication = publication_from_live_frame(
