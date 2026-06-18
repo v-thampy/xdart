@@ -791,5 +791,52 @@ class LiveScan:
         if "intensity_1d" not in ds.data_vars:
             return
 
+    def load_frame_index_only(self, fname: "str | None" = None) -> int:
+        """Populate ONLY ``self.frames`` (the lazy frame index) from a v2 .nxs,
+        leaving ``scan_data`` / ``bai_*_args`` / ``global_mask`` / geometry — and
+        the GUI's separate display caches — untouched.
+
+        The streaming live path writes the .nxs but never adds to ``self.frames``
+        (the lazy series re-integration iterates), so after a live run the
+        Reintegrate buttons have nothing to iterate.  Once the run has finished
+        and the writer has closed the file, this rebuilds the lazy index from it
+        so reintegration works immediately — matching the post-batch behavior —
+        WITHOUT a full ``set_datafile`` reload (which ``reset()``s the scan and
+        reloads every field).  Frames stay lazy: raw images materialize on demand
+        from the stacked datasets / source files when a re-integration reads them.
+
+        Returns the number of frames indexed (0 on empty file / failure).
+        """
+        with self.file_lock, self.scan_lock:
+            if fname is not None:
+                self.data_file = fname
+            if not self.data_file or not os.path.exists(self.data_file):
+                return 0
+            try:  # metadata-only reader skips the heavy stacks; fall back if absent
+                from xrd_tools.io.nexus import read_scan_metadata as _read
+            except ImportError:
+                from xrd_tools.io.nexus import read_scan as _read
+            try:
+                ds = _read(self.data_file)
+                frame_indices = []
+                for coord_name in ("frame", "frame_2d"):
+                    if coord_name in ds.coords:
+                        frame_indices.extend(
+                            np.asarray(ds[coord_name].values).astype(int).tolist())
+                frame_indices = sorted(set(frame_indices))
+                series = LiveFrameSeries(
+                    self.data_file, self.file_lock,
+                    static=self.static, gi=self.gi)
+                for idx in frame_indices:
+                    if idx not in series.index:
+                        series.index.append(idx)
+                series.index.sort()
+                self.frames = series
+                return len(series.index)
+            except Exception:
+                logger.exception(
+                    "load_frame_index_only failed for %s", self.data_file)
+                return 0
+
 
 __all__ = ["LiveScan"]

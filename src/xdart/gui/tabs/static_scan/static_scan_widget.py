@@ -1740,6 +1740,29 @@ class staticWidget(QWidget):
                 # to this file) so the last-frame select-last actually fires.
                 self.h5viewer.set_file(existing_file, internal=True)
 
+        # Live run (saw frames): the streaming path populated the display caches
+        # but NOT self.scan.frames (the lazy series re-integration iterates), so
+        # the Reintegrate row would stay disabled post-run.  Now that the writer
+        # has closed the file, rebuild ONLY the lazy frame index from it (no
+        # display reload, no scan-state reset) so reintegrate works immediately —
+        # batch already gets this via its end-of-batch reload above.  Skip when a
+        # reintegrate is still running (don't repoint frames mid-reintegrate) or
+        # when the run saw 0 frames (the append-feedback branch already reloaded).
+        if (not is_batch and not is_xye_only and not _reintegrate_running
+                and getattr(self, '_run_saw_frame', True)
+                and not self.scan.frames.index):
+            written = (getattr(self.wrangler.thread, 'fname', None)
+                       or getattr(self.wrangler, 'fname', None))
+            if written and os.path.exists(written):
+                try:
+                    n = self.scan.load_frame_index_only(written)
+                    logger.debug(
+                        "post-live: indexed %d frames for reintegrate", n)
+                except Exception:
+                    logger.debug("post-live frame-index populate failed",
+                                 exc_info=True)
+                self._apply_integration_control_state()
+
         # The scan-matches branch delegates to integrator_thread_finished() to
         # run the post-integration UI enable + exit the run-state.  Skip it when
         # a real reintegrate is still running (the overlap case): calling it

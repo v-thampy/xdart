@@ -149,3 +149,49 @@ class TestNonBatchNoDataLoss:
         assert len(reloaded.frames.index) == N
         for i in range(N):
             assert reloaded.frames[i].int_1d is not None
+
+
+class TestLoadFrameIndexOnly:
+    """load_frame_index_only is the post-live reintegrate hookup: rebuild the lazy
+    frame index from the finished .nxs WITHOUT a full set_datafile reload."""
+
+    def test_populates_frames_without_clobbering_scan_state(self, tmp_path):
+        import pandas as pd
+        from xdart.modules.ewald import LiveScan
+
+        nxs = str(tmp_path / "scan.nxs")
+        writer = LiveScan(data_file=nxs)
+        writer.skip_2d = True
+        N = 6
+        for i in range(N):
+            writer.add_frame(frame=_make_frame(i), calculate=False,
+                             update=True, get_sd=True, batch_save=True)
+        writer._save_to_nexus()
+
+        # A fresh scan standing in for the post-live state: frames empty (the
+        # streaming path never populated them), but other scan state + the GUI
+        # caches are live.  Sentinels here must survive the index load.
+        scan = LiveScan(data_file=None)
+        scan.bai_1d_args = {"numpoints": 999}
+        scan.bai_2d_args = {"npt_rad": 777}
+        scan.global_mask = np.array([1, 2, 3])
+        scan.scan_data = pd.DataFrame({"i0": [10.0, 20.0]})
+        assert not scan.frames.index            # empty before the load
+
+        n = scan.load_frame_index_only(nxs)
+
+        assert n == N
+        assert list(scan.frames.index) == list(range(N))
+        # Frames are usable + lazy: a frame loads its int_1d from disk on demand.
+        assert scan.frames[0].int_1d is not None
+        # And nothing else was touched (no reset / reload of these fields).
+        assert scan.bai_1d_args == {"numpoints": 999}
+        assert scan.bai_2d_args == {"npt_rad": 777}
+        np.testing.assert_array_equal(scan.global_mask, [1, 2, 3])
+        assert list(scan.scan_data["i0"]) == [10.0, 20.0]
+
+    def test_missing_file_is_a_safe_noop(self, tmp_path):
+        from xdart.modules.ewald import LiveScan
+        scan = LiveScan(data_file=None)
+        assert scan.load_frame_index_only(str(tmp_path / "nope.nxs")) == 0
+        assert not scan.frames.index
