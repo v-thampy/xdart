@@ -24,6 +24,7 @@ from .display_constants import (
 )
 from .display_logic import (
     plan_overlay,
+    overlay_read_failure_action,
     OverlayAction,
     pretty_unit,
     nanmean_slice,
@@ -436,7 +437,20 @@ class DisplayPlotMixin:
         # Get 1D data for all frames
         ydata, xdata = self.collect_plot_rows()
         if xdata is None or ydata is None:
-            self.clear_plot_view()
+            # Append-only invariant: a failed/partial INCREMENTAL read must never
+            # wipe an existing Overlay/Waterfall accumulator -- the missing frames
+            # are in flight (being written, or evicted past the store cap and
+            # awaiting async hydration) and arrive on a later tick.  Clearing here
+            # was the regression where a slow GUI (e.g. Share Axis) let the
+            # reduction race ahead, the non-blocking read of the newest frames
+            # returned None, and the whole stack collapsed to ~0 and re-stacked as
+            # it caught up.  PRESERVE keeps the accumulator and redraws it.
+            if overlay_read_failure_action(
+                method, bool(getattr(self, "overlaid_idxs", None))
+            ) == "preserve":
+                self.draw_plot_state()
+            else:
+                self.clear_plot_view()
             return
 
         row_ids = list(getattr(self, "_plot_row_ids", self.idxs_1d))

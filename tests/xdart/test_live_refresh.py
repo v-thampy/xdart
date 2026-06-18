@@ -612,6 +612,73 @@ def test_flush_pending_update_feeds_overlay_all_pending_frames():
     ]
 
 
+def test_update_plot_preserves_overlay_accumulator_on_failed_read():
+    """Append-only invariant (regression guard): when the incremental read returns
+    no data and an Overlay/Waterfall accumulator already exists, update_plot must
+    PRESERVE it (redraw) and NEVER clear_plot_view -- clearing wiped the whole
+    stack, which is what made a slow live scan (e.g. Share Axis) collapse the
+    waterfall to ~0 and repopulate + re-stack frames as it caught up."""
+    calls = []
+    host = SimpleNamespace(
+        scan=SimpleNamespace(name="scanA", data_file="scanA"),
+        frame_ids=[0, 1, 2, 3],
+        overlaid_idxs=[0, 1, 2],
+        idxs_1d=[3],                       # a new 'missing' frame -> the
+                                           # already-covered early-return is skipped
+        _overlay_scan_key="scanA",         # same scan -> no boundary reset
+        _last_plot_unit=0,
+        _payload_x_axis_label="stale",
+        _payload_y_axis_label="stale",
+        plot_data=[np.arange(3), np.ones((3, 3))],
+        frame_names=["scanA_0", "scanA_1", "scanA_2"],
+        ui=SimpleNamespace(
+            plotMethod=_FakeCombo("Overlay"),
+            plotUnit=_FakeIndexedCombo("Q", index=0),
+        ),
+        collect_plot_rows=lambda: (None, None),    # failed/empty incremental read
+        draw_plot_state=lambda: calls.append("draw"),
+        clear_plot_view=lambda: calls.append("clear"),
+    )
+    host.update_plot = MethodType(DisplayPlotMixin.update_plot, host)
+
+    host.update_plot()
+
+    assert "clear" not in calls                # never wipe an existing accumulator
+    assert "draw" in calls                     # redraw what we already have
+    assert host.overlaid_idxs == [0, 1, 2]     # untouched -> monotonic
+
+
+def test_update_plot_clears_when_no_overlay_accumulator_and_read_fails():
+    """The genuine empty case (fresh reload, nothing accumulated yet) still
+    clears -- the preserve guard is scoped to a non-empty accumulator."""
+    calls = []
+    host = SimpleNamespace(
+        scan=SimpleNamespace(name="scanA", data_file="scanA"),
+        frame_ids=[0, 1, 2, 3],
+        overlaid_idxs=[],                  # nothing accumulated yet
+        idxs_1d=[0, 1, 2, 3],
+        _overlay_scan_key="scanA",
+        _last_plot_unit=0,
+        _payload_x_axis_label=None,
+        _payload_y_axis_label=None,
+        plot_data=[np.zeros(0), np.zeros(0)],
+        frame_names=[],
+        ui=SimpleNamespace(
+            plotMethod=_FakeCombo("Overlay"),
+            plotUnit=_FakeIndexedCombo("Q", index=0),
+        ),
+        collect_plot_rows=lambda: (None, None),
+        draw_plot_state=lambda: calls.append("draw"),
+        clear_plot_view=lambda: calls.append("clear"),
+    )
+    host.update_plot = MethodType(DisplayPlotMixin.update_plot, host)
+
+    host.update_plot()
+
+    assert "clear" in calls
+    assert "draw" not in calls
+
+
 def _display_host():
     image_widget = _FakeImageWidget()
     binned_widget = _FakeImageWidget()

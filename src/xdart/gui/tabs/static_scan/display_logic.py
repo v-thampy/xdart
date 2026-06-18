@@ -729,6 +729,31 @@ def plan_overlay(method, unit_changed, has_existing, new_ids, prev_overlaid_ids)
     return OverlayAction.REPLACE, new_ids
 
 
+def overlay_read_failure_action(method, has_accumulator):
+    """Decide what an Overlay/Waterfall render does when its INCREMENTAL read of
+    the not-yet-accumulated frames comes back empty.
+
+    Append-only invariant: a failed/partial read must NEVER shrink an existing
+    accumulator.  When Overlay/Waterfall already has accumulated frames, the
+    missing ones are simply in flight (being written, or evicted past the store
+    cap and awaiting async hydration) and arrive on a later tick -- so PRESERVE
+    the accumulator and redraw what we have.  CLEAR only when nothing is
+    accumulated yet (a genuine empty selection) or for the non-accumulating
+    methods (Single/Sum/Average), which rebuild from the current selection.
+
+    This is the fix for the cap-store Overlay/Waterfall regression: a slow GUI
+    (e.g. toggling Share Axis) let the reduction race ahead, the non-blocking read
+    of the newest 'missing' frames returned nothing, and the panel was cleared --
+    collapsing the whole stack to ~0 and then repopulating + re-stacking frames as
+    it caught up.
+
+    Returns ``'preserve'`` or ``'clear'``.
+    """
+    if method in ('Overlay', 'Waterfall') and has_accumulator:
+        return 'preserve'
+    return 'clear'
+
+
 def integer_saturation_ceiling(arr):
     """GUI wrapper over :func:`xrd_tools.core.invalid.integer_saturation_ceiling`:
     the dtype-derived ceiling (``np.iinfo(dtype).max`` — 65535 for uint16, 255

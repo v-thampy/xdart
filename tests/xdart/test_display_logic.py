@@ -125,6 +125,26 @@ def test_plan_overlay_rebuild_on_unit_change_keeps_all_ids():
     assert action2 is dl.OverlayAction.REPLACE
 
 
+def test_overlay_read_failure_preserves_existing_accumulator():
+    # Append-only invariant: a failed/partial incremental read of the newest
+    # frames must NEVER wipe an existing Overlay/Waterfall accumulator (the
+    # cap-store regression).  With an accumulator present -> PRESERVE.
+    assert dl.overlay_read_failure_action('Overlay', has_accumulator=True) == 'preserve'
+    assert dl.overlay_read_failure_action('Waterfall', has_accumulator=True) == 'preserve'
+
+
+def test_overlay_read_failure_clears_when_nothing_accumulated():
+    # Genuine empty selection (fresh reload, no frames yet) -> CLEAR is correct.
+    assert dl.overlay_read_failure_action('Overlay', has_accumulator=False) == 'clear'
+    assert dl.overlay_read_failure_action('Waterfall', has_accumulator=False) == 'clear'
+
+
+def test_overlay_read_failure_clears_for_non_accumulating_methods():
+    # Single/Sum/Average rebuild from the current selection; a failed read clears.
+    for method in ('Single', 'Sum', 'Average'):
+        assert dl.overlay_read_failure_action(method, has_accumulator=True) == 'clear'
+
+
 def test_gi_axes_uniform_detects_mismatch():
     q = [0.0, 1.0, 2.0]
     assert dl.gi_axes_uniform([(q, q), (q, q)]) is True
