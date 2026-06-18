@@ -455,10 +455,12 @@ def test_publication_display_adapter_builds_raw_and_cake_image_payloads():
 
     # Universal raw-display policy: the raw panel is display-only and renders the
     # (precomputed, ~70x smaller) THUMBNAIL, not the full-res map_raw -- so the
-    # payload is the 2x2 thumbnail, normalized + flipped, NOT the 4x4 detector
-    # image.  (Rect-scaling the thumbnail's axes to the true detector extent is
-    # covered by test_raw_image_thumbnail_axes_span_true_detector_extent.)
-    expected_raw = (np.asarray(frame.thumbnail, dtype=float) / 10.0)[::-1, :]
+    # payload is the 2x2 thumbnail, with the per-frame background (bg_raw=1.0)
+    # subtracted then normalized then flipped (the thumbnail path now honors the
+    # background, like the full-res path).  (Rect-scaling the thumbnail's axes to
+    # the true detector extent is covered by
+    # test_raw_image_thumbnail_axes_span_true_detector_extent.)
+    expected_raw = ((np.asarray(frame.thumbnail, dtype=float) - 1.0) / 10.0)[::-1, :]
     assert raw is not None
     assert raw.image.shape == frame.thumbnail.shape          # thumbnail, not full-res
     np.testing.assert_allclose(raw.image, expected_raw, equal_nan=True)
