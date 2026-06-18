@@ -779,9 +779,12 @@ class staticWidget(QWidget):
         if not pending:
             return
         self._pending_frames = {}
+        import os as _os
         import time as _time
         import numpy as _np
+        _perf = bool(_os.environ.get("XDART_PERF"))
         t0 = _time.perf_counter()
+        _t_mask = _t_build = _t_upsert = _t_scan = 0.0   # per-leg accumulators
 
         published = getattr(self.wrangler, "thread", None)
         global_mask = getattr(published, "mask", None) if published is not None else None
@@ -812,6 +815,7 @@ class staticWidget(QWidget):
                 # end-of-scan full-res raw panel renders frame.mask; the live mask
                 # is only map_raw<0 and misses the 0-valued module gaps).  Cached
                 # sorted-global + setdiff fold; membership-only, need not be sorted.
+                _ts = _time.perf_counter() if _perf else 0.0
                 if g is not None:
                     _fm = getattr(frame, "mask", None)
                     if _fm is None or _np.size(_fm) == 0:
@@ -820,6 +824,8 @@ class staticWidget(QWidget):
                         extra = _np.setdiff1d(_np.asarray(_fm).ravel(), g)
                         frame.mask = (g if extra.size == 0
                                       else _np.concatenate([g, extra]))
+                if _perf:
+                    _t1 = _time.perf_counter(); _t_mask += _t1 - _ts; _ts = _t1
                 # Step 6: key the live record under the real GI mode so a later
                 # reintegrate at the same mode folds onto it.  .view is unaffected.
                 publication = publication_from_live_frame(
@@ -832,7 +838,11 @@ class staticWidget(QWidget):
                     logger.warning(
                         "Skipping frame %s 2D publication: %s", idx,
                         publication_error_details(publication, "2d"))
+                if _perf:
+                    _t1 = _time.perf_counter(); _t_build += _t1 - _ts; _ts = _t1
                 self.publication_store.upsert(publication)
+                if _perf:
+                    _t_upsert += _time.perf_counter() - _ts
             except Exception:
                 # Non-fatal — displayframe lazy-loads from disk as fallback.
                 logger.debug("In-memory frame hand-off failed for idx=%s", idx,
@@ -849,6 +859,7 @@ class staticWidget(QWidget):
         # flush, not the O(N^2) per-frame `sd.loc[idx] = ser` enlargement.  Mirrors
         # LiveScan.add_frame (heterogeneous dtypes; pandas infers per column).
         if new_rows:
+            _ts = _time.perf_counter() if _perf else 0.0
             import pandas as pd
             try:
                 df = pd.DataFrame.from_dict(self._scan_info_rows, orient="index")
@@ -857,7 +868,15 @@ class staticWidget(QWidget):
                     self.scan.scan_data = df
             except (ValueError, TypeError):
                 logger.debug("scan_data rebuild skipped", exc_info=True)
+            if _perf:
+                _t_scan = _time.perf_counter() - _ts
 
+        if _perf:
+            logger.info(
+                "[PERF] drain %d frame(s): mask=%.0fms build=%.0fms upsert=%.0fms "
+                "scan_data=%.0fms total=%.0fms",
+                len(pending), _t_mask * 1000, _t_build * 1000, _t_upsert * 1000,
+                _t_scan * 1000, (_time.perf_counter() - t0) * 1000)
         logger.debug("[PERF] drained %d frame(s) in %.1f ms",
                      len(pending), (_time.perf_counter() - t0) * 1000)
 
