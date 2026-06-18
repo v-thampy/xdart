@@ -198,8 +198,10 @@ PANEL_LAYOUT = {
     # process controls hidden.  frame_6 (scale + cmap) kept so the Linear/Log
     # scale and colormap apply to the raw image.
     Mode.IMAGE_VIEWER: PanelLayout(
+        # frame_4 shown to host the Set BG button (Norm Channel is hidden inside
+        # it at runtime, so only Set BG shows, left-justified where Norm is in Int).
         frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=False,
-        frame_4_vis=False, frame_6_vis=True, plotToolBar_vis=False,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
         show_image_btn_vis=False,
         twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
         plotWindow_h=(0, 0), imageToolbar_h=(40, 40),
@@ -210,8 +212,9 @@ PANEL_LAYOUT = {
     # the Log toggle applies to the 1D plot and the colormap stays available
     # (the XYE waterfall image uses it).
     Mode.XYE_VIEWER: PanelLayout(
+        # frame_4 shown to host the Set BG button (Norm Channel hidden at runtime).
         frame_top_vis=True, twoDWindow_vis=False, imageToolbar_vis=True,
-        frame_4_vis=False, frame_6_vis=True, plotToolBar_vis=False,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
         show_image_btn_vis=False,
         twoDWindow_h=(0, _FULL), imageWindow_h=(80, 85),
         plotWindow_h=(200, _FULL), imageToolbar_h=(40, 40),

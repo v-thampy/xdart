@@ -161,7 +161,10 @@ def _image_viewer_raw_payload(widget, state):
     * processed-xdart files (``_viewer_is_xdart`` True): keep the baked NaN
       mask (``sentinel_mask``);
     * single-select — only ``render_ids[0]`` is shown (no overlay/accumulate);
-    * **no** processing mask file, background subtraction or normalization.
+    * **no** processing mask file or monitor normalization; a background is
+      subtracted ONLY when the user set one in this mode (Set BG ->
+      ``bkg_map_raw``, cleared on a mode change), resized to the displayed
+      thumbnail -- a no-op for plain browsing.
 
     Returns ``None`` (→ the renderer clears the panel) when there is no
     selected frame, no ``map_raw``/``thumbnail``, or the sanitized array has no
@@ -199,6 +202,13 @@ def _image_viewer_raw_payload(widget, state):
     else:
         data = standalone_viewer_image(raw)     # fill sentinels, no mask
     data = np.asarray(data, dtype=float)
+    # Image Viewer Set BG: subtract the user-set background raw frame ONLY when its
+    # shape matches the displayed frame (or it is a scalar) -- never resize a
+    # possibly-incompatible background.  bkg_map_raw is 0 unless Set BG was used in
+    # THIS mode (cleared on a mode change), so plain browsing is unaffected.
+    _bkg = np.asarray(getattr(widget, "bkg_map_raw", 0))
+    if _bkg.shape == () or _bkg.shape == data.shape:
+        data = data - _bkg
     if data.ndim != 2 or data.size == 0 or not np.isfinite(data).any():
         return None
     image = data[::-1, :]
@@ -410,12 +420,21 @@ def _xye_plot_payload(widget, state):
     if first is None:
         return None
 
+    # XYE Viewer Set BG: subtract the averaged background pattern, interpolated
+    # onto each file's own grid (XYE files have per-file grids).  _bkg_xye is None
+    # unless Set BG was used in this mode (cleared on a mode change).
+    bkg_xye = getattr(widget, "_bkg_xye", None)
+    bkg_x = bkg_y = None
+    if bkg_xye is not None:
+        bkg_x, bkg_y = bkg_xye
     traces = []
     for i in render_ids:
         d = data.get(i)
         if d is None:
             continue
         radial, intensity, src = d
+        if bkg_x is not None and bkg_y is not None and np.size(bkg_x):
+            intensity = intensity - np.interp(radial, bkg_x, bkg_y)
         traces.append(Trace(
             os.path.basename(src or f'xye_{i}'),
             radial,

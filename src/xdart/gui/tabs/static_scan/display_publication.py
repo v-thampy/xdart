@@ -292,12 +292,11 @@ class PublicationDisplayAdapter:
                 data = self._apply_detector_mask(data, publication)
                 data = self._subtract_if_shape_matches(data, bg, "raw frame background")
             else:
-                # Thumbnail source: subtract the per-frame background too, resized
-                # to the thumbnail shape, so the raw display honors the background
-                # exactly like the full-res path (display-only policy).
+                # Thumbnail source: subtract the per-frame background only when its
+                # shape matches (or it is a scalar) -- never resize a possibly
+                # incompatible background onto the thumbnail.
                 data = self._subtract_if_shape_matches(
-                    data, self._bg_for_image_shape(bg, data),
-                    "raw frame background (thumbnail)")
+                    data, bg, "raw frame background (thumbnail)")
             data = self._normalize(data, publication.metadata_raw)
             if accum is None:
                 accum = data
@@ -313,13 +312,12 @@ class PublicationDisplayAdapter:
             return None
 
         image = accum / count
-        # The user-set raw background (Set Bkg -> bkg_map_raw) is full-res; resize
-        # it to the (possibly thumbnail) image so it subtracts from the raw display
-        # too, not only the full-res path.
-        _widget_bg = getattr(self._widget, "bkg_map_raw", 0)
+        # The user-set raw background (Set BG -> bkg_map_raw): subtract only when
+        # its shape matches the displayed image (or it is a scalar) -- a full-res
+        # background does not subtract from a thumbnail, by design.
         image = self._subtract_if_shape_matches(
             image,
-            self._bg_for_image_shape(_widget_bg, image),
+            getattr(self._widget, "bkg_map_raw", 0),
             "raw-image background",
         )
         if image.size == 0 or not np.isfinite(image).any():
@@ -1069,28 +1067,6 @@ class PublicationDisplayAdapter:
             return data - background
         return data
 
-    @staticmethod
-    def _bg_for_image_shape(background, image):
-        """Resize a full-res 2D background to the display ``image``'s shape so it
-        subtracts correctly from a DOWNSAMPLED thumbnail (the universal raw-display
-        policy renders the thumbnail, not the full-res map).  The thumbnail
-        downsample is linear (``scipy.ndimage.zoom``), so resizing the background
-        the same way and subtracting equals subtracting at full-res then
-        downsampling -- the raw thumbnail then matches the full-res background
-        subtraction.  Scalars, ``None``, non-2D, and already-matching backgrounds
-        pass through unchanged (``_subtract_if_shape_matches`` then applies them)."""
-        bg = np.asarray(background)
-        img = np.asarray(image)
-        if bg.ndim != 2 or img.ndim != 2 or bg.shape == img.shape:
-            return background
-        if 0 in bg.shape or 0 in img.shape:
-            return background
-        try:
-            from scipy.ndimage import zoom as _zoom
-            factors = (img.shape[0] / bg.shape[0], img.shape[1] / bg.shape[1])
-            return _zoom(np.asarray(bg, dtype=float), factors, order=1)
-        except Exception:
-            return background
 
     @staticmethod
     def _cake_background_for_image(background, image):

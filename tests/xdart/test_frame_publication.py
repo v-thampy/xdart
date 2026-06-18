@@ -928,7 +928,8 @@ def test_image_viewer_controller_owns_raw_preview_not_the_adapter():
         _viewer_is_xdart = False                      # standalone detector file
         data_lock = RLock()
         data_2d = {1: {"map_raw": raw, "thumbnail": None}}
-        # A monitor/background that MUST be ignored by the raw browser.
+        # A monitor (ignored by the raw browser) and a shape-matching Set-Bkg
+        # background (now subtracted -- the viewer Set BG feature).
         bkg_map_raw = np.array([[10.0, 10.0], [10.0, 10.0]])
 
         def normalize(self, data, metadata):
@@ -940,11 +941,11 @@ def test_image_viewer_controller_owns_raw_preview_not_the_adapter():
     assert payload.cake_image is None and payload.plot is None
     assert isinstance(payload.raw_image, ImagePayload)
     img = payload.raw_image.image
-    # Standalone uint16 ceiling kept (not NaN-masked), finite, and NOT divided
-    # by the monitor / background-subtracted.
+    # Standalone uint16 ceiling kept (not NaN-masked) and finite; the 10-count
+    # background IS subtracted (shapes match), the monitor is NOT divided out.
     assert np.isfinite(img).all()
-    assert np.nanmax(img) == 65535.0
-    np.testing.assert_allclose(np.sort(img.ravel()), [1, 3, 4, 65535])
+    assert np.nanmax(img) == 65525.0
+    np.testing.assert_allclose(np.sort(img.ravel()), [-9, -7, -6, 65525])
     assert payload.raw_image.axis_x.unit == "Pixels"
 
 

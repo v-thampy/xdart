@@ -372,7 +372,7 @@ def test_real_widget_setbkg_hydrates_evicted_subset_from_disk(widget, tmp_path):
     df.frame_ids = [str(i) for i in subset]
     df.overall = False
     df.idxs = list(subset)
-    df.ui.setBkg.setText("Set Bkg")
+    df.ui.setBkg.setText("Set BG")
 
     df.setBkg()
 

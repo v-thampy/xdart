@@ -1184,6 +1184,10 @@ def test_display_generation_bumps_on_mode_switch_and_selection():
         displayFrameWidget._bump_display_generation, host)
     host._note_selection_generation = MethodType(
         displayFrameWidget._note_selection_generation, host)
+    # set_viewer_display_mode clears the background on a real mode change.
+    host._clear_bkg = MethodType(displayFrameWidget._clear_bkg, host)
+    host._show_viewer_set_bkg = MethodType(
+        displayFrameWidget._show_viewer_set_bkg, host)
     # set_viewer_display_mode now routes panel geometry through the table-driven
     # _apply_layout; bind it too (it pokes the mocked ui / _showImageBtn only).
     host._apply_layout = MethodType(
@@ -3308,7 +3312,7 @@ def test_image_viewer_standalone_uint16_ceiling_stays_raw_and_finite():
     assert np.nanmax(payload.image) == 65535.0
 
 
-def test_image_viewer_payload_applies_no_mask_background_or_normalization():
+def test_image_viewer_payload_ignores_mask_and_norm_but_subtracts_matching_bkg():
     from xdart.gui.tabs.static_scan.display_controllers import (
         _image_viewer_raw_payload,
     )
@@ -3317,20 +3321,59 @@ def test_image_viewer_payload_applies_no_mask_background_or_normalization():
         data_lock=RLock(),
         data_2d={1: {"map_raw": raw, "thumbnail": None}},
         _viewer_is_xdart=False,
-        # A wrangler threshold/mask + a background + a monitor that the raw
-        # browser must all IGNORE (it shows detector counts, not a processed
-        # frame).  None of these may alter the payload pixels.
+        # A wrangler threshold/mask + a monitor that the raw browser must IGNORE
+        # (it shows detector counts, not a processed frame).
         _wrangler=SimpleNamespace(
             apply_threshold=True, threshold_min=2, threshold_max=3,
             mask_file="/definitely/not/a/raw-viewer-mask.edf"),
+        # A shape-matching Set-Bkg background IS subtracted (the viewer Set BG
+        # feature); a monitor normalization is still ignored.
         bkg_map_raw=np.array([[10.0, 10.0], [10.0, 10.0]]),
         normalize=lambda data, metadata: np.asarray(data, dtype=float) / 250.0,
     )
     payload = _image_viewer_raw_payload(host, _img_state([1]))
     assert payload is not None
-    # Values preserved exactly (only orientation flipped) — no mask applied, no
-    # background subtracted, not divided by the monitor.
-    np.testing.assert_allclose(np.sort(payload.image.ravel()), [1, 2, 3, 4])
+    # Background subtracted (shapes match); mask not applied; not monitor-divided.
+    np.testing.assert_allclose(np.sort(payload.image.ravel()), [-9, -8, -7, -6])
+
+    # A MISMATCHED-shape background is NOT subtracted (shape-match-only rule).
+    host.bkg_map_raw = np.array([[10.0, 10.0, 10.0]])   # (1,3) != (2,2)
+    payload2 = _image_viewer_raw_payload(host, _img_state([1]))
+    assert payload2 is not None
+    np.testing.assert_allclose(np.sort(payload2.image.ravel()), [1, 2, 3, 4])
+
+
+def test_xye_viewer_payload_subtracts_background():
+    from xdart.gui.tabs.static_scan.display_controllers import _xye_plot_payload
+    from xrd_tools.core.containers import IntegrationResult1D
+    x = np.array([1.0, 2.0, 3.0])
+    fr = SimpleNamespace(
+        int_1d=IntegrationResult1D(radial=x, intensity=np.array([10.0, 20.0, 30.0]),
+                                   sigma=np.ones(3), unit="q_A^-1"),
+        scan_info={"source_file": "data.xye"})
+    host = SimpleNamespace(
+        data_lock=RLock(), data_1d={0: fr}, publication_store=None,
+        _bkg_xye=(x, np.array([1.0, 2.0, 3.0])))   # XYE Set BG result
+    payload = _xye_plot_payload(host, _img_state([0]))
+    assert payload is not None and len(payload.traces) == 1
+    # bg subtracted (interpolated onto the file's grid): 10-1, 20-2, 30-3
+    np.testing.assert_allclose(payload.traces[0].y, [9.0, 18.0, 27.0])
+    # No background -> unchanged.
+    host._bkg_xye = None
+    payload2 = _xye_plot_payload(host, _img_state([0]))
+    np.testing.assert_allclose(payload2.traces[0].y, [10.0, 20.0, 30.0])
+
+
+def test_clear_bkg_zeros_all_backgrounds():
+    host = SimpleNamespace(
+        bkg_1d=5.0, bkg_2d=np.ones((2, 2)), bkg_map_raw=np.ones((2, 2)),
+        _bkg_xye=(np.arange(3.0), np.ones(3)),
+        ui=SimpleNamespace(setBkg=SimpleNamespace(setText=lambda t: setattr(
+            host.ui.setBkg, "_text", t))))
+    displayFrameWidget._clear_bkg(host)
+    assert host.bkg_1d == 0. and host.bkg_2d == 0. and host.bkg_map_raw == 0.
+    assert host._bkg_xye is None
+    assert host.ui.setBkg._text == 'Set BG'
 
 
 def test_available_norm_channels_filters_present_case_insensitive_aliases():

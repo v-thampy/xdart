@@ -441,7 +441,7 @@ class Ui_Form(object):
         self.normChannel.setItemText(4, QCoreApplication.translate("Form", u"I0", None))
         self.normChannel.setItemText(5, QCoreApplication.translate("Form", u"I1", None))
 
-        self.setBkg.setText(QCoreApplication.translate("Form", u"Set Bkg", None))
+        self.setBkg.setText(QCoreApplication.translate("Form", u"Set BG", None))
         self.labelCurrent.setText(QCoreApplication.translate("Form", u"Current", None))
         self.scale.setItemText(0, QCoreApplication.translate("Form", u"Linear", None))
         self.scale.setItemText(1, QCoreApplication.translate("Form", u"Log", None))
