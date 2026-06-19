@@ -2198,3 +2198,11 @@ def test_reintegrate_threshold_config_provider_reads_wrangler_fresh(widget):
             assert w._current_threshold_config().threshold_min == 7
         except Exception:
             pass        # wrangler without the Intensity-Threshold group (e.g. NeXus)
+
+
+def test_layout_wrangler_above_integrator(widget):
+    """Stage 1 of the panel refactor: the wrangler pane sits ABOVE the integrator
+    panel in the right vertical splitter (index 0 renders at the top)."""
+    w = widget
+    rs = w.ui.rightSplitter
+    assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)

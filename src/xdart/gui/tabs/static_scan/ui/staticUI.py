@@ -121,7 +121,11 @@ class Ui_Form(object):
 
         self.verticalLayout.addWidget(self.wranglerStack)
 
-        self.rightSplitter.addWidget(self.wranglerFrame)
+        # Wrangler ON TOP, integrator panel BELOW: integratorFrame was added at
+        # index 0 above, so insert the wrangler at index 0 to push the
+        # integrator to the lower pane.  (Vertical QSplitter renders index 0 at
+        # the top.)
+        self.rightSplitter.insertWidget(0, self.wranglerFrame)
 
         self.horizontalLayout_3.addWidget(self.rightSplitter)
 
