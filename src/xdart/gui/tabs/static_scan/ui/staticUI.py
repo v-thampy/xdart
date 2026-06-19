@@ -127,6 +127,21 @@ class Ui_Form(object):
         # the top.)
         self.rightSplitter.insertWidget(0, self.wranglerFrame)
 
+        # TOOLS section (Calibrate / Make Mask) at the very TOP of the right
+        # column.  staticWidget reparents those two buttons into toolsLayout
+        # (see _init_child_widgets); the button objects keep their wiring.
+        self.toolsFrame = QFrame(self.rightSplitter)
+        self.toolsFrame.setObjectName(u"toolsFrame")
+        _toolsSize = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.toolsFrame.setSizePolicy(_toolsSize)
+        self.toolsFrame.setMaximumSize(QSize(16777215, 50))
+        self.toolsFrame.setFrameShape(QFrame.StyledPanel)
+        self.toolsFrame.setFrameShadow(QFrame.Raised)
+        self.toolsLayout = QHBoxLayout(self.toolsFrame)
+        self.toolsLayout.setContentsMargins(5, 0, 5, 0)
+        self.toolsLayout.setSpacing(6)
+        self.rightSplitter.insertWidget(0, self.toolsFrame)   # very top pane
+
         self.horizontalLayout_3.addWidget(self.rightSplitter)
 
         self.mainSplitter.addWidget(self.rightFrame)

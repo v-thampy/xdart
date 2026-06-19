@@ -408,6 +408,17 @@ class staticWidget(QWidget):
         if len(self.scan.frames.index) > 0:
             self.integratorTree.update()
         self.integratorTree.ui.raw_to_tif.hide()
+        # TOOLS section: lift the integrator's bottom row (frame_3 = Calibrate /
+        # Make Mask; raw_to_tif hidden) into the top tools bar.  Reparent the
+        # WHOLE frame_3 as one self-contained widget (NOT its individual buttons
+        # — plucking buttons out of frame_3's layout leaves a dangling layout
+        # item that double-frees on teardown / segfaults).  The buttons keep
+        # their clicked wiring + the _apply_integration_control_state enable refs.
+        try:
+            self.ui.toolsLayout.addWidget(self.integratorTree.ui.frame_3)
+        except Exception:
+            logger.debug("could not move Calibrate/Make Mask to the tools bar",
+                         exc_info=True)
         # Restore the integration panel (units/pts/ranges/Auto flags/GI modes
         # + Advanced params) from the previous session; saved in close().
         try:

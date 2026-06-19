@@ -1337,9 +1337,13 @@ def test_reintegrate_row_present_and_advanced_rehomed(widget):
     assert iu.reintegrate1D.text() == "Reintegrate 1D"
     assert iu.reintegrate2D.text() == "Reintegrate 2D"
     assert iu.advanced_int.text() == "Advanced"
-    # The row is inserted immediately above frame_3 (Calibrate / Make Mask).
+    # frame_3 (Calibrate / Make Mask) moved to the top tools bar, so it's no
+    # longer in the integrator layout; the Reintegrate row is present, below the
+    # Threshold row.
     vlay = iu.verticalLayout
-    assert vlay.indexOf(iu.frame_reint) == vlay.indexOf(iu.frame_3) - 1
+    assert vlay.indexOf(iu.frame_reint) >= 0                 # present in the panel
+    assert vlay.indexOf(iu.frame_3) == -1                    # moved to tools bar
+    assert vlay.indexOf(iu.frame_pixreject) < vlay.indexOf(iu.frame_reint)
     # Exactly one Advanced: the wrangler's old button is explicitly hidden.
     if hasattr(w.wrangler, "ui") and hasattr(w.wrangler.ui, "advancedButton"):
         assert w.wrangler.ui.advancedButton.isHidden()
@@ -2231,4 +2235,21 @@ def test_layout_wrangler_above_integrator(widget):
     panel in the right vertical splitter (index 0 renders at the top)."""
     w = widget
     rs = w.ui.rightSplitter
+    assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)
+
+
+def test_tools_bar_hosts_calibrate_and_make_mask(widget):
+    """Sections refactor Stage 1: the whole Calibrate / Make Mask row (frame_3)
+    is reparented into the top tools bar (toolsFrame, index 0 of the right
+    splitter); the buttons stay inside it (same objects, wiring + enable refs
+    intact) and visible."""
+    w = widget
+    tools = w.ui.toolsFrame
+    f3 = w.integratorTree.ui.frame_3
+    assert f3.parentWidget() is tools                   # whole row reparented
+    assert w.integratorTree.ui.pyfai_calib.parentWidget() is f3
+    assert not w.integratorTree.ui.pyfai_calib.isHidden()
+    assert not w.integratorTree.ui.get_mask.isHidden()
+    rs = w.ui.rightSplitter
+    assert rs.indexOf(tools) == 0                       # very top pane
     assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)
