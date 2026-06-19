@@ -55,13 +55,10 @@ def _make(params_list, group_toggles):
 
 
 @pytest.mark.parametrize("wrangler_cls, params_list, titles", [
+    # Intensity Threshold (Mask) + Mask Saturated (MaskSat) moved to the
+    # integrator panel — GI is the only remaining wrangler header-toggle group.
     (imageWrangler, image_params,
-     {'GI': ('Grazing', 'Grazing Incidence'),
-      'Mask': ('Threshold', 'Intensity Threshold')}),
-    # NOTE: MaskSat is intentionally NOT listed here — this case asserts a
-    # default-OFF start state, but mask_sentinel defaults ON.  The default-
-    # agnostic peek/programmatic tests below + test_nexus_mask_saturated_wiring
-    # cover the nexus MaskSat toggle (R3-B).
+     {'GI': ('Grazing', 'Grazing Incidence')}),
     (nexusWrangler, nexus_params,
      {'GI': ('Grazing', 'Grazing Incidence')}),
 ])
@@ -174,32 +171,35 @@ def test_image_expand_active_groups_collapses_when_off(qapp):
     )
     run = imageWrangler._expand_active_groups.__get__(holder)
 
-    # GI on, Threshold off -> GI expands, Mask collapses.
+    # GI on -> expands.  (Intensity Threshold / Mask Saturated moved to the
+    # integrator panel, so they are no longer wrangler toggle groups.)
     root.child('GI').child('Grazing').setValue(True)
-    root.child('Mask').child('Threshold').setValue(False)
     root.child('GI').setOpts(expanded=False)     # pretend folded
-    root.child('Mask').setOpts(expanded=True)    # pretend open
     run()
     assert root.child('GI').opts.get('expanded') is True
-    assert root.child('Mask').opts.get('expanded') is False
+
+    # GI off -> collapses.
+    root.child('GI').child('Grazing').setValue(False)
+    root.child('GI').setOpts(expanded=True)      # pretend open
+    run()
+    assert root.child('GI').opts.get('expanded') is False
 
 
-def test_nexus_mask_saturated_wiring_present():
-    """R3-B: NeXus scans can opt out of detector-saturation masking.  The
-    MaskSat group, its header-toggle binding, and its session persistence must
-    all be present so the opt-out survives a save/restore and reaches the
-    reduction thread (setup() pushes ``self.mask_sentinel`` ->
-    ``self.thread.mask_sentinel``, read by the shared ``_resolve_frame_mask``).
-    Before this fix NeXus inherited the base default mask_sentinel=True with no
-    UI to flip it."""
+def test_nexus_mask_saturated_carrier_present():
+    """Mask Saturated moved to the integrator panel.  NeXus keeps a HIDDEN
+    carrier group + its session param so the integrator's value can be injected
+    at run-setup and still reach the reduction thread (setup() pushes
+    ``self.mask_sentinel`` -> ``self.thread.mask_sentinel``, read by the shared
+    ``_resolve_frame_mask``) — but it is NO LONGER a wrangler header-toggle."""
     masksat = next((g for g in nexus_params if g.get('name') == 'MaskSat'), None)
-    assert masksat is not None, "nexus params lost the MaskSat group"
+    assert masksat is not None, "nexus must keep the MaskSat carrier group"
+    # The carrier group is now hidden (the visible control lives in the integrator).
+    assert masksat.get('visible') is False, "MaskSat carrier must be hidden"
     bool_child = next(c for c in masksat['children']
                       if c['name'] == 'mask_sentinel')
-    # hidden bool, ON by default — preserves the long-standing behaviour; the
-    # header checkbox (UI-1) is the visible control.
     assert bool_child['value'] is True and bool_child['visible'] is False
-    assert nexusWrangler._GROUP_TOGGLES.get('MaskSat') == 'mask_sentinel'
-    # session round-trips the opt-out + syncs the attr setup() reads.
+    # No longer a wrangler header-toggle (the integrator owns the control).
+    assert 'MaskSat' not in nexusWrangler._GROUP_TOGGLES
+    # Session still round-trips the carrier so setup() can push it to the thread.
     assert ('mask_sentinel', ('MaskSat', 'mask_sentinel'), False,
             'mask_sentinel') in nexusWrangler._SESSION_PARAMS
