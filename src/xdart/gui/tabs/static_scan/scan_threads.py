@@ -357,6 +357,15 @@ class integratorThread(Qt.QtCore.QThread):
                     include_2d=False,
                     refresh_1d=True,
                 )
+            # Refresh the GUI per published frame (→ integrator_thread_update),
+            # so reintegration shows progress instead of jumping straight from
+            # "before" to the final result.  The success path previously emitted
+            # nothing — only the frame-by-frame retry path did — so the display
+            # stayed frozen until integrator_thread_finished.  Frames publish in
+            # batches (the reduce is atomic per batch), so updates land per batch;
+            # the display reads the in-memory publication store, not the .nxs (the
+            # persist save runs once at the end), so there's no half-written read.
+            self.update.emit(getattr(frame, "idx", -1))
 
         label = '2D' if do_2d else '1D'
         n_workers = max(1, min(max_cores, len(indices)))
