@@ -112,8 +112,10 @@ params = [
      'children': [
         # UI-1 (#81): header checkbox is the on/off toggle; bool hidden (see GI).
         {'name': 'Threshold', 'type': 'bool', 'value': False, 'visible': False},
-        {'name': 'min', 'title': 'Min', 'type': 'int', 'value': 0},
-        {'name': 'max', 'title': 'Max', 'type': 'int', 'value': 0},
+        # float (was int) so the integrator's text Min/Max round-trip exactly
+        # into this hidden carrier (no int coercion → live == reintegrate).
+        {'name': 'min', 'title': 'Min', 'type': 'float', 'value': 0},
+        {'name': 'max', 'title': 'Max', 'type': 'float', 'value': 0},
     ], 'expanded': False, 'visible': False},
     # Auto-mask the uint16 detector ceiling (65535) as a saturated/dead
     # sentinel.  Its OWN UI-1 header-checkbox group (a checkbox on the left,
@@ -486,8 +488,9 @@ class imageWrangler(wranglerWidget):
     # UI-1 (#81): the GI / Intensity-Threshold groups carry a header CHECKBOX
     # as their on/off toggle, mapped to the hidden bool that is their source
     # of truth (see wranglerWidget._install_group_toggles).
-    _GROUP_TOGGLES = {'GI': 'Grazing', 'Mask': 'Threshold',
-                      'MaskSat': 'mask_sentinel'}
+    # Mask / MaskSat moved to the integrator panel (hidden carriers here), so no
+    # header-checkbox toggles for them.
+    _GROUP_TOGGLES = {'GI': 'Grazing'}
 
     def _expand_active_groups(self):
         """Sync each wrangler group's expanded state to its enabling param.
@@ -499,8 +502,6 @@ class imageWrangler(wranglerWidget):
         is the ``bg_type`` list, not the header)."""
         groups = (
             ('GI', ('GI', 'Grazing'), lambda v: bool(v), True),
-            ('Mask', ('Mask', 'Threshold'), lambda v: bool(v), True),
-            ('MaskSat', ('MaskSat', 'mask_sentinel'), lambda v: bool(v), True),
             ('BG', ('BG', 'bg_type'), lambda v: v not in (None, '', 'None'), False),
         )
         for group_name, child_path, is_on, collapse_when_off in groups:
@@ -1171,7 +1172,10 @@ class imageWrangler(wranglerWidget):
     # N1: param groups gated behind the Project Folder + PONI (Project itself is
     # always visible).  Calibration appears once a Project Folder is set; the
     # rest (groups + the Save-Path row) appears once a valid PONI also loads.
-    _DISCLOSURE_REST = ('Signal', 'GI', 'Mask', 'MaskSat', 'BG')
+    # Intensity Threshold ('Mask') + Mask Saturated ('MaskSat') moved to the
+    # integrator panel — kept here as hidden carriers the integrator injects into
+    # at run-setup, so never disclosed.
+    _DISCLOSURE_REST = ('Signal', 'GI', 'BG')
     _DISCLOSURE_TOPLEVEL = ('h5_dir', 'h5_dir_browse')     # Save Path row
 
     @staticmethod

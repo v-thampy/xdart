@@ -194,12 +194,16 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.reintegrate1D.clicked.connect(self.bai_1d)
         self.ui.reintegrate2D.clicked.connect(self.bai_2d)
 
-        # Host-supplied provider (set by staticWidget) returning the GUI's
-        # CURRENT Intensity-Threshold / Mask-Saturated policy as a
-        # ThresholdSaturationConfig, so a reintegrate applies the same per-frame
-        # pixel rejection a live run does.  None when running stand-alone.  See
-        # _apply_threshold_config_to_thread.
-        self.get_threshold_config = None
+        # Pixel-rejection (Intensity Threshold + Mask Saturated) lives in THIS
+        # panel now (the integrator owns it).  ``get_threshold_config`` (a
+        # method below) reads the row widgets fresh; it's the single source for
+        # both Reintegrate (via _apply_threshold_config_to_thread) and live runs
+        # (staticWidget injects it into the wrangler at run-setup).  Mask
+        # Saturated default-on mirrors the historical wrangler default.
+        self.ui.threshold_enable.toggled.connect(self._save_to_session)
+        self.ui.threshold_min.textChanged.connect(self._save_to_session)
+        self.ui.threshold_max.textChanged.connect(self._save_to_session)
+        self.ui.mask_saturated.toggled.connect(self._save_to_session)
 
         self.integrator_thread = integratorThread(
             self.scan, self.frame, self.file_lock,
@@ -316,6 +320,11 @@ class integratorTree(QtWidgets.QWidget):
             'integ_radial_high_2D': self.ui.radial_high_2D.text(),
             'integ_azim_low_2D': self.ui.azim_low_2D.text(),
             'integ_azim_high_2D': self.ui.azim_high_2D.text(),
+            # Pixel-rejection policy (moved here from the wrangler).
+            'integ_threshold_enable': self.ui.threshold_enable.isChecked(),
+            'integ_threshold_min': self.ui.threshold_min.text(),
+            'integ_threshold_max': self.ui.threshold_max.text(),
+            'integ_mask_saturated': self.ui.mask_saturated.isChecked(),
         }
         # Save advanced parameter tree values
         for dim_label, tree in [('1d', self.bai_1d_pars), ('2d', self.bai_2d_pars)]:
@@ -395,6 +404,30 @@ class integratorTree(QtWidgets.QWidget):
             val = session.get(key)
             if val is not None:
                 widget.setText(str(val))
+
+        # Restore pixel-rejection policy (moved here from the wrangler).  Prefer
+        # the integrator's own integ_ keys; fall back to the OLD flat wrangler
+        # keys so an existing session's Threshold / Mask-Saturated settings carry
+        # over.  (Mask Saturated stays default-ON when nothing is stored.)
+        _thr_on = session.get('integ_threshold_enable')
+        if _thr_on is None:
+            _thr_on = session.get('apply_threshold')
+        if _thr_on is not None:
+            self.ui.threshold_enable.setChecked(bool(_thr_on))
+        for ikey, okey, widget in [
+            ('integ_threshold_min', 'threshold_min', self.ui.threshold_min),
+            ('integ_threshold_max', 'threshold_max', self.ui.threshold_max),
+        ]:
+            val = session.get(ikey)
+            if val is None:
+                val = session.get(okey)
+            if val is not None:
+                widget.setText(str(val))
+        _sat = session.get('integ_mask_saturated')
+        if _sat is None:
+            _sat = session.get('mask_sentinel')
+        if _sat is not None:
+            self.ui.mask_saturated.setChecked(bool(_sat))
 
         # Restore advanced parameter tree values
         for dim_label, tree in [('1d', self.bai_1d_pars), ('2d', self.bai_2d_pars)]:
@@ -1123,6 +1156,30 @@ class integratorTree(QtWidgets.QWidget):
         self.setEnabled(False)
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()
+
+    def get_threshold_config(self):
+        """The integrator's CURRENT pixel-rejection policy (Intensity Threshold +
+        Mask Saturated), read FRESH from the row widgets, as a
+        ``ThresholdSaturationConfig``.
+
+        Single source of truth: Reintegrate reads it here
+        (``_apply_threshold_config_to_thread``) and a live run reads it via
+        ``staticWidget`` at run-setup, so both apply identical pixel rejection.
+        """
+        from xdart.modules.reduction import ThresholdSaturationConfig
+
+        def _num(widget, default=0.0):
+            try:
+                return float(widget.text())
+            except (TypeError, ValueError):
+                return default
+
+        return ThresholdSaturationConfig(
+            apply_threshold=bool(self.ui.threshold_enable.isChecked()),
+            threshold_min=_num(self.ui.threshold_min, 0.0),
+            threshold_max=_num(self.ui.threshold_max, 0.0),
+            mask_saturation=bool(self.ui.mask_saturated.isChecked()),
+        )
 
     def _apply_threshold_config_to_thread(self) -> None:
         """Snapshot the GUI's CURRENT Intensity-Threshold / Mask-Saturated policy

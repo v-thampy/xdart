@@ -468,6 +468,54 @@ class Ui_Form(object):
         self.verticalLayout.insertWidget(
             self.verticalLayout.indexOf(self.frame_3), self.frame_reint)
 
+        # Pixel-rejection row (one compact line): an "Auto"-style Threshold
+        # toggle + Min/Max boxes, and an "Auto"-style Mask Saturated toggle.
+        # The integrator OWNS these (single source of truth); the live wrangler
+        # reads them at run-setup and Reintegrate reads them at click.  Sits just
+        # above the Reintegrate row.
+        self.frame_pixreject = QFrame(Form)
+        self.frame_pixreject.setObjectName(u"frame_pixreject")
+        self.frame_pixreject.setMaximumSize(QSize(16777215, 50))
+        self.frame_pixreject.setFrameShape(QFrame.StyledPanel)
+        self.frame_pixreject.setFrameShadow(QFrame.Raised)
+        self.horizontalLayout_pixreject = QHBoxLayout(self.frame_pixreject)
+        self.horizontalLayout_pixreject.setSpacing(6)
+        self.horizontalLayout_pixreject.setObjectName(u"horizontalLayout_pixreject")
+        self.horizontalLayout_pixreject.setContentsMargins(5, 0, 5, 0)
+        self.threshold_enable = QPushButton(self.frame_pixreject)
+        self.threshold_enable.setObjectName(u"threshold_enable")
+        self.threshold_enable.setCheckable(True)
+        self.threshold_enable.setText(u"Threshold")
+        self.threshold_enable.setToolTip(
+            u"Intensity Threshold: exclude pixels outside [Min, Max] from the "
+            u"integration (set to NaN before reducing). Applies to live runs and "
+            u"Reintegrate.")
+        self.horizontalLayout_pixreject.addWidget(self.threshold_enable)
+        self.threshold_min = QLineEdit(self.frame_pixreject)
+        self.threshold_min.setObjectName(u"threshold_min")
+        self.threshold_min.setText(u"0")
+        self.threshold_min.setToolTip(
+            u"Minimum intensity — pixels below this value are excluded.")
+        self.horizontalLayout_pixreject.addWidget(self.threshold_min)
+        self.threshold_max = QLineEdit(self.frame_pixreject)
+        self.threshold_max.setObjectName(u"threshold_max")
+        self.threshold_max.setText(u"0")
+        self.threshold_max.setToolTip(
+            u"Maximum intensity — pixels above this value are excluded.")
+        self.horizontalLayout_pixreject.addWidget(self.threshold_max)
+        self.mask_saturated = QPushButton(self.frame_pixreject)
+        self.mask_saturated.setObjectName(u"mask_saturated")
+        self.mask_saturated.setCheckable(True)
+        self.mask_saturated.setChecked(True)
+        self.mask_saturated.setText(u"Mask Saturated")
+        self.mask_saturated.setToolTip(
+            u"Mask Saturated: exclude a saturated/dead detector module (a block "
+            u"of pixels sitting at the detector's intensity ceiling) from the "
+            u"integration. On by default.")
+        self.horizontalLayout_pixreject.addWidget(self.mask_saturated)
+        self.verticalLayout.insertWidget(
+            self.verticalLayout.indexOf(self.frame_reint), self.frame_pixreject)
+
 #if QT_CONFIG(shortcut)
         self.label_npts_1D.setBuddy(self.npts_1D)
         self.label_npts_2D.setBuddy(self.npts_radial_2D)

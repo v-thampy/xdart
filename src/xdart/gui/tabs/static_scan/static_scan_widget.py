@@ -473,13 +473,11 @@ class staticWidget(QWidget):
         if hasattr(self.integratorTree.ui, 'advanced_int'):
             self.integratorTree.ui.advanced_int.clicked.connect(
                 self._show_integration_advanced)
-        # Reintegrate must apply the same per-frame pixel rejection (Intensity
-        # Threshold + Mask Saturated) a live run does.  Those options live on the
-        # wrangler today (they'll move to the integrator panel later); give the
-        # integrator tree a provider that reads them FRESH at click time so the
-        # CURRENT settings apply.  Wired ONCE — the bound method reads
-        # self.wrangler at call time, so it tracks wrangler swaps.
-        self.integratorTree.get_threshold_config = self._current_threshold_config
+        # Pixel rejection (Intensity Threshold + Mask Saturated) now lives in the
+        # integrator panel and is read straight from its own
+        # integratorTree.get_threshold_config() — for Reintegrate (the integrator
+        # reads itself) and for live runs (injected into the wrangler at
+        # run-setup; see _push_threshold_to_wrangler).
 
     def _show_reintegration_write_error(self, message: str) -> None:
         """Surface reintegration save failures in the same status area as runs."""
@@ -489,34 +487,39 @@ class staticWidget(QWidget):
             logger.debug("could not surface reintegration write failure",
                          exc_info=True)
 
-    def _current_threshold_config(self):
-        """Return the active wrangler's CURRENT Intensity-Threshold /
-        Mask-Saturated policy as a ThresholdSaturationConfig, or None.
+    def _push_threshold_to_wrangler(self):
+        """Inject the integrator's CURRENT pixel-rejection policy into the active
+        wrangler's (now-hidden) Mask / MaskSat params, so a LIVE run applies the
+        SAME Intensity-Threshold / Mask-Saturated rejection that Reintegrate
+        does — the integrator is the single source of truth.
 
-        Read FRESH from the param tree (not the attrs synced at last setup) so a
-        reintegrate honours what the user just set.  Per-field guarded: a
-        wrangler without an 'Intensity Threshold' group (e.g. NeXus) yields
-        apply_threshold=False — matching that its live path doesn't clamp — while
-        still picking up 'Mask Saturated'.
+        Called from ``start_wrangler`` BEFORE ``wrangler.setup()`` (which reads
+        those params and pushes them to the thread).  Per-field guarded: a
+        wrangler without an 'Intensity Threshold' group (e.g. NeXus) just skips
+        it, and still receives 'Mask Saturated'.
         """
-        from xdart.modules.reduction import ThresholdSaturationConfig
-        w = getattr(self, 'wrangler', None)
-        params = getattr(w, 'parameters', None)
+        try:
+            cfg = self.integratorTree.get_threshold_config()
+        except Exception:
+            logger.debug("could not read integrator threshold config",
+                         exc_info=True)
+            return
+        if cfg is None:
+            return
+        params = getattr(self.wrangler, 'parameters', None)
         if params is None:
-            return None
+            return
 
-        def _val(group, child, default):
+        def _set(group, child, value):
             try:
-                return params.child(group).child(child).value()
+                params.child(group).child(child).setValue(value)
             except Exception:
-                return default
+                pass  # wrangler lacks this group (e.g. NeXus has no 'Mask')
 
-        return ThresholdSaturationConfig(
-            apply_threshold=bool(_val('Mask', 'Threshold', False)),
-            threshold_min=_val('Mask', 'min', None),
-            threshold_max=_val('Mask', 'max', None),
-            mask_saturation=bool(_val('MaskSat', 'mask_sentinel', False)),
-        )
+        _set('Mask', 'Threshold', bool(cfg.apply_threshold))
+        _set('Mask', 'min', cfg.threshold_min)
+        _set('Mask', 'max', cfg.threshold_max)
+        _set('MaskSat', 'mask_sentinel', bool(cfg.mask_saturation))
 
     def _init_wranglers(self):
         """Initialize the wrangler stack and select the default wrangler."""
@@ -1634,6 +1637,10 @@ class staticWidget(QWidget):
         args = {'bai_1d_args': self.scan.bai_1d_args,
                 'bai_2d_args': self.scan.bai_2d_args}
         self.wrangler.scan_args = copy.deepcopy(args)
+        # Pixel rejection is owned by the integrator panel now — push the
+        # current Threshold / Mask-Saturated policy into the wrangler BEFORE
+        # setup() so the live run applies exactly what Reintegrate would.
+        self._push_threshold_to_wrangler()
         self.wrangler.setup()
         self.h5viewer.auto_last = True
 

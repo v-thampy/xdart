@@ -65,11 +65,13 @@ params = [
     # long-standing behaviour; OFF lets a genuinely-saturated module at the
     # integer ceiling be integrated.  Without this, NeXus scans were forced
     # mask_sentinel=True with no way to opt out.
+    # Mask Saturated moved to the integrator panel — hidden carrier the
+    # integrator injects into at run-setup (setup() still reads mask_sentinel).
     {'name': 'MaskSat', 'title': 'Mask Saturated', 'type': 'group',
      'children': [
         {'name': 'mask_sentinel', 'type': 'bool', 'value': True,
          'visible': False},
-    ], 'expanded': False},
+    ], 'expanded': False, 'visible': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group',
      'children': [
         # UI-1 (#81): the group HEADER carries a real checkbox — the on/off
@@ -372,7 +374,8 @@ class nexusWrangler(wranglerWidget):
     # UI-1 (#81): the GI group carries a header CHECKBOX as its on/off toggle,
     # mapped to the hidden bool that is its source of truth (see
     # wranglerWidget._install_group_toggles).
-    _GROUP_TOGGLES = {'GI': 'Grazing', 'MaskSat': 'mask_sentinel'}
+    # MaskSat moved to the integrator panel (hidden carrier), so no toggle here.
+    _GROUP_TOGGLES = {'GI': 'Grazing'}
 
     def _save_to_session(self):
         """Save parameters to session.json."""

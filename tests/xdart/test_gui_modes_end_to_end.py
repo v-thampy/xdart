@@ -2180,24 +2180,50 @@ def test_reintegrate_applies_current_threshold_config(widget):
     assert plan.mask_saturation is True
 
 
-def test_reintegrate_threshold_config_provider_reads_wrangler_fresh(widget):
-    """staticWidget._current_threshold_config reads the wrangler param tree fresh
-    so the CURRENT settings (not the last-setup attrs) drive a reintegrate."""
+def test_integrator_owns_threshold_config(widget):
+    """The integrator panel OWNS the pixel-rejection policy: get_threshold_config
+    reads its row widgets fresh (default: threshold OFF, Mask Saturated ON)."""
     w = widget
-    cfg = w._current_threshold_config()
-    # Image-Series wrangler exposes both groups; the default has Mask Saturated
-    # ON (mask_sentinel default True) and the intensity threshold OFF.
-    if cfg is not None:
-        assert cfg.apply_threshold is False
-        assert cfg.mask_saturation is True
-        # Flip the live param and confirm the provider sees it immediately.
-        try:
-            w.wrangler.parameters.child('Mask').child('Threshold').setValue(True)
-            w.wrangler.parameters.child('Mask').child('min').setValue(7)
-            assert w._current_threshold_config().apply_threshold is True
-            assert w._current_threshold_config().threshold_min == 7
-        except Exception:
-            pass        # wrangler without the Intensity-Threshold group (e.g. NeXus)
+    it = w.integratorTree
+    cfg = it.get_threshold_config()
+    assert cfg.apply_threshold is False
+    assert cfg.mask_saturation is True          # default-on, mirrors old wrangler
+
+    it.ui.threshold_enable.setChecked(True)
+    it.ui.threshold_min.setText("7")
+    it.ui.threshold_max.setText("9000")
+    it.ui.mask_saturated.setChecked(False)
+    cfg2 = it.get_threshold_config()
+    assert cfg2.apply_threshold is True
+    assert cfg2.threshold_min == 7 and cfg2.threshold_max == 9000
+    assert cfg2.mask_saturation is False
+
+
+def test_live_run_injects_integrator_threshold_into_wrangler(widget):
+    """SPINE: a live run must apply the SAME pixel rejection as Reintegrate.
+    _push_threshold_to_wrangler copies the integrator's policy into the wrangler's
+    hidden Mask/MaskSat carrier params before setup() — so live == reintegrate by
+    construction (both source from the integrator)."""
+    w = widget
+    it = w.integratorTree
+    it.ui.threshold_enable.setChecked(True)
+    it.ui.threshold_min.setText("3")
+    it.ui.threshold_max.setText("5000")
+    it.ui.mask_saturated.setChecked(False)
+
+    w._push_threshold_to_wrangler()
+
+    p = w.wrangler.parameters
+    try:
+        mask = p.child('Mask')
+    except Exception:
+        mask = None
+    if mask is not None:                         # image-series wrangler
+        assert mask.child('Threshold').value() is True
+        assert mask.child('min').value() == 3
+        assert mask.child('max').value() == 5000
+    # Mask Saturated exists on both image + nexus wranglers.
+    assert p.child('MaskSat').child('mask_sentinel').value() is False
 
 
 def test_layout_wrangler_above_integrator(widget):
