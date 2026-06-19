@@ -177,6 +177,16 @@ class LiveScan:
             self.global_mask = None
             self.detector_shape = None
             self._clear_persisted_wavelength()
+            # Calibration is per-file identity, like the fields above — a full
+            # load (replace=True -> reset) of a DIFFERENT file must not inherit
+            # the previous file's geometry.  Without this, loading an
+            # identity-less .nxs after a calibrated one would silently
+            # reintegrate it with the prior file's detector/geometry (the
+            # restore returns False but leaves the stale cache in place).
+            self._cached_integrator = None
+            self._cached_poni = None
+            self._cached_fiber_integrator = None
+            self._cached_data_mask = None
 
     def _clear_persisted_wavelength(self):
         """Drop the wavelength restored from a previously loaded .nxs (G1).
@@ -572,7 +582,20 @@ class LiveScan:
         if getattr(self, "_persisted_wavelength_m", None):
             _pd["wavelength"] = float(self._persisted_wavelength_m)
         _poni = PONI.from_dict(_pd)
-        _ai = poni_to_integrator(_poni)
+        try:
+            _ai = poni_to_integrator(_poni)
+        except Exception as e:
+            # The detector NAME resolved when the file was WRITTEN but not in
+            # this pyFAI registry (version skew across environments) — which is
+            # exactly what the persisted pixel-size fallback below exists for.
+            # Rebuild without the name (detector=None) so that fallback can fire
+            # instead of bailing the whole restore.
+            logger.info("[REINTEGRATE-CAL] detector name %r did not resolve "
+                        "(%s); falling back to persisted pixel sizes",
+                        _pd.get("detector", ""), e)
+            _pd.pop("detector", None)
+            _poni = PONI.from_dict(_pd)
+            _ai = poni_to_integrator(_poni)
         _adet = getattr(_ai, "detector", None)
         # Fallback: the name didn't resolve → build a generic detector from the
         # persisted pixel sizes (+ full-res shape if known).

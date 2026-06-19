@@ -2237,3 +2237,40 @@ def test_data_only_refresh_restores_when_empty_but_never_clobbers(tmp_path):
     s2._cached_integrator = sentinel
     s2.load_from_h5(replace=False, data_only=True)
     assert s2._cached_integrator is sentinel
+
+
+def test_full_load_clears_stale_calibration_across_files(tmp_path):
+    """Regression: the shared GUI LiveScan must not carry file A's calibration
+    into a full reload of an identity-less file B — else B is silently
+    reintegrated with A's geometry.  reset() clears the cache."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald import LiveScan
+    a = _written_calibrated_scan(tmp_path, "A_named.nxs")     # has detector identity
+    b = str(tmp_path / "B_identityless.nxs")                  # only geometry scalars
+    save_scan_to_nexus(_DuckSphere([_DuckArch(idx=i) for i in range(N_FRAMES)]),
+                       b, mode="w", finalize=False)
+
+    s = LiveScan(data_file=a)
+    s.load_from_h5()                          # full load A → cache populated
+    assert s._cached_integrator is not None
+    s.data_file = b
+    s.load_from_h5()                          # full load B (replace=True → reset)
+    assert s._cached_integrator is None       # A's geometry must NOT survive
+    assert s._cached_poni is None
+
+
+def test_unresolved_detector_name_falls_back_to_pixel_sizes(tmp_path):
+    """If the persisted detector_name does not resolve in this pyFAI registry
+    (version skew), the restore must fall back to the persisted pixel sizes
+    rather than bailing — otherwise the safety net is dead for its own use."""
+    import h5py
+    from xdart.modules.ewald import LiveScan
+    path = _written_calibrated_scan(tmp_path, "skew.nxs")    # Pilatus100k + pixel sizes
+    with h5py.File(path, "r+") as f:                          # simulate registry skew
+        det = f["entry/instrument/detector"]
+        del det["detector_name"]
+        det.create_dataset("detector_name", data="NotARealDetector_v999")
+
+    s = LiveScan(data_file=path)
+    assert s.ensure_calibration_loaded() is True
+    assert s._cached_integrator.detector.pixel1 is not None   # from pixel-size fallback
