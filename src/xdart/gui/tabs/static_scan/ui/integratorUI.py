@@ -486,6 +486,8 @@ class Ui_Form(object):
         self.threshold_enable.setObjectName(u"threshold_enable")
         self.threshold_enable.setCheckable(True)
         self.threshold_enable.setText(u"Threshold")
+        # Wide enough that "Threshold" isn't clipped when the row is squeezed.
+        self.threshold_enable.setMinimumWidth(90)
         self.threshold_enable.setToolTip(
             u"Intensity Threshold: exclude pixels outside [Min, Max] from the "
             u"integration (set to NaN before reducing). Applies to live runs and "
