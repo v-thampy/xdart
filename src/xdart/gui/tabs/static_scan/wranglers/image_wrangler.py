@@ -268,6 +268,10 @@ class imageWrangler(wranglerWidget):
         header.setStretchLastSection(True)
         header.resizeSection(0, 100)  # name column
         header.setMinimumSectionSize(40)
+        # Hide the "Parameter / Value" header bar — it's just visual noise above
+        # the wrangler tree.  Column sizing above still applies (the header is
+        # hidden, not removed).
+        self.tree.setHeaderHidden(True)
         self.layout = QtWidgets.QVBoxLayout(self.ui.paramFrame)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.addWidget(self.tree)
