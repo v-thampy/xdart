@@ -1249,7 +1249,8 @@ class imageWrangler(wranglerWidget):
                 child.show()                               # reveal everything
             # …except the pixel-rejection carriers, which moved to the
             # integrator panel and live here only as hidden injection targets.
-            for name in self._DISCLOSURE_CARRIERS:
+            # getattr default keeps lightweight duck holders (tests) working.
+            for name in getattr(self, '_DISCLOSURE_CARRIERS', ()):
                 try:
                     self.parameters.child(name).hide()
                 except Exception:
