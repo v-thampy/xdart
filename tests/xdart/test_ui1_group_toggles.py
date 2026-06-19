@@ -203,3 +203,29 @@ def test_nexus_mask_saturated_carrier_present():
     # Session still round-trips the carrier so setup() can push it to the thread.
     assert ('mask_sentinel', ('MaskSat', 'mask_sentinel'), False,
             'mask_sentinel') in nexusWrangler._SESSION_PARAMS
+
+
+def test_image_threshold_groups_stay_hidden_after_full_disclosure(qapp):
+    """Intensity Threshold (Mask) + Mask Saturated (MaskSat) moved to the
+    integrator panel.  They remain in the wrangler tree as HIDDEN carriers — even
+    in the fully-disclosed state (Project + PONI set), where _apply_disclosure
+    does 'reveal everything' — so they must be explicitly re-hidden there."""
+    import types
+    root = Parameter.create(name='p', type='group', children=image_params)
+    ParameterTree().setParameters(root, showTop=False)
+    holder = types.SimpleNamespace(
+        _DISCLOSURE_REST=imageWrangler._DISCLOSURE_REST,
+        _DISCLOSURE_TOPLEVEL=imageWrangler._DISCLOSURE_TOPLEVEL,
+        _DISCLOSURE_CARRIERS=imageWrangler._DISCLOSURE_CARRIERS,
+        parameters=root,
+        viewer_mode=None,
+        poni=object(),                                  # have_poni True
+        _compute_source_base=lambda: '/tmp',            # have_root True
+    )
+    holder._safe_status_text = lambda *a, **k: None
+    imageWrangler._apply_disclosure.__get__(holder)()   # fully-disclosed branch
+
+    assert root.child('Mask').opts.get('visible') is False
+    assert root.child('MaskSat').opts.get('visible') is False
+    # A normally-disclosed group IS shown (sanity: the branch ran).
+    assert root.child('GI').opts.get('visible') is True

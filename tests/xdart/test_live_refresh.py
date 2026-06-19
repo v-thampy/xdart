@@ -3036,7 +3036,9 @@ def test_wrangler_expands_active_groups_on_startup():
     )
     host._expand_active_groups()
     assert gi.opts.get("expanded") is True
-    assert mask.opts.get("expanded") is True
+    # Intensity Threshold (Mask) moved to the integrator panel — no longer a
+    # wrangler toggle group, so _expand_active_groups leaves it untouched.
+    assert "expanded" not in mask.opts
     assert bgg.opts.get("expanded") is True
 
     # All off / no background → groups left collapsed (no expand opt set).
@@ -3046,12 +3048,12 @@ def test_wrangler_expands_active_groups_on_startup():
         imageWrangler._expand_active_groups, host,
     )
     host._expand_active_groups()
-    # UI-1 (#81): the GI / Intensity-Threshold groups' EXPANDED state is now the
-    # on/off toggle, so "off" explicitly COLLAPSES them (expanded=False) rather
-    # than leaving the opt unset.  BG still only expands-when-on (its toggle is
-    # the bg_type list, not the header), so it stays untouched when off.
+    # UI-1 (#81): the GI group's EXPANDED state is the on/off toggle, so "off"
+    # explicitly COLLAPSES it (expanded=False).  BG only expands-when-on (its
+    # toggle is the bg_type list, not the header), so it stays untouched when
+    # off.  Intensity Threshold moved to the integrator panel — left untouched.
     assert gi.opts.get("expanded") is False
-    assert mask.opts.get("expanded") is False
+    assert "expanded" not in mask.opts
     assert "expanded" not in bgg.opts
 
 

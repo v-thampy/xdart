@@ -1174,8 +1174,9 @@ class imageWrangler(wranglerWidget):
     # rest (groups + the Save-Path row) appears once a valid PONI also loads.
     # Intensity Threshold ('Mask') + Mask Saturated ('MaskSat') moved to the
     # integrator panel — kept here as hidden carriers the integrator injects into
-    # at run-setup, so never disclosed.
+    # at run-setup, so never disclosed (and re-hidden after "reveal everything").
     _DISCLOSURE_REST = ('Signal', 'GI', 'BG')
+    _DISCLOSURE_CARRIERS = ('Mask', 'MaskSat')
     _DISCLOSURE_TOPLEVEL = ('h5_dir', 'h5_dir_browse')     # Save Path row
 
     @staticmethod
@@ -1246,6 +1247,13 @@ class imageWrangler(wranglerWidget):
         else:
             for child in self.parameters.children():
                 child.show()                               # reveal everything
+            # …except the pixel-rejection carriers, which moved to the
+            # integrator panel and live here only as hidden injection targets.
+            for name in self._DISCLOSURE_CARRIERS:
+                try:
+                    self.parameters.child(name).hide()
+                except Exception:
+                    pass
             imageWrangler._safe_status_text(self, '')
 
     def get_poni_dict(self):

@@ -507,7 +507,7 @@ class Ui_Form(object):
         self.mask_saturated.setObjectName(u"mask_saturated")
         self.mask_saturated.setCheckable(True)
         self.mask_saturated.setChecked(True)
-        self.mask_saturated.setText(u"Mask Saturated")
+        self.mask_saturated.setText(u"Auto")
         self.mask_saturated.setToolTip(
             u"Mask Saturated: exclude a saturated/dead detector module (a block "
             u"of pixels sitting at the detector's intensity ceiling) from the "
