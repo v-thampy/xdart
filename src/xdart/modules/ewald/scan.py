@@ -546,6 +546,88 @@ class LiveScan:
         with self.scan_lock:
             self._load_from_nexus_v2(grp, data_only=data_only)
 
+    def _restore_calibration_from_group(self, _det) -> bool:
+        """Rebuild ``_cached_poni`` / ``_cached_integrator`` from an open
+        NXdetector group.  Returns True iff a pixel-bearing integrator is now
+        cached.
+
+        Shared by the reload path (``_load_from_nexus_v2``) and the on-demand
+        ``ensure_calibration_loaded`` (reintegrate).  The detector NAME recovers
+        pixel sizes via pyFAI's registry; persisted ``x_pixel_size`` /
+        ``y_pixel_size`` are the fallback for unnamed/generic detectors.
+        """
+        if _det is None or not all(k in _det for k in
+                                   ("dist", "poni1", "poni2")):
+            logger.debug("[REINTEGRATE-CAL] no PONI scalars in detector group "
+                         "of %s; nothing to restore", self.data_file)
+            return False
+        from xrd_tools.core.containers import PONI
+        from xrd_tools.integrate.calibration import poni_to_integrator
+        _pd = {k: float(_det[k][()]) for k in
+               ("dist", "poni1", "poni2", "rot1", "rot2", "rot3") if k in _det}
+        if "detector_name" in _det:
+            _nm = _det["detector_name"][()]
+            _pd["detector"] = (_nm.decode() if isinstance(_nm, bytes)
+                               else str(_nm))
+        if getattr(self, "_persisted_wavelength_m", None):
+            _pd["wavelength"] = float(self._persisted_wavelength_m)
+        _poni = PONI.from_dict(_pd)
+        _ai = poni_to_integrator(_poni)
+        _adet = getattr(_ai, "detector", None)
+        # Fallback: the name didn't resolve → build a generic detector from the
+        # persisted pixel sizes (+ full-res shape if known).
+        if ((_adet is None or getattr(_adet, "pixel1", None) is None)
+                and "x_pixel_size" in _det and "y_pixel_size" in _det):
+            from pyFAI.detectors import Detector as _Detector
+            _shape = (tuple(self.detector_shape)
+                      if getattr(self, "detector_shape", None) else None)
+            _ai.detector = _Detector(
+                pixel1=float(_det["y_pixel_size"][()]),
+                pixel2=float(_det["x_pixel_size"][()]),
+                max_shape=_shape,
+            )
+            _adet = _ai.detector
+        if _adet is not None and getattr(_adet, "pixel1", None) is not None:
+            self._cached_poni = _poni
+            self._cached_integrator = _ai
+            self._cached_fiber_integrator = None
+            logger.info("[REINTEGRATE-CAL] restored calibration from %s: "
+                        "detector=%r pixel1=%s", self.data_file,
+                        _pd.get("detector", ""), getattr(_adet, "pixel1", None))
+            return True
+        logger.info("[REINTEGRATE-CAL] %s has geometry but no usable detector "
+                    "identity (name=%r, no pixel sizes) — cannot reintegrate",
+                    self.data_file, _pd.get("detector", ""))
+        return False
+
+    def ensure_calibration_loaded(self) -> bool:
+        """Ensure ``_cached_integrator`` is populated from the scan's OWN .nxs.
+
+        Idempotent and path-independent: safe to call right before a
+        re-integration regardless of how the scan reached the GUI (a full reload
+        restores calibration eagerly; a live ``data_only`` refresh does not).
+        Reads only the instrument/detector group.  Returns True iff a usable
+        integrator is in place.
+        """
+        if getattr(self, "_cached_integrator", None) is not None:
+            logger.info("[REINTEGRATE-CAL] ensure: already cached for %s",
+                        self.data_file)
+            return True
+        df = getattr(self, "data_file", None)
+        if not df or not os.path.exists(df):
+            logger.info("[REINTEGRATE-CAL] ensure: no .nxs on disk to read "
+                        "calibration from (data_file=%r)", df)
+            return False
+        try:
+            with self.file_lock:
+                with utils.catch_h5py_file(df, mode='r') as f:
+                    return self._restore_calibration_from_group(
+                        f.get("entry/instrument/detector"))
+        except Exception:
+            logger.info("[REINTEGRATE-CAL] ensure: failed reading calibration "
+                        "from %s", df, exc_info=True)
+            return False
+
     def set_datafile(self, fname, name=None, keep_current_data=False,
                      save_args=None, load_args=None):
         """Sets the data_file.
@@ -750,6 +832,29 @@ class LiveScan:
         except Exception:
             logger.debug("Failed to read global_mask from %s",
                          self.data_file, exc_info=True)
+
+        # ── calibration: rebuild _cached_poni / _cached_integrator from the
+        # instrument/detector group so a *reloaded* scan re-integrates with its
+        # OWN geometry (the GUI's configured PONI File is for new scans only).
+        # The 6 PONI scalars + the detector NAME (registry key → pixel sizes)
+        # round-trip the integrator, symmetric with what the wranglers cache at
+        # run start; persisted x/y pixel sizes are the fallback when the name
+        # does not resolve.  Files written before this round-trip carry no
+        # detector identity → leave the cache None so the Reintegrate guard
+        # surfaces a clear 're-process once' message instead of letting pyFAI
+        # crash on a pixel-less integrator (_pixel1 is None).
+        #
+        # Restore on a full load (new-scan context), and on a live ``data_only``
+        # refresh ONLY when the cache is empty — never clobber the wrangler's
+        # live integrator mid-run.  ``ensure_calibration_loaded`` re-reads it
+        # on demand at reintegrate time regardless of the load path.
+        if (not data_only) or getattr(self, "_cached_integrator", None) is None:
+            try:
+                self._restore_calibration_from_group(
+                    grp.get("entry/instrument/detector"))
+            except Exception:
+                logger.debug("Failed to restore calibration from %s",
+                             self.data_file, exc_info=True)
 
         # ── populate frames.index (always — required even in data_only
         # mode so the wrangler's per-frame `update_scan` refresh has

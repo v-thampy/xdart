@@ -2105,3 +2105,128 @@ def test_replace_with_shape_change_survives_one_publication_drop(tmp_path):
         i2d = f["entry/integrated_2d"]
         assert i2d["intensity"].shape == (2, N_CHI, new_nq)
         assert sorted(int(x) for x in i2d["frame_index"][()]) == [0, 2]
+
+
+# ---------------------------------------------------------------------------
+# Calibration round-trip — the detector identity must survive write→reload so a
+# reloaded scan can be re-integrated with its OWN geometry (2026-06-18 fix for
+# the `_pixel1 is None` crash: the .nxs used to persist only the 6 geometry
+# scalars, never the detector name/pixel sizes, so a reload had no usable
+# integrator).
+# ---------------------------------------------------------------------------
+
+def test_calibration_round_trips_through_nxs(tmp_path):
+    """Writer persists the detector NAME + pixel sizes; reader rebuilds a
+    pixel-bearing integrator + PONI from the file ALONE (no GUI PONI)."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald import LiveScan
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.integrate.calibration import poni_to_integrator
+
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    real_poni = PONI(dist=0.15, poni1=0.02, poni2=0.02,
+                     rot1=0.0, rot2=0.0, rot3=0.0,
+                     wavelength=1.0e-10, detector="Pilatus100k")
+    for fr in frames:
+        fr.poni = real_poni            # the representative-poni source
+    scan = _DuckSphere(frames)
+    scan._cached_integrator = poni_to_integrator(real_poni)   # pixel-size source
+
+    path = tmp_path / "calib_roundtrip.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    # WRITER: detector identity persisted under instrument/detector.
+    with h5py.File(path, "r") as f:
+        det = f["entry/instrument/detector"]
+        name = det["detector_name"][()]
+        assert (name.decode() if isinstance(name, bytes) else str(name)) \
+            == "Pilatus100k"
+        assert float(det["x_pixel_size"][()]) > 0.0
+        assert float(det["y_pixel_size"][()]) > 0.0
+
+    # READER: a reloaded scan carries a pixel-bearing integrator + PONI.
+    reloaded = LiveScan(data_file=str(path))
+    reloaded.load_from_h5()
+    assert reloaded._cached_integrator is not None
+    assert reloaded._cached_integrator.detector is not None
+    assert reloaded._cached_integrator.detector.pixel1 is not None
+    assert reloaded._cached_poni is not None
+    assert reloaded._cached_poni.detector == "Pilatus100k"
+
+
+def test_old_nxs_without_detector_identity_leaves_cache_none(tmp_path):
+    """Backward-compat: a .nxs written WITHOUT a detector name/pixel sizes (the
+    pre-fix shape — only the 6 geometry scalars) reloads with _cached_integrator
+    left None, so the Reintegrate guard surfaces a clear 're-process' message
+    instead of building a pixel-less integrator that crashes pyFAI."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xdart.modules.ewald import LiveScan
+
+    # _DuckPONI has no `detector`; no _cached_integrator → no pixel sizes.
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "old_style.nxs"
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        det = f["entry/instrument/detector"]
+        assert "detector_name" not in det        # nothing to round-trip
+        assert "x_pixel_size" not in det
+
+    reloaded = LiveScan(data_file=str(path))
+    reloaded.load_from_h5()
+    assert reloaded._cached_integrator is None    # guard will prompt re-process
+
+
+def _written_calibrated_scan(tmp_path, name="cal.nxs"):
+    """Write a 4-frame scan carrying a named-detector calibration; return path."""
+    from xdart.modules.ewald.nexus_writer import save_scan_to_nexus
+    from xrd_tools.core.containers import PONI
+    from xrd_tools.integrate.calibration import poni_to_integrator
+    frames = [_DuckArch(idx=i) for i in range(N_FRAMES)]
+    real_poni = PONI(dist=0.15, poni1=0.02, poni2=0.02, rot1=0.0, rot2=0.0,
+                     rot3=0.0, wavelength=1.0e-10, detector="Pilatus100k")
+    for fr in frames:
+        fr.poni = real_poni
+    scan = _DuckSphere(frames)
+    scan._cached_integrator = poni_to_integrator(real_poni)
+    path = tmp_path / name
+    save_scan_to_nexus(scan, path, mode="w", finalize=False)
+    return str(path)
+
+
+def test_ensure_calibration_loaded_self_heals_without_full_load(tmp_path):
+    """Reintegrate self-heal: a scan that never got a full reload (e.g. only a
+    live data_only refresh reached it) has _cached_integrator=None;
+    ensure_calibration_loaded re-reads it from the scan's OWN .nxs on demand."""
+    from xdart.modules.ewald import LiveScan
+    path = _written_calibrated_scan(tmp_path, "selfheal.nxs")
+
+    s = LiveScan(data_file=path)               # constructed, never load_from_h5'd
+    assert getattr(s, "_cached_integrator", None) is None
+    assert s.ensure_calibration_loaded() is True
+    assert s._cached_integrator.detector.pixel1 is not None
+    assert s._cached_poni.detector == "Pilatus100k"
+    assert s.ensure_calibration_loaded() is True   # idempotent
+
+
+def test_data_only_refresh_restores_when_empty_but_never_clobbers(tmp_path):
+    """A live data_only refresh restores calibration ONLY when the cache is
+    empty; it must never overwrite the wrangler's live integrator mid-run."""
+    from xdart.modules.ewald import LiveScan
+    path = _written_calibrated_scan(tmp_path, "dataonly.nxs")
+
+    # Empty cache → data_only refresh fills it from disk.
+    s = LiveScan(data_file=path)
+    s.load_from_h5(replace=False, data_only=True)
+    assert s._cached_integrator is not None
+    assert s._cached_integrator.detector.pixel1 is not None
+
+    # Live integrator already cached → data_only refresh leaves it untouched.
+    s2 = LiveScan(data_file=path)
+    sentinel = object()
+    s2._cached_integrator = sentinel
+    s2.load_from_h5(replace=False, data_only=True)
+    assert s2._cached_integrator is sentinel

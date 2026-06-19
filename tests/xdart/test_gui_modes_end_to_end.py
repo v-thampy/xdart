@@ -1308,16 +1308,23 @@ def test_integration_controls_enabled_per_mode(widget):
 
 # ── Reintegrate row (resurfaced buttons) ───────────────────────────────────
 
-def _fake_processed_scan(*, n_frames=3, raw_reachable=True, skip_2d=False):
+def _fake_processed_scan(*, n_frames=3, raw_reachable=True, skip_2d=False,
+                         cached=True):
     """Minimal stand-in carrying just the attrs the reintegrate enable-state
     and bai_* guards read: frames.index length, has_reload_only_frames(),
-    skip_2d."""
+    skip_2d, and the cached integrator a finished/loaded scan carries (so the
+    calibration guard at bai_* click time is satisfied)."""
     from types import SimpleNamespace
     return SimpleNamespace(
         name="reint_test",
         frames=SimpleNamespace(index=list(range(n_frames))),
         has_reload_only_frames=(lambda: not raw_reachable),
         skip_2d=skip_2d,
+        # A just-run (or already-bridged) scan has a cached integrator; a
+        # bare-reloaded scan does not (cached=False) — see the calibration guard.
+        _cached_integrator=(object() if cached else None),
+        _cached_poni=(object() if cached else None),
+        _cached_fiber_integrator=None,
     )
 
 
@@ -1425,6 +1432,56 @@ def test_reintegrate_no_processed_data_pops_message_not_thread(widget, monkeypat
     iu.reintegrate2D.clicked.emit()
     assert started == []                 # blocked — thread never started
     assert len(msgs) == 2                # a message popped for each click
+
+
+def test_reintegrate_uses_scans_own_cached_calibration(widget, monkeypatch):
+    """The geometry a re-integration uses comes entirely from the scan's OWN
+    calibration (a live run caches it; a .nxs reload restores it) — never the
+    GUI's configured PONI File.  A scan that carries a cached integrator
+    re-integrates with exactly that object, untouched."""
+    w = widget
+    it = w.integratorTree
+    iu = it.ui
+    started = []
+    it.integrator_thread.isRunning = lambda: False
+    it.integrator_thread.start = lambda: started.append(it.integrator_thread.method)
+    scan = _fake_processed_scan(raw_reachable=True, cached=True)
+    it.scan = scan
+    own_integrator = scan._cached_integrator
+
+    # The guard must not rebuild calibration from any GUI source: poni_to_integrator
+    # must never be called when the scan already carries one.
+    monkeypatch.setattr('xrd_tools.integrate.calibration.poni_to_integrator',
+                        lambda p: (_ for _ in ()).throw(
+                            AssertionError("reintegrate must not rebuild "
+                                           "calibration from the GUI")))
+
+    iu.reintegrate1D.clicked.emit()
+
+    assert started == ["bai_1d_all"]                 # thread started — not blocked
+    assert scan._cached_integrator is own_integrator  # the scan's own, untouched
+
+
+def test_reintegrate_no_stored_calibration_pops_message(widget, monkeypatch):
+    """Reloaded scan with NO stored calibration (a .nxs written before
+    calibration round-trip): surface a clear 're-process once' message and do
+    NOT start the thread — never hand the reduction a pixel-less integrator."""
+    from pyqtgraph.Qt import QtWidgets as _qtw
+    w = widget
+    it = w.integratorTree
+    iu = it.ui
+    started, msgs = [], []
+    it.integrator_thread.isRunning = lambda: False
+    it.integrator_thread.start = lambda: started.append("start")
+    it.scan = _fake_processed_scan(raw_reachable=True, cached=False)  # no calibration
+    monkeypatch.setattr(_qtw.QMessageBox, "information",
+                        lambda *a, **k: msgs.append(a))
+
+    iu.reintegrate1D.clicked.emit()
+    iu.reintegrate2D.clicked.emit()
+
+    assert started == []                 # blocked — no stored calibration
+    assert len(msgs) == 2                # one message per click
 
 
 def test_reintegrate_apply_never_probes_raw(widget):

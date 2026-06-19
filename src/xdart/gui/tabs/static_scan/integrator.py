@@ -1070,6 +1070,8 @@ class integratorTree(QtWidgets.QWidget):
             return
         if self._block_if_reload_only_frames('1D'):
             return
+        if not self._ensure_reintegration_calibration('1D'):
+            return
         with self.integrator_thread.lock:
             if len(self.scan.frames.index) > 0:
                 self.integrator_thread.method = 'bai_1d_all'
@@ -1094,6 +1096,8 @@ class integratorTree(QtWidgets.QWidget):
             return
         if self._block_if_reload_only_frames('2D'):
             return
+        if not self._ensure_reintegration_calibration('2D'):
+            return
         with self.integrator_thread.lock:
             if len(self.scan.frames.index) > 0:
                 self.integrator_thread.method = 'bai_2d_all'
@@ -1110,6 +1114,56 @@ class integratorTree(QtWidgets.QWidget):
         self.setEnabled(False)
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()
+
+    def _ensure_reintegration_calibration(self, dim_label: str) -> bool:
+        """Make sure the scan has a detector-bearing integrator before a
+        re-integration runs; surface a clear message if it can't.
+
+        The geometry a re-integration uses comes entirely from the scan's *own*
+        calibration — never the GUI's configured PONI File (that is for new
+        scans).  A live run caches it on ``_cached_integrator`` /
+        ``_cached_poni``; a scan reloaded from a ``.nxs`` restores it from the
+        file's instrument/detector group (see
+        ``LiveScan._load_from_nexus_v2``).  Only the integrator-panel params
+        (npts / ranges / units) come from the GUI.
+
+        If neither source produced a usable integrator — e.g. a ``.nxs`` written
+        before calibration round-trip, which stored no detector identity — we
+        surface a clear message instead of letting pyFAI crash deep inside
+        calc_cartesian_positions (``self._pixel1 is None``).  Returns True iff a
+        usable integrator is in place.
+        """
+        have = getattr(self.scan, '_cached_integrator', None) is not None
+        logger.info("[REINTEGRATE-CAL] %s click: cached_integrator=%s "
+                    "data_file=%s", dim_label, have,
+                    getattr(self.scan, 'data_file', None))
+        if not have:
+            # Self-heal: re-read calibration from the scan's OWN .nxs on demand,
+            # independent of how the GUI loaded it (a live data_only refresh does
+            # not restore calibration).
+            ensure = getattr(self.scan, 'ensure_calibration_loaded', None)
+            if callable(ensure):
+                have = bool(ensure())
+                logger.info("[REINTEGRATE-CAL] %s click: after "
+                            "ensure_calibration_loaded -> %s", dim_label, have)
+        if have:
+            return True
+        # No stored calibration: a clear message beats a cryptic pyFAI crash.
+        try:
+            from pyqtgraph.Qt import QtWidgets
+            QtWidgets.QMessageBox.information(
+                self,
+                f'Cannot re-integrate {dim_label}',
+                'This scan has no stored calibration to re-integrate with.\n\n'
+                'It was likely saved before the calibration was stored in the '
+                '.nxs file — re-process the scan once, then Reintegrate will '
+                'use the calibration read back from the file.',
+            )
+        except (ImportError, RuntimeError) as e:
+            logger.warning(
+                'Re-integrate %s blocked — no stored calibration (no '
+                'QMessageBox: %s)', dim_label, e)
+        return False
 
     def _block_if_no_frames(self, dim_label: str) -> bool:
         """Abort re-integration with a status message when the scan has no

@@ -1294,6 +1294,11 @@ def _representative_poni(scan):
             from xrd_tools.integrate.calibration import PONI  # type: ignore
         except Exception:
             return None
+    # Best-effort detector NAME for the round-trip (the frame-derived branch
+    # above carries the reliable original .poni string; this fallback uses the
+    # integrator's detector name, with persisted pixel sizes as the safety net).
+    det_obj = getattr(ai, "detector", None)
+    det_name = getattr(det_obj, "name", "") if det_obj is not None else ""
     return PONI(
         dist=float(getattr(ai, "dist", 0.0)),
         poni1=float(getattr(ai, "poni1", 0.0)),
@@ -1301,7 +1306,32 @@ def _representative_poni(scan):
         rot1=float(getattr(ai, "rot1", 0.0)),
         rot2=float(getattr(ai, "rot2", 0.0)),
         rot3=float(getattr(ai, "rot3", 0.0)),
+        detector=str(det_name or ""),
     )
+
+
+def _representative_detector(scan):
+    """Return the scan's pyFAI ``Detector`` (for persisting pixel sizes), or None.
+
+    Geometry is constant across a scan, so any one integrator's detector is
+    representative.  Prefers the wrangler's cached integrator; falls back to an
+    in-memory frame's integrator if the cache was drained.  Used to stamp the
+    NXdetector ``x_pixel_size`` / ``y_pixel_size`` — the safety net that lets a
+    reload rebuild a pixel-bearing integrator even when the detector name does
+    not resolve in pyFAI's registry.
+    """
+    ai = getattr(scan, "_cached_integrator", None)
+    det = getattr(ai, "detector", None) if ai is not None else None
+    if det is not None and getattr(det, "pixel1", None) is not None:
+        return det
+    in_mem = getattr(getattr(scan, "frames", None), "_in_memory", None)
+    if in_mem:
+        for fr in in_mem.values():
+            fai = getattr(fr, "integrator", None)
+            fdet = getattr(fai, "detector", None) if fai is not None else None
+            if fdet is not None and getattr(fdet, "pixel1", None) is not None:
+                return fdet
+    return None
 
 
 def _instrument_signature(scan) -> tuple:
@@ -1313,15 +1343,26 @@ def _instrument_signature(scan) -> tuple:
         pass
     poni = _representative_poni(scan)
     poni_sig = None
+    det_name = None
     if poni is not None:
         poni_sig = tuple(
             None if getattr(poni, key, None) is None
             else float(getattr(poni, key))
             for key in ("dist", "poni1", "poni2", "rot1", "rot2", "rot3")
         )
+        det_name = getattr(poni, "detector", None) or None
+    pdet = _representative_detector(scan)
+    pixel_sig = None
+    if pdet is not None:
+        pixel_sig = (
+            getattr(pdet, "pixel1", None),
+            getattr(pdet, "pixel2", None),
+        )
     return (
         None if wavelength is None else float(wavelength),
         poni_sig,
+        det_name,
+        pixel_sig,
         _array_digest(getattr(scan, "global_mask", None)),
         _array_digest(getattr(scan, "detector_shape", None)),
     )
@@ -1410,6 +1451,29 @@ def _write_instrument(f, scan, *, entry: str) -> None:
                 if k in det:
                     del det[k]
                 det.create_dataset(k, data=float(v))
+        # Detector NAME — the pyFAI registry key that recovers pixel sizes (the
+        # original .poni 'detector' string).  Persisted so a *reloaded* scan can
+        # rebuild a pixel-bearing integrator and be re-integrated; without it the
+        # reload had only the 6 scalars and pyFAI crashed (_pixel1 is None).
+        # Additive NXdetector field; external readers ignore it.
+        det_name = getattr(poni, "detector", "") or ""
+        if "detector_name" in det:
+            del det["detector_name"]
+        if det_name:
+            det.create_dataset("detector_name", data=str(det_name))
+
+    # Pixel sizes (metres) — NeXus-standard NXdetector fields, and the fallback
+    # detector-reconstruction path for a reload when the registry name does not
+    # resolve (generic/unnamed detectors).  Sourced from the scan's pyFAI
+    # detector independently of the PONI (which carries only the name).
+    pdet = _representative_detector(scan)
+    for fld, attr in (("x_pixel_size", "pixel2"), ("y_pixel_size", "pixel1")):
+        if fld in det:
+            del det[fld]
+        val = getattr(pdet, attr, None) if pdet is not None else None
+        if val is not None:
+            sds = det.create_dataset(fld, data=float(val))
+            sds.attrs["units"] = "m"
 
     # Global mask — flat indices of masked pixels (detector mask + the
     # user-supplied Mask File, combined via the wrangler).  Stored so
