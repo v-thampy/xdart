@@ -621,6 +621,21 @@ class LiveScan:
         try:
             with self.file_lock:
                 with utils.catch_h5py_file(df, mode='r') as f:
+                    # The detector group carries no wavelength (it lives in
+                    # source/wavelength_A); restore it too — without it the
+                    # rebuilt integrator can't compute q ("Scattering vector q
+                    # cannot be calculated without knowing wavelength").
+                    if getattr(self, "_persisted_wavelength_m", None) is None:
+                        try:
+                            wl_m = wavelength_angstrom_to_m(
+                                f["entry/instrument/source/wavelength_A"][()])
+                            if wl_m is not None:
+                                self._persisted_wavelength_m = wl_m
+                                if isinstance(self.mg_args, dict):
+                                    self.mg_args["wavelength"] = wl_m
+                        except KeyError:
+                            logger.info("[REINTEGRATE-CAL] ensure: no persisted "
+                                        "wavelength in %s", df)
                     return self._restore_calibration_from_group(
                         f.get("entry/instrument/detector"))
         except Exception:

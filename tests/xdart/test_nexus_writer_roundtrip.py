@@ -2209,6 +2209,13 @@ def test_ensure_calibration_loaded_self_heals_without_full_load(tmp_path):
     assert s.ensure_calibration_loaded() is True
     assert s._cached_integrator.detector.pixel1 is not None
     assert s._cached_poni.detector == "Pilatus100k"
+    # The rebuilt integrator must ALSO carry the wavelength (it lives in
+    # source/wavelength_A, not the detector group) — without it pyFAI raises
+    # "Scattering vector q cannot be calculated without knowing wavelength".
+    assert s._cached_poni.wavelength and s._cached_poni.wavelength > 0
+    img = np.ones(s._cached_integrator.detector.max_shape, dtype=np.float32)
+    res = s._cached_integrator.integrate1d(img, 100, unit="q_A^-1")
+    assert res[0][-1] > res[0][0]              # q axis computed — no crash
     assert s.ensure_calibration_loaded() is True   # idempotent
 
 
