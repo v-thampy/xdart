@@ -17,6 +17,7 @@ from xdart.modules.reduction import (
     open_live_reduction_session,
     StandardPlanCache,
     reduce_live_frames,
+    apply_threshold_saturation_to_plan,
 )
 
 # Qt imports
@@ -94,6 +95,24 @@ class integratorThread(Qt.QtCore.QThread):
         # reintegrate loop; set by staticWidget.close().  Checked between
         # batches only -- a batch in flight finishes.
         self.stop_requested = False
+        # Per-frame pixel-rejection policy (Intensity Threshold + Mask
+        # Saturated) snapshot onto the thread by the GUI (bai_1d/bai_2d) right
+        # before a reintegrate starts, read fresh from the wrangler so the
+        # CURRENT settings apply.  Applied to the reintegrate plan via
+        # apply_threshold_saturation_to_plan; None => plan unchanged.
+        self.threshold_config = None
+
+    def _plan_for_reintegration(self, *, integrate_2d: bool):
+        """Standard plan for a reintegrate, with the current Intensity-Threshold
+        / Mask-Saturated policy applied.
+
+        The plan-cache + session keys don't fingerprint the threshold fields, so
+        the policy is layered on AFTER the cache .get (a fresh object id when it
+        changes -> a fresh session; identity preserved when it doesn't ->
+        session reuse).
+        """
+        plan = self._plan_cache.get(self.scan, integrate_2d=integrate_2d)
+        return apply_threshold_saturation_to_plan(plan, self.threshold_config)
 
     def run(self):
         """Calls self.method. Catches exception where method does
@@ -369,9 +388,7 @@ class integratorThread(Qt.QtCore.QThread):
 
         label = '2D' if do_2d else '1D'
         n_workers = max(1, min(max_cores, len(indices)))
-        standard_plan = self._plan_cache.get(
-            self.scan, integrate_2d=do_2d,
-        )
+        standard_plan = self._plan_for_reintegration(integrate_2d=do_2d)
 
         # Batched dispatch: lazy-load each batch right before
         # submitting it, publish results, then drop the batch's
@@ -460,7 +477,7 @@ class integratorThread(Qt.QtCore.QThread):
             idxs = self.scan.frames.index
         # C1: cached plan covers integrate_1d + integrate_2d together
         # since a 2D reintegrate also refreshes the cached 1D entry.
-        plan = self._plan_cache.get(self.scan, integrate_2d=True)
+        plan = self._plan_for_reintegration(integrate_2d=True)
         # for idx in self.frames.keys():
         for idx in idxs:
             frame = self.scan.frames[int(idx)]
@@ -478,7 +495,7 @@ class integratorThread(Qt.QtCore.QThread):
         idxs = self.frame_ids
         if 'Overall' in self.frame_ids:
             idxs = self.scan.frames.index
-        plan = self._plan_cache.get(self.scan, integrate_2d=False)
+        plan = self._plan_for_reintegration(integrate_2d=False)
         # for (idx, frame) in self.frames.items():
         for idx in idxs:
             frame = self.scan.frames[int(idx)]

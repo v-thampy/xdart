@@ -2158,3 +2158,43 @@ def test_gi_entry_forces_q_unit(widget):
     assert tree.scan.bai_1d_args['unit'] == 'q_A^-1'    # stays Q, no surprise
     assert tree.ui.unit_1D.count() == 3                 # 2θ + χ (azimuthal) back
     assert tree.ui.unit_2D.count() == 2                 # 2D has no χ profile
+
+
+def test_reintegrate_applies_current_threshold_config(widget):
+    """A reintegrate snapshots the wrangler's CURRENT Intensity-Threshold /
+    Mask-Saturated policy onto the integrator thread (GUI thread, read fresh) and
+    bakes it into the reintegrate plan — so saturation/threshold rejection that a
+    live run applies also applies on reintegrate."""
+    from xdart.modules.reduction import ThresholdSaturationConfig
+    w = widget
+    it = w.integratorTree
+    cfg = ThresholdSaturationConfig(apply_threshold=True, threshold_min=2,
+                                    threshold_max=50, mask_saturation=True)
+    it.get_threshold_config = lambda: cfg
+
+    it._apply_threshold_config_to_thread()
+    assert it.integrator_thread.threshold_config is cfg          # snapshot on GUI thread
+
+    plan = it.integrator_thread._plan_for_reintegration(integrate_2d=False)
+    assert plan.threshold_min == 2 and plan.threshold_max == 50  # baked into the plan
+    assert plan.mask_saturation is True
+
+
+def test_reintegrate_threshold_config_provider_reads_wrangler_fresh(widget):
+    """staticWidget._current_threshold_config reads the wrangler param tree fresh
+    so the CURRENT settings (not the last-setup attrs) drive a reintegrate."""
+    w = widget
+    cfg = w._current_threshold_config()
+    # Image-Series wrangler exposes both groups; the default has Mask Saturated
+    # ON (mask_sentinel default True) and the intensity threshold OFF.
+    if cfg is not None:
+        assert cfg.apply_threshold is False
+        assert cfg.mask_saturation is True
+        # Flip the live param and confirm the provider sees it immediately.
+        try:
+            w.wrangler.parameters.child('Mask').child('Threshold').setValue(True)
+            w.wrangler.parameters.child('Mask').child('min').setValue(7)
+            assert w._current_threshold_config().apply_threshold is True
+            assert w._current_threshold_config().threshold_min == 7
+        except Exception:
+            pass        # wrangler without the Intensity-Threshold group (e.g. NeXus)

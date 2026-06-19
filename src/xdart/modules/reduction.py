@@ -9,7 +9,7 @@ headless reduction work should cross into ``xrd_tools`` as ``Frame`` /
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Any
 
@@ -138,6 +138,45 @@ def scan_from_live_scan(
         output_path=getattr(live_scan, "data_file", None),
         extra={"source": "xdart.LiveScan"},
     )
+
+
+@dataclass
+class ThresholdSaturationConfig:
+    """The wrangler's per-frame pixel-rejection policy, in plan terms.
+
+    Carries the GUI's *current* Intensity-Threshold + Mask-Saturated settings so
+    a re-integration can apply the same per-frame pixel rejection a live run
+    does — but via the headless ReductionPlan fields (``threshold_min`` /
+    ``threshold_max`` / ``mask_saturation``, applied by the reducer after
+    ``load_image``) rather than the wrangler's image-preprocessing path, which
+    the reintegrate route does not go through.
+    """
+    apply_threshold: bool = False
+    threshold_min: float | None = None
+    threshold_max: float | None = None
+    mask_saturation: bool = False
+
+
+def apply_threshold_saturation_to_plan(plan, cfg):
+    """Return a plan with the threshold/saturation fields set from ``cfg``.
+
+    No-op (identity preserved, so a cached session can be reused) when ``cfg``
+    is None or when it would not change the plan.  When the intensity threshold
+    is off, the band collapses to ``None`` (parity with the wrangler's
+    ``_apply_threshold_inline`` no-op).  Applied AFTER the plan cache .get
+    because the plan-cache / session keys don't fingerprint these fields.
+    """
+    if plan is None or cfg is None:
+        return plan
+    tmin = cfg.threshold_min if cfg.apply_threshold else None
+    tmax = cfg.threshold_max if cfg.apply_threshold else None
+    msat = bool(cfg.mask_saturation)
+    if (getattr(plan, "threshold_min", None) == tmin
+            and getattr(plan, "threshold_max", None) == tmax
+            and bool(getattr(plan, "mask_saturation", False)) == msat):
+        return plan
+    return replace(plan, threshold_min=tmin, threshold_max=tmax,
+                   mask_saturation=msat)
 
 
 def plan_from_live_scan(

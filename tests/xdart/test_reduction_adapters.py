@@ -1004,3 +1004,39 @@ def test_persistent_session_does_not_accumulate_products(monkeypatch) -> None:
                                  session=session)
         assert len(out) == 1 and out[0].int_1d is not None
         assert session.frames == {}            # released after each harvest
+
+
+# ---------------------------------------------------------------------------
+# ThresholdSaturationConfig -> plan (reintegrate pixel-rejection policy)
+# ---------------------------------------------------------------------------
+
+def test_apply_threshold_saturation_to_plan():
+    """The wrangler's Intensity-Threshold / Mask-Saturated policy maps onto the
+    headless ReductionPlan fields the reducer already applies after load_image."""
+    from xdart.modules.reduction import (
+        ThresholdSaturationConfig, apply_threshold_saturation_to_plan)
+
+    base = ReductionPlan()
+
+    # None cfg → identity preserved (so a cached session can be reused).
+    assert apply_threshold_saturation_to_plan(base, None) is base
+
+    # Threshold ON + Mask Saturated → all three fields set; fresh object.
+    cfg = ThresholdSaturationConfig(apply_threshold=True, threshold_min=5,
+                                    threshold_max=100, mask_saturation=True)
+    p = apply_threshold_saturation_to_plan(base, cfg)
+    assert p is not base
+    assert p.threshold_min == 5 and p.threshold_max == 100
+    assert p.mask_saturation is True
+
+    # Threshold OFF → band collapses to None (parity with _apply_threshold_inline
+    # no-op) even if min/max are set; saturation still applies independently.
+    cfg2 = ThresholdSaturationConfig(apply_threshold=False, threshold_min=5,
+                                     threshold_max=100, mask_saturation=True)
+    p2 = apply_threshold_saturation_to_plan(base, cfg2)
+    assert p2.threshold_min is None and p2.threshold_max is None
+    assert p2.mask_saturation is True
+
+    # All-off cfg matches the plan defaults → identity preserved (session reuse).
+    assert apply_threshold_saturation_to_plan(
+        base, ThresholdSaturationConfig()) is base

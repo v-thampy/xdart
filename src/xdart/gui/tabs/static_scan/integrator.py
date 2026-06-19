@@ -194,6 +194,13 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.reintegrate1D.clicked.connect(self.bai_1d)
         self.ui.reintegrate2D.clicked.connect(self.bai_2d)
 
+        # Host-supplied provider (set by staticWidget) returning the GUI's
+        # CURRENT Intensity-Threshold / Mask-Saturated policy as a
+        # ThresholdSaturationConfig, so a reintegrate applies the same per-frame
+        # pixel rejection a live run does.  None when running stand-alone.  See
+        # _apply_threshold_config_to_thread.
+        self.get_threshold_config = None
+
         self.integrator_thread = integratorThread(
             self.scan, self.frame, self.file_lock,
             self.frames, self.frame_ids, self.data_1d, self.data_2d,
@@ -1072,6 +1079,7 @@ class integratorTree(QtWidgets.QWidget):
             return
         if not self._ensure_reintegration_calibration('1D'):
             return
+        self._apply_threshold_config_to_thread()
         with self.integrator_thread.lock:
             if len(self.scan.frames.index) > 0:
                 self.integrator_thread.method = 'bai_1d_all'
@@ -1098,6 +1106,7 @@ class integratorTree(QtWidgets.QWidget):
             return
         if not self._ensure_reintegration_calibration('2D'):
             return
+        self._apply_threshold_config_to_thread()
         with self.integrator_thread.lock:
             if len(self.scan.frames.index) > 0:
                 self.integrator_thread.method = 'bai_2d_all'
@@ -1114,6 +1123,26 @@ class integratorTree(QtWidgets.QWidget):
         self.setEnabled(False)
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()
+
+    def _apply_threshold_config_to_thread(self) -> None:
+        """Snapshot the GUI's CURRENT Intensity-Threshold / Mask-Saturated policy
+        onto the integrator thread before a reintegrate.
+
+        Runs on the GUI thread (button click) and reads the wrangler params
+        fresh via the host-supplied provider, so the reintegrate applies what the
+        user has set RIGHT NOW (they tune these and re-run).  The thread reads
+        ``threshold_config`` in ``_plan_for_reintegration`` after ``.start()`` —
+        a clean happens-before, no cross-thread param read in the worker.
+        """
+        cfg = None
+        provider = getattr(self, 'get_threshold_config', None)
+        if callable(provider):
+            try:
+                cfg = provider()
+            except Exception as e:        # host-supplied; never crash the click
+                logger.debug("threshold-config provider errored: %s", e)
+                cfg = None
+        self.integrator_thread.threshold_config = cfg
 
     def _ensure_reintegration_calibration(self, dim_label: str) -> bool:
         """Make sure the scan has a detector-bearing integrator before a

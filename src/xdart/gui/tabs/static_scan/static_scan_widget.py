@@ -473,6 +473,13 @@ class staticWidget(QWidget):
         if hasattr(self.integratorTree.ui, 'advanced_int'):
             self.integratorTree.ui.advanced_int.clicked.connect(
                 self._show_integration_advanced)
+        # Reintegrate must apply the same per-frame pixel rejection (Intensity
+        # Threshold + Mask Saturated) a live run does.  Those options live on the
+        # wrangler today (they'll move to the integrator panel later); give the
+        # integrator tree a provider that reads them FRESH at click time so the
+        # CURRENT settings apply.  Wired ONCE — the bound method reads
+        # self.wrangler at call time, so it tracks wrangler swaps.
+        self.integratorTree.get_threshold_config = self._current_threshold_config
 
     def _show_reintegration_write_error(self, message: str) -> None:
         """Surface reintegration save failures in the same status area as runs."""
@@ -481,6 +488,35 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("could not surface reintegration write failure",
                          exc_info=True)
+
+    def _current_threshold_config(self):
+        """Return the active wrangler's CURRENT Intensity-Threshold /
+        Mask-Saturated policy as a ThresholdSaturationConfig, or None.
+
+        Read FRESH from the param tree (not the attrs synced at last setup) so a
+        reintegrate honours what the user just set.  Per-field guarded: a
+        wrangler without an 'Intensity Threshold' group (e.g. NeXus) yields
+        apply_threshold=False — matching that its live path doesn't clamp — while
+        still picking up 'Mask Saturated'.
+        """
+        from xdart.modules.reduction import ThresholdSaturationConfig
+        w = getattr(self, 'wrangler', None)
+        params = getattr(w, 'parameters', None)
+        if params is None:
+            return None
+
+        def _val(group, child, default):
+            try:
+                return params.child(group).child(child).value()
+            except Exception:
+                return default
+
+        return ThresholdSaturationConfig(
+            apply_threshold=bool(_val('Mask', 'Threshold', False)),
+            threshold_min=_val('Mask', 'min', None),
+            threshold_max=_val('Mask', 'max', None),
+            mask_saturation=bool(_val('MaskSat', 'mask_sentinel', False)),
+        )
 
     def _init_wranglers(self):
         """Initialize the wrangler stack and select the default wrangler."""
