@@ -540,6 +540,35 @@ class TestFreeRaw:
         assert a.map_raw is not None
         np.testing.assert_allclose(a.map_raw, img.astype(np.float32))
 
+    def test_lazy_load_preserves_integer_dtype_hdf5(self, tmp_path, monkeypatch):
+        """The HDF5 (Eiger) lazy raw load KEEPS the source integer dtype.
+        Casting to float32 here lost the saturation-mask ceiling
+        (integer_saturation_ceiling -> None for float), silently disabling
+        Mask-Saturated on a reintegrate — the high-Q edge spike vs a clean fresh
+        integrate at identical settings.  Consumers convert to float as needed."""
+        import xrd_tools.io.nexus as nexus_io
+        from xdart.modules.ewald.frame import LiveFrame
+
+        img = np.arange(64, dtype=np.uint16).reshape(8, 8)
+
+        class _Stack:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def __getitem__(self, _i): return img
+
+        monkeypatch.setattr(nexus_io, "open_nexus_image_stack",
+                            lambda _full: _Stack())
+        h5 = tmp_path / "src.h5"
+        h5.write_bytes(b"\x89HDF\r\n\x1a\n")          # exists for the os.path check
+        a = LiveFrame(idx=0)
+        a.source_file = "src.h5"
+        a.source_frame_idx = 0
+        a._source_root = str(tmp_path)
+
+        assert a._lazy_load_raw() is True
+        assert np.issubdtype(a.map_raw.dtype, np.integer)   # NOT float32
+        np.testing.assert_array_equal(a.map_raw, img)
+
 
 class TestCanSkipThumbnail:
     """PERF-5: can_skip_thumbnail gates the 1D-only thumbnail skip — only a

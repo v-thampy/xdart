@@ -401,18 +401,25 @@ class LiveFrame():
             if ext in (".h5", ".nxs", ".hdf5"):
                 from xrd_tools.io.nexus import open_nexus_image_stack
                 with open_nexus_image_stack(full) as stack:
-                    self.map_raw = np.asarray(
-                        stack[fidx], dtype=np.float32,
-                    )
+                    # Keep the source INTEGER dtype (Eiger uint16/uint32).  The
+                    # reduce derives the Mask-Saturated ceiling from the integer
+                    # dtype (integer_saturation_ceiling -> None for float) and
+                    # only then converts to float — casting to float32 HERE lost
+                    # the ceiling, silently disabling saturation masking on a
+                    # reintegrate (the high-Q edge spike vs a clean fresh
+                    # integrate, identical settings).  Consumers (display, stitch,
+                    # reduce) all np.asarray(..., float) as needed.
+                    self.map_raw = np.asarray(stack[fidx])
             else:
                 # O2: forward source_frame_idx for multi-frame
                 # non-HDF5 sources too (e.g. multi-frame TIFF /
                 # CBF stacks).  Single-frame files use frame=0
                 # and ignore the kwarg, so this is safe.
                 from xrd_tools.io.image import read_image
-                self.map_raw = np.asarray(
-                    read_image(full, frame=fidx), dtype=np.float32,
-                )
+                # Keep the source dtype (see the HDF5 branch above): integer raws
+                # must stay integer so the saturation ceiling survives to the
+                # reduce; consumers convert to float as needed.
+                self.map_raw = np.asarray(read_image(full, frame=fidx))
         except Exception as e:
             import logging
             logging.getLogger(__name__).debug(

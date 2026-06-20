@@ -4186,6 +4186,230 @@ def test_align_sets_geometry_xrange_when_not_aligned():
     assert lo < 0
 
 
+def _inverse_align_host(plot_xrange, cake_xrange=(0.889, 8.626)):
+    """Duck host for ``_align_cake_under_plot`` (the 2D-follows-1D direction):
+    the bottom plot shows ``plot_xrange`` over its screen span and the cake's
+    viewbox records setXRange so we can assert it converges to the geometry
+    target.  Identity scene->global maps, so rect edges ARE screen pixels."""
+    from xdart.gui.tabs.static_scan.display_frame_widget import displayFrameWidget
+
+    class _Pt:
+        def __init__(self, x): self._x = x
+        def x(self): return self._x
+
+    class _Rect:
+        def __init__(self, lo, hi): self._lo = _Pt(lo); self._hi = _Pt(hi)
+        def topLeft(self): return self._lo
+        def bottomRight(self): return self._hi
+
+    class _Win:
+        def isVisible(self): return True
+        def mapFromScene(self, pt): return pt
+        def mapToGlobal(self, pt): return pt
+
+    class _CakeVB:
+        def __init__(self, rect, xr):
+            self._rect = rect; self._xr = list(xr); self.setx_calls = []
+        def sceneBoundingRect(self): return self._rect
+        def viewRange(self): return [list(self._xr), [0.0, 1.0]]
+        def enableAutoRange(self, **kw): pass
+        def setXRange(self, lo, hi, padding=0): self.setx_calls.append((lo, hi))
+
+    class _PlotVB:
+        def __init__(self, rect, xr): self._rect = rect; self._xr = list(xr)
+        def sceneBoundingRect(self): return self._rect
+        def viewRange(self): return [list(self._xr), [0.0, 1.0]]
+
+    cake_vb = _CakeVB(_Rect(886.0, 1149.0), cake_xrange)     # cx0,cx1 / cake range
+    cake_plot = SimpleNamespace(getViewBox=lambda: cake_vb)
+    plot_vb = _PlotVB(_Rect(473.0, 1217.0), plot_xrange)     # px0,px1 / 1D range
+    bottom_plot = SimpleNamespace(getViewBox=lambda: plot_vb)
+    host = SimpleNamespace(
+        _share_link_on=True,
+        binned_widget=SimpleNamespace(image_win=_Win(), image_plot=cake_plot),
+    )
+    host._active_bottom_window = lambda: _Win()
+    host._active_bottom_plot = lambda: bottom_plot
+    host._align_cake_under_plot = MethodType(
+        displayFrameWidget._align_cake_under_plot, host)
+    px0, px1, cx0, cx1 = 473.0, 1217.0, 886.0, 1149.0
+    pq0, pq1 = plot_xrange
+    scale = (pq1 - pq0) / (px1 - px0)
+    target = (pq0 + (cx0 - px0) * scale, pq0 + (cx1 - px0) * scale)
+    return host, cake_vb, target
+
+
+def test_inverse_align_sets_cake_xrange_from_plot():
+    # "2D follows 1D" (Vivek-requested): zooming the 1D drives the CAKE's x-range
+    # so the shared Q columns stay aligned -- the inverse of the forward align.
+    host, cake_vb, target = _inverse_align_host(plot_xrange=(0.0, 9.0))
+    host._align_cake_under_plot()
+    assert len(cake_vb.setx_calls) == 1
+    lo, hi = cake_vb.setx_calls[0]
+    assert abs(lo - target[0]) < 1e-6 and abs(hi - target[1]) < 1e-6
+    # the inverse marks the cake as pinned so un-sharing can re-arm its autorange
+    assert host._cake_x_pinned_by_share is True
+
+
+def test_inverse_align_skips_when_cake_already_aligned():
+    # Same convergence guard as the forward direction: no setXRange (so no
+    # relayout->reschedule cascade) once the cake already sits at the target.
+    _, _, target = _inverse_align_host(plot_xrange=(0.0, 9.0))
+    host, cake_vb, _ = _inverse_align_host(plot_xrange=(0.0, 9.0),
+                                           cake_xrange=target)
+    host._align_cake_under_plot()
+    assert cake_vb.setx_calls == []
+
+
+def test_plot_xrange_change_drives_cake_only_when_not_syncing(monkeypatch):
+    # The 1D's x-range change drives the cake (inverse) -- but NOT while the
+    # forward align is the one moving the 1D (``_share_axis_syncing``), else the
+    # two directions chase each other.
+    import xdart.gui.tabs.static_scan.display_frame_widget as dfw
+    calls = []
+    monkeypatch.setattr(dfw.displayFrameWidget, '_schedule_align_cake',
+                        lambda self: calls.append(1))
+    host = SimpleNamespace(_share_link_on=True, _share_axis_syncing=False)
+    dfw.displayFrameWidget._on_plot_xrange_changed(host)
+    assert calls == [1]
+    host._share_axis_syncing = True                  # forward align is driving
+    dfw.displayFrameWidget._on_plot_xrange_changed(host)
+    assert calls == [1]                              # guarded -> no bounce-back
+    host._share_axis_syncing = False
+    host._share_link_on = False
+    dfw.displayFrameWidget._on_plot_xrange_changed(host)
+    assert calls == [1]                              # not shared -> no schedule
+
+
+def test_geometry_change_schedules_realign_only_when_shared(monkeypatch):
+    # The regression: dragging an internal splitter (or a cake/plot resize) must
+    # re-align the shared axes even though it doesn't fire the top-level
+    # resizeEvent -- but only while Share Axis is on.
+    import xdart.gui.tabs.static_scan.display_frame_widget as dfw
+    calls = []
+    monkeypatch.setattr(dfw.displayFrameWidget, '_schedule_align',
+                        lambda self: calls.append(1))
+    host = SimpleNamespace(_share_link_on=True)
+    dfw.displayFrameWidget._on_share_geometry_changed(host)
+    assert calls == [1]
+    host._share_link_on = False
+    dfw.displayFrameWidget._on_share_geometry_changed(host)
+    assert calls == [1]                              # not shared -> no realign
+
+
+def test_reintegrate_live_processes_one_frame_at_a_time(monkeypatch):
+    """Live reintegrate runs SERIAL with a batch of 1 so each frame displays the
+    instant it is reduced (and Stop aborts within a frame); the default batch
+    path coalesces all frames into one multicore dispatch.  Drives the real
+    ``integratorThread._reintegrate_all`` over a duck scan, recording the batch
+    sizes handed to the (mocked) reducer."""
+    import threading
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+    import xdart.utils.h5pool as h5pool
+    # The end-of-run persist brackets with the h5 pool — stub it out.
+    monkeypatch.setattr(
+        h5pool, 'get_pool',
+        lambda: SimpleNamespace(pause=lambda *a, **k: None,
+                                resume=lambda *a, **k: None))
+
+    def run(nframes, live):
+        calls = []
+
+        class _Frames:
+            index = list(range(nframes))
+            def __getitem__(self, i): return SimpleNamespace(idx=i)
+            def __setitem__(self, i, v): pass
+
+        scan = SimpleNamespace(
+            max_cores=4, frames=_Frames(), scan_lock=threading.RLock(),
+            data_file='x.nxs', save_to_nexus=lambda **k: None)
+        host = SimpleNamespace(
+            data_lock=threading.RLock(), data_1d={}, data_2d={},
+            publication_store=None, scan=scan, stop_requested=False,
+            reintegrate_live=live,
+            update=SimpleNamespace(emit=lambda *a, **k: None),
+            _plan_for_reintegration=lambda integrate_2d: object(),
+            _reduce_reintegration_batch=(
+                lambda frames, plan, n_workers: (calls.append(len(frames)),
+                                                 frames)[1]),
+            _publish_reintegrated_display=lambda *a, **k: None,
+        )
+        host._reintegrate_all = MethodType(
+            integratorThread._reintegrate_all, host)
+        host._reintegrate_all(do_2d=False)
+        return calls
+
+    # Live: 5 frames -> 5 dispatches of one frame each (per-frame streaming).
+    assert run(5, live=True) == [1, 1, 1, 1, 1]
+    # Batch (default): 5 frames -> a single multicore dispatch (batch >> 5).
+    assert run(5, live=False) == [5]
+
+
+def test_reintegrate_skips_vanished_frame_without_crashing(monkeypatch):
+    """A frame disappearing mid-pass (a concurrent scan.frames rebuild — e.g. a
+    scan started during the reintegrate) is SKIPPED, not fatal — guards the
+    'Frame not found' KeyError that crashed the whole reintegrate loop."""
+    import threading
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+    import xdart.utils.h5pool as h5pool
+    monkeypatch.setattr(
+        h5pool, 'get_pool',
+        lambda: SimpleNamespace(pause=lambda *a, **k: None,
+                                resume=lambda *a, **k: None))
+    reduced = []
+
+    class _Frames:
+        index = [0, 1, 2, 3, 4]
+        def __getitem__(self, i):
+            if i == 2:                       # frame 2 vanished mid-pass
+                raise KeyError(f"Frame not found with {i} index")
+            return SimpleNamespace(idx=i)
+        def __setitem__(self, i, v): pass
+
+    scan = SimpleNamespace(
+        max_cores=1, frames=_Frames(), scan_lock=threading.RLock(),
+        data_file='x.nxs', save_to_nexus=lambda **k: None)
+    host = SimpleNamespace(
+        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        publication_store=None, scan=scan, stop_requested=False,
+        reintegrate_live=True,
+        update=SimpleNamespace(emit=lambda *a, **k: None),
+        _plan_for_reintegration=lambda integrate_2d: object(),
+        _reduce_reintegration_batch=(
+            lambda frames, plan, n_workers: (
+                reduced.extend(f.idx for f in frames), frames)[1]),
+        _publish_reintegrated_display=lambda *a, **k: None,
+    )
+    host._reintegrate_all = MethodType(integratorThread._reintegrate_all, host)
+    host._reintegrate_all(do_2d=False)        # must NOT raise
+    assert reduced == [0, 1, 3, 4]            # frame 2 skipped, rest processed
+
+
+def test_reintegrate_each_button_is_single_dimension():
+    """Each Reintegrate button recomputes ONLY its own dimension, regardless of
+    GI: Reintegrate 2D never touches the 1D (recomputing it overwrote the good
+    1D -> the high-Q spike, and forced a 1D-stack rewrite that crashed a partial
+    save); Reintegrate 1D never touches the 2D."""
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+    calls = []
+    host = SimpleNamespace(
+        scan=SimpleNamespace(gi=True),
+        threshold_config=None,
+        _plan_cache=SimpleNamespace(
+            get=lambda scan, integrate_1d=True, integrate_2d=True: (
+                calls.append((integrate_1d, integrate_2d)), object())[1]),
+    )
+    host._plan_for_reintegration = MethodType(
+        integratorThread._plan_for_reintegration, host)
+
+    for gi in (True, False):                            # GI must not matter
+        host.scan.gi = gi
+        host._plan_for_reintegration(integrate_2d=True)   # Reintegrate 2D
+        assert calls[-1] == (False, True)                 # 2D only
+        host._plan_for_reintegration(integrate_2d=False)  # Reintegrate 1D
+        assert calls[-1] == (True, False)                 # 1D only
+
+
 def test_share_axis_targets_waterfall_plot_when_waterfall_is_active():
     host = _share_axis_host()
     host.plotMethod = "Waterfall"

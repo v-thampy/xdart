@@ -179,6 +179,78 @@ def apply_threshold_saturation_to_plan(plan, cfg):
                    mask_saturation=msat)
 
 
+def bad_pixel_counts(raw_image) -> dict[str, int]:
+    """Diagnostics for one raw detector frame: how many pixels are unambiguous
+    invalids (negatives + the uint32 dead/hot sentinel) and how many sit at the
+    fraction-guarded detector-saturation ceiling.  Pure counting, never raises —
+    for ``[REINT-MASK]`` logging so a reintegrate can SHOW what it rejected."""
+    from xrd_tools.core.invalid import (
+        UINT32_CEILING, integer_saturation_ceiling, saturation_pixels,
+    )
+    out = {"size": 0, "negative": 0, "uint32_dummy": 0, "saturation": 0}
+    try:
+        arr0 = np.asarray(raw_image)
+        flat = arr0.astype(float).flatten()
+    except (TypeError, ValueError):
+        return out
+    if flat.size == 0:
+        return out
+    out["size"] = int(flat.size)
+    out["negative"] = int((flat < 0).sum())
+    out["uint32_dummy"] = int((flat >= UINT32_CEILING).sum())
+    out["saturation"] = int(
+        saturation_pixels(flat, ceiling=integer_saturation_ceiling(arr0)).sum())
+    return out
+
+
+_CEILING_AUTO = object()
+
+
+def compute_bad_pixel_mask(raw_image, *, mask_saturation: bool = True,
+                           saturation_ceiling=_CEILING_AUTO):
+    """Flat-index "bad pixel" mask for one raw detector frame — the SINGLE
+    implementation shared by the live wrangler (``_resolve_frame_mask``) and the
+    reintegrate path, so a reintegrate masks exactly what a fresh integrate did.
+
+    Always masks the UNAMBIGUOUS invalids — negatives and the uint32 dead/hot
+    sentinel (:data:`~xrd_tools.core.invalid.UINT32_CEILING` = 4294967295, e.g.
+    Eiger masters) — which are never real photon counts.  Unmasked, the uint32
+    dummies (often whole dead modules) dominate every radial bin they fall in:
+    that is the high-Q spike a reintegrate showed but a fresh integrate did not
+    (the reintegrate frame, lazy-loaded from the ``.nxs``, carried ``mask=None``
+    because the per-frame bad-pixel mask is not persisted, while the live
+    ``LiveFrame`` carried ``_resolve_frame_mask``).
+
+    When ``mask_saturation`` is set, also OR in the fraction-guarded
+    detector-saturation ceiling (:func:`xrd_tools.core.invalid.saturation_pixels`
+    — uint16 65535 etc., only when a whole module sits there).
+    ``saturation_ceiling`` selects the ceiling policy: the default derives it
+    from the integer dtype (``None`` for a float frame — core never hardcodes
+    65535).  GUI callers pass the display policy's ceiling (its legacy 65535
+    float fallback) so live and reintegrate agree on a float-typed raw too — the
+    equivalence-spine-safe single policy.
+
+    Returns a flat ``int`` index array (the pyFAI / :class:`MaskSpec` format),
+    or ``None`` when nothing is bad or the input is unusable (never raises)."""
+    from xrd_tools.core.invalid import (
+        UINT32_CEILING, integer_saturation_ceiling, saturation_pixels,
+    )
+    try:
+        arr0 = np.asarray(raw_image)
+        flat = arr0.astype(float).flatten()
+    except (TypeError, ValueError):
+        return None
+    if flat.size == 0:
+        return None
+    bad = (flat < 0) | (flat >= UINT32_CEILING)
+    if mask_saturation:
+        ceil = (integer_saturation_ceiling(arr0)
+                if saturation_ceiling is _CEILING_AUTO else saturation_ceiling)
+        bad = bad | saturation_pixels(flat, ceiling=ceil)
+    idx = np.flatnonzero(bad)
+    return idx if idx.size else None
+
+
 def plan_from_live_scan(
     live_scan: Any,
     *,
@@ -225,6 +297,20 @@ def plan_from_live_scan(
     _pop_first(args_2d, ("normalization_factor",), None)
 
     is_gi = bool(getattr(live_scan, "gi", False))
+    # Reintegrate-on-reload: a .nxs-reloaded scan carries its GI geometry only in
+    # ``scan.gi_config`` — a live run sets the direct attrs via
+    # ``sync_live_scan_gi_settings``, but a reload restores only the dict.  Fall
+    # back to it so reintegrate uses the SAME sample_orientation / tilt as live;
+    # otherwise sample_orientation silently defaults to 1 and the GI out-of-plane
+    # (Q_oop) axis flips sign vs the live run.
+    _gi_cfg = dict(getattr(live_scan, "gi_config", {}) or {})
+
+    def _gi_geom(attr, default):
+        v = getattr(live_scan, attr, None)
+        if v is None:
+            v = _gi_cfg.get(attr)
+        return default if v is None else v
+
     gi_mode_1d = _pop_first(args_1d, ("gi_mode_1d",), "q_total")
     gi_mode_2d = _pop_first(args_2d, ("gi_mode_2d",), "qip_qoop")
     npt_oop = _pop_first(args_1d, ("npt_oop",), None)
@@ -251,20 +337,34 @@ def plan_from_live_scan(
             "Cannot build a GI ReductionPlan without gi_incident_angle or incidence_motor."
         )
 
+    # The flat ``global_mask`` indexes the FULL-RES detector, so PREFER the
+    # detector shape (persisted + restored for exactly this).  ``frames[0]
+    # .map_raw.shape`` is only sound for a LIVE/full-res frame — on a reloaded
+    # scan it can be a THUMBNAIL, whose smaller shape made the full-res flat
+    # indices fall out of bounds so ``_mask_for_plan`` silently DROPPED the mask
+    # and reintegrate ran UNMASKED.  detector_shape (present on reload) avoids
+    # that; the frame-shape fallback still covers live + older files that lack it.
     mask_shape = None
-    try:
-        first_idx = live_scan.frames.index[0]
-        first_img = getattr(live_scan.frames[int(first_idx)], "map_raw", None)
-        mask_shape = getattr(first_img, "shape", None)
-    except Exception:
-        mask_shape = None
+    _det_shape = getattr(live_scan, "detector_shape", None)
+    if _det_shape is not None:
+        try:
+            mask_shape = (int(_det_shape[0]), int(_det_shape[1]))
+        except (TypeError, ValueError, IndexError):
+            mask_shape = None
+    if mask_shape is None:
+        try:
+            first_idx = live_scan.frames.index[0]
+            first_img = getattr(live_scan.frames[int(first_idx)], "map_raw", None)
+            mask_shape = getattr(first_img, "shape", None)
+        except Exception:
+            mask_shape = None
 
     gi_mode = (
         GIMode(
             incident_angle=(float(gi_incident_angle) if gi_incident_angle is not None else None),
             incidence_motor=str(incidence_motor) if incidence_motor else None,
-            tilt_angle=float(getattr(live_scan, "tilt_angle", 0.0) or 0.0),
-            sample_orientation=int(getattr(live_scan, "sample_orientation", 1) or 1),
+            tilt_angle=float(_gi_geom("tilt_angle", 0.0) or 0.0),
+            sample_orientation=int(_gi_geom("sample_orientation", 1) or 1),
             method=str(gi_method),
             mode_1d=str(gi_mode_1d),
             mode_2d=str(gi_mode_2d),
@@ -274,6 +374,19 @@ def plan_from_live_scan(
     )
     unit_1d = _gi_1d_unit_default(unit_1d, str(gi_mode_1d), is_gi=is_gi)
     unit_2d = _gi_2d_unit_default(unit_2d, str(gi_mode_2d), is_gi=is_gi)
+
+    if is_gi and gi_mode is not None:
+        # Diagnostic for the GI-1D live-vs-reintegrate divergence hunt: log the
+        # GI geometry + 1D range/npt this plan was built with, so a live run vs a
+        # reintegrate can be diffed from the log.
+        logger.info(
+            "[GI-PLAN] incident_angle=%s incidence_motor=%s sample_orientation=%s "
+            "tilt=%s gi_mode_1d=%s gi_method=%s npt_1d=%s npt_oop=%s "
+            "radial_range_1d=%s azimuth_range_1d=%s unit_1d=%s",
+            gi_mode.incident_angle, gi_mode.incidence_motor,
+            gi_mode.sample_orientation, gi_mode.tilt_angle, gi_mode_1d,
+            gi_method, npt_1d, npt_oop, radial_range, azimuth_range_1d, unit_1d,
+        )
 
     return ReductionPlan(
         integration_1d=(
@@ -335,8 +448,14 @@ def reduce_live_frame(
     )
     result = run_reduction(plan, scan)
     reduction = result.frames[int(live_frame.idx)]
-    live_frame.int_1d = reduction.result_1d
-    live_frame.int_2d = reduction.result_2d
+    # Only overwrite the dimension the plan actually computed.  A 1D-only or
+    # 2D-only plan (e.g. a GI 2D reintegrate, which sets integrate_1d=False so it
+    # doesn't recompute a wrong full-range 1D) must PRESERVE the other dimension's
+    # existing result instead of nulling/clobbering it with an absent result.
+    if plan.integration_1d is not None:
+        live_frame.int_1d = reduction.result_1d
+    if plan.integration_2d is not None:
+        live_frame.int_2d = reduction.result_2d
     live_frame.map_norm = _frame_norm(frame, plan)
     return live_frame
 
@@ -393,8 +512,13 @@ def reduce_live_frames(
         reduction = result_frames.get(int(headless_frame.index))
         if reduction is None:
             continue
-        live_frame.int_1d = reduction.result_1d
-        live_frame.int_2d = reduction.result_2d
+        # Only overwrite the dimension the plan computed (see reduce_live_frame):
+        # a 2D-only GI reintegrate preserves the existing clean int_1d instead of
+        # clobbering it with an absent/wrong 1D result.
+        if active_plan.integration_1d is not None:
+            live_frame.int_1d = reduction.result_1d
+        if active_plan.integration_2d is not None:
+            live_frame.int_2d = reduction.result_2d
         live_frame.map_norm = _frame_norm(headless_frame, active_plan)
         reduced_frames.append(live_frame)
     if session is not None:

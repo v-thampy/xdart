@@ -401,6 +401,70 @@ def test_plan_from_gi_scan_maps_manual_numeric_incidence() -> None:
     assert plan.integration_2d.unit == "qip_A^-1"
 
 
+def test_plan_from_reloaded_gi_scan_recovers_orientation_from_gi_config() -> None:
+    """Reintegrate-on-reload regression: a ``.nxs``-reloaded scan carries its GI
+    geometry only in ``scan.gi_config`` (the live run sets direct
+    ``sample_orientation`` / ``tilt_angle`` attrs via sync_live_scan_gi_settings;
+    a reload restores only the dict).  ``plan_from_live_scan`` must recover them
+    from ``gi_config`` — otherwise sample_orientation silently defaults to 1 and
+    the GI out-of-plane (Q_oop) axis flips sign vs the live run.
+    """
+    class _Frames:
+        index = [0]
+
+    scan = SimpleNamespace(
+        gi=True,
+        skip_2d=False,
+        bai_1d_args={"gi_mode_1d": "q_total"},
+        bai_2d_args={"gi_mode_2d": "qip_qoop"},
+        # No direct sample_orientation / tilt_angle attrs — only gi_config,
+        # exactly as a reloaded scan presents them.
+        gi_config={"sample_orientation": 4, "tilt_angle": 1.5},
+        incidence_motor="3.0",
+        global_mask=None,
+        frames=_Frames(),
+    )
+    assert not hasattr(scan, "sample_orientation")
+
+    plan = plan_from_live_scan(scan)
+
+    assert plan.gi is not None
+    assert plan.gi.sample_orientation == 4
+    assert plan.gi.tilt_angle == 1.5
+
+
+def test_plan_uses_detector_shape_for_flat_mask_on_reload() -> None:
+    """Reintegrate-on-reload regression: the flat ``global_mask`` indexes the
+    FULL-RES detector, so the plan must build the mask against
+    ``scan.detector_shape`` — NOT ``frames[0].map_raw.shape``, which on a
+    reloaded scan can be a THUMBNAIL (the full-res flat indices then fall out of
+    bounds and the mask is silently dropped, so reintegrate runs UNMASKED).
+    """
+    class _Frames:
+        index = [0]
+
+        def __getitem__(self, i):
+            return SimpleNamespace(map_raw=np.ones((4, 4)))  # reloaded thumbnail
+
+    scan = SimpleNamespace(
+        gi=False,
+        skip_2d=False,
+        bai_1d_args={},
+        bai_2d_args={},
+        # Masks pixel 63 — valid in the 8x8 detector, out of bounds in the 4x4
+        # thumbnail (which is what the buggy frame-shape path used).
+        global_mask=np.array([63], dtype=np.int64),
+        detector_shape=(8, 8),
+        frames=_Frames(),
+    )
+
+    mask = plan_from_live_scan(scan).mask
+
+    assert mask is not None                       # not dropped
+    assert np.asarray(mask).shape == (8, 8)       # baked at detector shape
+    assert bool(np.asarray(mask)[7, 7])           # the masked pixel survives
+
+
 def test_standard_plan_cache_returns_headless_plan_for_gi_scan() -> None:
     from xdart.modules.reduction import StandardPlanCache
 
@@ -466,6 +530,29 @@ def test_reduce_live_frame_populates_existing_frame(monkeypatch) -> None:
     assert frame.int_1d is not None
     assert frame.int_2d is not None
     assert frame.map_norm == 33.0
+
+
+def test_reduce_live_frame_preserves_int_1d_when_plan_skips_1d(monkeypatch) -> None:
+    """A 2D-only plan (a GI 2D reintegrate sets integrate_1d=False) must PRESERVE
+    the frame's existing int_1d instead of clobbering it with the run's absent/
+    wrong 1D — otherwise the live display shows a corrupted (spike) 1D."""
+    frame = LiveFrame(idx=7, map_raw=np.arange(4).reshape(2, 2), poni=_poni(),
+                      scan_info={"I0": 1.0}, mask=np.array([0]))
+    sentinel_1d = object()
+    frame.int_1d = sentinel_1d                       # pre-existing clean 1D
+    plan = ReductionPlan(integration_1d=None,        # 2D-only
+                         integration_2d=Integration2DPlan())
+
+    monkeypatch.setattr(
+        reduction_adapters, "run_reduction",
+        lambda plan_arg, scan_arg: ReductionResult(
+            scan_name="scan",
+            frames={7: FrameReduction(7, result_1d=_r1d(), result_2d=_r2d())},
+            n_processed=1))
+
+    reduce_live_frame(frame, plan, scan_name="scan", integrator="ai")
+    assert frame.int_1d is sentinel_1d               # preserved, NOT overwritten
+    assert frame.int_2d is not None                  # 2D refreshed
 
 
 def test_reduce_live_frames_uses_one_headless_batch(monkeypatch) -> None:
@@ -745,7 +832,13 @@ def test_single_frame_reintegration_uses_headless_reduction(monkeypatch) -> None
     np.testing.assert_allclose(pub.view.intensity_1d, frame.int_1d.intensity)
 
 
-def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
+def test_single_frame_2d_reintegration_is_2d_only(monkeypatch) -> None:
+    # A 2D reintegrate (even the single-frame path) must compute ONLY the 2D and
+    # leave the existing 1D untouched.  Recomputing the 1D here ran an
+    # independent full-range/unmasked 1D pass that overwrote the good int_1d
+    # (the flat-line + high-Q spike) and forced a 1D-stack rewrite that crashed a
+    # partial save on Stop.  The fake reduce respects the plan so the assertion
+    # actually exercises the preservation, not the fake.
     from xdart.gui.tabs.static_scan import scan_threads
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
     from xdart.modules.frame_publication import PublicationStore
@@ -755,13 +848,18 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
     def fake_reduce_frames(frames, plan, **kwargs):
         calls.append(plan)
         for frame in frames:
-            frame.int_1d = _r1d()
-            frame.int_2d = _r2d()
+            if plan.integration_1d is not None:
+                frame.int_1d = _r1d()
+            if plan.integration_2d is not None:
+                frame.int_2d = _r2d()
         return list(frames)
 
     monkeypatch.setattr(scan_threads, "reduce_live_frames", fake_reduce_frames)
 
+    # Seed the frame with the "good" 1D from a prior fresh integrate.
+    good_1d = _r1d()
     frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    frame.int_1d = good_1d
     scan = LiveScan("scan", frames=[frame])
     scan._cached_integrator = _FakeIntegrator()
     data_1d = {}
@@ -781,16 +879,161 @@ def test_single_frame_2d_reintegration_refreshes_1d(monkeypatch) -> None:
     thread.bai_2d_SI()
 
     assert calls
-    assert calls[0].integration_1d is not None
+    # 2D-only plan: the 1D pass must NOT be requested.
+    assert calls[0].integration_1d is None
     assert calls[0].integration_2d is not None
-    assert frame.int_1d is not None
+    # The pre-existing good 1D survives untouched; the 2D is fresh.
+    assert frame.int_1d is good_1d
     assert frame.int_2d is not None
     assert data_1d == {}
     assert data_2d == {}
     pub = store.get(0)
     assert pub is not None
-    np.testing.assert_allclose(pub.view.intensity_1d, frame.int_1d.intensity)
     np.testing.assert_allclose(pub.view.intensity_2d, frame.int_2d.intensity.T)
+
+
+def test_compute_bad_pixel_mask_flags_uint32_dummy_and_negatives() -> None:
+    """The shared bad-pixel mask ALWAYS cuts the uint32 dead/hot sentinel
+    (4294967295, Eiger masters) + negatives, regardless of the Mask-Saturated
+    opt-in -- they are never real photon counts.  Unmasked, the uint32 dummies
+    (whole dead modules) dominate every radial bin -> the reintegrate high-Q
+    spike that a fresh integrate did not show."""
+    from xdart.modules.reduction import compute_bad_pixel_mask
+
+    raw = np.ones((4, 4), dtype=np.uint32)
+    raw[0, 0] = 4294967295
+    raw[1, 1] = 4294967295
+    m = compute_bad_pixel_mask(raw, mask_saturation=False)
+    assert m is not None
+    assert set(m.tolist()) == {0, 5}        # (0,0) and (1,1) row-major
+    # all-good frame -> None (nothing to mask)
+    assert compute_bad_pixel_mask(
+        np.ones((4, 4), dtype=np.uint32), mask_saturation=False) is None
+    # negatives (signed/float source) are cut too
+    sraw = np.zeros((2, 2), dtype=np.int32)
+    sraw[0, 1] = -5
+    assert set(
+        compute_bad_pixel_mask(sraw, mask_saturation=False).tolist()) == {1}
+
+
+def test_compute_bad_pixel_mask_saturation_is_opt_in() -> None:
+    """The fraction-guarded uint16 65535 ceiling is cut ONLY when
+    mask_saturation is on AND a whole module sits there (>1e-4 fraction)."""
+    from xdart.modules.reduction import compute_bad_pixel_mask
+
+    raw = np.zeros((100, 100), dtype=np.uint16)
+    raw[:, :50] = 65535                      # half the frame at the ceiling
+    assert compute_bad_pixel_mask(raw, mask_saturation=False) is None
+    on = compute_bad_pixel_mask(raw, mask_saturation=True)
+    assert on is not None and on.size == 5000
+
+
+def test_compute_bad_pixel_mask_float_ceiling_matches_display_policy() -> None:
+    """Equivalence-spine guard (the reviews' blocker): on a FLOAT raw with a
+    saturated block, live's _resolve_frame_mask uses display_logic's 65535 float
+    fallback and masks it.  With core's 'auto' ceiling (None for float) the
+    reintegrate path would NOT -> live≠reintegrate.  Both paths now pass the
+    display ceiling, so they agree on float frames too."""
+    from xdart.modules.reduction import compute_bad_pixel_mask
+    from xdart.gui.tabs.static_scan.display_logic import (
+        integer_saturation_ceiling)
+
+    raw = np.zeros((100, 100), dtype=np.float32)
+    raw[:, :50] = 65535.0                     # saturated block, but FLOAT dtype
+    # core 'auto' ceiling -> None for float -> saturation NOT masked
+    assert compute_bad_pixel_mask(raw, mask_saturation=True) is None
+    # display ceiling (65535 float fallback) -> masked, matching the live path
+    ceil = integer_saturation_ceiling(raw)
+    on = compute_bad_pixel_mask(
+        raw, mask_saturation=True, saturation_ceiling=ceil)
+    assert on is not None and on.size == 5000
+
+
+def test_bad_pixel_counts_reports_dummy_not_saturation_for_uint32() -> None:
+    from xdart.modules.reduction import bad_pixel_counts
+
+    raw = np.ones((10, 10), dtype=np.uint32)
+    raw[0, 0] = 4294967295
+    c = bad_pixel_counts(raw)
+    assert c["size"] == 100
+    assert c["uint32_dummy"] == 1
+    assert c["negative"] == 0
+    assert c["saturation"] == 0     # uint32 ceiling is excluded from saturation
+
+
+def test_reintegrate_prep_stamps_uint32_bad_pixel_mask() -> None:
+    """A frame lazy-loaded from the .nxs for reintegration carries mask=None
+    (the per-frame bad-pixel mask is not persisted).
+    _prepare_frame_for_headless_reduction must stamp it back on so the reduce
+    excludes the uint32 dummies -- exactly what the live wrangler's
+    _resolve_frame_mask does on the (clean) fresh path.  Regression: without it
+    the dummies spiked the reintegrated 1D."""
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+
+    raw = np.ones((4, 4), dtype=np.uint32)
+    raw[0, 0] = 4294967295
+    frame = LiveFrame(idx=0, map_raw=raw, poni=_poni())
+    frame.mask = None
+    scan = LiveScan("scan", frames=[frame])
+    scan.static = False
+    scan.gi = False
+    thread = integratorThread(scan, None, None, None, [0], {}, {})
+    out = thread._prepare_frame_for_headless_reduction(frame)
+    assert out.mask is not None
+    assert set(np.asarray(out.mask).tolist()) == {0}    # the dummy at (0,0)
+
+
+def test_plan_changes_output_shape_reads_intensity_array() -> None:
+    """The partial-savable pre-check reads the stored IntegrationResult's
+    .intensity shape.  Regression: np.shape(IntegrationResult1D) is () so a
+    [-1] index raised IndexError, the check was swallowed, partial_savable
+    stayed True, and the Stop "discard?" popup never showed on a shape-changing
+    1D reintegrate (and an unchanged-npt 2D was mis-flagged unsavable)."""
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+
+    changed = integratorThread._plan_changes_output_shape
+    f0 = SimpleNamespace(int_1d=_r1d(), int_2d=_r2d())   # 1D npt=2, 2D (2,2)
+    # 1D: unchanged npt -> no shape change; changed npt -> shape change
+    assert changed(SimpleNamespace(npt=2), None, f0) is False
+    assert changed(SimpleNamespace(npt=2000), None, f0) is True
+    # 2D: unchanged dims -> no change (old set(()) bug wrongly said True);
+    #     changed dims -> change
+    assert changed(None, SimpleNamespace(npt_rad=2, npt_azim=2), f0) is False
+    assert changed(None, SimpleNamespace(npt_rad=500, npt_azim=500), f0) is True
+
+
+def test_maybe_flag_unsavable_detects_axis_change_at_same_npt() -> None:
+    """A reintegrate that keeps npt but changes the radial axis (e.g. a
+    different range / GI mode) still can't partial-save -- the writer rejects a
+    changed axis at the same npt, which the npt-only pre-check can't predict.
+    _maybe_flag_unsavable catches it after the first frame so the Stop "discard?"
+    popup shows.  (The user's npt=2000 1D run that failed to persist yet showed
+    no popup.)"""
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+
+    scan = LiveScan(
+        "scan", frames=[LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())])
+    thread = integratorThread(scan, None, None, None, [0], {}, {})
+
+    def _frame_with_axis(lo, hi):
+        f = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+        f.int_1d = IntegrationResult1D(
+            radial=np.linspace(lo, hi, 100), intensity=np.ones(100),
+            sigma=None, unit="q_A^-1")
+        return f
+
+    thread._reint_stored_sig = integratorThread._frame_output_signature(
+        _frame_with_axis(0.0, 5.0))
+
+    # same npt (100) but a DIFFERENT extent -> not savable
+    thread.reintegrate_partial_savable = True
+    thread._maybe_flag_unsavable(_frame_with_axis(0.0, 8.0), False, "1D")
+    assert thread.reintegrate_partial_savable is False
+
+    # identical axis -> stays savable (a same-settings re-run can persist)
+    thread.reintegrate_partial_savable = True
+    thread._maybe_flag_unsavable(_frame_with_axis(0.0, 5.0), False, "1D")
+    assert thread.reintegrate_partial_savable is True
 
 
 def test_reintegrate_all_refreshes_publication_store(monkeypatch) -> None:

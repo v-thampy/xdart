@@ -18,6 +18,8 @@ from xdart.modules.reduction import (
     StandardPlanCache,
     reduce_live_frames,
     apply_threshold_saturation_to_plan,
+    compute_bad_pixel_mask,
+    bad_pixel_counts,
 )
 
 # Qt imports
@@ -92,9 +94,22 @@ class integratorThread(Qt.QtCore.QThread):
         self._reduction_session = None
         self._reduction_session_key = None
         # Cooperative stop for the (potentially minutes-long) batched
-        # reintegrate loop; set by staticWidget.close().  Checked between
-        # batches only -- a batch in flight finishes.
+        # reintegrate loop; set by staticWidget.close() AND by the user Stop
+        # button during a reintegrate.  Checked between batches -- a batch in
+        # flight finishes (in live mode a batch is one frame, so Stop is
+        # effectively per-frame).
         self.stop_requested = False
+        # Live (per-frame) reintegrate: when True, _reintegrate_all runs serial
+        # with a batch of 1 so each frame displays the instant it's reduced and
+        # Stop aborts within one frame -- the interactive "watch + retune" path.
+        # When False (default) it uses the fast batched-multicore path.  Set by
+        # the GUI (bai_1d/bai_2d) from the integrator's Live toggle before start.
+        self.reintegrate_live = False
+        # Set False once a reintegrate is found to CHANGE the output shape
+        # (npt/unit/axis), meaning a stopped partial save would be rejected by
+        # the writer (mixed old+new rows).  The GUI Stop handler reads this to
+        # WARN before discarding (vs silently losing the in-progress work).
+        self.reintegrate_partial_savable = True
         # Per-frame pixel-rejection policy (Intensity Threshold + Mask
         # Saturated) snapshot onto the thread by the GUI (bai_1d/bai_2d) right
         # before a reintegrate starts, read fresh from the wrangler so the
@@ -111,8 +126,89 @@ class integratorThread(Qt.QtCore.QThread):
         changes -> a fresh session; identity preserved when it doesn't ->
         session reuse).
         """
-        plan = self._plan_cache.get(self.scan, integrate_2d=integrate_2d)
+        # Each Reintegrate button recomputes ONLY its own dimension: Reintegrate
+        # 2D does 2D-only, Reintegrate 1D does 1D-only.  Previously a 2D
+        # reintegrate ALSO recomputed the 1D ("refresh the cached 1D entry"),
+        # which (a) overwrote the good 1D with a wrong full-range/unmasked one
+        # (the high-Q spike), and (b) forced a 1D-stack rewrite that the writer
+        # rejects on a partial/stopped save (the _prepare_integrated_1d crash).
+        # A 2D reintegrate has no business changing the 1D — leave it untouched;
+        # the user clicks Reintegrate 1D to redo the 1D.
+        integrate_1d = not integrate_2d
+        plan = self._plan_cache.get(
+            self.scan, integrate_1d=integrate_1d, integrate_2d=integrate_2d)
         return apply_threshold_saturation_to_plan(plan, self.threshold_config)
+
+    @staticmethod
+    def _plan_changes_output_shape(p1, p2, f0) -> bool:
+        """True when reintegrating with this plan would CHANGE the stored output
+        row shape (npt / 2D dims) vs the first stored frame -- in which case a
+        partial (stopped) save is illegal (the writer forbids mixing fresh rows
+        with stale ones) and the GUI must warn before discarding.
+
+        Reads the stored result's ``.intensity`` array shape: ``int_1d`` /
+        ``int_2d`` are ``IntegrationResult{1,2}D`` dataclasses, so ``np.shape``
+        on the dataclass itself is ``()`` -- a ``[-1]`` index then raised
+        ``IndexError``, the pre-check swallowed it, ``partial_savable`` stayed
+        True, and the Stop "discard?" popup never showed on a shape-changing 1D
+        reintegrate (the 2D ``set(())`` comparison only "worked" by accident and
+        would even mis-flag an unchanged-npt 2D as unsavable)."""
+        i1 = getattr(f0, "int_1d", None)
+        s1 = np.shape(getattr(i1, "intensity", i1)) if i1 is not None else ()
+        if p1 is not None and s1 and getattr(p1, "npt", None):
+            if int(p1.npt) != int(s1[-1]):
+                return True
+        i2 = getattr(f0, "int_2d", None)
+        s2 = set(np.shape(getattr(i2, "intensity", i2))) if i2 is not None else set()
+        if p2 is not None and s2:
+            plan_dims = {d for d in (getattr(p2, "npt_rad", None),
+                                     getattr(p2, "npt_azim", None))
+                         if d is not None}
+            if plan_dims and s2 != plan_dims:
+                return True
+        return False
+
+    @staticmethod
+    def _frame_output_signature(frame):
+        """(sig_1d, sig_2d) for a frame's stored/reduced result, where each sig
+        is the writer-relevant fingerprint — unit, point count(s) and axis
+        extents.  Two passes whose signatures differ cannot be mixed in one
+        stack, so a partial (stopped) save of the changed pass is illegal.  A
+        dim with no result is None."""
+        def _ends(a):
+            a = np.asarray(a)
+            if a.size == 0:
+                return (0, None, None)
+            return (int(a.size), round(float(a[0]), 6), round(float(a[-1]), 6))
+        i1 = getattr(frame, "int_1d", None)
+        sig1 = None if i1 is None else (
+            getattr(i1, "unit", None), _ends(getattr(i1, "radial", [])))
+        i2 = getattr(frame, "int_2d", None)
+        sig2 = None if i2 is None else (
+            getattr(i2, "unit", None),
+            _ends(getattr(i2, "radial", [])),
+            _ends(getattr(i2, "azimuthal", [])))
+        return (sig1, sig2)
+
+    def _maybe_flag_unsavable(self, reduced_frame, do_2d: bool, label: str) -> None:
+        """Once-per-pass: flip ``reintegrate_partial_savable`` to False when the
+        freshly reduced output signature differs from the stored one (axis /
+        unit / shape).  This is the authoritative check the npt-only pre-check
+        can't make — it runs after the first frame is reduced, well before the
+        user can Stop, so the discard popup stays reliable."""
+        self._reint_sig_checked = True
+        try:
+            old1, old2 = getattr(self, "_reint_stored_sig", (None, None))
+            new1, new2 = self._frame_output_signature(reduced_frame)
+            old, new = (old2, new2) if do_2d else (old1, new1)
+            if old is not None and new is not None and old != new:
+                self.reintegrate_partial_savable = False
+                logger.info(
+                    "[REINT] %s partial-savable=False (axis/unit/shape changed "
+                    "vs stored: %s -> %s)", label, old, new)
+        except Exception:
+            logger.debug("[REINT] post-reduce savability check failed",
+                         exc_info=True)
 
     def run(self):
         """Calls self.method. Catches exception where method does
@@ -207,6 +303,48 @@ class integratorThread(Qt.QtCore.QThread):
             frame.gi = True
         if getattr(self.scan, "_cached_integrator", None) is not None:
             frame.integrator = self.scan._cached_integrator
+        # Stamp the bad-pixel mask the live wrangler puts on every LiveFrame
+        # (negatives + the uint32 dead/hot dummy, e.g. Eiger masters, + the
+        # opt-in detector-saturation ceiling).  A frame lazy-loaded from the
+        # .nxs for reintegration carries mask=None — that per-frame mask is not
+        # persisted — so without this the unmasked uint32 dummies (whole dead
+        # modules at 4.29e9 counts) dominate every radial bin and produce the
+        # high-Q spike a reintegrate showed but a fresh integrate did not.  Uses
+        # the SAME compute_bad_pixel_mask + DISPLAY ceiling as _resolve_frame_mask
+        # so live ≡ reintegrate on the same frame (incl. a float-typed raw).
+        # Recomputed every pass (not cached on the frame) so a Mask-Saturated
+        # toggle change between Reintegrate clicks is honoured.
+        raw = getattr(frame, "map_raw", None)
+        if raw is None:
+            # The reduce needs the raw anyway; _lazy_load_raw is idempotent and
+            # never raises.
+            loader = getattr(frame, "_lazy_load_raw", None)
+            if callable(loader):
+                try:
+                    loader()
+                except Exception:
+                    logger.debug("reintegrate prep: raw load failed for frame "
+                                 "%s", getattr(frame, "idx", "?"), exc_info=True)
+            raw = getattr(frame, "map_raw", None)
+        if raw is not None:
+            from .display_logic import integer_saturation_ceiling
+            arr0 = np.asarray(raw)
+            cfg = getattr(self, "threshold_config", None)
+            mask_sat = bool(getattr(cfg, "mask_saturation", True)) if cfg is not None else True
+            bad = compute_bad_pixel_mask(
+                arr0, mask_saturation=mask_sat,
+                saturation_ceiling=integer_saturation_ceiling(arr0))
+            frame.mask = bad
+            # [REINT-MASK] once-per-pass: show what the reintegrate is rejecting
+            # (the user's ask: how many points are saturated before/after).
+            if not getattr(self, "_reint_mask_logged", True):
+                c = bad_pixel_counts(arr0)
+                logger.info(
+                    "[REINT-MASK] raw dtype=%s size=%s | uint32_dummy=%s "
+                    "negative=%s sat_ceiling(opt-in)=%s -> masked(bad-pixel)=%s",
+                    arr0.dtype, c["size"], c["uint32_dummy"], c["negative"],
+                    c["saturation"], 0 if bad is None else int(np.size(bad)))
+                self._reint_mask_logged = True
         return frame
 
     def _reduce_reintegration_batch(self, frames, plan, *, n_workers: int = 1):
@@ -330,6 +468,12 @@ class integratorThread(Qt.QtCore.QThread):
           integrator copies — xdart only publishes results.
         * Stop is honoured between batches.
         """
+        # Fresh run starts un-stopped (a prior user Stop must not carry over).
+        self.stop_requested = False
+        # [REINT-MASK] diagnostics are logged once per pass, on the first frame
+        # whose raw is in hand (see _prepare_frame_for_headless_reduction).
+        self._reint_mask_logged = False
+        live = bool(getattr(self, 'reintegrate_live', False))
         with self.data_lock:
             if do_2d:
                 self.data_2d.clear()
@@ -376,36 +520,98 @@ class integratorThread(Qt.QtCore.QThread):
                     include_2d=False,
                     refresh_1d=True,
                 )
-            # Refresh the GUI per published frame (→ integrator_thread_update),
-            # so reintegration shows progress instead of jumping straight from
-            # "before" to the final result.  The success path previously emitted
-            # nothing — only the frame-by-frame retry path did — so the display
-            # stayed frozen until integrator_thread_finished.  Frames publish in
-            # batches (the reduce is atomic per batch), so updates land per batch;
-            # the display reads the in-memory publication store, not the .nxs (the
-            # persist save runs once at the end), so there's no half-written read.
-            self.update.emit(getattr(frame, "idx", -1))
+            # NB: _publish_reintegrated_display already emits ``update`` for this
+            # frame (→ integrator_thread_update), so reintegration shows progress
+            # per published frame.  Do NOT emit a second time here — that doubled
+            # the cross-thread update pressure (the coalescer hid it, but it was
+            # avoidable churn on slow machines).  The display reads the in-memory
+            # publication store, not the .nxs (the persist save runs once at the
+            # end), so there's no half-written read.
 
         label = '2D' if do_2d else '1D'
-        n_workers = max(1, min(max_cores, len(indices)))
+        # Live = serial, one frame at a time so each frame DISPLAYS the instant
+        # it is reduced (per-frame ``update.emit`` below) and Stop aborts within
+        # a single frame -- the interactive "watch + retune" path.  Batch (the
+        # default) keeps the fast multicore dispatch.
+        n_workers = 1 if live else max(1, min(max_cores, len(indices)))
         standard_plan = self._plan_for_reintegration(integrate_2d=do_2d)
+        # [REINT] diagnostics: the plan's output shape (npt/unit) is what the
+        # writer compares against the stored stack — a change here is exactly
+        # what makes a partial (stopped) save illegal.  mask_sat/threshold show
+        # whether pixel rejection is engaged for this pass.
+        _p1 = getattr(standard_plan, "integration_1d", None)
+        _p2 = getattr(standard_plan, "integration_2d", None)
+        logger.info(
+            "[REINT] start %s live=%s frames=%s | 1d_npt=%s unit=%s | "
+            "2d_npt=(%s,%s) | mask_sat=%s threshold=[%s,%s]",
+            label, live, len(indices),
+            getattr(_p1, "npt", None), getattr(_p1, "unit", None),
+            getattr(_p2, "npt_rad", None), getattr(_p2, "npt_azim", None),
+            getattr(standard_plan, "mask_saturation", None),
+            getattr(standard_plan, "threshold_min", None),
+            getattr(standard_plan, "threshold_max", None))
+
+        # Pre-flight: will this pass CHANGE the stored output shape?  If so a
+        # stopped partial save can't be persisted (writer forbids mixed rows),
+        # so the GUI warns before discarding.  Compare the plan's output npt to
+        # the first stored frame's int_*/ shape (peeking frame[0] lazy-loads it).
+        self.reintegrate_partial_savable = True
+        # Stored output signature (unit + axis extents + shape) of the first
+        # frame, captured BEFORE the loop reduces it in place.  The npt/dims
+        # pre-check below is the fast path; the authoritative check happens once
+        # after the first frame is reduced (_maybe_flag_unsavable), because a
+        # reintegrate can change the AXIS or UNIT at the *same* npt (e.g. a
+        # different radial range) — which the writer also rejects, but which the
+        # plan's npt alone cannot predict.  That gap is why the Stop "discard?"
+        # popup did not show on an axis-only change.
+        self._reint_stored_sig = (None, None)
+        self._reint_sig_checked = False
+        try:
+            _f0 = self.scan.frames[indices[0]]
+            self._reint_stored_sig = self._frame_output_signature(_f0)
+            if self._plan_changes_output_shape(_p1, _p2, _f0):
+                self.reintegrate_partial_savable = False
+                self._reint_sig_checked = True
+            logger.info("[REINT] %s partial-savable=%s (shape vs stored)",
+                        label, self.reintegrate_partial_savable)
+        except Exception:
+            logger.debug("[REINT] shape pre-check failed", exc_info=True)
 
         # Batched dispatch: lazy-load each batch right before
         # submitting it, publish results, then drop the batch's
-        # frames so RAM stays bounded.
-        _RE_BATCH = max(8, 32 * n_workers)
+        # frames so RAM stays bounded.  Live uses a batch of 1.
+        _RE_BATCH = 1 if live else max(8, 32 * n_workers)
+
+        # Indices actually reduced + published this pass.  On a user Stop we
+        # KEEP these (persist below) instead of discarding — the frames done so
+        # far stay reintegrated; only the not-yet-reached frames keep their prior
+        # result.  (A re-run reintegrates everything again, overwriting.)
+        processed_idxs: list[int] = []
 
         for i in range(0, len(indices), _RE_BATCH):
             if self.stop_requested:
                 logger.warning(
-                    "%s reintegration stopped at frame %s/%s (app close); "
-                    "recomputed frames are NOT saved.", label,
-                    i, len(indices))
-                return
+                    "[REINT] %s reintegration STOPPED at frame %s/%s (%s done) "
+                    "-- attempting to persist the done frames (see the next "
+                    "[REINT] line for whether the partial save was allowed).",
+                    label, i, len(indices), len(processed_idxs))
+                break
             chunk_idxs = indices[i:i + _RE_BATCH]
             # LiveFrameSeries.__getitem__ does the lazy v2 load + sets
-            # source refs / _source_root for the L1 raw loader.
-            frames = [self.scan.frames[idx] for idx in chunk_idxs]
+            # source refs / _source_root for the L1 raw loader.  Resilient to a
+            # frame vanishing mid-pass (a concurrent scan.frames rebuild — e.g. a
+            # scan started during the reintegrate): skip the missing index rather
+            # than crashing the whole loop with a 'Frame not found' KeyError.
+            frames = []
+            for idx in chunk_idxs:
+                try:
+                    frames.append(self.scan.frames[idx])
+                except KeyError:
+                    logger.warning(
+                        "%s reintegration: frame %s no longer present "
+                        "(concurrent scan change); skipping.", label, idx)
+            if not frames:
+                continue
             try:
                 reduced_frames = self._reduce_reintegration_batch(
                     frames,
@@ -438,6 +644,20 @@ class integratorThread(Qt.QtCore.QThread):
                         self.update.emit(getattr(frame, "idx", -1))
             for frame in reduced_frames:
                 _publish(frame)
+                processed_idxs.append(int(getattr(frame, "idx", -1)))
+            # Authoritative once-per-pass savability check: compare the freshly
+            # reduced output signature to the stored one.  Catches axis/unit
+            # changes the plan-npt pre-check can't (so the Stop popup is reliable
+            # for every reason the writer would reject a partial rewrite).
+            # Advisory only (the writer is the real gate) -> never let it crash
+            # the reduction: a failed heuristic just leaves partial_savable as-is.
+            if reduced_frames and not getattr(self, "_reint_sig_checked", True):
+                try:
+                    self._maybe_flag_unsavable(reduced_frames[0], do_2d, label)
+                except Exception:
+                    logger.debug("[REINT] savability check skipped",
+                                 exc_info=True)
+                    self._reint_sig_checked = True
             # ``frames`` goes out of scope at the end of the iteration, so
             # the FIFO _in_memory_cap eviction can free old frames before
             # the next chunk loads.
@@ -456,7 +676,18 @@ class integratorThread(Qt.QtCore.QThread):
         # release.  Wrangler save paths already do this; the
         # reintegrate path was the one save site that didn't, which
         # could race a viewer's open handle on the same .nxs file.
-        replace_idxs = list(self.scan.frames.index)
+        # Persist exactly the frames that were reintegrated this pass (all of
+        # them on a normal finish; the partial set on a Stop), so a stopped
+        # reintegrate KEEPS the work done so far.  BUT: if this reintegrate
+        # changed the output axis/unit/row shape, the writer's
+        # _select_frames_to_write REJECTS a partial rewrite (it would mix fresh
+        # rows with stale rows — a real corruption).  We honour that, never
+        # bypass it: catch the ValueError, leave the .nxs untouched, and tell the
+        # user the partial can't be persisted (finish the run, or use Batch).
+        # The done frames remain in the in-memory publication store for this
+        # session either way.
+        _stopped = bool(self.stop_requested)
+        replace_idxs = sorted({i for i in processed_idxs if i >= 0})
         if replace_idxs:
             from xdart.utils.h5pool import get_pool as _get_h5pool
             _get_h5pool().pause(self.scan.data_file)
@@ -464,6 +695,20 @@ class integratorThread(Qt.QtCore.QThread):
                 self.scan.save_to_nexus(
                     replace_frame_indices=replace_idxs,
                 )
+                logger.info(
+                    "[REINT] %s saved %s reintegrated frame(s)%s.",
+                    label, len(replace_idxs),
+                    " (partial — stopped)" if _stopped else "")
+            except ValueError as exc:
+                # Shape/axis/unit changed -> partial rewrite forbidden by the
+                # writer (correctly).  Don't crash, don't loosen the check.
+                logger.warning(
+                    "[REINT] %s partial save NOT persisted (the reintegrate "
+                    "changed the output axis/unit/npts, so the %s done frames "
+                    "can't be mixed with the %s un-reintegrated ones): %s  Let "
+                    "the reintegrate FINISH (or run it in Batch) to save.",
+                    label, len(replace_idxs),
+                    len(self.scan.frames.index) - len(replace_idxs), exc)
             finally:
                 _get_h5pool().resume(self.scan.data_file)
 
@@ -475,8 +720,8 @@ class integratorThread(Qt.QtCore.QThread):
         idxs = self.frame_ids
         if 'Overall' in self.frame_ids:
             idxs = self.scan.frames.index
-        # C1: cached plan covers integrate_1d + integrate_2d together
-        # since a 2D reintegrate also refreshes the cached 1D entry.
+        # 2D reintegrate is 2D-only: the plan never recomputes the 1D, so the
+        # existing int_1d is left untouched (see _plan_for_reintegration).
         plan = self._plan_for_reintegration(integrate_2d=True)
         # for idx in self.frames.keys():
         for idx in idxs:
@@ -486,7 +731,7 @@ class integratorThread(Qt.QtCore.QThread):
             self._publish_reintegrated_display(
                 frame,
                 include_2d=True,
-                refresh_1d=not self.scan.gi,
+                refresh_1d=False,
             )
 
     def bai_1d_SI(self):
