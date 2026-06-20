@@ -28,7 +28,6 @@ from xrd_tools.io.metadata import _extract_scan_info
 from .wrangler_widget import wranglerWidget
 from .image_wrangler_thread import imageThread, _get_scan_info  # noqa: F401
 from .ui.specUI import Ui_Form
-from ....gui_utils import NamedActionParameter
 from xdart.utils import get_fname_dir, match_img_detector
 from xdart.utils.session import load_session, save_session
 
@@ -50,20 +49,18 @@ params = [
     # reset UX is a follow-up; the portable storage is active once a folder is
     # set.)
     {'name': 'Project', 'title': 'Project Folder', 'type': 'group', 'children': [
-        {'name': 'project_folder', 'title': 'Folder', 'type': 'str', 'value': ''},
-        NamedActionParameter(name='project_folder_browse', title='Browse...'),
+        # str_browse: path field + inline Browse (the group header already says
+        # "Project Folder", so the child label is dropped).
+        {'name': 'project_folder', 'title': '', 'type': 'str_browse', 'value': ''},
     ], 'expanded': True},
     {'name': 'Calibration', 'type': 'group', 'children': [
-        {'name': 'poni_file', 'title': 'PONI File    ', 'type': 'str', 'value': def_poni_file},
-        NamedActionParameter(name='poni_file_browse', title='Browse...'),
+        {'name': 'poni_file', 'title': '', 'type': 'str_browse', 'value': def_poni_file},
     ], 'expanded': True},
     {'name': 'Signal', 'type': 'group', 'children': [
         {'name': 'inp_type', 'title': '', 'type': 'list',
          'values': ['Image Series', 'Image Directory', 'Single Image'], 'value': 'Image Series'},
-        {'name': 'File', 'title': 'Image File   ', 'type': 'str', 'value': def_img_file},
-        NamedActionParameter(name='img_file_browse', title='Browse...'),
-        {'name': 'img_dir', 'title': 'Directory', 'type': 'str', 'value': '', 'visible': False},
-        NamedActionParameter(name='img_dir_browse', title='Browse...', visible=False),
+        {'name': 'File', 'title': 'Image File   ', 'type': 'str_browse', 'value': def_img_file},
+        {'name': 'img_dir', 'title': 'Directory', 'type': 'str_browse', 'value': '', 'visible': False},
         {'name': 'include_subdir', 'title': 'Subdirectories', 'type': 'bool', 'value': False, 'visible': False},
         {'name': 'img_ext', 'title': 'File Type  ', 'type': 'list',
          'values': ['tif', 'raw', 'h5', 'nxs', 'mar3450'], 'value': 'tif', 'visible': False},
@@ -74,15 +71,13 @@ params = [
         # when ``meta_ext == 'SPEC'`` (see ``set_meta_ext``).  Blank
         # → use the default search (image dir + immediate parent);
         # set → that directory is searched first.
-        {'name': 'meta_dir', 'title': 'Meta Directory', 'type': 'str',
+        {'name': 'meta_dir', 'title': 'Meta Directory', 'type': 'str_browse',
          'value': '', 'visible': False},
-        NamedActionParameter(name='meta_dir_browse', title='Browse...', visible=False),
         {'name': 'Filter', 'type': 'str', 'value': '', 'visible': False,
          'tip': "Filename filter: space-separated terms = AND (any order), '|' or OR = either, leading -term or NOT = exclude.  Case-insensitive substrings; empty = all files."},
         {'name': 'write_mode', 'title': 'Write Mode  ', 'type': 'list',
          'values': ['Append', 'Overwrite'], 'value': 'Append'},
-        {'name': 'mask_file', 'title': 'Mask File', 'type': 'str', 'value': ''},
-        NamedActionParameter(name='mask_file_browse', title='Browse...'),
+        {'name': 'mask_file', 'title': 'Mask File', 'type': 'str_browse', 'value': ''},
     ], 'expanded': True, 'visible': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group',
      'children': [
@@ -133,13 +128,11 @@ params = [
     {'name': 'BG', 'title': 'Background', 'type': 'group', 'children': [
         {'name': 'bg_type', 'title': '', 'type': 'list',
          'values': ['None', 'Single BG File', 'Series Average', 'BG Directory'], 'value': 'None'},
-        {'name': 'File', 'title': 'BG File', 'type': 'str', 'value': '', 'visible': False},
-        NamedActionParameter(name='bg_file_browse', title='Browse...', visible=False),
+        {'name': 'File', 'title': 'BG File', 'type': 'str_browse', 'value': '', 'visible': False},
         {'name': 'Match', 'title': 'Match Parameter', 'type': 'group', 'children': [
             {'name': 'Parameter', 'type': 'list', 'values': ['None'], 'value': 'None'},
             {'name': 'match_fname', 'title': 'Match File Root', 'type': 'bool', 'value': False},
-            {'name': 'bg_dir', 'title': 'Directory', 'type': 'str', 'value': ''},
-            NamedActionParameter(name='bg_dir_browse', title='Browse...'),
+            {'name': 'bg_dir', 'title': 'Directory', 'type': 'str_browse', 'value': ''},
             {'name': 'Filter', 'type': 'str', 'value': '',
              'tip': "Filename filter: space-separated terms = AND (any order), '|' or OR = either, leading -term or NOT = exclude.  Case-insensitive substrings; empty = all files."},
         ], 'expanded': True, 'visible': False},
@@ -147,8 +140,7 @@ params = [
         {'name': 'norm_channel', 'title': 'Normalize', 'type': 'list', 'values': ['bstop'], 'value': 'bstop',
          'visible': False},
     ], 'expanded': False, 'visible': False},
-    {'name': 'h5_dir', 'title': 'Save Path', 'type': 'str', 'value': get_fname_dir(), 'enabled': True},
-    NamedActionParameter(name='h5_dir_browse', title='Browse...', visible=False),
+    {'name': 'h5_dir', 'title': 'Save Path', 'type': 'str_browse', 'value': get_fname_dir(), 'enabled': True},
 ]
 
 ctr = 1
@@ -229,22 +221,9 @@ class imageWrangler(wranglerWidget):
         _nx_idx = self.ui.processingModeCombo.findText('NeXus Viewer')
         if _nx_idx >= 0:
             self.ui.processingModeCombo.removeItem(_nx_idx)
-        self.ui.startButton.clicked.connect(self._on_start_clicked)
-        # self.ui.startButton.clicked.connect(self.sigStart.emit)
-        self.ui.stopButton.clicked.connect(self.stop)
-        self.ui.processingModeCombo.currentTextChanged.connect(self._on_mode_changed)
-        # Live/Batch are checkable QPushButtons now — use ``toggled`` (bool)
-        # rather than the QCheckBox-only ``stateChanged``.
-        self.ui.liveCheckBox.toggled.connect(self._on_mode_changed)
-        self.ui.batchCheckBox.toggled.connect(self._on_mode_changed)
-        # Phase B: Live is now a pure MODE toggle (it no longer starts/stops a
-        # run — the single Start/Pause/Resume action button does).  _on_live_toggled
-        # just resyncs live_mode (a no-op alongside _on_mode_changed, kept for
-        # clarity).  Connected AFTER _on_mode_changed.
-        self.ui.liveCheckBox.toggled.connect(self._on_live_toggled)
-        self.ui.processingModeCombo.currentTextChanged.connect(lambda _: self._save_to_session())
-        self.ui.liveCheckBox.toggled.connect(lambda _: self._save_to_session())
-        self.ui.batchCheckBox.toggled.connect(lambda _: self._save_to_session())
+        # Run-control signal wiring moved to attach_controls() — the controls are
+        # the shared StaticControls widget now, connected to this wrangler's
+        # handlers on wrangler swap (and disconnected on the previous swap).
         self._on_mode_changed()
         self._set_wrangler_tooltips()
 
@@ -268,8 +247,18 @@ class imageWrangler(wranglerWidget):
         # Squeeze parameter tree columns to reduce panel width
         header = self.tree.header()
         header.setStretchLastSection(True)
-        header.resizeSection(0, 100)  # name column
+        header.resizeSection(0, 84)  # name column (narrower → wider value boxes)
         header.setMinimumSectionSize(40)
+        # Shallow indent so the grouped param names (Image File, Meta File, …)
+        # sit close under the top-level Save Path row instead of stepping far
+        # right, and Save Path itself sits nearer the left edge — both free up
+        # width for the path/value boxes.  The group chevrons need this column,
+        # so it can't go to 0 (the names land just shy of exact alignment with
+        # Save Path, which is a top-level row).  The name-column width (84) is
+        # unchanged, so the value boxes stay put as the names shift left.  At
+        # this point the group chevron column is very narrow; going lower starts
+        # to crowd it.
+        self.tree.setIndentation(3)
         # Hide the "Parameter / Value" header bar — it's just visual noise above
         # the wrangler tree.  Column sizing above still applies (the header is
         # hidden, not removed).
@@ -356,7 +345,7 @@ class imageWrangler(wranglerWidget):
         # hidden enabling bool (see wranglerWidget._install_group_toggles).
         self._install_group_toggles(self.tree)
 
-        self.parameters.child('Project').child('project_folder_browse').sigActivated.connect(
+        self.parameters.child('Project').child('project_folder').sigActivated.connect(
             self.set_project_folder
         )
         # N1 Decision 2: a folder change (browse OR direct edit) resets the
@@ -365,7 +354,7 @@ class imageWrangler(wranglerWidget):
         self.parameters.child('Project').child('project_folder').sigValueChanged.connect(
             self._on_project_folder_changed
         )
-        self.parameters.child('Calibration').child('poni_file_browse').sigActivated.connect(
+        self.parameters.child('Calibration').child('poni_file').sigActivated.connect(
             self.set_poni_file
         )
         self.parameters.child('Calibration').child('poni_file').sigValueChanged.connect(
@@ -374,13 +363,13 @@ class imageWrangler(wranglerWidget):
         self.parameters.child('Signal').child('inp_type').sigValueChanged.connect(
             self.set_inp_type
         )
-        self.parameters.child('Signal').child('img_file_browse').sigActivated.connect(
+        self.parameters.child('Signal').child('File').sigActivated.connect(
             self.set_img_file
         )
-        self.parameters.child('Signal').child('img_dir_browse').sigActivated.connect(
+        self.parameters.child('Signal').child('img_dir').sigActivated.connect(
             self.set_img_dir
         )
-        self.parameters.child('Signal').child('mask_file_browse').sigActivated.connect(
+        self.parameters.child('Signal').child('mask_file').sigActivated.connect(
             self.set_mask_file
         )
         self.parameters.child('Signal').child('series_average').sigValueChanged.connect(
@@ -389,16 +378,16 @@ class imageWrangler(wranglerWidget):
         self.parameters.child('Signal').child('meta_ext').sigValueChanged.connect(
             self.set_meta_ext
         )
-        self.parameters.child('Signal').child('meta_dir_browse').sigActivated.connect(
+        self.parameters.child('Signal').child('meta_dir').sigActivated.connect(
             self.set_meta_dir
         )
         self.parameters.child('BG').child('bg_type').sigValueChanged.connect(
             self.set_bg_type
         )
-        self.parameters.child('BG').child('bg_file_browse').sigActivated.connect(
+        self.parameters.child('BG').child('File').sigActivated.connect(
             self.set_bg_file
         )
-        self.parameters.child('BG').child('Match').child('bg_dir_browse').sigActivated.connect(
+        self.parameters.child('BG').child('Match').child('bg_dir').sigActivated.connect(
             self.set_bg_dir
         )
         self.parameters.child('BG').child('Match').child('Parameter').sigValueChanged.connect(
@@ -413,7 +402,7 @@ class imageWrangler(wranglerWidget):
         self.parameters.child('GI').child('th_val').sigValueChanged.connect(
             self.set_gi_th_motor
         )
-        self.parameters.child('h5_dir_browse').sigActivated.connect(
+        self.parameters.child('h5_dir').sigActivated.connect(
             self.set_h5_dir
         )
 
@@ -490,7 +479,8 @@ class imageWrangler(wranglerWidget):
     # of truth (see wranglerWidget._install_group_toggles).
     # Mask / MaskSat moved to the integrator panel (hidden carriers here), so no
     # header-checkbox toggles for them.
-    _GROUP_TOGGLES = {'GI': 'Grazing'}
+    # GI moved to the integrator panel (hidden carrier here) — no header toggle.
+    _GROUP_TOGGLES = {}
 
     def _expand_active_groups(self):
         """Sync each wrangler group's expanded state to its enabling param.
@@ -795,8 +785,16 @@ class imageWrangler(wranglerWidget):
             self.tree.setEnabled(True)
         except AttributeError:
             pass
-        # Hide start/stop in viewer mode
-        self.ui.frame.setVisible(not is_viewer)
+        # Hide the run row (Live/Start/Stop) in viewer mode.  Pre-attach
+        # (standalone / tests) the wrangler owns its specUI `frame`; post-attach
+        # that frame is dead and hidden by attach_controls — re-showing it here
+        # was the source of the DUPLICATE run row, so when attached we instead
+        # toggle the SHARED controls' action row.
+        _controls = getattr(self, '_controls', None)
+        if _controls is None:
+            self.ui.frame.setVisible(not is_viewer)
+        else:
+            _controls.set_run_row_visible(not is_viewer)
         # Notify parent only when viewer mode actually changed (avoids
         # unnecessary layout resets when just toggling Live/Batch).
         new_vm = self.viewer_mode or ''
@@ -818,7 +816,7 @@ class imageWrangler(wranglerWidget):
             except (AttributeError, KeyError) as e:
                 logger.debug("Failed to set enabled state for %s: %s", group_name, e)
         # Also disable write mode and mask file in Signal group
-        for child_name in ('write_mode', 'mask_file', 'mask_file_browse'):
+        for child_name in ('write_mode', 'mask_file'):
             try:
                 self.parameters.child('Signal').child(child_name).setOpts(enabled=enabled)
             except (AttributeError, KeyError) as e:
@@ -988,6 +986,63 @@ class imageWrangler(wranglerWidget):
             w = getattr(self.ui, name, None)
             if w is not None:
                 w.setToolTip(tip)
+
+    def controls_profile(self):
+        """Image wrangler: Live + Batch + cores, full mode list (NeXus Viewer is
+        deferred / hidden for this wrangler).  ``current`` is read from the
+        wrangler's own (pre-alias) combo, which __init__ already restored from
+        the session — so the shared combo can be restored to it on attach."""
+        try:
+            current = self.ui.processingModeCombo.currentText()
+        except Exception:
+            current = ''
+        return {
+            'modes': ['Int 1D', 'Int 2D', 'Int 1D (XYE)',
+                      'Image Viewer', 'XYE Viewer'],
+            'live': True, 'batch': True, 'cores': True,
+            'current': current,
+        }
+
+    def attach_controls(self, controls):
+        """Adopt the shared run controls: hide this wrangler's own (now-dead)
+        specUI command/run rows, ALIAS the ``self.ui.*`` control refs onto the
+        shared widgets (so all existing run-lifecycle logic drives them), and
+        wire the shared signals to this wrangler's handlers."""
+        super().attach_controls(controls)
+        # Hide the now-dead specUI rows: the command/run rows (controls moved to
+        # StaticControls) AND specLabel — the status bar moved to the control
+        # layer (controls.statusLabel via _status_label), so specLabel would just
+        # sit as an empty bar above the integrator.
+        for name in ('commandFrame', 'frame', 'specLabel'):
+            w = getattr(self.ui, name, None)
+            if w is not None:
+                w.hide()
+        self.ui.startButton = controls.startButton
+        self.ui.stopButton = controls.stopButton
+        self.ui.processingModeCombo = controls.modeCombo
+        self.ui.liveCheckBox = controls.liveButton
+        self.ui.batchCheckBox = controls.batchButton
+        self.ui.maxCoresSpinBox = controls.coresSpin
+        # Alias coresLabel too, so _on_mode_changed's batch-gated cores show/hide
+        # (+ enable) drives the SHARED label/spin as a unit (Cores hidden when
+        # Batch is off).
+        self.ui.coresLabel = controls.coresLabel
+        self._connect_control(controls.startButton.clicked, self._on_start_clicked)
+        # Stop is NOT connected here: the host (staticWidget._on_stop_clicked)
+        # owns the shared Stop button and dispatches to the active run (a
+        # reintegrate, else this wrangler's stop()).
+        self._connect_control(controls.modeCombo.currentTextChanged,
+                              self._on_mode_changed)
+        self._connect_control(controls.liveButton.toggled, self._on_mode_changed)
+        self._connect_control(controls.batchButton.toggled, self._on_mode_changed)
+        self._connect_control(controls.liveButton.toggled, self._on_live_toggled)
+        self._connect_control(controls.modeCombo.currentTextChanged,
+                              lambda _=None: self._save_to_session())
+        self._connect_control(controls.liveButton.toggled,
+                              lambda _=None: self._save_to_session())
+        self._connect_control(controls.batchButton.toggled,
+                              lambda _=None: self._save_to_session())
+        self._set_action_button('idle')          # reset the morph on (re)attach
 
     def _on_start_clicked(self):
         """The single action button is a 3-state machine (Phase B):
@@ -1175,9 +1230,11 @@ class imageWrangler(wranglerWidget):
     # Intensity Threshold ('Mask') + Mask Saturated ('MaskSat') moved to the
     # integrator panel — kept here as hidden carriers the integrator injects into
     # at run-setup, so never disclosed (and re-hidden after "reveal everything").
-    _DISCLOSURE_REST = ('Signal', 'GI', 'BG')
-    _DISCLOSURE_CARRIERS = ('Mask', 'MaskSat')
-    _DISCLOSURE_TOPLEVEL = ('h5_dir', 'h5_dir_browse')     # Save Path row
+    _DISCLOSURE_REST = ('Signal', 'BG')
+    # GI joins Mask/MaskSat as a HIDDEN CARRIER: the integrator panel owns the GI
+    # controls now and injects into this group at run-setup (_push_gi_to_wrangler).
+    _DISCLOSURE_CARRIERS = ('Mask', 'MaskSat', 'GI')
+    _DISCLOSURE_TOPLEVEL = ('h5_dir',)     # Save Path row (path + inline Browse)
 
     @staticmethod
     def _safe_status_text(obj, text):
@@ -1289,9 +1346,7 @@ class imageWrangler(wranglerWidget):
         """
         self.single_img = False
         self.parameters.child('Signal').child('File').show()
-        self.parameters.child('Signal').child('img_file_browse').show()
         self.parameters.child('Signal').child('img_dir').hide()
-        self.parameters.child('Signal').child('img_dir_browse').hide()
         self.parameters.child('Signal').child('include_subdir').hide()
         self.parameters.child('Signal').child('Filter').hide()
         self.parameters.child('Signal').child('series_average').show()
@@ -1300,9 +1355,7 @@ class imageWrangler(wranglerWidget):
         inp_type = self.parameters.child('Signal').child('inp_type').value()
         if inp_type == 'Image Directory':
             self.parameters.child('Signal').child('File').hide()
-            self.parameters.child('Signal').child('img_file_browse').hide()
             self.parameters.child('Signal').child('img_dir').show()
-            self.parameters.child('Signal').child('img_dir_browse').show()
             self.parameters.child('Signal').child('include_subdir').show()
             self.parameters.child('Signal').child('Filter').show()
             self.parameters.child('Signal').child('img_ext').show()
@@ -1441,7 +1494,6 @@ class imageWrangler(wranglerWidget):
         # makes sense.  This mirrors the bg_dir pattern.
         is_spec = (self.meta_ext == 'SPEC')
         self.parameters.child('Signal').child('meta_dir').show(is_spec)
-        self.parameters.child('Signal').child('meta_dir_browse').show(is_spec)
         self._save_to_session()
         self.get_img_fname()
 
@@ -1561,7 +1613,6 @@ class imageWrangler(wranglerWidget):
             else:
                 opts = {'title': 'First File'}
             self.parameters.child('BG').child('File').setOpts(**opts)
-            self.parameters.child('BG').child('bg_file_browse').show()
         else:
             self.parameters.child('BG').child('Match').show()
 
@@ -1731,6 +1782,14 @@ class imageWrangler(wranglerWidget):
         # (possibly newly-defaulted) selection — setOpts may not re-fire
         # sigValueChanged when the value is set programmatically.
         self.set_gi_th_motor()
+        # GI move (Stage B): hand the available motor columns (excl. Manual) to
+        # the integrator panel's GI motor dropdown, which owns the selection.
+        # getattr-guarded: duck-typed test hosts have no Qt signal.
+        _sig = getattr(self, 'sigGIMotorOptions', None)
+        if _sig is not None:
+            _avail = [p for p in self.motors
+                      if not any(x.lower() in p.lower() for x in ['ROI', 'PD'])]
+            _sig.emit(list(_avail))
 
     def set_gi_th_motor(self):
         """Update Grazing theta motor.
@@ -1813,7 +1872,14 @@ class imageWrangler(wranglerWidget):
             self.ui.batchCheckBox.setEnabled(False)
 
     def stylize_ParameterTree(self):
+        # Uniform DARK rows (no light/dark stripe) so the panel reads cleanly;
+        # the group-header rows keep their lighter band (the :has-children rule),
+        # and the input boxes are tinted a touch lighter so the editable fields
+        # stand out against the dark rows.  Scoped to this tree so the left scans
+        # list keeps its own alternating shading.
+        self.tree.setAlternatingRowColors(False)
         self.tree.setStyleSheet("""
+        QTreeView { alternate-background-color: #21222c; }
         QTreeView::item:has-children {
             background-color: #44475a;
             color: #f8f8f2;
@@ -1821,5 +1887,9 @@ class imageWrangler(wranglerWidget):
         QTreeView::item:has-children:disabled {
             background-color: #3a3d4d;
             color: #6272a4;
+        }
+        QLineEdit, QComboBox, QAbstractSpinBox {
+            background-color: #4a4f63;
+            color: #f8f8f2;
         }
             """)

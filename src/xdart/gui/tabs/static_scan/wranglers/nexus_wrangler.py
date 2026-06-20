@@ -29,7 +29,6 @@ from pyqtgraph.parametertree import ParameterTree, Parameter
 from xrd_tools.core.containers import PONI
 from .wrangler_widget import wranglerWidget
 from .nexus_wrangler_thread import nexusThread
-from ....gui_utils import NamedActionParameter
 from xdart.utils import get_fname_dir
 from xdart.utils.session import load_session, save_session
 
@@ -42,21 +41,18 @@ params = [
     # progressive-disclosure UX is image-wrangler only; here it's the portable
     # field + wiring).
     {'name': 'Project', 'title': 'Project Folder', 'type': 'group', 'children': [
-        {'name': 'project_folder', 'title': 'Folder', 'type': 'str', 'value': ''},
-        NamedActionParameter(name='project_folder_browse', title='Browse...'),
+        # str_browse: path + inline Browse (group header already says the name).
+        {'name': 'project_folder', 'title': '', 'type': 'str_browse', 'value': ''},
     ], 'expanded': True},
     {'name': 'Calibration', 'type': 'group', 'children': [
-        {'name': 'poni_file', 'title': 'PONI File    ', 'type': 'str', 'value': ''},
-        NamedActionParameter(name='poni_file_browse', title='Browse...'),
+        {'name': 'poni_file', 'title': '', 'type': 'str_browse', 'value': ''},
     ], 'expanded': True},
     {'name': 'NeXus File', 'type': 'group', 'children': [
-        {'name': 'nexus_file', 'title': 'File         ', 'type': 'str', 'value': ''},
-        NamedActionParameter(name='nexus_file_browse', title='Browse...'),
+        {'name': 'nexus_file', 'title': 'File         ', 'type': 'str_browse', 'value': ''},
         {'name': 'entry', 'title': 'Entry', 'type': 'str', 'value': 'entry'},
     ], 'expanded': True},
     {'name': 'Signal', 'type': 'group', 'children': [
-        {'name': 'mask_file', 'title': 'Mask File    ', 'type': 'str', 'value': ''},
-        NamedActionParameter(name='mask_file_browse', title='Browse...'),
+        {'name': 'mask_file', 'title': 'Mask File    ', 'type': 'str_browse', 'value': ''},
     ], 'expanded': False},
     # R3-B: detector-saturation masking opt-out for NeXus sources too.  Same
     # UI-1 header-checkbox pattern as GI/the image wrangler's MaskSat: the group
@@ -93,10 +89,9 @@ params = [
         {'name': 'gi_mode_2d', 'title': '2D Mode', 'type': 'list',
          'values': ['qip_qoop', 'q_chi', 'exit_angles'],
          'value': 'qip_qoop', 'visible': False},
-    ], 'expanded': False},
+    ], 'expanded': False, 'visible': False},  # hidden carrier: GI owned by the integrator panel
     {'name': 'Output', 'type': 'group', 'children': [
-        {'name': 'h5_dir', 'title': 'Output Dir   ', 'type': 'str', 'value': ''},
-        NamedActionParameter(name='h5_dir_browse', title='Browse...'),
+        {'name': 'h5_dir', 'title': 'Output Dir   ', 'type': 'str_browse', 'value': ''},
     ], 'expanded': False},
 ]
 
@@ -196,23 +191,15 @@ class nexusWrangler(wranglerWidget):
         btn_layout.addWidget(self.processingModeCombo)
         btn_layout.addWidget(self.coresLabel)
         btn_layout.addWidget(self.maxCoresSpinBox)
-        layout.addLayout(btn_layout)
+        # Wrap the legacy per-wrangler controls in a frame so attach_controls()
+        # can hide them as one — the run controls are the shared StaticControls
+        # widget now (Stage-3 cleanup deletes this build entirely).
+        self._legacy_controls = QtWidgets.QFrame()
+        self._legacy_controls.setLayout(btn_layout)
+        layout.addWidget(self._legacy_controls)
 
-        self.startButton.clicked.connect(self.start)
-        self.stopButton.clicked.connect(self.stop)
-        # Reflect dropdown choice into scan.skip_2d + self.xye_only
-        # immediately on selection — the thread reads both before each
-        # frame, so the user can change mode between runs without
-        # restarting xdart.  Save the mode to session so the next
-        # launch reopens in the same configuration.
-        self.processingModeCombo.currentTextChanged.connect(self._on_mode_changed)
-        self.processingModeCombo.currentTextChanged.connect(
-            lambda _: self._save_to_session()
-        )
-        # Apply the default selection once now that the signal is
-        # wired up.  Without this, the first run after launch would
-        # see ``scan.skip_2d`` unchanged from whatever the previous
-        # consumer left it as.
+        # Signal wiring moved to attach_controls() (shared controls).  Seed the
+        # processing-mode flags once from the init-time local combo.
         self._on_mode_changed(self.processingModeCombo.currentText())
 
         self.stopButton.setEnabled(False)
@@ -226,10 +213,18 @@ class nexusWrangler(wranglerWidget):
         # Hide the "Parameter / Value" header bar (parity with the image
         # wrangler) — visual noise above the tree.
         self.tree.setHeaderHidden(True)
+        # Shallow indent (parity with the image wrangler): grouped param names
+        # sit close under the top-level rows and nearer the left edge, giving
+        # the value boxes more room.  Chevrons need the column so it stays > 0.
+        self.tree.setIndentation(3)
         # Match the image wrangler's tree styling so the group headers (and
         # their expand/collapse arrows) are legible against the Dracula theme
-        # -- the nexus tree previously had no styling at all (UI-4).
+        # -- the nexus tree previously had no styling at all (UI-4).  Uniform
+        # dark rows (no stripe), lighter input boxes; group headers keep their
+        # band.  Scoped to this tree (left scans list keeps its striping).
+        self.tree.setAlternatingRowColors(False)
         self.tree.setStyleSheet("""
+        QTreeView { alternate-background-color: #21222c; }
         QTreeView::item:has-children {
             background-color: #44475a;
             color: #f8f8f2;
@@ -238,23 +233,27 @@ class nexusWrangler(wranglerWidget):
             background-color: #3a3d4d;
             color: #6272a4;
         }
+        QLineEdit, QComboBox, QAbstractSpinBox {
+            background-color: #4a4f63;
+            color: #f8f8f2;
+        }
             """)
         layout.addWidget(self.tree)
 
         # Connect parameter browse buttons
-        self.parameters.child('Project').child('project_folder_browse').sigActivated.connect(
+        self.parameters.child('Project').child('project_folder').sigActivated.connect(
             self.browse_project_folder
         )
-        self.parameters.child('Calibration').child('poni_file_browse').sigActivated.connect(
+        self.parameters.child('Calibration').child('poni_file').sigActivated.connect(
             self.browse_poni
         )
-        self.parameters.child('NeXus File').child('nexus_file_browse').sigActivated.connect(
+        self.parameters.child('NeXus File').child('nexus_file').sigActivated.connect(
             self.browse_nexus
         )
-        self.parameters.child('Signal').child('mask_file_browse').sigActivated.connect(
+        self.parameters.child('Signal').child('mask_file').sigActivated.connect(
             self.browse_mask
         )
-        self.parameters.child('Output').child('h5_dir_browse').sigActivated.connect(
+        self.parameters.child('Output').child('h5_dir').sigActivated.connect(
             self.browse_h5_dir
         )
 
@@ -375,7 +374,8 @@ class nexusWrangler(wranglerWidget):
     # mapped to the hidden bool that is its source of truth (see
     # wranglerWidget._install_group_toggles).
     # MaskSat moved to the integrator panel (hidden carrier), so no toggle here.
-    _GROUP_TOGGLES = {'GI': 'Grazing'}
+    # GI moved to the integrator panel (hidden carrier here) — no header toggle.
+    _GROUP_TOGGLES = {}
 
     def _save_to_session(self):
         """Save parameters to session.json."""
@@ -565,6 +565,50 @@ class nexusWrangler(wranglerWidget):
         # N1: push the project root so the writer stamps @source_base + relative
         # raw paths (set AFTER the thread recreate above).
         self.thread.source_base = self.source_base
+
+    def controls_profile(self):
+        """NeXus wrangler: no Live / Batch / Pause; its own 3 mode items.
+        ``current`` is the wrangler's own (pre-alias) combo, which __init__
+        already restored from the session."""
+        try:
+            current = self.processingModeCombo.currentText()
+        except Exception:
+            current = ''
+        return {
+            'modes': ['Int 1D + 2D', 'Int 1D', 'Int 1D (XYE)'],
+            'live': False, 'batch': False, 'cores': True,
+            'current': current,
+        }
+
+    def attach_controls(self, controls):
+        """Adopt the shared run controls: hide the legacy frame, ALIAS the
+        self.* control refs onto the shared widgets (so start/stop/enabled/
+        _on_mode_changed drive them), and wire the shared signals to handlers.
+        NeXus has no Live/Batch/Pause — the action button is two-state
+        (enabled 'Start' / disabled during a run)."""
+        super().attach_controls(controls)
+        if getattr(self, '_legacy_controls', None) is not None:
+            self._legacy_controls.hide()
+        # Status moved to the control layer (controls.statusLabel via
+        # _status_label) — hide this wrangler's own now-orphaned status label.
+        if getattr(self, 'statusLabel', None) is not None:
+            self.statusLabel.hide()
+        self.startButton = controls.startButton
+        self.stopButton = controls.stopButton
+        self.processingModeCombo = controls.modeCombo
+        self.maxCoresSpinBox = controls.coresSpin
+        self.coresLabel = controls.coresLabel
+        self._connect_control(controls.startButton.clicked, self.start)
+        # Stop is owned by the host (staticWidget._on_stop_clicked), which
+        # dispatches to the active run (reintegrate, else this wrangler).
+        self._connect_control(controls.modeCombo.currentTextChanged,
+                              self._on_mode_changed)
+        self._connect_control(controls.modeCombo.currentTextChanged,
+                              lambda _=None: self._save_to_session())
+        # NeXus never pauses: ensure the action button is the plain green Start.
+        controls.set_action_phase('idle')
+        self.startButton.setEnabled(True)
+        self.stopButton.setEnabled(False)
 
     def start(self):
         self.command = 'start'

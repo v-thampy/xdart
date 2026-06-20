@@ -188,10 +188,118 @@ class NamedActionParameter(Parameter):
     """Used for displaying a button within the tree."""
     itemClass = NamedActionParameterItem
     sigActivated = QtCore.Signal(object)
-    
+
     def activate(self):
         self.sigActivated.emit(self)
         self.emitStateChanged('activated', None)
+
+
+from pyqtgraph.parametertree import registerParameterType
+from pyqtgraph.parametertree.parameterTypes.basetypes import SimpleParameter
+from pyqtgraph.parametertree.parameterTypes.str import StrParameterItem
+
+
+class _TailLineEdit(QtWidgets.QLineEdit):
+    """QLineEdit that keeps the END of its text visible (cursor parked at the
+    end) whenever it is not being edited — so a long path shows its tail (the
+    file name) rather than the root."""
+
+    def _park_tail(self):
+        if not self.hasFocus():
+            self.setCursorPosition(len(self.text()))
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._park_tail()
+
+
+class StrBrowseParameterItem(StrParameterItem):
+    """A ``str`` (path) parameter rendered as an always-visible line edit with an
+    INLINE ``Browse`` button, instead of the path and a separate full-width
+    Browse row.
+
+    The button emits the parameter's ``sigActivated`` — the same contract as
+    :class:`NamedActionParameter` — so existing browse handlers wire straight to
+    the path parameter (no separate ``*_browse`` action param).  The line edit
+    shows the END of long paths (see :class:`_TailLineEdit`)."""
+
+    def makeWidget(self):
+        # Always show the editor + button (no label/editor swap), so Browse is
+        # always reachable and the path stays editable inline.
+        self.hideWidget = False
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(3)
+        le = _TailLineEdit()
+        le.setStyleSheet('border: 0px')
+        btn = QtWidgets.QPushButton(self.param.opts.get('buttonText', 'Browse'))
+        btn.setMaximumWidth(72)
+        btn.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
+        # Tint the Browse button a distinct indigo-gray so it reads as an action
+        # against the same-shade path field + neighbouring buttons (the default
+        # QPushButton bg #3a3d4d matches the inputs).  Scoped here like the line
+        # edit's inline style above; hover picks up the purple focus accent.
+        btn.setStyleSheet(
+            "QPushButton {"
+            " background-color: #6272a4; color: #f8f8f2;"
+            " border: 1px solid #6272a4; border-radius: 3px; padding: 1px 6px; }"
+            "QPushButton:hover {"
+            " background-color: #7282b4; border-color: #bd93f9; }"
+            "QPushButton:pressed { background-color: #565f8c; }"
+        )
+        lay.addWidget(le, 1)
+        lay.addWidget(btn)
+        btn.clicked.connect(lambda: self.param.activate())
+
+        def _set_value(v):
+            text = '' if v is None else str(v)
+            le.setText(text)
+            le.setToolTip(text)
+            le._park_tail()
+
+        # WidgetParameterItem contract — proxied to the line edit.
+        w.sigChanged = le.editingFinished
+        w.sigChanging = le.textChanged
+        w.value = le.text
+        w.setValue = _set_value
+        w.setReadOnly = le.setReadOnly          # WidgetParameterItem may call this
+        w.setFocusProxy(le)
+        w.lineEdit = le
+        self._lineEdit = le
+        self._browseButton = btn
+        return w
+
+    def treeWidgetChanged(self):
+        StrParameterItem.treeWidgetChanged(self)
+        # The composite editor is always shown (hideWidget=False); make sure the
+        # stand-in display label never claims space beside it.
+        dl = getattr(self, 'displayLabel', None)
+        if dl is not None:
+            dl.hide()
+        # Re-park once the row is in the tree (the widget now has a real width).
+        le = getattr(self, '_lineEdit', None)
+        if le is not None:
+            le._park_tail()
+
+
+class StrBrowseParameter(SimpleParameter):
+    """A ``'str_browse'`` parameter: a string path value with an inline Browse
+    button (:class:`StrBrowseParameterItem`).  Activating the button emits
+    ``sigActivated`` like :class:`NamedActionParameter`, so it is a drop-in for a
+    ``str`` path field + its separate ``Browse`` action."""
+    itemClass = StrBrowseParameterItem
+    sigActivated = QtCore.Signal(object)
+
+    def activate(self):
+        self.sigActivated.emit(self)
+        self.emitStateChanged('activated', None)
+
+    def _interpretValue(self, v):
+        return '' if v is None else str(v)
+
+
+registerParameterType('str_browse', StrBrowseParameter, override=True)
 
 
 class XdartEncoder(json.JSONEncoder):

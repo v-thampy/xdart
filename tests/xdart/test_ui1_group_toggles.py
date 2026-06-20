@@ -55,8 +55,11 @@ def _make(params_list, group_toggles):
 
 
 @pytest.mark.parametrize("wrangler_cls, params_list, titles", [
-    # Intensity Threshold (Mask) + Mask Saturated (MaskSat) moved to the
-    # integrator panel — GI is the only remaining wrangler header-toggle group.
+    # Intensity Threshold (Mask) + Mask Saturated (MaskSat) AND Grazing Incidence
+    # (GI) all moved to the integrator panel, so the wranglers have NO header-
+    # toggle groups now (_GROUP_TOGGLES == {}).  GI still exists in the params as
+    # a hidden carrier, so install the toggle on it explicitly here to keep
+    # COVERAGE of the _install_group_toggles mechanism (the updateFlags-trap fix).
     (imageWrangler, image_params,
      {'GI': ('Grazing', 'Grazing Incidence')}),
     (nexusWrangler, nexus_params,
@@ -64,7 +67,7 @@ def _make(params_list, group_toggles):
 ])
 def test_header_checkbox_drives_hidden_bool(qapp, wrangler_cls, params_list,
                                             titles):
-    w, tree = _make(params_list, wrangler_cls._GROUP_TOGGLES)
+    w, tree = _make(params_list, {g: t[0] for g, t in titles.items()})
 
     for grp_name, (bool_name, title) in titles.items():
         grp = w.parameters.child(grp_name)
@@ -227,5 +230,7 @@ def test_image_threshold_groups_stay_hidden_after_full_disclosure(qapp):
 
     assert root.child('Mask').opts.get('visible') is False
     assert root.child('MaskSat').opts.get('visible') is False
-    # A normally-disclosed group IS shown (sanity: the branch ran).
-    assert root.child('GI').opts.get('visible') is True
+    # GI moved to the integrator panel — it is now a HIDDEN carrier too.
+    assert root.child('GI').opts.get('visible') is False
+    # A normally-disclosed group IS shown (sanity: the reveal branch ran).
+    assert root.child('Signal').opts.get('visible') is True

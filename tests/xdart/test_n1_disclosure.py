@@ -62,7 +62,6 @@ def test_disclosure_three_stages(qapp):
     assert not _hidden(root, "Project")
     assert _hidden(root, "Calibration") and _hidden(root, "Signal")
     assert root.child("h5_dir").opts.get("visible") is False
-    assert root.child("h5_dir_browse").opts.get("visible") is False
     assert "Project Folder" in h.ui.specLabel.t
 
     # Folder set, no PONI -> Calibration appears, rest still hidden.
@@ -184,7 +183,6 @@ def test_viewer_modes_hide_all_processing_groups(qapp):
         h._apply_disclosure()
         assert not _hidden(root, "Project"), vm    # Project Folder: visible
         assert root.child("h5_dir").opts.get("visible") is not False, vm        # Save Path
-        assert root.child("h5_dir_browse").opts.get("visible") is not False, vm
         for g in ("Calibration",) + imageWrangler._DISCLOSURE_REST:  # Signal/GI/Mask/MaskSat/BG
             assert _hidden(root, g), (vm, g)
 
