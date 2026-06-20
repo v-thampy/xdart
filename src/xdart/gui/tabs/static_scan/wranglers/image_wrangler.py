@@ -247,7 +247,7 @@ class imageWrangler(wranglerWidget):
         # Squeeze parameter tree columns to reduce panel width
         header = self.tree.header()
         header.setStretchLastSection(True)
-        header.resizeSection(0, 84)  # name column (narrower → wider value boxes)
+        header.resizeSection(0, 79)  # name column (narrower -> wider value boxes)
         header.setMinimumSectionSize(40)
         # Shallow indent so the grouped param names (Image File, Meta File, …)
         # sit close under the top-level Save Path row instead of stepping far
@@ -761,7 +761,7 @@ class imageWrangler(wranglerWidget):
             self.scan.skip_2d = False
         else:
             self.viewer_mode = None
-            self.scan.skip_2d = '1D' in mode_text
+            self.scan.skip_2d = ('1D' in mode_text) and ('2D' not in mode_text)
 
         # Sync to thread
         self.thread.batch_mode = self.batch_mode
@@ -785,16 +785,22 @@ class imageWrangler(wranglerWidget):
             self.tree.setEnabled(True)
         except AttributeError:
             pass
-        # Hide the run row (Live/Start/Stop) in viewer mode.  Pre-attach
-        # (standalone / tests) the wrangler owns its specUI `frame`; post-attach
-        # that frame is dead and hidden by attach_controls — re-showing it here
-        # was the source of the DUPLICATE run row, so when attached we instead
-        # toggle the SHARED controls' action row.
+        # In viewer mode there's no run, but HIDING the run row leaves an ugly
+        # empty box (Vivek) -- so keep the row visible and just DISABLE it
+        # (greyed Live/Start/Stop).  Pre-attach (standalone / tests) the wrangler
+        # owns its specUI `frame`; post-attach that frame is dead (hidden by
+        # attach_controls) and we drive the SHARED controls' action row instead.
         _controls = getattr(self, '_controls', None)
         if _controls is None:
-            self.ui.frame.setVisible(not is_viewer)
+            self.ui.frame.setVisible(True)
+            self.ui.frame.setEnabled(not is_viewer)
         else:
-            _controls.set_run_row_visible(not is_viewer)
+            _controls.set_run_row_visible(True)
+            _controls.set_run_row_enabled(not is_viewer)
+            # No batch processing in a file viewer -> hide the Batch toggle (and
+            # the Cores it gates) in viewer modes; apply_profile restores it for
+            # processing modes.
+            _controls.batchButton.setVisible(not is_viewer)
         # Notify parent only when viewer mode actually changed (avoids
         # unnecessary layout resets when just toggling Live/Batch).
         new_vm = self.viewer_mode or ''
@@ -1881,15 +1887,15 @@ class imageWrangler(wranglerWidget):
         self.tree.setStyleSheet("""
         QTreeView { alternate-background-color: #21222c; }
         QTreeView::item:has-children {
-            background-color: #44475a;
+            background-color: #52566d;
             color: #f8f8f2;
         }
         QTreeView::item:has-children:disabled {
-            background-color: #3a3d4d;
+            background-color: #46495c;
             color: #6272a4;
         }
         QLineEdit, QComboBox, QAbstractSpinBox {
-            background-color: #4a4f63;
+            background-color: #3f4354;
             color: #f8f8f2;
         }
             """)

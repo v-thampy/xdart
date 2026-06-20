@@ -146,8 +146,8 @@ class PanelLayout:
     * ``imageToolbar`` — middle control bar (40px tall by UI default).
     * ``frame_4``/``frame_6`` — process-mode controls (norm/bkg, scale/cmap);
       hidden in viewer modes.  ``_showImageBtn`` lives inside ``frame_6``.
-    * ``plotToolBar``  — permanently collapsed (its controls moved to the
-      middle bar in ``_reflow_controls``).
+    * ``plotToolBar``  — legacy bottom plot toolbar, emptied by
+      ``_reflow_controls`` and reused as the Image Viewer top intensity row.
     * ``show_image_btn`` — the raw-preview button (only meaningful in 1D-only
       Int mode; its host ``frame_6`` is hidden in viewer modes regardless).
     """
@@ -201,11 +201,11 @@ PANEL_LAYOUT = {
         # frame_4 shown to host the Set BG button (Norm Channel is hidden inside
         # it at runtime, so only Set BG shows, left-justified where Norm is in Int).
         frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=False,
-        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=True,
         show_image_btn_vis=False,
         twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
         plotWindow_h=(0, 0), imageToolbar_h=(40, 40),
-        plotToolBar_h=(0, 0), binnedFrame_w=(0, 0),
+        plotToolBar_h=(40, 40), binnedFrame_w=(0, 0),
     ),
     # XYE Viewer: 1D overlay only; 2D container hidden, middle bar kept
     # (Single/Options/Legend/Clear), process controls hidden.  frame_6 kept so

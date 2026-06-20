@@ -91,6 +91,33 @@ def test_run_active_locks_controls(qapp):
     assert c.liveButton.isEnabled()
 
 
+def test_mode_row_enabled_locks_mode_batch_cores(qapp):
+    """The mode row (mode combo + Batch + Cores) locks during a run while the
+    action row stays usable.  Owned by _enter/_exit_run_state so a reintegrate
+    (which skips wrangler.enabled()) also locks it."""
+    c = StaticControls()
+    c.set_mode_row_enabled(False)
+    assert not c.modeCombo.isEnabled()
+    assert not c.batchButton.isEnabled()
+    assert not c.coresSpin.isEnabled()
+    assert c.actionRow.isEnabled()                 # action row left alone
+    c.set_mode_row_enabled(True)
+    assert c.modeCombo.isEnabled()
+    assert c.batchButton.isEnabled()
+
+
+def test_run_row_enabled_keeps_row_visible(qapp):
+    """Viewer modes DISABLE the action row rather than hiding it (an empty box
+    looked broken) -- the row stays visible, just greyed."""
+    c = StaticControls()
+    c.set_run_row_visible(True)
+    c.set_run_row_enabled(False)
+    assert not c.actionRow.isEnabled()             # greyed
+    assert not c.actionRow.isHidden()              # but still visible (no empty box)
+    c.set_run_row_enabled(True)
+    assert c.actionRow.isEnabled()
+
+
 def test_getters(qapp):
     c = StaticControls()
     c.apply_profile(modes=['Int 1D', 'Int 2D'])

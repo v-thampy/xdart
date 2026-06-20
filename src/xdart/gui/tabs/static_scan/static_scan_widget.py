@@ -430,10 +430,11 @@ class staticWidget(QWidget):
         self.ui.controlsLayout.addWidget(self.controls)
         # Hug the controls' own (snug, uniform-padded) content height and fix it,
         # so the bottom controls bar can't be resized by the splitter and has no
-        # excess black space above/below the rows.
-        self.ui.controlsFrame.setFixedHeight(
-            self.controls.sizeHint().height()
-            + 2 * self.ui.controlsFrame.frameWidth())
+        # excess black space above/below the rows.  RECOMPUTED after profile /
+        # run-row show-hide (set_wrangler, mode change) so it can't go stale
+        # (slack in viewer modes where the run row is hidden, or clip if content
+        # grows) -- see _fit_controls_height.
+        self._fit_controls_height()
         self.controls.modeCombo.currentTextChanged.connect(
             self._on_processing_mode_changed)
         # Single owner of the shared Stop button: dispatch to whichever run is
@@ -660,6 +661,21 @@ class staticWidget(QWidget):
         self._pending_frames = {}
         self._scan_info_rows = {}
 
+    def _fit_controls_height(self):
+        """Pin the bottom controls bar to its current content height.
+
+        Recomputed (not set once) because StaticControls shows/hides rows after
+        init -- the run row hides in viewer modes, mode-specific widgets toggle
+        per profile -- so a height frozen from the initial sizeHint would leave
+        slack (run row hidden) or clip (content grown).  Called at init and after
+        every profile / mode change."""
+        try:
+            self.ui.controlsFrame.setFixedHeight(
+                self.controls.sizeHint().height()
+                + 2 * self.ui.controlsFrame.frameWidth())
+        except Exception:
+            logger.debug("fit controls height failed", exc_info=True)
+
     def set_wrangler(self, qint):
         """Sets the wrangler based on the selected item in the dropdown.
         Syncs the wrangler's attributes and wires signals as needed.
@@ -731,9 +747,11 @@ class staticWidget(QWidget):
         self.wrangler.setup()
         self._sync_h5viewer_save_dir(getattr(self.wrangler, 'h5_dir', None))
         # currentTextChanged (above) only fires on a CHANGE, so seed the control
-        # state once now — otherwise the Reintegrate row would sit at its default
-        # (enabled) until the first mode switch even with no processed scan.
-        self._apply_integration_control_state()
+        # and display state once now.  This is especially important on a fresh
+        # startup: the mode combo is restored while signals are blocked, so the
+        # display must not wait for a later scan/run to learn whether the current
+        # mode is 1D-only or 2D.
+        self._on_processing_mode_changed(_combo.currentText())
         # E1/E2: modifier-free, plotMethod-aware overlay build for the XYE file
         # list (active only in xye mode).  Mouse presses go to the viewport, key
         # presses to the list widget — install on both.
@@ -768,18 +786,22 @@ class staticWidget(QWidget):
         # reproduces them.  (Re-added per wrangler swap, like the lines above.)
         self.h5viewer.sigNewFile.connect(self._hydrate_integrator_on_load)
         # self.h5viewer.sigNewFile.connect(self.disable_displayframe_update)
+        # The freshly-attached profile may have shown/hidden run rows -> refit the
+        # controls bar to the new content height.
+        self._fit_controls_height()
 
     def disconnect_wrangler(self):
         """Disconnects all signals attached the the current wrangler
         """
         import warnings
+        # These signals belong to the wrangler being torn down — a bare
+        # disconnect() is fine (the whole wrangler is going away).
         signals = [self.wrangler.sigStart,
                    self.wrangler.sigUpdateData,
                    self.wrangler.sigUpdateFile,
                    self.wrangler.finished,
                    self.wrangler.sigPaused,
-                   self.wrangler.sigResuming,
-                   self.h5viewer.sigNewFile]
+                   self.wrangler.sigResuming]
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
             signals.append(self.wrangler.sigViewerModeChanged)
         if hasattr(self.wrangler, 'sigSavePathChanged'):
@@ -798,6 +820,21 @@ class staticWidget(QWidget):
                     signal.disconnect()
             except (TypeError, RuntimeError, SystemError) as e:
                 logger.debug("Failed to disconnect signal: %s", e)
+        # h5viewer.sigNewFile is on a PERSISTENT object (the viewer survives
+        # wrangler swaps), so a bare .disconnect() would also drop any future /
+        # other subscriber.  Disconnect ONLY the slots set_wrangler attached.
+        for slot in (getattr(self.wrangler, 'set_fname', None),
+                     self.displayframe.set_axes,
+                     self.h5viewer.data_reset,
+                     self._hydrate_integrator_on_load):
+            if slot is None:
+                continue
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    self.h5viewer.sigNewFile.disconnect(slot)
+            except (TypeError, RuntimeError, SystemError):
+                pass
         # Release the shared run-controls so the next wrangler can re-alias them
         # cleanly (drops this wrangler's tracked signal connections).
         try:
@@ -812,9 +849,19 @@ class staticWidget(QWidget):
         so it survives wrangler swaps.  Per-mode integration-control state +
         forcing the display out of any stuck viewer mode for a non-viewer mode.
         """
+        # This slot is connected before the active wrangler's mode handler.  Do
+        # not let display geometry depend on the wrangler updating scan.skip_2d
+        # first, or a fresh startup can briefly use the previous/default mode and
+        # show the opposite panel.  The selected mode text is the source of truth
+        # for layout.
+        self._sync_processing_mode_to_scan(mode_text)
         # Per-mode integration control enable/dim (C3/C4) — runs for every
         # processing-mode change, including the viewer modes.
         self._apply_integration_control_state()
+        # The mode change may show/hide the run row (hidden in viewer modes) —
+        # refit the controls bar height.  BEFORE the viewer-mode early return so
+        # it runs for viewer modes too (that's exactly when the row hides).
+        self._fit_controls_height()
         # Skip the rest when in viewer mode — set_viewer_display_mode controls
         # panels.
         if 'Viewer' in mode_text:
@@ -836,6 +883,34 @@ class staticWidget(QWidget):
         self.displayframe.clear_display_state()
         self.displayframe.request_plot_autorange()
         self.h5viewer.data_changed()
+
+    @staticmethod
+    def _mode_skips_2d(mode_text):
+        """Return whether a processing-mode label represents a 1D-only run."""
+        text = str(mode_text or '')
+        if 'Viewer' in text:
+            return False
+        return ('1D' in text) and ('2D' not in text)
+
+    def _sync_processing_mode_to_scan(self, mode_text):
+        """Synchronize scan/display 1D-only state from the selected mode text."""
+        skip_2d = self._mode_skips_2d(mode_text)
+        targets = [
+            getattr(self, 'scan', None),
+            getattr(getattr(self, 'displayframe', None), 'scan', None),
+            getattr(getattr(self, 'wrangler', None), 'scan', None),
+        ]
+        thread = getattr(getattr(self, 'wrangler', None), 'thread', None)
+        if thread is not None:
+            targets.append(getattr(thread, 'scan', None))
+        for target in targets:
+            if target is None:
+                continue
+            try:
+                target.skip_2d = skip_2d
+            except Exception:
+                logger.debug("could not sync skip_2d for %r", target,
+                             exc_info=True)
 
     def _sync_h5viewer_save_dir(self, path, *, refresh=True):
         """Point the Scans browser at the active processed-output directory."""
@@ -1413,6 +1488,15 @@ class staticWidget(QWidget):
         if adv is not None:
             adv.setEnabled(not is_viewer and not run_active)
 
+        # GI (Fiber) + Threshold rows (added this cycle) follow the SAME rule as
+        # the integration panels: disabled in viewer modes and during a run.
+        # They were omitted before, so they stayed bright/active while the rest of
+        # the integrator was greyed -- now the whole integrator dims together.
+        for name in ('gi_frame', 'frame_pixreject'):
+            frame = getattr(ui, name, None)
+            if frame is not None:
+                frame.setEnabled(not is_viewer and not run_active)
+
     def _session_run_active(self):
         """4d: True iff a streaming session is open AND reports it is running.
 
@@ -1456,6 +1540,14 @@ class staticWidget(QWidget):
         # writer is churning — that's the frame-click freeze).
         self.h5viewer.set_run_writing(True)
         self._apply_integration_control_state()   # run_active=True → disable
+        # Lock the MODE row (mode combo + Batch + Cores) for the run.  A wrangler
+        # run also does this via wrangler.enabled(), but a reintegrate does not —
+        # so own it here (the single run-start owner).  The ACTION row stays
+        # enabled (Pause/Resume/Stop).
+        try:
+            self.controls.set_mode_row_enabled(False)
+        except Exception:
+            logger.debug("lock mode row on run enter failed", exc_info=True)
         # Enable the shared Stop button for the run.  For a wrangler run this is
         # redundant (the wrangler enables it via the alias); for a reintegrate it
         # is the ONLY thing that makes Stop usable -> abort + retune.
@@ -1510,6 +1602,12 @@ class staticWidget(QWidget):
         # the mode-correct state (run_active is now False).
         self.enable_integration(True)
         self._apply_integration_control_state()
+        # Unlock the mode row (matched with _enter_run_state).  A wrangler end
+        # also does this via wrangler.enabled(True); both agree on the idle state.
+        try:
+            self.controls.set_mode_row_enabled(True)
+        except Exception:
+            logger.debug("unlock mode row on run exit failed", exc_info=True)
         # Run fully ended: drop the Stop button (reintegrate enabled it in
         # _enter_run_state; a wrangler end agrees on the idle state).
         try:

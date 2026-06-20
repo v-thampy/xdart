@@ -232,7 +232,10 @@ class StrBrowseParameterItem(StrParameterItem):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(3)
         le = _TailLineEdit()
-        le.setStyleSheet('border: 0px')
+        # Match the wrangler tree's darker input tone.  Set explicitly because
+        # this custom widget otherwise falls back to the global button/input
+        # styles instead of the tree-local QLineEdit rule.
+        le.setStyleSheet('border: 0px; background-color: #3f4354;')
         btn = QtWidgets.QPushButton(self.param.opts.get('buttonText', 'Browse'))
         btn.setMaximumWidth(72)
         btn.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
@@ -242,11 +245,11 @@ class StrBrowseParameterItem(StrParameterItem):
         # edit's inline style above; hover picks up the purple focus accent.
         btn.setStyleSheet(
             "QPushButton {"
-            " background-color: #6272a4; color: #f8f8f2;"
-            " border: 1px solid #6272a4; border-radius: 3px; padding: 1px 6px; }"
+            " background-color: #5269a8; color: #f8f8f2;"
+            " border: 1px solid #6075b5; border-radius: 3px; padding: 1px 6px; }"
             "QPushButton:hover {"
-            " background-color: #7282b4; border-color: #bd93f9; }"
-            "QPushButton:pressed { background-color: #565f8c; }"
+            " background-color: #627ac0; border-color: #bd93f9; }"
+            "QPushButton:pressed { background-color: #465d96; }"
         )
         lay.addWidget(le, 1)
         lay.addWidget(btn)

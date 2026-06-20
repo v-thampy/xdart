@@ -107,6 +107,136 @@ def _combo_text(combo, index):
         pass
     return ''
 
+
+class _IntensityRangeSlider(QtWidgets.QWidget):
+    """Small two-handle horizontal range slider for display intensity."""
+
+    sigRangeChanged = Qt.QtCore.Signal(float, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._vmin = 0.0
+        self._vmax = 1.0
+        self._lo = 0.0
+        self._hi = 1.0
+        self._drag = None
+        self.setMinimumSize(Qt.QtCore.QSize(150, 24))
+        self.setMaximumHeight(28)
+        self.setFocusPolicy(pyQt.StrongFocus)
+        self.setToolTip("Manual intensity range.")
+
+    def values(self):
+        return self._lo, self._hi
+
+    def domain(self):
+        return self._vmin, self._vmax
+
+    def has_valid_domain(self):
+        return np.isfinite(self._vmin) and np.isfinite(self._vmax) and self._vmax > self._vmin
+
+    def _fractions(self):
+        if not self.has_valid_domain():
+            return 0.0, 1.0
+        span = self._vmax - self._vmin
+        return ((self._lo - self._vmin) / span,
+                (self._hi - self._vmin) / span)
+
+    def setDomain(self, vmin, vmax, *, lower=None, upper=None,
+                  preserve_fraction=True, emit=False):
+        try:
+            vmin, vmax = float(vmin), float(vmax)
+        except (TypeError, ValueError):
+            self.setEnabled(False)
+            return
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            self.setEnabled(False)
+            return
+
+        old_frac = self._fractions()
+        self._vmin, self._vmax = vmin, vmax
+        self.setEnabled(True)
+        if lower is None or upper is None:
+            if preserve_fraction:
+                lower = vmin + old_frac[0] * (vmax - vmin)
+                upper = vmin + old_frac[1] * (vmax - vmin)
+            else:
+                lower, upper = vmin, vmax
+        self.setValues(lower, upper, emit=emit)
+
+    def setValues(self, lower, upper, *, emit=True):
+        if not self.has_valid_domain():
+            return
+        lo = float(np.clip(lower, self._vmin, self._vmax))
+        hi = float(np.clip(upper, self._vmin, self._vmax))
+        if hi < lo:
+            lo, hi = hi, lo
+        changed = (abs(lo - self._lo) > 1e-12 or abs(hi - self._hi) > 1e-12)
+        self._lo, self._hi = lo, hi
+        self.update()
+        if emit and changed:
+            self.sigRangeChanged.emit(self._lo, self._hi)
+
+    def _track_rect(self):
+        margin = 9
+        h = self.height()
+        return Qt.QtCore.QRectF(margin, h / 2 - 3, max(1, self.width() - 2 * margin), 6)
+
+    def _x_for_value(self, value):
+        rect = self._track_rect()
+        if not self.has_valid_domain():
+            return rect.left()
+        frac = (value - self._vmin) / (self._vmax - self._vmin)
+        return rect.left() + float(np.clip(frac, 0.0, 1.0)) * rect.width()
+
+    def _value_for_x(self, x):
+        rect = self._track_rect()
+        frac = (float(x) - rect.left()) / rect.width()
+        frac = float(np.clip(frac, 0.0, 1.0))
+        return self._vmin + frac * (self._vmax - self._vmin)
+
+    def paintEvent(self, event):
+        painter = Qt.QtGui.QPainter(self)
+        painter.setRenderHint(Qt.QtGui.QPainter.RenderHint.Antialiasing)
+        rect = self._track_rect()
+        disabled = not self.isEnabled()
+        track = Qt.QtGui.QColor("#3a3d4d" if not disabled else "#282a36")
+        fill = Qt.QtGui.QColor("#bd93f9" if not disabled else "#6272a4")
+        handle = Qt.QtGui.QColor("#f8f8f2" if not disabled else "#6272a4")
+        painter.setPen(pyQt.NoPen)
+        painter.setBrush(track)
+        painter.drawRoundedRect(rect, 3, 3)
+        lo_x = self._x_for_value(self._lo)
+        hi_x = self._x_for_value(self._hi)
+        sel = Qt.QtCore.QRectF(lo_x, rect.top(), max(1.0, hi_x - lo_x), rect.height())
+        painter.setBrush(fill)
+        painter.drawRoundedRect(sel, 3, 3)
+        painter.setBrush(handle)
+        for x in (lo_x, hi_x):
+            painter.drawEllipse(Qt.QtCore.QPointF(x, rect.center().y()), 5.5, 5.5)
+
+    def mousePressEvent(self, event):
+        if not self.isEnabled():
+            return
+        x = event.position().x()
+        lo_x = self._x_for_value(self._lo)
+        hi_x = self._x_for_value(self._hi)
+        self._drag = "lo" if abs(x - lo_x) <= abs(x - hi_x) else "hi"
+        self._move_handle(x)
+
+    def mouseMoveEvent(self, event):
+        if self._drag is not None:
+            self._move_handle(event.position().x())
+
+    def mouseReleaseEvent(self, event):
+        self._drag = None
+
+    def _move_handle(self, x):
+        value = self._value_for_x(x)
+        if self._drag == "lo":
+            self.setValues(min(value, self._hi), self._hi)
+        elif self._drag == "hi":
+            self.setValues(self._lo, max(value, self._lo))
+
 # Switch to using white background and black foreground
 pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
@@ -282,6 +412,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._connect_signals()
         self._init_controls()
         self._reflow_controls()
+        self._init_intensity_controls()
         self._set_tooltips()
         self._set_equal_primary_panel_heights()
         self._install_share_geometry_hooks()
@@ -349,6 +480,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self.ui.clear_1D)
         for w in ones:
             bot.removeWidget(w)
+        while bot.count():
+            bot.takeAt(0)
 
         # Rebuild the middle bar: 1D controls, stretch, then 2D controls.
         for w in ones:
@@ -357,7 +490,29 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         mid.addWidget(self.ui.shareAxis)
         mid.addWidget(self.ui.imageUnit)
 
-        # The bottom bar is empty now — collapse it so the 1D plot grows.
+        # The bottom bar is empty now.  It is collapsed in normal modes and
+        # reused as the Image Viewer top intensity row.
+        bot.setContentsMargins(0, 0, 8, 0)
+        bot.setSpacing(8)
+        bot.addStretch(1)
+        self._prepare_viewer_intensity_toolbar()
+
+    def _prepare_viewer_intensity_toolbar(self):
+        """Reuse the emptied legacy plot toolbar as Image Viewer's top row."""
+        toolbar = self.ui.plotToolBar
+        toolbar.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        toolbar.setLineWidth(0)
+        toolbar.setMidLineWidth(0)
+        try:
+            layout = self.ui.verticalLayout_3
+            two_d = self.ui.twoDWindow
+            target = layout.indexOf(two_d)
+            if target >= 0 and layout.indexOf(toolbar) != target:
+                layout.insertWidget(target, toolbar)
+        except Exception:
+            logger.debug("viewer intensity toolbar placement failed", exc_info=True)
+
+        # Start hidden; PANEL_LAYOUT owns visibility/height from here on.
         self.ui.plotToolBar.setMaximumHeight(0)
         self.ui.plotToolBar.setMinimumHeight(0)
         self.ui.plotToolBar.setVisible(False)
@@ -370,6 +525,62 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         for w in (self.ui.shareAxis, self.ui.imageUnit, self.ui.slice,
                   self.ui.slice_center, self.ui.slice_width):
             w.setVisible(visible)
+
+    def _set_middle_1d_controls_visible(self, visible: bool):
+        """Show/hide toolbar controls that are analysis controls, not viewer
+        intensity controls."""
+        for w in (self.ui.plotUnit, self.ui.plotMethod,
+                  self.ui.wf_options, self.ui.clear_1D):
+            w.setVisible(visible)
+
+    def _init_intensity_controls(self):
+        """Viewer / 1D-only display-scale controls hosted in the middle row."""
+        self._intensityWidget = QtWidgets.QFrame(self.ui.imageToolbar)
+        self._intensityWidget.setObjectName("viewerIntensityControls")
+        self._intensityWidget.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._intensityWidget.setStyleSheet("""
+        QFrame#viewerIntensityControls {
+            border: 0px;
+            background: transparent;
+        }
+        QFrame#viewerIntensityControls QLabel {
+            border: 0px;
+            background: transparent;
+        }
+        """)
+        lay = QtWidgets.QHBoxLayout(self._intensityWidget)
+        lay.setContentsMargins(0, 0, 8, 0)
+        lay.setSpacing(8)
+        self._intensityLabel = QtWidgets.QLabel("Intensity", self._intensityWidget)
+        self._intensitySlider = _IntensityRangeSlider(self._intensityWidget)
+        self._intensityAuto = QtWidgets.QPushButton("Autoscale", self._intensityWidget)
+        self._intensityAuto.setCheckable(True)
+        self._intensityAuto.setChecked(True)
+        self._intensityAuto.setFixedHeight(28)
+        displayFrameWidget._fit_button_width(self._intensityAuto, pad=34)
+        self._intensityAuto.setMinimumWidth(112)
+        lay.addWidget(self._intensityLabel)
+        lay.addWidget(self._intensitySlider)
+        lay.addWidget(self._intensityAuto)
+        self._move_intensity_controls_for_mode(Mode.INT_1D)
+        self._intensityWidget.setVisible(False)
+        self._intensitySlider.sigRangeChanged.connect(self._on_intensity_range_changed)
+        self._intensityAuto.toggled.connect(self._on_intensity_autoscale_toggled)
+
+    def _move_intensity_controls_for_mode(self, mode):
+        """Host the intensity controls on the row that is visible for mode."""
+        if not hasattr(self, "_intensityWidget"):
+            return
+        try:
+            if mode is Mode.IMAGE_VIEWER:
+                self.ui.horizontalLayout.addWidget(self._intensityWidget)
+            else:
+                idx = self.ui.horizontalLayout_2.indexOf(self.ui.shareAxis)
+                if idx < 0:
+                    idx = self.ui.horizontalLayout_2.count()
+                self.ui.horizontalLayout_2.insertWidget(idx, self._intensityWidget)
+        except Exception:
+            logger.debug("intensity control placement failed", exc_info=True)
 
     def _set_equal_primary_panel_heights(self):
         """Give the 2D and 1D primary panels equal splitter space."""
@@ -1641,7 +1852,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
         The geometric align lines panes up by SCREEN columns (not equal data
         ranges), so the spans must be in a common coordinate system -- global
-        screen pixels -- even though each pane lives in its own window."""
+        screen pixels -- even though each pane lives in its own window.
+
+        ASSUMES an axis-aligned scene transform (translation + uniform scale):
+        only the rect's two opposite corners' x() are mapped, so a rotated /
+        sheared viewbox would misalign.  Safe today -- no path rotates these
+        pyqtgraph viewboxes -- but revisit this mapping if one ever does."""
         r = vb.sceneBoundingRect()
         left = win.mapToGlobal(win.mapFromScene(r.topLeft())).x()
         right = win.mapToGlobal(win.mapFromScene(r.bottomRight())).x()
@@ -1899,6 +2115,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         elif (mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER)
                 and state.load_status is LoadStatus.READY):
             self._set_viewer_title(list(state.render_ids))
+        refresh_intensity = getattr(
+            self, "_refresh_intensity_controls_after_render", None)
+        if refresh_intensity is not None:
+            refresh_intensity(mode)
         return True
 
     def update_views(self):
@@ -1928,6 +2148,173 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.update_2d_label()
         self.update_plot_view()
 
+    # ── Viewer / 1D intensity range controls ─────────────────────
+
+    def _intensity_controls_visible_for_mode(self, mode):
+        if mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER, Mode.INT_1D):
+            return True
+        return False
+
+    def _set_intensity_controls_visible(self, visible):
+        try:
+            self._intensityWidget.setVisible(bool(visible))
+        except Exception:
+            logger.debug("intensity control visibility update failed", exc_info=True)
+
+    @staticmethod
+    def _finite_minmax(data):
+        arr = np.asarray(data, dtype=float)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return None
+        lo, hi = float(np.nanmin(finite)), float(np.nanmax(finite))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return None
+        return lo, hi
+
+    def _image_display_minmax(self, widget):
+        data = getattr(widget, "displayed_image", None)
+        return displayFrameWidget._finite_minmax(data)
+
+    def _image_current_levels(self, widget):
+        levels = getattr(getattr(widget, "imageItem", None), "levels", None)
+        if levels is None:
+            return None
+        try:
+            lo, hi = float(levels[0]), float(levels[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            return lo, hi
+        return None
+
+    def _plot_display_minmax(self):
+        try:
+            plot = self._active_bottom_plot()
+            if plot is not None:
+                y_range = plot.getViewBox().viewRange()[1]
+            else:
+                y_range = None
+        except Exception:
+            y_range = None
+        data_range = displayFrameWidget._finite_minmax(
+            self.plot_data[1] if len(self.plot_data) > 1 else ()
+        )
+        if data_range is not None:
+            return data_range
+        if y_range is not None:
+            return float(y_range[0]), float(y_range[1])
+        return None
+
+    def _plot_current_levels(self):
+        try:
+            plot = self._active_bottom_plot()
+            if plot is None:
+                return None
+            lo, hi = plot.getViewBox().viewRange()[1]
+            lo, hi = float(lo), float(hi)
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                return lo, hi
+        except Exception:
+            logger.debug("plot y-range lookup failed", exc_info=True)
+        return None
+
+    def _intensity_target_for_mode(self, mode):
+        if mode is Mode.IMAGE_VIEWER:
+            return ("image", self.image_widget)
+        if mode in (Mode.XYE_VIEWER, Mode.INT_1D):
+            if getattr(self, "_waterfall_active", lambda: False)():
+                return ("waterfall", self.wf_widget)
+            return ("plot", self._active_bottom_plot())
+        return (None, None)
+
+    def _refresh_intensity_controls_after_render(self, mode):
+        if not hasattr(self, "_intensityWidget"):
+            return
+        visible = self._intensity_controls_visible_for_mode(mode)
+        self._set_intensity_controls_visible(visible)
+        if not visible:
+            return
+
+        target, obj = self._intensity_target_for_mode(mode)
+        if target in ("image", "waterfall"):
+            domain = self._image_display_minmax(obj)
+            current = self._image_current_levels(obj)
+        elif target == "plot":
+            domain = self._plot_display_minmax()
+            current = self._plot_current_levels()
+        else:
+            domain = current = None
+
+        if domain is None:
+            self._intensitySlider.setEnabled(False)
+            return
+
+        if self._intensityAuto.isChecked():
+            values = current if current is not None else domain
+            self._intensitySlider.setDomain(
+                domain[0], domain[1], lower=values[0], upper=values[1],
+                preserve_fraction=False, emit=False,
+            )
+            return
+
+        self._intensitySlider.setDomain(
+            domain[0], domain[1], preserve_fraction=True, emit=False)
+        lo, hi = self._intensitySlider.values()
+        self._apply_intensity_range(mode, lo, hi)
+
+    def _on_intensity_autoscale_toggled(self, checked):
+        mode = self._live_mode()
+        if checked:
+            try:
+                target, obj = self._intensity_target_for_mode(mode)
+                if target == "plot":
+                    plot = self._active_bottom_plot()
+                    if plot is not None:
+                        plot.enableAutoRange(axis='y')
+                else:
+                    self.update()
+            except Exception:
+                logger.debug("intensity autoscale restore failed", exc_info=True)
+            return
+
+        # Seed manual mode from what is currently on screen, then apply it.
+        target, obj = self._intensity_target_for_mode(mode)
+        if target in ("image", "waterfall"):
+            domain = self._image_display_minmax(obj)
+            current = self._image_current_levels(obj)
+        elif target == "plot":
+            domain = self._plot_display_minmax()
+            current = self._plot_current_levels()
+        else:
+            domain = current = None
+        if domain is None:
+            self._intensitySlider.setEnabled(False)
+            return
+        values = current if current is not None else domain
+        self._intensitySlider.setDomain(
+            domain[0], domain[1], lower=values[0], upper=values[1],
+            preserve_fraction=False, emit=False,
+        )
+        self._apply_intensity_range(mode, *self._intensitySlider.values())
+
+    def _on_intensity_range_changed(self, lo, hi):
+        if self._intensityAuto.isChecked():
+            return
+        self._apply_intensity_range(self._live_mode(), lo, hi)
+
+    def _apply_intensity_range(self, mode, lo, hi):
+        target, obj = self._intensity_target_for_mode(mode)
+        if target in ("image", "waterfall") and obj is not None:
+            displayFrameWidget._apply_image_levels(obj, (lo, hi))
+        elif target == "plot":
+            plot = self._active_bottom_plot()
+            if plot is not None:
+                try:
+                    plot.setYRange(float(lo), float(hi), padding=0)
+                except Exception:
+                    logger.debug("manual plot y-range failed", exc_info=True)
+
     # ── 1D-only visibility ────────────────────────────────────────
 
     def _apply_layout(self, mode):
@@ -1947,6 +2334,9 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         """
         spec = PANEL_LAYOUT[mode]
         ui = self.ui
+        move_intensity = getattr(self, "_move_intensity_controls_for_mode", None)
+        if move_intensity is not None:
+            move_intensity(mode)
         # Visibility.
         ui.frame_top.setVisible(spec.frame_top_vis)
         ui.twoDWindow.setVisible(spec.twoDWindow_vis)
@@ -1994,6 +2384,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self._set_2d_controls_visible(False)
         else:
             self._set_2d_controls_visible(True)
+        set_intensity_visible = getattr(
+            self, "_set_intensity_controls_visible", None)
+        if set_intensity_visible is not None:
+            set_intensity_visible(skip)
         # Rebuild the plotUnit combo only on a 1D-only<->2D *transition* (so the
         # user's current selection is preserved on every other render).
         # ``set_axes`` is skip-aware: Int 1D drops the 2D-derived axes, Int 2D
@@ -2990,6 +3384,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             # mode change so a viewer's background never bleeds into Int (or the
             # other viewer).  Each mode starts with no background.
             self._clear_bkg()
+            try:
+                self._intensityAuto.blockSignals(True)
+                self._intensityAuto.setChecked(True)
+                self._intensityAuto.blockSignals(False)
+            except Exception:
+                pass
         self.viewer_mode = mode
         self._viewer_is_xdart = False
         self._viewer_x_axis_label = None
@@ -3022,6 +3422,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             layout_mode = (Mode.INT_1D if getattr(self.scan, 'skip_2d', False)
                            else Mode.INT_2D)
         self._apply_layout(layout_mode)
+        set_intensity_visible = getattr(
+            self, "_set_intensity_controls_visible", None)
+        if set_intensity_visible is not None:
+            set_intensity_visible(
+                layout_mode in (Mode.IMAGE_VIEWER, Mode.XYE_VIEWER, Mode.INT_1D)
+            )
 
         # Control-state the geometry table deliberately does not own.
         if mode == 'xye':
@@ -3034,7 +3440,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _plot = getattr(self, 'plot', None)   # duck holders in tests
             if _plot is not None:
                 _plot.enableAutoRange()
-            self.ui.plotUnit.setVisible(False)
+            set_middle_visible = getattr(
+                self, "_set_middle_1d_controls_visible", None)
+            if set_middle_visible is not None:
+                set_middle_visible(False)
             self._set_2d_controls_visible(False)
             # frame_6 is shown so the Linear/Log scale applies to the 1D
             # plot; the colormap stays too (Vivek) — the XYE waterfall image
@@ -3065,6 +3474,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             _plot = getattr(self, 'plot', None)
             if _plot is not None:
                 _plot.enableAutoRange()
+            if mode == 'image':
+                set_middle_visible = getattr(
+                    self, "_set_middle_1d_controls_visible", None)
+                if set_middle_visible is not None:
+                    set_middle_visible(False)
+                self._set_2d_controls_visible(False)
             # Image Viewer: Set BG subtracts a background raw frame; NeXus has no
             # subtractable display, so its button stays hidden.
             self._show_viewer_set_bkg(mode == 'image')
@@ -3081,6 +3496,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             self.ui.cmap.setEnabled(True)
             if self.ui.cmap.parent() is not None:
                 self.ui.cmap.setVisible(True)   # restore if hidden by XYE viewer
+            set_middle_visible = getattr(
+                self, "_set_middle_1d_controls_visible", None)
+            if set_middle_visible is not None:
+                set_middle_visible(True)
             self.ui.plotUnit.setVisible(True)
             self.ui.plotUnit.setEnabled(True)
             # Re-baseline the Overlay/Waterfall unit tracker on the return to a

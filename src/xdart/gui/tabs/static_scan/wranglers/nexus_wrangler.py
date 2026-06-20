@@ -210,6 +210,10 @@ class nexusWrangler(wranglerWidget):
             name='nexus_wrangler', type='group', children=params
         )
         self.tree.setParameters(self.parameters, showTop=False)
+        header = self.tree.header()
+        header.setStretchLastSection(True)
+        header.resizeSection(0, 79)
+        header.setMinimumSectionSize(40)
         # Hide the "Parameter / Value" header bar (parity with the image
         # wrangler) — visual noise above the tree.
         self.tree.setHeaderHidden(True)
@@ -226,15 +230,15 @@ class nexusWrangler(wranglerWidget):
         self.tree.setStyleSheet("""
         QTreeView { alternate-background-color: #21222c; }
         QTreeView::item:has-children {
-            background-color: #44475a;
+            background-color: #52566d;
             color: #f8f8f2;
         }
         QTreeView::item:has-children:disabled {
-            background-color: #3a3d4d;
+            background-color: #46495c;
             color: #6272a4;
         }
         QLineEdit, QComboBox, QAbstractSpinBox {
-            background-color: #4a4f63;
+            background-color: #3f4354;
             color: #f8f8f2;
         }
             """)

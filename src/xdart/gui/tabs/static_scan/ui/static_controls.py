@@ -187,6 +187,23 @@ class StaticControls(QtWidgets.QWidget):
         self._divider.setVisible(visible)
         self.actionRow.setVisible(visible)
 
+    def set_run_row_enabled(self, enabled):
+        """Enable/disable the whole ACTION row (Live/Start/Stop) while keeping it
+        VISIBLE.  Viewer modes have no run, but a hidden row leaves an ugly empty
+        box -- so they show the row greyed-out instead.  Within an enabled row the
+        per-button states (Stop disabled at idle, etc.) still apply."""
+        self.actionRow.setEnabled(bool(enabled))
+
+    def set_mode_row_enabled(self, enabled):
+        """Enable/disable the MODE row (mode combo + Batch + Cores).  Locked while
+        a run is in progress -- including a reintegrate, which (unlike a wrangler
+        run) does not go through wrangler.enabled().  The ACTION row is left
+        alone so Pause/Resume/Stop stay usable."""
+        enabled = bool(enabled)
+        for w in (self.modeCombo, self.batchButton, self.coresSpin,
+                  self.coresLabel):
+            w.setEnabled(enabled)
+
     # ── per-wrangler capability profile ──
     def apply_profile(self, *, modes=None, live=True, batch=True, cores=True):
         """Repopulate the mode items + show/hide Live/Batch/cores for the active

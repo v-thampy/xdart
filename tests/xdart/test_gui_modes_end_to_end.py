@@ -259,6 +259,76 @@ def test_image_viewer_no_selection_clears_panel(widget):
     assert df.image_data is None
 
 
+def test_f8_intensity_controls_are_mode_scoped(widget):
+    """Intensity controls live in the existing second row for every 1D/viewer
+    display, but stay out of the full Int 2D panel."""
+    w = widget
+    df = w.displayframe
+
+    w._on_viewer_mode_changed("image")
+    assert not df._intensityWidget.isHidden()
+    assert df.ui.imageToolbar.isHidden()
+    assert not df.ui.plotToolBar.isHidden()
+    assert df.ui.verticalLayout_3.indexOf(df.ui.plotToolBar) < df.ui.verticalLayout_3.indexOf(df.ui.twoDWindow)
+    assert df.ui.plotMethod.isHidden()
+    assert df.ui.clear_1D.isHidden()
+
+    w._on_viewer_mode_changed("xye")
+    assert not df._intensityWidget.isHidden()
+    assert not df.ui.imageToolbar.isHidden()
+    assert df.ui.plotToolBar.isHidden()
+    assert df.ui.plotUnit.isHidden()
+    assert df.ui.plotMethod.isHidden()
+
+    w._on_viewer_mode_changed("")
+    df.scan.skip_2d = False
+    df._apply_1d_only_visibility()
+    assert df._intensityWidget.isHidden()
+
+    df.scan.skip_2d = True
+    df._apply_1d_only_visibility()
+    assert not df._intensityWidget.isHidden()
+    assert not df.ui.plotMethod.isHidden()
+
+
+def test_f8_image_viewer_manual_intensity_levels(widget):
+    """Turning Autoscale off seeds from the current image levels, then the range
+    slider applies display-only levels to the Image Viewer."""
+    w = widget
+    w._on_viewer_mode_changed("image")
+    df = w.displayframe
+    raw = np.arange(100, dtype=float).reshape(10, 10)
+    _set_image_frame(w, 0, raw)
+    w.h5viewer._viewer_is_xdart = False
+    w.set_data()
+
+    assert df._intensityAuto.isChecked() is True
+    assert df.image_widget.imageItem.levels is not None
+
+    df._intensityAuto.setChecked(False)
+    df._intensitySlider.setValues(10.0, 20.0)
+    lo, hi = df.image_widget.imageItem.levels
+    assert np.isclose(lo, 10.0)
+    assert np.isclose(hi, 20.0)
+
+
+def test_wrangler_tree_polish(widget):
+    w = widget
+    tree = w.wrangler.tree
+    assert tree.header().minimumSectionSize() == 40
+    assert tree.header().sectionSize(0) <= 79
+    style = tree.styleSheet()
+    assert "#52566d" in style
+    assert "#3f4354" in style
+    from PySide6 import QtWidgets
+    browse_buttons = [
+        b for b in tree.findChildren(QtWidgets.QPushButton)
+        if b.text() == "Browse"
+    ]
+    assert browse_buttons
+    assert "#5269a8" in browse_buttons[0].styleSheet()
+
+
 def test_image_widget_colorbar_limits_nan_aware(qapp):
     """Regression: a NaN-masked frame must still display with percentile levels.
 
@@ -478,6 +548,43 @@ def test_layout_transition_destination_geometry(widget, origin, dest):
     # 1D-only origin must have a non-zero twoDWindow height.
     if dest in (Mode.IMAGE_VIEWER, Mode.NEXUS_VIEWER, Mode.INT_2D):
         assert df.ui.twoDWindow.maximumHeight() > 0
+
+
+def test_processing_mode_change_uses_selected_text_not_stale_skip(widget, qapp):
+    """Fresh-start mode changes must not depend on the previous skip_2d flag.
+
+    The static-widget mode handler is connected before the wrangler's handler,
+    so it must seed ``scan.skip_2d`` from the selected text before applying the
+    layout.  Otherwise a fresh startup can show the Int 1D panel for Int 2D, and
+    vice versa, until a scan run updates the flag through another path.
+    """
+    w = widget
+    df = w.displayframe
+
+    _set_processing_mode(w, "Int 1D")
+    qapp.processEvents()
+    assert _geom(df) == _expected(Mode.INT_1D)
+
+    # Simulate the stale fresh-start state: the selected text is about to switch
+    # to Int 2D, but all scan objects still say 1D-only.
+    w.scan.skip_2d = True
+    df.scan.skip_2d = True
+    getattr(w.wrangler, "scan", w.scan).skip_2d = True
+    _set_processing_mode(w, "Int 2D")
+    qapp.processEvents()
+    assert w.scan.skip_2d is False
+    assert df.scan.skip_2d is False
+    assert _geom(df) == _expected(Mode.INT_2D)
+
+    # And the reverse: switching to Int 1D while the scan objects still say 2D.
+    w.scan.skip_2d = False
+    df.scan.skip_2d = False
+    getattr(w.wrangler, "scan", w.scan).skip_2d = False
+    _set_processing_mode(w, "Int 1D")
+    qapp.processEvents()
+    assert w.scan.skip_2d is True
+    assert df.scan.skip_2d is True
+    assert _geom(df) == _expected(Mode.INT_1D)
 
 
 def test_layout_render_path_int_1d_only_is_self_sufficient(widget):
@@ -1296,14 +1403,17 @@ def test_integration_controls_enabled_per_mode(widget):
         assert not iu.frame2D.isEnabled()
 
     # XYE Viewer: both integration panels disabled, but Calibrate / Make Mask
-    # stay enabled.
+    # stay enabled.  The GI (Fiber) + Threshold rows (relocated into the
+    # integrator this cycle) must dim with the rest -- they used to stay bright.
     _mode("XYE Viewer")
     assert not iu.frame1D.isEnabled() and not iu.frame2D.isEnabled()
+    assert not iu.gi_frame.isEnabled() and not iu.frame_pixreject.isEnabled()
     assert iu.pyfai_calib.isEnabled() and iu.get_mask.isEnabled()
 
     # Back to Int 2D restores everything.
     _mode("Int 2D")
     assert iu.frame1D.isEnabled() and iu.frame2D.isEnabled()
+    assert iu.gi_frame.isEnabled() and iu.frame_pixreject.isEnabled()
 
 
 # ── Reintegrate row (resurfaced buttons) ───────────────────────────────────
@@ -1699,6 +1809,35 @@ def test_run_state_toggles_processing_active(widget):
     w._exit_run_state()
     assert w._run_active is False
     assert w.displayframe._processing_active is False
+
+
+def test_run_state_disables_whole_integrator_and_mode_row(widget):
+    """During a run the WHOLE integrator greys -- including the GI (Fiber) +
+    Threshold rows relocated into the integrator this cycle (the regression: they
+    stayed bright while the rest dimmed) -- and the mode row (mode combo / Batch /
+    Cores) locks; the action row (Pause/Resume/Stop) stays usable."""
+    w = widget
+    iu = w.integratorTree.ui
+    w._exit_run_state()                          # idle baseline
+    combo = w.wrangler.ui.processingModeCombo
+    i = combo.findText("Int 2D")                 # a mode where the rows start on
+    if i >= 0:
+        combo.blockSignals(True)
+        combo.setCurrentIndex(i)
+        combo.blockSignals(False)
+        w._apply_integration_control_state()
+    assert iu.gi_frame.isEnabled() and iu.frame_pixreject.isEnabled()
+
+    w._enter_run_state()
+    assert not iu.frame1D.isEnabled() and not iu.frame2D.isEnabled()
+    assert not iu.gi_frame.isEnabled() and not iu.frame_pixreject.isEnabled()
+    assert not w.controls.modeCombo.isEnabled()
+    assert not w.controls.batchButton.isEnabled()
+    assert w.controls.actionRow.isEnabled()      # action row stays live
+
+    w._exit_run_state()
+    assert iu.gi_frame.isEnabled() and iu.frame_pixreject.isEnabled()
+    assert w.controls.modeCombo.isEnabled()
 
 
 def test_run_state_is_idempotent(widget):
