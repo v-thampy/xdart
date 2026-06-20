@@ -94,6 +94,47 @@ view = read_frame_view("processed/scan1.nxs", 0)   # one frame, display-ready
 raw = get_raw_frame("processed/scan1.nxs", 0)      # resolves the source pointer
 ```
 
+## Intensity corrections
+
+The value in each (q, χ) cake cell or RSM voxel is only physically meaningful once per-pixel
+**intensity corrections** are applied. They divide out instrumental/geometric factors so what
+remains is proportional to the sample's scattering. Two groups:
+
+**Detector / beam (apply to any integration):**
+
+- **Solid angle.** A flat-panel pixel far from the beam centre is farther away and viewed
+  obliquely, so it subtends a smaller solid angle Ω (∝ cos³2θ) and collects fewer photons for
+  the same scattered intensity. Dividing by Ω converts counts → intensity-per-solid-angle and
+  boosts the high-angle pixels. (pyFAI applies this by default.)
+- **Polarization.** Synchrotron light is ~linearly polarized; Thomson scattering is suppressed
+  along the polarization direction, imprinting a 2θ- and azimuth-dependent modulation on the
+  rings. Dividing by the polarization factor removes it. (Set the degree of polarization,
+  ≈ 0.99 horizontal at most beamlines.)
+- **Lorentz, dark/flat/efficiency, air absorption.** Standard powder/detector corrections; Lorentz
+  is a geometric weighting usually folded into 1D integration.
+
+**Grazing incidence** (gated to GI mode; built from `xrayutilities` optics, n = 1 − δ + iβ,
+critical angle αc = √2δ, with exit angle αf = arcsin(qz/k − sin αi)):
+
+- **Footprint / illuminated area.** At grazing αi the beam spreads over a footprint ∝ 1/sin αi;
+  for a sample larger than the beam the illuminated scattering volume grows with it, so measured
+  intensity does too. The correction (× sin αi) normalizes it (a global scale at fixed αi;
+  per-frame when αi is scanned).
+- **Refraction.** The beam refracts at the surface (δ ~ 10⁻⁶); the true angles inside the film
+  are αi′ = √(αi²−αc²), αf′ = √(αf²−αc²), which shift the apparent qz / ring positions near αc.
+  Below αc the wave is evanescent.
+- **Penetration / absorption.** Probed depth depends sharply on αi vs αc (nm below, µm above),
+  and both the αi and αf paths are attenuated over the absorption length μ⁻¹. The correction
+  accounts for the αi/αf-dependent path length, boosting strongly-absorbed grazing-exit pixels.
+- **Fresnel transmission / Vineyard (DWBA).** |T(αi)|² and |T(αf)|² peak at αc — the bright
+  **Yoneda band**. Measured intensity carries |T(αi)|²|T(αf)|²; dividing it out removes the
+  Yoneda enhancement and recovers the true scattering.
+
+Design: [`docs/design/design_intensity_corrections_jun2026.md`](docs/design/design_intensity_corrections_jun2026.md)
+(per-pixel weight stack at the accumulator seam — solid-angle/polarization reuse pyFAI arrays,
+the GI stack uses `xu.materials`). Interactive demo with on/off toggles, an αi slider and a
+material selector: `examples/.../Stitching/Multi120_GI_Corrections_Explorer.ipynb`.
+
 ## The GUI
 
 ```bash

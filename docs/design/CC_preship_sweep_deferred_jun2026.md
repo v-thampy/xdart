@@ -239,3 +239,25 @@ Notes for implementation:
   switches (store on the shared display state, not the mode controller),
   and the generation-stamp rules apply (background change = effective
   selection change -> bump display_generation).
+
+### F6 — metadata readers should record ALL motor positions, not just the scanned motor (Vivek, Jun 19)
+In a SPEC file the **scanned** motors/positioners are recorded per-point in the
+**table data** (`#L` columns), while the **non-scanned** motors are recorded
+**once at the scan header** (`#P`/`#O` positioner lines).  The current readers
+likely capture only the scanned column(s); they should record **all** motor
+positions — per-frame scanned + static header — and the same applies to future
+NeXus / other source readers.
+
+**Why it matters:** the GI incidence motor can be a non-standard / non-scanned
+motor (desired default search order, case-insensitive: `th`, `theta`, `eta`,
+`halpha`, `gth`, `gonth`).  If only the scanned motor is kept, a GI scan whose
+incidence motor wasn't the scanned axis loses its angle source.  Also general
+provenance/reprocessing value.
+
+Notes for implementation:
+- Look at `xrd_tools.io.metadata` (`read_image_metadata`, `_extract_scan_info`)
+  + the SPEC parser; compare what it extracts vs the full `#P`/`#O` header vs
+  the `#L` data columns.  Estimate effort first — depth unknown.
+- Dependency of the GI-panel-move + 2-way-sync feature
+  (`design_gi_panel_move_and_2way_sync_jun2026.md`): the incidence-motor
+  dropdown's options come from this metadata.

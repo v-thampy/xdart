@@ -63,22 +63,135 @@ assume vs what is now true:
 
 ---
 
+## 2.5 Validated against real data (Jun 2026) — gaps the stitching notebook exposed
+
+`examples/.../Stitching/stitch_simplified.ipynb` was built + executed end-to-end on
+real beamline data (SSRL, **Pilatus 300k-w on a `psic` arm**: LaB6 at 17 keV, a
+287-frame `mesh del 5 45 / nu -10 29`; `.raw` int32 `(195, 1475)`; `del`/`nu` from the
+SPEC file). It runs the headless readers (`io.spec.get_angles`, `io.image.read_image`,
+the result/`PONI` containers) but had to fall back to **pyFAI's own goniometer** for
+the stitch — which surfaced concrete gaps in the current stitch modules:
+
+- **The real-world geometry is a pyFAI `GoniometerRefinement`** (`MG_gonio_object.json`):
+  params `{dist, poni1, poni2, rot1_offset, rot1_scale, rot2_offset, rot2_scale,
+  rot3_offset}` + a `GeometryTransformation` — `rot1 = rot1_scale·nu + rot1_offset`,
+  `rot2 = rot2_scale·del + rot2_offset`, `rot3 = rot3_offset (≈0)` — over a detector
+  carrying `Detector_config {"orientation": 3}` (the 90° panel mount). This is the
+  declarative model `DiffractometerGeometry` already approximates, *fitted*.
+
+- **GAP A — `stitch_images` / `create_multigeometry_integrators` hardwire the scale to
+  `deg2rad`.** `create_multigeometry_integrators` (`multi.py:33`) builds each AI as
+  `rot1 = base.rot1 + deg2rad(motor)` / `rot2 = base.rot2 + deg2rad(motor)`. It cannot
+  use the **fitted** `rot1_scale`/`rot2_scale` (≈0.0172/0.0168 ≈ 0.96–0.99·deg2rad
+  here), so per-frame geometry drifts from the calibration by `(deg2rad − scale)·angle`
+  — **~1.7° at del=45, growing with angle**. The notebook confirms the stitched pattern
+  diverges from the calibrated goniometer.
+
+- **GAP B — `PONI` carries only the detector *name*, not `Detector_config`.**
+  `core/containers.PONI.detector` is a `str`; `poni_to_integrator` (`calibration.py:110`)
+  rebuilds it with `detector_factory(name)` (`:164`) at **default** config. A non-default
+  orientation / custom mask / binning is silently lost. It only works here because
+  `Pilatus300kw`'s pyFAI default *is* `orientation 3`; on a detector whose needed
+  orientation isn't the default, the PONI base would be geometrically wrong.
+
+- **GAP C — no per-frame *full-geometry* input path.** `run_stitch`/`stitch_images`
+  vary only `rot1`/`rot2` from one fixed base; there is no way to hand the stitch a list
+  of complete per-frame geometries. The `stitch_ponis(images, ponis)` primitive (§3.2)
+  does not exist yet, so neither a calibrated goniometer **nor** a moving-detector source
+  can flow through the headless API.
+
+- **GAP D — no goniometer/calibration model in core, and no importer.** The real
+  artifact is a pyFAI gonio JSON. `DiffractometerGeometry` is close but (a) produces only
+  `rot1/2/3` (no `dist`/`poni`/`detector`), (b) has no detector config, and (c) has no
+  `from_pyfai_goniometer` constructor. So a calibration computed in pyFAI can't be loaded
+  into the xrd-tools model.
+
+- **GAP E — image-array orientation is a required, beamline-specific input (the biggest
+  *practical* bug; validated).** The raw detector array must be transformed (rot/flip/
+  transpose) to match the orientation the calibration used — here a **180° rotation**.
+  With identity, every frame's q-map is wrong and the stitched rings wash out to a flat
+  line. The detector's `Detector_config orientation` alone is **not** sufficient (identity
+  stays broken). **This is exactly what the old `rot3=-90` was wrongly compensating for.**
+  So the source/geometry spec needs an explicit **image-orientation transform** field
+  (0/90/180/270 + flip/transpose; 90/270 also swap the detector dims → a transposed
+  detector). The wrangler must collect it per detector mount.
+- **GAP F — the detector mask is mandatory + build the MultiGeometry with `unit=`.**
+  Without the module-gap mask (`detector.calc_mask()`, applied per-image via `lst_mask`)
+  the gaps dominate the histogram and flatten the pattern. And `gonio.get_mg()` returns a
+  `(2th_deg, chi_deg)` MultiGeometry — setting `.unit` afterward is **silently ignored**,
+  so the headless stitch must construct `MultiGeometry(ais, unit=…, radial_range=…)`
+  explicitly. Both must be baked into the headless stitch path (the notebook hit all of
+  GAP E/F before it produced LaB6).
+
+**Net:** for this psic/Pilatus case the calibrated goniometer is the production path; the
+current headless stitch needs the geometry carrier + bridge + an explicit image-orientation
+transform + mandatory masking. Closing A–F = a **per-frame full-geometry carrier**
+(§3.1–3.2) + a **pyFAI-goniometer bridge** (companion doc) + an **image-orientation input**
++ **always-on detector masking**. These are the load-bearing additions for a real
+stitching module.
+
+---
+
 ## 3. Headless design (the one source layer)
 
-### 3.1 Geometry input = the shared `Diffractometer`
-Stitch's per-frame detector rotations come from
-`Diffractometer.to_pyfai_per_frame(motors)` (companion doc), the **same** object RSM
-consumes. `run_stitch` today takes `rot1_key`/`rot2_key` and reads raw motor columns;
-reconcile it to **derive rotations from the scan's `Diffractometer`** (already on
-`Scan.geometry` / persisted + reloadable), with the explicit-key path kept as an
-override. This is the concrete "one geometry object, both consumers" payoff.
+### 3.1 Geometry input = a base `DetectorCalibration` + the shared `Diffractometer`
 
-### 3.2 Per-image PONIs (the different-position case)
-Keep `run_stitch`'s common path (shared `base_poni` + per-frame rotations) and add the
-general path the old doc proposed: a `stitch_ponis(images, ponis)` primitive (a
-complete `PONI` per image) so a source that genuinely moves the detector (per-position
-PONI files, or a translation motor) feeds a per-image PONI list and skips rotation
-derivation. `MultiGeometry` consumes either identically.
+**Refinement is OPTIONAL — two construction routes, ONE stitch path** (Vivek, Jun 2026):
+- **Uncalibrated** (no goniometer fit): build the `Diffractometer` from a **preset + a
+  base `DetectorCalibration`** (a single-position `.poni` + its `detector_config` **and
+  image-orientation transform**, GAP E). Per-frame `rot = base.rot + deg2rad(motor)`
+  (scale = 1). Approximate but **usable across the full nu/del range** — a single low-nu
+  row is sharpest, wide nu broadens mildly (no cliff; med|Δq| 0.027→0.048 Å⁻¹). This is
+  today's `stitch_images`/`create_multigeometry_integrators`, **fixed to carry
+  `detector_config` + the image transform** (GAP B/E). Matches the old notebook's
+  `MultiGeometry([AzInt(...rot1=nu,rot2=del...)])` path.
+- **Calibrated** (goniometer fit done): `Diffractometer.from_pyfai_goniometer(gonio_json)`
+  — fitted per-axis scale+offset (§3.4). Sharpest over the full range. (Build the
+  `MultiGeometry` explicitly with `unit=` — `gonio.get_mg()` returns `2th_deg` and a
+  post-hoc `.unit` is silently ignored, GAP F.)
+
+Both routes produce per-frame `DetectorCalibration`s that feed the **same**
+`stitch_ponis(images, geometries)` → `MultiGeometry` (§3.2). The stitch primitive is
+geometry-source-agnostic — "refinement optional" just means the `Diffractometer` was
+**preset-built** or **gonio-fitted**. The Refine button (§5.4) is what turns the
+uncalibrated inputs into a calibrated goniometer.
+
+A stitch frame's geometry has two parts, and the current API only carries one:
+
+- **Constant per scan:** `dist, poni1, poni2`, the *detector* and its `Detector_config`
+  (orientation/mask/binning), wavelength. Today this is a `PONI`, which **drops the
+  detector config** (GAP B). Fix: a **`DetectorCalibration`** = `PONI` fields **plus**
+  `detector_config` (or extend `PONI` with a `detector_config: dict`), so the base
+  carries the 90° mount and any custom detector setup. Both stitch (pyFAI AI) and RSM
+  (the `DetectorHeader`/camera mount) read it.
+- **Per frame:** `rot1/rot2/rot3` from `Diffractometer.to_pyfai_per_frame(motors)`
+  (companion doc) — the **same** object RSM consumes. Crucially the `Diffractometer` must
+  carry the **fitted** per-axis scale+offset (not a hardwired `deg2rad`, GAP A): its
+  `AngleMapping(sign=scale, offset=…)` already expresses `rot = scale·motor + offset`, so
+  a fitted goniometer model fits the object exactly.
+
+So: `per_frame_geometry = base DetectorCalibration ⊕ Diffractometer.to_pyfai_per_frame`.
+`run_stitch` today takes `rot1_key`/`rot2_key` and **adds `deg2rad(motor)`** — reconcile
+it to derive rotations from the scan's `Diffractometer` (fitted scales preserved), with
+the explicit-key path kept only as a no-calibration fallback.
+
+### 3.2 `stitch_ponis` must accept *full* per-frame geometries (closes GAP C)
+Add the primitive the old doc proposed, generalized: **`stitch_ponis(images,
+geometries)`** where each `geometry` is a complete per-frame `DetectorCalibration`
+(dist/poni/rot1/rot2/rot3 + detector_config) — built either from the
+`base ⊕ Diffractometer` path above, or supplied directly when a source genuinely *moves*
+the detector (per-position PONI files, a translation motor). `MultiGeometry` consumes the
+resulting per-image AIs identically. `create_multigeometry_integrators` becomes the
+thin "base + Diffractometer rotations → per-frame geometries" helper feeding it.
+
+### 3.2a Bridge: load a pyFAI goniometer calibration (closes GAP D)
+The real-world calibration artifact is a pyFAI `GoniometerRefinement` JSON. Add a
+**`Diffractometer.from_pyfai_goniometer(json)`** importer (companion doc) that parses the
+`GeometryTransformation` expressions into `AngleMapping`s (scale→`sign`, offset→`offset`)
+and the base params into a `DetectorCalibration` (incl. `detector_config`). This lets a
+beamline calibrate in pyFAI and stitch/RSM headlessly in xrd-tools with no pyFAI
+`Goniometer` at runtime — and is the single most useful interop step (the notebook
+currently calls pyFAI's `Goniometer.sload` directly only because this bridge is missing).
 
 ### 3.3 Stitch is a SCAN-LEVEL finalize-stage product — NOT a `FrameRecord`
 Critical reconciliation to arch-v2: ADR-0003/0005 are about **per-frame** records
@@ -171,6 +284,64 @@ Register through the existing controller registry (`display_logic.py` /
 the memory note that lumped stitch + RSM as both needing #69. (RSM does; stitch
 doesn't.)
 
+### 5.4 Inputs the wrangler widget must collect (from the notebook)
+
+> **Organization** (how these inputs are grouped into mode-gated panels, plus the RSM-only
+> additions — DiffractometerConfig + UB capture, image-orientation transform, scan_data
+> round-trip, live-vs-batch) is specced in
+> [`design_wrangler_organization_jun2026.md`](design_wrangler_organization_jun2026.md). This
+> section stays the authoritative *input list*; that doc is the *layout*.
+
+Everything the notebook hard-codes becomes a widget field. Grouped by concern, with the
+`StitchPlan`/source mapping (★ = **new**, not on `StitchPlan` today):
+
+**Source / data**
+- SPEC (or NeXus/Tiled) master file path → builds the `FrameSource`.
+- Scan selection **+ grouping** with range syntax `1-3, 5, 7-9` → one `run_stitch` per
+  group (`frame_indices` / a grouped source).
+- Image directory + filename pattern/prefix (`{prefix}{spec}_scan{N}_{frame:04d}.raw`),
+  or auto-derived → resolved by the source.
+- ★ Raw-image read params for headerless formats: `detector_shape`, `raw_dtype`,
+  `header_skip` (or inferred from the detector) → `read_image` args on the source.
+
+**Geometry / calibration** (the load-bearing new inputs)
+- ★ **Calibration source**: a pyFAI **goniometer JSON** (preferred) *or* a base
+  `.poni` + a `Diffractometer` preset → a `DetectorCalibration` + `Diffractometer`
+  (§3.1–3.2a). Replaces today's bare `base_poni`.
+- ★ **"Refine" button next to the calibration control** (Vivek, Jun 2026): when no
+  goniometer JSON exists yet, the user supplies a **single-position base `.poni`** (from
+  pyFAI-calib on one low-angle image) + **calibration images + their `(del,nu)`
+  metadata** + the calibrant (LaB6); the button runs the headless
+  `refine_goniometer(base_poni, images, angles, calibrant, …)` (companion doc §3.4) and
+  stores the resulting `Diffractometer`. The base `.poni` is the *starting point* for
+  the fit, not the final geometry. Thin button; refinement is the headless function.
+- ★ Detector name **+ `Detector_config`** (orientation, mask, binning) — from the gonio/
+  poni or set explicitly (GAP B).
+- ★ Convention/preset (`two_circle`/`psic`/…) **+ motor-name mapping**: which SPEC
+  columns are the detector-arm angles (`del`,`nu`) and the incidence motor (GI). The
+  notebook assumes `del`/`nu`; the widget must let the user map/override.
+
+**Stitch parameters** (mostly exist on `StitchPlan`)
+- `mode` (1D/2D); `npt_1d` / `npt_rad_2d` / `npt_azim_2d`; `unit`; `method`;
+  `radial_range` / `azimuth_range` (or auto from the angle span).
+- `mask` (detector mask) ★ + a **hot-pixel/saturation threshold** (`threshold`→NaN in
+  `read_image`; the notebook used `8e5`).
+- `monitor_key` for per-frame normalization (i0/i1; optional).
+
+**Frame selection** (optional — NOT an accuracy gate)
+- Angle-range filters (nu/del) to drop genuinely bad frames only. **No default guard:**
+  with the geometry correct, stitching is good across the full nu/del range (measured:
+  full mesh == narrow band), so default to **ALL frames**. The `nu·del` cross-term of
+  pyFAI's fixed order is a graceful residual the *fitted* path shares too — restrict only
+  if you actually see broadening at extreme angles. Applied as `frame_indices`.
+
+**Energy / wavelength**: from the SPEC `energy` motor, or an override field.
+**Output**: stitched-file name/location (one `.nxs` per group; §6.5).
+
+> Most "stitch parameters" already exist on `StitchPlan`; the **new** surface is the
+> calibration/Diffractometer carrier, `detector_config`, raw-read params, and the
+> angle-range frame filters — i.e. exactly GAPs A–D plus the validity window.
+
 ---
 
 ## 6. Open questions — resolved or flagged
@@ -209,19 +380,27 @@ doesn't.)
    + `CapabilityAttr` to `io/schema.py`; route `write_stitched` through the sink/schema
    path; add `get_stitched_1d/2d` readers. **Gate:** write→read round-trip; capability
    feature-detect; existing `read_stitched` xarray still passes; orientation preserved.
-2. **Reconcile `run_stitch` to the one source layer.** Derive per-frame rotations from
-   `scan.Diffractometer` (explicit `rot*_key` as override); add the `stitch_ponis`
-   per-image-PONI path; persist stitch provenance. **Gate:** synthetic multi-frame
-   source → stitched 1D + 2D; per-image-PONI path; no-raw on a moved tree fails loud
-   with a clear message (never stitch off thumbnails).
-3. **xdart grouping over `FrameSource`.** Range-syntax grouping; one `run_stitch` per
-   group; composite source for cross-file "Multi". **Gate:** grouping parser test;
-   end-to-end on real SPEC data (the old §11 "1000-frame psic" check).
-4. **Stitch viewer registration.** `Mode.STITCH_VIEWER` + `PANEL_LAYOUT` +
+2. **Geometry carrier + goniometer bridge (closes GAPs A–D).** Add the
+   `DetectorCalibration` (PONI + `detector_config`), make `Diffractometer` carry fitted
+   per-axis scale+offset (companion doc), add `stitch_ponis(images, geometries)` over
+   *full* per-frame geometries, and add `Diffractometer.from_pyfai_goniometer(json)`.
+   **Gate (real data):** load `MG_gonio_object.json` → stitch the LaB6 17 keV mesh →
+   assert the stitched pattern matches the pyFAI-`Goniometer` reference within the
+   radial bin width (the notebook is the fixture); a non-default `Detector_config`
+   round-trips; the fitted scale (not `deg2rad`) is used.
+3. **Reconcile `run_stitch` to the one source layer.** Derive per-frame rotations from
+   `scan.Diffractometer` (explicit `rot*_key` as a no-calibration fallback); persist
+   stitch provenance (Diffractometer + DetectorCalibration). **Gate:** synthetic
+   multi-frame source → stitched 1D + 2D; no-raw on a moved tree fails loud (never
+   stitch off thumbnails).
+4. **xdart grouping over `FrameSource`.** Range-syntax grouping; one `run_stitch` per
+   group; composite source for cross-file "Multi"; collect the §5.4 inputs. **Gate:**
+   grouping parser test; end-to-end on the real SPEC mesh (the notebook data).
+5. **Stitch viewer registration.** `Mode.STITCH_VIEWER` + `PANEL_LAYOUT` +
    `StitchViewerController` + `register_controller`; "Int-minus-raw" layout; optional
    raw popup (shared dialog). **Gate:** offscreen `display_logic` test asserts the
    panels/layout for the mode; controller `build_payload` renders a stitched result.
-5. **(deferred) Live directory stitching + streaming `StitchPlan` backend.** Only when
+6. **(deferred) Live directory stitching + streaming `StitchPlan` backend.** Only when
    a real need lands; streaming follows the RSM gridder shape; any bounds prepass
    follows ADR-0006 (concrete function + `scan_manifest()`), not a framework.
 
@@ -235,6 +414,11 @@ doesn't.)
   `Scan.geometry`), `core/frame_view.py:476` (`FrameRecord` — why stitch is NOT
   per-frame), `display_logic.py` (`Mode`/`PanelRole.STITCH_2D`/`PanelKey`/`PanelLayout`/
   `register_controller`, WS-X2 TODO l.924), `display_controllers.py` (`_BaseController`).
+- Code (gaps): `integrate/multi.py:33` (`create_multigeometry_integrators`, hardwired
+  `deg2rad`), `integrate/calibration.py:110,164` (`poni_to_integrator` → `detector_factory(name)`,
+  drops `Detector_config`), `core/containers.py` (`PONI.detector: str`).
+- Validated by: `examples/.../Stitching/stitch_simplified.ipynb` on real SSRL data
+  (LaB6 17 keV `del`/`nu` mesh, Pilatus 300k-w, pyFAI `MG_gonio_object.json`).
 - Superseded: `docs/gui/stitching_design.md`, `docs/gui/nexus_stitch_refactor_plan.md`.
 - Decisions: ADR-0002 (capability attrs), ADR-0003 (per-frame cardinality — stitch is
   out of scope of it), ADR-0005 (store ownership), ADR-0006 (finalize-stage
