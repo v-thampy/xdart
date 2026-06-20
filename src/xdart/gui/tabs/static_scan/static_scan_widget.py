@@ -419,6 +419,34 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("could not move Calibrate/Make Mask to the tools bar",
                          exc_info=True)
+        # CONTROLS section: the single shared run-controls widget, installed into
+        # the bottom controlsFrame.  set_wrangler attaches it to the active
+        # wrangler (routing its signals) — it is never reparented on swap.  Its
+        # mode-change drives the staticWidget-level reaction (viewer reset +
+        # display clear + integration-control state) here, ONCE.
+        from .ui.static_controls import StaticControls
+        self.controls = StaticControls()
+        self.ui.controlsLayout.setContentsMargins(0, 0, 0, 0)
+        self.ui.controlsLayout.addWidget(self.controls)
+        # Hug the controls' own (snug, uniform-padded) content height and fix it,
+        # so the bottom controls bar can't be resized by the splitter and has no
+        # excess black space above/below the rows.
+        self.ui.controlsFrame.setFixedHeight(
+            self.controls.sizeHint().height()
+            + 2 * self.ui.controlsFrame.frameWidth())
+        self.controls.modeCombo.currentTextChanged.connect(
+            self._on_processing_mode_changed)
+        # Single owner of the shared Stop button: dispatch to whichever run is
+        # active — a reintegrate (integrator thread) takes priority, else the
+        # wrangler.  The wranglers no longer connect Stop directly, so a Stop
+        # press during a reintegrate can't also trip the idle wrangler's stop()
+        # side-effects (unchecking Live, command='stop', button morph).
+        self.controls.stopButton.clicked.connect(self._on_stop_clicked)
+        # Reintegrate reuses the shared Batch toggle: Batch off -> live (per-frame,
+        # the default); Batch on -> fast multicore.  The integrator reads it
+        # through this provider at click time (no direct controls ref needed).
+        self.integratorTree._reintegrate_batch_provider = (
+            lambda: self.controls.batchButton.isChecked())
         # Restore the integration panel (units/pts/ranges/Auto flags/GI modes
         # + Advanced params) from the previous session; saved in close().
         try:
@@ -467,6 +495,10 @@ class staticWidget(QWidget):
         self.displayframe.sigCleared.connect(self._on_display_cleared)
 
         # Integrator signals
+        # GI on/off now lives on the integrator panel — route its toggle through
+        # the same handler the wrangler's GI checkbox used (sets scan.gi +
+        # refreshes the panel axis units/labels).
+        self.integratorTree.sigUpdateGI.connect(self.update_scattering_geometry)
         self.integratorTree.integrator_thread.started.connect(self.thread_state_changed)
         # Re-integration is a "run" too: route its START through the single
         # run-state owner (task #68) — keeps the 2D panels persistent AND
@@ -512,8 +544,13 @@ class staticWidget(QWidget):
         try:
             cfg = self.integratorTree.get_threshold_config()
         except Exception:
-            logger.debug("could not read integrator threshold config",
-                         exc_info=True)
+            # Fail LOUD: silently falling back means the LIVE run applies the
+            # wrangler's default pixel-rejection instead of the integrator's
+            # setting (a quiet live≠reintegrate divergence).
+            logger.warning(
+                "Could not read integrator threshold config; the live run will "
+                "use the wrangler default pixel-rejection, which may differ from "
+                "the integrator setting.", exc_info=True)
             return
         if cfg is None:
             return
@@ -531,6 +568,39 @@ class staticWidget(QWidget):
         _set('Mask', 'min', cfg.threshold_min)
         _set('Mask', 'max', cfg.threshold_max)
         _set('MaskSat', 'mask_sentinel', bool(cfg.mask_saturation))
+
+    def _push_gi_to_wrangler(self):
+        """Inject the integrator's CURRENT GI geometry into the active wrangler's
+        (now-hidden) GI carrier params, so a LIVE run uses the SAME GI geometry
+        the integrator shows (and Reintegrate reads).  Called from
+        ``start_wrangler`` BEFORE ``wrangler.setup()`` (which reads the GI params
+        into the thread).  Per-field guarded: a wrangler without a 'GI' group
+        just skips."""
+        try:
+            cfg = self.integratorTree.get_gi_config()
+        except Exception:
+            # Fail LOUD: a silent fallback means the LIVE run uses the wrangler's
+            # default GI geometry instead of the integrator's (quiet divergence).
+            logger.warning(
+                "Could not read integrator GI config; the live run will use the "
+                "wrangler default GI geometry, which may differ from the "
+                "integrator setting.", exc_info=True)
+            return
+        params = getattr(self.wrangler, 'parameters', None)
+        if params is None or cfg is None:
+            return
+
+        def _set(group, child, value):
+            try:
+                params.child(group).child(child).setValue(value)
+            except Exception:
+                pass  # wrangler lacks this group/child
+
+        _set('GI', 'Grazing', bool(cfg['gi']))
+        _set('GI', 'sample_orientation', int(cfg['sample_orientation']))
+        _set('GI', 'tilt_angle', float(cfg['tilt_angle']))
+        _set('GI', 'th_motor', str(cfg['incidence_motor']))
+        _set('GI', 'th_val', str(cfg['th_val']))
 
     def _init_wranglers(self):
         """Initialize the wrangler stack and select the default wrangler."""
@@ -571,6 +641,14 @@ class staticWidget(QWidget):
         # xdart.utils.throttle).
         self._update_timer = Coalescer(200, mode="throttle", parent=self)
         self._update_timer.triggered.connect(self._flush_pending_update)
+        # Reintegrate gets its OWN throttle: bai_*_all (live, batch=1) fires a
+        # per-frame `update` signal, and rendering each one synchronously floods
+        # the GUI (esp. the 2D cake at ~hundreds-of-ms each) -> the whole GUI
+        # freezes + paints nothing until the run ends.  Coalesce to ~5 Hz so the
+        # display tracks progress smoothly, like the wrangler's update_data path.
+        self._pending_reint_idx = None
+        self._reint_update_timer = Coalescer(200, mode="throttle", parent=self)
+        self._reint_update_timer.triggered.connect(self._flush_reintegrate_update)
         # Per-frame work is COALESCED off the GUI event loop: update_data only
         # POPs the freshly-integrated frame (cheap) into _pending_frames; the
         # heavy build/upsert/scan_data runs once per ~200 ms flush over ALL frames
@@ -601,6 +679,11 @@ class staticWidget(QWidget):
         self.wrangler.sigUpdateFile.connect(self.new_scan)
         # self.wrangler.sigUpdateFrame.connect(self.new_frame)
         self.wrangler.sigUpdateGI.connect(self.update_scattering_geometry)
+        # GI move (Stage B): the wrangler hands its available SPEC motor columns
+        # to the integrator's GI motor dropdown (the integrator owns selection).
+        if hasattr(self.wrangler, 'sigGIMotorOptions'):
+            self.wrangler.sigGIMotorOptions.connect(
+                self.integratorTree.set_gi_motor_options)
         self.wrangler.started.connect(self.thread_state_changed)
         self.wrangler.finished.connect(self.wrangler_finished)
         # Pause/Resume (Phase B): lift the freeze guard once paused (frozen at a
@@ -608,34 +691,27 @@ class staticWidget(QWidget):
         # wranglers that never emit these (nexus).
         self.wrangler.sigPaused.connect(self._on_run_paused)
         self.wrangler.sigResuming.connect(self._on_run_resuming)
-        if hasattr(self.wrangler, 'ui') and hasattr(self.wrangler.ui, 'processingModeCombo'):
-            def _on_mode_changed(mode_text):
-                # Per-mode integration control enable/dim (C3/C4) — runs for
-                # every processing-mode change, including the viewer modes.
-                self._apply_integration_control_state()
-                # Skip the rest when in viewer mode — set_viewer_display_mode
-                # controls panels.
-                if 'Viewer' in mode_text:
-                    return
-                # A non-viewer processing mode (Int 1D/2D, Int 1D (XYE)) must take
-                # the display OUT of any viewer mode it is stuck in.  The
-                # wrangler's sigViewerModeChanged is guarded by its own
-                # _prev_viewer_mode, which misses the case where the display was
-                # auto-switched to XYE after an Int 1D (XYE) batch (the wrangler's
-                # viewer_mode stayed None, so _prev stays '' and no reset emits).
-                # Force the display reset here so the combo and display can't desync.
-                if getattr(self.displayframe, 'viewer_mode', None) is not None:
-                    self._on_viewer_mode_changed('')
-                self.displayframe._apply_1d_only_visibility()
-                # Drop any visible/cached content from the previous mode,
-                # then reload the current selection for the new processing
-                # mode. Calling update() alone can leave a stale image/cake
-                # or curve visible when the new mode needs data that has not
-                # been loaded yet.
-                self.displayframe.clear_display_state()
-                self.displayframe.request_plot_autorange()
-                self.h5viewer.data_changed()
-            self.wrangler.ui.processingModeCombo.currentTextChanged.connect(_on_mode_changed)
+        # CONTROLS: attach the shared run-controls to this wrangler, apply its
+        # capability profile (mode items + Live/Batch/cores) and restore its
+        # persisted mode with the combo's signals BLOCKED — so item population
+        # can't fire a mode-change against a half-attached wrangler — then sync
+        # the wrangler's mode flags once.  The staticWidget-level mode reaction
+        # (_on_processing_mode_changed) is wired ONCE to the shared combo in
+        # _init_child_widgets, so it isn't reconnected per wrangler here.
+        prof = self.wrangler.controls_profile()
+        self.wrangler.attach_controls(self.controls)
+        _combo = self.controls.modeCombo
+        _combo.blockSignals(True)
+        self.controls.apply_profile(
+            modes=prof.get('modes'), live=prof.get('live', False),
+            batch=prof.get('batch', False), cores=prof.get('cores', True))
+        _cur = prof.get('current')
+        if _cur:
+            _i = _combo.findText(_cur)
+            if _i >= 0:
+                _combo.setCurrentIndex(_i)
+        _combo.blockSignals(False)
+        self.wrangler._on_mode_changed(_combo.currentText())
         if hasattr(self.wrangler, 'sigViewerModeChanged'):
             self.wrangler.sigViewerModeChanged.connect(self._on_viewer_mode_changed)
             # Sync current viewer mode (may have been restored from session).
@@ -663,6 +739,18 @@ class staticWidget(QWidget):
         # presses to the list widget — install on both.
         try:
             scans = self.h5viewer.ui.listScans
+            # listScans persists across wrangler swaps, so REMOVE the prior
+            # filter before installing a new one — otherwise repeated mode/source
+            # swaps stack filters on the same widget (duplicate handling + a
+            # small memory creep).
+            prev = getattr(self, '_xye_input_filter', None)
+            if prev is not None:
+                try:
+                    scans.viewport().removeEventFilter(prev)
+                    scans.removeEventFilter(prev)
+                except Exception:
+                    logger.debug("removing prior XYE input filter failed",
+                                 exc_info=True)
             self._xye_input_filter = _XyeOverlayInputFilter(
                 scans,
                 lambda: getattr(self.h5viewer, 'viewer_mode', None) == 'xye',
@@ -675,6 +763,10 @@ class staticWidget(QWidget):
         self.h5viewer.sigNewFile.connect(self.wrangler.set_fname)
         self.h5viewer.sigNewFile.connect(self.displayframe.set_axes)
         self.h5viewer.sigNewFile.connect(self.h5viewer.data_reset)
+        # Stage C (2-way sync): on a .nxs load, populate the integration panel
+        # from the saved scan so it shows the saved settings + reintegrate
+        # reproduces them.  (Re-added per wrangler swap, like the lines above.)
+        self.h5viewer.sigNewFile.connect(self._hydrate_integrator_on_load)
         # self.h5viewer.sigNewFile.connect(self.disable_displayframe_update)
 
     def disconnect_wrangler(self):
@@ -692,6 +784,10 @@ class staticWidget(QWidget):
             signals.append(self.wrangler.sigViewerModeChanged)
         if hasattr(self.wrangler, 'sigSavePathChanged'):
             signals.append(self.wrangler.sigSavePathChanged)
+        if hasattr(self.wrangler, 'sigUpdateGI'):
+            signals.append(self.wrangler.sigUpdateGI)
+        if hasattr(self.wrangler, 'sigGIMotorOptions'):
+            signals.append(self.wrangler.sigGIMotorOptions)
         # (Advanced is no longer wired to the wrangler button — it lives on the
         # integrator's persistent advanced_int now, so there's nothing per-wrangler
         # to disconnect here.)
@@ -702,6 +798,44 @@ class staticWidget(QWidget):
                     signal.disconnect()
             except (TypeError, RuntimeError, SystemError) as e:
                 logger.debug("Failed to disconnect signal: %s", e)
+        # Release the shared run-controls so the next wrangler can re-alias them
+        # cleanly (drops this wrangler's tracked signal connections).
+        try:
+            self.wrangler.detach_controls()
+        except Exception:
+            logger.debug("detach_controls failed", exc_info=True)
+
+    def _on_processing_mode_changed(self, mode_text):
+        """staticWidget-level reaction to a processing-mode change.
+
+        Wired ONCE to the shared controls' mode combo (see _init_child_widgets),
+        so it survives wrangler swaps.  Per-mode integration-control state +
+        forcing the display out of any stuck viewer mode for a non-viewer mode.
+        """
+        # Per-mode integration control enable/dim (C3/C4) — runs for every
+        # processing-mode change, including the viewer modes.
+        self._apply_integration_control_state()
+        # Skip the rest when in viewer mode — set_viewer_display_mode controls
+        # panels.
+        if 'Viewer' in mode_text:
+            return
+        # A non-viewer processing mode (Int 1D/2D, Int 1D (XYE)) must take the
+        # display OUT of any viewer mode it is stuck in.  The wrangler's
+        # sigViewerModeChanged is guarded by its own _prev_viewer_mode, which
+        # misses the case where the display was auto-switched to XYE after an
+        # Int 1D (XYE) batch (the wrangler's viewer_mode stayed None, so _prev
+        # stays '' and no reset emits).  Force the display reset here so the
+        # combo and display can't desync.
+        if getattr(self.displayframe, 'viewer_mode', None) is not None:
+            self._on_viewer_mode_changed('')
+        self.displayframe._apply_1d_only_visibility()
+        # Drop any visible/cached content from the previous mode, then reload the
+        # current selection for the new processing mode.  Calling update() alone
+        # can leave a stale image/cake or curve visible when the new mode needs
+        # data that has not been loaded yet.
+        self.displayframe.clear_display_state()
+        self.displayframe.request_plot_autorange()
+        self.h5viewer.data_changed()
 
     def _sync_h5viewer_save_dir(self, path, *, refresh=True):
         """Point the Scans browser at the active processed-output directory."""
@@ -1050,6 +1184,18 @@ class staticWidget(QWidget):
             self.metawidget.update()
             # self.integratorTree.update()
 
+    def _hydrate_integrator_on_load(self, *args):
+        """Stage C: when a ``.nxs`` is loaded, populate the integration panel from
+        the saved scan (units/npts/ranges/GI), so the panel shows the saved
+        reduction and Reintegrate reproduces it.  Skipped during an active run —
+        the wrangler owns the config then, and the scan is mid-write."""
+        if getattr(self, '_run_active', False):
+            return
+        try:
+            self.integratorTree.hydrate_from_scan()
+        except Exception:
+            logger.debug("integrator hydrate_from_scan failed", exc_info=True)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         # Keep the default 19/57/24 split through the launch-time window-
@@ -1218,7 +1364,7 @@ class staticWidget(QWidget):
         if itree is None or not hasattr(itree, 'ui'):
             return
         try:
-            mode_text = self.wrangler.ui.processingModeCombo.currentText()
+            mode_text = self.controls.current_mode()
         except Exception:
             mode_text = ''
         is_viewer = mode_text in ('Image Viewer', 'XYE Viewer', 'NeXus Viewer')
@@ -1310,6 +1456,25 @@ class staticWidget(QWidget):
         # writer is churning — that's the frame-click freeze).
         self.h5viewer.set_run_writing(True)
         self._apply_integration_control_state()   # run_active=True → disable
+        # Enable the shared Stop button for the run.  For a wrangler run this is
+        # redundant (the wrangler enables it via the alias); for a reintegrate it
+        # is the ONLY thing that makes Stop usable -> abort + retune.
+        try:
+            self.controls.set_stop_enabled(True)
+        except Exception:
+            logger.debug("enable Stop on run enter failed", exc_info=True)
+        # Reintegrate also LOCKS Start: launching a scan mid-reintegrate starts a
+        # wrangler run that rebuilds scan.frames out from under the reintegrate
+        # loop (the 'Frame not found' KeyError crash).  A wrangler run instead
+        # morphs Start->Pause (still clickable), so only lock it for reintegrate.
+        _it = getattr(getattr(self, 'integratorTree', None),
+                      'integrator_thread', None)
+        if _it is not None and _it.isRunning():
+            try:
+                self.controls.startButton.setEnabled(False)
+            except Exception:
+                logger.debug("disable Start on reintegrate failed",
+                             exc_info=True)
         # The Advanced 1D/2D parameter dialogs also feed bai_*_args (their
         # sigUpdateArgs → get_args mutates scan.bai_1d/2d_args), so a dialog left
         # open from before the run could leak a mid-run edit into the next scan.
@@ -1345,6 +1510,73 @@ class staticWidget(QWidget):
         # the mode-correct state (run_active is now False).
         self.enable_integration(True)
         self._apply_integration_control_state()
+        # Run fully ended: drop the Stop button (reintegrate enabled it in
+        # _enter_run_state; a wrangler end agrees on the idle state).
+        try:
+            self.controls.set_stop_enabled(False)
+        except Exception:
+            logger.debug("disable Stop on run exit failed", exc_info=True)
+        # Re-enable Start (reintegrate disabled it in _enter_run_state; a wrangler
+        # end resets it via its own idle morph, so True here is consistent).
+        try:
+            self.controls.startButton.setEnabled(True)
+        except Exception:
+            logger.debug("re-enable Start on run exit failed", exc_info=True)
+
+    def _on_stop_clicked(self):
+        """Single owner of the shared Stop button — route to the active run.
+
+        A running **reintegrate** takes priority: set the integrator thread's
+        cooperative ``stop_requested`` (checked between batches; one frame in
+        Live mode), so it unwinds within a frame, fires ``finished`` →
+        ``integrator_thread_finished`` → ``_exit_run_state`` (re-enabling the
+        panel).  The partial pass is intentionally NOT persisted — change
+        parameters and Reintegrate again.  Otherwise delegate to the active
+        **wrangler**'s ``stop()`` (its run-end UI reset)."""
+        it = getattr(getattr(self, 'integratorTree', None),
+                     'integrator_thread', None)
+        if it is not None and it.isRunning():
+            # If this reintegrate changed the output shape, a partial save is
+            # impossible (the writer forbids mixing new + un-reintegrated rows),
+            # so stopping now DISCARDS the in-progress work.  Warn + let the user
+            # choose rather than silently lose it.
+            if not getattr(it, 'reintegrate_partial_savable', True):
+                if not self._confirm_discard_reintegrate():
+                    return                                # let it finish
+            it.stop_requested = True
+            try:
+                self.controls.set_stop_enabled(False)   # immediate feedback
+            except Exception:
+                logger.debug("disable Stop after reintegrate-stop failed",
+                             exc_info=True)
+            return
+        w = getattr(self, 'wrangler', None)
+        if w is not None and hasattr(w, 'stop'):
+            w.stop()
+
+    def _confirm_discard_reintegrate(self) -> bool:
+        """Modal warning when stopping a reintegrate whose CHANGED output shape
+        means the done frames can't be saved partially.  Returns True to proceed
+        with the stop (discard the in-progress work), False to keep running.
+        Isolated so tests can stub it without a live dialog."""
+        from pyqtgraph import Qt
+        mb = Qt.QtWidgets.QMessageBox(self)
+        mb.setIcon(Qt.QtWidgets.QMessageBox.Icon.Warning)
+        mb.setWindowTitle("Stop reintegration?")
+        mb.setText("This reintegration changed the output shape "
+                   "(points / unit / axis).")
+        mb.setInformativeText(
+            "The frames done so far CANNOT be saved if you stop now — a scan "
+            "can't mix the new rows with the un-reintegrated ones.\n\n"
+            "Stop and discard the in-progress reintegration, or let it finish "
+            "so everything is saved?")
+        stop_btn = mb.addButton("Stop && Discard",
+                                Qt.QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+        keep_btn = mb.addButton("Let it finish",
+                                Qt.QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        mb.setDefaultButton(keep_btn)
+        mb.exec()
+        return mb.clickedButton() is stop_btn
 
     def _on_run_paused(self):
         """Pause (Phase B): the run is FROZEN at a frame boundary (the worker has
@@ -1396,16 +1628,36 @@ class staticWidget(QWidget):
         self.metawidget.update()
 
     def integrator_thread_update(self, idx):
-        # self.thread_state_changed()
+        """Per-frame reintegrate signal — THROTTLED.
+
+        The reintegrate worker emits this once per frame (live = every frame).
+        Rendering each synchronously floods the GUI event loop (the 2D cake is
+        ~hundreds of ms a frame) so nothing paints until the run ends — the
+        "freezes + no live updates" report.  Coalesce to the ~5 Hz timer (like
+        the wrangler's update_data) and do the actual refresh in
+        ``_flush_reintegrate_update``.  set_open_enabled is cheap + wants to be
+        prompt, so it stays here."""
+        self.h5viewer.set_open_enabled(True)
+        self._pending_reint_idx = idx
+        self._reint_update_timer.trigger()
+
+    def _flush_reintegrate_update(self):
+        """Coalesced reintegrate display refresh (≤ ~5 Hz).  Advances to the most
+        recent reintegrated frame and renders it from the in-memory publication
+        store (the run-write disk guard is fine — reintegrate has no concurrent
+        writer until the end save)."""
+        idx = self._pending_reint_idx
+        self._pending_reint_idx = None
         if idx is not None:
             self.h5viewer.latest_idx = idx
-
-        self.h5viewer.set_open_enabled(True)
         self.h5viewer.update_data()
-        
-        if self.h5viewer.auto_last:
+        # Live reintegrate auto-FOLLOWS each frame as it's reduced — that's the
+        # whole point (watch progress + decide whether to retune) — so advance
+        # the displayed frame even when Auto-Last is off.
+        it = getattr(self.integratorTree, 'integrator_thread', None)
+        live_reint = bool(getattr(it, 'reintegrate_live', False))
+        if self.h5viewer.auto_last or live_reint:
             self.latest_frame()
-
         self.displayframe.update()
         self.metawidget.update()
 
@@ -1652,6 +1904,9 @@ class staticWidget(QWidget):
         # current Threshold / Mask-Saturated policy into the wrangler BEFORE
         # setup() so the live run applies exactly what Reintegrate would.
         self._push_threshold_to_wrangler()
+        # GI geometry is owned by the integrator panel now — push it into the
+        # wrangler's hidden GI carrier params BEFORE setup() too, same reason.
+        self._push_gi_to_wrangler()
         self.wrangler.setup()
         self.h5viewer.auto_last = True
 
@@ -1871,7 +2126,7 @@ class staticWidget(QWidget):
                 # combo is unavailable.
                 mode_text = ''
                 try:
-                    mode_text = self.wrangler.ui.processingModeCombo.currentText()
+                    mode_text = self.controls.current_mode()
                 except Exception:
                     mode_text = ''
                 # Tree stays enabled in viewers: processing groups are

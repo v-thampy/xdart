@@ -122,6 +122,11 @@ class integratorTree(QtWidgets.QWidget):
         update: Grabs args from LiveScan object and sets all params
             to match.
     """
+    # Emitted when the integrator's GI on/off toggle changes — staticWidget
+    # connects it to update_scattering_geometry (sets scan.gi + refreshes the
+    # panel), the same handler the wrangler's GI checkbox used to drive.
+    sigUpdateGI = QtCore.Signal(bool)
+
     def __init__(self, scan, frame, file_lock,
                  frames, frame_ids, data_1d, data_2d, parent=None,
                  data_lock=None, publication_store=None):
@@ -203,6 +208,15 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.threshold_enable.toggled.connect(self._save_to_session)
         self.ui.threshold_min.textChanged.connect(self._save_to_session)
         self.ui.threshold_max.textChanged.connect(self._save_to_session)
+        # Entering a non-default Min/Max means "I want to clip" — auto-enable the
+        # Threshold toggle so the value actually applies, instead of silently
+        # doing nothing until the separate toggle is also clicked (the recurring
+        # "I set Max=1000 but it didn't clip" confusion; "Auto" is Mask Saturated,
+        # NOT the threshold enable).
+        self.ui.threshold_min.editingFinished.connect(
+            self._maybe_autoenable_threshold)
+        self.ui.threshold_max.editingFinished.connect(
+            self._maybe_autoenable_threshold)
         self.ui.mask_saturated.toggled.connect(self._save_to_session)
 
         self.integrator_thread = integratorThread(
@@ -246,6 +260,89 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.label_azim_1D.setMaximumSize(QtCore.QSize(80, 50))
         self.ui.label_azim_2D.setMinimumSize(QtCore.QSize(70, 0))
         self.ui.label_azim_2D.setMaximumSize(QtCore.QSize(80, 50))
+
+        # ── GI geometry section (integrator-owned) ───────────────────────────
+        # The integrator owns the GI geometry now (the wrangler's GI group is a
+        # hidden carrier).  Mode lives in the 1D/2D headers (axis1D/axis2D); this
+        # top row adds GI on/off + sample orientation + tilt + the incidence
+        # motor.  get_gi_config() reads it; staticWidget injects it into the
+        # wrangler at run-setup (live) and writes scan.gi_config (reintegrate),
+        # exactly like the threshold row.
+        self.ui.gi_frame = QtWidgets.QFrame(self)
+        self.ui.gi_frame.setObjectName('gi_frame')
+        _gi_lay = QtWidgets.QHBoxLayout(self.ui.gi_frame)
+        _gi_lay.setContentsMargins(2, 0, 2, 0)
+        _gi_lay.setSpacing(4)
+
+        self.ui.gi_enable = QtWidgets.QPushButton('GI (Fiber)')
+        self.ui.gi_enable.setObjectName('gi_enable')
+        self.ui.gi_enable.setCheckable(True)
+        self.ui.gi_enable.setMinimumWidth(90)
+        _gi_lay.addWidget(self.ui.gi_enable)
+
+        # Motor first (the incidence-angle source), then Orient + Tilt.
+        self.ui.gi_motor_label = QtWidgets.QLabel('Motor')
+        _gi_lay.addWidget(self.ui.gi_motor_label)
+        self.ui.gi_motor = QtWidgets.QComboBox()
+        self.ui.gi_motor.setObjectName('gi_motor')
+        self.ui.gi_motor.addItems(['th', 'Manual'])
+        self.ui.gi_motor.setMaximumWidth(110)
+        _gi_lay.addWidget(self.ui.gi_motor)
+
+        self.ui.gi_motor_value = QtWidgets.QLineEdit('0.1')
+        self.ui.gi_motor_value.setObjectName('gi_motor_value')
+        self.ui.gi_motor_value.setMaximumWidth(55)
+        _gi_lay.addWidget(self.ui.gi_motor_value)
+
+        # Orient + Tilt no longer sit inline on the row — they live in a "More"
+        # popup (below), which keeps the row compact and is the seam for future
+        # GI options (e.g. a tilt motor).  Created here, re-parented into the
+        # popup's form; every consumer (get_gi_config / session / hydrate) reads
+        # these same widget objects, so moving them is display-only.
+        self.ui.gi_orient_label = QtWidgets.QLabel('Orient')
+        self.ui.gi_sample_orientation = QtWidgets.QSpinBox()
+        self.ui.gi_sample_orientation.setObjectName('gi_sample_orientation')
+        self.ui.gi_sample_orientation.setMinimum(1)
+        self.ui.gi_sample_orientation.setMaximum(8)
+        self.ui.gi_sample_orientation.setValue(4)
+        self.ui.gi_sample_orientation.setMaximumWidth(70)
+
+        self.ui.gi_tilt_label = QtWidgets.QLabel('Tilt')
+        self.ui.gi_tilt = QtWidgets.QLineEdit('0.0')
+        self.ui.gi_tilt.setObjectName('gi_tilt')
+        self.ui.gi_tilt.setMaximumWidth(70)
+
+        # "More" opens the GI options popup — right-justified + just wide enough.
+        _gi_lay.addStretch(1)
+        self.ui.gi_more = QtWidgets.QPushButton('More')
+        self.ui.gi_more.setObjectName('gi_more')
+        self.ui.gi_more.setMaximumWidth(60)
+        _gi_lay.addWidget(self.ui.gi_more)
+
+        # GI section sits at the very top of the integrator panel.
+        self.ui.verticalLayout.insertWidget(0, self.ui.gi_frame)
+
+        # GI options popup: a floating tool window PARENTED to the integrator so
+        # its lifetime is owned (destroyed with the panel) rather than leaking as
+        # an unparented top-level across mode/window teardown.  Orient + Tilt
+        # today; add future GI options (tilt motor, etc.) as more rows on this
+        # form without touching the compact GI row.
+        self.gi_more_popup = QtWidgets.QWidget(self, QtCore.Qt.Tool)
+        self.gi_more_popup.setObjectName('gi_more_popup')
+        self.gi_more_popup.setWindowTitle('GI Options')
+        _gi_more_form = QtWidgets.QFormLayout(self.gi_more_popup)
+        _gi_more_form.addRow(self.ui.gi_orient_label,
+                             self.ui.gi_sample_orientation)
+        _gi_more_form.addRow(self.ui.gi_tilt_label, self.ui.gi_tilt)
+        self.ui.gi_more.clicked.connect(self._show_gi_more)
+
+        self.ui.gi_enable.toggled.connect(self._on_gi_toggled)
+        self.ui.gi_enable.toggled.connect(self._save_to_session)
+        self.ui.gi_sample_orientation.valueChanged.connect(self._save_to_session)
+        self.ui.gi_tilt.textChanged.connect(self._save_to_session)
+        self.ui.gi_motor.currentIndexChanged.connect(self._on_gi_motor_changed)
+        self.ui.gi_motor.currentIndexChanged.connect(self._save_to_session)
+        self.ui.gi_motor_value.textChanged.connect(self._save_to_session)
 
         self.setEnabled()
         # self.set_image_units()
@@ -325,6 +422,12 @@ class integratorTree(QtWidgets.QWidget):
             'integ_threshold_min': self.ui.threshold_min.text(),
             'integ_threshold_max': self.ui.threshold_max.text(),
             'integ_mask_saturated': self.ui.mask_saturated.isChecked(),
+            # GI geometry (moved here from the wrangler).
+            'integ_gi_enable': self.ui.gi_enable.isChecked(),
+            'integ_gi_sample_orientation': self.ui.gi_sample_orientation.value(),
+            'integ_gi_tilt': self.ui.gi_tilt.text(),
+            'integ_gi_motor': self.ui.gi_motor.currentText(),
+            'integ_gi_motor_value': self.ui.gi_motor_value.text(),
         }
         # Save advanced parameter tree values
         for dim_label, tree in [('1d', self.bai_1d_pars), ('2d', self.bai_2d_pars)]:
@@ -429,6 +532,35 @@ class integratorTree(QtWidgets.QWidget):
         if _sat is not None:
             self.ui.mask_saturated.setChecked(bool(_sat))
 
+        # Restore GI geometry (integrator-owned).  Block the toggle's signals so
+        # restore can't fire _on_gi_toggled (sigUpdateGI) mid-init; sync the
+        # reveal state + scan.gi manually after.
+        self.ui.gi_enable.blockSignals(True)
+        _gi_on = session.get('integ_gi_enable')
+        if _gi_on is not None:
+            self.ui.gi_enable.setChecked(bool(_gi_on))
+        _so = session.get('integ_gi_sample_orientation')
+        if _so is not None:
+            try:
+                self.ui.gi_sample_orientation.setValue(int(_so))
+            except (TypeError, ValueError):
+                pass
+        _tilt = session.get('integ_gi_tilt')
+        if _tilt is not None:
+            self.ui.gi_tilt.setText(str(_tilt))
+        _mot = session.get('integ_gi_motor')
+        if _mot is not None:
+            _mi = self.ui.gi_motor.findText(str(_mot))
+            if _mi >= 0:
+                self.ui.gi_motor.setCurrentIndex(_mi)
+        _mv = session.get('integ_gi_motor_value')
+        if _mv is not None:
+            self.ui.gi_motor_value.setText(str(_mv))
+        self.ui.gi_enable.blockSignals(False)
+        self._update_gi_section_visibility()
+        if _gi_on is not None and getattr(self, 'scan', None) is not None:
+            self.scan.gi = bool(_gi_on)
+
         # Restore advanced parameter tree values
         for dim_label, tree in [('1d', self.bai_1d_pars), ('2d', self.bai_2d_pars)]:
             with tree.treeChangeBlocker():
@@ -460,6 +592,145 @@ class integratorTree(QtWidgets.QWidget):
             scan: LiveScan, object to get args from.
         """
         self._update_params()
+
+    def _hydrate_gi_motor(self, gic):
+        """Set the GI motor dropdown + manual theta from saved ``gi_config``.
+
+        A numeric ``incidence_motor`` (old-build manual gi_config) or the literal
+        'Manual' -> select Manual + the numeric theta (``th_val``, else the
+        numeric ``incidence_motor``).  A real motor name -> select that motor."""
+        mot = str(gic.get('incidence_motor', '') or '')
+        thv = gic.get('th_val')
+        try:
+            _num = float(mot)
+            manual = True
+        except (TypeError, ValueError):
+            _num = None
+            manual = mot in ('', 'Manual')
+        if manual:
+            i = self.ui.gi_motor.findText('Manual')
+            if i >= 0:
+                self.ui.gi_motor.setCurrentIndex(i)
+            val = thv if thv is not None else _num
+            if val is not None:
+                self.ui.gi_motor_value.setText(str(val))
+        else:
+            i = self.ui.gi_motor.findText(mot)
+            if i < 0:
+                self.ui.gi_motor.addItem(mot)
+                i = self.ui.gi_motor.findText(mot)
+            if i >= 0:
+                self.ui.gi_motor.setCurrentIndex(i)
+
+    @staticmethod
+    def _hydrate_range(rng, low_w, high_w, auto_w):
+        """A saved (lo, hi) range -> Auto OFF + the values; None/missing -> Auto ON."""
+        if (rng is not None and len(rng) == 2
+                and rng[0] is not None and rng[1] is not None):
+            auto_w.setChecked(False)
+            low_w.setText(str(rng[0]))
+            high_w.setText(str(rng[1]))
+        else:
+            auto_w.setChecked(True)
+
+    def hydrate_from_scan(self):
+        """Stage C (2-way sync): populate the integration panel from the LOADED
+        scan's saved reduction settings (``scan.bai_*_args`` + ``scan.gi_config``)
+        so the panel SHOWS what produced the data and Reintegrate reproduces it
+        by default.  No-op for a not-yet-loaded scan; all widget writes are
+        signal-blocked so it can't fire a reintegrate / session-churn / arg
+        re-derivation.  ``set_image_units`` rewrites the mode-default ranges into
+        ``scan.bai_*_args``, so the saved ranges/npts are snapshot first and
+        restored after."""
+        scan = getattr(self, 'scan', None)
+        if scan is None:
+            return
+        a1 = dict(getattr(scan, 'bai_1d_args', {}) or {})
+        a2 = dict(getattr(scan, 'bai_2d_args', {}) or {})
+        gic = dict(getattr(scan, 'gi_config', {}) or {})
+        if not a1 and not a2 and not gic:
+            return  # nothing saved to hydrate from (fresh/empty scan)
+
+        # 1. GI section + scan.gi (the reload-Manual fix) — signal-blocked.
+        gi_widgets = (self.ui.gi_enable, self.ui.gi_motor,
+                      self.ui.gi_sample_orientation, self.ui.gi_tilt,
+                      self.ui.gi_motor_value)
+        for w in gi_widgets:
+            w.blockSignals(True)
+        try:
+            gi_on = bool(getattr(scan, 'gi', False)) or bool(gic)
+            self.ui.gi_enable.setChecked(gi_on)
+            if gic:
+                so = gic.get('sample_orientation')
+                if so is not None:
+                    try:
+                        self.ui.gi_sample_orientation.setValue(int(so))
+                    except (TypeError, ValueError):
+                        pass
+                tl = gic.get('tilt_angle')
+                if tl is not None:
+                    self.ui.gi_tilt.setText(str(tl))
+                self._hydrate_gi_motor(gic)
+            scan.gi = gi_on
+        finally:
+            for w in gi_widgets:
+                w.blockSignals(False)
+
+        # 2. Rebuild axis/unit combos + sync gi_mode from scan.bai_args (existing
+        # sync).  NB: this rewrites mode-default ranges/npts into scan.bai_args.
+        self.set_image_units()
+
+        # 3. Restore the SAVED npts + ranges over those mode-defaults, in BOTH
+        # the widgets and scan.bai_args, so the panel shows the saved reduction
+        # and reintegrate reproduces it.
+        range_widgets = (
+            self.ui.npts_1D, self.ui.npts_oop_1D, self.ui.npts_radial_2D,
+            self.ui.npts_azim_2D, self.ui.radial_low_1D, self.ui.radial_high_1D,
+            self.ui.azim_low_1D, self.ui.azim_high_1D, self.ui.radial_autoRange_1D,
+            self.ui.azim_autoRange_1D, self.ui.radial_low_2D, self.ui.radial_high_2D,
+            self.ui.azim_low_2D, self.ui.azim_high_2D, self.ui.radial_autoRange_2D,
+            self.ui.azim_autoRange_2D,
+        )
+        for w in range_widgets:
+            w.blockSignals(True)
+        try:
+            with self.scan.scan_lock:
+                for k in ('numpoints', 'npt_oop'):
+                    if k in a1:
+                        self.scan.bai_1d_args[k] = a1[k]
+                for k in ('npt_rad', 'npt_azim'):
+                    if k in a2:
+                        self.scan.bai_2d_args[k] = a2[k]
+                self.scan.bai_1d_args['radial_range'] = a1.get('radial_range')
+                self.scan.bai_1d_args['azimuth_range'] = a1.get('azimuth_range')
+                self.scan.bai_2d_args['radial_range'] = a2.get('radial_range')
+                self.scan.bai_2d_args['azimuth_range'] = a2.get('azimuth_range')
+
+            def _txt(widget, value):
+                if value is not None:
+                    try:
+                        widget.setText(str(int(value)))
+                    except (TypeError, ValueError):
+                        widget.setText(str(value))
+
+            _txt(self.ui.npts_1D, a1.get('numpoints', a1.get('npt')))
+            _txt(self.ui.npts_oop_1D, a1.get('npt_oop'))
+            _txt(self.ui.npts_radial_2D, a2.get('npt_rad', a2.get('npt')))
+            _txt(self.ui.npts_azim_2D, a2.get('npt_azim'))
+            self._hydrate_range(a1.get('radial_range'), self.ui.radial_low_1D,
+                                self.ui.radial_high_1D, self.ui.radial_autoRange_1D)
+            self._hydrate_range(a1.get('azimuth_range'), self.ui.azim_low_1D,
+                                self.ui.azim_high_1D, self.ui.azim_autoRange_1D)
+            self._hydrate_range(a2.get('radial_range'), self.ui.radial_low_2D,
+                                self.ui.radial_high_2D, self.ui.radial_autoRange_2D)
+            self._hydrate_range(a2.get('azimuth_range'), self.ui.azim_low_2D,
+                                self.ui.azim_high_2D, self.ui.azim_autoRange_2D)
+        finally:
+            for w in range_widgets:
+                w.blockSignals(False)
+
+        self._update_gi_section_visibility()
+        self.setEnabled(self.ui.frame1D.isEnabled())
 
     def setEnabled(self, enable=True):
         """Overrides parent class method. Ensures appropriate child
@@ -1103,6 +1374,15 @@ class integratorTree(QtWidgets.QWidget):
     def _disconnect_azim_range_2D_signals(self):
         self._disconnect_range_signals('azim_2D')
 
+    def _reintegrate_is_live(self):
+        """Reintegrate runs LIVE (per-frame, abortable) by default; the shared
+        **Batch** toggle (StaticControls) switches it to the fast multicore path.
+        The host installs ``_reintegrate_batch_provider`` (reads
+        controls.batchButton); absent it (tests / standalone) we default to live."""
+        prov = getattr(self, '_reintegrate_batch_provider', None)
+        batch = bool(prov()) if callable(prov) else False
+        return not batch
+
     def bai_1d(self, q):
         """Uses the integrator_thread attribute to call bai_1d
         """
@@ -1112,10 +1392,12 @@ class integratorTree(QtWidgets.QWidget):
             return
         if not self._ensure_reintegration_calibration('1D'):
             return
+        self._apply_gi_config_to_scan()
         self._apply_threshold_config_to_thread()
         with self.integrator_thread.lock:
             if len(self.scan.frames.index) > 0:
                 self.integrator_thread.method = 'bai_1d_all'
+                self.integrator_thread.reintegrate_live = self._reintegrate_is_live()
         # N3: clear under data_lock to avoid racing with the
         # integrator thread's _publish or with the GUI's
         # _absorb_chunk arrivals (which also write through
@@ -1139,10 +1421,12 @@ class integratorTree(QtWidgets.QWidget):
             return
         if not self._ensure_reintegration_calibration('2D'):
             return
+        self._apply_gi_config_to_scan()
         self._apply_threshold_config_to_thread()
         with self.integrator_thread.lock:
             if len(self.scan.frames.index) > 0:
                 self.integrator_thread.method = 'bai_2d_all'
+                self.integrator_thread.reintegrate_live = self._reintegrate_is_live()
         # N3: same data_lock discipline as bai_1d above.
         from .hydrated_raw import clear_hydrated_raw
         data_lock = getattr(self.integrator_thread, 'data_lock', None)
@@ -1156,6 +1440,159 @@ class integratorTree(QtWidgets.QWidget):
         self.setEnabled(False)
         if not self.integrator_thread.isRunning():
             self.integrator_thread.start()
+
+    # Default-select order for the GI incidence motor when the current selection
+    # isn't in the loaded scan's motor list (case-insensitive).
+    _GI_MOTOR_PREFERENCE = ('th', 'theta', 'eta', 'halpha', 'gth', 'gonth')
+
+    def set_gi_motor_options(self, motors):
+        """Populate the GI motor dropdown from the active wrangler's available
+        SPEC motor columns (Stage B).  Always offers 'Manual'; keeps the current
+        selection if still present, else default-selects by ``_GI_MOTOR_PREFERENCE``
+        (case-insensitive), then the first motor, then Manual."""
+        motors = [str(m) for m in (motors or []) if str(m)]
+        items = ['Manual'] + motors
+        current = self.ui.gi_motor.currentText()
+        self.ui.gi_motor.blockSignals(True)
+        self.ui.gi_motor.clear()
+        self.ui.gi_motor.addItems(items)
+        if current in items:
+            target = current
+        else:
+            lower = {m.lower(): m for m in motors}
+            target = next((lower[p] for p in self._GI_MOTOR_PREFERENCE
+                           if p in lower),
+                          motors[0] if motors else 'Manual')
+        idx = self.ui.gi_motor.findText(target)
+        if idx >= 0:
+            self.ui.gi_motor.setCurrentIndex(idx)
+        self.ui.gi_motor.blockSignals(False)
+        self._update_gi_section_visibility()
+        self._save_to_session()
+
+    def _on_gi_motor_changed(self, *args):
+        self._update_gi_section_visibility()
+
+    def _show_gi_more(self):
+        """Open the GI options popup (Orient/Tilt; extensible) — raised + focused."""
+        popup = getattr(self, 'gi_more_popup', None)
+        if popup is None:
+            return
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
+
+    def _update_gi_section_visibility(self):
+        """Reveal the GI row fields only when GI is on: the Motor combo + the
+        "More" popup button (Orient/Tilt now live inside the popup); the manual
+        theta value only when the motor is 'Manual'."""
+        on = self.ui.gi_enable.isChecked()
+        for w in (self.ui.gi_motor_label, self.ui.gi_motor, self.ui.gi_more):
+            w.setVisible(on)
+        manual = (self.ui.gi_motor.currentText() == 'Manual')
+        self.ui.gi_motor_value.setVisible(on and manual)
+        # Don't leave the options popup floating once GI is switched off.
+        popup = getattr(self, 'gi_more_popup', None)
+        if popup is not None and not on:
+            popup.hide()
+
+    def _on_gi_toggled(self, checked):
+        """GI on/off — reveal the fields and drive scan.gi via the same
+        ``update_scattering_geometry`` seam the wrangler checkbox used (sets
+        scan.gi + refreshes the panel's axis units/labels)."""
+        self._update_gi_section_visibility()
+        scan = getattr(self, 'scan', None)
+        if scan is not None:
+            scan.gi = bool(checked)
+        self.sigUpdateGI.emit(bool(checked))
+
+    def get_gi_config(self):
+        """The integrator's CURRENT GI geometry, read FRESH from the GI row.
+
+        Single source of truth: a live run reads it via ``staticWidget`` at
+        run-setup (injected into the wrangler's hidden GI carrier params) and
+        Reintegrate reads it via ``_apply_gi_config_to_scan`` (writes scan.gi +
+        scan.gi_config) — so both apply identical GI geometry.  Mode comes from
+        the 1D/2D axis combos (already mirrored into ``scan.bai_*_args``)."""
+        def _f(widget, default=0.0):
+            try:
+                return float(widget.text())
+            except (TypeError, ValueError):
+                return default
+        return {
+            'gi': bool(self.ui.gi_enable.isChecked()),
+            'sample_orientation': int(self.ui.gi_sample_orientation.value()),
+            'tilt_angle': _f(self.ui.gi_tilt, 0.0),
+            'incidence_motor': str(self.ui.gi_motor.currentText()),
+            'th_val': _f(self.ui.gi_motor_value, 0.0),
+            'gi_mode_1d': self.scan.bai_1d_args.get('gi_mode_1d', 'q_total'),
+            'gi_mode_2d': self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop'),
+        }
+
+    def _apply_gi_config_to_scan(self) -> None:
+        """Before a Reintegrate, write the integrator's CURRENT GI geometry onto
+        the scan so ``plan_from_live_scan`` reproduces it: ``scan.gi`` +
+        ``scan.gi_config`` (the gi_mode keys already live in ``scan.bai_*_args``).
+        Mirrors ``_apply_threshold_config_to_thread``."""
+        try:
+            cfg = self.get_gi_config()
+        except Exception:
+            logger.debug("could not read integrator GI config", exc_info=True)
+            return
+        scan = getattr(self, 'scan', None)
+        if scan is None:
+            return
+        scan.gi = bool(cfg['gi'])
+        if cfg['gi']:
+            scan.gi_config = {
+                'gi_mode_1d': str(cfg['gi_mode_1d']),
+                'gi_mode_2d': str(cfg['gi_mode_2d']),
+                'incidence_motor': str(cfg['incidence_motor'] or ''),
+                # th_val (the Manual incidence angle) is the ONLY round-trip
+                # source for a Manual scan (no motor metadata, no baked angle),
+                # so persist it for reload + panel hydration (Stage C).
+                'th_val': float(cfg['th_val'] or 0.0),
+                'tilt_angle': float(cfg['tilt_angle'] or 0.0),
+                'sample_orientation': int(cfg['sample_orientation'] or 1),
+            }
+            # Also write the GI geometry to direct scan attributes, mirroring the
+            # live path's ``sync_live_scan_gi_settings`` — so a RELOADED scan
+            # reintegrates with the panel's geometry.  The incidence source is
+            # written so ``plan_from_live_scan`` resolves the SAME per-frame angle
+            # live did:
+            #   * a real MOTOR ('th', ...) -> write the NAME; plan leaves
+            #     incident_angle=None and the per-frame angle baked from the
+            #     motor metadata is used (the working th-motor path).
+            #   * 'Manual' -> there is NO motor metadata AND no baked per-frame
+            #     angle for this source, so write the NUMERIC theta value; plan
+            #     float()s it into GIMode.incident_angle.  (Writing the literal
+            #     'Manual' instead made the reduction raise "cannot resolve GI
+            #     incident angle from metadata motor 'Manual'".)  The value comes
+            #     from the GI-row theta field — set it to the real incidence.
+            _motor = cfg['incidence_motor']
+            _incidence = (str(cfg['th_val']) if _motor == 'Manual'
+                          else str(_motor or ''))
+            scan.incidence_motor = _incidence
+            scan.th_mtr = _incidence
+            scan.sample_orientation = int(cfg['sample_orientation'] or 1)
+            scan.tilt_angle = float(cfg['tilt_angle'] or 0.0)
+        else:
+            scan.gi_config = {}
+
+    def _maybe_autoenable_threshold(self):
+        """Auto-enable the Intensity-Threshold toggle once the user sets a
+        non-default Min/Max, so the value takes effect without a second click.
+        Only ever ENABLES (never disables) — an explicit toggle-off is respected
+        until the user edits a value again.  Default 0/0 (or blank) never enables
+        (and Max=0 would mask everything, so we must not auto-enable it)."""
+        def _f(widget):
+            try:
+                return float(widget.text())
+            except (TypeError, ValueError):
+                return 0.0
+        if (_f(self.ui.threshold_min) != 0.0 or _f(self.ui.threshold_max) != 0.0):
+            if not self.ui.threshold_enable.isChecked():
+                self.ui.threshold_enable.setChecked(True)
 
     def get_threshold_config(self):
         """The integrator's CURRENT pixel-rejection policy (Intensity Threshold +

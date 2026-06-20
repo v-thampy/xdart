@@ -98,6 +98,9 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
     # sigUpdateFrame = Qt.QtCore.Signal(dict)
     sigUpdateFile = Qt.QtCore.Signal(str, str, bool, str, bool, bool)
     sigUpdateGI = Qt.QtCore.Signal(bool)
+    # GI move (Stage B): hands the available SPEC incidence-motor columns to the
+    # integrator panel's GI motor dropdown (the integrator owns the selection).
+    sigGIMotorOptions = Qt.QtCore.Signal(list)
     finished = Qt.QtCore.Signal()
     started = Qt.QtCore.Signal()
     # Pause/Resume (Phase B): sigPaused fires once the run is frozen at a frame
@@ -128,11 +131,49 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         # self.thread.sigUpdateFrame.connect(self.sigUpdateFrame.emit)
         self.thread.sigUpdateGI.connect(self.sigUpdateGI.emit)
 
+        # Shared run-controls (CONTROLS section): the staticWidget owns one
+        # StaticControls widget and ATTACHES it to the active wrangler, which
+        # aliases its own control refs onto the shared widgets so all existing
+        # run-lifecycle logic drives them.  None until attached.
+        self._controls = None
+        self._control_conns = []
+
     def enabled(self, enable):
         """Use this function to control what is enabled and disabled
         during integration.
         """
         pass
+
+    # ── Shared run-controls (CONTROLS section) ──────────────────────────
+    def controls_profile(self):
+        """Per-wrangler capability descriptor for the shared StaticControls:
+        the mode items to show + whether Live / Batch / cores apply.  Base
+        default = no Live/Batch (subclasses override)."""
+        return {'modes': None, 'live': False, 'batch': False, 'cores': True}
+
+    def attach_controls(self, controls):
+        """Adopt the shared StaticControls widget.  Base just stores the ref;
+        subclasses override to alias their own control attributes onto the shared
+        widgets and wire the shared signals to their handlers (tracking
+        connections via _connect_control for detach_controls)."""
+        self._controls = controls
+
+    def _connect_control(self, signal, slot):
+        """Connect a shared-control signal to one of THIS wrangler's handlers and
+        record it, so detach_controls (on wrangler swap) disconnects exactly
+        these — preventing a stale wrangler from double-dispatching a click."""
+        signal.connect(slot)
+        self._control_conns.append((signal, slot))
+
+    def detach_controls(self):
+        """Disconnect this wrangler's shared-control connections (on swap, before
+        the next wrangler attaches)."""
+        for signal, slot in self._control_conns:
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._control_conns = []
 
     # ── Group-header toggles (UI-1, #81) ────────────────────────────────
     # Maps a toggle-group's name (e.g. 'GI') to its hidden enabling bool
@@ -219,7 +260,15 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
     # once after building their UI.
 
     def _status_label(self):
-        """The wrangler's status QLabel, whatever the subclass calls it."""
+        """The status QLabel that messages route to.  Prefers the shared
+        control-layer ``statusLabel`` (StaticControls) when controls are
+        attached, so the message bar lives in ONE place (the control stack)
+        instead of the wrangler's own orphaned label; falls back to the
+        subclass's own label / specUI specLabel when standalone."""
+        controls = getattr(self, '_controls', None)
+        cl = getattr(controls, 'statusLabel', None) if controls is not None else None
+        if cl is not None:
+            return cl
         label = getattr(self, 'statusLabel', None)
         if label is not None:
             return label
@@ -539,36 +588,31 @@ class wranglerThread(Qt.QtCore.QThread):
             sat_fired = 0           # R3-A: how many saturation pixels were cut
             frame_size = 0
             try:
+                from xdart.modules.reduction import compute_bad_pixel_mask
+                from ..display_logic import integer_saturation_ceiling
+                from xrd_tools.core.invalid import saturation_pixels
                 arr0 = np.asarray(img_data)
-                flat = arr0.astype(float).flatten()
-                frame_size = flat.size
-                # Negatives + the uint32 dead/hot ceiling (Eiger masters) are
-                # always invalid.
-                bad = (flat < 0) | (flat >= 4294967295.0)
-                # Detector SATURATION ceiling — the uint16 65535, or whatever
-                # ``iinfo.max`` the RAW integer dtype implies (derived from the
-                # bit depth via integer_saturation_ceiling, captured here before
-                # the float conversion).  A dead module only when MANY pixels sit
-                # exactly there (the >1e-4 fraction guard, parity with the
-                # display's sentinel_mask), so a few genuinely-saturated pixels
-                # are NOT masked.  OPT-IN via the "Mask Saturated" toggle
-                # (default ON) so a genuinely-saturated Bragg peak at the ceiling
-                # can be integrated when the user turns it off.  The gate is a
-                # per-scan constant → mask still computed-once and cached, so
-                # pyFAI's CSR mask-CRC stays stable frame-to-frame.
-                if getattr(self, 'mask_sentinel', True):
-                    from ..display_logic import integer_saturation_ceiling
-                    from xrd_tools.core.invalid import saturation_pixels
-                    # Fraction-guarded ceiling exclusion — the SAME headless
-                    # policy the display uses (R3-C: xrd_tools.core.invalid).
-                    # Returns all-False for the uint32 ceiling (already always-on
-                    # above) and below the >1e-4 fraction guard, so a few
-                    # genuinely-saturated pixels are not masked.
-                    sat = saturation_pixels(
-                        flat, ceiling=integer_saturation_ceiling(arr0))
-                    sat_fired = int(sat.sum())
-                    bad |= sat
-                cached = np.arange(flat.size)[bad]
+                frame_size = int(arr0.size)
+                mask_sat = bool(getattr(self, 'mask_sentinel', True))
+                # ONE masking implementation (xdart.modules.reduction) shared
+                # with the reintegrate path so live ≡ reintegrate on the same
+                # frame.  Pass the DISPLAY policy's ceiling (its legacy 65535
+                # float fallback) so a float-typed raw masks identically on both
+                # paths — keeping the live≡batch≡reload equivalence spine safe.
+                # Unambiguous invalids (negatives + the uint32 dummy) are always
+                # cut; the detector-saturation ceiling is OPT-IN (the "Mask
+                # Saturated" toggle, default ON) and fraction-guarded so a few
+                # genuinely-saturated Bragg pixels survive.  Computed-once +
+                # cached, so pyFAI's CSR mask-CRC stays stable frame-to-frame.
+                ceil = integer_saturation_ceiling(arr0)
+                idx = compute_bad_pixel_mask(
+                    arr0, mask_saturation=mask_sat, saturation_ceiling=ceil)
+                # Preserve the legacy contract: an empty index array (not None)
+                # when nothing is bad, so callers can pass it straight to pyFAI.
+                cached = idx if idx is not None else np.array([], dtype=int)
+                if mask_sat:
+                    sat_fired = int(saturation_pixels(
+                        arr0.astype(float).flatten(), ceiling=ceil).sum())
             except (AttributeError, TypeError, ValueError) as e:
                 logger.debug("frame-mask compute failed: %s", e)
                 cached = None

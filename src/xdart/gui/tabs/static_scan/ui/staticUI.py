@@ -142,6 +142,23 @@ class Ui_Form(object):
         self.toolsLayout.setSpacing(6)
         self.rightSplitter.insertWidget(0, self.toolsFrame)   # very top pane
 
+        # CONTROLS section (mode + Batch/cores + Live/Start/Stop) at the very
+        # BOTTOM.  staticWidget installs the shared StaticControls into
+        # controlsLayout and routes it to the active wrangler.
+        self.controlsFrame = QFrame(self.rightSplitter)
+        self.controlsFrame.setObjectName(u"controlsFrame")
+        _ctrlSize = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.controlsFrame.setSizePolicy(_ctrlSize)
+        # The host (staticWidget._init_child_widgets) sets a FIXED height equal to
+        # the StaticControls' snug content height, so the bottom controls box
+        # can't be resized by the splitter and has no excess space.
+        self.controlsFrame.setFrameShape(QFrame.StyledPanel)
+        self.controlsFrame.setFrameShadow(QFrame.Raised)
+        self.controlsLayout = QVBoxLayout(self.controlsFrame)
+        self.controlsLayout.setContentsMargins(2, 2, 2, 2)
+        self.controlsLayout.setSpacing(0)
+        self.rightSplitter.addWidget(self.controlsFrame)      # very bottom pane
+
         self.horizontalLayout_3.addWidget(self.rightSplitter)
 
         self.mainSplitter.addWidget(self.rightFrame)

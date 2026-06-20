@@ -2253,3 +2253,237 @@ def test_tools_bar_hosts_calibrate_and_make_mask(widget):
     rs = w.ui.rightSplitter
     assert rs.indexOf(tools) == 0                       # very top pane
     assert rs.indexOf(w.ui.wranglerFrame) < rs.indexOf(w.ui.integratorFrame)
+
+
+def test_gi_manual_incidence_reintegrate_uses_numeric_not_motor_name(widget):
+    """Regression: GI **Manual** incidence (eiger / no metadata, no baked
+    per-frame angle) must reintegrate at the entered theta value.  The integrator
+    writes the NUMERIC theta to ``scan.incidence_motor`` — writing the literal
+    'Manual' made the reduction raise "cannot resolve GI incident angle from
+    metadata motor 'Manual'"; writing the panel-default 0.1 reintegrated at the
+    wrong incidence."""
+    from xdart.modules.reduction import plan_from_live_scan
+
+    w = widget
+    it = w.integratorTree
+    it.ui.gi_enable.setChecked(True)
+    mi = it.ui.gi_motor.findText('Manual')
+    assert mi >= 0
+    it.ui.gi_motor.setCurrentIndex(mi)
+    it.ui.gi_motor_value.setText('2.0')
+
+    it._apply_gi_config_to_scan()
+
+    # Numeric theta, NOT the literal 'Manual' (which would crash the reduction).
+    assert w.scan.incidence_motor == '2.0'
+    assert w.scan.gi_config.get('th_val') == 2.0
+
+    # The plan resolves a real incident angle (not None -> no per-frame crash).
+    w.scan.bai_1d_args = {'gi_mode_1d': 'q_total'}
+    w.scan.bai_2d_args = {'gi_mode_2d': 'qip_qoop'}
+    plan = plan_from_live_scan(w.scan, integrate_1d=True, integrate_2d=False)
+    assert plan.gi is not None
+    assert plan.gi.incident_angle == 2.0
+
+
+def test_hydrate_from_scan_populates_panel_from_saved_settings(widget):
+    """Stage C (2-way sync): loading a scan hydrates the integration panel from
+    its saved settings — GI section (incl. the Manual theta value, which fixes
+    reload-Manual reintegrate), npts, and ranges — WITHOUT clobbering the saved
+    ranges reintegrate relies on (set_image_units writes mode defaults, which
+    hydrate restores over)."""
+    w = widget
+    it = w.integratorTree
+    w.scan.gi = False  # hydrate must turn GI on from gi_config
+    w.scan.gi_config = {
+        'gi_mode_1d': 'q_total', 'gi_mode_2d': 'qip_qoop',
+        'incidence_motor': 'Manual', 'th_val': 2.0,
+        'sample_orientation': 4, 'tilt_angle': 0.0,
+    }
+    w.scan.bai_1d_args = {'gi_mode_1d': 'q_total', 'unit': 'q_A^-1',
+                          'numpoints': 1234, 'radial_range': (0.5, 7.5)}
+    w.scan.bai_2d_args = {'gi_mode_2d': 'qip_qoop', 'unit': 'q_A^-1',
+                          'npt_rad': 800, 'npt_azim': 900}
+
+    it.hydrate_from_scan()
+
+    assert it.ui.gi_enable.isChecked() is True
+    assert w.scan.gi is True
+    assert it.ui.gi_motor.currentText() == 'Manual'
+    assert it.ui.gi_motor_value.text() == '2.0'         # reload-Manual recovered
+    assert it.ui.gi_sample_orientation.value() == 4
+    assert it.ui.npts_1D.text() == '1234'
+    # The saved ranges survive set_image_units' mode-default clobber.
+    assert w.scan.bai_1d_args.get('radial_range') == (0.5, 7.5)
+    assert it.ui.radial_low_1D.text() == '0.5'
+    assert it.ui.radial_high_1D.text() == '7.5'
+
+
+def test_gi_more_popup_hosts_orient_and_tilt(widget):
+    """The GI (Fiber) row keeps only GI/Motor inline; Orient + Tilt moved into a
+    right-justified "More" popup (the seam for future GI options).  The widgets
+    are the SAME objects (get_gi_config / session / hydrate read them) — just
+    re-parented — and the More button + popup toggle with GI."""
+    w = widget
+    it = w.integratorTree
+
+    # Orient/Tilt now live in the popup window, not inline on the GI row.
+    assert it.ui.gi_sample_orientation.window() is it.gi_more_popup
+    assert it.ui.gi_tilt.window() is it.gi_more_popup
+    assert it.ui.gi_more.maximumWidth() <= 60               # snug, won't clip
+
+    # GI on -> Motor + More visible; clicking More opens the popup.
+    it.ui.gi_enable.setChecked(True)
+    assert it.ui.gi_more.isVisibleTo(it.ui.gi_frame)
+    assert it.ui.gi_motor.isVisibleTo(it.ui.gi_frame)
+    it._show_gi_more()
+    assert it.gi_more_popup.isVisible()
+
+    # GI off -> Motor + More hidden, popup closed (not left floating).
+    it.ui.gi_enable.setChecked(False)
+    assert not it.ui.gi_more.isVisibleTo(it.ui.gi_frame)
+    assert not it.gi_more_popup.isVisible()
+
+    # Orient/Tilt still round-trip through get_gi_config from the popup widgets.
+    it.ui.gi_enable.setChecked(True)
+    it.ui.gi_sample_orientation.setValue(6)
+    it.ui.gi_tilt.setText('1.5')
+    cfg = it.get_gi_config()
+    assert cfg['sample_orientation'] == 6
+    assert cfg['tilt_angle'] == 1.5
+
+
+def test_reintegrate_live_default_and_stop_wiring(widget, monkeypatch):
+    """Reintegrate runs LIVE by default and switches to the fast batch path via
+    the shared Batch toggle (no separate Live button); the shared Stop dispatches
+    to the active run — a running reintegrate takes priority, else the wrangler."""
+    w = widget
+    it = w.integratorTree
+
+    # Batch is off by default → live; checking Batch → fast multicore.  Driven
+    # by the shared controls.batchButton through the host-installed provider.
+    assert w.controls.batchButton.isChecked() is False        # live default
+    assert it._reintegrate_is_live() is True
+    w.controls.batchButton.setChecked(True)
+    assert it._reintegrate_is_live() is False
+    w.controls.batchButton.setChecked(False)
+    assert it._reintegrate_is_live() is True
+
+    # No reintegrate running → Stop dispatches to the wrangler, not the
+    # integrator (its stop flag is untouched).
+    wrangler_stops = []
+    monkeypatch.setattr(w.wrangler, 'stop', lambda: wrangler_stops.append(1))
+    it.integrator_thread.stop_requested = False
+    w._on_stop_clicked()
+    assert it.integrator_thread.stop_requested is False
+    assert wrangler_stops == [1]
+
+    # Reintegrate running → Stop aborts the reintegrate and does NOT also trip
+    # the wrangler (no idle-stop side effects).
+    monkeypatch.setattr(it.integrator_thread, 'isRunning', lambda: True)
+    w._on_stop_clicked()
+    assert it.integrator_thread.stop_requested is True
+    assert wrangler_stops == [1]
+
+    # Entering run-state for a reintegrate LOCKS Start (so a scan can't rebuild
+    # scan.frames out from under the reintegrate loop); _exit re-enables it.
+    w._run_active = False
+    w._enter_run_state()
+    assert not w.controls.startButton.isEnabled()
+    w._exit_run_state()
+    assert w.controls.startButton.isEnabled()
+
+    # Per-frame reintegrate updates are THROTTLED (coalesced), not rendered
+    # synchronously — integrator_thread_update just stashes the latest index;
+    # the timer's _flush_reintegrate_update does the actual refresh.
+    w._pending_reint_idx = None
+    w.integrator_thread_update(7)
+    assert w._pending_reint_idx == 7
+
+    # Stop on a SHAPE-CHANGING reintegrate (partial can't be saved) warns first:
+    # "let it finish" cancels the stop; "stop & discard" proceeds.
+    it.integrator_thread.reintegrate_partial_savable = False
+    it.integrator_thread.stop_requested = False
+    monkeypatch.setattr(w, '_confirm_discard_reintegrate', lambda: False)
+    w._on_stop_clicked()
+    assert it.integrator_thread.stop_requested is False        # cancelled
+    monkeypatch.setattr(w, '_confirm_discard_reintegrate', lambda: True)
+    w._on_stop_clicked()
+    assert it.integrator_thread.stop_requested is True         # discarded
+    # A shape-COMPATIBLE reintegrate stops with no prompt (partial saves fine).
+    it.integrator_thread.reintegrate_partial_savable = True
+    it.integrator_thread.stop_requested = False
+    monkeypatch.setattr(w, '_confirm_discard_reintegrate',
+                        lambda: pytest.fail("should not prompt when savable"))
+    w._on_stop_clicked()
+    assert it.integrator_thread.stop_requested is True
+
+
+def test_threshold_autoenables_on_value_entry(widget):
+    """Entering a non-default Threshold Min/Max auto-enables the Threshold toggle
+    so the clip actually applies (the "I set Max=1000 but it didn't clip" trap).
+    Default 0/0 never auto-enables (Max=0 would mask everything)."""
+    w = widget
+    it = w.integratorTree
+
+    it.ui.threshold_enable.setChecked(False)
+    it.ui.threshold_max.setText('1000')
+    it._maybe_autoenable_threshold()
+    assert it.ui.threshold_enable.isChecked() is True
+    cfg = it.get_threshold_config()
+    assert cfg.apply_threshold is True and cfg.threshold_max == 1000.0
+
+    # Default 0/0 must NOT auto-enable (Max=0 masks everything).
+    it.ui.threshold_enable.setChecked(False)
+    it.ui.threshold_min.setText('0')
+    it.ui.threshold_max.setText('0')
+    it._maybe_autoenable_threshold()
+    assert it.ui.threshold_enable.isChecked() is False
+
+
+def test_shared_controls_reroute_on_wrangler_swap(widget):
+    """Stage 2b: the ONE StaticControls bar follows the active wrangler.  On
+    swap, apply_profile repopulates the mode items + shows/hides Live/Batch for
+    the new wrangler, the new wrangler's control refs ALIAS onto the shared
+    widgets, and the old wrangler's signal connections are dropped (no stale
+    double-dispatch)."""
+    w = widget
+    stack = w.ui.wranglerStack
+    ctrls = w.controls
+
+    # Resolve the image / nexus stack indices by wrangler class name.
+    idx = {type(stack.widget(i)).__name__: i for i in range(stack.count())}
+    img_i = idx['imageWrangler']
+    nx_i = idx['nexusWrangler']
+
+    # Start on the image wrangler: Live + Batch present, full image mode list,
+    # and the image wrangler's ``self.ui.*`` refs alias the shared widgets.
+    stack.setCurrentIndex(img_i)
+    assert not ctrls.liveButton.isHidden()
+    assert not ctrls.batchButton.isHidden()
+    img_modes = [ctrls.modeCombo.itemText(i) for i in range(ctrls.modeCombo.count())]
+    assert 'Int 2D' in img_modes and 'NeXus Viewer' not in img_modes
+    assert w.wrangler.ui.processingModeCombo is ctrls.modeCombo
+    assert w.wrangler.ui.startButton is ctrls.startButton
+    assert w.wrangler._control_conns                     # image owns the wiring
+
+    # Swap to the NeXus wrangler: Live + Batch hidden, the 3 NeXus modes, and
+    # the nexus wrangler aliases the SAME shared widgets.
+    stack.setCurrentIndex(nx_i)
+    assert ctrls.liveButton.isHidden()
+    assert ctrls.batchButton.isHidden()
+    nx_modes = [ctrls.modeCombo.itemText(i) for i in range(ctrls.modeCombo.count())]
+    assert nx_modes == ['Int 1D + 2D', 'Int 1D', 'Int 1D (XYE)']
+    assert w.wrangler.processingModeCombo is ctrls.modeCombo
+    assert w.wrangler.startButton is ctrls.startButton
+    assert w.wrangler._control_conns                     # nexus now owns wiring
+    # The image wrangler released its shared-control connections on swap.
+    img_w = stack.widget(img_i)
+    assert not img_w._control_conns
+
+    # Swap back to image: Live/Batch return, image modes restored.
+    stack.setCurrentIndex(img_i)
+    assert not ctrls.liveButton.isHidden()
+    assert not ctrls.batchButton.isHidden()
+    back_modes = [ctrls.modeCombo.itemText(i) for i in range(ctrls.modeCombo.count())]
+    assert 'Int 2D' in back_modes
