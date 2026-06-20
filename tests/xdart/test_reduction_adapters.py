@@ -892,33 +892,35 @@ def test_single_frame_2d_reintegration_is_2d_only(monkeypatch) -> None:
     np.testing.assert_allclose(pub.view.intensity_2d, frame.int_2d.intensity.T)
 
 
-def test_compute_bad_pixel_mask_flags_uint32_dummy_and_negatives() -> None:
-    """The shared bad-pixel mask ALWAYS cuts the uint32 dead/hot sentinel
-    (4294967295, Eiger masters) + negatives, regardless of the Mask-Saturated
-    opt-in -- they are never real photon counts.  Unmasked, the uint32 dummies
-    (whole dead modules) dominate every radial bin -> the reintegrate high-Q
-    spike that a fresh integrate did not show."""
+def test_compute_bad_pixel_mask_toggle_is_authoritative() -> None:
+    """'Auto Mask Saturated' is the AUTHORITATIVE on/off: OFF masks NOTHING
+    (returns None) -- the raw frame incl. the uint32 sentinel + negatives is kept
+    (strong Bragg peaks that saturate are the user's to keep); ON masks the
+    uint32 dead/hot sentinel (4294967295) + negatives.  (Was wrong: the sentinel
+    used to be masked ALWAYS, making the toggle pointless.)"""
     from xdart.modules.reduction import compute_bad_pixel_mask
 
     raw = np.ones((4, 4), dtype=np.uint32)
     raw[0, 0] = 4294967295
     raw[1, 1] = 4294967295
-    m = compute_bad_pixel_mask(raw, mask_saturation=False)
-    assert m is not None
-    assert set(m.tolist()) == {0, 5}        # (0,0) and (1,1) row-major
-    # all-good frame -> None (nothing to mask)
-    assert compute_bad_pixel_mask(
-        np.ones((4, 4), dtype=np.uint32), mask_saturation=False) is None
-    # negatives (signed/float source) are cut too
+    # OFF -> nothing masked, even the uint32 sentinel
+    assert compute_bad_pixel_mask(raw, mask_saturation=False) is None
+    # ON -> the sentinel pixels are masked
+    on = compute_bad_pixel_mask(raw, mask_saturation=True)
+    assert on is not None and set(on.tolist()) == {0, 5}   # (0,0),(1,1) row-major
+    # negatives are cut on ON, kept on OFF
     sraw = np.zeros((2, 2), dtype=np.int32)
     sraw[0, 1] = -5
-    assert set(
-        compute_bad_pixel_mask(sraw, mask_saturation=False).tolist()) == {1}
+    assert compute_bad_pixel_mask(sraw, mask_saturation=False) is None
+    assert set(compute_bad_pixel_mask(sraw, mask_saturation=True).tolist()) == {1}
+    # all-good frame -> None either way
+    assert compute_bad_pixel_mask(
+        np.ones((4, 4), dtype=np.uint32), mask_saturation=True) is None
 
 
-def test_compute_bad_pixel_mask_saturation_is_opt_in() -> None:
-    """The fraction-guarded uint16 65535 ceiling is cut ONLY when
-    mask_saturation is on AND a whole module sits there (>1e-4 fraction)."""
+def test_compute_bad_pixel_mask_saturation_ceiling_when_on() -> None:
+    """When ON, the fraction-guarded uint16 65535 ceiling is cut (a whole module
+    at the ceiling, >1e-4 fraction).  When OFF, nothing is cut."""
     from xdart.modules.reduction import compute_bad_pixel_mask
 
     raw = np.zeros((100, 100), dtype=np.uint16)
@@ -978,9 +980,18 @@ def test_reintegrate_prep_stamps_uint32_bad_pixel_mask() -> None:
     scan.static = False
     scan.gi = False
     thread = integratorThread(scan, None, None, None, [0], {}, {})
+    # Default: Mask Saturated ON -> the dummy is stamped
     out = thread._prepare_frame_for_headless_reduction(frame)
     assert out.mask is not None
     assert set(np.asarray(out.mask).tolist()) == {0}    # the dummy at (0,0)
+
+    # Mask Saturated OFF -> NOTHING masked (the toggle is authoritative): the
+    # frame integrates raw, saturated pixels kept.
+    from xdart.modules.reduction import ThresholdSaturationConfig
+    frame.mask = None
+    thread.threshold_config = ThresholdSaturationConfig(mask_saturation=False)
+    out = thread._prepare_frame_for_headless_reduction(frame)
+    assert out.mask is None
 
 
 def test_plan_changes_output_shape_reads_intensity_array() -> None:

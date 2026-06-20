@@ -210,28 +210,35 @@ def compute_bad_pixel_mask(raw_image, *, mask_saturation: bool = True,
                            saturation_ceiling=_CEILING_AUTO):
     """Flat-index "bad pixel" mask for one raw detector frame — the SINGLE
     implementation shared by the live wrangler (``_resolve_frame_mask``) and the
-    reintegrate path, so a reintegrate masks exactly what a fresh integrate did.
+    reintegrate path, so they mask the same pixels on the same frame.
 
-    Always masks the UNAMBIGUOUS invalids — negatives and the uint32 dead/hot
-    sentinel (:data:`~xrd_tools.core.invalid.UINT32_CEILING` = 4294967295, e.g.
-    Eiger masters) — which are never real photon counts.  Unmasked, the uint32
-    dummies (often whole dead modules) dominate every radial bin they fall in:
-    that is the high-Q spike a reintegrate showed but a fresh integrate did not
-    (the reintegrate frame, lazy-loaded from the ``.nxs``, carried ``mask=None``
-    because the per-frame bad-pixel mask is not persisted, while the live
-    ``LiveFrame`` carried ``_resolve_frame_mask``).
+    ``mask_saturation`` (the GUI "Auto Mask Saturated" toggle) is the
+    AUTHORITATIVE on/off for ALL masking here:
 
-    When ``mask_saturation`` is set, also OR in the fraction-guarded
-    detector-saturation ceiling (:func:`xrd_tools.core.invalid.saturation_pixels`
-    — uint16 65535 etc., only when a whole module sits there).
-    ``saturation_ceiling`` selects the ceiling policy: the default derives it
-    from the integer dtype (``None`` for a float frame — core never hardcodes
-    65535).  GUI callers pass the display policy's ceiling (its legacy 65535
-    float fallback) so live and reintegrate agree on a float-typed raw too — the
-    equivalence-spine-safe single policy.
+    * **False -> mask NOTHING** (returns ``None``).  The raw frame is integrated
+      as-is, including the highest-value pixels — the uint32 dead/hot sentinel
+      (:data:`~xrd_tools.core.invalid.UINT32_CEILING` = 4294967295, Eiger
+      masters) AND genuinely-saturated pixels.  This is deliberate: strong Bragg
+      peaks legitimately saturate, and the user must be able to KEEP them rather
+      than have them auto-masked.  (Yes, the unmasked uint32 sentinel then
+      dominates radial bins -> the high-Q spike; that is the user's choice when
+      the toggle is off.  See [[mask-saturated-toggle-authoritative]].)
+    * **True -> mask** negatives + the uint32 sentinel + the fraction-guarded
+      detector-saturation ceiling (:func:`~xrd_tools.core.invalid.saturation_pixels`
+      — uint16 65535 etc., only when a whole module sits there).
+
+    NOTE: the ``xrd_tools.core.invalid`` policy that the uint32 dummy is "masked
+    always, not gated" is the HEADLESS/core stance for non-GUI callers; the xdart
+    GUI gates everything on the toggle here.  ``saturation_ceiling`` selects the
+    ceiling for the fraction-guarded part: the default derives it from the integer
+    dtype (``None`` for float — core never hardcodes 65535); GUI callers pass the
+    display policy's ceiling (its 65535 float fallback) so live and reintegrate
+    agree on a float-typed raw too.
 
     Returns a flat ``int`` index array (the pyFAI / :class:`MaskSpec` format),
-    or ``None`` when nothing is bad or the input is unusable (never raises)."""
+    or ``None`` when nothing is masked or the input is unusable (never raises)."""
+    if not mask_saturation:
+        return None
     from xrd_tools.core.invalid import (
         UINT32_CEILING, integer_saturation_ceiling, saturation_pixels,
     )
@@ -242,11 +249,9 @@ def compute_bad_pixel_mask(raw_image, *, mask_saturation: bool = True,
         return None
     if flat.size == 0:
         return None
-    bad = (flat < 0) | (flat >= UINT32_CEILING)
-    if mask_saturation:
-        ceil = (integer_saturation_ceiling(arr0)
-                if saturation_ceiling is _CEILING_AUTO else saturation_ceiling)
-        bad = bad | saturation_pixels(flat, ceiling=ceil)
+    ceil = (integer_saturation_ceiling(arr0)
+            if saturation_ceiling is _CEILING_AUTO else saturation_ceiling)
+    bad = (flat < 0) | (flat >= UINT32_CEILING) | saturation_pixels(flat, ceiling=ceil)
     idx = np.flatnonzero(bad)
     return idx if idx.size else None
 
@@ -376,10 +381,10 @@ def plan_from_live_scan(
     unit_2d = _gi_2d_unit_default(unit_2d, str(gi_mode_2d), is_gi=is_gi)
 
     if is_gi and gi_mode is not None:
-        # Diagnostic for the GI-1D live-vs-reintegrate divergence hunt: log the
-        # GI geometry + 1D range/npt this plan was built with, so a live run vs a
-        # reintegrate can be diffed from the log.
-        logger.info(
+        # Diagnostic for the GI-1D live-vs-reintegrate divergence hunt (now
+        # resolved): kept at DEBUG so it's available for a future hunt without
+        # spamming the normal run log.
+        logger.debug(
             "[GI-PLAN] incident_angle=%s incidence_motor=%s sample_orientation=%s "
             "tilt=%s gi_mode_1d=%s gi_method=%s npt_1d=%s npt_oop=%s "
             "radial_range_1d=%s azimuth_range_1d=%s unit_1d=%s",

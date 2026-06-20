@@ -80,6 +80,26 @@ class TestStashPersistBeforeEvict:
         assert all(i not in fs._in_memory for i in range(6)) or \
             len(fs._in_memory) <= 6 + fs._in_memory_cap
 
+    def test_evict_persisted_beyond_cap_releases_after_save(self):
+        """D1: after a reintegrate's single end-of-run save, no further stash
+        fires to trigger eviction, so the just-saved frames would stay pinned.
+        evict_persisted_beyond_cap releases the persisted ones down to the cap --
+        but never an unsaved frame."""
+        from xdart.modules.ewald.frame import LiveFrame
+        fs = self._series(cap=4)
+        for i in range(20):
+            fs[i] = LiveFrame(idx=i)
+        assert len(fs._in_memory) == 20          # nothing persisted yet -> pinned
+        fs.mark_persisted(range(20))             # the reintegrate save persisted all
+        n = fs.evict_persisted_beyond_cap()
+        assert n == 20 - fs._in_memory_cap       # 16 released
+        assert len(fs._in_memory) == fs._in_memory_cap
+        # An unsaved frame is never dropped by the sweep, even past cap.
+        fs[100] = LiveFrame(idx=100)             # unsaved
+        fs.evict_persisted_beyond_cap()
+        assert 100 in fs._in_memory
+        assert fs.unsaved_in_memory_count() == 1
+
     def test_stash_marks_frame_unsaved_again(self):
         from xdart.modules.ewald.frame import LiveFrame
         fs = self._series()

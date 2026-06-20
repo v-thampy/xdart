@@ -303,17 +303,16 @@ class integratorThread(Qt.QtCore.QThread):
             frame.gi = True
         if getattr(self.scan, "_cached_integrator", None) is not None:
             frame.integrator = self.scan._cached_integrator
-        # Stamp the bad-pixel mask the live wrangler puts on every LiveFrame
-        # (negatives + the uint32 dead/hot dummy, e.g. Eiger masters, + the
-        # opt-in detector-saturation ceiling).  A frame lazy-loaded from the
-        # .nxs for reintegration carries mask=None — that per-frame mask is not
-        # persisted — so without this the unmasked uint32 dummies (whole dead
-        # modules at 4.29e9 counts) dominate every radial bin and produce the
-        # high-Q spike a reintegrate showed but a fresh integrate did not.  Uses
-        # the SAME compute_bad_pixel_mask + DISPLAY ceiling as _resolve_frame_mask
-        # so live ≡ reintegrate on the same frame (incl. a float-typed raw).
-        # Recomputed every pass (not cached on the frame) so a Mask-Saturated
-        # toggle change between Reintegrate clicks is honoured.
+        # Stamp the bad-pixel mask the live wrangler puts on every LiveFrame, so a
+        # reintegrate masks exactly what a fresh integrate did.  A frame lazy-
+        # loaded from the .nxs carries mask=None (the per-frame mask is not
+        # persisted).  Uses the SAME compute_bad_pixel_mask + DISPLAY ceiling as
+        # _resolve_frame_mask so live ≡ reintegrate on the same frame (incl. a
+        # float-typed raw).  "Mask Saturated" is the AUTHORITATIVE on/off: OFF ->
+        # mask=None -> nothing masked (saturated Bragg peaks KEPT, the user's
+        # choice); ON -> negatives + uint32 sentinel + fraction-guarded ceiling.
+        # Recomputed every pass (not cached on the frame) so a toggle change
+        # between Reintegrate clicks is honoured.
         raw = getattr(frame, "map_raw", None)
         if raw is None:
             # The reduce needs the raw anyway; _lazy_load_raw is idempotent and
@@ -645,6 +644,20 @@ class integratorThread(Qt.QtCore.QThread):
             for frame in reduced_frames:
                 _publish(frame)
                 processed_idxs.append(int(getattr(frame, "idx", -1)))
+                # D1 RAM: every published frame is pinned in scan.frames
+                # (unsaved -> un-evictable) until the single end-of-run save, so
+                # N frames accumulate.  Shrink each frame's footprint now that its
+                # results are published:
+                #   * drop map_raw (~18 MB/frame) -- consumed by the reduce + the
+                #     publication upsert; the replace-save doesn't rewrite the raw
+                #     or thumbnail (is_replace guard), and it re-lazy-loads on
+                #     demand for display.
+                #   * for a 1D-only pass, drop the stale 2D slab the lazy-load
+                #     pulled in (~2-8 MB/frame): it's unchanged and the save skips
+                #     the 2D group (skip_2d forced below), so it's dead weight.
+                frame.map_raw = None
+                if not do_2d:
+                    frame.int_2d = None
             # Authoritative once-per-pass savability check: compare the freshly
             # reduced output signature to the stored one.  Catches axis/unit
             # changes the plan-npt pre-check can't (so the Stop popup is reliable
@@ -691,6 +704,13 @@ class integratorThread(Qt.QtCore.QThread):
         if replace_idxs:
             from xdart.utils.h5pool import get_pool as _get_h5pool
             _get_h5pool().pause(self.scan.data_file)
+            # D1: a 1D-only reintegrate must NOT rewrite the (unchanged) 2D group
+            # -- that's what lets us drop the in-memory 2D slabs above.  Force
+            # skip_2d so _prepare_integrated_2d short-circuits (disk 2D untouched);
+            # restored in the finally.  (A 2D reintegrate keeps its own skip_2d.)
+            _saved_skip_2d = getattr(self.scan, "skip_2d", False)
+            if not do_2d:
+                self.scan.skip_2d = True
             try:
                 self.scan.save_to_nexus(
                     replace_frame_indices=replace_idxs,
@@ -699,6 +719,17 @@ class integratorThread(Qt.QtCore.QThread):
                     "[REINT] %s saved %s reintegrated frame(s)%s.",
                     label, len(replace_idxs),
                     " (partial — stopped)" if _stopped else "")
+                # D1: release the now-persisted frames so they don't stay pinned
+                # in _in_memory after the run (no further stash fires to evict).
+                try:
+                    self.scan.frames.mark_persisted(replace_idxs)
+                    n_evicted = self.scan.frames.evict_persisted_beyond_cap()
+                    if n_evicted:
+                        logger.info("[REINT] released %s frame(s) from memory "
+                                    "after save.", n_evicted)
+                except Exception:
+                    logger.debug("[REINT] post-save eviction skipped",
+                                 exc_info=True)
             except ValueError as exc:
                 # Shape/axis/unit changed -> partial rewrite forbidden by the
                 # writer (correctly).  Don't crash, don't loosen the check.
@@ -710,6 +741,7 @@ class integratorThread(Qt.QtCore.QThread):
                     label, len(replace_idxs),
                     len(self.scan.frames.index) - len(replace_idxs), exc)
             finally:
+                self.scan.skip_2d = _saved_skip_2d
                 _get_h5pool().resume(self.scan.data_file)
 
     def bai_2d_SI(self):

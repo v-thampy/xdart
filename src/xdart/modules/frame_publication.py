@@ -576,7 +576,18 @@ def _same_source_id(sa, sb) -> bool:
     compare this still REJECTS two different directories that share a filename
     (e.g. ``run1/frame_0001.tif`` vs ``run2/frame_0001.tif``).  Missing source
     IDs merge only when BOTH sides are missing; one missing + one known source is
-    not enough evidence to splice records."""
+    not enough evidence to splice records.
+
+    KNOWN LIMITATION (transitional compat — review #3, accepted for v1.0): if one
+    side is a SINGLE-component id (a bare filename, no directory), the suffix
+    match degrades to basename matching for that pair — a bare ``frame_0001.tif``
+    would match ANY path ending in it.  This is tolerated because source IDs are
+    not yet reliably canonical (a live frame carries an absolute ``source_file``,
+    a reload the relative ``source/path``), and a real bare-filename relative path
+    (``source_base`` == the file's own directory) must still merge with its
+    absolute spelling.  Tighten to exact canonical identity once IDs are
+    canonicalised at the source seam (then abs/rel normalise to one form and this
+    whole suffix dance — and the hole — goes away)."""
     if not sa or not sb:
         return not sa and not sb
     na, nb = os.path.normpath(sa), os.path.normpath(sb)

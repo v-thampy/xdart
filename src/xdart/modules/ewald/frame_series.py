@@ -519,6 +519,28 @@ class LiveFrameSeries:
         with self._cache_lock:
             self._persisted.update(int(i) for i in idxs)
 
+    def evict_persisted_beyond_cap(self) -> int:
+        """Drop persisted in-memory frames beyond ``_in_memory_cap`` (oldest
+        first); returns the number evicted.
+
+        ``stash`` only evicts when a NEW frame is added, so after a reintegrate's
+        single end-of-run save (no further stash fires) every just-saved frame
+        would stay pinned in ``_in_memory`` — the D1 RAM residency.  Call this
+        right after the save (and after :meth:`mark_persisted`) to release them.
+        Only persisted frames are dropped (persist-before-evict invariant)."""
+        with self._cache_lock:
+            evicted = 0
+            excess = len(self._in_memory) - self._in_memory_cap
+            if excess <= 0:
+                return 0
+            for idx in list(self._in_memory.keys()):
+                if evicted >= excess:
+                    break
+                if idx in self._persisted:
+                    self._in_memory.pop(idx, None)
+                    evicted += 1
+            return evicted
+
     def unsaved_in_memory_count(self) -> int:
         """How many in-memory frames are not yet persisted to disk.
 

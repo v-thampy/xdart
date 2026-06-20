@@ -599,10 +599,10 @@ class wranglerThread(Qt.QtCore.QThread):
                 # frame.  Pass the DISPLAY policy's ceiling (its legacy 65535
                 # float fallback) so a float-typed raw masks identically on both
                 # paths — keeping the live≡batch≡reload equivalence spine safe.
-                # Unambiguous invalids (negatives + the uint32 dummy) are always
-                # cut; the detector-saturation ceiling is OPT-IN (the "Mask
-                # Saturated" toggle, default ON) and fraction-guarded so a few
-                # genuinely-saturated Bragg pixels survive.  Computed-once +
+                # "Mask Saturated" (mask_sentinel) is the AUTHORITATIVE on/off:
+                # OFF -> compute_bad_pixel_mask returns None -> nothing masked
+                # (strong Bragg peaks that saturate are KEPT); ON -> negatives +
+                # uint32 sentinel + fraction-guarded ceiling.  Computed-once +
                 # cached, so pyFAI's CSR mask-CRC stays stable frame-to-frame.
                 ceil = integer_saturation_ceiling(arr0)
                 idx = compute_bad_pixel_mask(

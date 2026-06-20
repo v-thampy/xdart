@@ -40,19 +40,20 @@ def test_resolve_frame_mask_excludes_uint16_sentinels():
     assert not m[50, 50]             # real pixels untouched
 
 
-def test_resolve_frame_mask_toggle_off_keeps_saturation_masks_invalids():
-    """With the toggle OFF, the uint16 ceiling (65535) is NOT masked — a real
-    saturated Bragg peak survives into the integration — while the UNAMBIGUOUS
-    invalids (negatives, the uint32 ceiling) are still masked always."""
+def test_resolve_frame_mask_toggle_off_masks_nothing():
+    """'Mask Saturated' is the AUTHORITATIVE on/off (Vivek requirement): OFF masks
+    NOTHING — a real saturated Bragg peak, negatives, AND the uint32 sentinel all
+    survive into the integration.  Experiments with strong saturating peaks need
+    the raw pixels kept; a toggle that masks regardless of state is pointless.
+    (Was: OFF still masked the 'unambiguous' invalids — that design is rejected.)
+    Independent of the Threshold toggle (intensity band), which this never touches.
+    """
     img = np.full((100, 100), 500.0)
-    img[10:20, :] = 65535.0          # would be a 10% sentinel band when ON
-    img[0, 0] = -1.0                 # negative bad pixel (always invalid)
-    img[0, 1] = 4294967295.0         # uint32 ceiling (always invalid)
+    img[10:20, :] = 65535.0          # uint16 ceiling band
+    img[0, 0] = -1.0                 # negative
+    img[0, 1] = 4294967295.0         # uint32 sentinel
     m = _resolve(img, mask_sentinel=False)
-    assert not m[10:20, :].any()     # 65535 NOT masked when the toggle is off
-    assert m[0, 0]                   # negatives still masked
-    assert m[0, 1]                   # uint32 ceiling still masked
-    assert not m[50, 50]             # real pixels untouched
+    assert not m.any()               # NOTHING masked when the toggle is off
 
 
 def test_resolve_frame_mask_ceiling_from_dtype():

@@ -4385,6 +4385,53 @@ def test_reintegrate_skips_vanished_frame_without_crashing(monkeypatch):
     assert reduced == [0, 1, 3, 4]            # frame 2 skipped, rest processed
 
 
+def test_reintegrate_drops_map_raw_and_2d_slab_for_ram(monkeypatch):
+    """D1 RAM: a reintegrate drops each published frame's map_raw (~18 MB) and,
+    for a 1D-only pass, the stale 2D slab, so N frames don't pile up
+    un-evictable until the end-of-run save.  The 1D-only save forces skip_2d (so
+    the unchanged 2D group isn't rewritten) and RESTORES it; a post-save sweep
+    evicts the now-persisted frames."""
+    import threading
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+    import xdart.utils.h5pool as h5pool
+    monkeypatch.setattr(h5pool, 'get_pool', lambda: SimpleNamespace(
+        pause=lambda *a, **k: None, resume=lambda *a, **k: None))
+
+    persisted, evicted = [], []
+    store = {i: SimpleNamespace(idx=i, map_raw=np.ones((4, 4)),
+                                int_1d=object(), int_2d=object())
+             for i in range(3)}
+
+    class _Frames:
+        index = list(range(3))
+        def __getitem__(self, i): return store[i]
+        def __setitem__(self, i, v): store[i] = v
+        def mark_persisted(self, idxs): persisted.extend(int(i) for i in idxs)
+        def evict_persisted_beyond_cap(self): evicted.append(True); return 0
+
+    scan = SimpleNamespace(
+        max_cores=1, frames=_Frames(), scan_lock=threading.RLock(),
+        data_file='x.nxs', save_to_nexus=lambda **k: None, skip_2d=False)
+    host = SimpleNamespace(
+        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        publication_store=None, scan=scan, stop_requested=False,
+        reintegrate_live=True,
+        update=SimpleNamespace(emit=lambda *a, **k: None),
+        _plan_for_reintegration=lambda integrate_2d: object(),
+        _reduce_reintegration_batch=lambda frames, plan, n_workers: frames,
+        _publish_reintegrated_display=lambda *a, **k: None,
+    )
+    host._reintegrate_all = MethodType(integratorThread._reintegrate_all, host)
+    host._reintegrate_all(do_2d=False)
+
+    for fr in store.values():
+        assert fr.map_raw is None             # raw dropped (dominant pin)
+        assert fr.int_2d is None              # 1D-only -> stale 2D slab dropped
+    assert scan.skip_2d is False              # forced True for the save, restored
+    assert persisted == [0, 1, 2]            # marked persisted before eviction
+    assert evicted == [True]                  # post-save eviction sweep ran
+
+
 def test_reintegrate_each_button_is_single_dimension():
     """Each Reintegrate button recomputes ONLY its own dimension, regardless of
     GI: Reintegrate 2D never touches the 1D (recomputing it overwrote the good
@@ -4990,7 +5037,10 @@ def test_wrangler_enabled_reapplies_viewer_mode_controls():
         assert host.ui.liveCheckBox.isChecked() is False
         assert host.ui.liveCheckBox.isEnabled() is False
         assert host.ui.batchCheckBox.isEnabled() is False
-        assert host.ui.frame.isVisible() is False
+        # Viewer modes now DISABLE the run row rather than hiding it (a hidden row
+        # left an ugly empty box) -- visible but greyed.
+        assert host.ui.frame.isVisible() is True
+        assert host.ui.frame.isEnabled() is False
         assert host._integration_controls_enabled is False
         assert host.thread.live_mode is False
         assert host.tree.isEnabled() is True   # Project/Save Path stay usable

@@ -81,6 +81,14 @@ deferred-items register lives IN-REPO now**; the old
 - The **publication gate** (`validate_publication`) complements the writer
   validators, never replaces them.  Reject/skip bad output **per frame**,
   never abort a whole-scan save.  Carry `metadata_raw` + `metadata_numeric`.
+- **"Auto Mask Saturated" is the AUTHORITATIVE GUI toggle for saturated-pixel
+  masking** (live AND reintegrate, kept equal): OFF masks **nothing** — the raw
+  frame, including the uint32-max `4294967295` sentinel — ON masks dead/saturated
+  pixels.  Strong Bragg peaks legitimately saturate; the user must be able to
+  KEEP them, so **never auto-mask** regardless of the toggle.  `compute_bad_pixel_mask`
+  gates the whole mask on it.  The `xrd_tools.core.invalid` "uint32 dummy masked
+  always, not gated" note is the **headless/core** policy and does NOT govern the
+  GUI toggle.  See `[[mask-saturated-toggle-authoritative]]`.
 - When fixing a bug, label it **regression** vs **pre-existing**.
 
 ## Name resolution (the two Scans, and Live*)
