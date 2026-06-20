@@ -178,6 +178,54 @@ class TestReadNexus:
         with pytest.raises(FileNotFoundError):
             read_nexus(tmp_path / "ghost.h5")
 
+    def test_harvests_scan_data_and_positioners(self, tmp_path):
+        """F6: motors live under entry/scan_data (the SPEC-style all-motors
+        per-point table) and entry/sample/positioners/<motor>/value (the scanned
+        NXpositioner), not just entry/data.  read_nexus harvests all three so the
+        GI incidence motor (possibly a non-scanned positioner) reaches the
+        metadata.  Non-positioner datasets under positioners (e.g. frame_index)
+        are NOT treated as motors."""
+        p = tmp_path / "scan_nexusstyle.h5"
+        with h5py.File(p, "w") as f:
+            entry = f.create_group("entry")
+            entry.attrs["NX_class"] = "NXentry"
+            sd = entry.create_group("scan_data")          # no entry/data here
+            sd.create_dataset("samz", data=np.linspace(4.0, 5.0, 5))
+            sd.create_dataset("phi", data=np.zeros(5))
+            sd.create_dataset("i0", data=np.ones(5) * 1e5)   # a counter
+            # xdart's own writer emits frame_index into scan_data -- it's a
+            # bookkeeping index, NOT a motor, and must be skipped.
+            sd.create_dataset("frame_index", data=np.arange(5))
+            # SPEC-style tables carry string timestamp/label columns: a
+            # fixed-length-string (|S) column AND a variable-length (object)
+            # string column must be SKIPPED, not crash the cast (h5py raises
+            # OSError casting a string dataset to float).
+            sd.create_dataset("timestamp",
+                              data=np.array([b"t0", b"t1", b"t2", b"t3", b"t4"]))
+            sd.create_dataset("label", data=["a", "b", "c", "d", "e"],
+                              dtype=h5py.string_dtype())
+            sample = entry.create_group("sample")
+            positioners = sample.create_group("positioners")
+            th = positioners.create_group("th")              # NXpositioner
+            th.attrs["NX_class"] = "NXpositioner"
+            th.create_dataset("value", data=np.linspace(2.0, 2.4, 5))
+            positioners.create_dataset("frame_index", data=np.arange(5))
+
+        meta = read_nexus(p)                      # must NOT raise on |S columns
+        assert "th" in meta.angles                # scanned positioner
+        assert "samz" in meta.angles              # scan_data motor
+        assert "phi" in meta.angles
+        assert "i0" in meta.counters              # scan_data counter
+        # frame_index (bookkeeping index our own writer emits into scan_data AND
+        # under positioners) is never a motor/counter.
+        assert "frame_index" not in meta.angles
+        assert "frame_index" not in meta.counters
+        # string columns skipped entirely (the OSError-on-cast regression)
+        for s in ("timestamp", "label"):
+            assert s not in meta.angles and s not in meta.counters
+        np.testing.assert_allclose(
+            meta.angles["th"], np.linspace(2.0, 2.4, 5))
+
 
 # ---------------------------------------------------------------------------
 # TestFindNexusImageDataset

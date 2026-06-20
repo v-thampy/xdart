@@ -105,6 +105,12 @@ _DEFAULT_COUNTER_NAMES: frozenset[str] = frozenset(
     {"i0", "i1", "i2", "monitor", "mon", "det", "diode", "seconds", "epoch", "time"}
 )
 
+# Per-point columns that are neither motors nor counters — bookkeeping indices
+# that must not pollute the motor list.  xdart's own writer emits ``frame_index``
+# into ``/entry/scan_data`` (and under sample/positioners), so a re-ingested file
+# would otherwise classify it as a motor angle.
+_NON_MOTOR_COLUMNS: frozenset[str] = frozenset({"frame_index"})
+
 
 # ---------------------------------------------------------------------------
 # Read API
@@ -126,9 +132,11 @@ def read_nexus(
     entry : str, optional
         Name of the NXentry group (default ``"entry"``).
     motor_names : list of str, optional
-        Motor names to extract from ``/{entry}/data/``.  If *None*, all 1D
-        float datasets whose names are **not** in ``counter_names`` are
-        treated as motors.
+        Motor names to extract.  If *None*, all 1D float datasets whose names
+        are **not** in ``counter_names`` are treated as motors.  Sources scanned
+        (see :func:`_read_data_group`): ``/{entry}/data/`` + ``/{entry}/scan_data/``
+        (per-point motor/counter tables) and ``/{entry}/sample/positioners/*``
+        (NXpositioner ``value`` arrays — the scanned motors).
     counter_names : list of str, optional
         Counter names to extract.  If *None*, tries the built-in set:
         ``{"i0", "i1", "i2", "monitor", "mon", "det", "diode", "seconds",
@@ -2491,7 +2499,17 @@ def _read_data_group(
     counter_names: list[str] | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """
-    Extract per-point arrays from ``/{entry}/data/``.
+    Extract per-point motor/counter arrays from a scan's data groups.
+
+    Harvests 1-D float datasets from BOTH ``/{entry}/data/`` and
+    ``/{entry}/scan_data/`` (the SPEC-style "all motors + counters" per-point
+    table some facilities write — the NeXus equivalent of reading every SPEC
+    motor column), classifying each as a motor *angle* or a *counter*; PLUS the
+    NXpositioner ``value`` arrays under ``/{entry}/sample/positioners/<motor>``
+    (the actual scanned motor(s)), which are ALWAYS treated as angles and win on
+    a name clash.  The GI incidence motor can be a non-scanned positioner, so all
+    three sources are needed.  (NXpositioner stores ``value`` as a rank-1 ``[n]``
+    array over the scan — NeXus manual.)
 
     Returns
     -------
@@ -2501,38 +2519,71 @@ def _read_data_group(
     angles: dict[str, np.ndarray] = {}
     counters: dict[str, np.ndarray] = {}
 
-    if "data" not in grp:
-        return angles, counters
+    counter_set: frozenset[str] = (
+        frozenset(counter_names) if counter_names is not None
+        else _DEFAULT_COUNTER_NAMES)
+    motor_set: frozenset[str] | None = (
+        frozenset(motor_names) if motor_names is not None else None)
 
-    data_grp = grp["data"]
-    if not isinstance(data_grp, h5py.Group):
-        return angles, counters
-
-    counter_set: frozenset[str]
-    if counter_names is not None:
-        counter_set = frozenset(counter_names)
-    else:
-        counter_set = _DEFAULT_COUNTER_NAMES
-
-    motor_set: frozenset[str] | None = frozenset(motor_names) if motor_names is not None else None
-
-    for name, obj in data_grp.items():
-        if not isinstance(obj, h5py.Dataset):
-            continue
-        arr = np.asarray(obj, dtype=float)
-        if arr.ndim != 1:
-            continue
-
-        if motor_set is not None:
-            if name in motor_set:
-                angles[name] = arr
+    def _harvest(group: h5py.Group) -> None:
+        for name, obj in group.items():
+            if not isinstance(obj, h5py.Dataset):
+                continue
+            if name in _NON_MOTOR_COLUMNS:   # frame_index etc. — not a motor
+                continue
+            # Skip non-numeric columns WITHOUT reading them: SPEC-style
+            # ``scan_data`` tables routinely carry fixed-length-string (|S),
+            # unicode (|U), or variable-length-string (object) timestamp/label
+            # columns.  Casting those to float raises ``OSError`` from h5py
+            # (not just Type/ValueError), which would crash read_nexus on a
+            # user-selected foreign file.  ``dtype.kind`` is metadata — no read.
+            if getattr(obj.dtype, "kind", "O") not in "fiub":
+                continue
+            try:
+                arr = np.asarray(obj, dtype=float)
+            except (TypeError, ValueError, OSError):
+                continue
+            if arr.ndim != 1:
+                continue
+            if motor_set is not None:
+                if name in motor_set:
+                    angles.setdefault(name, arr)
+                elif name in counter_set:
+                    counters.setdefault(name, arr)
             elif name in counter_set:
-                counters[name] = arr
-        else:
-            if name in counter_set:
-                counters[name] = arr
+                counters.setdefault(name, arr)
             else:
-                angles[name] = arr
+                angles.setdefault(name, arr)
+
+    for gname in ("data", "scan_data"):
+        sub = grp.get(gname)
+        if isinstance(sub, h5py.Group):
+            _harvest(sub)
+
+    # NXpositioner ``value`` arrays under sample/positioners — the actual scanned
+    # motor(s).  Each positioner is a GROUP (NXpositioner) with a ``value`` field;
+    # non-group children (e.g. a stray ``frame_index`` dataset) are NOT motors and
+    # are skipped.  These are authoritative motors -> force into angles.
+    sample = grp.get("sample")
+    if isinstance(sample, h5py.Group):
+        positioners = sample.get("positioners")
+        if isinstance(positioners, h5py.Group):
+            for name, obj in positioners.items():
+                if not isinstance(obj, h5py.Group):
+                    continue
+                value = obj.get("value")
+                if not isinstance(value, h5py.Dataset):
+                    continue
+                if getattr(value.dtype, "kind", "O") not in "fiub":
+                    continue
+                try:
+                    arr = np.asarray(value, dtype=float)
+                except (TypeError, ValueError, OSError):
+                    continue
+                if arr.ndim != 1:
+                    continue
+                angles[name] = arr          # authoritative scanned motor
+                counters.pop(name, None)
 
     return angles, counters
 
