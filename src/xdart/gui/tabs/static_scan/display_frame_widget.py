@@ -284,6 +284,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self._reflow_controls()
         self._set_tooltips()
         self._set_equal_primary_panel_heights()
+        self._install_share_geometry_hooks()
 
     # ── Initialization helpers ─────────────────────────────────────
 
@@ -1528,8 +1529,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         already = getattr(self, '_share_link_on', False)
         if on and not already:
             self._share_link_on = True
-            # Track the cake's x-range so a zoom/pan re-aligns the 1D.  getattr
-            # so duck holders (which don't bind the slot) just skip the connect.
+            # Two-way wiring:
+            #   cake x-range change  -> re-align the 1D under the cake (forward),
+            #   1D/waterfall x-range -> drive the cake to match (inverse, the
+            #     "2D follows 1D" zoom Vivek asked for).
+            # The ``_share_axis_syncing`` guard (set around each programmatic
+            # setXRange) keeps one direction's range-set from re-triggering the
+            # other.  getattr so duck holders (no bound slots) just skip.
             handler = getattr(self, '_on_cake_xrange_changed', None)
             if handler is not None:
                 self._share_cake_handler = handler   # stable ref for disconnect
@@ -1537,6 +1543,24 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     vb.sigXRangeChanged.connect(handler)
                 except Exception:
                     logger.debug("share-axis connect failed", exc_info=True)
+            inv = getattr(self, '_on_plot_xrange_changed', None)
+            if inv is not None:
+                self._share_plot_handler = inv
+                self._share_plot_vbs = []
+                for plot in (
+                    getattr(self, 'plot', None),
+                    getattr(getattr(self, 'wf_widget', None),
+                            'image_plot', None),
+                ):
+                    pvb = (plot.getViewBox()
+                           if hasattr(plot, 'getViewBox') else None)
+                    if pvb is not None:
+                        try:
+                            pvb.sigXRangeChanged.connect(inv)
+                            self._share_plot_vbs.append(pvb)
+                        except Exception:
+                            logger.debug("share-axis inverse connect failed",
+                                         exc_info=True)
             displayFrameWidget._schedule_align(self)
         elif not on and already:
             self._share_link_on = False
@@ -1547,6 +1571,15 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 except (TypeError, RuntimeError):
                     pass
                 self._share_cake_handler = None
+            inv = getattr(self, '_share_plot_handler', None)
+            if inv is not None:
+                for pvb in getattr(self, '_share_plot_vbs', []) or []:
+                    try:
+                        pvb.sigXRangeChanged.disconnect(inv)
+                    except (TypeError, RuntimeError):
+                        pass
+                self._share_plot_handler = None
+                self._share_plot_vbs = []
             # Detach; _on_share_axis_toggled re-arms the 1D's own autorange.
             for plot in (
                 getattr(self, 'plot', None),
@@ -1559,7 +1592,28 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                     logger.debug("share-axis unlink failed", exc_info=True)
 
     def _on_cake_xrange_changed(self, *args) -> None:
-        """Re-align the 1D under the cake whenever the cake's x-range changes."""
+        """Re-align the 1D under the cake whenever the cake's x-range changes.
+
+        Skipped while ``_share_axis_syncing`` -- that means the inverse
+        (2D-follows-1D) align is the one driving the cake, and forwarding it
+        back to the 1D would fight the user's 1D zoom."""
+        if (getattr(self, '_share_link_on', False)
+                and not getattr(self, '_share_axis_syncing', False)):
+            displayFrameWidget._schedule_align(self)
+
+    def _on_plot_xrange_changed(self, *args) -> None:
+        """User zoomed/panned the 1D (or waterfall) -> drive the cake to match
+        (the "2D follows 1D" direction).
+
+        Skipped while ``_share_axis_syncing`` (the forward align is repositioning
+        the 1D) so the two directions never chase each other."""
+        if (getattr(self, '_share_link_on', False)
+                and not getattr(self, '_share_axis_syncing', False)):
+            displayFrameWidget._schedule_align_cake(self)
+
+    def _on_share_geometry_changed(self, *args) -> None:
+        """Re-align after a layout geometry change (internal splitter drag or a
+        cake/bottom-plot resize/show) -- no-op unless Share Axis is on."""
         if getattr(self, '_share_link_on', False):
             displayFrameWidget._schedule_align(self)
 
@@ -1580,6 +1634,18 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 return                       # superseded by a later schedule
             displayFrameWidget._align_plot_under_cake(self)
         Qt.QtCore.QTimer.singleShot(50, _go)
+
+    @staticmethod
+    def _global_xspan(win, vb):
+        """Global-screen x-extent [left, right] of a viewbox's scene rect.
+
+        The geometric align lines panes up by SCREEN columns (not equal data
+        ranges), so the spans must be in a common coordinate system -- global
+        screen pixels -- even though each pane lives in its own window."""
+        r = vb.sceneBoundingRect()
+        left = win.mapToGlobal(win.mapFromScene(r.topLeft())).x()
+        right = win.mapToGlobal(win.mapFromScene(r.bottomRight())).x()
+        return float(left), float(right)
 
     def _align_plot_under_cake(self) -> None:
         """Set the 1D plot's x-RANGE so the shared Q values land at the same screen
@@ -1604,15 +1670,8 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             cvb = bw.image_plot.getViewBox()
             pvb = bottom_plot.getViewBox()
 
-            def _gspan(win, vb):
-                r = vb.sceneBoundingRect()
-                left = win.mapToGlobal(win.mapFromScene(r.topLeft())).x()
-                right = win.mapToGlobal(
-                    win.mapFromScene(r.bottomRight())).x()
-                return float(left), float(right)
-
-            cx0, cx1 = _gspan(cake_win, cvb)
-            px0, px1 = _gspan(plot_win, pvb)
+            cx0, cx1 = displayFrameWidget._global_xspan(cake_win, cvb)
+            px0, px1 = displayFrameWidget._global_xspan(plot_win, pvb)
             if (cx1 - cx0) <= 1.0 or (px1 - px0) <= 1.0:
                 return
             xr = cvb.viewRange()[0]
@@ -1634,10 +1693,128 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 tol = 0.005 * span
                 if abs(cur0 - pq0) <= tol and abs(cur1 - pq1) <= tol:
                     return
-            bottom_plot.enableAutoRange(x=False, y=True)   # freeze x; keep y auto
-            bottom_plot.setXRange(pq0, pq1, padding=0)     # extends left if needed
+            # Mark this range-set as ours so the bottom plot's resulting
+            # sigXRangeChanged doesn't bounce back as a "2D follows 1D" inverse.
+            self._share_axis_syncing = True
+            try:
+                bottom_plot.enableAutoRange(x=False, y=True)  # freeze x; keep y auto
+                bottom_plot.setXRange(pq0, pq1, padding=0)    # extends left if needed
+            finally:
+                self._share_axis_syncing = False
         except Exception:
             logger.debug("share-axis geometric align failed", exc_info=True)
+
+    def _schedule_align_cake(self) -> None:
+        """Debounced scheduler for the inverse (2D-follows-1D) align -- mirrors
+        ``_schedule_align`` with its own sequence counter so the two directions'
+        pending timers don't cancel each other."""
+        seq = getattr(self, '_align_cake_seq', 0) + 1
+        self._align_cake_seq = seq
+
+        def _go():
+            if seq != getattr(self, '_align_cake_seq', 0):
+                return
+            displayFrameWidget._align_cake_under_plot(self)
+        Qt.QtCore.QTimer.singleShot(50, _go)
+
+    def _align_cake_under_plot(self) -> None:
+        """Inverse of :meth:`_align_plot_under_cake`: set the CAKE's x-range so its
+        screen columns line up with the (user-zoomed) 1D -- the "2D follows 1D"
+        direction.
+
+        The 1D maps its range [pq0, pq1] over screen span [px0, px1]; we set the
+        cake's range over its own span [cx0, cx1] to the same data->screen map.
+        Convergence-guarded + ``_share_axis_syncing`` wrapped, exactly like the
+        forward align, so it terminates and never fights the forward direction."""
+        try:
+            if not getattr(self, '_share_link_on', False):
+                return
+            bw = getattr(self, 'binned_widget', None)
+            cake_win = getattr(bw, 'image_win', None)
+            plot_win = self._active_bottom_window()
+            bottom_plot = self._active_bottom_plot()
+            if (cake_win is None or plot_win is None
+                    or bottom_plot is None
+                    or not cake_win.isVisible() or not plot_win.isVisible()):
+                return
+            cvb = bw.image_plot.getViewBox()
+            pvb = bottom_plot.getViewBox()
+
+            cx0, cx1 = displayFrameWidget._global_xspan(cake_win, cvb)
+            px0, px1 = displayFrameWidget._global_xspan(plot_win, pvb)
+            if (cx1 - cx0) <= 1.0 or (px1 - px0) <= 1.0:
+                return
+            xr = pvb.viewRange()[0]
+            pq0, pq1 = float(xr[0]), float(xr[1])
+            scale = (pq1 - pq0) / (px1 - px0)        # data units per screen pixel
+            cq0 = pq0 + (cx0 - px0) * scale
+            cq1 = pq0 + (cx1 - px0) * scale
+            span = cq1 - cq0
+            if span <= 0:
+                return
+            cur0, cur1 = (float(v) for v in cvb.viewRange()[0])
+            tol = 0.005 * span
+            if abs(cur0 - cq0) <= tol and abs(cur1 - cq1) <= tol:
+                return
+            self._share_axis_syncing = True
+            try:
+                cvb.enableAutoRange(x=False)
+                cvb.setXRange(cq0, cq1, padding=0)
+            finally:
+                self._share_axis_syncing = False
+            # Remember the cake was pinned by the inverse sync so unchecking
+            # Share Axis can re-arm its autorange (forward-only zooms leave it
+            # untouched, preserving the prior "keep cake zoom on uncheck").
+            self._cake_x_pinned_by_share = True
+        except Exception:
+            logger.debug("share-axis inverse align failed", exc_info=True)
+
+    def _install_share_geometry_hooks(self) -> None:
+        """Re-align the shared axes on any layout geometry change, not just this
+        widget's own resize.
+
+        Dragging an internal splitter resizes the cake/plot panes WITHOUT
+        resizing this widget, so ``resizeEvent`` never fires (the reported
+        "expand the plot window and the 1D doesn't follow" regression).  Hook the
+        splitters' ``splitterMoved`` directly, and install an event filter on the
+        cake / bottom-plot windows for Resize/Show -- those fire after the layout
+        reflow settles, giving the align correct timing.  All hooks no-op unless
+        Share Axis is on."""
+        for name in ('splitter', 'splitter_2', 'splitter_3'):
+            sp = getattr(self.ui, name, None)
+            sig = getattr(sp, 'splitterMoved', None)
+            if sig is not None:
+                try:
+                    sig.connect(self._on_share_geometry_changed)
+                except Exception:
+                    logger.debug("share-axis splitter hook failed",
+                                 exc_info=True)
+        for w in (getattr(getattr(self, 'binned_widget', None),
+                          'image_win', None),
+                  getattr(self, 'plot_win', None),
+                  getattr(getattr(self, 'wf_widget', None),
+                          'image_win', None)):
+            inst = getattr(w, 'installEventFilter', None)
+            if callable(inst):
+                try:
+                    inst(self)
+                except Exception:
+                    logger.debug("share-axis event-filter install failed",
+                                 exc_info=True)
+
+    def eventFilter(self, obj, event):
+        """Schedule a share-axis realign when a watched cake/plot window resizes
+        or is shown (installed by ``_install_share_geometry_hooks``).  Never
+        consumes the event."""
+        try:
+            et = event.type()
+            if et in (Qt.QtCore.QEvent.Type.Resize,
+                      Qt.QtCore.QEvent.Type.Show) \
+                    and getattr(self, '_share_link_on', False):
+                displayFrameWidget._schedule_align(self)
+        except Exception:
+            logger.debug("share-axis eventFilter failed", exc_info=True)
+        return super().eventFilter(obj, event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2094,6 +2271,19 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 except Exception:
                     logger.debug("autoscale on Share Axis off failed",
                                  exc_info=True)
+            # If the inverse ("2D follows 1D") sync had pinned the cake's
+            # x-range, re-arm its autorange too so it refits its own data on
+            # uncheck.  Forward-only zooms never pin it, so this preserves the
+            # prior behavior of leaving a cake-zoom intact after unsharing.
+            if getattr(self, '_cake_x_pinned_by_share', False):
+                try:
+                    cvb = self.binned_widget.image_plot.getViewBox()
+                    cvb.autoRange()
+                    cvb.enableAutoRange()
+                except Exception:
+                    logger.debug("cake autoscale on Share Axis off failed",
+                                 exc_info=True)
+                self._cake_x_pinned_by_share = False
 
         # Update slice range label
         self._set_slice_range()
