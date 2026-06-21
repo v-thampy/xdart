@@ -447,6 +447,11 @@ def save_scan_to_nexus(
             )
             if write_integrated_2d else None
         )
+        # Keep the pre-filter selection so the publication-gate drops can be
+        # surfaced to the caller by diffing it against the kept rows below —
+        # robust to _filter_prepared_output collapsing an all-dropped output to
+        # None (which would otherwise discard its dropped_indices).
+        _pre_1d, _pre_2d = prepared_1d, prepared_2d
         prepared_1d, prepared_2d = _filter_prepared_frame_publications(
             prepared_1d, prepared_2d,
         )
@@ -541,14 +546,19 @@ def save_scan_to_nexus(
     # reintegrate uses this so a legitimately-dropped frame does not make the
     # shadow's coverage look short at swap time (Finding 1): the dropped rows
     # are excluded from the shadow's *expected* set, never silently re-added.
+    # Computed by diffing the pre-filter selection against the kept rows so an
+    # all-dropped output (filtered to None) still reports its drops; the
+    # all-rows-dropped case then yields an empty expected set and the caller
+    # skips the swap rather than crashing on a never-created shadow group.
     # Other callers ignore the return value.
     dropped_by_group: dict[str, list[int]] = {}
-    for _prep in (prepared_1d, prepared_2d):
-        if not _prep:
+    for _pre, _post in ((_pre_1d, prepared_1d), (_pre_2d, prepared_2d)):
+        if not _pre:
             continue
-        _di = _prep.get("dropped_indices")
-        if _di:
-            dropped_by_group[_prep["group_path"]] = sorted(int(i) for i in _di)
+        _kept = {int(i) for i in (_post["indices"] if _post else ())}
+        _drop = sorted(int(i) for i in _pre["indices"] if int(i) not in _kept)
+        if _drop:
+            dropped_by_group[_pre["group_path"]] = _drop
     return dropped_by_group
 
 

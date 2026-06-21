@@ -935,6 +935,46 @@ def test_finalize_reintegrate_accepts_complete_shadow_with_dropped_frame(tmp_pat
         assert f"entry/{shadow_2d}" not in f
 
 
+def test_save_scan_surfaces_all_dropped_publication_rows(tmp_path):
+    """When EVERY selected row fails the publication gate on a fresh shadow
+    group (is_replace=False), _filter_prepared_output collapses the output to
+    None -- but the drops must STILL be surfaced in the return value.  Otherwise
+    a streaming reintegrate sees an empty drop set, hands finalize the full
+    expected set, and crashes on the never-created shadow group."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_2D_GROUP,
+        reintegrate_shadow_group_name,
+        save_scan_to_nexus,
+    )
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    for fr in frames:
+        old = fr.int_2d
+        fr.int_2d = _DuckResult2D(
+            radial=np.asarray(old.radial),
+            azimuthal=np.asarray(old.azimuthal),
+            intensity=np.full(np.asarray(old.intensity).shape, np.nan, np.float32),
+            unit=old.unit,
+            azimuthal_unit=old.azimuthal_unit,
+        )
+    scan = _DuckSphere(frames)
+    path = tmp_path / "all_dropped.nxs"
+    shadow_2d = reintegrate_shadow_group_name(INTEGRATED_2D_GROUP)
+    dropped = save_scan_to_nexus(
+        scan, path, mode="a", entry="entry", finalize=False,
+        replace_frame_indices=[0, 1, 2],
+        write_integrated_1d=False,
+        integrated_2d_group_name=shadow_2d,
+        write_reduction=False,
+        recover_shadow_groups=False,
+    )
+    # Every frame dropped -> still reported, even though no shadow group exists.
+    assert dropped == {f"entry/{shadow_2d}": [0, 1, 2]}
+    with h5py.File(path, "r") as f:
+        assert f"entry/{shadow_2d}" not in f
+
+
 def test_shadow_cleanup_recovers_or_removes_stale_groups(tmp_path):
     """Startup cleanup adopts final-missing shadows and drops stale shadows."""
     import h5py
