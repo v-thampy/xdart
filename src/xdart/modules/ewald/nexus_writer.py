@@ -161,6 +161,57 @@ def swap_reintegrated_groups(path: Union[str, "Path"], *, entry: str = "entry",
             _swap_integrated_group(h5f, entry=entry, group_name=INTEGRATED_1D_GROUP)
         if swap_2d:
             _swap_integrated_group(h5f, entry=entry, group_name=INTEGRATED_2D_GROUP)
+    from xdart.modules.ewald.frame_series import clear_frame_position_cache
+    clear_frame_position_cache(os.fspath(path))
+
+
+def finalize_reintegrated_groups(scan: "LiveScan", path: Union[str, "Path"], *,
+                                 entry: str = "entry",
+                                 swap_1d: bool = False,
+                                 swap_2d: bool = False,
+                                 expected_frame_indices=None) -> None:
+    """Publish completed reintegration shadows and stamp new provenance.
+
+    ``expected_frame_indices`` is the full frame set that should be present in
+    every swapped shadow.  A partial shadow is treated as an aborted run and is
+    never moved over the canonical group.
+    """
+    if not swap_1d and not swap_2d:
+        return
+    expected = (
+        {int(i) for i in expected_frame_indices}
+        if expected_frame_indices is not None else None
+    )
+    with _open_with_retry(Path(path), "a") as f:
+        h5f = _h5(f)
+        for enabled, group_name in (
+            (swap_1d, INTEGRATED_1D_GROUP),
+            (swap_2d, INTEGRATED_2D_GROUP),
+        ):
+            if not enabled or expected is None:
+                continue
+            shadow_path = _shadow_group_path(entry, group_name)
+            if shadow_path not in h5f or "frame_index" not in h5f[shadow_path]:
+                raise ValueError(
+                    f"Reintegration shadow {shadow_path} is missing frame labels"
+                )
+            labels = {int(x) for x in np.asarray(
+                h5f[shadow_path]["frame_index"][()]
+            ).ravel()}
+            if labels != expected:
+                missing = sorted(expected - labels)
+                extra = sorted(labels - expected)
+                raise ValueError(
+                    f"Reintegration shadow {shadow_path} does not cover the "
+                    f"full scan (missing={missing[:8]}, extra={extra[:8]})."
+                )
+        if swap_1d:
+            _swap_integrated_group(h5f, entry=entry, group_name=INTEGRATED_1D_GROUP)
+        if swap_2d:
+            _swap_integrated_group(h5f, entry=entry, group_name=INTEGRATED_2D_GROUP)
+        _write_reduction(h5f, scan, entry=entry)
+    from xdart.modules.ewald.frame_series import clear_frame_position_cache
+    clear_frame_position_cache(os.fspath(path))
 
 
 @dataclass

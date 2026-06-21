@@ -831,6 +831,45 @@ def test_shadow_swap_replaces_only_requested_dimension(tmp_path):
         )
 
 
+def test_finalize_reintegrate_rejects_partial_shadow(tmp_path):
+    """A partial shadow must not replace the canonical integrated group."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_1D_GROUP,
+        finalize_reintegrated_groups,
+        reintegrate_shadow_group_name,
+        save_scan_to_nexus,
+    )
+
+    frames = [_DuckArch(idx=i) for i in range(4)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "shadow_partial.nxs"
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+    with h5py.File(path, "r") as f:
+        canonical = f["entry/integrated_1d/intensity"][()].copy()
+
+    shadow_1d = reintegrate_shadow_group_name(INTEGRATED_1D_GROUP)
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
+        replace_frame_indices=[0, 1],
+        write_integrated_2d=False,
+        integrated_1d_group_name=shadow_1d,
+        write_reduction=False,
+        recover_shadow_groups=False,
+    )
+
+    with pytest.raises(ValueError, match="does not cover the full scan"):
+        finalize_reintegrated_groups(
+            scan, path, entry="entry", swap_1d=True,
+            expected_frame_indices=[0, 1, 2, 3],
+        )
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f["entry/integrated_1d/intensity"][()], canonical,
+        )
+        assert f"entry/{shadow_1d}" in f
+
+
 def test_shadow_cleanup_recovers_or_removes_stale_groups(tmp_path):
     """Startup cleanup adopts final-missing shadows and drops stale shadows."""
     import h5py
