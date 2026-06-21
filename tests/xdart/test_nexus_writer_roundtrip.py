@@ -1145,6 +1145,50 @@ def test_reader_adopts_orphan_reint_shadow(tmp_path):
     assert fv.has_1d and fv.intensity_1d is not None
 
 
+def test_swap_leaves_complete_orphan_if_move_crashes_after_del(tmp_path):
+    """Regression: _swap_integrated_group clears the shadow markers AFTER the
+    move, so a crash STRICTLY between del-canonical and move-shadow leaves a
+    COMPLETE-marked (adoptable) orphan -- not an unmarked one the reader/cleanup
+    would discard, silently losing the complete group."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_1D_GROUP, reintegrate_shadow_group_name, save_scan_to_nexus,
+        _swap_integrated_group,
+    )
+    from xrd_tools.io.schema import resolve_integrated_group
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "swapcrash.nxs"
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+    shadow_1d = reintegrate_shadow_group_name(INTEGRATED_1D_GROUP)
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False, replace_frame_indices=[0, 1, 2],
+        write_integrated_2d=False, integrated_1d_group_name=shadow_1d,
+        write_reduction=False, recover_shadow_groups=False)
+
+    class _MoveFails:
+        """Proxy: forwards reads/del but crashes on move (mid-swap crash)."""
+        def __init__(self, f): self._f = f
+        def __getitem__(self, k): return self._f[k]
+        def __delitem__(self, k): del self._f[k]
+        def __contains__(self, k): return k in self._f
+        def move(self, *a, **k): raise RuntimeError("crash during move")
+
+    import pytest
+    with h5py.File(path, "a") as f:
+        # finalize stamps the complete marker before the swap; simulate that.
+        f[f"entry/{shadow_1d}"].attrs["reintegrate_shadow_complete"] = True
+        with pytest.raises(RuntimeError):
+            _swap_integrated_group(
+                _MoveFails(f), entry="entry", group_name=INTEGRATED_1D_GROUP)
+        assert "entry/integrated_1d" not in f                      # del ran
+        # The marker MUST survive (was not stripped before the move).
+        assert f[f"entry/{shadow_1d}"].attrs.get("reintegrate_shadow_complete")
+        g, adopted = resolve_integrated_group(f["entry"], "integrated_1d")
+        assert adopted and g is not None                           # reader adopts
+
+
 def test_reader_ignores_incomplete_orphan_shadow(tmp_path):
     """D1 hardening: a partial shadow left by a crash MID-WRITE (canonical never
     existed -- e.g. a 2D reintegrate on a 1D-only scan) is NOT marked complete,

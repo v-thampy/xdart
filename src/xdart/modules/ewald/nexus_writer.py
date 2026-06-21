@@ -179,13 +179,20 @@ def _swap_integrated_group(h5f, *, entry: str, group_name: str) -> None:
     shadow_path = _shadow_group_path(entry, group_name)
     if shadow_path not in h5f:
         raise ValueError(f"missing reintegration shadow group: {shadow_path}")
-    # Drop the streaming-shadow markers before the move so the published
-    # canonical group doesn't carry them.
-    h5f[shadow_path].attrs.pop(REINTEGRATE_SHADOW_ACTIVE_ATTR, None)
-    h5f[shadow_path].attrs.pop(REINTEGRATE_SHADOW_COMPLETE_ATTR, None)
     if final_path in h5f:
         del h5f[final_path]
     h5f.move(shadow_path, final_path)
+    # Clear the streaming-shadow markers AFTER the move, on the now-published
+    # canonical group -- NOT before the del/move.  Stripping them first would
+    # leave an UNMARKED orphan if a crash landed strictly between del-canonical
+    # and move-shadow: the reader/cleanup would then treat it as a partial
+    # mid-write shadow and DISCARD it, silently losing the complete group whose
+    # data physically survives.  Clearing after the move keeps the orphan
+    # COMPLETE-marked (hence adoptable) through that window; a crash here instead
+    # leaves only harmless stray attrs on canonical, which the next
+    # reintegrate's swap deletes.
+    h5f[final_path].attrs.pop(REINTEGRATE_SHADOW_ACTIVE_ATTR, None)
+    h5f[final_path].attrs.pop(REINTEGRATE_SHADOW_COMPLETE_ATTR, None)
 
 
 def _mark_reintegrate_shadow_complete(h5f, *, entry: str, group_name: str) -> None:

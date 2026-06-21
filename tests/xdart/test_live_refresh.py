@@ -4697,6 +4697,40 @@ def test_reintegrate_stop_drops_shadow_without_finalize(monkeypatch):
     assert drops == [True]
 
 
+def test_drop_reintegrate_shadow_reconciles_published_frames(monkeypatch):
+    """The REAL _drop_reintegrate_shadow body reconciles EVERY displayed frame
+    back to the prior canonical result: unmark_persisted + discard_in_memory +
+    store.invalidate over _reint_published_idxs, then clears it (cluster B)."""
+    from types import MethodType, SimpleNamespace
+    import xdart.utils.h5pool as h5pool
+    import xdart.modules.ewald.nexus_writer as nw
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+
+    monkeypatch.setattr(h5pool, "get_pool", lambda: SimpleNamespace(
+        pause=lambda *a, **k: None, resume=lambda *a, **k: None))
+    monkeypatch.setattr(nw, "drop_reintegrate_shadow_groups", lambda *a, **k: None)
+
+    unmarked, discarded, invalidated = [], [], []
+    frames = SimpleNamespace(
+        unmark_persisted=lambda idxs: unmarked.extend(idxs),
+        discard_in_memory=lambda idxs: discarded.extend(idxs))
+    store = SimpleNamespace(invalidate=lambda labels: invalidated.append(set(labels)))
+    scan = SimpleNamespace(data_file="x.nxs", frames=frames)
+    host = SimpleNamespace(
+        scan=scan, publication_store=store,
+        _reint_published_idxs={0, 1, 2, 3}, _reintegrate_shadow_active=True)
+    host._drop_reintegrate_shadow = MethodType(
+        integratorThread._drop_reintegrate_shadow, host)
+
+    host._drop_reintegrate_shadow()
+
+    assert set(unmarked) == {0, 1, 2, 3}        # un-persist every touched frame
+    assert set(discarded) == {0, 1, 2, 3}       # discard in-memory recomputed
+    assert invalidated == [{0, 1, 2, 3}]        # revert store -> re-hydrate prior
+    assert host._reint_published_idxs == set()  # cleared after reconcile
+    assert host._reintegrate_shadow_active is False
+
+
 def test_reintegrate_run_finally_drops_active_shadow_on_unexpected_error():
     """Unexpected reintegrate failures still remove staged shadow groups."""
     import threading
