@@ -797,10 +797,13 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         self.ui.yOffset.valueChanged.connect(self.update_plot_view)
         self.ui.plotUnit.activated.connect(self._on_plotUnit_changed)
         self.ui.plotUnit.activated.connect(self.request_plot_autorange)
-        self.ui.plotUnit.activated.connect(self.update_plot)
+        # Stage 4: drive the redraw through the payload pipeline (update) rather
+        # than the legacy update_plot; _on_plotUnit_changed / request_plot_
+        # autorange still set the label + autorange request consumed by update.
+        self.ui.plotUnit.activated.connect(self.update)
         self.ui.showLegend.toggled.connect(self.update_legend)
         self.ui.slice.toggled.connect(self._sync_slice_controls)
-        self.ui.slice.toggled.connect(self.update_plot)
+        self.ui.slice.toggled.connect(self.update)
         self.ui.slice.toggled.connect(self._update_slice_range)
         self.ui.slice_center.valueChanged.connect(self.update_plot_range)
         self.ui.slice_width.valueChanged.connect(self.update_plot_range)
@@ -1211,7 +1214,7 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
 
     def update_plot_range(self):
         if self.ui.slice.isChecked():
-            self.update_plot()
+            self.update()
 
     # ── Update orchestration ──────────────────────────────────────
 
@@ -1366,6 +1369,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if role is PanelRole.PLOT_1D:
             if mode in (Mode.XYE_VIEWER, Mode.NEXUS_VIEWER):
                 return self.clear_plot_view
+            # Stage 4: the production CONTROLS (plotUnit/slice/slice-range,
+            # plotMethod, slice converter) now drive the redraw through update()
+            # -> the payload pipeline.  The PLOT_1D None-payload fallback is KEPT
+            # as update_plot (a safety net + rollback path) pending the live
+            # checkpoint that confirms integration_plot_payload covers every case;
+            # removing it is the live-gated final step (see update_plot's note).
             return self.update_plot
         if role is PanelRole.CAKE_2D:
             # CAKE_2D renders solely from the payload (cake_image); a None cake

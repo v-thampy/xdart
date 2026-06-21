@@ -393,7 +393,18 @@ class DisplayPlotMixin:
         return kept, names
 
     def update_plot(self):
-        """Updates data in plot frame
+        """Updates data in plot frame.
+
+        Stage 4: the production CONTROL handlers -- the plotUnit/slice/slice-
+        range controls, the plotMethod handler, and the slice-range converter --
+        now drive the redraw through ``update()`` -> the payload pipeline
+        (``integration_plot_payload`` covers native / 2theta / GI / no-wavelength
+        / 2D-slice / Overlay-Waterfall / Sum-Average).  This method is RETAINED
+        as render_display's PLOT_1D None-payload fallback (a safety net) and as
+        the direct target of the legacy characterization tests, pending a live
+        checkpoint that confirms full payload coverage; retiring the fallback +
+        deleting this method (and migrating those tests to ``update()``) is the
+        next live-gated cycle.
         """
         # Legacy path owns its axis label from the plotUnit combo.  After the
         # Step-5 flip a payload render may have stashed _payload_x/y_axis_label
@@ -630,7 +641,7 @@ class DisplayPlotMixin:
             self.overlaid_idxs = []
             if hasattr(self, "get_idxs"):
                 self.get_idxs()
-            self.update_plot()
+            self.update()
         elif new_method in ('Sum', 'Average'):
             # No accumulation needed: aggregation happens inside
             # update_1d_view() based on the current selection.
@@ -639,7 +650,7 @@ class DisplayPlotMixin:
             self.overlaid_idxs = []
             if hasattr(self, "get_idxs"):
                 self.get_idxs()
-            self.update_plot()
+            self.update()
         else:
             # Overlay / Waterfall: keep existing accumulated curves and
             # just refresh the rendered view.
@@ -1344,7 +1355,7 @@ class DisplayPlotMixin:
         # In GI mode or when metadata explicitly defines the slice axis,
         # no unit conversion is needed — just refresh
         if self.scan.gi or (info and info['source'] not in ('2d', '1d_2d')):
-            self.update_plot()
+            self.update()
             return
 
         # Standard mode, chi axis: handle Q ↔ 2θ conversion
@@ -1359,14 +1370,14 @@ class DisplayPlotMixin:
             # falls back to the scan-level / NeXus wavelength when the frame
             # isn't resident, so no per-frame data_1d entry is needed.
             if not self.idxs_1d:
-                self.update_plot()
+                self.update()
                 return
             frames = getattr(self, 'frames', None)
             frame_for_wl = (frames.get(self.idxs_1d[0])
                             if hasattr(frames, 'get') else None)
             wavelength = self._get_wavelength(frame_for_wl)
             if wavelength is None or wavelength <= 0:
-                self.update_plot()
+                self.update()
                 return
 
             if imageUnit == 0:
