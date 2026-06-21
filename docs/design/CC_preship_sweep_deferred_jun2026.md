@@ -8,6 +8,50 @@ below are **deliberately deferred**: each is a behavior trade-off, and the
 proper fixes belong to the post-release design refinements that start with the
 monorepo migration (`CC_monorepo_handoff.md`).
 
+## v1.0 inclusion summary (Jun 20, 2026 — final wrap-up)
+
+Audited every item below against the shipped code this round.  **Now shipping in
+v1.0** (done/fixed, verified):
+- **D1** Reintegrate-All RAM — FIXED (batched lazy `_reintegrate_all`,
+  `_RE_BATCH`); Re-Integrate 1D/2D buttons **re-exposed** (D1 addendum corrected).
+- **D5** hydrated-raw LRU — FIXED (shared order on `data_2d` under `data_lock`).
+- **D6** chunked error-cleanup — FIXED (`_wait_pending_futures` drains in-flight
+  futures before clearing `frame.image`).
+- **F1** boolean filter grammar — DONE (`compile_filter`, all three sites).
+- **F5** Set Bkg in viewer modes — DONE (display-only, shared row).
+- **F7** "Auto Mask Saturated" authoritative toggle — DONE (integrator panel);
+  the "More" popup stays deferred.
+- **F8** viewer intensity slider + Autoscale — DONE.
+- **F6** metadata all-motors — READER DONE; the nexus GI-motor **dropdown**
+  wiring is the one small remaining piece (functionally optional).
+
+**Still deferred** (post-v1.0 / monorepo cycle): D2, D3, D4, F2, F3, F4, plus the
+F6 dropdown-wiring and F7 "More" popup follow-ups.
+
+**✅ FIXED (Jun 20):** the F6 `scan_data`-harvest reader regression —
+`xrd_tools/io/nexus.py` `_harvest` + the NXpositioner cast now **pre-filter
+`dtype.kind in "fiub"`** (skip `|S`/`|U`/object string columns without reading
+them) and add `OSError` to the catch.  `frame_index` (a bookkeeping index our own
+writer emits into `scan_data`) is skipped via `_NON_MOTOR_COLUMNS`.  Fixtures
+(`|S` + vlen-string + `frame_index`) in `tests/core/test_nexus.py`.
+
+**⚠ TWO v1.0-TAG BLOCKERS REMAIN (Round-38, in already-merged `main`, NOT this WIP):**
+1. **D1 Re-Integrate RAM** — Re-Integrate ships VISIBLE (D1 addendum) but the
+   batched `_reintegrate_all` only *mitigates* peak: every recomputed frame is
+   pinned unpersisted until the single end-of-run save (un-evictable, no post-save
+   sweep) and the float64 2D slab loads per frame even for 1D-only → ~10 GB on a
+   651-frame Eiger, OOM at 10k.  Fix before tag: gate/hide Re-Integrate for large
+   scans, OR land skip-2D-slab + a post-save eviction sweep.  (So D1 is
+   MITIGATED, not fully FIXED — the summary's "D1 FIXED" overstates it.)
+2. **Azimuthal Mode A (non-GI χ) broken on the run path** — the headless
+   `integrate_radial` wrapper is correct but never called during a run: the
+   streaming/reintegrate 1D spine has no `chi_deg` branch (only CHI_GI), so it
+   calls `ai.integrate1d(unit='chi_deg', radial_range=<q-band>)` → misreads the
+   q-band as a χ-range → garbage sliver → persisted unguarded into
+   `integrated_1d` with `units="chi_deg"`.  Mode A is selectable.  Fix: add a
+   `chi_deg` dispatch in the non-GI 1D spine → `integrate_radial` (q-band as
+   radial_range), + a writer axis-kind guard.  (Mode B / CHI_GI is correct.)
+
 ## Deferred (fix during the monorepo design-refinement cycle)
 
 ### D1 — Reintegrate-All peak RAM (M4) — HIGH
@@ -27,6 +71,11 @@ at the end so per-batch saves become legal; (b) teach the lazy loader to skip
 the 2D slab for 1D-only reintegration (~100 KB/frame instead of 8–16 MB);
 (c) explicit eviction sweep after the final save.
 **Until then:** avoid reintegrate-all on multi-thousand-frame scans in one go.
+**STATUS (Jun 20): FIXED + SHIPPING.** RAM mitigation via batched lazy
+`_reintegrate_all` (`_RE_BATCH = max(8, 32*n_workers)`; frames go out of scope
+after publish, replacing the whole-scan-pinned pattern).  Re-Integrate 1D/2D
+buttons re-exposed (`integratorUI.py` `frame_reint`, `integrator.py` wiring to
+`bai_1d`/`bai_2d`).
 
 ### D2 — `data_1d` thumbnail copies — MED
 `copy_for_display(include_2d=False)` keeps a fresh ≤256×256 float32 thumbnail
@@ -100,11 +149,19 @@ typed order; reversed order does not match.  No OR / NOT / XOR.
 - Belongs with the monorepo design refinements (CC_monorepo_handoff.md);
   natural first user of the shared headless-helpers layout.
 
+**STATUS (Jun 20): DONE + SHIPPING** — `compile_filter`
+(`xrd_tools/core/filters.py`) implements unordered AND / OR (`|`) / NOT (`-`) as
+a headless predicate, used at all three sites (image-dir glob, Eiger `_master.h5`
+queue, BG Match); `"abc def"` now matches `def_abc`.  Tests in
+`tests/core/test_filters.py`.
+
 ### D1 addendum — Re-Integrate status & decision (Vivek, Jun 10)
-The Re-Integrate 1D/2D buttons are **deliberately hidden** in v2
-(`integratorUI: setVisible(False)`); the interim reprocessing story is
-Start + Write Mode=Overwrite.  The D1 RAM issue is therefore **dormant**
-(no GUI trigger) until the buttons return.
+**SUPERSEDED (Jun 20):** the Re-Integrate 1D/2D buttons are now **VISIBLE and
+wired** — `frame_reint` has no `setVisible(False)` (only the internal frame1D/2D
+button sub-rows remain hidden).  The D1 RAM issue is live-triggerable again and
+was FIXED (see the D1 STATUS line above).  *Historical (v2):* the buttons were
+deliberately hidden (`integratorUI: setVisible(False)`); the interim reprocessing
+story was Start + Write Mode=Overwrite, with D1 dormant until the buttons returned.
 
 Why reintegrate stays in the design (indispensable cases):
 - redo ONE output (1D or 2D) without losing the other — Start+Overwrite
@@ -150,6 +207,9 @@ scan_threads.py reintegrate-display publish (~:236) and full-reload load_frames
 Bounded by FixSizeOrderedDict size (~40 x 18 MB worst case), not a true leak.
 Fix in the monorepo cycle: make the hydrated-raw LRU state live with the
 shared dict under data_lock so all writers can trim safely.
+**STATUS (Jun 20): FIXED + SHIPPING** — shared order rides on `data_2d` under
+`data_lock` (`hydrated_raw.py`); thread-side inserts (`scan_threads.py` reint
+display, `h5viewer.py` full-reload) synchronize and trim the same cap.
 
 ### D6 — chunked error-cleanup vs running worker (LOW, Jun 11, ssrl core.py:1540)
 The except-BaseException cleanup in process()'s drain loop nulls
@@ -158,6 +218,10 @@ can re-pin frame.image (core.py:1960) after the clear -- one frame's raw
 (~18 MB) retained until session close, on an already-failing path.  Strictly
 better than pre-fix (whole chunk leaked).  Airtight fix belongs with the
 monorepo session-layer rework (e.g. clear inside _reduce_frame's finally).
+**STATUS (Jun 20): FIXED** — `_wait_pending_futures` drains in-flight futures
+before the clear (the fix lives in THIS repo at `xrd_tools/reduction/core.py`,
+not an external `ssrl` core.py — the heading path reference is historical), so a
+running worker can no longer re-pin raw after the clear.
 
 ### D2 — status update (monorepo cycle, Jun 12): ANALYZED, DEFERRED AGAIN
 Scouted during the Stage-6e deferred-items pass.  Decision: do NOT bolt a
@@ -240,7 +304,39 @@ Notes for implementation:
   and the generation-stamp rules apply (background change = effective
   selection change -> bump display_generation).
 
+**STATUS (Jun 20): DONE + SHIPPING** — Set Bkg exposed in Image/XYE viewers,
+display-only (never touches the persisted record), on the shared display-state
+row so it survives mode switches.
+
 ### F6 — metadata readers should record ALL motor positions, not just the scanned motor (Vivek, Jun 19)
+**STATUS (Jun 20): reader DONE for all source types; nexus GI-motor-DROPDOWN
+wiring is the only remaining piece.**
+- **SPEC** — already records all motors: `_read_spec_metadata` returns every
+  `scan.motor_names` (the `#O`/`#P` header positioners) + every `scan.labels`
+  (the `#L` per-point columns).
+- **txt / pdi** — record whatever the file's Motors section lists (already all).
+- **NeXus** — FIXED: `read_nexus`/`_read_data_group` now harvests
+  `entry/data/` + `entry/scan_data/` (the SPEC-style all-motors per-point table)
+  **and** `entry/sample/positioners/<motor>/value` (the scanned NXpositioner).
+  So all motors reach the per-frame `scan_info` → GI incidence resolution +
+  provenance work for nexus.  Test: `test_nexus.py::...harvests_scan_data_and_positioners`.
+- **REMAINING (follow-up):** the nexus wrangler **widget** does not yet feed those
+  motor names to the integrator's GI-motor dropdown (it reads no source metadata
+  on file/entry selection — unlike the image wrangler's `get_scan_parameters`
+  → `set_gi_motor_options`/`sigGIMotorOptions`).  Functionally optional (the
+  metadata resolves `th`/Manual already); add the widget-side `read_nexus` +
+  `sigGIMotorOptions` emit so a non-standard nexus incidence motor is selectable.
+- **⚠ CAUTION (v1.0 blocker, Jun 20):** the `_read_data_group` harvest path that
+  completes the reader has two CONFIRMED crash bugs on fixed-length-string (`|S`)
+  columns — `_harvest` float cast (`nexus.py` ~:2527) and the NXpositioner float
+  cast (~:2562) catch only `(TypeError, ValueError)`, but `np.asarray(.., float)`
+  on a `|S` column raises `OSError`, which escapes and crashes `read_nexus`.
+  SPEC-style `scan_data` tables routinely carry `|S` timestamp/label columns, so
+  the new harvest both widened and realized the crash surface.  Broaden both
+  catches to include `OSError` (or pre-filter `dtype.kind in {'S','U','O'}`)
+  before tagging v1.0.
+
+Original context:
 In a SPEC file the **scanned** motors/positioners are recorded per-point in the
 **table data** (`#L` columns), while the **non-scanned** motors are recorded
 **once at the scan header** (`#P`/`#O` positioner lines).  The current readers
@@ -261,3 +357,55 @@ Notes for implementation:
 - Dependency of the GI-panel-move + 2-way-sync feature
   (`design_gi_panel_move_and_2way_sync_jun2026.md`): the incidence-motor
   dropdown's options come from this metadata.
+
+### F7 — "Auto Mask Saturated" toggle → "More" filter-options popup (Vivek, Jun 20)
+The integrator's **"Auto Mask Saturated"** toggle (authoritative on/off for
+saturated-pixel masking — OFF masks nothing, keeping genuinely-saturated Bragg
+peaks) should eventually become a **"More" button → filter-options popup** (same
+pattern as the GI "More" popup), exposing additional per-pixel / per-stack image
+filters.  First requested: **median filtering across a stack of images**; room for
+others (e.g. outlier rejection, custom masks).
+
+**Notes:**
+- Keep it DISTINCT from the **"Threshold"** toggle (intensity-band filter,
+  `apply_threshold`/`threshold_min/max`): they are independent controls.
+- Mask/saturation masking is the per-frame `compute_bad_pixel_mask`
+  (`xdart.modules.reduction`); a stack-median filter is a *cross-frame* operation
+  → needs a different seam (likely `xrd_tools.corrections`/a provider stage), not
+  the per-frame bad-pixel mask.  Estimate where it belongs before building.
+- See memory `mask-saturated-toggle-authoritative`.
+
+**STATUS (Jun 20): toggle DONE + SHIPPING** — the authoritative on/off "Auto Mask
+Saturated" toggle ships in the integrator panel (gating the whole mask via
+`compute_bad_pixel_mask`).  The "More" button → filter-options popup (stack-median
+etc.) stays DEFERRED (a future cross-frame seam in `xrd_tools.corrections`).
+
+### F8 — Image/XYE Viewer intensity-range slider + Autoscale toggle (Vivek, Jun 20)
+The file viewers (Image Viewer, XYE Viewer) should grow a **second top row** —
+mirroring the integration view's Q/Single/Options/Clear row for layout
+consistency, but WITHOUT those boxes.  Instead, **right-justified** toward the
+edge: an **intensity-range slider** + an **Autoscale toggle** next to it.
+
+Behaviour:
+- **Autoscale ON by default** (current behaviour — levels auto-fit the data).
+- When Autoscale is OFF, the **slider sets the intensity scale**, ranging from the
+  data **min → max** (image levels for the Image Viewer; y-axis range for the XYE
+  Viewer).
+
+**Why deferred (not a 5-10 min change):** a new slider+toggle widget added to the
+viewer top row for BOTH viewer modes, wired to the display's levels (pyqtgraph
+image LUT levels for the image; y-range for the 1D plot), with data-min/max
+derivation and Autoscale-state persistence.  A real feature, not a tweak.
+
+**Notes:**
+- The viewer top row is owned by the display layer (`display_frame_widget` /
+  the controllers); the Q/Single/Options/Clear row is the integration view's —
+  the viewer variant shows only the slider+toggle, right-justified.
+- Image Viewer "intensity" = pyqtgraph image levels (vmin/vmax); XYE Viewer
+  "intensity" = the 1D plot's y-range.  A `Range` slider (two handles) fits both.
+- Persist the Autoscale state + manual levels per viewer mode (session), like the
+  other viewer controls.
+
+**STATUS (Jun 20): DONE + SHIPPING** — intensity-range slider + Autoscale toggle
+implemented for Image/XYE viewers, wired to the display levels (image LUT levels /
+1D y-range); Autoscale ON by default, state persisted per viewer mode.
