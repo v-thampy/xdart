@@ -71,7 +71,9 @@ class Ui_Form(object):
         font.setBold(True)
         self.label1D.setFont(font)
         self.label1D.setAutoFillBackground(False)
-        self.label1D.setStyleSheet(u"background-color: rgba(195, 195, 195, 200);")
+        # Stage 3b: badge styled via the global QSS (QLabel#label1D) as an accent
+        # pill — was a hardcoded grey rgba that didn't theme.
+        self.label1D.setStyleSheet(u"")
         self.label1D.setAlignment(Qt.AlignCenter)
 
         self.horizontalLayout_3.addWidget(self.label1D)
@@ -249,7 +251,8 @@ class Ui_Form(object):
         self.label2D.setMaximumSize(QSize(50, 16777215))
         self.label2D.setFont(font)
         self.label2D.setAutoFillBackground(False)
-        self.label2D.setStyleSheet(u"background-color: rgba(195, 195, 195, 200);")
+        # Stage 3b: accent-pill badge via the global QSS (QLabel#label2D).
+        self.label2D.setStyleSheet(u"")
         self.label2D.setAlignment(Qt.AlignCenter)
 
         self.horizontalLayout_8.addWidget(self.label2D)

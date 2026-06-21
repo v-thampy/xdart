@@ -431,6 +431,29 @@ QTreeView#WranglerTree QAbstractSpinBox {
     color: $text;
 }
 
+/* ── Integration panel sub-cards (Stage 3b) ───────────────────── */
+/* The 1-D / 2-D blocks become distinct sub-cards (radius 6, $card body);
+   their inner header/range frames go transparent so only the outer card
+   border shows (the generated UI gave every nested QFrame a border).  The
+   "1-D" / "2-D" tags become accent pills (were a hardcoded grey rgba), and
+   the numeric range/Pts fields pick up a monospace face. */
+QFrame#frame1D, QFrame#frame2D {
+    background-color: $card;
+    border: 1px solid $field_border;
+    border-radius: 6px;
+}
+QFrame#frame1D_header, QFrame#frame1D_range,
+QFrame#frame2D_header, QFrame#frame2D_range {
+    border: none;
+    background-color: transparent;
+}
+QLabel#label1D, QLabel#label2D {
+    background-color: $accent;
+    color: $accent_on_text;
+    border-radius: 4px;
+    font-weight: 700;
+}
+
 /* ── Tabs ──────────────────────────────────────────────────────── */
 QTabWidget::pane {
     background-color: $win_bg;
