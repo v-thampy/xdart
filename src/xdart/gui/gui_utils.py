@@ -195,8 +195,24 @@ class NamedActionParameter(Parameter):
 
 
 from pyqtgraph.parametertree import registerParameterType
-from pyqtgraph.parametertree.parameterTypes.basetypes import SimpleParameter
+from pyqtgraph.parametertree.parameterTypes.basetypes import (
+    SimpleParameter, WidgetParameterItem)
 from pyqtgraph.parametertree.parameterTypes.str import StrParameterItem
+
+
+# Direction-A redesign: drop pyqtgraph's per-row "reset to default" glyph — the
+# small curved-arrow button it shows on every row whose parameter hasDefault()
+# (which is nearly all of them).  The mockup has none and they cluttered every
+# wrangler/integrator field.  Hiding the button rather than removing it keeps
+# pyqtgraph's internal references intact, and a hidden widget claims no layout
+# space so the row collapses cleanly.  Reset-to-default stays reachable in code
+# (``param.setToDefault()``).  Patched on the shared base so every widget
+# parameter type (str/int/float/bool/list/str_browse) inherits it.
+def _hide_default_btn(self):
+    self.defaultBtn.setVisible(False)
+
+
+WidgetParameterItem.updateDefaultBtn = _hide_default_btn
 
 
 class _TailLineEdit(QtWidgets.QLineEdit):
@@ -232,25 +248,15 @@ class StrBrowseParameterItem(StrParameterItem):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(3)
         le = _TailLineEdit()
-        # Match the wrangler tree's darker input tone.  Set explicitly because
-        # this custom widget otherwise falls back to the global button/input
-        # styles instead of the tree-local QLineEdit rule.
-        le.setStyleSheet('border: 0px; background-color: #3f4354;')
+        # Themed via the global QSS (``QLineEdit#BrowsePathEdit`` /
+        # ``QPushButton#BrowseButton`` in themes/dark.py) rather than inline hex,
+        # so both Dark and Light render correctly and a live theme switch
+        # recolours them.  The object names are the QSS hooks.
+        le.setObjectName('BrowsePathEdit')
         btn = QtWidgets.QPushButton(self.param.opts.get('buttonText', 'Browse'))
+        btn.setObjectName('BrowseButton')
         btn.setMaximumWidth(72)
         btn.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
-        # Tint the Browse button a distinct indigo-gray so it reads as an action
-        # against the same-shade path field + neighbouring buttons (the default
-        # QPushButton bg #3a3d4d matches the inputs).  Scoped here like the line
-        # edit's inline style above; hover picks up the purple focus accent.
-        btn.setStyleSheet(
-            "QPushButton {"
-            " background-color: #5269a8; color: #f8f8f2;"
-            " border: 1px solid #6075b5; border-radius: 3px; padding: 1px 6px; }"
-            "QPushButton:hover {"
-            " background-color: #627ac0; border-color: #bd93f9; }"
-            "QPushButton:pressed { background-color: #465d96; }"
-        )
         lay.addWidget(le, 1)
         lay.addWidget(btn)
         btn.clicked.connect(lambda: self.param.activate())

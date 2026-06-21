@@ -112,6 +112,9 @@ def _resolve(base, *, is_light):
     p["accent_on_text"] = "#ffffff" if is_light else "#1a1a1a"
     p["accent_hover"] = _shade(base["accent"], 0.12)
     p["accent_muted"] = _blend(base["accent"], base["field"], 0.6)
+    p["browse_hover"] = _shade(base["browse"], 0.14)
+    p["browse_pressed"] = _shade(base["browse"], -0.16)
+    p["browse_muted"] = _blend(base["browse"], base["field"], 0.6)
     p["start_border"] = _shade(base["start"], -0.16)
     p["start_hover"] = _shade(base["start"], 0.14)
     p["start_muted"] = _blend(base["start"], base["field"], 0.6)
@@ -191,6 +194,37 @@ QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
 QComboBox:disabled {
     background-color: $panel;
     color: $text_muted;
+}
+
+/* Inline path field + Browse button (StrBrowseParameterItem — the str_browse
+   wrangler rows: Project Folder, Calibration, Image/Mask File, Save Path).
+   Object-named so they theme through QSS and recolour on a live theme switch,
+   replacing the old inline Dracula hex that broke under the Light palette. */
+QLineEdit#BrowsePathEdit {
+    background-color: $field;
+    border: 1px solid $field_border;
+}
+QLineEdit#BrowsePathEdit:focus {
+    border: 1px solid $accent;
+}
+QPushButton#BrowseButton {
+    background-color: $browse;
+    color: $browse_text;
+    border: 1px solid $browse_border;
+    border-radius: 3px;
+    padding: 1px 6px;
+}
+QPushButton#BrowseButton:hover {
+    background-color: $browse_hover;
+    border-color: $accent;
+}
+QPushButton#BrowseButton:pressed {
+    background-color: $browse_pressed;
+}
+QPushButton#BrowseButton:disabled {
+    background-color: $browse_muted;
+    color: $text_muted;
+    border-color: $browse_muted;
 }
 
 QComboBox::drop-down {
@@ -505,57 +539,6 @@ SEABORN_BG = "#EAEAF2"      # seaborn darkgrid panel
 SEABORN_FG = "#2e2e2e"      # axis / tick text
 SEABORN_GRID = "#ffffff"    # gridline color
 SEABORN_FONT_PT = 11        # "talk-context" rough match
-
-
-def apply_dark_theme(app) -> None:
-    """Apply :data:`DARK_QSS` to a :class:`QApplication` instance.
-
-    Also seeds pyqtgraph's default plot background / foreground to
-    the seaborn darkgrid colours so newly constructed plots adopt
-    the look automatically.  Must be called BEFORE any pyqtgraph
-    plot widgets are constructed — pyqtgraph caches the config at
-    widget-creation time.
-
-    For per-plot grid + tick-font polish, callers should also
-    invoke :func:`apply_seaborn_plot_style` on each ``PlotItem``.
-
-    Parameters
-    ----------
-    app
-        A live :class:`QtWidgets.QApplication`.
-    """
-    # Build the final stylesheet by appending platform-conditional
-    # overrides to the base DARK_QSS.  Currently only Windows needs
-    # extra rules — Qt's default button font is larger there than
-    # on macOS, so a couple of named buttons get squeezed.
-    qss = DARK_QSS
-    import sys as _sys
-    if _sys.platform == "win32":
-        qss += """
-/* ── Windows-only font tweaks ─────────────────────────────────
-   Calibrate + Make Mask buttons are sized for the macOS default
-   button font (~13 px AppleSystemFont).  On Windows, Qt's default
-   QPushButton font renders larger and the labels overflow.  Shrink
-   the font for just those two buttons by name.  8.5 pt = ~5%
-   bigger than the initial 8 pt (which was a too-aggressive ~11%
-   reduction from the platform-default 9 pt) — gives the labels
-   enough room without looking visibly small. */
-QPushButton#pyfai_calib, QPushButton#get_mask {
-    font-size: 8.5pt;
-}
-"""
-    app.setStyleSheet(qss)
-    # Imported here to avoid a hard dependency at module import
-    # time (e.g. in headless test sandboxes).
-    try:
-        import pyqtgraph as pg
-        pg.setConfigOption("background", SEABORN_BG)
-        pg.setConfigOption("foreground", SEABORN_FG)
-        # Use Qt's antialiased lines so gridlines and curves look
-        # like the matplotlib equivalents at typical screen scales.
-        pg.setConfigOption("antialias", True)
-    except ImportError:  # pragma: no cover
-        pass
 
 
 def apply_seaborn_plot_style(plot, *, font_pt: int = SEABORN_FONT_PT,

@@ -326,7 +326,39 @@ def test_wrangler_tree_polish(widget):
         if b.text() == "Browse"
     ]
     assert browse_buttons
-    assert "#5269a8" in browse_buttons[0].styleSheet()
+    # Direction-A Stage 2: the path field + Browse button are themed through the
+    # global QSS by object name (QLineEdit#BrowsePathEdit / QPushButton#
+    # BrowseButton) rather than inline Dracula hex, so both Dark and Light render
+    # and a live theme switch recolours them.  Assert the QSS hooks, not colours.
+    assert browse_buttons[0].objectName() == "BrowseButton"
+    path_edits = [
+        e for e in tree.findChildren(QtWidgets.QLineEdit)
+        if e.objectName() == "BrowsePathEdit"
+    ]
+    assert path_edits
+
+
+def test_param_rows_hide_reset_glyph(qapp):
+    """Stage 2 (Direction A): pyqtgraph's per-row reset-to-default glyph (the
+    little curved-arrow button it shows on every row whose param hasDefault())
+    is suppressed globally — the redesigned wrangler/integrator forms have none.
+    Patched on the shared base, so it holds for both str_browse and plain str
+    rows (``isHidden`` is independent of whether the tree has been shown)."""
+    from pyqtgraph.parametertree import Parameter, ParameterTree
+    p = Parameter.create(name="root", type="group", children=[
+        {"name": "poni_file", "title": "Calibration",
+         "type": "str_browse", "value": "/a/b/LaB6.poni"},
+        {"name": "entry", "title": "Entry", "type": "str", "value": "entry"},
+    ])
+    tree = ParameterTree()
+    tree.setParameters(p, showTop=False)
+    try:
+        for child in ("poni_file", "entry"):
+            item = next(iter(p.child(child).items))
+            assert item.defaultBtn.isHidden()
+    finally:
+        tree.deleteLater()
+        qapp.processEvents()
 
 
 def test_image_widget_colorbar_limits_nan_aware(qapp):
