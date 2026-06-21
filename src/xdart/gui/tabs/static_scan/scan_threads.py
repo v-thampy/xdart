@@ -118,6 +118,12 @@ class integratorThread(Qt.QtCore.QThread):
         # apply_threshold_saturation_to_plan; None => plan unchanged.
         self.threshold_config = None
         self._reintegrate_shadow_active = False
+        # Frames whose recomputed rows were written to the shadow this pass (and
+        # mark_persisted'd against the not-yet-swapped canonical).  On a drop
+        # they are reconciled (unmark_persisted + store.invalidate) so a stopped
+        # reintegrate shows the prior canonical result everywhere, not a stale
+        # store/lazy-load divergence.
+        self._shadow_written_idxs: set = set()
 
     def _plan_for_reintegration(self, *, integrate_2d: bool):
         """Standard plan for a reintegrate, with the current Intensity-Threshold
@@ -461,6 +467,23 @@ class integratorThread(Qt.QtCore.QThread):
         finally:
             self._reintegrate_shadow_active = False
             _get_h5pool().resume(self.scan.data_file)
+        # Reconcile the in-session state to the prior canonical result: the
+        # shadow's recomputed rows are gone, so the frames it wrote are NOT on
+        # canonical (undo their mark_persisted) and any recomputed publication
+        # for them must yield to the prior canonical row (invalidate -> next
+        # render re-hydrates from disk).  Uses the full set sent to the shadow
+        # (incl. any Finding-1 publication-dropped frames, which were still
+        # mark_persisted'd) so display and lazy-load agree.
+        written = getattr(self, "_shadow_written_idxs", set())
+        if written:
+            try:
+                self.scan.frames.unmark_persisted(written)
+                if self.publication_store is not None:
+                    self.publication_store.invalidate(set(written))
+            except Exception:
+                logger.debug("[REINT] shadow-drop reconcile skipped",
+                             exc_info=True)
+            self._shadow_written_idxs = set()
 
     def _write_reintegrate_shadow_batch(self, frame_indices, *,
                                         do_2d: bool, label: str) -> set:
@@ -625,6 +648,7 @@ class integratorThread(Qt.QtCore.QThread):
         indices = list(self.scan.frames.index)
         if not indices:
             return
+        self._shadow_written_idxs = set()
         self._prepare_reintegrate_shadow()
 
         def _publish(frame):
@@ -804,6 +828,10 @@ class integratorThread(Qt.QtCore.QThread):
                     shadow_batch_idxs, do_2d=do_2d, label=label,
                 )
                 all_dropped.update(batch_dropped or ())
+                # Record what was mark_persisted'd this batch so a later drop can
+                # reconcile it back to the prior canonical result (cluster B).
+                self._shadow_written_idxs.update(
+                    int(i) for i in shadow_batch_idxs if int(i) >= 0)
             except Exception:
                 logger.error(
                     "[REINT] %s shadow batch write failed; restoring previous "

@@ -15,11 +15,14 @@ structures additively; never rename an attribute key or dataset name.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
 
 from xrd_tools.core.frame_view import DEFAULT_MODE_KEY  # "default"; the top-level slot
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CAPABILITIES",
@@ -49,7 +52,41 @@ __all__ = [
     "GroupSchema",
     "ProcessedScanSchema",
     "SCHEMA",
+    "REINTEGRATE_SHADOW_SUFFIX",
+    "resolve_integrated_group",
 ]
+
+
+# ── streaming-reintegrate shadow recovery ────────────────────────────────────
+#: suffix of the shadow group a streaming reintegrate stages rows into before
+#: the atomic swap (writer side: xdart.modules.ewald.nexus_writer).  Shared here
+#: so the headless readers can recover an orphan left by a crash mid-swap.
+REINTEGRATE_SHADOW_SUFFIX = "__reint"
+
+
+def resolve_integrated_group(entry_grp, group_name: str):
+    """Resolve a canonical integrated group, recovering from a crash mid-swap.
+
+    Returns ``(group, adopted)``: the canonical ``group_name`` group when
+    present; else, when only its ``<group_name>__reint`` orphan shadow survives
+    (a crash precisely between the swap's delete-canonical and move-shadow), the
+    shadow is adopted READ-ONLY (the file is not mutated) so consumers "open
+    sanely" on the complete result; else ``(None, False)``.  A writer pass
+    (next save / reintegrate) repairs the orphan in place via
+    ``cleanup_reintegrate_shadow_groups``.
+    """
+    g = entry_grp.get(group_name)
+    if g is not None:
+        return g, False
+    shadow = entry_grp.get(f"{group_name}{REINTEGRATE_SHADOW_SUFFIX}")
+    if shadow is not None:
+        logger.warning(
+            "Adopting orphan reintegration shadow %s%s as %s (read-only; the "
+            "file appears crashed mid-swap -- run a writer pass to repair).",
+            group_name, REINTEGRATE_SHADOW_SUFFIX, group_name,
+        )
+        return shadow, True
+    return None, False
 
 
 # ── persisted attribute KEYS (entry/group/dataset attrs) ─────────────────────
@@ -344,6 +381,10 @@ CAPABILITIES = MappingProxyType({
     "two_d_kind": CapabilityAttr(
         "two_d_kind", "integrated_2d", "attr",
         "explicit GI axis identity (else inferred from units)"),
+    "axis_kind_1d": CapabilityAttr(
+        "axis_kind", "integrated_1d", "attr",
+        "explicit 1D axis identity -- 'azimuthal' for I-vs-chi "
+        "(chi_deg/chigi_deg), else 'radial' (inferred from units)"),
     "multi_result_1d": CapabilityAttr(
         MULTI_RESULT_MODES_ATTR, "integrated_1d", "attr",
         "per-GI-mode results: the primary at integrated_1d, others under "

@@ -48,7 +48,16 @@ import numpy as np
 # 2c: the convenience readers consume the declared layout — group and
 # dataset names come from the schema, so writer/reader drift is
 # impossible by construction.
-from xrd_tools.io.schema import SCHEMA
+from xrd_tools.io.schema import SCHEMA, resolve_integrated_group
+
+
+def _group_or_shadow(grp, name: str):
+    """Resolve ``name`` under ``grp``, adopting an orphan ``__reint`` shadow for
+    the integrated groups when a crash left the file mid-swap (read-only)."""
+    if name in ("integrated_1d", "integrated_2d"):
+        g, _ = resolve_integrated_group(grp, name)
+        return g
+    return grp.get(name)
 
 logger = logging.getLogger(__name__)
 
@@ -119,8 +128,9 @@ def _frame_index(grp: h5py.Group, prefer: str | None = None) -> np.ndarray:
     if prefer is not None:
         order = (prefer,) + tuple(n for n in order if n != prefer)
     for name in order:
-        if name in grp and "frame_index" in grp[name]:
-            return np.asarray(grp[name]["frame_index"][()])
+        g = _group_or_shadow(grp, name)
+        if g is not None and "frame_index" in g:
+            return np.asarray(g["frame_index"][()])
     raise KeyError("No frame_index found (integrated_1d/2d/per_frame_geometry)")
 
 
@@ -136,8 +146,9 @@ def _all_frame_index(grp: h5py.Group) -> np.ndarray:
             except ValueError:
                 continue
     for name in ("integrated_1d", "integrated_2d"):
-        if name in grp and "frame_index" in grp[name]:
-            labels.update(int(x) for x in np.asarray(grp[name]["frame_index"][()]).ravel())
+        g = _group_or_shadow(grp, name)
+        if g is not None and "frame_index" in g:
+            labels.update(int(x) for x in np.asarray(g["frame_index"][()]).ravel())
     if labels:
         return np.asarray(sorted(labels), dtype=np.int64)
     return _frame_index(grp)
@@ -250,9 +261,9 @@ def get_1d(
     (q_name,) = spec.axes
     with h5py.File(Path(scan_file), "r") as f:
         e = _entry(f, entry)
-        if spec.name not in e:
+        g = _group_or_shadow(e, spec.name)
+        if g is None:
             raise KeyError(f"{scan_file} has no {spec.name} group")
-        g = e[spec.name]
         positions, frames, single = _resolve_positions(
             _frame_index(e, prefer=spec.name), frame)
 
@@ -285,9 +296,9 @@ def get_2d(
     q_name, chi_name = spec.axes
     with h5py.File(Path(scan_file), "r") as f:
         e = _entry(f, entry)
-        if spec.name not in e:
+        g = _group_or_shadow(e, spec.name)
+        if g is None:
             raise KeyError(f"{scan_file} has no {spec.name} group")
-        g = e[spec.name]
         positions, frames, single = _resolve_positions(
             _frame_index(e, prefer=spec.name), frame)
 

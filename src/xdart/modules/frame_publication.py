@@ -693,6 +693,27 @@ class PublicationStore:
         with self._lock:
             self._carryover.clear()
 
+    def invalidate(self, labels) -> None:
+        """Drop store entries for ``labels`` so display re-hydrates from disk.
+
+        Used when a reintegrate shadow is DISCARDED (Stop / abort): the
+        recomputed publications staged this pass are no longer authoritative --
+        the canonical (prior) row must win.  Popping the entry (and its
+        carry-over, so the stale record isn't merged into the next pass) makes
+        the next render re-hydrate the prior row from disk, keeping display and
+        lazy-load in agreement.  Generation bumps so in-flight renders re-resolve.
+        """
+        with self._lock:
+            changed = False
+            for label in labels:
+                if self._items.pop(label, None) is not None:
+                    self._drop_heavy_label_locked(label)
+                    self._drop_thumb_label_locked(label)
+                    self._carryover.pop(label, None)
+                    changed = True
+            if changed:
+                self._generation += 1
+
     def set_hydrator(self, hydrator) -> None:
         """Register the rehydration source for :meth:`get_or_hydrate`."""
         with self._lock:

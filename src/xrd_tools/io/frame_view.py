@@ -145,8 +145,12 @@ class FrameViewReader:
         self._source_base = (
             _decode(self._entry.attrs["source_base"])
             if "source_base" in self._entry.attrs else None)
-        self._g1 = self._entry.get("integrated_1d")
-        self._g2 = self._entry.get("integrated_2d")
+        # Recover an orphan __reint shadow left by a crash mid-swap (read-only
+        # adoption) so a reintegrate interrupted between del-canonical and
+        # move-shadow still opens on its complete result.
+        from xrd_tools.io.schema import resolve_integrated_group
+        self._g1, _ = resolve_integrated_group(self._entry, "integrated_1d")
+        self._g2, _ = resolve_integrated_group(self._entry, "integrated_2d")
         self._geom = self._entry.get("per_frame_geometry")
         self._scan_data = self._entry.get("scan_data")
         self._map_1d = _frame_map(self._g1)

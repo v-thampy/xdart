@@ -82,6 +82,14 @@ logger.info("Integrated-stack compression = %r", INTEGRATED_STACK_COMPRESSION)
 REINTEGRATE_SHADOW_SUFFIX = "__reint"
 INTEGRATED_1D_GROUP = "integrated_1d"
 INTEGRATED_2D_GROUP = "integrated_2d"
+# Attr written on a shadow group while a reintegrate is actively streaming into
+# it, set to the writing process's PID.  A concurrent save in the SAME process
+# (the only writer that could race the shadow; reachability is otherwise blocked
+# by the GUI run-state gate) spares a shadow whose marker == its own PID, so its
+# default cleanup pass can't delete an in-progress shadow.  After a real crash a
+# NEW process's PID differs from the stale marker, so the shadow falls back to
+# the normal orphan rule (adopt if canonical is gone, else drop).
+REINTEGRATE_SHADOW_ACTIVE_ATTR = "reintegrate_shadow_active"
 
 
 def reintegrate_shadow_group_name(group_name: str) -> str:
@@ -97,25 +105,45 @@ def _shadow_group_path(entry: str, group_name: str) -> str:
     return _entry_group_path(entry, reintegrate_shadow_group_name(group_name))
 
 
-def cleanup_reintegrate_shadow_groups(h5f, *, entry: str = "entry") -> None:
+def _shadow_active_pid(h5f, shadow_path: str):
+    """PID stamped on an active streaming shadow, or None."""
+    if shadow_path not in h5f:
+        return None
+    raw = h5f[shadow_path].attrs.get(REINTEGRATE_SHADOW_ACTIVE_ATTR)
+    return None if raw is None else int(raw)
+
+
+def cleanup_reintegrate_shadow_groups(h5f, *, entry: str = "entry",
+                                      spare_active_pid: int | None = None) -> None:
     """Remove stale reintegration shadow groups.
 
     If a previous crash happened after deleting the canonical group but before
     moving its shadow into place, adopt the shadow.  If the canonical group is
     present, any leftover shadow is stale and is removed.
+
+    ``spare_active_pid``: when set, a shadow marked active by THIS process
+    (``REINTEGRATE_SHADOW_ACTIVE_ATTR == spare_active_pid``) is left untouched --
+    a concurrent save in the same process must not delete an in-progress shadow.
+    A marker from a different (crashed) PID is treated as stale and recovered by
+    the normal orphan rule.
     """
     for group_name in (INTEGRATED_1D_GROUP, INTEGRATED_2D_GROUP):
         final_path = _entry_group_path(entry, group_name)
         shadow_path = _shadow_group_path(entry, group_name)
         final_exists = final_path in h5f
         shadow_exists = shadow_path in h5f
-        if shadow_exists and not final_exists:
+        if not shadow_exists:
+            continue
+        if (spare_active_pid is not None
+                and _shadow_active_pid(h5f, shadow_path) == spare_active_pid):
+            continue
+        if not final_exists:
             h5f.move(shadow_path, final_path)
             logger.warning(
                 "Recovered interrupted reintegration shadow %s -> %s",
                 shadow_path, final_path,
             )
-        elif shadow_exists:
+        else:
             del h5f[shadow_path]
 
 
@@ -130,9 +158,21 @@ def _swap_integrated_group(h5f, *, entry: str, group_name: str) -> None:
     shadow_path = _shadow_group_path(entry, group_name)
     if shadow_path not in h5f:
         raise ValueError(f"missing reintegration shadow group: {shadow_path}")
+    # Drop the active marker before the move so the published canonical group
+    # doesn't carry the streaming-shadow attr.
+    h5f[shadow_path].attrs.pop(REINTEGRATE_SHADOW_ACTIVE_ATTR, None)
     if final_path in h5f:
         del h5f[final_path]
     h5f.move(shadow_path, final_path)
+
+
+def mark_reintegrate_shadow_active(h5f, *, entry: str, pid: int) -> None:
+    """Stamp the active-shadow marker (this process's PID) on any shadow group
+    that exists, so a concurrent same-process cleanup spares it."""
+    for group_name in (INTEGRATED_1D_GROUP, INTEGRATED_2D_GROUP):
+        shadow_path = _shadow_group_path(entry, group_name)
+        if shadow_path in h5f:
+            h5f[shadow_path].attrs[REINTEGRATE_SHADOW_ACTIVE_ATTR] = int(pid)
 
 
 def drop_reintegrate_shadow_groups(path: Union[str, "Path"], *,
@@ -155,6 +195,11 @@ def swap_reintegrated_groups(path: Union[str, "Path"], *, entry: str = "entry",
     """Publish shadow integrated groups after a completed reintegration."""
     if not swap_1d and not swap_2d:
         return
+    if swap_1d and swap_2d:
+        raise ValueError(
+            "cross-dimension reintegration swap is not crash-atomic; swap "
+            "one dimension (swap_1d XOR swap_2d) per call"
+        )
     with _open_with_retry(Path(path), "a") as f:
         h5f = _h5(f)
         if swap_1d:
@@ -178,17 +223,31 @@ def finalize_reintegrated_groups(scan: "LiveScan", path: Union[str, "Path"], *,
     """
     if not swap_1d and not swap_2d:
         return
-    expected = (
-        {int(i) for i in expected_frame_indices}
-        if expected_frame_indices is not None else None
-    )
+    # A2: a both-dimensions swap (del+move 1D, then del+move 2D) is NOT
+    # crash-atomic -- a crash between them leaves new-1D / stale-2D.  The
+    # production caller finalizes exactly one dimension per pass; forbid the
+    # both-dims call rather than silently risk a torn 1D/2D record.
+    if swap_1d and swap_2d:
+        raise ValueError(
+            "cross-dimension reintegration swap is not crash-atomic; finalize "
+            "one dimension (swap_1d XOR swap_2d) per call"
+        )
+    # A3: never swap without validating shadow coverage.  A None expected set
+    # would publish a partial/aborted shadow over the canonical result with no
+    # coverage check -- a destructive foot-gun.  Require it.
+    if expected_frame_indices is None:
+        raise ValueError(
+            "finalize_reintegrated_groups requires expected_frame_indices to "
+            "validate shadow coverage before swapping"
+        )
+    expected = {int(i) for i in expected_frame_indices}
     with _open_with_retry(Path(path), "a") as f:
         h5f = _h5(f)
         for enabled, group_name in (
             (swap_1d, INTEGRATED_1D_GROUP),
             (swap_2d, INTEGRATED_2D_GROUP),
         ):
-            if not enabled or expected is None:
+            if not enabled:
                 continue
             shadow_path = _shadow_group_path(entry, group_name)
             if shadow_path not in h5f or "frame_index" not in h5f[shadow_path]:
@@ -205,11 +264,20 @@ def finalize_reintegrated_groups(scan: "LiveScan", path: Union[str, "Path"], *,
                     f"Reintegration shadow {shadow_path} does not cover the "
                     f"full scan (missing={missing[:8]}, extra={extra[:8]})."
                 )
+        # A1: write provenance BEFORE the swap so the swap (del canonical + move
+        # shadow) is the single last durable commit.  /entry/reduction is
+        # disjoint from integrated_*, so writing it first leaves the canonical
+        # rows intact; if it raises here, both canonical and shadow are
+        # untouched and the prior result stands (recoverable).  A crash after
+        # provenance but before the swap leaves new-params + old-rows + an
+        # orphan shadow, which cleanup_reintegrate_shadow_groups collapses to
+        # old-rows (an uncommitted run); a crash mid-swap adopts the shadow ->
+        # new-rows + already-new-params.  No window yields new-rows+stale-params.
+        _write_reduction(h5f, scan, entry=entry)
         if swap_1d:
             _swap_integrated_group(h5f, entry=entry, group_name=INTEGRATED_1D_GROUP)
         if swap_2d:
             _swap_integrated_group(h5f, entry=entry, group_name=INTEGRATED_2D_GROUP)
-        _write_reduction(h5f, scan, entry=entry)
     from xdart.modules.ewald.frame_series import clear_frame_position_cache
     clear_frame_position_cache(os.fspath(path))
 
@@ -422,7 +490,10 @@ def save_scan_to_nexus(
         _t0 = _tick("entry", _t0)
         h5f = _h5(f)
         if recover_shadow_groups:
-            cleanup_reintegrate_shadow_groups(h5f, entry=entry)
+            # Spare an in-progress shadow this process owns: a concurrent save
+            # must not delete a streaming reintegrate's active shadow.
+            cleanup_reintegrate_shadow_groups(
+                h5f, entry=entry, spare_active_pid=os.getpid())
         cursor = _write_cursor(scan, h5f)
 
         # 1. Stacked integrated_1d and integrated_2d (delegated to
@@ -492,6 +563,13 @@ def save_scan_to_nexus(
         _t0 = _tick("integrated_1d", _t0)
         _commit_integrated_2d(f, prepared_2d)
         _t0 = _tick("integrated_2d", _t0)
+
+        # A streaming reintegrate writes into a ``…__reint`` shadow group; stamp
+        # the active marker so a concurrent same-process save's cleanup spares
+        # it (set every batch, idempotent; cleared by the swap or the drop).
+        if (integrated_1d_group_name.endswith(REINTEGRATE_SHADOW_SUFFIX)
+                or integrated_2d_group_name.endswith(REINTEGRATE_SHADOW_SUFFIX)):
+            mark_reintegrate_shadow_active(h5f, entry=entry, pid=os.getpid())
 
         # 3-6: per-frame metadata, positioners, derived geometry and
         # instrument are *write-once* values (raw motor positions

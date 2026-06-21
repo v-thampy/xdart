@@ -80,6 +80,23 @@ class TestStashPersistBeforeEvict:
         assert all(i not in fs._in_memory for i in range(6)) or \
             len(fs._in_memory) <= 6 + fs._in_memory_cap
 
+    def test_unmark_persisted_reverts_evictability(self):
+        """Cluster B: a dropped reintegrate shadow's frames must be un-marked so
+        they are no longer treated as safely-on-canonical (they only lived in
+        the deleted shadow).  unmark only makes frames LESS evictable."""
+        from xdart.modules.ewald.frame import LiveFrame
+        fs = self._series(cap=4)
+        for i in range(8):
+            fs[i] = LiveFrame(idx=i)
+        fs.mark_persisted(range(8))
+        # The reintegrate "Stop" path discards the shadow for a subset.
+        fs.unmark_persisted([2, 3, 4])
+        assert {2, 3, 4}.isdisjoint(fs._persisted)
+        assert {0, 1, 5, 6, 7} <= fs._persisted
+        # A still-resident unmarked frame is no longer eviction-eligible.
+        fs._in_memory = {2: LiveFrame(idx=2)}
+        assert fs.evict_persisted_beyond_cap() == 0
+
     def test_evict_persisted_beyond_cap_releases_after_save(self):
         """D1: after a reintegrate's single end-of-run save, no further stash
         fires to trigger eviction, so the just-saved frames would stay pinned.

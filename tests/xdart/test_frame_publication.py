@@ -129,6 +129,28 @@ def test_publication_store_is_generation_aware():
     assert store.generation == 1
 
 
+def test_publication_store_invalidate_drops_label_and_bumps_generation():
+    """Cluster B: invalidate drops a frame's recomputed entry (and its
+    carry-over) so a dropped reintegrate shadow reverts to the prior canonical
+    row on the next render; generation bumps so in-flight renders re-resolve."""
+    store = PublicationStore()
+    store.upsert(publication_from_live_frame(DuckFrame(idx=1)))
+    store.upsert(publication_from_live_frame(DuckFrame(idx=2)))
+    gen0 = store.generation
+
+    store.invalidate([1])
+    assert store.get(1) is None
+    assert store.get(2) is not None
+    assert 1 not in store._heavy_labels and 1 not in store._thumb_labels
+    assert 1 not in store._carryover
+    assert store.generation == gen0 + 1
+
+    # Invalidating an absent label is a no-op (no spurious generation bump).
+    gen1 = store.generation
+    store.invalidate([999])
+    assert store.generation == gen1
+
+
 def test_publication_store_bounds_heavy_payloads_but_keeps_metadata():
     """D2 two-tier eviction: over the heavy bound, the full arrays drop
     but the THUMBNAIL survives (tier 1) so scroll-back stays paintable;

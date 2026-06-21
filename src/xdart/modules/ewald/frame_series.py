@@ -519,6 +519,21 @@ class LiveFrameSeries:
         with self._cache_lock:
             self._persisted.update(int(i) for i in idxs)
 
+    def unmark_persisted(self, idxs) -> None:
+        """Forget that ``idxs`` are safely on the canonical stack.
+
+        Symmetric to :meth:`mark_persisted`.  Used when a streaming reintegrate
+        shadow is DISCARDED: those frames' recomputed rows lived only in the
+        now-deleted shadow, so they are NOT on canonical and must not be treated
+        as evictable-because-saved.  A still-resident recomputed frame becomes
+        un-evictable again (correct -- it is unsaved); an already-evicted frame
+        lazy-loads the canonical (prior) row, the intended stopped-pass result.
+        Only ever makes frames LESS evictable, so it cannot reintroduce the
+        persist-before-evict data-loss bug.
+        """
+        with self._cache_lock:
+            self._persisted.difference_update(int(i) for i in idxs)
+
     def evict_persisted_beyond_cap(self) -> int:
         """Drop persisted in-memory frames beyond ``_in_memory_cap`` (oldest
         first); returns the number evicted.

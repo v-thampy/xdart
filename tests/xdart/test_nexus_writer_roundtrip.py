@@ -975,6 +975,134 @@ def test_save_scan_surfaces_all_dropped_publication_rows(tmp_path):
         assert f"entry/{shadow_2d}" not in f
 
 
+def test_finalize_rejects_cross_dimension_swap(tmp_path):
+    """A2: a both-dimensions swap is not crash-atomic and must be refused."""
+    from xdart.modules.ewald.nexus_writer import finalize_reintegrated_groups
+    scan = _DuckSphere([_DuckArch(idx=i) for i in range(2)])
+    with pytest.raises(ValueError, match="cross-dimension"):
+        finalize_reintegrated_groups(
+            scan, tmp_path / "x.nxs", entry="entry",
+            swap_1d=True, swap_2d=True, expected_frame_indices=[0, 1],
+        )
+
+
+def test_finalize_requires_expected_frame_indices(tmp_path):
+    """A3: a swap must never run without coverage validation."""
+    from xdart.modules.ewald.nexus_writer import finalize_reintegrated_groups
+    scan = _DuckSphere([_DuckArch(idx=i) for i in range(2)])
+    with pytest.raises(ValueError, match="requires expected_frame_indices"):
+        finalize_reintegrated_groups(
+            scan, tmp_path / "x.nxs", entry="entry",
+            swap_2d=True, expected_frame_indices=None,
+        )
+
+
+def test_finalize_writes_provenance_before_swap(tmp_path, monkeypatch):
+    """A1: provenance is written BEFORE the destructive swap, so a provenance
+    failure leaves the canonical rows + shadow intact (recoverable), never
+    new-rows + stale-params."""
+    import h5py
+    from xdart.modules.ewald import nexus_writer as nw
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_1D_GROUP, finalize_reintegrated_groups,
+        reintegrate_shadow_group_name, save_scan_to_nexus,
+    )
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "prov.nxs"
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+    with h5py.File(path, "r") as f:
+        canonical_1d = f["entry/integrated_1d/intensity"][()].copy()
+
+    shadow_1d = reintegrate_shadow_group_name(INTEGRATED_1D_GROUP)
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
+        replace_frame_indices=[0, 1, 2], write_integrated_2d=False,
+        integrated_1d_group_name=shadow_1d, write_reduction=False,
+        recover_shadow_groups=False,
+    )
+
+    monkeypatch.setattr(nw, "_write_reduction", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError, match="boom"):
+        finalize_reintegrated_groups(
+            scan, path, entry="entry", swap_1d=True,
+            expected_frame_indices=[0, 1, 2],
+        )
+    # Provenance ran (and failed) BEFORE the swap, so canonical is untouched and
+    # the shadow still exists -- the prior result stands.
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f["entry/integrated_1d/intensity"][()], canonical_1d)
+        assert f"entry/{shadow_1d}" in f
+
+
+def test_active_shadow_marker_spares_same_process_save(tmp_path):
+    """C: a concurrent same-process save must NOT delete an in-progress shadow;
+    a shadow stamped by a different (crashed) PID is cleaned as an orphan."""
+    import os
+    import h5py
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_2D_GROUP, REINTEGRATE_SHADOW_ACTIVE_ATTR,
+        reintegrate_shadow_group_name, save_scan_to_nexus,
+    )
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "active.nxs"
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+    shadow_2d = reintegrate_shadow_group_name(INTEGRATED_2D_GROUP)
+    # Stage a shadow batch -> save_scan_to_nexus stamps the active marker (our PID).
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
+        replace_frame_indices=[0, 1, 2], write_integrated_1d=False,
+        integrated_2d_group_name=shadow_2d, write_reduction=False,
+        recover_shadow_groups=False,
+    )
+    with h5py.File(path, "r") as f:
+        assert f[f"entry/{shadow_2d}"].attrs[REINTEGRATE_SHADOW_ACTIVE_ATTR] == os.getpid()
+
+    # A concurrent default save (recover_shadow_groups=True) must SPARE it.
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+    with h5py.File(path, "r") as f:
+        assert f"entry/{shadow_2d}" in f  # in-progress shadow survived
+
+    # Now make it look like a different process's crash-orphan; canonical
+    # present -> the next save cleans it.
+    with h5py.File(path, "a") as f:
+        f[f"entry/{shadow_2d}"].attrs[REINTEGRATE_SHADOW_ACTIVE_ATTR] = os.getpid() + 1
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+    with h5py.File(path, "r") as f:
+        assert f"entry/{shadow_2d}" not in f  # stale orphan removed
+
+
+def test_reader_adopts_orphan_reint_shadow(tmp_path):
+    """D1: a file crashed precisely between del-canonical and move-shadow (only
+    integrated_1d__reint survives) still opens sanely -- readers adopt the
+    orphan read-only."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_1D_GROUP, reintegrate_shadow_group_name, save_scan_to_nexus,
+    )
+    from xrd_tools.io.read import get_1d
+    from xrd_tools.io.frame_view import read_frame_view
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "orphan.nxs"
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+    shadow_1d = reintegrate_shadow_group_name(INTEGRATED_1D_GROUP)
+    # Simulate the crash window: canonical deleted, shadow in place but not moved.
+    with h5py.File(path, "a") as f:
+        f.move("entry/integrated_1d", f"entry/{shadow_1d}")
+        assert "entry/integrated_1d" not in f
+
+    out = get_1d(path)                       # must not raise
+    assert out.intensity.shape[0] == 3
+    fv = read_frame_view(str(path), 0)       # must not silently lose 1D
+    assert fv.has_1d and fv.intensity_1d is not None
+
+
 def test_shadow_cleanup_recovers_or_removes_stale_groups(tmp_path):
     """Startup cleanup adopts final-missing shadows and drops stale shadows."""
     import h5py
