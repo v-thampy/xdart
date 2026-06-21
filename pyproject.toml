@@ -63,7 +63,7 @@ gui = [
     "imagecodecs",
     "imageio",
 ]
-notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "jupyterlab"]
+notebook = ["ipywidgets", "anywidget", "ipyfilechooser", "ipykernel", "ipympl", "jupyterlab"]
 all = ["xrd-tools[fitting,rsm,gui,notebook]"]
 dev = ["pytest", "pytest-timeout", "build", "twine", "tifffile"]  # tifffile: test fixtures write TIFFs
 
