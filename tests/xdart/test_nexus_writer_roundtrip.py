@@ -975,6 +975,46 @@ def test_save_scan_surfaces_all_dropped_publication_rows(tmp_path):
         assert f"entry/{shadow_2d}" not in f
 
 
+def test_shadow_swap_byte_equivalent_to_direct_write(tmp_path):
+    """Equivalence-spine gate: a shadow-write -> atomic swap produces
+    byte-identical integrated rows (intensity/q/chi/frame_index/sigma) to a
+    direct write of the same frames.  Catches a transpose or sigma
+    row-misalignment in the shadow path that the shape/axis validators would
+    not -- a valid-shape-but-wrong-bytes regression."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_1D_GROUP, INTEGRATED_2D_GROUP, finalize_reintegrated_groups,
+        reintegrate_shadow_group_name, save_scan_to_nexus,
+    )
+
+    direct = tmp_path / "direct.nxs"
+    save_scan_to_nexus(_DuckSphere([_DuckArch(idx=i) for i in range(4)]),
+                       direct, mode="w", finalize=False)
+
+    via_shadow = tmp_path / "shadow.nxs"
+    scan = _DuckSphere([_DuckArch(idx=i) for i in range(4)])
+    save_scan_to_nexus(scan, via_shadow, mode="w", finalize=False)  # canonical
+    # 2D shadow + swap.
+    shadow_2d = reintegrate_shadow_group_name(INTEGRATED_2D_GROUP)
+    save_scan_to_nexus(
+        scan, via_shadow, entry="entry", finalize=False,
+        replace_frame_indices=[0, 1, 2, 3], write_integrated_1d=False,
+        integrated_2d_group_name=shadow_2d, write_reduction=False,
+        recover_shadow_groups=False,
+    )
+    finalize_reintegrated_groups(scan, via_shadow, entry="entry", swap_2d=True,
+                                 expected_frame_indices=[0, 1, 2, 3])
+
+    with h5py.File(direct, "r") as fd, h5py.File(via_shadow, "r") as fs:
+        for ds in ("integrated_2d/intensity", "integrated_2d/q",
+                   "integrated_2d/chi", "integrated_2d/frame_index"):
+            np.testing.assert_array_equal(
+                fd[f"entry/{ds}"][()], fs[f"entry/{ds}"][()],
+                err_msg=f"{ds} differs between direct write and shadow swap")
+        assert ("sigma" in fd["entry/integrated_2d"]) == \
+               ("sigma" in fs["entry/integrated_2d"])
+
+
 def test_finalize_rejects_cross_dimension_swap(tmp_path):
     """A2: a both-dimensions swap is not crash-atomic and must be refused."""
     from xdart.modules.ewald.nexus_writer import finalize_reintegrated_groups

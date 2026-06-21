@@ -279,6 +279,10 @@ def plan_from_live_scan(
     method_1d = str(_pop_first(args_1d, ("method",), "csr"))
     method_2d = str(_pop_first(args_2d, ("method",), "csr"))
     npt_1d = int(_pop_first(args_1d, ("npt", "numpoints", "npt_rad"), 1000))
+    # Azimuthal Mode A (unit='chi_deg') band sampling.  A DISTINCT key from
+    # 'npt_rad' (which is aliased to the chi-bin npt above) so the two never
+    # collide; absent -> the pyFAI default of 1000.
+    npt_rad_1d = int(_pop_first(args_1d, ("chi_npt_rad",), 1000))
     npt_rad_2d, npt_azim_2d = _npt_2d(args_2d)
     radial_range = _pop_first(args_1d, ("radial_range",), None)
     radial_range_2d = _pop_first(args_2d, ("radial_range",), None)
@@ -397,6 +401,7 @@ def plan_from_live_scan(
         integration_1d=(
             Integration1DPlan(
                 npt=npt_1d,
+                npt_rad=npt_rad_1d,
                 unit=unit_1d,
                 method=method_1d,
                 radial_range=radial_range,

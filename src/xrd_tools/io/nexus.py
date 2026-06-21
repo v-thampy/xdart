@@ -1642,12 +1642,18 @@ def write_integrated_stack(
             [np.asarray(r.intensity, np.float32).T for r in results]
         )  # (N, n_chi, n_q)
         n_chi, n_q = stacked.shape[1], stacked.shape[2]
+        # Block the leading (frame) axis so a streaming reintegrate's per-row
+        # appends after batch 1 reuse a chunk instead of allocating one per
+        # frame (F2).  Byte-budgeted (~2 MB) so a large cake stays at one frame
+        # per chunk (unchanged) while small cakes block up to 32 frames.
+        rows_2d = max(1, min(len(fis_), 32,
+                             (2 << 20) // max(1, n_chi * n_q * 4)))
         g = _create_group_from_schema(parent, "integrated_2d", disk_name=disk_name)
         g.attrs["two_d_kind"] = two_d_kind_from_units(
             r0.unit, r0.azimuthal_unit
         ).value
         _schema_dataset(g, "integrated_2d", "intensity", stacked,
-                        ck=ck, row_chunk=(1, n_chi, n_q))
+                        ck=ck, row_chunk=(rows_2d, n_chi, n_q))
         qd = _schema_dataset(g, "integrated_2d", "q", r0.radial, ck=ck)
         qd.attrs["units"] = r0.unit            # units_from="radial_unit"
         cd = _schema_dataset(g, "integrated_2d", "chi", r0.azimuthal, ck=ck)
@@ -1664,7 +1670,7 @@ def write_integrated_stack(
                 for r in results
             ])
             _schema_dataset(g, "integrated_2d", "sigma", sig,
-                            ck=ck, row_chunk=(1, n_chi, n_q))
+                            ck=ck, row_chunk=(rows_2d, n_chi, n_q))
 
     if results_1d is not None and len(results_1d):
         if len(results_1d) != len(fis):

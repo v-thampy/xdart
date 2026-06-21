@@ -169,11 +169,18 @@ class Integration1DPlan:
     monitor_key: str | None = None
     error_model: str | None = None
     polarization_factor: float | None = None
+    # Azimuthal Mode A (unit='chi_deg') only: the radial sampling across the
+    # q (or 2theta) band the I-vs-chi profile is pooled over.  ``npt`` is the
+    # chi-bin count; this is the band resolution.  Ignored by the radial path.
+    npt_rad: int = 1000
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.npt <= 0:
             raise ValueError(f"Integration1DPlan.npt must be > 0; got {self.npt}")
+        if self.npt_rad <= 0:
+            raise ValueError(
+                f"Integration1DPlan.npt_rad must be > 0; got {self.npt_rad}")
 
 
 @dataclass(slots=True)
@@ -2191,6 +2198,7 @@ def _reduce_frame(
                 image,
                 ai,
                 npt=p1.npt,
+                npt_rad=p1.npt_rad,
                 radial_unit="q_A^-1",
                 method=p1.method,
                 mask=mask,

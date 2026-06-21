@@ -412,7 +412,8 @@ def _write_publication_reload(path, frame, thumb_record=None):
 
 def _assert_live_batch_reload_equivalent(tmp_path, *, gi,
                                          gi_mode_1d="q_total",
-                                         gi_mode_2d="qip_qoop"):
+                                         gi_mode_2d="qip_qoop",
+                                         unit_1d="q_A^-1"):
     """The equivalence spine: for one frame integrated under the given mode,
     the live (serial), batch (parallel), and NeXus-reload paths must produce
     byte-equivalent FrameViews.
@@ -434,9 +435,11 @@ def _assert_live_batch_reload_equivalent(tmp_path, *, gi,
             gi_mode_1d=gi_mode_1d, gi_mode_2d=gi_mode_2d,
         )
     else:
+        # Mode A (unit_1d='chi_deg'): the OUTPUT axis is chi; radial_range is the
+        # q BAND to pool over.  Otherwise a standard radial 1D.
         bai_1d = {
             "numpoints": 256,
-            "unit": "q_A^-1",
+            "unit": unit_1d,
             "radial_range": (0.1, 6.0),
             "method": "csr",
         }
@@ -559,6 +562,14 @@ def test_batch_parallel_eiger_cake_nondegenerate_manual_incidence():
 
 def test_standard_publication_live_batch_reload_equivalence(tmp_path):
     _assert_live_batch_reload_equivalent(tmp_path, gi=False)
+
+
+def test_mode_a_chi_publication_live_batch_reload_equivalence(tmp_path):
+    """Azimuthal Mode A (non-GI I-vs-chi, unit='chi_deg') must round-trip
+    live == batch == reload, exactly like its GI sibling chi_gi (which is
+    covered by test_gi_submode_...).  Guards the chi_deg run-path dispatch +
+    the writer's 1D azimuthal axis_kind against a transpose/axis regression."""
+    _assert_live_batch_reload_equivalent(tmp_path, gi=False, unit_1d="chi_deg")
 
 
 def test_gi_qip_qoop_publication_live_batch_reload_equivalence(tmp_path):

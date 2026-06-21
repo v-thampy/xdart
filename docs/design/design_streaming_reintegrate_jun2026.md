@@ -1,5 +1,16 @@
 # Streaming reintegrate — the proper D1 fix (shadow-dataset + atomic swap)
 
+**Date:** 2026-06-20 · **Status:** IMPLEMENTED (`fix/reintegrate-publication-drop-coverage`).
+The shadow group + per-batch append + atomic swap + restore-on-abort are in
+`scan_threads._reintegrate_all` / `nexus_writer`.  Memory is bounded to ~cap
+(per-batch `mark_persisted` + `evict_persisted_beyond_cap`; verified by the
+persist/evict tests) and the raw-load window is decoupled from the write batch
+(`raw_window`≈2·workers) so peak RAW residency is O(workers), not O(batch).
+Hardening landed on top: provenance-before-swap, single-dimension swap guard,
+coverage-required finalize, active-shadow marker, reader-side orphan adoption,
+and the `_persisted`/store reconcile on a dropped (stopped) pass.
+*(original design below)*
+
 **Date:** 2026-06-20 · **Status:** designed, ready to implement (its own focused effort).
 **Goal:** make Re-Integrate stream to disk incrementally so memory is bounded for
 ANY scan size — closing the D1 gap by extending the live-streaming architecture

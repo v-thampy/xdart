@@ -97,6 +97,19 @@ class TestStashPersistBeforeEvict:
         fs._in_memory = {2: LiveFrame(idx=2)}
         assert fs.evict_persisted_beyond_cap() == 0
 
+    def test_discard_in_memory_forces_lazy_reload(self):
+        """Cluster B: discarding a stopped reintegrate's in-memory recomputed
+        frame makes the next access lazy-load (prior canonical) instead of
+        returning the abandoned recomputed object."""
+        from xdart.modules.ewald.frame import LiveFrame
+        fs = self._series(cap=4)
+        for i in range(3):
+            fs[i] = LiveFrame(idx=i)
+        assert 1 in fs._in_memory
+        fs.discard_in_memory([1])
+        assert 1 not in fs._in_memory       # gone -> next __getitem__ re-loads
+        assert 0 in fs._in_memory and 2 in fs._in_memory
+
     def test_evict_persisted_beyond_cap_releases_after_save(self):
         """D1: after a reintegrate's single end-of-run save, no further stash
         fires to trigger eviction, so the just-saved frames would stay pinned.

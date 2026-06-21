@@ -6,6 +6,7 @@
 # Standard library imports
 import logging
 import os
+import time
 from queue import Queue
 from threading import Condition, RLock
 import traceback
@@ -118,12 +119,12 @@ class integratorThread(Qt.QtCore.QThread):
         # apply_threshold_saturation_to_plan; None => plan unchanged.
         self.threshold_config = None
         self._reintegrate_shadow_active = False
-        # Frames whose recomputed rows were written to the shadow this pass (and
-        # mark_persisted'd against the not-yet-swapped canonical).  On a drop
-        # they are reconciled (unmark_persisted + store.invalidate) so a stopped
-        # reintegrate shows the prior canonical result everywhere, not a stale
-        # store/lazy-load divergence.
-        self._shadow_written_idxs: set = set()
+        # Every frame published (displayed) during the current reintegrate pass.
+        # On a drop they are reconciled back to the prior canonical result
+        # (unmark_persisted + discard in-memory recomputed + store.invalidate) so
+        # a stopped reintegrate shows the prior result everywhere -- including the
+        # frames reduced-and-displayed but not yet flushed to the shadow.
+        self._reint_published_idxs: set = set()
 
     def _plan_for_reintegration(self, *, integrate_2d: bool):
         """Standard plan for a reintegrate, with the current Intensity-Threshold
@@ -467,23 +468,25 @@ class integratorThread(Qt.QtCore.QThread):
         finally:
             self._reintegrate_shadow_active = False
             _get_h5pool().resume(self.scan.data_file)
-        # Reconcile the in-session state to the prior canonical result: the
-        # shadow's recomputed rows are gone, so the frames it wrote are NOT on
-        # canonical (undo their mark_persisted) and any recomputed publication
-        # for them must yield to the prior canonical row (invalidate -> next
-        # render re-hydrates from disk).  Uses the full set sent to the shadow
-        # (incl. any Finding-1 publication-dropped frames, which were still
-        # mark_persisted'd) so display and lazy-load agree.
-        written = getattr(self, "_shadow_written_idxs", set())
-        if written:
+        # Reconcile the in-session state to the prior canonical result.  The
+        # shadow's recomputed rows are gone, so for EVERY frame the pass
+        # displayed: undo any mark_persisted (they are not on canonical), drop
+        # the recomputed in-memory row so the next access lazy-loads the prior
+        # canonical one, and invalidate the recomputed publication so display
+        # re-hydrates the prior row.  Covers both flushed frames (evicted, lazy
+        # canonical) and reduced-but-unflushed frames (still in memory) so
+        # display and lazy-load agree on the prior result.
+        touched = getattr(self, "_reint_published_idxs", set())
+        if touched:
             try:
-                self.scan.frames.unmark_persisted(written)
+                self.scan.frames.unmark_persisted(touched)
+                self.scan.frames.discard_in_memory(touched)
                 if self.publication_store is not None:
-                    self.publication_store.invalidate(set(written))
+                    self.publication_store.invalidate(set(touched))
             except Exception:
                 logger.debug("[REINT] shadow-drop reconcile skipped",
                              exc_info=True)
-            self._shadow_written_idxs = set()
+            self._reint_published_idxs = set()
 
     def _write_reintegrate_shadow_batch(self, frame_indices, *,
                                         do_2d: bool, label: str) -> set:
@@ -648,7 +651,7 @@ class integratorThread(Qt.QtCore.QThread):
         indices = list(self.scan.frames.index)
         if not indices:
             return
-        self._shadow_written_idxs = set()
+        self._reint_published_idxs = set()
         self._prepare_reintegrate_shadow()
 
         def _publish(frame):
@@ -734,10 +737,19 @@ class integratorThread(Qt.QtCore.QThread):
         except Exception:
             logger.debug("[REINT] shape pre-check failed", exc_info=True)
 
-        # Batched dispatch: lazy-load each batch right before
-        # submitting it, publish results, then drop the batch's
-        # frames so RAM stays bounded.  Live uses a batch of 1.
-        _RE_BATCH = 1 if live else max(8, 32 * n_workers)
+        # Dispatch in two decoupled cadences:
+        #  * raw_window -- how many frames' raw maps are lazy-loaded + reduced at
+        #    once.  Small (O(workers)) so the peak RAW residency is bounded to
+        #    ~the worker count, not the whole write batch (E2; a 32x16 write
+        #    batch otherwise pinned ~9 GB of raw at once).
+        #  * flush_n / flush_t -- how often the accumulated recomputed rows are
+        #    written to the shadow group.  The per-write open/pause/resume cycle
+        #    is the costly part (and, live, the GUI-freeze source), so amortise
+        #    it over many frames while display stays per-frame (publish is
+        #    independent of the disk write) (E1).
+        raw_window = 1 if live else max(2, 2 * n_workers)
+        flush_n = 16 if live else max(64, 8 * n_workers)
+        flush_t = 2.0
 
         # Indices actually reduced + published to the live display this pass.
         # They are written to shadow groups batch-by-batch; a user Stop drops the
@@ -748,16 +760,40 @@ class integratorThread(Qt.QtCore.QThread):
         # the shadow's expected coverage at finalize so one dropped frame does
         # not abort the whole reintegrate (Finding 1).
         all_dropped: set[int] = set()
+        # Recomputed rows awaiting a shadow flush, and the last flush time.
+        pending_shadow_idxs: list[int] = []
+        last_flush = time.monotonic()
 
-        for i in range(0, len(indices), _RE_BATCH):
+        def _flush_shadow():
+            """Write the pending recomputed rows to the shadow + evict; track
+            drops and the written set for the swap / drop reconcile."""
+            nonlocal pending_shadow_idxs, last_flush
+            if not pending_shadow_idxs:
+                return
+            idxs, pending_shadow_idxs = pending_shadow_idxs, []
+            try:
+                batch_dropped = self._write_reintegrate_shadow_batch(
+                    idxs, do_2d=do_2d, label=label,
+                )
+                all_dropped.update(batch_dropped or ())
+            except Exception:
+                logger.error(
+                    "[REINT] %s shadow batch write failed; restoring previous "
+                    "persisted result.", label, exc_info=True,
+                )
+                self._drop_reintegrate_shadow()
+                raise
+            last_flush = time.monotonic()
+
+        for i in range(0, len(indices), raw_window):
             if self.stop_requested:
                 logger.warning(
                     "[REINT] %s reintegration STOPPED at frame %s/%s (%s done) "
-                    "-- attempting to persist the done frames (see the next "
-                    "[REINT] line for whether the partial save was allowed).",
+                    "-- the staged shadow is dropped; the prior persisted result "
+                    "is left unchanged.",
                     label, i, len(indices), len(processed_idxs))
                 break
-            chunk_idxs = indices[i:i + _RE_BATCH]
+            chunk_idxs = indices[i:i + raw_window]
             # LiveFrameSeries.__getitem__ does the lazy v2 load + sets
             # source refs / _source_root for the L1 raw loader.  Resilient to a
             # frame vanishing mid-pass (a concurrent scan.frames rebuild — e.g. a
@@ -806,6 +842,9 @@ class integratorThread(Qt.QtCore.QThread):
             for frame in reduced_frames:
                 _publish(frame)
                 processed_idxs.append(int(getattr(frame, "idx", -1)))
+                # Track every displayed frame so a drop can revert it (incl.
+                # frames not yet flushed to the shadow).
+                self._reint_published_idxs.add(int(getattr(frame, "idx", -1)))
                 # D1 RAM: every published frame is pinned in scan.frames
                 # (unsaved -> un-evictable) until the single end-of-run save, so
                 # N frames accumulate.  Shrink each frame's footprint now that its
@@ -820,25 +859,15 @@ class integratorThread(Qt.QtCore.QThread):
                 frame.map_raw = None
                 if not do_2d:
                     frame.int_2d = None
-            shadow_batch_idxs = [
+            pending_shadow_idxs.extend(
                 int(getattr(frame, "idx", -1)) for frame in reduced_frames
-            ]
-            try:
-                batch_dropped = self._write_reintegrate_shadow_batch(
-                    shadow_batch_idxs, do_2d=do_2d, label=label,
-                )
-                all_dropped.update(batch_dropped or ())
-                # Record what was mark_persisted'd this batch so a later drop can
-                # reconcile it back to the prior canonical result (cluster B).
-                self._shadow_written_idxs.update(
-                    int(i) for i in shadow_batch_idxs if int(i) >= 0)
-            except Exception:
-                logger.error(
-                    "[REINT] %s shadow batch write failed; restoring previous "
-                    "persisted result.", label, exc_info=True,
-                )
-                self._drop_reintegrate_shadow()
-                raise
+            )
+            # Flush on the size cadence (both modes) or, live, on the time
+            # cadence so a slow trickle of frames still persists promptly.
+            now = time.monotonic()
+            if (len(pending_shadow_idxs) >= flush_n
+                    or (live and (now - last_flush) >= flush_t)):
+                _flush_shadow()
             # Authoritative once-per-pass savability check: compare the freshly
             # reduced output signature to the stored one.  Catches axis/unit
             # changes the plan-npt pre-check can't (so the Stop popup is reliable
@@ -855,6 +884,12 @@ class integratorThread(Qt.QtCore.QThread):
             # ``frames`` goes out of scope at the end of the iteration, so
             # the FIFO _in_memory_cap eviction can free old frames before
             # the next chunk loads.
+
+        # Flush the tail of recomputed rows on a normal finish so the shadow is
+        # complete before the swap.  On a Stop the shadow is dropped below, so
+        # there is no point flushing the last partial batch first.
+        if not self.stop_requested:
+            _flush_shadow()
 
         # Publish the completed shadow only if the reintegrate reached every
         # frame.  A stop or per-frame failure drops the shadow and leaves the

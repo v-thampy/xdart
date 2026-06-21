@@ -534,6 +534,17 @@ class LiveFrameSeries:
         with self._cache_lock:
             self._persisted.difference_update(int(i) for i in idxs)
 
+    def discard_in_memory(self, idxs) -> None:
+        """Drop ``idxs`` from the in-memory cache so the next access lazy-loads
+        from disk.  Used to abandon a STOPPED reintegrate's recomputed in-memory
+        rows in favour of the prior canonical result, which is safe on disk --
+        unlike eviction this is a deliberate discard of unsaved (recomputed)
+        state, valid only because the canonical row still holds the prior one.
+        """
+        with self._cache_lock:
+            for i in idxs:
+                self._in_memory.pop(int(i), None)
+
     def evict_persisted_beyond_cap(self) -> int:
         """Drop persisted in-memory frames beyond ``_in_memory_cap`` (oldest
         first); returns the number evicted.

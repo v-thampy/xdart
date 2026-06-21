@@ -4443,8 +4443,10 @@ def test_reintegrate_drops_map_raw_and_2d_slab_for_ram(monkeypatch):
         assert fr.map_raw is None             # raw dropped (dominant pin)
         assert fr.int_2d is None              # 1D-only -> stale 2D slab dropped
     assert scan.skip_2d is False              # no 1D pass should touch the 2D flag
-    assert persisted == [0, 1, 2]             # each live batch was shadow-persisted
-    assert evicted == [True, True, True]      # per-batch eviction sweep ran
+    assert persisted == [0, 1, 2]             # every frame was shadow-persisted
+    # Writes are now flushed on a cadence (here once, post-loop, for 3 frames),
+    # so the eviction sweep runs at least once -- not once per frame.
+    assert evicted and all(evicted)
 
 
 def test_reintegrate_streams_batches_then_finalizes_shadow(monkeypatch):
@@ -4548,6 +4550,52 @@ def test_reintegrate_excludes_publication_dropped_frame_from_finalize(monkeypatc
     assert drops == []
 
 
+def test_reintegrate_live_batches_shadow_writes_on_a_cadence(monkeypatch):
+    """E1: a LIVE reintegrate displays per frame but flushes shadow writes on a
+    size cadence (every 16 frames), not once per frame -- the per-write
+    open/pause/resume cycle is the GUI-freeze source.  40 frames -> 3 writes."""
+    import threading
+    from types import MethodType, SimpleNamespace
+
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+
+    N = 40
+
+    class _Frames:
+        index = list(range(N))
+        def __init__(self):
+            self._items = {i: SimpleNamespace(idx=i, map_raw=None, int_2d=None)
+                           for i in self.index}
+        def __getitem__(self, i): return self._items[i]
+        def __setitem__(self, i, v): self._items[i] = v
+
+    writes, finalizes = [], []
+    scan = SimpleNamespace(
+        max_cores=1, frames=_Frames(), scan_lock=threading.RLock(),
+        data_file='x.nxs', skip_2d=False,
+    )
+    host = SimpleNamespace(
+        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        publication_store=None, scan=scan, stop_requested=False,
+        reintegrate_live=True,
+        update=SimpleNamespace(emit=lambda *a, **k: None),
+        _plan_for_reintegration=lambda integrate_2d: object(),
+        _reduce_reintegration_batch=lambda frames, plan, n_workers: frames,
+        _publish_reintegrated_display=lambda *a, **k: None,
+        _prepare_reintegrate_shadow=lambda: None,
+        _write_reintegrate_shadow_batch=lambda idxs, **k: writes.append(list(idxs)),
+        _finalize_reintegrate_shadow=lambda **k: finalizes.append(k),
+        _drop_reintegrate_shadow=lambda: None,
+    )
+    host._reintegrate_all = MethodType(integratorThread._reintegrate_all, host)
+    host._reintegrate_all(do_2d=False)
+
+    # 16 + 16 + 8 -> three flushes covering every frame exactly once, in order.
+    assert writes == [list(range(0, 16)), list(range(16, 32)), list(range(32, 40))]
+    assert [i for w in writes for i in w] == list(range(N))
+    assert finalizes == [{"do_2d": False, "expected_indices": list(range(N))}]
+
+
 def test_reintegrate_all_frames_dropped_skips_swap_gracefully(monkeypatch):
     """If the publication gate dropped EVERY frame, the reintegrate must skip
     the swap (expected coverage is empty) and drop the shadow, leaving the prior
@@ -4641,7 +4689,10 @@ def test_reintegrate_stop_drops_shadow_without_finalize(monkeypatch):
     host._reintegrate_all = MethodType(integratorThread._reintegrate_all, host)
     host._reintegrate_all(do_2d=False)
 
-    assert writes == [[0]]
+    # The single reduced frame is published (displayed) but the Stop fires
+    # before the write cadence flushes it, so nothing is written to the shadow;
+    # the shadow is dropped and the prior persisted result is left unchanged.
+    assert writes == []
     assert finalizes == []
     assert drops == [True]
 
