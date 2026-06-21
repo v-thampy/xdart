@@ -105,10 +105,11 @@ class integratorThread(Qt.QtCore.QThread):
         # When False (default) it uses the fast batched-multicore path.  Set by
         # the GUI (bai_1d/bai_2d) from the integrator's Live toggle before start.
         self.reintegrate_live = False
-        # Set False once a reintegrate is found to CHANGE the output shape
-        # (npt/unit/axis), meaning a stopped partial save would be rejected by
-        # the writer (mixed old+new rows).  The GUI Stop handler reads this to
-        # WARN before discarding (vs silently losing the in-progress work).
+        # Diagnostic flag from the pre-shadow writer path: False means the new
+        # rows differ in shape/unit/axis from the stored rows. Streaming
+        # reintegrate now stages all rows in shadow groups and rolls back any
+        # stopped pass regardless of this flag, but the signature checks remain
+        # useful logging around why partial replacement would have been unsafe.
         self.reintegrate_partial_savable = True
         # Per-frame pixel-rejection policy (Intensity Threshold + Mask
         # Saturated) snapshot onto the thread by the GUI (bai_1d/bai_2d) right
@@ -116,6 +117,7 @@ class integratorThread(Qt.QtCore.QThread):
         # CURRENT settings apply.  Applied to the reintegrate plan via
         # apply_threshold_saturation_to_plan; None => plan unchanged.
         self.threshold_config = None
+        self._reintegrate_shadow_active = False
 
     def _plan_for_reintegration(self, *, integrate_2d: bool):
         """Standard plan for a reintegrate, with the current Intensity-Threshold
@@ -142,9 +144,12 @@ class integratorThread(Qt.QtCore.QThread):
     @staticmethod
     def _plan_changes_output_shape(p1, p2, f0) -> bool:
         """True when reintegrating with this plan would CHANGE the stored output
-        row shape (npt / 2D dims) vs the first stored frame -- in which case a
-        partial (stopped) save is illegal (the writer forbids mixing fresh rows
-        with stale ones) and the GUI must warn before discarding.
+        row shape (npt / 2D dims) vs the first stored frame.
+
+        Shadow-group reintegrate never publishes a stopped partial pass, but the
+        check still records whether an old-style partial replacement would have
+        been illegal because the writer forbids mixing fresh rows with stale
+        axes.
 
         Reads the stored result's ``.intensity`` array shape: ``int_1d`` /
         ``int_2d`` are ``IntegrationResult{1,2}D`` dataclasses, so ``np.shape``
@@ -193,9 +198,12 @@ class integratorThread(Qt.QtCore.QThread):
     def _maybe_flag_unsavable(self, reduced_frame, do_2d: bool, label: str) -> None:
         """Once-per-pass: flip ``reintegrate_partial_savable`` to False when the
         freshly reduced output signature differs from the stored one (axis /
-        unit / shape).  This is the authoritative check the npt-only pre-check
-        can't make — it runs after the first frame is reduced, well before the
-        user can Stop, so the discard popup stays reliable."""
+        unit / shape).
+
+        The flag is now diagnostic rather than a UI gate: a stopped streaming
+        reintegrate always rolls back. Keeping the check makes axis/unit changes
+        visible in logs and keeps the writer-safety tests anchored.
+        """
         self._reint_sig_checked = True
         try:
             old1, old2 = getattr(self, "_reint_stored_sig", (None, None))
@@ -222,7 +230,11 @@ class integratorThread(Qt.QtCore.QThread):
                 logger.error("Method %s failed with KeyError: %s", self.method, e, exc_info=True)
                 traceback.print_exc()
             finally:
-                self._close_reduction_session()
+                try:
+                    if getattr(self, "_reintegrate_shadow_active", False):
+                        self._drop_reintegrate_shadow()
+                finally:
+                    self._close_reduction_session()
 
     def _get_reduction_session(self, key, factory):
         if self._reduction_session is not None and self._reduction_session_key == key:
@@ -420,6 +432,115 @@ class integratorThread(Qt.QtCore.QThread):
         if self.publication_store is not None:
             self.publication_store.end_reintegrate()
 
+    def _prepare_reintegrate_shadow(self) -> None:
+        """Recover or remove stale shadows before a new reintegration pass."""
+        from xdart.modules.ewald.nexus_writer import (
+            cleanup_reintegrate_shadow_groups,
+        )
+        from xdart.utils.h5pool import get_pool as _get_h5pool
+
+        _get_h5pool().pause(self.scan.data_file)
+        try:
+            with self.file_lock:
+                with catch(self.scan.data_file, "a") as f:
+                    cleanup_reintegrate_shadow_groups(f, entry="entry")
+            self._reintegrate_shadow_active = True
+        finally:
+            _get_h5pool().resume(self.scan.data_file)
+
+    def _drop_reintegrate_shadow(self) -> None:
+        """Delete active reintegration shadows after stop/error."""
+        from xdart.modules.ewald.nexus_writer import drop_reintegrate_shadow_groups
+        from xdart.utils.h5pool import get_pool as _get_h5pool
+
+        _get_h5pool().pause(self.scan.data_file)
+        try:
+            drop_reintegrate_shadow_groups(self.scan.data_file, entry="entry")
+        except Exception:
+            logger.debug("[REINT] shadow cleanup failed", exc_info=True)
+        finally:
+            self._reintegrate_shadow_active = False
+            _get_h5pool().resume(self.scan.data_file)
+
+    def _write_reintegrate_shadow_batch(self, frame_indices, *,
+                                        do_2d: bool, label: str) -> None:
+        """Persist one reintegrated batch to the shadow stack and evict it.
+
+        The canonical integrated group is not touched here.  The frame-series
+        mark is used only as the in-session memory-release boundary; the final
+        swap is what makes the recomputed rows authoritative on disk.
+        """
+        frame_indices = sorted({int(i) for i in frame_indices if int(i) >= 0})
+        if not frame_indices:
+            return
+
+        from xdart.modules.ewald.nexus_writer import (
+            INTEGRATED_1D_GROUP,
+            INTEGRATED_2D_GROUP,
+            reintegrate_shadow_group_name,
+            save_scan_to_nexus,
+        )
+        from xdart.utils.h5pool import get_pool as _get_h5pool
+
+        shadow_1d = reintegrate_shadow_group_name(INTEGRATED_1D_GROUP)
+        shadow_2d = reintegrate_shadow_group_name(INTEGRATED_2D_GROUP)
+        _get_h5pool().pause(self.scan.data_file)
+        try:
+            with self.file_lock:
+                with self.scan.scan_lock:
+                    save_scan_to_nexus(
+                        self.scan,
+                        self.scan.data_file,
+                        mode="a",
+                        entry="entry",
+                        finalize=False,
+                        replace_frame_indices=frame_indices,
+                        write_integrated_1d=not do_2d,
+                        write_integrated_2d=do_2d,
+                        integrated_1d_group_name=(
+                            INTEGRATED_1D_GROUP if do_2d else shadow_1d
+                        ),
+                        integrated_2d_group_name=(
+                            shadow_2d if do_2d else INTEGRATED_2D_GROUP
+                        ),
+                        write_reduction=False,
+                        recover_shadow_groups=False,
+                    )
+            try:
+                self.scan.frames.mark_persisted(frame_indices)
+                n_evicted = self.scan.frames.evict_persisted_beyond_cap()
+                if n_evicted:
+                    logger.info(
+                        "[REINT] %s shadow-persisted %s frame(s), evicted %s.",
+                        label, len(frame_indices), n_evicted,
+                    )
+            except Exception:
+                logger.debug("[REINT] post-shadow eviction skipped",
+                             exc_info=True)
+        finally:
+            _get_h5pool().resume(self.scan.data_file)
+
+    def _finalize_reintegrate_shadow(self, *, do_2d: bool, expected_indices) -> None:
+        """Swap the completed shadow into place and stamp reduction settings."""
+        from xdart.modules.ewald.nexus_writer import finalize_reintegrated_groups
+        from xdart.utils.h5pool import get_pool as _get_h5pool
+
+        _get_h5pool().pause(self.scan.data_file)
+        try:
+            with self.file_lock:
+                with self.scan.scan_lock:
+                    finalize_reintegrated_groups(
+                        self.scan,
+                        self.scan.data_file,
+                        entry="entry",
+                        swap_1d=not do_2d,
+                        swap_2d=do_2d,
+                        expected_frame_indices=expected_indices,
+                    )
+            self._reintegrate_shadow_active = False
+        finally:
+            _get_h5pool().resume(self.scan.data_file)
+
     def bai_2d_all(self):
         """Integrates all frames 2d.  Thin wrapper over _reintegrate_all."""
         if getattr(self.scan, 'skip_2d', False):
@@ -493,6 +614,7 @@ class integratorThread(Qt.QtCore.QThread):
         indices = list(self.scan.frames.index)
         if not indices:
             return
+        self._prepare_reintegrate_shadow()
 
         def _publish(frame):
             """Reattach frame into scan and viewer dicts.
@@ -550,10 +672,11 @@ class integratorThread(Qt.QtCore.QThread):
             getattr(standard_plan, "threshold_min", None),
             getattr(standard_plan, "threshold_max", None))
 
-        # Pre-flight: will this pass CHANGE the stored output shape?  If so a
-        # stopped partial save can't be persisted (writer forbids mixed rows),
-        # so the GUI warns before discarding.  Compare the plan's output npt to
-        # the first stored frame's int_*/ shape (peeking frame[0] lazy-loads it).
+        # Pre-flight: will this pass CHANGE the stored output shape?  Streaming
+        # reintegrate publishes only after every requested frame finishes, but
+        # this check remains useful diagnostics and protects older assumptions in
+        # tests. Compare the plan's output npt to the first stored frame's int_*/
+        # shape (peeking frame[0] lazy-loads it).
         self.reintegrate_partial_savable = True
         # Stored output signature (unit + axis extents + shape) of the first
         # frame, captured BEFORE the loop reduces it in place.  The npt/dims
@@ -581,10 +704,9 @@ class integratorThread(Qt.QtCore.QThread):
         # frames so RAM stays bounded.  Live uses a batch of 1.
         _RE_BATCH = 1 if live else max(8, 32 * n_workers)
 
-        # Indices actually reduced + published this pass.  On a user Stop we
-        # KEEP these (persist below) instead of discarding — the frames done so
-        # far stay reintegrated; only the not-yet-reached frames keep their prior
-        # result.  (A re-run reintegrates everything again, overwriting.)
+        # Indices actually reduced + published to the live display this pass.
+        # They are written to shadow groups batch-by-batch; a user Stop drops the
+        # shadow groups, leaving the persisted integrated stack unchanged.
         processed_idxs: list[int] = []
 
         for i in range(0, len(indices), _RE_BATCH):
@@ -658,6 +780,20 @@ class integratorThread(Qt.QtCore.QThread):
                 frame.map_raw = None
                 if not do_2d:
                     frame.int_2d = None
+            shadow_batch_idxs = [
+                int(getattr(frame, "idx", -1)) for frame in reduced_frames
+            ]
+            try:
+                self._write_reintegrate_shadow_batch(
+                    shadow_batch_idxs, do_2d=do_2d, label=label,
+                )
+            except Exception:
+                logger.error(
+                    "[REINT] %s shadow batch write failed; restoring previous "
+                    "persisted result.", label, exc_info=True,
+                )
+                self._drop_reintegrate_shadow()
+                raise
             # Authoritative once-per-pass savability check: compare the freshly
             # reduced output signature to the stored one.  Catches axis/unit
             # changes the plan-npt pre-check can't (so the Stop popup is reliable
@@ -675,74 +811,39 @@ class integratorThread(Qt.QtCore.QThread):
             # the FIFO _in_memory_cap eviction can free old frames before
             # the next chunk loads.
 
-        # Persist recomputed int_* rows back to disk via the v2
-        # replace-frames path.  The save re-writes /entry/reduction
-        # so the persisted bai_*_args reflect this reintegration's
-        # parameters (which is the whole reason the user kicked it
-        # off).  Replaces the legacy ``ut.dict_to_h5(...,
-        # 'bai_*_args')`` write-to-root path (v1 layout, dropped
-        # in 0.37.0) — that path never updated the v2 stacked rows.
-        #
-        # K2: bracket the save with the H5FilePool pause/resume
-        # protocol so any concurrent GUI h5viewer reads through the
-        # pool drop their cached handles and wait for the writer to
-        # release.  Wrangler save paths already do this; the
-        # reintegrate path was the one save site that didn't, which
-        # could race a viewer's open handle on the same .nxs file.
-        # Persist exactly the frames that were reintegrated this pass (all of
-        # them on a normal finish; the partial set on a Stop), so a stopped
-        # reintegrate KEEPS the work done so far.  BUT: if this reintegrate
-        # changed the output axis/unit/row shape, the writer's
-        # _select_frames_to_write REJECTS a partial rewrite (it would mix fresh
-        # rows with stale rows — a real corruption).  We honour that, never
-        # bypass it: catch the ValueError, leave the .nxs untouched, and tell the
-        # user the partial can't be persisted (finish the run, or use Batch).
-        # The done frames remain in the in-memory publication store for this
-        # session either way.
+        # Publish the completed shadow only if the reintegrate reached every
+        # frame.  A stop or per-frame failure drops the shadow and leaves the
+        # canonical integrated stack untouched; mixing old and new axes is never
+        # persisted.
         _stopped = bool(self.stop_requested)
         replace_idxs = sorted({i for i in processed_idxs if i >= 0})
-        if replace_idxs:
-            from xdart.utils.h5pool import get_pool as _get_h5pool
-            _get_h5pool().pause(self.scan.data_file)
-            # D1: a 1D-only reintegrate must NOT rewrite the (unchanged) 2D group
-            # -- that's what lets us drop the in-memory 2D slabs above.  Force
-            # skip_2d so _prepare_integrated_2d short-circuits (disk 2D untouched);
-            # restored in the finally.  (A 2D reintegrate keeps its own skip_2d.)
-            _saved_skip_2d = getattr(self.scan, "skip_2d", False)
-            if not do_2d:
-                self.scan.skip_2d = True
+        expected = [int(i) for i in indices]
+        if replace_idxs and not _stopped and set(replace_idxs) == set(expected):
             try:
-                self.scan.save_to_nexus(
-                    replace_frame_indices=replace_idxs,
+                self._finalize_reintegrate_shadow(
+                    do_2d=do_2d,
+                    expected_indices=expected,
                 )
                 logger.info(
-                    "[REINT] %s saved %s reintegrated frame(s)%s.",
+                    "[REINT] %s atomically published %s reintegrated frame(s).",
                     label, len(replace_idxs),
-                    " (partial — stopped)" if _stopped else "")
-                # D1: release the now-persisted frames so they don't stay pinned
-                # in _in_memory after the run (no further stash fires to evict).
-                try:
-                    self.scan.frames.mark_persisted(replace_idxs)
-                    n_evicted = self.scan.frames.evict_persisted_beyond_cap()
-                    if n_evicted:
-                        logger.info("[REINT] released %s frame(s) from memory "
-                                    "after save.", n_evicted)
-                except Exception:
-                    logger.debug("[REINT] post-save eviction skipped",
-                                 exc_info=True)
-            except ValueError as exc:
-                # Shape/axis/unit changed -> partial rewrite forbidden by the
-                # writer (correctly).  Don't crash, don't loosen the check.
+                )
+            except Exception:
+                logger.error(
+                    "[REINT] %s shadow finalize failed; restoring previous "
+                    "persisted result.", label, exc_info=True,
+                )
+                self._drop_reintegrate_shadow()
+                raise
+        else:
+            self._drop_reintegrate_shadow()
+            if replace_idxs:
                 logger.warning(
-                    "[REINT] %s partial save NOT persisted (the reintegrate "
-                    "changed the output axis/unit/npts, so the %s done frames "
-                    "can't be mixed with the %s un-reintegrated ones): %s  Let "
-                    "the reintegrate FINISH (or run it in Batch) to save.",
-                    label, len(replace_idxs),
-                    len(self.scan.frames.index) - len(replace_idxs), exc)
-            finally:
-                self.scan.skip_2d = _saved_skip_2d
-                _get_h5pool().resume(self.scan.data_file)
+                    "[REINT] %s reintegration did not finish all frames "
+                    "(done=%s/%s, stopped=%s); previous persisted result left "
+                    "unchanged.",
+                    label, len(replace_idxs), len(expected), _stopped,
+                )
 
     def bai_2d_SI(self):
         """Integrate the current frame, 2d

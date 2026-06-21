@@ -1081,6 +1081,10 @@ def test_reintegrate_all_refreshes_publication_store(monkeypatch) -> None:
         scan, None, None, None, [0], {}, {},
         publication_store=store,
     )
+    thread._prepare_reintegrate_shadow = lambda: None
+    thread._write_reintegrate_shadow_batch = lambda *a, **k: None
+    thread._finalize_reintegrate_shadow = lambda *a, **k: None
+    thread._drop_reintegrate_shadow = lambda: None
 
     thread.bai_2d_all()
     pub = store.get(0)

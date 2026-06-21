@@ -1624,23 +1624,19 @@ class staticWidget(QWidget):
     def _on_stop_clicked(self):
         """Single owner of the shared Stop button — route to the active run.
 
-        A running **reintegrate** takes priority: set the integrator thread's
-        cooperative ``stop_requested`` (checked between batches; one frame in
-        Live mode), so it unwinds within a frame, fires ``finished`` →
-        ``integrator_thread_finished`` → ``_exit_run_state`` (re-enabling the
-        panel).  The partial pass is intentionally NOT persisted — change
-        parameters and Reintegrate again.  Otherwise delegate to the active
+        A running **reintegrate** takes priority. Stopped reintegrations roll
+        back their shadow write and leave the persisted scan unchanged, so Stop
+        asks before discarding the in-progress pass, then sets the integrator
+        thread's cooperative ``stop_requested`` (checked between batches; one
+        frame in Live mode). The thread unwinds within a frame, fires
+        ``finished`` → ``integrator_thread_finished`` → ``_exit_run_state``
+        (re-enabling the panel). Otherwise delegate to the active
         **wrangler**'s ``stop()`` (its run-end UI reset)."""
         it = getattr(getattr(self, 'integratorTree', None),
                      'integrator_thread', None)
         if it is not None and it.isRunning():
-            # If this reintegrate changed the output shape, a partial save is
-            # impossible (the writer forbids mixing new + un-reintegrated rows),
-            # so stopping now DISCARDS the in-progress work.  Warn + let the user
-            # choose rather than silently lose it.
-            if not getattr(it, 'reintegrate_partial_savable', True):
-                if not self._confirm_discard_reintegrate():
-                    return                                # let it finish
+            if not self._confirm_discard_reintegrate():
+                return                                    # let it finish
             it.stop_requested = True
             try:
                 self.controls.set_stop_enabled(False)   # immediate feedback
@@ -1653,19 +1649,23 @@ class staticWidget(QWidget):
             w.stop()
 
     def _confirm_discard_reintegrate(self) -> bool:
-        """Modal warning when stopping a reintegrate whose CHANGED output shape
-        means the done frames can't be saved partially.  Returns True to proceed
-        with the stop (discard the in-progress work), False to keep running.
-        Isolated so tests can stub it without a live dialog."""
+        """Modal warning before stopping a reintegrate.
+
+        Streaming reintegrate writes into shadow groups and atomically swaps
+        them only when every requested frame finishes. Stopping rolls back the
+        shadow groups, so the persisted scan stays unchanged. Returns True to
+        stop and discard the in-progress pass, False to keep running. Isolated
+        so tests can stub it without a live dialog.
+        """
         from pyqtgraph import Qt
         mb = Qt.QtWidgets.QMessageBox(self)
         mb.setIcon(Qt.QtWidgets.QMessageBox.Icon.Warning)
         mb.setWindowTitle("Stop reintegration?")
-        mb.setText("This reintegration changed the output shape "
-                   "(points / unit / axis).")
+        mb.setText("Stop this reintegration?")
         mb.setInformativeText(
-            "The frames done so far CANNOT be saved if you stop now — a scan "
-            "can't mix the new rows with the un-reintegrated ones.\n\n"
+            "Frames processed so far are only staged in a temporary write. If "
+            "you stop now, that staged work will be discarded and the saved "
+            "scan will remain unchanged.\n\n"
             "Stop and discard the in-progress reintegration, or let it finish "
             "so everything is saved?")
         stop_btn = mb.addButton("Stop && Discard",

@@ -4333,6 +4333,10 @@ def test_reintegrate_live_processes_one_frame_at_a_time(monkeypatch):
                 lambda frames, plan, n_workers: (calls.append(len(frames)),
                                                  frames)[1]),
             _publish_reintegrated_display=lambda *a, **k: None,
+            _prepare_reintegrate_shadow=lambda: None,
+            _write_reintegrate_shadow_batch=lambda *a, **k: None,
+            _finalize_reintegrate_shadow=lambda *a, **k: None,
+            _drop_reintegrate_shadow=lambda: None,
         )
         host._reintegrate_all = MethodType(
             integratorThread._reintegrate_all, host)
@@ -4379,6 +4383,10 @@ def test_reintegrate_skips_vanished_frame_without_crashing(monkeypatch):
             lambda frames, plan, n_workers: (
                 reduced.extend(f.idx for f in frames), frames)[1]),
         _publish_reintegrated_display=lambda *a, **k: None,
+        _prepare_reintegrate_shadow=lambda: None,
+        _write_reintegrate_shadow_batch=lambda *a, **k: None,
+        _finalize_reintegrate_shadow=lambda *a, **k: None,
+        _drop_reintegrate_shadow=lambda: None,
     )
     host._reintegrate_all = MethodType(integratorThread._reintegrate_all, host)
     host._reintegrate_all(do_2d=False)        # must NOT raise
@@ -4388,9 +4396,8 @@ def test_reintegrate_skips_vanished_frame_without_crashing(monkeypatch):
 def test_reintegrate_drops_map_raw_and_2d_slab_for_ram(monkeypatch):
     """D1 RAM: a reintegrate drops each published frame's map_raw (~18 MB) and,
     for a 1D-only pass, the stale 2D slab, so N frames don't pile up
-    un-evictable until the end-of-run save.  The 1D-only save forces skip_2d (so
-    the unchanged 2D group isn't rewritten) and RESTORES it; a post-save sweep
-    evicts the now-persisted frames."""
+    un-evictable until the end of the pass.  Streaming reintegrate now persists
+    each completed batch to a shadow group, then marks those frames evictable."""
     import threading
     from xdart.gui.tabs.static_scan.scan_threads import integratorThread
     import xdart.utils.h5pool as h5pool
@@ -4412,6 +4419,10 @@ def test_reintegrate_drops_map_raw_and_2d_slab_for_ram(monkeypatch):
     scan = SimpleNamespace(
         max_cores=1, frames=_Frames(), scan_lock=threading.RLock(),
         data_file='x.nxs', save_to_nexus=lambda **k: None, skip_2d=False)
+    def _write_shadow(idxs, **_k):
+        scan.frames.mark_persisted(idxs)
+        scan.frames.evict_persisted_beyond_cap()
+
     host = SimpleNamespace(
         data_lock=threading.RLock(), data_1d={}, data_2d={},
         publication_store=None, scan=scan, stop_requested=False,
@@ -4420,6 +4431,10 @@ def test_reintegrate_drops_map_raw_and_2d_slab_for_ram(monkeypatch):
         _plan_for_reintegration=lambda integrate_2d: object(),
         _reduce_reintegration_batch=lambda frames, plan, n_workers: frames,
         _publish_reintegrated_display=lambda *a, **k: None,
+        _prepare_reintegrate_shadow=lambda: None,
+        _write_reintegrate_shadow_batch=_write_shadow,
+        _finalize_reintegrate_shadow=lambda *a, **k: None,
+        _drop_reintegrate_shadow=lambda: None,
     )
     host._reintegrate_all = MethodType(integratorThread._reintegrate_all, host)
     host._reintegrate_all(do_2d=False)
@@ -4427,9 +4442,131 @@ def test_reintegrate_drops_map_raw_and_2d_slab_for_ram(monkeypatch):
     for fr in store.values():
         assert fr.map_raw is None             # raw dropped (dominant pin)
         assert fr.int_2d is None              # 1D-only -> stale 2D slab dropped
-    assert scan.skip_2d is False              # forced True for the save, restored
-    assert persisted == [0, 1, 2]            # marked persisted before eviction
-    assert evicted == [True]                  # post-save eviction sweep ran
+    assert scan.skip_2d is False              # no 1D pass should touch the 2D flag
+    assert persisted == [0, 1, 2]             # each live batch was shadow-persisted
+    assert evicted == [True, True, True]      # per-batch eviction sweep ran
+
+
+def test_reintegrate_streams_batches_then_finalizes_shadow(monkeypatch):
+    """Successful reintegrate writes each batch to a shadow and swaps once."""
+    import threading
+    from types import MethodType, SimpleNamespace
+
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+
+    class _Frames:
+        index = list(range(5))
+        def __init__(self):
+            self._items = {i: SimpleNamespace(idx=i, map_raw=None, int_2d=None)
+                           for i in self.index}
+        def __getitem__(self, i): return self._items[i]
+        def __setitem__(self, i, v): self._items[i] = v
+
+    writes, finalizes, drops = [], [], []
+    scan = SimpleNamespace(
+        max_cores=4, frames=_Frames(), scan_lock=threading.RLock(),
+        data_file='x.nxs', skip_2d=False,
+    )
+    host = SimpleNamespace(
+        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        publication_store=None, scan=scan, stop_requested=False,
+        reintegrate_live=False,
+        update=SimpleNamespace(emit=lambda *a, **k: None),
+        _plan_for_reintegration=lambda integrate_2d: object(),
+        _reduce_reintegration_batch=lambda frames, plan, n_workers: frames,
+        _publish_reintegrated_display=lambda *a, **k: None,
+        _prepare_reintegrate_shadow=lambda: None,
+        _write_reintegrate_shadow_batch=(
+            lambda idxs, **k: writes.append(list(idxs))),
+        _finalize_reintegrate_shadow=lambda **k: finalizes.append(k),
+        _drop_reintegrate_shadow=lambda: drops.append(True),
+    )
+    host._reintegrate_all = MethodType(integratorThread._reintegrate_all, host)
+    host._reintegrate_all(do_2d=False)
+
+    assert writes == [[0, 1, 2, 3, 4]]
+    assert finalizes == [{
+        "do_2d": False,
+        "expected_indices": [0, 1, 2, 3, 4],
+    }]
+    assert drops == []
+
+
+def test_reintegrate_stop_drops_shadow_without_finalize(monkeypatch):
+    """A stopped reintegrate leaves canonical disk untouched by dropping shadow."""
+    import threading
+    from types import MethodType, SimpleNamespace
+
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+
+    class _Frames:
+        index = [0, 1, 2]
+        def __init__(self):
+            self._items = {i: SimpleNamespace(idx=i, map_raw=None, int_2d=None)
+                           for i in self.index}
+        def __getitem__(self, i): return self._items[i]
+        def __setitem__(self, i, v): self._items[i] = v
+
+    writes, finalizes, drops = [], [], []
+
+    def _reduce(frames, plan, n_workers):
+        host.stop_requested = True
+        return frames
+
+    scan = SimpleNamespace(
+        max_cores=1, frames=_Frames(), scan_lock=threading.RLock(),
+        data_file='x.nxs', skip_2d=False,
+    )
+    host = SimpleNamespace(
+        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        publication_store=None, scan=scan, stop_requested=False,
+        reintegrate_live=True,
+        update=SimpleNamespace(emit=lambda *a, **k: None),
+        _plan_for_reintegration=lambda integrate_2d: object(),
+        _reduce_reintegration_batch=_reduce,
+        _publish_reintegrated_display=lambda *a, **k: None,
+        _prepare_reintegrate_shadow=lambda: None,
+        _write_reintegrate_shadow_batch=(
+            lambda idxs, **k: writes.append(list(idxs))),
+        _finalize_reintegrate_shadow=lambda **k: finalizes.append(k),
+        _drop_reintegrate_shadow=lambda: drops.append(True),
+    )
+    host._reintegrate_all = MethodType(integratorThread._reintegrate_all, host)
+    host._reintegrate_all(do_2d=False)
+
+    assert writes == [[0]]
+    assert finalizes == []
+    assert drops == [True]
+
+
+def test_reintegrate_run_finally_drops_active_shadow_on_unexpected_error():
+    """Unexpected reintegrate failures still remove staged shadow groups."""
+    import threading
+
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+
+    events = []
+
+    def _boom():
+        raise RuntimeError("late reintegrate failure")
+
+    def _drop():
+        events.append("drop")
+        host._reintegrate_shadow_active = False
+
+    host = SimpleNamespace(
+        lock=threading.RLock(),
+        method="_boom",
+        _boom=_boom,
+        _reintegrate_shadow_active=True,
+        _drop_reintegrate_shadow=_drop,
+        _close_reduction_session=lambda: events.append("close"),
+    )
+
+    with pytest.raises(RuntimeError):
+        integratorThread.run(host)
+
+    assert events == ["drop", "close"]
 
 
 def test_reintegrate_each_button_is_single_dimension():

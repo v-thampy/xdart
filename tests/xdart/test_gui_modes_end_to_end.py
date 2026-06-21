@@ -2517,9 +2517,11 @@ def test_reintegrate_live_default_and_stop_wiring(widget, monkeypatch):
     assert it.integrator_thread.stop_requested is False
     assert wrangler_stops == [1]
 
-    # Reintegrate running → Stop aborts the reintegrate and does NOT also trip
-    # the wrangler (no idle-stop side effects).
+    # Reintegrate running → Stop asks before discarding the staged shadow write.
+    # If confirmed, it aborts the reintegrate and does NOT also trip the
+    # wrangler (no idle-stop side effects).
     monkeypatch.setattr(it.integrator_thread, 'isRunning', lambda: True)
+    monkeypatch.setattr(w, '_confirm_discard_reintegrate', lambda: True)
     w._on_stop_clicked()
     assert it.integrator_thread.stop_requested is True
     assert wrangler_stops == [1]
@@ -2539,9 +2541,9 @@ def test_reintegrate_live_default_and_stop_wiring(widget, monkeypatch):
     w.integrator_thread_update(7)
     assert w._pending_reint_idx == 7
 
-    # Stop on a SHAPE-CHANGING reintegrate (partial can't be saved) warns first:
-    # "let it finish" cancels the stop; "stop & discard" proceeds.
-    it.integrator_thread.reintegrate_partial_savable = False
+    # Streaming reintegrate only swaps the shadow stack into place when the full
+    # requested pass finishes. Stop therefore always warns first: "let it
+    # finish" cancels the stop; "stop & discard" proceeds.
     it.integrator_thread.stop_requested = False
     monkeypatch.setattr(w, '_confirm_discard_reintegrate', lambda: False)
     w._on_stop_clicked()
@@ -2549,13 +2551,6 @@ def test_reintegrate_live_default_and_stop_wiring(widget, monkeypatch):
     monkeypatch.setattr(w, '_confirm_discard_reintegrate', lambda: True)
     w._on_stop_clicked()
     assert it.integrator_thread.stop_requested is True         # discarded
-    # A shape-COMPATIBLE reintegrate stops with no prompt (partial saves fine).
-    it.integrator_thread.reintegrate_partial_savable = True
-    it.integrator_thread.stop_requested = False
-    monkeypatch.setattr(w, '_confirm_discard_reintegrate',
-                        lambda: pytest.fail("should not prompt when savable"))
-    w._on_stop_clicked()
-    assert it.integrator_thread.stop_requested is True
 
 
 def test_threshold_autoenables_on_value_entry(widget):
