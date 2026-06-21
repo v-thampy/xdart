@@ -84,6 +84,12 @@ def integrate_1d(*args: Any, **kwargs: Any) -> IntegrationResult1D:
     return _impl(*args, **kwargs)
 
 
+def integrate_radial(*args: Any, **kwargs: Any) -> IntegrationResult1D:
+    from xrd_tools.integrate.single import integrate_radial as _impl
+
+    return _impl(*args, **kwargs)
+
+
 def integrate_2d(*args: Any, **kwargs: Any) -> IntegrationResult2D:
     from xrd_tools.integrate.single import integrate_2d as _impl
 
@@ -2169,24 +2175,50 @@ def _reduce_frame(
         )
     else:
         ai = integrators.standard()
-        r1d = (
-            integrate_1d(
+        p1 = plan.integration_1d
+        if p1 is not None and str(p1.unit or "").lower() == "chi_deg":
+            # Non-GI azimuthal profile (Mode A): the output axis is chi, while
+            # radial_range is the q band to integrate over.  Mirror
+            # xdart.LiveFrame.integrate_1d's legacy dispatch to
+            # integrate_radial; pyFAI's normal integrate1d would interpret the
+            # q band as a chi output range and persist a garbage sliver.
+            chi_extra = dict(p1.extra)
+            chi_extra.pop("error_model", None)
+            chi_extra.pop("variance", None)
+            if p1.azimuth_range is not None:
+                chi_extra.setdefault("azimuth_range", p1.azimuth_range)
+            r1d = integrate_radial(
                 image,
                 ai,
-                npt=plan.integration_1d.npt,
-                unit=plan.integration_1d.unit,
-                method=plan.integration_1d.method,
+                npt=p1.npt,
+                radial_unit="q_A^-1",
+                method=p1.method,
                 mask=mask,
-                radial_range=plan.integration_1d.radial_range,
-                azimuth_range=plan.integration_1d.azimuth_range,
-                error_model=plan.integration_1d.error_model,
-                polarization_factor=plan.integration_1d.polarization_factor,
+                radial_range=p1.radial_range,
+                polarization_factor=p1.polarization_factor,
                 normalization_factor=_normalization_for(
-                    frame, plan.integration_1d, warned_monitor_keys),
-                **plan.integration_1d.extra,
+                    frame, p1, warned_monitor_keys),
+                **chi_extra,
             )
-            if plan.integration_1d is not None else None
-        )
+        else:
+            r1d = (
+                integrate_1d(
+                    image,
+                    ai,
+                    npt=p1.npt,
+                    unit=p1.unit,
+                    method=p1.method,
+                    mask=mask,
+                    radial_range=p1.radial_range,
+                    azimuth_range=p1.azimuth_range,
+                    error_model=p1.error_model,
+                    polarization_factor=p1.polarization_factor,
+                    normalization_factor=_normalization_for(
+                        frame, p1, warned_monitor_keys),
+                    **p1.extra,
+                )
+                if p1 is not None else None
+            )
         r2d = (
             integrate_2d(
                 image,

@@ -368,6 +368,33 @@ def test_plan_from_live_scan_maps_integration_settings() -> None:
     )
 
 
+def test_plan_from_live_scan_preserves_non_gi_chi_1d_mode() -> None:
+    frame = LiveFrame(idx=0, map_raw=np.ones((2, 2)), poni=_poni())
+    scan = LiveScan(
+        "scan",
+        frames=[frame],
+        skip_2d=True,
+        bai_1d_args={
+            "numpoints": 181,
+            "unit": "chi_deg",
+            "method": "csr",
+            "radial_range": (0.5, 4.0),
+            "azimuth_range": (-90.0, 90.0),
+        },
+    )
+
+    plan = plan_from_live_scan(scan, integrate_2d=False)
+
+    assert plan.integration_1d is not None
+    assert plan.integration_2d is None
+    assert plan.integration_1d.unit == "chi_deg"
+    assert plan.integration_1d.npt == 181
+    assert plan.integration_1d.method == "csr"
+    assert plan.integration_1d.radial_range == (0.5, 4.0)
+    assert plan.integration_1d.azimuth_range == (-90.0, 90.0)
+    assert plan.gi is None
+
+
 def test_plan_from_gi_scan_requires_incident_angle_or_motor() -> None:
     scan = LiveScan(
         "scan",

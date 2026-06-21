@@ -410,6 +410,110 @@ def test_run_reduction_uses_independent_1d_2d_settings(
     np.testing.assert_allclose(result.frames[0].result_2d.azimuthal, [85.0, 95.0])
 
 
+def test_run_reduction_dispatches_non_gi_chi_to_integrate_radial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fail_integrate_1d(*args, **kwargs):
+        raise AssertionError("chi_deg must use integrate_radial, not integrate_1d")
+
+    def fake_integrate_radial(image, ai, **kwargs):
+        calls.append(dict(kwargs))
+        npt = int(kwargs["npt"])
+        return IntegrationResult1D(
+            radial=np.linspace(-180.0, 180.0, npt),
+            intensity=np.arange(npt, dtype=float),
+            sigma=None,
+            unit="chi_deg",
+        )
+
+    monkeypatch.setattr(reduction_core, "integrate_1d", fail_integrate_1d)
+    monkeypatch.setattr(reduction_core, "integrate_radial", fake_integrate_radial)
+
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(
+            npt=9,
+            unit="chi_deg",
+            method="csr",
+            radial_range=(0.5, 4.0),
+            azimuth_range=(-90.0, 90.0),
+            monitor_key="i0",
+            error_model="poisson",
+            polarization_factor=0.99,
+            extra={"variance": "drop-me", "correctSolidAngle": False},
+        ),
+        integration_2d=None,
+    )
+    scan = Scan(
+        "chi",
+        [Frame(0, image=np.ones((4, 4)), metadata={"i0": 2.0})],
+        integrator=object(),
+    )
+
+    result = run_reduction(plan, scan)
+
+    assert result.frames[0].result_1d.unit == "chi_deg"
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["npt"] == 9
+    assert call["radial_unit"] == "q_A^-1"
+    assert call["radial_range"] == (0.5, 4.0)
+    assert call["method"] == "csr"
+    assert call["azimuth_range"] == (-90.0, 90.0)
+    assert call["normalization_factor"] == 2.0
+    assert call["polarization_factor"] == 0.99
+    assert call["correctSolidAngle"] is False
+    assert "error_model" not in call
+    assert "variance" not in call
+
+
+@pytest.mark.slow
+def test_run_reduction_non_gi_chi_matches_integrate_radial(
+    ai_fixture,
+    synthetic_image,
+) -> None:
+    from xrd_tools.integrate.single import integrate_radial
+
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(
+            npt=72,
+            unit="chi_deg",
+            method="csr",
+            radial_range=(0.5, 5.0),
+            extra={"correctSolidAngle": False},
+        ),
+        integration_2d=None,
+    )
+    scan = Scan(
+        "chi",
+        [Frame(0, image=synthetic_image)],
+        integrator=ai_fixture,
+    )
+
+    result = run_reduction(plan, scan)
+    expected = integrate_radial(
+        synthetic_image,
+        ai_fixture,
+        npt=72,
+        radial_unit="q_A^-1",
+        method="csr",
+        radial_range=(0.5, 5.0),
+        correctSolidAngle=False,
+    )
+
+    actual = result.frames[0].result_1d
+    assert actual.unit == "chi_deg"
+    np.testing.assert_allclose(actual.radial, expected.radial, rtol=1e-6, atol=1e-8)
+    np.testing.assert_allclose(
+        actual.intensity,
+        expected.intensity,
+        rtol=1e-6,
+        atol=1e-8,
+        equal_nan=True,
+    )
+
+
 def test_chunked_error_clear_waits_for_running_tail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -736,6 +840,40 @@ def test_nexus_sink_writes_frame_results(
             h5["entry/integrated_1d/intensity"][0],
             [3.0, 4.0],
         )
+
+
+def test_nexus_sink_persists_non_gi_chi_1d_axis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_integrate_radial(image, ai, **kwargs):
+        npt = int(kwargs["npt"])
+        return IntegrationResult1D(
+            radial=np.linspace(-180.0, 180.0, npt),
+            intensity=np.arange(npt, dtype=float),
+            sigma=None,
+            unit="chi_deg",
+        )
+
+    monkeypatch.setattr(reduction_core, "integrate_radial", fake_integrate_radial)
+    out = tmp_path / "chi_scan.nxs"
+    plan = ReductionPlan(
+        integration_1d=Integration1DPlan(npt=5, unit="chi_deg", radial_range=(1.0, 2.0)),
+        integration_2d=None,
+    )
+    scan = Scan(
+        "chi",
+        [Frame(0, image=np.ones((4, 4)))],
+        integrator=object(),
+    )
+
+    run_reduction(plan, scan, NexusSink(out, overwrite=True))
+
+    with h5py.File(out, "r") as h5:
+        g = h5["entry/integrated_1d"]
+        assert g.attrs["axis_kind"] == "azimuthal"
+        assert g["q"].attrs["units"] == "chi_deg"
+        np.testing.assert_allclose(g["q"][()], np.linspace(-180.0, 180.0, 5))
 
 
 def test_nexus_sink_atomic_overwrite_preserves_target_on_failure(

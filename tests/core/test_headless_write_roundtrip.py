@@ -347,6 +347,42 @@ def test_write_integrated_stack_axis_change_same_bincount_rewrites(tmp_path):
     np.testing.assert_allclose(ds["q"].values[-1], 45.0, atol=1e-3)  # axis refreshed
 
 
+def test_write_integrated_stack_marks_and_guards_azimuthal_1d_axis(tmp_path):
+    import h5py
+    import pytest
+    from xrd_tools.io.nexus import write_integrated_stack, write_nexus_frame
+
+    p = tmp_path / "chi_axis.nxs"
+    chi = np.linspace(-180.0, 180.0, N_Q)
+
+    def _chi_result(seed: int) -> IntegrationResult1D:
+        return IntegrationResult1D(
+            radial=chi,
+            intensity=np.full(N_Q, seed, dtype=float),
+            unit="chi_deg",
+        )
+
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        write_integrated_stack(
+            e,
+            frame_indices=[0, 1],
+            results_1d=[_chi_result(0), _chi_result(1)],
+        )
+        g = e["integrated_1d"]
+        assert g.attrs["axis_kind"] == "azimuthal"
+        assert g["q"].attrs["units"] == "chi_deg"
+
+    ds = read_scan(p, groups=("1d",))
+    assert ds["q"].attrs.get("units") == "chi_deg"
+    np.testing.assert_allclose(ds["q"].values, chi, rtol=1e-6)
+
+    with h5py.File(p, "a") as f:
+        f["entry/integrated_1d"].attrs["axis_kind"] = "radial"
+        with pytest.raises(ValueError, match="axis/unit"):
+            write_nexus_frame(f, 2, result_1d=_chi_result(2), compression=None)
+
+
 def test_write_integrated_stack_sigma_stays_row_aligned(tmp_path):
     """P1: once a sigma dataset exists, every appended frame extends it
     (NaN-padded when that frame has no sigma) so intensity never outgrows

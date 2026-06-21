@@ -1076,6 +1076,9 @@ def _append_stacked_1d(
         qd.attrs["units"] = r.unit
         g.create_dataset("frame_index", data=np.asarray([idx], dtype=np.int64),
                          maxshape=(None,), chunks=(64,))
+        axis_kind = _axis_kind_1d(r.unit)
+        if axis_kind != "radial":
+            g.attrs["axis_kind"] = axis_kind
         g.attrs[MONOTONIC_ATTR] = True
         if r.sigma is not None:
             g.create_dataset("sigma", data=np.asarray(r.sigma, dtype=np.float32)[None, :],
@@ -1284,14 +1287,38 @@ def _require_uniform_axes_1d(results_1d) -> None:
     r0 = results_1d[0]
     q0 = np.asarray(r0.radial, np.float32)
     u0 = r0.unit or ""
+    kind0 = _axis_kind_1d(u0)
     for i, r in enumerate(results_1d[1:], start=1):
         q = np.asarray(r.radial, np.float32)
         if q.shape != q0.shape or not np.allclose(q, q0, rtol=1e-5, atol=1e-8) \
-                or (r.unit or "") != u0:
+                or (r.unit or "") != u0 or _axis_kind_1d(r.unit or "") != kind0:
             raise ValueError(
                 f"results_1d[{i}] has a different radial axis/unit than "
                 "results_1d[0]; all frames in a batch must share one q axis."
             )
+
+
+_AZIMUTHAL_1D_UNITS = frozenset({
+    "chi_deg",
+    "chi_rad",
+    "chigi_deg",
+    "chigi_rad",
+})
+
+
+def _axis_kind_1d(unit: str | None) -> str:
+    """Return the logical identity of a stacked 1D axis."""
+    return "azimuthal" if (unit or "").lower() in _AZIMUTHAL_1D_UNITS else "radial"
+
+
+def _axis_kind_from_group_1d(g: h5py.Group) -> str:
+    """Read or infer the stacked 1D axis kind for back-compatible validation."""
+    attr = _v2_decode_str(g.attrs.get("axis_kind", ""))
+    if attr in ("radial", "azimuthal"):
+        return attr
+    (q_name,) = SCHEMA.groups["integrated_1d"].axes
+    unit = _v2_decode_str(g[q_name].attrs.get("units", "")) if q_name in g else ""
+    return _axis_kind_1d(unit)
 
 
 def _require_uniform_axes_2d(results_2d) -> None:
@@ -1328,7 +1355,11 @@ def _axes_match_1d(g, r0) -> bool:
     new_q = np.asarray(r0.radial, np.float32)
     if q.shape != new_q.shape or not np.allclose(q, new_q, rtol=1e-5, atol=1e-8):
         return False
-    return _v2_decode_str(g[q_name].attrs.get("units", "")) == (r0.unit or "")
+    unit = r0.unit or ""
+    return (
+        _v2_decode_str(g[q_name].attrs.get("units", "")) == unit
+        and _axis_kind_from_group_1d(g) == _axis_kind_1d(unit)
+    )
 
 
 def _axes_match_2d(g, r0) -> bool:
@@ -1586,6 +1617,9 @@ def write_integrated_stack(
         qd = _schema_dataset(g, "integrated_1d", "q", r0.radial, ck=ck)
         qd.attrs["units"] = r0.unit            # units_from="radial_unit"
         _schema_dataset(g, "integrated_1d", "frame_index", fis_, ck=ck)
+        axis_kind = _axis_kind_1d(r0.unit)
+        if axis_kind != "radial":
+            g.attrs["axis_kind"] = axis_kind
         g.attrs[MONOTONIC_ATTR] = bool(
             len(fis_) < 2 or np.all(np.diff(fis_) > 0)
         )
