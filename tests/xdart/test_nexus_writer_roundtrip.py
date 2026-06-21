@@ -1132,15 +1132,43 @@ def test_reader_adopts_orphan_reint_shadow(tmp_path):
     path = tmp_path / "orphan.nxs"
     save_scan_to_nexus(scan, path, entry="entry", finalize=False)
     shadow_1d = reintegrate_shadow_group_name(INTEGRATED_1D_GROUP)
-    # Simulate the crash window: canonical deleted, shadow in place but not moved.
+    # Simulate the crash window: canonical deleted, COMPLETE-marked shadow in
+    # place but not yet moved (finalize stamps the marker before the swap).
     with h5py.File(path, "a") as f:
         f.move("entry/integrated_1d", f"entry/{shadow_1d}")
+        f[f"entry/{shadow_1d}"].attrs["reintegrate_shadow_complete"] = True
         assert "entry/integrated_1d" not in f
 
     out = get_1d(path)                       # must not raise
     assert out.intensity.shape[0] == 3
     fv = read_frame_view(str(path), 0)       # must not silently lose 1D
     assert fv.has_1d and fv.intensity_1d is not None
+
+
+def test_reader_ignores_incomplete_orphan_shadow(tmp_path):
+    """D1 hardening: a partial shadow left by a crash MID-WRITE (canonical never
+    existed -- e.g. a 2D reintegrate on a 1D-only scan) is NOT marked complete,
+    so the reader must NOT present its truncated rows as the result -- it raises
+    like a genuinely-absent group rather than silently returning partial data."""
+    import h5py
+    import pytest
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_2D_GROUP, reintegrate_shadow_group_name, save_scan_to_nexus,
+    )
+    from xrd_tools.io.read import get_2d
+
+    frames = [_DuckArch(idx=i) for i in range(3)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "partial_orphan.nxs"
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+    shadow_2d = reintegrate_shadow_group_name(INTEGRATED_2D_GROUP)
+    # Canonical 2D absent + a partial, UNMARKED 2D shadow (mid-write crash).
+    with h5py.File(path, "a") as f:
+        f.move("entry/integrated_2d", f"entry/{shadow_2d}")
+        # truncate the shadow to look partial; crucially, NO complete marker
+        assert "entry/integrated_2d" not in f
+    with pytest.raises(KeyError):
+        get_2d(path)                          # never silently returns partial
 
 
 def test_shadow_cleanup_recovers_or_removes_stale_groups(tmp_path):
@@ -1174,7 +1202,8 @@ def test_shadow_cleanup_recovers_or_removes_stale_groups(tmp_path):
         assert f"entry/{shadow_1d}" not in f
         assert "entry/integrated_1d" in f
 
-    # Final missing, shadow present -> adopt shadow.
+    # Final missing + COMPLETE-marked shadow (crash mid-swap, after finalize
+    # validated coverage) -> adopt shadow.
     save_scan_to_nexus(
         scan, path, entry="entry", finalize=False,
         replace_frame_indices=[0, 1],
@@ -1185,9 +1214,27 @@ def test_shadow_cleanup_recovers_or_removes_stale_groups(tmp_path):
     )
     with h5py.File(path, "r+") as f:
         del f["entry/integrated_1d"]
+        f[f"entry/{shadow_1d}"].attrs["reintegrate_shadow_complete"] = True
         cleanup_reintegrate_shadow_groups(f, entry="entry")
         assert "entry/integrated_1d" in f
         assert f"entry/{shadow_1d}" not in f
+
+    # Final missing + INCOMPLETE shadow (crash mid-write, canonical never
+    # existed) -> DROP the partial shadow, do NOT promote it to canonical.
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
+        replace_frame_indices=[0, 1],
+        write_integrated_2d=False,
+        integrated_1d_group_name=shadow_1d,
+        write_reduction=False,
+        recover_shadow_groups=False,
+    )
+    with h5py.File(path, "r+") as f:
+        del f["entry/integrated_1d"]                       # canonical absent
+        # (no complete marker -> partial)
+        cleanup_reintegrate_shadow_groups(f, entry="entry")
+        assert "entry/integrated_1d" not in f              # NOT promoted
+        assert f"entry/{shadow_1d}" not in f               # partial dropped
 
 
 def test_reload_only_flag_round_trips(tmp_path):

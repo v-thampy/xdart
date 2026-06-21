@@ -90,6 +90,14 @@ INTEGRATED_2D_GROUP = "integrated_2d"
 # NEW process's PID differs from the stale marker, so the shadow falls back to
 # the normal orphan rule (adopt if canonical is gone, else drop).
 REINTEGRATE_SHADOW_ACTIVE_ATTR = "reintegrate_shadow_active"
+# Attr stamped on a shadow ONLY once its coverage is validated, immediately
+# before the swap deletes the canonical group.  An orphan shadow (canonical
+# absent) is adopted as the authoritative result -- by both the reader
+# (xrd_tools.io.schema.resolve_integrated_group) and cleanup below -- ONLY when
+# it carries this marker.  A shadow from a crash MID-WRITE (still streaming,
+# never validated; e.g. a 2D reintegrate on a 1D-only scan) is partial and is
+# dropped, never promoted.  Must match xrd_tools.io.schema.
+REINTEGRATE_SHADOW_COMPLETE_ATTR = "reintegrate_shadow_complete"
 
 
 def reintegrate_shadow_group_name(group_name: str) -> str:
@@ -138,11 +146,24 @@ def cleanup_reintegrate_shadow_groups(h5f, *, entry: str = "entry",
                 and _shadow_active_pid(h5f, shadow_path) == spare_active_pid):
             continue
         if not final_exists:
-            h5f.move(shadow_path, final_path)
-            logger.warning(
-                "Recovered interrupted reintegration shadow %s -> %s",
-                shadow_path, final_path,
-            )
+            # Adopt an orphan ONLY if it was marked complete (crash mid-swap).
+            # An unmarked orphan is a partial crash-mid-write shadow -- drop it
+            # rather than promote a truncated result to canonical.
+            if h5f[shadow_path].attrs.get(REINTEGRATE_SHADOW_COMPLETE_ATTR):
+                h5f[shadow_path].attrs.pop(REINTEGRATE_SHADOW_COMPLETE_ATTR, None)
+                h5f[shadow_path].attrs.pop(REINTEGRATE_SHADOW_ACTIVE_ATTR, None)
+                h5f.move(shadow_path, final_path)
+                logger.warning(
+                    "Recovered completed reintegration shadow %s -> %s",
+                    shadow_path, final_path,
+                )
+            else:
+                del h5f[shadow_path]
+                logger.warning(
+                    "Dropped incomplete reintegration shadow %s (crash "
+                    "mid-write; %s is absent and not recoverable from it).",
+                    shadow_path, final_path,
+                )
         else:
             del h5f[shadow_path]
 
@@ -158,12 +179,22 @@ def _swap_integrated_group(h5f, *, entry: str, group_name: str) -> None:
     shadow_path = _shadow_group_path(entry, group_name)
     if shadow_path not in h5f:
         raise ValueError(f"missing reintegration shadow group: {shadow_path}")
-    # Drop the active marker before the move so the published canonical group
-    # doesn't carry the streaming-shadow attr.
+    # Drop the streaming-shadow markers before the move so the published
+    # canonical group doesn't carry them.
     h5f[shadow_path].attrs.pop(REINTEGRATE_SHADOW_ACTIVE_ATTR, None)
+    h5f[shadow_path].attrs.pop(REINTEGRATE_SHADOW_COMPLETE_ATTR, None)
     if final_path in h5f:
         del h5f[final_path]
     h5f.move(shadow_path, final_path)
+
+
+def _mark_reintegrate_shadow_complete(h5f, *, entry: str, group_name: str) -> None:
+    """Stamp the completeness marker on a shadow whose full coverage was just
+    validated -- so a crash between here and the swap leaves an orphan that the
+    reader/cleanup can safely adopt as the authoritative result."""
+    shadow_path = _shadow_group_path(entry, group_name)
+    if shadow_path in h5f:
+        h5f[shadow_path].attrs[REINTEGRATE_SHADOW_COMPLETE_ATTR] = True
 
 
 def mark_reintegrate_shadow_active(h5f, *, entry: str, pid: int) -> None:
@@ -274,9 +305,17 @@ def finalize_reintegrated_groups(scan: "LiveScan", path: Union[str, "Path"], *,
         # old-rows (an uncommitted run); a crash mid-swap adopts the shadow ->
         # new-rows + already-new-params.  No window yields new-rows+stale-params.
         _write_reduction(h5f, scan, entry=entry)
+        # Coverage is validated above, so mark the shadow COMPLETE before the
+        # destructive swap: a crash between here and the move leaves an orphan
+        # the reader/cleanup can safely adopt (vs a partial mid-write shadow,
+        # which is never marked and is dropped).
         if swap_1d:
+            _mark_reintegrate_shadow_complete(
+                h5f, entry=entry, group_name=INTEGRATED_1D_GROUP)
             _swap_integrated_group(h5f, entry=entry, group_name=INTEGRATED_1D_GROUP)
         if swap_2d:
+            _mark_reintegrate_shadow_complete(
+                h5f, entry=entry, group_name=INTEGRATED_2D_GROUP)
             _swap_integrated_group(h5f, entry=entry, group_name=INTEGRATED_2D_GROUP)
     from xdart.modules.ewald.frame_series import clear_frame_position_cache
     clear_frame_position_cache(os.fspath(path))

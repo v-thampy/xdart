@@ -53,6 +53,7 @@ __all__ = [
     "ProcessedScanSchema",
     "SCHEMA",
     "REINTEGRATE_SHADOW_SUFFIX",
+    "REINTEGRATE_SHADOW_COMPLETE_ATTR",
     "resolve_integrated_group",
 ]
 
@@ -62,6 +63,13 @@ __all__ = [
 #: the atomic swap (writer side: xdart.modules.ewald.nexus_writer).  Shared here
 #: so the headless readers can recover an orphan left by a crash mid-swap.
 REINTEGRATE_SHADOW_SUFFIX = "__reint"
+#: attr the writer stamps on a shadow ONLY once its coverage is validated, right
+#: before the swap deletes the canonical group.  An orphan shadow is adopted as
+#: the authoritative result ONLY when it carries this marker -- a shadow left by
+#: a crash MID-WRITE (still streaming, never validated; e.g. a 2D reintegrate on
+#: a 1D-only scan whose canonical 2D never existed) is partial and must NOT be
+#: presented as complete.
+REINTEGRATE_SHADOW_COMPLETE_ATTR = "reintegrate_shadow_complete"
 
 
 def resolve_integrated_group(entry_grp, group_name: str):
@@ -69,23 +77,33 @@ def resolve_integrated_group(entry_grp, group_name: str):
 
     Returns ``(group, adopted)``: the canonical ``group_name`` group when
     present; else, when only its ``<group_name>__reint`` orphan shadow survives
-    (a crash precisely between the swap's delete-canonical and move-shadow), the
-    shadow is adopted READ-ONLY (the file is not mutated) so consumers "open
-    sanely" on the complete result; else ``(None, False)``.  A writer pass
-    (next save / reintegrate) repairs the orphan in place via
+    AND that shadow was marked COMPLETE by the writer (a crash precisely between
+    the swap's delete-canonical and move-shadow), the shadow is adopted
+    READ-ONLY (the file is not mutated) so consumers "open sanely" on the
+    complete result.  An UNMARKED orphan (a reintegrate crashed mid-write -- its
+    rows are partial) is ignored, never presented as the result; else
+    ``(None, False)``.  A writer pass repairs/clears the orphan via
     ``cleanup_reintegrate_shadow_groups``.
     """
     g = entry_grp.get(group_name)
     if g is not None:
         return g, False
     shadow = entry_grp.get(f"{group_name}{REINTEGRATE_SHADOW_SUFFIX}")
-    if shadow is not None:
+    if shadow is None:
+        return None, False
+    if shadow.attrs.get(REINTEGRATE_SHADOW_COMPLETE_ATTR):
         logger.warning(
-            "Adopting orphan reintegration shadow %s%s as %s (read-only; the "
-            "file appears crashed mid-swap -- run a writer pass to repair).",
-            group_name, REINTEGRATE_SHADOW_SUFFIX, group_name,
+            "Adopting completed orphan reintegration shadow %s%s as %s "
+            "(read-only; the file crashed mid-swap -- run a writer pass to "
+            "repair).", group_name, REINTEGRATE_SHADOW_SUFFIX, group_name,
         )
         return shadow, True
+    logger.warning(
+        "Ignoring incomplete orphan reintegration shadow %s%s: a reintegrate "
+        "crashed mid-write, so its rows are partial and are NOT presented as "
+        "%s (which is absent on disk).",
+        group_name, REINTEGRATE_SHADOW_SUFFIX, group_name,
+    )
     return None, False
 
 
