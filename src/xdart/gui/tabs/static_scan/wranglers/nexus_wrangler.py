@@ -40,18 +40,19 @@ params = [
     # -> absolute paths (back-compat).  Mirrors the image wrangler (the fuller
     # progressive-disclosure UX is image-wrangler only; here it's the portable
     # field + wiring).
-    {'name': 'Project', 'title': 'Project Folder', 'type': 'group', 'children': [
+    # Direction-A Stage 3: card-header band titles (display only; `name`s stay).
+    {'name': 'Project', 'title': 'PROJECT', 'type': 'group', 'children': [
         # str_browse: path + inline Browse (group header already says the name).
         {'name': 'project_folder', 'title': '', 'type': 'str_browse', 'value': ''},
     ], 'expanded': True},
-    {'name': 'Calibration', 'type': 'group', 'children': [
+    {'name': 'Calibration', 'title': 'CALIBRATION', 'type': 'group', 'children': [
         {'name': 'poni_file', 'title': '', 'type': 'str_browse', 'value': ''},
     ], 'expanded': True},
-    {'name': 'NeXus File', 'type': 'group', 'children': [
+    {'name': 'NeXus File', 'title': 'DATA', 'type': 'group', 'children': [
         {'name': 'nexus_file', 'title': 'File         ', 'type': 'str_browse', 'value': ''},
         {'name': 'entry', 'title': 'Entry', 'type': 'str', 'value': 'entry'},
     ], 'expanded': True},
-    {'name': 'Signal', 'type': 'group', 'children': [
+    {'name': 'Signal', 'title': 'MASK', 'type': 'group', 'children': [
         {'name': 'mask_file', 'title': 'Mask File    ', 'type': 'str_browse', 'value': ''},
     ], 'expanded': False},
     # R3-B: detector-saturation masking opt-out for NeXus sources too.  Same
@@ -90,7 +91,7 @@ params = [
          'values': ['qip_qoop', 'q_chi', 'exit_angles'],
          'value': 'qip_qoop', 'visible': False},
     ], 'expanded': False, 'visible': False},  # hidden carrier: GI owned by the integrator panel
-    {'name': 'Output', 'type': 'group', 'children': [
+    {'name': 'Output', 'title': 'OUTPUT', 'type': 'group', 'children': [
         {'name': 'h5_dir', 'title': 'Output Dir   ', 'type': 'str_browse', 'value': ''},
     ], 'expanded': False},
 ]
@@ -206,13 +207,20 @@ class nexusWrangler(wranglerWidget):
 
         # Parameter tree
         self.tree = ParameterTree()
+        # Stage 3a: object-named so the global QSS themes it (card bands + field
+        # tint) and live-switches — parity with the image wrangler.
+        self.tree.setObjectName('WranglerTree')
         self.parameters = Parameter.create(
             name='nexus_wrangler', type='group', children=params
         )
         self.tree.setParameters(self.parameters, showTop=False)
         header = self.tree.header()
         header.setStretchLastSection(True)
-        header.resizeSection(0, 79)
+        # Stage 3a: consistent, non-clipping name column.  ParameterTree defaults
+        # column 0 to ResizeToContents (ignores resizeSection); force Interactive
+        # so the fixed 120 applies (parity with the image wrangler).
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(0, 120)
         header.setMinimumSectionSize(40)
         # Hide the "Parameter / Value" header bar (parity with the image
         # wrangler) — visual noise above the tree.
@@ -221,27 +229,11 @@ class nexusWrangler(wranglerWidget):
         # sit close under the top-level rows and nearer the left edge, giving
         # the value boxes more room.  Chevrons need the column so it stays > 0.
         self.tree.setIndentation(3)
-        # Match the image wrangler's tree styling so the group headers (and
-        # their expand/collapse arrows) are legible against the Dracula theme
-        # -- the nexus tree previously had no styling at all (UI-4).  Uniform
-        # dark rows (no stripe), lighter input boxes; group headers keep their
-        # band.  Scoped to this tree (left scans list keeps its striping).
+        # Stage 3a: group-header band + field tint now come from the global QSS
+        # (QTreeView#WranglerTree in themes/dark.py) via the object name set
+        # above, so the nexus tree themes in both Dark AND Light and live-
+        # switches — the old widget-local Dracula stylesheet broke under Light.
         self.tree.setAlternatingRowColors(False)
-        self.tree.setStyleSheet("""
-        QTreeView { alternate-background-color: #21222c; }
-        QTreeView::item:has-children {
-            background-color: #52566d;
-            color: #f8f8f2;
-        }
-        QTreeView::item:has-children:disabled {
-            background-color: #46495c;
-            color: #6272a4;
-        }
-        QLineEdit, QComboBox, QAbstractSpinBox {
-            background-color: #3f4354;
-            color: #f8f8f2;
-        }
-            """)
         layout.addWidget(self.tree)
 
         # Connect parameter browse buttons

@@ -48,16 +48,20 @@ params = [
     # paths (back-compat).  (The full progressive-disclosure / folder-change
     # reset UX is a follow-up; the portable storage is active once a folder is
     # set.)
-    {'name': 'Project', 'title': 'Project Folder', 'type': 'group', 'children': [
+    # Direction-A Stage 3: group `title`s are the card-header band text
+    # (uppercase per spec).  Only the display `title` changes — every group
+    # `name` (Project/Calibration/Signal/BG) stays put, so .child() paths,
+    # session save/load, and the disclosure/toggle logic are untouched.
+    {'name': 'Project', 'title': 'PROJECT', 'type': 'group', 'children': [
         # str_browse: path field + inline Browse (the group header already says
-        # "Project Folder", so the child label is dropped).
+        # "PROJECT", so the child label is dropped).
         {'name': 'project_folder', 'title': '', 'type': 'str_browse', 'value': ''},
     ], 'expanded': True},
-    {'name': 'Calibration', 'type': 'group', 'children': [
+    {'name': 'Calibration', 'title': 'CALIBRATION', 'type': 'group', 'children': [
         {'name': 'poni_file', 'title': '', 'type': 'str_browse', 'value': def_poni_file},
     ], 'expanded': True},
-    {'name': 'Signal', 'type': 'group', 'children': [
-        {'name': 'inp_type', 'title': '', 'type': 'list',
+    {'name': 'Signal', 'title': 'DATA', 'type': 'group', 'children': [
+        {'name': 'inp_type', 'title': 'Source', 'type': 'list',
          'values': ['Image Series', 'Image Directory', 'Single Image'], 'value': 'Image Series'},
         {'name': 'File', 'title': 'Image File   ', 'type': 'str_browse', 'value': def_img_file},
         {'name': 'img_dir', 'title': 'Directory', 'type': 'str_browse', 'value': '', 'visible': False},
@@ -125,7 +129,7 @@ params = [
         {'name': 'mask_sentinel', 'type': 'bool', 'value': True,
          'visible': False},
     ], 'expanded': False, 'visible': False},
-    {'name': 'BG', 'title': 'Background', 'type': 'group', 'children': [
+    {'name': 'BG', 'title': 'BACKGROUND', 'type': 'group', 'children': [
         {'name': 'bg_type', 'title': '', 'type': 'list',
          'values': ['None', 'Single BG File', 'Series Average', 'BG Directory'], 'value': 'None'},
         {'name': 'File', 'title': 'BG File', 'type': 'str_browse', 'value': '', 'visible': False},
@@ -235,6 +239,11 @@ class imageWrangler(wranglerWidget):
 
         # Setup parameter tree
         self.tree = ParameterTree()
+        # Stage 3a: object-named so the global QSS themes it (card-band group
+        # headers + field tint) and live-switches Dark/Light, replacing the old
+        # widget-local Dracula stylesheet (see stylize_ParameterTree + the
+        # QTreeView#WranglerTree rules in themes/dark.py).
+        self.tree.setObjectName('WranglerTree')
         # This (and the name-column width below) is the dominant floor on
         # how narrow the right panel drags — the param tree is the widest
         # fixed content.  Keep it small so the panel can shrink.
@@ -247,7 +256,14 @@ class imageWrangler(wranglerWidget):
         # Squeeze parameter tree columns to reduce panel width
         header = self.tree.header()
         header.setStretchLastSection(True)
-        header.resizeSection(0, 79)  # name column (narrower -> wider value boxes)
+        # Stage 3a: wider name column (was nominally 79) so card-row labels like
+        # "Average Scan" / "Write Mode" / "Calibration" never clip, and a
+        # *consistent* label width per the spec.  ParameterTree defaults column 0
+        # to ResizeToContents (which ignored the old resizeSection AND marginally
+        # clipped "Average Scan" at ~98px); switch it to Interactive so the fixed
+        # 120 actually applies.
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(0, 120)
         header.setMinimumSectionSize(40)
         # Shallow indent so the grouped param names (Image File, Meta File, …)
         # sit close under the top-level Save Path row instead of stepping far
@@ -1878,24 +1894,10 @@ class imageWrangler(wranglerWidget):
             self.ui.batchCheckBox.setEnabled(False)
 
     def stylize_ParameterTree(self):
-        # Uniform DARK rows (no light/dark stripe) so the panel reads cleanly;
-        # the group-header rows keep their lighter band (the :has-children rule),
-        # and the input boxes are tinted a touch lighter so the editable fields
-        # stand out against the dark rows.  Scoped to this tree so the left scans
-        # list keeps its own alternating shading.
+        # Uniform rows (no light/dark stripe) so the panel reads cleanly.  The
+        # group-header band + field tint now come from the GLOBAL QSS, scoped by
+        # the tree's object name (QTreeView#WranglerTree in themes/dark.py), so
+        # the wrangler tree themes correctly in both Dark AND Light and recolours
+        # on a live theme switch — the old widget-local Dracula stylesheet broke
+        # under the Light palette (Stage-2 deferral, closed here).
         self.tree.setAlternatingRowColors(False)
-        self.tree.setStyleSheet("""
-        QTreeView { alternate-background-color: #21222c; }
-        QTreeView::item:has-children {
-            background-color: #52566d;
-            color: #f8f8f2;
-        }
-        QTreeView::item:has-children:disabled {
-            background-color: #46495c;
-            color: #6272a4;
-        }
-        QLineEdit, QComboBox, QAbstractSpinBox {
-            background-color: #3f4354;
-            color: #f8f8f2;
-        }
-            """)

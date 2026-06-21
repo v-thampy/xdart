@@ -316,10 +316,19 @@ def test_wrangler_tree_polish(widget):
     w = widget
     tree = w.wrangler.tree
     assert tree.header().minimumSectionSize() == 40
-    assert tree.header().sectionSize(0) <= 79
-    style = tree.styleSheet()
-    assert "#52566d" in style
-    assert "#3f4354" in style
+    # Direction-A Stage 3a: the name column is widened (resizeSection(0, 100), was
+    # 79) so card-row labels like "Average Scan" / "Write Mode" don't clip.  The
+    # *rendered* sectionSize is environment-dependent (clamped to the realized
+    # tree width — tiny offscreen, ~100 in the real 334px panel), so it's not a
+    # reliable headless assertion; the widening is verified by construction.
+    # The wrangler tree is themed via the GLOBAL QSS by object name (replacing
+    # the old inline Dracula stylesheet), so it renders in both Dark and Light
+    # and live-switches.  Assert the QSS hook + that the rules exist, not colours
+    # on the widget-local stylesheet (which is now empty).
+    assert tree.objectName() == "WranglerTree"
+    from xdart.gui.themes import render_qss
+    assert "#WranglerTree" in render_qss("dark")
+    assert "#WranglerTree" in render_qss("light")
     from PySide6 import QtWidgets
     browse_buttons = [
         b for b in tree.findChildren(QtWidgets.QPushButton)

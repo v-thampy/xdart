@@ -40,6 +40,7 @@ DARK = {
     "text_3": "#9aa0b5",
     "text_muted": "#828799",
     "titlebar": "#16171f",
+    "tree_band": "#52566d",
     "win_bg": "#21232e",
 }
 
@@ -71,6 +72,7 @@ LIGHT = {
     "text_3": "#5a6075",
     "text_muted": "#8a90a2",
     "titlebar": "#e9ebf1",
+    "tree_band": "#dfe3ee",
     "win_bg": "#ffffff",
 }
 
@@ -115,6 +117,7 @@ def _resolve(base, *, is_light):
     p["browse_hover"] = _shade(base["browse"], 0.14)
     p["browse_pressed"] = _shade(base["browse"], -0.16)
     p["browse_muted"] = _blend(base["browse"], base["field"], 0.6)
+    p["tree_band_disabled"] = _blend(base["tree_band"], base["panel"], 0.5)
     p["start_border"] = _shade(base["start"], -0.16)
     p["start_hover"] = _shade(base["start"], 0.14)
     p["start_muted"] = _blend(base["start"], base["field"], 0.6)
@@ -400,6 +403,32 @@ QHeaderView::section {
     padding: 4px;
     border: 0 solid $field_border;
     border-bottom: 1px solid $field_border;
+}
+
+/* Wrangler ParameterTree (image + nexus) — Stage 3a card grouping.  The
+   top-level group rows (Project / Calibration / Data / Background / Output …)
+   render as uppercase card-header BANDS; the editable fields pick up the
+   themed field tint.  Object-named (setObjectName('WranglerTree')) so this
+   themes in both Dark AND Light and live-switches, replacing the old
+   widget-local Dracula stylesheet that broke under the Light palette. */
+QTreeView#WranglerTree {
+    background-color: $card;
+    alternate-background-color: $card;
+}
+QTreeView#WranglerTree::item:has-children {
+    background-color: $tree_band;
+    color: $text;
+    font-weight: 700;
+}
+QTreeView#WranglerTree::item:has-children:disabled {
+    background-color: $tree_band_disabled;
+    color: $text_muted;
+}
+QTreeView#WranglerTree QLineEdit,
+QTreeView#WranglerTree QComboBox,
+QTreeView#WranglerTree QAbstractSpinBox {
+    background-color: $field;
+    color: $text;
 }
 
 /* ── Tabs ──────────────────────────────────────────────────────── */
