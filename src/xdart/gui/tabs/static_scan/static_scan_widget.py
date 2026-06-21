@@ -464,7 +464,88 @@ class staticWidget(QWidget):
                                          data_1d=self.data_1d,
                                          publication_store=self.publication_store,
                                          data_lock=self.data_lock)
-        self.ui.metaFrame.setLayout(self.metawidget.layout)
+        # Stage 4 (Direction A): the metadata table is no longer inline in the
+        # bottom-left.  It opens on demand via the "Metadata" button, which
+        # reparents this same metawidget into a popup dialog (see
+        # _open_metadata_dialog).  The widget keeps every ctor reference
+        # (scan/frame/frame_ids/frames/publication_store/data_lock) — they are
+        # shared mutable objects, so it still refreshes from frame selection and
+        # the publication store exactly as before.  The vacated metaFrame now
+        # hosts a Tools placeholder for planned modules.
+        self._metadata_dialog = None
+        self._build_tools_placeholder()
+
+    def _build_tools_placeholder(self):
+        """Fill the vacated bottom-left ``metaFrame`` with a 'Tools' placeholder.
+
+        Reserves the corner freed by moving the metadata table into a popup for
+        planned modules.  Purely cosmetic — the two rows are disabled stubs
+        (no behaviour), easy to populate later."""
+        lay = QtWidgets.QVBoxLayout(self.ui.metaFrame)
+        lay.setContentsMargins(13, 11, 13, 13)
+        lay.setSpacing(8)
+
+        header = QtWidgets.QLabel('TOOLS')
+        header.setObjectName('toolsHeader')
+        lay.addWidget(header)
+
+        card = QtWidgets.QFrame()
+        card.setObjectName('toolsPlaceholder')
+        card_lay = QtWidgets.QVBoxLayout(card)
+        card_lay.setContentsMargins(11, 11, 11, 11)
+        card_lay.setSpacing(8)
+        for name in ('Peak Fitting', 'Plot Metadata'):
+            row = QtWidgets.QWidget()
+            row_lay = QtWidgets.QHBoxLayout(row)
+            row_lay.setContentsMargins(0, 0, 0, 0)
+            row_lay.setSpacing(8)
+            dot = QtWidgets.QFrame()
+            dot.setObjectName('toolDot')
+            dot.setFixedSize(7, 7)
+            label = QtWidgets.QLabel(name)
+            label.setObjectName('toolLabel')
+            chip = QtWidgets.QLabel('PLANNED')
+            chip.setObjectName('toolChip')
+            row_lay.addWidget(dot)
+            row_lay.addWidget(label)
+            row_lay.addStretch(1)
+            row_lay.addWidget(chip)
+            row.setEnabled(False)          # reads as inactive (D2 disabled styling)
+            card_lay.addWidget(row)
+        lay.addWidget(card)
+
+        note = QtWidgets.QLabel(
+            'Space reclaimed from the metadata table — reserved for the fitting '
+            'module and a metadata-vs-frame plot picker.')
+        note.setObjectName('toolsNote')
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        lay.addStretch(1)
+
+    def _open_metadata_dialog(self):
+        """Open (or re-show) the frame-metadata popup.
+
+        Lazy, single-instance, NON-modal: built once on first click by reparenting
+        the live ``self.metawidget`` into a ``QDialog`` so its table becomes
+        visible.  Non-modal keeps the live scan + h5viewer frame selection
+        responsive, and because the widget holds the shared frame_ids /
+        publication store, it refreshes as you browse frames (its ``update()``
+        is gated on ``tableview.isVisible()``, which is now exactly 'dialog
+        open')."""
+        if self._metadata_dialog is None:
+            dlg = QDialog(self)
+            dlg.setObjectName('metadataDialog')
+            dlg.setWindowTitle('Frame metadata')
+            dlg.resize(460, 460)
+            dlg_lay = QtWidgets.QVBoxLayout(dlg)
+            dlg_lay.setContentsMargins(0, 0, 0, 0)
+            dlg_lay.addWidget(self.metawidget)
+            self._metadata_dialog = dlg
+        self._metadata_dialog.show()
+        self._metadata_dialog.raise_()
+        self._metadata_dialog.activateWindow()
+        # The table only renders while visible; refresh now it is shown.
+        self.metawidget.update()
 
     def _connect_signals(self):
         """Wire signal/slot connections for H5Viewer, DisplayFrame, and Integrator."""
@@ -475,6 +556,8 @@ class staticWidget(QWidget):
         self.h5viewer.ui.listData.itemClicked.connect(self.disable_auto_last)
         self.h5viewer.ui.auto_last.clicked.connect(self.enable_auto_last)
         self.h5viewer.ui.auto_last.clicked.connect(self.latest_frame)
+        # Stage 4: open the frame-metadata popup (local open-dialog connection).
+        self.h5viewer.ui.metadata_btn.clicked.connect(self._open_metadata_dialog)
 
         # DisplayFrame signals.  (The "Update 2D" toggle was removed — 2D
         # now always renders.  The File ▸ Export menu actions still drive

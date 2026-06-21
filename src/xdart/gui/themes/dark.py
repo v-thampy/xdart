@@ -454,6 +454,40 @@ QLabel#label1D, QLabel#label2D {
     font-weight: 700;
 }
 
+/* ── Tools placeholder + Metadata popup (Stage 4) ─────────────── */
+/* The inline metadata table moved into the on-demand "Metadata" dialog; the
+   freed bottom-left corner is a dashed Tools card reserving space for planned
+   modules.  All direct #id selectors (metaFrame is not reparented), so the
+   chip's mono face is safe here. */
+QLabel#toolsHeader {
+    color: $text_muted;
+    font-weight: 700;
+}
+QFrame#toolsPlaceholder {
+    background-color: $card;
+    border: 1px dashed $field_border;
+    border-radius: 7px;
+}
+QFrame#toolDot {
+    background-color: $accent;
+    border: none;
+    border-radius: 3px;
+}
+QLabel#toolLabel {
+    color: $text_2;
+    font-weight: 600;
+}
+QLabel#toolChip {
+    background-color: $accent_muted;
+    color: $accent_text;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: "IBM Plex Mono", Menlo, Consolas, monospace;
+}
+QLabel#toolsNote {
+    color: $text_muted;
+}
+
 /* ── Tabs ──────────────────────────────────────────────────────── */
 QTabWidget::pane {
     background-color: $win_bg;

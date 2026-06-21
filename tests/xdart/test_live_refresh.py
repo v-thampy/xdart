@@ -1260,7 +1260,10 @@ def test_metadata_panel_populates_when_layout_reparented():
     assert not mw.isVisible()                    # the widget itself never shows
 
     frame = QtWidgets.QFrame()
-    frame.setLayout(mw.layout)                   # mirror static_scan_widget
+    # Layout-only host: the pre-Stage-4 inline pattern (Stage 4 instead reparents
+    # the metadataWidget into an on-demand popup dialog).  Either way the gate
+    # must key on the tableview, not self.isVisible(), so keep exercising it.
+    frame.setLayout(mw.layout)
     win = QtWidgets.QWidget()
     QtWidgets.QVBoxLayout(win).addWidget(frame)
     win.show()

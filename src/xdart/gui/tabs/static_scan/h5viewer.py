@@ -482,6 +482,13 @@ class H5Viewer(QWidget):
         btn_layout.addWidget(self.ui.refresh)
         btn_layout.addWidget(self.ui.show_all)
         btn_layout.addWidget(self.ui.auto_last)
+        # Stage 4 (Direction A): the frame-metadata table is no longer inline in
+        # the bottom-left — this button opens it as an on-demand popup (wired in
+        # staticWidget._connect_signals -> _open_metadata_dialog).
+        self.ui.metadata_btn = QtWidgets.QPushButton('Metadata ▾')
+        self.ui.metadata_btn.setObjectName('metadata_btn')
+        self.ui.metadata_btn.setMaximumSize(QtCore.QSize(16777215, 25))
+        btn_layout.addWidget(self.ui.metadata_btn)
         self.ui.gridLayout.addWidget(btn_row, 3, 0, 1, 2)
 
     def refresh_directory(self):
