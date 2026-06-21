@@ -870,6 +870,71 @@ def test_finalize_reintegrate_rejects_partial_shadow(tmp_path):
         assert f"entry/{shadow_1d}" in f
 
 
+def test_finalize_reintegrate_accepts_complete_shadow_with_dropped_frame(tmp_path):
+    """Finding 1: a COMPLETE reintegrate whose per-frame publication gate
+    dropped one row (an all-NaN / all-dummy GI 2D cake) must still swap.  The
+    dropped frame is surfaced by the writer and excluded from the shadow's
+    *expected* coverage, so the swap is NOT mistaken for a partial/aborted
+    shadow and rolled back over the prior result.  Counterpart to
+    test_finalize_reintegrate_rejects_partial_shadow (a genuinely short shadow,
+    no drops, still raises)."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_2D_GROUP,
+        finalize_reintegrated_groups,
+        reintegrate_shadow_group_name,
+        save_scan_to_nexus,
+    )
+
+    frames = [_DuckArch(idx=i) for i in range(4)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "shadow_drop.nxs"
+    # Canonical save: all four 2D rows are valid.
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f["entry/integrated_2d/frame_index"][()], [0, 1, 2, 3],
+        )
+
+    # Simulate a reintegrate that turns frame 2's cake all-NaN (e.g. a GI map
+    # at grazing incidence): the publication gate must drop just that row.
+    old = frames[2].int_2d
+    frames[2].int_2d = _DuckResult2D(
+        radial=np.asarray(old.radial),
+        azimuthal=np.asarray(old.azimuthal),
+        intensity=np.full(np.asarray(old.intensity).shape, np.nan, np.float32),
+        unit=old.unit,
+        azimuthal_unit=old.azimuthal_unit,
+    )
+
+    shadow_2d = reintegrate_shadow_group_name(INTEGRATED_2D_GROUP)
+    dropped = save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
+        replace_frame_indices=[0, 1, 2, 3],
+        write_integrated_1d=False,
+        integrated_2d_group_name=shadow_2d,
+        write_reduction=False,
+        recover_shadow_groups=False,
+    )
+    # The writer surfaces the publication-dropped frame to its caller.
+    assert dropped == {f"entry/{shadow_2d}": [2]}
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f[f"entry/{shadow_2d}/frame_index"][()], [0, 1, 3],
+        )
+
+    # Finalize with the drop-subtracted expected set SUCCEEDS — no rollback.
+    finalize_reintegrated_groups(
+        scan, path, entry="entry", swap_2d=True,
+        expected_frame_indices=[0, 1, 3],
+    )
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f["entry/integrated_2d/frame_index"][()], [0, 1, 3],
+        )
+        assert f"entry/{shadow_2d}" not in f
+
+
 def test_shadow_cleanup_recovers_or_removes_stale_groups(tmp_path):
     """Startup cleanup adopts final-missing shadows and drops stale shadows."""
     import h5py

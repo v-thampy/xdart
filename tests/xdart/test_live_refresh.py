@@ -4492,6 +4492,62 @@ def test_reintegrate_streams_batches_then_finalizes_shadow(monkeypatch):
     assert drops == []
 
 
+def test_reintegrate_excludes_publication_dropped_frame_from_finalize(monkeypatch):
+    """A complete reintegrate where the writer publication-dropped one frame
+    swaps successfully, excluding the dropped frame from the shadow's expected
+    coverage (Finding 1).  The shadow is NOT dropped — the prior all-or-nothing
+    rollback over one all-dummy GI 2D row is gone."""
+    import threading
+    from types import MethodType, SimpleNamespace
+
+    from xdart.gui.tabs.static_scan.scan_threads import integratorThread
+
+    class _Frames:
+        index = list(range(5))
+        def __init__(self):
+            self._items = {i: SimpleNamespace(idx=i, map_raw=None, int_2d=None)
+                           for i in self.index}
+        def __getitem__(self, i): return self._items[i]
+        def __setitem__(self, i, v): self._items[i] = v
+
+    writes, finalizes, drops = [], [], []
+
+    def _shadow_write(idxs, **k):
+        writes.append(list(idxs))
+        # The writer's publication gate dropped frame 2 (e.g. an all-dummy GI
+        # 2D row); surface it so the loop subtracts it from `expected`.
+        return {2}
+
+    scan = SimpleNamespace(
+        max_cores=4, frames=_Frames(), scan_lock=threading.RLock(),
+        data_file='x.nxs', skip_2d=False,
+    )
+    host = SimpleNamespace(
+        data_lock=threading.RLock(), data_1d={}, data_2d={},
+        publication_store=None, scan=scan, stop_requested=False,
+        reintegrate_live=False,
+        update=SimpleNamespace(emit=lambda *a, **k: None),
+        _plan_for_reintegration=lambda integrate_2d: object(),
+        _reduce_reintegration_batch=lambda frames, plan, n_workers: frames,
+        _publish_reintegrated_display=lambda *a, **k: None,
+        _prepare_reintegrate_shadow=lambda: None,
+        _write_reintegrate_shadow_batch=_shadow_write,
+        _finalize_reintegrate_shadow=lambda **k: finalizes.append(k),
+        _drop_reintegrate_shadow=lambda: drops.append(True),
+    )
+    host._reintegrate_all = MethodType(integratorThread._reintegrate_all, host)
+    host._reintegrate_all(do_2d=False)
+
+    assert writes == [[0, 1, 2, 3, 4]]
+    # Frame 2 is excluded from the expected coverage handed to finalize, so the
+    # swap succeeds instead of rolling back.
+    assert finalizes == [{
+        "do_2d": False,
+        "expected_indices": [0, 1, 3, 4],
+    }]
+    assert drops == []
+
+
 def test_reintegrate_stop_drops_shadow_without_finalize(monkeypatch):
     """A stopped reintegrate leaves canonical disk untouched by dropping shadow."""
     import threading

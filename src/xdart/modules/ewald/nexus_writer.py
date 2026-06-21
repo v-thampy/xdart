@@ -330,7 +330,7 @@ def save_scan_to_nexus(
     write_reduction: bool = True,
     recover_shadow_groups: bool = True,
     _atomic_write: bool = True,
-) -> None:
+) -> dict[str, list[int]]:
     """Write ``scan``'s state into the file at ``path`` as a v2 NXroot.
 
     Two write modes:
@@ -379,7 +379,7 @@ def save_scan_to_nexus(
             f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}"
         )
         try:
-            save_scan_to_nexus(
+            dropped = save_scan_to_nexus(
                 scan,
                 tmp_path,
                 mode=mode,
@@ -401,7 +401,7 @@ def save_scan_to_nexus(
             except FileNotFoundError:
                 pass
             raise
-        return
+        return dropped
 
     _logger = logging.getLogger(__name__)
     _verbose = _logger.isEnabledFor(logging.DEBUG)
@@ -535,6 +535,21 @@ def save_scan_to_nexus(
     if _verbose:
         _logger.debug("save_scan_to_nexus[close+TOTAL]: %.3fs",
                       time.time() - _t_total)
+
+    # Surface the frames the per-frame publication gate dropped from each
+    # integrated group this write (e.g. an all-dummy GI 2D row).  A streaming
+    # reintegrate uses this so a legitimately-dropped frame does not make the
+    # shadow's coverage look short at swap time (Finding 1): the dropped rows
+    # are excluded from the shadow's *expected* set, never silently re-added.
+    # Other callers ignore the return value.
+    dropped_by_group: dict[str, list[int]] = {}
+    for _prep in (prepared_1d, prepared_2d):
+        if not _prep:
+            continue
+        _di = _prep.get("dropped_indices")
+        if _di:
+            dropped_by_group[_prep["group_path"]] = sorted(int(i) for i in _di)
+    return dropped_by_group
 
 
 # ---------------------------------------------------------------------------

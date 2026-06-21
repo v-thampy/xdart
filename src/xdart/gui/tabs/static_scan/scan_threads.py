@@ -463,16 +463,22 @@ class integratorThread(Qt.QtCore.QThread):
             _get_h5pool().resume(self.scan.data_file)
 
     def _write_reintegrate_shadow_batch(self, frame_indices, *,
-                                        do_2d: bool, label: str) -> None:
+                                        do_2d: bool, label: str) -> set:
         """Persist one reintegrated batch to the shadow stack and evict it.
 
         The canonical integrated group is not touched here.  The frame-series
         mark is used only as the in-session memory-release boundary; the final
         swap is what makes the recomputed rows authoritative on disk.
+
+        Returns the set of frame indices the writer's per-frame publication
+        gate dropped from this batch (e.g. an all-dummy GI 2D row).  The caller
+        subtracts these from the shadow's *expected* coverage at finalize so a
+        legitimately-dropped frame does not abort the whole reintegrate
+        (Finding 1).
         """
         frame_indices = sorted({int(i) for i in frame_indices if int(i) >= 0})
         if not frame_indices:
-            return
+            return set()
 
         from xdart.modules.ewald.nexus_writer import (
             INTEGRATED_1D_GROUP,
@@ -486,9 +492,10 @@ class integratorThread(Qt.QtCore.QThread):
         shadow_2d = reintegrate_shadow_group_name(INTEGRATED_2D_GROUP)
         _get_h5pool().pause(self.scan.data_file)
         try:
+            dropped_map = None
             with self.file_lock:
                 with self.scan.scan_lock:
-                    save_scan_to_nexus(
+                    dropped_map = save_scan_to_nexus(
                         self.scan,
                         self.scan.data_file,
                         mode="a",
@@ -517,6 +524,10 @@ class integratorThread(Qt.QtCore.QThread):
             except Exception:
                 logger.debug("[REINT] post-shadow eviction skipped",
                              exc_info=True)
+            # Only this pass's active dimension is written to a shadow group, so
+            # the union over the returned dict is that dimension's drops.
+            return {int(i) for _vals in (dropped_map or {}).values()
+                    for i in _vals}
         finally:
             _get_h5pool().resume(self.scan.data_file)
 
@@ -708,6 +719,11 @@ class integratorThread(Qt.QtCore.QThread):
         # They are written to shadow groups batch-by-batch; a user Stop drops the
         # shadow groups, leaving the persisted integrated stack unchanged.
         processed_idxs: list[int] = []
+        # Frames the writer's per-frame publication gate legitimately dropped
+        # from the shadow (e.g. an all-dummy GI 2D row).  They are excluded from
+        # the shadow's expected coverage at finalize so one dropped frame does
+        # not abort the whole reintegrate (Finding 1).
+        all_dropped: set[int] = set()
 
         for i in range(0, len(indices), _RE_BATCH):
             if self.stop_requested:
@@ -784,9 +800,10 @@ class integratorThread(Qt.QtCore.QThread):
                 int(getattr(frame, "idx", -1)) for frame in reduced_frames
             ]
             try:
-                self._write_reintegrate_shadow_batch(
+                batch_dropped = self._write_reintegrate_shadow_batch(
                     shadow_batch_idxs, do_2d=do_2d, label=label,
                 )
+                all_dropped.update(batch_dropped or ())
             except Exception:
                 logger.error(
                     "[REINT] %s shadow batch write failed; restoring previous "
@@ -818,15 +835,25 @@ class integratorThread(Qt.QtCore.QThread):
         _stopped = bool(self.stop_requested)
         replace_idxs = sorted({i for i in processed_idxs if i >= 0})
         expected = [int(i) for i in indices]
-        if replace_idxs and not _stopped and set(replace_idxs) == set(expected):
+        # The shadow holds every reduced frame EXCEPT the ones the writer's
+        # publication gate dropped; those legitimately-absent rows must be
+        # subtracted from the coverage the swap expects.  A genuinely short
+        # shadow (stop / per-frame reduce failure / partial write) is NOT in
+        # all_dropped, so finalize still rejects it and the prior result stands.
+        expected_for_finalize = sorted(set(expected) - all_dropped)
+        _complete = (replace_idxs and not _stopped
+                     and set(replace_idxs) == set(expected))
+        if _complete and expected_for_finalize:
             try:
                 self._finalize_reintegrate_shadow(
                     do_2d=do_2d,
-                    expected_indices=expected,
+                    expected_indices=expected_for_finalize,
                 )
                 logger.info(
-                    "[REINT] %s atomically published %s reintegrated frame(s).",
-                    label, len(replace_idxs),
+                    "[REINT] %s atomically published %s reintegrated frame(s)%s.",
+                    label, len(expected_for_finalize),
+                    (" (%s publication-dropped)" % len(all_dropped))
+                    if all_dropped else "",
                 )
             except Exception:
                 logger.error(
@@ -837,7 +864,13 @@ class integratorThread(Qt.QtCore.QThread):
                 raise
         else:
             self._drop_reintegrate_shadow()
-            if replace_idxs:
+            if replace_idxs and not expected_for_finalize:
+                logger.warning(
+                    "[REINT] %s reintegration produced no publishable rows "
+                    "(every frame was publication-dropped); previous persisted "
+                    "result left unchanged.", label,
+                )
+            elif replace_idxs:
                 logger.warning(
                     "[REINT] %s reintegration did not finish all frames "
                     "(done=%s/%s, stopped=%s); previous persisted result left "
