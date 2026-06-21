@@ -76,7 +76,6 @@ class Main(QMainWindow):
         self.setWindowTitle('xdart')
         self.ui.actionOpen.triggered.connect(self.openFile)
         self.ui.actionExit.triggered.connect(self.exit)
-        self._init_theme_menu()
         self.fname = None
 
         # Embed the main widget directly (no tab container).
@@ -91,6 +90,7 @@ class Main(QMainWindow):
             self.main_widget.enable_async_hydration()
         except Exception:
             pass
+        self._init_theme_menu()
 
         # Default size: 90% of the available screen, centered (was a fixed
         # 1600x920, whose width clamped the middle display panels below
@@ -107,24 +107,24 @@ class Main(QMainWindow):
             self.resize(1600, 920)
 
     def _init_theme_menu(self):
-        """Add a Config ▸ Theme (Dark/Light) toggle, persisted in QSettings.
+        """Add a Theme (Dark/Light) submenu to the in-window Config menu.
 
-        Built in code (not the .ui) so the menu exists without regenerating the
-        designer file.  Switching re-applies the QSS live; the pyqtgraph plot
-        canvas background is snapshotted at widget creation, so a full plot
-        recolor still needs a relaunch (noted for a later stage)."""
-        settings = QtCore.QSettings("xdart", "xdart")
-        current = settings.value("theme", "dark")
+        The visible File/Config controls are the H5Viewer toolbar's tool-buttons
+        (``h5viewer.paramMenu``), NOT the QMainWindow menu bar (which on macOS is
+        the native top-of-screen bar).  Add Theme there so it sits next to
+        Save/Load/Advanced where the user expects it.  Persisted in QSettings;
+        switching re-applies the QSS live (the pyqtgraph plot-canvas background
+        is snapshotted at widget creation, so a full plot recolor needs a
+        relaunch -- a later stage owns per-mode plot backgrounds)."""
+        try:
+            config_menu = self.main_widget.h5viewer.paramMenu
+        except Exception:
+            logger.exception("Could not locate the Config menu for the theme toggle")
+            return
+        current = QtCore.QSettings("xdart", "xdart").value("theme", "dark")
         if current not in ("dark", "light"):
             current = "dark"
-        menubar = self.menuBar()
-        config_menu = None
-        for menu in menubar.findChildren(QtWidgets.QMenu):
-            if menu.title().replace("&", "").strip().lower() == "config":
-                config_menu = menu
-                break
-        if config_menu is None:
-            config_menu = menubar.addMenu("Config")
+        config_menu.addSeparator()
         theme_menu = config_menu.addMenu("Theme")
         group = QtGui.QActionGroup(self)
         group.setExclusive(True)
