@@ -54,10 +54,11 @@ logger = logging.getLogger(__name__)
 # Qt imports
 from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
+    QtCore: Any = None
     QtGui: Any = None
     QtWidgets: Any = None
 else:
-    from pyqtgraph.Qt import QtGui, QtWidgets
+    from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 # This module imports
 from xdart.gui.mainWindow import Ui_MainWindow
@@ -75,6 +76,7 @@ class Main(QMainWindow):
         self.setWindowTitle('xdart')
         self.ui.actionOpen.triggered.connect(self.openFile)
         self.ui.actionExit.triggered.connect(self.exit)
+        self._init_theme_menu()
         self.fname = None
 
         # Embed the main widget directly (no tab container).
@@ -103,6 +105,45 @@ class Main(QMainWindow):
                              avail.y() + (avail.height() - h) // 2, w, h)
         except Exception:
             self.resize(1600, 920)
+
+    def _init_theme_menu(self):
+        """Add a Config ▸ Theme (Dark/Light) toggle, persisted in QSettings.
+
+        Built in code (not the .ui) so the menu exists without regenerating the
+        designer file.  Switching re-applies the QSS live; the pyqtgraph plot
+        canvas background is snapshotted at widget creation, so a full plot
+        recolor still needs a relaunch (noted for a later stage)."""
+        settings = QtCore.QSettings("xdart", "xdart")
+        current = settings.value("theme", "dark")
+        if current not in ("dark", "light"):
+            current = "dark"
+        menubar = self.menuBar()
+        config_menu = None
+        for menu in menubar.findChildren(QtWidgets.QMenu):
+            if menu.title().replace("&", "").strip().lower() == "config":
+                config_menu = menu
+                break
+        if config_menu is None:
+            config_menu = menubar.addMenu("Config")
+        theme_menu = config_menu.addMenu("Theme")
+        group = QtGui.QActionGroup(self)
+        group.setExclusive(True)
+        for name, label in (("dark", "Dark"), ("light", "Light")):
+            action = QtGui.QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(name == current)
+            action.triggered.connect(
+                lambda _checked=False, n=name: self._set_theme(n))
+            group.addAction(action)
+            theme_menu.addAction(action)
+
+    def _set_theme(self, name):
+        """Apply theme ``name`` live and persist the choice."""
+        from xdart.gui.themes import apply_theme
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            apply_theme(app, name)
+        QtCore.QSettings("xdart", "xdart").setValue("theme", name)
 
     def exit(self):
         try:
@@ -161,14 +202,17 @@ def _apply_cli_session_args(argv):
 def run():
     argv = _apply_cli_session_args(sys.argv)
     app = QtWidgets.QApplication(argv)
-    # N8: apply dark theme before any widget construction so
+    # N8: apply the saved theme before any widget construction so
     # pyqtgraph plot backgrounds are set in time (pyqtgraph
     # snapshots the config at widget creation).
     try:
-        from xdart.gui.themes import apply_dark_theme
-        apply_dark_theme(app)
+        from xdart.gui.themes import apply_theme
+        theme = QtCore.QSettings("xdart", "xdart").value("theme", "dark")
+        if theme not in ("dark", "light"):
+            theme = "dark"
+        apply_theme(app, theme)
     except Exception:
-        logger.exception("Failed to apply dark theme; using Qt default")
+        logger.exception("Failed to apply theme; using Qt default")
     mw = Main()
     mw.show()
     app.exec()
