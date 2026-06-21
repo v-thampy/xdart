@@ -1046,6 +1046,8 @@ def _append_stacked_1d(
     frame_idx: int | str,
     r: IntegrationResult1D,
     comp_kwargs: dict[str, Any],
+    *,
+    group_name: str = "integrated_1d",
 ) -> None:
     """Append one IntegrationResult1D as a row of the stacked
     ``/{entry}/integrated_1d`` NXdata group.
@@ -1064,11 +1066,10 @@ def _append_stacked_1d(
     n_q = intensity.shape[0]
     idx = int(frame_idx)
 
-    if "integrated_1d" not in entry_grp:
-        g = entry_grp.create_group("integrated_1d")
-        g.attrs["NX_class"] = "NXdata"
-        g.attrs["signal"] = "intensity"
-        g.attrs["axes"] = ["frame_index", "q"]
+    if group_name not in entry_grp:
+        g = _create_group_from_schema(
+            entry_grp, "integrated_1d", disk_name=group_name,
+        )
         g.create_dataset("intensity", data=intensity[None, :],
                          maxshape=(None, n_q), chunks=(1, n_q), **comp_kwargs)
         qd = g.create_dataset("q", data=np.asarray(r.radial, dtype=np.float32))
@@ -1081,11 +1082,11 @@ def _append_stacked_1d(
                              maxshape=(None, n_q), chunks=(1, n_q), **comp_kwargs)
         return
 
-    g = entry_grp["integrated_1d"]
+    g = entry_grp[group_name]
     di = g["intensity"]
     if di.shape[1] != n_q:
         raise ValueError(
-            f"integrated_1d row size {n_q} != on-disk {di.shape[1]}; "
+            f"{group_name} row size {n_q} != on-disk {di.shape[1]}; "
             "all frames in a scan must share the same npt."
         )
     # Per-frame appends can't refresh the shared q axis / units, so a frame
@@ -1095,7 +1096,7 @@ def _append_stacked_1d(
     # reaches here directly, so reject it loudly.
     if not _axes_match_1d(g, r):
         raise ValueError(
-            "integrated_1d radial axis/unit differs from what's on disk; "
+            f"{group_name} radial axis/unit differs from what's on disk; "
             "a frame's q axis must match the rest of the scan (use "
             "write_integrated_stack with all frames to re-axis a reintegration)."
         )
@@ -1198,6 +1199,8 @@ def _append_stacked_2d(
     frame_idx: int | str,
     r: IntegrationResult2D,
     comp_kwargs: dict[str, Any],
+    *,
+    group_name: str = "integrated_2d",
 ) -> None:
     """Append one IntegrationResult2D as a slice of the stacked
     ``/{entry}/integrated_2d`` NXdata group ``(n_frames, n_chi, n_q)``.
@@ -1210,11 +1213,10 @@ def _append_stacked_2d(
     n_chi, n_q = intensity.shape
     idx = int(frame_idx)
 
-    if "integrated_2d" not in entry_grp:
-        g = entry_grp.create_group("integrated_2d")
-        g.attrs["NX_class"] = "NXdata"
-        g.attrs["signal"] = "intensity"
-        g.attrs["axes"] = ["frame_index", "chi", "q"]
+    if group_name not in entry_grp:
+        g = _create_group_from_schema(
+            entry_grp, "integrated_2d", disk_name=group_name,
+        )
         g.attrs["two_d_kind"] = two_d_kind_from_units(r.unit, r.azimuthal_unit).value
         g.create_dataset("intensity", data=intensity[None],
                          maxshape=(None, n_chi, n_q),
@@ -1233,19 +1235,19 @@ def _append_stacked_2d(
                              chunks=(1, n_chi, n_q), **comp_kwargs)
         return
 
-    g = entry_grp["integrated_2d"]
+    g = entry_grp[group_name]
     if "two_d_kind" not in g.attrs:
         g.attrs["two_d_kind"] = two_d_kind_from_units(r.unit, r.azimuthal_unit).value
     di = g["intensity"]
     if di.shape[1:] != (n_chi, n_q):
         raise ValueError(
-            f"integrated_2d slice {(n_chi, n_q)} != on-disk {tuple(di.shape[1:])}; "
+            f"{group_name} slice {(n_chi, n_q)} != on-disk {tuple(di.shape[1:])}; "
             "all frames in a scan must share the same (npt_azim, npt_rad)."
         )
     # Reject a frame whose q/chi axis differs from disk (see _append_stacked_1d).
     if not _axes_match_2d(g, r):
         raise ValueError(
-            "integrated_2d q/chi axis or unit differs from what's on disk; "
+            f"{group_name} q/chi axis or unit differs from what's on disk; "
             "a frame's axes must match the rest of the scan (use "
             "write_integrated_stack with all frames to re-axis a reintegration)."
         )
@@ -1377,6 +1379,8 @@ def validate_integrated_stack_write(
     frame_indices: Sequence[int],
     results_1d: Sequence[IntegrationResult1D] | None = None,
     results_2d: Sequence[IntegrationResult2D] | None = None,
+    group_name_1d: str = "integrated_1d",
+    group_name_2d: str = "integrated_2d",
 ) -> list[int]:
     """Validate a stacked integrated write without mutating ``entry_grp``.
 
@@ -1392,24 +1396,24 @@ def validate_integrated_stack_write(
         if len(results_1d) != len(fis):
             raise ValueError("results_1d length must match frame_indices")
         _require_uniform_axes_1d(results_1d)
-        g = entry_grp.get("integrated_1d")
+        g = entry_grp.get(group_name_1d)
         if g is not None and (
             g["intensity"].shape[1] != np.asarray(results_1d[0].intensity).shape[0]
             or not _axes_match_1d(g, results_1d[0])
         ):
-            _require_batch_covers_existing(g, "integrated_1d", fis)
+            _require_batch_covers_existing(g, group_name_1d, fis)
 
     if results_2d is not None and len(results_2d):
         if len(results_2d) != len(fis):
             raise ValueError("results_2d length must match frame_indices")
         _require_uniform_axes_2d(results_2d)
-        g = entry_grp.get("integrated_2d")
+        g = entry_grp.get(group_name_2d)
         new_2d_shape = np.asarray(results_2d[0].intensity).T.shape
         if g is not None and (
             tuple(g["intensity"].shape[1:]) != new_2d_shape
             or not _axes_match_2d(g, results_2d[0])
         ):
-            _require_batch_covers_existing(g, "integrated_2d", fis)
+            _require_batch_covers_existing(g, group_name_2d, fis)
 
     return fis
 
@@ -1519,6 +1523,8 @@ def write_integrated_stack(
     extra_modes_2d: "Mapping[str, Sequence[IntegrationResult2D]] | None" = None,
     primary_mode_1d: str | None = None,
     primary_mode_2d: str | None = None,
+    group_name_1d: str = "integrated_1d",
+    group_name_2d: str = "integrated_2d",
     compression: str | None = None,
 ) -> None:
     """Write/extend the stacked ``integrated_1d`` / ``integrated_2d`` NXdata
@@ -1558,6 +1564,8 @@ def write_integrated_stack(
         frame_indices=frame_indices,
         results_1d=results_1d,
         results_2d=results_2d,
+        group_name_1d=group_name_1d,
+        group_name_2d=group_name_2d,
     )
     ck = _comp_kwargs(compression)
 
@@ -1632,7 +1640,7 @@ def write_integrated_stack(
         # be silently mislabeled.  Validate the whole batch BEFORE touching
         # the file (checking only results[0] missed later divergent rows).
         _require_uniform_axes_1d(results_1d)
-        g = entry_grp.get("integrated_1d")
+        g = entry_grp.get(group_name_1d)
         # Rebuild trigger: reintegration that changes the npt (row size) OR
         # the radial axis / unit (e.g. q_A^-1 → 2th_deg, or a different
         # radial range at the same bin count).  The per-frame upsert path
@@ -1643,20 +1651,20 @@ def write_integrated_stack(
             g["intensity"].shape[1] != np.asarray(results_1d[0].intensity).shape[0]
             or not _axes_match_1d(g, results_1d[0])
         ):
-            _require_batch_covers_existing(g, "integrated_1d", fis)
-            del entry_grp["integrated_1d"]
+            _require_batch_covers_existing(g, group_name_1d, fis)
+            del entry_grp[group_name_1d]
             g = None
         if g is None:
-            _bulk_create_1d(entry_grp, results_1d, fis)
+            _bulk_create_1d(entry_grp, results_1d, fis, disk_name=group_name_1d)
         else:
             for fi, r in zip(fis, results_1d):
-                _append_stacked_1d(entry_grp, fi, r, ck)
+                _append_stacked_1d(entry_grp, fi, r, ck, group_name=group_name_1d)
 
     if results_2d is not None and len(results_2d):
         if len(results_2d) != len(fis):
             raise ValueError("results_2d length must match frame_indices")
         _require_uniform_axes_2d(results_2d)
-        g = entry_grp.get("integrated_2d")
+        g = entry_grp.get(group_name_2d)
         new_2d_shape = np.asarray(results_2d[0].intensity).T.shape  # (n_chi, n_q)
         # Rebuild on a row-shape change OR a q/chi axis / unit change (see
         # the 1D block) — the upsert path can't refresh the stored axes.
@@ -1664,21 +1672,21 @@ def write_integrated_stack(
             tuple(g["intensity"].shape[1:]) != new_2d_shape
             or not _axes_match_2d(g, results_2d[0])
         ):
-            _require_batch_covers_existing(g, "integrated_2d", fis)
-            del entry_grp["integrated_2d"]
+            _require_batch_covers_existing(g, group_name_2d, fis)
+            del entry_grp[group_name_2d]
             g = None
         if g is None:
-            _bulk_create_2d(entry_grp, results_2d, fis)
+            _bulk_create_2d(entry_grp, results_2d, fis, disk_name=group_name_2d)
         else:
             for fi, r in zip(fis, results_2d):
-                _append_stacked_2d(entry_grp, fi, r, ck)
+                _append_stacked_2d(entry_grp, fi, r, ck, group_name=group_name_2d)
 
     # ── nested per-mode GI subgroups (ADR-0003) ─────────────────────────────
     # Each non-primary mode is its own NXdata child of the top-level group,
     # validated INDEPENDENTLY by the frozen uniform-axes validators (a child's
     # axis grid legitimately differs from the primary's).  First-save only.
     if extra_modes_1d:
-        parent = entry_grp.get("integrated_1d")
+        parent = entry_grp.get(group_name_1d)
         if parent is None:
             raise ValueError(
                 "extra_modes_1d requires results_1d (the primary 1D mode at "
@@ -1711,7 +1719,7 @@ def write_integrated_stack(
             _bulk_create_1d(parent, results, fis, disk_name=sub)
 
     if extra_modes_2d:
-        parent = entry_grp.get("integrated_2d")
+        parent = entry_grp.get(group_name_2d)
         if parent is None:
             raise ValueError(
                 "extra_modes_2d requires results_2d (the primary 2D mode at "
@@ -1745,8 +1753,8 @@ def write_integrated_stack(
 
     # Stamp the per-scan mode attrs LAST, per dimension (no-op for a DEFAULT/
     # unnamed primary ⇒ standard scans stay byte-identical).
-    _stamp_mode_attrs(entry_grp, "integrated_1d", primary_mode_1d, extra_modes_1d)
-    _stamp_mode_attrs(entry_grp, "integrated_2d", primary_mode_2d, extra_modes_2d)
+    _stamp_mode_attrs(entry_grp, group_name_1d, primary_mode_1d, extra_modes_1d)
+    _stamp_mode_attrs(entry_grp, group_name_2d, primary_mode_2d, extra_modes_2d)
 
 
 def write_frame_records(entry_grp: h5py.Group, records, *, compression=None) -> None:

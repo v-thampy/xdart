@@ -732,6 +732,152 @@ def test_replace_with_no_existing_file_degrades_to_append(tmp_path):
         assert f["entry/integrated_1d/intensity"].shape == (3, N_Q)
 
 
+def test_shadow_replace_writes_only_explicit_frames(tmp_path):
+    """Streaming reintegrate shadow chunks must not widen to all missing rows."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_1D_GROUP,
+        reintegrate_shadow_group_name,
+        save_scan_to_nexus,
+    )
+
+    frames = [_DuckArch(idx=i) for i in range(5)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "shadow_explicit.nxs"
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        canonical_before = f["entry/integrated_1d/intensity"][()].copy()
+
+    targets = [1, 3]
+    for idx in targets:
+        frames[idx].int_1d = _DuckResult1D(
+            radial=np.asarray(frames[idx].int_1d.radial),
+            intensity=np.full(N_Q, idx + 10, dtype=np.float32),
+            sigma=frames[idx].int_1d.sigma,
+        )
+
+    shadow_1d = reintegrate_shadow_group_name(INTEGRATED_1D_GROUP)
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
+        replace_frame_indices=targets,
+        write_integrated_2d=False,
+        integrated_1d_group_name=shadow_1d,
+        write_reduction=False,
+        recover_shadow_groups=False,
+    )
+
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            f[f"entry/{shadow_1d}/frame_index"][()], targets,
+        )
+        assert f[f"entry/{shadow_1d}/intensity"].shape == (2, N_Q)
+        assert f["entry/integrated_1d/intensity"].shape == (5, N_Q)
+        np.testing.assert_array_equal(
+            f["entry/integrated_1d/intensity"][()], canonical_before,
+        )
+        assert f"entry/{reintegrate_shadow_group_name('integrated_2d')}" not in f
+
+
+def test_shadow_swap_replaces_only_requested_dimension(tmp_path):
+    """A completed shadow stack can replace 1D while preserving canonical 2D."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_1D_GROUP,
+        reintegrate_shadow_group_name,
+        save_scan_to_nexus,
+        swap_reintegrated_groups,
+    )
+
+    frames = [_DuckArch(idx=i) for i in range(5)]
+    scan = _DuckSphere(frames)
+    path = tmp_path / "shadow_swap.nxs"
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+
+    with h5py.File(path, "r") as f:
+        canonical_2d = f["entry/integrated_2d/intensity"][()].copy()
+
+    shadow_1d = reintegrate_shadow_group_name(INTEGRATED_1D_GROUP)
+    for chunk in ([0, 1], [2, 3, 4]):
+        for idx in chunk:
+            frames[idx].int_1d = _DuckResult1D(
+                radial=np.asarray(frames[idx].int_1d.radial),
+                intensity=np.full(N_Q, idx + 100, dtype=np.float32),
+                sigma=frames[idx].int_1d.sigma,
+            )
+        save_scan_to_nexus(
+            scan, path, entry="entry", finalize=False,
+            replace_frame_indices=chunk,
+            write_integrated_2d=False,
+            integrated_1d_group_name=shadow_1d,
+            write_reduction=False,
+            recover_shadow_groups=False,
+        )
+
+    swap_reintegrated_groups(path, entry="entry", swap_1d=True)
+
+    with h5py.File(path, "r") as f:
+        assert f"entry/{shadow_1d}" not in f
+        np.testing.assert_array_equal(
+            f["entry/integrated_1d/frame_index"][()], [0, 1, 2, 3, 4],
+        )
+        for idx in range(5):
+            np.testing.assert_allclose(
+                f["entry/integrated_1d/intensity"][idx],
+                np.full(N_Q, idx + 100, dtype=np.float32),
+            )
+        np.testing.assert_array_equal(
+            f["entry/integrated_2d/intensity"][()], canonical_2d,
+        )
+
+
+def test_shadow_cleanup_recovers_or_removes_stale_groups(tmp_path):
+    """Startup cleanup adopts final-missing shadows and drops stale shadows."""
+    import h5py
+    from xdart.modules.ewald.nexus_writer import (
+        INTEGRATED_1D_GROUP,
+        cleanup_reintegrate_shadow_groups,
+        reintegrate_shadow_group_name,
+        save_scan_to_nexus,
+    )
+
+    shadow_1d = reintegrate_shadow_group_name(INTEGRATED_1D_GROUP)
+    path = tmp_path / "shadow_cleanup.nxs"
+    frames = [_DuckArch(idx=i) for i in range(2)]
+    scan = _DuckSphere(frames)
+    save_scan_to_nexus(scan, path, entry="entry", finalize=False)
+
+    # Stale shadow while canonical exists -> delete shadow.
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
+        replace_frame_indices=[0, 1],
+        write_integrated_2d=False,
+        integrated_1d_group_name=shadow_1d,
+        write_reduction=False,
+        recover_shadow_groups=False,
+    )
+    with h5py.File(path, "r+") as f:
+        assert f"entry/{shadow_1d}" in f
+        cleanup_reintegrate_shadow_groups(f, entry="entry")
+        assert f"entry/{shadow_1d}" not in f
+        assert "entry/integrated_1d" in f
+
+    # Final missing, shadow present -> adopt shadow.
+    save_scan_to_nexus(
+        scan, path, entry="entry", finalize=False,
+        replace_frame_indices=[0, 1],
+        write_integrated_2d=False,
+        integrated_1d_group_name=shadow_1d,
+        write_reduction=False,
+        recover_shadow_groups=False,
+    )
+    with h5py.File(path, "r+") as f:
+        del f["entry/integrated_1d"]
+        cleanup_reintegrate_shadow_groups(f, entry="entry")
+        assert "entry/integrated_1d" in f
+        assert f"entry/{shadow_1d}" not in f
+
+
 def test_reload_only_flag_round_trips(tmp_path):
     """Frames loaded from disk via _load_frame_v2 should carry
     is_reload_only=True; freshly-integrated frames handed from the

@@ -79,6 +79,89 @@ _resolve_integrated_compression = resolve_stack_compression
 INTEGRATED_STACK_COMPRESSION = _resolve_integrated_compression()
 logger.info("Integrated-stack compression = %r", INTEGRATED_STACK_COMPRESSION)
 
+REINTEGRATE_SHADOW_SUFFIX = "__reint"
+INTEGRATED_1D_GROUP = "integrated_1d"
+INTEGRATED_2D_GROUP = "integrated_2d"
+
+
+def reintegrate_shadow_group_name(group_name: str) -> str:
+    """Return the shadow group name used by streaming reintegration."""
+    return f"{group_name}{REINTEGRATE_SHADOW_SUFFIX}"
+
+
+def _entry_group_path(entry: str, group_name: str) -> str:
+    return f"{entry}/{group_name}"
+
+
+def _shadow_group_path(entry: str, group_name: str) -> str:
+    return _entry_group_path(entry, reintegrate_shadow_group_name(group_name))
+
+
+def cleanup_reintegrate_shadow_groups(h5f, *, entry: str = "entry") -> None:
+    """Remove stale reintegration shadow groups.
+
+    If a previous crash happened after deleting the canonical group but before
+    moving its shadow into place, adopt the shadow.  If the canonical group is
+    present, any leftover shadow is stale and is removed.
+    """
+    for group_name in (INTEGRATED_1D_GROUP, INTEGRATED_2D_GROUP):
+        final_path = _entry_group_path(entry, group_name)
+        shadow_path = _shadow_group_path(entry, group_name)
+        final_exists = final_path in h5f
+        shadow_exists = shadow_path in h5f
+        if shadow_exists and not final_exists:
+            h5f.move(shadow_path, final_path)
+            logger.warning(
+                "Recovered interrupted reintegration shadow %s -> %s",
+                shadow_path, final_path,
+            )
+        elif shadow_exists:
+            del h5f[shadow_path]
+
+
+def _swap_integrated_group(h5f, *, entry: str, group_name: str) -> None:
+    """Atomically publish a shadow integrated group within the HDF5 file.
+
+    HDF5 link updates are atomic within a single open file handle from the
+    reader's perspective: after this returns either the old final group was
+    visible or the new final group is visible, never a partially copied group.
+    """
+    final_path = _entry_group_path(entry, group_name)
+    shadow_path = _shadow_group_path(entry, group_name)
+    if shadow_path not in h5f:
+        raise ValueError(f"missing reintegration shadow group: {shadow_path}")
+    if final_path in h5f:
+        del h5f[final_path]
+    h5f.move(shadow_path, final_path)
+
+
+def drop_reintegrate_shadow_groups(path: Union[str, "Path"], *,
+                                   entry: str = "entry") -> None:
+    """Best-effort cleanup for aborted streaming reintegration."""
+    path = Path(path)
+    if not path.exists():
+        return
+    with _open_with_retry(path, "a") as f:
+        h5f = _h5(f)
+        for group_name in (INTEGRATED_1D_GROUP, INTEGRATED_2D_GROUP):
+            shadow_path = _shadow_group_path(entry, group_name)
+            if shadow_path in h5f:
+                del h5f[shadow_path]
+
+
+def swap_reintegrated_groups(path: Union[str, "Path"], *, entry: str = "entry",
+                             swap_1d: bool = False,
+                             swap_2d: bool = False) -> None:
+    """Publish shadow integrated groups after a completed reintegration."""
+    if not swap_1d and not swap_2d:
+        return
+    with _open_with_retry(Path(path), "a") as f:
+        h5f = _h5(f)
+        if swap_1d:
+            _swap_integrated_group(h5f, entry=entry, group_name=INTEGRATED_1D_GROUP)
+        if swap_2d:
+            _swap_integrated_group(h5f, entry=entry, group_name=INTEGRATED_2D_GROUP)
+
 
 @dataclass
 class NexusWriteCursor:
@@ -189,6 +272,12 @@ def save_scan_to_nexus(
     entry: str = "entry",
     finalize: bool = False,
     replace_frame_indices=None,
+    write_integrated_1d: bool = True,
+    write_integrated_2d: bool = True,
+    integrated_1d_group_name: str = INTEGRATED_1D_GROUP,
+    integrated_2d_group_name: str = INTEGRATED_2D_GROUP,
+    write_reduction: bool = True,
+    recover_shadow_groups: bool = True,
     _atomic_write: bool = True,
 ) -> None:
     """Write ``scan``'s state into the file at ``path`` as a v2 NXroot.
@@ -246,6 +335,12 @@ def save_scan_to_nexus(
                 entry=entry,
                 finalize=finalize,
                 replace_frame_indices=replace_frame_indices,
+                write_integrated_1d=write_integrated_1d,
+                write_integrated_2d=write_integrated_2d,
+                integrated_1d_group_name=integrated_1d_group_name,
+                integrated_2d_group_name=integrated_2d_group_name,
+                write_reduction=write_reduction,
+                recover_shadow_groups=recover_shadow_groups,
                 _atomic_write=False,
             )
             os.replace(tmp_path, path)
@@ -275,21 +370,31 @@ def save_scan_to_nexus(
         _ensure_nxentry(f, entry)
         _t0 = _tick("entry", _t0)
         h5f = _h5(f)
+        if recover_shadow_groups:
+            cleanup_reintegrate_shadow_groups(h5f, entry=entry)
         cursor = _write_cursor(scan, h5f)
 
         # 1. Stacked integrated_1d and integrated_2d (delegated to
         #    xrd_tools.io.nexus.write_integrated_stack).  Select and
         # validate both outputs before either is written so a 2D mismatch
         # cannot leave 1D one frame ahead — or even refresh provenance.
-        prepared_1d = _prepare_integrated_1d(
-            f, scan, entry=entry,
-            replace_frame_indices=replace_frame_indices,
-            cursor=cursor,
+        prepared_1d = (
+            _prepare_integrated_1d(
+                f, scan, entry=entry,
+                group_name=integrated_1d_group_name,
+                replace_frame_indices=replace_frame_indices,
+                cursor=cursor,
+            )
+            if write_integrated_1d else None
         )
-        prepared_2d = _prepare_integrated_2d(
-            f, scan, entry=entry,
-            replace_frame_indices=replace_frame_indices,
-            cursor=cursor,
+        prepared_2d = (
+            _prepare_integrated_2d(
+                f, scan, entry=entry,
+                group_name=integrated_2d_group_name,
+                replace_frame_indices=replace_frame_indices,
+                cursor=cursor,
+            )
+            if write_integrated_2d else None
         )
         prepared_1d, prepared_2d = _filter_prepared_frame_publications(
             prepared_1d, prepared_2d,
@@ -320,7 +425,7 @@ def save_scan_to_nexus(
         _cur = _write_cursor(scan, h5f)
         _diag_pending = bool(_gi_diag) and getattr(
             _cur, "gi_diag_written", None) != _gi_diag
-        if (is_replace or finalize or _diag_pending
+        if write_reduction and (is_replace or finalize or _diag_pending
                 or "reduction" not in h5f.get(entry, {})):
             _write_reduction(h5f, scan, entry=entry)
             if _gi_diag:
@@ -608,6 +713,16 @@ def _select_frames_to_write(scan, h5f, group_path, replace_frame_indices,
             return frames, ids
         return frames, ids
 
+    # Explicit replace into a new target group (streaming reintegration
+    # shadows).  Treat the caller's labels as authoritative; do not fall
+    # through to the normal append selector, which would widen the first
+    # shadow chunk to every frame missing from the new group.
+    if replace_frame_indices is not None:
+        ids = [i for i in replace_frame_indices if i in scan.frames.index]
+        if not ids:
+            return [], []
+        return [scan.frames[i] for i in ids], ids
+
     # ── Append (default; also replace-with-no-existing-group) ────────
     new_frames, existing_n = _new_frames_for_write(scan, h5f, group_path, cursor)
     if existing_n == -1:
@@ -684,10 +799,8 @@ def _disk_axis_signature(h5f, group_path: str):
     group = h5f[group_path]
     if "q" not in group:
         return None
-    if group_path.endswith("integrated_1d"):
-        return (np.asarray(group["q"][()]), _decode_unit(group["q"].attrs.get("units", "")))
     if "chi" not in group:
-        return None
+        return (np.asarray(group["q"][()]), _decode_unit(group["q"].attrs.get("units", "")))
     return (
         np.asarray(group["q"][()]),
         np.asarray(group["chi"][()]),
@@ -718,12 +831,14 @@ def _validate_prepared_integrated(entry_grp, prepared_1d, prepared_2d) -> None:
             entry_grp,
             frame_indices=prepared_1d["indices"],
             results_1d=prepared_1d["results"],
+            group_name_1d=prepared_1d["group_name"],
         )
     if prepared_2d is not None and prepared_2d["results"]:
         validate_integrated_stack_write(
             entry_grp,
             frame_indices=prepared_2d["indices"],
             results_2d=prepared_2d["results"],
+            group_name_2d=prepared_2d["group_name"],
         )
 
 
@@ -843,6 +958,7 @@ def _drop_integrated_rows(h5f, group_path: str, frame_indices) -> None:
 
 
 def _prepare_integrated_1d(f, scan, *, entry: str,
+                           group_name: str = INTEGRATED_1D_GROUP,
                            replace_frame_indices=None,
                            cursor: NexusWriteCursor | None = None):
     """Select the 1D rows that would be written, without mutating disk."""
@@ -850,7 +966,7 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
         return None
 
     h5f = _h5(f)
-    group_path = f"{entry}/integrated_1d"
+    group_path = f"{entry}/{group_name}"
     frames, indices = _select_frames_to_write(
         scan, h5f, group_path, replace_frame_indices, _row_shape_1d,
         _axis_signature_1d, cursor,
@@ -887,6 +1003,7 @@ def _prepare_integrated_1d(f, scan, *, entry: str,
         results = [r for _fr, _i, r in kept]
     return {
         "entry": entry,
+        "group_name": group_name,
         "group_path": group_path,
         "frames": frames,
         "indices": indices,
@@ -906,6 +1023,7 @@ def _commit_integrated_1d(f, prepared) -> None:
         h5f.require_group(prepared["entry"]),
         frame_indices=prepared["indices"],
         results_1d=prepared["results"],
+        group_name_1d=prepared["group_name"],
         compression=INTEGRATED_STACK_COMPRESSION,
     )
     _refresh_group_cursor(
@@ -916,6 +1034,7 @@ def _commit_integrated_1d(f, prepared) -> None:
 
 
 def _prepare_integrated_2d(f, scan, *, entry: str,
+                           group_name: str = INTEGRATED_2D_GROUP,
                            replace_frame_indices=None,
                            cursor: NexusWriteCursor | None = None):
     """Select the 2D rows that would be written, without mutating disk."""
@@ -927,7 +1046,7 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
         return None
 
     h5f = _h5(f)
-    group_path = f"{entry}/integrated_2d"
+    group_path = f"{entry}/{group_name}"
     frames, indices = _select_frames_to_write(
         scan, h5f, group_path, replace_frame_indices, _row_shape_2d,
         _axis_signature_2d, cursor,
@@ -964,6 +1083,7 @@ def _prepare_integrated_2d(f, scan, *, entry: str,
         results = [r for _fr, _i, r in kept]
     return {
         "entry": entry,
+        "group_name": group_name,
         "group_path": group_path,
         "frames": frames,
         "indices": indices,
@@ -983,6 +1103,7 @@ def _commit_integrated_2d(f, prepared) -> None:
         h5f.require_group(prepared["entry"]),
         frame_indices=prepared["indices"],
         results_2d=prepared["results"],
+        group_name_2d=prepared["group_name"],
         compression=INTEGRATED_STACK_COMPRESSION,
     )
     _refresh_group_cursor(
