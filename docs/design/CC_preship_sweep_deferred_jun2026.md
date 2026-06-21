@@ -35,22 +35,23 @@ them) and add `OSError` to the catch.  `frame_index` (a bookkeeping index our ow
 writer emits into `scan_data`) is skipped via `_NON_MOTOR_COLUMNS`.  Fixtures
 (`|S` + vlen-string + `frame_index`) in `tests/core/test_nexus.py`.
 
-**⚠ TWO v1.0-TAG BLOCKERS REMAIN (Round-38, in already-merged `main`, NOT this WIP):**
-1. **D1 Re-Integrate RAM** — Re-Integrate ships VISIBLE (D1 addendum) but the
-   batched `_reintegrate_all` only *mitigates* peak: every recomputed frame is
-   pinned unpersisted until the single end-of-run save (un-evictable, no post-save
-   sweep) and the float64 2D slab loads per frame even for 1D-only → ~10 GB on a
-   651-frame Eiger, OOM at 10k.  Fix before tag: gate/hide Re-Integrate for large
-   scans, OR land skip-2D-slab + a post-save eviction sweep.  (So D1 is
-   MITIGATED, not fully FIXED — the summary's "D1 FIXED" overstates it.)
-2. **Azimuthal Mode A (non-GI χ) broken on the run path** — the headless
-   `integrate_radial` wrapper is correct but never called during a run: the
-   streaming/reintegrate 1D spine has no `chi_deg` branch (only CHI_GI), so it
-   calls `ai.integrate1d(unit='chi_deg', radial_range=<q-band>)` → misreads the
-   q-band as a χ-range → garbage sliver → persisted unguarded into
-   `integrated_1d` with `units="chi_deg"`.  Mode A is selectable.  Fix: add a
-   `chi_deg` dispatch in the non-GI 1D spine → `integrate_radial` (q-band as
-   radial_range), + a writer axis-kind guard.  (Mode B / CHI_GI is correct.)
+**✅ BOTH former v1.0-TAG BLOCKERS ARE FIXED (Round-38 → resolved on
+`fix/reintegrate-publication-drop-coverage`):**
+1. **D1 Re-Integrate RAM — FIXED via shadow-stack streaming reintegrate**
+   (`scan_threads._reintegrate_all` + `nexus_writer` shadow helpers): each batch
+   streams to a `…__reint` shadow group, marks the frames persisted + evicts, so
+   peak memory is bounded to ~cap (no longer the single end-of-run save that
+   pinned all N).  The 1D-only pass drops the stale 2D slab; raw is dropped
+   per frame.  **Two residual perf follow-ups remain** (neither a correctness
+   blocker): (a) per-batch RAW residency is O(raw_window)≈2·workers now (the
+   raw-load window is decoupled from the write batch); (b) an interrupted shadow
+   is recovered by `cleanup_reintegrate_shadow_groups` on the next writer pass
+   and adopted read-only by `schema.resolve_integrated_group` on read.
+2. **Azimuthal Mode A (non-GI χ) — FIXED**: `reduction/core._reduce_frame` now
+   dispatches `unit=='chi_deg'` to `integrate_radial` (q-band as `radial_range`,
+   `radial_unit='q_A^-1'`, `npt`=χ bins, tunable `npt_rad` band sampling) and the
+   writer records/validates the 1D `axis_kind` (declared in schema CAPABILITIES).
+   (Mode B / CHI_GI was already correct.)
 
 ## Deferred (fix during the monorepo design-refinement cycle)
 

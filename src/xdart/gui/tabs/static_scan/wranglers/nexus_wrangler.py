@@ -462,6 +462,30 @@ class nexusWrangler(wranglerWidget):
             self.parameters.child('NeXus File').child('nexus_file').setValue(nexus_file)
             self.nexus_file = nexus_file
             self._save_to_session()
+            self._emit_gi_motor_options()
+
+    def _emit_gi_motor_options(self):
+        """Hand the NeXus file's motor names to the integrator's GI-motor
+        dropdown so a non-standard incidence motor is selectable (F6).
+
+        Best-effort: a bad/locked/missing file or a duck-typed test host (no Qt
+        signal) must never crash the GUI -- GI still resolves ``th``/Manual from
+        metadata without this.
+        """
+        sig = getattr(self, 'sigGIMotorOptions', None)
+        if sig is None or not self.nexus_file:
+            return
+        try:
+            from xrd_tools.io.nexus import read_nexus
+            entry = (self.parameters.child('NeXus File').child('entry').value()
+                     or self.entry)
+            meta = read_nexus(self.nexus_file, entry)
+            motors = list(getattr(meta, 'angles', None) or {})
+        except Exception:
+            logger.debug("[NEXUS] GI-motor option read failed", exc_info=True)
+            return
+        if motors:
+            sig.emit(motors)
 
     def browse_mask(self):
         mask_file, _ = QFileDialog.getOpenFileName(
@@ -486,6 +510,7 @@ class nexusWrangler(wranglerWidget):
         """Sync parameters to thread before starting."""
         self.nexus_file = self.parameters.child('NeXus File').child('nexus_file').value()
         self.entry = self.parameters.child('NeXus File').child('entry').value()
+        self._emit_gi_motor_options()
         self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
         self.mask_file = self.parameters.child('Signal').child('mask_file').value()
         # R3-B: detector-saturation masking opt-out (default ON).
