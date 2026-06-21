@@ -679,8 +679,7 @@ need Qt belongs in `xrd_tools` ("keep xdart thin").
   (`display_controllers.py`). Viewer controllers resolve files through the
   headless `xrd_tools.io` APIs — xdart never opens HDF5 to guess.
 
-Layer map: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Working notes for
-AI/code assistants: [`CLAUDE.md`](CLAUDE.md).
+Layer map: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 

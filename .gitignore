@@ -16,3 +16,10 @@ build/
 .claude/
 claude_prompts*.md
 test.hdf5
+
+# AI-assistant working notes + internal planning/review docs — kept local
+# for development, not part of the published repo.
+/CLAUDE.md
+/AGENTS.md
+docs/design/CC_*.md
+docs/design/deep_review_*.md

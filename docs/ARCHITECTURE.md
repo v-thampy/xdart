@@ -13,8 +13,7 @@ xrd_tools  (pure compute + schema + I/O: core / io / reduction /
             integrate / sources / rsm / analysis / viz)
 ```
 
-\* the session layer is the in-flight piece (Phase 4 of
-`design/CC_greenfield_implementation_plan_2026-06-12.md`).  The headless
+\* the session layer is the in-flight piece.  The headless
 **`xrd_tools.session.ScanSession`** now EXISTS (4f-headless: commands in /
 immutable `FrameEvent` out; ADR-0003/0004) and `reduction.ReductionSession`
 is its streaming engine.  What remains: the **4f-bridge** — rewiring xdart's
