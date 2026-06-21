@@ -12,8 +12,9 @@ monorepo migration (`CC_monorepo_handoff.md`).
 
 Audited every item below against the shipped code this round.  **Now shipping in
 v1.0** (done/fixed, verified):
-- **D1** Reintegrate-All RAM — FIXED (batched lazy `_reintegrate_all`,
-  `_RE_BATCH`); Re-Integrate 1D/2D buttons **re-exposed** (D1 addendum corrected).
+- **D1** Reintegrate-All RAM — FIXED (streaming reintegrate writes each batch to
+  shadow integrated groups, then atomically swaps the completed stack);
+  Re-Integrate 1D/2D buttons **re-exposed** (D1 addendum corrected).
 - **D5** hydrated-raw LRU — FIXED (shared order on `data_2d` under `data_lock`).
 - **D6** chunked error-cleanup — FIXED (`_wait_pending_futures` drains in-flight
   futures before clearing `frame.image`).
@@ -22,11 +23,14 @@ v1.0** (done/fixed, verified):
 - **F7** "Auto Mask Saturated" authoritative toggle — DONE (integrator panel);
   the "More" popup stays deferred.
 - **F8** viewer intensity slider + Autoscale — DONE.
-- **F6** metadata all-motors — READER DONE; the nexus GI-motor **dropdown**
-  wiring is the one small remaining piece (functionally optional).
+- **F6** metadata all-motors — DONE (reader **and** the nexus GI-motor
+  **dropdown** wiring: `nexus_wrangler._emit_gi_motor_options` →
+  `sigGIMotorOptions`, fired on browse + setup).
 
 **Still deferred** (post-v1.0 / monorepo cycle): D2, D3, D4, F2, F3, F4, plus the
-F6 dropdown-wiring and F7 "More" popup follow-ups.
+F7 "More" popup follow-up.  Stage-4 `update_plot` deletion + Stage-5 Role-A
+`data_1d`/`data_2d` + `hydrated_raw.py` removal are also post-v1.0 (live-gated;
+the dicts remain as bounded transitional mirrors for the viewer/fallback paths).
 
 **✅ FIXED (Jun 20):** the F6 `scan_data`-harvest reader regression —
 `xrd_tools/io/nexus.py` `_harvest` + the NXpositioner cast now **pre-filter
@@ -42,41 +46,33 @@ writer emits into `scan_data`) is skipped via `_NON_MOTOR_COLUMNS`.  Fixtures
    streams to a `…__reint` shadow group, marks the frames persisted + evicts, so
    peak memory is bounded to ~cap (no longer the single end-of-run save that
    pinned all N).  The 1D-only pass drops the stale 2D slab; raw is dropped
-   per frame.  **Two residual perf follow-ups remain** (neither a correctness
-   blocker): (a) per-batch RAW residency is O(raw_window)≈2·workers now (the
-   raw-load window is decoupled from the write batch); (b) an interrupted shadow
-   is recovered by `cleanup_reintegrate_shadow_groups` on the next writer pass
-   and adopted read-only by `schema.resolve_integrated_group` on read.
+   per frame.  Remaining reintegrate work is tuning, not correctness: keep an eye
+   on per-batch RAW residency on very small-memory machines.  Interrupted shadows
+   are recovered by `cleanup_reintegrate_shadow_groups` on the next writer pass
+   and resolved read-only by `schema.resolve_integrated_group` on read.
 2. **Azimuthal Mode A (non-GI χ) — FIXED**: `reduction/core._reduce_frame` now
    dispatches `unit=='chi_deg'` to `integrate_radial` (q-band as `radial_range`,
    `radial_unit='q_A^-1'`, `npt`=χ bins, tunable `npt_rad` band sampling) and the
    writer records/validates the 1D `axis_kind` (declared in schema CAPABILITIES).
    (Mode B / CHI_GI was already correct.)
 
-## Deferred (fix during the monorepo design-refinement cycle)
+## Resolved from the original deferred list
 
-### D1 — Reintegrate-All peak RAM (M4) — HIGH
-`scan_threads._reintegrate_all` publishes every recomputed frame via
-`frames[idx] = frame` → `stash()` marks it UNSAVED, and the only save is the
-single end-of-run `save_to_nexus(replace_frame_indices=…)`.  Persist-before-
-evict therefore pins **all N frames** (each ~8–16 MB with the float64 2D slab
-`_load_frame_v2` loads even for 1D-only reintegration) — ~10 GB on a 651-frame
-Eiger scan; OOM territory at 10k.  After the save they stay resident (eviction
-only runs inside `stash`).
-**Why deferred:** the obvious fix (periodic replace-saves inside the loop)
-collides with the writer validator *by design* — a reintegration that changes
-npts/ranges (the common case) must save all frames together
-(`_select_frames_to_write` raises on partial shape-changed replaces).
-**Design directions:** (a) stage shape-changed stacks in a temp group and swap
-at the end so per-batch saves become legal; (b) teach the lazy loader to skip
-the 2D slab for 1D-only reintegration (~100 KB/frame instead of 8–16 MB);
-(c) explicit eviction sweep after the final save.
-**Until then:** avoid reintegrate-all on multi-thousand-frame scans in one go.
-**STATUS (Jun 20): FIXED + SHIPPING.** RAM mitigation via batched lazy
-`_reintegrate_all` (`_RE_BATCH = max(8, 32*n_workers)`; frames go out of scope
-after publish, replacing the whole-scan-pinned pattern).  Re-Integrate 1D/2D
-buttons re-exposed (`integratorUI.py` `frame_reint`, `integrator.py` wiring to
-`bai_1d`/`bai_2d`).
+### D1 — Reintegrate-All peak RAM (M4) — FIXED + SHIPPING
+Historical failure: reintegration used to hold all recomputed frames in memory
+until one end-of-run `save_to_nexus(replace_frame_indices=…)`, which pinned
+large raw/cake payloads for the full scan.
+
+Current fix: reintegration now streams batches to shadow integrated groups,
+marks the written frames persisted, evicts old frame payloads, and atomically
+swaps the completed shadow stack into place at the end.  Stop/error drops the
+shadow and leaves the canonical integrated stack unchanged.  Re-Integrate 1D/2D
+buttons are re-exposed (`integratorUI.py` `frame_reint`, `integrator.py` wiring
+to `bai_1d`/`bai_2d`).
+
+Remaining work: only low-memory tuning, not a v1.0 blocker.
+
+## Deferred (fix during the monorepo design-refinement cycle)
 
 ### D2 — `data_1d` thumbnail copies — MED
 `copy_for_display(include_2d=False)` keeps a fresh ≤256×256 float32 thumbnail
@@ -310,8 +306,8 @@ display-only (never touches the persisted record), on the shared display-state
 row so it survives mode switches.
 
 ### F6 — metadata readers should record ALL motor positions, not just the scanned motor (Vivek, Jun 19)
-**STATUS (Jun 20): reader DONE for all source types; nexus GI-motor-DROPDOWN
-wiring is the only remaining piece.**
+**STATUS (Jun 20): DONE + SHIPPING — reader (all source types), the nexus
+GI-motor dropdown wiring, AND the `|S`-column crash fix all landed (details below).**
 - **SPEC** — already records all motors: `_read_spec_metadata` returns every
   `scan.motor_names` (the `#O`/`#P` header positioners) + every `scan.labels`
   (the `#L` per-point columns).
@@ -321,21 +317,17 @@ wiring is the only remaining piece.**
   **and** `entry/sample/positioners/<motor>/value` (the scanned NXpositioner).
   So all motors reach the per-frame `scan_info` → GI incidence resolution +
   provenance work for nexus.  Test: `test_nexus.py::...harvests_scan_data_and_positioners`.
-- **REMAINING (follow-up):** the nexus wrangler **widget** does not yet feed those
-  motor names to the integrator's GI-motor dropdown (it reads no source metadata
-  on file/entry selection — unlike the image wrangler's `get_scan_parameters`
-  → `set_gi_motor_options`/`sigGIMotorOptions`).  Functionally optional (the
-  metadata resolves `th`/Manual already); add the widget-side `read_nexus` +
-  `sigGIMotorOptions` emit so a non-standard nexus incidence motor is selectable.
-- **⚠ CAUTION (v1.0 blocker, Jun 20):** the `_read_data_group` harvest path that
-  completes the reader has two CONFIRMED crash bugs on fixed-length-string (`|S`)
-  columns — `_harvest` float cast (`nexus.py` ~:2527) and the NXpositioner float
-  cast (~:2562) catch only `(TypeError, ValueError)`, but `np.asarray(.., float)`
-  on a `|S` column raises `OSError`, which escapes and crashes `read_nexus`.
-  SPEC-style `scan_data` tables routinely carry `|S` timestamp/label columns, so
-  the new harvest both widened and realized the crash surface.  Broaden both
-  catches to include `OSError` (or pre-filter `dtype.kind in {'S','U','O'}`)
-  before tagging v1.0.
+- **DONE (F6 dropdown):** the nexus wrangler widget now feeds those motor names
+  to the integrator's GI-motor dropdown — `nexus_wrangler._emit_gi_motor_options`
+  calls `read_nexus(...).angles` and emits `sigGIMotorOptions` on browse + setup
+  (best-effort; a bad/locked file never crashes the GUI), mirroring the image
+  wrangler.  So a non-standard nexus incidence motor is selectable.
+- **FIXED (was a v1.0 blocker):** the `_read_data_group` harvest `|S`-column crash
+  — both float casts (`_harvest` and the NXpositioner cast) now catch `OSError`
+  and pre-filter `dtype.kind` (`xrd_tools/io/nexus.py` ~:2580/:2620, commit
+  `8bbea58`), so a SPEC-style `scan_data` table with `|S` timestamp/label columns
+  no longer crashes `read_nexus`.  Test: the `|S`/vlen/`frame_index` cases in
+  `tests/core/test_nexus.py`.
 
 Original context:
 In a SPEC file the **scanned** motors/positioners are recorded per-point in the
