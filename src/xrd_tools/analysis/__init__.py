@@ -47,6 +47,12 @@ _EXPORTS = {
     "run_rsm": ("xrd_tools.analysis.plans", "run_rsm"),
     "run_sin2psi": ("xrd_tools.analysis.plans", "run_sin2psi"),
     "run_stitch": ("xrd_tools.analysis.plans", "run_stitch"),
+    # Analysis-agnostic live/batch runner contract.
+    "AnalysisInput": ("xrd_tools.analysis.runner", "AnalysisInput"),
+    "Overlay": ("xrd_tools.analysis.runner", "Overlay"),
+    "AnalysisOutcome": ("xrd_tools.analysis.runner", "AnalysisOutcome"),
+    "Analyzer": ("xrd_tools.analysis.runner", "Analyzer"),
+    "PeakFitAnalyzer": ("xrd_tools.analysis.runner", "PeakFitAnalyzer"),
 }
 
 __all__ = sorted(_EXPORTS)
