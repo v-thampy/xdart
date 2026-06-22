@@ -550,52 +550,56 @@ def test_live_fit_is_noop_without_open_dialog(widget):
     assert w._live_analysis_worker is None     # worker stays lazy until a real request
 
 
-def test_batch_param_family_helpers_are_pure():
-    """split_family / group_families parse the flat param keys into per-peak
-    families with no Qt — the basis for the vs-frame curves."""
-    from xdart.gui.tabs.static_scan.batch_fit_results_dialog import (
-        group_families, split_family)
+def test_param_family_helpers_are_pure():
+    """split_family / group_families / accumulator_to_table parse the flat param
+    keys into per-peak families + an aligned vs-frame table, with no Qt."""
+    from xdart.gui.tabs.static_scan.peak_fit_util import (
+        accumulator_to_table, group_families, split_family)
     assert split_family("center_0") == ("center", 0)
     assert split_family("center_err_2") == ("center_err", 2)
     assert split_family("amplitude") == ("amplitude", 0)
-    fams = group_families({"center_0": [], "center_1": [], "fwhm_0": []})
+    fams = group_families(["center_0", "center_1", "fwhm_0"])
     assert fams["center"] == [("center_0", 0), ("center_1", 1)]
     assert fams["fwhm"] == [("fwhm_0", 0)]
+    # {frame: params} -> aligned (labels, columns), sorted, missing param -> nan
+    labels, cols = accumulator_to_table(
+        {2: {"center_0": 2.2, "center_1": 3.5}, 0: {"center_0": 2.0}})
+    assert labels == ["0", "2"]                     # sorted by frame index
+    assert cols["center_0"] == [2.0, 2.2]
+    assert cols["center_1"][0] != cols["center_1"][0]   # nan (frame 0 lacked it)
+    assert cols["center_1"][1] == 3.5
 
 
-def test_batch_results_dialog_plots_param_vs_frame(qapp):
-    """Step 4: the results popup builds a family selector from the batch table
-    and plots one curve per peak vs frame; switching family re-draws."""
-    from xdart.gui.tabs.static_scan.batch_fit_results_dialog import (
-        BatchFitResultsDialog)
-    dlg = BatchFitResultsDialog()
+def test_peak_fit_dialog_param_trend_row(qapp):
+    """Row 3 (params vs frame): accumulating frames builds the family combo and
+    plots one curve per peak; Overlay toggles all-peaks vs the first; reset
+    clears it."""
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    dlg = PeakFitDialog(lambda: None)
     try:
-        labels = ["0", "1", "2"]
-        columns = {"center_0": [2.0, 2.1, 2.2], "center_1": [3.5, 3.4, 3.6],
-                   "fwhm_0": [0.1, 0.1, 0.12], "amplitude_0": [1e5, 9e4, 1.1e5]}
-        dlg.set_results(labels, columns, x_unit="q (Å⁻¹)")
-        fams = [dlg.family_combo.itemData(i)
-                for i in range(dlg.family_combo.count())]
+        for idx in range(3):
+            dlg._accumulate_frame_params(idx, {
+                "center_0": 2.0 + 0.1 * idx, "center_1": 3.5,
+                "fwhm_0": 0.1, "amplitude_0": 1e5})
+        fams = [dlg.param_family_combo.itemData(i)
+                for i in range(dlg.param_family_combo.count())]
         assert {"center", "fwhm", "amplitude"} <= set(fams)
-        # default family (first = center) -> two curves (center_0, center_1)
-        assert len(dlg.plot.getPlotItem().listDataItems()) == 2
-        dlg.family_combo.setCurrentIndex(fams.index("amplitude"))
-        assert len(dlg.plot.getPlotItem().listDataItems()) == 1
-    finally:
-        dlg.deleteLater()
-        qapp.processEvents()
-
-
-def test_batch_results_dialog_handles_empty_table(qapp):
-    """No peaks fit anywhere -> empty table: the popup reports it and draws
-    nothing (no crash, no families)."""
-    from xdart.gui.tabs.static_scan.batch_fit_results_dialog import (
-        BatchFitResultsDialog)
-    dlg = BatchFitResultsDialog()
-    try:
-        dlg.set_results(["0", "1"], {}, x_unit="q")
-        assert dlg.family_combo.count() == 0
-        assert dlg.plot.getPlotItem().listDataItems() == []
+        assert dlg.param_family_combo.isEnabled() and dlg.param_save_btn.isEnabled()
+        # default family = center; overlay off -> one curve (center_0)
+        dlg.param_family_combo.setCurrentIndex(fams.index("center"))
+        dlg.param_overlay_check.setChecked(False)
+        assert len(dlg.param_plot.getPlotItem().listDataItems()) == 1
+        # overlay on -> both center_0 + center_1
+        dlg.param_overlay_check.setChecked(True)
+        assert len(dlg.param_plot.getPlotItem().listDataItems()) == 2
+        # a re-fit of an existing frame updates, not duplicates
+        dlg._accumulate_frame_params(1, {"center_0": 9.9, "center_1": 3.5})
+        assert len(dlg._param_accumulator) == 3
+        # reset clears the trend + disables the controls
+        dlg.reset_param_trend()
+        assert dlg.param_plot.getPlotItem().listDataItems() == []
+        assert not dlg.param_family_combo.isEnabled()
+        assert dlg._param_accumulator == {}
     finally:
         dlg.deleteLater()
         qapp.processEvents()
@@ -635,14 +639,15 @@ def test_batch_fit_through_static_widget_populates_results(widget, qapp):
         qapp.processEvents()
         time.sleep(0.01)
     worker.wait(3000)
-    qapp.processEvents()                     # deliver the queued sigBatchDone
+    qapp.processEvents()                     # deliver queued sigFrameFit/sigBatchDone
 
-    rd = w._batch_results_dialog
-    assert rd is not None
-    assert rd._labels == ["0", "1", "2"]
-    assert "center_0" in rd._columns and len(rd._columns["center_0"]) == 3
+    # The trend filled the dialog's embedded row 3 incrementally (no popup).
+    acc = dlg._param_accumulator
+    assert set(acc.keys()) == {0, 1, 2}
+    assert "center_0" in acc[0]
     # the first peak's recovered center is near 2.0 across frames
-    assert all(abs(c - 2.0) < 0.1 for c in rd._columns["center_0"])
+    assert all(abs(acc[i]["center_0"] - 2.0) < 0.1 for i in (0, 1, 2))
+    assert len(dlg.param_plot.getPlotItem().listDataItems()) >= 1
 
 
 def test_image_widget_colorbar_limits_nan_aware(qapp):

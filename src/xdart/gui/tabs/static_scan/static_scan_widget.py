@@ -480,11 +480,9 @@ class staticWidget(QWidget):
         # stale results.
         self._live_analysis_worker = None
         self._live_fit_gen = 0
-        # Batch analysis (Step 4): one worker fits every frame; the results
-        # popup plots parameters vs frame number.
+        # Batch analysis: one worker fits every frame and streams params into the
+        # dialog's embedded vs-frame trend (row 3).
         self._batch_analysis_worker = None
-        self._batch_results_dialog = None
-        self._batch_x_unit = ""
         self._build_tools_placeholder()
 
     def _build_tools_placeholder(self):
@@ -604,6 +602,9 @@ class staticWidget(QWidget):
         """Live checkbox flipped — fit the current frame immediately on enable so
         there's no wait for the next frame; disabling just stops the pushes."""
         if on:
+            dlg = self._peak_fit_dialog
+            if dlg is not None:
+                dlg.reset_param_trend()      # fresh vs-frame trend for this run
             self._maybe_live_fit()
 
     def _ensure_live_analysis_worker(self):
@@ -634,9 +635,14 @@ class staticWidget(QWidget):
         if req is None:                      # nothing fittable (status set by dialog)
             return
         inp, analyzer = req
+        # Label the analysis by the FRAME index (not the axis unit) so the
+        # dialog keys the vs-frame trend by frame; build_fit_request defaults the
+        # label to "current".
+        idxs = getattr(self, 'frame_ids', None) or []
+        inp.label = str(idxs[0]) if idxs else ""
         self._live_fit_gen += 1
         self._ensure_live_analysis_worker().request(
-            label, self._live_fit_gen, analyzer, inp)
+            inp.label, self._live_fit_gen, analyzer, inp)
 
     def _on_live_analyzed(self, label, generation, outcome):
         """Draw a live fit result — but only if it's still the newest request and
@@ -708,8 +714,9 @@ class staticWidget(QWidget):
         if self._batch_analysis_worker is None:
             self._batch_analysis_worker = BatchAnalysisWorker(self)
             self._batch_analysis_worker.sigProgress.connect(self._on_batch_progress)
+            self._batch_analysis_worker.sigFrameFit.connect(self._on_batch_frame_fit)
             self._batch_analysis_worker.sigBatchDone.connect(self._on_batch_done)
-        self._batch_x_unit = x_unit
+        dlg.reset_param_trend()             # fresh vs-frame trend for this batch
         self._batch_analysis_worker.configure(analyzer, inputs)
         dlg.set_batch_running(True)
         dlg.set_batch_progress(0, len(inputs))
@@ -720,9 +727,20 @@ class staticWidget(QWidget):
         if dlg is not None:
             dlg.set_batch_progress(done, total)
 
+    def _on_batch_frame_fit(self, label, params):
+        """A batch frame finished: grow the dialog's vs-frame trend (row 3)."""
+        dlg = self._peak_fit_dialog
+        if dlg is None or not dlg.isVisible():
+            return
+        try:
+            frame_idx = int(label)
+        except (TypeError, ValueError):
+            return
+        dlg._accumulate_frame_params(frame_idx, params)
+
     def _on_batch_done(self, labels, columns):
-        """Batch finished: re-enable the dialog and open the vs-frame results
-        popup (or report a cancel)."""
+        """Batch finished: re-enable the dialog (or report a cancel).  The
+        vs-frame trend already filled row 3 incrementally via sigFrameFit."""
         dlg = self._peak_fit_dialog
         if dlg is not None:
             dlg.set_batch_running(False)
@@ -731,15 +749,9 @@ class staticWidget(QWidget):
                 dlg.status.setText("Batch fit cancelled.")
             return
         if dlg is not None:
-            dlg.status.setText(f"Batch fit done — {len(labels)} frames.")
-        if self._batch_results_dialog is None:
-            from .batch_fit_results_dialog import BatchFitResultsDialog
-            self._batch_results_dialog = BatchFitResultsDialog(self)
-        rd = self._batch_results_dialog
-        rd.set_results(labels, columns, x_unit=self._batch_x_unit)
-        rd.show()
-        rd.raise_()
-        rd.activateWindow()
+            dlg.status.setText(
+                f"Batch fit done — {len(labels)} frames. Pick a parameter to "
+                "track below; Save CSV to export.")
 
     def _open_metadata_dialog(self):
         """Open (or re-show) the frame-metadata popup.

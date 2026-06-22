@@ -100,7 +100,7 @@ class Analyzer(Protocol):
 # --------------------------------------------------------------------------
 
 
-def run_batch(analyzer, inputs, on_progress=None, should_cancel=None):
+def run_batch(analyzer, inputs, on_progress=None, should_cancel=None, on_frame=None):
     """Apply ``analyzer`` across a sequence of :class:`AnalysisInput`.
 
     Branches ONCE on ``analyzer.unit`` (the single analysis-specific decision):
@@ -113,8 +113,10 @@ def run_batch(analyzer, inputs, on_progress=None, should_cancel=None):
     Never raises for an analysis failure — a bad input yields an inert
     ``ok=False`` outcome so the batch always completes.  ``on_progress(done,
     total)`` is called after each input (and once at the end for scan-unit).
-    ``should_cancel()`` is polled before each frame (frame-unit only); if it
-    returns true the loop stops and the outcomes gathered so far are returned."""
+    ``on_frame(outcome)`` streams each outcome as it is computed (so a live
+    vs-frame plot can grow during the run).  ``should_cancel()`` is polled
+    before each frame (frame-unit only); if it returns true the loop stops and
+    the outcomes gathered so far are returned."""
     inputs = list(inputs)
     total = len(inputs)
     if getattr(analyzer, "unit", "frame") == "scan":
@@ -122,6 +124,8 @@ def run_batch(analyzer, inputs, on_progress=None, should_cancel=None):
             out = analyzer.analyze_scan(inputs)
         except Exception as exc:  # noqa: BLE001 — inert on failure
             out = AnalysisOutcome(label="scan", ok=False, message=str(exc))
+        if on_frame is not None:
+            on_frame(out)
         if on_progress is not None:
             on_progress(total, total)
         return [out]
@@ -134,6 +138,8 @@ def run_batch(analyzer, inputs, on_progress=None, should_cancel=None):
         except Exception as exc:  # noqa: BLE001 — one bad frame can't abort the batch
             out = AnalysisOutcome(label=inp.label, ok=False, message=str(exc))
         outcomes.append(out)
+        if on_frame is not None:
+            on_frame(out)
         if on_progress is not None:
             on_progress(i + 1, total)
     return outcomes

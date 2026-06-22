@@ -104,6 +104,8 @@ class BatchAnalysisWorker(Qt.QtCore.QThread):
 
     #: (done, total) progress after each frame.
     sigProgress = Qt.QtCore.Signal(int, int)
+    #: (label, params) streamed per frame — grows the live vs-frame trend.
+    sigFrameFit = Qt.QtCore.Signal(object, object)
     #: (labels, columns) on completion — or (None, None) if cancelled.
     sigBatchDone = Qt.QtCore.Signal(object, object)
 
@@ -126,6 +128,7 @@ class BatchAnalysisWorker(Qt.QtCore.QThread):
         outcomes = run_batch(
             self._analyzer, self._inputs,
             on_progress=lambda done, total: self.sigProgress.emit(done, total),
+            on_frame=lambda out: self.sigFrameFit.emit(out.label, out.params),
             should_cancel=lambda: self._cancel)
         if self._cancel:
             self.sigBatchDone.emit(None, None)   # cancelled -> no partial plot
