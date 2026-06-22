@@ -483,6 +483,10 @@ class staticWidget(QWidget):
         # Batch analysis: one worker fits every frame and streams params into the
         # dialog's embedded vs-frame trend (row 3).
         self._batch_analysis_worker = None
+        # Set in close() before tearing the widget down — the analysis slots bail
+        # on it so a worker signal queued just before teardown can't touch the
+        # (about-to-be-destroyed) peak-fit dialog.
+        self._tearing_down = False
         self._build_tools_placeholder()
 
     def _build_tools_placeholder(self):
@@ -648,6 +652,8 @@ class staticWidget(QWidget):
         """Draw a live fit result — but only if it's still the newest request and
         the dialog is still open + Live (a stale or superseded result is dropped,
         so the overlay never lags behind the displayed frame)."""
+        if self._tearing_down:
+            return                              # widget closing — dialog may be gone
         if generation != self._live_fit_gen:
             return
         dlg = self._peak_fit_dialog
@@ -723,12 +729,16 @@ class staticWidget(QWidget):
         self._batch_analysis_worker.start()
 
     def _on_batch_progress(self, done, total):
+        if self._tearing_down:
+            return
         dlg = self._peak_fit_dialog
         if dlg is not None:
             dlg.set_batch_progress(done, total)
 
     def _on_batch_frame_fit(self, label, params):
         """A batch frame finished: grow the dialog's vs-frame trend (row 3)."""
+        if self._tearing_down:
+            return
         dlg = self._peak_fit_dialog
         if dlg is None or not dlg.isVisible():
             return
@@ -741,6 +751,8 @@ class staticWidget(QWidget):
     def _on_batch_done(self, labels, columns):
         """Batch finished: re-enable the dialog (or report a cancel).  The
         vs-frame trend already filled row 3 incrementally via sigFrameFit."""
+        if self._tearing_down:
+            return
         dlg = self._peak_fit_dialog
         if dlg is not None:
             dlg.set_batch_running(False)
@@ -1614,6 +1626,9 @@ class staticWidget(QWidget):
     def close(self):
         """Tries a graceful close.
         """
+        # Block the analysis slots first: a worker signal queued just before we
+        # stop + destroy must not touch the about-to-be-destroyed dialog.
+        self._tearing_down = True
         # Persist the integration panel settings (the wrangler tree saves
         # continuously; the integrator panel saves here at exit).
         try:

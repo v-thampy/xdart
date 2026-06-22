@@ -343,7 +343,10 @@ class PeakFitDialog(QtWidgets.QDialog):
     def refresh_pattern(self):
         """Re-grab the active frame's pattern, draw the raw data, reset the fit."""
         self._clear_fit()
-        self.reset_param_trend()      # Reload starts a fresh vs-frame trend
+        # Reload starts a fresh vs-frame trend — but NOT while a live run is
+        # accumulating (don't discard the user's live trend on a manual Reload).
+        if not self.live_check.isChecked():
+            self.reset_param_trend()
         data = None
         try:
             data = self._provider()
@@ -648,7 +651,9 @@ class PeakFitDialog(QtWidgets.QDialog):
                 if k not in keys:
                     keys.append(k)
         families = tuple(group_families(keys))
-        if families == self._param_family_keys:
+        # Compare as a set: only rebuild when the SET of families changes, not
+        # when their discovery order happens to differ between frames.
+        if frozenset(families) == frozenset(self._param_family_keys):
             return
         current = self.param_family_combo.currentData()
         self.param_family_combo.blockSignals(True)

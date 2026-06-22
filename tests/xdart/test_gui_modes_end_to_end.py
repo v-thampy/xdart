@@ -666,6 +666,39 @@ def test_peak_fit_manual_centers_filter_to_range_and_toggle(qapp):
         qapp.processEvents()
 
 
+def test_reload_during_live_keeps_trend(qapp):
+    """Reload while Live is on must NOT wipe the accumulated vs-frame trend;
+    Reload when not live starts fresh."""
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 5.0, 200)
+    dlg = PeakFitDialog(lambda: (x, x * 0 + 1.0, "q"))
+    try:
+        dlg._accumulate_frame_params(0, {"center_0": 2.0})
+        dlg._accumulate_frame_params(1, {"center_0": 2.1})
+        dlg.live_check.setChecked(True)
+        dlg.refresh_pattern()                  # Reload mid-live -> trend kept
+        assert set(dlg._param_accumulator) == {0, 1}
+        dlg.live_check.setChecked(False)
+        dlg.refresh_pattern()                  # Reload not-live -> fresh
+        assert dlg._param_accumulator == {}
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_close_guard_blocks_analysis_slots(widget):
+    """Once close() set _tearing_down, the worker-signal slots must bail without
+    touching the dialog — guards the close-during-run use-after-free."""
+    w = widget
+    w._tearing_down = True
+    # None of these may raise or require a live dialog (queued signal arriving
+    # mid-teardown).
+    w._on_batch_progress(1, 2)
+    w._on_batch_frame_fit("0", {"center_0": 2.0})
+    w._on_batch_done(["0"], {"center_0": [2.0]})
+    w._on_live_analyzed("0", w._live_fit_gen, None)
+
+
 def test_batch_fit_through_static_widget_populates_results(widget, qapp):
     """End-to-end Step 4: _run_batch_fit collects every frame's pattern, the
     worker fits them off the GUI thread, and _on_batch_done opens the populated
