@@ -15,7 +15,7 @@ import numpy as np
 #: attr/dataset LEAF names whose VALUES are volatile (still recorded as
 #: present, just not by value)
 VOLATILE_LEAVES = {
-    "date", "timestamp", "hostname", "python", "platform",
+    "date", "timestamp", "host", "hostname", "python", "platform",
     # per-run environment noise: the output tmp path, write clock, and the
     # (absolute, env-dependent) project root -- presence still asserted
     "file_name", "file_time", "source_base",
