@@ -141,6 +141,73 @@ class PeakFitDialog(QtWidgets.QDialog):
         range_row.addStretch(1)
         lay.addLayout(range_row)
 
+        # Advanced options (collapsible) — all backed by fit_peaks / PeakFitPlan
+        # today, so they apply identically to manual Fit, Live, and Batch.
+        self.advanced_btn = QtWidgets.QPushButton("Advanced ▾")
+        self.advanced_btn.setCheckable(True)
+        self.advanced_btn.setObjectName("peakFitAdvancedToggle")
+        adv_row = QtWidgets.QHBoxLayout()
+        adv_row.addWidget(self.advanced_btn)
+        adv_row.addStretch(1)
+        lay.addLayout(adv_row)
+
+        self.advanced_box = QtWidgets.QWidget()
+        self.advanced_box.setVisible(False)
+        adv = QtWidgets.QGridLayout(self.advanced_box)
+        adv.setContentsMargins(2, 2, 2, 2)
+        adv.setHorizontalSpacing(8)
+        adv.setVerticalSpacing(5)
+
+        def _num():
+            e = QtWidgets.QLineEdit()
+            e.setValidator(QtGui.QDoubleValidator(self))
+            e.setMaximumWidth(90)
+            e.setPlaceholderText("auto")
+            return e
+
+        self.adv_centers = QtWidgets.QLineEdit()
+        self.adv_centers.setPlaceholderText("auto-detect — e.g. 2.1, 3.5, 4.8")
+        self.adv_centers.setToolTip(
+            "Manual peak centers (current x-unit), comma-separated.  When set, "
+            "these seed the fit and override Auto-detect — for shoulders / weak "
+            "peaks find_peaks misses.")
+        self.adv_sigma_init = _num()
+        self.adv_sigma_init.setToolTip("Initial peak width σ (blank = auto)")
+        self.adv_sigma_min = _num()
+        self.adv_sigma_max = _num()
+        self.adv_center_delta = _num()
+        self.adv_center_delta.setToolTip(
+            "Constrain each center to ± this much around its start (blank = free)")
+        self.adv_fraction = _num()
+        self.adv_fraction.setPlaceholderText("0.5")
+        self.adv_fraction.setToolTip(
+            "Pseudo-Voigt Gaussian/Lorentzian mix, 0–1 (Pseudo-Voigt only)")
+        self.adv_maxfev = QtWidgets.QSpinBox()
+        self.adv_maxfev.setRange(0, 1000000)
+        self.adv_maxfev.setSingleStep(500)
+        self.adv_maxfev.setSpecialValueText("auto")
+        self.adv_maxfev.setMaximumWidth(110)
+        self.adv_maxfev.setToolTip("Max solver iterations (max_nfev); 0 = lmfit default")
+
+        adv.addWidget(QtWidgets.QLabel("Peak centers"), 0, 0)
+        adv.addWidget(self.adv_centers, 0, 1, 1, 3)
+        adv.addWidget(QtWidgets.QLabel("σ initial"), 1, 0)
+        adv.addWidget(self.adv_sigma_init, 1, 1)
+        adv.addWidget(QtWidgets.QLabel("σ min / max"), 1, 2)
+        sig_row = QtWidgets.QHBoxLayout()
+        sig_row.setSpacing(4)
+        sig_row.addWidget(self.adv_sigma_min)
+        sig_row.addWidget(self.adv_sigma_max)
+        adv.addLayout(sig_row, 1, 3)
+        adv.addWidget(QtWidgets.QLabel("Center ± delta"), 2, 0)
+        adv.addWidget(self.adv_center_delta, 2, 1)
+        adv.addWidget(QtWidgets.QLabel("PV fraction"), 2, 2)
+        adv.addWidget(self.adv_fraction, 2, 3)
+        adv.addWidget(QtWidgets.QLabel("Max iterations"), 3, 0)
+        adv.addWidget(self.adv_maxfev, 3, 1)
+        adv.setColumnStretch(3, 1)
+        lay.addWidget(self.advanced_box)
+
         self.status = QtWidgets.QLabel("")
         self.status.setObjectName("peakFitStatus")
         self.status.setWordWrap(True)
@@ -211,6 +278,11 @@ class PeakFitDialog(QtWidgets.QDialog):
         self.param_family_combo.currentIndexChanged.connect(self._redraw_param_plot)
         self.param_overlay_check.toggled.connect(self._redraw_param_plot)
         self.param_save_btn.clicked.connect(self._save_param_csv)
+        self.advanced_btn.toggled.connect(self._on_advanced_toggled)
+
+    def _on_advanced_toggled(self, on):
+        self.advanced_box.setVisible(on)
+        self.advanced_btn.setText("Advanced ▴" if on else "Advanced ▾")
 
     # ---- range sync -----------------------------------------------------
     def _data_extent(self):
@@ -380,13 +452,19 @@ class PeakFitDialog(QtWidgets.QDialog):
         x = self._x[finite]
         y = self._y[finite]
 
-        positions = None
-        if self.auto_check.isChecked():
+        # Manual centers (Advanced) take precedence over Auto-detect.
+        positions = self._manual_centers(lo, hi)
+        if positions:
+            n_peaks = len(positions)
+            self.npeaks_spin.blockSignals(True)
+            self.npeaks_spin.setValue(min(n_peaks, _MAX_PEAKS))
+            self.npeaks_spin.blockSignals(False)
+        elif self.auto_check.isChecked():
             positions = self._detect_peaks(x, y)
             if not positions:
                 self.status.setText(
-                    "No peaks auto-detected in this range — narrow the range or "
-                    "uncheck Auto and set a count.")
+                    "No peaks auto-detected in this range — narrow the range, "
+                    "uncheck Auto and set a count, or enter centers in Advanced.")
                 return None
             n_peaks = len(positions)
             self.npeaks_spin.blockSignals(True)
@@ -400,9 +478,60 @@ class PeakFitDialog(QtWidgets.QDialog):
             return None
         plan = PeakFitPlan(
             positions=tuple(positions) if positions else None,
-            model=model, n_peaks=n_peaks, background=background)
+            model=model, n_peaks=n_peaks, background=background,
+            **self._advanced_kwargs())
         inp = AnalysisInput(label="current", x=x, y=y, x_unit=self._x_label)
         return inp, PeakFitAnalyzer(plan)
+
+    # ---- advanced options -----------------------------------------------
+    @staticmethod
+    def _line_float(line_edit):
+        t = line_edit.text().strip()
+        if not t:
+            return None
+        try:
+            return float(t)
+        except ValueError:
+            return None
+
+    def _manual_centers(self, lo, hi):
+        """Parsed in-range manual peak centers from Advanced, or None."""
+        text = self.adv_centers.text().strip()
+        if not text:
+            return None
+        vals = []
+        for part in text.replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                vals.append(float(part))
+            except ValueError:
+                continue
+        vals = [v for v in vals if lo <= v <= hi]
+        return sorted(vals) or None
+
+    def _advanced_kwargs(self):
+        """The optional PeakFitPlan kwargs set in the Advanced box (only the
+        ones the user filled in)."""
+        out = {}
+        si = self._line_float(self.adv_sigma_init)
+        if si is not None:
+            out["sigma_init"] = si
+        smin = self._line_float(self.adv_sigma_min)
+        smax = self._line_float(self.adv_sigma_max)
+        if smin is not None and smax is not None and smax > smin:
+            out["sigma_bounds"] = (smin, smax)
+        delta = self._line_float(self.adv_center_delta)
+        if delta is not None and delta > 0:
+            out["center_bounds_delta"] = delta
+        frac = self._line_float(self.adv_fraction)
+        if frac is not None:
+            out["fraction_init"] = min(max(frac, 0.0), 1.0)
+        nfev = self.adv_maxfev.value()
+        if nfev > 0:
+            out["fit_kwargs"] = {"max_nfev": int(nfev)}
+        return out
 
     def _do_fit(self):
         if self._x is None or self._y is None:

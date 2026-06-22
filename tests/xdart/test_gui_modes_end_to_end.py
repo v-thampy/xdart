@@ -605,6 +605,67 @@ def test_peak_fit_dialog_param_trend_row(qapp):
         qapp.processEvents()
 
 
+def test_peak_fit_advanced_options_feed_the_plan(qapp):
+    """Advanced box: manual centers override Auto, and the optional kwargs
+    (σ init/bounds, center δ, max_nfev) flow into the PeakFitPlan + fit."""
+    pytest.importorskip("lmfit")
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 5.0, 600)
+
+    def g(c, s, a):
+        return a * np.exp(-0.5 * ((x - c) / s) ** 2)
+
+    y = g(2.0, 0.05, 1e5) + g(3.5, 0.07, 6e4) + 2000.0 + 500.0 * x
+    dlg = PeakFitDialog(lambda: (x, y, "q"))
+    try:
+        dlg.refresh_pattern()
+        dlg.auto_check.setChecked(True)        # manual centers must still win
+        dlg.adv_centers.setText("2.0, 3.5")
+        dlg.adv_sigma_init.setText("0.06")
+        dlg.adv_sigma_min.setText("0.01")
+        dlg.adv_sigma_max.setText("0.2")
+        dlg.adv_center_delta.setText("0.1")
+        dlg.adv_maxfev.setValue(5000)
+        req = dlg.build_fit_request()
+        assert req is not None
+        inp, analyzer = req
+        plan = analyzer.plan
+        assert plan.positions == (2.0, 3.5) and plan.n_peaks == 2   # manual wins
+        assert plan.sigma_init == 0.06
+        assert plan.sigma_bounds == (0.01, 0.2)
+        assert plan.center_bounds_delta == 0.1
+        assert plan.fit_kwargs == {"max_nfev": 5000}
+        out = analyzer.analyze(inp)            # and it actually fits
+        assert out.ok
+        centers = sorted(out.params[f"center_{i}"] for i in range(2))
+        assert abs(centers[0] - 2.0) < 0.05 and abs(centers[1] - 3.5) < 0.05
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_peak_fit_manual_centers_filter_to_range_and_toggle(qapp):
+    """The Advanced toggle shows the box; manual centers outside the fit range
+    are dropped (seeds must lie in the fitted window)."""
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 5.0, 400)
+    dlg = PeakFitDialog(lambda: (x, x * 0 + 1.0, "q"))
+    try:
+        dlg.refresh_pattern()
+        # isVisibleTo (not isVisible) — the dialog itself isn't shown in the test
+        assert not dlg.advanced_box.isVisibleTo(dlg)
+        dlg.advanced_btn.setChecked(True)
+        assert dlg.advanced_box.isVisibleTo(dlg)
+        dlg._fit_lo, dlg._fit_hi = 1.5, 4.0
+        dlg.adv_centers.setText("0.5, 2.1, 3.5, 9.0")   # 0.5 & 9.0 out of window
+        assert dlg._manual_centers(*dlg._fit_range()) == [2.1, 3.5]
+        dlg.adv_centers.setText("")
+        assert dlg._manual_centers(*dlg._fit_range()) is None
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
 def test_batch_fit_through_static_widget_populates_results(widget, qapp):
     """End-to-end Step 4: _run_batch_fit collects every frame's pattern, the
     worker fits them off the GUI thread, and _on_batch_done opens the populated
