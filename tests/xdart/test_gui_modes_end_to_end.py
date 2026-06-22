@@ -432,6 +432,7 @@ def test_peak_fit_dialog_fits_synthetic_pattern(qapp):
     y = g(2.0, 0.05, 1.0e5) + g(3.5, 0.07, 6.0e4) + 2000.0 + 500.0 * x
     dlg = PeakFitDialog(lambda: (x, y, "q (Å⁻¹)"))
     try:
+        dlg.auto_check.setChecked(False)       # exercise the fixed-count path
         dlg.npeaks_spin.setValue(2)
         dlg.model_combo.setCurrentText("Gaussian")
         dlg.refresh_pattern()
@@ -441,6 +442,37 @@ def test_peak_fit_dialog_fits_synthetic_pattern(qapp):
                          for r in range(dlg.table.rowCount()))
         assert abs(centers[0] - 2.0) < 0.05
         assert abs(centers[1] - 3.5) < 0.05
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_peak_fit_auto_detect_and_range(qapp):
+    """Auto peak detection finds the peaks unaided, and the fit range restricts
+    the fit to the selected window (excludes out-of-range peaks)."""
+    pytest.importorskip("lmfit")
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 6.0, 800)
+
+    def g(c, s, a):
+        return a * np.exp(-0.5 * ((x - c) / s) ** 2)
+
+    y = (g(2.0, 0.05, 1.0e5) + g(3.5, 0.06, 7.0e4) + g(4.8, 0.07, 5.0e4)
+         + 2000.0 + 300.0 * x)
+    dlg = PeakFitDialog(lambda: (x, y, "q (Å⁻¹)"))
+    try:
+        dlg.refresh_pattern()                  # auto is on by default
+        # (1) auto-detect over the whole pattern finds all three peaks
+        dlg._do_fit()
+        assert dlg.table.rowCount() == 3
+        # (2) restrict the range -> only the two in-window peaks are fit
+        dlg._fit_lo, dlg._fit_hi = 1.5, 4.0
+        assert dlg._fit_range() == (1.5, 4.0)
+        dlg._do_fit()
+        assert dlg.table.rowCount() == 2
+        centers = sorted(float(dlg.table.item(r, 1).text())
+                         for r in range(dlg.table.rowCount()))
+        assert abs(centers[0] - 2.0) < 0.05 and abs(centers[1] - 3.5) < 0.05
     finally:
         dlg.deleteLater()
         qapp.processEvents()
