@@ -145,3 +145,66 @@ def test_run_batch_scan_unit_is_one_outcome():
                      on_progress=lambda d, t: ticks.append((d, t)))
     assert len(outs) == 1 and outs[0].params["n"] == 4
     assert ticks == [(4, 4)]
+
+
+# ── Sin2PsiAnalyzer (scan-unit, the first scan-unit concrete analyzer) ─────
+
+
+def _synthetic_polar_map():
+    """A (q, χ) polar map with one Bragg peak per χ sector whose center drifts
+    linearly in sin²ψ (ψ=|χ|), so the sin²ψ regression has a clean slope."""
+    from xrd_tools.core.containers import IntegrationResult2D
+
+    q = np.linspace(2.0, 4.0, 400)
+    chi = np.linspace(-40.0, 40.0, 33)
+    intensity = np.zeros((q.size, chi.size), dtype=float)
+    for j, c in enumerate(chi):
+        s2 = np.sin(np.deg2rad(abs(c))) ** 2
+        center = 3.0 + 0.02 * s2                      # peak walks with sin²ψ
+        intensity[:, j] = 1.0e4 * np.exp(-0.5 * ((q - center) / 0.03) ** 2) + 100.0
+    return IntegrationResult2D(radial=q, azimuthal=chi, intensity=intensity,
+                               unit="q_A^-1", azimuthal_unit="chi_deg")
+
+
+def test_sin2psi_analyzer_is_scan_unit_and_rejects_frame_call():
+    from xrd_tools.analysis.plans import Sin2PsiPlan
+    from xrd_tools.analysis.runner import Analyzer, AnalysisInput, Sin2PsiAnalyzer
+
+    a = Sin2PsiAnalyzer(Sin2PsiPlan(q_range=(2.7, 3.3)))
+    assert isinstance(a, Analyzer)
+    assert a.kind == "sin2psi" and a.unit == "scan"
+    with pytest.raises(NotImplementedError):
+        a.analyze(AnalysisInput(label="0", x=np.array([1.0]), y=np.array([1.0])))
+
+
+def test_sin2psi_analyzer_projects_regression_and_overlay():
+    pytest.importorskip("lmfit")
+    from xrd_tools.analysis.plans import Sin2PsiPlan
+    from xrd_tools.analysis.runner import AnalysisInput, Sin2PsiAnalyzer
+
+    result2d = _synthetic_polar_map()
+    analyzer = Sin2PsiAnalyzer(Sin2PsiPlan(q_range=(2.7, 3.3), chi_width=5.0))
+    # The 2-D map rides on result_1d; x/y are unused for a scan-unit analyzer.
+    inp = AnalysisInput(label="scan", x=result2d.radial,
+                        y=result2d.intensity[:, 0], result_1d=result2d)
+    out = analyzer.analyze_scan([inp])
+
+    assert out.ok and out.label == "scan"
+    assert {"d0", "slope", "r_squared", "n_sectors"} <= set(out.params)
+    assert out.params["n_sectors"] >= 2
+    assert out.result.payload.r_squared > 0.9        # clean synthetic regression
+    # Overlay is the sin²ψ regression: measured d points + the fitted line.
+    assert {"data", "fit"} <= set(out.overlay.traces)
+    assert out.overlay.x.size == out.overlay.traces["data"].size
+
+
+def test_sin2psi_analyzer_is_inert_without_a_2d_map():
+    """No IntegrationResult2D on any input -> ok=False, no exception, so a runner
+    driving it stays alive."""
+    from xrd_tools.analysis.plans import Sin2PsiPlan
+    from xrd_tools.analysis.runner import AnalysisInput, Sin2PsiAnalyzer
+
+    out = Sin2PsiAnalyzer(Sin2PsiPlan(q_range=(2.7, 3.3))).analyze_scan(
+        [AnalysisInput(label="0", x=np.array([1.0]), y=np.array([1.0]))]
+    )
+    assert out.ok is False and "IntegrationResult2D" in out.message

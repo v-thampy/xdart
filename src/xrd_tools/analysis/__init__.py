@@ -53,6 +53,7 @@ _EXPORTS = {
     "AnalysisOutcome": ("xrd_tools.analysis.runner", "AnalysisOutcome"),
     "Analyzer": ("xrd_tools.analysis.runner", "Analyzer"),
     "PeakFitAnalyzer": ("xrd_tools.analysis.runner", "PeakFitAnalyzer"),
+    "Sin2PsiAnalyzer": ("xrd_tools.analysis.runner", "Sin2PsiAnalyzer"),
     "run_batch": ("xrd_tools.analysis.runner", "run_batch"),
     "batch_params_table": ("xrd_tools.analysis.runner", "batch_params_table"),
 }

@@ -85,12 +85,47 @@ def main() -> None:
     print(f"batch: {len(labels)} frames; center_0 {drift[0]:.3f} -> "
           f"{drift[-1]:.3f} (vs-frame series ready for a DataFrame/plot)")
 
+    # --- a SCAN-UNIT analyzer: the SAME contract, one outcome for a set -----
+    # sin²ψ aggregates χ-sectors within one (q, χ) polar map -> unit='scan'.
+    _scan_unit_demo()
+
     # --- the whole point: no xdart GUI on the import graph ------------------
     gui_roots = {"xdart", "pyqtgraph"}
     leaked = sorted({m.split(".")[0] for m in sys.modules} & gui_roots)
     assert not leaked, f"headless example pulled in the xdart GUI stack: {leaked}"
-    print("OK: analysis runner exercised single-frame + batch with no "
-          "xdart/pyqtgraph GUI stack.")
+    print("OK: analysis runner exercised single-frame + batch + scan-unit with "
+          "no xdart/pyqtgraph GUI stack.")
+
+
+def _scan_unit_demo() -> None:
+    """sin²ψ strain — a scan-unit analyzer driven through the SAME contract.
+
+    The unit is the whole (q, χ) polar map (not per-frame); it rides on
+    ``AnalysisInput.result_1d`` and the runner branches on ``unit='scan'`` to
+    call ``analyze_scan`` once.  Here a synthetic map whose Bragg peak walks with
+    sin²ψ gives a clean d-vs-sin²ψ regression."""
+    from xrd_tools.analysis.plans import Sin2PsiPlan
+    from xrd_tools.analysis.runner import AnalysisInput, Sin2PsiAnalyzer
+    from xrd_tools.core.containers import IntegrationResult2D
+
+    q = np.linspace(2.0, 4.0, 400)
+    chi = np.linspace(-40.0, 40.0, 33)
+    intensity = np.zeros((q.size, chi.size))
+    for j, c in enumerate(chi):
+        s2 = np.sin(np.deg2rad(abs(c))) ** 2
+        intensity[:, j] = 1.0e4 * np.exp(
+            -0.5 * ((q - (3.0 + 0.02 * s2)) / 0.03) ** 2) + 100.0
+    polar = IntegrationResult2D(radial=q, azimuthal=chi, intensity=intensity,
+                                unit="q_A^-1", azimuthal_unit="chi_deg")
+
+    analyzer = Sin2PsiAnalyzer(Sin2PsiPlan(q_range=(2.7, 3.3), chi_width=5.0))
+    assert analyzer.unit == "scan"
+    out = analyzer.analyze_scan(
+        [AnalysisInput(label="sin2psi", x=q, y=intensity[:, 0], result_1d=polar)])
+    assert out.ok, out.message
+    print(f"scan-unit (sin2psi): d0={out.params['d0']:.4f} Å, "
+          f"slope={out.params['slope']:+.4f}, R²={out.params['r_squared']:.3f} "
+          f"over {int(out.params['n_sectors'])} χ-sectors")
 
 
 if __name__ == "__main__":
