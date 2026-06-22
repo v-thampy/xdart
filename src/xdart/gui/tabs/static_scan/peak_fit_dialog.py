@@ -92,6 +92,10 @@ class PeakFitDialog(QtWidgets.QDialog):
         self.npeaks_spin.setEnabled(False)        # auto on by default
         self.refresh_btn = QtWidgets.QPushButton("Reload")
         self.refresh_btn.setToolTip("Re-grab the currently selected frame's pattern")
+        self.live_check = QtWidgets.QCheckBox("Live")
+        self.live_check.setToolTip(
+            "Re-fit automatically as new frames arrive during a scan "
+            "(latest-wins — the fit tracks the newest frame).")
         self.fit_btn = QtWidgets.QPushButton("Fit")
         self.fit_btn.setObjectName("peakFitGo")
         controls.addWidget(QtWidgets.QLabel("Model"))
@@ -103,6 +107,7 @@ class PeakFitDialog(QtWidgets.QDialog):
         controls.addWidget(self.npeaks_spin)
         controls.addStretch(1)
         controls.addWidget(self.refresh_btn)
+        controls.addWidget(self.live_check)
         controls.addWidget(self.fit_btn)
         lay.addLayout(controls)
 
@@ -236,6 +241,19 @@ class PeakFitDialog(QtWidgets.QDialog):
             self.region.hide()
             return
         x, y, x_label = data
+        self._show_pattern(x, y, x_label)
+        n = int(np.sum(np.isfinite(self._y)))
+        self.status.setText(f"Loaded {n} points. Set the model and click Fit.")
+
+    def set_live_pattern(self, x, y, x_label):
+        """Show a pattern pushed by the live runner — the data appears at once;
+        the fit overlay arrives later via :meth:`_draw_outcome` on the worker
+        result.  Called by staticWidget's live controller per frame."""
+        self._clear_fit()
+        self._show_pattern(x, y, x_label)
+
+    def _show_pattern(self, x, y, x_label):
+        """Draw the raw pattern + the fit-range region and set self._x / self._y."""
         self._x = np.asarray(x, dtype=float)
         self._y = np.asarray(y, dtype=float)
         self._x_label = x_label or "q"
@@ -255,8 +273,6 @@ class PeakFitDialog(QtWidgets.QDialog):
             self._sync_guard = False
         self.region.show()
         self._region_to_fields()
-        n = int(np.sum(np.isfinite(self._y)))
-        self.status.setText(f"Loaded {n} points. Set the model and click Fit.")
 
     def _clear_fit(self):
         self.resid_plot.clear()
@@ -281,18 +297,24 @@ class PeakFitDialog(QtWidgets.QDialog):
             idx = idx[keep]
         return sorted(float(x[i]) for i in idx)
 
-    def _do_fit(self):
+    def build_fit_request(self):
+        """Build ``(AnalysisInput, PeakFitAnalyzer)`` from the current pattern +
+        controls, or ``None`` (with a status message) if it can't be fit.
+
+        Shared by the manual Fit button (synchronous) AND the live worker
+        (background), so live + manual fit identically — the dialog is just one
+        consumer of the agnostic Analyzer contract."""
         if self._x is None or self._y is None:
-            self.refresh_pattern()
-            if self._x is None:
-                return
+            return None
         try:
-            from xrd_tools.analysis.fitting import fit_peaks
+            from xrd_tools.analysis.fitting import fit_peaks  # noqa: F401  lmfit probe
         except Exception:
             self.status.setText(
                 "Peak fitting needs lmfit — install it with "
                 "`pip install \"xrd-tools[fitting]\"`, then reopen.")
-            return
+            return None
+        from xrd_tools.analysis.plans import PeakFitPlan
+        from xrd_tools.analysis.runner import AnalysisInput, PeakFitAnalyzer
 
         model = _MODELS[self.model_combo.currentIndex()][1]
         background = _BACKGROUNDS[self.bkg_combo.currentIndex()][1]
@@ -311,7 +333,7 @@ class PeakFitDialog(QtWidgets.QDialog):
                 self.status.setText(
                     "No peaks auto-detected in this range — narrow the range or "
                     "uncheck Auto and set a count.")
-                return
+                return None
             n_peaks = len(positions)
             self.npeaks_spin.blockSignals(True)
             self.npeaks_spin.setValue(min(n_peaks, _MAX_PEAKS))
@@ -321,24 +343,30 @@ class PeakFitDialog(QtWidgets.QDialog):
 
         if x.size < max(5, 3 * n_peaks):
             self.status.setText("Not enough finite points in the range to fit.")
-            return
-        # Run through the agnostic Analyzer (the SAME contract the live + batch
-        # runners drive) rather than calling fit_peaks directly — the dialog is
-        # now just one consumer of PeakFitAnalyzer.
-        from xrd_tools.analysis.plans import PeakFitPlan
-        from xrd_tools.analysis.runner import AnalysisInput, PeakFitAnalyzer
+            return None
         plan = PeakFitPlan(
             positions=tuple(positions) if positions else None,
             model=model, n_peaks=n_peaks, background=background)
-        outcome = PeakFitAnalyzer(plan).analyze(
-            AnalysisInput(label="current", x=x, y=y, x_unit=self._x_label))
-        if not outcome.ok:
-            self.status.setText(
-                f"Fit failed: {outcome.message or 'did not converge'}")
-            return
-        self._draw_outcome(x, y, outcome, auto=self.auto_check.isChecked())
+        inp = AnalysisInput(label="current", x=x, y=y, x_unit=self._x_label)
+        return inp, PeakFitAnalyzer(plan)
 
-    def _draw_outcome(self, x, y, outcome, auto=False):
+    def _do_fit(self):
+        if self._x is None or self._y is None:
+            self.refresh_pattern()
+            if self._x is None:
+                return
+        req = self.build_fit_request()
+        if req is None:
+            return
+        inp, analyzer = req
+        outcome = analyzer.analyze(inp)
+        if not outcome or not outcome.ok:
+            self.status.setText(
+                f"Fit failed: {outcome.message if outcome else 'no result'}")
+            return
+        self._draw_outcome(outcome, auto=self.auto_check.isChecked())
+
+    def _draw_outcome(self, outcome, auto=False):
         # data over the FULL pattern (context); the analyzer's Overlay traces
         # (fit / background / residual) over the fitted range.
         overlay = outcome.overlay

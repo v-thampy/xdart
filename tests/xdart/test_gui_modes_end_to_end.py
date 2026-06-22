@@ -505,6 +505,51 @@ def test_peak_fit_tool_wired_in_static_widget(widget):
     assert w._peak_fit_dialog is not None and not w._peak_fit_dialog.isModal()
 
 
+def test_peak_fit_live_path_draws_outcome(qapp):
+    """Step 3 (live): set_live_pattern shows the data, build_fit_request + analyze
+    produce an outcome, and _draw_outcome fills the table — the exact path the
+    live worker drives, run synchronously here so it's lmfit-real but not flaky."""
+    pytest.importorskip("lmfit")
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 5.0, 600)
+
+    def g(c, s, a):
+        return a * np.exp(-0.5 * ((x - c) / s) ** 2)
+
+    y = g(2.0, 0.05, 1.0e5) + g(3.5, 0.07, 6.0e4) + 2000.0 + 500.0 * x
+    # The provider returns nothing — live PUSHES the pattern (set_live_pattern),
+    # it doesn't pull through the provider.
+    dlg = PeakFitDialog(lambda: None)
+    try:
+        dlg.live_check.setChecked(True)
+        dlg.auto_check.setChecked(False)
+        dlg.npeaks_spin.setValue(2)
+        dlg.model_combo.setCurrentText("Gaussian")
+        dlg.set_live_pattern(x, y, "q (Å⁻¹)")  # data shown immediately
+        req = dlg.build_fit_request()          # same request manual Fit builds
+        assert req is not None
+        inp, analyzer = req
+        outcome = analyzer.analyze(inp)
+        assert outcome.ok
+        dlg._draw_outcome(outcome, auto=False)
+        assert dlg.table.rowCount() == 2
+        centers = sorted(float(dlg.table.item(r, 1).text())
+                         for r in range(dlg.table.rowCount()))
+        assert abs(centers[0] - 2.0) < 0.05 and abs(centers[1] - 3.5) < 0.05
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_live_fit_is_noop_without_open_dialog(widget):
+    """set_data calls _maybe_live_fit on every frame, so with the dialog closed
+    (or Live off) it must be a cheap no-op that never spins up the worker."""
+    w = widget
+    assert w._peak_fit_dialog is None
+    w._maybe_live_fit()                        # no dialog -> no-op
+    assert w._live_analysis_worker is None     # worker stays lazy until a real request
+
+
 def test_image_widget_colorbar_limits_nan_aware(qapp):
     """Regression: a NaN-masked frame must still display with percentile levels.
 
@@ -1126,7 +1171,7 @@ def _set_int_scan(w, *, n=1, wavelength_m=0.7293e-10):
         scan_lock=threading.RLock(),
         frames=SimpleNamespace(index=list(range(n))),
         gi=False, skip_2d=False, name="scan", global_mask=None,
-        scan_data=SimpleNamespace(columns=[]), bai_2d_args={},
+        scan_data=SimpleNamespace(columns=[]), bai_1d_args={}, bai_2d_args={},
         series_average=False, single_img=False,
         mg_args={"wavelength": wavelength_m})
     df.viewer_mode = None
@@ -1405,6 +1450,7 @@ def test_int_plot_slice_characterizes_update_plot_state(widget):
     w = widget
     df = _set_int_scan(w, n=1)
     df.ui.plotMethod.setCurrentText("Single")
+    df.update()                                # populate the plot-unit axes first
     chi_index = df.ui.plotUnit.findText("χ (°)")
     assert chi_index >= 0
     df.ui.plotUnit.setCurrentIndex(chi_index)

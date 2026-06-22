@@ -474,6 +474,12 @@ class staticWidget(QWidget):
         # hosts a Tools placeholder for planned modules.
         self._metadata_dialog = None
         self._peak_fit_dialog = None
+        # Live analysis preview (analyzer framework Step 3): a latest-wins
+        # background worker re-fits the newest frame while the dialog's "Live"
+        # toggle is on.  Lazily created on first live request; generation gates
+        # stale results.
+        self._live_analysis_worker = None
+        self._live_fit_gen = 0
         self._build_tools_placeholder()
 
     def _build_tools_placeholder(self):
@@ -573,11 +579,65 @@ class staticWidget(QWidget):
             from .peak_fit_dialog import PeakFitDialog
             self._peak_fit_dialog = PeakFitDialog(
                 self._current_pattern_for_fit, parent=self)
+            # Toggling Live on re-fits the current frame at once (then every new
+            # frame, via set_data); off just stops pushing.
+            self._peak_fit_dialog.live_check.toggled.connect(
+                self._on_live_fit_toggled)
         dlg = self._peak_fit_dialog
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
         dlg.refresh_pattern()
+
+    def _on_live_fit_toggled(self, on):
+        """Live checkbox flipped — fit the current frame immediately on enable so
+        there's no wait for the next frame; disabling just stops the pushes."""
+        if on:
+            self._maybe_live_fit()
+
+    def _ensure_live_analysis_worker(self):
+        """Lazily create + start the latest-wins live analysis worker."""
+        if self._live_analysis_worker is None:
+            from .analysis_worker import LiveAnalysisWorker
+            self._live_analysis_worker = LiveAnalysisWorker(self)
+            self._live_analysis_worker.sigAnalyzed.connect(self._on_live_analyzed)
+            self._live_analysis_worker.start()
+        return self._live_analysis_worker
+
+    def _maybe_live_fit(self):
+        """If the Peak Fitting dialog is open with Live on, push the current
+        frame's pattern to it and request a background re-fit (latest-wins).
+
+        Called from ``set_data`` (per frame) and on Live-toggle.  The analyzer +
+        request are built through the dialog's own ``build_fit_request`` so live
+        and the manual Fit button behave identically."""
+        dlg = self._peak_fit_dialog
+        if dlg is None or not dlg.isVisible() or not dlg.live_check.isChecked():
+            return
+        data = self._current_pattern_for_fit()
+        if not data:
+            return
+        x, y, label = data
+        dlg.set_live_pattern(x, y, label)   # show the data now; fit overlays async
+        req = dlg.build_fit_request()
+        if req is None:                      # nothing fittable (status set by dialog)
+            return
+        inp, analyzer = req
+        self._live_fit_gen += 1
+        self._ensure_live_analysis_worker().request(
+            label, self._live_fit_gen, analyzer, inp)
+
+    def _on_live_analyzed(self, label, generation, outcome):
+        """Draw a live fit result — but only if it's still the newest request and
+        the dialog is still open + Live (a stale or superseded result is dropped,
+        so the overlay never lags behind the displayed frame)."""
+        if generation != self._live_fit_gen:
+            return
+        dlg = self._peak_fit_dialog
+        if dlg is None or not dlg.isVisible() or not dlg.live_check.isChecked():
+            return
+        if outcome is not None and outcome.ok:
+            dlg._draw_outcome(outcome, auto=dlg.auto_check.isChecked())
 
     def _open_metadata_dialog(self):
         """Open (or re-show) the frame-metadata popup.
@@ -1399,6 +1459,9 @@ class staticWidget(QWidget):
             self.metawidget.update()
             # self.integratorTree.update()
 
+            # Live peak-fit preview (no-op unless the dialog is open + Live on).
+            self._maybe_live_fit()
+
     def _hydrate_integrator_on_load(self, *args):
         """Stage C: when a ``.nxs`` is loaded, populate the integration panel from
         the saved scan (units/npts/ranges/GI), so the panel shows the saved
@@ -1502,6 +1565,14 @@ class staticWidget(QWidget):
                 df.stop_aggregation_worker()
         except Exception:
             logger.debug("hydration-worker shutdown on close failed",
+                         exc_info=True)
+        # Stop the live analysis worker (latest-wins preview) before teardown.
+        try:
+            law = getattr(self, '_live_analysis_worker', None)
+            if law is not None:
+                law.stop()
+        except Exception:
+            logger.debug("live-analysis-worker shutdown on close failed",
                          exc_info=True)
         del self.scan
         del self.displayframe.scan
