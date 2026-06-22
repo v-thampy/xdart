@@ -529,6 +529,39 @@ plt.tight_layout(); plt.show()"""),
   widths / areas (peak shifts vs. temperature, line broadening
   analysis).
 """),
+    md("""---
+
+## The analysis-agnostic runner contract
+
+`fit_peaks` / `PhaseFitter` above are the analysis **primitives**.  xdart's
+live + batch peak-fit runners don't call them directly — they drive an
+`Analyzer` (`xrd_tools.analysis.runner`): a uniform contract that wraps an
+analysis *Plan* and projects its result into a flat `params` dict + display
+traces, so the same live/batch machinery can drive peak-fit today and
+phase-fit / sin²ψ later (the runner branches once on `unit`, nothing else).
+
+See `examples/headless_analysis.py` for the standalone runnable version."""),
+    code("""from xrd_tools.analysis.plans import PeakFitPlan
+from xrd_tools.analysis.runner import AnalysisInput, PeakFitAnalyzer
+
+# Wrap the SAME peak fit as a frame-unit Analyzer.
+analyzer = PeakFitAnalyzer(PeakFitPlan(
+    positions=tuple(float(p) for p in positions),
+    model='pseudovoigt', background=background))
+outcome = analyzer.analyze(
+    AnalysisInput(label='0', x=q[mask], y=intensity[mask], x_unit='q'))
+
+print('ok:', outcome.ok, '| kind:', analyzer.kind, '| unit:', analyzer.unit)
+# Flat per-frame params — the series a batch run plots vs frame number:
+print('params:', {k: round(v, 3) for k, v in outcome.params.items()})
+# Display overlay (fit / background / residual traces + peak-center markers):
+print('overlay traces:', sorted(outcome.overlay.traces),
+      '| markers:', [round(m, 3) for m in outcome.overlay.markers])"""),
+    md("""`outcome.params` (`center_i` / `fwhm_i` / `amplitude_i`) is exactly
+what `run_batch(analyzer, inputs)` + `batch_params_table(...)` accumulate into
+a parameters-vs-frame series, and `outcome.overlay` is what the live preview
+draws.  A scan-unit analyzer (`unit='scan'`, e.g. sin²ψ across tilts) instead
+consumes a whole set at once — same runner, one branch."""),
 ]
 
 
@@ -887,6 +920,11 @@ print(f'one-call stress = {one_shot.stress}'
   primitives.
 - For multi-peak strain analysis, run `sin2psi_analysis` per peak and
   aggregate the regression slopes.
+- sin²ψ is a **scan-unit** analysis (a whole set of χ-sector/tilt patterns
+  → one result). The headless callables (`Sin2PsiPlan` / `run_sin2psi`, and
+  the primitives above) exist today; a `Sin2PsiAnalyzer` wrapper for the
+  agnostic runner contract (`unit='scan'`, so xdart's batch machinery could
+  drive it like peak-fit — see notebook 03) is a planned addition.
 """),
 ]
 

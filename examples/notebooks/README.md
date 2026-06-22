@@ -1,6 +1,6 @@
-# `ssrl_xrd_tools` example notebooks
+# `xrd_tools` example notebooks
 
-End-to-end demonstrations of the headless `ssrl_xrd_tools` API.
+End-to-end demonstrations of the headless `xrd_tools` API.
 
 Every notebook follows the same convention:
 
@@ -54,13 +54,13 @@ exercise:
 
 ```bash
 # Minimal headless install — sufficient for notebooks 01, 02:
-pip install ssrl_xrd_tools
+pip install xrd-tools
 
 # For fitting (notebooks 03, 04, 05):
-pip install "ssrl_xrd_tools[fitting]"
+pip install "xrd-tools[fitting]"
 
 # Full kitchen sink (you'll thank yourself later):
-pip install "ssrl_xrd_tools[all]"
+pip install "xrd-tools[all]"
 ```
 
 > `uv pip install` is **10–100× faster** if you have `uv` on hand —
