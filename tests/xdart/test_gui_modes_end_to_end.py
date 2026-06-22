@@ -316,11 +316,16 @@ def test_wrangler_tree_polish(widget):
     w = widget
     tree = w.wrangler.tree
     assert tree.header().minimumSectionSize() == 40
-    # Direction-A Stage 3a: the name column is widened (resizeSection(0, 100), was
+    # Direction-A Stage 3a: the name column is widened (resizeSection(0, 120), was
     # 79) so card-row labels like "Average Scan" / "Write Mode" don't clip.  The
     # *rendered* sectionSize is environment-dependent (clamped to the realized
-    # tree width — tiny offscreen, ~100 in the real 334px panel), so it's not a
-    # reliable headless assertion; the widening is verified by construction.
+    # tree width — tiny offscreen, ~120 in the real 334px panel), so it's not a
+    # reliable headless assertion; the widening is verified by construction.  What
+    # IS deterministic is the resize MODE: pyqtgraph defaults col 0 to
+    # ResizeToContents (which silently ignored resizeSection + clipped labels);
+    # the fix forces Interactive so the fixed width actually applies.  Guard it.
+    from PySide6.QtWidgets import QHeaderView
+    assert tree.header().sectionResizeMode(0) == QHeaderView.ResizeMode.Interactive
     # The wrangler tree is themed via the GLOBAL QSS by object name (replacing
     # the old inline Dracula stylesheet), so it renders in both Dark and Light
     # and live-switches.  Assert the QSS hook + that the rules exist, not colours
@@ -368,6 +373,104 @@ def test_param_rows_hide_reset_glyph(qapp):
     finally:
         tree.deleteLater()
         qapp.processEvents()
+
+
+def test_theme_token_and_selector_invariants():
+    """Direction-A guard rails for the theme refactor:
+    (1) DARK and LIGHT define the SAME token set and both render with no
+        unresolved ``$token`` — ``string.Template.substitute`` raises on a missing
+        key, so a one-sided token would crash ``render_qss`` (and the live app).
+    (2) NO descendant selector targets the integrator's ``frame1D``/``frame2D``
+        subtree, which is REPARENTED at runtime (frame_3 -> toolsFrame,
+        integratorFrame.setLayout) — a descendant style rule across a reparented
+        subtree segfaults Qt's style engine at teardown (the Stage-3b Mono-rule
+        crash).  Only direct ``#id`` selectors are allowed there."""
+    import re
+    from xdart.gui.themes.dark import DARK, LIGHT, _QSS_TEMPLATE, render_qss
+    assert set(DARK) == set(LIGHT)
+    for name in ("dark", "light"):
+        assert not re.search(r"\$\w+", render_qss(name)), f"unresolved token in {name}"
+    assert "#frame1D Q" not in _QSS_TEMPLATE, "descendant selector on reparented frame1D"
+    assert "#frame2D Q" not in _QSS_TEMPLATE, "descendant selector on reparented frame2D"
+
+
+def test_metadata_popup_and_tools_placeholder(widget):
+    """Stage 4 (Direction A): the metadata table opens as an on-demand non-modal
+    popup (reparenting the live metawidget) and the vacated bottom-left hosts the
+    Tools placeholder."""
+    from PySide6 import QtWidgets
+    w = widget
+    # The Metadata button exists in the Data-Browser button row.
+    assert hasattr(w.h5viewer.ui, "metadata_btn")
+    # Tools placeholder occupies metaFrame (the table is no longer inline there).
+    assert w.ui.metaFrame.findChild(QtWidgets.QFrame, "toolsPlaceholder") is not None
+    labels = {l.text() for l in w.ui.metaFrame.findChildren(QtWidgets.QLabel)
+              if l.objectName() == "toolLabel"}
+    assert {"Peak Fitting", "Plot Metadata"} <= labels
+    # Opening the popup reparents the live metawidget into a non-modal dialog.
+    assert w._metadata_dialog is None
+    w._open_metadata_dialog()
+    dlg = w._metadata_dialog
+    assert dlg is not None and not dlg.isModal()
+    assert dlg.isAncestorOf(w.metawidget)
+    # Idempotent: a second open reuses the single instance.
+    w._open_metadata_dialog()
+    assert w._metadata_dialog is dlg
+
+
+def test_peak_fit_dialog_fits_synthetic_pattern(qapp):
+    """Tools ▸ Peak Fitting: the self-contained dialog fits the provided 1-D
+    pattern via xrd_tools.analysis.fitting and fills its results table.  Uses a
+    synthetic two-Gaussian pattern so the recovered centers are checkable."""
+    lmfit = pytest.importorskip("lmfit")  # the xrd-tools[fitting] extra
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    x = np.linspace(1.0, 5.0, 600)
+
+    def g(c, s, a):
+        return a * np.exp(-0.5 * ((x - c) / s) ** 2)
+
+    y = g(2.0, 0.05, 1.0e5) + g(3.5, 0.07, 6.0e4) + 2000.0 + 500.0 * x
+    dlg = PeakFitDialog(lambda: (x, y, "q (Å⁻¹)"))
+    try:
+        dlg.npeaks_spin.setValue(2)
+        dlg.model_combo.setCurrentText("Gaussian")
+        dlg.refresh_pattern()
+        dlg._do_fit()
+        assert dlg.table.rowCount() == 2
+        centers = sorted(float(dlg.table.item(r, 1).text())
+                         for r in range(dlg.table.rowCount()))
+        assert abs(centers[0] - 2.0) < 0.05
+        assert abs(centers[1] - 3.5) < 0.05
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_peak_fit_dialog_handles_no_pattern(qapp):
+    """No frame selected -> the dialog reports it and does not crash on Fit."""
+    from xdart.gui.tabs.static_scan.peak_fit_dialog import PeakFitDialog
+    dlg = PeakFitDialog(lambda: None)
+    try:
+        dlg.refresh_pattern()
+        assert dlg.table.rowCount() == 0
+        dlg._do_fit()                      # must not raise
+        assert dlg.table.rowCount() == 0
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_peak_fit_tool_wired_in_static_widget(widget):
+    """The Tools card exposes an active 'Open' affordance for Peak Fitting and
+    staticWidget can build the dialog (lazy, non-modal)."""
+    from PySide6 import QtWidgets
+    w = widget
+    opens = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
+             if b.objectName() == "toolOpen"]
+    assert len(opens) == 1                 # Peak Fitting active; Plot Metadata planned
+    assert w._peak_fit_dialog is None
+    w._open_peak_fit_dialog()
+    assert w._peak_fit_dialog is not None and not w._peak_fit_dialog.isModal()
 
 
 def test_image_widget_colorbar_limits_nan_aware(qapp):

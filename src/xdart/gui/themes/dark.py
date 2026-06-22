@@ -453,6 +453,13 @@ QLabel#label1D, QLabel#label2D {
     border-radius: 4px;
     font-weight: 700;
 }
+/* When the 1-D/2-D card is disabled (viewer modes / Int-1D 2-D block / during a
+   run) the pill must dim with the rest of the card — the ID selector outranks
+   the generic QLabel:disabled rule, so it needs its own :disabled variant. */
+QLabel#label1D:disabled, QLabel#label2D:disabled {
+    background-color: $accent_muted;
+    color: $text_muted;
+}
 
 /* ── Tools placeholder + Metadata popup (Stage 4) ─────────────── */
 /* The inline metadata table moved into the on-demand "Metadata" dialog; the
@@ -485,6 +492,22 @@ QLabel#toolChip {
     font-family: "IBM Plex Mono", Menlo, Consolas, monospace;
 }
 QLabel#toolsNote {
+    color: $text_muted;
+}
+/* Active-tool "Open" affordance + the Peak Fitting popup's primary Fit button. */
+QPushButton#toolOpen, QPushButton#peakFitGo {
+    background-color: $accent;
+    color: $accent_on_text;
+    border: 1px solid $accent;
+    border-radius: 4px;
+    padding: 1px 10px;
+    font-weight: 700;
+}
+QPushButton#toolOpen:hover, QPushButton#peakFitGo:hover {
+    background-color: $accent_hover;
+    border-color: $accent_hover;
+}
+QLabel#peakFitStatus {
     color: $text_muted;
 }
 

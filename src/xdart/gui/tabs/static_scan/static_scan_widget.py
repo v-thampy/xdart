@@ -473,14 +473,15 @@ class staticWidget(QWidget):
         # the publication store exactly as before.  The vacated metaFrame now
         # hosts a Tools placeholder for planned modules.
         self._metadata_dialog = None
+        self._peak_fit_dialog = None
         self._build_tools_placeholder()
 
     def _build_tools_placeholder(self):
-        """Fill the vacated bottom-left ``metaFrame`` with a 'Tools' placeholder.
+        """Fill the vacated bottom-left ``metaFrame`` with the 'Tools' card.
 
-        Reserves the corner freed by moving the metadata table into a popup for
-        planned modules.  Purely cosmetic — the two rows are disabled stubs
-        (no behaviour), easy to populate later."""
+        Reclaims the corner freed by moving the metadata table into a popup.
+        Active tools get an 'Open' button; not-yet-built ones show a disabled
+        PLANNED chip.  Peak Fitting is wired (``_open_peak_fit_dialog``)."""
         lay = QtWidgets.QVBoxLayout(self.ui.metaFrame)
         lay.setContentsMargins(13, 11, 13, 13)
         lay.setSpacing(8)
@@ -494,7 +495,12 @@ class staticWidget(QWidget):
         card_lay = QtWidgets.QVBoxLayout(card)
         card_lay.setContentsMargins(11, 11, 11, 11)
         card_lay.setSpacing(8)
-        for name in ('Peak Fitting', 'Plot Metadata'):
+        # (label, handler-or-None).  Handler => active tool with an Open button.
+        tools = [
+            ('Peak Fitting', self._open_peak_fit_dialog),
+            ('Plot Metadata', None),
+        ]
+        for name, handler in tools:
             row = QtWidgets.QWidget()
             row_lay = QtWidgets.QHBoxLayout(row)
             row_lay.setContentsMargins(0, 0, 0, 0)
@@ -504,23 +510,74 @@ class staticWidget(QWidget):
             dot.setFixedSize(7, 7)
             label = QtWidgets.QLabel(name)
             label.setObjectName('toolLabel')
-            chip = QtWidgets.QLabel('PLANNED')
-            chip.setObjectName('toolChip')
             row_lay.addWidget(dot)
             row_lay.addWidget(label)
             row_lay.addStretch(1)
-            row_lay.addWidget(chip)
-            row.setEnabled(False)          # reads as inactive (D2 disabled styling)
+            if handler is not None:
+                open_btn = QtWidgets.QPushButton('Open')
+                open_btn.setObjectName('toolOpen')
+                open_btn.clicked.connect(handler)
+                row_lay.addWidget(open_btn)
+            else:
+                chip = QtWidgets.QLabel('PLANNED')
+                chip.setObjectName('toolChip')
+                row_lay.addWidget(chip)
+                row.setEnabled(False)      # reads as inactive (D2 disabled styling)
             card_lay.addWidget(row)
         lay.addWidget(card)
 
         note = QtWidgets.QLabel(
-            'Space reclaimed from the metadata table — reserved for the fitting '
-            'module and a metadata-vs-frame plot picker.')
+            'Peak Fitting fits the selected frame’s 1-D pattern. '
+            'Plot Metadata is planned.')
         note.setObjectName('toolsNote')
         note.setWordWrap(True)
         lay.addWidget(note)
         lay.addStretch(1)
+
+    def _current_pattern_for_fit(self):
+        """Return ``(x, y, x_label)`` for the selected frame's 1-D pattern, or
+        ``None``.  Reads the same data + axis unit the main 1-D plot shows, so a
+        fit always matches what the user is looking at."""
+        idxs = getattr(self, 'frame_ids', None) or []
+        if not idxs:
+            return None
+        try:
+            idx = int(idxs[0])
+        except (TypeError, ValueError):
+            return None
+        try:
+            ydata, xdata = self.displayframe.get_frames_int_1d([idx], rv='all')
+        except Exception:
+            logger.exception("peak-fit: get_frames_int_1d failed")
+            return None
+        if xdata is None or ydata is None:
+            return None
+        import numpy as np
+        x = np.asarray(xdata)
+        y = np.asarray(ydata)
+        if y.ndim > 1:
+            y = y[0]
+        if x.size == 0 or y.size == 0:
+            return None
+        try:
+            label = self.displayframe.ui.plotUnit.currentText()
+        except Exception:
+            label = 'q'
+        return x, y, label
+
+    def _open_peak_fit_dialog(self):
+        """Open (or re-show) the Peak Fitting popup — lazy, single-instance,
+        non-modal (so the live scan + frame browsing stay responsive; Reload
+        re-grabs the current frame)."""
+        if self._peak_fit_dialog is None:
+            from .peak_fit_dialog import PeakFitDialog
+            self._peak_fit_dialog = PeakFitDialog(
+                self._current_pattern_for_fit, parent=self)
+        dlg = self._peak_fit_dialog
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.refresh_pattern()
 
     def _open_metadata_dialog(self):
         """Open (or re-show) the frame-metadata popup.
