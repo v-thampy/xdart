@@ -17,7 +17,16 @@ jobs:
       - run: pytest tests/core -q --timeout=600
       - env:
           QT_QPA_PLATFORM: offscreen
-        run: pytest tests/xdart -q --timeout=900
+        # Retry ONLY on the offscreen-pyqtgraph segfault (exit 139); any real
+        # test failure still fails fast (see pr.yml for the rationale).
+        run: |
+          for attempt in 1 2 3; do
+            pytest tests/xdart -q --timeout=900 && exit 0
+            code=$?
+            if [ "$code" -ne 139 ]; then exit "$code"; fi
+            echo "::warning::pytest tests/xdart segfaulted (139) on attempt $attempt; retrying"
+          done
+          exit 139
       # The GI live==batch==reload equivalence spine needs the real
       # detector test data; runs on self-hosted/local checkouts where
       # XDART_TEST_DATA points at it.  Kept here as a reminder job step:

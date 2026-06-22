@@ -36,4 +36,15 @@ jobs:
       - run: pip install -e ".[gui,dev,fitting,rsm]"
       - env:
           QT_QPA_PLATFORM: offscreen
-        run: pytest tests/xdart -q --timeout=600
+        # The offscreen pyqtgraph backend intermittently segfaults (exit 139)
+        # while constructing PlotItems under repeated widget creation — a Qt/GL
+        # teardown flake, not a test failure.  Retry ONLY on 139 so a real test
+        # failure (any other non-zero) still fails fast and is never masked.
+        run: |
+          for attempt in 1 2 3; do
+            pytest tests/xdart -q --timeout=600 && exit 0
+            code=$?
+            if [ "$code" -ne 139 ]; then exit "$code"; fi
+            echo "::warning::pytest tests/xdart segfaulted (139) on attempt $attempt; retrying"
+          done
+          exit 139

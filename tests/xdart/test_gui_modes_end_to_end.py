@@ -950,7 +950,14 @@ def _set_int_scan(w, *, n=1, wavelength_m=0.7293e-10):
         scan_lock=threading.RLock(),
         frames=SimpleNamespace(index=list(range(n))),
         gi=False, skip_2d=False, name="scan", global_mask=None,
-        scan_data=SimpleNamespace(columns=[]), bai_2d_args={},
+        # Both bai_*_args must be present: _apply_1d_only_visibility reads
+        # scan.bai_1d_args even on the non-GI (else) path.  Omitting it made the
+        # display crash with AttributeError whenever a prior test left the
+        # display in 1d-only mode (green in the full suite only because other
+        # tests happened to keep it out of that path; red running this file
+        # alone, as CI does via `pytest tests/xdart`).  A real scan always has
+        # both, so this completes the mock rather than guarding production.
+        scan_data=SimpleNamespace(columns=[]), bai_1d_args={}, bai_2d_args={},
         series_average=False, single_img=False,
         mg_args={"wavelength": wavelength_m})
     df.viewer_mode = None
@@ -1229,6 +1236,7 @@ def test_int_plot_slice_characterizes_update_plot_state(widget):
     w = widget
     df = _set_int_scan(w, n=1)
     df.ui.plotMethod.setCurrentText("Single")
+    df.update()              # populate plotUnit (χ is added here, not at construction)
     chi_index = df.ui.plotUnit.findText("χ (°)")
     assert chi_index >= 0
     df.ui.plotUnit.setCurrentIndex(chi_index)
