@@ -21,6 +21,8 @@ from threading import Condition
 
 from pyqtgraph import Qt
 
+from xrd_tools.analysis.runner import batch_params_table, run_batch
+
 logger = logging.getLogger(__name__)
 
 
@@ -87,6 +89,54 @@ class LiveAnalysisWorker(Qt.QtCore.QThread):
         with self._cond:
             self._stop = True
             self._cond.notify_all()
+        if self.isRunning():
+            return bool(self.wait(timeout_ms))
+        return True
+
+
+class BatchAnalysisWorker(Qt.QtCore.QThread):
+    """Run an analyzer across EVERY frame's pattern off the GUI thread.
+
+    Unlike :class:`LiveAnalysisWorker` (latest-wins), batch processes the full
+    input set in order — emitting progress and returning the per-frame parameter
+    table for the vs-frame plot.  A thin thread around the headless
+    :func:`run_batch` / :func:`batch_params_table`; cancellable between frames."""
+
+    #: (done, total) progress after each frame.
+    sigProgress = Qt.QtCore.Signal(int, int)
+    #: (labels, columns) on completion — or (None, None) if cancelled.
+    sigBatchDone = Qt.QtCore.Signal(object, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._analyzer = None
+        self._inputs = []
+        self._cancel = False
+
+    def configure(self, analyzer, inputs) -> None:
+        """Set the analyzer + the per-frame inputs for the next ``start()``."""
+        self._analyzer = analyzer
+        self._inputs = list(inputs)
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        outcomes = run_batch(
+            self._analyzer, self._inputs,
+            on_progress=lambda done, total: self.sigProgress.emit(done, total),
+            should_cancel=lambda: self._cancel)
+        if self._cancel:
+            self.sigBatchDone.emit(None, None)   # cancelled -> no partial plot
+            return
+        labels, columns = batch_params_table(outcomes)
+        self.sigBatchDone.emit(labels, columns)
+
+    def stop(self, timeout_ms: int = 8000) -> bool:
+        """Request cancel + join (idempotent).  Longer default than the live
+        worker — a frame's fit must finish before the loop re-checks cancel."""
+        self._cancel = True
         if self.isRunning():
             return bool(self.wait(timeout_ms))
         return True

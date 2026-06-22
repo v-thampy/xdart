@@ -58,3 +58,90 @@ def test_peak_fit_analyzer_is_inert_on_failure():
     assert out.ok is False
     assert out.params == {}
     assert out.overlay is None
+
+
+# ── Batch driver (analysis-agnostic) ──────────────────────────────────────
+
+
+def test_run_batch_frame_unit_accumulates_per_input():
+    """Frame-unit: one outcome per input, in order, with progress ticks; the
+    table is the aligned vs-index series."""
+    from xrd_tools.analysis.runner import (
+        AnalysisInput, AnalysisOutcome, batch_params_table, run_batch)
+
+    class CountAnalyzer:
+        kind = "count"
+        unit = "frame"
+
+        def analyze(self, inp):
+            return AnalysisOutcome(label=inp.label, ok=True,
+                                   params={"center_0": float(inp.label)})
+
+        def analyze_scan(self, inputs):
+            raise AssertionError("frame-unit must not call analyze_scan")
+
+    inputs = [AnalysisInput(label=str(i), x=np.array([1.0]), y=np.array([1.0]))
+              for i in range(3)]
+    ticks = []
+    outs = run_batch(CountAnalyzer(), inputs,
+                     on_progress=lambda d, t: ticks.append((d, t)))
+    assert [o.label for o in outs] == ["0", "1", "2"]
+    assert ticks == [(1, 3), (2, 3), (3, 3)]
+    labels, cols = batch_params_table(outs)
+    assert labels == ["0", "1", "2"]
+    assert cols["center_0"] == [0.0, 1.0, 2.0]
+
+
+def test_run_batch_is_inert_when_a_frame_raises():
+    """A raising analyze() yields ok=False; the batch still completes and the
+    failed frame is nan in the table (kept aligned with labels)."""
+    from xrd_tools.analysis.runner import (
+        AnalysisInput, AnalysisOutcome, batch_params_table, run_batch)
+
+    class FlakyAnalyzer:
+        kind = "flaky"
+        unit = "frame"
+
+        def analyze(self, inp):
+            if inp.label == "1":
+                raise RuntimeError("bad frame")
+            return AnalysisOutcome(label=inp.label, ok=True,
+                                   params={"center_0": 5.0})
+
+        def analyze_scan(self, inputs):
+            raise AssertionError
+
+    inputs = [AnalysisInput(label=str(i), x=np.array([1.0]), y=np.array([1.0]))
+              for i in range(3)]
+    outs = run_batch(FlakyAnalyzer(), inputs)
+    assert [o.ok for o in outs] == [True, False, True]
+    labels, cols = batch_params_table(outs)
+    assert labels == ["0", "1", "2"]
+    assert cols["center_0"][0] == 5.0
+    assert np.isnan(cols["center_0"][1])       # raising frame -> nan, still aligned
+    assert cols["center_0"][2] == 5.0
+
+
+def test_run_batch_scan_unit_is_one_outcome():
+    """Scan-unit: the whole set is analyzed once -> a single-element list."""
+    from xrd_tools.analysis.runner import (
+        AnalysisInput, AnalysisOutcome, run_batch)
+
+    class ScanAnalyzer:
+        kind = "scan"
+        unit = "scan"
+
+        def analyze(self, inp):
+            raise AssertionError("scan-unit must not call analyze")
+
+        def analyze_scan(self, inputs):
+            return AnalysisOutcome(label="scan", ok=True,
+                                   params={"n": len(inputs)})
+
+    inputs = [AnalysisInput(label=str(i), x=np.array([1.0]), y=np.array([1.0]))
+              for i in range(4)]
+    ticks = []
+    outs = run_batch(ScanAnalyzer(), inputs,
+                     on_progress=lambda d, t: ticks.append((d, t)))
+    assert len(outs) == 1 and outs[0].params["n"] == 4
+    assert ticks == [(4, 4)]

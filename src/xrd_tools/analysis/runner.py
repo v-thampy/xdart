@@ -88,6 +88,71 @@ class Analyzer(Protocol):
 
 
 # --------------------------------------------------------------------------
+# Batch driver (analysis-agnostic) — the headless core the GUI batch worker
+# wraps in a thread, and the same call notebooks/pipelines use directly.
+# --------------------------------------------------------------------------
+
+
+def run_batch(analyzer, inputs, on_progress=None, should_cancel=None):
+    """Apply ``analyzer`` across a sequence of :class:`AnalysisInput`.
+
+    Branches ONCE on ``analyzer.unit`` (the single analysis-specific decision):
+
+    * ``"frame"`` — one outcome per input (e.g. peak/phase fitting), the
+      per-frame series a vs-index plot is built from.
+    * ``"scan"`` — the whole set is one unit (e.g. sin2psi/texture across
+      tilts); returns a single-element list.
+
+    Never raises for an analysis failure — a bad input yields an inert
+    ``ok=False`` outcome so the batch always completes.  ``on_progress(done,
+    total)`` is called after each input (and once at the end for scan-unit).
+    ``should_cancel()`` is polled before each frame (frame-unit only); if it
+    returns true the loop stops and the outcomes gathered so far are returned."""
+    inputs = list(inputs)
+    total = len(inputs)
+    if getattr(analyzer, "unit", "frame") == "scan":
+        try:
+            out = analyzer.analyze_scan(inputs)
+        except Exception as exc:  # noqa: BLE001 — inert on failure
+            out = AnalysisOutcome(label="scan", ok=False, message=str(exc))
+        if on_progress is not None:
+            on_progress(total, total)
+        return [out]
+    outcomes = []
+    for i, inp in enumerate(inputs):
+        if should_cancel is not None and should_cancel():
+            break
+        try:
+            out = analyzer.analyze(inp)
+        except Exception as exc:  # noqa: BLE001 — one bad frame can't abort the batch
+            out = AnalysisOutcome(label=inp.label, ok=False, message=str(exc))
+        outcomes.append(out)
+        if on_progress is not None:
+            on_progress(i + 1, total)
+    return outcomes
+
+
+def batch_params_table(outcomes):
+    """Flatten a list of :class:`AnalysisOutcome` to ``(labels, columns)``.
+
+    ``labels`` is one label per outcome (the frame index for frame-unit work);
+    ``columns`` is an order-preserving ``{param_name: [value per outcome]}`` —
+    the vs-index series for plotting or CSV export.  A param absent from a given
+    outcome (e.g. a frame where that peak wasn't fit) is ``nan``, so every column
+    is the same length and the series stay aligned with ``labels``."""
+    labels = [o.label for o in outcomes]
+    keys: "list[str]" = []
+    seen: "set[str]" = set()
+    for o in outcomes:
+        for k in o.params:
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+    columns = {k: [float(o.params.get(k, np.nan)) for o in outcomes] for k in keys}
+    return labels, columns
+
+
+# --------------------------------------------------------------------------
 # Peak fitting (frame-unit) — the first concrete analyzer.
 # --------------------------------------------------------------------------
 

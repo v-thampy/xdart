@@ -550,6 +550,101 @@ def test_live_fit_is_noop_without_open_dialog(widget):
     assert w._live_analysis_worker is None     # worker stays lazy until a real request
 
 
+def test_batch_param_family_helpers_are_pure():
+    """split_family / group_families parse the flat param keys into per-peak
+    families with no Qt — the basis for the vs-frame curves."""
+    from xdart.gui.tabs.static_scan.batch_fit_results_dialog import (
+        group_families, split_family)
+    assert split_family("center_0") == ("center", 0)
+    assert split_family("center_err_2") == ("center_err", 2)
+    assert split_family("amplitude") == ("amplitude", 0)
+    fams = group_families({"center_0": [], "center_1": [], "fwhm_0": []})
+    assert fams["center"] == [("center_0", 0), ("center_1", 1)]
+    assert fams["fwhm"] == [("fwhm_0", 0)]
+
+
+def test_batch_results_dialog_plots_param_vs_frame(qapp):
+    """Step 4: the results popup builds a family selector from the batch table
+    and plots one curve per peak vs frame; switching family re-draws."""
+    from xdart.gui.tabs.static_scan.batch_fit_results_dialog import (
+        BatchFitResultsDialog)
+    dlg = BatchFitResultsDialog()
+    try:
+        labels = ["0", "1", "2"]
+        columns = {"center_0": [2.0, 2.1, 2.2], "center_1": [3.5, 3.4, 3.6],
+                   "fwhm_0": [0.1, 0.1, 0.12], "amplitude_0": [1e5, 9e4, 1.1e5]}
+        dlg.set_results(labels, columns, x_unit="q (Å⁻¹)")
+        fams = [dlg.family_combo.itemData(i)
+                for i in range(dlg.family_combo.count())]
+        assert {"center", "fwhm", "amplitude"} <= set(fams)
+        # default family (first = center) -> two curves (center_0, center_1)
+        assert len(dlg.plot.getPlotItem().listDataItems()) == 2
+        dlg.family_combo.setCurrentIndex(fams.index("amplitude"))
+        assert len(dlg.plot.getPlotItem().listDataItems()) == 1
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_batch_results_dialog_handles_empty_table(qapp):
+    """No peaks fit anywhere -> empty table: the popup reports it and draws
+    nothing (no crash, no families)."""
+    from xdart.gui.tabs.static_scan.batch_fit_results_dialog import (
+        BatchFitResultsDialog)
+    dlg = BatchFitResultsDialog()
+    try:
+        dlg.set_results(["0", "1"], {}, x_unit="q")
+        assert dlg.family_combo.count() == 0
+        assert dlg.plot.getPlotItem().listDataItems() == []
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_batch_fit_through_static_widget_populates_results(widget, qapp):
+    """End-to-end Step 4: _run_batch_fit collects every frame's pattern, the
+    worker fits them off the GUI thread, and _on_batch_done opens the populated
+    vs-frame results popup — exercising the full signal wiring."""
+    import time
+    from types import SimpleNamespace
+    pytest.importorskip("lmfit")
+    w = widget
+
+    def fake_pattern(idx):
+        x = np.linspace(1.0, 5.0, 400)
+        shift = 0.02 * int(idx)              # peak drifts with frame -> series varies
+        y = (1.0e5 * np.exp(-0.5 * ((x - (2.0 + shift)) / 0.05) ** 2)
+             + 6.0e4 * np.exp(-0.5 * ((x - 3.5) / 0.07) ** 2) + 2000.0)
+        return x, y, "q (Å⁻¹)"
+
+    w._pattern_for_frame = fake_pattern      # feed synthetic patterns to batch
+    w.frame_ids = ["0"]
+    w.scan.frames = SimpleNamespace(index=[0, 1, 2])
+
+    w._open_peak_fit_dialog()
+    dlg = w._peak_fit_dialog
+    dlg.auto_check.setChecked(False)
+    dlg.npeaks_spin.setValue(2)
+    dlg.model_combo.setCurrentText("Gaussian")
+
+    w._run_batch_fit()
+    worker = w._batch_analysis_worker
+    assert worker is not None
+    deadline = time.monotonic() + 15
+    while worker.isRunning() and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    worker.wait(3000)
+    qapp.processEvents()                     # deliver the queued sigBatchDone
+
+    rd = w._batch_results_dialog
+    assert rd is not None
+    assert rd._labels == ["0", "1", "2"]
+    assert "center_0" in rd._columns and len(rd._columns["center_0"]) == 3
+    # the first peak's recovered center is near 2.0 across frames
+    assert all(abs(c - 2.0) < 0.1 for c in rd._columns["center_0"])
+
+
 def test_image_widget_colorbar_limits_nan_aware(qapp):
     """Regression: a NaN-masked frame must still display with percentile levels.
 

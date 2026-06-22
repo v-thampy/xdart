@@ -11,7 +11,7 @@ import pytest
 
 from pyqtgraph import Qt
 from xdart.gui.tabs.static_scan.analysis_worker import (
-    LiveAnalysisWorker, _run_analyzer,
+    BatchAnalysisWorker, LiveAnalysisWorker, _run_analyzer,
 )
 from xrd_tools.analysis.runner import AnalysisInput, AnalysisOutcome
 
@@ -160,3 +160,61 @@ def test_request_after_stop_is_a_noop(qapp):
     time.sleep(0.2)
     assert emitted == []
     assert analyzer.threads == []
+
+
+# ── Batch worker (every frame, in order, vs-frame table) ──────────────────
+
+
+def test_batch_worker_runs_all_frames_and_returns_table(qapp):
+    analyzer = FakeFrameAnalyzer()
+    done = threading.Event()
+    result = {}
+    progress = []
+    worker = BatchAnalysisWorker()
+    worker.sigProgress.connect(lambda d, t: progress.append((d, t)), _DIRECT)
+    worker.sigBatchDone.connect(
+        lambda labels, cols: (result.update(labels=labels, cols=cols), done.set()),
+        _DIRECT)
+    worker.configure(analyzer, [_inp(0), _inp(1), _inp(2)])
+    worker.start()
+    try:
+        assert done.wait(5.0), "batch worker never finished"
+        assert result["labels"] == ["0", "1", "2"]
+        assert result["cols"]["center_0"] == [0.0, 1.0, 2.0]   # vs-frame series
+        assert progress[-1] == (3, 3)
+    finally:
+        worker.stop()
+
+
+def test_batch_worker_cancel_emits_none(qapp):
+    """Cancelling mid-run emits (None, None) so the GUI shows no partial plot."""
+    started = threading.Event()
+    done = threading.Event()
+    result = {}
+
+    class SlowAnalyzer:
+        kind = "slow"
+        unit = "frame"
+
+        def analyze(self, inp):
+            started.set()
+            time.sleep(0.05)
+            return AnalysisOutcome(label=inp.label, ok=True,
+                                   params={"center_0": 1.0})
+
+        def analyze_scan(self, inputs):
+            raise AssertionError
+
+    worker = BatchAnalysisWorker()
+    worker.sigBatchDone.connect(
+        lambda labels, cols: (result.update(labels=labels, cols=cols), done.set()),
+        _DIRECT)
+    worker.configure(SlowAnalyzer(), [_inp(i) for i in range(50)])
+    worker.start()
+    try:
+        assert started.wait(2.0)
+        worker.cancel()
+        assert done.wait(5.0)
+        assert result["labels"] is None and result["cols"] is None
+    finally:
+        worker.stop()

@@ -480,6 +480,11 @@ class staticWidget(QWidget):
         # stale results.
         self._live_analysis_worker = None
         self._live_fit_gen = 0
+        # Batch analysis (Step 4): one worker fits every frame; the results
+        # popup plots parameters vs frame number.
+        self._batch_analysis_worker = None
+        self._batch_results_dialog = None
+        self._batch_x_unit = ""
         self._build_tools_placeholder()
 
     def _build_tools_placeholder(self):
@@ -540,15 +545,12 @@ class staticWidget(QWidget):
         lay.addWidget(note)
         lay.addStretch(1)
 
-    def _current_pattern_for_fit(self):
-        """Return ``(x, y, x_label)`` for the selected frame's 1-D pattern, or
-        ``None``.  Reads the same data + axis unit the main 1-D plot shows, so a
-        fit always matches what the user is looking at."""
-        idxs = getattr(self, 'frame_ids', None) or []
-        if not idxs:
-            return None
+    def _pattern_for_frame(self, idx):
+        """Return ``(x, y, x_label)`` for ONE frame's 1-D pattern, or ``None``.
+        Reads the same data + axis unit the main 1-D plot shows.  Shared by the
+        single-frame fit (selected frame) and batch (every frame)."""
         try:
-            idx = int(idxs[0])
+            idx = int(idx)
         except (TypeError, ValueError):
             return None
         try:
@@ -571,6 +573,14 @@ class staticWidget(QWidget):
             label = 'q'
         return x, y, label
 
+    def _current_pattern_for_fit(self):
+        """Return ``(x, y, x_label)`` for the SELECTED frame's 1-D pattern, or
+        ``None`` — so a fit always matches what the user is looking at."""
+        idxs = getattr(self, 'frame_ids', None) or []
+        if not idxs:
+            return None
+        return self._pattern_for_frame(idxs[0])
+
     def _open_peak_fit_dialog(self):
         """Open (or re-show) the Peak Fitting popup — lazy, single-instance,
         non-modal (so the live scan + frame browsing stay responsive; Reload
@@ -583,6 +593,7 @@ class staticWidget(QWidget):
             # frame, via set_data); off just stops pushing.
             self._peak_fit_dialog.live_check.toggled.connect(
                 self._on_live_fit_toggled)
+            self._peak_fit_dialog.batch_btn.clicked.connect(self._on_batch_clicked)
         dlg = self._peak_fit_dialog
         dlg.show()
         dlg.raise_()
@@ -638,6 +649,97 @@ class staticWidget(QWidget):
             return
         if outcome is not None and outcome.ok:
             dlg._draw_outcome(outcome, auto=dlg.auto_check.isChecked())
+
+    # ---- Batch peak fit (Step 4) ---------------------------------------
+    def _on_batch_clicked(self):
+        """Batch button: start a batch fit, or cancel one already in flight."""
+        worker = self._batch_analysis_worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            return
+        self._run_batch_fit()
+
+    def _run_batch_fit(self):
+        """Fit every frame in the scan with the dialog's current settings, then
+        (on completion) plot the parameters vs frame number.
+
+        The fit model is fixed ONCE from the current frame (auto-detect /
+        positions / peak count via the dialog's ``build_fit_request``) and the
+        SAME analyzer is applied to every frame, so each parameter series tracks
+        the same peak across frames.  The range is re-applied per frame."""
+        import numpy as np
+        from xrd_tools.analysis.runner import AnalysisInput
+        dlg = self._peak_fit_dialog
+        if dlg is None:
+            return
+        if dlg._x is None or dlg._y is None:
+            dlg.refresh_pattern()
+        req = dlg.build_fit_request()
+        if req is None:
+            return                              # status set by the dialog
+        _, analyzer = req
+        lo, hi = dlg._fit_range()
+        try:
+            frame_idxs = list(self.scan.frames.index)
+        except Exception:
+            frame_idxs = []
+        if not frame_idxs:
+            dlg.status.setText("No frames to batch-fit.")
+            return
+        x_unit = dlg._x_label
+        inputs = []
+        for idx in frame_idxs:
+            data = self._pattern_for_frame(idx)
+            if not data:
+                continue
+            fx, fy, _lbl = data
+            fx = np.asarray(fx, dtype=float)
+            fy = np.asarray(fy, dtype=float)
+            mask = (np.isfinite(fx) & np.isfinite(fy)
+                    & (fx >= lo) & (fx <= hi))
+            if not np.any(mask):
+                continue
+            inputs.append(AnalysisInput(label=str(idx), x=fx[mask], y=fy[mask],
+                                        x_unit=x_unit))
+        if not inputs:
+            dlg.status.setText("No fittable frames in the selected range.")
+            return
+        from .analysis_worker import BatchAnalysisWorker
+        if self._batch_analysis_worker is None:
+            self._batch_analysis_worker = BatchAnalysisWorker(self)
+            self._batch_analysis_worker.sigProgress.connect(self._on_batch_progress)
+            self._batch_analysis_worker.sigBatchDone.connect(self._on_batch_done)
+        self._batch_x_unit = x_unit
+        self._batch_analysis_worker.configure(analyzer, inputs)
+        dlg.set_batch_running(True)
+        dlg.set_batch_progress(0, len(inputs))
+        self._batch_analysis_worker.start()
+
+    def _on_batch_progress(self, done, total):
+        dlg = self._peak_fit_dialog
+        if dlg is not None:
+            dlg.set_batch_progress(done, total)
+
+    def _on_batch_done(self, labels, columns):
+        """Batch finished: re-enable the dialog and open the vs-frame results
+        popup (or report a cancel)."""
+        dlg = self._peak_fit_dialog
+        if dlg is not None:
+            dlg.set_batch_running(False)
+        if labels is None:                      # cancelled before completion
+            if dlg is not None:
+                dlg.status.setText("Batch fit cancelled.")
+            return
+        if dlg is not None:
+            dlg.status.setText(f"Batch fit done — {len(labels)} frames.")
+        if self._batch_results_dialog is None:
+            from .batch_fit_results_dialog import BatchFitResultsDialog
+            self._batch_results_dialog = BatchFitResultsDialog(self)
+        rd = self._batch_results_dialog
+        rd.set_results(labels, columns, x_unit=self._batch_x_unit)
+        rd.show()
+        rd.raise_()
+        rd.activateWindow()
 
     def _open_metadata_dialog(self):
         """Open (or re-show) the frame-metadata popup.
@@ -1566,13 +1668,16 @@ class staticWidget(QWidget):
         except Exception:
             logger.debug("hydration-worker shutdown on close failed",
                          exc_info=True)
-        # Stop the live analysis worker (latest-wins preview) before teardown.
+        # Stop the analysis workers (live preview + batch) before teardown.
         try:
             law = getattr(self, '_live_analysis_worker', None)
             if law is not None:
                 law.stop()
+            baw = getattr(self, '_batch_analysis_worker', None)
+            if baw is not None:
+                baw.stop()
         except Exception:
-            logger.debug("live-analysis-worker shutdown on close failed",
+            logger.debug("analysis-worker shutdown on close failed",
                          exc_info=True)
         del self.scan
         del self.displayframe.scan
