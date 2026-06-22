@@ -322,49 +322,53 @@ class PeakFitDialog(QtWidgets.QDialog):
         if x.size < max(5, 3 * n_peaks):
             self.status.setText("Not enough finite points in the range to fit.")
             return
-        try:
-            result = fit_peaks(x, y, positions=positions, model=model,
-                               n_peaks=n_peaks, background=background)
-        except Exception as exc:
-            logger.exception("peak-fit: fit_peaks failed")
-            self.status.setText(f"Fit failed: {exc}")
+        # Run through the agnostic Analyzer (the SAME contract the live + batch
+        # runners drive) rather than calling fit_peaks directly — the dialog is
+        # now just one consumer of PeakFitAnalyzer.
+        from xrd_tools.analysis.plans import PeakFitPlan
+        from xrd_tools.analysis.runner import AnalysisInput, PeakFitAnalyzer
+        plan = PeakFitPlan(
+            positions=tuple(positions) if positions else None,
+            model=model, n_peaks=n_peaks, background=background)
+        outcome = PeakFitAnalyzer(plan).analyze(
+            AnalysisInput(label="current", x=x, y=y, x_unit=self._x_label))
+        if not outcome.ok:
+            self.status.setText(
+                f"Fit failed: {outcome.message or 'did not converge'}")
             return
+        self._draw_outcome(x, y, outcome, auto=self.auto_check.isChecked())
 
-        self._draw_result(x, y, result, auto=self.auto_check.isChecked())
-
-    def _draw_result(self, x, y, result, auto=False):
-        # redraw data over the FULL pattern (context), then fit over the range
+    def _draw_outcome(self, x, y, outcome, auto=False):
+        # data over the FULL pattern (context); the analyzer's Overlay traces
+        # (fit / background / residual) over the fitted range.
+        overlay = outcome.overlay
+        payload = outcome.result.payload
         self.plot.clear()
         self.plot.addItem(self.region)
         self.plot.setLabel("bottom", self._x_label)
         self.plot.setLabel("left", "Intensity")
         self.plot.plot(self._x, self._y, pen=pg.mkPen((210, 210, 220), width=1),
                        name="data")
-        best = np.asarray(result.best_fit, dtype=float)
-        self.plot.plot(x, best, pen=pg.mkPen((189, 147, 249), width=2), name="fit")
-        try:
-            comps = result.fit_result.eval_components(x=x)
-            bg = sum(v for k, v in comps.items() if str(k).startswith("bg"))
-            if np.ndim(bg) == 1:
-                self.plot.plot(x, np.asarray(bg, dtype=float),
-                               pen=pg.mkPen((130, 200, 160), width=1,
-                                            style=QtCore.Qt.PenStyle.DashLine),
-                               name="background")
-        except Exception:
-            logger.debug("peak-fit: no background component to draw", exc_info=True)
-
+        ox = overlay.x
+        if "fit" in overlay.traces:
+            self.plot.plot(ox, overlay.traces["fit"],
+                           pen=pg.mkPen((189, 147, 249), width=2), name="fit")
+        if "background" in overlay.traces:
+            self.plot.plot(ox, overlay.traces["background"],
+                           pen=pg.mkPen((130, 200, 160), width=1,
+                                        style=QtCore.Qt.PenStyle.DashLine),
+                           name="background")
         self._clear_fit()
-        try:
-            self.resid_plot.plot(x, y - best, pen=pg.mkPen((230, 133, 151), width=1))
+        if "residual" in overlay.traces:
+            self.resid_plot.plot(ox, overlay.traces["residual"],
+                                 pen=pg.mkPen((230, 133, 151), width=1))
             self.resid_plot.setLabel("left", "resid")
-        except Exception:
-            logger.debug("peak-fit: residual draw failed", exc_info=True)
 
-        centers = list(result.peak_centers or [])
-        cerrs = list(getattr(result, "peak_centers_err", []) or [])
-        sigmas = list(result.peak_sigmas or [])
-        amps = list(result.peak_amplitudes or [])
-        params = getattr(result, "params", None)
+        centers = list(payload.peak_centers or [])
+        cerrs = list(getattr(payload, "peak_centers_err", []) or [])
+        sigmas = list(payload.peak_sigmas or [])
+        amps = list(payload.peak_amplitudes or [])
+        params = getattr(payload, "params", None)
         self.table.setRowCount(len(centers))
         for i, c in enumerate(centers):
             fwhm = None
@@ -381,9 +385,9 @@ class PeakFitDialog(QtWidgets.QDialog):
             for col, v in enumerate(vals):
                 self.table.setItem(i, col, QtWidgets.QTableWidgetItem(v))
 
-        ok = bool(getattr(result, "success", True))
+        ok = bool(getattr(payload, "success", True))
         how = "auto-detected" if auto else "fixed-count"
         self.status.setText(
             ("Fit converged." if ok else "Fit did NOT converge (best effort).")
             + f"  {len(centers)} {how} peak(s), "
-            + f"{result.model_name} + {result.background_name}.")
+            + f"{payload.model_name} + {payload.background_name}.")
