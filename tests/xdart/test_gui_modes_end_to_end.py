@@ -843,18 +843,24 @@ def test_scan_plot_dialog_columns_and_normalization(qapp):
         cols = [dlg.x_combo.itemText(i) for i in range(dlg.x_combo.count())]
         assert {"frame_index", "theta", "i0"} <= set(cols)
         assert "label" not in cols                  # non-numeric excluded
-        # default: X = frame_index; first non-X (theta) checked -> one curve
-        assert dlg.x_combo.currentText() == "frame_index"
+        # sensible defaults: X is a numeric column; exactly one Y checked -> 1 curve
+        assert dlg.x_combo.currentText() in cols
+        assert dlg.x_combo.currentText() != "label"
         assert len(dlg.plot.getPlotItem().listDataItems()) == 1
-        # overlay a second Y
-        i0 = dlg.y_list.findItems("i0", QtCore.Qt.MatchFlag.MatchExactly)[0]
-        i0.setCheckState(QtCore.Qt.CheckState.Checked)
-        assert len(dlg.plot.getPlotItem().listDataItems()) == 2
-        # normalization is available + divides without crashing
+        # overlay: check every numeric column -> one curve per checked Y
+        for c in cols:
+            dlg.y_list.findItems(c, QtCore.Qt.MatchFlag.MatchExactly)[0].setCheckState(
+                QtCore.Qt.CheckState.Checked)
+        n_checked = sum(
+            1 for i in range(dlg.y_list.count())
+            if dlg.y_list.item(i).checkState() == QtCore.Qt.CheckState.Checked)
+        assert n_checked == len(cols)
+        assert len(dlg.plot.getPlotItem().listDataItems()) == n_checked
+        # normalization is available + divides without crashing (curve count holds)
         norms = [dlg.norm_combo.itemText(i) for i in range(dlg.norm_combo.count())]
         assert "None" in norms and "i0" in norms
         dlg.norm_combo.setCurrentText("i0")
-        assert len(dlg.plot.getPlotItem().listDataItems()) == 2
+        assert len(dlg.plot.getPlotItem().listDataItems()) == n_checked
     finally:
         dlg.deleteLater()
         qapp.processEvents()

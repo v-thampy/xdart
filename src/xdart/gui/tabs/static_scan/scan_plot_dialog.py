@@ -14,6 +14,7 @@ a later increment — see docs/design/design_scan_plotter_metadata_roi_jun2026.m
 
 import logging
 import os
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
@@ -23,17 +24,23 @@ from .peak_fit_util import CURVE_PENS
 
 logger = logging.getLogger(__name__)
 
+_TIFF_SUFFIXES = {".tif", ".tiff"}
+
 
 def load_scan_table(uri):
     """Return ``(label, {column: ndarray})`` of per-frame metadata for a scan
     URI, classifying it via the headless source layer.
 
-    Processed NeXus → the full ``scan_data`` table (every motor + counter).
-    Other kinds (Eiger / TIFF-or-RAW series / NeXus stack) → best-effort:
-    ``frame_index`` plus any per-frame ``motors`` the source exposes.  Thin GUI
-    orchestration over headless functions (no analysis here)."""
+    * processed NeXus → the full ``scan_data`` table (every motor + counter);
+    * a TIFF/RAW image (the "first image of a sequence") → the whole folder as a
+      ``TiffSeriesSource``, reading each frame's ``.txt``/``.pdi`` sidecar;
+    * other sources (Eiger / NeXus stack) → ``frame_index`` + per-frame
+      ``metadata_for`` + any ``motors`` the source exposes.
+
+    Thin GUI orchestration over headless functions (no analysis here)."""
     from xrd_tools.io import read_scan_data
-    from xrd_tools.sources import SourceKind, guess_source_kind, open_source
+    from xrd_tools.sources import (SourceKind, TiffSeriesSource,
+                                   guess_source_kind, open_source)
 
     label = os.path.basename(str(uri))
     kind = guess_source_kind(uri)
@@ -41,24 +48,59 @@ def load_scan_table(uri):
         table = read_scan_data(uri)
         if table:
             return label, table
-        # fall through to the generic path if there was no scan_data group
-    table = {}
+        # else fall through to the generic per-frame path
+
     try:
-        src = open_source(uri)
+        if Path(uri).suffix.lower() in _TIFF_SUFFIXES:
+            # A picked image is the first of a sequence: read the folder's series
+            # so per-frame .txt/.pdi sidecars become the metadata columns.
+            src = TiffSeriesSource.from_directory(Path(uri).parent)
+            label = f"{Path(uri).parent.name} (image series)"
+        else:
+            src = open_source(uri)
     except Exception:
         logger.exception("scan-plot: could not open source %s", uri)
-        return label, table
+        return label, {}
+    return label, _table_from_source(src)
+
+
+def _table_from_source(src):
+    """Assemble a per-frame ``{column: float ndarray}`` from a FrameSource:
+    ``frame_index`` + whole-array ``motors`` + per-frame ``metadata_for`` (sidecar
+    dict[str, float]).  Missing/non-numeric values are NaN."""
+    out = {}
     try:
-        idx = np.asarray(list(src.frame_indices), dtype=float)
-        table["frame_index"] = idx
-        motors = getattr(src, "motors", None) or {}
-        for name, values in motors.items():
-            arr = np.asarray(values, dtype=float)
-            if arr.ndim == 1 and arr.shape[0] == idx.shape[0]:
-                table[str(name)] = arr
+        idxs = list(src.frame_indices)
     except Exception:
-        logger.exception("scan-plot: could not read metadata from %s", uri)
-    return label, table
+        return out
+    if not idxs:
+        return out
+    out["frame_index"] = np.asarray([float(i) for i in idxs], dtype=float)
+    motors = getattr(src, "motors", None) or {}
+    for name, vals in motors.items():
+        arr = np.asarray(vals, dtype=float)
+        if arr.ndim == 1 and arr.shape[0] == len(idxs):
+            out[str(name)] = arr
+    rows = []
+    for i in idxs:
+        try:
+            rows.append(dict(src.metadata_for(i)))
+        except Exception:
+            rows.append({})
+    keys = []
+    for md in rows:
+        for k in md:
+            if k not in keys and k not in out:
+                keys.append(k)
+    for k in keys:
+        col = np.full(len(idxs), np.nan, dtype=float)
+        for r, md in enumerate(rows):
+            try:
+                col[r] = float(md.get(k))
+            except (TypeError, ValueError):
+                pass
+        out[k] = col
+    return out
 
 
 def _numeric_columns(table):
@@ -185,12 +227,11 @@ class ScanPlotDialog(QtWidgets.QDialog):
             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(QtCore.Qt.CheckState.Unchecked)
             self.y_list.addItem(item)
-        # Defaults: X = frame_index if present else first column; Y = first
-        # column that isn't X.
+        # Defaults: X = the scanned positioner, Y = an intensity-like column.
         if cols:
-            x_default = "frame_index" if "frame_index" in cols else cols[0]
-            self.x_combo.setCurrentText(x_default)
-            y_default = next((c for c in cols if c != x_default), None)
+            x_default, y_default = self._guess_axes(cols)
+            if x_default:
+                self.x_combo.setCurrentText(x_default)
             if y_default is not None:
                 items = self.y_list.findItems(y_default, QtCore.Qt.MatchFlag.MatchExactly)
                 if items:
@@ -209,6 +250,31 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self.status.setText(
                 f"{len(cols)} plottable column(s). Pick X and check Y column(s).")
         self._redraw()
+
+    def _guess_axes(self, cols):
+        """(x_default, y_default).  X = the scanned positioner — the
+        most-monotonic non-index column (a scan axis varies smoothly) — else
+        frame_index.  Y = an intensity-like column (name hint) else the first
+        non-X column."""
+        candidates = [c for c in cols if c != "frame_index"]
+        x, best = None, 0.0
+        for c in candidates:
+            a = np.asarray(self._table[c], dtype=float)
+            a = a[np.isfinite(a)]
+            if a.size < 3:
+                continue
+            d = np.diff(a)
+            mono = max(float(np.mean(d >= 0)), float(np.mean(d <= 0)))
+            if mono > best:
+                best, x = mono, c
+        if x is None or best < 0.9:
+            x = "frame_index" if "frame_index" in cols else cols[0]
+        hints = ("i0", "int", "counts", "roi", "mon", "signal", "intensity")
+        y = next((c for c in candidates
+                  if c != x and any(h in c.lower() for h in hints)), None)
+        if y is None:
+            y = next((c for c in cols if c != x), None)
+        return x, y
 
     def _checked_y(self):
         out = []
