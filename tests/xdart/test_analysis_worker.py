@@ -218,3 +218,81 @@ def test_batch_worker_cancel_emits_none(qapp):
         assert result["labels"] is None and result["cols"] is None
     finally:
         worker.stop()
+
+
+# ── ROI-stats worker (per-frame stats over a source -> computed columns) ───
+
+
+def _img_stack():
+    """3 frames: a bright 2x2 block whose mean rises 10, 20, 30."""
+    out = []
+    for f in range(3):
+        im = np.zeros((4, 4), dtype=float)
+        im[1:3, 1:3] = (f + 1) * 10.0
+        out.append(im)
+    return out
+
+
+def test_roi_stats_worker_streams_and_returns_result(qapp):
+    """Streams per-frame stats AND the completed series equals a direct headless
+    run_roi_signals — the mini live≡batch spine for the ROI worker."""
+    from xdart.gui.tabs.static_scan.analysis_worker import RoiStatsWorker
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.core.roi import RoiSpec
+    from xrd_tools.sources import MemoryFrameSource
+
+    src = MemoryFrameSource(_img_stack())
+    sig = RoiSignal(roi=RoiSpec(center_x=1.5, center_y=1.5, width_x=2, width_y=2),
+                    reducer="mean", name="roiA")
+    done = threading.Event()
+    streamed, progress, result = [], [], {}
+    worker = RoiStatsWorker()
+    worker.sigFrameStat.connect(
+        lambda f, row: streamed.append((f, row["roiA"])), _DIRECT)
+    worker.sigProgress.connect(lambda d, t: progress.append((d, t)), _DIRECT)
+    worker.sigRoiDone.connect(
+        lambda res: (result.update(res=res), done.set()), _DIRECT)
+    worker.configure((sig,), src)
+    worker.start()
+    try:
+        assert done.wait(5.0), "ROI worker never finished"
+        assert [f for f, _ in streamed] == [0, 1, 2]
+        assert progress[-1] == (3, 3)
+        direct = run_roi_signals((sig,), src).payload
+        np.testing.assert_allclose(result["res"].payload.series["roiA"],
+                                   direct.series["roiA"])
+        np.testing.assert_allclose([v for _, v in streamed], direct.series["roiA"])
+    finally:
+        worker.stop()
+
+
+def test_roi_stats_worker_cancel_emits_none(qapp):
+    """Cancelling mid-run emits None (the dialog then abandons partial columns)."""
+    from xdart.gui.tabs.static_scan.analysis_worker import RoiStatsWorker
+    from xrd_tools.analysis.plans import RoiSignal
+    from xrd_tools.core.roi import RoiSpec
+    from xrd_tools.sources import MemoryFrameSource
+
+    started = threading.Event()
+    done = threading.Event()
+    result = {}
+
+    class _SlowSource(MemoryFrameSource):
+        def load_frame(self, index):
+            started.set()
+            time.sleep(0.05)
+            return super().load_frame(index)
+
+    src = _SlowSource([np.zeros((4, 4)) for _ in range(50)])
+    worker = RoiStatsWorker()
+    worker.sigRoiDone.connect(
+        lambda res: (result.update(res=res), done.set()), _DIRECT)
+    worker.configure((RoiSignal(roi=RoiSpec.full_frame(), name="full"),), src)
+    worker.start()
+    try:
+        assert started.wait(2.0)
+        worker.cancel()
+        assert done.wait(5.0)
+        assert result["res"] is None
+    finally:
+        worker.stop()

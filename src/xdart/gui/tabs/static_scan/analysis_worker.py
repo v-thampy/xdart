@@ -21,6 +21,7 @@ from threading import Condition
 
 from pyqtgraph import Qt
 
+from xrd_tools.analysis.plans import run_roi_signals
 from xrd_tools.analysis.runner import batch_params_table, run_batch
 
 logger = logging.getLogger(__name__)
@@ -139,6 +140,68 @@ class BatchAnalysisWorker(Qt.QtCore.QThread):
     def stop(self, timeout_ms: int = 8000) -> bool:
         """Request cancel + join (idempotent).  Longer default than the live
         worker — a frame's fit must finish before the loop re-checks cancel."""
+        self._cancel = True
+        if self.isRunning():
+            return bool(self.wait(timeout_ms))
+        return True
+
+
+class RoiStatsWorker(Qt.QtCore.QThread):
+    """Reduce ROI signals over EVERY raw frame of a source off the GUI thread.
+
+    The ROI counterpart of :class:`BatchAnalysisWorker`: a thin thread around the
+    headless :func:`xrd_tools.analysis.run_roi_signals`, streaming each frame's
+    per-ROI stats so the Scan Plot table fills its computed columns
+    incrementally, with progress + cancel.  Loading each raw frame is the real
+    cost (the reduce is cheap), so it runs OFF the GUI thread; the math stays
+    headless."""
+
+    #: (done, total) progress after each frame.
+    sigProgress = Qt.QtCore.Signal(int, int)
+    #: (frame_index, {column_name: value}) streamed per frame — grows the columns.
+    sigFrameStat = Qt.QtCore.Signal(object, object)
+    #: the completed AnalysisResult on success, or ``None`` if cancelled.
+    sigRoiDone = Qt.QtCore.Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._signals = ()
+        self._source = None
+        self._x_key = None
+        self._mask_saturation = False
+        self._cancel = False
+
+    def configure(self, signals, source, *, x_key=None,
+                  mask_saturation=False) -> None:
+        """Set the ROI signals + the raw source for the next ``start()``."""
+        self._signals = tuple(signals)
+        self._source = source
+        self._x_key = x_key
+        self._mask_saturation = bool(mask_saturation)
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        try:
+            result = run_roi_signals(
+                self._signals, self._source,
+                x_key=self._x_key, mask_saturation=self._mask_saturation,
+                on_progress=lambda done, total: self.sigProgress.emit(done, total),
+                on_frame=lambda f, row: self.sigFrameStat.emit(f, row),
+                should_cancel=lambda: self._cancel)
+        except Exception:
+            logger.exception("ROI-stats worker failed")
+            self.sigRoiDone.emit(None)
+            return
+        if self._cancel:
+            self.sigRoiDone.emit(None)   # cancelled -> abandon the partial columns
+            return
+        self.sigRoiDone.emit(result)
+
+    def stop(self, timeout_ms: int = 8000) -> bool:
+        """Request cancel + join (idempotent)."""
         self._cancel = True
         if self.isRunning():
             return bool(self.wait(timeout_ms))
