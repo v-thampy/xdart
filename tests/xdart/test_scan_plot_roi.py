@@ -196,6 +196,63 @@ def test_scan_plot_roi_fills_columns_end_to_end(qapp):
         dlg.close()
 
 
+def test_scan_plot_roi_aligns_noncontiguous_frame_index(qapp):
+    """ROI stats stream the SOURCE frame index; _frame_row_map must map them to
+    the right table rows when frame_index doesn't start at 0 / isn't 0..n-1."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.core.roi import RoiSpec
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.sources import MemoryFrameSource
+
+    # frames labelled 5,6,7 (not 0,1,2) so keyed != positional alignment.
+    src = MemoryFrameSource([ScanFrame(index=5 + i, image=im)
+                             for i, im in enumerate(_stack())])
+    assert src.frame_indices == [5, 6, 7]
+    dlg = ScanPlotDialog()
+    try:
+        dlg.set_table("s", {"frame_index": np.array([5.0, 6.0, 7.0]),
+                            "motor": np.array([1.0, 2.0, 3.0])})
+        dlg._source = src
+        dlg._raw_reachable = True
+        sig = RoiSignal(roi=RoiSpec(center_x=1.5, center_y=1.5, width_x=2,
+                                    width_y=2), reducer="mean", name="roiA")
+        dlg._compute_roi([sig])
+        assert _pump(qapp, lambda: (dlg._roi_worker is not None
+                                    and not dlg._roi_worker.isRunning()
+                                    and not dlg._roi_run_columns))
+        direct = run_roi_signals([sig], src).payload.series["roiA"]
+        np.testing.assert_allclose(dlg._table["roiA"], direct)   # aligned by index
+        assert np.all(np.diff(dlg._table["roiA"]) > 0)
+    finally:
+        dlg.close()
+
+
+def test_scan_plot_roi_abort_on_source_swap(qapp):
+    """Loading a new source mid-run stops the worker + forgets the run state, so
+    a stale worker can't stream into the replaced table."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xrd_tools.analysis.plans import RoiSignal
+    from xrd_tools.core.roi import RoiSpec
+    from xrd_tools.sources import MemoryFrameSource
+
+    class _Slow(MemoryFrameSource):
+        def load_frame(self, index):
+            time.sleep(0.03)
+            return super().load_frame(index)
+
+    dlg = ScanPlotDialog()
+    dlg.set_table("s", {"frame_index": np.arange(40.0)})
+    dlg._source = _Slow([np.zeros((6, 6)) for _ in range(40)])
+    dlg._raw_reachable = True
+    dlg._compute_roi([RoiSignal(roi=RoiSpec.full_frame(), name="roiZ")])
+    assert _pump(qapp, lambda: dlg._roi_worker.isRunning(), timeout=2.0)
+    dlg._abort_roi_run()                       # what load_uri calls on a new scan
+    assert not dlg._roi_worker.isRunning()
+    assert dlg._roi_run_columns == [] and dlg._roi_row_of == {}
+    assert dlg._roi_dialog is None
+
+
 # ── cross-family right-hand axis ──────────────────────────────────────────
 
 

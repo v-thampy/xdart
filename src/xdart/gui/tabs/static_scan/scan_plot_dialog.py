@@ -87,27 +87,37 @@ def load_scan_table(uri):
     return label, table
 
 
-def raw_is_reachable(source):
-    """True iff ``source`` can load its first frame as a 2-D raw image — the
-    strict-raw probe the ROI stats require.
+def probe_first_frame(source):
+    """Return ``(reachable, first_image)`` — load the source's first frame as a
+    strict 2-D raw image (the ROI-stats requirement).
 
     Mirrors the reintegrate raw path: a processed NeXus whose linked raw tree is
-    missing raises (so this reads False), and the strict ``load_frame`` never
-    substitutes a downsampled thumbnail.  A metadata-only source (``None``) or an
-    empty scan is unreachable."""
+    missing raises (so ``reachable`` is False), and the strict ``load_frame``
+    never substitutes a downsampled thumbnail.  A metadata-only source (``None``)
+    or an empty scan is unreachable.  The decoded image is returned so the caller
+    can reuse it (the ROI picker shows exactly this frame) instead of decoding a
+    possibly multi-MB Eiger frame twice."""
     if source is None:
-        return False
+        return False, None
     try:
         idxs = list(source.frame_indices)
     except Exception:
-        return False
+        return False, None
     if not idxs:
-        return False
+        return False, None
     try:
         img = np.asarray(source.load_frame(idxs[0]))
     except Exception:
-        return False
-    return img.ndim == 2 and img.size > 0
+        return False, None
+    if img.ndim == 2 and img.size > 0:
+        return True, img
+    return False, None
+
+
+def raw_is_reachable(source):
+    """True iff ``source`` can load its first frame as a 2-D raw image — the
+    strict-raw probe the ROI stats require (see :func:`probe_first_frame`)."""
+    return probe_first_frame(source)[0]
 
 
 def _table_from_source(src):
@@ -178,6 +188,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._source = None
         self._source_uri = None
         self._raw_reachable = False
+        self._first_image = None            # cached first frame (probe → picker)
         self._roi_dialog = None
         self._roi_worker = None
         self._roi_run_columns = []          # column names filling this run
@@ -285,12 +296,29 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self.load_uri(path)
 
     def load_uri(self, uri):
+        # A new scan replaces the table wholesale; abort any in-flight ROI run so
+        # a stale worker can't stream into it and the picker can't show the old
+        # frame.
+        self._abort_roi_run()
         label, table, source = open_scan(uri)
         self._source = source
         self._source_uri = uri
-        self._raw_reachable = raw_is_reachable(source)
+        self._raw_reachable, self._first_image = probe_first_frame(source)
         self.set_table(label, table)
         self._update_roi_button()
+
+    def _abort_roi_run(self):
+        """Stop an in-flight ROI computation + close the picker and forget its
+        run state — used when the source is swapped (the old columns vanish with
+        the replaced table, so unlike ``closeEvent`` we clear ``_roi_run_columns``
+        here rather than leaving them for ``_on_roi_done`` to drop)."""
+        if self._roi_worker is not None and self._roi_worker.isRunning():
+            self._roi_worker.stop()
+        self._roi_run_columns = []
+        self._roi_row_of = {}
+        if self._roi_dialog is not None:
+            self._roi_dialog.close()
+            self._roi_dialog = None
 
     def set_table(self, label, table):
         """Load a per-frame column table + populate the X/Y/Normalize selectors."""
@@ -406,7 +434,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         # draw in the stable column order for deterministic colours/legend.
         y_cols = set(self._checked_y())
         draw_cols = [c for c in self._columns if c in y_cols or c in right_cols]
-        any_right = False
+        any_left = any_right = False
         for n, ycol in enumerate(draw_cols):
             y = np.asarray(self._table[ycol], dtype=float)
             if normalized:
@@ -425,12 +453,14 @@ class ScanPlotDialog(QtWidgets.QDialog):
             else:
                 self.plot.plot(x, y, pen=pen, name=ycol, symbol="o",
                                symbolSize=4, symbolBrush=color)
+                any_left = True
         self.plot.setLabel("bottom", xcol)
-        self.plot.setLabel("left", "value / " + norm_col if normalized else "value")
+        value_label = ("value / " + norm_col) if normalized else "value"
+        self.plot.setLabel("left", value_label if any_left else "")
         self.right_axis.setVisible(any_right)
         self.right_vb.setVisible(any_right)
         if any_right:
-            self.right_axis.setLabel("value (right)")
+            self.right_axis.setLabel(f"{value_label} (right)")
 
     # ---- ROI columns ----------------------------------------------------
     def _update_roi_button(self):
@@ -530,13 +560,15 @@ class ScanPlotDialog(QtWidgets.QDialog):
                 "Raw frames aren't reachable for this scan — ROI plotting is "
                 "unavailable.")
             return
-        try:
-            idxs = list(self._source.frame_indices)
-            image = np.asarray(self._source.load_frame(idxs[0]))
-        except Exception:
-            logger.exception("scan-plot: could not load the first frame for ROI")
-            self.status.setText("Could not load the first frame (see log).")
-            return
+        image = self._first_image       # reuse the frame the reachability probe decoded
+        if image is None:
+            try:
+                idxs = list(self._source.frame_indices)
+                image = np.asarray(self._source.load_frame(idxs[0]))
+            except Exception:
+                logger.exception("scan-plot: could not load the first frame for ROI")
+                self.status.setText("Could not load the first frame (see log).")
+                return
         from .roi_select_dialog import RoiSelectDialog
         if self._roi_dialog is not None:
             self._roi_dialog.close()
@@ -605,10 +637,11 @@ class ScanPlotDialog(QtWidgets.QDialog):
         # the orphan NaN columns survive into the next time the (reused) dialog
         # is shown.
         if result is None:                  # cancelled / failed -> drop partials
+            had = bool(self._roi_run_columns)
             for name in self._roi_run_columns:
                 self._remove_column(name)
             self._roi_run_columns = []
-            if not self._closing:
+            if had and not self._closing:    # quiet if a source-swap already cleared
                 self.status.setText("ROI computation cancelled.")
                 self._redraw()
             return

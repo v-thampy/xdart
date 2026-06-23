@@ -5,8 +5,8 @@ Columns of very different magnitude (peak center ~2 vs amplitude ~1e5, or
 temperature vs an ROI sum) read cleanly only when the small one gets its own
 scale.  :func:`attach_right_axis` wires the standard pyqtgraph linked-``ViewBox``
 pattern (a second ViewBox sharing the x range, its geometry kept in step with
-the main view), returning the ViewBox; add right-axis curves with
-``vb.addItem(item)``.  Used by the Scan Plot overlay and the fitting trend.
+the main view), returning ``(view_box, axis)``; add right-axis curves with
+``view_box.addItem(item)``.  Used by the Scan Plot overlay and the fitting trend.
 """
 
 import pyqtgraph as pg

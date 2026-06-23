@@ -482,6 +482,24 @@ def _combine_background(value, n_valid, reducer, background_op, bkg_mean, bkg_sa
     return value - bkg_mean
 
 
+def _dedup_names(names):
+    """Disambiguate colliding resolved ROI names (append ``_2``, ``_3``, …) so
+    the per-ROI series dict never collapses two signals onto one key — which
+    would interleave their values into one wrong-length array.  Mirrors the
+    GUI's ``_unique_col_name`` so a headless caller is protected too."""
+    seen = set()
+    out = []
+    for name in names:
+        candidate = name
+        k = 2
+        while candidate in seen:
+            candidate = f"{name}_{k}"
+            k += 1
+        seen.add(candidate)
+        out.append(candidate)
+    return out
+
+
 def _reduce_signal(img, mask, signal):
     """Reduce one :class:`RoiSignal` over a single (mask-computed) image →
     ``(value, n_valid)``, applying its optional background."""
@@ -526,7 +544,8 @@ def run_roi_signals(
     payload=RoiStatsResult)``."""
     src = ensure_frame_source(source)
     signals = tuple(signals) or (RoiSignal(RoiSpec.full_frame()),)
-    names = [sig.name or sig.roi.name or f"roi{i}" for i, sig in enumerate(signals)]
+    names = _dedup_names(
+        [sig.name or sig.roi.name or f"roi{i}" for i, sig in enumerate(signals)])
     all_frames = [int(f) for f in
                   (src.frame_indices if frame_indices is None else frame_indices)]
     series: dict[str, list] = {n: [] for n in names}

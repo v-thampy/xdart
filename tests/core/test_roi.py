@@ -158,6 +158,24 @@ def test_run_roi_signals_matches_run_roi_stats_for_shared_config():
         np.testing.assert_allclose(via_plan.series[name], via_signals.series[name])
 
 
+def test_run_roi_signals_dedups_colliding_names():
+    """Two signals resolving to the SAME name must not collapse into one
+    interleaved, wrong-length column (silent corruption for headless callers)."""
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.sources import MemoryFrameSource
+
+    src = MemoryFrameSource(_stack())                 # 3 frames
+    a = RoiSpec(center_x=2, center_y=2, width_x=2, width_y=2)
+    b = RoiSpec(center_x=4.5, center_y=4.5, width_x=2, width_y=2)
+    res = run_roi_signals(
+        (RoiSignal(roi=a, name="roi"), RoiSignal(roi=b, name="roi")), src).payload
+    assert set(res.series) == {"roi", "roi_2"}        # disambiguated
+    for name in ("roi", "roi_2"):
+        assert len(res.series[name]) == len(res.frames) == 3
+    # the two columns are distinct (signal vs background block), not interleaved.
+    assert not np.array_equal(res.series["roi"], res.series["roi_2"])
+
+
 def test_run_roi_signals_streams_and_cancels():
     """on_frame/on_progress stream per frame; should_cancel stops early and the
     result covers only the processed frames (diagnostics['cancelled'])."""
