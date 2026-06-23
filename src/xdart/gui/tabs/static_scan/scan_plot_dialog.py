@@ -377,7 +377,9 @@ class ScanPlotDialog(QtWidgets.QDialog):
         return self._checked_in(self.y_list)
 
     def _right_cols(self):
-        """Columns assigned to the right-hand axis (subset of the plotted Y)."""
+        """Columns assigned to the right-hand axis.  Checking a column here
+        plots it on the right axis even if it isn't checked in Y, so the
+        right-axis toggle is never a silent no-op."""
         return set(self._checked_in(self.r_list))
 
     def _redraw(self):
@@ -400,8 +402,12 @@ class ScanPlotDialog(QtWidgets.QDialog):
             norm = np.where(norm == 0, np.nan, norm)   # avoid /0
         normalized = norm is not None
         right_cols = self._right_cols()
+        # A column plots if it's checked in Y OR assigned to the right axis;
+        # draw in the stable column order for deterministic colours/legend.
+        y_cols = set(self._checked_y())
+        draw_cols = [c for c in self._columns if c in y_cols or c in right_cols]
         any_right = False
-        for n, ycol in enumerate(self._checked_y()):
+        for n, ycol in enumerate(draw_cols):
             y = np.asarray(self._table[ycol], dtype=float)
             if normalized:
                 y = y / norm
@@ -593,22 +599,31 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._redraw()
 
     def _on_roi_done(self, result):
-        if self._closing:
-            return
+        # The cancel/fail cleanup runs even while closing: a close mid-run stops
+        # the worker, which emits sigRoiDone(None) AFTER _closing is set — so
+        # dropping the partial columns must NOT sit behind the _closing guard, or
+        # the orphan NaN columns survive into the next time the (reused) dialog
+        # is shown.
         if result is None:                  # cancelled / failed -> drop partials
             for name in self._roi_run_columns:
                 self._remove_column(name)
             self._roi_run_columns = []
-            self.status.setText("ROI computation cancelled.")
-            self._redraw()
+            if not self._closing:
+                self.status.setText("ROI computation cancelled.")
+                self._redraw()
+            return
+        # A run that COMPLETED keeps its columns; if the dialog is closing, just
+        # finalise the bookkeeping without touching the UI.
+        n_added = len(self._roi_run_columns)
+        self._roi_run_columns = []
+        if self._closing:
             return
         diag = getattr(result.payload, "diagnostics", {}) or {}
         no_raw = diag.get("no_raw_frames") or []
-        msg = f"ROI stats done — {len(self._roi_run_columns)} column(s) added."
+        msg = f"ROI stats done — {n_added} column(s) added."
         if no_raw:
             msg += f" ({len(no_raw)} frame(s) had unreachable raw → NaN.)"
         self.status.setText(msg)
-        self._roi_run_columns = []
 
     def showEvent(self, event):
         self._closing = False

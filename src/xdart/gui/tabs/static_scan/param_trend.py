@@ -46,6 +46,11 @@ class ParamTrendMixin:
         self.param_save_btn.setEnabled(False)
         self.param_plot.clear()
         self.param_right_vb.clear()
+        # The right-axis curves live in param_right_vb, so their legend entries
+        # were added manually and PlotItem.clear() can't reach them — clear the
+        # legend too, else a phantom "(R)" entry survives the reset.
+        if self.param_legend is not None:
+            self.param_legend.clear()
         self.param_right_axis.setVisible(False)
 
     def _accumulate_frame_params(self, frame_idx, params):

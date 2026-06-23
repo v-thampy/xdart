@@ -26,6 +26,15 @@ def attach_right_axis(plot_widget):
     right_axis.linkToView(vb)
     vb.setXLink(plot_item)
     right_axis.setVisible(False)
+    # The right ViewBox shares the x range and AUTO-RANGES its y to fit the
+    # right-axis series on every redraw.  Leaving it independently mouse/menu
+    # interactive is the classic linked-ViewBox footgun: a stray drag/wheel
+    # would pan-or-zoom (and latch off autorange on) just this axis, so the
+    # right series silently drifts off-scale.  Disable its own mouse handling —
+    # the user interacts with the primary (left) view; x stays linked, y keeps
+    # tracking the data.
+    vb.setMouseEnabled(x=False, y=False)
+    vb.setMenuEnabled(False)
 
     def _sync_geometry():
         vb.setGeometry(plot_item.vb.sceneBoundingRect())

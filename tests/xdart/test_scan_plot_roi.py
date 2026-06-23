@@ -229,5 +229,58 @@ def test_scan_plot_right_axis_splits_series(qapp):
         assert left_names == {"small"}
         assert len(dlg.right_vb.addedItems) == 1
         assert dlg.right_vb.addedItems[0].name() == "big"
+        # the right ViewBox is not independently mouse-zoomable (no y-desync).
+        assert list(dlg.right_vb.mouseEnabled()) == [False, False]
     finally:
         dlg.close()
+
+
+def test_scan_plot_right_axis_plots_column_not_checked_in_y(qapp):
+    """A column checked ONLY in the Right-axis list still plots (on the right) —
+    the right toggle is never a silent no-op."""
+    from pyqtgraph.Qt import QtCore
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+
+    _EX = QtCore.Qt.MatchFlag.MatchExactly
+    dlg = ScanPlotDialog()
+    try:
+        dlg.set_table("s", {"frame_index": np.arange(5.0),
+                            "a": np.linspace(0.0, 1.0, 5),
+                            "b": np.linspace(0.0, 1e5, 5)})
+        for i in range(dlg.y_list.count()):
+            dlg.y_list.item(i).setCheckState(QtCore.Qt.CheckState.Unchecked)
+        dlg.r_list.findItems("b", _EX)[0].setCheckState(QtCore.Qt.CheckState.Checked)
+        assert len(dlg.plot.getPlotItem().listDataItems()) == 0
+        assert len(dlg.right_vb.addedItems) == 1
+        assert dlg.right_vb.addedItems[0].name() == "b"
+    finally:
+        dlg.close()
+
+
+def test_scan_plot_roi_close_mid_run_drops_partial_columns(qapp):
+    """Closing the dialog mid-ROI-run drops the partial NaN columns (they must
+    not survive into the reused single-instance dialog's next show)."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xrd_tools.analysis.plans import RoiSignal
+    from xrd_tools.core.roi import RoiSpec
+    from xrd_tools.sources import MemoryFrameSource
+
+    class _Slow(MemoryFrameSource):
+        def load_frame(self, index):
+            time.sleep(0.03)
+            return super().load_frame(index)
+
+    src = _Slow([np.zeros((6, 6)) for _ in range(40)])
+    dlg = ScanPlotDialog()
+    dlg.set_table("s", {"frame_index": np.arange(40.0)})
+    dlg._source = src
+    dlg._raw_reachable = True
+    dlg._compute_roi([RoiSignal(roi=RoiSpec.full_frame(), name="roiZ")])
+    assert "roiZ" in dlg._table                       # column seeded
+    assert _pump(qapp, lambda: dlg._roi_worker.isRunning(), timeout=2.0)
+    dlg.close()                                        # -> sigRoiDone(None) queued
+    assert _pump(qapp, lambda: (not dlg._roi_worker.isRunning()
+                                and "roiZ" not in dlg._table), timeout=5.0), \
+        "partial ROI column survived the close"
+    assert "roiZ" not in dlg._columns
+    assert dlg._roi_run_columns == []
