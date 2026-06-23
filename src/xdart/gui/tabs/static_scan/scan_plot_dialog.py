@@ -14,6 +14,7 @@ a later increment — see docs/design/design_scan_plotter_metadata_roi_jun2026.m
 
 import logging
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -27,41 +28,86 @@ logger = logging.getLogger(__name__)
 _TIFF_SUFFIXES = {".tif", ".tiff"}
 
 
-def load_scan_table(uri):
-    """Return ``(label, {column: ndarray})`` of per-frame metadata for a scan
-    URI, classifying it via the headless source layer.
+def open_scan(uri):
+    """Return ``(label, {column: ndarray}, source)`` for a scan URI: the
+    per-frame metadata columns AND the :class:`FrameSource` for raw-frame access
+    (ROI stats), classifying it via the headless source layer.
 
-    * processed NeXus → the full ``scan_data`` table (every motor + counter);
+    * processed NeXus → the full ``scan_data`` table (every motor + counter) +
+      the source that resolves the linked raw (for ROIs);
     * a TIFF/RAW image (the "first image of a sequence") → the whole folder as a
       ``TiffSeriesSource``, reading each frame's ``.txt``/``.pdi`` sidecar;
     * other sources (Eiger / NeXus stack) → ``frame_index`` + per-frame
       ``metadata_for`` + any ``motors`` the source exposes.
 
-    Thin GUI orchestration over headless functions (no analysis here)."""
+    ``source`` is ``None`` when the scan can't be opened as a frame source
+    (metadata-only / unopenable) — the ROI path is then disabled.  Thin GUI
+    orchestration over headless functions (no analysis here)."""
     from xrd_tools.io import read_scan_data
     from xrd_tools.sources import (SourceKind, TiffSeriesSource,
                                    guess_source_kind, open_source)
 
     label = os.path.basename(str(uri))
     kind = guess_source_kind(uri)
+    source = None
+    table = {}
     if kind is SourceKind.PROCESSED_NEXUS:
-        table = read_scan_data(uri)
+        try:
+            table = read_scan_data(uri)
+        except Exception:
+            logger.exception("scan-plot: read_scan_data failed for %s", uri)
+            table = {}
+        try:
+            source = open_source(uri)       # resolves the linked raw, for ROIs
+        except Exception:
+            source = None
         if table:
-            return label, table
+            return label, table, source
         # else fall through to the generic per-frame path
 
     try:
         if Path(uri).suffix.lower() in _TIFF_SUFFIXES:
             # A picked image is the first of a sequence: read the folder's series
             # so per-frame .txt/.pdi sidecars become the metadata columns.
-            src = TiffSeriesSource.from_directory(Path(uri).parent)
+            source = TiffSeriesSource.from_directory(Path(uri).parent)
             label = f"{Path(uri).parent.name} (image series)"
-        else:
-            src = open_source(uri)
+        elif source is None:
+            source = open_source(uri)
     except Exception:
         logger.exception("scan-plot: could not open source %s", uri)
-        return label, {}
-    return label, _table_from_source(src)
+        return label, table, None
+    if source is not None and not table:
+        table = _table_from_source(source)
+    return label, table, source
+
+
+def load_scan_table(uri):
+    """``(label, table)`` — back-compat wrapper over :func:`open_scan`."""
+    label, table, _source = open_scan(uri)
+    return label, table
+
+
+def raw_is_reachable(source):
+    """True iff ``source`` can load its first frame as a 2-D raw image — the
+    strict-raw probe the ROI stats require.
+
+    Mirrors the reintegrate raw path: a processed NeXus whose linked raw tree is
+    missing raises (so this reads False), and the strict ``load_frame`` never
+    substitutes a downsampled thumbnail.  A metadata-only source (``None``) or an
+    empty scan is unreachable."""
+    if source is None:
+        return False
+    try:
+        idxs = list(source.frame_indices)
+    except Exception:
+        return False
+    if not idxs:
+        return False
+    try:
+        img = np.asarray(source.load_frame(idxs[0]))
+    except Exception:
+        return False
+    return img.ndim == 2 and img.size > 0
 
 
 def _table_from_source(src):
@@ -120,6 +166,15 @@ class ScanPlotDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self._table = {}
         self._columns = []
+        # ROI path: the opened raw source + its computed columns.
+        self._source = None
+        self._source_uri = None
+        self._raw_reachable = False
+        self._roi_dialog = None
+        self._roi_worker = None
+        self._roi_run_columns = []          # column names filling this run
+        self._roi_row_of = {}               # frame_index -> table row
+        self._closing = False
         self.setObjectName("scanPlotDialog")
         self.setWindowTitle("Scan Plot")
         self.resize(640, 620)
@@ -160,6 +215,13 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.norm_combo.setToolTip("Divide Y by this column (None = off)")
         axes_row.addWidget(self.norm_combo)
         axes_row.addStretch(1)
+        self.roi_btn = QtWidgets.QPushButton("Plot ROI…")
+        self.roi_btn.setObjectName("scanPlotRoiBtn")
+        self.roi_btn.setEnabled(False)
+        self.roi_btn.setToolTip(
+            "Reduce rectangular ROIs over the scan's raw frames and add each as "
+            "a plotted column (enabled only when the raw frames are reachable)")
+        axes_row.addWidget(self.roi_btn)
         self.save_btn = QtWidgets.QPushButton("Save CSV…")
         self.save_btn.setEnabled(False)
         axes_row.addWidget(self.save_btn)
@@ -191,6 +253,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.x_combo.currentIndexChanged.connect(self._redraw)
         self.norm_combo.currentIndexChanged.connect(self._redraw)
         self.y_list.itemChanged.connect(self._redraw)
+        self.roi_btn.clicked.connect(self._open_roi_dialog)
         self.save_btn.clicked.connect(self._save_csv)
 
     # ---- source loading -------------------------------------------------
@@ -202,8 +265,12 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self.load_uri(path)
 
     def load_uri(self, uri):
-        label, table = load_scan_table(uri)
+        label, table, source = open_scan(uri)
+        self._source = source
+        self._source_uri = uri
+        self._raw_reachable = raw_is_reachable(source)
         self.set_table(label, table)
+        self._update_roi_button()
 
     def set_table(self, label, table):
         """Load a per-frame column table + populate the X/Y/Normalize selectors."""
@@ -307,6 +374,198 @@ class ScanPlotDialog(QtWidgets.QDialog):
                            symbol="o", symbolSize=4, symbolBrush=color)
         self.plot.setLabel("bottom", xcol)
         self.plot.setLabel("left", "value / " + norm_col if normalized else "value")
+
+    # ---- ROI columns ----------------------------------------------------
+    def _update_roi_button(self):
+        self.roi_btn.setEnabled(bool(self._raw_reachable))
+        if self._raw_reachable:
+            self.roi_btn.setToolTip(
+                "Reduce rectangular ROIs over the scan's raw frames and add each "
+                "as a plotted column")
+        elif self._source is None:
+            self.roi_btn.setToolTip(
+                "This scan exposes no raw frames (metadata only) — ROI plotting "
+                "is unavailable")
+        else:
+            self.roi_btn.setToolTip(
+                "The scan's raw frames aren't reachable on disk — ROI plotting is "
+                "unavailable")
+
+    def _table_len(self):
+        return max((len(np.atleast_1d(v)) for v in self._table.values()), default=0)
+
+    def _frame_row_map(self):
+        """``{frame_index: table row}`` for aligning streamed ROI stats to the
+        table; positional when there is no ``frame_index`` column."""
+        fi = self._table.get("frame_index")
+        if fi is None:
+            return {i: i for i in range(self._table_len())}
+        out = {}
+        for r, v in enumerate(np.asarray(fi, dtype=float)):
+            if np.isfinite(v):
+                out[int(round(v))] = r
+        return out
+
+    def _unique_col_name(self, base):
+        base = base or "roi"
+        if base not in self._table:
+            return base
+        i = 2
+        while f"{base}_{i}" in self._table:
+            i += 1
+        return f"{base}_{i}"
+
+    def _append_column(self, name, arr, *, check=False):
+        """Add a per-frame column to the table + the X/Norm/Y selectors (so an
+        ROI stat plots/overlays/normalizes/exports exactly like a metadata
+        column).  Signals are blocked so adding items never spuriously redraws."""
+        self._table[name] = np.asarray(arr, dtype=float)
+        if name in self._columns:
+            return
+        self._columns.append(name)
+        self.x_combo.blockSignals(True)
+        self.norm_combo.blockSignals(True)
+        self.y_list.blockSignals(True)
+        try:
+            self.x_combo.addItem(name)
+            self.norm_combo.addItem(name, name)
+            item = QtWidgets.QListWidgetItem(name)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Checked if check
+                               else QtCore.Qt.CheckState.Unchecked)
+            self.y_list.addItem(item)
+        finally:
+            self.x_combo.blockSignals(False)
+            self.norm_combo.blockSignals(False)
+            self.y_list.blockSignals(False)
+        self.save_btn.setEnabled(True)
+
+    def _remove_column(self, name):
+        self._table.pop(name, None)
+        if name in self._columns:
+            self._columns.remove(name)
+        self.x_combo.blockSignals(True)
+        self.norm_combo.blockSignals(True)
+        self.y_list.blockSignals(True)
+        try:
+            i = self.x_combo.findText(name)
+            if i >= 0:
+                self.x_combo.removeItem(i)
+            j = self.norm_combo.findText(name)
+            if j >= 0:
+                self.norm_combo.removeItem(j)
+            for k in range(self.y_list.count() - 1, -1, -1):
+                if self.y_list.item(k).text() == name:
+                    self.y_list.takeItem(k)
+        finally:
+            self.x_combo.blockSignals(False)
+            self.norm_combo.blockSignals(False)
+            self.y_list.blockSignals(False)
+
+    def _open_roi_dialog(self):
+        if not self._raw_reachable or self._source is None:
+            self.status.setText(
+                "Raw frames aren't reachable for this scan — ROI plotting is "
+                "unavailable.")
+            return
+        try:
+            idxs = list(self._source.frame_indices)
+            image = np.asarray(self._source.load_frame(idxs[0]))
+        except Exception:
+            logger.exception("scan-plot: could not load the first frame for ROI")
+            self.status.setText("Could not load the first frame (see log).")
+            return
+        from .roi_select_dialog import RoiSelectDialog
+        if self._roi_dialog is not None:
+            self._roi_dialog.close()
+        self._roi_dialog = RoiSelectDialog(image, parent=self)
+        self._roi_dialog.sigCompute.connect(self._compute_roi)
+        self._roi_dialog.show()
+        self._roi_dialog.raise_()
+        self._roi_dialog.activateWindow()
+
+    def _compute_roi(self, signals):
+        """Reduce ``signals`` (RoiSignals from the picker) over the raw frames
+        off-thread; each becomes a NaN-seeded column that fills incrementally."""
+        if self._source is None or not signals:
+            return
+        if self._roi_worker is not None and self._roi_worker.isRunning():
+            self.status.setText("An ROI computation is already running.")
+            return
+        if "frame_index" not in self._table:
+            try:
+                idxs = [float(i) for i in self._source.frame_indices]
+                self._append_column("frame_index", np.asarray(idxs))
+            except Exception:
+                pass
+        self._roi_row_of = self._frame_row_map()
+        n = self._table_len()
+        named = []
+        self._roi_run_columns = []
+        for sig in signals:
+            col = self._unique_col_name(sig.name or sig.roi.name or "roi")
+            named.append(replace(sig, name=col))
+            self._append_column(col, np.full(n, np.nan), check=True)
+            self._roi_run_columns.append(col)
+        from .analysis_worker import RoiStatsWorker
+        if self._roi_worker is None:
+            self._roi_worker = RoiStatsWorker(self)
+            self._roi_worker.sigProgress.connect(self._on_roi_progress)
+            self._roi_worker.sigFrameStat.connect(self._on_roi_frame)
+            self._roi_worker.sigRoiDone.connect(self._on_roi_done)
+        self._roi_worker.configure(named, self._source, x_key=None,
+                                   mask_saturation=False)
+        self.status.setText("Computing ROI stats…")
+        self._roi_worker.start()
+        self._redraw()
+
+    def _on_roi_progress(self, done, total):
+        if self._closing:
+            return
+        self.status.setText(f"Computing ROI stats… {done}/{total}")
+
+    def _on_roi_frame(self, frame_index, row):
+        if self._closing:
+            return
+        r = self._roi_row_of.get(int(frame_index))
+        if r is None:
+            return
+        for name, val in row.items():
+            arr = self._table.get(name)
+            if arr is not None and 0 <= r < len(arr):
+                arr[r] = val
+        self._redraw()
+
+    def _on_roi_done(self, result):
+        if self._closing:
+            return
+        if result is None:                  # cancelled / failed -> drop partials
+            for name in self._roi_run_columns:
+                self._remove_column(name)
+            self._roi_run_columns = []
+            self.status.setText("ROI computation cancelled.")
+            self._redraw()
+            return
+        diag = getattr(result.payload, "diagnostics", {}) or {}
+        no_raw = diag.get("no_raw_frames") or []
+        msg = f"ROI stats done — {len(self._roi_run_columns)} column(s) added."
+        if no_raw:
+            msg += f" ({len(no_raw)} frame(s) had unreachable raw → NaN.)"
+        self.status.setText(msg)
+        self._roi_run_columns = []
+
+    def showEvent(self, event):
+        self._closing = False
+        super().showEvent(event)
+
+    def closeEvent(self, event):
+        self._closing = True
+        if self._roi_worker is not None:
+            self._roi_worker.stop()
+        if self._roi_dialog is not None:
+            self._roi_dialog.close()
+            self._roi_dialog = None
+        super().closeEvent(event)
 
     def _save_csv(self):
         if not self._columns:

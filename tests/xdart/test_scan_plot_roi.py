@@ -1,0 +1,196 @@
+# -*- coding: utf-8 -*-
+"""Scan Plot ROI path: reachable-raw gating, the RectROI<->fields round-trip in
+the ROI picker, and the end-to-end worker fill (ROI series become table columns
+equal to a direct headless run_roi_signals — the mini spine).  Offscreen GUI; an
+occasional pyqtgraph teardown SIGSEGV is a known flake — just rerun."""
+import time
+
+import numpy as np
+import pytest
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    from pyqtgraph.Qt import QtWidgets
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    yield app
+
+
+def _stack():
+    """3 frames: a bright 2x2 block at rows/cols 1:3 whose mean rises 10,20,30."""
+    out = []
+    for f in range(3):
+        im = np.zeros((6, 6), dtype=float)
+        im[1:3, 1:3] = (f + 1) * 10.0
+        out.append(im)
+    return out
+
+
+def _pump(qapp, predicate, timeout=8.0):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        qapp.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    qapp.processEvents()
+    return predicate()
+
+
+# ── reachable-raw gating truth-table ──────────────────────────────────────
+
+
+def test_raw_is_reachable_truth_table(qapp):
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import raw_is_reachable
+    from xrd_tools.sources import MemoryFrameSource
+
+    # Eiger/TIFF-like: the images ARE the source -> reachable.
+    assert raw_is_reachable(MemoryFrameSource(_stack())) is True
+
+    # SPEC / metadata-only: no frame source at all.
+    assert raw_is_reachable(None) is False
+
+    # empty scan -> nothing to read.
+    assert raw_is_reachable(MemoryFrameSource([])) is False
+
+    # processed NeXus whose linked raw is missing: strict load_frame raises.
+    class _NoRaw(MemoryFrameSource):
+        def load_frame(self, index):
+            raise KeyError("raw master unresolved")
+
+    assert raw_is_reachable(_NoRaw(_stack())) is False
+
+    # a 1-D "frame" is not a usable raw image.
+    class _OneD(MemoryFrameSource):
+        def load_frame(self, index):
+            return np.arange(5.0)
+
+    assert raw_is_reachable(_OneD(_stack())) is False
+
+
+def test_roi_button_reflects_reachability(qapp):
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xrd_tools.sources import MemoryFrameSource
+
+    dlg = ScanPlotDialog()
+    try:
+        assert dlg.roi_btn.isEnabled() is False         # blank -> disabled
+        dlg._source = MemoryFrameSource(_stack())
+        dlg._raw_reachable = True
+        dlg._update_roi_button()
+        assert dlg.roi_btn.isEnabled() is True
+        dlg._source = None
+        dlg._raw_reachable = False
+        dlg._update_roi_button()
+        assert dlg.roi_btn.isEnabled() is False
+    finally:
+        dlg.close()
+
+
+# ── ROI picker: RectROI <-> fields two-way sync ───────────────────────────
+
+
+def test_roi_select_field_round_trip(qapp):
+    from xdart.gui.tabs.static_scan.roi_select_dialog import (
+        RoiSelectDialog, _rect_center_size)
+
+    img = np.zeros((100, 80), dtype=float)       # (rows, cols)
+    dlg = RoiSelectDialog(img)
+    try:
+        assert len(dlg._rois) == 1               # starts with one ROI
+        entry = dlg._rois[0]
+
+        # fields -> rect: type a box, commit, and the RectROI + RoiSpec follow.
+        dlg.f_crow.setText("40")
+        dlg.f_ccol.setText("30")
+        dlg.f_wrow.setText("10")
+        dlg.f_wcol.setText("6")
+        dlg._fields_to_rect()
+        crow, ccol, wrow, wcol = _rect_center_size(entry.rect)
+        assert (crow, ccol, wrow, wcol) == pytest.approx((40, 30, 10, 6), abs=0.5)
+
+        sig = dlg.roi_signals()[0]
+        assert sig.roi.center_y == pytest.approx(40, abs=0.5)   # row
+        assert sig.roi.center_x == pytest.approx(30, abs=0.5)   # col
+        assert sig.roi.width_y == pytest.approx(10, abs=0.5)
+        assert sig.roi.width_x == pytest.approx(6, abs=0.5)
+        assert sig.reducer == "mean"
+        assert sig.background is None
+
+        # rect -> fields: move the rectangle, the fields mirror it.
+        entry.rect.setSize([8, 20], update=False)
+        entry.rect.setPos([10, 5])               # x0=col, y0=row
+        dlg._on_rect_changed(entry, bg=False)
+        assert float(dlg.f_ccol.text()) == pytest.approx(10 + 8 / 2, abs=0.5)
+        assert float(dlg.f_crow.text()) == pytest.approx(5 + 20 / 2, abs=0.5)
+        assert float(dlg.f_wcol.text()) == pytest.approx(8, abs=0.5)
+        assert float(dlg.f_wrow.text()) == pytest.approx(20, abs=0.5)
+    finally:
+        dlg.close()
+
+
+def test_roi_select_reducer_and_background(qapp):
+    from xdart.gui.tabs.static_scan.roi_select_dialog import RoiSelectDialog
+
+    dlg = RoiSelectDialog(np.zeros((50, 50), dtype=float))
+    try:
+        dlg.reducer_combo.setCurrentText("sum")
+        dlg._on_reducer_changed(0)
+        dlg.bg_check.setChecked(True)            # -> creates a background rect
+        dlg.bg_op_combo.setCurrentIndex(1)       # divide
+        dlg._on_bg_op_changed(1)
+        sig = dlg.roi_signals()[0]
+        assert sig.reducer == "sum"
+        assert sig.background is not None
+        assert sig.background_op == "divide"
+
+        # adding/removing ROIs grows/shrinks the signal list.
+        dlg._add_roi()
+        assert len(dlg.roi_signals()) == 2
+        dlg._remove_roi()
+        assert len(dlg.roi_signals()) == 1
+    finally:
+        dlg.close()
+
+
+# ── end-to-end: compute fills table columns == direct run_roi_signals ─────
+
+
+def test_scan_plot_roi_fills_columns_end_to_end(qapp):
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.core.roi import RoiSpec
+    from xrd_tools.sources import MemoryFrameSource
+
+    src = MemoryFrameSource(_stack())
+    dlg = ScanPlotDialog()
+    try:
+        dlg.set_table("scan", {"frame_index": np.array([0.0, 1.0, 2.0]),
+                               "motor": np.array([10.0, 11.0, 12.0])})
+        dlg._source = src
+        dlg._raw_reachable = True
+
+        sig = RoiSignal(
+            roi=RoiSpec(center_x=1.5, center_y=1.5, width_x=2, width_y=2),
+            reducer="mean", name="roiA")
+        dlg._compute_roi([sig])
+        assert _pump(
+            qapp,
+            lambda: (dlg._roi_worker is not None
+                     and not dlg._roi_worker.isRunning()
+                     and not dlg._roi_run_columns)), "ROI worker never finished"
+
+        # the column was appended to the table + the selectors, and checked.
+        assert "roiA" in dlg._table
+        assert "roiA" in dlg._columns
+        checked = {dlg.y_list.item(i).text() for i in range(dlg.y_list.count())
+                   if dlg.y_list.item(i).checkState().value == 2}
+        assert "roiA" in checked
+
+        # the streamed/aligned column equals a direct headless run (mini spine),
+        # and tracks the rising signal (monotonic up).
+        direct = run_roi_signals([sig], src).payload.series["roiA"]
+        np.testing.assert_allclose(dlg._table["roiA"], direct)
+        assert np.all(np.diff(dlg._table["roiA"]) > 0)
+    finally:
+        dlg.close()
