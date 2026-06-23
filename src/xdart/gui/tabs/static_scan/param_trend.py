@@ -18,6 +18,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from .peak_fit_util import (CURVE_PENS, FAMILY_LABELS, X_UNIT_FAMILIES,
                             accumulator_to_table, group_families)
+from .plot_axes import add_right_series, attach_right_axis
 
 logger = logging.getLogger(__name__)
 
@@ -143,13 +144,11 @@ class ParamTrendMixin:
                 y = np.asarray(columns[key], dtype=float)
                 color = CURVE_PENS[color_idx % len(CURVE_PENS)]
                 color_idx += 1
-                item = pg.PlotDataItem(
-                    x, y, pen=pg.mkPen(color, width=2,
-                                       style=QtCore.Qt.PenStyle.DashLine),
-                    name=key, symbol="t", symbolSize=5, symbolBrush=color)
-                self.param_right_vb.addItem(item)
-                if self.param_legend is not None:
-                    self.param_legend.addItem(item, f"{key} (R)")
+                add_right_series(
+                    self.param_right_vb, self.param_legend, x, y,
+                    pen=pg.mkPen(color, width=2,
+                                 style=QtCore.Qt.PenStyle.DashLine),
+                    name=key, symbol="t", symbol_size=5, symbol_brush=color)
                 any_right = True
             self.param_right_axis.setLabel(self._family_axis_label(fam2))
         self.param_right_axis.setVisible(any_right)
@@ -217,7 +216,6 @@ class ParamTrendMixin:
         self.param_plot.setMinimumHeight(150)
         self.param_legend = self.param_plot.addLegend(offset=(-10, 10))
         self.param_plot.setLabel("bottom", "Frame")
-        from .plot_axes import attach_right_axis
         self.param_right_vb, self.param_right_axis = attach_right_axis(
             self.param_plot)
         lay.addWidget(self.param_plot, 2)

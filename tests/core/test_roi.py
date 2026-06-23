@@ -158,6 +158,47 @@ def test_run_roi_signals_matches_run_roi_stats_for_shared_config():
         np.testing.assert_allclose(via_plan.series[name], via_signals.series[name])
 
 
+def test_run_roi_signals_divide_is_area_scaled():
+    """divide uses the background DENSITY (like subtract), so sum+divide and
+    mean+divide give the same ratio regardless of the ROI's pixel area."""
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.sources import MemoryFrameSource
+
+    src = MemoryFrameSource(_stack())
+    sig = RoiSpec(center_x=2, center_y=2, width_x=2, width_y=2)
+    bg = RoiSpec(center_x=4.5, center_y=4.5, width_x=2, width_y=2)   # density 10
+    mean = run_roi_signals(
+        (RoiSignal(roi=sig, reducer="mean", background=bg,
+                   background_op="divide", name="m"),), src).payload
+    summ = run_roi_signals(
+        (RoiSignal(roi=sig, reducer="sum", background=bg,
+                   background_op="divide", name="s"),), src).payload
+    np.testing.assert_allclose(mean.series["m"], [10, 20, 30])
+    np.testing.assert_allclose(summ.series["s"], [10, 20, 30])    # area cancels
+
+
+def test_run_roi_signals_applies_static_mask():
+    """A static detector mask (MaskSpec or bool array) excludes pixels from ROI
+    stats — the parity §6.3 requires with the reducer."""
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.core.scan import MaskSpec
+    from xrd_tools.sources import MemoryFrameSource
+
+    img = np.arange(36, dtype=float).reshape(6, 6)
+    src = MemoryFrameSource([img])
+    sig = RoiSignal(roi=RoiSpec.full_frame(), reducer="mean", name="f")
+    base = run_roi_signals((sig,), src).payload
+    mask = np.zeros((6, 6), dtype=bool)
+    mask[:, :3] = True                       # exclude the (lower-valued) left half
+    masked = run_roi_signals((sig,), src, mask=mask).payload
+    assert masked.valid_counts["f"][0] == 18
+    assert masked.series["f"][0] == pytest.approx(img[:, 3:].mean())
+    assert masked.series["f"][0] > base.series["f"][0]
+    # the MaskSpec wrapper resolves to the same exclusion.
+    via_spec = run_roi_signals((sig,), src, mask=MaskSpec(mask)).payload
+    np.testing.assert_allclose(via_spec.series["f"], masked.series["f"])
+
+
 def test_run_roi_signals_dedups_colliding_names():
     """Two signals resolving to the SAME name must not collapse into one
     interleaved, wrong-length column (silent corruption for headless callers)."""

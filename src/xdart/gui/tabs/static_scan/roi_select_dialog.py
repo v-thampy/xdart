@@ -167,6 +167,12 @@ class RoiSelectDialog(QtWidgets.QDialog):
 
         # Compute / Close.
         action_row = QtWidgets.QHBoxLayout()
+        self.mask_sat_check = QtWidgets.QCheckBox("Mask saturated")
+        self.mask_sat_check.setToolTip(
+            "Exclude dead/saturated pixels (the dtype-ceiling module mask) from "
+            "the ROI stats — matches the integrator's saturated-pixel masking. "
+            "The uint32 dummy + non-finite pixels are always excluded.")
+        action_row.addWidget(self.mask_sat_check)
         action_row.addStretch(1)
         self.compute_btn = QtWidgets.QPushButton("Compute")
         self.compute_btn.setObjectName("roiCompute")
@@ -207,6 +213,12 @@ class RoiSelectDialog(QtWidgets.QDialog):
         h = max(4.0, rows / 4.0)
         return [cols / 2.0 - w / 2.0, rows / 2.0 - h / 2.0], [w, h]
 
+    def _full_frame_box(self):
+        """The whole-detector rectangle ``([0, 0], [cols, rows])`` — the default
+        first ROI (ROI doc §1: one ROI defaults to the entire frame)."""
+        rows, cols = self._image_shape
+        return [0.0, 0.0], [float(cols), float(rows)]
+
     def _new_name(self):
         existing = {e.name for e in self._rois}
         i = 1
@@ -224,7 +236,8 @@ class RoiSelectDialog(QtWidgets.QDialog):
         return rect
 
     def _add_roi(self):
-        pos, size = self._default_box()
+        # The first ROI defaults to the whole frame; later ones to a ¼ box.
+        pos, size = self._full_frame_box() if not self._rois else self._default_box()
         color = CURVE_PENS[len(self._rois) % len(CURVE_PENS)]
         rect = self._make_rect(pos, size, color)
         entry = _RoiEntry(self._new_name(), rect)
@@ -272,6 +285,7 @@ class RoiSelectDialog(QtWidgets.QDialog):
         finally:
             self._guard = False
         self._set_bg_fields_visible(entry.bg_enabled)
+        self._apply_bg_gate()
 
     @staticmethod
     def _rect_to_fields(rect, f_crow, f_ccol, f_wrow, f_wcol):
@@ -348,6 +362,17 @@ class RoiSelectDialog(QtWidgets.QDialog):
         entry = self._current_entry()
         if entry is not None and not self._guard:
             entry.reducer = self.reducer_combo.currentText()
+        self._apply_bg_gate()
+
+    def _apply_bg_gate(self):
+        """A paired background is only defined for the mean/sum reducers (the
+        density rule, ROI doc §6.2); disable the background controls — and turn an
+        active background off — for max/min/std."""
+        entry = self._current_entry()
+        allow = entry is not None and entry.reducer in ("mean", "sum")
+        self.bg_check.setEnabled(allow)
+        if not allow and self.bg_check.isChecked():
+            self.bg_check.setChecked(False)         # -> _on_bg_toggled hides it
 
     def _on_bg_op_changed(self, _idx):
         entry = self._current_entry()
@@ -408,6 +433,10 @@ class RoiSelectDialog(QtWidgets.QDialog):
             out.append(RoiSignal(roi=roi, reducer=entry.reducer, background=bg,
                                  background_op=entry.bg_op, name=entry.name))
         return out
+
+    def mask_saturated(self):
+        """Whether dead/saturated pixels should be excluded from the ROI stats."""
+        return self.mask_sat_check.isChecked()
 
     def _on_compute(self):
         if not self._rois:

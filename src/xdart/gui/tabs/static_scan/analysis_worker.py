@@ -168,15 +168,17 @@ class RoiStatsWorker(Qt.QtCore.QThread):
         self._signals = ()
         self._source = None
         self._x_key = None
+        self._mask = None
         self._mask_saturation = False
         self._cancel = False
 
-    def configure(self, signals, source, *, x_key=None,
+    def configure(self, signals, source, *, x_key=None, mask=None,
                   mask_saturation=False) -> None:
         """Set the ROI signals + the raw source for the next ``start()``."""
         self._signals = tuple(signals)
         self._source = source
         self._x_key = x_key
+        self._mask = mask
         self._mask_saturation = bool(mask_saturation)
         self._cancel = False
 
@@ -187,7 +189,8 @@ class RoiStatsWorker(Qt.QtCore.QThread):
         try:
             result = run_roi_signals(
                 self._signals, self._source,
-                x_key=self._x_key, mask_saturation=self._mask_saturation,
+                x_key=self._x_key, mask=self._mask,
+                mask_saturation=self._mask_saturation,
                 on_progress=lambda done, total: self.sigProgress.emit(done, total),
                 on_frame=lambda f, row: self.sigFrameStat.emit(f, row),
                 should_cancel=lambda: self._cancel)

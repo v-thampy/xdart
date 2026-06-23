@@ -51,3 +51,19 @@ def set_right_axis_visible(view_box, axis, visible, label=None):
     view_box.setVisible(bool(visible))
     if visible and label is not None:
         axis.setLabel(label)
+
+
+def add_right_series(view_box, legend, x, y, *, pen, name, symbol="o",
+                     symbol_size=4, symbol_brush=None):
+    """Add one curve to the right-axis ``view_box`` + a ``"… (R)"`` entry to the
+    main ``legend`` (which can't auto-track items outside its PlotItem), and
+    return the ``PlotDataItem``.  Shared by the Scan Plot overlay and the fitting
+    trend so the right-axis draw lives in one place."""
+    item = pg.PlotDataItem(x, y, pen=pen, name=name, symbol=symbol,
+                           symbolSize=symbol_size,
+                           symbolBrush=symbol_brush if symbol_brush is not None
+                           else pen.color())
+    view_box.addItem(item)
+    if legend is not None:
+        legend.addItem(item, f"{name} (R)")
+    return item

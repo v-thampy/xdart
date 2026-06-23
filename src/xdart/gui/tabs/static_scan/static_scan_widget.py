@@ -800,13 +800,28 @@ class staticWidget(QWidget):
                 continue
         return None
 
+    def _scan_plot_mask_provider(self, uri):
+        """The loaded scan's static detector mask (``scan.global_mask``) — but
+        ONLY when the Scan Plot's picked source IS that loaded scan.  An
+        arbitrary other source has its own detector/geometry, so the loaded
+        scan's mask must not be applied to it."""
+        import os
+        loaded = self._current_scan_uri()
+        try:
+            same = bool(loaded and uri and os.path.realpath(str(uri))
+                        == os.path.realpath(str(loaded)))
+        except (TypeError, ValueError):
+            same = False
+        return getattr(self.scan, 'global_mask', None) if same else None
+
     def _open_scan_plot_dialog(self):
         """Open (or re-show) the Scan Plot popup — lazy, single-instance,
         non-modal.  Starts on the currently-loaded scan (or blank)."""
         if self._scan_plot_dialog is None:
             from .scan_plot_dialog import ScanPlotDialog
             self._scan_plot_dialog = ScanPlotDialog(
-                default_uri=self._current_scan_uri(), parent=self)
+                default_uri=self._current_scan_uri(),
+                mask_provider=self._scan_plot_mask_provider, parent=self)
         dlg = self._scan_plot_dialog
         dlg.show()
         dlg.raise_()

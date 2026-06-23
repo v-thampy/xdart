@@ -129,6 +129,33 @@ def test_roi_select_field_round_trip(qapp):
         dlg.close()
 
 
+def test_roi_select_picker_defaults_and_gating(qapp):
+    """First ROI defaults to the whole frame; the saturation toggle is exposed;
+    the background controls gate to mean/sum."""
+    from xdart.gui.tabs.static_scan.roi_select_dialog import (
+        RoiSelectDialog, _rect_center_size)
+
+    dlg = RoiSelectDialog(np.zeros((40, 60), dtype=float))   # rows=40, cols=60
+    try:
+        _crow, _ccol, wrow, wcol = _rect_center_size(dlg._rois[0].rect)
+        assert (wrow, wcol) == pytest.approx((40, 60), abs=0.5)   # full frame
+
+        assert dlg.mask_saturated() is False
+        dlg.mask_sat_check.setChecked(True)
+        assert dlg.mask_saturated() is True
+
+        dlg.reducer_combo.setCurrentText("sum")
+        assert dlg.bg_check.isEnabled()
+        dlg.bg_check.setChecked(True)
+        assert dlg.roi_signals()[0].background is not None
+        dlg.reducer_combo.setCurrentText("max")          # gate background off
+        assert not dlg.bg_check.isEnabled()
+        assert not dlg.bg_check.isChecked()
+        assert dlg.roi_signals()[0].background is None
+    finally:
+        dlg.close()
+
+
 def test_roi_select_reducer_and_background(qapp):
     from xdart.gui.tabs.static_scan.roi_select_dialog import RoiSelectDialog
 
@@ -224,6 +251,72 @@ def test_scan_plot_roi_aligns_noncontiguous_frame_index(qapp):
         direct = run_roi_signals([sig], src).payload.series["roiA"]
         np.testing.assert_allclose(dlg._table["roiA"], direct)   # aligned by index
         assert np.all(np.diff(dlg._table["roiA"]) > 0)
+    finally:
+        dlg.close()
+
+
+def test_scan_plot_roi_applies_provider_mask(qapp):
+    """The dialog's mask_provider mask is threaded to the worker, so the ROI
+    column matches a direct masked run (and differs from the unmasked one)."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.core.roi import RoiSpec
+    from xrd_tools.sources import MemoryFrameSource
+
+    frames = [np.arange(36, dtype=float).reshape(6, 6) + 100 * f for f in range(3)]
+    src = MemoryFrameSource(frames)
+    mask = np.zeros((6, 6), dtype=bool)
+    mask[:, :3] = True
+    dlg = ScanPlotDialog(mask_provider=lambda uri: mask)
+    try:
+        dlg.set_table("s", {"frame_index": np.array([0.0, 1.0, 2.0])})
+        dlg._source = src
+        dlg._source_uri = "scan-A"
+        dlg._raw_reachable = True
+        sig = RoiSignal(roi=RoiSpec.full_frame(), reducer="mean", name="roiM")
+        dlg._compute_roi([sig])
+        assert _pump(qapp, lambda: (dlg._roi_worker is not None
+                                    and not dlg._roi_worker.isRunning()
+                                    and not dlg._roi_run_columns))
+        direct = run_roi_signals([sig], src, mask=mask).payload.series["roiM"]
+        np.testing.assert_allclose(dlg._table["roiM"], direct)
+        unmasked = run_roi_signals([sig], src).payload.series["roiM"]
+        assert not np.allclose(dlg._table["roiM"], unmasked)
+    finally:
+        dlg.close()
+
+
+def test_scan_plot_roi_column_normalizes_and_csv_roundtrips(qapp, tmp_path):
+    """An ROI/metadata column normalizes (y/norm) and the CSV exports the full
+    assembled table incl. a non-numeric column."""
+    from pyqtgraph.Qt import QtCore
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+
+    dlg = ScanPlotDialog()
+    try:
+        dlg.set_table("s", {"frame_index": np.array([0.0, 1.0, 2.0]),
+                            "i0": np.array([2.0, 4.0, 8.0]),
+                            "sig": np.array([10.0, 20.0, 40.0]),
+                            "label": np.array(["a", "b", "c"], dtype=object)})
+        for i in range(dlg.y_list.count()):
+            item = dlg.y_list.item(i)
+            item.setCheckState(QtCore.Qt.CheckState.Checked if item.text() == "sig"
+                               else QtCore.Qt.CheckState.Unchecked)
+        dlg.norm_combo.setCurrentText("i0")
+        items = dlg.plot.getPlotItem().listDataItems()
+        assert len(items) == 1
+        np.testing.assert_allclose(items[0].getData()[1], [5.0, 5.0, 5.0])  # sig/i0
+
+        out = tmp_path / "scan.csv"
+        dlg._write_csv(str(out))
+        import csv
+        with open(out) as fh:
+            rows = list(csv.reader(fh))
+        header = rows[0]
+        assert "label" in header and "sig" in header     # non-numeric kept
+        col = {h: [r[i] for r in rows[1:]] for i, h in enumerate(header)}
+        assert col["label"] == ["a", "b", "c"]
+        assert [float(v) for v in col["sig"]] == [10.0, 20.0, 40.0]
     finally:
         dlg.close()
 

@@ -22,6 +22,7 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from .peak_fit_util import CURVE_PENS
+from .plot_axes import add_right_series, attach_right_axis
 
 logger = logging.getLogger(__name__)
 
@@ -180,11 +181,15 @@ def _numeric_columns(table):
 class ScanPlotDialog(QtWidgets.QDialog):
     """Plot scan metadata columns vs each other, overlaid, with normalization."""
 
-    def __init__(self, default_uri=None, parent=None):
+    def __init__(self, default_uri=None, mask_provider=None, parent=None):
         super().__init__(parent)
         self._table = {}
         self._columns = []
         # ROI path: the opened raw source + its computed columns.
+        # ``mask_provider(uri)`` returns the static detector mask to apply to ROI
+        # stats for that source (e.g. the loaded scan's global_mask when the
+        # picked source IS the loaded scan), or None.
+        self._mask_provider = mask_provider
         self._source = None
         self._source_uri = None
         self._raw_reachable = False
@@ -269,7 +274,6 @@ class ScanPlotDialog(QtWidgets.QDialog):
         body.addLayout(y_col)
         self.plot = pg.PlotWidget()
         self.legend = self.plot.addLegend(offset=(-10, 10))
-        from .plot_axes import attach_right_axis
         self.right_vb, self.right_axis = attach_right_axis(self.plot)
         body.addWidget(self.plot, 1)
         lay.addLayout(body, 1)
@@ -356,7 +360,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.y_list.blockSignals(False)
         self.r_list.blockSignals(False)
 
-        self.save_btn.setEnabled(bool(cols))
+        self.save_btn.setEnabled(bool(self._table))   # CSV exports all columns
         if not self._table:
             self.status.setText("No metadata found for this source.")
         elif not cols:
@@ -442,13 +446,9 @@ class ScanPlotDialog(QtWidgets.QDialog):
             color = CURVE_PENS[n % len(CURVE_PENS)]
             pen = pg.mkPen(color, width=2)
             if ycol in right_cols:
-                # A separate, x-linked ViewBox carries the right-axis curves; the
-                # main PlotItem legend doesn't auto-track them, so add manually.
-                item = pg.PlotDataItem(x, y, pen=pen, name=ycol, symbol="o",
-                                       symbolSize=4, symbolBrush=color)
-                self.right_vb.addItem(item)
-                if self.legend is not None:
-                    self.legend.addItem(item, f"{ycol} (R)")
+                add_right_series(self.right_vb, self.legend, x, y, pen=pen,
+                                 name=ycol, symbol="o", symbol_size=4,
+                                 symbol_brush=color)
                 any_right = True
             else:
                 self.plot.plot(x, y, pen=pen, name=ycol, symbol="o",
@@ -607,8 +607,20 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self._roi_worker.sigProgress.connect(self._on_roi_progress)
             self._roi_worker.sigFrameStat.connect(self._on_roi_frame)
             self._roi_worker.sigRoiDone.connect(self._on_roi_done)
-        self._roi_worker.configure(named, self._source, x_key=None,
-                                   mask_saturation=False)
+        # Apply the same static detector mask the reducer uses (when the source
+        # is the loaded scan) + the picker's saturation toggle, so ROI stats
+        # agree with the reduction.
+        mask = None
+        if self._mask_provider is not None:
+            try:
+                mask = self._mask_provider(self._source_uri)
+            except Exception:
+                logger.exception("scan-plot: mask provider failed")
+                mask = None
+        mask_saturation = bool(self._roi_dialog is not None
+                               and self._roi_dialog.mask_saturated())
+        self._roi_worker.configure(named, self._source, x_key=None, mask=mask,
+                                   mask_saturation=mask_saturation)
         self.status.setText("Computing ROI stats…")
         self._roi_worker.start()
         self._redraw()
@@ -671,24 +683,40 @@ class ScanPlotDialog(QtWidgets.QDialog):
             self._roi_dialog = None
         super().closeEvent(event)
 
+    def _csv_columns(self):
+        """Every 1-D column of the assembled table — including non-numeric (e.g.
+        string motor) and all-NaN columns the plot selectors omit, so the CSV is
+        the full per-frame table the user sees + computed."""
+        out = []
+        for name, arr in self._table.items():
+            a = np.atleast_1d(np.asarray(arr, dtype=object))
+            if a.ndim == 1:
+                out.append(name)
+        return out
+
+    def _write_csv(self, path):
+        """Write the assembled table to ``path`` (one column per key, blanks for
+        ragged rows).  Separated from the file dialog so it's unit-testable."""
+        import csv
+        cols = self._csv_columns()
+        arrays = {c: np.atleast_1d(self._table[c]) for c in cols}
+        n = max((len(a) for a in arrays.values()), default=0)
+        with open(path, "w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(cols)
+            for r in range(n):
+                writer.writerow([arrays[c][r] if r < len(arrays[c]) else ""
+                                 for c in cols])
+
     def _save_csv(self):
-        if not self._columns:
+        if not self._table:
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save scan table", "scan_table.csv", "CSV files (*.csv)")
         if not path:
             return
-        import csv
-        cols = self._columns
-        n = max((len(self._table[c]) for c in cols), default=0)
         try:
-            with open(path, "w", newline="") as fh:
-                writer = csv.writer(fh)
-                writer.writerow(cols)
-                for r in range(n):
-                    writer.writerow([
-                        self._table[c][r] if r < len(self._table[c]) else ""
-                        for c in cols])
+            self._write_csv(path)
             self.status.setText(f"Saved {path}")
         except Exception:
             logger.exception("scan-table CSV save failed")

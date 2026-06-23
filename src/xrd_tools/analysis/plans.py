@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D, PONI
 from xrd_tools.core.roi import RoiSpec, invalid_pixel_mask, roi_reduce
-from xrd_tools.core.scan import FrameSource
+from xrd_tools.core.scan import FrameSource, MaskSpec
 from xrd_tools.sources import ensure_frame_source
 
 if TYPE_CHECKING:
@@ -423,17 +426,21 @@ class RoiStatsPlan:
     """Reduce one or more :class:`RoiSpec` rectangles over a scan's raw frames.
 
     ``background`` (optional) is combined with each signal ROI per
-    ``background_op``: ``"subtract"`` uses the mask-correct background *density*
-    (so ``sum`` stays area-scaled); ``"divide"`` is the same-reducer ratio.
+    ``background_op`` off the background *density* (mean per valid bg pixel), so
+    both ``"subtract"`` and ``"divide"`` stay area-scaled for the ``sum`` reducer.
     ``x_key`` picks a scan_data/metadata column for the x-axis (else frame
-    label).  ``mask_saturation`` opts into the dtype-ceiling saturation mask
-    (the uint32 dummy + non-finite are always excluded — R3-C parity)."""
+    label).  ``mask`` is a static detector mask (beamstop / bad module,
+    :class:`~xrd_tools.core.scan.MaskSpec` or a bool/flat-index array) excluded
+    from every ROI — the SAME mask the reducer applies, so ROI stats and the
+    reduction agree (§6.3).  ``mask_saturation`` opts into the dtype-ceiling
+    saturation mask (the uint32 dummy + non-finite are always excluded)."""
 
     rois: tuple[RoiSpec, ...] = ()
     background: RoiSpec | None = None
     background_op: str = "subtract"        # "subtract" | "divide"
     reducer: str = "mean"                  # mean | sum | max | min | std
     x_key: str | None = None
+    mask: Any = None                       # static detector MaskSpec / array
     mask_saturation: bool = False
     frame_indices: tuple[int, ...] | None = None
 
@@ -457,9 +464,9 @@ class RoiSignal:
     The per-ROI generalization of :class:`RoiStatsPlan` (which shares a single
     reducer/background across every ROI): each signal owns its column ``name``,
     its ``reducer``, and an optional ``background`` ROI combined per
-    ``background_op`` (``"subtract"`` = mask-correct density so ``sum`` stays
-    area-scaled; ``"divide"`` = same-reducer ratio).  Drive a sequence of these
-    with :func:`run_roi_signals`."""
+    ``background_op`` off the background density (``"subtract"`` and ``"divide"``
+    are both area-scaled for ``sum``).  Drive a sequence of these with
+    :func:`run_roi_signals`."""
 
     roi: RoiSpec
     reducer: str = "mean"                  # mean | sum | max | min | std
@@ -468,18 +475,20 @@ class RoiSignal:
     name: str = ""
 
 
-def _combine_background(value, n_valid, reducer, background_op, bkg_mean, bkg_same):
-    """Combine a signal ROI value with its background per ``background_op``."""
-    if background_op == "divide":
-        if bkg_same is None or not np.isfinite(bkg_same) or bkg_same == 0:
-            return float("nan")
-        return value / bkg_same
-    # subtract: background DENSITY (mean per valid pixel), area-scaled for sum
+def _combine_background(value, n_valid, reducer, background_op, bkg_mean):
+    """Combine a signal ROI value with its background, both ops keyed off the
+    background **density** ``bkg_mean`` (mean per valid bg pixel) so they are
+    area-consistent: for the ``sum`` reducer the background is scaled by the
+    signal ROI's valid-pixel count (a small bg box and a large one give the same
+    per-pixel correction).  ``subtract`` → ``value - scaled``; ``divide`` →
+    ``value / scaled``."""
     if bkg_mean is None or not np.isfinite(bkg_mean):
-        return value
-    if reducer == "sum":
-        return value - bkg_mean * n_valid
-    return value - bkg_mean
+        # No usable background: subtract is a no-op; divide is undefined.
+        return value if background_op == "subtract" else float("nan")
+    scaled = bkg_mean * n_valid if reducer == "sum" else bkg_mean
+    if background_op == "divide":
+        return value / scaled if scaled != 0 else float("nan")
+    return value - scaled
 
 
 def _dedup_names(names):
@@ -500,21 +509,33 @@ def _dedup_names(names):
     return out
 
 
+def _resolve_static_mask(mask, shape):
+    """Resolve a static detector mask (``MaskSpec`` / bool 2-D / flat-index
+    array) to a bool array of ``shape`` (True = exclude), or ``None`` if absent /
+    unresolvable.  Warn-don't-crash: a shape mismatch logs and yields ``None`` so
+    a bad mask never aborts the whole scan."""
+    if mask is None:
+        return None
+    try:
+        spec = mask if hasattr(mask, "to_bool") else MaskSpec(mask)
+        return np.asarray(spec.to_bool(tuple(shape)), dtype=bool)
+    except Exception:
+        logger.warning("ROI stats: could not resolve the static mask to %s; "
+                       "ignoring it", tuple(shape), exc_info=True)
+        return None
+
+
 def _reduce_signal(img, mask, signal):
     """Reduce one :class:`RoiSignal` over a single (mask-computed) image →
-    ``(value, n_valid)``, applying its optional background."""
+    ``(value, n_valid)``, applying its optional background.  Both subtract and
+    divide use the background DENSITY (mean over valid bg pixels), so a sum
+    reducer stays area-scaled for either op."""
     val, n_valid = roi_reduce(img, signal.roi, mask=mask, reducer=signal.reducer)
     if signal.background is None:
         return val, n_valid
-    if signal.background_op == "divide":
-        bkg_same, _ = roi_reduce(img, signal.background, mask=mask,
-                                 reducer=signal.reducer)
-        val = _combine_background(val, n_valid, signal.reducer, "divide",
-                                  None, bkg_same)
-    else:
-        bkg_mean, _ = roi_reduce(img, signal.background, mask=mask, reducer="mean")
-        val = _combine_background(val, n_valid, signal.reducer, "subtract",
-                                  bkg_mean, None)
+    bkg_mean, _ = roi_reduce(img, signal.background, mask=mask, reducer="mean")
+    val = _combine_background(val, n_valid, signal.reducer,
+                              signal.background_op, bkg_mean)
     return val, n_valid
 
 
@@ -523,6 +544,7 @@ def run_roi_signals(
     source,
     *,
     x_key: str | None = None,
+    mask: Any = None,
     mask_saturation: bool = False,
     frame_indices=None,
     on_progress=None,
@@ -554,6 +576,7 @@ def run_roi_signals(
     done_frames: list[int] = []
     total = len(all_frames)
     cancelled = False
+    static_mask = None          # resolved lazily on the first frame (uniform shape)
 
     for done, f in enumerate(all_frames, start=1):
         if should_cancel is not None and should_cancel():
@@ -569,10 +592,14 @@ def run_roi_signals(
                 row[n] = float("nan")
             no_raw.append(f)
         else:
-            mask = invalid_pixel_mask(img, mask_saturation=mask_saturation)
+            if mask is not None and static_mask is None:
+                static_mask = _resolve_static_mask(mask, img.shape)
+            frame_mask = invalid_pixel_mask(img, mask_saturation=mask_saturation)
+            if static_mask is not None and static_mask.shape == img.shape:
+                frame_mask = frame_mask | static_mask
             row = {}
             for sig, n in zip(signals, names):
-                val, n_valid = _reduce_signal(img, mask, sig)
+                val, n_valid = _reduce_signal(img, frame_mask, sig)
                 series[n].append(val)
                 counts[n].append(n_valid)
                 row[n] = val
@@ -617,7 +644,7 @@ def run_roi_stats(plan: RoiStatsPlan, source) -> AnalysisResult:
                   background_op=plan.background_op, name=roi.name or f"roi{i}")
         for i, roi in enumerate(rois))
     result = run_roi_signals(
-        signals, source, x_key=plan.x_key,
+        signals, source, x_key=plan.x_key, mask=plan.mask,
         mask_saturation=plan.mask_saturation, frame_indices=plan.frame_indices)
     # Preserve the original provenance (the plan dict) for back-compat.
     return AnalysisResult(kind=result.kind, payload=result.payload,
