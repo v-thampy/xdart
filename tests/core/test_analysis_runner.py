@@ -208,3 +208,53 @@ def test_sin2psi_analyzer_is_inert_without_a_2d_map():
         [AnalysisInput(label="0", x=np.array([1.0]), y=np.array([1.0]))]
     )
     assert out.ok is False and "IntegrationResult2D" in out.message
+
+
+# ── PhaseFitAnalyzer (frame-unit, structure-informed) ─────────────────────
+
+
+def test_phase_fit_analyzer_protocol_and_no_phases():
+    pytest.importorskip("lmfit")        # PhaseFitPlan() builds a FitConfig
+    from xrd_tools.analysis.plans import PhaseFitPlan
+    from xrd_tools.analysis.runner import Analyzer, AnalysisInput, PhaseFitAnalyzer
+
+    a = PhaseFitAnalyzer(PhaseFitPlan(), phases=[])
+    assert isinstance(a, Analyzer)
+    assert a.kind == "phase_fit" and a.unit == "frame"
+    out = a.analyze(AnalysisInput(label="0", x=np.array([1.0, 2.0]),
+                                  y=np.array([1.0, 2.0])))
+    assert out.ok is False and "CIF" in out.message    # inert without phases
+    with pytest.raises(NotImplementedError):
+        a.analyze_scan([])
+
+
+def test_phase_params_and_overlay_projection():
+    """The MultiPhaseResult -> flat params + overlay projection, on a synthetic
+    FitResultStore entry (no pymatgen / lmfit needed)."""
+    from xrd_tools.analysis.runner import _phase_overlay, _phase_params
+
+    class _FakeFitter:
+        def eval_model(self, params):
+            return np.array([10.0, 11.0, 12.0])
+
+    class _FakeResult:
+        def __init__(self):
+            self.fitter = _FakeFitter()
+            self.params = {}
+
+    entry = {
+        "result": _FakeResult(),
+        "phase_fractions": {"Ortho": 0.6, "Mono": 0.4},
+        "lattice_params": {"Ortho": {"a": 4.0}, "Mono": {"a": 5.1, "c": 5.2}},
+        "q_shift": 0.01, "redchi": 1.2, "success": True,
+    }
+    params = _phase_params(entry)
+    assert params["frac_Ortho"] == 0.6 and params["frac_Mono"] == 0.4
+    assert params["Ortho_a"] == 4.0 and params["Mono_c"] == 5.2
+    assert params["q_shift"] == 0.01 and params["redchi"] == 1.2
+
+    x = np.array([1.0, 2.0, 3.0])
+    y = np.array([12.0, 12.0, 12.0])
+    ov = _phase_overlay(x, y, entry)
+    assert {"fit", "residual"} <= set(ov.traces)
+    np.testing.assert_allclose(ov.traces["residual"], y - np.array([10., 11., 12.]))

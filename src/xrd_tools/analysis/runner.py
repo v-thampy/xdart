@@ -31,8 +31,10 @@ import numpy as np
 from xrd_tools.analysis.plans import (
     AnalysisResult,
     PeakFitPlan,
+    PhaseFitPlan,
     Sin2PsiPlan,
     run_peak_fit,
+    run_phase_fit,
     run_sin2psi,
 )
 from xrd_tools.core.containers import IntegrationResult2D
@@ -345,3 +347,104 @@ def _sin2psi_overlay(payload: Any) -> Overlay:
     d = np.asarray(payload.d_values, dtype=float)
     fit = np.asarray(payload.d0 + payload.slope * x, dtype=float)
     return Overlay(x=x, traces={"data": d, "fit": fit}, markers=[])
+
+
+# --------------------------------------------------------------------------
+# Phase fitting (frame-unit) — structure-informed multi-phase fit.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class PhaseFitAnalyzer:
+    """Frame-unit analyzer wrapping :class:`PhaseFitPlan` + :func:`run_phase_fit`.
+
+    Unlike :class:`PeakFitAnalyzer`, phase fitting needs the crystallographic
+    ``phases`` (``PhaseModel`` objects from CIFs) — the Plan's ``FitConfig``
+    carries only phase NAMES — so they are injected at construction.  Projects
+    the per-frame ``MultiPhaseResult`` to flat params (``frac_<phase>``,
+    ``<phase>_a`` / ``_b`` / ``_c``, ``q_shift``, ``redchi``) — the vs-frame
+    series a batch run plots — plus a fit / residual overlay
+    (``fitter.eval_model``).
+    """
+
+    plan: PhaseFitPlan
+    phases: "list[Any]" = field(default_factory=list)
+    kind: str = "phase_fit"
+    unit: str = "frame"
+
+    def analyze(self, inp: AnalysisInput) -> AnalysisOutcome:
+        if not self.phases:
+            return AnalysisOutcome(
+                inp.label, ok=False,
+                message="No phases — add one or more CIF files.")
+        x = np.asarray(inp.x, dtype=float)
+        y = np.asarray(inp.y, dtype=float)
+        finite = np.isfinite(x) & np.isfinite(y)
+        x, y = x[finite], y[finite]
+        try:
+            result = run_phase_fit(self._effective_plan(), [(x, y)],
+                                   self.phases, labels=[inp.label])
+        except Exception as exc:  # backend/fit failure -> inert outcome
+            return AnalysisOutcome(inp.label, ok=False, message=str(exc))
+        store = result.payload
+        if len(store) == 0:
+            return AnalysisOutcome(inp.label, ok=False,
+                                   message="phase fit produced no result")
+        entry = store[0]
+        return AnalysisOutcome(
+            label=inp.label,
+            ok=bool(entry.get("success", False)),
+            params=_phase_params(entry),
+            overlay=_phase_overlay(x, y, entry),
+            result=result,
+        )
+
+    def analyze_scan(self, inputs: Sequence[AnalysisInput]) -> AnalysisOutcome:
+        raise NotImplementedError(
+            "PhaseFitAnalyzer is frame-unit; the runner calls analyze() per frame."
+        )
+
+    def _effective_plan(self) -> PhaseFitPlan:
+        """A plan whose FitConfig selects every injected phase by name (an empty
+        phase_names selects NONE in fit_sequence — so fill it from self.phases)."""
+        config = self.plan.config
+        if getattr(config, "phase_names", None):
+            return self.plan
+        from xrd_tools.analysis.fitting import FitConfig
+        names = [getattr(p, "name", f"phase_{i}")
+                 for i, p in enumerate(self.phases)]
+        filled = FitConfig(init_kw=dict(config.init_kw),
+                           fit_kw=dict(config.fit_kw),
+                           phase_names=names,
+                           min_intensity=config.min_intensity,
+                           name=config.name)
+        return PhaseFitPlan(config=filled, sequential=self.plan.sequential)
+
+
+def _phase_params(entry: "dict[str, Any]") -> "dict[str, float]":
+    out: "dict[str, float]" = {}
+    for name, frac in (entry.get("phase_fractions") or {}).items():
+        out[f"frac_{name}"] = float(frac)
+    for name, lat in (entry.get("lattice_params") or {}).items():
+        for k, v in (lat or {}).items():
+            out[f"{name}_{k}"] = float(v)
+    out["q_shift"] = float(entry.get("q_shift", 0.0) or 0.0)
+    redchi = entry.get("redchi")
+    if redchi is not None and np.isfinite(redchi):
+        out["redchi"] = float(redchi)
+    return out
+
+
+def _phase_overlay(x: np.ndarray, y: np.ndarray, entry: "dict[str, Any]") -> Overlay:
+    x = np.asarray(x, dtype=float)
+    result = entry.get("result")
+    traces: "dict[str, np.ndarray]" = {}
+    if result is not None:
+        try:
+            model = np.asarray(result.fitter.eval_model(result.params), dtype=float)
+            if model.shape == x.shape:
+                traces["fit"] = model
+                traces["residual"] = np.asarray(y, dtype=float) - model
+        except Exception:
+            pass
+    return Overlay(x=x, traces=traces, markers=[])
