@@ -301,6 +301,42 @@ def test_scan_plot_roi_aligns_noncontiguous_frame_index(qapp):
         dlg.close()
 
 
+def test_scan_plot_same_scan_param_change_keeps_columns(qapp):
+    """Editing the raw/image pairing of the SAME scan refreshes the source +
+    gating but must NOT wipe the table or the user's computed ROI columns; a
+    DIFFERENT scan rebuilds wholesale."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSelection
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+    from xrd_tools.sources import MemoryFrameSource
+
+    dlg = ScanPlotDialog()
+    try:
+        spec5 = SourceSpec("scanA", SourceKind.SPEC, options={"scan": "5"})
+        src = MemoryFrameSource(_stack())
+        dlg._on_source_selected(ScanSelection(
+            spec=spec5, source=src, label="A5", reachable=True,
+            first_image=_stack()[0]))
+        dlg._append_column("roiX", np.array([1.0, 2.0, 3.0]), check=True)
+        assert "roiX" in dlg._columns
+
+        # same scan, only the source/raw pairing changed -> columns preserved
+        src2 = MemoryFrameSource(_stack())
+        dlg._on_source_selected(ScanSelection(
+            spec=spec5, source=src2, label="A5", reachable=True,
+            first_image=_stack()[0]))
+        assert "roiX" in dlg._columns and dlg._source is src2
+
+        # a different scan -> full rebuild drops the ROI column
+        spec6 = SourceSpec("scanA", SourceKind.SPEC, options={"scan": "6"})
+        dlg._on_source_selected(ScanSelection(
+            spec=spec6, source=src2, label="A6", reachable=True,
+            first_image=_stack()[0]))
+        assert "roiX" not in dlg._columns
+    finally:
+        dlg.close()
+
+
 def test_scan_plot_metadata_less_source_roi_vs_frame(qapp):
     """An images-only source (Eiger/raw burst — no motors) plots ROI vs frame
     number: the table is just frame_index, raw is reachable, ROI fills (§2.3)."""

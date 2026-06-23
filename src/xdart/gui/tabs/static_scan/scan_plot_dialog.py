@@ -13,9 +13,7 @@ a later increment — see docs/design/design_scan_plotter_metadata_roi_jun2026.m
 """
 
 import logging
-import os
 from dataclasses import replace
-from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
@@ -25,68 +23,6 @@ from .peak_fit_util import CURVE_PENS
 from .plot_axes import add_right_series, attach_right_axis
 
 logger = logging.getLogger(__name__)
-
-_TIFF_SUFFIXES = {".tif", ".tiff"}
-
-
-def open_scan(uri, scan=None):
-    """Return ``(label, {column: ndarray}, source)`` for a scan URI: the
-    per-frame metadata columns AND the :class:`FrameSource` for raw-frame access
-    (ROI stats), classifying it via the headless source layer.  ``scan`` selects
-    a SPEC scan number (ignored by other source kinds).
-
-    * processed NeXus → the full ``scan_data`` table (every motor + counter) +
-      the source that resolves the linked raw (for ROIs);
-    * a TIFF/RAW image (the "first image of a sequence") → the whole folder as a
-      ``TiffSeriesSource``, reading each frame's ``.txt``/``.pdi`` sidecar;
-    * other sources (Eiger / NeXus stack) → ``frame_index`` + per-frame
-      ``metadata_for`` + any ``motors`` the source exposes.
-
-    ``source`` is ``None`` when the scan can't be opened as a frame source
-    (metadata-only / unopenable) — the ROI path is then disabled.  Thin GUI
-    orchestration over headless functions (no analysis here)."""
-    from xrd_tools.io import read_scan_data
-    from xrd_tools.sources import (SourceKind, TiffSeriesSource,
-                                   guess_source_kind, open_source)
-
-    label = os.path.basename(str(uri))
-    kind = guess_source_kind(uri)
-    source = None
-    table = {}
-    if kind is SourceKind.PROCESSED_NEXUS:
-        try:
-            table = read_scan_data(uri)
-        except Exception:
-            logger.exception("scan-plot: read_scan_data failed for %s", uri)
-            table = {}
-        try:
-            source = open_source(uri)       # resolves the linked raw, for ROIs
-        except Exception:
-            source = None
-        if table:
-            return label, table, source
-        # else fall through to the generic per-frame path
-
-    try:
-        if Path(uri).suffix.lower() in _TIFF_SUFFIXES:
-            # A picked image is the first of a sequence: read the folder's series
-            # so per-frame .txt/.pdi sidecars become the metadata columns.
-            source = TiffSeriesSource.from_directory(Path(uri).parent)
-            label = f"{Path(uri).parent.name} (image series)"
-        elif source is None:
-            source = open_source(uri, scan=scan)   # scan selects a SPEC scan
-    except Exception:
-        logger.exception("scan-plot: could not open source %s", uri)
-        return label, table, None
-    if source is not None and not table:
-        table = _table_from_source(source)
-    return label, table, source
-
-
-def load_scan_table(uri):
-    """``(label, table)`` — back-compat wrapper over :func:`open_scan`."""
-    label, table, _source = open_scan(uri)
-    return label, table
 
 
 def probe_first_frame(source):
@@ -193,6 +129,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._mask_provider = mask_provider
         self._source = None
         self._source_uri = None
+        self._scan_identity = None          # (uri, scan, entry) of the loaded scan
         self._raw_reachable = False
         self._first_image = None            # cached first frame (probe → picker)
         self._roi_dialog = None
@@ -284,28 +221,47 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.save_btn.clicked.connect(self._save_csv)
 
     # ---- source loading -------------------------------------------------
-    def load_uri(self, uri, scan=None):
+    def load_uri(self, uri):
         """Programmatically load a scan into the source widget (e.g. the dialog's
         default scan); the widget emits ``sigSourceChanged`` → loads the table."""
         self.source_widget.set_uri(uri)
 
+    @staticmethod
+    def _selection_identity(selection):
+        """The (file, scan, entry) identity of a selection — unchanged when only
+        the raw/image pairing was edited; ``None`` for an anonymous source."""
+        if selection.spec is None:
+            return None
+        opts = dict(getattr(selection.spec, "options", {}) or {})
+        return (str(selection.spec.uri), opts.get("scan"),
+                getattr(selection.spec, "entry", None))
+
     def _on_source_selected(self, selection):
-        """The ScanSourceWidget chose a scan: rebuild the table + ROI gating from
-        the opened source.  A new scan replaces the table wholesale, so abort any
-        in-flight ROI run first (a stale worker must not stream into it)."""
-        self._abort_roi_run()
+        """The ScanSourceWidget chose a source.  A NEW scan rebuilds the table
+        wholesale (and aborts any in-flight ROI run); when only the raw/image
+        pairing of the SAME scan changed, refresh the source + ROI gating WITHOUT
+        wiping the table or the user's computed ROI columns."""
         if selection is None or selection.source is None:
+            self._abort_roi_run()
             self._source = None
             self._source_uri = None
             self._raw_reachable = False
             self._first_image = None
+            self._scan_identity = None
             self.set_table("", {})
             self._update_roi_button()
             return
+        identity = self._selection_identity(selection)
+        same_scan = identity is not None and identity == self._scan_identity
         self._source = selection.source
         self._source_uri = str(selection.spec.uri) if selection.spec else None
         self._raw_reachable = bool(selection.reachable)
         self._first_image = selection.first_image
+        if same_scan:
+            self._update_roi_button()       # only re-gate; keep table + ROI columns
+            return
+        self._abort_roi_run()
+        self._scan_identity = identity
         label, table = self._table_for(selection)
         self.set_table(label, table)
         self._update_roi_button()
