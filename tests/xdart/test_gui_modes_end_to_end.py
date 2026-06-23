@@ -406,7 +406,7 @@ def test_metadata_popup_and_tools_placeholder(widget):
     assert w.ui.metaFrame.findChild(QtWidgets.QFrame, "toolsPlaceholder") is not None
     labels = {l.text() for l in w.ui.metaFrame.findChildren(QtWidgets.QLabel)
               if l.objectName() == "toolLabel"}
-    assert {"Peak Fitting", "Plot Metadata"} <= labels
+    assert {"Peak Fitting", "Phase Fitting", "Scan Plot"} <= labels
     # Opening the popup reparents the live metawidget into a non-modal dialog.
     assert w._metadata_dialog is None
     w._open_metadata_dialog()
@@ -499,7 +499,7 @@ def test_peak_fit_tool_wired_in_static_widget(widget):
     w = widget
     opens = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
              if b.objectName() == "toolOpen"]
-    assert len(opens) == 2                 # Peak + Phase active; Plot Metadata planned
+    assert len(opens) == 3                 # Peak + Phase + Scan Plot active
     assert w._peak_fit_dialog is None
     w._open_peak_fit_dialog()
     assert w._peak_fit_dialog is not None and not w._peak_fit_dialog.isModal()
@@ -709,7 +709,7 @@ def test_phase_fit_tool_wired_in_static_widget(widget):
     w = widget
     opens = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
              if b.objectName() == "toolOpen"]
-    assert len(opens) == 2
+    assert len(opens) == 3
     assert w._phase_fit_dialog is None
     w._open_phase_fit_dialog()
     assert w._phase_fit_dialog is not None and not w._phase_fit_dialog.isModal()
@@ -807,6 +807,71 @@ def test_phase_batch_does_not_crash_on_range(widget, qapp):
             qapp.processEvents()
             time.sleep(0.01)
         worker.wait(2000)
+
+
+# ── Scan Plot tool (metadata plotting — step 1) ───────────────────────────
+
+
+def test_scan_plot_tool_wired_in_static_widget(widget):
+    """Tools now exposes three active tools incl. Scan Plot; it builds lazily +
+    non-modal."""
+    from PySide6 import QtWidgets
+    w = widget
+    opens = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
+             if b.objectName() == "toolOpen"]
+    assert len(opens) == 3
+    assert w._scan_plot_dialog is None
+    w._open_scan_plot_dialog()
+    assert w._scan_plot_dialog is not None and not w._scan_plot_dialog.isModal()
+
+
+def test_scan_plot_dialog_columns_and_normalization(qapp):
+    """set_table populates X/Y/Normalize from the numeric columns; checking Y
+    plots a curve; a second Y overlays; normalization divides; non-numeric
+    columns are excluded."""
+    from pyqtgraph.Qt import QtCore
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    dlg = ScanPlotDialog()
+    try:
+        table = {
+            "frame_index": np.arange(5, dtype=float),
+            "theta": np.linspace(0.0, 2.0, 5),
+            "i0": np.array([100.0, 110.0, 120.0, 130.0, 140.0]),
+            "label": np.array(["a", "b", "c", "d", "e"], dtype=object),
+        }
+        dlg.set_table("scan.nxs", table)
+        cols = [dlg.x_combo.itemText(i) for i in range(dlg.x_combo.count())]
+        assert {"frame_index", "theta", "i0"} <= set(cols)
+        assert "label" not in cols                  # non-numeric excluded
+        # default: X = frame_index; first non-X (theta) checked -> one curve
+        assert dlg.x_combo.currentText() == "frame_index"
+        assert len(dlg.plot.getPlotItem().listDataItems()) == 1
+        # overlay a second Y
+        i0 = dlg.y_list.findItems("i0", QtCore.Qt.MatchFlag.MatchExactly)[0]
+        i0.setCheckState(QtCore.Qt.CheckState.Checked)
+        assert len(dlg.plot.getPlotItem().listDataItems()) == 2
+        # normalization is available + divides without crashing
+        norms = [dlg.norm_combo.itemText(i) for i in range(dlg.norm_combo.count())]
+        assert "None" in norms and "i0" in norms
+        dlg.norm_combo.setCurrentText("i0")
+        assert len(dlg.plot.getPlotItem().listDataItems()) == 2
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_scan_plot_dialog_empty_table_is_graceful(qapp):
+    """No metadata -> no columns, no curves, Save disabled, no crash."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    dlg = ScanPlotDialog()
+    try:
+        dlg.set_table("empty", {})
+        assert dlg.x_combo.count() == 0
+        assert dlg.plot.getPlotItem().listDataItems() == []
+        assert not dlg.save_btn.isEnabled()
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
 
 
 def test_batch_fit_through_static_widget_populates_results(widget, qapp):

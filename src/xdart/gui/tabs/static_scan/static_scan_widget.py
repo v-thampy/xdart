@@ -475,6 +475,7 @@ class staticWidget(QWidget):
         self._metadata_dialog = None
         self._peak_fit_dialog = None
         self._phase_fit_dialog = None
+        self._scan_plot_dialog = None
         # The fit dialog whose batch run is currently in flight (Peak or Phase).
         self._batch_dialog = None
         # Live analysis preview (analyzer framework Step 3): a latest-wins
@@ -515,7 +516,7 @@ class staticWidget(QWidget):
         tools = [
             ('Peak Fitting', self._open_peak_fit_dialog),
             ('Phase Fitting', self._open_phase_fit_dialog),
-            ('Plot Metadata', None),
+            ('Scan Plot', self._open_scan_plot_dialog),
         ]
         for name, handler in tools:
             row = QtWidgets.QWidget()
@@ -785,6 +786,31 @@ class staticWidget(QWidget):
         dlg.raise_()
         dlg.activateWindow()
         dlg.refresh_pattern()
+
+    def _current_scan_uri(self):
+        """Best-effort path to the currently-loaded scan (for Scan Plot's default
+        source); None when nothing real is loaded (the dialog starts blank)."""
+        import os
+        for cand in (getattr(self.scan, 'data_file', None),
+                     getattr(self, 'fname', None)):
+            try:
+                if cand and os.path.exists(str(cand)):
+                    return str(cand)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _open_scan_plot_dialog(self):
+        """Open (or re-show) the Scan Plot popup — lazy, single-instance,
+        non-modal.  Starts on the currently-loaded scan (or blank)."""
+        if self._scan_plot_dialog is None:
+            from .scan_plot_dialog import ScanPlotDialog
+            self._scan_plot_dialog = ScanPlotDialog(
+                default_uri=self._current_scan_uri(), parent=self)
+        dlg = self._scan_plot_dialog
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _open_metadata_dialog(self):
         """Open (or re-show) the frame-metadata popup.
