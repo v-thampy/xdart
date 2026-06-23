@@ -60,17 +60,24 @@ reproducibility seam** (it round-trips; a saved scan definition re-opens the sam
 | (Processed NeXus) moved raw | `source_root` (`ProcessedNexusSource`) | existing (N1) |
 | (Tiled, future) catalog / node | `catalog` / `node` (`TiledSource`) | reserved; no factory yet |
 
-**One small headless addition** (pure, testable, no Qt): a grouping helper for stitch/RSM —
+**Two small headless additions** (pure, testable, no Qt) — grouping + the composite source that
+makes "combine several scans into one output" seamless (stitch/RSM design §5.1, §6 Q1):
 
 ```python
 # xrd_tools/sources/grouping.py
-def parse_scan_range("1-3, 5, 7-9") -> [1, 2, 3, 5, 7, 9]      # pure
-def spec_scan_specs(spec_uri, scans, *, image_dir=None, **read_kw) -> list[SourceSpec]
+def parse_scan_groups("1-3, 5, 7-9") -> [[1,2,3], [5], [7,8,9]]   # pure: GROUPS, not a flat list
+# xrd_tools/sources/composite.py
+class CompositeFrameSource(FrameSource):     # concatenates member sources into one frame stream
+    """frames = s0.frames ++ s1.frames ++ …; load_frame/metadata_for dispatch to the owning
+    member; motors/scan_data concatenate.  One scan-group => one source => ONE run."""
 ```
 
-ROI uses a single scan; stitch/RSM pass a range → a list of `SourceSpec`s → one
-`run_stitch`/`run_rsm` per group. Keeping range-parsing headless means the widget's grouping
-field is trivial.
+A **group** (e.g. `1-3`) *combines* scans 1+2+3 into a single `CompositeFrameSource` → ONE
+`run_stitch`/`run_rsm`; `5` is a singleton; so `"1-3, 5, 7-9"` → **three** outputs. ROI uses a
+single scan (no grouping shown); stitch/RSM turn grouping on. Keeping group-parsing + the
+concatenation headless means the widget's grouping field is trivial and the "process several
+scans together" capability is the same `FrameSource` everything else already consumes (it is
+also how stitch's cross-file "Multi" is modelled — a composite over different files/kinds).
 
 ## 2.1 One widget, every source kind (the generality that makes it reusable)
 
@@ -103,6 +110,53 @@ scan numbers, NeXus entries, Tiled runs — so it generalizes unchanged.
 contract (`catalog`, `node`/`uid`) is reserved so today's widget + every consumer accept it
 with no downstream change. Until then the kind is simply absent from the picker.
 
+## 2.2 Two entry modes: a single master file, or a directory + kind
+
+The widget's source can be entered two ways (this is how the wrangler works today and how Vivek
+wants to keep it):
+
+- **File mode** — pick one master (a SPEC file, a `.nxs`, an Eiger master). Its scan-id space
+  (§2.1) is enumerated *from the file* (SPEC scans / NeXus entries).
+- **Directory mode** — pick a **folder** + a **Scan kind** selector (SPEC / TIFF / NeXus /
+  Eiger / …). The headless layer then **walks the directory (and, optionally, subdirectories)**,
+  finds the files matching that kind, and **uses `FrameSource` to identify the scan(s)** inside
+  it — e.g. group a folder of `*_scanN_*` images into per-`N` scans, or list every SPEC/`.nxs`
+  found. Directory mode can therefore surface **many** scans; the user then selects (and, for
+  stitch/RSM, groups) among them.
+
+Headless seam (one discovery function per kind, returning openable specs — Qt-free, testable):
+
+```python
+# xrd_tools/sources/discover.py
+def discover_scans(directory, kind, *, recursive=False, **opts) -> list[SourceSpec]
+```
+
+`TiffSeriesSource.from_directory` is today's only instance; `discover_scans` generalizes it
+(SPEC: each spec file × its scans, or images grouped by `_scanN_`; NeXus/Eiger: each master).
+**Directory mode is OPTIONAL for the ROI plotter** (which wants one scan) — but because it
+produces the same `SourceSpec`s, adding it is just another entry path into the same machinery,
+so the widget supports it where it's cheap and the consumer can hide it.
+
+## 2.3 Metadata is OPTIONAL — images-only sources (Eiger/raw burst mode)
+
+Some scans have **no associated metadata** — notably **Eiger burst-mode** acquisition (and some
+raw collections): a stack of frames, no motors/counters. This must stay first-class
+(wrangler-org §1: metadata optional for Int; extend to ROI-vs-frame):
+
+- An images-only `FrameSource` exposes `frame_indices` + `load_frame` with `metadata_for ≈ {}`.
+  `_table_from_source` then yields **just `frame_index`**.
+- **ROI stats still work** — plotted **vs frame number** (the dialog's default x). The ROI path
+  must NOT require any metadata column (it already synthesizes `frame_index` from
+  `source.frame_indices`); the only requirement is reachable raw, which an image stack has.
+- **Integration still works** — a bare stack already integrates through the pyFAI Int 1D/2D path
+  (wrangler-org §1; `ImageFileSource`/`NexusStackSource`). The source the widget emits feeds the
+  *same* integrators, so an Eiger burst can be both ROI-vs-frame **and** Int 1D/2D'd.
+
+So the **raw-reachable dot is independent of metadata**: an Eiger burst shows the dot green
+(images present) with an empty metadata table, and Plot ROI + integration are both available.
+*(Gap to verify in the build: the integration path supports metadata-less stacks today; the ROI
+path should be exercised on one too — see §5 step 3 gate.)*
+
 ---
 
 ## 3. The widget — fields + behavior
@@ -124,10 +178,15 @@ to it and call `open_source(spec)` themselves (so the widget never holds analysi
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**File / source** — one picker, "All files" (SPEC is extensionless). On pick,
-`guess_source_kind` classifies (content-sniff for SPEC; suffix/inspect for NeXus/Eiger/TIFF);
-the `kind:` label reflects it. *(Tiled later replaces the file picker with a catalog-URI field
-+ a Browse… catalog dialog — same `sigSourceChanged` contract.)*
+**File / source** — a **File ⟷ Directory** entry-mode toggle (§2.2):
+- *File*: one picker, "All files" (SPEC is extensionless). `guess_source_kind` classifies
+  (content-sniff for SPEC; suffix/inspect for NeXus/Eiger/TIFF); the `kind:` label reflects it.
+- *Directory*: a folder picker **+ a Scan-kind dropdown** (SPEC / TIFF / NeXus / Eiger) **+ a
+  "include subfolders" check** → `discover_scans(dir, kind, recursive)` lists the scans found;
+  the Scan selector below becomes a list of *those* scans.
+
+*(Tiled later adds a third entry: a catalog-URI field + a Browse… catalog dialog — same
+`sigSourceChanged` contract.)*
 
 **Scan — kind-adaptive selector** (§2.1): SPEC → a **scan-number** combo
 (`SpecSource(uri).available_scans`); NeXus → an **entry** combo (usually one); Tiled → a
@@ -156,8 +215,9 @@ hidden for them. (These are stitch §5.4's "★ raw-image read params".) The **i
 transform** (GAP E) belongs here too but is **stitch/RSM-only** (irrelevant to ROI box stats on
 the raw array) — gate it off for the ROI consumer.
 
-**Grouping** — range syntax `1-3, 5, 7-9` (`parse_scan_range`); **stitch/RSM only**, hidden for
-ROI (single scan). Emits a list of specs instead of one.
+**Grouping** — range syntax `1-3, 5, 7-9` (`parse_scan_groups` → combine 1+2+3, then 5, then
+7+8+9 via `CompositeFrameSource`, §2); **stitch/RSM only**, hidden for ROI (single scan). Emits
+one source **per group**.
 
 ### 3.1 Mode/consumer gating (one widget, fields toggle)
 Mirrors wrangler-org §2's mode table, but at the *field* level inside this widget:
@@ -196,8 +256,11 @@ geometry/calibration, DiffractometerConfig, UB, reduction, and output panels *ar
 
 0. **(done)** Headless `SpecSource` (metadata + optional images) + content detection + scan
    selection. *(Shipped `3a9d18c`.)*
-1. **Headless grouping helper.** `parse_scan_range` + `spec_scan_specs`. *Gate:* pure unit
-   tests (`"1-3,5"` → specs; image_dir threads into each spec's options).
+1. **Headless grouping + composite + discovery.** `parse_scan_groups("1-3,5") → [[1,2,3],[5]]`;
+   `CompositeFrameSource` (concatenate members → one frame stream, metadata dispatched per
+   member); `discover_scans(dir, kind, recursive)` (generalize `TiffSeriesSource.from_directory`).
+   *Gate:* pure unit tests — group parsing; a composite's frames/metadata equal the concatenation;
+   `discover_scans` finds the scans in a synthetic folder; image_dir/options thread through.
 2. **`ScanSourceWidget` — kind-adaptive, SPEC + NeXus.** The widget above with the §2.1
    kind-adaptive Scan selector (SPEC scan combo / NeXus entry combo) + Images affordance
    (external folder for SPEC; inline for raw NeXus/Eiger; `source_root` repoint for processed
@@ -206,8 +269,10 @@ geometry/calibration, DiffractometerConfig, UB, reduction, and output panels *ar
    flips the dot; a processed-NeXus + reachable raw shows the dot green; the scan/entry selector
    reloads. (Both source families already exist headless, so this is GUI-only.)
 3. **Adopt in the ROI Scan Plotter.** Replace the ad-hoc source row; ROI works end-to-end on a
-   SPEC scan (point at images → Plot ROI) AND a processed NeXus (linked raw). *Gate:* the
-   existing `test_scan_plot_roi` SPEC/NeXus tests + a new "SPEC + image dir → ROI column fills".
+   SPEC scan (point at images → Plot ROI), a processed NeXus (linked raw), AND a **metadata-less
+   image stack** (Eiger/raw burst → ROI vs frame_index). *Gate:* the existing `test_scan_plot_roi`
+   SPEC/NeXus tests + "SPEC + image dir → ROI column fills" + **"images-only source → ROI plots
+   vs frame_index with an empty metadata table"** (the §2.3 case).
 4. **(later) Wrangler reuse.** Embed `mode="stitch"|"rsm"`; grouping + orientation on. *Gate:*
    wrangler-org's gates.
 5. **(future) Tiled.** Add `TiledSource` + an `open_source` factory + a catalog-browser
@@ -227,8 +292,11 @@ step 4; Tiled slots in at step 5 behind the same seam.
    `detector` preset dropdown that fills shape/dtype.)
 3. **Where the widget lives.** `xdart/gui/.../scan_source_widget.py` (shared), imported by both
    the static-scan ROI dialog and the future wrangler — confirm the single-home placement.
-4. **Composite / cross-file sources** (stitch "Multi", stitching §6 Q1) — out of scope for this
-   widget v1 (one master file per definition); a later composite layer concatenates specs.
+4. **Composite / cross-file "Multi"** (stitch §6 Q1) — the `CompositeFrameSource` (§2) makes
+   combining scans (even across different files/kinds) into one output first-class. v1 supports
+   grouping within one source-entry; cross-file Multi (a group whose members come from different
+   master files) is the same composite over specs from several widget instances — flag the UX
+   (one widget vs a small list of source rows) for the implementing branch.
 5. **NeXus "scan id".** A processed `.nxs` is usually one entry; multi-entry/multi-scan NeXus —
    treat entries as the scan-id space (so grouping a range of entries works like SPEC scan
    numbers), or one file = one scan? (Recommend: entries are the scan-id space, symmetric with
