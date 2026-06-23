@@ -20,10 +20,14 @@ from xrd_tools.sources.registry import (
     open_source,
     register_source,
 )
+from xrd_tools.sources.composite import CompositeFrameSource, concat_sources
+from xrd_tools.sources.discover import discover_scans
+from xrd_tools.sources.grouping import flatten_scan_groups, parse_scan_groups
 from xrd_tools.sources.spec import SpecSource
 
 __all__ = [
     "BaseFrameSource",
+    "CompositeFrameSource",
     "FrameSource",
     "ImageFileSource",
     "LiveFrameSource",
@@ -35,8 +39,12 @@ __all__ = [
     "SourceSpec",
     "SpecSource",
     "TiffSeriesSource",
+    "concat_sources",
+    "discover_scans",
     "ensure_frame_source",
+    "flatten_scan_groups",
     "guess_source_kind",
     "open_source",
+    "parse_scan_groups",
     "register_source",
 ]
