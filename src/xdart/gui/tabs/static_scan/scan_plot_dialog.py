@@ -212,29 +212,11 @@ class ScanPlotDialog(QtWidgets.QDialog):
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
 
-        # Source row.
-        src_row = QtWidgets.QHBoxLayout()
-        src_row.setSpacing(7)
-        src_row.addWidget(QtWidgets.QLabel("Source"))
-        self.source_label = QtWidgets.QLineEdit()
-        self.source_label.setReadOnly(True)
-        self.source_label.setPlaceholderText("(no scan chosen)")
-        src_row.addWidget(self.source_label, 1)
-        # Scan selector — shown only for a multi-scan SPEC file.
-        self.scan_label = QtWidgets.QLabel("Scan")
-        self.scan_combo = QtWidgets.QComboBox()
-        self.scan_combo.setMinimumWidth(70)
-        self.scan_combo.setToolTip("Which scan of the SPEC file to plot")
-        self.scan_label.setVisible(False)
-        self.scan_combo.setVisible(False)
-        src_row.addWidget(self.scan_label)
-        src_row.addWidget(self.scan_combo)
-        self.choose_btn = QtWidgets.QPushButton("Choose…")
-        self.choose_btn.setToolTip(
-            "Open a scan: processed NeXus, Eiger, the first image of a "
-            "TIFF/RAW sequence, or a SPEC scan file (extensionless)")
-        src_row.addWidget(self.choose_btn)
-        lay.addLayout(src_row)
+        # Source — the shared scan-source widget (File/Directory, kind-adaptive,
+        # SPEC scan + optional images + raw-reachable gating).
+        from .scan_source_widget import ScanSourceWidget
+        self.source_widget = ScanSourceWidget(mode="roi", parent=self)
+        lay.addWidget(self.source_widget)
 
         # Axes row: X / Normalize combos (Y is the multi-select below).
         axes_row = QtWidgets.QHBoxLayout()
@@ -293,58 +275,59 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
 
-        self.choose_btn.clicked.connect(self._choose_source)
         self.x_combo.currentIndexChanged.connect(self._redraw)
         self.norm_combo.currentIndexChanged.connect(self._redraw)
         self.y_list.itemChanged.connect(self._redraw)
         self.r_list.itemChanged.connect(self._redraw)
-        self.scan_combo.currentIndexChanged.connect(self._on_scan_changed)
+        self.source_widget.sigSourceChanged.connect(self._on_source_selected)
         self.roi_btn.clicked.connect(self._open_roi_dialog)
         self.save_btn.clicked.connect(self._save_csv)
 
     # ---- source loading -------------------------------------------------
-    def _choose_source(self):
-        # SPEC scan files are extensionless, so there is no SPEC filter — pick
-        # them via "All files".
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Choose a scan", "",
-            "Scans (*.nxs *.h5 *.hdf5 *.cxi *.tif *.tiff);;All files (*)")
-        if path:
-            self.load_uri(path)
-
     def load_uri(self, uri, scan=None):
-        # A new scan replaces the table wholesale; abort any in-flight ROI run so
-        # a stale worker can't stream into it and the picker can't show the old
-        # frame.
+        """Programmatically load a scan into the source widget (e.g. the dialog's
+        default scan); the widget emits ``sigSourceChanged`` → loads the table."""
+        self.source_widget.set_uri(uri)
+
+    def _on_source_selected(self, selection):
+        """The ScanSourceWidget chose a scan: rebuild the table + ROI gating from
+        the opened source.  A new scan replaces the table wholesale, so abort any
+        in-flight ROI run first (a stale worker must not stream into it)."""
         self._abort_roi_run()
-        label, table, source = open_scan(uri, scan=scan)
-        self._source = source
-        self._source_uri = uri
-        self._raw_reachable, self._first_image = probe_first_frame(source)
+        if selection is None or selection.source is None:
+            self._source = None
+            self._source_uri = None
+            self._raw_reachable = False
+            self._first_image = None
+            self.set_table("", {})
+            self._update_roi_button()
+            return
+        self._source = selection.source
+        self._source_uri = str(selection.spec.uri) if selection.spec else None
+        self._raw_reachable = bool(selection.reachable)
+        self._first_image = selection.first_image
+        label, table = self._table_for(selection)
         self.set_table(label, table)
-        self._populate_scan_combo(source)
         self._update_roi_button()
 
-    def _populate_scan_combo(self, source):
-        """Show + fill the scan selector for a multi-scan SPEC source; hide it
-        for everything else."""
-        scans = list(getattr(source, "available_scans", None) or [])
-        multi = len(scans) > 1
-        self.scan_combo.blockSignals(True)
-        self.scan_combo.clear()
-        if multi:
-            self.scan_combo.addItems(scans)
-            current = getattr(source, "scan_key", None)
-            if current in scans:
-                self.scan_combo.setCurrentIndex(scans.index(current))
-        self.scan_combo.blockSignals(False)
-        self.scan_label.setVisible(multi)
-        self.scan_combo.setVisible(multi)
-
-    def _on_scan_changed(self, _idx):
-        scan = self.scan_combo.currentText()
-        if scan and self._source_uri:
-            self.load_uri(self._source_uri, scan=scan)
+    @staticmethod
+    def _table_for(selection):
+        """Per-frame metadata table for a selection — the full ``scan_data`` for a
+        processed NeXus, else the source's own per-frame metadata (which is just
+        ``frame_index`` for a metadata-less image stack)."""
+        from xrd_tools.core.scan import SourceKind
+        spec, source = selection.spec, selection.source
+        table = {}
+        if spec is not None and spec.kind is SourceKind.PROCESSED_NEXUS:
+            from xrd_tools.io import read_scan_data
+            try:
+                table = read_scan_data(spec.uri)
+            except Exception:
+                logger.exception("scan-plot: read_scan_data failed")
+                table = {}
+        if not table:
+            table = _table_from_source(source)
+        return selection.label, table
 
     def _abort_roi_run(self):
         """Stop an in-flight ROI computation + close the picker and forget its
@@ -363,7 +346,6 @@ class ScanPlotDialog(QtWidgets.QDialog):
         """Load a per-frame column table + populate the X/Y/Normalize selectors."""
         self._table = dict(table or {})
         self._columns = _numeric_columns(self._table)
-        self.source_label.setText(label or "")
         cols = self._columns
 
         self.x_combo.blockSignals(True)

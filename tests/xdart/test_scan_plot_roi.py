@@ -102,14 +102,13 @@ def test_scan_plot_loads_spec_metadata_roi_disabled(qapp, tmp_path):
     p.write_text(_SPEC)
     dlg = ScanPlotDialog()
     try:
-        dlg.load_uri(str(p))
+        dlg.load_uri(str(p))                           # routes through the source widget
         assert {"th", "i0", "det", "chi"} <= set(dlg._columns)   # scan 5 columns
         assert dlg.roi_btn.isEnabled() is False        # no raw -> ROI off
-        # the multi-scan selector is populated (offscreen isVisible() is unreliable
-        # without a shown parent, so assert the populated state)
-        assert [dlg.scan_combo.itemText(i)
-                for i in range(dlg.scan_combo.count())] == ["5.1", "6.1"]
-        dlg.scan_combo.setCurrentText("6.1")           # -> reloads scan 6
+        # the shared widget's scan selector lists both scans; switching reloads
+        scan_combo = dlg.source_widget.scan_combo
+        assert scan_combo.count() == 2
+        scan_combo.setCurrentIndex(1)                  # -> scan 6
         assert "chi" in dlg._columns and "det" not in dlg._columns
     finally:
         dlg.close()
@@ -298,6 +297,34 @@ def test_scan_plot_roi_aligns_noncontiguous_frame_index(qapp):
         direct = run_roi_signals([sig], src).payload.series["roiA"]
         np.testing.assert_allclose(dlg._table["roiA"], direct)   # aligned by index
         assert np.all(np.diff(dlg._table["roiA"]) > 0)
+    finally:
+        dlg.close()
+
+
+def test_scan_plot_metadata_less_source_roi_vs_frame(qapp):
+    """An images-only source (Eiger/raw burst — no motors) plots ROI vs frame
+    number: the table is just frame_index, raw is reachable, ROI fills (§2.3)."""
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSelection
+    from xrd_tools.analysis.plans import RoiSignal
+    from xrd_tools.core.roi import RoiSpec
+    from xrd_tools.sources import MemoryFrameSource
+
+    src = MemoryFrameSource(_stack())            # images, NO metadata
+    dlg = ScanPlotDialog()
+    try:
+        dlg._on_source_selected(ScanSelection(
+            spec=None, source=src, label="burst", reachable=True,
+            first_image=_stack()[0]))
+        assert dlg._columns == ["frame_index"]   # metadata-less → frame_index only
+        assert dlg.roi_btn.isEnabled() is True   # reachable raw, no metadata needed
+        sig = RoiSignal(roi=RoiSpec(center_x=1.5, center_y=1.5, width_x=2,
+                                    width_y=2), reducer="mean", name="roiB")
+        dlg._compute_roi([sig])
+        assert _pump(qapp, lambda: (dlg._roi_worker is not None
+                                    and not dlg._roi_worker.isRunning()
+                                    and not dlg._roi_run_columns))
+        assert "roiB" in dlg._table and np.all(np.diff(dlg._table["roiB"]) > 0)
     finally:
         dlg.close()
 
