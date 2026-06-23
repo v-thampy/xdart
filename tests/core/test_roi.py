@@ -116,3 +116,74 @@ def test_run_roi_stats_no_raw_frame_is_nan_not_crash():
     assert res.series["full"][0] == 5.0
     assert np.isnan(res.series["full"][1])       # unreadable frame -> NaN, no crash
     assert res.series["full"][2] == 5.0
+
+
+def test_run_roi_signals_per_roi_reducer_and_background():
+    """Each RoiSignal carries its OWN reducer + background — two signals with
+    different reducers/ops reduce in a single pass over the frames."""
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.sources import MemoryFrameSource
+
+    src = MemoryFrameSource(_stack())
+    sig_roi = RoiSpec(center_x=2, center_y=2, width_x=2, width_y=2)
+    bg = RoiSpec(center_x=4.5, center_y=4.5, width_x=2, width_y=2)
+    signals = (
+        RoiSignal(roi=sig_roi, reducer="sum", background=bg,
+                  background_op="subtract", name="A"),       # 360, 760, 1160
+        RoiSignal(roi=sig_roi, reducer="mean", background=bg,
+                  background_op="divide", name="B"),         # 10, 20, 30
+    )
+    res = run_roi_signals(signals, src).payload
+    np.testing.assert_allclose(res.series["A"], [360, 760, 1160])
+    np.testing.assert_allclose(res.series["B"], [10, 20, 30])
+    np.testing.assert_array_equal(res.frames, [0, 1, 2])
+    assert res.diagnostics["cancelled"] is False
+
+
+def test_run_roi_signals_matches_run_roi_stats_for_shared_config():
+    """The shared-reducer plan is the special case of per-ROI signals — the
+    wrapper and the driver must agree element-for-element (the mini spine)."""
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.sources import MemoryFrameSource
+
+    src = MemoryFrameSource(_stack())
+    a = RoiSpec(center_x=2, center_y=2, width_x=2, width_y=2, name="a")
+    b = RoiSpec(center_x=4.5, center_y=4.5, width_x=2, width_y=2, name="b")
+    plan = RoiStatsPlan(rois=(a, b), reducer="mean")
+    via_plan = run_roi_stats(plan, src).payload
+    via_signals = run_roi_signals(
+        (RoiSignal(roi=a, reducer="mean", name="a"),
+         RoiSignal(roi=b, reducer="mean", name="b")), src).payload
+    for name in ("a", "b"):
+        np.testing.assert_allclose(via_plan.series[name], via_signals.series[name])
+
+
+def test_run_roi_signals_streams_and_cancels():
+    """on_frame/on_progress stream per frame; should_cancel stops early and the
+    result covers only the processed frames (diagnostics['cancelled'])."""
+    from xrd_tools.analysis.plans import RoiSignal, run_roi_signals
+    from xrd_tools.sources import MemoryFrameSource
+
+    src = MemoryFrameSource(_stack())                 # 3 frames
+    sig = RoiSignal(roi=RoiSpec.full_frame(), reducer="mean", name="full")
+
+    streamed, progress = [], []
+    res = run_roi_signals(
+        (sig,), src,
+        on_frame=lambda f, row: streamed.append((f, row["full"])),
+        on_progress=lambda d, t: progress.append((d, t))).payload
+    assert [f for f, _ in streamed] == [0, 1, 2]
+    assert progress[-1] == (3, 3)
+    assert res.diagnostics["cancelled"] is False
+
+    # cancel before the 2nd frame -> only frame 0 processed.
+    seen = []
+
+    def stop_after_one():
+        return len(seen) >= 1
+
+    res2 = run_roi_signals(
+        (sig,), src, on_frame=lambda f, _row: seen.append(f),
+        should_cancel=stop_after_one).payload
+    assert list(res2.frames) == [0]
+    assert res2.diagnostics["cancelled"] is True
