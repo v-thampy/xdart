@@ -132,46 +132,55 @@ stitching module.
 
 ---
 
-## 2.6 TWO stitch backends — pyFAI MultiGeometry **and** xrayutilities (decision 2026-06-23)
+## 2.6 THREE stitch backends — the merge is selectable (decision 2026-06-23)
 
-**The merge engine is selectable, not fixed.** The original framing above ("hard seam:
-(images, PONIs) → `MultiGeometry`") is **one** backend. Validation on real del/nu data
-(the `Multi120_*` notebooks, §8) **converged on xrayutilities** for the geometry — it fits
-the `del`/`nu` motor offsets directly and evaluates the stacked pose exactly, whereas pyFAI
-`MultiGeometry` hard-wires `deg2rad` per axis (GAP A) — while pyFAI still owns the per-pixel
-**intensity corrections**. So `StitchPlan` gains a backend selector and the stitch is built
-backend-agnostic over the shared per-frame geometry:
+**Stitching factors into two independent choices — the q-GEOMETRY engine and the MERGE
+engine — and we ship THREE of the meaningful combinations** (Vivek, 2026-06-23). Validation
+on real del/nu data (the `Multi120_*` notebooks, §8) converged on **xrayutilities** for the
+geometry (it fits the `del`/`nu` motor offsets directly + evaluates the stacked pose exactly,
+where pyFAI `MultiGeometry` hard-wires `deg2rad` per axis = GAP A), while pyFAI still owns the
+per-pixel **intensity corrections** — but the **histogram** merge (vs pyFAI's azimuthal
+`MultiGeometry`) is independently valuable because it **streams** (stitch-on-the-fly). So:
 
 ```python
-StitchPlan.backend: Literal["xu_grid", "multigeometry"] = "xu_grid"
+StitchPlan.backend: Literal["xu_hist", "pyfai_hist", "multigeometry"] = "xu_hist"
 ```
 
-- **`"xu_grid"` (default — the converged path).** Per-frame `(q_per_pixel, χ_per_pixel)`
-  from `Diffractometer.to_qconversion()` → xu `HXRD.Ang2Q.area(...)`; per-pixel
-  **corrections** (solid-angle, polarization — and the GI stack) applied as weights, reused
-  from pyFAI's arrays (`design_intensity_corrections_jun2026.md`); **merge = a per-pixel
-  histogram gridder** into the common (q, χ) grid — the canonical Backend-B merge (this is
-  exactly the notebooks' shared `stitch(provider)` helper, and the SAME accumulator shape as
-  RSM's `rsm.gridding.StreamingGridder`). Geometry-exact for multi-axis goniometers.
-- **`"multigeometry"` (the lighter pyFAI-only alternative).** Today's path: per-frame pyFAI
-  `AzimuthalIntegrator`s (geometry from `Diffractometer.to_pyfai_per_frame`) → pyFAI
-  `MultiGeometry`, which does geometry + corrections + azimuthal-integration + merge in one
-  (§3.2). Simple + battle-tested; fine for single-axis / small-offset scans. *(Default flagged
-  for the maintainer — flip to `"multigeometry"` if you'd rather not require xu by default.)*
+|  | q-geometry | merge | 1D + 2D | streams | role |
+|---|---|---|---|---|---|
+| **`"multigeometry"`** | pyFAI AIs (`to_pyfai_per_frame`) | pyFAI `MultiGeometry` | **both via MG** | no | the validated pyFAI azimuthal path |
+| **`"pyfai_hist"`** | pyFAI q/χ maps | per-pixel **histogram** | both via hist | **yes** | pyFAI geometry, streaming merge |
+| **`"xu_hist"`** (default) | xu `Ang2Q.area` (`to_qconversion`) | per-pixel **histogram** | both via hist | **yes** | the converged path |
 
-**The seam both share:** a per-frame **q-provider** `(|q| per pixel, χ per pixel, weight)`
-→ a merge. `"xu_grid"` merges with the histogram gridder; `"multigeometry"` merges with pyFAI
-`MultiGeometry` (its own AIs ARE the provider+merge). `run_stitch(plan, source)` dispatches on
-`plan.backend`; `stitch_ponis` (§3.2) is the `"multigeometry"` feeder, and a sibling
-`stitch_q_grid(images, geometries, corrections)` is the `"xu_grid"` feeder.
+- **`"multigeometry"`** — per-frame pyFAI `AzimuthalIntegrator`s → pyFAI `MultiGeometry`, which
+  does geometry + corrections + azimuthal-integration + merge in one. **Both the 1D and the 2D
+  (q, χ) stitch go through MultiGeometry** (`stitch_1d`/`stitch_2d`, §3.2) — the validated
+  pyFAI azimuthal path. *(Gate: compare its 1D + 2D against the `reduce_pyFAI_multigeometry`
+  notebook to confirm parity — §7.)*
+- **`"pyfai_hist"` / `"xu_hist"`** — share ONE per-pixel **histogram** merge fed by a per-frame
+  **q-provider** `(|q| per pixel, χ per pixel, weight)`; they differ ONLY in the q-provider:
+  `pyfai_hist` from pyFAI's q/χ maps, `xu_hist` from `Diffractometer.to_qconversion()` → xu
+  `HXRD.Ang2Q.area(...)`. Per-pixel **corrections** (solid-angle, polarization, GI stack)
+  applied as weights, reused from pyFAI arrays (`design_intensity_corrections_jun2026.md`). The
+  histogram is the notebooks' shared `stitch(provider)` and the SAME accumulator shape as RSM's
+  `rsm.gridding.StreamingGridder` (`design_rsm_jun2026.md`) — so it **streams**
+  (stitch-on-the-fly, §3.4).
+
+**The shared seam.** `run_stitch(plan, source)` dispatches on `plan.backend`. `stitch_ponis`
+(§3.2) is the `multigeometry` feeder; a sibling `stitch_q_grid(provider, corrections)` is the
+**shared histogram** feeder for BOTH `pyfai_hist` and `xu_hist` (only the q-provider closure
+swaps). `xu_hist` is the default (the converged, geometry-exact, streaming path) — *flagged for
+the maintainer*.
 
 **Why this does NOT touch geometry (§3.1):** the shared `Diffractometer` already produces both
-adapters — `to_pyfai_per_frame` (Backend A) and `to_qconversion`/`to_hxrd(energy)` (Backend B,
-the same adapter RSM consumes). Both backends consume the SAME per-frame `DetectorCalibration`;
-only the merge differs. And the per-pixel **corrections are a shared pre-weight step** feeding
-either backend (and RSM). *(Validated: on del-only the two backends overlay essentially
-perfectly in ring position — the notebooks' §6 confirms pyFAI's corrections reweight intensity,
-not peak position; the del/nu "edges-off" was high-`nu` extrapolation, not a missing engine.)*
+adapters — `to_pyfai_per_frame` (MultiGeometry + the pyFAI q-provider) and
+`to_qconversion`/`to_hxrd(energy)` (the xu q-provider, the same adapter RSM consumes). All three
+backends consume the SAME per-frame `DetectorCalibration`; only the q-provider + merge differ.
+Corrections are a shared pre-weight feeding all three (and RSM). *(Validated: on del-only the
+backends overlay in ring position — notebook §6 confirms pyFAI's corrections reweight intensity,
+not peak position; the del/nu "edges-off" was high-`nu` extrapolation, not a missing engine. The
+3-way `pyfai_hist` vs `multigeometry` vs `xu_hist` comparison also cross-checks histogram-vs-MG
+parity for the pyFAI geometry.)*
 
 ---
 
@@ -228,11 +237,12 @@ resulting per-image AIs identically. `create_multigeometry_integrators` becomes 
 thin "base + Diffractometer rotations → per-frame geometries" helper feeding it.
 
 > **Backend-aware (§2.6):** `stitch_ponis` is the **`"multigeometry"`** feeder (per-frame
-> `DetectorCalibration`s → AIs → `MultiGeometry`). The **`"xu_grid"`** backend takes the SAME
-> per-frame `DetectorCalibration`s through a sibling `stitch_q_grid(images, geometries,
-> corrections)` — `to_qconversion` → `Ang2Q.area` per frame → a per-pixel histogram merge into
-> the common (q, χ) grid, with pyFAI correction arrays applied as weights. Both are dispatched
-> by `run_stitch(plan, source)` on `plan.backend`; the per-frame geometry carrier is shared.
+> `DetectorCalibration`s → AIs → `MultiGeometry`, both 1D + 2D). The histogram backends
+> **`"pyfai_hist"`** and **`"xu_hist"`** take the SAME per-frame `DetectorCalibration`s through
+> a sibling `stitch_q_grid(provider, corrections)` — a per-frame q-provider `(|q|, χ, weight)`
+> → a per-pixel histogram merge into the (q, χ) grid, pyFAI correction arrays as weights —
+> differing ONLY in the q-provider (pyFAI q/χ maps vs `to_qconversion` → `Ang2Q.area`). All
+> dispatched by `run_stitch(plan, source)` on `plan.backend`; the geometry carrier is shared.
 
 ### 3.2a Bridge: load a pyFAI goniometer calibration (closes GAP D)
 The real-world calibration artifact is a pyFAI `GoniometerRefinement` JSON. Add a
@@ -450,15 +460,18 @@ Everything the notebook hard-codes becomes a widget field. Grouped by concern, w
    stitch provenance (Diffractometer + DetectorCalibration). **Gate:** synthetic
    multi-frame source → stitched 1D + 2D; no-raw on a moved tree fails loud (never
    stitch off thumbnails).
-3b. **`"xu_grid"` stitch backend (§2.6).** Add `StitchPlan.backend`; implement
-   `stitch_q_grid(images, geometries, corrections)` — `to_qconversion` → `Ang2Q.area` per
-   frame → a per-pixel **histogram merge** into the common (q, χ) grid (the canonical
-   Backend-B merge — the `Multi120_Compare_xu_vs_pyFAI_del_only` notebook's `stitch(provider)`
-   and the same accumulator shape as RSM's `StreamingGridder`); per-pixel corrections
-   (solid-angle / polarization) applied as weights, reused from pyFAI arrays. **Gate (real
-   data):** on the del-only LaB6 scan `"xu_grid"` and `"multigeometry"` overlay in ring
-   position within the radial bin width (the `Multi120_Compare` notebook is the fixture);
-   per-pixel χ matches pyFAI `chiArray` ≤ 0.03°.
+3b. **Histogram stitch backends `"pyfai_hist"` + `"xu_hist"` (§2.6).** Add
+   `StitchPlan.backend` (3 values); implement the shared `stitch_q_grid(provider, corrections)`
+   — a per-frame q-provider `(|q|, χ, weight)` → a per-pixel **histogram merge** into the
+   common (q, χ) grid (the `Multi120_Compare_xu_vs_pyFAI_del_only` notebook's `stitch(provider)`
+   and the same accumulator shape as RSM's `StreamingGridder`, so it streams); the two histogram
+   backends differ only in the q-provider (pyFAI q/χ maps vs `to_qconversion` → `Ang2Q.area`);
+   per-pixel
+   corrections (solid-angle / polarization) applied as weights from pyFAI arrays. **Gate (real
+   data):** the 3-way `multigeometry` (1D+2D via MG, parity vs `reduce_pyFAI_multigeometry`) vs
+   `pyfai_hist` vs `xu_hist` comparison on the del-only LaB6 scan — all overlay in ring position
+   within the radial bin width (the `Multi120_Compare` notebook is the fixture); per-pixel χ
+   matches pyFAI `chiArray` ≤ 0.03°.
 4. **xdart grouping over `FrameSource`.** Range-syntax grouping; one `run_stitch` per
    group; composite source for cross-file "Multi"; collect the §5.4 inputs. **Gate:**
    grouping parser test; end-to-end on the real SPEC mesh (the notebook data).

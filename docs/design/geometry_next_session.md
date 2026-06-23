@@ -31,14 +31,14 @@ of those, but stitching (next) will reuse `CompositeFrameSource`, so branch geom
   `xu_geometry_del_nu.json` (pyFAI GoniometerRefinement AND xu control-point fits: Pilatus
   300k-w on a psic arm, LaB6, del/nu mesh); `Multi120_Compare_xu_vs_pyFAI_del_only.ipynb`
   (the dual-engine head-to-head). The fitted goniometer is the production instance (§3.4).
-- **Geometry feeds BOTH stitch backends (`design_stitching_jun2026.md` §2.6, decided
-  2026-06-23):** `"multigeometry"` (pyFAI) consumes `to_pyfai_per_frame`; `"xu_grid"` (the
-  converged/default path: xu `Ang2Q.area` → histogram merge) consumes
-  `to_qconversion`/`to_hxrd`. **Keep both adapters + the xu control-point refinement
-  first-class** — `to_qconversion` is NOT "RSM-only"; the xu stitch backend needs it. Geometry
-  is genuinely the unifying object (pyFAI-gonio-JSON *and* xu-control-point both → one
-  `Diffractometer`; both backends consume it). The backend choice is downstream and does NOT
-  change anything in this module.
+- **Geometry feeds all THREE stitch backends (`design_stitching_jun2026.md` §2.6, decided
+  2026-06-23):** `"multigeometry"` consumes `to_pyfai_per_frame` (1D+2D via pyFAI MG);
+  `"pyfai_hist"` uses pyFAI q/χ maps; `"xu_hist"` (the converged/default path: xu `Ang2Q.area`
+  → histogram merge) consumes `to_qconversion`/`to_hxrd`. **Keep both adapters + the xu
+  control-point refinement first-class** — `to_qconversion` is NOT "RSM-only"; the xu stitch
+  backend + RSM both need it. Geometry is the unifying object (pyFAI-gonio-JSON *and*
+  xu-control-point both → one `Diffractometer`; all backends consume it). The backend choice is
+  downstream and does NOT change anything in this module.
 
 Env: `conda activate xrd_test`. Tests: `python -m pytest tests/core` (headless) and
 `QT_QPA_PLATFORM=offscreen python -m pytest tests/xdart`. Do NOT push / bump versions.

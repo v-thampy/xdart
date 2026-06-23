@@ -10,14 +10,14 @@ none**, and **grazing-incidence corrections are missing everywhere**.
 orthogonal to geometry (`Diffractometer`) and to the stitch/RSM plans. Headless, source-agnostic,
 mode-configured.
 
-> **Update 2026-06-23 — the correction stack feeds THREE consumers, and the gridder is shared.**
-> Stitching now has TWO backends (`design_stitching_jun2026.md` §2.6): **`"multigeometry"`**
-> (pyFAI MG) and **`"xu_grid"`** (xu `Ang2Q.area` → a per-pixel **histogram merge**). So the
-> per-pixel correction stack in this doc is the **shared pre-weight** for all three reduction
-> paths — pyFAI-MultiGeometry stitch, **`xu_grid` stitch, and RSM** — applied identically as
-> weights at the accumulator seam. The `xu_grid` stitch and RSM share the **same** histogram /
-> `rsm.gridding.StreamingGridder` accumulator (only the bin space differs: (q, χ) for stitch,
-> (qx, qy, qz) for RSM). That makes "reuse pyFAI's correction arrays on the xu path" (§2/§5)
+> **Update 2026-06-23 — the correction stack is the shared pre-weight; the gridder is shared.**
+> Stitching has THREE backends (`design_stitching_jun2026.md` §2.6): **`"multigeometry"`** (pyFAI
+> MG, 1D+2D), **`"pyfai_hist"`** and **`"xu_hist"`** (pyFAI- vs xu-geometry q-provider → a shared
+> per-pixel **histogram merge**). The per-pixel correction stack in this doc is the **shared
+> pre-weight** for ALL of them + RSM, applied identically as weights at the provider/accumulator
+> seam. The two histogram stitch backends + RSM share the **same** `rsm.gridding.StreamingGridder`
+> accumulator (only the bin space differs: (q, χ) for stitch, (qx, qy, qz) for RSM) — so they
+> stream. That makes "reuse pyFAI's correction arrays on the xu/histogram path" (§2/§5)
 > load-bearing for stitch too, not just RSM. Validated in the `Multi120_*` notebooks (§6).
 
 ---
@@ -158,7 +158,8 @@ C = C_solidangle · C_polarization · C_absorption_air · C_flat⁻¹ · (GI: C_
   `_correct_parallax`.
 - Companions: `design_diffractometer_geometry_jun2026.md` §3.5 (azimuth/2D load-bearing),
   `design_wrangler_organization_jun2026.md` (GI-mode inputs), `design_stitching_jun2026.md` §2.6
-  (the two stitch backends the correction stack feeds).
+  (the three stitch backends the correction stack feeds), `design_rsm_jun2026.md` §3.3 (RSM
+  consumes the same stack at the gridder weight).
 - Reference notebooks (NOT in-repo — `~/repos/example_notebooks/Stitching/`):
   `Multi120_Diagnose_xu_pyFAI_intensity_discrepancy.ipynb` (the per-pixel correction diff —
   solid-angle/polarization reweight intensity, not ring position),
