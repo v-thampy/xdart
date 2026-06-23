@@ -20,6 +20,7 @@ from xrd_tools.sources.registry import (
     open_source,
     register_source,
 )
+from xrd_tools.sources.spec import SpecSource
 
 __all__ = [
     "BaseFrameSource",
@@ -32,6 +33,7 @@ __all__ = [
     "SourceCapabilities",
     "SourceKind",
     "SourceSpec",
+    "SpecSource",
     "TiffSeriesSource",
     "ensure_frame_source",
     "guess_source_kind",

@@ -11,6 +11,7 @@ from xrd_tools.io.image_source import ImageSourceKind, classify_image_source
 from xrd_tools.sources.image import ImageFileSource, TiffSeriesSource
 from xrd_tools.sources.memory import LiveFrameSource, MemoryFrameSource
 from xrd_tools.sources.nexus import NexusStackSource, ProcessedNexusSource
+from xrd_tools.sources.spec import SpecSource
 
 
 SourceFactory = Callable[[SourceSpec], FrameSource]
@@ -25,6 +26,8 @@ def guess_source_kind(uri: str | Path) -> SourceKind:
     path = Path(uri)
     if path.is_dir():
         return SourceKind.TIFF_SERIES
+    if path.suffix.lower() == ".spec":          # metadata-only SPEC scan file
+        return SourceKind.SPEC
     info = classify_image_source(path)
     if info.kind is ImageSourceKind.PROCESSED_XDART or info.kind is ImageSourceKind.THUMBNAIL_ONLY:
         return SourceKind.PROCESSED_NEXUS
@@ -68,6 +71,8 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
             source_root=dict(spec.options).get("source_root"))
     if kind is SourceKind.IMAGE_FILE:
         return ImageFileSource(spec.uri, **dict(spec.options))
+    if kind is SourceKind.SPEC:
+        return SpecSource(spec.uri, scan=dict(spec.options).get("scan"))
     if kind is SourceKind.LIVE:
         return LiveFrameSource(name=str(spec.uri))
     raise ValueError(f"cannot open source {spec.uri!r} with kind {kind.value!r}")
@@ -79,6 +84,7 @@ __all__ = [
     "ImageFileSource",
     "NexusStackSource",
     "ProcessedNexusSource",
+    "SpecSource",
     "TiffSeriesSource",
     "guess_source_kind",
     "open_source",

@@ -68,6 +68,39 @@ def test_raw_is_reachable_truth_table(qapp):
     assert raw_is_reachable(_OneD(_stack())) is False
 
 
+_SPEC = """#F t.spec
+#E 1
+#D today
+#O0 th  chi
+
+#S 1 ascan th 0 2 2 1
+#D today
+#P0 0 5
+#N 3
+#L th  i0  det
+0 100 10
+1 110 20
+2 120 30
+"""
+
+
+def test_scan_plot_loads_spec_metadata_roi_disabled(qapp, tmp_path):
+    """A picked SPEC file populates the table from its columns; Plot ROI stays
+    disabled (metadata only — no raw frames)."""
+    pytest.importorskip("silx")
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+
+    p = tmp_path / "t.spec"
+    p.write_text(_SPEC)
+    dlg = ScanPlotDialog()
+    try:
+        dlg.load_uri(str(p))
+        assert {"th", "i0", "det", "chi"} <= set(dlg._columns)
+        assert dlg.roi_btn.isEnabled() is False        # no raw -> ROI off
+    finally:
+        dlg.close()
+
+
 def test_roi_button_reflects_reachability(qapp):
     from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
     from xrd_tools.sources import MemoryFrameSource
