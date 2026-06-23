@@ -7,13 +7,13 @@ live-tested.
 
 ---
 
-## State (branch `feature/gui-redesign-direction-a`, base commit `8eb69ac`, NOT pushed)
+## State (branch `feature/gui-redesign-direction-a`, base commit `6f971c4`, NOT pushed)
 
 The Scan Plotter (ROI + right axes), SPEC source, and the shared `ScanSourceWidget`
 + headless `CompositeFrameSource`/`parse_scan_groups`/`discover_scans` are done +
 green (core 1111 / xdart 1087 offscreen), pending live-test. Geometry is independent
 of those, but stitching (next) will reuse `CompositeFrameSource`, so branch geometry
-**off `8eb69ac`** to keep the lineage.
+**off `6f971c4`** to keep the lineage.
 
 - **Design (source of truth):** `docs/design/design_diffractometer_geometry_jun2026.md`
   — read it IN FULL first. §2 = what exists; §3.2 = the layered shape; §3.2a =
@@ -49,7 +49,7 @@ Do the geometry refactor test-first; it touches RSM + the writer — keep them g
 ## PROMPT
 
 > Build the shared `Diffractometer` geometry module (headless) on a branch off
-> `8eb69ac` in the xrd-tools monorepo (`~/repos/xrd-tools`; activate `xrd_test`).
+> `6f971c4` in the xrd-tools monorepo (`~/repos/xrd-tools`; activate `xrd_test`).
 > Read `docs/design/design_diffractometer_geometry_jun2026.md` IN FULL first (and
 > `design_stitching_jun2026.md` §2.5 GAPs A–F) — it is the source of truth and should
 > be promoted to ADR-0007. Work the §6 gated step sequence, committing + testing each
