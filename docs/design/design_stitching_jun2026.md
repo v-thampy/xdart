@@ -132,6 +132,49 @@ stitching module.
 
 ---
 
+## 2.6 TWO stitch backends — pyFAI MultiGeometry **and** xrayutilities (decision 2026-06-23)
+
+**The merge engine is selectable, not fixed.** The original framing above ("hard seam:
+(images, PONIs) → `MultiGeometry`") is **one** backend. Validation on real del/nu data
+(the `Multi120_*` notebooks, §8) **converged on xrayutilities** for the geometry — it fits
+the `del`/`nu` motor offsets directly and evaluates the stacked pose exactly, whereas pyFAI
+`MultiGeometry` hard-wires `deg2rad` per axis (GAP A) — while pyFAI still owns the per-pixel
+**intensity corrections**. So `StitchPlan` gains a backend selector and the stitch is built
+backend-agnostic over the shared per-frame geometry:
+
+```python
+StitchPlan.backend: Literal["xu_grid", "multigeometry"] = "xu_grid"
+```
+
+- **`"xu_grid"` (default — the converged path).** Per-frame `(q_per_pixel, χ_per_pixel)`
+  from `Diffractometer.to_qconversion()` → xu `HXRD.Ang2Q.area(...)`; per-pixel
+  **corrections** (solid-angle, polarization — and the GI stack) applied as weights, reused
+  from pyFAI's arrays (`design_intensity_corrections_jun2026.md`); **merge = a per-pixel
+  histogram gridder** into the common (q, χ) grid — the canonical Backend-B merge (this is
+  exactly the notebooks' shared `stitch(provider)` helper, and the SAME accumulator shape as
+  RSM's `rsm.gridding.StreamingGridder`). Geometry-exact for multi-axis goniometers.
+- **`"multigeometry"` (the lighter pyFAI-only alternative).** Today's path: per-frame pyFAI
+  `AzimuthalIntegrator`s (geometry from `Diffractometer.to_pyfai_per_frame`) → pyFAI
+  `MultiGeometry`, which does geometry + corrections + azimuthal-integration + merge in one
+  (§3.2). Simple + battle-tested; fine for single-axis / small-offset scans. *(Default flagged
+  for the maintainer — flip to `"multigeometry"` if you'd rather not require xu by default.)*
+
+**The seam both share:** a per-frame **q-provider** `(|q| per pixel, χ per pixel, weight)`
+→ a merge. `"xu_grid"` merges with the histogram gridder; `"multigeometry"` merges with pyFAI
+`MultiGeometry` (its own AIs ARE the provider+merge). `run_stitch(plan, source)` dispatches on
+`plan.backend`; `stitch_ponis` (§3.2) is the `"multigeometry"` feeder, and a sibling
+`stitch_q_grid(images, geometries, corrections)` is the `"xu_grid"` feeder.
+
+**Why this does NOT touch geometry (§3.1):** the shared `Diffractometer` already produces both
+adapters — `to_pyfai_per_frame` (Backend A) and `to_qconversion`/`to_hxrd(energy)` (Backend B,
+the same adapter RSM consumes). Both backends consume the SAME per-frame `DetectorCalibration`;
+only the merge differs. And the per-pixel **corrections are a shared pre-weight step** feeding
+either backend (and RSM). *(Validated: on del-only the two backends overlay essentially
+perfectly in ring position — the notebooks' §6 confirms pyFAI's corrections reweight intensity,
+not peak position; the del/nu "edges-off" was high-`nu` extrapolation, not a missing engine.)*
+
+---
+
 ## 3. Headless design (the one source layer)
 
 ### 3.1 Geometry input = a base `DetectorCalibration` + the shared `Diffractometer`
@@ -183,6 +226,13 @@ geometries)`** where each `geometry` is a complete per-frame `DetectorCalibratio
 the detector (per-position PONI files, a translation motor). `MultiGeometry` consumes the
 resulting per-image AIs identically. `create_multigeometry_integrators` becomes the
 thin "base + Diffractometer rotations → per-frame geometries" helper feeding it.
+
+> **Backend-aware (§2.6):** `stitch_ponis` is the **`"multigeometry"`** feeder (per-frame
+> `DetectorCalibration`s → AIs → `MultiGeometry`). The **`"xu_grid"`** backend takes the SAME
+> per-frame `DetectorCalibration`s through a sibling `stitch_q_grid(images, geometries,
+> corrections)` — `to_qconversion` → `Ang2Q.area` per frame → a per-pixel histogram merge into
+> the common (q, χ) grid, with pyFAI correction arrays applied as weights. Both are dispatched
+> by `run_stitch(plan, source)` on `plan.backend`; the per-frame geometry carrier is shared.
 
 ### 3.2a Bridge: load a pyFAI goniometer calibration (closes GAP D)
 The real-world calibration artifact is a pyFAI `GoniometerRefinement` JSON. Add a
@@ -400,6 +450,15 @@ Everything the notebook hard-codes becomes a widget field. Grouped by concern, w
    stitch provenance (Diffractometer + DetectorCalibration). **Gate:** synthetic
    multi-frame source → stitched 1D + 2D; no-raw on a moved tree fails loud (never
    stitch off thumbnails).
+3b. **`"xu_grid"` stitch backend (§2.6).** Add `StitchPlan.backend`; implement
+   `stitch_q_grid(images, geometries, corrections)` — `to_qconversion` → `Ang2Q.area` per
+   frame → a per-pixel **histogram merge** into the common (q, χ) grid (the canonical
+   Backend-B merge — the `Multi120_Compare_xu_vs_pyFAI_del_only` notebook's `stitch(provider)`
+   and the same accumulator shape as RSM's `StreamingGridder`); per-pixel corrections
+   (solid-angle / polarization) applied as weights, reused from pyFAI arrays. **Gate (real
+   data):** on the del-only LaB6 scan `"xu_grid"` and `"multigeometry"` overlay in ring
+   position within the radial bin width (the `Multi120_Compare` notebook is the fixture);
+   per-pixel χ matches pyFAI `chiArray` ≤ 0.03°.
 4. **xdart grouping over `FrameSource`.** Range-syntax grouping; one `run_stitch` per
    group; composite source for cross-file "Multi"; collect the §5.4 inputs. **Gate:**
    grouping parser test; end-to-end on the real SPEC mesh (the notebook data).
@@ -424,8 +483,20 @@ Everything the notebook hard-codes becomes a widget field. Grouped by concern, w
 - Code (gaps): `integrate/multi.py:33` (`create_multigeometry_integrators`, hardwired
   `deg2rad`), `integrate/calibration.py:110,164` (`poni_to_integrator` → `detector_factory(name)`,
   drops `Detector_config`), `core/containers.py` (`PONI.detector: str`).
-- Validated by: `examples/.../Stitching/stitch_simplified.ipynb` on real SSRL data
-  (LaB6 17 keV `del`/`nu` mesh, Pilatus 300k-w, pyFAI `MG_gonio_object.json`).
+- **Reference notebooks (NOT in-repo — `~/repos/example_notebooks/Stitching/`):** the
+  dual-backend + calibration validation fixtures on real SSRL data (LaB6, Pilatus 300k-w,
+  `del`/`nu` mesh):
+  - `Multi120_Compare_xu_vs_pyFAI_del_only.ipynb` — the **canonical dual-backend** head-to-head
+    (§2.6): one shared `stitch(provider)` histogram merge fed by a `pf_provider` and an
+    `xu_provider` (`HXRD.Ang2Q.area`); §6/§7 = the "why xu" conclusion + the corrections answer.
+  - `Multi120_Diagnose_xu_pyFAI_intensity_discrepancy.ipynb` — the per-pixel correction diff
+    (solid-angle/polarization reweight intensity, not ring position).
+  - `Multi120_GI_Corrections_Explorer.ipynb` — the GI correction stack (footprint/refraction/
+    Fresnel), pairs with `design_intensity_corrections_jun2026.md`.
+  - `Multi120_Calibration_Pilatus300kw_del_nu*.ipynb` + `MG_gonio_del_nu_*.json` /
+    `xu_geometry_del_nu.json` — the goniometer/xu control-point calibrations (the geometry doc's
+    fixtures); `integration_xru.ipynb` / `reduce_pyFAI_multigeometry.ipynb` — the two engines
+    standalone; `stitch_simplified.ipynb` — the simplified end-to-end.
 - Superseded: `docs/gui/stitching_design.md`, `docs/gui/nexus_stitch_refactor_plan.md`.
 - Decisions: ADR-0002 (capability attrs), ADR-0003 (per-frame cardinality — stitch is
   out of scope of it), ADR-0005 (store ownership), ADR-0006 (finalize-stage
