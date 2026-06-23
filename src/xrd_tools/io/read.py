@@ -70,6 +70,7 @@ __all__ = [
     "get_thumbnail",
     "get_raw_frame",
     "get_metadata",
+    "read_scan_data",
     "open_scan",
     "ProcessedScan",
     "Scan",
@@ -187,6 +188,35 @@ def _scan_data_for_frames(
                 if src >= 0:
                     aligned[dst] = arr[src]
             out[str(key)] = aligned
+    return out
+
+
+def read_scan_data(
+    scan_file: str | Path,
+    frames: Sequence[int] | None = None,
+    *,
+    entry: str = "entry",
+) -> dict[str, np.ndarray]:
+    """Read ``/entry/scan_data`` as ``{column: array}`` — the per-frame metadata
+    columns (motors + counters) a processed scan persisted.
+
+    With ``frames`` given, each column is aligned to those frame labels (missing
+    labels → NaN / "" rows); with ``frames=None``, every column is returned in
+    natural ``scan_data`` order, **including** ``frame_index``.  This is the
+    public, frame-aligned companion to :func:`get_metadata` — the basis for
+    plotting any column vs frame (or vs another column).  Returns ``{}`` when the
+    file has no ``scan_data``.
+    """
+    if frames is not None:
+        return _scan_data_for_frames(scan_file, frames, entry=entry)
+    out: dict[str, np.ndarray] = {}
+    with h5py.File(Path(scan_file), "r") as f:
+        e = _entry(f, entry)
+        if "scan_data" not in e:
+            return out
+        for key, item in e["scan_data"].items():
+            if isinstance(item, h5py.Dataset):
+                out[str(key)] = _dataset_values(item)
     return out
 
 

@@ -43,8 +43,7 @@ import numpy as np
 
 from xrd_tools.core.frame_view import DEFAULT_MODE_KEY
 from xrd_tools.io import aggregate as _agg
-from xrd_tools.io import get_frames
-from xrd_tools.io.read import _scan_data_for_frames
+from xrd_tools.io import get_frames, read_scan_data
 
 __all__ = [
     "whole_scan_aggregate_1d",
@@ -193,7 +192,7 @@ def _build_norm_map(data_file, norm_channel, tail_items):
     except (KeyError, OSError):
         disk_labels = []
     if disk_labels:
-        scan_data = _scan_data_for_frames(data_file, disk_labels)
+        scan_data = read_scan_data(data_file, disk_labels)
         actual_key = _resolve_norm_key(scan_data.keys(), norm_channel)
         col = scan_data.get(actual_key) if actual_key is not None else None
         if col is not None:

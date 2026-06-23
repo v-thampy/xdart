@@ -201,6 +201,39 @@ def test_get_metadata_positioners_vs_scan_data_split(tmp_path):
     np.testing.assert_allclose(m["scan_data"]["i0"], [1e6, 1.1e6, 1.2e6])
 
 
+def test_read_scan_data_all_and_aligned(tmp_path):
+    """read_scan_data: all columns (+ frame_index) with frames=None; a subset
+    aligned to explicit frame labels (missing labels -> NaN)."""
+    import pandas as pd
+    from xrd_tools.io import read_scan_data, write_scan_metadata
+
+    p = tmp_path / "sd.nxs"
+    sd = pd.DataFrame(
+        {"th": [0.1, 0.2, 0.3], "i0": [1e6, 1.1e6, 1.2e6]}, index=[0, 1, 2])
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        g = e.create_group("integrated_1d")
+        g.create_dataset("frame_index", data=np.array([0, 1, 2], dtype=np.int64))
+        write_scan_metadata(e, sd, [0, 1, 2])
+
+    # frames=None -> all columns incl frame_index, natural order
+    full = read_scan_data(p)
+    assert {"th", "i0", "frame_index"}.issubset(set(full))
+    np.testing.assert_allclose(full["i0"], [1e6, 1.1e6, 1.2e6])
+    np.testing.assert_array_equal(full["frame_index"], [0, 1, 2])
+
+    # frames given -> aligned to those labels; a missing label -> NaN row
+    aligned = read_scan_data(p, [2, 0, 9])
+    np.testing.assert_allclose(aligned["th"][:2], [0.3, 0.1])
+    assert np.isnan(aligned["th"][2])             # label 9 absent
+
+    # no scan_data -> {}
+    p2 = tmp_path / "empty.nxs"
+    with h5py.File(p2, "w") as f:
+        f.create_group("entry")
+    assert read_scan_data(p2) == {}
+
+
 def test_mismatched_positioner_length_is_skipped_not_fatal(tmp_path):
     """A per-frame column whose length != frame count (malformed/partial
     file, e.g. 4 integrated frames but 2 'th' positions) must be skipped
