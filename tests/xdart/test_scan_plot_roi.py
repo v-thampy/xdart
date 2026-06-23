@@ -194,3 +194,40 @@ def test_scan_plot_roi_fills_columns_end_to_end(qapp):
         assert np.all(np.diff(dlg._table["roiA"]) > 0)
     finally:
         dlg.close()
+
+
+# ── cross-family right-hand axis ──────────────────────────────────────────
+
+
+def test_scan_plot_right_axis_splits_series(qapp):
+    """Checking a plotted column in the Right-axis list moves it from the main
+    PlotItem onto the linked right ViewBox (so incommensurable columns overlay
+    cleanly)."""
+    from pyqtgraph.Qt import QtCore
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+
+    _EX = QtCore.Qt.MatchFlag.MatchExactly
+    _CHECKED = QtCore.Qt.CheckState.Checked
+    dlg = ScanPlotDialog()
+    try:
+        dlg.set_table("s", {"frame_index": np.arange(5.0),
+                            "small": np.linspace(0.0, 2.0, 5),
+                            "big": np.linspace(0.0, 1e5, 5)})
+        # deterministic selection: exactly small + big on Y (drop the auto-pick).
+        _UNCHECKED = QtCore.Qt.CheckState.Unchecked
+        for i in range(dlg.y_list.count()):
+            item = dlg.y_list.item(i)
+            item.setCheckState(_CHECKED if item.text() in ("small", "big")
+                               else _UNCHECKED)
+        # both default to the left axis: 2 curves on the main PlotItem, none right.
+        assert len(dlg.plot.getPlotItem().listDataItems()) == 2
+        assert len(dlg.right_vb.addedItems) == 0
+
+        # move "big" to the right axis.
+        dlg.r_list.findItems("big", _EX)[0].setCheckState(_CHECKED)
+        left_names = {it.name() for it in dlg.plot.getPlotItem().listDataItems()}
+        assert left_names == {"small"}
+        assert len(dlg.right_vb.addedItems) == 1
+        assert dlg.right_vb.addedItems[0].name() == "big"
+    finally:
+        dlg.close()

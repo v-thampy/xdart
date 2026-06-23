@@ -149,6 +149,14 @@ def _table_from_source(src):
     return out
 
 
+def _checkable_item(text):
+    """An unchecked, user-checkable ``QListWidgetItem`` for a column selector."""
+    item = QtWidgets.QListWidgetItem(text)
+    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+    item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+    return item
+
+
 def _numeric_columns(table):
     """Plottable columns: 1-D, numeric, finite-bearing."""
     out = []
@@ -238,9 +246,20 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.y_list.setMaximumWidth(160)
         self.y_list.setToolTip("Check one or more columns to plot vs X")
         y_col.addWidget(self.y_list, 1)
+        y_col.addWidget(QtWidgets.QLabel("Right axis"))
+        self.r_list = QtWidgets.QListWidget()
+        self.r_list.setObjectName("scanPlotRList")
+        self.r_list.setMaximumWidth(160)
+        self.r_list.setMaximumHeight(110)
+        self.r_list.setToolTip(
+            "Check a (plotted) column here to draw it against a second Y axis on "
+            "the right — for columns of very different magnitude")
+        y_col.addWidget(self.r_list)
         body.addLayout(y_col)
         self.plot = pg.PlotWidget()
-        self.plot.addLegend(offset=(-10, 10))
+        self.legend = self.plot.addLegend(offset=(-10, 10))
+        from .plot_axes import attach_right_axis
+        self.right_vb, self.right_axis = attach_right_axis(self.plot)
         body.addWidget(self.plot, 1)
         lay.addLayout(body, 1)
 
@@ -253,6 +272,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.x_combo.currentIndexChanged.connect(self._redraw)
         self.norm_combo.currentIndexChanged.connect(self._redraw)
         self.y_list.itemChanged.connect(self._redraw)
+        self.r_list.itemChanged.connect(self._redraw)
         self.roi_btn.clicked.connect(self._open_roi_dialog)
         self.save_btn.clicked.connect(self._save_csv)
 
@@ -282,18 +302,18 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.x_combo.blockSignals(True)
         self.norm_combo.blockSignals(True)
         self.y_list.blockSignals(True)
+        self.r_list.blockSignals(True)
         self.x_combo.clear()
         self.norm_combo.clear()
         self.y_list.clear()
+        self.r_list.clear()
         self.x_combo.addItems(cols)
         self.norm_combo.addItem("None", None)
         for c in cols:
             self.norm_combo.addItem(c, c)
         for c in cols:
-            item = QtWidgets.QListWidgetItem(c)
-            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
-            self.y_list.addItem(item)
+            self.y_list.addItem(_checkable_item(c))
+            self.r_list.addItem(_checkable_item(c))
         # Defaults: X = the scanned positioner, Y = an intensity-like column.
         if cols:
             x_default, y_default = self._guess_axes(cols)
@@ -306,6 +326,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.x_combo.blockSignals(False)
         self.norm_combo.blockSignals(False)
         self.y_list.blockSignals(False)
+        self.r_list.blockSignals(False)
 
         self.save_btn.setEnabled(bool(cols))
         if not self._table:
@@ -343,20 +364,33 @@ class ScanPlotDialog(QtWidgets.QDialog):
             y = next((c for c in cols if c != x), None)
         return x, y
 
-    def _checked_y(self):
+    @staticmethod
+    def _checked_in(list_widget):
         out = []
-        for i in range(self.y_list.count()):
-            item = self.y_list.item(i)
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
             if item.checkState() == QtCore.Qt.CheckState.Checked:
                 out.append(item.text())
         return out
 
+    def _checked_y(self):
+        return self._checked_in(self.y_list)
+
+    def _right_cols(self):
+        """Columns assigned to the right-hand axis (subset of the plotted Y)."""
+        return set(self._checked_in(self.r_list))
+
     def _redraw(self):
         self.plot.clear()
+        self.right_vb.clear()
+        if self.legend is not None:
+            self.legend.clear()
         if not self._columns:
+            self.right_axis.setVisible(False)
             return
         xcol = self.x_combo.currentText()
         if xcol not in self._table:
+            self.right_axis.setVisible(False)
             return
         x = np.asarray(self._table[xcol], dtype=float)
         norm_col = self.norm_combo.currentData()
@@ -365,15 +399,32 @@ class ScanPlotDialog(QtWidgets.QDialog):
             norm = np.asarray(self._table[norm_col], dtype=float)
             norm = np.where(norm == 0, np.nan, norm)   # avoid /0
         normalized = norm is not None
+        right_cols = self._right_cols()
+        any_right = False
         for n, ycol in enumerate(self._checked_y()):
             y = np.asarray(self._table[ycol], dtype=float)
             if normalized:
                 y = y / norm
             color = CURVE_PENS[n % len(CURVE_PENS)]
-            self.plot.plot(x, y, pen=pg.mkPen(color, width=2), name=ycol,
-                           symbol="o", symbolSize=4, symbolBrush=color)
+            pen = pg.mkPen(color, width=2)
+            if ycol in right_cols:
+                # A separate, x-linked ViewBox carries the right-axis curves; the
+                # main PlotItem legend doesn't auto-track them, so add manually.
+                item = pg.PlotDataItem(x, y, pen=pen, name=ycol, symbol="o",
+                                       symbolSize=4, symbolBrush=color)
+                self.right_vb.addItem(item)
+                if self.legend is not None:
+                    self.legend.addItem(item, f"{ycol} (R)")
+                any_right = True
+            else:
+                self.plot.plot(x, y, pen=pen, name=ycol, symbol="o",
+                               symbolSize=4, symbolBrush=color)
         self.plot.setLabel("bottom", xcol)
         self.plot.setLabel("left", "value / " + norm_col if normalized else "value")
+        self.right_axis.setVisible(any_right)
+        self.right_vb.setVisible(any_right)
+        if any_right:
+            self.right_axis.setLabel("value (right)")
 
     # ---- ROI columns ----------------------------------------------------
     def _update_roi_button(self):
@@ -426,18 +477,20 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.x_combo.blockSignals(True)
         self.norm_combo.blockSignals(True)
         self.y_list.blockSignals(True)
+        self.r_list.blockSignals(True)
         try:
             self.x_combo.addItem(name)
             self.norm_combo.addItem(name, name)
-            item = QtWidgets.QListWidgetItem(name)
-            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.CheckState.Checked if check
-                               else QtCore.Qt.CheckState.Unchecked)
+            item = _checkable_item(name)
+            if check:
+                item.setCheckState(QtCore.Qt.CheckState.Checked)
             self.y_list.addItem(item)
+            self.r_list.addItem(_checkable_item(name))
         finally:
             self.x_combo.blockSignals(False)
             self.norm_combo.blockSignals(False)
             self.y_list.blockSignals(False)
+            self.r_list.blockSignals(False)
         self.save_btn.setEnabled(True)
 
     def _remove_column(self, name):
@@ -447,6 +500,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.x_combo.blockSignals(True)
         self.norm_combo.blockSignals(True)
         self.y_list.blockSignals(True)
+        self.r_list.blockSignals(True)
         try:
             i = self.x_combo.findText(name)
             if i >= 0:
@@ -454,13 +508,15 @@ class ScanPlotDialog(QtWidgets.QDialog):
             j = self.norm_combo.findText(name)
             if j >= 0:
                 self.norm_combo.removeItem(j)
-            for k in range(self.y_list.count() - 1, -1, -1):
-                if self.y_list.item(k).text() == name:
-                    self.y_list.takeItem(k)
+            for lst in (self.y_list, self.r_list):
+                for k in range(lst.count() - 1, -1, -1):
+                    if lst.item(k).text() == name:
+                        lst.takeItem(k)
         finally:
             self.x_combo.blockSignals(False)
             self.norm_combo.blockSignals(False)
             self.y_list.blockSignals(False)
+            self.r_list.blockSignals(False)
 
     def _open_roi_dialog(self):
         if not self._raw_reachable or self._source is None:
