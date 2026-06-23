@@ -474,6 +474,9 @@ class staticWidget(QWidget):
         # hosts a Tools placeholder for planned modules.
         self._metadata_dialog = None
         self._peak_fit_dialog = None
+        self._phase_fit_dialog = None
+        # The fit dialog whose batch run is currently in flight (Peak or Phase).
+        self._batch_dialog = None
         # Live analysis preview (analyzer framework Step 3): a latest-wins
         # background worker re-fits the newest frame while the dialog's "Live"
         # toggle is on.  Lazily created on first live request; generation gates
@@ -511,6 +514,7 @@ class staticWidget(QWidget):
         # (label, handler-or-None).  Handler => active tool with an Open button.
         tools = [
             ('Peak Fitting', self._open_peak_fit_dialog),
+            ('Phase Fitting', self._open_phase_fit_dialog),
             ('Plot Metadata', None),
         ]
         for name, handler in tools:
@@ -540,8 +544,8 @@ class staticWidget(QWidget):
         lay.addWidget(card)
 
         note = QtWidgets.QLabel(
-            'Peak Fitting fits the selected frame’s 1-D pattern. '
-            'Plot Metadata is planned.')
+            'Peak Fitting (structure-agnostic) and Phase Fitting (CIF-based) work '
+            'on the selected frame and across the scan. Plot Metadata is planned.')
         note.setObjectName('toolsNote')
         note.setWordWrap(True)
         lay.addWidget(note)
@@ -595,7 +599,8 @@ class staticWidget(QWidget):
             # frame, via set_data); off just stops pushing.
             self._peak_fit_dialog.live_check.toggled.connect(
                 self._on_live_fit_toggled)
-            self._peak_fit_dialog.batch_btn.clicked.connect(self._on_batch_clicked)
+            self._peak_fit_dialog.batch_btn.clicked.connect(
+                lambda: self._on_batch_clicked(self._peak_fit_dialog))
         dlg = self._peak_fit_dialog
         dlg.show()
         dlg.raise_()
@@ -662,26 +667,26 @@ class staticWidget(QWidget):
         if outcome is not None and outcome.ok:
             dlg._draw_outcome(outcome, auto=dlg.auto_check.isChecked())
 
-    # ---- Batch peak fit (Step 4) ---------------------------------------
-    def _on_batch_clicked(self):
-        """Batch button: start a batch fit, or cancel one already in flight."""
+    # ---- Batch fit (Peak or Phase — dialog-parameterized) --------------
+    def _on_batch_clicked(self, dialog):
+        """Batch button: start a batch fit for ``dialog``, or cancel one in
+        flight.  Shared by the Peak and Phase fitters."""
         worker = self._batch_analysis_worker
         if worker is not None and worker.isRunning():
             worker.cancel()
             return
-        self._run_batch_fit()
+        self._run_batch_fit(dialog)
 
-    def _run_batch_fit(self):
-        """Fit every frame in the scan with the dialog's current settings, then
-        (on completion) plot the parameters vs frame number.
+    def _run_batch_fit(self, dialog):
+        """Fit every frame in the scan with ``dialog``'s current settings, then
+        plot the parameters vs frame number.
 
-        The fit model is fixed ONCE from the current frame (auto-detect /
-        positions / peak count via the dialog's ``build_fit_request``) and the
-        SAME analyzer is applied to every frame, so each parameter series tracks
-        the same peak across frames.  The range is re-applied per frame."""
+        The analyzer is fixed ONCE from the current frame (via the dialog's
+        ``build_fit_request``) and applied to every frame, so each parameter
+        series tracks the same thing across frames."""
         import numpy as np
         from xrd_tools.analysis.runner import AnalysisInput
-        dlg = self._peak_fit_dialog
+        dlg = dialog
         if dlg is None:
             return
         if dlg._x is None or dlg._y is None:
@@ -723,6 +728,7 @@ class staticWidget(QWidget):
             self._batch_analysis_worker.sigFrameFit.connect(self._on_batch_frame_fit)
             self._batch_analysis_worker.sigBatchDone.connect(self._on_batch_done)
         dlg.reset_param_trend()             # fresh vs-frame trend for this batch
+        self._batch_dialog = dlg            # the slots route results back to it
         self._batch_analysis_worker.configure(analyzer, inputs)
         dlg.set_batch_running(True)
         dlg.set_batch_progress(0, len(inputs))
@@ -731,7 +737,7 @@ class staticWidget(QWidget):
     def _on_batch_progress(self, done, total):
         if self._tearing_down:
             return
-        dlg = self._peak_fit_dialog
+        dlg = self._batch_dialog
         if dlg is not None:
             dlg.set_batch_progress(done, total)
 
@@ -739,7 +745,7 @@ class staticWidget(QWidget):
         """A batch frame finished: grow the dialog's vs-frame trend (row 3)."""
         if self._tearing_down:
             return
-        dlg = self._peak_fit_dialog
+        dlg = self._batch_dialog
         if dlg is None or not dlg.isVisible():
             return
         try:
@@ -753,7 +759,7 @@ class staticWidget(QWidget):
         vs-frame trend already filled row 3 incrementally via sigFrameFit."""
         if self._tearing_down:
             return
-        dlg = self._peak_fit_dialog
+        dlg = self._batch_dialog
         if dlg is not None:
             dlg.set_batch_running(False)
         if labels is None:                      # cancelled before completion
@@ -764,6 +770,21 @@ class staticWidget(QWidget):
             dlg.status.setText(
                 f"Batch fit done — {len(labels)} frames. Pick a parameter to "
                 "track below; Save CSV to export.")
+
+    def _open_phase_fit_dialog(self):
+        """Open (or re-show) the Phase Fitting popup — lazy, single-instance,
+        non-modal.  Shares the batch worker + vs-frame trend with Peak Fitting."""
+        if self._phase_fit_dialog is None:
+            from .phase_fit_dialog import PhaseFitDialog
+            self._phase_fit_dialog = PhaseFitDialog(
+                self._current_pattern_for_fit, parent=self)
+            self._phase_fit_dialog.batch_btn.clicked.connect(
+                lambda: self._on_batch_clicked(self._phase_fit_dialog))
+        dlg = self._phase_fit_dialog
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.refresh_pattern()
 
     def _open_metadata_dialog(self):
         """Open (or re-show) the frame-metadata popup.

@@ -499,7 +499,7 @@ def test_peak_fit_tool_wired_in_static_widget(widget):
     w = widget
     opens = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
              if b.objectName() == "toolOpen"]
-    assert len(opens) == 1                 # Peak Fitting active; Plot Metadata planned
+    assert len(opens) == 2                 # Peak + Phase active; Plot Metadata planned
     assert w._peak_fit_dialog is None
     w._open_peak_fit_dialog()
     assert w._peak_fit_dialog is not None and not w._peak_fit_dialog.isModal()
@@ -699,6 +699,81 @@ def test_close_guard_blocks_analysis_slots(widget):
     w._on_live_analyzed("0", w._live_fit_gen, None)
 
 
+# ── Phase Fitting tool ────────────────────────────────────────────────────
+
+
+def test_phase_fit_tool_wired_in_static_widget(widget):
+    """Tools exposes Peak + Phase Fitting (both active); the Phase dialog builds
+    lazily + non-modal and shares the batch machinery."""
+    from PySide6 import QtWidgets
+    w = widget
+    opens = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
+             if b.objectName() == "toolOpen"]
+    assert len(opens) == 2
+    assert w._phase_fit_dialog is None
+    w._open_phase_fit_dialog()
+    assert w._phase_fit_dialog is not None and not w._phase_fit_dialog.isModal()
+
+
+def test_phase_fit_dialog_scaffolding(qapp):
+    """The Phase dialog builds (CIF list + options + shared trend), and
+    build_fit_request refuses without phases."""
+    from xdart.gui.tabs.static_scan.phase_fit_dialog import PhaseFitDialog
+    x = np.linspace(1.0, 5.0, 200)
+    dlg = PhaseFitDialog(lambda: (x, x * 0 + 1.0, "q"))
+    try:
+        dlg.refresh_pattern()
+        # core widgets present
+        assert dlg.cif_list is not None and dlg.profile_combo.count() == 4
+        assert dlg.batch_btn is not None and dlg.param_plot is not None
+        # no phases -> can't build a request
+        assert dlg.build_fit_request() is None
+        assert "CIF" in dlg.status.text()
+        # pymatgen-absent: Add CIF shows the install hint instead of a dialog
+        try:
+            import pymatgen  # noqa: F401
+            has_pymatgen = True
+        except Exception:
+            has_pymatgen = False
+        if not has_pymatgen:
+            dlg._add_cif()
+            assert "pymatgen" in dlg.status.text()
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_phase_fit_fills_phase_table(qapp):
+    """_fill_phase_table renders the per-phase fractions + lattice from a
+    FitResultStore entry (synthetic — no pymatgen / lmfit)."""
+    from xdart.gui.tabs.static_scan.phase_fit_dialog import PhaseFitDialog
+    dlg = PhaseFitDialog(lambda: None)
+    try:
+        entry = {"phase_fractions": {"Ortho": 0.6, "Mono": 0.4},
+                 "lattice_params": {"Ortho": {"a": 4.0, "b": 4.1, "c": 4.2},
+                                    "Mono": {"a": 5.1}},
+                 "success": True, "redchi": 1.2}
+
+        class _Result:
+            payload = [entry]
+
+        class _Outcome:
+            result = _Result()
+            params = {}
+            label = "x"           # non-int -> trend skipped, table still fills
+
+        dlg._fill_phase_table(_Outcome())
+        assert dlg.table.rowCount() == 2
+        assert dlg.table.item(0, 0).text() == "Ortho"
+        assert dlg.table.item(0, 1).text() == "0.600"
+        assert dlg.table.item(0, 2).text() == "4.0000"
+        assert dlg.table.item(1, 2).text() == "5.1000"   # Mono a
+        assert "χ²" in dlg.status.text()
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
 def test_batch_fit_through_static_widget_populates_results(widget, qapp):
     """End-to-end Step 4: _run_batch_fit collects every frame's pattern, the
     worker fits them off the GUI thread, and _on_batch_done opens the populated
@@ -725,7 +800,7 @@ def test_batch_fit_through_static_widget_populates_results(widget, qapp):
     dlg.npeaks_spin.setValue(2)
     dlg.model_combo.setCurrentText("Gaussian")
 
-    w._run_batch_fit()
+    w._run_batch_fit(dlg)
     worker = w._batch_analysis_worker
     assert worker is not None
     deadline = time.monotonic() + 15
