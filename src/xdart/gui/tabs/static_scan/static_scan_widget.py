@@ -695,7 +695,7 @@ class staticWidget(QWidget):
         if req is None:
             return                              # status set by the dialog
         _, analyzer = req
-        lo, hi = dlg._fit_range()
+        lo, hi = dlg.batch_x_range()        # Peak: fit range; Phase: full extent
         try:
             frame_idxs = list(self.scan.frames.index)
         except Exception:

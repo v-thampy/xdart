@@ -774,6 +774,41 @@ def test_phase_fit_fills_phase_table(qapp):
         qapp.processEvents()
 
 
+def test_phase_batch_does_not_crash_on_range(widget, qapp):
+    """Regression: _run_batch_fit was peak-specific (called dlg._fit_range()),
+    which PhaseFitDialog lacks -> AttributeError on Phase ▸ Batch. Both fit
+    dialogs now expose batch_x_range() and the phase batch reaches the worker."""
+    import time
+    from types import SimpleNamespace
+    pytest.importorskip("lmfit")
+    w = widget
+
+    def fake_pattern(idx):
+        x = np.linspace(1.0, 5.0, 300)
+        y = 1.0e4 * np.exp(-0.5 * ((x - 3.0) / 0.05) ** 2) + 1000.0
+        return x, y, "q"
+
+    w._pattern_for_frame = fake_pattern
+    w.frame_ids = ["0"]
+    w.scan.frames = SimpleNamespace(index=[0, 1])
+    w._open_phase_fit_dialog()
+    dlg = w._phase_fit_dialog
+    # both dialogs honor the shared batch contract
+    assert len(dlg.batch_x_range()) == 2
+    assert dlg.batch_x_range()[0] == -np.inf      # phase = no x-window
+    # inject fake phases so build_fit_request returns a request (no pymatgen)
+    dlg.refresh_pattern()
+    dlg._phases = [("a.cif", SimpleNamespace(name="A"))]
+    w._run_batch_fit(dlg)                          # must NOT raise AttributeError
+    worker = w._batch_analysis_worker
+    if worker is not None:                         # reached the worker -> fix works
+        deadline = time.monotonic() + 8
+        while worker.isRunning() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        worker.wait(2000)
+
+
 def test_batch_fit_through_static_widget_populates_results(widget, qapp):
     """End-to-end Step 4: _run_batch_fit collects every frame's pattern, the
     worker fits them off the GUI thread, and _on_batch_done opens the populated

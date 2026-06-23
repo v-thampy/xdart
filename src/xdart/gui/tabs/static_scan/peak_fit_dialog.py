@@ -306,6 +306,12 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         finally:
             self._sync_guard = False
 
+    def batch_x_range(self):
+        """The (lo, hi) x-window to clip each frame to in a batch run — for the
+        Peak Fitter this is the chosen fit range (the shared batch contract; the
+        Phase Fitter returns the full extent)."""
+        return self._fit_range()
+
     def _fit_range(self):
         """The (lo, hi) fit window, clamped to the current data extent."""
         lo_ext, hi_ext = self._data_extent()

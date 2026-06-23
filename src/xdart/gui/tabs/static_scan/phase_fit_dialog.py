@@ -411,6 +411,11 @@ class PhaseFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         self.status.setText(msg)
 
     # ---- batch hooks (driven by staticWidget) ---------------------------
+    def batch_x_range(self):
+        """Phase fitting has no fit-range UI — fit the whole finite pattern, so
+        the batch input-builder applies no x-window (the shared batch contract)."""
+        return (-np.inf, np.inf)
+
     def set_batch_running(self, running):
         self.batch_btn.setText("Cancel" if running else "Batch")
         self.fit_btn.setEnabled(not running)
