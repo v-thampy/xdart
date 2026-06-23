@@ -1,6 +1,19 @@
 # Design: ROI statistics plotting + general `scan_data` popup plotter
 
-**Status:** draft for discussion · 2026-06-14 · planning only (no code)
+> **2026-06-22 update — folded into the unified Scan Plotter.** The GUI framing
+> (one combined metadata + ROI tool, generic source picker, multi-ROI overlay,
+> subtract-**or-divide** background, a **normalization axis**, and reuse of the
+> now-shipped `ParamTrendMixin` / `BatchAnalysisWorker` / reachable-raw gating)
+> lives in [`design_scan_plotter_metadata_roi_jun2026.md`]. **This doc remains the
+> source of truth for the HEADLESS layer** (`RoiSpec` / `RoiStatsPlan` /
+> `run_roi_stats`, background math §6.2, masking prereq §6.3, persistence §6.4,
+> live monitor §6.1, step sequence §7). Refinements to apply here when built:
+> the reducer gains `max`/`min`/`std`; the background op gains **`divide`** (not
+> only subtract); per-ROI background (vs the single global background assumed
+> below) is an open call (lean per-ROI). The normalization axis (y / column) is a
+> plot-time concern in the GUI, not a `RoiStatsPlan` field.
+
+**Status:** draft for discussion · 2026-06-14 (updated 2026-06-22) · planning only (no code)
 **Gated on:** 3e+Phase-5 (one store / `FrameRecord`) done + tested. The live ROI
 monitor reads the *same* raw projection the 2D panel maintains, so it must not be
 designed against a moving store.
