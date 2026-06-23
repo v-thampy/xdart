@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 
 #: (label, SourceKind value) for the Directory-mode scan-kind dropdown.
 _DIR_KINDS = [("SPEC", "spec"), ("TIFF / RAW series", "tiff_series"),
-              ("NeXus", "nexus_stack"), ("Eiger", "eiger_master")]
+              ("NeXus (raw stack)", "nexus_stack"),
+              ("Processed NeXus", "processed_nexus"), ("Eiger", "eiger_master")]
+_TIFF_SUFFIXES = {".tif", ".tiff"}
 _RAW_DTYPES = ["int32", "uint32", "int16", "uint16", "float32", "float64"]
 
 
@@ -52,7 +54,8 @@ class ScanSourceWidget(QtWidgets.QWidget):
         self._mode = mode
         self._allow_grouping = mode in ("stitch", "rsm")
         self._candidates = []          # list[SourceSpec] for the Scan selector
-        self._guard = False
+        self._last_sig = None          # signature of the last-opened spec (dedupe)
+        self._last_selection = None
         self._build_ui()
 
     # ---- UI -------------------------------------------------------------
@@ -105,7 +108,8 @@ class ScanSourceWidget(QtWidgets.QWidget):
         row3 = QtWidgets.QHBoxLayout(self.images_row)
         row3.setContentsMargins(0, 0, 0, 0)
         row3.setSpacing(6)
-        row3.addWidget(QtWidgets.QLabel("Images"))
+        self.images_label = QtWidgets.QLabel("Images")
+        row3.addWidget(self.images_label)
         self.image_dir_edit = QtWidgets.QLineEdit()
         self.image_dir_edit.setPlaceholderText("(image folder — blank = metadata only)")
         row3.addWidget(self.image_dir_edit, 1)
@@ -188,6 +192,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
     def _on_mode_toggled(self, _on):
         self.dir_kind_combo.setVisible(self.dir_check.isChecked())
         self.kind_label.setVisible(not self.dir_check.isChecked())
+        self.kind_label.setText("")            # stale until a file is chosen
         self.path_edit.clear()
         self._set_candidates([])
 
@@ -196,9 +201,10 @@ class ScanSourceWidget(QtWidgets.QWidget):
         if self.dir_check.isChecked():
             path = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose a folder")
         else:
+            # All files first/default — SPEC scan files are extensionless.
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
                 self, "Choose a scan", "",
-                "Scans (*.nxs *.h5 *.hdf5 *.cxi *.tif *.tiff);;All files (*)")
+                "All files (*);;Scans (*.nxs *.h5 *.hdf5 *.cxi *.tif *.tiff)")
         if path:
             self.path_edit.setText(path)
             self._refresh_candidates()
@@ -234,13 +240,26 @@ class ScanSourceWidget(QtWidgets.QWidget):
 
     @staticmethod
     def _file_candidates(path, kind, SourceKind, SourceSpec):
-        """File mode → one spec per scan (SPEC) / per entry (NeXus, v1=one) / else
-        one spec."""
+        """File mode → one spec per scan (SPEC) / per entry (NeXus) / else one."""
         if kind is SourceKind.SPEC:
             from xrd_tools.io.spec import list_spec_scans
             scans = list_spec_scans(path)
             return [SourceSpec(path, SourceKind.SPEC, options={"scan": s})
                     for s in scans] or [SourceSpec(path, SourceKind.SPEC)]
+        if (kind is SourceKind.IMAGE_FILE
+                and Path(path).suffix.lower() in _TIFF_SUFFIXES):
+            # a picked TIFF is the first of a folder series (sidecars → metadata)
+            return [SourceSpec(Path(path).parent, SourceKind.TIFF_SERIES)]
+        if kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER,
+                    SourceKind.PROCESSED_NEXUS):
+            from xrd_tools.io.nexus import list_entries
+            try:
+                entries = list(list_entries(path))
+            except Exception:
+                entries = []
+            if len(entries) > 1:                 # multi-entry NeXus → entry selector
+                return [SourceSpec(path, kind, entry=e) for e in entries]
+            return [SourceSpec(path, kind, entry=(entries[0] if entries else None))]
         return [SourceSpec(path, kind)]
 
     def _set_candidates(self, specs):
@@ -260,19 +279,28 @@ class ScanSourceWidget(QtWidgets.QWidget):
 
     @staticmethod
     def _candidate_label(spec):
-        scan = dict(getattr(spec, "options", {}) or {}).get("scan")
+        opts = dict(getattr(spec, "options", {}) or {})
+        tag = opts.get("scan") or getattr(spec, "entry", None)
         base = Path(str(spec.uri)).name
-        return f"{base} [{scan}]" if scan else base
+        return f"{base} [{tag}]" if tag else base
 
     def _update_images_visibility(self):
+        """Adapt the images row to the candidate kind: SPEC pairs an EXTERNAL
+        image folder; a processed NeXus reuses the field as a 'Repoint raw'
+        (``source_root``) for a moved tree; other kinds carry images inline (the
+        dot still reflects reachability)."""
         from xrd_tools.core.scan import SourceKind
         spec = self._current_candidate()
-        is_spec = spec is not None and spec.kind is SourceKind.SPEC
-        # the images folder/root only make sense for SPEC (external images);
-        # keep the row (for the dot) but disable the folder field otherwise.
-        self.image_dir_edit.setEnabled(is_spec)
-        self.image_dir_btn.setEnabled(is_spec)
-        self.image_stem_edit.setEnabled(is_spec)
+        kind = spec.kind if spec is not None else None
+        is_spec = kind is SourceKind.SPEC
+        is_proc = kind is SourceKind.PROCESSED_NEXUS
+        self.images_label.setText("Repoint raw" if is_proc else "Images")
+        self.image_dir_edit.setPlaceholderText(
+            "(raw tree root, if the data moved)" if is_proc
+            else "(image folder — blank = auto / metadata only)")
+        self.image_dir_edit.setEnabled(is_spec or is_proc)
+        self.image_dir_btn.setEnabled(is_spec or is_proc)
+        self.image_stem_edit.setEnabled(is_spec)        # filename root: SPEC only
 
     def _current_candidate(self):
         i = self.scan_combo.currentIndex()
@@ -290,7 +318,7 @@ class ScanSourceWidget(QtWidgets.QWidget):
             r = c = None
         if r and c:
             out["detector_shape"] = (r, c)
-        out["raw_dtype"] = self.dtype_combo.currentText()
+            out["raw_dtype"] = self.dtype_combo.currentText()   # only with a shape
         try:
             skip = int(self.header_skip.text()) if self.header_skip.text().strip() else 0
         except ValueError:
@@ -309,24 +337,61 @@ class ScanSourceWidget(QtWidgets.QWidget):
         options = dict(getattr(spec, "options", {}) or {})
         if spec.kind is SourceKind.SPEC:
             image_dir = self.image_dir_edit.text().strip()
+            stem = self.image_stem_edit.text().strip()
+            if not image_dir:                       # auto: images next to the spec
+                auto = self._auto_image_dir(spec, options, stem)
+                if auto:
+                    image_dir, stem = auto[0], (stem or auto[1])
             if image_dir:
                 options["image_dir"] = image_dir
-                stem = self.image_stem_edit.text().strip()
                 if stem:
                     options["image_stem"] = stem
                 rk = self._read_image_kwargs()
                 if rk:
                     options["read_image_kwargs"] = rk
+        elif spec.kind is SourceKind.PROCESSED_NEXUS:
+            root = self.image_dir_edit.text().strip()
+            if root:
+                options["source_root"] = root       # repoint a moved raw tree
         return SourceSpec(spec.uri, spec.kind, entry=getattr(spec, "entry", None),
                           options=options)
 
+    @staticmethod
+    def _auto_image_dir(spec, options, stem):
+        """SPEC auto-image-folder (design §3): when no folder is typed, try the
+        spec file's own directory with the default stem; returns ``(dir, stem)``
+        if matching images exist, else None."""
+        scan = options.get("scan")
+        if not scan:
+            return None
+        from xrd_tools.io.image import find_image_files
+        parent = Path(str(spec.uri)).parent
+        auto_stem = stem or f"{Path(str(spec.uri)).stem}_scan{str(scan).split('.')[0]}_"
+        try:
+            if find_image_files(parent, stem=auto_stem):
+                return str(parent), auto_stem
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _spec_signature(spec):
+        opts = dict(getattr(spec, "options", {}) or {})
+        return (str(spec.uri), str(spec.kind), str(getattr(spec, "entry", None)),
+                repr(sorted((k, repr(v)) for k, v in opts.items())))
+
     def _emit_selection(self):
-        if self._guard:
-            return
         spec = self._build_spec()
         if spec is None:
+            self._last_sig = self._last_selection = None
             self._set_dot(False)
             self.sigSourceChanged.emit(None)
+            return
+        sig = self._spec_signature(spec)
+        if sig == self._last_sig and self._last_selection is not None:
+            # unchanged spec — re-emit the cached selection without re-opening or
+            # re-decoding a (possibly multi-MB Eiger) frame.
+            self.sigSourceChanged.emit(self._last_selection)
             return
         from xrd_tools.sources import open_source
         from .scan_plot_dialog import probe_first_frame
@@ -334,15 +399,17 @@ class ScanSourceWidget(QtWidgets.QWidget):
             source = open_source(spec)
         except Exception:
             logger.exception("scan-source: open_source failed for %s", spec.uri)
+            self._last_sig = self._last_selection = None
             self._set_dot(False)
             self.sigSourceChanged.emit(None)
             return
         reachable, first_image = probe_first_frame(source)
         self._set_dot(reachable)
-        label = self._candidate_label(spec)
-        self.sigSourceChanged.emit(
-            ScanSelection(spec=spec, source=source, label=label,
-                          reachable=reachable, first_image=first_image))
+        selection = ScanSelection(
+            spec=spec, source=source, label=self._candidate_label(spec),
+            reachable=reachable, first_image=first_image)
+        self._last_sig, self._last_selection = sig, selection
+        self.sigSourceChanged.emit(selection)
 
     def _set_dot(self, reachable):
         self.raw_dot.setText("● raw" if reachable else "○ no raw")

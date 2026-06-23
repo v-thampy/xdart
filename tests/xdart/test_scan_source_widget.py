@@ -76,6 +76,47 @@ def test_widget_spec_metadata_then_images(qapp, tmp_path):
         w.deleteLater()
 
 
+def test_widget_spec_auto_image_folder(qapp, tmp_path):
+    """When the image folder is left blank, images sitting next to the spec file
+    are auto-found (design §3), so raw becomes reachable without a folder pick."""
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+
+    spec = _spec_with_images(tmp_path)
+    w = ScanSourceWidget(mode="roi")
+    emitted = []
+    w.sigSourceChanged.connect(lambda sel: emitted.append(sel))
+    try:
+        w.set_uri(str(spec))
+        # raw read params (needed to decode the .raw) but NOT the image folder
+        w.det_rows.setText("6")
+        w.det_cols.setText("6")
+        w.dtype_combo.setCurrentText("int32")
+        w._emit_selection()
+        sel = emitted[-1]
+        assert sel.reachable is True
+        assert sel.spec.options["image_dir"] == str(tmp_path)   # auto-derived
+    finally:
+        w.deleteLater()
+
+
+def test_widget_caches_unchanged_spec(qapp, tmp_path):
+    """Re-emitting with no field change re-uses the cached, already-opened
+    selection (no redundant open_source / frame decode)."""
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+
+    spec = _spec_with_images(tmp_path)
+    w = ScanSourceWidget(mode="roi")
+    emitted = []
+    w.sigSourceChanged.connect(lambda sel: emitted.append(sel))
+    try:
+        w.set_uri(str(spec))
+        first = emitted[-1]
+        w._emit_selection()                       # nothing changed
+        assert emitted[-1] is first               # same cached object, not re-opened
+    finally:
+        w.deleteLater()
+
+
 def test_widget_scan_switch_reloads(qapp, tmp_path):
     from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
 
