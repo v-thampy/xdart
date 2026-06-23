@@ -72,8 +72,21 @@ variables (T, stress, time…) — see §7. Always *collected*; the requirement 
 ## 3. Panel-by-panel organization
 
 ### 3.1 Source / data (stitch §5.4)
+
+> **This panel is now fully specced as a reusable widget in
+> [`design_shared_source_panel_jun2026.md`](design_shared_source_panel_jun2026.md)** (approved
+> 2026-06-23) — the `ScanSourceWidget` the ROI Scan Plotter uses now and the wrangler embeds
+> later (`mode="stitch"|"rsm"`). It resolves the items below + three additions: **(a)** a
+> File ⟷ Directory entry mode (a folder + a Scan-kind dropdown → headless `discover_scans(dir,
+> kind, recursive)`); **(b)** grouping that **combines** scans into one output via a
+> `CompositeFrameSource` (one run per group; also stitch's cross-file Multi); **(c)** explicit
+> metadata-**optional** sources (Eiger/raw burst → ROI-vs-frame + Int 1D/2D with no motors). The
+> bullets below remain the input inventory; that doc is the widget spec.
+
 - Master file path (SPEC / NeXus / Tiled) → builds the `FrameSource`.
-- Scan selection **+ grouping** with range syntax `1-3, 5, 7-9` → one reduction per group.
+- Scan selection **+ grouping** with range syntax `1-3, 5, 7-9` → one reduction per **group**
+  (members *combined* via `CompositeFrameSource`).
+- **Directory entry mode:** a folder + a Scan-kind selector → `discover_scans` walks the tree.
 - Image directory + filename pattern/prefix (headerless formats).
 - Raw-image read params: `detector_shape`, `raw_dtype`, `header_skip`, hot-pixel/saturation
   `threshold` → `read_image` args.

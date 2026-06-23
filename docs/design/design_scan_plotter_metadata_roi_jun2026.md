@@ -38,6 +38,15 @@ fold-or-not question: fold.)
 
 ## 2. The "scan" is the existing `FrameSource`
 
+> **Update 2026-06-23:** SPEC is the **primary** scan source and is now wired
+> (`xrd_tools.sources.SpecSource`: extensionless content detection, all `#L`+`#O/#P` motors,
+> scan-number selection, optional images). The ad-hoc source row described below is being
+> promoted to the **shared `ScanSourceWidget`**
+> ([`design_shared_source_panel_jun2026.md`](design_shared_source_panel_jun2026.md), approved)
+> — kind-general (SPEC/NeXus/Eiger/TIFF/Tiled-future), File or Directory entry, with the same
+> picker reused by the stitch/RSM wrangler. ROI-on-SPEC (point at the image folder) lands when
+> that widget is adopted here.
+
 Not tied to the loaded `.nxs`. On open, start with the **currently loaded `.nxs`** (or
 blank). A **source picker** at the top chooses a "scan", classified by the EXISTING
 machinery (`xrd_tools.sources.ensure_frame_source` — the same classifier the Wranglers

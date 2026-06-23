@@ -247,9 +247,14 @@ one until a real need lands.
 - **Source = the existing `FrameSource`/`open_source(spec)` abstraction.** The old
   `StitchSource` Protocol + per-format backends collapse into this: SPEC/NeXus/Tiled/
   image sources already exist as `FrameSource`s; stitching needs only a thin
-  **grouping** layer on top (which frames form one output).
-- **Grouping** keeps the range syntax (`1-3, 5, 7-9` → group, single, group) as the
-  one expressive field; each group → one `run_stitch` call → one stitched output.
+  **grouping** layer on top (which frames form one output). The wrangler's Source panel
+  is the shared `ScanSourceWidget`
+  ([`design_shared_source_panel_jun2026.md`](design_shared_source_panel_jun2026.md),
+  approved 2026-06-23) — SPEC scan-number / NeXus entry / Eiger / TIFF / Tiled-future, File
+  or Directory entry, embedded with `mode="stitch"`.
+- **Grouping** keeps the range syntax (`1-3, 5, 7-9` → group, single, group); each group
+  **combines** its scans into one output via a `CompositeFrameSource` (shared-panel doc §2)
+  → one `run_stitch` call → one stitched output.
 
 ### 5.2 Display layout — "Int-minus-raw, optional raw popup"
 (Memory `display_modules_layouts_jun2026`.) The Stitch viewer shows the **integrated/
@@ -348,9 +353,11 @@ Everything the notebook hard-codes becomes a widget field. Grouped by concern, w
 
 1. **Multi / cross-file combine** (old §5.1). **Resolved:** grouping within a source is
    the range syntax; "Multi" is specifically *combine across different files/formats*
-   into one output → model it as a **composite `FrameSource`** (a list of sources
+   into one output → model it as a **`CompositeFrameSource`** (a list of sources
    presented as one frame stream) handed to `run_stitch`. Not a separate code path —
-   just a source that concatenates.
+   just a source that concatenates. Specced + built in
+   [`design_shared_source_panel_jun2026.md`](design_shared_source_panel_jun2026.md) §2
+   (`parse_scan_groups` + `CompositeFrameSource`), shared with RSM + the ROI plotter.
 2. **Per-source motor→angle mapping** (old §5.2). **Resolved:** the shared
    `Diffractometer` preset supplies defaults; auto-detect candidate motor names from
    the source (SPEC `#O/#P`, NeXus positioners, Tiled metadata); user overrides names
