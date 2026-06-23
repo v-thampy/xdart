@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 
 from xrd_tools.core.scan import SourceCapabilities, SourceKind
-from xrd_tools.sources.base import BaseFrameSource, ensure_frame_source
+from xrd_tools.sources.base import BaseFrameSource
 
 
 class CompositeFrameSource(BaseFrameSource):
@@ -30,7 +30,7 @@ class CompositeFrameSource(BaseFrameSource):
     kind = SourceKind.UNKNOWN
 
     def __init__(self, members, *, name: str | None = None) -> None:
-        self._members = [ensure_frame_source(m) for m in members]
+        self._members = [self._as_source(m) for m in members]
         if not self._members:
             raise ValueError("CompositeFrameSource needs at least one member")
         # global frame index -> (member position, member's own frame label)
@@ -50,6 +50,16 @@ class CompositeFrameSource(BaseFrameSource):
                 has_raw_references=all(c.has_raw_references for c in caps),
             ),
         )
+
+    @staticmethod
+    def _as_source(member):
+        """A member may be an opened FrameSource OR an openable spec/URI — open
+        specs here so ``concat_sources([spec_a, spec_b])`` (the grouping path)
+        works as documented."""
+        if hasattr(member, "frame_indices") and hasattr(member, "load_frame"):
+            return member
+        from xrd_tools.sources.registry import open_source
+        return open_source(member)
 
     @property
     def members(self):
@@ -78,10 +88,17 @@ class CompositeFrameSource(BaseFrameSource):
             for member in self._members:
                 mm = getattr(member, "motors", None) or {}
                 n = len(member.frame_indices)
+                # Each block MUST be exactly n long so the concatenation stays
+                # frame-aligned: a member whose motor array is longer than its
+                # frame count (e.g. a partial SPEC scan with fewer images than
+                # metadata points) is clipped; a shorter/absent one is NaN-padded.
                 if k in mm:
-                    parts.append(np.asarray(mm[k], dtype=float))
+                    arr = np.asarray(mm[k], dtype=float).ravel()
+                    block = (arr[:n] if arr.shape[0] >= n
+                             else np.concatenate([arr, np.full(n - arr.shape[0], np.nan)]))
                 else:
-                    parts.append(np.full(n, np.nan))
+                    block = np.full(n, np.nan)
+                parts.append(block)
             out[k] = np.concatenate(parts) if parts else np.asarray([], dtype=float)
         return out
 

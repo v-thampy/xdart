@@ -54,8 +54,32 @@ def discover_scans(directory, kind, *, recursive: bool = False,
 
     if kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER,
                 SourceKind.PROCESSED_NEXUS):
-        return [SourceSpec(f, kind, options=dict(options))
-                for f in files if f.suffix.lower() in _NEXUS_EXTS]
+        from xrd_tools.io.image import _is_eiger_master
+        from xrd_tools.sources.registry import guess_source_kind
+        out = []
+        for f in files:
+            if f.suffix.lower() not in _NEXUS_EXTS:
+                continue
+            if kind is SourceKind.EIGER_MASTER:
+                if not _is_eiger_master(f):       # skip the sibling _data_ files
+                    continue
+                out.append(SourceSpec(f, SourceKind.EIGER_MASTER,
+                                      options=dict(options)))
+                continue
+            # raw / processed NeXus: skip obvious Eiger data files, and classify
+            # each master to its REAL kind so a processed .nxs opens as
+            # PROCESSED_NEXUS (linked raw + scan_data), not a raw stack.
+            if "_data_" in f.stem and not f.stem.endswith("_master"):
+                continue
+            try:
+                actual = guess_source_kind(f)
+            except Exception:
+                actual = kind
+            if actual not in (SourceKind.NEXUS_STACK, SourceKind.PROCESSED_NEXUS,
+                              SourceKind.EIGER_MASTER):
+                actual = kind
+            out.append(SourceSpec(f, actual, options=dict(options)))
+        return out
 
     if kind in (SourceKind.TIFF_SERIES, SourceKind.IMAGE_FILE):
         from xrd_tools.io.image import SUPPORTED_EXTS
