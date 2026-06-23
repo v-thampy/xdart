@@ -68,12 +68,12 @@ def test_raw_is_reachable_truth_table(qapp):
     assert raw_is_reachable(_OneD(_stack())) is False
 
 
-_SPEC = """#F t.spec
+_SPEC = """#F myscan
 #E 1
 #D today
 #O0 th  chi
 
-#S 1 ascan th 0 2 2 1
+#S 5 ascan th 0 2 2 1
 #D today
 #P0 0 5
 #N 3
@@ -81,22 +81,36 @@ _SPEC = """#F t.spec
 0 100 10
 1 110 20
 2 120 30
+
+#S 6 ascan chi 0 1 1 1
+#D today
+#P0 7 0
+#N 2
+#L chi  i0
+0 300
+1 310
 """
 
 
 def test_scan_plot_loads_spec_metadata_roi_disabled(qapp, tmp_path):
-    """A picked SPEC file populates the table from its columns; Plot ROI stays
-    disabled (metadata only — no raw frames)."""
+    """An extensionless SPEC file populates the table from its columns; the scan
+    selector appears; Plot ROI stays disabled (metadata only — no raw)."""
     pytest.importorskip("silx")
     from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
 
-    p = tmp_path / "t.spec"
+    p = tmp_path / "myscan"            # extensionless, the SSRL convention
     p.write_text(_SPEC)
     dlg = ScanPlotDialog()
     try:
         dlg.load_uri(str(p))
-        assert {"th", "i0", "det", "chi"} <= set(dlg._columns)
+        assert {"th", "i0", "det", "chi"} <= set(dlg._columns)   # scan 5 columns
         assert dlg.roi_btn.isEnabled() is False        # no raw -> ROI off
+        # the multi-scan selector is populated (offscreen isVisible() is unreliable
+        # without a shown parent, so assert the populated state)
+        assert [dlg.scan_combo.itemText(i)
+                for i in range(dlg.scan_combo.count())] == ["5.1", "6.1"]
+        dlg.scan_combo.setCurrentText("6.1")           # -> reloads scan 6
+        assert "chi" in dlg._columns and "det" not in dlg._columns
     finally:
         dlg.close()
 

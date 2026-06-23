@@ -26,8 +26,12 @@ def guess_source_kind(uri: str | Path) -> SourceKind:
     path = Path(uri)
     if path.is_dir():
         return SourceKind.TIFF_SERIES
-    if path.suffix.lower() == ".spec":          # metadata-only SPEC scan file
-        return SourceKind.SPEC
+    # SSRL SPEC files are extensionless; detect by content, not suffix.  Probe
+    # only no-extension (or .spec/.dat) files to avoid I/O on every image.
+    if path.suffix == "" or path.suffix.lower() in {".spec", ".dat"}:
+        from xrd_tools.io.spec import is_spec_file
+        if is_spec_file(path):
+            return SourceKind.SPEC
     info = classify_image_source(path)
     if info.kind is ImageSourceKind.PROCESSED_XDART or info.kind is ImageSourceKind.THUMBNAIL_ONLY:
         return SourceKind.PROCESSED_NEXUS
@@ -72,7 +76,11 @@ def open_source(uri_or_spec: str | Path | SourceSpec | FrameSource, **opts: Any)
     if kind is SourceKind.IMAGE_FILE:
         return ImageFileSource(spec.uri, **dict(spec.options))
     if kind is SourceKind.SPEC:
-        return SpecSource(spec.uri, scan=dict(spec.options).get("scan"))
+        opts = dict(spec.options)
+        return SpecSource(
+            spec.uri, scan=opts.get("scan"), image_dir=opts.get("image_dir"),
+            image_stem=opts.get("image_stem"),
+            read_image_kwargs=opts.get("read_image_kwargs"))
     if kind is SourceKind.LIVE:
         return LiveFrameSource(name=str(spec.uri))
     raise ValueError(f"cannot open source {spec.uri!r} with kind {kind.value!r}")
