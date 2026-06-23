@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 import numpy as np
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D, PONI
+from xrd_tools.core.roi import RoiSpec, invalid_pixel_mask, roi_reduce
 from xrd_tools.core.scan import FrameSource
 from xrd_tools.sources import ensure_frame_source
 
@@ -410,6 +411,116 @@ def _json_safe(value: Any) -> Any:
     except TypeError:
         return repr(value)
     return value
+
+
+# ---------------------------------------------------------------------------
+# ROI statistics (rectangular ROIs reduced over a scan's RAW frames)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RoiStatsPlan:
+    """Reduce one or more :class:`RoiSpec` rectangles over a scan's raw frames.
+
+    ``background`` (optional) is combined with each signal ROI per
+    ``background_op``: ``"subtract"`` uses the mask-correct background *density*
+    (so ``sum`` stays area-scaled); ``"divide"`` is the same-reducer ratio.
+    ``x_key`` picks a scan_data/metadata column for the x-axis (else frame
+    label).  ``mask_saturation`` opts into the dtype-ceiling saturation mask
+    (the uint32 dummy + non-finite are always excluded — R3-C parity)."""
+
+    rois: tuple[RoiSpec, ...] = ()
+    background: RoiSpec | None = None
+    background_op: str = "subtract"        # "subtract" | "divide"
+    reducer: str = "mean"                  # mean | sum | max | min | std
+    x_key: str | None = None
+    mask_saturation: bool = False
+    frame_indices: tuple[int, ...] | None = None
+
+
+@dataclass
+class RoiStatsResult:
+    """Per-frame ROI series — one ``{frame -> value}`` column per ROI."""
+
+    x: np.ndarray
+    x_label: str
+    series: dict[str, np.ndarray]          # roi name -> stat per frame
+    frames: np.ndarray
+    valid_counts: dict[str, np.ndarray]    # roi name -> valid-pixel count per frame
+    diagnostics: dict[str, Any]
+
+
+def _apply_roi_background(value, n_valid, plan, bkg_mean, bkg_same):
+    """Combine a signal ROI value with the background per ``plan.background_op``."""
+    if plan.background_op == "divide":
+        if bkg_same is None or not np.isfinite(bkg_same) or bkg_same == 0:
+            return float("nan")
+        return value / bkg_same
+    # subtract: background DENSITY (mean per valid pixel), area-scaled for sum
+    if bkg_mean is None or not np.isfinite(bkg_mean):
+        return value
+    if plan.reducer == "sum":
+        return value - bkg_mean * n_valid
+    return value - bkg_mean
+
+
+def run_roi_stats(plan: RoiStatsPlan, source) -> AnalysisResult:
+    """Reduce ``plan.rois`` over each raw frame of ``source`` into per-frame
+    series.  An unreadable raw frame records NaN + a diagnostic (warn, never
+    crash).  ``x`` is ``plan.x_key`` aligned to the frames, else the frame
+    labels.  Returns ``AnalysisResult(kind="roi_stats", payload=RoiStatsResult)``.
+    """
+    src = ensure_frame_source(source)
+    frames = [int(f) for f in (plan.frame_indices or src.frame_indices)]
+    rois = plan.rois or (RoiSpec.full_frame(),)
+    names = [roi.name or f"roi{i}" for i, roi in enumerate(rois)]
+    series: dict[str, list] = {n: [] for n in names}
+    counts: dict[str, list] = {n: [] for n in names}
+    no_raw: list[int] = []
+
+    for f in frames:
+        try:
+            img = np.asarray(src.load_frame(f))
+        except Exception:
+            for n in names:
+                series[n].append(float("nan"))
+                counts[n].append(0)
+            no_raw.append(f)
+            continue
+        mask = invalid_pixel_mask(img, mask_saturation=plan.mask_saturation)
+        bkg_mean = bkg_same = None
+        if plan.background is not None:
+            if plan.background_op == "divide":
+                bkg_same, _ = roi_reduce(img, plan.background, mask=mask,
+                                         reducer=plan.reducer)
+            else:
+                bkg_mean, _ = roi_reduce(img, plan.background, mask=mask,
+                                         reducer="mean")
+        for roi, name in zip(rois, names):
+            val, n_valid = roi_reduce(img, roi, mask=mask, reducer=plan.reducer)
+            if plan.background is not None:
+                val = _apply_roi_background(val, n_valid, plan, bkg_mean, bkg_same)
+            series[name].append(val)
+            counts[name].append(n_valid)
+
+    x_label = "frame"
+    x = np.asarray(frames, dtype=float)
+    if plan.x_key:
+        try:
+            x = _metadata_series(src, frames, plan.x_key)
+            x_label = plan.x_key
+        except (KeyError, ValueError, TypeError):
+            pass  # a frame lacked the key -> fall back to frame labels
+
+    payload = RoiStatsResult(
+        x=np.asarray(x, dtype=float), x_label=x_label,
+        series={n: np.asarray(v, dtype=float) for n, v in series.items()},
+        frames=np.asarray(frames),
+        valid_counts={n: np.asarray(v) for n, v in counts.items()},
+        diagnostics={"no_raw_frames": no_raw},
+    )
+    return AnalysisResult(kind="roi_stats", payload=payload,
+                          provenance={"plan": _plan_dict(plan)})
 
 
 __all__ = [
