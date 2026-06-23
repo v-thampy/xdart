@@ -6,9 +6,11 @@
 [`design_stitching_jun2026.md`](design_stitching_jun2026.md) §5.4's source/data input
 inventory.
 **Driven by:** SPEC is the **primary** scan-definition source today (Vivek, 2026-06-23) —
-extensionless, scan-number-addressed, with image files paired by directory + filename root.
-The ROI Scan Plotter needs it now; stitch/RSM need the **same** definition. Build the source
-panel **once**, shared.
+extensionless, scan-number-addressed, with image files paired by directory + filename root —
+**but the panel must be general across source kinds from the start**: SPEC now, processed/raw
+**NeXus** (+ Eiger) now, **Tiled** later. Designed that way, the one source panel is "truly
+general" — the ROI Scan Plotter, stitch, and RSM all consume any kind through it (Vivek,
+2026-06-23). Build it **once**, shared.
 **Depends on (already shipped):** the `FrameSource` + `open_source(uri, **opts)` /
 `SourceSpec` seam (`xrd_tools.sources`); `SpecSource` (extensionless content detection, all
 `#L`+`#O/#P` motors, scan selection, optional images via `io.image.read_image`);
@@ -56,6 +58,7 @@ reproducibility seam** (it round-trips; a saved scan definition re-opens the sam
 | Raw read params | `read_image_kwargs` (`SpecSource`→`read_image`) | `detector_shape`/`raw_dtype`/`raw_header_skip`/`threshold`/`detector` |
 | (NeXus) entry | `SourceSpec.entry` | existing |
 | (Processed NeXus) moved raw | `source_root` (`ProcessedNexusSource`) | existing (N1) |
+| (Tiled, future) catalog / node | `catalog` / `node` (`TiledSource`) | reserved; no factory yet |
 
 **One small headless addition** (pure, testable, no Qt): a grouping helper for stitch/RSM —
 
@@ -68,6 +71,37 @@ def spec_scan_specs(spec_uri, scans, *, image_dir=None, **read_kw) -> list[Sourc
 ROI uses a single scan; stitch/RSM pass a range → a list of `SourceSpec`s → one
 `run_stitch`/`run_rsm` per group. Keeping range-parsing headless means the widget's grouping
 field is trivial.
+
+## 2.1 One widget, every source kind (the generality that makes it reusable)
+
+Downstream is **already source-agnostic**: ROI/stitch/RSM only ever see a `FrameSource`
+(`frame_indices` / `load_frame` / `metadata_for` / `motors`). So the widget is the *only*
+kind-aware layer, and "general" means **two fields adapt by kind** — the **scan-id selector**
+and the **image affordance** — while everything below is identical. The unifying abstraction:
+
+> Every source has a **scan-id space** (what you pick) and an **image origin** (where raw comes
+> from). SPEC: scan number + an external image folder. NeXus: an entry + images *inside* the
+> file (raw stack) or *linked* from it (processed). Tiled: a run/node UID + images *via the
+> catalog*. All three resolve to `open_source(uri, **options) → FrameSource`.
+
+| Kind | `uri` | Scan-id selector | Image origin | Metadata | Status |
+|---|---|---|---|---|---|
+| **SPEC** | the (extensionless) spec file | **scan number** (`list_spec_scans` → combo) | **external** folder + stem (`image_dir`/`image_stem`) — or none ⇒ metadata-only | `#L` + all `#O/#P` (`read_spec_scan_table`) | ✅ shipped |
+| **Processed NeXus** | the `.nxs` | **entry** (usually one) | **linked raw**, auto-resolved (N1); a *Repoint raw* field = `source_root` for a moved tree | `read_scan_data` (full `scan_data`) | ✅ exists (`ProcessedNexusSource`) |
+| **Raw NeXus / Eiger** | the `.h5`/`.nxs` master | **entry** (+ optional dataset path) | **inline** frames in the file | positioners in-file | ✅ exists (`NexusStackSource`) |
+| **TIFF / RAW series** | the first image (or its folder) | n/a (the folder *is* the scan) | the folder itself | `.txt`/`.pdi` sidecars | ✅ exists (`TiffSeriesSource`) |
+| **Tiled** | a catalog URI + node path | **run/node UID** picked from a **catalog browser** | **via the catalog** (lazy) | catalog metadata | 🔜 `SourceKind.TILED` reserved; no factory yet |
+
+So the widget's "Scan" control is a **kind-adaptive selector** (SPEC scan combo / NeXus entry
+combo / Tiled catalog browser), and its "Images" control is a **kind-adaptive affordance**
+(external folder for SPEC; hidden+auto for NeXus/Tiled; a *Repoint raw* field for a moved
+processed-NeXus tree). The grouping range (§2) is over **whatever the scan-id space is** — SPEC
+scan numbers, NeXus entries, Tiled runs — so it generalizes unchanged.
+
+**Tiled forward seam (no speculative code now):** a `TiledSource(FrameSource)` +
+`open_source` factory + a catalog-browser sub-widget land when Tiled does; the `uri`/`options`
+contract (`catalog`, `node`/`uid`) is reserved so today's widget + every consumer accept it
+with no downstream change. Until then the kind is simply absent from the picker.
 
 ---
 
@@ -90,18 +124,30 @@ to it and call `open_source(spec)` themselves (so the widget never holds analysi
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**File** — one picker, "All files" (SPEC is extensionless). On pick, `guess_source_kind`
-classifies (content-sniff for SPEC); the `kind:` label reflects it. NeXus/Eiger/TIFF-seq paths
-are unchanged.
+**File / source** — one picker, "All files" (SPEC is extensionless). On pick,
+`guess_source_kind` classifies (content-sniff for SPEC; suffix/inspect for NeXus/Eiger/TIFF);
+the `kind:` label reflects it. *(Tiled later replaces the file picker with a catalog-URI field
++ a Browse… catalog dialog — same `sigSourceChanged` contract.)*
 
-**Scan** — for a SPEC file, populated from `SpecSource(uri).available_scans`; shown only when
->1 scan. Hidden for single-scan / non-SPEC sources. (Already prototyped in the ROI dialog.)
+**Scan — kind-adaptive selector** (§2.1): SPEC → a **scan-number** combo
+(`SpecSource(uri).available_scans`); NeXus → an **entry** combo (usually one); Tiled → a
+**catalog browser** (future). Shown only when there is a real choice (>1 scan/entry); hidden
+for single-scan / single-entry / folder-series sources. (The SPEC case is already prototyped in
+the ROI dialog.)
 
-**Images** — the directory of detector files. **Auto-default:** when blank, try the SPEC
-file's own directory with the default stem; if `find_image_files` hits, pre-fill + show the
-**raw-reachable dot green**; else grey (metadata only). The user can point elsewhere. Omitting
-it entirely ⇒ metadata-only source ⇒ the consumer disables raw features (ROI/stitch/RSM).
-**Filename root** override lives next to it (default `{spec}_scan{N}_`).
+**Images — kind-adaptive affordance** (§2.1):
+- **SPEC** → an external image **folder** + **filename root** (default `{spec}_scan{N}_`).
+  Auto-default: when blank, try the spec file's own directory with the default stem; if
+  `find_image_files` hits, pre-fill + show the **raw-reachable dot green**, else grey
+  (metadata-only). Omitting it ⇒ metadata-only ⇒ raw features off.
+- **Raw NeXus / Eiger** → images are **inline**; no folder field (the dot is green when the
+  file has a readable image stack). An optional dataset-path override for non-standard files.
+- **Processed NeXus** → raw is **linked**; no folder field, but a **Repoint raw** path
+  (`source_root`) for a moved tree, with the dot reflecting whether the raw resolves.
+- **Tiled** → images come **via the catalog**; no folder field.
+
+The single invariant the consumers rely on: **the dot = "raw reachable"** (`probe_first_frame`
+succeeds), regardless of kind — that's what gates Plot ROI / stitch / RSM.
 
 **Advanced (raw read params)** — collapsed by default; only needed for **headerless raw
 binaries** (`.raw`): `detector_shape` *or* a detector name (→ pyFAI factory), `raw_dtype`,
@@ -152,17 +198,24 @@ geometry/calibration, DiffractometerConfig, UB, reduction, and output panels *ar
    selection. *(Shipped `3a9d18c`.)*
 1. **Headless grouping helper.** `parse_scan_range` + `spec_scan_specs`. *Gate:* pure unit
    tests (`"1-3,5"` → specs; image_dir threads into each spec's options).
-2. **`ScanSourceWidget`.** The widget above, `mode="roi"` first; emits `SourceSpec`; auto-derive
-   image dir/stem + the raw-reachable dot; Advanced raw params. *Gate:* offscreen — picking a
-   SPEC file emits a spec with the right options; pointing Images at a raw folder flips the
-   reachable dot; the scan combo reloads.
-3. **Adopt in the ROI Scan Plotter.** Replace the ad-hoc source row; ROI-on-SPEC works
-   end-to-end (point at images → Plot ROI). *Gate:* the existing `test_scan_plot_roi` SPEC
-   tests + a new "SPEC + image dir → ROI column fills" end-to-end.
+2. **`ScanSourceWidget` — kind-adaptive, SPEC + NeXus.** The widget above with the §2.1
+   kind-adaptive Scan selector (SPEC scan combo / NeXus entry combo) + Images affordance
+   (external folder for SPEC; inline for raw NeXus/Eiger; `source_root` repoint for processed
+   NeXus); emits `SourceSpec`; the raw-reachable **dot** via `probe_first_frame`; Advanced raw
+   params. *Gate:* offscreen — each kind emits a spec with the right options; SPEC images folder
+   flips the dot; a processed-NeXus + reachable raw shows the dot green; the scan/entry selector
+   reloads. (Both source families already exist headless, so this is GUI-only.)
+3. **Adopt in the ROI Scan Plotter.** Replace the ad-hoc source row; ROI works end-to-end on a
+   SPEC scan (point at images → Plot ROI) AND a processed NeXus (linked raw). *Gate:* the
+   existing `test_scan_plot_roi` SPEC/NeXus tests + a new "SPEC + image dir → ROI column fills".
 4. **(later) Wrangler reuse.** Embed `mode="stitch"|"rsm"`; grouping + orientation on. *Gate:*
    wrangler-org's gates.
+5. **(future) Tiled.** Add `TiledSource` + an `open_source` factory + a catalog-browser
+   sub-widget; the widget gains a "Tiled" path with no change to the `sigSourceChanged` contract
+   or any consumer. *Gate:* catalog browse → spec → `FrameSource` round-trip.
 
-ROI gets the full SPEC story at step 3; stitch/RSM inherit the source half for free at step 4.
+ROI gets the full SPEC + NeXus story at step 3; stitch/RSM inherit the source half for free at
+step 4; Tiled slots in at step 5 behind the same seam.
 
 ---
 
@@ -176,6 +229,13 @@ ROI gets the full SPEC story at step 3; stitch/RSM inherit the source half for f
    the static-scan ROI dialog and the future wrangler — confirm the single-home placement.
 4. **Composite / cross-file sources** (stitch "Multi", stitching §6 Q1) — out of scope for this
    widget v1 (one master file per definition); a later composite layer concatenates specs.
+5. **NeXus "scan id".** A processed `.nxs` is usually one entry; multi-entry/multi-scan NeXus —
+   treat entries as the scan-id space (so grouping a range of entries works like SPEC scan
+   numbers), or one file = one scan? (Recommend: entries are the scan-id space, symmetric with
+   SPEC, so grouping generalizes.)
+6. **Tiled catalog UX.** When Tiled lands, is the catalog browser embedded in this widget or a
+   separate dialog that returns a `(catalog, node)` spec? (Recommend a separate Browse… dialog
+   feeding the same `sigSourceChanged`, to keep this widget compact.)
 
 ---
 
