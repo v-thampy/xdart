@@ -32,7 +32,7 @@ Key invariants of the v2 schema:
    ``/entry/sample/positioners/``.
 5. Derived pyFAI rotations + GI incidence angle live in
    ``/entry/per_frame_geometry/``, recomputed from the raw positioners
-   via the :class:`DiffractometerGeometry` config blob stored in
+   via the :class:`Diffractometer` config blob stored in
    ``/entry/reduction/config/geometry/``.
 6. Provenance (NXprocess) is written via
    :func:`xrd_tools.core.provenance.write_provenance` — versions
@@ -56,7 +56,7 @@ import numpy as np
 from xrd_tools.io.nexus import resolve_stack_compression
 
 if TYPE_CHECKING:  # pragma: no cover
-    from xrd_tools.core.geometry import DiffractometerGeometry
+    from xrd_tools.core.geometry import Diffractometer  # noqa: F401
 
     from xdart.modules.live import LiveScan
 
@@ -469,7 +469,7 @@ def save_scan_to_nexus(
         :class:`LiveScan` carrying the in-memory state.  Must expose
         ``frames`` (ordered), ``scan_data`` (pandas DataFrame),
         ``bai_1d_args``, ``bai_2d_args``, optionally ``geometry``
-        (:class:`DiffractometerGeometry`) and ``incidence_motor``.
+        (:class:`Diffractometer`) and ``incidence_motor``.
     path
         Filesystem path to the ``.nxs`` file.  The writer opens and
         closes its own file handle (NFS-retry semantics included), so

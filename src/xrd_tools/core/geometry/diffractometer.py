@@ -32,7 +32,16 @@ if TYPE_CHECKING:  # Only needed for type checkers; avoided at runtime.
 
 @dataclass(slots=True)
 class DiffractometerConfig:
-    """Geometry configuration for ``xu.QConversion`` and ``xu.HXRD``."""
+    """Geometry configuration for ``xu.QConversion`` and ``xu.HXRD``.
+
+    .. deprecated::
+        Superseded by :class:`Diffractometer` (the one canonical object, ADR-0007),
+        which exposes the same ``make_hxrd`` + ``init_area_*`` surface as a drop-in.
+        Kept as the value-preserving reference + as the source/target of
+        :meth:`Diffractometer.from_diffractometer_config` /
+        :meth:`Diffractometer.to_diffractometer_config`, and to parse legacy
+        experiment-config JSON.  Do not author new geometry with it.
+    """
 
     sample_rot: tuple[str, ...] = ("z-", "y+", "z-")
     detector_rot: tuple[str, ...] = ("z-",)
@@ -121,6 +130,15 @@ class AngleMapping:
 @dataclass(frozen=True)
 class DiffractometerGeometry:
     """Maps scan-file motor columns to pyFAI rotations + GI incidence angle.
+
+    .. deprecated::
+        Superseded by :class:`Diffractometer` (the one canonical object, ADR-0007),
+        which carries the same per-frame ``rot*``/``incident_angle`` mappings and
+        exposes ``derive_per_frame`` as a drop-in.  Kept as the value-preserving
+        reference + as the source/target of
+        :meth:`Diffractometer.from_diffractometer_geometry` /
+        :meth:`Diffractometer.to_diffractometer_geometry`, and to parse a legacy
+        ``mapping_json`` on reload.  Do not author new geometry with it.
 
     Conventions:
 

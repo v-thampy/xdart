@@ -44,7 +44,7 @@ def run_stitch(
     Reads:
 
     * ``scan.frames`` — image stack (via ``frame.map_raw - frame.bg_raw``).
-    * ``scan.geometry`` — :class:`DiffractometerGeometry` for the
+    * ``scan.geometry`` — :class:`Diffractometer` for the
       per-frame ``rot1``/``rot2`` derivation.
     * ``scan.scan_data`` — motor positions (DataFrame).
     * ``scan.frames[0].poni`` — base PONI geometry shared across
@@ -90,7 +90,7 @@ def run_stitch(
     if scan.geometry is None:
         raise RuntimeError(
             "LiveScan.geometry is unset — set it before stitching "
-            "(use xrd_tools.core.geometry.DiffractometerGeometry)."
+            "(use xrd_tools.core.geometry.Diffractometer)."
         )
     frames = list(scan.frames)
     if not frames:

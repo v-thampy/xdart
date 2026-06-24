@@ -829,13 +829,17 @@ class LiveScan:
             if isinstance(geom_cfg, dict) and geom_cfg.get("mapping_json"):
                 try:
                     from xrd_tools.core.geometry import (
+                        Diffractometer,
                         DiffractometerGeometry,
                     )
                     mj = geom_cfg["mapping_json"]
                     if isinstance(mj, dict):  # already parsed by read_provenance
                         import json as _json
                         mj = _json.dumps(mj)
-                    self.geometry = DiffractometerGeometry.from_json(mj)
+                    # parse the legacy per-frame mapping, then lift to the one
+                    # canonical object so self.geometry is always a Diffractometer
+                    self.geometry = Diffractometer.from_diffractometer_geometry(
+                        DiffractometerGeometry.from_json(mj))
                 except Exception:
                     logger.debug(
                         "Failed to restore geometry from reduction config",
