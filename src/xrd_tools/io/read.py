@@ -741,6 +741,36 @@ def _slice_stack(dset: h5py.Dataset, positions: np.ndarray, single: bool) -> np.
     return out[0] if single else out
 
 
+def get_diffractometer(scan_file: str | Path, *, entry: str = "entry"):
+    """Read the persisted canonical :class:`Diffractometer`, or ``None``.
+
+    Returns ``None`` when the ``diffractometer`` group is absent (every file
+    written before the group existed — the back-compat contract, mirroring
+    :func:`_read_ub_matrix`); never raises on an old file and never
+    synthesizes a default geometry.  Reconstructs the full instrument (both
+    adapter views + the fitted ``DetectorCalibration`` + preset + motor map)
+    from the ``config_json`` blob for offline stitch/RSM.
+    """
+    from xrd_tools.core.geometry import Diffractometer
+
+    with h5py.File(Path(scan_file), "r") as f:
+        if entry not in f:
+            return None
+        grp = f[entry]
+        ds = grp.get("diffractometer/config_json")
+        if ds is None:
+            return None
+        blob = ds.asstr()[()] if h5py.check_string_dtype(ds.dtype) else ds[()]
+        if isinstance(blob, (bytes, np.bytes_)):
+            blob = blob.decode("utf-8")
+    try:
+        return Diffractometer.from_json(str(blob))
+    except Exception:
+        logger.warning("Could not parse persisted diffractometer blob in %s",
+                       scan_file, exc_info=True)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # object-style sugar
 # ---------------------------------------------------------------------------
@@ -769,6 +799,9 @@ class ProcessedScan:
         self._metadata_cache: dict | None = None
         self._scan_data_cache: dict[str, np.ndarray] | None = None
         self._frames_cache: np.ndarray | None = None
+        #: ``None`` is a valid value (absent group), so cache via a flag.
+        self._diffractometer_cache = None
+        self._diffractometer_loaded = False
 
     @property
     def frames(self) -> np.ndarray:
@@ -812,6 +845,20 @@ class ProcessedScan:
         return self._scan_data_cache
 
     @property
+    def diffractometer(self):
+        """The persisted canonical :class:`Diffractometer`, or ``None``.
+
+        Lets offline stitch/RSM run from the file with no GUI (the "metadata
+        mandatory for stitch/RSM" contract).  ``None`` on any file written
+        before the group existed.
+        """
+        if not self._diffractometer_loaded:
+            self._diffractometer_cache = get_diffractometer(
+                self.path, entry=self.entry)
+            self._diffractometer_loaded = True
+        return self._diffractometer_cache
+
+    @property
     def energy(self) -> float | None:
         return self.energy_keV
 
@@ -829,6 +876,8 @@ class ProcessedScan:
         self._metadata_cache = None
         self._scan_data_cache = None
         self._frames_cache = None
+        self._diffractometer_cache = None
+        self._diffractometer_loaded = False
         return self.metadata
 
     def get_1d(self, frame=None) -> Integrated1D:

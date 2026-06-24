@@ -2084,6 +2084,28 @@ def write_per_frame_geometry(
             ds.attrs["units"] = "rad"
 
 
+def write_diffractometer(entry_grp: h5py.Group, diffractometer) -> None:
+    """Write ``/entry/diffractometer`` — the canonical :class:`Diffractometer`
+    serialized to a single ``config_json`` vlen-UTF8 string blob.
+
+    Scan-level + capability-gated (``diffractometer``): a reloaded scan
+    reconstructs the full instrument geometry (both adapter views + the fitted
+    ``DetectorCalibration`` + preset + motor map) for offline stitch/RSM with
+    no GUI.  ``None`` (or a geometry without ``to_json``) → no-op / clears any
+    stale group, so an old file simply lacks the group (reader → ``None``).
+    """
+    to_json = getattr(diffractometer, "to_json", None)
+    if diffractometer is None or not callable(to_json):
+        if "diffractometer" in entry_grp:
+            del entry_grp["diffractometer"]
+        return
+    blob = to_json()
+    if "diffractometer" in entry_grp:
+        del entry_grp["diffractometer"]
+    g = _create_group_from_schema(entry_grp, "diffractometer")
+    g.create_dataset("config_json", data=blob, dtype=_UTF8_DTYPE)
+
+
 def write_scan_metadata(
     entry_grp: h5py.Group,
     scan_data,

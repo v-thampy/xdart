@@ -612,6 +612,16 @@ class NexusSink:
                             self._h5[self.entry], scan_data,
                             list(scan.frame_indices), geom,
                         )
+                    # Persist the canonical Diffractometer blob for offline
+                    # stitch/RSM — but ONLY when a complete object is present.
+                    # Today's Scan.geometry is a bare DiffractometerGeometry
+                    # (pyFAI half only, no xu axes / calibration), so persisting
+                    # it would be a misleading partial blob; the step-4 rewire
+                    # threads the full Diffractometer in and flips this on.
+                    from xrd_tools.core.geometry import Diffractometer
+                    if isinstance(geom, Diffractometer):
+                        from xrd_tools.io.nexus import write_diffractometer
+                        write_diffractometer(self._h5[self.entry], geom)
             self._h5.flush()
             self._h5.close()
             self._h5 = None

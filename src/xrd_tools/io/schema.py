@@ -368,6 +368,16 @@ class ProcessedScanSchema:
                 datasets=_GEOMETRY_DATASETS,
                 nx_attrs=MappingProxyType({"NX_class": "NXcollection"}),
             ),
+            # The canonical Diffractometer as a single JSON blob (config_json):
+            # the declarative instrument (both adapter views), the fitted
+            # DetectorCalibration (PONI + Detector_config + image mount), the
+            # preset tag + motor map.  Scan-level (no per-frame rows), so it
+            # carries no schema datasets — the blob is written by hand as a
+            # vlen-UTF8 string (it is not a numeric row-aligned stack).
+            "diffractometer": GroupSchema(
+                "diffractometer",
+                nx_attrs=MappingProxyType({"NX_class": "NXcollection"}),
+            ),
         })
     )
 
@@ -411,6 +421,15 @@ CAPABILITIES = MappingProxyType({
         MULTI_RESULT_MODES_ATTR, "integrated_2d", "attr",
         "per-GI-mode results: the primary at integrated_2d, others under "
         "integrated_2d/<mode>/ nested NXdata subgroups"),
+    "diffractometer": CapabilityAttr(
+        "diffractometer", "", "group",
+        "canonical Diffractometer geometry blob (config_json: both adapter "
+        "views + fitted DetectorCalibration + preset + motor map) for offline "
+        "stitch/RSM"),
+    "ub_matrix": CapabilityAttr(
+        "ub_matrix", "sample", "dataset",
+        "UB sample orientation matrix (the dataset already round-trips; this "
+        "only advertises its presence)"),
 })
 
 
