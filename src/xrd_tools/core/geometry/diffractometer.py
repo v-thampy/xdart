@@ -1028,6 +1028,21 @@ class Diffractometer:
             **self.hxrd_kwargs,
         )
 
+    # -- PixelQMap drop-in: the same names DiffractometerConfig exposes, so a
+    #    Diffractometer is a transparent ``PixelQMap.diff_config`` (the RSM
+    #    pipeline reads make_hxrd + init_area_detrot/tiltazimuth + ang2q_kwargs).
+    def make_hxrd(self, energy: float) -> "xu.HXRD":
+        """Legacy-compatible alias of :meth:`to_hxrd`."""
+        return self.to_hxrd(energy)
+
+    @property
+    def init_area_detrot(self) -> str:
+        return self.camera[0]
+
+    @property
+    def init_area_tiltazimuth(self) -> str:
+        return self.camera[1]
+
     # ------------------------------------------------------------------
     # Motor bookkeeping + serialisation
     # ------------------------------------------------------------------

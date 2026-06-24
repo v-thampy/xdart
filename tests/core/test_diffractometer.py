@@ -705,6 +705,30 @@ class TestLegacyInterop:
         for a, b in zip(run(c.make_hxrd), run(d.to_hxrd)):
             np.testing.assert_array_equal(a, b)
 
+    def test_pixelqmap_dropin_equivalence(self):
+        """A Diffractometer is a transparent PixelQMap.diff_config: same q as
+        the equivalent DiffractometerConfig through the full RSM pixel_q path."""
+        pytest.importorskip("xrayutilities")
+        from xrd_tools.core.geometry import DetectorHeader, PixelQMap
+        sample = ("x+", "z-", "y+", "z-")
+        detector = ("x+", "z-")
+        camera = ("z-", "x-")
+        cfg = DiffractometerConfig(
+            sample_rot=sample, detector_rot=detector, r_i=(0.0, 1.0, 0.0),
+            init_area_detrot=camera[0], init_area_tiltazimuth=camera[1],
+            hxrd_n=(0.0, 1.0, 0.0), hxrd_q=(0.0, 0.0, 1.0))
+        diff = Diffractometer.from_diffractometer_config(cfg)
+        header = DetectorHeader(cch1=100.0, cch2=200.0, pwidth1=0.172,
+                                pwidth2=0.172, distance=390.0, Nch1=40, Nch2=50)
+        angles = [np.array([0.0, 0.0]), np.array([1.0, 2.0]),
+                  np.array([0.0, 0.0]), np.array([0.0, 0.0]),
+                  np.array([5.0, 6.0]), np.array([10.0, 12.0])]
+        UB = np.eye(3)
+        q_cfg = PixelQMap(cfg, header).pixel_q(angles, 17000.0, UB=UB)
+        q_diff = PixelQMap(diff, header).pixel_q(angles, 17000.0, UB=UB)
+        for a, b in zip(q_cfg, q_diff):
+            np.testing.assert_array_equal(a, b)
+
     def test_lift_with_overrides_donates_xu_half(self):
         # a writer holds a DiffractometerGeometry (pyFAI half only); donate the
         # xu half from a config so the lifted object also feeds RSM.
