@@ -184,6 +184,61 @@ parity for the pyFAI geometry.)*
 
 ---
 
+## 2.7 Status: the shared geometry foundation is BUILT; convergence is the stitch module
+
+**The shared `Diffractometer` geometry object (ADR-0007) is implemented + green**
+(`feature/geometry`, Jun 2026): both adapters (`to_pyfai_per_frame` for the pyFAI/MG
+backend, `to_qconversion` for the xu_hist backend), `DetectorCalibration`/
+`ImageOrientation`, `from_pyfai_goniometer` (the gonio importer), `refine_goniometer`
+(the producer/fit), capability-gated persistence, and every existing consumer
+(RSM/reduction/writer) repointed onto it. **So the shared spine of §2.6/§3 is now
+buildable — but not yet built.** Honest status of the §2.6 convergence:
+
+- **Shared today (code):** the source layer + the one `Diffractometer` (the q-geometry
+  for all backends). RSM's `StreamingGridder` is the mature histogram accumulator the
+  `xu_hist`/`pyfai_hist` backends are meant to *reuse*.
+- **Design-only (this module builds it):** `StitchPlan.backend`, the `xu_hist`/`pyfai_hist`
+  backends, `stitch_q_grid`/`stitch_ponis`, the shared per-pixel correction stack, and the
+  histogram-stitch path. Today `run_stitch` still uses the old `deg2rad` per-frame hardwire
+  (GAP A) and pyFAI `MultiGeometry`; it does **not** yet consume the `Diffractometer`.
+- **The convergence claim, precisely:** once built, **`xu_hist`-stitch ≡ RSM** up to and
+  including the per-pixel q (`to_qconversion → Ang2Q.area`) + the shared corrections; the
+  **single divergence is the bin space** handed to the shared accumulator — `(q, χ)` 2D for
+  stitch vs `(qx,qy,qz)`→`(h,k,l)` 3D for RSM (RSM additionally needs the UB matrix). That
+  is the design target this module realizes.
+
+## 2.8 Grazing-incidence stitching — a `StitchPlan.gi` flag (reuse the Int `GIMode`)
+
+A GI experiment should be stitchable at grazing incidence with a flag mirroring the Int
+1D/2D GI mode (Vivek, Jun 2026). Design (validated against the geometry object + the Int GI
+path):
+
+- **`StitchPlan.gi: GIMode | None = None`** — reuse the **existing**
+  `xrd_tools.reduction.core.GIMode` verbatim (its `GI1DMode` `q_total/q_ip/q_oop/exit_angle/
+  chi_gi` + `GI2DMode` `qip_qoop/q_chi/exit_angles` ARE the GI stitch output coordinates;
+  `q_chi` is exactly the I-vs-(q,χ) GI cake). `plan.gi is not None` is the flag — one
+  optional sum-type so "GI geometry with GI off" is unrepresentable. **Reuse the same
+  `gi_config`** (`incident_angle`/`incidence_motor`/`tilt_angle`/`sample_orientation`) the
+  Int path persists — do not invent a stitch-specific one.
+- **GI is orthogonal to the backend** (no new geometry needed):
+  - `backend="multigeometry"` + gi → swap the per-frame `AzimuthalIntegrator` for a
+    `FiberIntegrator` (reuse `integrate/gid.py::poni_to_fiber_integrator`), incidence
+    resolved exactly as Int does, then merge via `MultiGeometry`.
+  - `backend="xu_hist"/"pyfai_hist"` + gi → the per-pixel q-provider places the resolved
+    incidence in the **sample-circle slot** before `to_qconversion()`→`Ang2Q.area` (xu) /
+    the FiberIntegrator q/χ arrays (pyFAI); the histogram merge is unchanged.
+- **The `Diffractometer` needs NO GI extension.** It already expresses grazing incidence
+  via `incident_angle: AngleMapping` + `hxrd_n` (surface normal) + the `psic_halpha`/
+  `two_circle` GI presets — xu GI is *just* the incidence angle in the sample-circle slot,
+  not a flag or subclass. **The one wiring task** (this module, not the geometry object):
+  the xu provider must assemble the per-frame sample-angle vector (incidence in its slot,
+  others at their motor values) from `circle_motors` before `Ang2Q.area` — `circle_motors`
+  is carried but not yet adapter-consumed. For a dual-backend GI to *agree*, the xu provider
+  must also translate `tilt_angle`/`sample_orientation` into the xu surface convention (a
+  parity concern for the dual-backend GI gate, not a blocker for the pyFAI GI path).
+
+---
+
 ## 3. Headless design (the one source layer)
 
 ### 3.1 Geometry input = a base `DetectorCalibration` + the shared `Diffractometer`

@@ -1,7 +1,8 @@
 # ADR-0007: one shared `Diffractometer` geometry object (kill parallel representations)
 
-**Status:** accepted (steps 0–4 implemented + green; live verification + 4b/5 pending) ·
-2026-06-23 · promotes `docs/design/design_diffractometer_geometry_jun2026.md`.
+**Status:** accepted (steps 0–5 implemented + green incl. `refine_goniometer`; app-default
+live verification pending) · 2026-06-23 · promotes
+`docs/design/design_diffractometer_geometry_jun2026.md`.
 **Builds on:** ADR-0002 (capability attrs — the persistence mechanism).
 **Consumed by:** `design_stitching_jun2026.md` (all three stitch backends) and
 `design_rsm_jun2026.md` — both reference this object as their single geometry input.
@@ -123,13 +124,18 @@ reduction / the writer / `Scan.geometry` onto the one object with no behaviour c
   3 GI quantities are byte-identical because `to_pyfai_per_frame` == the old
   `derive_per_frame`. Core 1191 + xdart 1087 green. *Remaining: a live `xrd_test` GUI run
   (the app-default-psic flip + the persisted blob on a real save/reload).*
-- **Not yet done:**
-  - **Step 4b — `refine_goniometer`** (the Refine-button backend): a headless
-    control-point `least_squares` fit (NOT pyFAI `refine3`, which diverges for the stacked
-    psic), seeded from a base `.poni` + calibration images + their `(del,nu)` + calibrant.
-    Ships with the stitch/RSM feature, not the core refactor.
-  - **Step 5 — retire** the two legacy classes (or leave deprecation aliases) once all
-    callers move; grep finds no independent authoring of the two encodings.
+- **Step 4b — `refine_goniometer` (DONE).** `integrate/refine.py`: a headless
+  control-point `scipy.least_squares` fit of an axis-separable pyFAI
+  `GeometryTransformation` (NOT `refine3`), with motor-zero offsets as first-class
+  params, producing a standard gonio that round-trips through `from_pyfai_goniometer`
+  into a fitted `Diffractometer`. Committed gate = synthetic round-trip recovering the
+  real del/nu geometry; the |q|-RMS / <1px real-data gate runs in the Multi120 notebooks.
+- **Step 5 — retire (DONE).** The two legacy classes are marked deprecated and kept only
+  as the value-preserving reference + the bridges' source/target + the two back-compat
+  JSON parsers; grep finds no new independent authoring. `PixelQMap.diff_config` retyped;
+  the reload fallback lifts to a `Diffractometer`.
+- **Only remaining:** the live `xrd_test` GUI confirmation of the app-default-psic flip +
+  the persisted blob on a real save/reload (the headless work is all green).
 - **`circle_motors`** is carried for completeness / persistence but is not yet
   adapter-consumed (RSM passes its motor list explicitly); the psic sample-circle↔motor
   order is the conventional SPEC order, to be cross-validated against real `Ang2Q.area`
