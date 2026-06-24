@@ -502,13 +502,18 @@ class Diffractometer:
     incident_angle: AngleMapping = field(default_factory=AngleMapping)
 
     # --- xrayutilities / RSM view (circle stack + camera + HXRD refs) -------
-    sample_circles: tuple[str, ...] = ("z-", "y+", "z-")
-    detector_circles: tuple[str, ...] = ("z-",)
+    # The defaults are the validated **psic** orientation (the house standard;
+    # examples/.../RSM/RSM_process.ipynb production calls) — a bare
+    # ``Diffractometer()`` is psic-oriented (motors unwired until a preset is
+    # applied).  ``sample_circles`` == (mu, eta, chi, phi); ``detector_circles``
+    # == (nu, del); ``camera`` == camera_or; HXRD idir/ndir == [0,1,0]/[0,0,1].
+    sample_circles: tuple[str, ...] = ("x+", "z-", "y+", "z-")
+    detector_circles: tuple[str, ...] = ("x+", "z-")
     r_i: tuple[float, float, float] = (0.0, 1.0, 0.0)
     #: detector-on-arm orientation: (init_area_detrot, init_area_tiltazimuth).
-    camera: tuple[str, str] = ("z-", "x+")
+    camera: tuple[str, str] = ("z-", "x-")
     hxrd_n: tuple[float, float, float] = (0.0, 1.0, 0.0)
-    hxrd_q: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    hxrd_q: tuple[float, float, float] = (0.0, 0.0, 1.0)
     hxrd_geometry: str = "real"
     #: xu: motor driving each circle, aligned to sample_circles + detector_circles.
     circle_motors: tuple[AngleMapping, ...] = ()
@@ -552,6 +557,7 @@ class Diffractometer:
             sample_circles=("z-",),
             detector_circles=("z-",),
             camera=("z-", "x+"),
+            hxrd_n=(0.0, 1.0, 0.0), hxrd_q=(1.0, 0.0, 0.0),
             sample_motors=sample,
             detector_motors=(tth,),
             circle_motors=(AngleMapping(source_motor=th),
@@ -564,12 +570,13 @@ class Diffractometer:
              mu: str = "mu") -> "Diffractometer":
         """6-circle psic (``rot1←nu``, ``rot2←del``, incidence``←eta``).
 
-        The xu axis stacks + camera orientation are the validated values for
-        the SSRL Pilatus-300k-w psic arm (``xu_geometry_del_nu.json``).  The
-        ``circle_motors`` ordering follows the conventional SPEC psic order
-        ``(mu, eta, chi, phi)`` sample, ``(nu, del)`` detector; it is not yet
-        adapter-consumed, so the exact motor↔axis order is cross-validated
-        against real ``Ang2Q.area`` usage when the stitch/RSM gate lands.
+        The house-standard default geometry.  The xu axis stacks, camera
+        orientation, HXRD idir/ndir, and motor order are the production values
+        from ``examples/.../RSM/RSM_process.ipynb`` (``sample_or``/``det_or``/
+        ``beam_dr``/``camera_or`` + ``diff_motors=['mu','eta','chi','phi',
+        'nu','del']``), validated on real RSM data.  ``circle_motors`` therefore
+        follows that confirmed order: ``(mu, eta, chi, phi)`` sample,
+        ``(nu, del)`` detector.
         """
         return cls(
             preset="psic",
@@ -578,7 +585,8 @@ class Diffractometer:
             incident_angle=AngleMapping(source_motor=eta),
             sample_circles=("x+", "z-", "y+", "z-"),
             detector_circles=("x+", "z-"),
-            camera=("x-", "z+"),
+            camera=("z-", "x-"),
+            hxrd_n=(0.0, 1.0, 0.0), hxrd_q=(0.0, 0.0, 1.0),
             sample_motors=(eta, chi, phi, mu),
             detector_motors=(del_, nu),
             circle_motors=(
@@ -612,6 +620,7 @@ class Diffractometer:
             sample_circles=("z-", "y+", "z-"),
             detector_circles=("z-",),
             camera=("z-", "x+"),
+            hxrd_n=(0.0, 1.0, 0.0), hxrd_q=(1.0, 0.0, 0.0),
             sample_motors=(om, chi, phi),
             detector_motors=(tth,),
             circle_motors=(
@@ -632,7 +641,8 @@ class Diffractometer:
             incident_angle=AngleMapping(source_motor=halpha),
             sample_circles=("x+", "z-", "y+", "z-"),
             detector_circles=("x+", "z-"),
-            camera=("x-", "z+"),
+            camera=("z-", "x-"),
+            hxrd_n=(0.0, 1.0, 0.0), hxrd_q=(0.0, 0.0, 1.0),
             sample_motors=(halpha, chi, phi, mu),
             detector_motors=(del_, nu),
             circle_motors=(
@@ -1041,12 +1051,13 @@ class Diffractometer:
             rot2=_am("rot2"),
             rot3=_am("rot3"),
             incident_angle=_am("incident_angle"),
-            sample_circles=tuple(d.get("sample_circles", ("z-", "y+", "z-"))),
-            detector_circles=tuple(d.get("detector_circles", ("z-",))),
+            sample_circles=tuple(d.get("sample_circles",
+                                       ("x+", "z-", "y+", "z-"))),
+            detector_circles=tuple(d.get("detector_circles", ("x+", "z-"))),
             r_i=tuple(d.get("r_i", (0.0, 1.0, 0.0))),
-            camera=tuple(d.get("camera", ("z-", "x+"))),
+            camera=tuple(d.get("camera", ("z-", "x-"))),
             hxrd_n=tuple(d.get("hxrd_n", (0.0, 1.0, 0.0))),
-            hxrd_q=tuple(d.get("hxrd_q", (1.0, 0.0, 0.0))),
+            hxrd_q=tuple(d.get("hxrd_q", (0.0, 0.0, 1.0))),
             hxrd_geometry=d.get("hxrd_geometry", "real"),
             circle_motors=tuple(
                 AngleMapping(**cm) for cm in d.get("circle_motors", ())

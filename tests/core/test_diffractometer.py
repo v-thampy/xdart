@@ -83,20 +83,31 @@ class TestPresets:
         assert d.sample_motors == g.sample_motors
 
     def test_psic_xu_half_is_validated_stack(self):
-        # The SSRL Pilatus-300k-w psic arm (xu_geometry_del_nu.json).
+        # The production RSM psic values (RSM_process.ipynb).
         d = Diffractometer.psic()
         assert d.sample_circles == ("x+", "z-", "y+", "z-")
         assert d.detector_circles == ("x+", "z-")
-        assert d.camera == ("x-", "z+")
+        assert d.camera == ("z-", "x-")
+        assert d.hxrd_n == (0.0, 1.0, 0.0)
+        assert d.hxrd_q == (0.0, 0.0, 1.0)
+
+    def test_default_is_psic_oriented(self):
+        # a bare Diffractometer() is psic-oriented (the house default); the
+        # motors are unwired until a preset is applied.
+        d = Diffractometer()
+        assert d.sample_circles == ("x+", "z-", "y+", "z-")
+        assert d.detector_circles == ("x+", "z-")
+        assert d.camera == ("z-", "x-")
+        assert d.rot1.is_active is False  # orientation only, no motor wiring
 
     # design-validated golden xu stacks — a swapped/garbage stack must fail,
     # not pass vacuously (the order-blind set check alone cannot catch that).
     _GOLDEN_XU = {
         "two_circle": (("z-",), ("z-",), ("z-", "x+")),
         "fourc": (("z-", "y+", "z-"), ("z-",), ("z-", "x+")),
-        "psic": (("x+", "z-", "y+", "z-"), ("x+", "z-"), ("x-", "z+")),
-        "sixc": (("x+", "z-", "y+", "z-"), ("x+", "z-"), ("x-", "z+")),
-        "psic_halpha": (("x+", "z-", "y+", "z-"), ("x+", "z-"), ("x-", "z+")),
+        "psic": (("x+", "z-", "y+", "z-"), ("x+", "z-"), ("z-", "x-")),
+        "sixc": (("x+", "z-", "y+", "z-"), ("x+", "z-"), ("z-", "x-")),
+        "psic_halpha": (("x+", "z-", "y+", "z-"), ("x+", "z-"), ("z-", "x-")),
     }
 
     @pytest.mark.parametrize("preset", _ALL_PRESETS)
@@ -306,9 +317,11 @@ class TestXuAdapters:
             sample_rot=sample, detector_rot=detector, r_i=r_i,
             init_area_detrot=camera[0], init_area_tiltazimuth=camera[1],
         )
+        # match the legacy config's HXRD defaults so the only thing under test
+        # is the adapter, not a default mismatch
         diff = Diffractometer(
             sample_circles=sample, detector_circles=detector, r_i=r_i,
-            camera=camera,
+            camera=camera, hxrd_n=cfg.hxrd_n, hxrd_q=cfg.hxrd_q,
         )
 
         energy = 17000.0
@@ -506,7 +519,7 @@ class TestFromPyfaiGoniometer:
             _GONIO_V1, source_motors="del", base=Diffractometer.psic())
         # the gonio JSON has no xu info; it comes from the base preset
         assert d.sample_circles == ("x+", "z-", "y+", "z-")
-        assert d.camera == ("x-", "z+")
+        assert d.camera == ("z-", "x-")
         assert "del" in d.detector_motors
 
     def test_image_orientation_threaded(self):
@@ -614,10 +627,11 @@ class TestSerializationRobustness:
         assert DetectorCalibration.from_json(cal.to_json()) == cal
 
     def test_partial_json_uses_canonical_defaults(self):
-        # a blob missing the xu circle stacks reconstructs the dataclass defaults
+        # a blob missing the xu circle stacks reconstructs the dataclass
+        # defaults (the psic orientation)
         d = Diffractometer.from_json(json.dumps({"preset": "custom"}))
-        assert d.sample_circles == ("z-", "y+", "z-")
-        assert d.detector_circles == ("z-",)
+        assert d.sample_circles == ("x+", "z-", "y+", "z-")
+        assert d.detector_circles == ("x+", "z-")
         assert d == Diffractometer()
 
 
