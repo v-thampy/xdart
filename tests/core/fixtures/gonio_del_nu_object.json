@@ -1,0 +1,58 @@
+{
+  "content": "Goniometer calibration v2",
+  "detector": "Pilatus 300kw",
+  "detector_config": {
+    "orientation": 3
+  },
+  "wavelength": 7.292933454541047e-11,
+  "param": [
+    0.38919623829929645,
+    0.06736199826756004,
+    0.06360523894588814,
+    0.025224135006794105,
+    0.017236948588537637,
+    -0.1462515601822692,
+    0.016811064480795893,
+    7.45058061058228e-12
+  ],
+  "param_names": [
+    "dist",
+    "poni1",
+    "poni2",
+    "rot1_offset",
+    "rot1_scale",
+    "rot2_offset",
+    "rot2_scale",
+    "rot3_offset"
+  ],
+  "pos_names": [
+    "del_value",
+    "nu_value"
+  ],
+  "trans_function": {
+    "content": "GeometryTransformation",
+    "param_names": [
+      "dist",
+      "poni1",
+      "poni2",
+      "rot1_offset",
+      "rot1_scale",
+      "rot2_offset",
+      "rot2_scale",
+      "rot3_offset"
+    ],
+    "pos_names": [
+      "del_value",
+      "nu_value"
+    ],
+    "dist_expr": "dist",
+    "poni1_expr": "poni1",
+    "poni2_expr": "poni2",
+    "rot1_expr": "rot1_scale * nu_value + rot1_offset",
+    "rot2_expr": "rot2_scale * del_value + rot2_offset",
+    "rot3_expr": "rot3_offset",
+    "constants": {
+      "pi": 3.141592653589793
+    }
+  }
+}

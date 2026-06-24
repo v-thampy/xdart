@@ -33,6 +33,7 @@ from xrd_tools.core.geometry import (
 _FIXTURES = Path(__file__).parent / "fixtures"
 _GONIO_V1 = _FIXTURES / "gonio_robl_v1.json"   # del-only, rot2 pos-linear
 _GONIO_V2 = _FIXTURES / "gonio_robl_v2.json"   # del-only, rot1 AND rot2 pos-linear
+_GONIO_DELNU = _FIXTURES / "gonio_del_nu_object.json"  # real del/nu (rot1<-nu, rot2<-del)
 
 
 # Presets that have an exact legacy ``DiffractometerGeometry`` counterpart —
@@ -524,6 +525,25 @@ class TestFromPyfaiGoniometer:
                 assert d.calibration.poni.dist == pytest.approx(ai.dist)
                 assert d.calibration.poni.poni1 == pytest.approx(ai.poni1)
                 assert d.calibration.poni.poni2 == pytest.approx(ai.poni2)
+
+    def test_real_del_nu_two_axis(self):
+        """Real two-position (del, nu) goniometer: rot1<-nu, rot2<-del,
+        axis-separable — reproduces pyFAI get_ai at arbitrary (del, nu)."""
+        gonio = pytest.importorskip("pyFAI.goniometer")
+        g = gonio.Goniometer.sload(str(_GONIO_DELNU))
+        d = Diffractometer.from_pyfai_goniometer(
+            _GONIO_DELNU, source_motors={"del_value": "del", "nu_value": "nu"},
+            base=Diffractometer.psic())
+        assert d.rot1.source_motor == "nu" and d.rot1.is_active
+        assert d.rot2.source_motor == "del" and d.rot2.is_active
+        cal = d.calibration
+        for de, nu in [(6.0, 0.0), (20.0, 5.0), (45.0, 29.0)]:
+            ai = g.get_ai((de, nu))
+            pf = d.to_pyfai_per_frame({"del": np.array([de]), "nu": np.array([nu])})
+            got = (cal.poni.rot1 + pf["rot1"][0], cal.poni.rot2 + pf["rot2"][0],
+                   cal.poni.rot3 + pf["rot3"][0])
+            np.testing.assert_allclose(
+                got, (ai.rot1, ai.rot2, ai.rot3), rtol=0, atol=1e-12)
 
     def test_xu_half_donated_from_base(self):
         d = Diffractometer.from_pyfai_goniometer(
