@@ -786,6 +786,82 @@ class Diffractometer:
         )
 
     # ------------------------------------------------------------------
+    # Legacy interop — lift / lower the two old encodings (compat shims)
+    # ------------------------------------------------------------------
+    #
+    # The two old classes stay authoritative for one release; these bridges
+    # let a consumer build the canonical object from whatever it holds today
+    # (``Scan.geometry`` = a ``DiffractometerGeometry``; RSM config = a
+    # ``DiffractometerConfig``) and extract the old view back out, all
+    # value-preserving so step 4 can repoint callers without behaviour change.
+
+    @classmethod
+    def from_diffractometer_geometry(
+        cls, geom: "DiffractometerGeometry", **overrides: Any
+    ) -> "Diffractometer":
+        """Lift a legacy ``DiffractometerGeometry`` (pyFAI per-frame view).
+
+        Copies the pyFAI half verbatim; the xu half stays at defaults unless
+        supplied via ``overrides`` (or later donated from a config/preset).
+        """
+        fields: dict[str, Any] = dict(
+            preset=geom.convention,
+            rot1=geom.rot1, rot2=geom.rot2, rot3=geom.rot3,
+            incident_angle=geom.incident_angle,
+            sample_motors=geom.sample_motors,
+            detector_motors=geom.detector_motors,
+        )
+        fields.update(overrides)
+        return cls(**fields)
+
+    def to_diffractometer_geometry(self) -> "DiffractometerGeometry":
+        """Lower to the legacy pyFAI per-frame view (byte-equal mappings)."""
+        conv = (self.preset
+                if self.preset in ("two_circle", "psic", "psic_halpha", "custom")
+                else "custom")
+        return DiffractometerGeometry(
+            convention=conv,  # type: ignore[arg-type]
+            rot1=self.rot1, rot2=self.rot2, rot3=self.rot3,
+            incident_angle=self.incident_angle,
+            sample_motors=self.sample_motors,
+            detector_motors=self.detector_motors,
+        )
+
+    @classmethod
+    def from_diffractometer_config(
+        cls, config: "DiffractometerConfig", **overrides: Any
+    ) -> "Diffractometer":
+        """Lift a legacy ``DiffractometerConfig`` (xrayutilities view)."""
+        fields: dict[str, Any] = dict(
+            sample_circles=config.sample_rot,
+            detector_circles=config.detector_rot,
+            r_i=config.r_i,
+            camera=(config.init_area_detrot, config.init_area_tiltazimuth),
+            hxrd_n=config.hxrd_n, hxrd_q=config.hxrd_q,
+            hxrd_geometry=config.hxrd_geometry,
+            qconv_kwargs=dict(config.q_conv_kwargs),
+            hxrd_kwargs=dict(config.hxrd_kwargs),
+            ang2q_kwargs=dict(config.ang2q_kwargs),
+        )
+        fields.update(overrides)
+        return cls(**fields)
+
+    def to_diffractometer_config(self) -> "DiffractometerConfig":
+        """Lower to the legacy xrayutilities view (byte-equal QConversion)."""
+        return DiffractometerConfig(
+            sample_rot=self.sample_circles,
+            detector_rot=self.detector_circles,
+            r_i=self.r_i,
+            q_conv_kwargs=dict(self.qconv_kwargs),
+            hxrd_n=self.hxrd_n, hxrd_q=self.hxrd_q,
+            hxrd_geometry=self.hxrd_geometry,
+            hxrd_kwargs=dict(self.hxrd_kwargs),
+            init_area_detrot=self.camera[0],
+            init_area_tiltazimuth=self.camera[1],
+            ang2q_kwargs=dict(self.ang2q_kwargs),
+        )
+
+    # ------------------------------------------------------------------
     # Adapter view 1 — pyFAI per-frame (== DiffractometerGeometry)
     # ------------------------------------------------------------------
 

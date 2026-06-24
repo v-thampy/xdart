@@ -526,3 +526,76 @@ class TestFromPyfaiGoniometer:
         }
         with pytest.raises(NotImplementedError, match="non-linear"):
             Diffractometer.from_pyfai_goniometer(gonio, source_motors="del")
+
+
+# ---------------------------------------------------------------------------
+# Legacy interop bridges (step 2 — lift/lower, value-preserving)
+# ---------------------------------------------------------------------------
+
+class TestLegacyInterop:
+    @pytest.mark.parametrize("preset", _LEGACY_PARITY_PRESETS)
+    def test_geometry_lift_lower_roundtrip(self, preset):
+        g = getattr(DiffractometerGeometry, preset)()
+        d = Diffractometer.from_diffractometer_geometry(g)
+        assert d.to_diffractometer_geometry() == g
+
+    @pytest.mark.parametrize("preset", _LEGACY_PARITY_PRESETS)
+    def test_lifted_geometry_derive_is_byte_equal(self, preset):
+        g = getattr(DiffractometerGeometry, preset)()
+        d = Diffractometer.from_diffractometer_geometry(g)
+        motors = {
+            "tth": np.array([10.0, 20.0]), "th": np.array([1.0, 2.0]),
+            "nu": np.array([2.0, 4.0]), "del": np.array([15.0, 30.0]),
+            "eta": np.array([0.5, 0.5]), "halpha": np.array([3.0, 3.0]),
+        }
+        need = {m: motors[m] for m in g.all_referenced_motors() if m in motors}
+        out_new = d.to_pyfai_per_frame(need)
+        out_old = g.derive_per_frame(need)
+        for k in out_old:
+            np.testing.assert_array_equal(out_new[k], out_old[k])
+
+    def test_config_lift_lower_roundtrip(self):
+        c = DiffractometerConfig(
+            sample_rot=("x+", "z-", "y+", "z-"),
+            detector_rot=("x+", "z-"),
+            init_area_detrot="x-", init_area_tiltazimuth="z+",
+            q_conv_kwargs={"wl": 1.2}, ang2q_kwargs={"foo": "bar"},
+        )
+        d = Diffractometer.from_diffractometer_config(c)
+        assert d.to_diffractometer_config() == c
+
+    def test_lifted_config_qconversion_is_byte_equal(self):
+        pytest.importorskip("xrayutilities")
+        c = DiffractometerConfig(
+            sample_rot=("x+", "z-", "y+", "z-"),
+            detector_rot=("x+", "z-"),
+            init_area_detrot="x-", init_area_tiltazimuth="z+",
+        )
+        d = Diffractometer.from_diffractometer_config(c)
+        angles = [np.array([0.0, 0.0]), np.array([1.0, 2.0]),
+                  np.array([0.0, 0.0]), np.array([0.0, 0.0]),
+                  np.array([5.0, 6.0]), np.array([10.0, 12.0])]
+
+        def run(builder):
+            hxrd = builder(17000.0)
+            hxrd.Ang2Q.init_area(c.init_area_detrot, c.init_area_tiltazimuth,
+                                 cch1=100.0, cch2=200.0, pwidth1=0.172,
+                                 pwidth2=0.172, distance=390.0,
+                                 Nch1=40, Nch2=50)
+            return hxrd.Ang2Q.area(*angles)
+
+        for a, b in zip(run(c.make_hxrd), run(d.to_hxrd)):
+            np.testing.assert_array_equal(a, b)
+
+    def test_lift_with_overrides_donates_xu_half(self):
+        # a writer holds a DiffractometerGeometry (pyFAI half only); donate the
+        # xu half from a config so the lifted object also feeds RSM.
+        g = DiffractometerGeometry.psic()
+        c = DiffractometerConfig(sample_rot=("x+", "z-", "y+", "z-"),
+                                 detector_rot=("x+", "z-"))
+        donor = Diffractometer.from_diffractometer_config(c)
+        d = Diffractometer.from_diffractometer_geometry(
+            g, sample_circles=donor.sample_circles,
+            detector_circles=donor.detector_circles, camera=donor.camera)
+        assert d.rot1 == g.rot1 and d.rot2 == g.rot2
+        assert d.sample_circles == ("x+", "z-", "y+", "z-")
