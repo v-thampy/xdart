@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Mapping, Sequence
 
 import numpy as np
+
+from xrd_tools.core.containers import PONI
 
 if TYPE_CHECKING:  # Only needed for type checkers; avoided at runtime.
     import xrayutilities as xu
@@ -251,6 +254,168 @@ class DiffractometerGeometry:
 
 
 # ---------------------------------------------------------------------------
+# Detector calibration (static, per-scan) — PONI + Detector_config + mount
+# ---------------------------------------------------------------------------
+#
+# ``PONI`` (core/containers) carries the pyFAI calibration geometry but DROPS
+# ``Detector_config`` (a non-default orientation / custom mask / binning is
+# silently lost — stitching GAP B) and has no notion of the beamline-specific
+# image-array orientation needed to match the raw detector frame to the
+# calibration (GAP E).  ``DetectorCalibration`` wraps a ``PONI`` and restores
+# both.  It is *static detector calibration*, NOT goniometer state — the
+# per-frame rotations live on ``Diffractometer`` (design §3.2).
+
+
+@dataclass(frozen=True)
+class ImageOrientation:
+    """Beamline-specific transform mapping a raw detector array to the
+    orientation the calibration was computed in (stitching GAP E).
+
+    The detector's pyFAI ``Detector_config`` orientation alone is *not*
+    sufficient (the validated psic case needed a 180° array rotation on top
+    of ``orientation 3``).  Applied to the trailing two axes so a single 2D
+    frame ``(H, W)`` or a stack ``(N, H, W)`` both work.  A 90°/270° rotation
+    or a transpose swaps the detector dimensions (:attr:`swaps_axes`).
+    """
+
+    rotation: int = 0          # CCW degrees, one of {0, 90, 180, 270}
+    flip_vertical: bool = False
+    flip_horizontal: bool = False
+    transpose: bool = False
+
+    def __post_init__(self) -> None:
+        if self.rotation not in (0, 90, 180, 270):
+            raise ValueError(
+                f"rotation must be one of 0/90/180/270, got {self.rotation!r}"
+            )
+
+    @property
+    def is_identity(self) -> bool:
+        return (self.rotation == 0 and not self.flip_vertical
+                and not self.flip_horizontal and not self.transpose)
+
+    @property
+    def swaps_axes(self) -> bool:
+        """True if the transform swaps the detector's two dimensions."""
+        return (self.rotation in (90, 270)) ^ self.transpose
+
+    def apply(self, image: "np.ndarray") -> np.ndarray:
+        """Apply the transform to the trailing two axes of ``image``."""
+        out = np.asarray(image)
+        if self.transpose:
+            out = np.swapaxes(out, -1, -2)
+        if self.rotation:
+            out = np.rot90(out, k=self.rotation // 90, axes=(-2, -1))
+        if self.flip_vertical:
+            out = out[..., ::-1, :]
+        if self.flip_horizontal:
+            out = out[..., :, ::-1]
+        return np.ascontiguousarray(out)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> "ImageOrientation":
+        return cls(
+            rotation=int(d.get("rotation", 0)),
+            flip_vertical=bool(d.get("flip_vertical", False)),
+            flip_horizontal=bool(d.get("flip_horizontal", False)),
+            transpose=bool(d.get("transpose", False)),
+        )
+
+
+@dataclass(frozen=True)
+class DetectorCalibration:
+    """Static detector calibration: a ``PONI`` + ``Detector_config`` + mount.
+
+    Restores the two things a bare ``PONI`` drops:
+
+    * ``detector_config`` — the pyFAI ``Detector_config`` dict
+      (``{"orientation": N}``, custom mask, binning) so a non-default mount
+      survives a round-trip (GAP B).
+    * ``image_orientation`` — the raw-array transform that aligns the
+      detector frame to the calibration (GAP E).
+
+    The pyFAI 90° panel mount and the xu camera orientation are the *same*
+    physics in two conventions; the mount is held once here (the pyFAI
+    ``detector_config``) and once on :class:`Diffractometer` (the xu
+    ``camera`` tuple) — both populated by the preset/fit, not derived from
+    each other (the correspondence is fit-determined, design §3.5).
+    """
+
+    poni: PONI
+    detector_config: Mapping[str, Any] = field(default_factory=dict)
+    image_orientation: ImageOrientation = field(default_factory=ImageOrientation)
+
+    def to_json(self) -> str:
+        return json.dumps(self._as_jsonable(), separators=(",", ":"),
+                          sort_keys=True)
+
+    def _as_jsonable(self) -> dict[str, Any]:
+        return {
+            "poni": self.poni.to_dict(),
+            "detector_config": dict(self.detector_config),
+            "image_orientation": self.image_orientation.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> "DetectorCalibration":
+        return cls(
+            poni=PONI.from_dict(d.get("poni", {})),
+            detector_config=dict(d.get("detector_config", {})),
+            image_orientation=ImageOrientation.from_dict(
+                d.get("image_orientation", {})),
+        )
+
+    @classmethod
+    def from_json(cls, s: str) -> "DetectorCalibration":
+        return cls.from_dict(json.loads(s))
+
+
+_DEG2RAD = float(np.deg2rad(1.0))
+
+
+def _eval_geometry_expr(expr: str, variables: Mapping[str, Any]) -> float:
+    """Safely evaluate one pyFAI ``GeometryTransformation`` expression.
+
+    The expressions (``"rot2_scale * pos + rot2_offset"``, ``"0.0"``, …) are
+    pure arithmetic, so they are evaluated with ``numexpr`` (arithmetic-only,
+    no arbitrary code — unlike ``eval`` on file-sourced strings) with an empty
+    global scope.
+    """
+    import numexpr  # noqa: PLC0415 — lazy; only needed by the gonio bridge
+
+    return float(numexpr.evaluate(str(expr), local_dict=dict(variables),
+                                  global_dict={}))
+
+
+def _resolve_source_motors(
+    pos_names: Sequence[str],
+    source_motors: "str | Sequence[str] | Mapping[str, str] | None",
+) -> dict[str, str]:
+    """Map each goniometer position axis name to a real scan motor column."""
+    if source_motors is None:
+        return {n: n for n in pos_names}
+    if isinstance(source_motors, str):
+        if len(pos_names) != 1:
+            raise ValueError(
+                f"a single source_motors string needs exactly one position "
+                f"axis, but the goniometer has {pos_names}"
+            )
+        return {pos_names[0]: source_motors}
+    if isinstance(source_motors, Mapping):
+        return {n: str(source_motors.get(n, n)) for n in pos_names}
+    seq = list(source_motors)
+    if len(seq) != len(pos_names):
+        raise ValueError(
+            f"source_motors has {len(seq)} entries for {len(pos_names)} "
+            f"position axes {pos_names}"
+        )
+    return {n: str(m) for n, m in zip(pos_names, seq)}
+
+
+# ---------------------------------------------------------------------------
 # Canonical Diffractometer (one description, two derived adapter views)
 # ---------------------------------------------------------------------------
 #
@@ -333,6 +498,12 @@ class Diffractometer:
     qconv_kwargs: Mapping[str, Any] = field(default_factory=dict)
     hxrd_kwargs: Mapping[str, Any] = field(default_factory=dict)
     ang2q_kwargs: Mapping[str, Any] = field(default_factory=dict)
+
+    # --- static detector calibration (None until calibrated/fitted) ---------
+    #: the base ``DetectorCalibration`` (dist/poni/rot + Detector_config +
+    #: image mount).  Per-frame full geometry = this base ⊕
+    #: :meth:`to_pyfai_per_frame`.  ``None`` for a bare preset.
+    calibration: "DetectorCalibration | None" = None
 
     # ------------------------------------------------------------------
     # Presets — author BOTH halves consistently
@@ -438,6 +609,180 @@ class Diffractometer:
                 AngleMapping(source_motor=chi), AngleMapping(source_motor=phi),
                 AngleMapping(source_motor=nu), AngleMapping(source_motor=del_),
             ),
+        )
+
+    # ------------------------------------------------------------------
+    # Bridge — load a pyFAI GoniometerRefinement calibration (closes GAP D)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_pyfai_goniometer(
+        cls,
+        gonio: "Mapping[str, Any] | str | Path",
+        *,
+        source_motors: "str | Sequence[str] | Mapping[str, str] | None" = None,
+        base: "Diffractometer | None" = None,
+        image_orientation: "ImageOrientation | None" = None,
+        preset: str = "fitted",
+    ) -> "Diffractometer":
+        """Build a *fitted* :class:`Diffractometer` from a pyFAI goniometer JSON.
+
+        Parses a standard pyFAI ``GoniometerRefinement`` serialization (the
+        ``trans_function`` ``GeometryTransformation`` with ``rotN_expr``
+        strings) into per-axis :class:`AngleMapping`\\s + a base
+        :class:`DetectorCalibration` (incl. ``Detector_config``) — so a
+        beamline can calibrate in pyFAI and stitch/RSM headlessly with no
+        pyFAI ``Goniometer`` at runtime (design §3.2a, closes stitching GAP D).
+
+        Decomposition (each ``rotN_expr`` is linear in the position axes):
+
+        * a **constant** rotation (no position dependence, e.g. ``rot1_expr =
+          "rot1"`` or ``rot3_expr = "0.0"``) → the base ``PONI.rotN`` (radians),
+          an **inactive** :class:`AngleMapping`.
+        * a **position-linear** rotation (``rotN = scale·pos + offset``) → an
+          :class:`AngleMapping` carrying the *whole* rotation
+          (``sign = scale/deg2rad``, ``offset = offset_rad/deg2rad`` — both in
+          degrees, since :meth:`to_pyfai_per_frame` folds ``deg2rad`` back in),
+          with the base ``PONI.rotN = 0``.
+
+        So per-frame ``rotN = calibration.poni.rotN +
+        to_pyfai_per_frame(motors)[rotN]`` reproduces pyFAI ``get_ai(pos).rotN``.
+
+        Parameters
+        ----------
+        gonio : Mapping, path, or JSON string
+            The goniometer record.
+        source_motors : str / sequence / mapping, optional
+            Maps each goniometer position axis (``trans_function.pos_names``,
+            generically ``"pos"``) to a real scan motor column (e.g. ``"del"``).
+            Defaults to the position-axis names verbatim.
+        base : Diffractometer, optional
+            Donates the xrayutilities half (circle stacks, ``camera``, HXRD
+            refs, motor lists) — the gonio JSON carries only the pyFAI side.
+            Pass e.g. ``Diffractometer.psic()`` so the result also feeds RSM.
+        image_orientation : ImageOrientation, optional
+            The raw-array mount transform (GAP E); not in the pyFAI JSON.
+        preset : str
+            Recorded tag (default ``"fitted"``).
+
+        Raises
+        ------
+        NotImplementedError
+            For custom goniometer subclasses (no ``trans_function`` /
+            ``ExtendedTransformation`` / non-linear position dependence).
+        """
+        if isinstance(gonio, Mapping):
+            data: dict[str, Any] = dict(gonio)
+        else:
+            p = Path(gonio)
+            text = p.read_text() if p.exists() else str(gonio)
+            data = json.loads(text)
+
+        trans = data.get("trans_function")
+        if trans is None:
+            raise NotImplementedError(
+                f"{data.get('content')!r} is not a standard pyFAI "
+                "GeometryTransformation (no 'trans_function'); custom "
+                "goniometer subclasses (StackedArmGoniometer / "
+                "GeometrySurfaceModel / ...) are out of scope"
+            )
+        tcontent = trans.get("content", "GeometryTransformation")
+        if tcontent not in ("GeometryTransformation", "GeometryTranslation"):
+            raise NotImplementedError(
+                f"transformation {tcontent!r} is unsupported "
+                "(only GeometryTransformation)"
+            )
+
+        param_names = list(data.get("param_names", []))
+        param = list(data.get("param", []))
+        params = dict(zip(param_names, param))
+        pos_names = list(trans.get("pos_names",
+                                   data.get("pos_names", ["pos"])))
+        constants = dict(trans.get("constants", {}))
+        local_base = {**constants, **params}
+        motor_for = _resolve_source_motors(pos_names, source_motors)
+
+        pos_zero = {n: 0.0 for n in pos_names}
+
+        def _ev(expr: str, posvals: Mapping[str, float]) -> float:
+            return _eval_geometry_expr(expr, {**local_base, **posvals})
+
+        # Base geometry (constant for a standard GeometryTransformation).
+        dist = _ev(trans["dist_expr"], pos_zero)
+        poni1 = _ev(trans["poni1_expr"], pos_zero)
+        poni2 = _ev(trans["poni2_expr"], pos_zero)
+
+        rot_mappings: dict[str, AngleMapping] = {}
+        base_rots: dict[str, float] = {}
+        for axis in ("rot1", "rot2", "rot3"):
+            expr = trans[f"{axis}_expr"]
+            f0 = _ev(expr, pos_zero)
+            scales = []
+            for name in pos_names:
+                f1 = _ev(expr, {**pos_zero, name: 1.0})
+                f2 = _ev(expr, {**pos_zero, name: 2.0})
+                if abs((f2 - f1) - (f1 - f0)) > 1e-12 * (1 + abs(f1)):
+                    raise NotImplementedError(
+                        f"{axis}_expr is non-linear in {name!r}; only linear "
+                        "goniometer transformations are supported"
+                    )
+                scales.append(f1 - f0)
+            nz = [i for i, s in enumerate(scales) if abs(s) > 1e-15]
+            if not nz:
+                base_rots[axis] = f0           # constant → base PONI
+                rot_mappings[axis] = AngleMapping()
+            elif len(nz) == 1:
+                i = nz[0]
+                base_rots[axis] = 0.0           # whole rotation in the mapping
+                rot_mappings[axis] = AngleMapping(
+                    source_motor=motor_for[pos_names[i]],
+                    sign=scales[i] / _DEG2RAD,
+                    offset=f0 / _DEG2RAD,
+                )
+            else:
+                raise NotImplementedError(
+                    f"{axis}_expr depends on multiple position axes; "
+                    "custom/surface goniometers are out of scope"
+                )
+
+        cal = DetectorCalibration(
+            poni=PONI(
+                dist=dist, poni1=poni1, poni2=poni2,
+                rot1=base_rots["rot1"], rot2=base_rots["rot2"],
+                rot3=base_rots["rot3"],
+                wavelength=float(data.get("wavelength", 0.0)),
+                detector=str(data.get("detector", "")),
+            ),
+            detector_config=dict(data.get("detector_config", {})),
+            image_orientation=image_orientation or ImageOrientation(),
+        )
+
+        # The xu half is not in the pyFAI JSON — donate it from ``base``.
+        xu_fields: dict[str, Any] = {}
+        if base is not None:
+            xu_fields = dict(
+                sample_circles=base.sample_circles,
+                detector_circles=base.detector_circles,
+                r_i=base.r_i, camera=base.camera,
+                hxrd_n=base.hxrd_n, hxrd_q=base.hxrd_q,
+                hxrd_geometry=base.hxrd_geometry,
+                circle_motors=base.circle_motors,
+                sample_motors=base.sample_motors,
+                detector_motors=base.detector_motors,
+            )
+        else:
+            xu_fields = dict(
+                detector_motors=tuple(motor_for[n] for n in pos_names),
+            )
+
+        return cls(
+            preset=preset,
+            rot1=rot_mappings["rot1"],
+            rot2=rot_mappings["rot2"],
+            rot3=rot_mappings["rot3"],
+            incident_angle=AngleMapping(),  # pyFAI gonios carry no GI incidence
+            calibration=cal,
+            **xu_fields,
         )
 
     # ------------------------------------------------------------------
@@ -576,13 +921,19 @@ class Diffractometer:
             qconv_kwargs=dict(d.get("qconv_kwargs", {})),
             hxrd_kwargs=dict(d.get("hxrd_kwargs", {})),
             ang2q_kwargs=dict(d.get("ang2q_kwargs", {})),
+            calibration=(
+                DetectorCalibration.from_dict(d["calibration"])
+                if d.get("calibration") is not None else None
+            ),
         )
 
 
 __all__ = [
     "AngleMapping",
     "Convention",
+    "DetectorCalibration",
     "Diffractometer",
     "DiffractometerConfig",
     "DiffractometerGeometry",
+    "ImageOrientation",
 ]

@@ -15,16 +15,24 @@ exactly so the step-2 compat shims are trivial.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from xrd_tools.core.containers import PONI
 from xrd_tools.core.geometry import (
     AngleMapping,
+    DetectorCalibration,
     Diffractometer,
     DiffractometerConfig,
     DiffractometerGeometry,
+    ImageOrientation,
 )
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+_GONIO_V1 = _FIXTURES / "gonio_robl_v1.json"   # del-only, rot2 pos-linear
+_GONIO_V2 = _FIXTURES / "gonio_robl_v2.json"   # del-only, rot1 AND rot2 pos-linear
 
 
 # Presets that have an exact legacy ``DiffractometerGeometry`` counterpart —
@@ -308,3 +316,213 @@ class TestXuAdapters:
         np.testing.assert_array_equal(qx0, qx1)
         np.testing.assert_array_equal(qy0, qy1)
         np.testing.assert_array_equal(qz0, qz1)
+
+
+# ---------------------------------------------------------------------------
+# ImageOrientation (GAP E — raw-array mount transform)
+# ---------------------------------------------------------------------------
+
+class TestImageOrientation:
+    def test_identity(self):
+        o = ImageOrientation()
+        assert o.is_identity
+        assert not o.swaps_axes
+        img = np.arange(6).reshape(2, 3)
+        np.testing.assert_array_equal(o.apply(img), img)
+
+    def test_rejects_bad_rotation(self):
+        with pytest.raises(ValueError, match="0/90/180/270"):
+            ImageOrientation(rotation=45)
+
+    def test_180_rotation(self):
+        o = ImageOrientation(rotation=180)
+        img = np.arange(6).reshape(2, 3)
+        np.testing.assert_array_equal(o.apply(img), img[::-1, ::-1])
+        assert not o.swaps_axes
+
+    def test_90_swaps_axes(self):
+        o = ImageOrientation(rotation=90)
+        assert o.swaps_axes
+        img = np.arange(6).reshape(2, 3)  # (2,3) -> (3,2)
+        assert o.apply(img).shape == (3, 2)
+
+    def test_transpose_xor_rotation_swaps(self):
+        # transpose + 90 cancel back to no swap
+        assert not ImageOrientation(rotation=90, transpose=True).swaps_axes
+        assert ImageOrientation(transpose=True).swaps_axes
+
+    def test_applies_to_trailing_axes_of_stack(self):
+        o = ImageOrientation(rotation=180)
+        stack = np.arange(2 * 2 * 3).reshape(2, 2, 3)
+        out = o.apply(stack)
+        assert out.shape == (2, 2, 3)
+        np.testing.assert_array_equal(out[0], stack[0, ::-1, ::-1])
+
+    def test_dict_roundtrip(self):
+        o = ImageOrientation(rotation=270, flip_vertical=True, transpose=True)
+        assert ImageOrientation.from_dict(o.to_dict()) == o
+
+
+# ---------------------------------------------------------------------------
+# DetectorCalibration (PONI + Detector_config + mount)
+# ---------------------------------------------------------------------------
+
+class TestDetectorCalibration:
+    def test_carries_detector_config_and_mount(self):
+        cal = DetectorCalibration(
+            poni=PONI(dist=0.39, poni1=0.03, poni2=0.05, rot1=0.002,
+                      wavelength=7.7e-11, detector="Pilatus300kw"),
+            detector_config={"orientation": 3},
+            image_orientation=ImageOrientation(rotation=180),
+        )
+        assert cal.detector_config["orientation"] == 3
+        assert cal.image_orientation.rotation == 180
+
+    def test_json_roundtrip(self):
+        cal = DetectorCalibration(
+            poni=PONI(dist=0.39, poni1=0.03, poni2=0.05, rot1=0.002,
+                      rot2=0.0, rot3=0.0, wavelength=7.7e-11,
+                      detector="Pilatus300kw"),
+            detector_config={"orientation": 3},
+            image_orientation=ImageOrientation(rotation=180),
+        )
+        cal2 = DetectorCalibration.from_json(cal.to_json())
+        assert cal2.poni == cal.poni
+        assert cal2.detector_config == cal.detector_config
+        assert cal2.image_orientation == cal.image_orientation
+
+
+# ---------------------------------------------------------------------------
+# from_pyfai_goniometer (real-data gate — closes stitching GAP D)
+# ---------------------------------------------------------------------------
+
+def _full_rot(diff: Diffractometer, motor: str, pos: float):
+    """Reconstruct full per-frame pyFAI (rot1, rot2, rot3) at a scalar pos:
+
+    full rotN = base calibration rotN + the per-frame mapping rotN.
+    """
+    pf = diff.to_pyfai_per_frame({motor: np.array([float(pos)])})
+    cal = diff.calibration
+    assert cal is not None
+    return (
+        cal.poni.rot1 + pf["rot1"][0],
+        cal.poni.rot2 + pf["rot2"][0],
+        cal.poni.rot3 + pf["rot3"][0],
+    )
+
+
+class TestFromPyfaiGoniometer:
+    def test_v1_base_calibration(self):
+        d = Diffractometer.from_pyfai_goniometer(
+            _GONIO_V1, source_motors="del", base=Diffractometer.psic())
+        cal = d.calibration
+        assert cal is not None
+        # base poni (constant) from ROBL_v1
+        assert cal.poni.dist == pytest.approx(0.3935276273297399)
+        assert cal.poni.poni1 == pytest.approx(0.03312099826826781)
+        assert cal.poni.poni2 == pytest.approx(0.04978509374677992)
+        # rot1 is a CONSTANT in v1 -> lives on the base poni, mapping inactive
+        assert cal.poni.rot1 == pytest.approx(0.0027275019657882526)
+        assert d.rot1.is_active is False
+        # rot2 is pos-linear -> base rot2 == 0, mapping carries it all
+        assert cal.poni.rot2 == 0.0
+        assert d.rot2.is_active is True
+        assert d.rot2.source_motor == "del"
+        # rot3 == 0 constant -> inactive
+        assert cal.poni.rot3 == 0.0
+        assert d.rot3.is_active is False
+        # wavelength (meters) + detector + Detector_config preserved
+        assert cal.poni.wavelength == pytest.approx(7.748757264459935e-11)
+        assert "Pilatus" in cal.poni.detector
+        assert cal.detector_config.get("orientation") == 3
+
+    def test_v1_recovered_scale_and_offset(self):
+        d = Diffractometer.from_pyfai_goniometer(
+            _GONIO_V1, source_motors="del")
+        # rot2 = deg2rad(sign*del + offset); the fitted scale is ~0.998·deg2rad
+        assert d.rot2.sign == pytest.approx(0.9976885327329215, rel=1e-12)
+        assert d.rot2.offset == pytest.approx(0.4449878175901234, rel=1e-12)
+
+    def test_v1_reproduces_pyfai_rotations(self):
+        d = Diffractometer.from_pyfai_goniometer(
+            _GONIO_V1, source_motors="del", base=Diffractometer.psic())
+        # ground truth from pyFAI Goniometer.get_ai(pos) (radians)
+        expected = {
+            5: (0.0027275019657882526, 0.09483125157611509, 0.0),
+            25: (0.0027275019657882526, 0.4430902476877291, 0.0),
+            45: (0.0027275019657882526, 0.791349243799343, 0.0),
+        }
+        for pos, (r1, r2, r3) in expected.items():
+            got = _full_rot(d, "del", pos)
+            np.testing.assert_allclose(got, (r1, r2, r3), rtol=0, atol=1e-12)
+
+    def test_v2_rot1_also_pos_linear(self):
+        d = Diffractometer.from_pyfai_goniometer(
+            _GONIO_V2, source_motors="del")
+        # in v2 rot1_expr = 'rot1_scale*pos + rot1' -> ACTIVE mapping
+        assert d.rot1.is_active is True
+        assert d.rot1.sign == pytest.approx(-0.008853094908028594, rel=1e-9)
+        assert d.rot1.offset == pytest.approx(0.6567280316039488, rel=1e-9)
+        assert d.calibration.poni.rot1 == 0.0  # whole rotation in the mapping
+
+    def test_cross_check_against_pyfai_goniometer(self):
+        """Strongest gate: reconstruction == pyFAI Goniometer.get_ai per frame."""
+        gonio = pytest.importorskip("pyFAI.goniometer")
+        for path in (_GONIO_V1, _GONIO_V2):
+            g = gonio.Goniometer.sload(str(path))
+            d = Diffractometer.from_pyfai_goniometer(path, source_motors="del")
+            for pos in (3.0, 17.5, 41.0):
+                ai = g.get_ai(pos)
+                got = _full_rot(d, "del", pos)
+                np.testing.assert_allclose(
+                    got, (ai.rot1, ai.rot2, ai.rot3), rtol=0, atol=1e-12)
+                # base geometry matches too
+                assert d.calibration.poni.dist == pytest.approx(ai.dist)
+                assert d.calibration.poni.poni1 == pytest.approx(ai.poni1)
+                assert d.calibration.poni.poni2 == pytest.approx(ai.poni2)
+
+    def test_xu_half_donated_from_base(self):
+        d = Diffractometer.from_pyfai_goniometer(
+            _GONIO_V1, source_motors="del", base=Diffractometer.psic())
+        # the gonio JSON has no xu info; it comes from the base preset
+        assert d.sample_circles == ("x+", "z-", "y+", "z-")
+        assert d.camera == ("x-", "z+")
+        assert "del" in d.detector_motors
+
+    def test_image_orientation_threaded(self):
+        d = Diffractometer.from_pyfai_goniometer(
+            _GONIO_V1, source_motors="del",
+            image_orientation=ImageOrientation(rotation=180))
+        assert d.calibration.image_orientation.rotation == 180
+
+    def test_full_json_roundtrip_with_calibration(self):
+        d = Diffractometer.from_pyfai_goniometer(
+            _GONIO_V1, source_motors="del", base=Diffractometer.psic(),
+            image_orientation=ImageOrientation(rotation=180))
+        d2 = Diffractometer.from_json(d.to_json())
+        assert d2 == d
+
+    def test_custom_subclass_rejected(self):
+        # a record with no trans_function (StackedArmGoniometer etc.)
+        with pytest.raises(NotImplementedError, match="trans_function"):
+            Diffractometer.from_pyfai_goniometer(
+                {"content": "StackedArmGoniometer", "param": [], "param_names": []})
+
+    def test_nonlinear_rejected(self):
+        gonio = {
+            "content": "Goniometer calibration v2",
+            "detector": "Pilatus300kw",
+            "wavelength": 7.7e-11,
+            "param_names": ["dist", "poni1", "poni2", "k"],
+            "param": [0.39, 0.03, 0.05, 0.01],
+            "trans_function": {
+                "content": "GeometryTransformation",
+                "pos_names": ["pos"],
+                "param_names": ["dist", "poni1", "poni2", "k"],
+                "dist_expr": "dist", "poni1_expr": "poni1", "poni2_expr": "poni2",
+                "rot1_expr": "k * pos**2", "rot2_expr": "0.0", "rot3_expr": "0.0",
+                "constants": {"pi": 3.141592653589793},
+            },
+        }
+        with pytest.raises(NotImplementedError, match="non-linear"):
+            Diffractometer.from_pyfai_goniometer(gonio, source_motors="del")
