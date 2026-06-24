@@ -19,6 +19,7 @@ from __future__ import annotations
 from xrd_tools.core.geometry.diffractometer import (
     AngleMapping,
     Convention,
+    Diffractometer,
     DiffractometerConfig,
     DiffractometerGeometry,
 )
@@ -33,6 +34,8 @@ __all__ = [
     "Convention",
     "DiffractometerConfig",
     "DiffractometerGeometry",
+    # Canonical one-object geometry (two derived adapter views)
+    "Diffractometer",
     # Per-pixel q-space (RSM)
     "DetectorHeader",
     "PixelQMap",
