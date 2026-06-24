@@ -98,10 +98,14 @@ class TestRefineGoniometer:
 
         assert res.success
         assert res.rms_q < 0.006              # clean synthetic points
+        assert res.condition_number < 1e8     # well-spanned -> well-conditioned
+        assert res.frozen_scales == ()        # both motors span -> both scales fit
         d = res.diffractometer
         # the correspondence is recovered: rot1<-nu, rot2<-del
         assert d.rot1.source_motor == "nu" and d.rot1.is_active
         assert d.rot2.source_motor == "del" and d.rot2.is_active
+        # rot3 (beam-axis rotation) is pinned at the base, NOT diverged to ~1e9 rad
+        assert abs(d.calibration.poni.rot3) < 1e-3
         # the fitted per-frame geometry tracks the truth (held-out frames)
         held = [(10.0, 2.0), (35.0, 8.0), (45.0, 9.0)]
         assert _max_rot_error(truth, d, held) < 3e-3     # rad (~0.17°)
@@ -109,6 +113,37 @@ class TestRefineGoniometer:
         assert d.calibration is not None
         assert d.calibration.detector_config.get("orientation") == 3
         assert d == Diffractometer.from_json(d.to_json())
+
+    def test_rot3_is_not_fit(self):
+        """rot3 leaves |q| invariant — fitting it free let LM diverge to ~1e9 rad
+        and silently corrupt the azimuth.  It must stay pinned at the base."""
+        pytest.importorskip("pyFAI")
+        from xrd_tools.integrate.refine import refine_goniometer
+        truth = _truth()
+        frames = _synth_control_frames(truth, _FRAMES)
+        res = refine_goniometer(
+            truth.calibration.poni, frames, rot1_motor="nu", rot2_motor="del",
+            detector_config={"orientation": 3}, base=Diffractometer.psic())
+        # base rot3 was ~7e-12; it must not have wandered
+        assert abs(res.diffractometer.calibration.poni.rot3) < 1e-6
+        assert abs(res.params["rot3_offset"]) < 1e-6
+
+    def test_non_spanning_axis_is_flagged_not_catastrophic(self):
+        """A motor that does not span (del fixed) makes its scale unidentifiable;
+        it must be frozen + flagged, never fit to a low-RMS garbage value."""
+        pytest.importorskip("pyFAI")
+        from xrd_tools.integrate.refine import refine_goniometer
+        truth = _truth()
+        # del fixed at 15; only nu varies
+        frames = _synth_control_frames(truth, [(15.0, 0.0), (15.0, 4.0), (15.0, 9.0)])
+        res = refine_goniometer(
+            truth.calibration.poni, frames, rot1_motor="nu", rot2_motor="del",
+            detector_config={"orientation": 3}, base=Diffractometer.psic())
+        assert "del" in res.frozen_scales           # del scale frozen (un-spanned)
+        # the frozen scale is the sane deg2rad, NOT a collapsed garbage value
+        assert res.diffractometer.rot2.sign == pytest.approx(1.0, abs=1e-6)
+        # nu still spans -> its scale is fit and the nu fit is usable
+        assert "nu" not in res.frozen_scales
 
     def test_recovers_motor_zero_offsets(self):
         """The motor-zero offsets are first-class fit params (the missing
@@ -145,3 +180,15 @@ class TestRefineGoniometer:
         cf = ControlFrame(rows=[1, 2], cols=[3, 4], rings=[0, 1],
                           motors={"nu": 0.0, "del": 6.0})
         assert cf.rows.dtype == int and cf.rings.tolist() == [0, 1]
+
+    def test_control_frame_rejects_mismatched_lengths(self):
+        from xrd_tools.integrate.refine import ControlFrame
+        with pytest.raises(ValueError, match="mismatched lengths"):
+            ControlFrame(rows=[1, 2], cols=[3], rings=[0, 1],
+                         motors={"nu": 0.0, "del": 6.0})
+
+    def test_control_frame_rejects_negative_index(self):
+        from xrd_tools.integrate.refine import ControlFrame
+        with pytest.raises(ValueError, match="negative index"):
+            ControlFrame(rows=[1, -2], cols=[3, 4], rings=[0, 1],
+                         motors={"nu": 0.0, "del": 6.0})
