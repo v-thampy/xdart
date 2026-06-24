@@ -89,6 +89,16 @@ class TestPresets:
         assert d.detector_circles == ("x+", "z-")
         assert d.camera == ("x-", "z+")
 
+    # design-validated golden xu stacks — a swapped/garbage stack must fail,
+    # not pass vacuously (the order-blind set check alone cannot catch that).
+    _GOLDEN_XU = {
+        "two_circle": (("z-",), ("z-",), ("z-", "x+")),
+        "fourc": (("z-", "y+", "z-"), ("z-",), ("z-", "x+")),
+        "psic": (("x+", "z-", "y+", "z-"), ("x+", "z-"), ("x-", "z+")),
+        "sixc": (("x+", "z-", "y+", "z-"), ("x+", "z-"), ("x-", "z+")),
+        "psic_halpha": (("x+", "z-", "y+", "z-"), ("x+", "z-"), ("x-", "z+")),
+    }
+
     @pytest.mark.parametrize("preset", _ALL_PRESETS)
     def test_preset_consistency_structural(self, preset):
         """The two derived views must agree on the motor wiring (§5.1).
@@ -98,6 +108,13 @@ class TestPresets:
         """
         d = _build(preset)
         refs = set(d.all_referenced_motors())
+
+        # (0) the xu circle stack + camera are the design-validated literals —
+        # an order-blind membership check alone would pass a swapped stack.
+        sample_g, detector_g, camera_g = self._GOLDEN_XU[preset]
+        assert d.sample_circles == sample_g
+        assert d.detector_circles == detector_g
+        assert d.camera == camera_g
 
         # (1) every active pyFAI detector rotation is driven by a detector motor
         for rot in (d.rot1, d.rot2, d.rot3):
@@ -259,6 +276,9 @@ class TestXuAdapters:
         d = Diffractometer.psic()
         qc = d.to_qconversion()
         assert isinstance(qc, xu.QConversion)
+        # the QConversion really carries the preset's 4 sample + 2 detector axes
+        assert len(qc.sampleAxis) == len(d.sample_circles) == 4
+        assert len(qc.detectorAxis) == len(d.detector_circles) == 2
 
     def test_to_hxrd_builds_instance(self):
         xu = pytest.importorskip("xrayutilities")
@@ -526,6 +546,79 @@ class TestFromPyfaiGoniometer:
         }
         with pytest.raises(NotImplementedError, match="non-linear"):
             Diffractometer.from_pyfai_goniometer(gonio, source_motors="del")
+
+    def _two_pos_gonio(self, *, dist_expr="dist", rot3_expr="0.0"):
+        return {
+            "content": "Goniometer calibration v2",
+            "detector": "Pilatus300kw", "wavelength": 7.7e-11,
+            "param_names": ["dist", "poni1", "poni2", "r2s", "c", "drift"],
+            "param": [0.39, 0.03, 0.05, 0.0174, 0.001, 0.001],
+            "trans_function": {
+                "content": "GeometryTransformation",
+                "pos_names": ["p", "q"],
+                "param_names": ["dist", "poni1", "poni2", "r2s", "c", "drift"],
+                "dist_expr": dist_expr, "poni1_expr": "poni1", "poni2_expr": "poni2",
+                "rot1_expr": "0.0", "rot2_expr": "r2s * p", "rot3_expr": rot3_expr,
+                "constants": {"pi": 3.141592653589793},
+            },
+        }
+
+    def test_cross_term_rejected(self):
+        # a pure bilinear p*q term would otherwise read as constant 0 and be
+        # silently dropped (verified to grow to tens of degrees off-axis).
+        g = self._two_pos_gonio(rot3_expr="c * p * q")
+        with pytest.raises(NotImplementedError, match="cross-term"):
+            Diffractometer.from_pyfai_goniometer(g, source_motors={"p": "nu", "q": "del"})
+
+    def test_moving_base_rejected(self):
+        # a position-dependent dist (moving detector) cannot be frozen at pos=0.
+        g = self._two_pos_gonio(dist_expr="dist + drift * p")
+        with pytest.raises(NotImplementedError, match="dist_expr depends on position"):
+            Diffractometer.from_pyfai_goniometer(g, source_motors={"p": "nu", "q": "del"})
+
+    def test_additive_multi_axis_still_rejected(self):
+        # additive (non-cross) multi-axis dependence is still out of scope, but
+        # must be rejected by the multi-axis branch, not the cross-term one.
+        g = self._two_pos_gonio(rot3_expr="0.01 * p + 0.02 * q")
+        with pytest.raises(NotImplementedError, match="multiple position axes"):
+            Diffractometer.from_pyfai_goniometer(g, source_motors={"p": "nu", "q": "del"})
+
+
+# ---------------------------------------------------------------------------
+# Serialization robustness (review fixes — numpy scalars, tuples, partial JSON)
+# ---------------------------------------------------------------------------
+
+class TestSerializationRobustness:
+    def test_numpy_rotation_coerced(self):
+        o = ImageOrientation(rotation=np.int64(180))
+        assert isinstance(o.rotation, int)
+        assert json.dumps(o.to_dict())  # would raise TypeError on a numpy scalar
+
+    def test_numpy_scalar_in_detector_config_does_not_crash(self):
+        cal = DetectorCalibration(
+            poni=PONI(dist=0.39, poni1=0.0, poni2=0.0),
+            detector_config={"orientation": np.int64(3)},
+            image_orientation=ImageOrientation(rotation=np.int64(180)))
+        # to_json must not raise on the numpy scalar, and must round-trip
+        assert DetectorCalibration.from_json(cal.to_json()) == cal
+        assert cal.detector_config["orientation"] == 3
+
+    def test_tuple_valued_kwargs_roundtrip(self):
+        d = Diffractometer(preset="custom", hxrd_kwargs={"sampleor": ("z+",)})
+        assert d == Diffractometer.from_json(d.to_json())
+
+    def test_tuple_in_detector_config_roundtrip(self):
+        cal = DetectorCalibration(
+            poni=PONI(dist=0.39, poni1=0.0, poni2=0.0),
+            detector_config={"max_shape": (195, 1475)})
+        assert DetectorCalibration.from_json(cal.to_json()) == cal
+
+    def test_partial_json_uses_canonical_defaults(self):
+        # a blob missing the xu circle stacks reconstructs the dataclass defaults
+        d = Diffractometer.from_json(json.dumps({"preset": "custom"}))
+        assert d.sample_circles == ("z-", "y+", "z-")
+        assert d.detector_circles == ("z-",)
+        assert d == Diffractometer()
 
 
 # ---------------------------------------------------------------------------

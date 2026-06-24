@@ -266,6 +266,21 @@ class DiffractometerGeometry:
 # per-frame rotations live on ``Diffractometer`` (design §3.2).
 
 
+def _json_canonical(value: Any) -> Any:
+    """Coerce a value to its JSON-canonical form so ``to_json`` never crashes on
+    a numpy scalar and a serialize→parse round-trip is idempotent (tuples →
+    lists, numpy scalars → Python scalars, recursively).  Applied to the
+    free-form serialization-bound fields (``detector_config`` + the xu kwargs)
+    whose contents are written verbatim as JSON."""
+    if isinstance(value, Mapping):
+        return {str(k): _json_canonical(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_canonical(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 @dataclass(frozen=True)
 class ImageOrientation:
     """Beamline-specific transform mapping a raw detector array to the
@@ -284,6 +299,8 @@ class ImageOrientation:
     transpose: bool = False
 
     def __post_init__(self) -> None:
+        # coerce a numpy/parsed scalar to a plain int so membership + to_json work
+        object.__setattr__(self, "rotation", int(self.rotation))
         if self.rotation not in (0, 90, 180, 270):
             raise ValueError(
                 f"rotation must be one of 0/90/180/270, got {self.rotation!r}"
@@ -347,6 +364,12 @@ class DetectorCalibration:
     poni: PONI
     detector_config: Mapping[str, Any] = field(default_factory=dict)
     image_orientation: ImageOrientation = field(default_factory=ImageOrientation)
+
+    def __post_init__(self) -> None:
+        # store detector_config JSON-canonical so to_json never crashes on a
+        # numpy scalar and the round-trip is idempotent (tuple -> list, etc.)
+        object.__setattr__(self, "detector_config",
+                           _json_canonical(dict(self.detector_config)))
 
     def to_json(self) -> str:
         return json.dumps(self._as_jsonable(), separators=(",", ":"),
@@ -504,6 +527,14 @@ class Diffractometer:
     #: image mount).  Per-frame full geometry = this base ⊕
     #: :meth:`to_pyfai_per_frame`.  ``None`` for a bare preset.
     calibration: "DetectorCalibration | None" = None
+
+    def __post_init__(self) -> None:
+        # store the free-form xu passthrough dicts JSON-canonical so to_json
+        # never crashes on a numpy scalar and a round-trip is idempotent
+        # (tuple -> list); these are written verbatim into the JSON blob.
+        for name in ("qconv_kwargs", "hxrd_kwargs", "ang2q_kwargs"):
+            object.__setattr__(self, name,
+                               _json_canonical(dict(getattr(self, name))))
 
     # ------------------------------------------------------------------
     # Presets — author BOTH halves consistently
@@ -698,7 +729,9 @@ class Diffractometer:
         params = dict(zip(param_names, param))
         pos_names = list(trans.get("pos_names",
                                    data.get("pos_names", ["pos"])))
-        constants = dict(trans.get("constants", {}))
+        # numexpr needs ``pi`` available; pyFAI ships it in constants but
+        # default it so an expr referencing pi never KeyErrors.
+        constants = {"pi": float(np.pi), **dict(trans.get("constants", {}))}
         local_base = {**constants, **params}
         motor_for = _resolve_source_motors(pos_names, source_motors)
 
@@ -707,10 +740,23 @@ class Diffractometer:
         def _ev(expr: str, posvals: Mapping[str, float]) -> float:
             return _eval_geometry_expr(expr, {**local_base, **posvals})
 
+        def _require_pos_independent(label: str, expr: str) -> float:
+            """Base PONI fields must be constant in position (the per-frame
+            geometry emits only rot*; a moving-detector base is out of scope)."""
+            f0 = _ev(expr, pos_zero)
+            for name in pos_names:
+                if abs(_ev(expr, {**pos_zero, name: 1.0}) - f0) > 1e-12 * (1 + abs(f0)):
+                    raise NotImplementedError(
+                        f"{label}_expr depends on position axis {name!r} "
+                        "(moving-detector goniometer); only a fixed base "
+                        "dist/poni is supported"
+                    )
+            return f0
+
         # Base geometry (constant for a standard GeometryTransformation).
-        dist = _ev(trans["dist_expr"], pos_zero)
-        poni1 = _ev(trans["poni1_expr"], pos_zero)
-        poni2 = _ev(trans["poni2_expr"], pos_zero)
+        dist = _require_pos_independent("dist", trans["dist_expr"])
+        poni1 = _require_pos_independent("poni1", trans["poni1_expr"])
+        poni2 = _require_pos_independent("poni2", trans["poni2_expr"])
 
         rot_mappings: dict[str, AngleMapping] = {}
         base_rots: dict[str, float] = {}
@@ -727,6 +773,19 @@ class Diffractometer:
                         "goniometer transformations are supported"
                     )
                 scales.append(f1 - f0)
+            # Reject a coupled (cross-term, e.g. nu*del) dependence: each axis
+            # alone can look linear yet a pure product slips through as a sum of
+            # zero slopes (mis-read as constant).  A genuinely axis-separable
+            # linear expr satisfies f(all=1) == f0 + Σ scales; a cross-term does
+            # not.  Fail loud, consistent with the non-linear rejection above.
+            if len(pos_names) > 1:
+                f_all = _ev(expr, {n: 1.0 for n in pos_names})
+                if abs(f_all - (f0 + sum(scales))) > 1e-12 * (1 + abs(f_all)):
+                    raise NotImplementedError(
+                        f"{axis}_expr couples multiple position axes "
+                        "(cross-term); only axis-separable linear goniometer "
+                        "transformations are supported"
+                    )
             nz = [i for i, s in enumerate(scales) if abs(s) > 1e-15]
             if not nz:
                 base_rots[axis] = f0           # constant → base PONI
@@ -982,8 +1041,8 @@ class Diffractometer:
             rot2=_am("rot2"),
             rot3=_am("rot3"),
             incident_angle=_am("incident_angle"),
-            sample_circles=tuple(d.get("sample_circles", ())),
-            detector_circles=tuple(d.get("detector_circles", ())),
+            sample_circles=tuple(d.get("sample_circles", ("z-", "y+", "z-"))),
+            detector_circles=tuple(d.get("detector_circles", ("z-",))),
             r_i=tuple(d.get("r_i", (0.0, 1.0, 0.0))),
             camera=tuple(d.get("camera", ("z-", "x+"))),
             hxrd_n=tuple(d.get("hxrd_n", (0.0, 1.0, 0.0))),
