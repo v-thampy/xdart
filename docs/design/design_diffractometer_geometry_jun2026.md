@@ -1,8 +1,13 @@
 # Design: one shared `Diffractometer` geometry object
 
-**Status:** draft for discussion · 2026-06-14 · planning only (no code)
-**Promote to:** ADR-0007 once ratified (this is a "kill parallel representations"
-decision that freezes a public API + a persisted group, so it deserves an ADR).
+**Status:** ratified → **ADR-0007** (`docs/decisions/0007-one-shared-diffractometer-geometry-object.md`).
+Headless core implemented (§6 steps 0–3: the `Diffractometer` object + both adapters +
+presets, `DetectorCalibration`/`ImageOrientation`, `from_pyfai_goniometer`, the legacy
+bridges, capability-gated persistence — all test-gated incl. the real-data pyFAI
+goniometer gate). **Remaining:** §6 step 4 (repoint consumers — the invasive migration),
+step 4b (`refine_goniometer`), step 5 (retire). This doc stays the detailed reference; the
+ADR is the decision record.
+**Was:** draft for discussion · 2026-06-14 · planning only (no code).
 **Consumed by:** [`design_stitching_jun2026.md`](design_stitching_jun2026.md) and the
 RSM viewer/reconcile work; both reference this object as their single geometry input.
 **Gated on:** nothing in this doc is blocked by 3e/Phase-5 (geometry is orthogonal to
