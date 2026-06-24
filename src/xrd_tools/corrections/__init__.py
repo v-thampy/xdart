@@ -21,8 +21,11 @@ from xrd_tools.corrections.normalization import (
     normalize_time,
     scale_to_range,
 )
+from xrd_tools.corrections.stack import CorrectionStack
 
 __all__ = [
+    # the shared per-pixel pre-weight (stitch backends + RSM)
+    "CorrectionStack",
     # beam
     "absorption_correction",
     "polarization_correction",

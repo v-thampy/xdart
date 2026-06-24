@@ -28,6 +28,7 @@ from xrd_tools.integrate.single import (
     integrate_scan,
 )
 from xrd_tools.integrate.calibration import (
+    detector_calibration_to_integrator,
     get_detector,
     get_detector_mask,
     load_poni,
@@ -69,4 +70,5 @@ __all__ = [
     "ControlFrame",
     "RefineResult",
     "refine_goniometer",
+    "detector_calibration_to_integrator",
 ]
