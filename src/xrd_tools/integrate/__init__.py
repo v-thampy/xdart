@@ -35,6 +35,11 @@ from xrd_tools.integrate.calibration import (
     poni_to_integrator,
     save_poni,
 )
+from xrd_tools.integrate.refine import (
+    ControlFrame,
+    RefineResult,
+    refine_goniometer,
+)
 
 __all__ = [
     "DirectoryWatcher",
@@ -61,4 +66,7 @@ __all__ = [
     "process_scan",
     "process_series",
     "save_poni",
+    "ControlFrame",
+    "RefineResult",
+    "refine_goniometer",
 ]
