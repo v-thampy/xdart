@@ -10,11 +10,14 @@ from pathlib import Path
 
 import h5py
 
+import numpy as np
+
 from xrd_tools.core.geometry import (
     Diffractometer,
+    DiffractometerGeometry,
     ImageOrientation,
 )
-from xrd_tools.io.nexus import write_diffractometer
+from xrd_tools.io.nexus import write_diffractometer, write_per_frame_geometry
 from xrd_tools.io.read import ProcessedScan, get_diffractometer
 from xrd_tools.io.schema import CAPABILITIES, detect_capabilities
 
@@ -143,3 +146,39 @@ def test_processed_scan_refresh_resets(tmp_path):
         write_diffractometer(f["entry"], Diffractometer.psic())
     scan.refresh_metadata()
     assert scan.diffractometer == Diffractometer.psic()
+
+
+# ---------------------------------------------------------------------------
+# step-4 seam: a Diffractometer is a drop-in for the duck-typed Scan.geometry
+# ---------------------------------------------------------------------------
+
+def _read_geom_group(path: Path) -> dict:
+    out = {}
+    with h5py.File(path, "r") as f:
+        g = f["entry/per_frame_geometry"]
+        for k in ("rot1", "rot2", "rot3", "incident_angle"):
+            out[k] = np.asarray(g[k])
+    return out
+
+
+def test_diffractometer_is_writer_dropin(tmp_path):
+    """write_per_frame_geometry (the sole Scan.geometry consumer) must produce
+    byte-identical output from a Diffractometer and the legacy class."""
+    pd = __import__("pandas")
+    scan_data = pd.DataFrame({
+        "nu": [2.0, 4.0, 6.0], "del": [15.0, 30.0, 45.0],
+        "eta": [0.5, 0.5, 0.5],
+    })
+    frames = [0, 1, 2]
+
+    def _write(geometry):
+        p = tmp_path / f"{type(geometry).__name__}.nxs"
+        with h5py.File(p, "w") as f:
+            write_per_frame_geometry(f.create_group("entry"), scan_data,
+                                     frames, geometry)
+        return _read_geom_group(p)
+
+    new = _write(Diffractometer.psic())
+    old = _write(DiffractometerGeometry.psic())
+    for k in old:
+        np.testing.assert_array_equal(new[k], old[k])

@@ -233,6 +233,17 @@ class TestPyfaiPerFrame:
             assert out[k].shape == (1,)
             assert out[k][0] == 0.0
 
+    def test_derive_per_frame_alias(self):
+        # the legacy-compat name a duck-typed Scan.geometry consumer calls
+        d = Diffractometer.psic()
+        motors = {"nu": np.array([2.0]), "del": np.array([15.0]),
+                  "eta": np.array([0.5])}
+        a = d.derive_per_frame(motors)
+        b = d.to_pyfai_per_frame(motors)
+        assert a.keys() == b.keys()
+        for k in a:
+            np.testing.assert_array_equal(a[k], b[k])
+
 
 # ---------------------------------------------------------------------------
 # JSON round-trip (persistence)

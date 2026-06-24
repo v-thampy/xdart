@@ -978,6 +978,17 @@ class Diffractometer:
             out["incident_angle"] = np.zeros(N, dtype=float)
         return out
 
+    def derive_per_frame(self, motors: Mapping[str, "np.ndarray"]
+                         ) -> dict[str, np.ndarray]:
+        """Legacy-compatible alias of :meth:`to_pyfai_per_frame`.
+
+        A ``Diffractometer`` is duck-typed exactly like the old
+        ``DiffractometerGeometry`` (the writer's ``Scan.geometry`` consumer
+        calls only ``.derive_per_frame`` + ``.all_referenced_motors``), so it
+        is a drop-in replacement — the step-4 seam.
+        """
+        return self.to_pyfai_per_frame(motors)
+
     # ------------------------------------------------------------------
     # Adapter view 2 — xrayutilities (== DiffractometerConfig.make_hxrd)
     # ------------------------------------------------------------------
