@@ -1,7 +1,7 @@
 # ADR-0007: one shared `Diffractometer` geometry object (kill parallel representations)
 
-**Status:** accepted (headless core, steps 0–3) · 2026-06-23 · promotes
-`docs/design/design_diffractometer_geometry_jun2026.md`.
+**Status:** accepted (steps 0–4 implemented + green; live verification + 4b/5 pending) ·
+2026-06-23 · promotes `docs/design/design_diffractometer_geometry_jun2026.md`.
 **Builds on:** ADR-0002 (capability attrs — the persistence mechanism).
 **Consumed by:** `design_stitching_jun2026.md` (all three stitch backends) and
 `design_rsm_jun2026.md` — both reference this object as their single geometry input.
@@ -113,15 +113,17 @@ reduction / the writer / `Scan.geometry` onto the one object with no behaviour c
   Real-data gate: the goniometer bridge reproduces pyFAI `Goniometer.get_ai` per frame to
   1e-12 on the vendored `gonio_robl_v1/v2.json`. The two legacy classes are untouched, so
   RSM / writer tests pass unchanged.
-- **Not yet done (next session — the invasive migration):**
-  - **Step 4 — repoint consumers.** RSM `gridding`/`pipeline` → `diff.to_qconversion()`;
-    reduction/GI + `write_per_frame_geometry` → `diff.to_pyfai_per_frame()`;
-    `Scan.geometry` → a `Diffractometer`; `core/config.diff_config`; the xdart producers
-    (`LiveScan.default_geometry` / `_load_from_nexus_v2`). **GI guardrail:** the three
-    GI-defining quantities (per-frame `incident_angle`, `gi.tilt_angle`,
-    `gi.sample_orientation`) must stay byte-identical; the FiberIntegrator is still built
-    from the first frame's incidence and the genuine per-frame incidence applied at
-    integration time. This flips the finish-site blob write on with the complete object.
+- **Step 4 — repoint consumers (DONE in code; live verification pending).** All
+  consumers now read the one object via byte-equal drop-in aliases (`derive_per_frame`
+  == `to_pyfai_per_frame`; `make_hxrd` == `to_hxrd`; `init_area_detrot/tiltazimuth` ==
+  `camera`): RSM `PixelQMap`/gridding, `core/config.diff_config` (default psic),
+  `Scan.geometry`, the finish-site blob write (now flipped on), and the xdart producers
+  (`LiveScan.default_geometry` → psic; `_load_from_nexus_v2` prefers the blob). **GI
+  guardrail held:** the live/batch/reload equivalence spine (18 tests) stays green — the
+  3 GI quantities are byte-identical because `to_pyfai_per_frame` == the old
+  `derive_per_frame`. Core 1191 + xdart 1087 green. *Remaining: a live `xrd_test` GUI run
+  (the app-default-psic flip + the persisted blob on a real save/reload).*
+- **Not yet done:**
   - **Step 4b — `refine_goniometer`** (the Refine-button backend): a headless
     control-point `least_squares` fit (NOT pyFAI `refine3`, which diverges for the stacked
     psic), seeded from a base `.poni` + calibration images + their `(del,nu)` + calibrant.
