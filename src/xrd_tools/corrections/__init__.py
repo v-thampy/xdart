@@ -22,10 +22,19 @@ from xrd_tools.corrections.normalization import (
     scale_to_range,
 )
 from xrd_tools.corrections.stack import CorrectionStack
+from xrd_tools.corrections.grazing import (
+    GICorrectionStack,
+    fresnel_transmission_sq,
+    refracted_angle,
+)
 
 __all__ = [
     # the shared per-pixel pre-weight (stitch backends + RSM)
     "CorrectionStack",
+    # grazing-incidence per-pixel corrections (GI mode)
+    "GICorrectionStack",
+    "fresnel_transmission_sq",
+    "refracted_angle",
     # beam
     "absorption_correction",
     "polarization_correction",
