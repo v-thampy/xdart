@@ -83,6 +83,71 @@ def create_multigeometry_integrators(
     return integrators
 
 
+def create_multigeometry_integrators_from_geometry(
+    diffractometer: Any,
+    motors: Any,
+    *,
+    base_calibration: Any = None,
+) -> list[AzimuthalIntegrator]:
+    """Per-frame integrators from a :class:`Diffractometer` — the calibrated path.
+
+    Closes stitching GAP A + GAP B vs :func:`create_multigeometry_integrators`:
+
+    * **GAP A (fitted scales, not a hardwired ``deg2rad``):** per-frame rotations
+      come from ``diffractometer.to_pyfai_per_frame(motors)``, so a *calibrated*
+      goniometer's fitted per-axis scales/offsets are used (an uncalibrated preset
+      whose ``AngleMapping.sign == 1`` reduces exactly to the old ``deg2rad`` path).
+    * **GAP B (panel mount preserved):** the base geometry is a
+      :class:`DetectorCalibration` carrying ``Detector_config`` (orientation), built
+      via :func:`detector_calibration_to_integrator` — the orientation is no longer
+      silently dropped.
+
+    Per-frame ``rotN = base.poni.rotN + to_pyfai_per_frame()[rotN]`` (the same
+    decomposition :meth:`Diffractometer.from_pyfai_goniometer` produces).
+
+    Parameters
+    ----------
+    diffractometer : Diffractometer
+        The instrument geometry (preset-built or gonio-fitted).
+    motors : Mapping[str, array-like]
+        Per-frame motor columns (degrees), keyed by motor name.
+    base_calibration : DetectorCalibration, optional
+        The base detector calibration; defaults to
+        ``diffractometer.calibration``.
+
+    Returns
+    -------
+    list of AzimuthalIntegrator
+        One per frame, ready for :class:`MultiGeometry` / the histogram backends.
+    """
+    from xrd_tools.integrate.calibration import (  # noqa: PLC0415
+        detector_calibration_to_integrator,
+    )
+
+    cal = base_calibration if base_calibration is not None else getattr(
+        diffractometer, "calibration", None)
+    if cal is None:
+        raise ValueError(
+            "no DetectorCalibration: pass base_calibration= or use a "
+            "Diffractometer carrying one (from_pyfai_goniometer / a fitted "
+            "geometry). The base dist/poni/Detector_config is required to stitch.")
+    derived = diffractometer.to_pyfai_per_frame(motors)
+    rot1, rot2, rot3 = derived["rot1"], derived["rot2"], derived["rot3"]
+    base = cal.poni
+    integrators: list[AzimuthalIntegrator] = []
+    for i in range(len(rot1)):
+        integrators.append(detector_calibration_to_integrator(
+            cal,
+            rot1=float(base.rot1) + float(rot1[i]),
+            rot2=float(base.rot2) + float(rot2[i]),
+            rot3=float(base.rot3) + float(rot3[i]),
+        ))
+    logger.debug("Created %d per-frame integrators from a Diffractometer "
+                 "(preset=%s)", len(integrators),
+                 getattr(diffractometer, "preset", "?"))
+    return integrators
+
+
 def stitch_1d(
     images: list[np.ndarray] | np.ndarray,
     integrators: list[AzimuthalIntegrator],
@@ -332,6 +397,7 @@ def stitch_images(
 
 __all__ = [
     "create_multigeometry_integrators",
+    "create_multigeometry_integrators_from_geometry",
     "stitch_1d",
     "stitch_2d",
     "stitch_images",

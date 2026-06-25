@@ -89,6 +89,10 @@ class StitchPlan:
     """Plan for MultiGeometry stitching of a frame source."""
 
     base_poni: PONI | None = None
+    #: a calibrated/preset Diffractometer (closes GAP A: per-frame rotations from
+    #: its fitted scales, not a deg2rad hardwire). When set, it drives the stitch
+    #: geometry; the rot1_key/rot2_key path below is the no-calibration fallback.
+    diffractometer: Any = None
     rot1_key: str = "rot1"
     rot2_key: str | None = None
     monitor_key: str | None = None
@@ -118,8 +122,13 @@ def run_stitch(
     if not labels:
         raise ValueError("run_stitch requires at least one frame")
     base_poni = plan.base_poni or getattr(src, "poni", None)
-    if base_poni is None:
-        raise ValueError("StitchPlan.base_poni or source.poni is required")
+    # base_poni is required UNLESS a calibrated Diffractometer supplies the base
+    # geometry itself (its DetectorCalibration carries dist/poni/Detector_config).
+    _diff = plan.diffractometer or getattr(src, "diffractometer", None)
+    if base_poni is None and getattr(_diff, "calibration", None) is None:
+        raise ValueError(
+            "StitchPlan.base_poni or source.poni is required (or a Diffractometer "
+            "carrying a DetectorCalibration)")
 
     images: list[np.ndarray] = []
     eager_bytes = 0
@@ -136,32 +145,66 @@ def run_stitch(
                 "this call to the future streaming StitchPlan backend."
             )
         images.append(image)
-    rot1 = _metadata_series(src, labels, plan.rot1_key)
-    rot2 = (
-        _metadata_series(src, labels, plan.rot2_key)
-        if plan.rot2_key is not None else None
-    )
     normalization = (
         _metadata_series(src, labels, plan.monitor_key)
         if plan.monitor_key is not None else None
     )
-    payload = stitch_images(
-        images,
-        base_poni,
-        rot1_angles=rot1,
-        rot2_angles=rot2,
-        mode=plan.mode,
-        npt_1d=plan.npt_1d,
-        npt_rad_2d=plan.npt_rad_2d,
-        npt_azim_2d=plan.npt_azim_2d,
-        unit=plan.unit,
-        method=plan.method,
-        radial_range=plan.radial_range,
-        azimuth_range=plan.azimuth_range,
-        mask=plan.mask,
-        normalization=normalization,
-        **plan.extra,
-    )
+
+    diffractometer = plan.diffractometer or getattr(src, "diffractometer", None)
+    if diffractometer is not None:
+        # GAP-A path: per-frame rotations from the calibrated Diffractometer.
+        from xrd_tools.integrate.multi import (  # noqa: PLC0415
+            create_multigeometry_integrators_from_geometry,
+            stitch_1d, stitch_2d,
+        )
+        motors: dict[str, np.ndarray] = {}
+        for m in diffractometer.all_referenced_motors():
+            try:
+                motors[m] = _metadata_series(src, labels, m)
+            except Exception:  # noqa: BLE001 — motor not in this source's metadata
+                continue
+        base_cal = getattr(diffractometer, "calibration", None)
+        if base_cal is None:
+            from xrd_tools.core.geometry import DetectorCalibration  # noqa: PLC0415
+            base_cal = DetectorCalibration(
+                poni=base_poni, detector_config=dict(plan.extra.get("detector_config", {})))
+        integrators = create_multigeometry_integrators_from_geometry(
+            diffractometer, motors, base_calibration=base_cal)
+        extra = {k: v for k, v in plan.extra.items() if k != "detector_config"}
+        if plan.mode == "2d":
+            payload = stitch_2d(
+                images, integrators, npt_rad=plan.npt_rad_2d,
+                npt_azim=plan.npt_azim_2d, unit=plan.unit, method=plan.method,
+                radial_range=plan.radial_range, azimuth_range=plan.azimuth_range,
+                mask=plan.mask, normalization=normalization, **extra)
+        else:
+            payload = stitch_1d(
+                images, integrators, npt=plan.npt_1d, unit=plan.unit,
+                method=plan.method, radial_range=plan.radial_range,
+                mask=plan.mask, normalization=normalization, **extra)
+    else:
+        rot1 = _metadata_series(src, labels, plan.rot1_key)
+        rot2 = (
+            _metadata_series(src, labels, plan.rot2_key)
+            if plan.rot2_key is not None else None
+        )
+        payload = stitch_images(
+            images,
+            base_poni,
+            rot1_angles=rot1,
+            rot2_angles=rot2,
+            mode=plan.mode,
+            npt_1d=plan.npt_1d,
+            npt_rad_2d=plan.npt_rad_2d,
+            npt_azim_2d=plan.npt_azim_2d,
+            unit=plan.unit,
+            method=plan.method,
+            radial_range=plan.radial_range,
+            azimuth_range=plan.azimuth_range,
+            mask=plan.mask,
+            normalization=normalization,
+            **plan.extra,
+        )
     return AnalysisResult(
         kind="stitch",
         payload=payload,
