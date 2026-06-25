@@ -22,17 +22,20 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
 
 ## Phases (each ends green + committed)
 
-- **P1 — stitch consumes the `Diffractometer`** (closes GAP A): `run_stitch` /
-  `create_multigeometry_integrators` (`integrate/multi.py`, `analysis/plans.py`) use
-  `to_pyfai_per_frame` (the calibrated per-frame rotations) instead of the `deg2rad` hardwire.
-  *Gate:* reproduce the notebook's `stitched_LaB6_17keV_scan14.xye`.
+- **P1 — stitch consumes the `Diffractometer` ✓ DONE** (`integrate/multi.py` +
+  `analysis/plans.py`, `8a1347a`): `create_multigeometry_integrators_from_geometry` uses
+  `to_pyfai_per_frame` (fitted scales, GAP A) over a `DetectorCalibration` (Detector_config,
+  GAP B); `run_stitch` dispatches on `StitchPlan.diffractometer` (legacy deg2rad = fallback).
+  Gated: uncalibrated psic == legacy end-to-end; calibrated == `get_ai`. *Live gate:* the
+  notebook `stitched_LaB6_17keV_scan14.xye`.
 - **P2a — shared correction stack ✓ DONE** (`corrections/stack.py`, `937a978`): the per-pixel
   normalization (solid-angle/polarization) at the accumulator seam, `Σraw/Σnorm` == pyFAI.
-- **P2b — GI corrections** (footprint/refraction/Fresnel) from xu materials
-  (`idx_refraction`/`critical_angle`/`absorption_length`/`chi0`). *Research-heavy* (subtle GI
-  physics — wrong factors silently corrupt intensity). *Gate:* the
-  `Multi120_GI_Corrections_Explorer.ipynb` reference (refraction shifts qz the right way +
-  vanishes far above αc; Fresnel peaks at αc / Yoneda; footprint ∝ 1/sin αi).
+- **P2b — GI corrections ✓ DONE** (`corrections/grazing.py`, `7542c0e`): footprint/refraction/
+  Fresnel/absorption from xu materials; the INTENSITY-vs-POSITION split (refraction →
+  `refract_q`, the rest → `gi_normalization`). Gated notebook-free (Si@10keV: Fresnel peaks at
+  αc; refraction shift vanishes above αc; footprint ∝ 1/sin αi). *Flagged:* the footprint +
+  path-absorption composition signs are convention-dependent — verify vs a GIXSGUI worked
+  example with live data.
 - **P3 — `stitch_ponis` + the histogram backend** (`stitch_q_grid`) + `StitchPlan.backend`
   dispatch (`multigeometry` | `pyfai_hist` | `xu_hist`), sharing RSM's `StreamingGridder`
   accumulator (signal + normalization, `Σraw/Σnorm`). *Gate:* the 3 backends agree on |q|;
@@ -57,6 +60,7 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
 - [ ] P7: the Stitch viewer + Refine button + GI stitch flow.
 
 ## Status
-Geometry (ADR-0007 steps 0–5 + 4b `refine_goniometer`) — **done, reviewed, green**. P2a — done.
-Next: **P2b** (GI corrections, research-gated) or **P1** (wire stitch onto geometry) — both
-headless. The live tail is P7.
+Geometry (ADR-0007 steps 0–5 + 4b `refine_goniometer`) — **done, reviewed, green**.
+**P1, P2a, P2b — done + gated.** Next: **P3** (`stitch_q_grid` histogram backend +
+`StitchPlan.backend` dispatch, sharing RSM's `StreamingGridder` + the `CorrectionStack`
+weight), then P4 (GI flag), P5 (persistence), P6 (RSM), P7 (live GUI). The live tail is P7.
