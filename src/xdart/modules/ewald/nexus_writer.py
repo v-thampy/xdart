@@ -727,7 +727,9 @@ def _write_reduction(h5f, scan, *, entry: str) -> None:
     geom = getattr(scan, "geometry", None)
     if geom is not None:
         config["geometry"] = {
-            "convention": geom.convention,
+            # dual-class safe: the canonical Diffractometer names it `preset`,
+            # the legacy DiffractometerGeometry names it `convention`.
+            "convention": getattr(geom, "convention", getattr(geom, "preset", "")),
             "mapping_json": geom.to_json(),
             "motor_sources": {
                 m: m for m in geom.all_referenced_motors()

@@ -164,6 +164,11 @@ def run_stitch(
             except Exception:  # noqa: BLE001 — motor not in this source's metadata
                 continue
         base_cal = getattr(diffractometer, "calibration", None)
+        if base_cal is not None and "detector_config" in plan.extra:
+            raise ValueError(
+                "ambiguous detector_config: the Diffractometer already carries a "
+                "DetectorCalibration (with its own Detector_config); remove "
+                "detector_config from StitchPlan.extra")
         if base_cal is None:
             from xrd_tools.core.geometry import DetectorCalibration  # noqa: PLC0415
             base_cal = DetectorCalibration(

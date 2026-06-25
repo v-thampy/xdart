@@ -86,6 +86,29 @@ def test_preserves_detector_config_orientation():
     assert int(ais[0].detector.orientation) == 3
 
 
+def test_stitch_without_incidence_motor():
+    """A stitch never needs the GI incidence — a psic Diffractometer must build
+    integrators from nu/del alone, NOT crash on a missing 'eta' column."""
+    pytest.importorskip("pyFAI")
+    from xrd_tools.integrate.multi import (
+        create_multigeometry_integrators_from_geometry,
+    )
+    base = PONI(dist=0.39, poni1=0.10, poni2=0.12, wavelength=0.729e-10,
+                detector="Pilatus300kw")
+    psic = Diffractometer.psic()  # incident_angle active <- eta
+    diff = Diffractometer(preset="psic", rot1=psic.rot1, rot2=psic.rot2,
+                          incident_angle=psic.incident_angle,
+                          calibration=DetectorCalibration(poni=base))
+    # motors carry nu/del but NOT eta — must not raise
+    ais = create_multigeometry_integrators_from_geometry(
+        diff, {"nu": np.array([0.0, 3.0]), "del": np.array([6.0, 20.0])})
+    assert len(ais) == 2
+
+    # but a missing *rotation* motor still fails loud (and names the motor)
+    with pytest.raises(KeyError, match="nu"):
+        create_multigeometry_integrators_from_geometry(diff, {"del": np.array([6.0])})
+
+
 def test_requires_a_calibration():
     from xrd_tools.integrate.multi import (
         create_multigeometry_integrators_from_geometry,

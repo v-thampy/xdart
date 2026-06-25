@@ -74,9 +74,12 @@ def refracted_angle(alpha_rad: np.ndarray | float, ac_rad: float,
 
 def absorption_path(incident_angle_rad: np.ndarray | float,
                     alpha_f_rad: np.ndarray | float) -> np.ndarray:
-    """Geometric path-length sum ``1/sin αi + 1/sin αf`` (thickness-free form A)."""
-    return (1.0 / np.sin(np.asarray(incident_angle_rad, dtype=float))
-            + 1.0 / _floor_alpha(alpha_f_rad))
+    """Geometric path-length sum ``1/sin αi + 1/sin αf`` (thickness-free form A).
+
+    Both angles are floored at 0.01° so a sub-horizon/zero incidence or exit can
+    never produce a ``±inf`` or sign-flipped path (1/sin diverges at 0)."""
+    return (1.0 / np.sin(_floor_alpha(incident_angle_rad))
+            + 1.0 / np.sin(_floor_alpha(alpha_f_rad)))
 
 
 def film_absorption(incident_angle_rad: np.ndarray | float,
@@ -164,7 +167,9 @@ class GICorrectionStack:
         the accumulator forms ``I = Σ raw / Σ norm``.  Refraction is NOT here.
         """
         oc = self.optical_constants()
-        ai = np.radians(float(incident_angle_deg))
+        # floor αi (like αf): a zero/sub-horizon incidence must not make 1/sin αi
+        # diverge or sin αi flip sign (silent intensity corruption).
+        ai = float(_floor_alpha(np.radians(float(incident_angle_deg))))
         af = _floor_alpha(alpha_f_rad)
         norm = np.ones(np.shape(af), dtype=float)
         if self.footprint:
@@ -187,7 +192,14 @@ class GICorrectionStack:
                   q_total: np.ndarray, q_z: np.ndarray) -> np.ndarray:
         """Refraction-shifted ``|q|``: replace the out-of-plane component with the
         refracted ``qz`` (Snell), keeping the in-plane part.  Maps measured qz
-        **down** (peaks shift to smaller qz); the shift vanishes far above αc."""
+        **down** (peaks shift to smaller qz); the shift vanishes far above αc.
+
+        Contract: reflection-geometry GI — every pixel is taken to be in the
+        **upper (qz ≥ 0) half-plane**.  The sign of the input ``q_z`` is not used
+        (only ``q_total² − q_z²`` enters, recovering the in-plane magnitude), and
+        the returned ``|q|`` is always built from a non-negative refracted ``qz``.
+        A genuinely below-horizon pixel would be folded to ``+qz`` — do not feed
+        transmission-geometry (qz < 0) pixels here."""
         oc = self.optical_constants()
         k0 = oc["k0_per_A"]
         ai_in = refracted_angle(np.radians(float(incident_angle_deg)),

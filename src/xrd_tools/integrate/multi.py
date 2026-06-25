@@ -131,16 +131,35 @@ def create_multigeometry_integrators_from_geometry(
             "no DetectorCalibration: pass base_calibration= or use a "
             "Diffractometer carrying one (from_pyfai_goniometer / a fitted "
             "geometry). The base dist/poni/Detector_config is required to stitch.")
-    derived = diffractometer.to_pyfai_per_frame(motors)
-    rot1, rot2, rot3 = derived["rot1"], derived["rot2"], derived["rot3"]
+
+    # Compute ONLY the per-frame detector rotations (rot1/2/3) directly — a stitch
+    # never needs the GI incidence, so a stitch scan that lacks the incidence motor
+    # (e.g. psic's `eta`) must not crash; to_pyfai_per_frame stays strict for GI.
+    def _frame_rot(mapping: Any) -> np.ndarray | None:
+        if not mapping.is_active:
+            return None
+        if mapping.source_motor not in motors:
+            raise KeyError(
+                f"stitch geometry needs motor {mapping.source_motor!r} (it drives "
+                f"a detector rotation) but the source provides {sorted(motors)}")
+        return np.deg2rad(mapping.apply(
+            np.asarray(motors[mapping.source_motor], dtype=float)))
+
+    r1 = _frame_rot(diffractometer.rot1)
+    r2 = _frame_rot(diffractometer.rot2)
+    r3 = _frame_rot(diffractometer.rot3)
+    nframes = next((len(r) for r in (r1, r2, r3) if r is not None), None)
+    if nframes is None:  # no active detector rotation — use any motor column length
+        col = next(iter(motors.values()), None)
+        nframes = len(np.atleast_1d(np.asarray(col))) if col is not None else 1
     base = cal.poni
     integrators: list[AzimuthalIntegrator] = []
-    for i in range(len(rot1)):
+    for i in range(nframes):
         integrators.append(detector_calibration_to_integrator(
             cal,
-            rot1=float(base.rot1) + float(rot1[i]),
-            rot2=float(base.rot2) + float(rot2[i]),
-            rot3=float(base.rot3) + float(rot3[i]),
+            rot1=float(base.rot1) + (float(r1[i]) if r1 is not None else 0.0),
+            rot2=float(base.rot2) + (float(r2[i]) if r2 is not None else 0.0),
+            rot3=float(base.rot3) + (float(r3[i]) if r3 is not None else 0.0),
         ))
     logger.debug("Created %d per-frame integrators from a Diffractometer "
                  "(preset=%s)", len(integrators),

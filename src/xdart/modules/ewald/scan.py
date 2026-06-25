@@ -703,21 +703,26 @@ class LiveScan:
     # ------------------------------------------------------------------
 
     def default_geometry(self):
-        """Return ``self.geometry``, constructing the default psic if unset.
+        """Return ``self.geometry``, constructing a sensible default if unset.
 
-        The house default is the canonical **psic** :class:`Diffractometer`
-        (the RSM_process production geometry), with the GI incidence taken
-        from ``self.incidence_motor`` when set (else ``eta``).  Override by
-        assigning a different :class:`Diffractometer` (e.g.
-        ``Diffractometer.two_circle(...)`` for a 2-circle experiment) to
-        ``self.geometry`` before saving in v2 mode.
+        Picks the preset from what the scan actually recorded (do NOT stamp a
+        6-circle psic on a 2-circle scan): **psic** when the psic detector
+        motors ``nu``/``del`` are present in ``scan_data`` (a true RSM/6-circle
+        scan), else the **two-circle** convention (``rot1←tth``, incidence ←
+        ``self.incidence_motor`` or ``th``) — which preserves per-frame geometry
+        + GI incidence for standard/2-circle scans.  Override by assigning a
+        :class:`Diffractometer` to ``self.geometry`` before saving in v2 mode.
         """
         if self.geometry is not None:
             return self.geometry
         from xrd_tools.core.geometry import Diffractometer
-        self.geometry = Diffractometer.psic(
-            eta=self.incidence_motor or "eta",
-        )
+        _cols = getattr(getattr(self, "scan_data", None), "columns", None)
+        cols = set(_cols) if _cols is not None else set()
+        if {"nu", "del"} <= cols:
+            self.geometry = Diffractometer.psic(eta=self.incidence_motor or "eta")
+        else:
+            self.geometry = Diffractometer.two_circle(
+                tth="tth", th=self.incidence_motor or "th")
         return self.geometry
 
     # ------------------------------------------------------------------

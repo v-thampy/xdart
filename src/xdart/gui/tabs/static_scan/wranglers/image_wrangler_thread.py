@@ -2576,11 +2576,12 @@ class imageThread(wranglerThread):
         # N1: the project root -> entry/@source_base + relative raw source paths
         # in the writer (portable .nxs).  None -> absolute paths (back-compat).
         scan.source_base = getattr(self, "source_base", None)
-        # v2 NeXus writer needs a DiffractometerGeometry to derive per-frame
-        # rot1/rot2/rot3 and incidence-angle arrays from scan_data.  The
-        # default is a two-circle convention using `tth` (detector arm) and
-        # whatever `th_mtr` resolves to (sample tilt).  Override later from
-        # the geometry UI panel when the user picks a non-default convention.
+        # v2 NeXus writer needs a Diffractometer to derive per-frame
+        # rot1/rot2/rot3 + incidence-angle arrays from scan_data.  default_geometry()
+        # picks the preset from what scan_data recorded: psic when nu/del are
+        # present (RSM/6-circle), else the two-circle convention (rot1←tth,
+        # incidence ← the resolved sample-tilt motor).  Override later from the
+        # geometry UI panel when the user picks a different convention.
         scan.default_geometry()
 
         write_mode = self.write_mode

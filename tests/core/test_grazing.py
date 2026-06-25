@@ -103,6 +103,20 @@ class TestGICorrectionStack:
         n = gi.gi_normalization(incident_angle_deg=0.3, alpha_f_rad=af)
         assert np.all(np.isfinite(n)) and np.all(n > 0)
 
+    def test_floors_nonpositive_incidence(self):
+        """αi ≤ 0 must not yield ±inf / sign-flipped intensity (1/sin diverges at
+        0); both αi and αf are floored at 0.01°."""
+        pytest.importorskip("xrayutilities")
+        from xrd_tools.corrections.grazing import absorption_path
+        gi = _stack()
+        af = np.radians(np.array([0.1, 0.5, 1.0]))
+        for ai_deg in (0.0, -0.3):
+            n = gi.gi_normalization(incident_angle_deg=ai_deg, alpha_f_rad=af)
+            assert np.all(np.isfinite(n)) and np.all(n > 0)
+        # absorption_path is finite + positive for a zero/negative incidence too
+        p = absorption_path(np.radians(0.0), np.radians(np.array([0.0, 0.5])))
+        assert np.all(np.isfinite(p)) and np.all(p > 0)
+
     def test_footprint_only_is_constant_sin_ai(self):
         pytest.importorskip("xrayutilities")
         gi = _stack(fresnel=False, absorption=False)
