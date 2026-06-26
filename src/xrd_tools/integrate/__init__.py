@@ -16,8 +16,13 @@ from xrd_tools.integrate.gid import (
     integrate_gi_polar,
     integrate_gi_polar_1d,
 )
+from xrd_tools.integrate.stitch_hist import (
+    pyfai_q_frames,
+    stitch_q_grid,
+)
 from xrd_tools.integrate.multi import (
     create_multigeometry_integrators,
+    create_multigeometry_integrators_from_geometry,
     stitch_1d,
     stitch_2d,
 )
@@ -46,6 +51,9 @@ __all__ = [
     "DirectoryWatcher",
     "create_fiber_integrator",
     "create_multigeometry_integrators",
+    "create_multigeometry_integrators_from_geometry",
+    "pyfai_q_frames",
+    "stitch_q_grid",
     "integrate_gi_1d",
     "integrate_gi_2d",
     "integrate_gi_azimuthal_1d",
