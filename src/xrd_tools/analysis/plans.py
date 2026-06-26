@@ -191,10 +191,12 @@ def run_stitch(
         if plan.backend == "pyfai_hist":
             from xrd_tools.integrate.stitch_hist import (  # noqa: PLC0415
                 pyfai_q_frames, stitch_q_grid)
+            # 2D uses the 2D radial bin count; 1D uses the 1D count.
+            npt_rad = plan.npt_rad_2d if plan.mode == "2d" else plan.npt_1d
             payload = stitch_q_grid(
                 pyfai_q_frames(images, integrators, corrections=plan.corrections,
                                mask=plan.mask, normalization=normalization),
-                mode=plan.mode, npt=plan.npt_1d, npt_azim=plan.npt_azim_2d,
+                mode=plan.mode, npt=npt_rad, npt_azim=plan.npt_azim_2d,
                 unit=plan.unit, radial_range=plan.radial_range,
                 azimuth_range=plan.azimuth_range)
         elif plan.mode == "2d":

@@ -36,10 +36,17 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
   αc; refraction shift vanishes above αc; footprint ∝ 1/sin αi). *Flagged:* the footprint +
   path-absorption composition signs are convention-dependent — verify vs a GIXSGUI worked
   example with live data.
-- **P3 — `stitch_ponis` + the histogram backend** (`stitch_q_grid`) + `StitchPlan.backend`
-  dispatch (`multigeometry` | `pyfai_hist` | `xu_hist`), sharing RSM's `StreamingGridder`
-  accumulator (signal + normalization, `Σraw/Σnorm`). *Gate:* the 3 backends agree on |q|;
-  histogram == MultiGeometry for the pyFAI geometry.
+- **P3a — histogram merge ✓ DONE** (`integrate/stitch_hist.py`, `1f37cb3`):
+  `stitch_q_grid` (streaming `Σraw/Σnorm` over (q[,χ]) bins) + the `pyfai_hist` provider
+  (`pyfai_q_frames`). Gated: single-frame == pyFAI `integrate1d` exact; multi-frame ==
+  MultiGeometry shape within 3%.
+- **P3b — `StitchPlan.backend` dispatch ✓ DONE** (`analysis/plans.py`, `ae754e1`):
+  `multigeometry` | `pyfai_hist` routed in `run_stitch`; `xu_hist` raises (deferred).
+- **P3c — `xu_hist` backend** (the design default; deferred): the xu q-provider
+  (`to_qconversion` → `Ang2Q.area`) + the per-frame sample-angle assembly from
+  `circle_motors` (the "one wiring task"). *Gate:* xu_hist |q| == pyfai_hist within the
+  radial bin width (validates the psic circle order) + χ == pyFAI `chiArray`. Best done
+  with the real-data notebook so the circle order is validated, not guessed.
 - **P4 — GI flag** (`StitchPlan.gi: GIMode | None`, reusing the reduction `GIMode`/`gi_config`;
   see `design_stitching_jun2026.md §2.8`). GI orthogonal to backend; no `Diffractometer`
   extension needed (the one wiring task is the per-frame sample-angle assembly from
@@ -61,6 +68,6 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
 
 ## Status
 Geometry (ADR-0007 steps 0–5 + 4b `refine_goniometer`) — **done, reviewed, green**.
-**P1, P2a, P2b — done + gated.** Next: **P3** (`stitch_q_grid` histogram backend +
-`StitchPlan.backend` dispatch, sharing RSM's `StreamingGridder` + the `CorrectionStack`
-weight), then P4 (GI flag), P5 (persistence), P6 (RSM), P7 (live GUI). The live tail is P7.
+**P1, P2a, P2b, P3a, P3b — done + gated.** Next: **P3c** (`xu_hist` backend — the design
+default; needs the `circle_motors` angle-assembly validated, ideally with the real-data
+notebook), then P4 (GI flag), P5 (persistence), P6 (RSM), P7 (live GUI). The live tail is P7.
