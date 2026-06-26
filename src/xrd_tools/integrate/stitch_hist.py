@@ -143,8 +143,28 @@ def pyfai_q_frames(
     """
     images = list(images)
     integrators = list(integrators)
-    mon = (np.asarray(list(normalization), dtype=float)
-           if normalization is not None else None)
+    # fail loud on a frame/integrator desync (zip would silently truncate, losing
+    # whole frames from the stitch with no error).
+    if len(images) != len(integrators):
+        raise ValueError(
+            f"pyfai_q_frames: {len(images)} images but {len(integrators)} "
+            "integrators — every frame needs exactly one integrator")
+    mon = None
+    if normalization is not None:
+        mon = np.asarray(list(normalization), dtype=float)
+        if len(mon) != len(images):
+            raise ValueError(
+                f"pyfai_q_frames: {len(mon)} monitor/normalization values for "
+                f"{len(images)} images")
+        # a zero/NaN monitor silently DROPS a whole frame (signal → inf/NaN, then
+        # dropped); a NEGATIVE monitor FLIPS the frame's sign and cancels healthy
+        # frames in the merge — both produce a finite, plausible, wrong result.
+        bad = ~np.isfinite(mon) | (mon <= 0)
+        if bad.any():
+            raise ValueError(
+                "stitch monitor/normalization has invalid value(s) (non-finite "
+                f"or <= 0) at frame index/indices {np.flatnonzero(bad).tolist()}: "
+                f"{mon[bad].tolist()}")
     for i, (ai, img) in enumerate(zip(integrators, images)):
         shape = np.asarray(img).shape
         q = np.asarray(ai.qArray(shape=shape), dtype=float) / 10.0

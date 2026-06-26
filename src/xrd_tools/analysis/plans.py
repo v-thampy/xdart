@@ -191,6 +191,25 @@ def run_stitch(
         if plan.backend == "pyfai_hist":
             from xrd_tools.integrate.stitch_hist import (  # noqa: PLC0415
                 pyfai_q_frames, stitch_q_grid)
+            # the pyfai_hist provider emits |q| in Å⁻¹ ONLY — a non-q unit would
+            # silently mislabel a q-axis as 2θ/r (fail loud instead).
+            if plan.unit != "q_A^-1":
+                raise ValueError(
+                    f"the 'pyfai_hist' stitch backend only emits q in Å⁻¹ "
+                    f"(unit='q_A^-1'); got unit={plan.unit!r}. Use the "
+                    "'multigeometry' backend for other units.")
+            # the histogram merge takes its parameters directly from the plan; it
+            # cannot forward pyFAI integrate kwargs. Surface anything it would drop.
+            if extra:
+                raise ValueError(
+                    f"the 'pyfai_hist' stitch backend cannot consume pyFAI "
+                    f"integrate kwargs {sorted(extra)} (StitchPlan.extra); they "
+                    "apply only to the 'multigeometry' backend.")
+            if plan.method != "BBox":
+                logger.warning(
+                    "StitchPlan.method=%r is ignored by the 'pyfai_hist' backend "
+                    "(the histogram merge does its own pixel splitting).",
+                    plan.method)
             # 2D uses the 2D radial bin count; 1D uses the 1D count.
             npt_rad = plan.npt_rad_2d if plan.mode == "2d" else plan.npt_1d
             payload = stitch_q_grid(

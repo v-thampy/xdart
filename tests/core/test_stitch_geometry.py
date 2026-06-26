@@ -205,3 +205,63 @@ def test_run_stitch_backend_dispatch():
 
     with pytest.raises(NotImplementedError, match="xu_hist"):
         run_stitch(StitchPlan(diffractometer=diff, backend="xu_hist"), src)
+
+
+def _stitch_diff_and_src():
+    """A small psic Diffractometer + 3-frame source for the dispatch-guard tests."""
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.sources import MemoryFrameSource
+    shape = (195, 487)
+    base = PONI(dist=0.2, poni1=shape[0] * 172e-6 / 2, poni2=shape[1] * 172e-6 / 2,
+                rot1=0.0, rot2=0.0, rot3=0.0, wavelength=1.0e-10, detector="Pilatus100k")
+
+    def _ring(seed):
+        rng = np.random.default_rng(seed)
+        y, x = np.mgrid[:shape[0], :shape[1]]
+        r = np.sqrt((y - shape[0] / 2) ** 2 + (x - shape[1] / 2) ** 2)
+        return (500.0 * np.exp(-((r - 60.0) / 10.0) ** 2)
+                + rng.poisson(3, size=shape)).astype(float)
+
+    frames = [ScanFrame(i, image=_ring(i),
+                        metadata={"nu": float(i), "del": float(5 * i), "eta": 0.3})
+              for i in range(3)]
+    src = MemoryFrameSource(frames, name="stitch")
+    psic = Diffractometer.psic()
+    diff = Diffractometer(preset="psic", rot1=psic.rot1, rot2=psic.rot2,
+                          incident_angle=psic.incident_angle,
+                          calibration=DetectorCalibration(poni=base))
+    return diff, src
+
+
+def test_pyfai_hist_rejects_silently_dropped_params():
+    """P3 review — the pyfai_hist backend emits q in Å⁻¹ and cannot forward pyFAI
+    kwargs, so a non-q unit or leftover extra must fail loud, not mislabel/vanish."""
+    pytest.importorskip("pyFAI")
+    from xrd_tools.analysis.plans import StitchPlan, run_stitch
+    diff, src = _stitch_diff_and_src()
+
+    # a non-q unit would mislabel the q-axis as 2θ
+    with pytest.raises(ValueError, match="only emits q in"):
+        run_stitch(StitchPlan(diffractometer=diff, backend="pyfai_hist",
+                              unit="2th_deg", npt_1d=100), src)
+    # pyFAI integrate kwargs would silently vanish
+    with pytest.raises(ValueError, match="cannot consume pyFAI"):
+        run_stitch(StitchPlan(diffractometer=diff, backend="pyfai_hist",
+                              npt_1d=100, extra={"safe": True}), src)
+    # method != BBox is ignored — warned, not fatal (still produces a result)
+    out = run_stitch(StitchPlan(diffractometer=diff, backend="pyfai_hist",
+                                npt_1d=100, method="splitpixel"), src)
+    assert out.payload.radial.shape == (100,)
+
+
+def test_pyfai_hist_2d_dispatch_and_no_corrections():
+    """2D pyfai_hist uses npt_rad_2d (NOT npt_1d) and corrections=None is unit-weight."""
+    pytest.importorskip("pyFAI")
+    from xrd_tools.analysis.plans import StitchPlan, run_stitch
+    diff, src = _stitch_diff_and_src()
+    out = run_stitch(StitchPlan(diffractometer=diff, backend="pyfai_hist", mode="2d",
+                                npt_rad_2d=111, npt_azim_2d=40, npt_1d=999,
+                                corrections=None), src)
+    # crucially npt_1d=999 must NOT leak into the 2D radial axis
+    assert out.payload.intensity.shape == (111, 40)
+    assert np.isfinite(out.payload.intensity).any()

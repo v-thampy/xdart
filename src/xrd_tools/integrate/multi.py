@@ -338,8 +338,12 @@ def _prepare_images(
             )
         if not np.all(np.isfinite(norm)):
             raise ValueError("normalization contains non-finite (nan/inf) values")
-        if np.any(norm == 0):
-            raise ValueError("normalization contains zero values (would divide by zero)")
+        if np.any(norm <= 0):
+            # zero divides by zero; a NEGATIVE monitor flips the frame's sign and
+            # silently cancels healthy frames in the stitch (finite, plausible, wrong).
+            raise ValueError(
+                "normalization contains zero or negative values "
+                f"(monitor must be > 0): {norm[norm <= 0].tolist()}")
         img_list = [img / n for img, n in zip(img_list, norm)]
 
     return img_list

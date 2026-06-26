@@ -42,6 +42,13 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
   MultiGeometry shape within 3%.
 - **P3b — `StitchPlan.backend` dispatch ✓ DONE** (`analysis/plans.py`, `ae754e1`):
   `multigeometry` | `pyfai_hist` routed in `run_stitch`; `xu_hist` raises (deferred).
+- **P3 adversarial review ✓ DONE** (10 confirmed; `wgtp49v9r`): fixed the silent-corruption
+  class in `pyfai_q_frames` — a bad per-frame monitor (0/NaN/**negative** → sign-flip cancels
+  healthy frames) and a `zip(images, integrators)` length desync (silent truncation) now both
+  fail loud; mirrored the negative-monitor guard into MG `_prepare_images`. The `pyfai_hist`
+  dispatch rejects a non-q `unit` (provider emits q Å⁻¹ only) + leftover `extra` pyFAI kwargs,
+  and warns on an ignored `method`. + merge-level + dispatch regression tests (monitor/NaN/
+  empty-bin/mask-merge/2D-seam/2D-npt/corrections=None).
 - **P3c — `xu_hist` backend** (the design default; deferred): the xu q-provider
   (`to_qconversion` → `Ang2Q.area`) + the per-frame sample-angle assembly from
   `circle_motors` (the "one wiring task"). *Gate:* xu_hist |q| == pyfai_hist within the
