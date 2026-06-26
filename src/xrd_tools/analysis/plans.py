@@ -93,6 +93,14 @@ class StitchPlan:
     #: its fitted scales, not a deg2rad hardwire). When set, it drives the stitch
     #: geometry; the rot1_key/rot2_key path below is the no-calibration fallback.
     diffractometer: Any = None
+    #: merge engine: "multigeometry" (pyFAI MG), "pyfai_hist" (pyFAI q/chi maps →
+    #: the streaming Σraw/Σnorm histogram), or "xu_hist" (xu q-provider; not built
+    #: yet). Histogram backends require the geometry path (a Diffractometer).
+    backend: str = "multigeometry"
+    #: per-pixel CorrectionStack for the histogram backends (solid-angle /
+    #: polarization …); None = unit weight. Ignored by the multigeometry backend
+    #: (which carries pyFAI's own correctSolidAngle + polarization_factor).
+    corrections: Any = None
     rot1_key: str = "rot1"
     rot2_key: str | None = None
     monitor_key: str | None = None
@@ -176,7 +184,20 @@ def run_stitch(
         integrators = create_multigeometry_integrators_from_geometry(
             diffractometer, motors, base_calibration=base_cal)
         extra = {k: v for k, v in plan.extra.items() if k != "detector_config"}
-        if plan.mode == "2d":
+        if plan.backend == "xu_hist":
+            raise NotImplementedError(
+                "the 'xu_hist' stitch backend (xu Ang2Q q-provider) is not built "
+                "yet; use 'multigeometry' or 'pyfai_hist'")
+        if plan.backend == "pyfai_hist":
+            from xrd_tools.integrate.stitch_hist import (  # noqa: PLC0415
+                pyfai_q_frames, stitch_q_grid)
+            payload = stitch_q_grid(
+                pyfai_q_frames(images, integrators, corrections=plan.corrections,
+                               mask=plan.mask, normalization=normalization),
+                mode=plan.mode, npt=plan.npt_1d, npt_azim=plan.npt_azim_2d,
+                unit=plan.unit, radial_range=plan.radial_range,
+                azimuth_range=plan.azimuth_range)
+        elif plan.mode == "2d":
             payload = stitch_2d(
                 images, integrators, npt_rad=plan.npt_rad_2d,
                 npt_azim=plan.npt_azim_2d, unit=plan.unit, method=plan.method,

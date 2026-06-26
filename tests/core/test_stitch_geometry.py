@@ -156,3 +156,52 @@ def test_run_stitch_geometry_dispatch_equals_legacy_uncalibrated():
     np.testing.assert_allclose(geom.payload.intensity, legacy.payload.intensity,
                                equal_nan=True)
     np.testing.assert_allclose(geom.payload.radial, legacy.payload.radial)
+
+
+def test_run_stitch_backend_dispatch():
+    """run_stitch(backend='pyfai_hist') routes to the streaming histogram merge and
+    shape-matches the multigeometry backend; 'xu_hist' is a clear NotImplementedError."""
+    pytest.importorskip("pyFAI")
+    from xrd_tools.analysis.plans import StitchPlan, run_stitch
+    from xrd_tools.core.scan import ScanFrame
+    from xrd_tools.corrections.stack import CorrectionStack
+    from xrd_tools.sources import MemoryFrameSource
+
+    shape = (195, 487)
+    base = PONI(dist=0.2, poni1=shape[0] * 172e-6 / 2, poni2=shape[1] * 172e-6 / 2,
+                rot1=0.0, rot2=0.0, rot3=0.0, wavelength=1.0e-10, detector="Pilatus100k")
+
+    def _ring(seed):
+        rng = np.random.default_rng(seed)
+        y, x = np.mgrid[:shape[0], :shape[1]]
+        r = np.sqrt((y - shape[0] / 2) ** 2 + (x - shape[1] / 2) ** 2)
+        return (500.0 * np.exp(-((r - 60.0) / 10.0) ** 2)
+                + rng.poisson(3, size=shape)).astype(float)
+
+    frames = [ScanFrame(i, image=_ring(i),
+                        metadata={"nu": float(i), "del": float(5 * i), "eta": 0.3})
+              for i in range(3)]
+    src = MemoryFrameSource(frames, name="stitch")
+    psic = Diffractometer.psic()
+    diff = Diffractometer(preset="psic", rot1=psic.rot1, rot2=psic.rot2,
+                          incident_angle=psic.incident_angle,
+                          calibration=DetectorCalibration(poni=base))
+
+    mg = run_stitch(StitchPlan(diffractometer=diff, mode="1d", npt_1d=250,
+                               backend="multigeometry"), src)
+    hist = run_stitch(StitchPlan(diffractometer=diff, mode="1d", npt_1d=250,
+                                 backend="pyfai_hist",
+                                 corrections=CorrectionStack(solid_angle=True,
+                                                             polarization_factor=0.99)),
+                      src)
+    assert hist.payload.radial.shape == (250,)
+    # the histogram backend shape-matches MG (absolute vs normalized solid angle)
+    m = (np.isfinite(hist.payload.intensity) & (mg.payload.intensity > 0)
+         & (hist.payload.intensity > 0))
+    scale = np.nanmedian(mg.payload.intensity[m] / hist.payload.intensity[m])
+    rel = np.abs(hist.payload.intensity[m] * scale - mg.payload.intensity[m]) / \
+        np.maximum(np.abs(mg.payload.intensity[m]), 1e-9)
+    assert np.nanmedian(rel) < 0.05
+
+    with pytest.raises(NotImplementedError, match="xu_hist"):
+        run_stitch(StitchPlan(diffractometer=diff, backend="xu_hist"), src)
