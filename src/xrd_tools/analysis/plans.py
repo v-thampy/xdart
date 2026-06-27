@@ -362,8 +362,16 @@ class RSMPlan:
     scout_pad: float = 0.0
     #: per-pixel CorrectionStack (solid-angle / polarization …) folded into the
     #: Σ(raw·w)/Σ(w) grid as the SAME weight stitching uses; None = unit weight
-    #: (the count-mean). Geometry-static (fixed lab detector); GI weights TBD.
+    #: (the count-mean). Geometry-static (fixed lab detector).
     corrections: Any = None
+    #: a GICorrectionStack to add grazing-incidence intensity weighting
+    #: (footprint/Fresnel/absorption) to the grid. Requires gi_incident_angle_deg
+    #: (a FIXED αi). Refraction + per-frame-varying αi + the absolute GI signs are
+    #: the real-data-gated tail (see rsm/corrections.gi_grid_weight).
+    gi: Any = None
+    gi_incident_angle_deg: float | None = None
+    gi_sample_orientation: int = 1
+    gi_tilt_deg: float = 0.0
 
     def provenance(self) -> dict[str, Any]:
         """A JSON-safe record of this RSM run for persistence (pass to
@@ -388,6 +396,8 @@ class RSMPlan:
             "roi": list(self.roi) if self.roi is not None else None,
             "chunk_size": self.chunk_size,
             "corrections": _ser(self.corrections),
+            "gi": _ser(self.gi),
+            "gi_incident_angle_deg": self.gi_incident_angle_deg,
             "diffractometer": (getattr(diff, "preset", None)
                                or getattr(diff, "convention", None)),
         }
@@ -413,6 +423,10 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
             static_mask=plan.static_mask,
             scout_pad=plan.scout_pad,
             corrections=plan.corrections,
+            gi=plan.gi,
+            gi_incident_angle_deg=plan.gi_incident_angle_deg,
+            gi_sample_orientation=plan.gi_sample_orientation,
+            gi_tilt_deg=plan.gi_tilt_deg,
         )
         n_sources = len(inputs)
     else:
@@ -430,6 +444,10 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
             static_mask=plan.static_mask,
             scout_pad=plan.scout_pad,
             corrections=plan.corrections,
+            gi=plan.gi,
+            gi_incident_angle_deg=plan.gi_incident_angle_deg,
+            gi_sample_orientation=plan.gi_sample_orientation,
+            gi_tilt_deg=plan.gi_tilt_deg,
         )
         n_sources = 1
     return AnalysisResult(

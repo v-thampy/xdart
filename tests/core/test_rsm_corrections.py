@@ -95,6 +95,55 @@ class _FakeMapper:
                 np.ascontiguousarray(qz))
 
 
+class TestGiGridWeight:
+    """P6.8 — the GI intensity weight for the RSM grid (footprint·Fresnel·
+    absorption), reusing P4's pyFAI-fiber αf. Refraction + per-frame αi + the
+    absolute GI signs are the real-data-gated tail (not asserted here)."""
+
+    def test_off_factors_reduce_to_unit_weight(self):
+        pytest.importorskip("pyFAI")
+        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.rsm.corrections import gi_grid_weight
+        gi = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=False,
+                               fresnel=False, absorption=False, refraction=False)
+        w = gi_grid_weight(_header(), gi, incident_angle_deg=0.3)
+        np.testing.assert_allclose(w, 1.0)
+
+    def test_footprint_only_is_sin_alpha_i(self):
+        pytest.importorskip("pyFAI")
+        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.rsm.corrections import gi_grid_weight
+        gi = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=True,
+                               fresnel=False, absorption=False, refraction=False)
+        w = gi_grid_weight(_header(), gi, incident_angle_deg=0.3)
+        np.testing.assert_allclose(w, np.sin(np.deg2rad(0.3)))
+
+    def test_rsm_correction_weight_multiplies_gi_in(self):
+        """rsm_correction_weight(corrections, gi) == base × GI weight."""
+        pytest.importorskip("pyFAI")
+        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.stack import CorrectionStack
+        from xrd_tools.rsm.corrections import (
+            gi_grid_weight, rsm_correction_weight,
+        )
+        h = _header()
+        cs = CorrectionStack(solid_angle=True)
+        gi = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=True,
+                               fresnel=True, absorption=False, refraction=False)
+        base = rsm_correction_weight(h, cs)
+        giw = gi_grid_weight(h, gi, incident_angle_deg=0.3)
+        combined = rsm_correction_weight(h, cs, gi=gi, gi_incident_angle_deg=0.3)
+        np.testing.assert_allclose(combined, base * giw)
+
+    def test_gi_requires_fixed_incident_angle(self):
+        pytest.importorskip("pyFAI")
+        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.rsm.corrections import rsm_correction_weight
+        gi = GICorrectionStack(material="Si", energy_eV=10000.0)
+        with pytest.raises(ValueError, match="gi_incident_angle_deg"):
+            rsm_correction_weight(_header(), None, gi=gi)
+
+
 class TestRsmGridCorrectionsWiring:
     """corrections flow end-to-end through the grid and change I."""
 

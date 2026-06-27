@@ -454,6 +454,10 @@ def process_scan_from_nexus(
     static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
     corrections: Any = None,
+    gi: Any = None,
+    gi_incident_angle_deg: float | None = None,
+    gi_sample_orientation: int = 1,
+    gi_tilt_deg: float = 0.0,
 ) -> RSMVolume:
     """Stream-process a frame-source scan into an :class:`RSMVolume`.
 
@@ -507,7 +511,11 @@ def process_scan_from_nexus(
     angles_full = _angles_for_indices(scan, diff_motors)
 
     from xrd_tools.rsm.corrections import rsm_correction_weight  # noqa: PLC0415
-    weight = rsm_correction_weight(mapper.header, corrections, roi=roi)
+    weight = rsm_correction_weight(
+        mapper.header, corrections, gi=gi,
+        gi_incident_angle_deg=gi_incident_angle_deg,
+        gi_sample_orientation=gi_sample_orientation, gi_tilt_deg=gi_tilt_deg,
+        roi=roi)
 
     sg = StreamingGridder(mapper, bins)
     if q_bounds is None:
@@ -563,6 +571,10 @@ def grid_scans_streaming(
     static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
     corrections: Any = None,
+    gi: Any = None,
+    gi_incident_angle_deg: float | None = None,
+    gi_sample_orientation: int = 1,
+    gi_tilt_deg: float = 0.0,
 ) -> RSMVolume:
     """Stream multiple v2 :class:`LiveScan`s into one :class:`RSMVolume`.
 
@@ -605,7 +617,11 @@ def grid_scans_streaming(
     from xrd_tools.rsm.corrections import rsm_correction_weight  # noqa: PLC0415
     for si, energy, _full_angles in resolved:
         # the weight is ROI-cropped to match this scan's chunk images
-        weight = rsm_correction_weight(mapper.header, corrections, roi=si.roi)
+        weight = rsm_correction_weight(
+            mapper.header, corrections, gi=gi,
+            gi_incident_angle_deg=gi_incident_angle_deg,
+            gi_sample_orientation=gi_sample_orientation, gi_tilt_deg=gi_tilt_deg,
+            roi=si.roi)
         for img_chunk, chunk_indices in _iter_scan_chunks(si.scan, chunk_size):
             angles_chunk = _angles_for_indices(
                 si.scan, diff_motors, chunk_indices,
