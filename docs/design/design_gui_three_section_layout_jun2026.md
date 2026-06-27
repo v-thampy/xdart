@@ -9,6 +9,11 @@ This doc is the **CONTROLS** (right column). The companion UI-spec docs:
 onto this layout) and [`design_gui_display_panels_jun2026.md`](design_gui_display_panels_jun2026.md)
 (the **DISPLAY** panels — the Stitch cake-over-1D / RSM 2×3-slices view + the raw-frame & 3D popups).
 
+> **For mockups:** a tightened, self-contained, jargon-free brief of *this* doc — optimized for
+> handing to claude.ai/design to generate UI renders (field tables, state badges, the reactive rule,
+> the mockups to produce) — is
+> [`design_brief_three_section_controls_jun2026.md`](design_brief_three_section_controls_jun2026.md).
+
 ## The principle: GUI sections mirror the headless data model
 
 The headless layer already separates concerns cleanly, so the GUI sections should fall out of it
