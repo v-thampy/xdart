@@ -137,13 +137,43 @@ not in scope. (See the take-stock review for the final recommended shape.)
 
 ---
 
-## Generalization to Int-1D/2D — template, not a refactor
+## Generalization to Int-1D/2D — a MODERATE migration, noted as a direction (not now)
 
 The 3-section structure generalizes: Int / Stitch / RSM / Fitting all fit (1) data, (2) instrument,
-(3) plan. Today the Int "Integrator panel" **mixes** experimental (detector/calibration) and
-processing (npt/unit/corrections) — the 3-section split would separate them. **Do not refactor Int
-now** (it works; no compelling reason yet). The new Stitch/RSM tools adopt this layout as the
-**reference**, and Int can migrate later when there's a reason.
+(3) plan. The new Stitch/RSM tools adopt this layout as the **reference**; Int migrates later. A
+concrete migration assessment (read the current widgets, `aad2247d`) sized it as **MODERATE
+(~6.5–13 h)** — *not straightforward* (so not folded in now), but a re-organisation of already-
+separated pieces, not a redesign.
+
+**What's already separable (the good news):** the wrangler and the integrator own **separate**
+pyqtgraph param trees (no single mixed tree); the **1D and 2D blocks are fully independent**
+(`frame1D`/`frame2D`, `bai_1d_args`/`bai_2d_args`, separate handlers) so the re-slice applies to
+each identically; Tools (`toolsFrame`) + `StaticControls` are already the mode-agnostic panes
+(`staticUI.py`). Only the two middle panes (`wranglerFrame` + `integratorFrame`) get re-sliced.
+
+**What makes it MODERATE (the entanglement at the section-2↔3 boundary):**
+- **`set_image_units()`** (`integrator.py`, the GI↔standard reactivity) straddles the boundary: a
+  section-2c GI toggle must keep re-rendering the section-3 axis/range combos (force unit=Q, disable
+  `chi_offset`, swap to GI axes). Exactly **one** signal crosses today —
+  `integrator.sigUpdateGI → staticWidget.update_scattering_geometry → scan.gi → set_image_units()` —
+  and it must stay wired across the new container boundary (the same state→render flow §3 above).
+- **GI geometry is integrator-owned but conceptually section-2** (`gi_enable`/`gi_motor`/
+  `gi_sample_orientation`/`gi_tilt` live in the integrator; the wrangler keeps a hidden carrier for
+  persistence). Extracting them to section-2 means re-homing those widgets + their session keys.
+- **PONI relocation → progressive disclosure**: moving the PONI param out of the wrangler into
+  section-2b means section-3 visibility should gate on `scan.poni is not None`.
+
+**Migration phases (when there's a reason to do it):** (1) container re-slice — reparent
+`frame1D`/`frame2D` into a section-3 frame, the GI frame into section-2; (2) extract the GI-geometry
+widgets to section-2, keep `sigUpdateGI` routing intact; (3) move the PONI param + gate section-3 on
+PONI-loaded; (4) verify `set_image_units()` still fires on the section-2 GI toggle; (5) session
+backward-compat (old keys fallback). **Signals that must survive:** `sigUpdateGI`, the range-default
+repopulation, the advanced-corrections `sigTreeStateChanged`, the reintegrate dispatch, and
+`get_gi_config()` reading from the new location. **Main risk:** the `set_image_units()`
+disconnect/reconnect + the PONI progressive-disclosure gate.
+
+**Verdict:** worth doing once the Stitch/RSM 3-section layout is proven (so Int inherits a validated
+pattern), but it's real GUI work — **not bundled with the new-tool wiring**.
 
 ---
 
