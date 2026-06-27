@@ -509,6 +509,7 @@ def grid_img_data_streaming(
     roi: tuple[int, int, int, int] | None = None,
     static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
+    weight: np.ndarray | None = None,
 ) -> RSMVolume:
     """Stream a single in-memory image stack through :class:`StreamingGridder`.
 
@@ -564,6 +565,7 @@ def grid_img_data_streaming(
             UB=UB,
             roi=roi,
             static_mask=static_mask,
+            weight=weight,
         )
     return sg.to_volume()
 

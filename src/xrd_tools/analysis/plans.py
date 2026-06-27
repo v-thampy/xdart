@@ -360,6 +360,10 @@ class RSMPlan:
     roi: tuple[int, int, int, int] | None = None
     static_mask: np.ndarray | None = field(default=None, repr=False, compare=False)
     scout_pad: float = 0.0
+    #: per-pixel CorrectionStack (solid-angle / polarization …) folded into the
+    #: Σ(raw·w)/Σ(w) grid as the SAME weight stitching uses; None = unit weight
+    #: (the count-mean). Geometry-static (fixed lab detector); GI weights TBD.
+    corrections: Any = None
 
 
 def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> AnalysisResult:
@@ -381,6 +385,7 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
             q_bounds=plan.q_bounds,
             static_mask=plan.static_mask,
             scout_pad=plan.scout_pad,
+            corrections=plan.corrections,
         )
         n_sources = len(inputs)
     else:
@@ -397,6 +402,7 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
             roi=plan.roi,
             static_mask=plan.static_mask,
             scout_pad=plan.scout_pad,
+            corrections=plan.corrections,
         )
         n_sources = 1
     return AnalysisResult(

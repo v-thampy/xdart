@@ -453,6 +453,7 @@ def process_scan_from_nexus(
     roi: tuple[int, int, int, int] | None = None,
     static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
+    corrections: Any = None,
 ) -> RSMVolume:
     """Stream-process a frame-source scan into an :class:`RSMVolume`.
 
@@ -505,6 +506,9 @@ def process_scan_from_nexus(
         energy = _energy_from_scan(scan)
     angles_full = _angles_for_indices(scan, diff_motors)
 
+    from xrd_tools.rsm.corrections import rsm_correction_weight  # noqa: PLC0415
+    weight = rsm_correction_weight(mapper.header, corrections, roi=roi)
+
     sg = StreamingGridder(mapper, bins)
     if q_bounds is None:
         # Scout uses the full angle arrays + the configured detector
@@ -527,6 +531,7 @@ def process_scan_from_nexus(
             UB=UB,
             roi=roi,
             static_mask=static_mask,
+            weight=weight,
         )
     return sg.to_volume()
 
@@ -557,6 +562,7 @@ def grid_scans_streaming(
     ] | None = None,
     static_mask: np.ndarray | None = None,
     scout_pad: float = 0.0,
+    corrections: Any = None,
 ) -> RSMVolume:
     """Stream multiple v2 :class:`LiveScan`s into one :class:`RSMVolume`.
 
@@ -596,7 +602,10 @@ def grid_scans_streaming(
     else:
         sg.set_bounds(*q_bounds)
 
+    from xrd_tools.rsm.corrections import rsm_correction_weight  # noqa: PLC0415
     for si, energy, _full_angles in resolved:
+        # the weight is ROI-cropped to match this scan's chunk images
+        weight = rsm_correction_weight(mapper.header, corrections, roi=si.roi)
         for img_chunk, chunk_indices in _iter_scan_chunks(si.scan, chunk_size):
             angles_chunk = _angles_for_indices(
                 si.scan, diff_motors, chunk_indices,
@@ -608,5 +617,6 @@ def grid_scans_streaming(
                 UB=si.UB,
                 roi=si.roi,
                 static_mask=static_mask,
+                weight=weight,
             )
     return sg.to_volume()
