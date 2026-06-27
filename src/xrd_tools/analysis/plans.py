@@ -128,6 +128,42 @@ class StitchPlan:
     max_eager_bytes: int | None = 2 * 1024 * 1024 * 1024
     extra: dict[str, Any] = field(default_factory=dict)
 
+    def provenance(self) -> dict[str, Any]:
+        """A JSON-safe record of this stitch for persistence (pass to
+        ``write_stitched(provenance=…)``).
+
+        The merge parameters + the applied corrections — NOT the binary ``mask``
+        nor the full Diffractometer blob (that round-trips separately under
+        ``/entry/diffractometer``; only its preset/convention tag is noted here).
+        """
+        def _ser(obj):
+            to_dict = getattr(obj, "to_dict", None)
+            return to_dict() if callable(to_dict) else None
+
+        prov: dict[str, Any] = {
+            "backend": self.backend,
+            "mode": self.mode,
+            "unit": self.unit,
+            "npt_1d": self.npt_1d,
+            "npt_rad_2d": self.npt_rad_2d,
+            "npt_azim_2d": self.npt_azim_2d,
+            "radial_range": list(self.radial_range) if self.radial_range else None,
+            "azimuth_range": (list(self.azimuth_range)
+                              if self.azimuth_range else None),
+            "monitor_key": self.monitor_key,
+            "corrections": _ser(self.corrections),
+            "gi": _ser(self.gi),
+        }
+        if self.gi is not None:
+            prov["gi_incident_angle_deg"] = self.gi_incident_angle_deg
+            prov["gi_sample_orientation"] = self.gi_sample_orientation
+            prov["gi_tilt_deg"] = self.gi_tilt_deg
+        diff = self.diffractometer
+        if diff is not None:
+            prov["diffractometer"] = (getattr(diff, "preset", None)
+                                      or getattr(diff, "convention", None))
+        return prov
+
 
 def run_stitch(
     plan: StitchPlan,

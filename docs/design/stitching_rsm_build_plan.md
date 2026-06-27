@@ -64,8 +64,13 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
   `Diffractometer.incident_angle` mapping. **Gated headless:** GI-off ≡ non-GI; footprint-only
   ⇒ `I = I_nonGI / sin αi`; refraction toggle; backend/diffractometer guards. **NOT validated:**
   the absolute composition signs (P2b flag) + `sample_orientation`/`tilt` — pending GIXSGUI.
-- **P5 — persistence**: register `stitched_1d/2d` schema groups + capability (mirror the
-  `diffractometer` group), persist the applied-`CorrectionStack` + plan provenance.
+- **P5 — persistence ✓ DONE** (`io/schema.py` + `io/nexus.py`): registered `stitched_1d/2d`
+  as schema groups + capabilities (mirroring the `diffractometer` group — optional, feature-
+  detected via `detect_capabilities`, schema-validated when present). `write_stitched` now
+  stamps a `provenance_json` vlen-UTF8 blob (the `StitchPlan` + applied `CorrectionStack`/
+  `GICorrectionStack` via the new `StitchPlan.provenance()`); `read_stitched` parses it back
+  onto the `xr.Dataset.attrs`. Round-trip + capability + validation gated headless. The
+  binary stitch pattern already round-tripped; P5 adds the registry + provenance.
 - **P6 — RSM**: unify the RSM pipeline onto the one `Diffractometer` + the shared accumulator +
   the `CorrectionStack` weight.
 - **P7 — [LIVE-GATED] GUI**: Stitch viewer controller + layout, the wrangler stitch/GI panels,
@@ -84,9 +89,10 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
 
 ## Status
 Geometry (ADR-0007 steps 0–5 + 4b `refine_goniometer`) — **done, reviewed, green**.
-**P1, P2a, P2b, P3a, P3b, P3-review, P4 — done + gated** (P4 headless; its absolute GI
-convention is live-gated, αf/q_z maps delegated to pyFAI + pinned). **P3c (`xu_hist`) and the
-P4 GI-sign validation share the same real-data gate** — both need the notebook to confirm a
-geometry convention, so they're batched for the next live/real-data session. Next headless:
-**P5 (persistence)** — convention-independent, fully round-trip-gateable. Then P6 (RSM),
-P7 (live GUI). The live tail is P7 + the two convention validations.
+**P1, P2a, P2b, P3a, P3b, P3-review, P4, P5 — done + gated** (P4 headless; its absolute GI
+convention is live-gated, αf/q_z maps delegated to pyFAI + pinned. P5 fully round-trip-gated).
+**P3c (`xu_hist`) and the P4 GI-sign validation share the same real-data gate** — both need
+the notebook to confirm a geometry convention, batched for the next live/real-data session.
+Next headless: **P6 (RSM)** — unify the RSM pipeline onto the one `Diffractometer` + the shared
+accumulator + the `CorrectionStack`. Then P7 (live GUI). The live tail is P7 + the two
+convention validations.

@@ -33,6 +33,7 @@ Performance features:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import warnings
@@ -1890,6 +1891,7 @@ def write_stitched(
     *,
     stitched_1d: IntegrationResult1D | None = None,
     stitched_2d: IntegrationResult2D | None = None,
+    provenance: "Mapping[str, object] | str | None" = None,
     compression: str | None = None,
 ) -> None:
     """Write ``/entry/stitched_1d`` / ``/entry/stitched_2d`` — the symmetric
@@ -1900,8 +1902,18 @@ def write_stitched(
     **as-is** ``(n_q, n_chi)`` and read back with dims ``(q, chi)`` — this
     matches the existing xdart writer + ``read_stitched`` so files stay
     interchangeable.  Each group is replaced atomically (idempotent).
+
+    ``provenance`` (the StitchPlan + applied CorrectionStack — typically
+    ``StitchPlan.provenance()``) is stamped into each written group as a
+    ``provenance_json`` vlen-UTF8 blob, the same idiom as the diffractometer
+    ``config_json``; ``None`` writes no blob.  A dict is JSON-encoded; a str is
+    written verbatim (assumed already-JSON).
     """
     ck = _comp_kwargs(compression)
+    prov_json: str | None = None
+    if provenance is not None:
+        prov_json = provenance if isinstance(provenance, str) else json.dumps(
+            provenance, default=str)
 
     if stitched_1d is not None:
         if "stitched_1d" in entry_grp:
@@ -1917,6 +1929,8 @@ def write_stitched(
         if stitched_1d.sigma is not None:
             g.create_dataset("sigma",
                              data=np.asarray(stitched_1d.sigma, np.float32), **ck)
+        if prov_json is not None:
+            g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
 
     if stitched_2d is not None:
         if "stitched_2d" in entry_grp:
@@ -1931,6 +1945,8 @@ def write_stitched(
         qd.attrs["units"] = stitched_2d.unit
         cd = g.create_dataset("chi", data=np.asarray(stitched_2d.azimuthal, np.float32))
         cd.attrs["units"] = stitched_2d.azimuthal_unit
+        if prov_json is not None:
+            g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
 
 
 def _reindex_scan_data_to_frames(scan_data, frame_indices):
@@ -3085,6 +3101,20 @@ def read_stitched(
     path = Path(path)
     data_vars: dict[str, tuple] = {}
     coords: dict[str, np.ndarray] = {}
+    attrs: dict[str, object] = {}
+
+    def _read_provenance(g):
+        """The provenance_json blob → a parsed dict (or the raw string if it
+        isn't JSON; absent → None)."""
+        if "provenance_json" not in g:
+            return None
+        raw = g["provenance_json"][()]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return str(raw)
 
     with h5py.File(path, "r") as f:
         if entry not in f:
@@ -3102,6 +3132,9 @@ def read_stitched(
                 data_vars["stitched_1d_sigma"] = (
                     ("q",), np.asarray(g["sigma"][()])
                 )
+            prov = _read_provenance(g)
+            if prov is not None:
+                attrs["stitched_1d_provenance"] = prov
         if has_2d:
             g = e["stitched_2d"]
             coords.setdefault("q", np.asarray(g["q"][()]))
@@ -3109,8 +3142,11 @@ def read_stitched(
             data_vars["stitched_2d"] = (
                 ("q", "chi"), np.asarray(g["intensity"][()])
             )
+            prov = _read_provenance(g)
+            if prov is not None:
+                attrs["stitched_2d_provenance"] = prov
 
-    return xr.Dataset(data_vars=data_vars, coords=coords)
+    return xr.Dataset(data_vars=data_vars, coords=coords, attrs=attrs)
 
 
 __all__ = [
