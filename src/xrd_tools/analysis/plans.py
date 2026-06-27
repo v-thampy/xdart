@@ -153,6 +153,47 @@ class StitchPlan:
                                       or getattr(diff, "convention", None))
         return prov
 
+    @classmethod
+    def from_provenance(
+        cls,
+        prov: "dict[str, Any]",
+        *,
+        diffractometer: Any = None,
+        base_poni: "PONI | None" = None,
+        mask: "np.ndarray | None" = None,
+    ) -> "StitchPlan":
+        """Rebuild a StitchPlan from a :meth:`provenance` dict — the reload half of
+        the round-trip (e.g. to repopulate the GUI processing panel from a saved
+        ``.nxs``).
+
+        Only the **processing options** round-trip through provenance; the
+        geometry (``diffractometer``/``base_poni``) + the binary ``mask`` are NOT
+        in it (they persist separately, e.g. under ``/entry/diffractometer``) —
+        pass them in to reattach.
+        """
+        from xrd_tools.corrections.grazing import GISettings  # noqa: PLC0415
+        from xrd_tools.corrections.stack import CorrectionStack  # noqa: PLC0415
+        corr = prov.get("corrections")
+        gi = prov.get("gi")
+        rr = prov.get("radial_range")
+        ar = prov.get("azimuth_range")
+        return cls(
+            diffractometer=diffractometer,
+            base_poni=base_poni,
+            mask=mask,
+            backend=prov.get("backend", "multigeometry"),
+            mode=prov.get("mode", "1d"),
+            unit=prov.get("unit", "q_A^-1"),
+            npt_1d=int(prov.get("npt_1d", 2000)),
+            npt_rad_2d=int(prov.get("npt_rad_2d", 1500)),
+            npt_azim_2d=int(prov.get("npt_azim_2d", 720)),
+            radial_range=tuple(rr) if rr else None,
+            azimuth_range=tuple(ar) if ar else None,
+            monitor_key=prov.get("monitor_key"),
+            corrections=CorrectionStack.from_dict(corr) if corr else None,
+            gi=GISettings.from_dict(gi) if gi else None,
+        )
+
 
 def run_stitch(
     plan: StitchPlan,
@@ -263,6 +304,20 @@ def run_stitch(
             # 2D uses the 2D radial bin count; 1D uses the 1D count.
             npt_rad = plan.npt_rad_2d if plan.mode == "2d" else plan.npt_1d
             if plan.gi is not None:
+                # The GI optical constants use gi.corrections.energy_eV — warn if
+                # it diverges from the canonical calibration wavelength (one
+                # energy, the calibration's, is the source of truth).
+                _gc = getattr(plan.gi, "corrections", None)
+                _cal = getattr(diffractometer, "calibration", None)
+                _wl = getattr(getattr(_cal, "poni", None), "wavelength", None)
+                if _gc is not None and _wl:
+                    from xrd_tools.core.energy import (  # noqa: PLC0415
+                        check_energy_consistency, wavelength_m_to_energy_eV)
+                    check_energy_consistency(
+                        getattr(_gc, "energy_eV", None),
+                        wavelength_m_to_energy_eV(_wl),
+                        what_a="GICorrectionStack.energy_eV",
+                        what_b="calibration wavelength")
                 # per-frame αi: explicit fixed angle (gi.incident_angle_deg), else
                 # the Diffractometer's incident_angle mapping (degrees).
                 if plan.gi.incident_angle_deg is not None:
@@ -396,6 +451,40 @@ class RSMPlan:
             "diffractometer": (getattr(diff, "preset", None)
                                or getattr(diff, "convention", None)),
         }
+
+    @classmethod
+    def from_provenance(
+        cls,
+        prov: "dict[str, Any]",
+        *,
+        mapper: Any = None,
+        UB: "np.ndarray | None" = None,
+        static_mask: "np.ndarray | None" = None,
+    ) -> "RSMPlan":
+        """Rebuild an RSMPlan from a :meth:`provenance` dict — the reload half of
+        the round-trip.  The ``mapper`` (PixelQMap/geometry), ``UB``, and the
+        binary ``static_mask`` are NOT in provenance (they come from the scan /
+        the persisted geometry) — pass them in to reattach.
+        """
+        from xrd_tools.corrections.grazing import GISettings  # noqa: PLC0415
+        from xrd_tools.corrections.stack import CorrectionStack  # noqa: PLC0415
+        corr = prov.get("corrections")
+        gi = prov.get("gi")
+        qb = prov.get("q_bounds")
+        roi = prov.get("roi")
+        return cls(
+            mapper=mapper,
+            UB=UB,
+            static_mask=static_mask,
+            bins=tuple(prov.get("bins", (101, 101, 101))),
+            diff_motors=tuple(prov.get("diff_motors", ())),
+            energy=prov.get("energy"),
+            q_bounds=(tuple(tuple(r) for r in qb) if qb is not None else None),
+            roi=tuple(roi) if roi else None,
+            chunk_size=int(prov.get("chunk_size", 8)),
+            corrections=CorrectionStack.from_dict(corr) if corr else None,
+            gi=GISettings.from_dict(gi) if gi else None,
+        )
 
 
 def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> AnalysisResult:

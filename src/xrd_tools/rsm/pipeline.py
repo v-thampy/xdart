@@ -298,13 +298,14 @@ class _ScanLike(Protocol):
 def _energy_from_scan(scan: _ScanLike) -> float:
     """Resolve X-ray energy in eV from the scan's stored wavelength.
 
-    ``scan.mg_args['wavelength']`` is in metres (pyFAI convention),
-    so ``E = h c / λ`` simplifies to ``E_eV = 12398 / λ_Å``.
+    ``scan.mg_args['wavelength']`` is in metres (pyFAI convention); the
+    conversion is the single canonical one in :mod:`xrd_tools.core.energy`.
     """
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV  # noqa: PLC0415
     mg_args = getattr(scan, "mg_args", {}) or {}
     wavelength_m = mg_args.get("wavelength")
     if wavelength_m and wavelength_m > 0:
-        return 12398.0 / (float(wavelength_m) * 1e10)
+        return wavelength_m_to_energy_eV(float(wavelength_m))
     explicit_energy_eV = getattr(scan, "energy_eV", None)
     if explicit_energy_eV is not None and np.isfinite(explicit_energy_eV):
         return float(explicit_energy_eV)

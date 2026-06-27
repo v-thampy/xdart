@@ -217,12 +217,13 @@ def _make_scan(
 
 class TestEnergyFromSphere:
     def test_wavelength_to_eV(self) -> None:
-        # 1.10 Å ≈ 11271.0 eV (12398 / 1.10)
+        # 1.10 Å ≈ 11271 eV — via the single canonical conversion
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
         scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
                              {"tth": [0.0]},
                              wavelength_m=1.10e-10)
         e = _energy_from_scan(scan)
-        assert e == pytest.approx(12398.0 / 1.10, rel=1e-6)
+        assert e == pytest.approx(wavelength_m_to_energy_eV(1.10e-10), rel=1e-9)
 
     def test_missing_wavelength_raises(self) -> None:
         scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
