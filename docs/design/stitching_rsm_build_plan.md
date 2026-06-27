@@ -89,11 +89,25 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
     to_ai` (xu mm header → fixed-lab pyFAI ai; gate: solid angle peaks at the beam centre) +
     `rsm_correction_weight` (the same `CorrectionStack.normalization` stitch uses; wavelength-
     independent, computed once; geometry-static). Threaded run_rsm → pipeline → `add(weight=)`.
-  - **Remaining:** P6.4 reconcile `PixelQMap` onto the canonical `Diffractometer` (drop-in works
-    through `pixel_q`; needs the legacy-equivalence identity gate). P6.5 `xu_q_frames` provider
-    (dead-but-proven → unblocks P3c). P6.6 vendor the real RSM fixture + the equivalence spine.
-    P6.7 `RSMVolume ↔ NeXus` persistence. **Convention/live-gated:** P6.3 `assemble_circle_angles`
-    (circle order) + P6.8 GI RSM seam (`gi_normalization`/`refract_q` signs) — batch with P3c/P4.
+  - **P6.3 ✓ DONE** (`f5bae7a`): `assemble_circle_angles` (`circle_motors` → per-frame xu angle
+    vector) — the shared blocker for RSM-GI + the xu_hist stitch. Convention CARRIED in the
+    preset's `circle_motors`, not invented; gate = byte-equal to the legacy explicit-`diff_motors`
+    path + q-identity through `pixel_q`. (Production reroute deferred — convention-gated.)
+  - **P6.4 ✓ DONE** (`f79806b`): the canonical `Diffractometer` is a byte-equal `PixelQMap`
+    drop-in (`from_diffractometer_config` identity through `pixel_q`, every convention knob).
+  - **P6.5 ✓ DONE** (`7607787`): `xu_q_frames` provider (dead-but-proven → P3c is pure wiring).
+    `|q|` gate-checked; χ azimuth flagged pending the P3c real-data gate (== pyFAI chiArray).
+  - **P6.6 ✓ DONE** (`83a51b7`): the equivalence spine — streaming ≡ single-shot + chunk-
+    invariant, WITH corrections on (the cases never compared on real intensities before).
+  - **P6.7 ✓ DONE** (`c50fcb6`): `RSMVolume ↔ NeXus` (`write_rsm`/`read_rsm`) + the `rsm` schema
+    group/capability + provenance, mirroring the P5 stitched persistence.
+  - **P6.8 ✓ DONE (intensity weight; refraction live-gated)** (`71c26a2`): `RSMPlan.gi` +
+    `gi_grid_weight` — the GI footprint/Fresnel/absorption weight, reusing P4's pyFAI-fiber αf
+    (convention-pinned). FIXED-incidence only; **refraction (qz rewrite in 3-D) + per-frame αi +
+    the absolute GI signs are the real-data-gated tail** (batch with P3c/P4 GI validation).
+  - **All 8 sub-steps committed, core 1301✓.** Remaining for P6: the production angle-assembly
+    reroute + the GI refraction/convention — all real-data-gated (the live tail), batched with
+    P3c + the P4 GI-sign validation.
 - **P7 — [LIVE-GATED] GUI**: Stitch viewer controller + layout, the wrangler stitch/GI panels,
   the Refine button (wrapping `refine_goniometer`). Thin, isolated; the only part that waits.
 
@@ -110,10 +124,11 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
 
 ## Status
 Geometry (ADR-0007 steps 0–5 + 4b `refine_goniometer`) — **done, reviewed, green**.
-**P1, P2a, P2b, P3a, P3b, P3-review, P4, P5 — done + gated** (P4 headless; its absolute GI
-convention is live-gated, αf/q_z maps delegated to pyFAI + pinned. P5 fully round-trip-gated).
-**P3c (`xu_hist`) and the P4 GI-sign validation share the same real-data gate** — both need
-the notebook to confirm a geometry convention, batched for the next live/real-data session.
-Next headless: **P6 (RSM)** — unify the RSM pipeline onto the one `Diffractometer` + the shared
-accumulator + the `CorrectionStack`. Then P7 (live GUI). The live tail is P7 + the two
-convention validations.
+**P1, P2a, P2b, P3a, P3b, P3-review, P4, P5, P6 (all 8 sub-steps) — done + gated** (core 1301✓).
+P6 unified RSM onto the one `Diffractometer` + the shared Σ(raw·w)/Σ(w) accumulator + the
+`CorrectionStack` (+ the shared `assemble_circle_angles` + `xu_q_frames` that make P3c pure
+wiring + RSM persistence + the GI intensity-weight seam). **The real-data gate now batches:**
+P3c (`xu_hist`) circle order, the P4 GI-sign validation, the xu_q_frames χ azimuth (== pyFAI
+chiArray), and the P6 GI refraction/convention + production angle-assembly reroute — all need
+the notebook to confirm a geometry convention. Next headless: **P7 (live GUI)** — the only
+remaining tail besides the batched convention validations.
