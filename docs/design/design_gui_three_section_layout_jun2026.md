@@ -167,14 +167,64 @@ step 1 of the GUI design**, not a chore after it.
 
 ---
 
-## Open questions (for the take-stock review + Vivek)
+## Open questions (for Vivek)
 
-- Final `GISettings` shape — new object vs extend `GIMode`; does energy/material belong on
-  `GISettings` or stay section-2-global?
-- Energy/UB home — section 2d (beam) + 2c (sample), or a separate panel?
-- How much of section 2 is read-only-after-load vs editable (e.g. can you override an
-  auto-inferred motor mapping)?
+- **Energy single-source (decision needed).** The take-stock found energy triple-sourced
+  (`RSMPlan.energy` / `GICorrectionStack.energy_eV` / calibration wavelength). Recommend: the
+  **calibration wavelength** is the source of truth (it persists under `/entry/diffractometer`);
+  `RSMPlan.energy` + `GICorrectionStack.energy_eV` *derive/validate* against it. Confirm, then it's
+  a small headless fix.
+- **GISettings self-contained vs section-2-global energy/material?** `GISettings` is built (new
+  object, separate from `GIMode` — resolved). Open: should it carry its own energy/material, or
+  read them from section-2-global (since the non-GI `CorrectionStack` + q-conversion need energy
+  too)? Lean: section-2-global, decide during the notebook refresh.
+- Read-only-after-load vs editable section 2 (e.g. override an auto-inferred motor mapping?).
 - Multi-scan section-1 selector UX for Stitch / multi-scan RSM.
+
+## Take-stock review refinements (`wbalkxzey`, Jun 2026)
+
+A multi-agent take-stock confirmed the 3-section split is "a presentation re-grouping
+over an already-separated core" — low-risk. Refinements + corrections:
+
+**Already done (don't redo):** the GI-knob consolidation into `GISettings` (`grazing.py`);
+`stitched_1d/2d` + `rsm` ARE schema-registered + capability-gated (P5/P6.7); `pyfai_q_frames`
+computes the correction weight **per-frame** (the stitch is not geometry-static — only the
+RSM weight is, by design).
+
+**The real pre-GUI contract fixes (small, headless, do first):**
+1. **Energy single-source (HIGH).** Energy enters three ways — `RSMPlan.energy`,
+   `GICorrectionStack.energy_eV` (eV), and the calibration **wavelength** (`/entry/diffractometer`).
+   Pick one source of truth (the calibration wavelength — it persists), and make the others
+   *derive/validate* against it, before a section-2 energy widget binds to it. **Decision needed**
+   (see Open questions).
+2. **`StitchPlan.from_provenance` / `RSMPlan.from_provenance` (MEDIUM-HIGH).** The plans have
+   `provenance()` (write) but no inverse — section-3 reload needs the rebuild path. Add it during
+   the notebook refresh (a persist→read→rebuild cell forces it).
+3. `DetectorHeader` is mm while PONI is SI — gate with a unit assertion (LOW footgun).
+
+**Two silent assumptions → become GUI rules (the review surfaced these):**
+- **`multigeometry` ignores `corrections`/`gi`** — it uses pyFAI's *own* correctSolidAngle/
+  polarization. `run_stitch` now **warns**; the GUI must **disable/relabel the section-3
+  CorrectionStack + GI toggles when backend = multigeometry** (else users believe they applied
+  the shared pre-weight when they didn't).
+- **Stitch-2D `pyfai_hist` χ axis is provisional** (`stitch_hist.py` χ = `atan2(qz,qy)`, P3c-gated
+  vs pyFAI `chiArray`). Until P3c clears, **default Stitch-2D to `multigeometry`** or surface a
+  "provisional azimuth" note. (1D `|q|` is convention-free and safe.)
+
+**Concrete current-widget anchors (for the re-slice):**
+- The **PONI param** currently lives in the *wrangler* (`image_wrangler.py`) — **move it to
+  section-2b detector config**, carrying its run-precondition gate.
+- The section-2→3 **reactivity already exists** as `set_image_units` (`integrator.py`): GI vs
+  standard repopulates the axis combos, forces unit=Q, disables `chi_offset`. Wire the new
+  layout's 2c→3 coupling as the same **state→render** one-direction flow the display layer uses.
+- **Tools** (Calibrate/Refine/Mask — the *producers* of section-2 state) and **`StaticControls`**
+  (mode + Start/Pause) stay as the two mode-agnostic panes; re-slice **only the two middle panes**.
+- The 1D/2D blocks are parallel + dimension-neutral — the re-slice maps onto each independently,
+  preserving every integrate/reintegrate signal. No 1D/2D rewrite.
+
+**UB / sample is its own block (2d), not folded into diff/detector** — per ADR-0007 the UB +
+energy "come from the scan, not the goniometer"; UB is a separate persisted group. Add a distinct
+**2d sample/UB sub-block** (RSM-relevant, sourced from the scan, editable for override).
 
 ## Sequenced next steps
 
