@@ -137,43 +137,20 @@ not in scope. (See the take-stock review for the final recommended shape.)
 
 ---
 
-## Generalization to Int-1D/2D — a MODERATE migration, noted as a direction (not now)
+## Generalization to Int-1D/2D — a MODERATE migration, fully designed
 
 The 3-section structure generalizes: Int / Stitch / RSM / Fitting all fit (1) data, (2) instrument,
-(3) plan. The new Stitch/RSM tools adopt this layout as the **reference**; Int migrates later. A
-concrete migration assessment (read the current widgets, `aad2247d`) sized it as **MODERATE
-(~6.5–13 h)** — *not straightforward* (so not folded in now), but a re-organisation of already-
-separated pieces, not a redesign.
+(3) plan. The new Stitch/RSM tools adopt this layout as the **reference**; Int then migrates onto it.
+Sized at **MODERATE (~6.5–13 h)** (analysis `aad2247d`) — a re-organisation of already-separated
+widgets (the wrangler + integrator own *separate* param trees; 1D/2D are fully independent; Tools +
+StaticControls are already mode-agnostic), *not* a redesign. The one real coupling is
+`set_image_units()` (the GI↔standard reactivity) straddling the section-2↔3 boundary.
 
-**What's already separable (the good news):** the wrangler and the integrator own **separate**
-pyqtgraph param trees (no single mixed tree); the **1D and 2D blocks are fully independent**
-(`frame1D`/`frame2D`, `bai_1d_args`/`bai_2d_args`, separate handlers) so the re-slice applies to
-each identically; Tools (`toolsFrame`) + `StaticControls` are already the mode-agnostic panes
-(`staticUI.py`). Only the two middle panes (`wranglerFrame` + `integratorFrame`) get re-sliced.
-
-**What makes it MODERATE (the entanglement at the section-2↔3 boundary):**
-- **`set_image_units()`** (`integrator.py`, the GI↔standard reactivity) straddles the boundary: a
-  section-2c GI toggle must keep re-rendering the section-3 axis/range combos (force unit=Q, disable
-  `chi_offset`, swap to GI axes). Exactly **one** signal crosses today —
-  `integrator.sigUpdateGI → staticWidget.update_scattering_geometry → scan.gi → set_image_units()` —
-  and it must stay wired across the new container boundary (the same state→render flow §3 above).
-- **GI geometry is integrator-owned but conceptually section-2** (`gi_enable`/`gi_motor`/
-  `gi_sample_orientation`/`gi_tilt` live in the integrator; the wrangler keeps a hidden carrier for
-  persistence). Extracting them to section-2 means re-homing those widgets + their session keys.
-- **PONI relocation → progressive disclosure**: moving the PONI param out of the wrangler into
-  section-2b means section-3 visibility should gate on `scan.poni is not None`.
-
-**Migration phases (when there's a reason to do it):** (1) container re-slice — reparent
-`frame1D`/`frame2D` into a section-3 frame, the GI frame into section-2; (2) extract the GI-geometry
-widgets to section-2, keep `sigUpdateGI` routing intact; (3) move the PONI param + gate section-3 on
-PONI-loaded; (4) verify `set_image_units()` still fires on the section-2 GI toggle; (5) session
-backward-compat (old keys fallback). **Signals that must survive:** `sigUpdateGI`, the range-default
-repopulation, the advanced-corrections `sigTreeStateChanged`, the reintegrate dispatch, and
-`get_gi_config()` reading from the new location. **Main risk:** the `set_image_units()`
-disconnect/reconnect + the PONI progressive-disclosure gate.
-
-**Verdict:** worth doing once the Stitch/RSM 3-section layout is proven (so Int inherits a validated
-pattern), but it's real GUI work — **not bundled with the new-tool wiring**.
+**The full structural design — widget-move table, the section-2 panel, the signal re-wiring, a
+wireframe, the phased plan, and the open UX questions — is in
+[`design_gui_int_migration_jun2026.md`](design_gui_int_migration_jun2026.md)** (ready for UI mockups
+→ Qt implementation). Do it **once the Stitch/RSM layout is proven**, so Int inherits a validated
+pattern; not bundled with the new-tool wiring.
 
 ---
 
@@ -204,10 +181,11 @@ step 1 of the GUI design**, not a chore after it.
   **calibration wavelength** is the source of truth (it persists under `/entry/diffractometer`);
   `RSMPlan.energy` + `GICorrectionStack.energy_eV` *derive/validate* against it. Confirm, then it's
   a small headless fix.
-- **GISettings self-contained vs section-2-global energy/material?** `GISettings` is built (new
-  object, separate from `GIMode` — resolved). Open: should it carry its own energy/material, or
-  read them from section-2-global (since the non-GI `CorrectionStack` + q-conversion need energy
-  too)? Lean: section-2-global, decide during the notebook refresh.
+- **GISettings energy/material — RESOLVED: section-2-global** (Vivek, Jun 2026). `GISettings` does
+  *not* carry its own energy/material; the `GICorrectionStack` inside it keeps its `energy_eV`/
+  `material` fields, but the GUI **binds them to the section-2 globals** (2d energy / 2c sample
+  material). Energy already has a canonical source (the calibration wavelength) + a divergence
+  guard (`check_energy_consistency`); UB is likewise section-2-global. No headless change needed.
 - Read-only-after-load vs editable section 2 (e.g. override an auto-inferred motor mapping?).
 - Multi-scan section-1 selector UX for Stitch / multi-scan RSM.
 
