@@ -118,6 +118,78 @@ def test_run_stitch_runs_real_synthetic_multigeometry():
     assert result.provenance["frame_indices"] == [0, 1, 2]
 
 
+def _pilatus_poni():
+    from xrd_tools.core.containers import PONI
+    shape = (195, 487)
+    return shape, PONI(
+        dist=0.2, poni1=shape[0] * 172e-6 / 2.0, poni2=shape[1] * 172e-6 / 2.0,
+        rot1=0.0, rot2=0.0, rot3=0.0, wavelength=1.0e-10, detector="Pilatus100k")
+
+
+def _ring_source(name, *, n, rot_base, source_path):
+    shape, _ = _pilatus_poni()
+
+    def _ring(seed):
+        rng = np.random.default_rng(seed)
+        ny, nx = shape
+        y, x = np.mgrid[:ny, :nx]
+        r = np.sqrt((y - ny / 2.0) ** 2 + (x - nx / 2.0) ** 2)
+        return (500.0 * np.exp(-((r - 60.0) / 10.0) ** 2)
+                + rng.poisson(3, size=shape)).astype(float)
+
+    frames = [ScanFrame(i, image=_ring(rot_base * 10 + i),
+                        metadata={"rot1": float(rot_base + 5 * i), "I0": float(10 + i)},
+                        source_path=source_path, source_frame_index=i)
+              for i in range(1, n + 1)]
+    return MemoryFrameSource(frames, name=name)
+
+
+def test_run_stitch_single_in_a_list_is_equivalent_to_bare_source():
+    """A group of ONE source must reduce to exactly the single-source result (no
+    spurious CompositeFrameSource re-indexing)."""
+    _, base_poni = _pilatus_poni()
+    src = _ring_source("s", n=3, rot_base=0, source_path="/data/s.h5")
+    plan = StitchPlan(base_poni=base_poni, rot1_key="rot1", mode="1d", npt_1d=200)
+
+    bare = run_stitch(plan, src)
+    grouped = run_stitch(plan, [src])
+
+    np.testing.assert_array_equal(bare.payload.radial, grouped.payload.radial)
+    np.testing.assert_array_equal(bare.payload.intensity, grouped.payload.intensity)
+    # both flat (single scan, no scan_labels) → scan_label None
+    assert {r["scan_label"] for r in bare.frame_records} == {None}
+    assert [r["frame_index"] for r in bare.frame_records] == [1, 2, 3]
+
+
+def test_run_stitch_groups_multiple_sources_and_tags_frame_records():
+    """Two scans grouped → one merged payload + scan-tagged contributing-frame
+    records (per-scan labels, real scan numbers via scan_labels)."""
+    _, base_poni = _pilatus_poni()
+    s5 = _ring_source("s5", n=2, rot_base=0, source_path="/data/scan5.h5")
+    s7 = _ring_source("s7", n=2, rot_base=30, source_path="/data/scan7.h5")
+    plan = StitchPlan(base_poni=base_poni, rot1_key="rot1", mode="1d", npt_1d=200)
+
+    result = run_stitch(plan, [s5, s7], scan_labels=[5, 7])
+
+    assert result.kind == "stitch"
+    assert result.payload.radial.shape == (200,)
+    assert np.nanmax(result.payload.intensity) > 0
+    # 4 contributing frames, scan-tagged with per-scan labels 5-1,5-2,7-1,7-2
+    tagged = [(r["scan_label"], r["frame_index"], r["source_path"])
+              for r in result.frame_records]
+    assert tagged == [
+        (5, 1, "/data/scan5.h5"), (5, 2, "/data/scan5.h5"),
+        (7, 1, "/data/scan7.h5"), (7, 2, "/data/scan7.h5"),
+    ]
+
+
+def test_run_stitch_empty_group_raises():
+    _, base_poni = _pilatus_poni()
+    plan = StitchPlan(base_poni=base_poni, rot1_key="rot1", mode="1d", npt_1d=8)
+    with pytest.raises(ValueError, match="empty source group"):
+        run_stitch(plan, [])
+
+
 def test_canonical_scan_exposes_scan_data_for_rsm_consumers():
     scan = Scan(
         "scan",
@@ -156,6 +228,24 @@ def test_run_rsm_delegates_single_and_multi_source(monkeypatch):
     assert calls[0][4]["energy"] == 12000.0
     assert calls[1][0] == "multi"
     assert calls[1][1][0].scan is source
+
+
+def test_run_rsm_attaches_scan_tagged_frame_records(monkeypatch):
+    """run_rsm carries the raw-popup records too — a grouped RSM tags each
+    contributing frame by its scan (RSM has the raw popup as well)."""
+    monkeypatch.setattr(plan_mod, "grid_scans_streaming",
+                        lambda *a, **k: "volume-multi")
+    s5 = MemoryFrameSource(
+        [ScanFrame(1, image=np.ones((2, 2)), source_path="/d/scan5.h5", source_frame_index=1)],
+        name="s5")
+    s7 = MemoryFrameSource(
+        [ScanFrame(1, image=np.ones((2, 2)), source_path="/d/scan7.h5", source_frame_index=1)],
+        name="s7")
+    plan = RSMPlan(mapper=object(), diff_motors=("th",), bins=(3, 4, 5), energy=12000.0)
+
+    result = run_rsm(plan, [s5, s7], scan_labels=[5, 7])
+    assert [(r["scan_label"], r["frame_index"], r["source_path"]) for r in result.frame_records] == [
+        (5, 1, "/d/scan5.h5"), (7, 1, "/d/scan7.h5")]
 
 
 def test_peak_fit_plan_and_result_envelope_are_json_safe(monkeypatch):

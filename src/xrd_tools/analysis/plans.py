@@ -69,6 +69,12 @@ class AnalysisResult:
     kind: str
     payload: Any
     provenance: dict[str, Any] = field(default_factory=dict)
+    #: per-frame source records for a grouped/single Stitch/RSM result — the
+    #: raw-popup enabler the whole-result writer persists via
+    #: ``write_stitched(frame_records=…)`` / ``write_rsm(frame_records=…)``.  Not
+    #: provenance (it can carry binary thumbnails); excluded from to_dict/to_json.
+    frame_records: list[dict[str, Any]] | None = field(
+        default=None, repr=False, compare=False)
 
     def to_dict(self, *, include_payload: bool = True) -> dict[str, Any]:
         data = {
@@ -195,15 +201,49 @@ class StitchPlan:
         )
 
 
+def _harvest_frame_records(source, scan_labels):
+    """Fail-soft wrapper around :func:`harvest_frame_records` — the per-frame raw
+    pointers are an enhancement (the raw popup), never core to the reduction, so a
+    harvest failure logs and yields ``None`` rather than killing the run."""
+    try:
+        from xrd_tools.io.nexus_record import harvest_frame_records  # noqa: PLC0415
+        return harvest_frame_records(source, scan_labels=scan_labels)
+    except Exception:  # noqa: BLE001
+        logger.debug("frame-record harvest failed; raw popup will be unavailable",
+                     exc_info=True)
+        return None
+
+
 def run_stitch(
     plan: StitchPlan,
-    source: FrameSource,
+    source: FrameSource | Sequence[FrameSource],
     *,
     frame_indices: Sequence[int] | None = None,
+    scan_labels: Sequence[Any] | None = None,
 ) -> AnalysisResult:
-    """Run MultiGeometry stitching over any headless frame source."""
+    """Run MultiGeometry stitching over one headless frame source or a GROUP.
 
-    src = ensure_frame_source(source)
+    A group (a sequence of sources — a multi-scan stitch) is concatenated into one
+    :class:`~xrd_tools.sources.composite.CompositeFrameSource` and merged as a
+    single output, frames re-indexed ``0..N-1`` (the documented grouping path).
+    ``scan_labels`` tags the grouped contributing frames for the raw-popup records
+    (default ``1..N``; pass the real scan numbers, e.g. ``[5, 7, 8]``).
+    """
+
+    # A group (sequence of sources) → one CompositeFrameSource; a single source
+    # passes through unchanged.  ``_harvest`` keeps the per-member structure so the
+    # raw-popup records are scan-tagged (the composite re-indexes globally).
+    grouped = isinstance(source, Sequence) and not isinstance(source, (str, bytes))
+    if grouped:
+        from xrd_tools.sources.composite import CompositeFrameSource  # noqa: PLC0415
+        members = [ensure_frame_source(s) for s in source]
+        if not members:
+            raise ValueError("run_stitch received an empty source group")
+        src = CompositeFrameSource(members) if len(members) > 1 else members[0]
+        _harvest = members
+    else:
+        src = ensure_frame_source(source)
+        _harvest = src
     labels = [int(i) for i in (frame_indices or src.frame_indices)]
     if not labels:
         raise ValueError("run_stitch requires at least one frame")
@@ -395,6 +435,7 @@ def run_stitch(
             "source": getattr(src, "name", type(src).__name__),
             "frame_indices": labels,
         },
+        frame_records=_harvest_frame_records(_harvest, scan_labels),
     )
 
 
@@ -487,15 +528,26 @@ class RSMPlan:
         )
 
 
-def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> AnalysisResult:
-    """Run the streaming RSM pipeline for one source or a list of sources."""
+def run_rsm(
+    plan: RSMPlan,
+    source: FrameSource | Sequence[FrameSource],
+    *,
+    scan_labels: Sequence[Any] | None = None,
+) -> AnalysisResult:
+    """Run the streaming RSM pipeline for one source or a list of sources.
 
-    if isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
+    ``scan_labels`` tags grouped contributing frames for the raw-popup records
+    (default ``1..N``; pass the real scan numbers, e.g. ``[5, 7, 8]``).
+    """
+
+    grouped = isinstance(source, Sequence) and not isinstance(source, (str, bytes))
+    if grouped:
         from xrd_tools.rsm.pipeline import ScanInput
 
+        members = [ensure_frame_source(scan) for scan in source]
         inputs = [
-            ScanInput(scan=ensure_frame_source(scan), energy=plan.energy, UB=plan.UB, roi=plan.roi)
-            for scan in source
+            ScanInput(scan=m, energy=plan.energy, UB=plan.UB, roi=plan.roi)
+            for m in members
         ]
         payload = grid_scans_streaming(
             plan.mapper,
@@ -510,8 +562,10 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
             gi=plan.gi,
         )
         n_sources = len(inputs)
+        _harvest = members
     else:
         src = ensure_frame_source(source)  # type: ignore[arg-type]
+        _harvest = src
         payload = process_scan_from_nexus(
             src,
             plan.mapper,
@@ -532,6 +586,7 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
         kind="rsm",
         payload=payload,
         provenance={"plan": _plan_dict(plan), "n_sources": n_sources},
+        frame_records=_harvest_frame_records(_harvest, scan_labels),
     )
 
 

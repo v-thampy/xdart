@@ -10,7 +10,11 @@ import numpy as np
 
 from xrd_tools.core.containers import IntegrationResult1D
 from xrd_tools.io.nexus import write_rsm, write_stitched
-from xrd_tools.io.nexus_record import frame_record_key
+from xrd_tools.io.nexus_record import (
+    frame_record_key,
+    frame_record_labels,
+    iter_frame_record_groups,
+)
 from xrd_tools.io.read import get_raw_frame
 from xrd_tools.rsm.volume import RSMVolume
 
@@ -87,3 +91,45 @@ def test_write_rsm_carries_frame_records(tmp_path):
         write_rsm(f.create_group("entry"), vol, frame_records=records)
     img = get_raw_frame(p, 2, scan=8)
     assert np.unravel_index(int(np.argmax(img)), img.shape) == (5, 5)
+
+
+def test_iter_frame_record_groups_descends_flat_and_nested(tmp_path):
+    import h5py
+    s1 = IntegrationResult1D(radial=np.linspace(0.5, 5.0, 4),
+                             intensity=np.ones(4), unit="q_A^-1")
+    records = [
+        {"frame_index": 1, "thumbnail": _peaked(8, (0, 0))},            # flat
+        {"scan_label": 5, "frame_index": 1, "thumbnail": _peaked(8, (1, 1))},
+        {"scan_label": 5, "frame_index": 2, "thumbnail": _peaked(8, (2, 2))},
+        {"scan_label": 7, "frame_index": 1, "thumbnail": _peaked(8, (3, 3))},
+    ]
+    p = tmp_path / "mixed.nxs"
+    with h5py.File(p, "w") as f:
+        write_stitched(f.create_group("entry"), stitched_1d=s1, frame_records=records)
+
+    with h5py.File(p, "r") as f:
+        frames = f["entry/frames"]
+        # the intermediate scan_<N> containers are NOT yielded — only leaf frames
+        got = {(sl, fl) for sl, fl, _grp in iter_frame_record_groups(frames)}
+        assert got == {(None, 1), ("5", 1), ("5", 2), ("7", 1)}
+        # display labels: flat ints first ("1"), then "<scan>-<frame>"
+        labels = frame_record_labels(frames)
+        assert [t[0] for t in labels] == ["1", "5-1", "5-2", "7-1"]
+        # each label carries its (scan, frame) resolution address
+        assert labels[0] == ("1", None, 1)
+        assert labels[1] == ("5-1", "5", 1)
+
+
+def test_frame_record_labels_skips_unloadable(tmp_path):
+    """A frame group with neither thumbnail nor source pointer is not a usable
+    Frames-panel entry."""
+    import h5py
+    from xrd_tools.io.nexus_record import ensure_frames_container, write_frame_record
+    p = tmp_path / "bare.nxs"
+    with h5py.File(p, "w") as f:
+        e = f.create_group("entry")
+        frames = ensure_frames_container(e)
+        write_frame_record(frames, "frame_0001", thumbnail=_peaked(8, (0, 0)))
+        write_frame_record(frames, "frame_0002")   # no thumbnail, no source → skip
+        labels = frame_record_labels(e["frames"])
+    assert [t[0] for t in labels] == ["1"]

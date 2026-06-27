@@ -221,7 +221,12 @@ the 3D dialog.
 7. ~~Multi-scan frame storage~~ — **RESOLVED + LANDED: nested `scan_<N>/frame_NNNN`**
    (`frame_record_key` / `write_contributing_frames` in `nexus_record.py`; `get_raw_frame(…, scan=)`
    in `read.py`; both `write_stitched`/`write_rsm` carry `frame_records`). Single-scan stays flat.
-   Still open: confirm/land the multi-scan **Stitch** path (RSM's `grid_scans_streaming` exists).
+   **Multi-scan Stitch path also LANDED:** `run_stitch` now accepts a `Sequence[FrameSource]`
+   (concatenated via the existing `CompositeFrameSource` — the documented grouping idiom — frames
+   re-indexed `0..N-1`); `run_rsm` already took a sequence. Both `run_stitch`/`run_rsm` harvest
+   scan-tagged `frame_records` onto the `AnalysisResult` (`harvest_frame_records` recovers each
+   member's own per-scan labels from the composite, so the records are `5-1,5-2,7-1`, not the
+   flattened global index). `scan_labels=[5,7,8]` tags with the real scan numbers.
 
 **Persistence TODOs (write side) — STANDARD for BOTH writers (Vivek, Jun 2026):**
 - **T1 (Stitch) + T2 (RSM):** `write_stitched` AND `write_rsm` write per-frame records (the
@@ -231,18 +236,18 @@ the 3D dialog.
 - **T-multiscan (LANDED, write+read primitives):** for grouped scans the `frame_key` is
   **scan-tagged** (`scan_<N>/frame_NNNN`) and `get_raw_frame(…, scan=)` resolves it; the writer
   carries the scan number (source `scan_id` / `get_scan_path_info`).
-- **T-multiscan READER CHECKLIST (do this when the multi-scan PRODUCER lands):** five readers iterate
-  `/entry/frames/` assuming **flat** `frame_NNNN` children. All are name-guarded
-  (`if not name.startswith("frame_"): continue`), so a nested `scan_<N>` group is **silently skipped
-  — no crash**, but its frames are **invisible** to them. Each must learn to descend (one level) +
-  surface `"<scan>-<frame>"`:
-  - `io/image_source.py::_frame_labels_from_groups` (`:98`) — the **Frames-panel** label source
-    (highest priority: a grouped file would otherwise list no contributing frames).
-  - `io/frame_view.py` `iter`/`read_frame_view` (`:245`, `:310`/`:319` flat `get`) — frame-view union
-    + per-frame lookup.
-  - `io/nexus_inspect.py::_frame_group_labels` (`:428`) + `_frame_artifact_counts` (`:459`, no name
-    filter → `scan_<N>` undercounts, no crash).
-  - `io/read.py::_all_frame_index` (`:142`) + the flat thumbnail lookup (`:363`).
+- **T-multiscan READER PATH (RESOLVED — additive grouped primitive, NOT a mutation of the flat
+  readers):** the grouped read path is the new `iter_frame_record_groups` / `frame_record_labels` in
+  `nexus_record.py` — they descend one level into `scan_<N>/` and return display labels
+  (`"<scan>-<frame>"`, e.g. `5-1`) each paired with its `(scan, frame)` resolution address for
+  `get_raw_frame(scan=…, frame=…)`. The **GUI Frames panel adopts `frame_record_labels`** for grouped
+  results (xdart-side wiring, plan step 4/6). The five existing **flat** `frames/frame_NNNN` iterators
+  are left **unchanged BY DESIGN**: they are integrated-frame enumerators (`io/read.py::_all_frame_index`
+  `:142`, `io/frame_view.py` `:245`, `io/nexus_inspect.py` `:428`/`:459`, and `io/image_source.py::
+  _frame_labels_from_groups` `:98` which returns *int* labels on a GUI contract). A Stitch/RSM `.nxs`
+  carries **no** per-frame integrated data, so nested raw-source records are correctly out of their
+  scope; they name-guard on `frame_` and skip `scan_<N>` (no crash, no single-scan regression). The
+  grouped raw popup goes through the new primitive instead.
 - **T3:** the `ssrl_xrd_tools>=` floor caveat (CLAUDE.md north-star) applies if these primitives move.
 
 **Sequenced plan (each live-gated in `xrd_test`):**
@@ -250,15 +255,18 @@ the 3D dialog.
    (PLOT_1D only) + register. No render-core change.
 2. **Stitch-2D** — add `imageFrame_w` to `PanelLayout`; `STITCH_2D→binned_widget` delegate; emit
    `STITCH_2D` in the `cake_image` slot.
-3. ✅ **DONE — Frame records (both writers) + the multi-scan scheme** — `frame_record_key` +
-   `write_contributing_frames` (`nexus_record.py`); `write_stitched`/`write_rsm` take
-   `frame_records=`/`source_base=`; `get_raw_frame(…, scan=)` resolves `scan_<N>/frame_NNNN`
-   (single-scan stays flat). Round-trip tested (`test_frame_records_multiscan.py`, 4✓). The headless
-   persistence enabler for both raw popups. **Still pending (the PRODUCER side):** the multi-scan
-   **Stitch** source path (`run_stitch` is single-source today; RSM's `grid_scans_streaming` already
-   groups) + harvesting the real `Frame` source pointers at write time (the GUI wiring that produces
-   the `frame_records` list) + the **reader checklist** above (5 flat-frames iterators must learn to
-   descend into `scan_<N>/` — currently they silently skip it, so nested frames are invisible).
+3. ✅ **DONE — Frame records (both writers) + multi-scan scheme + PRODUCER side.** Write/read storage:
+   `frame_record_key` / `write_contributing_frames` (`nexus_record.py`); `write_stitched`/`write_rsm`
+   take `frame_records=`/`source_base=`; `get_raw_frame(…, scan=)` resolves `scan_<N>/frame_NNNN`
+   (single-scan stays flat). **Producer:** `run_stitch` accepts a `Sequence[FrameSource]` (→
+   `CompositeFrameSource`); `run_stitch`/`run_rsm` harvest scan-tagged `frame_records` onto the
+   `AnalysisResult` via `harvest_frame_records` (`scan_labels=[5,7,8]` → real scan numbers; composite
+   global index recovered to per-scan labels). **Grouped read path:** `iter_frame_record_groups` /
+   `frame_record_labels` (the `"<scan>-<frame>"` Frames-panel list + `(scan,frame)` address). Tested:
+   `test_frame_records_multiscan.py` + producer tests in `test_analysis_plans.py` (core 1325✓).
+   **xdart-side follow-up only:** the GUI passes the grouped sources + real scan numbers into
+   `run_stitch`/`run_rsm`, forwards `result.frame_records` to the writer, and the Frames panel renders
+   `frame_record_labels` (steps 4/6).
 4. **Stitch raw popup** — reuse `_show_image_preview`, reroute load to the ssrl loaders; Frames panel
    shows `"<scan>-<frame>"`; verify it resolves a contributing frame from a freshly-saved `.nxs`.
 5. **WS-X2 render-core promotion** — drive `render_display` from `draw_keys`/`clear_keys`;
