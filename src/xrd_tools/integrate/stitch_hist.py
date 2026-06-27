@@ -285,4 +285,66 @@ def pyfai_gi_q_frames(
         yield q, chi, signal, w
 
 
-__all__ = ["pyfai_gi_q_frames", "pyfai_q_frames", "stitch_q_grid"]
+def xu_q_frames(
+    images: Iterable[np.ndarray],
+    mapper: Any,
+    angles: Any,
+    energy: float,
+    *,
+    UB: np.ndarray | None = None,
+    weight: np.ndarray | None = None,
+    mask: np.ndarray | None = None,
+    normalization: Iterable[float] | None = None,
+) -> Iterator[Any]:
+    """``xu_hist`` q-provider: per-frame ``(|q|_Å⁻¹, χ_deg, signal, weight)`` from
+    the **xrayutilities** geometry (``PixelQMap`` → ``Ang2Q.area``).
+
+    The cartesian per-pixel ``(qx, qy, qz)`` are RSM's (the SAME ``pixel_q`` call,
+    so RSM and the stitch share one geometry); this projects them to the
+    ``(|q|, χ)`` the histogram merge :func:`stitch_q_grid` bins.  ``angles`` is
+    the per-circle angle list (from
+    :func:`~xrd_tools.core.geometry.assemble_circle_angles`); ``weight`` is the
+    per-pixel ``Σnorm`` weight (e.g. from a CorrectionStack), ``None`` → ones.
+
+    This is the dead-but-proven provider so the deferred ``xu_hist`` stitch
+    backend (P3c) is pure wiring.  ``|q|`` (the vector magnitude) is convention-
+    free and gate-checked.  ⚠ **χ is the q-vector azimuth** ``atan2(qz, qy)`` —
+    PENDING validation against pyFAI ``chiArray`` (the P3c real-data gate: xu_hist
+    χ must match pyfai_hist); do not treat the azimuth as final until then.
+    """
+    images = list(images)
+    mon = None
+    if normalization is not None:
+        mon = np.asarray(list(normalization), dtype=float)
+        if len(mon) != len(images):
+            raise ValueError(
+                f"xu_q_frames: {len(mon)} monitor/normalization values for "
+                f"{len(images)} images")
+        bad = ~np.isfinite(mon) | (mon <= 0)
+        if bad.any():
+            raise ValueError(
+                "stitch monitor/normalization has invalid value(s) (non-finite "
+                f"or <= 0) at frame index/indices {np.flatnonzero(bad).tolist()}: "
+                f"{mon[bad].tolist()}")
+
+    stack = np.stack([np.asarray(im, dtype=float) for im in images], axis=0)
+    qx, qy, qz = mapper.pixel_q(angles, energy, UB=UB, image_shape=stack.shape)
+    qx = np.asarray(qx, dtype=float)
+    qy = np.asarray(qy, dtype=float)
+    qz = np.asarray(qz, dtype=float)
+    qmag = np.sqrt(qx ** 2 + qy ** 2 + qz ** 2)          # |q|, convention-free
+    chi = np.degrees(np.arctan2(qz, qy))                  # ⚠ azimuth — P3c-gated
+    for i in range(len(images)):
+        img = stack[i]
+        if weight is not None:
+            w = np.broadcast_to(np.asarray(weight, dtype=float), img.shape).astype(
+                float, copy=True)
+        else:
+            w = np.ones(img.shape, dtype=float)
+        if mask is not None:
+            w = np.where(np.asarray(mask, dtype=bool), 0.0, w)
+        signal = img / mon[i] if mon is not None else img
+        yield qmag[i], chi[i], signal, w
+
+
+__all__ = ["pyfai_gi_q_frames", "pyfai_q_frames", "stitch_q_grid", "xu_q_frames"]

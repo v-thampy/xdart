@@ -20,6 +20,7 @@ from xrd_tools.integrate.stitch_hist import (
     pyfai_gi_q_frames,
     pyfai_q_frames,
     stitch_q_grid,
+    xu_q_frames,
 )
 from xrd_tools.integrate.multi import (
     create_multigeometry_integrators,
@@ -56,6 +57,7 @@ __all__ = [
     "pyfai_gi_q_frames",
     "pyfai_q_frames",
     "stitch_q_grid",
+    "xu_q_frames",
     "integrate_gi_1d",
     "integrate_gi_2d",
     "integrate_gi_azimuthal_1d",
