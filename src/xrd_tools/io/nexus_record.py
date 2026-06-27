@@ -52,6 +52,8 @@ __all__ = [
     "stamp_source_base",
     "ensure_frames_container",
     "write_frame_record",
+    "frame_record_key",
+    "write_contributing_frames",
     "write_frame_source_ref",
     "write_thumbnail",
     "drop_integrated_rows",
@@ -223,6 +225,48 @@ def write_frame_record(frames_grp: h5py.Group, frame_key: str, *,
     if timestamp is not None and "timestamp" not in fg:
         fg["timestamp"] = str(timestamp)
     return fg
+
+
+def frame_record_key(scan_label, frame_index: int) -> str:
+    """The ``/entry/frames/<key>`` group name for one contributing frame.
+
+    ``scan_label is None`` → flat ``frame_NNNN`` (single-scan, the reduction
+    convention — backward-compatible).  A scan label → nested
+    ``scan_<label>/frame_NNNN`` so frames from **grouped** scans (a Stitch/RSM over
+    several scans) don't collide on the flat index.  The h5viewer Frames panel
+    surfaces these as ``"<label>-<frame>"``.
+    """
+    base = f"frame_{int(frame_index):04d}"
+    return base if scan_label is None else f"scan_{scan_label}/{base}"
+
+
+def write_contributing_frames(entry_grp: h5py.Group, records, *,
+                              source_base=None) -> int:
+    """Write the per-frame **source records** for a Stitch/RSM result — the
+    enabler for the raw-image popup (resolve a contributing frame from the saved
+    ``.nxs``).  ``records`` is an iterable of mappings with ``frame_index`` and
+    optionally ``scan_label`` / ``source_path`` / ``source_frame_index`` /
+    ``thumbnail``.  Multi-scan records (a ``scan_label``) nest under
+    ``scan_<label>/``; single-scan stays flat.  Returns the count written.
+    """
+    records = list(records)
+    if not records:
+        return 0
+    if source_base is not None:
+        stamp_source_base(entry_grp, source_base)
+    frames = ensure_frames_container(entry_grp)
+    # pre-create the scan subgroups so they carry NX_class (require_group via a
+    # nested key would leave the intermediate group bare).
+    for sl in sorted({r.get("scan_label") for r in records
+                      if r.get("scan_label") is not None}, key=str):
+        _nxcollection(frames, f"scan_{sl}")
+    for r in records:
+        write_frame_record(
+            frames, frame_record_key(r.get("scan_label"), r["frame_index"]),
+            source_path=r.get("source_path"),
+            source_frame_index=int(r.get("source_frame_index") or 0),
+            thumbnail=r.get("thumbnail"), source_base=source_base)
+    return len(records)
 
 
 # ---------------------------------------------------------------------------

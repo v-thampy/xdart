@@ -1892,6 +1892,8 @@ def write_stitched(
     stitched_1d: IntegrationResult1D | None = None,
     stitched_2d: IntegrationResult2D | None = None,
     provenance: "Mapping[str, object] | str | None" = None,
+    frame_records=None,
+    source_base=None,
     compression: str | None = None,
 ) -> None:
     """Write ``/entry/stitched_1d`` / ``/entry/stitched_2d`` — the symmetric
@@ -1948,12 +1950,18 @@ def write_stitched(
         if prov_json is not None:
             g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
 
+    if frame_records:
+        from xrd_tools.io.nexus_record import write_contributing_frames  # noqa: PLC0415
+        write_contributing_frames(entry_grp, frame_records, source_base=source_base)
+
 
 def write_rsm(
     entry_grp: h5py.Group,
     volume: Any,
     *,
     provenance: "Mapping[str, object] | str | None" = None,
+    frame_records=None,
+    source_base=None,
     compression: str | None = None,
 ) -> None:
     """Write ``/entry/rsm`` — a gridded :class:`~xrd_tools.rsm.RSMVolume` as an
@@ -1977,6 +1985,10 @@ def write_rsm(
         prov = provenance if isinstance(provenance, str) else json.dumps(
             provenance, default=str)
         g.create_dataset("provenance_json", data=prov, dtype=_UTF8_DTYPE)
+
+    if frame_records:
+        from xrd_tools.io.nexus_record import write_contributing_frames  # noqa: PLC0415
+        write_contributing_frames(entry_grp, frame_records, source_base=source_base)
 
 
 def read_rsm(path: Path | str, *, entry: str = "entry"):

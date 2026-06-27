@@ -493,6 +493,7 @@ def get_raw_frame(
     scan_file: str | Path,
     frame: int,
     *,
+    scan: str | int | None = None,
     entry: str = "entry",
     allow_thumbnail: bool = True,
     source_root: str | Path | None = None,
@@ -515,7 +516,9 @@ def get_raw_frame(
     after processing.
 
     ``frame`` is the frame **label** (the ``frame_index`` value), matching
-    the other ``get_*`` readers.  Raises ``KeyError`` when neither a usable
+    the other ``get_*`` readers; ``scan`` selects a contributing scan for a
+    grouped Stitch/RSM result (``frames/scan_<scan>/frame_NNNN``), ``None`` is
+    the flat single-scan record.  Raises ``KeyError`` when neither a usable
     source pointer nor a thumbnail is present.
     """
     scan_file = Path(scan_file)
@@ -524,6 +527,7 @@ def get_raw_frame(
             scan_file,
             _entry(f, entry),
             int(frame),
+            scan=scan,
             source_root=source_root,
         )
     return _raw_frame_or_thumbnail(
@@ -570,18 +574,26 @@ def _raw_frame_parts_from_entry(
     entry_group: h5py.Group,
     frame: int,
     *,
+    scan: str | int | None = None,
     source_root: str | Path | None = None,
 ) -> tuple[Path | None, int, np.ndarray | None]:
-    """Resolve one processed frame's raw source pointer and thumbnail."""
+    """Resolve one processed frame's raw source pointer and thumbnail.
+
+    ``scan`` selects a grouped-scan record (``frames/scan_<scan>/frame_NNNN``);
+    ``None`` is the flat single-scan record (``frames/frame_NNNN``).
+    """
 
     source_base = (
         _decode(entry_group.attrs["source_base"])
         if "source_base" in entry_group.attrs
         else None
     )
-    fg = entry_group.get(f"frames/frame_{int(frame):04d}")
+    from xrd_tools.io.nexus_record import frame_record_key  # noqa: PLC0415
+    fg = entry_group.get(f"frames/{frame_record_key(scan, frame)}")
     if fg is None:
-        raise KeyError(f"No frame group for frame {frame} in {scan_file}")
+        raise KeyError(
+            f"No frame group for frame {frame}"
+            f"{f' (scan {scan})' if scan is not None else ''} in {scan_file}")
 
     master: Path | None = None
     src_frame_idx = 0

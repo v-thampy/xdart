@@ -310,7 +310,7 @@ def extract_line_cut(
         slab = np.moveaxis(slab, 0, dim)
 
     slab = np.moveaxis(slab, axis, -1)
-    intensity_1d = np.nansum(slab, axis=(0, 1))
+    intensity_1d = np.nanmean(slab, axis=(0, 1))
     return axes_arr[axis], intensity_1d
 
 
@@ -361,11 +361,11 @@ def extract_2d_slice(
 
     if integrate_axis == 0:
         slab = intensity[mask, :, :]
-        return k, l, np.nansum(slab, axis=0), h[mask]
+        return k, l, np.nanmean(slab, axis=0), h[mask]
 
     if integrate_axis == 1:
         slab = intensity[:, mask, :]
-        return h, l, np.nansum(slab, axis=1), k[mask]
+        return h, l, np.nanmean(slab, axis=1), k[mask]
 
     slab = intensity[:, :, mask]
-    return h, k, np.nansum(slab, axis=2), l[mask]
+    return h, k, np.nanmean(slab, axis=2), l[mask]

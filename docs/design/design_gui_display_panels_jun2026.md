@@ -118,9 +118,11 @@ generation stamp is the safety guard** (`render_plan` drops a payload whose gene
 `:1500`) — a slow recompute from a superseded band can't paint over a newer one (reuse the Int load
 worker's staleness mechanism verbatim).
 
-> **Round-trip nuance:** the notebook integrates with `nanmean`; headless `extract_2d_slice`/
-> `extract_line_cut` use `nansum` (`volume.py:317`). Pick **`nansum`** for the GUI (matches the
-> headless round-trip; label the colorbar accordingly) so reload-equivalence holds — Open Q2.
+> **Round-trip nuance (RESOLVED — Open Q2):** slice/projection integration is **`nanmean`**
+> everywhere — `extract_2d_slice`/`extract_line_cut` (`volume.py:313/364/368/371`), the notebook, and
+> the GUI all agree. Vivek's call: nanmean is more reliable and **band-width-independent** (a slice
+> averaged over 2 voxels vs 200 is directly comparable — no per-band scaling), so reload-equivalence
+> holds and the colorbar needs no normalization caveat.
 
 **`RSMDisplayController`** copies the read-only `NexusViewerController` pattern; holds the loaded
 `RSMVolume` + `RSMViewState`; emits the 6 `PanelPlan`s + the 2×3 layout; never consults
@@ -145,8 +147,9 @@ tooltip when GL import fails** (the 2D/1D viewer degrades gracefully).
 volume; scattering only the bright N points is trivially interactive). `GLViewWidget` gives
 rotate/zoom/pan free. Alternatives: `pg.isosurface`→`GLMeshItem` (a Bragg iso-shell; needs an
 iso-level control); `GLVolumeItem` (best-looking but GPU-fill-bound; downsample to ~64-100³).
-**Minimal controls:** colormap, threshold(scatter)/iso-level slider, log, downsample factor. No
-slicing (that's the 2D/1D panels). Several details still need planning — see Open Qs 4-5.
+**Minimal controls:** colormap, threshold slider, log, downsample factor. No slicing (that's the
+2D/1D panels) and **always the full volume** — decoupled from the 2D/1D bands (Open Qs 4-5 RESOLVED:
+scatter, full-volume, view-only).
 
 ---
 
@@ -173,8 +176,10 @@ frame_key, …)` takes a free **string** key (`nexus_record.py:207`) and the sca
 - **Read path:** generalize `get_raw_frame` from a bare `int` to a `(scan, frame)` address (stays
   int-keyed for single-scan); the multi-scan writer tags each frame with its scan number.
 
-This is the shared enabler for **both** raw popups (Stitch §1a, RSM §2c). **Open Q7:** nested groups
-(recommended) vs flat encoded keys; and confirm the multi-scan Stitch path exists/lands (RSM's does).
+This is the shared enabler for **both** raw popups (Stitch §1a, RSM §2c). **Q7 RESOLVED + LANDED:**
+nested `scan_<N>/frame_NNNN` (`frame_record_key`/`write_contributing_frames` in `nexus_record.py`;
+`get_raw_frame(…, scan=)` in `read.py`; both writers carry `frame_records=`). Single-scan stays flat.
+Still pending: confirm/land the multi-scan **Stitch** source path (RSM's `grid_scans_streaming` does).
 
 ---
 
@@ -206,13 +211,17 @@ the 3D dialog.
 
 **Open questions (decide before/at the mockup):**
 1. Stitch: one `STITCH_VIEWER` Mode + `has_2d` collapse (recommended) vs two Modes.
-2. RSM integration op: **`nansum`** (recommended, round-trips) vs `nanmean` (notebook).
+2. ~~RSM integration op~~ — **RESOLVED: `nanmean`** everywhere (Vivek: more reliable,
+   band-width-independent, no scaling). Landed in `volume.py` (`extract_2d_slice`/`extract_line_cut`).
 3. `DisplayPayload` for 6 panels: optional keyed `panels` field (recommended) vs controller bypass.
-4. 3D v1 backend: **scatter** (recommended) vs iso vs volume.
-5. 3D honors current bands (`crop`) vs always full volume (recommended: full, decoupled, v1).
+4. ~~3D v1 backend~~ — **RESOLVED: `GLScatterPlotItem`**, thresholded finite voxels, view-only.
+5. ~~3D bands vs full volume~~ — **RESOLVED: always full volume** (decoupled from the 2D/1D bands;
+   threshold slider only). "Sounds good for now" — v1 scope.
 6. RSM 6-panel: standalone `rsm_panel_widget` (recommended) vs extend the splitter.
-7. Multi-scan frame storage: nested `scan_<N>/frame_NNNN` (recommended) vs flat `frame_<N>-<idx>`
-   keys; + confirm/land the multi-scan **Stitch** path (RSM's `grid_scans_streaming` exists).
+7. ~~Multi-scan frame storage~~ — **RESOLVED + LANDED: nested `scan_<N>/frame_NNNN`**
+   (`frame_record_key` / `write_contributing_frames` in `nexus_record.py`; `get_raw_frame(…, scan=)`
+   in `read.py`; both `write_stitched`/`write_rsm` carry `frame_records`). Single-scan stays flat.
+   Still open: confirm/land the multi-scan **Stitch** path (RSM's `grid_scans_streaming` exists).
 
 **Persistence TODOs (write side) — STANDARD for BOTH writers (Vivek, Jun 2026):**
 - **T1 (Stitch) + T2 (RSM):** `write_stitched` AND `write_rsm` write per-frame records (the
@@ -229,9 +238,13 @@ the 3D dialog.
    (PLOT_1D only) + register. No render-core change.
 2. **Stitch-2D** — add `imageFrame_w` to `PanelLayout`; `STITCH_2D→binned_widget` delegate; emit
    `STITCH_2D` in the `cake_image` slot.
-3. **Frame records (both writers) + the multi-scan scheme** — add frame-record writing to
-   `write_stitched` AND `write_rsm`, scan-tagged (`scan_<N>/frame_NNNN`); generalize `get_raw_frame`
-   to `(scan, frame)`. The headless persistence enabler for both raw popups; round-trip tested.
+3. ✅ **DONE — Frame records (both writers) + the multi-scan scheme** — `frame_record_key` +
+   `write_contributing_frames` (`nexus_record.py`); `write_stitched`/`write_rsm` take
+   `frame_records=`/`source_base=`; `get_raw_frame(…, scan=)` resolves `scan_<N>/frame_NNNN`
+   (single-scan stays flat). Round-trip tested (`test_frame_records_multiscan.py`, 4✓). The headless
+   persistence enabler for both raw popups. **Still pending:** the multi-scan **Stitch** source path
+   (`run_stitch` is single-source today; RSM's `grid_scans_streaming` already groups) + harvesting the
+   real `Frame` source pointers at write time (the GUI wiring that produces the `frame_records` list).
 4. **Stitch raw popup** — reuse `_show_image_preview`, reroute load to the ssrl loaders; Frames panel
    shows `"<scan>-<frame>"`; verify it resolves a contributing frame from a freshly-saved `.nxs`.
 5. **WS-X2 render-core promotion** — drive `render_display` from `draw_keys`/`clear_keys`;
