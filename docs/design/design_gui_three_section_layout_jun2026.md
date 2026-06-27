@@ -4,6 +4,11 @@
 Refined by the take-stock review (`wbalkxzey`). Applies first to the **new** Stitch/RSM tools;
 the existing Int-1D/2D layout is **not** refactored now (this becomes its eventual template).
 
+This doc is the **CONTROLS** (right column). The companion UI-spec docs:
+[`design_gui_int_migration_jun2026.md`](design_gui_int_migration_jun2026.md) (migrating Int-1D/2D
+onto this layout) and [`design_gui_display_panels_jun2026.md`](design_gui_display_panels_jun2026.md)
+(the **DISPLAY** panels — the Stitch cake-over-1D / RSM 2×3-slices view + the raw-frame & 3D popups).
+
 ## The principle: GUI sections mirror the headless data model
 
 The headless layer already separates concerns cleanly, so the GUI sections should fall out of it
