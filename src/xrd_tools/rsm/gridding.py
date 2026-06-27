@@ -43,6 +43,62 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# The shared Σ(raw·w) / Σ(w) accumulator (P6)
+# ---------------------------------------------------------------------------
+# RSM bins onto a 3D grid via two xu.Gridder3D running with Normalize(False)
+# (so ``.data`` returns the bare SUM, not xu's count-mean): ``_grid_raw``
+# accumulates Σ(raw·w), ``_grid_norm`` accumulates Σ(w), and the volume is
+# ``Σ(raw·w)/Σ(w)`` — the SAME weighted-mean accumulator as the stitch
+# histogram merge + CorrectionStack (stitch_hist.stitch_q_grid), not the old
+# count-mean.  With ``weight = 1`` everywhere it reproduces the prior
+# ``Σraw/Σcounts`` exactly, so the default (no corrections) is behaviour-
+# preserving; a CorrectionStack weight only changes numbers when supplied.
+
+def _new_gridder(bins: tuple[int, int, int],
+                 bounds: tuple[float, ...] | None = None):
+    """A KeepData(True) + Normalize(False) Gridder3D (bare-SUM accumulator)."""
+    g = xu.Gridder3D(*bins)
+    g.KeepData(True)
+    g.Normalize(False)
+    if bounds is not None:
+        g.dataRange(*bounds, fixed=True)
+    return g
+
+
+def _feed_pair(grid_raw, grid_norm, qx, qy, qz, img, weight) -> None:
+    """Accumulate one chunk into the Σ(raw·w) and Σ(w) gridders.
+
+    Bad pixels — non-finite q, non-finite image, or ``weight <= 0`` — are set
+    to NaN in BOTH the raw and the weight channel so xrayutilities drops them
+    from each sum (the same good-mask :func:`stitch_q_grid` uses): a NaN q
+    COORD would otherwise be clamped onto an edge bin, and a masked pixel's
+    finite weight would pollute the denominator → a biased mean.
+    """
+    img = np.asarray(img, dtype=float)
+    w = np.broadcast_to(np.asarray(weight, dtype=float), img.shape)
+    bad = ~(np.isfinite(qx) & np.isfinite(qy) & np.isfinite(qz)
+            & np.isfinite(img) & np.isfinite(w) & (w > 0))
+    grid_raw(qx, qy, qz, np.where(bad, np.nan, img * w))
+    grid_norm(qx, qy, qz, np.where(bad, np.nan, w))
+
+
+def _pair_intensity(grid_raw, grid_norm) -> np.ndarray:
+    """``Σ(raw·w) / Σ(w)``; NaN where the weight sum is non-positive (empty)."""
+    num = np.asarray(grid_raw.data, dtype=float)
+    den = np.asarray(grid_norm.data, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = num / den
+    out[~(den > 0)] = np.nan
+    return out
+
+
+def _qbounds(qx, qy, qz) -> tuple[float, float, float, float, float, float]:
+    return (float(np.nanmin(qx)), float(np.nanmax(qx)),
+            float(np.nanmin(qy)), float(np.nanmax(qy)),
+            float(np.nanmin(qz)), float(np.nanmax(qz)))
+
+
+# ---------------------------------------------------------------------------
 # Single-shot path (in-memory)
 # ---------------------------------------------------------------------------
 
@@ -56,6 +112,7 @@ def grid_img_data(
     bins: tuple[int, int, int] = (200, 200, 200),
     roi: tuple[int, int, int, int] | None = None,
     mask_static_pixels: bool = True,
+    weight: np.ndarray | None = None,
 ) -> RSMVolume:
     """Map a 3D image stack to reciprocal space and bin onto a 3D grid.
 
@@ -82,6 +139,10 @@ def grid_img_data(
     mask_static_pixels : bool
         Mask pixels whose per-frame variance is zero (typically hot
         masks or chip gaps).  Default ``True``.
+    weight : ndarray, optional
+        Per-pixel correction weight (``(H, W)`` or ``(N, H, W)``) that enters
+        the ``Σ(raw·w)/Σ(w)`` accumulator — e.g. a ``CorrectionStack``
+        normalization.  ``None`` → unit weight (the prior count-mean).
 
     Returns
     -------
@@ -110,14 +171,17 @@ def grid_img_data(
         image_shape=img.shape,
     )
 
-    gridder = xu.Gridder3D(*bins)
-    gridder(qx, qy, qz, img)
+    bounds = _qbounds(qx, qy, qz)
+    grid_raw = _new_gridder(bins, bounds)
+    grid_norm = _new_gridder(bins, bounds)
+    _feed_pair(grid_raw, grid_norm, qx, qy, qz, img,
+               1.0 if weight is None else weight)
 
     return RSMVolume(
-        h=np.asarray(gridder.xaxis, dtype=float),
-        k=np.asarray(gridder.yaxis, dtype=float),
-        l=np.asarray(gridder.zaxis, dtype=float),
-        intensity=np.asarray(gridder.data, dtype=float),
+        h=np.asarray(grid_raw.xaxis, dtype=float),
+        k=np.asarray(grid_raw.yaxis, dtype=float),
+        l=np.asarray(grid_raw.zaxis, dtype=float),
+        intensity=_pair_intensity(grid_raw, grid_norm),
     )
 
 
@@ -208,7 +272,9 @@ class StreamingGridder:
     def __init__(self, mapper: PixelQMap, bins: tuple[int, int, int]) -> None:
         self.mapper = mapper
         self.bins = tuple(int(b) for b in bins)
-        self._gridder: xu.Gridder3D | None = None
+        # the Σ(raw·w) and Σ(w) accumulators (P6) — both KeepData+Normalize(False)
+        self._grid_raw: xu.Gridder3D | None = None
+        self._grid_norm: xu.Gridder3D | None = None
         self._bounds: tuple[float, float, float, float, float, float] | None = None
         self.n_frames_processed: int = 0
 
@@ -227,7 +293,7 @@ class StreamingGridder:
         Must be called before :meth:`add`.  Bins outside the range are
         silently dropped by ``xu.Gridder3D``.
         """
-        if self._gridder is not None:
+        if self._grid_raw is not None:
             raise RuntimeError("bounds already set; create a fresh "
                                "StreamingGridder to re-bound")
         qxmin, qxmax = float(qx_range[0]), float(qx_range[1])
@@ -240,11 +306,10 @@ class StreamingGridder:
                 raise ValueError(f"{name} range must be (lo, hi) with hi > lo; "
                                  f"got ({lo}, {hi})")
 
-        gridder = xu.Gridder3D(*self.bins)
-        gridder.KeepData(True)
-        gridder.dataRange(qxmin, qxmax, qymin, qymax, qzmin, qzmax, fixed=True)
-        self._gridder = gridder
-        self._bounds = (qxmin, qxmax, qymin, qymax, qzmin, qzmax)
+        bounds = (qxmin, qxmax, qymin, qymax, qzmin, qzmax)
+        self._grid_raw = _new_gridder(self.bins, bounds)
+        self._grid_norm = _new_gridder(self.bins, bounds)
+        self._bounds = bounds
 
     def scout(
         self,
@@ -316,6 +381,7 @@ class StreamingGridder:
         UB: np.ndarray | None = None,
         roi: tuple[int, int, int, int] | None = None,
         static_mask: np.ndarray | None = None,
+        weight: np.ndarray | None = None,
     ) -> None:
         """Process one chunk of frames and accumulate it into the gridder.
 
@@ -344,13 +410,17 @@ class StreamingGridder:
             The single-shot :func:`grid_img_data` retains its own
             per-frame std heuristic only because there is only one
             "chunk" (the full stack) — see its docstring.
+        weight : ndarray, optional
+            Per-pixel correction weight (``(H, W)`` or ``(n_chunk, H, W)``)
+            for the ``Σ(raw·w)/Σ(w)`` accumulator (e.g. a ``CorrectionStack``
+            normalization).  ``None`` → unit weight (the count-mean).
 
         Notes
         -----
         The chunk-shape contract is ``(n_chunk, H, W)``; ``static_mask``
         must be ``(H, W)``.  Broadcast is applied along the frame axis.
         """
-        if self._gridder is None:
+        if self._grid_raw is None:
             raise RuntimeError(
                 "StreamingGridder bounds not set; call set_bounds() or "
                 "scout() before add()."
@@ -389,7 +459,8 @@ class StreamingGridder:
                 f"per-pixel q shape {qx.shape} does not match chunk shape "
                 f"{img.shape}; check angle array lengths"
             )
-        self._gridder(qx, qy, qz, img)
+        _feed_pair(self._grid_raw, self._grid_norm, qx, qy, qz, img,
+                   1.0 if weight is None else weight)
         self.n_frames_processed += img.shape[0]
 
     # ------------------------------------------------------------------
@@ -398,7 +469,7 @@ class StreamingGridder:
 
     def to_volume(self) -> RSMVolume:
         """Build the final :class:`RSMVolume` from the accumulated grid."""
-        if self._gridder is None:
+        if self._grid_raw is None:
             raise RuntimeError(
                 "bounds not set; call set_bounds() or scout() before to_volume()."
             )
@@ -407,10 +478,10 @@ class StreamingGridder:
                 "no chunks processed; call add() at least once before to_volume()."
             )
         return RSMVolume(
-            h=np.asarray(self._gridder.xaxis, dtype=float),
-            k=np.asarray(self._gridder.yaxis, dtype=float),
-            l=np.asarray(self._gridder.zaxis, dtype=float),
-            intensity=np.asarray(self._gridder.data, dtype=float),
+            h=np.asarray(self._grid_raw.xaxis, dtype=float),
+            k=np.asarray(self._grid_raw.yaxis, dtype=float),
+            l=np.asarray(self._grid_raw.zaxis, dtype=float),
+            intensity=_pair_intensity(self._grid_raw, self._grid_norm),
         )
 
 

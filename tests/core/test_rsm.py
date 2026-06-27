@@ -274,8 +274,17 @@ class TestGridImgData:
                 self.zaxis = np.linspace(0, 3, nz)
                 self.data = np.zeros((nx, ny, nz), dtype=float)
 
+            def KeepData(self, flag):  # noqa: N802
+                pass
+
+            def Normalize(self, flag):  # noqa: N802
+                pass
+
+            def dataRange(self, *a, **k):  # noqa: N802
+                pass
+
             def __call__(self, qx, qy, qz, img):
-                self.data = np.full(self.data.shape, float(np.nanmean(img)))
+                self.data = np.full(self.data.shape, float(np.nansum(img)))
 
         import xrd_tools.rsm.gridding as gridding_module
 
@@ -330,8 +339,17 @@ class TestGridImgData:
                 self.zaxis = np.linspace(-1, 1, nz)
                 self.data = np.zeros((nx, ny, nz), dtype=float)
 
+            def KeepData(self, flag):  # noqa: N802
+                pass
+
+            def Normalize(self, flag):  # noqa: N802
+                pass
+
+            def dataRange(self, *a, **k):  # noqa: N802
+                pass
+
             def __call__(self, qx, qy, qz, img):
-                self.data = np.full(self.data.shape, float(np.nanmean(img)))
+                self.data = np.full(self.data.shape, float(np.nansum(img)))
 
         import xrd_tools.rsm.gridding as gridding_module
 

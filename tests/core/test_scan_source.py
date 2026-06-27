@@ -58,6 +58,9 @@ class _FakeGridder3D:
     def KeepData(self, flag: bool) -> None:
         self.keep_data = bool(flag)
 
+    def Normalize(self, flag: bool) -> None:  # noqa: N802 — matches xu API
+        self.normalize = bool(flag)
+
     def dataRange(  # noqa: N802 — matches xu API
         self, xmin, xmax, ymin, ymax, zmin, zmax, fixed=False,
     ) -> None:
@@ -416,8 +419,8 @@ class TestProcessScanFromSphere:
             chunk_size=3,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),
         )
-        # Exactly one xu.Gridder3D for the whole scan
-        assert len(_FakeGridder3D.instances) == 1
+        # One Σ(raw·w)/Σ(w) accumulator PAIR for the whole scan
+        assert len(_FakeGridder3D.instances) == 2
         # 11 frames in chunk_size=3 → [3, 3, 3, 2]
         g = _FakeGridder3D.instances[0]
         sizes = [shape[0] for (_, shape) in g.chunks]
@@ -522,8 +525,8 @@ class TestGridSpheresStreaming:
             chunk_size=2,
             q_bounds=((-1, 1), (-1, 1), (-1, 1)),
         )
-        # 12 frames total, chunk_size 2 → 6 chunks, all into ONE gridder
-        assert len(_FakeGridder3D.instances) == 1
+        # 12 frames total, chunk_size 2 → 6 chunks, all into ONE accumulator pair
+        assert len(_FakeGridder3D.instances) == 2
         g = _FakeGridder3D.instances[0]
         sizes = [shape[0] for (_, shape) in g.chunks]
         assert sizes == [2, 2, 2, 2, 2, 2]
