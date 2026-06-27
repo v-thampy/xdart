@@ -24,6 +24,7 @@ from xrd_tools.corrections.normalization import (
 from xrd_tools.corrections.stack import CorrectionStack
 from xrd_tools.corrections.grazing import (
     GICorrectionStack,
+    GISettings,
     fresnel_transmission_sq,
     refracted_angle,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "CorrectionStack",
     # grazing-incidence per-pixel corrections (GI mode)
     "GICorrectionStack",
+    "GISettings",
     "fresnel_transmission_sq",
     "refracted_angle",
     # beam

@@ -121,7 +121,7 @@ class TestGiGridWeight:
     def test_rsm_correction_weight_multiplies_gi_in(self):
         """rsm_correction_weight(corrections, gi) == base × GI weight."""
         pytest.importorskip("pyFAI")
-        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.corrections.stack import CorrectionStack
         from xrd_tools.rsm.corrections import (
             gi_grid_weight, rsm_correction_weight,
@@ -132,16 +132,17 @@ class TestGiGridWeight:
                                fresnel=True, absorption=False, refraction=False)
         base = rsm_correction_weight(h, cs)
         giw = gi_grid_weight(h, gi, incident_angle_deg=0.3)
-        combined = rsm_correction_weight(h, cs, gi=gi, gi_incident_angle_deg=0.3)
+        combined = rsm_correction_weight(
+            h, cs, gi=GISettings(corrections=gi, incident_angle_deg=0.3))
         np.testing.assert_allclose(combined, base * giw)
 
     def test_gi_requires_fixed_incident_angle(self):
         pytest.importorskip("pyFAI")
-        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.rsm.corrections import rsm_correction_weight
         gi = GICorrectionStack(material="Si", energy_eV=10000.0)
-        with pytest.raises(ValueError, match="gi_incident_angle_deg"):
-            rsm_correction_weight(_header(), None, gi=gi)
+        with pytest.raises(ValueError, match="incident_angle_deg"):
+            rsm_correction_weight(_header(), None, gi=GISettings(corrections=gi))
 
 
 class TestRsmGridCorrectionsWiring:

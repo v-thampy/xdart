@@ -101,18 +101,11 @@ class StitchPlan:
     #: polarization …); None = unit weight. Ignored by the multigeometry backend
     #: (which carries pyFAI's own correctSolidAngle + polarization_factor).
     corrections: Any = None
-    #: a GICorrectionStack to stitch in grazing-incidence mode (footprint/Fresnel/
-    #: absorption → the Σnorm weight; refraction → the q-map). pyfai_hist backend
-    #: only. Per-frame αi comes from gi_incident_angle_deg, else the Diffractometer's
-    #: incident_angle mapping. The sample geometry is pyFAI's fiber convention;
-    #: absolute correctness is pending real-data validation (see grazing.py).
+    #: grazing-incidence settings (a GISettings: the GICorrectionStack +
+    #: incident_angle_deg / sample_orientation / tilt). pyfai_hist backend only.
+    #: αi from gi.incident_angle_deg, else the Diffractometer's incident_angle
+    #: mapping. Absolute GI correctness is pending real-data validation (grazing.py).
     gi: Any = None
-    #: explicit fixed incident angle (degrees) for GI; None → per-frame from the
-    #: Diffractometer incidence mapping.
-    gi_incident_angle_deg: float | None = None
-    #: pyFAI fiber sample geometry for the GI exit-angle/q_oop maps.
-    gi_sample_orientation: int = 1
-    gi_tilt_deg: float = 0.0
     rot1_key: str = "rot1"
     rot2_key: str | None = None
     monitor_key: str | None = None
@@ -154,10 +147,6 @@ class StitchPlan:
             "corrections": _ser(self.corrections),
             "gi": _ser(self.gi),
         }
-        if self.gi is not None:
-            prov["gi_incident_angle_deg"] = self.gi_incident_angle_deg
-            prov["gi_sample_orientation"] = self.gi_sample_orientation
-            prov["gi_tilt_deg"] = self.gi_tilt_deg
         diff = self.diffractometer
         if diff is not None:
             prov["diffractometer"] = (getattr(diff, "preset", None)
@@ -265,10 +254,10 @@ def run_stitch(
             # 2D uses the 2D radial bin count; 1D uses the 1D count.
             npt_rad = plan.npt_rad_2d if plan.mode == "2d" else plan.npt_1d
             if plan.gi is not None:
-                # per-frame αi: explicit fixed angle, else the Diffractometer's
-                # incident_angle mapping (degrees).
-                if plan.gi_incident_angle_deg is not None:
-                    inc = np.full(len(images), float(plan.gi_incident_angle_deg))
+                # per-frame αi: explicit fixed angle (gi.incident_angle_deg), else
+                # the Diffractometer's incident_angle mapping (degrees).
+                if plan.gi.incident_angle_deg is not None:
+                    inc = np.full(len(images), float(plan.gi.incident_angle_deg))
                 else:
                     per = diffractometer.to_pyfai_per_frame(motors)
                     inc = np.atleast_1d(np.asarray(per["incident_angle"], dtype=float))
@@ -277,13 +266,14 @@ def run_stitch(
                     if not np.any(inc != 0.0):
                         raise ValueError(
                             "GI stitching: the incident angle is 0 for every frame — "
-                            "set StitchPlan.gi_incident_angle_deg or activate the "
+                            "set GISettings.incident_angle_deg or activate the "
                             "Diffractometer's incident_angle mapping (an incidence "
                             "motor in the scan).")
                 frames = pyfai_gi_q_frames(
-                    images, integrators, gi=plan.gi, incident_angles_deg=inc,
-                    sample_orientation=plan.gi_sample_orientation,
-                    tilt_deg=plan.gi_tilt_deg, corrections=plan.corrections,
+                    images, integrators, gi=plan.gi.corrections,
+                    incident_angles_deg=inc,
+                    sample_orientation=plan.gi.sample_orientation,
+                    tilt_deg=plan.gi.tilt_deg, corrections=plan.corrections,
                     mask=plan.mask, normalization=normalization)
             else:
                 frames = pyfai_q_frames(
@@ -364,14 +354,11 @@ class RSMPlan:
     #: Σ(raw·w)/Σ(w) grid as the SAME weight stitching uses; None = unit weight
     #: (the count-mean). Geometry-static (fixed lab detector).
     corrections: Any = None
-    #: a GICorrectionStack to add grazing-incidence intensity weighting
-    #: (footprint/Fresnel/absorption) to the grid. Requires gi_incident_angle_deg
+    #: grazing-incidence settings (a GISettings) — adds the GI intensity weight
+    #: (footprint/Fresnel/absorption) to the grid. Requires gi.incident_angle_deg
     #: (a FIXED αi). Refraction + per-frame-varying αi + the absolute GI signs are
     #: the real-data-gated tail (see rsm/corrections.gi_grid_weight).
     gi: Any = None
-    gi_incident_angle_deg: float | None = None
-    gi_sample_orientation: int = 1
-    gi_tilt_deg: float = 0.0
 
     def provenance(self) -> dict[str, Any]:
         """A JSON-safe record of this RSM run for persistence (pass to
@@ -397,7 +384,6 @@ class RSMPlan:
             "chunk_size": self.chunk_size,
             "corrections": _ser(self.corrections),
             "gi": _ser(self.gi),
-            "gi_incident_angle_deg": self.gi_incident_angle_deg,
             "diffractometer": (getattr(diff, "preset", None)
                                or getattr(diff, "convention", None)),
         }
@@ -424,9 +410,6 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
             scout_pad=plan.scout_pad,
             corrections=plan.corrections,
             gi=plan.gi,
-            gi_incident_angle_deg=plan.gi_incident_angle_deg,
-            gi_sample_orientation=plan.gi_sample_orientation,
-            gi_tilt_deg=plan.gi_tilt_deg,
         )
         n_sources = len(inputs)
     else:
@@ -445,9 +428,6 @@ def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> Analy
             scout_pad=plan.scout_pad,
             corrections=plan.corrections,
             gi=plan.gi,
-            gi_incident_angle_deg=plan.gi_incident_angle_deg,
-            gi_sample_orientation=plan.gi_sample_orientation,
-            gi_tilt_deg=plan.gi_tilt_deg,
         )
         n_sources = 1
     return AnalysisResult(

@@ -106,9 +106,6 @@ def rsm_correction_weight(
     corrections: Any,
     *,
     gi: Any = None,
-    gi_incident_angle_deg: float | None = None,
-    gi_sample_orientation: int = 1,
-    gi_tilt_deg: float = 0.0,
     roi: tuple[int, int, int, int] | None = None,
 ) -> np.ndarray | None:
     """Per-pixel ``Σnorm`` weight for the RSM grid, or ``None``.
@@ -118,10 +115,11 @@ def rsm_correction_weight(
     ROI-cropped detector so it lines up with the chunk images
     :meth:`StreamingGridder.add` feeds (which are ROI-cropped the same way).
 
-    When ``gi`` (a ``GICorrectionStack``) is given, the GI intensity weight
-    (:func:`gi_grid_weight`) is multiplied in — ``gi_incident_angle_deg`` is the
+    When ``gi`` (a :class:`~xrd_tools.corrections.GISettings`) carrying a
+    ``GICorrectionStack`` is given, the GI intensity weight
+    (:func:`gi_grid_weight`) is multiplied in — ``gi.incident_angle_deg`` is the
     fixed incidence αi (required; per-frame-varying αi + refraction are the
-    real-data-gated tail).  ``corrections is None`` and ``gi is None`` → ``None``
+    real-data-gated tail).  ``corrections is None`` and ``gi`` empty → ``None``
     (unit weight, the count-mean).
     """
     base = None
@@ -130,14 +128,14 @@ def rsm_correction_weight(
         ai = detector_header_to_ai(h)
         base = np.asarray(
             corrections.normalization(ai, (int(h.Nch1), int(h.Nch2))), dtype=float)
-    if gi is not None:
-        if gi_incident_angle_deg is None:
+    if gi is not None and gi.corrections is not None:
+        if gi.incident_angle_deg is None:
             raise ValueError(
-                "GI RSM (RSMPlan.gi) requires gi_incident_angle_deg (a fixed "
-                "incidence angle); per-frame-varying αi is the real-data-gated "
-                "tail.")
+                "GI RSM (RSMPlan.gi) requires GISettings.incident_angle_deg (a "
+                "fixed incidence angle); per-frame-varying αi is the real-data-"
+                "gated tail.")
         giw = gi_grid_weight(
-            header, gi, incident_angle_deg=gi_incident_angle_deg,
-            sample_orientation=gi_sample_orientation, tilt_deg=gi_tilt_deg, roi=roi)
+            header, gi.corrections, incident_angle_deg=gi.incident_angle_deg,
+            sample_orientation=gi.sample_orientation, tilt_deg=gi.tilt_deg, roi=roi)
         base = giw if base is None else base * giw
     return base

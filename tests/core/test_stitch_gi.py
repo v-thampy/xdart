@@ -54,6 +54,27 @@ def _gi_diff_and_src():
     return diff, src
 
 
+class TestGISettings:
+    """The shared GI config object (StitchPlan.gi / RSMPlan.gi)."""
+
+    def test_roundtrip_to_from_dict(self):
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
+        gi = GISettings(
+            corrections=GICorrectionStack(material="Si", energy_eV=10000.0,
+                                          footprint=True, refraction=False),
+            incident_angle_deg=0.35, sample_orientation=3, tilt_deg=1.5)
+        back = GISettings.from_dict(gi.to_dict())
+        assert back.incident_angle_deg == 0.35
+        assert back.sample_orientation == 3 and back.tilt_deg == 1.5
+        assert back.corrections.material == "Si"
+        assert back.corrections.footprint is True and back.corrections.refraction is False
+
+    def test_empty_settings_roundtrip(self):
+        from xrd_tools.corrections.grazing import GISettings
+        back = GISettings.from_dict(GISettings().to_dict())
+        assert back.corrections is None and back.incident_angle_deg is None
+
+
 class TestGIConvention:
     """Pin the pyFAI fiber convention the GI provider delegates to."""
 
@@ -80,7 +101,7 @@ class TestGIProvider:
         """A GICorrectionStack with every factor off (incl. refraction) must yield a
         byte-equal frame to pyfai_q_frames — the GI path adds nothing when idle."""
         pytest.importorskip("pyFAI")
-        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.integrate.stitch_hist import pyfai_gi_q_frames, pyfai_q_frames
         ai = _ai(); img = _ring(0)
         off = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=False,
@@ -94,7 +115,7 @@ class TestGIProvider:
 
     def test_footprint_only_scales_weight_by_sin_ai(self):
         pytest.importorskip("pyFAI")
-        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.integrate.stitch_hist import pyfai_gi_q_frames, pyfai_q_frames
         ai = _ai(); img = _ring(0); aideg = 0.3
         fp = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=True,
@@ -109,7 +130,7 @@ class TestGIProvider:
         refraction=False leaves |q| byte-equal to the plain provider. (The refraction
         *physics* — shift vanishing above αc — is gate-tested in test_grazing.py.)"""
         pytest.importorskip("pyFAI")
-        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.integrate.stitch_hist import pyfai_gi_q_frames, pyfai_q_frames
         ai = _ai(); img = _ring(0)
         q_plain, *_ = next(pyfai_q_frames([img], [ai]))
@@ -127,7 +148,7 @@ class TestGIProvider:
 
     def test_bad_incident_angle_count_raises(self):
         pytest.importorskip("pyFAI")
-        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.integrate.stitch_hist import pyfai_gi_q_frames
         gi = GICorrectionStack(material="Si", energy_eV=10000.0)
         with pytest.raises(ValueError, match="incident angle"):
@@ -139,37 +160,37 @@ class TestGIRunStitch:
     def test_gi_requires_pyfai_hist_backend(self):
         pytest.importorskip("pyFAI")
         from xrd_tools.analysis.plans import StitchPlan, run_stitch
-        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         diff, src = _gi_diff_and_src()
         gi = GICorrectionStack(material="Si", energy_eV=10000.0)
         with pytest.raises(ValueError, match="only available on the 'pyfai_hist'"):
-            run_stitch(StitchPlan(diffractometer=diff, gi=gi,
+            run_stitch(StitchPlan(diffractometer=diff, gi=GISettings(corrections=gi),
                                   backend="multigeometry"), src)
 
     def test_gi_requires_diffractometer(self):
         pytest.importorskip("pyFAI")
         from xrd_tools.analysis.plans import StitchPlan, run_stitch
-        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         _diff, src = _gi_diff_and_src()
         base = PONI(dist=0.2, poni1=_SHAPE[0] * 172e-6 / 2, poni2=_SHAPE[1] * 172e-6 / 2,
                     wavelength=1.0e-10, detector="Pilatus100k")
         gi = GICorrectionStack(material="Si", energy_eV=10000.0)
         with pytest.raises(ValueError, match="requires the geometry path"):
             run_stitch(StitchPlan(base_poni=base, rot1_key="nu", rot2_key="del",
-                                  backend="pyfai_hist", gi=gi), src)
+                                  backend="pyfai_hist", gi=GISettings(corrections=gi)), src)
 
     def test_gi_off_matches_non_gi_run(self):
         """An all-off GICorrectionStack run_stitch must equal the plain pyfai_hist run."""
         pytest.importorskip("pyFAI")
         from xrd_tools.analysis.plans import StitchPlan, run_stitch
-        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         diff, src = _gi_diff_and_src()
         off = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=False,
                                 fresnel=False, absorption=False, refraction=False)
         plain = run_stitch(StitchPlan(diffractometer=diff, backend="pyfai_hist",
                                       mode="1d", npt_1d=200), src)
         gi = run_stitch(StitchPlan(diffractometer=diff, backend="pyfai_hist",
-                                   mode="1d", npt_1d=200, gi=off), src)
+                                   mode="1d", npt_1d=200, gi=GISettings(corrections=off)), src)
         np.testing.assert_allclose(gi.payload.intensity, plain.payload.intensity,
                                    equal_nan=True)
 
@@ -177,14 +198,14 @@ class TestGIRunStitch:
         """run_stitch GI footprint-only ⇒ I = I_nonGI / sin(αi) (αi=0.3° from eta)."""
         pytest.importorskip("pyFAI")
         from xrd_tools.analysis.plans import StitchPlan, run_stitch
-        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         diff, src = _gi_diff_and_src()
         fp = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=True,
                                fresnel=False, absorption=False, refraction=False)
         plain = run_stitch(StitchPlan(diffractometer=diff, backend="pyfai_hist",
                                       mode="1d", npt_1d=200), src)
         gi = run_stitch(StitchPlan(diffractometer=diff, backend="pyfai_hist",
-                                   mode="1d", npt_1d=200, gi=fp), src)
+                                   mode="1d", npt_1d=200, gi=GISettings(corrections=fp)), src)
         m = np.isfinite(plain.payload.intensity) & np.isfinite(gi.payload.intensity)
         ratio = gi.payload.intensity[m] / plain.payload.intensity[m]
         np.testing.assert_allclose(ratio, 1.0 / np.sin(np.deg2rad(0.3)), rtol=1e-6)
@@ -192,7 +213,7 @@ class TestGIRunStitch:
     def test_gi_explicit_incident_angle_override(self):
         pytest.importorskip("pyFAI")
         from xrd_tools.analysis.plans import StitchPlan, run_stitch
-        from xrd_tools.corrections.grazing import GICorrectionStack
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         diff, src = _gi_diff_and_src()
         fp = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=True,
                                fresnel=False, absorption=False, refraction=False)
@@ -200,8 +221,8 @@ class TestGIRunStitch:
                                       mode="1d", npt_1d=200), src)
         # override αi to 1.0° (ignore the eta=0.3° in the metadata)
         gi = run_stitch(StitchPlan(diffractometer=diff, backend="pyfai_hist",
-                                   mode="1d", npt_1d=200, gi=fp,
-                                   gi_incident_angle_deg=1.0), src)
+                                   mode="1d", npt_1d=200,
+                                   gi=GISettings(corrections=fp, incident_angle_deg=1.0)), src)
         m = np.isfinite(plain.payload.intensity) & np.isfinite(gi.payload.intensity)
         ratio = gi.payload.intensity[m] / plain.payload.intensity[m]
         np.testing.assert_allclose(ratio, 1.0 / np.sin(np.deg2rad(1.0)), rtol=1e-6)

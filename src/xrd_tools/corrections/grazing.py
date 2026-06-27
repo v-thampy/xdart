@@ -232,8 +232,53 @@ class GICorrectionStack:
         )
 
 
+@dataclass(frozen=True)
+class GISettings:
+    """Grazing-incidence settings shared by ``StitchPlan`` + ``RSMPlan``.
+
+    Bundles the per-pixel GI :class:`GICorrectionStack` (footprint / Fresnel /
+    absorption / refraction) with the pyFAI fiber **sample geometry** — so the
+    GUI's "measurement config" panel binds to ONE object instead of four loose
+    plan fields, and Stitch and RSM share one GI contract.
+
+    ``incident_angle_deg`` is a FIXED αi; ``None`` means "derive per-frame from
+    the Diffractometer's incident_angle mapping" (Stitch supports per-frame αi;
+    RSM is fixed-αi only for now).  ``sample_orientation``/``tilt_deg`` are the
+    pyFAI fiber EXIF orientation + roll.
+
+    (The reduction-side :class:`~xrd_tools.reduction.GIMode` stays separate — it
+    carries reduction-output baggage, ``mode_1d/2d``/``method``/``npt_oop``; a
+    future convergence is noted but not in scope.)
+    """
+
+    corrections: "GICorrectionStack | None" = None
+    incident_angle_deg: float | None = None
+    sample_orientation: int = 1
+    tilt_deg: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "corrections": (self.corrections.to_dict()
+                            if self.corrections is not None else None),
+            "incident_angle_deg": self.incident_angle_deg,
+            "sample_orientation": self.sample_orientation,
+            "tilt_deg": self.tilt_deg,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> "GISettings":
+        c = d.get("corrections")
+        return cls(
+            corrections=(GICorrectionStack.from_dict(c) if c is not None else None),
+            incident_angle_deg=d.get("incident_angle_deg"),
+            sample_orientation=int(d.get("sample_orientation", 1)),
+            tilt_deg=float(d.get("tilt_deg", 0.0)),
+        )
+
+
 __all__ = [
     "GICorrectionStack",
+    "GISettings",
     "absorption_path",
     "film_absorption",
     "footprint_weight",
