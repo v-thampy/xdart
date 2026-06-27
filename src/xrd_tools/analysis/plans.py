@@ -101,6 +101,18 @@ class StitchPlan:
     #: polarization …); None = unit weight. Ignored by the multigeometry backend
     #: (which carries pyFAI's own correctSolidAngle + polarization_factor).
     corrections: Any = None
+    #: a GICorrectionStack to stitch in grazing-incidence mode (footprint/Fresnel/
+    #: absorption → the Σnorm weight; refraction → the q-map). pyfai_hist backend
+    #: only. Per-frame αi comes from gi_incident_angle_deg, else the Diffractometer's
+    #: incident_angle mapping. The sample geometry is pyFAI's fiber convention;
+    #: absolute correctness is pending real-data validation (see grazing.py).
+    gi: Any = None
+    #: explicit fixed incident angle (degrees) for GI; None → per-frame from the
+    #: Diffractometer incidence mapping.
+    gi_incident_angle_deg: float | None = None
+    #: pyFAI fiber sample geometry for the GI exit-angle/q_oop maps.
+    gi_sample_orientation: int = 1
+    gi_tilt_deg: float = 0.0
     rot1_key: str = "rot1"
     rot2_key: str | None = None
     monitor_key: str | None = None
@@ -184,13 +196,17 @@ def run_stitch(
         integrators = create_multigeometry_integrators_from_geometry(
             diffractometer, motors, base_calibration=base_cal)
         extra = {k: v for k, v in plan.extra.items() if k != "detector_config"}
+        if plan.gi is not None and plan.backend != "pyfai_hist":
+            raise ValueError(
+                "GI stitching (StitchPlan.gi) is only available on the 'pyfai_hist' "
+                f"backend; got backend={plan.backend!r}.")
         if plan.backend == "xu_hist":
             raise NotImplementedError(
                 "the 'xu_hist' stitch backend (xu Ang2Q q-provider) is not built "
                 "yet; use 'multigeometry' or 'pyfai_hist'")
         if plan.backend == "pyfai_hist":
             from xrd_tools.integrate.stitch_hist import (  # noqa: PLC0415
-                pyfai_q_frames, stitch_q_grid)
+                pyfai_gi_q_frames, pyfai_q_frames, stitch_q_grid)
             # the pyfai_hist provider emits |q| in Å⁻¹ ONLY — a non-q unit would
             # silently mislabel a q-axis as 2θ/r (fail loud instead).
             if plan.unit != "q_A^-1":
@@ -212,9 +228,33 @@ def run_stitch(
                     plan.method)
             # 2D uses the 2D radial bin count; 1D uses the 1D count.
             npt_rad = plan.npt_rad_2d if plan.mode == "2d" else plan.npt_1d
+            if plan.gi is not None:
+                # per-frame αi: explicit fixed angle, else the Diffractometer's
+                # incident_angle mapping (degrees).
+                if plan.gi_incident_angle_deg is not None:
+                    inc = np.full(len(images), float(plan.gi_incident_angle_deg))
+                else:
+                    per = diffractometer.to_pyfai_per_frame(motors)
+                    inc = np.atleast_1d(np.asarray(per["incident_angle"], dtype=float))
+                    if inc.shape[0] == 1 and len(images) > 1:
+                        inc = np.full(len(images), float(inc[0]))
+                    if not np.any(inc != 0.0):
+                        raise ValueError(
+                            "GI stitching: the incident angle is 0 for every frame — "
+                            "set StitchPlan.gi_incident_angle_deg or activate the "
+                            "Diffractometer's incident_angle mapping (an incidence "
+                            "motor in the scan).")
+                frames = pyfai_gi_q_frames(
+                    images, integrators, gi=plan.gi, incident_angles_deg=inc,
+                    sample_orientation=plan.gi_sample_orientation,
+                    tilt_deg=plan.gi_tilt_deg, corrections=plan.corrections,
+                    mask=plan.mask, normalization=normalization)
+            else:
+                frames = pyfai_q_frames(
+                    images, integrators, corrections=plan.corrections,
+                    mask=plan.mask, normalization=normalization)
             payload = stitch_q_grid(
-                pyfai_q_frames(images, integrators, corrections=plan.corrections,
-                               mask=plan.mask, normalization=normalization),
+                frames,
                 mode=plan.mode, npt=npt_rad, npt_azim=plan.npt_azim_2d,
                 unit=plan.unit, radial_range=plan.radial_range,
                 azimuth_range=plan.azimuth_range)
@@ -230,6 +270,11 @@ def run_stitch(
                 method=plan.method, radial_range=plan.radial_range,
                 mask=plan.mask, normalization=normalization, **extra)
     else:
+        if plan.gi is not None:
+            raise ValueError(
+                "GI stitching (StitchPlan.gi) requires the geometry path — set "
+                "StitchPlan.diffractometer (the per-frame incident angle αi is read "
+                "from its incident_angle mapping).")
         rot1 = _metadata_series(src, labels, plan.rot1_key)
         rot2 = (
             _metadata_series(src, labels, plan.rot2_key)

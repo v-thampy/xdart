@@ -54,10 +54,16 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
   `circle_motors` (the "one wiring task"). *Gate:* xu_hist |q| == pyfai_hist within the
   radial bin width (validates the psic circle order) + χ == pyFAI `chiArray`. Best done
   with the real-data notebook so the circle order is validated, not guessed.
-- **P4 — GI flag** (`StitchPlan.gi: GIMode | None`, reusing the reduction `GIMode`/`gi_config`;
-  see `design_stitching_jun2026.md §2.8`). GI orthogonal to backend; no `Diffractometer`
-  extension needed (the one wiring task is the per-frame sample-angle assembly from
-  `circle_motors`).
+- **P4 — GI flag ✓ DONE (headless; convention live-gated)** (`StitchPlan.gi: GICorrectionStack`,
+  `pyfai_gi_q_frames`): GI on the `pyfai_hist` backend only. The per-pixel αf + out-of-plane
+  q_z come from **pyFAI's own fiber units** (`FiberIntegrator` + `exit_angle_vert`/`qoop`
+  after `reset_integrator(incident_angle=…)`) — the SAME convention as the reduction GI path,
+  gate-pinned by `q_oop ≡ k0·(sin αf + sin αi)` (`test_stitch_gi.py::TestGIConvention`). The
+  P2b `GICorrectionStack` then supplies the weight (footprint·Fresnel·absorption → `Σnorm`)
+  + refraction (→ the q-map). Per-frame αi = `StitchPlan.gi_incident_angle_deg` else the
+  `Diffractometer.incident_angle` mapping. **Gated headless:** GI-off ≡ non-GI; footprint-only
+  ⇒ `I = I_nonGI / sin αi`; refraction toggle; backend/diffractometer guards. **NOT validated:**
+  the absolute composition signs (P2b flag) + `sample_orientation`/`tilt` — pending GIXSGUI.
 - **P5 — persistence**: register `stitched_1d/2d` schema groups + capability (mirror the
   `diffractometer` group), persist the applied-`CorrectionStack` + plan provenance.
 - **P6 — RSM**: unify the RSM pipeline onto the one `Diffractometer` + the shared accumulator +
@@ -71,10 +77,16 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
       `/entry/diffractometer`; reload restores `ProcessedScan.diffractometer`. (app default is
       now psic — a non-psic scan must set `scan.geometry` explicitly.)
 - [ ] P1: a live stitch reproduces the notebook stitch.
+- [ ] P4: a GI stitch vs a GIXSGUI-worked example — confirm the composition signs
+      (footprint/absorption direction) + `sample_orientation`/`tilt` against real data.
+      (αf/q_z maps are pyFAI's, already pinned; only the absolute correction direction waits.)
 - [ ] P7: the Stitch viewer + Refine button + GI stitch flow.
 
 ## Status
 Geometry (ADR-0007 steps 0–5 + 4b `refine_goniometer`) — **done, reviewed, green**.
-**P1, P2a, P2b, P3a, P3b — done + gated.** Next: **P3c** (`xu_hist` backend — the design
-default; needs the `circle_motors` angle-assembly validated, ideally with the real-data
-notebook), then P4 (GI flag), P5 (persistence), P6 (RSM), P7 (live GUI). The live tail is P7.
+**P1, P2a, P2b, P3a, P3b, P3-review, P4 — done + gated** (P4 headless; its absolute GI
+convention is live-gated, αf/q_z maps delegated to pyFAI + pinned). **P3c (`xu_hist`) and the
+P4 GI-sign validation share the same real-data gate** — both need the notebook to confirm a
+geometry convention, so they're batched for the next live/real-data session. Next headless:
+**P5 (persistence)** — convention-independent, fully round-trip-gateable. Then P6 (RSM),
+P7 (live GUI). The live tail is P7 + the two convention validations.

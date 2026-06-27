@@ -124,6 +124,36 @@ def stitch_q_grid(
         unit=unit, azimuthal_unit="chi_deg")
 
 
+def _materialize_and_validate(images, integrators, normalization, *, who):
+    """Materialize the image/integrator iterables and fail loud on a corrupting
+    input — shared by the plain and GI q-providers.
+
+    Catches the silent-corruption class: a frame/integrator length desync (``zip``
+    would truncate, dropping whole frames) and a bad per-frame monitor (zero/NaN
+    drops a frame; **negative** flips its sign and cancels healthy frames).
+    """
+    images = list(images)
+    integrators = list(integrators)
+    if len(images) != len(integrators):
+        raise ValueError(
+            f"{who}: {len(images)} images but {len(integrators)} integrators — "
+            "every frame needs exactly one integrator")
+    mon = None
+    if normalization is not None:
+        mon = np.asarray(list(normalization), dtype=float)
+        if len(mon) != len(images):
+            raise ValueError(
+                f"{who}: {len(mon)} monitor/normalization values for "
+                f"{len(images)} images")
+        bad = ~np.isfinite(mon) | (mon <= 0)
+        if bad.any():
+            raise ValueError(
+                "stitch monitor/normalization has invalid value(s) (non-finite "
+                f"or <= 0) at frame index/indices {np.flatnonzero(bad).tolist()}: "
+                f"{mon[bad].tolist()}")
+    return images, integrators, mon
+
+
 def pyfai_q_frames(
     images: Iterable[np.ndarray],
     integrators: Iterable[Any],
@@ -141,30 +171,8 @@ def pyfai_q_frames(
     pixels' weight; a per-frame monitor ``normalization`` scalar divides the
     signal (matching the MultiGeometry path).
     """
-    images = list(images)
-    integrators = list(integrators)
-    # fail loud on a frame/integrator desync (zip would silently truncate, losing
-    # whole frames from the stitch with no error).
-    if len(images) != len(integrators):
-        raise ValueError(
-            f"pyfai_q_frames: {len(images)} images but {len(integrators)} "
-            "integrators — every frame needs exactly one integrator")
-    mon = None
-    if normalization is not None:
-        mon = np.asarray(list(normalization), dtype=float)
-        if len(mon) != len(images):
-            raise ValueError(
-                f"pyfai_q_frames: {len(mon)} monitor/normalization values for "
-                f"{len(images)} images")
-        # a zero/NaN monitor silently DROPS a whole frame (signal → inf/NaN, then
-        # dropped); a NEGATIVE monitor FLIPS the frame's sign and cancels healthy
-        # frames in the merge — both produce a finite, plausible, wrong result.
-        bad = ~np.isfinite(mon) | (mon <= 0)
-        if bad.any():
-            raise ValueError(
-                "stitch monitor/normalization has invalid value(s) (non-finite "
-                f"or <= 0) at frame index/indices {np.flatnonzero(bad).tolist()}: "
-                f"{mon[bad].tolist()}")
+    images, integrators, mon = _materialize_and_validate(
+        images, integrators, normalization, who="pyfai_q_frames")
     for i, (ai, img) in enumerate(zip(integrators, images)):
         shape = np.asarray(img).shape
         q = np.asarray(ai.qArray(shape=shape), dtype=float) / 10.0
@@ -181,4 +189,100 @@ def pyfai_q_frames(
         yield q, chi, signal, w
 
 
-__all__ = ["pyfai_q_frames", "stitch_q_grid"]
+def _as_fiber(ai: Any) -> Any:
+    """Promote a pyFAI integrator to a ``FiberIntegrator`` with the same geometry.
+
+    ``FiberIntegrator`` *is* an ``AzimuthalIntegrator`` (same dist/poni/rot/detector/
+    wavelength) — we only need its GI unit machinery for the per-pixel αf and q_oop
+    maps, so a plain integrator is rebuilt as a fiber one without changing geometry.
+    """
+    from pyFAI.integrator.fiber import FiberIntegrator  # noqa: PLC0415
+    if isinstance(ai, FiberIntegrator):
+        return ai
+    return FiberIntegrator(
+        dist=ai.dist, poni1=ai.poni1, poni2=ai.poni2,
+        rot1=ai.rot1, rot2=ai.rot2, rot3=ai.rot3,
+        detector=ai.detector, wavelength=ai.wavelength)
+
+
+def pyfai_gi_q_frames(
+    images: Iterable[np.ndarray],
+    integrators: Iterable[Any],
+    *,
+    gi: Any,
+    incident_angles_deg: Iterable[float],
+    sample_orientation: int = 1,
+    tilt_deg: float = 0.0,
+    corrections: Any = None,
+    mask: np.ndarray | None = None,
+    normalization: Iterable[float] | None = None,
+) -> Iterator[Any]:
+    """``pyfai_hist`` **grazing-incidence** q-provider — like :func:`pyfai_q_frames`
+    but applies a :class:`~xrd_tools.corrections.grazing.GICorrectionStack`.
+
+    Per pixel: the GI intensity factors (footprint·Fresnel·absorption) multiply into
+    the ``Σnorm`` weight via ``gi.gi_normalization``; if ``gi.refraction`` the q-map
+    is rewritten by ``gi.refract_q`` (a position correction).  The per-pixel exit
+    angle αf and out-of-plane q_z come from **pyFAI's own fiber geometry**
+    (``FiberIntegrator`` + the ``exit_angle_vert``/``qoop`` units, after
+    ``reset_integrator(incident_angle=…)``) — the SAME convention as the reduction
+    GI path, so q_oop ≡ k0·(sin αf + sin αi).  Per-frame αi (degrees) is
+    ``incident_angles_deg`` (one per frame, from
+    ``Diffractometer.to_pyfai_per_frame(...)['incident_angle']``).
+
+    ⚠ The GI sample geometry (``sample_orientation``/``tilt_deg``) + the P2b
+    composition signs are **pending real-data (GIXSGUI) validation** — the per-pixel
+    αf/q_z maps are pyFAI's (gate-checked), but the absolute correction direction is
+    not yet confirmed against a worked GI example.
+    """
+    import pyFAI.units as U  # noqa: PLC0415
+
+    if gi is None:
+        raise ValueError("pyfai_gi_q_frames requires a GICorrectionStack (gi=)")
+    images, integrators, mon = _materialize_and_validate(
+        images, integrators, normalization, who="pyfai_gi_q_frames")
+    inc = np.asarray(list(incident_angles_deg), dtype=float)
+    if inc.shape != (len(images),):
+        raise ValueError(
+            f"pyfai_gi_q_frames: {inc.shape} incident angle(s) for "
+            f"{len(images)} images — need exactly one αi per frame")
+    if not np.all(np.isfinite(inc)):
+        raise ValueError(
+            "pyfai_gi_q_frames: non-finite incident angle(s) at "
+            f"{np.flatnonzero(~np.isfinite(inc)).tolist()}")
+
+    tilt_rad = float(np.radians(tilt_deg))
+    so = int(sample_orientation)
+    for i, (ai, img) in enumerate(zip(integrators, images)):
+        shape = np.asarray(img).shape
+        air = float(np.radians(inc[i]))
+        fi = _as_fiber(ai)
+        # populate the fiber geometry cache so the unit maps recompute for this αi
+        fi.reset_integrator(incident_angle=air, tilt_angle=tilt_rad,
+                            sample_orientation=so)
+        af_u = U.get_unit_fiber("exit_angle_vert_rad", incident_angle=air,
+                                tilt_angle=tilt_rad, sample_orientation=so)
+        qoop_u = U.get_unit_fiber("qoop_A^-1", incident_angle=air,
+                                  tilt_angle=tilt_rad, sample_orientation=so)
+        af = np.asarray(fi.array_from_unit(shape, "center", af_u), dtype=float)
+        q_oop = np.asarray(fi.array_from_unit(shape, "center", qoop_u), dtype=float)
+        q = np.asarray(fi.qArray(shape=shape), dtype=float) / 10.0
+        chi = np.degrees(np.asarray(fi.chiArray(shape=shape), dtype=float))
+        # base normalization (solid angle/polarization) × the GI intensity weight
+        if corrections is not None:
+            w = np.asarray(corrections.normalization(fi, shape), dtype=float)
+        else:
+            w = np.ones(shape, dtype=float)
+        w = w * gi.gi_normalization(incident_angle_deg=float(inc[i]), alpha_f_rad=af)
+        if mask is not None:
+            w = np.where(np.asarray(mask, dtype=bool), 0.0, w)
+        if getattr(gi, "refraction", False):
+            q = gi.refract_q(incident_angle_deg=float(inc[i]), alpha_f_rad=af,
+                             q_total=q, q_z=q_oop)
+        signal = np.asarray(img, dtype=float)
+        if mon is not None:
+            signal = signal / mon[i]
+        yield q, chi, signal, w
+
+
+__all__ = ["pyfai_gi_q_frames", "pyfai_q_frames", "stitch_q_grid"]
