@@ -123,5 +123,23 @@ class ProcessedNexusSource(BaseFrameSource):
     def metadata_for(self, index: int) -> Mapping[str, Any]:
         return self.read_view(index, include_thumbnail=False).metadata_raw
 
+    def frame_for(self, index: int) -> ScanFrame:
+        """Attach the ORIGINAL raw-master pointer (carried by the FrameView's
+        ``source_path``/``source_frame_index``) so a stitch/RSM built from a
+        processed ``.nxs`` persists resolvable contributing-frame records — the
+        raw popup resolves the true master two hops out (stitch.nxs → this
+        processed.nxs's per-frame source pointer → the master), not this
+        already-reduced file.  (One reader open per frame; harvest is a one-time
+        per-result step, not a hot loop.)"""
+        view = self.read_view(int(index), include_thumbnail=False)
+        return ScanFrame(
+            index=int(index),
+            metadata=dict(view.metadata_raw),
+            source_path=view.source_path,
+            source_frame_index=view.source_frame_index,
+            loader=lambda fr: self.load_frame(int(index)),
+            source_identity=str(self.path),
+        )
+
 
 __all__ = ["NexusStackSource", "ProcessedNexusSource"]

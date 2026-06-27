@@ -334,7 +334,8 @@ def frame_record_labels(frames_grp):
     return out
 
 
-def harvest_frame_records(source, *, scan_labels=None, with_thumbnails: bool = False):
+def harvest_frame_records(source, *, scan_labels=None, selected_labels=None,
+                          with_thumbnails: bool = False):
     """Build the ``frame_records`` list for a Stitch/RSM result from its source(s).
 
     Mirrors what :class:`~xrd_tools.reduction.NexusSink` writes per frame, but for
@@ -353,6 +354,13 @@ def harvest_frame_records(source, *, scan_labels=None, with_thumbnails: bool = F
     member's ``source_path`` / ``source_frame_index``, which the raw popup
     resolves to the original master.  ``with_thumbnails=True`` additionally bakes a
     downsampled preview (loads each frame).
+
+    ``selected_labels`` restricts the records to the frames that **actually
+    contributed** — pass ``run_stitch``'s reduced ``frame_indices`` here (in the
+    *source*'s own label space: the composite's GLOBAL index for a group, the
+    source's own labels otherwise).  ``None`` (the default) records every frame.
+    Without this, a subselected stitch would persist records for frames that were
+    never merged.
     """
     members = _expand_frame_sources(source)
     if scan_labels is None:
@@ -363,9 +371,13 @@ def harvest_frame_records(source, *, scan_labels=None, with_thumbnails: bool = F
             raise ValueError(
                 f"scan_labels has {len(labels)} entries but the source expands to "
                 f"{len(members)} member(s)")
+    wanted = _partition_selected_local_labels(source, members, selected_labels)
     records: list[dict] = []
-    for scan_label, member in zip(labels, members):
+    for mi, (scan_label, member) in enumerate(zip(labels, members)):
+        want = wanted[mi] if wanted is not None else None
         for idx in member.frame_indices:
+            if want is not None and int(idx) not in want:
+                continue
             sf = member.frame_for(idx)
             sp = getattr(sf, "source_path", None)
             rec = {
@@ -383,6 +395,30 @@ def harvest_frame_records(source, *, scan_labels=None, with_thumbnails: bool = F
                                  "%s frame %s", scan_label, idx, exc_info=True)
             records.append(rec)
     return records
+
+
+def _partition_selected_local_labels(source, members, selected_labels):
+    """Map ``selected_labels`` (in ``source``'s own label space) to a per-member
+    set of LOCAL frame labels — ``None`` means "no restriction".
+
+    For a :class:`~xrd_tools.sources.composite.CompositeFrameSource` the selection
+    is in the GLOBAL ``0..N-1`` index, so it's resolved through the composite's
+    ``_map`` (``global → (member_pos, local_label)``).  For a single source the
+    selection is already that source's own labels.  A bare multi-member sequence
+    with a selection is ambiguous (no caller does this) → not filtered."""
+    if selected_labels is None:
+        return None
+    sel = {int(s) for s in selected_labels}
+    gmap = getattr(source, "_map", None)   # composite: list[(member_pos, local)]
+    if gmap is not None:
+        per: list[set] = [set() for _ in members]
+        for g in sel:
+            member_pos, local = gmap[int(g)]
+            per[int(member_pos)].add(int(local))
+        return per
+    if len(members) == 1:
+        return [sel]
+    return None
 
 
 def _expand_frame_sources(source) -> list:

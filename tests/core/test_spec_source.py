@@ -101,3 +101,23 @@ def test_spec_with_images_enables_raw(tmp_path):
                       read_image_kwargs={"detector_shape": (6, 6),
                                          "raw_dtype": "int32"})
     assert src2.frame_indices == [0, 1, 2]           # still only scan 5's three
+
+
+def test_spec_frame_for_carries_raw_source_pointer(tmp_path):
+    """frame_for must attach the raw-image source pointer (the stitch/RSM raw-popup
+    enabler) — else a SPEC-sourced stitch persists empty contributing-frame
+    records and the popup silently vanishes for the commonest stitch source."""
+    p = _spec(tmp_path)
+    for i in range(3):
+        (np.full((6, 6), i + 1, dtype="int32")).tofile(
+            tmp_path / f"myscan_scan5_{i:04d}.raw")
+    src = SpecSource(p, scan=5, image_dir=tmp_path,
+                     read_image_kwargs={"detector_shape": (6, 6),
+                                        "raw_dtype": "int32"})
+    sf = src.frame_for(1)
+    assert sf.source_path is not None
+    assert sf.source_path.name == "myscan_scan5_0001.raw"
+
+    # metadata-only SPEC (no image_dir) → no raw → source_path stays None
+    bare = SpecSource(p, scan=5)
+    assert bare.frame_for(1).source_path is None

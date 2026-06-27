@@ -142,8 +142,21 @@ def create_multigeometry_integrators_from_geometry(
             raise KeyError(
                 f"stitch geometry needs motor {mapping.source_motor!r} (it drives "
                 f"a detector rotation) but the source provides {sorted(motors)}")
-        return np.deg2rad(mapping.apply(
-            np.asarray(motors[mapping.source_motor], dtype=float)))
+        col = np.asarray(motors[mapping.source_motor], dtype=float)
+        # Fail loud on a non-finite rotation rather than letting pyFAI silently
+        # collapse the geometry (NaN rot → qmax≈0, frames dropped with no error).
+        # This is the multi-source-stitch footgun: a CompositeFrameSource NaN-pads
+        # a member that lacks this detector-rotation motor (so the key is present
+        # but the column carries NaN), which slips past the missing-key guard above.
+        if not np.all(np.isfinite(col)):
+            bad = np.flatnonzero(~np.isfinite(col)).tolist()
+            raise ValueError(
+                f"stitch geometry motor {mapping.source_motor!r} has non-finite "
+                f"value(s) at frame position(s) {bad[:10]}"
+                f"{' …' if len(bad) > 10 else ''} — a grouped/composite source is "
+                f"NaN-padding a member that lacks this detector-rotation motor. "
+                f"Every member of a multi-source stitch must provide it.")
+        return np.deg2rad(mapping.apply(col))
 
     r1 = _frame_rot(diffractometer.rot1)
     r2 = _frame_rot(diffractometer.rot2)

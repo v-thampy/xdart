@@ -251,6 +251,39 @@ def test_processed_nexus_source_source_root_repoints_moved_tree(tmp_path):
     np.testing.assert_allclose(src.load_frame(0), raw[0])
 
 
+def test_harvest_from_processed_nexus_carries_resolvable_pointer(tmp_path):
+    """A stitch/RSM built from a ProcessedNexusSource must persist a RESOLVABLE
+    contributing-frame record. frame_for now carries the ORIGINAL master pointer
+    (from the FrameView), so harvest yields a non-None source_path and
+    frame_record_labels keeps the frame (the raw popup survives for processed
+    sources, which previously got source_path=None → empty record → dropped)."""
+    from xrd_tools.io.nexus_record import (
+        frame_record_labels,
+        harvest_frame_records,
+        write_contributing_frames,
+    )
+    from xrd_tools.sources.nexus import ProcessedNexusSource
+    root = tmp_path / "proj"
+    master = root / "raw" / "m.h5"
+    master.parent.mkdir(parents=True)
+    _write_master(master, np.arange(2 * 4 * 4, dtype=float).reshape(2, 4, 4))
+    nxs = tmp_path / "processed" / "scan.nxs"
+    nxs.parent.mkdir(parents=True)
+    _write_processed(nxs, source_path=master, source_base=str(root), master_frame=1)
+
+    recs = harvest_frame_records(ProcessedNexusSource(nxs))
+    assert len(recs) == 1
+    assert recs[0]["source_path"] is not None and "m.h5" in recs[0]["source_path"]
+    assert recs[0]["source_frame_index"] == 1
+
+    # and the written records are NOT skipped by the Frames-panel label builder
+    out = tmp_path / "stitch.nxs"
+    with h5py.File(out, "w") as f:
+        write_contributing_frames(f.create_group("entry"), recs)
+    with h5py.File(out, "r") as f:
+        assert [t[0] for t in frame_record_labels(f["entry/frames"])] == ["0"]
+
+
 def test_open_scan_source_root_load_frame(tmp_path):
     """N1 §3: open_scan(nxs, source_root=...).load_frame resolves through the
     moved tree (the notebook sugar override)."""

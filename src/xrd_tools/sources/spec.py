@@ -23,7 +23,12 @@ from typing import Any
 
 import numpy as np
 
-from xrd_tools.core.scan import SourceCapabilities, SourceKind, SourceSpec
+from xrd_tools.core.scan import (
+    ScanFrame,
+    SourceCapabilities,
+    SourceKind,
+    SourceSpec,
+)
 from xrd_tools.sources.base import BaseFrameSource
 
 
@@ -158,6 +163,25 @@ class SpecSource(BaseFrameSource):
         return np.asarray(
             read_image(path, frame=frame, **self._read_image_kwargs),
             dtype=float)
+
+    def frame_for(self, index: int) -> ScanFrame:
+        """Attach the raw-image source pointer (from the in-memory ``_frame_map``)
+        so a stitch/RSM built from this source can persist resolvable
+        contributing-frame records (the raw popup).  A metadata-only SPEC source
+        (no ``image_dir``) has no ``_frame_map`` → ``source_path`` stays ``None``
+        (correctly — there is no raw image to point at)."""
+        i = int(index)
+        path = frame_in_file = None
+        if self._frame_map:
+            path, frame_in_file = self._frame_map[i]
+        return ScanFrame(
+            index=i,
+            metadata=dict(self.metadata_for(i)),
+            source_path=path,
+            source_frame_index=frame_in_file,
+            loader=lambda fr: self.load_frame(fr.index),
+            source_identity=self.name,
+        )
 
 
 __all__ = ["SpecSource"]

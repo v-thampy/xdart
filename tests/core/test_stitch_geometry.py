@@ -50,6 +50,28 @@ def test_uncalibrated_psic_reproduces_legacy_deg2rad_path():
         assert a.rot3 == pytest.approx(b.rot3)
 
 
+def test_geometry_integrators_fail_loud_on_nonfinite_motor():
+    """A grouped/composite stitch NaN-pads a member that lacks a detector-rotation
+    motor (the key is then present-but-NaN, slipping past the missing-key guard).
+    That must FAIL LOUD, not let pyFAI silently collapse the geometry (NaN rot →
+    qmax≈0, the member's frames dropped from the merge with no error)."""
+    pytest.importorskip("pyFAI")
+    from xrd_tools.integrate.multi import (
+        create_multigeometry_integrators_from_geometry,
+    )
+    base = PONI(dist=0.39, poni1=0.10, poni2=0.12, rot1=0.003, rot2=0.0, rot3=0.0,
+                wavelength=0.729e-10, detector="Pilatus300kw")
+    psic = Diffractometer.psic()
+    diff = Diffractometer(
+        preset="psic", rot1=psic.rot1, rot2=psic.rot2,
+        calibration=DetectorCalibration(poni=base, detector_config={"orientation": 3}),
+    )
+    nu = np.array([0.0, 3.0, 6.0])
+    del_ = np.array([6.0, np.nan, 40.0])         # member lacked 'del' → NaN-padded
+    with pytest.raises(ValueError, match="non-finite"):
+        create_multigeometry_integrators_from_geometry(diff, {"nu": nu, "del": del_})
+
+
 def test_calibrated_goniometer_integrators_match_get_ai():
     """The fitted per-axis scales are used (GAP A): per-frame integrator rotations
     equal pyFAI Goniometer.get_ai(motors)."""

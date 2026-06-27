@@ -190,6 +190,35 @@ def test_run_stitch_empty_group_raises():
         run_stitch(plan, [])
 
 
+def test_run_stitch_frame_subset_records_only_contributing_frames():
+    """A frame_indices SUBSET must record only the frames that actually merged —
+    not every frame in the source (else the raw-popup lists non-contributing
+    frames, and frame_records disagree with provenance)."""
+    _, base_poni = _pilatus_poni()
+    src = _ring_source("s", n=5, rot_base=0, source_path="/data/s.h5")  # labels 1..5
+    plan = StitchPlan(base_poni=base_poni, rot1_key="rot1", mode="1d", npt_1d=64)
+
+    result = run_stitch(plan, src, frame_indices=[1, 3])
+
+    assert result.provenance["frame_indices"] == [1, 3]
+    assert {r["frame_index"] for r in result.frame_records} == {1, 3}
+
+
+def test_run_stitch_grouped_frame_subset_maps_global_to_member():
+    """A subset over a GROUP is in the composite's GLOBAL index; the records must
+    map it back to the right scan+local frame (not the global index)."""
+    _, base_poni = _pilatus_poni()
+    s5 = _ring_source("s5", n=2, rot_base=0, source_path="/data/scan5.h5")   # local 1,2
+    s7 = _ring_source("s7", n=2, rot_base=30, source_path="/data/scan7.h5")  # local 1,2
+    plan = StitchPlan(base_poni=base_poni, rot1_key="rot1", mode="1d", npt_1d=64)
+
+    # global 0,1 = scan5 local 1,2 ; global 2,3 = scan7 local 1,2. Pick global 0 and 3.
+    result = run_stitch(plan, [s5, s7], scan_labels=[5, 7], frame_indices=[0, 3])
+
+    tagged = sorted((r["scan_label"], r["frame_index"]) for r in result.frame_records)
+    assert tagged == [(5, 1), (7, 2)]
+
+
 def test_canonical_scan_exposes_scan_data_for_rsm_consumers():
     scan = Scan(
         "scan",

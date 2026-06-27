@@ -201,13 +201,14 @@ class StitchPlan:
         )
 
 
-def _harvest_frame_records(source, scan_labels):
+def _harvest_frame_records(source, scan_labels, *, selected_labels=None):
     """Fail-soft wrapper around :func:`harvest_frame_records` — the per-frame raw
     pointers are an enhancement (the raw popup), never core to the reduction, so a
     harvest failure logs and yields ``None`` rather than killing the run."""
     try:
         from xrd_tools.io.nexus_record import harvest_frame_records  # noqa: PLC0415
-        return harvest_frame_records(source, scan_labels=scan_labels)
+        return harvest_frame_records(source, scan_labels=scan_labels,
+                                     selected_labels=selected_labels)
     except Exception:  # noqa: BLE001
         logger.debug("frame-record harvest failed; raw popup will be unavailable",
                      exc_info=True)
@@ -231,8 +232,9 @@ def run_stitch(
     """
 
     # A group (sequence of sources) → one CompositeFrameSource; a single source
-    # passes through unchanged.  ``_harvest`` keeps the per-member structure so the
-    # raw-popup records are scan-tagged (the composite re-indexes globally).
+    # passes through unchanged.  Harvest reads ``src`` directly: a composite
+    # exposes both its members (for scan-tagging) and its ``_map`` (to translate a
+    # subselected GLOBAL frame back to the right member+local label).
     grouped = isinstance(source, Sequence) and not isinstance(source, (str, bytes))
     if grouped:
         from xrd_tools.sources.composite import CompositeFrameSource  # noqa: PLC0415
@@ -240,10 +242,8 @@ def run_stitch(
         if not members:
             raise ValueError("run_stitch received an empty source group")
         src = CompositeFrameSource(members) if len(members) > 1 else members[0]
-        _harvest = members
     else:
         src = ensure_frame_source(source)
-        _harvest = src
     labels = [int(i) for i in (frame_indices or src.frame_indices)]
     if not labels:
         raise ValueError("run_stitch requires at least one frame")
@@ -284,6 +284,16 @@ def run_stitch(
         _metadata_series(src, labels, plan.monitor_key)
         if plan.monitor_key is not None else None
     )
+    if normalization is not None and not np.all(np.isfinite(normalization)):
+        # Same multi-source footgun as the geometry path: a composite NaN-pads the
+        # monitor for a member that lacks it → NaN normalization → those frames
+        # silently vanish from the merge. Fail loud instead.
+        bad = np.flatnonzero(~np.isfinite(np.asarray(normalization))).tolist()
+        raise ValueError(
+            f"stitch monitor {plan.monitor_key!r} has non-finite value(s) at frame "
+            f"position(s) {bad[:10]}{' …' if len(bad) > 10 else ''} — a "
+            f"grouped/composite source is NaN-padding a member that lacks this "
+            f"monitor. Every member of a multi-source stitch must provide it.")
 
     diffractometer = plan.diffractometer or getattr(src, "diffractometer", None)
     if diffractometer is not None:
@@ -435,7 +445,11 @@ def run_stitch(
             "source": getattr(src, "name", type(src).__name__),
             "frame_indices": labels,
         },
-        frame_records=_harvest_frame_records(_harvest, scan_labels),
+        # only the frames that actually contributed (the subselected `labels`),
+        # in src's own label space (composite GLOBAL index, else the source's own)
+        frame_records=_harvest_frame_records(
+            src, scan_labels,
+            selected_labels=(None if frame_indices is None else labels)),
     )
 
 
