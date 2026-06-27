@@ -1949,6 +1949,69 @@ def write_stitched(
             g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
 
 
+def write_rsm(
+    entry_grp: h5py.Group,
+    volume: Any,
+    *,
+    provenance: "Mapping[str, object] | str | None" = None,
+    compression: str | None = None,
+) -> None:
+    """Write ``/entry/rsm`` — a gridded :class:`~xrd_tools.rsm.RSMVolume` as an
+    NXdata group (``h``/``k``/``l`` axes + the 3D ``intensity``), plus an optional
+    ``provenance_json`` blob (the RSMPlan + applied CorrectionStack), the same
+    idiom as :func:`write_stitched` / the diffractometer ``config_json``.  The
+    group is replaced atomically (idempotent).
+    """
+    ck = _comp_kwargs(compression)
+    if "rsm" in entry_grp:
+        del entry_grp["rsm"]
+    g = entry_grp.create_group("rsm")
+    g.attrs["NX_class"] = "NXdata"
+    g.attrs["signal"] = "intensity"
+    g.attrs["axes"] = ["h", "k", "l"]
+    g.create_dataset("intensity",
+                     data=np.asarray(volume.intensity, np.float32), **ck)
+    for name, axis in (("h", volume.h), ("k", volume.k), ("l", volume.l)):
+        g.create_dataset(name, data=np.asarray(axis, np.float32))
+    if provenance is not None:
+        prov = provenance if isinstance(provenance, str) else json.dumps(
+            provenance, default=str)
+        g.create_dataset("provenance_json", data=prov, dtype=_UTF8_DTYPE)
+
+
+def read_rsm(path: Path | str, *, entry: str = "entry"):
+    """Read ``/entry/rsm`` into an :class:`~xrd_tools.rsm.RSMVolume`.
+
+    The ``provenance_json`` blob (if present) is parsed onto
+    :attr:`RSMVolume.provenance`.  Raises :class:`KeyError` when the entry or the
+    ``rsm`` group is absent.
+    """
+    from xrd_tools.rsm.volume import RSMVolume  # noqa: PLC0415
+
+    path = Path(path)
+    with h5py.File(path, "r") as f:
+        if entry not in f:
+            raise KeyError(f"No {entry!r} group in {path}")
+        e = f[entry]
+        if "rsm" not in e:
+            raise KeyError(f"No rsm group in {path}:{entry}")
+        g = e["rsm"]
+        prov = None
+        if "provenance_json" in g:
+            raw = g["provenance_json"][()]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            try:
+                prov = json.loads(raw)
+            except (ValueError, TypeError):
+                prov = str(raw)
+        return RSMVolume(
+            h=np.asarray(g["h"][()]), k=np.asarray(g["k"][()]),
+            l=np.asarray(g["l"][()]), intensity=np.asarray(g["intensity"][()]),
+            provenance=prov,
+        )
+
+
 def _reindex_scan_data_to_frames(scan_data, frame_indices):
     """Return ``scan_data`` rows aligned 1:1 to ``frame_indices``.
 
@@ -3165,6 +3228,8 @@ __all__ = [
     "validate_integrated_stack_write",
     "write_integrated_stack",
     "write_stitched",
+    "write_rsm",
+    "read_rsm",
     "upsert_scan_metadata",
     "upsert_positioners",
     "upsert_per_frame_geometry",

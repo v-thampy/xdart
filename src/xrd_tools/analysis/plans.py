@@ -365,6 +365,33 @@ class RSMPlan:
     #: (the count-mean). Geometry-static (fixed lab detector); GI weights TBD.
     corrections: Any = None
 
+    def provenance(self) -> dict[str, Any]:
+        """A JSON-safe record of this RSM run for persistence (pass to
+        ``write_rsm(provenance=…)``).
+
+        The grid parameters + the applied corrections — NOT the binary mask/UB
+        nor the PixelQMap; the diffractometer geometry round-trips separately
+        under ``/entry/diffractometer`` (its preset tag is noted here).
+        """
+        def _ser(obj):
+            to_dict = getattr(obj, "to_dict", None)
+            return to_dict() if callable(to_dict) else None
+
+        diff = getattr(self.mapper, "diff_config", None)
+        return {
+            "kind": "rsm",
+            "bins": list(self.bins),
+            "diff_motors": list(self.diff_motors),
+            "energy": self.energy,
+            "q_bounds": ([list(r) for r in self.q_bounds]
+                         if self.q_bounds is not None else None),
+            "roi": list(self.roi) if self.roi is not None else None,
+            "chunk_size": self.chunk_size,
+            "corrections": _ser(self.corrections),
+            "diffractometer": (getattr(diff, "preset", None)
+                               or getattr(diff, "convention", None)),
+        }
+
 
 def run_rsm(plan: RSMPlan, source: FrameSource | Sequence[FrameSource]) -> AnalysisResult:
     """Run the streaming RSM pipeline for one source or a list of sources."""

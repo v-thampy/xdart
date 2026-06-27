@@ -42,6 +42,9 @@ class RSMVolume:
     k: np.ndarray
     l: np.ndarray
     intensity: np.ndarray
+    #: optional provenance (the RSMPlan + applied CorrectionStack) — populated by
+    #: read_rsm when a persisted volume carries a provenance_json blob.
+    provenance: Any = None
 
     def __post_init__(self) -> None:
         self.h = np.asarray(self.h, dtype=float)

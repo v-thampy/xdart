@@ -423,6 +423,25 @@ class ProcessedScanSchema:
                     "axes": ("q", "chi"),
                 }),
             ),
+            # The gridded RSM volume (one 3D H-K-L grid; not a per-frame stack):
+            # h/k/l axes + the 3D intensity + a provenance_json blob. Scan-level,
+            # capability-gated; written by write_rsm, read by read_rsm.
+            "rsm": GroupSchema(
+                "rsm", axes=("h", "k", "l"),
+                datasets=MappingProxyType({
+                    "intensity": DatasetSpec(
+                        "intensity", "float32", "signal", row_aligned=False,
+                        compressed=True),
+                    "h": DatasetSpec("h", "float32", "axis", row_aligned=False),
+                    "k": DatasetSpec("k", "float32", "axis", row_aligned=False),
+                    "l": DatasetSpec("l", "float32", "axis", row_aligned=False),
+                }),
+                nx_attrs=MappingProxyType({
+                    "NX_class": "NXdata",
+                    "signal": "intensity",
+                    "axes": ("h", "k", "l"),
+                }),
+            ),
         })
     )
 
@@ -483,6 +502,10 @@ CAPABILITIES = MappingProxyType({
         "stitched_2d", "", "group",
         "merged 2D (q,χ) stitch pattern + provenance_json (StitchPlan + "
         "applied CorrectionStack)"),
+    "rsm": CapabilityAttr(
+        "rsm", "", "group",
+        "gridded reciprocal-space-map volume (h/k/l NXdata) + provenance_json "
+        "(RSMPlan + applied CorrectionStack)"),
 })
 
 
