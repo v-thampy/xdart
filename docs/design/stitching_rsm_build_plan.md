@@ -64,6 +64,10 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
   `Diffractometer.incident_angle` mapping. **Gated headless:** GI-off ≡ non-GI; footprint-only
   ⇒ `I = I_nonGI / sin αi`; refraction toggle; backend/diffractometer guards. **NOT validated:**
   the absolute composition signs (P2b flag) + `sample_orientation`/`tilt` — pending GIXSGUI.
+- **P4+P5 adversarial review ✓ CLEAN** (`w39j3h9ol`, worktree-isolated, 3 dimensions ×
+  verify): 0 confirmed findings. Finders ran live reproduction probes for the FiberIntegrator
+  cache-leak across frames, refraction q/q_z consistency, the dispatch guards, and the P5
+  provenance round-trip — none broke. Main tree verified clean (worktrees auto-pruned).
 - **P5 — persistence ✓ DONE** (`io/schema.py` + `io/nexus.py`): registered `stitched_1d/2d`
   as schema groups + capabilities (mirroring the `diffractometer` group — optional, feature-
   detected via `detect_capabilities`, schema-validated when present). `write_stitched` now
