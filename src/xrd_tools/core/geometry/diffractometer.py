@@ -1118,6 +1118,61 @@ class Diffractometer:
         )
 
 
+def assemble_circle_angles(
+    diffractometer: "Diffractometer",
+    scan: Any,
+    indices: "list[int] | None" = None,
+) -> list[np.ndarray]:
+    """Assemble the per-frame xu sample+detector angle arrays from a
+    :class:`Diffractometer`'s ``circle_motors`` + a scan's per-frame motor table.
+
+    Returns a list aligned to ``sample_circles + detector_circles``: for each
+    circle, ``sign·motor + offset`` (its :class:`AngleMapping`) of the source
+    motor pulled from ``scan.scan_data``, in the exact order
+    ``xu.QConversion``/``Ang2Q.area`` expects.
+
+    The circle ORDER + per-circle sign/offset — i.e. the q-convention — are
+    **carried in ``circle_motors``** (authored in the validated preset, e.g.
+    psic from ``RSM_process.ipynb``), never invented here; this only mechanises
+    the lookup + :meth:`AngleMapping.apply`.  It is the drop-in replacement for
+    the legacy explicit-``diff_motors`` angle list (the per-frame angle assembly
+    the design calls "the one wiring task" shared by RSM and the xu_hist stitch).
+
+    The ABSOLUTE convention (the circle order/signs themselves) is validated
+    against real data (the RSM/stitch notebooks), not here — this pins only that
+    the assembly faithfully reproduces the legacy explicit path.
+    """
+    circles = getattr(diffractometer, "circle_motors", ())
+    if not circles:
+        raise ValueError(
+            "Diffractometer.circle_motors is empty — this preset did not wire "
+            "the xu circle→motor map needed for the angle assembly; use a preset "
+            "that wires circle_motors (e.g. psic) or pass diff_motors explicitly.")
+    scan_data = getattr(scan, "scan_data", None)
+    if scan_data is None:
+        raise ValueError("scan has no scan_data per-frame motor table")
+    cols = (list(scan_data.columns) if hasattr(scan_data, "columns")
+            else list(scan_data))
+    missing = [m.source_motor for m in circles if m.source_motor not in cols]
+    if missing:
+        raise KeyError(
+            f"circle motors {missing!r} not in scan.scan_data (have {cols!r})")
+
+    rows: "list[int] | None" = None
+    if indices is not None:
+        labels = [int(idx) for idx in getattr(scan, "frame_indices")]
+        row_of = {label: r for r, label in enumerate(labels)}
+        rows = [row_of[int(idx)] for idx in indices]
+
+    out: list[np.ndarray] = []
+    for m in circles:
+        col = np.asarray(scan_data[m.source_motor], dtype=float)
+        if rows is not None:
+            col = col[rows]
+        out.append(np.asarray(m.apply(col), dtype=float))
+    return out
+
+
 __all__ = [
     "AngleMapping",
     "Convention",
@@ -1126,4 +1181,5 @@ __all__ = [
     "DiffractometerConfig",
     "DiffractometerGeometry",
     "ImageOrientation",
+    "assemble_circle_angles",
 ]

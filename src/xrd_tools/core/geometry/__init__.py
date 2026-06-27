@@ -24,6 +24,7 @@ from xrd_tools.core.geometry.diffractometer import (
     DiffractometerConfig,
     DiffractometerGeometry,
     ImageOrientation,
+    assemble_circle_angles,
 )
 from xrd_tools.core.geometry.pixel_q import (
     DetectorHeader,
@@ -38,6 +39,7 @@ __all__ = [
     "DiffractometerGeometry",
     # Canonical one-object geometry (two derived adapter views)
     "Diffractometer",
+    "assemble_circle_angles",
     # Static detector calibration (PONI + Detector_config + image mount)
     "DetectorCalibration",
     "ImageOrientation",
