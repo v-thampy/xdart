@@ -126,7 +126,15 @@ worker's staleness mechanism verbatim).
 `RSMVolume` + `RSMViewState`; emits the 6 `PanelPlan`s + the 2×3 layout; never consults
 `scan.frames`/the unit combo; `build_payload` returns the keyed `panels` map.
 
-### 2c. The 3D popup (the other genuinely-new piece)
+### 2c. The raw-image popup (RSM has it too)
+
+RSM also gets the **contributing-frame raw popup** — the *same* mechanism as Stitch §1a (the
+h5viewer Frames panel picks a contributing frame → `ImageViewerController` ssrl loaders → a raw
+image dialog). RSM thus has **two** popups: the raw-frame viewer (this) and the 3D view (§2d). The
+enabler is the same frame-record persistence (now standard for both writers — §1b / §4-T1/T2) with
+the multi-scan naming below.
+
+### 2d. The 3D popup (the other genuinely-new piece)
 
 A **standalone, view-only** rotatable/zoomable window — **not** in the display registry (no Mode, no
 controller, no generation state). **`PyOpenGL` is NOT installed in `xrd_test`** → add it as an
@@ -139,6 +147,34 @@ rotate/zoom/pan free. Alternatives: `pg.isosurface`→`GLMeshItem` (a Bragg iso-
 iso-level control); `GLVolumeItem` (best-looking but GPU-fill-bound; downsample to ~64-100³).
 **Minimal controls:** colormap, threshold(scatter)/iso-level slider, log, downsample factor. No
 slicing (that's the 2D/1D panels). Several details still need planning — see Open Qs 4-5.
+
+---
+
+## 2e. Multi-scan grouping — frame records + the Frames-panel naming
+
+A single Stitch/RSM can **group several scans** (RSM already does via `grid_scans_streaming` over a
+list of `ScanInput`; Stitch needs the same multi-source path). The Frames panel must then
+**disambiguate which scan** each contributing frame came from — Vivek's convention: prefix the scan
+number, so grouping scans (5, 7, 8) lists `5-1, 5-2, … 7-1, 7-2, … 8-1, …`.
+
+**Is this consistent with the current storage? — Not yet; it's a small extension.** Today the frame
+records are **flat + per-scan**: `NexusSink._write_frame_record` writes `/entry/frames/frame_{index:04d}`
+(`reduction/core.py:559`), and `get_raw_frame(frame: int)` reads by that **int** index (`read.py:492`).
+Grouped scans **collide** (every scan has a `frame_0001`). But `write_frame_record(frames_grp,
+frame_key, …)` takes a free **string** key (`nexus_record.py:207`) and the scan number is available
+(the source `scan_id`/`name`, or `get_scan_path_info`), so it's an additive extension:
+
+- **Storage:** nested per-scan groups for grouped runs — `/entry/frames/scan_5/frame_0001`,
+  `…/scan_7/frame_0001` — keeping the flat `/entry/frames/frame_NNNN` for **single-scan**
+  (backward-compatible). (Alternative: flat encoded keys `frame_5-0001`; nesting is cleaner + groups
+  naturally.) Each record still carries its `source/{path,frame_index}` (the raw-resolution pointer).
+- **Frames-panel display:** flatten to `"<scan>-<frame>"` labels (`5-1`, `5-2`, …) — a presentation
+  layer over the stored structure (a flat list, or a scan→frames tree).
+- **Read path:** generalize `get_raw_frame` from a bare `int` to a `(scan, frame)` address (stays
+  int-keyed for single-scan); the multi-scan writer tags each frame with its scan number.
+
+This is the shared enabler for **both** raw popups (Stitch §1a, RSM §2c). **Open Q7:** nested groups
+(recommended) vs flat encoded keys; and confirm the multi-scan Stitch path exists/lands (RSM's does).
 
 ---
 
@@ -155,7 +191,9 @@ branches on mode or imports these modules (§10 seam 3 holds).
 | New controller? | Yes | Yes |
 | Slider/view state? | No | **Yes** (`RSMViewState`) |
 | Render-core change? | No (role-level suffices) | **Yes** (WS-X2: draw_keys/clear_keys, per-key delegates, 6-panel scaffold, keyed payload) |
+| Raw-image popup? | **Yes** (contributing-frame picker) | **Yes** (same mechanism) + the 3D view |
 | 3D viewer? | n/a | **Yes** (standalone GL dialog + PyOpenGL extra) |
+| Frame records on `.nxs`? | **Yes — standard** (scan-tagged for multi-scan) | **Yes — standard** (scan-tagged) |
 | Free from the layer | panels/layout/PanelKey, compute_display_state, render_plan, registry, `_BaseController`, Image/Plot/Trace payloads, the raw-popup pattern, the shared `frame_ids`→`sigUpdate` selection | the same data/decision spine + per-PanelKey *planning* + the `get_slice`/`line_cut`/`get_bounds` headless math |
 
 **One line:** Stitch = pure reuse (new Mode + controller + 2 trivial edits); RSM reuses the spine
@@ -173,12 +211,17 @@ the 3D dialog.
 4. 3D v1 backend: **scatter** (recommended) vs iso vs volume.
 5. 3D honors current bands (`crop`) vs always full volume (recommended: full, decoupled, v1).
 6. RSM 6-panel: standalone `rsm_panel_widget` (recommended) vs extend the splitter.
+7. Multi-scan frame storage: nested `scan_<N>/frame_NNNN` (recommended) vs flat `frame_<N>-<idx>`
+   keys; + confirm/land the multi-scan **Stitch** path (RSM's `grid_scans_streaming` exists).
 
-**Persistence TODOs (write side only):**
-- **T1 (Stitch):** add frame-record writing to `write_stitched` (the raw-popup enabler) — `stamp_source_base`
-  + `ensure_frames_container` + `write_frame_record`, `frame_key` == the Frames-panel label.
-- **T2 (RSM):** the user spec's RSM popup is the **3D view**, not a raw-frame picker — so RSM likely
-  needs **no** frame records for v1. Confirm before adding to `write_rsm`.
+**Persistence TODOs (write side) — STANDARD for BOTH writers (Vivek, Jun 2026):**
+- **T1 (Stitch) + T2 (RSM):** `write_stitched` AND `write_rsm` write per-frame records (the
+  raw-popup enabler — RSM has the raw popup too) — `stamp_source_base` + `ensure_frames_container`
+  + `write_frame_record`, harvesting `source_path`/`source_frame_index` from the `Frame`s the run
+  iterates (template `NexusSink._write_frame_record`).
+- **T-multiscan:** for grouped scans the `frame_key` is **scan-tagged** (`scan_<N>/frame_NNNN`),
+  and `get_raw_frame` is generalized to a `(scan, frame)` address; the Frames panel shows
+  `"<scan>-<frame>"`. The writer carries the scan number (source `scan_id` / `get_scan_path_info`).
 - **T3:** the `ssrl_xrd_tools>=` floor caveat (CLAUDE.md north-star) applies if these primitives move.
 
 **Sequenced plan (each live-gated in `xrd_test`):**
@@ -186,20 +229,24 @@ the 3D dialog.
    (PLOT_1D only) + register. No render-core change.
 2. **Stitch-2D** — add `imageFrame_w` to `PanelLayout`; `STITCH_2D→binned_widget` delegate; emit
    `STITCH_2D` in the `cake_image` slot.
-3. **Stitch raw popup + T1** — reuse `_show_image_preview`, reroute load to the ssrl loaders; add
-   frame-record writing to `write_stitched`; verify the popup resolves a contributing frame from a
-   freshly-saved `.nxs`.
-4. **WS-X2 render-core promotion** — drive `render_display` from `draw_keys`/`clear_keys`;
+3. **Frame records (both writers) + the multi-scan scheme** — add frame-record writing to
+   `write_stitched` AND `write_rsm`, scan-tagged (`scan_<N>/frame_NNNN`); generalize `get_raw_frame`
+   to `(scan, frame)`. The headless persistence enabler for both raw popups; round-trip tested.
+4. **Stitch raw popup** — reuse `_show_image_preview`, reroute load to the ssrl loaders; Frames panel
+   shows `"<scan>-<frame>"`; verify it resolves a contributing frame from a freshly-saved `.nxs`.
+5. **WS-X2 render-core promotion** — drive `render_display` from `draw_keys`/`clear_keys`;
    per-PanelKey delegates; keyed `DisplayPayload`. Additive (keep the role-level path); unit-test
    headlessly (`pytest -m display_logic`). **Keep the live≡batch≡reload equivalence spine green.**
-5. **RSM 6-panel viewer** — `RSM_VIEWER` + 2×3 layout + `RSMDisplayController` + `RSMViewState`
-   sliders + the standalone 6-panel widget; wire `get_slice`/`line_cut`/`get_bounds`.
-6. **RSM 3D popup** — add the `PyOpenGL` extra; a standalone `GLViewWidget` + `GLScatterPlotItem`
+6. **RSM 6-panel viewer** — `RSM_VIEWER` + 2×3 layout + `RSMDisplayController` + `RSMViewState`
+   sliders + the standalone 6-panel widget; wire `get_slice`/`line_cut`/`get_bounds`. + the **raw
+   popup** (reuses step 3/4).
+7. **RSM 3D popup** — add the `PyOpenGL` extra; a standalone `GLViewWidget` + `GLScatterPlotItem`
    dialog with the 4 controls; disable-with-tooltip when GL is unavailable.
 
-**Risk:** steps 1-3 are low-risk reuse; **step 4 touches the pure render core** — land it additively
-(behind the existing role-level path) before flipping the renderer, keep the equivalence spine green.
-Steps 5-6 are net-new and live-gated.
+**Risk:** step 3 (frame records + multi-scan addressing) is headless + testable; steps 1-2/4 are
+low-risk reuse; **step 5 touches the pure render core** — land it additively (behind the existing
+role-level path) before flipping the renderer, keep the equivalence spine green. Steps 6-7 are
+net-new and live-gated.
 
 ## Key anchors
 `display_logic.py`: `:236` roles, `:275` PanelKey, `:554` DisplayState, `:595` DisplayPayload (+ keyed
