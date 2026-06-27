@@ -254,6 +254,21 @@ def test_pyfai_hist_rejects_silently_dropped_params():
     assert out.payload.radial.shape == (100,)
 
 
+def test_multigeometry_warns_when_corrections_ignored(caplog):
+    """The MG backend uses pyFAI's own corrections, NOT the shared CorrectionStack
+    — run_stitch must warn so the caller/GUI knows the toggle was a no-op."""
+    pytest.importorskip("pyFAI")
+    import logging
+    from xrd_tools.analysis.plans import StitchPlan, run_stitch
+    from xrd_tools.corrections.stack import CorrectionStack
+    diff, src = _stitch_diff_and_src()
+    with caplog.at_level(logging.WARNING, logger="xrd_tools.analysis.plans"):
+        run_stitch(StitchPlan(diffractometer=diff, backend="multigeometry",
+                              mode="1d", npt_1d=100,
+                              corrections=CorrectionStack(solid_angle=True)), src)
+    assert any("IGNORED by the 'multigeometry'" in r.message for r in caplog.records)
+
+
 def test_pyfai_hist_2d_dispatch_and_no_corrections():
     """2D pyfai_hist uses npt_rad_2d (NOT npt_1d) and corrections=None is unit-weight."""
     pytest.importorskip("pyFAI")

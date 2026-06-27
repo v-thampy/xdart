@@ -97,6 +97,7 @@ from natsort import natsorted
 from xrd_tools.io import read_image, load_mask, write_nexus
 from xrd_tools.integrate import (
     load_poni,
+    poni_to_integrator,
     integrate_1d,
     integrate_2d,
 )"""),
@@ -133,6 +134,7 @@ assert _images_preview, f'No images match {image_glob!r} in {data_dir}'
 print(f'OK — {len(_images_preview)} image(s) found, PONI present.')"""),
     md("## Load calibration + mask"),
     code("""poni = load_poni(poni_file)
+ai = poni_to_integrator(poni)   # integrate_1d/2d take a pyFAI AzimuthalIntegrator
 mask = load_mask(mask_file) if mask_file and mask_file.exists() else None
 print(f'PONI: dist={poni.dist:.4f} m, λ={poni.wavelength * 1e10:.4f} Å')
 print(f'Mask: {mask.shape if mask is not None else \"none\"}')"""),
@@ -143,8 +145,9 @@ print(f'Found {len(image_files)} images matching {image_glob!r}')
 results_1d, results_2d = [], []
 for i, path in enumerate(image_files):
     img = read_image(path, mask=mask)
-    r1 = integrate_1d(img, poni, npt=npt_1d, unit=unit, method=method, mask=mask)
-    r2 = integrate_2d(img, poni, npt=npt_2d, unit=unit, method=method, mask=mask)
+    r1 = integrate_1d(img, ai, npt=npt_1d, unit=unit, method=method, mask=mask)
+    r2 = integrate_2d(img, ai, npt_rad=npt_2d[0], npt_azim=npt_2d[1],
+                      unit=unit, method=method, mask=mask)
     results_1d.append(r1)
     results_2d.append(r2)
     if (i + 1) % 10 == 0 or i == len(image_files) - 1:

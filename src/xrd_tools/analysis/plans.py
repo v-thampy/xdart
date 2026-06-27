@@ -166,6 +166,15 @@ def run_stitch(
     labels = [int(i) for i in (frame_indices or src.frame_indices)]
     if not labels:
         raise ValueError("run_stitch requires at least one frame")
+    # The multigeometry backend uses pyFAI's OWN correctSolidAngle/polarization,
+    # NOT the shared CorrectionStack/GISettings — surface the silent drop so a
+    # caller (and the GUI) doesn't believe it applied the shared pre-weight.
+    if plan.backend == "multigeometry" and (
+            plan.corrections is not None or plan.gi is not None):
+        logger.warning(
+            "StitchPlan.corrections/gi are IGNORED by the 'multigeometry' backend "
+            "(it uses pyFAI's own correctSolidAngle/polarization). Use the "
+            "'pyfai_hist' backend to apply the shared CorrectionStack/GI weight.")
     base_poni = plan.base_poni or getattr(src, "poni", None)
     # base_poni is required UNLESS a calibrated Diffractometer supplies the base
     # geometry itself (its DetectorCalibration carries dist/poni/Detector_config).
