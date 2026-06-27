@@ -75,8 +75,25 @@ at a green, committed state) and the running **LIVE CHECKLIST**.
   `GICorrectionStack` via the new `StitchPlan.provenance()`); `read_stitched` parses it back
   onto the `xr.Dataset.attrs`. Round-trip + capability + validation gated headless. The
   binary stitch pattern already round-tripped; P5 adds the registry + provenance.
-- **P6 — RSM**: unify the RSM pipeline onto the one `Diffractometer` + the shared accumulator +
-  the `CorrectionStack` weight.
+- **P6 — RSM (in progress)**: unify the RSM pipeline onto the one `Diffractometer` + the shared
+  accumulator + the `CorrectionStack` weight. Design: the Understand-workflow synthesis
+  (`wpc9exe8j`). RSM was a 3D streaming **count-mean** gridder (`xu.Gridder3D` NO_NORMALIZATION,
+  `Σraw/Σcounts`) with a parallel geometry path + ZERO corrections.
+  - **P6.1 ✓ DONE** (`1f9d8d8`): the two-gridder `Σ(raw·w)/Σ(w)` accumulator — `StreamingGridder`
+    + `grid_img_data` now run two `xu.Gridder3D` with `Normalize(False)` (bare SUM): `_grid_raw`
+    = Σ(raw·w), `_grid_norm` = Σ(w), volume = the ratio. The SAME accumulator as `stitch_q_grid`.
+    `weight=1` reproduces the prior count-mean exactly (behaviour-preserving). Good-mask drops
+    non-finite-q / non-finite-img / w≤0 from BOTH sums (a NaN coord would be clamped; a masked
+    pixel's weight would bias the denominator — both verified on xu 1.7.12).
+  - **P6.2 ✓ DONE** (`5fd8c35`): `RSMPlan.corrections` + `rsm/corrections.py` — `detector_header_
+    to_ai` (xu mm header → fixed-lab pyFAI ai; gate: solid angle peaks at the beam centre) +
+    `rsm_correction_weight` (the same `CorrectionStack.normalization` stitch uses; wavelength-
+    independent, computed once; geometry-static). Threaded run_rsm → pipeline → `add(weight=)`.
+  - **Remaining:** P6.4 reconcile `PixelQMap` onto the canonical `Diffractometer` (drop-in works
+    through `pixel_q`; needs the legacy-equivalence identity gate). P6.5 `xu_q_frames` provider
+    (dead-but-proven → unblocks P3c). P6.6 vendor the real RSM fixture + the equivalence spine.
+    P6.7 `RSMVolume ↔ NeXus` persistence. **Convention/live-gated:** P6.3 `assemble_circle_angles`
+    (circle order) + P6.8 GI RSM seam (`gi_normalization`/`refract_q` signs) — batch with P3c/P4.
 - **P7 — [LIVE-GATED] GUI**: Stitch viewer controller + layout, the wrangler stitch/GI panels,
   the Refine button (wrapping `refine_goniometer`). Thin, isolated; the only part that waits.
 
