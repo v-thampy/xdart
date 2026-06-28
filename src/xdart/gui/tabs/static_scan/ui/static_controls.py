@@ -109,23 +109,21 @@ class StaticControls(QtWidgets.QWidget):
         row2.setSpacing(6)
         outer.addWidget(self.actionRow)
 
-        # Row order: Run · Stop · Append · Live.  Run is the prominent primary
-        # action but should not hog the whole row — it takes the bulk of the
-        # slack (stretch 4) with a small flexible gap (stretch 1) trimming it
-        # ~20% and separating it from the Stop/Append/Live cluster.
+        # Row order: Run · Stop · Append · Live, filling the row edge-to-edge (no
+        # gap).  The slack splits 12 : 1 : 1 : 1, so Run keeps ~80% (its current
+        # prominent width) while Stop / Append / Live take the remaining ~20%
+        # between them instead of leaving a gap.
         self.startButton = QtWidgets.QPushButton('Run')
         # objectName 'startButton' + the runPhase property are what the dark
         # theme keys the green/orange Run/Pause styling on.
         self.startButton.setObjectName('startButton')
         self.startButton.setProperty('runPhase', 'idle')
-        row2.addWidget(self.startButton, 4)
-        row2.addStretch(1)
+        row2.addWidget(self.startButton, 12)
 
         self.stopButton = QtWidgets.QPushButton('Stop')
         self.stopButton.setObjectName('stopButton')
         self.stopButton.setEnabled(False)
-        self.stopButton.setMaximumWidth(72)
-        row2.addWidget(self.stopButton)
+        row2.addWidget(self.stopButton, 1)
 
         # Output mode (Append vs Replace): a run/output property — it lives with
         # the run controls now, not in the data wrangler.  A checkable button that
@@ -137,14 +135,12 @@ class StaticControls(QtWidgets.QWidget):
         self.writeModeButton.setObjectName('writeModeButton')
         self.writeModeButton.setCheckable(True)
         self.writeModeButton.setChecked(False)            # Append
-        self.writeModeButton.setMaximumWidth(82)
-        row2.addWidget(self.writeModeButton)
+        row2.addWidget(self.writeModeButton, 1)
 
         self.liveButton = QtWidgets.QPushButton('Live')
         self.liveButton.setObjectName('liveCheckBox')
         self.liveButton.setCheckable(True)
-        self.liveButton.setMaximumWidth(72)
-        row2.addWidget(self.liveButton)
+        row2.addWidget(self.liveButton, 1)
 
         self._run_phase = 'idle'
 

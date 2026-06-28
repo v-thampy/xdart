@@ -399,11 +399,11 @@ class staticWidget(QWidget):
         def _default_split():
             try:
                 total = sum(self.ui.mainSplitter.sizes()) or 1000
-                # Right (integration/wrangler) column reduced ~15% (0.24 ->
-                # 0.204; it was too wide on startup, esp. on Windows); the
-                # freed width goes to the middle display panels (Vivek).
+                # Right (integration/wrangler) column reduced another ~15%
+                # (0.204 -> 0.173; was too wide, esp. on Windows); the freed
+                # width goes to the middle display panels (Vivek).
                 self.ui.mainSplitter.setSizes(
-                    [int(total * f) for f in (0.19, 0.606, 0.204)])
+                    [int(total * f) for f in (0.19, 0.637, 0.173)])
                 self.ui.mainSplitter.setStretchFactor(1, 1)
                 # Left column: the Tools card is now a compact 3-button panel, so
                 # give it only a small share (~18%) and let the data browser take

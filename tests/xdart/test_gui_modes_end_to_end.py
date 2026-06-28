@@ -3058,32 +3058,30 @@ def test_hydrate_from_scan_populates_panel_from_saved_settings(widget):
     assert it.ui.radial_high_1D.text() == '7.5'
 
 
-def test_gi_more_popup_hosts_motor_orient_tilt(widget):
-    """The GI header row keeps only the INTEGRATION title + the GI (Fiber) toggle
-    + the "More" button; ALL GI options — Motor, its manual Value, Orient, Tilt —
-    now live in the right-justified "More" popup.  The widgets are the SAME
-    objects (get_gi_config / session / hydrate read them) — just re-parented —
-    and the More button + popup toggle with GI."""
+def test_gi_toggle_opens_options_popup(widget):
+    """The GI (Fiber) toggle IS the options control — there is NO separate More
+    button.  Toggling GI on opens the options popup (Motor / Value / Orient /
+    Tilt); toggling it off hides it.  The widgets are the SAME objects
+    (get_gi_config / session / hydrate read them) — just re-parented into the
+    popup — and the header row is just the INTEGRATION title + the GI toggle."""
     w = widget
     it = w.integratorTree
 
-    # Every GI option lives in the popup window now, not inline on the row.
+    # Every GI option lives in the popup window, not inline on the row.
     for wdg in (it.ui.gi_motor, it.ui.gi_motor_value,
                 it.ui.gi_sample_orientation, it.ui.gi_tilt):
         assert wdg.window() is it.gi_more_popup
-    # The header row holds the title + the GI toggle + More (not the popup).
     assert it.ui.integration_heading.window() is not it.gi_more_popup
-    assert it.ui.gi_more.maximumWidth() <= 60               # snug, won't clip
+    # No "More" button — the GI toggle drives the popup.
+    assert getattr(it.ui, 'gi_more', None) is None
 
-    # GI on -> More visible; clicking More opens the popup.
-    it.ui.gi_enable.setChecked(True)
-    assert it.ui.gi_more.isVisibleTo(it.ui.gi_frame)
-    it._show_gi_more()
-    assert it.gi_more_popup.isVisible()
-
-    # GI off -> More hidden, popup closed (not left floating).
+    # GI on -> the options popup opens; GI off -> it hides (not left floating).
+    # (Reset first: the widget fixture is module-scoped, so a prior test may have
+    # left GI on — without the reset, setChecked(True) wouldn't emit `toggled`.)
     it.ui.gi_enable.setChecked(False)
-    assert not it.ui.gi_more.isVisibleTo(it.ui.gi_frame)
+    it.ui.gi_enable.setChecked(True)
+    assert it.gi_more_popup.isVisible()
+    it.ui.gi_enable.setChecked(False)
     assert not it.gi_more_popup.isVisible()
 
     # Motor + Orient + Tilt all round-trip through get_gi_config from the popup.

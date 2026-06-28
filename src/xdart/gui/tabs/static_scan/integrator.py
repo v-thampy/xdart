@@ -321,12 +321,10 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.gi_tilt.setObjectName('gi_tilt')
         self.ui.gi_tilt.setMaximumWidth(70)
 
-        # "More" opens the GI options popup; it sits right next to the GI toggle
-        # at the right end (the heading's stretch above pushes the cluster right).
-        self.ui.gi_more = QtWidgets.QPushButton('More')
-        self.ui.gi_more.setObjectName('gi_more')
-        self.ui.gi_more.setMaximumWidth(60)
-        _gi_lay.addWidget(self.ui.gi_more)
+        # No separate "More" button: the GI (Fiber) toggle IS the options
+        # control — toggling GI on opens the options popup, toggling it off hides
+        # it (see _on_gi_toggled).  So the header row is just the INTEGRATION
+        # title (left) + the GI (Fiber) toggle (right).
 
         # GI section sits at the very top of the integrator panel.
         self.ui.verticalLayout.insertWidget(0, self.ui.gi_frame)
@@ -346,7 +344,6 @@ class integratorTree(QtWidgets.QWidget):
         _gi_more_form.addRow(self.ui.gi_orient_label,
                              self.ui.gi_sample_orientation)
         _gi_more_form.addRow(self.ui.gi_tilt_label, self.ui.gi_tilt)
-        self.ui.gi_more.clicked.connect(self._show_gi_more)
 
         self.ui.gi_enable.toggled.connect(self._on_gi_toggled)
         self.ui.gi_enable.toggled.connect(self._save_to_session)
@@ -1495,16 +1492,11 @@ class integratorTree(QtWidgets.QWidget):
         popup.activateWindow()
 
     def _update_gi_section_visibility(self):
-        """Reveal the GI row fields only when GI is on: the Motor combo + the
-        "More" popup button (Orient/Tilt now live inside the popup); the manual
-        theta value only when the motor is 'Manual'."""
+        """Keep the GI options popup consistent with GI state.  All GI options
+        live in the popup (there is no inline More button); the manual-theta
+        Value row shows only when the motor is 'Manual', and the popup as a whole
+        is hidden when GI is off, so the field keys on `manual` alone."""
         on = self.ui.gi_enable.isChecked()
-        # The motor controls moved into the "More" popup, so only the More button
-        # tracks GI-on in the inline header row.  Inside the popup, the
-        # manual-theta Value row shows only when the motor is 'Manual'; the popup
-        # as a whole is hidden when GI is off (below), so the field keys on
-        # `manual` alone.
-        self.ui.gi_more.setVisible(on)
         manual = (self.ui.gi_motor.currentText() == 'Manual')
         self.ui.gi_motor_value_label.setVisible(manual)
         self.ui.gi_motor_value.setVisible(manual)
@@ -1514,10 +1506,13 @@ class integratorTree(QtWidgets.QWidget):
             popup.hide()
 
     def _on_gi_toggled(self, checked):
-        """GI on/off — reveal the fields and drive scan.gi via the same
+        """GI on/off — the toggle IS the options control: turning GI on opens the
+        options popup, turning it off hides it.  Also drives scan.gi via the same
         ``update_scattering_geometry`` seam the wrangler checkbox used (sets
         scan.gi + refreshes the panel's axis units/labels)."""
         self._update_gi_section_visibility()
+        if checked:
+            self._show_gi_more()        # toggle on -> reveal the options popup
         scan = getattr(self, 'scan', None)
         if scan is not None:
             scan.gi = bool(checked)
