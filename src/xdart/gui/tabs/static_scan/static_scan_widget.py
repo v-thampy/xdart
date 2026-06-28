@@ -42,6 +42,7 @@ from .ui.staticUI import Ui_Form
 from .h5viewer import H5Viewer
 from .display_frame_widget import displayFrameWidget
 from .integrator import integratorTree
+from .scan_threads import stitchThread
 from .metadata import metadataWidget
 from .wranglers import imageWrangler, nexusWrangler, wranglerWidget
 from xdart.utils.throttle import Coalescer
@@ -392,6 +393,13 @@ class staticWidget(QWidget):
             self.frames, self.frame_ids, self.data_1d, self.data_2d,
             data_lock=self.data_lock,
             publication_store=self.publication_store)
+        # Stitch worker (Stitch 1D / Stitch 2D modes): a one-shot off-thread
+        # reduction of the loaded scan, routed through the SAME run-state owner
+        # (_enter/_exit_run_state) as a wrangler run or a reintegrate.
+        self.stitch_thread = stitchThread(self.scan, parent=self)
+        self.stitch_thread.started.connect(self._enter_run_state)
+        self.stitch_thread.finished.connect(self.stitch_thread_finished)
+        self.stitch_thread.errorSig.connect(self._on_stitch_error)
         # Default panel proportions: middle (image/plot) panels ~10% wider
         # than Qt's hint-based split (Vivek).  Applied via singleShot AFTER
         # the window has real geometry -- setSizes at __init__ ran before the
@@ -1088,6 +1096,8 @@ class staticWidget(QWidget):
         self.wrangler.fname = self.fname
         self.wrangler.file_lock = self.file_lock
         self.wrangler.sigStart.connect(self.start_wrangler)
+        if hasattr(self.wrangler, 'sigStitchRequested'):
+            self.wrangler.sigStitchRequested.connect(self.start_stitch)
         self.wrangler.sigUpdateData.connect(self.update_data)
         self.wrangler.sigUpdateFile.connect(self.new_scan)
         # self.wrangler.sigUpdateFrame.connect(self.new_frame)
@@ -2046,6 +2056,19 @@ class staticWidget(QWidget):
         ``finished`` → ``integrator_thread_finished`` → ``_exit_run_state``
         (re-enabling the panel). Otherwise delegate to the active
         **wrangler**'s ``stop()`` (its run-end UI reset)."""
+        st = getattr(self, 'stitch_thread', None)
+        if st is not None and st.isRunning():
+            # Stitch is one MultiGeometry call — not abortable mid-reduction;
+            # flag it (honoured only before the heavy work starts) and give
+            # immediate Stop-button feedback.  The in-flight reduction completes,
+            # then finished → stitch_thread_finished → _exit_run_state.
+            st.stop_requested = True
+            try:
+                self.controls.set_stop_enabled(False)
+            except Exception:
+                logger.debug("disable Stop after stitch-stop failed",
+                             exc_info=True)
+            return
         it = getattr(getattr(self, 'integratorTree', None),
                      'integrator_thread', None)
         if it is not None and it.isRunning():
@@ -2193,6 +2216,94 @@ class staticWidget(QWidget):
         self.update_all()
         if not self.wrangler.thread.isRunning():
             self.wrangler.enabled(True)
+
+    # ── Stitch (Stitch 1D / Stitch 2D modes) ───────────────────────────
+    def _stitch_status(self, msg):
+        """Surface a stitch status message in the bottom status bar (via the
+        active wrangler's router), falling back to the window status bar."""
+        w = getattr(self, 'wrangler', None)
+        if w is not None and hasattr(w, '_set_status_text'):
+            w._set_status_text(msg)
+            return
+        try:
+            self.window().statusBar().showMessage(msg)
+        except Exception:
+            logger.debug("stitch status failed", exc_info=True)
+
+    def start_stitch(self, mode):
+        """Launch the one-shot stitch worker for the loaded scan (Stitch 1D/2D).
+
+        Diverted here from imageWrangler.start() when a Stitch mode is active.
+        Gates on frames + geometry up front (run_stitch raises on the worker
+        thread otherwise), reads the stitch params from the integrator's
+        existing 1D/2D fields, and starts the worker — whose started/finished
+        route through the shared run-state owner (_enter/_exit_run_state)."""
+        if self.stitch_thread.isRunning() or getattr(self, '_run_active', False):
+            return
+        scan = self.scan
+        if not getattr(scan, 'frames', None):
+            self._stitch_status('Load a scan before stitching.')
+            return
+        if getattr(scan, 'geometry', None) is None:
+            self._stitch_status(
+                'Stitch needs a calibration/geometry on the scan.')
+            return
+        try:
+            params = self._build_stitch_params(mode)
+        except Exception:
+            logger.error("build stitch params failed", exc_info=True)
+            self._stitch_status('Could not read stitch settings.')
+            return
+        self.stitch_thread.mode = mode
+        self.stitch_thread.params = params
+        self.stitch_thread.stop_requested = False
+        self._stitch_status(f'Stitching ({mode.upper()})…')
+        self.stitch_thread.start()         # started -> _enter_run_state
+
+    def _build_stitch_params(self, mode):
+        """run_stitch kwargs from the integrator's existing 1D/2D fields (reused
+        — no separate stitch options in Phase 1).
+
+        NOTE (Phase 1a): mask is left None — the wrangler's detector mask is
+        flat indices, and converting it to the 2D boolean run_stitch wants is a
+        Phase-1b follow-up.  No `backend` kwarg: run_stitch is MultiGeometry-only
+        today (the GI→histogram backend needs a headless change first)."""
+        args = self.scan.bai_1d_args if mode == '1d' else self.scan.bai_2d_args
+        p = dict(
+            unit=args.get('unit', 'q_A^-1'),
+            method=args.get('method', 'BBox'),
+            radial_range=args.get('radial_range'),
+            azimuth_range=args.get('azimuth_range'),
+            mask=None,
+        )
+        if mode == '1d':
+            p['npt_1d'] = int(self.scan.bai_1d_args.get('numpoints') or 2000)
+        else:
+            p['npt_rad_2d'] = int(self.scan.bai_2d_args.get('npt_rad') or 1500)
+            p['npt_azim_2d'] = int(self.scan.bai_2d_args.get('npt_azim') or 720)
+        return p
+
+    def stitch_thread_finished(self):
+        """Stitch worker done: end the shared run-state (unless a wrangler run is
+        also in flight) and refresh.  Phase 1a confirms completion in the status
+        bar; rendering scan.stitched_1d/2d into the panels lands in Phase 1b."""
+        self.thread_state_changed()
+        if not self.wrangler.thread.isRunning():
+            self._exit_run_state()
+        self.h5viewer.set_open_enabled(True)
+        if getattr(self.stitch_thread, 'ok', False):
+            self._stitch_status(
+                f'Stitch {self.stitch_thread.mode.upper()} complete.')
+        # else: _on_stitch_error already surfaced the failure — don't overwrite.
+        self.update_all()
+        if not self.wrangler.thread.isRunning():
+            self.wrangler.enabled(True)
+
+    def _on_stitch_error(self, msg):
+        """Stitch worker raised (caught in the worker, so the thread survived and
+        still fires finished → run-state exit).  Surface the message."""
+        self._stitch_status(f'Stitch failed: {msg}')
+        logger.error("Stitch error: %s", msg)
 
     def new_scan(self, name, fname, gi, incidence_motor, single_img,
                  series_average):

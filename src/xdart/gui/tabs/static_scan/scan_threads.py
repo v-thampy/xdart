@@ -987,6 +987,42 @@ class integratorThread(Qt.QtCore.QThread):
         self.scan.load_from_h5()
 
 
+class stitchThread(Qt.QtCore.QThread):
+    """One-shot off-thread stitch of the already-loaded scan (Stitch 1D / 2D
+    processing modes).
+
+    Calls the headless ``xdart.modules.ewald.stitch.run_stitch``, which merges
+    every frame's image into a single pattern and writes it onto
+    ``scan.stitched_1d`` / ``scan.stitched_2d``.  It is ONE pyFAI MultiGeometry
+    call — not interruptible mid-reduction: ``stop_requested`` is only honoured
+    *before* the call starts; an in-flight reduction runs to completion.  Errors
+    (incl. the memory guard's ``MemoryError``) are routed to ``errorSig`` so the
+    GUI can surface them instead of crashing the thread.
+    """
+
+    errorSig = Qt.QtCore.Signal(str)
+
+    def __init__(self, scan, parent=None):
+        super().__init__(parent)
+        self.scan = scan
+        self.mode = '1d'            # '1d' | '2d'
+        self.params = {}            # run_stitch kwargs, filled by the host
+        self.stop_requested = False
+        self.ok = False             # set True only on a successful reduction
+
+    def run(self):
+        self.ok = False
+        if self.stop_requested:
+            return
+        try:
+            from xdart.modules.ewald.stitch import run_stitch
+            run_stitch(self.scan, mode=self.mode, **self.params)
+            self.ok = True
+        except Exception as e:       # fail-loud to the GUI, don't kill the thread
+            logger.error("Stitch failed: %s", e, exc_info=True)
+            self.errorSig.emit(str(e))
+
+
 class fileHandlerThread(Qt.QtCore.QThread):
     """Thread class for loading data. Handles locks and waiting for
     locks to be released.

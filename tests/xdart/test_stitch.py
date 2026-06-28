@@ -212,3 +212,47 @@ def test_run_stitch_duplicate_scan_data_index_raises(monkeypatch):
 
     with pytest.raises(ValueError, match="cannot align scan_data"):
         run_stitch(scan, mode="1d")
+
+
+# ---------------------------------------------------------------------------
+# GUI stitch worker (stitchThread) — Phase 1a
+# ---------------------------------------------------------------------------
+
+def _ensure_qapp():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from pyqtgraph.Qt import QtWidgets
+    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def test_stitch_thread_runs_and_flags_ok(monkeypatch):
+    """stitchThread.run() drives run_stitch on its scan and sets ok=True on
+    success (the GUI's stitch_thread_finished keys the 'complete' message on it)."""
+    _ensure_qapp()
+    _patch_stitch_images(monkeypatch)
+    from xdart.gui.tabs.static_scan.scan_threads import stitchThread
+    frames = [_DuckFrame(i) for i in range(3)]
+    geom = _DuckGeometry(np.deg2rad([10.0, 11.0, 12.0]))
+    scan_data = pd.DataFrame({"tth": [10.0, 11.0, 12.0]}, index=range(3))
+    scan = _DuckScan(frames, geom, scan_data)
+    th = stitchThread(scan)
+    th.mode = "1d"
+    th.params = {"unit": "q_A^-1", "method": "BBox", "npt_1d": 500}
+    th.run()                       # synchronous — no event loop needed
+    assert th.ok is True
+    assert scan.stitched_1d == "RESULT_1d"
+
+
+def test_stitch_thread_error_routes_to_signal_and_clears_ok():
+    """A failing reduction (no geometry → run_stitch raises) is caught: ok stays
+    False and the message is emitted on errorSig (the GUI surfaces it)."""
+    _ensure_qapp()
+    from xdart.gui.tabs.static_scan.scan_threads import stitchThread
+    scan = _DuckScan([_DuckFrame(0)], None, pd.DataFrame())   # geometry=None
+    th = stitchThread(scan)
+    th.mode = "1d"
+    errs = []
+    th.errorSig.connect(lambda m: errs.append(m))
+    th.run()
+    assert th.ok is False
+    assert errs and "geometry" in errs[0].lower()

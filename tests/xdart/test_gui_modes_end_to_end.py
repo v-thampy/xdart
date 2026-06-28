@@ -3097,6 +3097,56 @@ def test_gi_toggle_opens_options_popup(widget):
     assert cfg['tilt_angle'] == 1.5
 
 
+def test_stitch_modes_present_and_mode_flags(widget):
+    """Stitch 1D / Stitch 2D appear in the image wrangler's mode list and set the
+    stitch_mode flag (+ the 1D/2D skip_2d) without being viewer modes."""
+    w = widget
+    wr = w.wrangler
+    assert {'Stitch 1D', 'Stitch 2D'} <= set(wr.controls_profile()['modes'])
+    combo = w.controls.modeCombo
+    combo.setCurrentIndex(combo.findText('Stitch 1D'))
+    assert wr.stitch_mode is True and w.scan.skip_2d is True
+    assert wr.viewer_mode is None
+    combo.setCurrentIndex(combo.findText('Stitch 2D'))
+    assert wr.stitch_mode is True and w.scan.skip_2d is False
+    combo.setCurrentIndex(combo.findText('Int 2D'))
+    assert wr.stitch_mode is False
+
+
+def test_run_in_stitch_mode_routes_to_stitch_not_wrangler(widget):
+    """A Run click while a Stitch mode is active emits sigStitchRequested (→
+    start_stitch) and does NOT emit sigStart (no wrangler run) nor morph the
+    action button to Pause — it stays a green 'Run' (stitch is Start/Stop only)."""
+    w = widget
+    wr = w.wrangler
+    combo = w.controls.modeCombo
+    combo.setCurrentIndex(combo.findText('Stitch 1D'))
+    got = {'stitch': None, 'start': False}
+    wr.sigStitchRequested.connect(lambda m: got.__setitem__('stitch', m))
+    wr.sigStart.connect(lambda: got.__setitem__('start', True))
+    wr.poni = object()                 # satisfy _inputs_valid (PONI loaded)
+    wr.start()
+    assert got['stitch'] == '1d'
+    assert got['start'] is False
+    assert w.controls.startButton.text() == 'Run'      # no Pause morph
+
+
+def test_build_stitch_params_reads_integrator_args(widget):
+    """_build_stitch_params pulls npts/unit/ranges/method from the scan's
+    bai_*_args, leaves mask None, and passes no `backend` kwarg (Phase 1a)."""
+    w = widget
+    w.scan.bai_1d_args.update(numpoints=1234, unit='q_A^-1', method='csr',
+                              radial_range=(0.0, 5.0), azimuth_range=None)
+    p1 = w._build_stitch_params('1d')
+    assert p1['npt_1d'] == 1234 and p1['unit'] == 'q_A^-1'
+    assert p1['method'] == 'csr' and p1['radial_range'] == (0.0, 5.0)
+    assert p1['mask'] is None and 'backend' not in p1
+    w.scan.bai_2d_args.update(npt_rad=600, npt_azim=360, unit='2th_deg')
+    p2 = w._build_stitch_params('2d')
+    assert p2['npt_rad_2d'] == 600 and p2['npt_azim_2d'] == 360
+    assert p2['unit'] == '2th_deg' and 'npt_1d' not in p2
+
+
 def test_reintegrate_live_default_and_stop_wiring(widget, monkeypatch):
     """Reintegrate runs LIVE by default and switches to the fast batch path via
     the shared Batch toggle (no separate Live button); the shared Stop dispatches

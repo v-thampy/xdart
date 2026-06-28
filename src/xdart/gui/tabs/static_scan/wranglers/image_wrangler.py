@@ -694,6 +694,10 @@ class imageWrangler(wranglerWidget):
     # Emits the viewer_mode string ('image', 'xye') or '' for normal.
     sigViewerModeChanged = QtCore.Signal(str)
 
+    # A Run click in a Stitch mode diverts here instead of a wrangler run; the
+    # host (staticWidget.start_stitch) launches the stitch worker.  Arg: '1d'|'2d'.
+    sigStitchRequested = QtCore.Signal(str)
+
     def _on_mode_changed(self, *args):
         """Update all flags from the processing mode dropdown and checkboxes."""
         mode_text = self.ui.processingModeCombo.currentText()
@@ -768,7 +772,11 @@ class imageWrangler(wranglerWidget):
         self.batch_mode = self.ui.batchCheckBox.isChecked()
         self.live_mode = self.ui.liveCheckBox.isChecked()
         self.xye_only = is_xye
-        
+        # Stitch 1D / Stitch 2D are post-load batch reductions of the loaded
+        # scan, not a wrangler acquisition run; start() diverts to the host's
+        # stitch worker when this is set (viewer mode texts never contain it).
+        self.stitch_mode = ('Stitch' in mode_text)
+
         if mode_text == 'Image Viewer':
             self.viewer_mode = 'image'
             self.scan.skip_2d = False
@@ -1034,6 +1042,7 @@ class imageWrangler(wranglerWidget):
             current = ''
         return {
             'modes': ['Int 1D', 'Int 2D', 'Int 1D (XYE)',
+                      'Stitch 1D', 'Stitch 2D',
                       'Image Viewer', 'XYE Viewer'],
             'live': True, 'batch': True, 'cores': True,
             'current': current,
@@ -1120,6 +1129,15 @@ class imageWrangler(wranglerWidget):
         # Refuse to run without a valid PONI rather than re-running the stale
         # previous scan.  Honors the Live/Batch mode toggles (no force-off).
         if not self._inputs_valid():
+            return
+        if getattr(self, 'stitch_mode', False):
+            # Stitch is a one-shot batch reduction of the already-loaded scan,
+            # not a wrangler acquisition run.  Divert to the host's stitch worker
+            # and return BEFORE the Pause/Resume morph or sigStart, so the action
+            # button stays a green "Run" (stitch is Start/Stop only).
+            self.sigStitchRequested.emit(
+                '1d' if '1D' in self.ui.processingModeCombo.currentText()
+                else '2d')
             return
         self.command = 'start'
         # M2: Stop morphs the button back to green immediately, but the worker
