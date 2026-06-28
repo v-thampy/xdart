@@ -53,9 +53,7 @@ params = [
     # `name` (Project/Calibration/Signal/BG) stays put, so .child() paths,
     # session save/load, and the disclosure/toggle logic are untouched.
     {'name': 'Project', 'title': 'PROJECT', 'type': 'group', 'children': [
-        # str_browse: path field + inline Browse (the group header already says
-        # "PROJECT", so the child label is dropped).
-        {'name': 'project_folder', 'title': '', 'type': 'str_browse', 'value': ''},
+        {'name': 'project_folder', 'title': 'Folder', 'type': 'str_browse', 'value': ''},
     ], 'expanded': True},
     {'name': 'Calibration', 'title': 'CALIBRATION', 'type': 'group', 'children': [
         {'name': 'poni_file', 'title': '', 'type': 'str_browse', 'value': def_poni_file},
@@ -79,9 +77,11 @@ params = [
          'value': '', 'visible': False},
         {'name': 'Filter', 'type': 'str', 'value': '', 'visible': False,
          'tip': "Filename filter: space-separated terms = AND (any order), '|' or OR = either, leading -term or NOT = exclude.  Case-insensitive substrings; empty = all files."},
+        {'name': 'mask_file', 'title': 'Mask File', 'type': 'str_browse', 'value': ''},
+        # Write Mode at the BOTTOM of DATA (display order only; the
+        # child('Signal').child('write_mode') path is unchanged).
         {'name': 'write_mode', 'title': 'Write Mode  ', 'type': 'list',
          'values': ['Append', 'Overwrite'], 'value': 'Append'},
-        {'name': 'mask_file', 'title': 'Mask File', 'type': 'str_browse', 'value': ''},
     ], 'expanded': True, 'visible': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group',
      'children': [
