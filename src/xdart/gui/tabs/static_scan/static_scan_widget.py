@@ -516,7 +516,7 @@ class staticWidget(QWidget):
         tools = [
             ('Peak Fitting', self._open_peak_fit_dialog),
             ('Phase Fitting', self._open_phase_fit_dialog),
-            ('Scan Plot', self._open_scan_plot_dialog),
+            ('Plot Metadata', self._open_scan_plot_dialog),
         ]
         for name, handler in tools:
             row = QtWidgets.QWidget()
