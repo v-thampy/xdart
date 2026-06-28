@@ -146,7 +146,7 @@ params = [
         {'name': 'Scale', 'type': 'float', 'value': 1, 'visible': False},
         {'name': 'norm_channel', 'title': 'Normalize', 'type': 'list', 'values': ['bstop'], 'value': 'bstop',
          'visible': False},
-    ], 'expanded': False, 'visible': False},
+    ], 'expanded': True, 'visible': False},   # expanded so the BG dropdown shows (was collapsed)
     # (h5_dir / Save Path moved into the PROJECT group above.)
 ]
 
