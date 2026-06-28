@@ -406,7 +406,7 @@ def test_metadata_popup_and_tools_placeholder(widget):
     assert w.ui.metaFrame.findChild(QtWidgets.QFrame, "toolsPlaceholder") is not None
     labels = {l.text() for l in w.ui.metaFrame.findChildren(QtWidgets.QLabel)
               if l.objectName() == "toolLabel"}
-    assert {"Peak Fitting", "Phase Fitting", "Scan Plot"} <= labels
+    assert {"Peak Fitting", "Phase Fitting", "Plot Metadata"} <= labels
     # Opening the popup reparents the live metawidget into a non-modal dialog.
     assert w._metadata_dialog is None
     w._open_metadata_dialog()
@@ -1965,7 +1965,7 @@ def test_int1d_xye_keeps_wrangler_inputs_enabled(widget):
     # (Per-group disables are the WRANGLER's _on_mode_changed job -- covered
     # by test_file_viewer_mode_disables_processing_tree_but_not_mode_combo;
     # this helper drives the widget-side handler with combo signals blocked.)
-    assert w.wrangler.parameters.child('h5_dir').opts.get(
+    assert w.wrangler.parameters.child('Project').child('h5_dir').opts.get(
         'enabled', True) is True
 
 

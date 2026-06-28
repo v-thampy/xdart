@@ -54,27 +54,29 @@ def _hidden(root, group):
     return root.child(group).opts.get("visible") is False
 
 
-def test_disclosure_three_stages(qapp):
+def test_disclosure_two_stages(qapp):
+    # Two-stage now: the PONI picker lives inside DATA (first row), so the
+    # separate CALIBRATION stage is gone — DATA reveals once a Project Folder is
+    # set, and PONI validity is enforced at run time (status nudge only).
     h, root = _holder()
 
-    # Fresh: ONLY Project visible (incl. the Save-Path row hidden).
+    # Fresh: ONLY Project visible (Folder + Save Path live in it); DATA hidden.
     h._apply_disclosure()
     assert not _hidden(root, "Project")
-    assert _hidden(root, "Calibration") and _hidden(root, "Signal")
-    assert root.child("h5_dir").opts.get("visible") is False
+    assert _hidden(root, "Signal")
     assert "Project Folder" in h.ui.specLabel.t
 
-    # Folder set, no PONI -> Calibration appears, rest still hidden.
+    # Folder set -> the whole DATA group reveals (Poni is its first row), even
+    # without a PONI yet — but the status nudges to load one.
     root.child("Project").child("project_folder").setValue("/tmp")
     h._apply_disclosure()
-    assert not _hidden(root, "Calibration")
-    assert _hidden(root, "Signal") and _hidden(root, "GI")
+    assert not _hidden(root, "Signal") and not _hidden(root, "BG")
     assert "PONI" in h.ui.specLabel.t
 
-    # Folder + valid PONI -> everything revealed.
+    # Folder + valid PONI -> status clears.
     h.poni = object()
     h._apply_disclosure()
-    for g in ("Project", "Calibration", "Signal", "GI", "Mask", "BG"):
+    for g in ("Project", "Signal", "BG"):
         assert not _hidden(root, g)
     assert h.ui.specLabel.t == ""
 
@@ -82,7 +84,7 @@ def test_disclosure_three_stages(qapp):
 def test_folder_change_resets_dependent_paths_and_clears_stale_poni(qapp, tmp_path):
     h, root = _holder()
     # Seed a prior folder's config, incl. a "loaded" PONI (instance attr + param).
-    root.child("Calibration").child("poni_file").setValue("/old/cal.poni")
+    root.child("Signal").child("poni_file").setValue("/old/cal.poni")
     h.poni_file = "/old/cal.poni"
     h.poni = object()                              # a loaded calibration
     root.child("Signal").child("File").setValue("/old/img_0001.tif")
@@ -92,13 +94,13 @@ def test_folder_change_resets_dependent_paths_and_clears_stale_poni(qapp, tmp_pa
     root.child("Project").child("project_folder").setValue(str(tmp_path))
     h._on_project_folder_changed()
 
-    assert root.child("Calibration").child("poni_file").value() == ""
+    assert root.child("Signal").child("poni_file").value() == ""
     # The INSTANCE attr is resynced too (else get_poni_dict reloads the stale PONI
     # and _inputs_valid stays True -> Start runs the new images vs the old cal).
     assert h.poni_file == ""
     assert root.child("Signal").child("File").value() == ""
     assert root.child("Signal").child("mask_file").value() == ""
-    assert root.child("h5_dir").value() == os.path.join(
+    assert root.child("Project").child("h5_dir").value() == os.path.join(
         str(tmp_path), "xdart_processed_data")
     assert h.source_base == os.path.abspath(str(tmp_path))
 
@@ -110,17 +112,17 @@ def test_folder_change_inert_during_restore(qapp):
     h, root = _holder()
     root.child("Project").child("project_folder").sigValueChanged.connect(
         lambda *a: h._on_project_folder_changed())
-    root.child("Calibration").child("poni_file").setValue("/keep/cal.poni")
+    root.child("Signal").child("poni_file").setValue("/keep/cal.poni")
     h.poni_file = "/keep/cal.poni"
 
     h._restoring = True
     root.child("Project").child("project_folder").setValue("/restored/root")
-    assert root.child("Calibration").child("poni_file").value() == "/keep/cal.poni"
+    assert root.child("Signal").child("poni_file").value() == "/keep/cal.poni"
     assert h.poni_file == "/keep/cal.poni"          # guard held
 
     h._restoring = False
     root.child("Project").child("project_folder").setValue("/new/root")
-    assert root.child("Calibration").child("poni_file").value() == ""   # now reset
+    assert root.child("Signal").child("poni_file").value() == ""   # now reset
     assert h.poni_file == ""
 
 
@@ -182,8 +184,8 @@ def test_viewer_modes_hide_all_processing_groups(qapp):
         h.poni = object()                          # would normally reveal all
         h._apply_disclosure()
         assert not _hidden(root, "Project"), vm    # Project Folder: visible
-        assert root.child("h5_dir").opts.get("visible") is not False, vm        # Save Path
-        for g in ("Calibration",) + imageWrangler._DISCLOSURE_REST:  # Signal/GI/Mask/MaskSat/BG
+        assert root.child("Project").child("h5_dir").opts.get("visible") is not False, vm        # Save Path (in Project)
+        for g in imageWrangler._DISCLOSURE_REST:   # Signal/BG (DATA + background)
             assert _hidden(root, g), (vm, g)
 
 
@@ -198,5 +200,5 @@ def test_leaving_viewer_mode_restores_disclosure(qapp):
     assert _hidden(root, "Signal")                 # hidden in viewer mode
     h.viewer_mode = None                           # back to a processing mode
     h._apply_disclosure()
-    for g in ("Project", "Calibration", "Signal", "GI", "Mask", "BG"):
+    for g in ("Project", "Signal", "BG"):
         assert not _hidden(root, g), g             # full disclosure restored

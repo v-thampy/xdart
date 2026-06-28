@@ -54,11 +54,16 @@ params = [
     # session save/load, and the disclosure/toggle logic are untouched.
     {'name': 'Project', 'title': 'PROJECT', 'type': 'group', 'children': [
         {'name': 'project_folder', 'title': 'Folder', 'type': 'str_browse', 'value': ''},
+        {'name': 'h5_dir', 'title': 'Save Path', 'type': 'str_browse',
+         'value': get_fname_dir(), 'enabled': True},
     ], 'expanded': True},
-    {'name': 'Calibration', 'title': 'CALIBRATION', 'type': 'group', 'children': [
-        {'name': 'poni_file', 'title': '', 'type': 'str_browse', 'value': def_poni_file},
-    ], 'expanded': True},
+    # PONI is the first row of DATA — the standalone CALIBRATION group is gone.
+    # This collapses the N1 progressive disclosure to two stages (Folder -> DATA),
+    # since the PONI picker now lives inside DATA (see _apply_disclosure).  A
+    # proper redo belongs in the Tier-B custom-card wrangler migration
+    # (design_gui_int_migration_jun2026.md).
     {'name': 'Signal', 'title': 'DATA', 'type': 'group', 'children': [
+        {'name': 'poni_file', 'title': 'Poni', 'type': 'str_browse', 'value': def_poni_file},
         {'name': 'inp_type', 'title': 'Source', 'type': 'list',
          'values': ['Image Series', 'Image Directory', 'Single Image'], 'value': 'Image Series'},
         {'name': 'File', 'title': 'Image File   ', 'type': 'str_browse', 'value': def_img_file},
@@ -144,7 +149,7 @@ params = [
         {'name': 'norm_channel', 'title': 'Normalize', 'type': 'list', 'values': ['bstop'], 'value': 'bstop',
          'visible': False},
     ], 'expanded': False, 'visible': False},
-    {'name': 'h5_dir', 'title': 'Save Path', 'type': 'str_browse', 'value': get_fname_dir(), 'enabled': True},
+    # (h5_dir / Save Path moved into the PROJECT group above.)
 ]
 
 ctr = 1
@@ -290,7 +295,7 @@ class imageWrangler(wranglerWidget):
         self.project_folder = self.parameters.child('Project').child('project_folder').value()
         self.source_base = self._compute_source_base()
         # Calibration
-        self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
+        self.poni_file = self.parameters.child('Signal').child('poni_file').value()
         # Applies the N1 progressive disclosure for the fresh-start state (no
         # folder -> only Project visible).
         self.get_poni_dict()
@@ -346,7 +351,7 @@ class imageWrangler(wranglerWidget):
         self.gi_mode_2d = self.scan.bai_2d_args.get('gi_mode_2d', 'qip_qoop')
 
         # HDF5 Save Path
-        self.h5_dir = self.parameters.child('h5_dir').value()
+        self.h5_dir = self.parameters.child('Project').child('h5_dir').value()
 
         # NOTE: Integration Advanced button (self.ui.advancedButton) is wired
         # in static_scan_widget.set_wrangler() to show the integratorTree's
@@ -370,10 +375,10 @@ class imageWrangler(wranglerWidget):
         self.parameters.child('Project').child('project_folder').sigValueChanged.connect(
             self._on_project_folder_changed
         )
-        self.parameters.child('Calibration').child('poni_file').sigActivated.connect(
+        self.parameters.child('Signal').child('poni_file').sigActivated.connect(
             self.set_poni_file
         )
-        self.parameters.child('Calibration').child('poni_file').sigValueChanged.connect(
+        self.parameters.child('Signal').child('poni_file').sigValueChanged.connect(
             self.get_poni_dict
         )
         self.parameters.child('Signal').child('inp_type').sigValueChanged.connect(
@@ -418,7 +423,7 @@ class imageWrangler(wranglerWidget):
         self.parameters.child('GI').child('th_val').sigValueChanged.connect(
             self.set_gi_th_motor
         )
-        self.parameters.child('h5_dir').sigActivated.connect(
+        self.parameters.child('Project').child('h5_dir').sigActivated.connect(
             self.set_h5_dir
         )
 
@@ -531,7 +536,7 @@ class imageWrangler(wranglerWidget):
     # self_attr     → attribute to sync on restore (None = handled by sigValueChanged)
     _SESSION_PARAMS = [
         ('project_folder', ('Project', 'project_folder'),            True,  'project_folder'),
-        ('poni_file',      ('Calibration', 'poni_file'),             True,  'poni_file'),
+        ('poni_file',      ('Signal', 'poni_file'),                  True,  'poni_file'),
         ('inp_type',       ('Signal', 'inp_type'),                   False, 'inp_type'),
         ('img_file',       ('Signal', 'File'),                       True,  'img_file'),
         ('img_dir',        ('Signal', 'img_dir'),                    True,  'img_dir'),
@@ -561,7 +566,7 @@ class imageWrangler(wranglerWidget):
         ('threshold_min',  ('Mask', 'min'),                          False, 'threshold_min'),
         ('threshold_max',  ('Mask', 'max'),                          False, 'threshold_max'),
         ('mask_sentinel',  ('MaskSat', 'mask_sentinel'),             False, 'mask_sentinel'),
-        ('h5_dir',         ('h5_dir',),                              True,  'h5_dir'),
+        ('h5_dir',         ('Project', 'h5_dir'),                    True,  'h5_dir'),
     ]
 
     def _save_to_session(self, *args):
@@ -652,7 +657,7 @@ class imageWrangler(wranglerWidget):
         (the setValue re-enters this method via the tree-change cascade and
         passes validation on the second pass).
         """
-        path = self.parameters.child('h5_dir').value()
+        path = self.parameters.child('Project').child('h5_dir').value()
         base = self._compute_source_base()
         if path and base:
             _abs = os.path.abspath(os.path.expanduser(str(path)))
@@ -680,7 +685,7 @@ class imageWrangler(wranglerWidget):
                     'Save Path rejected: must be inside the Project Folder. '
                     f'Kept {os.path.basename(fallback) or fallback}.',
                 )
-                self.parameters.child('h5_dir').setValue(fallback)
+                self.parameters.child('Project').child('h5_dir').setValue(fallback)
                 return
         old_path = getattr(self, 'h5_dir', None)
         self.h5_dir = path
@@ -828,7 +833,7 @@ class imageWrangler(wranglerWidget):
 
     def _set_integration_controls_enabled(self, enabled, *, include_gi=True):
         """Enable or disable parameter tree groups related to integration."""
-        group_names = ['Calibration', 'Signal', 'BG', 'Mask', 'MaskSat']
+        group_names = ['Signal', 'BG', 'Mask', 'MaskSat']  # poni_file lives in Signal now
         if include_gi:
             group_names.append('GI')
         for group_name in group_names:
@@ -854,7 +859,7 @@ class imageWrangler(wranglerWidget):
         global ctr
         ctr += 1
 
-        self.poni_file = self.parameters.child('Calibration').child('poni_file').value()
+        self.poni_file = self.parameters.child('Signal').child('poni_file').value()
         self.thread.poni = self.poni
 
         # N1: Project Folder -> @source_base (raw source paths stored RELATIVE to
@@ -1242,13 +1247,14 @@ class imageWrangler(wranglerWidget):
             filter="PONI (*.poni *.PONI)"
         )
         if fname != '':
-            self.parameters.child('Calibration').child('poni_file').setValue(fname)
+            self.parameters.child('Signal').child('poni_file').setValue(fname)
             self.poni_file = fname
             self._save_to_session()
 
-    # N1: param groups gated behind the Project Folder + PONI (Project itself is
-    # always visible).  Calibration appears once a Project Folder is set; the
-    # rest (groups + the Save-Path row) appears once a valid PONI also loads.
+    # Two-stage disclosure: Project (Folder + Save Path) is always visible; the
+    # DATA group (PONI first, then the source rows) + BG reveal once a Project
+    # Folder is set.  (The PONI used to be its own CALIBRATION stage; it now lives
+    # inside DATA, so the staging collapsed — see _apply_disclosure.)
     # Intensity Threshold ('Mask') + Mask Saturated ('MaskSat') moved to the
     # integrator panel — kept here as hidden carriers the integrator injects into
     # at run-setup, so never disclosed (and re-hidden after "reveal everything").
@@ -1256,7 +1262,7 @@ class imageWrangler(wranglerWidget):
     # GI joins Mask/MaskSat as a HIDDEN CARRIER: the integrator panel owns the GI
     # controls now and injects into this group at run-setup (_push_gi_to_wrangler).
     _DISCLOSURE_CARRIERS = ('Mask', 'MaskSat', 'GI')
-    _DISCLOSURE_TOPLEVEL = ('h5_dir',)     # Save Path row (path + inline Browse)
+    _DISCLOSURE_TOPLEVEL = ()              # Save Path now lives inside PROJECT
 
     @staticmethod
     def _safe_status_text(obj, text):
@@ -1287,45 +1293,32 @@ class imageWrangler(wranglerWidget):
         # child, so a check placed only in _on_mode_changed would be silently
         # undone by the next folder/PONI event.
         if getattr(self, 'viewer_mode', None) in ('image', 'xye'):
-            self.parameters.child('Project').show()          # Project Folder: keep
-            self.parameters.child('Calibration').hide()
+            # Project (Folder + Save Path) stays; every processing group hides.
+            self.parameters.child('Project').show()
             for name in self._DISCLOSURE_REST:               # Signal/GI/Mask/MaskSat/BG
                 self.parameters.child(name).hide()
-            for name in self._DISCLOSURE_TOPLEVEL:           # Save Path row: keep
-                self.parameters.child(name).show()
             imageWrangler._safe_status_text(self, '')
             return
         have_root = self._compute_source_base() is not None
         have_poni = self.poni is not None
-        self.parameters.child('Project').show()            # always visible
-        cal = self.parameters.child('Calibration')
+        # Project (Folder + Save Path) is always visible.
+        self.parameters.child('Project').show()
 
         def _hide_rest():
-            for name in self._DISCLOSURE_REST + self._DISCLOSURE_TOPLEVEL:
+            for name in self._DISCLOSURE_REST:
                 self.parameters.child(name).hide()
 
+        # Two-stage disclosure (the PONI picker now lives inside DATA as the first
+        # row, so it can no longer be its own reveal stage): Project Folder ->
+        # the whole DATA group once a folder is set.  PONI validity is enforced at
+        # run time (the run guard / _inputs_valid), not by hiding DATA.
         if not have_root:
-            cal.hide()
             _hide_rest()
             imageWrangler._safe_status_text(
-                self,
-                'Choose a Project Folder to begin.',
-            )
-        elif not have_poni:
-            cal.show()
-            _hide_rest()
-            # Save Path stays visible alongside Calibration (Vivek): the
-            # processed-data location is project-level, decided before the
-            # PONI -- and the scans browser already follows it.
-            for name in self._DISCLOSURE_TOPLEVEL:
-                self.parameters.child(name).show()
-            imageWrangler._safe_status_text(
-                self,
-                'Load a PONI calibration file to begin.',
-            )
+                self, 'Choose a Project Folder to begin.')
         else:
             for child in self.parameters.children():
-                child.show()                               # reveal everything
+                child.show()                               # reveal DATA (Poni first) + rest
             # …except the pixel-rejection carriers, which moved to the
             # integrator panel and live here only as hidden injection targets.
             # getattr default keeps lightweight duck holders (tests) working.
@@ -1334,7 +1327,9 @@ class imageWrangler(wranglerWidget):
                     self.parameters.child(name).hide()
                 except Exception:
                     pass
-            imageWrangler._safe_status_text(self, '')
+            imageWrangler._safe_status_text(
+                self,
+                '' if have_poni else 'Load a PONI calibration to enable a run.')
 
     def get_poni_dict(self):
         """Load the PONI calibration file and store as a PONI object, then apply
@@ -1674,7 +1669,7 @@ class imageWrangler(wranglerWidget):
         )
         if path != '':
             Path(path).mkdir(parents=True, exist_ok=True)
-            self.parameters.child('h5_dir').setValue(path)
+            self.parameters.child('Project').child('h5_dir').setValue(path)
             self._sync_h5_dir_from_parameters()
 
     def _compute_source_base(self):
@@ -1689,9 +1684,9 @@ class imageWrangler(wranglerWidget):
         base = self._compute_source_base()
         if not base:
             return
-        cur_h5 = (self.parameters.child('h5_dir').value() or '').strip()
+        cur_h5 = (self.parameters.child('Project').child('h5_dir').value() or '').strip()
         if not cur_h5 or cur_h5 == get_fname_dir():
-            self.parameters.child('h5_dir').setValue(
+            self.parameters.child('Project').child('h5_dir').setValue(
                 os.path.join(base, 'xdart_processed_data'))
             self._sync_h5_dir_from_parameters()
 
@@ -1728,7 +1723,7 @@ class imageWrangler(wranglerWidget):
         # letting a Start run the new folder's images against the old calibration
         # (the BUG-1 this reset exists to prevent).
         self.poni_file = ''
-        self.parameters.child('Calibration').child('poni_file').setValue('')
+        self.parameters.child('Signal').child('poni_file').setValue('')
         for seg in (('Signal', 'File'), ('Signal', 'img_dir'),
                     ('Signal', 'mask_file')):
             try:
@@ -1739,7 +1734,7 @@ class imageWrangler(wranglerWidget):
         # helper re-points it under the NEW folder (its keep-user-value
         # guard otherwise retains the OLD project's path on a switch, and
         # the scans browser never followed).
-        self.parameters.child('h5_dir').setValue('')
+        self.parameters.child('Project').child('h5_dir').setValue('')
         self._default_h5_under_project()
         self._apply_disclosure()
 
