@@ -378,12 +378,13 @@ def stitch_images(
     azimuth_range: tuple[float, float] | None = None,
     mask: np.ndarray | None = None,
     normalization: np.ndarray | Sequence[float] | None = None,
+    backend: str = "multigeometry",
 ) -> IntegrationResult1D | IntegrationResult2D:
     """Stitch a detector-angle image stack into a 1D or 2D pattern.
 
     High-level entry point that builds the per-image MultiGeometry
     integrators from ``base_poni`` + per-image ``rot1``/``rot2`` offsets
-    (degrees) and dispatches to :func:`stitch_1d` / :func:`stitch_2d`.
+    (degrees) and merges them with the chosen ``backend``.
     This is the orchestration the xdart GUI used to carry inline; keeping
     it here lets headless callers stitch without reimplementing the
     integrator-build + dispatch.
@@ -391,6 +392,17 @@ def stitch_images(
     Parameters mirror :func:`stitch_1d` / :func:`stitch_2d`; ``mode``
     selects which.  ``rot2_angles`` that are all-zero (or ``None``) are
     treated as a pure ``rot1`` scan.
+
+    ``backend``
+        ``"multigeometry"`` (default) — pyFAI MultiGeometry, which applies
+        its OWN solid-angle/polarization corrections and supports any unit.
+        ``"pyfai_hist"`` — the per-pixel q-map histogram merge (Σraw/Σnorm)
+        from :mod:`xrd_tools.integrate.stitch_hist`; it emits ``|q|`` in Å⁻¹
+        ONLY (``unit='q_A^-1'``) and does its own pixel splitting (``method``
+        is ignored).  This is the substrate the shared CorrectionStack + GI
+        corrections plug into; GI-corrected stitching (footprint/Fresnel/
+        refraction) layers on it via ``stitch_hist.pyfai_gi_q_frames`` and is
+        NOT wired here.
     """
     # Fail early on a count mismatch — feeding MultiGeometry an unequal
     # number of images and integrators silently mispairs images with the
@@ -417,6 +429,16 @@ def stitch_images(
     integrators = create_multigeometry_integrators(
         base_poni, rot1_angles=rot1_angles, rot2_angles=rot2,
     )
+    if backend == "pyfai_hist":
+        return _stitch_pyfai_hist(
+            images, integrators, mode=mode, npt_1d=npt_1d,
+            npt_rad_2d=npt_rad_2d, npt_azim_2d=npt_azim_2d, unit=unit,
+            method=method, radial_range=radial_range,
+            azimuth_range=azimuth_range, mask=mask, normalization=normalization)
+    if backend != "multigeometry":
+        raise ValueError(
+            "stitch_images: backend must be 'multigeometry' or 'pyfai_hist', "
+            f"got {backend!r}")
     if mode == "1d":
         return stitch_1d(
             images, integrators, npt=npt_1d, unit=unit, method=method,
@@ -429,6 +451,39 @@ def stitch_images(
             azimuth_range=azimuth_range, mask=mask, normalization=normalization,
         )
     raise ValueError(f"mode must be '1d' or '2d', got {mode!r}")
+
+
+def _stitch_pyfai_hist(
+    images, integrators, *, mode, npt_1d, npt_rad_2d, npt_azim_2d, unit,
+    method, radial_range, azimuth_range, mask, normalization,
+):
+    """The ``pyfai_hist`` merge: build per-frame pyFAI q-maps and accumulate
+    them on a shared q-grid (Σraw/Σnorm), instead of pyFAI MultiGeometry.
+
+    q-only (``unit='q_A^-1'``); the histogram does its own pixel splitting so
+    ``method`` is ignored.  Mirrors the ``pyfai_hist`` branch of
+    :func:`xrd_tools.analysis.plans.run_stitch` for the non-GI case."""
+    from xrd_tools.integrate.stitch_hist import pyfai_q_frames, stitch_q_grid
+    if unit != "q_A^-1":
+        raise ValueError(
+            "stitch_images: backend='pyfai_hist' emits q in Å⁻¹ only "
+            f"(unit='q_A^-1'); got unit={unit!r}. Use backend='multigeometry' "
+            "for other units.")
+    if method != "BBox":
+        logger.warning(
+            "stitch_images: method=%r is ignored by backend='pyfai_hist' "
+            "(the histogram merge does its own pixel splitting).", method)
+    npt_rad = npt_rad_2d if mode == "2d" else npt_1d
+
+    def _frames():
+        # Re-built per call: stitch_q_grid may make a scout pass + an
+        # accumulation pass, so the factory must be replayable.
+        return pyfai_q_frames(
+            images, integrators, mask=mask, normalization=normalization)
+
+    return stitch_q_grid(
+        _frames, mode=mode, npt=npt_rad, npt_azim=npt_azim_2d, unit=unit,
+        radial_range=radial_range, azimuth_range=azimuth_range)
 
 
 __all__ = [

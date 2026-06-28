@@ -37,6 +37,7 @@ def run_stitch(
     radial_range: tuple[float, float] | None = None,
     azimuth_range: tuple[float, float] | None = None,
     unit: str = "q_A^-1",
+    backend: str = "multigeometry",
     max_stack_bytes: float = 16e9,
 ) -> None:
     """Stitch the scan's per-frame images into a single merged pattern.
@@ -77,6 +78,10 @@ def run_stitch(
         Optional explicit bin ranges; pyFAI auto-sizes if ``None``.
     unit
         Radial output unit string.
+    backend
+        ``"multigeometry"`` (default, pyFAI MultiGeometry) or ``"pyfai_hist"``
+        (the per-pixel q-histogram merge — q-Å⁻¹ only; the substrate the shared
+        CorrectionStack + GI corrections layer on).
 
     Raises
     ------
@@ -319,6 +324,7 @@ def run_stitch(
             radial_range=radial_range,
             azimuth_range=azimuth_range,
             mask=mask,
+            backend=backend,
         )
         if mode == "1d":
             scan.stitched_1d = result
