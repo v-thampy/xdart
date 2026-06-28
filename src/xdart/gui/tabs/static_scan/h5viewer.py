@@ -453,17 +453,32 @@ class H5Viewer(QWidget):
         self._apply_frames_panel_width(None)
 
     def _add_refresh_button(self):
-        """Add a Refresh button to the left of Show All / Auto Last.
+        """Place Refresh in the DATA BROWSER header (top-right), per the redesign.
 
-        It re-reads the current directory listing (``update_scans``) — handy in
-        Image/XYE Viewer modes where new files may be written outside xdart
-        while a run is in progress.  The three buttons are reflowed into one
-        row so Refresh sits to the left of the existing two.
+        Refresh re-reads the current directory listing (``update_scans``) — handy
+        in Image/XYE Viewer modes where new files may be written outside xdart
+        while a run is in progress.  The mockup puts it on the right of a header
+        row above the lists; the bottom row then holds Show All / Auto Last /
+        Metadata.
         """
         self.ui.refresh = QtWidgets.QPushButton('Refresh')
         self.ui.refresh.setObjectName('refresh')
         self.ui.refresh.setMaximumSize(QtCore.QSize(16777215, 25))
 
+        # Header row (the previously-empty row-0 frame): "Data Browser" label on
+        # the left, Refresh on the right.
+        self.ui.frame.setObjectName('dataBrowserBar')
+        self.ui.frame.setMaximumSize(QtCore.QSize(16777215, 30))
+        hdr = QtWidgets.QHBoxLayout(self.ui.frame)
+        hdr.setContentsMargins(2, 0, 2, 0)
+        hdr.setSpacing(6)
+        browser_label = QtWidgets.QLabel('Data Browser')
+        browser_label.setObjectName('dataBrowserHeader')
+        hdr.addWidget(browser_label)
+        hdr.addStretch(1)
+        hdr.addWidget(self.ui.refresh)
+
+        # Bottom button row: Show All / Auto Last / Metadata (Refresh removed).
         btn_row = QtWidgets.QWidget()
         # Constrain the row to the button height so it doesn't steal vertical
         # stretch from the lists splitter above (which would leave the buttons
@@ -479,7 +494,6 @@ class H5Viewer(QWidget):
         # Move the existing buttons out of the grid into the row.
         self.ui.gridLayout.removeWidget(self.ui.show_all)
         self.ui.gridLayout.removeWidget(self.ui.auto_last)
-        btn_layout.addWidget(self.ui.refresh)
         btn_layout.addWidget(self.ui.show_all)
         btn_layout.addWidget(self.ui.auto_last)
         # Stage 4 (Direction A): the frame-metadata table is no longer inline in

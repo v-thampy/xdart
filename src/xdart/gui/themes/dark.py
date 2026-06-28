@@ -169,6 +169,17 @@ QFrame#frame_4, QFrame#frame_5, QFrame#frame_6, QLabel#labelCurrent {
     border: none;
     background: transparent;
 }
+/* DATA BROWSER header bar: a clean title row (label left, Refresh right) — no
+   card box around it. */
+QFrame#dataBrowserBar {
+    border: none;
+    background: transparent;
+}
+QLabel#dataBrowserHeader {
+    font-weight: 600;
+    color: $text_muted;
+    padding-left: 2px;
+}
 QGroupBox {
     margin-top: 8px;
     padding-top: 8px;
