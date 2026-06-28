@@ -83,10 +83,8 @@ params = [
         {'name': 'Filter', 'type': 'str', 'value': '', 'visible': False,
          'tip': "Filename filter: space-separated terms = AND (any order), '|' or OR = either, leading -term or NOT = exclude.  Case-insensitive substrings; empty = all files."},
         {'name': 'mask_file', 'title': 'Mask File', 'type': 'str_browse', 'value': ''},
-        # Write Mode at the BOTTOM of DATA (display order only; the
-        # child('Signal').child('write_mode') path is unchanged).
-        {'name': 'write_mode', 'title': 'Write Mode  ', 'type': 'list',
-         'values': ['Append', 'Overwrite'], 'value': 'Append'},
+        # (Write Mode moved to the Controls run bar — it's a run/output property,
+        # not a data input.  setup() reads it from the shared StaticControls.)
     ], 'expanded': True, 'visible': False},
     {'name': 'GI', 'title': 'Grazing Incidence', 'type': 'group',
      'children': [
@@ -328,7 +326,7 @@ class imageWrangler(wranglerWidget):
         self.mask_sentinel = self.parameters.child('MaskSat').child('mask_sentinel').value()
 
         # Write Mode
-        self.write_mode = self.parameters.child('Signal').child('write_mode').value()
+        self.write_mode = self._active_write_mode()
 
         # Background
         self.bg_type = self.parameters.child('BG').child('bg_type').value()
@@ -546,7 +544,6 @@ class imageWrangler(wranglerWidget):
         ('meta_ext',       ('Signal', 'meta_ext'),                   False, None),
         ('meta_dir',       ('Signal', 'meta_dir'),                   True,  'meta_dir'),
         ('file_filter',    ('Signal', 'Filter'),                     False, 'file_filter'),
-        ('write_mode',     ('Signal', 'write_mode'),                 False, 'write_mode'),
         ('mask_file',      ('Signal', 'mask_file'),                  True,  'mask_file'),
         ('bg_type',        ('BG', 'bg_type'),                        False, 'bg_type'),
         ('bg_file',        ('BG', 'File'),                           True,  'bg_file'),
@@ -852,6 +849,17 @@ class imageWrangler(wranglerWidget):
         # browser, which viewer modes rely on; the run-lock (enabled())
         # disables the whole tree during runs.
 
+    def _active_write_mode(self):
+        """Output mode ('Append'/'Overwrite') from the shared run Controls.
+
+        Write Mode moved out of the wrangler param tree into the Controls run bar
+        (it's a run/output property).  Defaults to the SAFE 'Append' when the
+        controls aren't attached (headless/test holders) — never silently
+        Overwrite."""
+        controls = getattr(self, '_controls', None)
+        getter = getattr(controls, 'write_mode', None)
+        return getter() if callable(getter) else 'Append'
+
     def setup(self):
         """Sets up the child thread, syncs all parameters.
         """
@@ -911,7 +919,7 @@ class imageWrangler(wranglerWidget):
         self.thread.mask_sentinel = self.mask_sentinel
 
         # Write Mode
-        self.write_mode = self.parameters.child('Signal').child('write_mode').value()
+        self.write_mode = self._active_write_mode()
         self.thread.write_mode = self.write_mode
 
         # Background
@@ -1183,11 +1191,11 @@ class imageWrangler(wranglerWidget):
         (styled in the dark theme).  ``pausing`` is a transient disabled state."""
         btn = self.ui.startButton
         label, prop, enabled = {
-            'idle':    ('Start',    'idle',   True),
+            'idle':    ('Run',      'idle',   True),
             'running': ('Pause',    'active', True),
             'pausing': ('Pausing…', 'active', False),
             'paused':  ('Resume',   'active', True),
-        }.get(phase, ('Start', 'idle', True))
+        }.get(phase, ('Run', 'idle', True))
         # Keep the transient 'pausing' distinct (not collapsed into 'running'),
         # so a re-dispatch during the disabled 'Pausing…' window is an explicit
         # no-op in _on_start_clicked rather than a redundant second pause().

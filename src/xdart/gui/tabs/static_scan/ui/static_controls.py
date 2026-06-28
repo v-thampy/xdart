@@ -27,11 +27,13 @@ class StaticControls(QtWidgets.QWidget):
     modeChanged = QtCore.Signal(str)
     batchToggled = QtCore.Signal(bool)
     liveToggled = QtCore.Signal(bool)
+    writeModeChanged = QtCore.Signal(str)    # 'Append' / 'Overwrite' (output mode)
 
-    # Phase-B action-button morph table (text, runPhase property, enabled),
-    # lifted verbatim from imageWrangler._set_action_button.
+    # Phase-B action-button morph table (text, runPhase property, enabled).
+    # Idle reads "Run" (the run trigger); the running/paused phases keep the
+    # Pause/Resume morph.
     _PHASES = {
-        'idle':    ('Start',    'idle',   True),
+        'idle':    ('Run',      'idle',   True),
         'running': ('Pause',    'active', True),
         'pausing': ('Pausing…', 'active', False),
         'paused':  ('Resume',   'active', True),
@@ -118,9 +120,20 @@ class StaticControls(QtWidgets.QWidget):
         self.liveButton.setMaximumWidth(140)
         row2.addWidget(self.liveButton)
 
-        self.startButton = QtWidgets.QPushButton('Start')
+        # Output mode (Append vs Overwrite): a run/output property — it lives with
+        # the run controls now, not in the data wrangler.  A checkable button that
+        # reads its current state; Overwrite is destructive, shown right next to
+        # Run so it's visible at the moment of triggering a run.  Default Append.
+        self.writeModeButton = QtWidgets.QPushButton('Append')
+        self.writeModeButton.setObjectName('writeModeButton')
+        self.writeModeButton.setCheckable(True)
+        self.writeModeButton.setChecked(False)            # Append
+        self.writeModeButton.setMaximumWidth(110)
+        row2.addWidget(self.writeModeButton)
+
+        self.startButton = QtWidgets.QPushButton('Run')
         # objectName 'startButton' + the runPhase property are what the dark
-        # theme keys the green/orange Start/Pause styling on.
+        # theme keys the green/orange Run/Pause styling on.
         self.startButton.setObjectName('startButton')
         self.startButton.setProperty('runPhase', 'idle')
         row2.addWidget(self.startButton)
@@ -138,6 +151,7 @@ class StaticControls(QtWidgets.QWidget):
         self.modeCombo.currentTextChanged.connect(self.modeChanged)
         self.batchButton.toggled.connect(self.batchToggled)
         self.liveButton.toggled.connect(self.liveToggled)
+        self.writeModeButton.toggled.connect(self._on_write_mode_toggled)
 
     # ── action-button morph (the wrangler drives this via its back-ref) ──
     def set_action_phase(self, phase):
@@ -160,6 +174,25 @@ class StaticControls(QtWidgets.QWidget):
     def set_stop_enabled(self, enabled):
         self.stopButton.setEnabled(bool(enabled))
 
+    # ── output mode (Append / Overwrite) ──
+    def write_mode(self):
+        """The current output mode string the writer expects."""
+        return 'Overwrite' if self.writeModeButton.isChecked() else 'Append'
+
+    def set_write_mode(self, mode):
+        """Set the toggle from a mode string (session restore / external sync).
+        Blocks signals so a programmatic set doesn't re-emit writeModeChanged."""
+        checked = str(mode) == 'Overwrite'
+        if self.writeModeButton.isChecked() != checked:
+            self.writeModeButton.blockSignals(True)
+            self.writeModeButton.setChecked(checked)
+            self.writeModeButton.blockSignals(False)
+        self.writeModeButton.setText('Overwrite' if checked else 'Append')
+
+    def _on_write_mode_toggled(self, checked):
+        self.writeModeButton.setText('Overwrite' if checked else 'Append')
+        self.writeModeChanged.emit(self.write_mode())
+
     # ── run-state gating (self-contained helper) ──
     def set_run_active(self, active):
         """During a run, lock mode/Batch/cores/Live; keep Stop and the action
@@ -173,7 +206,7 @@ class StaticControls(QtWidgets.QWidget):
         run-state path or the controls would be double-gated."""
         active = bool(active)
         for w in (self.modeCombo, self.batchButton, self.coresSpin,
-                  self.liveButton):
+                  self.liveButton, self.writeModeButton):
             w.setEnabled(not active)
         if active:
             self.stopButton.setEnabled(True)

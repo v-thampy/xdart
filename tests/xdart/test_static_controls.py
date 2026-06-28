@@ -24,7 +24,7 @@ def qapp():
 def test_action_phase_morph_cycles(qapp):
     c = StaticControls()
     c.set_action_phase('idle')
-    assert c.startButton.text() == 'Start'
+    assert c.startButton.text() == 'Run'
     assert c.startButton.property('runPhase') == 'idle'
     assert c.startButton.isEnabled()
 
@@ -42,7 +42,7 @@ def test_action_phase_morph_cycles(qapp):
     assert c.action_phase() == 'paused'
 
     c.set_action_phase('idle')                      # morph back to green
-    assert c.startButton.text() == 'Start'
+    assert c.startButton.text() == 'Run'
     assert c.startButton.property('runPhase') == 'idle'
 
 

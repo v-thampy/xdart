@@ -152,7 +152,7 @@ class nexusWrangler(wranglerWidget):
 
         # Buttons
         btn_layout = QtWidgets.QHBoxLayout()
-        self.startButton = QtWidgets.QPushButton('Start')
+        self.startButton = QtWidgets.QPushButton('Run')
         # N8: object names enable the dark-theme QSS to colour
         # these primary CTAs (green/red).  See xdart/gui/themes/dark.py.
         self.startButton.setObjectName('startButton')

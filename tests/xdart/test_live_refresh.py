@@ -5423,7 +5423,7 @@ def test_wrangler_enabled_run_end_reenables_mode_toggles():
     assert host.ui.frame.isVisible() is True
     assert host._integration_controls_enabled is True
     # Action button reset to green Start (idle).
-    assert host.ui.startButton.text() == "Start"
+    assert host.ui.startButton.text() == "Run"
     assert host.ui.startButton.property("runPhase") == "idle"
     assert host._run_phase == "idle"
 
@@ -5486,11 +5486,11 @@ def test_stop_during_pausing_ignores_late_sigpaused():
     imageWrangler._on_start_clicked(host)      # running
     imageWrangler._on_start_clicked(host)      # -> pause ('Pausing…')
     imageWrangler.stop(host)                   # Stop lands during 'Pausing…'
-    assert host.ui.startButton.text() == "Start"     # morphed back to green
+    assert host.ui.startButton.text() == "Run"     # morphed back to green
     assert host._run_phase == "idle"
 
     imageWrangler._on_paused(host)             # late queued sigPaused arrives
-    assert host.ui.startButton.text() == "Start"     # NOT flashed to 'Resume'
+    assert host.ui.startButton.text() == "Run"     # NOT flashed to 'Resume'
     assert host._run_phase == "idle"
 
 
