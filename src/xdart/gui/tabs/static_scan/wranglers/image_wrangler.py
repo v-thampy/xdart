@@ -268,16 +268,16 @@ class imageWrangler(wranglerWidget):
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
         header.resizeSection(0, 120)
         header.setMinimumSectionSize(40)
-        # Shallow indent so the grouped param names (Image File, Meta File, …)
-        # sit close under the top-level Save Path row instead of stepping far
-        # right, and Save Path itself sits nearer the left edge — both free up
-        # width for the path/value boxes.  The group chevrons need this column,
-        # so it can't go to 0 (the names land just shy of exact alignment with
-        # Save Path, which is a top-level row).  The name-column width (84) is
-        # unchanged, so the value boxes stay put as the names shift left.  At
-        # this point the group chevron column is very narrow; going lower starts
-        # to crowd it.
-        self.tree.setIndentation(3)
+        # The group expand/collapse chevrons live in the indentation column;
+        # the old shallow indent (3px) squeezed them to near-invisibility ("the
+        # arrows are barely visible").  Widen it so the chevron has room, and
+        # turn on root decoration so the top-level group rows draw a branch
+        # arrow that the theme replaces with a clear, high-contrast triangle
+        # (themes/dark: QTreeView#WranglerTree::branch images).  The field-name
+        # column shifts right by the extra indent but the value boxes are still
+        # comfortably wide.
+        self.tree.setIndentation(16)
+        self.tree.setRootIsDecorated(True)
         # Hide the "Parameter / Value" header bar — it's just visual noise above
         # the wrangler tree.  Column sizing above still applies (the header is
         # hidden, not removed).
@@ -1615,7 +1615,7 @@ class imageWrangler(wranglerWidget):
         """
         fname, _ = QFileDialog().getOpenFileName(
             dir=self._browse_dir(self.mask_file),
-            filter="EDF (*.edf)"
+            filter="Mask files (*.edf *.npy);;EDF (*.edf);;NumPy (*.npy)"
         )
         if fname != '':
             self.parameters.child('Signal').child('mask_file').setValue(fname)

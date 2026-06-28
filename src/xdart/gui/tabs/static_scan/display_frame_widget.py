@@ -837,12 +837,26 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         displayFrameWidget._fit_button_width(self._showImageBtn)
         self._showImageBtn.setToolTip('Show raw image preview for selected frame')
         self._showImageBtn.setFocusPolicy(pyQt.StrongFocus)
-        # Rebuild the right cluster in its final order: Raw | colormap | Log
-        # (Log at the right corner in every mode).
+        # The colormap selector ("Default") and the Log scale toggle are always
+        # shown together, so group them into one segmented pill (shared border,
+        # a hairline divider between, flush edges).  Raw stays a separate button
+        # to the left of the pill.
+        self._scaleGroup = QtWidgets.QFrame()
+        self._scaleGroup.setObjectName('displayScaleGroup')
+        _sg = QtWidgets.QHBoxLayout(self._scaleGroup)
+        _sg.setContentsMargins(0, 0, 0, 0)
+        _sg.setSpacing(0)
+        _scale_div = QtWidgets.QFrame()
+        _scale_div.setObjectName('displayScaleDivider')
+        _scale_div.setFrameShape(QtWidgets.QFrame.VLine)
+        _sg.addWidget(self.ui.cmap)
+        _sg.addWidget(_scale_div)
+        _sg.addWidget(self._logBtn)
+        # Rebuild the right cluster in its final order: Raw | [colormap ┊ Log].
         _l9 = self.ui.horizontalLayout_9
         while _l9.count():
             _l9.takeAt(0)
-        for _w in (self._showImageBtn, self.ui.cmap, self._logBtn):
+        for _w in (self._showImageBtn, self._scaleGroup):
             _l9.addWidget(_w)
             _l9.setAlignment(_w, pyQt.AlignVCenter)
         _l9.setSpacing(8)

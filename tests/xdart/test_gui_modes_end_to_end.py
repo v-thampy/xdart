@@ -404,9 +404,11 @@ def test_metadata_popup_and_tools_placeholder(widget):
     assert hasattr(w.h5viewer.ui, "metadata_btn")
     # Tools placeholder occupies metaFrame (the table is no longer inline there).
     assert w.ui.metaFrame.findChild(QtWidgets.QFrame, "toolsPlaceholder") is not None
-    labels = {l.text() for l in w.ui.metaFrame.findChildren(QtWidgets.QLabel)
-              if l.objectName() == "toolLabel"}
-    assert {"Peak Fitting", "Phase Fitting", "Plot Metadata"} <= labels
+    # Each tool is now a button labelled with the tool name (the descriptive note
+    # was dropped; the hover tooltip carries the description).
+    btn_texts = {b.text() for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
+                 if b.objectName() == "toolButton"}
+    assert {"Peak Fitting", "Phase Fitting", "Plot Metadata"} <= btn_texts
     # Opening the popup reparents the live metawidget into a non-modal dialog.
     assert w._metadata_dialog is None
     w._open_metadata_dialog()
@@ -497,9 +499,10 @@ def test_peak_fit_tool_wired_in_static_widget(widget):
     staticWidget can build the dialog (lazy, non-modal)."""
     from PySide6 import QtWidgets
     w = widget
-    opens = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
-             if b.objectName() == "toolOpen"]
-    assert len(opens) == 3                 # Peak + Phase + Scan Plot active
+    tools = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
+             if b.objectName() == "toolButton"]
+    assert len(tools) == 3                 # Peak + Phase + Scan Plot active
+    assert all(b.isEnabled() for b in tools)
     assert w._peak_fit_dialog is None
     w._open_peak_fit_dialog()
     assert w._peak_fit_dialog is not None and not w._peak_fit_dialog.isModal()
@@ -707,9 +710,9 @@ def test_phase_fit_tool_wired_in_static_widget(widget):
     lazily + non-modal and shares the batch machinery."""
     from PySide6 import QtWidgets
     w = widget
-    opens = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
-             if b.objectName() == "toolOpen"]
-    assert len(opens) == 3
+    tools = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
+             if b.objectName() == "toolButton"]
+    assert len(tools) == 3
     assert w._phase_fit_dialog is None
     w._open_phase_fit_dialog()
     assert w._phase_fit_dialog is not None and not w._phase_fit_dialog.isModal()
@@ -817,9 +820,9 @@ def test_scan_plot_tool_wired_in_static_widget(widget):
     non-modal."""
     from PySide6 import QtWidgets
     w = widget
-    opens = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
-             if b.objectName() == "toolOpen"]
-    assert len(opens) == 3
+    tools = [b for b in w.ui.metaFrame.findChildren(QtWidgets.QPushButton)
+             if b.objectName() == "toolButton"]
+    assert len(tools) == 3
     assert w._scan_plot_dialog is None
     w._open_scan_plot_dialog()
     assert w._scan_plot_dialog is not None and not w._scan_plot_dialog.isModal()

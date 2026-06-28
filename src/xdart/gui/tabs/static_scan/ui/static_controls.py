@@ -114,34 +114,40 @@ class StaticControls(QtWidgets.QWidget):
         row2.setSpacing(6)
         outer.addWidget(self.actionRow)
 
-        self.liveButton = QtWidgets.QPushButton('Live')
-        self.liveButton.setObjectName('liveCheckBox')
-        self.liveButton.setCheckable(True)
-        self.liveButton.setMaximumWidth(140)
-        row2.addWidget(self.liveButton)
-
-        # Output mode (Append vs Overwrite): a run/output property — it lives with
-        # the run controls now, not in the data wrangler.  A checkable button that
-        # reads its current state; Overwrite is destructive, shown right next to
-        # Run so it's visible at the moment of triggering a run.  Default Append.
-        self.writeModeButton = QtWidgets.QPushButton('Append')
-        self.writeModeButton.setObjectName('writeModeButton')
-        self.writeModeButton.setCheckable(True)
-        self.writeModeButton.setChecked(False)            # Append
-        self.writeModeButton.setMaximumWidth(110)
-        row2.addWidget(self.writeModeButton)
-
+        # Row order: Run · Stop · Append · Live.  Run is the prominent primary
+        # action (stretch=1 so it absorbs the row's slack); Stop / Append / Live
+        # are secondary and kept narrow.
         self.startButton = QtWidgets.QPushButton('Run')
         # objectName 'startButton' + the runPhase property are what the dark
         # theme keys the green/orange Run/Pause styling on.
         self.startButton.setObjectName('startButton')
         self.startButton.setProperty('runPhase', 'idle')
-        row2.addWidget(self.startButton)
+        row2.addWidget(self.startButton, 1)
 
         self.stopButton = QtWidgets.QPushButton('Stop')
         self.stopButton.setObjectName('stopButton')
         self.stopButton.setEnabled(False)
+        self.stopButton.setMaximumWidth(72)
         row2.addWidget(self.stopButton)
+
+        # Output mode (Append vs Replace): a run/output property — it lives with
+        # the run controls now, not in the data wrangler.  A checkable button that
+        # reads its current state; Replace (== writer 'Overwrite') is destructive,
+        # shown next to Run so it's visible at the moment of triggering a run.
+        # Default Append.  The displayed label is 'Append'/'Replace'; the value
+        # string the writer expects stays 'Append'/'Overwrite' (see write_mode).
+        self.writeModeButton = QtWidgets.QPushButton('Append')
+        self.writeModeButton.setObjectName('writeModeButton')
+        self.writeModeButton.setCheckable(True)
+        self.writeModeButton.setChecked(False)            # Append
+        self.writeModeButton.setMaximumWidth(82)
+        row2.addWidget(self.writeModeButton)
+
+        self.liveButton = QtWidgets.QPushButton('Live')
+        self.liveButton.setObjectName('liveCheckBox')
+        self.liveButton.setCheckable(True)
+        self.liveButton.setMaximumWidth(72)
+        row2.addWidget(self.liveButton)
 
         self._run_phase = 'idle'
 
@@ -175,6 +181,8 @@ class StaticControls(QtWidgets.QWidget):
         self.stopButton.setEnabled(bool(enabled))
 
     # ── output mode (Append / Overwrite) ──
+    # The button DISPLAYS 'Append'/'Replace'; the VALUE the writer compares
+    # against stays 'Append'/'Overwrite' (write_mode).  Keep the two apart.
     def write_mode(self):
         """The current output mode string the writer expects."""
         return 'Overwrite' if self.writeModeButton.isChecked() else 'Append'
@@ -187,10 +195,10 @@ class StaticControls(QtWidgets.QWidget):
             self.writeModeButton.blockSignals(True)
             self.writeModeButton.setChecked(checked)
             self.writeModeButton.blockSignals(False)
-        self.writeModeButton.setText('Overwrite' if checked else 'Append')
+        self.writeModeButton.setText('Replace' if checked else 'Append')
 
     def _on_write_mode_toggled(self, checked):
-        self.writeModeButton.setText('Overwrite' if checked else 'Append')
+        self.writeModeButton.setText('Replace' if checked else 'Append')
         self.writeModeChanged.emit(self.write_mode())
 
     # ── run-state gating (self-contained helper) ──

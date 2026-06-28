@@ -464,10 +464,9 @@ class H5Viewer(QWidget):
         self.ui.refresh = QtWidgets.QPushButton('Refresh')
         self.ui.refresh.setObjectName('refresh')
         self.ui.refresh.setMaximumSize(QtCore.QSize(16777215, 25))
-        # Refresh is placed on the RIGHT of the File/Config toolbar (the header
-        # row) in _init_toolbar — the row-0 frame is occupied by that toolbar, so
-        # it can't host the header.  The bottom row below holds Show All / Auto
-        # Last / Metadata.
+        # Refresh is placed on the RIGHT of the DATA BROWSER header row (built in
+        # _init_toolbar, below the File/Config toolbar).  The bottom row below the
+        # lists holds Show All / Auto Last / Metadata.
 
         # Bottom button row: Show All / Auto Last / Metadata (Refresh removed).
         btn_row = QtWidgets.QWidget()
@@ -549,28 +548,45 @@ class H5Viewer(QWidget):
         self.fileMenu.addAction(self.actionSaveDataAs)
         self.fileMenu.addMenu(self.exportMenu)
 
-        # Toolbar buttons
+        # Toolbar buttons.  objectName'd so the theme can suppress the oversized
+        # QToolButton menu-indicator arrow (themes/dark.py).
         self.fileButton = QtWidgets.QToolButton()
+        self.fileButton.setObjectName('fileMenuButton')
         self.fileButton.setText('File')
         self.fileButton.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.fileButton.setMenu(self.fileMenu)
         self.paramButton = QtWidgets.QToolButton()
+        self.paramButton.setObjectName('configMenuButton')
         self.paramButton.setText('Config')
         self.paramButton.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.paramButton.setMenu(self.paramMenu)
 
         self.toolbar.addWidget(self.fileButton)
         self.toolbar.addWidget(self.paramButton)
-        # Refresh sits on the RIGHT of this header toolbar (per the redesign): a
-        # stretch spacer pushes it to the trailing edge.  (refresh is created in
-        # _add_refresh_button, which runs before _init_toolbar.)
-        spacer = QtWidgets.QWidget()
-        spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
-                             QtWidgets.QSizePolicy.Policy.Preferred)
-        self.toolbar.addWidget(spacer)
+
+        # DATA BROWSER header row, sitting just BELOW the File/Config toolbar: a
+        # section title on the left, Refresh on the right.  Stacked with the
+        # toolbar inside one wrapper so the pair occupies grid row 0 together
+        # (no renumbering of the Scans/Data labels + lists below).
+        self.dataBrowserBar = QtWidgets.QFrame()
+        self.dataBrowserBar.setObjectName('dataBrowserBar')
+        _db = QtWidgets.QHBoxLayout(self.dataBrowserBar)
+        _db.setContentsMargins(2, 0, 0, 0)
+        _db.setSpacing(6)
+        self.dataBrowserHeader = QtWidgets.QLabel('DATA BROWSER')
+        self.dataBrowserHeader.setObjectName('dataBrowserHeader')
+        _db.addWidget(self.dataBrowserHeader)
+        _db.addStretch(1)
         if hasattr(self.ui, 'refresh'):
-            self.toolbar.addWidget(self.ui.refresh)
-        self.layout.addWidget(self.toolbar, 0, 0, 1, 2)
+            _db.addWidget(self.ui.refresh)
+
+        header = QtWidgets.QWidget()
+        _hdr = QtWidgets.QVBoxLayout(header)
+        _hdr.setContentsMargins(0, 0, 0, 0)
+        _hdr.setSpacing(2)
+        _hdr.addWidget(self.toolbar)
+        _hdr.addWidget(self.dataBrowserBar)
+        self.layout.addWidget(header, 0, 0, 1, 2)
 
     def _connect_signals(self):
         """Wire signal/slot connections for list widgets and menu actions."""

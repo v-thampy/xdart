@@ -161,6 +161,15 @@ QFrame, QGroupBox {
     border: 1px solid $field_border;
     border-radius: 8px;
 }
+/* QLabel subclasses QFrame, so the blanket border above boxes EVERY text label
+   (most visibly 'Pts'/'Motor' on the decluttered integrator rows).  Labels are
+   text, not cards — strip the box + panel tint.  The more-derived QLabel type
+   selector outranks the QFrame rule; ID-targeted label styles (the blue browse
+   pills #label1D/#label2D, the tool chip) set their own fill and keep it. */
+QLabel {
+    border: none;
+    background: transparent;
+}
 /* Display top bar: ONE continuous bar -- the cluster/title containers and
    the title label are borderless + transparent so only frame_top's panel
    shows (the buttons inside keep their own styling).  setFrameShape can't
@@ -324,6 +333,13 @@ QToolButton:hover {
 }
 QToolButton:pressed, QToolButton:checked {
     background-color: $field_border;
+}
+/* File / Config open their menu on click (InstantPopup) — the oversized
+   down-arrow menu-indicator is redundant noise, so drop it entirely. */
+QToolButton#fileMenuButton::menu-indicator,
+QToolButton#configMenuButton::menu-indicator {
+    image: none;
+    width: 0px;
 }
 
 /* Checkable *toggle* buttons (Live, Batch, Auto, Legend, Share Axis,
@@ -523,23 +539,24 @@ QFrame#toolsPlaceholder {
     border: 1px dashed $field_border;
     border-radius: 7px;
 }
-QFrame#toolDot {
-    background-color: $accent;
-    border: none;
-    border-radius: 3px;
-}
-QLabel#toolLabel {
-    color: $text_2;
+/* Each tool is now a full-width button labelled with the tool name (tooltip
+   carries the description).  Left-aligned text reads as a menu of tools; hover
+   tints with the accent. */
+QPushButton#toolButton {
+    background-color: $field;
+    color: $text;
+    border: 1px solid $field_border;
+    border-radius: 5px;
+    padding: 4px 10px;
+    text-align: left;
     font-weight: 600;
 }
-QLabel#toolChip {
+QPushButton#toolButton:hover {
     background-color: $accent_muted;
+    border-color: $accent;
     color: $accent_text;
-    border-radius: 4px;
-    padding: 1px 6px;
-    font-family: "IBM Plex Mono", Menlo, Consolas, monospace;
 }
-QLabel#toolsNote {
+QPushButton#toolButton:disabled {
     color: $text_muted;
 }
 /* Active-tool "Open" affordance + the Peak Fitting popup's primary Fit button. */
@@ -557,6 +574,34 @@ QPushButton#toolOpen:hover, QPushButton#peakFitGo:hover {
 }
 QLabel#peakFitStatus {
     color: $text_muted;
+}
+
+/* Segmented "colormap | Log" pill on the display top bar — the colormap
+   selector and the Log scale toggle read as one unit.  The container owns the
+   rounded border; the inner combo/button go borderless and square, with the
+   end caps rounded to match and a hairline divider between them. */
+QFrame#displayScaleGroup {
+    border: 1px solid $field_border;
+    border-radius: 6px;
+    background-color: $field;
+}
+QFrame#displayScaleGroup QComboBox {
+    border: none;
+    border-top-left-radius: 5px;
+    border-bottom-left-radius: 5px;
+    border-top-right-radius: 0px;
+    border-bottom-right-radius: 0px;
+}
+QFrame#displayScaleGroup QPushButton {
+    border: none;
+    border-top-right-radius: 5px;
+    border-bottom-right-radius: 5px;
+    border-top-left-radius: 0px;
+    border-bottom-left-radius: 0px;
+}
+QFrame#displayScaleDivider {
+    color: $field_border;
+    max-width: 1px;
 }
 
 /* ── Tabs ──────────────────────────────────────────────────────── */
@@ -657,6 +702,68 @@ QToolTip {
 }"""
 
 
+_ARROW_CACHE = {}
+
+
+def _arrow_icon_paths(color_hex):
+    """Generate (right ▶, down ▼) expand/collapse triangle PNGs filled with
+    ``color_hex``, cached on disk; return ``(right_url, down_url)`` as
+    forward-slash file paths for QSS ``image: url(...)``.
+
+    Qt cannot recolour a QTreeView's default branch arrow through QSS without
+    an image, and the default mid-grey arrow is barely visible on the wrangler's
+    tinted group-header band.  We paint our own in the theme's text colour so the
+    affordance reads clearly.  Returns ``(None, None)`` when there is no live
+    QApplication (e.g. import-time ``render_qss``) — the caller then leaves the
+    style's default arrows in place rather than crash."""
+    if color_hex in _ARROW_CACHE:
+        return _ARROW_CACHE[color_hex]
+    try:
+        from pyqtgraph.Qt import QtGui, QtCore, QtWidgets
+        if QtWidgets.QApplication.instance() is None:
+            return (None, None)
+    except Exception:  # pragma: no cover - Qt missing
+        return (None, None)
+    import os
+    import tempfile
+    out_dir = os.path.join(tempfile.gettempdir(), "xdart_theme_icons")
+    os.makedirs(out_dir, exist_ok=True)
+    safe = color_hex.lstrip("#")
+    shapes = {
+        "right": [(4.0, 2.5), (9.5, 6.5), (4.0, 10.5)],
+        "down":  [(2.5, 4.0), (10.5, 4.0), (6.5, 9.5)],
+    }
+    out = {}
+    for name, pts in shapes.items():
+        fp = os.path.join(out_dir, f"arrow_{name}_{safe}.png")
+        if not os.path.exists(fp):
+            pm = QtGui.QPixmap(13, 13)
+            pm.fill(QtCore.Qt.transparent)
+            painter = QtGui.QPainter(pm)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(color_hex))
+            painter.drawPolygon(
+                QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in pts]))
+            painter.end()
+            pm.save(fp, "PNG")
+        out[name] = fp.replace("\\", "/")
+    res = (out["right"], out["down"])
+    _ARROW_CACHE[color_hex] = res
+    return res
+
+
+def _branch_qss(right_url, down_url):
+    """QSS giving the wrangler tree visible themed expand/collapse arrows."""
+    return (
+        "\nQTreeView#WranglerTree::branch:has-children:closed,"
+        "\nQTreeView#WranglerTree::branch:closed:has-children:has-siblings {"
+        f'\n    image: url("{right_url}"); }}'
+        "\nQTreeView#WranglerTree::branch:has-children:open,"
+        "\nQTreeView#WranglerTree::branch:open:has-children:has-siblings {"
+        f'\n    image: url("{down_url}"); }}\n')
+
+
 def render_qss(name="dark"):
     """Render the QSS for theme ``name`` ("dark"/"light")."""
     base, is_light = _THEMES.get(name, _THEMES["dark"])
@@ -669,6 +776,13 @@ def apply_theme(app, name="dark") -> None:
 
     Must run before pyqtgraph plot widgets are constructed."""
     qss = render_qss(name)
+    # Visible, themed expand/collapse arrows for the wrangler ParameterTree.
+    # Generated lazily (needs a live QApplication) and appended here rather than
+    # in render_qss so the import-time DARK_QSS render stays Qt-free.
+    base, is_light = _THEMES.get(name, _THEMES["dark"])
+    right_url, down_url = _arrow_icon_paths(_resolve(base, is_light=is_light)["text"])
+    if right_url and down_url:
+        qss += _branch_qss(right_url, down_url)
     import sys as _sys
     if _sys.platform == "win32":
         qss += ("\nQPushButton#pyfai_calib, QPushButton#get_mask "

@@ -290,3 +290,38 @@ def test_load_image_frame_reads_raw_master(raw_master):
     nxs, raw = raw_master
     img = load_image_frame(nxs, 2)
     np.testing.assert_allclose(img, raw[2])
+
+
+# ── .npy reading (mask files; fabio can't open these) ─────────────────
+
+def test_read_image_npy_2d(tmp_path):
+    """read_image loads a saved 2-D .npy array directly — the path a .npy mask
+    file takes (fabio cannot open .npy)."""
+    from xrd_tools.io.image import read_image
+    arr = np.array([[0, 1], [2, 0]], dtype=np.int32)
+    p = tmp_path / "mask.npy"
+    np.save(p, arr)
+    out = read_image(p)
+    assert out.shape == (2, 2)
+    np.testing.assert_array_equal(out, arr.astype(float))
+
+
+def test_read_image_npy_stack_indexes_frame(tmp_path):
+    """A stacked (>2-D) .npy is indexed by ``frame``."""
+    from xrd_tools.io.image import read_image
+    stack = np.arange(2 * 3 * 4, dtype=np.int32).reshape(2, 3, 4)
+    p = tmp_path / "stack.npy"
+    np.save(p, stack)
+    np.testing.assert_array_equal(read_image(p, frame=1), stack[1].astype(float))
+
+
+def test_load_mask_npy_roundtrip(tmp_path):
+    """A boolean .npy mask round-trips through load_mask (the GUI mask path:
+    str_browse value -> read_image -> bool)."""
+    from xrd_tools.io.image import load_mask
+    mask = np.array([[True, False], [False, True]])
+    p = tmp_path / "m.npy"
+    np.save(p, mask)
+    out = load_mask(p)
+    assert out.dtype == bool
+    np.testing.assert_array_equal(out, mask)

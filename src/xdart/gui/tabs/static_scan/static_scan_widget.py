@@ -405,6 +405,15 @@ class staticWidget(QWidget):
                 self.ui.mainSplitter.setSizes(
                     [int(total * f) for f in (0.19, 0.606, 0.204)])
                 self.ui.mainSplitter.setStretchFactor(1, 1)
+                # Left column: the Tools card is now a compact 3-button panel, so
+                # give it only a small share (~18%) and let the data browser take
+                # the rest.  Stretch so a window resize grows the browser, not
+                # Tools.
+                ltotal = sum(self.ui.leftSplitter.sizes()) or 600
+                self.ui.leftSplitter.setSizes(
+                    [int(ltotal * 0.82), int(ltotal * 0.18)])
+                self.ui.leftSplitter.setStretchFactor(0, 1)
+                self.ui.leftSplitter.setStretchFactor(1, 0)
             except Exception:
                 logger.debug("mainSplitter default sizing failed",
                              exc_info=True)
@@ -510,14 +519,16 @@ class staticWidget(QWidget):
         self._build_tools_placeholder()
 
     def _build_tools_placeholder(self):
-        """Fill the vacated bottom-left ``metaFrame`` with the 'Tools' card.
+        """Fill the vacated bottom-left ``metaFrame`` with the compact 'Tools' card.
 
-        Reclaims the corner freed by moving the metadata table into a popup.
-        Active tools get an 'Open' button; not-yet-built ones show a disabled
-        PLANNED chip.  Peak Fitting is wired (``_open_peak_fit_dialog``)."""
+        Each tool is a full-width button labelled with the tool name; the hover
+        tooltip carries the description (the old dot+label+Open rows and the
+        wrapped note below took too much vertical space).  Clicking opens the
+        tool's dialog.  Reclaims the corner freed by moving the metadata table
+        into a popup."""
         lay = QtWidgets.QVBoxLayout(self.ui.metaFrame)
-        lay.setContentsMargins(13, 11, 13, 13)
-        lay.setSpacing(8)
+        lay.setContentsMargins(13, 9, 13, 10)
+        lay.setSpacing(6)
 
         header = QtWidgets.QLabel('TOOLS')
         header.setObjectName('toolsHeader')
@@ -526,46 +537,28 @@ class staticWidget(QWidget):
         card = QtWidgets.QFrame()
         card.setObjectName('toolsPlaceholder')
         card_lay = QtWidgets.QVBoxLayout(card)
-        card_lay.setContentsMargins(11, 11, 11, 11)
-        card_lay.setSpacing(8)
-        # (label, handler-or-None).  Handler => active tool with an Open button.
+        card_lay.setContentsMargins(9, 9, 9, 9)
+        card_lay.setSpacing(6)
+        # (label, handler-or-None, tooltip).  Handler => active tool; the button
+        # opens it.  A None handler is a not-yet-built tool (button disabled).
         tools = [
-            ('Peak Fitting', self._open_peak_fit_dialog),
-            ('Phase Fitting', self._open_phase_fit_dialog),
-            ('Plot Metadata', self._open_scan_plot_dialog),
+            ('Peak Fitting', self._open_peak_fit_dialog,
+             'Structure-agnostic peak fitting — selected frame and across the scan.'),
+            ('Phase Fitting', self._open_phase_fit_dialog,
+             'CIF-based phase fitting — selected frame and across the scan.'),
+            ('Plot Metadata', self._open_scan_plot_dialog,
+             'Plot scan metadata + image-ROI statistics vs frame.'),
         ]
-        for name, handler in tools:
-            row = QtWidgets.QWidget()
-            row_lay = QtWidgets.QHBoxLayout(row)
-            row_lay.setContentsMargins(0, 0, 0, 0)
-            row_lay.setSpacing(8)
-            dot = QtWidgets.QFrame()
-            dot.setObjectName('toolDot')
-            dot.setFixedSize(7, 7)
-            label = QtWidgets.QLabel(name)
-            label.setObjectName('toolLabel')
-            row_lay.addWidget(dot)
-            row_lay.addWidget(label)
-            row_lay.addStretch(1)
+        for name, handler, tip in tools:
+            btn = QtWidgets.QPushButton(name)
+            btn.setObjectName('toolButton')
+            btn.setToolTip(tip)
             if handler is not None:
-                open_btn = QtWidgets.QPushButton('Open')
-                open_btn.setObjectName('toolOpen')
-                open_btn.clicked.connect(handler)
-                row_lay.addWidget(open_btn)
+                btn.clicked.connect(handler)
             else:
-                chip = QtWidgets.QLabel('PLANNED')
-                chip.setObjectName('toolChip')
-                row_lay.addWidget(chip)
-                row.setEnabled(False)      # reads as inactive (D2 disabled styling)
-            card_lay.addWidget(row)
+                btn.setEnabled(False)
+            card_lay.addWidget(btn)
         lay.addWidget(card)
-
-        note = QtWidgets.QLabel(
-            'Peak Fitting (structure-agnostic) and Phase Fitting (CIF-based) work '
-            'on the selected frame and across the scan. Plot Metadata is planned.')
-        note.setObjectName('toolsNote')
-        note.setWordWrap(True)
-        lay.addWidget(note)
         lay.addStretch(1)
 
     def _pattern_for_frame(self, idx):
