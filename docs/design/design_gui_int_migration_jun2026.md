@@ -195,3 +195,24 @@ signals during restore, as today); the PONI progressive-disclosure gate; session
 - Where does the read-only "loaded calibration / loaded-from-file" summary live — inline in 2b, or a
   status strip?
 - Does section 3 *disable* (grey) or *hide* until PONI loaded? (Disable keeps the layout stable.)
+
+---
+
+## Tier-B note: redo the wrangler grouping + disclosure here (added Jun 2026, post live-test)
+
+A **tactical** regroup landed on the live ParameterTree wrangler (`image_wrangler.py`, commit
+`8704678`): PROJECT = Folder + Save Path, DATA leads with **Poni**, the standalone CALIBRATION group
+is gone, and the N1 progressive disclosure was **collapsed from three stages to two** (Project always
+→ whole DATA reveals once a folder is set) *because the PONI picker now lives inside DATA and so can
+no longer be its own reveal stage*. That staging conflict is a symptom of the ParameterTree forcing
+group-granular show/hide. **In the custom-card migration, redo this properly:**
+
+- Cards are `QFrame#card`s, so grouping is free layout — **Poni is just the first field row of the
+  DATA card**, no group/path gymnastics, and Save Path is a Project-card row.
+- Disclosure becomes **per-field/per-card enable or reveal** driven by the value model, not
+  group-tree show/hide — so a guided "folder → calibration → data" flow (or any other) is expressible
+  *without* the deadlock that forced the 2-stage collapse. Decide the flow at design time, not around
+  a tree constraint.
+- **Write Mode moves to the Controls strip** (run/output property, not a data input); the DATA card
+  holds only data inputs.
+- Mirror all of this for the **NeXus wrangler** (still on the old Calibration/Output grouping).
