@@ -464,19 +464,10 @@ class H5Viewer(QWidget):
         self.ui.refresh = QtWidgets.QPushButton('Refresh')
         self.ui.refresh.setObjectName('refresh')
         self.ui.refresh.setMaximumSize(QtCore.QSize(16777215, 25))
-
-        # Header row (the previously-empty row-0 frame): "Data Browser" label on
-        # the left, Refresh on the right.
-        self.ui.frame.setObjectName('dataBrowserBar')
-        self.ui.frame.setMaximumSize(QtCore.QSize(16777215, 30))
-        hdr = QtWidgets.QHBoxLayout(self.ui.frame)
-        hdr.setContentsMargins(2, 0, 2, 0)
-        hdr.setSpacing(6)
-        browser_label = QtWidgets.QLabel('Data Browser')
-        browser_label.setObjectName('dataBrowserHeader')
-        hdr.addWidget(browser_label)
-        hdr.addStretch(1)
-        hdr.addWidget(self.ui.refresh)
+        # Refresh is placed on the RIGHT of the File/Config toolbar (the header
+        # row) in _init_toolbar — the row-0 frame is occupied by that toolbar, so
+        # it can't host the header.  The bottom row below holds Show All / Auto
+        # Last / Metadata.
 
         # Bottom button row: Show All / Auto Last / Metadata (Refresh removed).
         btn_row = QtWidgets.QWidget()
@@ -570,6 +561,15 @@ class H5Viewer(QWidget):
 
         self.toolbar.addWidget(self.fileButton)
         self.toolbar.addWidget(self.paramButton)
+        # Refresh sits on the RIGHT of this header toolbar (per the redesign): a
+        # stretch spacer pushes it to the trailing edge.  (refresh is created in
+        # _add_refresh_button, which runs before _init_toolbar.)
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                             QtWidgets.QSizePolicy.Policy.Preferred)
+        self.toolbar.addWidget(spacer)
+        if hasattr(self.ui, 'refresh'):
+            self.toolbar.addWidget(self.ui.refresh)
         self.layout.addWidget(self.toolbar, 0, 0, 1, 2)
 
     def _connect_signals(self):

@@ -302,6 +302,30 @@ QPushButton:disabled {
     color: $text_muted;
 }
 
+/* The Data Browser header toolbar (File / Config menus + Refresh). Untyped
+   QToolBar/QToolButton fall back to Qt's native (dark) chrome — which read wrong
+   under the Light palette. Theme them from the tokens so they track the palette. */
+QToolBar {
+    background-color: $panel;
+    border: none;
+    spacing: 5px;
+    padding: 2px 4px;
+}
+QToolButton {
+    background-color: $field;
+    color: $text;
+    border: 1px solid $field_border;
+    border-radius: 6px;
+    padding: 3px 9px;
+}
+QToolButton:hover {
+    background-color: $field_border;
+    border-color: $text_muted;
+}
+QToolButton:pressed, QToolButton:checked {
+    background-color: $field_border;
+}
+
 /* Checkable *toggle* buttons (Live, Batch, Auto, Legend, Share Axis,
    X Range, …) — fill with the purple accent when active so the on/off
    state is obvious.  ``:checked`` only matches checkable buttons, so
@@ -468,9 +492,12 @@ QFrame#frame2D_header, QFrame#frame2D_range {
     border: none;
     background-color: transparent;
 }
+/* The 1-D/2-D tags are IDENTIFIERS, not controls — give them the blue 'browse'
+   hue so they read distinctly from the purple accent toggle buttons (Auto, Live,
+   the active unit pills) they sit next to. */
 QLabel#label1D, QLabel#label2D {
-    background-color: $accent;
-    color: $accent_on_text;
+    background-color: $browse;
+    color: $browse_text;
     border-radius: 4px;
     font-weight: 700;
 }
@@ -478,7 +505,7 @@ QLabel#label1D, QLabel#label2D {
    run) the pill must dim with the rest of the card — the ID selector outranks
    the generic QLabel:disabled rule, so it needs its own :disabled variant. */
 QLabel#label1D:disabled, QLabel#label2D:disabled {
-    background-color: $accent_muted;
+    background-color: $browse_muted;
     color: $text_muted;
 }
 
