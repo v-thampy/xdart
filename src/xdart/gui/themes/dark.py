@@ -180,6 +180,16 @@ QLabel#dataBrowserHeader {
     color: $text_muted;
     padding-left: 2px;
 }
+/* Integrator inner rows are layout containers, not cards. Keep frame1D / frame2D
+   (StyledPanel) as the bordered sub-cards, but make the header / range / button
+   rows inside them transparent — otherwise the blanket QFrame border boxes every
+   row, putting a field-box around 'Pts', the unit dropdowns, and the range
+   fields. Declutters to the clean nested-card look of the mockup. */
+QFrame#frame1D_header, QFrame#frame1D_range, QFrame#frame1D_buttons,
+QFrame#frame2D_header, QFrame#frame2D_range, QFrame#frame2D_buttons {
+    border: none;
+    background: transparent;
+}
 QGroupBox {
     margin-top: 8px;
     padding-top: 8px;
