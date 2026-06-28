@@ -159,7 +159,7 @@ QMainWindow, QDialog {
 QFrame, QGroupBox {
     background-color: $panel;
     border: 1px solid $field_border;
-    border-radius: 4px;
+    border-radius: 8px;
 }
 /* Display top bar: ONE continuous bar -- the cluster/title containers and
    the title label are borderless + transparent so only frame_top's panel
@@ -185,7 +185,7 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QPlainTextEdit {
     background-color: $field;
     color: $text;
     border: 1px solid $field_border;
-    border-radius: 3px;
+    border-radius: 5px;
     padding: 2px 4px;
     selection-background-color: $field_border;
 }
@@ -214,7 +214,7 @@ QPushButton#BrowseButton {
     background-color: $browse;
     color: $browse_text;
     border: 1px solid $browse_border;
-    border-radius: 3px;
+    border-radius: 6px;
     padding: 1px 6px;
 }
 QPushButton#BrowseButton:hover {
@@ -266,7 +266,7 @@ QPushButton {
     background-color: $field;
     color: $text;
     border: 1px solid $field_border;
-    border-radius: 3px;
+    border-radius: 6px;
     padding: 4px 12px;
 }
 QPushButton:hover {
