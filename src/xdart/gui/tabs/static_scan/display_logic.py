@@ -1471,6 +1471,53 @@ def build_payload(state, store=None):
                           cake_image=cake, plot=plot)
 
 
+def stitch_plot_payload(result):
+    """``IntegrationResult1D`` (a stitched 1-D pattern) → ``PlotPayload``.
+
+    Pure / Qt-free.  Returns ``None`` for a missing/empty/all-NaN result so the
+    caller skips drawing.  One ``data`` trace; the x-axis label/unit come from
+    the result's pyFAI unit string (the same mapping the integration view uses).
+    """
+    if result is None:
+        return None
+    radial = np.asarray(getattr(result, "radial", None), dtype=float)
+    inten = np.asarray(getattr(result, "intensity", None), dtype=float)
+    if radial.size == 0 or inten.size == 0 or not np.isfinite(inten).any():
+        return None
+    unit = getattr(result, "unit", "q_A^-1") or "q_A^-1"
+    label, _sym = x_axis_for_unit(unit)
+    return PlotPayload(
+        axis_x=Axis(label=label, unit=unit, values=radial),
+        traces=(Trace(label="Stitch", x=radial, y=inten),),
+    )
+
+
+def stitch_image_payload(result):
+    """``IntegrationResult2D`` (a stitched cake) → ``ImagePayload``.
+
+    Pure / Qt-free.  ``intensity`` is ``(len(radial), len(azimuthal))``; the
+    image-draw delegate transposes ``payload.image`` (rows=y, cols=x), so we
+    store ``intensity.T`` with x=radial, y=azimuthal — matching the integration
+    cake's orientation.  Returns ``None`` for a missing/empty/all-NaN result.
+    """
+    if result is None:
+        return None
+    radial = np.asarray(getattr(result, "radial", None), dtype=float)
+    azim = np.asarray(getattr(result, "azimuthal", None), dtype=float)
+    inten = np.asarray(getattr(result, "intensity", None), dtype=float)
+    if inten.ndim != 2 or inten.size == 0 or not np.isfinite(inten).any():
+        return None
+    r_unit = getattr(result, "unit", "q_A^-1") or "q_A^-1"
+    a_unit = getattr(result, "azimuthal_unit", "chi_deg") or "chi_deg"
+    r_label, _ = x_axis_for_unit(r_unit)
+    a_label, _ = x_axis_for_unit(a_unit)
+    return ImagePayload(
+        image=inten.T,                       # (azimuthal, radial) = rows=y, cols=x
+        axis_x=Axis(label=r_label, unit=r_unit, values=radial),
+        axis_y=Axis(label=a_label, unit=a_unit, values=azim),
+    )
+
+
 @dataclass(frozen=True)
 class RenderPlan:
     """The pure decision render executes: drop a stale payload, blank

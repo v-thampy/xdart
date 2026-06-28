@@ -55,6 +55,7 @@ from .display_logic import (
     resolve_selection, resolve_render_ids,
     default_plot_unit, pretty_unit, sentinel_mask, integer_saturation_ceiling,
     combine_flat_masks, nan_gaps_in_thumbnail,
+    stitch_plot_payload, stitch_image_payload,
 )
 from .display_controllers import register_default_controllers
 
@@ -1584,6 +1585,47 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
             if _sso is not None:
                 _sso()
         return True
+
+    def render_stitch_result(self, result_1d=None, result_2d=None):
+        """Draw a stitched result (``scan.stitched_1d`` / ``stitched_2d``) into
+        the 1-D plot / 2-D cake panels, reusing the integration view's draw
+        delegates (Stitch 1D/2D map to INT_1D/INT_2D, so the panels are already
+        laid out).  Direct one-shot draw — bypasses the controller/payload
+        compute_state dance since the source is ``scan.stitched_*``, not the
+        publication store.
+
+        NOTE (Phase 1b): this is a direct render after the run; it is overwritten
+        the next time ``update()`` runs (selection/mode change), since the stitch
+        result is not yet a first-class display source (a StitchDisplayController
+        + store is the persistent follow-up).  Returns True if anything drew."""
+        drew = False
+        pp = stitch_plot_payload(result_1d)
+        if pp is not None:
+            # Draw the single merged curve directly onto the 1-D plot.  (The
+            # payload→update_plot_view path depends on per-frame selection state
+            # that a synthetic stitch result doesn't have, so a direct draw is
+            # the reliable one-shot here.)
+            try:
+                x = np.asarray(pp.traces[0].x, dtype=float)
+                y = np.asarray(pp.traces[0].y, dtype=float)
+                self.plot.clear()
+                self.plot.plot(x, y, pen=pg.mkPen('#2b6cb0', width=1.5),
+                               name='Stitch')
+                self.plot.setLabel('bottom', pp.axis_x.label,
+                                   units=pretty_unit(pp.axis_x.unit))
+                self.plot.setLabel('left', 'Intensity')
+                self.plot.autoRange()
+                drew = True
+            except Exception:
+                logger.error("stitch 1D draw failed", exc_info=True)
+        ip = stitch_image_payload(result_2d)
+        if ip is not None:
+            try:
+                self._draw_image_payload(PanelRole.CAKE_2D, ip)
+                drew = True
+            except Exception:
+                logger.error("stitch 2D draw failed", exc_info=True)
+        return drew
 
     @staticmethod
     def _trim_view_to_data(widget, image, x, y):

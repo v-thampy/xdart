@@ -2291,11 +2291,19 @@ class staticWidget(QWidget):
         if not self.wrangler.thread.isRunning():
             self._exit_run_state()
         self.h5viewer.set_open_enabled(True)
+        self.update_all()
         if getattr(self.stitch_thread, 'ok', False):
+            # Draw the merged result AFTER update_all (which redraws the
+            # per-frame integration view) so the stitch is the final paint.
+            try:
+                self.displayframe.render_stitch_result(
+                    getattr(self.scan, 'stitched_1d', None),
+                    getattr(self.scan, 'stitched_2d', None))
+            except Exception:
+                logger.error("render stitch result failed", exc_info=True)
             self._stitch_status(
                 f'Stitch {self.stitch_thread.mode.upper()} complete.')
         # else: _on_stitch_error already surfaced the failure — don't overwrite.
-        self.update_all()
         if not self.wrangler.thread.isRunning():
             self.wrangler.enabled(True)
 

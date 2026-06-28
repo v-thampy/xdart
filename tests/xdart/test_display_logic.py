@@ -1107,3 +1107,37 @@ def test_image_and_plot_payload_carry_new_fields_and_freeze():
     assert pp.overlaid_ids is None and pp.plot_history is None
     with _pt.raises(dataclasses.FrozenInstanceError):
         ip.raw_full_shape = (1, 1)                          # frozen invariant preserved
+
+
+def test_stitch_plot_payload_builds_one_data_trace():
+    """stitch_plot_payload turns an IntegrationResult1D into a PlotPayload with a
+    single data trace + a unit-labelled x-axis; empty/None -> None."""
+    import numpy as np
+    from xrd_tools.core.containers import IntegrationResult1D
+    r = IntegrationResult1D(radial=np.linspace(0.5, 5, 50),
+                            intensity=np.arange(50.0), unit="q_A^-1")
+    pp = dl.stitch_plot_payload(r)
+    assert pp is not None and len(pp.traces) == 1
+    assert pp.axis_x.unit == "q_A^-1" and pp.axis_x.values.size == 50
+    assert pp.traces[0].x.size == 50 and pp.traces[0].kind == "data"
+    assert dl.stitch_plot_payload(None) is None
+    assert dl.stitch_plot_payload(
+        IntegrationResult1D(radial=np.array([]), intensity=np.array([]))) is None
+
+
+def test_stitch_image_payload_transposes_for_display():
+    """stitch_image_payload stores intensity.T (rows=y=azimuthal, cols=x=radial)
+    so the image-draw delegate's own transpose yields radial-on-x."""
+    import numpy as np
+    from xrd_tools.core.containers import IntegrationResult2D
+    R, A = 7, 4
+    inten = np.arange(R * A, dtype=float).reshape(R, A)     # (radial, azimuthal)
+    r = IntegrationResult2D(radial=np.linspace(0, 5, R),
+                            azimuthal=np.linspace(-90, 90, A),
+                            intensity=inten, unit="q_A^-1", azimuthal_unit="chi_deg")
+    ip = dl.stitch_image_payload(r)
+    assert ip is not None
+    assert ip.image.shape == (A, R)
+    assert np.array_equal(ip.image, inten.T)
+    assert ip.axis_x.values.size == R and ip.axis_y.values.size == A
+    assert dl.stitch_image_payload(None) is None
