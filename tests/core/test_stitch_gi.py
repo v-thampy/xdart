@@ -148,12 +148,12 @@ class TestGIProvider:
 
     def test_bad_incident_angle_count_raises(self):
         pytest.importorskip("pyFAI")
-        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
+        from xrd_tools.corrections.grazing import GICorrectionStack
         from xrd_tools.integrate.stitch_hist import pyfai_gi_q_frames
         gi = GICorrectionStack(material="Si", energy_eV=10000.0)
         with pytest.raises(ValueError, match="incident angle"):
-            next(pyfai_gi_q_frames([_ring(0), _ring(1)], [_ai(), _ai()], gi=gi,
-                                   incident_angles_deg=[0.3]))   # 1 αi / 2 frames
+            list(pyfai_gi_q_frames([_ring(0), _ring(1)], [_ai(), _ai()], gi=gi,
+                                    incident_angles_deg=[0.3]))  # 1 αi / 2 frames
 
 
 class TestGIRunStitch:

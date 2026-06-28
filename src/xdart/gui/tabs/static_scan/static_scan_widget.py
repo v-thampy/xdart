@@ -89,8 +89,11 @@ class _XyeOverlayInputFilter(QtCore.QObject):
         self._get_method = get_method
 
     def _accumulating(self):
+        get_method = getattr(self, '_get_method', None)
+        if not callable(get_method):
+            return False
         try:
-            return self._get_method() in self._ACCUMULATING
+            return get_method() in self._ACCUMULATING
         except Exception:
             return False
 
@@ -102,7 +105,14 @@ class _XyeOverlayInputFilter(QtCore.QObject):
         return text != '..' and not text.endswith('/')
 
     def eventFilter(self, obj, event):
-        if not self._is_active():
+        is_active = getattr(self, '_is_active', None)
+        if not callable(is_active):
+            return False
+        try:
+            active = is_active()
+        except Exception:
+            return False
+        if not active:
             return False
         etype = event.type()
         if etype == QtCore.QEvent.MouseButtonPress:
@@ -131,6 +141,9 @@ class _XyeOverlayInputFilter(QtCore.QObject):
     def _on_click(self, event):
         if event.button() != QtCore.Qt.LeftButton:
             return False
+        list_widget = getattr(self, '_list', None)
+        if list_widget is None:
+            return False
         has_shift, has_toggle_mod = self._meaningful_modifiers(event)
         if has_shift:
             return False                  # let Qt handle shift range-select
@@ -138,34 +151,37 @@ class _XyeOverlayInputFilter(QtCore.QObject):
             pos = event.position().toPoint()
         except AttributeError:            # Qt5 fallback
             pos = event.pos()
-        item = self._list.itemAt(pos)
+        item = list_widget.itemAt(pos)
         if not self._is_data_item(item):
             return False
         if not (has_toggle_mod or self._accumulating()):
             return False                  # Single plain click: Qt replace
         # Accumulating (or explicit ctrl/cmd-toggle): toggle this file in/out of
         # the overlay via the selection model (robust in ExtendedSelection).
-        sm = self._list.selectionModel()
-        idx = self._list.indexFromItem(item)
+        sm = list_widget.selectionModel()
+        idx = list_widget.indexFromItem(item)
         sm.select(idx, QtCore.QItemSelectionModel.Toggle)
         sm.setCurrentIndex(idx, QtCore.QItemSelectionModel.NoUpdate)
         return True
 
     def _on_key(self, event):
+        list_widget = getattr(self, '_list', None)
+        if list_widget is None:
+            return False
         has_shift, has_toggle_mod = self._meaningful_modifiers(event)
         if (not self._accumulating()
                 or has_shift or has_toggle_mod
                 or event.key() not in (QtCore.Qt.Key_Up, QtCore.Qt.Key_Down)):
             return False                  # Single / modified: Qt default browse
         step = -1 if event.key() == QtCore.Qt.Key_Up else 1
-        row = self._list.currentRow() + step
-        while 0 <= row < self._list.count():
-            item = self._list.item(row)
+        row = list_widget.currentRow() + step
+        while 0 <= row < list_widget.count():
+            item = list_widget.item(row)
             if self._is_data_item(item):
                 # Extend: add the newly-current file without clearing the rest,
                 # so arrow-browsing builds the comparison set.
                 item.setSelected(True)
-                self._list.setCurrentItem(
+                list_widget.setCurrentItem(
                     item, QtCore.QItemSelectionModel.NoUpdate)
                 return True
             row += step

@@ -141,6 +141,10 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.setWindowTitle("Scan Plot")
         self.resize(640, 620)
         self._build_ui()
+        self._roi_redraw_timer = QtCore.QTimer(self)
+        self._roi_redraw_timer.setSingleShot(True)
+        self._roi_redraw_timer.setInterval(50)
+        self._roi_redraw_timer.timeout.connect(self._redraw)
         if default_uri:
             self.load_uri(default_uri)
 
@@ -416,6 +420,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
             y = np.asarray(self._table[ycol], dtype=float)
             if normalized:
                 y = y / norm
+            if not (np.isfinite(x).any() and np.isfinite(y).any()):
+                continue
             color = CURVE_PENS[n % len(CURVE_PENS)]
             pen = pg.mkPen(color, width=2)
             if ycol in right_cols:
@@ -434,6 +440,12 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.right_vb.setVisible(any_right)
         if any_right:
             self.right_axis.setLabel(f"{value_label} (right)")
+
+    def _schedule_redraw(self):
+        if self._closing:
+            return
+        if not self._roi_redraw_timer.isActive():
+            self._roi_redraw_timer.start()
 
     # ---- ROI columns ----------------------------------------------------
     def _update_roi_button(self):
@@ -596,7 +608,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
                                    mask_saturation=mask_saturation)
         self.status.setText("Computing ROI stats…")
         self._roi_worker.start()
-        self._redraw()
+        self._schedule_redraw()
 
     def _on_roi_progress(self, done, total):
         if self._closing:
@@ -613,7 +625,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
             arr = self._table.get(name)
             if arr is not None and 0 <= r < len(arr):
                 arr[r] = val
-        self._redraw()
+        self._schedule_redraw()
 
     def _on_roi_done(self, result):
         # The cancel/fail cleanup runs even while closing: a close mid-run stops
@@ -622,6 +634,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         # the orphan NaN columns survive into the next time the (reused) dialog
         # is shown.
         if result is None:                  # cancelled / failed -> drop partials
+            self._roi_redraw_timer.stop()
             had = bool(self._roi_run_columns)
             for name in self._roi_run_columns:
                 self._remove_column(name)
@@ -633,9 +646,15 @@ class ScanPlotDialog(QtWidgets.QDialog):
         # A run that COMPLETED keeps its columns; if the dialog is closing, just
         # finalise the bookkeeping without touching the UI.
         n_added = len(self._roi_run_columns)
+        self._roi_redraw_timer.stop()
         self._roi_run_columns = []
         if self._closing:
             return
+        # Flush the final coalesced frame(s): the last _on_roi_frame scheduled a
+        # debounced redraw, but sigRoiDone (this slot) cancels the pending timer
+        # above before it fires — so the plot would otherwise stay one update
+        # stale until some other event redraws.  _redraw is idempotent.
+        self._redraw()
         diag = getattr(result.payload, "diagnostics", {}) or {}
         no_raw = diag.get("no_raw_frames") or []
         msg = f"ROI stats done — {n_added} column(s) added."
@@ -651,6 +670,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._closing = True
         if self._roi_worker is not None:
             self._roi_worker.stop()
+        if hasattr(self, "_roi_redraw_timer"):
+            self._roi_redraw_timer.stop()
         if self._roi_dialog is not None:
             self._roi_dialog.close()
             self._roi_dialog = None

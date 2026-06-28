@@ -260,8 +260,10 @@ def process_scan(
 #
 # Per-scan quantities pulled here:
 #
-# * Energy (eV)  — from ``scan.mg_args['wavelength']`` (metres) unless
-#   the caller passes ``energy=`` explicitly.
+# * Energy (eV)  — from the persisted calibration wavelength when present,
+#   warning if explicit plan/source energy disagrees.  ``scan.mg_args['wavelength']``
+#   is accepted only as a fallback real value, not xdart's historical 1 Å default
+#   placeholder.
 # * Per-frame motor positions — ``scan.scan_data[motor].values``, indexed
 #   by the frame IDs in ``scan.frames.index``.
 # * Raw images — one chunk at a time via ``frame._lazy_load_raw()``; frames
@@ -295,34 +297,84 @@ class _ScanLike(Protocol):
     def iter_chunks(self, chunk_size: int) -> Iterator[tuple[np.ndarray, list[int]]]: ...
 
 
-def _energy_from_scan(scan: _ScanLike) -> float:
-    """Resolve X-ray energy in eV from the scan's stored wavelength.
+_LEGACY_DEFAULT_WAVELENGTH_M = 1.0e-10
 
-    ``scan.mg_args['wavelength']`` is in metres (pyFAI convention); the
-    conversion is the single canonical one in :mod:`xrd_tools.core.energy`.
+
+def _is_legacy_default_wavelength(value: Any) -> bool:
+    try:
+        wl = float(value)
+    except (TypeError, ValueError):
+        return False
+    return np.isfinite(wl) and np.isclose(
+        wl, _LEGACY_DEFAULT_WAVELENGTH_M, rtol=0.0, atol=1.0e-18)
+
+
+def _energy_from_scan(scan: _ScanLike) -> float:
+    """Resolve X-ray energy in eV.
+
+    The canonical source is the persisted calibration wavelength.  Older xdart
+    live objects also carry ``mg_args["wavelength"]`` and historically default it
+    to ``1e-10`` m; that placeholder is ignored here unless it was restored as an
+    explicitly persisted wavelength.
     """
-    from xrd_tools.core.energy import wavelength_m_to_energy_eV  # noqa: PLC0415
-    mg_args = getattr(scan, "mg_args", {}) or {}
-    wavelength_m = mg_args.get("wavelength")
-    if wavelength_m and wavelength_m > 0:
-        return wavelength_m_to_energy_eV(float(wavelength_m))
+    from xrd_tools.core.energy import (  # noqa: PLC0415
+        check_energy_consistency,
+        wavelength_m_to_energy_eV,
+    )
+
+    def _finite_float(value: Any) -> float | None:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if np.isfinite(out) else None
+
+    explicit_candidates: list[tuple[str, float]] = []
     explicit_energy_eV = getattr(scan, "energy_eV", None)
-    if explicit_energy_eV is not None and np.isfinite(explicit_energy_eV):
-        return float(explicit_energy_eV)
+    energy_eV = _finite_float(explicit_energy_eV)
+    if energy_eV is not None:
+        explicit_candidates.append(("scan.energy_eV", energy_eV))
     explicit_energy_keV = getattr(scan, "energy_keV", None)
-    if explicit_energy_keV is not None and np.isfinite(explicit_energy_keV):
-        return float(explicit_energy_keV) * 1000.0
+    energy_keV = _finite_float(explicit_energy_keV)
+    if energy_keV is not None:
+        explicit_candidates.append(("scan.energy_keV", energy_keV * 1000.0))
     metadata = getattr(scan, "metadata", {}) or {}
     if isinstance(metadata, dict):
         energy_eV = metadata.get("energy_eV")
-        if energy_eV is not None and np.isfinite(energy_eV):
-            return float(energy_eV)
+        energy_eV_float = _finite_float(energy_eV)
+        if energy_eV_float is not None:
+            explicit_candidates.append(("scan.metadata['energy_eV']", energy_eV_float))
         energy_keV = metadata.get("energy_keV")
-        if energy_keV is not None and np.isfinite(energy_keV):
-            return float(energy_keV) * 1000.0
+        energy_keV_float = _finite_float(energy_keV)
+        if energy_keV_float is not None:
+            explicit_candidates.append(
+                ("scan.metadata['energy_keV']", energy_keV_float * 1000.0))
     explicit_energy = getattr(scan, "energy", None)
-    if explicit_energy is not None and np.isfinite(explicit_energy):
-        return float(explicit_energy) * 1000.0  # legacy Scan.energy is keV
+    energy_legacy_keV = _finite_float(explicit_energy)
+    if energy_legacy_keV is not None:
+        explicit_candidates.append(("scan.energy", energy_legacy_keV * 1000.0))
+    persisted_wavelength_m = getattr(scan, "_persisted_wavelength_m", None)
+    persisted_wavelength = _finite_float(persisted_wavelength_m)
+    if persisted_wavelength is not None and persisted_wavelength > 0:
+        persisted_energy = wavelength_m_to_energy_eV(persisted_wavelength)
+        for name, candidate in explicit_candidates:
+            check_energy_consistency(
+                candidate,
+                persisted_energy,
+                what_a=name,
+                what_b="persisted calibration wavelength",
+            )
+        return persisted_energy
+    if explicit_candidates:
+        return explicit_candidates[0][1]
+    mg_args = getattr(scan, "mg_args", {}) or {}
+    wavelength_m = _finite_float(mg_args.get("wavelength"))
+    if (
+        wavelength_m is not None
+        and wavelength_m > 0
+        and not _is_legacy_default_wavelength(wavelength_m)
+    ):
+        return wavelength_m_to_energy_eV(wavelength_m)
     raise ValueError(
         "scan has no usable wavelength or energy metadata; pass energy= explicitly."
     )
@@ -459,9 +511,9 @@ def process_scan_from_nexus(
 ) -> RSMVolume:
     """Stream-process a frame-source scan into an :class:`RSMVolume`.
 
-    Reads per-frame motor positions from ``scan.scan_data``, energy
-    from ``scan.mg_args['wavelength']`` (unless ``energy=`` is given),
-    and raw images one chunk at a time via ``scan.iter_chunks``.
+    Reads per-frame motor positions from ``scan.scan_data``, explicit/persisted
+    energy metadata (unless ``energy=`` is given), and raw images one chunk at a
+    time via ``scan.iter_chunks``.
     All frames flow through a single :class:`StreamingGridder` so peak
     memory is bounded by ``chunk_size`` regardless of total frame count.
 

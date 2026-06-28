@@ -38,6 +38,7 @@ class CompositeFrameSource(BaseFrameSource):
         for mi, member in enumerate(self._members):
             for label in member.frame_indices:
                 self._map.append((mi, int(label)))
+        self._motors_cache: dict[str, np.ndarray] | None = None
         caps = [m.capabilities for m in self._members]
         super().__init__(
             name=name or " + ".join(m.name for m in self._members),
@@ -77,16 +78,21 @@ class CompositeFrameSource(BaseFrameSource):
     def motors(self) -> dict[str, np.ndarray]:
         """Per-key concatenation of the members' whole-array ``motors``; a member
         missing a key contributes a NaN block so every column spans all frames."""
+        if self._motors_cache is not None:
+            return {k: v.copy() for k, v in self._motors_cache.items()}
         keys: list[str] = []
-        for member in self._members:
-            for k in (getattr(member, "motors", None) or {}):
+        member_motors = [
+            (getattr(member, "motors", None) or {})
+            for member in self._members
+        ]
+        for mm in member_motors:
+            for k in mm:
                 if k not in keys:
                     keys.append(k)
         out: dict[str, np.ndarray] = {}
         for k in keys:
             parts = []
-            for member in self._members:
-                mm = getattr(member, "motors", None) or {}
+            for member, mm in zip(self._members, member_motors):
                 n = len(member.frame_indices)
                 # Each block MUST be exactly n long so the concatenation stays
                 # frame-aligned: a member whose motor array is longer than its
@@ -100,6 +106,7 @@ class CompositeFrameSource(BaseFrameSource):
                     block = np.full(n, np.nan)
                 parts.append(block)
             out[k] = np.concatenate(parts) if parts else np.asarray([], dtype=float)
+        self._motors_cache = {k: v.copy() for k, v in out.items()}
         return out
 
 

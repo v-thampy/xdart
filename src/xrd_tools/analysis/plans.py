@@ -265,21 +265,31 @@ def run_stitch(
             "StitchPlan.base_poni or source.poni is required (or a Diffractometer "
             "carrying a DetectorCalibration)")
 
-    images: list[np.ndarray] = []
-    eager_bytes = 0
-    for label in labels:
-        image = np.asarray(src.load_frame(label), dtype=float)
-        eager_bytes += int(image.nbytes)
-        if plan.max_eager_bytes is not None and eager_bytes > int(plan.max_eager_bytes):
-            raise MemoryError(
-                "run_stitch currently materializes all selected images before "
-                "calling pyFAI MultiGeometry. Selected frames require at least "
-                f"{eager_bytes / (1024 ** 3):.2f} GiB, exceeding "
-                f"StitchPlan.max_eager_bytes={plan.max_eager_bytes}. "
-                "Use fewer frames, raise the limit intentionally, or migrate "
-                "this call to the future streaming StitchPlan backend."
-            )
-        images.append(image)
+    def _iter_images():
+        for label in labels:
+            yield np.asarray(src.load_frame(label), dtype=float)
+
+    def _load_images_eager() -> list[np.ndarray]:
+        images: list[np.ndarray] = []
+        eager_bytes = 0
+        for image in _iter_images():
+            eager_bytes += int(image.nbytes)
+            if (
+                plan.max_eager_bytes is not None
+                and eager_bytes > int(plan.max_eager_bytes)
+            ):
+                raise MemoryError(
+                    "this stitch backend materializes all selected images before "
+                    "calling pyFAI MultiGeometry. Selected frames require at "
+                    f"least {eager_bytes / (1024 ** 3):.2f} GiB, exceeding "
+                    f"StitchPlan.max_eager_bytes={plan.max_eager_bytes}. "
+                    "Use fewer frames, raise the limit intentionally, or use "
+                    "backend='pyfai_hist' when its q-grid convention fits the "
+                    "analysis."
+                )
+            images.append(image)
+        return images
+
     normalization = (
         _metadata_series(src, labels, plan.monitor_key)
         if plan.monitor_key is not None else None
@@ -371,40 +381,44 @@ def run_stitch(
                 # per-frame αi: explicit fixed angle (gi.incident_angle_deg), else
                 # the Diffractometer's incident_angle mapping (degrees).
                 if plan.gi.incident_angle_deg is not None:
-                    inc = np.full(len(images), float(plan.gi.incident_angle_deg))
+                    inc = np.full(len(labels), float(plan.gi.incident_angle_deg))
                 else:
                     per = diffractometer.to_pyfai_per_frame(motors)
                     inc = np.atleast_1d(np.asarray(per["incident_angle"], dtype=float))
-                    if inc.shape[0] == 1 and len(images) > 1:
-                        inc = np.full(len(images), float(inc[0]))
+                    if inc.shape[0] == 1 and len(labels) > 1:
+                        inc = np.full(len(labels), float(inc[0]))
                     if not np.any(inc != 0.0):
                         raise ValueError(
                             "GI stitching: the incident angle is 0 for every frame — "
                             "set GISettings.incident_angle_deg or activate the "
                             "Diffractometer's incident_angle mapping (an incidence "
                             "motor in the scan).")
-                frames = pyfai_gi_q_frames(
-                    images, integrators, gi=plan.gi.corrections,
-                    incident_angles_deg=inc,
-                    sample_orientation=plan.gi.sample_orientation,
-                    tilt_deg=plan.gi.tilt_deg, corrections=plan.corrections,
-                    mask=plan.mask, normalization=normalization)
+                def frames_factory():
+                    return pyfai_gi_q_frames(
+                        _iter_images(), integrators, gi=plan.gi.corrections,
+                        incident_angles_deg=inc,
+                        sample_orientation=plan.gi.sample_orientation,
+                        tilt_deg=plan.gi.tilt_deg, corrections=plan.corrections,
+                        mask=plan.mask, normalization=normalization)
             else:
-                frames = pyfai_q_frames(
-                    images, integrators, corrections=plan.corrections,
-                    mask=plan.mask, normalization=normalization)
+                def frames_factory():
+                    return pyfai_q_frames(
+                        _iter_images(), integrators, corrections=plan.corrections,
+                        mask=plan.mask, normalization=normalization)
             payload = stitch_q_grid(
-                frames,
+                frames_factory,
                 mode=plan.mode, npt=npt_rad, npt_azim=plan.npt_azim_2d,
                 unit=plan.unit, radial_range=plan.radial_range,
                 azimuth_range=plan.azimuth_range)
         elif plan.mode == "2d":
+            images = _load_images_eager()
             payload = stitch_2d(
                 images, integrators, npt_rad=plan.npt_rad_2d,
                 npt_azim=plan.npt_azim_2d, unit=plan.unit, method=plan.method,
                 radial_range=plan.radial_range, azimuth_range=plan.azimuth_range,
                 mask=plan.mask, normalization=normalization, **extra)
         else:
+            images = _load_images_eager()
             payload = stitch_1d(
                 images, integrators, npt=plan.npt_1d, unit=plan.unit,
                 method=plan.method, radial_range=plan.radial_range,
@@ -420,6 +434,7 @@ def run_stitch(
             _metadata_series(src, labels, plan.rot2_key)
             if plan.rot2_key is not None else None
         )
+        images = _load_images_eager()
         payload = stitch_images(
             images,
             base_poni,

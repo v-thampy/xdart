@@ -13,6 +13,7 @@ the tests run in any environment that has numpy + pandas + pytest.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -225,6 +226,48 @@ class TestEnergyFromSphere:
         e = _energy_from_scan(scan)
         assert e == pytest.approx(wavelength_m_to_energy_eV(1.10e-10), rel=1e-9)
 
+    def test_legacy_default_wavelength_sentinel_is_not_authoritative(self) -> None:
+        scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
+                         {"tth": [0.0]},
+                         wavelength_m=1.0e-10)
+        with pytest.raises(ValueError, match="no usable wavelength"):
+            _energy_from_scan(scan)
+
+    def test_persisted_wavelength_may_equal_sentinel_value(self) -> None:
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
+        scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
+                         {"tth": [0.0]},
+                         wavelength_m=1.0e-10)
+        scan._persisted_wavelength_m = 1.0e-10
+        assert _energy_from_scan(scan) == pytest.approx(
+            wavelength_m_to_energy_eV(1.0e-10), rel=1e-9)
+
+    def test_persisted_wavelength_is_canonical_over_matching_energy(self) -> None:
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
+        scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
+                         {"tth": [0.0]},
+                         wavelength_m=1.0e-10)
+        scan._persisted_wavelength_m = 1.20e-10
+        scan.energy_eV = wavelength_m_to_energy_eV(1.20e-10)
+        assert _energy_from_scan(scan) == pytest.approx(
+            wavelength_m_to_energy_eV(1.20e-10), rel=1e-9)
+
+    def test_persisted_wavelength_warns_and_wins_over_conflicting_energy(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from xrd_tools.core.energy import wavelength_m_to_energy_eV
+        scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
+                         {"tth": [0.0]},
+                         wavelength_m=1.0e-10)
+        scan._persisted_wavelength_m = 1.20e-10
+        scan.energy_eV = 8000.0
+
+        with caplog.at_level(logging.WARNING, logger="xrd_tools.core.energy"):
+            energy = _energy_from_scan(scan)
+
+        assert energy == pytest.approx(wavelength_m_to_energy_eV(1.20e-10), rel=1e-9)
+        assert any("energy mismatch" in r.message for r in caplog.records)
+
     def test_missing_wavelength_raises(self) -> None:
         scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
                              {"tth": [0.0]},
@@ -364,6 +407,13 @@ class TestIterSphereChunks:
             energy_eV = 12400.0
 
         assert _energy_from_scan(_HeadlessSource()) == pytest.approx(12400.0)
+
+    def test_explicit_energy_wins_over_legacy_default_wavelength(self) -> None:
+        scan = _FakeScan([_FakeFrame(0, image=np.zeros((4, 4)))],
+                         {"tth": [0.0]},
+                         wavelength_m=1.0e-10)
+        scan.energy_eV = 11111.0
+        assert _energy_from_scan(scan) == pytest.approx(11111.0)
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +586,8 @@ class TestGridSpheresStreaming:
         """If ScanInput.energy is None, each scan resolves its own."""
         s1 = _make_scan(n_frames=2, Nch1=8, Nch2=8)
         s2 = _make_scan(n_frames=2, Nch1=8, Nch2=8)
-        s1.mg_args["wavelength"] = 1.0e-10  # 12398 eV
+        s1.mg_args["wavelength"] = 1.0e-10  # real persisted 1 Å calibration
+        s1._persisted_wavelength_m = 1.0e-10
         s2.mg_args["wavelength"] = 2.0e-10  #  6199 eV
         grid_scans_streaming(
             _default_mapper(Nch1=8, Nch2=8),

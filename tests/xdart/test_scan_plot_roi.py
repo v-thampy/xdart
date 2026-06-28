@@ -544,3 +544,83 @@ def test_scan_plot_roi_close_mid_run_drops_partial_columns(qapp):
         "partial ROI column survived the close"
     assert "roiZ" not in dlg._columns
     assert dlg._roi_run_columns == []
+
+
+def test_roi_frame_updates_are_redraw_coalesced(qapp):
+    from pyqtgraph.Qt import QtCore
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+
+    dlg = ScanPlotDialog()
+    try:
+        dlg.set_table("s", {"frame_index": np.arange(4.0), "i0": np.arange(4.0)})
+        dlg._append_column("roiZ", np.full(4, np.nan), check=True)
+        dlg._roi_row_of = {i: i for i in range(4)}
+
+        calls = {"n": 0}
+
+        def _count_redraw():
+            calls["n"] += 1
+
+        dlg._roi_redraw_timer.timeout.disconnect()
+        dlg._roi_redraw_timer.timeout.connect(_count_redraw)
+
+        for i in range(4):
+            dlg._on_roi_frame(i, {"roiZ": float(i)})
+
+        assert calls["n"] == 0
+        assert dlg._roi_redraw_timer.isActive()
+        assert _pump(qapp, lambda: calls["n"] == 1, timeout=1.0)
+        np.testing.assert_allclose(dlg._table["roiZ"], [0.0, 1.0, 2.0, 3.0])
+    finally:
+        dlg.close()
+
+
+def test_roi_done_flushes_final_coalesced_redraw(qapp):
+    """A completing sigRoiDone cancels the pending debounce timer, so it must
+    issue a final _redraw() itself — else the last frame's update stays stale."""
+    import types
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+
+    dlg = ScanPlotDialog()
+    try:
+        dlg.set_table("s", {"frame_index": np.arange(4.0), "i0": np.arange(4.0)})
+        dlg._append_column("roiZ", np.full(4, np.nan), check=True)
+        dlg._roi_row_of = {i: i for i in range(4)}
+        dlg._roi_run_columns = ["roiZ"]
+
+        calls = {"n": 0}
+        dlg._redraw = lambda *a, **k: calls.__setitem__("n", calls["n"] + 1)
+
+        # last frame schedules a debounced redraw (timer pending, not yet fired)
+        dlg._on_roi_frame(3, {"roiZ": 3.0})
+        assert dlg._roi_redraw_timer.isActive()
+        assert calls["n"] == 0
+
+        # the completing sigRoiDone must cancel the timer AND flush a final redraw
+        dlg._on_roi_done(types.SimpleNamespace(
+            payload=types.SimpleNamespace(diagnostics={})))
+        assert not dlg._roi_redraw_timer.isActive()
+        assert calls["n"] == 1
+    finally:
+        dlg.close()
+
+
+def test_scan_plot_skips_all_nan_series_without_pyqtgraph_warning(qapp):
+    from pyqtgraph.Qt import QtCore
+    from xdart.gui.tabs.static_scan.scan_plot_dialog import ScanPlotDialog
+
+    dlg = ScanPlotDialog()
+    try:
+        dlg.set_table("s", {"frame_index": np.arange(3.0), "i0": np.arange(3.0)})
+        dlg._append_column("empty", np.full(3, np.nan), check=True)
+        for i in range(dlg.y_list.count()):
+            item = dlg.y_list.item(i)
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked
+                if item.text() == "empty"
+                else QtCore.Qt.CheckState.Unchecked
+            )
+        dlg._redraw()
+        assert len(dlg.plot.getPlotItem().listDataItems()) == 0
+    finally:
+        dlg.close()

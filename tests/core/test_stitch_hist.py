@@ -102,7 +102,7 @@ class TestStitchQGrid:
 
     def test_empty_raises(self):
         from xrd_tools.integrate.stitch_hist import stitch_q_grid
-        with pytest.raises(ValueError, match="no frames"):
+        with pytest.raises(ValueError, match="no frames|finite q/chi range"):
             stitch_q_grid([], mode="1d")
 
 
@@ -116,15 +116,21 @@ class TestPyfaiQFramesGuards:
         from xrd_tools.integrate.stitch_hist import pyfai_q_frames
         ais = [_ai(), _ai()]
         imgs = [_ring(0), _ring(1), _ring(2)]   # 3 imgs / 2 integrators
-        with pytest.raises(ValueError, match="3 images but 2 integrators"):
-            next(pyfai_q_frames(imgs, ais))
+        frames = pyfai_q_frames(imgs, ais)
+        next(frames)
+        next(frames)
+        with pytest.raises(ValueError, match="length mismatch"):
+            next(frames)
 
     def test_monitor_length_mismatch_raises(self):
         pytest.importorskip("pyFAI")
         from xrd_tools.integrate.stitch_hist import pyfai_q_frames
         ais = [_ai(), _ai()]; imgs = [_ring(0), _ring(1)]
+        frames = pyfai_q_frames(imgs, ais, normalization=[1.0, 2.0, 3.0])
+        next(frames)
+        next(frames)
         with pytest.raises(ValueError, match="monitor/normalization values"):
-            next(pyfai_q_frames(imgs, ais, normalization=[1.0, 2.0, 3.0]))
+            next(frames)
 
     @pytest.mark.parametrize("bad", [0.0, np.nan, np.inf, -2.0])
     def test_bad_monitor_raises(self, bad):
@@ -222,3 +228,67 @@ class TestStitchMergeSemantics:
         pop = np.isfinite(out.intensity)
         assert pop.any()
         np.testing.assert_allclose(out.intensity[pop], 1.0)
+
+
+def _q_frame(value: float):
+    q = np.array([[0.0, 1.0], [2.0, 3.0]], dtype=float) + value
+    chi = np.array([[-1.0, -0.5], [0.5, 1.0]], dtype=float)
+    signal = np.full((2, 2), value + 1.0, dtype=float)
+    norm = np.ones((2, 2), dtype=float)
+    return q, chi, signal, norm
+
+
+def test_stitch_q_grid_replays_factory_without_materializing_frames():
+    from xrd_tools.integrate.stitch_hist import stitch_q_grid
+
+    calls = 0
+
+    def frame_factory():
+        nonlocal calls
+        calls += 1
+        yield _q_frame(0.0)
+        yield _q_frame(1.0)
+
+    out = stitch_q_grid(frame_factory, mode="2d", npt=4, npt_azim=3)
+
+    assert calls == 2       # one range scout + one accumulation pass
+    assert out.intensity.shape == (4, 3)
+    assert np.isfinite(out.intensity).any()
+
+
+class _TinyIntegrator:
+    def qArray(self, *, shape):
+        return np.ones(shape, dtype=float)
+
+    def chiArray(self, *, shape):
+        return np.zeros(shape, dtype=float)
+
+
+def test_pyfai_q_frames_streams_one_image_before_first_yield():
+    from xrd_tools.integrate.stitch_hist import pyfai_q_frames
+
+    loaded: list[int] = []
+
+    def images():
+        for i in range(3):
+            loaded.append(i)
+            yield np.full((2, 2), i + 1.0, dtype=float)
+
+    frames = pyfai_q_frames(images(), [_TinyIntegrator() for _ in range(3)])
+    first = next(frames)
+
+    assert loaded == [0]
+    np.testing.assert_allclose(first[2], 1.0)
+
+
+def test_pyfai_q_frames_detects_length_mismatch_after_streaming_prefix():
+    from xrd_tools.integrate.stitch_hist import pyfai_q_frames
+
+    frames = pyfai_q_frames(
+        [np.ones((2, 2)), np.ones((2, 2))],
+        [_TinyIntegrator()],
+    )
+
+    next(frames)
+    with pytest.raises(ValueError, match="length mismatch"):
+        next(frames)

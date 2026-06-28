@@ -86,6 +86,30 @@ def test_composite_motors_clipped_to_frame_count():
     np.testing.assert_allclose(comp.motors["th"], [0.0, 1.0])   # 99 clipped off
 
 
+def test_composite_motors_cached_and_returned_as_copies():
+    class _Motors(MemoryFrameSource):
+        def __init__(self, imgs, motors):
+            super().__init__(imgs)
+            self._mt = motors
+            self.calls = 0
+
+        @property
+        def motors(self):
+            self.calls += 1
+            return self._mt
+
+    a = _Motors([np.zeros((2, 2))], {"th": np.array([1.0])})
+    b = _Motors([np.zeros((2, 2))], {"th": np.array([2.0])})
+    comp = CompositeFrameSource([a, b])
+
+    first = comp.motors
+    first["th"][0] = 99.0
+    second = comp.motors
+
+    np.testing.assert_allclose(second["th"], [1.0, 2.0])
+    assert a.calls == 1 and b.calls == 1
+
+
 def test_composite_dispatches_sparse_labels():
     """A member with non-0..n-1 frame labels (e.g. 5, 7) still dispatches
     load_frame/metadata_for to the right member frame."""
@@ -138,6 +162,19 @@ def test_discover_scans_nexus_and_images(tmp_path):
     assert len(img) == 1 and img[0].kind is SourceKind.TIFF_SERIES
 
     assert discover_scans(tmp_path / "nope", "nexus_stack") == []
+
+
+def test_discover_scans_uses_natural_file_order(tmp_path):
+    for name in ("scan_10.nxs", "scan_2.nxs", "scan_1.nxs"):
+        (tmp_path / name).write_bytes(b"")
+
+    specs = discover_scans(tmp_path, "nexus_stack")
+
+    assert [s.uri.name for s in specs] == [
+        "scan_1.nxs",
+        "scan_2.nxs",
+        "scan_10.nxs",
+    ]
 
 
 def test_discover_scans_eiger_filters_master(tmp_path):

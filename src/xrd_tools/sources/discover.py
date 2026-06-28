@@ -18,7 +18,12 @@ _NEXUS_EXTS = {".nxs", ".h5", ".hdf5", ".cxi"}
 
 def _walk_files(directory: Path, recursive: bool) -> list[Path]:
     it = directory.rglob("*") if recursive else directory.iterdir()
-    return sorted(p for p in it if p.is_file())
+    files = [p for p in it if p.is_file()]
+    try:
+        from natsort import os_sorted
+        return list(os_sorted(files))
+    except Exception:
+        return sorted(files)
 
 
 def discover_scans(directory, kind, *, recursive: bool = False,
