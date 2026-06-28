@@ -524,6 +524,20 @@ QLabel#label1D:disabled, QLabel#label2D:disabled {
     background-color: $browse_muted;
     color: $text_muted;
 }
+/* The Threshold + Reintegrate rows are sub-cards too — give them the same
+   card body/border as frame1D/frame2D (otherwise they fall through to the
+   blanket QFrame panel tint and read inconsistently). */
+QFrame#frame_pixreject, QFrame#frame_reint {
+    background-color: $card;
+    border: 1px solid $field_border;
+    border-radius: 6px;
+}
+/* Integrator panel title — section-header tint, left of the GI row. */
+QLabel#integration_heading {
+    font-weight: 700;
+    color: $text_muted;
+    padding-left: 2px;
+}
 
 /* ── Tools placeholder + Metadata popup (Stage 4) ─────────────── */
 /* The inline metadata table moved into the on-demand "Metadata" dialog; the

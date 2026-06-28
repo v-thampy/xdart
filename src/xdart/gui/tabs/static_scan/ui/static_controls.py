@@ -55,19 +55,14 @@ class StaticControls(QtWidgets.QWidget):
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
                            QtWidgets.QSizePolicy.Policy.Fixed)
 
-        # Status / message bar — the control-layer home for run + browse messages
-        # (relocated here from the wrangler's orphaned specLabel).  Sits at the
-        # top of the control stack, above the mode/Batch row; the wranglers route
-        # status to it via wranglerWidget._status_label when controls are attached.
-        self.statusLabel = QtWidgets.QLabel('')
+        # Run/browse status now shows in the main window's BOTTOM status bar
+        # (wranglerWidget._set_status_text routes there), not in a strip above the
+        # mode row.  Keep this label — parented + hidden, NOT in the layout — only
+        # for back-compat references and the standalone fallback; dropping it from
+        # the layout frees the vertical space it used to occupy at the top.
+        self.statusLabel = QtWidgets.QLabel('', self)
         self.statusLabel.setObjectName('statusLabel')
-        self.statusLabel.setMinimumHeight(21)
-        # Ignored horizontal policy: overlong status text clips/elides instead of
-        # forcing the right panel wider (mirrors wranglerWidget._guard_status_label).
-        _sp = self.statusLabel.sizePolicy()
-        _sp.setHorizontalPolicy(QtWidgets.QSizePolicy.Policy.Ignored)
-        self.statusLabel.setSizePolicy(_sp)
-        outer.addWidget(self.statusLabel)
+        self.statusLabel.hide()
 
         row1 = QtWidgets.QHBoxLayout()
         row1.setContentsMargins(0, 0, 0, 0)
@@ -115,14 +110,16 @@ class StaticControls(QtWidgets.QWidget):
         outer.addWidget(self.actionRow)
 
         # Row order: Run · Stop · Append · Live.  Run is the prominent primary
-        # action (stretch=1 so it absorbs the row's slack); Stop / Append / Live
-        # are secondary and kept narrow.
+        # action but should not hog the whole row — it takes the bulk of the
+        # slack (stretch 4) with a small flexible gap (stretch 1) trimming it
+        # ~20% and separating it from the Stop/Append/Live cluster.
         self.startButton = QtWidgets.QPushButton('Run')
         # objectName 'startButton' + the runPhase property are what the dark
         # theme keys the green/orange Run/Pause styling on.
         self.startButton.setObjectName('startButton')
         self.startButton.setProperty('runPhase', 'idle')
-        row2.addWidget(self.startButton, 1)
+        row2.addWidget(self.startButton, 4)
+        row2.addStretch(1)
 
         self.stopButton = QtWidgets.QPushButton('Stop')
         self.stopButton.setObjectName('stopButton')

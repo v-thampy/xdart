@@ -369,6 +369,10 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         for _c in (self.ui.normChannel, self.ui.scale, self.ui.cmap):
             displayFrameWidget._fit_combo_width(_c, max_w=130)
             _c.setFixedHeight(_ROW_H)
+        # The colormap selector shows a short value ("Default") and lives in the
+        # compact scale pill — trim it ~15% so the pill is tighter (Vivek).
+        _cmw = self.ui.cmap.maximumWidth()
+        self.ui.cmap.setFixedWidth(int(_cmw * 0.85) if 0 < _cmw < 16777215 else 110)
         # Widen the BG button (+7%, then another +10% = x1.177) so the 'Clear BG'
         # label has comfortable room (Vivek).
         displayFrameWidget._fit_button_width(self.ui.setBkg, scale=1.177)

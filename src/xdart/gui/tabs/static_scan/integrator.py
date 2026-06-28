@@ -274,25 +274,34 @@ class integratorTree(QtWidgets.QWidget):
         _gi_lay.setContentsMargins(2, 0, 2, 0)
         _gi_lay.setSpacing(4)
 
+        # The integrator panel's title sits at the LEFT of this header row; the
+        # GI (Fiber) toggle + its "More" options button cluster at the RIGHT.
+        self.ui.integration_heading = QtWidgets.QLabel('INTEGRATION')
+        self.ui.integration_heading.setObjectName('integration_heading')
+        _gi_lay.addWidget(self.ui.integration_heading)
+        _gi_lay.addStretch(1)
+
         self.ui.gi_enable = QtWidgets.QPushButton('GI (Fiber)')
         self.ui.gi_enable.setObjectName('gi_enable')
         self.ui.gi_enable.setCheckable(True)
         self.ui.gi_enable.setMinimumWidth(90)
         _gi_lay.addWidget(self.ui.gi_enable)
 
-        # Motor first (the incidence-angle source), then Orient + Tilt.
+        # Motor (incidence-angle source) + its manual-theta value are CONSTRUCTED
+        # here but live in the "More" popup form (added below), NOT inline on the
+        # row — the header stays just the title + GI toggle.  Every consumer
+        # (get_gi_config / session / hydrate) reads these widget objects, so
+        # their location is display-only.
         self.ui.gi_motor_label = QtWidgets.QLabel('Motor')
-        _gi_lay.addWidget(self.ui.gi_motor_label)
         self.ui.gi_motor = QtWidgets.QComboBox()
         self.ui.gi_motor.setObjectName('gi_motor')
         self.ui.gi_motor.addItems(['th', 'Manual'])
         self.ui.gi_motor.setMaximumWidth(110)
-        _gi_lay.addWidget(self.ui.gi_motor)
 
+        self.ui.gi_motor_value_label = QtWidgets.QLabel('Value')
         self.ui.gi_motor_value = QtWidgets.QLineEdit('0.1')
         self.ui.gi_motor_value.setObjectName('gi_motor_value')
         self.ui.gi_motor_value.setMaximumWidth(55)
-        _gi_lay.addWidget(self.ui.gi_motor_value)
 
         # Orient + Tilt no longer sit inline on the row — they live in a "More"
         # popup (below), which keeps the row compact and is the seam for future
@@ -312,8 +321,8 @@ class integratorTree(QtWidgets.QWidget):
         self.ui.gi_tilt.setObjectName('gi_tilt')
         self.ui.gi_tilt.setMaximumWidth(70)
 
-        # "More" opens the GI options popup — right-justified + just wide enough.
-        _gi_lay.addStretch(1)
+        # "More" opens the GI options popup; it sits right next to the GI toggle
+        # at the right end (the heading's stretch above pushes the cluster right).
         self.ui.gi_more = QtWidgets.QPushButton('More')
         self.ui.gi_more.setObjectName('gi_more')
         self.ui.gi_more.setMaximumWidth(60)
@@ -331,6 +340,9 @@ class integratorTree(QtWidgets.QWidget):
         self.gi_more_popup.setObjectName('gi_more_popup')
         self.gi_more_popup.setWindowTitle('GI Options')
         _gi_more_form = QtWidgets.QFormLayout(self.gi_more_popup)
+        # Motor (+ its manual-theta value) lead, then Orient + Tilt.
+        _gi_more_form.addRow(self.ui.gi_motor_label, self.ui.gi_motor)
+        _gi_more_form.addRow(self.ui.gi_motor_value_label, self.ui.gi_motor_value)
         _gi_more_form.addRow(self.ui.gi_orient_label,
                              self.ui.gi_sample_orientation)
         _gi_more_form.addRow(self.ui.gi_tilt_label, self.ui.gi_tilt)
@@ -1487,10 +1499,15 @@ class integratorTree(QtWidgets.QWidget):
         "More" popup button (Orient/Tilt now live inside the popup); the manual
         theta value only when the motor is 'Manual'."""
         on = self.ui.gi_enable.isChecked()
-        for w in (self.ui.gi_motor_label, self.ui.gi_motor, self.ui.gi_more):
-            w.setVisible(on)
+        # The motor controls moved into the "More" popup, so only the More button
+        # tracks GI-on in the inline header row.  Inside the popup, the
+        # manual-theta Value row shows only when the motor is 'Manual'; the popup
+        # as a whole is hidden when GI is off (below), so the field keys on
+        # `manual` alone.
+        self.ui.gi_more.setVisible(on)
         manual = (self.ui.gi_motor.currentText() == 'Manual')
-        self.ui.gi_motor_value.setVisible(on and manual)
+        self.ui.gi_motor_value_label.setVisible(manual)
+        self.ui.gi_motor_value.setVisible(manual)
         # Don't leave the options popup floating once GI is switched off.
         popup = getattr(self, 'gi_more_popup', None)
         if popup is not None and not on:

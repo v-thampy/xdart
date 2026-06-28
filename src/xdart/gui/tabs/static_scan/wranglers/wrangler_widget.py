@@ -286,14 +286,30 @@ class wranglerWidget(Qt.QtWidgets.QWidget):
         policy.setHorizontalPolicy(Qt.QtWidgets.QSizePolicy.Policy.Ignored)
         label.setSizePolicy(policy)
 
+    def _status_bar(self):
+        """The main window's BOTTOM QStatusBar, when this widget is hosted in a
+        QMainWindow (the normal app).  None when standalone (tests / popped-out
+        wranglers) — status then falls back to the elide-safe label."""
+        try:
+            win = self.window()
+            fn = getattr(win, 'statusBar', None)
+            return fn() if callable(fn) else None
+        except Exception:
+            return None
+
     def _set_status_text(self, text):
-        """Set the status label, eliding to the label's current width (the
-        full text goes in the tooltip).  Safe for arbitrarily long thread
-        messages — see _guard_status_label."""
+        """Route run/browse status to the main window's bottom status bar (the
+        message bar).  Falls back to the elide-safe status label when there is no
+        status bar (standalone): elides to the label's width, full text in the
+        tooltip — see _guard_status_label."""
+        text = text or ''
+        bar = self._status_bar()
+        if bar is not None:
+            bar.showMessage(text)
+            return
         label = self._status_label()
         if label is None:
             return
-        text = text or ''
         label.setToolTip(text)
         if label.isVisible() and label.width() > 0:
             metrics = Qt.QtGui.QFontMetrics(label.font())

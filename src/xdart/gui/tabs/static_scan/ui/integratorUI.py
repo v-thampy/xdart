@@ -25,11 +25,15 @@ class Ui_Form(object):
         if not Form.objectName():
             Form.setObjectName(u"Form")
         Form.resize(1440, 260)
-        Form.setMaximumSize(QSize(16777215, 280))
+        # Raised from 280 so the inter-card spacing (verticalLayout below) is not
+        # clipped — the cards used to butt together at spacing 0.
+        Form.setMaximumSize(QSize(16777215, 320))
         self.verticalLayout = QVBoxLayout(Form)
-        self.verticalLayout.setSpacing(0)
+        # Breathing room between the stacked cards (GI/heading · 1-D · 2-D ·
+        # Threshold · Reintegrate) so they read as separate boxes, not squished.
+        self.verticalLayout.setSpacing(6)
         self.verticalLayout.setObjectName(u"verticalLayout")
-        self.verticalLayout.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout.setContentsMargins(4, 4, 4, 4)
         self.frame1D = QFrame(Form)
         self.frame1D.setObjectName(u"frame1D")
         self.frame1D.setMaximumSize(QSize(16777215, 120))
@@ -57,6 +61,9 @@ class Ui_Form(object):
         self.horizontalLayout_4.setContentsMargins(15, 3, 5, 3)
         self.horizontalLayout_3 = QHBoxLayout()
         self.horizontalLayout_3.setObjectName(u"horizontalLayout_3")
+        # Tighten adjacency gaps (e.g. Pts label → its input); the explicit
+        # spacers below still hold the larger axis→Pts separation.
+        self.horizontalLayout_3.setSpacing(4)
         self.label1D = QLabel(self.frame1D_header)
         self.label1D.setObjectName(u"label1D")
         sizePolicy = QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
@@ -94,7 +101,7 @@ class Ui_Form(object):
 
         self.label_npts_1D = QLabel(self.frame1D_header)
         self.label_npts_1D.setObjectName(u"label_npts_1D")
-        self.label_npts_1D.setMaximumSize(QSize(40, 16777215))
+        self.label_npts_1D.setMaximumSize(QSize(28, 16777215))
         self.label_npts_1D.setIndent(-1)
 
         self.horizontalLayout_3.addWidget(self.label_npts_1D)
@@ -243,6 +250,7 @@ class Ui_Form(object):
         self.horizontalLayout_7.setContentsMargins(15, 3, 5, 3)
         self.horizontalLayout_8 = QHBoxLayout()
         self.horizontalLayout_8.setObjectName(u"horizontalLayout_8")
+        self.horizontalLayout_8.setSpacing(4)
         self.label2D = QLabel(self.frame2D_header)
         self.label2D.setObjectName(u"label2D")
         sizePolicy.setHeightForWidth(self.label2D.sizePolicy().hasHeightForWidth())
@@ -274,7 +282,7 @@ class Ui_Form(object):
 
         self.label_npts_2D = QLabel(self.frame2D_header)
         self.label_npts_2D.setObjectName(u"label_npts_2D")
-        self.label_npts_2D.setMaximumSize(QSize(40, 16777215))
+        self.label_npts_2D.setMaximumSize(QSize(28, 16777215))
         self.label_npts_2D.setIndent(-1)
 
         self.horizontalLayout_8.addWidget(self.label_npts_2D)

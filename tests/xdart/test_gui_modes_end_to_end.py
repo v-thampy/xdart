@@ -3058,36 +3058,43 @@ def test_hydrate_from_scan_populates_panel_from_saved_settings(widget):
     assert it.ui.radial_high_1D.text() == '7.5'
 
 
-def test_gi_more_popup_hosts_orient_and_tilt(widget):
-    """The GI (Fiber) row keeps only GI/Motor inline; Orient + Tilt moved into a
-    right-justified "More" popup (the seam for future GI options).  The widgets
-    are the SAME objects (get_gi_config / session / hydrate read them) — just
-    re-parented — and the More button + popup toggle with GI."""
+def test_gi_more_popup_hosts_motor_orient_tilt(widget):
+    """The GI header row keeps only the INTEGRATION title + the GI (Fiber) toggle
+    + the "More" button; ALL GI options — Motor, its manual Value, Orient, Tilt —
+    now live in the right-justified "More" popup.  The widgets are the SAME
+    objects (get_gi_config / session / hydrate read them) — just re-parented —
+    and the More button + popup toggle with GI."""
     w = widget
     it = w.integratorTree
 
-    # Orient/Tilt now live in the popup window, not inline on the GI row.
-    assert it.ui.gi_sample_orientation.window() is it.gi_more_popup
-    assert it.ui.gi_tilt.window() is it.gi_more_popup
+    # Every GI option lives in the popup window now, not inline on the row.
+    for wdg in (it.ui.gi_motor, it.ui.gi_motor_value,
+                it.ui.gi_sample_orientation, it.ui.gi_tilt):
+        assert wdg.window() is it.gi_more_popup
+    # The header row holds the title + the GI toggle + More (not the popup).
+    assert it.ui.integration_heading.window() is not it.gi_more_popup
     assert it.ui.gi_more.maximumWidth() <= 60               # snug, won't clip
 
-    # GI on -> Motor + More visible; clicking More opens the popup.
+    # GI on -> More visible; clicking More opens the popup.
     it.ui.gi_enable.setChecked(True)
     assert it.ui.gi_more.isVisibleTo(it.ui.gi_frame)
-    assert it.ui.gi_motor.isVisibleTo(it.ui.gi_frame)
     it._show_gi_more()
     assert it.gi_more_popup.isVisible()
 
-    # GI off -> Motor + More hidden, popup closed (not left floating).
+    # GI off -> More hidden, popup closed (not left floating).
     it.ui.gi_enable.setChecked(False)
     assert not it.ui.gi_more.isVisibleTo(it.ui.gi_frame)
     assert not it.gi_more_popup.isVisible()
 
-    # Orient/Tilt still round-trip through get_gi_config from the popup widgets.
+    # Motor + Orient + Tilt all round-trip through get_gi_config from the popup.
     it.ui.gi_enable.setChecked(True)
+    it.ui.gi_motor.setCurrentText('Manual')
+    it.ui.gi_motor_value.setText('0.3')
     it.ui.gi_sample_orientation.setValue(6)
     it.ui.gi_tilt.setText('1.5')
     cfg = it.get_gi_config()
+    assert cfg['incidence_motor'] == 'Manual'
+    assert cfg['th_val'] == 0.3
     assert cfg['sample_orientation'] == 6
     assert cfg['tilt_angle'] == 1.5
 

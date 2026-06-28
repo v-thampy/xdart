@@ -266,17 +266,18 @@ class imageWrangler(wranglerWidget):
         # clipped "Average Scan" at ~98px); switch it to Interactive so the fixed
         # 120 actually applies.
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
-        header.resizeSection(0, 120)
+        # Root decoration (below) adds a small per-row gutter, so the name column
+        # needs a touch more room or labels like "Average Scan" clip.
+        header.resizeSection(0, 132)
         header.setMinimumSectionSize(40)
-        # The group expand/collapse chevrons live in the indentation column;
-        # the old shallow indent (3px) squeezed them to near-invisibility ("the
-        # arrows are barely visible").  Widen it so the chevron has room, and
-        # turn on root decoration so the top-level group rows draw a branch
-        # arrow that the theme replaces with a clear, high-contrast triangle
-        # (themes/dark: QTreeView#WranglerTree::branch images).  The field-name
-        # column shifts right by the extra indent but the value boxes are still
-        # comfortably wide.
-        self.tree.setIndentation(16)
+        # The group expand/collapse chevrons live in the indentation column; the
+        # old shallow indent (3px) squeezed them to near-invisibility.  Root
+        # decoration makes the top-level group rows draw a branch arrow the theme
+        # replaces with a clear, high-contrast triangle (themes/dark:
+        # QTreeView#WranglerTree::branch).  Keep the indent small (a touch above
+        # the old 3) so the field labels are not pushed far right or clipped —
+        # just enough for the chevron to read.
+        self.tree.setIndentation(9)
         self.tree.setRootIsDecorated(True)
         # Hide the "Parameter / Value" header bar — it's just visual noise above
         # the wrangler tree.  Column sizing above still applies (the header is
