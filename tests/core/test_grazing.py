@@ -117,12 +117,13 @@ class TestGICorrectionStack:
         p = absorption_path(np.radians(0.0), np.radians(np.array([0.0, 0.5])))
         assert np.all(np.isfinite(p)) and np.all(p > 0)
 
-    def test_footprint_only_is_constant_sin_ai(self):
+    def test_footprint_only_is_constant_inv_sin_ai(self):
         pytest.importorskip("xrayutilities")
         gi = _stack(fresnel=False, absorption=False)
         af = np.radians(np.array([0.1, 0.5, 1.0]))
         n = gi.gi_normalization(incident_angle_deg=0.3, alpha_f_rad=af)
-        np.testing.assert_allclose(n, np.sin(np.radians(0.3)))  # per-frame scalar
+        # footprint boost 1/sin αi enters the Σnorm denominator (per-frame scalar)
+        np.testing.assert_allclose(n, 1.0 / np.sin(np.radians(0.3)))
 
     def test_fresnel_only_enhances_near_ac(self):
         pytest.importorskip("xrayutilities")

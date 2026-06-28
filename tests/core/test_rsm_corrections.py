@@ -1,7 +1,7 @@
 """P6.2 — the CorrectionStack weight hook for RSM.
 
-The RSM grid folds a CorrectionStack into the Σ(raw·w)/Σ(w) accumulator as the
-SAME per-pixel weight stitching uses.  Gates:
+The RSM grid folds a CorrectionStack into the Σraw/Σnorm accumulator as the
+SAME per-pixel norm stitching uses.  Gates:
 * the DetectorHeader → pyFAI ai bridge is correct (solid angle peaks at the beam
   centre — the convention check), and is wavelength-independent;
 * the weight flows into the grid and changes intensities the pyFAI-reproducing
@@ -109,14 +109,15 @@ class TestGiGridWeight:
         w = gi_grid_weight(_header(), gi, incident_angle_deg=0.3)
         np.testing.assert_allclose(w, 1.0)
 
-    def test_footprint_only_is_sin_alpha_i(self):
+    def test_footprint_only_is_inv_sin_alpha_i(self):
         pytest.importorskip("pyFAI")
         from xrd_tools.corrections.grazing import GICorrectionStack
         from xrd_tools.rsm.corrections import gi_grid_weight
         gi = GICorrectionStack(material="Si", energy_eV=10000.0, footprint=True,
                                fresnel=False, absorption=False, refraction=False)
         w = gi_grid_weight(_header(), gi, incident_angle_deg=0.3)
-        np.testing.assert_allclose(w, np.sin(np.deg2rad(0.3)))
+        # footprint boost 1/sin αi enters the Σnorm weight
+        np.testing.assert_allclose(w, 1.0 / np.sin(np.deg2rad(0.3)))
 
     def test_rsm_correction_weight_multiplies_gi_in(self):
         """rsm_correction_weight(corrections, gi) == base × GI weight."""
@@ -149,7 +150,7 @@ class TestRsmGridCorrectionsWiring:
     """corrections flow end-to-end through the grid and change I."""
 
     def test_weight_reweights_the_grid_else_count_mean(self):
-        """A per-pixel weight feeds the Σ(raw·w)/Σ(w) grid (so it differs from the
+        """A per-pixel norm feeds the Σraw/Σnorm grid (so it differs from the
         count mean); weight=None is the plain count-mean. (The CorrectionStack
         magnitude is gated by TestRsmCorrectionWeight; this is the plumbing — a
         strongly-varying weight makes the effect visible.)"""
@@ -161,7 +162,7 @@ class TestRsmGridCorrectionsWiring:
         img = np.random.default_rng(0).random((6, 32, 32)) + 1.0
         angles = [np.linspace(0, 0.5, 6)]
         # a strong gradient weight — the kind a CorrectionStack supplies, but
-        # large enough to move the weighted mean unmistakably.
+        # large enough to move the Σraw/Σnorm mean unmistakably.
         weight = np.linspace(0.1, 1.0, 32 * 32).reshape(32, 32)
 
         plain = grid_img_data(mapper, img, angles, energy=12000.0,

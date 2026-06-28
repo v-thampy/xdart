@@ -108,13 +108,16 @@ class GICorrectionStack:
     q-map via :meth:`refract_q` (a position correction, never a weight).
     ``None``/off factors are no-ops.
 
-    ⚠ Composition-sign note (flagged for review): the *primitives* above are
-    unambiguous + gate-pinned, but the *direction* in which footprint and the
-    path-length absorption enter the normalization is convention-dependent
-    (the GI notebook and the design doc differ).  We follow the design contract
-    (footprint → ``norm·=sin αi`` so ``corrected = result/sin αi``; absorption
-    → ``norm·=A`` (form B) or ``norm·=1/P`` (form A) so grazing-exit intensity is
-    raised) — verify against a worked GIXSGUI example when live data is available.
+    Composition convention: every intensity factor enters as the per-pixel
+    *boost* the measurement carries, so it multiplies into the ``Σnorm``
+    denominator of ``I = Σ raw / Σ norm`` and divides back out — footprint
+    ``norm·=1/sin αi`` (⇒ ``corrected = raw·sin αi``), Fresnel
+    ``norm·=|T(αi)|²|T(αf)|²``, absorption ``norm·=1/P`` (form A) or ``norm·=A``
+    (form B).  This matches the GI notebook, textbook GIXS, and the now-unified
+    RSM accumulator (``rsm.gridding`` was reconciled onto the same ``Σraw/Σnorm``;
+    see docs/design/design_stitch_rsm_accumulator_jun2026.md).  The *absolute* GI
+    conventions (``sample_orientation``/tilt) still await a worked GIXSGUI
+    real-data cross-check.
     """
 
     material: str | None = None
@@ -173,8 +176,10 @@ class GICorrectionStack:
         af = _floor_alpha(alpha_f_rad)
         norm = np.ones(np.shape(af), dtype=float)
         if self.footprint:
-            # corrected = result/sin αi  ⇒  sin αi in the denominator (per-frame).
-            norm = norm * np.sin(ai)
+            # over-illumination boosts measured raw by 1/sin αi, so the boost
+            # 1/sin αi enters the Σnorm denominator (per-frame scalar) and
+            # corrected = raw·sin αi (the Σraw/Σnorm convention).
+            norm = norm / np.sin(ai)
         if self.fresnel:
             v = (fresnel_transmission_sq(ai, oc["ac_rad"], oc["beta"])
                  * fresnel_transmission_sq(af, oc["ac_rad"], oc["beta"]))

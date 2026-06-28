@@ -72,7 +72,7 @@ class _FakeGridder3D:
 
     def Normalize(self, flag: bool) -> None:  # noqa: N802 — matches xu API
         # P6: the real gridder runs Normalize(False) so .data is the bare SUM
-        # (Σ over the bin), which the two-gridder Σ(raw·w)/Σ(w) form relies on.
+        # (Σ over the bin), which the two-gridder Σraw/Σnorm form relies on.
         self.normalize = bool(flag)
 
     def dataRange(  # noqa: N802 — matches xu API
@@ -310,7 +310,7 @@ class TestStreamingGridder:
         g = _FakeGridder3D.instances[-1]
         assert [c.data.shape[0] for c in g.chunks] == [3, 4, 2]
         # One StreamingGridder uses TWO xu.Gridder3D instances (P6): the
-        # Σ(raw·w) and Σ(w) accumulators of the weighted-mean grid.
+        # Σraw and Σnorm accumulators of the Σraw/Σnorm grid.
         assert len(_FakeGridder3D.instances) == 2
 
     def test_scout_sets_bounds_from_corner_q(self, patched_xu) -> None:
@@ -392,7 +392,7 @@ class TestStreamingGridder:
         # All three runs see the SAME pixel data because no chunk-local
         # mask is applied.  Verify by comparing the per-chunk data
         # arrays the mocked gridder recorded.  (Each run now builds the
-        # Σ(raw·w)/Σ(w) PAIR, so there are 3 × 2 = 6 instances-with-chunks.)
+        # Σraw/Σnorm PAIR, so there are 3 × 2 = 6 instances-with-chunks.)
         instances = [
             inst for inst in _FakeGridder3D.instances
             if inst.chunks  # ignore the ones that never received data
@@ -476,7 +476,7 @@ class TestGridImgDataStreaming:
             chunk_size=2,
             q_bounds=((-1, 1), (-2, 2), (-3, 3)),
         )
-        # No scout (q_bounds given) → only the Σ(raw·w)/Σ(w) accumulator pair
+        # No scout (q_bounds given) → only the Σraw/Σnorm accumulator pair
         # is constructed (the scout path uses mapper.pixel_q, not a Gridder3D).
         assert len(_FakeGridder3D.instances) == 2
         assert _FakeGridder3D.instances[0].data_range == (-1, 1, -2, 2, -3, 3)
@@ -524,7 +524,7 @@ class TestGridScansStreaming:
             q_bounds=((-5, 5), (-5, 5), (-5, 5)),
         )
         assert isinstance(out, RSMVolume)
-        # ONE accumulator PAIR (Σ(raw·w), Σ(w)) for the entire multi-scan run
+        # ONE accumulator PAIR (Σraw, Σnorm) for the entire multi-scan run
         assert len(_FakeGridder3D.instances) == 2
         # And it sees all 12 frames in 2-frame chunks → 6 chunks
         g = _FakeGridder3D.instances[0]
@@ -556,41 +556,41 @@ class TestGridScansStreaming:
 
 
 # ---------------------------------------------------------------------------
-# The Σ(raw·w) / Σ(w) accumulator core (P6) — real xrayutilities
+# The Σraw / Σnorm accumulator core (P6) — real xrayutilities
 # ---------------------------------------------------------------------------
 
 class TestTwoGridderAccumulator:
-    """The shared weighted-mean accumulator the RSM grid is built on.
+    """The shared Σraw/Σnorm accumulator the RSM grid is built on.
 
     Uses the REAL ``xu.Gridder3D`` (not the fake) — these pin the actual
     binning arithmetic the corrections ride on.
     """
 
-    def test_weighted_mean_else_count_mean(self) -> None:
+    def test_sum_ratio_else_count_mean(self) -> None:
         pytest.importorskip("xrayutilities")
         from xrd_tools.rsm.gridding import (
             _feed_pair, _new_gridder, _pair_intensity,
         )
         bins, bounds = (4, 4, 4), (0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
-        # two pixels in the SAME bin: values 10, 20 with weights 1, 3
+        # two pixels in the SAME bin: raw 10, 20 with per-pixel norm 1, 3
         q = np.array([0.5, 0.5])
         img = np.array([10.0, 20.0])
 
         gr = _new_gridder(bins, bounds); gn = _new_gridder(bins, bounds)
         _feed_pair(gr, gn, q, q, q, img, np.array([1.0, 3.0]))
         out = _pair_intensity(gr, gn)
-        # Σ(raw·w)/Σ(w) = (10·1 + 20·3)/(1+3) = 17.5
-        assert np.nanmax(out) == pytest.approx(17.5)
+        # Σraw/Σnorm = (10 + 20)/(1 + 3) = 7.5  (the stitch accumulator)
+        assert np.nanmax(out) == pytest.approx(7.5)
         assert np.isnan(out).any()          # empty bins are NaN, not 0
 
         gr2 = _new_gridder(bins, bounds); gn2 = _new_gridder(bins, bounds)
         _feed_pair(gr2, gn2, q, q, q, img, 1.0)
-        # unit weight ⇒ the old count-mean (10+20)/2 = 15
+        # unit norm ⇒ the count-mean (10+20)/2 = 15
         assert np.nanmax(_pair_intensity(gr2, gn2)) == pytest.approx(15.0)
 
     def test_masked_pixel_does_not_bias_denominator(self) -> None:
         """A NaN-data (masked) pixel drops from BOTH sums — not just the
-        numerator — so it can't drag the weighted mean down."""
+        numerator — so it can't drag the Σraw/Σnorm mean down."""
         pytest.importorskip("xrayutilities")
         from xrd_tools.rsm.gridding import (
             _feed_pair, _new_gridder, _pair_intensity,

@@ -113,7 +113,7 @@ class TestGIProvider:
         np.testing.assert_allclose(w1, w0)        # all factors off ⇒ unit weight
         np.testing.assert_allclose(s1, s0)
 
-    def test_footprint_only_scales_weight_by_sin_ai(self):
+    def test_footprint_only_scales_weight_by_inv_sin_ai(self):
         pytest.importorskip("pyFAI")
         from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
         from xrd_tools.integrate.stitch_hist import pyfai_gi_q_frames, pyfai_q_frames
@@ -123,7 +123,8 @@ class TestGIProvider:
         _q0, _c0, _s0, w0 = next(pyfai_q_frames([img], [ai]))
         _q1, _c1, _s1, w1 = next(pyfai_gi_q_frames([img], [ai], gi=fp,
                                                    incident_angles_deg=[aideg]))
-        np.testing.assert_allclose(w1, w0 * np.sin(np.deg2rad(aideg)))
+        # footprint boost 1/sin αi multiplies into the Σnorm weight
+        np.testing.assert_allclose(w1, w0 / np.sin(np.deg2rad(aideg)))
 
     def test_refraction_toggle_rewrites_q_else_leaves_it(self):
         """Provider wiring: refraction=True rewrites |q| (and stays finite/≥0);
@@ -195,7 +196,9 @@ class TestGIRunStitch:
                                    equal_nan=True)
 
     def test_gi_footprint_run_scales_intensity(self):
-        """run_stitch GI footprint-only ⇒ I = I_nonGI / sin(αi) (αi=0.3° from eta)."""
+        """run_stitch GI footprint-only ⇒ I = I_nonGI · sin(αi) (αi=0.3° from eta):
+        the 1/sin αi boost in the Σnorm denominator divides the over-illumination
+        back out, so the corrected intensity is smaller at grazing."""
         pytest.importorskip("pyFAI")
         from xrd_tools.analysis.plans import StitchPlan, run_stitch
         from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
@@ -208,7 +211,7 @@ class TestGIRunStitch:
                                    mode="1d", npt_1d=200, gi=GISettings(corrections=fp)), src)
         m = np.isfinite(plain.payload.intensity) & np.isfinite(gi.payload.intensity)
         ratio = gi.payload.intensity[m] / plain.payload.intensity[m]
-        np.testing.assert_allclose(ratio, 1.0 / np.sin(np.deg2rad(0.3)), rtol=1e-6)
+        np.testing.assert_allclose(ratio, np.sin(np.deg2rad(0.3)), rtol=1e-6)
 
     def test_gi_explicit_incident_angle_override(self):
         pytest.importorskip("pyFAI")
@@ -225,4 +228,4 @@ class TestGIRunStitch:
                                    gi=GISettings(corrections=fp, incident_angle_deg=1.0)), src)
         m = np.isfinite(plain.payload.intensity) & np.isfinite(gi.payload.intensity)
         ratio = gi.payload.intensity[m] / plain.payload.intensity[m]
-        np.testing.assert_allclose(ratio, 1.0 / np.sin(np.deg2rad(1.0)), rtol=1e-6)
+        np.testing.assert_allclose(ratio, np.sin(np.deg2rad(1.0)), rtol=1e-6)

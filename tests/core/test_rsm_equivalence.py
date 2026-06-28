@@ -1,7 +1,7 @@
 """P6.6 — the RSM equivalence spine (the live proxy), WITH corrections on.
 
-The two-gridder Σ(raw·w)/Σ(w) refactor must keep the streaming and single-shot
-paths identical and chunk-size-independent EVEN with a per-pixel weight — the
+The two-gridder Σraw/Σnorm refactor must keep the streaming and single-shot
+paths identical and chunk-size-independent EVEN with a per-pixel norm — the
 gates that the design notes were never compared on real intensities before.
 
 Uses an angle-driven fake mapper: per-pixel q is a function of the per-frame

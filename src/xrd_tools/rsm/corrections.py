@@ -1,10 +1,10 @@
 """Per-pixel intensity corrections for the RSM grid (P6).
 
-RSM bins onto a 3D ``(qx, qy, qz)`` grid via the shared ``Σ(raw·w)/Σ(w)``
-accumulator (:mod:`xrd_tools.rsm.gridding`).  The per-pixel weight ``w`` is the
+RSM bins onto a 3D ``(qx, qy, qz)`` grid via the shared ``Σraw/Σnorm``
+accumulator (:mod:`xrd_tools.rsm.gridding`).  The per-pixel ``norm`` is the
 SAME :class:`~xrd_tools.corrections.CorrectionStack` normalization the stitch
 histogram merge uses — so RSM, stitching, and pyFAI all share one intensity
-convention.
+convention (a multiplicative correction ``raw = true·C`` is applied by ``norm = C``).
 
 ``CorrectionStack.normalization`` is expressed against a pyFAI
 ``AzimuthalIntegrator``; RSM's geometry is xrayutilities (a

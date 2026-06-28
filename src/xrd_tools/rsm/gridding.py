@@ -43,16 +43,22 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# The shared Σ(raw·w) / Σ(w) accumulator (P6)
+# The shared Σ(raw) / Σ(norm) accumulator (P6)
 # ---------------------------------------------------------------------------
 # RSM bins onto a 3D grid via two xu.Gridder3D running with Normalize(False)
 # (so ``.data`` returns the bare SUM, not xu's count-mean): ``_grid_raw``
-# accumulates Σ(raw·w), ``_grid_norm`` accumulates Σ(w), and the volume is
-# ``Σ(raw·w)/Σ(w)`` — the SAME weighted-mean accumulator as the stitch
-# histogram merge + CorrectionStack (stitch_hist.stitch_q_grid), not the old
-# count-mean.  With ``weight = 1`` everywhere it reproduces the prior
-# ``Σraw/Σcounts`` exactly, so the default (no corrections) is behaviour-
-# preserving; a CorrectionStack weight only changes numbers when supplied.
+# accumulates Σraw, ``_grid_norm`` accumulates Σnorm, and the volume is
+# ``Σraw/Σnorm`` — the SAME accumulator as the stitch histogram merge
+# (``stitch_hist.stitch_q_grid``), and the convention the shared CorrectionStack
+# documents (a multiplicative correction is the per-pixel ``norm``).  With
+# ``norm = 1`` everywhere it reproduces the prior ``Σraw/Σcounts`` exactly, so
+# the default (no corrections) is behaviour-preserving; a CorrectionStack weight
+# only changes numbers when supplied.
+#
+# (Until Jun-2026 this accumulated ``Σ(raw·w)/Σw``, which only *weights* — it
+# cannot apply a multiplicative correction: it returned ``Σ(true·C²)/ΣC ≠ true``.
+# Unified onto ``Σraw/Σnorm`` per
+# docs/design/design_stitch_rsm_accumulator_jun2026.md.)
 
 def _new_gridder(bins: tuple[int, int, int],
                  bounds: tuple[float, ...] | None = None):
@@ -66,24 +72,30 @@ def _new_gridder(bins: tuple[int, int, int],
 
 
 def _feed_pair(grid_raw, grid_norm, qx, qy, qz, img, weight) -> None:
-    """Accumulate one chunk into the Σ(raw·w) and Σ(w) gridders.
+    """Accumulate one chunk into the Σraw and Σnorm gridders.
+
+    ``weight`` is the per-pixel ``norm`` of the shared correction convention: the
+    raw channel accumulates Σraw (the bare image), the norm channel accumulates
+    Σnorm, and the volume is ``Σraw/Σnorm`` — so a multiplicative correction
+    ``raw = true·C`` is applied by passing ``norm = C`` (recovers ``true``), the
+    SAME accumulator and convention as :func:`stitch_q_grid`.
 
     Bad pixels — non-finite q, non-finite image, or ``weight <= 0`` — are set
-    to NaN in BOTH the raw and the weight channel so xrayutilities drops them
-    from each sum (the same good-mask :func:`stitch_q_grid` uses): a NaN q
-    COORD would otherwise be clamped onto an edge bin, and a masked pixel's
-    finite weight would pollute the denominator → a biased mean.
+    to NaN in BOTH channels so xrayutilities drops them from each sum (the same
+    good-mask :func:`stitch_q_grid` uses): a NaN q COORD would otherwise be
+    clamped onto an edge bin, and a masked pixel's finite norm would pollute the
+    denominator → a biased mean.
     """
     img = np.asarray(img, dtype=float)
     w = np.broadcast_to(np.asarray(weight, dtype=float), img.shape)
     bad = ~(np.isfinite(qx) & np.isfinite(qy) & np.isfinite(qz)
             & np.isfinite(img) & np.isfinite(w) & (w > 0))
-    grid_raw(qx, qy, qz, np.where(bad, np.nan, img * w))
+    grid_raw(qx, qy, qz, np.where(bad, np.nan, img))
     grid_norm(qx, qy, qz, np.where(bad, np.nan, w))
 
 
 def _pair_intensity(grid_raw, grid_norm) -> np.ndarray:
-    """``Σ(raw·w) / Σ(w)``; NaN where the weight sum is non-positive (empty)."""
+    """``Σraw / Σnorm``; NaN where the norm sum is non-positive (empty)."""
     num = np.asarray(grid_raw.data, dtype=float)
     den = np.asarray(grid_norm.data, dtype=float)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -140,9 +152,10 @@ def grid_img_data(
         Mask pixels whose per-frame variance is zero (typically hot
         masks or chip gaps).  Default ``True``.
     weight : ndarray, optional
-        Per-pixel correction weight (``(H, W)`` or ``(N, H, W)``) that enters
-        the ``Σ(raw·w)/Σ(w)`` accumulator — e.g. a ``CorrectionStack``
-        normalization.  ``None`` → unit weight (the prior count-mean).
+        Per-pixel correction ``norm`` (``(H, W)`` or ``(N, H, W)``) — the
+        denominator of the ``Σraw/Σnorm`` accumulator, e.g. a ``CorrectionStack``
+        normalization (a multiplicative correction ``raw = true·C`` is applied by
+        ``norm = C``).  ``None`` → unit norm (the count-mean).
 
     Returns
     -------
@@ -272,7 +285,7 @@ class StreamingGridder:
     def __init__(self, mapper: PixelQMap, bins: tuple[int, int, int]) -> None:
         self.mapper = mapper
         self.bins = tuple(int(b) for b in bins)
-        # the Σ(raw·w) and Σ(w) accumulators (P6) — both KeepData+Normalize(False)
+        # the Σraw and Σnorm accumulators (P6) — both KeepData+Normalize(False)
         self._grid_raw: xu.Gridder3D | None = None
         self._grid_norm: xu.Gridder3D | None = None
         self._bounds: tuple[float, float, float, float, float, float] | None = None
@@ -411,9 +424,10 @@ class StreamingGridder:
             per-frame std heuristic only because there is only one
             "chunk" (the full stack) — see its docstring.
         weight : ndarray, optional
-            Per-pixel correction weight (``(H, W)`` or ``(n_chunk, H, W)``)
-            for the ``Σ(raw·w)/Σ(w)`` accumulator (e.g. a ``CorrectionStack``
-            normalization).  ``None`` → unit weight (the count-mean).
+            Per-pixel correction ``norm`` (``(H, W)`` or ``(n_chunk, H, W)``) —
+            the denominator of the ``Σraw/Σnorm`` accumulator (e.g. a
+            ``CorrectionStack`` normalization; ``raw = true·C`` is applied by
+            ``norm = C``).  ``None`` → unit norm (the count-mean).
 
         Notes
         -----

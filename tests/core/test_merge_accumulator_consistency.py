@@ -1,15 +1,15 @@
-"""Pins the stitch ↔ RSM merge-accumulator inconsistency (Jun 2026 finding).
+"""Pins the stitch ↔ RSM merge-accumulator equivalence (Jun 2026 reconciliation).
 
-Stitch merges with ``I = Σraw/Σnorm`` (``stitch_hist.stitch_q_grid``), RSM with
-``I = Σ(raw·w)/Σw`` (``rsm.gridding``) — two different accumulators that share one
-correction weight (``GICorrectionStack.gi_normalization`` / ``CorrectionStack``).
-Only ``Σraw/Σnorm`` correctly applies a multiplicative correction; the
-``Σ(raw·w)/Σw`` form can only *weight*, not *correct*.  See
-``docs/design/design_stitch_rsm_accumulator_jun2026.md``.
+Both reduction pipelines that share ``xrd_tools.corrections`` weights now merge
+with the SAME accumulator, ``I = Σraw/Σnorm`` (stitch: ``stitch_hist.stitch_q_grid``;
+RSM: ``rsm.gridding``).  This is the only accumulator that correctly *applies* a
+multiplicative correction: with ``raw = true·C`` and ``norm = C`` it recovers
+``true``.  (Until Jun-2026 RSM accumulated ``Σ(raw·w)/Σw``, which only *weights* —
+it returned ``Σ(true·C²)/ΣC ≠ true`` and could not apply a multiplicative
+correction.  See ``docs/design/design_stitch_rsm_accumulator_jun2026.md``.)
 
-The RSM test below is ``xfail(strict)`` — it documents the defect and will start
-PASSING (and fail the strict-xfail) once RSM is unified onto ``Σraw/Σnorm``, which
-is the cue to drop the marker.
+Both tests below assert the recovery of ``true``; a regression in either pipeline's
+accumulator (e.g. a slide back to ``Σ(raw·w)/Σw``) re-fails the RSM gate.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import pytest
 
 
 # raw = true · C, a per-pixel multiplicative boost (e.g. solid angle / footprint).
-# The merge must recover `true`; with norm/weight = C only Σraw/Σnorm does.
+# The merge must recover `true`; with norm = C only Σraw/Σnorm does.
 _TRUE = 100.0
 _C = np.array([1.0, 2.0, 4.0, 8.0, 1.0, 2.0, 4.0, 8.0])
 _RAW = _TRUE * _C
@@ -36,16 +36,9 @@ def test_stitch_accumulator_recovers_true_from_multiplicative_correction():
     assert float(res.intensity[0]) == pytest.approx(_TRUE, rel=1e-6)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "RSM uses Σ(raw·w)/Σw (rsm/gridding.py:86), NOT the stitch Σraw/Σnorm — "
-    "rsm/gridding.py:51 wrongly claims they are the same accumulator. A "
-    "Σ(raw·w)/Σw merge cannot apply a multiplicative correction via w: it "
-    "returns Σ(true·C²)/ΣC ≠ true. Unify RSM onto Σraw/Σnorm (see "
-    "docs/design/design_stitch_rsm_accumulator_jun2026.md), then drop this "
-    "marker."))
 def test_rsm_accumulator_recovers_true_from_multiplicative_correction():
-    """The RSM gridder should recover `true` from raw=true·C, weight=C the same
-    way stitch does — it currently does not (different accumulator)."""
+    """Σraw/Σnorm (RSM gridder) recovers `true` from raw=true·C, norm=C — the SAME
+    way stitch does (unified Jun 2026; was Σ(raw·w)/Σw, which could not)."""
     pytest.importorskip("xrayutilities")
     from xrd_tools.rsm.gridding import _feed_pair, _new_gridder, _pair_intensity
     n = _C.size

@@ -485,7 +485,7 @@ class RSMPlan:
     static_mask: np.ndarray | None = field(default=None, repr=False, compare=False)
     scout_pad: float = 0.0
     #: per-pixel CorrectionStack (solid-angle / polarization …) folded into the
-    #: Σ(raw·w)/Σ(w) grid as the SAME weight stitching uses; None = unit weight
+    #: Σraw/Σnorm grid as the SAME norm stitching uses; None = unit norm
     #: (the count-mean). Geometry-static (fixed lab detector).
     corrections: Any = None
     #: grazing-incidence settings (a GISettings) — adds the GI intensity weight
