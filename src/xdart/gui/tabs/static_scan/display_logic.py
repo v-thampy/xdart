@@ -4,8 +4,7 @@
 This module is the single source of truth for *what should be on screen*.
 It is deliberately free of Qt, pyqtgraph, h5py and pyFAI so its decision
 logic can be unit-tested headlessly (``pytest -m display_logic``) — see
-``tests/test_display_logic.py`` and the design doc
-(``display_refactor_plan.md``).
+``tests/test_display_logic.py``.
 
 Populated across the staged refactor:
 

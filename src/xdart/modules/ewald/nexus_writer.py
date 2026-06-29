@@ -1,7 +1,7 @@
 """xdart v2 NeXus writer (xdart 0.37+ schema).
 
-This module produces files conforming to the layout described in
-``xdart/docs/nexus_stitch_refactor_plan.md`` §2.  The single public
+This module produces files conforming to the v2 NeXus schema
+(``xrd_tools.io.schema``).  The single public
 entry point is :func:`save_scan_to_nexus`, called from
 :meth:`LiveScan._save_to_nexus`.
 

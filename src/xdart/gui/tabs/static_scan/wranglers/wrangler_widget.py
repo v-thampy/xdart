@@ -28,9 +28,7 @@ logger = logging.getLogger(__name__)
 # Sentinel used by ``_apply_threshold_inline`` to mark out-of-band
 # pixels.  pyFAI's CSR integrator auto-skips NaN at integrate time
 # without invalidating the mask CRC, so the per-frame threshold
-# filter survives without forcing a per-frame LUT rebuild.  See the
-# session_may2026_nexusformat_writer.md lesson notes for the full
-# story (lessons 2, 3 in particular).
+# filter survives without forcing a per-frame LUT rebuild.
 _THRESHOLD_NAN = np.float32(np.nan)
 
 # Default cadence: flush scan state to disk every N frames in batch
@@ -46,8 +44,7 @@ _LIVE_SAVE_INTERVAL = 8
 # _save_due cap bound in imageWranglerThread) guarantees a save fires before the
 # unsaved in-memory set reaches _in_memory_cap, so no frame's int_1d is ever
 # evicted before it's written — the high interval is safe on scans longer than
-# the cap.  Effective cadence is therefore min(this, cap-margin).  See
-# review/CC_data_loss_save_vs_evict_jun2026.md.
+# the cap.  Effective cadence is therefore min(this, cap-margin).
 _LIVE_SAVE_INTERVAL_1D = 1000
 
 

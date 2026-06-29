@@ -2763,7 +2763,7 @@ def _read_data_group(
 # ===========================================================================
 # v2 schema reader (xdart 0.37+)
 # ---------------------------------------------------------------------------
-# See xdart/docs/nexus_stitch_refactor_plan.md §2 for the layout.
+# The v2 schema layout is defined in ``xrd_tools.io.schema``.
 # v1 (xdart ≤ 0.36.x) is intentionally not supported — re-reduce old
 # data with current xdart if you need to view it.
 #

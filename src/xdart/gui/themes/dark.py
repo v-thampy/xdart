@@ -2,7 +2,7 @@
 
 The QSS is a single ``_QSS_TEMPLATE`` of ``$token`` placeholders
 (``string.Template`` -- ``$`` avoids clashing with QSS ``{ }`` blocks).
-``DARK``/``LIGHT`` (from the Direction-A mockup; XDART_REDESIGN.md s3)
+``DARK``/``LIGHT`` (from the Direction-A mockup)
 supply the values; ``render_qss`` substitutes and ``apply_theme`` re-applies
 on a switch.  ``DARK`` refines the original Dracula palette (same #bd93f9
 accent / #5269a8 browse).  ``apply_dark_theme``/``DARK_QSS`` stay as aliases.
