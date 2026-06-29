@@ -2270,7 +2270,16 @@ class staticWidget(QWidget):
         self.stitch_thread.mode = mode
         self.stitch_thread.params = params
         self.stitch_thread.stop_requested = False
-        self._stitch_status(f'Stitching ({mode.upper()})…')
+        # Fail-loud UX: a detector mask that can't be applied to the stitch
+        # geometry is dropped to None by _flat_mask_as_bool with only a log
+        # warning, so the stitch would silently run UNMASKED.  Surface it in
+        # the run status rather than letting it pass unseen.
+        if getattr(scan, 'global_mask', None) is not None and params.get('mask') is None:
+            self._stitch_status(
+                f'Detector mask could not be applied — stitching '
+                f'({mode.upper()}) UNMASKED…')
+        else:
+            self._stitch_status(f'Stitching ({mode.upper()})…')
         self.stitch_thread.start()         # started -> _enter_run_state
 
     def _build_stitch_params(self, mode):
