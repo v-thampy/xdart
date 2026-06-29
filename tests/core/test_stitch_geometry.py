@@ -72,6 +72,60 @@ def test_geometry_integrators_fail_loud_on_nonfinite_motor():
         create_multigeometry_integrators_from_geometry(diff, {"nu": nu, "del": del_})
 
 
+def test_legacy_integrators_fail_loud_on_nonfinite_rotation():
+    """The LEGACY (base_poni + rot1_key/rot2_key) path must also fail loud on a
+    NaN rotation — the twin of the calibrated-path guard above.  A grouped stitch
+    NaN-pads a member lacking the rotation motor, so the rot*_key column is
+    present-but-NaN; pyFAI would otherwise collapse that frame (qmax≈0) silently."""
+    pytest.importorskip("pyFAI")
+    from xrd_tools.integrate.multi import create_multigeometry_integrators
+    base = PONI(dist=0.39, poni1=0.10, poni2=0.12, rot1=0.003, rot2=0.0, rot3=0.0,
+                wavelength=0.729e-10, detector="Pilatus300kw")
+    nu = np.array([0.0, 3.0, 6.0])
+    with pytest.raises(ValueError, match="non-finite"):           # NaN in rot2
+        create_multigeometry_integrators(
+            base, rot1_angles=nu, rot2_angles=np.array([6.0, np.nan, 40.0]))
+    with pytest.raises(ValueError, match="non-finite"):           # NaN in rot1
+        create_multigeometry_integrators(
+            base, rot1_angles=np.array([0.0, np.nan, 6.0]))
+    # A zero-supplied rot2 (rot2_angles=None) must NOT trip the guard.
+    ok = create_multigeometry_integrators(base, rot1_angles=nu)
+    assert len(ok) == 3
+
+
+def test_multimember_stitch_rejects_mismatched_wavelengths():
+    """A multi-member stitch integrates every member through ONE shared base
+    calibration (q ∝ sinθ/λ), so members at different X-ray energies land in a
+    silently-wrong q-grid.  Fail loud when member wavelengths diverge >0.1%; allow
+    a sub-rtol difference; skip members that carry no wavelength."""
+    from types import SimpleNamespace
+
+    from xrd_tools.analysis.plans import (
+        _assert_members_same_wavelength, _member_wavelength_m,
+    )
+
+    def _m(wl):
+        return SimpleNamespace(poni=SimpleNamespace(wavelength=wl))
+
+    # wavelength also resolvable via a diffractometer calibration poni.
+    diff_member = SimpleNamespace(
+        poni=None,
+        diffractometer=SimpleNamespace(
+            calibration=SimpleNamespace(poni=SimpleNamespace(wavelength=0.729e-10))))
+    assert _member_wavelength_m(diff_member) == pytest.approx(0.729e-10)
+    assert _member_wavelength_m(SimpleNamespace(poni=None)) is None
+
+    # >0.1% apart → raise (1% here).
+    with pytest.raises(ValueError, match="matching X-ray wavelengths"):
+        _assert_members_same_wavelength([_m(0.729e-10), _m(0.736e-10)])
+    # within rtol → fine.
+    _assert_members_same_wavelength([_m(0.729e-10), _m(0.7295e-10)])
+    # a member with no wavelength is skipped (can't compare) → no raise.
+    _assert_members_same_wavelength([_m(0.729e-10), SimpleNamespace(poni=None)])
+    # fewer than two known wavelengths → no-op.
+    _assert_members_same_wavelength([_m(0.729e-10)])
+
+
 def test_calibrated_goniometer_integrators_match_get_ai():
     """The fitted per-axis scales are used (GAP A): per-frame integrator rotations
     equal pyFAI Goniometer.get_ai(motors)."""

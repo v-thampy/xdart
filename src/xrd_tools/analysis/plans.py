@@ -215,6 +215,47 @@ def _harvest_frame_records(source, scan_labels, *, selected_labels=None):
         return None
 
 
+def _member_wavelength_m(member: Any) -> float | None:
+    """A stitch member's calibration wavelength in metres, or ``None`` if it
+    carries none (its own ``poni``, else its diffractometer's calibration poni)."""
+    wl = getattr(getattr(member, "poni", None), "wavelength", None)
+    if wl is None:
+        cal = getattr(getattr(member, "diffractometer", None), "calibration", None)
+        wl = getattr(getattr(cal, "poni", None), "wavelength", None)
+    if wl is None:
+        return None
+    try:
+        wl_f = float(wl)
+    except (TypeError, ValueError):
+        return None
+    return wl_f if np.isfinite(wl_f) and wl_f > 0.0 else None
+
+
+def _assert_members_same_wavelength(members: Sequence[Any], *, rtol: float = 1.0e-3) -> None:
+    """Fail loud if grouped stitch members were taken at different X-ray
+    wavelengths.
+
+    A multi-member stitch integrates EVERY member through one shared base
+    calibration (``plan.base_poni`` / ``members[0].poni``), and ``q ∝ sinθ/λ`` —
+    so a member at a different λ lands in a silently-wrong q-space with no error
+    (``check_energy_consistency`` only ever compares GI-vs-calibration within one
+    scan, never member-vs-member).  Only members that expose a wavelength are
+    compared; a divergence beyond ``rtol`` (0.1%) raises."""
+    known = [(i, wl) for i, m in enumerate(members)
+             if (wl := _member_wavelength_m(m)) is not None]
+    if len(known) < 2:
+        return
+    ref_i, ref = known[0]
+    for i, wl in known[1:]:
+        if abs(wl - ref) > rtol * max(abs(wl), abs(ref)):
+            raise ValueError(
+                f"multi-member stitch requires matching X-ray wavelengths "
+                f"(q ∝ 1/λ): member[{i}] λ={wl:.6e} m differs from member[{ref_i}] "
+                f"λ={ref:.6e} m by >{rtol * 100:.1f}%. Stitching members taken at "
+                f"different energies into one shared q-grid is silently wrong — "
+                f"reduce them separately or recalibrate to a common geometry.")
+
+
 def run_stitch(
     plan: StitchPlan,
     source: FrameSource | Sequence[FrameSource],
@@ -241,6 +282,8 @@ def run_stitch(
         members = [ensure_frame_source(s) for s in source]
         if not members:
             raise ValueError("run_stitch received an empty source group")
+        if len(members) > 1:
+            _assert_members_same_wavelength(members)
         src = CompositeFrameSource(members) if len(members) > 1 else members[0]
     else:
         src = ensure_frame_source(source)

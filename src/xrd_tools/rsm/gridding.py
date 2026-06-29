@@ -558,6 +558,21 @@ def grid_img_data_streaming(
             "angles arrays must each have length N matching img.shape[0]"
         )
 
+    # A 3D (N, H, W) *per-frame* weight must be sliced to each chunk's frames,
+    # exactly like the image + angle arrays — otherwise every chunk gets the full
+    # N-frame weight and _feed_pair fails / mis-broadcasts (the chunk-safety bug).
+    # A 2D (H, W) per-pixel weight (what rsm_correction_weight returns) broadcasts
+    # over frames and is passed through unchanged.  The weight's spatial dims must
+    # already match the POST-ROI image (the caller crops a per-pixel weight to the
+    # ROI, as rsm_correction_weight does — add()/grid_img_data crop only the image,
+    # never the weight, so cropping it here too would double-crop).
+    weight_arr = None if weight is None else np.asarray(weight, dtype=float)
+    per_frame_weight = weight_arr is not None and weight_arr.ndim == 3
+    if per_frame_weight and weight_arr.shape[0] != n_frames:
+        raise ValueError(
+            f"per-frame weight has {weight_arr.shape[0]} frames but the stack has "
+            f"{n_frames}; a 3D weight must be (N, H, W) with N == img.shape[0].")
+
     sg = StreamingGridder(mapper, bins)
     if q_bounds is None:
         sg.scout(
@@ -572,6 +587,7 @@ def grid_img_data_streaming(
         end = min(start + chunk_size, n_frames)
         img_chunk = img[start:end]
         angles_chunk = [np.asarray(a)[start:end] for a in angles]
+        weight_chunk = weight_arr[start:end] if per_frame_weight else weight_arr
         sg.add(
             img_chunk,
             angles_chunk,
@@ -579,7 +595,7 @@ def grid_img_data_streaming(
             UB=UB,
             roi=roi,
             static_mask=static_mask,
-            weight=weight,
+            weight=weight_chunk,
         )
     return sg.to_volume()
 

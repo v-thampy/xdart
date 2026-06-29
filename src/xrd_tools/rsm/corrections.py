@@ -134,6 +134,20 @@ def rsm_correction_weight(
                 "GI RSM (RSMPlan.gi) requires GISettings.incident_angle_deg (a "
                 "fixed incidence angle); per-frame-varying αi is the real-data-"
                 "gated tail.")
+        # Fail loud rather than silently diverge from GI stitch: the RSM grid
+        # applies only the GI *intensity* weight (footprint/Fresnel/absorption);
+        # it does NOT yet rewrite the q-coordinates for refraction the way the
+        # stitch GI provider (pyfai_gi_q_frames → refract_q) does.  Accepting a
+        # refraction=True stack here would produce a q-space that disagrees with
+        # the GI stitch while looking like the same correction object.  RSM
+        # q-refraction is gated on real-data GI validation (don't guess geometry).
+        if getattr(gi.corrections, "refraction", False):
+            raise NotImplementedError(
+                "GI refraction (q-coordinate rewriting) is not implemented in the "
+                "RSM path — it would silently diverge from GI stitch.  Pass a "
+                "GICorrectionStack(refraction=False) for RSM until RSM q-refraction "
+                "lands (real-data-gated); the intensity weights "
+                "(footprint/Fresnel/absorption) still apply.")
         giw = gi_grid_weight(
             header, gi.corrections, incident_angle_deg=gi.incident_angle_deg,
             sample_orientation=gi.sample_orientation, tilt_deg=gi.tilt_deg, roi=roi)

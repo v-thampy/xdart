@@ -64,6 +64,22 @@ def create_multigeometry_integrators(
             f"rot1_angles length {rot1.shape} != rot2_angles length {rot2.shape}"
         )
 
+    # Fail loud on a non-finite rotation rather than letting pyFAI silently
+    # collapse the geometry (NaN rot → qmax≈0, that frame dropped with no error).
+    # Mirrors the calibrated path (create_multigeometry_integrators_from_geometry):
+    # a CompositeFrameSource NaN-pads a member lacking the rotation motor, so the
+    # rot1_key/rot2_key column is present-but-NaN and slips past the missing-key
+    # guard upstream.  This is the legacy (base_poni + rot*_key) twin of that fix.
+    for _name, _vals, _supplied in (("rot1", rot1, True),
+                                    ("rot2", rot2, rot2_angles is not None)):
+        if _supplied and not np.all(np.isfinite(_vals)):
+            bad = np.flatnonzero(~np.isfinite(_vals)).tolist()
+            raise ValueError(
+                f"{_name}_angles has non-finite value(s) at frame position(s) "
+                f"{bad[:10]}{' …' if len(bad) > 10 else ''} — a grouped/composite "
+                f"source is NaN-padding a member that lacks this detector-rotation "
+                f"motor.  Every member of a multi-source stitch must provide it.")
+
     base_ai = poni_to_integrator(base_poni)
     base_rot1 = float(base_ai.rot1)
     base_rot2 = float(base_ai.rot2)

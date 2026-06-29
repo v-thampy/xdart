@@ -11,6 +11,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+# natsort is a hard dependency (pyproject).  Import it at module top and let an
+# ImportError surface: a broken install must fail loud, not silently degrade to
+# lexicographic order — which mis-orders a discovered stitch/RSM group
+# (scan_1, scan_10, scan_2) with no warning, silently corrupting the merge.
+from natsort import os_sorted
+
 from xrd_tools.core.scan import SourceKind, SourceSpec, coerce_source_kind
 
 _NEXUS_EXTS = {".nxs", ".h5", ".hdf5", ".cxi"}
@@ -19,11 +25,7 @@ _NEXUS_EXTS = {".nxs", ".h5", ".hdf5", ".cxi"}
 def _walk_files(directory: Path, recursive: bool) -> list[Path]:
     it = directory.rglob("*") if recursive else directory.iterdir()
     files = [p for p in it if p.is_file()]
-    try:
-        from natsort import os_sorted
-        return list(os_sorted(files))
-    except Exception:
-        return sorted(files)
+    return list(os_sorted(files))
 
 
 def discover_scans(directory, kind, *, recursive: bool = False,

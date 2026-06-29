@@ -6,6 +6,7 @@ split fix)."""
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.io.nexus import (
@@ -175,6 +176,26 @@ def test_write_stitched_roundtrips_through_read_stitched(tmp_path):
     assert ds["stitched_2d"].shape == (N_Q, N_CHI)
     np.testing.assert_allclose(ds["stitched_2d"].values, s2.intensity, rtol=1e-6)
     np.testing.assert_allclose(ds["stitched_1d"].values, s1.intensity, rtol=1e-6)
+
+
+def test_write_stitched_rejects_transposed_cake(tmp_path):
+    """write_stitched fails loud on a (chi, q) cake: read_stitched blindly applies
+    (q, chi) and the stitched validator skips the row-count block, so a transposed
+    array would round-trip as silently-wrong axes.  Enforce (n_q, n_chi) at write."""
+    import h5py
+    from xrd_tools.io.nexus import write_stitched
+
+    s2 = IntegrationResult2D(
+        radial=np.linspace(0.5, 4.0, N_Q),
+        azimuthal=np.linspace(-180, 180, N_CHI, endpoint=False),
+        intensity=np.random.default_rng(4).random((N_Q, N_CHI)),
+        unit="q_A^-1", azimuthal_unit="chi_deg",
+    )
+    s2.intensity = s2.intensity.T            # (chi, q) — transposed (slots dataclass)
+    p = tmp_path / "bad.nxs"
+    with h5py.File(p, "w") as f:
+        with pytest.raises(ValueError, match=r"n_q.*n_chi|len\(radial\)"):
+            write_stitched(f.create_group("entry"), stitched_2d=s2)
 
 
 def test_write_stitched_persists_provenance(tmp_path):

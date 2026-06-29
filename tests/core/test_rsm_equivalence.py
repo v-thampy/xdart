@@ -105,3 +105,36 @@ def test_weight_changes_intensity_vs_count_mean():
     both = np.isfinite(plain) & np.isfinite(wtd)
     assert both.any()
     assert not np.allclose(plain[both], wtd[both])
+
+
+def test_3d_per_frame_weight_chunk_equivalence():
+    """A 3D (N, H, W) PER-FRAME weight must chunk the same as the single-shot
+    path: the streaming wrapper slices weight[start:end] per chunk (the
+    chunk-safety fix).  Before the fix every chunk got the full N-frame weight →
+    a shape mismatch / wrong result; now the binned intensity is chunk-size-
+    independent and equals the single-shot grid."""
+    pytest.importorskip("xrayutilities")
+    from xrd_tools.rsm.gridding import grid_img_data, grid_img_data_streaming
+    mapper, img, angles, _w2d, bounds = _setup()
+    n = img.shape[0]
+    w3d = np.random.default_rng(1).uniform(0.2, 1.0, size=img.shape)  # (N, H, W)
+
+    single = grid_img_data(mapper, img, angles, energy=1.0e4, bins=(8, 8, 8),
+                           mask_static_pixels=False, weight=w3d)
+    for cs in (1, 3, n):
+        stream = grid_img_data_streaming(
+            mapper, img, angles, energy=1.0e4, bins=(8, 8, 8),
+            q_bounds=bounds, chunk_size=cs, weight=w3d)
+        np.testing.assert_allclose(single.intensity, stream.intensity, equal_nan=True)
+
+
+def test_3d_weight_frame_count_mismatch_raises():
+    """A 3D weight whose frame count != the stack's must fail loud, not silently
+    mis-slice."""
+    pytest.importorskip("xrayutilities")
+    from xrd_tools.rsm.gridding import grid_img_data_streaming
+    mapper, img, angles, _w2d, bounds = _setup()
+    bad = np.ones((img.shape[0] + 1, img.shape[1], img.shape[2]))
+    with pytest.raises(ValueError, match="per-frame weight"):
+        grid_img_data_streaming(mapper, img, angles, energy=1.0e4, bins=(8, 8, 8),
+                                q_bounds=bounds, chunk_size=3, weight=bad)

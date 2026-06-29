@@ -405,7 +405,10 @@ def _partition_selected_local_labels(source, members, selected_labels):
     is in the GLOBAL ``0..N-1`` index, so it's resolved through the composite's
     ``_map`` (``global → (member_pos, local_label)``).  For a single source the
     selection is already that source's own labels.  A bare multi-member sequence
-    with a selection is ambiguous (no caller does this) → not filtered."""
+    with a selection is ambiguous — there is no global→local map to honour the
+    selection, so silently widening to ALL frames would be a label-space footgun;
+    raise instead (no caller hits this: run_stitch wraps groups in a
+    CompositeFrameSource before harvest)."""
     if selected_labels is None:
         return None
     sel = {int(s) for s in selected_labels}
@@ -418,7 +421,11 @@ def _partition_selected_local_labels(source, members, selected_labels):
         return per
     if len(members) == 1:
         return [sel]
-    return None
+    raise ValueError(
+        f"selected_labels={sorted(sel)} given for a bare {len(members)}-member "
+        "sequence with no global→local index map; wrap the group in a "
+        "CompositeFrameSource (or omit selected_labels) — silently recording all "
+        "frames would ignore the selection.")
 
 
 def _expand_frame_sources(source) -> list:

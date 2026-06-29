@@ -1935,6 +1935,17 @@ def write_stitched(
             g.create_dataset("provenance_json", data=prov_json, dtype=_UTF8_DTYPE)
 
     if stitched_2d is not None:
+        # Fail loud on a transposed cake: read_stitched blindly applies (q, chi)
+        # to the stored array and the stitched validator skips the row-count
+        # block, so a transposed (n_chi, n_q) array round-trips as silently
+        # wrong axes for a square cake.  Enforce the (n_q, n_chi) contract at the
+        # write boundary (complements, never relaxes, the validators).
+        _i2d = np.asarray(stitched_2d.intensity, np.float32)
+        _exp = (len(stitched_2d.radial), len(stitched_2d.azimuthal))
+        if _i2d.shape != _exp:
+            raise ValueError(
+                f"stitched_2d.intensity shape {_i2d.shape} != (len(radial), "
+                f"len(azimuthal)) = {_exp}; the stored cake must be (n_q, n_chi).")
         if "stitched_2d" in entry_grp:
             del entry_grp["stitched_2d"]
         g = entry_grp.create_group("stitched_2d")
@@ -1942,7 +1953,7 @@ def write_stitched(
         g.attrs["signal"] = "intensity"
         g.attrs["axes"] = ["q", "chi"]
         g.create_dataset("intensity",  # (n_q, n_chi) as-is — see docstring
-                         data=np.asarray(stitched_2d.intensity, np.float32), **ck)
+                         data=_i2d, **ck)
         qd = g.create_dataset("q", data=np.asarray(stitched_2d.radial, np.float32))
         qd.attrs["units"] = stitched_2d.unit
         cd = g.create_dataset("chi", data=np.asarray(stitched_2d.azimuthal, np.float32))

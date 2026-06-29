@@ -133,3 +133,27 @@ def test_frame_record_labels_skips_unloadable(tmp_path):
         write_frame_record(frames, "frame_0002")   # no thumbnail, no source → skip
         labels = frame_record_labels(e["frames"])
     assert [t[0] for t in labels] == ["1"]
+
+
+def test_partition_bare_multimember_with_selection_raises():
+    """_partition_selected_local_labels: a bare multi-member sequence (no
+    global→local _map) WITH a selection is ambiguous — raise rather than silently
+    widening to ALL frames.  A composite or single source resolves normally; no
+    selection is a no-op.  (No current caller hits the bare-multi case — run_stitch
+    wraps groups in a CompositeFrameSource — this pins the fail-loud contract.)"""
+    import pytest
+    from types import SimpleNamespace
+    from xrd_tools.io.nexus_record import _partition_selected_local_labels
+
+    bare = SimpleNamespace()                       # no _map attribute
+    members = [SimpleNamespace(), SimpleNamespace()]
+    with pytest.raises(ValueError, match="CompositeFrameSource"):
+        _partition_selected_local_labels(bare, members, [0, 1])
+    # no selection → no restriction
+    assert _partition_selected_local_labels(bare, members, None) is None
+    # single member → the selection passes through as that member's own labels
+    assert _partition_selected_local_labels(
+        SimpleNamespace(), [SimpleNamespace()], [3, 4]) == [{3, 4}]
+    # composite (carries _map) → resolves global → (member, local)
+    comp = SimpleNamespace(_map=[(0, 10), (1, 20)])
+    assert _partition_selected_local_labels(comp, members, [0, 1]) == [{10}, {20}]

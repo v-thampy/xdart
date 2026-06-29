@@ -145,6 +145,24 @@ class TestGiGridWeight:
         with pytest.raises(ValueError, match="incident_angle_deg"):
             rsm_correction_weight(_header(), None, gi=GISettings(corrections=gi))
 
+    def test_gi_refraction_rejected_in_rsm(self):
+        """RSM applies only the GI *intensity* weight, not the q-coordinate
+        refraction the stitch GI provider does — so a refraction=True stack would
+        silently diverge from GI stitch.  Reject it (default is refraction=True);
+        refraction=False is accepted."""
+        pytest.importorskip("pyFAI")
+        from xrd_tools.corrections.grazing import GICorrectionStack, GISettings
+        from xrd_tools.rsm.corrections import rsm_correction_weight
+        on = GICorrectionStack(material="Si", energy_eV=10000.0)   # refraction=True default
+        with pytest.raises(NotImplementedError, match="refraction"):
+            rsm_correction_weight(
+                _header(), None,
+                gi=GISettings(corrections=on, incident_angle_deg=0.3))
+        off = GICorrectionStack(material="Si", energy_eV=10000.0, refraction=False)
+        w = rsm_correction_weight(
+            _header(), None, gi=GISettings(corrections=off, incident_angle_deg=0.3))
+        assert w is not None and np.all(np.isfinite(w))
+
 
 class TestRsmGridCorrectionsWiring:
     """corrections flow end-to-end through the grid and change I."""
