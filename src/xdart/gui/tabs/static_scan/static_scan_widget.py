@@ -2266,17 +2266,25 @@ class staticWidget(QWidget):
         """run_stitch kwargs from the integrator's existing 1D/2D fields (reused
         — no separate stitch options in Phase 1).
 
-        NOTE (Phase 1a): mask is left None — the wrangler's detector mask is
-        flat indices, and converting it to the 2D boolean run_stitch wants is a
-        Phase-1b follow-up.  No `backend` kwarg: run_stitch is MultiGeometry-only
-        today (the GI→histogram backend needs a headless change first)."""
+        The wrangler's detector/global mask is stored on the scan as flat indices
+        (``scan.global_mask``) with the full-res ``scan.detector_shape``; convert
+        it to the 2D boolean (True = exclude) run_stitch → pyFAI expect, reusing
+        the canonical fail-soft converter (a mask that doesn't fit the detector is
+        dropped with a warning, never crashes the stitch).  No `backend` kwarg:
+        run_stitch is MultiGeometry-only today (the GI→histogram backend needs a
+        headless change first)."""
+        from xdart.modules.reduction import _flat_mask_as_bool
         args = self.scan.bai_1d_args if mode == '1d' else self.scan.bai_2d_args
+        mask = _flat_mask_as_bool(
+            getattr(self.scan, 'global_mask', None),
+            getattr(self.scan, 'detector_shape', None),
+        )
         p = dict(
             unit=args.get('unit', 'q_A^-1'),
             method=args.get('method', 'BBox'),
             radial_range=args.get('radial_range'),
             azimuth_range=args.get('azimuth_range'),
-            mask=None,
+            mask=mask,
         )
         if mode == '1d':
             p['npt_1d'] = int(self.scan.bai_1d_args.get('numpoints') or 2000)

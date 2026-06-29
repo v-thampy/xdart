@@ -3327,3 +3327,23 @@ def test_stitch_display_persists_across_updates(widget):
     df.scan.stitched_1d = None
     assert df._active_stitch_mode() is None
     assert df._live_mode() in (Mode.INT_1D, Mode.INT_2D)
+
+
+def test_build_stitch_params_converts_flat_mask_to_2d_bool(widget):
+    """_build_stitch_params turns the scan's flat-index detector mask + detector_
+    shape into the 2D boolean (True = exclude) run_stitch/pyFAI want; it degrades
+    to None (mask dropped, never crashes) when the shape is unknown."""
+    w = widget
+    w.scan.detector_shape = (4, 5)
+    w.scan.global_mask = np.array([0, 7])          # flat indices 0 and 7 masked
+    w.scan.bai_1d_args = {'unit': 'q_A^-1', 'method': 'BBox', 'numpoints': 1000}
+    m = w._build_stitch_params('1d')['mask']
+    assert m is not None and m.shape == (4, 5) and m.dtype == bool
+    assert m.ravel()[0] and m.ravel()[7] and m.sum() == 2
+    # Unknown detector shape → converter returns None (graceful, no crash).
+    w.scan.detector_shape = None
+    assert w._build_stitch_params('1d')['mask'] is None
+    # No mask at all → None.
+    w.scan.detector_shape = (4, 5)
+    w.scan.global_mask = None
+    assert w._build_stitch_params('1d')['mask'] is None
