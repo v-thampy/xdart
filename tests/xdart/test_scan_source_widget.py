@@ -3,6 +3,7 @@
 images affordance + raw-reachable dot, and directory mode."""
 import numpy as np
 import pytest
+import time
 
 pytest.importorskip("silx")
 
@@ -41,6 +42,16 @@ def _spec_with_images(tmp_path):
         np.full((6, 6), i + 1, dtype="int32").tofile(
             tmp_path / f"myscan_scan5_{i:04d}.raw")
     return spec
+
+
+def _wait_for(qapp, predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
 
 
 def test_widget_spec_metadata_then_images(qapp, tmp_path):
@@ -151,4 +162,53 @@ def test_widget_directory_mode_discovers_scans(qapp, tmp_path):
             ["myscan [5.1]", "myscan [6.1]"]
         assert emitted[-1].source.frame_indices == [0, 1, 2]
     finally:
+        w.deleteLater()
+
+
+def test_widget_async_probe_emits_latest_selection(qapp, tmp_path):
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+
+    spec = _spec_with_images(tmp_path)
+    w = ScanSourceWidget(mode="roi", async_probe=True)
+    emitted = []
+    w.sigSourceChanged.connect(lambda sel: emitted.append(sel))
+    try:
+        w.set_uri(str(spec))
+        assert "probing" in w.raw_dot.text()
+        assert _wait_for(qapp, lambda: emitted and emitted[-1] is not None)
+        first = emitted[-1]
+        assert first.reachable is False
+
+        w.image_dir_edit.setText(str(tmp_path))
+        w.det_rows.setText("6")
+        w.det_cols.setText("6")
+        w.dtype_combo.setCurrentText("int32")
+        w._emit_selection()
+
+        assert _wait_for(qapp, lambda: emitted[-1] is not first)
+        sel = emitted[-1]
+        assert sel.reachable is True
+        np.testing.assert_allclose(sel.source.load_frame(0), 1.0)
+    finally:
+        w.shutdown_probe_worker()
+        w.deleteLater()
+
+
+def test_widget_async_probe_ignores_stale_generation(qapp, tmp_path):
+    from xdart.gui.tabs.static_scan.scan_source_widget import ScanSourceWidget
+    from xrd_tools.core.scan import SourceKind, SourceSpec
+
+    w = ScanSourceWidget(mode="roi", async_probe=True)
+    emitted = []
+    w.sigSourceChanged.connect(lambda sel: emitted.append(sel))
+    try:
+        spec = SourceSpec(str(tmp_path), SourceKind.TIFF_SERIES)
+        sig = w._spec_signature(spec)
+        w._probe_generation = 2
+        w._pending_sig = sig
+        w._on_probe_done((1, sig, spec, object(), True, None, None))
+        assert emitted == []
+        assert w._last_selection is None
+    finally:
+        w.shutdown_probe_worker()
         w.deleteLater()

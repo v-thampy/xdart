@@ -354,6 +354,12 @@ display data changes, viewer mode changes, and stitch-mode changes. `MoreButton`
 truth table, grouped scans producing one composite source, no GUI-thread blocking regression for a
 slow fake source.
 
+**Status:** PARTIAL FOUNDATION IMPLEMENTED. `ScanSourceWidget` now has an opt-in async source
+probe path with generation cancellation and stale-result suppression, while preserving the existing
+synchronous default for current callers. This gives the future Source card the needed worker pattern
+without flipping production source selection yet. The V2 panel still delegates "Choose Source" to
+the legacy wrangler browser until ScanSourceWidget is mounted and parity-tested as the active card.
+
 ### Phase 4 — Experiment card and instrument producer tools
 
 - Build Experiment summaries:
