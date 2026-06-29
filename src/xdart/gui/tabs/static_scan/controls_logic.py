@@ -48,6 +48,21 @@ class SectionId(str, Enum):
     ANALYSIS = "analysis"
 
 
+class ControlAction(str, Enum):
+    """Intent emitted by the Controls V2 preview.
+
+    The Qt widget renders these as buttons, but the static-scan tab owns the
+    actual routing while V2 is hidden.  Keeping the action list pure avoids
+    giving the preview direct access to wrangler/integrator internals.
+    """
+
+    CHOOSE_SOURCE = "choose_source"
+    CALIBRATE = "calibrate"
+    MAKE_MASK = "make_mask"
+    REFINE_GEOMETRY = "refine_geometry"
+    ADVANCED_PROCESSING = "advanced_processing"
+
+
 class FieldId(str, Enum):
     SOURCE_PATH = "source.path"
     SOURCE_FRAMES = "source.frames"
@@ -193,6 +208,16 @@ class AnalysisLauncherSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class ControlActionSpec:
+    action: ControlAction
+    label: str
+    section: SectionId
+    enabled: bool = True
+    reason: str = ""
+    production_ready: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class FieldStatus:
     field_id: FieldId
     label: str
@@ -235,6 +260,9 @@ class ControlProfile:
     run_enabled: bool
     run_blockers: tuple[str, ...] = ()
     fields: Mapping[FieldId, FieldStatus] = field(default_factory=dict)
+    section_actions: Mapping[SectionId, tuple[ControlActionSpec, ...]] = (
+        field(default_factory=dict)
+    )
     analysis_launchers: tuple[AnalysisLauncherSpec, ...] = ()
     show_experiment_card: bool = True
     show_processing_card: bool = True
@@ -245,6 +273,9 @@ class ControlProfile:
             if spec.section == section
             if (status := self.fields.get(spec.field_id)) is not None
         )
+
+    def actions_for(self, section: SectionId) -> tuple[ControlActionSpec, ...]:
+        return tuple(self.section_actions.get(section, ()))
 
 
 def _field(
@@ -436,6 +467,68 @@ def build_analysis_launchers(caps: ResultCaps) -> tuple[AnalysisLauncherSpec, ..
     return peak, phase, scan_plot, roi, strain, texture
 
 
+def build_section_actions(state: ControlState) -> Mapping[SectionId, tuple[ControlActionSpec, ...]]:
+    """Return producer/inspector actions grouped by card section.
+
+    These actions are intentionally small wrappers around existing production
+    paths while the V2 panel is hidden.  Disabled future actions still render
+    with a reason so the surface is ready for real-data gates without implying
+    production readiness.
+    """
+
+    viewer = state.tool in (Tool.IMAGE_VIEWER, Tool.XYE_VIEWER, Tool.NEXUS_VIEWER)
+    processing_enabled = state.tool in (Tool.INT_1D, Tool.INT_2D, Tool.STITCH, Tool.RSM)
+    actions = {
+        SectionId.SOURCE: (
+            ControlActionSpec(
+                ControlAction.CHOOSE_SOURCE,
+                "Choose Source",
+                SectionId.SOURCE,
+                enabled=True,
+                reason="Uses the current legacy source browser until the Source card is live.",
+            ),
+        ),
+        SectionId.EXPERIMENT: (
+            ControlActionSpec(
+                ControlAction.CALIBRATE,
+                "Calibrate",
+                SectionId.EXPERIMENT,
+                enabled=True,
+                reason="Open the existing pyFAI calibration tool.",
+            ),
+            ControlActionSpec(
+                ControlAction.MAKE_MASK,
+                "Make Mask",
+                SectionId.EXPERIMENT,
+                enabled=True,
+                reason="Open the existing mask editor.",
+            ),
+            ControlActionSpec(
+                ControlAction.REFINE_GEOMETRY,
+                "Refine",
+                SectionId.EXPERIMENT,
+                enabled=False,
+                reason="Geometry refinement is scaffolded; real-data GUI gate pending.",
+                production_ready=False,
+            ),
+        ),
+        SectionId.PROCESSING: (
+            ControlActionSpec(
+                ControlAction.ADVANCED_PROCESSING,
+                "Advanced",
+                SectionId.PROCESSING,
+                enabled=processing_enabled and not viewer,
+                reason=(
+                    "Open advanced integration settings."
+                    if processing_enabled and not viewer
+                    else "Advanced processing is not used in viewer modes."
+                ),
+            ),
+        ),
+    }
+    return MappingProxyType(actions)
+
+
 def processing_page_for(tool: Tool, mode: MeasMode) -> ProcessingPage:
     if tool == Tool.INT_1D:
         return ProcessingPage.INT_1D
@@ -511,6 +604,7 @@ def build_control_profile(state: ControlState) -> ControlProfile:
         run_enabled=not blockers and not viewer,
         run_blockers=blockers,
         fields=fields,
+        section_actions=build_section_actions(state),
         analysis_launchers=build_analysis_launchers(state.result_caps),
         show_experiment_card=True,
         show_processing_card=not viewer)

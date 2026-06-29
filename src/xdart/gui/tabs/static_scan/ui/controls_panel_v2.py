@@ -13,6 +13,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from ..controls_logic import (
     AnalysisLauncherSpec,
+    ControlActionSpec,
     ControlProfile,
     FieldStatus,
     SectionId,
@@ -50,6 +51,32 @@ class LauncherButton(QtWidgets.QPushButton):
         return self._spec
 
     def apply_spec(self, spec: AnalysisLauncherSpec) -> None:
+        self._spec = spec
+        self.setText(spec.label)
+        self.setEnabled(bool(spec.enabled))
+        self.setToolTip(spec.reason or "")
+        self.setProperty("productionReady", bool(spec.production_ready))
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class ActionButton(QtWidgets.QPushButton):
+    """Small card action button carrying a ``ControlActionSpec``."""
+
+    actionRequested = QtCore.Signal(object)
+
+    def __init__(self, spec: ControlActionSpec, parent=None):
+        super().__init__(spec.label, parent)
+        self.setObjectName("controlsV2ActionButton")
+        self._spec = spec
+        self.clicked.connect(lambda: self.actionRequested.emit(self._spec.action))
+        self.apply_spec(spec)
+
+    @property
+    def spec(self) -> ControlActionSpec:
+        return self._spec
+
+    def apply_spec(self, spec: ControlActionSpec) -> None:
         self._spec = spec
         self.setText(spec.label)
         self.setEnabled(bool(spec.enabled))
@@ -123,6 +150,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
     """
 
     analysisLaunchRequested = QtCore.Signal(object)
+    controlActionRequested = QtCore.Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -180,8 +208,28 @@ class ControlsPanelV2(QtWidgets.QWidget):
             card.clear_rows()
             for status in profile.fields_for(section):
                 card.add_row(FieldRow(status))
+            self._add_actions(card, profile.actions_for(section))
         self.experiment_card.setVisible(bool(profile.show_experiment_card))
         self.processing_card.setVisible(bool(profile.show_processing_card))
+
+    def _add_actions(
+        self,
+        card: SectionCard,
+        actions: tuple[ControlActionSpec, ...],
+    ) -> None:
+        if not actions:
+            return
+        row = QtWidgets.QWidget()
+        row.setObjectName("controlsV2ActionRow")
+        lay = QtWidgets.QHBoxLayout(row)
+        lay.setContentsMargins(0, 2, 0, 0)
+        lay.setSpacing(5)
+        lay.addStretch(1)
+        for spec in actions:
+            btn = ActionButton(spec)
+            btn.actionRequested.connect(self.controlActionRequested)
+            lay.addWidget(btn)
+        card.add_row(row)
 
     def _render_analysis(self, launchers: tuple[AnalysisLauncherSpec, ...]) -> None:
         self.analysis_card.clear_rows()

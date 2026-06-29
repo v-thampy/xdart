@@ -1,5 +1,6 @@
 from xdart.gui.tabs.static_scan.controls_logic import (
     AnalysisTool,
+    ControlAction,
     ControlState,
     FieldId,
     SectionId,
@@ -135,3 +136,35 @@ def test_control_profile_returns_fields_by_section_in_inventory_order():
         FieldId.SOURCE_FRAMES,
     ]
     assert all(field.section == SectionId.SOURCE for field in source_fields)
+
+
+def test_control_profile_exposes_section_actions():
+    profile = build_control_profile(
+        ControlState(
+            tool=Tool.INT_2D,
+            source_caps=SourceCaps(has_frames=True),
+            geom=GeomState(calibrated=True, energy_known=True),
+        )
+    )
+
+    source_actions = profile.actions_for(SectionId.SOURCE)
+    experiment_actions = profile.actions_for(SectionId.EXPERIMENT)
+    processing_actions = profile.actions_for(SectionId.PROCESSING)
+
+    assert [action.action for action in source_actions] == [
+        ControlAction.CHOOSE_SOURCE]
+    assert [action.action for action in experiment_actions] == [
+        ControlAction.CALIBRATE,
+        ControlAction.MAKE_MASK,
+        ControlAction.REFINE_GEOMETRY,
+    ]
+    assert not experiment_actions[-1].enabled
+    assert processing_actions[0].action == ControlAction.ADVANCED_PROCESSING
+    assert processing_actions[0].enabled
+
+
+def test_viewer_profile_disables_advanced_processing_action():
+    profile = build_control_profile(ControlState(tool=Tool.IMAGE_VIEWER))
+    action = profile.actions_for(SectionId.PROCESSING)[0]
+    assert action.action == ControlAction.ADVANCED_PROCESSING
+    assert not action.enabled

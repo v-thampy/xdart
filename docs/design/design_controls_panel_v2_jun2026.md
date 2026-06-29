@@ -280,7 +280,9 @@ Peak Fit, Phase Fit, and Scan Plot launch. This is intentionally behavior-preser
 the visible controls panel is still legacy-backed, and live fitting still follows the
 latest processed frame through the same latest-wins worker. The hidden V2 panel is
 observational only: it shows source/experiment/processing/output/analysis status and opens
-the existing analysis popups, but it does not yet drive processing.
+the existing analysis popups. It also renders hidden producer/inspector action intents for
+Choose Source, Calibrate, Make Mask, Refine, and Advanced; the enabled ones route through
+the existing production hooks and do not yet replace legacy processing controls.
 
 ### Phase 0 — doc/API reconcile, no GUI behavior change
 
@@ -365,6 +367,13 @@ slow fake source.
 **Tests:** PONI load hydrates detector+beam; `.nxs` reload marks saved fields; GI toggle changes valid
 processing axes without spurious reintegrate; conflicting energy blocks run; Refine result updates
 diffractometer summary; mask value and mask reachability do not drift.
+
+**Status:** PREVIEW ACTIONS IMPLEMENTED. The hidden V2 panel now exposes typed
+`ControlActionSpec` producer/inspector buttons. Choose Source delegates to the current wrangler
+browser, Calibrate and Make Mask click the existing integrator buttons, and Advanced opens the
+current combined advanced integration dialog. Refine is visible but disabled with a real-data-gate
+reason. The Experiment card is still a read-only status preview; the legacy panel remains the
+authoritative editor until field hydration/provenance parity is complete.
 
 ### Phase 5 — Processing stack for Int/Stitch/RSM
 

@@ -47,6 +47,7 @@ from .metadata import metadataWidget
 from .wranglers import imageWrangler, nexusWrangler, wranglerWidget
 from .controls_logic import (
     AnalysisTool,
+    ControlAction,
     ControlState,
     GeomState,
     MeasMode,
@@ -559,6 +560,8 @@ class staticWidget(QWidget):
             panel.setMaximumHeight(520)
             panel.analysisLaunchRequested.connect(
                 self._on_controls_v2_analysis_launch)
+            panel.controlActionRequested.connect(
+                self._on_controls_v2_action)
             self.ui.verticalLayout.insertWidget(0, panel)
             self.controls_v2 = panel
             self._refresh_controls_v2_profile()
@@ -579,6 +582,55 @@ class staticWidget(QWidget):
             QMessageBox.information(
                 self, "Tool not ready",
                 "This analysis tool is scaffolded but not production-ready yet.")
+
+    def _on_controls_v2_action(self, action) -> None:
+        """Route Controls V2 preview actions through existing production hooks."""
+        if action == ControlAction.CHOOSE_SOURCE:
+            self._controls_v2_choose_source()
+        elif action == ControlAction.CALIBRATE:
+            self._controls_v2_click_integrator_button("pyfai_calib")
+        elif action == ControlAction.MAKE_MASK:
+            self._controls_v2_click_integrator_button("get_mask")
+        elif action == ControlAction.ADVANCED_PROCESSING:
+            self._show_integration_advanced()
+        elif action == ControlAction.REFINE_GEOMETRY:
+            QMessageBox.information(
+                self, "Refine geometry",
+                "Geometry refinement is scaffolded and will be enabled after "
+                "the real-data GUI gate lands.")
+        else:
+            QMessageBox.information(
+                self, "Action not ready",
+                "This control is scaffolded but not production-ready yet.")
+        self._refresh_controls_v2_profile()
+
+    def _controls_v2_click_integrator_button(self, button_name: str) -> None:
+        button = getattr(getattr(self.integratorTree, "ui", None), button_name, None)
+        if button is None:
+            return
+        click = getattr(button, "click", None)
+        if callable(click):
+            click()
+
+    def _controls_v2_choose_source(self) -> None:
+        wrangler = getattr(self, "wrangler", None)
+        if wrangler is None:
+            return
+        try:
+            mode_text = self.controls.current_mode()
+        except Exception:
+            mode_text = ""
+        if hasattr(wrangler, "browse_nexus"):
+            wrangler.browse_nexus()
+            return
+        if "directory" in str(getattr(wrangler, "inp_type", "")).lower():
+            browse = getattr(wrangler, "set_img_dir", None)
+        else:
+            browse = getattr(wrangler, "set_img_file", None)
+        if mode_text in ("Image Viewer", "XYE Viewer"):
+            browse = getattr(wrangler, "set_img_file", None) or browse
+        if callable(browse):
+            browse()
 
     def _refresh_controls_v2_profile(self) -> None:
         panel = getattr(self, "controls_v2", None)
