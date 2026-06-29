@@ -5423,7 +5423,7 @@ def test_wrangler_enabled_run_end_reenables_mode_toggles():
     assert host.ui.frame.isVisible() is True
     assert host._integration_controls_enabled is True
     # Action button reset to green Start (idle).
-    assert host.ui.startButton.text() == "Run"
+    assert host.ui.startButton.text() == "▶ Run"
     assert host.ui.startButton.property("runPhase") == "idle"
     assert host._run_phase == "idle"
 
@@ -5445,7 +5445,7 @@ def test_start_click_honors_live_toggle_and_morphs_to_pause():
     assert host.ui.stopButton.isEnabled() is True
     assert host.sigStart.emitted == [()]
     # The action button morphed to orange 'Pause'.
-    assert host.ui.startButton.text() == "Pause"
+    assert host.ui.startButton.text() == "❚❚ Pause"
     assert host.ui.startButton.property("runPhase") == "active"
     assert host._run_phase == "running"
 
@@ -5463,14 +5463,14 @@ def test_start_pause_resume_button_state_machine():
 
     imageWrangler._on_start_clicked(host)      # running -> pause
     assert host.command == "pause" and host.thread.command == "pause"
-    assert host.ui.startButton.text() == "Pausing…"   # transient until sigPaused
+    assert host.ui.startButton.text() == "❚❚ Pausing…"   # transient until sigPaused
 
     imageWrangler._on_paused(host)             # worker confirms paused
-    assert host._run_phase == "paused" and host.ui.startButton.text() == "Resume"
+    assert host._run_phase == "paused" and host.ui.startButton.text() == "▶ Resume"
 
     imageWrangler._on_start_clicked(host)      # paused -> resume
     assert host.command == "start" and host.thread.command == "start"
-    assert host._run_phase == "running" and host.ui.startButton.text() == "Pause"
+    assert host._run_phase == "running" and host.ui.startButton.text() == "❚❚ Pause"
     assert host.sigResuming.emitted == [()]    # guard re-engaged before resume
 
 
@@ -5486,11 +5486,11 @@ def test_stop_during_pausing_ignores_late_sigpaused():
     imageWrangler._on_start_clicked(host)      # running
     imageWrangler._on_start_clicked(host)      # -> pause ('Pausing…')
     imageWrangler.stop(host)                   # Stop lands during 'Pausing…'
-    assert host.ui.startButton.text() == "Run"     # morphed back to green
+    assert host.ui.startButton.text() == "▶ Run"     # morphed back to green
     assert host._run_phase == "idle"
 
     imageWrangler._on_paused(host)             # late queued sigPaused arrives
-    assert host.ui.startButton.text() == "Run"     # NOT flashed to 'Resume'
+    assert host.ui.startButton.text() == "▶ Run"     # NOT flashed to 'Resume'
     assert host._run_phase == "idle"
 
 
@@ -5507,7 +5507,7 @@ def test_redispatch_during_pausing_is_noop():
     host.thread.command = "sentinel"           # detect any spurious command write
     imageWrangler._on_start_clicked(host)      # re-dispatch while 'pausing'
     assert host.thread.command == "sentinel"   # no-op: no pause()/start() fired
-    assert host.ui.startButton.text() == "Pausing…"
+    assert host.ui.startButton.text() == "❚❚ Pausing…"
 
 
 def test_start_without_poni_is_gated():

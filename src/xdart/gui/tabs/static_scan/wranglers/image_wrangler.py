@@ -1220,12 +1220,14 @@ class imageWrangler(wranglerWidget):
         orange-vs-green visual state driven by a dynamic ``runPhase`` Qt property
         (styled in the dark theme).  ``pausing`` is a transient disabled state."""
         btn = self.ui.startButton
+        # Labels carry the run-control glyphs (▶ play / ❚❚ pause), matching
+        # StaticControls._PHASES — both drive this same button.
         label, prop, enabled = {
-            'idle':    ('Run',      'idle',   True),
-            'running': ('Pause',    'active', True),
-            'pausing': ('Pausing…', 'active', False),
-            'paused':  ('Resume',   'active', True),
-        }.get(phase, ('Run', 'idle', True))
+            'idle':    ('▶ Run',      'idle',   True),
+            'running': ('❚❚ Pause',    'active', True),
+            'pausing': ('❚❚ Pausing…', 'active', False),
+            'paused':  ('▶ Resume',   'active', True),
+        }.get(phase, ('▶ Run', 'idle', True))
         # Keep the transient 'pausing' distinct (not collapsed into 'running'),
         # so a re-dispatch during the disabled 'Pausing…' window is an explicit
         # no-op in _on_start_clicked rather than a redundant second pause().

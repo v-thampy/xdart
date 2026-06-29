@@ -52,9 +52,9 @@ Units_dict = {Units[0]: 'q_A^-1', Units[1]: '2th_deg', Units[2]: 'chi_deg'}
 Units_dict_inv = {'q_A^-1': 0, '2th_deg': 1, 'chi_deg': 2}
 
 GI_MODES_1D = ['q_total', 'q_ip', 'q_oop', 'exit_angle', 'chi_gi']
-GI_LABELS_1D = ["Q", "Q\u1D62\u209A", "Q\u2092\u2092\u209A", "Exit", f"{Chi}GI"]
+GI_LABELS_1D = ["Q", "Qip", "Qoop", "Exit", f"{Chi}GI"]
 GI_MODES_2D = ['qip_qoop', 'q_chi', 'exit_angles']
-GI_LABELS_2D = [u"Q\u1D62\u209A\u2013Q\u2092\u2092\u209A", f"Q-{Chi}", "Exit"]
+GI_LABELS_2D = ["Qip-Qoop", f"Q-{Chi}", "Exit"]
 
 params = [
     {'name': 'Default', 'type': 'group', 'children': [
@@ -126,6 +126,9 @@ class integratorTree(QtWidgets.QWidget):
     # connects it to update_scattering_geometry (sets scan.gi + refreshes the
     # panel), the same handler the wrangler's GI checkbox used to drive.
     sigUpdateGI = QtCore.Signal(bool)
+    # Emitted with the saved mask-file path after Make Mask writes a mask —
+    # staticWidget uses it to auto-populate the Mask File field.
+    sigMaskCreated = QtCore.Signal(str)
 
     def __init__(self, scan, frame, file_lock,
                  frames, frame_ids, data_1d, data_2d, parent=None,
@@ -1808,6 +1811,9 @@ class integratorTree(QtWidgets.QWidget):
         MaskWidgetClass = get_MaskImageWidgetXdart()
         self.mask_window = MaskWidgetClass()
         self.mask_window.setWindowModality(QtCore.Qt.WindowModal)
+        # Re-emit upward so staticWidget can auto-populate the Mask File field
+        # once the user saves + closes the editor.
+        self.mask_window.maskSaved.connect(self.sigMaskCreated)
         self.mask_window.show()
 
         image = fabio.open(processFile).data
@@ -2075,13 +2081,13 @@ class integratorTree(QtWidgets.QWidget):
         self.scan.bai_1d_args['gi_mode_1d'] = mode
         if mode in ('q_ip', 'q_oop'):
             self.ui.unit_1D.hide()
-            self.ui.gi_radial_label_1D.setText(f"IP ({AA_inv})")
+            self.ui.gi_radial_label_1D.setText(f"Qip ({AA_inv})")
             self.ui.gi_radial_label_1D.show()
-            self.ui.label_azim_1D.setText(f"OOP ({AA_inv})")
+            self.ui.label_azim_1D.setText(f"Qoop ({AA_inv})")
             self._set_range_defaults_1d(-10, 10, 0, 5)
         elif mode == 'exit_angle':
             self.ui.unit_1D.hide()
-            self.ui.gi_radial_label_1D.setText(f"IP ({AA_inv})")
+            self.ui.gi_radial_label_1D.setText(f"Qip ({AA_inv})")
             self.ui.gi_radial_label_1D.show()
             self.ui.label_azim_1D.setText(f"Exit ({Deg})")
             self._set_range_defaults_1d(-5, 5, 0, 90)
@@ -2142,9 +2148,9 @@ class integratorTree(QtWidgets.QWidget):
         self.scan.bai_2d_args['gi_mode_2d'] = mode
         if mode == 'qip_qoop':
             self.ui.unit_2D.hide()
-            self.ui.gi_radial_label_2D.setText(f"IP ({AA_inv})")
+            self.ui.gi_radial_label_2D.setText(f"Qip ({AA_inv})")
             self.ui.gi_radial_label_2D.show()
-            self.ui.label_azim_2D.setText(f"OOP ({AA_inv})")
+            self.ui.label_azim_2D.setText(f"Qoop ({AA_inv})")
             self._set_range_defaults_2d(-10, 10, 0, 5)
         elif mode == 'q_chi':
             self.ui.unit_2D.show()
@@ -2157,7 +2163,7 @@ class integratorTree(QtWidgets.QWidget):
                 self._set_range_defaults_2d(0, 5, -180, 180)
         else:  # exit_angles
             self.ui.unit_2D.hide()
-            self.ui.gi_radial_label_2D.setText(f"IP ({AA_inv})")
+            self.ui.gi_radial_label_2D.setText(f"Qip ({AA_inv})")
             self.ui.gi_radial_label_2D.show()
             self._set_range_defaults_2d(-5, 5, 0, 90)
             self.ui.label_azim_2D.setText(f"Exit ({Deg})")

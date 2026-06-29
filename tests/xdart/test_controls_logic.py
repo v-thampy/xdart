@@ -1,8 +1,12 @@
 from xdart.gui.tabs.static_scan.controls_logic import (
     AnalysisTool,
+    BOUND_CONTROL_PATHS,
     ControlAction,
+    ControlFieldKind,
     ControlState,
     FieldId,
+    INTEGRATOR_BACKED_CONTROL_PATHS,
+    INTEGRATOR_BACKED_CONTROL_SPECS,
     SectionId,
     StatusKind,
     MeasMode,
@@ -11,9 +15,13 @@ from xdart.gui.tabs.static_scan.controls_logic import (
     SourceCaps,
     Tool,
     GeomState,
+    INTEGRATION_CONTROL_PATHS,
     build_field_statuses,
     build_analysis_launchers,
+    build_bound_control_state,
+    build_control_panel_state,
     build_control_profile,
+    coerce_control_edit_value,
     tool_from_mode_text,
 )
 
@@ -166,6 +174,308 @@ def test_control_profile_returns_fields_by_section_in_inventory_order():
     assert all(field.section == SectionId.SOURCE for field in source_fields)
 
 
+def test_bound_control_state_describes_image_directory_form():
+    state = build_bound_control_state(
+        {
+            ("Project", "project_folder"): "/data",
+            ("Project", "h5_dir"): "/data/out",
+            ("Signal", "poni_file"): "/data/cal.poni",
+            ("Signal", "inp_type"): "Image Directory",
+            ("Signal", "img_dir"): "/data/images",
+            ("Signal", "img_ext"): "tif",
+            ("Signal", "include_subdir"): True,
+            ("Signal", "Filter"): "scan_",
+            ("Signal", "meta_ext"): "SPEC",
+            ("Signal", "meta_dir"): "/data/spec",
+            ("Signal", "mask_file"): "/data/mask.edf",
+            ("GI", "Grazing"): True,
+            ("GI", "th_motor"): "Manual",
+            ("GI", "th_val"): 0.1,
+            ("GI", "sample_orientation"): 4,
+            ("GI", "tilt_angle"): 0.0,
+            ("MaskSat", "mask_sentinel"): False,
+            ("BG", "bg_type"): "File",
+            ("BG", "File"): "/data/bg.tif",
+            ("BG", "Scale"): 1.0,
+        },
+        {
+            ("Signal", "inp_type"): ("Image Series", "Image Directory"),
+            ("GI", "th_motor"): ("th", "Manual"),
+        },
+    )
+
+    source = state.fields_for(SectionId.SOURCE)
+    experiment = state.fields_for(SectionId.EXPERIMENT)
+    processing = state.fields_for(SectionId.PROCESSING)
+
+    assert [field.label for field in source] == [
+        "Source",
+        "Directory",
+        "File Type",
+        "Subdirs",
+        "Filter",
+        "Meta File",
+        "Meta Dir",
+    ]
+    assert source[0].kind == ControlFieldKind.COMBO
+    assert source[0].choices == ("Image Series", "Image Directory")
+    assert "Poni" in [field.label for field in experiment]
+    assert "Mask File" in [field.label for field in experiment]
+    assert any(field.label == "Theta" for field in experiment)
+    assert [field.label for field in processing] == [
+        "Mask Saturated",
+        "Background",
+        "BG File",
+        "Scale",
+    ]
+
+
+def test_bound_control_state_describes_integration_form():
+    state = build_bound_control_state(
+        {
+            ("Int1D", "axis"): "Q (Å⁻¹)",
+            ("Int1D", "points"): "2000",
+            ("Int1D", "radial_auto"): True,
+            ("Int1D", "radial_low"): "0",
+            ("Int1D", "radial_high"): "5",
+            ("Int1D", "azim_auto"): True,
+            ("Int1D", "azim_low"): "-180",
+            ("Int1D", "azim_high"): "180",
+            ("Int2D", "axis"): "Q-χ",
+            ("Int2D", "radial_points"): "500",
+            ("Int2D", "azim_points"): "500",
+            ("Int2D", "radial_auto"): True,
+            ("Int2D", "radial_low"): "0",
+            ("Int2D", "radial_high"): "5",
+            ("Int2D", "azim_auto"): True,
+            ("Int2D", "azim_low"): "-180",
+            ("Int2D", "azim_high"): "180",
+        },
+        {
+            ("Int1D", "axis"): ("Q (Å⁻¹)", "2θ (°)", "χ (°)"),
+            ("Int2D", "axis"): ("Q-χ", "2θ-χ"),
+        },
+    )
+
+    processing = state.fields_for(SectionId.PROCESSING)
+    by_path = {field.path: field for field in processing}
+
+    assert by_path[("Int1D", "axis")].kind == ControlFieldKind.COMBO
+    assert by_path[("Int1D", "axis")].choices == (
+        "Q (Å⁻¹)", "2θ (°)", "χ (°)")
+    assert by_path[("Int1D", "radial_auto")].kind == ControlFieldKind.BOOL
+    assert by_path[("Int1D", "radial_low")].label == "Q (Å⁻¹) Low"
+    assert by_path[("Int1D", "azim_low")].label == "χ (°) Low"
+    assert not by_path[("Int1D", "radial_low")].enabled
+    assert not by_path[("Int1D", "azim_low")].enabled
+    assert by_path[("Int2D", "radial_points")].label == "2D Radial Points"
+    assert by_path[("Int2D", "radial_low")].label == "Q (Å⁻¹) Low"
+    assert by_path[("Int2D", "azim_low")].label == "χ (°) Low"
+    assert not by_path[("Int2D", "radial_low")].enabled
+    assert not by_path[("Int2D", "azim_low")].enabled
+
+
+def test_bound_control_state_uses_axis_labels_for_range_rows():
+    values = {
+        ("Int1D", "axis"): "2θ (°)",
+        ("Int1D", "radial_low"): "0",
+        ("Int1D", "azim_low"): "-180",
+        ("Int2D", "axis"): "Qᵢₚ–Qₒₒₚ",
+        ("Int2D", "radial_low"): "-10",
+        ("Int2D", "azim_low"): "0",
+    }
+
+    state = build_bound_control_state(values, tool=Tool.INT_2D)
+    by_path = {
+        field.path: field
+        for field in state.fields_for(SectionId.PROCESSING)
+    }
+
+    assert by_path[("Int1D", "radial_low")].label == "2θ (°) Low"
+    assert by_path[("Int1D", "azim_low")].label == "χ (°) Low"
+    assert by_path[("Int2D", "radial_low")].label == "Qip (Å⁻¹) Low"
+    assert by_path[("Int2D", "azim_low")].label == "Qoop (Å⁻¹) Low"
+
+
+def test_bound_control_state_uses_hidden_gi_modes_for_legacy_labels():
+    values = {
+        ("Int1D", "axis"): "Qₒₒₚ",
+        ("Int1D", "unit"): "q_A^-1",
+        ("Int1D", "gi_mode"): "q_oop",
+        ("Int1D", "radial_low"): "-10",
+        ("Int1D", "azim_low"): "0",
+        ("Int2D", "axis"): "Exit",
+        ("Int2D", "unit"): "q_A^-1",
+        ("Int2D", "gi_mode"): "exit_angles",
+        ("Int2D", "radial_low"): "-5",
+        ("Int2D", "azim_low"): "0",
+    }
+
+    state = build_bound_control_state(values, tool=Tool.INT_2D)
+    by_path = {
+        field.path: field
+        for field in state.fields_for(SectionId.PROCESSING)
+    }
+
+    assert by_path[("Int1D", "radial_low")].label == "Qip (Å⁻¹) Low"
+    assert by_path[("Int1D", "azim_low")].label == "Qoop (Å⁻¹) Low"
+    assert by_path[("Int2D", "radial_low")].label == "Qip (Å⁻¹) Low"
+    assert by_path[("Int2D", "azim_low")].label == "Exit (°) Low"
+
+
+def test_bound_control_state_disables_locked_and_dependent_fields():
+    values = {
+        ("Mask", "Threshold"): False,
+        ("Mask", "min"): "0",
+        ("Int1D", "radial_auto"): True,
+        ("Int1D", "radial_low"): "0",
+        ("Int1D", "radial_high"): "5",
+    }
+
+    state = build_bound_control_state(values, tool=Tool.INT_1D)
+    by_path = {
+        field.path: field
+        for field in state.fields_for(SectionId.PROCESSING)
+    }
+
+    assert by_path[("Mask", "Threshold")].enabled
+    assert not by_path[("Mask", "min")].enabled
+    assert "Threshold" in by_path[("Mask", "min")].reason
+    assert not by_path[("Int1D", "radial_low")].enabled
+    assert "Auto" in by_path[("Int1D", "radial_low")].reason
+
+    locked = build_bound_control_state(
+        values,
+        tool=Tool.INT_1D,
+        controls_enabled=False,
+    )
+    assert not any(field.enabled for field in locked.fields)
+
+
+def test_bound_control_state_gates_integration_rows_by_tool():
+    values = {
+        ("Int1D", "axis"): "Q",
+        ("Int1D", "points"): "2000",
+        ("Int1D", "radial_auto"): True,
+        ("Int1D", "radial_low"): "0",
+        ("Int1D", "radial_high"): "5",
+        ("Int1D", "azim_auto"): True,
+        ("Int1D", "azim_low"): "-180",
+        ("Int1D", "azim_high"): "180",
+        ("Int2D", "axis"): "Q-χ",
+        ("Int2D", "radial_points"): "500",
+        ("Int2D", "azim_points"): "500",
+        ("Int2D", "radial_auto"): True,
+        ("Int2D", "radial_low"): "0",
+        ("Int2D", "radial_high"): "5",
+        ("Int2D", "azim_auto"): True,
+        ("Int2D", "azim_low"): "-180",
+        ("Int2D", "azim_high"): "180",
+    }
+
+    int_1d = build_bound_control_state(values, tool=Tool.INT_1D)
+    int_2d = build_bound_control_state(values, tool=Tool.INT_2D)
+
+    labels_1d = {
+        field.label for field in int_1d.fields_for(SectionId.PROCESSING)
+    }
+    labels_2d = {
+        field.label for field in int_2d.fields_for(SectionId.PROCESSING)
+    }
+
+    assert "1D Axis" in labels_1d
+    assert "1D Points" in labels_1d
+    assert "2D Axis" not in labels_1d
+    assert "1D Axis" in labels_2d
+    assert "1D Points" in labels_2d
+    assert "2D Axis" in labels_2d
+    assert "2D Radial Points" in labels_2d
+
+
+def test_bound_control_paths_cover_transitional_sections():
+    assert ("Project", "project_folder") in BOUND_CONTROL_PATHS
+    assert ("Signal", "inp_type") in BOUND_CONTROL_PATHS
+    assert ("NeXus File", "nexus_file") in BOUND_CONTROL_PATHS
+    assert ("GI", "Grazing") in BOUND_CONTROL_PATHS
+    assert ("BG", "bg_type") in BOUND_CONTROL_PATHS
+    assert ("Int1D", "axis") in INTEGRATION_CONTROL_PATHS
+    assert ("Int2D", "azim_points") in INTEGRATION_CONTROL_PATHS
+
+
+def test_integrator_binding_table_is_the_single_membership_source():
+    bound_paths = set(BOUND_CONTROL_PATHS)
+    backed_paths = {spec.path for spec in INTEGRATOR_BACKED_CONTROL_SPECS}
+
+    assert set(INTEGRATOR_BACKED_CONTROL_PATHS) == backed_paths
+    assert set(INTEGRATION_CONTROL_PATHS) == {
+        path for path in backed_paths if path[0] in {"Int1D", "Int2D"}
+    }
+    assert backed_paths <= bound_paths
+
+
+def test_coerce_control_edit_value_matches_backing_type():
+    assert coerce_control_edit_value(True, "false") is False
+    assert coerce_control_edit_value(False, "yes") is True
+    assert coerce_control_edit_value(4, "5.0") == 5
+    assert coerce_control_edit_value(1.5, "2.25") == 2.25
+    assert coerce_control_edit_value("old", "new") == "new"
+
+
+def test_bound_control_state_describes_nexus_form_without_qt():
+    state = build_bound_control_state(
+        {
+            ("Project", "project_folder"): "/data",
+            ("Output", "h5_dir"): "/data/out",
+            ("Calibration", "poni_file"): "/data/cal.poni",
+            ("NeXus File", "nexus_file"): "/data/scan.nxs",
+            ("NeXus File", "entry"): "entry",
+            ("GI", "Grazing"): False,
+            ("GI", "th_motor"): "th",
+            ("GI", "sample_orientation"): 4,
+            ("GI", "tilt_angle"): 0.0,
+            ("MaskSat", "mask_sentinel"): False,
+            ("BG", "bg_type"): "None",
+        }
+    )
+
+    assert [field.label for field in state.fields_for(SectionId.PROJECT)] == [
+        "Folder",
+        "Save Path",
+    ]
+    assert [field.label for field in state.fields_for(SectionId.SOURCE)] == [
+        "NeXus File",
+        "Entry",
+    ]
+    assert "Poni" in [
+        field.label for field in state.fields_for(SectionId.EXPERIMENT)
+    ]
+    assert "Theta" not in [
+        field.label for field in state.fields_for(SectionId.EXPERIMENT)
+    ]
+
+
+def test_control_panel_state_combines_profile_and_bound_fields():
+    state = build_control_panel_state(
+        ControlState(
+            tool=Tool.INT_2D,
+            source_caps=SourceCaps(has_frames=True),
+            geom=GeomState(calibrated=True, energy_known=True),
+        ),
+        {
+            ("Project", "project_folder"): "/data",
+            ("Project", "h5_dir"): "/data/out",
+            ("Signal", "inp_type"): "Single Image",
+        },
+    )
+
+    assert state.profile.processing_page.value == "int_2d"
+    assert state.profile.can_run
+    assert state.bound_controls is not None
+    assert state.bound_controls.value_for(
+        ("Project", "project_folder")
+    ) == "/data"
+
+
 def test_control_profile_exposes_section_actions():
     profile = build_control_profile(
         ControlState(
@@ -186,14 +496,31 @@ def test_control_profile_exposes_section_actions():
     ]
     assert [action.action for action in source_actions] == [
         ControlAction.CHOOSE_SOURCE]
+    # Refine is hidden in the plain 1-D/2-D integration modes (here INT_2D).
     assert [action.action for action in experiment_actions] == [
+        ControlAction.CALIBRATE,
+        ControlAction.MAKE_MASK,
+    ]
+    # ...but it returns for Stitch/RSM/GI, still disabled pending its gate.
+    refine_actions = build_control_profile(
+        ControlState(
+            tool=Tool.STITCH,
+            source_caps=SourceCaps(has_frames=True),
+            geom=GeomState(calibrated=True, energy_known=True),
+        )
+    ).actions_for(SectionId.EXPERIMENT)
+    assert [action.action for action in refine_actions] == [
         ControlAction.CALIBRATE,
         ControlAction.MAKE_MASK,
         ControlAction.REFINE_GEOMETRY,
     ]
-    assert not experiment_actions[-1].enabled
-    assert processing_actions[0].action == ControlAction.ADVANCED_PROCESSING
-    assert processing_actions[0].enabled
+    assert not refine_actions[-1].enabled
+    assert [action.action for action in processing_actions] == [
+        ControlAction.REINTEGRATE_1D,
+        ControlAction.REINTEGRATE_2D,
+        ControlAction.ADVANCED_PROCESSING,
+    ]
+    assert all(action.enabled for action in processing_actions)
 
 
 def test_viewer_profile_disables_advanced_processing_action():
