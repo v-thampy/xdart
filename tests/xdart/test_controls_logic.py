@@ -1,13 +1,18 @@
 from xdart.gui.tabs.static_scan.controls_logic import (
     AnalysisTool,
     ControlState,
+    FieldId,
+    SectionId,
+    StatusKind,
     MeasMode,
     ResultCaps,
     SourceCaps,
     Tool,
     GeomState,
+    build_field_statuses,
     build_analysis_launchers,
     build_control_profile,
+    tool_from_mode_text,
 )
 
 
@@ -78,3 +83,55 @@ def test_viewer_modes_do_not_offer_run_even_without_blockers():
         ControlState(tool=Tool.IMAGE_VIEWER, source_caps=SourceCaps(has_frames=True)))
     assert not profile.run_enabled
     assert not profile.show_processing_card
+
+
+def test_tool_from_legacy_mode_text():
+    assert tool_from_mode_text("Int 1D") == Tool.INT_1D
+    assert tool_from_mode_text("Int 2D") == Tool.INT_2D
+    assert tool_from_mode_text("Int 1D (XYE)") == Tool.INT_1D
+    assert tool_from_mode_text("Image Viewer") == Tool.IMAGE_VIEWER
+    assert tool_from_mode_text("XYE Viewer") == Tool.XYE_VIEWER
+    assert tool_from_mode_text("NeXus Viewer") == Tool.NEXUS_VIEWER
+    assert tool_from_mode_text("Stitch 2D") == Tool.STITCH
+    assert tool_from_mode_text("RSM") == Tool.RSM
+
+
+def test_build_field_statuses_tracks_source_geometry_and_results():
+    fields = build_field_statuses(
+        ControlState(
+            tool=Tool.INT_2D,
+            source_label="/data/scan001.nxs",
+            save_path="/data/out",
+            frame_count=3,
+            processing_mode="Int 2D",
+            source_caps=SourceCaps(
+                has_frames=True, has_raw=True, raw_reachable=True,
+                has_metadata=True, has_motors=True, has_energy=True,
+                has_geometry=True),
+            result_caps=ResultCaps(has_1d=True, has_2d=False),
+            geom=GeomState(calibrated=True, energy_known=True),
+        )
+    )
+
+    assert fields[FieldId.SOURCE_PATH].status == StatusKind.OK
+    assert fields[FieldId.SOURCE_FRAMES].value == "3"
+    assert fields[FieldId.CALIBRATION_PONI].status == StatusKind.OK
+    assert fields[FieldId.OUTPUT_SAVE_PATH].value == "/data/out"
+    assert fields[FieldId.RESULT_1D].status == StatusKind.OK
+    assert fields[FieldId.RESULT_2D].status == StatusKind.MISSING
+
+
+def test_control_profile_returns_fields_by_section_in_inventory_order():
+    profile = build_control_profile(
+        ControlState(
+            source_caps=SourceCaps(has_frames=True),
+            processing_mode="Int 1D",
+        )
+    )
+
+    source_fields = profile.fields_for(SectionId.SOURCE)
+    assert [field.field_id for field in source_fields][:2] == [
+        FieldId.SOURCE_PATH,
+        FieldId.SOURCE_FRAMES,
+    ]
+    assert all(field.section == SectionId.SOURCE for field in source_fields)

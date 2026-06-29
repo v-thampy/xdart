@@ -269,14 +269,18 @@ the card panel reaches behavior parity — with the inspector as the escape hatc
 Implement this as a new branch and land it in small, gated commits. The first half is deliberately
 Qt-free or hidden behind a flag; the live visible flip comes only after profile parity is proven.
 
-**Current implementation note (2026-06-28):** the first foundation slice has landed:
+**Current implementation note (2026-06-28):** the foundation slices have landed on
+`feature/controls-panel-v2`:
 `xdart.gui.tabs.static_scan.controls_logic` provides the Qt-free `ControlState →
-ControlProfile` / analysis-launcher gate, and
+ControlProfile` / field-status / analysis-launcher gate,
+`xdart.gui.tabs.static_scan.ui.controls_panel_v2.ControlsPanelV2` renders a hidden
+card scaffold behind `XDART_CONTROLS_PANEL_V2=1`, and
 `xdart.gui.tabs.static_scan.analysis_context.AnalysisContext` is now the seam used by
 Peak Fit, Phase Fit, and Scan Plot launch. This is intentionally behavior-preserving:
 the visible controls panel is still legacy-backed, and live fitting still follows the
-latest processed frame through the same latest-wins worker. The hidden card-panel scaffold
-and visible flip remain later phases.
+latest processed frame through the same latest-wins worker. The hidden V2 panel is
+observational only: it shows source/experiment/processing/output/analysis status and opens
+the existing analysis popups, but it does not yet drive processing.
 
 ### Phase 0 — doc/API reconcile, no GUI behavior change
 
@@ -306,10 +310,12 @@ and visible flip remain later phases.
 raw-unreachable ROI, missing 1D fit inputs, optional dependency missing, energy conflict, and
 `multigeometry`+corrections conflict.
 
-**Status:** PARTIAL/FOUNDATION IMPLEMENTED. The current module covers `ControlState`,
-`ControlProfile`, source/result/geometry caps, analysis launchers, viewer run suppression,
-and GI Stitch/RSM/xu_hist real-data gates. Detailed `FieldId`/`FieldStatus` provenance rows
-remain Phase 2/4 work, where the actual card renderer needs them.
+**Status:** FOUNDATION IMPLEMENTED. The current module covers `ControlState`,
+`ControlProfile`, `FieldId`, `FieldSpec`, `FieldStatus`, source/result/geometry caps,
+analysis launchers, viewer run suppression, legacy mode-text mapping, and
+GI Stitch/RSM/xu_hist real-data gates. The current `FieldStatus` implementation is a
+first-pass status/provenance surface; richer conflict/provenance detail remains Phase 4
+work as the Experiment card becomes authoritative.
 
 ### Phase 2 — hidden `ControlsPanelV2` scaffold
 
@@ -322,6 +328,13 @@ remain Phase 2/4 work, where the actual card renderer needs them.
 
 **Tests:** offscreen render tests for card visibility, badge text/classes, disabled tooltips, and
 signal blocking during profile swaps.
+
+**Status:** HIDDEN PREVIEW IMPLEMENTED. `ControlsPanelV2` renders Run Readiness,
+Source, Experiment, Processing, Output, and Analysis cards from `ControlProfile`.
+`staticWidget` mounts it only when `XDART_CONTROLS_PANEL_V2=1`; the legacy panel remains
+the production surface. The preview refreshes on wrangler attach, mode changes, new scans,
+display data changes, viewer mode changes, and stitch-mode changes. `MoreButton`,
+`SegmentedControl`, and the real Processing stack remain future phases.
 
 ### Phase 3 — Source card over `ScanSourceWidget`
 
@@ -391,9 +404,11 @@ the plan during session restore.
 Scan Plot opens from loaded metadata; ROI disabled when raw is unreachable; optional deps missing yields
 friendly message without crashing xdart.
 
-**Status:** PARTIAL/FOUNDATION IMPLEMENTED. `AnalysisContext` exists and existing Peak/Phase/Scan
-Plot entry points use it instead of direct dialog-to-widget internals. The launcher rail,
-tooltip wiring, and future Strain/Texture popups remain future visible UI work.
+**Status:** PARTIAL/PREVIEW IMPLEMENTED. `AnalysisContext` exists and existing Peak/Phase/Scan
+Plot entry points use it instead of direct dialog-to-widget internals. The hidden V2 Analysis
+card renders launcher buttons with disabled reasons and opens the existing Peak Fit, Phase Fit,
+Plot Metadata/Scan Plot, and ROI entry points. Future Strain/Texture launchers are present but
+disabled until their headless result contracts and real-data gates are ready.
 
 ### Phase 7 — Int 1D/2D migration
 

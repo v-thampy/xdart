@@ -12,10 +12,14 @@ from pyqtgraph import QtWidgets
 from xdart.gui.tabs.static_scan.controls_logic import (
     AnalysisLauncherSpec,
     AnalysisTool,
+    ControlState,
     ControlProfile,
     ProcessingPage,
+    ResultCaps,
+    SourceCaps,
+    build_control_profile,
 )
-from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2
+from xdart.gui.tabs.static_scan.ui.controls_panel_v2 import ControlsPanelV2, FieldRow
 
 
 @pytest.fixture(scope="module")
@@ -64,3 +68,44 @@ def test_controls_panel_v2_emits_launcher_intent(qapp):
     panel.analysisLaunchRequested.connect(got.append)
     panel.analysis_card.body.findChildren(QtWidgets.QPushButton)[0].click()
     assert got == [AnalysisTool.SCAN_PLOT]
+
+
+def test_controls_panel_v2_renders_typed_field_cards(qapp):
+    profile = build_control_profile(
+        ControlState(
+            source_label="/tmp/scan.nxs",
+            save_path="/tmp/out",
+            frame_count=5,
+            processing_mode="Int 1D",
+            source_caps=SourceCaps(
+                has_frames=True, has_raw=True, raw_reachable=True,
+                has_metadata=True),
+            result_caps=ResultCaps(has_1d=True),
+        )
+    )
+
+    panel = ControlsPanelV2()
+    panel.set_profile(profile)
+
+    source_rows = panel.source_card.body.findChildren(FieldRow)
+    assert [row.status.label for row in source_rows][:2] == ["Source", "Frames"]
+    assert source_rows[0].status.value == "/tmp/scan.nxs"
+    assert source_rows[1].status.value == "5"
+
+    analysis_rows = panel.analysis_card.body.findChildren(FieldRow)
+    assert [row.status.label for row in analysis_rows] == [
+        "1D result", "2D result", "RSM result"]
+
+
+def test_controls_panel_v2_mounts_behind_feature_flag(qapp, monkeypatch):
+    monkeypatch.setenv("XDART_CONTROLS_PANEL_V2", "1")
+    from xdart.gui.tabs.static_scan.static_scan_widget import staticWidget
+
+    widget = staticWidget()
+    try:
+        assert widget.controls_v2 is not None
+        assert widget.controls_v2.profile is not None
+        assert widget.controls_v2.source_card.body.findChildren(FieldRow)
+    finally:
+        widget.close()
+        widget.deleteLater()

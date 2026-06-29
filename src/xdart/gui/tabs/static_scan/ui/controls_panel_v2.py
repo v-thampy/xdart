@@ -11,7 +11,12 @@ from __future__ import annotations
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from ..controls_logic import AnalysisLauncherSpec, ControlProfile
+from ..controls_logic import (
+    AnalysisLauncherSpec,
+    ControlProfile,
+    FieldStatus,
+    SectionId,
+)
 
 
 class StatusBadge(QtWidgets.QLabel):
@@ -83,6 +88,32 @@ class SectionCard(QtWidgets.QFrame):
         self.body_layout.addWidget(widget)
 
 
+class FieldRow(QtWidgets.QWidget):
+    """One typed field row rendered from ``FieldStatus``."""
+
+    def __init__(self, status: FieldStatus, parent=None):
+        super().__init__(parent)
+        self.setObjectName("controlsV2FieldRow")
+        self._status = status
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(5)
+        self.label = QtWidgets.QLabel(status.label)
+        self.label.setObjectName("controlsV2FieldLabel")
+        self.value = QtWidgets.QLabel(status.value or status.reason or status.status.value)
+        self.value.setObjectName("controlsV2FieldValue")
+        self.badge = StatusBadge(status.status.value)
+        self.badge.set_status(status.status.value, status.status.value)
+        lay.addWidget(self.label)
+        lay.addWidget(self.value, 1)
+        lay.addWidget(self.badge)
+        self.setToolTip(status.reason or status.headless_key or status.session_key)
+
+    @property
+    def status(self) -> FieldStatus:
+        return self._status
+
+
 class ControlsPanelV2(QtWidgets.QWidget):
     """Feature-flag-ready renderer for :class:`ControlProfile`.
 
@@ -101,8 +132,16 @@ class ControlsPanelV2(QtWidgets.QWidget):
         lay.setSpacing(7)
 
         self.summary_card = SectionCard("Run Readiness")
+        self.source_card = SectionCard("Source")
+        self.experiment_card = SectionCard("Experiment")
+        self.processing_card = SectionCard("Processing")
+        self.output_card = SectionCard("Output")
         self.analysis_card = SectionCard("Analysis")
         lay.addWidget(self.summary_card)
+        lay.addWidget(self.source_card)
+        lay.addWidget(self.experiment_card)
+        lay.addWidget(self.processing_card)
+        lay.addWidget(self.output_card)
         lay.addWidget(self.analysis_card)
         lay.addStretch(1)
         self._profile = None
@@ -114,6 +153,7 @@ class ControlsPanelV2(QtWidgets.QWidget):
     def set_profile(self, profile: ControlProfile) -> None:
         self._profile = profile
         self._render_summary(profile)
+        self._render_fields(profile)
         self._render_analysis(profile.analysis_launchers)
 
     def _render_summary(self, profile: ControlProfile) -> None:
@@ -129,8 +169,25 @@ class ControlsPanelV2(QtWidgets.QWidget):
             badge.set_status(blocker, "blocked")
             self.summary_card.add_row(badge)
 
+    def _render_fields(self, profile: ControlProfile) -> None:
+        sections = (
+            (self.source_card, SectionId.SOURCE),
+            (self.experiment_card, SectionId.EXPERIMENT),
+            (self.processing_card, SectionId.PROCESSING),
+            (self.output_card, SectionId.OUTPUT),
+        )
+        for card, section in sections:
+            card.clear_rows()
+            for status in profile.fields_for(section):
+                card.add_row(FieldRow(status))
+        self.experiment_card.setVisible(bool(profile.show_experiment_card))
+        self.processing_card.setVisible(bool(profile.show_processing_card))
+
     def _render_analysis(self, launchers: tuple[AnalysisLauncherSpec, ...]) -> None:
         self.analysis_card.clear_rows()
+        for status in (self._profile.fields_for(SectionId.ANALYSIS)
+                       if self._profile is not None else ()):
+            self.analysis_card.add_row(FieldRow(status))
         for spec in launchers:
             btn = LauncherButton(spec)
             btn.launched.connect(self.analysisLaunchRequested)

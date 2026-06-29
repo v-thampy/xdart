@@ -45,6 +45,17 @@ from .integrator import integratorTree
 from .scan_threads import stitchThread
 from .metadata import metadataWidget
 from .wranglers import imageWrangler, nexusWrangler, wranglerWidget
+from .controls_logic import (
+    AnalysisTool,
+    ControlState,
+    GeomState,
+    MeasMode,
+    ResultCaps,
+    SourceCaps,
+    Tool,
+    build_profile,
+    tool_from_mode_text,
+)
 from xdart.utils.throttle import Coalescer
 from xdart.utils._utils import FixSizeOrderedDict, get_fname_dir, get_img_data
 
@@ -476,6 +487,8 @@ class staticWidget(QWidget):
         # press during a reintegrate can't also trip the idle wrangler's stop()
         # side-effects (unchecking Live, command='stop', button morph).
         self.controls.stopButton.clicked.connect(self._on_stop_clicked)
+        self.controls_v2 = None
+        self._init_controls_v2_preview()
         # Reintegrate reuses the shared Batch toggle: Batch off -> live (per-frame,
         # the default); Batch on -> fast multicore.  The integrator reads it
         # through this provider at click time (no direct controls ref needed).
@@ -525,6 +538,184 @@ class staticWidget(QWidget):
         # (about-to-be-destroyed) peak-fit dialog.
         self._tearing_down = False
         self._build_tools_placeholder()
+
+    @staticmethod
+    def _controls_v2_enabled() -> bool:
+        value = os.environ.get("XDART_CONTROLS_PANEL_V2", "")
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _init_controls_v2_preview(self) -> None:
+        """Mount the Controls Panel V2 preview behind a feature flag.
+
+        The panel is observational for now: it renders the typed control
+        profile and emits analysis-launch intents, but the legacy wrangler and
+        integration widgets remain the production controls.
+        """
+        if not self._controls_v2_enabled():
+            return
+        try:
+            from .ui.controls_panel_v2 import ControlsPanelV2
+            panel = ControlsPanelV2(self.ui.wranglerFrame)
+            panel.setMaximumHeight(520)
+            panel.analysisLaunchRequested.connect(
+                self._on_controls_v2_analysis_launch)
+            self.ui.verticalLayout.insertWidget(0, panel)
+            self.controls_v2 = panel
+            self._refresh_controls_v2_profile()
+        except Exception:
+            self.controls_v2 = None
+            logger.debug("Controls Panel V2 preview mount failed",
+                         exc_info=True)
+
+    def _on_controls_v2_analysis_launch(self, tool) -> None:
+        """Open the existing analysis popup for a V2 launcher intent."""
+        if tool == AnalysisTool.PEAK_FIT:
+            self._open_peak_fit_dialog()
+        elif tool == AnalysisTool.PHASE_FIT:
+            self._open_phase_fit_dialog()
+        elif tool in (AnalysisTool.SCAN_PLOT, AnalysisTool.ROI_STATS):
+            self._open_scan_plot_dialog()
+        else:
+            QMessageBox.information(
+                self, "Tool not ready",
+                "This analysis tool is scaffolded but not production-ready yet.")
+
+    def _refresh_controls_v2_profile(self) -> None:
+        panel = getattr(self, "controls_v2", None)
+        if panel is None:
+            return
+        try:
+            panel.set_profile(build_profile(self._controls_v2_state()))
+        except Exception:
+            logger.debug("Controls Panel V2 profile refresh failed",
+                         exc_info=True)
+
+    def _controls_v2_state(self) -> ControlState:
+        """Build a lightweight, best-effort Controls V2 state snapshot."""
+        mode_text = ""
+        try:
+            mode_text = self.controls.current_mode()
+        except Exception:
+            pass
+        tool = tool_from_mode_text(mode_text)
+        gi_cfg = {}
+        try:
+            gi_cfg = self.integratorTree.get_gi_config()
+        except Exception:
+            gi_cfg = {}
+        gi_on = bool(gi_cfg.get("gi", getattr(self.scan, "gi", False)))
+        meas_mode = MeasMode.GI if gi_on else MeasMode.STANDARD
+
+        frame_count = 0
+        try:
+            frame_count = len(getattr(self.scan.frames, "index", ()) or ())
+        except Exception:
+            frame_count = 0
+        source_label = self._controls_v2_source_label()
+        has_scan_data = False
+        try:
+            has_scan_data = not getattr(self.scan, "scan_data", None).empty
+        except Exception:
+            has_scan_data = False
+        wrangler = getattr(self, "wrangler", None)
+        has_motors = bool(getattr(wrangler, "motors", None)) or has_scan_data
+        has_raw = bool(frame_count or source_label)
+        source_caps = SourceCaps(
+            has_frames=frame_count > 0,
+            has_raw=has_raw,
+            raw_reachable=has_raw,
+            has_metadata=has_scan_data or bool(getattr(wrangler, "scan_args", None)),
+            has_motors=has_motors,
+            has_energy=self._controls_v2_energy_known(),
+            has_geometry=self._controls_v2_calibrated(),
+            has_psi_metadata=has_scan_data,
+        )
+
+        has_1d = bool(self.data_1d)
+        has_2d = bool(self.data_2d)
+        labels = ()
+        try:
+            labels = self.publication_store.labels()
+            recent = labels[-16:] if len(labels) > 16 else labels
+            pubs = self.publication_store.get_many(recent).values()
+            has_1d = has_1d or any(getattr(pub.view, "int_1d", None) is not None
+                                   for pub in pubs)
+            pubs = self.publication_store.get_many(recent).values()
+            has_2d = has_2d or any(getattr(pub.view, "int_2d", None) is not None
+                                   for pub in pubs)
+        except Exception:
+            labels = ()
+        result_caps = ResultCaps(
+            has_1d=has_1d,
+            has_2d=has_2d,
+            has_raw=has_raw,
+            raw_reachable=has_raw,
+            has_scan_metadata=has_scan_data,
+            has_rsm=bool(getattr(self.scan, "rsm_result", None)),
+            has_phase_result=False,
+            has_psi_metadata=has_scan_data,
+        )
+        geom = GeomState(
+            calibrated=self._controls_v2_calibrated(),
+            energy_known=source_caps.has_energy,
+            gi_enabled=gi_on,
+            sample_orientation_known=(
+                not gi_on or bool(gi_cfg.get("sample_orientation"))),
+            ub_known=bool(getattr(self.scan, "ub_matrix", None)),
+            material_known=False,
+        )
+        return ControlState(
+            tool=tool,
+            mode=meas_mode,
+            source_caps=source_caps,
+            result_caps=result_caps,
+            geom=geom,
+            backend=self._controls_v2_backend(tool),
+            source_label=source_label,
+            save_path=str(getattr(getattr(self, "wrangler", None), "h5_dir", "") or ""),
+            frame_count=frame_count or len(labels),
+            processing_mode=mode_text,
+            real_data_gates=frozenset(),
+        )
+
+    def _controls_v2_source_label(self) -> str:
+        for candidate in (
+            getattr(self.scan, "data_file", None),
+            getattr(self, "fname", None),
+            getattr(getattr(self, "wrangler", None), "fname", None),
+        ):
+            if candidate:
+                return str(candidate)
+        return ""
+
+    def _controls_v2_calibrated(self) -> bool:
+        scan = getattr(self, "scan", None)
+        if getattr(scan, "_cached_integrator", None) is not None:
+            return True
+        if getattr(scan, "geometry", None) is not None:
+            return True
+        try:
+            return bool(getattr(self.integratorTree, "_cached_poni", None))
+        except Exception:
+            return False
+
+    def _controls_v2_energy_known(self) -> bool:
+        scan = getattr(self, "scan", None)
+        if getattr(scan, "_persisted_wavelength_m", None) is not None:
+            return True
+        integrator = getattr(scan, "_cached_integrator", None)
+        if getattr(integrator, "wavelength", None) is not None:
+            return True
+        mg_args = getattr(scan, "mg_args", {}) or {}
+        return mg_args.get("wavelength") not in (None, 1e-10)
+
+    @staticmethod
+    def _controls_v2_backend(tool) -> str | None:
+        if tool == Tool.STITCH:
+            return "multigeometry"
+        if tool == Tool.RSM:
+            return "rsm"
+        return None
 
     def _build_tools_placeholder(self):
         """Fill the vacated bottom-left ``metaFrame`` with the compact 'Tools' card.
@@ -1217,6 +1408,7 @@ class staticWidget(QWidget):
         # The freshly-attached profile may have shown/hidden run rows -> refit the
         # controls bar to the new content height.
         self._fit_controls_height()
+        self._refresh_controls_v2_profile()
 
     def disconnect_wrangler(self):
         """Disconnects all signals attached the the current wrangler
@@ -1293,6 +1485,7 @@ class staticWidget(QWidget):
         # Skip the rest when in viewer mode — set_viewer_display_mode controls
         # panels.
         if 'Viewer' in mode_text:
+            self._refresh_controls_v2_profile()
             return
         # A non-viewer processing mode (Int 1D/2D, Int 1D (XYE)) must take the
         # display OUT of any viewer mode it is stuck in.  The wrangler's
@@ -1311,6 +1504,7 @@ class staticWidget(QWidget):
         self.displayframe.clear_display_state()
         self.displayframe.request_plot_autorange()
         self.h5viewer.data_changed()
+        self._refresh_controls_v2_profile()
 
     @staticmethod
     def _mode_skips_2d(mode_text):
@@ -1689,6 +1883,7 @@ class staticWidget(QWidget):
 
             # Live peak-fit preview (no-op unless the dialog is open + Live on).
             self._maybe_live_fit()
+            self._refresh_controls_v2_profile()
 
     def _hydrate_integrator_on_load(self, *args):
         """Stage C: when a ``.nxs`` is loaded, populate the integration panel from
@@ -2343,6 +2538,7 @@ class staticWidget(QWidget):
         self.displayframe.stitch_display_mode = stitch_mode_str or None
         self.displayframe._bump_display_generation()
         self.update_all()
+        self._refresh_controls_v2_profile()
 
     def stitch_thread_finished(self):
         """Stitch worker done: end the shared run-state (unless a wrangler run is
@@ -2423,6 +2619,7 @@ class staticWidget(QWidget):
         self.scan.stitched_1d = None
         self.scan.stitched_2d = None
         self.displayframe.stitch_display_mode = None
+        self._refresh_controls_v2_profile()
         # Propagate the wrangler-loaded mask (detector + user Mask File,
         # combined into flat indices) into the main scan so the
         # displayframe can overlay it on the raw image.  Without this,
@@ -2882,6 +3079,7 @@ class staticWidget(QWidget):
         finally:
             self.h5viewer._suspend_scan_selection_loads = prev_suspend
             scans.blockSignals(was_blocked)
+        self._refresh_controls_v2_profile()
 
     def latest_frame(self, checked=None, *, emit_update=True):
         """Advances to last frame in data list, updates displayframe, and

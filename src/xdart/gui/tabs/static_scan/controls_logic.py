@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
+from typing import Mapping
 
 
 class Tool(str, Enum):
@@ -36,6 +38,94 @@ class ProcessingPage(str, Enum):
     STITCH = "stitch"
     STITCH_GI = "stitch_gi"
     RSM = "rsm"
+
+
+class SectionId(str, Enum):
+    SOURCE = "source"
+    EXPERIMENT = "experiment"
+    PROCESSING = "processing"
+    OUTPUT = "output"
+    ANALYSIS = "analysis"
+
+
+class FieldId(str, Enum):
+    SOURCE_PATH = "source.path"
+    SOURCE_FRAMES = "source.frames"
+    SOURCE_RAW = "source.raw"
+    SOURCE_METADATA = "source.metadata"
+    SOURCE_MOTORS = "source.motors"
+    CALIBRATION_PONI = "calibration.poni"
+    DETECTOR_MASK = "detector.mask"
+    BEAM_ENERGY = "beam.energy"
+    SAMPLE_GI = "sample.gi"
+    SAMPLE_ORIENTATION = "sample.orientation"
+    DIFFRACTOMETER_UB = "diffractometer.ub"
+    PROCESSING_MODE = "processing.mode"
+    PROCESSING_BACKEND = "processing.backend"
+    OUTPUT_SAVE_PATH = "output.save_path"
+    RESULT_1D = "result.1d"
+    RESULT_2D = "result.2d"
+    RESULT_RSM = "result.rsm"
+
+
+class StatusKind(str, Enum):
+    OK = "ok"
+    MISSING = "missing"
+    INFERRED = "inferred"
+    SAVED = "saved"
+    CONFLICT = "conflict"
+    LOCKED = "locked"
+    DEFERRED = "deferred"
+
+
+@dataclass(frozen=True, slots=True)
+class FieldSpec:
+    field_id: FieldId
+    section: SectionId
+    label: str
+    owner: str
+    session_key: str = ""
+    headless_key: str = ""
+
+
+FIELD_INVENTORY: tuple[FieldSpec, ...] = (
+    FieldSpec(FieldId.SOURCE_PATH, SectionId.SOURCE, "Source", "source"),
+    FieldSpec(FieldId.SOURCE_FRAMES, SectionId.SOURCE, "Frames", "source",
+              headless_key="FrameSource.frame_indices"),
+    FieldSpec(FieldId.SOURCE_RAW, SectionId.SOURCE, "Raw images", "source",
+              headless_key="FrameSource.load_frame"),
+    FieldSpec(FieldId.SOURCE_METADATA, SectionId.SOURCE, "Metadata", "source",
+              headless_key="FrameSource.metadata_for"),
+    FieldSpec(FieldId.SOURCE_MOTORS, SectionId.SOURCE, "Motors", "source",
+              headless_key="FrameSource.motors"),
+    FieldSpec(FieldId.CALIBRATION_PONI, SectionId.EXPERIMENT, "PONI", "experiment",
+              session_key="integrator.poni_file", headless_key="geometry.poni"),
+    FieldSpec(FieldId.DETECTOR_MASK, SectionId.EXPERIMENT, "Mask", "experiment",
+              session_key="wrangler.mask_file", headless_key="mask"),
+    FieldSpec(FieldId.BEAM_ENERGY, SectionId.EXPERIMENT, "Beam energy", "experiment",
+              headless_key="diffractometer.wavelength"),
+    FieldSpec(FieldId.SAMPLE_GI, SectionId.EXPERIMENT, "Grazing incidence", "experiment",
+              session_key="integrator.gi", headless_key="gi.enabled"),
+    FieldSpec(FieldId.SAMPLE_ORIENTATION, SectionId.EXPERIMENT, "Sample orientation",
+              "experiment", session_key="integrator.gi.sample_orientation",
+              headless_key="gi.sample_orientation"),
+    FieldSpec(FieldId.DIFFRACTOMETER_UB, SectionId.EXPERIMENT, "UB matrix",
+              "experiment", headless_key="diffractometer.ub"),
+    FieldSpec(FieldId.PROCESSING_MODE, SectionId.PROCESSING, "Mode", "processing",
+              session_key="processing_mode"),
+    FieldSpec(FieldId.PROCESSING_BACKEND, SectionId.PROCESSING, "Backend",
+              "processing", headless_key="StitchPlan.backend"),
+    FieldSpec(FieldId.OUTPUT_SAVE_PATH, SectionId.OUTPUT, "Save path", "output",
+              session_key="wrangler.h5_dir"),
+    FieldSpec(FieldId.RESULT_1D, SectionId.ANALYSIS, "1D result", "analysis"),
+    FieldSpec(FieldId.RESULT_2D, SectionId.ANALYSIS, "2D result", "analysis"),
+    FieldSpec(FieldId.RESULT_RSM, SectionId.ANALYSIS, "RSM result", "analysis"),
+)
+
+
+FIELD_SPECS: Mapping[FieldId, FieldSpec] = MappingProxyType(
+    {spec.field_id: spec for spec in FIELD_INVENTORY}
+)
 
 
 class AnalysisTool(str, Enum):
@@ -103,6 +193,28 @@ class AnalysisLauncherSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class FieldStatus:
+    field_id: FieldId
+    label: str
+    section: SectionId
+    status: StatusKind
+    value: str = ""
+    reason: str = ""
+    owner: str = ""
+    session_key: str = ""
+    headless_key: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status in {
+            StatusKind.OK,
+            StatusKind.INFERRED,
+            StatusKind.SAVED,
+            StatusKind.DEFERRED,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ControlState:
     tool: Tool = Tool.INT_1D
     mode: MeasMode = MeasMode.STANDARD
@@ -110,6 +222,10 @@ class ControlState:
     result_caps: ResultCaps = field(default_factory=ResultCaps)
     geom: GeomState = field(default_factory=GeomState)
     backend: str | None = None
+    source_label: str = ""
+    save_path: str = ""
+    frame_count: int = 0
+    processing_mode: str = ""
     real_data_gates: frozenset[str] = field(default_factory=frozenset)
 
 
@@ -118,9 +234,137 @@ class ControlProfile:
     processing_page: ProcessingPage
     run_enabled: bool
     run_blockers: tuple[str, ...] = ()
+    fields: Mapping[FieldId, FieldStatus] = field(default_factory=dict)
     analysis_launchers: tuple[AnalysisLauncherSpec, ...] = ()
     show_experiment_card: bool = True
     show_processing_card: bool = True
+
+    def fields_for(self, section: SectionId) -> tuple[FieldStatus, ...]:
+        return tuple(
+            status for spec in FIELD_INVENTORY
+            if spec.section == section
+            if (status := self.fields.get(spec.field_id)) is not None
+        )
+
+
+def _field(
+    field_id: FieldId,
+    status: StatusKind,
+    *,
+    value: str = "",
+    reason: str = "",
+) -> FieldStatus:
+    spec = FIELD_SPECS[field_id]
+    return FieldStatus(
+        field_id=field_id,
+        label=spec.label,
+        section=spec.section,
+        status=status,
+        value=value,
+        reason=reason,
+        owner=spec.owner,
+        session_key=spec.session_key,
+        headless_key=spec.headless_key,
+    )
+
+
+def build_field_statuses(state: ControlState) -> Mapping[FieldId, FieldStatus]:
+    caps = state.source_caps
+    geom = state.geom
+    results = state.result_caps
+    source_label = state.source_label or "No source selected"
+    frame_value = str(state.frame_count) if state.frame_count else ""
+    fields = {
+        FieldId.SOURCE_PATH: _field(
+            FieldId.SOURCE_PATH,
+            StatusKind.OK if caps.has_frames or source_label != "No source selected"
+            else StatusKind.MISSING,
+            value=source_label,
+            reason="" if source_label != "No source selected" else "Choose data."),
+        FieldId.SOURCE_FRAMES: _field(
+            FieldId.SOURCE_FRAMES,
+            StatusKind.OK if caps.has_frames else StatusKind.MISSING,
+            value=frame_value,
+            reason="" if caps.has_frames else "No frame source is loaded."),
+        FieldId.SOURCE_RAW: _field(
+            FieldId.SOURCE_RAW,
+            StatusKind.OK if caps.raw_reachable else (
+                StatusKind.INFERRED if caps.has_raw else StatusKind.MISSING),
+            value="reachable" if caps.raw_reachable else ("present" if caps.has_raw else ""),
+            reason="" if caps.raw_reachable else "Raw frames are not reachable."),
+        FieldId.SOURCE_METADATA: _field(
+            FieldId.SOURCE_METADATA,
+            StatusKind.OK if caps.has_metadata else StatusKind.MISSING,
+            value="available" if caps.has_metadata else "",
+            reason="" if caps.has_metadata else "Metadata not detected."),
+        FieldId.SOURCE_MOTORS: _field(
+            FieldId.SOURCE_MOTORS,
+            StatusKind.OK if caps.has_motors else StatusKind.MISSING,
+            value="available" if caps.has_motors else "",
+            reason="" if caps.has_motors else "Motor metadata not detected."),
+        FieldId.CALIBRATION_PONI: _field(
+            FieldId.CALIBRATION_PONI,
+            StatusKind.OK if geom.calibrated else StatusKind.MISSING,
+            value="loaded" if geom.calibrated else "",
+            reason="" if geom.calibrated else "Load detector calibration."),
+        FieldId.DETECTOR_MASK: _field(
+            FieldId.DETECTOR_MASK,
+            StatusKind.OK if caps.has_raw else StatusKind.DEFERRED,
+            value="configured" if caps.has_raw else "",
+            reason="" if caps.has_raw else "Mask is optional until raw data is loaded."),
+        FieldId.BEAM_ENERGY: _field(
+            FieldId.BEAM_ENERGY,
+            StatusKind.OK if geom.energy_known or caps.has_energy else StatusKind.MISSING,
+            value="known" if geom.energy_known or caps.has_energy else "",
+            reason="" if geom.energy_known or caps.has_energy
+            else "Set calibration wavelength or source energy."),
+        FieldId.SAMPLE_GI: _field(
+            FieldId.SAMPLE_GI,
+            StatusKind.OK if geom.gi_enabled else StatusKind.DEFERRED,
+            value="on" if geom.gi_enabled else "standard",
+            reason="" if geom.gi_enabled else "Standard geometry."),
+        FieldId.SAMPLE_ORIENTATION: _field(
+            FieldId.SAMPLE_ORIENTATION,
+            StatusKind.OK if geom.sample_orientation_known else (
+                StatusKind.MISSING if state.mode == MeasMode.GI else StatusKind.DEFERRED),
+            value="known" if geom.sample_orientation_known else "",
+            reason="" if geom.sample_orientation_known else "Needed for GI."),
+        FieldId.DIFFRACTOMETER_UB: _field(
+            FieldId.DIFFRACTOMETER_UB,
+            StatusKind.OK if geom.ub_known else (
+                StatusKind.MISSING if state.tool == Tool.RSM else StatusKind.DEFERRED),
+            value="known" if geom.ub_known else "",
+            reason="" if geom.ub_known else "Needed for RSM."),
+        FieldId.PROCESSING_MODE: _field(
+            FieldId.PROCESSING_MODE,
+            StatusKind.OK,
+            value=state.processing_mode or state.tool.value),
+        FieldId.PROCESSING_BACKEND: _field(
+            FieldId.PROCESSING_BACKEND,
+            StatusKind.OK if state.backend else StatusKind.DEFERRED,
+            value=state.backend or "default"),
+        FieldId.OUTPUT_SAVE_PATH: _field(
+            FieldId.OUTPUT_SAVE_PATH,
+            StatusKind.OK if state.save_path else StatusKind.MISSING,
+            value=state.save_path,
+            reason="" if state.save_path else "Choose a save path."),
+        FieldId.RESULT_1D: _field(
+            FieldId.RESULT_1D,
+            StatusKind.OK if results.has_1d else StatusKind.MISSING,
+            value="available" if results.has_1d else "",
+            reason="" if results.has_1d else "No 1D result yet."),
+        FieldId.RESULT_2D: _field(
+            FieldId.RESULT_2D,
+            StatusKind.OK if results.has_2d else StatusKind.MISSING,
+            value="available" if results.has_2d else "",
+            reason="" if results.has_2d else "No 2D result yet."),
+        FieldId.RESULT_RSM: _field(
+            FieldId.RESULT_RSM,
+            StatusKind.OK if results.has_rsm else StatusKind.DEFERRED,
+            value="available" if results.has_rsm else "",
+            reason="" if results.has_rsm else "RSM viewer is gated until real-data tests pass."),
+    }
+    return MappingProxyType(fields)
 
 
 def _disabled(tool: AnalysisTool, label: str, reason: str, *,
@@ -206,6 +450,28 @@ def processing_page_for(tool: Tool, mode: MeasMode) -> ProcessingPage:
     return ProcessingPage.INT_1D
 
 
+def tool_from_mode_text(mode_text: str | None) -> Tool:
+    """Map the legacy mode-combo text to the typed Controls V2 tool.
+
+    The current GUI still owns the mode strings.  Keeping this conversion pure
+    lets tests pin the bridge while the V2 panel is feature-flagged.
+    """
+    text = str(mode_text or "").strip().lower()
+    if "image viewer" in text:
+        return Tool.IMAGE_VIEWER
+    if "xye viewer" in text:
+        return Tool.XYE_VIEWER
+    if "nexus viewer" in text or "nexus" in text and "viewer" in text:
+        return Tool.NEXUS_VIEWER
+    if "stitch" in text:
+        return Tool.STITCH
+    if "rsm" in text:
+        return Tool.RSM
+    if "2d" in text and "1d" not in text:
+        return Tool.INT_2D
+    return Tool.INT_1D
+
+
 def run_blockers_for(state: ControlState) -> tuple[str, ...]:
     blockers: list[str] = []
     caps = state.source_caps
@@ -239,10 +505,12 @@ def build_control_profile(state: ControlState) -> ControlProfile:
     page = processing_page_for(state.tool, state.mode)
     blockers = run_blockers_for(state)
     viewer = page == ProcessingPage.VIEWER
+    fields = build_field_statuses(state)
     return ControlProfile(
         processing_page=page,
         run_enabled=not blockers and not viewer,
         run_blockers=blockers,
+        fields=fields,
         analysis_launchers=build_analysis_launchers(state.result_caps),
         show_experiment_card=True,
         show_processing_card=not viewer)
