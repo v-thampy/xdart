@@ -1143,6 +1143,8 @@ class staticWidget(QWidget):
             vm = getattr(self.wrangler, 'viewer_mode', None)
             if vm is not None:
                 QtCore.QTimer.singleShot(0, lambda v=vm: self._on_viewer_mode_changed(v))
+        if hasattr(self.wrangler, 'sigStitchModeChanged'):
+            self.wrangler.sigStitchModeChanged.connect(self._on_stitch_mode_changed)
         if hasattr(self.wrangler, 'sigSavePathChanged'):
             self.wrangler.sigSavePathChanged.connect(self._sync_h5viewer_save_dir)
         # Advanced is now re-homed onto the integrator's Reintegrate row
@@ -2283,27 +2285,35 @@ class staticWidget(QWidget):
             p['npt_azim_2d'] = int(self.scan.bai_2d_args.get('npt_azim') or 720)
         return p
 
+    def _on_stitch_mode_changed(self, stitch_mode_str):
+        """Route the display to/from the persistent stitch view when the wrangler
+        Mode dropdown enters/leaves a Stitch mode (``'1d'``/``'2d'``/``''``).
+
+        Only flips the flag + refreshes; ``displayFrameWidget._active_stitch_mode``
+        gates the actual render on a matching ``scan.stitched_*`` result, so
+        selecting Stitch before a run leaves the per-frame view untouched and
+        leaving Stitch restores it."""
+        self.displayframe.stitch_display_mode = stitch_mode_str or None
+        self.displayframe._bump_display_generation()
+        self.update_all()
+
     def stitch_thread_finished(self):
         """Stitch worker done: end the shared run-state (unless a wrangler run is
-        also in flight) and refresh.  Phase 1a confirms completion in the status
-        bar; rendering scan.stitched_1d/2d into the panels lands in Phase 1b."""
+        also in flight) and refresh.  On success the result becomes the persistent
+        display source (StitchDisplayController) — set the flag + bump generation
+        BEFORE the refresh so update_all() routes through it (it now survives
+        subsequent update() calls instead of the old one-shot paint)."""
         self.thread_state_changed()
         if not self.wrangler.thread.isRunning():
             self._exit_run_state()
         self.h5viewer.set_open_enabled(True)
-        self.update_all()
         if getattr(self.stitch_thread, 'ok', False):
-            # Draw the merged result AFTER update_all (which redraws the
-            # per-frame integration view) so the stitch is the final paint.
-            try:
-                self.displayframe.render_stitch_result(
-                    getattr(self.scan, 'stitched_1d', None),
-                    getattr(self.scan, 'stitched_2d', None))
-            except Exception:
-                logger.error("render stitch result failed", exc_info=True)
+            self.displayframe.stitch_display_mode = self.stitch_thread.mode
+            self.displayframe._bump_display_generation()
             self._stitch_status(
                 f'Stitch {self.stitch_thread.mode.upper()} complete.')
         # else: _on_stitch_error already surfaced the failure — don't overwrite.
+        self.update_all()
         if not self.wrangler.thread.isRunning():
             self.wrangler.enabled(True)
 
@@ -2355,6 +2365,13 @@ class staticWidget(QWidget):
         self.scan.incidence_motor = incidence_motor
         self.scan.single_img = single_img
         self.scan.series_average = series_average
+        # New scan identity: drop any prior whole-scan stitch result and leave the
+        # persistent stitch display.  The scan object is REUSED across scans, so
+        # stale stitched_* would otherwise keep an old merge on screen; the
+        # result-existence guard then returns the display to the per-frame view.
+        self.scan.stitched_1d = None
+        self.scan.stitched_2d = None
+        self.displayframe.stitch_display_mode = None
         # Propagate the wrangler-loaded mask (detector + user Mask File,
         # combined into flat indices) into the main scan so the
         # displayframe can overlay it on the raw image.  Without this,

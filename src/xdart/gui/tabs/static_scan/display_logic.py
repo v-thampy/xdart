@@ -105,6 +105,8 @@ class Mode(Enum):
     IMAGE_VIEWER = "image_viewer"
     XYE_VIEWER = "xye_viewer"
     NEXUS_VIEWER = "nexus_viewer"
+    STITCH_1D = "stitch_1d"      # whole-scan merged 1D pattern (scan.stitched_1d)
+    STITCH_2D = "stitch_2d"      # whole-scan merged 2D cake (scan.stitched_2d)
 
 
 # ── Panel layout table (Stage 4/5 step 1) ────────────────────────────
@@ -229,6 +231,27 @@ PANEL_LAYOUT = {
         twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
         plotWindow_h=(200, _FULL), imageToolbar_h=(40, 40),
         plotToolBar_h=(0, 0), binnedFrame_w=(0, 0),
+    ),
+    # Stitch 1D: the whole-scan merged 1D pattern — plot-only, identical
+    # geometry to INT_1D (2D pane collapsed, raw-preview button hidden since
+    # there is no per-frame raw for a merge).
+    Mode.STITCH_1D: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=True,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, 0), imageWindow_h=(80, 85), plotWindow_h=(200, _FULL),
+        imageToolbar_h=(40, 40), plotToolBar_h=(0, 0), binnedFrame_w=(0, _FULL),
+    ),
+    # Stitch 2D: the whole-scan merged cake — cake-focused; the 1D plot is
+    # collapsed and the cake fills the 2D pane (the raw panel carries no
+    # per-frame image for a merge, so render_plan blanks it).
+    Mode.STITCH_2D: PanelLayout(
+        frame_top_vis=True, twoDWindow_vis=True, imageToolbar_vis=True,
+        frame_4_vis=True, frame_6_vis=True, plotToolBar_vis=False,
+        show_image_btn_vis=False,
+        twoDWindow_h=(0, _FULL), imageWindow_h=(200, _FULL),
+        plotWindow_h=(0, 0), imageToolbar_h=(40, 40),
+        plotToolBar_h=(0, 0), binnedFrame_w=(0, _FULL),
     ),
 }
 
@@ -1437,6 +1460,49 @@ def empty_display_state(mode, generation, *, title=""):
         title=title,
         panels=(),
         layout=(),
+        results=None,
+    )
+
+
+def stitch_display_state(mode, generation, *, has_1d, has_2d, title=""):
+    """A :class:`DisplayState` for a whole-scan stitch result (STITCH_1D/2D).
+
+    Pure / Qt-free.  Unlike :func:`compute_display_state` there is no per-frame
+    selection: the stitch is a single synthetic panel (PLOT_1D for STITCH_1D,
+    CAKE_2D for STITCH_2D) whose ``has_data`` is just "does the matching result
+    exist".  ``render_roles_for_state`` appends the other legacy roles as cleanup,
+    so the unused panels (raw + the other dimension) are always blanked.
+
+    ``load_status`` is READY when the relevant result exists, else EMPTY — so a
+    Stitch mode selected before a run renders an explicit blank rather than stale
+    per-frame content.
+    """
+    if mode is Mode.STITCH_2D:
+        role = PanelRole.CAKE_2D
+        has = bool(has_2d)
+    else:
+        role = PanelRole.PLOT_1D
+        has = bool(has_1d)
+    key = PanelKey(role)
+    panels = ((key, PanelPlan(visible=True, has_data=has)),)
+    layout = ((key,),)
+    return DisplayState(
+        mode=mode,
+        load_status=LoadStatus.READY if has else LoadStatus.EMPTY,
+        error_message=None,
+        generation=generation,
+        selected_ids=(),
+        render_ids=(),
+        overall=True,                # a stitch aggregates the whole scan
+        gi=False,
+        x_unit="q_A^-1",
+        x_label="q",
+        method="Single",
+        overlay=OverlayAction.REPLACE,
+        overlaid_ids=(),
+        title=title,
+        panels=panels,
+        layout=layout,
         results=None,
     )
 

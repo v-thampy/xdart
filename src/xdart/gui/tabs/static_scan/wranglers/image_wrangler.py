@@ -697,6 +697,10 @@ class imageWrangler(wranglerWidget):
     # A Run click in a Stitch mode diverts here instead of a wrangler run; the
     # host (staticWidget.start_stitch) launches the stitch worker.  Arg: '1d'|'2d'.
     sigStitchRequested = QtCore.Signal(str)
+    # Emitted ('1d'|'2d'|'') when the dropdown enters/leaves a Stitch mode, so the
+    # host can route the display to the persistent StitchDisplayController (mirrors
+    # sigViewerModeChanged).  Prev-tracked to fire only on an actual change.
+    sigStitchModeChanged = QtCore.Signal(str)
 
     def _on_mode_changed(self, *args):
         """Update all flags from the processing mode dropdown and checkboxes."""
@@ -836,6 +840,14 @@ class imageWrangler(wranglerWidget):
         if new_vm != self._prev_viewer_mode:
             self._prev_viewer_mode = new_vm
             self.sigViewerModeChanged.emit(new_vm)
+
+        # Stitch-mode dropdown change → the host routes the display to/from the
+        # persistent StitchDisplayController.  '' on any non-stitch mode.
+        new_sm = ('1d' if mode_text == 'Stitch 1D'
+                  else '2d' if mode_text == 'Stitch 2D' else '')
+        if new_sm != getattr(self, '_prev_stitch_mode', ''):
+            self._prev_stitch_mode = new_sm
+            self.sigStitchModeChanged.emit(new_sm)
 
     def _set_integration_controls_enabled(self, enabled, *, include_gi=True):
         """Enable or disable parameter tree groups related to integration."""

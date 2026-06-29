@@ -663,6 +663,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         # scan/file load — so a worker result computed against an old
         # generation can be dropped (full enforcement lands in Stage 5).
         self.display_generation = 0
+        # Persistent stitch display: '1d'/'2d' while a Stitch mode is selected in
+        # the wrangler dropdown AND a result exists; None ⇒ the per-frame view.
+        # Set by the host via sigStitchModeChanged + stitch_thread_finished;
+        # gated by result-existence in _active_stitch_mode.
+        self.stitch_display_mode = None
         # D2 (greenfield Phase 3): off-GUI-thread rehydration of evicted frames.
         # The store reads an evicted frame's heavy payload through THIS widget's
         # disk reader; the background worker calls it off the GUI thread.  Async
@@ -1206,16 +1211,37 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 self._bump_display_generation()
             self._last_selection_sig = sig
 
+    def _active_stitch_mode(self):
+        """``'1d'``/``'2d'`` when the persistent stitch display should show, else
+        None.  ``stitch_display_mode`` follows the wrangler Mode dropdown, but the
+        stitch only renders once the matching result actually exists on the scan —
+        so selecting a Stitch mode before a run (or after a new scan cleared the
+        result) keeps the per-frame view rather than flashing an empty stitch."""
+        m = getattr(self, 'stitch_display_mode', None)
+        scan = getattr(self, 'scan', None)
+        if m == '1d' and getattr(scan, 'stitched_1d', None) is not None:
+            return '1d'
+        if m == '2d' and getattr(scan, 'stitched_2d', None) is not None:
+            return '2d'
+        return None
+
     def _live_mode(self):
         """Map the widget's viewer state to a :class:`Mode`.  Normal mode is
         INT_1D when the scan is 1D-only (skip_2d) — plot-only, matching
-        _apply_1d_only_visibility — else INT_2D (raw|cake / plot)."""
+        _apply_1d_only_visibility — else INT_2D (raw|cake / plot).  A live stitch
+        result (STITCH_1D/2D) takes precedence over the per-frame integration
+        view but not over a file viewer."""
         if self.viewer_mode == 'image':
             return Mode.IMAGE_VIEWER
         if self.viewer_mode == 'xye':
             return Mode.XYE_VIEWER
         if self.viewer_mode == 'nexus':
             return Mode.NEXUS_VIEWER
+        stitch = self._active_stitch_mode()
+        if stitch == '1d':
+            return Mode.STITCH_1D
+        if stitch == '2d':
+            return Mode.STITCH_2D
         if getattr(self.scan, 'skip_2d', False):
             return Mode.INT_1D
         return Mode.INT_2D
@@ -1240,6 +1266,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
     def _updated(self):
         """Check if there is data to update
         """
+        # A live stitch result is a whole-scan synthetic independent of per-frame
+        # cache readiness — render it whenever it exists (so it survives eviction
+        # of the per-frame data and re-renders on every tick).
+        if self._active_stitch_mode() is not None:
+            return True
+
         # In viewer mode, bypass the scan.name check — no HDF5 scan is loaded
         if self.viewer_mode is not None:
             if len(self.frame_ids) == 0:
@@ -1437,6 +1469,12 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if role is not PanelRole.PLOT_1D:
             return False
 
+        # A stitch is a single synthetic whole-scan curve with no per-frame
+        # selection state — draw it directly rather than through update_plot_view
+        # (which keys legends/waterfall offsets off frame ids the stitch lacks).
+        if state is not None and state.mode in (Mode.STITCH_1D, Mode.STITCH_2D):
+            return self._draw_stitch_plot(payload_value)
+
         traces = tuple(getattr(payload_value, "traces", ()) or ())
         if not traces:
             self.clear_plot_view()
@@ -1586,38 +1624,42 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
                 _sso()
         return True
 
-    def render_stitch_result(self, result_1d=None, result_2d=None):
-        """Draw a stitched result (``scan.stitched_1d`` / ``stitched_2d``) into
-        the 1-D plot / 2-D cake panels, reusing the integration view's draw
-        delegates (Stitch 1D/2D map to INT_1D/INT_2D, so the panels are already
-        laid out).  Direct one-shot draw — bypasses the controller/payload
-        compute_state dance since the source is ``scan.stitched_*``, not the
-        publication store.
+    def _draw_stitch_plot(self, plot_payload):
+        """Draw a stitch's single merged 1-D curve directly onto ``self.plot``.
 
-        NOTE (Phase 1b): this is a direct render after the run; it is overwritten
-        the next time ``update()`` runs (selection/mode change), since the stitch
-        result is not yet a first-class display source (a StitchDisplayController
-        + store is the persistent follow-up).  Returns True if anything drew."""
+        A stitch is one synthetic whole-scan trace with no per-frame selection,
+        so it bypasses ``update_plot_view`` (which keys legends + waterfall
+        offsets off per-frame ids).  Shared by the persistent payload path
+        (:meth:`_draw_payload`) and the legacy :meth:`render_stitch_result`.
+        Returns True if it drew, False otherwise."""
+        traces = tuple(getattr(plot_payload, "traces", ()) or ())
+        if not traces:
+            self.clear_plot_view()
+            return True
+        try:
+            x = np.asarray(traces[0].x, dtype=float)
+            y = np.asarray(traces[0].y, dtype=float)
+            self.plot.clear()
+            self.plot.plot(x, y, pen=pg.mkPen('#2b6cb0', width=1.5), name='Stitch')
+            self.plot.setLabel('bottom', plot_payload.axis_x.label,
+                               units=pretty_unit(plot_payload.axis_x.unit))
+            self.plot.setLabel('left', 'Intensity')
+            self.plot.autoRange()
+            return True
+        except Exception:
+            logger.error("stitch 1D draw failed", exc_info=True)
+            return False
+
+    def render_stitch_result(self, result_1d=None, result_2d=None):
+        """Legacy one-shot stitch draw (``scan.stitched_1d`` / ``stitched_2d``).
+
+        Superseded by the persistent :class:`StitchDisplayController` (the stitch
+        is now a first-class display source routed through ``update()``); kept as a
+        direct-draw helper / rollback path.  Returns True if anything drew."""
         drew = False
         pp = stitch_plot_payload(result_1d)
-        if pp is not None:
-            # Draw the single merged curve directly onto the 1-D plot.  (The
-            # payload→update_plot_view path depends on per-frame selection state
-            # that a synthetic stitch result doesn't have, so a direct draw is
-            # the reliable one-shot here.)
-            try:
-                x = np.asarray(pp.traces[0].x, dtype=float)
-                y = np.asarray(pp.traces[0].y, dtype=float)
-                self.plot.clear()
-                self.plot.plot(x, y, pen=pg.mkPen('#2b6cb0', width=1.5),
-                               name='Stitch')
-                self.plot.setLabel('bottom', pp.axis_x.label,
-                                   units=pretty_unit(pp.axis_x.unit))
-                self.plot.setLabel('left', 'Intensity')
-                self.plot.autoRange()
-                drew = True
-            except Exception:
-                logger.error("stitch 1D draw failed", exc_info=True)
+        if pp is not None and self._draw_stitch_plot(pp):
+            drew = True
         ip = stitch_image_payload(result_2d)
         if ip is not None:
             try:
@@ -2131,6 +2173,11 @@ class displayFrameWidget(DisplayDataMixin, DisplayPlotMixin, Qt.QtWidgets.QWidge
         if mode in (Mode.INT_1D, Mode.INT_2D):
             self._apply_share_axis_state()
             self._apply_1d_only_visibility()
+        elif mode in (Mode.STITCH_1D, Mode.STITCH_2D):
+            # Stitch modes are not in the _apply_1d_only_visibility path; assert
+            # their geometry here (idempotent) so the cake/plot pane is visible
+            # and so leaving stitch restores the INT geometry on the next render.
+            self._apply_layout(mode)
 
         # Clear the panels this state does not want (kills stale content).
         for role in plan.clear:

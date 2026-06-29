@@ -40,6 +40,9 @@ from .display_logic import (
     register_controller,
     sentinel_mask,
     standalone_viewer_image,
+    stitch_display_state,
+    stitch_image_payload,
+    stitch_plot_payload,
     xye_unit_from_filename,
     x_axis_for_unit,
 )
@@ -55,6 +58,7 @@ __all__ = [
     "ImageViewerController",
     "XYEViewerController",
     "NexusViewerController",
+    "StitchDisplayController",
     "register_default_controllers",
 ]
 
@@ -573,11 +577,47 @@ class NexusViewerController(_BaseController):
         )
 
 
+class StitchDisplayController(_BaseController):
+    """Whole-scan stitch result (STITCH_1D / STITCH_2D).
+
+    The merged result is a *synthetic* whole-scan record, not a per-frame
+    publication, so this controller does NOT consult ``scan.frames``, the
+    PublicationStore, or the integration-unit combo.  It reads the result
+    straight off the scan (``scan.stitched_1d`` / ``scan.stitched_2d``, where
+    ``ewald.stitch.run_stitch`` wrote it) and turns it into a single-panel
+    :class:`DisplayState` + :class:`DisplayPayload`.  Making it a first-class
+    display source is what lets the stitch survive subsequent ``update()`` calls
+    (the previous one-shot ``render_stitch_result`` was overwritten by the next
+    per-frame render)."""
+
+    def compute_state(self, widget, mode):
+        scan = getattr(widget, "scan", None)
+        has_1d = getattr(scan, "stitched_1d", None) is not None
+        has_2d = getattr(scan, "stitched_2d", None) is not None
+        return stitch_display_state(
+            mode, widget.display_generation, has_1d=has_1d, has_2d=has_2d)
+
+    def build_payload(self, widget, state):
+        scan = getattr(widget, "scan", None)
+        plot = cake = None
+        if state.mode is Mode.STITCH_2D:
+            cake = stitch_image_payload(getattr(scan, "stitched_2d", None))
+        else:
+            plot = stitch_plot_payload(getattr(scan, "stitched_1d", None))
+        return DisplayPayload(
+            generation=state.generation,
+            raw_image=None,
+            cake_image=cake,
+            plot=plot,
+        )
+
+
 # Singleton adapters (stateless) registered for each mode.
 _SCAN = ScanDisplayController()
 _IMAGE = ImageViewerController()
 _XYE = XYEViewerController()
 _NEXUS = NexusViewerController()
+_STITCH = StitchDisplayController()
 
 
 def register_default_controllers():
@@ -588,6 +628,8 @@ def register_default_controllers():
     register_controller(Mode.IMAGE_VIEWER, _IMAGE)
     register_controller(Mode.XYE_VIEWER, _XYE)
     register_controller(Mode.NEXUS_VIEWER, _NEXUS)
+    register_controller(Mode.STITCH_1D, _STITCH)
+    register_controller(Mode.STITCH_2D, _STITCH)
 
 
 # Register on import so simply importing this module (or display_frame_widget)

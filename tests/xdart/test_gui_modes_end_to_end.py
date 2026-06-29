@@ -3276,3 +3276,54 @@ def test_shared_controls_reroute_on_wrangler_swap(widget):
     assert not ctrls.batchButton.isHidden()
     back_modes = [ctrls.modeCombo.itemText(i) for i in range(ctrls.modeCombo.count())]
     assert 'Int 2D' in back_modes
+
+
+def test_stitch_display_persists_across_updates(widget):
+    """The persistent StitchDisplayController keeps a merged result on screen
+    across subsequent update() calls (the regression the one-shot render had),
+    and returns to the per-frame view when the Stitch mode is left or the result
+    is cleared."""
+    from xdart.gui.tabs.static_scan.display_logic import Mode
+    from xrd_tools.core.containers import IntegrationResult1D
+    w = widget
+    df = w.displayframe
+    # No frames selected → the per-frame view has nothing; the stitch result is
+    # the only thing to draw.  get_idxs early-returns on empty frame_ids and
+    # _updated() returns True because a stitch is active.
+    df.frame_ids[:] = []
+    radial = np.linspace(1.0, 5.0, 40)
+    df.scan.stitched_2d = None
+    df.scan.stitched_1d = IntegrationResult1D(
+        radial=radial, intensity=np.linspace(10.0, 50.0, 40), unit="q_A^-1")
+    df.stitch_display_mode = '1d'
+
+    assert df._active_stitch_mode() == '1d'
+    assert df._live_mode() is Mode.STITCH_1D
+
+    df.update()
+    items = df.plot.listDataItems()
+    assert items, "stitch curve should be drawn"
+    x0 = np.asarray(items[0].getData()[0], dtype=float)
+    assert x0.size == 40
+    np.testing.assert_allclose([x0.min(), x0.max()], [1.0, 5.0], atol=1e-6)
+
+    # Persistence: the NEXT update() (the call that used to overwrite the one-shot
+    # paint with the per-frame view) must keep the stitch.
+    df.update()
+    assert df._live_mode() is Mode.STITCH_1D
+    items2 = df.plot.listDataItems()
+    assert items2
+    np.testing.assert_allclose(
+        np.asarray(items2[0].getData()[0], dtype=float), x0)
+
+    # Leaving the Stitch mode (dropdown → a per-frame mode) returns to per-frame.
+    df.stitch_display_mode = None
+    assert df._active_stitch_mode() is None
+    assert df._live_mode() in (Mode.INT_1D, Mode.INT_2D)
+
+    # Result-existence guard: a Stitch mode selected with no result also falls
+    # back to per-frame (no premature blank before a run / after new_scan clears).
+    df.stitch_display_mode = '1d'
+    df.scan.stitched_1d = None
+    assert df._active_stitch_mode() is None
+    assert df._live_mode() in (Mode.INT_1D, Mode.INT_2D)
