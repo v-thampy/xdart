@@ -1,6 +1,9 @@
 # Design: wrangler widget organization (Int / Stitch / RSM)
 
-**Status:** draft for discussion · 2026-06-20 · planning only (no code)
+**Status:** DESIGN/P7 · reconciled 2026-06-27. Headless source, geometry,
+correction, stitch, and RSM foundations are implemented or tracked in
+`stitching_rsm_build_plan.md`; this document remains the GUI organization plan for
+future Stitch/RSM wrangler panels.
 **Companion to:** [`design_stitching_jun2026.md`](design_stitching_jun2026.md) §5.4 (the
 authoritative *input inventory*) and
 [`design_diffractometer_geometry_jun2026.md`](design_diffractometer_geometry_jun2026.md)
@@ -9,9 +12,8 @@ how those inputs are grouped into panels, gated by mode, and surfaced live vs ba
 new input list.
 **Purpose:** pull every wrangler requirement Vivek has stated (some only in project memory)
 into one place, organized for the eventual Claude Code handoff.
-**Gated on:** the headless seams (`Diffractometer`, `DetectorCalibration`, `refine_goniometer`,
-streaming sinks) land first; the wrangler is the thin Qt layer over them. Sequence after
-3e+Phase-5 (memory `planned_features_roi_and_stitching_jun2026`).
+**Gated on:** P7 GUI work after the current headless gates; the wrangler is the thin Qt
+layer over the shipped headless seams.
 
 ---
 
@@ -150,9 +152,9 @@ wrangler list:
   `radial_range`/`azimuth_range` (or auto from angle span), `mask`, `monitor_key`.
 - RSM: grid bins + q/HKL ranges (or auto-scout — §6), UB, energy.
 - Frame selection: optional angle filters → `frame_indices`; not an accuracy gate (§2 note ³).
-- Energy/wavelength: from the energy motor or an override field. *(Watch the per-beamline unit:
-  `get_from_spec_file` returns energy already in eV on the psic data — memory
-  `psic_del_nu_calibration_solved`.)*
+- Energy/wavelength: canonical source is the calibration wavelength persisted under
+  `/entry/diffractometer` per ADR-0009; plan/correction energy derives from or validates
+  against it. Explicit scan/GUI energy is an override only when intentionally authoritative.
 - Output: stitched/gridded file name + location, one `.nxs` per group.
 
 ---

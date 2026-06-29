@@ -1,6 +1,6 @@
 > **HISTORICAL:** design note from the two-repo era; review against the current display-layer seams (docs/ARCHITECTURE.md) before acting on it.
 >
-> **SUPERSEDED (2026-06-14) by [`docs/design/design_stitching_jun2026.md`](../design/design_stitching_jun2026.md)** — reconciled to the monorepo / arch-v2 (one `FrameSource` layer, schema-as-code persistence, display-controller registry, the shared `Diffractometer`). Kept for provenance only.
+> **SUPERSEDED (2026-06-14) by [`docs/design/design_stitching_jun2026.md`](../../design/design_stitching_jun2026.md)** — reconciled to the monorepo / arch-v2 (one `FrameSource` layer, schema-as-code persistence, display-controller registry, the shared `Diffractometer`). Kept for provenance only.
 
 # Stitching architecture — design doc
 

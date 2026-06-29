@@ -1,8 +1,10 @@
 # Design: Reciprocal Space Mapping (RSM) — consolidated
 
-**Status:** draft for discussion · 2026-06-23 · pools the RSM-relevant design that was
-scattered across the geometry / corrections / wrangler / stitching docs into one place
-(RSM is the next-but-one module).
+**Status:** PARTIAL · reconciled 2026-06-27. Headless RSM is implemented through the
+shared `Diffractometer`, weighted streaming gridder, NeXus persistence, and correction
+seams. Production angle reroute, GI refraction/convention validation, and the RSM GUI
+viewer/wrangler remain deferred/P7. Current status authority:
+[`stitching_rsm_build_plan.md`](stitching_rsm_build_plan.md).
 **Depends on:** the shared `Diffractometer`
 ([`design_diffractometer_geometry_jun2026.md`](design_diffractometer_geometry_jun2026.md) —
 the single geometry input, incl. `to_qconversion`); the per-pixel correction stack
@@ -36,8 +38,8 @@ source layer, the `Diffractometer`, the corrections — is shared.
 
 ## 2. What already exists (cited — read before acting)
 
-The headless RSM spine is **largely built**; the gaps are geometry-reconcile + corrections +
-xdart wiring.
+The headless RSM spine is **largely built**; the remaining gaps are production convention
+reroute/validation and xdart wiring.
 
 - **Plan seam:** `analysis/plans.py` `RSMPlan(diff_motors, bins, UB, energy, q_bounds, roi, …)`
   + `run_rsm(plan, source | [sources])` (l.177/194) → `AnalysisResult(kind="rsm", payload=RSMVolume)`.
@@ -51,14 +53,14 @@ xdart wiring.
 - **Pipeline:** `rsm/pipeline.py` `ScanInfo(spec_path, img_dir, h5_path)` (the spec+images scan
   definition — now generalized by the shared source panel), `load_images`, `process_scan_data`,
   `process_scan_from_nexus`, `grid_scans_streaming`. `volume.py` `RSMVolume`.
-- **Geometry today:** the pipeline builds q via `io.spec.get_angles`/`get_energy_and_UB` +
-  `core/geometry/pixel_q.py` `PixelQMap` — its OWN qconversion, NOT yet the shared `Diffractometer`.
+- **Geometry today:** the pipeline has the shared `Diffractometer` drop-in path and
+  `assemble_circle_angles`; production reroute is deferred until convention validation.
 - **NOT wired into xdart:** `run_rsm` is imported nowhere in `src/xdart`. No RSM wrangler, no RSM
   viewer controller. Display reserves the seam (§6).
 
 ## 3. Headless design — reconcile onto the shared seams
 
-### 3.1 Geometry = the shared `Diffractometer.to_qconversion()` (closes the parallel-rep gap)
+### 3.1 Geometry = the shared `Diffractometer.to_qconversion()` (implemented drop-in)
 RSM's q-mapping must derive from the **one** `Diffractometer`
 (`design_diffractometer_geometry_jun2026.md` §3, ADR-0007), not a parallel qconversion. The
 geometry object already plans `to_qconversion()`/`to_hxrd(energy)` — the SAME adapter the
@@ -78,14 +80,10 @@ sample/alignment, not per instrument — `design_wrangler_organization_jun2026.m
   reference reflection later.
 - Persisted to `/entry/sample/UB` (v2 schema, capability-gated).
 
-### 3.3 Corrections — the shared per-pixel weight stack (closes "xu path applies none")
-The xu RSM path applies **no** per-pixel corrections today
-(`design_intensity_corrections_jun2026.md`: solid-angle/polarization/GI all missing). RSM
-consumes the **same** correction stack as stitch — applied as a per-pixel **weight** into
-`StreamingGridder.add` (the accumulator seam). Reuse pyFAI's `solidAngleArray`/`polarization`
-arrays (built once on the equivalent geometry) + the GI stack (footprint/refraction/Fresnel from
-xu primitives). **Gate:** corrected vs uncorrected voxel intensity on the GI fixture matches the
-`Multi120_GI_Corrections_Explorer` notebook.
+### 3.3 Corrections — the shared per-pixel weight stack (implemented headless)
+RSM consumes the **same** correction stack as stitch — applied as a per-pixel **weight** into
+`StreamingGridder.add` (the accumulator seam). Solid-angle/polarization and GI intensity
+weights are implemented; GI refraction/convention validation remains a real-data gate.
 
 ### 3.4 Streaming + multi-scan (the gridder is already stream-ready)
 - **Live RSM is architecturally cheap** (`design_wrangler_organization_jun2026.md` §6): the
@@ -101,8 +99,8 @@ xu primitives). **Gate:** corrected vs uncorrected voxel intensity on the GI fix
 ## 4. Persistence (schema-as-code, additive, capability-gated)
 Persist the **RSMVolume** (qx/qy/qz axes + intensity + counts) as a scan-level schema group
 (mirroring stitched_1d/2d, stitching §4) with a `rsm` `CapabilityAttr`; persist provenance
-(`Diffractometer` + UB + bins + q_bounds + corrections). Add `get_rsm` reader. **Gate:**
-write→read round-trip; capability feature-detect; absent → None.
+(`Diffractometer` + UB + bins + q_bounds + corrections). **Implemented:** `write_rsm` /
+`read_rsm` and schema/capability registration. **Deferred:** convenience `get_rsm` reader.
 
 ## 5. xdart (thin) — wrangler + viewer
 
@@ -119,21 +117,21 @@ Reuse the shared `ScanSourceWidget(mode="rsm")` (source-panel §3, grouping on) 
 Unlike stitch, the RSM viewer shows **repeated** panels — a 2×3 of `SLICE_2D` (qx-qy, qx-qz,
 qy-qz cuts) + `PROJ_1D` projections — so it **requires** the display registry's repeated-role
 support (the WS-X2 TODO at `display_logic.py:924`; stitching §5.3 correctly notes stitch does
-NOT need it but RSM does). Register `Mode.RSM_VIEWER` + a `PANEL_LAYOUT` of repeated
+NOT need it but RSM does). P7/deferred: register `Mode.RSM_VIEWER` + a `PANEL_LAYOUT` of repeated
 `PanelKey(SLICE_2D)/PanelKey(PROJ_1D)` instances + an `RSMViewerController` (`design` §10 seam
 in the static-scan display layer). Slice axis + index are view state.
 
 ## 6. Gated step sequence (each independently testable; headless gates = the RSM notebooks)
-0. **(prereq) Shared `Diffractometer`** (geometry doc) lands first.
-1. **Reconcile q-mapping** onto `Diffractometer.to_qconversion()` (§3.1). *Gate:* voxel
+0. **DONE: shared `Diffractometer`** (geometry doc) lands first.
+1. **DONE headless: reconcile q-mapping** onto `Diffractometer.to_qconversion()` (§3.1). *Gate:* voxel
    positions match the `RSM_process` fixture; old qconversion retired/aliased.
-2. **Corrections into the gridder weight** (§3.3). *Gate:* corrected voxel intensities match the
+2. **DONE headless: corrections into the gridder weight** (§3.3). *Gate:* corrected voxel intensities match the
    GI-corrections notebook.
-3. **UB capture + persistence** (§3.2, §4). *Gate:* `#G3` parse; write→read round-trip; UB-less
+3. **PARTIAL: UB capture + persistence** (§3.2, §4). *Gate:* `#G3` parse; write→read round-trip; UB-less
    path warns.
-4. **xdart RSM wrangler** over the shared source panel (§5.1) — DiffractometerConfig + UB + bins.
+4. **P7/deferred: xdart RSM wrangler** over the shared source panel (§5.1) — DiffractometerConfig + UB + bins.
    *Gate:* end-to-end `run_rsm` on the notebook scan → a volume; grouping → one volume.
-5. **RSM viewer** (§5.2) — requires WS-X2 repeated roles. *Gate:* offscreen `display_logic` test
+5. **P7/deferred: RSM viewer** (§5.2) — requires WS-X2 repeated roles. *Gate:* offscreen `display_logic` test
    for the 2×3 layout; controller renders slices/projections.
 6. **(cheap, optional) Live RSM** — an RSM sink calling `StreamingGridder.add` per chunk;
    partial-volume events; bounds via `scout` or explicit `q_bounds` (§3.4). *Gate:* a
@@ -147,8 +145,8 @@ in the static-scan display layer). Slice axis + index are view state.
   `io/spec.py` (`get_angles`/`get_energy_and_UB`), `display_logic.py` (WS-X2 repeated-role TODO
   l.924, `PanelRole`).
 - Docs: `design_diffractometer_geometry_jun2026.md` (geometry + `to_qconversion`),
-  `design_intensity_corrections_jun2026.md` (the shared correction stack; xu RSM path applies
-  none today), `design_stitching_jun2026.md` §2.6 (the shared histogram/`StreamingGridder`
+  `design_intensity_corrections_jun2026.md` (the shared correction stack),
+  `design_stitching_jun2026.md` §2.6 (the shared histogram/`StreamingGridder`
   merge), `design_shared_source_panel_jun2026.md` (`ScanSourceWidget`/`CompositeFrameSource`),
   `design_wrangler_organization_jun2026.md` §3.4–3.6 + §6 (DiffractometerConfig/UB/live RSM).
 - Notebooks (`~/repos/example_notebooks/`): `RSM/RSM_process.ipynb`, `RSM/RSM.ipynb`;

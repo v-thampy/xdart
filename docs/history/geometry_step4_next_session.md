@@ -1,5 +1,9 @@
 # Handoff — `Diffractometer`: step 4 DONE (live check pending) → 4b/5 next
 
+> Archived 2026-06-27. This was a historical handoff note; current geometry status lives
+> in `docs/decisions/0007-one-shared-diffractometer-geometry-object.md` and
+> `docs/design/stitching_rsm_build_plan.md`.
+
 ADR-0007 §6 **steps 0–4 are implemented and green** on branch `feature/geometry`
 (off `feature/gui-redesign-direction-a`, NOT pushed). What remains is a **live
 verification** of the step-4 behaviour change, then **4b (`refine_goniometer`)**

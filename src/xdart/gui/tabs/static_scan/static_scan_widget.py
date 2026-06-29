@@ -605,6 +605,23 @@ class staticWidget(QWidget):
             return None
         return self._pattern_for_frame(idxs[0])
 
+    def _analysis_context(self):
+        """Stable analysis-data contract for popup tools.
+
+        Popups consume this context rather than reading staticWidget,
+        displayframe, wrangler, or integrator internals.  The providers still
+        point at the current live/reloaded publication path, so live fitting
+        continues to update on each processed frame.
+        """
+        from .analysis_context import AnalysisContext
+        return AnalysisContext(
+            current_pattern_provider=self._current_pattern_for_fit,
+            frame_pattern_provider=self._pattern_for_frame,
+            scan_uri_provider=self._current_scan_uri,
+            mask_provider=self._scan_plot_mask_provider,
+            frame_labels_provider=lambda: tuple(getattr(self, 'frame_ids', ()) or ()),
+            metadata_provider=lambda: {})
+
     def _open_peak_fit_dialog(self):
         """Open (or re-show) the Peak Fitting popup — lazy, single-instance,
         non-modal (so the live scan + frame browsing stay responsive; Reload
@@ -612,7 +629,7 @@ class staticWidget(QWidget):
         if self._peak_fit_dialog is None:
             from .peak_fit_dialog import PeakFitDialog
             self._peak_fit_dialog = PeakFitDialog(
-                self._current_pattern_for_fit, parent=self)
+                analysis_context=self._analysis_context(), parent=self)
             # Toggling Live on re-fits the current frame at once (then every new
             # frame, via set_data); off just stops pushing.
             self._peak_fit_dialog.live_check.toggled.connect(
@@ -653,7 +670,7 @@ class staticWidget(QWidget):
         dlg = self._peak_fit_dialog
         if dlg is None or not dlg.isVisible() or not dlg.live_check.isChecked():
             return
-        data = self._current_pattern_for_fit()
+        data = self._analysis_context().current_pattern_tuple()
         if not data:
             return
         x, y, label = data
@@ -723,8 +740,9 @@ class staticWidget(QWidget):
             return
         x_unit = dlg._x_label
         inputs = []
+        ctx = self._analysis_context()
         for idx in frame_idxs:
-            data = self._pattern_for_frame(idx)
+            data = ctx.pattern_tuple_for_frame(idx)
             if not data:
                 continue
             fx, fy, _lbl = data
@@ -795,7 +813,7 @@ class staticWidget(QWidget):
         if self._phase_fit_dialog is None:
             from .phase_fit_dialog import PhaseFitDialog
             self._phase_fit_dialog = PhaseFitDialog(
-                self._current_pattern_for_fit, parent=self)
+                analysis_context=self._analysis_context(), parent=self)
             self._phase_fit_dialog.batch_btn.clicked.connect(
                 lambda: self._on_batch_clicked(self._phase_fit_dialog))
         dlg = self._phase_fit_dialog
@@ -836,9 +854,10 @@ class staticWidget(QWidget):
         non-modal.  Starts on the currently-loaded scan (or blank)."""
         if self._scan_plot_dialog is None:
             from .scan_plot_dialog import ScanPlotDialog
+            ctx = self._analysis_context()
             self._scan_plot_dialog = ScanPlotDialog(
-                default_uri=self._current_scan_uri(),
-                mask_provider=self._scan_plot_mask_provider, parent=self)
+                default_uri=ctx.current_scan_uri(),
+                mask_provider=ctx.mask_for_scan_uri, parent=self)
         dlg = self._scan_plot_dialog
         dlg.show()
         dlg.raise_()

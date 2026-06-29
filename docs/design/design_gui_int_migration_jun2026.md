@@ -1,7 +1,9 @@
 # Int-1D/2D → three-section layout — detailed migration design
 
-**Status:** detailed design (Jun 2026), ready for UI mockups (Claude design) → Qt implementation.
-Parent: `design_gui_three_section_layout_jun2026.md` (the principle + the Stitch/RSM reference).
+**Status:** DESIGN/P7, detailed migration design (Jun 2026), ready for UI mockups → Qt implementation.
+GI ownership follows [`ADR-0008`](../decisions/0008-gi-control-ownership.md); energy follows
+[`ADR-0009`](../decisions/0009-energy-single-source.md).
+Parent: `design_controls_panel_v2_jun2026.md` (the canonical controls-panel spec — the principle + the Stitch/RSM reference).
 Sizing: **MODERATE, ~6.5–13 h** (migration analysis `aad2247d`) — a re-organisation of already-
 separated widgets, *not* a redesign. **Do this once the Stitch/RSM 3-section layout is proven**, so
 Int inherits a validated pattern; not bundled with the new-tool wiring.
@@ -52,7 +54,7 @@ each dimension identically — **no 1D/2D rewrite**.
 | GI incidence motor | `integrator.gi_motor` (`:286`) | **2c** |
 | GI sample_orientation | `integrator.gi_sample_orientation` (`:303`) | **2c** |
 | GI tilt | `integrator.gi_tilt` (`:310`) | **2c** |
-| GI material/density/film (NEW — needed for `GICorrectionStack`) | — | **2c** |
+| GI material/density/film (NEW — needed for `GICorrectionStack`) | — | **2c** sample facts |
 | Diffractometer convention (NEW — psic/fourc…) | — (inferred today) | **2a** |
 
 The wrangler's existing hidden GI carrier group (`image_wrangler.py:86-109`) was a persistence
@@ -70,9 +72,9 @@ session-restore target).
 | Reintegrate 1D / 2D + Advanced | `integratorUI.py:447` |
 
 **Energy/wavelength (single-sourced):** bind the **2d** energy widget to the **calibration
-wavelength** (the canonical source, `core/energy.py`); `GICorrectionStack.energy_eV` (2c) and any
-plan energy derive from it. A divergence already warns (`check_energy_consistency`). **GI material**
-(2c) feeds the same `GICorrectionStack` — both stay section-2-global, not duplicated (Vivek's call).
+wavelength** (ADR-0009); `GICorrectionStack.energy_eV` and any plan energy derive from or validate
+against it. **GI material** (2c) feeds the same `GICorrectionStack` — both stay section-2-global,
+not duplicated.
 
 ---
 
@@ -88,10 +90,12 @@ GI/sample state**, so reload re-hydrates section 2 from a loaded `.nxs`:
 - **2b Detector & calibration** → `DetectorCalibration` (PONI dist/poni/rot + wavelength) +
   `Detector_config` orientation + the detector mask. The relocated **PONI… button** + a read-only
   summary of the loaded calibration.
-- **2c Sample & measurement** → one **`GISettings`** object: GI on/off, incidence (motor or fixed
-  `incident_angle_deg`), `sample_orientation`, `tilt_deg`, + the `GICorrectionStack`
-  material/density/film. Plus **UB / sample orientation** (RSM-relevant; sourced from the scan).
-- **2d Beam** → energy/wavelength (bound to 2b's calibration wavelength) + the polarization plane.
+- **2c Sample & measurement** → one **`GISettings`** sample-facts object: GI on/off, incidence
+  (motor or fixed `incident_angle_deg`), `sample_orientation`, `tilt_deg`, + the
+  `GICorrectionStack` material/density/film. Plus **UB / sample orientation** (RSM-relevant;
+  sourced from the scan). GI output axes/submodes remain section-3 plan choices per ADR-0008.
+- **2d Beam** → energy/wavelength (bound to 2b's calibration wavelength; ADR-0009) + the
+  polarization plane.
 
 **Field provenance (the §design-doc table):** most 2b/2a/2d fields are *derived* (PONI file → 2b;
 SPEC motor names → 2a; `.nxs` blob → all), so the panel shows each field's source (inferred /
@@ -169,8 +173,8 @@ unit forces to Q, `chi_offset` greys out, and `npts_oop` appears — all via the
    section-3 in `staticUI.py`/`static_scan_widget.py`; reparent `frame1D`/`frame2D`/pixreject/
    reintegrate into section-3. (No behaviour change yet — just the split.)
 2. **GI extraction** — move `gi_enable`/`gi_motor`/`gi_sample_orientation`/`gi_tilt` (+ a new
-   material field) into 2c; re-home the `sigUpdateGI` emit; point `get_gi_config()` at 2c. Verify
-   `set_image_units()` still fires + the axis swap works.
+   material field) into 2c; keep GI axes/submodes/npts in 3; re-home the `sigUpdateGI` emit; point
+   `get_gi_config()` at 2c. Verify `set_image_units()` still fires + the axis swap works.
 3. **PONI relocation** — move the PONI param + run-gate to 2b; wire load/clear to enable/disable
    section 3 (progressive disclosure).
 4. **2a/2b/2d binding** — add the Diffractometer-preset, detector-orientation, and energy widgets;

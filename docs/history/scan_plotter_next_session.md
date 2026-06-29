@@ -1,5 +1,9 @@
 # Next-session prompt — finish the Scan Plotter (ROI GUI + right axis)
 
+> Archived 2026-06-27. This was a historical handoff note; current Scan Plotter/ROI
+> status lives in `docs/design/design_scan_plotter_metadata_roi_jun2026.md` and
+> `docs/design/design_roi_stats_plotting_jun2026.md`.
+
 Paste the **PROMPT** block below into a fresh session to continue. Everything
 above it is the state summary it refers to.
 

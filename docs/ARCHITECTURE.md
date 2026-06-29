@@ -23,8 +23,8 @@ So "public ScanSession exists" ≠ "xdart is thin" yet — the bridge is the lin
 
 ## North star
 
-(Full version: `design/roadmap_2026-06-10.md`; the from-scratch framing:
-`design/greenfield_design_2026-06-09.md`.)
+(Full version: `design/roadmap_2026-06-10.md`; the plan that executed the
+from-scratch framing: `design/CC_greenfield_implementation_plan_2026-06-12.md`.)
 
 1. **Headless-first** — everything below the GUI is fully usable with no
    Qt installed; a notebook, CLI batch job, or autonomous agent drives the

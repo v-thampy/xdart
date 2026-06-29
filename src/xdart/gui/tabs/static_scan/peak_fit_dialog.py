@@ -53,9 +53,14 @@ class PeakFitDialog(ParamTrendMixin, QtWidgets.QDialog):
         fits what the user is looking at.
     """
 
-    def __init__(self, pattern_provider, parent=None):
+    def __init__(self, pattern_provider=None, parent=None, *, analysis_context=None):
         super().__init__(parent)
-        self._provider = pattern_provider
+        self._analysis_context = analysis_context
+        self._provider = (
+            analysis_context.current_pattern_tuple
+            if analysis_context is not None else pattern_provider)
+        if self._provider is None:
+            self._provider = lambda: None
         self._x = None
         self._y = None
         self._x_label = "q"

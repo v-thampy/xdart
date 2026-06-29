@@ -1,6 +1,8 @@
 # Design: the shared scan-source panel (`ScanSourceWidget`)
 
-**Status:** draft for discussion · 2026-06-23 · planning only (no code)
+**Status:** PARTIAL / implemented core widget · reconciled 2026-06-27. The shared
+source seam, SPEC source, grouped/composite sources, and Scan Plotter usage are
+implemented. Stitch/RSM wrangler embedding and Tiled remain deferred/P7.
 **Realizes:** [`design_wrangler_organization_jun2026.md`](design_wrangler_organization_jun2026.md)
 §3.1 ("Source / data") as a concrete, reusable Qt widget — and
 [`design_stitching_jun2026.md`](design_stitching_jun2026.md) §5.4's source/data input
@@ -60,8 +62,8 @@ reproducibility seam** (it round-trips; a saved scan definition re-opens the sam
 | (Processed NeXus) moved raw | `source_root` (`ProcessedNexusSource`) | existing (N1) |
 | (Tiled, future) catalog / node | `catalog` / `node` (`TiledSource`) | reserved; no factory yet |
 
-**Two small headless additions** (pure, testable, no Qt) — grouping + the composite source that
-makes "combine several scans into one output" seamless (stitch/RSM design §5.1, §6 Q1):
+**Headless additions now shipped** (pure, testable, no Qt) — grouping + the composite source
+that makes "combine several scans into one output" seamless (stitch/RSM design §5.1, §6 Q1):
 
 ```python
 # xrd_tools/sources/grouping.py
@@ -133,7 +135,7 @@ def discover_scans(directory, kind, *, recursive=False, **opts) -> list[SourceSp
 
 `TiffSeriesSource.from_directory` is today's only instance; `discover_scans` generalizes it
 (SPEC: each spec file × its scans, or images grouped by `_scanN_`; NeXus/Eiger: each master).
-**Directory mode is OPTIONAL for the ROI plotter** (which wants one scan) — but because it
+**Directory mode is available to the ROI plotter** (which wants one scan) — but because it
 produces the same `SourceSpec`s, adding it is just another entry path into the same machinery,
 so the widget supports it where it's cheap and the consumer can hide it.
 

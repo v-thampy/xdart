@@ -1,6 +1,9 @@
 # Design: intensity corrections (porting pyFAI's + xu grazing-incidence)
 
-**Status:** draft for discussion · 2026-06-20 · planning only (no code)
+**Status:** PARTIAL / implemented headless stack · reconciled 2026-06-27. The shared
+`CorrectionStack`, GI correction primitives, stitch/RSM weighting seams, and persistence
+provenance are implemented. Remaining work is real-data GI convention/sign validation and
+GUI surfacing.
 **Why now:** the xu cake/RSM χ-bug surfaced that `I(q, χ)` and RSM voxel intensities are
 load-bearing, not cosmetic (`design_diffractometer_geometry_jun2026.md` §3.5). The *value* in
 each (q, χ) / HKL cell is only meaningful once per-pixel intensity corrections are applied. Our
@@ -43,10 +46,9 @@ refraction, penetration-depth / absorption, and Fresnel (Vineyard/DWBA) transmis
 | **penetration / absorption** (GI) | evanescent below αc; finite probe depth | — | — | from `absorption_length` + `critical_angle` |
 | **Fresnel / Vineyard** (GI) | `|T(αi)|²|T(αf)|²` Yoneda enhancement near αc | — | — | from `chi0` / `simpack` reflectivity |
 
-**Takeaway:** for *powder stitch* the only real gap is turning on **polarization** (solid angle
-is already on). For the **xu RSM/cake path, all of solid-angle + polarization (+ optional
-dark/flat) are missing**. **GI corrections are missing in every path** and are the bigger
-scientific lift.
+**Takeaway:** the headless correction stack now covers the shared solid-angle/polarization
+and GI weighting seams. The remaining scientific gate is real-data convention/sign
+validation for GI and the deferred GUI controls.
 
 ---
 
@@ -113,21 +115,22 @@ C = C_solidangle · C_polarization · C_absorption_air · C_flat⁻¹ · (GI: C_
 
 ## 4. Implementation plan (gated, additive)
 
-0. **Correction primitives (headless).** `corrections.py`: `solid_angle(geom)`,
+0. **DONE: correction primitives (headless).** `corrections.py`: `solid_angle(geom)`,
    `polarization(geom, factor)`, `air_absorption(geom, μ_air)`, returning per-pixel arrays on
    the existing pixel grid. **Gate:** numeric match to pyFAI `ai.solidAngleArray()` /
    `ai.polarization()` on a shared geometry.
-1. **Wire into the accumulator weight.** Multiply into the provider/`StreamingGridder.add`
+1. **DONE: wire into the accumulator weight.** Multiply into the provider/`StreamingGridder.add`
    weight (and expose on the stitch path). **Gate:** powder stitch with polarization on
    reproduces pyFAI `MultiGeometry.integrate1d(polarization_factor=…)` within tolerance; RSM
    voxel intensities change only by the expected smooth factor.
-2. **GI corrections (headless, GI-mode).** `gi_footprint`, `gi_refraction` (Snell via
+2. **DONE headless / live-gated convention: GI corrections (GI-mode).** `gi_footprint`, `gi_refraction` (Snell via
    `idx_refraction`), `gi_absorption` (`absorption_length`+`critical_angle`), `gi_fresnel`
    (`chi0`/`simpack`). **Gate:** refraction shifts qz in the expected direction and vanishes far
    above αc; Fresnel peaks at αc (Yoneda); footprint ∝ 1/sin αi. Validate against a GIXSGUI/
    literature worked example.
-3. **Wrangler + persistence.** GI mode collects material + αi; persist applied-corrections
-   provenance. **Gate:** reload → corrections metadata round-trips; re-reduction reproducible.
+3. **PARTIAL: wrangler + persistence.** Correction provenance persists headlessly. GUI
+   material/energy/incidence controls are governed by ADR-0008/0009 and remain a GUI wiring
+   task.
 
 ---
 

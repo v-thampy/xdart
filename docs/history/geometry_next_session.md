@@ -1,5 +1,9 @@
 # Next-session handoff — shared `Diffractometer` geometry (headless, no live test)
 
+> Archived 2026-06-27. This was a historical handoff note; current geometry status lives
+> in `docs/decisions/0007-one-shared-diffractometer-geometry-object.md` and
+> `docs/design/stitching_rsm_build_plan.md`.
+
 Paste the **PROMPT** block into a fresh session to start the geometry module. It is
 the gating prerequisite for stitching + RSM and is **fully headless** — its gates are
 unit tests + the real-data LaB6 notebook, so it can be built while the app can't be

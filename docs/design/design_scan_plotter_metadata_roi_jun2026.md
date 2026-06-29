@@ -1,8 +1,11 @@
 # Design: unified Scan Plotter (metadata + ROI stats)
 
-**Status:** draft for discussion · 2026-06-22 · planning only (no code)
+**Status:** PARTIAL / implemented · reconciled 2026-06-27. The Scan Plotter,
+metadata plotting, ROI picker, ROI worker, per-ROI reducers/background operations, and
+source picker are implemented. Optional ROI persistence/live monitor remain deferred.
 **Supersedes the *framing* of** [`design_roi_stats_plotting_jun2026.md`] — that doc's
-headless core (`RoiSpec` / `RoiStatsPlan` / `run_roi_stats`, background math, masking,
+headless core (`RoiSpec` / `RoiSignal` / `run_roi_signals`, plus `RoiStatsPlan` /
+`run_roi_stats` compatibility, background math, masking,
 persistence, live monitor) **still stands and is the source of truth for the headless
 layer**; this doc folds it into one GUI tool and records the refinements from the
 2026-06-22 discussion (generic source picker, subtract-**or-divide** background,
@@ -123,12 +126,9 @@ plotted = stat(signal_roi)  /  bkg          # divide
 - background reduced over **valid pixels** with the mask-correct `bkg_density` rule from
   the ROI doc §6.2 (so `sum` stays area-scaled and masked/dead/saturated pixels never
   distort signal or background).
-- **OPEN (resolve before build):** is the background **global** (one bg ROI applied to
-  all signal ROIs, as the existing ROI doc assumes) or **per-ROI** (each signal ROI
-  pairs with its own bg)? The user said "for *an* ROI … a background ROI that is
-  subtracted or divided from the chosen signal ROI", which reads **per-ROI**. Lean
-  per-ROI (more flexible; a shared bg is the special case of pointing several ROIs at
-  the same bg), but confirm.
+- **Resolved/shipped:** background is **per-ROI** via `RoiSignal.background` and
+  `RoiSignal.background_op`. A shared/global background is represented by assigning the
+  same background ROI to multiple signals.
 
 ## 5. Headless vs xdart (keep xdart thin)
 
@@ -136,10 +136,10 @@ The ROI math stays **headless** (`xrd_tools`), per the existing ROI doc — exte
 don't move it into the GUI:
 
 - `core/roi.py` `RoiSpec` + reducer math (existing doc §3).
-- `analysis/plans.py` `RoiStatsPlan` + `run_roi_stats(plan, source)` →
-  `AnalysisResult` (existing doc §3). **Extensions for this design:** reducer gains
-  `max`/`min`/`std`; the background op gains `divide` (not just subtract); per-ROI
-  background if §4.4 resolves that way.
+- `analysis/plans.py` `RoiSignal` + `run_roi_signals(signals, source)` →
+  `AnalysisResult`; `RoiStatsPlan` + `run_roi_stats(plan, source)` remain the
+  shared-config compatibility wrapper. Reducers include `mean`/`sum`/`max`/`min`/`std`,
+  `background_op` includes `subtract`/`divide`, and background is per-ROI.
 - The **normalization axis** is a **plot-time** division (y / norm column) — it lives in
   the xdart popup, not the headless plan (it's display, and the norm column is already
   in the table).
@@ -161,30 +161,29 @@ progress + cancel). I/O (loading every frame) is the real cost; the stat is chea
   `RoiSpec` would gain a `space` discriminator (existing ROI doc §5).
 - **Store raw in the `.nxs`** — the future feature that would let a processed file
   support ROI standalone (§4.1).
-- **Mask/saturation awareness** — the existing ROI doc §6.3 prerequisite (R3-C:
-  invalid-pixel policy into core) still applies so headless ROI stats match the
-  reducer/display. Ship with static-mask + NaN exclusion first, full saturation parity
-  after R3-C.
+- **Mask/saturation awareness** — implemented via static masks, non-finite exclusion, and
+  `mask_saturation` in the shared core ROI/reduction helpers so headless ROI stats match
+  the reducer/display when the toggle is enabled.
 
 ## 7. Staged plan (each step independently testable)
 
-The headless steps are the existing ROI doc §7 steps 0–2 (`RoiSpec`+math →
-[R3-C prereq] → `RoiStatsPlan`/`run_roi_stats`), **extended** with the `divide` op,
-extra reducers, and (if chosen) per-ROI background. The GUI steps, in order:
+The headless steps in the ROI doc §7 are implemented (`RoiSpec`+math →
+`RoiSignal`/`run_roi_signals`, `RoiStatsPlan` compatibility, static/saturation masks).
+The GUI steps, in order:
 
-1. **Scan source picker + metadata table.** Source picker (loaded `.nxs` / blank →
+1. **DONE: Scan source picker + metadata table.** Source picker (loaded `.nxs` / blank →
    pick NeXus/Eiger/TIFF-seq/SPEC via `ensure_frame_source`); read metadata into the
    per-frame table. *Gate:* offscreen test — each source kind populates the expected
    columns; SPEC yields metadata + no images.
-2. **The plot popup (metadata only).** x/y/normalization column selectors (defaults:
+2. **DONE: The plot popup (metadata only).** x/y/normalization column selectors (defaults:
    positioner / intensity / none) + overlay + CSV, over the table from step 1, reusing
    `ParamTrendMixin`. *Gate:* synthetic table renders the expected traces; normalization
    divides; overlay shows multiple.
-3. **"Plot ROI" gating + the ROI image popup.** Enable only on reachable raw; first
+3. **DONE: "Plot ROI" gating + the ROI image popup.** Enable only on reachable raw; first
    image + `RectROI` ↔ numeric fields (2-way sync round-trip), multiple ROIs, stat + bg
    ROI + subtract/divide. *Gate:* sync round-trip (drag → spec → fields and back);
    gating truth-table per source kind.
-4. **ROI-stat worker → columns.** Off-thread per-frame raw load + `run_roi_stats`;
+4. **DONE: ROI-stat worker → columns.** Off-thread per-frame raw load + `run_roi_signals`;
    each ROI series appended as a column; plot fills incrementally with progress/cancel.
    *Gate:* end-to-end on a small real/synthetic image-series source; the incremental
    series equals a direct `run_roi_stats` (a mini live≡batch spine).
@@ -196,16 +195,15 @@ extra reducers, and (if chosen) per-ROI background. The GUI steps, in order:
 - **Generic source picker** (NeXus/Eiger/TIFF-seq/SPEC), not nxs-bound; start on the
   loaded nxs or blank. ✓
 - **Several ROIs at once** + a **general overlay** to compare multiple columns/ROIs. ✓
-- **Background ROI** per signal ROI, **subtract OR divide** (op selectable). ✓ (global
-  vs per-ROI bg: lean per-ROI — confirm.)
+- **Background ROI** per signal ROI, **subtract OR divide** (op selectable). ✓
 - **Disable Plot ROI** when raw isn't stored in / reachable from the source (esp. a
   processed nxs without stored raw — and *storing raw in the nxs* is a future feature). ✓
 - **Selectable axes:** x default = positioner, y default = intensity, both any column;
   **+ a normalization axis** (default none, any column → y/norm). ✓
 
 ## 9. References
-- [`design_roi_stats_plotting_jun2026.md`] — the headless core (RoiSpec / RoiStatsPlan /
-  run_roi_stats), background math (§6.2), masking prereq (§6.3), persistence (§6.4),
+- [`design_roi_stats_plotting_jun2026.md`] — the headless core (RoiSpec / RoiSignal /
+  run_roi_signals, plus RoiStatsPlan compatibility), background math (§6.2), masking (§6.3), persistence (§6.4),
   live monitor (§6.1), full step sequence (§7). **Read it for the headless contract.**
 - Code to reuse: `xrd_tools/sources/__init__.py` (`ensure_frame_source`),
   `xrd_tools/io/metadata.py` (readers), `xrd_tools/io/read.py`

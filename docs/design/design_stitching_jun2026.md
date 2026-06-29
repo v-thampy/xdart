@@ -1,10 +1,14 @@
 # Design: stitching — reconciled to the xrd-tools monorepo / arch-v2
 
-**Status:** draft for discussion · 2026-06-14 · planning only (no code)
-**Supersedes:** `docs/gui/stitching_design.md` and
-`docs/gui/nexus_stitch_refactor_plan.md` (both pre-monorepo / pre-arch-v2; kept for
-provenance). This doc is the current source of truth for stitching.
-**Gated on:** 3e+Phase-5 (one store / `FrameRecord`) done + tested.
+**Status:** PARTIAL · reconciled 2026-06-27. Headless stitching foundations are
+implemented through the current `StitchPlan` backends and NeXus persistence; GUI
+viewer/wrangler work and `xu_hist` remain deferred/P7.
+**Supersedes:** `../history/stitching_design_gui.md` and
+`../history/nexus_stitch_refactor_plan.md` (both pre-monorepo / pre-arch-v2; archived for
+provenance). Current implementation status is tracked in
+[`stitching_rsm_build_plan.md`](stitching_rsm_build_plan.md).
+**Gated on:** headless backends/persistence are implemented; P7 GUI wiring and the
+`xu_hist` convention gate remain.
 **Depends on:** the shared geometry object —
 [`design_diffractometer_geometry_jun2026.md`] — for per-frame rotations; N1 raw
 resolution (✓); schema-as-code (✓); the display-controller registry (✓). The Stitch
@@ -23,7 +27,7 @@ assume vs what is now true:
 | "create `core/geometry.py` with `DiffractometerGeometry`" | **Already exists** (`core/geometry/diffractometer.py`); being consolidated into a shared `Diffractometer` (companion doc) |
 | Target `0.36.0`; **no backcompat, no `schema_version`** | Past `0.41/0.40`; **schema-as-code** with `PROCESSED_SCHEMA_VERSION`, `CapabilityAttr`s, `ACCEPTED_SCHEMA_NAMES` back-compat (`io/schema.py`) |
 | Writer = xdart `sphere.py::_save_to_nexus` | Writer is **core** (`io/nexus.py` via a `ReductionSink`); xdart sink is Qt-signal-only |
-| New `read_sphere`/`write_stitched`/`read_stitched` | Readers are `get_1d`/`get_2d`/`get_metadata`/`read_scan`/`ProcessedScan`; **`write_stitched`/`read_stitched` already exist** in `io/nexus.py` (but are NOT yet schema-registered — §4) |
+| New `read_sphere`/`write_stitched`/`read_stitched` | Readers are `get_1d`/`get_2d`/`get_metadata`/`read_scan`/`ProcessedScan`; **`write_stitched`/`read_stitched` exist and are schema/capability registered** in `io/nexus.py` / `io/schema.py` |
 | Mode dropdown "gains Stitch 1D/2D" in a wrangler | Display is the **`Mode` enum + `PanelRole` + controller registry** (`display_logic.py`); a Stitch viewer **registers** a controller |
 | `StitchSource` Protocol + per-format backends | The **`FrameSource` + `open_source(spec)`** abstraction already exists; `StitchSource` collapses into it + a thin grouping layer |
 
@@ -51,12 +55,9 @@ assume vs what is now true:
 - **Stitch primitive:** `integrate/multi.py` — `create_multigeometry_integrators`
   (l.33), `stitch_1d` (l.86), `stitch_2d` (l.145), `stitch_images` (l.264). Handles
   2-circle + psic via the optional `rot2_angles`.
-- **Persistence (partial):** `io/nexus.py::write_stitched` (l.1519) writes
-  `/entry/stitched_1d` + `/entry/stitched_2d` (NXdata, scan-level); `read_stitched`
-  (l.2639) reads them into an xarray. **Gap:** these are **not** registered in
-  `io/schema.py` `SCHEMA` (no `stitched_1d`/`stitched_2d` `GroupSchema`, no
-  `CapabilityAttr`) — so they bypass schema-as-code (no capability detection, no
-  validator coverage). Reconciling that is step one of the persistence work.
+- **Persistence:** `io/nexus.py::write_stitched` writes `/entry/stitched_1d` +
+  `/entry/stitched_2d` (NXdata, scan-level) with provenance; `read_stitched` reads
+  them into an xarray; `io/schema.py` registers the stitched groups/capabilities.
 - **Display reservations:** `display_logic.py` already reserves
   `PanelRole.STITCH_2D` and `Mode` is open for a `STITCH_VIEWER`. No controller/layout
   yet.
@@ -135,7 +136,7 @@ stitching module.
 ## 2.6 THREE stitch backends — the merge is selectable (decision 2026-06-23)
 
 **Stitching factors into two independent choices — the q-GEOMETRY engine and the MERGE
-engine — and we ship THREE of the meaningful combinations** (Vivek, 2026-06-23). Validation
+engine — and the design keeps THREE meaningful combinations** (Vivek, 2026-06-23). Validation
 on real del/nu data (the `Multi120_*` notebooks, §8) converged on **xrayutilities** for the
 geometry (it fits the `del`/`nu` motor offsets directly + evaluates the stacked pose exactly,
 where pyFAI `MultiGeometry` hard-wires `deg2rad` per axis = GAP A), while pyFAI still owns the
@@ -143,14 +144,14 @@ per-pixel **intensity corrections** — but the **histogram** merge (vs pyFAI's 
 `MultiGeometry`) is independently valuable because it **streams** (stitch-on-the-fly). So:
 
 ```python
-StitchPlan.backend: Literal["xu_hist", "pyfai_hist", "multigeometry"] = "xu_hist"
+StitchPlan.backend: Literal["multigeometry", "pyfai_hist", "xu_hist"] = "multigeometry"
 ```
 
 |  | q-geometry | merge | 1D + 2D | streams | role |
 |---|---|---|---|---|---|
-| **`"multigeometry"`** | pyFAI AIs (`to_pyfai_per_frame`) | pyFAI `MultiGeometry` | **both via MG** | no | the validated pyFAI azimuthal path |
-| **`"pyfai_hist"`** | pyFAI q/χ maps | per-pixel **histogram** | both via hist | **yes** | pyFAI geometry, streaming merge |
-| **`"xu_hist"`** (default) | xu `Ang2Q.area` (`to_qconversion`) | per-pixel **histogram** | both via hist | **yes** | the converged path |
+| **`"multigeometry"`** (current default) | pyFAI AIs (`to_pyfai_per_frame`) | pyFAI `MultiGeometry` | **both via MG** | no | the validated pyFAI azimuthal path |
+| **`"pyfai_hist"`** | pyFAI q/χ maps | per-pixel **histogram** | both via hist | bounded-memory streaming; auto-ranges are two-pass | pyFAI geometry, histogram merge |
+| **`"xu_hist"`** (deferred; raises) | xu `Ang2Q.area` (`to_qconversion`) | per-pixel **histogram** | both via hist | deferred | the converged design path after convention validation |
 
 - **`"multigeometry"`** — per-frame pyFAI `AzimuthalIntegrator`s → pyFAI `MultiGeometry`, which
   does geometry + corrections + azimuthal-integration + merge in one. **Both the 1D and the 2D
@@ -163,14 +164,15 @@ StitchPlan.backend: Literal["xu_hist", "pyfai_hist", "multigeometry"] = "xu_hist
   `HXRD.Ang2Q.area(...)`. Per-pixel **corrections** (solid-angle, polarization, GI stack)
   applied as weights, reused from pyFAI arrays (`design_intensity_corrections_jun2026.md`). The
   histogram is the notebooks' shared `stitch(provider)` and the SAME accumulator shape as RSM's
-  `rsm.gridding.StreamingGridder` (`design_rsm_jun2026.md`) — so it **streams**
-  (stitch-on-the-fly, §3.4).
+  `rsm.gridding.StreamingGridder` (`design_rsm_jun2026.md`) — so it is **bounded-memory
+  streaming**. When q/χ ranges are omitted it uses a scout pass plus an accumulation pass;
+  explicit/cached ranges are the slow-computer path for a single read/compute pass (§3.4).
 
-**The shared seam.** `run_stitch(plan, source)` dispatches on `plan.backend`. `stitch_ponis`
-(§3.2) is the `multigeometry` feeder; a sibling `stitch_q_grid(provider, corrections)` is the
-**shared histogram** feeder for BOTH `pyfai_hist` and `xu_hist` (only the q-provider closure
-swaps). `xu_hist` is the default (the converged, geometry-exact, streaming path) — *flagged for
-the maintainer*.
+**The shared seam.** `run_stitch(plan, source)` dispatches on `plan.backend`. The current
+production default is `multigeometry`; `pyfai_hist` exists as the histogram backend; `xu_hist`
+is intentionally deferred until the real-data convention gate. `stitch_ponis` (§3.2) is still
+the design name for the full-geometry `multigeometry` feeder; the implemented headless path
+uses the shared `Diffractometer`/`DetectorCalibration` adapters directly.
 
 **Why this does NOT touch geometry (§3.1):** the shared `Diffractometer` already produces both
 adapters — `to_pyfai_per_frame` (MultiGeometry + the pyFAI q-provider) and
@@ -192,15 +194,14 @@ backend, `to_qconversion` for the xu_hist backend), `DetectorCalibration`/
 `ImageOrientation`, `from_pyfai_goniometer` (the gonio importer), `refine_goniometer`
 (the producer/fit), capability-gated persistence, and every existing consumer
 (RSM/reduction/writer) repointed onto it. **So the shared spine of §2.6/§3 is now
-buildable — but not yet built.** Honest status of the §2.6 convergence:
+largely built.** Honest status of the §2.6 convergence:
 
-- **Shared today (code):** the source layer + the one `Diffractometer` (the q-geometry
-  for all backends). RSM's `StreamingGridder` is the mature histogram accumulator the
-  `xu_hist`/`pyfai_hist` backends are meant to *reuse*.
-- **Design-only (this module builds it):** `StitchPlan.backend`, the `xu_hist`/`pyfai_hist`
-  backends, `stitch_q_grid`/`stitch_ponis`, the shared per-pixel correction stack, and the
-  histogram-stitch path. Today `run_stitch` still uses the old `deg2rad` per-frame hardwire
-  (GAP A) and pyFAI `MultiGeometry`; it does **not** yet consume the `Diffractometer`.
+- **Shared today (code):** the source layer + one `Diffractometer`; `StitchPlan.backend`;
+  `multigeometry`; `pyfai_hist`; `stitch_q_grid`; the shared per-pixel correction stack;
+  stitched persistence/provenance; and RSM's streaming accumulator shape.
+- **Deferred/P7:** `xu_hist`, explicit `stitch_ponis` public helper, GUI Stitch viewer, and
+  live convention validation. `run_stitch` now consumes the `Diffractometer` when provided
+  and keeps the old explicit `rot*_key` path as fallback.
 - **The convergence claim, precisely:** once built, **`xu_hist`-stitch ≡ RSM** up to and
   including the per-pixel q (`to_qconversion → Ang2Q.area`) + the shared corrections; the
   **single divergence is the bin space** handed to the shared accumulator — `(q, χ)` 2D for
@@ -322,30 +323,27 @@ store and must not be forced into it. ADR-0006 already classified stitch as a
 - It still produces per-image `integrated_1d`/`integrated_2d` (the existing per-frame
   stack) **in addition** to the merged stitch, so the viewer can show per-image QA.
 
-### 3.4 Streaming (forward seam, not v1)
-`run_stitch` eagerly materializes all images (guarded). `MultiGeometry` itself is not
-streaming-friendly, but the **scout-bounds → bin → finalize** shape mirrors RSM's
-streaming gridder. Flag a future `StitchPlan` streaming backend (the `MemoryError`
-message already points at it); v1 stays eager with the guard. If a `prepare_*` pass is
-ever needed for stitch bounds, it follows the **ADR-0006 pattern** (a concrete
-function + the `scan_manifest()` capability), *not* a speculative framework — ADR-0006
-explicitly classified stitch as finalize-stage with no prepass today, so do not build
-one until a real need lands.
+### 3.4 Streaming / memory posture
+`multigeometry` is explicitly eager and guarded. `pyfai_hist` is the slow-computer-safe
+direction because it can use the **scout-bounds → bin → finalize** shape shared with RSM's
+streaming gridder, but it must not promise unbounded streaming unless the caller supplies
+explicit ranges or the implementation can do a bounded scout/replay. Any future
+`prepare_*` pass follows the **ADR-0006 pattern** (a concrete function + the
+`scan_manifest()` capability), *not* a speculative framework.
 
 ---
 
 ## 4. Persistence (schema-as-code)
 
-1. **Register the existing stitched groups.** Add `stitched_1d`/`stitched_2d`
-   `GroupSchema` entries + `CapabilityAttr`s to `io/schema.py` so `write_stitched`/
-   `read_stitched` are covered by capability detection + validators (they exist but
-   are unregistered today — the one real correctness gap). Preserve the **as-is**
+1. **DONE: register the existing stitched groups.** `stitched_1d`/`stitched_2d`
+   `GroupSchema` entries + `CapabilityAttr`s exist in `io/schema.py`, so `write_stitched`/
+   `read_stitched` are covered by capability detection + validators. Preserve the **as-is**
    `stitched_2d` orientation `(n_q, n_chi)` (`write_stitched` docstring + xdart files
    stay interchangeable) — do **not** "fix" it to the per-frame `(chi, q)` convention.
 2. **Write through the sink/schema path**, not a bespoke xdart writer (the
    "complete-v2-record orchestration into core" arc): the headless run produces a
    complete file; xdart only triggers it.
-3. **Add a convenience reader** `get_stitched_1d`/`get_stitched_2d` mirroring
+3. **Deferred:** add convenience readers `get_stitched_1d`/`get_stitched_2d` mirroring
    `get_1d`/`get_2d` (notebook-friendly), alongside the existing xarray `read_stitched`.
 4. Persist the stitch provenance (plan + `Diffractometer` + group list) so a reloaded
    scan's stitch is reproducible — and so the **mandatory** geometry metadata for
@@ -384,7 +382,7 @@ stitched** result and **drops the inline raw panel**; raw is reachable via an
   ([`design_roi_stats_plotting_jun2026.md`]), not a registered panel.
 
 ### 5.3 Registration (the seam, with exact API)
-Register through the existing controller registry (`display_logic.py` /
+P7/deferred: register through the existing controller registry (`display_logic.py` /
 `display_controllers.py`):
 
 1. Add `Mode.STITCH_VIEWER` to the `Mode` enum.
@@ -498,10 +496,10 @@ Everything the notebook hard-codes becomes a widget field. Grouped by concern, w
 
 0. **(prereq) Shared `Diffractometer`** through step 4 of the companion doc, so stitch
    and RSM share one geometry input. **Gate:** companion doc's gates.
-1. **Schema-register stitched output.** Add `stitched_1d`/`stitched_2d` `GroupSchema`
-   + `CapabilityAttr` to `io/schema.py`; route `write_stitched` through the sink/schema
-   path; add `get_stitched_1d/2d` readers. **Gate:** write→read round-trip; capability
-   feature-detect; existing `read_stitched` xarray still passes; orientation preserved.
+1. **DONE: schema-register stitched output.** `stitched_1d`/`stitched_2d` `GroupSchema`
+   + `CapabilityAttr` exist in `io/schema.py`, and `write_stitched` / `read_stitched`
+   round-trip through the registered schema. **Deferred:** `get_stitched_1d/2d`
+   convenience readers.
 2. **Geometry carrier + goniometer bridge (closes GAPs A–D).** Add the
    `DetectorCalibration` (PONI + `detector_config`), make `Diffractometer` carry fitted
    per-axis scale+offset (companion doc), add `stitch_ponis(images, geometries)` over
@@ -565,7 +563,7 @@ Everything the notebook hard-codes becomes a widget field. Grouped by concern, w
     `xu_geometry_del_nu.json` — the goniometer/xu control-point calibrations (the geometry doc's
     fixtures); `integration_xru.ipynb` / `reduce_pyFAI_multigeometry.ipynb` — the two engines
     standalone; `stitch_simplified.ipynb` — the simplified end-to-end.
-- Superseded: `docs/gui/stitching_design.md`, `docs/gui/nexus_stitch_refactor_plan.md`.
+- Superseded: `../history/stitching_design_gui.md`, `../history/nexus_stitch_refactor_plan.md`.
 - Decisions: ADR-0002 (capability attrs), ADR-0003 (per-frame cardinality — stitch is
   out of scope of it), ADR-0005 (store ownership), ADR-0006 (finalize-stage
   classification + the prepare/capability pattern).

@@ -1,7 +1,9 @@
 # Stitch / RSM display panels — design
 
-**Status:** design (Jun 2026), ready for UI mockups → Qt implementation. The third UI-spec doc:
-- `design_gui_three_section_layout_jun2026.md` — the CONTROLS (right column: data / experimental / processing).
+**Status:** DESIGN/P7 · reconciled 2026-06-27. Stitch/RSM display remains future GUI
+work; the headless stitch/RSM foundations are tracked in
+[`stitching_rsm_build_plan.md`](stitching_rsm_build_plan.md). The third UI-spec doc:
+- `design_controls_panel_v2_jun2026.md` — the CONTROLS (right column: Project / Source / Experiment / Processing).
 - `design_gui_int_migration_jun2026.md` — migrating Int-1D/2D onto that layout.
 - **this** — the DISPLAY panels (main view) for the new Stitch + RSM tools.
 
@@ -40,7 +42,7 @@ merged stitch has no single raw frame; `render_plan` already clears panels the s
 trio) show for Stitch-2D, hide for Stitch-1D. **Show the `Raw` button** (`_showImageBtn`, `:835`) in
 both.
 
-**`StitchDisplayController`** — subclass `_BaseController` (`display_controllers.py:222`), register
+**P7/deferred `StitchDisplayController`** — subclass `_BaseController` (`display_controllers.py:222`), register
 `register_controller(Mode.STITCH_VIEWER, StitchDisplayController())` next to
 `register_default_controllers` (`:583`). It reads the in-memory/reloaded stitch result, sets
 `has_2d = stitched_2d is not None`, emits the 2 panels + the collapsing layout, is generation-stamped,

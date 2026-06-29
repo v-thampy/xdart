@@ -1,5 +1,9 @@
 # Codebase health + feature-readiness review (2026-06-18)
 
+**Status:** HISTORICAL REVIEW. Several findings below have since landed or been
+superseded; use `stitching_rsm_build_plan.md` and the individual design docs for
+current implementation status.
+
 **Method:** 10-agent review workflow (4 regression audits of the last few sessions' major changes + 5 architecture-suitability assessments + a lead synthesis), each agent reading source and citing file:line.  Branch `overlay-waterfall-payload-flip` @ `6cdfa0e`.  Full per-agent JSON in the session transcript.
 
 > Note: the 3 viewer Set-BG "HIGH" findings predate the maintainer's explicit "shape-match-only" decision — see the resolution notes in the follow-up plan; the shape-mismatch no-subtract is intended, the normChannel-restore + reset_key(None) are the genuinely actionable ones.
@@ -43,7 +47,7 @@ Verified ground truth: `Mode` enum has only the 5 shipped values (`display_logic
 |---|---|---|---|
 | **Azimuthal (I vs χ)** | **Ready / largely landed** | Headless `integrate_radial` shipped (6cdfa0e, `single.py:105`); only display wiring of Mode-A profile remains. | Wire the χ-profile into a `PlotPayload` trace; smallest of the set. |
 | **Geometry (unified Diffractometer)** | **Minor extension, but the heaviest authoring** | **No canonical `Diffractometer` class** — two parallel encodings (`DiffractometerConfig` line 31, `DiffractometerGeometry` line 119) risk drift. | Author `Diffractometer` + presets + `to_pyfai_per_frame`/`to_qconversion` **and the consistency test as a merge gate** (design §5.1/§6 step 0). |
-| **Stitching** | **Ready** | **`stitched_1d/2d` not registered in `schema.py`** (writer/reader exist, no capability feature-detect) — the one correctness gap. Verified. | Register the two `GroupSchema` + `CapabilityAttr` entries (step 1), then add `Mode.STITCH_VIEWER` + `StitchViewerController` (step 4) — both small, parallelizable. |
+| **Stitching** | **Ready (headless foundations landed)** | At review time, `stitched_1d/2d` were not registered in `schema.py`; this is now fixed. Update (2026-06-28): the persistent Stitch display has since landed — `StitchDisplayController` is registered for `Mode.STITCH_1D/STITCH_2D` and `_live_mode()` returns those when `scan.stitched_*` exists, so the "deferred GUI viewer" caveat is now partly down (Refine button + GI-stitch panels remain P7). | See `stitching_rsm_build_plan.md` for current backend/schema status. |
 | **Fitting** | **Ready** | No `Mode.PEAK_FIT` + no `fit_logic.py`; everything else (lmfit `run_peak_fit`, `Trace.kind='fit'/'component'/'background'/'residual'`, reserved `RESIDUAL_1D`, `ResultsView` stub) is in place. | Add `Mode.PEAK_FIT` + a pure `fit_logic.py` emitting fit/residual traces; UI later. |
 | **RSM** | **Ready (headless), moderate display work** | **WS-X2 multi-instance panel promotion (#69) still deferred** — the 2×3 repeated-role grid needs it (a role-level fallback loop exists as a bridge). | Add `Mode.RSM_VIEWER` + `PANEL_LAYOUT`, verify the 2×3 layout via a *headless* `compute_display_state` test **before** wiring reduction. |
 | **Phase 4 session** | **Complete minus 1 ADR + live checkpoint** | Three already-implemented Phase-4f decisions need an ADR; QThread-teardown / disk-read-during-pause need a **manual live checkpoint** (not offscreen-simulable). | Write the ADR (~20 min), then schedule Vivek's live checkpoint before v1.0. |
@@ -65,7 +69,7 @@ Verified ground truth: `Mode` enum has only the 5 shipped values (`display_logic
 
 **Then, geometry + stitching on the new branch (max reuse, min risk):**
 1. **Geometry first.** It is the shared dependency: `run_stitch` should derive per-frame rotations from `scan.geometry.to_pyfai_per_frame(motors)`, and RSM's `to_qconversion` needs the same canonical object. Land `Diffractometer` + presets + both adapters **gated on the consistency test** (design §6 step 0). Doing this first means stitching and RSM consume the finished adapter instead of re-deriving geometry three times.
-2. **Stitching, in parallel where possible.** (a) Register `stitched_1d/2d` in `schema.py` — the one correctness gap, independent of geometry. (b) `Mode.STITCH_VIEWER` + `PANEL_LAYOUT` + `StitchViewerController` (reads pre-loaded result first). (c) Reconcile `run_stitch` to consume `to_pyfai_per_frame` once geometry lands. (d) xdart range-syntax grouping. Single `STITCH_2D` role means **no WS-X2 dependency** — stitching ships before RSM.
+2. **Stitching, in parallel where possible.** Historical note: schema registration has since landed. Remaining GUI work is `Mode.STITCH_VIEWER` + `PANEL_LAYOUT` + `StitchViewerController` (reads pre-loaded result first), plus xdart range-syntax grouping. Single `STITCH_2D` role means **no WS-X2 dependency** — stitching ships before RSM.
 
 **Later (fitting / RSM):**
 3. **Fitting** is the lowest-risk addition (headless `run_peak_fit` is prod-grade, all traces/roles reserved) — slot it whenever convenient; it doesn't gate anything.

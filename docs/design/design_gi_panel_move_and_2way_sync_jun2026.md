@@ -1,4 +1,8 @@
-# Design: GI controls → integration panel + 2-way load hydration (Jun 19, 2026)
+# Design: GI controls → section 2/3 split + 2-way load hydration (Jun 19, 2026)
+
+**Status:** DESIGN/P7, reconciled to
+[`ADR-0008`](../decisions/0008-gi-control-ownership.md) and
+[`ADR-0009`](../decisions/0009-energy-single-source.md).
 
 Branch: `panel-sections-refactor`.  Builds on the panel-sections refactor (shared
 `StaticControls`, integrator-owned threshold row, Browse-inline) and on the
@@ -22,10 +26,11 @@ reintegrate plan reads a mix of the two:
 (`skip_2d` is NOT in this class — reintegrate passes `integrate_2d` explicitly
 via the Reintegrate 1D/2D buttons.)
 
-**Goal:** one home for *every* integration parameter (transmission + GI) in the
-integration panel, and loading a `.nxs` populates it — so the user immediately
-sees the saved parameters and reintegrate-from-the-panel reproduces the saved
-reduction by default.  This is also why GI belongs in the integration panel.
+**Goal:** one canonical home for every GI value, with reload hydrating the visible
+controls. ADR-0008 splits ownership: sample/measurement facts live in section 2,
+while output axes, GI submodes, bins, ranges, and correction toggles live in
+section 3. The GUI may place the controls adjacently for usability, but saved
+state and plan provenance follow that split.
 
 ## The incidence-motor separation (the part that made this feel cursed)
 
@@ -38,24 +43,25 @@ concern, not a reintegrate one:
 - The motor **name** is only needed when acquiring/reducing fresh (which SPEC
   column to read).
 
-So: **selection** of the motor lives in the integrator (one unified GI section);
-the **metadata read** stays in the wrangler thread (live).  On a loaded `.nxs`
-the motor box is informational (angle already baked).
+So: **selection** of the motor is a section-2 sample/measurement fact; the
+**metadata read** stays in the wrangler thread (live).  On a loaded `.nxs` the
+motor box is informational (angle already baked).
 
 ## Plan (stage-by-stage, live-gated after each)
 
-### Stage A — GI section in the integrator (controls + ownership)
-- integratorUI: add a GI section — GI on/off toggle, Sample Orientation, Tilt,
-  Theta Motor dropdown, Theta Value (manual).  The GI *mode* combos
-  (`axis1D`/`axis2D`) + `npts_oop` already live in the integrator; group them in.
-- integrator.py: `get_gi_config()` reads these → dict; session-persist; reveal
-  motor/orientation/tilt only when GI is on.  The GI toggle drives `scan.gi`
-  through the existing `update_scattering_geometry`/`sigUpdateGI` seam.
+### Stage A — GI section split (controls + ownership)
+- Section 2c: GI on/off toggle, Sample Orientation, Tilt, Theta Motor dropdown,
+  Theta Value (manual), material, and incidence source.
+- Section 3: GI *mode* combos (`axis1D`/`axis2D`), `npts_oop`, ranges, bins, and
+  correction toggles.
+- `get_gi_config()` reads the section-2 facts → dict; session-persist; reveal
+  motor/orientation/tilt/material only when GI is on. The GI toggle drives
+  `scan.gi` through the existing `update_scattering_geometry`/`sigUpdateGI` seam.
 - Live injection: before `wrangler.setup()`, push the integrator GI config into
   the wrangler params — same seam as the threshold row
   (`_push_threshold_to_wrangler`).  So **live == panel**.
-- The integrator writes its GI config into `scan.bai_*_args` + `scan.gi_config`
-  so **reintegrate == panel** (values used directly, not just the fallbacks).
+- The GUI writes section-2 GI facts into `scan.gi_config` and writes section-3
+  run choices into `scan.bai_*_args` so **reintegrate == panel**.
 
 ### Stage B — motor wire + default order
 - wrangler → integrator: when metadata loads (`set_gi_motor_options`), emit the
@@ -69,15 +75,15 @@ the motor box is informational (angle already baked).
   ships functional with `th`/`Manual` until then.
 
 ### Stage C — load hydration (the 2-way sync)
-- On `.nxs` load, the integrator hydrates ALL its widgets from the restored
-  `bai_1d_args` + `bai_2d_args` + `gi_config` (units, npts 1D/2D, ranges,
-  gi_mode, GI on/off, orientation, tilt, motor-info) — **signals BLOCKED** so it
-  can't trigger a spurious reintegrate or session-churn.  Hydrating GI on/off
-  sets `scan.gi` to match the loaded scan, closing the footgun.
+- On `.nxs` load, section 2 hydrates from `gi_config`/diffractometer/beam state
+  and section 3 hydrates from `bai_1d_args` + `bai_2d_args` (units, npts 1D/2D,
+  ranges, gi modes). Signals are **BLOCKED** so hydration cannot trigger a
+  spurious reintegrate or session churn. Hydrating GI on/off sets `scan.gi` to
+  match the loaded scan, closing the footgun.
 
 ### Stage D — cleanup + tests
-- Hide/remove the wrangler GI group (now owned by the integrator); keep only the
-  motor-options provider.
+- Hide/remove the wrangler GI group once section 2 owns the sample facts; keep
+  only the motor-options provider.
 - Tests: load → panel reflects saved params; GI hydration round-trip; motor
   default-order (pure unit test); live≡batch≡reload equivalence spine + full
   suite green.
