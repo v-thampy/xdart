@@ -581,7 +581,7 @@ class wranglerThread(Qt.QtCore.QThread):
         engine cache stay valid — a single pixel changing in the
         mask invalidates the cache and forces a ~250 ms LUT rebuild
         (observed on Eiger scans where saturation flicker shifts the
-        mask CRC frame-to-frame; see session_may2026 lesson 1).
+        mask CRC frame-to-frame).
 
         Per-frame threshold filtering is NOT routed through this
         mask — see :meth:`_apply_threshold_inline` for that path
