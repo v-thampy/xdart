@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Hidden Controls Panel V2 scaffold.
+"""Controls Panel V2 preview scaffold.
 
-This widget is not mounted in production yet.  It is a thin renderer for the
-Qt-free :mod:`xdart.gui.tabs.static_scan.controls_logic` profile so the next
-GUI pass can build typed cards behind a feature flag instead of editing the
-legacy ParameterTree in place.
+This widget is a thin renderer for the Qt-free
+:mod:`xdart.gui.tabs.static_scan.controls_logic` profile.  It stays inside a
+bounded preview container while the legacy wrangler/integration widgets remain
+the production controls.
 """
 
 from __future__ import annotations
@@ -93,15 +93,15 @@ class SectionCard(QtWidgets.QFrame):
         super().__init__(parent)
         self.setObjectName("controlsV2SectionCard")
         outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(8, 7, 8, 8)
-        outer.setSpacing(6)
+        outer.setContentsMargins(7, 5, 7, 6)
+        outer.setSpacing(4)
         self.title = QtWidgets.QLabel(title)
         self.title.setObjectName("controlsV2SectionTitle")
         outer.addWidget(self.title)
         self.body = QtWidgets.QWidget()
         self.body_layout = QtWidgets.QVBoxLayout(self.body)
         self.body_layout.setContentsMargins(0, 0, 0, 0)
-        self.body_layout.setSpacing(5)
+        self.body_layout.setSpacing(3)
         outer.addWidget(self.body)
 
     def clear_rows(self) -> None:
@@ -127,10 +127,18 @@ class FieldRow(QtWidgets.QWidget):
         lay.setSpacing(5)
         self.label = QtWidgets.QLabel(status.label)
         self.label.setObjectName("controlsV2FieldLabel")
+        self.label.setMinimumWidth(80)
         self.value = QtWidgets.QLabel(status.value or status.reason or status.status.value)
         self.value.setObjectName("controlsV2FieldValue")
+        self.value.setWordWrap(False)
+        self.value.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         self.badge = StatusBadge(status.status.value)
         self.badge.set_status(status.status.value, status.status.value)
+        self.badge.setMinimumWidth(48)
+        self.badge.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         lay.addWidget(self.label)
         lay.addWidget(self.value, 1)
         lay.addWidget(self.badge)
@@ -156,8 +164,8 @@ class ControlsPanelV2(QtWidgets.QWidget):
         super().__init__(parent)
         self.setObjectName("controlsPanelV2")
         lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(7)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(5)
 
         self.summary_card = SectionCard("Run Readiness")
         self.project_card = SectionCard("Project")

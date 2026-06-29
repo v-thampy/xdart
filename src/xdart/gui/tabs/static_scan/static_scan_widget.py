@@ -564,15 +564,30 @@ class staticWidget(QWidget):
         try:
             from .ui.controls_panel_v2 import ControlsPanelV2
             panel = ControlsPanelV2(self.ui.wranglerFrame)
-            panel.setMaximumHeight(520)
+            preview = QtWidgets.QScrollArea(self.ui.wranglerFrame)
+            preview.setObjectName("controlsPanelV2Preview")
+            preview.setWidgetResizable(True)
+            preview.setFrameShape(QtWidgets.QFrame.NoFrame)
+            preview.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            preview.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            preview.setMinimumHeight(120)
+            preview.setMaximumHeight(240)
+            preview.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Maximum,
+            )
             panel.analysisLaunchRequested.connect(
                 self._on_controls_v2_analysis_launch)
             panel.controlActionRequested.connect(
                 self._on_controls_v2_action)
-            self.ui.verticalLayout.insertWidget(0, panel)
+            preview.setWidget(panel)
+            self.ui.verticalLayout.insertWidget(0, preview, 0)
+            self.ui.verticalLayout.setStretchFactor(self.ui.wranglerStack, 1)
+            self.controls_v2_preview = preview
             self.controls_v2 = panel
             self._refresh_controls_v2_profile(immediate=True)
         except Exception:
+            self.controls_v2_preview = None
             self.controls_v2 = None
             logger.debug("Controls Panel V2 preview mount failed",
                          exc_info=True)
