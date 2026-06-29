@@ -317,7 +317,10 @@ raw-unreachable ROI, missing 1D fit inputs, optional dependency missing, energy 
 **Status:** FOUNDATION IMPLEMENTED. The current module covers `ControlState`,
 `ControlProfile`, `FieldId`, `FieldSpec`, `FieldStatus`, source/result/geometry caps,
 analysis launchers, viewer run suppression, legacy mode-text mapping, and
-GI Stitch/RSM/xu_hist real-data gates. The current `FieldStatus` implementation is a
+GI Stitch/RSM/xu_hist real-data gates. It now also exposes design-level
+`valid_modes`, `backend_required`, and `can_run`/`run_enabled` outputs so the future
+Processing stack can render mode/backend constraints without Qt-side branching. The current
+`FieldStatus` implementation is a
 first-pass status/provenance surface; richer conflict/provenance detail remains Phase 4
 work as the Experiment card becomes authoritative.
 

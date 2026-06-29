@@ -280,6 +280,10 @@ class ControlProfile:
     processing_page: ProcessingPage
     run_enabled: bool
     run_blockers: tuple[str, ...] = ()
+    valid_modes: frozenset[MeasMode] = field(
+        default_factory=lambda: frozenset(MeasMode)
+    )
+    backend_required: str | None = None
     fields: Mapping[FieldId, FieldStatus] = field(default_factory=dict)
     section_actions: Mapping[SectionId, tuple[ControlActionSpec, ...]] = (
         field(default_factory=dict)
@@ -297,6 +301,11 @@ class ControlProfile:
 
     def actions_for(self, section: SectionId) -> tuple[ControlActionSpec, ...]:
         return tuple(self.section_actions.get(section, ()))
+
+    @property
+    def can_run(self) -> bool:
+        """Design-doc spelling for ``run_enabled``."""
+        return self.run_enabled
 
 
 def _field(
@@ -701,6 +710,20 @@ def run_blockers_for(state: ControlState) -> tuple[str, ...]:
     return tuple(dict.fromkeys(blockers))
 
 
+def valid_modes_for(tool: Tool) -> frozenset[MeasMode]:
+    if tool == Tool.RSM:
+        return frozenset()
+    if tool in (Tool.IMAGE_VIEWER, Tool.XYE_VIEWER, Tool.NEXUS_VIEWER):
+        return frozenset()
+    return frozenset(MeasMode)
+
+
+def backend_required_for(state: ControlState) -> str | None:
+    if state.tool == Tool.STITCH and state.mode == MeasMode.GI:
+        return "pyfai_hist"
+    return None
+
+
 def build_control_profile(state: ControlState) -> ControlProfile:
     page = processing_page_for(state.tool, state.mode)
     blockers = run_blockers_for(state)
@@ -710,6 +733,8 @@ def build_control_profile(state: ControlState) -> ControlProfile:
         processing_page=page,
         run_enabled=not blockers and not viewer,
         run_blockers=blockers,
+        valid_modes=valid_modes_for(state.tool),
+        backend_required=backend_required_for(state),
         fields=fields,
         section_actions=build_section_actions(state),
         analysis_launchers=build_analysis_launchers(state.result_caps),

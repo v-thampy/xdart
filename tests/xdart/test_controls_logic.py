@@ -82,11 +82,15 @@ def test_gi_stitch_and_rsm_controls_are_ready_but_blocked_until_gates():
 
     gi_stitch = build_control_profile(
         ControlState(tool=Tool.STITCH, mode=MeasMode.GI, **common))
+    assert gi_stitch.valid_modes == frozenset(MeasMode)
+    assert gi_stitch.backend_required == "pyfai_hist"
     assert not gi_stitch.run_enabled
     assert "GI stitching awaits real-data gate." in gi_stitch.run_blockers
 
     rsm = build_control_profile(
         ControlState(tool=Tool.RSM, mode=MeasMode.STANDARD, **common))
+    assert rsm.valid_modes == frozenset()
+    assert rsm.backend_required is None
     assert not rsm.run_enabled
     assert "RSM GUI awaits real-data gate." in rsm.run_blockers
 
@@ -95,6 +99,7 @@ def test_gi_stitch_and_rsm_controls_are_ready_but_blocked_until_gates():
             tool=Tool.RSM, mode=MeasMode.STANDARD,
             real_data_gates=frozenset({"rsm_real_data"}), **common))
     assert rsm_ready.run_enabled
+    assert rsm_ready.can_run
 
 
 def test_viewer_modes_do_not_offer_run_even_without_blockers():
